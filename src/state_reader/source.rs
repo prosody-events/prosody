@@ -2,14 +2,15 @@
 
 use crate::Topic;
 use crate::state_reader::PartitionCount;
-use crate::state_reader::error::StateReaderError;
 use smallvec::SmallVec;
 use std::sync::Arc;
+use thiserror::Error;
 
-/// The maximum number of publication sources one collection may advertise.
-/// A collection that advertises more fails `Permanent` with
-/// [`StateReaderError::TooManySources`]. A future release may raise the bound,
-/// but it never changes at runtime.
+/// The maximum number of publication sources one collection may advertise. A
+/// collection that advertises more is rejected with
+/// [`NoSnapshot::TooManySources`], which the reader surfaces as a `Permanent`
+/// error. A future release may raise the bound, but it never changes at
+/// runtime.
 pub(crate) const MAX_PUBLICATION_SOURCES: usize = 16;
 
 /// A source's **stable** identity: the publishing consumer group and the topic
@@ -61,26 +62,18 @@ impl ValidatedPublications {
     ///
     /// # Errors
     ///
-    /// Returns [`StateReaderError::TooManySources`] when `sources` holds more
-    /// than [`MAX_PUBLICATION_SOURCES`] entries. Returns
-    /// [`StateReaderError::UnknownPublication`] when `sources` is empty. The
-    /// non-empty invariant is structural, so the caller stores `None` rather
-    /// than building an empty snapshot.
+    /// Returns [`NoSnapshot`] when `sources` is empty or oversized. Both keep
+    /// the snapshot's invariants structural: the caller stores `None` rather
+    /// than building an empty or oversized snapshot.
     pub(super) fn new(
         mut sources: SmallVec<[Source; MAX_PUBLICATION_SOURCES]>,
-        subsystem: &str,
-        name: &str,
-    ) -> Result<Self, StateReaderError> {
+    ) -> Result<Self, NoSnapshot> {
         if sources.is_empty() {
-            return Err(StateReaderError::UnknownPublication {
-                subsystem: subsystem.to_owned(),
-                name: name.to_owned(),
-            });
+            return Err(NoSnapshot::NoSource);
         }
         if sources.len() > MAX_PUBLICATION_SOURCES {
-            return Err(StateReaderError::TooManySources {
+            return Err(NoSnapshot::TooManySources {
                 found: sources.len(),
-                max: MAX_PUBLICATION_SOURCES,
             });
         }
         sources.sort_by(|a, b| a.id.cmp(&b.id));
@@ -93,15 +86,33 @@ impl ValidatedPublications {
     }
 }
 
+/// Why a set of admitted sources yields no validated snapshot. The two arms
+/// classify differently for the reader: no source at all is a Transient absence
+/// that a later read re-admits, while an oversized routing table is a Permanent
+/// misconfiguration.
+#[derive(Debug, Error)]
+pub(super) enum NoSnapshot {
+    /// No source was admitted, so there is nothing to validate.
+    #[error("no admitted publication source")]
+    NoSource,
+    /// More sources are advertised than [`MAX_PUBLICATION_SOURCES`] admits.
+    #[error("too many publication sources ({found} > {MAX_PUBLICATION_SOURCES})")]
+    TooManySources {
+        /// The number of sources advertised.
+        found: usize,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state_reader::PartitionCount;
     use internment::Intern;
 
-    /// Advertising more than [`MAX_PUBLICATION_SOURCES`] fails with
-    /// `TooManySources` (a `Permanent` error) at construction, never a silent
-    /// truncation.
+    /// Advertising more than [`MAX_PUBLICATION_SOURCES`] is rejected at
+    /// construction, never silently truncated. `StateReader` records the
+    /// rejection as a sticky Permanent fault; see
+    /// `oversized_routing_table_is_sticky`.
     ///
     /// Falsify: drop the length check in [`ValidatedPublications::new`]. The
     /// oversized snapshot then builds and the match arm is never reached.
@@ -117,10 +128,9 @@ mod tests {
             })
             .collect();
         assert_eq!(sources.len(), MAX_PUBLICATION_SOURCES + 1);
-        match ValidatedPublications::new(sources, "orders", "coll") {
-            Err(StateReaderError::TooManySources { found, max }) => {
+        match ValidatedPublications::new(sources) {
+            Err(NoSnapshot::TooManySources { found }) => {
                 assert_eq!(found, MAX_PUBLICATION_SOURCES + 1);
-                assert_eq!(max, MAX_PUBLICATION_SOURCES);
             }
             other => color_eyre::eyre::bail!("expected TooManySources, got {other:?}"),
         }

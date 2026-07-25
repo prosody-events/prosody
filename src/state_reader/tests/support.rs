@@ -792,14 +792,8 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
         .await;
     }
 
-    /// A reader-dep bundle over this env's stores with a fresh wall-clock
-    /// cache.
-    pub(super) fn deps(&self) -> SharedDeps<JsonCodec> {
-        self.deps_with_cache(ReaderCache::with_budget(1 << 20))
-    }
-
-    /// [`Self::deps`] over an explicit `cache`. The sticky-mismatch test
-    /// drives its clock through this.
+    /// A reader-dep bundle over this env's stores, sharing `cache` (and so its
+    /// clock) with every reader built from it.
     pub(super) fn deps_with_cache(&self, cache: ReaderCache) -> SharedDeps<JsonCodec> {
         scripted_deps(
             self.cells.clone(),
@@ -809,9 +803,18 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
         )
     }
 
-    /// An eager reader (refreshes every operation) over [`Self::deps`].
+    /// An eager reader (refreshes every operation) on a wall-clock cache.
     pub(super) fn reader_eager(&self) -> Result<StateReader<D, JsonCodec>> {
-        let deps = self.deps();
+        self.reader_eager_with_cache(ReaderCache::with_budget(1 << 20))
+    }
+
+    /// [`Self::reader_eager`] over an explicit `cache`, so a refresh test can
+    /// drive the clock the reader paces its retries on.
+    pub(super) fn reader_eager_with_cache(
+        &self,
+        cache: ReaderCache,
+    ) -> Result<StateReader<D, JsonCodec>> {
+        let deps = self.deps_with_cache(cache);
         StateReader::new_eager(&deps, self.sub.clone(), self.descriptor)
             .map_err(|e| eyre!("reader: {e}"))
     }

@@ -7,13 +7,17 @@
 //! fails with `UnknownPublication`. A table whose every new source lacks a
 //! frozen identity fails with `IdentityUnavailable`.
 //!
+//! [`prop_refresh_pacing`] proves what a failed refresh leaves behind: a window
+//! in which every read serves the held outcome without a store read, and past
+//! which the next read re-reads the routing table.
+//!
 //! The focused example [`identity_mismatch_sticky`] covers the one case the
-//! property does not: an identity that is present but disagrees with the
-//! descriptor. That needs precise interval and clock control the property
-//! does not model.
+//! properties do not: an identity that is present but disagrees with the
+//! descriptor. That needs precise interval and clock control they do not model.
 //!
 //! Every reader here refreshes on every operation (`new_eager`), except the
 //! sticky example, which uses `new_with_interval` for the cached fast path.
+//! Both properties drive a mocked clock, never a sleep.
 
 use super::support::{
     CountingIdentityStore, GROUP_A, GROUP_B, ScriptedEnv, mock_clock_cache, topic,
@@ -28,6 +32,8 @@ use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state::{StateName, StateType};
 use crate::state_reader::PartitionCount;
 use crate::state_reader::StateReaderError;
+use crate::state_reader::reader::REFRESH_BACKOFF;
+use crate::state_reader::source::MAX_PUBLICATION_SOURCES;
 use crate::subsystem::SubsystemName;
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::executor::block_on;
@@ -147,6 +153,9 @@ enum Expect {
     IdentityUnavailable,
     /// A failed routing read with no prior snapshot → a store `Err`.
     ReadError,
+    /// `Err(RefreshUnavailable)` — a read inside the pacing window left by a
+    /// failed refresh, with nothing held to serve.
+    RefreshUnavailable,
 }
 
 /// The committed value that source `idx` holds.
@@ -160,7 +169,9 @@ fn element(idx: usize) -> Value {
 /// successful read (apply additions only, skip withdrawals) → a withdraw round
 /// still serves the withdrawn source → the value assert reds. Drop the
 /// `prior_groups` filter in `admit` (re-read admitted groups) → the identity
-/// read delta exceeds the model's newly-admitted count → red.
+/// read delta exceeds the model's newly-admitted count → red. Stop stepping the
+/// clock between rounds → the round after an outage is paced instead of
+/// refreshing → the delta assert reds.
 #[test]
 fn prop_snapshot_refresh() {
     fn property(script: RefreshScript) -> Result<bool> {
@@ -200,7 +211,8 @@ async fn run_snapshot_refresh(script: RefreshScript) -> Result<bool> {
         identity,
         count: env.count,
     };
-    let reader = env.reader_eager()?;
+    let (cache, mock) = mock_clock_cache(1 << 20);
+    let reader = env.reader_eager_with_cache(cache)?;
 
     // Model state.
     let mut advertised = [false; REFRESH_GROUPS.len()];
@@ -226,6 +238,9 @@ async fn run_snapshot_refresh(script: RefreshScript) -> Result<bool> {
         if !round.fail {
             admitted = next_admitted;
         }
+        // Step exactly to any pacing deadline a failed round established, so
+        // every round refreshes. `prop_refresh_pacing` owns the window itself.
+        mock.increment(REFRESH_BACKOFF);
     }
     Ok(true)
 }
@@ -343,7 +358,186 @@ fn outcome_matches(expect: &Expect, observed: &Result<Option<Value>, StateReader
             matches!(observed, Err(StateReaderError::IdentityUnavailable { .. }))
         }
         Expect::ReadError => matches!(observed, Err(StateReaderError::Store { .. })),
+        Expect::RefreshUnavailable => {
+            matches!(observed, Err(StateReaderError::RefreshUnavailable { .. }))
+        }
     }
+}
+
+// --- Failed-refresh pacing --------------------------------------------------
+
+/// How far one pacing step moves the mock clock before its read.
+#[derive(Clone, Copy, Debug)]
+enum Advance {
+    /// Not at all, so the read lands inside any open pacing window.
+    None,
+    /// Half a window, so two steps are needed to cross one deadline.
+    Half,
+    /// A whole window, landing exactly on the deadline a failing step opened.
+    Full,
+}
+
+impl Advance {
+    /// The mock-clock step this advance takes.
+    fn duration(self) -> Duration {
+        match self {
+            Self::None => Duration::ZERO,
+            Self::Half => REFRESH_BACKOFF / 2,
+            Self::Full => REFRESH_BACKOFF,
+        }
+    }
+}
+
+impl Arbitrary for Advance {
+    fn arbitrary(g: &mut Gen) -> Self {
+        match u8::arbitrary(g) % 3 {
+            0 => Self::None,
+            1 => Self::Half,
+            _ => Self::Full,
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        match self {
+            Self::None => Box::new(empty()),
+            _ => Box::new(once(Self::None)),
+        }
+    }
+}
+
+/// One pacing step: how far the clock moves, then whether the routing read
+/// fails.
+#[derive(Clone, Copy, Debug)]
+struct PacingStep {
+    advance: Advance,
+    fail: bool,
+}
+
+impl Arbitrary for PacingStep {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            advance: Advance::arbitrary(g),
+            fail: bool::arbitrary(g),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let advance = self.advance;
+        let fail = self.fail;
+        // Shrink toward no outage, then toward a clock that does not move.
+        let healed = fail.then_some(Self {
+            advance,
+            fail: false,
+        });
+        let slower = advance.shrink().map(move |advance| Self { advance, fail });
+        Box::new(healed.into_iter().chain(slower))
+    }
+}
+
+/// A shrinkable sequence of pacing steps.
+#[derive(Clone, Debug)]
+struct PacingScript {
+    steps: Vec<PacingStep>,
+}
+
+impl Arbitrary for PacingScript {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            steps: Vec::<PacingStep>::arbitrary(g)
+                .into_iter()
+                .take(16)
+                .collect(),
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(self.steps.shrink().map(|steps| Self { steps }))
+    }
+}
+
+/// A failed refresh paces the next attempt by `REFRESH_BACKOFF`. Every read
+/// inside that window serves the held outcome without touching the store, and
+/// the first read at or past the deadline re-reads the routing table. Proven
+/// over random outage and clock-advance scripts against a model of the window.
+///
+/// The reader refreshes on every operation, so pacing is the only thing that
+/// can suppress a routing read: the model's expected read count is exact.
+///
+/// FALSIFICATION: drop the `paced` term from `StateReader::snapshot`'s gate → a
+/// read inside the window re-reads the routing table → the read-count assert
+/// reds. Leave pacing behind on a completed refresh (give
+/// `SnapshotState::refreshed` a `retry_after`) → a read after a success is
+/// suppressed → red. Fall through to the store instead of `RefreshUnavailable`
+/// when paced with nothing held → a script whose first step fails sees a store
+/// error where the model expects `RefreshUnavailable` → red.
+#[test]
+fn prop_refresh_pacing() {
+    fn property(script: PacingScript) -> Result<bool> {
+        block_on(run_refresh_pacing(script))
+    }
+    QuickCheck::new().quickcheck(property as fn(PacingScript) -> Result<bool>);
+}
+
+async fn run_refresh_pacing(script: PacingScript) -> Result<bool> {
+    let descriptor = value_state::<JsonCodec>("pacing-v");
+    let env = ScriptedEnv::new(descriptor)?;
+    let key = Key::from("user-1");
+    let tp = topic(GROUP_A);
+    env.commit(GROUP_A, tp, &key, 1, |handle| async move {
+        handle.set(element(0)).await.map_err(|e| eyre!("set: {e}"))
+    })
+    .await?;
+    env.publish(GROUP_A, tp).await;
+
+    let (cache, mock) = mock_clock_cache(1 << 20);
+    let reader = env.reader_eager_with_cache(cache)?;
+
+    // Model state: elapsed mock time, when pacing next permits an attempt, and
+    // whether a snapshot has ever been admitted.
+    let mut elapsed = Duration::ZERO;
+    let mut retry_after: Option<Duration> = None;
+    let mut held = false;
+
+    for step in script.steps {
+        let advance = step.advance.duration();
+        mock.increment(advance);
+        elapsed += advance;
+        if step.fail {
+            env.publications.fail_reads_with(ErrorCategory::Transient);
+        } else {
+            env.publications.heal_reads();
+        }
+
+        let paced = retry_after.is_some_and(|deadline| elapsed < deadline);
+        let (expect, expected_reads) = if paced {
+            let served = if held {
+                Expect::Value(0)
+            } else {
+                Expect::RefreshUnavailable
+            };
+            (served, 0)
+        } else if step.fail {
+            retry_after = Some(elapsed + REFRESH_BACKOFF);
+            let served = if held {
+                Expect::Value(0)
+            } else {
+                Expect::ReadError
+            };
+            (served, 1)
+        } else {
+            retry_after = None;
+            held = true;
+            (Expect::Value(0), 1)
+        };
+
+        let reads_before = env.publications.reads();
+        let observed = reader.get(key.clone()).await;
+        let reads = env.publications.reads() - reads_before;
+        if !outcome_matches(&expect, &observed) || reads != expected_reads {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // --- Sticky identity mismatch -----------------------------------------------
@@ -402,12 +596,18 @@ async fn identity_mismatch_sticky() -> Result<()> {
         Err(StateReaderError::IdentityMismatch { .. }) => {}
         other => bail!("op 1 expected IdentityMismatch, got {other:?}"),
     }
+    let reads_after_first = env.publications.reads();
     // Op 2 (within the interval, cached fast path): the mismatch must still
-    // surface, not A's admitted subset.
+    // surface, not A's admitted subset, and without a second routing read.
     match reader.get(key.clone()).await {
         Err(StateReaderError::IdentityMismatch { .. }) => {}
         other => bail!("op 2 (within interval) expected a sticky IdentityMismatch, got {other:?}"),
     }
+    assert_eq!(
+        env.publications.reads(),
+        reads_after_first,
+        "a sticky fault must not re-read the routing table"
+    );
     // Elapse the interval and make every routing read fail.
     mock.increment(Duration::from_mins(2));
     env.publications.fail_reads_with(ErrorCategory::Transient);
@@ -416,5 +616,73 @@ async fn identity_mismatch_sticky() -> Result<()> {
     match reader.get(key).await {
         Err(StateReaderError::IdentityMismatch { .. }) => Ok(()),
         other => bail!("op 3 (failed refresh) expected a sticky IdentityMismatch, got {other:?}"),
+    }
+}
+
+// --- Oversized routing table ------------------------------------------------
+
+/// An oversized routing table is the other Permanent fault a refresh can find,
+/// and it is sticky the same way: every read within the refresh interval
+/// surfaces `TooManySources` without re-reading the table. Past the interval
+/// the reader re-validates, so withdrawing a source clears the fault.
+///
+/// This is the twin of [`identity_mismatch_sticky`]. Both prove one rule: a
+/// Permanent fault is cached like a snapshot, because only an operator can
+/// clear it, while a Transient absence re-reads eagerly.
+///
+/// Falsify: propagate the rejection out of `StateReader::refresh` instead of
+/// publishing it as a fault → op 2 re-reads the routing table → the read-count
+/// assert reds. Publish it with no fault → op 2 falls through to
+/// `UnknownPublication` → the op 2 match reds.
+#[tokio::test]
+async fn oversized_routing_table_is_sticky() -> Result<()> {
+    let descriptor = value_state::<JsonCodec>("v-oversized");
+    let env = ScriptedEnv::new(descriptor)?;
+    let key = Key::from("user-1");
+
+    // One more source than the reader admits, each with a matching frozen
+    // identity, so admission succeeds and the bound is the only rejection.
+    for i in 0..=MAX_PUBLICATION_SOURCES {
+        env.publish(
+            &format!("oversized-g{i}"),
+            topic(&format!("oversized-t{i}")),
+        )
+        .await;
+    }
+
+    let (cache, mock) = mock_clock_cache(1 << 20);
+    let reader = env.reader_with_interval(cache, Duration::from_mins(1))?;
+
+    // Op 1, at t=0: the initial refresh reads the table and rejects it.
+    match reader.get(key.clone()).await {
+        Err(StateReaderError::TooManySources { found, max }) => {
+            assert_eq!(found, MAX_PUBLICATION_SOURCES + 1);
+            assert_eq!(max, MAX_PUBLICATION_SOURCES);
+        }
+        other => bail!("op 1 expected TooManySources, got {other:?}"),
+    }
+    let reads_after_first = env.publications.reads();
+    // Op 2 (within the interval): the same Permanent fault, served from the
+    // cached state.
+    match reader.get(key.clone()).await {
+        Err(StateReaderError::TooManySources { .. }) => {}
+        other => bail!("op 2 (within interval) expected a sticky TooManySources, got {other:?}"),
+    }
+    assert_eq!(
+        env.publications.reads(),
+        reads_after_first,
+        "a sticky fault must not re-read the routing table"
+    );
+
+    // Op 3, past the interval with one source withdrawn: the table is back
+    // within the bound, so the re-validation clears the fault.
+    mock.increment(Duration::from_mins(2));
+    env.publications
+        .remove_group(&env.sub, StateType::Application, &env.name, "oversized-g0")
+        .await
+        .map_err(|e| eyre!("remove_group: {e}"))?;
+    match reader.get(key).await {
+        Ok(None) => Ok(()),
+        other => bail!("op 3 (withdrawn back within the bound) expected Ok(None), got {other:?}"),
     }
 }

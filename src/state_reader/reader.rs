@@ -32,7 +32,7 @@ use crate::state_reader::error::StateReaderError;
 use crate::state_reader::loader::ReaderLoader;
 use crate::state_reader::session::{ReadSession, ReaderCollectionDef};
 use crate::state_reader::source::{
-    MAX_PUBLICATION_SOURCES, Source, SourceId, ValidatedPublications,
+    MAX_PUBLICATION_SOURCES, NoSnapshot, Source, SourceId, ValidatedPublications,
 };
 use crate::state_reader::stores::ReaderStores;
 use crate::subsystem::SubsystemName;
@@ -50,25 +50,97 @@ use tracing::warn;
 /// reader re-reads the routing table at most once per minute per collection.
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_mins(1);
 
-/// The reader's cached view of a collection's publication sources plus the
-/// instant the view was last refreshed.
+/// How long a failed refresh paces the next attempt. Unpaced, every read during
+/// a routing-table outage pays its own store round trip before falling back to
+/// the held snapshot, so a burst of reads waits one timeout each. Well under
+/// [`DEFAULT_REFRESH_INTERVAL`], so a recovered store is picked up promptly.
+pub(super) const REFRESH_BACKOFF: Duration = Duration::from_secs(5);
+
+/// The reader's cached view of a collection's publication sources: what the
+/// last refresh found, when it completed, and the retry pacing a failed one
+/// left behind.
 ///
 /// The snapshot is an `Option`. An **absent** snapshot is stored as `None`,
 /// never as an empty [`ValidatedPublications`]. Absence means no admitted
 /// source, or an emptied routing table. This keeps the non-empty invariant on
 /// the validated snapshot structural.
+///
+/// The default is the never-refreshed state, which is why a fresh reader
+/// refreshes on its first read.
+#[derive(Default)]
 struct SnapshotState {
     snapshot: Option<Arc<ValidatedPublications>>,
-    /// An identity that was present but did not match, observed at the last
-    /// refresh and held until the next refresh re-reads. `IdentityMismatch` is
-    /// a Permanent misconfiguration. It must surface on **every** read within
-    /// the refresh interval, never masked by the valid subset served from the
-    /// cached snapshot. A refresh that re-reads and re-validates clears it
-    /// automatically.
-    mismatch: Option<String>,
-    /// When the last refresh completed. `None` until the first one, which is
-    /// why a fresh reader always refreshes on its first read.
+    /// The Permanent misconfiguration the last refresh found, if any (see
+    /// [`Fault`]).
+    fault: Option<Fault>,
+    /// When the last refresh completed.
     refreshed_at: Option<Instant>,
+    /// When a failed refresh permits the next attempt (see
+    /// [`REFRESH_BACKOFF`]). `None` whenever the last refresh completed.
+    retry_after: Option<Instant>,
+}
+
+impl SnapshotState {
+    /// The state a completed refresh publishes. Publishing the whole state is
+    /// what lifts the pacing an earlier failure left behind.
+    fn refreshed(
+        snapshot: Option<Arc<ValidatedPublications>>,
+        fault: Option<Fault>,
+        at: Instant,
+    ) -> Self {
+        Self {
+            snapshot,
+            fault,
+            refreshed_at: Some(at),
+            retry_after: None,
+        }
+    }
+
+    /// The outcome a read resolves without touching the store, or `None` when
+    /// this state holds nothing to serve.
+    ///
+    /// A fault outranks a held snapshot: a Permanent misconfiguration must
+    /// never be masked by the admitted subset it was found alongside. This
+    /// is the only place that precedence lives.
+    fn cached_outcome(&self) -> Option<Result<Arc<ValidatedPublications>, StateReaderError>> {
+        if let Some(fault) = &self.fault {
+            return Some(Err(fault.error()));
+        }
+        self.snapshot.clone().map(Ok)
+    }
+}
+
+/// A Permanent misconfiguration a refresh found. It is **sticky**: it surfaces
+/// on every read until a refresh re-validates, never masked by an admitted
+/// subset found alongside it. Only an operator changing the deployment or the
+/// routing table can clear one, so re-reading the routing table per read buys
+/// nothing.
+///
+/// A Transient absence is not a fault. An emptied or identity-less routing
+/// table is stored as no snapshot and no fault, which re-reads eagerly so a
+/// later read can re-admit.
+enum Fault {
+    /// A source's frozen identity disagrees with the reader's descriptor,
+    /// carrying the publishing group.
+    IdentityMismatch(Arc<str>),
+    /// The collection advertises more sources than the reader admits, carrying
+    /// the number advertised.
+    TooManySources(usize),
+}
+
+impl Fault {
+    /// The error every read surfaces while this fault stands.
+    fn error(&self) -> StateReaderError {
+        match self {
+            Self::IdentityMismatch(group) => StateReaderError::IdentityMismatch {
+                group: group.clone(),
+            },
+            Self::TooManySources(found) => StateReaderError::TooManySources {
+                found: *found,
+                max: MAX_PUBLICATION_SOURCES,
+            },
+        }
+    }
 }
 
 /// The running result of a refresh's identity validation: the admitted
@@ -77,7 +149,7 @@ struct SnapshotState {
 #[derive(Default)]
 struct Admission {
     admitted: SmallVec<[Source; MAX_PUBLICATION_SOURCES]>,
-    mismatch: Option<String>,
+    mismatch: Option<Arc<str>>,
     any_missing: bool,
 }
 
@@ -166,11 +238,7 @@ where
             cache: deps.cache().clone(),
             clock: deps.cache().clock(),
             refresh_interval,
-            snapshot: Mutex::new(SnapshotState {
-                snapshot: None,
-                mismatch: None,
-                refreshed_at: None,
-            }),
+            snapshot: Mutex::new(SnapshotState::default()),
             #[cfg(test)]
             deps_instance_id: deps.instance_id(),
         })
@@ -181,10 +249,11 @@ where
     ///
     /// Refresh follows a three-outcome rule:
     ///
-    /// * a **failed** routing-table read keeps the previous acquisition
-    ///   outcome. A held snapshot is returned. A known sticky mismatch still
-    ///   outranks that snapshot (see below); otherwise the read error
-    ///   propagates.
+    /// * a **failed** read keeps the previous acquisition outcome and paces the
+    ///   next attempt (see [`Self::failed`]). A held snapshot is returned, and
+    ///   a known sticky mismatch outranks it. With nothing held, the read that
+    ///   attempted gets the store error, and reads inside the pacing window get
+    ///   [`StateReaderError::RefreshUnavailable`].
     /// * a **successful** read applies withdrawals unconditionally: a source no
     ///   longer advertised is dropped without consulting its identity. It
     ///   validates identity only for newly admitted groups, so an
@@ -199,29 +268,30 @@ where
     /// clears it (see [`SnapshotState::mismatch`]). A missing identity skips
     /// that source with a `warn!`.
     ///
-    /// The `snapshot` mutex is held across [`Self::refresh`]'s network I/O on
-    /// purpose: it single-flights the refresh so only one read re-reads the
-    /// routing table while the rest wait and wake to the fresh snapshot. Do not
-    /// "fix" this by dropping the guard across the await — that would let a
-    /// thundering herd of reads all refresh at once.
+    /// One mutex owns both the cached read and the refresh transition, so a
+    /// refresh is one `&mut` read-modify-write over the whole state. The guard
+    /// is held across [`Self::refresh`]'s network I/O on purpose: it
+    /// single-flights the refresh, so one read re-reads the routing table while
+    /// the rest wait and wake to the fresh state. Two changes to resist: do not
+    /// drop the guard across the await, and do not publish the state through a
+    /// lock-free swap so fresh reads skip the guard. A stale read must still
+    /// wait, because a withdrawal or a newly present mismatch takes effect at
+    /// the refresh that finds it.
     async fn snapshot(&self) -> Result<Arc<ValidatedPublications>, StateReaderError> {
         let mut state = self.snapshot.lock().await;
         let now = self.clock.now();
-        if state
+        let fresh = state
             .refreshed_at
-            .is_some_and(|at| now.duration_since(at) < self.refresh_interval)
-        {
-            // A sticky mismatch outranks the cached snapshot: a Permanent
-            // misconfiguration surfaces on every read, never masked by the
-            // admitted subset. An absent snapshot with no mismatch falls
-            // through to re-read (a withdrawn table re-admits eagerly).
-            if let Some(group) = &state.mismatch {
-                return Err(StateReaderError::IdentityMismatch {
-                    group: group.clone(),
-                });
+            .is_some_and(|at| now.duration_since(at) < self.refresh_interval);
+        let paced = state.retry_after.is_some_and(|deadline| now < deadline);
+        if fresh || paced {
+            if let Some(outcome) = state.cached_outcome() {
+                return outcome;
             }
-            if let Some(snapshot) = &state.snapshot {
-                return Ok(snapshot.clone());
+            // Nothing to serve. A paced read must not re-attempt; a merely fresh
+            // one falls through, so an emptied routing table re-admits eagerly.
+            if paced {
+                return Err(self.refresh_unavailable());
             }
         }
         self.refresh(&mut state, now).await
@@ -246,50 +316,76 @@ where
             // outranks that subset. A transient outage is no evidence the
             // mismatch was repaired, so the mismatch stays sticky through the
             // outage.
-            Err(error) => return held_or_error(state.mismatch.as_deref(), prior, error),
+            Err(error) => return self.failed(state, "routing", error),
         };
 
         if rows.is_empty() {
-            state.snapshot = None;
-            state.mismatch = None;
-            state.refreshed_at = Some(now);
+            *state = SnapshotState::refreshed(None, None, now);
             return Err(self.unknown_publication());
         }
 
         let admission = match self.admit(&rows, prior.as_deref()).await {
             Ok(admission) => admission,
             // An identity-read failure mid-admit is a transient outage, on the
-            // same footing as a failed routing read. It is no evidence a known
-            // sticky mismatch was repaired, so it must not mask that mismatch,
-            // nor demote a held snapshot to a bare error.
-            Err(error) => return held_or_error(state.mismatch.as_deref(), prior, error),
+            // same footing as a failed routing read.
+            Err(error) => return self.failed(state, "identity", error),
         };
 
-        // Withdrawals took effect on `admitted` regardless of outcome. Store it
-        // (or its absence) before surfacing a mismatch, so a later refresh sees
-        // the withdrawal. Record the mismatch as sticky (see
-        // [`SnapshotState::mismatch`]).
-        state.snapshot = if admission.admitted.is_empty() {
-            None
-        } else {
-            Some(Arc::new(ValidatedPublications::new(
-                admission.admitted,
-                self.subsystem.as_str(),
-                self.name.as_str(),
-            )?))
+        // Withdrawals took effect on `admitted` regardless of outcome. Publish
+        // it (or its absence) before surfacing a fault, so a later refresh sees
+        // the withdrawal.
+        let mismatch = admission.mismatch.map(Fault::IdentityMismatch);
+        let (snapshot, fault) = match ValidatedPublications::new(admission.admitted) {
+            Ok(sources) => (Some(Arc::new(sources)), mismatch),
+            // No admitted source: a Transient absence, so no fault is recorded
+            // and a later read re-admits eagerly.
+            Err(NoSnapshot::NoSource) => (None, mismatch),
+            // An oversized routing table is Permanent, on the same footing as a
+            // mismatched identity, so it is recorded sticky (see [`Fault`]). A
+            // mismatch found alongside it outranks it; both are Permanent, so
+            // either is a correct answer.
+            Err(NoSnapshot::TooManySources { found }) => {
+                (None, mismatch.or(Some(Fault::TooManySources(found))))
+            }
         };
-        state.mismatch.clone_from(&admission.mismatch);
-        state.refreshed_at = Some(now);
+        *state = SnapshotState::refreshed(snapshot, fault, now);
 
-        if let Some(group) = admission.mismatch {
-            return Err(StateReaderError::IdentityMismatch { group });
+        if let Some(outcome) = state.cached_outcome() {
+            return outcome;
         }
-        match &state.snapshot {
-            Some(snapshot) => Ok(snapshot.clone()),
-            None if admission.any_missing => Err(StateReaderError::IdentityUnavailable {
+        if admission.any_missing {
+            return Err(StateReaderError::IdentityUnavailable {
                 name: self.name.as_str().to_owned(),
-            }),
-            None => Err(self.unknown_publication()),
+            });
+        }
+        Err(self.unknown_publication())
+    }
+
+    /// Applies a failed refresh: pace the next attempt, then serve whatever the
+    /// held state can (see [`SnapshotState::cached_outcome`]). Only a failure
+    /// with nothing held propagates `error`.
+    ///
+    /// The pacing deadline is sampled here, after the failed read returned, so
+    /// a store timeout cannot consume the window. `phase` names which of the
+    /// refresh's two reads failed, the routing table or the identity admission.
+    /// Reads inside the window get no cause of their own, so this is where an
+    /// outage is diagnosed.
+    fn failed(
+        &self,
+        state: &mut SnapshotState,
+        phase: &'static str,
+        error: StateReaderError,
+    ) -> Result<Arc<ValidatedPublications>, StateReaderError> {
+        warn!(
+            collection = %self.name.as_str(),
+            phase,
+            error = %error,
+            "publication refresh failed; pacing the retry"
+        );
+        state.retry_after = self.clock.now().checked_add(REFRESH_BACKOFF);
+        match state.cached_outcome() {
+            Some(outcome) => outcome,
+            None => Err(error),
         }
     }
 
@@ -398,7 +494,7 @@ where
             return true;
         }
         if admission.mismatch.is_none() {
-            admission.mismatch = Some(group.as_ref().to_owned());
+            admission.mismatch = Some(Arc::clone(group));
         }
         false
     }
@@ -408,6 +504,13 @@ where
         StateReaderError::UnknownPublication {
             subsystem: self.subsystem.as_str().to_owned(),
             name: self.name.as_str().to_owned(),
+        }
+    }
+
+    /// The `RefreshUnavailable` error for this reader's collection.
+    fn refresh_unavailable(&self) -> StateReaderError {
+        StateReaderError::RefreshUnavailable {
+            name: Arc::from(&self.name),
         }
     }
 
@@ -444,25 +547,6 @@ fn validate_read_cache(ttl: Option<Duration>) -> Result<(), StateReaderError> {
         });
     }
     Ok(())
-}
-
-/// The held-snapshot fallback shared by the two refresh failure paths: a
-/// failed routing-table read and a failed identity admission. A known sticky
-/// mismatch outranks everything, since a transient outage is no evidence it was
-/// repaired. Otherwise a held snapshot beats a bare error. Only a first-ever
-/// failure with nothing held propagates the error.
-fn held_or_error(
-    mismatch: Option<&str>,
-    prior: Option<Arc<ValidatedPublications>>,
-    error: StateReaderError,
-) -> Result<Arc<ValidatedPublications>, StateReaderError> {
-    match (mismatch, prior) {
-        (Some(group), _) => Err(StateReaderError::IdentityMismatch {
-            group: group.to_owned(),
-        }),
-        (None, Some(snapshot)) => Ok(snapshot),
-        (None, None) => Err(error),
-    }
 }
 
 // --- Value (and Kafka-message-ref) reads -----------------------------------

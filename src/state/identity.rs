@@ -122,6 +122,14 @@ impl AsRef<str> for StateName {
     }
 }
 
+/// Shares the name's backing allocation, so an error or log field that needs an
+/// owned name never copies the bytes.
+impl From<&StateName> for Arc<str> {
+    fn from(name: &StateName) -> Self {
+        Arc::clone(&name.0)
+    }
+}
+
 /// Lets registry maps keyed by [`StateName`] resolve `&str` lookups without
 /// allocating (`CollectionDefRegistry::lookup` passes the descriptor's
 /// `&'static str` straight to `HashMap::get_key_value`). Sound because the

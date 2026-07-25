@@ -3,6 +3,7 @@
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::access::StateAccessError;
 use std::error::Error;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Error raised by [`StateReader`](super::StateReader) construction and its
@@ -14,6 +15,7 @@ use thiserror::Error;
 /// FFI-exposable: owned fields, a C-like classification, no generics or borrows
 /// in return position.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum StateReaderError {
     /// No publication rows exist for the collection yet. Always transient.
     /// Under first-write publication, zero rows cannot distinguish a
@@ -34,7 +36,17 @@ pub enum StateReaderError {
     #[error("descriptor identity mismatch for source group {group}")]
     IdentityMismatch {
         /// The publishing group whose frozen identity disagreed.
-        group: String,
+        group: Arc<str>,
+    },
+
+    /// The last refresh of the collection's publication sources failed, and the
+    /// reader is pacing its retry with no cached outcome to serve. Transient:
+    /// the first read past the pacing window re-reads the routing table. The
+    /// failure that established the pacing is logged with its cause.
+    #[error("publication sources unavailable for {name}, pacing retries after a failed refresh")]
+    RefreshUnavailable {
+        /// The collection name.
+        name: Arc<str>,
     },
 
     /// Publication rows exist but no source has a frozen identity yet.
@@ -113,9 +125,9 @@ impl StateReaderError {
 impl ClassifyError for StateReaderError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::UnknownPublication { .. } | Self::IdentityUnavailable { .. } => {
-                ErrorCategory::Transient
-            }
+            Self::UnknownPublication { .. }
+            | Self::IdentityUnavailable { .. }
+            | Self::RefreshUnavailable { .. } => ErrorCategory::Transient,
             Self::IdentityMismatch { .. }
             | Self::TooManySources { .. }
             | Self::EmptyKey
@@ -182,6 +194,9 @@ mod tests {
                 group: "group-a".into(),
             },
             StateReaderError::IdentityUnavailable {
+                name: "cart".into(),
+            },
+            StateReaderError::RefreshUnavailable {
                 name: "cart".into(),
             },
             StateReaderError::TooManySources { found: 9, max: 4 },

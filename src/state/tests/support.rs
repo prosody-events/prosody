@@ -1298,6 +1298,16 @@ impl ScriptedPublicationStore {
         self.calls.lock().clone()
     }
 
+    /// How many `read_publications` calls reached the store, counting the ones
+    /// a read fault then failed.
+    pub(crate) fn reads(&self) -> usize {
+        self.calls
+            .lock()
+            .iter()
+            .filter(|call| matches!(call, PublicationCall::Read { .. }))
+            .count()
+    }
+
     /// How many `upsert`s targeted `(name, topic)`.
     pub(crate) fn upserts_for(&self, name: &str, topic: &str) -> usize {
         self.calls
