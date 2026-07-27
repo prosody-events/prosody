@@ -15,8 +15,8 @@
 use aho_corasick::{AhoCorasick, BuildError, StartKind};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use rdkafka::ClientContext;
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance};
+use rdkafka::{ClientContext, Statistics};
 use std::array::from_fn;
 use std::collections::hash_map::Entry;
 use std::future::ready;
@@ -27,6 +27,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
+use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{
     ConsumerConfiguration, ConsumerError, EventHandler, HandlerProvider, Managers, WatermarkVersion,
@@ -40,14 +41,16 @@ use crate::timers::duration::{CompactDuration, CompactDurationError};
 use crate::timers::store::TriggerStoreProvider;
 use crate::{EventIdentity, EventType, Partition, Topic};
 
-/// The shared partition-manager map paired with the channel that republishes
-/// its size after each rebalance, so assignment readiness can be awaited rather
-/// than polled.
-pub(super) struct ManagerRegistry<PL> {
+/// The shared handles a [`Context`] keeps beside its partition-manager factory.
+pub(super) struct ContextHandles<PL> {
     /// Thread-safe storage for partition managers.
     pub(super) managers: Arc<Managers<PL>>,
-    /// Publishes the assigned-partition count after each rebalance.
+    /// Publishes the assigned-partition count after each rebalance, so
+    /// assignment readiness can be awaited rather than polled.
     pub(super) assignment_tx: watch::Sender<u32>,
+    /// The one consumer observation this client updates from its statistics
+    /// callback. Readers elsewhere hold clones of the same handle.
+    pub(super) observer: KafkaObserver,
 }
 
 /// The per-partition factories the context threads into each
@@ -106,6 +109,9 @@ pub(super) struct Context<F, PL> {
     assignment_tx: watch::Sender<u32>,
 
     telemetry: TelemetrySender,
+
+    /// Receives librdkafka's statistics and holds the shared observation.
+    observer: KafkaObserver,
 }
 
 /// Creates a new consumer context with the given configuration.
@@ -114,7 +120,11 @@ pub(super) struct Context<F, PL> {
 /// configuration and captures the handler provider and per-partition factories
 /// into a partition-manager factory closure. This discharges the provider
 /// trait bounds in one place; the returned [`Context`] carries only the
-/// payload-erased factory.
+/// payload-erased factory and the shared handles.
+///
+/// The context must exist before its `BaseConsumer`, so `shared.observer`
+/// arrives here empty. The caller seeds it through that consumer once it is
+/// subscribed.
 ///
 /// # Errors
 ///
@@ -126,7 +136,7 @@ pub(super) fn new_context<T, P, SP, PL>(
     handler_provider: T,
     providers: PartitionProviders<P, SP>,
     watermark_version: Arc<WatermarkVersion>,
-    registry: ManagerRegistry<PL>,
+    shared: ContextHandles<PL>,
     telemetry: TelemetrySender,
     version: Arc<str>,
 ) -> Result<Context<impl MakeManager<PL>, PL>, ContextError>
@@ -184,9 +194,10 @@ where
 
     Ok(Context {
         make_manager,
-        managers: registry.managers,
-        assignment_tx: registry.assignment_tx,
+        managers: shared.managers,
+        assignment_tx: shared.assignment_tx,
         telemetry,
+        observer: shared.observer,
     })
 }
 
@@ -195,6 +206,13 @@ where
     F: MakeManager<PL>,
     PL: Send + Sync + 'static,
 {
+    /// Receives librdkafka's periodic statistics on the poll thread. Short and
+    /// synchronous: record the gauges from the borrowed tree, then atomically
+    /// replace the whole observation. Never blocks, spawns, logs the full tree,
+    /// or calls a Kafka API.
+    fn stats(&self, statistics: Statistics) {
+        self.observer.observe_statistics(statistics);
+    }
 }
 
 impl<F, PL> ConsumerContext for Context<F, PL>

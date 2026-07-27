@@ -4,7 +4,8 @@
 use crate::consumer::config::ConsumerConfiguration;
 use crate::consumer::error::ConsumerError;
 use crate::consumer::handler::{EventHandler, HandlerProvider};
-use crate::consumer::kafka_context::{ManagerRegistry, PartitionProviders, new_context};
+use crate::consumer::kafka_context::{ContextHandles, PartitionProviders, new_context};
+use crate::consumer::observer::{KafkaObserver, STATISTICS_INTERVAL};
 use crate::consumer::poll::{PollConfig, poll};
 use crate::consumer::probes::ProbeServer;
 use crate::consumer::{Managers, ProsodyConsumer, RuntimeState, WatermarkVersion};
@@ -26,21 +27,41 @@ use tokio::task::spawn_blocking;
 use validator::Validate;
 use whoami::hostname;
 
+/// Everything startup needs beyond the consumer configuration and the two
+/// per-partition providers. Every mode fills this in once, so the observer it
+/// names is the same instance its readers hold.
+pub(in crate::consumer) struct StartupServices<'a> {
+    /// Idempotence version stamped into the partition configuration.
+    pub(in crate::consumer) version: Arc<str>,
+    /// Telemetry the partitions and middleware publish through.
+    pub(in crate::consumer) telemetry: &'a Telemetry,
+    /// Stall-detection registry, shared with the probe server.
+    pub(in crate::consumer) heartbeats: HeartbeatRegistry,
+    /// The consumer's one Kafka observation handle. The primary consumer's
+    /// context holds a clone and updates it from the statistics callback.
+    pub(in crate::consumer) observer: KafkaObserver,
+}
+
 /// Initializes a Prosody consumer with a trigger store provider, wiring the
 /// partition machinery to a Kafka consumer and starting its background poll
 /// loop. The provider creates per-partition stores with independent caches.
+///
+/// The primary consumer is the sole source of Kafka observations: it carries
+/// the statistics interval, and its startup metadata is fetched here, after
+/// subscribe and before the poll loop starts. That fetch blocks the calling
+/// task, bounded by the observer's startup timeout.
+///
 /// Fails if the configuration is invalid, the consumer context can't be
 /// created, the hostname can't be retrieved for the client ID, the Kafka
 /// consumer can't be created with the provided configuration, topic
-/// subscription fails, or the probe server can't be started (if enabled).
+/// subscription fails, the startup metadata fetch fails, or the probe server
+/// can't be started (if enabled).
 pub(in crate::consumer) fn initialize_consumer<T, P, SP, C>(
     consumer_config: &ConsumerConfiguration,
-    version: Arc<str>,
     handler_provider: T,
     trigger_provider: P,
     state_provider: SP,
-    telemetry: &Telemetry,
-    heartbeats: HeartbeatRegistry,
+    services: StartupServices<'_>,
 ) -> Result<ProsodyConsumer<C>, ConsumerError>
 where
     T: HandlerProvider,
@@ -53,6 +74,13 @@ where
     C::Payload: EventType + Clone + EventIdentity,
 {
     consumer_config.validate()?;
+
+    let StartupServices {
+        version,
+        telemetry,
+        heartbeats,
+        observer,
+    } = services;
 
     let watermark_version: Arc<WatermarkVersion> = Arc::default();
     let managers: Arc<Managers<C::Payload>> = Arc::default();
@@ -68,9 +96,10 @@ where
             state: state_provider,
         },
         watermark_version.clone(),
-        ManagerRegistry {
+        ContextHandles {
             managers: managers.clone(),
             assignment_tx,
+            observer: observer.clone(),
         },
         telemetry.sender(),
         version,
@@ -92,6 +121,10 @@ where
             "auto.commit.interval.ms",
             consumer_config.commit_interval.as_millis().to_string(),
         )
+        .set(
+            "statistics.interval.ms",
+            STATISTICS_INTERVAL.as_millis().to_string(),
+        )
         .set("enable.auto.offset.store", "false")
         .set("auto.offset.reset", "earliest")
         .set("partition.assignment.strategy", "cooperative-sticky")
@@ -106,6 +139,11 @@ where
         .collect();
 
     consumer.subscribe(&topics)?;
+
+    // Seed the observer through the primary consumer before the poll loop
+    // starts, so a running consumer always has an observation before it can
+    // dispatch a handler.
+    observer.install_startup_metadata(&consumer)?;
 
     let poll_interval = consumer_config.poll_interval;
     let heartbeat = heartbeats.register("Kafka poll loop");
@@ -140,6 +178,7 @@ where
     let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
         poll_handle,
         probe_server,
+        observer,
     })));
 
     Ok(ProsodyConsumer {

@@ -8,7 +8,7 @@ use crate::consumer::error::ConsumerError;
 use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::storage::StorePair;
-use crate::consumer::wiring::runtime::initialize_consumer;
+use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::state::{
     cassandra_arm_inputs, cassandra_state_provider, memory_arm_inputs, memory_state_provider,
 };
@@ -27,8 +27,17 @@ where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
     T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
 {
-    let (stores, keyed_state, heartbeats, shared) = build_shared_state(&setup).await?;
+    let (stores, keyed_state, heartbeats, shared, observer) = build_shared_state(&setup).await?;
     let version = keyed_state.version.clone();
+
+    // One `StartupServices` for the whole construction: whichever storage arm
+    // runs moves the same observer into the primary consumer.
+    let services = StartupServices {
+        version,
+        telemetry: &telemetry,
+        heartbeats,
+        observer,
+    };
 
     // dedup lives inside the common block; `log` layers OUTSIDE it and forwards
     // the failure verbatim. Nothing retries it, so the `settle` boundary
@@ -67,12 +76,10 @@ where
             .into_provider(handler);
             initialize_consumer::<_, _, _, C>(
                 setup.consumer,
-                version,
                 provider,
                 trigger_provider,
                 state_provider,
-                &telemetry,
-                heartbeats,
+                services,
             )
         }
         StorePair::Cassandra {
@@ -84,7 +91,7 @@ where
             ..
         } => {
             let (loader, partition_counts) =
-                cassandra_arm_inputs(setup.deps.as_ref(), setup.consumer, &heartbeats)?;
+                cassandra_arm_inputs(setup.deps.as_ref(), setup.consumer, &services.heartbeats)?;
             let publisher_template = keyed_state
                 .publication_setup(
                     PublicationBackend::Cassandra(publication_store),
@@ -109,12 +116,10 @@ where
             .into_provider(handler);
             initialize_consumer::<_, _, _, C>(
                 setup.consumer,
-                version,
                 provider,
                 trigger_provider,
                 state_provider,
-                &telemetry,
-                heartbeats,
+                services,
             )
         }
     }

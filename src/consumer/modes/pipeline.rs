@@ -15,8 +15,9 @@ use crate::consumer::middleware::defer::{
 use crate::consumer::middleware::monopolization::MonopolizationMiddleware;
 use crate::consumer::middleware::retry::RetryMiddleware;
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
+use crate::consumer::observer::KafkaObserver;
 use crate::consumer::storage::{SharedStorage, StorePair};
-use crate::consumer::wiring::runtime::initialize_consumer;
+use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::state::{
     KeyedStateInputs, cassandra_arm_inputs, cassandra_state_provider, memory_arm_inputs,
     memory_state_provider,
@@ -45,6 +46,9 @@ struct PipelineMiddlewareStack {
     retry_middleware: RetryMiddleware,
     heartbeats: HeartbeatRegistry,
     telemetry: Telemetry,
+    /// The one consumer observation handle, passed to the primary consumer
+    /// context whichever storage arm builds it.
+    observer: KafkaObserver,
 }
 
 impl PipelineMiddlewareStack {
@@ -106,12 +110,15 @@ impl PipelineMiddlewareStack {
 
         initialize_consumer::<_, _, _, C>(
             &self.consumer_config,
-            version,
             provider,
             trigger_provider,
             state_provider,
-            &self.telemetry,
-            self.heartbeats,
+            StartupServices {
+                version,
+                telemetry: &self.telemetry,
+                heartbeats: self.heartbeats,
+                observer: self.observer,
+            },
         )
     }
 }
@@ -136,7 +143,7 @@ async fn prepare_pipeline_stack<C: Codec>(
         monopolization: monopolization_config,
         defer: defer_config,
     } = pipeline_config;
-    let (stores, keyed_state, heartbeats, shared) = build_shared_state(setup).await?;
+    let (stores, keyed_state, heartbeats, shared, observer) = build_shared_state(setup).await?;
     let monopolization_middleware =
         MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
     let failure_tracker = FailureTracker::new(
@@ -155,6 +162,7 @@ async fn prepare_pipeline_stack<C: Codec>(
         retry_middleware: RetryMiddleware::new(retry_config)?,
         heartbeats,
         telemetry,
+        observer,
     };
 
     Ok((stores, keyed_state, stack, shared))

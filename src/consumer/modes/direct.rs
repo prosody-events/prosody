@@ -9,8 +9,9 @@ use crate::consumer::handler::{EventHandler, HandlerProvider};
 use crate::consumer::middleware::deduplication::{
     DEFAULT_IDEMPOTENCE_VERSION, MemoryDeduplicationStoreProvider,
 };
+use crate::consumer::observer::KafkaObserver;
 use crate::consumer::storage::StorePair;
-use crate::consumer::wiring::runtime::initialize_consumer;
+use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::state::{KeyedStateInputs, memory_state_provider};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
@@ -72,6 +73,15 @@ where
         DEFAULT_IDEMPOTENCE_VERSION,
     )?;
 
+    // One `StartupServices` for the whole construction: whichever storage arm
+    // runs moves the same observer into the primary consumer.
+    let services = StartupServices {
+        version: keyed_state.version.clone(),
+        telemetry: &telemetry,
+        heartbeats,
+        observer: KafkaObserver::new(&consumer_config.group_id),
+    };
+
     match stores {
         StorePair::Memory {
             trigger_provider,
@@ -90,12 +100,10 @@ where
             );
             initialize_consumer::<_, _, _, C>(
                 consumer_config,
-                keyed_state.version.clone(),
                 handler_provider,
                 trigger_provider,
                 state_provider,
-                &telemetry,
-                heartbeats,
+                services,
             )
         }
         StorePair::Cassandra {
@@ -121,12 +129,10 @@ where
             );
             initialize_consumer::<_, _, _, C>(
                 consumer_config,
-                keyed_state.version.clone(),
                 handler_provider,
                 trigger_provider,
                 state_provider,
-                &telemetry,
-                heartbeats,
+                services,
             )
         }
     }

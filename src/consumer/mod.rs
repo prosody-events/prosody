@@ -128,6 +128,7 @@ pub use crate::consumer::kafka_state::{
 };
 pub use crate::consumer::message::ConsumerMessage;
 pub use crate::consumer::middleware::{FallibleHandler, RepinProof};
+use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::probes::ProbeServer;
 use crate::heartbeat::HeartbeatRegistry;
@@ -159,6 +160,7 @@ pub mod kafka_state;
 pub mod message;
 pub mod middleware;
 mod modes;
+pub(crate) mod observer;
 pub(crate) mod partition;
 mod poll;
 mod probes;
@@ -185,6 +187,9 @@ type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManager<P>>>;
 struct RuntimeState {
     poll_handle: JoinHandle<()>,
     probe_server: Option<ProbeServer>,
+    /// The consumer's Kafka observation. Zeroed on shutdown so a stopped
+    /// consumer stops reporting fetch-queue gauges.
+    observer: KafkaObserver,
 }
 
 /// High-level Kafka consumer implementation.
@@ -285,6 +290,7 @@ impl<C: Codec> ProsodyConsumer<C> {
         let Some(RuntimeState {
             poll_handle,
             probe_server,
+            observer,
         }) = self.runtime_state.lock().take()
         else {
             return;
@@ -293,6 +299,10 @@ impl<C: Codec> ProsodyConsumer<C> {
         if let Err(error) = poll_handle.await {
             error!("consumer shutdown failed: {error:#}");
         }
+
+        // The poll thread has exited, so no statistics callback can record over
+        // this.
+        observer.shutdown();
 
         if let Some(probe_server) = probe_server {
             probe_server.shutdown().await;

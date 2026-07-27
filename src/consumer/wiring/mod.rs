@@ -18,6 +18,7 @@ use crate::consumer::middleware::scheduler::SchedulerMiddleware;
 use crate::consumer::middleware::telemetry::TelemetryMiddleware;
 use crate::consumer::middleware::timeout::TimeoutMiddleware;
 use crate::consumer::middleware::{ComposedMiddleware, HandlerMiddleware};
+use crate::consumer::observer::KafkaObserver;
 use crate::consumer::storage::{SharedStorage, StorePair};
 use crate::consumer::wiring::state::KeyedStateInputs;
 use crate::heartbeat::HeartbeatRegistry;
@@ -49,9 +50,24 @@ pub(in crate::consumer) type CommonMiddleware<DP, P> = ComposedMiddleware<
     P,
 >;
 
-/// Builds the storage core shared by every constructor: the trigger and defer
-/// store pair, keyed-state inputs, the heartbeat registry, and any storage
-/// reused from a [`SharedDeps`] bundle.
+/// What [`build_shared_state`] returns: the store pair, keyed-state inputs, the
+/// heartbeat registry, any storage reused from a bundle, and the consumer's one
+/// Kafka observation handle.
+pub(in crate::consumer) type SharedState = (
+    StorePair,
+    KeyedStateInputs,
+    HeartbeatRegistry,
+    Option<SharedStorage>,
+    KafkaObserver,
+);
+
+/// Builds the core shared by every constructor: the trigger and defer store
+/// pair, keyed-state inputs, the heartbeat registry, any storage reused from a
+/// [`SharedDeps`] bundle, and the consumer's Kafka observation handle.
+///
+/// The observer is created here, before any storage `match`, so every arm of
+/// every mode threads the same instance to its primary consumer. A second
+/// observer would silently split the observation stream.
 ///
 /// Validates the consumer and keyed-state configuration up front, before
 /// [`StorePair::new`]'s Cassandra IO, so all callers fail fast uniformly. The
@@ -60,15 +76,7 @@ pub(in crate::consumer) type CommonMiddleware<DP, P> = ComposedMiddleware<
 /// invariant chokepoint; this early validation is the fail-fast guard.
 pub(in crate::consumer) async fn build_shared_state<C: Codec>(
     setup: &ConsumerSetup<'_, C>,
-) -> Result<
-    (
-        StorePair,
-        KeyedStateInputs,
-        HeartbeatRegistry,
-        Option<SharedStorage>,
-    ),
-    ConsumerError,
-> {
+) -> Result<SharedState, ConsumerError> {
     let ConsumerSetup {
         consumer: consumer_config,
         trigger_store: trigger_store_config,
@@ -119,7 +127,8 @@ pub(in crate::consumer) async fn build_shared_state<C: Codec>(
     .await?;
     let keyed_state =
         KeyedStateInputs::new(keyed_state_config, consumer_config, &dedup_config.version)?;
-    Ok((stores, keyed_state, heartbeats, shared))
+    let observer = KafkaObserver::new(&consumer_config.group_id);
+    Ok((stores, keyed_state, heartbeats, shared, observer))
 }
 
 /// Builds the common middleware shared by every mode — the single place any
