@@ -1,20 +1,18 @@
 //! The client-local gauges an observation reports: fetch-queue depth and size
 //! per assigned partition, and the age of the client's topic metadata.
 //!
-//! Assignment and lag are deliberately absent. The deployed Kafka exporter
-//! already reports both, so a second series would compete with it for no gain.
+//! Assignment and lag are left to broker-side exporters, which already report
+//! them. A second series would compete with theirs for no gain.
 //!
 //! These are ordinary synchronous gauges, so a series keeps its last recorded
-//! value until something records over it. That is why a revoked partition is
-//! explicitly zeroed: observable callbacks would avoid the bookkeeping, but
-//! they would also pull the observation out of the statistics callback and make
-//! the observer an active poller instead of a passive holder.
+//! value until something records over it. A revoked partition is therefore
+//! zeroed explicitly.
 //!
-//! Attribute values are owned by the `OTel` API, so building them clones a few
-//! strings once per statistics report. That periodic cost is deliberate; there
-//! is no attribute cache keyed by topic or partition.
+//! Attribute values are owned by the `OTel` API, so the identity strings are
+//! cloned once per partition per statistics report. There is no attribute cache
+//! keyed by topic or partition.
 
-use crate::consumer::observer::{KafkaSnapshotGuard, assigned_partitions, is_assigned};
+use super::{assigned_partitions, is_assigned};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Gauge, Meter};
 use rdkafka::Statistics;
@@ -66,9 +64,9 @@ impl KafkaMetrics {
     /// Retired series are addressed with `incoming`'s identity attributes:
     /// librdkafka's handle name and the configured `client.id` are fixed for a
     /// client's lifetime, so they name the same series either way.
-    pub(super) fn record(&self, previous: Option<&KafkaSnapshotGuard>, incoming: &Statistics) {
+    pub(super) fn record(&self, previous: Option<&Statistics>, incoming: &Statistics) {
         if let Some(previous) = previous {
-            for (topic, id, _) in previous.assigned_partitions() {
+            for (topic, id, _) in assigned_partitions(previous) {
                 if retained(incoming, topic, id) {
                     continue;
                 }
@@ -78,8 +76,8 @@ impl KafkaMetrics {
 
         for (topic, id, partition) in assigned_partitions(incoming) {
             let attributes = self.partition_attributes(incoming, topic, id);
-            // librdkafka reports -1 for counters it has not populated yet; the
-            // honest reading of "no messages queued" is zero.
+            // rdkafka declares the queue length as `i64` and the gauge is
+            // `u64`; librdkafka only ever emits a non-negative length.
             self.fetch_queue_messages.record(
                 u64::try_from(partition.fetchq_cnt).unwrap_or(0),
                 &attributes,
@@ -95,17 +93,12 @@ impl KafkaMetrics {
     }
 
     /// Zeroes every series of `last`'s assignment, so a stopped consumer stops
-    /// reporting. A startup-metadata generation exported nothing, so this is
-    /// then a no-op.
-    pub(super) fn zero_assigned(&self, last: &KafkaSnapshotGuard) {
-        let Some(statistics) = last.statistics() else {
-            return;
-        };
-        for (topic, id, _) in last.assigned_partitions() {
-            self.zero_partition(statistics, topic, id);
+    /// reporting.
+    pub(super) fn zero_assigned(&self, last: &Statistics) {
+        for (topic, id, _) in assigned_partitions(last) {
+            self.zero_partition(last, topic, id);
         }
-        self.metadata_age
-            .record(0, &self.base_attributes(statistics));
+        self.metadata_age.record(0, &self.base_attributes(last));
     }
 
     /// Records zero on both per-partition gauges for one `(topic, id)` series.
@@ -120,10 +113,7 @@ impl KafkaMetrics {
         [
             KeyValue::new("messaging.system", "kafka"),
             KeyValue::new("messaging.client.id", statistics.client_id.clone()),
-            KeyValue::new(
-                "messaging.consumer.group.name",
-                self.group.as_ref().to_owned(),
-            ),
+            KeyValue::new("messaging.consumer.group.name", self.group.clone()),
             KeyValue::new("prosody.kafka.consumer.name", statistics.name.clone()),
         ]
     }
@@ -155,9 +145,8 @@ fn retained(incoming: &Statistics, topic: &str, id: i32) -> bool {
 /// The oldest metadata age among topics with at least one assigned partition,
 /// or zero when this instance holds no assignment.
 ///
-/// librdkafka reports -1 for a topic it has never refreshed. Such a topic is
-/// skipped rather than reported as freshly refreshed; a topic with an assigned
-/// partition always has metadata, so the case is defensive.
+/// librdkafka reports zero for a topic it has never refreshed, which is
+/// indistinguishable from a topic refreshed just now.
 fn oldest_metadata_age(statistics: &Statistics) -> u64 {
     statistics
         .topics
@@ -168,7 +157,7 @@ fn oldest_metadata_age(statistics: &Statistics) -> u64 {
                 .iter()
                 .any(|(&id, partition)| is_assigned(id, partition))
         })
-        .filter_map(|topic| u64::try_from(topic.metadata_age).ok())
+        .map(|topic| u64::try_from(topic.metadata_age).unwrap_or(0))
         .max()
         .unwrap_or(0)
 }

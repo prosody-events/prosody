@@ -33,10 +33,7 @@ use crate::timers::store::TriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType};
 use std::sync::Arc;
 
-/// Shared middleware components for pipeline consumer construction.
-///
-/// Groups the middleware and configuration that are common to both memory
-/// and Cassandra storage backends, reducing parameter counts.
+/// Everything both storage arms need to finish a pipeline consumer.
 struct PipelineMiddlewareStack {
     consumer_config: ConsumerConfiguration,
     defer_config: DeferConfiguration,
@@ -46,13 +43,12 @@ struct PipelineMiddlewareStack {
     retry_middleware: RetryMiddleware,
     heartbeats: HeartbeatRegistry,
     telemetry: Telemetry,
-    /// The one consumer observation handle, passed to the primary consumer
-    /// context whichever storage arm builds it.
+    /// The consumer's one Kafka observation handle.
     observer: KafkaObserver,
 }
 
 impl PipelineMiddlewareStack {
-    fn into_consumer<T, MP, TP, DP, PP, SP, L, C>(
+    async fn into_consumer<T, MP, TP, DP, PP, SP, L, C>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
@@ -120,6 +116,7 @@ impl PipelineMiddlewareStack {
                 observer: self.observer,
             },
         )
+        .await
     }
 }
 
@@ -194,11 +191,9 @@ where
             // Memory/mock arm inputs come from the bundle when supplied, else fresh.
             let (loader, cells, identities, partition_counts) =
                 memory_arm_inputs(deps.as_ref(), shared)?;
+            let backend = PublicationBackend::Memory(publication_store);
             let publisher_template = keyed_state
-                .publication_setup(
-                    PublicationBackend::Memory(publication_store),
-                    partition_counts,
-                )
+                .publication_setup(backend, partition_counts)
                 .await?;
             let state_provider = memory_state_provider::<C>(
                 &keyed_state,
@@ -217,14 +212,16 @@ where
                 &stack.common_config.dedup.version,
                 &stack.telemetry,
             )?;
-            stack.into_consumer::<_, _, _, _, _, _, _, C>(
-                message_defer_middleware,
-                timer_provider,
-                dedup_provider,
-                trigger_provider,
-                state_provider,
-                handler,
-            )
+            stack
+                .into_consumer::<_, _, _, _, _, _, _, C>(
+                    message_defer_middleware,
+                    timer_provider,
+                    dedup_provider,
+                    trigger_provider,
+                    state_provider,
+                    handler,
+                )
+                .await
         }
         StorePair::Cassandra {
             trigger_provider,
@@ -240,11 +237,9 @@ where
             // `cassandra_arm_inputs`.
             let (loader, partition_counts) =
                 cassandra_arm_inputs(deps.as_ref(), &stack.consumer_config, &stack.heartbeats)?;
+            let backend = PublicationBackend::Cassandra(publication_store);
             let publisher_template = keyed_state
-                .publication_setup(
-                    PublicationBackend::Cassandra(publication_store),
-                    partition_counts,
-                )
+                .publication_setup(backend, partition_counts)
                 .await?;
             let state_provider = cassandra_state_provider::<C>(
                 &keyed_state,
@@ -263,14 +258,16 @@ where
                 &stack.common_config.dedup.version,
                 &stack.telemetry,
             )?;
-            stack.into_consumer::<_, _, _, _, _, _, _, C>(
-                message_defer_middleware,
-                timer_provider,
-                dedup_provider,
-                trigger_provider,
-                state_provider,
-                handler,
-            )
+            stack
+                .into_consumer::<_, _, _, _, _, _, _, C>(
+                    message_defer_middleware,
+                    timer_provider,
+                    dedup_provider,
+                    trigger_provider,
+                    state_provider,
+                    handler,
+                )
+                .await
         }
     }
 }

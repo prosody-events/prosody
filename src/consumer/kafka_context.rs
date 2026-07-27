@@ -8,9 +8,11 @@
 //! - Creation and lifecycle management of `PartitionManager` instances
 //! - Concurrent shutdown of revoked partitions with proper cleanup
 //! - Coordination of partition handlers during consumer group rebalances
+//! - librdkafka's periodic statistics callback
 //!
 //! The core component is the `Context` struct which implements Kafka's
-//! rebalance callbacks to manage partition lifecycle events.
+//! rebalance callbacks to manage partition lifecycle events, and holds the
+//! observation handle the statistics callback updates.
 
 use aho_corasick::{AhoCorasick, BuildError, StartKind};
 use futures::StreamExt;
@@ -30,7 +32,8 @@ use tracing::{debug, error, info, warn};
 use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{
-    ConsumerConfiguration, ConsumerError, EventHandler, HandlerProvider, Managers, WatermarkVersion,
+    ConsumerConfiguration, ConsumerError, EventHandler, HandlerProvider, Managers,
+    WatermarkVersion, get_assigned_partition_count,
 };
 use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
@@ -48,6 +51,8 @@ pub(super) struct ContextHandles<PL> {
     /// Publishes the assigned-partition count after each rebalance, so
     /// assignment readiness can be awaited rather than polled.
     pub(super) assignment_tx: watch::Sender<u32>,
+    /// Telemetry the context and the partitions it creates publish through.
+    pub(super) telemetry: TelemetrySender,
     /// The one consumer observation this client updates from its statistics
     /// callback. Readers elsewhere hold clones of the same handle.
     pub(super) observer: KafkaObserver,
@@ -108,6 +113,7 @@ pub(super) struct Context<F, PL> {
     /// can be awaited rather than polled.
     assignment_tx: watch::Sender<u32>,
 
+    /// Publishes the rebalance events this context observes.
     telemetry: TelemetrySender,
 
     /// Receives librdkafka's statistics and holds the shared observation.
@@ -122,10 +128,6 @@ pub(super) struct Context<F, PL> {
 /// trait bounds in one place; the returned [`Context`] carries only the
 /// payload-erased factory and the shared handles.
 ///
-/// The context must exist before its `BaseConsumer`, so `shared.observer`
-/// arrives here empty. The caller seeds it through that consumer once it is
-/// subscribed.
-///
 /// # Errors
 ///
 /// [`ContextError`] when the configured `allowed_events` prefixes cannot be
@@ -137,7 +139,6 @@ pub(super) fn new_context<T, P, SP, PL>(
     providers: PartitionProviders<P, SP>,
     watermark_version: Arc<WatermarkVersion>,
     shared: ContextHandles<PL>,
-    telemetry: TelemetrySender,
     version: Arc<str>,
 ) -> Result<Context<impl MakeManager<PL>, PL>, ContextError>
 where
@@ -182,7 +183,7 @@ where
         state_provider: providers.state,
         timer_slab_size,
         timer_semaphores,
-        telemetry_sender: telemetry.clone(),
+        telemetry_sender: shared.telemetry.clone(),
         timer_spans: config.timer_spans,
         _payload: PhantomData,
     };
@@ -196,7 +197,7 @@ where
         make_manager,
         managers: shared.managers,
         assignment_tx: shared.assignment_tx,
-        telemetry,
+        telemetry: shared.telemetry,
         observer: shared.observer,
     })
 }
@@ -206,10 +207,13 @@ where
     F: MakeManager<PL>,
     PL: Send + Sync + 'static,
 {
-    /// Receives librdkafka's periodic statistics on the poll thread. Short and
-    /// synchronous: record the gauges from the borrowed tree, then atomically
-    /// replace the whole observation. Never blocks, spawns, logs the full tree,
-    /// or calls a Kafka API.
+    /// Receives librdkafka's periodic statistics on the poll thread, so the
+    /// body must never block, spawn, or call a Kafka API. See
+    /// [`KafkaObserver::observe_statistics`] for the record-then-replace
+    /// sequence it delegates to.
+    ///
+    /// Do not delete this override: rdkafka's default `stats` logs the entire
+    /// statistics tree at `info` and the observation stream stops.
     fn stats(&self, statistics: Statistics) {
         self.observer.observe_statistics(statistics);
     }
@@ -303,7 +307,7 @@ where
         // than polled. Assign, revoke, and rebalance-error all fall through
         // here; empty rebalances returned early and left the count unchanged.
         self.assignment_tx
-            .send_replace(self.managers.read().len() as u32);
+            .send_replace(get_assigned_partition_count(&self.managers));
 
         debug!("pre-rebalance complete");
     }

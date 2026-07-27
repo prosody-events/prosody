@@ -22,6 +22,8 @@
 //! - `PartitionManager`: Manages message processing for a single Kafka
 //!   partition
 //! - `EventHandler`: User-implemented trait for message processing logic
+//! - `KafkaObserver`: What the primary Kafka client knows about itself, shared
+//!   with the consumer context
 //! - Failure strategies: Composable error handling mechanisms
 //!
 //! # Usage
@@ -160,6 +162,8 @@ pub mod kafka_state;
 pub mod message;
 pub mod middleware;
 mod modes;
+// Crate-wide, not `pub(in crate::consumer)`: keyed-state publication reads the
+// observed partition count from outside this module.
 pub(crate) mod observer;
 pub(crate) mod partition;
 mod poll;
@@ -187,8 +191,8 @@ type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManager<P>>>;
 struct RuntimeState {
     poll_handle: JoinHandle<()>,
     probe_server: Option<ProbeServer>,
-    /// The consumer's Kafka observation. Zeroed on shutdown so a stopped
-    /// consumer stops reporting fetch-queue gauges.
+    /// The consumer's Kafka observation handle. Shutdown retires its gauge
+    /// series so a stopped consumer stops contributing to `sum` aggregations.
     observer: KafkaObserver,
 }
 
@@ -300,9 +304,10 @@ impl<C: Codec> ProsodyConsumer<C> {
             error!("consumer shutdown failed: {error:#}");
         }
 
-        // The poll thread has exited, so no statistics callback can record over
-        // this.
-        observer.shutdown();
+        // The `BaseConsumer` is dropped inside the poll task, so its close-time
+        // polling — which can deliver one last statistics sample — finished
+        // before the join handle resolved. Nothing can record over this.
+        observer.retire_gauges();
 
         if let Some(probe_server) = probe_server {
             probe_server.shutdown().await;
@@ -323,7 +328,7 @@ impl<C: Codec> Drop for ProsodyConsumer<C> {
 pub(crate) fn get_assigned_partition_count<P: Send + Sync + 'static>(
     managers: &Managers<P>,
 ) -> u32 {
-    managers.read().len() as u32
+    u32::try_from(managers.read().len()).unwrap_or(u32::MAX)
 }
 
 /// Checks if any partition is stalled.

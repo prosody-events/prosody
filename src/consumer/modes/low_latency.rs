@@ -36,17 +36,14 @@ where
     T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
 {
     let (stores, keyed_state, heartbeats, shared, observer) = build_shared_state(&setup).await?;
-    let version = keyed_state.version.clone();
     let retry_middleware = RetryMiddleware::new(low_latency_config.retry)?;
     let topic_middleware = FailureTopicMiddleware::new(
         low_latency_config.failure_topic,
         setup.consumer.group_id.clone(),
         producer,
     )?;
-    // One `StartupServices` for the whole construction: whichever storage arm
-    // runs moves the same observer into the primary consumer.
     let services = StartupServices {
-        version,
+        version: keyed_state.version.clone(),
         telemetry: &telemetry,
         heartbeats,
         observer,
@@ -61,11 +58,9 @@ where
         } => {
             let (loader, cells, identities, partition_counts) =
                 memory_arm_inputs(setup.deps.as_ref(), shared)?;
+            let backend = PublicationBackend::Memory(publication_store);
             let publisher_template = keyed_state
-                .publication_setup(
-                    PublicationBackend::Memory(publication_store),
-                    partition_counts,
-                )
+                .publication_setup(backend, partition_counts)
                 .await?;
             let state_provider = memory_state_provider::<C>(
                 &keyed_state,
@@ -92,6 +87,7 @@ where
                 state_provider,
                 services,
             )
+            .await
         }
         StorePair::Cassandra {
             trigger_provider,
@@ -103,11 +99,9 @@ where
         } => {
             let (loader, partition_counts) =
                 cassandra_arm_inputs(setup.deps.as_ref(), setup.consumer, &services.heartbeats)?;
+            let backend = PublicationBackend::Cassandra(publication_store);
             let publisher_template = keyed_state
-                .publication_setup(
-                    PublicationBackend::Cassandra(publication_store),
-                    partition_counts,
-                )
+                .publication_setup(backend, partition_counts)
                 .await?;
             let state_provider = cassandra_state_provider::<C>(
                 &keyed_state,
@@ -134,6 +128,7 @@ where
                 state_provider,
                 services,
             )
+            .await
         }
     }
 }

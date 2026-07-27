@@ -18,6 +18,7 @@ mod tests;
 use crate::consumer::observer::metrics::KafkaMetrics;
 use arc_swap::ArcSwapOption;
 use opentelemetry::global::meter;
+use opentelemetry::metrics::Meter;
 use rdkafka::Statistics;
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
 use rdkafka::error::KafkaError;
@@ -27,8 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
 
-// Test-only until first-write publication consumes the observed count. The
-// gates come off together with the lookup below.
+// Test-only until first-write publication reads the observation. These gates
+// and the ones on the reader methods below come off together.
 #[cfg(test)]
 use crate::error::{ClassifyError, ErrorCategory};
 #[cfg(test)]
@@ -40,6 +41,10 @@ use thiserror::Error;
 
 /// How often the primary consumer emits librdkafka statistics. Private on
 /// purpose: no operational caller has asked for a tunable interval.
+///
+/// rdkafka parses each report from JSON on the thread that polls it, and the
+/// tree grows with the client's known brokers, topics, and partitions. The
+/// interval buys observation freshness at that parse cost.
 pub(in crate::consumer) const STATISTICS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long the startup metadata fetch may run before construction fails.
@@ -56,8 +61,8 @@ enum KafkaSnapshot {
     /// predates partition assignment, so it reports no assigned partitions.
     InitialMetadata(Metadata),
     /// The newest librdkafka statistics report. It replaces startup metadata
-    /// outright rather than merging with it. Boxed so both generations are the
-    /// same size.
+    /// outright rather than merging with it. Boxed because `Statistics` is
+    /// hundreds of bytes: unboxed it would trip `clippy::large_enum_variant`.
     ConsumerStatistics(Box<Statistics>),
 }
 
@@ -96,9 +101,12 @@ impl KafkaSnapshot {
         }
     }
 
-    /// How many topics this generation observed. A cluster with no topics yet
-    /// is a legal observation, so startup logs this count instead of rejecting
-    /// an empty view.
+    /// How many topics this generation observed.
+    ///
+    /// Startup logs this through the stored observation rather than counting
+    /// the metadata locally: it is the only production read of the
+    /// `InitialMetadata` payload while the count lookup below is test-gated,
+    /// and without it that payload is dead code.
     fn observed_topics(&self) -> usize {
         match self {
             Self::InitialMetadata(metadata) => metadata.topics().len(),
@@ -116,7 +124,6 @@ impl KafkaSnapshot {
     ///
     /// [`PartitionCountObservationError`] when the topic is absent from this
     /// observation, or present with an incomplete or non-contiguous topology.
-    // Test-only until first-write publication consumes the observed count.
     #[cfg(test)]
     fn partition_count(
         &self,
@@ -164,17 +171,18 @@ impl KafkaObserver {
     /// Creates the empty observer a consumer's construction threads everywhere.
     /// Gauges report under `group_id`, which never changes for this consumer.
     pub(in crate::consumer) fn new(group_id: &str) -> Self {
-        Self::with_startup_timeout(group_id, STARTUP_METADATA_TIMEOUT)
+        Self::with_instrumentation(group_id, STARTUP_METADATA_TIMEOUT, &meter("prosody"))
     }
 
-    /// [`Self::new`] with an explicit startup timeout. Tests use a short one so
-    /// the real construction path's metadata-fetch failure is reachable in
-    /// milliseconds.
-    fn with_startup_timeout(group_id: &str, startup_timeout: Duration) -> Self {
+    /// [`Self::new`] with an explicit startup timeout and meter. Tests use a
+    /// short timeout so the real construction path's metadata-fetch failure is
+    /// reachable in milliseconds, and their own meter so exported series are
+    /// readable back.
+    fn with_instrumentation(group_id: &str, startup_timeout: Duration, meter: &Meter) -> Self {
         Self {
             inner: Arc::new(KafkaObserverInner {
                 snapshot: ArcSwapOption::empty(),
-                metrics: KafkaMetrics::new(&meter("prosody"), group_id),
+                metrics: KafkaMetrics::new(meter, group_id),
                 startup_timeout,
             }),
         }
@@ -183,9 +191,14 @@ impl KafkaObserver {
     /// Fetches broker metadata through `consumer` and installs it as the first
     /// observation.
     ///
-    /// Blocking, bounded by the observer's startup timeout. Runs once, after
-    /// subscribe and before the poll loop starts, so a consumer never begins
-    /// dispatching without an observation.
+    /// Blocking, bounded by the observer's startup timeout. The caller runs it
+    /// on a blocking thread. It runs once, after subscribe and before the poll
+    /// loop starts, so a consumer never begins dispatching without an
+    /// observation.
+    ///
+    /// The fetch asks for all topics. `fetch_metadata` accepts at most one
+    /// topic, a consumer may subscribe to several, and a publication read may
+    /// need a topic outside the subscription.
     ///
     /// # Errors
     ///
@@ -197,6 +210,8 @@ impl KafkaObserver {
     ) -> Result<(), KafkaError> {
         let metadata = consumer.fetch_metadata(None, self.inner.startup_timeout)?;
         let snapshot = KafkaSnapshot::InitialMetadata(metadata);
+        // A cluster with no topics yet is a legal observation, so this logs the
+        // count instead of rejecting an empty view.
         debug!(
             topics = snapshot.observed_topics(),
             "installed the consumer's initial Kafka observation"
@@ -213,9 +228,18 @@ impl KafkaObserver {
     /// load-record-store sequence needs no read-modify-write atomicity.
     /// Recording gauges is infallible, so nothing can leave the observation
     /// stale.
+    ///
+    /// A report librdkafka queued while the startup fetch was still running
+    /// predates that fetch. Installing it moves the observation back to the
+    /// older view, for at most one statistics interval after startup.
     pub(in crate::consumer) fn observe_statistics(&self, statistics: Statistics) {
         let previous = self.snapshot();
-        self.inner.metrics.record(previous.as_ref(), &statistics);
+        self.inner.metrics.record(
+            previous
+                .as_ref()
+                .and_then(|guard| guard.snapshot.statistics()),
+            &statistics,
+        );
         self.inner
             .snapshot
             .store(Some(Arc::new(KafkaSnapshot::ConsumerStatistics(Box::new(
@@ -237,7 +261,6 @@ impl KafkaObserver {
     ///
     /// [`PartitionCountObservationError`] when no observation is installed yet,
     /// or the current one cannot supply a count for `topic`.
-    // Test-only until first-write publication consumes the observed count.
     #[cfg(test)]
     pub(crate) fn partition_count(
         &self,
@@ -255,9 +278,12 @@ impl KafkaObserver {
     /// follow and re-record. Without it a stopped consumer would keep reporting
     /// its final fetch-queue values. `consumer::partition::metrics` zeroes its
     /// timer gauges before exit for the same reason.
-    pub(in crate::consumer) fn shutdown(&self) {
-        if let Some(guard) = self.snapshot() {
-            self.inner.metrics.zero_assigned(&guard);
+    pub(in crate::consumer) fn retire_gauges(&self) {
+        let Some(guard) = self.snapshot() else {
+            return;
+        };
+        if let Some(statistics) = guard.snapshot.statistics() {
+            self.inner.metrics.zero_assigned(statistics);
         }
     }
 }
@@ -266,16 +292,12 @@ impl KafkaSnapshotGuard {
     /// The topic, id, and statistics of every partition assigned to this
     /// consumer instance. Yields nothing for the startup metadata generation,
     /// which predates assignment.
+    #[cfg(test)]
     pub(crate) fn assigned_partitions(&self) -> impl Iterator<Item = (&str, i32, &StatsPartition)> {
         self.snapshot
             .statistics()
             .into_iter()
             .flat_map(assigned_partitions)
-    }
-
-    /// The statistics of this generation, or `None` for startup metadata.
-    fn statistics(&self) -> Option<&Statistics> {
-        self.snapshot.statistics()
     }
 }
 
@@ -305,7 +327,6 @@ fn is_assigned(id: i32, partition: &StatsPartition) -> bool {
 /// Validates that `ids` is a nonempty contiguous range from zero and converts
 /// its length into a [`PartitionCount`]. The one place both observation
 /// generations agree on what a usable topology is.
-// Test-only until first-write publication consumes the observed count.
 #[cfg(test)]
 fn contiguous_count(
     mut ids: SmallVec<[i32; 16]>,
@@ -324,7 +345,6 @@ fn contiguous_count(
 }
 
 /// Why the current Kafka observation cannot supply a topic's partition count.
-// Test-only until first-write publication consumes the observed count.
 #[cfg(test)]
 #[derive(Debug, Error)]
 pub(crate) enum PartitionCountObservationError {
@@ -343,6 +363,10 @@ pub(crate) enum PartitionCountObservationError {
     TopicIncomplete(String),
 
     /// The observed topology yielded a count outside `[1, i32::MAX]`.
+    ///
+    /// Unreachable while [`contiguous_count`] rejects an empty id set first.
+    /// The variant is kept so a count `PartitionCount` rejects stays permanent
+    /// rather than being retried forever.
     #[error(transparent)]
     Count(#[from] PartitionCountError),
 }

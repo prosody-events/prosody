@@ -63,7 +63,7 @@ where
         Duration::default(),
         NonZeroUsize::MIN,
         consumer_config.timer_spans,
-        // The low-level constructor shares no infrastructure bundle.
+        // The direct mode shares no infrastructure bundle.
         None,
     )
     .await?;
@@ -73,8 +73,6 @@ where
         DEFAULT_IDEMPOTENCE_VERSION,
     )?;
 
-    // One `StartupServices` for the whole construction: whichever storage arm
-    // runs moves the same observer into the primary consumer.
     let services = StartupServices {
         version: keyed_state.version.clone(),
         telemetry: &telemetry,
@@ -94,8 +92,8 @@ where
                 MemoryCells::new(),
                 MemoryDescriptorIdentityStore::new(),
                 MemoryLoader::<C::Payload>::new(),
-                // The low-level constructor rejects registrations, so
-                // nothing is ever published: no publisher, no reconcile.
+                // The direct mode rejects registrations, so nothing is ever
+                // published: no publisher, no reconcile.
                 None,
             );
             initialize_consumer::<_, _, _, C>(
@@ -105,6 +103,7 @@ where
                 state_provider,
                 services,
             )
+            .await
         }
         StorePair::Cassandra {
             trigger_provider, ..
@@ -134,6 +133,7 @@ where
                 state_provider,
                 services,
             )
+            .await
         }
     }
 }

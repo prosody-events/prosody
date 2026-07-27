@@ -3,29 +3,27 @@
 
 mod support;
 
-use super::{KafkaSnapshot, PartitionCountObservationError, metrics::KafkaMetrics};
+use super::{KafkaObserver, KafkaSnapshot, PartitionCountObservationError};
 use crate::consumer::config::ConsumerConfiguration;
 use crate::consumer::error::ConsumerError;
-use crate::consumer::observer::KafkaObserver;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state_reader::PartitionCountError;
 use color_eyre::Result;
 use color_eyre::eyre::{bail, ensure, eyre};
-use opentelemetry::metrics::MeterProvider;
+use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
+use rdkafka::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::DefaultProducerContext;
 use rdkafka::statistics::Partition as StatsPartition;
-use rdkafka::statistics::Topic as StatsTopic;
-use rdkafka::{ClientConfig, Statistics};
 use std::collections::HashMap;
 use std::time::Duration;
 use support::{
-    Entry, FETCH_BYTES, FETCH_MESSAGES, GROUP, METADATA_AGE, TOPIC, Topology, assigned_ids,
-    contiguous, gauge_value, guard_of, initialize_with, partition_gauge, statistics_with,
-    test_meter,
+    Assignment, Entry, FETCH_BYTES, FETCH_MESSAGES, GROUP, METADATA_AGE, Report, TOPIC, Topology,
+    assigned_ids, contiguous, gauge_value, guard_of, identity, initialize_with, observer_with,
+    partition_gauge, statistics_of_partitions, statistics_with, test_meter,
 };
 
 /// The statistics view reports a count exactly when an independent calculation
@@ -33,8 +31,8 @@ use support::{
 /// compare with `0..len`. One generated map feeds oracle and subject, so a
 /// duplicate id cannot desync them.
 ///
-/// The assignment iterator is checked on the same value: it must yield exactly
-/// the real desired ids.
+/// The assignment iterator is checked on the same value: it must yield each
+/// real desired id paired with its own fetch-queue depth.
 #[quickcheck]
 fn statistics_count_matches_an_independent_oracle(topology: Topology) -> TestResult {
     let partitions: HashMap<i32, StatsPartition> = topology
@@ -58,26 +56,14 @@ fn statistics_count_matches_an_independent_oracle(topology: Topology) -> TestRes
         }
         _ => None,
     };
-    let mut expected_assigned: Vec<i32> = partitions
+    let mut expected_assigned: Vec<(&str, i32, i64)> = partitions
         .iter()
         .filter(|&(&id, partition)| id != -1_i32 && partition.desired)
-        .map(|(&id, _)| id)
+        .map(|(&id, partition)| (TOPIC, id, partition.fetchq_cnt))
         .collect();
     expected_assigned.sort_unstable();
 
-    let guard = guard_of(Statistics {
-        topics: [(
-            TOPIC.to_owned(),
-            StatsTopic {
-                topic: TOPIC.to_owned(),
-                partitions,
-                ..StatsTopic::default()
-            },
-        )]
-        .into_iter()
-        .collect(),
-        ..Statistics::default()
-    });
+    let guard = guard_of(statistics_of_partitions(partitions));
 
     let observed = guard.snapshot.partition_count(TOPIC);
     let agrees = match (expected, &observed) {
@@ -92,16 +78,81 @@ fn statistics_count_matches_an_independent_oracle(topology: Topology) -> TestRes
         ));
     }
 
-    let yielded: Vec<(&str, i32)> = guard
+    let mut yielded: Vec<(&str, i32, i64)> = guard
         .assigned_partitions()
-        .map(|(topic, id, _)| (topic, id))
+        .map(|(topic, id, partition)| (topic, id, partition.fetchq_cnt))
         .collect();
-    if yielded.iter().any(|&(topic, _)| topic != TOPIC) {
-        return TestResult::error("the iterator yielded a topic outside the tree");
+    yielded.sort_unstable();
+    if yielded == expected_assigned {
+        TestResult::passed()
+    } else {
+        TestResult::error(format!(
+            "the iterator yielded {yielded:?}, expected {expected_assigned:?}"
+        ))
     }
-    let mut ids: Vec<i32> = yielded.iter().map(|&(_, id)| id).collect();
-    ids.sort_unstable();
-    TestResult::from_bool(ids == expected_assigned)
+}
+
+/// Observing two statistics reports exports exactly the assignment the second
+/// one holds. Each series is checked against an oracle over the two generated
+/// reports: a partition the second report holds carries its own counters, a
+/// partition only the first report held reads zero, and metadata age is the
+/// oldest among topics holding an assignment.
+#[quickcheck]
+fn observing_statistics_exports_the_second_assignment(first: Report, second: Report) -> TestResult {
+    let (provider, exporter) = test_meter();
+    let observer = observer_with(GROUP, Duration::default(), &provider);
+    let previous = first.assigned();
+    let held = second.assigned();
+    let expected_age = second.metadata_age();
+
+    observer.observe_statistics(first.into_statistics());
+    observer.observe_statistics(second.into_statistics());
+    if let Err(error) = provider.force_flush() {
+        return TestResult::error(format!("flushing the test meter failed: {error:#}"));
+    }
+
+    match exported_series_match(&exporter, &previous, &held, expected_age) {
+        Ok(()) => TestResult::passed(),
+        Err(error) => TestResult::error(format!("{error:#}")),
+    }
+}
+
+/// The oracle for [`observing_statistics_exports_the_second_assignment`].
+fn exported_series_match(
+    exporter: &InMemoryMetricExporter,
+    previous: &Assignment,
+    held: &Assignment,
+    expected_age: u64,
+) -> Result<()> {
+    for (&(topic, id), &(messages, bytes)) in held {
+        for (name, expected) in [(FETCH_MESSAGES, messages), (FETCH_BYTES, bytes)] {
+            let observed = partition_gauge(exporter, name, topic, id)?;
+            ensure!(
+                observed == Some(expected),
+                "{name} for held {topic}:{id} was {observed:?}, expected {expected}"
+            );
+        }
+    }
+
+    for &(topic, id) in previous.keys() {
+        if held.contains_key(&(topic, id)) {
+            continue;
+        }
+        for name in [FETCH_MESSAGES, FETCH_BYTES] {
+            let observed = partition_gauge(exporter, name, topic, id)?;
+            ensure!(
+                observed == Some(0),
+                "{name} for retired {topic}:{id} was {observed:?}, expected 0"
+            );
+        }
+    }
+
+    let age = gauge_value(exporter, METADATA_AGE, &identity())?;
+    ensure!(
+        age == Some(expected_age),
+        "metadata age was {age:?}, expected {expected_age}"
+    );
+    Ok(())
 }
 
 /// Both observation generations report the same count for equivalent valid
@@ -124,7 +175,12 @@ fn metadata_and_statistics_agree_on_valid_topology() -> Result<()> {
             "startup metadata reported {} partitions for {topic}, expected {count}",
             i32::from(observed)
         );
-        let equivalent = statistics_with(&[(topic, 0, &contiguous(count))]);
+        // A second topic with a different count: the statistics view must select
+        // by name rather than take whichever topic it walks first.
+        let equivalent = statistics_with(&[
+            (topic, 0, &contiguous(count)),
+            ("parity-decoy", 0, &contiguous(count + 5)),
+        ]);
         let from_statistics = KafkaSnapshot::ConsumerStatistics(Box::new(equivalent));
         ensure!(
             from_statistics.partition_count(topic)? == observed,
@@ -185,18 +241,15 @@ fn assigned_iterator_excludes_internal_and_undesired() -> Result<()> {
 #[test]
 fn metadata_age_covers_only_assigned_topics() -> Result<()> {
     let (provider, exporter) = test_meter();
-    let metrics = KafkaMetrics::new(&provider.meter("observer-tests"), GROUP);
+    let observer = observer_with(GROUP, Duration::default(), &provider);
 
-    metrics.record(
-        None,
-        &statistics_with(&[
-            ("assigned", 100, &[Entry::assigned(0, 0, 0)]),
-            ("idle", 999, &[Entry::revoked(0)]),
-        ]),
-    );
+    observer.observe_statistics(statistics_with(&[
+        ("assigned", 100, &[Entry::assigned(0, 0, 0)]),
+        ("idle", 999, &[Entry::revoked(0)]),
+    ]));
     provider.force_flush()?;
 
-    let age = gauge_value(&exporter, METADATA_AGE, &[])?;
+    let age = gauge_value(&exporter, METADATA_AGE, &identity())?;
     ensure!(
         age == Some(100),
         "expected the assigned topic's age of 100, got {age:?}"
@@ -204,55 +257,26 @@ fn metadata_age_covers_only_assigned_topics() -> Result<()> {
     Ok(())
 }
 
-/// A partition the next statistics report no longer holds has both of its
-/// per-partition series zeroed, while the surviving partition keeps reporting.
-#[test]
-fn removed_assignment_zeroes_retired_series() -> Result<()> {
-    let (provider, exporter) = test_meter();
-    let metrics = KafkaMetrics::new(&provider.meter("observer-tests"), GROUP);
-
-    let first = statistics_with(&[(
-        TOPIC,
-        0,
-        &[Entry::assigned(0, 5, 50), Entry::assigned(1, 7, 70)],
-    )]);
-    metrics.record(None, &first);
-    let second = statistics_with(&[(TOPIC, 0, &[Entry::assigned(0, 9, 90), Entry::revoked(1)])]);
-    metrics.record(Some(&guard_of(first)), &second);
-    provider.force_flush()?;
-
-    for (name, kept) in [(FETCH_MESSAGES, 9_u64), (FETCH_BYTES, 90_u64)] {
-        let held = partition_gauge(&exporter, name, TOPIC, 0)?;
-        ensure!(
-            held == Some(kept),
-            "{name} for the retained partition was {held:?}, expected {kept}"
-        );
-        let gone = partition_gauge(&exporter, name, TOPIC, 1)?;
-        ensure!(
-            gone == Some(0),
-            "{name} for the revoked partition was {gone:?}, expected 0"
-        );
-    }
-    Ok(())
-}
-
-/// Shutdown zeroes the last assignment's series, so a stopped consumer stops
+/// Shutdown retires the last assignment's series, so a stopped consumer stops
 /// reporting fetch-queue depth.
 #[test]
 fn shutdown_zeroes_the_last_assignment() -> Result<()> {
     let (provider, exporter) = test_meter();
-    let metrics = KafkaMetrics::new(&provider.meter("observer-tests"), GROUP);
+    let observer = observer_with(GROUP, Duration::default(), &provider);
 
-    let last = statistics_with(&[(TOPIC, 100, &[Entry::assigned(0, 5, 50)])]);
-    metrics.record(None, &last);
-    metrics.zero_assigned(&guard_of(last));
+    observer.observe_statistics(statistics_with(&[(
+        TOPIC,
+        100,
+        &[Entry::assigned(0, 5, 50)],
+    )]));
+    observer.retire_gauges();
     provider.force_flush()?;
 
     for name in [FETCH_MESSAGES, FETCH_BYTES] {
         let value = partition_gauge(&exporter, name, TOPIC, 0)?;
         ensure!(value == Some(0), "{name} was {value:?} after shutdown");
     }
-    let age = gauge_value(&exporter, METADATA_AGE, &[])?;
+    let age = gauge_value(&exporter, METADATA_AGE, &identity())?;
     ensure!(age == Some(0), "metadata age was {age:?} after shutdown");
     Ok(())
 }
@@ -297,8 +321,8 @@ async fn startup_fails_when_metadata_is_unreachable() -> Result<()> {
         .group_id("observer-unreachable-group")
         .subscribed_topics(vec![TOPIC.to_owned()])
         .build()?;
-    let observer =
-        KafkaObserver::with_startup_timeout(&config.group_id, Duration::from_millis(250));
+    let (provider, _exporter) = test_meter();
+    let observer = observer_with(&config.group_id, Duration::from_millis(250), &provider);
 
     match initialize_with(&config, observer.clone()).await? {
         Ok(consumer) => {

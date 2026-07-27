@@ -50,9 +50,7 @@ pub(in crate::consumer) type CommonMiddleware<DP, P> = ComposedMiddleware<
     P,
 >;
 
-/// What [`build_shared_state`] returns: the store pair, keyed-state inputs, the
-/// heartbeat registry, any storage reused from a bundle, and the consumer's one
-/// Kafka observation handle.
+/// What [`build_shared_state`] returns; see its doc.
 pub(in crate::consumer) type SharedState = (
     StorePair,
     KeyedStateInputs,
@@ -65,9 +63,8 @@ pub(in crate::consumer) type SharedState = (
 /// pair, keyed-state inputs, the heartbeat registry, any storage reused from a
 /// [`SharedDeps`] bundle, and the consumer's Kafka observation handle.
 ///
-/// The observer is created here, before any storage `match`, so every arm of
-/// every mode threads the same instance to its primary consumer. A second
-/// observer would silently split the observation stream.
+/// This mints the observer the high-level modes hand to their primary consumer;
+/// [`StartupServices`](runtime::StartupServices) keeps it single.
 ///
 /// Validates the consumer and keyed-state configuration up front, before
 /// [`StorePair::new`]'s Cassandra IO, so all callers fail fast uniformly. The

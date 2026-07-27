@@ -14,6 +14,7 @@ use crate::timers::store::cassandra::CassandraTriggerStoreError;
 use rdkafka::error::KafkaError;
 use std::io;
 use thiserror::Error;
+use tokio::task::JoinError;
 use validator::ValidationErrors;
 
 /// Errors that can occur during consumer operations.
@@ -42,6 +43,11 @@ pub enum ConsumerError {
     /// Indicates a Kafka operation failure.
     #[error("Kafka operation failed: {0:#}")]
     Kafka(#[from] KafkaError),
+
+    /// A blocking startup step — the initial Kafka metadata fetch — did not
+    /// finish.
+    #[error("consumer startup task failed: {0:#}")]
+    StartupTask(#[from] JoinError),
 
     /// Indicates a Cassandra trigger store operation failure.
     #[error("Cassandra trigger store operation failed: {0:#}")]

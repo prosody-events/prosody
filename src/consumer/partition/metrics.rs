@@ -26,6 +26,9 @@ pub async fn run<T: TriggerStore>(
     mut shutdown_rx: watch::Receiver<ShutdownPhase>,
 ) {
     let meter = meter("prosody");
+    // These attribute keys predate the `OTel` semantic conventions
+    // `consumer::observer::metrics` uses. Renaming them would break existing
+    // dashboards and KEDA queries, so they stay.
     let attrs = [
         KeyValue::new("group_id", group_id.to_string()),
         KeyValue::new("topic", topic.to_string()),
