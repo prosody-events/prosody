@@ -48,7 +48,7 @@ struct PipelineMiddlewareStack {
 }
 
 impl PipelineMiddlewareStack {
-    fn build<T, MP, TP, DP, PP, SP, L, C>(
+    fn into_consumer<T, MP, TP, DP, PP, SP, L, C>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
@@ -80,27 +80,17 @@ impl PipelineMiddlewareStack {
 
         let version: Arc<str> = Arc::from(self.common_config.dedup.version.as_str());
 
-        // `build_common_middleware` constructs the whole common block —
-        // including dedup — so the pipeline only layers its mode-specific
-        // middleware OUTSIDE it. `.layer(x)` makes `x` the OUTERMOST layer, so
-        // the stack runs outer→inner as:
+        // This stack runs outer→inner as:
         //
         //   retry → message_defer → timer_defer → monopolization
         //     → dedup → common(cancellation → scheduler → timeout
         //     → telemetry) → handler
         //
-        // The keyed-state durability sequence is NOT in this stack — it runs
-        // once after the stack returns, owned by the `settle` boundary (see
-        // `consumer::middleware`'s `FallibleEventHandler` docs), which decides
-        // commit-vs-bypass from the typed `Settlement` classification of the
-        // final result. Two residual order facts remain: retry stays OUTERMOST
-        // so each attempt is a fresh dispatch, isolated by the `next_attempt`
-        // verb between attempts (its `reset` transition discards the failed
-        // attempt's dirty overlay and bumps the session's attempt epoch under
-        // one gate hold, fencing a leaked handle instead of letting it join the
-        // next attempt); and the dedup filter sits INSIDE message-defer so a
-        // deferred reload's duplicate check sees the reload identity override.
-        // `monopolization` is state-agnostic.
+        // See `build_common_middleware` for what the common block owns. Two
+        // placements here are required for correctness. Retry stays OUTERMOST
+        // so every attempt is a fresh dispatch. The dedup filter sits INSIDE
+        // message-defer so a deferred reload's duplicate check sees the reload
+        // identity override.
         let common_middleware = build_common_middleware::<DP, C::Payload>(
             &self.common_config,
             &self.consumer_config,
@@ -127,8 +117,7 @@ impl PipelineMiddlewareStack {
 }
 
 /// Builds the storage pair, keyed-state inputs, and shared middleware stack
-/// for [`ProsodyConsumer::pipeline_consumer`], enforcing the keyed-state
-/// deduplication gate.
+/// for [`ProsodyConsumer::pipeline_consumer`].
 async fn prepare_pipeline_stack<C: Codec>(
     setup: &ConsumerSetup<'_, C>,
     pipeline_config: PipelineMiddlewareConfiguration,
@@ -220,7 +209,7 @@ where
                 &stack.common_config.dedup.version,
                 &stack.telemetry,
             )?;
-            stack.build::<_, _, _, _, _, _, _, C>(
+            stack.into_consumer::<_, _, _, _, _, _, _, C>(
                 message_defer_middleware,
                 timer_provider,
                 dedup_provider,
@@ -266,7 +255,7 @@ where
                 &stack.common_config.dedup.version,
                 &stack.telemetry,
             )?;
-            stack.build::<_, _, _, _, _, _, _, C>(
+            stack.into_consumer::<_, _, _, _, _, _, _, C>(
                 message_defer_middleware,
                 timer_provider,
                 dedup_provider,

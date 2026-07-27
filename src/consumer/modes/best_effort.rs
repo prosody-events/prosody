@@ -1,5 +1,6 @@
-//! The best-effort mode: one logging layer outside the common block. Failures
-//! are logged and dropped.
+//! The best-effort mode: one logging layer outside the common block. A failure
+//! is logged once and never retried; the settle boundary then settles the event
+//! as it stands.
 
 use crate::consumer::ProsodyConsumer;
 use crate::consumer::config::ConsumerSetup;
@@ -29,10 +30,10 @@ where
     let (stores, keyed_state, heartbeats, shared) = build_shared_state(&setup).await?;
     let version = keyed_state.version.clone();
 
-    // dedup lives inside the common block; `log` (which swallows failures)
-    // layers OUTSIDE it. The keyed-state durability sequence runs after the
-    // stack returns, in the `settle` boundary. Built per storage arm
-    // because the dedup store lives there.
+    // dedup lives inside the common block; `log` layers OUTSIDE it and forwards
+    // the failure verbatim. Nothing retries it, so the `settle` boundary
+    // settles the event. Built per storage arm because the dedup store lives
+    // there.
     match stores {
         StorePair::Memory {
             trigger_provider,

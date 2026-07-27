@@ -6,7 +6,7 @@
 //!
 //! - Per-key concurrency with ordered processing within keys
 //! - Automatic partition assignment and revocation handling
-//! - Offset management with exactly-once semantics
+//! - Offset management with at-least-once delivery semantics
 //! - Global message buffering with bounded concurrency
 //! - Backpressure handling and flow control
 //! - Error handling with configurable retry strategies
@@ -120,16 +120,14 @@ pub use crate::consumer::config::{
     PipelineMiddlewareConfiguration, RecoveryTtlMarginError,
 };
 pub use crate::consumer::error::{ConsumerError, KeyedStateInitError};
-pub use crate::consumer::event_context::EventContext;
-pub use crate::consumer::event_context::TerminationSignals;
+pub use crate::consumer::event_context::{EventContext, TerminationSignals};
 pub use crate::consumer::handler::{DemandType, EventHandler, HandlerProvider, Keyed, Uncommitted};
 pub use crate::consumer::kafka_state::{
     MessageCell, MessageDescriptor, MessageRef, MessageRefCodec, MessageRefCodecError,
     MessageResolver, MessageStateError, message_deque_state, message_map_state, message_state,
 };
 pub use crate::consumer::message::ConsumerMessage;
-pub use crate::consumer::middleware::FallibleHandler;
-pub use crate::consumer::middleware::RepinProof;
+pub use crate::consumer::middleware::{FallibleHandler, RepinProof};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::probes::ProbeServer;
 use crate::heartbeat::HeartbeatRegistry;
@@ -282,10 +280,8 @@ impl<C: Codec> ProsodyConsumer<C> {
     /// This method is used by both the public shutdown method and the drop
     /// handler to ensure resources are properly cleaned up.
     async fn execute_shutdown(&mut self) {
-        // Signal the consumer to shut down
         self.shutdown.store(true, Ordering::Relaxed);
 
-        // Attempt to take the handle from the mutex
         let Some(RuntimeState {
             poll_handle,
             probe_server,
@@ -294,12 +290,10 @@ impl<C: Codec> ProsodyConsumer<C> {
             return;
         };
 
-        // Wait for the polling task to complete
         if let Err(error) = poll_handle.await {
             error!("consumer shutdown failed: {error:#}");
         }
 
-        // Shutdown probe server if it exists
         if let Some(probe_server) = probe_server {
             probe_server.shutdown().await;
         }
@@ -316,7 +310,6 @@ impl<C: Codec> Drop for ProsodyConsumer<C> {
     }
 }
 
-/// Returns the number of assigned partitions.
 pub(crate) fn get_assigned_partition_count<P: Send + Sync + 'static>(
     managers: &Managers<P>,
 ) -> u32 {
@@ -324,10 +317,6 @@ pub(crate) fn get_assigned_partition_count<P: Send + Sync + 'static>(
 }
 
 /// Checks if any partition is stalled.
-///
-/// A partition is considered stalled if it hasn't processed messages within
-/// the configured stall threshold duration or if its processing loop is
-/// blocked.
 pub(crate) fn get_is_stalled<P: Send + Sync + 'static>(managers: &Managers<P>) -> bool {
     managers.read().values().any(PartitionManager::is_stalled)
 }

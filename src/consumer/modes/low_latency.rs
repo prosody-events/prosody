@@ -1,5 +1,10 @@
 //! The low-latency mode: retry, then route to a failure topic, then retry that
 //! — all layered outside the common block.
+//!
+//! The three layers run in that sequence. The inner retry caps transient errors
+//! at `max_retries`. The failure topic then routes the exhausted failure. The
+//! outermost retry re-dispatches that routing forever, since there is nothing
+//! left to fall back to.
 
 use crate::consumer::ProsodyConsumer;
 use crate::consumer::config::{ConsumerSetup, LowLatencyMiddlewareConfiguration};
@@ -68,9 +73,9 @@ where
                 telemetry.clone(),
                 dedup_provider,
             )?
-            .layer(retry_middleware.clone()) // retry the task a fixed number of times
-            .layer(topic_middleware) // write to failure topic
-            .layer(retry_middleware) // retry writing to the failure topic indefinitely
+            .layer(retry_middleware.clone())
+            .layer(topic_middleware)
+            .layer(retry_middleware)
             .into_provider(handler);
             initialize_consumer::<_, _, _, C>(
                 setup.consumer,

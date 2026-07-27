@@ -1,5 +1,10 @@
 //! What every mode does before its mode-specific work: validate the
 //! configuration, open storage, and build the common middleware block.
+//!
+//! Two submodules complete the assembly. [`state`] derives the keyed-state
+//! inputs and the per-backend state providers. [`runtime`] takes the finished
+//! middleware stack and starts the consumer: Kafka client, subscription, and
+//! poll loop.
 
 use crate::consumer::config::{
     CommonConfiguration, ConsumerConfiguration, ConsumerSetup, validate_recovery_ttl_margin,
@@ -44,8 +49,9 @@ pub(in crate::consumer) type CommonMiddleware<DP, P> = ComposedMiddleware<
     P,
 >;
 
-/// Builds the storage core shared by every constructor: the deduplication
-/// store pair, keyed-state inputs, and heartbeat registry.
+/// Builds the storage core shared by every constructor: the trigger and defer
+/// store pair, keyed-state inputs, the heartbeat registry, and any storage
+/// reused from a [`SharedDeps`] bundle.
 ///
 /// Validates the consumer and keyed-state configuration up front, before
 /// [`StorePair::new`]'s Cassandra IO, so all callers fail fast uniformly. The

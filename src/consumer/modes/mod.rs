@@ -4,7 +4,7 @@
 //! retries and defers. `low_latency` routes exhausted failures to a topic.
 //! `best_effort` logs them and moves on.
 //!
-//! The four public constructors stay in one inherent impl block here, each
+//! The four constructors stay in one inherent impl block here, each
 //! delegating to its submodule. Do not move a constructor into its module:
 //! `clippy::multiple_inherent_impl` fires on inherent impls that share a self
 //! type and predicates even across files, and these four have no distinct
@@ -131,7 +131,7 @@ where
     /// Creates a new `ProsodyConsumer` with logging middleware for failure
     /// handling.
     ///
-    /// The best-effort approach is the simplest - it tries to process
+    /// The best-effort approach is the simplest — it tries to process
     /// messages once, logs any failures, and moves on. This approach should
     /// only be used for development or for services where occasional
     /// message loss is acceptable.

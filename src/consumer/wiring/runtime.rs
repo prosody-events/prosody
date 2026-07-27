@@ -29,7 +29,8 @@ use whoami::hostname;
 /// Initializes a Prosody consumer with a trigger store provider, wiring the
 /// partition machinery to a Kafka consumer and starting its background poll
 /// loop. The provider creates per-partition stores with independent caches.
-/// Fails if the hostname can't be retrieved for the client ID, the Kafka
+/// Fails if the configuration is invalid, the consumer context can't be
+/// created, the hostname can't be retrieved for the client ID, the Kafka
 /// consumer can't be created with the provided configuration, topic
 /// subscription fails, or the probe server can't be started (if enabled).
 pub(in crate::consumer) fn initialize_consumer<T, P, SP, C>(
@@ -109,10 +110,19 @@ where
     let poll_interval = consumer_config.poll_interval;
     let heartbeat = heartbeats.register("Kafka poll loop");
     let cloned_managers = managers.clone();
-    let cloned_heartbeat = heartbeat.clone();
     let cloned_shutdown = shutdown.clone();
     let max_message_count = consumer_config.max_uncommitted;
     let message_spans = consumer_config.message_spans;
+
+    // Every fallible step runs before the poll loop starts. A blocking task
+    // cannot be aborted, so dropping its handle on an error path would detach
+    // an unreachable thread that holds the Kafka client forever.
+    let probe_server = consumer_config
+        .probe_port
+        .filter(|_| !consumer_config.mock)
+        .map(|port| ProbeServer::new(port, managers.clone(), heartbeats.clone()))
+        .transpose()?;
+
     let poll_handle = spawn_blocking(move || {
         poll(PollConfig {
             poll_interval,
@@ -121,17 +131,11 @@ where
             codec: C::default(),
             watermark_version: &watermark_version,
             managers: &cloned_managers,
-            heartbeat: &cloned_heartbeat,
+            heartbeat: &heartbeat,
             shutdown: &cloned_shutdown,
             message_spans,
         });
     });
-
-    let probe_server = consumer_config
-        .probe_port
-        .filter(|_| !consumer_config.mock)
-        .map(|port| ProbeServer::new(port, managers.clone(), heartbeats.clone()))
-        .transpose()?;
 
     let runtime_state = Arc::new(Mutex::new(Some(RuntimeState {
         poll_handle,

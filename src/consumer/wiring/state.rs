@@ -27,25 +27,22 @@ use crate::{Codec, ConsumerGroup, EventIdentity, EventType};
 use std::fs;
 use std::sync::Arc;
 
-/// Keyed-state wiring inputs shared by both storage branches of
-/// [`ProsodyConsumer::pipeline_consumer`](crate::consumer::ProsodyConsumer::pipeline_consumer).
+/// What [`memory_arm_inputs`] returns: `(loader, cells, identities,
+/// partition_counts)`.
+type MemoryArmInputs<P> = (
+    MemoryLoader<P>,
+    MemoryCells,
+    MemoryDescriptorIdentityStore,
+    PartitionCounts,
+);
+
+/// Keyed-state wiring inputs shared by every mode's storage branches.
 pub(in crate::consumer) struct KeyedStateInputs {
     config: KeyedStateConfiguration,
     group: ConsumerGroup,
     pub(in crate::consumer) version: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
 }
-
-/// The memory-arm inputs a consumer resolves from an optional shared bundle:
-/// `(loader, cells, identities, partition_counts)`. These come from the bundle
-/// when one is supplied, so a reader built from the same bundle sees this
-/// consumer's committed writes. Otherwise they are fresh mock defaults.
-pub(in crate::consumer) type MemoryArmInputs<P> = (
-    MemoryLoader<P>,
-    MemoryCells,
-    MemoryDescriptorIdentityStore,
-    PartitionCounts,
-);
 
 impl KeyedStateInputs {
     /// Validates the registrations and derives the shared inputs. The dedup
@@ -71,7 +68,7 @@ impl KeyedStateInputs {
 
     /// Builds the per-partition keyed-state provider over a branch's
     /// backend and loader. The partition loop acquires one state manager
-    /// per assignment from it; the pending-index scanner now travels inside
+    /// per assignment from it; the pending-index scanner travels inside
     /// the backend the factory mints.
     fn provider<B, L>(
         &self,
@@ -195,6 +192,10 @@ fn shared_memory_handles(
     }
 }
 
+/// The memory-arm inputs a consumer resolves from an optional shared bundle.
+/// These come from the bundle when one is supplied, so a reader built from the
+/// same bundle sees this consumer's committed writes. Otherwise they are fresh
+/// mock defaults.
 pub(in crate::consumer) fn memory_arm_inputs<C: Codec>(
     deps: Option<&SharedDeps<C>>,
     shared: Option<SharedStorage>,

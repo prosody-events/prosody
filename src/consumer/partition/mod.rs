@@ -6,7 +6,7 @@
 //!
 //! - Processes messages with different keys concurrently for high throughput
 //! - Preserves strict ordering for messages with the same key
-//! - Tracks and commits message offsets for exactly-once processing
+//! - Tracks and commits message offsets for at-least-once processing
 //! - Manages graceful shutdown of partition processing
 //! - Implements backpressure through the bounded message channel
 //!
