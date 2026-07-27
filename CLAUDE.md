@@ -247,6 +247,14 @@ give each module a doc comment naming what it owns. Re-export from the parent
 that only balances line counts, cutting a coherent unit in half, is worse than
 the long file; find the real seam.
 
+**Prefer one-word module names.** `config`, `wiring`, `handler`, `poll`,
+`settle`, `modes`. A name that needs two words usually means one of two things:
+the module owns more than one concern and should be split, or the name restates
+its parent's path (`consumer::kafka_observer` says Kafka twice — inside
+`consumer`, it is `observer`). Rename the concept until one word carries it.
+A compound name is right only when the compound *is* the domain term:
+`first_write`, `low_latency`, `event_context`.
+
 **Order within files (topological by dependencies):**
 
 1. Constants → Statics → Types → Implementations → Functions → Errors (bottom)
