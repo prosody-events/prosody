@@ -964,11 +964,11 @@ pub(crate) mod sealed {
         ///
         /// # Errors
         ///
-        /// A count-fetch or upsert failure, type-erased into
-        /// [`StateAccessError::Store`] with the publication error's
-        /// `Permanent`/`Transient` classification preserved (never `Terminal`);
-        /// the settle boundary retries it until it succeeds or shutdown
-        /// intervenes.
+        /// An unavailable partition count or an upsert failure, type-erased
+        /// into [`StateAccessError::Store`] with the publication
+        /// error's `Permanent`/`Transient` classification preserved
+        /// (never `Terminal`); the settle boundary retries it until it
+        /// succeeds or shutdown intervenes.
         fn publish_first_writes(&self)
         -> impl Future<Output = Result<(), StateAccessError>> + Send;
     }

@@ -19,7 +19,6 @@ use crate::consumer::wiring::state::{
 };
 use crate::consumer::wiring::{build_common_middleware, build_shared_state};
 use crate::producer::ProsodyProducer;
-use crate::state::first_write::PublicationBackend;
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity, EventType};
 
@@ -56,11 +55,9 @@ where
             publication_store,
             ..
         } => {
-            let (loader, cells, identities, partition_counts) =
-                memory_arm_inputs(setup.deps.as_ref(), shared)?;
-            let backend = PublicationBackend::Memory(publication_store);
+            let (loader, cells, identities) = memory_arm_inputs(setup.deps.as_ref(), shared)?;
             let publisher_template = keyed_state
-                .publication_setup(backend, partition_counts)
+                .memory_publication_setup(publication_store)
                 .await?;
             let state_provider = memory_state_provider::<C>(
                 &keyed_state,
@@ -97,11 +94,10 @@ where
             publication_store,
             ..
         } => {
-            let (loader, partition_counts) =
+            let loader =
                 cassandra_arm_inputs(setup.deps.as_ref(), setup.consumer, &services.heartbeats)?;
-            let backend = PublicationBackend::Cassandra(publication_store);
             let publisher_template = keyed_state
-                .publication_setup(backend, partition_counts)
+                .cassandra_publication_setup(publication_store, services.observer.clone())
                 .await?;
             let state_provider = cassandra_state_provider::<C>(
                 &keyed_state,

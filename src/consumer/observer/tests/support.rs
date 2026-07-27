@@ -1,8 +1,8 @@
 //! Statistics fixtures: a partition-topology generator, the trees librdkafka
-//! would report for it, and the identity attributes every generated series
-//! carries.
+//! would report for it, the identity attributes every generated series carries,
+//! and the observers the publication tests read counts from.
 
-use super::super::{KafkaSnapshot, KafkaSnapshotGuard};
+use super::super::{KafkaObserver, KafkaSnapshot, KafkaSnapshotGuard};
 use quickcheck::{Arbitrary, Gen};
 use rdkafka::Statistics;
 use rdkafka::statistics::Partition as StatsPartition;
@@ -309,4 +309,29 @@ pub(super) fn assigned_ids(guard: &KafkaSnapshotGuard) -> Vec<i32> {
     let mut ids: Vec<i32> = guard.assigned_partitions().map(|(_, id, _)| id).collect();
     ids.sort_unstable();
     ids
+}
+
+/// An observer with no observation installed — the pre-startup state.
+pub(crate) fn unobserved(group: &str) -> KafkaObserver {
+    KafkaObserver::new(group)
+}
+
+/// An observer reporting each `(topic, partition count)` as a contiguous
+/// assigned topology. An empty slice yields an observation that knows no topics
+/// at all.
+pub(crate) fn observing(group: &str, topics: &[(&str, i32)]) -> KafkaObserver {
+    let observer = unobserved(group);
+    observe(&observer, topics);
+    observer
+}
+
+/// Replaces `observer`'s observation, as the next statistics report would.
+pub(crate) fn observe(observer: &KafkaObserver, topics: &[(&str, i32)]) {
+    let topologies: Vec<Vec<Entry>> = topics.iter().map(|&(_, count)| contiguous(count)).collect();
+    let report: Vec<(&str, i64, &[Entry])> = topics
+        .iter()
+        .zip(&topologies)
+        .map(|(&(name, _), entries)| (name, 0_i64, entries.as_slice()))
+        .collect();
+    observer.observe_statistics(statistics_with(&report));
 }

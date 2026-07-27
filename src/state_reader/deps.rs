@@ -2,8 +2,8 @@
 //!
 //! [`SharedDeps`] owns every handle that a cross-group reader and the owning
 //! consumer share: the backend stores, the message loader, the byte-budgeted
-//! read-through cache, the topic partition-count source, and the heartbeat
-//! registry. Build one bundle, then clone its handles into several
+//! read-through cache, and the heartbeat registry. Build one bundle, then clone
+//! its handles into several
 //! [`StateReader`](super::StateReader)s and into the consumer that writes the
 //! state. Cloning shares handles, so exactly one scylla session and one Kafka
 //! client back the whole process.
@@ -23,12 +23,10 @@ use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
     CellQueries, IdentityQueries, PublicationQueries,
 };
-use crate::state::first_write::PartitionCounts;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state_reader::cache::ReaderCache;
 use crate::state_reader::error::StateReaderError;
 use crate::state_reader::loader::ReaderLoader;
-use crate::state_reader::partitioner::PartitionCount;
 use crate::state_reader::stores::ReaderStores;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -59,16 +57,15 @@ fn next_instance_id() -> u64 {
     NEXT_DEPS_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Shared reader infrastructure: stores, loader, byte-budgeted cache, topic
-/// partition counts, and the heartbeat registry. Clone shares the underlying
-/// handles (see the module docs).
+/// Shared reader infrastructure: stores, loader, byte-budgeted cache, and the
+/// heartbeat registry. Clone shares the underlying handles (see the module
+/// docs).
 pub struct SharedDeps<C: Codec> {
     stores: ReaderStores,
     // `Arc` over an already-cheap-clone enum, so this bundle's `Clone` needs no
     // `C::Payload: Clone` bound. Cloning `ReaderLoader<C>` directly would need it.
     loader: Arc<ReaderLoader<C>>,
     cache: ReaderCache,
-    partition_counts: PartitionCounts,
     heartbeats: HeartbeatRegistry,
     /// Bundle-wide default read-cache TTL. Set through
     /// [`Self::with_default_read_cache_ttl`]. Collection policies can replace
@@ -84,7 +81,6 @@ impl<C: Codec> Clone for SharedDeps<C> {
             stores: self.stores.clone(),
             loader: self.loader.clone(),
             cache: self.cache.clone(),
-            partition_counts: self.partition_counts.clone(),
             heartbeats: self.heartbeats.clone(),
             default_read_cache_ttl: self.default_read_cache_ttl,
             #[cfg(test)]
@@ -118,7 +114,6 @@ impl<C: Codec> SharedDeps<C> {
             },
             loader: Arc::new(ReaderLoader::Memory(loader)),
             cache: ReaderCache::with_budget(budget),
-            partition_counts: PartitionCounts::Memory(PartitionCount::MOCK),
             heartbeats: HeartbeatRegistry::new(group_id, stall_threshold),
             default_read_cache_ttl: None,
             #[cfg(test)]
@@ -186,9 +181,6 @@ impl<C: Codec> SharedDeps<C> {
             },
             loader: Arc::new(ReaderLoader::Kafka(loader)),
             cache: ReaderCache::with_budget(read_cache_size_bytes.get()),
-            partition_counts: PartitionCounts::Kafka {
-                bootstrap: Arc::from(consumer_config.bootstrap_servers.clone()),
-            },
             heartbeats,
             default_read_cache_ttl: None,
             #[cfg(test)]
@@ -207,9 +199,8 @@ impl<C: Codec> SharedDeps<C> {
     }
 
     /// A bundle over arbitrary reader stores, loader, and cache — the seam the
-    /// scripted-fault suites build through. The partition-count and heartbeat
-    /// fields are inert defaults (these suites never fetch counts or probe
-    /// stalls).
+    /// scripted-fault suites build through. The heartbeat field is an inert
+    /// default (these suites never probe stalls).
     #[cfg(test)]
     pub(crate) fn from_parts(
         stores: ReaderStores,
@@ -220,7 +211,6 @@ impl<C: Codec> SharedDeps<C> {
             stores,
             loader: Arc::new(loader),
             cache,
-            partition_counts: PartitionCounts::Memory(PartitionCount::MOCK),
             heartbeats: HeartbeatRegistry::new("reader-test".to_owned(), Duration::from_secs(30)),
             default_read_cache_ttl: None,
             instance_id: next_instance_id(),
@@ -256,12 +246,6 @@ impl<C: Codec> SharedDeps<C> {
     /// loader's.
     pub(crate) fn heartbeats(&self) -> &HeartbeatRegistry {
         &self.heartbeats
-    }
-
-    /// The topic partition-count source (cheap-clone handle) the consumer's
-    /// publication template uses.
-    pub(crate) fn partition_counts(&self) -> PartitionCounts {
-        self.partition_counts.clone()
     }
 
     /// The already-constructed shareable storage a consumer reuses instead of

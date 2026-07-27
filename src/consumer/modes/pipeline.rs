@@ -25,7 +25,6 @@ use crate::consumer::wiring::state::{
 use crate::consumer::wiring::{build_common_middleware, build_shared_state};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
-use crate::state::first_write::PublicationBackend;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::CellWrite;
 use crate::telemetry::Telemetry;
@@ -189,11 +188,9 @@ where
             publication_store,
         } => {
             // Memory/mock arm inputs come from the bundle when supplied, else fresh.
-            let (loader, cells, identities, partition_counts) =
-                memory_arm_inputs(deps.as_ref(), shared)?;
-            let backend = PublicationBackend::Memory(publication_store);
+            let (loader, cells, identities) = memory_arm_inputs(deps.as_ref(), shared)?;
             let publisher_template = keyed_state
-                .publication_setup(backend, partition_counts)
+                .memory_publication_setup(publication_store)
                 .await?;
             let state_provider = memory_state_provider::<C>(
                 &keyed_state,
@@ -235,11 +232,10 @@ where
             // One Kafka loader per consumer, from the bundle when supplied.
             // A clone shares the client and poll thread. See
             // `cassandra_arm_inputs`.
-            let (loader, partition_counts) =
+            let loader =
                 cassandra_arm_inputs(deps.as_ref(), &stack.consumer_config, &stack.heartbeats)?;
-            let backend = PublicationBackend::Cassandra(publication_store);
             let publisher_template = keyed_state
-                .publication_setup(backend, partition_counts)
+                .cassandra_publication_setup(publication_store, stack.observer.clone())
                 .await?;
             let state_provider = cassandra_state_provider::<C>(
                 &keyed_state,

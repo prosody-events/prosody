@@ -7,18 +7,21 @@ use crate::consumer::middleware::deduplication::{
     CassandraDeduplicationStoreProvider, MemoryDeduplicationStoreProvider,
 };
 use crate::consumer::middleware::defer::DeferInitError;
+use crate::consumer::observer::KafkaObserver;
 use crate::consumer::storage::SharedStorage;
 use crate::error::ClassifyError;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::{KafkaLoader, MemoryLoader};
-use crate::state::cassandra::{CassandraCellResources, CassandraDescriptorIdentityStore};
+use crate::state::cassandra::{
+    CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
+};
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::first_write::{
     PartitionCounts, PublicationBackend, PublisherTemplate, reconcile_publications,
 };
 use crate::state::fjall::FjallClient;
 use crate::state::manager::StateManagerProvider;
-use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
+use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state_reader::{PartitionCount, SharedDeps};
@@ -27,14 +30,8 @@ use crate::{Codec, ConsumerGroup, EventIdentity, EventType};
 use std::fs;
 use std::sync::Arc;
 
-/// What [`memory_arm_inputs`] returns: `(loader, cells, identities,
-/// partition_counts)`.
-type MemoryArmInputs<P> = (
-    MemoryLoader<P>,
-    MemoryCells,
-    MemoryDescriptorIdentityStore,
-    PartitionCounts,
-);
+/// What [`memory_arm_inputs`] returns: `(loader, cells, identities)`.
+type MemoryArmInputs<P> = (MemoryLoader<P>, MemoryCells, MemoryDescriptorIdentityStore);
 
 /// Keyed-state wiring inputs shared by every mode's storage branches.
 pub(in crate::consumer) struct KeyedStateInputs {
@@ -86,8 +83,47 @@ impl KeyedStateInputs {
         )
     }
 
+    /// Publication setup for a Cassandra arm. The count source is the primary
+    /// consumer's own observation, so the routing row advertises the topology
+    /// that consumer sees. Pass the same observer the mode hands to
+    /// [`initialize_consumer`](super::runtime::initialize_consumer).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::publication_setup`].
+    pub(in crate::consumer) async fn cassandra_publication_setup(
+        &self,
+        store: CassandraPublicationStore,
+        observer: KafkaObserver,
+    ) -> Result<Option<PublisherTemplate>, ConsumerError> {
+        self.publication_setup(
+            PublicationBackend::Cassandra(store),
+            PartitionCounts::Observed(observer),
+        )
+        .await
+    }
+
+    /// Publication setup for a memory arm. Mock mode has one fixed topology and
+    /// no Kafka observation to read, so the count is [`PartitionCount::MOCK`].
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::publication_setup`].
+    pub(in crate::consumer) async fn memory_publication_setup(
+        &self,
+        store: MemoryPublicationStore,
+    ) -> Result<Option<PublisherTemplate>, ConsumerError> {
+        self.publication_setup(
+            PublicationBackend::Memory(store),
+            PartitionCounts::Fixed(PartitionCount::MOCK),
+        )
+        .await
+    }
+
     /// Runs startup reconciliation and, when publishing is active, builds the
     /// first-write publisher template for one storage arm's publication store.
+    /// The two typed wrappers above choose the count source, so a mock topology
+    /// can never reach a Cassandra routing row.
     ///
     /// Reconciliation runs whenever a subsystem is configured. It retires this
     /// group's routing rows for collections no longer published, the
@@ -107,7 +143,7 @@ impl KeyedStateInputs {
     /// propagates so the caller's build fails and the deploy retries.
     /// Per-collection permanent decode failures are logged and skipped inside
     /// [`reconcile_publications`].
-    pub(in crate::consumer) async fn publication_setup(
+    async fn publication_setup(
         &self,
         store: PublicationBackend,
         counts: PartitionCounts,
@@ -128,7 +164,7 @@ impl KeyedStateInputs {
             subsystem,
             self.group.clone(),
             Arc::new(store),
-            Arc::new(counts),
+            counts,
             self.registry.clone(),
         )))
     }
@@ -205,16 +241,12 @@ where
 {
     let loader = deps.and_then(SharedDeps::memory_loader).unwrap_or_default();
     let (cells, identities) = shared_memory_handles(shared)?;
-    let partition_counts = deps.map_or_else(
-        || PartitionCounts::Memory(PartitionCount::MOCK),
-        SharedDeps::partition_counts,
-    );
-    Ok((loader, cells, identities, partition_counts))
+    Ok((loader, cells, identities))
 }
 
-/// The Cassandra-arm inputs a consumer resolves from an optional shared bundle:
-/// the Kafka loader and the partition-count source. A supplied bundle's `Clone`
-/// shares the client and poll thread. Otherwise the loader is freshly built.
+/// The Cassandra-arm input a consumer resolves from an optional shared bundle:
+/// the Kafka loader. A supplied bundle's `Clone` shares the client and poll
+/// thread. Otherwise the loader is freshly built.
 ///
 /// A memory bundle cannot back a Cassandra arm. That mismatch is reported as
 /// [`ConsumerError::SharedDepsBackendMismatch`].
@@ -222,24 +254,17 @@ pub(in crate::consumer) fn cassandra_arm_inputs<C: Codec>(
     deps: Option<&SharedDeps<C>>,
     consumer_config: &ConsumerConfiguration,
     heartbeats: &HeartbeatRegistry,
-) -> Result<(KafkaLoader<C>, PartitionCounts), ConsumerError>
+) -> Result<KafkaLoader<C>, ConsumerError>
 where
     C::Payload: Clone,
 {
-    let loader = match deps {
+    match deps {
         Some(deps) => deps
             .kafka_loader()
-            .ok_or(ConsumerError::SharedDepsBackendMismatch)?,
+            .ok_or(ConsumerError::SharedDepsBackendMismatch),
         None => KafkaLoader::<C>::for_consumer(consumer_config, heartbeats)
-            .map_err(|error| ConsumerError::from(DeferInitError::from(error)))?,
-    };
-    let partition_counts = deps.map_or_else(
-        || PartitionCounts::Kafka {
-            bootstrap: Arc::from(consumer_config.bootstrap_servers.clone()),
-        },
-        SharedDeps::partition_counts,
-    );
-    Ok((loader, partition_counts))
+            .map_err(|error| ConsumerError::from(DeferInitError::from(error))),
+    }
 }
 
 /// Builds the keyed-state provider for a

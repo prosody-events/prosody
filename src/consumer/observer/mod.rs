@@ -13,9 +13,11 @@
 
 mod metrics;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use crate::consumer::observer::metrics::KafkaMetrics;
+use crate::error::{ClassifyError, ErrorCategory};
+use crate::state_reader::{PartitionCount, PartitionCountError};
 use arc_swap::ArcSwapOption;
 use opentelemetry::global::meter;
 use opentelemetry::metrics::Meter;
@@ -24,20 +26,11 @@ use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
 use rdkafka::error::KafkaError;
 use rdkafka::metadata::Metadata;
 use rdkafka::statistics::Partition as StatsPartition;
+use smallvec::SmallVec;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
-
-// Test-only until first-write publication reads the observation. These gates
-// and the ones on the reader methods below come off together.
-#[cfg(test)]
-use crate::error::{ClassifyError, ErrorCategory};
-#[cfg(test)]
-use crate::state_reader::{PartitionCount, PartitionCountError};
-#[cfg(test)]
-use smallvec::SmallVec;
-#[cfg(test)]
 use thiserror::Error;
+use tracing::debug;
 
 /// How often the primary consumer emits librdkafka statistics. Private on
 /// purpose: no operational caller has asked for a tunable interval.
@@ -102,12 +95,8 @@ impl KafkaSnapshot {
         }
     }
 
-    /// How many topics this generation observed.
-    ///
-    /// Startup logs this through the stored observation rather than counting
-    /// the metadata locally: it is the only production read of the
-    /// `InitialMetadata` payload while the count lookup below is test-gated,
-    /// and without it that payload is dead code.
+    /// How many topics this generation observed. Startup logs it so a bare or
+    /// empty first observation is visible in a trace.
     fn observed_topics(&self) -> usize {
         match self {
             Self::InitialMetadata(metadata) => metadata.topics().len(),
@@ -125,7 +114,6 @@ impl KafkaSnapshot {
     ///
     /// [`PartitionCountObservationError`] when the topic is absent from this
     /// observation, or present with an incomplete or non-contiguous topology.
-    #[cfg(test)]
     fn partition_count(
         &self,
         topic: &str,
@@ -273,7 +261,6 @@ impl KafkaObserver {
     ///
     /// [`PartitionCountObservationError`] when no observation is installed yet,
     /// or the current one cannot supply a count for `topic`.
-    #[cfg(test)]
     pub(crate) fn partition_count(
         &self,
         topic: &str,
@@ -339,7 +326,6 @@ fn is_assigned(id: i32, partition: &StatsPartition) -> bool {
 /// Validates that `ids` is a nonempty contiguous range from zero and converts
 /// its length into a [`PartitionCount`]. The one place both observation
 /// generations agree on what a usable topology is.
-#[cfg(test)]
 fn contiguous_count(
     mut ids: SmallVec<[i32; 16]>,
     topic: &str,
@@ -357,7 +343,6 @@ fn contiguous_count(
 }
 
 /// Why the current Kafka observation cannot supply a topic's partition count.
-#[cfg(test)]
 #[derive(Debug, Error)]
 pub(crate) enum PartitionCountObservationError {
     /// No observation is installed yet, which can only happen before consumer
@@ -383,7 +368,6 @@ pub(crate) enum PartitionCountObservationError {
     Count(#[from] PartitionCountError),
 }
 
-#[cfg(test)]
 impl PartitionCountObservationError {
     fn unknown(topic: &str) -> Self {
         Self::TopicUnknown(topic.to_owned())
@@ -396,7 +380,6 @@ impl PartitionCountObservationError {
 
 /// A missing or incomplete observation is transient: the next statistics report
 /// may repair either. Only a structurally invalid count is permanent.
-#[cfg(test)]
 impl ClassifyError for PartitionCountObservationError {
     fn classify_error(&self) -> ErrorCategory {
         match self {

@@ -13,19 +13,15 @@
 //! makes reconciliation's removal final for an un-publishing group.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::{StreamExt, TryStreamExt, stream};
 use quick_cache::sync::Cache;
-use rdkafka::ClientConfig;
-use rdkafka::consumer::{BaseConsumer, Consumer};
-use rdkafka::error::KafkaError;
 use thiserror::Error;
 use tokio::task::coop::cooperative;
-use tokio::task::{JoinError, spawn_blocking};
 use tracing::{error, warn};
 
 use crate::Topic;
+use crate::consumer::observer::{KafkaObserver, PartitionCountObservationError};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cassandra::{CassandraPublicationError, CassandraPublicationStore};
 use crate::state::memory::MemoryPublicationStore;
@@ -34,7 +30,7 @@ use crate::state::registry::CollectionDefRegistry;
 #[cfg(test)]
 use crate::state::tests::support::{ScriptedPublicationError, ScriptedPublicationStore};
 use crate::state::{STATE_FANOUT_CONCURRENCY, StateName, StateType};
-use crate::state_reader::{PartitionCount, PartitionCountError};
+use crate::state_reader::PartitionCount;
 use crate::subsystem::SubsystemName;
 
 #[cfg(test)]
@@ -45,9 +41,6 @@ mod tests;
 /// capacity-bounded `quick_cache` — never an insert-only map. Eviction only
 /// costs one extra idempotent re-run of the barrier for the evicted entry.
 const PUBLICATION_MEMO_CAPACITY: usize = 4096;
-
-/// How long the Kafka metadata fetch for a partition count may run.
-const METADATA_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Backend variance for the write-path publication store — a closed enum, so
 /// the concrete publisher type carries no store type parameter and introduces
@@ -146,65 +139,34 @@ impl PublicationBackend {
     }
 }
 
-/// The topic's live partition-count source — a closed enum, so the count fetch
-/// carries no type parameter. The `Kafka` arm builds a throwaway
-/// [`BaseConsumer`] per fetch under [`spawn_blocking`]; it only ever runs on a
-/// cold memo entry (the first write per `(collection, topic)`), never on the
-/// steady-state path.
+/// Where the publication barrier reads a topic's partition count. A closed
+/// enum, so the lookup carries no type parameter and no `dyn`.
 ///
-/// Cloning is cheap: the `Kafka` arm holds an `Arc<[String]>` and `Memory` a
-/// `Copy` count. Cloning the
-/// [`SharedDeps`](crate::state_reader::SharedDeps) bundle that carries one
-/// copies no resources.
+/// Cloning is cheap: the observer is a shared handle and the fixed count is
+/// `Copy`.
 #[derive(Clone)]
 pub(crate) enum PartitionCounts {
-    /// Fetch the count from a Kafka broker.
-    Kafka {
-        /// Bootstrap servers of the cluster to query.
-        bootstrap: Arc<[String]>,
-    },
+    /// The primary consumer's own Kafka observation. No extra client and no
+    /// broker round trip — the count comes from the snapshot that consumer
+    /// already keeps.
+    Observed(KafkaObserver),
     /// The mock topology's fixed count (mock mode).
-    Memory(PartitionCount),
+    Fixed(PartitionCount),
 }
 
 impl PartitionCounts {
-    /// The topic's live partition count.
+    /// The topic's current partition count.
     ///
     /// # Errors
     ///
-    /// A broker/metadata failure or a topic not yet in metadata classifies
-    /// `Transient` (retry); a live topic reporting a degenerate count
-    /// classifies `Permanent`. Never `Terminal`.
-    async fn live_count(&self, topic: &str) -> Result<PartitionCount, PartitionCountFetchError> {
+    /// [`PartitionCountObservationError`] when the observation cannot supply
+    /// one. An absent or incomplete topic is `Transient`, so the caller retries
+    /// until a later statistics report repairs it; only a structurally invalid
+    /// count is `Permanent`. Never `Terminal`.
+    fn live_count(&self, topic: &str) -> Result<PartitionCount, PartitionCountObservationError> {
         match self {
-            Self::Memory(count) => Ok(*count),
-            Self::Kafka { bootstrap } => {
-                let servers = bootstrap.join(",");
-                let topic_owned = topic.to_owned();
-                let count = spawn_blocking(move || {
-                    let consumer: BaseConsumer = ClientConfig::new()
-                        .set("bootstrap.servers", servers)
-                        .create()?;
-                    let metadata =
-                        consumer.fetch_metadata(Some(&topic_owned), METADATA_FETCH_TIMEOUT)?;
-                    // Count the partitions of the requested topic. A topic
-                    // absent from metadata (or reporting zero partitions) is
-                    // treated as "not ready yet" — Transient.
-                    let partitions = metadata
-                        .topics()
-                        .iter()
-                        .find(|t| t.name() == topic_owned)
-                        .filter(|t| t.error().is_none())
-                        .map_or(0, |t| t.partitions().len());
-                    Ok::<usize, KafkaError>(partitions)
-                })
-                .await??;
-                let count = i32::try_from(count).unwrap_or(i32::MAX);
-                if count == 0_i32 {
-                    return Err(PartitionCountFetchError::TopicNotReady(topic.to_owned()));
-                }
-                Ok(PartitionCount::try_from(count)?)
-            }
+            Self::Fixed(count) => Ok(*count),
+            Self::Observed(observer) => observer.partition_count(topic),
         }
     }
 }
@@ -226,7 +188,7 @@ pub(crate) struct PublisherTemplate {
     subsystem: SubsystemName,
     group: Arc<str>,
     store: Arc<PublicationBackend>,
-    counts: Arc<PartitionCounts>,
+    counts: PartitionCounts,
     memo: Arc<Cache<PublicationMemoKey, ()>>,
     registry: Arc<CollectionDefRegistry>,
 }
@@ -237,7 +199,7 @@ impl PublisherTemplate {
         subsystem: SubsystemName,
         group: Arc<str>,
         store: Arc<PublicationBackend>,
-        counts: Arc<PartitionCounts>,
+        counts: PartitionCounts,
         registry: Arc<CollectionDefRegistry>,
     ) -> Self {
         Self::with_memo_capacity(
@@ -257,7 +219,7 @@ impl PublisherTemplate {
         subsystem: SubsystemName,
         group: Arc<str>,
         store: Arc<PublicationBackend>,
-        counts: Arc<PartitionCounts>,
+        counts: PartitionCounts,
         registry: Arc<CollectionDefRegistry>,
         capacity: usize,
     ) -> Self {
@@ -302,8 +264,8 @@ impl FirstWritePublisher {
     /// added for published state must call the barrier first too.
     ///
     /// For a `Published`, cold-memo `(collection, topic)` the sequence is:
-    /// 1. fetch the topic's live partition count (must ride the caller's retry
-    ///    posture);
+    /// 1. read the topic's partition count from the consumer's Kafka
+    ///    observation (must ride the caller's retry posture);
     /// 2. **best-effort** own-row read to detect a changed partition count. A
     ///    read failure is logged at `warn!` and skips the check; it never
     ///    blocks the upsert, since step 3 overwrites the row regardless. A
@@ -327,7 +289,7 @@ impl FirstWritePublisher {
     ///
     /// # Errors
     ///
-    /// Any of the count fetch or the upsert failing. The error classifies
+    /// An unavailable partition count or a failing upsert. The error classifies
     /// `Permanent`/`Transient` only — never `Terminal` — so the settle path
     /// retries it forever and `commit()` re-runs the handler.
     pub(crate) async fn ensure_one(
@@ -347,7 +309,7 @@ impl FirstWritePublisher {
         if t.memo.get(&key).is_some() {
             return Ok(());
         }
-        let live = t.counts.live_count(self.topic.as_ref()).await?;
+        let live = t.counts.live_count(self.topic.as_ref())?;
         // Detect a changed partition count. A stored own-row count that differs
         // from the live count means the topic was repartitioned, which is
         // unsupported (see this method's doc). Log it as an error. The blind
@@ -462,9 +424,10 @@ pub(crate) enum PublicationError {
     #[error(transparent)]
     Store(#[from] PublicationBackendError),
 
-    /// The topic's live partition count could not be fetched.
+    /// The topic's partition count was not available from the Kafka
+    /// observation.
     #[error(transparent)]
-    Count(#[from] PartitionCountFetchError),
+    Count(#[from] PartitionCountObservationError),
 }
 
 impl ClassifyError for PublicationError {
@@ -502,36 +465,6 @@ impl ClassifyError for PublicationBackendError {
         match category {
             ErrorCategory::Permanent => ErrorCategory::Permanent,
             ErrorCategory::Transient | ErrorCategory::Terminal => ErrorCategory::Transient,
-        }
-    }
-}
-
-/// Error fetching a topic's live partition count. Never `Terminal`.
-#[derive(Debug, Error)]
-pub(crate) enum PartitionCountFetchError {
-    /// A Kafka broker/metadata error — retryable.
-    #[error("kafka metadata fetch failed: {0:#}")]
-    Kafka(#[from] KafkaError),
-
-    /// The blocking metadata fetch task failed to join — retryable.
-    #[error("partition-count fetch task failed: {0}")]
-    Join(#[from] JoinError),
-
-    /// The topic is not yet visible in cluster metadata — retryable (it may
-    /// not be created yet).
-    #[error("topic {0:?} not yet visible in cluster metadata")]
-    TopicNotReady(String),
-
-    /// A live topic reported a degenerate partition count — a data problem.
-    #[error(transparent)]
-    Count(#[from] PartitionCountError),
-}
-
-impl ClassifyError for PartitionCountFetchError {
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            Self::Kafka(_) | Self::Join(_) | Self::TopicNotReady(_) => ErrorCategory::Transient,
-            Self::Count(e) => e.classify_error(),
         }
     }
 }

@@ -3,7 +3,7 @@
 
 mod capture;
 mod startup;
-mod support;
+pub(crate) mod support;
 
 use super::{KafkaObserver, KafkaSnapshot, PartitionCountObservationError};
 use crate::consumer::config::ConsumerConfiguration;
