@@ -1,6 +1,8 @@
 //! Tests for the Kafka consumer observation: the shared partition-count rule,
 //! the borrowed assignment iterator, the gauges, and the real startup install.
 
+mod capture;
+mod startup;
 mod support;
 
 use super::{KafkaObserver, KafkaSnapshot, PartitionCountObservationError};
@@ -8,6 +10,10 @@ use crate::consumer::config::ConsumerConfiguration;
 use crate::consumer::error::ConsumerError;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state_reader::PartitionCountError;
+use capture::{
+    FETCH_BYTES, FETCH_MESSAGES, METADATA_AGE, gauge_value, observer_with, partition_gauge,
+    test_meter,
+};
 use color_eyre::Result;
 use color_eyre::eyre::{bail, ensure, eyre};
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -18,12 +24,13 @@ use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::DefaultProducerContext;
 use rdkafka::statistics::Partition as StatsPartition;
+use startup::initialize_with;
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, TcpListener};
 use std::time::Duration;
 use support::{
-    Assignment, Entry, FETCH_BYTES, FETCH_MESSAGES, GROUP, METADATA_AGE, Report, TOPIC, Topology,
-    assigned_ids, contiguous, gauge_value, guard_of, identity, initialize_with, observer_with,
-    partition_gauge, statistics_of_partitions, statistics_with, test_meter,
+    Assignment, Entry, GROUP, Report, TOPIC, Topology, assigned_ids, contiguous, guard_of,
+    identity, statistics_of_partitions, statistics_with,
 };
 
 /// The statistics view reports a count exactly when an independent calculation
@@ -312,7 +319,12 @@ async fn startup_installs_metadata_into_the_callers_observer() -> Result<()> {
 }
 
 /// A consumer refuses to start when its mandatory startup metadata fetch fails,
-/// and installs nothing.
+/// and leaves no observation behind.
+///
+/// The observer starts out holding a report, which is the state a real failure
+/// reaches: dropping the primary consumer polls its queue a last time and can
+/// dispatch statistics into the observer. So the assertion is that construction
+/// cleared it, not merely that it never wrote.
 #[tokio::test(flavor = "multi_thread")]
 async fn startup_fails_when_metadata_is_unreachable() -> Result<()> {
     let config = ConsumerConfiguration::builder()
@@ -320,9 +332,11 @@ async fn startup_fails_when_metadata_is_unreachable() -> Result<()> {
         .bootstrap_servers(vec!["127.0.0.1:1".to_owned()])
         .group_id("observer-unreachable-group")
         .subscribed_topics(vec![TOPIC.to_owned()])
+        .probe_port(None)
         .build()?;
     let (provider, _exporter) = test_meter();
     let observer = observer_with(&config.group_id, Duration::from_millis(250), &provider);
+    observer.observe_statistics(statistics_with(&[(TOPIC, 0, &contiguous(1))]));
 
     match initialize_with(&config, observer.clone()).await? {
         Ok(consumer) => {
@@ -336,9 +350,53 @@ async fn startup_fails_when_metadata_is_unreachable() -> Result<()> {
     }
     ensure!(
         observer.snapshot().is_none(),
-        "a failed startup fetch must install no observation"
+        "a failed startup fetch must leave no observation"
     );
     Ok(())
+}
+
+/// A failed startup releases its probe port before returning. Dropping the
+/// server only signals graceful shutdown, so a caller that retried construction
+/// on the same port would find the listener still bound.
+#[tokio::test]
+async fn failed_startup_releases_the_probe_port() -> Result<()> {
+    let port = free_port()?;
+    let config = ConsumerConfiguration::builder()
+        // Port 1 is unassigned, so the connection is refused rather than hung.
+        .bootstrap_servers(vec!["127.0.0.1:1".to_owned()])
+        .group_id("observer-probe-group")
+        .subscribed_topics(vec![TOPIC.to_owned()])
+        .probe_port(port)
+        .build()?;
+    let (provider, _exporter) = test_meter();
+    let observer = observer_with(&config.group_id, Duration::from_millis(250), &provider);
+
+    match initialize_with(&config, observer).await? {
+        Ok(consumer) => {
+            consumer.shutdown().await;
+            bail!("construction succeeded without a startup observation");
+        }
+        Err(error) => ensure!(
+            matches!(error, ConsumerError::Kafka(_)),
+            "expected a Kafka error, got {error:#}"
+        ),
+    }
+    // Binding synchronously: nothing between the failed construction and this
+    // call yields, so the probe task cannot close its listener behind the
+    // assertion's back.
+    ensure!(
+        TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok(),
+        "the probe port was still bound after construction failed"
+    );
+    Ok(())
+}
+
+/// A port nothing is listening on. Binding an ephemeral port and closing it
+/// leaves that port free and unlikely to be claimed again.
+fn free_port() -> Result<u16> {
+    Ok(TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?
+        .local_addr()?
+        .port())
 }
 
 /// Statistics replace the whole observation, and a guard taken beforehand keeps

@@ -20,7 +20,6 @@ use parking_lot::Mutex;
 use rdkafka::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
-use rdkafka::error::KafkaError;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::watch;
@@ -137,11 +136,24 @@ where
     // dispatch a handler. The fetch blocks, so it runs on a blocking thread and
     // hands the consumer back.
     let fetch_observer = observer.clone();
-    let consumer = spawn_blocking(move || {
+    let fetched = spawn_blocking(move || {
         fetch_observer.install_startup_metadata(&consumer)?;
-        Ok::<_, KafkaError>(consumer)
+        Ok::<_, ConsumerError>(consumer)
     })
-    .await??;
+    .await;
+
+    let consumer = match fetched.map_err(ConsumerError::StartupTask) {
+        Ok(Ok(consumer)) => consumer,
+        Ok(Err(error)) | Err(error) => {
+            // The task is over, so its consumer is dropped — and that drop
+            // polls the client's queue a last time, which can dispatch a
+            // statistics report into the observer. Clearing here, rather than
+            // inside the task, is what leaves a failed construction with no
+            // observation. It covers a panicking fetch for the same reason.
+            observer.clear();
+            return Err(release_probe(probe_server, error).await);
+        }
+    };
 
     let poll_interval = consumer_config.poll_interval;
     let heartbeat = heartbeats.register("Kafka poll loop");
@@ -177,6 +189,18 @@ where
         runtime_state,
         heartbeats,
     })
+}
+
+/// Releases the probe port, then returns `error` for construction to fail with.
+///
+/// Dropping a [`ProbeServer`] only signals its graceful shutdown; nothing waits
+/// for the listener to close. A caller that retries construction on the same
+/// port would race the old listener, so the failure path waits here instead.
+async fn release_probe(probe_server: Option<ProbeServer>, error: ConsumerError) -> ConsumerError {
+    if let Some(server) = probe_server {
+        server.shutdown().await;
+    }
+    error
 }
 
 /// The primary consumer's librdkafka configuration: offsets are committed

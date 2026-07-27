@@ -77,9 +77,10 @@ pub(crate) struct KafkaObserver {
 
 /// The shared observation and its gauges.
 ///
-/// Invariant: the snapshot may be absent only before `initialize_consumer`
-/// completes its startup metadata fetch. No event handler is reachable during
-/// that interval, so a running consumer always has an observation.
+/// Invariant: a running consumer always has an observation. The snapshot is
+/// absent only before `initialize_consumer` installs the startup metadata, and
+/// after a construction that failed discards it. No event handler is reachable
+/// in either case.
 struct KafkaObserverInner {
     snapshot: ArcSwapOption<KafkaSnapshot>,
     metrics: KafkaMetrics,
@@ -218,6 +219,17 @@ impl KafkaObserver {
         );
         self.inner.snapshot.store(Some(Arc::new(snapshot)));
         Ok(())
+    }
+
+    /// Discards the observation, leaving the observer as constructed.
+    ///
+    /// Construction calls this when it fails, once the primary consumer has
+    /// been dropped. That drop polls the client's queue one last time and can
+    /// dispatch a statistics report into this observer, so clearing any earlier
+    /// would not stick. A failed construction must leave nothing installed: a
+    /// clone that outlives it would otherwise read a dead client's view.
+    pub(in crate::consumer) fn clear(&self) {
+        self.inner.snapshot.store(None);
     }
 
     /// Records the gauges from `statistics`, then replaces the whole
