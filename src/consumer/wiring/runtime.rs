@@ -5,7 +5,7 @@ use crate::consumer::config::ConsumerConfiguration;
 use crate::consumer::error::ConsumerError;
 use crate::consumer::handler::{EventHandler, HandlerProvider};
 use crate::consumer::kafka_context::{ContextHandles, PartitionProviders, new_context};
-use crate::consumer::observer::{KafkaObserver, STATISTICS_INTERVAL};
+use crate::consumer::observer::KafkaObserver;
 use crate::consumer::poll::{PollConfig, poll};
 use crate::consumer::probes::ProbeServer;
 use crate::consumer::{Managers, ProsodyConsumer, RuntimeState, WatermarkVersion};
@@ -50,9 +50,9 @@ pub(in crate::consumer) struct StartupServices<'a> {
 /// partition machinery to a Kafka consumer and starting its background poll
 /// loop. The provider creates per-partition stores with independent caches.
 ///
-/// The primary consumer is the sole source of Kafka observations: it carries
-/// the statistics interval, and its first observation is seeded here by
-/// [`KafkaObserver::install_startup_metadata`], which owns that contract.
+/// The primary consumer is the sole source of Kafka observations: it is the
+/// client configured to report statistics, and its first observation is seeded
+/// by [`KafkaObserver::install_startup_metadata`], which owns that contract.
 ///
 /// Fails if the configuration is invalid, the probe server can't be started
 /// (if enabled), the consumer context can't be created, the hostname can't be
@@ -198,8 +198,8 @@ async fn release_probe(probe_server: Option<ProbeServer>, error: ConsumerError) 
 }
 
 /// The primary consumer's librdkafka configuration: offsets are committed
-/// automatically but stored by prosody, and the client emits statistics on the
-/// observer's interval.
+/// automatically but stored by prosody, and the client reports statistics on
+/// the configured interval.
 ///
 /// # Errors
 ///
@@ -223,7 +223,7 @@ fn client_config(consumer_config: &ConsumerConfiguration) -> Result<ClientConfig
         )
         .set(
             "statistics.interval.ms",
-            STATISTICS_INTERVAL.as_millis().to_string(),
+            consumer_config.statistics_interval.as_millis().to_string(),
         )
         .set("enable.auto.offset.store", "false")
         .set("auto.offset.reset", "earliest")

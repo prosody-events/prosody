@@ -1,7 +1,8 @@
 //! Unit tests for consumer-build configuration cross-checks.
 
 use super::{
-    MIN_RECOVERY_EVIDENCE_TTL_SECONDS, RECOVERY_TTL_DELAY_MULTIPLIER, validate_recovery_ttl_margin,
+    DEFAULT_STATISTICS_INTERVAL, MAX_STATISTICS_INTERVAL, MIN_RECOVERY_EVIDENCE_TTL_SECONDS,
+    RECOVERY_TTL_DELAY_MULTIPLIER, validate_recovery_ttl_margin, validate_statistics_interval,
 };
 use crate::timers::duration::CompactDuration;
 use quickcheck::TestResult;
@@ -39,4 +40,32 @@ fn prop_dedup_ttl_must_clear_the_recovery_margin(delay_secs: u32, below: bool) -
 fn the_defaults_clear_the_margin() {
     let delay = CompactDuration::new(30);
     assert!(validate_recovery_ttl_margin(Duration::from_hours(7 * 24), delay).is_ok());
+}
+
+/// A statistics interval is accepted exactly when librdkafka can carry it: at
+/// least one whole millisecond, at most 24 hours. Anything shorter truncates to
+/// zero milliseconds, which would silently stop reporting.
+///
+/// Falsify: relax either bound in [`validate_statistics_interval`]. The
+/// sub-millisecond and over-24-hour intervals then pass.
+#[quickcheck]
+fn prop_statistics_interval_accepts_only_what_librdkafka_carries(
+    exponent: u8,
+    offset: u32,
+) -> TestResult {
+    // One nanosecond to roughly 292 years, so both bounds stay reachable from
+    // quickcheck's small integer generator.
+    let nanos = (1_u64 << (exponent % 63)).saturating_add(u64::from(offset));
+    let interval = Duration::from_nanos(nanos);
+    let accepted = validate_statistics_interval(&interval).is_ok();
+    TestResult::from_bool(
+        accepted == (interval.as_millis() >= 1 && interval <= MAX_STATISTICS_INTERVAL),
+    )
+}
+
+/// The default interval survives its own validation, so a consumer that
+/// configures nothing builds.
+#[test]
+fn the_default_statistics_interval_validates() {
+    assert!(validate_statistics_interval(&DEFAULT_STATISTICS_INTERVAL).is_ok());
 }

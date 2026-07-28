@@ -32,13 +32,6 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::debug;
 
-/// How often the primary consumer emits librdkafka statistics.
-///
-/// rdkafka parses each report from JSON on the thread that polls it, and the
-/// tree grows with the client's known brokers, topics, and partitions. The
-/// interval buys observation freshness at that parse cost.
-pub(in crate::consumer) const STATISTICS_INTERVAL: Duration = Duration::from_secs(5);
-
 /// How long the startup metadata fetch may run before construction fails.
 const STARTUP_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 

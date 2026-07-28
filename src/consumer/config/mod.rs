@@ -23,7 +23,7 @@ use derive_builder::Builder;
 use std::env::var;
 use std::time::Duration;
 use thiserror::Error;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 /// Environment variable name for the Kafka consumer group ID.
 const PROSODY_GROUP_ID: &str = "PROSODY_GROUP_ID";
@@ -37,6 +37,13 @@ const RECOVERY_TTL_DELAY_MULTIPLIER: u64 = 48;
 /// Absolute floor for the deduplication TTL when state is registered, in
 /// seconds (1 hour) — the larger of this and `48 × recovery_delay` applies.
 const MIN_RECOVERY_EVIDENCE_TTL_SECONDS: u64 = 3_600;
+
+/// Default statistics reporting interval. See
+/// [`ConsumerConfiguration::statistics_interval`].
+const DEFAULT_STATISTICS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Longest statistics interval librdkafka accepts.
+const MAX_STATISTICS_INTERVAL: Duration = Duration::from_hours(24);
 
 /// Configuration for the Kafka consumer.
 ///
@@ -163,6 +170,28 @@ pub struct ConsumerConfiguration {
         setter(into)
     )]
     pub commit_interval: Duration,
+
+    /// How often the consumer's Kafka client reports librdkafka statistics.
+    ///
+    /// Environment variable: `PROSODY_STATISTICS_INTERVAL`
+    /// Default: 5 seconds
+    ///
+    /// Each report arrives as JSON that rdkafka parses on the poll thread, and
+    /// it grows with the client's brokers, topics, and partitions. A shorter
+    /// interval spends more poll-thread time on that parse.
+    ///
+    /// Reporting cannot be turned off. Reports are the only thing that
+    /// refreshes the observed partition counts published keyed state routes
+    /// on, and they drive the fetch-queue and metadata-age gauges. Raise
+    /// the interval to make them cheaper. The accepted range is 1
+    /// millisecond to 24 hours.
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_STATISTICS_INTERVAL\", \
+                   DEFAULT_STATISTICS_INTERVAL)?",
+        setter(into)
+    )]
+    #[validate(custom(function = "validate_statistics_interval"))]
+    pub statistics_interval: Duration,
 
     /// Use a mock consumer for testing purposes.
     ///
@@ -338,6 +367,23 @@ impl ConsumerConfigurationBuilder {
     pub(crate) fn configured_consumer_group(&self) -> Option<String> {
         self.group_id.clone().or_else(|| var(PROSODY_GROUP_ID).ok())
     }
+}
+
+/// Validates the statistics interval against what librdkafka accepts.
+///
+/// The interval reaches librdkafka in whole milliseconds, where zero means "do
+/// not report". A sub-millisecond duration would truncate to zero and disable
+/// reporting silently, so it is rejected instead.
+fn validate_statistics_interval(interval: &Duration) -> Result<(), ValidationError> {
+    if interval.as_millis() == 0 {
+        return Err(ValidationError::new(
+            "statistics_interval_below_a_millisecond",
+        ));
+    }
+    if *interval > MAX_STATISTICS_INTERVAL {
+        return Err(ValidationError::new("statistics_interval_above_24_hours"));
+    }
+    Ok(())
 }
 
 /// Validates that the deduplication TTL clears the keyed-state recovery
