@@ -13,20 +13,13 @@
 //! splicing, a mid-stream scan error after a source has pinned, and a
 //! source-call trace proving a pinned scan never opens the decoy source.
 
-use super::support::{
-    CountingIdentityStore, FaultPoint, GROUP_A, GROUP_B, ScriptedCellSource, ScriptedEnv,
-    collect_stream, mock_count, owner_commit, publish_scripted, registry_of, scripted_deps,
-    source_state_key, state_name, subsystem, topic,
-};
+use super::support::{FaultPoint, GROUP_A, GROUP_B, ScriptedEnv, collect_stream, topic};
 use crate::Key;
 use crate::codec::JsonCodec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::Direction;
 use crate::state::descriptor::{DequeDescriptor, deque_state, map_state};
 use crate::state::order_codec::I64KeyCodec;
-use crate::state::registry::CollectionDef;
-use crate::state::tests::support::ScriptedPublicationStore;
-use crate::state_reader::cache::ReaderCache;
 use crate::state_reader::{StateReader, StateReaderError};
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::StreamExt;
@@ -305,50 +298,17 @@ async fn scan_midstream_error_propagates() -> Result<()> {
 /// batch.
 #[tokio::test]
 async fn get_many_error_beats_all_none() -> Result<()> {
-    let cells = ScriptedCellSource::new();
-    let publications = ScriptedPublicationStore::new();
-    let identities = CountingIdentityStore::new();
-    let descriptor = map_state::<I64KeyCodec, JsonCodec>("m-err-none");
-    let name = state_name("m-err-none")?;
-    let sub = subsystem()?;
-    let count = mock_count();
+    let env = ScriptedEnv::new(map_state::<I64KeyCodec, JsonCodec>("m-err-none"))?;
     let key = Key::from("user-1");
-
     let tp_a = topic("topic-a");
     let tp_b = topic("topic-b");
-    let sk_a = source_state_key(tp_a, GROUP_A, &key, count)?;
 
     // A (lowest) faults at open; B is published but holds none of the batch
     // cells, so it answers an all-`None` buffer.
-    cells.fault_at(sk_a.segment_id, FaultPoint::AtOpen);
-    publish_scripted(
-        (&publications, &identities),
-        &sub,
-        &name,
-        GROUP_A,
-        tp_a,
-        count,
-        &descriptor,
-    )
-    .await;
-    publish_scripted(
-        (&publications, &identities),
-        &sub,
-        &name,
-        GROUP_B,
-        tp_b,
-        count,
-        &descriptor,
-    )
-    .await;
-
-    let deps = scripted_deps(
-        cells,
-        publications,
-        identities,
-        ReaderCache::with_budget(1 << 20),
-    );
-    let reader = StateReader::new_eager(&deps, sub, descriptor)?;
+    env.fault(GROUP_A, tp_a, &key, FaultPoint::AtOpen)?;
+    env.publish(GROUP_A, tp_a).await;
+    env.publish(GROUP_B, tp_b).await;
+    let reader = env.reader_eager()?;
 
     match reader.get_many(key, &[0, 1]).await {
         Err(error) if error.classify_error() == ErrorCategory::Transient => Ok(()),
@@ -366,77 +326,28 @@ async fn get_many_error_beats_all_none() -> Result<()> {
 /// Key 1 would then carry B's value and the `None` assert goes red.
 #[tokio::test]
 async fn get_many_answers_from_one_source() -> Result<()> {
-    let cells = ScriptedCellSource::new();
-    let publications = ScriptedPublicationStore::new();
-    let identities = CountingIdentityStore::new();
-    let descriptor = map_state::<I64KeyCodec, JsonCodec>("m-coherent");
-    let name = state_name("m-coherent")?;
-    let sub = subsystem()?;
-    let count = mock_count();
+    let env = ScriptedEnv::new(map_state::<I64KeyCodec, JsonCodec>("m-coherent"))?;
     let key = Key::from("user-1");
-    let registry = registry_of(&descriptor, CollectionDef::new(None))?;
-
     let tp_a = topic("topic-a");
     let tp_b = topic("topic-b");
-    let sk_a = source_state_key(tp_a, GROUP_A, &key, count)?;
-    let sk_b = source_state_key(tp_b, GROUP_B, &key, count)?;
 
     // A is the lowest source and holds only key 0; B is the decoy and holds
     // only key 1, tagged distinctly.
-    owner_commit(
-        &cells.cells(),
-        &registry,
-        &sk_a,
-        descriptor,
-        1,
-        |h| async move {
-            h.set(0, Value::from("A0"))
-                .await
-                .map_err(|e| eyre!("set: {e}"))
-        },
-    )
+    env.commit(GROUP_A, tp_a, &key, 1, |h| async move {
+        h.set(0, Value::from("A0"))
+            .await
+            .map_err(|e| eyre!("set: {e}"))
+    })
     .await?;
-    owner_commit(
-        &cells.cells(),
-        &registry,
-        &sk_b,
-        descriptor,
-        2,
-        |h| async move {
-            h.set(1, Value::from("B1"))
-                .await
-                .map_err(|e| eyre!("set: {e}"))
-        },
-    )
+    env.commit(GROUP_B, tp_b, &key, 2, |h| async move {
+        h.set(1, Value::from("B1"))
+            .await
+            .map_err(|e| eyre!("set: {e}"))
+    })
     .await?;
-    publish_scripted(
-        (&publications, &identities),
-        &sub,
-        &name,
-        GROUP_A,
-        tp_a,
-        count,
-        &descriptor,
-    )
-    .await;
-    publish_scripted(
-        (&publications, &identities),
-        &sub,
-        &name,
-        GROUP_B,
-        tp_b,
-        count,
-        &descriptor,
-    )
-    .await;
-
-    let deps = scripted_deps(
-        cells,
-        publications,
-        identities,
-        ReaderCache::with_budget(1 << 20),
-    );
-    let reader = StateReader::new_eager(&deps, sub, descriptor)?;
+    env.publish(GROUP_A, tp_a).await;
+    env.publish(GROUP_B, tp_b).await;
+    let reader = env.reader_eager()?;
 
     let got = reader.get_many(key, &[0, 1]).await?;
     assert_eq!(

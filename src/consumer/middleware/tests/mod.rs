@@ -154,6 +154,23 @@ struct RecordingGuard {
     aborted: Arc<AtomicUsize>,
 }
 
+impl RecordingGuard {
+    /// A fresh guard and the two counters it records into, in
+    /// `(guard, committed, aborted)` order.
+    fn new() -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let committed: Arc<AtomicUsize> = Arc::default();
+        let aborted: Arc<AtomicUsize> = Arc::default();
+        (
+            Self {
+                committed: committed.clone(),
+                aborted: aborted.clone(),
+            },
+            committed,
+            aborted,
+        )
+    }
+}
+
 impl Uncommitted for RecordingGuard {
     async fn commit(self) {
         self.committed.fetch_add(1, Ordering::SeqCst);
@@ -512,12 +529,7 @@ mod staged_rollback {
         let (context, cell_store, cart_id) = buffered(Ctx::with_shutdown_on_timer_read).await?;
         let handler = ProbeHandler::ok(0);
         let log = handler.log.clone();
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(&handler, context, guard, Ok(0)).await;
 
@@ -612,12 +624,7 @@ mod staged_rollback {
         handle.set(json!({ "x": 1_i32 })).await?;
 
         let handler = ProbeHandler::ok(0);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(&handler, context.clone(), guard, Ok(0)).await;
 
@@ -771,12 +778,7 @@ mod staged_rollback {
         let context = MockEventContext::new().with_session(session);
         let read = Arc::new(Mutex::new(None));
         let handler = SkipReadProbe { read: read.clone() };
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, _aborted) = RecordingGuard::new();
 
         settle(&handler, context, guard, Ok(0)).await;
 
@@ -839,12 +841,7 @@ mod staged_rollback {
                     return TestResult::error("failed to buffer the write");
                 };
                 let handler = ProbeHandler::ok(0);
-                let committed = Arc::new(AtomicUsize::new(0));
-                let aborted = Arc::new(AtomicUsize::new(0));
-                let guard = RecordingGuard {
-                    committed: committed.clone(),
-                    aborted: aborted.clone(),
-                };
+                let (guard, committed, aborted) = RecordingGuard::new();
 
                 settle(&handler, context, guard, Ok(0)).await;
 
@@ -1045,12 +1042,7 @@ mod hook_visibility {
             )
             .await?;
         let handler = HookProbe::new(vec![StateName::try_new("cart")?]);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(&handler, context, guard, Ok(0)).await;
 
@@ -1165,12 +1157,7 @@ mod hook_visibility {
         let context = base.with_session(session);
 
         let handler = HookProbe::new(vec![cart]);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(&handler, context, guard, Ok(0)).await;
 
@@ -1266,12 +1253,7 @@ mod hook_visibility {
         let context = MockEventContext::new().with_session(session);
 
         let handler = HookProbe::new(vec![cart, wishlist]);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(&handler, context, guard, Ok(0)).await;
 
@@ -1897,12 +1879,7 @@ mod marker_record_must_succeed {
         handle.set(json!({ "x": 1_i32 })).await?;
 
         let handler = ProbeHandler::ok(0);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(
             &handler,
@@ -1938,12 +1915,7 @@ mod marker_record_must_succeed {
         handle.set(json!({ "x": 1_i32 })).await?;
 
         let handler = ProbeHandler::ok(0);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(
             &handler,
@@ -1984,12 +1956,7 @@ mod marker_record_must_succeed {
             let (session, _cell_store, _cart_id) = flaky_session(oracle.clone(), timer)?;
             let context = MockEventContext::new().with_session(session);
             let handler = ProbeHandler::ok(0);
-            let committed = Arc::new(AtomicUsize::new(0));
-            let aborted = Arc::new(AtomicUsize::new(0));
-            let guard = RecordingGuard {
-                committed: committed.clone(),
-                aborted: aborted.clone(),
-            };
+            let (guard, committed, aborted) = RecordingGuard::new();
 
             settle(&handler, context, guard, result).await;
 
@@ -2041,12 +2008,7 @@ mod marker_record_must_succeed {
                 }
 
                 let handler = ProbeHandler::ok(0);
-                let committed = Arc::new(AtomicUsize::new(0));
-                let aborted = Arc::new(AtomicUsize::new(0));
-                let guard = RecordingGuard {
-                    committed: committed.clone(),
-                    aborted: aborted.clone(),
-                };
+                let (guard, committed, aborted) = RecordingGuard::new();
 
                 settle(&handler, context, guard, Ok(0)).await;
 

@@ -1,10 +1,12 @@
-//! Tests for first-write publication at the settle boundary and the
-//! mid-handler `commit()` path.
+//! Tests for first-write publication at the settle boundary, and the fixtures
+//! the [`commit`] path's tests share with them.
 //!
 //! A `Published` collection's routing row is written before its committed
 //! state. A failing publication store blocks the durable write rather than
 //! settling an unpublished collection. Shutdown during publication abandons
 //! the event without staging anything.
+
+mod commit;
 
 use super::*;
 use crate::consumer::observer::KafkaObserver;
@@ -15,6 +17,7 @@ use crate::state::descriptor::tests::{FixedOracle, TestSession, test_session_wit
 use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
 use crate::state::first_write::{PartitionCounts, PublicationBackend, PublisherTemplate};
 use crate::state::memory::MemoryCellStore;
+use crate::state::publication::StatePublication;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, StateVisibility};
 use crate::state::store::CellStore;
 use crate::state::tests::cell_suite::value_cell;
@@ -44,30 +47,35 @@ fn cart() -> ValueDescriptor {
     value_state("cart")
 }
 
-fn published_registry() -> Result<CollectionDefRegistry> {
+/// A registry with every named collection registered `Published`. A test that
+/// names two writes only one, proving that only touched collections advertise.
+fn published_registry(names: &[&'static str]) -> Result<CollectionDefRegistry> {
     let mut registry = CollectionDefRegistry::default();
-    registry
-        .register(
-            &cart(),
-            CollectionDef {
-                visibility: StateVisibility::Published,
-                ..CollectionDef::new(None)
-            },
-        )
-        .map_err(|e| eyre!("register cart: {e}"))?;
+    for name in names {
+        registry
+            .register(
+                &value_state(name) as &ValueDescriptor,
+                CollectionDef {
+                    visibility: StateVisibility::Published,
+                    ..CollectionDef::new(None)
+                },
+            )
+            .map_err(|e| eyre!("register {name}: {e}"))?;
+    }
     Ok(registry)
 }
 
 fn publisher_template(
     store: ScriptedPublicationStore,
     observer: &KafkaObserver,
+    names: &[&'static str],
 ) -> Result<PublisherTemplate> {
     Ok(PublisherTemplate::new(
-        SubsystemName::try_new(SUBSYSTEM).map_err(|e| eyre!("subsystem: {e}"))?,
+        subsystem()?,
         Arc::from(GROUP),
         Arc::new(PublicationBackend::Scripted(store)),
         PartitionCounts::Observed(observer.clone()),
-        Arc::new(published_registry()?),
+        Arc::new(published_registry(names)?),
     ))
 }
 
@@ -88,64 +96,64 @@ async fn committed_value(
         .map_err(|e| eyre!("read committed: {e}"))
 }
 
-/// Buffers one value write on a Published `cart` through a real session
-/// carrying a first-write publisher over `store`. No finalize — `settle`
-/// owns the only stage. Returns the settle-ready context, the durable
-/// store, and the cell id.
-async fn buffered_published(
-    configure: impl FnOnce(Ctx) -> Ctx,
+/// A real session over `store`, carrying a first-write publisher for every
+/// `Published` collection in `names`, keyed by `key`. Nothing is written yet.
+/// Returns the context, the durable store, and `cart`'s cell id.
+fn published_context(
     store: ScriptedPublicationStore,
     observer: &KafkaObserver,
+    names: &[&'static str],
+    key: u128,
 ) -> Result<(Ctx, MemoryCellStore<FixedOracle>, CollectionId)> {
-    let state_key = StateKey::new(Uuid::from_u128(0x7), Arc::from("user-1"));
-    let publisher = publisher_template(store, observer)?.bind(Intern::<str>::from(TOPIC));
+    let state_key = StateKey::new(Uuid::from_u128(key), Arc::from("user-1"));
+    let publisher = publisher_template(store, observer, names)?.bind(Intern::<str>::from(TOPIC));
     let (session, cell_store) = test_session_with_publisher(
         MemoryLoader::new(),
-        published_registry()?,
+        published_registry(names)?,
         state_key.clone(),
         publisher,
     );
-    let context: Ctx = configure(MockEventContext::new().with_session(session));
+    let cart_id = CollectionId::new(state_key, StateType::Application, state_name("cart")?);
+    let context: Ctx = MockEventContext::new().with_session(session);
+    Ok((context, cell_store, cart_id))
+}
+
+/// Writes one value into a `Published` `cart` on a [`published_context`]. No
+/// finalize — `settle` owns the only stage.
+async fn buffered_published(
+    store: ScriptedPublicationStore,
+    observer: &KafkaObserver,
+) -> Result<(Ctx, MemoryCellStore<FixedOracle>, CollectionId)> {
+    let (context, cell_store, cart_id) = published_context(store, observer, &["cart"], 0x7)?;
+    write_cart(&context).await?;
+    Ok((context, cell_store, cart_id))
+}
+
+/// Binds `cart` on `context` and writes one value into it.
+async fn write_cart(context: &Ctx) -> Result<()> {
     let handle = context
         .state(Registered::new(cart()))
         .map_err(|e| eyre!("bind cart: {e}"))?;
     handle.set(json!({ "x": 1_i32 })).await?;
-    let cart_id = CollectionId::new(
-        state_key,
-        StateType::Application,
-        StateName::try_new("cart").map_err(|e| eyre!("name: {e}"))?,
-    );
-    Ok((context, cell_store, cart_id))
+    Ok(())
 }
 
 fn subsystem() -> Result<SubsystemName> {
     SubsystemName::try_new(SUBSYSTEM).map_err(|e| eyre!("subsystem: {e}"))
 }
 
-fn cart_state_name() -> Result<StateName> {
-    StateName::try_new("cart").map_err(|e| eyre!("name: {e}"))
+fn state_name(name: &str) -> Result<StateName> {
+    StateName::try_new(name).map_err(|e| eyre!("name: {e}"))
 }
 
-fn wishlist_state_name() -> Result<StateName> {
-    StateName::try_new("wishlist").map_err(|e| eyre!("name: {e}"))
-}
-
-/// A registry with both `cart` and `wishlist` registered `Published`.
-/// Lets a test register two published collections while writing only
-/// one.
-fn two_published_registry() -> Result<CollectionDefRegistry> {
-    let mut registry = published_registry()?;
-    let wishlist: ValueDescriptor = value_state("wishlist");
-    registry
-        .register(
-            &wishlist,
-            CollectionDef {
-                visibility: StateVisibility::Published,
-                ..CollectionDef::new(None)
-            },
-        )
-        .map_err(|e| eyre!("register wishlist: {e}"))?;
-    Ok(registry)
+/// The routing rows `store` holds for one collection of this suite's subsystem.
+async fn publication_rows(
+    store: &ScriptedPublicationStore,
+    name: &str,
+) -> Result<Vec<StatePublication>> {
+    Ok(store
+        .rows(&subsystem()?, StateType::Application, &state_name(name)?)
+        .await)
 }
 
 /// The routing row is written before the durable state. The gated upsert
@@ -156,15 +164,9 @@ fn two_published_registry() -> Result<CollectionDefRegistry> {
 async fn publication_precedes_the_durable_write() -> Result<()> {
     let store = ScriptedPublicationStore::gated();
     let observer = observing(GROUP, &[(TOPIC, 3_i32), (DECOY, 7_i32)]);
-    let (context, cell_store, cart_id) =
-        buffered_published(|c| c, store.clone(), &observer).await?;
+    let (context, cell_store, cart_id) = buffered_published(store.clone(), &observer).await?;
     let handler = ProbeHandler::ok(0);
-    let committed = Arc::new(AtomicUsize::new(0));
-    let aborted = Arc::new(AtomicUsize::new(0));
-    let guard = RecordingGuard {
-        committed: committed.clone(),
-        aborted: aborted.clone(),
-    };
+    let (guard, committed, aborted) = RecordingGuard::new();
 
     let task = tokio::spawn(async move {
         settle(&handler, context, guard, Ok(0)).await;
@@ -186,9 +188,7 @@ async fn publication_precedes_the_durable_write() -> Result<()> {
     store.release();
     task.await.map_err(|e| eyre!("settle task: {e}"))?;
 
-    let rows = store
-        .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
-        .await;
+    let rows = publication_rows(&store, "cart").await?;
     assert_eq!(rows.len(), 1, "the routing row landed");
     assert_eq!(
         i32::from(rows[0].partition_count),
@@ -217,15 +217,9 @@ async fn publication_precedes_the_durable_write() -> Result<()> {
 async fn failed_publication_blocks_the_write() -> Result<()> {
     let store = ScriptedPublicationStore::failing();
     let observer = observing(GROUP, &[(TOPIC, 3_i32)]);
-    let (context, cell_store, cart_id) =
-        buffered_published(|c| c, store.clone(), &observer).await?;
+    let (context, cell_store, cart_id) = buffered_published(store.clone(), &observer).await?;
     let handler = ProbeHandler::ok(0);
-    let committed = Arc::new(AtomicUsize::new(0));
-    let aborted = Arc::new(AtomicUsize::new(0));
-    let guard = RecordingGuard {
-        committed: committed.clone(),
-        aborted: aborted.clone(),
-    };
+    let (guard, committed, aborted) = RecordingGuard::new();
 
     let task = tokio::spawn(async move {
         settle(&handler, context, guard, Ok(0)).await;
@@ -251,9 +245,7 @@ async fn failed_publication_blocks_the_write() -> Result<()> {
         .map_err(|_| eyre!("settle did not finish after the store healed"))?
         .map_err(|e| eyre!("settle task: {e}"))?;
 
-    let rows = store
-        .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
-        .await;
+    let rows = publication_rows(&store, "cart").await?;
     assert_eq!(
         rows.len(),
         1,
@@ -284,19 +276,13 @@ async fn shutdown_during_publication_abandons() -> Result<()> {
     // before any upsert is attempted.
     let store = ScriptedPublicationStore::failing();
     let observer = observing(GROUP, &[(TOPIC, 3_i32)]);
-    let (context, cell_store, cart_id) =
-        buffered_published(|c| c, store.clone(), &observer).await?;
+    let (context, cell_store, cart_id) = buffered_published(store.clone(), &observer).await?;
     // Request shutdown AFTER the write is buffered: the write itself needs
     // a live session first. Settle's publish loop then sees shutdown at
     // its top.
     context.request_shutdown();
     let handler = ProbeHandler::ok(0);
-    let committed = Arc::new(AtomicUsize::new(0));
-    let aborted = Arc::new(AtomicUsize::new(0));
-    let guard = RecordingGuard {
-        committed: committed.clone(),
-        aborted: aborted.clone(),
-    };
+    let (guard, committed, aborted) = RecordingGuard::new();
 
     settle(&handler, context, guard, Ok(0)).await;
 
@@ -308,85 +294,8 @@ async fn shutdown_during_publication_abandons() -> Result<()> {
         "nothing staged when shutdown pre-empts publication",
     );
     assert!(
-        store
-            .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
-            .await
-            .is_empty(),
+        publication_rows(&store, "cart").await?.is_empty(),
         "no routing row is written on the shutdown-abandon path",
-    );
-    Ok(())
-}
-
-/// The mid-handler `commit()` path publishes before its direct durable
-/// write. A successful publication lets `commit()` write the cell. A
-/// failing publication store makes `commit()` return `Err` and leaves no
-/// durable cell: the routing row gates `write_resolved`.
-#[tokio::test]
-async fn commit_path_publishes_before_write_resolved() -> Result<()> {
-    // Success: commit publishes then writes.
-    let store = ScriptedPublicationStore::new();
-    let observer = observing(GROUP, &[(TOPIC, 3_i32)]);
-    let state_key = StateKey::new(Uuid::from_u128(0x9), Arc::from("user-1"));
-    let publisher = publisher_template(store.clone(), &observer)?.bind(Intern::<str>::from(TOPIC));
-    let (session, cell_store) = test_session_with_publisher(
-        MemoryLoader::new(),
-        published_registry()?,
-        state_key.clone(),
-        publisher,
-    );
-    let context: Ctx = MockEventContext::new().with_session(session);
-    let handle = context
-        .state(Registered::new(cart()))
-        .map_err(|e| eyre!("bind cart: {e}"))?;
-    handle.set(json!({ "x": 1_i32 })).await?;
-    assert_eq!(
-        handle.commit().await.map_err(|e| eyre!("commit: {e}"))?,
-        StoreOutcome::Applied,
-        "commit() durably applied the cell",
-    );
-
-    let cart_id = CollectionId::new(state_key, StateType::Application, cart_state_name()?);
-    let rows = store
-        .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
-        .await;
-    assert_eq!(rows.len(), 1, "commit() published a routing row");
-    assert_eq!(i32::from(rows[0].partition_count), 3_i32);
-    assert!(
-        committed_value(&cell_store, &cart_id).await?.is_some(),
-        "commit() wrote the cell durably",
-    );
-
-    // Failure: a failing store makes commit() error and write nothing.
-    let store = ScriptedPublicationStore::failing();
-    let state_key = StateKey::new(Uuid::from_u128(0xA), Arc::from("user-2"));
-    let publisher = publisher_template(store.clone(), &observer)?.bind(Intern::<str>::from(TOPIC));
-    let (session, cell_store) = test_session_with_publisher(
-        MemoryLoader::new(),
-        published_registry()?,
-        state_key.clone(),
-        publisher,
-    );
-    let context: Ctx = MockEventContext::new().with_session(session);
-    let handle = context
-        .state(Registered::new(cart()))
-        .map_err(|e| eyre!("bind cart: {e}"))?;
-    handle.set(json!({ "x": 1_i32 })).await?;
-    assert!(
-        handle.commit().await.is_err(),
-        "commit() fails when publication fails",
-    );
-    let cart_id = CollectionId::new(state_key, StateType::Application, cart_state_name()?);
-    assert_eq!(
-        committed_value(&cell_store, &cart_id).await?,
-        None,
-        "no durable cell when publication gates the write",
-    );
-    assert!(
-        store
-            .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
-            .await
-            .is_empty(),
-        "no routing row when the failing store rejects the upsert",
     );
     Ok(())
 }
@@ -403,35 +312,14 @@ async fn commit_path_publishes_before_write_resolved() -> Result<()> {
 #[tokio::test]
 async fn only_written_published_collections_are_advertised() -> Result<()> {
     let store = ScriptedPublicationStore::new();
-    let state_key = StateKey::new(Uuid::from_u128(0xB), Arc::from("user-1"));
-    let publisher = PublisherTemplate::new(
-        subsystem()?,
-        Arc::from(GROUP),
-        Arc::new(PublicationBackend::Scripted(store.clone())),
-        PartitionCounts::Observed(observing(GROUP, &[(TOPIC, 3_i32)])),
-        Arc::new(two_published_registry()?),
-    )
-    .bind(Intern::<str>::from(TOPIC));
-    let (session, _cell_store) = test_session_with_publisher(
-        MemoryLoader::new(),
-        two_published_registry()?,
-        state_key,
-        publisher,
-    );
-    let context: Ctx = MockEventContext::new().with_session(session);
+    let observer = observing(GROUP, &[(TOPIC, 3_i32)]);
+    let (context, _cell_store, _cart_id) =
+        published_context(store.clone(), &observer, &["cart", "wishlist"], 0xB)?;
     // Write ONLY cart; wishlist is Published but untouched by this event.
-    let handle = context
-        .state(Registered::new(cart()))
-        .map_err(|e| eyre!("bind cart: {e}"))?;
-    handle.set(json!({ "x": 1_i32 })).await?;
+    write_cart(&context).await?;
 
     let handler = ProbeHandler::ok(0);
-    let committed = Arc::new(AtomicUsize::new(0));
-    let aborted = Arc::new(AtomicUsize::new(0));
-    let guard = RecordingGuard {
-        committed: committed.clone(),
-        aborted: aborted.clone(),
-    };
+    let (guard, committed, _aborted) = RecordingGuard::new();
     settle(&handler, context, guard, Ok(0)).await;
 
     assert_eq!(
@@ -450,19 +338,10 @@ async fn only_written_published_collections_are_advertised() -> Result<()> {
         "the unwritten published collection is NOT advertised",
     );
     assert!(
-        store
-            .rows(
-                &subsystem()?,
-                StateType::Application,
-                &wishlist_state_name()?
-            )
-            .await
-            .is_empty(),
+        publication_rows(&store, "wishlist").await?.is_empty(),
         "no routing row for a published collection that never wrote",
     );
-    let cart_rows = store
-        .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
-        .await;
+    let cart_rows = publication_rows(&store, "cart").await?;
     assert_eq!(
         cart_rows.len(),
         1,
@@ -499,15 +378,9 @@ async fn unobserved_topic_blocks_the_write_until_the_snapshot_repairs() -> Resul
     // An observation that knows a decoy topic but not the one being written.
     let observer = observing(GROUP, &[(DECOY, 7_i32)]);
     let store = ScriptedPublicationStore::gated();
-    let (context, cell_store, cart_id) =
-        buffered_published(|c| c, store.clone(), &observer).await?;
+    let (context, cell_store, cart_id) = buffered_published(store.clone(), &observer).await?;
     let handler = ProbeHandler::ok(0);
-    let committed = Arc::new(AtomicUsize::new(0));
-    let aborted = Arc::new(AtomicUsize::new(0));
-    let guard = RecordingGuard {
-        committed: committed.clone(),
-        aborted: aborted.clone(),
-    };
+    let (guard, committed, aborted) = RecordingGuard::new();
 
     let (events, capture) = capture_events(Level::ERROR);
     let settling = settle(&handler, context, guard, Ok(0));
@@ -557,9 +430,7 @@ async fn unobserved_topic_blocks_the_write_until_the_snapshot_repairs() -> Resul
         .map_err(|_| eyre!("settle never finished after the routing row landed"))?;
     drop(capture);
 
-    let rows = store
-        .rows(&subsystem()?, StateType::Application, &cart_state_name()?)
-        .await;
+    let rows = publication_rows(&store, "cart").await?;
     ensure!(rows.len() == 1, "exactly one routing row landed");
     ensure!(
         rows[0].group_id.as_ref() == GROUP && rows[0].topic.as_ref() == TOPIC,
