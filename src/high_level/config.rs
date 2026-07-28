@@ -10,26 +10,93 @@ use crate::cassandra::{
     CassandraConfiguration,
     config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError},
 };
+use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
 use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilderError;
+use crate::consumer::middleware::defer::DeferConfigurationBuilder;
 use crate::consumer::middleware::defer::{DeferConfigError, DeferConfiguration};
+use crate::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
 use crate::consumer::middleware::monopolization::{
     MonopolizationConfiguration, MonopolizationConfigurationBuilderError,
 };
+use crate::consumer::middleware::retry::RetryConfigurationBuilder;
 use crate::consumer::middleware::retry::{RetryConfiguration, RetryConfigurationBuilderError};
+use crate::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 use crate::consumer::middleware::scheduler::{
     SchedulerConfigurationBuilderError, SchedulerInitError,
 };
+use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use crate::consumer::middleware::timeout::TimeoutConfigurationBuilderError;
+use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::middleware::topic::{
     FailureTopicConfiguration, FailureTopicConfigurationBuilderError,
 };
 use crate::consumer::{
-    CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilderError,
+    CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
+    ConsumerConfigurationBuilderError, KeyedStateConfiguration,
+    KeyedStateConfigurationBuilderError,
 };
-use crate::high_level::ConsumerBuilders;
 use crate::high_level::mode::Mode;
 use crate::state::descriptor::{Registered, StateDescriptor};
+use crate::telemetry::emitter::TelemetryEmitterConfiguration;
 use thiserror::Error;
+
+/// Builder configuration for consumer and middleware components.
+///
+/// Bundles all consumer-related configuration builders to reduce parameter
+/// count in `HighLevelClient::new`. Build a starting set with [`Self::new`].
+pub struct ConsumerBuilders {
+    /// Consumer configuration builder.
+    pub consumer: ConsumerConfigurationBuilder,
+    /// Retry middleware configuration builder.
+    pub retry: RetryConfigurationBuilder,
+    /// Failure topic middleware configuration builder.
+    pub failure_topic: FailureTopicConfigurationBuilder,
+    /// Scheduler middleware configuration builder.
+    pub scheduler: SchedulerConfigurationBuilder,
+    /// Monopolization middleware configuration builder.
+    pub monopolization: MonopolizationConfigurationBuilder,
+    /// Defer middleware configuration builder.
+    pub defer: DeferConfigurationBuilder,
+    /// Deduplication middleware configuration builder.
+    pub dedup: DeduplicationConfigurationBuilder,
+    /// Timeout middleware configuration builder.
+    pub timeout: TimeoutConfigurationBuilder,
+    /// Keyed-state configuration (always-on; carries collection
+    /// registrations). Mode-independent — every mode threads it through.
+    pub keyed_state: KeyedStateConfiguration,
+    /// Telemetry emitter configuration.
+    pub emitter: TelemetryEmitterConfiguration,
+}
+
+impl ConsumerBuilders {
+    /// Every builder at its default, with the keyed-state section resolved from
+    /// the environment.
+    ///
+    /// Fallible only because that section reads environment overrides: an
+    /// override the operator supplied but got wrong fails here instead of being
+    /// replaced by a default. A `Default` impl could not report that, so there
+    /// is none.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyedStateConfigurationBuilderError`] when a `PROSODY_STATE_*`
+    /// override is set to a value that cannot be parsed. An unset or blank
+    /// variable takes its default and never errors.
+    pub fn new() -> Result<Self, KeyedStateConfigurationBuilderError> {
+        Ok(Self {
+            consumer: ConsumerConfigurationBuilder::default(),
+            retry: RetryConfigurationBuilder::default(),
+            failure_topic: FailureTopicConfigurationBuilder::default(),
+            scheduler: SchedulerConfigurationBuilder::default(),
+            monopolization: MonopolizationConfigurationBuilder::default(),
+            defer: DeferConfigurationBuilder::default(),
+            dedup: DeduplicationConfigurationBuilder::default(),
+            timeout: TimeoutConfigurationBuilder::default(),
+            keyed_state: KeyedStateConfiguration::builder().build()?,
+            emitter: TelemetryEmitterConfiguration::default(),
+        })
+    }
+}
 
 /// Parameters for building a mode configuration.
 pub(crate) struct ModeConfigurationBuildParams<'a> {

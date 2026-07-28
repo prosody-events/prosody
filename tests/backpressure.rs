@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use crate::common::ChannelHandler;
+use crate::common::handler::ChannelHandler;
 use color_eyre::eyre::Result;
 use prosody::tracing::init_test_logging;
 use prosody::{
@@ -41,7 +41,7 @@ async fn test_backpressure() -> Result<()> {
     init_test_logging();
 
     // Create a unique four-partition topic for the test
-    let (topic, admin_client) = common::create_topic_with_partitions(4).await?;
+    let (topic, admin_client) = common::kafka::create_topic_with_partitions(4).await?;
     let bootstrap: Vec<String> = vec!["localhost:9094".to_owned()];
 
     // Use a channel with a buffer capacity to accommodate slow processing

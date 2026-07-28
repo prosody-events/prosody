@@ -175,7 +175,7 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     init_test_logging();
 
     // Create a topic with 3 partitions
-    let (topic, admin_client) = common::create_topic_with_partitions(3).await?;
+    let (topic, admin_client) = common::kafka::create_topic_with_partitions(3).await?;
     let bootstrap = vec!["localhost:9094".to_owned()];
 
     // Configure test parameters

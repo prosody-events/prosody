@@ -263,7 +263,7 @@ async fn test_producer_deduplication() -> Result<()> {
             &cfg,
             &common::create_cassandra_trigger_store_config(),
             KeyedStateConfiguration::builder().build()?,
-            CloneProvider::new(common::ChannelHandler::new(tx)),
+            CloneProvider::new(common::handler::ChannelHandler::new(tx)),
             Telemetry::new(),
         )
         .await?;

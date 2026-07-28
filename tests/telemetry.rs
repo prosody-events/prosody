@@ -32,7 +32,7 @@ use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 mod common;
-use common::{FallibleTestHandler, TestError, TransientError};
+use common::handler::{FallibleTestHandler, TestError, TransientError};
 
 const BOOTSTRAP: &str = "localhost:9094";
 const CASSANDRA_HOST: &str = "localhost:9042";

@@ -6,7 +6,8 @@
 
 #![recursion_limit = "256"]
 
-use crate::common::{FallibleTestHandler, collect_messages_with_timeout};
+use crate::common::handler::FallibleTestHandler;
+use crate::common::receive::collect_messages_with_timeout;
 use color_eyre::eyre::{Result, ensure};
 use prosody::tracing::init_test_logging;
 use prosody::{

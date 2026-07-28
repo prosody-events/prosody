@@ -16,7 +16,8 @@ use uuid::Uuid;
 
 mod common;
 
-use common::{ChannelHandler, create_cassandra_trigger_store_config};
+use common::create_cassandra_trigger_store_config;
+use common::handler::ChannelHandler;
 
 #[tokio::test]
 async fn stateless_cassandra_consumer_does_not_create_the_fjall_cache_dir() -> Result<()> {

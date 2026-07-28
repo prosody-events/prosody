@@ -8,7 +8,7 @@
 
 #![recursion_limit = "256"]
 
-use crate::common::ChannelHandler;
+use crate::common::handler::ChannelHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::tracing::init_test_logging;
 use prosody::{
@@ -57,7 +57,7 @@ async fn run_scenario(
     event_suffix: &'static str,
 ) -> Result<()> {
     // Create a unique single-partition Kafka topic for the test.
-    let (topic, admin_client) = common::create_single_partition_topic().await?;
+    let (topic, admin_client) = common::kafka::create_topic_with_partitions(1).await?;
     let bootstrap = vec!["localhost:9094".to_owned()];
 
     // Build producer and consumer configurations.

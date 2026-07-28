@@ -1,117 +1,46 @@
-//! High-level client module for managing both producer and consumer operations.
+//! High-level client: one handle owning both a producer and a consumer.
 //!
-//! This module provides a unified interface for message production and
-//! consumption in various operational modes through the `HighLevelClient`
-//! struct.
+//! [`HighLevelClient`] is built from [`ConsumerBuilders`] and a [`Mode`], then
+//! driven through [`subscribe`](HighLevelClient::subscribe) /
+//! [`unsubscribe`](HighLevelClient::unsubscribe). The shared infrastructure it
+//! hands to consumers and readers alike lives in `deps`; topic reconciliation
+//! in `topics`; the consumer's state machine in [`state`].
 
 use crate::cassandra::config::CassandraConfigurationBuilder;
 use crate::consumer::middleware::FallibleHandler;
-use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
-use crate::consumer::middleware::defer::DeferConfigurationBuilder;
-use crate::consumer::middleware::monopolization::MonopolizationConfigurationBuilder;
-use crate::consumer::middleware::retry::RetryConfigurationBuilder;
-use crate::consumer::middleware::scheduler::{SchedulerConfigurationBuilder, SchedulerInitError};
-use crate::consumer::middleware::timeout::TimeoutConfigurationBuilder;
-use crate::consumer::middleware::topic::FailureTopicConfigurationBuilder;
 use crate::consumer::{
-    CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder, ConsumerError,
-    ConsumerSetup, KeyedStateConfiguration, KeyedStateConfigurationBuilderError,
     LowLatencyMiddlewareConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
-use crate::high_level::config::{
-    ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
-    TriggerStoreConfiguration,
-};
+pub use crate::high_level::config::ConsumerBuilders;
+use crate::high_level::config::{ModeConfiguration, ModeConfigurationBuildParams};
+pub use crate::high_level::error::HighLevelClientError;
 pub use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
-use crate::loader::MemoryLoader;
-use crate::producer::{
-    ProducerConfiguration, ProducerConfigurationBuilder, ProducerConfigurationBuilderError,
-    ProducerError, ProsodyProducer,
-};
+use crate::high_level::topics::missing_topics;
+use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder, ProsodyProducer};
 use crate::propagator::new_propagator;
 use crate::state::descriptor::{Registered, StateDescriptor};
-use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
-use crate::state_reader::{
-    DEFAULT_READER_CACHE_SIZE_BYTES, SharedDeps, StateReader, StateReaderError,
-};
+#[cfg(test)]
+use crate::state_reader::SharedDeps;
+use crate::state_reader::StateReader;
 use crate::subsystem::SubsystemName;
-use crate::telemetry::emitter::TelemetryEmitterConfiguration;
-use crate::telemetry::{EmitterError, Telemetry, spawn_telemetry_emitter};
+use crate::telemetry::{Telemetry, spawn_telemetry_emitter};
 use crate::{Codec, JsonCodec, Topic};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
-use std::time::Duration;
-use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::info;
 
 pub mod config;
+mod deps;
+mod error;
 pub mod mode;
 pub mod state;
+mod topics;
 
 #[cfg(test)]
 mod tests;
-
-/// Builder configuration for consumer and middleware components.
-///
-/// Bundles all consumer-related configuration builders to reduce parameter
-/// count in `HighLevelClient::new`.
-///
-/// Build a starting set with [`Self::new`]. It applies every default, and is
-/// fallible only because the keyed-state section reads environment overrides:
-/// an override the operator supplied but got wrong fails here instead of being
-/// replaced by a default. There is no `Default` impl, which could not report
-/// that.
-pub struct ConsumerBuilders {
-    /// Consumer configuration builder.
-    pub consumer: ConsumerConfigurationBuilder,
-    /// Retry middleware configuration builder.
-    pub retry: RetryConfigurationBuilder,
-    /// Failure topic middleware configuration builder.
-    pub failure_topic: FailureTopicConfigurationBuilder,
-    /// Scheduler middleware configuration builder.
-    pub scheduler: SchedulerConfigurationBuilder,
-    /// Monopolization middleware configuration builder.
-    pub monopolization: MonopolizationConfigurationBuilder,
-    /// Defer middleware configuration builder.
-    pub defer: DeferConfigurationBuilder,
-    /// Deduplication middleware configuration builder.
-    pub dedup: DeduplicationConfigurationBuilder,
-    /// Timeout middleware configuration builder.
-    pub timeout: TimeoutConfigurationBuilder,
-    /// Keyed-state configuration (always-on; carries collection
-    /// registrations). Mode-independent — every mode threads it through.
-    pub keyed_state: KeyedStateConfiguration,
-    /// Telemetry emitter configuration.
-    pub emitter: TelemetryEmitterConfiguration,
-}
-
-impl ConsumerBuilders {
-    /// Every builder at its default, with the keyed-state section resolved from
-    /// the environment.
-    ///
-    /// # Errors
-    ///
-    /// [`KeyedStateConfigurationBuilderError`] when a `PROSODY_STATE_*`
-    /// override is set to a value that cannot be parsed. An unset or blank
-    /// variable takes its default and never errors.
-    pub fn new() -> Result<Self, KeyedStateConfigurationBuilderError> {
-        Ok(Self {
-            consumer: ConsumerConfigurationBuilder::default(),
-            retry: RetryConfigurationBuilder::default(),
-            failure_topic: FailureTopicConfigurationBuilder::default(),
-            scheduler: SchedulerConfigurationBuilder::default(),
-            monopolization: MonopolizationConfigurationBuilder::default(),
-            defer: DeferConfigurationBuilder::default(),
-            dedup: DeduplicationConfigurationBuilder::default(),
-            timeout: TimeoutConfigurationBuilder::default(),
-            keyed_state: KeyedStateConfiguration::builder().build()?,
-            emitter: TelemetryEmitterConfiguration::default(),
-        })
-    }
-}
 
 /// A combined client that manages both producer and consumer operations.
 #[derive(Educe)]
@@ -158,9 +87,8 @@ where
 
     /// Returns the configured source system identifier.
     ///
-    /// The source system is used to identify the originating service or
-    /// component in produced messages, enabling message tracing and loop
-    /// detection.
+    /// The source system identifies the originating service in produced
+    /// messages, enabling message tracing and loop detection.
     #[must_use]
     pub fn source_system(&self) -> &str {
         &self.producer_config.source_system
@@ -208,8 +136,8 @@ where
         }?;
 
         // Mock mode is offline: the emitter opens no real broker connection
-        // (just as `check_topic_existence` below is skipped). The returned
-        // spawn flag is unused here.
+        // (just as the topic check below is skipped). The returned spawn flag is
+        // unused here.
         spawn_telemetry_emitter(
             &consumer_builders.emitter,
             &producer_config.bootstrap_servers,
@@ -223,17 +151,21 @@ where
             cassandra_builder,
         });
 
-        // Check for topic existence only if not in mock mode
-        if !producer_config.mock {
-            check_topic_existence(&producer, &consumer_state)?;
+        // Only a configured consumer has topics to check, and only a live client
+        // can ask the cluster about them.
+        if !producer_config.mock
+            && let ConsumerState::Configured { config, .. } = &consumer_state
+        {
+            let missing = missing_topics(&producer, config.configured_topics())?;
+            if !missing.is_empty() {
+                return Err(HighLevelClientError::TopicsNotFound(missing));
+            }
         }
-
-        let consumer = Mutex::new(consumer_state);
 
         Ok(Self {
             producer,
             producer_config,
-            consumer,
+            consumer: Mutex::new(consumer_state),
             propagator: new_propagator(),
             telemetry,
         })
@@ -319,7 +251,7 @@ where
         C::Payload: Clone,
     {
         let mut guard = self.consumer.lock().await;
-        let deps = shared_deps(&mut guard).await?;
+        let deps = deps::get_or_build(&mut guard).await?;
         StateReader::new(&deps, subsystem, descriptor).map_err(HighLevelClientError::StateReader)
     }
 
@@ -337,18 +269,17 @@ where
         C::Payload: crate::EventType + Clone,
     {
         let mut guard = self.consumer.lock().await;
-        let consumer_ref = &mut *guard;
 
         // Take the state out. Only `Configured` proceeds; the others restore
         // themselves (or leave `Unconfigured`) and return their errors.
-        let (config, existing_deps) = match take(consumer_ref) {
+        let (config, existing_deps) = match take(&mut *guard) {
             ConsumerState::Unconfigured => return Err(HighLevelClientError::UnconfiguredConsumer),
             ConsumerState::ConfigurationFailed(error) => {
                 return Err(HighLevelClientError::ConsumerConfiguration(error));
             }
             ConsumerState::Configured { config, deps } => (config, deps),
             running @ ConsumerState::Running { .. } => {
-                *consumer_ref = running;
+                *guard = running;
                 return Err(HighLevelClientError::AlreadySubscribed);
             }
         };
@@ -356,12 +287,12 @@ where
         // Build (or reuse the memoized) bundle now that we own the config, so
         // the running consumer and any reader share it. A build failure here
         // must stay retryable, so restore `Configured` (no bundle) and return.
-        let deps = match existing_deps {
-            Some(deps) => deps,
-            None => match build_shared_deps(&config).await {
-                Ok(deps) => deps,
+        let shared = match existing_deps {
+            Some(shared) => shared,
+            None => match deps::build(&config).await {
+                Ok(shared) => shared,
                 Err(error) => {
-                    *consumer_ref = ConsumerState::Configured { config, deps: None };
+                    *guard = ConsumerState::Configured { config, deps: None };
                     return Err(error);
                 }
             },
@@ -379,7 +310,7 @@ where
                 common,
                 trigger_store,
             } => ProsodyConsumer::<C>::pipeline_consumer(
-                setup(consumer, trigger_store, common, &deps),
+                deps::consumer_setup(consumer, trigger_store, common, &shared),
                 PipelineMiddlewareConfiguration {
                     retry: retry.clone(),
                     monopolization: monopolization.clone(),
@@ -397,7 +328,7 @@ where
                 common,
                 trigger_store,
             } => ProsodyConsumer::low_latency_consumer(
-                setup(consumer, trigger_store, common, &deps),
+                deps::consumer_setup(consumer, trigger_store, common, &shared),
                 LowLatencyMiddlewareConfiguration {
                     retry: retry.clone(),
                     failure_topic: failure_topic.clone(),
@@ -413,7 +344,7 @@ where
                 common,
                 trigger_store,
             } => ProsodyConsumer::<C>::best_effort_consumer(
-                setup(consumer, trigger_store, common, &deps),
+                deps::consumer_setup(consumer, trigger_store, common, &shared),
                 self.telemetry.clone(),
                 handler.clone(),
             )
@@ -429,16 +360,16 @@ where
                 // live rdkafka poll thread, and registered heartbeat would
                 // otherwise be stranded. The next `subscribe` rebuilds a
                 // fresh one.
-                *consumer_ref = ConsumerState::Configured { config, deps: None };
+                *guard = ConsumerState::Configured { config, deps: None };
                 return Err(error);
             }
         };
 
-        *consumer_ref = ConsumerState::Running {
+        *guard = ConsumerState::Running {
             consumer,
             config,
             handler,
-            deps,
+            deps: shared,
         };
 
         Ok(())
@@ -453,7 +384,6 @@ where
     pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>> {
         let consumer = {
             let mut guard = self.consumer.lock().await;
-            let consumer_ref = &mut *guard;
 
             // Restore `Configured` without a bundle: the taken `Running.deps`
             // is dropped here. Its heartbeat registry holds this consumer's
@@ -461,17 +391,17 @@ where
             // same registry on a later `subscribe` would count that dead
             // heartbeat in `is_stalled` forever and grow the registry with no
             // removal path. The next `subscribe` rebuilds a fresh bundle.
-            match take(consumer_ref) {
+            match take(&mut *guard) {
                 state @ (ConsumerState::Unconfigured
                 | ConsumerState::ConfigurationFailed(_)
                 | ConsumerState::Configured { .. }) => {
-                    *consumer_ref = state;
+                    *guard = state;
                     return Err(HighLevelClientError::NotSubscribed);
                 }
                 ConsumerState::Running {
                     consumer, config, ..
                 } => {
-                    *consumer_ref = ConsumerState::Configured { config, deps: None };
+                    *guard = ConsumerState::Configured { config, deps: None };
                     consumer
                 }
             }
@@ -503,209 +433,4 @@ where
 
         consumer.is_stalled()
     }
-}
-
-/// Checks if all required topics exist for the given consumer state.
-fn check_topic_existence<S, C: Codec, D: Codec>(
-    producer: &ProsodyProducer<C>,
-    consumer_state: &ConsumerState<S, D>,
-) -> Result<(), HighLevelClientError<C::Error>>
-where
-    C::Payload: crate::EventIdentity,
-{
-    let ConsumerState::Configured { config, .. } = &consumer_state else {
-        return Ok(());
-    };
-
-    let missing_topics = missing_topics(producer, config.configured_topics())?;
-    if missing_topics.is_empty() {
-        Ok(())
-    } else {
-        Err(HighLevelClientError::TopicsNotFound(missing_topics))
-    }
-}
-
-/// Returns the shared bundle for the given consumer state, building and
-/// memoizing it into a `Configured` state on first need. The caller holds the
-/// `consumer` lock, so this exclusive `&mut` access is race-free. `Running`
-/// already carries its bundle; `Unconfigured`/`ConfigurationFailed` have no
-/// config to build from and error.
-async fn shared_deps<T, C: Codec>(
-    state: &mut ConsumerState<T, C>,
-) -> Result<SharedDeps<C>, HighLevelClientError<C::Error>>
-where
-    C::Payload: Clone,
-{
-    match state {
-        ConsumerState::Running { deps, .. } => Ok(deps.clone()),
-        ConsumerState::Configured { config, deps } => {
-            if let Some(existing) = deps.as_ref() {
-                return Ok(existing.clone());
-            }
-            let built = build_shared_deps(config).await?;
-            *deps = Some(built.clone());
-            Ok(built)
-        }
-        ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => {
-            Err(HighLevelClientError::UnconfiguredConsumer)
-        }
-    }
-}
-
-/// Builds the one shared infrastructure bundle from a mode configuration.
-/// Pairs a mode's configuration sections with the client's shared
-/// infrastructure. Every mode passes the same bundle, so a consumer the client
-/// builds always reuses the one Cassandra session and loader the client already
-/// opened.
-fn setup<'a, C: Codec>(
-    consumer: &'a ConsumerConfiguration,
-    trigger_store: &'a TriggerStoreConfiguration,
-    common: &'a CommonConfiguration,
-    deps: &SharedDeps<C>,
-) -> ConsumerSetup<'a, C> {
-    ConsumerSetup {
-        consumer,
-        trigger_store,
-        common,
-        deps: Some(deps.clone()),
-    }
-}
-
-/// The bundle depends only on the trigger-store backend, group id, and cache
-/// budget, all of which are mode-independent, so the same build serves any
-/// mode. This mirrors the Cassandra-session reuse in `StorePair::new`.
-/// `InMemory` selects the memory arm, mock mode or not. Its bundle carries the
-/// shared in-memory stores, so a reader built from it gets read-your-writes
-/// against the running consumer.
-async fn build_shared_deps<C: Codec>(
-    mode: &ModeConfiguration,
-) -> Result<SharedDeps<C>, HighLevelClientError<C::Error>>
-where
-    C::Payload: Clone,
-{
-    let (consumer, keyed_state, trigger_store) = match mode {
-        ModeConfiguration::Pipeline {
-            consumer,
-            common,
-            trigger_store,
-            ..
-        }
-        | ModeConfiguration::LowLatency {
-            consumer,
-            common,
-            trigger_store,
-            ..
-        }
-        | ModeConfiguration::BestEffort {
-            consumer,
-            common,
-            trigger_store,
-        } => (consumer, &common.keyed_state, trigger_store),
-    };
-    // One knob: the reader cache follows `read_cache_size_bytes`, then
-    // `cache_size_bytes`, then the built-in default.
-    let budget = keyed_state
-        .read_cache_size_bytes
-        .or(keyed_state.cache_size_bytes)
-        .unwrap_or(DEFAULT_READER_CACHE_SIZE_BYTES);
-    let deps = match trigger_store {
-        TriggerStoreConfiguration::InMemory => SharedDeps::memory(
-            consumer.group_id.clone(),
-            consumer.stall_threshold,
-            MemoryCells::new(),
-            MemoryPublicationStore::new(),
-            MemoryDescriptorIdentityStore::new(),
-            MemoryLoader::new(),
-            budget.get(),
-        ),
-        TriggerStoreConfiguration::Cassandra(cassandra) => {
-            SharedDeps::connect(consumer, cassandra, budget).await?
-        }
-    };
-    Ok(deps.with_default_read_cache_ttl(keyed_state.read_cache_ttl))
-}
-
-/// Identifies which topics from the given list are missing in the Kafka
-/// cluster.
-fn missing_topics<C: Codec>(
-    producer: &ProsodyProducer<C>,
-    mut topics: Vec<Topic>,
-) -> Result<Vec<Topic>, ProducerError<C::Error>>
-where
-    C::Payload: crate::EventIdentity,
-{
-    const TIMEOUT: Duration = Duration::from_mins(1);
-    let metadata = producer.kafka_client().fetch_metadata(None, TIMEOUT)?;
-
-    topics.sort_unstable();
-    topics.dedup();
-
-    // Filter out topics that start with '^' as they are pattern-based subscriptions
-    topics.retain(|topic| !topic.starts_with('^'));
-
-    for metadata_topic in metadata.topics() {
-        let topic_name = metadata_topic.name();
-        let Some(position) = topics
-            .iter()
-            .position(|&topic| topic.as_ref() == topic_name)
-        else {
-            continue;
-        };
-
-        topics.swap_remove(position);
-        if topics.is_empty() {
-            return Ok(topics);
-        }
-    }
-
-    Ok(topics)
-}
-
-/// Errors that can occur in the `HighLevelClient` operations.
-#[derive(Debug, Error)]
-pub enum HighLevelClientError<E> {
-    /// Error when the producer configuration is invalid.
-    #[error("invalid producer configuration: {0:#}")]
-    ProducerConfiguration(#[from] ProducerConfigurationBuilderError),
-
-    /// Error when initializing the producer fails.
-    #[error("failed to initialize producer: {0:#}")]
-    Producer(#[from] ProducerError<E>),
-
-    /// Error when initializing the consumer fails.
-    #[error("failed to initialize consumer: {0:#}")]
-    Consumer(#[from] ConsumerError),
-
-    /// Error when the scheduler configuration is invalid.
-    #[error("invalid scheduler configuration: {0:#}")]
-    SchedulerConfiguration(#[from] SchedulerInitError),
-
-    /// Error when attempting to use an unconfigured consumer.
-    #[error("unconfigured consumer; client does not have a valid consumer configuration")]
-    UnconfiguredConsumer,
-
-    /// Error when the consumer configuration failed during build.
-    #[error("consumer configuration failed: {0:#}")]
-    ConsumerConfiguration(ModeConfigurationError),
-
-    /// Error when attempting to subscribe an already subscribed consumer.
-    #[error("consumer is already subscribed")]
-    AlreadySubscribed,
-
-    /// Error when attempting to unsubscribe a not subscribed consumer.
-    #[error("consumer is not subscribed")]
-    NotSubscribed,
-
-    /// Error when required topics are not found in the Kafka cluster.
-    #[error("topics not found: {}", .0.iter().map(AsRef::as_ref).collect::<Vec<&str>>().join(", "))]
-    TopicsNotFound(Vec<Topic>),
-
-    /// Error when the telemetry emitter cannot be started.
-    #[error("failed to start telemetry emitter: {0:#}")]
-    TelemetryEmitter(#[from] EmitterError),
-
-    /// Error building or using a standalone state reader from the shared bundle
-    /// (a connect failure, or a descriptor the reader rejects).
-    #[error("state reader failed: {0:#}")]
-    StateReader(#[from] StateReaderError),
 }

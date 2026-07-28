@@ -32,7 +32,7 @@ homes — per-file scaffolding clones are how this test tree once doubled:
 | Keyed state (oracles, cells, collections, `UnavailableState`) | `src/state/tests/support.rs` |
 | Timers (segment/trigger factories, in-memory `TimerManager` harness) | `src/timers/test_support.rs` |
 | Timer stores (store helpers, `KEY_POOL`, suite macros) | `src/timers/store/tests/` |
-| Integration | `tests/common.rs` |
+| Integration (keyspace/runtime in `mod.rs`; handlers, Kafka fixtures, channel helpers in children) | `tests/common/` |
 
 If the helper you need exists in a sibling test file but not a shared home,
 hoist it into one — never copy it.
@@ -245,7 +245,7 @@ Time-sensitive properties build a fresh
 — one per iteration — with `.start_paused(true)` when the test advances
 time manually. A paused-time runtime cannot be shared across iterations
 (state leaks between cases). Ordinary suites share the multi-threaded
-`TEST_RUNTIME` in `tests/common.rs`.
+`TEST_RUNTIME` in `tests/common/mod.rs`.
 
 Exemplars: `src/timers/manager/tests.rs`,
 `src/consumer/partition/offsets/test.rs`.

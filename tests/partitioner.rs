@@ -84,7 +84,7 @@ impl EventHandler for PartitionCaptureHandler {
 async fn consumed_partition_matches_partition_for_key() -> Result<()> {
     init_test_logging();
 
-    let (topic, admin) = common::create_topic_with_partitions(PRIME_PARTITIONS).await?;
+    let (topic, admin) = common::kafka::create_topic_with_partitions(PRIME_PARTITIONS).await?;
     let count = PartitionCount::try_from(i32::from(PRIME_PARTITIONS))?;
     let bootstrap = vec!["localhost:9094".to_owned()];
 
@@ -106,7 +106,7 @@ async fn consumed_partition_matches_partition_for_key() -> Result<()> {
 
     // Single consumer owns all partitions; wait before producing so no record
     // is missed by an unassigned partition.
-    common::wait_for_assignment(&consumer, u32::from(PRIME_PARTITIONS)).await?;
+    common::kafka::wait_for_assignment(&consumer, u32::from(PRIME_PARTITIONS)).await?;
 
     let producer_config = ProducerConfiguration::builder()
         .bootstrap_servers(bootstrap.clone())
@@ -125,7 +125,7 @@ async fn consumed_partition_matches_partition_for_key() -> Result<()> {
         }
 
         for _ in 0..n {
-            let (key, observed) = common::expect_event(&mut rx, RECV_HANG_GUARD).await?;
+            let (key, observed) = common::receive::expect_event(&mut rx, RECV_HANG_GUARD).await?;
             let want = *expected
                 .get(&key)
                 .ok_or_else(|| color_eyre::eyre::eyre!("consumed unknown key {key}"))?;
@@ -136,7 +136,7 @@ async fn consumed_partition_matches_partition_for_key() -> Result<()> {
         }
         // A dropped message would surface as a hang above, never a false pass.
         // This check confirms exactly `n` messages arrived, with no extras.
-        common::expect_no_event(&mut rx, Duration::from_millis(500)).await?;
+        common::receive::expect_no_event(&mut rx, Duration::from_millis(500)).await?;
         Ok(())
     }
     .await;

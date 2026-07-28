@@ -31,7 +31,8 @@ use tokio::task::JoinSet;
 use tracing::info;
 
 mod common;
-use common::{ChannelHandler, TEST_RUNTIME, create_cassandra_trigger_store_config};
+use common::handler::ChannelHandler;
+use common::{TEST_RUNTIME, create_cassandra_trigger_store_config};
 use uuid::Uuid;
 
 /// Reusable per-partition-count environments: one topic + consumer group per
@@ -216,7 +217,7 @@ async fn pooled_env(partition_count: SmallCount) -> Result<(Topic, String)> {
     }
 
     let (topic, _admin) =
-        common::create_topic_with_partitions(partition_count.value() as u16).await?;
+        common::kafka::create_topic_with_partitions(partition_count.value() as u16).await?;
     let group_id = format!("ordering-consumer-{}", Uuid::new_v4());
     ENV_POOL
         .lock()
