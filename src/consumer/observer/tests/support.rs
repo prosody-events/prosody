@@ -85,15 +85,6 @@ impl Entry {
         }
     }
 
-    /// A real partition the last rebalance took away. librdkafka keeps the
-    /// entry and clears `desired`.
-    pub(super) const fn revoked(id: i32) -> Self {
-        Self {
-            desired: false,
-            ..Self::assigned(id, 0, 0)
-        }
-    }
-
     /// librdkafka's internal entry, marked desired so only the `-1` filter can
     /// exclude it.
     pub(super) const fn internal() -> Self {

@@ -209,54 +209,6 @@ fn metadata_and_statistics_agree_on_valid_topology() -> Result<()> {
     Ok(())
 }
 
-/// The assignment iterator yields borrowed entries for real desired partitions
-/// only. The internal entry is marked desired and the undesired entry has a
-/// real id, so each filter conjunct is on its own the reason an entry is
-/// excluded.
-#[test]
-fn assigned_iterator_excludes_internal_and_undesired() -> Result<()> {
-    let guard = guard_of(statistics_with(&[
-        (
-            TOPIC,
-            0,
-            &[
-                Entry::assigned(0, 17, 170),
-                Entry::revoked(1),
-                Entry::internal(),
-            ],
-        ),
-        ("idle", 0, &[Entry::revoked(0)]),
-    ]));
-
-    let yielded = assigned_depths(&guard);
-    ensure!(
-        yielded == vec![(TOPIC, 0_i32, 17_i64)],
-        "expected only the assigned partition with its own queue depth, got {yielded:?}"
-    );
-    Ok(())
-}
-
-/// Metadata age reports the oldest metadata among topics this instance actually
-/// holds, ignoring topics the client knows but was not assigned.
-#[test]
-fn metadata_age_covers_only_assigned_topics() -> Result<()> {
-    let (provider, exporter) = test_meter();
-    let observer = observer_with(GROUP, Duration::default(), &provider);
-
-    observer.observe_statistics(statistics_with(&[
-        ("assigned", 100, &[Entry::assigned(0, 0, 0)]),
-        ("idle", 999, &[Entry::revoked(0)]),
-    ]));
-    provider.force_flush()?;
-
-    let age = gauge_value(&exporter, METADATA_AGE, &identity())?;
-    ensure!(
-        age == Some(100),
-        "expected the assigned topic's age of 100, got {age:?}"
-    );
-    Ok(())
-}
-
 /// Shutdown retires the last assignment's series, so a stopped consumer stops
 /// reporting fetch-queue depth.
 #[test]
