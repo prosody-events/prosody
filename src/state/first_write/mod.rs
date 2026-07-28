@@ -384,9 +384,20 @@ impl FirstWritePublisher {
 /// [`StateVisibility::Private`]: crate::state::registry::StateVisibility::Private
 /// [`is_published`]: CollectionDefRegistry::is_published
 ///
-/// Convergence rests on the zero-or-one-instance-per-partition invariant plus
-/// running at every startup: with stop-then-start deploy ordering the
-/// last-started instance reconciles after the final old-generation write.
+/// Convergence needs one thing: a sweep must run after the last write of the
+/// generation that still held the collection published. A deploy that stops
+/// every old instance before starting a new one gives that. A rolling deploy
+/// that overlaps two generations does not. An old instance re-upserts the row
+/// after a new one swept it, and nothing sweeps again until the next startup,
+/// so the row keeps advertising a retired collection.
+///
+/// Exclusive partition ownership does not help here. The row is keyed by
+/// `(group_id, topic)`, so every instance of the group contends over the same
+/// row whatever partitions it holds.
+///
+/// Retirement also assumes the delete's write timestamp beats every old
+/// insert's. The session's timestamp generator orders one session's writes, not
+/// two processes' clocks.
 ///
 /// Each private name costs exactly one clustering-prefix removal of this
 /// group's slice — no read, so a corrupt sibling row can never block the

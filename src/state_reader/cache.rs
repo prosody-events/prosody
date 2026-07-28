@@ -17,7 +17,10 @@
 //! store result it just read. That result reflects committed state as of the
 //! fill's completion, so it is fresh no matter how long the fill took. Taking
 //! the stamp at issue only makes the cached entry expire conservatively for
-//! later readers. There is no fill-retry loop, which would risk livelock.
+//! later readers. A completed fill is never re-checked and never re-run. The
+//! retry in [`ReaderCache::get_cached`] re-reads the key only after evicting
+//! the stale entry it just observed, so each pass either drops an entry or
+//! takes the fill guard.
 
 use crate::Key;
 use crate::error::ErrorCategory;

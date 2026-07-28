@@ -213,9 +213,9 @@ impl<C: Codec> ReadSession<C> {
             }
             Some(ttl) => {
                 let key = self.cache_key(source, cell);
-                // `collection_id_for` does key murmur and segment routing. It
-                // runs only inside the fill closure on a cache miss, never on a
-                // hit.
+                // `collection_id_for` hashes the key and routes it to a
+                // segment. It runs only inside the fill closure on a cache
+                // miss, never on a hit.
                 self.context
                     .cache
                     .get_cached(key, ttl, || async {
