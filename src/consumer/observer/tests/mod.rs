@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, TcpListener};
 use std::time::Duration;
 use support::{
-    Assignment, Entry, GROUP, Report, TOPIC, Topology, assigned_ids, contiguous, guard_of,
-    identity, statistics_of_partitions, statistics_with,
+    Assignment, Entry, GROUP, Report, TOPIC, Topology, assigned_depths, assigned_ids, contiguous,
+    guard_of, identity, statistics_of_partitions, statistics_with,
 };
 
 /// The statistics view reports a count exactly when an independent calculation
@@ -85,11 +85,7 @@ fn statistics_count_matches_an_independent_oracle(topology: Topology) -> TestRes
         ));
     }
 
-    let mut yielded: Vec<(&str, i32, i64)> = guard
-        .assigned_partitions()
-        .map(|(topic, id, partition)| (topic, id, partition.fetchq_cnt))
-        .collect();
-    yielded.sort_unstable();
+    let yielded = assigned_depths(&guard);
     if yielded == expected_assigned {
         TestResult::passed()
     } else {
@@ -232,10 +228,7 @@ fn assigned_iterator_excludes_internal_and_undesired() -> Result<()> {
         ("idle", 0, &[Entry::revoked(0)]),
     ]));
 
-    let yielded: Vec<(&str, i32, i64)> = guard
-        .assigned_partitions()
-        .map(|(topic, id, partition)| (topic, id, partition.fetchq_cnt))
-        .collect();
+    let yielded = assigned_depths(&guard);
     ensure!(
         yielded == vec![(TOPIC, 0_i32, 17_i64)],
         "expected only the assigned partition with its own queue depth, got {yielded:?}"
@@ -327,27 +320,12 @@ async fn startup_installs_metadata_into_the_callers_observer() -> Result<()> {
 /// cleared it, not merely that it never wrote.
 #[tokio::test(flavor = "multi_thread")]
 async fn startup_fails_when_metadata_is_unreachable() -> Result<()> {
-    let config = ConsumerConfiguration::builder()
-        // Port 1 is unassigned, so the connection is refused rather than hung.
-        .bootstrap_servers(vec!["127.0.0.1:1".to_owned()])
-        .group_id("observer-unreachable-group")
-        .subscribed_topics(vec![TOPIC.to_owned()])
-        .probe_port(None)
-        .build()?;
+    let config = unreachable_config("observer-unreachable-group", None)?;
     let (provider, _exporter) = test_meter();
     let observer = observer_with(&config.group_id, Duration::from_millis(250), &provider);
     observer.observe_statistics(statistics_with(&[(TOPIC, 0, &contiguous(1))]));
 
-    match initialize_with(&config, observer.clone()).await? {
-        Ok(consumer) => {
-            consumer.shutdown().await;
-            bail!("construction succeeded without a startup observation");
-        }
-        Err(error) => ensure!(
-            matches!(error, ConsumerError::Kafka(_)),
-            "expected a Kafka error, got {error:#}"
-        ),
-    }
+    expect_unreachable_startup(&config, observer.clone()).await?;
     ensure!(
         observer.snapshot().is_none(),
         "a failed startup fetch must leave no observation"
@@ -361,17 +339,38 @@ async fn startup_fails_when_metadata_is_unreachable() -> Result<()> {
 #[tokio::test]
 async fn failed_startup_releases_the_probe_port() -> Result<()> {
     let port = free_port()?;
-    let config = ConsumerConfiguration::builder()
-        // Port 1 is unassigned, so the connection is refused rather than hung.
-        .bootstrap_servers(vec!["127.0.0.1:1".to_owned()])
-        .group_id("observer-probe-group")
-        .subscribed_topics(vec![TOPIC.to_owned()])
-        .probe_port(port)
-        .build()?;
+    let config = unreachable_config("observer-probe-group", Some(port))?;
     let (provider, _exporter) = test_meter();
     let observer = observer_with(&config.group_id, Duration::from_millis(250), &provider);
 
-    match initialize_with(&config, observer).await? {
+    expect_unreachable_startup(&config, observer).await?;
+    // Binding synchronously: nothing between the failed construction and this
+    // call yields, so the probe task cannot close its listener behind the
+    // assertion's back.
+    ensure!(
+        TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok(),
+        "the probe port was still bound after construction failed"
+    );
+    Ok(())
+}
+
+/// A configuration pointed at an unreachable broker. Port 1 is unassigned, so
+/// the connection is refused rather than hung.
+fn unreachable_config(group: &str, probe_port: Option<u16>) -> Result<ConsumerConfiguration> {
+    Ok(ConsumerConfiguration::builder()
+        .bootstrap_servers(vec!["127.0.0.1:1".to_owned()])
+        .group_id(group)
+        .subscribed_topics(vec![TOPIC.to_owned()])
+        .probe_port(probe_port)
+        .build()?)
+}
+
+/// Runs construction and asserts it failed in the startup metadata fetch.
+async fn expect_unreachable_startup(
+    config: &ConsumerConfiguration,
+    observer: KafkaObserver,
+) -> Result<()> {
+    match initialize_with(config, observer).await? {
         Ok(consumer) => {
             consumer.shutdown().await;
             bail!("construction succeeded without a startup observation");
@@ -381,13 +380,6 @@ async fn failed_startup_releases_the_probe_port() -> Result<()> {
             "expected a Kafka error, got {error:#}"
         ),
     }
-    // Binding synchronously: nothing between the failed construction and this
-    // call yields, so the probe task cannot close its listener behind the
-    // assertion's back.
-    ensure!(
-        TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok(),
-        "the probe port was still bound after construction failed"
-    );
     Ok(())
 }
 

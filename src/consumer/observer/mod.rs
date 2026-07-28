@@ -54,8 +54,11 @@ enum KafkaSnapshot {
     /// predates partition assignment, so it reports no assigned partitions.
     InitialMetadata(Metadata),
     /// The newest librdkafka statistics report. It replaces startup metadata
-    /// outright rather than merging with it. Boxed because `Statistics` is
-    /// hundreds of bytes: unboxed it would trip `clippy::large_enum_variant`.
+    /// outright rather than merging with it. It covers only topics this client
+    /// holds, so once the first report lands the observation can no longer
+    /// answer for a topic the consumer never consumed. Boxed because
+    /// `Statistics` is hundreds of bytes: unboxed it would trip
+    /// `clippy::large_enum_variant`.
     ConsumerStatistics(Box<Statistics>),
 }
 
@@ -185,9 +188,8 @@ impl KafkaObserver {
     /// loop starts, so a consumer never begins dispatching without an
     /// observation.
     ///
-    /// The fetch asks for all topics. `fetch_metadata` accepts at most one
-    /// topic, a consumer may subscribe to several, and a publication read may
-    /// need a topic outside the subscription.
+    /// The fetch asks for all topics: `fetch_metadata` accepts at most one
+    /// topic and a consumer may subscribe to several.
     ///
     /// # Errors
     ///
@@ -223,15 +225,18 @@ impl KafkaObserver {
     /// Records the gauges from `statistics`, then replaces the whole
     /// observation with it.
     ///
-    /// Only two writers exist and they never overlap: the startup install runs
-    /// before the poll loop starts, and this runs on the poll thread. So the
+    /// Three writers exist and none overlap: the startup install runs before
+    /// the poll loop starts, this runs on the poll thread, and [`Self::clear`]
+    /// runs only after the primary consumer has been dropped. So the
     /// load-record-store sequence needs no read-modify-write atomicity.
     /// Recording gauges is infallible, so nothing can leave the observation
     /// stale.
     ///
     /// A report librdkafka queued while the startup fetch was still running
     /// predates that fetch. Installing it moves the observation back to the
-    /// older view, for at most one statistics interval after startup.
+    /// older view, for at most one statistics interval after startup. A
+    /// published durable write whose topic that older view lacks blocks until
+    /// the next report.
     pub(in crate::consumer) fn observe_statistics(&self, statistics: Statistics) {
         let previous = self.snapshot();
         self.inner.metrics.record(
@@ -291,6 +296,10 @@ impl KafkaSnapshotGuard {
     /// The topic, id, and statistics of every partition assigned to this
     /// consumer instance. Yields nothing for the startup metadata generation,
     /// which predates assignment.
+    ///
+    /// Test-only, and not dead: only a guard-based read can show that a guard
+    /// taken before a replacement keeps answering from its own generation.
+    /// Production borrows through the free [`assigned_partitions`] instead.
     #[cfg(test)]
     pub(crate) fn assigned_partitions(&self) -> impl Iterator<Item = (&str, i32, &StatsPartition)> {
         self.snapshot

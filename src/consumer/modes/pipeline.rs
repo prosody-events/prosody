@@ -19,7 +19,7 @@ use crate::consumer::observer::KafkaObserver;
 use crate::consumer::storage::{SharedStorage, StorePair};
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::state::{
-    KeyedStateInputs, cassandra_arm_inputs, cassandra_state_provider, memory_arm_inputs,
+    KeyedStateInputs, cassandra_loader, cassandra_state_provider, memory_arm_inputs,
     memory_state_provider,
 };
 use crate::consumer::wiring::{build_common_middleware, build_shared_state};
@@ -42,7 +42,6 @@ struct PipelineMiddlewareStack {
     retry_middleware: RetryMiddleware,
     heartbeats: HeartbeatRegistry,
     telemetry: Telemetry,
-    /// The consumer's one Kafka observation handle.
     observer: KafkaObserver,
 }
 
@@ -187,7 +186,6 @@ where
             dedup_provider,
             publication_store,
         } => {
-            // Memory/mock arm inputs come from the bundle when supplied, else fresh.
             let (loader, cells, identities) = memory_arm_inputs(deps.as_ref(), shared)?;
             let publisher_template = keyed_state
                 .memory_publication_setup(publication_store)
@@ -229,11 +227,8 @@ where
             identity_store,
             publication_store,
         } => {
-            // One Kafka loader per consumer, from the bundle when supplied.
-            // A clone shares the client and poll thread. See
-            // `cassandra_arm_inputs`.
             let loader =
-                cassandra_arm_inputs(deps.as_ref(), &stack.consumer_config, &stack.heartbeats)?;
+                cassandra_loader(deps.as_ref(), &stack.consumer_config, &stack.heartbeats)?;
             let publisher_template = keyed_state
                 .cassandra_publication_setup(publication_store, stack.observer.clone())
                 .await?;

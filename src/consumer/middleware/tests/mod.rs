@@ -1032,7 +1032,7 @@ mod settle_publication {
     /// The routing row is written before the durable state. The gated upsert
     /// parks in settle step 0, so the cell is not yet durable until finalize
     /// runs in step 1. Releasing the gate lets settle stage and commit, and
-    /// the row lands with the live partition count.
+    /// the row lands with the observed partition count.
     #[tokio::test]
     async fn publication_precedes_the_durable_write() -> Result<()> {
         let store = ScriptedPublicationStore::gated();
@@ -1364,10 +1364,12 @@ mod settle_publication {
     /// then proves the routing row is offered before the cell becomes
     /// durable.
     ///
-    /// Both `select!`s are bounded by virtual-time deadlines that fail on
-    /// expiry. The runtime is paused, so a stuck retry loop burns virtual time
-    /// (each pass awaits the durability retry sleep) and the deadline fires
-    /// rather than hanging.
+    /// Phase one's deadline is the expected exit: the runtime is paused, so
+    /// virtual time only advances while every task is idle, and the barrier
+    /// must have refused across several durability retries before
+    /// `REFUSAL_WINDOW` elapses. The `settling` and `wait_entered` arms are the
+    /// failures. Phase two inverts this — `HANG_GUARD` is a hang guard and
+    /// firing it fails the test.
     #[tokio::test(start_paused = true)]
     async fn unobserved_topic_blocks_the_write_until_the_snapshot_repairs() -> Result<()> {
         /// Several durability retry delays: long enough for the publish loop to

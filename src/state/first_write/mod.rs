@@ -48,7 +48,7 @@ const PUBLICATION_MEMO_CAPACITY: usize = 4096;
 pub(crate) enum PublicationBackend {
     /// Cassandra-backed routing table (production).
     Cassandra(CassandraPublicationStore),
-    /// In-memory routing table (mock mode).
+    /// In-memory routing table: mock mode, or in-memory trigger storage.
     Memory(MemoryPublicationStore),
     /// Scripted store for tests: call log, injectable errors, upsert barrier.
     #[cfg(test)]
@@ -149,8 +149,13 @@ pub(crate) enum PartitionCounts {
     /// The primary consumer's own Kafka observation. No extra client and no
     /// broker round trip — the count comes from the snapshot that consumer
     /// already keeps.
+    ///
+    /// It answers only for topics that consumer consumes. The barrier's topic
+    /// is always the assignment's topic, bound when `StateManagerProvider`
+    /// acquires the partition's state manager, so the lookup is always in
+    /// range.
     Observed(KafkaObserver),
-    /// The mock topology's fixed count (mock mode).
+    /// The memory arm's fixed count, which has no observation to read.
     Fixed(PartitionCount),
 }
 
@@ -163,7 +168,10 @@ impl PartitionCounts {
     /// one. An absent or incomplete topic is `Transient`, so the caller retries
     /// until a later statistics report repairs it; only a structurally invalid
     /// count is `Permanent`. Never `Terminal`.
-    fn live_count(&self, topic: &str) -> Result<PartitionCount, PartitionCountObservationError> {
+    fn partition_count(
+        &self,
+        topic: &str,
+    ) -> Result<PartitionCount, PartitionCountObservationError> {
         match self {
             Self::Fixed(count) => Ok(*count),
             Self::Observed(observer) => observer.partition_count(topic),
@@ -212,10 +220,9 @@ impl PublisherTemplate {
         )
     }
 
-    /// Builds the template with an explicit memo capacity. The eviction test
-    /// uses a tiny memo to prove the barrier re-runs after an entry is evicted.
-    /// Production always uses [`PUBLICATION_MEMO_CAPACITY`] via [`Self::new`].
-    pub(crate) fn with_memo_capacity(
+    /// Builds the template with an explicit memo capacity. Production always
+    /// uses [`PUBLICATION_MEMO_CAPACITY`] via [`Self::new`].
+    fn with_memo_capacity(
         subsystem: SubsystemName,
         group: Arc<str>,
         store: Arc<PublicationBackend>,
@@ -264,15 +271,16 @@ impl FirstWritePublisher {
     /// added for published state must call the barrier first too.
     ///
     /// For a `Published`, cold-memo `(collection, topic)` the sequence is:
-    /// 1. read the topic's partition count from the consumer's Kafka
-    ///    observation (must ride the caller's retry posture);
+    /// 1. read the topic's partition count from the configured count source
+    ///    ([`PartitionCounts`]), which must ride the caller's retry posture;
     /// 2. **best-effort** own-row read to detect a changed partition count. A
     ///    read failure is logged at `warn!` and skips the check; it never
     ///    blocks the upsert, since step 3 overwrites the row regardless. A
-    ///    stored count that differs from the live count is logged at `error!`
-    ///    and the row is overwritten with the live count (see below);
-    /// 3. blind idempotent upsert of `{group, topic, live_count}` — this is the
-    ///    barrier;
+    ///    stored count that differs from the current count is logged at
+    ///    `error!` and the row is overwritten with the current count (see
+    ///    below);
+    /// 3. blind idempotent upsert of `{group, topic, partition_count}` — this
+    ///    is the barrier;
     /// 4. latch the memo, **only after** the upsert is acknowledged.
     ///
     /// A private collection returns `Ok(())` immediately: the visibility gate
@@ -297,8 +305,8 @@ impl FirstWritePublisher {
         state_type: StateType,
         name: &StateName,
     ) -> Result<(), PublicationError> {
-        let t = &self.template;
-        if !t.registry.is_published(state_type, name) {
+        let template = &self.template;
+        if !template.registry.is_published(state_type, name) {
             return Ok(());
         }
         let key = PublicationMemoKey {
@@ -306,36 +314,35 @@ impl FirstWritePublisher {
             name: name.clone(),
             topic: self.topic,
         };
-        if t.memo.get(&key).is_some() {
+        if template.memo.get(&key).is_some() {
             return Ok(());
         }
-        let live = t.counts.live_count(self.topic.as_ref())?;
+        let count = template.counts.partition_count(self.topic.as_ref())?;
         // Detect a changed partition count. A stored own-row count that differs
-        // from the live count means the topic was repartitioned, which is
+        // from the current count means the topic was repartitioned, which is
         // unsupported (see this method's doc). Log it as an error. The blind
-        // upsert below overwrites the row with the live count either way, so a
-        // read failure only costs the check.
-        match t
+        // upsert below overwrites the row with the current count either way, so
+        // a read failure only costs the check.
+        match template
             .store
-            .read_publications(&t.subsystem, state_type, name)
+            .read_publications(&template.subsystem, state_type, name)
             .await
         {
             Ok(rows) => {
-                if let Some(stored) = rows
-                    .iter()
-                    .find(|r| r.group_id.as_ref() == t.group.as_ref() && r.topic == self.topic)
-                    && stored.partition_count != live
+                if let Some(stored) = rows.iter().find(|r| {
+                    r.group_id.as_ref() == template.group.as_ref() && r.topic == self.topic
+                }) && stored.partition_count != count
                 {
                     error!(
                         collection = %name.as_str(),
                         topic = %self.topic.as_ref(),
                         stored = i32::from(stored.partition_count),
-                        live = i32::from(live),
+                        current = i32::from(count),
                         "keyed-state publication partition count changed for a topic backing \
                          keyed state: keys written under the previous partition count are no \
                          longer reachable by owner or readers; partition expansion on such topics \
-                         is unsupported. Overwriting the routing row with the live count to keep \
-                         readers consistent with the owner."
+                         is unsupported. Overwriting the routing row with the current count to \
+                         keep readers consistent with the owner."
                     );
                 }
             }
@@ -344,16 +351,19 @@ impl FirstWritePublisher {
                 topic = %self.topic.as_ref(),
                 error = %error,
                 "reading the routing row before the publication upsert failed; skipping the \
-                 repartition check. The upsert proceeds with the live partition count."
+                 repartition check. The upsert proceeds with the current partition count."
             ),
         }
         let row = StatePublication {
-            group_id: t.group.clone(),
+            group_id: template.group.clone(),
             topic: self.topic,
-            partition_count: live,
+            partition_count: count,
         };
-        t.store.upsert(&t.subsystem, state_type, name, &row).await?;
-        t.memo.insert(key, ());
+        template
+            .store
+            .upsert(&template.subsystem, state_type, name, &row)
+            .await?;
+        template.memo.insert(key, ());
         Ok(())
     }
 }
@@ -424,8 +434,7 @@ pub(crate) enum PublicationError {
     #[error(transparent)]
     Store(#[from] PublicationBackendError),
 
-    /// The topic's partition count was not available from the Kafka
-    /// observation.
+    /// The topic's partition count was not available.
     #[error(transparent)]
     Count(#[from] PartitionCountObservationError),
 }

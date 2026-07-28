@@ -574,9 +574,9 @@ fn setup<'a, C: Codec>(
 /// The bundle depends only on the trigger-store backend, group id, and cache
 /// budget, all of which are mode-independent, so the same build serves any
 /// mode. This mirrors the Cassandra-session reuse in `StorePair::new`.
-/// `InMemory` is exactly mock mode. Its bundle carries the shared in-memory
-/// stores, so a reader built from it gets read-your-writes against the
-/// running consumer.
+/// `InMemory` selects the memory arm, mock mode or not. Its bundle carries the
+/// shared in-memory stores, so a reader built from it gets read-your-writes
+/// against the running consumer.
 async fn build_shared_deps<C: Codec>(
     mode: &ModeConfiguration,
 ) -> Result<SharedDeps<C>, HighLevelClientError<C::Error>>

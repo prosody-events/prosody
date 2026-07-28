@@ -87,10 +87,6 @@ impl KeyedStateInputs {
     /// consumer's own observation, so the routing row advertises the topology
     /// that consumer sees. Pass the same observer the mode hands to
     /// [`initialize_consumer`](super::runtime::initialize_consumer).
-    ///
-    /// # Errors
-    ///
-    /// See [`Self::publication_setup`].
     pub(in crate::consumer) async fn cassandra_publication_setup(
         &self,
         store: CassandraPublicationStore,
@@ -103,12 +99,10 @@ impl KeyedStateInputs {
         .await
     }
 
-    /// Publication setup for a memory arm. Mock mode has one fixed topology and
-    /// no Kafka observation to read, so the count is [`PartitionCount::MOCK`].
-    ///
-    /// # Errors
-    ///
-    /// See [`Self::publication_setup`].
+    /// Publication setup for a memory arm — mock mode, or a consumer
+    /// configured with in-memory trigger storage. Both keep their routing rows
+    /// in-process, where the only reader is one sharing this consumer's
+    /// bundle, so the count is [`PartitionCount::MOCK`].
     pub(in crate::consumer) async fn memory_publication_setup(
         &self,
         store: MemoryPublicationStore,
@@ -214,8 +208,8 @@ where
 ///
 /// A Cassandra bundle cannot back a memory arm. The composition derives both
 /// from one config, so this mismatch is reported as
-/// [`ConsumerError::SharedDepsBackendMismatch`]. See [`cassandra_arm_inputs`]
-/// for the mirror.
+/// [`ConsumerError::SharedDepsBackendMismatch`]. See [`cassandra_loader`] for
+/// the mirror.
 fn shared_memory_handles(
     shared: Option<SharedStorage>,
 ) -> Result<(MemoryCells, MemoryDescriptorIdentityStore), ConsumerError> {
@@ -250,7 +244,7 @@ where
 ///
 /// A memory bundle cannot back a Cassandra arm. That mismatch is reported as
 /// [`ConsumerError::SharedDepsBackendMismatch`].
-pub(in crate::consumer) fn cassandra_arm_inputs<C: Codec>(
+pub(in crate::consumer) fn cassandra_loader<C: Codec>(
     deps: Option<&SharedDeps<C>>,
     consumer_config: &ConsumerConfiguration,
     heartbeats: &HeartbeatRegistry,

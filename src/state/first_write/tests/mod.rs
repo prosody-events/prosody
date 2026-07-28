@@ -127,7 +127,7 @@ fn row_on(group: &str, topic: Topic, count: i32) -> Result<StatePublication> {
 /// decoy topic with a different count, so a lookup that ignored the topic would
 /// stamp the wrong number.
 #[tokio::test]
-async fn published_first_write_upserts_live_count() -> Result<()> {
+async fn published_first_write_upserts_the_observed_count() -> Result<()> {
     let store = ScriptedPublicationStore::new();
     let publisher = publisher(
         store.clone(),
@@ -201,8 +201,9 @@ async fn private_collection_never_upserts() -> Result<()> {
     Ok(())
 }
 
-/// A pre-seeded row with a valid but stale count is overwritten with the live
-/// count, and the `StableRouting` tripwire logs an error-level mismatch event.
+/// A pre-seeded row with a valid but stale count is overwritten with the
+/// observed count, and the `StableRouting` tripwire logs an error-level
+/// mismatch event.
 /// The write warns and overwrites; it never fails. The test asserts the
 /// event as well as the corrected row, because the corrected row alone would
 /// not catch a regression that silently dropped the tripwire warning.
@@ -229,14 +230,14 @@ async fn wrong_stored_count_is_overwritten_not_failed() -> Result<()> {
     assert!(
         events.contains("keyed-state publication partition count changed"),
         "the mismatch tripwire must fire an error-level event when the stored count disagrees \
-         with the live count"
+         with the observed count"
     );
     let rows = store.rows(&subsystem, StateType::Application, &name).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
         i32::from(rows[0].partition_count),
         3_i32,
-        "the stale count is overwritten with the live one"
+        "the stale count is overwritten with the observed one"
     );
     Ok(())
 }

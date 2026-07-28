@@ -22,8 +22,9 @@ impl PartitionCount {
     pub(crate) const MIN: Self = Self(NonZeroU32::MIN);
     /// The mock / in-memory topology's fixed partition count, matching
     /// `MockCluster::new(3)` and `create_topic(_, 3, 3)` in the crate root.
-    /// The mock arm of the publication count source returns this; it is
-    /// cosmetic in mock mode (no cross-process reader consults it).
+    /// The memory arm of the publication count source returns this. Its
+    /// routing rows never leave the process, so only a reader sharing the
+    /// consumer's bundle can route by it.
     pub(crate) const MOCK: Self = match NonZeroU32::new(3) {
         Some(count) => Self(count),
         None => Self::MIN,

@@ -311,14 +311,27 @@ pub(super) fn assigned_ids(guard: &KafkaSnapshotGuard) -> Vec<i32> {
     ids
 }
 
+/// The assigned `(topic, id, fetch-queue depth)` triples a guard yields,
+/// sorted. Pairing each id with its own depth is what proves the iterator does
+/// not mix entries.
+pub(super) fn assigned_depths(guard: &KafkaSnapshotGuard) -> Vec<(&str, i32, i64)> {
+    let mut yielded: Vec<(&str, i32, i64)> = guard
+        .assigned_partitions()
+        .map(|(topic, id, partition)| (topic, id, partition.fetchq_cnt))
+        .collect();
+    yielded.sort_unstable();
+    yielded
+}
+
 /// An observer with no observation installed — the pre-startup state.
 pub(crate) fn unobserved(group: &str) -> KafkaObserver {
     KafkaObserver::new(group)
 }
 
 /// An observer reporting each `(topic, partition count)` as a contiguous
-/// assigned topology. An empty slice yields an observation that knows no topics
-/// at all.
+/// assigned topology. Counts must be positive: `contiguous(0)` yields a topic
+/// with no partitions, which the count lookup rejects as an incomplete
+/// topology rather than reporting zero.
 pub(crate) fn observing(group: &str, topics: &[(&str, i32)]) -> KafkaObserver {
     let observer = unobserved(group);
     observe(&observer, topics);
@@ -327,11 +340,10 @@ pub(crate) fn observing(group: &str, topics: &[(&str, i32)]) -> KafkaObserver {
 
 /// Replaces `observer`'s observation, as the next statistics report would.
 pub(crate) fn observe(observer: &KafkaObserver, topics: &[(&str, i32)]) {
-    let topologies: Vec<Vec<Entry>> = topics.iter().map(|&(_, count)| contiguous(count)).collect();
-    let report: Vec<(&str, i64, &[Entry])> = topics
-        .iter()
-        .zip(&topologies)
-        .map(|(&(name, _), entries)| (name, 0_i64, entries.as_slice()))
-        .collect();
-    observer.observe_statistics(statistics_with(&report));
+    observer.observe_statistics(statistics_of(topics.iter().map(|&(name, count)| {
+        (
+            name.to_owned(),
+            stats_topic(0, partition_map(&contiguous(count))),
+        )
+    })));
 }

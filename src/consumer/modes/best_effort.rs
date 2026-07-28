@@ -10,7 +10,7 @@ use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::storage::StorePair;
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::state::{
-    cassandra_arm_inputs, cassandra_state_provider, memory_arm_inputs, memory_state_provider,
+    cassandra_loader, cassandra_state_provider, memory_arm_inputs, memory_state_provider,
 };
 use crate::consumer::wiring::{build_common_middleware, build_shared_state};
 use crate::telemetry::Telemetry;
@@ -84,7 +84,7 @@ where
             ..
         } => {
             let loader =
-                cassandra_arm_inputs(setup.deps.as_ref(), setup.consumer, &services.heartbeats)?;
+                cassandra_loader(setup.deps.as_ref(), setup.consumer, &services.heartbeats)?;
             let publisher_template = keyed_state
                 .cassandra_publication_setup(publication_store, services.observer.clone())
                 .await?;
