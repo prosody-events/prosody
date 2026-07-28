@@ -14,7 +14,12 @@ use thiserror::Error;
 /// plus a captured [`ErrorCategory`]. This keeps the public type flat and
 /// FFI-exposable: owned fields, a C-like classification, no generics or borrows
 /// in return position.
+/// Tests derive a fieldless mirror of this enum so
+/// `no_variant_leaks_terminal_to_the_client` can enumerate every variant. A new
+/// variant then fails to compile until it is covered there.
 #[derive(Debug, Error)]
+#[cfg_attr(test, derive(strum::EnumDiscriminants))]
+#[cfg_attr(test, strum_discriminants(derive(strum::VariantArray)))]
 #[non_exhaustive]
 pub enum StateReaderError {
     /// No publication rows exist for the collection yet. Always transient.
@@ -156,6 +161,11 @@ fn client_category(category: ErrorCategory) -> ErrorCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use strum::VariantArray;
+
+    /// The derived fieldless mirror of [`StateReaderError`], aliased for
+    /// readability.
+    use super::StateReaderErrorDiscriminants as Variant;
 
     /// A synthetic upstream error that classifies `Terminal`. It stands in for
     /// a shut-down Kafka loader or a scylla driver fault reaching the reader.
@@ -169,51 +179,61 @@ mod tests {
         }
     }
 
-    /// No constructible [`StateReaderError`] classifies `Terminal`: the reader
-    /// is a leaf client with no middleware to consume one. The two type-erasing
-    /// arms carry an upstream classification, so both are driven with a
-    /// `Terminal`-emitting fault through the production `store`/`load`
-    /// boundaries.
+    /// One value of the named variant, carrying `Terminal` wherever the variant
+    /// can carry a classification at all.
     ///
-    /// The clamp must also hold for a `Store` value constructed directly with a
-    /// `Terminal` category, bypassing [`StateReaderError::store`]. The variant
-    /// and its fields are public, so `classify_error` must fold on read, not
-    /// only `store(...)` on capture.
+    /// The match is exhaustive over the derived discriminants and has no
+    /// wildcard, so adding a [`StateReaderError`] variant stops this compiling
+    /// until the new variant returns a sample.
+    fn sample(variant: Variant) -> StateReaderError {
+        match variant {
+            Variant::UnknownPublication => StateReaderError::UnknownPublication {
+                subsystem: "orders".into(),
+                name: "cart".into(),
+            },
+            Variant::IdentityMismatch => StateReaderError::IdentityMismatch {
+                group: "group-a".into(),
+            },
+            Variant::IdentityUnavailable => StateReaderError::IdentityUnavailable {
+                name: "cart".into(),
+            },
+            Variant::RefreshUnavailable => StateReaderError::RefreshUnavailable {
+                name: "cart".into(),
+            },
+            Variant::TooManySources => StateReaderError::TooManySources { found: 9, max: 4 },
+            Variant::EmptyKey => StateReaderError::EmptyKey,
+            Variant::InvalidReadCache => StateReaderError::InvalidReadCache { reason: "zero ttl" },
+            Variant::Unsupported => StateReaderError::Unsupported {
+                reason: "empty name",
+            },
+            // Constructed directly rather than through `store`, so only a fold
+            // on read keeps this from leaking Terminal.
+            Variant::Store => StateReaderError::Store {
+                message: "directly constructed terminal".into(),
+                category: ErrorCategory::Terminal,
+            },
+            // `StateAccessError::load` keeps the upstream Terminal, so the fold
+            // on read is again the only thing clamping it.
+            Variant::Access => StateReaderError::Access(StateAccessError::load(&SyntheticTerminal)),
+        }
+    }
+
+    /// No [`StateReaderError`] classifies `Terminal`: the reader is a leaf
+    /// client with no middleware to consume one. Every variant is covered,
+    /// and the type-erasing capture boundary is driven separately with a
+    /// `Terminal`-emitting fault.
     ///
     /// FALSIFICATION: drop the `client_category` clamp from either the
     /// `store(...)` capture or the `classify_error` `Store`/`Access` arms. A
     /// `Terminal` then reaches classification and the assert fires.
     #[test]
     fn no_variant_leaks_terminal_to_the_client() {
-        let cases = [
-            StateReaderError::UnknownPublication {
-                subsystem: "orders".into(),
-                name: "cart".into(),
-            },
-            StateReaderError::IdentityMismatch {
-                group: "group-a".into(),
-            },
-            StateReaderError::IdentityUnavailable {
-                name: "cart".into(),
-            },
-            StateReaderError::RefreshUnavailable {
-                name: "cart".into(),
-            },
-            StateReaderError::TooManySources { found: 9, max: 4 },
-            StateReaderError::EmptyKey,
-            StateReaderError::InvalidReadCache { reason: "zero ttl" },
-            StateReaderError::Unsupported {
-                reason: "empty name",
-            },
-            StateReaderError::store(&SyntheticTerminal),
-            StateReaderError::Access(StateAccessError::load(&SyntheticTerminal)),
-            // Directly constructed (not via `store`), so only a fold on read
-            // keeps this from leaking Terminal.
-            StateReaderError::Store {
-                message: "directly constructed terminal".into(),
-                category: ErrorCategory::Terminal,
-            },
-        ];
+        let captured = StateReaderError::store(&SyntheticTerminal);
+        let cases = Variant::VARIANTS
+            .iter()
+            .copied()
+            .map(sample)
+            .chain([captured]);
         for case in cases {
             assert_ne!(
                 case.classify_error(),
