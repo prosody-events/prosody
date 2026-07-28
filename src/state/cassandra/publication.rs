@@ -17,10 +17,12 @@ use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::{StateName, StateType};
 use crate::state_reader::{PartitionCount, PartitionCountError};
 use crate::subsystem::SubsystemName;
+use futures::{TryStreamExt, pin_mut};
 use internment::Intern;
 use scylla::client::session::Session;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::task::coop::cooperative;
 
 /// Cassandra-backed routing-only publication store.
 #[derive(Clone, Debug)]
@@ -92,34 +94,35 @@ impl PublicationStore for CassandraPublicationStore {
         state_type: StateType,
         name: &StateName,
     ) -> Result<Vec<StatePublication>, Self::Error> {
-        let rows = self
+        let stream = self
             .cql()
-            .execute_unpaged(
-                &self.queries.read_publications,
+            .execute_iter(
+                self.queries.read_publications.clone(),
                 (subsystem.as_str(), state_type, name.as_str()),
             )
             .await
             .map_err(CassandraStoreError::from)?
-            .into_rows_result()
+            .rows_stream::<(String, String, Option<i32>)>()
             .map_err(CassandraStoreError::from)?;
-        let mut out = Vec::with_capacity(rows.rows_num());
-        for row in rows
-            .rows::<(&str, &str, Option<i32>)>()
+        pin_mut!(stream);
+
+        let mut out = Vec::new();
+        while let Some((group_id, topic, partition_count)) = cooperative(stream.try_next())
+            .await
             .map_err(CassandraStoreError::from)?
         {
-            let (group_id, topic, partition_count) = row.map_err(CassandraStoreError::from)?;
             // `upsert` always binds a count, so a NULL means the row was
             // hand-edited or partially written. Decoding it as `Option` keeps
             // that a Permanent data rejection; decoding it as `i32` would make
             // scylla raise a Terminal deserialization error instead.
             let partition_count =
                 partition_count.ok_or_else(|| CassandraPublicationError::NullPartitionCount {
-                    group_id: group_id.to_owned(),
-                    topic: topic.to_owned(),
+                    group_id: group_id.clone(),
+                    topic: topic.clone(),
                 })?;
             out.push(StatePublication {
                 group_id: Arc::from(group_id),
-                topic: Intern::<str>::from(topic),
+                topic: Intern::<str>::from(topic.as_str()),
                 partition_count: PartitionCount::try_from(partition_count)?,
             });
         }
