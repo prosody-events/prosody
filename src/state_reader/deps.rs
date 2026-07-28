@@ -2,11 +2,10 @@
 //!
 //! [`SharedDeps`] owns every handle that a cross-group reader and the owning
 //! consumer share: the backend stores, the message loader, the byte-budgeted
-//! read-through cache, and the heartbeat registry. Build one bundle, then clone
-//! its handles into several
-//! [`StateReader`](super::StateReader)s and into the consumer that writes the
-//! state. Cloning shares handles, so exactly one scylla session and one Kafka
-//! client back the whole process.
+//! read-through cache, and the heartbeat registry. Build one bundle, then
+//! clone its handles into several [`StateReader`](super::StateReader)s and
+//! into the consumer that writes the state. Cloning shares handles, so exactly
+//! one scylla session and one Kafka client back the whole process.
 //!
 //! Every field is a cheap-clone handle, so cloning the bundle shares handles,
 //! never resources. [`SharedDeps::connect`] opens the Cassandra session,

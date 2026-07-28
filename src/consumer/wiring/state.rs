@@ -102,7 +102,12 @@ impl KeyedStateInputs {
     /// Publication setup for a memory arm — mock mode, or a consumer
     /// configured with in-memory trigger storage. Both keep their routing rows
     /// in-process, where the only reader is one sharing this consumer's
-    /// bundle, so the count is [`PartitionCount::MOCK`].
+    /// bundle, and both advertise the fixed [`PartitionCount::MOCK`] topology.
+    ///
+    /// That count is the mock cluster's own, so mock mode routes correctly. A
+    /// non-mock consumer with in-memory triggers advertises it too, so a
+    /// bundle-sharing reader reaches the writer's segment only when the real
+    /// topic has that many partitions.
     pub(in crate::consumer) async fn memory_publication_setup(
         &self,
         store: MemoryPublicationStore,

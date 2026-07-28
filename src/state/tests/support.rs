@@ -1144,7 +1144,7 @@ pub(crate) enum PublicationCall {
         group: String,
         /// The topic.
         topic: String,
-        /// The recorded live partition count.
+        /// The recorded partition count.
         partition_count: i32,
     },
     /// A `remove_group` reached the store.
