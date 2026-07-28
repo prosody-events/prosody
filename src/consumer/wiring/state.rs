@@ -126,8 +126,9 @@ impl KeyedStateInputs {
     ///
     /// Reconciliation runs whenever a subsystem is configured. It retires this
     /// group's routing rows for collections no longer published, the
-    /// `.published(false)` path. It runs once, here, so it converges only under
-    /// the deploy ordering [`reconcile_publications`] documents.
+    /// `.published(false)` path. Running once per process start is what makes
+    /// retirement eventually consistent rather than immediate; see
+    /// [`reconcile_publications`].
     ///
     /// The template is built only when a collection is actually published.
     /// Otherwise there is nothing to advertise, and `None` disables the

@@ -384,20 +384,29 @@ impl FirstWritePublisher {
 /// [`StateVisibility::Private`]: crate::state::registry::StateVisibility::Private
 /// [`is_published`]: CollectionDefRegistry::is_published
 ///
-/// Convergence needs one thing: a sweep must run after the last write of the
-/// generation that still held the collection published. A deploy that stops
-/// every old instance before starting a new one gives that. A rolling deploy
-/// that overlaps two generations does not. An old instance re-upserts the row
-/// after a new one swept it, and nothing sweeps again until the next startup,
-/// so the row keeps advertising a retired collection.
+/// Retirement is eventually consistent, and the trigger is a process start
+/// rather than a timer. A sweep converges once it runs after the last write of
+/// the generation that still held the collection published. A deploy that stops
+/// every old instance before starting a new one gives that immediately. Under a
+/// rolling deploy the generations overlap, so an old instance can re-upsert the
+/// row after a new one swept it; the row then keeps advertising a retired
+/// collection until the group's next start, which sweeps with no old writer
+/// left to resurrect it. Readers in that window still see correct committed
+/// state.
 ///
 /// Exclusive partition ownership does not help here. The row is keyed by
 /// `(group_id, topic)`, so every instance of the group contends over the same
 /// row whatever partitions it holds.
 ///
-/// Retirement also assumes the delete's write timestamp beats every old
-/// insert's. The session's timestamp generator orders one session's writes, not
-/// two processes' clocks.
+/// A delete only shadows an insert whose write timestamp it beats, and one
+/// session's timestamp generator cannot order two processes' clocks. That
+/// delays convergence without preventing it: the old insert's timestamp is
+/// fixed once its generation exits, while each later start's delete carries a
+/// fresh one.
+///
+/// Only a **registered** private name is swept, so un-publishing and
+/// unregistering in one deploy strands the row for good. See
+/// [`KeyedStateConfiguration::subsystem`](crate::state::config::KeyedStateConfiguration).
 ///
 /// Each private name costs exactly one clustering-prefix removal of this
 /// group's slice — no read, so a corrupt sibling row can never block the
