@@ -333,17 +333,27 @@ async fn startup_fails_when_metadata_is_unreachable() -> Result<()> {
     Ok(())
 }
 
-/// A failed startup releases its probe port before returning. Dropping the
-/// server only signals graceful shutdown, so a caller that retried construction
-/// on the same port would find the listener still bound.
+/// A failed startup releases its probe port before returning, and clears the
+/// observation on the way out. Dropping the server only signals graceful
+/// shutdown, so a caller that retried construction on the same port would find
+/// the listener still bound.
+///
+/// The two cleanups share one failure arm, so the probe path is asserted to
+/// clear as well. Seeding a report first is what makes that assertion
+/// falsifiable: without it the observation would be absent either way.
 #[tokio::test]
 async fn failed_startup_releases_the_probe_port() -> Result<()> {
     let port = free_port()?;
     let config = unreachable_config("observer-probe-group", Some(port))?;
     let (provider, _exporter) = test_meter();
     let observer = observer_with(&config.group_id, Duration::from_millis(250), &provider);
+    observer.observe_statistics(statistics_with(&[(TOPIC, 0, &contiguous(1))]));
 
-    expect_unreachable_startup(&config, observer).await?;
+    expect_unreachable_startup(&config, observer.clone()).await?;
+    ensure!(
+        observer.snapshot().is_none(),
+        "a failed startup must leave no observation on the probe path either"
+    );
     // Binding synchronously: nothing between the failed construction and this
     // call yields, so the probe task cannot close its listener behind the
     // assertion's back.

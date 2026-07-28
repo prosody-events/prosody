@@ -618,8 +618,7 @@ async fn read_cart_via_standalone_reader(
 
 /// Reads the `keyed_state_publication` table directly. Asserts exactly one
 /// routing row for `group_id` under `(subsystem, cart)`, carrying `topic` and
-/// the topic's live partition count (1, since the test topic has one
-/// partition).
+/// the topic's partition count (1, since the test topic has one partition).
 async fn assert_routing_row(subsystem: &SubsystemName, group_id: &str, topic: Topic) -> Result<()> {
     let store = CassandraStore::new(&common::test_cassandra_config()).await?;
     let queries = Arc::new(PublicationQueries::new(store.session(), common::TEST_KEYSPACE).await?);
@@ -644,7 +643,7 @@ async fn assert_routing_row(subsystem: &SubsystemName, group_id: &str, topic: To
     );
     ensure!(
         i32::from(own[0].partition_count) == 1_i32,
-        "row must carry the topic's live partition count (1), got {}",
+        "row must carry the topic's partition count (1), got {}",
         i32::from(own[0].partition_count)
     );
 

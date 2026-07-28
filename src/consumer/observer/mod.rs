@@ -32,8 +32,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::debug;
 
-/// How often the primary consumer emits librdkafka statistics. Private on
-/// purpose: no operational caller has asked for a tunable interval.
+/// How often the primary consumer emits librdkafka statistics.
 ///
 /// rdkafka parses each report from JSON on the thread that polls it, and the
 /// tree grows with the client's known brokers, topics, and partitions. The

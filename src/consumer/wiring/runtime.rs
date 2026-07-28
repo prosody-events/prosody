@@ -51,16 +51,14 @@ pub(in crate::consumer) struct StartupServices<'a> {
 /// loop. The provider creates per-partition stores with independent caches.
 ///
 /// The primary consumer is the sole source of Kafka observations: it carries
-/// the statistics interval, and its startup metadata is fetched here, after
-/// subscribe and before the poll loop starts. That fetch is a synchronous
-/// librdkafka round trip, so it runs on a blocking thread, bounded by the
-/// observer's startup timeout. Construction fails if it fails.
+/// the statistics interval, and its first observation is seeded here by
+/// [`KafkaObserver::install_startup_metadata`], which owns that contract.
 ///
-/// Fails if the configuration is invalid, the consumer context can't be
-/// created, the hostname can't be retrieved for the client ID, the Kafka
-/// consumer can't be created with the provided configuration, topic
-/// subscription fails, the probe server can't be started (if enabled), or the
-/// startup metadata fetch fails.
+/// Fails if the configuration is invalid, the probe server can't be started
+/// (if enabled), the consumer context can't be created, the hostname can't be
+/// retrieved for the client ID, the Kafka consumer can't be created with the
+/// provided configuration, topic subscription fails, or the startup metadata
+/// fetch fails.
 pub(in crate::consumer) async fn initialize_consumer<T, P, SP, C>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
@@ -92,64 +90,60 @@ where
     let shutdown: Arc<AtomicBool> = Arc::default();
     let (assignment_tx, assignment) = watch::channel(0u32);
 
-    // Create the consumer context with the message handler and shared state
-    let context = new_context(
-        consumer_config,
-        handler_provider,
-        PartitionProviders {
-            triggers: trigger_provider,
-            state: state_provider,
-        },
-        watermark_version.clone(),
-        ContextHandles {
-            managers: managers.clone(),
-            assignment_tx,
-            telemetry: telemetry.sender(),
-            observer: observer.clone(),
-        },
-        version,
-    )?;
-
-    let consumer: BaseConsumer<_> = client_config(consumer_config)?.create_with_context(context)?;
-
-    let topics: Vec<&str> = consumer_config
-        .subscribed_topics
-        .iter()
-        .map(String::as_str)
-        .collect();
-
-    consumer.subscribe(&topics)?;
-
     // Every fallible step runs before the poll loop starts. A blocking task
     // cannot be aborted, so dropping its handle on an error path would detach
     // an unreachable thread that holds the Kafka client forever. The probe
     // server binds first: a misconfigured port fails in microseconds, ahead of
-    // the metadata fetch's network round trip.
+    // the client's network round trips, and no consumer exists yet to release.
     let probe_server = consumer_config
         .probe_port
         .filter(|_| !consumer_config.mock)
         .map(|port| ProbeServer::new(port, managers.clone(), heartbeats.clone()))
         .transpose()?;
 
-    // Seed the observer through the primary consumer before the poll loop
-    // starts, so a running consumer always has an observation before it can
-    // dispatch a handler. The fetch blocks, so it runs on a blocking thread and
-    // hands the consumer back.
-    let fetch_observer = observer.clone();
-    let fetched = spawn_blocking(move || {
-        fetch_observer.install_startup_metadata(&consumer)?;
-        Ok::<_, ConsumerError>(consumer)
-    })
+    // Build the client, subscribe, and seed the observer, so a running consumer
+    // always has an observation before it can dispatch a handler. Subscribing
+    // and fetching both block, and dropping a `BaseConsumer` poll-loops until
+    // its queue closes, so the client lives and dies inside the blocking task.
+    let started: Result<BaseConsumer<_>, ConsumerError> = async {
+        let context = new_context(
+            consumer_config,
+            handler_provider,
+            PartitionProviders {
+                triggers: trigger_provider,
+                state: state_provider,
+            },
+            watermark_version.clone(),
+            ContextHandles {
+                managers: managers.clone(),
+                assignment_tx,
+                telemetry: telemetry.sender(),
+                observer: observer.clone(),
+            },
+            version,
+        )?;
+        let consumer: BaseConsumer<_> =
+            client_config(consumer_config)?.create_with_context(context)?;
+        let topics = consumer_config.subscribed_topics.clone();
+        let fetch_observer = observer.clone();
+        spawn_blocking(move || {
+            let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
+            consumer.subscribe(&topics)?;
+            fetch_observer.install_startup_metadata(&consumer)?;
+            Ok::<_, ConsumerError>(consumer)
+        })
+        .await
+        .map_err(ConsumerError::StartupTask)?
+    }
     .await;
 
-    let consumer = match fetched.map_err(ConsumerError::StartupTask) {
-        Ok(Ok(consumer)) => consumer,
-        Ok(Err(error)) | Err(error) => {
-            // The task is over, so its consumer is dropped — and that drop
-            // polls the client's queue a last time, which can dispatch a
-            // statistics report into the observer. Clearing here, rather than
-            // inside the task, is what leaves a failed construction with no
-            // observation. It covers a panicking fetch for the same reason.
+    // One failure arm for every step after the probe bound: the observation is
+    // discarded and the probe port released. Clearing after the task, rather
+    // than inside it, also covers a fetch that panicked — see
+    // `KafkaObserver::clear`.
+    let consumer = match started {
+        Ok(consumer) => consumer,
+        Err(error) => {
             observer.clear();
             return Err(release_probe(probe_server, error).await);
         }

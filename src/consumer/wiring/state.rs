@@ -85,8 +85,8 @@ impl KeyedStateInputs {
 
     /// Publication setup for a Cassandra arm. The count source is the primary
     /// consumer's own observation, so the routing row advertises the topology
-    /// that consumer sees. Pass the same observer the mode hands to
-    /// [`initialize_consumer`](super::runtime::initialize_consumer).
+    /// that consumer sees. The observer is the one carried by
+    /// [`StartupServices`](super::runtime::StartupServices).
     pub(in crate::consumer) async fn cassandra_publication_setup(
         &self,
         store: CassandraPublicationStore,
