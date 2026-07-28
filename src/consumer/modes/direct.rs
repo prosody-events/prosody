@@ -24,116 +24,143 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 use validator::Validate;
 
-pub(super) async fn build<T, C>(
-    consumer_config: &ConsumerConfiguration,
-    trigger_store_config: &TriggerStoreConfiguration,
-    keyed_state_config: KeyedStateConfiguration,
-    handler_provider: T,
-    telemetry: Telemetry,
-) -> Result<ProsodyConsumer<C>, ConsumerError>
+impl<C: Codec> ProsodyConsumer<C>
 where
-    C: Codec,
-    C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
-    T: HandlerProvider,
-    T::Handler: EventHandler<Payload = C::Payload>,
+    C::Payload: EventType + Clone,
 {
-    consumer_config.validate()?;
-    keyed_state_config.validate()?;
+    /// Creates a low-level `ProsodyConsumer` that runs an [`EventHandler`]
+    /// directly, with **no middleware**.
+    ///
+    /// This is the lower of the two consumer layers. It wires the partition
+    /// machinery and an empty keyed-state backend, then dispatches each
+    /// message and timer straight to the handler — no retry, deduplication,
+    /// monopolization, or defer middleware runs, and the `settle` durability
+    /// boundary never executes. The handler owns its own commit decisions
+    /// through the `Uncommitted` types.
+    ///
+    /// Because the durability boundary never runs here, keyed-state
+    /// collections can be neither staged nor recovered: registering any is
+    /// rejected with
+    /// [`KeyedStateInitError::StateUnsupported`].
+    /// Use a high-level constructor ([`Self::pipeline_consumer`],
+    /// [`Self::low_latency_consumer`]) for keyed state and the full middleware
+    /// stack — those take a
+    /// [`FallibleHandler`](crate::consumer::FallibleHandler).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ConsumerError` if the configuration is invalid, keyed-state
+    /// collections are registered, or store/consumer creation fails.
+    pub async fn new<T>(
+        consumer_config: &ConsumerConfiguration,
+        trigger_store_config: &TriggerStoreConfiguration,
+        keyed_state_config: KeyedStateConfiguration,
+        handler_provider: T,
+        telemetry: Telemetry,
+    ) -> Result<Self, ConsumerError>
+    where
+        C::Payload: EventIdentity + Send + Sync + 'static,
+        T: HandlerProvider,
+        T::Handler: EventHandler<Payload = C::Payload>,
+    {
+        consumer_config.validate()?;
+        keyed_state_config.validate()?;
 
-    // The `settle` durability boundary never runs on this path, so a
-    // registered collection could never be staged or recovered. Reject it
-    // rather than silently accept a non-functional registration.
-    if keyed_state_config.has_registrations() {
-        return Err(KeyedStateInitError::StateUnsupported.into());
-    }
-
-    let heartbeats = HeartbeatRegistry::new(
-        consumer_config.group_id.clone(),
-        consumer_config.stall_threshold,
-    );
-
-    // Build the empty keyed-state backend the partition machinery requires.
-    // Deduplication is structurally mandatory in the store layer, but with
-    // no dedup/state middleware on this path the dedup store stays inert and
-    // its oracle is never consulted — an empty registry stages nothing — so a
-    // minimal cache capacity is sufficient.
-    let stores = StorePair::new(
-        trigger_store_config,
-        consumer_config.mock,
-        Duration::default(),
-        NonZeroUsize::MIN,
-        consumer_config.timer_spans,
-        // The direct mode shares no infrastructure bundle.
-        None,
-    )
-    .await?;
-    let keyed_state = KeyedStateInputs::new(
-        keyed_state_config,
-        consumer_config,
-        DEFAULT_IDEMPOTENCE_VERSION,
-    )?;
-
-    let services = StartupServices {
-        version: keyed_state.version.clone(),
-        telemetry: &telemetry,
-        heartbeats,
-        observer: KafkaObserver::new(&consumer_config.group_id),
-    };
-
-    match stores {
-        StorePair::Memory {
-            trigger_provider,
-            dedup_provider,
-            ..
-        } => {
-            let state_provider = memory_state_provider::<C>(
-                &keyed_state,
-                dedup_provider,
-                MemoryCells::new(),
-                MemoryDescriptorIdentityStore::new(),
-                MemoryLoader::<C::Payload>::new(),
-                // The direct mode rejects registrations, so nothing is ever
-                // published: no publisher, no reconcile.
-                None,
-            );
-            initialize_consumer::<_, _, _, C>(
-                consumer_config,
-                handler_provider,
-                trigger_provider,
-                state_provider,
-                services,
-            )
-            .await
+        // The `settle` durability boundary never runs on this path, so a
+        // registered collection could never be staged or recovered. Reject it
+        // rather than silently accept a non-functional registration.
+        if keyed_state_config.has_registrations() {
+            return Err(KeyedStateInitError::StateUnsupported.into());
         }
-        StorePair::Cassandra {
-            trigger_provider, ..
-        } => {
-            // Stateless consumer: the `settle` boundary never runs and the
-            // registry is provably empty (rejected above otherwise), so no
-            // session can ever stage. Back keyed state with the inert memory
-            // provider rather than `cassandra_state_provider`, which would
-            // otherwise spawn a loader `BaseConsumer` + poll thread and
-            // create the fjall cache dir for a backend that stages nothing.
-            // The real Cassandra `trigger_provider` still drives the timer
-            // system, and its per-partition store handle is what the (never
-            // consulted) commit oracle receives at acquisition.
-            let state_provider = memory_state_provider::<C>(
-                &keyed_state,
-                MemoryDeduplicationStoreProvider::new(),
-                MemoryCells::new(),
-                MemoryDescriptorIdentityStore::new(),
-                MemoryLoader::<C::Payload>::new(),
-                // Stateless: registrations are rejected, nothing publishes.
-                None,
-            );
-            initialize_consumer::<_, _, _, C>(
-                consumer_config,
-                handler_provider,
+
+        let heartbeats = HeartbeatRegistry::new(
+            consumer_config.group_id.clone(),
+            consumer_config.stall_threshold,
+        );
+
+        // Build the empty keyed-state backend the partition machinery requires.
+        // Deduplication is structurally mandatory in the store layer, but with
+        // no dedup/state middleware on this path the dedup store stays inert and
+        // its oracle is never consulted — an empty registry stages nothing — so a
+        // minimal cache capacity is sufficient.
+        let stores = StorePair::new(
+            trigger_store_config,
+            consumer_config.mock,
+            Duration::default(),
+            NonZeroUsize::MIN,
+            consumer_config.timer_spans,
+            // The direct mode shares no infrastructure bundle.
+            None,
+        )
+        .await?;
+        let keyed_state = KeyedStateInputs::new(
+            keyed_state_config,
+            consumer_config,
+            DEFAULT_IDEMPOTENCE_VERSION,
+        )?;
+
+        let services = StartupServices {
+            version: keyed_state.version.clone(),
+            telemetry: &telemetry,
+            heartbeats,
+            observer: KafkaObserver::new(&consumer_config.group_id),
+        };
+
+        match stores {
+            StorePair::Memory {
                 trigger_provider,
-                state_provider,
-                services,
-            )
-            .await
+                dedup_provider,
+                ..
+            } => {
+                let state_provider = memory_state_provider::<C>(
+                    &keyed_state,
+                    dedup_provider,
+                    MemoryCells::new(),
+                    MemoryDescriptorIdentityStore::new(),
+                    MemoryLoader::<C::Payload>::new(),
+                    // The direct mode rejects registrations, so nothing is ever
+                    // published: no publisher, no reconcile.
+                    None,
+                );
+                initialize_consumer::<_, _, _, C>(
+                    consumer_config,
+                    handler_provider,
+                    trigger_provider,
+                    state_provider,
+                    services,
+                )
+                .await
+            }
+            StorePair::Cassandra {
+                trigger_provider, ..
+            } => {
+                // Stateless consumer: the `settle` boundary never runs and the
+                // registry is provably empty (rejected above otherwise), so no
+                // session can ever stage. Back keyed state with the inert memory
+                // provider rather than `cassandra_state_provider`, which would
+                // otherwise spawn a loader `BaseConsumer` + poll thread and
+                // create the fjall cache dir for a backend that stages nothing.
+                // The real Cassandra `trigger_provider` still drives the timer
+                // system, and its per-partition store handle is what the (never
+                // consulted) commit oracle receives at acquisition.
+                let state_provider = memory_state_provider::<C>(
+                    &keyed_state,
+                    MemoryDeduplicationStoreProvider::new(),
+                    MemoryCells::new(),
+                    MemoryDescriptorIdentityStore::new(),
+                    MemoryLoader::<C::Payload>::new(),
+                    // Stateless: registrations are rejected, nothing publishes.
+                    None,
+                );
+                initialize_consumer::<_, _, _, C>(
+                    consumer_config,
+                    handler_provider,
+                    trigger_provider,
+                    state_provider,
+                    services,
+                )
+                .await
+            }
         }
     }
 }

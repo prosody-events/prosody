@@ -163,102 +163,117 @@ async fn prepare_pipeline_stack<C: Codec>(
     Ok((stores, keyed_state, stack, shared))
 }
 
-pub(super) async fn build<T, C>(
-    setup: ConsumerSetup<'_, C>,
-    pipeline_config: PipelineMiddlewareConfiguration,
-    telemetry: Telemetry,
-    handler: T,
-) -> Result<ProsodyConsumer<C>, ConsumerError>
+impl<C: Codec> ProsodyConsumer<C>
 where
-    C: Codec,
-    C::Payload: EventType + Clone + EventIdentity,
-    T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+    C::Payload: EventType + Clone,
 {
-    let (stores, keyed_state, stack, shared) =
-        prepare_pipeline_stack(&setup, pipeline_config, telemetry).await?;
-    let deps = setup.deps;
+    /// Creates a new `ProsodyConsumer` with a retry strategy for pipeline
+    /// processing.
+    ///
+    /// Pipeline processing emphasizes reliability with automatic retries on
+    /// failure. Messages that fail processing will be retried with
+    /// exponential backoff. Includes monopolization detection to prevent
+    /// single keys from consuming excessive processing time.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ConsumerError` if the consumer creation fails.
+    pub async fn pipeline_consumer<T>(
+        setup: ConsumerSetup<'_, C>,
+        pipeline_config: PipelineMiddlewareConfiguration,
+        telemetry: Telemetry,
+        handler: T,
+    ) -> Result<Self, ConsumerError>
+    where
+        C::Payload: EventIdentity,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+    {
+        let (stores, keyed_state, stack, shared) =
+            prepare_pipeline_stack(&setup, pipeline_config, telemetry).await?;
+        let deps = setup.deps;
 
-    match stores {
-        StorePair::Memory {
-            trigger_provider,
-            message_provider,
-            timer_provider,
-            dedup_provider,
-            publication_store,
-        } => {
-            let (loader, cells, identities) = memory_arm_inputs(deps.as_ref(), shared)?;
-            let publisher_template = keyed_state
-                .memory_publication_setup(publication_store)
-                .await?;
-            let state_provider = memory_state_provider::<C>(
-                &keyed_state,
-                dedup_provider.clone(),
-                cells,
-                identities,
-                loader.clone(),
-                publisher_template,
-            );
-            let message_defer_middleware = MessageDeferMiddleware::new(
-                stack.defer_config.clone(),
-                &stack.consumer_config,
+        match stores {
+            StorePair::Memory {
+                trigger_provider,
                 message_provider,
-                stack.failure_tracker.clone(),
-                loader,
-                &stack.common_config.dedup.version,
-                &stack.telemetry,
-            )?;
-            stack
-                .into_consumer::<_, _, _, _, _, _, _, C>(
-                    message_defer_middleware,
-                    timer_provider,
-                    dedup_provider,
-                    trigger_provider,
-                    state_provider,
-                    handler,
-                )
-                .await
-        }
-        StorePair::Cassandra {
-            trigger_provider,
-            message_provider,
-            timer_provider,
-            dedup_provider,
-            cell_store,
-            identity_store,
-            publication_store,
-        } => {
-            let loader =
-                cassandra_loader(deps.as_ref(), &stack.consumer_config, &stack.heartbeats)?;
-            let publisher_template = keyed_state
-                .cassandra_publication_setup(publication_store, stack.observer.clone())
-                .await?;
-            let state_provider = cassandra_state_provider::<C>(
-                &keyed_state,
-                dedup_provider.clone(),
+                timer_provider,
+                dedup_provider,
+                publication_store,
+            } => {
+                let (loader, cells, identities) = memory_arm_inputs(deps.as_ref(), shared)?;
+                let publisher_template = keyed_state
+                    .memory_publication_setup(publication_store)
+                    .await?;
+                let state_provider = memory_state_provider::<C>(
+                    &keyed_state,
+                    dedup_provider.clone(),
+                    cells,
+                    identities,
+                    loader.clone(),
+                    publisher_template,
+                );
+                let message_defer_middleware = MessageDeferMiddleware::new(
+                    stack.defer_config.clone(),
+                    &stack.consumer_config,
+                    message_provider,
+                    stack.failure_tracker.clone(),
+                    loader,
+                    &stack.common_config.dedup.version,
+                    &stack.telemetry,
+                )?;
+                stack
+                    .into_consumer::<_, _, _, _, _, _, _, C>(
+                        message_defer_middleware,
+                        timer_provider,
+                        dedup_provider,
+                        trigger_provider,
+                        state_provider,
+                        handler,
+                    )
+                    .await
+            }
+            StorePair::Cassandra {
+                trigger_provider,
+                message_provider,
+                timer_provider,
+                dedup_provider,
                 cell_store,
                 identity_store,
-                loader.clone(),
-                publisher_template,
-            )?;
-            let message_defer_middleware = MessageDeferMiddleware::new(
-                stack.defer_config.clone(),
-                &stack.consumer_config,
-                message_provider,
-                stack.failure_tracker.clone(),
-                loader,
-                &stack.common_config.dedup.version,
-                &stack.telemetry,
-            )?;
-            stack
-                .into_consumer::<_, _, _, _, _, _, _, C>(
-                    message_defer_middleware,
-                    timer_provider,
-                    dedup_provider,
-                    trigger_provider,
-                    state_provider,
-                    handler,
-                )
-                .await
+                publication_store,
+            } => {
+                let loader =
+                    cassandra_loader(deps.as_ref(), &stack.consumer_config, &stack.heartbeats)?;
+                let publisher_template = keyed_state
+                    .cassandra_publication_setup(publication_store, stack.observer.clone())
+                    .await?;
+                let state_provider = cassandra_state_provider::<C>(
+                    &keyed_state,
+                    dedup_provider.clone(),
+                    cell_store,
+                    identity_store,
+                    loader.clone(),
+                    publisher_template,
+                )?;
+                let message_defer_middleware = MessageDeferMiddleware::new(
+                    stack.defer_config.clone(),
+                    &stack.consumer_config,
+                    message_provider,
+                    stack.failure_tracker.clone(),
+                    loader,
+                    &stack.common_config.dedup.version,
+                    &stack.telemetry,
+                )?;
+                stack
+                    .into_consumer::<_, _, _, _, _, _, _, C>(
+                        message_defer_middleware,
+                        timer_provider,
+                        dedup_provider,
+                        trigger_provider,
+                        state_provider,
+                        handler,
+                    )
+                    .await
+            }
         }
     }
 }
