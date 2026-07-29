@@ -6,7 +6,7 @@
 //! Kafka loader, it requires explicit message storage via
 //! [`MemoryLoader::store_message`].
 
-use super::MessageLoader;
+use super::{MessageLoader, PermitMode};
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::otel::SpanRelation;
@@ -19,7 +19,7 @@ use parking_lot::RwLock;
 use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, TryAcquireError};
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
@@ -66,10 +66,18 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
     /// loader's configured relation.
     #[must_use]
     pub fn with_message_spans(message_spans: SpanRelation) -> Self {
+        Self::with_capacity_and_spans(1000, message_spans)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_spans(capacity, SpanRelation::default())
+    }
+
+    fn with_capacity_and_spans(capacity: usize, message_spans: SpanRelation) -> Self {
         Self {
             messages: Arc::new(RwLock::new(HashMap::default())),
-            // Large semaphore since we don't care about backpressure in tests
-            semaphore: Arc::new(Semaphore::new(1000)),
+            semaphore: Arc::new(Semaphore::new(capacity)),
             message_spans,
         }
     }
@@ -132,15 +140,21 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
         topic: Topic,
         partition: Partition,
         offset: Offset,
+        mode: PermitMode,
     ) -> Result<ConsumerMessage<P>, MemoryLoaderError> {
-        // Acquire a dummy permit to construct ConsumerMessage
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| MemoryLoaderError::LoaderShutdown)?;
-
+        let semaphore = self.semaphore.clone();
+        let permit = match mode {
+            PermitMode::Wait => semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| MemoryLoaderError::LoaderShutdown)?,
+            PermitMode::Available => {
+                semaphore.try_acquire_owned().map_err(|error| match error {
+                    TryAcquireError::Closed => MemoryLoaderError::LoaderShutdown,
+                    TryAcquireError::NoPermits => MemoryLoaderError::CapacityExhausted,
+                })?
+            }
+        };
         // Look up the message
         let messages = self.messages.read();
         let (message_value, context) = messages
@@ -183,7 +197,16 @@ impl<P: Clone + Send + Sync + 'static> MessageLoader for MemoryLoader<P> {
         partition: Partition,
         offset: Offset,
     ) -> impl Future<Output = Result<ConsumerMessage<Self::Payload>, Self::Error>> + Send {
-        self.load_message_impl(topic, partition, offset)
+        self.load_message_impl(topic, partition, offset, PermitMode::Wait)
+    }
+
+    fn try_load_message(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        offset: Offset,
+    ) -> impl Future<Output = Result<ConsumerMessage<Self::Payload>, Self::Error>> + Send {
+        self.load_message_impl(topic, partition, offset, PermitMode::Available)
     }
 }
 
@@ -197,6 +220,10 @@ pub enum MemoryLoaderError {
     /// The loader has been shut down and cannot process requests.
     #[error("Loader has shut down")]
     LoaderShutdown,
+
+    /// Every loader permit is held.
+    #[error("Loader capacity is exhausted")]
+    CapacityExhausted,
 }
 
 impl ClassifyError for MemoryLoaderError {
@@ -204,6 +231,8 @@ impl ClassifyError for MemoryLoaderError {
         match self {
             // Terminal - loader cannot operate
             Self::LoaderShutdown => ErrorCategory::Terminal,
+
+            Self::CapacityExhausted => ErrorCategory::Transient,
 
             // Permanent - message doesn't exist
             Self::NotFound(..) => ErrorCategory::Permanent,

@@ -43,7 +43,7 @@
 //! This approach avoids upfront offset validation (which requires metadata
 //! queries) and lets rdkafka handle offset recovery automatically.
 
-use super::MessageLoader;
+use super::{MessageLoader, PermitMode};
 use crate::consumer::ConsumerConfiguration;
 use crate::consumer::decode::{DecodedMessage, decode_message};
 use crate::consumer::message::ConsumerMessage;
@@ -68,7 +68,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, TryAcquireError, mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use tracing::field::Empty;
 use tracing::{Span, debug, error, instrument, warn};
@@ -76,6 +76,7 @@ use tracing::{Span, debug, error, instrument, warn};
 use crate::Codec;
 use crate::otel::SpanRelation;
 use crate::related_span;
+use crate::state::RESOLVE_FANOUT;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use derive_builder::Builder;
 use tokio::select;
@@ -143,10 +144,9 @@ pub struct LoaderConfiguration {
     /// ID, ensuring no conflicts with the primary consumer.
     pub group_id: String,
 
-    /// Maximum number of concurrent message decoding operations.
+    /// Maximum number of loaded messages retained by callers.
     ///
-    /// Controls the size of the semaphore used for decoding permits
-    /// and the capacity of the request channel.
+    /// Controls the semaphore and request-channel capacity.
     pub max_permits: usize,
 
     /// Maximum number of messages to cache.
@@ -193,7 +193,7 @@ impl LoaderConfiguration {
         Self {
             bootstrap_servers: consumer_config.bootstrap_servers.clone(),
             group_id: format!("{}.defer-loader", consumer_config.group_id),
-            max_permits: consumer_config.max_uncommitted,
+            max_permits: loader_capacity(consumer_config.max_uncommitted),
             cache_size: consumer_config.loader.cache_size,
             poll_interval: consumer_config.poll_interval,
             seek_timeout: consumer_config.loader.seek_timeout,
@@ -335,7 +335,16 @@ where
         partition: Partition,
         offset: Offset,
     ) -> impl Future<Output = Result<ConsumerMessage<C::Payload>, Self::Error>> + Send {
-        self.load_message_impl(topic, partition, offset)
+        self.load_message_impl(topic, partition, offset, PermitMode::Wait)
+    }
+
+    fn try_load_message(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        offset: Offset,
+    ) -> impl Future<Output = Result<ConsumerMessage<C::Payload>, Self::Error>> + Send {
+        self.load_message_impl(topic, partition, offset, PermitMode::Available)
     }
 }
 
@@ -435,15 +444,14 @@ where
     /// Fails with [`KafkaLoaderError::LoaderShutdown`] if the semaphore or
     /// either channel has closed, or with a decode/Kafka error if the message
     /// can't be found or decoded.
-    #[instrument(level = "debug", skip(self), fields(cached = Empty), err)]
+    #[instrument(level = "debug", skip(self, mode), fields(cached = Empty), err)]
     async fn load_message_impl(
         &self,
         topic: Topic,
         partition: Partition,
         offset: Offset,
+        mode: PermitMode,
     ) -> Result<ConsumerMessage<C::Payload>, KafkaLoaderError> {
-        let instrument_span = Span::current();
-
         debug!(
             topic = %topic,
             partition = partition,
@@ -451,14 +459,20 @@ where
             "Acquiring permit for deferred message load"
         );
 
-        // Acquire load permit for the returned message (backpressure)
-        let load_permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| KafkaLoaderError::LoaderShutdown)?;
-
+        let semaphore = self.semaphore.clone();
+        let load_permit = match mode {
+            PermitMode::Wait => semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| KafkaLoaderError::LoaderShutdown)?,
+            PermitMode::Available => {
+                semaphore.try_acquire_owned().map_err(|error| match error {
+                    TryAcquireError::Closed => KafkaLoaderError::LoaderShutdown,
+                    TryAcquireError::NoPermits => KafkaLoaderError::CapacityExhausted,
+                })?
+            }
+        };
+        let instrument_span = Span::current();
         let cache_key = (topic, partition, offset);
 
         // Get decoded message from cache or load from Kafka, tracking cache status
@@ -1096,6 +1110,12 @@ fn create_load_span<P>(decoded: &DecodedMessage<P>, cached: bool, relation: Span
     )
 }
 
+fn loader_capacity(max_uncommitted: usize) -> usize {
+    max_uncommitted
+        .saturating_mul(RESOLVE_FANOUT)
+        .min(Semaphore::MAX_PERMITS)
+}
+
 /// Errors that can occur during Kafka message loading.
 #[derive(Clone, Debug, Error)]
 pub enum KafkaLoaderError {
@@ -1106,6 +1126,10 @@ pub enum KafkaLoaderError {
     /// The loader has been shut down and cannot process requests.
     #[error("Loader has shut down")]
     LoaderShutdown,
+
+    /// Every loader permit is held.
+    #[error("Loader capacity is exhausted")]
+    CapacityExhausted,
 
     /// The requested offset no longer exists due to retention or compaction.
     ///
@@ -1159,6 +1183,8 @@ impl ClassifyError for KafkaLoaderError {
             Self::LoaderShutdown | Self::ConsumerCreation(_) | Self::Hostname(_) => {
                 ErrorCategory::Terminal
             }
+
+            Self::CapacityExhausted => ErrorCategory::Transient,
 
             // Classify Kafka operation errors using shared implementation
             Self::Kafka(kafka_error) => kafka_error.classify_error(),

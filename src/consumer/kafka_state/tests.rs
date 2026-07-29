@@ -23,6 +23,8 @@ use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
 
 const TOPIC_POOL: &[&str] = &[
     "orders.v1",
@@ -200,6 +202,30 @@ async fn kafka_descriptor_deleted_offset_is_permanent() -> Result<()> {
 async fn kafka_descriptor_absent_cell_returns_none() -> Result<()> {
     let handle = bind_registered(last_seen(), MemoryLoader::<Value>::new())?;
     assert!(handle.get().await?.is_none());
+    Ok(())
+}
+
+/// State resolution never waits for capacity held by an earlier resolved
+/// value. Saturation is a transient error.
+#[tokio::test]
+async fn kafka_state_capacity_exhaustion_never_waits() -> Result<()> {
+    let (topic, partition, offset) = coords();
+    let loader = MemoryLoader::with_capacity(1);
+    loader.store_message(topic, partition, offset, Arc::from("user-1"), json!(1_i32));
+
+    let handle = bind_registered(last_seen(), loader)?;
+    handle.set(&message_for_testing(json!(1_i32))?).await?;
+    let _first = handle
+        .get()
+        .await?
+        .ok_or_else(|| eyre!("expected the first resolved message"))?;
+
+    let error = timeout(Duration::from_millis(100), handle.get())
+        .await
+        .map_err(|_| eyre!("state resolution waited for loader capacity"))?
+        .err()
+        .ok_or_else(|| eyre!("state resolution must fail while capacity is held"))?;
+    assert_eq!(error.classify_error(), ErrorCategory::Transient);
     Ok(())
 }
 

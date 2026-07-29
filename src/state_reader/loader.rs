@@ -59,6 +59,24 @@ where
                 .map_err(ReaderLoaderError::Memory),
         }
     }
+
+    async fn try_load_message(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        offset: Offset,
+    ) -> Result<ConsumerMessage<Self::Payload>, Self::Error> {
+        match self {
+            Self::Kafka(loader) => loader
+                .try_load_message(topic, partition, offset)
+                .await
+                .map_err(ReaderLoaderError::Kafka),
+            Self::Memory(loader) => loader
+                .try_load_message(topic, partition, offset)
+                .await
+                .map_err(ReaderLoaderError::Memory),
+        }
+    }
 }
 
 /// Error from a [`ReaderLoader`], delegating classification to the active arm.

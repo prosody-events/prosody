@@ -37,6 +37,12 @@ pub use kafka::{
 };
 pub use memory::{MemoryLoader, MemoryLoaderError};
 
+#[derive(Clone, Copy)]
+enum PermitMode {
+    Wait,
+    Available,
+}
+
 /// Loads messages by their exact offset coordinates for retry.
 ///
 /// This trait abstracts message loading to enable different implementations:
@@ -65,6 +71,16 @@ pub trait MessageLoader: Send + Sync + Clone {
     /// Returns an error if the message cannot be loaded (deleted, network
     /// failure, etc.)
     fn load_message(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        offset: Offset,
+    ) -> impl Future<Output = Result<ConsumerMessage<Self::Payload>, Self::Error>> + Send;
+
+    /// Loads a message without waiting for loader capacity.
+    ///
+    /// Returns a transient error when every permit is held.
+    fn try_load_message(
         &self,
         topic: Topic,
         partition: Partition,
