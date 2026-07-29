@@ -8,7 +8,7 @@ use super::descriptor_identity::{
 use super::dirty::{Edge, remove_span};
 use super::marker::{EventMarker, SectionClear};
 use super::oracle::CommitOracle;
-use super::publication::{PublicationStore, StatePublication};
+use super::publication::{PublicationRows, PublicationStore, StatePublication};
 use super::registry::CollectionDefRegistry;
 use super::resolve::{
     ResolveCellError, Resolver, flatten_resolve, help_read_window, help_write_window, peek_read,
@@ -17,6 +17,7 @@ use super::resolve::{
 use super::store::{CellBuffer, CellStore, CoordinateBatch, provisional_point_loop};
 use super::{CollectionId, CollectionRef, EventRef, StateName, StateType};
 use crate::Topic;
+use crate::state_reader::PUBLICATION_READ_LIMIT;
 use crate::subsystem::SubsystemName;
 use ahash::RandomState;
 use async_stream::try_stream;
@@ -767,11 +768,12 @@ impl PublicationStore for MemoryPublicationStore {
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
-    ) -> Result<Vec<StatePublication>, Self::Error> {
+    ) -> Result<PublicationRows, Self::Error> {
         let guard = Guard::new();
         let out = self
             .rows
             .range(PublicationScope::range(subsystem, state_type, name), &guard)
+            .take(PUBLICATION_READ_LIMIT)
             .map(|(_key, row)| row.clone())
             .collect();
         drop(guard);

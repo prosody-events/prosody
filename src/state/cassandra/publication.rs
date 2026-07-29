@@ -13,9 +13,9 @@ use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraStore as CassandraSession, TABLE_KEYED_STATE_PUBLICATION};
 use crate::cassandra_queries;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::state::publication::{PublicationStore, StatePublication};
+use crate::state::publication::{PublicationRows, PublicationStore, StatePublication};
 use crate::state::{StateName, StateType};
-use crate::state_reader::{PartitionCount, PartitionCountError};
+use crate::state_reader::{PUBLICATION_READ_LIMIT, PartitionCount, PartitionCountError};
 use crate::subsystem::SubsystemName;
 use futures::{TryStreamExt, pin_mut};
 use internment::Intern;
@@ -93,12 +93,17 @@ impl PublicationStore for CassandraPublicationStore {
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
-    ) -> Result<Vec<StatePublication>, Self::Error> {
+    ) -> Result<PublicationRows, Self::Error> {
         let stream = self
             .cql()
             .execute_iter(
                 self.queries.read_publications.clone(),
-                (subsystem.as_str(), state_type, name.as_str()),
+                (
+                    subsystem.as_str(),
+                    state_type,
+                    name.as_str(),
+                    PUBLICATION_READ_LIMIT as i32,
+                ),
             )
             .await
             .map_err(CassandraStoreError::from)?
@@ -106,7 +111,7 @@ impl PublicationStore for CassandraPublicationStore {
             .map_err(CassandraStoreError::from)?;
         pin_mut!(stream);
 
-        let mut out = Vec::new();
+        let mut out = PublicationRows::new();
         while let Some((group_id, topic, partition_count)) = cooperative(stream.try_next())
             .await
             .map_err(CassandraStoreError::from)?
@@ -155,7 +160,7 @@ cassandra_queries! {
         /// scan, no `ALLOW FILTERING`.
         read_publications: (
             "SELECT group_id, topic, partition_count \
-             FROM $keyspace.{} WHERE subsystem = ? AND state_type = ? AND name = ?",
+             FROM $keyspace.{} WHERE subsystem = ? AND state_type = ? AND name = ? LIMIT ?",
             TABLE_KEYED_STATE_PUBLICATION
         ),
     }

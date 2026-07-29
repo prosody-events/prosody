@@ -11,9 +11,16 @@ use crate::error::ClassifyError;
 use crate::state::{StateName, StateType};
 use crate::state_reader::PartitionCount;
 use crate::subsystem::SubsystemName;
+use smallvec::SmallVec;
 use std::error::Error;
 use std::future::Future;
 use std::sync::Arc;
+
+/// Publication rows returned by one collection read.
+///
+/// One or two sources are the common case. Backends may impose a higher fixed
+/// read limit before returning this collection.
+pub(crate) type PublicationRows = SmallVec<[StatePublication; 2]>;
 
 /// One published source of a collection's state: a `(group_id, topic)` pair and
 /// the topic's partition count. Routing facts only — no identity.
@@ -75,8 +82,9 @@ pub trait PublicationStore: Clone + Send + Sync + 'static {
         group_id: &str,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// All published sources of `(subsystem, state_type, name)` — one
-    /// partition read.
+    /// Published sources of `(subsystem, state_type, name)` — one bounded
+    /// partition read. The bound includes one overflow row so callers can
+    /// reject an oversized source set without reading the rest.
     ///
     /// # Errors
     /// Backend failure, or (Cassandra backend) a decoded partition count
@@ -86,5 +94,5 @@ pub trait PublicationStore: Clone + Send + Sync + 'static {
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
-    ) -> impl Future<Output = Result<Vec<StatePublication>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<PublicationRows, Self::Error>> + Send;
 }

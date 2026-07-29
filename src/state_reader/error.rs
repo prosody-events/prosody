@@ -67,7 +67,7 @@ pub enum StateReaderError {
     /// The collection advertises more publication sources than the reader
     /// admits. Permanent (the bound is liftable in a later release, never at
     /// runtime).
-    #[error("too many publication sources ({found} > {max})")]
+    #[error("too many publication sources (at least {found}; maximum {max})")]
     TooManySources {
         /// The number of distinct sources advertised.
         found: usize,

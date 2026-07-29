@@ -12,6 +12,9 @@ use thiserror::Error;
 /// error. A future release may raise the bound, but it never changes at
 /// runtime.
 pub(crate) const MAX_PUBLICATION_SOURCES: usize = 16;
+/// Rows requested from the publication store. The extra row proves overflow
+/// without reading the rest of an oversized routing partition.
+pub(crate) const PUBLICATION_READ_LIMIT: usize = MAX_PUBLICATION_SOURCES + 1;
 
 /// A source's **stable** identity: the publishing consumer group and the topic
 /// whose messages wrote the state.
@@ -96,7 +99,7 @@ pub(super) enum NoSnapshot {
     #[error("no admitted publication source")]
     NoSource,
     /// More sources are advertised than [`MAX_PUBLICATION_SOURCES`] admits.
-    #[error("too many publication sources ({found} > {MAX_PUBLICATION_SOURCES})")]
+    #[error("too many publication sources (at least {found}; maximum {MAX_PUBLICATION_SOURCES})")]
     TooManySources {
         /// The number of sources advertised.
         found: usize,

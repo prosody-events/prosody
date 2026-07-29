@@ -35,7 +35,7 @@ use crate::state::descriptor::{DescriptorIdentity, value_state};
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state_reader::StateReaderError;
-use crate::state_reader::source::MAX_PUBLICATION_SOURCES;
+use crate::state_reader::source::{MAX_PUBLICATION_SOURCES, PUBLICATION_READ_LIMIT};
 use color_eyre::eyre::{Result, bail, eyre};
 use serde_json::Value;
 use std::sync::Arc;
@@ -162,7 +162,7 @@ async fn identity_mismatch_sticky() -> Result<()> {
 /// An oversized routing table is the other Permanent fault a refresh can find,
 /// and it is sticky the same way: every read within the refresh interval
 /// surfaces `TooManySources` without re-reading the table. Past the interval
-/// the reader re-validates, so withdrawing a source clears the fault.
+/// the reader re-validates, so withdrawing enough sources clears the fault.
 ///
 /// This is the twin of [`identity_mismatch_sticky`]. Both prove one rule: a
 /// Permanent fault is cached like a snapshot, because only an operator can
@@ -178,9 +178,9 @@ async fn oversized_routing_table_is_sticky() -> Result<()> {
     let env = ScriptedEnv::new(descriptor)?;
     let key = Key::from("user-1");
 
-    // One more source than the reader admits, each with a matching frozen
-    // identity, so admission succeeds and the bound is the only rejection.
-    for i in 0..=MAX_PUBLICATION_SOURCES {
+    // More rows than the store returns, each with a matching frozen identity,
+    // so the reported count proves the read stops at the overflow sentinel.
+    for i in 0..PUBLICATION_READ_LIMIT + 5 {
         env.publish(
             &format!("oversized-g{i}"),
             topic(&format!("oversized-t{i}")),
@@ -194,7 +194,7 @@ async fn oversized_routing_table_is_sticky() -> Result<()> {
     // Op 1, at t=0: the initial refresh reads the table and rejects it.
     match reader.get(key.clone()).await {
         Err(StateReaderError::TooManySources { found, max }) => {
-            assert_eq!(found, MAX_PUBLICATION_SOURCES + 1);
+            assert_eq!(found, PUBLICATION_READ_LIMIT);
             assert_eq!(max, MAX_PUBLICATION_SOURCES);
         }
         other => bail!("op 1 expected TooManySources, got {other:?}"),
@@ -212,13 +212,20 @@ async fn oversized_routing_table_is_sticky() -> Result<()> {
         "a sticky fault must not re-read the routing table"
     );
 
-    // Op 3, past the interval with one source withdrawn: the table is back
+    // Op 3, past the interval with enough sources withdrawn: the table is back
     // within the bound, so the re-validation clears the fault.
     mock.increment(Duration::from_mins(2));
-    env.publications
-        .remove_group(&env.sub, StateType::Application, &env.name, "oversized-g0")
-        .await
-        .map_err(|e| eyre!("remove_group: {e}"))?;
+    for i in 0_usize..6 {
+        env.publications
+            .remove_group(
+                &env.sub,
+                StateType::Application,
+                &env.name,
+                &format!("oversized-g{i}"),
+            )
+            .await
+            .map_err(|e| eyre!("remove_group: {e}"))?;
+    }
     match reader.get(key).await {
         Ok(None) => Ok(()),
         other => bail!("op 3 (withdrawn back within the bound) expected Ok(None), got {other:?}"),

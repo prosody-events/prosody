@@ -15,7 +15,7 @@ use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
 use crate::state::identity::CollectionId;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
-use crate::state::publication::{PublicationStore, StatePublication};
+use crate::state::publication::{PublicationRows, PublicationStore};
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{StateName, StateType};
 use crate::state_reader::error::StateReaderError;
@@ -145,7 +145,7 @@ impl ReaderStores {
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
-    ) -> Result<Vec<StatePublication>, StateReaderError> {
+    ) -> Result<PublicationRows, StateReaderError> {
         match self {
             Self::Cassandra { publications, .. } => publications
                 .read_publications(subsystem, state_type, name)

@@ -14,7 +14,7 @@ use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::memory::MemoryPublicationStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
-use crate::state::publication::{PublicationStore, StatePublication};
+use crate::state::publication::{PublicationRows, PublicationStore, StatePublication};
 use crate::state::registry::DEFAULT_KEYSET_LIMIT;
 use crate::state::session::sealed::{MarkerIdentity, ReadAdmission, StateLifecycle};
 use crate::state::session::{
@@ -1333,6 +1333,7 @@ impl ScriptedPublicationStore {
             .read_publications(subsystem, state_type, name)
             .await
             .unwrap_or_default()
+            .into_vec()
     }
 }
 
@@ -1394,7 +1395,7 @@ impl PublicationStore for ScriptedPublicationStore {
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
-    ) -> Result<Vec<StatePublication>, Self::Error> {
+    ) -> Result<PublicationRows, Self::Error> {
         self.calls.lock().push(PublicationCall::Read {
             name: name.as_str().to_owned(),
         });

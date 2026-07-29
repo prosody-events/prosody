@@ -29,6 +29,7 @@ pub(crate) use deps::DEFAULT_READER_CACHE_SIZE_BYTES;
 pub use deps::SharedDeps;
 pub use error::StateReaderError;
 pub use loader::{ReaderLoader, ReaderLoaderError};
+pub(crate) use source::PUBLICATION_READ_LIMIT;
 // `partition_for_key` is public on purpose. It is the librdkafka-compatible
 // routing primitive. The reader ecosystem and the cross-language clients must
 // route a key to the same partition the producer's partitioner would.

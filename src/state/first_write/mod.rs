@@ -25,7 +25,7 @@ use crate::consumer::observer::{KafkaObserver, PartitionCountObservationError};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cassandra::{CassandraPublicationError, CassandraPublicationStore};
 use crate::state::memory::MemoryPublicationStore;
-use crate::state::publication::{PublicationStore, StatePublication};
+use crate::state::publication::{PublicationRows, PublicationStore, StatePublication};
 use crate::state::registry::CollectionDefRegistry;
 #[cfg(test)]
 use crate::state::tests::support::{ScriptedPublicationError, ScriptedPublicationStore};
@@ -120,7 +120,7 @@ impl PublicationBackend {
         subsystem: &SubsystemName,
         state_type: StateType,
         name: &StateName,
-    ) -> Result<Vec<StatePublication>, PublicationBackendError> {
+    ) -> Result<PublicationRows, PublicationBackendError> {
         match self {
             Self::Cassandra(store) => {
                 Ok(store.read_publications(subsystem, state_type, name).await?)
