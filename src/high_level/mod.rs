@@ -450,6 +450,8 @@ where
     }
 }
 
+// Concrete impls keep consumer construction internals out of ClientBackend's
+// public bounds.
 macro_rules! impl_subscribe {
     ($backend:ty) => {
         impl<T, C> HighLevelClient<T, C, $backend>

@@ -5,7 +5,7 @@ use crate::consumer::middleware::FallibleHandler;
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::state::ConsumerState;
 use crate::high_level::{
-    CassandraClientBackend, ConsumerBuilders, HighLevelClient, HighLevelClientError,
+    CassandraClientBackend, ClientBackend, ConsumerBuilders, HighLevelClient, HighLevelClientError,
     MemoryClientBackend, Mode,
 };
 use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder};
@@ -54,28 +54,28 @@ where
     C: Codec,
 {
     /// Sends one event.
-    async fn erased_send(
+    async fn send(
         &self,
         topic: Topic,
         key: String,
         payload: C::Payload,
     ) -> Result<(), HighLevelClientError<C::Error>>;
     /// Starts consuming.
-    async fn erased_subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>;
+    async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>;
     /// Stops consuming.
-    async fn erased_unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>>;
+    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>>;
     /// Returns the current lifecycle state.
-    async fn erased_consumer_state(&self) -> ErasedConsumerState<T>;
+    async fn consumer_state(&self) -> ErasedConsumerState<T>;
     /// Returns the assigned partition count.
-    async fn erased_assigned_partition_count(&self) -> u32;
+    async fn assigned_partition_count(&self) -> u32;
     /// Reports whether any consumer heartbeat is stalled.
-    async fn erased_is_stalled(&self) -> bool;
+    async fn is_stalled(&self) -> bool;
     /// Producer configuration.
-    fn erased_producer_config(&self) -> &ProducerConfiguration;
+    fn producer_config(&self) -> &ProducerConfiguration;
     /// Trace-context propagator.
-    fn erased_propagator(&self) -> &TextMapCompositePropagator;
+    fn propagator(&self) -> &TextMapCompositePropagator;
     /// Configured source system.
-    fn erased_source_system(&self) -> &str;
+    fn source_system(&self) -> &str;
 }
 
 /// Shared erased client representation stored by native FFI wrappers.
@@ -101,54 +101,59 @@ where
     C::Payload: EventIdentity + EventType + Clone,
 {
     if mock {
-        Ok(Arc::new(HighLevelClient::new(
+        Ok(Arc::new(ErasedClient(HighLevelClient::new(
             MemoryClientBackend::new(),
             mode,
             producer,
             consumers,
-        )?))
+        )?)))
     } else {
         let cassandra = cassandra.ok_or(ErasedClientBuildError::MissingCassandra)?;
-        Ok(Arc::new(HighLevelClient::new(
+        Ok(Arc::new(ErasedClient(HighLevelClient::new(
             CassandraClientBackend::new(cassandra),
             mode,
             producer,
             consumers,
-        )?))
+        )?)))
     }
 }
 
+struct ErasedClient<T, C, B>(HighLevelClient<T, C, B>)
+where
+    C: Codec,
+    C::Payload: EventIdentity,
+    B: ClientBackend<C>;
+
+// Concrete impls keep consumer construction internals out of ClientBackend's
+// public bounds.
 macro_rules! impl_erased_client {
     ($backend:ty) => {
         #[async_trait]
-        impl<T, C> ErasedHighLevelClient<T, C> for HighLevelClient<T, C, $backend>
+        impl<T, C> ErasedHighLevelClient<T, C> for ErasedClient<T, C, $backend>
         where
             T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
             C: Codec + Send + Sync,
             C::Payload: EventIdentity + EventType + Clone,
         {
-            async fn erased_send(
+            async fn send(
                 &self,
                 topic: Topic,
                 key: String,
                 payload: C::Payload,
             ) -> Result<(), HighLevelClientError<C::Error>> {
-                HighLevelClient::send(self, topic, &key, payload).await
+                self.0.send(topic, &key, payload).await
             }
 
-            async fn erased_subscribe(
-                &self,
-                handler: T,
-            ) -> Result<(), HighLevelClientError<C::Error>> {
-                self.subscribe(handler).await
+            async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>> {
+                self.0.subscribe(handler).await
             }
 
-            async fn erased_unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>> {
-                HighLevelClient::unsubscribe(self).await
+            async fn unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>> {
+                self.0.unsubscribe().await
             }
 
-            async fn erased_consumer_state(&self) -> ErasedConsumerState<T> {
-                match &*HighLevelClient::consumer_state(self).await {
+            async fn consumer_state(&self) -> ErasedConsumerState<T> {
+                match &*self.0.consumer_state().await {
                     ConsumerState::Unconfigured => ErasedConsumerState::Unconfigured,
                     ConsumerState::ConfigurationFailed(error) => {
                         ErasedConsumerState::ConfigurationFailed(error.to_string())
@@ -165,24 +170,24 @@ macro_rules! impl_erased_client {
                 }
             }
 
-            async fn erased_assigned_partition_count(&self) -> u32 {
-                HighLevelClient::assigned_partition_count(self).await
+            async fn assigned_partition_count(&self) -> u32 {
+                self.0.assigned_partition_count().await
             }
 
-            async fn erased_is_stalled(&self) -> bool {
-                HighLevelClient::is_stalled(self).await
+            async fn is_stalled(&self) -> bool {
+                self.0.is_stalled().await
             }
 
-            fn erased_producer_config(&self) -> &ProducerConfiguration {
-                HighLevelClient::producer_config(self)
+            fn producer_config(&self) -> &ProducerConfiguration {
+                self.0.producer_config()
             }
 
-            fn erased_propagator(&self) -> &TextMapCompositePropagator {
-                HighLevelClient::propagator(self)
+            fn propagator(&self) -> &TextMapCompositePropagator {
+                self.0.propagator()
             }
 
-            fn erased_source_system(&self) -> &str {
-                HighLevelClient::source_system(self)
+            fn source_system(&self) -> &str {
+                self.0.source_system()
             }
         }
     };
