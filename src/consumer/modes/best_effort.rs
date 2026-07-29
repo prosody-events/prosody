@@ -13,6 +13,7 @@ use crate::consumer::wiring::state::{
     cassandra_loader, cassandra_state_provider, memory_arm_inputs, memory_state_provider,
 };
 use crate::consumer::wiring::{build_common_middleware, build_shared_state};
+use crate::state_reader::ConsumerReaderBackend;
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity, EventType};
 
@@ -27,17 +28,17 @@ where
     /// messages once, logs any failures, and moves on. This approach should
     /// only be used for development or for services where occasional
     /// message loss is acceptable.
-    pub(crate) async fn best_effort_consumer<T>(
-        setup: ConsumerSetup<'_, C>,
+    pub(crate) async fn best_effort_consumer<T, B>(
+        setup: ConsumerSetup<'_, C, B>,
         telemetry: Telemetry,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
+        B: ConsumerReaderBackend<C>,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
-        let (stores, keyed_state, heartbeats, shared, observer) =
-            build_shared_state(&setup).await?;
+        let (stores, keyed_state, heartbeats, observer) = build_shared_state(&setup).await?;
 
         let services = StartupServices {
             version: keyed_state.version.clone(),
@@ -57,7 +58,7 @@ where
                 publication_store,
                 ..
             } => {
-                let (loader, cells, identities) = memory_arm_inputs(setup.deps.as_ref(), shared)?;
+                let (loader, cells, identities) = memory_arm_inputs(setup.deps.as_ref());
                 let publisher_template = keyed_state
                     .memory_publication_setup(publication_store)
                     .await?;

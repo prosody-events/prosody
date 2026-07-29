@@ -15,8 +15,11 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
 use crate::state::tests::support::FixedOracle;
 use crate::state::{StateName, StateType};
-use crate::state_reader::PartitionCount;
 use crate::state_reader::deps::SharedDeps;
+use crate::state_reader::{
+    MemoryReaderBackend as CoreMemoryReaderBackend, PartitionCount,
+    ReaderBackend as CoreReaderBackend,
+};
 use crate::subsystem::SubsystemName;
 use color_eyre::eyre::Result;
 use std::sync::Arc;
@@ -125,6 +128,8 @@ pub(in crate::state_reader::tests) trait ReaderBackend {
     /// The owner-seed cell store: [`MemoryCellStore`] for memory, the shared
     /// `CassandraStore<FixedOracle>` for Cassandra.
     type OwnerCell: CellStore;
+    /// Concrete standalone-reader component family.
+    type DepsBackend: CoreReaderBackend<JsonCodec>;
 
     /// The registry the sessions and the owner cell store share.
     fn registry(&self) -> Arc<CollectionDefRegistry>;
@@ -150,7 +155,7 @@ pub(in crate::state_reader::tests) trait ReaderBackend {
     /// A fresh reader bundle over this backend's stores. Each call gets a
     /// fresh cache, so a per-event reader observes current committed state
     /// instead of a stale one.
-    fn deps(&self) -> SharedDeps<JsonCodec>;
+    fn deps(&self) -> SharedDeps<JsonCodec, Self::DepsBackend>;
 }
 
 /// The memory [`ReaderBackend`]: a fresh [`MemoryHarness`] plus a registry
@@ -174,6 +179,7 @@ impl MemoryReaderBackend {
 }
 
 impl ReaderBackend for MemoryReaderBackend {
+    type DepsBackend = CoreMemoryReaderBackend<JsonCodec>;
     type OwnerCell = MemoryCellStore<FixedOracle>;
 
     fn registry(&self) -> Arc<CollectionDefRegistry> {

@@ -60,7 +60,6 @@ fn memory_state_provider(registry: CollectionDefRegistry) -> MemoryStateProvider
         registry,
         Arc::from("test-group"),
         CompactDuration::new(30),
-        None,
     )
 }
 

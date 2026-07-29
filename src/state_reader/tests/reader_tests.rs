@@ -285,12 +285,11 @@ async fn zero_bundle_default_is_rejected_at_reader_construction() -> Result<()> 
 
 /// The owner writes a `MessageRef`, the Kafka coordinates of the message it
 /// has in hand. The standalone reader reads the committed ref and resolves
-/// it to the full message body through `ReaderLoader::Memory`. This is the
-/// same read path as a plain Value; only the loader arm differs.
+/// it to the full message body through `MemoryLoader`. This is the same read
+/// path as a plain Value; only the loader operation differs.
 ///
-/// The owner and the reader use different loader types, `MemoryLoader` and
-/// `ReaderLoader`, but the same collection: they share one structural
-/// identity (codec `message-ref`, value kind, unit key).
+/// The owner and reader share the same loader and collection identity (codec
+/// `message-ref`, value kind, unit key).
 ///
 /// Falsify: never seed the loader body. The resolve then returns a loader
 /// error instead of the message, and the assertion goes red.
@@ -300,12 +299,11 @@ async fn kafka_ref_reader_resolves_through_loader() -> Result<()> {
     use crate::consumer::message_state;
     use crate::loader::MemoryLoader;
     use crate::state_reader::deps::SharedDeps;
-    use crate::state_reader::loader::ReaderLoader;
     use std::sync::Arc;
 
     let harness = MemoryHarness::new();
     let owner_descriptor = message_state::<MemoryLoader<Value>>("mref");
-    let reader_descriptor = message_state::<ReaderLoader<JsonCodec>>("mref");
+    let reader_descriptor = message_state::<MemoryLoader<Value>>("mref");
     let name = state_name("mref")?;
     let sub = subsystem()?;
     let tp = topic("orders");

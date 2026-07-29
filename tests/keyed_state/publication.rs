@@ -8,10 +8,11 @@ use crate::common;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::CassandraStore;
 use prosody::consumer::{ConsumerConfiguration, message_state};
+use prosody::loader::KafkaLoader;
 use prosody::state::cassandra::{CassandraPublicationStore, PublicationQueries};
 use prosody::state::publication::PublicationStore;
 use prosody::state::{StateName, StateType};
-use prosody::state_reader::{ReaderLoader, SharedDeps, StateReader};
+use prosody::state_reader::{CassandraReaderBackend, SharedDeps, StateReader};
 use prosody::subsystem::SubsystemName;
 use prosody::{JsonCodec, Topic};
 use serde_json::json;
@@ -83,9 +84,12 @@ pub(crate) async fn read_cart_via_standalone_reader(
     // the Kafka loader. The plain `Value` read below never consults the loader;
     // the receipt read does.
     let budget = NonZeroU64::new(READER_CACHE_BYTES).ok_or_else(|| eyre!("nonzero budget"))?;
-    let deps =
-        SharedDeps::<JsonCodec>::connect(consumer_config, &common::test_cassandra_config(), budget)
-            .await?;
+    let deps = SharedDeps::<JsonCodec, CassandraReaderBackend<JsonCodec>>::connect(
+        consumer_config,
+        &common::test_cassandra_config(),
+        budget,
+    )
+    .await?;
 
     let value = StateReader::new(&deps, subsystem.clone(), cart())?
         .get(key)
@@ -96,14 +100,14 @@ pub(crate) async fn read_cart_via_standalone_reader(
     );
 
     // The receipt is a Kafka-message cell, so this read goes through
-    // `ReaderLoader::Kafka`, which re-fetches the committed message ref's body
+    // `KafkaLoader`, which re-fetches the committed message ref's body
     // from Kafka. The reader binds the same message identity under its own
     // loader because the resolver id does not depend on the loader, so the
     // source discovered above serves the second message the consumer recorded.
     let receipt = StateReader::new(
         &deps,
         subsystem.clone(),
-        message_state::<ReaderLoader<JsonCodec>>(RECEIPT),
+        message_state::<KafkaLoader<JsonCodec>>(RECEIPT),
     )?
     .get(key)
     .await?

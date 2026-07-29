@@ -242,9 +242,9 @@ async fn assert_map<B: ReaderBackend>(
 /// a `BTreeMap`, and after every event assert the reader matches the model.
 ///
 /// FALSIFICATION: perturb the reader's committed point read
-/// (`ReaderStores::read_committed`/`read_committed_many`) to drop or misorder
-/// an entry → the keyset-backed `stream`/`get_many` diverges from the model on
-/// the first non-empty event. This property never reaches the wide
+/// (`CommittedCellSource::read_committed`/`read_committed_many`) to drop or
+/// misorder an entry → the keyset-backed `stream`/`get_many` diverges from the
+/// model on the first non-empty event. This property never reaches the wide
 /// committed-scan arm that keyset overflow falls back to, since `KEY_POOL`
 /// stays under the keyset limit. That fallback is covered separately: by
 /// [`scan_reads_only_pinned_source`](super::probe_tests) for memory, and by

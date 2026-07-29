@@ -6,10 +6,7 @@
 //! custom error type for handling configuration-related errors.
 
 use crate::Topic;
-use crate::cassandra::{
-    CassandraConfiguration,
-    config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError},
-};
+use crate::cassandra::{CassandraConfiguration, config::CassandraConfigurationBuilderError};
 use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
 use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilderError;
 use crate::consumer::middleware::defer::DeferConfigurationBuilder;
@@ -104,12 +101,10 @@ pub(crate) struct ModeConfigurationBuildParams<'a> {
     pub mode: Mode,
     /// Bundled consumer and middleware configuration builders.
     pub consumer_builders: &'a ConsumerBuilders,
-    /// Builder for the Cassandra configuration.
-    pub cassandra_builder: &'a CassandraConfigurationBuilder,
 }
 
 /// Configuration for timer storage backends.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum TriggerStoreConfiguration {
     /// In-memory storage for testing and mock mode.
     InMemory,
@@ -132,8 +127,6 @@ pub enum ModeConfiguration {
         defer: DeferConfiguration,
         /// Common configuration (scheduler, timeout, dedup, keyed state).
         common: CommonConfiguration,
-        /// The trigger store configuration.
-        trigger_store: TriggerStoreConfiguration,
     },
     /// Configuration for Low-Latency mode.
     LowLatency {
@@ -145,8 +138,6 @@ pub enum ModeConfiguration {
         failure_topic: FailureTopicConfiguration,
         /// Common configuration (scheduler, timeout, dedup, keyed state).
         common: CommonConfiguration,
-        /// The trigger store configuration.
-        trigger_store: TriggerStoreConfiguration,
     },
     /// Configuration for Best-Effort mode.
     BestEffort {
@@ -154,8 +145,6 @@ pub enum ModeConfiguration {
         consumer: ConsumerConfiguration,
         /// Common configuration (scheduler, timeout, dedup, keyed state).
         common: CommonConfiguration,
-        /// The trigger store configuration.
-        trigger_store: TriggerStoreConfiguration,
     },
 }
 
@@ -183,14 +172,6 @@ impl ModeConfiguration {
             keyed_state: builders.keyed_state.clone(),
         };
 
-        // Create trigger store configuration based on mock mode
-        let trigger_store = if consumer.mock {
-            TriggerStoreConfiguration::InMemory
-        } else {
-            let cassandra_config = params.cassandra_builder.build()?;
-            TriggerStoreConfiguration::Cassandra(cassandra_config)
-        };
-
         Ok(match params.mode {
             Mode::Pipeline => {
                 let monopolization = builders.monopolization.build()?;
@@ -201,7 +182,6 @@ impl ModeConfiguration {
                     monopolization,
                     defer,
                     common,
-                    trigger_store,
                 }
             }
             Mode::LowLatency => {
@@ -211,14 +191,9 @@ impl ModeConfiguration {
                     retry,
                     failure_topic,
                     common,
-                    trigger_store,
                 }
             }
-            Mode::BestEffort => Self::BestEffort {
-                consumer,
-                common,
-                trigger_store,
-            },
+            Mode::BestEffort => Self::BestEffort { consumer, common },
         })
     }
 
@@ -319,7 +294,7 @@ pub enum ModeConfigurationError {
     #[error("invalid timeout configuration: {0:#}")]
     TimeoutConfigurationBuilder(#[from] TimeoutConfigurationBuilderError),
 
-    /// Error when the Cassandra configuration is invalid.
+    /// Cassandra backend configuration is invalid.
     #[error("invalid cassandra configuration: {0:#}")]
     Cassandra(#[from] CassandraConfigurationBuilderError),
 }

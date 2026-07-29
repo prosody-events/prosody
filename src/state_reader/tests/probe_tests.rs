@@ -20,6 +20,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::Direction;
 use crate::state::descriptor::{DequeDescriptor, deque_state, map_state};
 use crate::state::order_codec::I64KeyCodec;
+use crate::state_reader::backend::ScriptedReaderBackend;
 use crate::state_reader::{StateReader, StateReaderError};
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::StreamExt;
@@ -198,7 +199,7 @@ async fn run_probe_and_pin(script: FaultScript) -> Result<bool> {
 }
 
 /// The concrete deque reader the probe property drives.
-type DequeReader = StateReader<DequeDescriptor<JsonCodec>, JsonCodec>;
+type DequeReader = StateReader<DequeDescriptor<JsonCodec>, JsonCodec, ScriptedReaderBackend>;
 
 /// Asserts the reader's point reads and scan match the point-fan-out
 /// selection the script resolves to. Point reads are `len` and `get`; the

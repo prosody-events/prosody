@@ -6,6 +6,7 @@
 //! created when using Cassandra backend.
 
 use crate::cassandra::CassandraStore;
+use crate::cassandra::config::CassandraConfiguration;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::middleware::deduplication::cassandra::CassandraDeduplicationStoreProvider;
 use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStoreProvider;
@@ -25,7 +26,7 @@ use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
     CellQueries, IdentityQueries, PublicationQueries,
 };
-use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
+use crate::state::memory::MemoryPublicationStore;
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use std::num::NonZeroUsize;
@@ -80,45 +81,11 @@ pub(crate) enum StorePair {
     },
 }
 
-/// Storage already built elsewhere, handed to [`StorePair::new`] to reuse
-/// instead of building a second copy. A consumer that receives a
-/// [`SharedDeps`](crate::state_reader::SharedDeps) bundle passes the bundle's
-/// Cassandra session or in-memory stores here. The backend must match the one
-/// [`StorePair`] selects for the same configuration. Both derive from a single
-/// configuration, so a mismatch cannot occur.
-pub(crate) enum SharedStorage {
-    /// In-memory stores from a mock-mode bundle. `publications` is the store
-    /// [`StorePair`] itself owns. `cells` and `identities` are the consumer's
-    /// keyed-state backend, carried here so one set of instances backs both the
-    /// reader and the consumer's state provider. That sharing is what makes
-    /// mock read-your-writes work.
-    Memory {
-        /// Committed cell store shared with the reader.
-        cells: MemoryCells,
-        /// Descriptor-identity store shared with the reader.
-        identities: MemoryDescriptorIdentityStore,
-        /// Routing-only publication store shared with the reader.
-        publications: MemoryPublicationStore,
-    },
-    /// The pre-built Cassandra session and the bundle's already-prepared
-    /// keyed-state store handles. [`StorePair::new`] reuses `cells`,
-    /// `identities`, and `publications` verbatim, since they already carry the
-    /// reader's prepared cell, identity, and publication statements. It
-    /// prepares only the remaining trigger, defer, and dedup statements against
-    /// `store`. One scylla session and one set of keyed-state prepared
-    /// statements then serve both the consumer and the reader bundle.
-    Cassandra {
-        /// The shared scylla session handle. Its keyspace comes from the
-        /// caller's `TriggerStoreConfiguration`, built from the same
-        /// `CassandraConfiguration` as the bundle's session.
-        store: CassandraStore,
-        /// Keyed-state cell-store resources prepared by the bundle.
-        cells: CassandraCellResources,
-        /// Descriptor-identity store prepared by the bundle.
-        identities: CassandraDescriptorIdentityStore,
-        /// Routing-only publication store prepared by the bundle.
-        publications: CassandraPublicationStore,
-    },
+#[derive(Clone, Copy)]
+pub(crate) struct StorePairInputs {
+    pub(crate) dedup_ttl: Duration,
+    pub(crate) dedup_cache_capacity: NonZeroUsize,
+    pub(crate) timer_spans: SpanRelation,
 }
 
 impl StorePair {
@@ -133,117 +100,115 @@ impl StorePair {
     /// # Errors
     ///
     /// Returns error if store initialization fails.
-    ///
-    /// When `shared` is `Some`, the pair reuses that already-constructed
-    /// storage (the mock publication store, or the pre-built Cassandra
-    /// session) instead of building a fresh one. When `None`, it builds
-    /// everything internally. [`SharedStorage`] documents why `shared`'s
-    /// backend always matches the one selected here; the `_` fallbacks
-    /// below build fresh only on the mismatch path that guarantee rules
-    /// out.
     pub(crate) async fn new(
         config: &TriggerStoreConfiguration,
         mock: bool,
         dedup_ttl: Duration,
         dedup_cache_capacity: NonZeroUsize,
         timer_spans: SpanRelation,
-        shared: Option<&SharedStorage>,
     ) -> Result<Self, StoreCreationError> {
-        // Pure config validation first: fail fast before any Cassandra IO
-        // (memory mode validates too, deliberately).
-        let dedup_ttl_secs = dedup_ttl_seconds(dedup_ttl)?;
-
-        let cass_config = match (mock, config) {
+        dedup_ttl_seconds(dedup_ttl)?;
+        match (mock, config) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
-                // Reuse the bundle's publication store so the reader and the
-                // consumer route through one instance; else build a fresh one.
-                let publication_store = match shared {
-                    Some(SharedStorage::Memory { publications, .. }) => publications.clone(),
-                    _ => MemoryPublicationStore::new(),
-                };
-                return Ok(Self::Memory {
-                    trigger_provider: InMemoryTriggerStoreProvider::new(),
-                    message_provider: MemoryMessageDeferStoreProvider::new(),
-                    timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_spans),
-                    dedup_provider: MemoryDeduplicationStoreProvider::new(),
-                    publication_store,
-                });
+                Ok(Self::memory(timer_spans, MemoryPublicationStore::new()))
             }
-            (false, TriggerStoreConfiguration::Cassandra(cass_config)) => cass_config,
-        };
+            (false, TriggerStoreConfiguration::Cassandra(config)) => {
+                let store = CassandraStore::new(config).await?;
+                let keyspace = &config.keyspace;
+                let (cells, identities, publications) = try_join!(
+                    CellQueries::new(store.session(), keyspace),
+                    IdentityQueries::new(store.session(), keyspace),
+                    PublicationQueries::new(store.session(), keyspace),
+                )?;
+                Self::cassandra(
+                    store.clone(),
+                    keyspace,
+                    StorePairInputs {
+                        dedup_ttl,
+                        dedup_cache_capacity,
+                        timer_spans,
+                    },
+                    CassandraCellResources::new(store.clone(), Arc::new(cells)),
+                    CassandraDescriptorIdentityStore::new(store.clone(), Arc::new(identities)),
+                    CassandraPublicationStore::new(store, Arc::new(publications)),
+                )
+                .await
+            }
+        }
+    }
 
-        // One shared session for every Cassandra store below. When a bundle is
-        // supplied, reuse its already-connected session instead of connecting
-        // again.
-        let store = match shared {
-            Some(SharedStorage::Cassandra { store, .. }) => store.clone(),
-            _ => CassandraStore::new(cass_config).await?,
-        };
-        let keyspace = &cass_config.keyspace;
+    pub(crate) fn memory_with(
+        dedup_ttl: Duration,
+        timer_spans: SpanRelation,
+        publications: MemoryPublicationStore,
+    ) -> Result<Self, StoreCreationError> {
+        dedup_ttl_seconds(dedup_ttl)?;
+        Ok(Self::memory(timer_spans, publications))
+    }
 
-        // Create trigger store provider (prepares queries once, creates
-        // per-partition stores with independent caches on demand)
+    pub(crate) async fn cassandra_with(
+        config: &CassandraConfiguration,
+        inputs: StorePairInputs,
+        store: CassandraStore,
+        cells: CassandraCellResources,
+        identities: CassandraDescriptorIdentityStore,
+        publications: CassandraPublicationStore,
+    ) -> Result<Self, StoreCreationError> {
+        Self::cassandra(
+            store,
+            &config.keyspace,
+            inputs,
+            cells,
+            identities,
+            publications,
+        )
+        .await
+    }
+
+    fn memory(timer_spans: SpanRelation, publication_store: MemoryPublicationStore) -> Self {
+        Self::Memory {
+            trigger_provider: InMemoryTriggerStoreProvider::new(),
+            message_provider: MemoryMessageDeferStoreProvider::new(),
+            timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_spans),
+            dedup_provider: MemoryDeduplicationStoreProvider::new(),
+            publication_store,
+        }
+    }
+
+    async fn cassandra(
+        store: CassandraStore,
+        keyspace: &str,
+        inputs: StorePairInputs,
+        cell_store: CassandraCellResources,
+        identity_store: CassandraDescriptorIdentityStore,
+        publication_store: CassandraPublicationStore,
+    ) -> Result<Self, StoreCreationError> {
         let trigger_provider =
             CassandraTriggerStoreProvider::with_store(store.clone(), keyspace).await?;
-
-        // Create segment store for defer stores (shared across message and timer)
         let segment_store = CassandraSegmentStore::new(store.clone(), keyspace).await?;
-
-        // Prepare queries for message defer stores
         let message_queries = Arc::new(MessageQueries::new(store.session(), keyspace).await?);
-
-        // Prepare queries for timer defer stores
         let timer_queries = Arc::new(TimerQueries::new(store.session(), keyspace).await?);
-
         let message_provider = CassandraMessageDeferStoreProvider::new(
             store.clone(),
             message_queries,
             segment_store.clone(),
         );
-
         let timer_provider = CassandraTimerDeferStoreProvider::new(
             store.clone(),
             timer_queries,
             segment_store,
-            timer_spans,
+            inputs.timer_spans,
         );
 
+        let dedup_ttl_secs = dedup_ttl_seconds(inputs.dedup_ttl)?;
         debug!(ttl_secs = dedup_ttl_secs, "deduplication store TTL");
         let dedup_queries = Arc::new(DeduplicationQueries::new(store.session(), keyspace).await?);
         let dedup_provider = CassandraDeduplicationStoreProvider::new(
             store.clone(),
             dedup_queries,
             dedup_ttl_secs,
-            dedup_cache_capacity,
+            inputs.dedup_cache_capacity,
         );
-
-        // Reuse the bundle's already-prepared keyed-state stores when supplied;
-        // otherwise prepare the three independent query sets concurrently.
-        let (cell_store, identity_store, publication_store) =
-            if let Some(SharedStorage::Cassandra {
-                cells,
-                identities,
-                publications,
-                ..
-            }) = shared
-            {
-                (cells.clone(), identities.clone(), publications.clone())
-            } else {
-                let (cell_queries, identity_queries, publication_queries) = try_join!(
-                    CellQueries::new(store.session(), keyspace),
-                    IdentityQueries::new(store.session(), keyspace),
-                    PublicationQueries::new(store.session(), keyspace),
-                )?;
-                (
-                    CassandraCellResources::new(store.clone(), Arc::new(cell_queries)),
-                    CassandraDescriptorIdentityStore::new(
-                        store.clone(),
-                        Arc::new(identity_queries),
-                    ),
-                    CassandraPublicationStore::new(store.clone(), Arc::new(publication_queries)),
-                )
-            };
-
         Ok(Self::Cassandra {
             trigger_provider,
             message_provider,
@@ -274,6 +239,9 @@ fn dedup_ttl_seconds(ttl: Duration) -> Result<i32, StoreCreationError> {
 /// Errors that can occur during store pair creation.
 #[derive(Debug, Error)]
 pub enum StoreCreationError {
+    /// The supplied reader family disagrees with the storage configuration.
+    #[error("reader backend does not match the consumer storage configuration")]
+    BackendMismatch,
     /// Failed to create trigger store.
     #[error("failed to create trigger store: {0:#}")]
     TriggerStore(Box<CassandraTriggerStoreError>),

@@ -23,13 +23,7 @@ async fn private_write_stays_unpublished_after_reconcile() -> Result<()> {
 
     // The collection is now registered Private; reconciliation removes the row.
     let registry = registry(StateVisibility::Private)?;
-    reconcile_publications(
-        &PublicationBackend::Scripted(store.clone()),
-        &registry,
-        &subsystem,
-        GROUP,
-    )
-    .await?;
+    reconcile_publications(&store, &registry, &subsystem, GROUP).await?;
     assert!(
         store
             .rows(&subsystem, StateType::Application, &name)
@@ -73,7 +67,7 @@ async fn reconcile_removes_own_group_slice_keeps_others() -> Result<()> {
     }
 
     reconcile_publications(
-        &PublicationBackend::Scripted(store.clone()),
+        &store,
         &registry(StateVisibility::Private)?,
         &subsystem,
         GROUP,
@@ -105,7 +99,7 @@ async fn reconcile_removes_blind_without_reading() -> Result<()> {
     let store = ScriptedPublicationStore::new();
     let subsystem = subsystem()?;
     reconcile_publications(
-        &PublicationBackend::Scripted(store.clone()),
+        &store,
         &registry(StateVisibility::Private)?,
         &subsystem,
         GROUP,
@@ -142,7 +136,7 @@ async fn reconcile_keeps_published_collection_row() -> Result<()> {
         .await;
 
     reconcile_publications(
-        &PublicationBackend::Scripted(store.clone()),
+        &store,
         &registry(StateVisibility::Published)?,
         &subsystem,
         GROUP,
@@ -176,7 +170,7 @@ async fn reconcile_propagates_transient_remove_failure() -> Result<()> {
     store.fail_removes_with(ErrorCategory::Transient);
 
     let result = reconcile_publications(
-        &PublicationBackend::Scripted(store.clone()),
+        &store,
         &registry(StateVisibility::Private)?,
         &subsystem,
         GROUP,

@@ -19,10 +19,10 @@ use crate::consumer::middleware::telemetry::TelemetryMiddleware;
 use crate::consumer::middleware::timeout::TimeoutMiddleware;
 use crate::consumer::middleware::{ComposedMiddleware, HandlerMiddleware};
 use crate::consumer::observer::KafkaObserver;
-use crate::consumer::storage::{SharedStorage, StorePair};
+use crate::consumer::storage::{StorePair, StorePairInputs};
 use crate::consumer::wiring::state::KeyedStateInputs;
 use crate::heartbeat::HeartbeatRegistry;
-use crate::state_reader::SharedDeps;
+use crate::state_reader::ConsumerReaderBackend;
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity};
 use std::sync::Arc;
@@ -55,7 +55,6 @@ pub(in crate::consumer) type SharedState = (
     StorePair,
     KeyedStateInputs,
     HeartbeatRegistry,
-    Option<SharedStorage>,
     KafkaObserver,
 );
 
@@ -71,9 +70,14 @@ pub(in crate::consumer) type SharedState = (
 /// canonical `consumer_config.validate()` in
 /// [`initialize_consumer`](runtime::initialize_consumer) remains the single
 /// invariant chokepoint; this early validation is the fail-fast guard.
-pub(in crate::consumer) async fn build_shared_state<C: Codec>(
-    setup: &ConsumerSetup<'_, C>,
-) -> Result<SharedState, ConsumerError> {
+pub(in crate::consumer) async fn build_shared_state<C, B>(
+    setup: &ConsumerSetup<'_, C, B>,
+) -> Result<SharedState, ConsumerError>
+where
+    C: Codec,
+    C::Payload: Clone,
+    B: ConsumerReaderBackend<C>,
+{
     let ConsumerSetup {
         consumer: consumer_config,
         trigger_store: trigger_store_config,
@@ -101,7 +105,6 @@ pub(in crate::consumer) async fn build_shared_state<C: Codec>(
     // Reuse the bundle's already-constructed storage when one is supplied, so
     // no second session/publication store is built on the Configured→Running
     // transition.
-    let shared = deps.map(SharedDeps::shared_storage);
     // Take the bundle's heartbeat registry when supplied, so the consumer's
     // stall probe covers the shared loader's poll-loop heartbeat. Build a fresh
     // one only on the no-bundle path.
@@ -113,19 +116,28 @@ pub(in crate::consumer) async fn build_shared_state<C: Codec>(
         ),
     };
     // Create both stores atomically — ensures trigger and defer stores match.
-    let stores = StorePair::new(
-        trigger_store_config,
-        consumer_config.mock,
-        dedup_config.ttl,
-        dedup_config.cache_capacity,
-        consumer_config.timer_spans,
-        shared.as_ref(),
-    )
-    .await?;
+    let inputs = StorePairInputs {
+        dedup_ttl: dedup_config.ttl,
+        dedup_cache_capacity: dedup_config.cache_capacity,
+        timer_spans: consumer_config.timer_spans,
+    };
+    let stores = match deps {
+        Some(deps) => deps.build_store_pair(trigger_store_config, inputs).await?,
+        None => {
+            StorePair::new(
+                trigger_store_config,
+                consumer_config.mock,
+                inputs.dedup_ttl,
+                inputs.dedup_cache_capacity,
+                inputs.timer_spans,
+            )
+            .await?
+        }
+    };
     let keyed_state =
         KeyedStateInputs::new(keyed_state_config, consumer_config, &dedup_config.version)?;
     let observer = KafkaObserver::new(&consumer_config.group_id);
-    Ok((stores, keyed_state, heartbeats, shared, observer))
+    Ok((stores, keyed_state, heartbeats, observer))
 }
 
 /// Builds the common middleware shared by every mode — the single place any

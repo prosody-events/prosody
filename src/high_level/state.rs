@@ -6,6 +6,7 @@
 
 use crate::Codec;
 use crate::consumer::ProsodyConsumer;
+use crate::high_level::ClientBackend;
 use crate::high_level::config::{
     ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
 };
@@ -21,10 +22,12 @@ use tracing::info;
 ///
 /// This type provides a view into the current state of the consumer,
 /// allowing read-only access to the underlying `ConsumerState`.
-pub struct ConsumerStateView<'a, T, C: Codec>(pub(crate) MutexGuard<'a, ConsumerState<T, C>>);
+pub struct ConsumerStateView<'a, T, C: Codec, B: ClientBackend<C>>(
+    pub(crate) MutexGuard<'a, ConsumerState<T, C, B>>,
+);
 
-impl<T, C: Codec> Deref for ConsumerStateView<'_, T, C> {
-    type Target = ConsumerState<T, C>;
+impl<T, C: Codec, B: ClientBackend<C>> Deref for ConsumerStateView<'_, T, C, B> {
+    type Target = ConsumerState<T, C, B>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -43,7 +46,7 @@ impl<T, C: Codec> Deref for ConsumerStateView<'_, T, C> {
 /// carry a bundle.
 #[derive(Educe, Default)]
 #[educe(Debug)]
-pub enum ConsumerState<T, C: Codec> {
+pub enum ConsumerState<T, C: Codec, B: ClientBackend<C>> {
     /// The consumer is not yet configured.
     #[default]
     Unconfigured,
@@ -56,7 +59,7 @@ pub enum ConsumerState<T, C: Codec> {
         /// The shared bundle, or `None` until first built. Built lazily and
         /// reused when the consumer moves to `Running`.
         #[educe(Debug(ignore))]
-        deps: Option<SharedDeps<C>>,
+        deps: Option<SharedDeps<C, B::Reader>>,
     },
     /// The consumer is actively running.
     Running {
@@ -69,11 +72,11 @@ pub enum ConsumerState<T, C: Codec> {
         /// The shared bundle handed to the running consumer and reused by any
         /// reader built while running.
         #[educe(Debug(ignore))]
-        deps: SharedDeps<C>,
+        deps: SharedDeps<C, B::Reader>,
     },
 }
 
-impl<T, C: Codec> ConsumerState<T, C> {
+impl<T, C: Codec, B: ClientBackend<C>> ConsumerState<T, C, B> {
     /// Builds a new `ConsumerState` from the given configuration, returning
     /// [`ConsumerState::Configured`] on success or
     /// [`ConsumerState::ConfigurationFailed`] with the error otherwise.
@@ -91,7 +94,7 @@ impl<T, C: Codec> ConsumerState<T, C> {
     }
 }
 
-impl<T, C: Codec> Display for ConsumerState<T, C> {
+impl<T, C: Codec, B: ClientBackend<C>> Display for ConsumerState<T, C, B> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let state = match self {
             ConsumerState::Unconfigured => "unconfigured",

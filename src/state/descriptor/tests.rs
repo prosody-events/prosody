@@ -11,6 +11,7 @@ use crate::codec::{I64Codec, JsonCodecError};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::kafka_state::{MessageCell, message_state};
 use crate::consumer::middleware::tests::test_support::MockEventContext;
+use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::cell_key::{CellKey, Direction, ScanEdge};
@@ -21,6 +22,7 @@ use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentit
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state::{
     CommitMode, EventRef, PartitionBackend, RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateKey,
     StateName, StateType,
@@ -53,10 +55,7 @@ fn finish_trace(result: Result<bool>, message: &str, input: &str) -> TestResult 
     }
 }
 
-pub(crate) type TestSession = KeyedStateSession<
-    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>,
-    MemoryLoader<Value>,
->;
+pub(crate) type TestSession = KeyedStateSession<TestBackend, MemoryLoader<Value>>;
 
 /// Builds a session with `descriptor` registered and binds it via
 /// `StateDescriptor::bind` — the single shared machinery every descriptor
@@ -122,7 +121,7 @@ pub(crate) fn test_session_with_publisher(
     loader: MemoryLoader<Value>,
     registry: CollectionDefRegistry,
     state_key: StateKey,
-    publisher: FirstWritePublisher,
+    publisher: FirstWritePublisher<ScriptedPublicationStore, KafkaObserver>,
 ) -> (TestSession, MemoryCellStore<FixedOracle>) {
     let (mut parts, cell_store) = session_parts(loader, registry, state_key, Arc::default(), false);
     parts.publisher = Some(publisher);
@@ -131,8 +130,12 @@ pub(crate) fn test_session_with_publisher(
 
 /// The partition backend every test-session fixture in this module shares: the
 /// memory cell store resolving through a get-out-of-the-way [`FixedOracle`].
-pub(crate) type TestBackend =
-    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>;
+pub(crate) type TestBackend = PartitionBackend<
+    FixedOracle,
+    MemoryDescriptorIdentityStore,
+    MemoryCellStore<FixedOracle>,
+    FirstWritePublisher<ScriptedPublicationStore, KafkaObserver>,
+>;
 
 /// Builds a test session over an arbitrary loader payload — the generic twin of
 /// [`test_session`] (which pins the loader to `MemoryLoader<Value>`). The
@@ -787,10 +790,7 @@ mod typed_cell_view {
 
     /// The session type the gated-scan fixture binds over: the standard memory
     /// backend with the [`GateLoader`] capability slot.
-    type GateSession = KeyedStateSession<
-        PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>,
-        GateLoader,
-    >;
+    type GateSession = KeyedStateSession<TestBackend, GateLoader>;
 
     /// Custom resolver context borrowing the gate ladder from the session — the
     /// [`FromSession`] extension a resolver author writes for their own

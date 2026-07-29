@@ -12,7 +12,9 @@ use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::config::CassandraConfigurationBuilder;
 use prosody::consumer::event_context::EventContext;
 use prosody::high_level::mode::Mode;
-use prosody::high_level::{ConsumerBuilders, HighLevelClient};
+use prosody::high_level::{
+    CassandraClientBackend, CassandraHighLevelClient, ConsumerBuilders, HighLevelClient,
+};
 use prosody::producer::ProducerConfigurationBuilder;
 use prosody::telemetry::TelemetryEmitterConfiguration;
 use prosody::tracing::init_test_logging;
@@ -453,7 +455,7 @@ where
 fn build_inline_replacement_client(
     source_topic: &str,
     telemetry_topic: &str,
-) -> Result<HighLevelClient<InlineReplacementHandler>> {
+) -> Result<CassandraHighLevelClient<InlineReplacementHandler>> {
     let mut producer_builder = ProducerConfigurationBuilder::default();
     producer_builder
         .bootstrap_servers(vec!["localhost:9094".to_owned()])
@@ -479,10 +481,10 @@ fn build_inline_replacement_client(
     cassandra_builder.nodes(vec!["localhost:9042".to_owned()]);
 
     let client = HighLevelClient::new(
+        CassandraClientBackend::new(cassandra_builder.build()?),
         Mode::Pipeline,
         &mut producer_builder,
         &consumer_builders,
-        &cassandra_builder,
     )?;
     Ok(client)
 }
@@ -787,7 +789,7 @@ async fn inline_replacement_fires_once_at_replacement_time() -> Result<()> {
         let (telemetry_topic, _) = common::kafka::create_topic_with_partitions(1).await?;
         let source_topic = source.to_string();
 
-        let client: HighLevelClient<InlineReplacementHandler> =
+        let client: CassandraHighLevelClient<InlineReplacementHandler> =
             build_inline_replacement_client(&source_topic, telemetry_topic.as_ref())?;
 
         let (messages, mut msg_rx) = channel(16);

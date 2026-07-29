@@ -1,15 +1,15 @@
 use super::*;
+use crate::JsonCodec;
 use crate::Key;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
-use crate::consumer::storage::SharedStorage;
 use crate::consumer::{ConsumerConfiguration, DemandType};
-use crate::high_level::CassandraConfigurationBuilder;
 use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;
 use crate::state::descriptor::value_state;
 use crate::state::registry::CollectionDef;
+use crate::state_reader::ReaderBackend;
 use crate::state_reader::tests::support::{
     mock_count, owner_commit, publish_source, registry_of, source_state_key, state_name, topic,
 };
@@ -17,16 +17,14 @@ use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::Trigger;
 use color_eyre::Result;
-use color_eyre::eyre::{bail, ensure, eyre};
+use color_eyre::eyre::{ensure, eyre};
 use rdkafka::mocking::MockCluster;
 use rdkafka::producer::DefaultProducerContext;
 use serde_json::{Value, json};
 use std::convert::Infallible;
 
-/// Owns the helper-produced mock cluster alongside the `HighLevelClient` so
-/// the cluster's Drop runs at end of test (no `mem::forget` leaks).
 struct ClientFixture<T> {
-    client: HighLevelClient<T>,
+    client: HighLevelClient<T, JsonCodec, MemoryClientBackend<JsonCodec>>,
     _cluster: MockCluster<'static, DefaultProducerContext>,
 }
 
@@ -57,13 +55,11 @@ fn create_test_client<T>(group_id: &str, source_system: Option<&str>) -> Result<
         consumer: consumer_builder,
         ..ConsumerBuilders::new()?
     };
-    let cassandra_builder = CassandraConfigurationBuilder::default();
-
     let client = HighLevelClient::new(
+        MemoryClientBackend::new(),
         Mode::Pipeline,
         &mut producer_builder,
         &consumer_builders,
-        &cassandra_builder,
     )?;
     Ok(ClientFixture {
         client,
@@ -321,14 +317,10 @@ fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
                 .retained_deps()
                 .await
                 .ok_or_else(|| eyre!("client retained no shared bundle after subscribe"))?;
-            let SharedStorage::Memory {
-                cells,
-                publications,
-                identities,
-            } = deps.shared_storage()
-            else {
-                bail!("mock client must build a memory bundle");
-            };
+            let backend = deps.backend();
+            let cells = backend.cells();
+            let publications = backend.publications();
+            let identities = backend.identities();
 
             // Seed a committed `cart` value plus its published routing row and
             // frozen identity into the shared stores — as the owning consumer
@@ -342,7 +334,7 @@ fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
             let registry = registry_of(&descriptor, CollectionDef::new(None))?;
             let state_key = source_state_key(orders, GROUP, &key, count)?;
             publish_source(
-                (&publications, &identities),
+                (publications, identities),
                 &sub,
                 &name,
                 GROUP,
@@ -352,7 +344,7 @@ fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
             )
             .await;
             owner_commit(
-                &cells,
+                cells,
                 &registry,
                 &state_key,
                 descriptor,

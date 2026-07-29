@@ -34,7 +34,6 @@ use crate::state::descriptor_identity::{
     DescriptorIdentityError, DescriptorIdentityStore, acquire_descriptor_identities,
 };
 use crate::state::dirty::DirtyStore;
-use crate::state::first_write::{FirstWritePublisher, PublisherTemplate};
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{ResolveCellError, sweep_provisional};
@@ -300,7 +299,7 @@ where
     /// The first-write publisher bound to this partition's topic, or `None`
     /// when nothing is published. Cloned into every session this manager
     /// creates.
-    publisher: Option<FirstWritePublisher>,
+    publisher: Option<B::Publisher>,
 }
 
 /// The real per-partition state manager: owns the partition-lifetime cell
@@ -488,12 +487,6 @@ pub struct StateManagerProvider<F, L> {
     registry: Arc<CollectionDefRegistry>,
     consumer_group: Arc<str>,
     recovery_delay: CompactDuration,
-    /// The provider-wide first-write publication template, or `None` when no
-    /// collection is published or no subsystem is configured. `acquire` binds
-    /// it to the partition's topic. The shared memo dedups publication
-    /// across every session this provider creates (see
-    /// [`PublisherTemplate`]).
-    publisher_template: Option<PublisherTemplate>,
     /// Process-level latch for descriptor-identity validation. The identity
     /// table is group-global, so validating the registry against it is a
     /// once-per-process concern, not per-partition. Shared across provider
@@ -526,7 +519,6 @@ impl<F, L> StateManagerProvider<F, L> {
         registry: Arc<CollectionDefRegistry>,
         consumer_group: Arc<str>,
         recovery_delay: CompactDuration,
-        publisher_template: Option<PublisherTemplate>,
     ) -> Self {
         Self {
             backend,
@@ -534,7 +526,6 @@ impl<F, L> StateManagerProvider<F, L> {
             registry,
             consumer_group,
             recovery_delay,
-            publisher_template,
             validated: Arc::new(OnceCell::new()),
         }
     }
@@ -585,7 +576,7 @@ where
                 segment_id,
                 recovery_delay: self.recovery_delay,
                 armed: Arc::default(),
-                publisher: self.publisher_template.as_ref().map(|t| t.bind(topic)),
+                publisher: backend.publisher(),
             }),
         })
     }

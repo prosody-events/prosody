@@ -13,7 +13,7 @@ use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::KafkaLoaderConfiguration;
 use crate::otel::SpanRelation;
 use crate::state::config::KeyedStateConfiguration;
-use crate::state_reader::SharedDeps;
+use crate::state_reader::{MemoryReaderBackend, SharedDeps};
 use crate::timers::duration::CompactDuration;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
@@ -332,7 +332,7 @@ pub struct LowLatencyMiddlewareConfiguration {
 /// These four are one parameter because they are consumed as a unit. Every
 /// constructor hands the whole thing to `build_shared_state`, which validates
 /// the configuration and opens (or reuses) the storage behind it.
-pub struct ConsumerSetup<'a, C: Codec> {
+pub struct ConsumerSetup<'a, C: Codec, B = MemoryReaderBackend<C>> {
     /// Kafka consumer settings: group, topics, mock mode, stall threshold.
     pub consumer: &'a ConsumerConfiguration,
     /// Backend settings for the timer trigger store.
@@ -344,7 +344,7 @@ pub struct ConsumerSetup<'a, C: Codec> {
     /// The high-level client passes the bundle it already built, so one
     /// Cassandra session and one Kafka loader back the whole process. `None`
     /// makes the consumer compose its own.
-    pub deps: Option<SharedDeps<C>>,
+    pub deps: Option<SharedDeps<C, B>>,
 }
 
 impl ConsumerConfiguration {

@@ -8,7 +8,6 @@ use crate::consumer::middleware::deduplication::{
 };
 use crate::consumer::middleware::defer::DeferInitError;
 use crate::consumer::observer::KafkaObserver;
-use crate::consumer::storage::SharedStorage;
 use crate::error::ClassifyError;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::{KafkaLoader, MemoryLoader};
@@ -17,14 +16,15 @@ use crate::state::cassandra::{
 };
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::first_write::{
-    PartitionCounts, PublicationBackend, PublisherTemplate, reconcile_publications,
+    FixedPartitionCount, PartitionCountSource, PublisherTemplate, reconcile_publications,
 };
 use crate::state::fjall::FjallClient;
 use crate::state::manager::StateManagerProvider;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
+use crate::state::publication::PublicationStore;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state_reader::{PartitionCount, SharedDeps};
+use crate::state_reader::{ConsumerReaderBackend, PartitionCount, SharedDeps};
 use crate::timers::duration::CompactDuration;
 use crate::{Codec, ConsumerGroup, EventIdentity, EventType};
 use std::fs;
@@ -67,19 +67,13 @@ impl KeyedStateInputs {
     /// backend and loader. The partition loop acquires one state manager
     /// per assignment from it; the pending-index scanner travels inside
     /// the backend the factory mints.
-    fn provider<B, L>(
-        &self,
-        backend: B,
-        loader: L,
-        publisher_template: Option<PublisherTemplate>,
-    ) -> StateManagerProvider<B, L> {
+    fn provider<B, L>(&self, backend: B, loader: L) -> StateManagerProvider<B, L> {
         StateManagerProvider::new(
             backend,
             loader,
             self.registry.clone(),
             self.group.clone(),
             self.config.recovery_delay,
-            publisher_template,
         )
     }
 
@@ -91,12 +85,9 @@ impl KeyedStateInputs {
         &self,
         store: CassandraPublicationStore,
         observer: KafkaObserver,
-    ) -> Result<Option<PublisherTemplate>, ConsumerError> {
-        self.publication_setup(
-            PublicationBackend::Cassandra(store),
-            PartitionCounts::Observed(observer),
-        )
-        .await
+    ) -> Result<Option<PublisherTemplate<CassandraPublicationStore, KafkaObserver>>, ConsumerError>
+    {
+        self.publication_setup(store, observer).await
     }
 
     /// Publication setup for a memory arm — mock mode, or a consumer
@@ -111,12 +102,10 @@ impl KeyedStateInputs {
     pub(in crate::consumer) async fn memory_publication_setup(
         &self,
         store: MemoryPublicationStore,
-    ) -> Result<Option<PublisherTemplate>, ConsumerError> {
-        self.publication_setup(
-            PublicationBackend::Memory(store),
-            PartitionCounts::Fixed(PartitionCount::MOCK),
-        )
-        .await
+    ) -> Result<Option<PublisherTemplate<MemoryPublicationStore, FixedPartitionCount>>, ConsumerError>
+    {
+        self.publication_setup(store, FixedPartitionCount(PartitionCount::MOCK))
+            .await
     }
 
     /// Runs startup reconciliation and, when publishing is active, builds the
@@ -142,11 +131,15 @@ impl KeyedStateInputs {
     /// propagates so the caller's build fails and the deploy retries.
     /// Per-collection permanent decode failures are logged and skipped inside
     /// [`reconcile_publications`].
-    async fn publication_setup(
+    async fn publication_setup<S, N>(
         &self,
-        store: PublicationBackend,
-        counts: PartitionCounts,
-    ) -> Result<Option<PublisherTemplate>, ConsumerError> {
+        store: S,
+        counts: N,
+    ) -> Result<Option<PublisherTemplate<S, N>>, ConsumerError>
+    where
+        S: PublicationStore,
+        N: PartitionCountSource,
+    {
         let Some(subsystem) = self.config.subsystem.clone() else {
             return Ok(None);
         };
@@ -185,7 +178,7 @@ pub(in crate::consumer) fn memory_state_provider<C: Codec>(
     cells: MemoryCells,
     identities: MemoryDescriptorIdentityStore,
     loader: MemoryLoader<C::Payload>,
-    publisher_template: Option<PublisherTemplate>,
+    publisher_template: Option<PublisherTemplate<MemoryPublicationStore, FixedPartitionCount>>,
 ) -> StateManagerProvider<
     MemoryStateBackendFactory<MemoryDeduplicationStoreProvider>,
     MemoryLoader<C::Payload>,
@@ -202,8 +195,9 @@ where
         keyed_state.registry.clone(),
         dedup_provider,
         keyed_state.group.clone(),
+        publisher_template,
     );
-    keyed_state.provider(backend, loader, publisher_template)
+    keyed_state.provider(backend, loader)
 }
 
 /// The memory cell and identity stores backing the state provider. Returns the
@@ -215,32 +209,24 @@ where
 /// from one config, so this mismatch is reported as
 /// [`ConsumerError::SharedDepsBackendMismatch`]. See [`cassandra_loader`] for
 /// the mirror.
-fn shared_memory_handles(
-    shared: Option<SharedStorage>,
-) -> Result<(MemoryCells, MemoryDescriptorIdentityStore), ConsumerError> {
-    match shared {
-        Some(SharedStorage::Memory {
-            cells, identities, ..
-        }) => Ok((cells, identities)),
-        Some(SharedStorage::Cassandra { .. }) => Err(ConsumerError::SharedDepsBackendMismatch),
-        None => Ok((MemoryCells::new(), MemoryDescriptorIdentityStore::new())),
-    }
-}
-
 /// The memory-arm inputs a consumer resolves from an optional shared bundle.
 /// These come from the bundle when one is supplied, so a reader built from the
 /// same bundle sees this consumer's committed writes. Otherwise they are fresh
 /// mock defaults.
-pub(in crate::consumer) fn memory_arm_inputs<C: Codec>(
-    deps: Option<&SharedDeps<C>>,
-    shared: Option<SharedStorage>,
-) -> Result<MemoryArmInputs<C::Payload>, ConsumerError>
+pub(in crate::consumer) fn memory_arm_inputs<C, B>(
+    deps: Option<&SharedDeps<C, B>>,
+) -> MemoryArmInputs<C::Payload>
 where
+    C: Codec,
     C::Payload: Clone,
+    B: ConsumerReaderBackend<C>,
 {
     let loader = deps.and_then(SharedDeps::memory_loader).unwrap_or_default();
-    let (cells, identities) = shared_memory_handles(shared)?;
-    Ok((loader, cells, identities))
+    let cells = deps.and_then(SharedDeps::memory_cells).unwrap_or_default();
+    let identities = deps
+        .and_then(SharedDeps::memory_identities)
+        .unwrap_or_default();
+    (loader, cells, identities)
 }
 
 /// The Cassandra-arm input a consumer resolves from an optional shared bundle:
@@ -249,13 +235,15 @@ where
 ///
 /// A memory bundle cannot back a Cassandra arm. That mismatch is reported as
 /// [`ConsumerError::SharedDepsBackendMismatch`].
-pub(in crate::consumer) fn cassandra_loader<C: Codec>(
-    deps: Option<&SharedDeps<C>>,
+pub(in crate::consumer) fn cassandra_loader<C, B>(
+    deps: Option<&SharedDeps<C, B>>,
     consumer_config: &ConsumerConfiguration,
     heartbeats: &HeartbeatRegistry,
 ) -> Result<KafkaLoader<C>, ConsumerError>
 where
+    C: Codec,
     C::Payload: Clone,
+    B: ConsumerReaderBackend<C>,
 {
     match deps {
         Some(deps) => deps
@@ -278,7 +266,7 @@ pub(in crate::consumer) fn cassandra_state_provider<C: Codec>(
     cell_store: CassandraCellResources,
     identity_store: CassandraDescriptorIdentityStore,
     loader: KafkaLoader<C>,
-    publisher_template: Option<PublisherTemplate>,
+    publisher_template: Option<PublisherTemplate<CassandraPublicationStore, KafkaObserver>>,
 ) -> Result<
     StateManagerProvider<
         CassandraStateBackendFactory<CassandraDeduplicationStoreProvider>,
@@ -307,6 +295,7 @@ where
         keyed_state.registry.clone(),
         dedup_provider,
         keyed_state.group.clone(),
+        publisher_template,
     );
-    Ok(keyed_state.provider(backend, loader, publisher_template))
+    Ok(keyed_state.provider(backend, loader))
 }

@@ -12,7 +12,7 @@
 //! collection handle. That handle is the same one the owning consumer's
 //! handlers use, so owner and reader share one read implementation. A
 //! descriptor backed by a Kafka message reference takes the same path because
-//! the session's loader is a [`ReaderLoader`].
+//! the session's loader is selected by its backend family.
 //!
 //! Source discovery itself — the cached snapshot, its refresh, and retry
 //! pacing — lives in [`acquisition`]. `clippy::multiple_inherent_impl` fires on
@@ -38,6 +38,7 @@ use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
 use crate::state_reader::deps::SharedDeps;
 use crate::state_reader::error::StateReaderError;
 use crate::state_reader::session::{ReadSession, ReaderCollectionDef, ReaderContext};
+use crate::state_reader::{MemoryReaderBackend, ReaderBackend};
 use crate::subsystem::SubsystemName;
 use acquisition::{DEFAULT_REFRESH_INTERVAL, SnapshotState};
 use futures::stream::{Stream, StreamExt};
@@ -62,11 +63,11 @@ use tokio::sync::Mutex;
 /// codec `C`. The read methods live in descriptor-specialized impl blocks for
 /// Value, Map, and Deque. Each is a thin bind-and-delegate over the shared read
 /// machinery.
-pub struct StateReader<D, C: Codec> {
+pub struct StateReader<D, C: Codec, B = MemoryReaderBackend<C>> {
     descriptor: D,
     subsystem: SubsystemName,
     /// The collection addressed and the handles every session clones.
-    context: ReaderContext<C>,
+    context: ReaderContext<C, B>,
     clock: Clock,
     refresh_interval: Duration,
     snapshot: Mutex<SnapshotState>,
@@ -76,10 +77,11 @@ pub struct StateReader<D, C: Codec> {
     deps_instance_id: u64,
 }
 
-impl<D, C> StateReader<D, C>
+impl<D, C, B> StateReader<D, C, B>
 where
     D: StateDescriptor,
     C: Codec,
+    B: ReaderBackend<C>,
 {
     /// Builds a reader over the shared `deps` bundle for `descriptor`, routed
     /// under `subsystem`.
@@ -95,7 +97,7 @@ where
     /// read-cache TTL is zero, or [`StateReaderError::Unsupported`] when the
     /// collection name is empty.
     pub fn new(
-        deps: &SharedDeps<C>,
+        deps: &SharedDeps<C, B>,
         subsystem: SubsystemName,
         descriptor: D,
     ) -> Result<Self, StateReaderError> {
@@ -105,7 +107,7 @@ where
     /// [`Self::new`] with an explicit refresh cadence — the tests drive it to
     /// [`Duration::ZERO`] so every operation refreshes the snapshot.
     pub(super) fn with_refresh_interval(
-        deps: &SharedDeps<C>,
+        deps: &SharedDeps<C, B>,
         subsystem: SubsystemName,
         descriptor: D,
         refresh_interval: Duration,
@@ -120,8 +122,7 @@ where
             })?;
         Ok(Self {
             context: ReaderContext::new(
-                deps.stores().clone(),
-                deps.loader().clone(),
+                deps.backend().clone(),
                 deps.cache().clone(),
                 def,
                 descriptor.state_type(),
@@ -140,7 +141,7 @@ where
     /// Builds a per-operation [`ReadSession`] over the current snapshot, with a
     /// fresh source pin. Rejects an empty key first: an empty or NULL key has
     /// no deterministic partition to route to.
-    async fn session(&self, key: Key) -> Result<ReadSession<C>, StateReaderError> {
+    async fn session(&self, key: Key) -> Result<ReadSession<C, B>, StateReaderError> {
         if key.is_empty() {
             return Err(StateReaderError::EmptyKey);
         }
@@ -165,12 +166,13 @@ fn validate_read_cache(ttl: Option<Duration>) -> Result<(), StateReaderError> {
 
 // --- Value (and Kafka-message-ref) reads -----------------------------------
 
-impl<T, C> StateReader<ValueDescriptor<T>, C>
+impl<T, C, B> StateReader<ValueDescriptor<T>, C, B>
 where
     C: Codec,
+    B: ReaderBackend<C>,
     C::Payload: Clone,
     T: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C>>,
+    for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
 {
     /// Reads and resolves the committed value for `key` (`None` when absent).
     ///
@@ -190,14 +192,15 @@ where
 
 // --- Map reads --------------------------------------------------------------
 
-impl<KC, V, C> StateReader<MapDescriptor<KC, V>, C>
+impl<KC, V, C, B> StateReader<MapDescriptor<KC, V>, C, B>
 where
     C: Codec,
+    B: ReaderBackend<C>,
     C::Payload: Clone,
     KC: OrderedKeyCodec + 'static,
     KC::Key: Display,
     V: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C>>,
+    for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
 {
     /// Reads and resolves the committed value for map entry `map_key` under
     /// partition `key`.
@@ -275,12 +278,13 @@ where
 
 // --- Deque reads ------------------------------------------------------------
 
-impl<T, C> StateReader<DequeDescriptor<T>, C>
+impl<T, C, B> StateReader<DequeDescriptor<T>, C, B>
 where
     C: Codec,
+    B: ReaderBackend<C>,
     C::Payload: Clone,
     T: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C>>,
+    for<'s> ContextOf<'s, T>: FromSession<'s, ReadSession<C, B>>,
 {
     /// Reads and resolves the committed element at front-relative `index`
     /// (`None` when `index >= len`).
@@ -349,15 +353,16 @@ where
 }
 
 #[cfg(test)]
-impl<D, C> StateReader<D, C>
+impl<D, C, B> StateReader<D, C, B>
 where
     D: StateDescriptor,
     C: Codec,
+    B: ReaderBackend<C>,
 {
     /// A reader that refreshes its snapshot on every operation — the
     /// deterministic driver for the acquisition/refresh property tests.
     pub(crate) fn new_eager(
-        deps: &SharedDeps<C>,
+        deps: &SharedDeps<C, B>,
         subsystem: SubsystemName,
         descriptor: D,
     ) -> Result<Self, StateReaderError> {

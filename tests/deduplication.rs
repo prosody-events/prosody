@@ -91,7 +91,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
     };
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
-        ConsumerSetup {
+        ConsumerSetup::<JsonCodec> {
             consumer: &consumer_config,
             trigger_store: &common::create_cassandra_trigger_store_config(),
             common: &common_config,

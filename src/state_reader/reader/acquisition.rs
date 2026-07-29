@@ -7,8 +7,11 @@
 
 use crate::state::access::StateAccessError;
 use crate::state::descriptor::StateDescriptor;
+use crate::state::descriptor_identity::DescriptorIdentityStore;
 use crate::state::descriptor_identity::{self, DurableDescriptorIdentity};
+use crate::state::publication::PublicationStore;
 use crate::state::publication::StatePublication;
+use crate::state_reader::ReaderBackend;
 use crate::state_reader::error::StateReaderError;
 use crate::state_reader::source::{
     MAX_PUBLICATION_SOURCES, NoSnapshot, Source, SourceId, ValidatedPublications,
@@ -153,10 +156,11 @@ struct Admission {
     any_missing: bool,
 }
 
-impl<D, C> StateReader<D, C>
+impl<D, C, B> StateReader<D, C, B>
 where
     D: StateDescriptor,
     C: Codec,
+    B: ReaderBackend<C>,
 {
     /// The refresh-if-stale acquisition, returning the validated snapshot every
     /// read resolves against.
@@ -226,9 +230,11 @@ where
         let prior = state.sources();
         let rows = match self
             .context
-            .stores
+            .backend
+            .publications()
             .read_publications(&self.subsystem, self.context.state_type, &self.context.name)
             .await
+            .map_err(|error| StateReaderError::store(&error))
         {
             Ok(rows) => rows,
             // A failed read keeps the previous acquisition untouched, not
@@ -390,9 +396,11 @@ where
         .map(|group| {
             cooperative(async move {
                 self.context
-                    .stores
+                    .backend
+                    .identities()
                     .read_identity(&group, self.context.state_type, self.context.name.as_str())
                     .await
+                    .map_err(|error| StateReaderError::store(&error))
             })
         })
         .buffered(MAX_PUBLICATION_SOURCES)

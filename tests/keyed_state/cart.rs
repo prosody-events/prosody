@@ -40,7 +40,7 @@ pub(crate) const LAST_SEEN: &str = "last_seen";
 
 /// A second Kafka-message collection, recorded alongside `last_seen`. The
 /// publication test registers it published so a standalone reader can resolve
-/// it through `ReaderLoader::Kafka`, which re-fetches a message-ref cell's body
+/// it through `KafkaLoader`, which re-fetches a message-ref cell's body
 /// from Kafka. `last_seen` stays private, so it cannot demonstrate that path.
 pub(crate) const RECEIPT: &str = "receipt";
 

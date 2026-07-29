@@ -73,7 +73,6 @@ pub(super) async fn initialize_with(
         Duration::default(),
         NonZeroUsize::MIN,
         config.timer_spans,
-        None,
     )
     .await?;
     let StorePair::Memory {

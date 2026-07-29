@@ -51,13 +51,13 @@ use crate::state::session::CellRead;
 use crate::state::session::sealed::ReadAdmission;
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{StateName, StateType};
+use crate::state_reader::backend::{CommittedCellSource, ReaderBackend};
 use crate::state_reader::cache::{CacheKey, ReaderCache};
-use crate::state_reader::loader::ReaderLoader;
 use crate::state_reader::partition_for_key;
 use crate::state_reader::source::{Source, ValidatedPublications};
-use crate::state_reader::stores::ReaderStores;
 use bytes::Bytes;
 use futures::stream::{FuturesOrdered, Stream, StreamExt};
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -87,27 +87,26 @@ impl ReaderCollectionDef {
 ///
 /// Every field is a cheap-clone handle, so building a session per operation
 /// copies no resources.
-pub(crate) struct ReaderContext<C: Codec> {
-    pub(super) stores: ReaderStores,
-    loader: Arc<ReaderLoader<C>>,
+pub(crate) struct ReaderContext<C: Codec, B> {
+    pub(super) backend: Arc<B>,
+    codec: PhantomData<fn() -> C>,
     cache: ReaderCache,
     def: ReaderCollectionDef,
     pub(super) state_type: StateType,
     pub(super) name: StateName,
 }
 
-impl<C: Codec> ReaderContext<C> {
+impl<C: Codec, B: ReaderBackend<C>> ReaderContext<C, B> {
     pub(crate) fn new(
-        stores: ReaderStores,
-        loader: Arc<ReaderLoader<C>>,
+        backend: Arc<B>,
         cache: ReaderCache,
         def: ReaderCollectionDef,
         state_type: StateType,
         name: StateName,
     ) -> Self {
         Self {
-            stores,
-            loader,
+            backend,
+            codec: PhantomData,
             cache,
             def,
             state_type,
@@ -118,11 +117,11 @@ impl<C: Codec> ReaderContext<C> {
 
 /// Cloning shares handles; the manual impl keeps the bundle free of a
 /// `C: Clone` bound the derive would add.
-impl<C: Codec> Clone for ReaderContext<C> {
+impl<C: Codec, B> Clone for ReaderContext<C, B> {
     fn clone(&self) -> Self {
         Self {
-            stores: self.stores.clone(),
-            loader: self.loader.clone(),
+            backend: self.backend.clone(),
+            codec: PhantomData,
             cache: self.cache.clone(),
             def: self.def,
             state_type: self.state_type,
@@ -139,8 +138,8 @@ impl<C: Codec> Clone for ReaderContext<C> {
 /// public `KeyedStateSession`. Its fields and constructor stay crate-internal,
 /// so a downstream crate can name it in a bound but can neither build one nor
 /// reach a cell through it.
-pub struct ReadSession<C: Codec> {
-    context: ReaderContext<C>,
+pub struct ReadSession<C: Codec, B> {
+    context: ReaderContext<C, B>,
     snapshot: Arc<ValidatedPublications>,
     key: Key,
     /// The pinned source, shared across the operation's handle clones so every
@@ -148,7 +147,7 @@ pub struct ReadSession<C: Codec> {
     pin: Arc<OnceLock<Source>>,
 }
 
-impl<C: Codec> Clone for ReadSession<C> {
+impl<C: Codec, B> Clone for ReadSession<C, B> {
     fn clone(&self) -> Self {
         Self {
             context: self.context.clone(),
@@ -159,10 +158,10 @@ impl<C: Codec> Clone for ReadSession<C> {
     }
 }
 
-impl<C: Codec> ReadSession<C> {
+impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     /// Builds a session for one operation over `snapshot`, with a fresh pin.
     pub(crate) fn new(
-        context: ReaderContext<C>,
+        context: ReaderContext<C, B>,
         snapshot: Arc<ValidatedPublications>,
         key: Key,
     ) -> Self {
@@ -209,7 +208,12 @@ impl<C: Codec> ReadSession<C> {
         match self.context.def.read_cache_ttl {
             None => {
                 let id = self.collection_id_for(source)?;
-                self.context.stores.read_committed(&id, cell).await
+                self.context
+                    .backend
+                    .cells()
+                    .load(&id, cell)
+                    .await
+                    .map_err(|error| StateAccessError::store(&error))
             }
             Some(ttl) => {
                 let key = self.cache_key(source, cell);
@@ -220,7 +224,12 @@ impl<C: Codec> ReadSession<C> {
                     .cache
                     .get_cached(key, ttl, || async {
                         let id = self.collection_id_for(source)?;
-                        self.context.stores.read_committed(&id, cell).await
+                        self.context
+                            .backend
+                            .cells()
+                            .load(&id, cell)
+                            .await
+                            .map_err(|error| StateAccessError::store(&error))
                     })
                     .await
             }
@@ -239,9 +248,11 @@ impl<C: Codec> ReadSession<C> {
             None => {
                 let id = self.collection_id_for(source)?;
                 self.context
-                    .stores
-                    .read_committed_many(&id, section, batch)
+                    .backend
+                    .cells()
+                    .load_many(&id, section, batch)
                     .await
+                    .map_err(|error| StateAccessError::store(&error))
             }
             Some(ttl) => {
                 let keys: CellBuffer<CacheKey> = batch
@@ -263,9 +274,11 @@ impl<C: Codec> ReadSession<C> {
                     .get_many_cached(&keys, ttl, || async {
                         let id = self.collection_id_for(source)?;
                         self.context
-                            .stores
-                            .read_committed_many(&id, section, batch)
+                            .backend
+                            .cells()
+                            .load_many(&id, section, batch)
                             .await
+                            .map_err(|error| StateAccessError::store(&error))
                     })
                     .await
             }
@@ -273,7 +286,7 @@ impl<C: Codec> ReadSession<C> {
     }
 }
 
-impl<C: Codec> ReadAdmission for ReadSession<C> {
+impl<C: Codec, B: ReaderBackend<C>> ReadAdmission for ReadSession<C, B> {
     type Permit<'s> = ();
 
     async fn permit(&self) -> Self::Permit<'_> {}
@@ -283,14 +296,14 @@ impl<C: Codec> ReadAdmission for ReadSession<C> {
     }
 }
 
-impl<C: Codec> CellRead for ReadSession<C>
+impl<C: Codec, B: ReaderBackend<C>> CellRead for ReadSession<C, B>
 where
     C::Payload: Clone,
 {
-    type Loader = ReaderLoader<C>;
+    type Loader = B::Loader;
 
     fn loader(&self) -> &Self::Loader {
-        &self.context.loader
+        self.context.backend.loader()
     }
 
     fn is_terminated(&self) -> bool {
@@ -438,10 +451,10 @@ where
         async_stream::try_stream! {
             if let Some(source) = self.pin.get() {
                 let id = self.collection_id_for(source)?;
-                let inner = self.context.stores.scan_committed(&id, scan);
+                let inner = self.context.backend.cells().scan(&id, scan);
                 futures::pin_mut!(inner);
                 while let Some(item) = inner.next().await {
-                    yield item?;
+                    yield item.map_err(|error| StateAccessError::store(&error))?;
                 }
                 return;
             }
@@ -456,7 +469,7 @@ where
             let mut pinned = false;
             for source in sources {
                 let id = self.collection_id_for(source)?;
-                let inner = self.context.stores.scan_committed(&id, scan);
+                let inner = self.context.backend.cells().scan(&id, scan);
                 futures::pin_mut!(inner);
                 let mut yielded_any = false;
                 loop {
@@ -469,6 +482,7 @@ where
                             yield item;
                         }
                         Some(Err(error)) => {
+                            let error = StateAccessError::store(&error);
                             if yielded_any {
                                 // Mid-stream error after the pin. Terminate,
                                 // never restart, because a restart would

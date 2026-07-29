@@ -16,7 +16,7 @@ use crate::consumer::middleware::monopolization::MonopolizationMiddleware;
 use crate::consumer::middleware::retry::RetryMiddleware;
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::observer::KafkaObserver;
-use crate::consumer::storage::{SharedStorage, StorePair};
+use crate::consumer::storage::StorePair;
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::state::{
     KeyedStateInputs, cassandra_loader, cassandra_state_provider, memory_arm_inputs,
@@ -27,6 +27,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::CellWrite;
+use crate::state_reader::ConsumerReaderBackend;
 use crate::telemetry::Telemetry;
 use crate::timers::store::TriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType};
@@ -120,25 +121,22 @@ impl PipelineMiddlewareStack {
 
 /// Builds the storage pair, keyed-state inputs, and shared middleware stack
 /// for [`ProsodyConsumer::pipeline_consumer`].
-async fn prepare_pipeline_stack<C: Codec>(
-    setup: &ConsumerSetup<'_, C>,
+async fn prepare_pipeline_stack<C, B>(
+    setup: &ConsumerSetup<'_, C, B>,
     pipeline_config: PipelineMiddlewareConfiguration,
     telemetry: Telemetry,
-) -> Result<
-    (
-        StorePair,
-        KeyedStateInputs,
-        PipelineMiddlewareStack,
-        Option<SharedStorage>,
-    ),
-    ConsumerError,
-> {
+) -> Result<(StorePair, KeyedStateInputs, PipelineMiddlewareStack), ConsumerError>
+where
+    C: Codec,
+    C::Payload: Clone,
+    B: ConsumerReaderBackend<C>,
+{
     let PipelineMiddlewareConfiguration {
         retry: retry_config,
         monopolization: monopolization_config,
         defer: defer_config,
     } = pipeline_config;
-    let (stores, keyed_state, heartbeats, shared, observer) = build_shared_state(setup).await?;
+    let (stores, keyed_state, heartbeats, observer) = build_shared_state(setup).await?;
     let monopolization_middleware =
         MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
     let failure_tracker = FailureTracker::new(
@@ -160,7 +158,7 @@ async fn prepare_pipeline_stack<C: Codec>(
         observer,
     };
 
-    Ok((stores, keyed_state, stack, shared))
+    Ok((stores, keyed_state, stack))
 }
 
 impl<C: Codec> ProsodyConsumer<C>
@@ -188,7 +186,21 @@ where
         C::Payload: EventIdentity,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
-        let (stores, keyed_state, stack, shared) =
+        Self::pipeline_consumer_with_backend(setup, pipeline_config, telemetry, handler).await
+    }
+
+    pub(crate) async fn pipeline_consumer_with_backend<T, B>(
+        setup: ConsumerSetup<'_, C, B>,
+        pipeline_config: PipelineMiddlewareConfiguration,
+        telemetry: Telemetry,
+        handler: T,
+    ) -> Result<Self, ConsumerError>
+    where
+        C::Payload: EventIdentity,
+        B: ConsumerReaderBackend<C>,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+    {
+        let (stores, keyed_state, stack) =
             prepare_pipeline_stack(&setup, pipeline_config, telemetry).await?;
         let deps = setup.deps;
 
@@ -200,7 +212,7 @@ where
                 dedup_provider,
                 publication_store,
             } => {
-                let (loader, cells, identities) = memory_arm_inputs(deps.as_ref(), shared)?;
+                let (loader, cells, identities) = memory_arm_inputs(deps.as_ref());
                 let publisher_template = keyed_state
                     .memory_publication_setup(publication_store)
                     .await?;

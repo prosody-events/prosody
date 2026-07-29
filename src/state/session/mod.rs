@@ -73,7 +73,7 @@ use crate::state::descriptor::{
     DescriptorIdentity, Registered, SealedDescriptor, StateDescriptor, StructuralIdentity,
 };
 use crate::state::dirty::{CellSnapshot, ClearedSections, DirtyStore, DirtyVal, ResolvedCells};
-use crate::state::first_write::{FirstWritePublisher, PublicationError};
+use crate::state::first_write::FirstWriteBarrier;
 use crate::state::identity::{CollectionId, CollectionRef};
 use crate::state::manager::ArmedKeys;
 use crate::state::marker::{EventMarker, SectionClear};
@@ -1078,7 +1078,7 @@ where
     /// `None` when no collection is published or no subsystem is configured
     /// (nothing to advertise). Consulted before every session-owned durable
     /// write of a `Published` collection.
-    pub(crate) publisher: Option<FirstWritePublisher>,
+    pub(crate) publisher: Option<B::Publisher>,
 }
 
 /// The per-event attempt epoch. Bumped once per retry attempt boundary
@@ -1151,7 +1151,7 @@ where
     /// The first-write publication barrier for this session's topic — see
     /// [`SessionParts::publisher`]. `None` disables publication (no published
     /// collection / no subsystem).
-    publisher: Option<FirstWritePublisher>,
+    publisher: Option<B::Publisher>,
 }
 
 /// The real per-event session over a partition's cell store.
@@ -1256,9 +1256,9 @@ where
         &self,
         state_type: StateType,
         name: &StateName,
-    ) -> Result<(), PublicationError> {
+    ) -> Result<(), <B::Publisher as FirstWriteBarrier>::Error> {
         match &self.inner.publisher {
-            Some(publisher) => publisher.ensure_one(state_type, name).await,
+            Some(publisher) => publisher.publish_if_needed(state_type, name).await,
             None => Ok(()),
         }
     }

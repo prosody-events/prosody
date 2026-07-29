@@ -15,7 +15,7 @@ use crate::loader::MemoryLoader;
 use crate::state::cell::Committed;
 use crate::state::descriptor::tests::{FixedOracle, TestSession, test_session_with_publisher};
 use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
-use crate::state::first_write::{PartitionCounts, PublicationBackend, PublisherTemplate};
+use crate::state::first_write::PublisherTemplate;
 use crate::state::memory::MemoryCellStore;
 use crate::state::publication::StatePublication;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, StateVisibility};
@@ -69,12 +69,12 @@ fn publisher_template(
     store: ScriptedPublicationStore,
     observer: &KafkaObserver,
     names: &[&'static str],
-) -> Result<PublisherTemplate> {
+) -> Result<PublisherTemplate<ScriptedPublicationStore, KafkaObserver>> {
     Ok(PublisherTemplate::new(
         subsystem()?,
         Arc::from(GROUP),
-        Arc::new(PublicationBackend::Scripted(store)),
-        PartitionCounts::Observed(observer.clone()),
+        Arc::new(store),
+        observer.clone(),
         Arc::new(published_registry(names)?),
     ))
 }

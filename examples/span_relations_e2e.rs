@@ -26,6 +26,7 @@ use color_eyre::eyre::{Error, Result, eyre};
 use opentelemetry::trace::TraceContextExt as _;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::consumer::KeyedStateConfiguration;
+use prosody::high_level::CassandraClientBackend;
 use prosody::otel::SpanRelation;
 use prosody::prelude::*;
 use prosody::state::descriptor::{
@@ -254,11 +255,11 @@ async fn main() -> Result<()> {
     };
 
     let (sender, mut receiver) = channel(keys * 2 + 4);
-    let client = HighLevelClient::<SpanProbe, JsonCodec>::new(
+    let client = HighLevelClient::<SpanProbe, JsonCodec, _>::new(
+        CassandraClientBackend::new(cassandra_config.build()?),
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-        &cassandra_config,
     )?;
 
     // One shared absolute fire time lands every timer in the same instant, so

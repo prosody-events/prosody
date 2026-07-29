@@ -89,8 +89,6 @@ where
             Duration::default(),
             NonZeroUsize::MIN,
             consumer_config.timer_spans,
-            // The direct mode shares no infrastructure bundle.
-            None,
         )
         .await?;
         let keyed_state = KeyedStateInputs::new(

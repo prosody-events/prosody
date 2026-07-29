@@ -22,10 +22,9 @@ use crate::state::registry::CollectionDefRegistry;
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::tests::support::{FixedOracle, ScriptedPublicationStore};
 use crate::state::{StateName, StateType};
+use crate::state_reader::backend::{ReaderComponents, ScriptedReaderBackend};
 use crate::state_reader::cache::ReaderCache;
 use crate::state_reader::deps::SharedDeps;
-use crate::state_reader::loader::ReaderLoader;
-use crate::state_reader::stores::ReaderStores;
 use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
 use crate::{Key, SegmentId, Topic};
@@ -88,9 +87,8 @@ pub(in crate::state_reader::tests) enum FaultPoint {
 
 /// A committed cell source that can fault deterministically per source. It
 /// wraps a real [`MemoryCells`] for the actual committed data, seeded
-/// through the owner harness. The closed [`ReaderStores::Scripted`] arm
-/// carries it because neither production arm can script a mid-stream scan
-/// error: Memory is `Infallible`, and Cassandra needs a live cluster.
+/// through the owner harness. Neither production source can script a
+/// mid-stream scan error.
 #[derive(Clone, Default)]
 pub(crate) struct ScriptedCellSource {
     inner: MemoryCells,
@@ -285,14 +283,9 @@ fn scripted_deps(
     publications: ScriptedPublicationStore,
     identities: CountingIdentityStore,
     cache: ReaderCache,
-) -> SharedDeps<JsonCodec> {
+) -> SharedDeps<JsonCodec, ScriptedReaderBackend> {
     SharedDeps::from_parts(
-        ReaderStores::Scripted {
-            cells,
-            publications,
-            identities,
-        },
-        ReaderLoader::Memory(MemoryLoader::new()),
+        ReaderComponents::new(cells, publications, identities, MemoryLoader::new()),
         cache,
     )
 }
@@ -398,7 +391,7 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
     pub(in crate::state_reader::tests) fn deps_with_cache(
         &self,
         cache: ReaderCache,
-    ) -> SharedDeps<JsonCodec> {
+    ) -> SharedDeps<JsonCodec, ScriptedReaderBackend> {
         scripted_deps(
             self.cells.clone(),
             self.publications.clone(),
@@ -408,7 +401,9 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
     }
 
     /// An eager reader (refreshes every operation) on a wall-clock cache.
-    pub(in crate::state_reader::tests) fn reader_eager(&self) -> Result<StateReader<D, JsonCodec>> {
+    pub(in crate::state_reader::tests) fn reader_eager(
+        &self,
+    ) -> Result<StateReader<D, JsonCodec, ScriptedReaderBackend>> {
         self.reader_eager_with_cache(ReaderCache::with_budget(1 << 20))
     }
 
@@ -417,7 +412,7 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
     pub(in crate::state_reader::tests) fn reader_eager_with_cache(
         &self,
         cache: ReaderCache,
-    ) -> Result<StateReader<D, JsonCodec>> {
+    ) -> Result<StateReader<D, JsonCodec, ScriptedReaderBackend>> {
         let deps = self.deps_with_cache(cache);
         StateReader::new_eager(&deps, self.sub.clone(), self.descriptor)
             .map_err(|e| eyre!("reader: {e}"))
@@ -430,7 +425,7 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
         &self,
         cache: ReaderCache,
         refresh_interval: Duration,
-    ) -> Result<StateReader<D, JsonCodec>> {
+    ) -> Result<StateReader<D, JsonCodec, ScriptedReaderBackend>> {
         let deps = self.deps_with_cache(cache);
         StateReader::with_refresh_interval(
             &deps,

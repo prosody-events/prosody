@@ -6,7 +6,6 @@
 //! hands to consumers and readers alike lives in `deps`; topic reconciliation
 //! in `topics`; the consumer's state machine in [`state`].
 
-use crate::cassandra::config::CassandraConfigurationBuilder;
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::{
     LowLatencyMiddlewareConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
@@ -20,24 +19,37 @@ use crate::high_level::topics::missing_topics;
 use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder, ProsodyProducer};
 use crate::propagator::new_propagator;
 use crate::state::descriptor::{Registered, StateDescriptor};
+use crate::state_reader::ConsumerReaderBackend;
 #[cfg(test)]
 use crate::state_reader::SharedDeps;
 use crate::state_reader::StateReader;
 use crate::subsystem::SubsystemName;
 use crate::telemetry::{Telemetry, spawn_telemetry_emitter};
-use crate::{Codec, JsonCodec, Topic};
+use crate::{Codec, Topic};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
 use tokio::sync::Mutex;
 use tracing::info;
 
+mod backend;
 pub mod config;
 mod deps;
+pub mod erased;
 mod error;
 pub mod mode;
 pub mod state;
 mod topics;
+
+pub use backend::{CassandraClientBackend, ClientBackend, MemoryClientBackend};
+
+/// High-level client using Cassandra storage.
+pub type CassandraHighLevelClient<T, C = crate::JsonCodec> =
+    HighLevelClient<T, C, CassandraClientBackend<C>>;
+
+/// High-level client using in-memory storage.
+pub type MemoryHighLevelClient<T, C = crate::JsonCodec> =
+    HighLevelClient<T, C, MemoryClientBackend<C>>;
 
 #[cfg(test)]
 mod tests;
@@ -45,9 +57,11 @@ mod tests;
 /// A combined client that manages both producer and consumer operations.
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct HighLevelClient<T, C: Codec = JsonCodec>
+pub struct HighLevelClient<T, C, B>
 where
+    C: Codec,
     C::Payload: crate::EventIdentity,
+    B: ClientBackend<C>,
 {
     producer: ProsodyProducer<C>,
     producer_config: ProducerConfiguration,
@@ -56,14 +70,17 @@ where
     /// built lazily on first use, by [`Self::state`] or [`Self::subscribe`],
     /// and retained across the `Configured → Running` transition. No state
     /// transition builds a second session, loader, or memory store.
-    consumer: Mutex<ConsumerState<T, C>>,
+    consumer: Mutex<ConsumerState<T, C, B>>,
+    backend: B,
     propagator: TextMapCompositePropagator,
     telemetry: Telemetry,
 }
 
-impl<T, C: Codec> HighLevelClient<T, C>
+impl<T, C, B> HighLevelClient<T, C, B>
 where
+    C: Codec,
     C::Payload: crate::EventIdentity,
+    B: ClientBackend<C>,
 {
     /// Returns a reference to the internal `ProsodyProducer`.
     pub fn producer(&self) -> &ProsodyProducer<C> {
@@ -76,7 +93,7 @@ where
     }
 
     /// Returns a view of the current consumer state.
-    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T, C> {
+    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T, C, B> {
         ConsumerStateView(self.consumer.lock().await)
     }
 
@@ -109,10 +126,10 @@ where
     /// - Required topics are not found.
     /// - The telemetry emitter cannot be started.
     pub fn new(
+        backend: B,
         mode: Mode,
         producer_builder: &mut ProducerConfigurationBuilder,
         consumer_builders: &ConsumerBuilders,
-        cassandra_builder: &CassandraConfigurationBuilder,
     ) -> Result<Self, HighLevelClientError<C::Error>> {
         // Set the producer source system to the consumer group if unspecified
         if let (None, Some(group_id)) = (
@@ -148,7 +165,6 @@ where
         let consumer_state = ConsumerState::build(&ModeConfigurationBuildParams {
             mode,
             consumer_builders,
-            cassandra_builder,
         });
 
         // Only a configured consumer has topics to check, and only a live client
@@ -166,6 +182,7 @@ where
             producer,
             producer_config,
             consumer: Mutex::new(consumer_state),
+            backend,
             propagator: new_propagator(),
             telemetry,
         })
@@ -221,7 +238,7 @@ where
     /// hook lets the composition suite seed committed state into the exact
     /// stores that the running consumer and the client's readers share.
     #[cfg(test)]
-    pub(crate) async fn retained_deps(&self) -> Option<SharedDeps<C>> {
+    pub(crate) async fn retained_deps(&self) -> Option<SharedDeps<C, B::Reader>> {
         match &*self.consumer.lock().await {
             ConsumerState::Configured { deps, .. } => deps.clone(),
             ConsumerState::Running { deps, .. } => Some(deps.clone()),
@@ -245,13 +262,13 @@ where
         &self,
         subsystem: SubsystemName,
         descriptor: D,
-    ) -> Result<StateReader<D, C>, HighLevelClientError<C::Error>>
+    ) -> Result<StateReader<D, C, B::Reader>, HighLevelClientError<C::Error>>
     where
         D: StateDescriptor,
         C::Payload: Clone,
     {
         let mut guard = self.consumer.lock().await;
-        let deps = deps::get_or_build(&mut guard).await?;
+        let deps = deps::get_or_build(&mut guard, &self.backend).await?;
         StateReader::new(&deps, subsystem, descriptor).map_err(HighLevelClientError::StateReader)
     }
 
@@ -263,10 +280,11 @@ where
     /// - The consumer is unconfigured.
     /// - The consumer is already subscribed.
     /// - Consumer initialization fails.
-    pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>
+    async fn subscribe_inner(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone,
         C::Payload: crate::EventType + Clone,
+        B::Reader: ConsumerReaderBackend<C>,
     {
         let mut guard = self.consumer.lock().await;
 
@@ -289,7 +307,7 @@ where
         // must stay retryable, so restore `Configured` (no bundle) and return.
         let shared = match existing_deps {
             Some(shared) => shared,
-            None => match deps::build(&config).await {
+            None => match deps::build(&config, &self.backend).await {
                 Ok(shared) => shared,
                 Err(error) => {
                     *guard = ConsumerState::Configured { config, deps: None };
@@ -301,6 +319,7 @@ where
         // Build the consumer. `take` moved the config out, so any failure must
         // undo both: the match below restores `Configured` and drops the
         // bundle. See there for why each step is needed.
+        let trigger_store = self.backend.trigger_store();
         let built: Result<_, HighLevelClientError<C::Error>> = match &config {
             ModeConfiguration::Pipeline {
                 consumer,
@@ -308,9 +327,8 @@ where
                 monopolization,
                 defer,
                 common,
-                trigger_store,
-            } => ProsodyConsumer::<C>::pipeline_consumer(
-                deps::consumer_setup(consumer, trigger_store, common, &shared),
+            } => ProsodyConsumer::<C>::pipeline_consumer_with_backend::<T, B::Reader>(
+                deps::consumer_setup::<C, B>(consumer, &trigger_store, common, &shared),
                 PipelineMiddlewareConfiguration {
                     retry: retry.clone(),
                     monopolization: monopolization.clone(),
@@ -326,9 +344,8 @@ where
                 retry,
                 failure_topic,
                 common,
-                trigger_store,
-            } => ProsodyConsumer::low_latency_consumer(
-                deps::consumer_setup(consumer, trigger_store, common, &shared),
+            } => ProsodyConsumer::low_latency_consumer_with_backend::<T, B::Reader>(
+                deps::consumer_setup::<C, B>(consumer, &trigger_store, common, &shared),
                 LowLatencyMiddlewareConfiguration {
                     retry: retry.clone(),
                     failure_topic: failure_topic.clone(),
@@ -339,17 +356,15 @@ where
             )
             .await
             .map_err(Into::into),
-            ModeConfiguration::BestEffort {
-                consumer,
-                common,
-                trigger_store,
-            } => ProsodyConsumer::<C>::best_effort_consumer(
-                deps::consumer_setup(consumer, trigger_store, common, &shared),
-                self.telemetry.clone(),
-                handler.clone(),
-            )
-            .await
-            .map_err(Into::into),
+            ModeConfiguration::BestEffort { consumer, common } => {
+                ProsodyConsumer::<C>::best_effort_consumer::<T, B::Reader>(
+                    deps::consumer_setup::<C, B>(consumer, &trigger_store, common, &shared),
+                    self.telemetry.clone(),
+                    handler.clone(),
+                )
+                .await
+                .map_err(Into::into)
+            }
         };
 
         let consumer = match built {
@@ -434,3 +449,30 @@ where
         consumer.is_stalled()
     }
 }
+
+macro_rules! impl_subscribe {
+    ($backend:ty) => {
+        impl<T, C> HighLevelClient<T, C, $backend>
+        where
+            C: Codec,
+            C::Payload: crate::EventIdentity + crate::EventType + Clone,
+            T: FallibleHandler<Payload = C::Payload> + Clone,
+        {
+            /// Subscribes the consumer with the provided handler.
+            ///
+            /// # Errors
+            ///
+            /// Returns an error when the consumer is unconfigured, already
+            /// subscribed, or cannot be initialized.
+            pub fn subscribe(
+                &self,
+                handler: T,
+            ) -> impl Future<Output = Result<(), HighLevelClientError<C::Error>>> + Send + '_ {
+                self.subscribe_inner(handler)
+            }
+        }
+    };
+}
+
+impl_subscribe!(MemoryClientBackend<C>);
+impl_subscribe!(CassandraClientBackend<C>);

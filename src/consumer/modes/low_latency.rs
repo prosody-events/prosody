@@ -19,6 +19,7 @@ use crate::consumer::wiring::state::{
 };
 use crate::consumer::wiring::{build_common_middleware, build_shared_state};
 use crate::producer::ProsodyProducer;
+use crate::state_reader::ConsumerReaderBackend;
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity, EventType};
 
@@ -50,8 +51,29 @@ where
         C::Payload: EventIdentity + Send + Sync + 'static,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
-        let (stores, keyed_state, heartbeats, shared, observer) =
-            build_shared_state(&setup).await?;
+        Self::low_latency_consumer_with_backend(
+            setup,
+            low_latency_config,
+            producer,
+            telemetry,
+            handler,
+        )
+        .await
+    }
+
+    pub(crate) async fn low_latency_consumer_with_backend<T, B>(
+        setup: ConsumerSetup<'_, C, B>,
+        low_latency_config: LowLatencyMiddlewareConfiguration,
+        producer: ProsodyProducer<C>,
+        telemetry: Telemetry,
+        handler: T,
+    ) -> Result<Self, ConsumerError>
+    where
+        C::Payload: EventIdentity + Send + Sync + 'static,
+        B: ConsumerReaderBackend<C>,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+    {
+        let (stores, keyed_state, heartbeats, observer) = build_shared_state(&setup).await?;
         let retry_middleware = RetryMiddleware::new(low_latency_config.retry)?;
         let topic_middleware = FailureTopicMiddleware::new(
             low_latency_config.failure_topic,
@@ -72,7 +94,7 @@ where
                 publication_store,
                 ..
             } => {
-                let (loader, cells, identities) = memory_arm_inputs(setup.deps.as_ref(), shared)?;
+                let (loader, cells, identities) = memory_arm_inputs(setup.deps.as_ref());
                 let publisher_template = keyed_state
                     .memory_publication_setup(publication_store)
                     .await?;

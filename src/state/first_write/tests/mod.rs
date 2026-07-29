@@ -19,10 +19,11 @@ use internment::Intern;
 use tracing::Level;
 
 use super::{
-    FirstWritePublisher, PartitionCounts, PublicationBackend, PublisherTemplate,
+    FirstWritePublisher, FixedPartitionCount, PartitionCountSource, PublisherTemplate,
     reconcile_publications,
 };
 use crate::Topic;
+use crate::consumer::observer::KafkaObserver;
 use crate::consumer::observer::tests::support::{observing, unobserved};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::descriptor::{ValueDescriptor, value_state};
@@ -72,39 +73,39 @@ fn registry(visibility: StateVisibility) -> Result<CollectionDefRegistry> {
 }
 
 /// The mock topology's fixed count — the memory arm's source.
-fn fixed(count: i32) -> Result<PartitionCounts> {
-    Ok(PartitionCounts::Fixed(PartitionCount::try_from(count)?))
+fn fixed(count: i32) -> Result<FixedPartitionCount> {
+    Ok(FixedPartitionCount(PartitionCount::try_from(count)?))
 }
 
 /// A Kafka observation reporting each `(topic, partition count)` — the
 /// production arm's source.
-fn observed(topics: &[(&str, i32)]) -> PartitionCounts {
-    PartitionCounts::Observed(observing(GROUP, topics))
+fn observed(topics: &[(&str, i32)]) -> KafkaObserver {
+    observing(GROUP, topics)
 }
 
 /// A template over the scripted store with the given count source and a memo of
 /// the given capacity.
-fn template(
+fn template<N: PartitionCountSource>(
     store: ScriptedPublicationStore,
     registry: CollectionDefRegistry,
-    counts: PartitionCounts,
+    counts: N,
     capacity: usize,
-) -> Result<PublisherTemplate> {
+) -> Result<PublisherTemplate<ScriptedPublicationStore, N>> {
     Ok(PublisherTemplate::with_memo_capacity(
         subsystem()?,
         Arc::from(GROUP),
-        Arc::new(PublicationBackend::Scripted(store)),
+        Arc::new(store),
         counts,
         Arc::new(registry),
         capacity,
     ))
 }
 
-fn publisher(
+fn publisher<N: PartitionCountSource>(
     store: ScriptedPublicationStore,
     registry: CollectionDefRegistry,
-    counts: PartitionCounts,
-) -> Result<FirstWritePublisher> {
+    counts: N,
+) -> Result<FirstWritePublisher<ScriptedPublicationStore, N>> {
     Ok(template(store, registry, counts, 64)?.bind(topic()))
 }
 
@@ -355,10 +356,7 @@ async fn distinct_topics_publish_distinct_rows() -> Result<()> {
 /// `consumer::observer`.
 #[tokio::test]
 async fn unusable_observation_blocks_publication() -> Result<()> {
-    for counts in [
-        PartitionCounts::Observed(unobserved(GROUP)),
-        observed(&[(DECOY, 7_i32)]),
-    ] {
+    for counts in [unobserved(GROUP), observed(&[(DECOY, 7_i32)])] {
         let store = ScriptedPublicationStore::new();
         let publisher = publisher(store.clone(), registry(StateVisibility::Published)?, counts)?;
 

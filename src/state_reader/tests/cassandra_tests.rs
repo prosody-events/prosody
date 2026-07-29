@@ -43,10 +43,9 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::tests::collection_suite::{DequeOp, MapOp, Trace};
 use crate::state::tests::support::FixedOracle;
 use crate::state::{StateName, StateType};
+use crate::state_reader::backend::ReaderComponents;
 use crate::state_reader::cache::ReaderCache;
 use crate::state_reader::deps::SharedDeps;
-use crate::state_reader::loader::ReaderLoader;
-use crate::state_reader::stores::ReaderStores;
 use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
 use crate::test_util::{
@@ -74,6 +73,13 @@ struct CassandraReaderBackend {
 }
 
 impl ReaderBackend for CassandraReaderBackend {
+    type DepsBackend = ReaderComponents<
+        JsonCodec,
+        CassandraCellResources,
+        CassandraPublicationStore,
+        CassandraDescriptorIdentityStore,
+        MemoryLoader<Value>,
+    >;
     type OwnerCell = CassandraCellStore<FixedOracle>;
 
     fn registry(&self) -> Arc<CollectionDefRegistry> {
@@ -113,17 +119,25 @@ impl ReaderBackend for CassandraReaderBackend {
         Ok(())
     }
 
-    fn deps(&self) -> SharedDeps<JsonCodec> {
+    fn deps(
+        &self,
+    ) -> SharedDeps<
+        JsonCodec,
+        ReaderComponents<
+            JsonCodec,
+            CassandraCellResources,
+            CassandraPublicationStore,
+            CassandraDescriptorIdentityStore,
+            MemoryLoader<Value>,
+        >,
+    > {
         SharedDeps::from_parts(
-            ReaderStores::Cassandra {
-                cells: self.cells.clone(),
-                publications: self.publications.clone(),
-                identities: self.identities.clone(),
-            },
-            // Value/Map/Deque never consult the loader. The in-memory loader avoids
-            // a live Kafka consumer config here, while the cell, publication, and
-            // identity stores stay the real Cassandra implementations under test.
-            ReaderLoader::Memory(MemoryLoader::new()),
+            ReaderComponents::new(
+                self.cells.clone(),
+                self.publications.clone(),
+                self.identities.clone(),
+                MemoryLoader::new(),
+            ),
             ReaderCache::with_budget(1 << 20),
         )
     }

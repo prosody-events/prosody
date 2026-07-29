@@ -136,7 +136,7 @@ impl CartEnv {
         )?;
 
         let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
-            ConsumerSetup {
+            ConsumerSetup::<JsonCodec> {
                 consumer: &consumer_config,
                 trigger_store: &trigger_store,
                 common: &common_config,
