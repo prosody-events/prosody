@@ -10,12 +10,10 @@ use crate::state_reader::DEFAULT_READER_CACHE_SIZE_BYTES;
 use crate::state_reader::{
     CassandraReaderBackend, MemoryReaderBackend, ReaderBackend, SharedDeps, StateReaderError,
 };
-use async_trait::async_trait;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 
 /// Builds the reader family matching one high-level storage choice.
-#[async_trait]
 pub trait ClientBackend<C>: Clone + Send + Sync + 'static
 where
     C: Codec,
@@ -27,11 +25,11 @@ where
     fn trigger_store(&self) -> TriggerStoreConfiguration;
 
     /// Builds the shared reader components.
-    async fn build_reader(
+    fn build_reader(
         &self,
         consumer: &ConsumerConfiguration,
         keyed_state: &KeyedStateConfiguration,
-    ) -> Result<SharedDeps<C, Self::Reader>, StateReaderError>;
+    ) -> impl Future<Output = Result<SharedDeps<C, Self::Reader>, StateReaderError>> + Send;
 }
 
 /// In-memory high-level client backend.
@@ -59,7 +57,6 @@ impl<C> Default for MemoryClientBackend<C> {
     }
 }
 
-#[async_trait]
 impl<C> ClientBackend<C> for MemoryClientBackend<C>
 where
     C: Codec,
@@ -112,7 +109,6 @@ impl<C> Clone for CassandraClientBackend<C> {
     }
 }
 
-#[async_trait]
 impl<C> ClientBackend<C> for CassandraClientBackend<C>
 where
     C: Codec,

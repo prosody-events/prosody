@@ -285,7 +285,7 @@ fn scripted_deps(
     cache: ReaderCache,
 ) -> SharedDeps<JsonCodec, ScriptedReaderBackend> {
     SharedDeps::from_parts(
-        ReaderComponents::new(cells, publications, identities, MemoryLoader::new(), ()),
+        ReaderComponents::new(cells, publications, identities, MemoryLoader::new()),
         cache,
     )
 }

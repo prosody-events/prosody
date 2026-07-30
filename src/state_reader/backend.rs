@@ -1,6 +1,5 @@
 //! Concrete component families used by standalone readers.
 
-use crate::cassandra::config::CassandraConfiguration;
 use crate::codec::Codec;
 use crate::consumer::storage::{
     MemoryArmInputs, StatefulStorePair, StoreCreationError, StorePair, StorePairInputs,
@@ -17,7 +16,6 @@ use crate::state::identity::CollectionId;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state::publication::PublicationStore;
 use crate::state::store::{CellBuffer, CoordinateBatch};
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
 use std::convert::Infallible;
@@ -164,15 +162,14 @@ where
 mod consumer {
     use super::{Codec, ReaderBackend, StatefulStorePair, StoreCreationError, StorePairInputs};
 
-    #[async_trait::async_trait]
     pub(crate) trait Backend<C>: ReaderBackend<C>
     where
         C: Codec,
     {
-        async fn build_store_pair(
+        fn build_store_pair(
             &self,
             inputs: StorePairInputs,
-        ) -> Result<StatefulStorePair<C>, StoreCreationError>;
+        ) -> impl Future<Output = Result<StatefulStorePair<C>, StoreCreationError>> + Send;
     }
 }
 
@@ -192,36 +189,33 @@ where
 
 /// One concrete reader component family.
 #[derive(Clone)]
-pub struct ReaderComponents<C, S, P, I, L, R = ()> {
+pub struct ReaderComponents<C, S, P, I, L> {
     cells: S,
     publications: P,
     identities: I,
     loader: L,
-    consumer: R,
     codec: PhantomData<fn() -> C>,
 }
 
-impl<C, S, P, I, L, R> ReaderComponents<C, S, P, I, L, R> {
-    pub(crate) fn new(cells: S, publications: P, identities: I, loader: L, consumer: R) -> Self {
+impl<C, S, P, I, L> ReaderComponents<C, S, P, I, L> {
+    pub(crate) fn new(cells: S, publications: P, identities: I, loader: L) -> Self {
         Self {
             cells,
             publications,
             identities,
             loader,
-            consumer,
             codec: PhantomData,
         }
     }
 }
 
-impl<C, S, P, I, L, R> ReaderBackend<C> for ReaderComponents<C, S, P, I, L, R>
+impl<C, S, P, I, L> ReaderBackend<C> for ReaderComponents<C, S, P, I, L>
 where
     C: Codec,
     S: CommittedCellSource,
     P: PublicationStore,
     I: DescriptorIdentityStore,
     L: MessageLoader<Payload = C::Payload> + 'static,
-    R: Send + Sync + 'static,
 {
     type Cells = S;
     type Identities = I;
@@ -252,7 +246,6 @@ pub type CassandraReaderBackend<C> = ReaderComponents<
     CassandraPublicationStore,
     CassandraDescriptorIdentityStore,
     KafkaLoader<C>,
-    CassandraConfiguration,
 >;
 
 /// In-memory stores and loader.
@@ -262,10 +255,8 @@ pub type MemoryReaderBackend<C> = ReaderComponents<
     MemoryPublicationStore,
     MemoryDescriptorIdentityStore,
     MemoryLoader<<C as Codec>::Payload>,
-    (),
 >;
 
-#[async_trait]
 impl<C> consumer::Backend<C> for CassandraReaderBackend<C>
 where
     C: Codec,
@@ -276,7 +267,6 @@ where
         inputs: StorePairInputs,
     ) -> Result<StatefulStorePair<C>, StoreCreationError> {
         StorePair::cassandra_with(
-            &self.consumer,
             inputs,
             self.cells().session.clone(),
             self.cells().clone(),
@@ -288,7 +278,6 @@ where
     }
 }
 
-#[async_trait]
 impl<C> consumer::Backend<C> for MemoryReaderBackend<C>
 where
     C: Codec,
@@ -318,5 +307,4 @@ pub(crate) type ScriptedReaderBackend = ReaderComponents<
     ScriptedPublicationStore,
     CountingIdentityStore,
     MemoryLoader<serde_json::Value>,
-    (),
 >;

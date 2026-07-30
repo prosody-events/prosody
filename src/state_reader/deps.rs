@@ -85,7 +85,7 @@ where
         budget: u64,
     ) -> Self {
         Self::build(
-            ReaderComponents::new(cells, publications, identities, loader, ()),
+            ReaderComponents::new(cells, publications, identities, loader),
             ReaderCache::with_budget(budget),
             HeartbeatRegistry::new(group_id, stall_threshold),
         )
@@ -127,7 +127,6 @@ where
             CassandraPublicationStore::new(store.clone(), Arc::new(publications)),
             CassandraDescriptorIdentityStore::new(store, Arc::new(identities)),
             loader,
-            cassandra.clone(),
         );
         Ok(Self::build(
             backend,

@@ -6,7 +6,6 @@
 //! created when using Cassandra backend.
 
 use crate::cassandra::CassandraStore;
-use crate::cassandra::config::CassandraConfiguration;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::consumer::ConsumerConfiguration;
 use crate::consumer::middleware::deduplication::cassandra::CassandraDeduplicationStoreProvider;
@@ -176,7 +175,6 @@ where
     }
 
     pub(crate) async fn cassandra_with(
-        config: &CassandraConfiguration,
         inputs: StorePairInputs,
         store: CassandraStore,
         cells: CassandraCellResources,
@@ -185,8 +183,8 @@ where
         resources: KafkaLoader<C>,
     ) -> Result<Self, StoreCreationError> {
         Self::cassandra(
-            store,
-            &config.keyspace,
+            store.clone(),
+            store.keyspace(),
             inputs,
             cells,
             identities,
