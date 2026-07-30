@@ -78,7 +78,7 @@ reloads and keyed-state message resolution.
 | `PROSODY_STATE_CACHE_DIR`            | Disk workspace for the local keyed-state cache. Wiped on restart, so it needs no persistence — but production deployments **must** set it to a mounted path (e.g. a Kubernetes `emptyDir`). | per-process temp dir |
 | `PROSODY_STATE_CACHE_SIZE_BYTES`     | Capacity of the in-memory keyed-state cache, in bytes. Must be greater than zero. | storage-engine default |
 | `PROSODY_STATE_RECOVERY_DELAY` | Grace period before a background sweep reconciles a freshly written value, in case the fast path did not. Rarely needs changing; second-granularity and must be at least `1s`. | 30s |
-| `PROSODY_STATE_READ_CACHE_SIZE_BYTES` | Byte budget for the read-only client's read-through cache (shared by every reader the client composes). Must be greater than zero. | follows `PROSODY_STATE_CACHE_SIZE_BYTES`, then a built-in default |
+| `PROSODY_STATE_READ_CACHE_SIZE_BYTES` | Byte budget for the read-only client's read-through cache (shared by every reader the client composes). Must be greater than zero. | follows `PROSODY_STATE_CACHE_SIZE_BYTES`, then 1 MiB |
 | `PROSODY_STATE_READ_CACHE_TTL` | Default read-cache TTL for composed readers: how long a `StateReader` may serve a collection's reads from its cache before re-reading the store. A humantime duration (`5s`, `750ms`); `none` disables the inherited default. A descriptor can replace it with `.read_cache(duration)` or bypass it with `.read_cache(ReadCachePolicy::Disabled)`. Reader-only — never affects the owning consumer's writes or a collection's durable TTL. | 5s |
 
 ## Deduplication (All Modes)
