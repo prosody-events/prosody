@@ -387,26 +387,27 @@ where
         // order-preserving, so the read results stay aligned to the
         // newly-advertised groups in advertisement order and the fold below
         // stays deterministic.
-        let mut reads = stream::iter(
-            groups
-                .iter()
-                .filter(|group| !prior_groups.iter().any(|prior| prior == *group))
-                .cloned(),
-        )
-        .map(|group| {
-            cooperative(async move {
-                self.context
-                    .backend
-                    .identities()
-                    .read_identity(&group, self.context.state_type, self.context.name.as_str())
-                    .await
-                    .map_err(|error| StateReaderError::store(&error))
+        let mut new_groups = GroupIds::new();
+        for group in &groups {
+            if !prior_groups.iter().any(|prior| prior == group) {
+                new_groups.push(group.clone());
+            }
+        }
+        let mut reads = stream::iter(new_groups)
+            .map(|group| {
+                cooperative(async move {
+                    self.context
+                        .backend
+                        .identities()
+                        .read_identity(&group, self.context.state_type, self.context.name.as_str())
+                        .await
+                        .map_err(|error| StateReaderError::store(&error))
+                })
             })
-        })
-        .buffered(MAX_PUBLICATION_SOURCES)
-        .collect::<SmallVec<[_; MAX_PUBLICATION_SOURCES]>>()
-        .await
-        .into_iter();
+            .buffered(MAX_PUBLICATION_SOURCES)
+            .collect::<SmallVec<[_; MAX_PUBLICATION_SOURCES]>>()
+            .await
+            .into_iter();
 
         // Fold sequentially in advertisement order: a prior group is admitted
         // with no read; a new group consumes its order-aligned identity read.
@@ -424,14 +425,16 @@ where
                 }
             };
             if admitted {
-                for row in rows.iter().filter(|row| *row.group_id == **group) {
-                    admission.admitted.push(Source {
-                        id: SourceId {
-                            group_id: row.group_id.clone(),
-                            topic: row.topic,
-                        },
-                        partition_count: row.partition_count,
-                    });
+                for row in rows {
+                    if *row.group_id == **group {
+                        admission.admitted.push(Source {
+                            id: SourceId {
+                                group_id: row.group_id.clone(),
+                                topic: row.topic,
+                            },
+                            partition_count: row.partition_count,
+                        });
+                    }
                 }
             }
         }

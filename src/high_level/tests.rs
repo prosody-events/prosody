@@ -5,7 +5,9 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::{ConsumerConfiguration, DemandType};
-use crate::high_level::erased::{ErasedConsumerState, new_erased};
+use crate::high_level::erased::{
+    ErasedConsumerState, ErasedReadCache, ErasedReaderBuildError, new_erased,
+};
 use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;
 use crate::state::descriptor::value_state;
@@ -144,6 +146,61 @@ fn erased_client_retains_consumer_failure_until_subscribe() -> Result<()> {
         subscribed,
         Err(HighLevelClientError::ConsumerConfiguration(_))
     ));
+    Ok(())
+}
+
+/// Every erased reader constructor validates its subsystem before touching
+/// storage. This keeps the four foreign-language APIs aligned at the shared
+/// boundary instead of relying on wrapper-specific validation.
+#[test]
+fn erased_reader_kinds_share_subsystem_validation() -> Result<()> {
+    let mut producer = ProducerConfiguration::builder();
+    producer.bootstrap_servers(vec!["unused-in-mock-mode:9092".to_owned()]);
+    let mut consumer = ConsumerConfiguration::builder();
+    consumer
+        .bootstrap_servers(vec!["unused-in-mock-mode:9092".to_owned()])
+        .group_id("erased-readers")
+        .subscribed_topics(&["test-topic".to_owned()])
+        .mock(true);
+    let consumers = ConsumerBuilders {
+        consumer,
+        ..ConsumerBuilders::new()?
+    };
+    let client =
+        new_erased::<NoOpHandler, JsonCodec>(Mode::Pipeline, &mut producer, &consumers, None)?;
+
+    TEST_RUNTIME.block_on(async {
+        let value = client
+            .value_state(
+                " ".to_owned(),
+                "value".to_owned(),
+                ErasedReadCache::default(),
+            )
+            .await;
+        let map = client
+            .map_state(String::new(), "map".to_owned(), ErasedReadCache::default())
+            .await;
+        let deque = client
+            .deque_state(
+                "\t".to_owned(),
+                "deque".to_owned(),
+                ErasedReadCache::default(),
+            )
+            .await;
+
+        assert!(matches!(
+            value,
+            Err(ErasedReaderBuildError::InvalidSubsystem(_))
+        ));
+        assert!(matches!(
+            map,
+            Err(ErasedReaderBuildError::InvalidSubsystem(_))
+        ));
+        assert!(matches!(
+            deque,
+            Err(ErasedReaderBuildError::InvalidSubsystem(_))
+        ));
+    });
     Ok(())
 }
 

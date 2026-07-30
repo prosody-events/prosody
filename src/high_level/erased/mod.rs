@@ -17,6 +17,14 @@ use std::error::Error as StdError;
 use std::sync::Arc;
 use thiserror::Error;
 
+mod readers;
+
+pub use readers::{
+    ErasedDequeReader, ErasedDirection, ErasedMapReader, ErasedReadCache, ErasedReaderBuildError,
+    ErasedStateStream, ErasedValueReader, SharedDequeReader, SharedMapReader, SharedStateStream,
+    SharedValueReader,
+};
+
 /// Consumer lifecycle state materialized across an FFI boundary.
 #[derive(Clone, Debug)]
 pub enum ErasedConsumerState<T> {
@@ -67,6 +75,27 @@ where
     async fn unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>>;
     /// Returns the current lifecycle state.
     async fn consumer_state(&self) -> ErasedConsumerState<T>;
+    /// Builds a read-only view of one published value collection.
+    async fn value_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedValueReader<C>, ErasedReaderBuildError<C::Error>>;
+    /// Builds a read-only view of one published string-keyed map collection.
+    async fn map_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedMapReader<C>, ErasedReaderBuildError<C::Error>>;
+    /// Builds a read-only view of one published deque collection.
+    async fn deque_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedDequeReader<C>, ErasedReaderBuildError<C::Error>>;
     /// Returns the assigned partition count.
     async fn assigned_partition_count(&self) -> u32;
     /// Reports whether any consumer heartbeat is stalled.
@@ -165,6 +194,33 @@ where
                 handler: handler.clone(),
             },
         }
+    }
+
+    async fn value_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedValueReader<C>, ErasedReaderBuildError<C::Error>> {
+        readers::value(&self.0, subsystem, name, cache).await
+    }
+
+    async fn map_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedMapReader<C>, ErasedReaderBuildError<C::Error>> {
+        readers::map(&self.0, subsystem, name, cache).await
+    }
+
+    async fn deque_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedDequeReader<C>, ErasedReaderBuildError<C::Error>> {
+        readers::deque(&self.0, subsystem, name, cache).await
     }
 
     async fn assigned_partition_count(&self) -> u32 {
