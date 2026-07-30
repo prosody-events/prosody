@@ -41,10 +41,14 @@ pub use crate::error::ErrorCategory;
 pub use crate::cassandra::config::CassandraConfigurationBuilder;
 /// Consumer bootstrap and subscription configuration.
 pub use crate::consumer::ConsumerConfiguration;
-/// Bundled consumer configuration builders passed to `HighLevelClient::new`.
+/// High-level client using Cassandra storage.
+pub use crate::high_level::CassandraHighLevelClient;
+/// Bundled consumer configuration builders passed to a client constructor.
 pub use crate::high_level::ConsumerBuilders;
 /// The combined producer + consumer client.
 pub use crate::high_level::HighLevelClient;
+/// High-level client using in-memory storage.
+pub use crate::high_level::MemoryHighLevelClient;
 /// Operational mode: `Pipeline`, `LowLatency`, or `BestEffort`.
 pub use crate::high_level::mode::Mode;
 /// Producer bootstrap and delivery configuration.

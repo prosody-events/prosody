@@ -18,53 +18,39 @@ use crate::test_util::TEST_RUNTIME;
 use crate::timers::Trigger;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
-use rdkafka::mocking::MockCluster;
-use rdkafka::producer::DefaultProducerContext;
 use serde_json::{Value, json};
 use std::convert::Infallible;
 
 struct ClientFixture<T> {
-    client: HighLevelClient<T, JsonCodec, MemoryClientBackend<JsonCodec>>,
-    _cluster: MockCluster<'static, DefaultProducerContext>,
+    client: MemoryHighLevelClient<T>,
 }
 
 /// Builds a mock-mode pipeline `HighLevelClient<T>`, ready to `register`
 /// (Configured) and `subscribe`/`unsubscribe`. Optionally overrides the
 /// producer's source system (default: derived from `group_id`).
 fn create_test_client<T>(group_id: &str, source_system: Option<&str>) -> Result<ClientFixture<T>> {
-    let cluster = MockCluster::<DefaultProducerContext>::new(1)?;
-    let bootstrap = cluster.bootstrap_servers();
-    cluster.create_topic("test-topic", 1, 1)?;
-
     let mut producer_builder = ProducerConfiguration::builder();
     producer_builder
-        .bootstrap_servers(vec![bootstrap.clone()])
-        .mock(true);
+        .bootstrap_servers(vec!["unused-in-mock-mode:9092".to_owned()])
+        .mock(false);
     if let Some(source) = source_system {
         producer_builder.source_system(source);
     }
 
     let mut consumer_builder = ConsumerConfiguration::builder();
     consumer_builder
-        .bootstrap_servers(vec![bootstrap])
+        .bootstrap_servers(vec!["unused-in-mock-mode:9092".to_owned()])
         .group_id(group_id)
         .subscribed_topics(&["test-topic".to_owned()])
-        .mock(true);
+        .mock(false);
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_builder,
         ..ConsumerBuilders::new()?
     };
-    let client = HighLevelClient::new(
-        MemoryClientBackend::new(),
-        Mode::Pipeline,
-        &mut producer_builder,
-        &consumer_builders,
-    )?;
-    Ok(ClientFixture {
-        client,
-        _cluster: cluster,
-    })
+    let client =
+        MemoryHighLevelClient::new(Mode::Pipeline, &mut producer_builder, &consumer_builders)?;
+    Ok(ClientFixture { client })
 }
 
 #[test]
@@ -76,6 +62,7 @@ fn test_source_system_defaults_to_consumer_group() -> Result<()> {
 
     // Verify that source_system() returns the consumer group_id
     assert_eq!(fixture.client.source_system(), group_id);
+    assert!(fixture.client.producer_config().mock);
     Ok(())
 }
 

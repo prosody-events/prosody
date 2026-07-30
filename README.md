@@ -122,11 +122,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..ConsumerBuilders::default()
     };
 
-    let client: HighLevelClient<MyHandler> = HighLevelClient::new(
+    let client: CassandraHighLevelClient<MyHandler> = CassandraHighLevelClient::new(
+        cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-        &cassandra_config,
     )?;
 
     client.subscribe(MyHandler).await?;

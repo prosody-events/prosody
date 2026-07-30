@@ -80,13 +80,6 @@ pub enum ConsumerError {
     /// Indicates a keyed-state initialization failure.
     #[error("Keyed-state initialization failed: {0:#}")]
     KeyedState(#[from] KeyedStateInitError),
-
-    /// The supplied [`SharedDeps`](crate::state_reader::SharedDeps) bundle's
-    /// backend does not match the consumer's storage backend (e.g. a memory
-    /// bundle for a Cassandra consumer). Unreachable when the bundle and the
-    /// consumer are composed from one configuration.
-    #[error("shared dependency bundle backend does not match the consumer's storage backend")]
-    SharedDepsBackendMismatch,
 }
 
 /// Errors raised while wiring the keyed-state layer into a pipeline

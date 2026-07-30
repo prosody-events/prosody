@@ -4,9 +4,8 @@ use crate::cassandra::CassandraStore;
 use crate::cassandra::config::CassandraConfiguration;
 use crate::codec::Codec;
 use crate::consumer::ConsumerConfiguration;
-use crate::consumer::storage::{StoreCreationError, StorePair, StorePairInputs};
+use crate::consumer::storage::{StatefulStorePair, StoreCreationError, StorePairInputs};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::{KafkaLoader, MemoryLoader};
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
@@ -86,7 +85,7 @@ where
         budget: u64,
     ) -> Self {
         Self::build(
-            ReaderComponents::new(cells, publications, identities, loader),
+            ReaderComponents::new(cells, publications, identities, loader, ()),
             ReaderCache::with_budget(budget),
             HeartbeatRegistry::new(group_id, stall_threshold),
         )
@@ -128,6 +127,7 @@ where
             CassandraPublicationStore::new(store.clone(), Arc::new(publications)),
             CassandraDescriptorIdentityStore::new(store, Arc::new(identities)),
             loader,
+            cassandra.clone(),
         );
         Ok(Self::build(
             backend,
@@ -194,41 +194,12 @@ where
 
     pub(crate) async fn build_store_pair(
         &self,
-        config: &TriggerStoreConfiguration,
         inputs: StorePairInputs,
-    ) -> Result<StorePair, StoreCreationError>
+    ) -> Result<StatefulStorePair<C>, StoreCreationError>
     where
         B: ConsumerReaderBackend<C>,
     {
-        self.backend.build_store_pair(config, inputs).await
-    }
-
-    pub(crate) fn memory_loader(&self) -> Option<MemoryLoader<C::Payload>>
-    where
-        B: ConsumerReaderBackend<C>,
-    {
-        self.backend.memory_loader()
-    }
-
-    pub(crate) fn memory_cells(&self) -> Option<MemoryCells>
-    where
-        B: ConsumerReaderBackend<C>,
-    {
-        self.backend.memory_cells()
-    }
-
-    pub(crate) fn memory_identities(&self) -> Option<MemoryDescriptorIdentityStore>
-    where
-        B: ConsumerReaderBackend<C>,
-    {
-        self.backend.memory_identities()
-    }
-
-    pub(crate) fn kafka_loader(&self) -> Option<KafkaLoader<C>>
-    where
-        B: ConsumerReaderBackend<C>,
-    {
-        self.backend.kafka_loader()
+        self.backend.build_store_pair(inputs).await
     }
 
     #[cfg(test)]

@@ -137,6 +137,7 @@ impl ReaderBackend for CassandraReaderBackend {
                 self.publications.clone(),
                 self.identities.clone(),
                 MemoryLoader::new(),
+                (),
             ),
             ReaderCache::with_budget(1 << 20),
         )

@@ -17,8 +17,8 @@ use prosody::{
     codec::JsonCodecError,
     consumer::{ConsumerConfigurationBuilder, ConsumerError},
     high_level::{
-        CassandraClientBackend, CassandraHighLevelClient, ConsumerBuilders, HighLevelClient,
-        HighLevelClientError, config::ModeConfigurationError, mode::Mode,
+        CassandraHighLevelClient, ConsumerBuilders, HighLevelClientError,
+        config::ModeConfigurationError, mode::Mode,
     },
     producer::ProducerConfigurationBuilder,
     telemetry::emitter::TelemetryEmitterConfiguration,
@@ -115,10 +115,10 @@ fn create_high_level_client(
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
 
-    HighLevelClient::new(
-        CassandraClientBackend::new(cassandra_builder.build().map_err(|error| {
+    CassandraHighLevelClient::new(
+        cassandra_builder.build().map_err(|error| {
             HighLevelClientError::ConsumerConfiguration(ModeConfigurationError::Cassandra(error))
-        })?),
+        })?,
         Mode::BestEffort,
         &mut producer_builder,
         &consumer_builders,

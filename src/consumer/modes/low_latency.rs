@@ -14,9 +14,7 @@ use crate::consumer::middleware::topic::FailureTopicMiddleware;
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::storage::StorePair;
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
-use crate::consumer::wiring::state::{
-    cassandra_loader, cassandra_state_provider, memory_arm_inputs, memory_state_provider,
-};
+use crate::consumer::wiring::state::{cassandra_state_provider, memory_state_provider};
 use crate::consumer::wiring::{build_common_middleware, build_shared_state};
 use crate::producer::ProsodyProducer;
 use crate::state_reader::ConsumerReaderBackend;
@@ -92,18 +90,18 @@ where
                 trigger_provider,
                 dedup_provider,
                 publication_store,
+                resources,
                 ..
             } => {
-                let (loader, cells, identities) = memory_arm_inputs(setup.deps.as_ref());
                 let publisher_template = keyed_state
                     .memory_publication_setup(publication_store)
                     .await?;
                 let state_provider = memory_state_provider::<C>(
                     &keyed_state,
                     dedup_provider.clone(),
-                    cells,
-                    identities,
-                    loader,
+                    resources.cells,
+                    resources.identities,
+                    resources.loader,
                     publisher_template,
                 );
                 let provider = build_common_middleware::<_, C::Payload>(
@@ -131,10 +129,9 @@ where
                 cell_store,
                 identity_store,
                 publication_store,
+                resources: loader,
                 ..
             } => {
-                let loader =
-                    cassandra_loader(setup.deps.as_ref(), setup.consumer, &services.heartbeats)?;
                 let publisher_template = keyed_state
                     .cassandra_publication_setup(publication_store, services.observer.clone())
                     .await?;

@@ -41,6 +41,7 @@ use thiserror::Error;
 ///
 /// Bundles all consumer-related configuration builders to reduce parameter
 /// count in `HighLevelClient::new`. Build a starting set with [`Self::new`].
+#[derive(Clone)]
 pub struct ConsumerBuilders {
     /// Consumer configuration builder.
     pub consumer: ConsumerConfigurationBuilder,

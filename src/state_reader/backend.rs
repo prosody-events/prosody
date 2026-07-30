@@ -1,9 +1,11 @@
 //! Concrete component families used by standalone readers.
 
+use crate::cassandra::config::CassandraConfiguration;
 use crate::codec::Codec;
-use crate::consumer::storage::{StoreCreationError, StorePair, StorePairInputs};
+use crate::consumer::storage::{
+    MemoryArmInputs, StatefulStorePair, StoreCreationError, StorePair, StorePairInputs,
+};
 use crate::error::ClassifyError;
-use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::{KafkaLoader, MemoryLoader, MessageLoader};
 use crate::state::cassandra::{
     CassandraCellResources, CassandraCellStoreError, CassandraDescriptorIdentityStore,
@@ -160,10 +162,7 @@ where
 }
 
 mod consumer {
-    use super::{
-        Codec, KafkaLoader, MemoryCells, MemoryDescriptorIdentityStore, MemoryLoader,
-        ReaderBackend, StoreCreationError, StorePair, StorePairInputs, TriggerStoreConfiguration,
-    };
+    use super::{Codec, ReaderBackend, StatefulStorePair, StoreCreationError, StorePairInputs};
 
     #[async_trait::async_trait]
     pub(crate) trait Backend<C>: ReaderBackend<C>
@@ -172,13 +171,8 @@ mod consumer {
     {
         async fn build_store_pair(
             &self,
-            config: &TriggerStoreConfiguration,
             inputs: StorePairInputs,
-        ) -> Result<StorePair, StoreCreationError>;
-        fn memory_loader(&self) -> Option<MemoryLoader<C::Payload>>;
-        fn memory_cells(&self) -> Option<MemoryCells>;
-        fn memory_identities(&self) -> Option<MemoryDescriptorIdentityStore>;
-        fn kafka_loader(&self) -> Option<KafkaLoader<C>>;
+        ) -> Result<StatefulStorePair<C>, StoreCreationError>;
     }
 }
 
@@ -198,33 +192,36 @@ where
 
 /// One concrete reader component family.
 #[derive(Clone)]
-pub struct ReaderComponents<C, S, P, I, L> {
+pub struct ReaderComponents<C, S, P, I, L, R = ()> {
     cells: S,
     publications: P,
     identities: I,
     loader: L,
+    consumer: R,
     codec: PhantomData<fn() -> C>,
 }
 
-impl<C, S, P, I, L> ReaderComponents<C, S, P, I, L> {
-    pub(crate) fn new(cells: S, publications: P, identities: I, loader: L) -> Self {
+impl<C, S, P, I, L, R> ReaderComponents<C, S, P, I, L, R> {
+    pub(crate) fn new(cells: S, publications: P, identities: I, loader: L, consumer: R) -> Self {
         Self {
             cells,
             publications,
             identities,
             loader,
+            consumer,
             codec: PhantomData,
         }
     }
 }
 
-impl<C, S, P, I, L> ReaderBackend<C> for ReaderComponents<C, S, P, I, L>
+impl<C, S, P, I, L, R> ReaderBackend<C> for ReaderComponents<C, S, P, I, L, R>
 where
     C: Codec,
     S: CommittedCellSource,
     P: PublicationStore,
     I: DescriptorIdentityStore,
     L: MessageLoader<Payload = C::Payload> + 'static,
+    R: Send + Sync + 'static,
 {
     type Cells = S;
     type Identities = I;
@@ -255,6 +252,7 @@ pub type CassandraReaderBackend<C> = ReaderComponents<
     CassandraPublicationStore,
     CassandraDescriptorIdentityStore,
     KafkaLoader<C>,
+    CassandraConfiguration,
 >;
 
 /// In-memory stores and loader.
@@ -264,6 +262,7 @@ pub type MemoryReaderBackend<C> = ReaderComponents<
     MemoryPublicationStore,
     MemoryDescriptorIdentityStore,
     MemoryLoader<<C as Codec>::Payload>,
+    (),
 >;
 
 #[async_trait]
@@ -274,37 +273,18 @@ where
 {
     async fn build_store_pair(
         &self,
-        config: &TriggerStoreConfiguration,
         inputs: StorePairInputs,
-    ) -> Result<StorePair, StoreCreationError> {
-        let TriggerStoreConfiguration::Cassandra(config) = config else {
-            return Err(StoreCreationError::BackendMismatch);
-        };
+    ) -> Result<StatefulStorePair<C>, StoreCreationError> {
         StorePair::cassandra_with(
-            config,
+            &self.consumer,
             inputs,
             self.cells().session.clone(),
             self.cells().clone(),
             self.identities().clone(),
             self.publications().clone(),
+            self.loader().clone(),
         )
         .await
-    }
-
-    fn memory_loader(&self) -> Option<MemoryLoader<C::Payload>> {
-        None
-    }
-
-    fn memory_cells(&self) -> Option<MemoryCells> {
-        None
-    }
-
-    fn memory_identities(&self) -> Option<MemoryDescriptorIdentityStore> {
-        None
-    }
-
-    fn kafka_loader(&self) -> Option<KafkaLoader<C>> {
-        Some(self.loader().clone())
     }
 }
 
@@ -316,33 +296,18 @@ where
 {
     async fn build_store_pair(
         &self,
-        config: &TriggerStoreConfiguration,
         inputs: StorePairInputs,
-    ) -> Result<StorePair, StoreCreationError> {
-        if !matches!(config, TriggerStoreConfiguration::InMemory) {
-            return Err(StoreCreationError::BackendMismatch);
-        }
+    ) -> Result<StatefulStorePair<C>, StoreCreationError> {
         StorePair::memory_with(
             inputs.dedup_ttl,
             inputs.timer_spans,
             self.publications().clone(),
+            MemoryArmInputs {
+                loader: self.loader().clone(),
+                cells: self.cells().clone(),
+                identities: self.identities().clone(),
+            },
         )
-    }
-
-    fn memory_loader(&self) -> Option<MemoryLoader<C::Payload>> {
-        Some(self.loader().clone())
-    }
-
-    fn memory_cells(&self) -> Option<MemoryCells> {
-        Some(self.cells().clone())
-    }
-
-    fn memory_identities(&self) -> Option<MemoryDescriptorIdentityStore> {
-        Some(self.identities().clone())
-    }
-
-    fn kafka_loader(&self) -> Option<KafkaLoader<C>> {
-        None
     }
 }
 
@@ -353,4 +318,5 @@ pub(crate) type ScriptedReaderBackend = ReaderComponents<
     ScriptedPublicationStore,
     CountingIdentityStore,
     MemoryLoader<serde_json::Value>,
+    (),
 >;

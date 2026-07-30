@@ -12,9 +12,7 @@ use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::config::CassandraConfigurationBuilder;
 use prosody::consumer::event_context::EventContext;
 use prosody::high_level::mode::Mode;
-use prosody::high_level::{
-    CassandraClientBackend, CassandraHighLevelClient, ConsumerBuilders, HighLevelClient,
-};
+use prosody::high_level::{CassandraHighLevelClient, ConsumerBuilders};
 use prosody::producer::ProducerConfigurationBuilder;
 use prosody::telemetry::TelemetryEmitterConfiguration;
 use prosody::tracing::init_test_logging;
@@ -480,8 +478,8 @@ fn build_inline_replacement_client(
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec!["localhost:9042".to_owned()]);
 
-    let client = HighLevelClient::new(
-        CassandraClientBackend::new(cassandra_builder.build()?),
+    let client = CassandraHighLevelClient::new(
+        cassandra_builder.build()?,
         Mode::Pipeline,
         &mut producer_builder,
         &consumer_builders,

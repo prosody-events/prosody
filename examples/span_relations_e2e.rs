@@ -26,7 +26,7 @@ use color_eyre::eyre::{Error, Result, eyre};
 use opentelemetry::trace::TraceContextExt as _;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::consumer::KeyedStateConfiguration;
-use prosody::high_level::CassandraClientBackend;
+use prosody::high_level::CassandraHighLevelClient;
 use prosody::otel::SpanRelation;
 use prosody::prelude::*;
 use prosody::state::descriptor::{
@@ -255,8 +255,8 @@ async fn main() -> Result<()> {
     };
 
     let (sender, mut receiver) = channel(keys * 2 + 4);
-    let client = HighLevelClient::<SpanProbe, JsonCodec, _>::new(
-        CassandraClientBackend::new(cassandra_config.build()?),
+    let client = CassandraHighLevelClient::<SpanProbe, JsonCodec>::new(
+        cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,

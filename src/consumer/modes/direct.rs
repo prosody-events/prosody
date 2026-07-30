@@ -83,7 +83,7 @@ where
         // no dedup/state middleware on this path the dedup store stays inert and
         // its oracle is never consulted — an empty registry stages nothing — so a
         // minimal cache capacity is sufficient.
-        let stores = StorePair::new(
+        let stores = StorePair::new_stateless(
             trigger_store_config,
             consumer_config.mock,
             Duration::default(),

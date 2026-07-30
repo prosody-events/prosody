@@ -67,7 +67,7 @@ pub(super) async fn initialize_with(
 ) -> Result<Result<ProsodyConsumer<JsonCodec>, ConsumerError>> {
     let telemetry = Telemetry::new();
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
-    let stores = StorePair::new(
+    let stores = StorePair::new_stateless(
         &TriggerStoreConfiguration::InMemory,
         config.mock,
         Duration::default(),

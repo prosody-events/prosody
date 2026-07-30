@@ -2,11 +2,11 @@
 
 use crate::cassandra::config::CassandraConfiguration;
 use crate::consumer::middleware::FallibleHandler;
-use crate::high_level::config::ModeConfiguration;
+use crate::high_level::config::{ModeConfiguration, ModeConfigurationError};
 use crate::high_level::state::ConsumerState;
 use crate::high_level::{
-    CassandraClientBackend, ClientBackend, ConsumerBuilders, HighLevelClient, HighLevelClientError,
-    MemoryClientBackend, Mode,
+    CassandraClientBackend, CassandraHighLevelClient, ClientBackend, ConsumerBuilders,
+    HighLevelClient, HighLevelClientError, MemoryClientBackend, MemoryHighLevelClient, Mode,
 };
 use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder};
 use crate::{Codec, EventIdentity, EventType, Topic};
@@ -89,7 +89,6 @@ pub type SharedHighLevelClient<T, C> = Arc<dyn ErasedHighLevelClient<T, C>>;
 /// no Cassandra configuration. Other construction failures retain the
 /// structured high-level error as their source.
 pub fn new_erased<T, C>(
-    mock: bool,
     mode: Mode,
     producer: &mut ProducerConfigurationBuilder,
     consumers: &ConsumerBuilders,
@@ -100,20 +99,21 @@ where
     C: Codec + Send + Sync,
     C::Payload: EventIdentity + EventType + Clone,
 {
+    let mock = consumers
+        .consumer
+        .build()
+        .map_err(ModeConfigurationError::Consumer)
+        .map_err(HighLevelClientError::ConsumerConfiguration)?
+        .mock;
+
     if mock {
-        Ok(Arc::new(ErasedClient(HighLevelClient::new(
-            MemoryClientBackend::new(),
-            mode,
-            producer,
-            consumers,
+        Ok(Arc::new(ErasedClient(MemoryHighLevelClient::new(
+            mode, producer, consumers,
         )?)))
     } else {
         let cassandra = cassandra.ok_or(ErasedClientBuildError::MissingCassandra)?;
-        Ok(Arc::new(ErasedClient(HighLevelClient::new(
-            CassandraClientBackend::new(cassandra),
-            mode,
-            producer,
-            consumers,
+        Ok(Arc::new(ErasedClient(CassandraHighLevelClient::new(
+            cassandra, mode, producer, consumers,
         )?)))
     }
 }

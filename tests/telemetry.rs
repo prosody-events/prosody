@@ -14,9 +14,7 @@ use prosody::consumer::middleware::FallibleHandler;
 use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
 use prosody::consumer::{ConsumerConfigurationBuilder, DemandType, Keyed};
 use prosody::high_level::mode::Mode;
-use prosody::high_level::{
-    CassandraClientBackend, CassandraHighLevelClient, ConsumerBuilders, HighLevelClient,
-};
+use prosody::high_level::{CassandraHighLevelClient, ConsumerBuilders};
 use prosody::producer::ProducerConfigurationBuilder;
 use prosody::telemetry::TelemetryEmitterConfiguration;
 use prosody::timers::TimerType;
@@ -811,8 +809,8 @@ fn build_client_with<T: FallibleHandler>(
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
 
-    let client = HighLevelClient::new(
-        CassandraClientBackend::new(cassandra_builder.build()?),
+    let client = CassandraHighLevelClient::new(
+        cassandra_builder.build()?,
         mode,
         &mut producer_builder,
         &consumer_builders,

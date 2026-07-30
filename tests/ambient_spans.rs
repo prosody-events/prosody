@@ -16,7 +16,7 @@
 
 use color_eyre::eyre::{Result, eyre};
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
-use prosody::high_level::CassandraClientBackend;
+use prosody::high_level::CassandraHighLevelClient;
 use prosody::prelude::*;
 use prosody::timers::duration::CompactDuration;
 use prosody::{JsonCodec, Topic};
@@ -120,8 +120,8 @@ async fn handlers_run_inside_their_event_spans() -> Result<()> {
     };
 
     let (sender, mut receiver) = channel(4);
-    let client = HighLevelClient::<AmbientProbe, JsonCodec, _>::new(
-        CassandraClientBackend::new(cassandra_config.build()?),
+    let client = CassandraHighLevelClient::<AmbientProbe, JsonCodec>::new(
+        cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,

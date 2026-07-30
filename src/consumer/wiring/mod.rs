@@ -19,7 +19,7 @@ use crate::consumer::middleware::telemetry::TelemetryMiddleware;
 use crate::consumer::middleware::timeout::TimeoutMiddleware;
 use crate::consumer::middleware::{ComposedMiddleware, HandlerMiddleware};
 use crate::consumer::observer::KafkaObserver;
-use crate::consumer::storage::{StorePair, StorePairInputs};
+use crate::consumer::storage::{StatefulStorePair, StorePair, StorePairInputs};
 use crate::consumer::wiring::state::KeyedStateInputs;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::state_reader::ConsumerReaderBackend;
@@ -51,8 +51,8 @@ pub(in crate::consumer) type CommonMiddleware<DP, P> = ComposedMiddleware<
 >;
 
 /// What [`build_shared_state`] returns; see its doc.
-pub(in crate::consumer) type SharedState = (
-    StorePair,
+pub(in crate::consumer) type SharedState<C> = (
+    StatefulStorePair<C>,
     KeyedStateInputs,
     HeartbeatRegistry,
     KafkaObserver,
@@ -72,7 +72,7 @@ pub(in crate::consumer) type SharedState = (
 /// invariant chokepoint; this early validation is the fail-fast guard.
 pub(in crate::consumer) async fn build_shared_state<C, B>(
     setup: &ConsumerSetup<'_, C, B>,
-) -> Result<SharedState, ConsumerError>
+) -> Result<SharedState<C>, ConsumerError>
 where
     C: Codec,
     C::Payload: Clone,
@@ -122,11 +122,12 @@ where
         timer_spans: consumer_config.timer_spans,
     };
     let stores = match deps {
-        Some(deps) => deps.build_store_pair(trigger_store_config, inputs).await?,
+        Some(deps) => deps.build_store_pair(inputs).await?,
         None => {
             StorePair::new(
                 trigger_store_config,
-                consumer_config.mock,
+                consumer_config,
+                &heartbeats,
                 inputs.dedup_ttl,
                 inputs.dedup_cache_capacity,
                 inputs.timer_spans,

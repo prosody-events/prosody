@@ -6,10 +6,8 @@ use crate::consumer::error::{ConsumerError, KeyedStateInitError};
 use crate::consumer::middleware::deduplication::{
     CassandraDeduplicationStoreProvider, MemoryDeduplicationStoreProvider,
 };
-use crate::consumer::middleware::defer::DeferInitError;
 use crate::consumer::observer::KafkaObserver;
 use crate::error::ClassifyError;
-use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::{KafkaLoader, MemoryLoader};
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
@@ -24,14 +22,11 @@ use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPub
 use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendFactory};
 use crate::state::publication::PublicationStore;
 use crate::state::registry::CollectionDefRegistry;
-use crate::state_reader::{ConsumerReaderBackend, PartitionCount, SharedDeps};
+use crate::state_reader::PartitionCount;
 use crate::timers::duration::CompactDuration;
 use crate::{Codec, ConsumerGroup, EventIdentity, EventType};
 use std::fs;
 use std::sync::Arc;
-
-/// What [`memory_arm_inputs`] returns: `(loader, cells, identities)`.
-type MemoryArmInputs<P> = (MemoryLoader<P>, MemoryCells, MemoryDescriptorIdentityStore);
 
 /// Keyed-state wiring inputs shared by every mode's storage branches.
 pub(in crate::consumer) struct KeyedStateInputs {
@@ -198,60 +193,6 @@ where
         publisher_template,
     );
     keyed_state.provider(backend, loader)
-}
-
-/// The memory cell and identity stores backing the state provider. Returns the
-/// shared bundle's stores when one is supplied, so a reader built from the same
-/// bundle sees this consumer's committed writes. Otherwise returns fresh
-/// stores.
-///
-/// A Cassandra bundle cannot back a memory arm. The composition derives both
-/// from one config, so this mismatch is reported as
-/// [`ConsumerError::SharedDepsBackendMismatch`]. See [`cassandra_loader`] for
-/// the mirror.
-/// The memory-arm inputs a consumer resolves from an optional shared bundle.
-/// These come from the bundle when one is supplied, so a reader built from the
-/// same bundle sees this consumer's committed writes. Otherwise they are fresh
-/// mock defaults.
-pub(in crate::consumer) fn memory_arm_inputs<C, B>(
-    deps: Option<&SharedDeps<C, B>>,
-) -> MemoryArmInputs<C::Payload>
-where
-    C: Codec,
-    C::Payload: Clone,
-    B: ConsumerReaderBackend<C>,
-{
-    let loader = deps.and_then(SharedDeps::memory_loader).unwrap_or_default();
-    let cells = deps.and_then(SharedDeps::memory_cells).unwrap_or_default();
-    let identities = deps
-        .and_then(SharedDeps::memory_identities)
-        .unwrap_or_default();
-    (loader, cells, identities)
-}
-
-/// The Cassandra-arm input a consumer resolves from an optional shared bundle:
-/// the Kafka loader. A supplied bundle's `Clone` shares the client and poll
-/// thread. Otherwise the loader is freshly built.
-///
-/// A memory bundle cannot back a Cassandra arm. That mismatch is reported as
-/// [`ConsumerError::SharedDepsBackendMismatch`].
-pub(in crate::consumer) fn cassandra_loader<C, B>(
-    deps: Option<&SharedDeps<C, B>>,
-    consumer_config: &ConsumerConfiguration,
-    heartbeats: &HeartbeatRegistry,
-) -> Result<KafkaLoader<C>, ConsumerError>
-where
-    C: Codec,
-    C::Payload: Clone,
-    B: ConsumerReaderBackend<C>,
-{
-    match deps {
-        Some(deps) => deps
-            .kafka_loader()
-            .ok_or(ConsumerError::SharedDepsBackendMismatch),
-        None => KafkaLoader::<C>::for_consumer(consumer_config, heartbeats)
-            .map_err(|error| ConsumerError::from(DeferInitError::from(error))),
-    }
 }
 
 /// Builds the keyed-state provider for a

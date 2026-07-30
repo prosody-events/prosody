@@ -8,6 +8,7 @@
 use crate::cassandra::CassandraStore;
 use crate::cassandra::config::CassandraConfiguration;
 use crate::cassandra::errors::CassandraStoreError;
+use crate::consumer::ConsumerConfiguration;
 use crate::consumer::middleware::deduplication::cassandra::CassandraDeduplicationStoreProvider;
 use crate::consumer::middleware::deduplication::memory::MemoryDeduplicationStoreProvider;
 use crate::consumer::middleware::deduplication::queries::DeduplicationQueries;
@@ -21,12 +22,14 @@ use crate::consumer::middleware::defer::timer::store::cassandra::queries::Querie
 use crate::consumer::middleware::defer::timer::store::{
     CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider,
 };
+use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
+use crate::loader::{KafkaLoader, KafkaLoaderError, MemoryLoader};
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
     CellQueries, IdentityQueries, PublicationQueries,
 };
-use crate::state::memory::MemoryPublicationStore;
+use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::timers::store::cassandra::{CassandraTriggerStoreError, CassandraTriggerStoreProvider};
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use std::num::NonZeroUsize;
@@ -36,6 +39,7 @@ use thiserror::Error;
 use tokio::try_join;
 use tracing::debug;
 
+use crate::Codec;
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::otel::SpanRelation;
 
@@ -44,8 +48,7 @@ use crate::otel::SpanRelation;
 /// This enum ensures that trigger and defer stores always use matching
 /// storage types, making mismatched stores unrepresentable in the type system.
 /// The crate-internal `StorePair::new` constructs it.
-#[derive(Clone)]
-pub(crate) enum StorePair {
+pub(crate) enum StorePair<M, K> {
     /// All stores use in-memory storage.
     Memory {
         /// Trigger store provider (Memory) — creates per-partition stores.
@@ -58,6 +61,8 @@ pub(crate) enum StorePair {
         dedup_provider: MemoryDeduplicationStoreProvider,
         /// Keyed-state routing-only publication store (Memory).
         publication_store: MemoryPublicationStore,
+        /// Resources consumed by this mode's memory arm.
+        resources: M,
     },
     /// All stores use Cassandra storage with a shared session.
     Cassandra {
@@ -78,8 +83,19 @@ pub(crate) enum StorePair {
         identity_store: CassandraDescriptorIdentityStore,
         /// Keyed-state routing-only publication store sharing the same session.
         publication_store: CassandraPublicationStore,
+        /// Resources consumed by this mode's Cassandra arm.
+        resources: K,
     },
 }
+
+pub(crate) struct MemoryArmInputs<P> {
+    pub(crate) loader: MemoryLoader<P>,
+    pub(crate) cells: MemoryCells,
+    pub(crate) identities: MemoryDescriptorIdentityStore,
+}
+
+pub(crate) type StatefulStorePair<C> =
+    StorePair<MemoryArmInputs<<C as Codec>::Payload>, KafkaLoader<C>>;
 
 #[derive(Clone, Copy)]
 pub(crate) struct StorePairInputs {
@@ -88,7 +104,11 @@ pub(crate) struct StorePairInputs {
     pub(crate) timer_spans: SpanRelation,
 }
 
-impl StorePair {
+impl<C> StatefulStorePair<C>
+where
+    C: Codec,
+    C::Payload: Clone,
+{
     /// Creates both trigger and defer store providers atomically.
     ///
     /// This is an atomic operation - both stores are created or the operation
@@ -102,6 +122,84 @@ impl StorePair {
     /// Returns error if store initialization fails.
     pub(crate) async fn new(
         config: &TriggerStoreConfiguration,
+        consumer: &ConsumerConfiguration,
+        heartbeats: &HeartbeatRegistry,
+        dedup_ttl: Duration,
+        dedup_cache_capacity: NonZeroUsize,
+        timer_spans: SpanRelation,
+    ) -> Result<Self, StoreCreationError> {
+        dedup_ttl_seconds(dedup_ttl)?;
+        match (consumer.mock, config) {
+            (true, _) | (false, TriggerStoreConfiguration::InMemory) => Ok(Self::memory(
+                timer_spans,
+                MemoryPublicationStore::new(),
+                MemoryArmInputs {
+                    loader: MemoryLoader::new(),
+                    cells: MemoryCells::new(),
+                    identities: MemoryDescriptorIdentityStore::new(),
+                },
+            )),
+            (false, TriggerStoreConfiguration::Cassandra(config)) => {
+                let store = CassandraStore::new(config).await?;
+                let keyspace = &config.keyspace;
+                let (cells, identities, publications) = try_join!(
+                    CellQueries::new(store.session(), keyspace),
+                    IdentityQueries::new(store.session(), keyspace),
+                    PublicationQueries::new(store.session(), keyspace),
+                )?;
+                Self::cassandra(
+                    store.clone(),
+                    keyspace,
+                    StorePairInputs {
+                        dedup_ttl,
+                        dedup_cache_capacity,
+                        timer_spans,
+                    },
+                    CassandraCellResources::new(store.clone(), Arc::new(cells)),
+                    CassandraDescriptorIdentityStore::new(store.clone(), Arc::new(identities)),
+                    CassandraPublicationStore::new(store, Arc::new(publications)),
+                    KafkaLoader::for_consumer(consumer, heartbeats)?,
+                )
+                .await
+            }
+        }
+    }
+
+    pub(crate) fn memory_with(
+        dedup_ttl: Duration,
+        timer_spans: SpanRelation,
+        publications: MemoryPublicationStore,
+        resources: MemoryArmInputs<C::Payload>,
+    ) -> Result<Self, StoreCreationError> {
+        dedup_ttl_seconds(dedup_ttl)?;
+        Ok(Self::memory(timer_spans, publications, resources))
+    }
+
+    pub(crate) async fn cassandra_with(
+        config: &CassandraConfiguration,
+        inputs: StorePairInputs,
+        store: CassandraStore,
+        cells: CassandraCellResources,
+        identities: CassandraDescriptorIdentityStore,
+        publications: CassandraPublicationStore,
+        resources: KafkaLoader<C>,
+    ) -> Result<Self, StoreCreationError> {
+        Self::cassandra(
+            store,
+            &config.keyspace,
+            inputs,
+            cells,
+            identities,
+            publications,
+            resources,
+        )
+        .await
+    }
+}
+
+impl StorePair<(), ()> {
+    pub(crate) async fn new_stateless(
+        config: &TriggerStoreConfiguration,
         mock: bool,
         dedup_ttl: Duration,
         dedup_cache_capacity: NonZeroUsize,
@@ -110,7 +208,7 @@ impl StorePair {
         dedup_ttl_seconds(dedup_ttl)?;
         match (mock, config) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
-                Ok(Self::memory(timer_spans, MemoryPublicationStore::new()))
+                Ok(Self::memory(timer_spans, MemoryPublicationStore::new(), ()))
             }
             (false, TriggerStoreConfiguration::Cassandra(config)) => {
                 let store = CassandraStore::new(config).await?;
@@ -131,47 +229,27 @@ impl StorePair {
                     CassandraCellResources::new(store.clone(), Arc::new(cells)),
                     CassandraDescriptorIdentityStore::new(store.clone(), Arc::new(identities)),
                     CassandraPublicationStore::new(store, Arc::new(publications)),
+                    (),
                 )
                 .await
             }
         }
     }
+}
 
-    pub(crate) fn memory_with(
-        dedup_ttl: Duration,
+impl<M, K> StorePair<M, K> {
+    fn memory(
         timer_spans: SpanRelation,
-        publications: MemoryPublicationStore,
-    ) -> Result<Self, StoreCreationError> {
-        dedup_ttl_seconds(dedup_ttl)?;
-        Ok(Self::memory(timer_spans, publications))
-    }
-
-    pub(crate) async fn cassandra_with(
-        config: &CassandraConfiguration,
-        inputs: StorePairInputs,
-        store: CassandraStore,
-        cells: CassandraCellResources,
-        identities: CassandraDescriptorIdentityStore,
-        publications: CassandraPublicationStore,
-    ) -> Result<Self, StoreCreationError> {
-        Self::cassandra(
-            store,
-            &config.keyspace,
-            inputs,
-            cells,
-            identities,
-            publications,
-        )
-        .await
-    }
-
-    fn memory(timer_spans: SpanRelation, publication_store: MemoryPublicationStore) -> Self {
+        publication_store: MemoryPublicationStore,
+        resources: M,
+    ) -> Self {
         Self::Memory {
             trigger_provider: InMemoryTriggerStoreProvider::new(),
             message_provider: MemoryMessageDeferStoreProvider::new(),
             timer_provider: MemoryTimerDeferStoreProvider::with_linking(timer_spans),
             dedup_provider: MemoryDeduplicationStoreProvider::new(),
             publication_store,
+            resources,
         }
     }
 
@@ -182,6 +260,7 @@ impl StorePair {
         cell_store: CassandraCellResources,
         identity_store: CassandraDescriptorIdentityStore,
         publication_store: CassandraPublicationStore,
+        resources: K,
     ) -> Result<Self, StoreCreationError> {
         let trigger_provider =
             CassandraTriggerStoreProvider::with_store(store.clone(), keyspace).await?;
@@ -217,6 +296,7 @@ impl StorePair {
             cell_store,
             identity_store,
             publication_store,
+            resources,
         })
     }
 }
@@ -239,9 +319,6 @@ fn dedup_ttl_seconds(ttl: Duration) -> Result<i32, StoreCreationError> {
 /// Errors that can occur during store pair creation.
 #[derive(Debug, Error)]
 pub enum StoreCreationError {
-    /// The supplied reader family disagrees with the storage configuration.
-    #[error("reader backend does not match the consumer storage configuration")]
-    BackendMismatch,
     /// Failed to create trigger store.
     #[error("failed to create trigger store: {0:#}")]
     TriggerStore(Box<CassandraTriggerStoreError>),
@@ -255,6 +332,10 @@ pub enum StoreCreationError {
     /// Failed to create segment store.
     #[error("failed to create segment store: {0:#}")]
     SegmentStore(Box<CassandraDeferStoreError>),
+
+    /// Failed to create the Kafka message loader.
+    #[error("failed to create message loader: {0:#}")]
+    Loader(#[from] KafkaLoaderError),
 
     /// Deduplication TTL exceeds Cassandra's maximum.
     #[error("deduplication TTL {0} seconds exceeds Cassandra maximum of 630,720,000 seconds")]

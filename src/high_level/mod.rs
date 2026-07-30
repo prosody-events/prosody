@@ -11,20 +11,18 @@ use crate::consumer::{
     LowLatencyMiddlewareConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
 pub use crate::high_level::config::ConsumerBuilders;
-use crate::high_level::config::{ModeConfiguration, ModeConfigurationBuildParams};
+use crate::high_level::config::ModeConfiguration;
 pub use crate::high_level::error::HighLevelClientError;
 pub use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
-use crate::high_level::topics::missing_topics;
-use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder, ProsodyProducer};
-use crate::propagator::new_propagator;
+use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state_reader::ConsumerReaderBackend;
 #[cfg(test)]
 use crate::state_reader::SharedDeps;
 use crate::state_reader::StateReader;
 use crate::subsystem::SubsystemName;
-use crate::telemetry::{Telemetry, spawn_telemetry_emitter};
+use crate::telemetry::Telemetry;
 use crate::{Codec, Topic};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
@@ -34,6 +32,7 @@ use tracing::info;
 
 mod backend;
 pub mod config;
+mod construction;
 mod deps;
 pub mod erased;
 mod error;
@@ -114,78 +113,6 @@ where
     /// Returns a reference to the shared telemetry instance.
     pub fn telemetry(&self) -> &Telemetry {
         &self.telemetry
-    }
-
-    /// Creates a new `HighLevelClient` with the specified configurations.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `HighLevelClientError` if:
-    /// - Any of the configuration builds fail.
-    /// - Producer initialization fails.
-    /// - Required topics are not found.
-    /// - The telemetry emitter cannot be started.
-    pub fn new(
-        backend: B,
-        mode: Mode,
-        producer_builder: &mut ProducerConfigurationBuilder,
-        consumer_builders: &ConsumerBuilders,
-    ) -> Result<Self, HighLevelClientError<C::Error>> {
-        // Set the producer source system to the consumer group if unspecified
-        if let (None, Some(group_id)) = (
-            producer_builder.configured_source_system(),
-            consumer_builders.consumer.configured_consumer_group(),
-        ) {
-            producer_builder.source_system(group_id);
-        }
-
-        let producer_config = producer_builder.build()?;
-        let cloned_config = producer_config.clone();
-        let telemetry = Telemetry::new();
-        let producer: ProsodyProducer<C> = match mode {
-            Mode::Pipeline => ProsodyProducer::pipeline_producer(cloned_config, telemetry.sender()),
-            Mode::LowLatency => {
-                ProsodyProducer::low_latency_producer(cloned_config, telemetry.sender())
-            }
-            Mode::BestEffort => {
-                ProsodyProducer::best_effort_producer(cloned_config, telemetry.sender())
-            }
-        }?;
-
-        // Mock mode is offline: the emitter opens no real broker connection
-        // (just as the topic check below is skipped). The returned spawn flag is
-        // unused here.
-        spawn_telemetry_emitter(
-            &consumer_builders.emitter,
-            &producer_config.bootstrap_servers,
-            &telemetry,
-            producer_config.mock,
-        )?;
-
-        let consumer_state = ConsumerState::build(&ModeConfigurationBuildParams {
-            mode,
-            consumer_builders,
-        });
-
-        // Only a configured consumer has topics to check, and only a live client
-        // can ask the cluster about them.
-        if !producer_config.mock
-            && let ConsumerState::Configured { config, .. } = &consumer_state
-        {
-            let missing = missing_topics(&producer, config.configured_topics())?;
-            if !missing.is_empty() {
-                return Err(HighLevelClientError::TopicsNotFound(missing));
-            }
-        }
-
-        Ok(Self {
-            producer,
-            producer_config,
-            consumer: Mutex::new(consumer_state),
-            backend,
-            propagator: new_propagator(),
-            telemetry,
-        })
     }
 
     /// Sends a message to the specified topic.

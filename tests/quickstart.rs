@@ -11,7 +11,7 @@
 
 use color_eyre::eyre::{Result, eyre};
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
-use prosody::high_level::CassandraClientBackend;
+use prosody::high_level::CassandraHighLevelClient;
 use prosody::prelude::*;
 use prosody::tracing::init_test_logging;
 use prosody::{JsonCodec, Topic};
@@ -99,8 +99,8 @@ async fn quickstart() -> Result<()> {
 
     let (sender, mut receiver) = channel(1);
 
-    let client = HighLevelClient::<MyHandler, JsonCodec, _>::new(
-        CassandraClientBackend::new(cassandra_config.build()?),
+    let client = CassandraHighLevelClient::<MyHandler, JsonCodec>::new(
+        cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,

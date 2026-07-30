@@ -16,11 +16,10 @@ use crate::consumer::middleware::monopolization::MonopolizationMiddleware;
 use crate::consumer::middleware::retry::RetryMiddleware;
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::observer::KafkaObserver;
-use crate::consumer::storage::StorePair;
+use crate::consumer::storage::{StatefulStorePair, StorePair};
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::state::{
-    KeyedStateInputs, cassandra_loader, cassandra_state_provider, memory_arm_inputs,
-    memory_state_provider,
+    KeyedStateInputs, cassandra_state_provider, memory_state_provider,
 };
 use crate::consumer::wiring::{build_common_middleware, build_shared_state};
 use crate::heartbeat::HeartbeatRegistry;
@@ -125,7 +124,14 @@ async fn prepare_pipeline_stack<C, B>(
     setup: &ConsumerSetup<'_, C, B>,
     pipeline_config: PipelineMiddlewareConfiguration,
     telemetry: Telemetry,
-) -> Result<(StorePair, KeyedStateInputs, PipelineMiddlewareStack), ConsumerError>
+) -> Result<
+    (
+        StatefulStorePair<C>,
+        KeyedStateInputs,
+        PipelineMiddlewareStack,
+    ),
+    ConsumerError,
+>
 where
     C: Codec,
     C::Payload: Clone,
@@ -202,8 +208,6 @@ where
     {
         let (stores, keyed_state, stack) =
             prepare_pipeline_stack(&setup, pipeline_config, telemetry).await?;
-        let deps = setup.deps;
-
         match stores {
             StorePair::Memory {
                 trigger_provider,
@@ -211,16 +215,17 @@ where
                 timer_provider,
                 dedup_provider,
                 publication_store,
+                resources,
             } => {
-                let (loader, cells, identities) = memory_arm_inputs(deps.as_ref());
+                let loader = resources.loader;
                 let publisher_template = keyed_state
                     .memory_publication_setup(publication_store)
                     .await?;
                 let state_provider = memory_state_provider::<C>(
                     &keyed_state,
                     dedup_provider.clone(),
-                    cells,
-                    identities,
+                    resources.cells,
+                    resources.identities,
                     loader.clone(),
                     publisher_template,
                 );
@@ -252,9 +257,8 @@ where
                 cell_store,
                 identity_store,
                 publication_store,
+                resources: loader,
             } => {
-                let loader =
-                    cassandra_loader(deps.as_ref(), &stack.consumer_config, &stack.heartbeats)?;
                 let publisher_template = keyed_state
                     .cassandra_publication_setup(publication_store, stack.observer.clone())
                     .await?;
