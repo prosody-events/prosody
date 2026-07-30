@@ -300,7 +300,7 @@ enum CursorInner<Item> {
 
 impl<Item> StateCursor<Item> {
     /// Wraps an erased typed stream as a fresh, open cursor.
-    fn new(stream: BoxStream<'static, Result<Item, ErasedStateError>>) -> Self {
+    pub(crate) fn new(stream: BoxStream<'static, Result<Item, ErasedStateError>>) -> Self {
         Self {
             inner: Mutex::new(CursorInner::Open(stream)),
         }

@@ -3,6 +3,7 @@
 use crate::EventIdentity;
 use crate::Key;
 use crate::codec::Codec;
+use crate::consumer::event_context::{BoxStateCursor, ErasedStateError, StateCursor};
 use crate::high_level::{ClientBackend, HighLevelClient, HighLevelClientError};
 use crate::state::ReadCachePolicy;
 use crate::state::cell_key::Direction;
@@ -14,12 +15,10 @@ use crate::state::order_codec::Utf8KeyCodec;
 use crate::state_reader::{ConsumerReaderBackend, ReaderBackend, StateReader, StateReaderError};
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use async_trait::async_trait;
-use futures::{Stream, StreamExt};
-use std::pin::Pin;
+use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::Mutex;
 
 /// Cache policy accepted by foreign-language published-state readers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -62,16 +61,6 @@ impl From<ErasedDirection> for Direction {
     }
 }
 
-/// One asynchronous read-only state stream.
-#[async_trait]
-pub trait ErasedStateStream<T>: Send + Sync {
-    /// Returns the next item, or `None` after the stream ends.
-    async fn next(&self) -> Option<Result<T, StateReaderError>>;
-}
-
-/// Shared stream representation stored by native FFI wrappers.
-pub type SharedStateStream<T> = Arc<dyn ErasedStateStream<T>>;
-
 /// Read-only access to a published value collection.
 #[async_trait]
 pub trait ErasedValueReader<C: Codec>: Send + Sync {
@@ -104,7 +93,7 @@ pub trait ErasedMapReader<C: Codec>: Send + Sync {
         &self,
         key: String,
         direction: ErasedDirection,
-    ) -> Result<SharedStateStream<(String, C::Payload)>, StateReaderError>;
+    ) -> Result<BoxStateCursor<(String, C::Payload)>, StateReaderError>;
 }
 
 /// Shared map-reader representation stored by native FFI wrappers.
@@ -124,7 +113,7 @@ pub trait ErasedDequeReader<C: Codec>: Send + Sync {
         &self,
         key: String,
         direction: ErasedDirection,
-    ) -> Result<SharedStateStream<C::Payload>, StateReaderError>;
+    ) -> Result<BoxStateCursor<C::Payload>, StateReaderError>;
 }
 
 /// Shared deque-reader representation stored by native FFI wrappers.
@@ -239,9 +228,9 @@ where
         &self,
         key: String,
         direction: ErasedDirection,
-    ) -> Result<SharedStateStream<(String, C::Payload)>, StateReaderError> {
+    ) -> Result<BoxStateCursor<(String, C::Payload)>, StateReaderError> {
         let stream = self.0.stream(Key::from(key), direction.into()).await?;
-        Ok(StateStream::new(stream))
+        Ok(state_cursor(stream))
     }
 }
 
@@ -266,25 +255,17 @@ where
         &self,
         key: String,
         direction: ErasedDirection,
-    ) -> Result<SharedStateStream<C::Payload>, StateReaderError> {
+    ) -> Result<BoxStateCursor<C::Payload>, StateReaderError> {
         let stream = self.0.stream(Key::from(key), direction.into()).await?;
-        Ok(StateStream::new(stream))
+        Ok(state_cursor(stream))
     }
 }
 
-type BoxStateStream<T> = Pin<Box<dyn Stream<Item = Result<T, StateReaderError>> + Send + 'static>>;
-
-struct StateStream<T>(Mutex<BoxStateStream<T>>);
-
-impl<T> StateStream<T> {
-    fn new(stream: impl Stream<Item = Result<T, StateReaderError>> + Send + 'static) -> Arc<Self> {
-        Arc::new(Self(Mutex::new(Box::pin(stream))))
-    }
-}
-
-#[async_trait]
-impl<T: Send + 'static> ErasedStateStream<T> for StateStream<T> {
-    async fn next(&self) -> Option<Result<T, StateReaderError>> {
-        self.0.lock().await.next().await
-    }
+fn state_cursor<T>(
+    stream: impl futures::Stream<Item = Result<T, StateReaderError>> + Send + 'static,
+) -> BoxStateCursor<T> {
+    let stream = stream
+        .map_err(|error| ErasedStateError::from_classified(&error))
+        .boxed();
+    Box::new(StateCursor::new(stream))
 }

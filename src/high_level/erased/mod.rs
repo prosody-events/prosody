@@ -21,8 +21,7 @@ mod readers;
 
 pub use readers::{
     ErasedDequeReader, ErasedDirection, ErasedMapReader, ErasedReadCache, ErasedReaderBuildError,
-    ErasedStateStream, ErasedValueReader, SharedDequeReader, SharedMapReader, SharedStateStream,
-    SharedValueReader,
+    ErasedValueReader, SharedDequeReader, SharedMapReader, SharedValueReader,
 };
 
 /// Consumer lifecycle state materialized across an FFI boundary.
