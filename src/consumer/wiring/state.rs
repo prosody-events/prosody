@@ -44,6 +44,7 @@ pub(crate) struct KeyedStateInputs {
     group: ConsumerGroup,
     pub(in crate::consumer) version: Arc<str>,
     registry: Arc<CollectionDefRegistry>,
+    mock: bool,
 }
 
 impl KeyedStateInputs {
@@ -65,6 +66,7 @@ impl KeyedStateInputs {
             group: Arc::from(consumer_config.group_id.as_str()),
             version: Arc::from(dedup_version),
             registry,
+            mock: consumer_config.mock,
         })
     }
 
@@ -95,20 +97,18 @@ impl KeyedStateInputs {
         self.publication_setup(store, observer).await
     }
 
-    /// Publication setup for a memory arm — mock mode, or a consumer
-    /// configured with in-memory trigger storage. Both keep their routing rows
-    /// in-process, where the only reader is one sharing this consumer's
-    /// bundle, and both advertise the fixed [`PartitionCount::MOCK`] topology.
-    ///
-    /// That count is the mock cluster's own, so mock mode routes correctly. A
-    /// non-mock consumer with in-memory triggers advertises it too, so a
-    /// bundle-sharing reader reaches the writer's segment only when the real
-    /// topic has that many partitions.
+    /// Publication setup for mock-mode memory storage. The fixed partition
+    /// count is the mock cluster's topology. A live Kafka consumer using
+    /// in-memory storage cannot publish because this backend has no real topic
+    /// partition-count source.
     pub(in crate::consumer) async fn memory_publication_setup(
         &self,
         store: MemoryPublicationStore,
     ) -> Result<Option<PublisherTemplate<MemoryPublicationStore, FixedPartitionCount>>, ConsumerError>
     {
+        if self.registry.has_published() && !self.mock {
+            return Err(KeyedStateInitError::PublishedMemoryStorage.into());
+        }
         self.publication_setup(store, FixedPartitionCount(PartitionCount::MOCK))
             .await
     }
@@ -132,10 +132,7 @@ impl KeyedStateInputs {
     ///
     /// # Errors
     ///
-    /// A transient reconciliation failure, such as a broken publication store,
-    /// propagates so the caller's build fails and the deploy retries.
-    /// Per-collection permanent decode failures are logged and skipped inside
-    /// [`reconcile_publications`].
+    /// Any reconciliation failure propagates so the caller's build fails.
     async fn publication_setup<S, N>(
         &self,
         store: S,
@@ -237,4 +234,43 @@ where
         publisher_template,
     );
     Ok(keyed_state.provider(backend, loader))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::JsonCodec;
+    use crate::state::descriptor::{StateDescriptor, value_state};
+    use crate::subsystem::SubsystemName;
+    use color_eyre::Result;
+
+    /// Published routing from memory is valid only when the Kafka topology is
+    /// also mocked. A live consumer has no typed partition-count source for
+    /// the in-memory publication store.
+    #[tokio::test]
+    async fn published_memory_state_requires_mock_mode() -> Result<()> {
+        let mut state = KeyedStateConfiguration::builder()
+            .subsystem(Some(SubsystemName::try_new("orders")?))
+            .build()?;
+        let _ = state.register(value_state::<JsonCodec>("cart").published(true));
+        let consumer = ConsumerConfiguration::builder()
+            .bootstrap_servers(vec!["unused:9092".to_owned()])
+            .group_id("orders")
+            .subscribed_topics(&["orders".to_owned()])
+            .mock(false)
+            .build()?;
+        let inputs = KeyedStateInputs::new(state, &consumer, "v1")?;
+
+        let result = inputs
+            .memory_publication_setup(MemoryPublicationStore::new())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ConsumerError::KeyedState(
+                KeyedStateInitError::PublishedMemoryStorage
+            ))
+        ));
+        Ok(())
+    }
 }

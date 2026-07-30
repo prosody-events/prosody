@@ -99,18 +99,13 @@ pub enum StateReaderError {
 
     /// A publication/identity/cell store read failed (type-erased). Carries
     /// the store error's classification so retry posture is preserved.
-    #[error("reader store failed: {message}")]
+    #[error("{message}")]
     Store {
         /// Rendered store error.
         message: String,
         /// The store error's captured classification.
         category: ErrorCategory,
     },
-
-    /// A descriptor bind failed, or a bound handle surfaced a keyed-state
-    /// access error.
-    #[error(transparent)]
-    Access(#[from] StateAccessError),
 }
 
 impl StateReaderError {
@@ -139,8 +134,13 @@ impl ClassifyError for StateReaderError {
             | Self::InvalidReadCache { .. }
             | Self::Unsupported { .. } => ErrorCategory::Permanent,
             Self::Store { category, .. } => client_category(*category),
-            Self::Access(error) => client_category(error.classify_error()),
         }
+    }
+}
+
+impl From<StateAccessError> for StateReaderError {
+    fn from(error: StateAccessError) -> Self {
+        Self::store(&error)
     }
 }
 
@@ -212,9 +212,6 @@ mod tests {
                 message: "directly constructed terminal".into(),
                 category: ErrorCategory::Terminal,
             },
-            // `StateAccessError::load` keeps the upstream Terminal, so the fold
-            // on read is again the only thing clamping it.
-            Variant::Access => StateReaderError::Access(StateAccessError::load(&SyntheticTerminal)),
         }
     }
 
@@ -224,8 +221,8 @@ mod tests {
     /// `Terminal`-emitting fault.
     ///
     /// FALSIFICATION: drop the `client_category` clamp from either the
-    /// `store(...)` capture or the `classify_error` `Store`/`Access` arms. A
-    /// `Terminal` then reaches classification and the assert fires.
+    /// `store(...)` capture or the `classify_error` `Store` arm. A `Terminal`
+    /// then reaches classification and the assert fires.
     #[test]
     fn no_variant_leaks_terminal_to_the_client() {
         let captured = StateReaderError::store(&SyntheticTerminal);

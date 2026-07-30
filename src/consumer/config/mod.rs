@@ -13,7 +13,7 @@ use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::KafkaLoaderConfiguration;
 use crate::otel::SpanRelation;
 use crate::state::config::KeyedStateConfiguration;
-use crate::state_reader::SharedDeps;
+use crate::state_reader::StateReaderDependencies;
 use crate::timers::duration::CompactDuration;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
@@ -343,7 +343,7 @@ pub struct ConsumerSetup<'a> {
 pub(crate) struct TypedConsumerSetup<'a, C: Codec, B> {
     pub(crate) consumer: &'a ConsumerConfiguration,
     pub(crate) common: &'a CommonConfiguration,
-    pub(crate) deps: SharedDeps<C, B>,
+    pub(crate) deps: StateReaderDependencies<C, B>,
 }
 
 impl ConsumerConfiguration {
@@ -363,10 +363,10 @@ impl ConsumerConfigurationBuilder {
     /// This does not build or validate unrelated consumer fields. High-level
     /// clients use it to select a concrete backend while retaining consumer
     /// configuration failures until subscription.
-    pub(crate) fn configured_mock(&self) -> Result<bool, String> {
+    pub(crate) fn configured_mock(&self) -> Result<bool, MockConfigurationError> {
         match self.mock {
             Some(mock) => Ok(mock),
-            None => from_env_with_fallback("PROSODY_MOCK", false),
+            None => from_env_with_fallback("PROSODY_MOCK", false).map_err(MockConfigurationError),
         }
     }
 
@@ -421,6 +421,11 @@ pub(in crate::consumer) fn validate_recovery_ttl_margin(
     }
     Ok(())
 }
+
+/// The `PROSODY_MOCK` environment value is not a boolean.
+#[derive(Debug, Error)]
+#[error("invalid mock-mode configuration: {0}")]
+pub struct MockConfigurationError(String);
 
 /// The deduplication TTL is below the keyed-state recovery margin: a
 /// provisional cell could outlive its commit-oracle marker and be lost under

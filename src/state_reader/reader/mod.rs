@@ -24,7 +24,7 @@
     reason = "the acquisition state machine is its own impl beside the state it owns"
 )]
 
-pub(super) mod acquisition;
+pub(crate) mod acquisition;
 
 use crate::Key;
 use crate::codec::Codec;
@@ -35,21 +35,23 @@ use crate::state::descriptor::{
     ResolvedOf, StateDescriptor, ValueDescriptor,
 };
 use crate::state::order_codec::{OrderedKeyCodec, UnitKey};
-use crate::state_reader::deps::SharedDeps;
+use crate::state_reader::deps::StateReaderDependencies;
 use crate::state_reader::error::StateReaderError;
 use crate::state_reader::session::{ReadSession, ReaderCollectionDef, ReaderContext};
 use crate::state_reader::{MemoryReaderBackend, ReaderBackend};
 use crate::subsystem::SubsystemName;
-use acquisition::{DEFAULT_REFRESH_INTERVAL, SnapshotState};
+use acquisition::{DEFAULT_REFRESH_INTERVAL, PublicationSnapshot};
 use futures::stream::{Stream, StreamExt};
 use quanta::Clock;
 use std::fmt::Display;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::task::coop::cooperative;
 
 /// A cross-group, read-only view over a published keyed-state collection.
 ///
-/// Built from a [`SharedDeps`] bundle with [`StateReader::new`]. Reads observe
+/// Built from a [`StateReaderDependencies`] bundle with [`StateReader::new`].
+/// Reads observe
 /// only [`Cell::project_committed`](crate::state::cell::Cell::project_committed)
 /// of one source per operation, with honest bounded staleness. Two independent
 /// sources bound that staleness. The descriptor's read-cache TTL bounds a
@@ -70,9 +72,10 @@ pub struct StateReader<D, C: Codec, B = MemoryReaderBackend<C>> {
     context: ReaderContext<C, B>,
     clock: Clock,
     refresh_interval: Duration,
-    snapshot: Mutex<SnapshotState>,
+    publication: Arc<PublicationSnapshot>,
     /// The source bundle's construction id, copied verbatim so a test can prove
-    /// two readers descend from the same [`SharedDeps`] construction.
+    /// two readers descend from the same [`StateReaderDependencies`]
+    /// construction.
     #[cfg(test)]
     deps_instance_id: u64,
 }
@@ -97,7 +100,7 @@ where
     /// read-cache TTL is zero, or [`StateReaderError::Unsupported`] when the
     /// collection name is empty.
     pub fn new(
-        deps: &SharedDeps<C, B>,
+        deps: &StateReaderDependencies<C, B>,
         subsystem: SubsystemName,
         descriptor: D,
     ) -> Result<Self, StateReaderError> {
@@ -107,7 +110,7 @@ where
     /// [`Self::new`] with an explicit refresh cadence — the tests drive it to
     /// [`Duration::ZERO`] so every operation refreshes the snapshot.
     pub(super) fn with_refresh_interval(
-        deps: &SharedDeps<C, B>,
+        deps: &StateReaderDependencies<C, B>,
         subsystem: SubsystemName,
         descriptor: D,
         refresh_interval: Duration,
@@ -120,6 +123,13 @@ where
             StateName::try_new(descriptor.name()).map_err(|_| StateReaderError::Unsupported {
                 reason: "collection name is empty",
             })?;
+        let publication = deps.publications().snapshot(
+            &subsystem,
+            descriptor.state_type(),
+            &name,
+            &descriptor.structural_identity(),
+            refresh_interval,
+        );
         Ok(Self {
             context: ReaderContext::new(
                 deps.backend().clone(),
@@ -132,7 +142,7 @@ where
             subsystem,
             clock: deps.cache().clock(),
             refresh_interval,
-            snapshot: Mutex::new(SnapshotState::default()),
+            publication,
             #[cfg(test)]
             deps_instance_id: deps.instance_id(),
         })
@@ -287,7 +297,7 @@ where
         Ok(async_stream::try_stream! {
             let inner = handle.stream(dir);
             futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
+            while let Some(item) = cooperative(inner.next()).await {
                 yield item.map_err(|e| StateReaderError::store(&e))?;
             }
         })
@@ -313,7 +323,7 @@ where
         Ok(async_stream::try_stream! {
             let inner = handle.keys(dir);
             futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
+            while let Some(item) = cooperative(inner.next()).await {
                 yield item.map_err(|e| StateReaderError::store(&e))?;
             }
         })
@@ -437,7 +447,7 @@ where
         Ok(async_stream::try_stream! {
             let inner = handle.stream(dir);
             futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
+            while let Some(item) = cooperative(inner.next()).await {
                 yield item.map_err(|e| StateReaderError::store(&e))?;
             }
         })
@@ -454,14 +464,15 @@ where
     /// A reader that refreshes its snapshot on every operation — the
     /// deterministic driver for the acquisition/refresh property tests.
     pub(crate) fn new_eager(
-        deps: &SharedDeps<C, B>,
+        deps: &StateReaderDependencies<C, B>,
         subsystem: SubsystemName,
         descriptor: D,
     ) -> Result<Self, StateReaderError> {
         Self::with_refresh_interval(deps, subsystem, descriptor, Duration::ZERO)
     }
 
-    /// The source bundle's construction id (see [`SharedDeps::instance_id`]).
+    /// The source bundle's construction id (see
+    /// [`StateReaderDependencies::instance_id`]).
     pub(crate) fn deps_instance_id(&self) -> u64 {
         self.deps_instance_id
     }

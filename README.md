@@ -216,18 +216,17 @@ is no ordering guarantee across sources. The two TTLs never interact: `.ttl`
 bounds how long the owner's written state is **retained** (Cassandra `USING
 TTL`, seconds granularity); `.read_cache` bounds how **stale** this read-only
 client tolerates a cached value (sub-second `Duration`s are fine). A process
-with no consumer of its own can build a reader directly from a `SharedDeps`
-bundle (`SharedDeps::connect` + `StateReader::new`); the high-level client
-shares one bundle across its consumer and all readers, so composing a reader
+with no consumer of its own can build `StateReaderDependencies::cassandra`,
+then pass it to `StateReaderClient::new`. The high-level client shares one
+dependency family across its consumer and all readers, so composing a reader
 never opens a second Cassandra session, Kafka loader, or cache.
 
-**Retiring a published collection.** To stop publishing, flip the collection to
-`.published(false)` but keep its registration and the consumer's `subsystem` for
-one full stop-then-start deploy. Startup reconciliation removes the routing row
-only for a still-registered, private, subsystem-configured collection, so that
-deploy is what withdraws it. Deleting the registration (or dropping the
-`subsystem`) outright strands the routing row: with no TTL it — and the
-collection's committed state — stay cross-group-discoverable indefinitely.
+**Retiring a published collection.** Change the collection to
+`.published(false)`. Keep its registration and the consumer's `subsystem` for
+one complete stop-then-start deployment. Startup reconciliation then removes
+the routing row. Deleting the registration or subsystem first strands the
+routing row. Routing rows and committed state have no automatic expiry, so
+other groups can continue to discover and read the collection.
 
 ## Quality of Service
 

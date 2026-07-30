@@ -11,7 +11,7 @@ use crate::high_level::topics::missing_topics;
 use crate::producer::{ProducerConfigurationBuilder, ProsodyProducer};
 use crate::propagator::new_propagator;
 use crate::telemetry::{Telemetry, spawn_telemetry_emitter};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 fn new_with_backend<T, C, B>(
     backend: B,
@@ -61,6 +61,14 @@ where
         mode,
         consumer_builders: &consumer_builders,
     });
+    let reader_config = match &consumer_state {
+        ConsumerState::Configured { config } => {
+            Some(super::deps::ReaderConfiguration::from_mode(config))
+        }
+        ConsumerState::Unconfigured
+        | ConsumerState::ConfigurationFailed(_)
+        | ConsumerState::Running { .. } => None,
+    };
     if !producer_config.mock
         && let ConsumerState::Configured { config, .. } = &consumer_state
     {
@@ -74,6 +82,8 @@ where
         producer,
         producer_config,
         consumer: Mutex::new(consumer_state),
+        reader: OnceCell::new(),
+        reader_config,
         backend,
         propagator: new_propagator(),
         telemetry,

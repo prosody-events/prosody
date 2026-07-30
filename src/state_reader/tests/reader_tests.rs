@@ -33,6 +33,7 @@ use crate::state_reader::{StateReader, StateReaderError};
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::executor::block_on;
 use serde_json::Value;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 /// Instantiates a memory `prop_reader_<kind>_committed` test.
@@ -162,7 +163,7 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
     )
     .await;
 
-    let deps = harness.deps(1 << 20);
+    let deps = harness.deps();
     let reader = StateReader::new(&deps, sub, descriptor)?;
     assert_eq!(
         reader.get(key).await?,
@@ -229,9 +230,7 @@ async fn read_cache_policy_resolves_against_the_bundle_default() -> Result<()> {
         )
         .await;
 
-        let deps = harness
-            .deps(1 << 20)
-            .with_default_read_cache_ttl(default_ttl);
+        let deps = harness.deps().with_default_read_cache_ttl(default_ttl);
         let reader = StateReader::new(&deps, sub, descriptor)?;
         assert_eq!(reader.get(key.clone()).await?, Some(Value::from(1i64)));
 
@@ -274,7 +273,7 @@ async fn zero_bundle_default_is_rejected_at_reader_construction() -> Result<()> 
     let harness = MemoryHarness::new();
     let descriptor = value_state::<JsonCodec>("v-zero-default");
     let deps = harness
-        .deps(1 << 20)
+        .deps()
         .with_default_read_cache_ttl(Some(Duration::ZERO));
     match StateReader::new(&deps, subsystem()?, descriptor) {
         Err(StateReaderError::InvalidReadCache { .. }) => Ok(()),
@@ -298,7 +297,7 @@ async fn kafka_ref_reader_resolves_through_loader() -> Result<()> {
     use crate::consumer::message::ConsumerMessage;
     use crate::consumer::message_state;
     use crate::loader::MemoryLoader;
-    use crate::state_reader::deps::SharedDeps;
+    use crate::state_reader::deps::StateReaderDependencies;
     use std::sync::Arc;
 
     let harness = MemoryHarness::new();
@@ -355,14 +354,14 @@ async fn kafka_ref_reader_resolves_through_loader() -> Result<()> {
         Arc::from("user-42"),
         payload.clone(),
     );
-    let deps = SharedDeps::<JsonCodec>::memory(
+    let deps = StateReaderDependencies::<JsonCodec>::memory(
         "reader-test".to_owned(),
         Duration::from_secs(30),
         harness.cells.clone(),
         harness.publications.clone(),
         harness.identities.clone(),
         loader,
-        1 << 20,
+        NonZeroU64::MAX,
     );
     let reader = StateReader::new(&deps, sub, reader_descriptor)?;
 
@@ -440,7 +439,7 @@ async fn identity_mismatch_is_permanent() -> Result<()> {
             .await
             .unwrap_or_else(|e| match e {});
 
-        let deps = harness.deps(1 << 20);
+        let deps = harness.deps();
         let reader = StateReader::new(&deps, sub.clone(), descriptor)?;
         match reader.get(Key::from("user-1")).await {
             Err(StateReaderError::IdentityMismatch { .. }) => {}
@@ -461,7 +460,7 @@ async fn identity_mismatch_is_permanent() -> Result<()> {
         &descriptor,
     )
     .await;
-    let deps = harness.deps(1 << 20);
+    let deps = harness.deps();
     let reader = StateReader::new(&deps, sub, descriptor)?;
     assert_eq!(reader.get(Key::from("user-1")).await?, None);
     Ok(())
@@ -479,7 +478,7 @@ async fn boundary_errors() -> Result<()> {
     let harness = MemoryHarness::new();
     let descriptor = value_state::<JsonCodec>("v-empty");
     let sub = subsystem()?;
-    let deps = harness.deps(1 << 20);
+    let deps = harness.deps();
     let reader = StateReader::new(&deps, sub, descriptor)?;
 
     match reader.get(Key::from("")).await {

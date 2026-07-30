@@ -26,6 +26,7 @@ environment variables for unset fields, so you can mix both approaches.
 | `PROSODY_POLL_INTERVAL`          | How often to fetch new messages from Kafka           | 100ms                  |
 | `PROSODY_SHUTDOWN_TIMEOUT`       | Shutdown budget; handlers complete freely before cancellation fires near the deadline | 30s |
 | `PROSODY_STALL_THRESHOLD`        | Report unhealthy if no progress for this long        | 5m                     |
+| `PROSODY_STATISTICS_INTERVAL`    | How often librdkafka reports client statistics; must be between 1ms and 24h | 5s |
 | `PROSODY_PROBE_PORT`             | HTTP port for health checks ('none' to disable)      | 8000                   |
 | `PROSODY_FAILURE_TOPIC`          | Send unprocessable messages here (dead letter queue) | -                      |
 | `PROSODY_SLAB_SIZE`              | Timer storage granularity (rarely needs changing)    | 1h                     |

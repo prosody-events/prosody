@@ -38,6 +38,15 @@ fn test_heartbeat_becomes_stalled() {
     );
 }
 
+#[test]
+fn registry_forgets_dropped_heartbeats() {
+    let registry = HeartbeatRegistry::test();
+    let heartbeat = registry.register("temporary");
+    assert_eq!(registry.active_count(), 1);
+    drop(heartbeat);
+    assert_eq!(registry.active_count(), 0);
+}
+
 #[tokio::test(start_paused = true)]
 async fn test_next_sleep_duration() {
     let threshold = Duration::from_millis(100);

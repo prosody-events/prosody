@@ -24,10 +24,11 @@ use crate::consumer::observer::KafkaObserver;
 use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
 use crate::consumer::wiring::state::KeyedStateInputs;
 use crate::heartbeat::HeartbeatRegistry;
+use crate::loader::LoaderConfiguration;
 use crate::loader::MemoryLoader;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state_reader::ConsumerReaderBackend;
-use crate::state_reader::{CassandraReaderBackend, MemoryReaderBackend, SharedDeps};
+use crate::state_reader::{CassandraReaderBackend, MemoryReaderBackend, StateReaderDependencies};
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity};
 use std::sync::Arc;
@@ -100,19 +101,19 @@ where
 
 pub(in crate::consumer) fn memory_deps<C>(
     setup: &ConsumerSetup<'_>,
-) -> SharedDeps<C, MemoryReaderBackend<C>>
+) -> StateReaderDependencies<C, MemoryReaderBackend<C>>
 where
     C: Codec,
     C::Payload: Clone,
 {
-    SharedDeps::memory(
+    StateReaderDependencies::memory(
         setup.consumer.group_id.clone(),
         setup.consumer.stall_threshold,
         MemoryCells::new(),
         MemoryPublicationStore::new(),
         MemoryDescriptorIdentityStore::new(),
         MemoryLoader::new(),
-        setup.common.keyed_state.reader_cache_size().get(),
+        setup.common.keyed_state.reader_cache_size(),
     )
     .with_default_read_cache_ttl(setup.common.keyed_state.read_cache_ttl)
 }
@@ -120,15 +121,16 @@ where
 pub(in crate::consumer) async fn cassandra_deps<C>(
     setup: &ConsumerSetup<'_>,
     config: &CassandraConfiguration,
-) -> Result<SharedDeps<C, CassandraReaderBackend<C>>, ConsumerError>
+) -> Result<StateReaderDependencies<C, CassandraReaderBackend<C>>, ConsumerError>
 where
     C: Codec,
     C::Payload: Clone,
 {
-    Ok(SharedDeps::connect(
-        setup.consumer,
+    Ok(StateReaderDependencies::cassandra_with_loader(
         config,
+        LoaderConfiguration::for_consumer(setup.consumer),
         setup.common.keyed_state.reader_cache_size(),
+        setup.consumer.stall_threshold,
     )
     .await?
     .with_default_read_cache_ttl(setup.common.keyed_state.read_cache_ttl))

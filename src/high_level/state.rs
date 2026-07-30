@@ -6,11 +6,9 @@
 
 use crate::Codec;
 use crate::consumer::ProsodyConsumer;
-use crate::high_level::ClientBackend;
 use crate::high_level::config::{
     ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
 };
-use crate::state_reader::SharedDeps;
 use educe::Educe;
 use std::fmt;
 use std::fmt::{Display, Formatter};
@@ -22,12 +20,10 @@ use tracing::info;
 ///
 /// This type provides a view into the current state of the consumer,
 /// allowing read-only access to the underlying `ConsumerState`.
-pub struct ConsumerStateView<'a, T, C: Codec, B: ClientBackend<C>>(
-    pub(crate) MutexGuard<'a, ConsumerState<T, C, B>>,
-);
+pub struct ConsumerStateView<'a, T, C: Codec>(pub(crate) MutexGuard<'a, ConsumerState<T, C>>);
 
-impl<T, C: Codec, B: ClientBackend<C>> Deref for ConsumerStateView<'_, T, C, B> {
-    type Target = ConsumerState<T, C, B>;
+impl<T, C: Codec> Deref for ConsumerStateView<'_, T, C> {
+    type Target = ConsumerState<T, C>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -36,17 +32,11 @@ impl<T, C: Codec, B: ClientBackend<C>> Deref for ConsumerStateView<'_, T, C, B> 
 
 /// Represents the current state of the consumer.
 ///
-/// The shared infrastructure bundle ([`SharedDeps`]) lives only on states that
-/// have a config to build it from. `Configured` holds it as an `Option`, built
-/// lazily on the first call to
-/// [`state`](crate::high_level::HighLevelClient::state) or
-/// [`subscribe`](crate::high_level::HighLevelClient::subscribe). `Running`
-/// always holds it, because `subscribe` builds it before starting the consumer.
-/// `Unconfigured` and `ConfigurationFailed` have no config, so they cannot
-/// carry a bundle.
+/// Reader infrastructure belongs to the high-level client's reader component,
+/// not this subscription state machine.
 #[derive(Educe, Default)]
 #[educe(Debug)]
-pub enum ConsumerState<T, C: Codec, B: ClientBackend<C>> {
+pub enum ConsumerState<T, C: Codec> {
     /// The consumer is not yet configured.
     #[default]
     Unconfigured,
@@ -56,10 +46,6 @@ pub enum ConsumerState<T, C: Codec, B: ClientBackend<C>> {
     Configured {
         /// The configuration to run when subscribed.
         config: ModeConfiguration,
-        /// The shared bundle, or `None` until first built. Built lazily and
-        /// reused when the consumer moves to `Running`.
-        #[educe(Debug(ignore))]
-        deps: Option<SharedDeps<C, B::Reader>>,
     },
     /// The consumer is actively running.
     Running {
@@ -69,14 +55,10 @@ pub enum ConsumerState<T, C: Codec, B: ClientBackend<C>> {
         config: ModeConfiguration,
         /// The handler for processing messages.
         handler: T,
-        /// The shared bundle handed to the running consumer and reused by any
-        /// reader built while running.
-        #[educe(Debug(ignore))]
-        deps: SharedDeps<C, B::Reader>,
     },
 }
 
-impl<T, C: Codec, B: ClientBackend<C>> ConsumerState<T, C, B> {
+impl<T, C: Codec> ConsumerState<T, C> {
     /// Builds a new `ConsumerState` from the given configuration, returning
     /// [`ConsumerState::Configured`] on success or
     /// [`ConsumerState::ConfigurationFailed`] with the error otherwise.
@@ -84,7 +66,6 @@ impl<T, C: Codec, B: ClientBackend<C>> ConsumerState<T, C, B> {
         match ModeConfiguration::build(params) {
             Ok(configuration) => Self::Configured {
                 config: configuration,
-                deps: None,
             },
             Err(error) => {
                 info!("disabling consumer (safe to ignore if you're only producing): {error:#}");
@@ -94,7 +75,7 @@ impl<T, C: Codec, B: ClientBackend<C>> ConsumerState<T, C, B> {
     }
 }
 
-impl<T, C: Codec, B: ClientBackend<C>> Display for ConsumerState<T, C, B> {
+impl<T, C: Codec> Display for ConsumerState<T, C> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let state = match self {
             ConsumerState::Unconfigured => "unconfigured",

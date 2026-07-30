@@ -15,13 +15,14 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::store::CellStore;
 use crate::state::tests::support::FixedOracle;
 use crate::state::{StateName, StateType};
-use crate::state_reader::deps::SharedDeps;
+use crate::state_reader::deps::StateReaderDependencies;
 use crate::state_reader::{
     MemoryReaderBackend as CoreMemoryReaderBackend, PartitionCount,
     ReaderBackend as CoreReaderBackend,
 };
 use crate::subsystem::SubsystemName;
 use color_eyre::eyre::Result;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -103,15 +104,15 @@ impl MemoryHarness {
     }
 
     /// A shared-deps bundle over these handles with a wall-clock cache.
-    pub(in crate::state_reader::tests) fn deps(&self, budget: u64) -> SharedDeps<JsonCodec> {
-        SharedDeps::memory(
+    pub(in crate::state_reader::tests) fn deps(&self) -> StateReaderDependencies<JsonCodec> {
+        StateReaderDependencies::memory(
             "reader-test".to_owned(),
             Duration::from_secs(30),
             self.cells.clone(),
             self.publications.clone(),
             self.identities.clone(),
             MemoryLoader::new(),
-            budget,
+            NonZeroU64::MAX,
         )
     }
 }
@@ -155,7 +156,7 @@ pub(in crate::state_reader::tests) trait ReaderBackend {
     /// A fresh reader bundle over this backend's stores. Each call gets a
     /// fresh cache, so a per-event reader observes current committed state
     /// instead of a stale one.
-    fn deps(&self) -> SharedDeps<JsonCodec, Self::DepsBackend>;
+    fn deps(&self) -> StateReaderDependencies<JsonCodec, Self::DepsBackend>;
 }
 
 /// The memory [`ReaderBackend`]: a fresh [`MemoryHarness`] plus a registry
@@ -220,7 +221,7 @@ impl ReaderBackend for MemoryReaderBackend {
         Ok(())
     }
 
-    fn deps(&self) -> SharedDeps<JsonCodec> {
-        self.harness.deps(1 << 20)
+    fn deps(&self) -> StateReaderDependencies<JsonCodec> {
+        self.harness.deps()
     }
 }

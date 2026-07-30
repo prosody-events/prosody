@@ -19,15 +19,15 @@ use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state_reader::ConsumerReaderBackend;
 #[cfg(test)]
-use crate::state_reader::SharedDeps;
-use crate::state_reader::StateReader;
+use crate::state_reader::StateReaderDependencies;
+use crate::state_reader::{StateReader, StateReaderClient};
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::{Codec, Topic};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tracing::info;
 
 mod backend;
@@ -41,6 +41,8 @@ pub mod state;
 mod topics;
 
 pub use backend::{CassandraClientBackend, ClientBackend, MemoryClientBackend};
+#[doc(hidden)]
+pub use deps::ReaderConfiguration;
 
 /// High-level client using Cassandra storage.
 pub type CassandraHighLevelClient<T, C = crate::JsonCodec> =
@@ -64,12 +66,11 @@ where
 {
     producer: ProsodyProducer<C>,
     producer_config: ProducerConfiguration,
-    /// The consumer state. On its `Configured` and `Running` variants it owns
-    /// the one shared infrastructure bundle ([`SharedDeps`]). The bundle is
-    /// built lazily on first use, by [`Self::state`] or [`Self::subscribe`],
-    /// and retained across the `Configured → Running` transition. No state
-    /// transition builds a second session, loader, or memory store.
-    consumer: Mutex<ConsumerState<T, C, B>>,
+    consumer: Mutex<ConsumerState<T, C>>,
+    #[educe(Debug(ignore))]
+    reader: OnceCell<StateReaderClient<C, B::Reader>>,
+    #[educe(Debug(ignore))]
+    reader_config: Option<ReaderConfiguration>,
     backend: B,
     propagator: TextMapCompositePropagator,
     telemetry: Telemetry,
@@ -81,6 +82,26 @@ where
     C::Payload: crate::EventIdentity,
     B: ClientBackend<C>,
 {
+    async fn reader(
+        &self,
+    ) -> Result<StateReaderClient<C, B::Reader>, HighLevelClientError<C::Error>>
+    where
+        C::Payload: Clone,
+    {
+        let config = self
+            .reader_config
+            .as_ref()
+            .ok_or(HighLevelClientError::UnconfiguredConsumer)?;
+        self.reader
+            .get_or_try_init(|| async {
+                deps::build(config, &self.backend)
+                    .await
+                    .map(StateReaderClient::new)
+            })
+            .await
+            .cloned()
+    }
+
     /// Returns a reference to the internal `ProsodyProducer`.
     pub fn producer(&self) -> &ProsodyProducer<C> {
         &self.producer
@@ -92,7 +113,7 @@ where
     }
 
     /// Returns a view of the current consumer state.
-    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T, C, B> {
+    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T, C> {
         ConsumerStateView(self.consumer.lock().await)
     }
 
@@ -153,7 +174,7 @@ where
     {
         let mut guard = self.consumer.lock().await;
         match &mut *guard {
-            ConsumerState::Configured { config, .. } => Ok(config.register(descriptor)),
+            ConsumerState::Configured { config } => Ok(config.register(descriptor)),
             ConsumerState::Running { .. } => Err(HighLevelClientError::AlreadySubscribed),
             ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => {
                 Err(HighLevelClientError::UnconfiguredConsumer)
@@ -165,12 +186,8 @@ where
     /// hook lets the composition suite seed committed state into the exact
     /// stores that the running consumer and the client's readers share.
     #[cfg(test)]
-    pub(crate) async fn retained_deps(&self) -> Option<SharedDeps<C, B::Reader>> {
-        match &*self.consumer.lock().await {
-            ConsumerState::Configured { deps, .. } => deps.clone(),
-            ConsumerState::Running { deps, .. } => Some(deps.clone()),
-            ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => None,
-        }
+    pub(crate) fn retained_deps(&self) -> Option<StateReaderDependencies<C, B::Reader>> {
+        self.reader.get().map(StateReaderClient::deps)
     }
 
     /// Composes a standalone [`StateReader`] over this client's one shared
@@ -184,7 +201,7 @@ where
     ///
     /// [`HighLevelClientError::UnconfiguredConsumer`] if the client has no
     /// consumer configuration; [`HighLevelClientError::StateReader`] if the
-    /// bundle cannot connect or the descriptor is rejected.
+    /// dependencies cannot be constructed or the descriptor is rejected.
     pub async fn state<D>(
         &self,
         subsystem: SubsystemName,
@@ -194,9 +211,10 @@ where
         D: StateDescriptor,
         C::Payload: Clone,
     {
-        let mut guard = self.consumer.lock().await;
-        let deps = deps::get_or_build(&mut guard, &self.backend).await?;
-        StateReader::new(&deps, subsystem, descriptor).map_err(HighLevelClientError::StateReader)
+        self.reader()
+            .await?
+            .state(subsystem, descriptor)
+            .map_err(HighLevelClientError::StateReader)
     }
 
     /// Subscribes the consumer with the provided handler.
@@ -217,30 +235,24 @@ where
 
         // Take the state out. Only `Configured` proceeds; the others restore
         // themselves (or leave `Unconfigured`) and return their errors.
-        let (config, existing_deps) = match take(&mut *guard) {
+        let config = match take(&mut *guard) {
             ConsumerState::Unconfigured => return Err(HighLevelClientError::UnconfiguredConsumer),
             ConsumerState::ConfigurationFailed(error) => {
                 return Err(HighLevelClientError::ConsumerConfiguration(error));
             }
-            ConsumerState::Configured { config, deps } => (config, deps),
+            ConsumerState::Configured { config } => config,
             running @ ConsumerState::Running { .. } => {
                 *guard = running;
                 return Err(HighLevelClientError::AlreadySubscribed);
             }
         };
 
-        // Build (or reuse the memoized) bundle now that we own the config, so
-        // the running consumer and any reader share it. A build failure here
-        // must stay retryable, so restore `Configured` (no bundle) and return.
-        let shared = match existing_deps {
-            Some(shared) => shared,
-            None => match deps::build(&config, &self.backend).await {
-                Ok(shared) => shared,
-                Err(error) => {
-                    *guard = ConsumerState::Configured { config, deps: None };
-                    return Err(error);
-                }
-            },
+        let shared = match self.reader().await {
+            Ok(reader) => reader.deps(),
+            Err(error) => {
+                *guard = ConsumerState::Configured { config };
+                return Err(error);
+            }
         };
 
         // Build the consumer. `take` moved the config out, so any failure must
@@ -297,11 +309,8 @@ where
             Ok(consumer) => consumer,
             Err(error) => {
                 // Restore the configured state so a transient build failure
-                // stays retryable. Drop the bundle: its open scylla session,
-                // live rdkafka poll thread, and registered heartbeat would
-                // otherwise be stranded. The next `subscribe` rebuilds a
-                // fresh one.
-                *guard = ConsumerState::Configured { config, deps: None };
+                // stays retryable.
+                *guard = ConsumerState::Configured { config };
                 return Err(error);
             }
         };
@@ -310,7 +319,6 @@ where
             consumer,
             config,
             handler,
-            deps: shared,
         };
 
         Ok(())
@@ -326,12 +334,8 @@ where
         let consumer = {
             let mut guard = self.consumer.lock().await;
 
-            // Restore `Configured` without a bundle: the taken `Running.deps`
-            // is dropped here. Its heartbeat registry holds this consumer's
-            // poll-loop heartbeat, which stops beating at shutdown. Reusing the
-            // same registry on a later `subscribe` would count that dead
-            // heartbeat in `is_stalled` forever and grow the registry with no
-            // removal path. The next `subscribe` rebuilds a fresh bundle.
+            // Restore `Configured`. Dropping the running consumer removes its
+            // heartbeat registrations from the retained shared registry.
             match take(&mut *guard) {
                 state @ (ConsumerState::Unconfigured
                 | ConsumerState::ConfigurationFailed(_)
@@ -342,7 +346,7 @@ where
                 ConsumerState::Running {
                     consumer, config, ..
                 } => {
-                    *guard = ConsumerState::Configured { config, deps: None };
+                    *guard = ConsumerState::Configured { config };
                     consumer
                 }
             }

@@ -45,7 +45,7 @@ use crate::state::tests::support::FixedOracle;
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::ReaderComponents;
 use crate::state_reader::cache::ReaderCache;
-use crate::state_reader::deps::SharedDeps;
+use crate::state_reader::deps::StateReaderDependencies;
 use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
 use crate::test_util::{
@@ -121,7 +121,7 @@ impl ReaderBackend for CassandraReaderBackend {
 
     fn deps(
         &self,
-    ) -> SharedDeps<
+    ) -> StateReaderDependencies<
         JsonCodec,
         ReaderComponents<
             JsonCodec,
@@ -131,7 +131,7 @@ impl ReaderBackend for CassandraReaderBackend {
             MemoryLoader<Value>,
         >,
     > {
-        SharedDeps::from_parts(
+        StateReaderDependencies::from_parts(
             ReaderComponents::new(
                 self.cells.clone(),
                 self.publications.clone(),

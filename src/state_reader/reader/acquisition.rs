@@ -18,10 +18,12 @@ use crate::state_reader::source::{
 };
 use crate::{Codec, state_reader::reader::StateReader};
 use futures::stream::{self, StreamExt};
+use parking_lot::RwLock;
 use quanta::Instant;
 use smallvec::SmallVec;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::task::coop::cooperative;
 use tracing::warn;
 
@@ -103,7 +105,7 @@ enum Absence {
 /// The default is the never-refreshed state, which is why a fresh reader
 /// refreshes on its first read.
 #[derive(Default)]
-pub(super) struct SnapshotState {
+pub(crate) struct SnapshotState {
     /// What the last refresh acquired; `None` until one completes.
     acquired: Option<Acquired>,
     /// When the last refresh completed.
@@ -113,6 +115,13 @@ pub(super) struct SnapshotState {
     /// [`ABSENT_BACKOFF`]; a refresh that acquires sources or a fault clears
     /// it.
     retry_after: Option<Instant>,
+}
+
+/// The cached publication state and its single-flight refresh gate.
+#[derive(Default)]
+pub(crate) struct PublicationSnapshot {
+    pub(super) state: RwLock<SnapshotState>,
+    pub(super) refresh: Mutex<()>,
 }
 
 impl SnapshotState {
@@ -187,28 +196,50 @@ where
     /// held sticky until a refresh re-validates it away (see [`Fault`]). A
     /// missing identity skips that source with a `warn!`.
     ///
-    /// One mutex owns both the cached read and the refresh transition, so a
-    /// refresh is one `&mut` read-modify-write over the whole state. The guard
-    /// is held across [`Self::refresh`]'s network I/O on purpose: it
-    /// single-flights the refresh, so one read re-reads the routing table while
-    /// the rest wait and wake to the fresh state. Two changes to resist: do not
-    /// drop the guard across the await, and do not publish the state through a
-    /// lock-free swap so fresh reads skip the guard. A stale read must still
-    /// wait, because a withdrawal or a newly present mismatch takes effect at
-    /// the refresh that finds it.
+    /// One asynchronous gate single-flights refresh I/O. The held acquisition
+    /// remains separately readable while that I/O is in flight. A concurrent
+    /// read serves it immediately. Only the first acquisition waits because it
+    /// has no snapshot to serve.
     pub(super) async fn snapshot(&self) -> Result<Arc<ValidatedPublications>, StateReaderError> {
-        let mut state = self.snapshot.lock().await;
         let now = self.clock.now();
-        if state.within_pacing(now) || state.is_fresh(now, self.refresh_interval) {
-            return match &state.acquired {
-                Some(acquired) => self.serve(acquired),
-                // Nothing was ever acquired and a failed refresh is pacing the
-                // retry. Re-attempting inside the window is what the pacing
-                // exists to prevent.
-                None => Err(self.refresh_unavailable()),
-            };
+        {
+            let state = self.publication.state.read();
+            if state.within_pacing(now) || state.is_fresh(now, self.refresh_interval) {
+                return match &state.acquired {
+                    Some(acquired) => self.serve(acquired),
+                    None => Err(self.refresh_unavailable()),
+                };
+            }
         }
-        self.refresh(&mut state, now).await
+
+        let refresh = if let Ok(refresh) = self.publication.refresh.try_lock() {
+            refresh
+        } else {
+            let held = {
+                let state = self.publication.state.read();
+                state.acquired.as_ref().map(|acquired| self.serve(acquired))
+            };
+            if let Some(outcome) = held {
+                return outcome;
+            }
+            self.publication.refresh.lock().await
+        };
+
+        // A refresh may have completed while a first acquisition waited for
+        // the gate. Re-check before issuing another store read.
+        let now = self.clock.now();
+        {
+            let state = self.publication.state.read();
+            if state.within_pacing(now) || state.is_fresh(now, self.refresh_interval) {
+                return match &state.acquired {
+                    Some(acquired) => self.serve(acquired),
+                    None => Err(self.refresh_unavailable()),
+                };
+            }
+        }
+        let outcome = self.refresh(now).await;
+        drop(refresh);
+        outcome
     }
 
     /// The outcome a read resolves to for `acquired`.
@@ -222,12 +253,8 @@ where
 
     /// Re-reads the routing table and applies the three-outcome rule, mutating
     /// `state` in place (see [`Self::snapshot`]).
-    async fn refresh(
-        &self,
-        state: &mut SnapshotState,
-        now: Instant,
-    ) -> Result<Arc<ValidatedPublications>, StateReaderError> {
-        let prior = state.sources();
+    async fn refresh(&self, now: Instant) -> Result<Arc<ValidatedPublications>, StateReaderError> {
+        let prior = self.publication.state.read().sources();
         let rows = match self
             .context
             .backend
@@ -240,7 +267,7 @@ where
             // A failed read keeps the previous acquisition untouched, not
             // merely its admitted subset. A transient outage is no evidence a
             // known mismatch was repaired, so a sticky fault survives it.
-            Err(error) => return self.failed(state, "routing", error),
+            Err(error) => return self.failed("routing", error),
         };
 
         // The cap bounds the identity fan-out below, so it is checked against
@@ -248,18 +275,14 @@ where
         // afterwards. Checked late, an oversized routing table would first pay
         // one identity read per advertised group.
         if rows.len() > MAX_PUBLICATION_SOURCES {
-            return self.acquire(
-                state,
-                Acquired::Fault(Fault::TooManySources(rows.len())),
-                now,
-            );
+            return self.acquire(Acquired::Fault(Fault::TooManySources(rows.len())), now);
         }
 
         let admission = match self.admit(&rows, prior.as_deref()).await {
             Ok(admission) => admission,
             // An identity-read failure mid-admit is a transient outage, on the
             // same footing as a failed routing read.
-            Err(error) => return self.failed(state, "identity", error),
+            Err(error) => return self.failed("identity", error),
         };
 
         // Withdrawals took effect on `admitted` regardless of outcome, so the
@@ -278,7 +301,7 @@ where
                 }
             },
         };
-        self.acquire(state, acquired, now)
+        self.acquire(acquired, now)
     }
 
     /// Publishes what a completed refresh acquired and returns the outcome
@@ -291,7 +314,6 @@ where
     /// the window.
     fn acquire(
         &self,
-        state: &mut SnapshotState,
         acquired: Acquired,
         at: Instant,
     ) -> Result<Arc<ValidatedPublications>, StateReaderError> {
@@ -299,7 +321,7 @@ where
         let retry_after = matches!(acquired, Acquired::Absent(_))
             .then(|| self.clock.now().checked_add(ABSENT_BACKOFF))
             .flatten();
-        *state = SnapshotState {
+        *self.publication.state.write() = SnapshotState {
             acquired: Some(acquired),
             refreshed_at: Some(at),
             retry_after,
@@ -326,7 +348,6 @@ where
     /// outage is diagnosed.
     fn failed(
         &self,
-        state: &mut SnapshotState,
         phase: &'static str,
         error: StateReaderError,
     ) -> Result<Arc<ValidatedPublications>, StateReaderError> {
@@ -336,6 +357,7 @@ where
             error = %error,
             "publication refresh failed; pacing the retry"
         );
+        let mut state = self.publication.state.write();
         if matches!(state.acquired, Some(Acquired::Absent(_))) {
             *state = SnapshotState::default();
         }
@@ -457,13 +479,19 @@ where
             admission.any_missing = true;
             return false;
         };
-        if descriptor_identity::validate::<StateAccessError>(stored, asserted).is_ok() {
-            return true;
+        if let Err(error) = descriptor_identity::validate::<StateAccessError>(stored, asserted) {
+            warn!(
+                group = %group,
+                name = %self.context.name.as_str(),
+                error = %error,
+                "publication source descriptor identity disagrees"
+            );
+            if admission.mismatch.is_none() {
+                admission.mismatch = Some(Arc::clone(group));
+            }
+            return false;
         }
-        if admission.mismatch.is_none() {
-            admission.mismatch = Some(Arc::clone(group));
-        }
-        false
+        true
     }
 
     /// The Transient error a read gets while this collection has nothing to

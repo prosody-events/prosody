@@ -3,10 +3,11 @@
 use crate::cassandra::CassandraStore;
 use crate::cassandra::config::CassandraConfiguration;
 use crate::codec::Codec;
-use crate::consumer::ConsumerConfiguration;
 use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
+use crate::consumer::{ConsumerConfiguration, KeyedStateConfiguration};
 use crate::consumer::{ConsumerError, KafkaObserver, KeyedStateInputs};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::loader::LoaderConfiguration;
 use crate::loader::{KafkaLoader, MemoryLoader};
 use crate::state::cassandra::{
     CassandraCellResources, CassandraDescriptorIdentityStore, CassandraPublicationStore,
@@ -19,6 +20,7 @@ use crate::state_reader::backend::{
 };
 use crate::state_reader::cache::ReaderCache;
 use crate::state_reader::error::StateReaderError;
+use crate::state_reader::publication_cache::PublicationCache;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -37,17 +39,18 @@ fn next_instance_id() -> u64 {
 }
 
 /// One backend family, cache, and heartbeat registry shared by every reader.
-pub struct SharedDeps<C: Codec, B = MemoryReaderBackend<C>> {
+pub struct StateReaderDependencies<C: Codec, B = MemoryReaderBackend<C>> {
     backend: Arc<B>,
     codec: PhantomData<fn() -> C>,
     cache: ReaderCache,
+    publications: PublicationCache,
     heartbeats: HeartbeatRegistry,
     default_read_cache_ttl: Option<Duration>,
     #[cfg(test)]
     instance_id: u64,
 }
 
-impl<C, B> Clone for SharedDeps<C, B>
+impl<C, B> Clone for StateReaderDependencies<C, B>
 where
     C: Codec,
 {
@@ -56,6 +59,7 @@ where
             backend: self.backend.clone(),
             codec: PhantomData,
             cache: self.cache.clone(),
+            publications: self.publications.clone(),
             heartbeats: self.heartbeats.clone(),
             default_read_cache_ttl: self.default_read_cache_ttl,
             #[cfg(test)]
@@ -64,7 +68,7 @@ where
     }
 }
 
-impl<C> SharedDeps<C, MemoryReaderBackend<C>>
+impl<C> StateReaderDependencies<C, MemoryReaderBackend<C>>
 where
     C: Codec,
     C::Payload: Clone,
@@ -78,34 +82,50 @@ where
         publications: MemoryPublicationStore,
         identities: MemoryDescriptorIdentityStore,
         loader: MemoryLoader<C::Payload>,
-        budget: u64,
+        budget: NonZeroU64,
     ) -> Self {
         Self::build(
             ReaderComponents::new(cells, publications, identities, loader),
-            ReaderCache::with_budget(budget),
+            ReaderCache::with_budget(budget.get()),
             HeartbeatRegistry::new(group_id, stall_threshold),
         )
     }
 }
 
-impl<C> SharedDeps<C, CassandraReaderBackend<C>>
+impl<C> StateReaderDependencies<C, CassandraReaderBackend<C>>
 where
     C: Codec,
     C::Payload: Clone,
 {
-    /// Opens one Cassandra session and one Kafka loader.
+    /// Builds Cassandra reader dependencies from the shared client
+    /// configuration.
     ///
     /// # Errors
     ///
     /// Returns a storage error when Cassandra preparation or Kafka loader
     /// construction fails.
-    pub async fn connect(
+    pub async fn cassandra(
         consumer: &ConsumerConfiguration,
         cassandra: &CassandraConfiguration,
-        budget: NonZeroU64,
+        keyed_state: &KeyedStateConfiguration,
     ) -> Result<Self, StateReaderError> {
-        let heartbeats =
-            HeartbeatRegistry::new(consumer.group_id.clone(), consumer.stall_threshold);
+        Ok(Self::cassandra_with_loader(
+            cassandra,
+            LoaderConfiguration::for_consumer(consumer),
+            keyed_state.reader_cache_size(),
+            consumer.stall_threshold,
+        )
+        .await?
+        .with_default_read_cache_ttl(keyed_state.read_cache_ttl))
+    }
+
+    pub(crate) async fn cassandra_with_loader(
+        cassandra: &CassandraConfiguration,
+        loader: LoaderConfiguration,
+        budget: NonZeroU64,
+        stall_threshold: Duration,
+    ) -> Result<Self, StateReaderError> {
+        let heartbeats = HeartbeatRegistry::new(loader.group_id.clone(), stall_threshold);
         let store = CassandraStore::new(cassandra)
             .await
             .map_err(|error| StateReaderError::store(&error))?;
@@ -116,7 +136,7 @@ where
             PublicationQueries::new(store.session(), keyspace),
         )
         .map_err(|error| StateReaderError::store(&error))?;
-        let loader = KafkaLoader::for_consumer(consumer, &heartbeats)
+        let loader = KafkaLoader::new(loader, &heartbeats)
             .map_err(|error| StateReaderError::store(&error))?;
         let backend = ReaderComponents::new(
             CassandraCellResources::new(store.clone(), Arc::new(cells)),
@@ -132,7 +152,7 @@ where
     }
 }
 
-impl<C, B> SharedDeps<C, B>
+impl<C, B> StateReaderDependencies<C, B>
 where
     C: Codec,
     B: ReaderBackend<C>,
@@ -142,6 +162,7 @@ where
             backend: Arc::new(backend),
             codec: PhantomData,
             cache,
+            publications: PublicationCache::new(),
             heartbeats,
             default_read_cache_ttl: None,
             #[cfg(test)]
@@ -181,6 +202,10 @@ where
 
     pub(crate) fn default_read_cache_ttl(&self) -> Option<Duration> {
         self.default_read_cache_ttl
+    }
+
+    pub(crate) fn publications(&self) -> &PublicationCache {
+        &self.publications
     }
 
     pub(crate) fn heartbeats(&self) -> &HeartbeatRegistry {

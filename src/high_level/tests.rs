@@ -268,19 +268,10 @@ fn registrations_survive_resubscribe_cycle() -> Result<()> {
     })
 }
 
-/// `unsubscribe` drops the retained bundle so the next `subscribe` builds a
-/// fresh one. The bundle's heartbeat registry tracks the running consumer's
-/// poll-loop heartbeat, which stops beating at shutdown. Reusing the bundle
-/// across a resubscribe would leave that dead heartbeat in `is_stalled` and
-/// grow the registry with no way to remove it.
-///
-/// This test checks two things: the bundle is cleared on `unsubscribe`, and
-/// the `SharedDeps` construction id changes across the resubscribe cycle. If
-/// `unsubscribe` retained `self.deps` instead, the bundle would survive and
-/// fail the first assertion. The construction id would then repeat and fail
-/// the second.
+/// Readers and subscriptions use the same dependency bundle across the entire
+/// high-level client lifetime.
 #[test]
-fn unsubscribe_rebuilds_bundle_on_resubscribe() -> Result<()> {
+fn unsubscribe_retains_bundle_on_resubscribe() -> Result<()> {
     let fixture = create_test_client::<NoOpHandler>("resubscribe-fresh-bundle", None)?;
     TEST_RUNTIME.block_on(async {
         // Configured: build and retain the first bundle.
@@ -293,22 +284,17 @@ fn unsubscribe_rebuilds_bundle_on_resubscribe() -> Result<()> {
         fixture.client.subscribe(NoOpHandler).await?;
         fixture.client.unsubscribe().await?;
 
-        // The retained bundle (holding the now-dead poll-loop heartbeat) is
-        // gone, so its stale registry cannot be reused.
-        assert!(
-            fixture.client.retained_deps().await.is_none(),
-            "unsubscribe must drop the retained bundle"
-        );
+        fixture.client.subscribe(NoOpHandler).await?;
+        fixture.client.unsubscribe().await?;
 
-        // A reader built after the cycle draws from the freshly built bundle.
         let second = fixture
             .client
             .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
             .await?;
-        assert_ne!(
+        assert_eq!(
             id_first,
             second.deps_instance_id(),
-            "resubscribe must rebuild the bundle, not reuse the stale one"
+            "state and every subscription must share one dependency bundle"
         );
         Result::<()>::Ok(())
     })
@@ -321,9 +307,9 @@ fn subsystem(name: &str) -> Result<SubsystemName> {
 
 /// `state()` builds one bundle and reuses it across `subscribe`. The reader
 /// built while `Configured` and the reader built while `Running` carry the
-/// same `SharedDeps` construction id, proving the client reuses the bundle
-/// instead of building a second one. The consumer started by `subscribe`
-/// receives that same bundle.
+/// same `StateReaderDependencies` construction id, proving the client reuses
+/// the bundle instead of building a second one. The consumer started by
+/// `subscribe` receives that same bundle.
 #[test]
 fn state_before_and_after_subscribe_share_one_bundle() -> Result<()> {
     let fixture = create_test_client::<NoOpHandler>("share-one-bundle", None)?;
@@ -359,10 +345,10 @@ fn state_before_and_after_subscribe_share_one_bundle() -> Result<()> {
 const GROUP: &str = "group-aaa";
 
 /// A reader built from the client observes committed state in the client's
-/// single retained `SharedDeps` bundle. That bundle holds the same in-memory
-/// cell store the running consumer holds, so this proves `client.state()`
-/// composes readers over the consumer's shared stores instead of a separate
-/// set.
+/// single retained `StateReaderDependencies` bundle. That bundle holds the same
+/// in-memory cell store the running consumer holds, so this proves
+/// `client.state()` composes readers over the consumer's shared stores instead
+/// of a separate set.
 ///
 /// A faithful end-to-end version of this test would drive the write through a
 /// produced Kafka record. The in-process mock cluster cannot do that: it
@@ -389,7 +375,6 @@ fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
             let deps = fixture
                 .client
                 .retained_deps()
-                .await
                 .ok_or_else(|| eyre!("client retained no shared bundle after subscribe"))?;
             let backend = deps.backend();
             let cells = backend.cells();

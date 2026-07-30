@@ -189,7 +189,7 @@ impl LoaderConfiguration {
     /// [`KafkaLoaderConfiguration`]. A `{group_id}.defer-loader` group keeps
     /// the loader out of the primary consumer's group coordination.
     #[must_use]
-    fn for_consumer(consumer_config: &ConsumerConfiguration) -> Self {
+    pub(crate) fn for_consumer(consumer_config: &ConsumerConfiguration) -> Self {
         Self {
             bootstrap_servers: consumer_config.bootstrap_servers.clone(),
             group_id: format!("{}.defer-loader", consumer_config.group_id),

@@ -24,7 +24,7 @@ use crate::state::tests::support::{FixedOracle, ScriptedPublicationStore};
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::{ReaderComponents, ScriptedReaderBackend};
 use crate::state_reader::cache::ReaderCache;
-use crate::state_reader::deps::SharedDeps;
+use crate::state_reader::deps::StateReaderDependencies;
 use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
 use crate::{Key, SegmentId, Topic};
@@ -283,8 +283,8 @@ fn scripted_deps(
     publications: ScriptedPublicationStore,
     identities: CountingIdentityStore,
     cache: ReaderCache,
-) -> SharedDeps<JsonCodec, ScriptedReaderBackend> {
-    SharedDeps::from_parts(
+) -> StateReaderDependencies<JsonCodec, ScriptedReaderBackend> {
+    StateReaderDependencies::from_parts(
         ReaderComponents::new(cells, publications, identities, MemoryLoader::new()),
         cache,
     )
@@ -391,7 +391,7 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
     pub(in crate::state_reader::tests) fn deps_with_cache(
         &self,
         cache: ReaderCache,
-    ) -> SharedDeps<JsonCodec, ScriptedReaderBackend> {
+    ) -> StateReaderDependencies<JsonCodec, ScriptedReaderBackend> {
         scripted_deps(
             self.cells.clone(),
             self.publications.clone(),

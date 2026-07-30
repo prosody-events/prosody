@@ -144,6 +144,7 @@ impl<S: PublicationStore, N: PartitionCountSource> FirstWriteBarrier for FirstWr
 }
 
 #[derive(Clone, Copy)]
+/// A first-write barrier for backends without publication.
 pub struct NoPublisher;
 
 impl FirstWriteBarrier for NoPublisher {

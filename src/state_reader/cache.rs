@@ -24,10 +24,10 @@
 
 use crate::Key;
 use crate::error::ErrorCategory;
-use crate::state::StateName;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::CellKey;
 use crate::state::store::CellBuffer;
+use crate::state::{StateName, StateType};
 use crate::state_reader::source::SourceId;
 use bytes::Bytes;
 use quanta::{Clock, Instant};
@@ -37,10 +37,11 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::task::coop::cooperative;
 
 /// Fixed per-entry accounting overhead added to every entry's declared weight,
 /// so a zero-byte negative entry still costs the budget something.
-const READER_CACHE_ENTRY_OVERHEAD: u64 = 64;
+const READER_CACHE_ENTRY_OVERHEAD: u64 = 176;
 
 /// A cache entry's issue token. The two fields answer two different questions,
 /// so they are never combined into one ordering:
@@ -73,11 +74,10 @@ pub(crate) struct Stamp {
     seq: u64,
 }
 
-/// The cache key: the stable [`SourceId`], the collection name, the partition
-/// key, and the cell. The [`SourceId`] is stable, never an ordinal, so an entry
-/// never aliases another source across a snapshot reorder. The [`StateName`]
-/// keeps two collections that share the cache from aliasing each other.
-pub(crate) type CacheKey = (SourceId, StateName, Key, CellKey);
+/// The cache key: the stable [`SourceId`], state namespace, collection name,
+/// partition key, and cell. The [`SourceId`] is stable, never an ordinal, so
+/// an entry never aliases another source across a snapshot reorder.
+pub(crate) type CacheKey = (SourceId, StateType, StateName, Key, CellKey);
 
 /// The cached value: the issue stamp and the committed bytes (or cached
 /// known-absence).
@@ -94,12 +94,13 @@ pub(crate) struct ReaderWeighter;
 
 impl Weighter<CacheKey, CacheVal> for ReaderWeighter {
     fn weight(&self, key: &CacheKey, val: &CacheVal) -> u64 {
-        let (source, name, partition_key, cell) = key;
+        let (source, _state_type, name, partition_key, cell) = key;
         let key_bytes = source.group_id.len()
             + source.topic.len()
             + name.as_str().len()
             + partition_key.len()
-            // section discriminator (i8) + coordinate bytes
+            // state type + section discriminator + coordinate bytes
+            + 1
             + 1
             + cell.coordinate.as_bytes().len();
         let val_bytes = val.1.as_ref().map_or(0, Bytes::len);
@@ -275,7 +276,7 @@ impl ReaderCache {
             });
         }
         for (key, value) in keys.iter().zip(fresh.iter()) {
-            self.write_through(key, stamp, value.clone()).await;
+            cooperative(self.write_through(key, stamp, value.clone())).await;
         }
         Ok(fresh)
     }

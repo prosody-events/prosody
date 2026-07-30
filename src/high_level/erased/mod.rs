@@ -1,6 +1,7 @@
 //! Optional type erasure for foreign-language client wrappers.
 
 use crate::cassandra::config::CassandraConfiguration;
+use crate::consumer::MockConfigurationError;
 use crate::consumer::middleware::FallibleHandler;
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::state::ConsumerState;
@@ -128,10 +129,7 @@ where
     C: Codec + Send + Sync,
     C::Payload: EventIdentity + EventType + Clone,
 {
-    let mock = consumers
-        .consumer
-        .configured_mock()
-        .map_err(ErasedClientBuildError::MockConfiguration)?;
+    let mock = consumers.consumer.configured_mock()?;
 
     if mock {
         Ok(Arc::new(ErasedClient(MemoryHighLevelClient::new(
@@ -259,8 +257,8 @@ where
     E: StdError + Send + Sync + 'static,
 {
     /// The existing mock-mode environment override could not be parsed.
-    #[error("invalid mock-mode configuration: {0}")]
-    MockConfiguration(String),
+    #[error(transparent)]
+    MockConfiguration(#[from] MockConfigurationError),
     /// A live client requires Cassandra storage configuration.
     #[error("Cassandra configuration is required when mock mode is disabled")]
     MissingCassandra,

@@ -46,89 +46,25 @@ use crate::state::access::StateAccessError;
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor::StructuralIdentity;
 use crate::state::identity::{CollectionId, StateKey};
-use crate::state::registry::CollectionDef;
+use crate::state::registry::MAX_KEYSET_LIMIT;
 use crate::state::session::CellRead;
 use crate::state::session::sealed::ReadAdmission;
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::{CommittedCellSource, ReaderBackend};
-use crate::state_reader::cache::{CacheKey, ReaderCache};
+use crate::state_reader::cache::CacheKey;
 use crate::state_reader::partition_for_key;
 use crate::state_reader::source::{Source, ValidatedPublications};
 use bytes::Bytes;
 use futures::stream::{FuturesOrdered, Stream, StreamExt};
-use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Duration;
 use tokio::task::coop::cooperative;
 
-/// A collection definition whose inherited reader-cache policy is resolved.
-#[derive(Clone, Copy)]
-pub(crate) struct ReaderCollectionDef {
-    collection: CollectionDef,
-    read_cache_ttl: Option<Duration>,
-}
+mod context;
 
-impl ReaderCollectionDef {
-    pub(crate) fn new(collection: CollectionDef, read_cache_ttl: Option<Duration>) -> Self {
-        Self {
-            collection,
-            read_cache_ttl,
-        }
-    }
-}
-
-/// Everything a [`StateReader`](super::StateReader) shares with every session
-/// it builds: which collection it addresses, and the infrastructure handles it
-/// cloned from the bundle. A session adds only what varies per operation — the
-/// snapshot, the key, and the pin.
-///
-/// Every field is a cheap-clone handle, so building a session per operation
-/// copies no resources.
-pub(crate) struct ReaderContext<C: Codec, B> {
-    pub(super) backend: Arc<B>,
-    codec: PhantomData<fn() -> C>,
-    cache: ReaderCache,
-    def: ReaderCollectionDef,
-    pub(super) state_type: StateType,
-    pub(super) name: StateName,
-}
-
-impl<C: Codec, B: ReaderBackend<C>> ReaderContext<C, B> {
-    pub(crate) fn new(
-        backend: Arc<B>,
-        cache: ReaderCache,
-        def: ReaderCollectionDef,
-        state_type: StateType,
-        name: StateName,
-    ) -> Self {
-        Self {
-            backend,
-            codec: PhantomData,
-            cache,
-            def,
-            state_type,
-            name,
-        }
-    }
-}
-
-/// Cloning shares handles; the manual impl keeps the bundle free of a
-/// `C: Clone` bound the derive would add.
-impl<C: Codec, B> Clone for ReaderContext<C, B> {
-    fn clone(&self) -> Self {
-        Self {
-            backend: self.backend.clone(),
-            codec: PhantomData,
-            cache: self.cache.clone(),
-            def: self.def,
-            state_type: self.state_type,
-            name: self.name.clone(),
-        }
-    }
-}
+pub(crate) use context::{ReaderCollectionDef, ReaderContext};
 
 /// A per-operation read-only session over a collection's validated publication
 /// snapshot. Implements [`CellRead`] only.
@@ -144,7 +80,12 @@ pub struct ReadSession<C: Codec, B> {
     key: Key,
     /// The pinned source, shared across the operation's handle clones so every
     /// call after the first data-bearing probe addresses one source.
-    pin: Arc<OnceLock<Source>>,
+    pin: Arc<OnceLock<PinnedSource>>,
+}
+
+struct PinnedSource {
+    source: Source,
+    collection: CollectionId,
 }
 
 impl<C: Codec, B> Clone for ReadSession<C, B> {
@@ -179,6 +120,11 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     /// empty keys are rejected at the `StateReader` boundary, so
     /// `partition_for_key` never errors here in practice.
     fn collection_id_for(&self, source: &Source) -> Result<CollectionId, StateAccessError> {
+        if let Some(pin) = self.pin.get()
+            && pin.source == *source
+        {
+            return Ok(pin.collection.clone());
+        }
         let partition = partition_for_key(self.key.as_bytes(), source.partition_count)
             .map_err(|e| StateAccessError::store(&e))?;
         let segment = partition_segment_id(source.id.topic, partition, &source.id.group_id);
@@ -190,9 +136,17 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         ))
     }
 
+    fn pin(&self, source: &Source, collection: CollectionId) {
+        let _ = self.pin.set(PinnedSource {
+            source: source.clone(),
+            collection,
+        });
+    }
+
     fn cache_key(&self, source: &Source, cell: &CellKey) -> CacheKey {
         (
             source.id.clone(),
+            self.context.state_type,
             self.context.name.clone(),
             self.key.clone(),
             cell.clone(),
@@ -315,7 +269,10 @@ where
     }
 
     fn collection_keyset_limit(&self, _state_type: StateType, _name: &StateName) -> usize {
-        self.context.def.collection.keyset_limit
+        // The persisted keyset records its own overflow. The global validated
+        // ceiling safely admits every tracked keyset regardless of the
+        // reader's local operational setting.
+        MAX_KEYSET_LIMIT
     }
 
     fn collection_capacity(
@@ -344,8 +301,8 @@ where
         _name: &StateName,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
-        if let Some(source) = self.pin.get() {
-            return self.cached_point(source, cell).await;
+        if let Some(pin) = self.pin.get() {
+            return self.cached_point(&pin.source, cell).await;
         }
         let sources = self.snapshot.sources();
         // `FuturesOrdered` heap-allocates one node per source, bounded by
@@ -363,14 +320,15 @@ where
             }));
         }
         let mut first_err = None;
-        while let Some((source, result)) = ordered.next().await {
+        while let Some((source, result)) = cooperative(ordered.next()).await {
             match result {
                 Ok(Some(value)) => {
                     // Discarding the `set` result is safe because unpinned reads
                     // in one operation are issued sequentially (the
                     // `SingleSourceCoherence` invariant). This is the first pin,
                     // so the `OnceLock` is empty and the set succeeds.
-                    let _ = self.pin.set(source.clone());
+                    let collection = self.collection_id_for(source)?;
+                    self.pin(source, collection);
                     return Ok(Some(value));
                 }
                 Ok(None) => {}
@@ -394,8 +352,8 @@ where
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
-        if let Some(source) = self.pin.get() {
-            return self.cached_batch(source, section, batch).await;
+        if let Some(pin) = self.pin.get() {
+            return self.cached_batch(&pin.source, section, batch).await;
         }
         let sources = self.snapshot.sources();
         // Bounded per-operation fan-out; see the ruling on the point-read
@@ -408,13 +366,14 @@ where
         }
         let mut first_err = None;
         let mut all_none: Option<CellBuffer<Option<Bytes>>> = None;
-        while let Some((source, result)) = ordered.next().await {
+        while let Some((source, result)) = cooperative(ordered.next()).await {
             match result {
                 Ok(buffer) => {
                     if buffer.iter().any(Option::is_some) {
                         // First pin, so the set succeeds and discarding its
                         // result is safe; see the `get` pin above.
-                        let _ = self.pin.set(source.clone());
+                        let collection = self.collection_id_for(source)?;
+                        self.pin(source, collection);
                         return Ok(buffer);
                     }
                     if all_none.is_none() {
@@ -449,11 +408,11 @@ where
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         async_stream::try_stream! {
-            if let Some(source) = self.pin.get() {
-                let id = self.collection_id_for(source)?;
+            if let Some(pin) = self.pin.get() {
+                let id = pin.collection.clone();
                 let inner = self.context.backend.cells().scan(&id, scan);
                 futures::pin_mut!(inner);
-                while let Some(item) = inner.next().await {
+                while let Some(item) = cooperative(inner.next()).await {
                     yield item.map_err(|error| StateAccessError::store(&error))?;
                 }
                 return;
@@ -473,10 +432,10 @@ where
                 futures::pin_mut!(inner);
                 let mut yielded_any = false;
                 loop {
-                    match inner.next().await {
+                    match cooperative(inner.next()).await {
                         Some(Ok(item)) => {
                             if !yielded_any {
-                                let _ = self.pin.set(source.clone());
+                                self.pin(source, id.clone());
                                 yielded_any = true;
                             }
                             yield item;

@@ -27,7 +27,7 @@ pub use definition::{CollectionDef, CommitMode, ReadCachePolicy, StateVisibility
 /// build ([`RegisterStateError::KeysetLimit`]), capping the point-get fan-out
 /// (and decode allocation) a single `stream` can issue — the byte ceiling
 /// separately bounds the frame's wire size.
-const MAX_KEYSET_LIMIT: usize = 4096;
+pub(crate) const MAX_KEYSET_LIMIT: usize = 4096;
 
 /// A registered collection: the descriptor-derived frozen identity plus
 /// the operational definition.

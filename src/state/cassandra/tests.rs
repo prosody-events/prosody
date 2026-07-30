@@ -20,7 +20,9 @@ use crate::cassandra::CassandraStore;
 use crate::state::tests::identity_suite::{
     IdentityTrace, run_concurrent_conflicting, run_concurrent_identical, run_identity_trace,
 };
-use crate::state::tests::publication_suite::{PublicationTrace, run_publication_trace};
+use crate::state::tests::publication_suite::{
+    PublicationTrace, cleanup_publication_trace, run_publication_trace,
+};
 use crate::test_util::{TEST_RUNTIME, integration_test_count, test_cassandra_config};
 use crate::tracing::init_test_logging;
 use color_eyre::eyre::Result;
@@ -60,10 +62,12 @@ fn prop_cassandra_publication_trace() {
             Err(error) => return TestResult::error(format!("store setup failed: {error:?}")),
         };
         let token = Uuid::new_v4().to_string();
-        match TEST_RUNTIME.block_on(run_publication_trace(&store, &token, trace)) {
-            Ok(true) => TestResult::passed(),
-            Ok(false) => TestResult::failed(),
-            Err(error) => TestResult::error(format!("{error:?}")),
+        let outcome = TEST_RUNTIME.block_on(run_publication_trace(&store, &token, trace));
+        let cleanup = TEST_RUNTIME.block_on(cleanup_publication_trace(&store, &token));
+        match (outcome, cleanup) {
+            (Ok(true), Ok(())) => TestResult::passed(),
+            (Ok(false), Ok(())) => TestResult::failed(),
+            (Err(error), _) | (_, Err(error)) => TestResult::error(format!("{error:?}")),
         }
     }
     init_test_logging();

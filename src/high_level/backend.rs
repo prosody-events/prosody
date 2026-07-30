@@ -2,11 +2,12 @@
 
 use crate::cassandra::config::CassandraConfiguration;
 use crate::codec::Codec;
-use crate::consumer::{ConsumerConfiguration, KeyedStateConfiguration};
+use crate::high_level::deps::ReaderConfiguration;
 use crate::loader::MemoryLoader;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state_reader::{
-    CassandraReaderBackend, MemoryReaderBackend, ReaderBackend, SharedDeps, StateReaderError,
+    CassandraReaderBackend, MemoryReaderBackend, ReaderBackend, StateReaderDependencies,
+    StateReaderError,
 };
 use std::marker::PhantomData;
 
@@ -29,37 +30,59 @@ where
     /// Builds the shared reader components.
     fn build_reader(
         &self,
-        consumer: &ConsumerConfiguration,
-        keyed_state: &KeyedStateConfiguration,
-    ) -> impl Future<Output = Result<SharedDeps<C, Self::Reader>, StateReaderError>> + Send;
+        config: &ReaderConfiguration,
+    ) -> impl Future<Output = Result<StateReaderDependencies<C, Self::Reader>, StateReaderError>> + Send;
 }
 
 /// In-memory high-level client backend.
-pub struct MemoryClientBackend<C>(PhantomData<fn() -> C>);
+///
+/// The backend constructs one store family shared by readers and consumers.
+pub struct MemoryClientBackend<C: Codec> {
+    cells: MemoryCells,
+    publications: MemoryPublicationStore,
+    identities: MemoryDescriptorIdentityStore,
+    loader: MemoryLoader<C::Payload>,
+}
 
-impl<C> MemoryClientBackend<C> {
+impl<C> MemoryClientBackend<C>
+where
+    C: Codec,
+    C::Payload: Send + Sync + 'static,
+{
     /// Selects in-memory storage.
     #[must_use]
-    pub const fn new() -> Self {
-        Self(PhantomData)
+    pub fn new() -> Self {
+        Self {
+            cells: MemoryCells::new(),
+            publications: MemoryPublicationStore::new(),
+            identities: MemoryDescriptorIdentityStore::new(),
+            loader: MemoryLoader::new(),
+        }
     }
 }
 
-impl<C> Clone for MemoryClientBackend<C> {
+impl<C: Codec> Clone for MemoryClientBackend<C> {
     fn clone(&self) -> Self {
-        *self
+        Self {
+            cells: self.cells.clone(),
+            publications: self.publications.clone(),
+            identities: self.identities.clone(),
+            loader: self.loader.clone(),
+        }
     }
 }
 
-impl<C> Copy for MemoryClientBackend<C> {}
-
-impl<C> sealed::Sealed for MemoryClientBackend<C> {}
-
-impl<C> Default for MemoryClientBackend<C> {
+impl<C> Default for MemoryClientBackend<C>
+where
+    C: Codec,
+    C::Payload: Send + Sync + 'static,
+{
     fn default() -> Self {
         Self::new()
     }
 }
+
+impl<C: Codec> sealed::Sealed for MemoryClientBackend<C> {}
 
 impl<C> ClientBackend<C> for MemoryClientBackend<C>
 where
@@ -70,19 +93,18 @@ where
 
     async fn build_reader(
         &self,
-        consumer: &ConsumerConfiguration,
-        keyed_state: &KeyedStateConfiguration,
-    ) -> Result<SharedDeps<C, Self::Reader>, StateReaderError> {
-        Ok(SharedDeps::memory(
-            consumer.group_id.clone(),
-            consumer.stall_threshold,
-            MemoryCells::new(),
-            MemoryPublicationStore::new(),
-            MemoryDescriptorIdentityStore::new(),
-            MemoryLoader::new(),
-            keyed_state.reader_cache_size().get(),
+        config: &ReaderConfiguration,
+    ) -> Result<StateReaderDependencies<C, Self::Reader>, StateReaderError> {
+        Ok(StateReaderDependencies::memory(
+            config.group_id.clone(),
+            config.stall_threshold,
+            self.cells.clone(),
+            self.publications.clone(),
+            self.identities.clone(),
+            self.loader.clone(),
+            config.cache_size,
         )
-        .with_default_read_cache_ttl(keyed_state.read_cache_ttl))
+        .with_default_read_cache_ttl(config.cache_ttl))
     }
 }
 
@@ -120,13 +142,15 @@ where
 
     async fn build_reader(
         &self,
-        consumer: &ConsumerConfiguration,
-        keyed_state: &KeyedStateConfiguration,
-    ) -> Result<SharedDeps<C, Self::Reader>, StateReaderError> {
-        Ok(
-            SharedDeps::connect(consumer, &self.config, keyed_state.reader_cache_size())
-                .await?
-                .with_default_read_cache_ttl(keyed_state.read_cache_ttl),
+        config: &ReaderConfiguration,
+    ) -> Result<StateReaderDependencies<C, Self::Reader>, StateReaderError> {
+        Ok(StateReaderDependencies::cassandra_with_loader(
+            &self.config,
+            config.loader.clone(),
+            config.cache_size,
+            config.stall_threshold,
         )
+        .await?
+        .with_default_read_cache_ttl(config.cache_ttl))
     }
 }

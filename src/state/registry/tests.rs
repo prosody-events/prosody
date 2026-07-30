@@ -5,11 +5,10 @@ use crate::state::descriptor::{DescriptorIdentity, value_state};
 use color_eyre::eyre::Result;
 
 /// A `Published` collection registered under a non-`Application` state type
-/// is rejected at registration. Publication routing rows carry no
-/// `state_type`, and the reader addresses `Application` cells only, so any
-/// other type would be unaddressable. The test uses the `#[cfg(test)]`
-/// `Framework` state type. Its `Application` arm shows the guard is
-/// specific to the state type, not a blanket ban on publishing.
+/// is rejected at registration. Cross-group publication is an application
+/// capability even though routing rows retain the namespace discriminator.
+/// The test uses the `#[cfg(test)]` `Framework` state type. Its `Application`
+/// arm shows the guard is specific to the state type.
 #[test]
 fn published_non_application_state_type_rejected() -> Result<()> {
     let identity = value_state::<JsonCodec>("cart").structural_identity();

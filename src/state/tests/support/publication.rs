@@ -1,0 +1,263 @@
+//! Scripted publication storage used by routing and refresh tests.
+
+use super::*;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PublicationCall {
+    Upsert {
+        name: String,
+        group: String,
+        topic: String,
+        partition_count: i32,
+    },
+    Remove {
+        name: String,
+        group: String,
+    },
+    Read {
+        name: String,
+    },
+}
+
+struct ReleaseGate {
+    entered: Semaphore,
+    released: Semaphore,
+}
+
+#[derive(Clone)]
+pub(crate) struct ScriptedPublicationStore {
+    inner: MemoryPublicationStore,
+    calls: Arc<Mutex<Vec<PublicationCall>>>,
+    fail: Arc<AtomicBool>,
+    read_fail: Arc<Mutex<Option<ErrorCategory>>>,
+    remove_fail: Arc<Mutex<Option<ErrorCategory>>>,
+    errored: Arc<Semaphore>,
+    gate: Option<Arc<ReleaseGate>>,
+    read_gate: Arc<Mutex<Option<Arc<ReleaseGate>>>>,
+}
+
+impl ScriptedPublicationStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: MemoryPublicationStore::new(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail: Arc::new(AtomicBool::new(false)),
+            read_fail: Arc::new(Mutex::new(None)),
+            remove_fail: Arc::new(Mutex::new(None)),
+            errored: Arc::new(Semaphore::new(0)),
+            gate: None,
+            read_gate: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn failing() -> Self {
+        let store = Self::new();
+        store.fail.store(true, Ordering::Release);
+        store
+    }
+
+    pub(crate) fn gated() -> Self {
+        Self {
+            gate: Some(Arc::new(ReleaseGate {
+                entered: Semaphore::new(0),
+                released: Semaphore::new(0),
+            })),
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn heal(&self) {
+        self.fail.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn fail_reads_with(&self, category: ErrorCategory) {
+        *self.read_fail.lock() = Some(category);
+    }
+
+    pub(crate) fn fail_removes_with(&self, category: ErrorCategory) {
+        *self.remove_fail.lock() = Some(category);
+    }
+
+    pub(crate) fn heal_reads(&self) {
+        *self.read_fail.lock() = None;
+    }
+
+    pub(crate) async fn wait_errored(&self) {
+        if let Ok(permit) = self.errored.acquire().await {
+            permit.forget();
+        }
+    }
+
+    pub(crate) async fn wait_entered(&self) {
+        if let Some(gate) = &self.gate
+            && let Ok(permit) = gate.entered.acquire().await
+        {
+            permit.forget();
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        if let Some(gate) = &self.gate {
+            gate.released.add_permits(1);
+        }
+    }
+
+    pub(crate) fn gate_reads(&self) {
+        *self.read_gate.lock() = Some(Arc::new(ReleaseGate {
+            entered: Semaphore::new(0),
+            released: Semaphore::new(0),
+        }));
+    }
+
+    pub(crate) async fn wait_read_entered(&self) {
+        let gate = self.read_gate.lock().clone();
+        if let Some(gate) = gate
+            && let Ok(permit) = gate.entered.acquire().await
+        {
+            permit.forget();
+        }
+    }
+
+    pub(crate) fn release_read(&self) {
+        if let Some(gate) = &*self.read_gate.lock() {
+            gate.released.add_permits(1);
+        }
+    }
+
+    pub(crate) async fn seed(
+        &self,
+        subsystem: &SubsystemName,
+        state_type: StateType,
+        name: &StateName,
+        row: &StatePublication,
+    ) {
+        let _ = self.inner.upsert(subsystem, state_type, name, row).await;
+    }
+
+    pub(crate) fn calls(&self) -> Vec<PublicationCall> {
+        self.calls.lock().clone()
+    }
+
+    pub(crate) fn reads(&self) -> usize {
+        self.calls
+            .lock()
+            .iter()
+            .filter(|call| matches!(call, PublicationCall::Read { .. }))
+            .count()
+    }
+
+    pub(crate) fn upserts_for(&self, name: &str, topic: &str) -> usize {
+        self.calls
+            .lock()
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call,
+                    PublicationCall::Upsert { name: stored_name, topic: stored_topic, .. }
+                        if stored_name == name && stored_topic == topic
+                )
+            })
+            .count()
+    }
+
+    pub(crate) async fn rows(
+        &self,
+        subsystem: &SubsystemName,
+        state_type: StateType,
+        name: &StateName,
+    ) -> Vec<StatePublication> {
+        self.inner
+            .read_publications(subsystem, state_type, name)
+            .await
+            .unwrap_or_default()
+            .into_vec()
+    }
+}
+
+impl PublicationStore for ScriptedPublicationStore {
+    type Error = ScriptedPublicationError;
+
+    async fn upsert(
+        &self,
+        subsystem: &SubsystemName,
+        state_type: StateType,
+        name: &StateName,
+        row: &StatePublication,
+    ) -> Result<(), Self::Error> {
+        if self.fail.load(Ordering::Acquire) {
+            self.errored.add_permits(1);
+            return Err(ScriptedPublicationError(ErrorCategory::Transient));
+        }
+        if let Some(gate) = &self.gate {
+            gate.entered.add_permits(1);
+            if let Ok(permit) = gate.released.acquire().await {
+                permit.forget();
+            }
+        }
+        self.calls.lock().push(PublicationCall::Upsert {
+            name: name.as_str().to_owned(),
+            group: row.group_id.to_string(),
+            topic: row.topic.to_string(),
+            partition_count: i32::from(row.partition_count),
+        });
+        self.inner
+            .upsert(subsystem, state_type, name, row)
+            .await
+            .map_err(|error| match error {})
+    }
+
+    async fn remove_group(
+        &self,
+        subsystem: &SubsystemName,
+        state_type: StateType,
+        name: &StateName,
+        group_id: &str,
+    ) -> Result<(), Self::Error> {
+        self.calls.lock().push(PublicationCall::Remove {
+            name: name.as_str().to_owned(),
+            group: group_id.to_owned(),
+        });
+        if let Some(category) = *self.remove_fail.lock() {
+            return Err(ScriptedPublicationError(category));
+        }
+        self.inner
+            .remove_group(subsystem, state_type, name, group_id)
+            .await
+            .map_err(|error| match error {})
+    }
+
+    async fn read_publications(
+        &self,
+        subsystem: &SubsystemName,
+        state_type: StateType,
+        name: &StateName,
+    ) -> Result<PublicationRows, Self::Error> {
+        self.calls.lock().push(PublicationCall::Read {
+            name: name.as_str().to_owned(),
+        });
+        let gate = self.read_gate.lock().clone();
+        if let Some(gate) = gate {
+            gate.entered.add_permits(1);
+            if let Ok(permit) = gate.released.acquire().await {
+                permit.forget();
+            }
+        }
+        if let Some(category) = *self.read_fail.lock() {
+            return Err(ScriptedPublicationError(category));
+        }
+        self.inner
+            .read_publications(subsystem, state_type, name)
+            .await
+            .map_err(|error| match error {})
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error)]
+#[error("scripted publication error ({0:?})")]
+pub(crate) struct ScriptedPublicationError(ErrorCategory);
+
+impl ClassifyError for ScriptedPublicationError {
+    fn classify_error(&self) -> ErrorCategory {
+        self.0
+    }
+}

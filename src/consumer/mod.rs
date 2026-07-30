@@ -120,7 +120,7 @@ pub(crate) use crate::consumer::config::TypedConsumerSetup;
 pub use crate::consumer::config::{
     CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
     ConsumerConfigurationBuilderError, ConsumerSetup, LowLatencyMiddlewareConfiguration,
-    PipelineMiddlewareConfiguration, RecoveryTtlMarginError,
+    MockConfigurationError, PipelineMiddlewareConfiguration, RecoveryTtlMarginError,
 };
 pub use crate::consumer::error::{ConsumerError, KeyedStateInitError};
 pub use crate::consumer::event_context::{EventContext, TerminationSignals};

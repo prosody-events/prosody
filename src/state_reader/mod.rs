@@ -8,15 +8,17 @@
 //! never an in-flight provisional value, never owner-side repair. Each logical
 //! operation reads from at most one publication source (probe-and-pin).
 //!
-//! Construct one from a [`SharedDeps`] bundle with [`StateReader::new`]. Build
-//! the bundle once so its stores, loader, and byte-budgeted cache are shared,
-//! then build a reader per collection.
+//! Construct a [`StateReaderClient`] from one [`StateReaderDependencies`]
+//! bundle. The client shares that bundle's stores, loader, heartbeat registry,
+//! and byte-budgeted cache across every collection reader it creates.
 
 mod backend;
 mod cache;
+mod client;
 mod deps;
 mod error;
 mod partitioner;
+mod publication_cache;
 mod reader;
 mod session;
 mod source;
@@ -28,7 +30,8 @@ pub(crate) use backend::ConsumerReaderBackend;
 pub use backend::{
     CassandraReaderBackend, CommittedCellSource, MemoryReaderBackend, ReaderBackend,
 };
-pub use deps::SharedDeps;
+pub use client::{CassandraStateReaderClient, StateReaderClient};
+pub use deps::StateReaderDependencies;
 pub use error::StateReaderError;
 pub(crate) use source::PUBLICATION_READ_LIMIT;
 // `partition_for_key` is public on purpose. It is the librdkafka-compatible

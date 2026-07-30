@@ -46,11 +46,20 @@ type MessageStorage<P> =
 /// let message = loader.load_message(topic, 0, 100).await?;
 /// assert_eq!(message.offset(), 100);
 /// ```
-#[derive(Clone)]
 pub struct MemoryLoader<P> {
     messages: Arc<RwLock<MessageStorage<P>>>,
     semaphore: Arc<Semaphore>,
     message_spans: SpanRelation,
+}
+
+impl<P> Clone for MemoryLoader<P> {
+    fn clone(&self) -> Self {
+        Self {
+            messages: self.messages.clone(),
+            semaphore: self.semaphore.clone(),
+            message_spans: self.message_spans,
+        }
+    }
 }
 
 impl<P: Send + Sync + 'static> MemoryLoader<P> {

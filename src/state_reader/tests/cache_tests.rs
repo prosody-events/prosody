@@ -7,7 +7,8 @@
 //! entry. The focused tests below pin invariants that schedule cannot
 //! express: concurrent single-flight, a fill that advances the clock while it
 //! runs, the newer-wins comparison in `write_through`, and the byte-budget
-//! bound.
+//! bound. Its key pool includes two namespaces with the same collection name,
+//! proving `StateType` participates in cache identity.
 //!
 //! Every test drives a mocked monotonic clock instead of sleeping, so timing
 //! stays deterministic. The cache is exercised directly, with no
@@ -17,10 +18,10 @@
 
 use super::support::{mock_clock_cache, topic};
 use crate::Key;
-use crate::state::StateName;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::store::CellBuffer;
+use crate::state::{StateName, StateType};
 use crate::state_reader::cache::CacheKey;
 use crate::state_reader::source::SourceId;
 use bytes::Bytes;
@@ -35,12 +36,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// A cache key for the given collection name at cell coordinate `coord`.
-fn key_at(name: &str, coord: Vec<u8>) -> Result<CacheKey> {
+fn key_at(state_type: StateType, name: &str, coord: Vec<u8>) -> Result<CacheKey> {
     Ok((
         SourceId {
             group_id: Arc::from("group-aaa"),
             topic: topic("t"),
         },
+        state_type,
         StateName::try_new(name)?,
         Key::from("user-1"),
         CellKey {
@@ -52,7 +54,7 @@ fn key_at(name: &str, coord: Vec<u8>) -> Result<CacheKey> {
 
 /// A cache key for the given collection name and one fixed cell.
 fn key(name: &str) -> Result<CacheKey> {
-    key_at(name, vec![0])
+    key_at(StateType::Application, name, vec![0])
 }
 
 // --- Staleness property -----------------------------------------------------
@@ -61,7 +63,12 @@ fn key(name: &str) -> Result<CacheKey> {
 /// **only** by `StateName`: same source, partition key, and cell. A cache key
 /// that dropped `StateName` would collapse them, aliasing one collection's
 /// entry onto another's.
-const CACHE_NAMES: [&str; 3] = ["cache-n0", "cache-n1", "cache-n2"];
+const CACHE_KEYS: [(StateType, &str); 4] = [
+    (StateType::Application, "cache-n0"),
+    (StateType::Application, "cache-n1"),
+    (StateType::Application, "cache-n2"),
+    (StateType::Framework, "cache-n0"),
+];
 
 /// The per-get TTL pool the schedule draws from: the degenerate zero (every
 /// read is born stale), a sub-millisecond TTL the old millisecond clock could
@@ -107,7 +114,7 @@ impl Arbitrary for CacheStep {
             Self::Advance(u8::arbitrary(g) % ADVANCE_POOL.len() as u8)
         } else {
             Self::Get {
-                key: u8::arbitrary(g) % CACHE_NAMES.len() as u8,
+                key: u8::arbitrary(g) % CACHE_KEYS.len() as u8,
                 ttl: u8::arbitrary(g) % TTL_POOL.len() as u8,
                 present: bool::arbitrary(g),
             }
@@ -143,9 +150,9 @@ fn fill_value(key: u8, present: bool) -> Option<Bytes> {
     present.then(|| Bytes::from(vec![key]))
 }
 
-/// One property proves five staleness rules at once: stamp-at-issue age, the
-/// `age == ttl` miss boundary, negative-entry refresh, `StateName`
-/// no-aliasing, and per-ttl freshness windows over a shared entry.
+/// One property proves the staleness rules and cache-key isolation together:
+/// stamp-at-issue age, the `age == ttl` miss boundary, negative-entry refresh,
+/// namespace and name isolation, and per-ttl freshness windows.
 ///
 /// A plain `HashMap<key, (issued, value)>` model predicts, for every get,
 /// both the served value and whether a fill fires. A get is a hit served
@@ -156,8 +163,8 @@ fn fill_value(key: u8, present: bool) -> Option<Bytes> {
 ///
 /// Falsify: change `ReaderCache::fresh`'s `<` to `<=`. An `age == ttl` step
 /// then serves a stale hit, so the fill count trails the model. Or drop
-/// `StateName` from `CacheKey`: a later get of a different name then hits
-/// the first name's entry, serving the wrong bytes with no fill.
+/// `StateName` or `StateType` from `CacheKey`: a later distinct collection
+/// then hits the first entry, serving the wrong bytes with no fill.
 #[test]
 fn prop_cache_staleness() {
     fn property(schedule: CacheSchedule) -> Result<bool> {
@@ -169,9 +176,9 @@ fn prop_cache_staleness() {
 async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
     let (cache, mock) = mock_clock_cache(1 << 20);
     let clock = cache.clock();
-    let keys: Vec<CacheKey> = CACHE_NAMES
+    let keys: Vec<CacheKey> = CACHE_KEYS
         .iter()
-        .map(|name| key(name))
+        .map(|(state_type, name)| key_at(*state_type, name, vec![0]))
         .collect::<Result<_>>()?;
     let fills = Arc::new(AtomicUsize::new(0));
     // key idx -> (issue instant, cached value).
@@ -397,7 +404,7 @@ async fn declared_weight_bounded_by_budget() -> Result<()> {
     let (cache, _mock) = mock_clock_cache(budget);
     let value = Bytes::from(vec![0u8; 256]);
     for i in 0..200u32 {
-        let k = key_at("weighted", i.to_be_bytes().to_vec())?;
+        let k = key_at(StateType::Application, "weighted", i.to_be_bytes().to_vec())?;
         let value = value.clone();
         cache
             .get_cached(k, Duration::from_secs(1000), || {

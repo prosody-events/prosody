@@ -123,9 +123,8 @@ pub enum KeyedStateInitError {
     /// typically because the publication store was unreachable.
     ///
     /// This variant carries a rendered message plus the error's classification
-    /// instead of the source type. A per-collection permanent decode failure
-    /// is logged and skipped, so any error surfaced here comes from the store
-    /// itself. Such a failure is typically transient, and the deploy retries.
+    /// instead of the source type. Reconciliation propagates every failure so
+    /// startup cannot continue with routing rows of unknown freshness.
     #[error("keyed-state publication reconciliation failed: {message}")]
     Publication {
         /// Rendered reconciliation error, full source chain.
@@ -133,6 +132,10 @@ pub enum KeyedStateInitError {
         /// The reconciliation error's captured classification.
         category: ErrorCategory,
     },
+
+    /// Published state needs a real topic partition count outside mock mode.
+    #[error("published keyed state with in-memory storage requires mock mode")]
+    PublishedMemoryStorage,
 
     /// Keyed-state collections were registered on the low-level
     /// [`ProsodyConsumer::new`](crate::consumer::ProsodyConsumer::new)

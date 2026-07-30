@@ -82,8 +82,8 @@ pub struct PartitionBackend<O, I, C, P = NoPublisher> {
 }
 
 impl<O, I, C, P> PartitionBackend<O, I, C, P> {
-    /// Bundles the per-partition backend parts: the shared oracle, the shared
-    /// descriptor-identity store, and the uniform cell store.
+    /// Bundles the shared oracle, descriptor-identity store, cell store, and
+    /// optional first-write publisher for one partition.
     #[must_use]
     pub fn with_publisher(oracle: O, identity: I, cell: C, publisher: Option<P>) -> Self {
         Self {

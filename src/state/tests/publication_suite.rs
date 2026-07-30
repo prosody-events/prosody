@@ -286,3 +286,25 @@ where
     }
     Ok(true)
 }
+
+/// Removes every row address the trace pool can create for `token`.
+pub(crate) async fn cleanup_publication_trace<S>(store: &S, token: &str) -> Result<()>
+where
+    S: PublicationStore,
+{
+    for subsystem in 0..u8::try_from(SUBSYSTEMS)? {
+        for state_type in STATE_TYPES {
+            for name in NAMES {
+                let subsystem = subsystem_for(token, subsystem)?;
+                let name = StateName::try_new(name)?;
+                for group in GROUPS {
+                    store
+                        .remove_group(&subsystem, state_type, &name, group)
+                        .await
+                        .map_err(|error| eyre!("publication cleanup failed: {error}"))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}

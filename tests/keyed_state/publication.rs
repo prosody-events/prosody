@@ -7,12 +7,12 @@ use crate::cart::{LAST_SEEN, RECEIPT, cart};
 use crate::common;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::CassandraStore;
-use prosody::consumer::{ConsumerConfiguration, message_state};
+use prosody::consumer::{ConsumerConfiguration, KeyedStateConfiguration, message_state};
 use prosody::loader::KafkaLoader;
 use prosody::state::cassandra::{CassandraPublicationStore, PublicationQueries};
 use prosody::state::publication::PublicationStore;
 use prosody::state::{StateName, StateType};
-use prosody::state_reader::{CassandraReaderBackend, SharedDeps, StateReader};
+use prosody::state_reader::{CassandraReaderBackend, StateReaderClient, StateReaderDependencies};
 use prosody::subsystem::SubsystemName;
 use prosody::{JsonCodec, Topic};
 use serde_json::json;
@@ -72,9 +72,10 @@ pub(crate) async fn assert_routing_row(
 
 /// Reads the published `cart` and `receipt` back through standalone
 /// Cassandra-backed readers, exercising the full production read path:
-/// `SharedDeps::connect`, publication-source discovery, frozen-identity
-/// validation against the reader's descriptor, probe-and-pin, and the committed
-/// projection. Both reads must observe exactly what the pipeline committed.
+/// `StateReaderDependencies::cassandra`, publication-source discovery,
+/// frozen-identity validation against the reader's descriptor, probe-and-pin,
+/// and the committed projection. Both reads must observe exactly what the
+/// pipeline committed.
 pub(crate) async fn read_cart_via_standalone_reader(
     subsystem: &SubsystemName,
     consumer_config: &ConsumerConfiguration,
@@ -83,17 +84,18 @@ pub(crate) async fn read_cart_via_standalone_reader(
     // One `connect` opens the session, prepares the reader's queries, and builds
     // the Kafka loader. The plain `Value` read below never consults the loader;
     // the receipt read does.
-    let budget = NonZeroU64::new(READER_CACHE_BYTES).ok_or_else(|| eyre!("nonzero budget"))?;
-    let deps = SharedDeps::<JsonCodec, CassandraReaderBackend<JsonCodec>>::connect(
+    let keyed_state = KeyedStateConfiguration::builder()
+        .read_cache_size_bytes(NonZeroU64::new(READER_CACHE_BYTES))
+        .build()?;
+    let deps = StateReaderDependencies::<JsonCodec, CassandraReaderBackend<JsonCodec>>::cassandra(
         consumer_config,
         &common::test_cassandra_config(),
-        budget,
+        &keyed_state,
     )
     .await?;
+    let reader = StateReaderClient::new(deps);
 
-    let value = StateReader::new(&deps, subsystem.clone(), cart())?
-        .get(key)
-        .await?;
+    let value = reader.state(subsystem.clone(), cart())?.get(key).await?;
     ensure!(
         value == Some(json!(["apple", "banana"])),
         "standalone reader must observe the committed cart, got {value:?}"
@@ -104,14 +106,14 @@ pub(crate) async fn read_cart_via_standalone_reader(
     // from Kafka. The reader binds the same message identity under its own
     // loader because the resolver id does not depend on the loader, so the
     // source discovered above serves the second message the consumer recorded.
-    let receipt = StateReader::new(
-        &deps,
-        subsystem.clone(),
-        message_state::<KafkaLoader<JsonCodec>>(RECEIPT),
-    )?
-    .get(key)
-    .await?
-    .ok_or_else(|| eyre!("standalone reader observed no published receipt"))?;
+    let receipt = reader
+        .state(
+            subsystem.clone(),
+            message_state::<KafkaLoader<JsonCodec>>(RECEIPT),
+        )?
+        .get(key)
+        .await?
+        .ok_or_else(|| eyre!("standalone reader observed no published receipt"))?;
     ensure!(
         receipt.offset() == 1,
         "receipt must reference the second message's offset, got {}",
