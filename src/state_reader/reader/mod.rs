@@ -221,6 +221,24 @@ where
             .map_err(|e| StateReaderError::store(&e))
     }
 
+    /// Reports whether a committed map entry exists without decoding its value.
+    ///
+    /// # Errors
+    ///
+    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
+    pub async fn contains_key<K: Into<Key>>(
+        &self,
+        key: K,
+        map_key: &KC::Key,
+    ) -> Result<bool, StateReaderError> {
+        let session = self.session(key.into()).await?;
+        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
+        handle
+            .contains_key(map_key)
+            .await
+            .map_err(|e| StateReaderError::store(&e))
+    }
+
     /// Reads the committed values for `map_keys` as one isolated batch,
     /// index-aligned to the input.
     ///
@@ -274,6 +292,32 @@ where
             }
         })
     }
+
+    /// Streams committed live keys without decoding or resolving values.
+    ///
+    /// # Errors
+    ///
+    /// Any [`StateReaderError`] from acquiring the session. Per-source read
+    /// failures surface as stream items.
+    pub async fn keys<K: Into<Key>>(
+        &self,
+        key: K,
+        dir: Direction,
+    ) -> Result<impl Stream<Item = Result<KC::Key, StateReaderError>> + 'static, StateReaderError>
+    where
+        V: 'static,
+        KC::Key: 'static,
+    {
+        let session = self.session(key.into()).await?;
+        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
+        Ok(async_stream::try_stream! {
+            let inner = handle.keys(dir);
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().await {
+                yield item.map_err(|e| StateReaderError::store(&e))?;
+            }
+        })
+    }
 }
 
 // --- Deque reads ------------------------------------------------------------
@@ -314,6 +358,54 @@ where
         let session = self.session(key.into()).await?;
         let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
         handle.len().await.map_err(|e| StateReaderError::store(&e))
+    }
+
+    /// Reports whether the committed deque is empty.
+    ///
+    /// # Errors
+    ///
+    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
+    pub async fn is_empty<K: Into<Key>>(&self, key: K) -> Result<bool, StateReaderError> {
+        let session = self.session(key.into()).await?;
+        let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
+        handle
+            .is_empty()
+            .await
+            .map_err(|e| StateReaderError::store(&e))
+    }
+
+    /// Reads the committed front endpoint without a length read.
+    ///
+    /// # Errors
+    ///
+    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
+    pub async fn peek_front<K: Into<Key>>(
+        &self,
+        key: K,
+    ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
+        let session = self.session(key.into()).await?;
+        let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
+        handle
+            .peek_front()
+            .await
+            .map_err(|e| StateReaderError::store(&e))
+    }
+
+    /// Reads the committed back endpoint without a length read.
+    ///
+    /// # Errors
+    ///
+    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
+    pub async fn peek_back<K: Into<Key>>(
+        &self,
+        key: K,
+    ) -> Result<Option<ResolvedOf<T>>, StateReaderError> {
+        let session = self.session(key.into()).await?;
+        let handle: DequeHandle<_, T> = self.descriptor.bind(&session)?;
+        handle
+            .peek_back()
+            .await
+            .map_err(|e| StateReaderError::store(&e))
     }
 
     /// Streams the committed live elements under partition `key` in index order

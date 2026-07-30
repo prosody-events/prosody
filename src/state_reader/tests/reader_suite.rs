@@ -202,8 +202,7 @@ fn model_map_ops(model: &mut BTreeMap<i64, Value>, ops: &[MapOp]) {
     }
 }
 
-/// Asserts the reader's point `get`, `get_many`, and ordered `stream` (forward
-/// and backward) over the whole key pool equal the `BTreeMap` model.
+/// Asserts every map read operation against the `BTreeMap` model.
 async fn assert_map<B: ReaderBackend>(
     backend: &B,
     descriptor: MapDescriptor<I64KeyCodec, JsonCodec>,
@@ -214,6 +213,9 @@ async fn assert_map<B: ReaderBackend>(
     let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
     for &k in &KEY_POOL {
         if reader.get(case.key.clone(), &k).await? != model.get(&k).cloned() {
+            return Ok(false);
+        }
+        if reader.contains_key(case.key.clone(), &k).await? != model.contains_key(&k) {
             return Ok(false);
         }
     }
@@ -227,6 +229,13 @@ async fn assert_map<B: ReaderBackend>(
     ))
     .await?;
     if forward != expect_forward {
+        return Ok(false);
+    }
+    let keys = Box::pin(collect_stream(
+        reader.keys(case.key.clone(), Direction::Forward).await?,
+    ))
+    .await?;
+    if keys != model.keys().copied().collect::<Vec<_>>() {
         return Ok(false);
     }
     let backward = Box::pin(collect_stream(
@@ -330,9 +339,7 @@ fn model_deque_ops(model: &mut VecDeque<Value>, ops: &[DequeOp]) {
     }
 }
 
-/// Asserts the reader's `len`, front-relative `get`, and ordered `stream`
-/// (forward and backward) equal the `VecDeque` model. `get` is also checked
-/// one past the end, where it must return `None`.
+/// Asserts every deque read operation against the `VecDeque` model.
 async fn assert_deque<B: ReaderBackend>(
     backend: &B,
     descriptor: DequeDescriptor<JsonCodec>,
@@ -342,6 +349,12 @@ async fn assert_deque<B: ReaderBackend>(
     let deps = backend.deps();
     let reader = StateReader::new(&deps, case.sub.clone(), descriptor)?;
     if reader.len(case.key.clone()).await? != model.len() {
+        return Ok(false);
+    }
+    if reader.is_empty(case.key.clone()).await? != model.is_empty()
+        || reader.peek_front(case.key.clone()).await? != model.front().cloned()
+        || reader.peek_back(case.key.clone()).await? != model.back().cloned()
+    {
         return Ok(false);
     }
     for i in 0..=model.len() {

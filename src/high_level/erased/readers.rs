@@ -81,6 +81,9 @@ pub trait ErasedMapReader<C: Codec>: Send + Sync {
         map_key: String,
     ) -> Result<Option<C::Payload>, StateReaderError>;
 
+    /// Reports whether one committed map entry exists without decoding it.
+    async fn contains_key(&self, key: String, map_key: String) -> Result<bool, StateReaderError>;
+
     /// Reads committed map entries aligned with `map_keys`.
     async fn get_many(
         &self,
@@ -94,6 +97,13 @@ pub trait ErasedMapReader<C: Codec>: Send + Sync {
         key: String,
         direction: ErasedDirection,
     ) -> Result<BoxStateCursor<(String, C::Payload)>, StateReaderError>;
+
+    /// Streams committed keys without decoding values.
+    async fn keys(
+        &self,
+        key: String,
+        direction: ErasedDirection,
+    ) -> Result<BoxStateCursor<String>, StateReaderError>;
 }
 
 /// Shared map-reader representation stored by native FFI wrappers.
@@ -107,6 +117,15 @@ pub trait ErasedDequeReader<C: Codec>: Send + Sync {
 
     /// Returns the committed deque length.
     async fn len(&self, key: String) -> Result<usize, StateReaderError>;
+
+    /// Reports whether the committed deque is empty.
+    async fn is_empty(&self, key: String) -> Result<bool, StateReaderError>;
+
+    /// Reads the committed front endpoint.
+    async fn peek_front(&self, key: String) -> Result<Option<C::Payload>, StateReaderError>;
+
+    /// Reads the committed back endpoint.
+    async fn peek_back(&self, key: String) -> Result<Option<C::Payload>, StateReaderError>;
 
     /// Streams committed elements in index order.
     async fn stream(
@@ -216,6 +235,10 @@ where
         self.0.get(Key::from(key), &map_key).await
     }
 
+    async fn contains_key(&self, key: String, map_key: String) -> Result<bool, StateReaderError> {
+        self.0.contains_key(Key::from(key), &map_key).await
+    }
+
     async fn get_many(
         &self,
         key: String,
@@ -230,7 +253,16 @@ where
         direction: ErasedDirection,
     ) -> Result<BoxStateCursor<(String, C::Payload)>, StateReaderError> {
         let stream = self.0.stream(Key::from(key), direction.into()).await?;
-        Ok(state_cursor(stream))
+        Ok(Box::new(state_cursor(stream)))
+    }
+
+    async fn keys(
+        &self,
+        key: String,
+        direction: ErasedDirection,
+    ) -> Result<BoxStateCursor<String>, StateReaderError> {
+        let stream = self.0.keys(Key::from(key), direction.into()).await?;
+        Ok(Box::new(state_cursor(stream)))
     }
 }
 
@@ -251,21 +283,33 @@ where
         self.0.len(Key::from(key)).await
     }
 
+    async fn is_empty(&self, key: String) -> Result<bool, StateReaderError> {
+        self.0.is_empty(Key::from(key)).await
+    }
+
+    async fn peek_front(&self, key: String) -> Result<Option<C::Payload>, StateReaderError> {
+        self.0.peek_front(Key::from(key)).await
+    }
+
+    async fn peek_back(&self, key: String) -> Result<Option<C::Payload>, StateReaderError> {
+        self.0.peek_back(Key::from(key)).await
+    }
+
     async fn stream(
         &self,
         key: String,
         direction: ErasedDirection,
     ) -> Result<BoxStateCursor<C::Payload>, StateReaderError> {
         let stream = self.0.stream(Key::from(key), direction.into()).await?;
-        Ok(state_cursor(stream))
+        Ok(Box::new(state_cursor(stream)))
     }
 }
 
 fn state_cursor<T>(
     stream: impl futures::Stream<Item = Result<T, StateReaderError>> + Send + 'static,
-) -> BoxStateCursor<T> {
+) -> StateCursor<T> {
     let stream = stream
         .map_err(|error| ErasedStateError::from_classified(&error))
         .boxed();
-    Box::new(StateCursor::new(stream))
+    StateCursor::new(stream)
 }
