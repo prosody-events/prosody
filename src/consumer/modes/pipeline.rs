@@ -4,6 +4,7 @@
 use crate::consumer::ProsodyConsumer;
 use crate::consumer::config::{
     CommonConfiguration, ConsumerConfiguration, ConsumerSetup, PipelineMiddlewareConfiguration,
+    TypedConsumerSetup,
 };
 use crate::consumer::error::ConsumerError;
 use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
@@ -16,13 +17,12 @@ use crate::consumer::middleware::monopolization::MonopolizationMiddleware;
 use crate::consumer::middleware::retry::RetryMiddleware;
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::observer::KafkaObserver;
-use crate::consumer::storage::{StatefulStorePair, StorePair};
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
-use crate::consumer::wiring::state::{
-    KeyedStateInputs, cassandra_state_provider, memory_state_provider,
+use crate::consumer::wiring::{
+    build_common_middleware, build_typed_state, cassandra_deps, memory_deps,
 };
-use crate::consumer::wiring::{build_common_middleware, build_shared_state};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::CellWrite;
@@ -32,13 +32,13 @@ use crate::timers::store::TriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType};
 use std::sync::Arc;
 
-/// Everything both storage arms need to finish a pipeline consumer.
+/// Everything any concrete backend needs to finish a pipeline consumer.
 struct PipelineMiddlewareStack {
     consumer_config: ConsumerConfiguration,
     defer_config: DeferConfiguration,
     common_config: CommonConfiguration,
     failure_tracker: FailureTracker,
-    monopolization_middleware: Option<MonopolizationMiddleware>,
+    monopolization_middleware: MonopolizationMiddleware,
     retry_middleware: RetryMiddleware,
     heartbeats: HeartbeatRegistry,
     telemetry: Telemetry,
@@ -118,55 +118,6 @@ impl PipelineMiddlewareStack {
     }
 }
 
-/// Builds the storage pair, keyed-state inputs, and shared middleware stack
-/// for [`ProsodyConsumer::pipeline_consumer`].
-async fn prepare_pipeline_stack<C, B>(
-    setup: &ConsumerSetup<'_, C, B>,
-    pipeline_config: PipelineMiddlewareConfiguration,
-    telemetry: Telemetry,
-) -> Result<
-    (
-        StatefulStorePair<C>,
-        KeyedStateInputs,
-        PipelineMiddlewareStack,
-    ),
-    ConsumerError,
->
-where
-    C: Codec,
-    C::Payload: Clone,
-    B: ConsumerReaderBackend<C>,
-{
-    let PipelineMiddlewareConfiguration {
-        retry: retry_config,
-        monopolization: monopolization_config,
-        defer: defer_config,
-    } = pipeline_config;
-    let (stores, keyed_state, heartbeats, observer) = build_shared_state(setup).await?;
-    let monopolization_middleware =
-        MonopolizationMiddleware::new(&monopolization_config, &telemetry)?;
-    let failure_tracker = FailureTracker::new(
-        defer_config.failure_window,
-        defer_config.failure_threshold,
-        &telemetry,
-        &heartbeats,
-    );
-
-    let stack = PipelineMiddlewareStack {
-        consumer_config: setup.consumer.clone(),
-        defer_config,
-        common_config: setup.common.clone(),
-        failure_tracker,
-        monopolization_middleware,
-        retry_middleware: RetryMiddleware::new(retry_config)?,
-        heartbeats,
-        telemetry,
-        observer,
-    };
-
-    Ok((stores, keyed_state, stack))
-}
-
 impl<C: Codec> ProsodyConsumer<C>
 where
     C::Payload: EventType + Clone,
@@ -183,7 +134,7 @@ where
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
     pub async fn pipeline_consumer<T>(
-        setup: ConsumerSetup<'_, C>,
+        setup: ConsumerSetup<'_>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
         handler: T,
@@ -192,104 +143,90 @@ where
         C::Payload: EventIdentity,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
-        Self::pipeline_consumer_with_backend(setup, pipeline_config, telemetry, handler).await
+        match (setup.consumer.mock, setup.trigger_store) {
+            (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
+                let deps = memory_deps(&setup);
+                Self::pipeline_consumer_with_backend(
+                    TypedConsumerSetup {
+                        consumer: setup.consumer,
+                        common: setup.common,
+                        deps,
+                    },
+                    pipeline_config,
+                    telemetry,
+                    handler,
+                )
+                .await
+            }
+            (false, TriggerStoreConfiguration::Cassandra(config)) => {
+                let deps = cassandra_deps(&setup, config).await?;
+                Self::pipeline_consumer_with_backend(
+                    TypedConsumerSetup {
+                        consumer: setup.consumer,
+                        common: setup.common,
+                        deps,
+                    },
+                    pipeline_config,
+                    telemetry,
+                    handler,
+                )
+                .await
+            }
+        }
     }
 
     pub(crate) async fn pipeline_consumer_with_backend<T, B>(
-        setup: ConsumerSetup<'_, C, B>,
+        setup: TypedConsumerSetup<'_, C, B>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
         handler: T,
     ) -> Result<Self, ConsumerError>
     where
-        C::Payload: EventIdentity,
+        C::Payload: EventIdentity + Send + Sync + 'static,
         B: ConsumerReaderBackend<C>,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
-        let (stores, keyed_state, stack) =
-            prepare_pipeline_stack(&setup, pipeline_config, telemetry).await?;
-        match stores {
-            StorePair::Memory {
-                trigger_provider,
-                message_provider,
-                timer_provider,
-                dedup_provider,
-                publication_store,
-                resources,
-            } => {
-                let loader = resources.loader;
-                let publisher_template = keyed_state
-                    .memory_publication_setup(publication_store)
-                    .await?;
-                let state_provider = memory_state_provider::<C>(
-                    &keyed_state,
-                    dedup_provider.clone(),
-                    resources.cells,
-                    resources.identities,
-                    loader.clone(),
-                    publisher_template,
-                );
-                let message_defer_middleware = MessageDeferMiddleware::new(
-                    stack.defer_config.clone(),
-                    &stack.consumer_config,
-                    message_provider,
-                    stack.failure_tracker.clone(),
-                    loader,
-                    &stack.common_config.dedup.version,
-                    &stack.telemetry,
-                )?;
-                stack
-                    .into_consumer::<_, _, _, _, _, _, _, C>(
-                        message_defer_middleware,
-                        timer_provider,
-                        dedup_provider,
-                        trigger_provider,
-                        state_provider,
-                        handler,
-                    )
-                    .await
-            }
-            StorePair::Cassandra {
-                trigger_provider,
-                message_provider,
-                timer_provider,
-                dedup_provider,
-                cell_store,
-                identity_store,
-                publication_store,
-                resources: loader,
-            } => {
-                let publisher_template = keyed_state
-                    .cassandra_publication_setup(publication_store, stack.observer.clone())
-                    .await?;
-                let state_provider = cassandra_state_provider::<C>(
-                    &keyed_state,
-                    dedup_provider.clone(),
-                    cell_store,
-                    identity_store,
-                    loader.clone(),
-                    publisher_template,
-                )?;
-                let message_defer_middleware = MessageDeferMiddleware::new(
-                    stack.defer_config.clone(),
-                    &stack.consumer_config,
-                    message_provider,
-                    stack.failure_tracker.clone(),
-                    loader,
-                    &stack.common_config.dedup.version,
-                    &stack.telemetry,
-                )?;
-                stack
-                    .into_consumer::<_, _, _, _, _, _, _, C>(
-                        message_defer_middleware,
-                        timer_provider,
-                        dedup_provider,
-                        trigger_provider,
-                        state_provider,
-                        handler,
-                    )
-                    .await
-            }
-        }
+        let PipelineMiddlewareConfiguration {
+            retry,
+            monopolization,
+            defer,
+        } = pipeline_config;
+        let (components, _keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
+        let failure_tracker = FailureTracker::new(
+            defer.failure_window,
+            defer.failure_threshold,
+            &telemetry,
+            &heartbeats,
+        );
+        let stack = PipelineMiddlewareStack {
+            consumer_config: setup.consumer.clone(),
+            defer_config: defer.clone(),
+            common_config: setup.common.clone(),
+            failure_tracker: failure_tracker.clone(),
+            monopolization_middleware: MonopolizationMiddleware::new(&monopolization, &telemetry)?,
+            retry_middleware: RetryMiddleware::new(retry)?,
+            heartbeats,
+            telemetry,
+            observer,
+        };
+        let message_defer = MessageDeferMiddleware::new(
+            defer,
+            setup.consumer,
+            components.messages,
+            failure_tracker,
+            components.loader,
+            &setup.common.dedup.version,
+            &stack.telemetry,
+        )?;
+        stack
+            .into_consumer::<_, _, _, _, _, _, _, C>(
+                message_defer,
+                components.timers,
+                components.dedup,
+                components.trigger,
+                components.state,
+                handler,
+            )
+            .await
     }
 }

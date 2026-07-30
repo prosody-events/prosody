@@ -1,9 +1,10 @@
 //! Lazy construction of the client's shared reader family.
 
 use crate::Codec;
-use crate::consumer::{CommonConfiguration, ConsumerConfiguration, ConsumerSetup};
+use crate::consumer::TypedConsumerSetup;
+use crate::consumer::{CommonConfiguration, ConsumerConfiguration};
 use crate::high_level::ClientBackend;
-use crate::high_level::config::{ModeConfiguration, TriggerStoreConfiguration};
+use crate::high_level::config::ModeConfiguration;
 use crate::high_level::error::HighLevelClientError;
 use crate::high_level::state::ConsumerState;
 use crate::state_reader::SharedDeps;
@@ -61,18 +62,16 @@ where
 
 pub(super) fn consumer_setup<'a, C, B>(
     consumer: &'a ConsumerConfiguration,
-    trigger_store: &'a TriggerStoreConfiguration,
     common: &'a CommonConfiguration,
     deps: &SharedDeps<C, B::Reader>,
-) -> ConsumerSetup<'a, C, B::Reader>
+) -> TypedConsumerSetup<'a, C, B::Reader>
 where
     C: Codec,
     B: ClientBackend<C>,
 {
-    ConsumerSetup {
+    TypedConsumerSetup {
         consumer,
-        trigger_store,
         common,
-        deps: Some(deps.clone()),
+        deps: deps.clone(),
     }
 }

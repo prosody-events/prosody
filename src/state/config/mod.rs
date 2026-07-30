@@ -38,6 +38,11 @@ const STATE_READ_CACHE_TTL_ENV: &str = "PROSODY_STATE_READ_CACHE_TTL";
 /// refresh every 60 seconds.
 const DEFAULT_READ_CACHE_TTL: Duration = Duration::from_secs(5);
 
+const DEFAULT_READER_CACHE_SIZE_BYTES: NonZeroU64 = match NonZeroU64::new(1_048_576) {
+    Some(budget) => budget,
+    None => NonZeroU64::MIN,
+};
+
 /// Environment variable for the `StateRecovery` backstop delay.
 const RECOVERY_DELAY_ENV: &str = "PROSODY_STATE_RECOVERY_DELAY";
 
@@ -172,6 +177,12 @@ impl KeyedStateConfiguration {
     #[must_use]
     pub fn builder() -> KeyedStateConfigurationBuilder {
         KeyedStateConfigurationBuilder::default()
+    }
+
+    pub(crate) fn reader_cache_size(&self) -> NonZeroU64 {
+        self.read_cache_size_bytes
+            .or(self.cache_size_bytes)
+            .unwrap_or(DEFAULT_READER_CACHE_SIZE_BYTES)
     }
 
     /// Registers `descriptor`'s collection, returning the [`Registered`]

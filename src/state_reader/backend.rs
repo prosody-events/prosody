@@ -1,8 +1,19 @@
 //! Concrete component families used by standalone readers.
 
 use crate::codec::Codec;
-use crate::consumer::storage::{
-    MemoryArmInputs, StatefulStorePair, StoreCreationError, StorePair, StorePairInputs,
+use crate::consumer::middleware::deduplication::{
+    CassandraDeduplicationStoreProvider, MemoryDeduplicationStoreProvider,
+};
+use crate::consumer::middleware::defer::message::store::{
+    CassandraMessageDeferStoreProvider, MemoryMessageDeferStoreProvider,
+};
+use crate::consumer::middleware::defer::timer::store::{
+    CassandraTimerDeferStoreProvider, MemoryTimerDeferStoreProvider,
+};
+use crate::consumer::storage::components::{cassandra, memory};
+use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
+use crate::consumer::{
+    CassandraStateProvider, ConsumerError, KafkaObserver, KeyedStateInputs, MemoryStateProvider,
 };
 use crate::error::ClassifyError;
 use crate::loader::{KafkaLoader, MemoryLoader, MessageLoader};
@@ -16,6 +27,8 @@ use crate::state::identity::CollectionId;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state::publication::PublicationStore;
 use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
+use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use bytes::Bytes;
 use futures::Stream;
 use std::convert::Infallible;
@@ -159,22 +172,9 @@ where
     fn loader(&self) -> &Self::Loader;
 }
 
-mod consumer {
-    use super::{Codec, ReaderBackend, StatefulStorePair, StoreCreationError, StorePairInputs};
-
-    pub(crate) trait Backend<C>: ReaderBackend<C>
-    where
-        C: Codec,
-    {
-        fn build_store_pair(
-            &self,
-            inputs: StorePairInputs,
-        ) -> impl Future<Output = Result<StatefulStorePair<C>, StoreCreationError>> + Send;
-    }
-}
-
 /// Reader family that can also supply a consumer's matching stores.
-pub(crate) trait ConsumerReaderBackend<C>: ReaderBackend<C> + consumer::Backend<C>
+pub(crate) trait ConsumerReaderBackend<C>:
+    ReaderBackend<C> + ConsumerStorageBackend<C>
 where
     C: Codec,
 {
@@ -183,7 +183,7 @@ where
 impl<C, B> ConsumerReaderBackend<C> for B
 where
     C: Codec,
-    B: ReaderBackend<C> + consumer::Backend<C>,
+    B: ReaderBackend<C> + ConsumerStorageBackend<C>,
 {
 }
 
@@ -257,46 +257,64 @@ pub type MemoryReaderBackend<C> = ReaderComponents<
     MemoryLoader<<C as Codec>::Payload>,
 >;
 
-impl<C> consumer::Backend<C> for CassandraReaderBackend<C>
+impl<C> ConsumerStorageBackend<C> for CassandraReaderBackend<C>
 where
     C: Codec,
-    C::Payload: Clone,
+    C::Payload: crate::EventIdentity + crate::EventType + Clone + Send + Sync + 'static,
 {
-    async fn build_store_pair(
+    type Dedup = CassandraDeduplicationStoreProvider;
+    type EventLoader = KafkaLoader<C>;
+    type Messages = CassandraMessageDeferStoreProvider;
+    type State = CassandraStateProvider<C>;
+    type Timers = CassandraTimerDeferStoreProvider;
+    type Trigger = CassandraTriggerStoreProvider;
+
+    async fn build_consumer_components(
         &self,
-        inputs: StorePairInputs,
-    ) -> Result<StatefulStorePair<C>, StoreCreationError> {
-        StorePair::cassandra_with(
+        inputs: ConsumerStorageInputs,
+        keyed_state: &KeyedStateInputs,
+        observer: KafkaObserver,
+    ) -> Result<ComponentsOf<C, Self>, ConsumerError> {
+        cassandra::<C>(
             inputs,
-            self.cells().session.clone(),
+            keyed_state,
             self.cells().clone(),
             self.identities().clone(),
             self.publications().clone(),
             self.loader().clone(),
+            observer,
         )
         .await
     }
 }
 
-impl<C> consumer::Backend<C> for MemoryReaderBackend<C>
+impl<C> ConsumerStorageBackend<C> for MemoryReaderBackend<C>
 where
     C: Codec,
-    C::Payload: Clone,
+    C::Payload: crate::EventIdentity + crate::EventType + Clone + Send + Sync + 'static,
 {
-    async fn build_store_pair(
+    type Dedup = MemoryDeduplicationStoreProvider;
+    type EventLoader = MemoryLoader<C::Payload>;
+    type Messages = MemoryMessageDeferStoreProvider;
+    type State = MemoryStateProvider<C::Payload>;
+    type Timers = MemoryTimerDeferStoreProvider;
+    type Trigger = InMemoryTriggerStoreProvider;
+
+    async fn build_consumer_components(
         &self,
-        inputs: StorePairInputs,
-    ) -> Result<StatefulStorePair<C>, StoreCreationError> {
-        StorePair::memory_with(
-            inputs.dedup_ttl,
-            inputs.timer_spans,
+        inputs: ConsumerStorageInputs,
+        keyed_state: &KeyedStateInputs,
+        _observer: KafkaObserver,
+    ) -> Result<ComponentsOf<C, Self>, ConsumerError> {
+        memory::<C>(
+            inputs,
+            keyed_state,
+            self.cells().clone(),
             self.publications().clone(),
-            MemoryArmInputs {
-                loader: self.loader().clone(),
-                cells: self.cells().clone(),
-                identities: self.identities().clone(),
-            },
+            self.identities().clone(),
+            self.loader().clone(),
         )
+        .await
     }
 }
 

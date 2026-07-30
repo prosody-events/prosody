@@ -3,26 +3,28 @@
 use crate::cassandra::config::CassandraConfiguration;
 use crate::codec::Codec;
 use crate::consumer::{ConsumerConfiguration, KeyedStateConfiguration};
-use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MemoryLoader;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
-use crate::state_reader::DEFAULT_READER_CACHE_SIZE_BYTES;
 use crate::state_reader::{
     CassandraReaderBackend, MemoryReaderBackend, ReaderBackend, SharedDeps, StateReaderError,
 };
 use std::marker::PhantomData;
-use std::num::NonZeroU64;
 
-/// Builds the reader family matching one high-level storage choice.
-pub trait ClientBackend<C>: Clone + Send + Sync + 'static
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Binds the components of one built-in high-level storage choice.
+///
+/// This trait compresses the concrete client types. Downstream implementations
+/// are not supported; use [`MemoryClientBackend`] or
+/// [`CassandraClientBackend`].
+pub trait ClientBackend<C>: sealed::Sealed + Clone + Send + Sync + 'static
 where
     C: Codec,
 {
     /// Reader components shared with the consumer.
     type Reader: ReaderBackend<C>;
-
-    /// Matching low-level trigger-store configuration.
-    fn trigger_store(&self) -> TriggerStoreConfiguration;
 
     /// Builds the shared reader components.
     fn build_reader(
@@ -51,6 +53,8 @@ impl<C> Clone for MemoryClientBackend<C> {
 
 impl<C> Copy for MemoryClientBackend<C> {}
 
+impl<C> sealed::Sealed for MemoryClientBackend<C> {}
+
 impl<C> Default for MemoryClientBackend<C> {
     fn default() -> Self {
         Self::new()
@@ -64,10 +68,6 @@ where
 {
     type Reader = MemoryReaderBackend<C>;
 
-    fn trigger_store(&self) -> TriggerStoreConfiguration {
-        TriggerStoreConfiguration::InMemory
-    }
-
     async fn build_reader(
         &self,
         consumer: &ConsumerConfiguration,
@@ -80,7 +80,7 @@ where
             MemoryPublicationStore::new(),
             MemoryDescriptorIdentityStore::new(),
             MemoryLoader::new(),
-            reader_cache_size(keyed_state).get(),
+            keyed_state.reader_cache_size().get(),
         )
         .with_default_read_cache_ttl(keyed_state.read_cache_ttl))
     }
@@ -109,6 +109,8 @@ impl<C> Clone for CassandraClientBackend<C> {
     }
 }
 
+impl<C> sealed::Sealed for CassandraClientBackend<C> {}
+
 impl<C> ClientBackend<C> for CassandraClientBackend<C>
 where
     C: Codec,
@@ -116,26 +118,15 @@ where
 {
     type Reader = CassandraReaderBackend<C>;
 
-    fn trigger_store(&self) -> TriggerStoreConfiguration {
-        TriggerStoreConfiguration::Cassandra(self.config.clone())
-    }
-
     async fn build_reader(
         &self,
         consumer: &ConsumerConfiguration,
         keyed_state: &KeyedStateConfiguration,
     ) -> Result<SharedDeps<C, Self::Reader>, StateReaderError> {
         Ok(
-            SharedDeps::connect(consumer, &self.config, reader_cache_size(keyed_state))
+            SharedDeps::connect(consumer, &self.config, keyed_state.reader_cache_size())
                 .await?
                 .with_default_read_cache_ttl(keyed_state.read_cache_ttl),
         )
     }
-}
-
-fn reader_cache_size(config: &KeyedStateConfiguration) -> NonZeroU64 {
-    config
-        .read_cache_size_bytes
-        .or(config.cache_size_bytes)
-        .unwrap_or(DEFAULT_READER_CACHE_SIZE_BYTES)
 }

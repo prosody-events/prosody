@@ -7,15 +7,18 @@
 //! left to fall back to.
 
 use crate::consumer::ProsodyConsumer;
-use crate::consumer::config::{ConsumerSetup, LowLatencyMiddlewareConfiguration};
+use crate::consumer::config::{
+    ConsumerSetup, LowLatencyMiddlewareConfiguration, TypedConsumerSetup,
+};
 use crate::consumer::error::ConsumerError;
 use crate::consumer::middleware::retry::RetryMiddleware;
 use crate::consumer::middleware::topic::FailureTopicMiddleware;
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
-use crate::consumer::storage::StorePair;
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
-use crate::consumer::wiring::state::{cassandra_state_provider, memory_state_provider};
-use crate::consumer::wiring::{build_common_middleware, build_shared_state};
+use crate::consumer::wiring::{
+    build_common_middleware, build_typed_state, cassandra_deps, memory_deps,
+};
+use crate::high_level::config::TriggerStoreConfiguration;
 use crate::producer::ProsodyProducer;
 use crate::state_reader::ConsumerReaderBackend;
 use crate::telemetry::Telemetry;
@@ -39,7 +42,7 @@ where
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
     pub async fn low_latency_consumer<T>(
-        setup: ConsumerSetup<'_, C>,
+        setup: ConsumerSetup<'_>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
@@ -49,18 +52,42 @@ where
         C::Payload: EventIdentity + Send + Sync + 'static,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
-        Self::low_latency_consumer_with_backend(
-            setup,
-            low_latency_config,
-            producer,
-            telemetry,
-            handler,
-        )
-        .await
+        match (setup.consumer.mock, setup.trigger_store) {
+            (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
+                let deps = memory_deps(&setup);
+                Self::low_latency_consumer_with_backend(
+                    TypedConsumerSetup {
+                        consumer: setup.consumer,
+                        common: setup.common,
+                        deps,
+                    },
+                    low_latency_config,
+                    producer,
+                    telemetry,
+                    handler,
+                )
+                .await
+            }
+            (false, TriggerStoreConfiguration::Cassandra(config)) => {
+                let deps = cassandra_deps(&setup, config).await?;
+                Self::low_latency_consumer_with_backend(
+                    TypedConsumerSetup {
+                        consumer: setup.consumer,
+                        common: setup.common,
+                        deps,
+                    },
+                    low_latency_config,
+                    producer,
+                    telemetry,
+                    handler,
+                )
+                .await
+            }
+        }
     }
 
     pub(crate) async fn low_latency_consumer_with_backend<T, B>(
-        setup: ConsumerSetup<'_, C, B>,
+        setup: TypedConsumerSetup<'_, C, B>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
@@ -71,9 +98,9 @@ where
         B: ConsumerReaderBackend<C>,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
-        let (stores, keyed_state, heartbeats, observer) = build_shared_state(&setup).await?;
-        let retry_middleware = RetryMiddleware::new(low_latency_config.retry)?;
-        let topic_middleware = FailureTopicMiddleware::new(
+        let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
+        let retry = RetryMiddleware::new(low_latency_config.retry)?;
+        let topic = FailureTopicMiddleware::new(
             low_latency_config.failure_topic,
             setup.consumer.group_id.clone(),
             producer,
@@ -84,84 +111,23 @@ where
             heartbeats,
             observer,
         };
-        // dedup is inside the common block; failure-topic/retry layer OUTSIDE it.
-        match stores {
-            StorePair::Memory {
-                trigger_provider,
-                dedup_provider,
-                publication_store,
-                resources,
-                ..
-            } => {
-                let publisher_template = keyed_state
-                    .memory_publication_setup(publication_store)
-                    .await?;
-                let state_provider = memory_state_provider::<C>(
-                    &keyed_state,
-                    dedup_provider.clone(),
-                    resources.cells,
-                    resources.identities,
-                    resources.loader,
-                    publisher_template,
-                );
-                let provider = build_common_middleware::<_, C::Payload>(
-                    setup.common,
-                    setup.consumer,
-                    telemetry.clone(),
-                    dedup_provider,
-                )?
-                .layer(retry_middleware.clone())
-                .layer(topic_middleware)
-                .layer(retry_middleware)
-                .into_provider(handler);
-                initialize_consumer::<_, _, _, C>(
-                    setup.consumer,
-                    provider,
-                    trigger_provider,
-                    state_provider,
-                    services,
-                )
-                .await
-            }
-            StorePair::Cassandra {
-                trigger_provider,
-                dedup_provider,
-                cell_store,
-                identity_store,
-                publication_store,
-                resources: loader,
-                ..
-            } => {
-                let publisher_template = keyed_state
-                    .cassandra_publication_setup(publication_store, services.observer.clone())
-                    .await?;
-                let state_provider = cassandra_state_provider::<C>(
-                    &keyed_state,
-                    dedup_provider.clone(),
-                    cell_store,
-                    identity_store,
-                    loader,
-                    publisher_template,
-                )?;
-                let provider = build_common_middleware::<_, C::Payload>(
-                    setup.common,
-                    setup.consumer,
-                    telemetry.clone(),
-                    dedup_provider,
-                )?
-                .layer(retry_middleware.clone())
-                .layer(topic_middleware)
-                .layer(retry_middleware)
-                .into_provider(handler);
-                initialize_consumer::<_, _, _, C>(
-                    setup.consumer,
-                    provider,
-                    trigger_provider,
-                    state_provider,
-                    services,
-                )
-                .await
-            }
-        }
+        let provider = build_common_middleware::<_, C::Payload>(
+            setup.common,
+            setup.consumer,
+            telemetry.clone(),
+            components.dedup,
+        )?
+        .layer(retry.clone())
+        .layer(topic)
+        .layer(retry)
+        .into_provider(handler);
+        initialize_consumer::<_, _, _, C>(
+            setup.consumer,
+            provider,
+            components.trigger,
+            components.state,
+            services,
+        )
+        .await
     }
 }

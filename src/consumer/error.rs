@@ -9,6 +9,7 @@ use crate::consumer::storage::StoreCreationError;
 use crate::error::ErrorCategory;
 use crate::state::config::KeyedStateConfigurationBuilderError;
 use crate::state::registry::RegisterStateError;
+use crate::state_reader::StateReaderError;
 use crate::timers::duration::CompactDurationError;
 use crate::timers::store::cassandra::CassandraTriggerStoreError;
 use rdkafka::error::KafkaError;
@@ -72,6 +73,10 @@ pub enum ConsumerError {
     /// Indicates storage backend creation failure.
     #[error("Failed to create storage backend: {0:#}")]
     StorageBackend(Box<StoreCreationError>),
+
+    /// Shared reader and consumer infrastructure could not be constructed.
+    #[error("Failed to create shared state infrastructure: {0:#}")]
+    StateReader(#[from] StateReaderError),
 
     /// Indicates an invalid timer slab size.
     #[error("Invalid timer slab size: {0:#}")]

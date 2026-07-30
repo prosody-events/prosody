@@ -28,7 +28,6 @@ pub(crate) use backend::ConsumerReaderBackend;
 pub use backend::{
     CassandraReaderBackend, CommittedCellSource, MemoryReaderBackend, ReaderBackend,
 };
-pub(crate) use deps::DEFAULT_READER_CACHE_SIZE_BYTES;
 pub use deps::SharedDeps;
 pub use error::StateReaderError;
 pub(crate) use source::PUBLICATION_READ_LIMIT;

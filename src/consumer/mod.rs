@@ -116,6 +116,7 @@
 //! - **Low latency processing**: Failed messages are sent to a failure topic
 //! - **Best effort processing**: Failed messages are logged and discarded
 
+pub(crate) use crate::consumer::config::TypedConsumerSetup;
 pub use crate::consumer::config::{
     CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
     ConsumerConfigurationBuilderError, ConsumerSetup, LowLatencyMiddlewareConfiguration,
@@ -130,9 +131,12 @@ pub use crate::consumer::kafka_state::{
 };
 pub use crate::consumer::message::ConsumerMessage;
 pub use crate::consumer::middleware::{FallibleHandler, RepinProof};
-use crate::consumer::observer::KafkaObserver;
+pub(crate) use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::probes::ProbeServer;
+pub(crate) use crate::consumer::wiring::state::{
+    CassandraStateProvider, KeyedStateInputs, MemoryStateProvider,
+};
 use crate::heartbeat::HeartbeatRegistry;
 pub use crate::otel::SpanRelation;
 pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};

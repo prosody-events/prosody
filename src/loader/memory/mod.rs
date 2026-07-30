@@ -1,5 +1,5 @@
 //! In-memory [`MessageLoader`] implementation, used for tests and the
-//! mock-mode (`StorePair::Memory`) consumer path — wherever a
+//! mock-mode consumer path — wherever a
 //! [`MessageLoader`] is needed without touching Kafka.
 //!
 //! [`MemoryLoader`] loads messages by exact offset coordinates. Unlike the

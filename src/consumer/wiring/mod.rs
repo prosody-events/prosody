@@ -6,6 +6,8 @@
 //! middleware stack and starts the consumer: Kafka client, subscription, and
 //! poll loop.
 
+use crate::cassandra::config::CassandraConfiguration;
+use crate::consumer::config::TypedConsumerSetup;
 use crate::consumer::config::{
     CommonConfiguration, ConsumerConfiguration, ConsumerSetup, validate_recovery_ttl_margin,
 };
@@ -19,10 +21,13 @@ use crate::consumer::middleware::telemetry::TelemetryMiddleware;
 use crate::consumer::middleware::timeout::TimeoutMiddleware;
 use crate::consumer::middleware::{ComposedMiddleware, HandlerMiddleware};
 use crate::consumer::observer::KafkaObserver;
-use crate::consumer::storage::{StatefulStorePair, StorePair, StorePairInputs};
+use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
 use crate::consumer::wiring::state::KeyedStateInputs;
 use crate::heartbeat::HeartbeatRegistry;
+use crate::loader::MemoryLoader;
+use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state_reader::ConsumerReaderBackend;
+use crate::state_reader::{CassandraReaderBackend, MemoryReaderBackend, SharedDeps};
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity};
 use std::sync::Arc;
@@ -50,95 +55,83 @@ pub(in crate::consumer) type CommonMiddleware<DP, P> = ComposedMiddleware<
     P,
 >;
 
-/// What [`build_shared_state`] returns; see its doc.
-pub(in crate::consumer) type SharedState<C> = (
-    StatefulStorePair<C>,
-    KeyedStateInputs,
-    HeartbeatRegistry,
-    KafkaObserver,
-);
+/// Validates shared configuration and builds one already-selected backend.
+pub(in crate::consumer) async fn build_typed_state<C, B>(
+    setup: &TypedConsumerSetup<'_, C, B>,
+) -> Result<
+    (
+        ComponentsOf<C, B>,
+        KeyedStateInputs,
+        HeartbeatRegistry,
+        KafkaObserver,
+    ),
+    ConsumerError,
+>
+where
+    C: Codec,
+    C::Payload: Clone + EventIdentity + crate::EventType + Send + Sync + 'static,
+    B: ConsumerReaderBackend<C> + ConsumerStorageBackend<C>,
+{
+    setup.consumer.validate()?;
+    let keyed_state_config = setup.common.keyed_state.clone();
+    keyed_state_config.validate()?;
+    let dedup = setup.common.dedup.clone();
+    if keyed_state_config.has_registrations() {
+        validate_recovery_ttl_margin(dedup.ttl, keyed_state_config.recovery_delay)
+            .map_err(KeyedStateInitError::from)?;
+    }
+    let heartbeats = setup.deps.heartbeats().clone();
+    let keyed_state = KeyedStateInputs::new(keyed_state_config, setup.consumer, &dedup.version)?;
+    let observer = KafkaObserver::new(&setup.consumer.group_id);
+    let components = setup
+        .deps
+        .build_consumer_components(
+            ConsumerStorageInputs {
+                dedup_ttl: dedup.ttl,
+                dedup_cache_capacity: dedup.cache_capacity,
+                timer_spans: setup.consumer.timer_spans,
+            },
+            &keyed_state,
+            observer.clone(),
+        )
+        .await?;
+    Ok((components, keyed_state, heartbeats, observer))
+}
 
-/// Builds the core shared by every constructor: the trigger and defer store
-/// pair, keyed-state inputs, the heartbeat registry, any storage reused from a
-/// [`SharedDeps`] bundle, and the consumer's Kafka observation handle.
-///
-/// This mints the observer the high-level modes hand to their primary consumer;
-/// [`StartupServices`](runtime::StartupServices) keeps it single.
-///
-/// Validates the consumer and keyed-state configuration up front, before
-/// [`StorePair::new`]'s Cassandra IO, so all callers fail fast uniformly. The
-/// canonical `consumer_config.validate()` in
-/// [`initialize_consumer`](runtime::initialize_consumer) remains the single
-/// invariant chokepoint; this early validation is the fail-fast guard.
-pub(in crate::consumer) async fn build_shared_state<C, B>(
-    setup: &ConsumerSetup<'_, C, B>,
-) -> Result<SharedState<C>, ConsumerError>
+pub(in crate::consumer) fn memory_deps<C>(
+    setup: &ConsumerSetup<'_>,
+) -> SharedDeps<C, MemoryReaderBackend<C>>
 where
     C: Codec,
     C::Payload: Clone,
-    B: ConsumerReaderBackend<C>,
 {
-    let ConsumerSetup {
-        consumer: consumer_config,
-        trigger_store: trigger_store_config,
-        common: common_config,
-        deps,
-    } = setup;
-    let deps = deps.as_ref();
-    consumer_config.validate()?;
-    // Clone (never drain) the registered keyed-state config: callers pass
-    // `common_config` by reference and retain the intact configuration, so a
-    // re-subscribe rebuilds the registry from the same registrations and
-    // existing `Registered<_>` tokens stay valid.
-    let keyed_state_config = common_config.keyed_state.clone();
-    keyed_state_config.validate()?;
-    let dedup_config = common_config.dedup.clone();
-    // The commit oracle is the dedup marker; a provisional cell must resolve
-    // while its marker still lives, so the dedup TTL must clear the recovery
-    // window with margin (see `validate_recovery_ttl_margin`). Only gate
-    // this when state is actually registered — an inert state layer arms no
-    // backstop, so a short dedup TTL on a stateless consumer is harmless.
-    if keyed_state_config.has_registrations() {
-        validate_recovery_ttl_margin(dedup_config.ttl, keyed_state_config.recovery_delay)
-            .map_err(KeyedStateInitError::from)?;
-    }
-    // Reuse the bundle's already-constructed storage when one is supplied, so
-    // no second session/publication store is built on the Configured→Running
-    // transition.
-    // Take the bundle's heartbeat registry when supplied, so the consumer's
-    // stall probe covers the shared loader's poll-loop heartbeat. Build a fresh
-    // one only on the no-bundle path.
-    let heartbeats = match deps {
-        Some(deps) => deps.heartbeats().clone(),
-        None => HeartbeatRegistry::new(
-            consumer_config.group_id.clone(),
-            consumer_config.stall_threshold,
-        ),
-    };
-    // Create both stores atomically — ensures trigger and defer stores match.
-    let inputs = StorePairInputs {
-        dedup_ttl: dedup_config.ttl,
-        dedup_cache_capacity: dedup_config.cache_capacity,
-        timer_spans: consumer_config.timer_spans,
-    };
-    let stores = match deps {
-        Some(deps) => deps.build_store_pair(inputs).await?,
-        None => {
-            StorePair::new(
-                trigger_store_config,
-                consumer_config,
-                &heartbeats,
-                inputs.dedup_ttl,
-                inputs.dedup_cache_capacity,
-                inputs.timer_spans,
-            )
-            .await?
-        }
-    };
-    let keyed_state =
-        KeyedStateInputs::new(keyed_state_config, consumer_config, &dedup_config.version)?;
-    let observer = KafkaObserver::new(&consumer_config.group_id);
-    Ok((stores, keyed_state, heartbeats, observer))
+    SharedDeps::memory(
+        setup.consumer.group_id.clone(),
+        setup.consumer.stall_threshold,
+        MemoryCells::new(),
+        MemoryPublicationStore::new(),
+        MemoryDescriptorIdentityStore::new(),
+        MemoryLoader::new(),
+        setup.common.keyed_state.reader_cache_size().get(),
+    )
+    .with_default_read_cache_ttl(setup.common.keyed_state.read_cache_ttl)
+}
+
+pub(in crate::consumer) async fn cassandra_deps<C>(
+    setup: &ConsumerSetup<'_>,
+    config: &CassandraConfiguration,
+) -> Result<SharedDeps<C, CassandraReaderBackend<C>>, ConsumerError>
+where
+    C: Codec,
+    C::Payload: Clone,
+{
+    Ok(SharedDeps::connect(
+        setup.consumer,
+        config,
+        setup.common.keyed_state.reader_cache_size(),
+    )
+    .await?
+    .with_default_read_cache_ttl(setup.common.keyed_state.read_cache_ttl))
 }
 
 /// Builds the common middleware shared by every mode — the single place any
@@ -153,9 +146,7 @@ where
 /// mode layers only its *mode-specific* middleware (retry, monopolization,
 /// defer, failure-topic, log) OUTSIDE the returned block.
 ///
-/// Because the deduplication middleware needs the per-partition dedup store,
-/// this is called INSIDE the storage `match` arm where the concrete
-/// `dedup_provider` is in hand.
+/// The associated backend family supplies the concrete deduplication provider.
 pub(in crate::consumer) fn build_common_middleware<DP, P>(
     config: &CommonConfiguration,
     consumer_config: &ConsumerConfiguration,

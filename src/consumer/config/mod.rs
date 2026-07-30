@@ -13,7 +13,7 @@ use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::KafkaLoaderConfiguration;
 use crate::otel::SpanRelation;
 use crate::state::config::KeyedStateConfiguration;
-use crate::state_reader::{MemoryReaderBackend, SharedDeps};
+use crate::state_reader::SharedDeps;
 use crate::timers::duration::CompactDuration;
 use crate::util::{
     from_duration_env_with_fallback, from_env, from_env_with_fallback,
@@ -326,25 +326,24 @@ pub struct LowLatencyMiddlewareConfiguration {
     pub failure_topic: FailureTopicConfiguration,
 }
 
-/// What every processing mode needs before its mode-specific middleware: the
-/// three configuration sections and the infrastructure to build on.
+/// What every processing mode needs before its mode-specific middleware.
 ///
-/// These four are one parameter because they are consumed as a unit. Every
-/// constructor hands the whole thing to `build_shared_state`, which validates
-/// the configuration and opens (or reuses) the storage behind it.
-pub struct ConsumerSetup<'a, C: Codec, B = MemoryReaderBackend<C>> {
+/// These three sections are one parameter because constructors consume them as
+/// a unit. The constructor selects a backend once, then enters typed wiring.
+pub struct ConsumerSetup<'a> {
     /// Kafka consumer settings: group, topics, mock mode, stall threshold.
     pub consumer: &'a ConsumerConfiguration,
     /// Backend settings for the timer trigger store.
     pub trigger_store: &'a TriggerStoreConfiguration,
     /// Settings every mode shares, keyed state and deduplication included.
     pub common: &'a CommonConfiguration,
-    /// Infrastructure to reuse instead of composing fresh handles.
-    ///
-    /// The high-level client passes the bundle it already built, so one
-    /// Cassandra session and one Kafka loader back the whole process. `None`
-    /// makes the consumer compose its own.
-    pub deps: Option<SharedDeps<C, B>>,
+}
+
+/// A consumer setup whose backend family has already been selected.
+pub(crate) struct TypedConsumerSetup<'a, C: Codec, B> {
+    pub(crate) consumer: &'a ConsumerConfiguration,
+    pub(crate) common: &'a CommonConfiguration,
+    pub(crate) deps: SharedDeps<C, B>,
 }
 
 impl ConsumerConfiguration {
@@ -359,6 +358,18 @@ impl ConsumerConfiguration {
 }
 
 impl ConsumerConfigurationBuilder {
+    /// Resolves only the configured mock mode.
+    ///
+    /// This does not build or validate unrelated consumer fields. High-level
+    /// clients use it to select a concrete backend while retaining consumer
+    /// configuration failures until subscription.
+    pub(crate) fn configured_mock(&self) -> Result<bool, String> {
+        match self.mock {
+            Some(mock) => Ok(mock),
+            None => from_env_with_fallback("PROSODY_MOCK", false),
+        }
+    }
+
     /// Retrieves the currently configured consumer group.
     ///
     /// Checks both the explicitly configured group ID and the environment

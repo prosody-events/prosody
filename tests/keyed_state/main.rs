@@ -136,11 +136,10 @@ impl CartEnv {
         )?;
 
         let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
-            ConsumerSetup::<JsonCodec> {
+            ConsumerSetup {
                 consumer: &consumer_config,
                 trigger_store: &trigger_store,
                 common: &common_config,
-                deps: None,
             },
             PipelineMiddlewareConfiguration {
                 retry: RetryConfigurationBuilder::default().build()?,

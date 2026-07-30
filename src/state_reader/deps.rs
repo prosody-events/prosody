@@ -4,7 +4,8 @@ use crate::cassandra::CassandraStore;
 use crate::cassandra::config::CassandraConfiguration;
 use crate::codec::Codec;
 use crate::consumer::ConsumerConfiguration;
-use crate::consumer::storage::{StatefulStorePair, StoreCreationError, StorePairInputs};
+use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
+use crate::consumer::{ConsumerError, KafkaObserver, KeyedStateInputs};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::{KafkaLoader, MemoryLoader};
 use crate::state::cassandra::{
@@ -26,11 +27,6 @@ use tokio::try_join;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-
-pub(crate) const DEFAULT_READER_CACHE_SIZE_BYTES: NonZeroU64 = match NonZeroU64::new(1_048_576) {
-    Some(budget) => budget,
-    None => NonZeroU64::MIN,
-};
 
 #[cfg(test)]
 static NEXT_DEPS_ID: AtomicU64 = AtomicU64::new(0);
@@ -191,14 +187,18 @@ where
         &self.heartbeats
     }
 
-    pub(crate) async fn build_store_pair(
+    pub(crate) async fn build_consumer_components(
         &self,
-        inputs: StorePairInputs,
-    ) -> Result<StatefulStorePair<C>, StoreCreationError>
+        inputs: ConsumerStorageInputs,
+        keyed_state: &KeyedStateInputs,
+        observer: KafkaObserver,
+    ) -> Result<ComponentsOf<C, B>, ConsumerError>
     where
-        B: ConsumerReaderBackend<C>,
+        B: ConsumerReaderBackend<C> + ConsumerStorageBackend<C>,
     {
-        self.backend.build_store_pair(inputs).await
+        self.backend
+            .build_consumer_components(inputs, keyed_state, observer)
+            .await
     }
 
     #[cfg(test)]

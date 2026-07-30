@@ -2058,14 +2058,12 @@ mod marker_record_must_succeed {
 
 /// Settlement classification tables for the wrappers without their own
 /// tests module: the pure pass-throughs (retry mid-stack, log, timeout,
-/// telemetry), `OptionHandler`'s per-branch delegation, and the `LeafHandler`
-/// chain terminator. Delegation is proven
+/// telemetry) and the `LeafHandler` chain terminator. Delegation is proven
 /// against [`BypassedHandler`], whose classification is `Bypassed` for every
 /// result — a wrapper hardcoding `Final` fails those rows.
 mod settlement_classification {
     use super::*;
     use crate::consumer::middleware::log::LogHandler;
-    use crate::consumer::middleware::optional::{OptionError, OptionHandler, OptionOutput};
     use crate::consumer::middleware::providers::LeafHandler;
     use crate::consumer::middleware::retry::RetryHandler;
     use crate::consumer::middleware::telemetry::TelemetryHandler;
@@ -2129,43 +2127,6 @@ mod settlement_classification {
         let err: Result<(), SupportError> = Err(SupportError(ErrorCategory::Permanent));
         assert_eq!(Subject::settlement(ok.as_ref()), Settlement::Final);
         assert_eq!(Subject::settlement(err.as_ref()), Settlement::Final);
-    }
-
-    /// `OptionHandler` delegates to whichever branch produced the result,
-    /// on both sides.
-    #[test]
-    fn option_handler_delegates_per_branch() {
-        type Subject = OptionHandler<ScriptedHandler, BypassedHandler>;
-        type Out = OptionOutput<(), ()>;
-        type Err_ = OptionError<SupportError, SupportError>;
-
-        let rows: Vec<(&str, Result<Out, Err_>, Settlement)> = vec![
-            (
-                "Enabled Ok delegates to the enabled branch (Final)",
-                Ok(OptionOutput::Enabled(())),
-                Settlement::Final,
-            ),
-            (
-                "Disabled Ok delegates to the disabled branch (Bypassed probe)",
-                Ok(OptionOutput::Disabled(())),
-                Settlement::Bypassed,
-            ),
-            (
-                "Enabled Err delegates to the enabled branch (Final)",
-                Err(OptionError::Enabled(SupportError(ErrorCategory::Permanent))),
-                Settlement::Final,
-            ),
-            (
-                "Disabled Err delegates to the disabled branch (Bypassed probe)",
-                Err(OptionError::Disabled(SupportError(
-                    ErrorCategory::Permanent,
-                ))),
-                Settlement::Bypassed,
-            ),
-        ];
-        for (label, result, expected) in rows {
-            assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
-        }
     }
 }
 

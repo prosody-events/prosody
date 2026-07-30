@@ -2,13 +2,14 @@
 
 use crate::cassandra::config::CassandraConfiguration;
 use crate::consumer::middleware::FallibleHandler;
-use crate::high_level::config::{ModeConfiguration, ModeConfigurationError};
+use crate::high_level::config::ModeConfiguration;
 use crate::high_level::state::ConsumerState;
 use crate::high_level::{
-    CassandraClientBackend, CassandraHighLevelClient, ClientBackend, ConsumerBuilders,
-    HighLevelClient, HighLevelClientError, MemoryClientBackend, MemoryHighLevelClient, Mode,
+    CassandraHighLevelClient, ClientBackend, ConsumerBuilders, HighLevelClient,
+    HighLevelClientError, MemoryHighLevelClient, Mode,
 };
 use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder};
+use crate::state_reader::ConsumerReaderBackend;
 use crate::{Codec, EventIdentity, EventType, Topic};
 use async_trait::async_trait;
 use opentelemetry::propagation::TextMapCompositePropagator;
@@ -101,10 +102,8 @@ where
 {
     let mock = consumers
         .consumer
-        .build()
-        .map_err(ModeConfigurationError::Consumer)
-        .map_err(HighLevelClientError::ConsumerConfiguration)?
-        .mock;
+        .configured_mock()
+        .map_err(ErasedClientBuildError::MockConfiguration)?;
 
     if mock {
         Ok(Arc::new(ErasedClient(MemoryHighLevelClient::new(
@@ -124,77 +123,70 @@ where
     C::Payload: EventIdentity,
     B: ClientBackend<C>;
 
-// Concrete impls keep consumer construction internals out of ClientBackend's
-// public bounds.
-macro_rules! impl_erased_client {
-    ($backend:ty) => {
-        #[async_trait]
-        impl<T, C> ErasedHighLevelClient<T, C> for ErasedClient<T, C, $backend>
-        where
-            T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-            C: Codec + Send + Sync,
-            C::Payload: EventIdentity + EventType + Clone,
-        {
-            async fn send(
-                &self,
-                topic: Topic,
-                key: String,
-                payload: C::Payload,
-            ) -> Result<(), HighLevelClientError<C::Error>> {
-                self.0.send(topic, &key, payload).await
-            }
+#[async_trait]
+impl<T, C, B> ErasedHighLevelClient<T, C> for ErasedClient<T, C, B>
+where
+    T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+    C: Codec + Send + Sync,
+    C::Payload: EventIdentity + EventType + Clone,
+    B: ClientBackend<C>,
+    B::Reader: ConsumerReaderBackend<C>,
+{
+    async fn send(
+        &self,
+        topic: Topic,
+        key: String,
+        payload: C::Payload,
+    ) -> Result<(), HighLevelClientError<C::Error>> {
+        self.0.send(topic, &key, payload).await
+    }
 
-            async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>> {
-                self.0.subscribe(handler).await
-            }
+    async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>> {
+        self.0.subscribe_inner(handler).await
+    }
 
-            async fn unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>> {
-                self.0.unsubscribe().await
-            }
+    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>> {
+        self.0.unsubscribe().await
+    }
 
-            async fn consumer_state(&self) -> ErasedConsumerState<T> {
-                match &*self.0.consumer_state().await {
-                    ConsumerState::Unconfigured => ErasedConsumerState::Unconfigured,
-                    ConsumerState::ConfigurationFailed(error) => {
-                        ErasedConsumerState::ConfigurationFailed(error.to_string())
-                    }
-                    ConsumerState::Configured { config, .. } => {
-                        ErasedConsumerState::Configured(erased_config(config))
-                    }
-                    ConsumerState::Running {
-                        config, handler, ..
-                    } => ErasedConsumerState::Running {
-                        config: erased_config(config),
-                        handler: handler.clone(),
-                    },
-                }
+    async fn consumer_state(&self) -> ErasedConsumerState<T> {
+        match &*self.0.consumer_state().await {
+            ConsumerState::Unconfigured => ErasedConsumerState::Unconfigured,
+            ConsumerState::ConfigurationFailed(error) => {
+                ErasedConsumerState::ConfigurationFailed(error.to_string())
             }
-
-            async fn assigned_partition_count(&self) -> u32 {
-                self.0.assigned_partition_count().await
+            ConsumerState::Configured { config, .. } => {
+                ErasedConsumerState::Configured(erased_config(config))
             }
-
-            async fn is_stalled(&self) -> bool {
-                self.0.is_stalled().await
-            }
-
-            fn producer_config(&self) -> &ProducerConfiguration {
-                self.0.producer_config()
-            }
-
-            fn propagator(&self) -> &TextMapCompositePropagator {
-                self.0.propagator()
-            }
-
-            fn source_system(&self) -> &str {
-                self.0.source_system()
-            }
+            ConsumerState::Running {
+                config, handler, ..
+            } => ErasedConsumerState::Running {
+                config: erased_config(config),
+                handler: handler.clone(),
+            },
         }
-    };
-}
+    }
 
-impl_erased_client!(MemoryClientBackend<C>);
-impl_erased_client!(CassandraClientBackend<C>);
+    async fn assigned_partition_count(&self) -> u32 {
+        self.0.assigned_partition_count().await
+    }
+
+    async fn is_stalled(&self) -> bool {
+        self.0.is_stalled().await
+    }
+
+    fn producer_config(&self) -> &ProducerConfiguration {
+        self.0.producer_config()
+    }
+
+    fn propagator(&self) -> &TextMapCompositePropagator {
+        self.0.propagator()
+    }
+
+    fn source_system(&self) -> &str {
+        self.0.source_system()
+    }
+}
 
 fn erased_config(config: &ModeConfiguration) -> ErasedConsumerConfiguration {
     let consumer = config.consumer_config();
@@ -211,6 +203,9 @@ pub enum ErasedClientBuildError<E>
 where
     E: StdError + Send + Sync + 'static,
 {
+    /// The existing mock-mode environment override could not be parsed.
+    #[error("invalid mock-mode configuration: {0}")]
+    MockConfiguration(String),
     /// A live client requires Cassandra storage configuration.
     #[error("Cassandra configuration is required when mock mode is disabled")]
     MissingCassandra,

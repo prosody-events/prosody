@@ -116,7 +116,7 @@ fn seeded_handler(threshold: f64, window: Duration) -> MonopolizationHandler<Scr
         topic: TEST_TOPIC.into(),
         partition: TEST_PARTITION,
         reference_instant: Instant::now(),
-        key_intervals: Arc::new(Cache::new(16_usize)),
+        key_intervals: Some(Arc::new(Cache::new(16_usize))),
         monopolization_threshold: threshold,
         window_duration: window,
     }
@@ -164,6 +164,9 @@ fn matches_model(case: WindowedCase) -> bool {
     let now_nanos = now_ms * NANOS_PER_MS;
     let window_start = now_nanos.saturating_sub(window_nanos);
     let now = handler.reference_instant + Duration::from_nanos(now_nanos);
+    let Some(key_intervals) = &handler.key_intervals else {
+        return false;
+    };
 
     for (i, pairs) in keys.iter().enumerate() {
         let nanos: Vec<(u64, u64)> = pairs
@@ -171,15 +174,13 @@ fn matches_model(case: WindowedCase) -> bool {
             .map(|&(start, len)| (start * NANOS_PER_MS, (start + len) * NANOS_PER_MS))
             .collect();
         if let Some(set) = interval_set(&nanos) {
-            handler
-                .key_intervals
-                .insert(test_tp_key(&format!("key-{i}")), set);
+            key_intervals.insert(test_tp_key(&format!("key-{i}")), set);
         }
     }
 
     (0..keys.len()).all(|i| {
         let tp_key = test_tp_key(&format!("key-{i}"));
-        let expected = handler.key_intervals.get(&tp_key).is_some_and(|set| {
+        let expected = key_intervals.get(&tp_key).is_some_and(|set| {
             let occupied = model_windowed_nanos(&set, window_start, now_nanos);
             u128::from(occupied) * 100_u128 > u128::from(threshold_pct) * u128::from(window_nanos)
         });
@@ -202,9 +203,13 @@ fn exact_threshold_occupancy_is_not_monopolizing() -> Result<()> {
     let tp_key = test_tp_key("exact-threshold");
     let now = handler.reference_instant + Duration::from_secs(100);
     let ninety_secs = Duration::from_secs(90).as_nanos() as u64;
+    let key_intervals = handler
+        .key_intervals
+        .as_ref()
+        .ok_or_else(|| eyre!("seeded handler must have a key cache"))?;
 
     let exact = interval_set(&[(0_u64, ninety_secs)]).ok_or_else(|| eyre!("non-empty pairs"))?;
-    handler.key_intervals.insert(tp_key.clone(), exact);
+    key_intervals.insert(tp_key.clone(), exact);
     assert!(
         handler.check_monopolization(&tp_key, now).is_none(),
         "exactly 90% of the window must pass (threshold is strict >, not >=)"
@@ -212,7 +217,7 @@ fn exact_threshold_occupancy_is_not_monopolizing() -> Result<()> {
 
     let just_above =
         interval_set(&[(0_u64, ninety_secs + 1_u64)]).ok_or_else(|| eyre!("non-empty pairs"))?;
-    handler.key_intervals.insert(tp_key.clone(), just_above);
+    key_intervals.insert(tp_key.clone(), just_above);
     assert!(
         handler.check_monopolization(&tp_key, now).is_some(),
         "one nanosecond above 90% must reject"
@@ -236,7 +241,7 @@ fn test_configuration_validation() -> Result<()> {
 }
 
 #[test]
-fn test_disabled_returns_none() -> Result<()> {
+fn disabled_middleware_retains_no_key_cache() -> Result<()> {
     let telemetry = Telemetry::new();
 
     let config = MonopolizationConfiguration::builder()
@@ -244,7 +249,10 @@ fn test_disabled_returns_none() -> Result<()> {
         .build()?;
 
     let middleware = MonopolizationMiddleware::new(&config, &telemetry)?;
-    assert!(middleware.is_none(), "Disabled config should return None");
+    assert!(
+        middleware.key_intervals.is_none(),
+        "disabled middleware must not allocate a key cache"
+    );
 
     Ok(())
 }
@@ -371,10 +379,7 @@ async fn open_interval_closed_on_completion() -> Result<()> {
     let provider = middleware.with_provider(MockProvider {
         handler: ScriptedHandler::success(),
     });
-    let handler = provider
-        .handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION)
-        .enabled()
-        .ok_or_else(|| eyre!("expected enabled handler"))?;
+    let handler = provider.handler_for_partition(TEST_TOPIC.into(), TEST_PARTITION);
 
     let tp_key = test_tp_key("test-key");
     let start = handler.reference_instant;

@@ -172,7 +172,6 @@ pub mod deduplication;
 pub mod defer;
 pub mod log;
 pub mod monopolization;
-pub mod optional;
 pub mod providers;
 pub mod retry;
 pub mod scheduler;

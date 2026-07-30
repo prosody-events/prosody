@@ -11,21 +11,18 @@ use crate::consumer::handler::{DemandType, EventHandler, Uncommitted};
 use crate::consumer::message::UncommittedMessage;
 use crate::consumer::middleware::CloneProvider;
 use crate::consumer::middleware::deduplication::DEFAULT_IDEMPOTENCE_VERSION;
-use crate::consumer::storage::StorePair;
+use crate::consumer::middleware::deduplication::MemoryDeduplicationStoreProvider;
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::state::{KeyedStateInputs, memory_state_provider};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MemoryLoader;
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
+use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use color_eyre::Result;
-use color_eyre::eyre::bail;
 use serde_json::Value;
-use std::num::NonZeroUsize;
-use std::time::Duration;
 
 /// A no-op handler. The startup tests build a real consumer but deliver nothing
 /// to it.
@@ -67,22 +64,6 @@ pub(super) async fn initialize_with(
 ) -> Result<Result<ProsodyConsumer<JsonCodec>, ConsumerError>> {
     let telemetry = Telemetry::new();
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
-    let stores = StorePair::new_stateless(
-        &TriggerStoreConfiguration::InMemory,
-        config.mock,
-        Duration::default(),
-        NonZeroUsize::MIN,
-        config.timer_spans,
-    )
-    .await?;
-    let StorePair::Memory {
-        trigger_provider,
-        dedup_provider,
-        ..
-    } = stores
-    else {
-        bail!("the in-memory trigger store configuration must yield the memory arm");
-    };
     let keyed_state = KeyedStateInputs::new(
         KeyedStateConfiguration::builder().build()?,
         config,
@@ -90,7 +71,7 @@ pub(super) async fn initialize_with(
     )?;
     let state_provider = memory_state_provider::<JsonCodec>(
         &keyed_state,
-        dedup_provider,
+        MemoryDeduplicationStoreProvider::new(),
         MemoryCells::new(),
         MemoryDescriptorIdentityStore::new(),
         MemoryLoader::<Value>::new(),
@@ -99,7 +80,7 @@ pub(super) async fn initialize_with(
     Ok(initialize_consumer::<_, _, _, JsonCodec>(
         config,
         CloneProvider::new(SilentHandler),
-        trigger_provider,
+        InMemoryTriggerStoreProvider::new(),
         state_provider,
         StartupServices {
             version: keyed_state.version.clone(),

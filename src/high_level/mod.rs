@@ -246,7 +246,6 @@ where
         // Build the consumer. `take` moved the config out, so any failure must
         // undo both: the match below restores `Configured` and drops the
         // bundle. See there for why each step is needed.
-        let trigger_store = self.backend.trigger_store();
         let built: Result<_, HighLevelClientError<C::Error>> = match &config {
             ModeConfiguration::Pipeline {
                 consumer,
@@ -255,7 +254,7 @@ where
                 defer,
                 common,
             } => ProsodyConsumer::<C>::pipeline_consumer_with_backend::<T, B::Reader>(
-                deps::consumer_setup::<C, B>(consumer, &trigger_store, common, &shared),
+                deps::consumer_setup::<C, B>(consumer, common, &shared),
                 PipelineMiddlewareConfiguration {
                     retry: retry.clone(),
                     monopolization: monopolization.clone(),
@@ -272,7 +271,7 @@ where
                 failure_topic,
                 common,
             } => ProsodyConsumer::low_latency_consumer_with_backend::<T, B::Reader>(
-                deps::consumer_setup::<C, B>(consumer, &trigger_store, common, &shared),
+                deps::consumer_setup::<C, B>(consumer, common, &shared),
                 LowLatencyMiddlewareConfiguration {
                     retry: retry.clone(),
                     failure_topic: failure_topic.clone(),
@@ -285,7 +284,7 @@ where
             .map_err(Into::into),
             ModeConfiguration::BestEffort { consumer, common } => {
                 ProsodyConsumer::<C>::best_effort_consumer::<T, B::Reader>(
-                    deps::consumer_setup::<C, B>(consumer, &trigger_store, common, &shared),
+                    deps::consumer_setup::<C, B>(consumer, common, &shared),
                     self.telemetry.clone(),
                     handler.clone(),
                 )

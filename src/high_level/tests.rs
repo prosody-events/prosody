@@ -5,6 +5,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::{ConsumerConfiguration, DemandType};
+use crate::high_level::erased::{ErasedConsumerState, new_erased};
 use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;
 use crate::state::descriptor::value_state;
@@ -115,6 +116,35 @@ impl FallibleHandler for NoOpHandler {
     }
 
     async fn shutdown(self) {}
+}
+
+/// Erased backend selection reads only mock mode. Invalid consumer-only fields
+/// remain deferred, so the producer half constructs and subscription reports
+/// the retained configuration error.
+#[test]
+fn erased_client_retains_consumer_failure_until_subscribe() -> Result<()> {
+    let mut producer = ProducerConfiguration::builder();
+    producer
+        .bootstrap_servers(vec!["unused-in-mock-mode:9092".to_owned()])
+        .source_system("producer-only");
+    let mut consumer = ConsumerConfiguration::builder();
+    consumer.mock(true);
+    let consumers = ConsumerBuilders {
+        consumer,
+        ..ConsumerBuilders::new()?
+    };
+
+    let client =
+        new_erased::<NoOpHandler, JsonCodec>(Mode::Pipeline, &mut producer, &consumers, None)?;
+    assert_eq!(client.source_system(), "producer-only");
+    let state = TEST_RUNTIME.block_on(client.consumer_state());
+    assert!(matches!(state, ErasedConsumerState::ConfigurationFailed(_)));
+    let subscribed = TEST_RUNTIME.block_on(client.subscribe(NoOpHandler));
+    assert!(matches!(
+        subscribed,
+        Err(HighLevelClientError::ConsumerConfiguration(_))
+    ));
+    Ok(())
 }
 
 /// In the `Configured` state, `register` mints a capability handle.

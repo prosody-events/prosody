@@ -2,6 +2,7 @@
 //! middleware. The durability boundary never runs, so keyed-state
 //! registrations are rejected.
 
+use crate::cassandra::CassandraStore;
 use crate::consumer::ProsodyConsumer;
 use crate::consumer::config::ConsumerConfiguration;
 use crate::consumer::error::{ConsumerError, KeyedStateInitError};
@@ -10,7 +11,7 @@ use crate::consumer::middleware::deduplication::{
     DEFAULT_IDEMPOTENCE_VERSION, MemoryDeduplicationStoreProvider,
 };
 use crate::consumer::observer::KafkaObserver;
-use crate::consumer::storage::StorePair;
+use crate::consumer::storage::StoreCreationError;
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::state::{KeyedStateInputs, memory_state_provider};
 use crate::heartbeat::HeartbeatRegistry;
@@ -19,9 +20,10 @@ use crate::loader::MemoryLoader;
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::telemetry::Telemetry;
+use crate::timers::store::TriggerStoreProvider;
+use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
+use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType};
-use std::num::NonZeroUsize;
-use std::time::Duration;
 use validator::Validate;
 
 impl<C: Codec> ProsodyConsumer<C>
@@ -78,19 +80,6 @@ where
             consumer_config.stall_threshold,
         );
 
-        // Build the empty keyed-state backend the partition machinery requires.
-        // Deduplication is structurally mandatory in the store layer, but with
-        // no dedup/state middleware on this path the dedup store stays inert and
-        // its oracle is never consulted — an empty registry stages nothing — so a
-        // minimal cache capacity is sufficient.
-        let stores = StorePair::new_stateless(
-            trigger_store_config,
-            consumer_config.mock,
-            Duration::default(),
-            NonZeroUsize::MIN,
-            consumer_config.timer_spans,
-        )
-        .await?;
         let keyed_state = KeyedStateInputs::new(
             keyed_state_config,
             consumer_config,
@@ -104,61 +93,57 @@ where
             observer: KafkaObserver::new(&consumer_config.group_id),
         };
 
-        match stores {
-            StorePair::Memory {
-                trigger_provider,
-                dedup_provider,
-                ..
-            } => {
-                let state_provider = memory_state_provider::<C>(
-                    &keyed_state,
-                    dedup_provider,
-                    MemoryCells::new(),
-                    MemoryDescriptorIdentityStore::new(),
-                    MemoryLoader::<C::Payload>::new(),
-                    // The direct mode rejects registrations, so nothing is ever
-                    // published: no publisher, no reconcile.
-                    None,
-                );
-                initialize_consumer::<_, _, _, C>(
+        match (consumer_config.mock, trigger_store_config) {
+            (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
+                initialize_direct::<T, _, C>(
                     consumer_config,
                     handler_provider,
-                    trigger_provider,
-                    state_provider,
+                    InMemoryTriggerStoreProvider::new(),
+                    &keyed_state,
                     services,
                 )
                 .await
             }
-            StorePair::Cassandra {
-                trigger_provider, ..
-            } => {
-                // Stateless consumer: the `settle` boundary never runs and the
-                // registry is provably empty (rejected above otherwise), so no
-                // session can ever stage. Back keyed state with the inert memory
-                // provider rather than `cassandra_state_provider`, which would
-                // otherwise spawn a loader `BaseConsumer` + poll thread and
-                // create the fjall cache dir for a backend that stages nothing.
-                // The real Cassandra `trigger_provider` still drives the timer
-                // system, and its per-partition store handle is what the (never
-                // consulted) commit oracle receives at acquisition.
-                let state_provider = memory_state_provider::<C>(
-                    &keyed_state,
-                    MemoryDeduplicationStoreProvider::new(),
-                    MemoryCells::new(),
-                    MemoryDescriptorIdentityStore::new(),
-                    MemoryLoader::<C::Payload>::new(),
-                    // Stateless: registrations are rejected, nothing publishes.
-                    None,
-                );
-                initialize_consumer::<_, _, _, C>(
+            (false, TriggerStoreConfiguration::Cassandra(config)) => {
+                let store = CassandraStore::new(config)
+                    .await
+                    .map_err(StoreCreationError::from)?;
+                let trigger =
+                    CassandraTriggerStoreProvider::with_store(store, &config.keyspace).await?;
+                initialize_direct::<T, _, C>(
                     consumer_config,
                     handler_provider,
-                    trigger_provider,
-                    state_provider,
+                    trigger,
+                    &keyed_state,
                     services,
                 )
                 .await
             }
         }
     }
+}
+
+async fn initialize_direct<T, P, C>(
+    consumer: &ConsumerConfiguration,
+    handler: T,
+    trigger: P,
+    keyed_state: &KeyedStateInputs,
+    services: StartupServices<'_>,
+) -> Result<ProsodyConsumer<C>, ConsumerError>
+where
+    T: HandlerProvider,
+    T::Handler: EventHandler<Payload = C::Payload>,
+    P: TriggerStoreProvider,
+    C: Codec,
+    C::Payload: EventIdentity + EventType + Clone,
+{
+    let state = memory_state_provider::<C>(
+        keyed_state,
+        MemoryDeduplicationStoreProvider::new(),
+        MemoryCells::new(),
+        MemoryDescriptorIdentityStore::new(),
+        MemoryLoader::new(),
+        None,
+    );
+    initialize_consumer::<_, _, _, C>(consumer, handler, trigger, state, services).await
 }

@@ -30,8 +30,8 @@ use whoami::hostname;
 /// Everything startup needs beyond the consumer configuration and the two
 /// per-partition providers.
 ///
-/// Deliberately not `Clone`: one value can serve only one storage arm, so a
-/// mode cannot hand two consumers two different observers without a second,
+/// Deliberately not `Clone`: one value can serve only one consumer, so a mode
+/// cannot hand two consumers two different observers without a second,
 /// grep-visible [`KafkaObserver::new`] call.
 pub(in crate::consumer) struct StartupServices<'a> {
     /// Idempotence version stamped into the partition configuration.

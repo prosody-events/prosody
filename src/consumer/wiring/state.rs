@@ -28,8 +28,18 @@ use crate::{Codec, ConsumerGroup, EventIdentity, EventType};
 use std::fs;
 use std::sync::Arc;
 
-/// Keyed-state wiring inputs shared by every mode's storage branches.
-pub(in crate::consumer) struct KeyedStateInputs {
+pub(crate) type MemoryStateProvider<P> = StateManagerProvider<
+    MemoryStateBackendFactory<MemoryDeduplicationStoreProvider>,
+    MemoryLoader<P>,
+>;
+
+pub(crate) type CassandraStateProvider<C> = StateManagerProvider<
+    CassandraStateBackendFactory<CassandraDeduplicationStoreProvider>,
+    KafkaLoader<C>,
+>;
+
+/// Keyed-state wiring inputs shared by every mode.
+pub(crate) struct KeyedStateInputs {
     config: KeyedStateConfiguration,
     group: ConsumerGroup,
     pub(in crate::consumer) version: Arc<str>,
@@ -104,7 +114,7 @@ impl KeyedStateInputs {
     }
 
     /// Runs startup reconciliation and, when publishing is active, builds the
-    /// first-write publisher template for one storage arm's publication store.
+    /// first-write publisher template for one backend's publication store.
     /// The two typed wrappers above choose the count source, so a mock topology
     /// can never reach a Cassandra routing row.
     ///
@@ -157,12 +167,11 @@ impl KeyedStateInputs {
     }
 }
 
-/// Builds the keyed-state provider for a
-/// [`StorePair::Memory`](crate::consumer::storage::StorePair::Memory) arm (and
-/// the stateless Cassandra arm): the in-memory durable store, backend factory,
+/// Builds the keyed-state provider for an in-memory backend (and the stateless
+/// Cassandra path): the in-memory durable store, backend factory,
 /// and the caller's in-memory message loader, wrapped in the partition state
 /// provider. The pipeline also hands this loader to message defer. Other arms
-/// take the bundle's loader when one is supplied, otherwise a fresh one.
+/// take their concrete bundle's loader.
 /// The factory is store-type agnostic — the commit oracle's trigger store
 /// handle arrives per partition via
 /// [`PartitionStateProvider::acquire`](crate::state::manager::PartitionStateProvider::acquire)
@@ -174,16 +183,12 @@ pub(in crate::consumer) fn memory_state_provider<C: Codec>(
     identities: MemoryDescriptorIdentityStore,
     loader: MemoryLoader<C::Payload>,
     publisher_template: Option<PublisherTemplate<MemoryPublicationStore, FixedPartitionCount>>,
-) -> StateManagerProvider<
-    MemoryStateBackendFactory<MemoryDeduplicationStoreProvider>,
-    MemoryLoader<C::Payload>,
->
+) -> MemoryStateProvider<C::Payload>
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
 {
-    // `cells`/`identities` come from the shared bundle when one is supplied. A
-    // reader built from the same bundle then observes this consumer's committed
-    // writes (mock read-your-writes). A no-bundle consumer passes fresh stores.
+    // `cells` and `identities` come from the shared bundle. A reader built from
+    // the same bundle observes this consumer's committed writes.
     let backend = MemoryStateBackendFactory::new(
         cells,
         identities,
@@ -195,9 +200,8 @@ where
     keyed_state.provider(backend, loader)
 }
 
-/// Builds the keyed-state provider for a
-/// [`StorePair::Cassandra`](crate::consumer::storage::StorePair::Cassandra)
-/// arm: opens the fjall workspace, mints the backend factory over the caller's
+/// Builds the keyed-state provider for a Cassandra backend. It opens the fjall
+/// workspace, mints the backend factory over the caller's
 /// Kafka loader, and wraps it in the partition state provider. Shared by every
 /// constructor's Cassandra arm; the caller owns the loader so the pipeline can
 /// hand the same one to its message-defer middleware.
@@ -208,13 +212,7 @@ pub(in crate::consumer) fn cassandra_state_provider<C: Codec>(
     identity_store: CassandraDescriptorIdentityStore,
     loader: KafkaLoader<C>,
     publisher_template: Option<PublisherTemplate<CassandraPublicationStore, KafkaObserver>>,
-) -> Result<
-    StateManagerProvider<
-        CassandraStateBackendFactory<CassandraDeduplicationStoreProvider>,
-        KafkaLoader<C>,
-    >,
-    ConsumerError,
->
+) -> Result<CassandraStateProvider<C>, ConsumerError>
 where
     C::Payload: EventType + Clone + EventIdentity + Send + Sync + 'static,
 {
