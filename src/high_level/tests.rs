@@ -1,6 +1,7 @@
 use super::*;
 use crate::JsonCodec;
 use crate::Key;
+use crate::cassandra::config::CassandraConfigurationBuilder;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
@@ -136,8 +137,12 @@ fn erased_client_retains_consumer_failure_until_subscribe() -> Result<()> {
         ..ConsumerBuilders::new()?
     };
 
-    let client =
-        new_erased::<NoOpHandler, JsonCodec>(Mode::Pipeline, &mut producer, &consumers, None)?;
+    let client = new_erased::<NoOpHandler, JsonCodec>(
+        Mode::Pipeline,
+        &mut producer,
+        &consumers,
+        &CassandraConfigurationBuilder::default(),
+    )?;
     assert_eq!(client.source_system(), "producer-only");
     let state = TEST_RUNTIME.block_on(client.consumer_state());
     assert!(matches!(state, ErasedConsumerState::ConfigurationFailed(_)));
@@ -166,8 +171,12 @@ fn erased_reader_kinds_share_subsystem_validation() -> Result<()> {
         consumer,
         ..ConsumerBuilders::new()?
     };
-    let client =
-        new_erased::<NoOpHandler, JsonCodec>(Mode::Pipeline, &mut producer, &consumers, None)?;
+    let client = new_erased::<NoOpHandler, JsonCodec>(
+        Mode::Pipeline,
+        &mut producer,
+        &consumers,
+        &CassandraConfigurationBuilder::default(),
+    )?;
 
     TEST_RUNTIME.block_on(async {
         let value = client

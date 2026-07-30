@@ -1,6 +1,6 @@
 //! Optional type erasure for foreign-language client wrappers.
 
-use crate::cassandra::config::CassandraConfiguration;
+use crate::cassandra::config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError};
 use crate::consumer::MockConfigurationError;
 use crate::consumer::middleware::FallibleHandler;
 use crate::high_level::config::ModeConfiguration;
@@ -115,14 +115,13 @@ pub type SharedHighLevelClient<T, C> = Arc<dyn ErasedHighLevelClient<T, C>>;
 ///
 /// # Errors
 ///
-/// Returns [`ErasedClientBuildError::MissingCassandra`] when a live client has
-/// no Cassandra configuration. Other construction failures retain the
-/// structured high-level error as their source.
+/// Backend selection and backend-specific configuration validation happen
+/// here so every foreign-language client follows the same construction path.
 pub fn new_erased<T, C>(
     mode: Mode,
     producer: &mut ProducerConfigurationBuilder,
     consumers: &ConsumerBuilders,
-    cassandra: Option<CassandraConfiguration>,
+    cassandra: &CassandraConfigurationBuilder,
 ) -> Result<SharedHighLevelClient<T, C>, ErasedClientBuildError<C::Error>>
 where
     T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
@@ -136,7 +135,7 @@ where
             mode, producer, consumers,
         )?)))
     } else {
-        let cassandra = cassandra.ok_or(ErasedClientBuildError::MissingCassandra)?;
+        let cassandra = cassandra.build()?;
         Ok(Arc::new(ErasedClient(CassandraHighLevelClient::new(
             cassandra, mode, producer, consumers,
         )?)))
@@ -259,9 +258,9 @@ where
     /// The existing mock-mode environment override could not be parsed.
     #[error(transparent)]
     MockConfiguration(#[from] MockConfigurationError),
-    /// A live client requires Cassandra storage configuration.
-    #[error("Cassandra configuration is required when mock mode is disabled")]
-    MissingCassandra,
+    /// Cassandra configuration failed for a live client.
+    #[error(transparent)]
+    CassandraConfiguration(#[from] CassandraConfigurationBuilderError),
     /// Concrete client construction failed.
     #[error(transparent)]
     Client(#[from] HighLevelClientError<E>),
