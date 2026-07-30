@@ -179,24 +179,29 @@ the write machinery. A published collection with no subsystem is rejected at
 build.
 
 ```rust,ignore
-// Owning consumer: publish the collection under a subsystem.
+// One descriptor configures both the owning handle and the published reader.
 let cart = value_state("cart")
     .published(true)
     .ttl(CompactDuration::new(30 * 24 * 60 * 60));
 let config = KeyedStateConfiguration::builder()
     .subsystem(Some(SubsystemName::try_new("carts")?))
     .build()?;
+// After constructing the owning client with `config`:
+let registered_cart = owner.register(cart).await?;
+
+// Inside the owner's handler, the current event supplies the state key.
+let state = context.state(registered_cart)?;
+let value = state.get().await?;
+state.set(updated).await?;
 ```
 
 Any other service reads it through the same high-level client, naming the
 subsystem and the same collection shape:
 
 ```rust,ignore
-// `.read_cache` overrides the read-only client's inherited cache policy. It is
-// unrelated to the owner's `.ttl` and inert on the owning consumer.
-let cart = value_state("cart").read_cache(Duration::from_secs(5));
+// Outside a handler, each read supplies the state key explicitly.
 let reader = client.state(SubsystemName::try_new("carts")?, cart).await?;
-let cart = reader.get("user-1").await?; // committed value from the owning group
+let value = reader.get("user-1").await?; // committed value from the owning group
 ```
 
 A reader observes only **committed** state — never an in-flight value and never
