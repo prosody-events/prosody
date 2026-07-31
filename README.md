@@ -211,7 +211,10 @@ the reader's own writes — read from a single publication source per operation.
 Reads are cached for 5 seconds by default. Override the default per process
 with `PROSODY_STATE_READ_CACHE_TTL` (`none` disables caching), or per
 collection with `.read_cache(...)`, which always wins over the process
-default. Pass `ReadCachePolicy::Disabled` to `.read_cache(...)` when one
+default. `PROSODY_STATE_OWNED_CACHE_SIZE` and
+`PROSODY_STATE_READ_CACHE_SIZE` accept human-readable values such as `64 MiB`;
+the read cache follows the owned cache size unless overridden. Pass
+`ReadCachePolicy::Disabled` to `.read_cache(...)` when one
 collection must always read the store despite an enabled process default. A
 cached value was the store's committed answer within the last cache TTL. There
 is no ordering guarantee across sources. The two TTLs never interact: `.ttl`
