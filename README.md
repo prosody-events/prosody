@@ -184,7 +184,7 @@ let cart = value_state("cart")
     .published(true)
     .ttl(CompactDuration::new(30 * 24 * 60 * 60));
 let config = KeyedStateConfiguration::builder()
-    .subsystem(Some(SubsystemName::try_new("carts")?))
+    .subsystem(Some(SubsystemName::try_new("checkout")?))
     .build()?;
 // After constructing the owning client with `config`:
 let registered_cart = owner.register(cart).await?;
@@ -200,7 +200,9 @@ subsystem and the same collection shape:
 
 ```rust,ignore
 // Outside a handler, each read supplies the state key explicitly.
-let reader = client.state(SubsystemName::try_new("carts")?, cart).await?;
+let reader = client
+    .state(SubsystemName::try_new("checkout")?, cart)
+    .await?;
 let value = reader.get("user-1").await?; // committed value from the owning group
 ```
 

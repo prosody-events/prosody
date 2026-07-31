@@ -223,7 +223,7 @@ impl KeyedStateConfiguration {
         validate_publication(
             descriptor.name(),
             descriptor.collection_def(),
-            &self.subsystem,
+            self.subsystem.as_ref(),
         )?;
         Ok(self.register(descriptor))
     }
@@ -250,7 +250,7 @@ impl KeyedStateConfiguration {
     pub(crate) fn build_registry(&self) -> Result<CollectionDefRegistry, RegisterStateError> {
         let mut registry = CollectionDefRegistry::default();
         for (state_type, name, identity, def) in &self.registrations {
-            validate_publication(name, *def, &self.subsystem)?;
+            validate_publication(name, *def, self.subsystem.as_ref())?;
             if let Some(ttl) = def.ttl
                 && ttl.seconds() <= self.recovery_delay.seconds()
             {
@@ -269,7 +269,7 @@ impl KeyedStateConfiguration {
 fn validate_publication(
     name: &str,
     definition: CollectionDef,
-    subsystem: &Option<SubsystemName>,
+    subsystem: Option<&SubsystemName>,
 ) -> Result<(), RegisterStateError> {
     if definition.visibility == StateVisibility::Published && subsystem.is_none() {
         return Err(RegisterStateError::PublishedWithoutSubsystem {
