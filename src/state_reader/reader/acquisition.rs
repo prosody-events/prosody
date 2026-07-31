@@ -5,26 +5,17 @@
 //! [`StateReader::snapshot`] is the refresh-if-stale entry point every read
 //! goes through.
 
-use crate::state::access::StateAccessError;
 use crate::state::descriptor::StateDescriptor;
-use crate::state::descriptor_identity::DescriptorIdentityStore;
-use crate::state::descriptor_identity::{self, DurableDescriptorIdentity};
 use crate::state::publication::PublicationStore;
-use crate::state::publication::StatePublication;
 use crate::state_reader::ReaderBackend;
 use crate::state_reader::error::StateReaderError;
-use crate::state_reader::source::{
-    MAX_PUBLICATION_SOURCES, NoSnapshot, Source, SourceId, ValidatedPublications,
-};
+use crate::state_reader::source::{MAX_PUBLICATION_SOURCES, NoSnapshot, ValidatedPublications};
 use crate::{Codec, state_reader::reader::StateReader};
-use futures::stream::{self, StreamExt};
 use parking_lot::RwLock;
 use quanta::Instant;
-use smallvec::SmallVec;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::task::coop::cooperative;
 use tracing::warn;
 
 /// The default snapshot-refresh cadence: a source list changes rarely, so the
@@ -149,20 +140,6 @@ impl SnapshotState {
     fn within_pacing(&self, now: Instant) -> bool {
         self.retry_after.is_some_and(|deadline| now < deadline)
     }
-}
-
-/// Publishing group ids gathered during one admission, bounded by the source
-/// cap so the common case stays on the stack.
-type GroupIds = SmallVec<[Arc<str>; MAX_PUBLICATION_SOURCES]>;
-
-/// The running result of a refresh's identity validation: the admitted
-/// sources, the first present-but-unequal group (a hard mismatch), and whether
-/// any advertised source lacked a frozen identity.
-#[derive(Default)]
-struct Admission {
-    admitted: SmallVec<[Source; MAX_PUBLICATION_SOURCES]>,
-    mismatch: Option<Arc<str>>,
-    any_missing: bool,
 }
 
 impl<D, C, B> StateReader<D, C, B>
@@ -366,132 +343,6 @@ where
             Some(acquired) => self.serve(acquired),
             None => Err(error),
         }
-    }
-
-    /// Validates each advertised source's frozen identity, admitting the ones
-    /// whose group is already in `prior` without a fresh read.
-    ///
-    /// `rows` is capped at [`MAX_PUBLICATION_SOURCES`] by the caller, so both
-    /// group lists and the fan-out below are bounded by that ceiling and stay
-    /// on the stack.
-    async fn admit(
-        &self,
-        rows: &[StatePublication],
-        prior: Option<&ValidatedPublications>,
-    ) -> Result<Admission, StateReaderError> {
-        let prior_groups: GroupIds = prior
-            .map(|snapshot| {
-                snapshot
-                    .sources()
-                    .iter()
-                    .map(|source| source.id.group_id.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let asserted = DurableDescriptorIdentity::from_identity(
-            self.context.state_type,
-            self.context.name.as_str(),
-            &self.descriptor.structural_identity(),
-        );
-
-        // Distinct group ids in advertisement order (few sources; a linear
-        // scan is cheaper than a hasher).
-        let mut groups = GroupIds::new();
-        for row in rows {
-            if !groups.iter().any(|g| **g == *row.group_id) {
-                groups.push(row.group_id.clone());
-            }
-        }
-
-        // Fan the identity reads for the newly-advertised groups (those absent
-        // from `prior`) out concurrently: a cold snapshot after a rebalance must
-        // not pay one serial round trip per source. `buffered` is
-        // order-preserving, so the read results stay aligned to the
-        // newly-advertised groups in advertisement order and the fold below
-        // stays deterministic.
-        let mut new_groups = GroupIds::new();
-        for group in &groups {
-            if !prior_groups.iter().any(|prior| prior == group) {
-                new_groups.push(group.clone());
-            }
-        }
-        let mut reads = stream::iter(new_groups)
-            .map(|group| {
-                cooperative(async move {
-                    self.context
-                        .backend
-                        .identities()
-                        .read_identity(&group, self.context.state_type, self.context.name.as_str())
-                        .await
-                        .map_err(|error| StateReaderError::store(&error))
-                })
-            })
-            .buffered(MAX_PUBLICATION_SOURCES)
-            .collect::<SmallVec<[_; MAX_PUBLICATION_SOURCES]>>()
-            .await
-            .into_iter();
-
-        // Fold sequentially in advertisement order: a prior group is admitted
-        // with no read; a new group consumes its order-aligned identity read.
-        let mut admission = Admission::default();
-        for group in &groups {
-            let admitted = if prior_groups.iter().any(|prior| prior == group) {
-                true
-            } else {
-                match reads.next() {
-                    Some(stored) => {
-                        self.classify_identity(stored?, group, &asserted, &mut admission)
-                    }
-                    // Unreachable: every new group produced exactly one read.
-                    None => false,
-                }
-            };
-            if admitted {
-                for row in rows {
-                    if *row.group_id == **group {
-                        admission.admitted.push(Source {
-                            id: SourceId {
-                                group_id: row.group_id.clone(),
-                                topic: row.topic,
-                            },
-                            partition_count: row.partition_count,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(admission)
-    }
-
-    /// Classifies a new group's already-read frozen identity, recording a
-    /// mismatch or missing identity in `admission`; returns whether the group
-    /// is admitted. This function does no I/O. The identity read runs
-    /// concurrently in [`Self::admit`].
-    fn classify_identity(
-        &self,
-        stored: Option<DurableDescriptorIdentity>,
-        group: &Arc<str>,
-        asserted: &DurableDescriptorIdentity,
-        admission: &mut Admission,
-    ) -> bool {
-        let Some(stored) = stored else {
-            warn!(group = %group, name = %self.context.name.as_str(), "publication source has no frozen identity yet");
-            admission.any_missing = true;
-            return false;
-        };
-        if let Err(error) = descriptor_identity::validate::<StateAccessError>(stored, asserted) {
-            warn!(
-                group = %group,
-                name = %self.context.name.as_str(),
-                error = %error,
-                "publication source descriptor identity disagrees"
-            );
-            if admission.mismatch.is_none() {
-                admission.mismatch = Some(Arc::clone(group));
-            }
-            return false;
-        }
-        true
     }
 
     /// The Transient error a read gets while this collection has nothing to

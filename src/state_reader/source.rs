@@ -19,32 +19,22 @@ pub(crate) const PUBLICATION_READ_LIMIT: usize = MAX_PUBLICATION_SOURCES + 1;
 /// A source's **stable** identity: the publishing consumer group and the topic
 /// whose messages wrote the state.
 ///
-/// This identity is not an ordinal index into the snapshot. A refresh can
-/// reorder or remove sources. A cache key or pin based on the index would then
-/// point at a *different* source's cells after a refresh. The reader would
-/// serve the wrong source's committed data, which is a correctness violation
-/// rather than mere staleness. Every cache key and pin carries this identity
-/// instead. `Ord` is lexicographic over `(group_id, topic)`, which gives the
-/// snapshot a deterministic order for preferring one source over another.
+/// This identity is not an ordinal index into the snapshot. It includes every
+/// input that determines the backing segment. A refresh can reorder sources or
+/// observe a changed partition count without letting cached cells alias the
+/// newly routed source. `Ord` gives the snapshot a deterministic source order.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SourceId {
     /// The publishing consumer group.
     pub(crate) group_id: Arc<str>,
     /// The topic whose messages wrote the state.
     pub(crate) topic: Topic,
-}
-
-/// One admitted source: its stable [`SourceId`] and the topic's Kafka partition
-/// count. The reader uses the count to map a key to its partition. The count is
-/// stored on the publication row, so the read path needs no live partition
-/// fetch.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Source {
-    /// Stable identity.
-    pub(crate) id: SourceId,
     /// The topic's partition count.
     pub(crate) partition_count: PartitionCount,
 }
+
+/// One admitted publication source.
+pub(crate) type Source = SourceId;
 
 /// A validated publication snapshot. It is a **non-empty** list of at most
 /// [`MAX_PUBLICATION_SOURCES`] sources, ordered by [`SourceId`]. Every source's
@@ -79,7 +69,7 @@ impl ValidatedPublications {
                 found: sources.len(),
             });
         }
-        sources.sort_by(|a, b| a.id.cmp(&b.id));
+        sources.sort();
         Ok(Self { sources })
     }
 
@@ -123,10 +113,8 @@ mod tests {
     fn oversized_snapshot_is_too_many_sources() -> color_eyre::Result<()> {
         let sources: SmallVec<[Source; MAX_PUBLICATION_SOURCES]> = (0..=MAX_PUBLICATION_SOURCES)
             .map(|i| Source {
-                id: SourceId {
-                    group_id: Arc::from(format!("group-{i}")),
-                    topic: Intern::<str>::from("topic"),
-                },
+                group_id: Arc::from(format!("group-{i}")),
+                topic: Intern::<str>::from("topic"),
                 partition_count: PartitionCount::MIN,
             })
             .collect();

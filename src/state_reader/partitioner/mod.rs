@@ -13,7 +13,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 /// row, so zero, negative, and oversized counts cannot exist past decode. The
 /// `i32` source already caps the value at `i32::MAX`, so no upper bound is
 /// checked at runtime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PartitionCount(NonZeroU32);
 
 impl PartitionCount {

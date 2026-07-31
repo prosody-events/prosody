@@ -56,8 +56,7 @@ impl KeyedStateInputs {
         consumer_config: &ConsumerConfiguration,
         dedup_version: &str,
     ) -> Result<Self, ConsumerError> {
-        // Fail fast on an invalid timer slab size — the partition loop would
-        // otherwise only log and fall back to a default at rebalance time.
+        // Fail before backend I/O instead of waiting for the first rebalance.
         CompactDuration::try_from(consumer_config.slab_size)
             .map_err(ConsumerError::InvalidSlabSize)?;
         let registry = Arc::new(config.build_registry().map_err(KeyedStateInitError::from)?);

@@ -127,7 +127,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         }
         let partition = partition_for_key(self.key.as_bytes(), source.partition_count)
             .map_err(|e| StateAccessError::store(&e))?;
-        let segment = partition_segment_id(source.id.topic, partition, &source.id.group_id);
+        let segment = partition_segment_id(source.topic, partition, &source.group_id);
         let state_key = StateKey::new(segment, self.key.clone());
         Ok(CollectionId::new(
             state_key,
@@ -145,7 +145,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
 
     fn cache_key(&self, source: &Source, cell: &CellKey) -> CacheKey {
         (
-            source.id.clone(),
+            source.clone(),
             self.context.state_type,
             self.context.name.clone(),
             self.key.clone(),

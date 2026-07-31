@@ -23,7 +23,7 @@ use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::store::CellBuffer;
 use crate::state::{StateName, StateType};
 use crate::state_reader::cache::CacheKey;
-use crate::state_reader::source::SourceId;
+use crate::state_reader::{PartitionCount, source::SourceId};
 use bytes::Bytes;
 use color_eyre::eyre::Result;
 use futures::executor::block_on;
@@ -36,11 +36,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// A cache key for the given collection name at cell coordinate `coord`.
-fn key_at(state_type: StateType, name: &str, coord: Vec<u8>) -> Result<CacheKey> {
+fn key_at(
+    state_type: StateType,
+    name: &str,
+    partition_count: i32,
+    coord: Vec<u8>,
+) -> Result<CacheKey> {
     Ok((
         SourceId {
             group_id: Arc::from("group-aaa"),
             topic: topic("t"),
+            partition_count: PartitionCount::try_from(partition_count)?,
         },
         state_type,
         StateName::try_new(name)?,
@@ -54,7 +60,7 @@ fn key_at(state_type: StateType, name: &str, coord: Vec<u8>) -> Result<CacheKey>
 
 /// A cache key for the given collection name and one fixed cell.
 fn key(name: &str) -> Result<CacheKey> {
-    key_at(StateType::Application, name, vec![0])
+    key_at(StateType::Application, name, 1, vec![0])
 }
 
 // --- Staleness property -----------------------------------------------------
@@ -63,11 +69,12 @@ fn key(name: &str) -> Result<CacheKey> {
 /// **only** by `StateName`: same source, partition key, and cell. A cache key
 /// that dropped `StateName` would collapse them, aliasing one collection's
 /// entry onto another's.
-const CACHE_KEYS: [(StateType, &str); 4] = [
-    (StateType::Application, "cache-n0"),
-    (StateType::Application, "cache-n1"),
-    (StateType::Application, "cache-n2"),
-    (StateType::Framework, "cache-n0"),
+const CACHE_KEYS: [(StateType, &str, i32); 5] = [
+    (StateType::Application, "cache-n0", 1),
+    (StateType::Application, "cache-n0", 2),
+    (StateType::Application, "cache-n1", 1),
+    (StateType::Application, "cache-n2", 1),
+    (StateType::Framework, "cache-n0", 1),
 ];
 
 /// The per-get TTL pool the schedule draws from: the degenerate zero (every
@@ -152,7 +159,8 @@ fn fill_value(key: u8, present: bool) -> Option<Bytes> {
 
 /// One property proves the staleness rules and cache-key isolation together:
 /// stamp-at-issue age, the `age == ttl` miss boundary, negative-entry refresh,
-/// namespace and name isolation, and per-ttl freshness windows.
+/// source topology, namespace, and name isolation, and per-ttl freshness
+/// windows.
 ///
 /// A plain `HashMap<key, (issued, value)>` model predicts, for every get,
 /// both the served value and whether a fill fires. A get is a hit served
@@ -163,8 +171,9 @@ fn fill_value(key: u8, present: bool) -> Option<Bytes> {
 ///
 /// Falsify: change `ReaderCache::fresh`'s `<` to `<=`. An `age == ttl` step
 /// then serves a stale hit, so the fill count trails the model. Or drop
-/// `StateName` or `StateType` from `CacheKey`: a later distinct collection
-/// then hits the first entry, serving the wrong bytes with no fill.
+/// `PartitionCount`, `StateName`, or `StateType` from `CacheKey`: a later
+/// distinct source or collection then hits the first entry, serving the wrong
+/// bytes with no fill.
 #[test]
 fn prop_cache_staleness() {
     fn property(schedule: CacheSchedule) -> Result<bool> {
@@ -178,7 +187,7 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
     let clock = cache.clock();
     let keys: Vec<CacheKey> = CACHE_KEYS
         .iter()
-        .map(|(state_type, name)| key_at(*state_type, name, vec![0]))
+        .map(|(state_type, name, count)| key_at(*state_type, name, *count, vec![0]))
         .collect::<Result<_>>()?;
     let fills = Arc::new(AtomicUsize::new(0));
     // key idx -> (issue instant, cached value).
@@ -404,7 +413,12 @@ async fn declared_weight_bounded_by_budget() -> Result<()> {
     let (cache, _mock) = mock_clock_cache(budget);
     let value = Bytes::from(vec![0u8; 256]);
     for i in 0..200u32 {
-        let k = key_at(StateType::Application, "weighted", i.to_be_bytes().to_vec())?;
+        let k = key_at(
+            StateType::Application,
+            "weighted",
+            1,
+            i.to_be_bytes().to_vec(),
+        )?;
         let value = value.clone();
         cache
             .get_cached(k, Duration::from_secs(1000), || {

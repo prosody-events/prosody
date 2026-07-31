@@ -25,6 +25,7 @@
 )]
 
 pub(crate) mod acquisition;
+mod admission;
 
 use crate::Key;
 use crate::codec::Codec;
