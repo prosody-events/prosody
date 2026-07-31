@@ -8,6 +8,7 @@
 
 use crate::error::{ClassifyError, ErrorCategory};
 use std::borrow::Borrow;
+use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -43,6 +44,14 @@ impl SubsystemName {
 impl AsRef<str> for SubsystemName {
     fn as_ref(&self) -> &str {
         self.as_str()
+    }
+}
+
+impl FromStr for SubsystemName {
+    type Err = SubsystemNameError;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::try_new(name)
     }
 }
 

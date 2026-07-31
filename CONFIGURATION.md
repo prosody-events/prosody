@@ -12,6 +12,7 @@ environment variables for unset fields, so you can mix both approaches.
 | `PROSODY_SUBSCRIBED_TOPICS` | Topics to read from                                | -            | ✓        |          |
 | `PROSODY_ALLOWED_EVENTS`    | Only process events matching these prefixes        | (all)        | ✓        |          |
 | `PROSODY_SOURCE_SYSTEM`     | Tag for outgoing messages (prevents reprocessing)  | `<group id>` |          | ✓        |
+| `PROSODY_SUBSYSTEM`         | Subsystem name used to advertise published collections | -        | ✓        |          |
 | `PROSODY_MOCK`              | Use in-memory Kafka for testing                    | false        | ✓        | ✓        |
 | `PROSODY_LOG`               | Log level (e.g., `info`, `prosody=debug`)          | info         | ✓        | ✓        |
 
@@ -81,6 +82,8 @@ reloads and keyed-state message resolution.
 | `PROSODY_STATE_RECOVERY_DELAY` | Grace period before a background sweep reconciles a freshly written value, in case the fast path did not. Rarely needs changing; second-granularity and must be at least `1s`. | 30s |
 | `PROSODY_STATE_READ_CACHE_SIZE_BYTES` | Byte budget for the read-only client's read-through cache (shared by every reader the client composes). Must be greater than zero. | follows `PROSODY_STATE_CACHE_SIZE_BYTES`, then 1 MiB |
 | `PROSODY_STATE_READ_CACHE_TTL` | Default read-cache TTL for composed readers: how long a `StateReader` may serve a collection's reads from its cache before re-reading the store. A humantime duration (`5s`, `750ms`); `none` disables the inherited default. A descriptor can replace it with `.read_cache(duration)` or bypass it with `.read_cache(ReadCachePolicy::Disabled)`. Reader-only — never affects the owning consumer's writes or a collection's durable TTL. | 5s |
+
+`PROSODY_SUBSYSTEM` is deployment identity rather than a state-engine tuning option. A published collection requires it or the equivalent builder field. Keep it set for the deployment that changes a collection to private so startup reconciliation can withdraw its routing row.
 
 ## Deduplication (All Modes)
 

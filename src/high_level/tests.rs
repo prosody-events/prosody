@@ -12,7 +12,7 @@ use crate::high_level::erased::{
 use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;
 use crate::state::descriptor::value_state;
-use crate::state::registry::CollectionDef;
+use crate::state::registry::{CollectionDef, RegisterStateError};
 use crate::state_reader::ReaderBackend;
 use crate::state_reader::tests::support::{
     mock_count, owner_commit, publish_source, registry_of, source_state_key, state_name, topic,
@@ -219,7 +219,19 @@ fn register_in_configured_state_binds() -> Result<()> {
     let fixture = create_test_client::<()>("register-configured", None)?;
     let registered =
         TEST_RUNTIME.block_on(fixture.client.register(value_state::<JsonCodec>("cart")));
-    assert!(registered.is_ok(), "register must succeed while Configured");
+    assert!(registered.is_ok(), "private registration must succeed");
+
+    let published = TEST_RUNTIME.block_on(
+        fixture
+            .client
+            .register(value_state::<JsonCodec>("published").published(true)),
+    );
+    assert!(matches!(
+        published,
+        Err(HighLevelClientError::StateRegistration(
+            RegisterStateError::PublishedWithoutSubsystem { .. }
+        ))
+    ));
     Ok(())
 }
 

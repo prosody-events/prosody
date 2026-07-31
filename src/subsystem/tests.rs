@@ -8,7 +8,11 @@ use quickcheck::{QuickCheck, TestResult};
 fn prop_subsystem_name_trims_and_rejects_blank() {
     fn prop(name: String) -> TestResult {
         let trimmed = name.trim().to_owned();
-        match SubsystemName::try_new(name) {
+        let parsed = name.parse::<SubsystemName>();
+        if parsed != SubsystemName::try_new(name) {
+            return TestResult::error("constructor and environment parsing must agree");
+        }
+        match parsed {
             Ok(_) if trimmed.is_empty() => TestResult::error("blank name must be rejected"),
             Ok(subsystem) if subsystem.as_str() == trimmed => TestResult::passed(),
             Ok(subsystem) => TestResult::error(format!(

@@ -30,6 +30,9 @@ const STATE_READ_CACHE_SIZE_ENV: &str = "PROSODY_STATE_READ_CACHE_SIZE_BYTES";
 /// Environment variable for the default read-cache TTL of composed readers.
 const STATE_READ_CACHE_TTL_ENV: &str = "PROSODY_STATE_READ_CACHE_TTL";
 
+/// Environment variable for the subsystem name.
+const SUBSYSTEM_ENV: &str = "PROSODY_SUBSYSTEM";
+
 /// Built-in default read-cache TTL, applied when the client composes readers
 /// and no other TTL is set. Five seconds trades a small staleness window for
 /// fewer repeated store reads on hot keys. It stays well within the delay
@@ -70,7 +73,7 @@ const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 /// ```
 ///
 /// There is deliberately **no `Default`**. Several fields read a
-/// `PROSODY_STATE_*` environment override, and a malformed one must fail the
+/// environment override, and a malformed one must fail the
 /// build rather than be replaced by a default. An infallible constructor has
 /// nowhere to report that, so it can only ignore the operator's value —
 /// silently, or with a log nobody reads. The builder is the only way in, and it
@@ -165,7 +168,9 @@ pub struct KeyedStateConfiguration {
     /// still registered `Private` under a configured subsystem. Dropping the
     /// subsystem or the registration in the same deploy as `.published(false)`
     /// strands the row instead of withdrawing it. See [`StateVisibility`].
-    #[builder(default)]
+    ///
+    /// Environment variable: `PROSODY_SUBSYSTEM`. `none` disables it.
+    #[builder(default = "from_option_env(SUBSYSTEM_ENV)?")]
     pub subsystem: Option<SubsystemName>,
 
     #[builder(setter(skip), default)]
@@ -208,6 +213,21 @@ impl KeyedStateConfiguration {
         Registered::new(descriptor)
     }
 
+    pub(crate) fn try_register<D>(
+        &mut self,
+        descriptor: D,
+    ) -> Result<Registered<D>, RegisterStateError>
+    where
+        D: StateDescriptor,
+    {
+        validate_publication(
+            descriptor.name(),
+            descriptor.collection_def(),
+            &self.subsystem,
+        )?;
+        Ok(self.register(descriptor))
+    }
+
     /// Returns whether any collections are registered.
     #[must_use]
     pub(crate) fn has_registrations(&self) -> bool {
@@ -230,11 +250,7 @@ impl KeyedStateConfiguration {
     pub(crate) fn build_registry(&self) -> Result<CollectionDefRegistry, RegisterStateError> {
         let mut registry = CollectionDefRegistry::default();
         for (state_type, name, identity, def) in &self.registrations {
-            if def.visibility == StateVisibility::Published && self.subsystem.is_none() {
-                return Err(RegisterStateError::PublishedWithoutSubsystem {
-                    name: StateName::try_new(name)?,
-                });
-            }
+            validate_publication(name, *def, &self.subsystem)?;
             if let Some(ttl) = def.ttl
                 && ttl.seconds() <= self.recovery_delay.seconds()
             {
@@ -248,6 +264,19 @@ impl KeyedStateConfiguration {
         }
         Ok(registry)
     }
+}
+
+fn validate_publication(
+    name: &str,
+    definition: CollectionDef,
+    subsystem: &Option<SubsystemName>,
+) -> Result<(), RegisterStateError> {
+    if definition.visibility == StateVisibility::Published && subsystem.is_none() {
+        return Err(RegisterStateError::PublishedWithoutSubsystem {
+            name: StateName::try_new(name)?,
+        });
+    }
+    Ok(())
 }
 
 /// Per-client fallback keyed-state cache workspace, used when

@@ -164,7 +164,9 @@ where
     /// Returns [`HighLevelClientError::AlreadySubscribed`] when the consumer
     /// is already running (registrations are frozen), or
     /// [`HighLevelClientError::UnconfiguredConsumer`] when there is no valid
-    /// consumer configuration to register against.
+    /// consumer configuration to register against. A published descriptor
+    /// without a configured subsystem returns
+    /// [`HighLevelClientError::StateRegistration`].
     pub async fn register<D>(
         &self,
         descriptor: D,
@@ -174,7 +176,7 @@ where
     {
         let mut guard = self.consumer.lock().await;
         match &mut *guard {
-            ConsumerState::Configured { config } => Ok(config.register(descriptor)),
+            ConsumerState::Configured { config } => config.register(descriptor).map_err(Into::into),
             ConsumerState::Running { .. } => Err(HighLevelClientError::AlreadySubscribed),
             ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => {
                 Err(HighLevelClientError::UnconfiguredConsumer)

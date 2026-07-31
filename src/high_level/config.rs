@@ -34,6 +34,7 @@ use crate::consumer::{
 };
 use crate::high_level::mode::Mode;
 use crate::state::descriptor::{Registered, StateDescriptor};
+use crate::state::registry::RegisterStateError;
 use crate::telemetry::emitter::TelemetryEmitterConfiguration;
 use thiserror::Error;
 
@@ -244,14 +245,14 @@ impl ModeConfiguration {
     /// Forwarded by `HighLevelClient::register` while the consumer is
     /// `Configured`; the moved configuration is rebuilt into the running
     /// consumer's registry on `subscribe`.
-    pub(crate) fn register<D>(&mut self, descriptor: D) -> Registered<D>
+    pub(crate) fn register<D>(&mut self, descriptor: D) -> Result<Registered<D>, RegisterStateError>
     where
         D: StateDescriptor,
     {
         match self {
             Self::Pipeline { common, .. }
             | Self::LowLatency { common, .. }
-            | Self::BestEffort { common, .. } => common.keyed_state.register(descriptor),
+            | Self::BestEffort { common, .. } => common.keyed_state.try_register(descriptor),
         }
     }
 }

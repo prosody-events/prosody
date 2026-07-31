@@ -176,7 +176,7 @@ By default a collection is private to the consumer group that owns it. Mark a
 collection `.published(true)` and give the owning consumer a `subsystem` name,
 and other services can read that state without owning the partition or running
 the write machinery. A published collection with no subsystem is rejected at
-build.
+registration. The builder field falls back to `PROSODY_SUBSYSTEM` when unset.
 
 ```rust,ignore
 // One descriptor configures both the owning handle and the published reader.

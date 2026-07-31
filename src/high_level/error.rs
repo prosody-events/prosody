@@ -6,6 +6,7 @@ use crate::consumer::ConsumerError;
 use crate::consumer::middleware::scheduler::SchedulerInitError;
 use crate::high_level::config::ModeConfigurationError;
 use crate::producer::{ProducerConfigurationBuilderError, ProducerError};
+use crate::state::registry::RegisterStateError;
 use crate::state_reader::StateReaderError;
 use crate::telemetry::EmitterError;
 use thiserror::Error;
@@ -36,6 +37,10 @@ pub enum HighLevelClientError<E> {
     /// Error when the consumer configuration failed during build.
     #[error("consumer configuration failed: {0:#}")]
     ConsumerConfiguration(ModeConfigurationError),
+
+    /// Error when a state descriptor cannot be registered.
+    #[error("state registration failed: {0:#}")]
+    StateRegistration(#[from] RegisterStateError),
 
     /// Error when attempting to subscribe an already subscribed consumer.
     #[error("consumer is already subscribed")]
