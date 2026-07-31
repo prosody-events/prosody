@@ -230,12 +230,15 @@ pub enum ManagerError { /* ... */ }
 
 ## Error Classification
 
-Classify errors through the `ClassifyError` trait and its `ErrorCategory`
-(`src/error/mod.rs`): `Transient` (retry with backoff), `Permanent`
-(message-level; do not retry), `Terminal` (client unusable; shut down).
-Implement the trait — never a parallel classification. The settle boundary's
-posture (retry transient and terminal store failures, skip permanent
-data-rejections, never emit Terminal) is documented in Architecture.
+Classify errors through the `ClassifyError` trait and its `ErrorCategory` in
+`src/error/mod.rs`:
+
+- `Transient` — retry with backoff.
+- `Permanent` — a message-level rejection; do not retry.
+- `Terminal` — the client is unusable and must shut down.
+
+Implement the trait; never invent a parallel classification. The settle
+boundary's posture toward each category is documented in Architecture.
 
 ## Testing
 
@@ -305,22 +308,22 @@ hang-guard, never the assertion. Patterns in TESTING.md.
 **Traits:** Keep generic with associated types; use type erasure only for FFI (JS/Python/Ruby/C#)
 
 **Monomorphize dispatch — never close it over an enum.** When a component
-varies by backend or capability, bind it through a generic parameter or an
-associated type, so each instantiation compiles against its concrete stores.
-The anti-pattern is the closed dispatch enum: one variant per backend, and a
-`match` over the variants inside every operation. Every new operation pays
-the full variant tour, and the arms duplicate what monomorphization would
-write for free — unwinding one such enum family into generics deleted ~500
-lines. Select the backend once, at the construction boundary; from there the
-choice travels as a type. The erased FFI layer is the one sanctioned home for
-runtime dispatch (see the Traits line above).
+varies by backend, bind it through a generic parameter or an associated
+type. Each instantiation then compiles against its concrete stores. The
+anti-pattern is the closed dispatch enum: one variant per backend, a `match`
+in every operation. Every new operation must repeat the match, and the arms
+duplicate what monomorphization writes for free. One rewrite of such an enum
+family into generics deleted ~500 lines. Select the backend once, at the
+construction boundary. From there the choice travels as a type. The erased
+FFI layer is the only sanctioned home for runtime dispatch (see the Traits
+line above).
 
-**Compress type parameters behind one bundle trait.** When cooperating
-generics (an `<O, I, C>` family) would thread through every signature,
-package them as one trait with associated types, so structs and functions
-name a single `B`. `StateBackend` (`src/state/backend.rs`) is the exemplar
-and documents the ruling at the trait. Reach for this whenever a signature's
-generic list starts to enumerate a family.
+**Compress type parameters behind one bundle trait.** When several
+cooperating generics thread through every signature, package them as one
+trait with associated types. Structs and functions then name a single `B`
+instead of an `<O, I, C>` family. `StateBackend` (`src/state/backend.rs`) is
+the exemplar and documents the ruling. Apply this wherever a signature
+accumulates generic parameters.
 
 **Every public API must stay FFI-exposable.** Prosody's public surface is
 **cross-language**: the sibling clients `prosody-{js,py,rb,cs}` wrap a
@@ -467,9 +470,9 @@ These invariants are why LWTs, distributed locks, and optimistic concurrency are
 except the first in the partition. Read it as `Option<T>` and filter in code.
 
 **TTL overflow protection:** Cassandra's maximum TTL is 630,720,000 seconds
-(20 years, past the 2038 boundary). Every computed TTL is checked against
-that maximum before binding. Reuse `calculate_ttl` (`src/cassandra/mod.rs`)
-— do not hand-roll TTL arithmetic.
+(20 years). Check every computed TTL against that maximum before binding.
+Reuse `calculate_ttl` (`src/cassandra/mod.rs`); do not hand-roll TTL
+arithmetic.
 
 **Secrets:** Use `#[educe(Debug(ignore))]` for password fields
 
