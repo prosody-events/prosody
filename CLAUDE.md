@@ -147,7 +147,7 @@ designs are where bloat and bug re-introduction live:
 
 **JSON codec isolation:**
 
-- `serde_json`, `simd_json`, and the `json!` macro are **banned** in all production code outside `src/codec.rs`
+- `serde_json`, `simd_json`, and the `json!` macro are **banned** in all production code outside `src/codec/`
 - Tests may use `serde_json::Value` as a concrete payload type — that is fine
 - Any `use serde_json` or `use simd_json` import in non-test, non-codec production code is a bug
 
@@ -230,19 +230,12 @@ pub enum ManagerError { /* ... */ }
 
 ## Error Classification
 
-Distinguish permanent from transient errors for retry logic:
-
-```rust
-#[derive(Debug, Clone, Copy)]
-pub enum ErrorType {
-    Permanent,  // Business logic - don't retry
-    Transient,  // Network/timeout - retry with backoff
-}
-
-trait ClassifyError {
-    fn classify_error(&self) -> ErrorType;
-}
-```
+Classify errors through the `ClassifyError` trait and its `ErrorCategory`
+(`src/error/mod.rs`): `Transient` (retry with backoff), `Permanent`
+(message-level; do not retry), `Terminal` (client unusable; shut down).
+Implement the trait — never a parallel classification. The settle boundary's
+posture (retry transient and terminal store failures, skip permanent
+data-rejections, never emit Terminal) is documented in Architecture.
 
 ## Testing
 
@@ -309,7 +302,7 @@ hang-guard, never the assertion. Patterns in TESTING.md.
 
 ## API Design
 
-**Traits:** Keep generic with associated types; use type erasure only for FFI (JS/Python/Ruby)
+**Traits:** Keep generic with associated types; use type erasure only for FFI (JS/Python/Ruby/C#)
 
 **Every public API must stay FFI-exposable.** Prosody's public surface is
 **cross-language**: the sibling clients `prosody-{js,py,rb,cs}` wrap a
@@ -452,39 +445,13 @@ These invariants are why LWTs, distributed locks, and optimistic concurrency are
 
 **Bind persisted types directly via their scylla serdes.** Pass persisted types to the driver through their `SerializeValue`/`DeserializeValue` impls; never hand-convert to a driver primitive (`i8`/`i16`/etc.) at the call site. When you persist a type, give it idiomatic `From<Self> for iN` / `TryFrom<iN> for Self` discriminator conversions (a dedicated error for the fallible direction) and let the scylla serde delegate through them — e.g. `i8::from(*self).serialize(...)`; see `TimerType`, `SegmentVersion`, `StateType`, `CollectionKindId`, `Encoding`, `CellKind`. Do not add bespoke `as_iN`/`from_iN` inherent methods; the trait impls are the single conversion surface. Reads may keep deserializing the raw primitive and validating it through `TryFrom` in a fallible post-step **only** when a bad value must classify `Permanent` (or be skipped for forward-compat) rather than become scylla's `Terminal` `DeserializationError` — as the `EventRef` UDT and the discriminators above do. In that case the serde is serialize-only by design (a `SerializeValue` impl with no `DeserializeValue`, since the latter cannot express "skip this row"); document the read-side validator it pairs with.
 
-**Handling NULLs from static columns:**
+**Static columns:** a static column returns NULL for every clustering row
+except the first in the partition. Read it as `Option<T>` and filter in code.
 
-```rust
-// Static columns return NULL for non-first clustering rows
-let stream = session
-.execute_iter("SELECT slab_id FROM segments WHERE id = ?", (segment_id,))
-.await?
-.rows_stream::<(Option<i32>, ) > () ?;
-
-while let Some((slab_id_opt,)) = stream.try_next().await? {
-if let Some(slab_id) = slab_id_opt {
-yield slab_id;
-}
-}
-```
-
-**TTL overflow protection (Cassandra max: 630,720,000 seconds):**
-
-```rust
-fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
-    const MAX_TTL: i32 = 630_720_000;
-    Some(
-        time.compact_duration_from_now()
-            .unwrap_or(CompactDuration::MIN)
-            .checked_add(self.base_ttl())
-            .unwrap_or(CompactDuration::MAX)
-            .seconds()
-            .try_into()
-            .unwrap_or(MAX_TTL),
-    )
-        .filter(|&ttl| ttl < MAX_TTL)
-}
-```
+**TTL overflow protection:** Cassandra's maximum TTL is 630,720,000 seconds
+(20 years, past the 2038 boundary). Every computed TTL is checked against
+that maximum before binding. Reuse `calculate_ttl` (`src/cassandra/mod.rs`)
+— do not hand-roll TTL arithmetic.
 
 **Secrets:** Use `#[educe(Debug(ignore))]` for password fields
 
@@ -533,7 +500,6 @@ fn calculate_ttl(&self, time: CompactDateTime) -> Option<i32> {
 - Use `LazyLock` for expensive static initialization
 - Implement `Arbitrary` for QuickCheck property tests
 - Efficient strings: `Flexstr` (stack), `Intern` (interning)
-- Dependencies: `ahash`, `parking_lot`, `simd-json` (non-ARM)
 
 ## Tracing / OpenTelemetry
 
@@ -626,13 +592,3 @@ When launching multi-agent workflows:
 ## Research
 
 - Automatically use context7 for code generation and library documentation.
-
-## Active Technologies
-- Rust Edition 2024 (stable) + scylla 1.5 (Cassandra driver), tokio 1.50, parking_lot 0.12, quick_cache 0.6, scc 3.6, tracing 0.1, tracing-opentelemetry 0.32, opentelemetry 0.31, thiserror 2.0, async-stream 0.3, smallvec 1.15, strum 0.28 (001-reduce-timer-tombstones)
-- Apache Cassandra via scylla-rust-driver — `timer_typed_keys` and `timer_typed_slabs` tables (001-reduce-timer-tombstones)
-- Rust Edition 2024 (stable) + rdkafka 0.39, tokio 1.50, futures 0.3, serde 1.0, simd-json 0.17 (non-ARM), serde_json 1.0 (ARM fallback), opentelemetry 0.31, tracing 0.1, tracing-opentelemetry 0.32, whoami 2.1 (002-kafka-telemetry)
-
-## Recent Changes
-
-- 001-simplified-prop-tests: Added Rust Edition 2024 (stable) + quickcheck 1.0, quickcheck_macros 1.1, color-eyre 0.6 (
-  dev-dependencies), existing defer middleware
