@@ -1,6 +1,7 @@
 //! User-facing configuration for the always-on keyed-state layer.
 
 use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError, StateVisibility};
+use crate::ByteSize;
 use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity};
 use crate::state::{StateName, StateType};
 use crate::subsystem::SubsystemName;
@@ -20,12 +21,12 @@ use validator::{Validate, ValidationError};
 /// Environment variable for the local keyed-state cache directory.
 const STATE_CACHE_DIR_ENV: &str = "PROSODY_STATE_CACHE_DIR";
 
-/// Environment variable for the in-memory keyed-state cache capacity, in bytes.
-const STATE_CACHE_SIZE_ENV: &str = "PROSODY_STATE_CACHE_SIZE_BYTES";
+/// Environment variable for the owning keyed-state cache capacity.
+const STATE_OWNED_CACHE_SIZE_ENV: &str = "PROSODY_STATE_OWNED_CACHE_SIZE";
 
 /// Environment variable for the reader-side read-through cache capacity, in
 /// bytes.
-const STATE_READ_CACHE_SIZE_ENV: &str = "PROSODY_STATE_READ_CACHE_SIZE_BYTES";
+const STATE_READ_CACHE_SIZE_ENV: &str = "PROSODY_STATE_READ_CACHE_SIZE";
 
 /// Environment variable for the default read-cache TTL of composed readers.
 const STATE_READ_CACHE_TTL_ENV: &str = "PROSODY_STATE_READ_CACHE_TTL";
@@ -41,9 +42,9 @@ const SUBSYSTEM_ENV: &str = "PROSODY_SUBSYSTEM";
 /// refresh every 60 seconds.
 const DEFAULT_READ_CACHE_TTL: Duration = Duration::from_secs(5);
 
-const DEFAULT_READER_CACHE_SIZE_BYTES: NonZeroU64 = match NonZeroU64::new(1_048_576) {
-    Some(budget) => budget,
-    None => NonZeroU64::MIN,
+const DEFAULT_READER_CACHE_SIZE: ByteSize = match NonZeroU64::new(1_048_576) {
+    Some(budget) => ByteSize::new(budget),
+    None => ByteSize::new(NonZeroU64::MIN),
 };
 
 /// Environment variable for the `StateRecovery` backstop delay.
@@ -116,25 +117,25 @@ pub struct KeyedStateConfiguration {
     /// opens at `cache_dir`; it is shared by every partition, never multiplied
     /// per partition.
     ///
-    /// Environment variable: `PROSODY_STATE_CACHE_SIZE_BYTES` (a positive
-    /// integer count of bytes; `0`, negative, non-numeric, and
-    /// out-of-`u64`-range values are rejected at build).
-    #[builder(default = "from_option_env(STATE_CACHE_SIZE_ENV)?")]
-    pub cache_size_bytes: Option<NonZeroU64>,
+    /// Environment variable: `PROSODY_STATE_OWNED_CACHE_SIZE`. Accepts a
+    /// positive human-readable byte size such as `64 MiB` or `500 MB`. A bare
+    /// number is interpreted as bytes.
+    #[builder(default = "from_option_env(STATE_OWNED_CACHE_SIZE_ENV)?")]
+    pub owned_cache_size: Option<ByteSize>,
 
     /// Byte budget for the reader-side read-through cache. The high-level
     /// client sizes this cache when it composes standalone readers.
     ///
     /// `None` (the default) follows
-    /// [`cache_size_bytes`](Self::cache_size_bytes), then a built-in default,
+    /// [`owned_cache_size`](Self::owned_cache_size), then a built-in default,
     /// so one setting covers both caches unless overridden. Only the composing
     /// client reads this value. A consumer never opens a reader cache.
     ///
-    /// Environment variable: `PROSODY_STATE_READ_CACHE_SIZE_BYTES` (a positive
-    /// integer count of bytes; `0`, negative, non-numeric, and
-    /// out-of-`u64`-range values are rejected at build).
+    /// Environment variable: `PROSODY_STATE_READ_CACHE_SIZE`. Accepts a
+    /// positive human-readable byte size such as `1 MiB`. A bare number is
+    /// interpreted as bytes.
     #[builder(default = "from_option_env(STATE_READ_CACHE_SIZE_ENV)?")]
-    pub read_cache_size_bytes: Option<NonZeroU64>,
+    pub read_cache_size: Option<ByteSize>,
 
     /// Default read-cache TTL for the readers this client composes. It sets how
     /// long a `StateReader` may serve a collection's reads from cache before
@@ -185,9 +186,10 @@ impl KeyedStateConfiguration {
     }
 
     pub(crate) fn reader_cache_size(&self) -> NonZeroU64 {
-        self.read_cache_size_bytes
-            .or(self.cache_size_bytes)
-            .unwrap_or(DEFAULT_READER_CACHE_SIZE_BYTES)
+        self.read_cache_size
+            .or(self.owned_cache_size)
+            .unwrap_or(DEFAULT_READER_CACHE_SIZE)
+            .nonzero()
     }
 
     /// Registers `descriptor`'s collection, returning the [`Registered`]

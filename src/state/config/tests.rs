@@ -1,4 +1,5 @@
 use super::KeyedStateConfiguration;
+use crate::ByteSize;
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::codec::JsonCodec;
 use crate::state::descriptor::{StateDescriptor, ValueDescriptor, map_state, value_state};
@@ -8,7 +9,6 @@ use crate::subsystem::SubsystemName;
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
-use std::num::NonZeroU64;
 use std::path::PathBuf;
 use validator::Validate;
 
@@ -16,39 +16,18 @@ fn cart() -> ValueDescriptor {
     value_state("cart")
 }
 
-/// Pins the element type of `cache_size_bytes` and its structural twin
-/// `read_cache_size_bytes` to `NonZeroU64`. That type is what makes each
-/// field's documented "rejected at build" contract hold. If either field's
-/// type ever weakened to `Option<u64>`, it would silently accept `0`, and one
-/// of these closures would fail to compile.
-///
-/// The build path parses a present value with
-/// `<Option<NonZeroU64>>::Item::from_str`, reached through `from_option_env`
-/// reading `STATE_CACHE_SIZE_ENV` or `STATE_READ_CACHE_SIZE_ENV`. The
-/// assertions below prove `NonZeroU64` accepts a positive byte count and
-/// rejects zero, negative, non-numeric, empty, and out-of-`u64` values. The
-/// `"0"` rejection is the one case that distinguishes `NonZeroU64` from a
-/// plain `u64`.
-///
-/// One test covers both fields since they share the same element type. The
-/// env-read wiring itself (`from_option_env`, [`super::STATE_CACHE_SIZE_ENV`])
-/// is trusted std, so this needs none of the `unsafe` env mutation a full
-/// build-path test would.
-const _: fn(&KeyedStateConfiguration) -> &Option<NonZeroU64> = |c| &c.cache_size_bytes;
-const _: fn(&KeyedStateConfiguration) -> &Option<NonZeroU64> = |c| &c.read_cache_size_bytes;
+const _: fn(&KeyedStateConfiguration) -> &Option<ByteSize> = |c| &c.owned_cache_size;
+const _: fn(&KeyedStateConfiguration) -> &Option<ByteSize> = |c| &c.read_cache_size;
 
 #[test]
-fn cache_size_element_type_parse_contract() -> Result<()> {
-    // A valid positive byte count parses into the field's element type.
-    let parsed: NonZeroU64 = "8388608"
+fn cache_sizes_parse_human_units_and_reject_degenerate_values() -> Result<()> {
+    let parsed: ByteSize = "8 MiB"
         .parse()
         .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     assert_eq!(parsed.get(), 8_388_608, "a valid byte count parses");
-    // Degenerate values are rejected — `0` because the field is `NonZeroU64`,
-    // the rest because they are not a `u64`.
     for bad in ["0", "-5", "abc", "", "99999999999999999999999999"] {
         assert!(
-            bad.parse::<NonZeroU64>().is_err(),
+            bad.parse::<ByteSize>().is_err(),
             "cache size {bad:?} must be rejected",
         );
     }

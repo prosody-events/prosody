@@ -24,7 +24,7 @@ use crate::state::publication::PublicationStore;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state_reader::PartitionCount;
 use crate::timers::duration::CompactDuration;
-use crate::{Codec, ConsumerGroup, EventIdentity, EventType};
+use crate::{ByteSize, Codec, ConsumerGroup, EventIdentity, EventType};
 use std::fs;
 use std::sync::Arc;
 
@@ -217,7 +217,7 @@ where
     fs::create_dir_all(&keyed_state.config.cache_dir)?;
     let fjall_client = FjallClient::open(
         &keyed_state.config.cache_dir,
-        keyed_state.config.cache_size_bytes,
+        keyed_state.config.owned_cache_size.map(ByteSize::nonzero),
     )
     .map_err(|error| KeyedStateInitError::Cache {
         message: format!("{error:#}"),

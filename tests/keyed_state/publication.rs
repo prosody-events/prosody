@@ -14,7 +14,7 @@ use prosody::state::publication::PublicationStore;
 use prosody::state::{StateName, StateType};
 use prosody::state_reader::{CassandraReaderBackend, StateReaderClient, StateReaderDependencies};
 use prosody::subsystem::SubsystemName;
-use prosody::{JsonCodec, Topic};
+use prosody::{ByteSize, JsonCodec, Topic};
 use serde_json::json;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -85,7 +85,10 @@ pub(crate) async fn read_cart_via_standalone_reader(
     // the Kafka loader. The plain `Value` read below never consults the loader;
     // the receipt read does.
     let keyed_state = KeyedStateConfiguration::builder()
-        .read_cache_size_bytes(NonZeroU64::new(READER_CACHE_BYTES))
+        .read_cache_size(Some(ByteSize::new(
+            NonZeroU64::new(READER_CACHE_BYTES)
+                .ok_or_else(|| eyre!("reader cache budget must be positive"))?,
+        )))
         .build()?;
     let deps = StateReaderDependencies::<JsonCodec, CassandraReaderBackend<JsonCodec>>::cassandra(
         consumer_config,

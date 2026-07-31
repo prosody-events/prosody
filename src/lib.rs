@@ -51,6 +51,7 @@ pub mod prelude;
 pub mod producer;
 pub mod propagator;
 mod segment;
+mod size;
 pub mod state;
 pub mod state_reader;
 pub mod subsystem;
@@ -136,6 +137,7 @@ pub type Topic = Intern<str>;
 pub type Partition = i32;
 
 pub use segment::SegmentId;
+pub use size::{ByteSize, ByteSizeError};
 
 /// A compact string optimized for UUID-length keys.
 ///
