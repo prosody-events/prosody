@@ -10,6 +10,7 @@ use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
 use std::path::PathBuf;
+use validator::Validate;
 
 fn cart() -> ValueDescriptor {
     value_state("cart")
