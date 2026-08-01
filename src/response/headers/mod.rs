@@ -10,8 +10,10 @@
 //! [`SubsystemName`].
 //!
 //! A record whose reserved headers are unusable yields no tag and one counted
-//! rejection. It is never a failed event: asking for a response badly is not a
-//! reason to stop processing the message. The count is per decode, not per
+//! rejection, on a consumer configured to answer for a subsystem. A consumer
+//! that answers for none never reads the headers, so it counts nothing. It is
+//! never a failed event: asking for a response badly is not a reason to stop
+//! processing the message. The count is per decode, not per
 //! record — a poll, a deferred reload and a state read each decode the same
 //! record — so read the counter as a rate, never as a population.
 

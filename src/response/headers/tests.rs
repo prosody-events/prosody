@@ -84,6 +84,10 @@ enum Mutation {
     RevisionValueAbsent,
     /// The 32-character unhyphenated UUID form.
     IdSimpleForm,
+    /// The braced UUID form, `{...}`.
+    IdBracedForm,
+    /// The URN UUID form, `urn:uuid:...`.
+    IdUrnForm,
     IdTruncated,
     IdNonUtf8,
     IdValueAbsent,
@@ -167,7 +171,12 @@ impl Case {
 
     /// The record's headers, well-formed and then deviated by the mutation.
     fn headers(self) -> Vec<(String, Option<Vec<u8>>)> {
+        // A producer's own header rides every record, so it belongs in the base
+        // rather than in one case. Every mutation then mixes producer headers
+        // with reserved ones, which is the shape a real record has, and the
+        // parser's skip arm is exercised by the whole suite.
         let mut headers = vec![
+            header(crate::SOURCE_SYSTEM_HEADER, b"upstream"),
             header(RESPONSE_VERSION_HEADER, b"1"),
             header(RESPONSE_REQUEST_ID_HEADER, REQUEST_ID_TEXT.as_bytes()),
             header(RESPONSE_NODE_HEADER, NODE_ID_TEXT.as_bytes()),
@@ -184,8 +193,7 @@ impl Case {
                 headers.push(header(RESPONSE_AWAITED_HEADER, COMMA_NAME.as_bytes()));
             }
             Mutation::NoReservedHeaders => {
-                headers.clear();
-                headers.push(header("source-system", b"upstream"));
+                headers.retain(|(key, _)| key == crate::SOURCE_SYSTEM_HEADER);
             }
             Mutation::DuplicateVersion => headers.push(header(RESPONSE_VERSION_HEADER, b"1")),
             Mutation::DuplicateRequestId => headers.push(header(
@@ -215,10 +223,10 @@ impl Case {
             Mutation::RevisionValueAbsent => {
                 set_value(&mut headers, RESPONSE_VERSION_HEADER, None);
             }
-            Mutation::IdSimpleForm => set_value(
+            Mutation::IdSimpleForm | Mutation::IdBracedForm | Mutation::IdUrnForm => set_value(
                 &mut headers,
                 RESPONSE_REQUEST_ID_HEADER,
-                Some(REQUEST_ID_TEXT.replace('-', "").into_bytes()),
+                Some(other_id_form(self.mutation).into_bytes()),
             ),
             Mutation::IdTruncated => set_value(
                 &mut headers,
@@ -270,6 +278,18 @@ impl Case {
     }
 }
 
+/// The request id in a text form the protocol does not accept.
+///
+/// Each one parses to the same 16 bytes, so only the length gate refuses it.
+/// That gate is what makes one id have one text form.
+fn other_id_form(mutation: Mutation) -> String {
+    match mutation {
+        Mutation::IdBracedForm => format!("{{{REQUEST_ID_TEXT}}}"),
+        Mutation::IdUrnForm => format!("urn:uuid:{REQUEST_ID_TEXT}"),
+        _ => REQUEST_ID_TEXT.replace('-', ""),
+    }
+}
+
 /// What the parser must answer, read off the mutation alone — never re-derived
 /// from the headers the way the parser derives it.
 fn expected(mutation: Mutation) -> Result<Option<RequestTag>, HeaderRejection> {
@@ -295,6 +315,8 @@ fn expected(mutation: Mutation) -> Result<Option<RequestTag>, HeaderRejection> {
         | Mutation::RevisionSigned
         | Mutation::RevisionValueAbsent => Err(HeaderRejection::UnsupportedVersion),
         Mutation::IdSimpleForm
+        | Mutation::IdBracedForm
+        | Mutation::IdUrnForm
         | Mutation::IdTruncated
         | Mutation::IdNonUtf8
         | Mutation::IdValueAbsent => Err(HeaderRejection::MalformedId),
