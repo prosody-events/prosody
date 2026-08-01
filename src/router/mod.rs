@@ -9,10 +9,13 @@ use uuid::Uuid;
 
 /// The host a node publishes for its peers to dial. Any ordinary hostname or
 /// address stays inline; a longer one spills to the heap.
-#[allow(
-    dead_code,
-    reason = "the node directory is this alias's production caller; the selection it feeds is \
-              exercised by this module's tests"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the node directory is this alias's production caller; the selection it feeds is \
+                  exercised by this module's tests"
+    )
 )]
 pub(crate) type Host = Flexstr<64>;
 
@@ -74,10 +77,13 @@ impl Display for NodeId {
 ///
 /// Returns the hostname lookup's error, and only when neither earlier source
 /// supplied a host.
-#[allow(
-    dead_code,
-    reason = "the node directory is this function's production caller; it is exercised by this \
-              module's tests"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the node directory is this function's production caller; it is exercised by \
+                  this module's tests"
+    )
 )]
 pub(crate) fn select_host<R, H, E>(
     configured: Option<Host>,

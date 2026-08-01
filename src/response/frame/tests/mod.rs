@@ -1,4 +1,3 @@
-use super::encode::{write_bytes_field, write_varint_field};
 use super::{
     FIELD_CATEGORY, FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE,
     FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameCapError, FrameHeader,
@@ -8,6 +7,7 @@ use crate::error::ErrorCategory;
 use crate::response::{RequestId, Subsystem};
 use crate::router::NodeId;
 use bytes::BytesMut;
+use prost::encoding::{WireType, encode_key, encode_varint};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -96,35 +96,49 @@ impl Default for RawFrame {
     }
 }
 
+/// Writes one protobuf field, without borrowing the encoder's writers, so a
+/// fixture frame is a second opinion on the wire form rather than a mirror of
+/// the code under test.
+fn raw_varint_field(tag: u32, value: u64, dst: &mut BytesMut) {
+    encode_key(tag, WireType::Varint, dst);
+    encode_varint(value, dst);
+}
+
+fn raw_bytes_field(tag: u32, value: &[u8], dst: &mut BytesMut) {
+    encode_key(tag, WireType::LengthDelimited, dst);
+    encode_varint(value.len() as u64, dst);
+    dst.extend_from_slice(value);
+}
+
 impl RawFrame {
     fn encode(&self) -> BytesMut {
         let mut dst = BytesMut::new();
         if let Some(version) = self.version {
-            write_varint_field(FIELD_PROTOCOL_VERSION, version, &mut dst);
+            raw_varint_field(FIELD_PROTOCOL_VERSION, version, &mut dst);
         }
         if let Some(target) = self.target {
-            write_bytes_field(FIELD_TARGET_NODE, target, &mut dst);
+            raw_bytes_field(FIELD_TARGET_NODE, target, &mut dst);
         }
         if let Some(request) = self.request {
-            write_bytes_field(FIELD_REQUEST_ID, request, &mut dst);
+            raw_bytes_field(FIELD_REQUEST_ID, request, &mut dst);
         }
         if let Some(subsystem) = self.subsystem {
-            write_bytes_field(FIELD_SUBSYSTEM, subsystem, &mut dst);
+            raw_bytes_field(FIELD_SUBSYSTEM, subsystem, &mut dst);
         }
         if let Some(format) = self.format {
-            write_bytes_field(FIELD_FORMAT, format, &mut dst);
+            raw_bytes_field(FIELD_FORMAT, format, &mut dst);
         }
         if let Some(category) = self.category {
-            write_varint_field(FIELD_CATEGORY, category, &mut dst);
+            raw_varint_field(FIELD_CATEGORY, category, &mut dst);
         }
         if let Some(payload) = self.payload {
-            write_bytes_field(FIELD_PAYLOAD, payload, &mut dst);
+            raw_bytes_field(FIELD_PAYLOAD, payload, &mut dst);
         }
         if let Some(relay) = self.relay {
-            write_bytes_field(FIELD_RELAY_NODE, relay, &mut dst);
+            raw_bytes_field(FIELD_RELAY_NODE, relay, &mut dst);
         }
         if let Some(unknown) = self.unknown {
-            write_varint_field(UNKNOWN_TAG, unknown, &mut dst);
+            raw_varint_field(UNKNOWN_TAG, unknown, &mut dst);
         }
         dst
     }

@@ -13,6 +13,11 @@ const ERR_TAG: u8 = 1;
 /// Composes an output codec and an error codec into one [`Codec`] over
 /// `Result<Output, Error>`.
 ///
+/// The two arms are named as *types*, never handed over as values: [`Codec`]
+/// requires [`Default`] and the framework builds every codec through it, so
+/// `ResultCodec::<O, E>::default()` composes any pair and an inherent `new`
+/// would have no caller to serve.
+///
 /// A response carries a whole result, so *something* has to say how the two
 /// arms are told apart. This is the one place the framework picks that
 /// representation: a one-byte discriminant — `0x00` for `Ok`, `0x01` for `Err`

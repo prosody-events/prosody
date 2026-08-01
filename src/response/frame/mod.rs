@@ -5,10 +5,17 @@
 //! the version of the message peers of different releases must agree on. A test
 //! decodes the generated descriptor set so the two cannot drift apart.
 
-#![allow(
-    dead_code,
-    reason = "the peer transport is this module's production caller; the conversions are \
-              exercised by this module's tests"
+// The `not(test)` gate is what makes this an *expectation* rather than a
+// blanket permission: it holds only while these items really are
+// production-dead, so the day the transport calls the last one, the gate
+// reports it unfulfilled and demands the attribute be deleted.
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the peer transport is this module's production caller; the conversions are \
+                  exercised by this module's tests"
+    )
 )]
 
 use super::{FormatToken, RequestId, Subsystem};

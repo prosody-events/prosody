@@ -71,10 +71,13 @@ impl Display for RequestId {
 /// [`Accepted`](Self::Accepted) names `OK`. There is deliberately no status
 /// field in the response body: with no body at all, success is carried in the
 /// HTTP/2 trailer and cannot be produced by an omitted field.
-#[allow(
-    dead_code,
-    reason = "the peer service is this enum's production caller; the mapping is exercised by this \
-              module's tests"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the peer service is this enum's production caller; the mapping is exercised by \
+                  this module's tests"
+    )
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(strum::VariantArray))]
@@ -103,10 +106,13 @@ pub(crate) enum ResponseDisposition {
     Unreachable,
 }
 
-#[allow(
-    dead_code,
-    reason = "the peer service is this mapping's production caller; it is exercised by this \
-              module's tests"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the peer service is this mapping's production caller; it is exercised by this \
+                  module's tests"
+    )
 )]
 impl ResponseDisposition {
     /// The gRPC status this disposition is reported as.

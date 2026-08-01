@@ -178,12 +178,16 @@ fn category_varint(category: ErrorCategory) -> u64 {
     i64::from(i32::from(category)) as u64
 }
 
-pub(super) fn write_varint_field<B: BufMut>(tag: u32, value: u64, dst: &mut B) {
+// These two are all it takes to emit a complete frame, so they stay private:
+// exporting them would put "framed without staging" back within reach of this
+// module, where `FrameEncoder` claims it is unrepresentable. A test that needs
+// a hand-built frame writes its own fields.
+fn write_varint_field<B: BufMut>(tag: u32, value: u64, dst: &mut B) {
     encode_key(tag, WireType::Varint, dst);
     encode_varint(value, dst);
 }
 
-pub(super) fn write_bytes_field<B: BufMut>(tag: u32, value: &[u8], dst: &mut B) {
+fn write_bytes_field<B: BufMut>(tag: u32, value: &[u8], dst: &mut B) {
     encode_key(tag, WireType::LengthDelimited, dst);
     encode_varint(value.len() as u64, dst);
     dst.put_slice(value);
