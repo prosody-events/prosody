@@ -12,7 +12,6 @@ use crate::state::descriptor::StructuralIdentity;
 use crate::state::{StateName, StateNameError, StateType};
 use crate::timers::duration::CompactDuration;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use thiserror::Error;
 
 mod definition;
@@ -20,7 +19,6 @@ mod definition;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use definition::DEFAULT_KEYSET_LIMIT;
 pub use definition::{CollectionDef, CommitMode, ReadCachePolicy, StateVisibility};
 
 /// Registration ceiling on the Map keyset bound: a larger limit is rejected at
@@ -191,25 +189,14 @@ impl CollectionDefRegistry {
             .and_then(|c| c.def.ttl)
     }
 
-    /// Returns the Map keyset bound for `(state_type, name)`, falling back to
-    /// [`DEFAULT_KEYSET_LIMIT`] for names not in the registry.
+    /// Returns the operational settings registered for `(state_type, name)` —
+    /// the whole definition a collection binding captures once. An unregistered
+    /// name yields the same defaults each setting carries on its own
+    /// ([`CollectionDef::new`] with no TTL).
     #[must_use]
-    pub(crate) fn keyset_limit_for(&self, state_type: StateType, name: &StateName) -> usize {
+    pub(crate) fn def_for(&self, state_type: StateType, name: &StateName) -> CollectionDef {
         self.lookup_collection(state_type, name)
-            .map_or(DEFAULT_KEYSET_LIMIT, |c| c.def.keyset_limit)
-    }
-
-    /// Returns the Deque push capacity for `(state_type, name)` — the
-    /// window-slot cap a bounded deque trims toward on push — or `None`
-    /// (unbounded) for names not in the registry.
-    #[must_use]
-    pub(crate) fn capacity_for(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-    ) -> Option<NonZeroUsize> {
-        self.lookup_collection(state_type, name)
-            .and_then(|c| c.def.capacity)
+            .map_or_else(|| CollectionDef::new(None), |c| c.def)
     }
 
     /// Returns the commit mode bound to `(state_type, name)`, falling back to

@@ -98,7 +98,6 @@ use sealed::{MarkerIdentity, ReadAdmission, StagedCollection, StagedState, State
 use std::fmt;
 use std::future::Future;
 use std::iter::from_fn;
-use std::num::NonZeroUsize;
 use std::ops::DerefMut;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -117,7 +116,7 @@ mod tests;
 /// [`ReadSession`](crate::state_reader::ReadSession) share one implementation.
 ///
 /// This capability pair (`CellRead` plus its sealed `ReadAdmission`) collapses
-/// into [`StateSession`] once Map and Deque run through the collection engine:
+/// into [`StateSession`] once Deque runs through the collection engine:
 /// the raw cell surface it exists to carry has no other caller.
 ///
 /// `get`/`get_many`/`scan` describe the session's **visible committed bytes**
@@ -131,24 +130,13 @@ pub trait CellRead: ReadAdmission + StateSession {
     /// cancelled. Descriptor handles guard every operation on this.
     fn is_terminated(&self) -> bool;
 
-    /// Whether the collection named `(state_type, name)` carries a TTL — the
-    /// query the Map meta refresh consults to keep its keyset `Meta` cell
-    /// renewed on every `set`, so it provably outlives every entry.
-    /// No default impl: a silent `false` would disable the refresh for a
-    /// real session.
-    fn collection_has_ttl(&self, state_type: StateType, name: &StateName) -> bool;
-
-    /// The Map keyset bound for `(state_type, name)` — the number of live
-    /// distinct keys a map tracks before overflowing to the full-section scan.
-    /// Read per `set`/`stream` on a Map handle. No default impl: a wrong
-    /// silent default would mis-size the keyset for a real session.
-    fn collection_keyset_limit(&self, state_type: StateType, name: &StateName) -> usize;
-
-    /// The Deque push capacity for `(state_type, name)` — the window-slot cap a
-    /// bounded deque trims toward on push; `None` is unbounded. Read per push
-    /// on a Deque handle. No default impl: a silent `None` default would
-    /// disable trim for a real session, leaving its window unbounded.
-    fn collection_capacity(&self, state_type: StateType, name: &StateName) -> Option<NonZeroUsize>;
+    /// The operational settings for `(state_type, name)` **as this session's
+    /// engine sees them** — the registry definition for a per-event session,
+    /// the descriptor's own for a published reader. A collection binding
+    /// captures it once, so every configuration query inside a scoped operation
+    /// answers from one snapshot. No default impl: silently defaulted settings
+    /// would mis-size a real session's keyset or disable its TTL refresh.
+    fn collection_def(&self, state_type: StateType, name: &StateName) -> CollectionDef;
 
     /// Validates that the keyed-state collection named `(state_type, name)` is
     /// registered with the asserted structural identity, returning the
@@ -406,7 +394,7 @@ pub trait CellWrite: CellRead + StateLifecycle + MarkerIdentity + WritableStateS
 pub(crate) mod sealed {
     use super::{
         Bytes, CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Duration,
-        Future, MarkerWrite, ProvisionalWrite, RepinProof, SectionClear, StateAccessError,
+        Future, MarkerWrite, ProvisionalWrite, RepinProof, Section, SectionClear, StateAccessError,
         StateName, StateType, Uuid, resolve_collections,
     };
     use opentelemetry::global::meter;
@@ -919,6 +907,18 @@ pub(crate) mod sealed {
             value: Option<Bytes>,
         );
 
+        /// Stages one section's dirty clear marker — the sink a whole-layout
+        /// reset replays through, one entry per declared section. Same
+        /// admission witness and the same "only looks asynchronous" rationale
+        /// as [`Self::stage_cell`].
+        fn stage_section_clear(
+            &self,
+            permit: &OpPermit<'_>,
+            state_type: StateType,
+            name: &StateName,
+            section: Section,
+        );
+
         /// Discards just this event's buffered dirty cells — the isolation step
         /// of the attempt-boundary [`Self::reset`] transition (which then bumps
         /// the epoch under the same gate hold), and the failure-path backstop
@@ -1346,16 +1346,8 @@ where
         self.inner.termination.is_terminated() || self.inner.terminated.load(Ordering::Relaxed)
     }
 
-    fn collection_has_ttl(&self, state_type: StateType, name: &StateName) -> bool {
-        self.inner.registry.ttl_for(state_type, name).is_some()
-    }
-
-    fn collection_keyset_limit(&self, state_type: StateType, name: &StateName) -> usize {
-        self.inner.registry.keyset_limit_for(state_type, name)
-    }
-
-    fn collection_capacity(&self, state_type: StateType, name: &StateName) -> Option<NonZeroUsize> {
-        self.inner.registry.capacity_for(state_type, name)
+    fn collection_def(&self, state_type: StateType, name: &StateName) -> CollectionDef {
+        self.inner.registry.def_for(state_type, name)
     }
 
     fn verify_state_registration(
@@ -1681,6 +1673,17 @@ where
             Some(bytes) => dirty.set_owned(&id, cell, bytes),
             None => dirty.clear(&id, cell),
         }
+    }
+
+    fn stage_section_clear(
+        &self,
+        _permit: &OpPermit<'_>,
+        state_type: StateType,
+        name: &StateName,
+        section: Section,
+    ) {
+        let id = self.id_for(state_type, name);
+        self.inner.overlay.dirty().clear_section(&id, section);
     }
 
     fn discard_dirty(&self) {

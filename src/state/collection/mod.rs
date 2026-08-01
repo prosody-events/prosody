@@ -29,21 +29,26 @@
 
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::access::StateAccessError;
-use crate::state::cell_key::{CellKey, Section};
+use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor::{
     CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession, KeyOf,
     ResolvedOf, StructuralIdentity, WriteOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
+use crate::state::registry::CollectionDef;
 use crate::state::session::CellRead;
-use crate::state::{StateName, StateType, StoreOutcome};
+use crate::state::store::{CellBuffer, CoordinateBatch};
+use crate::state::{RESOLVE_FANOUT, StateName, StateType, StoreOutcome};
 use bytes::Bytes;
 use educe::Educe;
+use futures::stream::{Stream, StreamExt, TryStreamExt, iter};
 use std::future::Future;
 use std::marker::PhantomData;
+use tokio::task::coop::cooperative;
 
 mod operation;
 pub(crate) mod owner;
+mod stream;
 
 #[cfg(test)]
 mod tests;
@@ -52,6 +57,7 @@ pub(crate) use operation::{
     JOURNAL_INLINE, Mutation, MutationJournal, ReadOperation, WriteOperation,
 };
 pub(crate) use prosody_macros::{collection_layout, collection_methods};
+pub(crate) use stream::{CoordinatePlan, KeyItem, RangePlan, ScanItem};
 
 /// Framework-internal engine authority: admission, raw cell commands, mutation
 /// replay, and durable repair.
@@ -66,7 +72,8 @@ pub(crate) use prosody_macros::{collection_layout, collection_methods};
 /// authority lives one layer below anything a caller can name.
 pub(crate) mod sealed {
     use super::{
-        Bytes, CellKey, MutationJournal, StateAccessError, StateName, StateType, StoreOutcome,
+        Bytes, CellBuffer, CellKey, CoordinateBatch, MutationJournal, Scan, Section,
+        StateAccessError, StateName, StateType, StoreOutcome, Stream,
     };
     use std::future::Future;
     use std::ops::DerefMut;
@@ -92,6 +99,12 @@ pub(crate) mod sealed {
         where
             S: 'a;
 
+        /// The owned state a managed stream plan carries out of the invocation
+        /// that built it. The owner keeps nothing (each chunk reacquires
+        /// admission); the reader keeps its selected source, so a chunk resumes
+        /// on exactly the source the planning command chose.
+        type Plan: Clone + Send + Sync + 'static;
+
         /// Acquires this invocation's read state.
         fn begin_read(session: &S) -> impl Future<Output = Self::ReadInner<'_>> + Send;
 
@@ -104,6 +117,51 @@ pub(crate) mod sealed {
             name: &StateName,
             cell: &CellKey,
         ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> + Send;
+
+        /// Reads one section's `batch` in one lower hop, index-aligned to
+        /// `batch`, advancing the invocation's state exactly as
+        /// [`Self::read_point`] does.
+        fn read_batch(
+            session: &S,
+            inner: &mut Self::ReadInner<'_>,
+            state_type: StateType,
+            name: &StateName,
+            section: Section,
+            batch: &CoordinateBatch,
+        ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>> + Send;
+
+        /// Freezes this invocation's state into the plan a managed stream
+        /// driver runs on. Total: there is no unplannable invocation, so no
+        /// driver carries an unreachable arm.
+        fn capture(inner: &Self::ReadInner<'_>) -> Self::Plan;
+
+        /// Re-enters an invocation under a captured plan — one coordinate
+        /// chunk's admission. The owner reacquires the gate here, which is what
+        /// keeps a coordinate stream free of a gate hold across a yield.
+        fn resume<'a>(
+            session: &'a S,
+            plan: &Self::Plan,
+        ) -> impl Future<Output = Self::ReadInner<'a>> + Send;
+
+        /// Pages a durable range under a captured plan, gate-free — the range
+        /// driver's only lower hop, and the one command that cannot repair.
+        fn page<'a>(
+            session: &'a S,
+            plan: &'a Self::Plan,
+            state_type: StateType,
+            name: &'a StateName,
+            scan: Scan<'a>,
+        ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a;
+
+        /// The per-emission fence a managed stream runs after every source
+        /// completion, before the item or error escapes. Vacuous on the
+        /// published reader, which has no attempt to leak past.
+        ///
+        /// # Errors
+        ///
+        /// [`StateAccessError::Terminated`] once the stream outlived its
+        /// dispatch attempt.
+        fn fence(session: &S) -> Result<(), StateAccessError>;
     }
 
     /// The write half of one engine: admission, the final fence, journal
@@ -314,7 +372,7 @@ impl<L, T> CellFamily<L, T> {
     }
 
     /// The durable section this family addresses.
-    const fn section(self) -> Section {
+    pub(crate) const fn section(self) -> Section {
         self.section
     }
 }
@@ -328,16 +386,19 @@ impl<L, T> CellFamily<L, T> {
 /// with another session, and a collection for another session type or layout is
 /// a different type.
 ///
-/// The binding deliberately does *not* capture the collection's
-/// [`CollectionDef`](crate::state::registry::CollectionDef): every
-/// configuration query still goes to the session per call. Capturing it waits
-/// for the first caller that reads configuration inside a scoped operation.
+/// The binding also captures the collection's [`CollectionDef`] **as the bound
+/// engine sees it** — the registry definition for a per-event session, the
+/// descriptor's own for a published reader. Registration is immutable for the
+/// session's lifetime, so one capture answers every configuration query a
+/// scoped operation makes, and a stream's arm cannot change under it
+/// mid-flight.
 #[derive(Educe)]
 #[educe(Clone(bound = "S: Clone"))]
 pub struct Collection<S, L> {
     session: S,
     state_type: StateType,
     name: StateName,
+    def: CollectionDef,
     _layout: PhantomData<fn() -> L>,
 }
 
@@ -346,6 +407,11 @@ impl<S, L> Collection<S, L> {
     /// handle method records.
     pub(crate) fn name(&self) -> &StateName {
         &self.name
+    }
+
+    /// The collection's captured operational settings; see the type doc.
+    fn def(&self) -> &CollectionDef {
+        &self.def
     }
 
     /// The bound session.
@@ -383,10 +449,12 @@ impl<S: CellRead, L> Collection<S, L> {
         identity: &StructuralIdentity,
     ) -> Result<Self, StateAccessError> {
         let name = session.verify_state_registration(name, state_type, identity)?;
+        let def = session.collection_def(state_type, &name);
         Ok(Self {
             session: session.clone(),
             state_type,
             name,
+            def,
             _layout: PhantomData,
         })
     }
@@ -464,6 +532,19 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     /// The layout brand every family argument is checked against.
     type Layout;
 
+    /// The collection's canonical name — the operation-span field and the
+    /// subject of a collection's degrade warnings.
+    fn name(&self) -> &StateName;
+
+    /// Whether the collection carries a durable TTL. Read from the binding's
+    /// captured settings; no I/O.
+    fn has_ttl(&self) -> bool;
+
+    /// The Map keyset bound: how many live distinct keys a map tracks before
+    /// overflowing to the full-section scan. Read from the binding's captured
+    /// settings; no I/O.
+    fn keyset_limit(&self) -> usize;
+
     /// Reads, decodes, and resolves the visible value at `key`.
     ///
     /// # Errors
@@ -478,6 +559,41 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     where
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
+
+    /// Reads, decodes, and resolves `keys` as one aligned batch: `result[i]`
+    /// answers `keys[i]`, duplicates are answered per position, and an absent
+    /// cell reads `None`.
+    ///
+    /// The lower reads are sub-batched and sequential (two repair-capable owner
+    /// reads must not race one collection's marker); the typed resolves fan out
+    /// across the whole call in an order-preserving window.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get`].
+    fn get_many<T>(
+        &mut self,
+        family: CellFamily<Self::Layout, T>,
+        keys: &[KeyOf<T>],
+    ) -> impl Future<
+        Output = Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>>,
+    > + Send
+    where
+        T: CellType,
+        for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
+
+    /// Whether a stored cell exists at `key`, **without decoding its value or
+    /// running the resolver**. The guarantee is "no decode, no resolve", not
+    /// "no I/O": a cold cache still reaches the store.
+    ///
+    /// # Errors
+    ///
+    /// An access error from the engine.
+    fn contains<T: CellType>(
+        &mut self,
+        family: CellFamily<Self::Layout, T>,
+        key: &KeyOf<T>,
+    ) -> impl Future<Output = Result<bool, StateAccessError>> + Send;
 }
 
 /// The mutation commands, implemented only by the write operation.
@@ -500,6 +616,15 @@ pub(crate) trait CollectionWrite: CollectionRead {
 
     /// Stages a clear of the cell at `key`.
     fn clear<T: CellType>(&mut self, family: CellFamily<Self::Layout, T>, key: &KeyOf<T>);
+
+    /// Stages an absence over the collection's **whole declared layout** — one
+    /// payload-free journal entry that expands to every active and reserved
+    /// section at merge, so a removed family's legacy rows are erased too. From
+    /// this program point the collection reads empty, and later commands in the
+    /// same invocation repopulate it.
+    fn clear_collection(&mut self)
+    where
+        Self::Layout: CollectionLayout;
 }
 
 /// Seals the author-facing command traits: they are implemented for the two
@@ -545,6 +670,42 @@ where
         let ctx = <ContextOf<'a, T> as FromSession<'a, S>>::from_session(session);
         Ok(<T::Resolver as CellResolver>::resolve(ctx, stored).await?)
     }
+}
+
+/// Decodes and resolves an aligned batch of raw cell slots into the exposed
+/// application values, preserving input order. The resolves — the expensive
+/// half, potentially a loader read per cell — fan out across the WHOLE batch
+/// through an ordered [`buffered`](StreamExt::buffered) window of
+/// [`RESOLVE_FANOUT`], so a batch's resolves overlap instead of serializing per
+/// sub-batch.
+///
+/// # Errors
+///
+/// A codec error (Permanent) when a cell's bytes do not decode, or a resolution
+/// error from the resolver.
+pub(in crate::state) async fn resolve_batch<S, T>(
+    session: &S,
+    bytes: CellBuffer<Option<Bytes>>,
+) -> Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>>
+where
+    S: StateSession,
+    T: CellType,
+    for<'s> ContextOf<'s, T>: FromSession<'s, S>,
+{
+    iter(bytes)
+        .map(|slot| {
+            cooperative(async move {
+                match slot {
+                    Some(raw) => Ok::<_, CellStateError<CellCodecError<T>>>(Some(
+                        resolve_cell::<S, T>(session, raw).await?,
+                    )),
+                    None => Ok(None),
+                }
+            })
+        })
+        .buffered(RESOLVE_FANOUT)
+        .try_collect()
+        .await
 }
 
 /// Decodes a cell's bytes as `C::Payload`. Parses in place when the `Bytes` is

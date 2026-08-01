@@ -23,9 +23,11 @@
 //! The selection reaches the read paths two ways, and the two agree. A scoped
 //! collection operation carries its own invocation-local selection: the reader
 //! engine seeds it from the session-shared [`PinnedSource`] and publishes the
-//! first one it makes back to that shared cell. The `CellRead` bridge paths
-//! (`get`, `get_many`, `scan`) read the shared cell directly, and serve the
-//! collection kinds that do not run through the engine yet.
+//! first one it makes back to that shared cell. A managed stream carries the
+//! selection its planning command captured, so a continuation can never
+//! re-probe. The `CellRead` bridge paths (`get`, `get_many`, `scan`) read the
+//! shared cell directly, and serve the collection kinds that do not run through
+//! the engine yet.
 //!
 //! Probe-and-pin is the reader's source-selection strategy:
 //!
@@ -51,7 +53,7 @@ use crate::Key;
 use crate::codec::Codec;
 use crate::segment::partition_segment_id;
 use crate::state::access::StateAccessError;
-use crate::state::cell_key::{CellKey, Section};
+use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::identity::{CollectionId, StateKey};
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state_reader::backend::{CommittedCellSource, ReaderBackend};
@@ -59,7 +61,7 @@ use crate::state_reader::cache::CacheKey;
 use crate::state_reader::partition_for_key;
 use crate::state_reader::source::{Source, ValidatedPublications};
 use bytes::Bytes;
-use futures::stream::{FuturesOrdered, StreamExt};
+use futures::stream::{FuturesOrdered, Stream, StreamExt};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::task::coop::cooperative;
@@ -85,7 +87,7 @@ pub struct ReadSession<C: Codec, B> {
     /// Bridge: the session-shared selection, so every call after the first
     /// data-bearing probe addresses one source. The `CellRead` paths read it
     /// directly; the engine seeds each invocation from it and publishes back.
-    /// It dies with the `CellRead` surface, once Map and Deque run through the
+    /// It dies with the `CellRead` surface, once Deque runs through the
     /// engine.
     pin: Arc<OnceLock<PinnedSource>>,
 }
@@ -324,6 +326,148 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         match first_err {
             Some(error) => Err(error),
             None => Ok(None),
+        }
+    }
+
+    /// One operation's committed batch read, index-aligned to `batch`: address
+    /// the already-selected source, or probe for one.
+    async fn batch_read(
+        &self,
+        selection: &mut Option<PinnedSource>,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
+        if let Some(pin) = selection.as_ref() {
+            return self
+                .cached_batch(Some(&pin.collection), &pin.source, section, batch)
+                .await;
+        }
+        self.probe_batch(selection, section, batch).await
+    }
+
+    /// Probe-and-pin for one batch read — [`Self::probe_point`]'s batch twin.
+    /// A buffer holding data anywhere pins its source; among the remaining
+    /// outcomes an error outranks an all-absent buffer, because absence cannot
+    /// be proven through a source that failed.
+    async fn probe_batch(
+        &self,
+        selection: &mut Option<PinnedSource>,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
+        let sources = self.snapshot.sources();
+        // Bounded per-operation fan-out; see the ruling on the point-read
+        // `FuturesOrdered` above.
+        let mut ordered = FuturesOrdered::new();
+        for source in sources {
+            ordered.push_back(cooperative(async move {
+                (
+                    source,
+                    self.cached_batch(None, source, section, batch).await,
+                )
+            }));
+        }
+        let mut first_err = None;
+        let mut all_none: Option<CellBuffer<Option<Bytes>>> = None;
+        while let Some((source, result)) = cooperative(ordered.next()).await {
+            match result {
+                Ok(buffer) => {
+                    if buffer.iter().any(Option::is_some) {
+                        let collection = self.collection_id_for(source)?;
+                        *selection = Some(PinnedSource {
+                            source: source.clone(),
+                            collection,
+                        });
+                        return Ok(buffer);
+                    }
+                    if all_none.is_none() {
+                        all_none = Some(buffer);
+                    }
+                }
+                Err(error) => {
+                    if first_err.is_none() {
+                        first_err = Some(error);
+                    }
+                }
+            }
+        }
+        match (all_none, first_err) {
+            (_, Some(error)) => Err(error),
+            (Some(buffer), None) => Ok(buffer),
+            // Unreachable: the snapshot is non-empty, so at least one source
+            // answered with data, all-absent, or an error.
+            (None, None) => Ok((0..batch.len()).map(|_| None).collect()),
+        }
+    }
+
+    /// One operation's committed range page: walk `selected`, or — when no read
+    /// has selected a source yet — probe the sources sequentially and pin the
+    /// first that yields a cell.
+    ///
+    /// A mid-stream error after the pin terminates the stream, because a
+    /// restart would double-yield. An error before any yield is remembered and
+    /// falls through to the next source; an empty source falls through too.
+    fn scan_from<'a>(
+        &'a self,
+        selected: Option<&'a PinnedSource>,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+        async_stream::try_stream! {
+            if let Some(pin) = selected {
+                let id = pin.collection.clone();
+                let inner = self.context.backend.cells().scan(&id, scan);
+                futures::pin_mut!(inner);
+                while let Some(item) = cooperative(inner.next()).await {
+                    yield item.map_err(|error| StateAccessError::store(&error))?;
+                }
+                return;
+            }
+            // Unselected sequential probe: sources are tried in preference
+            // order and the first to yield a cell pins. The public Map and
+            // Deque reader streams reach it only if their keyset or bounds read
+            // found nothing, since that read selects first.
+            let sources = self.snapshot.sources();
+            let mut first_err = None;
+            let mut pinned = false;
+            for source in sources {
+                let id = self.collection_id_for(source)?;
+                let inner = self.context.backend.cells().scan(&id, scan);
+                futures::pin_mut!(inner);
+                let mut yielded_any = false;
+                loop {
+                    match cooperative(inner.next()).await {
+                        Some(Ok(item)) => {
+                            if !yielded_any {
+                                let _ = self.pin.set(PinnedSource {
+                                    source: source.clone(),
+                                    collection: id.clone(),
+                                });
+                                yielded_any = true;
+                            }
+                            yield item;
+                        }
+                        Some(Err(error)) => {
+                            let error = StateAccessError::store(&error);
+                            if yielded_any {
+                                Err(error)?;
+                            } else if first_err.is_none() {
+                                first_err = Some(error);
+                            }
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                if yielded_any {
+                    pinned = true;
+                    break;
+                }
+            }
+            // Nothing pinned: propagate a remembered error, else the stream is
+            // empty (every source completed empty).
+            if !pinned && let Some(error) = first_err {
+                Err(error)?;
+            }
         }
     }
 }

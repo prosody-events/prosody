@@ -17,7 +17,7 @@ use crate::state::memory::MemoryPublicationStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
 use crate::state::publication::{PublicationRows, PublicationStore, StatePublication};
-use crate::state::registry::DEFAULT_KEYSET_LIMIT;
+use crate::state::registry::CollectionDef;
 use crate::state::session::sealed::{MarkerIdentity, ReadAdmission, StateLifecycle};
 use crate::state::session::{
     CellRead, CellWrite, Finalized, MessageMarker, MutatePermit, OpPermit, SessionGate,
@@ -41,7 +41,6 @@ use serde_json::Value;
 use std::convert::Infallible;
 use std::fmt;
 use std::future::{Future, ready};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use thiserror::Error;
@@ -210,24 +209,10 @@ where
         true
     }
 
-    fn collection_has_ttl(&self, _state_type: StateType, _name: &StateName) -> bool {
-        false
-    }
-
-    fn collection_keyset_limit(&self, _state_type: StateType, _name: &StateName) -> usize {
+    fn collection_def(&self, _state_type: StateType, _name: &StateName) -> CollectionDef {
         // Unreachable in practice: every op on this stub errors `Unavailable`
-        // first. The default keeps the trait total.
-        DEFAULT_KEYSET_LIMIT
-    }
-
-    fn collection_capacity(
-        &self,
-        _state_type: StateType,
-        _name: &StateName,
-    ) -> Option<NonZeroUsize> {
-        // Unreachable in practice (see `collection_keyset_limit`); unbounded
-        // keeps the trait total.
-        None
+        // first. The registry defaults keep the trait total.
+        CollectionDef::new(None)
     }
 
     fn verify_state_registration(
@@ -361,6 +346,16 @@ where
         _name: &StateName,
         _cell: &CellKey,
         _value: Option<Bytes>,
+    ) {
+    }
+
+    /// Unreachable for the same reason as [`Self::stage_cell`].
+    fn stage_section_clear(
+        &self,
+        _permit: &OpPermit<'_>,
+        _state_type: StateType,
+        _name: &StateName,
+        _section: Section,
     ) {
     }
 

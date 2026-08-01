@@ -597,7 +597,8 @@ fn memory_overlay_precedence_set_beats_section_clear() -> Result<()> {
 /// exactly ONE lower batch read for its entries — a full-width scan chunk is
 /// one [`CoordinateBatch`], one lower `get_many`; only the keyset meta cell
 /// stays a point read.
-/// FALSIFICATION: revert `coordinate_source` to the per-key point-`get` loop →
+/// FALSIFICATION: revert `CoordinatePlan`'s chunk source to a per-key point
+/// `get` loop →
 /// `batch_reads == 0` and `lower_reads == CELL_BATCH` (+ keyset) → both asserts
 /// red. Counters are read after the full drain, so nothing masks them.
 #[test]
@@ -1805,9 +1806,9 @@ fn resolve_session(
 /// never the whole `n`-entry collection. The counting store bounds fetches and
 /// the counting resolver bounds resolutions; both counters sit at the lowest
 /// layer, so nothing masks a materialization.
-/// FALSIFICATION: widen `coords.by_ref().take(STREAM_CHUNK)` in
-/// `coordinate_source` to `.take(usize::MAX)` (drain every tracked key in one
-/// chunk) → `take(k)` fetches and resolves all `n` → `batch_reads ==
+/// FALSIFICATION: widen `keys.by_ref().take(STREAM_CHUNK)` in
+/// `CoordinatePlan::entry_source` to `.take(usize::MAX)` (drain every tracked
+/// key in one chunk) → `take(k)` fetches and resolves all `n` → `batch_reads ==
 /// n.div_ceil(16)` and `resolves == n`, both over their bounds for `n ≫ k` →
 /// red. (Inflating `STREAM_CHUNK` itself cannot falsify: the assertion bound
 /// moves with it.)

@@ -8,20 +8,31 @@
 use super::*;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 
-/// The frozen discriminants and the single `Meta` cell address (a durable
-/// contract — the sections lower to `0`/`1` and the keyset encodes to `[2]`).
-/// Coordinates `[0]`/`[1]` are deliberately retired (they once held two min/max
-/// bound cells; the keyset-only meta layout leaves the gap so a stale artifact
-/// cannot alias an old frame).
+/// The frozen cell addresses (a durable contract — the keyset family lowers to
+/// section `0` and encodes to coordinate `[2]`, the entries family to section
+/// `1`) and the reset domain a `clear` covers. Coordinates `[0]`/`[1]` are
+/// deliberately retired (they once held two min/max bound cells; the
+/// keyset-only layout leaves the gap so a stale artifact cannot alias an old
+/// frame), so a whole-layout reset over section `0` is what erases them.
+///
+/// The declared ids, format tokens, and section count are additionally pinned
+/// by the `const` assertion beside the layout; this test pins what the two
+/// cell-address helpers resolve to, which is the address every seeded-cell test
+/// writes through.
 #[test]
 fn map_layout_is_frozen() {
-    assert_eq!(MapNs::Meta as i8, 0);
-    assert_eq!(MapNs::Entries as i8, 1);
-    assert_eq!(i8::from(META_SECTION), 0);
-    assert_eq!(i8::from(ENTRY_SECTION), 1);
-
-    let keyset = MapKeysetKey::encode(&());
-    assert_eq!(keyset.as_bytes(), &[2]);
+    let sections = <FrozenLayout as CollectionLayout>::SECTIONS;
+    assert_eq!(
+        sections.iter().map(|s| i8::from(*s)).collect::<Vec<_>>(),
+        vec![0, 1],
+        "a whole-layout reset covers both declared sections"
+    );
+    assert_eq!(i8::from(keyset_cell().section), 0);
+    assert_eq!(keyset_cell().coordinate.as_bytes(), &[2]);
+    assert_eq!(
+        i8::from(entry_cell_for(&Coordinate::from_bytes(vec![7])).section),
+        1
+    );
 }
 
 /// A short coordinate over a tiny null-prone alphabet, so the keyset frame's

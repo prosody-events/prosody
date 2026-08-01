@@ -700,9 +700,9 @@ fn collection_ops_export_operation_spans() -> Result<()> {
 }
 
 /// Behavioral arm of the collection-containment invariant: a handle bound to
-/// one collection cannot address another. Value carries `(state_type, name)`
-/// on its [`Collection`] binding; Map and Deque carry it on the `CellScope`
-/// they still rebuild. Both are enforced at the type level; this test pins the
+/// one collection cannot address another. Value and Map carry `(state_type,
+/// name)` on their [`Collection`] binding; Deque carries it on the `CellScope`
+/// it still rebuilds. Both are enforced at the type level; this test pins the
 /// matching runtime behavior.
 mod scope_containment {
     use super::*;

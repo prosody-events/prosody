@@ -1207,6 +1207,6 @@ fn erased_registration_options_thread_through() -> Result<()> {
         registry.commit_mode_for(StateType::Application, &v),
         CommitMode::ReadUncommitted
     );
-    assert_eq!(registry.keyset_limit_for(StateType::Application, &m), 7);
+    assert_eq!(registry.def_for(StateType::Application, &m).keyset_limit, 7);
     Ok(())
 }

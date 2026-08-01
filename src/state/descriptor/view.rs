@@ -4,8 +4,8 @@
 //! codecs and resolver; the raw sinks are **private to this module**, so a
 //! collection kind (a sibling module) can reach a cell only through the typed
 //! surface. Decoding and resolving is the *same* pair the scoped-operation
-//! boundary in [`crate::state::collection`] uses; this module dies once Map and
-//! Deque run through that engine too.
+//! boundary in [`crate::state::collection`] uses; this module dies once Deque
+//! runs through that engine too.
 
 use super::{
     CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession, KeyOf,
@@ -13,27 +13,19 @@ use super::{
 };
 use crate::state::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
-use crate::state::collection::{encode_cell, ensure_live, resolve_cell};
+use crate::state::collection::{ScanItem, encode_cell, ensure_live, resolve_batch, resolve_cell};
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::session::{CellRead, CellWrite};
 use crate::state::store::{CELL_BATCH, CellBuffer, CoordinateBatch};
-use crate::state::{RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateName, StateType, StoreOutcome};
+use crate::state::{SHARD_FANOUT_CONCURRENCY, StateName, StateType, StoreOutcome};
 use async_stream::try_stream;
 use bytes::Bytes;
-use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use futures::stream::{Stream, StreamExt, unfold};
 use smallvec::SmallVec;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
-
-/// One item [`CellView::scan`] yields: a decoded key paired with its resolved
-/// value, or the error that ended the stream.
-pub(crate) type ScanItem<T> = Result<(KeyOf<T>, ResolvedOf<T>), CellStateError<CellCodecError<T>>>;
-
-/// One item a key-only scan yields: a decoded key, or the error that ended the
-/// stream. The presence-only twin of [`ScanItem`] — no value, no resolve.
-pub(crate) type KeyItem<T> = Result<KeyOf<T>, CellStateError<CellCodecError<T>>>;
 
 /// A cell store scoped to ONE collection partition (the unit of atomicity).
 ///
@@ -90,25 +82,12 @@ impl<S> CellScope<S> {
 }
 
 impl<S: CellRead> CellScope<S> {
-    /// Whether this collection carries a TTL — a cheap, allocation-free
-    /// registry lookup the Map keyset write consults per `set` so the keyset
-    /// cell co-expires with its entries (`KeysetPresence`).
-    pub(in crate::state::descriptor) fn has_ttl(&self) -> bool {
-        self.session.collection_has_ttl(self.state_type, &self.name)
-    }
-
-    /// This collection's Map keyset bound — a cheap registry lookup the Map
-    /// keyset transition consults per `set`/`stream`.
-    pub(in crate::state::descriptor) fn keyset_limit(&self) -> usize {
-        self.session
-            .collection_keyset_limit(self.state_type, &self.name)
-    }
-
     /// This collection's Deque push capacity (`None` unbounded) — a cheap
-    /// registry lookup the Deque `push_*` enforcement consults per push.
+    /// settings lookup the Deque `push_*` enforcement consults per push.
     pub(in crate::state::descriptor) fn capacity(&self) -> Option<NonZeroUsize> {
         self.session
-            .collection_capacity(self.state_type, &self.name)
+            .collection_def(self.state_type, &self.name)
+            .capacity
     }
 
     /// Reads one cell's visible committed bytes. Demands a read permit. The
@@ -264,36 +243,6 @@ impl<S: CellRead, T: CellType> CellView<S, T> {
         }
     }
 
-    /// Whether a stored cell exists at `key`, read through the dirty overlay
-    /// (read-your-writes) — the presence half of [`Self::get`] with **no value
-    /// decode and no resolver run**. The guarantee is "no decode, no resolve,"
-    /// not "no I/O": a cold cache still reaches the store. Demands a read
-    /// permit, exactly like [`Self::get`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an access error from the session.
-    pub(in crate::state::descriptor) async fn contains(
-        &self,
-        permit: &S::Permit<'_>,
-        key: &KeyOf<T>,
-    ) -> Result<bool, StateAccessError> {
-        let cell = self.cell(key);
-        Ok(self.scope.raw_get(permit, &cell).await?.is_some())
-    }
-
-    /// Whether this view's collection carries a TTL (see
-    /// [`CellScope::has_ttl`]).
-    pub(in crate::state::descriptor) fn has_ttl(&self) -> bool {
-        self.scope.has_ttl()
-    }
-
-    /// This view's collection Map keyset bound (see
-    /// [`CellScope::keyset_limit`]).
-    pub(in crate::state::descriptor) fn keyset_limit(&self) -> usize {
-        self.scope.keyset_limit()
-    }
-
     /// This view's collection Deque push capacity (see
     /// [`CellScope::capacity`]).
     pub(in crate::state::descriptor) fn capacity(&self) -> Option<NonZeroUsize> {
@@ -302,10 +251,8 @@ impl<S: CellRead, T: CellType> CellView<S, T> {
 
     /// The scan shell's fence adapter — the shell's one uniform piece and the
     /// SOLE home of a scan's per-emission attempt fence. Wraps a source's item
-    /// stream (the resolving range/coordinate sources of [`Self::scan`] /
-    /// [`Self::scan_at`], and the presence-only key sources of
-    /// [`Self::key_scan`] / [`Self::key_scan_at`]) and runs [`ensure_live`]
-    /// after EVERY `inner.next()`
+    /// stream (the resolving range and coordinate sources of [`Self::scan`] /
+    /// [`Self::scan_at`]) and runs [`ensure_live`] after EVERY `inner.next()`
     /// completion — `Some`, `Err`, and the exhaustion `None` alike — BEFORE
     /// matching it, so a scan leaked past its handler attempt (a spawned task,
     /// an un-awaited future, a foreign promise) errors
@@ -355,12 +302,11 @@ impl<S: CellRead, T: CellType> CellView<S, T> {
         }
     }
 
-    /// The sub-batched committed-bytes read shared by [`Self::get_many`] (its
-    /// PHASE 1) and the presence-only key scan: lower each key to its
-    /// coordinate in input order, split via [`CoordinateBatch::chunks`], and
-    /// read the sub-batches SEQUENTIALLY. Aligned to `keys` (`result[i]`
-    /// answers `keys[i]`). **No decode, no resolver** — the result is raw
-    /// `Option<Bytes>`, so it sits in the resolver-free impl block.
+    /// [`Self::get_many`]'s PHASE 1: lower each key to its coordinate in input
+    /// order, split via [`CoordinateBatch::chunks`], and read the sub-batches
+    /// SEQUENTIALLY. Aligned to `keys` (`result[i]` answers `keys[i]`). **No
+    /// decode, no resolver** — the result is raw `Option<Bytes>`, so it sits in
+    /// the resolver-free impl block.
     ///
     /// # Errors
     ///
@@ -390,128 +336,6 @@ impl<S: CellRead, T: CellType> CellView<S, T> {
             "batch read answers every input position"
         );
         Ok(bytes)
-    }
-
-    /// The coordinate source of the presence-only key scan (tracked arm): the
-    /// twin of [`Self::coordinate_source`] that streams the **present** keys
-    /// addressed by `coords` (a draining key iterator, already in `dir` order)
-    /// in gate-scoped chunks of `STREAM_CHUNK`, batching a [`Self::read_bytes`]
-    /// over each chunk and yielding a key iff its slot is present — **without
-    /// decoding or resolving the value**, so a message-backed map enumerates
-    /// keys with zero Kafka fetches. Absent slots (TTL holes, popped positions,
-    /// membership races) are skipped, exactly as the resolving twin skips them.
-    /// One read permit per chunk, released before its first yield
-    /// (`StreamYieldFree`).
-    fn key_coordinate_source<'a, I>(
-        &'a self,
-        coords: I,
-    ) -> impl Stream<Item = KeyItem<T>> + Send + 'a
-    where
-        I: Iterator<Item = KeyOf<T>> + Send + 'a,
-    {
-        try_stream! {
-            let chunks = stream::unfold(coords.peekable(), |mut coords| async move {
-                coords.peek()?; // exhausted ⇒ unfold ends
-                let permit = self.read_permit().await;
-                let keys: CellBuffer<KeyOf<T>> = coords.by_ref().take(STREAM_CHUNK).collect();
-                // Presence-only batched read; pair each key with its slot so the
-                // emission stage can drop absent keys AND checkpoint per key.
-                let paired = self.read_bytes(&permit, &keys).await.map(|slots| {
-                    keys.into_iter()
-                        .zip(slots)
-                        .collect::<CellBuffer<(KeyOf<T>, Option<Bytes>)>>()
-                });
-                Some((paired, coords))
-            });
-            futures::pin_mut!(chunks);
-            while let Some(chunk) = chunks.next().await {
-                // Per-key coop checkpoint under an ordered window: the presence
-                // filter is synchronous, so a warm chunk of ≤ STREAM_CHUNK ready
-                // keys would otherwise drain the coop budget in one poll (the
-                // resolving twin spends the budget per item inside `get_many`).
-                // `buffered` keeps key order; absent keys are dropped here. The
-                // per-item `cooperative` under `buffered` is the coop checkpoint
-                // this presence-only path lacks — NOT a resolving fan-out (a
-                // per-chunk checkpoint is insufficient: ~128 warm chunks would
-                // drain the budget before a forced yield). The fan-out is a
-                // no-op wrapper on purpose: `cooperative` is the only per-item
-                // budget checkpoint reachable here, since tokio's `rt` feature
-                // is off and `consume_budget` is therefore uncallable. Do not
-                // re-litigate the empty `buffered` window.
-                let emit = stream::iter(chunk?)
-                    .map(|(key, slot)| {
-                        cooperative(async move {
-                            Ok::<Option<KeyOf<T>>, CellStateError<CellCodecError<T>>>(
-                                slot.map(|_| key),
-                            )
-                        })
-                    })
-                    .buffered(SHARD_FANOUT_CONCURRENCY);
-                futures::pin_mut!(emit);
-                while let Some(item) = emit.next().await {
-                    if let Some(key) = item? {
-                        yield key;
-                    }
-                }
-            }
-        }
-    }
-
-    /// The range source of the presence-only key scan (degrade arm): the twin
-    /// of [`Self::range_source`] that streams every key of this section over
-    /// the full range in `dir` order. Drives the gate-free `raw_scan` through
-    /// an ordered `buffered` window, decoding ONLY `cell.coordinate →
-    /// KeyOf<T>` and **discarding the value bytes** before any codec or
-    /// resolver.
-    fn key_range_source(&self, dir: Direction) -> impl Stream<Item = KeyItem<T>> + Send + '_ {
-        try_stream! {
-            ensure_live(self.scope.session())?;
-            let scan = Scan {
-                section: self.section,
-                start: ScanEdge::Unbounded,
-                dir,
-                end: ScanEdge::Unbounded,
-                limit: None,
-            };
-            let inner = self
-                .scope
-                .raw_scan(scan)
-                .map(|item| {
-                    cooperative(async move {
-                        let (cell, _bytes) = item?; // value bytes discarded — never decoded
-                        let key = <T::Key as OrderedKeyCodec>::decode(cell.coordinate.as_bytes())
-                            .map_err(CellStateError::Key)?;
-                        Ok::<KeyOf<T>, CellStateError<CellCodecError<T>>>(key)
-                    })
-                })
-                .buffered(SHARD_FANOUT_CONCURRENCY);
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
-                yield item?;
-            }
-        }
-    }
-
-    /// The presence-only key scan over `coords` (tracked arm), fenced per
-    /// emission by [`Self::fenced`] — the value-free twin of [`Self::scan_at`].
-    pub(in crate::state::descriptor) fn key_scan_at<'a, I>(
-        &'a self,
-        coords: I,
-    ) -> impl Stream<Item = KeyItem<T>> + Send + 'a
-    where
-        I: Iterator<Item = KeyOf<T>> + Send + 'a,
-    {
-        self.fenced(self.key_coordinate_source(coords))
-    }
-
-    /// The presence-only full-section key scan in `dir` order (degrade arm),
-    /// fenced per emission by [`Self::fenced`] — the value-free twin of
-    /// [`Self::scan`].
-    pub(in crate::state::descriptor) fn key_scan(
-        &self,
-        dir: Direction,
-    ) -> impl Stream<Item = KeyItem<T>> + Send + '_ {
-        self.fenced(self.key_range_source(dir))
     }
 }
 
@@ -648,19 +472,16 @@ where
     /// one aligned batch (`result[i]` answers `keys[i]`; duplicate keys are
     /// answered per position under the observation rules; absent → `None`).
     /// Owns the chunking and takes the read permit, exactly as [`Self::get`]
-    /// does. The scan coordinate source composes it per chunk under one chunk
-    /// permit.
+    /// does. The scan coordinate source is its only caller, composing it per
+    /// chunk under one chunk permit.
     ///
     /// Runs in two decoupled phases. PHASE 1 — the sub-batched store reads (the
     /// cheap part; carries marker-help + cache-fill writes beneath the cache,
     /// whose cross-sub-batch concurrency safety is asserted nowhere): the
-    /// shared [`Self::read_bytes`]. PHASE 2 — the typed resolves (the expensive
-    /// part: a
-    /// loader read from Kafka; a pure read, no cache write, no marker
-    /// help): fan out across the WHOLE call through an ordered
-    /// [`buffered`](StreamExt::buffered) window of [`RESOLVE_FANOUT`], so a
-    /// batch's resolves overlap rather than serialize per sub-batch.
-    /// `buffered` preserves input order for the aligned output.
+    /// [`Self::read_bytes`] loop. PHASE 2 — the typed resolves (the expensive
+    /// part: a loader read from Kafka; a pure read, no cache write, no marker
+    /// help): the shared [`resolve_batch`], whose ordered fan-out keeps the
+    /// output aligned to `keys`.
     ///
     /// # Errors
     ///
@@ -671,24 +492,8 @@ where
         permit: &S::Permit<'_>,
         keys: &[KeyOf<T>],
     ) -> Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>> {
-        // PHASE 1: sequential store reads → aligned committed bytes.
         let bytes = self.read_bytes(permit, keys).await?;
-        // PHASE 2: whole-call concurrent typed resolve, input-ordered.
-        let resolved: CellBuffer<Option<ResolvedOf<T>>> = stream::iter(bytes)
-            .map(|slot| {
-                cooperative(async move {
-                    match slot {
-                        Some(raw) => Ok::<_, CellStateError<CellCodecError<T>>>(Some(
-                            self.resolve_bytes(raw).await?,
-                        )),
-                        None => Ok(None),
-                    }
-                })
-            })
-            .buffered(RESOLVE_FANOUT)
-            .try_collect()
-            .await?;
-        Ok(resolved)
+        resolve_batch::<S, T>(self.scope.session(), bytes).await
     }
 
     /// Decodes and resolves raw cell bytes into the exposed value — the
@@ -765,7 +570,7 @@ where
             // Chunk source: the draining coordinate iterator is the unfold
             // state. `peek()` ends the unfold at drain (alloc-free; works for
             // `iter::empty()`).
-            let chunks = stream::unfold(coords.peekable(), |mut coords| async move {
+            let chunks = unfold(coords.peekable(), |mut coords| async move {
                 coords.peek()?; // exhausted ⇒ unfold ends
                 // One read permit per chunk, dropped with this future's scope —
                 // never held across a yield (StreamYieldFree). It spans the

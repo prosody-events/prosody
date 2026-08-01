@@ -161,8 +161,8 @@ pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 /// deployment-dependent, a separately validated config field is the follow-up.
 pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 
-/// Maximum concurrent typed resolves in flight within one `CellView::get_many`
-/// call — the loader (Kafka message) fan-out for a batch read. A resolve reads
+/// Maximum concurrent typed resolves in flight within one aligned batch read —
+/// the loader (Kafka message) fan-out for that read. A resolve reads
 /// the collection's source (a Kafka message for a loader-backed collection),
 /// which does not contend on the
 /// collection's Scylla shard, so it is not bounded by

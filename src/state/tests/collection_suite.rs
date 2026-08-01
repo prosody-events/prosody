@@ -1996,8 +1996,15 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
 /// absent-keyset ⇒ empty-map reading (`KeysetPresence`) survives a cleared map,
 /// and a later set repopulates a fresh single-key `Tracked` keyset (clear
 /// resets the tracking, not just the entries — not a stale pre-clear list).
+///
+/// It also pins the reset's **scope**: a directly-seeded cell at the retired
+/// meta coordinate `[0]` — a legacy row from the removed min/max bounds design,
+/// unreachable through any handle method — is erased too, because `clear()` is
+/// one whole-layout reset over the declared sections rather than a point clear
+/// of the keyset cell.
 #[test]
 fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
+    use crate::state::cell_key::{CellKey, Coordinate};
     use futures::executor::block_on;
 
     let oracle = ScriptedOracle::default();
@@ -2022,8 +2029,19 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
 
-    // Event 2: committed clear — stages the entries' section clear plus the
-    // Cleared keyset cell.
+    // A legacy artifact at the retired meta coordinate `[0]`, seeded straight
+    // through the store because no handle method can address it.
+    let legacy = CellKey {
+        section: keyset_cell().section,
+        coordinate: Coordinate::from_bytes(vec![0]),
+    };
+    block_on(store.write_resolved(
+        &collection_ref,
+        &[(legacy.clone(), Some(bytes::Bytes::from_static(&[0xAB])))],
+        &[],
+    ))?;
+
+    // Event 2: committed clear — one whole-layout reset over both sections.
     let event2 = EventRef::Message {
         dedup_id: Uuid::from_u128(2),
     };
@@ -2038,6 +2056,11 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
         block_on(store.get(id, &keyset_cell(), read_event(0)))?.into_inner(),
         None,
         "the committed clear must erase the keyset cell"
+    );
+    assert_eq!(
+        block_on(store.get(id, &legacy, read_event(0)))?.into_inner(),
+        None,
+        "the whole-layout reset must erase the retired meta coordinate too"
     );
 
     // Event 3: one committed set repopulates a fresh single-key Tracked keyset
@@ -2762,10 +2785,11 @@ fn check_map_yield(
 /// before any mutator runs, so a yielded key must be a seed key and its value
 /// one held there at some point (values are read live, chunk by chunk). Every
 /// op is bounded by [`INTERLEAVE_HANG_GUARD`] — the only deadline, never the
-/// assertion. FALSIFICATION: hold the permit across the yield by returning it
-/// in the unfold state (`Some((chunk, permit, keys))`) so it lives into the
-/// forwarding loop → the first mutator after an `Advance` blocks on the gate
-/// the suspended generator holds → the hang-guard elapses → red.
+/// assertion. FALSIFICATION: hold the chunk's admission across the yield by
+/// returning it in `CoordinatePlan`'s unfold state (`Some((entries, inner,
+/// keys))`) so it lives into the forwarding loop → the first mutator after an
+/// `Advance` blocks on the gate the suspended generator holds → the hang-guard
+/// elapses → red.
 pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bool> {
     let MapInterleave { steps, backward } = input;
     let dir = if backward {

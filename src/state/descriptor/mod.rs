@@ -100,15 +100,15 @@ pub(crate) use view::{CellScope, CellView};
 /// The point-get streams' chunk width: the granularity of both the per-chunk
 /// gate hold (one read permit per chunk, dropped with the chunk future's scope
 /// before any yield) and the batch read — each chunk's cells are fetched by
-/// ONE `CellView::get_many` call (one Cassandra query / one fjall hop), whose
-/// typed resolves then fan out under `RESOLVE_FANOUT`. Shared by
-/// [`MapHandle::stream`](map::MapHandle::stream) and
+/// ONE aligned batch read (one Cassandra query / one fjall hop), whose typed
+/// resolves then fan out under `RESOLVE_FANOUT`. Shared by the managed
+/// coordinate stream driver and
 /// [`DequeHandle::stream`](deque::DequeHandle::stream).
 ///
 /// An alias of [`CELL_BATCH`] — the point-get
 /// stream chunk width and the store batch-read width are one number, and the
-/// `> 0` invariant the shared `CellView::scan_at` chunk source relies on
-/// (`coords.by_ref().take(STREAM_CHUNK)` must take ≥ 1 coordinate per chunk) is
+/// `> 0` invariant both chunk sources rely on
+/// (`keys.by_ref().take(STREAM_CHUNK)` must take ≥ 1 key per chunk) is
 /// enforced once on `CELL_BATCH`.
 pub(crate) const STREAM_CHUNK: usize = CELL_BATCH;
 
@@ -550,8 +550,8 @@ impl<D> Registered<D> {
 /// deliberately unexposed, and now structurally so: the trait is sealed by a
 /// crate-internal marker, and for a macro-declared layout that marker is what
 /// [`collection_layout!`](crate::state::collection::collection_layout) emits,
-/// so such a kind cannot exist without a declared durable layout. Map and Deque
-/// hand-write the marker until they migrate to the scoped operation. Users
+/// so such a kind cannot exist without a declared durable layout. Deque
+/// hand-writes the marker until it migrates to the scoped operation. Users
 /// compose cell types (codec + resolver) instead — that surface is fully
 /// public.
 pub trait CollectionSpec: SealedSpec + Sized {

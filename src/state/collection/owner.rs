@@ -9,10 +9,12 @@
 
 use super::{Mutation, MutationJournal, StateSession, WritableStateSession, ensure_live, sealed};
 use crate::state::access::StateAccessError;
-use crate::state::cell_key::CellKey;
+use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::session::{CellRead, CellWrite, KeyedStateSession};
+use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{StateBackend, StateName, StateType, StoreOutcome};
 use bytes::Bytes;
+use futures::stream::Stream;
 
 /// The engine every per-event session binds.
 ///
@@ -24,10 +26,13 @@ pub struct OwnerEngine;
 
 /// Bridge: the owner engine still drives the session's cell-command surface
 /// (`get`, `mutate_permit`, `commit`, `rollback`, and the synchronous overlay
-/// staging). The commands die with that surface, once Map and Deque also run
-/// through the engine and the capability traits collapse into
-/// [`StateSession`].
+/// staging). The commands die with that surface, once Deque also runs through
+/// the engine and the capability traits collapse into [`StateSession`].
 impl<S: CellRead> sealed::ReadEngine<S> for OwnerEngine {
+    /// The owner keeps nothing across a stream continuation: a chunk
+    /// reacquires the gate from the session, which is what keeps the gate off
+    /// the yield path.
+    type Plan = ();
     type ReadInner<'a>
         = S::Permit<'a>
     where
@@ -49,6 +54,45 @@ impl<S: CellRead> sealed::ReadEngine<S> for OwnerEngine {
     ) -> Result<Option<Bytes>, StateAccessError> {
         ensure_live(session)?;
         session.get(state_type, name, cell).await
+    }
+
+    /// The batch twin of [`Self::read_point`], with the same witness and the
+    /// same guard.
+    async fn read_batch(
+        session: &S,
+        _inner: &mut S::Permit<'_>,
+        state_type: StateType,
+        name: &StateName,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
+        ensure_live(session)?;
+        session.get_many(state_type, name, section, batch).await
+    }
+
+    fn capture(_inner: &S::Permit<'_>) {}
+
+    /// Reacquires the gate for one continuation — the same acquire
+    /// [`Self::begin_read`] performs, which is what makes a coordinate stream
+    /// free of a gate hold across its yields.
+    async fn resume<'a>(session: &'a S, (): &()) -> S::Permit<'a> {
+        session.permit().await
+    }
+
+    fn page<'a>(
+        session: &'a S,
+        (): &'a (),
+        state_type: StateType,
+        name: &'a StateName,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+        // Unwitnessed by design: a range pages gate-free, taking the gate only
+        // for the planning command that preceded it.
+        session.scan(state_type, name, scan)
+    }
+
+    fn fence(session: &S) -> Result<(), StateAccessError> {
+        ensure_live(session)
     }
 }
 
@@ -94,6 +138,11 @@ impl<S: CellWrite> sealed::WriteEngine<S> for OwnerEngine {
                 }
                 Mutation::Clear { cell } => {
                     session.stage_cell(permit, state_type, name, &cell, None);
+                }
+                Mutation::Reset { sections } => {
+                    for section in sections {
+                        session.stage_section_clear(permit, state_type, name, *section);
+                    }
                 }
             }
         }
