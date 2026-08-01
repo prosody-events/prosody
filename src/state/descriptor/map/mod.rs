@@ -572,11 +572,11 @@ where
         // Read the keyset *before* staging the entry: own writes are visible to
         // own reads, and the transition depends on the pre-set frame.
         //
-        // `KC::encode` runs twice per mutation (here, and again inside
-        // `op.set`'s cell-key lowering) — one bounded extra coordinate.
-        // Collapsing it needs a coordinate-addressed mutation command on
-        // `CollectionWrite`, which gains its second caller when Deque's
-        // endpoint writes migrate; decide it there, not for one caller.
+        // `KC::encode` runs twice per mutation: once here, and once inside
+        // `op.set`'s cell-key lowering — one bounded extra coordinate. Map is
+        // the only collection that needs the coordinate at the call site. A
+        // coordinate-addressed mutation command on `CollectionWrite` would
+        // therefore serve one caller, so keep the second encode.
         let coordinate = KC::encode(&key);
         let prior = read_keyset_state(op).await?;
         op.set(MapKind::<KC, V>::ENTRIES, &key, value)?;

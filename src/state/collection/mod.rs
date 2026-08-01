@@ -541,6 +541,10 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     /// The Deque push cap. A push evicts from the far end above this many
     /// window slots. `None` means unbounded. Reads the binding's captured
     /// settings, with no I/O.
+    ///
+    /// Only a write calls it today, as with [`has_ttl`](Self::has_ttl). Both
+    /// stay here so the three binding-config accessors read as one group, and
+    /// a read does call [`keyset_limit`](Self::keyset_limit).
     fn capacity(&self) -> Option<NonZeroUsize>;
 
     /// Reads, decodes, and resolves the visible value at `key`.
