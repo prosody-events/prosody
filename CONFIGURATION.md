@@ -83,7 +83,14 @@ reloads and keyed-state message resolution.
 | `PROSODY_STATE_READ_CACHE_SIZE` | Capacity of the read-only client's shared read-through cache. Accepts sizes such as `1 MiB`. | follows `PROSODY_STATE_OWNED_CACHE_SIZE`, then 1 MiB |
 | `PROSODY_STATE_READ_CACHE_TTL` | Default read-cache TTL for composed readers: how long a `StateReader` may serve a collection's reads from its cache before re-reading the store. A humantime duration (`5s`, `750ms`); `none` disables the inherited default. A descriptor can replace it with `.read_cache(duration)` or bypass it with `.read_cache(ReadCachePolicy::Disabled)`. Reader-only — never affects the owning consumer's writes or a collection's durable TTL. | 5s |
 
-`PROSODY_SUBSYSTEM` is deployment identity rather than a state-engine tuning option. A published collection requires it or the equivalent builder field. Keep it set for the deployment that changes a collection to private so startup reconciliation can withdraw its routing row.
+`PROSODY_SUBSYSTEM` names the service's published keyed state. Set it whenever
+any collection uses `.published(true)`.
+
+To make a published collection private, change it to `.published(false)` but
+keep the collection registered and retain the same subsystem name for one
+complete deployment. On startup, Prosody removes the collection from the
+routing table. Removing the registration or subsystem at the same time leaves
+stale routing information, so readers may continue to discover the collection.
 
 ## Deduplication (All Modes)
 
