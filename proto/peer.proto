@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package prosody.peer.v1;
+
+import "google/protobuf/empty.proto";
+
+// Operations prosody nodes perform on each other. Later peer features add
+// methods here rather than services of their own.
+service Peer {
+  // Delivers one response frame to the node it is addressed to. The outcome is
+  // the gRPC status; there is no response body, so an empty message from a
+  // buggy or hostile peer can never read as a report of delivery.
+  rpc DeliverResponse(ResponseFrame) returns (google.protobuf.Empty);
+}
+
+// One response, addressed to the node that is waiting for it.
+message ResponseFrame {
+  uint32 protocol_version = 1;
+  // Which node this frame is for. A node that is not the target forwards the
+  // frame or rejects it, and never accepts it.
+  bytes  target_node      = 2;  // 16 bytes
+  bytes  request_id       = 3;  // 16 bytes
+  string subsystem        = 4;
+  string format           = 5;  // the responder's Codec::FORMAT_ID
+  int32  category         = 6;  // ClassifyError category; 0 is reserved
+  bytes  payload          = 7;
+  // Empty until a relay forwards the frame, then the relay's own node id. A
+  // frame that already names a relay is never forwarded again. A relay always
+  // sets this itself and never preserves a value it received.
+  bytes  relay_node       = 8;  // 16 bytes, or empty
+}

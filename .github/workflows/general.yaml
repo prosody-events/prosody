@@ -51,7 +51,7 @@ jobs:
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@v1.6.0
         with:
-          packages: cmake libcurl4-openssl-dev
+          packages: cmake libcurl4-openssl-dev protobuf-compiler
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-nextest
@@ -90,7 +90,7 @@ jobs:
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@v1.6.0
         with:
-          packages: cmake libcurl4-openssl-dev
+          packages: cmake libcurl4-openssl-dev protobuf-compiler
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Install udeps from crates.io
@@ -108,7 +108,7 @@ jobs:
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@v1.6.0
         with:
-          packages: cmake libcurl4-openssl-dev
+          packages: cmake libcurl4-openssl-dev protobuf-compiler
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check documentation

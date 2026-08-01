@@ -3,8 +3,10 @@
 use std::error::Error;
 
 mod binary;
+mod const_id;
 mod fixed;
 mod json;
+mod response;
 mod serialize_buf;
 
 pub use binary::{
@@ -14,6 +16,7 @@ pub use binary::{
 };
 pub use fixed::{FixedCodec, I64Codec, I64CodecError, PairCodecError};
 pub use json::{JsonCodec, JsonCodecError, serialize_to_json};
+pub use response::{ResultCodec, ResultCodecError};
 
 // Crate-internal: not part of the public codec API surface.
 pub(crate) use serialize_buf::SerializeBufGuard;

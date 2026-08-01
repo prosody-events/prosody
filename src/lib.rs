@@ -50,6 +50,8 @@ pub mod otel;
 pub mod prelude;
 pub mod producer;
 pub mod propagator;
+mod response;
+mod router;
 mod segment;
 mod size;
 pub mod state;
@@ -136,6 +138,8 @@ pub type Topic = Intern<str>;
 /// A partition identifier within a Kafka topic.
 pub type Partition = i32;
 
+pub use response::RequestId;
+pub use router::NodeId;
 pub use segment::SegmentId;
 pub use size::{ByteSize, ByteSizeError};
 

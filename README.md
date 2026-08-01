@@ -48,6 +48,16 @@ chain. Handler timeouts cancel handlers that exceed their deadline, preventing a
 
 ## Usage
 
+### Build prerequisites
+
+Building Prosody compiles its peer wire contract, so the Protocol Buffers
+compiler must be on `PATH`:
+
+```bash
+apt-get install -y protobuf-compiler   # Debian/Ubuntu
+brew install protobuf                  # macOS
+```
+
 Add Prosody to your `Cargo.toml`:
 
 ```toml

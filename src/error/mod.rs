@@ -14,6 +14,7 @@
 //!   waiting, configuration changes, or code changes.
 
 use serde::Serialize;
+use thiserror::Error;
 
 pub mod kafka;
 
@@ -39,3 +40,36 @@ pub trait ClassifyError {
         matches!(self.classify_error(), ErrorCategory::Transient)
     }
 }
+
+/// The wire discriminants, for formats that carry a category between processes.
+///
+/// **Zero is reserved and no category claims it.** Protobuf decodes a missing
+/// `int32` field as `0`, so an omitted category reads as malformed rather than
+/// as a silent [`Transient`](ErrorCategory::Transient).
+impl From<ErrorCategory> for i32 {
+    fn from(category: ErrorCategory) -> Self {
+        match category {
+            ErrorCategory::Transient => 1,
+            ErrorCategory::Permanent => 2,
+            ErrorCategory::Terminal => 3,
+        }
+    }
+}
+
+impl TryFrom<i32> for ErrorCategory {
+    type Error = UnknownErrorCategory;
+
+    fn try_from(value: i32) -> Result<Self, UnknownErrorCategory> {
+        match value {
+            1 => Ok(Self::Transient),
+            2 => Ok(Self::Permanent),
+            3 => Ok(Self::Terminal),
+            other => Err(UnknownErrorCategory(other)),
+        }
+    }
+}
+
+/// A wire discriminant naming no [`ErrorCategory`].
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("unknown error category discriminant: {0}")]
+pub struct UnknownErrorCategory(pub i32);
