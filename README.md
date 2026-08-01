@@ -180,17 +180,17 @@ registration. The builder field falls back to `PROSODY_SUBSYSTEM` when unset.
 
 ```rust,ignore
 // One descriptor configures both the owning handle and the published reader.
-let cart = value_state("cart")
+let current_order = value_state("current-order")
     .published(true)
     .ttl(CompactDuration::new(30 * 24 * 60 * 60));
 let config = KeyedStateConfiguration::builder()
     .subsystem(Some(SubsystemName::try_new("checkout")?))
     .build()?;
 // After constructing the owning client with `config`:
-let registered_cart = owner.register(cart).await?;
+let registered_order = owner.register(current_order).await?;
 
 // Inside the owner's handler, the current event supplies the state key.
-let state = context.state(registered_cart)?;
+let state = context.state(registered_order)?;
 let value = state.get().await?;
 state.set(updated).await?;
 ```
@@ -201,9 +201,9 @@ subsystem and the same collection shape:
 ```rust,ignore
 // Outside a handler, each read supplies the state key explicitly.
 let reader = client
-    .state(SubsystemName::try_new("checkout")?, cart)
+    .state(SubsystemName::try_new("checkout")?, current_order)
     .await?;
-let value = reader.get("user-1").await?; // committed value from the owning group
+let value = reader.get("customer-123").await?; // committed value from the owning group
 ```
 
 A reader observes only **committed** state — never an in-flight value and never
