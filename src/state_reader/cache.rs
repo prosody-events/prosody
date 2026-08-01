@@ -14,7 +14,8 @@
 //! readers. A completed fill is never re-checked and never re-run. The
 //! retry in [`ReaderCache::get_cached`] re-reads the key only after evicting
 //! the stale entry it just observed, so each pass either drops an entry or
-//! takes the fill guard.
+//! takes the fill guard. Cache admission is best-effort and never changes a
+//! successful store result into an error.
 
 use crate::Key;
 use crate::error::ErrorCategory;
@@ -169,7 +170,8 @@ impl ReaderCache {
                     // Single-flight: we own the fill. Record its issue time.
                     let issued = self.clock.now();
                     let value = fill().await?;
-                    let _ = guard.insert((issued, value.clone()));
+                    // The store answer remains valid if admission loses a race.
+                    drop(guard.insert((issued, value.clone())));
                     return Ok(value);
                 }
             }
@@ -242,7 +244,8 @@ impl ReaderCache {
             })
             .await;
         if let EntryResult::Vacant(guard) = outcome {
-            let _ = guard.insert((issued, value));
+            // The store answer remains valid if admission loses a race.
+            drop(guard.insert((issued, value)));
         }
     }
 }
