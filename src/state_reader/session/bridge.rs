@@ -1,10 +1,12 @@
 //! Bridge: the raw [`CellRead`] surface over a read session.
 //!
-//! The collection kinds that do not run through the reader engine yet reach
-//! cells through this impl instead of through a scoped operation, so every path
-//! here reads and publishes the session-shared selection rather than an
-//! invocation-local one. The whole file dies once Deque runs through the
-//! engine.
+//! Every collection now reaches cells through a scoped operation, so nothing
+//! here answers a collection command. The impl survives because binding does:
+//! [`Descriptor::bind`](crate::state::descriptor::StateDescriptor::bind)
+//! validates through [`CellRead`], so a reader session must offer that surface
+//! to be bindable at all. Its read paths therefore stay honest — each reads and
+//! publishes the session-shared selection rather than an invocation-local
+//! one — and the whole file dies with the old cell-command architecture.
 
 use super::ReadSession;
 use crate::codec::Codec;

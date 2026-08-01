@@ -25,10 +25,10 @@
 //! engine seeds it from the session-shared [`PinnedSource`] and publishes the
 //! first one it makes back to that shared cell. A managed stream carries the
 //! selection its planning command captured. The `CellRead` bridge paths (`get`,
-//! `get_many`, `scan`) read the shared cell directly, and serve the collection
-//! kinds that do not run through the engine yet. The precedence is uniform: a
-//! captured selection wins, an uncaptured one defers to the shared cell, and
-//! only a wholly unselected read probes.
+//! `get_many`, `scan`) read the shared cell directly; no collection calls them
+//! any more, but they stay correct because the surface outlives its callers.
+//! The precedence is uniform: a captured selection wins, an uncaptured one
+//! defers to the shared cell, and only a wholly unselected read probes.
 //!
 //! Probe-and-pin is the reader's source-selection strategy:
 //!
@@ -86,10 +86,9 @@ pub struct ReadSession<C: Codec, B> {
     snapshot: Arc<ValidatedPublications>,
     key: Key,
     /// Bridge: the session-shared selection, so every call after the first
-    /// data-bearing probe addresses one source. The `CellRead` paths read it
-    /// directly; the engine seeds each invocation from it and publishes back.
-    /// It dies with the `CellRead` surface, once Deque runs through the
-    /// engine.
+    /// data-bearing probe addresses one source. The engine seeds each
+    /// invocation from it and publishes back; the `CellRead` paths read it
+    /// directly. It dies with the `CellRead` surface.
     pin: Arc<OnceLock<PinnedSource>>,
 }
 

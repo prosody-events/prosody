@@ -3,20 +3,37 @@
 //! The behavioral invariants (the dense window, crash atomicity, residue
 //! skipping) are proven by the memory-backed `run_deque_trace` property in
 //! [`crate::state::tests`]; the frozen `head ‖ tail` frame bytes are pinned by
-//! the pair codec's own goldens (`crate::codec`). These pin the durable section
-//! discriminants and the collection-owned `head ≤ tail` window check.
+//! the pair codec's own goldens (`crate::codec`). These pin the durable cell
+//! addresses and the collection-owned `head ≤ tail` window check.
 
 use super::*;
 use quickcheck::{QuickCheck, TestResult};
 
-/// The frozen section discriminants — a durable wire contract (the sections
-/// lower to `0`/`1`).
+/// The frozen cell addresses (a durable contract — the bounds family lowers to
+/// section `0` at the empty coordinate, the entries family to section `1`) and
+/// the reset domain a `clear` covers.
+///
+/// The declared ids, format tokens, and section count are additionally pinned
+/// by the `const` assertion beside the layout; this test pins what the two
+/// cell-address helpers resolve to, which is the address every seeded-cell test
+/// writes through.
 #[test]
 fn deque_layout_is_frozen() {
-    assert_eq!(DequeNs::Meta as i8, 0);
-    assert_eq!(DequeNs::Entries as i8, 1);
-    assert_eq!(i8::from(META_SECTION), 0);
-    assert_eq!(i8::from(ENTRY_SECTION), 1);
+    let sections = <FrozenLayout as CollectionLayout>::SECTIONS;
+    assert_eq!(
+        sections.iter().map(|s| i8::from(*s)).collect::<Vec<_>>(),
+        vec![0, 1],
+        "a whole-layout reset covers both declared sections"
+    );
+    assert_eq!(i8::from(meta_cell().section), 0);
+    assert!(
+        meta_cell().coordinate.as_bytes().is_empty(),
+        "the bounds cell is unit-addressed at the empty coordinate"
+    );
+    assert_eq!(
+        i8::from(entry_cell_for(&I64KeyCodec::encode(&7)).section),
+        1
+    );
 }
 
 /// [`Window::new`] lifts an ordered `(head, tail)` pair (its length is the

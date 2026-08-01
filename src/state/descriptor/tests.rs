@@ -7,39 +7,36 @@
 //! including the state-unavailable stub on contexts without keyed state.
 
 use super::*;
-use crate::codec::{I64Codec, JsonCodec, JsonCodecError};
+use crate::codec::{JsonCodec, JsonCodecError};
 use crate::consumer::event_context::EventContext;
-use crate::consumer::kafka_state::{MessageCell, message_state};
+use crate::consumer::kafka_state::message_state;
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
-use crate::state::cell_key::{CellKey, Direction, ScanEdge, Section};
+use crate::state::cell_key::Direction;
 use crate::state::dirty::DirtyStore;
 use crate::state::first_write::FirstWritePublisher;
 use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
-use crate::state::session::{CellWrite, KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::tests::support::ScriptedPublicationStore;
-use crate::state::{
-    CommitMode, EventRef, PartitionBackend, RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateKey,
-    StateName, StateType,
-};
+use crate::state::{CommitMode, EventRef, PartitionBackend, StateKey, StateName, StateType};
 use crate::test_util::{ArbJson, TEST_RUNTIME, captured_spans};
 use crate::timers::duration::CompactDuration;
-use color_eyre::eyre::{Result, bail, eyre};
+use color_eyre::eyre::{Result, eyre};
+use futures::TryStreamExt;
 use futures::executor;
-use futures::{StreamExt, TryStreamExt};
 use opentelemetry_sdk::trace::SpanData;
-use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use quickcheck::{QuickCheck, TestResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::sync::Arc;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 use uuid::Uuid;
 
 // Re-exported so contexts that mount a get-out-of-the-way oracle (here and the
@@ -164,7 +161,7 @@ pub(crate) fn test_session_for<L>(
 /// the lifecycle.
 ///
 /// [`StateAccessError::Terminated`]: crate::state::access::StateAccessError::Terminated
-fn session_parts<L>(
+pub(crate) fn session_parts<L>(
     loader: L,
     registry: CollectionDefRegistry,
     state_key: StateKey,
@@ -700,10 +697,9 @@ fn collection_ops_export_operation_spans() -> Result<()> {
 }
 
 /// Behavioral arm of the collection-containment invariant: a handle bound to
-/// one collection cannot address another. Value and Map carry `(state_type,
-/// name)` on their [`Collection`] binding; Deque carries it on the `CellScope`
-/// it still rebuilds. Both are enforced at the type level; this test pins the
-/// matching runtime behavior.
+/// one collection cannot address another. Every kind carries `(state_type,
+/// name)` on its [`Collection`] binding, which is enforced at the type level;
+/// this test pins the matching runtime behavior.
 mod scope_containment {
     use super::*;
     use crate::state::order_codec::Utf8KeyCodec;
@@ -733,7 +729,7 @@ mod scope_containment {
     /// Sibling descriptors of every kind bound against one session address
     /// disjoint cells — a write to one never leaks into another's read, even
     /// though Value/Map/Deque reuse the same section discriminants (`0`/`1`)
-    /// and coordinate spaces. `CellView` pins `(state_type, name)`, so the
+    /// and coordinate spaces. The binding pins `(state_type, name)`, so the
     /// handles cannot collide sharing a session and a key.
     #[test]
     fn prop_sibling_descriptors_do_not_leak() {
@@ -775,692 +771,76 @@ mod scope_containment {
     }
 }
 
-/// Typed-cell-view invariants that live on `CellView` itself rather than any
-/// one kind: the ordered scan window resolves concurrently but yields in key
-/// order, the scan terminates at the first error, the termination guard is
-/// enforced by every kind's typed op, and the ops/scan stay `Send` (the
-/// desugared `-> impl Future + Send` form guarding rustc issue #100013).
-mod typed_cell_view {
-    use super::*;
-    use crate::consumer::middleware::RepinProof;
-    use crate::state::session::sealed::StateLifecycle;
-    use std::iter;
-    use tokio::runtime::Builder;
+/// The termination guard, enforced by every typed op, holds in each kind: a
+/// bound handle over a terminated session refuses the op with the (Transient)
+/// [`StateAccessError::Terminated`], surfaced through each kind's error type.
+#[tokio::test]
+async fn terminated_session_refuses_typed_ops_in_every_kind() -> Result<()> {
+    let value = value_state::<JsonCodec>("term_value");
+    let map = map_state::<Utf8KeyCodec, JsonCodec>("term_map");
+    let deque = deque_state::<JsonCodec>("term_deque");
+    let mut registry = CollectionDefRegistry::default();
+    registry.register(&value, CollectionDef::new(None))?;
+    registry.register(&map, CollectionDef::new(None))?;
+    registry.register(&deque, CollectionDef::new(None))?;
+    let session = terminated_session(MemoryLoader::new(), registry);
 
-    /// The single section every gated-scan / terminate-at-error fixture seeds
-    /// its cells into.
-    const CELL_SECTION: Section = Section::new(0);
+    let value_handle = value.bind(&session).map_err(|e| eyre!("bind value: {e}"))?;
+    let value_result = value_handle.get().await;
+    assert!(matches!(
+        value_result,
+        Err(CellStateError::Access(StateAccessError::Terminated))
+    ));
+    assert_eq!(
+        value_result.err().map(|e| e.classify_error()),
+        Some(ErrorCategory::Transient)
+    );
 
-    /// A per-index resolution ladder: `wait(i)` parks until `release(i)` fires
-    /// gate `i`. Rides the session's loader slot so a resolver reads it as its
-    /// [`CellResolver::Context`], exercising the custom-context [`FromSession`]
-    /// extension point (a local context struct, not the built-in loader
-    /// borrow).
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-    use tokio::time::timeout;
+    let map_handle = map.bind(&session).map_err(|e| eyre!("bind map: {e}"))?;
+    assert!(matches!(
+        map_handle.get(&"k".to_owned()).await,
+        Err(MapStateError::Cell(CellStateError::Access(
+            StateAccessError::Terminated
+        )))
+    ));
 
-    struct GateLadder {
-        gates: Vec<Notify>,
-        parked: AtomicUsize,
-    }
+    let deque_handle = deque.bind(&session).map_err(|e| eyre!("bind deque: {e}"))?;
+    assert!(matches!(
+        deque_handle.len().await,
+        Err(DequeStateError::Cell(CellStateError::Access(
+            StateAccessError::Terminated
+        )))
+    ));
+    Ok(())
+}
 
-    impl GateLadder {
-        fn new(n: usize) -> Self {
-            Self {
-                gates: (0..n).map(|_| Notify::new()).collect(),
-                parked: AtomicUsize::new(0),
-            }
-        }
+/// Builds a session whose per-event cancellation is already tripped, so every
+/// typed op guards to [`StateAccessError::Terminated`]. Binding still
+/// succeeds — bind validates registration, not liveness.
+fn terminated_session(loader: MemoryLoader<Value>, registry: CollectionDefRegistry) -> TestSession {
+    let (parts, _) = session_parts(
+        loader,
+        registry,
+        StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
+        Arc::default(),
+        true,
+    );
+    KeyedStateSession::new(parts)
+}
 
-        async fn wait(&self, idx: usize) {
-            if let Some(gate) = self.gates.get(idx) {
-                // On the current-thread runtime the count-then-park pair runs
-                // uninterrupted, so `parked` equals the number of resolutions
-                // waiting on their gates whenever another task observes it.
-                let notified = gate.notified();
-                self.parked.fetch_add(1, Ordering::SeqCst);
-                notified.await;
-            }
-        }
+/// Compile-time regression pin for the `-> impl Future + Send` desugar (rustc
+/// #100013): a handle's typed op future holds the resolver's borrowed context
+/// across its await and must stay `Send`. A regression to a plain `async fn`
+/// would drop `Send` and fail to compile here. The plan-driver twin is
+/// `plan_streams_are_send` in [`crate::state::collection::tests`].
+#[test]
+fn typed_op_future_is_send() -> Result<()> {
+    fn assert_send<T: Send>(_value: T) {}
 
-        /// How many resolutions are currently parked on their gates.
-        fn parked(&self) -> usize {
-            self.parked.load(Ordering::SeqCst)
-        }
-
-        fn release(&self, idx: usize) {
-            if let Some(gate) = self.gates.get(idx) {
-                gate.notify_one();
-            }
-        }
-    }
-
-    /// Session capability slot carrying the [`GateLadder`] the [`GateResolver`]
-    /// awaits through its context.
-    #[derive(Clone)]
-    struct GateLoader(Arc<GateLadder>);
-
-    impl GateLoader {
-        fn ladder(&self) -> &GateLadder {
-            &self.0
-        }
-    }
-
-    /// The session type the gated-scan fixture binds over: the standard memory
-    /// backend with the [`GateLoader`] capability slot.
-    type GateSession = KeyedStateSession<TestBackend, GateLoader>;
-
-    /// Custom resolver context borrowing the gate ladder from the session — the
-    /// [`FromSession`] extension a resolver author writes for their own
-    /// capability. Coherence-disjoint from the built-in `()` and `&S::Loader`
-    /// impls by being a distinct local struct.
-    struct GateContext<'s>(&'s GateLadder);
-
-    impl<'s> FromSession<'s, GateSession> for GateContext<'s> {
-        fn from_session(session: &'s GateSession) -> Self {
-            GateContext(session.loader().ladder())
-        }
-    }
-
-    /// A resolver whose `resolve` blocks on the stored index's gate, so a test
-    /// controls the completion order of a scan's in-flight resolutions.
-    struct GateResolver;
-
-    impl CellResolver for GateResolver {
-        type Context<'s> = GateContext<'s>;
-        type Resolved = i64;
-        type Stored = i64;
-        type Write<'a> = i64;
-
-        const RESOLVER_ID: Option<&'static str> = Some("gate");
-
-        // Desugared `-> impl Future + Send` (the house style guarding rustc
-        // #100013): the future holds the borrowed context across the await.
-        fn resolve(
-            ctx: Self::Context<'_>,
-            stored: i64,
-        ) -> impl Future<Output = Result<i64, StateAccessError>> + Send {
-            let GateContext(ladder) = ctx;
-            let gate = usize::try_from(stored).unwrap_or(usize::MAX);
-            async move {
-                ladder.wait(gate).await;
-                Ok(stored)
-            }
-        }
-
-        fn stored_from(write: i64) -> i64 {
-            write
-        }
-    }
-
-    /// The gated cell type: an `i64`-addressed cell whose payload is the same
-    /// `i64`, resolved through the gate ladder.
-    type GatedCell = Keyed<I64KeyCodec, WithResolver<I64Codec, GateResolver>>;
-
-    /// The seeding cell type over the same address + payload as [`GatedCell`],
-    /// but a plain passthrough so a test can write the cells without a gate.
-    type SeedCell = Keyed<I64KeyCodec, I64Codec>;
-
-    /// Builds a [`GateSession`] over a fresh memory store carrying `ladder`.
-    fn gate_session(ladder: Arc<GateLadder>) -> GateSession {
-        let (parts, _) = session_parts(
-            GateLoader(ladder),
-            CollectionDefRegistry::default(),
-            StateKey::new(Uuid::new_v4(), Arc::from("gate")),
-            Arc::default(),
-            false,
-        );
-        KeyedStateSession::new(parts)
-    }
-
-    /// Seeds cells `0..n` (payload == key) into a fresh gated session, then
-    /// scans the whole section forward while releasing the resolutions in
-    /// `release` order. The returned keys are what the ordered `buffered`
-    /// window yielded.
-    async fn gated_scan_keys(release: &[usize]) -> Result<Vec<i64>> {
-        let n = release.len();
-        let ladder = Arc::new(GateLadder::new(n));
-        let scope = CellScope::new(
-            gate_session(ladder.clone()),
-            StateType::Application,
-            StateName::try_new("gated")?,
-        );
-
-        let seed = scope.typed::<SeedCell>(CELL_SECTION);
-        // Acquire the mutate permit once for the whole seed phase (mirroring a
-        // production wrapper), then release it before the gate-free scan below.
-        let permit = seed
-            .mutate_permit()
-            .await
-            .map_err(|e| eyre!("seed permit: {e}"))?;
-        for key in 0..n as i64 {
-            seed.set(&permit, &key, key)
-                .await
-                .map_err(|e| eyre!("seed {key}: {e}"))?;
-        }
-        drop(permit);
-
-        let view = scope.typed::<GatedCell>(CELL_SECTION);
-        let (lo, hi) = (i64::MIN, i64::MAX);
-        let stream = view.scan(
-            ScanEdge::Included(&lo),
-            Direction::Forward,
-            ScanEdge::Included(&hi),
-            None,
-        );
-        let collector = async {
-            futures::pin_mut!(stream);
-            let mut keys = Vec::new();
-            while let Some(item) = stream.next().await {
-                let (key, value) = item.map_err(|e| eyre!("scan: {e}"))?;
-                // The resolver returns the stored payload, which equals the key;
-                // tie them so the decode-and-resolve path is actually exercised.
-                if key != value {
-                    return Err(eyre!("resolver desync: key {key} != resolved {value}"));
-                }
-                keys.push(key);
-            }
-            Ok::<Vec<i64>, color_eyre::Report>(keys)
-        };
-        // `join!` polls the collector first, so all `n <= SHARD_FANOUT_CONCURRENCY`
-        // resolutions register on their gates before the releaser fires them; the
-        // wakes queue in `release` order, which `buffer_unordered` would surface
-        // but `buffered` must not. The releaser PINS that assumption: were any
-        // resolution not yet parked, its release would become a stored permit
-        // and the release order would stop being the completion order —
-        // silently degrading this fixture to a detector that cannot detect.
-        let releaser = async {
-            if ladder.parked() != n {
-                bail!(
-                    "only {} of {n} resolutions parked before release",
-                    ladder.parked()
-                );
-            }
-            for &idx in release {
-                ladder.release(idx);
-            }
-            Ok(())
-        };
-        // The deadline is a hang-guard, never the assertion; boxed to keep
-        // the joined future off the caller's stack (clippy::large_futures).
-        let (collected, outcome) = timeout(
-            Duration::from_secs(30),
-            Box::pin(async { tokio::join!(collector, releaser) }),
-        )
-        .await
-        .map_err(|_| eyre!("gated scan hung"))?;
-        outcome?;
-        collected
-    }
-
-    /// Ordered-window invariant: however the concurrent resolutions of a typed
-    /// scan complete, `CellView::scan` (a `buffered` window, never
-    /// `buffer_unordered`) yields the cells in key order. The seed count is
-    /// held at or below [`SHARD_FANOUT_CONCURRENCY`] so every resolution is
-    /// in flight at once and the release order is the completion order.
-    ///
-    /// Falsifiable: switching `scan`'s `buffered` to `buffer_unordered` makes a
-    /// non-ascending release order surface out of order (see the full-reverse
-    /// directed test).
-    #[test]
-    fn prop_scan_yields_key_order_under_any_release_order() {
-        fn prop(order: ReleaseOrder) -> TestResult {
-            let ReleaseOrder(order) = order;
-            let expected: Vec<i64> = (0..order.len() as i64).collect();
-            let debug = format!("release={order:?}");
-            let runtime = match Builder::new_current_thread().enable_all().build() {
-                Ok(runtime) => runtime,
-                Err(e) => return TestResult::error(format!("runtime: {e}")),
-            };
-            match runtime.block_on(gated_scan_keys(&order)) {
-                Ok(keys) if keys == expected => TestResult::passed(),
-                Ok(keys) => TestResult::error(format!("out of order: {keys:?} for {debug}")),
-                Err(e) => TestResult::error(format!("{debug}: {e:#}")),
-            }
-        }
-        QuickCheck::new().quickcheck(prop as fn(ReleaseOrder) -> TestResult);
-    }
-
-    /// The strongest ordered-window case, pinned directly: releasing every
-    /// resolution in fully reversed order still yields ascending keys. This is
-    /// the case a `buffer_unordered` regression fails hardest.
-    #[tokio::test]
-    async fn scan_yields_key_order_under_full_reverse_release() -> Result<()> {
-        let n = SHARD_FANOUT_CONCURRENCY;
-        let reverse: Vec<usize> = (0..n).rev().collect();
-        let keys = gated_scan_keys(&reverse).await?;
-        let expected: Vec<i64> = (0..n as i64).collect();
-        if keys != expected {
-            return Err(eyre!(
-                "buffered scan must yield ascending keys under reversed release; got {keys:?}"
-            ));
-        }
-        Ok(())
-    }
-
-    /// Terminate-at-first-error: a typed scan over three ascending cells whose
-    /// middle payload does not decode yields the low cell, then the decode
-    /// error, then ends — the high cell beyond the error is never produced.
-    ///
-    /// Falsifiable: a scan that skipped rather than propagated the error would
-    /// yield the low and high cells and no error.
-    #[tokio::test]
-    async fn typed_scan_terminates_at_first_error() -> Result<()> {
-        let session = test_session(MemoryLoader::new(), CollectionDefRegistry::default());
-        let name = StateName::try_new("scan_err")?;
-        // Ascending keys; the middle cell's bytes are not valid JSON.
-        for (key, bytes) in [
-            (-1_i64, b"1".as_slice()),
-            (0, b"not json".as_slice()),
-            (5, b"2".as_slice()),
-        ] {
-            let cell = CellKey {
-                section: CELL_SECTION,
-                coordinate: I64KeyCodec::encode(&key),
-            };
-            session
-                .set(StateType::Application, &name, &cell, bytes)
-                .await
-                .map_err(|e| eyre!("seed {key}: {e}"))?;
-        }
-
-        let scope = CellScope::new(session, StateType::Application, name);
-        let view = scope.typed::<Keyed<I64KeyCodec, JsonCodec>>(CELL_SECTION);
-        let (lo, hi) = (i64::MIN, i64::MAX);
-        let stream = view.scan(
-            ScanEdge::Included(&lo),
-            Direction::Forward,
-            ScanEdge::Included(&hi),
-            None,
-        );
-        futures::pin_mut!(stream);
-        let mut items = Vec::new();
-        while let Some(item) = stream.next().await {
-            items.push(item);
-        }
-
-        match items.as_slice() {
-            [Ok((key, value)), Err(CellStateError::Codec(_))] => {
-                if *key != -1 || *value != json!(1_i32) {
-                    return Err(eyre!("unexpected first item: ({key}, {value})"));
-                }
-                Ok(())
-            }
-            _ => Err(eyre!(
-                "expected the low cell then a codec error and nothing more; got {items:?}"
-            )),
-        }
-    }
-
-    /// The termination guard, relocated onto every typed op, holds in each
-    /// kind: a bound handle over a terminated session refuses the op with
-    /// the (Transient) [`StateAccessError::Terminated`], surfaced through
-    /// each kind's error type.
-    #[tokio::test]
-    async fn terminated_session_refuses_typed_ops_in_every_kind() -> Result<()> {
-        let value = value_state::<JsonCodec>("term_value");
-        let map = map_state::<Utf8KeyCodec, JsonCodec>("term_map");
-        let deque = deque_state::<JsonCodec>("term_deque");
-        let mut registry = CollectionDefRegistry::default();
-        registry.register(&value, CollectionDef::new(None))?;
-        registry.register(&map, CollectionDef::new(None))?;
-        registry.register(&deque, CollectionDef::new(None))?;
-        let session = terminated_session(MemoryLoader::new(), registry);
-
-        let value_handle = value.bind(&session).map_err(|e| eyre!("bind value: {e}"))?;
-        let value_result = value_handle.get().await;
-        assert!(matches!(
-            value_result,
-            Err(CellStateError::Access(StateAccessError::Terminated))
-        ));
-        assert_eq!(
-            value_result.err().map(|e| e.classify_error()),
-            Some(ErrorCategory::Transient)
-        );
-
-        let map_handle = map.bind(&session).map_err(|e| eyre!("bind map: {e}"))?;
-        assert!(matches!(
-            map_handle.get(&"k".to_owned()).await,
-            Err(MapStateError::Cell(CellStateError::Access(
-                StateAccessError::Terminated
-            )))
-        ));
-
-        let deque_handle = deque.bind(&session).map_err(|e| eyre!("bind deque: {e}"))?;
-        assert!(matches!(
-            deque_handle.len().await,
-            Err(DequeStateError::Cell(CellStateError::Access(
-                StateAccessError::Terminated
-            )))
-        ));
-        Ok(())
-    }
-
-    /// Compile-time regression pin for the `-> impl Future + Send` desugar
-    /// (rustc #100013): both a typed op future that holds a resolver's borrowed
-    /// context across its await and the typed scan stream must stay `Send`. A
-    /// regression to a plain `async fn` would drop `Send` and fail to compile
-    /// here.
-    #[test]
-    fn typed_op_future_and_scan_stream_are_send() -> Result<()> {
-        fn assert_send<T: Send>(_value: T) {}
-
-        let loader = MemoryLoader::<Value>::new();
-        let handle = bind_registered(
-            message_state::<MemoryLoader<Value>>("send_value"),
-            loader.clone(),
-        )?;
-        assert_send(handle.get());
-
-        let scope = CellScope::new(
-            test_session(loader, CollectionDefRegistry::default()),
-            StateType::Application,
-            StateName::try_new("send_scan")?,
-        );
-        let view =
-            scope.typed::<Keyed<Utf8KeyCodec, MessageCell<MemoryLoader<Value>>>>(CELL_SECTION);
-        let key = String::new();
-        assert_send(view.scan(
-            ScanEdge::Included(&key),
-            Direction::Forward,
-            ScanEdge::Included(&key),
-            None,
-        ));
-        Ok(())
-    }
-
-    /// A release order over `0..n`, `n` bounded by the scan's `buffered` window
-    /// so every seeded resolution is in flight at once.
-    #[derive(Clone, Debug)]
-    struct ReleaseOrder(Vec<usize>);
-
-    impl Arbitrary for ReleaseOrder {
-        fn arbitrary(g: &mut Gen) -> Self {
-            let n = usize::arbitrary(g) % (SHARD_FANOUT_CONCURRENCY + 1);
-            let mut order: Vec<usize> = (0..n).collect();
-            // Fisher–Yates over the generator: a uniform permutation of `0..n`,
-            // which includes the fully-reversed worst case.
-            for i in (1..n).rev() {
-                let j = usize::arbitrary(g) % (i + 1);
-                order.swap(i, j);
-            }
-            Self(order)
-        }
-    }
-
-    /// Builds a session whose per-event cancellation is already tripped, so
-    /// every typed op guards to [`StateAccessError::Terminated`]. Binding still
-    /// succeeds — bind validates registration, not liveness.
-    fn terminated_session(
-        loader: MemoryLoader<Value>,
-        registry: CollectionDefRegistry,
-    ) -> TestSession {
-        let (parts, _) = session_parts(
-            loader,
-            registry,
-            StateKey::new(Uuid::new_v4(), Arc::from("user-1")),
-            Arc::default(),
-            true,
-        );
-        KeyedStateSession::new(parts)
-    }
-
-    // ======================================================================
-    // Scan-shell contract pins (below the collections): `CellView::scan_at`
-    // (the coordinate source), `CellView::fenced` (the per-emission fence),
-    // and `CellView::get_many` (the batch point-read).
-    // ======================================================================
-
-    /// Builds a scope over a fresh, live test session and seeds `keys` as
-    /// [`SeedCell`]s (payload == key) under one mutate permit, dropped before
-    /// return. Returns the session clone (so a caller can drive its lifecycle,
-    /// e.g. `reset`) alongside the scope, whose own clone shares the epoch.
-    async fn seeded_scope(
-        name: &str,
-        keys: &[i64],
-    ) -> Result<(TestSession, CellScope<TestSession>)> {
-        let session = test_session(MemoryLoader::new(), CollectionDefRegistry::default());
-        let scope = CellScope::new(
-            session.clone(),
-            StateType::Application,
-            StateName::try_new(name)?,
-        );
-        let seed = scope.typed::<SeedCell>(CELL_SECTION);
-        let permit = seed
-            .mutate_permit()
-            .await
-            .map_err(|e| eyre!("seed permit: {e}"))?;
-        for &key in keys {
-            seed.set(&permit, &key, key)
-                .await
-                .map_err(|e| eyre!("seed {key}: {e}"))?;
-        }
-        drop(permit);
-        Ok((session, scope))
-    }
-
-    /// `scan_at` yields resolved cells in INPUT coordinate order, not sorted
-    /// order. Falsifiable: sorting the coordinates (or feeding a `BTreeSet`)
-    /// before chunking would yield `[0, 2, 5, 7]` instead of the input order.
-    #[tokio::test]
-    async fn scan_at_preserves_input_coordinate_order() -> Result<()> {
-        let (_session, scope) = seeded_scope("order", &[0, 2, 5, 7]).await?;
-        let view = scope.typed::<SeedCell>(CELL_SECTION);
-        let stream = view.scan_at([5, 0, 7, 2].into_iter());
-        futures::pin_mut!(stream);
-        let mut keys = Vec::new();
-        while let Some(item) = stream.next().await {
-            let (key, value) = item.map_err(|e| eyre!("scan_at: {e}"))?;
-            if key != value {
-                return Err(eyre!("resolver desync: key {key} != {value}"));
-            }
-            keys.push(key);
-        }
-        assert_eq!(keys, vec![5, 0, 7, 2], "scan_at preserves input order");
-        Ok(())
-    }
-
-    /// `scan_at` skips absent cells uniformly (never errors on a hole) and
-    /// preserves the present ones in input order. Falsifiable: a pass-through
-    /// that surfaced `None` entries as items (or errored on absent) would add
-    /// extra items or an error.
-    #[tokio::test]
-    async fn scan_at_skips_absent_never_errors() -> Result<()> {
-        let (_session, scope) = seeded_scope("skip", &[0, 5]).await?;
-        let view = scope.typed::<SeedCell>(CELL_SECTION);
-        // 3 and 9 were never seeded.
-        let stream = view.scan_at([0, 3, 5, 9].into_iter());
-        futures::pin_mut!(stream);
-        let mut keys = Vec::new();
-        while let Some(item) = stream.next().await {
-            let (key, _) = item.map_err(|e| eyre!("scan_at: {e}"))?;
-            keys.push(key);
-        }
-        assert_eq!(keys, vec![0, 5], "absent cells skipped, present preserved");
-        Ok(())
-    }
-
-    /// `scan_at` is chunk-atomic: the first decode error short-circuits its
-    /// chunk's `try_collect`, so NONE of the chunk's Ok items surface — unlike
-    /// the range source (`typed_scan_terminates_at_first_error`), which yields
-    /// the pre-error prefix incrementally. All three keys land in one chunk.
-    /// Falsifiable: a per-item `collect` that kept the Ok items before the
-    /// error would surface `[Ok, Err]`.
-    #[tokio::test]
-    async fn scan_at_chunk_is_error_atomic() -> Result<()> {
-        let session = test_session(MemoryLoader::new(), CollectionDefRegistry::default());
-        let name = StateName::try_new("chunk_err")?;
-        // Ascending keys within one chunk; the middle cell's bytes are not JSON.
-        for (key, bytes) in [
-            (-1_i64, b"1".as_slice()),
-            (0, b"not json".as_slice()),
-            (5, b"2".as_slice()),
-        ] {
-            let cell = CellKey {
-                section: CELL_SECTION,
-                coordinate: I64KeyCodec::encode(&key),
-            };
-            session
-                .set(StateType::Application, &name, &cell, bytes)
-                .await
-                .map_err(|e| eyre!("seed {key}: {e}"))?;
-        }
-        let scope = CellScope::new(session, StateType::Application, name);
-        let view = scope.typed::<Keyed<I64KeyCodec, JsonCodec>>(CELL_SECTION);
-        let stream = view.scan_at([-1_i64, 0, 5].into_iter());
-        futures::pin_mut!(stream);
-        let mut items = Vec::new();
-        while let Some(item) = stream.next().await {
-            items.push(item);
-        }
-        match items.as_slice() {
-            [Err(CellStateError::Codec(_))] => Ok(()),
-            _ => Err(eyre!(
-                "expected exactly one codec error and NO Ok prefix (chunk-atomic); got {items:?}"
-            )),
-        }
-    }
-
-    /// The fence runs on the exhaustion `None`, not only on items: a source
-    /// whose epoch is bumped after its last item then yields `Terminated`,
-    /// never a clean end. Falsifiable: moving `ensure_live` inside
-    /// `fenced`'s `Some` arm (skipping it on `None`) makes the post-bump
-    /// pull return `None`.
-    #[tokio::test]
-    async fn scan_at_check_on_exhaustion_yields_terminated() -> Result<()> {
-        let (session, scope) = seeded_scope("exhaust", &[7]).await?;
-        let view = scope.typed::<SeedCell>(CELL_SECTION);
-        let stream = view.scan_at([7_i64].into_iter());
-        futures::pin_mut!(stream);
-        match stream.next().await {
-            Some(Ok((7, 7))) => {}
-            other => return Err(eyre!("first pull must be the seeded item, got {other:?}")),
-        }
-        // Bump the attempt epoch; the buffered chunk is already drained, so the
-        // next pull drives the source to exhaustion and the fence catches it.
-        session.reset(RepinProof::for_test()).await;
-        match stream.next().await {
-            Some(Err(CellStateError::Access(StateAccessError::Terminated))) => Ok(()),
-            other => Err(eyre!(
-                "the post-bump exhaustion pull must be Terminated, got {other:?}"
-            )),
-        }
-    }
-
-    /// A leaked EMPTY-plan stream (routed through `scan_at` over an empty
-    /// iterator, as the collections' absent/empty arms now are) still passes
-    /// the fence on exhaustion: after a bump its first pull errors
-    /// `Terminated`, not clean end-of-collection. Falsifiable identically
-    /// to the exhaustion pin.
-    #[tokio::test]
-    async fn scan_at_empty_fences_on_exhaustion() -> Result<()> {
-        let (session, scope) = seeded_scope("empty", &[]).await?;
-        let view = scope.typed::<SeedCell>(CELL_SECTION);
-        session.reset(RepinProof::for_test()).await;
-        let stream = view.scan_at(iter::empty::<i64>());
-        futures::pin_mut!(stream);
-        match stream.next().await {
-            Some(Err(CellStateError::Access(StateAccessError::Terminated))) => Ok(()),
-            other => Err(eyre!(
-                "a leaked empty-plan stream must fence Terminated on exhaustion, got {other:?}"
-            )),
-        }
-    }
-
-    /// `StreamYieldFree` at the shell: the per-chunk permit is dropped before
-    /// the first yield, so a mutator can acquire the gate BETWEEN stream
-    /// items without deadlock. Both cells sit in one chunk, so after item 0
-    /// the permit is already free. Falsifiable: hoisting `read_permit` out
-    /// of the unfold (holding it across yields) makes the between-items
-    /// mutate hang.
-    #[tokio::test]
-    async fn scan_at_permit_not_held_across_yield() -> Result<()> {
-        let (_session, scope) = seeded_scope("yield_free", &[0, 1]).await?;
-        let view = scope.typed::<SeedCell>(CELL_SECTION);
-        let stream = view.scan_at([0_i64, 1].into_iter());
-        futures::pin_mut!(stream);
-        // Pull item 0; its chunk's permit is dropped before it yields.
-        match stream.next().await {
-            Some(Ok((0, 0))) => {}
-            other => return Err(eyre!("first item unexpected: {other:?}")),
-        }
-        // A mutate permit must acquire immediately (no permit held across the
-        // yield) — the deadline is a hang-guard, never the assertion.
-        let permit = timeout(Duration::from_secs(30), view.mutate_permit())
-            .await
-            .map_err(|_| eyre!("mutate_permit hung: the chunk held the gate across a yield"))?
-            .map_err(|e| eyre!("mutate_permit: {e}"))?;
-        drop(permit);
-        // Draining the rest still works.
-        match stream.next().await {
-            Some(Ok((1, 1))) => Ok(()),
-            other => Err(eyre!("second item unexpected: {other:?}")),
-        }
-    }
-
-    /// One full resolve window runs concurrently: every gated resolver parks
-    /// before any is released. Falsifiable: lowering the `buffered` width below
-    /// `RESOLVE_FANOUT` leaves fewer resolvers parked, so the releaser fails
-    /// (or the join hangs → 30s timeout).
-    #[tokio::test(flavor = "current_thread")]
-    async fn get_many_resolves_full_window_concurrently() -> Result<()> {
-        let n = RESOLVE_FANOUT;
-        let ladder = Arc::new(GateLadder::new(n));
-        let scope = CellScope::new(
-            gate_session(ladder.clone()),
-            StateType::Application,
-            StateName::try_new("resolve_fanout")?,
-        );
-        // Seed all n as dirty Sets in the SAME session (payload == key) so
-        // Phase 1 answers from the overlay — the pin isolates resolve scheduling.
-        let seed = scope.typed::<SeedCell>(CELL_SECTION);
-        let permit = seed
-            .mutate_permit()
-            .await
-            .map_err(|e| eyre!("seed permit: {e}"))?;
-        for key in 0..n as i64 {
-            seed.set(&permit, &key, key)
-                .await
-                .map_err(|e| eyre!("seed {key}: {e}"))?;
-        }
-        drop(permit);
-
-        let view = scope.typed::<GatedCell>(CELL_SECTION);
-        let keys: Vec<i64> = (0..n as i64).collect();
-        let collector = async {
-            let read = view.read_permit().await;
-            let out = Box::pin(view.get_many(read, &keys))
-                .await
-                .map_err(|e| eyre!("get_many: {e}"))?;
-            Ok::<_, color_eyre::Report>(out)
-        };
-        // With the collector polled first, the full window parks under the one
-        // buffered(RESOLVE_FANOUT) window before any release.
-        let releaser = async {
-            if ladder.parked() != n {
-                bail!(
-                    "all {n} resolves must be in flight before release; parked = {}",
-                    ladder.parked()
-                );
-            }
-            for idx in 0..n {
-                ladder.release(idx);
-            }
-            Ok(())
-        };
-        let (collected, outcome) = timeout(
-            Duration::from_secs(30),
-            Box::pin(async { tokio::join!(collector, releaser) }),
-        )
-        .await
-        .map_err(|_| eyre!("resolve fan-out hung"))?;
-        outcome?;
-        let out = collected?;
-        assert_eq!(out.len(), n, "aligned output");
-        for (i, v) in out.iter().enumerate() {
-            assert_eq!(*v, Some(i as i64), "position {i} resolved in order");
-        }
-        Ok(())
-    }
+    let handle = bind_registered(
+        message_state::<MemoryLoader<Value>>("send_value"),
+        MemoryLoader::<Value>::new(),
+    )?;
+    assert_send(handle.get());
+    Ok(())
 }

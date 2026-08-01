@@ -1618,7 +1618,12 @@ async fn drain_deque_stream(
 
 /// Seeds a committed deque window of `width` entries named `name` directly into
 /// `counting`'s lower store, valued by its own index so a stream-order
-/// assertion is possible.
+/// assertion is possible — **plus one entry at index `width`, deliberately
+/// outside the seeded `[0, width)` bounds**.
+///
+/// That extra row is what makes the wide arm's range bound falsifiable: the
+/// entries section then holds a row the window does not, so a scan that walked
+/// the whole section instead of exactly `[head, tail − 1]` would yield it.
 async fn seed_wide_deque(
     counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
     state_key: &StateKey,
@@ -1635,7 +1640,8 @@ async fn seed_wide_deque(
         deque::meta_cell(),
         Some(Bytes::from(deque::seed_frame(0, i64::try_from(width)?))),
     )];
-    for i in 0..width {
+    // `0..=width`: the last one sits past `tail`, outside the window.
+    for i in 0..=width {
         let index = i64::try_from(i)?;
         seeded.push((
             deque::entry_cell_for(&I64KeyCodec::encode(&index)),
@@ -1648,11 +1654,9 @@ async fn seed_wide_deque(
 
 /// Sub-threshold deque iteration streams through the batch verb: a small
 /// committed deque issues **zero** lower-store scans, one bounds point-get, and
-/// one batch read for the entries, in both directions. The companion
-/// wide-window assertions prove the counters are live and pin the fallback: a
-/// directly-seeded window wider than [`deque::DEQUE_POINT_ITERATION_MAX`]
-/// streams every entry in order through exactly one lower scan (plus the one
-/// bounds get).
+/// one batch read for the entries, in both directions. It then hands the same
+/// fixture to [`assert_wide_deque_scan_is_window_bounded`], which pins the
+/// fallback arm.
 #[test]
 fn deque_stream_issues_no_scans() -> Result<()> {
     executor::block_on(async {
@@ -1727,28 +1731,55 @@ fn deque_stream_issues_no_scans() -> Result<()> {
             );
         }
 
-        // Companion: a directly-seeded window one wider than the threshold
-        // falls back to exactly one lower scan — proving the zero above is a
-        // live counter and pinning the fallback arm streams every entry in
-        // order.
-        let width = deque::DEQUE_POINT_ITERATION_MAX + 1;
-        seed_wide_deque(&counting, &state_key, "dq-wide", width).await?;
+        assert_wide_deque_scan_is_window_bounded(&counting, &oracle, &registry, &state_key, &armed)
+            .await
+    })
+}
 
+/// The wide-window companion of [`deque_stream_issues_no_scans`]: a
+/// directly-seeded window one entry wider than
+/// [`deque::DEQUE_POINT_ITERATION_MAX`] falls back to exactly one lower scan —
+/// proving the sub-threshold zero is a live counter — and that scan is bounded
+/// by the window, not the section.
+///
+/// [`seed_wide_deque`] plants one row past `tail`, so a scan that walked the
+/// whole section rather than `[head, tail − 1]` would yield it. Both directions
+/// are drained because a regression that kept the limit but dropped the edges
+/// is masked forward (the limit stops the walk short of the extra row) and
+/// immediately visible backward (the extra row becomes the first item).
+async fn assert_wide_deque_scan_is_window_bounded(
+    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    oracle: &ScriptedOracle,
+    registry: &Arc<CollectionDefRegistry>,
+    state_key: &StateKey,
+    armed: &ArmedKeys,
+) -> Result<()> {
+    let width = deque::DEQUE_POINT_ITERATION_MAX + 1;
+    seed_wide_deque(counting, state_key, "dq-wide", width).await?;
+    let ascending: Vec<Value> = (0..width)
+        .map(i64::try_from)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(Value::from)
+        .collect();
+
+    for (n, dir) in [Direction::Forward, Direction::Backward]
+        .into_iter()
+        .enumerate()
+    {
         counting.reset();
         let event = EventRef::Message {
-            dedup_id: Uuid::from_u128(u128::MAX - 2),
+            dedup_id: Uuid::from_u128(u128::MAX - 2 - n as u128),
         };
-        let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
-        let drained = drain_deque_stream(&session, "dq-wide", Direction::Forward).await?;
-        let expected: Vec<Value> = (0..width)
-            .map(i64::try_from)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(Value::from)
-            .collect();
+        let session = counting_session(counting, oracle, registry, state_key, armed, event);
+        let drained = drain_deque_stream(&session, "dq-wide", dir).await?;
+        let mut expected = ascending.clone();
+        if dir == Direction::Backward {
+            expected.reverse();
+        }
         assert_eq!(
             drained, expected,
-            "the wide window streams every seeded entry in order"
+            "the wide {dir:?} scan streams exactly the window's entries, in order"
         );
         assert_eq!(
             counting.lower_scans(),
@@ -1760,8 +1791,8 @@ fn deque_stream_issues_no_scans() -> Result<()> {
             1,
             "the wide arm reads only the bounds cell"
         );
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 /// A dense stream-laziness case: a collection of `n` entries drained

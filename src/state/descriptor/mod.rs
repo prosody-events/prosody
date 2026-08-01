@@ -56,10 +56,10 @@
 //! # Exposure
 //!
 //! Users define codecs, resolvers, and cell types (all public). Defining
-//! collection *kinds* is deliberately unexposed: `CellScope` and `CellView` are
-//! crate-internal, and [`CollectionSpec`] — nameable downstream because it
-//! names a public associated type — is *sealed*, so a kind can only be declared
-//! inside this crate.
+//! collection *kinds* is deliberately unexposed: [`CollectionSpec`] — nameable
+//! downstream because it names a public associated type — is *sealed* by a
+//! marker only the layout macro emits, so a kind can only be declared inside
+//! this crate, and never without a declared durable layout.
 //!
 //! [`StateDescriptor`] is sealed the same way (by the crate-private
 //! `SealedDescriptor` supertrait): a downstream crate can register and bind the
@@ -90,21 +90,19 @@ use thiserror::Error;
 pub mod deque;
 pub mod map;
 mod value;
-mod view;
 
 pub use deque::{DequeDescriptor, DequeHandle, DequeStateError, deque_state};
 pub use map::{MapDescriptor, MapHandle, MapStateError, map_state};
 pub use value::{ValueDescriptor, ValueHandle, ValueKind, value_state};
-pub(crate) use view::{CellScope, CellView};
 
 /// The point-get streams' chunk width: the granularity of both the per-chunk
 /// admission and the batch read — each chunk's cells are fetched by ONE aligned
 /// batch read (one Cassandra query / one fjall hop), whose typed resolves then
 /// fan out under `RESOLVE_FANOUT`. Admission covers that raw batch read only:
 /// the owner takes one per chunk and releases it before the chunk's resolves,
-/// and a published reader holds no gate at all. Shared by the managed
-/// coordinate stream driver and
-/// [`DequeHandle::stream`](deque::DequeHandle::stream).
+/// and a published reader holds no gate at all. Owned by the managed
+/// coordinate stream driver, which is what every collection's point-get stream
+/// arm runs on.
 ///
 /// An alias of [`CELL_BATCH`] — the point-get
 /// stream chunk width and the store batch-read width are one number, and the
@@ -547,13 +545,11 @@ impl<D> Registered<D> {
 ///
 /// This trait names the [`StateDescriptor`] impl's `Handle` associated type, a
 /// public interface, so it is `pub` — but defining collection kinds is
-/// deliberately unexposed, and now structurally so: the trait is sealed by a
-/// crate-internal marker, and for a macro-declared layout that marker is what
+/// deliberately unexposed, and structurally so: the trait is sealed by a
+/// crate-internal marker that only
 /// [`collection_layout!`](crate::state::collection::collection_layout) emits,
-/// so such a kind cannot exist without a declared durable layout. Deque
-/// hand-writes the marker until it migrates to the scoped operation. Users
-/// compose cell types (codec + resolver) instead — that surface is fully
-/// public.
+/// so a kind cannot exist without a declared durable layout. Users compose cell
+/// types (codec + resolver) instead — that surface is fully public.
 pub trait CollectionSpec: SealedSpec + Sized {
     /// This kind's durable discriminator.
     const KIND: CollectionKindId;
@@ -647,8 +643,7 @@ impl<K: CollectionSpec> StateDescriptor for Descriptor<K> {
     }
 }
 
-/// Error returned by typed cell operations — a scoped collection command, or
-/// the bridge `CellView` the one kind that has not migrated still uses.
+/// Error returned by a typed cell operation — one scoped collection command.
 #[derive(Debug, Error)]
 pub enum CellStateError<E>
 where

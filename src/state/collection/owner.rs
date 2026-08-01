@@ -26,8 +26,8 @@ pub struct OwnerEngine;
 
 /// Bridge: the owner engine still drives the session's cell-command surface
 /// (`get`, `mutate_permit`, `commit`, `rollback`, and the synchronous overlay
-/// staging). The commands die with that surface, once Deque also runs through
-/// the engine and the capability traits collapse into [`StateSession`].
+/// staging). The engine is now that surface's only caller; both die together
+/// when the capability traits collapse into [`StateSession`].
 impl<S: CellRead> sealed::ReadEngine<S> for OwnerEngine {
     /// The owner keeps nothing across a stream continuation: a chunk
     /// reacquires the gate from the session, which is what keeps the gate off

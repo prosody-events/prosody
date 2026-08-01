@@ -7,7 +7,7 @@ use super::{
     resolve_cell, sealed, sealed_ops,
 };
 use crate::state::access::StateAccessError;
-use crate::state::cell_key::{CellKey, Coordinate, Direction, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, ScanEdge, Section};
 use crate::state::descriptor::{
     CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession, KeyOf,
     ResolvedOf, WriteOf,
@@ -18,6 +18,7 @@ use crate::state::{StateName, StateType};
 use bytes::Bytes;
 use smallvec::SmallVec;
 use std::future::Future;
+use std::num::NonZeroUsize;
 
 /// Inline capacity of one invocation's mutation journal.
 ///
@@ -110,7 +111,39 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         family: CellFamily<L, T>,
         dir: Direction,
     ) -> RangePlan<S, T> {
-        RangePlan::new(self.plan_base(family.section()), dir)
+        RangePlan::new(
+            self.plan_base(family.section()),
+            ScanEdge::Unbounded,
+            dir,
+            ScanEdge::Unbounded,
+            None,
+        )
+    }
+
+    /// Plans a managed durable range over the inclusive typed span
+    /// `[start, end]` of `family`'s section, in `dir` order, yielding at most
+    /// `limit` cells — what a collection with a contiguous coordinate window
+    /// takes instead of enumerating every coordinate in it.
+    ///
+    /// `start`/`end` are direction-relative, exactly as
+    /// [`Scan`](crate::state::cell_key::Scan) defines them. Only inclusive
+    /// edges are offered: a collection that knows its window knows both of
+    /// its occupied endpoints.
+    pub(crate) fn range_within<T: CellType>(
+        &self,
+        family: CellFamily<L, T>,
+        start: &KeyOf<T>,
+        dir: Direction,
+        end: &KeyOf<T>,
+        limit: usize,
+    ) -> RangePlan<S, T> {
+        RangePlan::new(
+            self.plan_base(family.section()),
+            ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(start)),
+            dir,
+            ScanEdge::Included(<T::Key as OrderedKeyCodec>::encode(end)),
+            Some(limit),
+        )
     }
 
     /// The binding and captured engine state every managed plan carries.
@@ -241,6 +274,10 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
         self.collection.def().keyset_limit
     }
 
+    fn capacity(&self) -> Option<NonZeroUsize> {
+        self.collection.def().capacity
+    }
+
     fn get_many<T>(
         &mut self,
         family: CellFamily<L, T>,
@@ -333,6 +370,10 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         self.collection.def().keyset_limit
     }
 
+    fn capacity(&self) -> Option<NonZeroUsize> {
+        self.collection.def().capacity
+    }
+
     fn get_many<T>(
         &mut self,
         family: CellFamily<L, T>,
@@ -415,33 +456,39 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         let Self {
             collection, inner, ..
         } = self;
-        let session = collection.session();
-        async move {
-            let bytes = match staged {
-                Some(Staged::Present(bytes)) => Some(bytes),
-                Some(Staged::Absent) => None,
-                // The write state derefs to the read state, so the write
-                // operation reuses the read driver unchanged.
-                None => {
-                    <S::Engine as sealed::ReadEngine<S>>::read_point(
-                        session,
-                        &mut **inner,
-                        collection.state_type(),
-                        collection.name(),
-                        &cell,
-                    )
-                    .await?
-                }
-            };
-            match bytes {
-                Some(bytes) => Ok(Some(resolve_cell::<S, T>(session, bytes).await?)),
-                None => Ok(None),
-            }
-        }
+        // The owned cell moves into the future, so only it — never the borrowed
+        // key — crosses the engine await.
+        async move { read_staged::<S, T, L>(collection, &mut **inner, staged, &cell).await }
     }
 }
 
 impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
+    fn take<T>(
+        &mut self,
+        family: CellFamily<L, T>,
+        key: &KeyOf<T>,
+    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
+    where
+        T: CellType,
+        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
+    {
+        let cell = cell_key(family, key);
+        let staged = self.staged(&cell);
+        let Self {
+            collection,
+            inner,
+            journal,
+        } = self;
+        async move {
+            let value = read_staged::<S, T, L>(collection, &mut **inner, staged, &cell).await?;
+            // Only a completed read stages the clear; a read error leaves the
+            // journal silent, while `Ok(None)` still clears the addressed
+            // residue.
+            journal.push(Mutation::Clear { cell });
+            Ok(value)
+        }
+    }
+
     fn set<T: CellType>(
         &mut self,
         family: CellFamily<L, T>,
@@ -471,6 +518,53 @@ impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
         self.journal.push(Mutation::Reset {
             sections: L::SECTIONS,
         });
+    }
+}
+
+/// The typed point read a write invocation performs: the journal's answer when
+/// it has one, else one engine point read, then the shared decode and resolve.
+///
+/// Written in the desugared `-> impl Future + Send` form for the reason
+/// [`resolve_cell`] states — the future holds the resolver's [`ContextOf`]
+/// projection across the resolve await.
+///
+/// # Errors
+///
+/// An access error from the engine, a codec error (Permanent), or a resolution
+/// error.
+fn read_staged<'a, S, T, L>(
+    collection: &'a Collection<S, L>,
+    inner: &'a mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
+    staged: Option<Staged>,
+    cell: &'a CellKey,
+) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send + 'a
+where
+    S: StateSession,
+    T: CellType,
+    for<'s> ContextOf<'s, T>: FromSession<'s, S>,
+{
+    let session = collection.session();
+    async move {
+        let bytes = match staged {
+            Some(Staged::Present(bytes)) => Some(bytes),
+            Some(Staged::Absent) => None,
+            // The write state derefs to the read state, so the write operation
+            // reuses the read driver unchanged.
+            None => {
+                <S::Engine as sealed::ReadEngine<S>>::read_point(
+                    session,
+                    inner,
+                    collection.state_type(),
+                    collection.name(),
+                    cell,
+                )
+                .await?
+            }
+        };
+        match bytes {
+            Some(bytes) => Ok(Some(resolve_cell::<S, T>(session, bytes).await?)),
+            None => Ok(None),
+        }
     }
 }
 

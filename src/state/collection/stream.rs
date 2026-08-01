@@ -11,11 +11,12 @@
 //! A plan carries no admission and no operation. The owner reacquires the gate
 //! per coordinate chunk and pages a range gate-free; the reader carries the
 //! source its planning command selected, so a chunk can never re-probe or
-//! change source mid-stream.
+//! change source mid-stream. A range plan also carries the span its planning
+//! command chose, which may be the whole section or one bounded window.
 
 use super::operation::read_keys_bytes;
 use super::{StateSession, resolve_batch, resolve_cell, sealed};
-use crate::state::cell_key::{CellKey, Direction, Scan, ScanEdge, Section};
+use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
     STREAM_CHUNK,
@@ -84,12 +85,21 @@ pub(crate) struct CoordinatePlan<S: StateSession, T: CellType> {
     keys: Vec<KeyOf<T>>,
 }
 
-/// A managed durable-range plan: the whole of one section, walked in `dir`
-/// order. Pages gate-free and cannot repair, so it is the fallback for a
-/// collection with no coordinate enumeration to point-get.
+/// A managed durable-range plan: one contiguous span of one section, walked in
+/// `dir` order. Pages gate-free and cannot repair, so it is what a collection
+/// takes when it has no coordinate enumeration to point-get.
+///
+/// The span is the planning command's choice. `Unbounded` edges with no limit
+/// walk the whole section — the fallback for a collection that cannot say where
+/// its cells are. A collection with a contiguous coordinate window (a Deque's
+/// `[head, tail)`) plans inclusive edges and the window's own limit instead, so
+/// the walk never wades rows outside it.
 pub(crate) struct RangePlan<S: StateSession, T> {
     base: PlanBase<S>,
+    start: ScanEdge<Coordinate>,
     dir: Direction,
+    end: ScanEdge<Coordinate>,
+    limit: Option<usize>,
     _cell: PhantomData<fn() -> T>,
 }
 
@@ -237,13 +247,44 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
 }
 
 impl<S: StateSession, T: CellType> RangePlan<S, T> {
-    /// Builds the plan over the planning invocation's captured state.
-    pub(super) fn new(base: PlanBase<S>, dir: Direction) -> Self {
+    /// Builds the plan over the planning invocation's captured state, walking
+    /// `[start, end]` (direction-relative, exactly as [`Scan`] defines them)
+    /// and yielding at most `limit` cells.
+    pub(super) fn new(
+        base: PlanBase<S>,
+        start: ScanEdge<Coordinate>,
+        dir: Direction,
+        end: ScanEdge<Coordinate>,
+        limit: Option<usize>,
+    ) -> Self {
         Self {
             base,
+            start,
             dir,
+            end,
+            limit,
             _cell: PhantomData,
         }
+    }
+
+    /// Opens the plan's durable page over its planned span. One borrow of the
+    /// whole plan, so the [`Scan`]'s edges name the plan's own owned
+    /// coordinates.
+    fn page(&self) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + '_ {
+        let scan = Scan {
+            section: self.base.section,
+            start: self.start.as_ref(),
+            dir: self.dir,
+            end: self.end.as_ref(),
+            limit: self.limit,
+        };
+        <S::Engine as sealed::ReadEngine<S>>::page(
+            &self.base.session,
+            &self.base.plan,
+            self.base.state_type,
+            &self.base.name,
+            scan,
+        )
     }
 
     /// Streams the section's live entries, resolved, in `dir` order.
@@ -269,13 +310,13 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         try_stream! {
-            let Self { base, dir, .. } = self;
-            <S::Engine as sealed::ReadEngine<S>>::fence(&base.session)?;
-            let session = &base.session;
+            let plan = self;
+            <S::Engine as sealed::ReadEngine<S>>::fence(&plan.base.session)?;
+            let session = &plan.base.session;
             // `cooperative` inline in the producing closure (a
             // `.map(cooperative)` stage trips a higher-ranked-lifetime error on
             // the non-`'static` per-item futures); `buffered` keeps key order.
-            let inner = page(&base, dir)
+            let inner = plan.page()
                 .map(|item| {
                     cooperative(async move {
                         let (cell, bytes) = item?;
@@ -297,9 +338,9 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
     /// coordinate.
     fn key_source(self) -> impl Stream<Item = KeyItem<T>> + Send {
         try_stream! {
-            let Self { base, dir, .. } = self;
-            <S::Engine as sealed::ReadEngine<S>>::fence(&base.session)?;
-            let inner = page(&base, dir)
+            let plan = self;
+            <S::Engine as sealed::ReadEngine<S>>::fence(&plan.base.session)?;
+            let inner = plan.page()
                 .map(|item| {
                     cooperative(async move {
                         let (cell, _bytes) = item?; // value bytes discarded — never decoded
@@ -315,29 +356,6 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
             }
         }
     }
-}
-
-/// Opens the plan's durable page over the whole section. Both edges are
-/// `Unbounded`: a range plan exists precisely because no coordinate enumeration
-/// remains to fence the walk. `dir` still orders it.
-fn page<S: StateSession>(
-    base: &PlanBase<S>,
-    dir: Direction,
-) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + '_ {
-    let scan = Scan {
-        section: base.section,
-        start: ScanEdge::Unbounded,
-        dir,
-        end: ScanEdge::Unbounded,
-        limit: None,
-    };
-    <S::Engine as sealed::ReadEngine<S>>::page(
-        &base.session,
-        &base.plan,
-        base.state_type,
-        &base.name,
-        scan,
-    )
 }
 
 /// The managed stream fence adapter — the SOLE home of a managed stream's

@@ -21,11 +21,10 @@
 //!
 //! # The byte boundary
 //!
-//! Cell bytes are spoken here and in the descriptor's cell view only: one
-//! decode/encode pair is what every collection's values pass through, and a
-//! command's typed key is lowered to its
-//! order-preserving coordinate before any engine sees it. Collection code
-//! names no `Bytes`, `CellKey`, permit, or source.
+//! Cell bytes are spoken here and nowhere else: one decode/encode pair is what
+//! every collection's values pass through, and a command's typed key is lowered
+//! to its order-preserving coordinate before any engine sees it. Collection
+//! code names no `Bytes`, `CellKey`, permit, or source.
 
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::access::StateAccessError;
@@ -44,6 +43,7 @@ use educe::Educe;
 use futures::stream::{Stream, StreamExt, TryStreamExt, iter};
 use std::future::Future;
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
 
 mod operation;
@@ -423,13 +423,6 @@ impl<S, L> Collection<S, L> {
     fn state_type(&self) -> StateType {
         self.state_type
     }
-
-    /// Bridge: the binding's parts, for a collection kind that still builds a
-    /// `CellScope` from them. Dies with the old cell-command surface, once
-    /// every kind runs through the engine.
-    pub(in crate::state) fn into_parts(self) -> (S, StateType, StateName) {
-        (self.session, self.state_type, self.name)
-    }
 }
 
 impl<S: CellRead, L> Collection<S, L> {
@@ -545,6 +538,11 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     /// settings; no I/O.
     fn keyset_limit(&self) -> usize;
 
+    /// The Deque push cap: at most this many window slots before a push evicts
+    /// from the far end, or `None` when unbounded. Read from the binding's
+    /// captured settings; no I/O.
+    fn capacity(&self) -> Option<NonZeroUsize>;
+
     /// Reads, decodes, and resolves the visible value at `key`.
     ///
     /// # Errors
@@ -598,10 +596,34 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
 
 /// The mutation commands, implemented only by the write operation.
 ///
-/// Both are synchronous: encoding and staging perform no I/O, so representing
-/// them as futures would add suspension points without work. `set` is fallible
-/// only at typed encoding; a point clear cannot fail after admission.
+/// `set` and `clear` are synchronous: encoding and staging perform no I/O, so
+/// representing them as futures would add suspension points without work. `set`
+/// is fallible only at typed encoding; a point clear cannot fail after
+/// admission. [`take`](Self::take) is the one exception, because it reads
+/// first.
 pub(crate) trait CollectionWrite: CollectionRead {
+    /// Reads, decodes, and resolves the value at `key`, then stages a clear of
+    /// it — the one supported read-then-mutate composite.
+    ///
+    /// The read completes first: a read error stages nothing, while `Ok(None)`
+    /// still clears the addressed residue.
+    ///
+    /// Declared rather than provided: a default body over an opaque `Self`
+    /// cannot prove the returned future `Send` for its `&mut Self` and
+    /// `&KeyOf<T>` captures.
+    ///
+    /// # Errors
+    ///
+    /// As [`CollectionRead::get`].
+    fn take<T>(
+        &mut self,
+        family: CellFamily<Self::Layout, T>,
+        key: &KeyOf<T>,
+    ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send
+    where
+        T: CellType,
+        for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
+
     /// Stages a write of `value` at `key`.
     ///
     /// # Errors

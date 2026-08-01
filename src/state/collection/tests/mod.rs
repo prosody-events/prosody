@@ -10,6 +10,12 @@
 //! reverse-order fold must answer every in-invocation read, a successful merge
 //! must leave the event overlay exactly at the model, and every other exit must
 //! leave the overlay exactly as the invocation found it.
+//!
+//! The managed stream drivers a plan feeds — ordering, error termination, the
+//! per-emission fence, and the resolve fan-out — are in the sibling
+//! [`plans`] module.
+
+mod plans;
 
 use super::{
     CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE,
@@ -19,6 +25,7 @@ use crate::codec::{I64Codec, I64CodecError};
 use crate::consumer::middleware::RepinProof;
 use crate::loader::MemoryLoader;
 use crate::state::cached::Cached;
+use crate::state::cell_key::CellKey;
 use crate::state::descriptor::tests::{session_over, session_with_dirty, value_registry};
 use crate::state::descriptor::{
     CellStateError, Keyed, StateDescriptor, StructuralIdentity, ValueDescriptor, value_state,
@@ -29,12 +36,13 @@ use crate::state::identity::CollectionId;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use crate::state::registry::CollectionDefRegistry;
-use crate::state::session::CellRead;
 use crate::state::session::sealed::StateLifecycle;
+use crate::state::session::{CellRead, CellWrite};
 use crate::state::store::CELL_BATCH;
 use crate::state::tests::support::{CountingCellStore, FixedOracle};
 use crate::state::{CollectionKindId, StateAccessError, StateKey, StateType};
 use crate::test_util::TEST_RUNTIME;
+use bytes::Bytes;
 use color_eyre::eyre::{Result, eyre};
 use educe::Educe;
 use futures::StreamExt;
@@ -126,6 +134,19 @@ where
         stage_pair(op, key, left, right)?;
         Err(CellStateError::Access(StateAccessError::Unavailable))
     }
+
+    /// Takes `LEFT[key]`, **swallows** whatever it returns, then stages an
+    /// unrelated write and returns whether the take succeeded — so the
+    /// invocation merges either way and the take's staging (or its absence) is
+    /// observable on the overlay. The only shape in which a *failed* command's
+    /// journal contribution can be inspected: an invocation that propagates the
+    /// error drops the whole journal.
+    #[write(op)]
+    async fn take_swallowing(&self, key: i64, marker: i64) -> Result<bool, ProbeError> {
+        let took = op.take(PairLayout::LEFT, &key).await.is_ok();
+        op.set(PairLayout::RIGHT, &key, marker)?;
+        Ok(took)
+    }
 }
 
 /// The registered descriptor the probe binds against. A layout brand is
@@ -206,6 +227,7 @@ enum Command {
     Get(Family, i64),
     GetMany(Family, Vec<i64>),
     Contains(Family, i64),
+    Take(Family, i64),
     ClearCollection,
 }
 
@@ -215,7 +237,7 @@ impl Arbitrary for Command {
         // actually occur inside one invocation.
         let key = i64::from(u8::arbitrary(g) % 3);
         let family = Family::arbitrary(g);
-        match u8::arbitrary(g) % 6 {
+        match u8::arbitrary(g) % 7 {
             0 => Self::Set(family, key, i64::from(u8::arbitrary(g))),
             1 => Self::Clear(family, key),
             2 => Self::Get(family, key),
@@ -226,6 +248,7 @@ impl Arbitrary for Command {
                     .collect(),
             ),
             4 => Self::Contains(family, key),
+            5 => Self::Take(family, key),
             _ => Self::ClearCollection,
         }
     }
@@ -384,6 +407,14 @@ where
                     model.visible(family, key).is_some(),
                     "presence agrees with the journal fold, without resolving"
                 );
+            }
+            &Command::Take(family, key) => {
+                assert_eq!(
+                    op.take(family.token(), &key).await?,
+                    model.visible(family, key),
+                    "take answers from the journal fold, then clears"
+                );
+                model.cells.insert((family.section(), key), None);
             }
             Command::ClearCollection => {
                 op.clear_collection();
@@ -555,6 +586,64 @@ fn failed_write_leaves_the_overlay_unchanged() -> Result<()> {
             staged_state(&dirty, &id)?,
             before,
             "the failed invocation's mutations must not reach the overlay"
+        );
+        Ok(())
+    })
+}
+
+/// A `take` whose read fails stages nothing: the addressed cell still holds the
+/// bytes that would not decode, rather than the absence a staged clear would
+/// have replayed.
+///
+/// Observed through a probe that **swallows** the take's error and returns
+/// `Ok` — the only shape in which a failed command's journal contribution is
+/// observable, since an invocation that propagates the error drops the whole
+/// journal. The seeded bytes go straight into the overlay, and the assertion
+/// reads the overlay back raw, so nothing in between could heal a clear that
+/// should not be there.
+#[test]
+fn take_error_does_not_clear() -> Result<()> {
+    /// Bytes no `I64Codec` cell can decode.
+    const BAD: &[u8] = b"not an i64";
+    const KEY: i64 = 5;
+
+    TEST_RUNTIME.block_on(async {
+        let registry = value_registry(&probe_descriptor())?;
+        let state_key = StateKey::new(Uuid::new_v4(), Arc::from("probe-key"));
+        let (session, dirty) = session_with_dirty(MemoryLoader::new(), registry, state_key.clone());
+        let handle = bind_probe(&session)?;
+        let name = handle.cells.name().clone();
+        let id = CollectionId::new(state_key, StateType::Application, name.clone());
+        let left = CellKey {
+            section: PairLayout::LEFT.section(),
+            coordinate: I64KeyCodec::encode(&KEY),
+        };
+        session
+            .set(StateType::Application, &name, &left, BAD)
+            .await
+            .map_err(|e| eyre!("seeding the undecodable cell failed: {e}"))?;
+
+        assert!(
+            !handle.take_swallowing(KEY, 42).await?,
+            "the seeded bytes must not decode, so the take must have failed"
+        );
+
+        let staged: BTreeMap<CellKey, Option<Bytes>> =
+            dirty.collection_snapshot(&id).into_iter().collect();
+        assert_eq!(
+            staged
+                .get(&left)
+                .and_then(Option::as_ref)
+                .map(Bytes::as_ref),
+            Some(BAD),
+            "a failed take must leave the addressed cell exactly as it found it"
+        );
+        assert!(
+            staged.contains_key(&CellKey {
+                section: PairLayout::RIGHT.section(),
+                coordinate: I64KeyCodec::encode(&KEY),
+            }),
+            "the invocation still merged the write staged after the failed take"
         );
         Ok(())
     })

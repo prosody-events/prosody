@@ -116,8 +116,9 @@ mod tests;
 /// [`ReadSession`](crate::state_reader::ReadSession) share one implementation.
 ///
 /// This capability pair (`CellRead` plus its sealed `ReadAdmission`) collapses
-/// into [`StateSession`] once Deque runs through the collection engine:
-/// the raw cell surface it exists to carry has no other caller.
+/// into [`StateSession`] with the old cell-command architecture: the collection
+/// engine is the raw cell surface's only caller, and binding is the only reason
+/// the pair is still named.
 ///
 /// `get`/`get_many`/`scan` describe the session's **visible committed bytes**
 /// for a cell — [`KeyedStateSession`] realises that through the dirty overlay +
