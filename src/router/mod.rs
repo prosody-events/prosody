@@ -7,6 +7,9 @@ use fixedstr::Flexstr;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use uuid::Uuid;
 
+pub(crate) mod directory;
+pub(crate) mod runtime;
+
 /// The host a node publishes for its peers to dial. Any ordinary hostname or
 /// address stays inline; a longer one spills to the heap.
 #[cfg_attr(
@@ -54,6 +57,15 @@ impl NodeId {
     /// The 16-byte wire form.
     pub(crate) const fn into_bytes(self) -> [u8; 16] {
         self.0.into_bytes()
+    }
+}
+
+/// The directory stores a node id in a Cassandra `uuid` column, so the driver's
+/// own `Uuid` serde carries it. This conversion is the one place the newtype is
+/// unwrapped for that purpose.
+impl From<NodeId> for Uuid {
+    fn from(node: NodeId) -> Self {
+        node.0
     }
 }
 

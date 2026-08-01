@@ -6,7 +6,8 @@
 use crate::cassandra::{
     TABLE_DEDUPLICATION, TABLE_DEFERRED_OFFSETS, TABLE_DEFERRED_SEGMENTS, TABLE_DEFERRED_TIMERS,
     TABLE_KEYED_STATE_CELL, TABLE_KEYED_STATE_IDENTITY, TABLE_KEYED_STATE_PUBLICATION, TABLE_KEYS,
-    TABLE_SCHEMA_MIGRATIONS, TABLE_SEGMENTS, TABLE_SLABS, TABLE_TYPED_KEYS, TABLE_TYPED_SLABS,
+    TABLE_NODE_DIRECTORY, TABLE_NODES_BY_GROUP, TABLE_SCHEMA_MIGRATIONS, TABLE_SEGMENTS,
+    TABLE_SLABS, TABLE_TYPED_KEYS, TABLE_TYPED_SLABS,
 };
 use base16ct::HexDisplay;
 use rust_embed::RustEmbed;
@@ -78,7 +79,9 @@ pub fn load_embedded_migrations(keyspace: &str) -> Result<Vec<Migration>, super:
             .replace(
                 "{{TABLE_KEYED_STATE_PUBLICATION}}",
                 TABLE_KEYED_STATE_PUBLICATION,
-            );
+            )
+            .replace("{{TABLE_NODE_DIRECTORY}}", TABLE_NODE_DIRECTORY)
+            .replace("{{TABLE_NODES_BY_GROUP}}", TABLE_NODES_BY_GROUP);
 
         let checksum = calculate_checksum(&content_str);
         let timestamp = extract_timestamp(&filename)?;
