@@ -28,13 +28,15 @@ use quanta::{Clock, Instant};
 use quick_cache::Weighter;
 use quick_cache::sync::{Cache, DefaultLifecycle, EntryAction, EntryResult};
 use std::future::Future;
+use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::coop::cooperative;
 
-/// Fixed per-entry accounting overhead added to every entry's declared weight,
-/// so a zero-byte negative entry still costs the budget something.
-const READER_CACHE_ENTRY_OVERHEAD: u64 = 168;
+/// Inline key and value storage plus one cache bookkeeping word. Rust computes
+/// the target-specific layout, including padding and alignment.
+const READER_CACHE_ENTRY_OVERHEAD: u64 =
+    (size_of::<CacheKey>() + size_of::<CacheVal>() + size_of::<usize>()) as u64;
 
 /// The cache key: the stable [`SourceId`], state namespace, collection name,
 /// partition key, and cell. The [`SourceId`] is stable, never an ordinal, so
