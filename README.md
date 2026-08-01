@@ -180,9 +180,7 @@ registration. The builder field falls back to `PROSODY_SUBSYSTEM` when unset.
 
 ```rust,ignore
 // One descriptor configures both the owning handle and the published reader.
-let current_order = value_state("current-order")
-    .published(true)
-    .ttl(CompactDuration::new(30 * 24 * 60 * 60));
+let current_order = value_state("current-order").published(true);
 let config = KeyedStateConfiguration::builder()
     .subsystem(Some(SubsystemName::try_new("checkout")?))
     .build()?;
