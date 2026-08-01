@@ -34,7 +34,7 @@ use tokio::task::coop::cooperative;
 
 /// Fixed per-entry accounting overhead added to every entry's declared weight,
 /// so a zero-byte negative entry still costs the budget something.
-const READER_CACHE_ENTRY_OVERHEAD: u64 = 176;
+const READER_CACHE_ENTRY_OVERHEAD: u64 = 168;
 
 /// The cache key: the stable [`SourceId`], state namespace, collection name,
 /// partition key, and cell. The [`SourceId`] is stable, never an ordinal, so
