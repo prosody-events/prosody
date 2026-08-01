@@ -1948,7 +1948,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
 /// point-get arm — at most one batch read beyond `k` (entries flow through the
 /// batch verb; only the bounds meta cell is a point read) and at most
 /// `k + STREAM_CHUNK` resolved. FALSIFICATION: widen
-/// `coords.by_ref().take(STREAM_CHUNK)` in `coordinate_source` to
+/// `keys.by_ref().take(STREAM_CHUNK)` in `CoordinatePlan::entry_source` to
 /// `.take(usize::MAX)` (fetch the whole window in one chunk) →
 /// `batch_reads == n.div_ceil(16)` and `resolves == n`, both over their bounds
 /// for `n ≫ k` → red. (Inflating `STREAM_CHUNK` itself cannot falsify: the

@@ -24,10 +24,9 @@ use futures::stream::Stream;
 /// trait a downstream crate cannot name.
 pub struct OwnerEngine;
 
-/// Bridge: the owner engine still drives the session's cell-command surface
-/// (`get`, `mutate_permit`, `commit`, `rollback`, and the synchronous overlay
-/// staging). The engine is now that surface's only caller; both die together
-/// when the capability traits collapse into [`StateSession`].
+/// The owner engine drives the session's raw cell surface (`get`,
+/// `mutate_permit`, `commit`, `rollback`, and the synchronous overlay
+/// staging), and is that surface's only caller.
 impl<S: CellRead> sealed::ReadEngine<S> for OwnerEngine {
     /// The owner keeps nothing across a stream continuation: a chunk
     /// reacquires the gate from the session, which is what keeps the gate off

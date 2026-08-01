@@ -115,10 +115,8 @@ mod tests;
 /// [`KeyedStateSession`] and the published reader's
 /// [`ReadSession`](crate::state_reader::ReadSession) share one implementation.
 ///
-/// This capability pair (`CellRead` plus its sealed `ReadAdmission`) collapses
-/// into [`StateSession`] with the old cell-command architecture: the collection
-/// engine is the raw cell surface's only caller, and binding is the only reason
-/// the pair is still named.
+/// `CellRead` is the raw cell surface. The collection engine and the reader
+/// bridge are its only callers, and binding is what names the pair.
 ///
 /// `get`/`get_many`/`scan` describe the session's **visible committed bytes**
 /// for a cell — [`KeyedStateSession`] realises that through the dirty overlay +
@@ -210,11 +208,10 @@ pub trait CellRead: ReadAdmission + StateSession {
 /// reach either sealed surface.
 pub trait CellWrite: CellRead + StateLifecycle + MarkerIdentity + WritableStateSession {
     /// A held gate permit that additionally witnesses a session **mutation**,
-    /// returned by [`Self::mutate_permit`] after the ordered admission.
-    /// `Deref`s to the read `ReadAdmission::Permit`, so a mutator's one permit
-    /// also witnesses the reads inside its body. A read under a mutate hold is
-    /// legal; the converse is a type error. `Sync` because the permit is held
-    /// across `.await`s inside a `Send` mutator future.
+    /// returned by [`Self::mutate_permit`] after the ordered admission. The
+    /// owner's `sealed::MutatePermit` states the read-under-mutate rule this
+    /// `Deref` bound encodes. `Sync` because the permit is held across
+    /// `.await`s inside a `Send` mutator future.
     type MutatePermit<'s>: Send + Sync + DerefMut<Target = <Self as ReadAdmission>::Permit<'s>>
     where
         Self: 's;
@@ -492,8 +489,7 @@ pub(crate) mod sealed {
     /// * **scans and streams** — the managed stream fence adapter (`fenced` in
     ///   `crate::state::collection::stream`), which runs the engine fence after
     ///   every stream completion, so a leaked stream errors at its next
-    ///   emission and no buffered item crosses the boundary. Deque's scan shell
-    ///   still carries a pre-engine twin of it, and dies with the bridge.
+    ///   emission and no buffered item crosses the boundary.
     ///
     /// Keep every session op inside the handler future that owns the event all
     /// the same; the fence is the backstop, not a license to detach.
@@ -598,8 +594,8 @@ pub(crate) mod sealed {
     /// caller has sequenced the mutator admission order (pin → closed →
     /// termination — see
     /// [`CellWrite::mutate_permit`](super::CellWrite::mutate_permit)). The
-    /// descriptor's mutating sinks
-    /// `raw_set`/`raw_clear`/`clear_section`/`raw_commit` demand
+    /// write engine's `validate_write` and journal `apply`
+    /// (`crate::state::collection::owner`) demand
     /// `&S::MutatePermit<'_>`; the owner session's is this struct. A read
     /// permit at a write does not compile. A scoped write invocation holds one
     /// across its whole body and hands its [`Deref`] target to the

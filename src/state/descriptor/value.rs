@@ -5,8 +5,10 @@
 //! collection author — a bound [`Collection`] plus marked methods whose bodies
 //! are ordinary Rust over the scoped operation `op`.
 
-use super::{CellCodecError, CellStateError, CellType, Descriptor, ResolvedOf, WriteOf};
-use crate::codec::JsonCodec;
+use super::{
+    CellCodecError, CellStateError, CellType, CollectionSpec, Descriptor, ResolvedOf, WriteOf,
+};
+use crate::codec::{Codec, JsonCodec};
 use crate::state::collection::{
     Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE, StateSession,
     WritableStateSession, collection_layout, collection_methods, same_token,
@@ -60,6 +62,20 @@ const _: () = {
         "the default Value cell is durably JSON-encoded"
     );
     assert!(
+        same_token(
+            <<<ValueKind<JsonCodec> as CollectionSpec>::Cell as CellType>::Key as Codec>::FORMAT_ID,
+            families[0].key_format()
+        ),
+        "the spec's cell type addresses the entries family"
+    );
+    assert!(
+        same_token(
+            <<<ValueKind<JsonCodec> as CollectionSpec>::Cell as CellType>::Codec as Codec>::FORMAT_ID,
+            families[0].format()
+        ),
+        "the spec's cell type encodes the entries family"
+    );
+    assert!(
         <ValueKind<JsonCodec> as CollectionLayout>::SECTIONS.len() == 1,
         "Value's reset domain is its one family"
     );
@@ -91,7 +107,7 @@ where
     ValueDescriptor::new(name)
 }
 
-impl<T: CellType<Key = UnitKey>> super::CollectionSpec for ValueKind<T> {
+impl<T: CellType<Key = UnitKey>> CollectionSpec for ValueKind<T> {
     type Cell = T;
     type Handle<S: StateSession> = ValueHandle<S, T>;
 

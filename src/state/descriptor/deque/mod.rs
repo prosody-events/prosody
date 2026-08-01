@@ -47,12 +47,12 @@
 //! maps to a present entry cell, so `len` is exact and iteration yields exactly
 //! `len` elements. **With a TTL** an entry's expiry is anchored at its push, so
 //! entries can expire *inside* the window while it stays put — the window
-//! develops holes. The bounds cell is rewritten by every op, so it outlives the
-//! entries and `head`/`tail` are unaffected. Under holes `len` is an **upper
-//! bound** on the live count, and `get`/`stream` **skip** an expired index — an
-//! absent cell resolves as skipped (`get` → `None`, `stream` omits it), never
-//! an error. This is acceptable time-window semantics: a TTL'd deque is a
-//! sliding window of not-yet-expired elements.
+//! develops holes. The bounds cell is rewritten by every mutating op, so it
+//! outlives the entries and `head`/`tail` are unaffected. Under holes `len` is
+//! an **upper bound** on the live count, and `get`/`stream` **skip** an expired
+//! index — an absent cell resolves as skipped (`get` → `None`, `stream` omits
+//! it), never an error. This is acceptable time-window semantics: a TTL'd deque
+//! is a sliding window of not-yet-expired elements.
 //!
 //! # Invariant: capacity
 //!
@@ -73,7 +73,7 @@ use super::{
     CellCodecError, CellStateError, CellType, CollectionSpec, ContextOf, Descriptor, FromSession,
     Keyed, ResolvedOf, WriteOf,
 };
-use crate::codec::{I64Codec, I64CodecError, JsonCodec, PairCodecError};
+use crate::codec::{Codec, I64Codec, I64CodecError, JsonCodec, PairCodecError};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::Direction;
 #[cfg(test)]
@@ -193,6 +193,20 @@ const _: () = {
         "Deque entries are durably addressed by the kind's index codec"
     );
     assert!(
+        same_token(
+            <<<FrozenLayout as CollectionSpec>::Cell as CellType>::Key as Codec>::FORMAT_ID,
+            families[1].key_format()
+        ),
+        "the spec's cell type addresses the entries family"
+    );
+    assert!(
+        same_token(
+            <<<FrozenLayout as CollectionSpec>::Cell as CellType>::Codec as Codec>::FORMAT_ID,
+            families[1].format()
+        ),
+        "the spec's cell type encodes the entries family"
+    );
+    assert!(
         <FrozenLayout as CollectionLayout>::SECTIONS.len() == 2,
         "Deque's reset domain is its two families"
     );
@@ -203,8 +217,8 @@ const _: () = {
 };
 
 /// Descriptor for a codec-backed deque collection. Generic over an element
-/// [`CellType`] `T` — a plain [`Codec`](crate::codec::Codec) (JSON by default)
-/// or a codec paired with a resolver via [`WithResolver`](super::WithResolver).
+/// [`CellType`] `T` — a plain [`Codec`] (JSON by default) or a codec paired
+/// with a resolver via [`WithResolver`](super::WithResolver).
 /// There is no key-codec parameter: the index encoding is fixed by the kind.
 /// Declare via [`deque_state`].
 pub type DequeDescriptor<T = JsonCodec> = Descriptor<DequeKind<T>>;
@@ -581,6 +595,12 @@ where
     /// Removes and returns the front element, advancing `head` past it (`None`
     /// when empty). The element resolves *before* the clear and head move, so a
     /// resolve failure stages nothing at all.
+    ///
+    /// A pop is an endpoint-slot mutation. Under a TTL an expired front slot
+    /// yields `None` and is still consumed — the slot is cleared and `head`
+    /// advances — so a `while let Some(v) = pop_front()` drain stops at the
+    /// first hole. See [`peek_front`](Self::peek_front)'s endpoint-slot
+    /// contract.
     ///
     /// A cancelled or failed pop is atomic for a structural reason, not a
     /// checked one: the whole invocation's mutations live in one journal that

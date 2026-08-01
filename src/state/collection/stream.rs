@@ -92,7 +92,8 @@ pub(crate) struct CoordinatePlan<S: StateSession, T: CellType> {
 /// The span is the planning command's choice. `Unbounded` edges with no limit
 /// walk the whole section — the fallback for a collection that cannot say where
 /// its cells are. A collection with a contiguous coordinate window (a Deque's
-/// `[head, tail)`) plans inclusive edges and the window's own limit instead, so
+/// half-open `[head, tail)`) converts it to the inclusive span
+/// `[head, tail − 1]` and plans that with the window's own limit instead, so
 /// the walk never wades rows outside it.
 pub(crate) struct RangePlan<S: StateSession, T> {
     base: PlanBase<S>,

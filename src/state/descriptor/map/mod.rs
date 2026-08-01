@@ -167,6 +167,20 @@ const _: () = {
         "Map's entries family is durably section 1"
     );
     assert!(
+        same_token(
+            <<<FrozenLayout as CollectionSpec>::Cell as CellType>::Key as Codec>::FORMAT_ID,
+            families[1].key_format()
+        ),
+        "the spec's cell type addresses the entries family"
+    );
+    assert!(
+        same_token(
+            <<<FrozenLayout as CollectionSpec>::Cell as CellType>::Codec as Codec>::FORMAT_ID,
+            families[1].format()
+        ),
+        "the spec's cell type encodes the entries family"
+    );
+    assert!(
         <FrozenLayout as CollectionLayout>::SECTIONS.len() == 2,
         "Map's reset domain is its two families"
     );

@@ -17,8 +17,11 @@
 //! rule: the unpinned reads within one operation must be issued sequentially,
 //! each pinning before the next begins. Every read path here obeys that rule. A
 //! probe runs to a pin, then later calls address the pin, so a torn two-source
-//! view cannot occur. A concurrent batched probe added later would have to keep
-//! this sequential-pin behavior to preserve the invariant.
+//! view cannot occur. A probe is concurrent across *sources*, never across
+//! reads: `probe_batch` fans one batch out to every source at once, and still
+//! resolves to one pin. On every engine path the invocation's
+//! `&mut Option<PinnedSource>` (see [`engine`]) makes two overlapping unpinned
+//! reads not compile; the `&self` bridge paths below stay convention-based.
 //!
 //! The selection reaches the read paths two ways, and the two agree. A scoped
 //! collection operation carries its own invocation-local selection: the reader
@@ -230,6 +233,13 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                     .map_err(|error| StateAccessError::store(&error))
             }
             Some(ttl) => {
+                // A stream chunk is up to `CELL_BATCH`, well past
+                // `CELLS_INLINE`, so this buffer heap-spills on the common
+                // path. Accepted: one allocation, sized once from the batch and
+                // bounded by it, in front of a network- or fjall-bound store
+                // read — and the keys ARE the cache lookup. Widening
+                // `CELLS_INLINE` to avoid it is the wrong fix; it would inflate
+                // every `CellBuffer` on every path.
                 let keys: CellBuffer<CacheKey> = batch
                     .iter()
                     .map(|coordinate| {
@@ -437,9 +447,9 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 return;
             }
             // Unselected sequential probe: sources are tried in preference
-            // order and the first to yield a cell pins. The public Map and
-            // Deque reader streams reach it only if their keyset or bounds read
-            // found nothing, since that read selects first.
+            // order and the first to yield a cell pins. Map's untracked-keyset
+            // degrade arm is the only production caller — every other stream
+            // reaches a scan only after a meta point read that already pinned.
             let sources = self.snapshot.sources();
             let mut first_err = None;
             let mut pinned = false;

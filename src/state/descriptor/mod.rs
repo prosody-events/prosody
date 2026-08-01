@@ -5,10 +5,10 @@
 //! the consumer to mint a [`Registered`] capability handle. A handler binds
 //! that handle via
 //! [`EventContext::state`](crate::consumer::event_context::EventContext::state)
-//! to get a typed handle whose `get` reads the cell committed by the previous
-//! event on the key and whose `set` stages a write into the invocation's
-//! journal. `state` takes the handle, never a raw
-//! descriptor, so a handler can reach only collections it registered.
+//! to get a typed handle whose `get` reads the value visible to this event and
+//! whose `set` stages a write into the invocation's journal. `state` takes the
+//! handle, never a raw descriptor, so a handler can reach only collections it
+//! registered.
 //!
 //! # Composed cell types
 //!
@@ -127,10 +127,11 @@ pub(crate) const STREAM_CHUNK: usize = CELL_BATCH;
 /// pointer) belongs in a dedicated codec, the way the message cell's
 /// `"message-ref"` format is its own codec and its resolver merely fetches.
 ///
-/// A resolver must never issue a session or collection operation: point gets
-/// and point-get stream chunks resolve while holding the session gate (a scan
-/// resolves gate-free, but the contract binds every resolver regardless of
-/// path), so a resolver that re-entered the non-reentrant gate would deadlock.
+/// A resolver must never issue a session or collection operation. A point get
+/// resolves while it holds the session gate, so a resolver that re-entered the
+/// non-reentrant gate would deadlock. Other paths release admission first — a
+/// point-get stream chunk before its resolve fan-out, a range page gate-free —
+/// but the contract binds every resolver on every path.
 pub trait CellResolver {
     /// The decoded cell type this resolver maps from — pinned to the codec's
     /// payload by [`CellType`].
@@ -381,7 +382,8 @@ pub(crate) use sealed::SealedDescriptor;
 /// which binds against the context's per-event session. Binding validates
 /// registration + structural identity through the session's
 /// [`verify_state_registration`] and returns an owned, `Clone` handle over the
-/// bound collection, whose methods each run as one scoped operation.
+/// bound collection, whose methods each run as one scoped operation; a stream
+/// method runs a planning operation and then drives its plan outside it.
 ///
 /// Sealed by the crate-private `SealedDescriptor` supertrait: the only impls
 /// are the framework's own [`Descriptor<K>`] and its crate-internal access
@@ -395,8 +397,7 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     ///
     /// The bound stays [`CellRead`] rather than [`StateSession`] — which
     /// [`CollectionSpec::Handle`] uses — because `bind` is what *validates* the
-    /// session, through [`CellRead::verify_state_registration`]. The two
-    /// converge when the capability traits collapse into [`StateSession`].
+    /// session, through [`CellRead::verify_state_registration`].
     type Handle<S: CellRead>;
 
     /// Validates registration + structural identity and returns the typed
@@ -539,7 +540,9 @@ impl<D> Registered<D> {
 /// `collection_def`/`with_collection_def`, and `bind` body.
 ///
 /// The framework reads every [`StructuralIdentity`] token straight off
-/// `Cell`'s axes, so a kind cannot misstate the identity it registers.
+/// `Cell`'s axes. `Cell` itself is hand-written and could name a family the
+/// layout does not declare, so each kind's frozen-layout assertion pins it to
+/// the key and payload tokens of the data family it addresses.
 ///
 /// # Exposure
 ///
@@ -657,9 +660,9 @@ where
     #[error("state codec failed")]
     Codec(#[source] E),
 
-    /// A stored key coordinate did not decode back to a logical key. A scan
-    /// alone surfaces this — `get`/`set`/`clear` only *encode* the caller's
-    /// key, they never decode a stored one.
+    /// A stored key coordinate did not decode back to a logical key. Only a
+    /// coordinate decode can produce it — that is, a stream. Every point
+    /// command encodes the caller's key and never decodes a stored one.
     #[error(transparent)]
     Key(#[from] KeyCodecError),
 }
