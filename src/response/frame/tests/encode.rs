@@ -24,16 +24,18 @@ const FROZEN: [u8; 65] = [
     0x3a, 0x02, b'h', b'i', // payload
 ];
 
-/// The steady state allocates nothing: over a run of encodes up to the
-/// configured maximum, a destination buffer sized at the cap never grows, the
-/// payload is serialized exactly once per response, and the frame is exactly as
-/// long as the staging said it would be. After every accepted response the
-/// encoder is left holding the buffer it started with — even after one big
-/// enough to have grown it — or, for a codec that moves its own buffer into the
-/// empty scratch, exactly that buffer: the encoder never reserves either way.
+/// The encoder never reserves: over a run of encodes up to the configured
+/// maximum, a destination buffer sized at the cap never grows, the payload is
+/// serialized exactly once per response, and the frame is exactly as long as
+/// the staging said it would be. After every accepted response the encoder is
+/// left holding a scratch the size of the one it started with — even after a
+/// response big enough to have grown it — or, for a codec that moves its own
+/// buffer into the empty scratch, exactly that buffer, at whatever capacity it
+/// came with.
 ///
-/// Both codec shapes run, because the copy shape alone would leave half of
-/// [`Codec::serialize`]'s contract untested.
+/// Both codec shapes run and every payload is handed over with slack past the
+/// cap, because the copy shape alone — or a buffer whose capacity is only its
+/// length — leaves half of [`Codec::serialize`]'s contract untested.
 #[quickcheck]
 fn steady_state_encodes_never_reallocate(lengths: Vec<u16>, relay: bool) -> TestResult {
     let lengths: Vec<usize> = lengths.into_iter().map(usize::from).collect();
@@ -82,7 +84,11 @@ fn encodes_without_reserving(codec: &CountingCodec, lengths: &[usize], relay: bo
     ];
     for length in boundaries.into_iter().chain(lengths.iter().copied()) {
         let payload: Vec<u8> = (0..length).map(|index| index as u8).collect();
-        let handed = payload.clone();
+        // Slack past the cap, because a payload buffer's capacity is the
+        // application's business and only its length faces the cap: what a
+        // moving codec hands the encoder can be far larger than any frame.
+        let mut handed = Vec::with_capacity(length + cap.bytes());
+        handed.extend_from_slice(&payload);
         let expected_scratch = codec.expected_scratch(handed.capacity(), scratch_capacity);
         let serializes = codec.serializes();
         dst.clear();
@@ -119,10 +125,11 @@ fn encodes_without_reserving(codec: &CountingCodec, lengths: &[usize], relay: bo
                     &payload[..],
                     "the payload must be framed verbatim"
                 );
-                // Only a response the cap refuses can grow the scratch, and
-                // `stage` gives that memory back before the next one, so the
-                // encoder is left holding exactly the buffer its codec's shape
-                // implies and never one it had to reserve.
+                // A refused response grows the scratch and a moving codec
+                // replaces it outright, but `stage` shrinks it back toward the
+                // cap before the next response, so the encoder is left holding
+                // exactly the buffer its codec's shape implies and never one it
+                // had to reserve.
                 assert_eq!(
                     encoder.scratch_capacity(),
                     expected_scratch,

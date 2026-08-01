@@ -1,5 +1,5 @@
-//! Turning one response into frame bytes, against a bounded scratch buffer the
-//! encoder allocates once and never reserves again.
+//! Turning one response into frame bytes, against a scratch buffer sized to the
+//! cap that only the codec ever grows.
 
 use super::{
     FIELD_CATEGORY, FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE,
@@ -13,17 +13,22 @@ use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, k
 use std::error::Error;
 use thiserror::Error;
 
-/// Encodes responses into frames against one bounded scratch buffer.
+/// Encodes responses into frames against one scratch buffer.
 ///
-/// The encoder allocates once, at construction — a scratch sized to the cap —
-/// and [`FrameEncoder::stage`] never reserves, so a codec that appends cannot
-/// grow it with any response the cap admits. A codec that instead takes
-/// [`Codec::serialize`]'s sanctioned move into an empty buffer hands its own
-/// buffer over in place of the scratch, and the encoder reuses that one from
-/// then on; either way nothing here allocates per response. Beyond that the
-/// frozen `serialize` signature promises nothing — a codec free to allocate
-/// internally is equally free to alternate moving and appending, and would then
-/// regrow the buffer it handed over.
+/// The encoder allocates that scratch at construction, big enough for a payload
+/// at the cap, and never grows it: every `reserve` on it is the codec's own,
+/// through the `&mut Vec<u8>` [`Codec::serialize`] is handed. A codec that
+/// appends into a scratch at the cap therefore cannot grow it with any response
+/// the cap admits.
+///
+/// What the scratch *is* between responses is the codec's doing, not the
+/// encoder's. One that takes `serialize`'s sanctioned move into an empty buffer
+/// hands its own buffer over in place of the scratch, at whatever capacity that
+/// buffer came with — the cap bounds a payload's length, never its allocation.
+/// [`FrameEncoder::stage`] shrinks the scratch back toward the cap before each
+/// response, so nothing accumulates across them; that shrink is the only place
+/// the encoder itself can allocate after construction, and it does so only when
+/// the response before left the scratch over the cap.
 ///
 /// Staging and framing are two steps because a protobuf `bytes` field writes
 /// its varint length *before* its contents: the payload must be serialized
@@ -47,7 +52,7 @@ pub(crate) struct Staged<'a> {
 }
 
 impl<C: Codec> FrameEncoder<C> {
-    /// Builds an encoder, making its one allocation: a scratch at the cap.
+    /// Builds an encoder over a scratch big enough for a payload at the cap.
     pub(crate) fn new(codec: C, cap: FrameCap) -> Self {
         Self {
             codec,
@@ -86,12 +91,15 @@ impl<C: Codec> FrameEncoder<C> {
             });
         }
 
-        // Give back whatever a response the cap refused grew the scratch to —
-        // `Codec::serialize` writes into a `Vec`, so nothing can stop it growing
-        // one. Reclaiming at the top rather than on each failure arm is one site
-        // instead of three, at the cost of holding an oversized buffer until
-        // this encoder's next response. `shrink_to` never grows, so a codec that
-        // moved a smaller buffer of its own in keeps it.
+        // Shrink back toward the cap: a response the cap refused can have grown
+        // this scratch, and a codec that moved its own buffer in can have handed
+        // over one larger still. `shrink_to` never grows, so a smaller moved-in
+        // buffer is kept as it is. Doing this here rather than at each of the
+        // three exits below is one site instead of three, at the cost of holding
+        // an oversized buffer until this encoder's next response. Clearing is
+        // also what keeps the move shape reachable — the codec sees an empty
+        // buffer every time — so a moving codec never reuses the buffer it
+        // handed over.
         self.scratch.clear();
         self.scratch.shrink_to(self.cap.bytes());
         self.codec
