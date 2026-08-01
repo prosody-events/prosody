@@ -87,6 +87,8 @@ enum Mutation {
     AwaitedNonUtf8,
     AwaitedTooLong,
     AwaitedValueAbsent,
+    /// Exactly as many awaited names as a request may carry.
+    AwaitedAtBound,
     AwaitedOverBound,
 }
 
@@ -235,6 +237,14 @@ impl Case {
             Mutation::AwaitedValueAbsent => {
                 set_value(&mut headers, RESPONSE_AWAITED_HEADER, None);
             }
+            Mutation::AwaitedAtBound => {
+                let chosen = self.awaited[self.responder % self.awaited.len()];
+                drop_header(&mut headers, RESPONSE_AWAITED_HEADER);
+                headers.extend(
+                    (1..MAX_AWAITED).map(|_| header(RESPONSE_AWAITED_HEADER, OUTSIDER.as_bytes())),
+                );
+                headers.push(header(RESPONSE_AWAITED_HEADER, chosen.as_bytes()));
+            }
             Mutation::AwaitedOverBound => {
                 drop_header(&mut headers, RESPONSE_AWAITED_HEADER);
                 headers
@@ -254,10 +264,12 @@ impl Case {
 /// from the headers the way the parser derives it.
 fn expected(mutation: Mutation) -> Result<Option<RequestTag>, HeaderRejection> {
     match mutation {
-        Mutation::WellFormed | Mutation::WellFormedCommaResponder => Ok(Some(RequestTag::new(
-            RequestId::from_bytes(REQUEST_ID_BYTES),
-            NodeId::from_bytes(NODE_ID_BYTES),
-        ))),
+        Mutation::WellFormed | Mutation::WellFormedCommaResponder | Mutation::AwaitedAtBound => {
+            Ok(Some(RequestTag::new(
+                RequestId::from_bytes(REQUEST_ID_BYTES),
+                NodeId::from_bytes(NODE_ID_BYTES),
+            )))
+        }
         Mutation::NotAwaited | Mutation::NoReservedHeaders => Ok(None),
         Mutation::DuplicateVersion | Mutation::DuplicateRequestId | Mutation::DuplicateNode => {
             Err(HeaderRejection::DuplicateSingleton)

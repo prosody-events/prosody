@@ -27,6 +27,7 @@ use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::CellWrite;
 use crate::state_reader::ConsumerReaderBackend;
+use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::timers::store::TriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType};
@@ -43,6 +44,7 @@ struct PipelineMiddlewareStack {
     heartbeats: HeartbeatRegistry,
     telemetry: Telemetry,
     observer: KafkaObserver,
+    responder: Option<SubsystemName>,
 }
 
 impl PipelineMiddlewareStack {
@@ -77,7 +79,6 @@ impl PipelineMiddlewareStack {
         );
 
         let version: Arc<str> = Arc::from(self.common_config.dedup.version.as_str());
-        let responder = self.common_config.keyed_state.subsystem.clone();
 
         // This stack runs outer→inner as:
         //
@@ -113,7 +114,7 @@ impl PipelineMiddlewareStack {
                 telemetry: &self.telemetry,
                 heartbeats: self.heartbeats,
                 observer: self.observer,
-                responder,
+                responder: self.responder,
             },
         )
         .await
@@ -193,7 +194,7 @@ where
             monopolization,
             defer,
         } = pipeline_config;
-        let (components, _keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
+        let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
         let failure_tracker = FailureTracker::new(
             defer.failure_window,
             defer.failure_threshold,
@@ -210,6 +211,7 @@ where
             heartbeats,
             telemetry,
             observer,
+            responder: keyed_state.subsystem().cloned(),
         };
         let message_defer = MessageDeferMiddleware::new(
             defer,

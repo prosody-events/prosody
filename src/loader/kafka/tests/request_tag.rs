@@ -65,6 +65,21 @@ async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
         )
         .await?;
         let plain_offset = produce(&producer, topic_name, "plain", OwnedHeaders::new()).await?;
+        let malformed_offset = produce(
+            &producer,
+            topic_name,
+            "malformed",
+            OwnedHeaders::new()
+                .insert(Header {
+                    key: RESPONSE_VERSION_HEADER,
+                    value: Some("1"),
+                })
+                .insert(Header {
+                    key: RESPONSE_VERSION_HEADER,
+                    value: Some("1"),
+                }),
+        )
+        .await?;
 
         let config = LoaderConfiguration {
             responder: Some(SubsystemName::try_new(RESPONDER)?),
@@ -84,6 +99,14 @@ async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
             load(&loader, topic, plain_offset).await?,
             None,
             "a record that asked for no response must carry no destination"
+        );
+        // Asking for a response badly costs the request its destination, never
+        // the record its reload: a decode that discarded it would fail this
+        // load.
+        assert_eq!(
+            load(&loader, topic, malformed_offset).await?,
+            None,
+            "a record with unusable response headers must still reload"
         );
         Ok(())
     })

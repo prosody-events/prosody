@@ -1,12 +1,12 @@
 //! Decoding and validation of Kafka messages.
 //!
 //! This module provides functionality for converting rdkafka's
-//! `BorrowedMessage` into Prosody's `ConsumerMessage` type. The decoding
+//! `BorrowedMessage` into Prosody's [`DecodedMessage`] type. The decoding
 //! process includes:
 //!
 //! - Distributed tracing context extraction
 //! - Message header parsing (source system, and the reserved response headers)
-//! - JSON payload validation and parsing
+//! - Payload parsing via the configured codec
 //! - Key extraction and UTF-8 validation
 //! - Timestamp resolution from Kafka metadata
 //!
@@ -61,20 +61,12 @@ pub struct DecodedMessage<P> {
 
 /// Decodes and validates a Kafka message into a `DecodedMessage`.
 ///
-/// This function performs comprehensive message processing:
-/// 1. Extracts distributed tracing context from message headers
-/// 2. Reads the reserved response headers into a request tag
-/// 3. Parses and validates the payload via the provided codec
-/// 4. Extracts and validates the message key
-/// 5. Resolves the message timestamp from Kafka metadata
-///
 /// The decoded message contains immutable data and parent trace context.
 /// Callers create their own spans from the context, ensuring span lifecycles
 /// are independent of cache eviction.
 ///
 /// `responder` is the subsystem this consumer answers peer requests for, or
-/// `None` when it answers none. It is a required argument so no decode site can
-/// silently forget it and strip a request of its destination.
+/// `None` when it answers none.
 ///
 /// `message` is taken as `&mut` so the codec can parse the payload in place
 /// via `payload_mut`, avoiding a copy; its payload bytes are left in an
