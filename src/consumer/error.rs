@@ -7,7 +7,7 @@ use crate::consumer::middleware::scheduler::SchedulerInitError;
 use crate::consumer::middleware::timeout::TimeoutInitError;
 use crate::consumer::storage::StoreCreationError;
 use crate::error::ErrorCategory;
-use crate::state::config::KeyedStateConfigurationBuilderError;
+use crate::state::config::{KeyedStateConfigurationBuilderError, KeyedStateValidationError};
 use crate::state::registry::RegisterStateError;
 use crate::state_reader::StateReaderError;
 use crate::timers::duration::CompactDurationError;
@@ -156,6 +156,17 @@ pub enum KeyedStateInitError {
 impl From<KeyedStateConfigurationBuilderError> for ConsumerError {
     fn from(error: KeyedStateConfigurationBuilderError) -> Self {
         Self::KeyedState(KeyedStateInitError::Configuration(error))
+    }
+}
+
+impl From<KeyedStateValidationError> for ConsumerError {
+    fn from(error: KeyedStateValidationError) -> Self {
+        match error {
+            KeyedStateValidationError::Configuration(error) => Self::Configuration(error),
+            KeyedStateValidationError::Registration(error) => {
+                Self::KeyedState(KeyedStateInitError::Register(error))
+            }
+        }
     }
 }
 

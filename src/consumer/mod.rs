@@ -139,7 +139,9 @@ pub(crate) use crate::consumer::wiring::state::{
 };
 use crate::heartbeat::HeartbeatRegistry;
 pub use crate::otel::SpanRelation;
-pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
+pub use crate::state::config::{
+    KeyedStateConfiguration, KeyedStateConfigurationBuilderError, KeyedStateValidationError,
+};
 // `descriptor::Keyed` (the key-axis lifter) is deliberately not re-exported
 // here: it would shadow the message-routing `Keyed` trait re-exported here.
 pub use crate::state::descriptor::{CellResolver, CellType, FromSession, WithResolver};

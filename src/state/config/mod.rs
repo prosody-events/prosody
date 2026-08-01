@@ -15,8 +15,9 @@ use std::env;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use thiserror::Error;
 use uuid::Uuid;
-use validator::{Validate, ValidationError};
+use validator::{Validate, ValidationError, ValidationErrors};
 
 /// Environment variable for the local keyed-state cache directory.
 const STATE_CACHE_DIR_ENV: &str = "PROSODY_STATE_CACHE_DIR";
@@ -192,6 +193,21 @@ impl KeyedStateConfiguration {
             .nonzero()
     }
 
+    /// Validates the configuration and every registered descriptor.
+    ///
+    /// Bindings call this after mapping host-language definitions into typed
+    /// descriptors. All collection semantics remain owned by Prosody.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configuration field or descriptor registration
+    /// violates a keyed-state invariant.
+    pub fn validate(&self) -> Result<(), KeyedStateValidationError> {
+        Validate::validate(self)?;
+        self.build_registry()?;
+        Ok(())
+    }
+
     /// Registers `descriptor`'s collection, returning the [`Registered`]
     /// capability handle [`EventContext::state`] requires.
     ///
@@ -325,6 +341,18 @@ fn validate_read_cache_ttl(ttl: &Duration) -> Result<(), ValidationError> {
         return Err(ValidationError::new("read_cache_ttl_zero"));
     }
     Ok(())
+}
+
+/// A keyed-state configuration or descriptor registration was invalid.
+#[derive(Debug, Error)]
+pub enum KeyedStateValidationError {
+    /// A scalar configuration field failed validation.
+    #[error("invalid keyed-state configuration: {0:#}")]
+    Configuration(#[from] ValidationErrors),
+
+    /// A registered descriptor violated a collection invariant.
+    #[error(transparent)]
+    Registration(#[from] RegisterStateError),
 }
 
 #[cfg(test)]

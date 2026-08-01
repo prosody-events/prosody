@@ -1,4 +1,4 @@
-use super::KeyedStateConfiguration;
+use super::{KeyedStateConfiguration, KeyedStateValidationError};
 use crate::ByteSize;
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::codec::JsonCodec;
@@ -10,7 +10,6 @@ use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
 use std::path::PathBuf;
-use validator::Validate;
 
 fn cart() -> ValueDescriptor {
     value_state("cart")
@@ -184,15 +183,17 @@ fn keyset_limit_over_ceiling_is_rejected() -> Result<()> {
     let mut config = KeyedStateConfiguration::builder().build()?;
     let _ = config.register(map_state::<I64KeyCodec, JsonCodec>("m").keyset_limit(4097));
     assert!(matches!(
-        config.build_registry(),
-        Err(RegisterStateError::KeysetLimit { limit: 4097, .. })
+        config.validate(),
+        Err(KeyedStateValidationError::Registration(
+            RegisterStateError::KeysetLimit { limit: 4097, .. }
+        ))
     ));
 
     let mut ok = KeyedStateConfiguration::builder().build()?;
     let _ = ok.register(map_state::<I64KeyCodec, JsonCodec>("m4096").keyset_limit(4096));
     let _ = ok.register(map_state::<I64KeyCodec, JsonCodec>("m0").keyset_limit(0));
     assert!(
-        ok.build_registry().is_ok(),
+        ok.validate().is_ok(),
         "the ceiling and 0 both register cleanly"
     );
     Ok(())
