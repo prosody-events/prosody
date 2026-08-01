@@ -1,23 +1,17 @@
 //! The reader's read-through, byte-budgeted, TTL cache.
 //!
-//! `quick_cache` has no native TTL, so this module supplies one over it. Two
-//! rules make it race-free (see [`ReaderCache`]):
+//! `quick_cache` has no native TTL, so this module supplies one over it.
 //!
-//! * **Unique [`Stamp`]** `(issued, seq)`. Two fills can read one instant: a
-//!   mocked clock stands still between increments, and concurrent readers can
-//!   land on the same tick. A colliding stamp would let expiry evict a newer
-//!   fill. The per-bundle `seq` counter makes every issued store read's stamp
-//!   unique. See [`Stamp`] for how the two fields stay separate.
-//! * **Stamp taken at issue.** The stamp is taken when the store read is
-//!   issued, not when it completes. TTL therefore bounds the age since the read
-//!   began. A slow fill enters already-aged, so it cannot pass an old value off
-//!   as fresh to a future reader.
+//! The cache records when each store read begins, not when it completes. TTL
+//! therefore bounds the age since the read began. A slow fill enters
+//! already-aged, so it cannot pass an old value off as fresh to a future
+//! reader.
 //!
 //! The `age >= ttl` gate applies to cache hits only. A fill always serves the
 //! store result it just read. That result reflects committed state as of the
-//! fill's completion, so it is fresh no matter how long the fill took. Taking
-//! the stamp at issue only makes the cached entry expire conservatively for
-//! later readers. A completed fill is never re-checked and never re-run. The
+//! fill's completion, so it is fresh no matter how long the fill took. Using
+//! the issue time only makes the cached entry expire conservatively for later
+//! readers. A completed fill is never re-checked and never re-run. The
 //! retry in [`ReaderCache::get_cached`] re-reads the key only after evicting
 //! the stale entry it just observed, so each pass either drops an entry or
 //! takes the fill guard.
@@ -35,7 +29,6 @@ use quick_cache::Weighter;
 use quick_cache::sync::{Cache, DefaultLifecycle, EntryAction, EntryResult};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::task::coop::cooperative;
 
@@ -43,45 +36,14 @@ use tokio::task::coop::cooperative;
 /// so a zero-byte negative entry still costs the budget something.
 const READER_CACHE_ENTRY_OVERHEAD: u64 = 176;
 
-/// A cache entry's issue token. The two fields answer two different questions,
-/// so they are never combined into one ordering:
-///
-/// * `issued` governs TTL age (see [`ReaderCache::fresh`]): the time elapsed
-///   since observation began.
-/// * `seq` governs issue order (see [`ReaderCache::write_through`]'s
-///   newer-wins). The per-bundle atomic counter is the only total order of when
-///   reads were issued.
-///
-/// The clock is read before the separate `fetch_add` of `seq`. So a fill that
-/// read an earlier instant can still get a higher `seq` than one that read a
-/// later instant. Newer-wins therefore compares `seq` alone. Do not add an
-/// `Ord` derive and compare `(issued, seq)`: an older-issued fill could then
-/// overwrite a newer one, losing the newer write. Expiry compares the whole
-/// stamp for equality. The unique `seq` means `remove_if` never evicts a
-/// racing newer fill.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Stamp {
-    /// When the backing store read was issued, on a monotonic clock.
-    ///
-    /// TTL age is elapsed time, so it is never measured on the wall clock. A
-    /// backwards NTP step would floor every entry's age at zero and serve stale
-    /// values indefinitely. A forwards step would expire the whole cache at
-    /// once. A [`quanta::Instant`] only moves forward, so age is always the
-    /// real elapsed time.
-    issued: Instant,
-    /// Per-bundle monotonic issue counter, unique and totally ordered across
-    /// all issued reads — the newer-wins key.
-    seq: u64,
-}
-
 /// The cache key: the stable [`SourceId`], state namespace, collection name,
 /// partition key, and cell. The [`SourceId`] is stable, never an ordinal, so
 /// an entry never aliases another source across a snapshot reorder.
 pub(crate) type CacheKey = (SourceId, StateType, StateName, Key, CellKey);
 
-/// The cached value: the issue stamp and the committed bytes (or cached
+/// The cached value: the issue time and the committed bytes (or cached
 /// known-absence).
-type CacheVal = (Stamp, Option<Bytes>);
+type CacheVal = (Instant, Option<Bytes>);
 
 /// The concrete `quick_cache` instance the reader shares, byte-weighted and
 /// `ahash`-hashed.
@@ -120,7 +82,6 @@ impl Weighter<CacheKey, CacheVal> for ReaderWeighter {
 pub(crate) struct ReaderCache {
     inner: Arc<ReaderCacheInner>,
     clock: Clock,
-    seq: Arc<AtomicU64>,
 }
 
 impl ReaderCache {
@@ -154,7 +115,6 @@ impl ReaderCache {
         Self {
             inner: Arc::new(inner),
             clock,
-            seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -170,28 +130,14 @@ impl ReaderCache {
         self.clock.clone()
     }
 
-    /// A fresh, unique issue stamp: the clock's current instant and the next
-    /// issue sequence.
-    fn issue_stamp(&self) -> Stamp {
-        self.stamp_at(self.clock.now())
-    }
-
-    /// [`Self::issue_stamp`] at an explicit issue instant.
-    fn stamp_at(&self, issued: Instant) -> Stamp {
-        Stamp {
-            issued,
-            seq: self.seq.fetch_add(1, Ordering::Relaxed),
-        }
-    }
-
-    /// Whether an entry stamped `stamp` is still fresh under `ttl`.
-    fn fresh(&self, stamp: Stamp, ttl: Duration) -> bool {
-        self.clock.now().duration_since(stamp.issued) < ttl
+    /// Whether an entry issued at `issued` is still fresh under `ttl`.
+    fn fresh(&self, issued: Instant, ttl: Duration) -> bool {
+        self.clock.now().duration_since(issued) < ttl
     }
 
     /// The read-through point read. Serve a fresh hit. Expire a stale hit,
-    /// removing it only if it still carries the observed stamp, so a newer
-    /// racing fill is never evicted. Then refill single-flight through `fill`.
+    /// removing it only if it still carries the observed issue time. Then
+    /// refill single-flight through `fill`.
     ///
     /// # Errors
     ///
@@ -208,20 +154,20 @@ impl ReaderCache {
     {
         loop {
             match self.inner.get_value_or_guard_async(&key).await {
-                Ok((stamp, value)) => {
-                    if self.fresh(stamp, ttl) {
+                Ok((issued, value)) => {
+                    if self.fresh(issued, ttl) {
                         return Ok(value);
                     }
-                    // Stale for this reader: evict iff still this exact stamp,
-                    // then retry (a newer racing fill survives and is re-read).
+                    // Equal clock readings are interchangeable cache
+                    // observations. Removing either can only cause a refill.
                     self.inner
-                        .remove_if(&key, |(observed, _)| *observed == stamp);
+                        .remove_if(&key, |(observed, _)| *observed == issued);
                 }
                 Err(guard) => {
-                    // Single-flight: we own the fill. Stamp at issue.
-                    let stamp = self.issue_stamp();
+                    // Single-flight: we own the fill. Record its issue time.
+                    let issued = self.clock.now();
                     let value = fill().await?;
-                    let _ = guard.insert((stamp, value.clone()));
+                    let _ = guard.insert((issued, value.clone()));
                     return Ok(value);
                 }
             }
@@ -230,8 +176,8 @@ impl ReaderCache {
 
     /// The read-through batch read, index-aligned to `keys`. Serves the batch
     /// entirely from the cache when every key is a fresh hit. Otherwise it
-    /// issues one batch store read through `fill`, writes each key back
-    /// newer-wins, and returns the store answers.
+    /// issues one batch store read through `fill`, writes each key back, and
+    /// returns the store answers.
     ///
     /// # Errors
     ///
@@ -249,7 +195,7 @@ impl ReaderCache {
         let mut hits: CellBuffer<Option<Bytes>> = CellBuffer::with_capacity(keys.len());
         for key in keys {
             match self.inner.get(key) {
-                Some((stamp, value)) if self.fresh(stamp, ttl) => hits.push(value),
+                Some((issued, value)) if self.fresh(issued, ttl) => hits.push(value),
                 // A single miss refetches the whole batch, so probing the
                 // remaining keys is wasted work — stop at the first.
                 _ => break,
@@ -258,8 +204,8 @@ impl ReaderCache {
         if hits.len() == keys.len() {
             return Ok(hits);
         }
-        // One shared issue stamp for the whole batch fill.
-        let stamp = self.issue_stamp();
+        // One shared issue time for the whole batch fill.
+        let issued = self.clock.now();
         let fresh = fill().await?;
         // The store's batch read returns values index-aligned to `keys`. Check
         // that alignment here in every build, not just a debug assert. A shorter
@@ -276,46 +222,25 @@ impl ReaderCache {
             });
         }
         for (key, value) in keys.iter().zip(fresh.iter()) {
-            cooperative(self.write_through(key, stamp, value.clone())).await;
+            cooperative(self.write_through(key, issued, value.clone())).await;
         }
         Ok(fresh)
     }
 
-    /// Writes `value` for `key` newer-wins. Under the shard lock an occupied
-    /// entry keeps the higher-stamped value, so an older-issued fill that
-    /// completes late loses. An absent entry is inserted through the guard.
-    async fn write_through(&self, key: &CacheKey, stamp: Stamp, value: Option<Bytes>) {
+    /// Writes `value` for `key`. A fill replaces an observation issued earlier.
+    /// Equal instants are interchangeable cache observations.
+    async fn write_through(&self, key: &CacheKey, issued: Instant, value: Option<Bytes>) {
         let outcome = self
             .inner
             .entry_async(key, |_, existing: &mut CacheVal| {
-                // Newer-wins compares `seq` alone, never `(issued, seq)`.
-                // See [`Stamp`].
-                if stamp.seq > existing.0.seq {
-                    *existing = (stamp, value.clone());
+                if issued > existing.0 {
+                    *existing = (issued, value.clone());
                 }
                 EntryAction::Retain(())
             })
             .await;
         if let EntryResult::Vacant(guard) = outcome {
-            let _ = guard.insert((stamp, value));
+            let _ = guard.insert((issued, value));
         }
-    }
-
-    /// [`Self::write_through`] at an explicit issue instant, taking the next
-    /// issue sequence.
-    ///
-    /// The newer-wins pin needs an entry issued at an *earlier* instant with a
-    /// *later* sequence. In production that pair comes from two fills
-    /// interleaving between the clock read and the `seq` increment, which no
-    /// test can schedule deterministically, and a monotonic clock can never
-    /// hand it out in issue order. So the pin builds the pair here.
-    #[cfg(test)]
-    pub(crate) async fn write_through_at(
-        &self,
-        key: &CacheKey,
-        issued: Instant,
-        value: Option<Bytes>,
-    ) {
-        self.write_through(key, self.stamp_at(issued), value).await;
     }
 }

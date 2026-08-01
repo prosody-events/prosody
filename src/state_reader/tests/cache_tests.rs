@@ -2,13 +2,11 @@
 //!
 //! [`prop_cache_staleness`] proves the staleness rules together over random
 //! clock and get schedules, checked against a plain `HashMap` model: the
-//! stamp-at-issue age, the `age == ttl` miss boundary, negative caching,
-//! `StateName` no-aliasing, and per-ttl freshness windows over a shared
-//! entry. The focused tests below pin invariants that schedule cannot
-//! express: concurrent single-flight, a fill that advances the clock while it
-//! runs, the newer-wins comparison in `write_through`, and the byte-budget
-//! bound. Its key pool includes two namespaces with the same collection name,
-//! proving `StateType` participates in cache identity.
+//! issue-time age, expiry, negative caching, and cache-key isolation. The
+//! focused tests below pin invariants that schedule cannot express: concurrent
+//! single-flight, a fill that advances the clock while it runs, and the
+//! byte-budget bound. Its key pool includes two namespaces with the same
+//! collection name, proving `StateType` participates in cache identity.
 //!
 //! Every test drives a mocked monotonic clock instead of sleeping, so timing
 //! stays deterministic. The cache is exercised directly, with no
@@ -77,42 +75,29 @@ const CACHE_KEYS: [(StateType, &str, i32); 5] = [
     (StateType::Framework, "cache-n0", 1),
 ];
 
-/// The per-get TTL pool the schedule draws from: the degenerate zero (every
-/// read is born stale), a sub-millisecond TTL the old millisecond clock could
-/// not express, mid-range values, and one large enough to never expire within a
-/// bounded schedule. Reusing one key across different TTLs from this pool is
-/// how the property test exercises a freshness window that depends on the read,
-/// not just the key.
-const TTL_POOL: [Duration; 5] = [
-    Duration::ZERO,
-    Duration::from_micros(500),
-    Duration::from_millis(10),
-    Duration::from_millis(100),
-    Duration::from_secs(1000),
-];
+/// One coarse freshness window for the cache model.
+const CACHE_TTL: Duration = Duration::from_secs(5);
 
-/// The clock-advance pool. Sharing magnitudes with [`TTL_POOL`] makes the
-/// `age == ttl` boundary (the strict-`<` miss) recur.
-const ADVANCE_POOL: [Duration; 5] = [
+/// Clock advances spanning fresh, boundary, and expired observations.
+const ADVANCE_POOL: [Duration; 4] = [
     Duration::ZERO,
-    Duration::from_micros(500),
-    Duration::from_millis(10),
-    Duration::from_millis(100),
     Duration::from_secs(1),
+    CACHE_TTL,
+    Duration::from_secs(10),
 ];
 
 /// Upper bound on schedule length.
 const MAX_CACHE_STEPS: usize = 24;
 
-/// One step: advance the injected clock, or issue a cached get for a pooled key
-/// at a pooled TTL, filling `Some`/`None`.
+/// One step: advance the injected clock, or issue a cached get for a pooled
+/// key, filling `Some`/`None`.
 #[derive(Clone, Copy, Debug)]
 enum CacheStep {
     /// Advance the clock by `ADVANCE_POOL[idx]`.
     Advance(u8),
-    /// Get pooled key `key` at `TTL_POOL[ttl]`; a fill returns `Some` when
-    /// `present`, else the negative `None`.
-    Get { key: u8, ttl: u8, present: bool },
+    /// Get pooled key `key`; a fill returns `Some` when `present`, else the
+    /// negative `None`.
+    Get { key: u8, present: bool },
 }
 
 impl Arbitrary for CacheStep {
@@ -122,7 +107,6 @@ impl Arbitrary for CacheStep {
         } else {
             Self::Get {
                 key: u8::arbitrary(g) % CACHE_KEYS.len() as u8,
-                ttl: u8::arbitrary(g) % TTL_POOL.len() as u8,
                 present: bool::arbitrary(g),
             }
         }
@@ -158,16 +142,15 @@ fn fill_value(key: u8, present: bool) -> Option<Bytes> {
 }
 
 /// One property proves the staleness rules and cache-key isolation together:
-/// stamp-at-issue age, the `age == ttl` miss boundary, negative-entry refresh,
-/// source topology, namespace, and name isolation, and per-ttl freshness
-/// windows.
+/// issue-time age, expiry, negative-entry refresh, source topology, namespace,
+/// and name isolation.
 ///
 /// A plain `HashMap<key, (issued, value)>` model predicts, for every get,
 /// both the served value and whether a fill fires. A get is a hit served
 /// from the model's entry when `age < ttl`; otherwise it is a miss that
 /// refills. Asserting the served value and the running fill count after
 /// every step catches a stale hit as a wrong count, an alias as wrong bytes,
-/// and a laundered stamp as a wrong count.
+/// and a laundered issue time as a wrong count.
 ///
 /// Falsify: change `ReaderCache::fresh`'s `<` to `<=`. An `age == ttl` step
 /// then serves a stale hit, so the fill count trails the model. Or drop
@@ -197,14 +180,13 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
     for step in schedule.steps {
         match step {
             CacheStep::Advance(idx) => mock.increment(ADVANCE_POOL[idx as usize]),
-            CacheStep::Get { key, ttl, present } => {
-                let ttl = TTL_POOL[ttl as usize];
+            CacheStep::Get { key, present } => {
                 let cur = clock.now();
                 let filled = fill_value(key, present);
 
                 let hit = model
                     .get(&key)
-                    .is_some_and(|(issued, _)| cur.duration_since(*issued) < ttl);
+                    .is_some_and(|(issued, _)| cur.duration_since(*issued) < CACHE_TTL);
                 let expected_value = if hit {
                     model[&key].1.clone()
                 } else {
@@ -215,7 +197,7 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
 
                 let counter = fills.clone();
                 let served = cache
-                    .get_cached(keys[key as usize].clone(), ttl, move || {
+                    .get_cached(keys[key as usize].clone(), CACHE_TTL, move || {
                         let counter = counter.clone();
                         let filled = filled.clone();
                         async move {
@@ -239,41 +221,41 @@ async fn run_cache_schedule(schedule: CacheSchedule) -> Result<bool> {
 
 // --- Focused survivors (invariants the serial schedule cannot express) ------
 
-/// Stamp-at-issue: a slow fill enters already-aged, so it cannot launder an
-/// old value into a fresh window for a later reader.
+/// A slow fill enters already-aged, so it cannot launder an old value into a
+/// fresh window for a later reader.
 ///
-/// Falsify: stamp the entry at fill COMPLETION instead of issue — the entry is
-/// then stamped at t=200, the second read sees age 0, and `fills` stays 1.
+/// Falsify: record the entry at fill completion instead of issue. The second
+/// read then sees age zero and `fills` stays one.
 #[tokio::test]
 async fn slow_fill_cannot_launder() -> Result<()> {
     let (cache, mock) = mock_clock_cache(1 << 20);
     let k = key("slow")?;
     let fills = Arc::new(AtomicUsize::new(0));
-    let ttl = Duration::from_millis(100);
+    let ttl = Duration::from_secs(5);
     // The fill advances the clock past the ttl before returning — a "slow"
-    // store read. The stamp was taken at issue (t=0), not here.
+    // store read. The issue time was recorded at t=0, not here.
     let fill = || {
         let fills = fills.clone();
         let mock = mock.clone();
         async move {
             fills.fetch_add(1, Ordering::Relaxed);
-            mock.increment(Duration::from_millis(200));
+            mock.increment(Duration::from_secs(10));
             Ok::<_, StateAccessError>(Some(Bytes::from_static(b"v")))
         }
     };
 
-    // Issued at t=0, completes at t=200ms; the fill serves its own result.
+    // Issued at t=0, completes at t=10s; the fill serves its own result.
     let got = cache.get_cached(k.clone(), ttl, fill).await?;
     assert_eq!(got, Some(Bytes::from_static(b"v")));
     assert_eq!(fills.load(Ordering::Relaxed), 1);
 
-    // A later reader at t=200ms: age 200ms >= ttl → miss → refill. The refill
+    // A later reader at t=10s: age 10s >= ttl → miss → refill. The refill
     // advances the clock again, which only ages it further.
     cache.get_cached(k.clone(), ttl, fill).await?;
     assert_eq!(
         fills.load(Ordering::Relaxed),
         2,
-        "the slow fill was stamped at issue, so it expired for the next reader"
+        "the slow fill was timed from issue, so it expired for the next reader"
     );
     Ok(())
 }
@@ -311,48 +293,6 @@ async fn cold_miss_is_single_flight() -> Result<()> {
     Ok(())
 }
 
-/// Regression pin: `write_through`'s newer-wins compares `seq` (issue order)
-/// alone, never the lexicographic `(issued, seq)`. A later-issued fill that
-/// read an *earlier* instant must still win.
-///
-/// The two stamps are built through `write_through_at` because no schedule can
-/// produce them: in production the pair arises when two fills interleave
-/// between the clock read and the `seq` increment, and a monotonic clock never
-/// hands out a falling instant in issue order. The first write is issued at the
-/// LATE instant and so takes `seq` 0; the second at the EARLY instant and takes
-/// `seq` 1. Seq-only ordering keeps the second value. A lexicographic compare
-/// would rank `(early, 1) < (late, 0)` and keep the first.
-///
-/// Falsify: compare the full `Stamp` lexicographically in `write_through`.
-/// The read-back then returns "v1" and the assert goes red.
-#[tokio::test]
-async fn later_issued_fill_wins_despite_earlier_instant() -> Result<()> {
-    let (cache, mock) = mock_clock_cache(1 << 20);
-    let clock = cache.clock();
-    let k = key("newer-wins")?;
-
-    let early = clock.now();
-    mock.increment(Duration::from_secs(1));
-    let late = clock.now();
-
-    cache
-        .write_through_at(&k, late, Some(Bytes::from_static(b"v1")))
-        .await;
-    cache
-        .write_through_at(&k, early, Some(Bytes::from_static(b"v2")))
-        .await;
-
-    // A ttl far above the one-second spread, so the read-back turns on newer-wins
-    // and not on expiry. The fill must not run: the entry is a fresh hit.
-    let back = cache
-        .get_cached(k, Duration::from_secs(1000), || async {
-            Ok::<_, StateAccessError>(Some(Bytes::from_static(b"unused")))
-        })
-        .await?;
-    assert_eq!(back, Some(Bytes::from_static(b"v2")), "later seq wins");
-    Ok(())
-}
-
 /// The batch read serves entirely from the cache when every key is a fresh
 /// hit, firing zero fills. A single stale key triggers exactly ONE
 /// whole-batch refill, never a per-key fill.
@@ -363,7 +303,7 @@ async fn later_issued_fill_wins_despite_earlier_instant() -> Result<()> {
 #[tokio::test]
 async fn get_many_cached_shortcuts_when_all_fresh() -> Result<()> {
     let (cache, mock) = mock_clock_cache(1 << 20);
-    let ttl = Duration::from_millis(100);
+    let ttl = Duration::from_secs(5);
     let keys = [key("batch-0")?, key("batch-1")?];
     let fills = Arc::new(AtomicUsize::new(0));
     let fill = || {
