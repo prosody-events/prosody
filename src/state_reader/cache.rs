@@ -31,7 +31,6 @@ use std::future::Future;
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::task::coop::cooperative;
 
 /// Inline key and value storage. Rust computes the target-specific layout,
 /// including padding and alignment. Quick Cache's private allocations are not
@@ -224,23 +223,24 @@ impl ReaderCache {
             });
         }
         for (key, value) in keys.iter().zip(fresh.iter()) {
-            cooperative(self.write_through(key, issued, value.clone())).await;
+            self.write_through(key, issued, value.clone());
         }
         Ok(fresh)
     }
 
     /// Writes `value` for `key`. A fill replaces an observation issued earlier.
-    /// Equal instants are interchangeable cache observations.
-    async fn write_through(&self, key: &CacheKey, issued: Instant, value: Option<Bytes>) {
+    /// Equal instants are interchangeable cache observations. An in-flight
+    /// fill wins placeholder contention; caching must not delay a completed
+    /// store read.
+    fn write_through(&self, key: &CacheKey, issued: Instant, value: Option<Bytes>) {
         let outcome = self
             .inner
-            .entry_async(key, |_, existing: &mut CacheVal| {
+            .entry(key, Some(Duration::ZERO), |_, existing: &mut CacheVal| {
                 if issued > existing.0 {
                     *existing = (issued, value.clone());
                 }
                 EntryAction::Retain(())
-            })
-            .await;
+            });
         if let EntryResult::Vacant(guard) = outcome {
             let _ = guard.insert((issued, value));
         }
