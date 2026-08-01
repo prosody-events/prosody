@@ -1,8 +1,7 @@
-//! Message loaders for the defer middleware.
+//! Message loaders for exact Kafka coordinates.
 //!
 //! This module provides abstractions for loading messages by their exact offset
-//! coordinates. The defer middleware uses loaders to reload failed messages
-//! when retry timers fire.
+//! coordinates. Deferral and keyed state share the same loader.
 //!
 //! # Implementations
 //!
@@ -17,10 +16,8 @@
 //! loading implementations. Each loader returns a [`ConsumerMessage`] with
 //! appropriate backpressure (via semaphore permits) and tracing context.
 //!
-//! Error types must implement [`ClassifyError`] so the defer middleware can
-//! distinguish permanent failures (message deleted, decode error) from
-//! transient failures (network issues, timeouts) and apply appropriate retry
-//! logic.
+//! Error types implement [`ClassifyError`] so each caller can apply its retry
+//! policy.
 
 use crate::consumer::message::ConsumerMessage;
 use crate::error::ClassifyError;
@@ -43,22 +40,20 @@ enum PermitMode {
     Available,
 }
 
-/// Loads messages by their exact offset coordinates for retry.
+/// Loads messages by their exact offset coordinates.
 ///
 /// This trait abstracts message loading to enable different implementations:
 /// - [`KafkaLoader`] for production (loads from Kafka)
 /// - [`MemoryLoader`] for testing (loads from in-memory map)
 ///
-/// The loader is used by defer middleware to reload failed messages when their
-/// retry timer fires.
+/// Deferral and keyed state share this interface.
 pub trait MessageLoader: Send + Sync + Clone {
     /// The payload type of messages returned by this loader.
     type Payload: Send + Sync + 'static;
 
     /// Error type for load operations.
     ///
-    /// Must implement [`ClassifyError`] so the defer middleware can determine
-    /// if load failures are permanent (message deleted) or transient (network).
+    /// Classifies permanent data loss separately from transient failures.
     type Error: StdError + ClassifyError + Send + Sync + 'static;
 
     /// Loads a specific message from storage by its exact coordinates.

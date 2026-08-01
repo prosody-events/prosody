@@ -12,7 +12,7 @@ environment variables for unset fields, so you can mix both approaches.
 | `PROSODY_SUBSCRIBED_TOPICS` | Topics to read from                                | -            | ✓        |          |
 | `PROSODY_ALLOWED_EVENTS`    | Only process events matching these prefixes        | (all)        | ✓        |          |
 | `PROSODY_SOURCE_SYSTEM`     | Tag for outgoing messages (prevents reprocessing)  | `<group id>` |          | ✓        |
-| `PROSODY_SUBSYSTEM`         | Subsystem name used to advertise published collections | -        | ✓        |          |
+| `PROSODY_SUBSYSTEM`         | Subsystem name used to advertise published JSON collections | -    | ✓        |          |
 | `PROSODY_MOCK`              | Use in-memory Kafka for testing                    | false        | ✓        | ✓        |
 | `PROSODY_LOG`               | Log level (e.g., `info`, `prosody=debug`)          | info         | ✓        | ✓        |
 
@@ -62,7 +62,7 @@ When a handler fails, retry with exponential backoff:
 | `PROSODY_DEFER_FAILURE_WINDOW`    | Measure failure rate over this time window        | 5m      |
 | `PROSODY_DEFER_STORE_CACHE_SIZE`  | `(key → next_offset/next_timer, retry_count)` entries cached per Cassandra defer store | 8192    |
 
-## Message Loader (Pipeline Mode)
+## Kafka Message Loader (All Modes)
 
 The Kafka message loader is consumer-wide: it serves both deferred-message
 reloads and keyed-state message resolution.
@@ -73,14 +73,14 @@ reloads and keyed-state message resolution.
 | `PROSODY_LOADER_SEEK_TIMEOUT`     | Timeout for Kafka seek operations when loading         | 30s     |
 | `PROSODY_LOADER_DISCARD_THRESHOLD`| Sequential reads before seeking (rarely needs changing)| 100     |
 
-## Keyed State (Pipeline Mode)
+## Keyed State
 
 | Environment Variable                 | Description                                        | Default                  |
 |--------------------------------------|----------------------------------------------------|--------------------------|
 | `PROSODY_STATE_CACHE_DIR`            | Disk workspace for the local keyed-state cache. Wiped on restart, so it needs no persistence — but production deployments **must** set it to a mounted path (e.g. a Kubernetes `emptyDir`). | per-process temp dir |
 | `PROSODY_STATE_OWNED_CACHE_SIZE`     | Capacity of the owning keyed-state cache. Accepts sizes such as `64 MiB` or `500 MB`. | storage-engine default |
 | `PROSODY_STATE_RECOVERY_DELAY` | Grace period before a background sweep reconciles a freshly written value, in case the fast path did not. Rarely needs changing; second-granularity and must be at least `1s`. | 30s |
-| `PROSODY_STATE_READ_CACHE_SIZE` | Capacity of the read-only client's shared read-through cache. Accepts sizes such as `1 MiB`. | follows `PROSODY_STATE_OWNED_CACHE_SIZE`, then 1 MiB |
+| `PROSODY_STATE_READ_CACHE_SIZE` | Capacity of the read-only client's shared read-through cache. Accepts sizes such as `1 MiB`. | `PROSODY_STATE_OWNED_CACHE_SIZE` when set; otherwise 1 MiB |
 | `PROSODY_STATE_READ_CACHE_TTL` | Default read-cache TTL for composed readers: how long a `StateReader` may serve a collection's reads from its cache before re-reading the store. A humantime duration (`5s`, `750ms`); `none` disables the inherited default. A descriptor can replace it with `.read_cache(duration)` or bypass it with `.read_cache(ReadCachePolicy::Disabled)`. Reader-only — never affects the owning consumer's writes or a collection's durable TTL. | 5s |
 
 `PROSODY_SUBSYSTEM` names the service's published keyed state. Set it whenever
@@ -102,7 +102,7 @@ stale routing information, so readers may continue to discover the collection.
 
 ## Cassandra
 
-Persistent storage for scheduled retries and deduplication (not needed if `PROSODY_MOCK=true`):
+Persistent storage for timers, deferral, deduplication, and keyed state. It is not needed when `PROSODY_MOCK=true`.
 
 | Environment Variable           | Description                        | Default |
 |--------------------------------|------------------------------------|---------|
@@ -114,9 +114,9 @@ Persistent storage for scheduled retries and deduplication (not needed if `PROSO
 | `PROSODY_CASSANDRA_RACK`       | Prefer this rack for queries       | -       |
 | `PROSODY_CASSANDRA_RETENTION`  | Delete data older than this        | 1y      |
 
-## Telemetry Emitter
+## Telemetry
 
-Publishes message and timer lifecycle events to a Kafka topic:
+Publishes message, timer, and producer lifecycle events to a Kafka topic:
 
 | Environment Variable        | Description                                | Default                  |
 |-----------------------------|--------------------------------------------|--------------------------|

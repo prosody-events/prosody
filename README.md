@@ -211,7 +211,8 @@ with `PROSODY_STATE_READ_CACHE_TTL` (`none` disables caching), or per
 collection with `.read_cache(...)`, which always wins over the process
 default. `PROSODY_STATE_OWNED_CACHE_SIZE` and
 `PROSODY_STATE_READ_CACHE_SIZE` accept human-readable values such as `64 MiB`;
-the read cache follows the owned cache size unless overridden. Pass
+the read cache uses `PROSODY_STATE_OWNED_CACHE_SIZE` when set, or 1 MiB when
+both size variables are unset. Pass
 `ReadCachePolicy::Disabled` to `.read_cache(...)` when one
 collection must always read the store despite an enabled process default. A
 cached value was the store's committed answer within the last cache TTL. There

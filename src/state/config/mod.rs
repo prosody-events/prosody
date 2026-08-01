@@ -126,10 +126,10 @@ pub struct KeyedStateConfiguration {
     /// Byte budget for the reader-side read-through cache. The high-level
     /// client sizes this cache when it composes standalone readers.
     ///
-    /// `None` (the default) follows
-    /// [`owned_cache_size`](Self::owned_cache_size), then a built-in default,
-    /// so one setting covers both caches unless overridden. Only the composing
-    /// client reads this value. A consumer never opens a reader cache.
+    /// `None` (the default) uses
+    /// [`owned_cache_size`](Self::owned_cache_size) when it is set. It uses
+    /// 1 MiB when both sizes are unset. Only the composing client reads this
+    /// value. A consumer never opens a reader cache.
     ///
     /// Environment variable: `PROSODY_STATE_READ_CACHE_SIZE`. Accepts a
     /// positive human-readable byte size such as `1 MiB`. A bare number is
