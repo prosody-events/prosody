@@ -43,11 +43,11 @@ environment variables for unset fields, so you can mix both approaches.
 
 ## Retry
 
-When a handler fails, retry with exponential backoff:
+Retry backoff applies in pipeline and low-latency modes. `PROSODY_MAX_RETRIES` controls how many retries low-latency mode performs before routing the failure to `PROSODY_FAILURE_TOPIC`. Pipeline mode uses deferral and does not use this limit.
 
 | Environment Variable      | Description                      | Default |
 |---------------------------|----------------------------------|---------|
-| `PROSODY_MAX_RETRIES`     | Give up after this many attempts | 3       |
+| `PROSODY_MAX_RETRIES`     | Low-latency retries before routing to the failure topic | 3       |
 | `PROSODY_RETRY_BASE`      | Wait this long before first retry | 20ms    |
 | `PROSODY_RETRY_MAX_DELAY` | Never wait longer than this      | 5m      |
 

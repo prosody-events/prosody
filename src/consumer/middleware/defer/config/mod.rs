@@ -54,7 +54,7 @@ pub struct DeferConfiguration {
     )]
     pub max_delay: Duration,
 
-    /// Failure rate threshold for enabling deferral (0.0 to 1.0).
+    /// Failure rate threshold for disabling deferral (0.0 to 1.0).
     ///
     /// When failure rate exceeds this threshold within the failure window,
     /// deferral is disabled to prevent cascading failures.
@@ -71,7 +71,7 @@ pub struct DeferConfiguration {
     /// Time window for failure rate tracking.
     ///
     /// Failures are counted within this sliding window to determine
-    /// whether to enable deferral.
+    /// whether deferral remains enabled.
     ///
     /// Environment variable: `PROSODY_DEFER_FAILURE_WINDOW`
     /// Default: 5 minutes
