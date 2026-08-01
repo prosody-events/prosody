@@ -1,4 +1,4 @@
-use super::{KeyedStateConfiguration, KeyedStateValidationError};
+use super::KeyedStateConfiguration;
 use crate::ByteSize;
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::codec::JsonCodec;
@@ -183,17 +183,15 @@ fn keyset_limit_over_ceiling_is_rejected() -> Result<()> {
     let mut config = KeyedStateConfiguration::builder().build()?;
     let _ = config.register(map_state::<I64KeyCodec, JsonCodec>("m").keyset_limit(4097));
     assert!(matches!(
-        config.validate(),
-        Err(KeyedStateValidationError::Registration(
-            RegisterStateError::KeysetLimit { limit: 4097, .. }
-        ))
+        config.build_registry(),
+        Err(RegisterStateError::KeysetLimit { limit: 4097, .. })
     ));
 
     let mut ok = KeyedStateConfiguration::builder().build()?;
     let _ = ok.register(map_state::<I64KeyCodec, JsonCodec>("m4096").keyset_limit(4096));
     let _ = ok.register(map_state::<I64KeyCodec, JsonCodec>("m0").keyset_limit(0));
     assert!(
-        ok.validate().is_ok(),
+        ok.build_registry().is_ok(),
         "the ceiling and 0 both register cleanly"
     );
     Ok(())
