@@ -14,8 +14,10 @@ use thiserror::Error;
 /// [`ErrorCategory`]) so the error type needs no generics.
 #[derive(Debug, Error)]
 pub enum StateAccessError {
-    /// This context does not provide keyed state (the default for every
-    /// context outside the keyed-state middleware).
+    /// Keyed state is not reachable. Two paths raise it: a context that
+    /// provides no keyed state, and a reader range read that reached execution
+    /// with no selected source. The second path is unconstructable through the
+    /// collection API.
     #[error("keyed state is unavailable on this context")]
     Unavailable,
 

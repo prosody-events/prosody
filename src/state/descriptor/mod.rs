@@ -61,12 +61,17 @@
 //! that only the layout macro emits *seals* it. A kind can therefore exist only
 //! inside this crate, and never without a declared durable layout.
 //!
-//! [`StateDescriptor`] is sealed the same way (by the crate-private
-//! `SealedDescriptor` supertrait): a downstream crate can register and bind the
-//! framework's descriptors but cannot add its own impl, so no custom descriptor
-//! can receive the raw session from `bind`. The two seals cover different
-//! things — [`CollectionSpec`] seals cell *reach* for kinds, this seals
-//! descriptor *authorship*.
+//! [`StateDescriptor`] is sealed the same way, by the crate-private
+//! `SealedDescriptor` supertrait. A downstream crate can register and bind the
+//! framework's descriptors but cannot add its own impl. That is what keeps
+//! identity honest: [`DescriptorIdentity`] is unsealed and
+//! [`StructuralIdentity`]'s fields are `pub`, so without the seal a downstream
+//! type could claim any (kind, format, resolver, key format) tuple for any name
+//! and hand it to
+//! [`KeyedStateConfiguration::register`](crate::consumer::KeyedStateConfiguration::register)
+//! or [`EventContext::state`](crate::consumer::event_context::EventContext::state).
+//! The two seals cover different things — [`CollectionSpec`] seals cell *reach*
+//! for kinds, this seals descriptor *authorship*.
 
 use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -354,13 +359,9 @@ pub trait DescriptorIdentity {
 /// Seals [`StateDescriptor`]. The trait is crate-internal (declared `pub`
 /// inside a `pub(crate)` module so it caps at crate visibility yet reads as the
 /// supertrait of the `pub` [`StateDescriptor`] without the `private_bounds`
-/// lint), so only the framework's two descriptor carriers implement it —
-/// [`Descriptor<K>`] (with its public
-/// [`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`] aliases) and the
-/// crate-internal access tunnels (`LifecycleAccess` and `MarkerAccess` in
-/// [`crate::state::session`]). A downstream crate can name [`StateDescriptor`]
-/// in bounds and call `bind`, but cannot add an impl — so it can never hand its
-/// own `bind` a raw session and reach cells outside a scoped operation.
+/// lint), so no impl can exist outside this crate. A downstream crate can name
+/// [`StateDescriptor`] in bounds and call `bind`, but cannot add an impl. See
+/// the module's Exposure note for what that buys.
 pub(crate) mod sealed {
     use super::Descriptor;
 
@@ -384,10 +385,8 @@ pub(crate) use sealed::SealedDescriptor;
 /// Each of that handle's methods runs as one scoped operation. A stream method
 /// runs a planning operation, then drives its plan outside that operation.
 ///
-/// Sealed by the crate-private `SealedDescriptor` supertrait: the only impls
-/// are the framework's own [`Descriptor<K>`] and its crate-internal access
-/// tunnels, so `bind`'s raw-session access stays framework-only (see the
-/// module's Exposure note).
+/// Sealed by the crate-private `SealedDescriptor` supertrait; see the module's
+/// Exposure note.
 pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     /// Typed handle returned by [`Self::bind`]; owns a clone of the binding
     /// session.

@@ -142,16 +142,7 @@ where
         session: &KeyedStateSession<B, L>,
         inner: &MutatePermit<'_>,
     ) -> Result<(), StateAccessError> {
-        if !session.attempt_current() {
-            return Err(StateAccessError::Terminated);
-        }
-        if inner.is_closed() {
-            return Err(StateAccessError::SessionClosed);
-        }
-        if session.is_terminated() {
-            return Err(StateAccessError::Terminated);
-        }
-        Ok(())
+        session.check_write_admission(inner)
     }
 
     fn apply(
@@ -186,9 +177,8 @@ where
         state_type: StateType,
         name: &StateName,
     ) -> Result<StoreOutcome, StateAccessError> {
-        let _permit = session.mutate_permit().await?;
-        ensure_live(session)?;
-        session.commit(state_type, name).await
+        let permit = session.mutate_permit().await?;
+        session.commit(&permit, state_type, name).await
     }
 
     async fn rollback(

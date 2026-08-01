@@ -2,8 +2,7 @@
 //!
 //! A Deque is a window of cells over a monotonic `i64` index space. Every
 //! [`DequeHandle`] method runs as one scoped operation over the bound
-//! collection. There is no Deque-specific store or session, and no branch on
-//! the bound engine.
+//! collection.
 //!
 //! To use one, build a descriptor with [`deque_state`], register it with the
 //! consumer, then bind the [`Registered`](super::Registered) handle through
@@ -37,8 +36,8 @@
 //!
 //! Co-stamping keeps the window move and its entry mutation together. One
 //! invocation stages both into one journal. They buffer as one op, and they
-//! stage under one settle marker with one write TS/TTL (see
-//! [`KeyedStateSession::finalize`](crate::state::session)). Recovery therefore
+//! stage under one settle marker with one write TS/TTL, applied by the
+//! session's settle-time `finalize`. Recovery therefore
 //! restores both together, whatever the batching does.
 //!
 //! A mid-handler [`DequeHandle::commit`] drains them resolved and marker-free,
@@ -459,7 +458,7 @@ where
         // `DEQUE_POINT_ITERATION_MAX` bounds this buffer at 128 × 8 B ≈ 1 KiB.
         // This code sizes it once and pays it once per stream construction,
         // never in the per-item steady state. Owned indices are what let one
-        // driver serve the owner and the reader with no runtime branch.
+        // driver serve both the owner and the reader.
         let mut indices: Vec<i64> = Vec::with_capacity(len);
         indices.extend((0..len).map(|position| head + position as i64));
         if dir == Direction::Backward {
@@ -495,13 +494,14 @@ where
     /// fails at a page boundary. Within a chunk the error is atomic, so a
     /// failing chunk yields none of its items.
     ///
-    /// The stream takes session admission only for the init bounds read and
-    /// once per chunk, at most `STREAM_CHUNK` point reads each. A chunk's
-    /// admission covers its batch fetch, and the stream releases that admission
-    /// before it decodes and resolves the chunk. The stream therefore holds no
-    /// admission across a yield, for items and errors alike. A handler may
-    /// mutate this deque between stream items without deadlock
-    /// (`StreamYieldFree`; see [`SessionGate`](crate::state::session)).
+    /// The stream takes session admission at init for the bounds read. The
+    /// point arm then takes it once per chunk, at most `STREAM_CHUNK` point
+    /// reads each: a chunk's admission covers its batch fetch, and the stream
+    /// releases it before it decodes and resolves the chunk. The scan arm takes
+    /// no admission after init and pages gate-free. Neither arm holds admission
+    /// across a yield, for items and errors alike, so a handler may mutate this
+    /// deque between stream items without deadlock (`StreamYieldFree`, over the
+    /// per-event session operation gate).
     pub fn stream(
         &self,
         dir: Direction,
@@ -540,10 +540,7 @@ where
     /// # Bounded capacity
     ///
     /// On a deque registered with a `capacity`, a push first evicts from the
-    /// **front** toward the cap (see the module's capacity invariant). It
-    /// evicts up to `TRIM_MAX` slots per push. Each eviction is one single-cell
-    /// clear, staged beside the append and the bounds move. It runs no decode
-    /// and no resolver, and it discards the evicted value.
+    /// **front** toward the cap (see the module's capacity invariant).
     ///
     /// The evictions and the append stage as one transaction. A
     /// `ReadCommitted` rollback restores the evicted front slots.
@@ -735,13 +732,9 @@ where
 }
 
 impl<T> Descriptor<DequeKind<T>> {
-    /// Bounds this deque to at most `capacity` window slots, enforced lazily on
-    /// push: a `push_back` evicts from the front and a `push_front` from the
-    /// back, at most `TRIM_MAX` slots per push and decode-free (see the
-    /// module's capacity invariant). Runtime-only — never persisted, not part
-    /// of identity, and freely changed (bounded ⇄ unbounded) across
-    /// redeploys, so a reduction converges over the next pushes rather than
-    /// atomically. `NonZeroUsize` keeps `0` unrepresentable.
+    /// Bounds this deque to at most `capacity` window slots. Enforcement is
+    /// lazy and push-only; see the module's capacity invariant.
+    /// `NonZeroUsize` keeps `0` unrepresentable.
     ///
     /// Available on Deque registrations only — a capacity on a Value or Map is
     /// uncompilable, since this inherent method exists only at this type.
@@ -972,7 +965,7 @@ where
     MetaFrame(#[from] MetaCodecError),
 }
 
-/// A raw access refusal reaches the handle as the access arm of a cell error.
+/// An access refusal reaches the handle as the access arm of a cell error.
 /// That is the shape the scoped write invocation's final fence reports.
 impl<E> From<StateAccessError> for DequeStateError<E>
 where

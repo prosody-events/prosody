@@ -11,8 +11,9 @@
 //! The focused tests below cover invariants the script model does not
 //! express: `get_many` batch error precedence, `get_many` single-source
 //! splicing, a mid-stream scan error after a source has pinned, a source-call
-//! trace proving a pinned scan never opens the decoy source, and the
-//! session-wide reuse of one selection across scoped operations.
+//! trace proving a pinned scan never opens the decoy source, the overlap of two
+//! concurrent reads on one reader, and the session-wide reuse of one selection
+//! across scoped operations.
 
 use super::support::{
     FaultPoint, GROUP_A, GROUP_B, ScriptedEnv, collect_stream, source_state_key, topic,
@@ -161,10 +162,10 @@ fn selection(script: &FaultScript) -> Selection {
 /// holds for the point fan-out (`get`/`len`) and for the pinned scan,
 /// `stream` in both directions.
 ///
-/// FALSIFICATION: short-circuit `Err` at the first source in `ReadSession::get`
-/// (session.rs) instead of skipping. A `FaultOpen`-then-`Data` script then
-/// errors where data exists. Reverse the snapshot source order and a higher
-/// source pins instead, so the tagged value diverges.
+/// FALSIFICATION: short-circuit `Err` at the first source in
+/// `ReadSession::probe_point` instead of skipping. A `FaultOpen`-then-`Data`
+/// script then errors where data exists. Reverse the snapshot source order and
+/// a higher source pins instead, so the tagged value diverges.
 #[test]
 fn prop_probe_and_pin() {
     fn property(script: FaultScript) -> Result<bool> {

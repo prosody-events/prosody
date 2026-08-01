@@ -44,11 +44,11 @@
 //! multi-cell kinds commit data and bookkeeping together (a Map's entries and
 //! keyset, a Deque's entries and window bounds). Within the batch budget those
 //! cells ride one atomic same-partition batch; an over-budget commit splits
-//! into the fewest fitting batches, and — `write_resolved` being marker-free —
-//! a crash mid-split can leave a torn committed write the store cannot
-//! reconstruct (the over-budget residual on the collection-grain atomicity
-//! invariant, on the crate-internal `CellStore` trait), reconstructed
-//! only when the idempotent handler re-run re-issues the same ops. The
+//! into the fewest fitting batches. `write_resolved` is marker-free, so a
+//! crash mid-split can leave a torn committed write the store cannot
+//! reconstruct — the over-budget residual on the collection-grain atomicity
+//! invariant, stated in the `store` module. Only the idempotent handler re-run
+//! repairs it, by re-issuing the same ops. The
 //! guarantee is **at-least-once**: a `commit()`-landed write is durable and
 //! visible immediately — never provisional, never listed in any event marker,
 //! never rolled back (the bottom store resolves any standing clears-bearing

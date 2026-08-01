@@ -4,8 +4,7 @@
 //! the logical key, plus one keyset cell tracking current membership so a small
 //! map's `stream` becomes point gets instead of a durable scan. Every
 //! [`MapHandle`] method runs as one scoped collection operation over the bound
-//! collection — there is no Map-specific store or session, and no branch on
-//! which engine is bound. Build a descriptor with [`map_state`],
+//! collection. Build a descriptor with [`map_state`],
 //! register it with the consumer, and bind the
 //! [`Registered`](super::Registered) handle through
 //! [`EventContext::state`](crate::consumer::event_context::EventContext::state).
@@ -15,17 +14,15 @@
 //! Two declared cell families (see [`MapKind`]):
 //!
 //! * `KEYSET` holds **one** cell: the keyset, at the fixed coordinate `[2]`.
-//!   Coordinates `[0]`/`[1]` are a deliberately retired gap (they once held two
-//!   min/max bound cells; re-using a retired coordinate would let a stale
-//!   artifact alias an old frame). A Map that has never been written has no
-//!   keyset cell.
+//!   Coordinates `[0]`/`[1]` are a retired gap; `MapKeysetKey` owns that rule.
+//!   A Map that has never been written has no keyset cell.
 //! * `ENTRIES` holds one cell per key, addressed by the key codec's
 //!   order-preserving coordinate and typed by the entries cell type
 //!   [`Keyed`]`<KC, V>`.
 //!
 //! [`clear`](MapHandle::clear) is one whole-layout reset: it erases **both**
-//! declared sections, so the retired `[0]`/`[1]` coordinates left behind by the
-//! removed bounds design are erased along with the keyset and the entries.
+//! declared sections, so the retired coordinates go with the keyset and the
+//! entries.
 //!
 //! # Invariant: the keyset tracks current membership, `Overflowed` is one-way
 //!
@@ -54,13 +51,6 @@
 //! one incarnation overflows permanently (scan-rebuild re-entry from
 //! `Overflowed` is deliberately not implemented; it needs `clear` or TTL death
 //! to recover).
-//!
-//! Bounds deleted (`KeysetPresence` makes them redundant): the map once carried
-//! two min/max bound cells to anchor the fallback scan. They are gone — within
-//! an incarnation they fenced no tombstone the `Tracked` arm ever wades (that
-//! arm point-gets), and the accepted residual is the cross-incarnation
-//! `Overflowed` corner, whose fallback is a full-section scan that may cross a
-//! one-time tombstone wave (self-healing as those rows compact).
 //!
 //! The keyset is an optimization cell, so a malformed or oversized stored frame
 //! **degrades** iteration to the full-section scan (with a warning) and is
@@ -321,9 +311,10 @@ impl Codec for MapKeysetCodec {
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Keyset, KeysetFrameError> {
         // The trait boundary hands a `&mut [u8]`, which cannot alias into
-        // `Bytes`; one upfront copy of the frame (bounded by
-        // `KEYSET_BYTE_CEILING`) buys zero-copy coordinate slicing for the rest
-        // of the parse.
+        // `Bytes`; one upfront copy of the frame — sized by the stored cell,
+        // which a lowered bound or an older writer can leave above
+        // `KEYSET_BYTE_CEILING` — buys zero-copy coordinate slicing for the
+        // rest of the parse.
         decode_keyset(&Bytes::copy_from_slice(buf))
     }
 
@@ -356,7 +347,7 @@ impl Codec for MapKeysetCodec {
 /// The keyset cell's state as read at the top of a `set`, folding the typed
 /// get's malformed arm into data so [`update_keyset`] is one match.
 enum PriorKeyset {
-    /// No keyset cell (a fresh map, or pre-keyset/TTL-expired rows).
+    /// No keyset cell (a fresh map, or TTL-expired rows).
     Absent,
 
     /// A well-formed keyset.
@@ -376,7 +367,9 @@ enum MapPlan<S: StateSession, KC: OrderedKeyCodec, V: CellType<Key = UnitKey>> {
     /// Point-get each listed key (already reversed for a backward stream).
     Tracked(CoordinatePlan<S, Keyed<KC, V>>),
 
-    /// Degrade to the full-section (`Unbounded`-edged) scan.
+    /// Degrade to the full-section (`Unbounded`-edged) scan. Nothing anchors
+    /// its edges, so it may cross a one-time tombstone wave left by an earlier
+    /// incarnation, and it gets faster as those rows compact.
     Scan(RangePlan<S, Keyed<KC, V>>),
 }
 
@@ -486,9 +479,11 @@ where
     /// running the resolver**.
     ///
     /// Answers "a stored cell exists," read through the event's dirty overlay
-    /// (read-your-writes): an uncommitted `set` → `true`, an uncommitted
-    /// `remove` → `false`, `clear` hides entries, a `set` after `clear` →
-    /// `true`, and `rollback` restores the prior view. For a message-backed map
+    /// (read-your-writes). On a writable session an uncommitted `set` → `true`,
+    /// an uncommitted `remove` → `false`, `clear` hides entries, a `set` after
+    /// `clear` → `true`, and `rollback` restores the prior view; a
+    /// reader-bound handle has no overlay and answers from committed state
+    /// alone. For a message-backed map
     /// this can return `true` even when the referenced Kafka message can no
     /// longer be fetched — presence is about the cell, not the message. The
     /// guarantee is "no value decode, no resolver run," **not** "no I/O": a
@@ -707,14 +702,16 @@ where
     /// keyset means no live entries (the current-membership invariant), so the
     /// stream yields nothing with zero entry reads (no scan).
     ///
-    /// Session admission is taken only for the init keyset read and per chunk
-    /// (≤ `STREAM_CHUNK` point reads each): a chunk's admission covers its
-    /// batch fetch, and is released before the chunk is decoded and resolved —
-    /// so it is never held across a yield (items and errors alike), and a
-    /// handler may mutate this map between stream items without deadlock
-    /// (`StreamYieldFree`; see [`SessionGate`](crate::state::session)). Errors
-    /// are chunk-atomic: a failing chunk yields none of its items (all its live
-    /// entries, or only its error).
+    /// Session admission is taken at init for the keyset read. The tracked
+    /// (point) arm then takes it once per chunk, at most `STREAM_CHUNK` point
+    /// reads each: a chunk's admission covers its batch fetch, and is released
+    /// before the chunk is decoded and resolved. The degraded scan arm takes no
+    /// admission after init and pages gate-free. Neither arm holds admission
+    /// across a yield, for items and errors alike, so a handler may mutate this
+    /// map between stream items without deadlock (`StreamYieldFree`, over the
+    /// per-event session operation gate). Errors are chunk-atomic: a failing
+    /// chunk yields none of its items (all its live entries, or only its
+    /// error).
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
@@ -876,10 +873,10 @@ where
         // Absent → the empty map: a fresh singleton, itself subject to the
         // limit/ceiling.
         PriorKeyset::Absent => {
-            if fits_fresh(&coordinate, limit) {
-                write_keyset(op, Keyset::Tracked(vec![coordinate]))
-            } else {
+            if is_oversized(from_ref(&coordinate), limit) {
                 write_keyset(op, Keyset::Overflowed)
+            } else {
+                write_keyset(op, Keyset::Tracked(vec![coordinate]))
             }
         }
         // Overflowed is one-way: no write, except the TTL refresh.
@@ -1003,14 +1000,6 @@ where
         CellStateError::Key(e) => CellStateError::Key(e).into(),
         CellStateError::Codec(e) => MapStateError::KeysetFrame(e),
     }
-}
-
-/// Whether a fresh single-key keyset fits the registered `limit` and the byte
-/// ceiling — `false` when `limit == 0` (tracking disabled) or the one key's
-/// frame is already oversized.
-fn fits_fresh(coordinate: &Coordinate, limit: usize) -> bool {
-    limit >= 1
-        && tracked_frame_len(from_ref(coordinate)).is_some_and(|len| len <= KEYSET_BYTE_CEILING)
 }
 
 /// The exact encoded byte length of a `Tracked` frame over `keys`
@@ -1162,6 +1151,10 @@ impl<KC, V> Descriptor<MapKind<KC, V>> {
     /// permanently (until `clear` or TTL death), so a monotonically growing
     /// key universe should not expect cached iteration.
     ///
+    /// The bound shapes the **owner's** arm choice only. A published reader
+    /// binds the same map at the global validated ceiling, so a tracked keyset
+    /// the owner's lowered bound degrades still streams as point gets there.
+    ///
     /// Available on Map registrations only — a keyset bound on a Value or Deque
     /// is uncompilable, since this inherent method exists only at this type.
     #[must_use]
@@ -1197,7 +1190,7 @@ where
     KeysetFrame(#[from] KeysetFrameError),
 }
 
-/// A raw access refusal reaches the handle as the access arm of a cell error —
+/// An access refusal reaches the handle as the access arm of a cell error —
 /// the shape the scoped write invocation's final fence reports.
 impl<E> From<StateAccessError> for MapStateError<E>
 where

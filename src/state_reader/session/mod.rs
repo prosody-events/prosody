@@ -7,20 +7,19 @@
 //! operation therefore resolves against one exact source set and pins at most
 //! one source. Call this the `SingleSourceCoherence` invariant.
 //!
-//! Two of these guarantees are structural. `ReadOnlyHandleCannotMutate` holds
+//! Every guarantee here is structural. `ReadOnlyHandleCannotMutate` holds
 //! because no mutator bound exists. Committed-only holds because the only value
 //! a session can materialize is
 //! [`Cell::project_committed`](crate::state::cell::Cell::project_committed).
 //!
-//! `SingleSourceCoherence` is not purely type-enforced. It rests on a runtime
-//! rule: the unpinned reads within one operation must be issued sequentially,
-//! each pinning before the next begins. Every read path here obeys that rule. A
-//! probe runs to a pin, then later calls address the pin, so a torn two-source
-//! view cannot occur. A probe is concurrent across *sources*, never across
-//! reads: `probe_batch` fans one batch out to every source at once, and still
-//! resolves to one pin. On every engine path the invocation's
-//! `&mut Option<PinnedSource>` (see [`engine`]) stops two overlapping unpinned
-//! reads from compiling.
+//! `SingleSourceCoherence` holds two ways. Within one invocation, the
+//! `&mut Option<PinnedSource>` that every engine path threads (see [`engine`])
+//! stops two overlapping unpinned reads from compiling, so a probe always
+//! reaches its pin before the next read starts. A probe is concurrent across
+//! *sources*, never across reads: `probe_batch` fans one batch out to every
+//! source at once, and still resolves to one pin. Across invocations, the
+//! session-shared pin has exactly one writer, `engine::publish`, so the second
+//! invocation addresses the first selection.
 //!
 //! The selection reaches the read paths two ways, and the two agree. A scoped
 //! collection operation carries its own invocation-local selection: the reader
@@ -28,7 +27,7 @@
 //! first one it makes back to that shared cell. A managed stream carries the
 //! selection its planning command captured. The precedence is uniform: a
 //! captured selection wins, an uncaptured one defers to the shared cell, and
-//! only a wholly unselected read probes.
+//! only a wholly unselected point or batch read probes.
 //!
 //! Probe-and-pin is the reader's source-selection strategy:
 //!
@@ -39,10 +38,8 @@
 //!   never beat a slow `Some` from the owner. A source that errors is skipped
 //!   and its error remembered. Data beats a skipped error. No data plus at
 //!   least one error is an error.
-//! * **Scan** probes sources sequentially. The first stream to yield a cell
-//!   pins. A mid-stream error after the pin terminates with `Err`, because a
-//!   restart would double-yield. An error before any yield is skipped. An empty
-//!   source falls through to the next.
+//! * **Range page** never probes. It addresses the source the operation already
+//!   selected.
 //!
 //! Once pinned, every later call addresses the pinned source directly, even on
 //! `None` or `Err`. The probe never reruns within an operation. Determinism is
@@ -88,6 +85,11 @@ pub struct ReadSession<C: Codec, B> {
     /// The session-shared selection, so every invocation after the first
     /// data-bearing probe addresses one source. The engine seeds each
     /// invocation from it and publishes the first selection back.
+    ///
+    /// Operation-local selection does not replace this cell. No plan links two
+    /// invocations on one session, and the second invocation must address the
+    /// first selection with no second probe
+    /// (`one_session_selects_its_source_once`).
     pin: Arc<OnceLock<PinnedSource>>,
 }
 
@@ -403,96 +405,33 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         }
     }
 
-    /// One operation's committed range page: walk `selected`, or — when no read
-    /// has selected a source yet — probe the sources sequentially and pin the
-    /// first that yields a cell.
+    /// One operation's committed range page over the selected source.
     ///
     /// A captured `Some(selected)` always wins: a continuation addresses the
     /// source its planning command chose. A `None` falls back to the
-    /// session-shared pin **sampled at first poll**, and only probes when that
-    /// is empty too — so a stream constructed before a sibling read pinned
-    /// still addresses that selection rather than opening a second source.
+    /// session-shared pin **sampled at first poll**, so a stream constructed
+    /// before a sibling read pinned still addresses that selection rather than
+    /// opening a second source.
     ///
-    /// A mid-stream error after the pin terminates the stream, because a
-    /// restart would double-yield. An error before any yield is remembered and
-    /// falls through to the next source; an empty source falls through too.
-    ///
-    /// The unselected branch publishes its pin to the session-shared cell, not
-    /// back to the caller's selection. Fixing that needs a
-    /// `&mut Option<PinnedSource>` parameter, and no caller can observe the
-    /// difference today: a range plan pages exactly once and issues nothing
-    /// after, and a coordinate plan only has keys because its keyset read
-    /// already pinned.
-    // Ruling: the unselected arms below (the session-pin fallback, then the
-    // sequential probe) are this function's total-domain answer for a plan
-    // captured before any selection. No planning command builds one today —
-    // every range arm follows a metadata point read that pins — so they are
-    // unreached rather than dead. Encoding that in the plan type belongs with
-    // the reader's snapshot work, not here.
+    /// A range page never probes. Every range plan follows a metadata point
+    /// read that already pinned, so a wholly unselected one is unconstructable
+    /// through the collection API. Such a plan terminates the stream with
+    /// [`StateAccessError::Unavailable`] instead of opening a source the
+    /// operation did not select.
     fn scan_from<'a>(
         &'a self,
         selected: Option<&'a PinnedSource>,
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         async_stream::try_stream! {
-            // Sample the session pin at first poll, not at construction: a
-            // stream built before a sibling read pinned must still address that
-            // selection. A captured `Some` keeps precedence.
-            let selected = selected.or_else(|| self.pin.get());
-            if let Some(pin) = selected {
-                let id = pin.collection.clone();
-                let inner = self.context.backend.cells().scan(&id, scan);
-                futures::pin_mut!(inner);
-                while let Some(item) = cooperative(inner.next()).await {
-                    yield item.map_err(|error| StateAccessError::store(&error))?;
-                }
-                return;
-            }
-            // Unselected sequential probe: sources are tried in preference
-            // order and the first to yield a cell pins. Map's untracked-keyset
-            // degrade arm is the only production caller. Every other stream
-            // reaches a scan only after a meta point read that already pinned.
-            let sources = self.snapshot.sources();
-            let mut first_err = None;
-            let mut pinned = false;
-            for source in sources {
-                let id = self.collection_id_for(source)?;
-                let inner = self.context.backend.cells().scan(&id, scan);
-                futures::pin_mut!(inner);
-                let mut yielded_any = false;
-                loop {
-                    match cooperative(inner.next()).await {
-                        Some(Ok(item)) => {
-                            if !yielded_any {
-                                let _ = self.pin.set(PinnedSource {
-                                    source: source.clone(),
-                                    collection: id.clone(),
-                                });
-                                yielded_any = true;
-                            }
-                            yield item;
-                        }
-                        Some(Err(error)) => {
-                            let error = StateAccessError::store(&error);
-                            if yielded_any {
-                                Err(error)?;
-                            } else if first_err.is_none() {
-                                first_err = Some(error);
-                            }
-                            break;
-                        }
-                        None => break,
-                    }
-                }
-                if yielded_any {
-                    pinned = true;
-                    break;
-                }
-            }
-            // Nothing pinned: propagate a remembered error, else the stream is
-            // empty (every source completed empty).
-            if !pinned && let Some(error) = first_err {
-                Err(error)?;
+            let pin = selected
+                .or_else(|| self.pin.get())
+                .ok_or(StateAccessError::Unavailable)?;
+            let id = pin.collection.clone();
+            let inner = self.context.backend.cells().scan(&id, scan);
+            futures::pin_mut!(inner);
+            while let Some(item) = cooperative(inner.next()).await {
+                yield item.map_err(|error| StateAccessError::store(&error))?;
             }
         }
     }

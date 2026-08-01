@@ -2,11 +2,11 @@
 //!
 //! A session is the per-event view over a partition's keyed-state cell store:
 //! byte-cell reads and writes buffer in a per-event dirty overlay, and the
-//! framework drives the stage/promote lifecycle through a sealed supertrait
+//! framework drives the stage/promote lifecycle through sealed supertraits
 //! that downstream crates can neither implement nor call.
 //!
-//! [`KeyedStateSession`] is the sole implementation — the real session, minted
-//! per event by the partition's state manager. It holds **one uniform
+//! [`KeyedStateSession`] is the real session, minted per event by the
+//! partition's state manager. It holds **one uniform
 //! `Overlay`** (the per-event `DirtyStore` over the partition's committed
 //! cell store): clones share the per-event dirty overlay and reload-marker
 //! override plus the cross-event singletons (the commit oracle, the armed
@@ -16,10 +16,11 @@
 //! # The session surface
 //!
 //! The session's reads and staged mutations are crate-private inherent methods
-//! on [`KeyedStateSession`]. Their only caller is the owner engine
+//! on [`KeyedStateSession`]. Their only production caller is the owner engine
 //! (`crate::state::collection::owner`): a collection handle opens one scoped
-//! operation, and the engine turns that operation into those calls. No trait
-//! carries one, so nothing outside `crate::state` can reach a cell.
+//! operation, and the engine turns that operation into those calls. The suites
+//! reach them through the `#[cfg(test)]` seeding seams further down this file.
+//! No trait carries one, so nothing outside `crate::state` can reach a cell.
 //!
 //! Two sealed traits hold the framework's own moves. `sealed::StateLifecycle`
 //! is the manager-driven lifecycle (`finalize` and the attempt/teardown verbs —
@@ -542,10 +543,10 @@ pub(crate) mod sealed {
         /// backend's store (`B::Cell`).
         type Cell: CellStore;
 
-        /// The session's operation gate (KV4) — the descriptor handles acquire
-        /// their per-op permits through this accessor. On the sealed trait,
-        /// not the public capability pair: the gate is framework plumbing,
-        /// never a handler surface.
+        /// The session's operation gate (KV4) — the engine acquires each
+        /// operation's permit through this accessor. On the sealed lifecycle
+        /// trait, not on [`EventSession`](super::EventSession): the gate is
+        /// framework plumbing, never a handler surface.
         fn gate(&self) -> &SessionGate;
 
         /// Closes the session's gate for settlement — one acquire, phase
@@ -1136,10 +1137,23 @@ where
     pub(in crate::state) async fn mutate_permit(
         &self,
     ) -> Result<MutatePermit<'_>, StateAccessError> {
-        // The one total admission order (see the doc above), applied under the
-        // held permit. The epoch bump needs the gate exclusively, so the pin is
-        // stable between the check and the return.
-        let permit = self.inner.gate.read().await;
+        let permit = self.permit().await;
+        self.check_write_admission(&permit)?;
+        Ok(MutatePermit::witness(permit))
+    }
+
+    /// The one total write-admission order, applied under a held `permit` — the
+    /// single definition [`Self::mutate_permit`] runs to mint its witness and
+    /// the owner engine re-runs before each staged mutation. See
+    /// [`Self::mutate_permit`] for the order and why it is that order.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::mutate_permit`].
+    pub(in crate::state) fn check_write_admission(
+        &self,
+        permit: &OpPermit<'_>,
+    ) -> Result<(), StateAccessError> {
         if !self.attempt_current() {
             return Err(StateAccessError::Terminated);
         }
@@ -1149,7 +1163,7 @@ where
         if self.is_terminated() {
             return Err(StateAccessError::Terminated);
         }
-        Ok(MutatePermit::witness(permit))
+        Ok(())
     }
 
     /// Stages one already-encoded mutation into this event's dirty overlay —
@@ -1199,12 +1213,18 @@ where
     /// Returns [`StoreOutcome::Applied`] when buffered ops were written, or
     /// [`StoreOutcome::NoOp`] when nothing was buffered.
     ///
+    /// `permit` is the admission witness: the whole sequence runs under the
+    /// caller's hold, so it never re-enters the non-reentrant gate. It is never
+    /// inspected. [`Self::rollback`] takes no witness, because it acquires the
+    /// gate itself.
+    ///
     /// # Errors
     ///
     /// Returns [`StateAccessError::Store`] when the underlying store fails (the
     /// buffer is left intact, so the ops still ride the normal commit path).
     pub(in crate::state) async fn commit(
         &self,
+        _permit: &OpPermit<'_>,
         state_type: StateType,
         name: &StateName,
     ) -> Result<StoreOutcome, StateAccessError> {
@@ -1300,9 +1320,9 @@ where
 /// Seeding and inspection seams for the suites, so a test can arrange overlay
 /// state without a collection handle.
 ///
-/// The seams **arrange** state; they never model a mutation. Each one takes the
-/// operation gate — so a seed serializes against a concurrent scoped operation
-/// rather than tearing one — but deliberately skips the mutator admission order
+/// The seams **arrange** state; they never model a mutation. Each seeding seam
+/// takes the operation gate — so a seed serializes against a concurrent scoped
+/// operation rather than tearing one — but skips the mutator admission order
 /// (stale pin, closed session, termination), which is what the real handles
 /// exercise in the gate suite. A seed therefore succeeds on a session a handle
 /// would refuse, which is the point: a test can seed the state a refusal is
@@ -1799,10 +1819,7 @@ where
 /// forward. Binding it yields the session itself (`Handle<S> = S`), so the
 /// settlement boundary drives the full sealed [`StateLifecycle`] on it.
 ///
-/// This is the **settlement surface**: `close_gate` / `finalize` /
-/// `record_marker` / `discard_dirty` / `terminate` / the backstop accessors —
-/// plus `stage_cell`, the sink a scoped write invocation replays its journal
-/// through.
+/// This is the **settlement surface**: the sealed [`StateLifecycle`] verbs.
 /// It stays `pub(crate)` because the settle-module-private
 /// [`SettlementAccess`](crate::consumer::middleware::settle) extension must
 /// name it. Residual: no convenient crate-wide accessor exists (the old

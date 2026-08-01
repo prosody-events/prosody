@@ -368,10 +368,13 @@ async fn commit_drains_only_its_collection() -> Result<()> {
         .seed(StateType::Application, &wishlist, &value_cell(), Some(b"b"))
         .await;
 
-    assert_eq!(
-        session.commit(StateType::Application, &cart).await?,
-        StoreOutcome::Applied,
-    );
+    let outcome = {
+        let permit = session.permit().await;
+        session
+            .commit(&permit, StateType::Application, &cart)
+            .await?
+    };
+    assert_eq!(outcome, StoreOutcome::Applied);
 
     // Cart's write is committed durably; wishlist's is still only buffered.
     let probe = EventRef::Message {
@@ -424,10 +427,13 @@ async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<(
     session
         .seed(StateType::Application, &cart, &value_cell(), Some(b"V"))
         .await;
-    assert_eq!(
-        session.commit(StateType::Application, &cart).await?,
-        StoreOutcome::Applied,
-    );
+    let outcome = {
+        let permit = session.permit().await;
+        session
+            .commit(&permit, StateType::Application, &cart)
+            .await?
+    };
+    assert_eq!(outcome, StoreOutcome::Applied);
 
     // Buffer W over cart, and X over the sibling.
     session
@@ -739,7 +745,12 @@ async fn apply_value_op(
             model.buffered = true;
         }
         ValueOp::Commit => {
-            let outcome = session.commit(StateType::Application, name).await?;
+            let outcome = {
+                let permit = session.permit().await;
+                session
+                    .commit(&permit, StateType::Application, name)
+                    .await?
+            };
             if outcome != expected_outcome(model.buffered) {
                 return Ok(false);
             }
@@ -1531,7 +1542,7 @@ async fn apply_stage_ops<B: StateBackend>(
     session: &KeyedStateSession<B, ()>,
     name: &StateName,
     ops: &[StageOp],
-) -> Result<()> {
+) {
     for op in ops {
         match *op {
             StageOp::Set {
@@ -1565,7 +1576,6 @@ async fn apply_stage_ops<B: StateBackend>(
             }
         }
     }
-    Ok(())
 }
 
 /// Every cell a set/clear op names (a section-clear names no cell).
@@ -1605,7 +1615,7 @@ impl Arbitrary for StagePop {
 /// query-count law plus the committed projection.
 async fn run_stage_query_counts(pop: StagePop) -> Result<()> {
     let fx = CountingFixture::new(pop.ru, "qc")?;
-    apply_stage_ops(&fx.session, &fx.name, &pop.ops).await?;
+    apply_stage_ops(&fx.session, &fx.name, &pop.ops).await;
 
     // The expected batch count, derived from the stage's dirty input.
     let expected_batches = fx.expected_batches();
@@ -1910,7 +1920,7 @@ fn concrete_ops(ops: &[StageOp], next: &mut u8) -> Vec<ConcreteOp> {
 }
 
 /// Applies concrete ops to the session.
-async fn apply_concrete(session: &Session, name: &StateName, ops: &[ConcreteOp]) -> Result<()> {
+async fn apply_concrete(session: &Session, name: &StateName, ops: &[ConcreteOp]) {
     for op in ops {
         match op {
             ConcreteOp::Set(cell, byte) => {
@@ -1928,7 +1938,6 @@ async fn apply_concrete(session: &Session, name: &StateName, ops: &[ConcreteOp])
             }
         }
     }
-    Ok(())
 }
 
 /// The event's net surviving `Set` cells and cleared sections (mirroring
@@ -2013,7 +2022,7 @@ async fn run_multi_section(trace: MultiTrace) -> Result<()> {
         {
             let scope = fx.session(event);
             let session = scope.handle();
-            apply_concrete(&session, &name, &concrete).await?;
+            apply_concrete(&session, &name, &concrete).await;
 
             match ev.outcome {
                 MultiOutcome::Commit { fail_promote } => {
@@ -2048,7 +2057,7 @@ async fn run_multi_section(trace: MultiTrace) -> Result<()> {
                 MultiOutcome::Retry => {
                     drop(session.finalize().await?);
                     session.discard_dirty();
-                    apply_concrete(&session, &name, &concrete).await?;
+                    apply_concrete(&session, &name, &concrete).await;
                     let finalized = session.finalize().await?;
                     fx.oracle.record_message(dedup).await?;
                     if let Finalized::Staged(staged) = finalized {
