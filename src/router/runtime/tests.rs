@@ -1,4 +1,4 @@
-use super::{PeerRuntime, RouterConfiguration, refresh_delay, routed_host};
+use super::{PeerRuntime, PeerRuntimeError, RouterConfiguration, refresh_delay, routed_host};
 use crate::router::directory::RegistrationTtl;
 use crate::router::directory::tests::support::{directory, member_shards, membership};
 use crate::test_util::TEST_RUNTIME;
@@ -82,6 +82,26 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
                 "attempt {attempt}: shutdown must remove the index entry"
             );
         }
+        Ok(())
+    })
+}
+
+/// `start` refuses a configuration its own rules reject. A bound that nothing
+/// enforces at startup is not a bound.
+#[test]
+fn start_refuses_an_invalid_configuration() -> Result<()> {
+    init_test_logging();
+    TEST_RUNTIME.block_on(async {
+        let config = RouterConfiguration {
+            address_cache_capacity: 0,
+            ..RouterConfiguration::default()
+        };
+        let directory = directory(LEASE).await?;
+        let outcome = PeerRuntime::start(directory, 7777, CONTACT, &config, None).await;
+        assert!(
+            matches!(outcome, Err(PeerRuntimeError::Configuration(_))),
+            "a cache capacity of zero must stop the runtime from starting"
+        );
         Ok(())
     })
 }

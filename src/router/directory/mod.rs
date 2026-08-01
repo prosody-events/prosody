@@ -42,7 +42,7 @@ pub(crate) mod tests;
 /// partition that every renewal, expiry and shutdown tombstone lands in.
 const GROUP_SHARDS: u64 = 16;
 
-/// Where a process can be reached: a host and the port its listener bound.
+/// Where a process can be reached: a host and the port peers dial there.
 ///
 /// A tagged pair rather than a `host:port` string, because an entry point may
 /// later need a TLS server name or a scheme. Those are ordinary columns, so

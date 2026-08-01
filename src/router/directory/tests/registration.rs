@@ -46,7 +46,7 @@ fn prop_registration_round_trip() {
                 "a registration naming {:?} must occupy {expected} index shard(s), not {shards:?}",
                 written.group
             );
-            Ok(true)
+            Ok(())
         }))
     }
     init_test_logging();

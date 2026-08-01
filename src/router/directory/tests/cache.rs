@@ -49,18 +49,22 @@ static POOL_NODES: OnceCell<Vec<(NodeId, u16)>> = OnceCell::const_new();
 ///
 /// **Age.** A fresh entry is served with no read. Past the lease the same
 /// entry is read again rather than served.
+///
+/// **Absence.** A node the directory does not hold is cached as absent, so a
+/// burst for an unknown id issues one read and not one per request.
 #[test]
 fn prop_address_cache_bounded_single_flight() {
     fn property(generated: Vec<usize>) -> TestResult {
         finish(TEST_RUNTIME.block_on(async {
             let directory = directory(POOL_LEASE).await?;
             let pool = pool(&directory).await?;
-            let ttl = RegistrationTtl::try_from(POOL_LEASE)?;
+            let ttl = directory.ttl();
 
             occupancy_holds(&directory, pool, ttl, generated).await?;
             one_read_per_cold_burst(&directory, pool, ttl).await?;
             a_fresh_entry_is_served_until_the_lease_ends(&directory, pool, ttl).await?;
-            Ok(true)
+            absence_is_cached(&directory, ttl).await?;
+            Ok(())
         }))
     }
     init_test_logging();
@@ -167,6 +171,27 @@ async fn a_fresh_entry_is_served_until_the_lease_ends(
     assert!(
         cache.len() <= CAPACITY,
         "the refill pushed the cache over its capacity of {CAPACITY}"
+    );
+    Ok(())
+}
+
+/// A node the directory does not hold is cached as absent, so repeated
+/// requests for an unknown id issue one read and not one per request.
+async fn absence_is_cached(directory: &NodeDirectory, ttl: RegistrationTtl) -> Result<()> {
+    let (clock, _mock) = Clock::mock();
+    let cache = AddressCache::with_clock(CAPACITY, ttl, clock);
+    let reads = AtomicUsize::new(0);
+    let unknown = NodeId::new();
+    for attempt in 1_u8..=3 {
+        assert!(
+            resolve(&cache, directory, &reads, unknown).await?.is_none(),
+            "attempt {attempt}: a node the directory does not hold must resolve as absent"
+        );
+    }
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        1,
+        "repeated requests for an absent node must issue one read"
     );
     Ok(())
 }

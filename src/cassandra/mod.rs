@@ -85,8 +85,8 @@ pub const TABLE_KEYED_STATE_IDENTITY: &str = "keyed_state_identity";
 pub const TABLE_KEYED_STATE_PUBLICATION: &str = "keyed_state_publication";
 
 /// Table holding one row per live prosody process: where peers can reach it,
-/// and the consumer group it belongs to. Rows carry a TTL and each process
-/// rewrites its own row inside that TTL.
+/// and the consumer group it belongs to, if any. Rows carry a TTL and each
+/// process rewrites its own row inside that TTL.
 pub const TABLE_NODE_DIRECTORY: &str = "node_directory";
 
 /// Group listing index over [`TABLE_NODE_DIRECTORY`]. The rows carry no column

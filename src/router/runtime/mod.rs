@@ -27,7 +27,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{error, warn};
-use validator::{Validate, ValidationError};
+use validator::{Validate, ValidationError, ValidationErrors};
 use whoami::hostname;
 
 #[cfg(test)]
@@ -120,7 +120,8 @@ impl PeerRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`PeerRuntimeError`] when discovery or the first write fails.
+    /// Returns [`PeerRuntimeError`] when the configuration is invalid, or when
+    /// discovery or the first write fails.
     pub(crate) async fn start(
         directory: NodeDirectory,
         listener_port: u16,
@@ -128,6 +129,7 @@ impl PeerRuntime {
         config: &RouterConfiguration,
         group: Option<GroupMembership>,
     ) -> Result<Self, PeerRuntimeError> {
+        config.validate()?;
         let ttl = directory.ttl();
         let registration =
             discover_registration(NodeId::new(), listener_port, contact, config, group)?;
@@ -282,7 +284,7 @@ fn discover_registration(
 /// Always between a third and a half of the lease, so two consecutive refreshes
 /// can be lost before a row expires.
 fn refresh_delay(ttl: RegistrationTtl) -> Duration {
-    let millis = u64::from(ttl.seconds().unsigned_abs()) * 1000;
+    let millis = ttl.duration().as_secs() * 1000;
     let base = millis / 3;
     let span = millis / 6;
     Duration::from_millis(base + rand::rng().random_range(0..=span))
@@ -321,6 +323,10 @@ fn validate_registration_ttl(ttl: &Duration) -> Result<(), ValidationError> {
 /// What can stop a process from taking its place in the directory.
 #[derive(Debug, Error)]
 pub(crate) enum PeerRuntimeError {
+    /// The configuration this process was started with is invalid.
+    #[error("router configuration is invalid: {0:#}")]
+    Configuration(#[from] ValidationErrors),
+
     /// The machine's own name could not be read. Every registration publishes
     /// it, so the lookup is not optional.
     #[error("host discovery failed: {0:#}")]

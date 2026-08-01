@@ -135,12 +135,11 @@ pub(crate) async fn member_shards(membership: &GroupMembership, node: NodeId) ->
     Ok(found)
 }
 
-/// Converts a property body's `Result<bool>` into a `TestResult`: a store or
+/// Converts a property body's `Result<()>` into a `TestResult`: a store or
 /// setup failure is a broken environment, never a shrinkable property failure.
-pub(crate) fn finish(result: Result<bool>) -> TestResult {
+pub(crate) fn finish(result: Result<()>) -> TestResult {
     match result {
-        Ok(true) => TestResult::passed(),
-        Ok(false) => TestResult::failed(),
+        Ok(()) => TestResult::passed(),
         Err(error) => TestResult::error(format!("{error:?}")),
     }
 }
