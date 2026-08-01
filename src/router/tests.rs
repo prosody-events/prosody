@@ -3,6 +3,11 @@ use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use std::cell::Cell;
 
+/// Stands in for the hostname lookup's failure, which `whoami` gives this crate
+/// no way to construct.
+#[derive(Debug, Eq, PartialEq)]
+struct LookupFailed;
+
 /// Every candidate is distinct by construction, so no generated collision can
 /// mask a wrong pick.
 fn candidates(seed: u8) -> (Host, Host, Host) {
@@ -13,12 +18,15 @@ fn candidates(seed: u8) -> (Host, Host, Host) {
     )
 }
 
-/// Discovery order and laziness together: the first source that has a host
-/// wins, and no later source is even consulted.
+/// Discovery order, laziness, and failure together: the first source that has a
+/// host wins, no later source is even consulted, and the hostname lookup's
+/// failure reaches the caller exactly when that lookup was the source that had
+/// to answer.
 #[quickcheck]
 fn discovery_prefers_configured_then_routed_then_hostname(
     has_configured: bool,
     has_routed: bool,
+    hostname_fails: bool,
     seed: u8,
 ) -> TestResult {
     let (configured, routed, hostname) = candidates(seed);
@@ -33,22 +41,29 @@ fn discovery_prefers_configured_then_routed_then_hostname(
         },
         || {
             hostname_probed.set(true);
-            Ok(hostname.clone())
+            if hostname_fails {
+                Err(LookupFailed)
+            } else {
+                Ok(hostname.clone())
+            }
         },
     );
-    let Ok(selected) = selected else {
-        return TestResult::error("the hostname fallback cannot fail in this test");
-    };
 
+    let looked_up = if hostname_fails {
+        Err(LookupFailed)
+    } else {
+        Ok(hostname)
+    };
     let (expected, expect_routed_probe, expect_hostname_probe) = match (has_configured, has_routed)
     {
-        (true, _) => (configured, false, false),
-        (false, true) => (routed, true, false),
-        (false, false) => (hostname, true, true),
+        (true, _) => (Ok(configured), false, false),
+        (false, true) => (Ok(routed), true, false),
+        (false, false) => (looked_up, true, true),
     };
     assert_eq!(
         selected, expected,
-        "configured={has_configured} routed={has_routed}: wrong host selected"
+        "configured={has_configured} routed={has_routed} lookup_fails={hostname_fails}: wrong \
+         outcome"
     );
     assert_eq!(
         routed_probed.get(),

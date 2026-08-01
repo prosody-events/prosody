@@ -1,7 +1,8 @@
-use super::{CountingCodec, expected_frame_len, header};
+use super::{CountingCodec, RAW_ID, RELAY_FIELD_BYTES, expected_frame_len, header};
 use crate::error::ErrorCategory;
 use crate::response::frame::FrameCap;
 use crate::response::frame::encode::{EncodeError, FrameEncoder};
+use crate::router::NodeId;
 use bytes::BytesMut;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
@@ -24,11 +25,13 @@ const FROZEN: [u8; 65] = [
 ];
 
 /// The steady state allocates nothing: over a run of encodes up to the
-/// configured maximum, neither the encoder's scratch nor a destination buffer
-/// sized at the cap ever grows, the payload is serialized exactly once per
-/// response, and the frame is exactly as long as the staging said it would be.
+/// configured maximum, a destination buffer sized at the cap never grows, the
+/// payload is serialized exactly once per response, and the frame is exactly as
+/// long as the staging said it would be. The encoder's scratch is back at the
+/// cap for every response it accepts, even after one big enough to have grown
+/// it.
 #[quickcheck]
-fn steady_state_encodes_never_reallocate(lengths: Vec<u16>) -> TestResult {
+fn steady_state_encodes_never_reallocate(lengths: Vec<u16>, relay: bool) -> TestResult {
     let Ok(cap) = FrameCap::new(64 * 1024) else {
         return TestResult::error("64 KiB is a supported cap");
     };
@@ -38,19 +41,31 @@ fn steady_state_encodes_never_reallocate(lengths: Vec<u16>) -> TestResult {
     let scratch_capacity = encoder.scratch_capacity();
     let dst_capacity = dst.capacity();
     let subsystem = "billing";
-    let header = header(subsystem, ErrorCategory::Transient, None);
+    let header = header(
+        subsystem,
+        ErrorCategory::Transient,
+        relay.then(|| NodeId::from_bytes(RAW_ID)),
+    );
 
     // The boundary lengths lead every run, so the largest frame the cap admits
     // — and the first one it refuses — are exercised whatever quickcheck
-    // generated. The largest is found through the model rather than restated as
-    // a literal, so a change to the header cannot silently move it.
+    // generated. The first is large enough to grow the scratch, so the run
+    // covers giving that memory back. The largest is found through the model
+    // rather than restated as a literal, so a change to the header cannot
+    // silently move it.
     let Some(largest) = (0..=cap.bytes())
         .rev()
-        .find(|&length| expected_frame_len(subsystem, length, false) <= cap.bytes())
+        .find(|&length| expected_frame_len(subsystem, length, relay) <= cap.bytes())
     else {
         return TestResult::error("the cap admits some payload");
     };
-    let boundaries = [cap.bytes(), largest + 1, largest, largest - 1];
+    let boundaries = [
+        cap.bytes() * 2,
+        cap.bytes(),
+        largest + 1,
+        largest,
+        largest - 1,
+    ];
     let generated = lengths.into_iter().map(usize::from);
     for length in boundaries.into_iter().chain(generated) {
         let payload: Vec<u8> = (0..length).map(|index| index as u8).collect();
@@ -74,7 +89,7 @@ fn steady_state_encodes_never_reallocate(lengths: Vec<u16>) -> TestResult {
                 );
                 assert_eq!(
                     dst.len(),
-                    expected_frame_len(subsystem, length, false),
+                    expected_frame_len(subsystem, length, relay),
                     "the frame must cost exactly the fields it carries"
                 );
                 assert!(
@@ -83,10 +98,19 @@ fn steady_state_encodes_never_reallocate(lengths: Vec<u16>) -> TestResult {
                     dst.len(),
                     cap.bytes()
                 );
+                let tail = if relay { RELAY_FIELD_BYTES } else { 0 };
                 assert_eq!(
-                    &dst[dst.len() - length..],
+                    &dst[dst.len() - tail - length..dst.len() - tail],
                     &payload[..],
                     "the payload must be framed verbatim"
+                );
+                // Only a response the cap refuses can grow the scratch, and
+                // `stage` gives that memory back before the next one, so every
+                // accepted response finds the scratch at exactly the cap.
+                assert_eq!(
+                    encoder.scratch_capacity(),
+                    scratch_capacity,
+                    "the scratch must be back at the cap"
                 );
             }
         }
@@ -95,11 +119,6 @@ fn steady_state_encodes_never_reallocate(lengths: Vec<u16>) -> TestResult {
             codec.serializes(),
             serializes + 1,
             "each response must be serialized exactly once"
-        );
-        assert_eq!(
-            encoder.scratch_capacity(),
-            scratch_capacity,
-            "the scratch must never reallocate"
         );
         assert_eq!(
             dst.capacity(),
@@ -137,46 +156,27 @@ fn an_over_cap_response_is_refused_before_it_is_framed() -> Result<()> {
     Ok(())
 }
 
-/// A refused response does not leave the encoder holding an allocation sized
-/// for something the cap will refuse again: the next response finds the scratch
-/// back at exactly the cap.
+/// A subsystem name no decoder would accept — at either end of the range — is
+/// refused rather than framed into a message the far end must throw away.
 #[test]
-fn a_refused_response_returns_the_scratch_to_the_cap() -> Result<()> {
+fn an_unusable_subsystem_is_refused() -> Result<()> {
     let cap = FrameCap::new(1024)?;
     let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
-    let header = header("billing", ErrorCategory::Transient, None);
+    let too_long = "x".repeat(65);
 
-    let Err(EncodeError::TooLarge { .. }) = encoder.stage(&header, vec![0u8; cap.bytes() * 4])
-    else {
-        bail!("a response four times the cap must be refused");
-    };
-    let staged = encoder.stage(&header, vec![0u8; 8])?;
-    assert!(staged.bytes() < cap.bytes(), "a small response still fits");
-    assert_eq!(
-        encoder.scratch_capacity(),
-        cap.bytes(),
-        "the scratch must be back at the cap"
-    );
-    Ok(())
-}
-
-/// A subsystem name no decoder would accept is refused rather than framed into
-/// a message the far end must throw away.
-#[test]
-fn an_over_long_subsystem_is_refused() -> Result<()> {
-    let cap = FrameCap::new(1024)?;
-    let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
-    let header = header(&"x".repeat(65), ErrorCategory::Transient, None);
-
-    let Err(EncodeError::SubsystemTooLong { bytes, limit }) = encoder.stage(&header, Vec::new())
-    else {
-        bail!("a 65-byte subsystem name must be refused");
-    };
-    assert_eq!(
-        (bytes, limit),
-        (65, 64),
-        "the refusal must name the length and the limit"
-    );
+    for name in ["", &too_long] {
+        let header = header(name, ErrorCategory::Transient, None);
+        let Err(EncodeError::UnusableSubsystem { bytes, limit }) =
+            encoder.stage(&header, Vec::new())
+        else {
+            bail!("a {}-byte subsystem name must be refused", name.len());
+        };
+        assert_eq!(
+            (bytes, limit),
+            (name.len(), 64),
+            "the refusal must name the length and the limit"
+        );
+    }
     Ok(())
 }
 

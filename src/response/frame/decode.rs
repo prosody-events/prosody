@@ -72,14 +72,11 @@ pub(crate) fn decode_frame<B: Buf>(
             }
             FIELD_SUBSYSTEM => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
-                subsystem = Some(decode_text::<B, { SUBSYSTEM_MAX_BYTES + 1 }>(
-                    src,
-                    "subsystem",
-                )?);
+                subsystem = decode_text::<B, { SUBSYSTEM_MAX_BYTES + 1 }>(src, "subsystem")?;
             }
             FIELD_FORMAT => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
-                format = Some(decode_text::<B, { FORMAT_MAX_BYTES + 1 }>(src, "format")?);
+                format = decode_text::<B, { FORMAT_MAX_BYTES + 1 }>(src, "format")?;
             }
             FIELD_CATEGORY => {
                 check_wire_type(WireType::Varint, wire_type)?;
@@ -146,11 +143,18 @@ fn decode_id<B: Buf>(
 /// Reads a bounded UTF-8 field into an inline string. The claimed length is
 /// checked against the bound before a byte is copied, so the stack buffer is
 /// always large enough and no peer-claimed length ever sizes an allocation.
+///
+/// An empty string is protobuf's spelling of the default, which neither of this
+/// frame's text fields may be, so it reads as absent and the caller turns
+/// `None` into a missing-field error.
 fn decode_text<B: Buf, const N: usize>(
     src: &mut B,
     field: &'static str,
-) -> Result<Flexstr<N>, FrameDecodeError> {
+) -> Result<Option<Flexstr<N>>, FrameDecodeError> {
     let len = decode_varint(src)?;
+    if len == 0 {
+        return Ok(None);
+    }
     if len >= N as u64 {
         return Err(FrameDecodeError::StringTooLong {
             field,
@@ -168,7 +172,7 @@ fn decode_text<B: Buf, const N: usize>(
     let mut buf = [0u8; N];
     let len = len as usize;
     src.copy_to_slice(&mut buf[..len]);
-    Ok(Flexstr::make(from_utf8(&buf[..len])?))
+    Ok(Some(Flexstr::make(from_utf8(&buf[..len])?)))
 }
 
 /// Copies the payload into one allocation sized to the length the frame states,

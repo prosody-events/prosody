@@ -79,14 +79,14 @@ impl Display for NodeId {
     reason = "the node directory is this function's production caller; it is exercised by this \
               module's tests"
 )]
-pub(crate) fn select_host<R, H>(
+pub(crate) fn select_host<R, H, E>(
     configured: Option<Host>,
     routed: R,
     hostname: H,
-) -> Result<Host, whoami::Error>
+) -> Result<Host, E>
 where
     R: FnOnce() -> Option<Host>,
-    H: FnOnce() -> Result<Host, whoami::Error>,
+    H: FnOnce() -> Result<Host, E>,
 {
     if let Some(host) = configured {
         return Ok(host);

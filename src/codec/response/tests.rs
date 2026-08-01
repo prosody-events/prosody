@@ -70,8 +70,8 @@ fn each_arm_is_written_behind_its_discriminant() -> Result<()> {
     buffer.clear();
     codec.serialize(Err(Value::Bool(true)), &mut buffer)?;
     assert_eq!(
-        buffer.first(),
-        Some(&0x01),
+        buffer,
+        [0x01, b't', b'r', b'u', b'e'],
         "a failure is the error tag followed by the error codec's bytes"
     );
     Ok(())

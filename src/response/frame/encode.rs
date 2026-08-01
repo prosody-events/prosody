@@ -52,7 +52,7 @@ impl<C: Codec> FrameEncoder<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`EncodeError::SubsystemTooLong`] for a name no decoder would
+    /// Returns [`EncodeError::UnusableSubsystem`] for a name no decoder would
     /// accept, [`EncodeError::Codec`] when the codec fails, and
     /// [`EncodeError::TooLarge`] when the framed response would exceed the cap.
     pub(crate) fn stage<'a>(
@@ -62,12 +62,16 @@ impl<C: Codec> FrameEncoder<C> {
     ) -> Result<Staged<'a>, EncodeError<C::Error>> {
         const {
             assert!(
+                !C::FORMAT_ID.is_empty(),
+                "a codec used for responses must name a format"
+            );
+            assert!(
                 C::FORMAT_ID.len() <= FORMAT_MAX_BYTES,
                 "a codec used for responses must have a FORMAT_ID a frame can carry"
             );
         }
-        if header.subsystem.len() > SUBSYSTEM_MAX_BYTES {
-            return Err(EncodeError::SubsystemTooLong {
+        if header.subsystem.is_empty() || header.subsystem.len() > SUBSYSTEM_MAX_BYTES {
+            return Err(EncodeError::UnusableSubsystem {
                 bytes: header.subsystem.len(),
                 limit: SUBSYSTEM_MAX_BYTES,
             });
@@ -188,9 +192,10 @@ pub(super) fn write_bytes_field<B: BufMut>(tag: u32, value: &[u8], dst: &mut B) 
 /// Why one response could not be turned into a frame.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum EncodeError<E: Error> {
-    /// The subsystem name is longer than any decoder would accept.
-    #[error("subsystem name is {bytes} bytes, over the {limit}-byte limit")]
-    SubsystemTooLong {
+    /// The subsystem name is one no decoder would accept: a frame carries no
+    /// unnamed subsystem, and none longer than the limit.
+    #[error("subsystem name is {bytes} bytes, outside the 1..={limit} a frame carries")]
+    UnusableSubsystem {
         /// The name's length.
         bytes: usize,
         /// The longest name a frame may carry.

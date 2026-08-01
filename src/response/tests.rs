@@ -2,22 +2,9 @@ use super::ResponseDisposition;
 use strum::VariantArray;
 use tonic::Code;
 
-/// Success is not something a rejection can spell. Totality is the exhaustive
-/// `match` in [`ResponseDisposition::status`]; this pins which variant may
-/// claim `OK`.
-#[test]
-fn only_an_accepted_response_maps_to_ok() {
-    for disposition in ResponseDisposition::VARIANTS {
-        assert_eq!(
-            disposition.status() == Code::Ok,
-            matches!(disposition, ResponseDisposition::Accepted),
-            "{disposition:?} maps to {:?}",
-            disposition.status()
-        );
-    }
-}
-
-/// The status each disposition is reported as, one row per documented pair.
+/// The status each disposition is reported as, one row per documented pair —
+/// including the one row that may claim `OK`, since success is not something a
+/// rejection can spell.
 #[test]
 fn each_disposition_reports_its_documented_status() {
     let expected = [

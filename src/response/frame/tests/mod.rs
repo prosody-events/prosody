@@ -22,6 +22,9 @@ const UNKNOWN_TAG: u32 = 99;
 /// A well-formed 16-byte identifier.
 const RAW_ID: [u8; 16] = [0x11; 16];
 
+/// What a relay node costs a frame: key + length + the 16 identifier bytes.
+const RELAY_FIELD_BYTES: usize = 18;
+
 /// A codec whose payload is simply its bytes.
 ///
 /// The call counters are what make "the payload was serialized exactly once"
@@ -153,7 +156,7 @@ fn expected_frame_len(subsystem: &str, payload: usize, relay: bool) -> usize {
         + 2 + format                                  // format: key + len + bytes
         + 2                                           // category: key + value
         + 1 + varint_len(payload) + payload           // payload: key + len + bytes
-        + if relay { 18 } else { 0 }
+        + if relay { RELAY_FIELD_BYTES } else { 0 }
 }
 
 /// Bytes a protobuf varint of `value` occupies.

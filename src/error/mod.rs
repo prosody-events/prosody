@@ -73,3 +73,6 @@ impl TryFrom<i32> for ErrorCategory {
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error("unknown error category discriminant: {0}")]
 pub struct UnknownErrorCategory(pub i32);
+
+#[cfg(test)]
+mod tests;

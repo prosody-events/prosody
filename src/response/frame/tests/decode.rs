@@ -206,12 +206,65 @@ fn a_malformed_frame_is_refused_by_the_field_that_broke_it() -> Result<()> {
             },
             FrameDecodeError::MissingField("subsystem"),
         ),
+        // An explicitly empty string is protobuf's own spelling of an omitted
+        // one, so a decoder that refuses the omission must refuse this too.
+        (
+            RawFrame {
+                subsystem: Some(b""),
+                ..RawFrame::default()
+            },
+            FrameDecodeError::MissingField("subsystem"),
+        ),
+        (
+            RawFrame {
+                format: Some(b""),
+                ..RawFrame::default()
+            },
+            FrameDecodeError::MissingField("format"),
+        ),
     ];
     for (raw, expected) in cases {
         match decode_frame(&mut raw.encode(), cap) {
             Err(actual) => assert_eq!(actual, expected, "the frame was refused for another reason"),
             Ok(_) => bail!("the frame must be refused as {expected}"),
         }
+    }
+    Ok(())
+}
+
+/// A frame cut short is refused rather than read past its end: every
+/// length-delimited field reports the cut itself rather than trusting the
+/// length it claimed, and no cut smuggles bytes into a field the frame does not
+/// carry.
+#[test]
+fn a_frame_cut_short_is_refused_by_the_field_that_ran_out() -> Result<()> {
+    let cap = FrameCap::new(1024)?;
+    let wire = RawFrame::default().encode();
+    let mut cut = Vec::new();
+    for length in 0..wire.len() {
+        match decode_frame(&mut &wire[..length], cap) {
+            Err(FrameDecodeError::Truncated { field, .. }) => cut.push(field),
+            Err(_) => {}
+            // The payload is the fixture's last field and the one field whose
+            // default is legal, so a cut landing exactly on its key still
+            // decodes — as a frame that carries no payload at all.
+            Ok(frame) => assert!(
+                frame.payload.is_empty(),
+                "a frame cut at {length} bytes decoded a payload it does not carry"
+            ),
+        }
+    }
+    for field in [
+        "target_node",
+        "request_id",
+        "subsystem",
+        "format",
+        "payload",
+    ] {
+        assert!(
+            cut.contains(&field),
+            "a cut inside {field} must be reported there"
+        );
     }
     Ok(())
 }
