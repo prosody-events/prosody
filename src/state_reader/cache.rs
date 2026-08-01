@@ -33,10 +33,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::coop::cooperative;
 
-/// Inline key and value storage plus one cache bookkeeping word. Rust computes
-/// the target-specific layout, including padding and alignment.
-const READER_CACHE_ENTRY_OVERHEAD: u64 =
-    (size_of::<CacheKey>() + size_of::<CacheVal>() + size_of::<usize>()) as u64;
+/// Inline key and value storage. Rust computes the target-specific layout,
+/// including padding and alignment. Quick Cache's private allocations are not
+/// part of the declared weight.
+const READER_CACHE_ENTRY_INLINE_BYTES: u64 = (size_of::<CacheKey>() + size_of::<CacheVal>()) as u64;
 
 /// The cache key: the stable [`SourceId`], state namespace, collection name,
 /// partition key, and cell. The [`SourceId`] is stable, never an ordinal, so
@@ -68,7 +68,7 @@ impl Weighter<CacheKey, CacheVal> for ReaderWeighter {
             + 1
             + cell.coordinate.as_bytes().len();
         let val_bytes = val.1.as_ref().map_or(0, Bytes::len);
-        key_bytes as u64 + val_bytes as u64 + READER_CACHE_ENTRY_OVERHEAD
+        key_bytes as u64 + val_bytes as u64 + READER_CACHE_ENTRY_INLINE_BYTES
     }
 }
 
@@ -106,7 +106,7 @@ impl ReaderCache {
         // Estimate item count from the budget and the fixed overhead, so
         // quick_cache sizes its shards sensibly; the byte budget is the real
         // bound.
-        let estimated = (budget / READER_CACHE_ENTRY_OVERHEAD).max(1) as usize;
+        let estimated = (budget / READER_CACHE_ENTRY_INLINE_BYTES).max(1) as usize;
         let inner = Cache::with(
             estimated,
             budget,
