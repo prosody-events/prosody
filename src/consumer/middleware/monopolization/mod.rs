@@ -124,7 +124,7 @@ pub struct MonopolizationMiddleware {
     monopolization_threshold: f64,
     window_duration: Duration,
     reference_instant: Instant,
-    key_intervals: KeyIntervals,
+    key_intervals: Option<KeyIntervals>,
 }
 
 /// Provider that creates monopolization handlers for each partition.
@@ -134,7 +134,7 @@ pub struct MonopolizationProvider<T> {
     monopolization_threshold: f64,
     window_duration: Duration,
     reference_instant: Instant,
-    key_intervals: KeyIntervals,
+    key_intervals: Option<KeyIntervals>,
 }
 
 /// Handler wrapper that checks for monopolization before delegating to inner
@@ -145,7 +145,7 @@ pub struct MonopolizationHandler<T> {
     topic: Topic,
     partition: Partition,
     reference_instant: Instant,
-    key_intervals: KeyIntervals,
+    key_intervals: Option<KeyIntervals>,
     monopolization_threshold: f64,
     window_duration: Duration,
 }
@@ -161,9 +161,7 @@ impl MonopolizationConfiguration {
 impl MonopolizationMiddleware {
     /// Creates a new monopolization middleware with the given configuration.
     ///
-    /// Returns `None` if monopolization detection is disabled in the config.
-    /// The returned `Option<Self>` implements `HandlerMiddleware` directly,
-    /// passing through to the inner handler when `None`.
+    /// Disabled middleware retains no key cache and passes every event through.
     ///
     /// # Errors
     ///
@@ -171,12 +169,17 @@ impl MonopolizationMiddleware {
     pub fn new(
         config: &MonopolizationConfiguration,
         telemetry: &Telemetry,
-    ) -> Result<Option<Self>, MonopolizationInitError> {
+    ) -> Result<Self, MonopolizationInitError> {
         config.validate()?;
 
         if !config.enabled {
             debug!("Monopolization detection disabled by configuration");
-            return Ok(None);
+            return Ok(Self {
+                monopolization_threshold: config.monopolization_threshold,
+                window_duration: config.window_duration,
+                reference_instant: Instant::now(),
+                key_intervals: None,
+            });
         }
 
         let reference_instant = Instant::now();
@@ -200,12 +203,12 @@ impl MonopolizationMiddleware {
             telemetry_rx,
         ));
 
-        Ok(Some(Self {
+        Ok(Self {
             monopolization_threshold: config.monopolization_threshold,
             window_duration,
             reference_instant,
-            key_intervals,
-        }))
+            key_intervals: Some(key_intervals),
+        })
     }
 }
 
@@ -226,7 +229,7 @@ impl<P: Send + Sync + 'static> HandlerMiddleware<P> for MonopolizationMiddleware
             monopolization_threshold: self.monopolization_threshold,
             window_duration: self.window_duration,
             reference_instant: self.reference_instant,
-            key_intervals: Arc::clone(&self.key_intervals),
+            key_intervals: self.key_intervals.clone(),
         }
     }
 }
@@ -243,7 +246,7 @@ where
             topic,
             partition,
             reference_instant: self.reference_instant,
-            key_intervals: Arc::clone(&self.key_intervals),
+            key_intervals: self.key_intervals.clone(),
             monopolization_threshold: self.monopolization_threshold,
             window_duration: self.window_duration,
         }
@@ -331,10 +334,12 @@ where
     }
 
     async fn shutdown(self) {
-        debug!(
-            tracked_keys = self.key_intervals.len(),
-            "Monopolization handler shutting down"
-        );
+        if let Some(key_intervals) = &self.key_intervals {
+            debug!(
+                tracked_keys = key_intervals.len(),
+                "Monopolization handler shutting down"
+            );
+        }
         self.handler.shutdown().await;
     }
 }
@@ -370,7 +375,7 @@ where
         now: Instant,
     ) -> Option<MonopolizationError<T::Error>> {
         // No intervals tracked for this key yet - fast path
-        let intervals = self.key_intervals.get(tp_key)?;
+        let intervals = self.key_intervals.as_ref()?.get(tp_key)?;
 
         let now_nanos = now
             .saturating_duration_since(self.reference_instant)

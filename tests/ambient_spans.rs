@@ -16,6 +16,7 @@
 
 use color_eyre::eyre::{Result, eyre};
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
+use prosody::high_level::CassandraHighLevelClient;
 use prosody::prelude::*;
 use prosody::timers::duration::CompactDuration;
 use prosody::{JsonCodec, Topic};
@@ -115,15 +116,15 @@ async fn handlers_run_inside_their_event_spans() -> Result<()> {
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_config,
-        ..ConsumerBuilders::default()
+        ..ConsumerBuilders::new()?
     };
 
     let (sender, mut receiver) = channel(4);
-    let client = HighLevelClient::<AmbientProbe, JsonCodec>::new(
+    let client = CassandraHighLevelClient::<AmbientProbe, JsonCodec>::new(
+        cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-        &cassandra_config,
     )?;
 
     let fire_at = CompactDateTime::now()?.add_duration(CompactDuration::new(2))?;

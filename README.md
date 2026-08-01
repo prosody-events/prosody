@@ -122,11 +122,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..ConsumerBuilders::default()
     };
 
-    let client: HighLevelClient<MyHandler> = HighLevelClient::new(
+    let client: CassandraHighLevelClient<MyHandler> = CassandraHighLevelClient::new(
+        cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-        &cassandra_config,
     )?;
 
     client.subscribe(MyHandler).await?;
@@ -169,6 +169,68 @@ count.set(json!(current + 1)).await?;
 ```
 
 Keyed-state cache and recovery settings are listed in [CONFIGURATION.md](CONFIGURATION.md#keyed-state-pipeline-mode).
+
+### Reading another group's state
+
+By default a collection is private to the consumer group that owns it. Mark a
+collection `.published(true)` and give the owning consumer a `subsystem` name,
+and other services can read that state without owning the partition or running
+the write machinery. A published collection with no subsystem is rejected at
+registration. The builder field falls back to `PROSODY_SUBSYSTEM` when unset.
+
+```rust,ignore
+// One descriptor configures both the owning handle and the published reader.
+let current_order = value_state("current-order").published(true);
+let config = KeyedStateConfiguration::builder()
+    .subsystem(Some(SubsystemName::try_new("checkout")?))
+    .build()?;
+// After constructing the owning client with `config`:
+let registered_order = owner.register(current_order).await?;
+
+// Inside the owner's handler, the current event supplies the state key.
+let state = context.state(registered_order)?;
+let value = state.get().await?;
+state.set(updated).await?;
+```
+
+Any other service reads it through the same high-level client, naming the
+subsystem and the same collection shape:
+
+```rust,ignore
+// Outside a handler, each read supplies the state key explicitly.
+let reader = client
+    .state(SubsystemName::try_new("checkout")?, current_order)
+    .await?;
+let value = reader.get("customer-123").await?; // committed value from the owning group
+```
+
+A reader observes only **committed** state — never an in-flight value and never
+the reader's own writes — read from a single publication source per operation.
+Reads are cached for 5 seconds by default. Override the default per process
+with `PROSODY_STATE_READ_CACHE_TTL` (`none` disables caching), or per
+collection with `.read_cache(...)`, which always wins over the process
+default. `PROSODY_STATE_OWNED_CACHE_SIZE` and
+`PROSODY_STATE_READ_CACHE_SIZE` accept human-readable values such as `64 MiB`;
+the read cache uses `PROSODY_STATE_OWNED_CACHE_SIZE` when set, or 1 MiB when
+both size variables are unset. Pass
+`ReadCachePolicy::Disabled` to `.read_cache(...)` when one
+collection must always read the store despite an enabled process default. A
+cached value was the store's committed answer within the last cache TTL. There
+is no ordering guarantee across sources. The two TTLs never interact: `.ttl`
+bounds how long the owner's written state is **retained** (Cassandra `USING
+TTL`, seconds granularity); `.read_cache` bounds how **stale** this read-only
+client tolerates a cached value (sub-second `Duration`s are fine). A process
+with no consumer of its own can build `StateReaderDependencies::cassandra`,
+then pass it to `StateReaderClient::new`. The high-level client shares one
+dependency family across its consumer and all readers, so composing a reader
+never opens a second Cassandra session, Kafka loader, or cache.
+
+**Retiring a published collection.** Change the collection to
+`.published(false)`. Keep its registration and the consumer's `subsystem` for
+one complete stop-then-start deployment. Startup reconciliation then removes
+the routing row. Deleting the registration or subsystem first strands the
+routing row. Routing rows and committed state have no automatic expiry, so
+other groups can continue to discover and read the collection.
 
 ## Quality of Service
 

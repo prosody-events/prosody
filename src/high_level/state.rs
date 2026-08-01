@@ -9,6 +9,7 @@ use crate::consumer::ProsodyConsumer;
 use crate::high_level::config::{
     ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
 };
+use educe::Educe;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
@@ -30,7 +31,11 @@ impl<T, C: Codec> Deref for ConsumerStateView<'_, T, C> {
 }
 
 /// Represents the current state of the consumer.
-#[derive(Debug, Default)]
+///
+/// Reader infrastructure belongs to the high-level client's reader component,
+/// not this subscription state machine.
+#[derive(Educe, Default)]
+#[educe(Debug)]
 pub enum ConsumerState<T, C: Codec> {
     /// The consumer is not yet configured.
     #[default]
@@ -38,7 +43,10 @@ pub enum ConsumerState<T, C: Codec> {
     /// The consumer configuration failed during build.
     ConfigurationFailed(ModeConfigurationError),
     /// The consumer is configured but not running.
-    Configured(ModeConfiguration),
+    Configured {
+        /// The configuration to run when subscribed.
+        config: ModeConfiguration,
+    },
     /// The consumer is actively running.
     Running {
         /// The active Prosody consumer instance.
@@ -56,7 +64,9 @@ impl<T, C: Codec> ConsumerState<T, C> {
     /// [`ConsumerState::ConfigurationFailed`] with the error otherwise.
     pub(crate) fn build(params: &ModeConfigurationBuildParams) -> Self {
         match ModeConfiguration::build(params) {
-            Ok(configuration) => Self::Configured(configuration),
+            Ok(configuration) => Self::Configured {
+                config: configuration,
+            },
             Err(error) => {
                 info!("disabling consumer (safe to ignore if you're only producing): {error:#}");
                 Self::ConfigurationFailed(error)
@@ -70,7 +80,7 @@ impl<T, C: Codec> Display for ConsumerState<T, C> {
         let state = match self {
             ConsumerState::Unconfigured => "unconfigured",
             ConsumerState::ConfigurationFailed(_) => "configuration failed",
-            ConsumerState::Configured(_) => "configured",
+            ConsumerState::Configured { .. } => "configured",
             ConsumerState::Running { .. } => "running",
         };
 

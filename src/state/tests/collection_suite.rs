@@ -47,7 +47,7 @@ use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::resolve::sweep_provisional;
 use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
 use crate::state::session::{
-    CellSession, Finalized, KeyedStateSession, SessionParts, TerminationWatch,
+    CellRead, Finalized, KeyedStateSession, SessionParts, TerminationWatch,
 };
 use crate::state::store::CellStore;
 use crate::state::{
@@ -97,7 +97,7 @@ type SuiteSession = KeyedStateSession<SuiteBackend, MemoryLoader<Value>>;
 /// The bounded key space the Map trace ranges over — small and spanning the
 /// sign boundary so re-inserts, removes, and ordered scans across negative and
 /// positive `i64` keys all occur.
-const KEY_POOL: [i64; 5] = [-2, -1, 0, 1, 2];
+pub(crate) const KEY_POOL: [i64; 5] = [-2, -1, 0, 1, 2];
 
 /// Max ops per event, keeping each event's batch small while the trace as a
 /// whole still grows and drains the collection.
@@ -233,6 +233,17 @@ impl<O: Arbitrary> Arbitrary for Trace<O> {
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         Box::new(self.events.shrink().map(|events| Self { events }))
+    }
+}
+
+impl<O> Trace<O> {
+    /// The per-event op slices, in order.
+    ///
+    /// The `state_reader` test suite replays these ops but always promotes
+    /// every event. A `StateReader` only observes committed state, so the
+    /// per-event outcome does not matter there.
+    pub(crate) fn events_ops(&self) -> impl Iterator<Item = &[O]> + '_ {
+        self.events.iter().map(|event| event.ops.as_slice())
     }
 }
 
@@ -388,6 +399,7 @@ fn make_session_with_dirty(
         recovery_delay: CompactDuration::new(30),
         armed: armed.clone(),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        publisher: None,
     })
 }
 
@@ -1405,7 +1417,7 @@ fn assert_keyset_present(
 /// endpoint peeks (`peek_front == get(0)`, `peek_back == get(len-1)`).
 async fn assert_deque<S, C>(handle: &DequeHandle<S, C>, model: &VecDeque<Value>) -> Result<bool>
 where
-    S: CellSession,
+    S: CellRead,
     C: Codec<Payload = Value>,
 {
     if handle.len().await? != model.len() || handle.is_empty().await? != model.is_empty() {
@@ -1435,7 +1447,7 @@ where
 /// `len` is separately pinned to the model at every call site.
 async fn assert_peeks<S, C>(handle: &DequeHandle<S, C>) -> Result<bool>
 where
-    S: CellSession,
+    S: CellRead,
     C: Codec<Payload = Value>,
 {
     if handle.peek_front().await? != handle.get(0).await? {
@@ -1466,7 +1478,7 @@ where
 /// Collects a deque handle's `stream(dir)` into a vector.
 async fn collect_deque<S, C>(handle: &DequeHandle<S, C>, dir: Direction) -> Result<Vec<Value>>
 where
-    S: CellSession,
+    S: CellRead,
     C: Codec<Payload = Value>,
 {
     drain(handle.stream(dir)).await
@@ -1480,7 +1492,7 @@ async fn assert_map<S>(
     model: &BTreeMap<i64, Value>,
 ) -> Result<bool>
 where
-    S: CellSession,
+    S: CellRead,
 {
     for key in KEY_POOL {
         let got = handle.get(&key).await?;
@@ -1515,7 +1527,7 @@ async fn collect_map<S>(
     dir: Direction,
 ) -> Result<Vec<(i64, Value)>>
 where
-    S: CellSession,
+    S: CellRead,
 {
     drain(handle.stream(dir)).await
 }
@@ -1526,7 +1538,7 @@ async fn collect_map_keys<S>(
     dir: Direction,
 ) -> Result<Vec<i64>>
 where
-    S: CellSession,
+    S: CellRead,
 {
     drain(handle.keys(dir)).await
 }

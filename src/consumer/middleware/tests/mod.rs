@@ -154,6 +154,23 @@ struct RecordingGuard {
     aborted: Arc<AtomicUsize>,
 }
 
+impl RecordingGuard {
+    /// A fresh guard and the two counters it records into, in
+    /// `(guard, committed, aborted)` order.
+    fn new() -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let committed: Arc<AtomicUsize> = Arc::default();
+        let aborted: Arc<AtomicUsize> = Arc::default();
+        (
+            Self {
+                committed: committed.clone(),
+                aborted: aborted.clone(),
+            },
+            committed,
+            aborted,
+        )
+    }
+}
+
 impl Uncommitted for RecordingGuard {
     async fn commit(self) {
         self.committed.fetch_add(1, Ordering::SeqCst);
@@ -512,12 +529,7 @@ mod staged_rollback {
         let (context, cell_store, cart_id) = buffered(Ctx::with_shutdown_on_timer_read).await?;
         let handler = ProbeHandler::ok(0);
         let log = handler.log.clone();
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(&handler, context, guard, Ok(0)).await;
 
@@ -597,6 +609,7 @@ mod staged_rollback {
                 recovery_delay: CompactDuration::new(30),
                 armed: Arc::default(),
                 termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+                publisher: None,
             });
         let context = MockEventContext::new()
             .with_session(session)
@@ -611,12 +624,7 @@ mod staged_rollback {
         handle.set(json!({ "x": 1_i32 })).await?;
 
         let handler = ProbeHandler::ok(0);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(&handler, context.clone(), guard, Ok(0)).await;
 
@@ -751,6 +759,7 @@ mod staged_rollback {
                 recovery_delay: CompactDuration::new(30),
                 armed: Arc::default(),
                 termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+                publisher: None,
             });
 
         // A nested retry's epoch bump: `reset` discards the (empty) dirty and
@@ -769,12 +778,7 @@ mod staged_rollback {
         let context = MockEventContext::new().with_session(session);
         let read = Arc::new(Mutex::new(None));
         let handler = SkipReadProbe { read: read.clone() };
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, _aborted) = RecordingGuard::new();
 
         settle(&handler, context, guard, Ok(0)).await;
 
@@ -837,12 +841,7 @@ mod staged_rollback {
                     return TestResult::error("failed to buffer the write");
                 };
                 let handler = ProbeHandler::ok(0);
-                let committed = Arc::new(AtomicUsize::new(0));
-                let aborted = Arc::new(AtomicUsize::new(0));
-                let guard = RecordingGuard {
-                    committed: committed.clone(),
-                    aborted: aborted.clone(),
-                };
+                let (guard, committed, aborted) = RecordingGuard::new();
 
                 settle(&handler, context, guard, Ok(0)).await;
 
@@ -877,6 +876,8 @@ mod staged_rollback {
     }
 }
 
+mod publication;
+
 /// Post-settle hook visibility: `finalize` drains the event's dirty overlay
 /// on success, so the apply hooks read the **lower store** — the per-cell
 /// committed projection, where an own-event provisional cell answers its
@@ -899,7 +900,9 @@ mod hook_visibility {
     use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
     use crate::state::oracle::CommitOracle;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
+    use crate::state::session::{
+        CellRead, CellWrite, KeyedStateSession, SessionParts, TerminationWatch,
+    };
     use crate::state::store::CellStore;
     use crate::state::tests::cell_suite::{FailingCellStore, value_cell};
     use crate::state::{
@@ -1039,12 +1042,7 @@ mod hook_visibility {
             )
             .await?;
         let handler = HookProbe::new(vec![StateName::try_new("cart")?]);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(&handler, context, guard, Ok(0)).await;
 
@@ -1151,6 +1149,7 @@ mod hook_visibility {
                 recovery_delay: CompactDuration::new(30),
                 armed: Arc::default(),
                 termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+                publisher: None,
             });
         session
             .set(StateType::Application, &cart, &value_cell(), b"staged")
@@ -1158,12 +1157,7 @@ mod hook_visibility {
         let context = base.with_session(session);
 
         let handler = HookProbe::new(vec![cart]);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(&handler, context, guard, Ok(0)).await;
 
@@ -1248,6 +1242,7 @@ mod hook_visibility {
                 recovery_delay: CompactDuration::new(30),
                 armed: Arc::default(),
                 termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+                publisher: None,
             });
         session
             .set(StateType::Application, &cart, &value_cell(), b"A1")
@@ -1258,12 +1253,7 @@ mod hook_visibility {
         let context = MockEventContext::new().with_session(session);
 
         let handler = HookProbe::new(vec![cart, wishlist]);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(&handler, context, guard, Ok(0)).await;
 
@@ -1833,6 +1823,7 @@ mod marker_record_must_succeed {
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+            publisher: None,
         });
         let cart_id = CollectionId::new(
             state_key,
@@ -1888,12 +1879,7 @@ mod marker_record_must_succeed {
         handle.set(json!({ "x": 1_i32 })).await?;
 
         let handler = ProbeHandler::ok(0);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(
             &handler,
@@ -1929,12 +1915,7 @@ mod marker_record_must_succeed {
         handle.set(json!({ "x": 1_i32 })).await?;
 
         let handler = ProbeHandler::ok(0);
-        let committed = Arc::new(AtomicUsize::new(0));
-        let aborted = Arc::new(AtomicUsize::new(0));
-        let guard = RecordingGuard {
-            committed: committed.clone(),
-            aborted: aborted.clone(),
-        };
+        let (guard, committed, aborted) = RecordingGuard::new();
 
         settle(
             &handler,
@@ -1975,12 +1956,7 @@ mod marker_record_must_succeed {
             let (session, _cell_store, _cart_id) = flaky_session(oracle.clone(), timer)?;
             let context = MockEventContext::new().with_session(session);
             let handler = ProbeHandler::ok(0);
-            let committed = Arc::new(AtomicUsize::new(0));
-            let aborted = Arc::new(AtomicUsize::new(0));
-            let guard = RecordingGuard {
-                committed: committed.clone(),
-                aborted: aborted.clone(),
-            };
+            let (guard, committed, aborted) = RecordingGuard::new();
 
             settle(&handler, context, guard, result).await;
 
@@ -2032,12 +2008,7 @@ mod marker_record_must_succeed {
                 }
 
                 let handler = ProbeHandler::ok(0);
-                let committed = Arc::new(AtomicUsize::new(0));
-                let aborted = Arc::new(AtomicUsize::new(0));
-                let guard = RecordingGuard {
-                    committed: committed.clone(),
-                    aborted: aborted.clone(),
-                };
+                let (guard, committed, aborted) = RecordingGuard::new();
 
                 settle(&handler, context, guard, Ok(0)).await;
 
@@ -2087,14 +2058,12 @@ mod marker_record_must_succeed {
 
 /// Settlement classification tables for the wrappers without their own
 /// tests module: the pure pass-throughs (retry mid-stack, log, timeout,
-/// telemetry), `OptionHandler`'s per-branch delegation, and the `LeafHandler`
-/// chain terminator. Delegation is proven
+/// telemetry) and the `LeafHandler` chain terminator. Delegation is proven
 /// against [`BypassedHandler`], whose classification is `Bypassed` for every
 /// result — a wrapper hardcoding `Final` fails those rows.
 mod settlement_classification {
     use super::*;
     use crate::consumer::middleware::log::LogHandler;
-    use crate::consumer::middleware::optional::{OptionError, OptionHandler, OptionOutput};
     use crate::consumer::middleware::providers::LeafHandler;
     use crate::consumer::middleware::retry::RetryHandler;
     use crate::consumer::middleware::telemetry::TelemetryHandler;
@@ -2158,43 +2127,6 @@ mod settlement_classification {
         let err: Result<(), SupportError> = Err(SupportError(ErrorCategory::Permanent));
         assert_eq!(Subject::settlement(ok.as_ref()), Settlement::Final);
         assert_eq!(Subject::settlement(err.as_ref()), Settlement::Final);
-    }
-
-    /// `OptionHandler` delegates to whichever branch produced the result,
-    /// on both sides.
-    #[test]
-    fn option_handler_delegates_per_branch() {
-        type Subject = OptionHandler<ScriptedHandler, BypassedHandler>;
-        type Out = OptionOutput<(), ()>;
-        type Err_ = OptionError<SupportError, SupportError>;
-
-        let rows: Vec<(&str, Result<Out, Err_>, Settlement)> = vec![
-            (
-                "Enabled Ok delegates to the enabled branch (Final)",
-                Ok(OptionOutput::Enabled(())),
-                Settlement::Final,
-            ),
-            (
-                "Disabled Ok delegates to the disabled branch (Bypassed probe)",
-                Ok(OptionOutput::Disabled(())),
-                Settlement::Bypassed,
-            ),
-            (
-                "Enabled Err delegates to the enabled branch (Final)",
-                Err(OptionError::Enabled(SupportError(ErrorCategory::Permanent))),
-                Settlement::Final,
-            ),
-            (
-                "Disabled Err delegates to the disabled branch (Bypassed probe)",
-                Err(OptionError::Disabled(SupportError(
-                    ErrorCategory::Permanent,
-                ))),
-                Settlement::Bypassed,
-            ),
-        ];
-        for (label, result, expected) in rows {
-            assert_eq!(Subject::settlement(result.as_ref()), expected, "{label}");
-        }
     }
 }
 
@@ -2609,6 +2541,7 @@ mod settled_view {
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+            publisher: None,
         });
         let context = MockEventContext::new()
             .with_session(session)

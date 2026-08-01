@@ -77,7 +77,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::{CellKey, Coordinate};
 use crate::state::cell_key::{Direction, ScanEdge, Section};
 use crate::state::order_codec::{I64KeyCodec, UnitKey};
-use crate::state::session::{CellSession, MutatePermit, OpPermit};
+use crate::state::session::{CellRead, CellWrite};
 use crate::state::{CollectionKindId, StoreOutcome};
 use async_stream::try_stream;
 use educe::Educe;
@@ -164,11 +164,11 @@ pub struct DequeKind<T>(PhantomData<fn() -> T>);
 
 impl<T: CellType<Key = UnitKey>> CollectionSpec for DequeKind<T> {
     type Cell = Keyed<I64KeyCodec, T>;
-    type Handle<S: CellSession> = DequeHandle<S, T>;
+    type Handle<S: CellRead> = DequeHandle<S, T>;
 
     const KIND: CollectionKindId = CollectionKindId::Deque;
 
-    fn handle<S: CellSession>(scope: CellScope<S>) -> DequeHandle<S, T> {
+    fn handle<S: CellRead>(scope: CellScope<S>) -> DequeHandle<S, T> {
         DequeHandle {
             entries: scope.typed(ENTRY_SECTION),
             meta: scope.typed(META_SECTION),
@@ -191,7 +191,7 @@ pub struct DequeHandle<S, T> {
 
 impl<S, T> DequeHandle<S, T>
 where
-    S: CellSession,
+    S: CellRead,
     T: CellType<Key = UnitKey>,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
@@ -446,14 +446,21 @@ where
     /// `head ≤ tail`.
     async fn bounds(
         &self,
-        permit: &OpPermit<'_>,
+        permit: &S::Permit<'_>,
     ) -> Result<Window, DequeStateError<CellCodecError<T>>> {
         match self.meta.get(permit, &()).await.map_err(meta_err)? {
             Some((head, tail)) => Ok(Window::new(head, tail)?),
             None => Ok(Window { head: 0, tail: 0 }),
         }
     }
+}
 
+impl<S, T> DequeHandle<S, T>
+where
+    S: CellWrite,
+    T: CellType<Key = UnitKey>,
+    for<'s> ContextOf<'s, T>: FromSession<'s, S>,
+{
     /// Appends `value` at the back, extending the window to `tail + 1`.
     ///
     /// # Bounded capacity
@@ -606,7 +613,7 @@ where
     }
 
     /// Durably commits this deque's buffered ops mid-handler — entries and
-    /// the window bounds together. At-least-once; see [`CellSession::commit`]
+    /// the window bounds together. At-least-once; see [`CellWrite::commit`]
     /// for the contract, including the over-budget batch split.
     ///
     /// # Errors
@@ -621,7 +628,7 @@ where
     /// Discards this deque's buffered uncommitted ops — entries and the window
     /// bounds together — reverting reads to the last [`commit`](Self::commit),
     /// or the pre-event committed state if none. Infallible; see
-    /// [`CellSession::rollback`] for the contract.
+    /// [`CellWrite::rollback`] for the contract.
     #[instrument(name = "deque.rollback", skip_all, fields(collection = self.entries.name().as_str()))]
     pub async fn rollback(&self) -> StoreOutcome {
         self.entries.rollback().await
@@ -629,7 +636,9 @@ where
 
     /// Acquires the session operation gate for a mutator, re-homing the
     /// closed-session error under the deque's error type.
-    async fn mutate_permit(&self) -> Result<MutatePermit<'_>, DequeStateError<CellCodecError<T>>> {
+    async fn mutate_permit(
+        &self,
+    ) -> Result<S::MutatePermit<'_>, DequeStateError<CellCodecError<T>>> {
         self.entries
             .mutate_permit()
             .await
@@ -640,7 +649,7 @@ where
     /// also buffers, so the move and its entry stage together (module docs).
     async fn write_bounds(
         &self,
-        permit: &MutatePermit<'_>,
+        permit: &S::MutatePermit<'_>,
         head: i64,
         tail: i64,
     ) -> Result<(), DequeStateError<CellCodecError<T>>> {

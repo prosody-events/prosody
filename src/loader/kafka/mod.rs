@@ -2,7 +2,7 @@
 //!
 //! This module provides [`KafkaLoader`], which loads specific messages from
 //! Kafka by their exact offset coordinates (topic, partition, offset). The
-//! loader is used by the defer middleware to reload failed messages for retry.
+//! deferral and keyed state share the same loader.
 //!
 //! # Architecture
 //!
@@ -43,7 +43,7 @@
 //! This approach avoids upfront offset validation (which requires metadata
 //! queries) and lets rdkafka handle offset recovery automatically.
 
-use super::MessageLoader;
+use super::{MessageLoader, PermitMode};
 use crate::consumer::ConsumerConfiguration;
 use crate::consumer::decode::{DecodedMessage, decode_message};
 use crate::consumer::message::ConsumerMessage;
@@ -68,7 +68,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, TryAcquireError, mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use tracing::field::Empty;
 use tracing::{Span, debug, error, instrument, warn};
@@ -76,6 +76,7 @@ use tracing::{Span, debug, error, instrument, warn};
 use crate::Codec;
 use crate::otel::SpanRelation;
 use crate::related_span;
+use crate::state::RESOLVE_FANOUT;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use derive_builder::Builder;
 use tokio::select;
@@ -128,8 +129,7 @@ type ActiveRequests<P> = HashMap<(Topic, Partition), PartitionState<P>>;
 
 /// Configuration for the Kafka message loader.
 ///
-/// Controls performance characteristics and resource usage of the defer
-/// middleware loader that loads failed messages for retry.
+/// Controls the shared loader's performance and resource usage.
 #[derive(Clone, Debug)]
 pub struct LoaderConfiguration {
     /// Kafka broker addresses.
@@ -137,16 +137,12 @@ pub struct LoaderConfiguration {
     /// List of host:port pairs for initial connection to the Kafka cluster.
     pub bootstrap_servers: Vec<String>,
 
-    /// Consumer group ID base name.
-    ///
-    /// The loader will append `-deferred-loader` to create a unique group
-    /// ID, ensuring no conflicts with the primary consumer.
+    /// Consumer group ID base name. The loader appends `.loader`.
     pub group_id: String,
 
-    /// Maximum number of concurrent message decoding operations.
+    /// Maximum number of loaded messages retained by callers.
     ///
-    /// Controls the size of the semaphore used for decoding permits
-    /// and the capacity of the request channel.
+    /// Controls the semaphore and request-channel capacity.
     pub max_permits: usize,
 
     /// Maximum number of messages to cache.
@@ -186,14 +182,13 @@ impl LoaderConfiguration {
     /// The connection and concurrency fields come from
     /// [`ConsumerConfiguration`]; the loader-specific tuning
     /// (`cache_size`, `seek_timeout`, `discard_threshold`) comes from its
-    /// [`KafkaLoaderConfiguration`]. A `{group_id}.defer-loader` group keeps
-    /// the loader out of the primary consumer's group coordination.
+    /// [`KafkaLoaderConfiguration`].
     #[must_use]
-    fn for_consumer(consumer_config: &ConsumerConfiguration) -> Self {
+    pub(crate) fn for_consumer(consumer_config: &ConsumerConfiguration) -> Self {
         Self {
             bootstrap_servers: consumer_config.bootstrap_servers.clone(),
-            group_id: format!("{}.defer-loader", consumer_config.group_id),
-            max_permits: consumer_config.max_uncommitted,
+            group_id: consumer_config.group_id.clone(),
+            max_permits: loader_capacity(consumer_config.max_uncommitted),
             cache_size: consumer_config.loader.cache_size,
             poll_interval: consumer_config.poll_interval,
             seek_timeout: consumer_config.loader.seek_timeout,
@@ -335,7 +330,16 @@ where
         partition: Partition,
         offset: Offset,
     ) -> impl Future<Output = Result<ConsumerMessage<C::Payload>, Self::Error>> + Send {
-        self.load_message_impl(topic, partition, offset)
+        self.load_message_impl(topic, partition, offset, PermitMode::Wait)
+    }
+
+    fn try_load_message(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        offset: Offset,
+    ) -> impl Future<Output = Result<ConsumerMessage<C::Payload>, Self::Error>> + Send {
+        self.load_message_impl(topic, partition, offset, PermitMode::Available)
     }
 }
 
@@ -352,7 +356,7 @@ where
     ///
     /// The consumer is configured with:
     /// - `client.id`: hostname or UUID (unique per instance)
-    /// - `group.id`: `{config.group_id}-deferred-loader`
+    /// - `group.id`: `{config.group_id}.loader`
     /// - `auto.offset.reset=earliest` for recovery from deleted offsets
     /// - `enable.auto.commit=false` (manual offset management)
     /// - `enable.auto.offset.store=false` (manual seek/assign)
@@ -366,7 +370,7 @@ where
         config: LoaderConfiguration,
         heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, KafkaLoaderError> {
-        let group_id = format!("{}-deferred-loader", config.group_id);
+        let group_id = format!("{}.loader", config.group_id);
         let client_id = hostname().map_err(|error| KafkaLoaderError::Hostname(Arc::new(error)))?;
 
         // Point lookups don't benefit from prefetching. Start with small fetch
@@ -405,11 +409,7 @@ where
         })
     }
 
-    /// Builds a [`KafkaLoader`] configured from the surrounding consumer and
-    /// defer settings.
-    ///
-    /// Derives a `{group_id}.defer-loader` consumer group so the loader does
-    /// not conflict with the primary consumer's group coordination.
+    /// Builds a [`KafkaLoader`] configured from the surrounding consumer.
     ///
     /// # Errors
     ///
@@ -435,30 +435,35 @@ where
     /// Fails with [`KafkaLoaderError::LoaderShutdown`] if the semaphore or
     /// either channel has closed, or with a decode/Kafka error if the message
     /// can't be found or decoded.
-    #[instrument(level = "debug", skip(self), fields(cached = Empty), err)]
+    #[instrument(level = "debug", skip(self, mode), fields(cached = Empty), err)]
     async fn load_message_impl(
         &self,
         topic: Topic,
         partition: Partition,
         offset: Offset,
+        mode: PermitMode,
     ) -> Result<ConsumerMessage<C::Payload>, KafkaLoaderError> {
-        let instrument_span = Span::current();
-
         debug!(
             topic = %topic,
             partition = partition,
             offset = offset,
-            "Acquiring permit for deferred message load"
+            "Acquiring permit for message load"
         );
 
-        // Acquire load permit for the returned message (backpressure)
-        let load_permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| KafkaLoaderError::LoaderShutdown)?;
-
+        let semaphore = self.semaphore.clone();
+        let load_permit = match mode {
+            PermitMode::Wait => semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| KafkaLoaderError::LoaderShutdown)?,
+            PermitMode::Available => {
+                semaphore.try_acquire_owned().map_err(|error| match error {
+                    TryAcquireError::Closed => KafkaLoaderError::LoaderShutdown,
+                    TryAcquireError::NoPermits => KafkaLoaderError::CapacityExhausted,
+                })?
+            }
+        };
+        let instrument_span = Span::current();
         let cache_key = (topic, partition, offset);
 
         // Get decoded message from cache or load from Kafka, tracking cache status
@@ -468,7 +473,7 @@ where
                 topic = %topic,
                 partition = partition,
                 offset = offset,
-                "Loading deferred message from cache"
+                "Loading message from cache"
             );
             (cached, true)
         } else {
@@ -504,7 +509,7 @@ where
             topic = %topic,
             partition = partition,
             offset = offset,
-            "Loading deferred message from Kafka"
+            "Loading message from Kafka"
         );
 
         // Create response channel
@@ -539,7 +544,7 @@ where
             topic = %topic,
             partition = partition,
             offset = offset,
-            "Deferred message cached for future loads"
+            "Message cached for future loads"
         );
 
         Ok(decoded)
@@ -571,7 +576,7 @@ fn poll_loop<C: Codec>(
     let propagator = new_propagator();
     let mut codec = C::default();
 
-    debug!("Deferred message loader poll loop started");
+    debug!("Message loader poll loop started");
 
     loop {
         heartbeat.beat();
@@ -582,7 +587,7 @@ fn poll_loop<C: Codec>(
                 Ok(request) => handle_request(request, &mut active, consumer),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    debug!("Deferred message loader poll loop shutting down");
+                    debug!("Message loader poll loop shutting down");
                     return;
                 }
             }
@@ -658,7 +663,7 @@ fn process_poll_result<C: Codec>(
     let mut message = match result {
         Ok(message) => message,
         Err(error) => {
-            error!(error = %format_args!("{error:#}"), "Error polling for deferred message");
+            error!(error = %format_args!("{error:#}"), "Error polling for message");
             return;
         }
     };
@@ -741,7 +746,7 @@ fn notify_deleted_offsets<P>(
             requested_offset = requested_offset,
             next_offset = next_offset,
             affected_requests = senders.len(),
-            "Deferred message offset no longer exists (deleted by retention or compaction)"
+            "Message offset no longer exists (deleted by retention or compaction)"
         );
         let error = KafkaLoaderError::OffsetDeleted {
             topic,
@@ -769,19 +774,19 @@ fn fulfill_requests<C: Codec>(
 {
     let request_count = senders.len();
     debug!(topic = %topic, partition = partition, offset = offset, request_count = request_count,
-        "Fulfilling active requests for deferred message");
+        "Fulfilling active requests for message");
 
     let decoded_message = decode_message(message, propagator, codec);
 
     if let Some(decoded) = decoded_message {
         debug!(topic = %topic, partition = partition, offset = offset, request_count = request_count,
-            "Deferred message loaded successfully");
+            "Message loaded successfully");
         for sender in senders {
             let _ = sender.send(Ok(decoded.clone()));
         }
     } else {
         error!(topic = %topic, partition = partition, offset = offset,
-            "Failed to decode deferred message");
+            "Failed to decode message");
         let error = KafkaLoaderError::DecodeError(topic, partition, offset);
         for sender in senders {
             let _ = sender.send(Err(error.clone()));
@@ -829,7 +834,7 @@ fn handle_request<P>(request: Request<P>, active: &mut ActiveRequests<P>, consum
         topic = %topic,
         partition = partition,
         offset = offset,
-        "Processing load request for deferred message"
+        "Processing message load request"
     );
 
     if let Err(error) = assign_if_needed(active, consumer, topic, partition, offset) {
@@ -838,7 +843,7 @@ fn handle_request<P>(request: Request<P>, active: &mut ActiveRequests<P>, consum
             partition = partition,
             offset = offset,
             error = %format_args!("{error:#}"),
-            "Failed to assign partition for deferred message load"
+            "Failed to assign partition for message load"
         );
         let _ = tx.send(Err(KafkaLoaderError::Kafka(error)));
         return;
@@ -1049,7 +1054,7 @@ fn assign_if_needed<P>(
         topic = %topic,
         partition = partition,
         offset = offset,
-        "Assigned partition for deferred message loading"
+        "Assigned partition for message loading"
     );
 
     Ok(())
@@ -1096,6 +1101,12 @@ fn create_load_span<P>(decoded: &DecodedMessage<P>, cached: bool, relation: Span
     )
 }
 
+fn loader_capacity(max_uncommitted: usize) -> usize {
+    max_uncommitted
+        .saturating_mul(RESOLVE_FANOUT)
+        .min(Semaphore::MAX_PERMITS)
+}
+
 /// Errors that can occur during Kafka message loading.
 #[derive(Clone, Debug, Error)]
 pub enum KafkaLoaderError {
@@ -1106,6 +1117,10 @@ pub enum KafkaLoaderError {
     /// The loader has been shut down and cannot process requests.
     #[error("Loader has shut down")]
     LoaderShutdown,
+
+    /// Every loader permit is held.
+    #[error("Loader capacity is exhausted")]
+    CapacityExhausted,
 
     /// The requested offset no longer exists due to retention or compaction.
     ///
@@ -1159,6 +1174,8 @@ impl ClassifyError for KafkaLoaderError {
             Self::LoaderShutdown | Self::ConsumerCreation(_) | Self::Hostname(_) => {
                 ErrorCategory::Terminal
             }
+
+            Self::CapacityExhausted => ErrorCategory::Transient,
 
             // Classify Kafka operation errors using shared implementation
             Self::Kafka(kafka_error) => kafka_error.classify_error(),

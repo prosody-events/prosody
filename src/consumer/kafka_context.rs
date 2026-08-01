@@ -8,45 +8,54 @@
 //! - Creation and lifecycle management of `PartitionManager` instances
 //! - Concurrent shutdown of revoked partitions with proper cleanup
 //! - Coordination of partition handlers during consumer group rebalances
+//! - librdkafka's periodic statistics callback
 //!
 //! The core component is the `Context` struct which implements Kafka's
-//! rebalance callbacks to manage partition lifecycle events.
+//! rebalance callbacks to manage partition lifecycle events, and holds the
+//! observation handle the statistics callback updates.
 
 use aho_corasick::{AhoCorasick, BuildError, StartKind};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use rdkafka::ClientContext;
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance};
+use rdkafka::{ClientContext, Statistics};
 use std::array::from_fn;
 use std::collections::hash_map::Entry;
 use std::future::ready;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
+use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{
-    ConsumerConfiguration, EventHandler, HandlerProvider, Managers, WatermarkVersion,
+    ConsumerConfiguration, ConsumerError, EventHandler, HandlerProvider, Managers,
+    WatermarkVersion, get_assigned_partition_count,
 };
 use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
-use crate::state::session::CellSession;
+use crate::state::session::CellWrite;
 use crate::telemetry::sender::TelemetrySender;
 use crate::timers::TimerSemaphores;
-use crate::timers::duration::CompactDuration;
+use crate::timers::duration::{CompactDuration, CompactDurationError};
 use crate::timers::store::TriggerStoreProvider;
 use crate::{EventIdentity, EventType, Partition, Topic};
 
-/// The shared partition-manager map paired with the channel that republishes
-/// its size after each rebalance, so assignment readiness can be awaited rather
-/// than polled.
-pub(super) struct ManagerRegistry<PL> {
+/// The shared handles a [`Context`] keeps beside its partition-manager factory.
+pub(super) struct ContextHandles<PL> {
     /// Thread-safe storage for partition managers.
     pub(super) managers: Arc<Managers<PL>>,
-    /// Publishes the assigned-partition count after each rebalance.
+    /// Publishes the assigned-partition count after each rebalance, so
+    /// assignment readiness can be awaited rather than polled.
     pub(super) assignment_tx: watch::Sender<u32>,
+    /// Telemetry the context and the partitions it creates publish through.
+    pub(super) telemetry: TelemetrySender,
+    /// The one consumer observation this client updates from its statistics
+    /// callback. Readers elsewhere hold clones of the same handle.
+    pub(super) observer: KafkaObserver,
 }
 
 /// The per-partition factories the context threads into each
@@ -104,7 +113,11 @@ pub(super) struct Context<F, PL> {
     /// can be awaited rather than polled.
     assignment_tx: watch::Sender<u32>,
 
+    /// Publishes the rebalance events this context observes.
     telemetry: TelemetrySender,
+
+    /// Receives librdkafka's statistics and holds the shared observation.
+    observer: KafkaObserver,
 }
 
 /// Creates a new consumer context with the given configuration.
@@ -113,24 +126,27 @@ pub(super) struct Context<F, PL> {
 /// configuration and captures the handler provider and per-partition factories
 /// into a partition-manager factory closure. This discharges the provider
 /// trait bounds in one place; the returned [`Context`] carries only the
-/// payload-erased factory. Fails with a [`BuildError`] if the configured
-/// `allowed_events` prefixes cannot be compiled into a filter automaton.
+/// payload-erased factory and the shared handles.
+///
+/// # Errors
+///
+/// [`ContextError`] when the configured `allowed_events` prefixes cannot be
+/// compiled into a filter automaton, or `slab_size` is outside
+/// [`CompactDuration`]'s range.
 pub(super) fn new_context<T, P, SP, PL>(
     config: &ConsumerConfiguration,
     handler_provider: T,
     providers: PartitionProviders<P, SP>,
     watermark_version: Arc<WatermarkVersion>,
-    registry: ManagerRegistry<PL>,
-    telemetry: TelemetrySender,
+    shared: ContextHandles<PL>,
     version: Arc<str>,
-) -> Result<Context<impl MakeManager<PL>, PL>, BuildError>
+) -> Result<Context<impl MakeManager<PL>, PL>, ContextError>
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = PL>,
     P: TriggerStoreProvider,
     SP: PartitionStateProvider<P::Store>,
-    <SP::Manager as PartitionStateManager>::Session:
-        CellSession<Loader: MessageLoader<Payload = PL>>,
+    <SP::Manager as PartitionStateManager>::Session: CellWrite<Loader: MessageLoader<Payload = PL>>,
     PL: Clone + Send + Sync + 'static + EventType + EventIdentity,
 {
     // Compile the event-type filter automaton from the configured
@@ -145,10 +161,10 @@ where
         })
         .transpose()?;
 
-    let timer_slab_size = config.slab_size.try_into().unwrap_or_else(|error| {
-        error!("invalid timer slab size: {error:#}; using default");
-        CompactDuration::new(10 * 60)
-    });
+    // A slab size the operator set but that cannot be represented is rejected
+    // here. Substituting a default would silently run the timer system at a
+    // granularity nobody asked for.
+    let timer_slab_size = CompactDuration::try_from(config.slab_size)?;
 
     let timer_semaphores: Arc<TimerSemaphores> = Arc::new(from_fn(|_| {
         Arc::new(Semaphore::new(config.max_uncommitted))
@@ -167,7 +183,7 @@ where
         state_provider: providers.state,
         timer_slab_size,
         timer_semaphores,
-        telemetry_sender: telemetry.clone(),
+        telemetry_sender: shared.telemetry.clone(),
         timer_spans: config.timer_spans,
         _payload: PhantomData,
     };
@@ -179,9 +195,10 @@ where
 
     Ok(Context {
         make_manager,
-        managers: registry.managers,
-        assignment_tx: registry.assignment_tx,
-        telemetry,
+        managers: shared.managers,
+        assignment_tx: shared.assignment_tx,
+        telemetry: shared.telemetry,
+        observer: shared.observer,
     })
 }
 
@@ -190,6 +207,16 @@ where
     F: MakeManager<PL>,
     PL: Send + Sync + 'static,
 {
+    /// Receives librdkafka's periodic statistics on the poll thread, so the
+    /// body must never block, spawn, or call a Kafka API. See
+    /// [`KafkaObserver::observe_statistics`] for the record-then-replace
+    /// sequence it delegates to.
+    ///
+    /// Do not delete this override: rdkafka's default `stats` logs the entire
+    /// statistics tree at `info` and the observation stream stops.
+    fn stats(&self, statistics: Statistics) {
+        self.observer.observe_statistics(statistics);
+    }
 }
 
 impl<F, PL> ConsumerContext for Context<F, PL>
@@ -280,7 +307,7 @@ where
         // than polled. Assign, revoke, and rebalance-error all fall through
         // here; empty rebalances returned early and left the count unchanged.
         self.assignment_tx
-            .send_replace(self.managers.read().len() as u32);
+            .send_replace(get_assigned_partition_count(&self.managers));
 
         debug!("pre-rebalance complete");
     }
@@ -301,5 +328,33 @@ where
         }
 
         debug!("rebalance completed");
+    }
+}
+
+/// Errors raised while building a [`Context`] from consumer configuration.
+///
+/// Both arms are supplied-but-invalid configuration, so neither has a sensible
+/// default to fall back to.
+#[derive(Debug, Error)]
+pub(super) enum ContextError {
+    /// The `allowed_events` prefixes could not be compiled into a filter
+    /// automaton.
+    #[error("invalid allowed_events filter: {0}")]
+    AllowedEvents(#[from] BuildError),
+
+    /// `slab_size` is outside [`CompactDuration`]'s representable range.
+    #[error("invalid timer slab size: {0}")]
+    SlabSize(#[from] CompactDurationError),
+}
+
+/// Surfaces a context-build failure through the consumer's public error type.
+/// Both arms already have a [`ConsumerError`] variant, so the public surface is
+/// unchanged.
+impl From<ContextError> for ConsumerError {
+    fn from(error: ContextError) -> Self {
+        match error {
+            ContextError::AllowedEvents(error) => Self::AllowedEventsPattern(error),
+            ContextError::SlabSize(error) => Self::InvalidSlabSize(error),
+        }
     }
 }

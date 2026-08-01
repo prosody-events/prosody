@@ -20,7 +20,7 @@ use tokio::sync::mpsc::{Sender, channel};
 use tracing::info;
 
 mod common;
-use common::ConsumerEnv;
+use common::kafka::ConsumerEnv;
 
 /// Test handler that clones contexts during processing and sends them for later
 /// testing.

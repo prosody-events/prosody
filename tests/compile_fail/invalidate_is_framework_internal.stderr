@@ -1,7 +1,0 @@
-error[E0599]: no method named `invalidate` found for type parameter `C` in the current scope
-  --> tests/compile_fail/invalidate_is_framework_internal.rs:11:7
-   |
-10 | fn misuse<C: EventContext>(c: C) {
-   |           - method `invalidate` not found for this type parameter
-11 |     c.invalidate();
-   |       ^^^^^^^^^^ method not found in `C`

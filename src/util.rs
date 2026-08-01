@@ -3,6 +3,12 @@
 //! This module provides functions to parse environment variables into various
 //! types, including vectors and durations. It also includes functions for
 //! handling fallback values and optional durations.
+//!
+//! Throughout, a variable set to a blank value counts as unset. A deployment
+//! that writes `FOO=` has not configured `FOO`, so it takes the same path as
+//! one that never mentions it. Every other value the operator supplies is
+//! parsed, and a value that fails to parse is an error — never a silent
+//! substitution of the default.
 
 /// Default capacity for idempotence caches (producer and consumer
 /// deduplication).
@@ -40,7 +46,7 @@ pub fn from_option_env<T>(env_var: &str) -> Result<Option<T>, String>
 where
     T: FromStr<Err: Display>,
 {
-    let Ok(value_str) = env::var(env_var) else {
+    let Some(value_str) = env_value(env_var) else {
         return Ok(None);
     };
 
@@ -64,7 +70,7 @@ pub fn from_option_env_with_fallback<T>(env_var: &str, fallback: T) -> Result<Op
 where
     T: FromStr<Err: Display>,
 {
-    let Ok(value_str) = env::var(env_var) else {
+    let Some(value_str) = env_value(env_var) else {
         return Ok(Some(fallback));
     };
 
@@ -86,7 +92,7 @@ pub fn from_env_with_fallback<T>(env_var: &str, fallback: T) -> Result<T, String
 where
     T: FromStr<Err: Display>,
 {
-    let Ok(value_str) = env::var(env_var) else {
+    let Some(value_str) = env_value(env_var) else {
         return Ok(fallback);
     };
 
@@ -122,7 +128,7 @@ where
     <T as FromStr>::Err: Display,
 {
     // Return Ok(None) if the environment variable is not set.
-    let Ok(value_str) = env::var(env_var) else {
+    let Some(value_str) = env_value(env_var) else {
         return Ok(None);
     };
 
@@ -144,7 +150,7 @@ pub fn from_duration_env_with_fallback(
     env_var: &str,
     fallback: Duration,
 ) -> Result<Duration, String> {
-    let Ok(value_str) = env::var(env_var) else {
+    let Some(value_str) = env_value(env_var) else {
         return Ok(fallback);
     };
 
@@ -162,7 +168,7 @@ pub fn from_duration_env_with_fallback(
 /// Returns an error if the environment variable is set but cannot be parsed as
 /// a valid duration (unless the value is "none", which returns `Ok(None)`).
 pub fn from_option_duration_env(env_var: &str) -> Result<Option<Duration>, String> {
-    let Ok(value_str) = env::var(env_var) else {
+    let Some(value_str) = env_value(env_var) else {
         return Ok(None);
     };
 
@@ -187,7 +193,7 @@ pub fn from_option_duration_env_with_fallback(
     env_var: &str,
     fallback: Duration,
 ) -> Result<Option<Duration>, String> {
-    let Ok(value_str) = env::var(env_var) else {
+    let Some(value_str) = env_value(env_var) else {
         return Ok(Some(fallback));
     };
 
@@ -210,9 +216,22 @@ where
         .map_err(|error| format!("failed to parse environment variable '${env_var}': {error:#}"))
 }
 
-/// Retrieves the value of an environment variable.
+/// The variable's value, or `None` when it is unset **or blank**.
+///
+/// A declared-but-empty variable — `FOO=` in a shell, or an env entry with an
+/// empty value in a Kubernetes manifest — is how a deployment spells "not
+/// configured". It takes the same path as an unset variable, so the caller
+/// applies its default. The alternative is to hand `""` to the parser, which
+/// rejects a value the operator never set.
+fn env_value(env_var: &str) -> Option<String> {
+    env::var(env_var)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// Retrieves the value of an environment variable that has no fallback.
 fn get_env_value(env_var: &str) -> Result<String, String> {
-    env::var(env_var).map_err(|_| {
+    env_value(env_var).ok_or_else(|| {
         format!("value required and fallback environment variable '${env_var}' is not set")
     })
 }

@@ -611,7 +611,7 @@ mod unwind {
     use crate::state::dirty::DirtyStore;
     use crate::state::manager::EventStateScope;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
+    use crate::state::session::{CellRead, KeyedStateSession, SessionParts, TerminationWatch};
     use crate::state::tests::cell_suite::value_cell;
     use crate::state::{EventRef, StateKey, StateName, StateType};
     use crate::timers::duration::CompactDuration;
@@ -672,6 +672,7 @@ mod unwind {
                 recovery_delay: CompactDuration::new(30),
                 armed: Arc::default(),
                 termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+                publisher: None,
             })
         }
 

@@ -23,8 +23,8 @@ use humantime::format_duration;
 use parking_lot::Mutex;
 use quanta::{Clock, Instant};
 use std::borrow::Cow;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info};
@@ -48,7 +48,7 @@ pub struct HeartbeatRegistry {
     stall_threshold: Duration,
 
     #[educe(Debug(ignore))]
-    heartbeats: Arc<Mutex<Vec<Heartbeat>>>,
+    heartbeats: Arc<Mutex<Vec<Weak<Inner>>>>,
 }
 
 impl HeartbeatRegistry {
@@ -68,14 +68,31 @@ impl HeartbeatRegistry {
     pub fn register(&self, name: &str) -> Heartbeat {
         let mut registry = self.heartbeats.lock();
         let heartbeat = Heartbeat::new(format!("{} {name}", self.base_name), self.stall_threshold);
-        registry.push(heartbeat.clone());
+        registry.push(Arc::downgrade(&heartbeat.inner));
         heartbeat
     }
 
     /// Returns `true` if at least one registered heartbeat exceeds its stall
     /// threshold.
+    #[must_use]
     pub fn any_stalled(&self) -> bool {
-        self.heartbeats.lock().iter().any(Heartbeat::is_stalled)
+        let mut heartbeats = self.heartbeats.lock();
+        let mut stalled = false;
+        heartbeats.retain(|entry| {
+            let Some(inner) = entry.upgrade() else {
+                return false;
+            };
+            stalled |= Heartbeat { inner }.is_stalled();
+            true
+        });
+        stalled
+    }
+
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
+        let mut heartbeats = self.heartbeats.lock();
+        heartbeats.retain(|entry| entry.strong_count() > 0);
+        heartbeats.len()
     }
 
     /// Creates a test heartbeat registry with default settings.

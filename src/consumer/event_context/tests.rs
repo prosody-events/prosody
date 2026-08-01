@@ -1116,6 +1116,7 @@ fn counting_context(registry: CollectionDefRegistry) -> (CountingContext, Counti
         recovery_delay: CompactDuration::new(30),
         armed: Arc::default(),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        publisher: None,
     };
     let ctx = MockEventContext::<Value>::new().with_session(KeyedStateSession::new(parts));
     (ctx, counting)

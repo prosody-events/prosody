@@ -94,6 +94,18 @@ impl MessageLoader for FailableLoader {
             .await
             .map_err(FailableLoaderError::Inner)
     }
+
+    async fn try_load_message(
+        &self,
+        topic: Topic,
+        partition: Partition,
+        offset: Offset,
+    ) -> Result<ConsumerMessage<Value>, Self::Error> {
+        self.inner
+            .try_load_message(topic, partition, offset)
+            .await
+            .map_err(FailableLoaderError::Inner)
+    }
 }
 
 // ============================================================================

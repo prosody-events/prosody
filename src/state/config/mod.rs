@@ -1,10 +1,15 @@
 //! User-facing configuration for the always-on keyed-state layer.
 
-use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
+use super::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError, StateVisibility};
+use crate::ByteSize;
 use crate::state::descriptor::{Registered, StateDescriptor, StructuralIdentity};
 use crate::state::{StateName, StateType};
+use crate::subsystem::SubsystemName;
 use crate::timers::duration::CompactDuration;
-use crate::util::{from_duration_env_with_fallback, from_env_with_fallback, from_option_env};
+use crate::util::{
+    from_duration_env_with_fallback, from_env_with_fallback,
+    from_option_duration_env_with_fallback, from_option_env,
+};
 use derive_builder::Builder;
 use std::env;
 use std::num::NonZeroU64;
@@ -16,8 +21,31 @@ use validator::{Validate, ValidationError};
 /// Environment variable for the local keyed-state cache directory.
 const STATE_CACHE_DIR_ENV: &str = "PROSODY_STATE_CACHE_DIR";
 
-/// Environment variable for the in-memory keyed-state cache capacity, in bytes.
-const STATE_CACHE_SIZE_ENV: &str = "PROSODY_STATE_CACHE_SIZE_BYTES";
+/// Environment variable for the owning keyed-state cache capacity.
+const STATE_OWNED_CACHE_SIZE_ENV: &str = "PROSODY_STATE_OWNED_CACHE_SIZE";
+
+/// Environment variable for the reader-side read-through cache capacity, in
+/// bytes.
+const STATE_READ_CACHE_SIZE_ENV: &str = "PROSODY_STATE_READ_CACHE_SIZE";
+
+/// Environment variable for the default read-cache TTL of composed readers.
+const STATE_READ_CACHE_TTL_ENV: &str = "PROSODY_STATE_READ_CACHE_TTL";
+
+/// Environment variable for the subsystem name.
+const SUBSYSTEM_ENV: &str = "PROSODY_SUBSYSTEM";
+
+/// Built-in default read-cache TTL, applied when the client composes readers
+/// and no other TTL is set. Five seconds trades a small staleness window for
+/// fewer repeated store reads on hot keys. It stays well within the delay
+/// reads already tolerate. The recovery sweep converges committed values
+/// within [`DEFAULT_RECOVERY_DELAY_SECS`] seconds, and routing snapshots
+/// refresh every 60 seconds.
+const DEFAULT_READ_CACHE_TTL: Duration = Duration::from_secs(5);
+
+const DEFAULT_READER_CACHE_SIZE: ByteSize = match NonZeroU64::new(1_048_576) {
+    Some(budget) => ByteSize::new(budget),
+    None => ByteSize::new(NonZeroU64::MIN),
+};
 
 /// Environment variable for the `StateRecovery` backstop delay.
 const RECOVERY_DELAY_ENV: &str = "PROSODY_STATE_RECOVERY_DELAY";
@@ -44,6 +72,13 @@ const DEFAULT_RECOVERY_DELAY_SECS: u32 = 30;
 /// # Ok(())
 /// # }
 /// ```
+///
+/// There is deliberately **no `Default`**. Several fields read a
+/// environment override, and a malformed one must fail the
+/// build rather than be replaced by a default. An infallible constructor has
+/// nowhere to report that, so it can only ignore the operator's value —
+/// silently, or with a log nobody reads. The builder is the only way in, and it
+/// returns the parse error. Do not add a `Default` impl.
 #[derive(Builder, Clone, Debug, Validate)]
 pub struct KeyedStateConfiguration {
     /// Disk workspace for the local keyed-state cache.
@@ -82,27 +117,65 @@ pub struct KeyedStateConfiguration {
     /// opens at `cache_dir`; it is shared by every partition, never multiplied
     /// per partition.
     ///
-    /// Environment variable: `PROSODY_STATE_CACHE_SIZE_BYTES` (a positive
-    /// integer count of bytes; `0`, negative, non-numeric, and
-    /// out-of-`u64`-range values are rejected at build).
-    #[builder(default = "from_option_env(STATE_CACHE_SIZE_ENV)?")]
-    pub cache_size_bytes: Option<NonZeroU64>,
+    /// Environment variable: `PROSODY_STATE_OWNED_CACHE_SIZE`. Accepts a
+    /// positive human-readable byte size such as `64 MiB` or `500 MB`. A bare
+    /// number is interpreted as bytes.
+    #[builder(default = "from_option_env(STATE_OWNED_CACHE_SIZE_ENV)?")]
+    pub owned_cache_size: Option<ByteSize>,
+
+    /// Byte budget for the reader-side read-through cache. The high-level
+    /// client sizes this cache when it composes standalone readers.
+    ///
+    /// `None` (the default) uses
+    /// [`owned_cache_size`](Self::owned_cache_size) when it is set. It uses
+    /// 1 MiB when both sizes are unset. Only the composing client reads this
+    /// value. A consumer never opens a reader cache.
+    ///
+    /// Environment variable: `PROSODY_STATE_READ_CACHE_SIZE`. Accepts a
+    /// positive human-readable byte size such as `1 MiB`. A bare number is
+    /// interpreted as bytes.
+    #[builder(default = "from_option_env(STATE_READ_CACHE_SIZE_ENV)?")]
+    pub read_cache_size: Option<ByteSize>,
+
+    /// Default read-cache TTL for the readers this client composes. It sets how
+    /// long a `StateReader` may serve a collection's reads from cache before
+    /// re-reading the store. Defaults to 5 seconds, well inside the delay reads
+    /// already tolerate (see the recovery sweep on [`Self::recovery_delay`]).
+    ///
+    /// `None` disables the inherited default. A descriptor can replace this
+    /// TTL or select
+    /// [`ReadCachePolicy::Disabled`](crate::state::ReadCachePolicy)
+    /// to bypass it. This setting affects only composed readers, never the
+    /// owning consumer's writes. It is unrelated to a collection's durable TTL.
+    ///
+    /// Environment variable: `PROSODY_STATE_READ_CACHE_TTL` (a humantime
+    /// duration such as `5s` or `750ms`; `none` disables the inherited
+    /// default). Must not be zero: every cached entry would be born stale.
+    #[builder(
+        default = "from_option_duration_env_with_fallback(STATE_READ_CACHE_TTL_ENV, \
+                   DEFAULT_READ_CACHE_TTL)?"
+    )]
+    #[validate(custom(function = "validate_read_cache_ttl"))]
+    pub read_cache_ttl: Option<Duration>,
+
+    /// Subsystem this consumer publishes keyed state under. Required whenever
+    /// any registered collection is `.published(true)`. A published collection
+    /// with no subsystem is rejected at build
+    /// ([`RegisterStateError::PublishedWithoutSubsystem`]). `None` (the
+    /// default) is valid for consumers that publish nothing.
+    ///
+    /// Keep this set across the deploy that un-publishes a collection. Startup
+    /// reconciliation withdraws a collection's routing row only while it is
+    /// still registered `Private` under a configured subsystem. Dropping the
+    /// subsystem or the registration in the same deploy as `.published(false)`
+    /// strands the row instead of withdrawing it. See [`StateVisibility`].
+    ///
+    /// Environment variable: `PROSODY_SUBSYSTEM`. `none` disables it.
+    #[builder(default = "from_option_env(SUBSYSTEM_ENV)?")]
+    pub subsystem: Option<SubsystemName>,
 
     #[builder(setter(skip), default)]
     registrations: Vec<(StateType, &'static str, StructuralIdentity, CollectionDef)>,
-}
-
-impl Default for KeyedStateConfiguration {
-    fn default() -> Self {
-        Self {
-            cache_dir: from_env_with_fallback(STATE_CACHE_DIR_ENV, default_cache_dir())
-                .unwrap_or_else(|_| default_cache_dir()),
-            recovery_delay: recovery_delay_from_env()
-                .unwrap_or_else(|_| CompactDuration::new(DEFAULT_RECOVERY_DELAY_SECS)),
-            cache_size_bytes: from_option_env(STATE_CACHE_SIZE_ENV).unwrap_or_default(),
-            registrations: Vec::new(),
-        }
-    }
 }
 
 impl KeyedStateConfiguration {
@@ -110,6 +183,13 @@ impl KeyedStateConfiguration {
     #[must_use]
     pub fn builder() -> KeyedStateConfigurationBuilder {
         KeyedStateConfigurationBuilder::default()
+    }
+
+    pub(crate) fn reader_cache_size(&self) -> NonZeroU64 {
+        self.read_cache_size
+            .or(self.owned_cache_size)
+            .unwrap_or(DEFAULT_READER_CACHE_SIZE)
+            .nonzero()
     }
 
     /// Registers `descriptor`'s collection, returning the [`Registered`]
@@ -135,6 +215,21 @@ impl KeyedStateConfiguration {
         Registered::new(descriptor)
     }
 
+    pub(crate) fn try_register<D>(
+        &mut self,
+        descriptor: D,
+    ) -> Result<Registered<D>, RegisterStateError>
+    where
+        D: StateDescriptor,
+    {
+        validate_publication(
+            descriptor.name(),
+            descriptor.collection_def(),
+            self.subsystem.as_ref(),
+        )?;
+        Ok(self.register(descriptor))
+    }
+
     /// Returns whether any collections are registered.
     #[must_use]
     pub(crate) fn has_registrations(&self) -> bool {
@@ -152,10 +247,12 @@ impl KeyedStateConfiguration {
     ///
     /// Fails with [`RegisterStateError`] on an empty descriptor name, a TTL
     /// over Cassandra's `USING TTL` ceiling, a TTL at or below
-    /// `recovery_delay`, or an identity conflict.
+    /// `recovery_delay`, a `Published` collection with no configured subsystem,
+    /// or an identity conflict.
     pub(crate) fn build_registry(&self) -> Result<CollectionDefRegistry, RegisterStateError> {
         let mut registry = CollectionDefRegistry::default();
         for (state_type, name, identity, def) in &self.registrations {
+            validate_publication(name, *def, self.subsystem.as_ref())?;
             if let Some(ttl) = def.ttl
                 && ttl.seconds() <= self.recovery_delay.seconds()
             {
@@ -169,6 +266,19 @@ impl KeyedStateConfiguration {
         }
         Ok(registry)
     }
+}
+
+fn validate_publication(
+    name: &str,
+    definition: CollectionDef,
+    subsystem: Option<&SubsystemName>,
+) -> Result<(), RegisterStateError> {
+    if definition.visibility == StateVisibility::Published && subsystem.is_none() {
+        return Err(RegisterStateError::PublishedWithoutSubsystem {
+            name: StateName::try_new(name)?,
+        });
+    }
+    Ok(())
 }
 
 /// Per-client fallback keyed-state cache workspace, used when
@@ -206,6 +316,13 @@ fn validate_cache_dir(cache_dir: &Path) -> Result<(), ValidationError> {
 fn validate_recovery_delay(recovery_delay: &CompactDuration) -> Result<(), ValidationError> {
     if recovery_delay.seconds() == 0 {
         return Err(ValidationError::new("recovery_delay_zero"));
+    }
+    Ok(())
+}
+
+fn validate_read_cache_ttl(ttl: &Duration) -> Result<(), ValidationError> {
+    if ttl.is_zero() {
+        return Err(ValidationError::new("read_cache_ttl_zero"));
     }
     Ok(())
 }

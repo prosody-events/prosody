@@ -1,13 +1,14 @@
 use super::KeyedStateConfiguration;
+use crate::ByteSize;
 use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::codec::JsonCodec;
 use crate::state::descriptor::{StateDescriptor, ValueDescriptor, map_state, value_state};
 use crate::state::order_codec::I64KeyCodec;
 use crate::state::registry::RegisterStateError;
+use crate::subsystem::SubsystemName;
 use crate::timers::duration::CompactDuration;
 use color_eyre::eyre::Result;
 use quickcheck::{QuickCheck, TestResult};
-use std::num::NonZeroU64;
 use std::path::PathBuf;
 use validator::Validate;
 
@@ -15,32 +16,18 @@ fn cart() -> ValueDescriptor {
     value_state("cart")
 }
 
-/// Pins `cache_size_bytes`'s element type to `NonZeroU64` — the choice that
-/// makes the field's documented "rejected at build" contract hold. The build
-/// path is `from_option_env(STATE_CACHE_SIZE_ENV)?`, which parses a present
-/// value with `<Option<NonZeroU64>>::Item::from_str`; this closure fails to
-/// compile if the field type ever weakens (e.g. to `Option<u64>`, which would
-/// silently accept `0`), and the assertions below prove that element type
-/// accepts a positive byte count and rejects zero, negative, non-numeric,
-/// empty, and out-of-`u64` values. The `"0"` rejection is load-bearing: it is
-/// the sole value distinguishing `NonZeroU64` from a plain `u64`. The env-read
-/// wiring itself (`from_option_env`, [`super::STATE_CACHE_SIZE_ENV`]) is
-/// trusted std, so this needs none of the `unsafe` env mutation a full
-/// build-path test would.
-const _: fn(&KeyedStateConfiguration) -> &Option<NonZeroU64> = |c| &c.cache_size_bytes;
+const _: fn(&KeyedStateConfiguration) -> &Option<ByteSize> = |c| &c.owned_cache_size;
+const _: fn(&KeyedStateConfiguration) -> &Option<ByteSize> = |c| &c.read_cache_size;
 
 #[test]
-fn cache_size_element_type_parse_contract() -> Result<()> {
-    // A valid positive byte count parses into the field's element type.
-    let parsed: NonZeroU64 = "8388608"
+fn cache_sizes_parse_human_units_and_reject_degenerate_values() -> Result<()> {
+    let parsed: ByteSize = "8 MiB"
         .parse()
         .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     assert_eq!(parsed.get(), 8_388_608, "a valid byte count parses");
-    // Degenerate values are rejected — `0` because the field is `NonZeroU64`,
-    // the rest because they are not a `u64`.
     for bad in ["0", "-5", "abc", "", "99999999999999999999999999"] {
         assert!(
-            bad.parse::<NonZeroU64>().is_err(),
+            bad.parse::<ByteSize>().is_err(),
             "cache size {bad:?} must be rejected",
         );
     }
@@ -74,6 +61,34 @@ fn zero_recovery_delay_is_rejected() -> Result<()> {
         config.validate().is_err(),
         "a zero recovery_delay must fail validation"
     );
+    Ok(())
+}
+
+/// A zero read-cache TTL would make every cached entry born stale. Validation
+/// rejects it here, mirroring the check applied when the reader is constructed.
+/// A sub-millisecond TTL is valid — reader age is measured against a
+/// nanosecond-resolution monotonic clock — and so are longer TTLs and the
+/// explicit `None` opt-out.
+#[test]
+fn zero_read_cache_ttl_is_rejected() -> Result<()> {
+    use std::time::Duration;
+    let degenerate = KeyedStateConfiguration::builder()
+        .read_cache_ttl(Some(Duration::ZERO))
+        .build()?;
+    assert!(
+        degenerate.validate().is_err(),
+        "a zero read_cache_ttl must fail validation"
+    );
+    for ttl in [Duration::from_micros(500), Duration::from_millis(1)] {
+        let valid = KeyedStateConfiguration::builder()
+            .read_cache_ttl(Some(ttl))
+            .build()?;
+        valid.validate()?;
+    }
+    let disabled = KeyedStateConfiguration::builder()
+        .read_cache_ttl(None)
+        .build()?;
+    disabled.validate()?;
     Ok(())
 }
 
@@ -181,6 +196,46 @@ fn keyset_limit_over_ceiling_is_rejected() -> Result<()> {
         "the ceiling and 0 both register cleanly"
     );
     Ok(())
+}
+
+/// Registration succeeds unless a `Published` collection is declared with no
+/// configured subsystem, in which case build fails `PublishedWithoutSubsystem`.
+/// Covers the full published × subsystem matrix.
+#[test]
+fn prop_published_requires_subsystem() {
+    fn prop(published: bool, with_subsystem: bool) -> TestResult {
+        let build = || -> Result<()> {
+            let mut builder = KeyedStateConfiguration::builder();
+            if with_subsystem {
+                builder.subsystem(Some(SubsystemName::try_new("orders")?));
+            }
+            let mut config = builder.build()?;
+            let _ = config.register(cart().published(published));
+            match config.build_registry() {
+                Ok(_) if published && !with_subsystem => {
+                    color_eyre::eyre::bail!(
+                        "published={published} with_subsystem={with_subsystem}: \
+                         published-without-subsystem must be rejected"
+                    )
+                }
+                Ok(_) => Ok(()),
+                Err(RegisterStateError::PublishedWithoutSubsystem { .. })
+                    if published && !with_subsystem =>
+                {
+                    Ok(())
+                }
+                Err(e) => color_eyre::eyre::bail!(
+                    "published={published} with_subsystem={with_subsystem}: unexpected \
+                     build_registry error: {e}"
+                ),
+            }
+        };
+        match build() {
+            Ok(()) => TestResult::passed(),
+            Err(e) => TestResult::error(e.to_string()),
+        }
+    }
+    QuickCheck::new().quickcheck(prop as fn(bool, bool) -> TestResult);
 }
 
 /// Registers `descriptor` and reads its `recovery_within` back from the

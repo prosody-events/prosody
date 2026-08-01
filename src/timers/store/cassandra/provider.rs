@@ -71,9 +71,8 @@ impl CassandraTriggerStoreProvider {
     /// Creates a new provider by preparing queries against an existing
     /// `CassandraStore`.
     ///
-    /// This is the high-level constructor used by `StorePair` to create the
-    /// provider from raw configuration. Queries are prepared once and shared
-    /// across all stores created by this provider.
+    /// Consumer construction uses this with its already-selected Cassandra
+    /// store. Queries are prepared once and shared across all partition stores.
     ///
     /// # Errors
     ///

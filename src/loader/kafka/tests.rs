@@ -37,6 +37,34 @@ fn loader_config() -> LoaderConfiguration {
     }
 }
 
+#[test]
+fn consumer_capacity_provisions_one_resolve_batch_per_event() {
+    assert_eq!(loader_capacity(64), 64 * RESOLVE_FANOUT);
+}
+
+#[tokio::test]
+async fn try_load_reports_transient_capacity_exhaustion() -> color_eyre::Result<()> {
+    let (tx, _rx) = mpsc::channel(1);
+    let loader = KafkaLoader::<JsonCodec> {
+        tx,
+        semaphore: Arc::new(Semaphore::new(0)),
+        cache: Arc::new(Cache::new(1)),
+        message_spans: SpanRelation::default(),
+    };
+
+    let error = timeout(
+        Duration::from_millis(100),
+        loader.try_load_message(Topic::from("orders"), 0, 1),
+    )
+    .await
+    .map_err(|_| color_eyre::eyre::eyre!("non-waiting load waited for capacity"))?
+    .err()
+    .ok_or_else(|| color_eyre::eyre::eyre!("load must fail without capacity"))?;
+    assert!(matches!(error, KafkaLoaderError::CapacityExhausted));
+    assert_eq!(error.classify_error(), ErrorCategory::Transient);
+    Ok(())
+}
+
 fn producer() -> color_eyre::Result<FutureProducer> {
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", "localhost:9094")

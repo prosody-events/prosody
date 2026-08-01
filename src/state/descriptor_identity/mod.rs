@@ -184,7 +184,13 @@ where
 
 /// Accepts a durable row that equals the asserted identity; otherwise fails
 /// `Permanent` without overwriting the row.
-fn validate<StoreErr>(
+///
+/// Equality follows the wire-form comparison owned by
+/// [`DurableDescriptorIdentity`].
+///
+/// `pub(crate)` because the reader validates each source's identity through
+/// this same function.
+pub(crate) fn validate<StoreErr>(
     stored: DurableDescriptorIdentity,
     asserted: &DurableDescriptorIdentity,
 ) -> Result<(), DescriptorIdentityError<StoreErr>>

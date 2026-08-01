@@ -4,7 +4,7 @@
 
 #![recursion_limit = "256"]
 
-use crate::common::ChannelHandler;
+use crate::common::handler::ChannelHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::tracing::init_test_logging;
 use prosody::{
@@ -35,7 +35,7 @@ async fn test_allowed_events_filtering() -> Result<()> {
     init_test_logging();
 
     // Create a unique single-partition topic to isolate the test environment
-    let (topic, admin_client) = common::create_single_partition_topic().await?;
+    let (topic, admin_client) = common::kafka::create_topic_with_partitions(1).await?;
     let bootstrap = vec!["localhost:9094".to_owned()];
 
     // Configure the consumer to filter allowed events only
@@ -60,7 +60,7 @@ async fn test_allowed_events_filtering() -> Result<()> {
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
         &common::create_cassandra_trigger_store_config(),
-        KeyedStateConfiguration::default(),
+        KeyedStateConfiguration::builder().build()?,
         CloneProvider::new(ChannelHandler::new(messages_tx)),
         Telemetry::new(),
     )

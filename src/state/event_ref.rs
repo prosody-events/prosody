@@ -76,11 +76,11 @@ pub enum CommitDecision {
 
 /// Did this call take effect.
 ///
-/// Returned by the mid-handler transactional pair
-/// ([`commit`](super::session::CellSession::commit) /
-/// [`rollback`](super::session::CellSession::rollback)):
-/// [`StoreOutcome::Applied`] when buffered ops were drained — written to the
-/// committed value by `commit()`, discarded by `rollback()` —
+/// Returned by the mid-handler transactional pair,
+/// [`commit`](super::session::CellWrite::commit) and
+/// [`rollback`](super::session::CellWrite::rollback). It is
+/// [`StoreOutcome::Applied`] when buffered ops were drained: `commit()` writes
+/// them to the committed value, `rollback()` discards them. It is
 /// [`StoreOutcome::NoOp`] when nothing was buffered.
 ///
 /// Distinct from [`CommitDecision`]: the oracle decides whether a provisional

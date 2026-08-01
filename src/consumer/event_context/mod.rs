@@ -20,7 +20,7 @@ use crate::error::ClassifyError;
 use crate::loader::MessageLoader;
 use crate::state::descriptor::{Registered, StateDescriptor, deque_state, map_state, value_state};
 use crate::state::order_codec::Utf8KeyCodec;
-use crate::state::session::CellSession;
+use crate::state::session::{CellRead, CellWrite};
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
@@ -172,18 +172,19 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// Leaf contexts carry the session the partition loop minted for the
     /// event; wrapper contexts forward their inner context's session type
     /// (`type State = C::State`). State itself is Kafka-agnostic, so the
-    /// payload tie lives here: the session's loader yields `Self::Payload`,
-    /// which keeps Kafka-message handles fully typed inside generic handlers
-    /// without [`CellSession`] ever naming a payload — its `Loader` associated
-    /// type is pinned to the message loader here.
-    type State: CellSession<Loader: MessageLoader<Payload = Self::Payload>>;
+    /// payload tie lives here. The session's loader yields `Self::Payload`,
+    /// which keeps Kafka-message handles fully typed inside generic handlers.
+    /// Neither [`CellRead`] nor [`CellWrite`] names a payload; the `Loader`
+    /// associated type that [`CellRead`] carries is fixed to the message
+    /// loader here.
+    type State: CellWrite<Loader: MessageLoader<Payload = Self::Payload>>;
 
     /// Binds a registered keyed-state collection, returning its typed handle.
     ///
     /// Takes a [`Registered<DESC>`] capability handle, not a raw descriptor, so
     /// a handler can bind only collections it registered — binding an
     /// unregistered one is a compile error, not a runtime one. (The access-time
-    /// [`verify_state_registration`](crate::state::session::CellSession::verify_state_registration)
+    /// [`verify_state_registration`](crate::state::session::CellRead::verify_state_registration)
     /// check is the backstop for names that slip past the type system, e.g.
     /// through the erased FFI seam.)
     ///
@@ -287,7 +288,7 @@ pub trait TerminationSignals {
 /// # Type Parameters
 ///
 /// * `T`: The `TriggerStore` implementation backing the timer manager.
-/// * `S`: The per-event [`CellSession`]; its payload pins
+/// * `S`: The per-event [`CellWrite`] session; its payload fixes
 ///   [`EventContext::Payload`].
 #[derive(Educe)]
 #[educe(Clone(bound()), Debug(bound = ""))]
@@ -447,7 +448,7 @@ where
     /// draining the dirty overlay) uncompilable for user code.
     pub(in crate::consumer) fn invalidate(self)
     where
-        S: CellSession<Loader: MessageLoader>,
+        S: CellWrite<Loader: MessageLoader>,
     {
         self.cancel();
         self.inner.store(None);
@@ -457,7 +458,7 @@ where
 impl<T, S> EventContext for PartitionEventContext<T, S>
 where
     T: TriggerStore,
-    S: CellSession<Loader: MessageLoader>,
+    S: CellWrite<Loader: MessageLoader>,
 {
     type Error = TimerManagerError<T::Error>;
     type Payload = <S::Loader as MessageLoader>::Payload;
@@ -954,7 +955,7 @@ where
     ) -> Result<BoxValueState<ConsumerMessage<Self::Payload>>, ErasedStateError> {
         let handle = self
             .state(Registered::new(message_state::<
-                <C::State as CellSession>::Loader,
+                <C::State as CellRead>::Loader,
             >(name)))
             .map_err(|e| ErasedStateError::from_classified(&e))?;
         Ok(Box::new(ErasedValue::new(handle)))
@@ -967,7 +968,7 @@ where
         let handle = self
             .state(Registered::new(message_map_state::<
                 Utf8KeyCodec,
-                <C::State as CellSession>::Loader,
+                <C::State as CellRead>::Loader,
             >(name)))
             .map_err(|e| ErasedStateError::from_classified(&e))?;
         Ok(Box::new(ErasedMap::new(handle)))
@@ -979,7 +980,7 @@ where
     ) -> Result<BoxDequeState<ConsumerMessage<Self::Payload>>, ErasedStateError> {
         let handle = self
             .state(Registered::new(message_deque_state::<
-                <C::State as CellSession>::Loader,
+                <C::State as CellRead>::Loader,
             >(name)))
             .map_err(|e| ErasedStateError::from_classified(&e))?;
         Ok(Box::new(ErasedDeque::new(handle)))

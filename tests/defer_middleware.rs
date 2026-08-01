@@ -59,7 +59,8 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tracing::info;
 
 mod common;
-use common::{ConsumerEnv, TEST_RUNTIME};
+use common::TEST_RUNTIME;
+use common::kafka::ConsumerEnv;
 
 /// Test error that can be classified.
 #[derive(Debug, Error, Clone)]
@@ -337,7 +338,7 @@ impl DeferTestEnvironment {
     /// to other keys (they belong to other iterations' key domains).
     async fn expect_event(&mut self, key: &str, timeout_secs: u64) -> Result<HandlerEvent> {
         loop {
-            let event = common::expect_event(
+            let event = common::receive::expect_event(
                 &mut self.event_rx,
                 Duration::from_secs(timeout_secs.max(30)),
             )
@@ -351,7 +352,8 @@ impl DeferTestEnvironment {
 
     /// Verify that no event occurs within the given timeout.
     async fn expect_no_event(&mut self, timeout_millis: u64) -> Result<()> {
-        common::expect_no_event(&mut self.event_rx, Duration::from_millis(timeout_millis)).await
+        common::receive::expect_no_event(&mut self.event_rx, Duration::from_millis(timeout_millis))
+            .await
     }
 
     /// Budget `times` transient failures for `value`; once consumed, further

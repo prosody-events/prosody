@@ -23,7 +23,7 @@ use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::CollectionDef;
 use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
-use crate::state::session::{CellSession, Finalized};
+use crate::state::session::{CellWrite, Finalized};
 use crate::state::tests::cell_suite::{FailingCellStore, bytes, value_cell};
 use crate::state::tests::support::FixedOracle;
 use crate::state::{CommitMode, EventRef, PartitionBackend, SharedStateBackend, TimerEventRef};

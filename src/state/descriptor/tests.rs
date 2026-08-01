@@ -11,15 +11,18 @@ use crate::codec::{I64Codec, JsonCodecError};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::kafka_state::{MessageCell, message_state};
 use crate::consumer::middleware::tests::test_support::MockEventContext;
+use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
 use crate::state::cell_key::{CellKey, Direction, ScanEdge};
 use crate::state::dirty::DirtyStore;
+use crate::state::first_write::FirstWritePublisher;
 use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state::{
     CommitMode, EventRef, PartitionBackend, RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateKey,
     StateName, StateType,
@@ -52,10 +55,7 @@ fn finish_trace(result: Result<bool>, message: &str, input: &str) -> TestResult 
     }
 }
 
-pub(crate) type TestSession = KeyedStateSession<
-    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>,
-    MemoryLoader<Value>,
->;
+pub(crate) type TestSession = KeyedStateSession<TestBackend, MemoryLoader<Value>>;
 
 /// Builds a session with `descriptor` registered and binds it via
 /// `StateDescriptor::bind` — the single shared machinery every descriptor
@@ -114,10 +114,28 @@ pub(crate) fn test_session_with_armed(
     (KeyedStateSession::new(parts), cell_store)
 }
 
+/// Like [`test_session_parts`] but wires a [`FirstWritePublisher`] into the
+/// session, so a test can drive the first-write publication barrier that
+/// `Published` collections write through.
+pub(crate) fn test_session_with_publisher(
+    loader: MemoryLoader<Value>,
+    registry: CollectionDefRegistry,
+    state_key: StateKey,
+    publisher: FirstWritePublisher<ScriptedPublicationStore, KafkaObserver>,
+) -> (TestSession, MemoryCellStore<FixedOracle>) {
+    let (mut parts, cell_store) = session_parts(loader, registry, state_key, Arc::default(), false);
+    parts.publisher = Some(publisher);
+    (KeyedStateSession::new(parts), cell_store)
+}
+
 /// The partition backend every test-session fixture in this module shares: the
 /// memory cell store resolving through a get-out-of-the-way [`FixedOracle`].
-pub(crate) type TestBackend =
-    PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>;
+pub(crate) type TestBackend = PartitionBackend<
+    FixedOracle,
+    MemoryDescriptorIdentityStore,
+    MemoryCellStore<FixedOracle>,
+    FirstWritePublisher<ScriptedPublicationStore, KafkaObserver>,
+>;
 
 /// Builds a test session over an arbitrary loader payload — the generic twin of
 /// [`test_session`] (which pins the loader to `MemoryLoader<Value>`). The
@@ -175,6 +193,7 @@ fn session_parts<L>(
         recovery_delay: CompactDuration::new(30),
         armed,
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        publisher: None,
     };
     (parts, cell_store)
 }
@@ -446,6 +465,35 @@ fn keyset_limit_threads_into_the_collection_def() {
     assert_eq!(descriptor.keyset_limit(7).collection_def().keyset_limit, 7);
 }
 
+/// `.published(bool)` and every read-cache policy thread into the collection
+/// def. `.published` is also reversible.
+#[test]
+fn visibility_and_read_cache_thread_into_the_collection_def() {
+    use crate::state::ReadCachePolicy;
+    use std::time::Duration;
+
+    let ttl = Duration::from_secs(30);
+    let def = cart().published(true).read_cache(ttl).collection_def();
+    assert_eq!(def.visibility, StateVisibility::Published);
+    assert_eq!(def.read_cache, ReadCachePolicy::Ttl(ttl));
+    assert_eq!(
+        cart()
+            .read_cache(ReadCachePolicy::Disabled)
+            .collection_def()
+            .read_cache,
+        ReadCachePolicy::Disabled,
+    );
+    assert_eq!(
+        cart()
+            .published(true)
+            .published(false)
+            .collection_def()
+            .visibility,
+        StateVisibility::Private,
+        "published(true).published(false) reverts to Private",
+    );
+}
+
 /// An empty descriptor name fails loudly at registration — the
 /// fallible boundary backing the infallible `value_state`.
 #[test]
@@ -593,10 +641,10 @@ fn collection_ops_export_operation_spans() -> Result<()> {
     Ok(())
 }
 
-/// Behavioral arm of the `CollectionScopeContainment` invariant. The
-/// *discriminating* proof is the trybuild compile-fail golden
-/// (`tests/compile_fail/cellview_scope_is_pinned.rs`); this pins the runtime
-/// behavior the type-level proof pairs with.
+/// Behavioral arm of the `CollectionScopeContainment` invariant. A view pinned
+/// to one collection cannot address another. The API's lifetimes and bounds
+/// enforce that guarantee at the type level. This test pins the matching
+/// runtime behavior.
 mod scope_containment {
     use super::*;
     use crate::state::order_codec::Utf8KeyCodec;
@@ -742,10 +790,7 @@ mod typed_cell_view {
 
     /// The session type the gated-scan fixture binds over: the standard memory
     /// backend with the [`GateLoader`] capability slot.
-    type GateSession = KeyedStateSession<
-        PartitionBackend<FixedOracle, MemoryDescriptorIdentityStore, MemoryCellStore<FixedOracle>>,
-        GateLoader,
-    >;
+    type GateSession = KeyedStateSession<TestBackend, GateLoader>;
 
     /// Custom resolver context borrowing the gate ladder from the session — the
     /// [`FromSession`] extension a resolver author writes for their own

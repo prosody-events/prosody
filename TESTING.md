@@ -28,10 +28,11 @@ homes — per-file scaffolding clones are how this test tree once doubled:
 | --- | --- |
 | Crate-wide (`integration_test_count`, `test_cassandra_config`; span capture: `captured_spans{,_filtered}`, `assert_span_relation`, `sampled_remote_context`) | `src/tests/test_util.rs` |
 | Consumer middleware (mock contexts, handlers, fixtures) | `src/consumer/middleware/tests/test_support.rs` |
+| Kafka observation (statistics fixtures: `observing`, `observe`, `unobserved`) | `src/consumer/observer/tests/support.rs` |
 | Keyed state (oracles, cells, collections, `UnavailableState`) | `src/state/tests/support.rs` |
 | Timers (segment/trigger factories, in-memory `TimerManager` harness) | `src/timers/test_support.rs` |
 | Timer stores (store helpers, `KEY_POOL`, suite macros) | `src/timers/store/tests/` |
-| Integration | `tests/common.rs` |
+| Integration (keyspace/runtime in `mod.rs`; handlers, Kafka fixtures, channel helpers in children) | `tests/common/` |
 
 If the helper you need exists in a sibling test file but not a shared home,
 hoist it into one — never copy it.
@@ -93,6 +94,19 @@ banned:
 
 When you write or convert a test, spot-check it: break the invariant once
 (inject an `Err`, bypass the guard), confirm the test fails, then revert.
+
+## No compile-fail tests
+
+Never write a test whose purpose is to prove that code **fails to compile** —
+no compile-fail fixtures, no `tests/compile_fail/*.rs` paired with a `.stderr`
+snapshot. A type-level "cannot" guarantee — a reader handle cannot mutate, a
+sealed trait cannot be implemented downstream, a constructor is crate-private —
+is enforced by the *absence* of the API surface. It is evident from the design,
+and once stated as an invariant at the type that owns it, no test re-establishes
+it. Such fixtures also rot: the expected `.stderr` is a snapshot of one
+compiler's diagnostic text, so a routine toolchain or dependency bump reds the
+suite for a reason unrelated to the invariant. State the guarantee in a doc
+comment on the owning type and let the compiler be the enforcement.
 
 ## Deleting and folding tests
 
@@ -231,7 +245,7 @@ Time-sensitive properties build a fresh
 — one per iteration — with `.start_paused(true)` when the test advances
 time manually. A paused-time runtime cannot be shared across iterations
 (state leaks between cases). Ordinary suites share the multi-threaded
-`TEST_RUNTIME` in `tests/common.rs`.
+`TEST_RUNTIME` in `tests/common/mod.rs`.
 
 Exemplars: `src/timers/manager/tests.rs`,
 `src/consumer/partition/offsets/test.rs`.

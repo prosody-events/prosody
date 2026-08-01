@@ -73,6 +73,11 @@ pub type ClearedSections = SmallVec<[Section; SECTIONS_INLINE]>;
 /// sections it cleared (dirty clear markers), and its [`CellSnapshot`].
 pub type TouchedCollection = ((StateType, StateName), ClearedSections, CellSnapshot);
 
+/// One event's distinct touched `(state_type, name)` collections, inline for
+/// the common handful. This is the collection identity alone, without cell
+/// payloads; [`DirtyStore::touched_collections`] returns it.
+pub type TouchedCollectionNames = SmallVec<[(StateType, StateName); COLLECTIONS_INLINE]>;
+
 /// One event's touched collections — the `finalize` work-list, inline for the
 /// common handful.
 pub type TouchedCollections = SmallVec<[TouchedCollection; COLLECTIONS_INLINE]>;
@@ -305,6 +310,32 @@ impl DirtyStore {
         grouped
     }
 
+    /// The distinct `(state_type, name)` collections this event's dirty overlay
+    /// touched, for the single `key`. Projects the marker and entry ranges to
+    /// their collection identity. Clones no cell values or snapshots. This is
+    /// [`Self::touched`] without the per-cell payload, for callers that need
+    /// only the collection names.
+    #[must_use]
+    pub fn touched_collections(&self, key: &Key) -> TouchedCollectionNames {
+        let guard = Guard::new();
+        let mut names = TouchedCollectionNames::new();
+        let mut push_distinct = |collection: (StateType, StateName)| {
+            if !names.contains(&collection) {
+                names.push(collection);
+            }
+        };
+        for (marker_key, ()) in self
+            .markers
+            .range(MarkerKeyScope::range(key.clone()), &guard)
+        {
+            push_distinct((marker_key.state_type, marker_key.name.clone()));
+        }
+        for (dirty_key, _value) in self.entries.range(KeyScope::range(key.clone()), &guard) {
+            push_distinct((dirty_key.state_type, dirty_key.name.clone()));
+        }
+        names
+    }
+
     /// Discards every cell and dirty clear marker buffered for one event's
     /// `key` — the clear-at-settle / reset move. Race-free:
     /// single-writer-per-key makes this key's sub-range exclusively owned
@@ -328,9 +359,9 @@ mod tests;
 /// `section_snapshot` answering empty after a `clear_section`, i.e. buffered
 /// writes silently dropped from the stage. Point removal keeps every later
 /// seek sound (pinned by `clear_section_keeps_sibling_section_ranges` in the
-/// sibling tests). The doomed-key snapshot is bounded by what this event
-/// buffered, inline for the common handful of cells.
-fn remove_span<K, V, Q>(tree: &scc::TreeIndex<K, V>, range: RangeInclusive<Q>)
+/// sibling tests). The doomed-key snapshot is bounded by the span's size,
+/// inline for the common handful of entries.
+pub(in crate::state) fn remove_span<K, V, Q>(tree: &scc::TreeIndex<K, V>, range: RangeInclusive<Q>)
 where
     K: Clone + Ord,
     Q: scc::Comparable<K>,
@@ -383,7 +414,7 @@ fn marker_key(collection: &CollectionId, section: Section) -> MarkerKey {
 /// definition (`equivalent ⇔ compare == Equal`); widening it to prefix
 /// equality would desynchronize it from `compare`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Edge {
+pub(crate) enum Edge {
     Low,
     High,
 }
@@ -391,7 +422,7 @@ enum Edge {
 impl Edge {
     /// The ordering to return once the prefix compares `Equal`: a `Low` bound
     /// sinks below the span, a `High` bound rises above it.
-    fn beyond(self) -> Ordering {
+    pub(crate) fn beyond(self) -> Ordering {
         match self {
             Self::Low => Ordering::Less,
             Self::High => Ordering::Greater,

@@ -5,26 +5,18 @@
 //! a single session and unified migration system.
 
 use crate::propagator::new_propagator;
-use crate::timers::TimerType;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
-use crate::timers::store::SegmentVersion;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use opentelemetry::propagation::TextMapCompositePropagator;
-use scylla::_macro_internal::{CellWriter, ColumnType, WrittenCellProof};
 use scylla::client::Compression;
 use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
-use scylla::cluster::metadata::NativeType;
-use scylla::deserialize::value::DeserializeValue;
-use scylla::deserialize::{DeserializationError, FrameSlice, TypeCheckError};
 use scylla::policies::load_balancing::DefaultPolicy;
 use scylla::policies::retry::DefaultRetryPolicy;
 use scylla::policies::timestamp_generator::MonotonicTimestampGenerator;
-use scylla::serialize::SerializationError;
 use scylla::serialize::row::SerializeRow;
-use scylla::serialize::value::SerializeValue;
 use scylla::statement::Consistency;
 use scylla::statement::batch::{Batch, BatchStatement, BatchType};
 use scylla::statement::prepared::PreparedStatement;
@@ -37,6 +29,7 @@ pub mod config;
 pub mod errors;
 pub mod macros;
 pub mod migrator;
+mod value;
 
 #[cfg(test)]
 mod tests;
@@ -87,6 +80,10 @@ pub const TABLE_KEYED_STATE_CELL: &str = "keyed_state_cell";
 /// Table for the frozen group-global keyed-state descriptor identities.
 pub const TABLE_KEYED_STATE_IDENTITY: &str = "keyed_state_identity";
 
+/// Table for keyed-state publication rows. These carry only routing
+/// information: a reader uses them to find the sources it reads from.
+pub const TABLE_KEYED_STATE_PUBLICATION: &str = "keyed_state_publication";
+
 /// Cassandra's maximum TTL in seconds (~20 years).
 pub const MAX_CASSANDRA_TTL_SECS: i64 = 630_720_000;
 
@@ -104,6 +101,7 @@ pub struct CassandraStore {
 #[derive(Debug)]
 struct Inner {
     session: Session,
+    keyspace: Arc<str>,
     propagator: TextMapCompositePropagator,
     base_ttl: CompactDuration,
 }
@@ -131,6 +129,7 @@ impl CassandraStore {
         Ok(Self {
             inner: Arc::new(Inner {
                 session,
+                keyspace: Arc::from(config.keyspace.as_str()),
                 propagator: new_propagator(),
                 base_ttl,
             }),
@@ -144,6 +143,12 @@ impl CassandraStore {
     #[must_use]
     pub fn session(&self) -> &Session {
         &self.inner.session
+    }
+
+    /// Returns the keyspace prepared for this store.
+    #[must_use]
+    pub(crate) fn keyspace(&self) -> &str {
+        &self.inner.keyspace
     }
 
     /// Returns a reference to the OpenTelemetry propagator.
@@ -423,112 +428,4 @@ async fn create_session(config: &CassandraConfiguration) -> Result<Session, Cass
     }
 
     Ok(Box::pin(session.build()).await?)
-}
-
-// Scylla trait implementations for Prosody types
-
-impl SerializeValue for CompactDuration {
-    fn serialize<'b>(
-        &self,
-        typ: &ColumnType,
-        writer: CellWriter<'b>,
-    ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        i32::from(*self).serialize(typ, writer)
-    }
-}
-
-impl SerializeValue for CompactDateTime {
-    fn serialize<'b>(
-        &self,
-        typ: &ColumnType,
-        writer: CellWriter<'b>,
-    ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        i32::from(*self).serialize(typ, writer)
-    }
-}
-
-impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for CompactDuration {
-    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
-        match typ {
-            ColumnType::Native(NativeType::Int) => Ok(()),
-            _ => Err(TypeCheckError::new(CassandraStoreError::IntExpected)),
-        }
-    }
-
-    fn deserialize(
-        typ: &'metadata ColumnType<'metadata>,
-        v: Option<FrameSlice<'frame>>,
-    ) -> Result<Self, DeserializationError> {
-        Ok(CompactDuration::from(i32::deserialize(typ, v)?))
-    }
-}
-
-impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for CompactDateTime {
-    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
-        match typ {
-            ColumnType::Native(NativeType::Int) => Ok(()),
-            _ => Err(TypeCheckError::new(CassandraStoreError::IntExpected)),
-        }
-    }
-
-    fn deserialize(
-        typ: &'metadata ColumnType<'metadata>,
-        v: Option<FrameSlice<'frame>>,
-    ) -> Result<Self, DeserializationError> {
-        Ok(CompactDateTime::from(i32::deserialize(typ, v)?))
-    }
-}
-
-impl SerializeValue for TimerType {
-    fn serialize<'b>(
-        &self,
-        typ: &ColumnType,
-        writer: CellWriter<'b>,
-    ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        i8::from(*self).serialize(typ, writer)
-    }
-}
-
-impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for TimerType {
-    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
-        match typ {
-            ColumnType::Native(NativeType::TinyInt) => Ok(()),
-            _ => Err(TypeCheckError::new(CassandraStoreError::TinyIntExpected)),
-        }
-    }
-
-    fn deserialize(
-        typ: &'metadata ColumnType<'metadata>,
-        v: Option<FrameSlice<'frame>>,
-    ) -> Result<Self, DeserializationError> {
-        let value = i8::deserialize(typ, v)?;
-        TimerType::try_from(value).map_err(DeserializationError::new)
-    }
-}
-
-impl SerializeValue for SegmentVersion {
-    fn serialize<'b>(
-        &self,
-        typ: &ColumnType,
-        writer: CellWriter<'b>,
-    ) -> Result<WrittenCellProof<'b>, SerializationError> {
-        i8::from(*self).serialize(typ, writer)
-    }
-}
-
-impl<'frame, 'metadata> DeserializeValue<'frame, 'metadata> for SegmentVersion {
-    fn type_check(typ: &ColumnType) -> Result<(), TypeCheckError> {
-        match typ {
-            ColumnType::Native(NativeType::TinyInt) => Ok(()),
-            _ => Err(TypeCheckError::new(CassandraStoreError::TinyIntExpected)),
-        }
-    }
-
-    fn deserialize(
-        typ: &'metadata ColumnType<'metadata>,
-        v: Option<FrameSlice<'frame>>,
-    ) -> Result<Self, DeserializationError> {
-        let value = i8::deserialize(typ, v)?;
-        SegmentVersion::try_from(value).map_err(DeserializationError::new)
-    }
 }

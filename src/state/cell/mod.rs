@@ -80,9 +80,23 @@ impl Cell {
     /// `data` for a resolved one. No oracle, no mutation — sound because of
     /// the prev-is-committed invariant.
     ///
-    /// This is the committed-projection primitive a future non-owner reader
-    /// will observe: one point read, committed-only, possibly stale by the
-    /// single in-flight event. No production caller consumes it yet.
+    /// This is the committed-only point read the standalone
+    /// [`StateReader`](crate::state_reader::StateReader) observes. It never
+    /// returns an uncommitted value, but it can be stale in two ways.
+    ///
+    /// A `Provisional` cell returns its committed `prev`. This hides the single
+    /// in-flight event's outcome.
+    ///
+    /// A `Resolved` cell can hold a value that predates a change which has
+    /// committed but whose effect the owner has not yet applied. A section
+    /// clear is one such change: the clear commits, but the owner has not yet
+    /// deleted the rows. The read returns the older value until the owner
+    /// converges it on its next recovery sweep or commit. That older value was
+    /// itself committed at the time it was written.
+    ///
+    /// The methods that resolve values through it are `read_committed`,
+    /// `read_committed_many`, and `scan_committed`, on both the Cassandra and
+    /// memory backends.
     #[must_use]
     pub fn project_committed(&self) -> Option<&Bytes> {
         match self {

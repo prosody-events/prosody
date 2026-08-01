@@ -37,7 +37,7 @@ use crate::state::dirty::DirtyStore;
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::resolve::{ResolveCellError, sweep_provisional};
-use crate::state::session::{CellSession, KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::session::{CellWrite, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::CellStore;
 use crate::state::{
     CollectionId, CollectionRef, EventRef, STATE_FANOUT_CONCURRENCY, StateBackend,
@@ -108,7 +108,7 @@ pub(crate) type ArmedKeys = Arc<ConcurrentHashMap<Key, CompactDateTime, RandomSt
 /// there: the scope is the failure-path backstop.
 ///
 /// The session itself stays a freely-cloned `Arc`-backed handle
-/// ([`CellSession`]): the
+/// ([`CellWrite`]): the
 /// [`EventContext`](crate::consumer::event_context::EventContext),
 /// the descriptor handles held across `.await`, and the `'static` FFI erasure
 /// all require `Clone + 'static`. So this scope owns one
@@ -135,11 +135,11 @@ pub(crate) type ArmedKeys = Arc<ConcurrentHashMap<Key, CompactDateTime, RandomSt
 #[must_use]
 pub struct EventStateScope<S>(S)
 where
-    S: CellSession;
+    S: CellWrite;
 
 impl<S> EventStateScope<S>
 where
-    S: CellSession,
+    S: CellWrite,
 {
     /// Wraps the minted session as the event's owned scope.
     pub fn new(session: S) -> Self {
@@ -155,7 +155,7 @@ where
 
 impl<S> Drop for EventStateScope<S>
 where
-    S: CellSession,
+    S: CellWrite,
 {
     fn drop(&mut self) {
         // Flip termination first, then discard: a dispatch future dropped
@@ -184,7 +184,7 @@ where
 /// production impl [`StateManager`].
 pub trait PartitionStateManager: Clone + Send + Sync + 'static {
     /// Session type minted per event.
-    type Session: CellSession;
+    type Session: CellWrite;
 
     /// Mints the per-event session scope for `event` on `key`.
     ///
@@ -296,6 +296,10 @@ where
     /// the sweep fires. Semantics of an absent key are owned by [`ArmedKeys`]:
     /// unknown, not unarmed.
     armed: ArmedKeys,
+    /// The first-write publisher bound to this partition's topic, or `None`
+    /// when nothing is published. Cloned into every session this manager
+    /// creates.
+    publisher: Option<B::Publisher>,
 }
 
 /// The real per-partition state manager: owns the partition-lifetime cell
@@ -344,6 +348,7 @@ where
             recovery_delay: self.inner.recovery_delay,
             armed: self.inner.armed.clone(),
             termination,
+            publisher: self.inner.publisher.clone(),
         }))
     }
 
@@ -571,6 +576,7 @@ where
                 segment_id,
                 recovery_delay: self.recovery_delay,
                 armed: Arc::default(),
+                publisher: backend.publisher(),
             }),
         })
     }

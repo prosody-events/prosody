@@ -1,6 +1,6 @@
 //! The keyed-state durability sequence — the single owner of
-//! stage → arm → marker-record → commit → promote, run once per event after
-//! the middleware stack returns its final result.
+//! publish → stage → arm → marker-record → commit → promote, run once per event
+//! after the middleware stack returns its final result.
 //!
 //! Both durability boundaries — the blanket [`EventHandler`] impl in the
 //! parent module and [`RetryHandler`](super::retry::RetryHandler) — route
@@ -204,6 +204,31 @@ pub(super) enum ArmOutcome {
     ShuttingDown,
 }
 
+/// Outcome of the first-write publication barrier.
+///
+/// Publishing must succeed, for the same reason arming the backstop must
+/// (invariant 8). A `Published` collection's committed state is undiscoverable
+/// by a cross-group reader until its routing row exists. The row must precede
+/// the stage. [`publish_first_writes`] retries every non-shutdown failure
+/// forever, regardless of category, matching `arm_backstop`.
+///
+/// A dropped or misconfigured publication table surfaces
+/// `CassandraPublicationError::Database`, which classifies `Terminal` or
+/// `Transient`. The barrier retries it forever anyway, so a schema-level fault
+/// blocks dispatch until an operator repairs the schema. Blocking is
+/// deliberate: committing published state with no routing row to advertise it
+/// would leave that state permanently unreachable. The only non-`Published`
+/// outcome is a shutdown, which abandons before anything stages.
+enum PublishOutcome {
+    /// Every touched `Published` collection has a routing row (or there was
+    /// nothing to publish).
+    Published,
+
+    /// Shutdown intervened before publication completed. The caller abandons
+    /// before staging, so redelivery re-runs from clean state.
+    ShuttingDown,
+}
+
 /// The durability sequence: the single owner of stage → arm → marker-record →
 /// commit → promote, run once per event after the stack returns its final
 /// `result`. Both the blanket [`EventHandler`] impl and
@@ -330,9 +355,9 @@ fn discard_uncommitted<S: StateLifecycle>(lifecycle: Option<&S>) {
     }
 }
 
-/// The success arm of [`settle`]: stage, arm the backstop, record the marker
-/// strictly after the stage, commit, then promote the staged cells through
-/// the receipt.
+/// The success arm of [`settle`]: publish, stage, arm the backstop, record the
+/// marker strictly after the stage, commit, then promote the staged cells
+/// through the receipt.
 ///
 /// The marker is read from the session's event identity
 /// (`message_marker()`: the message `EventRef`'s dedup id, or the
@@ -342,10 +367,13 @@ fn discard_uncommitted<S: StateLifecycle>(lifecycle: Option<&S>) {
 ///
 /// # Crash windows
 ///
-/// The step order — stage → **arm** → marker record → **commit** → promote —
-/// closes every crash window without any acquisition-time sweep (there is
-/// none):
+/// The step order — publish → stage → **arm** → marker record → **commit** →
+/// promote — closes every crash window without any acquisition-time sweep
+/// (there is none):
 ///
+/// * Crash after the publication upsert, before the stage: a routing row stands
+///   over empty state, which a reader observes as a harmless absent value;
+///   redelivery re-stages.
 /// * Crash after the stage, before the arm: the offset never commits, so the
 ///   event **redelivers**, re-stages, and re-arms; the redelivered handler's
 ///   own reads first-touch-resolve the orphan to its committed base.
@@ -379,6 +407,18 @@ async fn settle_committed<'a, T, C, G>(
         fire_apply_hook(handler, context, true, result).await;
         return;
     };
+
+    // 0. First-write publication barrier. A `Published` collection's routing
+    // row must exist before its committed state does, so publish before the
+    // stage. This must succeed: it retries until shutdown. A shutdown here
+    // abandons before anything stages, so the marker is untouched and
+    // redelivery re-runs from a clean state.
+    if let PublishOutcome::ShuttingDown = publish_first_writes(&context, lifecycle).await {
+        discard_uncommitted(Some(lifecycle));
+        drop(permit);
+        abandon(handler, context, guard, result).await;
+        return;
+    }
 
     // 1. Stage provisional cells / write resolved, retrying transient
     // failures.
@@ -577,6 +617,33 @@ async fn fire_apply_hook<T, C>(
         handler.after_commit(stamped, result).await;
     } else {
         handler.after_abort(stamped, result).await;
+    }
+}
+
+/// Runs the first-write publication barrier for every `Published` collection
+/// this event touched, retrying until it succeeds or shutdown intervenes.
+///
+/// Must-succeed (see [`PublishOutcome`]): every non-shutdown failure retries
+/// forever, so this never emits a `Terminal` and never abandons in normal
+/// operation. Called as settle step 0 — before any stage — so a published
+/// collection's committed state can never exist without its routing row. The
+/// barrier is idempotent and memoized, so retries and a prior `commit()`'s
+/// publication cost nothing.
+async fn publish_first_writes<C>(context: &C, lifecycle: &C::State) -> PublishOutcome
+where
+    C: EventContext,
+{
+    loop {
+        if context.is_shutdown() {
+            return PublishOutcome::ShuttingDown;
+        }
+        match lifecycle.publish_first_writes().await {
+            Ok(()) => return PublishOutcome::Published,
+            Err(error) => {
+                error!(error = %error, "keyed-state publication failed; retrying");
+                sleep(DURABILITY_RETRY_DELAY).await;
+            }
+        }
     }
 }
 

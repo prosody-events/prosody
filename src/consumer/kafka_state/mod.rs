@@ -105,7 +105,7 @@ impl Codec for MessageRefCodec {
 pub struct MessageResolver<L>(PhantomData<fn() -> L>);
 
 // `L: 'static` — a resolver only ever borrows a session's loader, and
-// `CellSession::Loader` is always `'static`; the bound lets the `&'s L`
+// `CellRead::Loader` is always `'static`; the bound lets the `&'s L`
 // context GAT hold for any `'s`.
 impl<L: MessageLoader + 'static> CellResolver for MessageResolver<L> {
     type Context<'s> = &'s L;
@@ -121,7 +121,8 @@ impl<L: MessageLoader + 'static> CellResolver for MessageResolver<L> {
     // Desugared `-> impl Future + Send` rather than `async fn`: the returned
     // future borrows the loader through the `Context<'s>` GAT, and rustc
     // #100013 fails `Send` inference for `async fn` futures that hold GAT
-    // projections.
+    // projections. Resolution never waits for capacity because its caller may
+    // retain permits from earlier resolved messages.
     fn resolve(
         loader: Self::Context<'_>,
         stored: MessageRef,
@@ -133,7 +134,7 @@ impl<L: MessageLoader + 'static> CellResolver for MessageResolver<L> {
         } = stored;
         async move {
             loader
-                .load_message(topic, partition, offset)
+                .try_load_message(topic, partition, offset)
                 .await
                 .map_err(|error| StateAccessError::load(&error))
         }

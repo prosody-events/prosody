@@ -14,7 +14,7 @@ use prosody::consumer::middleware::FallibleHandler;
 use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
 use prosody::consumer::{ConsumerConfigurationBuilder, DemandType, Keyed};
 use prosody::high_level::mode::Mode;
-use prosody::high_level::{ConsumerBuilders, HighLevelClient};
+use prosody::high_level::{CassandraHighLevelClient, ConsumerBuilders};
 use prosody::producer::ProducerConfigurationBuilder;
 use prosody::telemetry::TelemetryEmitterConfiguration;
 use prosody::timers::TimerType;
@@ -32,7 +32,7 @@ use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 mod common;
-use common::{FallibleTestHandler, TestError, TransientError};
+use common::handler::{FallibleTestHandler, TestError, TransientError};
 
 const BOOTSTRAP: &str = "localhost:9094";
 const CASSANDRA_HOST: &str = "localhost:9042";
@@ -783,7 +783,7 @@ fn build_client_with<T: FallibleHandler>(
     telemetry_topic: &str,
     emitter_enabled: bool,
     defer: DeferConfigurationBuilder,
-) -> Result<HighLevelClient<T>> {
+) -> Result<CassandraHighLevelClient<T>> {
     let mut producer_builder = ProducerConfigurationBuilder::default();
     producer_builder
         .bootstrap_servers(bootstrap_servers())
@@ -803,17 +803,17 @@ fn build_client_with<T: FallibleHandler>(
             topic: telemetry_topic.to_owned(),
             enabled: emitter_enabled,
         },
-        ..Default::default()
+        ..ConsumerBuilders::new()?
     };
 
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
 
-    let client = HighLevelClient::new(
+    let client = CassandraHighLevelClient::new(
+        cassandra_builder.build()?,
         mode,
         &mut producer_builder,
         &consumer_builders,
-        &cassandra_builder,
     )?;
     Ok(client)
 }
@@ -823,7 +823,7 @@ fn build_client(
     source_topic: &str,
     telemetry_topic: &str,
     emitter_enabled: bool,
-) -> Result<HighLevelClient<FallibleTestHandler>> {
+) -> Result<CassandraHighLevelClient<FallibleTestHandler>> {
     build_client_with(
         Mode::BestEffort,
         source_topic,
@@ -836,7 +836,7 @@ fn build_client(
 fn build_typed_client<T: FallibleHandler>(
     source_topic: &str,
     telemetry_topic: &str,
-) -> Result<HighLevelClient<T>> {
+) -> Result<CassandraHighLevelClient<T>> {
     build_client_with(
         Mode::Pipeline,
         source_topic,
@@ -850,7 +850,7 @@ fn build_typed_client_with_defer<T: FallibleHandler>(
     source_topic: &str,
     telemetry_topic: &str,
     defer: DeferConfigurationBuilder,
-) -> Result<HighLevelClient<T>> {
+) -> Result<CassandraHighLevelClient<T>> {
     build_client_with(Mode::Pipeline, source_topic, telemetry_topic, true, defer)
 }
 
@@ -1132,7 +1132,7 @@ async fn message_failed_event_on_kafka() -> Result<()> {
         let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
 
-        let client: HighLevelClient<FailingHandler> =
+        let client: CassandraHighLevelClient<FailingHandler> =
             build_typed_client(&source_topic, &telemetry_topic)?;
 
         let (fail_tx, mut fail_rx) = channel(16);
@@ -1170,7 +1170,7 @@ async fn timer_lifecycle_events_on_kafka() -> Result<()> {
         let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
 
-        let client: HighLevelClient<TimerSchedulingHandler> =
+        let client: CassandraHighLevelClient<TimerSchedulingHandler> =
             build_typed_client(&source_topic, &telemetry_topic)?;
 
         let (msg_tx, mut msg_rx) = channel(16);
@@ -1222,7 +1222,7 @@ async fn timer_failed_event_on_kafka() -> Result<()> {
         let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
 
-        let client: HighLevelClient<TimerFailingHandler> =
+        let client: CassandraHighLevelClient<TimerFailingHandler> =
             build_typed_client(&source_topic, &telemetry_topic)?;
 
         let (msg_tx, mut msg_rx) = channel(16);
@@ -1276,7 +1276,7 @@ async fn deferred_message_timer_three_event_invariant() -> Result<()> {
 
         let mut defer = DeferConfigurationBuilder::default();
         defer.failure_threshold(1.0_f64);
-        let client: HighLevelClient<TransientMessageHandler> =
+        let client: CassandraHighLevelClient<TransientMessageHandler> =
             build_typed_client_with_defer(&source_topic, &telemetry_topic, defer)?;
 
         let (done_tx, mut done_rx) = channel(16);
@@ -1337,7 +1337,7 @@ async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
 
         let mut defer = DeferConfigurationBuilder::default();
         defer.failure_threshold(1.0_f64);
-        let client: HighLevelClient<TransientTimerHandler> =
+        let client: CassandraHighLevelClient<TransientTimerHandler> =
             build_typed_client_with_defer(&source_topic, &telemetry_topic, defer)?;
 
         let (msg_tx, mut msg_rx) = channel(16);
@@ -1403,7 +1403,7 @@ async fn timer_cancelled_event_on_kafka() -> Result<()> {
         let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
 
-        let client: HighLevelClient<TimerCancellingHandler> =
+        let client: CassandraHighLevelClient<TimerCancellingHandler> =
             build_typed_client(&source_topic, &telemetry_topic)?;
 
         let (msg_tx, mut msg_rx) = channel(16);
@@ -1472,7 +1472,7 @@ async fn clear_and_schedule_emits_cancelled_and_scheduled() -> Result<()> {
         let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
 
-        let client: HighLevelClient<ClearAndScheduleHandler> =
+        let client: CassandraHighLevelClient<ClearAndScheduleHandler> =
             build_typed_client(&source_topic, &telemetry_topic)?;
 
         let (msg_tx, mut msg_rx) = channel(16);

@@ -12,7 +12,7 @@ use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::config::CassandraConfigurationBuilder;
 use prosody::consumer::event_context::EventContext;
 use prosody::high_level::mode::Mode;
-use prosody::high_level::{ConsumerBuilders, HighLevelClient};
+use prosody::high_level::{CassandraHighLevelClient, ConsumerBuilders};
 use prosody::producer::ProducerConfigurationBuilder;
 use prosody::telemetry::TelemetryEmitterConfiguration;
 use prosody::tracing::init_test_logging;
@@ -35,7 +35,8 @@ use tracing::info;
 use uuid::Uuid;
 
 mod common;
-use common::{ConsumerEnv, TestError};
+use common::handler::TestError;
+use common::kafka::ConsumerEnv;
 
 /// Hang-guard for an individual wait on an event that *must* arrive (a message
 /// reaching the handler, a timer firing). These tests assert on event
@@ -318,12 +319,12 @@ impl TestEnvironment {
 
     /// Wait for a message event under the receive hang-guard
     async fn expect_message(&mut self) -> Result<MessageEvent> {
-        common::expect_event(&mut self.message_rx, RECEIVE_TIMEOUT).await
+        common::receive::expect_event(&mut self.message_rx, RECEIVE_TIMEOUT).await
     }
 
     /// Wait for a timer event under the receive hang-guard
     async fn expect_timer(&mut self) -> Result<TimerEvent> {
-        common::expect_event(&mut self.timer_rx, RECEIVE_TIMEOUT).await
+        common::receive::expect_event(&mut self.timer_rx, RECEIVE_TIMEOUT).await
     }
 
     /// Wait for exactly `count` timer events, then verify no extras arrive
@@ -331,7 +332,7 @@ impl TestEnvironment {
         let mut received_timers = Vec::with_capacity(count);
 
         for i in 0..count {
-            let timer_event = common::expect_event(&mut self.timer_rx, RECEIVE_TIMEOUT)
+            let timer_event = common::receive::expect_event(&mut self.timer_rx, RECEIVE_TIMEOUT)
                 .await
                 .map_err(|e| eyre!("waiting for timer {} of {}: {e}", i + 1, count))?;
             received_timers.push(timer_event);
@@ -352,7 +353,7 @@ impl TestEnvironment {
 
     /// Verify that no timer event occurs within the given window
     async fn expect_no_timer(&mut self, window_secs: u32) -> Result<()> {
-        common::expect_no_event(
+        common::receive::expect_no_event(
             &mut self.timer_rx,
             Duration::from_secs(u64::from(window_secs)),
         )
@@ -452,7 +453,7 @@ where
 fn build_inline_replacement_client(
     source_topic: &str,
     telemetry_topic: &str,
-) -> Result<HighLevelClient<InlineReplacementHandler>> {
+) -> Result<CassandraHighLevelClient<InlineReplacementHandler>> {
     let mut producer_builder = ProducerConfigurationBuilder::default();
     producer_builder
         .bootstrap_servers(vec!["localhost:9094".to_owned()])
@@ -471,17 +472,17 @@ fn build_inline_replacement_client(
             topic: telemetry_topic.to_owned(),
             enabled: true,
         },
-        ..Default::default()
+        ..ConsumerBuilders::new()?
     };
 
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec!["localhost:9042".to_owned()]);
 
-    let client = HighLevelClient::new(
+    let client = CassandraHighLevelClient::new(
+        cassandra_builder.build()?,
         Mode::Pipeline,
         &mut producer_builder,
         &consumer_builders,
-        &cassandra_builder,
     )?;
     Ok(client)
 }
@@ -782,11 +783,11 @@ async fn inline_replacement_fires_once_at_replacement_time() -> Result<()> {
     timeout(TIMER_TEST_TIMEOUT, async {
         init_test_logging();
 
-        let (source, admin) = common::create_single_partition_topic().await?;
-        let (telemetry_topic, _) = common::create_single_partition_topic().await?;
+        let (source, admin) = common::kafka::create_topic_with_partitions(1).await?;
+        let (telemetry_topic, _) = common::kafka::create_topic_with_partitions(1).await?;
         let source_topic = source.to_string();
 
-        let client: HighLevelClient<InlineReplacementHandler> =
+        let client: CassandraHighLevelClient<InlineReplacementHandler> =
             build_inline_replacement_client(&source_topic, telemetry_topic.as_ref())?;
 
         let (messages, mut msg_rx) = channel(16);

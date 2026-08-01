@@ -14,7 +14,7 @@ use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::order_codec::OrderedKeyCodec;
-use crate::state::session::{CellSession, MutatePermit, OpPermit};
+use crate::state::session::{CellRead, CellWrite};
 use crate::state::store::{CELL_BATCH, CellBuffer, CoordinateBatch};
 use crate::state::{RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateName, StateType, StoreOutcome};
 use async_stream::try_stream;
@@ -74,7 +74,7 @@ impl<S> CellScope<S> {
     }
 }
 
-impl<S: CellSession> CellScope<S> {
+impl<S: CellRead> CellScope<S> {
     /// Projects a typed view over this scope's cells in `section` for cell type
     /// `T`. A kind projects one view per cell family, each in its own section
     /// (a Map projects its entries and its meta cells from the same scope
@@ -113,13 +113,13 @@ impl<S: CellSession> CellScope<S> {
             .collection_capacity(self.state_type, &self.name)
     }
 
-    /// Reads one cell's visible committed bytes. Demands a read permit
-    /// (`GateWitness`); `_permit` is a terminal token — the borrow is not
-    /// threaded into the unwitnessed [`CellSession`] trait, but the returned
-    /// future's edition-2024 lifetime capture still binds it to the gate.
+    /// Reads one cell's visible committed bytes. Demands a read permit. The
+    /// `_permit` is unused in the body: the [`CellRead`] call does not take it.
+    /// The returned future still captures the borrow through its edition-2024
+    /// lifetime, so the gate stays held while the read runs.
     async fn raw_get(
         &self,
-        _permit: &OpPermit<'_>,
+        _permit: &S::Permit<'_>,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
         ensure_live(&self.session)?;
@@ -127,11 +127,11 @@ impl<S: CellSession> CellScope<S> {
     }
 
     /// Batch twin of [`Self::raw_get`]: reads `section`'s `batch` in one lower
-    /// hop, aligned. Demands the same `OpPermit` witness and runs the same
+    /// hop, aligned. Demands the same read-permit witness and runs the same
     /// `ensure_live` guard as [`Self::raw_get`].
     async fn raw_get_many(
         &self,
-        _permit: &OpPermit<'_>,
+        _permit: &S::Permit<'_>,
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
@@ -152,12 +152,14 @@ impl<S: CellSession> CellScope<S> {
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         self.session.scan(self.state_type, &self.name, scan)
     }
+}
 
-    /// Buffers a set of one cell's bytes. Demands a mutate permit
-    /// (`GateWitness`); see [`Self::raw_get`] for the `_permit` token.
+impl<S: CellWrite> CellScope<S> {
+    /// Buffers a set of one cell's bytes. Demands a mutate permit; see
+    /// [`Self::raw_get`] for the `_permit` token.
     async fn raw_set(
         &self,
-        _permit: &MutatePermit<'_>,
+        _permit: &S::MutatePermit<'_>,
         cell: &CellKey,
         value: &[u8],
     ) -> Result<(), StateAccessError> {
@@ -167,10 +169,10 @@ impl<S: CellSession> CellScope<S> {
             .await
     }
 
-    /// Buffers a clear of one cell. Demands a mutate permit (`GateWitness`).
+    /// Buffers a clear of one cell. Demands a mutate permit.
     async fn raw_clear(
         &self,
-        _permit: &MutatePermit<'_>,
+        _permit: &S::MutatePermit<'_>,
         cell: &CellKey,
     ) -> Result<(), StateAccessError> {
         ensure_live(&self.session)?;
@@ -178,10 +180,10 @@ impl<S: CellSession> CellScope<S> {
     }
 
     /// Buffers a dirty clear marker over one section; see
-    /// [`CellSession::clear_section`]. Demands a mutate permit (`GateWitness`).
+    /// [`CellWrite::clear_section`]. Demands a mutate permit.
     async fn clear_section(
         &self,
-        _permit: &MutatePermit<'_>,
+        _permit: &S::MutatePermit<'_>,
         section: Section,
     ) -> Result<(), StateAccessError> {
         ensure_live(&self.session)?;
@@ -191,18 +193,18 @@ impl<S: CellSession> CellScope<S> {
     }
 
     /// Durably commits this collection's buffered ops mid-handler.
-    /// At-least-once; see [`CellSession::commit`] for the contract. Demands a
-    /// mutate permit (`GateWitness`).
+    /// At-least-once; see [`CellWrite::commit`] for the contract. Demands a
+    /// mutate permit.
     async fn raw_commit(
         &self,
-        _permit: &MutatePermit<'_>,
+        _permit: &S::MutatePermit<'_>,
     ) -> Result<StoreOutcome, StateAccessError> {
         ensure_live(&self.session)?;
         self.session.commit(self.state_type, &self.name).await
     }
 
     /// Discards this collection's uncommitted buffered ops mid-handler; see
-    /// [`CellSession::rollback`] for the contract. Unwitnessed by design: the
+    /// [`CellWrite::rollback`] for the contract. Unwitnessed by design: the
     /// session owns rollback's gate acquire, so a handle-held permit would
     /// re-enter the non-reentrant mutex and deadlock. The terminated- and
     /// closed-session guards live in the session impl (as a `NoOp`), not
@@ -222,8 +224,10 @@ impl<S: CellSession> CellScope<S> {
 /// Every op guards on session termination.
 ///
 /// The one op bound `for<'s> ContextOf<'s, T>: FromSession<'s, S>` sits on the
-/// op impl block: it is what lets `get`/`scan` extract the resolver's context
-/// from the session for any lifetime.
+/// resolving read impl block (`S: CellRead`): it is what lets `get`/`scan`
+/// extract the resolver's context from the session for any lifetime. The
+/// mutators need no such bound — `set` only lowers through the resolver's
+/// `stored_from`, and `clear`/`commit` do not resolve at all.
 pub(crate) struct CellView<S, T> {
     scope: CellScope<S>,
     section: Section,
@@ -240,7 +244,7 @@ impl<S: Clone, T> Clone for CellView<S, T> {
     }
 }
 
-impl<S: CellSession, T: CellType> CellView<S, T> {
+impl<S: CellRead, T: CellType> CellView<S, T> {
     /// The collection's name, for the handles' operation spans.
     pub(in crate::state::descriptor) fn name(&self) -> &StateName {
         &self.scope.name
@@ -248,44 +252,9 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
 
     /// Acquires the session operation gate for a read — the top of every
     /// gated public read wrapper (the handles' `get`/`len`/stream inits). The
-    /// returned [`OpPermit`] is the witness the view's read sinks demand.
-    pub(in crate::state::descriptor) async fn read_permit(&self) -> OpPermit<'_> {
-        self.scope.session().gate().read().await
-    }
-
-    /// Acquires the session operation gate for a mutator, then applies the one
-    /// total admission order under the held permit before minting the witness:
-    ///
-    /// 1. **pin** — a stale attempt (this handle outlived its dispatch; the
-    ///    epoch was bumped) errors [`StateAccessError::Terminated`], so a
-    ///    dead-attempt mutation is fenced uniformly.
-    /// 2. **closed** — the settle boundary already closed the session, so an
-    ///    own-event mutation past the settle window errors
-    ///    [`StateAccessError::SessionClosed`] deterministically (pin-first
-    ///    means a *current*-pin hook mutation classifies `SessionClosed`, not
-    ///    `Terminated`, even under shutdown/cancellation).
-    /// 3. **termination** — shutdown or cancellation errors
-    ///    [`StateAccessError::Terminated`].
-    ///
-    /// The permit is held across all three checks and the bump needs the gate
-    /// exclusively, so the pin is stable between the check and the mint. The
-    /// returned [`MutatePermit`] is the witness the view's mutating sinks
-    /// demand.
-    pub(in crate::state::descriptor) async fn mutate_permit(
-        &self,
-    ) -> Result<MutatePermit<'_>, StateAccessError> {
-        let session = self.scope.session();
-        let permit = session.gate().read().await;
-        if !session.attempt_current() {
-            return Err(StateAccessError::Terminated);
-        }
-        if permit.is_closed() {
-            return Err(StateAccessError::SessionClosed);
-        }
-        if session.is_terminated() {
-            return Err(StateAccessError::Terminated);
-        }
-        Ok(MutatePermit::witness(permit))
+    /// returned `S::Permit` is the witness the view's read sinks demand.
+    pub(in crate::state::descriptor) async fn read_permit(&self) -> S::Permit<'_> {
+        self.scope.session().permit().await
     }
 
     /// The full cell address for `key` in this view's section — the sole place
@@ -308,7 +277,7 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
     /// Returns an access error from the session.
     pub(in crate::state::descriptor) async fn contains(
         &self,
-        permit: &OpPermit<'_>,
+        permit: &S::Permit<'_>,
         key: &KeyOf<T>,
     ) -> Result<bool, StateAccessError> {
         let cell = self.cell(key);
@@ -331,29 +300,6 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
     /// [`CellScope::capacity`]).
     pub(in crate::state::descriptor) fn capacity(&self) -> Option<NonZeroUsize> {
         self.scope.capacity()
-    }
-
-    /// Buffers a dirty clear marker over this view's whole section: every
-    /// cell reads as deleted from this program point, and later `set`s
-    /// repopulate. See [`CellSession::clear_section`] for the transactional
-    /// contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns an access error from the session.
-    pub(in crate::state::descriptor) async fn clear_all(
-        &self,
-        permit: &MutatePermit<'_>,
-    ) -> Result<(), CellStateError<CellCodecError<T>>> {
-        Ok(self.scope.clear_section(permit, self.section).await?)
-    }
-
-    /// Discards this collection's uncommitted buffered ops mid-handler — every
-    /// typed view over the scope, not just this view's cells; the discard twin
-    /// of [`Self::commit`]. See [`CellSession::rollback`] for the contract
-    /// (the session owns the gate acquire, so this stays permit-free).
-    pub(in crate::state::descriptor) async fn rollback(&self) -> StoreOutcome {
-        self.scope.raw_rollback().await
     }
 
     /// The scan shell's fence adapter — the shell's one uniform piece and the
@@ -423,7 +369,7 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
     /// Returns an access error from the session.
     async fn read_bytes(
         &self,
-        permit: &OpPermit<'_>,
+        permit: &S::Permit<'_>,
         keys: &[KeyOf<T>],
     ) -> Result<CellBuffer<Option<Bytes>>, CellStateError<CellCodecError<T>>> {
         // The per-chunk coordinate buffer stays inline (`≤ CELL_BATCH`); only
@@ -567,9 +513,98 @@ impl<S: CellSession, T: CellType> CellView<S, T> {
     }
 }
 
+impl<S: CellWrite, T: CellType> CellView<S, T> {
+    /// Acquires the session operation gate for a mutator and applies the total
+    /// admission order (pin → closed → termination) — a thin forwarder to
+    /// [`CellWrite::mutate_permit`], which owns the sequence. The returned
+    /// `S::MutatePermit` is the witness the view's mutating sinks demand.
+    pub(in crate::state::descriptor) async fn mutate_permit(
+        &self,
+    ) -> Result<S::MutatePermit<'_>, StateAccessError> {
+        self.scope.session().mutate_permit().await
+    }
+
+    /// Buffers a dirty clear marker over this view's whole section: every
+    /// cell reads as deleted from this program point, and later `set`s
+    /// repopulate. See [`CellWrite::clear_section`] for the transactional
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub(in crate::state::descriptor) async fn clear_all(
+        &self,
+        permit: &S::MutatePermit<'_>,
+    ) -> Result<(), CellStateError<CellCodecError<T>>> {
+        Ok(self.scope.clear_section(permit, self.section).await?)
+    }
+
+    /// Discards this collection's uncommitted buffered ops mid-handler — every
+    /// typed view over the scope, not just this view's cells; the discard twin
+    /// of [`Self::commit`]. See [`CellWrite::rollback`] for the contract
+    /// (the session owns the gate acquire, so this stays permit-free).
+    pub(in crate::state::descriptor) async fn rollback(&self) -> StoreOutcome {
+        self.scope.raw_rollback().await
+    }
+
+    /// Lowers `value` through the resolver, encodes it, and buffers a set at
+    /// `key`.
+    ///
+    /// Desugared like [`Self::get`]: the key is lowered to its coordinate and
+    /// the value through the resolver *before* the async block, so only owned
+    /// values cross the buffering await (a borrowed `&KeyOf<T>` never does).
+    ///
+    /// # Errors
+    ///
+    /// Returns a codec error (Permanent) when the cell fails to encode, or an
+    /// access error from the session.
+    pub(in crate::state::descriptor) fn set<'a>(
+        &'a self,
+        permit: &'a S::MutatePermit<'_>,
+        key: &KeyOf<T>,
+        value: WriteOf<'_, T>,
+    ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<T>>>> + Send + 'a {
+        let cell = self.cell(key);
+        let stored = <T::Resolver as CellResolver>::stored_from(value);
+        async move {
+            let buf = encode_cell::<T::Codec>(stored).map_err(CellStateError::Codec)?;
+            Ok(self.scope.raw_set(permit, &cell, &buf).await?)
+        }
+    }
+
+    /// Buffers a clear of the cell at `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub(in crate::state::descriptor) fn clear<'a>(
+        &'a self,
+        permit: &'a S::MutatePermit<'_>,
+        key: &KeyOf<T>,
+    ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<T>>>> + Send + 'a {
+        let cell = self.cell(key);
+        async move { Ok(self.scope.raw_clear(permit, &cell).await?) }
+    }
+
+    /// Durably commits this collection's buffered ops mid-handler — the
+    /// single `commit()` home, draining the whole collection's buffered ops
+    /// (every typed view over the scope), not just this view's cells.
+    /// At-least-once; see [`CellWrite::commit`] for the contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an access error from the session.
+    pub(in crate::state::descriptor) async fn commit(
+        &self,
+        permit: &S::MutatePermit<'_>,
+    ) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
+        Ok(self.scope.raw_commit(permit).await?)
+    }
+}
+
 impl<S, T> CellView<S, T>
 where
-    S: CellSession,
+    S: CellRead,
     T: CellType,
     for<'s> ContextOf<'s, T>: FromSession<'s, S>,
 {
@@ -594,7 +629,7 @@ where
     /// resolver.
     pub(in crate::state::descriptor) fn get<'a>(
         &'a self,
-        permit: &'a OpPermit<'_>,
+        permit: &'a S::Permit<'_>,
         key: &KeyOf<T>,
     ) -> impl Future<Output = Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>>> + Send + 'a
     {
@@ -631,7 +666,7 @@ where
     /// a cell's bytes do not decode, or a resolution error from the resolver.
     pub(in crate::state::descriptor) async fn get_many(
         &self,
-        permit: &OpPermit<'_>,
+        permit: &S::Permit<'_>,
         keys: &[KeyOf<T>],
     ) -> Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>> {
         // PHASE 1: sequential store reads → aligned committed bytes.
@@ -688,60 +723,6 @@ where
             let ctx = <ContextOf<'a, T> as FromSession<'a, S>>::from_session(self.scope.session());
             Ok(<T::Resolver as CellResolver>::resolve(ctx, stored).await?)
         }
-    }
-
-    /// Lowers `value` through the resolver, encodes it, and buffers a set at
-    /// `key`.
-    ///
-    /// Desugared like [`Self::get`]: the key is lowered to its coordinate and
-    /// the value through the resolver *before* the async block, so only owned
-    /// values cross the buffering await (a borrowed `&KeyOf<T>` never does).
-    ///
-    /// # Errors
-    ///
-    /// Returns a codec error (Permanent) when the cell fails to encode, or an
-    /// access error from the session.
-    pub(in crate::state::descriptor) fn set<'a>(
-        &'a self,
-        permit: &'a MutatePermit<'_>,
-        key: &KeyOf<T>,
-        value: WriteOf<'_, T>,
-    ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<T>>>> + Send + 'a {
-        let cell = self.cell(key);
-        let stored = <T::Resolver as CellResolver>::stored_from(value);
-        async move {
-            let buf = encode_cell::<T::Codec>(stored).map_err(CellStateError::Codec)?;
-            Ok(self.scope.raw_set(permit, &cell, &buf).await?)
-        }
-    }
-
-    /// Buffers a clear of the cell at `key`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an access error from the session.
-    pub(in crate::state::descriptor) fn clear<'a>(
-        &'a self,
-        permit: &'a MutatePermit<'_>,
-        key: &KeyOf<T>,
-    ) -> impl Future<Output = Result<(), CellStateError<CellCodecError<T>>>> + Send + 'a {
-        let cell = self.cell(key);
-        async move { Ok(self.scope.raw_clear(permit, &cell).await?) }
-    }
-
-    /// Durably commits this collection's buffered ops mid-handler — the
-    /// single `commit()` home, draining the whole collection's buffered ops
-    /// (every typed view over the scope), not just this view's cells.
-    /// At-least-once; see [`CellSession::commit`] for the contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns an access error from the session.
-    pub(in crate::state::descriptor) async fn commit(
-        &self,
-        permit: &MutatePermit<'_>,
-    ) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
-        Ok(self.scope.raw_commit(permit).await?)
     }
 
     /// Scans this section's cells in key order over the typed range
@@ -925,7 +906,7 @@ fn encode_edge<K: OrderedKeyCodec>(edge: ScanEdge<&K::Key>) -> ScanEdge<Coordina
 /// [`CellView::mutate_permit`].
 fn ensure_live<S>(session: &S) -> Result<(), StateAccessError>
 where
-    S: CellSession,
+    S: CellRead,
 {
     if session.is_terminated() || !session.attempt_current() {
         return Err(StateAccessError::Terminated);

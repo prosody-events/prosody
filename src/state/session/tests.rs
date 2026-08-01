@@ -46,7 +46,7 @@
 //! real boundary is driven.)
 
 use super::sealed::{ApplyOutcome, StagedState, StateLifecycle};
-use super::{CellSession, Finalized, KeyedStateSession, SessionParts, TerminationWatch};
+use super::{CellRead, CellWrite, Finalized, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::ErrorCategory;
@@ -180,6 +180,7 @@ impl Fixture {
             recovery_delay: CompactDuration::new(30),
             armed: self.armed.clone(),
             termination: TerminationWatch::new(self.shutdown_rx.clone(), self.cancel_rx.clone()),
+            publisher: None,
         }))
     }
 
@@ -204,6 +205,7 @@ impl Fixture {
             recovery_delay: CompactDuration::new(30),
             armed: self.armed.clone(),
             termination: TerminationWatch::new(self.shutdown_rx.clone(), cancel_rx),
+            publisher: None,
         }))
     }
 
@@ -297,6 +299,7 @@ async fn staged_fire_delay(
         recovery_delay: CompactDuration::new(floor_secs),
         armed: Arc::default(),
         termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        publisher: None,
     });
     for name in &names {
         session
@@ -1355,6 +1358,7 @@ impl CountingFixture {
             recovery_delay: CompactDuration::new(30),
             armed: Arc::default(),
             termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+            publisher: None,
         });
         let id = CollectionId::new(
             state_key.clone(),
@@ -1503,7 +1507,7 @@ fn replay_dirty(ops: &[StageOp]) -> (HashMap<CellKey, DirtyVal>, HashSet<Section
 
 /// Applies `ops` to `session` in order — the same sequence [`replay_dirty`]
 /// models. Generic over the session so both fixtures drive it.
-async fn apply_stage_ops<S: CellSession>(
+async fn apply_stage_ops<S: CellWrite>(
     session: &S,
     name: &StateName,
     ops: &[StageOp],

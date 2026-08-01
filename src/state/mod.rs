@@ -90,6 +90,7 @@ pub mod descriptor;
 pub mod descriptor_identity;
 pub(crate) mod dirty;
 pub mod event_ref;
+pub(crate) mod first_write;
 pub(crate) mod fjall;
 pub mod identity;
 pub mod manager;
@@ -99,6 +100,7 @@ pub mod oracle;
 pub mod order_codec;
 pub(crate) mod overlay;
 pub(crate) mod production;
+pub mod publication;
 pub mod registry;
 pub mod resolve;
 pub mod session;
@@ -117,7 +119,7 @@ pub use order_codec::{
     I64KeyCodec, KeyCodecError, OrderedKeyCodec, U64KeyCodec, UnitKey, Utf8KeyCodec,
     order_preserving_i64, order_preserving_i64_decode,
 };
-pub use registry::CommitMode;
+pub use registry::{CommitMode, ReadCachePolicy, StateVisibility};
 
 // The backend cluster is crate-internal (module-capped in [`backend`]); these
 // re-exports keep every in-crate `crate::state::X` import resolving without

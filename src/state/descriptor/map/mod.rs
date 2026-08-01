@@ -81,7 +81,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::CellKey;
 use crate::state::cell_key::{Coordinate, Direction, ScanEdge, Section};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
-use crate::state::session::{CellSession, MutatePermit, OpPermit};
+use crate::state::session::{CellRead, CellWrite};
 use crate::state::{CollectionKindId, StoreOutcome};
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -342,11 +342,11 @@ where
     V: CellType<Key = UnitKey>,
 {
     type Cell = Keyed<KC, V>;
-    type Handle<S: CellSession> = MapHandle<S, KC, V>;
+    type Handle<S: CellRead> = MapHandle<S, KC, V>;
 
     const KIND: CollectionKindId = CollectionKindId::Map;
 
-    fn handle<S: CellSession>(scope: CellScope<S>) -> MapHandle<S, KC, V> {
+    fn handle<S: CellRead>(scope: CellScope<S>) -> MapHandle<S, KC, V> {
         MapHandle {
             entries: scope.typed(ENTRY_SECTION),
             keyset: scope.typed(META_SECTION),
@@ -372,7 +372,7 @@ pub struct MapHandle<S, KC, V> {
 // needs it.
 impl<S, KC, V> MapHandle<S, KC, V>
 where
-    S: CellSession,
+    S: CellRead,
     KC: OrderedKeyCodec + 'static,
     KC::Key: Display,
     V: CellType<Key = UnitKey>,
@@ -646,6 +646,40 @@ where
         Ok(StreamPlan::Tracked(keys))
     }
 
+    /// Reads the keyset cell, folding a malformed frame into
+    /// [`PriorKeyset::Malformed`] (with a warning) so the caller degrades
+    /// rather than errors. An access error propagates; a key-decode error
+    /// cannot arise (the cell is read at its one fixed coordinate). This takes
+    /// a read permit (`&S::Permit`), so it belongs on the [`CellRead`] block.
+    /// Mutators reach it by deref-coercing their own permit; see [`Self::set`].
+    async fn read_keyset_state(
+        &self,
+        permit: &S::Permit<'_>,
+    ) -> Result<PriorKeyset, MapStateError<CellCodecError<V>>> {
+        match self.keyset.get(permit, &()).await {
+            Ok(None) => Ok(PriorKeyset::Absent),
+            Ok(Some(keyset)) => Ok(PriorKeyset::Decoded(keyset)),
+            Err(CellStateError::Codec(_)) => {
+                warn!(
+                    collection = self.entries.name().as_str(),
+                    "map keyset frame did not decode; degrading to the full-section scan until \
+                     the next set heals it"
+                );
+                Ok(PriorKeyset::Malformed)
+            }
+            Err(err) => Err(keyset_err(err)),
+        }
+    }
+}
+
+impl<S, KC, V> MapHandle<S, KC, V>
+where
+    S: CellWrite,
+    KC: OrderedKeyCodec + 'static,
+    KC::Key: Display,
+    V: CellType<Key = UnitKey>,
+    for<'s> ContextOf<'s, V>: FromSession<'s, S>,
+{
     /// Inserts or overwrites `key`'s value (a blind last-writer-wins write —
     /// the entry is never read first) and folds `key` into the keyset (see the
     /// module's current-membership invariant).
@@ -672,8 +706,8 @@ where
             .map_err(CellStateError::Access)?;
         // Read the keyset *before* the entry write: own writes are visible to
         // own reads, and the transition depends on the pre-set frame. `&permit`
-        // (a `&MutatePermit`) deref-coerces to the `&OpPermit` the read helper
-        // demands.
+        // (a `&S::MutatePermit`) deref-coerces to the `&S::Permit` the read
+        // helper demands.
         let coordinate = KC::encode(&key);
         let prior = self.read_keyset_state(&permit).await?;
         self.entries.set(&permit, &key, value).await?;
@@ -736,7 +770,7 @@ where
     }
 
     /// Durably commits this map's buffered ops mid-handler — entries and keyset
-    /// together. At-least-once; see [`CellSession::commit`] for the contract,
+    /// together. At-least-once; see [`CellWrite::commit`] for the contract,
     /// including the over-budget batch split.
     ///
     /// # Errors
@@ -760,7 +794,7 @@ where
     /// Discards this map's buffered uncommitted ops — entries and keyset
     /// together — reverting reads to the last [`commit`](Self::commit), or the
     /// pre-event committed state if none. Infallible; see
-    /// [`CellSession::rollback`] for the contract.
+    /// [`CellWrite::rollback`] for the contract.
     #[instrument(
         name = "map.rollback",
         skip_all,
@@ -768,29 +802,6 @@ where
     )]
     pub async fn rollback(&self) -> StoreOutcome {
         self.entries.rollback().await
-    }
-
-    /// Reads the keyset cell, folding a malformed frame into
-    /// [`PriorKeyset::Malformed`] (with a warning) so the caller degrades
-    /// rather than errors. An access error propagates; a key-decode error
-    /// cannot arise (the cell is read at its one fixed coordinate).
-    async fn read_keyset_state(
-        &self,
-        permit: &OpPermit<'_>,
-    ) -> Result<PriorKeyset, MapStateError<CellCodecError<V>>> {
-        match self.keyset.get(permit, &()).await {
-            Ok(None) => Ok(PriorKeyset::Absent),
-            Ok(Some(keyset)) => Ok(PriorKeyset::Decoded(keyset)),
-            Err(CellStateError::Codec(_)) => {
-                warn!(
-                    collection = self.entries.name().as_str(),
-                    "map keyset frame did not decode; degrading to the full-section scan until \
-                     the next set heals it"
-                );
-                Ok(PriorKeyset::Malformed)
-            }
-            Err(err) => Err(keyset_err(err)),
-        }
     }
 
     /// Folds `coordinate` into the keyset given the pre-read prior state (the
@@ -804,7 +815,7 @@ where
     /// cell, refreshing its TTL (the module's TTL-refresh invariant).
     async fn update_keyset(
         &self,
-        permit: &MutatePermit<'_>,
+        permit: &S::MutatePermit<'_>,
         coordinate: Coordinate,
         prior: PriorKeyset,
     ) -> Result<(), MapStateError<CellCodecError<V>>> {
@@ -850,7 +861,7 @@ where
     /// to `Overflowed`, exactly as `set` does.
     async fn subtract_keyset(
         &self,
-        permit: &MutatePermit<'_>,
+        permit: &S::MutatePermit<'_>,
         coordinate: &Coordinate,
         prior: PriorKeyset,
     ) -> Result<(), MapStateError<CellCodecError<V>>> {
@@ -874,7 +885,7 @@ where
     /// check.
     async fn update_tracked(
         &self,
-        permit: &MutatePermit<'_>,
+        permit: &S::MutatePermit<'_>,
         coordinate: Coordinate,
         keys: Vec<Coordinate>,
         limit: usize,
@@ -918,7 +929,7 @@ where
     /// Buffers a keyset-cell write, re-homing its error under the map's type.
     async fn write_keyset(
         &self,
-        permit: &MutatePermit<'_>,
+        permit: &S::MutatePermit<'_>,
         keyset: Keyset,
     ) -> Result<(), MapStateError<CellCodecError<V>>> {
         self.keyset

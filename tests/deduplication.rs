@@ -5,7 +5,8 @@
 
 #![recursion_limit = "256"]
 
-use crate::common::{FallibleTestHandler, collect_messages_with_timeout};
+use crate::common::handler::FallibleTestHandler;
+use crate::common::receive::collect_messages_with_timeout;
 use color_eyre::eyre::{Result, ensure};
 use prosody::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
 use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
@@ -14,7 +15,7 @@ use prosody::consumer::middleware::retry::RetryConfigurationBuilder;
 use prosody::consumer::middleware::scheduler::SchedulerConfigurationBuilder;
 use prosody::consumer::middleware::timeout::TimeoutConfigurationBuilder;
 use prosody::consumer::{
-    CommonConfiguration, ConsumerConfiguration, KeyedStateConfiguration,
+    CommonConfiguration, ConsumerConfiguration, ConsumerSetup, KeyedStateConfiguration,
     PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
@@ -86,14 +87,16 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         scheduler: SchedulerConfigurationBuilder::default().build()?,
         timeout: TimeoutConfigurationBuilder::default().build()?,
         dedup: DeduplicationConfigurationBuilder::default().build()?,
-        keyed_state: KeyedStateConfiguration::default(),
+        keyed_state: KeyedStateConfiguration::builder().build()?,
     };
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
-        &consumer_config,
-        &common::create_cassandra_trigger_store_config(),
+        ConsumerSetup {
+            consumer: &consumer_config,
+            trigger_store: &common::create_cassandra_trigger_store_config(),
+            common: &common_config,
+        },
         pipeline_config,
-        &common_config,
         telemetry,
         handler,
     )
@@ -108,21 +111,25 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
     producer.send([], topic, key, payload.clone()).await?;
     producer.send([], topic, key, payload_duplicate).await?;
 
-    // Only the first message should be processed
-    let received = collect_messages_with_timeout(&mut messages_rx, 1_usize, 30_u64).await?;
-
+    // Always shut the consumer down and delete the topic before propagating a
+    // failure. An early return would leave the consumer's client threads alive
+    // and hang the test binary, and it would leak the UUID-named topic in the
+    // shared cluster.
+    let outcome = async {
+        // Only the first message should be processed.
+        let received = collect_messages_with_timeout(&mut messages_rx, 1_usize, 30_u64).await?;
+        ensure!(
+            received.len() == 1,
+            "Expected one message due to deduplication, got {}",
+            received.len()
+        );
+        let (recv_key, recv_payload) = &received[0];
+        ensure!(recv_key == key);
+        ensure!(recv_payload == &payload);
+        Ok(())
+    }
+    .await;
     consumer.shutdown().await;
-
-    ensure!(
-        received.len() == 1,
-        "Expected one message due to deduplication, got {}",
-        received.len()
-    );
-
-    let (recv_key, recv_payload) = &received[0];
-    ensure!(recv_key == key);
-    ensure!(recv_payload == &payload);
-
     admin_client.delete_topic(&topic).await?;
-    Ok(())
+    outcome
 }
