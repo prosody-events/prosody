@@ -181,6 +181,12 @@ pub struct LoaderConfiguration {
     /// A reloaded record is decoded here rather than on the poll path, so a
     /// deferred request keeps its destination only while this matches what the
     /// poll loop was given.
+    ///
+    /// It stays a separate argument rather than being read from a keyed-state
+    /// configuration: a loader serves consumers that publish no state at all.
+    /// Every caller inside this crate passes the one configured subsystem name,
+    /// and a caller that passes another loses a deferred request's destination
+    /// and nothing besides.
     pub responder: Option<SubsystemName>,
 }
 

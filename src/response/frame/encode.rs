@@ -7,7 +7,8 @@ use super::{
 };
 use crate::codec::Codec;
 use crate::error::ErrorCategory;
-use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION, SUBSYSTEM_MAX_BYTES};
+use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION};
+use crate::subsystem::SubsystemName;
 use bytes::BufMut;
 use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len};
 use std::error::Error;
@@ -84,10 +85,10 @@ impl<C: Codec> FrameEncoder<C> {
                 "a codec used for responses must have a FORMAT_ID a frame can carry"
             );
         }
-        if header.subsystem.is_empty() || header.subsystem.len() > SUBSYSTEM_MAX_BYTES {
+        if header.subsystem.is_empty() || header.subsystem.len() > SubsystemName::MAX_BYTES {
             return Err(EncodeError::UnusableSubsystem {
                 bytes: header.subsystem.len(),
-                limit: SUBSYSTEM_MAX_BYTES,
+                limit: SubsystemName::MAX_BYTES,
             });
         }
 

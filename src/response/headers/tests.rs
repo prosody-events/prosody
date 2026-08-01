@@ -2,7 +2,7 @@ use super::{
     HeaderRejection, ID_TEXT_LEN, MAX_AWAITED, RESPONSE_AWAITED_HEADER, RESPONSE_NODE_HEADER,
     RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestTag, parse_request_tag,
 };
-use crate::response::{RequestId, SUBSYSTEM_MAX_BYTES};
+use crate::response::RequestId;
 use crate::router::NodeId;
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
@@ -38,11 +38,11 @@ const OVERLONG_NAME: &str = concat!(
     "a"
 );
 const _: () = assert!(
-    LONG_NAME.len() == SUBSYSTEM_MAX_BYTES,
+    LONG_NAME.len() == SubsystemName::MAX_BYTES,
     "LONG_NAME must sit exactly on the bound"
 );
 const _: () = assert!(
-    OVERLONG_NAME.len() == SUBSYSTEM_MAX_BYTES + 1,
+    OVERLONG_NAME.len() == SubsystemName::MAX_BYTES + 1,
     "OVERLONG_NAME must sit one byte past the bound"
 );
 
@@ -77,6 +77,10 @@ enum Mutation {
     /// A revision this responder does not read the other headers under.
     UnsupportedRevision,
     UnparseableRevision,
+    /// The supported revision written as `01`.
+    RevisionLeadingZero,
+    /// The supported revision written as `+1`.
+    RevisionSigned,
     RevisionValueAbsent,
     /// The 32-character unhyphenated UUID form.
     IdSimpleForm,
@@ -202,6 +206,12 @@ impl Case {
             Mutation::UnparseableRevision => {
                 set_value(&mut headers, RESPONSE_VERSION_HEADER, Some(b"one".to_vec()));
             }
+            Mutation::RevisionLeadingZero => {
+                set_value(&mut headers, RESPONSE_VERSION_HEADER, Some(b"01".to_vec()));
+            }
+            Mutation::RevisionSigned => {
+                set_value(&mut headers, RESPONSE_VERSION_HEADER, Some(b"+1".to_vec()));
+            }
             Mutation::RevisionValueAbsent => {
                 set_value(&mut headers, RESPONSE_VERSION_HEADER, None);
             }
@@ -281,6 +291,8 @@ fn expected(mutation: Mutation) -> Result<Option<RequestTag>, HeaderRejection> {
         | Mutation::OnlyVersion => Err(HeaderRejection::MissingSingleton),
         Mutation::UnsupportedRevision
         | Mutation::UnparseableRevision
+        | Mutation::RevisionLeadingZero
+        | Mutation::RevisionSigned
         | Mutation::RevisionValueAbsent => Err(HeaderRejection::UnsupportedVersion),
         Mutation::IdSimpleForm
         | Mutation::IdTruncated

@@ -1,6 +1,7 @@
 //! Synchrony recovery's own half: what a response is, how it is framed, and
 //! how one delivery attempt is answered.
 
+use crate::subsystem::SubsystemName;
 use fixedstr::Flexstr;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use tonic::Code;
@@ -12,15 +13,15 @@ pub(crate) mod headers;
 /// Version of the response frame both ends of a peer link must agree on.
 pub(crate) const RESPONSE_PROTOCOL_VERSION: u32 = 1;
 
-/// Longest subsystem name a frame may carry. The bound keeps a decoded name off
-/// the heap and keeps a peer-supplied string out of metric labels.
-pub(crate) const SUBSYSTEM_MAX_BYTES: usize = 64;
-
 /// Longest [`Codec::FORMAT_ID`](crate::Codec::FORMAT_ID) a frame may carry.
 pub(crate) const FORMAT_MAX_BYTES: usize = 128;
 
-/// The subsystem a response answers for, bounded by [`SUBSYSTEM_MAX_BYTES`].
-pub(crate) type Subsystem = Flexstr<{ SUBSYSTEM_MAX_BYTES + 1 }>;
+/// The subsystem a response answers for.
+///
+/// A frame carries exactly what [`SubsystemName`] accepts, so the width is that
+/// type's own bound: a name is either usable on the wire or is refused where it
+/// is made. The extra byte is the capacity a name of the bound needs.
+pub(crate) type Subsystem = Flexstr<{ SubsystemName::MAX_BYTES + 1 }>;
 
 /// The format token a frame's payload was encoded with, bounded by
 /// [`FORMAT_MAX_BYTES`].

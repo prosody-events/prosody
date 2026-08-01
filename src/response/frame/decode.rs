@@ -7,10 +7,9 @@ use super::{
     ResponseFrame,
 };
 use crate::error::{ErrorCategory, UnknownErrorCategory};
-use crate::response::{
-    FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION, RequestId, SUBSYSTEM_MAX_BYTES,
-};
+use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION, RequestId};
 use crate::router::NodeId;
+use crate::subsystem::SubsystemName;
 use bytes::{Buf, BufMut, BytesMut};
 use fixedstr::Flexstr;
 use prost::DecodeError;
@@ -103,7 +102,7 @@ pub(crate) fn decode_frame<B: Buf>(
             }
             FIELD_SUBSYSTEM => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
-                subsystem = decode_text::<B, { SUBSYSTEM_MAX_BYTES + 1 }>(src, "subsystem")?;
+                subsystem = decode_text::<B, { SubsystemName::MAX_BYTES + 1 }>(src, "subsystem")?;
             }
             FIELD_FORMAT => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;

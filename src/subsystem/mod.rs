@@ -17,18 +17,32 @@ use thiserror::Error;
 pub struct SubsystemName(Arc<str>);
 
 impl SubsystemName {
-    /// Creates a non-empty subsystem name.
+    /// Longest name this crate accepts, in bytes, measured after the trim.
+    ///
+    /// The bound belongs to the name rather than to any one reader of it,
+    /// because a name that exceeds it is unusable everywhere it travels: a peer
+    /// response frame carries the answering subsystem in a field of this width,
+    /// and a name also becomes a metric label and a Cassandra value. A consumer
+    /// configured with a longer name could never be addressed, so the name is
+    /// refused where it is made instead.
+    pub const MAX_BYTES: usize = 64;
+
+    /// Creates a subsystem name, trimmed of surrounding whitespace.
     ///
     /// # Errors
     ///
-    /// Returns [`SubsystemNameError`] when the trimmed name is empty.
+    /// Returns [`SubsystemNameError`] when the trimmed name is empty or is
+    /// longer than [`MAX_BYTES`](Self::MAX_BYTES).
     pub fn try_new<N>(name: N) -> Result<Self, SubsystemNameError>
     where
         N: AsRef<str>,
     {
         let name = name.as_ref().trim();
         if name.is_empty() {
-            return Err(SubsystemNameError);
+            return Err(SubsystemNameError::Blank);
+        }
+        if name.len() > Self::MAX_BYTES {
+            return Err(SubsystemNameError::TooLong { bytes: name.len() });
         }
 
         Ok(Self(Arc::from(name)))
@@ -75,10 +89,22 @@ impl Borrow<str> for SubsystemName {
     }
 }
 
-/// Error returned for an empty subsystem name.
+/// Why a subsystem name was refused.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("subsystem name must not be empty")]
-pub struct SubsystemNameError;
+pub enum SubsystemNameError {
+    /// The name is empty, or is whitespace alone.
+    #[error("subsystem name must not be empty")]
+    Blank,
+    /// The name is longer than [`SubsystemName::MAX_BYTES`].
+    #[error(
+        "subsystem name is {bytes} bytes; the limit is {}",
+        SubsystemName::MAX_BYTES
+    )]
+    TooLong {
+        /// Length of the trimmed name.
+        bytes: usize,
+    },
+}
 
 impl ClassifyError for SubsystemNameError {
     fn classify_error(&self) -> ErrorCategory {

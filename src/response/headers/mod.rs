@@ -11,9 +11,10 @@
 //!
 //! A record whose reserved headers are unusable yields no tag and one counted
 //! rejection. It is never a failed event: asking for a response badly is not a
-//! reason to stop processing the message.
+//! reason to stop processing the message. The count is per decode, not per
+//! record — a poll, a deferred reload and a state read each decode the same
+//! record — so read the counter as a rate, never as a population.
 
-use super::SUBSYSTEM_MAX_BYTES;
 use crate::response::RequestId;
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
@@ -28,31 +29,24 @@ use uuid::Uuid;
 #[cfg(test)]
 mod tests;
 
+// The four header names this protocol reserves. `parse_request_tag` matches a
+// record header against these and skips every other name, so this is the one
+// place they are written and none can be forgotten.
 pub(crate) const RESPONSE_VERSION_HEADER: &str = "response-version";
 pub(crate) const RESPONSE_REQUEST_ID_HEADER: &str = "response-request-id";
 pub(crate) const RESPONSE_NODE_HEADER: &str = "response-node";
 pub(crate) const RESPONSE_AWAITED_HEADER: &str = "response-awaited";
 
-/// Every header name this protocol reserves.
-///
-/// [`parse_request_tag`] tests each record header against this list before it
-/// looks at any single name, so a name missing from here is not read at all —
-/// which is why no other list of these names may exist.
-pub(crate) const RESERVED_HEADERS: [&str; 4] = [
-    RESPONSE_VERSION_HEADER,
-    RESPONSE_REQUEST_ID_HEADER,
-    RESPONSE_NODE_HEADER,
-    RESPONSE_AWAITED_HEADER,
-];
-
-/// The request-metadata revision this responder understands.
+/// The one request-metadata revision this responder understands, in the exact
+/// text a producer must write.
 ///
 /// Distinct from
 /// [`RESPONSE_PROTOCOL_VERSION`](super::RESPONSE_PROTOCOL_VERSION),
 /// which versions the response frame between two peers. This one freezes what
 /// the headers *mean*, so a later revision that redefines a header cannot be
-/// read under the old rules and answered confidently.
-const REQUEST_REVISION: u8 = 1;
+/// read under the old rules and answered confidently. One revision has one text
+/// form, as one id has one text form: `01` and `+1` are refused.
+const REQUEST_REVISION: &str = "1";
 
 /// The only accepted length of an id header value: the 36-character hyphenated
 /// UUID. Fixing the length rejects the simple, braced and URN forms, so one id
@@ -66,12 +60,12 @@ const ID_TEXT_LEN: usize = 36;
 /// bounded whatever a topic writer composes.
 pub(crate) const MAX_AWAITED: usize = 32;
 
-/// Records whose reserved headers were unusable, by fixed reason label.
+/// Decodes refused by their reserved headers, by fixed reason label.
 static REJECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter("prosody")
         .u64_counter("prosody.response.request_headers_rejected")
-        .with_description("Records whose reserved response headers were unusable")
-        .with_unit("{record}")
+        .with_description("Message decodes whose reserved response headers were unusable")
+        .with_unit("{decode}")
         .build()
 });
 
@@ -124,7 +118,6 @@ pub(crate) fn parse_request_tag<'h, H>(
 where
     H: IntoIterator<Item = (&'h str, Option<&'h [u8]>)>,
 {
-    let mut saw_reserved = false;
     let mut version_seen = false;
     let mut id = None;
     let mut node = None;
@@ -132,42 +125,44 @@ where
     let mut addressed = false;
 
     for (key, value) in headers {
-        if !RESERVED_HEADERS.contains(&key) {
-            continue;
-        }
-        saw_reserved = true;
-
-        if key == RESPONSE_AWAITED_HEADER {
-            awaited += 1;
-            if awaited > MAX_AWAITED {
-                return Err(HeaderRejection::TooManyAwaited);
+        match key {
+            RESPONSE_AWAITED_HEADER => {
+                awaited += 1;
+                if awaited > MAX_AWAITED {
+                    return Err(HeaderRejection::TooManyAwaited);
+                }
+                // Every name is validated even after a match is found: stopping
+                // early would make a later name's validity depend on where the
+                // producer put the match.
+                let name = awaited_name(value)?;
+                addressed |= name == responder.as_str();
             }
-            // Every name is validated even after a match is found: stopping
-            // early would make a later name's validity depend on where the
-            // producer put the match.
-            let name = awaited_name(value)?;
-            addressed |= name == responder.as_str();
-        } else if key == RESPONSE_VERSION_HEADER {
-            if version_seen {
-                return Err(HeaderRejection::DuplicateSingleton);
+            RESPONSE_VERSION_HEADER => {
+                if version_seen {
+                    return Err(HeaderRejection::DuplicateSingleton);
+                }
+                version_seen = true;
+                check_revision(value)?;
             }
-            version_seen = true;
-            check_revision(value)?;
-        } else if key == RESPONSE_REQUEST_ID_HEADER {
-            if id.is_some() {
-                return Err(HeaderRejection::DuplicateSingleton);
+            RESPONSE_REQUEST_ID_HEADER => {
+                if id.is_some() {
+                    return Err(HeaderRejection::DuplicateSingleton);
+                }
+                id = Some(RequestId::from_bytes(parse_id(value)?));
             }
-            id = Some(RequestId::from_bytes(parse_id(value)?));
-        } else {
-            // `response-node`: the only reserved name left.
-            if node.is_some() {
-                return Err(HeaderRejection::DuplicateSingleton);
+            RESPONSE_NODE_HEADER => {
+                if node.is_some() {
+                    return Err(HeaderRejection::DuplicateSingleton);
+                }
+                node = Some(NodeId::from_bytes(parse_id(value)?));
             }
-            node = Some(NodeId::from_bytes(parse_id(value)?));
+            // Every other header belongs to the producer, not to this protocol.
+            _ => {}
         }
     }
 
-    if !saw_reserved {
+    // No reserved header at all, so this record asks for nothing.
+    if !version_seen && id.is_none() && node.is_none() && awaited == 0 {
         return Ok(None);
     }
     let (Some(id), Some(node)) = (id, node) else {
@@ -182,16 +177,17 @@ where
 
 /// Reads one awaited subsystem name.
 ///
-/// Trimmed like [`SubsystemName::try_new`], so a producer writing a padded name
-/// addresses the same subsystem, and bounded by [`SUBSYSTEM_MAX_BYTES`] — the
-/// width a response frame can carry the answering subsystem back in.
+/// Held to exactly what [`SubsystemName::try_new`] accepts: trimmed, non-blank,
+/// and no longer than [`SubsystemName::MAX_BYTES`]. A producer writing a padded
+/// name therefore addresses the same subsystem, and a name no responder could
+/// ever hold is refused rather than compared.
 fn awaited_name(value: Option<&[u8]>) -> Result<&str, HeaderRejection> {
     let bytes = value.ok_or(HeaderRejection::MalformedAwaited)?;
     let name = str::from_utf8(bytes)
         .map_err(|_| HeaderRejection::MalformedAwaited)?
         .trim();
 
-    if name.is_empty() || name.len() > SUBSYSTEM_MAX_BYTES {
+    if name.is_empty() || name.len() > SubsystemName::MAX_BYTES {
         return Err(HeaderRejection::MalformedAwaited);
     }
     Ok(name)
@@ -213,13 +209,10 @@ fn parse_id(value: Option<&[u8]>) -> Result<[u8; 16], HeaderRejection> {
 /// discards it: keeping it would only let a later reader re-decide a question
 /// settled here.
 fn check_revision(value: Option<&[u8]>) -> Result<(), HeaderRejection> {
-    let bytes = value.ok_or(HeaderRejection::UnsupportedVersion)?;
-    let text = str::from_utf8(bytes).map_err(|_| HeaderRejection::UnsupportedVersion)?;
-
-    match text.parse::<u8>() {
-        Ok(REQUEST_REVISION) => Ok(()),
-        _ => Err(HeaderRejection::UnsupportedVersion),
+    if value == Some(REQUEST_REVISION.as_bytes()) {
+        return Ok(());
     }
+    Err(HeaderRejection::UnsupportedVersion)
 }
 
 /// Why a record's reserved headers yield no tag.
@@ -244,7 +237,7 @@ pub(crate) enum HeaderRejection {
 }
 
 impl HeaderRejection {
-    /// Counts one rejected record under this rejection's fixed label.
+    /// Counts one refused decode under this rejection's fixed label.
     pub(crate) fn record(self) {
         REJECTED.add(1, &[KeyValue::new("reason", self.reason())]);
     }
