@@ -17,17 +17,23 @@ use super::support::{FaultPoint, GROUP_A, GROUP_B, ScriptedEnv, collect_stream, 
 use crate::Key;
 use crate::codec::JsonCodec;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::ReadCachePolicy;
 use crate::state::cell_key::Direction;
-use crate::state::descriptor::{DequeDescriptor, deque_state, map_state};
+use crate::state::descriptor::{
+    DequeDescriptor, StateDescriptor, deque_state, map_state, value_state,
+};
 use crate::state::order_codec::I64KeyCodec;
 use crate::state_reader::backend::ScriptedReaderBackend;
 use crate::state_reader::{StateReader, StateReaderError};
+use crate::test_util::TEST_RUNTIME;
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::StreamExt;
 use futures::executor::block_on;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::Value;
 use std::iter::{empty, once};
+use std::time::Duration;
+use tokio::time::timeout;
 
 /// A deque length above the point-get ceiling, forcing the range-scan stream
 /// arm to be exercised.
@@ -420,4 +426,52 @@ async fn scan_reads_only_pinned_source() -> Result<()> {
         "source B (decoy) was never opened"
     );
     Ok(())
+}
+
+/// Two reads on one reader overlap: they drive cell I/O concurrently, sharing
+/// no admission.
+///
+/// The source holds every committed point read at a two-party meeting point,
+/// so both reads must arrive before either returns. Serializing them would
+/// park the first there forever; the deadline is only the hang guard, and the
+/// rendezvous is the assertion. The read cache is disabled so its same-key
+/// single-flight cannot collapse the two reads into one.
+#[test]
+fn concurrent_reads_on_one_reader_overlap() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let mut env = ScriptedEnv::new(
+            value_state::<JsonCodec>("probe-concurrent").read_cache(ReadCachePolicy::Disabled),
+        )?;
+        env.cells.rendezvous(2);
+        let key = Key::from("user-1");
+        let tp = topic(GROUP_A);
+        env.commit(GROUP_A, tp, &key, 1, |handle| async move {
+            handle
+                .set(Value::from(7_i64))
+                .await
+                .map_err(|e| eyre!("set: {e}"))?;
+            Ok(())
+        })
+        .await?;
+        env.publish(GROUP_A, tp).await;
+        let reader = env.reader_eager()?;
+
+        let both = timeout(Duration::from_secs(30), async {
+            tokio::join!(reader.get(key.clone()), reader.get(key.clone()))
+        })
+        .await
+        .map_err(|_| eyre!("the two reads never met: they did not overlap"))?;
+
+        assert_eq!(
+            both.0.map_err(|e| eyre!("first read: {e}"))?,
+            Some(Value::from(7_i64)),
+            "the first concurrent read"
+        );
+        assert_eq!(
+            both.1.map_err(|e| eyre!("second read: {e}"))?,
+            Some(Value::from(7_i64)),
+            "the second concurrent read"
+        );
+        Ok(())
+    })
 }

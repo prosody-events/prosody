@@ -142,12 +142,17 @@ impl DirtyStore {
         Self::default()
     }
 
-    /// Buffers a set of one cell's bytes (last-writer-wins).
+    /// Buffers a set of one cell's bytes (last-writer-wins), taking the one
+    /// owned copy a staged cell requires.
     pub fn set(&self, collection: &CollectionId, cell: &CellKey, bytes: &[u8]) {
-        self.entries.upsert_sync(
-            dirty_key(collection, cell),
-            DirtyVal::Set(Bytes::copy_from_slice(bytes)),
-        );
+        self.set_owned(collection, cell, Bytes::copy_from_slice(bytes));
+    }
+
+    /// [`Self::set`] over an already-owned payload: a caller that encoded into
+    /// its own `Bytes` moves it in rather than paying a second copy.
+    pub fn set_owned(&self, collection: &CollectionId, cell: &CellKey, bytes: Bytes) {
+        self.entries
+            .upsert_sync(dirty_key(collection, cell), DirtyVal::Set(bytes));
     }
 
     /// Buffers a clear of one cell (last-writer-wins).

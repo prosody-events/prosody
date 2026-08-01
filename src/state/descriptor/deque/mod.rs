@@ -76,6 +76,8 @@ use crate::error::{ClassifyError, ErrorCategory};
 #[cfg(test)]
 use crate::state::cell_key::{CellKey, Coordinate};
 use crate::state::cell_key::{Direction, ScanEdge, Section};
+use crate::state::collection::sealed_spec::SealedSpec;
+use crate::state::collection::{Collection, StateSession};
 use crate::state::order_codec::{I64KeyCodec, UnitKey};
 use crate::state::session::{CellRead, CellWrite};
 use crate::state::{CollectionKindId, StoreOutcome};
@@ -164,17 +166,25 @@ pub struct DequeKind<T>(PhantomData<fn() -> T>);
 
 impl<T: CellType<Key = UnitKey>> CollectionSpec for DequeKind<T> {
     type Cell = Keyed<I64KeyCodec, T>;
-    type Handle<S: CellRead> = DequeHandle<S, T>;
+    type Handle<S: StateSession> = DequeHandle<S, T>;
 
     const KIND: CollectionKindId = CollectionKindId::Deque;
 
-    fn handle<S: CellRead>(scope: CellScope<S>) -> DequeHandle<S, T> {
+    fn handle<S: StateSession>(collection: Collection<S, Self>) -> DequeHandle<S, T> {
+        let (session, state_type, name) = collection.parts();
+        let scope = CellScope::new(session.clone(), state_type, name.clone());
         DequeHandle {
             entries: scope.typed(ENTRY_SECTION),
             meta: scope.typed(META_SECTION),
         }
     }
 }
+
+/// Bridge: Deque's layout is still two hand-numbered section constants rather
+/// than a `collection_layout!` declaration, so its seal is hand-written. It is
+/// replaced by the generated marker when the kind migrates to the scoped
+/// operation.
+impl<T> SealedSpec for DequeKind<T> {}
 
 /// Typed, owned handle over a codec-backed deque — a thin composition over two
 /// typed `CellView`s: `entries` (the per-index data cells, addressed by the

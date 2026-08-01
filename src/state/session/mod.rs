@@ -20,10 +20,11 @@
 //!
 //! - [`CellRead`] — the complete non-mutating surface. Handlers reach it
 //!   through collection handles: `get`/`get_many`/`scan` plus
-//!   `loader`/`is_terminated`/`verify_state_registration` and the
-//!   collection-metadata queries. Every read method is written **once** here,
-//!   so the owner session and a future read-only session share one
-//!   implementation. Sealed by `sealed::ReadAdmission`.
+//!   `is_terminated`/`verify_state_registration` and the collection-metadata
+//!   queries. The resolver capability slot lives one layer up, on
+//!   [`StateSession`], which every session type implements. Every read method
+//!   is written **once** here, so the owner session and a future read-only
+//!   session share one implementation. Sealed by `sealed::ReadAdmission`.
 //! - [`CellWrite`] — the mutating remainder: the buffering mutators
 //!   `set`/`clear`/`clear_section` and the mid-handler transactional pair
 //!   `commit`/`rollback`. It extends [`CellRead`], `StateLifecycle`, and
@@ -69,6 +70,7 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Committed, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Scan, Section};
+use crate::state::collection::{StateSession, WritableStateSession};
 use crate::state::descriptor::{
     DescriptorIdentity, Registered, SealedDescriptor, StateDescriptor, StructuralIdentity,
 };
@@ -97,7 +99,7 @@ use std::fmt;
 use std::future::Future;
 use std::iter::from_fn;
 use std::num::NonZeroUsize;
-use std::ops::Deref;
+use std::ops::DerefMut;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -120,16 +122,7 @@ mod tests;
 /// subtrait, so a read-only handle cannot express a mutation. Sealed by the
 /// crate-internal `sealed::ReadAdmission`: downstream crates can name
 /// `CellRead` in bounds but can neither implement it nor forge a session.
-pub trait CellRead: ReadAdmission {
-    /// Opaque per-session capability slot. The keyed-state machinery never
-    /// interprets it; a
-    /// [`CellResolver`](crate::state::descriptor::CellResolver)
-    /// living outside `src/state` reads it from the session at resolve time.
-    type Loader: Clone + Send + Sync + 'static;
-
-    /// Returns the session's capability slot for a resolver to read.
-    fn loader(&self) -> &Self::Loader;
-
+pub trait CellRead: ReadAdmission + StateSession {
     /// Returns `true` once the partition is shutting down or the event has been
     /// cancelled. Descriptor handles guard every operation on this.
     fn is_terminated(&self) -> bool;
@@ -230,14 +223,14 @@ pub trait CellRead: ReadAdmission {
 /// lifecycle and marker halves. Downstream crates can name `CellWrite` in
 /// bounds (e.g. [`EventContext::State`]) but can neither implement it nor
 /// reach either sealed surface.
-pub trait CellWrite: CellRead + StateLifecycle + MarkerIdentity {
+pub trait CellWrite: CellRead + StateLifecycle + MarkerIdentity + WritableStateSession {
     /// A held gate permit that additionally witnesses a session **mutation**,
     /// returned by [`Self::mutate_permit`] after the ordered admission.
     /// `Deref`s to the read `ReadAdmission::Permit`, so a mutator's one permit
     /// also witnesses the reads inside its body. A read under a mutate hold is
     /// legal; the converse is a type error. `Sync` because the permit is held
     /// across `.await`s inside a `Send` mutator future.
-    type MutatePermit<'s>: Send + Sync + Deref<Target = <Self as ReadAdmission>::Permit<'s>>
+    type MutatePermit<'s>: Send + Sync + DerefMut<Target = <Self as ReadAdmission>::Permit<'s>>
     where
         Self: 's;
 
@@ -408,13 +401,13 @@ pub trait CellWrite: CellRead + StateLifecycle + MarkerIdentity {
 /// discarding are framework-only moves.
 pub(crate) mod sealed {
     use super::{
-        CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Duration, Future,
-        MarkerWrite, ProvisionalWrite, RepinProof, SectionClear, StateAccessError, Uuid,
-        resolve_collections,
+        Bytes, CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Duration,
+        Future, MarkerWrite, ProvisionalWrite, RepinProof, SectionClear, StateAccessError,
+        StateName, StateType, Uuid, resolve_collections,
     };
     use opentelemetry::global::meter;
     use opentelemetry::metrics::Counter;
-    use std::ops::Deref;
+    use std::ops::{Deref, DerefMut};
     use std::sync::LazyLock;
     use tokio::sync::{Mutex as TokioMutex, MutexGuard};
     use tokio::time::timeout;
@@ -639,11 +632,20 @@ pub(crate) mod sealed {
         }
     }
 
+    // The guard lifetime is named explicitly on both impls: elision would bind
+    // the returned reference's `'_` to `&self`, and `&mut Target` is invariant,
+    // so the elided `DerefMut` signature does not match the trait's.
     impl<'a> Deref for MutatePermit<'a> {
         type Target = OpPermit<'a>;
 
         fn deref(&self) -> &OpPermit<'a> {
             &self.0
+        }
+    }
+
+    impl<'a> DerefMut for MutatePermit<'a> {
+        fn deref_mut(&mut self) -> &mut OpPermit<'a> {
+            &mut self.0
         }
     }
 
@@ -888,6 +890,22 @@ pub(crate) mod sealed {
             marker: MessageMarker,
             proof: MarkerWrite,
         ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
+
+        /// Bridge: stages one already-encoded mutation into this event's dirty
+        /// overlay — the synchronous, infallible sink a scoped collection
+        /// invocation replays its journal through. `Some(bytes)` stages a
+        /// write, `None` an absence.
+        ///
+        /// The buffering cell commands only *look* asynchronous: this is the
+        /// same overlay write without the future the replay cannot await, and
+        /// it dies with the old cell-command surface.
+        fn stage_cell(
+            &self,
+            state_type: StateType,
+            name: &StateName,
+            cell: &CellKey,
+            value: Option<Bytes>,
+        );
 
         /// Discards just this event's buffered dirty cells — the isolation step
         /// of the attempt-boundary [`Self::reset`] transition (which then bumps
@@ -1262,6 +1280,12 @@ where
         }
     }
 
+    /// The session's opaque capability slot — see
+    /// [`StateSession::Loader`](crate::state::collection::StateSession::Loader).
+    pub(in crate::state) fn message_loader(&self) -> &L {
+        &self.inner.loader
+    }
+
     /// The session's live attempt epoch. A one-line copy-out: the leaf
     /// `RwLock` read guard is dropped before returning, so it is never held
     /// across an `.await`.
@@ -1306,12 +1330,6 @@ where
     B: StateBackend,
     L: Clone + Send + Sync + 'static,
 {
-    type Loader = L;
-
-    fn loader(&self) -> &L {
-        &self.inner.loader
-    }
-
     fn is_terminated(&self) -> bool {
         self.inner.termination.is_terminated() || self.inner.terminated.load(Ordering::Relaxed)
     }
@@ -1635,6 +1653,21 @@ where
             .record_message(marker.into_uuid())
             .await
             .map_err(|e| StateAccessError::store(&e))
+    }
+
+    fn stage_cell(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        cell: &CellKey,
+        value: Option<Bytes>,
+    ) {
+        let id = self.id_for(state_type, name);
+        let dirty = self.inner.overlay.dirty();
+        match value {
+            Some(bytes) => dirty.set_owned(&id, cell, bytes),
+            None => dirty.clear(&id, cell),
+        }
     }
 
     fn discard_dirty(&self) {

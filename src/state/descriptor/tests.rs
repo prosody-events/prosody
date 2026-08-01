@@ -7,21 +7,22 @@
 //! including the state-unavailable stub on contexts without keyed state.
 
 use super::*;
-use crate::codec::{I64Codec, JsonCodecError};
+use crate::codec::{I64Codec, JsonCodec, JsonCodecError};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::kafka_state::{MessageCell, message_state};
 use crate::consumer::middleware::tests::test_support::MockEventContext;
 use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
-use crate::state::cell_key::{CellKey, Direction, ScanEdge};
+use crate::state::cell_key::{CellKey, Direction, ScanEdge, Section};
 use crate::state::dirty::DirtyStore;
 use crate::state::first_write::FirstWritePublisher;
 use crate::state::manager::ArmedKeys;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::{I64KeyCodec, Utf8KeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry, RegisterStateError};
-use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::session::{CellWrite, KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::store::CellStore;
 use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state::{
     CommitMode, EventRef, PartitionBackend, RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateKey,
@@ -196,6 +197,65 @@ fn session_parts<L>(
         publisher: None,
     };
     (parts, cell_store)
+}
+
+/// A registry holding exactly `descriptor`, for a fixture that binds one
+/// collection.
+pub(crate) fn value_registry<D: StateDescriptor>(descriptor: &D) -> Result<CollectionDefRegistry> {
+    let mut registry = CollectionDefRegistry::default();
+    registry.register(descriptor, CollectionDef::new(None))?;
+    Ok(registry)
+}
+
+/// Like [`test_session_parts`] but hands back the shared dirty overlay, so a
+/// test can read the raw cells an invocation staged — or did not.
+pub(crate) fn session_with_dirty(
+    loader: MemoryLoader<Value>,
+    registry: CollectionDefRegistry,
+    state_key: StateKey,
+) -> (TestSession, Arc<DirtyStore>) {
+    let (parts, _cells) = session_parts(loader, registry, state_key, Arc::default(), false);
+    let dirty = parts.dirty.clone();
+    (KeyedStateSession::new(parts), dirty)
+}
+
+/// A test session over an arbitrary cell store `C` — the twin of
+/// [`TestSession`], whose store is pinned to the plain memory one.
+pub(crate) type SessionOver<C> = KeyedStateSession<
+    PartitionBackend<
+        FixedOracle,
+        MemoryDescriptorIdentityStore,
+        C,
+        FirstWritePublisher<ScriptedPublicationStore, KafkaObserver>,
+    >,
+    MemoryLoader<Value>,
+>;
+
+/// A session over an arbitrary cell store — the fixture for I/O-budget tests,
+/// which put a counting store under the committed cache.
+pub(crate) fn session_over<C: CellStore>(
+    loader: MemoryLoader<Value>,
+    registry: CollectionDefRegistry,
+    state_key: StateKey,
+    cell: C,
+) -> SessionOver<C> {
+    let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
+    let (_cancel_tx, cancel_rx) = watch::channel(false);
+    KeyedStateSession::new(SessionParts {
+        cell,
+        dirty: Arc::new(DirtyStore::new()),
+        oracle: FixedOracle::committed(),
+        loader,
+        registry: Arc::new(registry),
+        state_key,
+        event: EventRef::Message {
+            dedup_id: Uuid::new_v4(),
+        },
+        recovery_delay: CompactDuration::new(30),
+        armed: Arc::default(),
+        termination: TerminationWatch::new(shutdown_rx, cancel_rx),
+        publisher: None,
+    })
 }
 
 fn cart() -> ValueDescriptor {

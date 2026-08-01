@@ -18,9 +18,10 @@ use crate::consumer::middleware::RepinProof;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::ClassifyError;
 use crate::loader::MessageLoader;
+use crate::state::collection::StateSession;
 use crate::state::descriptor::{Registered, StateDescriptor, deque_state, map_state, value_state};
 use crate::state::order_codec::Utf8KeyCodec;
-use crate::state::session::{CellRead, CellWrite};
+use crate::state::session::CellWrite;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::error::TimerManagerError;
 use crate::timers::store::TriggerStore;
@@ -174,9 +175,9 @@ pub trait EventContext: TerminationSignals + Clone + Send + Sync + 'static {
     /// (`type State = C::State`). State itself is Kafka-agnostic, so the
     /// payload tie lives here. The session's loader yields `Self::Payload`,
     /// which keeps Kafka-message handles fully typed inside generic handlers.
-    /// Neither [`CellRead`] nor [`CellWrite`] names a payload; the `Loader`
-    /// associated type that [`CellRead`] carries is fixed to the message
-    /// loader here.
+    /// [`CellWrite`] names no payload; the `Loader` associated type its
+    /// [`StateSession`] supertrait carries is fixed to the message loader
+    /// here.
     type State: CellWrite<Loader: MessageLoader<Payload = Self::Payload>>;
 
     /// Binds a registered keyed-state collection, returning its typed handle.
@@ -955,7 +956,7 @@ where
     ) -> Result<BoxValueState<ConsumerMessage<Self::Payload>>, ErasedStateError> {
         let handle = self
             .state(Registered::new(message_state::<
-                <C::State as CellRead>::Loader,
+                <C::State as StateSession>::Loader,
             >(name)))
             .map_err(|e| ErasedStateError::from_classified(&e))?;
         Ok(Box::new(ErasedValue::new(handle)))
@@ -968,7 +969,7 @@ where
         let handle = self
             .state(Registered::new(message_map_state::<
                 Utf8KeyCodec,
-                <C::State as CellRead>::Loader,
+                <C::State as StateSession>::Loader,
             >(name)))
             .map_err(|e| ErasedStateError::from_classified(&e))?;
         Ok(Box::new(ErasedMap::new(handle)))
@@ -980,7 +981,7 @@ where
     ) -> Result<BoxDequeState<ConsumerMessage<Self::Payload>>, ErasedStateError> {
         let handle = self
             .state(Registered::new(message_deque_state::<
-                <C::State as CellRead>::Loader,
+                <C::State as StateSession>::Loader,
             >(name)))
             .map_err(|e| ErasedStateError::from_classified(&e))?;
         Ok(Box::new(ErasedDeque::new(handle)))

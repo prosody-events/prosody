@@ -127,7 +127,11 @@ impl CommittedCellSource for ScriptedCellSource {
     type Error = StateAccessError;
 
     async fn load(&self, id: &CollectionId, cell: &CellKey) -> Result<Option<Bytes>, Self::Error> {
-        Self::read_committed(self, id, cell)
+        let read = Self::read_committed(self, id, cell);
+        // After the read, before the answer: a concurrency test can require
+        // every reader to arrive here before any of them leaves.
+        self.meet().await;
+        read
     }
 
     async fn load_many(

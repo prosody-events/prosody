@@ -18,6 +18,9 @@
 //! * [`cell`] — the provisional-cell durability model ([`Cell`], [`Committed`],
 //!   [`ProvisionalCell`], [`ProvisionalWrite`]).
 //! * `store` — the uniform `CellStore` backend trait (crate-internal).
+//! * [`collection`] — the collection-operation core: one bound [`Collection`],
+//!   one scoped operation per public invocation, and the two sealed engines
+//!   (owner session and published reader) behind it.
 //! * [`descriptor`] — typed collection handles bound over the raw byte cells
 //!   the stores persist.
 //! * [`registry`] — per-collection operational settings ([`CommitMode`],
@@ -84,6 +87,7 @@ pub(crate) mod cached;
 pub mod cassandra;
 pub mod cell;
 pub mod cell_key;
+pub mod collection;
 pub(crate) mod commit;
 pub mod config;
 pub mod descriptor;
@@ -111,6 +115,7 @@ pub(crate) mod tests;
 
 pub use access::StateAccessError;
 pub use cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+pub use collection::{Collection, StateSession, WritableStateSession};
 pub use event_ref::{CommitDecision, EventRef, StoreOutcome, TimerEventRef};
 pub use identity::{
     CollectionId, CollectionKindId, CollectionRef, StateKey, StateName, StateNameError, StateType,

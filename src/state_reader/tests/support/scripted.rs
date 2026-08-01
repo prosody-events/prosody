@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Barrier;
 
 /// [`publish_source`](super::publish_source) against the scripted control-plane
 /// stores, freezing an identity that matches `descriptor`.
@@ -97,6 +98,11 @@ pub(crate) struct ScriptedCellSource {
     /// shares it, so a test reads the count after moving the source into a
     /// bundle.
     reads: Arc<scc::HashMap<SegmentId, usize, RandomState>>,
+    /// A meeting point at the committed point read: when installed, every
+    /// arriving read waits there until the configured number of readers has
+    /// arrived. It is how a concurrency test proves overlap without a clock —
+    /// if the reads serialize, the first one never leaves the meeting point.
+    rendezvous: Option<Arc<Barrier>>,
 }
 
 impl ScriptedCellSource {
@@ -107,6 +113,19 @@ impl ScriptedCellSource {
     /// The backing cells, for the owner harness to seed committed values into.
     pub(in crate::state_reader::tests) fn cells(&self) -> MemoryCells {
         self.inner.clone()
+    }
+
+    /// Installs a meeting point that `parties` concurrent committed point
+    /// reads must all reach before any of them returns.
+    pub(in crate::state_reader::tests) fn rendezvous(&mut self, parties: usize) {
+        self.rendezvous = Some(Arc::new(Barrier::new(parties)));
+    }
+
+    /// Waits at the installed meeting point, if any.
+    pub(crate) async fn meet(&self) {
+        if let Some(barrier) = &self.rendezvous {
+            barrier.wait().await;
+        }
     }
 
     /// Arms a fault for the source addressed by `segment`.

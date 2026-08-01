@@ -80,6 +80,8 @@ use crate::error::{ClassifyError, ErrorCategory};
 #[cfg(test)]
 use crate::state::cell_key::CellKey;
 use crate::state::cell_key::{Coordinate, Direction, ScanEdge, Section};
+use crate::state::collection::sealed_spec::SealedSpec;
+use crate::state::collection::{Collection, StateSession};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::session::{CellRead, CellWrite};
 use crate::state::{CollectionKindId, StoreOutcome};
@@ -342,17 +344,25 @@ where
     V: CellType<Key = UnitKey>,
 {
     type Cell = Keyed<KC, V>;
-    type Handle<S: CellRead> = MapHandle<S, KC, V>;
+    type Handle<S: StateSession> = MapHandle<S, KC, V>;
 
     const KIND: CollectionKindId = CollectionKindId::Map;
 
-    fn handle<S: CellRead>(scope: CellScope<S>) -> MapHandle<S, KC, V> {
+    fn handle<S: StateSession>(collection: Collection<S, Self>) -> MapHandle<S, KC, V> {
+        let (session, state_type, name) = collection.parts();
+        let scope = CellScope::new(session.clone(), state_type, name.clone());
         MapHandle {
             entries: scope.typed(ENTRY_SECTION),
             keyset: scope.typed(META_SECTION),
         }
     }
 }
+
+/// Bridge: Map's layout is still two hand-numbered section constants rather
+/// than a `collection_layout!` declaration, so its seal is hand-written. It is
+/// replaced by the generated marker when the kind migrates to the scoped
+/// operation.
+impl<KC, V> SealedSpec for MapKind<KC, V> {}
 
 /// Typed, owned handle over a codec-backed ordered map — a thin composition
 /// over two typed `CellView`s: `entries` (the per-key data cells, typed

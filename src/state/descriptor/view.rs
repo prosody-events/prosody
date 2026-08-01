@@ -1,18 +1,19 @@
-//! The byte boundary of keyed state — and the ONLY place `src/state` speaks a
-//! cell's raw bytes. [`CellScope`] forwards a collection partition's raw cell
-//! ops and [`CellView`] wraps them in a [`CellType`]'s codecs and resolver; the
-//! raw sinks and the `decode`/`encode` helpers are **private to this module**,
-//! so a collection kind (a sibling module) can reach a cell only through the
-//! typed surface — the codec (bytes ↔ stored) and resolver (stored ↔ exposed)
-//! are the only things that speak a cell's bytes.
+//! Bridge: the raw cell-command byte boundary of the collection kinds that
+//! still thread permits by hand. [`CellScope`] forwards a collection
+//! partition's raw cell ops and [`CellView`] wraps them in a [`CellType`]'s
+//! codecs and resolver; the raw sinks are **private to this module**, so a
+//! collection kind (a sibling module) can reach a cell only through the typed
+//! surface. The codec/resolver pair the typing runs through is shared with the
+//! scoped-operation boundary in [`crate::state::collection`]; this module dies
+//! once Map and Deque run through that engine too.
 
 use super::{
     CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession, KeyOf,
     ResolvedOf, STREAM_CHUNK, WriteOf,
 };
-use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+use crate::state::collection::{decode_cell, encode_cell, ensure_live};
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::session::{CellRead, CellWrite};
 use crate::state::store::{CELL_BATCH, CellBuffer, CoordinateBatch};
@@ -43,7 +44,7 @@ pub(crate) type KeyItem<T> = Result<KeyOf<T>, CellStateError<CellCodecError<T>>>
 /// session is private). A kind projects the typed views it needs from a scope
 /// with `Self::typed`; the raw byte ops stay module-private, so a cell's
 /// bytes are only ever spoken through its codecs — an [`OrderedKeyCodec`] for
-/// the address, a [`Codec`] for the value. Cheap `Clone`.
+/// the address, a [`Codec`](crate::codec::Codec) for the value. Cheap `Clone`.
 ///
 /// The type is `pub` because it names a parameter of the public
 /// [`CollectionSpec`](super::CollectionSpec)`::handle`, but it is *sealed*: its
@@ -72,21 +73,24 @@ impl<S> CellScope<S> {
             name,
         }
     }
-}
 
-impl<S: CellRead> CellScope<S> {
     /// Projects a typed view over this scope's cells in `section` for cell type
     /// `T`. A kind projects one view per cell family, each in its own section
     /// (a Map projects its entries and its meta cells from the same scope
     /// into different sections).
-    pub(in crate::state::descriptor) fn typed<T>(&self, section: Section) -> CellView<S, T> {
+    pub(in crate::state::descriptor) fn typed<T>(&self, section: Section) -> CellView<S, T>
+    where
+        S: Clone,
+    {
         CellView {
             scope: self.clone(),
             section,
             _marker: PhantomData,
         }
     }
+}
 
+impl<S: CellRead> CellScope<S> {
     /// The bound session, for a typed view to extract a resolver context from.
     fn session(&self) -> &S {
         &self.session
@@ -861,55 +865,9 @@ where
     }
 }
 
-/// Decodes a cell's bytes as `C::Payload`. Parses in place when the `Bytes` is
-/// uniquely owned (zero-copy, the production path — every backend decode mints
-/// a fresh `Bytes`); falls back to a copy for a shared clone (the in-memory
-/// test backend). The single decode path every typed cell view shares.
-fn decode_cell<C: Codec>(cell: Bytes) -> Result<C::Payload, C::Error> {
-    match cell.try_into_mut() {
-        Ok(mut buf) => C::with_cached_local(|codec| codec.deserialize(&mut buf)),
-        Err(cell) => {
-            let mut buf = cell.to_vec();
-            C::with_cached_local(|codec| codec.deserialize(&mut buf))
-        }
-    }
-}
-
-/// Encodes `payload` into the pooled, reusable serialize buffer, returning the
-/// guard so the caller hands its bytes to a cell `set` before the guard drops
-/// (returning the buffer to the pool). The guard owns its buffer, so it is
-/// `Send` and rides the write across an await. The single encode path every
-/// typed cell view shares.
-fn encode_cell<C: Codec>(payload: C::Payload) -> Result<SerializeBufGuard, C::Error> {
-    let mut buf = SerializeBufGuard::acquire();
-    C::with_cached_local(|codec| codec.serialize(payload, &mut buf))?;
-    Ok(buf)
-}
-
 /// Lowers a typed scan edge to its order-preserving coordinate edge. Called
 /// once per scan, on the stream's first poll; the owned coordinate — not the
 /// borrowed key — is what the running scan holds.
 fn encode_edge<K: OrderedKeyCodec>(edge: ScanEdge<&K::Key>) -> ScanEdge<Coordinate> {
     edge.map(K::encode)
-}
-
-/// Guards every cell operation: a session whose partition is shutting down,
-/// whose event is cancelled, or whose pinned attempt epoch no longer matches
-/// the live one (a handle/stream leaked past its dispatch attempt) refuses
-/// state access with [`StateAccessError::Terminated`].
-///
-/// Covers `raw_get`/`raw_set`/`raw_clear`/`clear_section`/`raw_commit` and the
-/// `scan` init. For reads and scans the pin-vs-termination order is immaterial
-/// — both map to `Terminated`. Permit-covered mutators re-run this under the
-/// held gate (harmless: the permit blocks the bump, so the pin is stable),
-/// having already sequenced the ordered admission in
-/// [`CellView::mutate_permit`].
-fn ensure_live<S>(session: &S) -> Result<(), StateAccessError>
-where
-    S: CellRead,
-{
-    if session.is_terminated() || !session.attempt_current() {
-        return Err(StateAccessError::Terminated);
-    }
-    Ok(())
 }

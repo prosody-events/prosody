@@ -63,6 +63,7 @@ use std::sync::OnceLock;
 use tokio::task::coop::cooperative;
 
 mod context;
+pub(crate) mod engine;
 
 pub(crate) use context::{ReaderCollectionDef, ReaderContext};
 
@@ -83,7 +84,13 @@ pub struct ReadSession<C: Codec, B> {
     pin: Arc<OnceLock<PinnedSource>>,
 }
 
-struct PinnedSource {
+/// One operation's selected publication source: the stable [`Source`] plus
+/// that source's computed [`CollectionId`].
+///
+/// `pub` only so the sealed reader engine can name it as its per-invocation
+/// state; the module is private, so it caps at crate visibility.
+#[derive(Clone)]
+pub struct PinnedSource {
     source: Source,
     collection: CollectionId,
 }
@@ -119,8 +126,12 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     /// `partition_segment_id`. The key is non-empty by construction, since
     /// empty keys are rejected at the `StateReader` boundary, so
     /// `partition_for_key` never errors here in practice.
-    fn collection_id_for(&self, source: &Source) -> Result<CollectionId, StateAccessError> {
-        if let Some(pin) = self.pin.get()
+    fn collection_id_for(
+        &self,
+        selection: Option<&PinnedSource>,
+        source: &Source,
+    ) -> Result<CollectionId, StateAccessError> {
+        if let Some(pin) = selection
             && pin.source == *source
         {
             return Ok(pin.collection.clone());
@@ -136,13 +147,6 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         ))
     }
 
-    fn pin(&self, source: &Source, collection: CollectionId) {
-        let _ = self.pin.set(PinnedSource {
-            source: source.clone(),
-            collection,
-        });
-    }
-
     fn cache_key(&self, source: &Source, cell: &CellKey) -> CacheKey {
         (
             source.clone(),
@@ -153,15 +157,18 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         )
     }
 
-    /// One source's committed point read, cached per policy.
+    /// One source's committed point read, cached per policy. `selection` is
+    /// the operation's already-pinned source, if any, so a pinned read reuses
+    /// its computed collection id instead of re-routing the key.
     async fn cached_point(
         &self,
+        selection: Option<&PinnedSource>,
         source: &Source,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
         match self.context.def.read_cache_ttl {
             None => {
-                let id = self.collection_id_for(source)?;
+                let id = self.collection_id_for(selection, source)?;
                 self.context
                     .backend
                     .cells()
@@ -177,7 +184,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 self.context
                     .cache
                     .get_cached(key, ttl, || async {
-                        let id = self.collection_id_for(source)?;
+                        let id = self.collection_id_for(selection, source)?;
                         self.context
                             .backend
                             .cells()
@@ -194,13 +201,14 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     /// `batch`).
     async fn cached_batch(
         &self,
+        selection: Option<&PinnedSource>,
         source: &Source,
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
         match self.context.def.read_cache_ttl {
             None => {
-                let id = self.collection_id_for(source)?;
+                let id = self.collection_id_for(selection, source)?;
                 self.context
                     .backend
                     .cells()
@@ -226,7 +234,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 self.context
                     .cache
                     .get_many_cached(&keys, ttl, || async {
-                        let id = self.collection_id_for(source)?;
+                        let id = self.collection_id_for(selection, source)?;
                         self.context
                             .backend
                             .cells()
@@ -236,6 +244,73 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                     })
                     .await
             }
+        }
+    }
+
+    /// One operation's committed point read: address the already-selected
+    /// source, or probe for one.
+    async fn point_read(
+        &self,
+        selection: &mut Option<PinnedSource>,
+        cell: &CellKey,
+    ) -> Result<Option<Bytes>, StateAccessError> {
+        if let Some(pin) = selection.as_ref() {
+            return self.cached_point(Some(pin), &pin.source, cell).await;
+        }
+        self.probe_point(selection, cell).await
+    }
+
+    /// Probe-and-pin for one point read: issue the read to every source
+    /// concurrently and resolve in source order with early exit, selecting the
+    /// first source that answers with data.
+    ///
+    /// A [`FuturesOrdered`] yields in push order regardless of completion
+    /// timing, so the lowest-ordered source with data always wins: a fast
+    /// `None` from a non-owner can never beat a slow `Some` from the owner. A
+    /// source that errors is skipped and its error remembered; data beats a
+    /// skipped error, and no data plus at least one error is an error.
+    async fn probe_point(
+        &self,
+        selection: &mut Option<PinnedSource>,
+        cell: &CellKey,
+    ) -> Result<Option<Bytes>, StateAccessError> {
+        let sources = self.snapshot.sources();
+        // `FuturesOrdered` heap-allocates one node per source, bounded by
+        // `MAX_PUBLICATION_SOURCES`. This is a per-operation, I/O-bound
+        // cross-group read, not the per-message or per-cell steady state the
+        // allocation rule targets. A bounded 16-node allocation alongside the
+        // store reads is acceptable here. Do not replace it with a hand-rolled
+        // poll loop over a `SmallVec` to avoid the allocation.
+        // Each future yields the source it read, so the selection never
+        // depends on the completion order matching the source order.
+        let mut ordered = FuturesOrdered::new();
+        for source in sources {
+            ordered.push_back(cooperative(async move {
+                (source, self.cached_point(None, source, cell).await)
+            }));
+        }
+        let mut first_err = None;
+        while let Some((source, result)) = cooperative(ordered.next()).await {
+            match result {
+                Ok(Some(value)) => {
+                    let collection = self.collection_id_for(None, source)?;
+                    *selection = Some(PinnedSource {
+                        source: source.clone(),
+                        collection,
+                    });
+                    return Ok(Some(value));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if first_err.is_none() {
+                        first_err = Some(error);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(error) => Err(error),
+            None => Ok(None),
         }
     }
 }
@@ -254,12 +329,6 @@ impl<C: Codec, B: ReaderBackend<C>> CellRead for ReadSession<C, B>
 where
     C::Payload: Clone,
 {
-    type Loader = B::Loader;
-
-    fn loader(&self) -> &Self::Loader {
-        self.context.backend.loader()
-    }
-
     fn is_terminated(&self) -> bool {
         false
     }
@@ -301,48 +370,21 @@ where
         _name: &StateName,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
-        if let Some(pin) = self.pin.get() {
-            return self.cached_point(&pin.source, cell).await;
+        // The session-shared pin adapter over the operation-local read: seed
+        // the selection from the shared cell, read, then publish a fresh
+        // selection back. The paths that still share one pin across calls
+        // (`get_many` and `scan`, until Map and Deque run through the engine)
+        // observe exactly what they observed before.
+        let mut selection = self.pin.get().cloned();
+        let result = self.point_read(&mut selection, cell).await;
+        if let Some(pin) = selection {
+            // Discarding the `set` result is safe because unpinned reads in
+            // one operation are issued sequentially (the
+            // `SingleSourceCoherence` invariant): either the cell was empty
+            // and this is the first pin, or it already holds this selection.
+            let _ = self.pin.set(pin);
         }
-        let sources = self.snapshot.sources();
-        // `FuturesOrdered` heap-allocates one node per source, bounded by
-        // `MAX_PUBLICATION_SOURCES`. This is a per-operation, I/O-bound
-        // cross-group read, not the per-message or per-cell steady state the
-        // allocation rule targets. A bounded 16-node allocation alongside the
-        // store reads is acceptable here. Do not replace it with a hand-rolled
-        // poll loop over a `SmallVec` to avoid the allocation.
-        // Each future yields the source it read, so the pin never depends on
-        // the completion order matching the source order.
-        let mut ordered = FuturesOrdered::new();
-        for source in sources {
-            ordered.push_back(cooperative(async move {
-                (source, self.cached_point(source, cell).await)
-            }));
-        }
-        let mut first_err = None;
-        while let Some((source, result)) = cooperative(ordered.next()).await {
-            match result {
-                Ok(Some(value)) => {
-                    // Discarding the `set` result is safe because unpinned reads
-                    // in one operation are issued sequentially (the
-                    // `SingleSourceCoherence` invariant). This is the first pin,
-                    // so the `OnceLock` is empty and the set succeeds.
-                    let collection = self.collection_id_for(source)?;
-                    self.pin(source, collection);
-                    return Ok(Some(value));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    if first_err.is_none() {
-                        first_err = Some(error);
-                    }
-                }
-            }
-        }
-        match first_err {
-            Some(error) => Err(error),
-            None => Ok(None),
-        }
+        result
     }
 
     async fn get_many(
@@ -353,7 +395,9 @@ where
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
         if let Some(pin) = self.pin.get() {
-            return self.cached_batch(&pin.source, section, batch).await;
+            return self
+                .cached_batch(Some(pin), &pin.source, section, batch)
+                .await;
         }
         let sources = self.snapshot.sources();
         // Bounded per-operation fan-out; see the ruling on the point-read
@@ -361,7 +405,10 @@ where
         let mut ordered = FuturesOrdered::new();
         for source in sources {
             ordered.push_back(cooperative(async move {
-                (source, self.cached_batch(source, section, batch).await)
+                (
+                    source,
+                    self.cached_batch(None, source, section, batch).await,
+                )
             }));
         }
         let mut first_err = None;
@@ -372,8 +419,11 @@ where
                     if buffer.iter().any(Option::is_some) {
                         // First pin, so the set succeeds and discarding its
                         // result is safe; see the `get` pin above.
-                        let collection = self.collection_id_for(source)?;
-                        self.pin(source, collection);
+                        let collection = self.collection_id_for(None, source)?;
+                        let _ = self.pin.set(PinnedSource {
+                            source: source.clone(),
+                            collection,
+                        });
                         return Ok(buffer);
                     }
                     if all_none.is_none() {
@@ -427,7 +477,7 @@ where
             let mut first_err = None;
             let mut pinned = false;
             for source in sources {
-                let id = self.collection_id_for(source)?;
+                let id = self.collection_id_for(self.pin.get(), source)?;
                 let inner = self.context.backend.cells().scan(&id, scan);
                 futures::pin_mut!(inner);
                 let mut yielded_any = false;
@@ -435,7 +485,10 @@ where
                     match cooperative(inner.next()).await {
                         Some(Ok(item)) => {
                             if !yielded_any {
-                                self.pin(source, id.clone());
+                                let _ = self.pin.set(PinnedSource {
+                                    source: source.clone(),
+                                    collection: id.clone(),
+                                });
                                 yielded_any = true;
                             }
                             yield item;

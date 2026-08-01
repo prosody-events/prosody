@@ -9,6 +9,8 @@ use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
+use crate::state::collection::owner::OwnerEngine;
+use crate::state::collection::{StateSession, WritableStateSession, sealed};
 use crate::state::descriptor::{CellResolver, StructuralIdentity};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::memory::MemoryPublicationStore;
@@ -178,16 +180,32 @@ where
     }
 }
 
-impl<P> CellRead for UnavailableState<P>
+impl<P> sealed::Session for UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
+    type Engine = OwnerEngine;
+}
+
+impl<P> sealed::WritableSession for UnavailableState<P> where P: Clone + Send + Sync + 'static {}
+
+impl<P> StateSession for UnavailableState<P>
 where
     P: Clone + Send + Sync + 'static,
 {
     type Loader = MemoryLoader<P>;
 
-    fn loader(&self) -> &Self::Loader {
+    fn loader(&self) -> &MemoryLoader<P> {
         &self.loader
     }
+}
 
+impl<P> WritableStateSession for UnavailableState<P> where P: Clone + Send + Sync + 'static {}
+
+impl<P> CellRead for UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
     fn is_terminated(&self) -> bool {
         true
     }
@@ -332,6 +350,17 @@ where
         _proof: MarkerWrite,
     ) -> Result<(), StateAccessError> {
         Ok(())
+    }
+
+    /// Unreachable: [`CellWrite::mutate_permit`] errors `Unavailable` before a
+    /// write operation can stage anything to replay.
+    fn stage_cell(
+        &self,
+        _state_type: StateType,
+        _name: &StateName,
+        _cell: &CellKey,
+        _value: Option<Bytes>,
+    ) {
     }
 
     fn discard_dirty(&self) {}
