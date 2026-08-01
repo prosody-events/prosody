@@ -177,20 +177,15 @@ where
 
 /// Reads one awaited subsystem name.
 ///
-/// Held to exactly what [`SubsystemName::try_new`] accepts: trimmed, non-blank,
-/// and no longer than [`SubsystemName::MAX_BYTES`]. A producer writing a padded
-/// name therefore addresses the same subsystem, and a name no responder could
-/// ever hold is refused rather than compared.
+/// [`SubsystemName::checked`] applies the rule, so a padded name addresses the
+/// same subsystem and a name no responder could ever hold is refused rather
+/// than compared. Nothing is copied: the name is compared where it lies in the
+/// record.
 fn awaited_name(value: Option<&[u8]>) -> Result<&str, HeaderRejection> {
     let bytes = value.ok_or(HeaderRejection::MalformedAwaited)?;
-    let name = str::from_utf8(bytes)
-        .map_err(|_| HeaderRejection::MalformedAwaited)?
-        .trim();
+    let name = str::from_utf8(bytes).map_err(|_| HeaderRejection::MalformedAwaited)?;
 
-    if name.is_empty() || name.len() > SubsystemName::MAX_BYTES {
-        return Err(HeaderRejection::MalformedAwaited);
-    }
-    Ok(name)
+    SubsystemName::checked(name).map_err(|_| HeaderRejection::MalformedAwaited)
 }
 
 /// Reads one id header into its 16 bytes.

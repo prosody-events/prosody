@@ -57,11 +57,13 @@ fn encodes_without_reserving(codec: &CountingCodec, lengths: &[usize], relay: bo
     let scratch_capacity = encoder.scratch_capacity();
     let dst_capacity = dst.capacity();
     let subsystem = "billing";
-    let header = header(
+    let Ok(header) = header(
         subsystem,
         ErrorCategory::Transient,
         relay.then(|| NodeId::from_bytes(RAW_ID)),
-    );
+    ) else {
+        return TestResult::error("the fixture subsystem is a legal name");
+    };
 
     // The boundary lengths lead every run, so the largest frame the cap admits
     // — and the first one it refuses — are exercised whatever quickcheck
@@ -159,7 +161,7 @@ fn encodes_without_reserving(codec: &CountingCodec, lengths: &[usize], relay: bo
 fn an_over_cap_response_is_refused_before_it_is_framed() -> Result<()> {
     let cap = FrameCap::new(1024)?;
     let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
-    let header = header("billing", ErrorCategory::Permanent, None);
+    let header = header("billing", ErrorCategory::Permanent, None)?;
 
     let staged = encoder.stage(&header, vec![0u8; 960])?;
     assert_eq!(
@@ -179,35 +181,11 @@ fn an_over_cap_response_is_refused_before_it_is_framed() -> Result<()> {
     Ok(())
 }
 
-/// A subsystem name no decoder would accept — at either end of the range — is
-/// refused rather than framed into a message the far end must throw away.
-#[test]
-fn an_unusable_subsystem_is_refused() -> Result<()> {
-    let cap = FrameCap::new(1024)?;
-    let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
-    let too_long = "x".repeat(65);
-
-    for name in ["", &too_long] {
-        let header = header(name, ErrorCategory::Transient, None);
-        let Err(EncodeError::UnusableSubsystem { bytes, limit }) =
-            encoder.stage(&header, Vec::new())
-        else {
-            bail!("a {}-byte subsystem name must be refused", name.len());
-        };
-        assert_eq!(
-            (bytes, limit),
-            (name.len(), 64),
-            "the refusal must name the length and the limit"
-        );
-    }
-    Ok(())
-}
-
 #[test]
 fn one_response_frames_to_known_bytes() -> Result<()> {
     let cap = FrameCap::new(1024)?;
     let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
-    let header = header("billing", ErrorCategory::Permanent, None);
+    let header = header("billing", ErrorCategory::Permanent, None)?;
     let mut dst = BytesMut::with_capacity(cap.bytes());
 
     encoder.stage(&header, b"hi".to_vec())?.write(&mut dst);

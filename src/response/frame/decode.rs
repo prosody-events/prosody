@@ -9,7 +9,7 @@ use super::{
 use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION, RequestId};
 use crate::router::NodeId;
-use crate::subsystem::SubsystemName;
+use crate::subsystem::{SubsystemName, SubsystemNameError};
 use bytes::{Buf, BufMut, BytesMut};
 use fixedstr::Flexstr;
 use prost::DecodeError;
@@ -102,7 +102,9 @@ pub(crate) fn decode_frame<B: Buf>(
             }
             FIELD_SUBSYSTEM => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
-                subsystem = decode_text::<B, { SubsystemName::MAX_BYTES + 1 }>(src, "subsystem")?;
+                subsystem = decode_text::<B, { SubsystemName::MAX_BYTES + 1 }>(src, "subsystem")?
+                    .map(SubsystemName::try_new)
+                    .transpose()?;
             }
             FIELD_FORMAT => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
@@ -280,6 +282,12 @@ pub(crate) enum FrameDecodeError {
     /// A string field is not valid UTF-8.
     #[error(transparent)]
     InvalidUtf8(#[from] Utf8Error),
+
+    /// The subsystem field carries no name a responder could hold. The length
+    /// bound above cannot catch this one: a name of whitespace alone is not
+    /// empty on the wire and is blank after the trim.
+    #[error(transparent)]
+    Subsystem(#[from] SubsystemNameError),
 
     /// The category field names no error category.
     #[error(transparent)]

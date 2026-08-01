@@ -351,7 +351,7 @@ where
         let name = Arc::from(&self.context.name);
         match absence {
             Absence::NoPublication => StateReaderError::UnknownPublication {
-                subsystem: Arc::from(&self.subsystem),
+                subsystem: self.subsystem.clone(),
                 name,
             },
             Absence::NoIdentity => StateReaderError::IdentityUnavailable { name },

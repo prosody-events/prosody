@@ -8,7 +8,6 @@ use super::{
 use crate::codec::Codec;
 use crate::error::ErrorCategory;
 use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION};
-use crate::subsystem::SubsystemName;
 use bytes::BufMut;
 use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len};
 use std::error::Error;
@@ -67,9 +66,12 @@ impl<C: Codec> FrameEncoder<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`EncodeError::UnusableSubsystem`] for a name no decoder would
-    /// accept, [`EncodeError::Codec`] when the codec fails, and
+    /// Returns [`EncodeError::Codec`] when the codec fails, and
     /// [`EncodeError::TooLarge`] when the framed response would exceed the cap.
+    /// The subsystem needs no check here: a [`SubsystemName`] is one a decoder
+    /// accepts by construction.
+    ///
+    /// [`SubsystemName`]: crate::subsystem::SubsystemName
     pub(crate) fn stage<'a>(
         &'a mut self,
         header: &'a FrameHeader,
@@ -85,13 +87,6 @@ impl<C: Codec> FrameEncoder<C> {
                 "a codec used for responses must have a FORMAT_ID a frame can carry"
             );
         }
-        if header.subsystem.is_empty() || header.subsystem.len() > SubsystemName::MAX_BYTES {
-            return Err(EncodeError::UnusableSubsystem {
-                bytes: header.subsystem.len(),
-                limit: SubsystemName::MAX_BYTES,
-            });
-        }
-
         // Shrink back toward the cap: a response the cap refused can have grown
         // this scratch, and a codec that moved its own buffer in can have handed
         // over one larger still. `shrink_to` never grows, so a smaller moved-in
@@ -154,7 +149,7 @@ impl Staged<'_> {
         write_bytes_field(FIELD_REQUEST_ID, &self.header.request.into_bytes(), dst);
         write_bytes_field(
             FIELD_SUBSYSTEM,
-            self.header.subsystem.to_str().as_bytes(),
+            self.header.subsystem.as_str().as_bytes(),
             dst,
         );
         write_bytes_field(FIELD_FORMAT, self.format.as_bytes(), dst);
@@ -172,7 +167,7 @@ fn frame_len(header: &FrameHeader, format: &str, payload: usize) -> u64 {
     varint_field_len(FIELD_PROTOCOL_VERSION, u64::from(RESPONSE_PROTOCOL_VERSION))
         + bytes_field_len(FIELD_TARGET_NODE, ID_BYTES)
         + bytes_field_len(FIELD_REQUEST_ID, ID_BYTES)
-        + bytes_field_len(FIELD_SUBSYSTEM, header.subsystem.len())
+        + bytes_field_len(FIELD_SUBSYSTEM, header.subsystem.as_str().len())
         + bytes_field_len(FIELD_FORMAT, format.len())
         + varint_field_len(FIELD_CATEGORY, category_varint(header.category))
         + bytes_field_len(FIELD_PAYLOAD, payload)
@@ -215,16 +210,6 @@ fn write_bytes_field<B: BufMut>(tag: u32, value: &[u8], dst: &mut B) {
 /// Why one response could not be turned into a frame.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum EncodeError<E: Error> {
-    /// The subsystem name is one no decoder would accept: a frame carries no
-    /// unnamed subsystem, and none longer than the limit.
-    #[error("subsystem name is {bytes} bytes, outside the 1..={limit} a frame carries")]
-    UnusableSubsystem {
-        /// The name's length.
-        bytes: usize,
-        /// The longest name a frame may carry.
-        limit: usize,
-    },
-
     /// The application's codec failed to serialize the response.
     #[error(transparent)]
     Codec(E),

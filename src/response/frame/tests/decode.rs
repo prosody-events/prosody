@@ -7,8 +7,9 @@ use crate::response::frame::{
     FIELD_CATEGORY, FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE,
     FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, PayloadError,
 };
-use crate::response::{FormatToken, RequestId, Subsystem};
+use crate::response::{FormatToken, RequestId};
 use crate::router::NodeId;
+use crate::subsystem::{SubsystemName, SubsystemNameError};
 use bytes::BytesMut;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
@@ -54,10 +55,13 @@ fn a_framed_response_round_trips(
     let Ok(cap) = FrameCap::new(4096) else {
         return TestResult::error("4 KiB is a supported cap");
     };
+    let Ok(subsystem) = SubsystemName::try_new(SUBSYSTEMS[subsystem % SUBSYSTEMS.len()]) else {
+        return TestResult::error("every name in the vocabulary is legal");
+    };
     let header = FrameHeader {
         target: node(target),
         request: RequestId::from_bytes(request.to_le_bytes()),
-        subsystem: Subsystem::make(SUBSYSTEMS[subsystem % SUBSYSTEMS.len()]),
+        subsystem,
         category: match category % 3 {
             0 => ErrorCategory::Transient,
             1 => ErrorCategory::Permanent,
@@ -107,7 +111,7 @@ fn the_raw_fixture_is_a_well_formed_frame() -> Result<()> {
     let decoded = decode_frame(&mut RawFrame::default().encode(), cap)?;
     assert_eq!(
         decoded.header.subsystem,
-        Subsystem::make("billing"),
+        SubsystemName::try_new("billing")?,
         "the fixture carries its subsystem"
     );
     assert_eq!(
@@ -214,6 +218,15 @@ fn a_malformed_frame_is_refused_by_the_field_that_broke_it() -> Result<()> {
                 ..RawFrame::default()
             },
             FrameDecodeError::MissingField("subsystem"),
+        ),
+        // Not empty on the wire, but blank once trimmed. The length bound
+        // cannot catch this one, so the name's own constructor does.
+        (
+            RawFrame {
+                subsystem: Some(b"   "),
+                ..RawFrame::default()
+            },
+            FrameDecodeError::Subsystem(SubsystemNameError::Blank),
         ),
         (
             RawFrame {

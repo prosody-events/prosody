@@ -2,6 +2,7 @@
 
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::access::StateAccessError;
+use crate::subsystem::SubsystemName;
 use std::error::Error;
 use std::sync::Arc;
 use thiserror::Error;
@@ -30,7 +31,7 @@ pub enum StateReaderError {
     #[error("no publication rows for {subsystem}/{name}")]
     UnknownPublication {
         /// The subsystem the reader routed under.
-        subsystem: Arc<str>,
+        subsystem: SubsystemName,
         /// The collection name.
         name: Arc<str>,
     },
@@ -161,6 +162,7 @@ fn client_category(category: ErrorCategory) -> ErrorCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use color_eyre::Result;
     use strum::VariantArray;
 
     /// The derived fieldless mirror of [`StateReaderError`], aliased for
@@ -185,10 +187,10 @@ mod tests {
     /// The match is exhaustive over the derived discriminants and has no
     /// wildcard, so adding a [`StateReaderError`] variant stops this compiling
     /// until the new variant returns a sample.
-    fn sample(variant: Variant) -> StateReaderError {
+    fn sample(variant: Variant, subsystem: &SubsystemName) -> StateReaderError {
         match variant {
             Variant::UnknownPublication => StateReaderError::UnknownPublication {
-                subsystem: "orders".into(),
+                subsystem: subsystem.clone(),
                 name: "cart".into(),
             },
             Variant::IdentityMismatch => StateReaderError::IdentityMismatch {
@@ -224,12 +226,13 @@ mod tests {
     /// `store(...)` capture or the `classify_error` `Store` arm. A `Terminal`
     /// then reaches classification and the assert fires.
     #[test]
-    fn no_variant_leaks_terminal_to_the_client() {
+    fn no_variant_leaks_terminal_to_the_client() -> Result<()> {
+        let subsystem = SubsystemName::try_new("orders")?;
         let captured = StateReaderError::store(&SyntheticTerminal);
         let cases = Variant::VARIANTS
             .iter()
             .copied()
-            .map(sample)
+            .map(|variant| sample(variant, &subsystem))
             .chain([captured]);
         for case in cases {
             assert_ne!(
@@ -238,5 +241,6 @@ mod tests {
                 "variant leaked Terminal: {case}"
             );
         }
+        Ok(())
     }
 }

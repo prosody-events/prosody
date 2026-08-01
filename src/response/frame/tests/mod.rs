@@ -4,9 +4,11 @@ use super::{
 };
 use crate::codec::Codec;
 use crate::error::ErrorCategory;
-use crate::response::{RequestId, Subsystem};
+use crate::response::RequestId;
 use crate::router::NodeId;
+use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
+use color_eyre::Result;
 use prost::encoding::{WireType, encode_key, encode_varint};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -171,16 +173,16 @@ impl RawFrame {
 
 /// A header whose fixed fields are deterministic, so a frozen-bytes assertion
 /// and a boundary calculation can both name exact numbers.
-fn header(subsystem: &str, category: ErrorCategory, relay: Option<NodeId>) -> FrameHeader {
-    FrameHeader {
+fn header(subsystem: &str, category: ErrorCategory, relay: Option<NodeId>) -> Result<FrameHeader> {
+    Ok(FrameHeader {
         target: NodeId::from_bytes([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
         request: RequestId::from_bytes([
             16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
         ]),
-        subsystem: Subsystem::make(subsystem),
+        subsystem: SubsystemName::try_new(subsystem)?,
         category,
         relay,
-    }
+    })
 }
 
 /// An independent model of the framed length, spelled out as the wire costs a

@@ -68,3 +68,21 @@ fn subsystem_name_boundaries() -> color_eyre::Result<()> {
     assert_eq!(SubsystemName::try_new(&at_bound)?.as_str(), at_bound);
     Ok(())
 }
+
+/// A name at the bound is stored inline, so no name ever allocates. The frame
+/// decoder builds one per received frame, and the reserved-header parser
+/// compares one per record, so an allocating name would be a per-message cost.
+///
+/// The inline capacity must exceed the bound, because `Flexstr` spills to the
+/// heap once the text reaches its capacity. One byte short and every
+/// maximum-length name would move to the heap with nothing to say so.
+#[test]
+fn a_name_at_the_bound_is_stored_inline() -> color_eyre::Result<()> {
+    let at_bound = SubsystemName::try_new("a".repeat(SubsystemName::MAX_BYTES))?;
+
+    assert!(
+        at_bound.0.is_fixed(),
+        "a name at the bound must not reach the heap"
+    );
+    Ok(())
+}
