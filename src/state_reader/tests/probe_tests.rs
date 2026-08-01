@@ -10,10 +10,13 @@
 //!
 //! The focused tests below cover invariants the script model does not
 //! express: `get_many` batch error precedence, `get_many` single-source
-//! splicing, a mid-stream scan error after a source has pinned, and a
-//! source-call trace proving a pinned scan never opens the decoy source.
+//! splicing, a mid-stream scan error after a source has pinned, a source-call
+//! trace proving a pinned scan never opens the decoy source, and the
+//! session-wide reuse of one selection across scoped operations.
 
-use super::support::{FaultPoint, GROUP_A, GROUP_B, ScriptedEnv, collect_stream, topic};
+use super::support::{
+    FaultPoint, GROUP_A, GROUP_B, ScriptedEnv, collect_stream, source_state_key, topic,
+};
 use crate::Key;
 use crate::codec::JsonCodec;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -25,7 +28,6 @@ use crate::state::descriptor::{
 use crate::state::order_codec::I64KeyCodec;
 use crate::state_reader::backend::ScriptedReaderBackend;
 use crate::state_reader::{StateReader, StateReaderError};
-use crate::test_util::TEST_RUNTIME;
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::StreamExt;
 use futures::executor::block_on;
@@ -436,42 +438,111 @@ async fn scan_reads_only_pinned_source() -> Result<()> {
 /// park the first there forever; the deadline is only the hang guard, and the
 /// rendezvous is the assertion. The read cache is disabled so its same-key
 /// single-flight cannot collapse the two reads into one.
-#[test]
-fn concurrent_reads_on_one_reader_overlap() -> Result<()> {
-    TEST_RUNTIME.block_on(async {
-        let mut env = ScriptedEnv::new(
-            value_state::<JsonCodec>("probe-concurrent").read_cache(ReadCachePolicy::Disabled),
-        )?;
-        env.cells.rendezvous(2);
-        let key = Key::from("user-1");
-        let tp = topic(GROUP_A);
-        env.commit(GROUP_A, tp, &key, 1, |handle| async move {
-            handle
-                .set(Value::from(7_i64))
-                .await
-                .map_err(|e| eyre!("set: {e}"))?;
-            Ok(())
-        })
-        .await?;
-        env.publish(GROUP_A, tp).await;
-        let reader = env.reader_eager()?;
-
-        let both = timeout(Duration::from_secs(30), async {
-            tokio::join!(reader.get(key.clone()), reader.get(key.clone()))
-        })
-        .await
-        .map_err(|_| eyre!("the two reads never met: they did not overlap"))?;
-
-        assert_eq!(
-            both.0.map_err(|e| eyre!("first read: {e}"))?,
-            Some(Value::from(7_i64)),
-            "the first concurrent read"
-        );
-        assert_eq!(
-            both.1.map_err(|e| eyre!("second read: {e}"))?,
-            Some(Value::from(7_i64)),
-            "the second concurrent read"
-        );
+///
+/// Falsify: route both reads through one shared admission — take a single
+/// session-wide permit around the read instead of building an independent
+/// session per operation. The second read then never reaches the meeting
+/// point and the deadline fires.
+#[tokio::test]
+async fn concurrent_reads_on_one_reader_overlap() -> Result<()> {
+    let mut env = ScriptedEnv::new(
+        value_state::<JsonCodec>("probe-concurrent").read_cache(ReadCachePolicy::Disabled),
+    )?;
+    env.cells.rendezvous(2);
+    let key = Key::from("user-1");
+    let tp = topic(GROUP_A);
+    env.commit(GROUP_A, tp, &key, 1, |handle| async move {
+        handle
+            .set(Value::from(7_i64))
+            .await
+            .map_err(|e| eyre!("set: {e}"))?;
         Ok(())
     })
+    .await?;
+    env.publish(GROUP_A, tp).await;
+    let reader = env.reader_eager()?;
+
+    let both = timeout(Duration::from_secs(30), async {
+        tokio::join!(reader.get(key.clone()), reader.get(key.clone()))
+    })
+    .await
+    .map_err(|_| eyre!("the two reads never met: they did not overlap"))?;
+
+    assert_eq!(
+        both.0.map_err(|e| eyre!("first read: {e}"))?,
+        Some(Value::from(7_i64)),
+        "the first concurrent read"
+    );
+    assert_eq!(
+        both.1.map_err(|e| eyre!("second read: {e}"))?,
+        Some(Value::from(7_i64)),
+        "the second concurrent read"
+    );
+    Ok(())
+}
+
+/// One session selects its source once. The first scoped operation probes for
+/// a source and publishes its selection onto the session; every later
+/// operation on that session seeds from that selection and addresses it
+/// directly, so no source below it is probed again.
+///
+/// The lowest source is published but holds nothing, which is what makes the
+/// re-probe observable: the probe must read it (and get `None`) before
+/// reaching the source that answers, so a second probe shows up as a second
+/// read of the empty source.
+///
+/// Falsify: have the reader engine start each invocation unselected, or stop
+/// publishing the first selection back to the session. The second `get` then
+/// re-probes and the empty source's read count rises to two.
+#[tokio::test]
+async fn one_session_selects_its_source_once() -> Result<()> {
+    /// Sorts below [`GROUP_A`], so this source is probed first.
+    const EMPTY_GROUP: &str = "group-000";
+
+    let env = ScriptedEnv::new(
+        value_state::<JsonCodec>("probe-select").read_cache(ReadCachePolicy::Disabled),
+    )?;
+    let key = Key::from("user-1");
+    let tp_empty = topic("topic-empty");
+    let tp_a = topic("topic-a");
+
+    let empty = source_state_key(tp_empty, EMPTY_GROUP, &key, env.count)?.segment_id;
+    env.publish(EMPTY_GROUP, tp_empty).await;
+    let answering = env
+        .commit(GROUP_A, tp_a, &key, 1, |handle| async move {
+            handle
+                .set(Value::from("A"))
+                .await
+                .map_err(|e| eyre!("set: {e}"))
+        })
+        .await?
+        .segment_id;
+    env.publish(GROUP_A, tp_a).await;
+
+    let reader = env.reader_eager()?;
+    let session = reader.session(key).await?;
+    let handle = env.descriptor.bind(&session)?;
+
+    assert_eq!(
+        handle.get().await.map_err(|e| eyre!("first read: {e}"))?,
+        Some(Value::from("A")),
+        "the first source with data answers the first read"
+    );
+    assert_eq!(
+        (env.cells.reads(empty), env.cells.reads(answering)),
+        (1, 1),
+        "the probe read the empty source, then the one that answered"
+    );
+
+    assert_eq!(
+        handle.get().await.map_err(|e| eyre!("second read: {e}"))?,
+        Some(Value::from("A")),
+        "the selected source answers the second read"
+    );
+    assert_eq!(
+        (env.cells.reads(empty), env.cells.reads(answering)),
+        (1, 2),
+        "the second read addressed the selection without probing again"
+    );
+    Ok(())
 }

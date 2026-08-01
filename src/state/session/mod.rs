@@ -23,8 +23,8 @@
 //!   `is_terminated`/`verify_state_registration` and the collection-metadata
 //!   queries. The resolver capability slot lives one layer up, on
 //!   [`StateSession`], which every session type implements. Every read method
-//!   is written **once** here, so the owner session and a future read-only
-//!   session share one implementation. Sealed by `sealed::ReadAdmission`.
+//!   is written **once** here, so the owner session and the published reader's
+//!   `ReadSession` share one implementation. Sealed by `sealed::ReadAdmission`.
 //! - [`CellWrite`] — the mutating remainder: the buffering mutators
 //!   `set`/`clear`/`clear_section` and the mid-handler transactional pair
 //!   `commit`/`rollback`. It extends [`CellRead`], `StateLifecycle`, and
@@ -113,8 +113,12 @@ mod tests;
 
 /// The complete non-mutating surface of a per-event session — every read a
 /// collection handle performs, written **once** here so the owner
-/// [`KeyedStateSession`] and a future read-only session share one
-/// implementation.
+/// [`KeyedStateSession`] and the published reader's
+/// [`ReadSession`](crate::state_reader::ReadSession) share one implementation.
+///
+/// This capability pair (`CellRead` plus its sealed `ReadAdmission`) collapses
+/// into [`StateSession`] once Map and Deque run through the collection engine:
+/// the raw cell surface it exists to carry has no other caller.
 ///
 /// `get`/`get_many`/`scan` describe the session's **visible committed bytes**
 /// for a cell — [`KeyedStateSession`] realises that through the dirty overlay +
@@ -579,15 +583,17 @@ pub(crate) mod sealed {
     /// A held [`SessionGate`] permit (RAII: dropping it releases the gate).
     ///
     /// Witnesses admission for a session **read**: the descriptor's cell-op
-    /// sinks demand `&S::Permit<'_>` (the owner's is this `OpPermit`), so
-    /// "forgot to acquire the gate" and "let the acquire outlive the op"
-    /// cannot compile. The same type is both the owner's
-    /// [`ReadAdmission::Permit`] and the hold [`SessionGate::close`] returns,
-    /// and a mutator's [`MutatePermit`] derefs to it. The read-vs-mutate split
-    /// encodes the gate's closure check, **not** shared-vs-exclusive access:
-    /// both permits are exclusive holds (a session read is not pure — a
-    /// point-get miss does durable read-repair and publishes a cache fill,
-    /// which KV4's fill-vs-write-through exclusion assumes runs under full
+    /// sinks and the engine's journal-replay sink
+    /// ([`StateLifecycle::stage_cell`]) all demand `&S::Permit<'_>` (the
+    /// owner's is this `OpPermit`), so "forgot to acquire the gate" and "let
+    /// the acquire outlive the op" cannot compile. The same type is both the
+    /// owner's [`ReadAdmission::Permit`] and the hold
+    /// [`SessionGate::close`] returns, and a mutator's [`MutatePermit`]
+    /// derefs to it. The read-vs-mutate split encodes the gate's closure
+    /// check, **not** shared-vs-exclusive access: both permits are
+    /// exclusive holds (a session read is not pure — a point-get miss does
+    /// durable read-repair and publishes a cache fill, which KV4's
+    /// fill-vs-write-through exclusion assumes runs under full
     /// mutual exclusion). [`SessionGate`] owns the conventional half of the
     /// contract: one acquire per public op, no re-acquire beneath it, same
     /// session.
@@ -612,7 +618,9 @@ pub(crate) mod sealed {
     /// descriptor's mutating sinks
     /// `raw_set`/`raw_clear`/`clear_section`/`raw_commit` demand
     /// `&S::MutatePermit<'_>`; the owner session's is this struct. A read
-    /// permit at a write does not compile.
+    /// permit at a write does not compile. A scoped write invocation holds one
+    /// across its whole body and hands its [`Deref`] target to
+    /// [`StateLifecycle::stage_cell`] at replay.
     /// It [`Deref`]s to [`OpPermit`], so a mutator's
     /// one permit also witnesses the reads inside its body — the read-under-
     /// mutate grade subtyping is one-directional and deliberate: a read is
@@ -632,9 +640,9 @@ pub(crate) mod sealed {
         }
     }
 
-    // The guard lifetime is named explicitly on both impls: elision would bind
-    // the returned reference's `'_` to `&self`, and `&mut Target` is invariant,
-    // so the elided `DerefMut` signature does not match the trait's.
+    // The guard lifetime is named explicitly on both impls: `Target` is
+    // `OpPermit<'a>`, so the elided `'_` (which binds to `&self`) does not
+    // match — on either impl.
     impl<'a> Deref for MutatePermit<'a> {
         type Target = OpPermit<'a>;
 
@@ -829,8 +837,8 @@ pub(crate) mod sealed {
         where
             Self: 's;
 
-        /// Acquires the read admission — the owner's gate read guard (a future
-        /// read-only session would hand back `()`).
+        /// Acquires the read admission — the owner's gate read guard; the
+        /// published reader, having no gate, hands back `()`.
         fn permit(&self) -> impl Future<Output = Self::Permit<'_>> + Send;
 
         /// Whether this handle/session clone's pinned epoch still equals the
@@ -838,8 +846,8 @@ pub(crate) mod sealed {
         /// ([`StateLifecycle::reset`]) bumped it — the pin half of
         /// `ensure_live`, the mutator admission order, and `rollback`'s `NoOp`
         /// guard. It lives here (not on [`StateLifecycle`]) so
-        /// `ensure_live<S: CellRead>` can consult it; a future read-only
-        /// session, having no attempt epoch, is always current.
+        /// `ensure_live<S: CellRead>` can consult it; the published reader,
+        /// having no attempt epoch, is always current.
         fn attempt_current(&self) -> bool;
     }
 
@@ -891,16 +899,20 @@ pub(crate) mod sealed {
             proof: MarkerWrite,
         ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
-        /// Bridge: stages one already-encoded mutation into this event's dirty
-        /// overlay — the synchronous, infallible sink a scoped collection
-        /// invocation replays its journal through. `Some(bytes)` stages a
-        /// write, `None` an absence.
+        /// Stages one already-encoded mutation into this event's dirty overlay
+        /// — the synchronous, infallible sink a scoped collection invocation
+        /// replays its journal through. `Some(bytes)` stages a write, `None` an
+        /// absence.
+        ///
+        /// `permit` is the admission witness: the replay runs under the write
+        /// hold the invocation took, and a `&MutatePermit` derefs to one, so
+        /// "staged without the gate" does not compile. It is never inspected.
         ///
         /// The buffering cell commands only *look* asynchronous: this is the
-        /// same overlay write without the future the replay cannot await, and
-        /// it dies with the old cell-command surface.
+        /// same overlay write without the future the replay cannot await.
         fn stage_cell(
             &self,
+            permit: &OpPermit<'_>,
             state_type: StateType,
             name: &StateName,
             cell: &CellKey,
@@ -1657,6 +1669,7 @@ where
 
     fn stage_cell(
         &self,
+        _permit: &OpPermit<'_>,
         state_type: StateType,
         name: &StateName,
         cell: &CellKey,
@@ -2017,7 +2030,9 @@ where
 /// settlement boundary drives the full sealed [`StateLifecycle`] on it.
 ///
 /// This is the **settlement surface**: `close_gate` / `finalize` /
-/// `record_marker` / `discard_dirty` / `terminate` / the backstop accessors.
+/// `record_marker` / `discard_dirty` / `terminate` / the backstop accessors —
+/// plus `stage_cell`, the sink a scoped write invocation replays its journal
+/// through.
 /// It stays `pub(crate)` because the settle-module-private
 /// [`SettlementAccess`](crate::consumer::middleware::settle) extension must
 /// name it. Residual: no convenient crate-wide accessor exists (the old

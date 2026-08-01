@@ -270,11 +270,11 @@ impl Arbitrary for Invocation {
                 )
             })
             .collect();
-        // Up to six commands: past `JOURNAL_INLINE`, so the spill path is
-        // generated as well as the inline one.
-        let commands = (0..=u8::arbitrary(g) % 6)
-            .map(|_| Command::arbitrary(g))
-            .collect();
+        // Zero to six commands: zero exercises the empty-journal invocation
+        // (admission plus a no-op merge), six is past `JOURNAL_INLINE`, so the
+        // spill path is generated as well as the inline one.
+        let count = u8::arbitrary(g) % 7;
+        let commands = (0..count).map(|_| Command::arbitrary(g)).collect();
         Self {
             seeded,
             commands,
@@ -285,16 +285,11 @@ impl Arbitrary for Invocation {
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         let seeded = self.seeded.clone();
         let exit = self.exit;
-        Box::new(
-            self.commands
-                .shrink()
-                .filter(|commands| !commands.is_empty())
-                .map(move |commands| Self {
-                    seeded: seeded.clone(),
-                    commands,
-                    exit,
-                }),
-        )
+        Box::new(self.commands.shrink().map(move |commands| Self {
+            seeded: seeded.clone(),
+            commands,
+            exit,
+        }))
     }
 }
 

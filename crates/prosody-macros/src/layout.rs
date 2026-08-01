@@ -7,22 +7,17 @@
 
 use crate::combine;
 use proc_macro2::{Span, TokenStream};
-use quote::quote;
+use quote::{ToTokens, quote};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
     Attribute, Error, Expr, ExprLit, ExprUnary, Field, Fields, GenericParam, Generics, Ident,
-    ItemStruct, Lit, LitInt, Token, Type, UnOp, Visibility, WhereClause, WherePredicate,
+    ItemStruct, Lit, LitInt, Token, Type, UnOp, Visibility,
 };
 
 /// The highest durable id a section can carry: sections are persisted as
 /// `i8` discriminants.
 const MAX_ID: i64 = i8::MAX as i64;
-
-/// Expands one `collection_layout!` declaration.
-pub(crate) fn expand(input: TokenStream) -> Result<TokenStream, Error> {
-    Layout::parse(syn::parse2(input)?).map(|layout| layout.emit())
-}
 
 /// One declared cell family: its durable id, its token name, and the cell type
 /// it stores.
@@ -41,6 +36,8 @@ struct Layout {
     ident: Ident,
     generics: Generics,
     families: Vec<Family>,
+    /// Reserved ids in ascending order, which `RESERVED` is emitted from
+    /// directly.
     reserved: Vec<(i64, Span)>,
 }
 
@@ -71,10 +68,22 @@ impl Layout {
             }
         }
 
-        let (attrs, reserved) = split_reserved(attrs, &mut errors);
+        let (attrs, mut reserved) = split_reserved(attrs, &mut errors);
 
         let named = match fields {
-            Fields::Named(named) => named.named,
+            Fields::Named(named) => {
+                if named.named.is_empty() {
+                    combine(
+                        &mut errors,
+                        Error::new(
+                            ident.span(),
+                            "a collection layout declares at least one cell family; a layout with \
+                             none has no reset domain",
+                        ),
+                    );
+                }
+                named.named
+            }
             other => {
                 let span = match &other {
                     Fields::Unnamed(unnamed) => unnamed.span(),
@@ -93,38 +102,10 @@ impl Layout {
         };
 
         let families = parse_families(named, &mut errors);
-
-        let mut seen: Vec<i64> = Vec::with_capacity(families.len());
-        for family in &families {
-            if seen.contains(&family.id) {
-                combine(
-                    &mut errors,
-                    Error::new(
-                        family.id_span,
-                        format!(
-                            "durable id {} is already declared in this layout; every family needs \
-                             its own id",
-                            family.id
-                        ),
-                    ),
-                );
-            }
-            seen.push(family.id);
-        }
-        for (id, span) in &reserved {
-            if seen.contains(id) {
-                combine(
-                    &mut errors,
-                    Error::new(
-                        *span,
-                        format!(
-                            "durable id {id} is reserved and also declared; a reserved id names a \
-                             removed family and can never be reused"
-                        ),
-                    ),
-                );
-            }
-        }
+        // Sorting is stable, so a repeated reserved id still reports at the
+        // later of the two literals.
+        reserved.sort_by_key(|&(id, _)| id);
+        check_ids(&families, &reserved, &mut errors);
 
         if let Some(error) = errors {
             return Err(error);
@@ -237,13 +218,85 @@ impl Layout {
     }
 }
 
+/// Expands one `collection_layout!` declaration.
+///
+/// A rejected declaration emits the diagnostic alone, where
+/// `#[collection_methods]` re-emits the authored block alongside it. There is
+/// no authored item to preserve here: a stub kind type would still lack the
+/// associated constants every use site reads, so the rejection would arrive
+/// buried under that cascade.
+pub(crate) fn expand(input: TokenStream) -> Result<TokenStream, Error> {
+    Layout::parse(syn::parse2(input)?).map(|layout| layout.emit())
+}
+
+/// Rejects a repeated active id, a repeated reserved id, and an id that is
+/// both reserved and declared. `reserved` arrives sorted, so a repetition is
+/// adjacent.
+fn check_ids(families: &[Family], reserved: &[(i64, Span)], errors: &mut Option<Error>) {
+    let mut seen: Vec<i64> = Vec::with_capacity(families.len());
+    for family in families {
+        if seen.contains(&family.id) {
+            combine(
+                errors,
+                Error::new(
+                    family.id_span,
+                    format!(
+                        "durable id {} is already declared in this layout; every family needs its \
+                         own id",
+                        family.id
+                    ),
+                ),
+            );
+        }
+        seen.push(family.id);
+    }
+
+    let mut previous: Option<i64> = None;
+    for &(id, span) in reserved {
+        if previous == Some(id) {
+            combine(
+                errors,
+                Error::new(
+                    span,
+                    format!("durable id {id} is already reserved in this layout"),
+                ),
+            );
+        }
+        previous = Some(id);
+        // The active declaration is the actionable token: the reserved literal
+        // names a removed family and must never be touched.
+        if let Some(active) = families.iter().find(|family| family.id == id) {
+            combine(
+                errors,
+                Error::new(
+                    active.id_span,
+                    format!(
+                        "durable id {id} is reserved and also declared; a reserved id names a \
+                         removed family and can never be reused"
+                    ),
+                ),
+            );
+        }
+    }
+}
+
 /// Reads one declaration's fields into families, reporting a field that
 /// carries no durable id at its own name.
 fn parse_families(named: Punctuated<Field, Token![,]>, errors: &mut Option<Error>) -> Vec<Family> {
     let mut families = Vec::with_capacity(named.len());
     for field in named {
         let Some(name) = field.ident else { continue };
-        let (id_attr, attrs) = split_id(field.attrs);
+        if !matches!(field.vis, Visibility::Inherited) {
+            combine(
+                errors,
+                Error::new(
+                    field.vis.span(),
+                    "a cell family carries no visibility of its own; the generated family \
+                     constant is always `pub(crate)`",
+                ),
+            );
+        }
+        let (id_attr, attrs) = split_id(field.attrs, errors);
         let Some(id_attr) = id_attr else {
             combine(
                 errors,
@@ -298,16 +351,28 @@ fn split_reserved(
     (kept, reserved)
 }
 
-/// Splits the `#[id(n)]` attribute out of one field's attributes.
-fn split_id(attrs: Vec<Attribute>) -> (Option<Attribute>, Vec<Attribute>) {
+/// Splits the `#[id(n)]` attribute out of one field's attributes, rejecting a
+/// second one at its own attribute rather than re-emitting it onto generated
+/// code.
+fn split_id(
+    attrs: Vec<Attribute>,
+    errors: &mut Option<Error>,
+) -> (Option<Attribute>, Vec<Attribute>) {
     let mut id = None;
     let mut kept = Vec::with_capacity(attrs.len());
     for attr in attrs {
-        if id.is_none() && attr.path().is_ident("id") {
-            id = Some(attr);
-        } else {
-            kept.push(attr);
+        if attr.path().is_ident("id") {
+            if id.is_some() {
+                combine(
+                    errors,
+                    Error::new(attr.span(), "a cell family carries one durable id"),
+                );
+            } else {
+                id = Some(attr);
+            }
+            continue;
         }
+        kept.push(attr);
     }
     (id, kept)
 }
@@ -319,9 +384,9 @@ fn parse_id(attr: &Attribute) -> Result<(i64, Span), Error> {
     id_value(&expr).map(|id| (id, span))
 }
 
-/// Validates one id expression: a plain integer literal in `0..=127`. A
-/// negated literal is rejected at the whole expression, which is where the
-/// author wrote the sign.
+/// Validates one id expression: a plain unsuffixed integer literal in
+/// `0..=127`. A negated literal is rejected at the whole expression, which is
+/// where the author wrote the sign.
 fn id_value(expr: &Expr) -> Result<i64, Error> {
     let literal = match expr {
         Expr::Lit(ExprLit {
@@ -330,12 +395,7 @@ fn id_value(expr: &Expr) -> Result<i64, Error> {
         }) => literal,
         Expr::Unary(ExprUnary {
             op: UnOp::Neg(_), ..
-        }) => {
-            return Err(Error::new(
-                expr.span(),
-                format!("a durable id is a section discriminant in 0..={MAX_ID}"),
-            ));
-        }
+        }) => return Err(range_error(expr.span())),
         other => {
             return Err(Error::new(
                 other.span(),
@@ -343,36 +403,47 @@ fn id_value(expr: &Expr) -> Result<i64, Error> {
             ));
         }
     };
-    let value: i64 = literal.base10_parse()?;
-    if value > MAX_ID {
+    if !literal.suffix().is_empty() {
         return Err(Error::new(
             literal.span(),
-            format!("a durable id is a section discriminant in 0..={MAX_ID}"),
+            "a durable id is a plain integer literal, e.g. `#[id(0)]`",
         ));
+    }
+    let value: i64 = literal.base10_parse()?;
+    if value > MAX_ID {
+        return Err(range_error(literal.span()));
     }
     Ok(value)
 }
 
 /// The `where` clause of the generated `CollectionLayout` implementation: the
 /// declaration's own predicates plus the cell-type bound each family's
-/// descriptor entry reads its format tokens through.
-fn layout_where_clause(generics: &Generics, families: &[Family]) -> WhereClause {
-    let mut clause = generics.where_clause.clone().unwrap_or(WhereClause {
-        where_token: Token![where](Span::call_site()),
-        predicates: Punctuated::new(),
-    });
-    for family in families {
+/// descriptor entry reads its format tokens through. Two families of the same
+/// type contribute that bound twice, which rustc accepts.
+fn layout_where_clause(generics: &Generics, families: &[Family]) -> TokenStream {
+    let declared = generics
+        .where_clause
+        .iter()
+        .flat_map(|clause| clause.predicates.iter())
+        .map(ToTokens::to_token_stream);
+    let bounds = families.iter().map(|family| {
         let ty = &family.ty;
-        let predicate =
-            syn::parse2::<WherePredicate>(quote!(#ty: crate::state::descriptor::CellType));
-        if let Ok(predicate) = predicate {
-            clause.predicates.push(predicate);
-        }
-    }
-    clause
+        quote!(#ty: crate::state::descriptor::CellType)
+    });
+    let predicates = declared.chain(bounds);
+    quote!(where #(#predicates),*)
 }
 
 /// An `i8`-suffixed literal for a validated id.
 fn id_literal(id: i64, span: Span) -> LitInt {
     LitInt::new(&format!("{id}i8"), span)
+}
+
+/// The shared out-of-range rejection: a negated id and an oversized one say
+/// the same thing about the same durable domain.
+fn range_error(span: Span) -> Error {
+    Error::new(
+        span,
+        format!("a durable id is a section discriminant in 0..={MAX_ID}"),
+    )
 }

@@ -9,24 +9,6 @@
 use super::*;
 use quickcheck::{QuickCheck, TestResult};
 
-/// The `Meta`/`Entries` discriminants round-trip through `i8`, and every
-/// other value is rejected (never coerced to a variant).
-#[test]
-fn prop_deque_section_round_trip() {
-    fn prop(value: i8) -> TestResult {
-        match value {
-            0 | 1 => TestResult::from_bool(
-                DequeNs::try_from(value).is_ok_and(|ns| i8::from(ns) == value),
-            ),
-            _ => TestResult::from_bool(matches!(
-                DequeNs::try_from(value),
-                Err(UnknownDequeSection(v)) if v == value
-            )),
-        }
-    }
-    QuickCheck::new().quickcheck(prop as fn(i8) -> TestResult);
-}
-
 /// The frozen section discriminants — a durable wire contract (the sections
 /// lower to `0`/`1`).
 #[test]

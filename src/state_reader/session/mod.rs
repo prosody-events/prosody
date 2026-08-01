@@ -1,8 +1,9 @@
 //! The per-operation read session that runs probe-and-pin.
 //!
-//! A [`ReadSession`] implements [`CellRead`] only. It has no mutator bound, so
-//! a handle built from a reader cannot express a mutation. Call this the
-//! `ReadOnlyHandleCannotMutate` invariant. One session is built per
+//! A [`ReadSession`] implements [`CellRead`](crate::state::session::CellRead)
+//! only. It has no mutator bound, so a handle built from a reader cannot
+//! express a mutation. Call this the `ReadOnlyHandleCannotMutate` invariant.
+//! One session is built per
 //! `StateReader` operation and captures an immutable snapshot. One logical
 //! operation therefore resolves against one exact source set and pins at most
 //! one source. Call this the `SingleSourceCoherence` invariant.
@@ -18,6 +19,13 @@
 //! probe runs to a pin, then later calls address the pin, so a torn two-source
 //! view cannot occur. A concurrent batched probe added later would have to keep
 //! this sequential-pin behavior to preserve the invariant.
+//!
+//! The selection reaches the read paths two ways, and the two agree. A scoped
+//! collection operation carries its own invocation-local selection: the reader
+//! engine seeds it from the session-shared [`PinnedSource`] and publishes the
+//! first one it makes back to that shared cell. The `CellRead` bridge paths
+//! (`get`, `get_many`, `scan`) read the shared cell directly, and serve the
+//! collection kinds that do not run through the engine yet.
 //!
 //! Probe-and-pin is the reader's source-selection strategy:
 //!
@@ -43,32 +51,27 @@ use crate::Key;
 use crate::codec::Codec;
 use crate::segment::partition_segment_id;
 use crate::state::access::StateAccessError;
-use crate::state::cell_key::{CellKey, Scan, Section};
-use crate::state::descriptor::StructuralIdentity;
+use crate::state::cell_key::{CellKey, Section};
 use crate::state::identity::{CollectionId, StateKey};
-use crate::state::registry::MAX_KEYSET_LIMIT;
-use crate::state::session::CellRead;
-use crate::state::session::sealed::ReadAdmission;
 use crate::state::store::{CellBuffer, CoordinateBatch};
-use crate::state::{StateName, StateType};
 use crate::state_reader::backend::{CommittedCellSource, ReaderBackend};
 use crate::state_reader::cache::CacheKey;
 use crate::state_reader::partition_for_key;
 use crate::state_reader::source::{Source, ValidatedPublications};
 use bytes::Bytes;
-use futures::stream::{FuturesOrdered, Stream, StreamExt};
-use std::num::NonZeroUsize;
+use futures::stream::{FuturesOrdered, StreamExt};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::task::coop::cooperative;
 
+mod bridge;
 mod context;
 pub(crate) mod engine;
 
 pub(crate) use context::{ReaderCollectionDef, ReaderContext};
 
 /// A per-operation read-only session over a collection's validated publication
-/// snapshot. Implements [`CellRead`] only.
+/// snapshot. Implements [`CellRead`](crate::state::session::CellRead) only.
 ///
 /// It is public because it appears in the `FromSession` bounds on
 /// [`StateReader`](super::StateReader)'s read methods, mirroring the owner's
@@ -79,16 +82,20 @@ pub struct ReadSession<C: Codec, B> {
     context: ReaderContext<C, B>,
     snapshot: Arc<ValidatedPublications>,
     key: Key,
-    /// The pinned source, shared across the operation's handle clones so every
-    /// call after the first data-bearing probe addresses one source.
+    /// Bridge: the session-shared selection, so every call after the first
+    /// data-bearing probe addresses one source. The `CellRead` paths read it
+    /// directly; the engine seeds each invocation from it and publishes back.
+    /// It dies with the `CellRead` surface, once Map and Deque run through the
+    /// engine.
     pin: Arc<OnceLock<PinnedSource>>,
 }
 
 /// One operation's selected publication source: the stable [`Source`] plus
 /// that source's computed [`CollectionId`].
 ///
-/// `pub` only so the sealed reader engine can name it as its per-invocation
-/// state; the module is private, so it caps at crate visibility.
+/// `pub` is forced: it is the reader engine's `ReadInner` associated type, and
+/// the sealed engine trait is itself `pub`. Nothing re-exports it and the
+/// module is private, so it stays unreachable from outside the crate.
 #[derive(Clone)]
 pub struct PinnedSource {
     source: Source,
@@ -126,16 +133,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     /// `partition_segment_id`. The key is non-empty by construction, since
     /// empty keys are rejected at the `StateReader` boundary, so
     /// `partition_for_key` never errors here in practice.
-    fn collection_id_for(
-        &self,
-        selection: Option<&PinnedSource>,
-        source: &Source,
-    ) -> Result<CollectionId, StateAccessError> {
-        if let Some(pin) = selection
-            && pin.source == *source
-        {
-            return Ok(pin.collection.clone());
-        }
+    fn collection_id_for(&self, source: &Source) -> Result<CollectionId, StateAccessError> {
         let partition = partition_for_key(self.key.as_bytes(), source.partition_count)
             .map_err(|e| StateAccessError::store(&e))?;
         let segment = partition_segment_id(source.topic, partition, &source.group_id);
@@ -145,6 +143,19 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
             self.context.state_type,
             self.context.name.clone(),
         ))
+    }
+
+    /// `selected` when the operation already routed this source, else a fresh
+    /// routing through [`Self::collection_id_for`].
+    fn resolved_id(
+        &self,
+        selected: Option<&CollectionId>,
+        source: &Source,
+    ) -> Result<CollectionId, StateAccessError> {
+        match selected {
+            Some(id) => Ok(id.clone()),
+            None => self.collection_id_for(source),
+        }
     }
 
     fn cache_key(&self, source: &Source, cell: &CellKey) -> CacheKey {
@@ -157,18 +168,18 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         )
     }
 
-    /// One source's committed point read, cached per policy. `selection` is
-    /// the operation's already-pinned source, if any, so a pinned read reuses
-    /// its computed collection id instead of re-routing the key.
+    /// One source's committed point read, cached per policy. `selected` is the
+    /// operation's already-routed collection id for this source, if any, so a
+    /// selected read reuses it instead of re-routing the key.
     async fn cached_point(
         &self,
-        selection: Option<&PinnedSource>,
+        selected: Option<&CollectionId>,
         source: &Source,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
         match self.context.def.read_cache_ttl {
             None => {
-                let id = self.collection_id_for(selection, source)?;
+                let id = self.resolved_id(selected, source)?;
                 self.context
                     .backend
                     .cells()
@@ -184,7 +195,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 self.context
                     .cache
                     .get_cached(key, ttl, || async {
-                        let id = self.collection_id_for(selection, source)?;
+                        let id = self.resolved_id(selected, source)?;
                         self.context
                             .backend
                             .cells()
@@ -201,14 +212,14 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     /// `batch`).
     async fn cached_batch(
         &self,
-        selection: Option<&PinnedSource>,
+        selected: Option<&CollectionId>,
         source: &Source,
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
         match self.context.def.read_cache_ttl {
             None => {
-                let id = self.collection_id_for(selection, source)?;
+                let id = self.resolved_id(selected, source)?;
                 self.context
                     .backend
                     .cells()
@@ -234,7 +245,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 self.context
                     .cache
                     .get_many_cached(&keys, ttl, || async {
-                        let id = self.collection_id_for(selection, source)?;
+                        let id = self.resolved_id(selected, source)?;
                         self.context
                             .backend
                             .cells()
@@ -255,7 +266,9 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
         if let Some(pin) = selection.as_ref() {
-            return self.cached_point(Some(pin), &pin.source, cell).await;
+            return self
+                .cached_point(Some(&pin.collection), &pin.source, cell)
+                .await;
         }
         self.probe_point(selection, cell).await
     }
@@ -293,7 +306,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         while let Some((source, result)) = cooperative(ordered.next()).await {
             match result {
                 Ok(Some(value)) => {
-                    let collection = self.collection_id_for(None, source)?;
+                    let collection = self.collection_id_for(source)?;
                     *selection = Some(PinnedSource {
                         source: source.clone(),
                         collection,
@@ -311,213 +324,6 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         match first_err {
             Some(error) => Err(error),
             None => Ok(None),
-        }
-    }
-}
-
-impl<C: Codec, B: ReaderBackend<C>> ReadAdmission for ReadSession<C, B> {
-    type Permit<'s> = ();
-
-    async fn permit(&self) -> Self::Permit<'_> {}
-
-    fn attempt_current(&self) -> bool {
-        true
-    }
-}
-
-impl<C: Codec, B: ReaderBackend<C>> CellRead for ReadSession<C, B>
-where
-    C::Payload: Clone,
-{
-    fn is_terminated(&self) -> bool {
-        false
-    }
-
-    fn collection_has_ttl(&self, _state_type: StateType, _name: &StateName) -> bool {
-        self.context.def.collection.ttl.is_some()
-    }
-
-    fn collection_keyset_limit(&self, _state_type: StateType, _name: &StateName) -> usize {
-        // The persisted keyset records its own overflow. The global validated
-        // ceiling safely admits every tracked keyset regardless of the
-        // reader's local operational setting.
-        MAX_KEYSET_LIMIT
-    }
-
-    fn collection_capacity(
-        &self,
-        _state_type: StateType,
-        _name: &StateName,
-    ) -> Option<NonZeroUsize> {
-        self.context.def.collection.capacity
-    }
-
-    fn verify_state_registration(
-        &self,
-        _name: &'static str,
-        _state_type: StateType,
-        _identity: &StructuralIdentity,
-    ) -> Result<StateName, StateAccessError> {
-        // Identity was validated at acquisition against every source. The
-        // descriptor is the source of both this session's collection and the
-        // handle's asserted identity, so a self-check is redundant.
-        Ok(self.context.name.clone())
-    }
-
-    async fn get(
-        &self,
-        _state_type: StateType,
-        _name: &StateName,
-        cell: &CellKey,
-    ) -> Result<Option<Bytes>, StateAccessError> {
-        // The session-shared pin adapter over the operation-local read: seed
-        // the selection from the shared cell, read, then publish a fresh
-        // selection back. The paths that still share one pin across calls
-        // (`get_many` and `scan`, until Map and Deque run through the engine)
-        // observe exactly what they observed before.
-        let mut selection = self.pin.get().cloned();
-        let result = self.point_read(&mut selection, cell).await;
-        if let Some(pin) = selection {
-            // Discarding the `set` result is safe because unpinned reads in
-            // one operation are issued sequentially (the
-            // `SingleSourceCoherence` invariant): either the cell was empty
-            // and this is the first pin, or it already holds this selection.
-            let _ = self.pin.set(pin);
-        }
-        result
-    }
-
-    async fn get_many(
-        &self,
-        _state_type: StateType,
-        _name: &StateName,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
-        if let Some(pin) = self.pin.get() {
-            return self
-                .cached_batch(Some(pin), &pin.source, section, batch)
-                .await;
-        }
-        let sources = self.snapshot.sources();
-        // Bounded per-operation fan-out; see the ruling on the point-read
-        // `FuturesOrdered` above.
-        let mut ordered = FuturesOrdered::new();
-        for source in sources {
-            ordered.push_back(cooperative(async move {
-                (
-                    source,
-                    self.cached_batch(None, source, section, batch).await,
-                )
-            }));
-        }
-        let mut first_err = None;
-        let mut all_none: Option<CellBuffer<Option<Bytes>>> = None;
-        while let Some((source, result)) = cooperative(ordered.next()).await {
-            match result {
-                Ok(buffer) => {
-                    if buffer.iter().any(Option::is_some) {
-                        // First pin, so the set succeeds and discarding its
-                        // result is safe; see the `get` pin above.
-                        let collection = self.collection_id_for(None, source)?;
-                        let _ = self.pin.set(PinnedSource {
-                            source: source.clone(),
-                            collection,
-                        });
-                        return Ok(buffer);
-                    }
-                    if all_none.is_none() {
-                        all_none = Some(buffer);
-                    }
-                }
-                Err(error) => {
-                    if first_err.is_none() {
-                        first_err = Some(error);
-                    }
-                }
-            }
-        }
-        match (all_none, first_err) {
-            // A data-bearing buffer already returned early above. Among the
-            // remaining outcomes an error outranks an all-`None` buffer, because
-            // absence cannot be proven through a source that failed. This
-            // mirrors the point read, where a remembered error beats the `None`
-            // answers.
-            (_, Some(error)) => Err(error),
-            (Some(buffer), None) => Ok(buffer),
-            // Unreachable: the snapshot is non-empty, so at least one source
-            // answered with data, all-`None`, or an error.
-            (None, None) => Ok((0..batch.len()).map(|_| None).collect()),
-        }
-    }
-
-    fn scan<'a>(
-        &'a self,
-        _state_type: StateType,
-        _name: &'a StateName,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
-        async_stream::try_stream! {
-            if let Some(pin) = self.pin.get() {
-                let id = pin.collection.clone();
-                let inner = self.context.backend.cells().scan(&id, scan);
-                futures::pin_mut!(inner);
-                while let Some(item) = cooperative(inner.next()).await {
-                    yield item.map_err(|error| StateAccessError::store(&error))?;
-                }
-                return;
-            }
-            // Unpinned sequential probe. This is the general `CellRead::scan`
-            // contract for a fresh session. The public Map and Deque reader
-            // streams never reach it: each first reads its keyset or bounds cell
-            // through the point fan-out (`get`), which pins before any scan is
-            // issued, or yields no scan at all. This is correct behavior for an
-            // unpinned scan, not dead code. Do not delete it as unreachable.
-            let sources = self.snapshot.sources();
-            let mut first_err = None;
-            let mut pinned = false;
-            for source in sources {
-                let id = self.collection_id_for(self.pin.get(), source)?;
-                let inner = self.context.backend.cells().scan(&id, scan);
-                futures::pin_mut!(inner);
-                let mut yielded_any = false;
-                loop {
-                    match cooperative(inner.next()).await {
-                        Some(Ok(item)) => {
-                            if !yielded_any {
-                                let _ = self.pin.set(PinnedSource {
-                                    source: source.clone(),
-                                    collection: id.clone(),
-                                });
-                                yielded_any = true;
-                            }
-                            yield item;
-                        }
-                        Some(Err(error)) => {
-                            let error = StateAccessError::store(&error);
-                            if yielded_any {
-                                // Mid-stream error after the pin. Terminate,
-                                // never restart, because a restart would
-                                // double-yield or skip cells.
-                                Err(error)?;
-                            } else if first_err.is_none() {
-                                first_err = Some(error);
-                            }
-                            break;
-                        }
-                        None => break,
-                    }
-                }
-                if yielded_any {
-                    pinned = true;
-                    break;
-                }
-            }
-            // Nothing pinned: propagate a remembered error, else the stream is
-            // empty (every source completed empty).
-            if !pinned && let Some(error) = first_err {
-                Err(error)?;
-            }
         }
     }
 }

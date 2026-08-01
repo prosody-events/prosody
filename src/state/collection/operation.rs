@@ -13,7 +13,6 @@ use crate::state::descriptor::{
 use bytes::Bytes;
 use smallvec::SmallVec;
 use std::future::Future;
-use std::mem::take;
 
 /// Inline capacity of one invocation's mutation journal.
 ///
@@ -121,11 +120,11 @@ impl<'a, S: WritableStateSession, L> WriteOperation<'a, S, L> {
     ///
     /// The final fence's refusal — a stale attempt, a closed session, or
     /// termination — in which case nothing is replayed.
-    pub(super) fn merge(mut self) -> Result<(), StateAccessError> {
+    pub(super) fn merge(self) -> Result<(), StateAccessError> {
         let session = self.collection.session();
         let (state_type, name) = (self.collection.state_type(), self.collection.name());
         <S::Engine as sealed::WriteEngine<S>>::validate_write(session, &self.inner)?;
-        let journal = take(&mut self.journal);
+        let journal = self.journal;
         <S::Engine as sealed::WriteEngine<S>>::apply(
             session,
             state_type,

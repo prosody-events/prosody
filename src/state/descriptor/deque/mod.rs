@@ -119,10 +119,14 @@ pub(crate) const TRIM_MAX: usize = 2;
 
 const _: () = assert!(TRIM_MAX >= 2, "a bounded push must net a window reduction");
 
+const _: () = assert!(
+    TRIM_MAX <= u8::MAX as usize,
+    "an eviction count is returned as a `u8`"
+);
+
 /// Deque's section enum, lowered to the opaque [`Section`]. Frozen: the
-/// discriminants are a durable wire contract (the `section tinyint` column), so
-/// the [`TryFrom`] guard rejects any other value as [`UnknownDequeSection`]
-/// (`Permanent`).
+/// discriminants are a durable wire contract (the `section tinyint` column),
+/// pinned by `deque_layout_is_frozen`.
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DequeNs {
@@ -131,24 +135,6 @@ enum DequeNs {
 
     /// Data: one cell per live element.
     Entries = 1,
-}
-
-impl From<DequeNs> for i8 {
-    fn from(section: DequeNs) -> Self {
-        section as i8
-    }
-}
-
-impl TryFrom<i8> for DequeNs {
-    type Error = UnknownDequeSection;
-
-    fn try_from(value: i8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Meta),
-            1 => Ok(Self::Entries),
-            _ => Err(UnknownDequeSection(value)),
-        }
-    }
 }
 
 /// Descriptor for a codec-backed deque collection. Generic over an element
@@ -171,8 +157,11 @@ impl<T: CellType<Key = UnitKey>> CollectionSpec for DequeKind<T> {
     const KIND: CollectionKindId = CollectionKindId::Deque;
 
     fn handle<S: StateSession>(collection: Collection<S, Self>) -> DequeHandle<S, T> {
-        let (session, state_type, name) = collection.parts();
-        let scope = CellScope::new(session.clone(), state_type, name.clone());
+        // Bridge: this kind rebuilds a `CellScope` from the binding instead
+        // of running its methods as scoped operations. It dies with the
+        // `CellScope` surface.
+        let (session, state_type, name) = collection.into_parts();
+        let scope = CellScope::new(session, state_type, name);
         DequeHandle {
             entries: scope.typed(ENTRY_SECTION),
             meta: scope.typed(META_SECTION),
@@ -501,8 +490,7 @@ where
             .tail
             .checked_add(1)
             .ok_or(MetaDecodeError::IndexOverflow)?;
-        let evict = i64::try_from(evictions(window, self.entries.capacity()))
-            .map_err(|_| MetaDecodeError::IndexOverflow)?;
+        let evict = i64::from(evictions(window, self.entries.capacity()));
         let new_head = window
             .head
             .checked_add(evict)
@@ -536,8 +524,7 @@ where
             .head
             .checked_sub(1)
             .ok_or(MetaDecodeError::IndexOverflow)?;
-        let evict = i64::try_from(evictions(window, self.entries.capacity()))
-            .map_err(|_| MetaDecodeError::IndexOverflow)?;
+        let evict = i64::from(evictions(window, self.entries.capacity()));
         let new_tail = window
             .tail
             .checked_sub(evict)
@@ -701,13 +688,14 @@ impl<T> Descriptor<DequeKind<T>> {
 
 /// Slots to evict from the far end before a bounded push appends one,
 /// converging the window toward `capacity`. Zero when unbounded or already
-/// within capacity; capped at `TRIM_MAX` so one push does bounded, decode-free
-/// work. A push adds one slot, so `len + 1` slots exist after the append and
-/// the trim is that count over `capacity`.
+/// within capacity; capped at `TRIM_MAX`, which is what makes the count fit a
+/// `u8` and one push bounded, decode-free work. A push adds one slot, so
+/// `len + 1` slots exist after the append and the trim is that count over
+/// `capacity`.
 ///
 /// See the module's capacity invariant: enforcement is lazy and push-only, so a
 /// persisted window may exceed `capacity`.
-fn evictions(window: Window, capacity: Option<NonZeroUsize>) -> usize {
+fn evictions(window: Window, capacity: Option<NonZeroUsize>) -> u8 {
     // Unbounded: never read `window.len()`, so a push on an over-wide window
     // (a span `Window::len` cannot measure — the `tail − head` `i64`
     // subtraction overflows, or on a 32-bit target the result exceeds `usize`;
@@ -724,12 +712,12 @@ fn evictions(window: Window, capacity: Option<NonZeroUsize>) -> usize {
     let Ok(len) = window.len() else {
         return (i64::MAX as usize)
             .saturating_sub(cap.get() - 1)
-            .min(TRIM_MAX);
+            .min(TRIM_MAX) as u8;
     };
     // `len − (cap − 1)`, algebraically `(len + 1) − cap` but overflow-free
     // (`cap ≥ 1`): at `len == cap == usize::MAX` this is the correct single
     // eviction, where `(len + 1) − cap` would overflow and saturate to the max.
-    len.saturating_sub(cap.get() - 1).min(TRIM_MAX)
+    len.saturating_sub(cap.get() - 1).min(TRIM_MAX) as u8
 }
 
 /// Re-homes a bounds-cell access or codec error under the deque's entry-codec
@@ -794,11 +782,6 @@ impl Window {
             .ok_or(MetaDecodeError::IndexOverflow)
     }
 }
-
-/// Error converting an `i8` that matches no [`DequeNs`] variant.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("unknown deque section discriminant: {0}")]
-struct UnknownDequeSection(i8);
 
 /// Error deriving the deque's `Meta` bookkeeping. Always `Permanent`: a
 /// disordered or overflowing window will not start being valid on retry. A

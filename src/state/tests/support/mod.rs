@@ -356,6 +356,7 @@ where
     /// write operation can stage anything to replay.
     fn stage_cell(
         &self,
+        _permit: &OpPermit<'_>,
         _state_type: StateType,
         _name: &StateName,
         _cell: &CellKey,

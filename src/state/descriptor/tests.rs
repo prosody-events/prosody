@@ -70,9 +70,7 @@ pub(crate) fn bind_registered<DESC>(
 where
     DESC: StateDescriptor,
 {
-    let mut registry = CollectionDefRegistry::default();
-    registry.register(&descriptor, CollectionDef::new(None))?;
-    let session = test_session(loader, registry);
+    let session = test_session(loader, value_registry(&descriptor)?);
     descriptor
         .bind(&session)
         .map_err(|e| eyre!("bind failed: {e}"))
@@ -701,10 +699,11 @@ fn collection_ops_export_operation_spans() -> Result<()> {
     Ok(())
 }
 
-/// Behavioral arm of the `CollectionScopeContainment` invariant. A view pinned
-/// to one collection cannot address another. The API's lifetimes and bounds
-/// enforce that guarantee at the type level. This test pins the matching
-/// runtime behavior.
+/// Behavioral arm of the collection-containment invariant: a handle bound to
+/// one collection cannot address another. Value carries `(state_type, name)`
+/// on its [`Collection`] binding; Map and Deque carry it on the `CellScope`
+/// they still rebuild. Both are enforced at the type level; this test pins the
+/// matching runtime behavior.
 mod scope_containment {
     use super::*;
     use crate::state::order_codec::Utf8KeyCodec;

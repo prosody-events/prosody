@@ -124,7 +124,7 @@ const KEYSET_MAX_ENTRIES: usize = KEYSET_BYTE_CEILING / 4;
 
 /// Map's section enum, lowered to the opaque [`Section`]. Frozen: the
 /// discriminants are a durable wire contract (the `section tinyint` column),
-/// pinned by `map_layout_is_frozen` and the [`TryFrom`] round-trip.
+/// pinned by `map_layout_is_frozen`.
 #[repr(i8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MapNs {
@@ -133,24 +133,6 @@ enum MapNs {
 
     /// Data: one cell per key.
     Entries = 1,
-}
-
-impl From<MapNs> for i8 {
-    fn from(section: MapNs) -> Self {
-        section as i8
-    }
-}
-
-impl TryFrom<i8> for MapNs {
-    type Error = UnknownMapSection;
-
-    fn try_from(value: i8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Meta),
-            1 => Ok(Self::Entries),
-            _ => Err(UnknownMapSection(value)),
-        }
-    }
 }
 
 /// The keyset cell's logical address within the `Meta` section: a single fixed
@@ -349,8 +331,11 @@ where
     const KIND: CollectionKindId = CollectionKindId::Map;
 
     fn handle<S: StateSession>(collection: Collection<S, Self>) -> MapHandle<S, KC, V> {
-        let (session, state_type, name) = collection.parts();
-        let scope = CellScope::new(session.clone(), state_type, name.clone());
+        // Bridge: this kind rebuilds a `CellScope` from the binding instead
+        // of running its methods as scoped operations. It dies with the
+        // `CellScope` surface.
+        let (session, state_type, name) = collection.into_parts();
+        let scope = CellScope::new(session, state_type, name);
         MapHandle {
             entries: scope.typed(ENTRY_SECTION),
             keyset: scope.typed(META_SECTION),
@@ -897,7 +882,7 @@ where
         &self,
         permit: &S::MutatePermit<'_>,
         coordinate: Coordinate,
-        keys: Vec<Coordinate>,
+        mut keys: Vec<Coordinate>,
         limit: usize,
         ttl: bool,
     ) -> Result<(), MapStateError<CellCodecError<V>>> {
@@ -927,11 +912,8 @@ where
                 if would_exceed {
                     return self.write_keyset(permit, Keyset::Overflowed).await;
                 }
-                let mut updated = Vec::with_capacity(keys.len() + 1);
-                updated.extend_from_slice(&keys[..position]);
-                updated.push(coordinate);
-                updated.extend_from_slice(&keys[position..]);
-                self.write_keyset(permit, Keyset::Tracked(updated)).await
+                keys.insert(position, coordinate);
+                self.write_keyset(permit, Keyset::Tracked(keys)).await
             }
         }
     }
@@ -1098,11 +1080,6 @@ fn decode_tracked(bytes: &Bytes) -> Result<Keyset, KeysetFrameError> {
     }
     Ok(Keyset::Tracked(keys))
 }
-
-/// Error converting an `i8` that matches no [`MapNs`] variant.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("unknown map section discriminant: {0}")]
-struct UnknownMapSection(i8);
 
 /// Error returned by [`MapHandle`] operations.
 ///

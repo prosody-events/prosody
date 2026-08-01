@@ -15,6 +15,11 @@ use crate::state::{StateBackend, StateName, StateType, StoreOutcome};
 use bytes::Bytes;
 
 /// The engine every per-event session binds.
+///
+/// `pub` is forced: it is the value of the sealed `Session::Engine` associated
+/// type, which is itself `pub`. The module's `pub(crate)` visibility is the
+/// seal — nothing re-exports the type, and every method it carries lives on a
+/// trait a downstream crate cannot name.
 pub struct OwnerEngine;
 
 /// Bridge: the owner engine still drives the session's cell-command surface
@@ -76,15 +81,20 @@ impl<S: CellWrite> sealed::WriteEngine<S> for OwnerEngine {
         session: &S,
         state_type: StateType,
         name: &StateName,
-        _inner: &S::MutatePermit<'_>,
+        inner: &S::MutatePermit<'_>,
         journal: MutationJournal,
     ) {
+        // The mutate permit derefs to the read permit the staging sink demands
+        // as its admission witness.
+        let permit = &**inner;
         for mutation in journal {
             match mutation {
                 Mutation::Set { cell, bytes } => {
-                    session.stage_cell(state_type, name, &cell, Some(bytes));
+                    session.stage_cell(permit, state_type, name, &cell, Some(bytes));
                 }
-                Mutation::Clear { cell } => session.stage_cell(state_type, name, &cell, None),
+                Mutation::Clear { cell } => {
+                    session.stage_cell(permit, state_type, name, &cell, None);
+                }
             }
         }
     }

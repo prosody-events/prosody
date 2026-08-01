@@ -105,7 +105,7 @@ impl Codec for MessageRefCodec {
 pub struct MessageResolver<L>(PhantomData<fn() -> L>);
 
 // `L: 'static` — a resolver only ever borrows a session's loader, and
-// `CellRead::Loader` is always `'static`; the bound lets the `&'s L`
+// `StateSession::Loader` is always `'static`; the bound lets the `&'s L`
 // context GAT hold for any `'s`.
 impl<L: MessageLoader + 'static> CellResolver for MessageResolver<L> {
     type Context<'s> = &'s L;

@@ -327,6 +327,11 @@ impl<L, T> CellFamily<L, T> {
 /// at once from private fields, there is no binding token that could be paired
 /// with another session, and a collection for another session type or layout is
 /// a different type.
+///
+/// The binding deliberately does *not* capture the collection's
+/// [`CollectionDef`](crate::state::registry::CollectionDef): every
+/// configuration query still goes to the session per call. Capturing it waits
+/// for the first caller that reads configuration inside a scoped operation.
 #[derive(Educe)]
 #[educe(Clone(bound = "S: Clone"))]
 pub struct Collection<S, L> {
@@ -356,8 +361,8 @@ impl<S, L> Collection<S, L> {
     /// Bridge: the binding's parts, for a collection kind that still builds a
     /// `CellScope` from them. Dies with the old cell-command surface, once
     /// every kind runs through the engine.
-    pub(in crate::state) fn parts(&self) -> (&S, StateType, &StateName) {
-        (&self.session, self.state_type, &self.name)
+    pub(in crate::state) fn into_parts(self) -> (S, StateType, StateName) {
+        (self.session, self.state_type, self.name)
     }
 }
 
@@ -525,7 +530,7 @@ fn cell_key<L, T: CellType>(family: CellFamily<L, T>, key: &KeyOf<T>) -> CellKey
 ///
 /// A codec error (Permanent) when the bytes do not decode, or a resolution
 /// error from the resolver.
-fn resolve_cell<'a, S, T>(
+pub(in crate::state) fn resolve_cell<'a, S, T>(
     session: &'a S,
     bytes: Bytes,
 ) -> impl Future<Output = Result<ResolvedOf<T>, CellStateError<CellCodecError<T>>>> + Send + 'a
@@ -568,10 +573,12 @@ pub(in crate::state) fn encode_cell<C: Codec>(
     Ok(buf)
 }
 
-/// Guards every owner cell operation: a session whose partition is shutting
-/// down, whose event is cancelled, or whose pinned attempt epoch no longer
-/// matches the live one (a handle or stream leaked past its dispatch attempt)
-/// refuses state access with [`StateAccessError::Terminated`].
+/// Guards every cell operation on either session kind: a session whose
+/// partition is shutting down, whose event is cancelled, or whose pinned
+/// attempt epoch no longer matches the live one (a handle or stream leaked past
+/// its dispatch attempt) refuses state access with
+/// [`StateAccessError::Terminated`]. Only the per-event session can be in any
+/// of those states, so the guard is vacuous on the published reader.
 ///
 /// # Errors
 ///

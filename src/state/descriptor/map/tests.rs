@@ -8,24 +8,6 @@
 use super::*;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 
-/// The `Meta`/`Entries` discriminants round-trip through `i8`, and every
-/// other value is rejected (never coerced to a variant).
-#[test]
-fn prop_map_section_round_trip() {
-    fn prop(value: i8) -> TestResult {
-        match value {
-            0 | 1 => {
-                TestResult::from_bool(MapNs::try_from(value).is_ok_and(|ns| i8::from(ns) == value))
-            }
-            _ => TestResult::from_bool(matches!(
-                MapNs::try_from(value),
-                Err(UnknownMapSection(v)) if v == value
-            )),
-        }
-    }
-    QuickCheck::new().quickcheck(prop as fn(i8) -> TestResult);
-}
-
 /// The frozen discriminants and the single `Meta` cell address (a durable
 /// contract — the sections lower to `0`/`1` and the keyset encodes to `[2]`).
 /// Coordinates `[0]`/`[1]` are deliberately retired (they once held two min/max

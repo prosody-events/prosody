@@ -7,7 +7,7 @@
 //! the same reason.
 
 use crate::combine;
-use crate::selfban::scan;
+use crate::selfban::{pattern_shadows, scan};
 use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens, quote, quote_spanned};
 use std::mem::take;
@@ -16,36 +16,19 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::{Visit, visit_type_path};
 use syn::{
-    Attribute, Error, FnArg, GenericArgument, Ident, ImplItem, ImplItemFn, ItemImpl, Pat,
-    PathArguments, ReceiverKind, ReturnType, Token, Type, TypePath, WherePredicate, parenthesized,
+    Attribute, Error, FnArg, GenericArgument, Ident, ImplItem, ImplItemFn, ItemImpl, PathArguments,
+    ReceiverKind, ReturnType, Token, Type, TypePath, WherePredicate, parenthesized,
 };
-
-/// Expands the attribute over one handle `impl` block. Malformed input still
-/// emits the block, so the author sees the rejection rather than a cascade of
-/// "method not found" errors.
-pub(crate) fn expand(args: TokenStream, item: TokenStream) -> TokenStream {
-    let mut item: ItemImpl = match syn::parse2(item) {
-        Ok(item) => item,
-        Err(error) => return error.into_compile_error(),
-    };
-    let mut errors = match syn::parse2::<Args>(args) {
-        Ok(args) => rewrite(&mut item, &args),
-        Err(error) => Some(error),
-    };
-    let mut out = item.into_token_stream();
-    if let Some(error) = errors.take() {
-        out.extend(error.into_compile_error());
-    }
-    out
-}
 
 /// The attribute's arguments: `field = <ident>, session = <ident>`.
 pub(crate) struct Args {
     /// The handle field holding the bound collection.
     field: Ident,
-    /// The impl's session type parameter, or `None` when unnamed.
-    session: Option<Ident>,
-    /// The `field` argument's span — where a missing `session` is reported.
+    /// The impl's session type parameter, which the write and resolver bounds
+    /// on marked methods are attached to.
+    session: Ident,
+    /// The `field` argument's span — where a rejection about the whole block
+    /// is reported.
     span: Span,
 }
 
@@ -54,25 +37,38 @@ impl Parse for Args {
         let mut field: Option<Ident> = None;
         let mut session: Option<Ident> = None;
         let mut span = input.span();
-        let pairs = Punctuated::<Pair, Token![,]>::parse_terminated(input)?;
-        for pair in pairs {
-            if pair.name == "field" {
+        for pair in Punctuated::<Pair, Token![,]>::parse_terminated(input)? {
+            let slot = if pair.name == "field" {
                 span = pair.name.span();
-                field = Some(pair.value);
+                &mut field
             } else if pair.name == "session" {
-                session = Some(pair.value);
+                &mut session
             } else {
                 return Err(Error::new(
                     pair.name.span(),
                     "expected `field = <ident>` or `session = <ident>`",
                 ));
+            };
+            if slot.is_some() {
+                return Err(Error::new(
+                    pair.name.span(),
+                    format!("`{}` is given twice; each argument appears once", pair.name),
+                ));
             }
+            *slot = Some(pair.value);
         }
         let Some(field) = field else {
             return Err(Error::new(
                 span,
                 "`#[collection_methods]` needs `field = <ident>` naming the handle field that \
                  holds the bound collection",
+            ));
+        };
+        let Some(session) = session else {
+            return Err(Error::new(
+                span,
+                "`#[collection_methods]` needs `session = <ident>` naming the impl's session type \
+                 parameter; the write and resolver bounds on marked methods are attached to it",
             ));
         };
         Ok(Self {
@@ -141,6 +137,61 @@ impl Parse for MarkerArgs {
     }
 }
 
+/// Collects the types a marked method resolves, keeping each one once.
+struct ResolvedFinder {
+    found: Vec<Type>,
+}
+
+impl ResolvedFinder {
+    /// Records one resolver type unless an identical one is already held: the
+    /// same type reached twice attaches one predicate, not two.
+    fn push(&mut self, resolved: &Type) {
+        let rendered = resolved.to_token_stream().to_string();
+        if !self
+            .found
+            .iter()
+            .any(|seen| seen.to_token_stream().to_string() == rendered)
+        {
+            self.found.push(resolved.clone());
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for ResolvedFinder {
+    fn visit_type_path(&mut self, node: &'ast TypePath) {
+        if let Some(last) = node.path.segments.last()
+            && last.ident == "ResolvedOf"
+            && let PathArguments::AngleBracketed(arguments) = &last.arguments
+            && let Some(GenericArgument::Type(resolved)) = arguments.args.first()
+        {
+            self.push(resolved);
+        }
+        visit_type_path(self, node);
+    }
+}
+
+/// Expands the attribute over one handle `impl` block. Malformed input still
+/// emits the block, so the author sees the rejection rather than a cascade of
+/// "method not found" errors.
+pub(crate) fn expand(args: TokenStream, item: TokenStream) -> TokenStream {
+    let mut item: ItemImpl = match syn::parse2(item) {
+        Ok(item) => item,
+        Err(error) => return error.into_compile_error(),
+    };
+    let errors = match syn::parse2::<Args>(args) {
+        Ok(args) => rewrite(&mut item, &args),
+        Err(error) => {
+            strip_markers(&mut item);
+            Some(error)
+        }
+    };
+    let mut out = item.into_token_stream();
+    if let Some(error) = errors {
+        out.extend(error.into_compile_error());
+    }
+    out
+}
+
 /// Rewrites every marked method of `item` in place, returning the combined
 /// diagnostic. Split out of the entry point so the diagnostic tests can drive
 /// it from `syn::parse_str` fixtures, whose tokens carry real source
@@ -156,19 +207,7 @@ pub(crate) fn rewrite(item: &mut ItemImpl, args: &Args) -> Option<Error> {
             Ok(None) => {}
             Ok(Some(marker)) => {
                 found_any = true;
-                let Some(session) = args.session.clone() else {
-                    combine(
-                        &mut errors,
-                        Error::new(
-                            args.span,
-                            "`#[collection_methods]` needs `session = <ident>` naming the impl's \
-                             session type parameter; the write and resolver bounds on marked \
-                             methods are attached to it",
-                        ),
-                    );
-                    continue;
-                };
-                if let Err(error) = lower(function, &marker, &args.field, &session) {
+                if let Err(error) = lower(function, &marker, &args.field, &args.session) {
                     combine(&mut errors, error);
                 }
             }
@@ -188,6 +227,17 @@ pub(crate) fn rewrite(item: &mut ItemImpl, args: &Args) -> Option<Error> {
         );
     }
     errors
+}
+
+/// Drops every operation marker without lowering anything. An unparsable
+/// argument list leaves no scope to lower into, and a surviving `#[read]` or
+/// `#[write]` would bury the rejection under "cannot find attribute" errors.
+fn strip_markers(item: &mut ItemImpl) {
+    for entry in &mut item.items {
+        if let ImplItem::Fn(function) = entry {
+            drop(take_marker(function));
+        }
+    }
 }
 
 /// Removes and parses the operation marker from one method's attributes.
@@ -247,10 +297,7 @@ fn lower(
     field: &Ident,
     session: &Ident,
 ) -> Result<(), Error> {
-    if let Some(error) = validate(function, marker) {
-        return Err(error);
-    }
-    let is_async = function.sig.asyncness.is_some();
+    validate(function, marker)?;
 
     let op = &marker.op;
     let body = &function.block;
@@ -259,15 +306,7 @@ fn lower(
         Scope::Read => quote_spanned!(at => self.#field.read(async move |#op| #body)),
         Scope::Write => quote_spanned!(at => self.#field.write(async move |#op| #body)),
     };
-    function.block = if is_async {
-        syn::parse2(quote_spanned!(at => { #call.await }))?
-    } else {
-        // A non-async marked method's written return type is its stream; the
-        // authored body is that stream's async plan, and the private driver
-        // turns the plan into the stream. Lowering here is what lets the
-        // author write `.await` in an ordinary-looking stream body.
-        syn::parse2(quote_spanned!(at => { crate::state::collection::drive_plan(#call) }))?
-    };
+    function.block = syn::parse2(quote_spanned!(at => { #call.await }))?;
 
     // Bounds are the macro's own tokens, not the author's: emitting them at
     // the attribute (rather than at the authored block) keeps a bound-level
@@ -279,6 +318,8 @@ fn lower(
             #session: crate::state::collection::WritableStateSession
         ))?);
     }
+    // `'__ctx` is the macro's own lifetime name; an authored `'__ctx` on a
+    // marked method collides with it.
     for resolved in resolver_types(marker, &function.sig.output) {
         added.push(syn::parse2(quote!(
             for<'__ctx> crate::state::descriptor::ContextOf<'__ctx, #resolved>:
@@ -294,11 +335,10 @@ fn lower(
 
 /// Rejects everything about one marked method that must be fixed before its
 /// body can be lowered: the receiver shape, an operation identifier the
-/// signature or body would shadow, a streaming write, and any `self`
+/// signature or body would shadow, a non-`async` method, and any `self`
 /// reference.
-fn validate(function: &ImplItemFn, marker: &Marker) -> Option<Error> {
+fn validate(function: &ImplItemFn, marker: &Marker) -> Result<(), Error> {
     let mut errors: Option<Error> = None;
-    let is_async = function.sig.asyncness.is_some();
 
     match function.sig.inputs.first() {
         Some(FnArg::Receiver(receiver)) => match &receiver.kind {
@@ -337,14 +377,11 @@ fn validate(function: &ImplItemFn, marker: &Marker) -> Option<Error> {
         let FnArg::Typed(typed) = argument else {
             continue;
         };
-        let Pat::Ident(pattern) = typed.pat.as_ref() else {
-            continue;
-        };
-        if pattern.ident == marker.op {
+        for span in pattern_shadows(&typed.pat, &marker.op) {
             combine(
                 &mut errors,
                 Error::new(
-                    pattern.ident.span(),
+                    span,
                     format!(
                         "`{}` names the scoped operation inside this body; rename the argument",
                         marker.op
@@ -354,13 +391,13 @@ fn validate(function: &ImplItemFn, marker: &Marker) -> Option<Error> {
         }
     }
 
-    if marker.scope == Scope::Write && !is_async {
+    if function.sig.asyncness.is_none() {
         combine(
             &mut errors,
             Error::new(
                 marker.span,
-                "a `#[write(op)]` method is `async`: it acquires write admission once, and no \
-                 write method streams",
+                "a marked collection method is `async`: it acquires admission once per \
+                 invocation, and no marked method streams",
             ),
         );
     }
@@ -392,43 +429,24 @@ fn validate(function: &ImplItemFn, marker: &Marker) -> Option<Error> {
         );
     }
 
-    errors
+    match errors {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// The types this method resolves: the marker's explicit `resolve(T)`
 /// overrides, or every `ResolvedOf<T>` appearing in the written return type.
 fn resolver_types(marker: &Marker, output: &ReturnType) -> Vec<Type> {
-    if !marker.resolve.is_empty() {
-        return marker.resolve.clone();
-    }
-    let ReturnType::Type(_, ty) = output else {
-        return Vec::new();
-    };
     let mut finder = ResolvedFinder { found: Vec::new() };
-    finder.visit_type(ty);
-    finder.found
-}
-
-struct ResolvedFinder {
-    found: Vec<Type>,
-}
-
-impl<'ast> Visit<'ast> for ResolvedFinder {
-    fn visit_type_path(&mut self, node: &'ast TypePath) {
-        if let Some(last) = node.path.segments.last()
-            && last.ident == "ResolvedOf"
-            && let PathArguments::AngleBracketed(arguments) = &last.arguments
-            && let Some(GenericArgument::Type(resolved)) = arguments.args.first()
-        {
-            let rendered = resolved.to_token_stream().to_string();
-            if !self
-                .found
-                .iter()
-                .any(|seen| seen.to_token_stream().to_string() == rendered)
-            {
-                self.found.push(resolved.clone());
-            }
+    if marker.resolve.is_empty() {
+        if let ReturnType::Type(_, ty) = output {
+            finder.visit_type(ty);
         }
-        visit_type_path(self, node);
+    } else {
+        for resolved in &marker.resolve {
+            finder.push(resolved);
+        }
     }
+    finder.found
 }

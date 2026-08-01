@@ -3,9 +3,9 @@
 //! partition's raw cell ops and [`CellView`] wraps them in a [`CellType`]'s
 //! codecs and resolver; the raw sinks are **private to this module**, so a
 //! collection kind (a sibling module) can reach a cell only through the typed
-//! surface. The codec/resolver pair the typing runs through is shared with the
-//! scoped-operation boundary in [`crate::state::collection`]; this module dies
-//! once Map and Deque run through that engine too.
+//! surface. Decoding and resolving is the *same* pair the scoped-operation
+//! boundary in [`crate::state::collection`] uses; this module dies once Map and
+//! Deque run through that engine too.
 
 use super::{
     CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession, KeyOf,
@@ -13,7 +13,7 @@ use super::{
 };
 use crate::state::StateAccessError;
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
-use crate::state::collection::{decode_cell, encode_cell, ensure_live};
+use crate::state::collection::{encode_cell, ensure_live, resolve_cell};
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::session::{CellRead, CellWrite};
 use crate::state::store::{CELL_BATCH, CellBuffer, CoordinateBatch};
@@ -45,14 +45,8 @@ pub(crate) type KeyItem<T> = Result<KeyOf<T>, CellStateError<CellCodecError<T>>>
 /// with `Self::typed`; the raw byte ops stay module-private, so a cell's
 /// bytes are only ever spoken through its codecs — an [`OrderedKeyCodec`] for
 /// the address, a [`Codec`](crate::codec::Codec) for the value. Cheap `Clone`.
-///
-/// The type is `pub` because it names a parameter of the public
-/// [`CollectionSpec`](super::CollectionSpec)`::handle`, but it is *sealed*: its
-/// constructor is crate-internal and its fields private, so downstream code can
-/// hold one only where the framework hands it in and can never mint one — the
-/// containment invariant survives exposure.
 #[derive(Clone)]
-pub struct CellScope<S> {
+pub(crate) struct CellScope<S> {
     session: S,
     state_type: StateType,
     name: StateName,
@@ -88,14 +82,14 @@ impl<S> CellScope<S> {
             _marker: PhantomData,
         }
     }
-}
 
-impl<S: CellRead> CellScope<S> {
     /// The bound session, for a typed view to extract a resolver context from.
     fn session(&self) -> &S {
         &self.session
     }
+}
 
+impl<S: CellRead> CellScope<S> {
     /// Whether this collection carries a TTL — a cheap, allocation-free
     /// registry lookup the Map keyset write consults per `set` so the keyset
     /// cell co-expires with its entries (`KeysetPresence`).
@@ -254,8 +248,8 @@ impl<S: CellRead, T: CellType> CellView<S, T> {
         &self.scope.name
     }
 
-    /// Acquires the session operation gate for a read — the top of every
-    /// gated public read wrapper (the handles' `get`/`len`/stream inits). The
+    /// Acquires the session operation gate for a read — the top of every Map
+    /// and Deque public read wrapper (their `get`/`len`/stream inits). The
     /// returned `S::Permit` is the witness the view's read sinks demand.
     pub(in crate::state::descriptor) async fn read_permit(&self) -> S::Permit<'_> {
         self.scope.session().permit().await
@@ -439,7 +433,11 @@ impl<S: CellRead, T: CellType> CellView<S, T> {
                 // per-item `cooperative` under `buffered` is the coop checkpoint
                 // this presence-only path lacks — NOT a resolving fan-out (a
                 // per-chunk checkpoint is insufficient: ~128 warm chunks would
-                // drain the budget before a forced yield).
+                // drain the budget before a forced yield). The fan-out is a
+                // no-op wrapper on purpose: `cooperative` is the only per-item
+                // budget checkpoint reachable here, since tokio's `rt` feature
+                // is off and `consume_budget` is therefore uncallable. Do not
+                // re-litigate the empty `buffered` window.
                 let emit = stream::iter(chunk?)
                     .map(|(key, slot)| {
                         cooperative(async move {
@@ -693,40 +691,23 @@ where
         Ok(resolved)
     }
 
-    /// Decodes and resolves raw cell bytes into the exposed value — the private
-    /// helper [`Self::get`] and [`Self::scan`] share. `get` decodes and
+    /// Decodes and resolves raw cell bytes into the exposed value — the
+    /// private helper [`Self::get`] and [`Self::scan`] share, delegating to the
+    /// single decode/resolve pair in [`crate::state::collection`]. `get`
     /// resolves under its point permit; `scan` resolves each yielded
-    /// `(CellKey, Bytes)` pair gate-free. Takes no permit: a resolver's only
-    /// session capability is `()` or `&Loader` ([`FromSession`]), never a cell
-    /// op, so resolution touches no cell state and needs no gate (which is why
-    /// a resolver that re-entered the gate would deadlock — see
-    /// [`CellResolver`]).
-    ///
-    /// Desugared `-> impl Future + Send + 'a` (with the synchronous decode
-    /// hoisted before the async block) so the `Send` bound is **stated**, not
-    /// inferred: a `.map(|item| cooperative(...resolve_bytes...))` fan-out
-    /// buffered under `.buffered(N)` requires the per-item futures `Send` for a
-    /// higher-ranked lifetime so the whole collection stream stays `Send` (it
-    /// is driven under `KeyManager`'s `buffer_unordered`), which an `async
-    /// fn`'s inferred `Send` is "not general enough" to satisfy. The
-    /// explicit bound also removes the need for the `manual_async_fn` shape
-    /// a single-async-block `async fn` would trip.
+    /// `(CellKey, Bytes)` pair gate-free. Neither passes a permit: a resolver's
+    /// only session capability is `()` or `&Loader` ([`FromSession`]), never a
+    /// cell op, so resolution touches no cell state and needs no gate.
     ///
     /// # Errors
     ///
     /// Returns a codec error (Permanent) when the bytes do not decode, or a
     /// resolution error from the resolver.
-    fn resolve_bytes<'a>(
-        &'a self,
+    fn resolve_bytes(
+        &self,
         bytes: Bytes,
-    ) -> impl Future<Output = Result<ResolvedOf<T>, CellStateError<CellCodecError<T>>>> + Send + 'a
-    {
-        let stored = decode_cell::<T::Codec>(bytes);
-        async move {
-            let stored = stored.map_err(CellStateError::Codec)?;
-            let ctx = <ContextOf<'a, T> as FromSession<'a, S>>::from_session(self.scope.session());
-            Ok(<T::Resolver as CellResolver>::resolve(ctx, stored).await?)
-        }
+    ) -> impl Future<Output = Result<ResolvedOf<T>, CellStateError<CellCodecError<T>>>> + Send {
+        resolve_cell::<S, T>(self.scope.session(), bytes)
     }
 
     /// Scans this section's cells in key order over the typed range

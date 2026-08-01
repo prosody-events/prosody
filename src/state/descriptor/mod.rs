@@ -5,8 +5,9 @@
 //! the consumer to mint a [`Registered`] capability handle. A handler binds
 //! that handle via
 //! [`EventContext::state`](crate::consumer::event_context::EventContext::state)
-//! to get a typed handle whose `get`/`set` read and write the cell committed
-//! by the previous event on the key. `state` takes the handle, never a raw
+//! to get a typed handle whose `get` reads the cell committed by the previous
+//! event on the key and whose `set` stages a write into the invocation's
+//! journal. `state` takes the handle, never a raw
 //! descriptor, so a handler can reach only collections it registered.
 //!
 //! # Composed cell types
@@ -29,9 +30,9 @@
 //! [`WithResolver`]; the consumer layer's Kafka message cell is exactly that
 //! pairing. To address a family of cells by a key, lift a single-cell type
 //! through [`Keyed`]. `src/state` never speaks a cell's bytes — key or
-//! value — directly; only its codecs do, and the compiler now enforces this:
-//! the byte-level sinks live in the private `view` submodule as items private
-//! to it, unreachable from the sibling collection kinds.
+//! value — directly; only its codecs do. The one decode/encode pair every
+//! typed cell passes through lives in [`crate::state::collection`], which owns
+//! that boundary.
 //!
 //! A [`CellResolver`] is **session-free**: it declares the capability it needs
 //! as [`CellResolver::Context`] and the framework extracts that context from
@@ -41,10 +42,12 @@
 //! resolver trait as a plain const, symmetric with [`Codec::FORMAT_ID`].
 //!
 //! Every descriptor asserts a [`StructuralIdentity`] — the frozen
-//! `(kind, codec id, resolver id, key codec id)` tuple. Codec, resolver, and
-//! key codec are all part of the durable contract: the codec types the stored
-//! cell, the resolver maps it to and from the exposed value, and the key codec
-//! orders keyed kinds, so swapping any silently would change what a cell means.
+//! `(kind, codec id, resolver id, key codec id)` tuple. Swapping any of them
+//! silently would change what a cell means: the codec types the stored cell,
+//! the resolver maps it to and from the exposed value, and the key codec orders
+//! keyed kinds. The codec and key-codec tokens are part of the *durable*
+//! contract; the resolver token is checked in process only (see
+//! [`StructuralIdentity::resolver_id`]).
 //! The identity is checked at registration (same `(state_type, name)` ⇒ same
 //! identity), at bind, and against the group-global durable identity table on
 //! first use, so a process carrying an incompatible descriptor fails loudly
@@ -53,19 +56,18 @@
 //! # Exposure
 //!
 //! Users define codecs, resolvers, and cell types (all public). Defining
-//! collection *kinds* is deliberately unexposed for now: `CellView` is
-//! crate-internal, and while [`CellScope`] and [`CollectionSpec`] are
-//! nameable downstream (they ride public signatures), the scope's
-//! view-minting surface is not — the structure is authoring-ready and opening
-//! it later is purely additive visibility.
+//! collection *kinds* is deliberately unexposed: `CellScope` and `CellView` are
+//! crate-internal, and [`CollectionSpec`] — nameable downstream because it
+//! names a public associated type — is *sealed*, so a kind can only be declared
+//! inside this crate.
 //!
-//! [`StateDescriptor`] itself is **sealed** (by the crate-private
+//! [`StateDescriptor`] is sealed the same way (by the crate-private
 //! `SealedDescriptor` supertrait): a downstream crate can register and bind the
 //! framework's descriptors but cannot add its own impl, so no custom descriptor
 //! can receive the raw, gate-free [`CellRead`] session from `bind` and reach
-//! cells outside the KV4 session gate. This closes the one hole
-//! `CollectionSpec`'s Exposure note (on [`CollectionSpec`]) does not — that
-//! seals cell *reach* for kinds, this seals descriptor *authorship*.
+//! cells outside the per-event session gate. The two seals cover different
+//! things — [`CollectionSpec`] seals cell *reach* for kinds, this seals
+//! descriptor *authorship*.
 
 use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -93,8 +95,7 @@ mod view;
 pub use deque::{DequeDescriptor, DequeHandle, DequeStateError, deque_state};
 pub use map::{MapDescriptor, MapHandle, MapStateError, map_state};
 pub use value::{ValueDescriptor, ValueHandle, ValueKind, value_state};
-pub use view::CellScope;
-pub(crate) use view::CellView;
+pub(crate) use view::{CellScope, CellView};
 
 /// The point-get streams' chunk width: the granularity of both the per-chunk
 /// gate hold (one read permit per chunk, dropped with the chunk future's scope
@@ -358,7 +359,7 @@ pub trait DescriptorIdentity {
 /// lint), so only the framework's two descriptor carriers implement it —
 /// [`Descriptor<K>`] (with its public
 /// [`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`] aliases) and the
-/// crate-internal lifecycle tunnel (`LifecycleAccess` in
+/// crate-internal access tunnels (`LifecycleAccess` and `MarkerAccess` in
 /// [`crate::state::session`]). A downstream crate can name [`StateDescriptor`]
 /// in bounds and call `bind`, but cannot add an impl — so it can never hand its
 /// own `bind` the raw, gate-free [`CellRead`] session and reach cells outside
@@ -381,17 +382,23 @@ pub(crate) use sealed::SealedDescriptor;
 /// [`EventContext::state`](crate::consumer::event_context::EventContext::state),
 /// which binds against the context's per-event session. Binding validates
 /// registration + structural identity through the session's
-/// [`verify_state_registration`] and returns an owned, `Clone` handle that
-/// wraps the session's byte cells with the descriptor's typing.
+/// [`verify_state_registration`] and returns an owned, `Clone` handle over the
+/// bound collection, whose methods each run as one scoped operation.
 ///
-/// Sealed by the crate-private `SealedDescriptor` supertrait: the two impls are
-/// the framework's own [`Descriptor<K>`] and the lifecycle tunnel, so `bind`'s
-/// raw-session access stays framework-only (see the module's Exposure note).
+/// Sealed by the crate-private `SealedDescriptor` supertrait: the only impls
+/// are the framework's own [`Descriptor<K>`] and its crate-internal access
+/// tunnels, so `bind`'s raw-session access stays framework-only (see the
+/// module's Exposure note).
 ///
 /// [`verify_state_registration`]: CellRead::verify_state_registration
 pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     /// Typed handle returned by [`Self::bind`]; owns a clone of the binding
     /// [`CellRead`] session.
+    ///
+    /// The bound stays [`CellRead`] rather than [`StateSession`] — which
+    /// [`CollectionSpec::Handle`] uses — because `bind` is what *validates* the
+    /// session, through [`CellRead::verify_state_registration`]. The two
+    /// converge when the capability traits collapse into [`StateSession`].
     type Handle<S: CellRead>;
 
     /// Validates registration + structural identity and returns the typed
@@ -527,9 +534,9 @@ impl<D> Registered<D> {
 
 /// Per-kind specialization for the shared [`Descriptor`] skeleton: the cell
 /// type a kind stores, its kind discriminator and optional key codec, and the
-/// typed handle a bind mints from a [`CellScope`]. One zero-sized impl per
-/// collection kind ([`ValueKind`], [`map::MapKind`], [`deque::DequeKind`]); the
-/// public [`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`] aliases
+/// typed handle a bind mints from the bound [`Collection`]. One zero-sized impl
+/// per collection kind ([`ValueKind`], [`map::MapKind`], [`deque::DequeKind`]);
+/// the public [`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`] aliases
 /// pick the spec, so every descriptor shares one `new`, `name`,
 /// `collection_def`/`with_collection_def`, and `bind` body.
 ///
@@ -540,12 +547,13 @@ impl<D> Registered<D> {
 ///
 /// This trait names the [`StateDescriptor`] impl's `Handle` associated type, a
 /// public interface, so it is `pub` — but defining collection kinds is
-/// deliberately unexposed, and now structurally so: the trait is sealed by the
-/// marker
+/// deliberately unexposed, and now structurally so: the trait is sealed by a
+/// crate-internal marker, and for a macro-declared layout that marker is what
 /// [`collection_layout!`](crate::state::collection::collection_layout) emits,
-/// so a kind cannot exist without a declared durable layout, and declaring one
-/// is crate-internal. Users compose cell types (codec + resolver) instead —
-/// that surface is fully public.
+/// so such a kind cannot exist without a declared durable layout. Map and Deque
+/// hand-write the marker until they migrate to the scoped operation. Users
+/// compose cell types (codec + resolver) instead — that surface is fully
+/// public.
 pub trait CollectionSpec: SealedSpec + Sized {
     /// This kind's durable discriminator.
     const KIND: CollectionKindId;
@@ -639,7 +647,8 @@ impl<K: CollectionSpec> StateDescriptor for Descriptor<K> {
     }
 }
 
-/// Error returned by typed cell operations ([`ValueHandle`], `CellView`).
+/// Error returned by typed cell operations — a scoped collection command, or
+/// the bridge `CellView` the kinds that have not migrated still use.
 #[derive(Debug, Error)]
 pub enum CellStateError<E>
 where

@@ -13,8 +13,7 @@
 //!   operation.
 //!
 //! Diagnostics are part of the interface: every rejection is a `syn::Error`
-//! spanned at the smallest responsible token and states the correction. The
-//! macros never panic, unwrap, or index unchecked on malformed input.
+//! spanned at the smallest responsible token and states the correction.
 
 use proc_macro::TokenStream;
 use syn::Error;
@@ -50,16 +49,17 @@ pub(crate) fn combine(slot: &mut Option<Error>, error: Error) {
 /// }
 /// ```
 ///
-/// Every field needs an explicit protobuf-style `#[id(n)]` in `0..=127`;
-/// declaration order is cosmetic and reordering is safe. Removing a field
-/// reserves its number through `#[reserved_ids(…)]` so the whole-layout reset
-/// keeps erasing its legacy rows. The macro rejects a missing, duplicate,
-/// negative, out-of-range, or reserved-and-active id at the exact literal.
+/// Every field needs an explicit protobuf-style `#[id(n)]` in `0..=127`, and a
+/// removed field reserves its number through `#[reserved_ids(…)]`. What those
+/// ids guarantee, and why one may never change, is documented on the
+/// `CollectionLayout` trait they implement; a malformed one is rejected here,
+/// spanned at the token that owns the mistake.
 ///
-/// The expansion is the kind type itself (zero-sized), one
-/// `CellFamily` associated constant per field, the sealed `CollectionLayout`
-/// implementation carrying the canonical section set and layout descriptor,
-/// and the marker that seals `CollectionSpec`.
+/// The expansion is the kind type itself (zero-sized), one `CellFamily`
+/// associated constant per field, the `CollectionLayout` implementation
+/// carrying the canonical section set (`SECTIONS`), the layout descriptor
+/// (`DESCRIPTOR`) and the reserved ids (`RESERVED`), and the marker that seals
+/// `CollectionSpec`.
 #[proc_macro]
 pub fn collection_layout(input: TokenStream) -> TokenStream {
     layout::expand(input.into())
@@ -90,18 +90,19 @@ pub fn collection_layout(input: TokenStream) -> TokenStream {
 /// from the field's type tokens: an alias, a same-named foreign trait, or a
 /// multi-parameter impl all defeat token inference.
 ///
-/// - `#[read(op)]` on an `async fn` wraps the body in one read scope;
+/// - `#[read(op)]` wraps the body in one read scope;
 /// - `#[write(op)]` wraps it in one write scope and adds a method-local
 ///   writable-session bound;
-/// - `#[read(op)]` on a non-`async fn` returning a stream treats the body as
-///   that stream's async plan;
 /// - unmarked methods are copied through untouched.
+///
+/// A marked method is `async`: admission is acquired once per invocation.
 ///
 /// The written method stays the public method: visibility, name, receiver,
 /// arguments, return type, generics, `where` clauses, rustdoc, and tracing
-/// attributes are preserved verbatim with their source spans. Resolver context
-/// bounds are added for every `ResolvedOf<T>` in the written return type, or
-/// for the type named by an explicit `#[read(op, resolve(T))]`.
+/// attributes are preserved verbatim with their source spans. A resolver
+/// context bound is added for every type the method resolves, detected by the
+/// name `ResolvedOf` in the written return type; when that type is aliased or
+/// constructed elsewhere, name it explicitly with `#[read(op, resolve(T))]`.
 ///
 /// A marked body may not name `self`: recursive acquisition of the admission
 /// the body already holds is made unexpressible rather than checked at
