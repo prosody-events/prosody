@@ -158,6 +158,21 @@ designs are where bloat and bug re-introduction live:
 
 **Documentation:**
 
+- **All written text for this project must conform to ASD-STE100
+  (Simplified Technical English). No written text is exempt.** This rule
+  applies to documentation, comments, READMEs, plans, issues, reviews, chat
+  responses, commit messages, PR text, and user-facing text. Apply these
+  primary STE rules:
+  - Use the active voice. Write instructions in the imperative.
+  - Write short sentences. Use 20 words or fewer for instructions. Use 25
+    words or fewer for descriptions.
+  - Write one instruction per sentence. Keep one topic per paragraph. Use a
+    maximum of six sentences in each paragraph.
+  - Use a word with only one meaning. Use the same word for the same thing.
+  - Use simple verb tenses. Do not use an "-ing" form as a verb when a simple
+    tense is correct.
+  - Do not use a noun cluster of more than three nouns.
+  - Use approved technical names and technical verbs consistently.
 - Write doc comments for a reader unfamiliar with the codebase: help them
   navigate the concept. Lead with what the reader needs — what the thing is,
   how to use it, what guarantee it gives — not the internal mechanism.
