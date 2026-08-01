@@ -160,7 +160,7 @@ pub struct SchedulerConfiguration {
     ///
     /// **Larger caches** can track more distinct keys simultaneously, reducing
     /// cache misses and providing more accurate long-term fairness across many
-    /// keys. Memory usage: ~64 bytes per entry.
+    /// keys. Memory depends on the target layout and the cache's bookkeeping.
     ///
     /// **Smaller caches** use less memory but cause more keys to start fresh
     /// at VT = 0, which may give temporary priority advantages to keys that

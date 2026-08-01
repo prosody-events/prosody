@@ -51,8 +51,8 @@ type CacheVal = (Instant, Option<Bytes>);
 /// `ahash`-hashed.
 type ReaderCacheInner = Cache<CacheKey, CacheVal, ReaderWeighter, ahash::RandomState>;
 
-/// Byte weigher: key byte length + value byte length + a fixed overhead. The
-/// budget bounds **declared weight** (bytes + overhead), never process RSS.
+/// Byte weigher: target-specific inline layout plus owned key and value bytes.
+/// The budget bounds **declared weight**, never process RSS.
 #[derive(Clone)]
 pub(crate) struct ReaderWeighter;
 
@@ -103,7 +103,7 @@ impl ReaderCache {
     }
 
     fn build(budget: u64, clock: Clock) -> Self {
-        // Estimate item count from the budget and the fixed overhead, so
+        // Estimate item count from the budget and the inline layout, so
         // quick_cache sizes its shards sensibly; the byte budget is the real
         // bound.
         let estimated = (budget / READER_CACHE_ENTRY_INLINE_BYTES).max(1) as usize;
