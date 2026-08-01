@@ -931,10 +931,9 @@ async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
     Ok(())
 }
 
-/// Read-path uniqueness invariant: a present cell read back from the Cassandra
-/// decode path is **uniquely owned** (`try_into_mut().is_ok()`), the production
-/// fast path a collection's typed read relies on. Run over random non-empty
-/// payloads.
+/// Read-path uniqueness invariant: the Cassandra decode path returns a present
+/// cell that is **uniquely owned** (`try_into_mut().is_ok()`). A collection's
+/// typed read relies on that fast path. Runs over random non-empty payloads.
 #[test]
 fn prop_cassandra_present_cell_is_uniquely_owned() {
     async fn check(payload: Vec<u8>) -> Result<bool> {

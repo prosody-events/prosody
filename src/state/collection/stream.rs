@@ -11,8 +11,9 @@
 //! A plan carries no admission and no operation. The owner reacquires the gate
 //! per coordinate chunk and pages a range gate-free; the reader carries the
 //! source its planning command selected, so a chunk can never re-probe or
-//! change source mid-stream. A range plan also carries the span its planning
-//! command chose, which may be the whole section or one bounded window.
+//! change source mid-stream. A range plan also carries the span that its
+//! planning command chose. That span is the whole section or one bounded
+//! window.
 
 use super::operation::read_keys_bytes;
 use super::{StateSession, resolve_batch, resolve_cell, sealed};
@@ -86,15 +87,17 @@ pub(crate) struct CoordinatePlan<S: StateSession, T: CellType> {
 }
 
 /// A managed durable-range plan: one contiguous span of one section, walked in
-/// `dir` order. Pages gate-free and cannot repair, so it is what a collection
-/// takes when it has no coordinate enumeration to point-get.
+/// `dir` order. It pages gate-free and cannot repair. A collection takes this
+/// plan when it has no coordinate enumeration to point-get.
 ///
-/// The span is the planning command's choice. `Unbounded` edges with no limit
-/// walk the whole section — the fallback for a collection that cannot say where
-/// its cells are. A collection with a contiguous coordinate window (a Deque's
-/// half-open `[head, tail)`) converts it to the inclusive span
-/// `[head, tail − 1]` and plans that with the window's own limit instead, so
-/// the walk never wades rows outside it.
+/// The planning command chooses the span. `Unbounded` edges with no limit walk
+/// the whole section. That is the fallback for a collection that cannot say
+/// where its cells are.
+///
+/// A collection with a contiguous coordinate window plans a narrower span
+/// instead. A Deque converts its half-open window `[head, tail)` to the
+/// inclusive span `[head, tail − 1]` and adds the window's own limit. The walk
+/// then reads no row outside the window.
 pub(crate) struct RangePlan<S: StateSession, T> {
     base: PlanBase<S>,
     start: ScanEdge<Coordinate>,
@@ -248,9 +251,9 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
 }
 
 impl<S: StateSession, T: CellType> RangePlan<S, T> {
-    /// Builds the plan over the planning invocation's captured state, walking
-    /// `[start, end]` (direction-relative, exactly as [`Scan`] defines them)
-    /// and yielding at most `limit` cells.
+    /// Builds the plan over the planning invocation's captured state. The plan
+    /// walks `[start, end]` and yields at most `limit` cells. The edges are
+    /// direction-relative, exactly as [`Scan`] defines them.
     pub(super) fn new(
         base: PlanBase<S>,
         start: ScanEdge<Coordinate>,
@@ -268,8 +271,8 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
         }
     }
 
-    /// Opens the plan's durable page over its planned span. One borrow of the
-    /// whole plan, so the [`Scan`]'s edges name the plan's own owned
+    /// Opens the plan's durable page over its planned span. It borrows the
+    /// whole plan once, so the [`Scan`]'s edges name the plan's own owned
     /// coordinates.
     fn page(&self) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + '_ {
         let scan = Scan {

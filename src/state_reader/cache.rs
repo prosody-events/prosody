@@ -76,11 +76,10 @@ impl Weighter<CacheKey, CacheVal> for ReaderWeighter {
 /// One read-through, TTL-bounded, byte-budgeted cache, shared by every reader
 /// drawing from a bundle. Clone shares the underlying `Arc`s.
 ///
-/// One allocation is accepted downstream of a cache hit. The shared cell decode
-/// falls back to copying its input when that input is shared, and a cache hit's
-/// `Bytes` is always shared because the cache retains a reference. The uncached
-/// store path stays zero-copy. The cache itself is zero-copy: every value is a
-/// `Bytes` refcount bump.
+/// A cache hit costs one allocation downstream. The shared cell decode copies
+/// its input when that input is shared, and the cache keeps a reference, so a
+/// hit's `Bytes` is always shared. The uncached store path stays zero-copy. The
+/// cache itself is zero-copy: every value is a `Bytes` refcount bump.
 #[derive(Clone)]
 pub(crate) struct ReaderCache {
     inner: Arc<ReaderCacheInner>,

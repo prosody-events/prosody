@@ -698,8 +698,8 @@ fn collection_ops_export_operation_spans() -> Result<()> {
 
 /// Behavioral arm of the collection-containment invariant: a handle bound to
 /// one collection cannot address another. Every kind carries `(state_type,
-/// name)` on its [`Collection`] binding, which is enforced at the type level;
-/// this test pins the matching runtime behavior.
+/// name)` on its [`Collection`] binding, and the type system enforces that.
+/// This test pins the matching runtime behavior.
 mod scope_containment {
     use super::*;
     use crate::state::order_codec::Utf8KeyCodec;
@@ -771,9 +771,10 @@ mod scope_containment {
     }
 }
 
-/// The termination guard, enforced by every typed op, holds in each kind: a
-/// bound handle over a terminated session refuses the op with the (Transient)
-/// [`StateAccessError::Terminated`], surfaced through each kind's error type.
+/// Every typed op enforces the termination guard, and the guard holds in each
+/// kind. A bound handle over a terminated session refuses the op with the
+/// Transient [`StateAccessError::Terminated`]. Each kind's error type carries
+/// that refusal.
 #[tokio::test]
 async fn terminated_session_refuses_typed_ops_in_every_kind() -> Result<()> {
     let value = value_state::<JsonCodec>("term_value");
@@ -814,9 +815,9 @@ async fn terminated_session_refuses_typed_ops_in_every_kind() -> Result<()> {
     Ok(())
 }
 
-/// Builds a session whose per-event cancellation is already tripped, so every
-/// typed op guards to [`StateAccessError::Terminated`]. Binding still
-/// succeeds — bind validates registration, not liveness.
+/// Builds a session whose per-event cancellation is already tripped. Every
+/// typed op then guards to [`StateAccessError::Terminated`]. Binding still
+/// succeeds, because bind validates registration, not liveness.
 fn terminated_session(loader: MemoryLoader<Value>, registry: CollectionDefRegistry) -> TestSession {
     let (parts, _) = session_parts(
         loader,
@@ -828,11 +829,12 @@ fn terminated_session(loader: MemoryLoader<Value>, registry: CollectionDefRegist
     KeyedStateSession::new(parts)
 }
 
-/// Compile-time regression pin for the `-> impl Future + Send` desugar (rustc
-/// #100013): a handle's typed op future holds the resolver's borrowed context
-/// across its await and must stay `Send`. A regression to a plain `async fn`
-/// would drop `Send` and fail to compile here. The plan-driver twin is
-/// `plan_streams_are_send` in [`crate::state::collection::tests`].
+/// Compile-time regression pin for the `-> impl Future + Send` desugar, which
+/// guards against rustc #100013. A handle's typed op future holds the
+/// resolver's borrowed context across its await, so it must stay `Send`. A
+/// plain `async fn` would drop `Send` and fail to compile here. The
+/// plan-driver twin is `plan_streams_are_send` in
+/// [`crate::state::collection::tests`].
 #[test]
 fn typed_op_future_is_send() -> Result<()> {
     fn assert_send<T: Send>(_value: T) {}

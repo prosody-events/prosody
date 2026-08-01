@@ -1,11 +1,12 @@
 //! Index-addressed double-ended queue collection.
 //!
 //! A Deque is a window of cells over a monotonic `i64` index space. Every
-//! [`DequeHandle`] method runs as one scoped collection operation over the
-//! bound collection — there is no Deque-specific store or session, and no
-//! branch on which engine is bound. Build a descriptor with [`deque_state`],
-//! register it with the consumer, and bind the
-//! [`Registered`](super::Registered) handle through
+//! [`DequeHandle`] method runs as one scoped operation over the bound
+//! collection. There is no Deque-specific store or session, and no branch on
+//! the bound engine.
+//!
+//! To use one, build a descriptor with [`deque_state`], register it with the
+//! consumer, then bind the [`Registered`](super::Registered) handle through
 //! [`EventContext::state`](crate::consumer::event_context::EventContext::state).
 //!
 //! # Layout
@@ -32,27 +33,31 @@
 //! **resets the index space**: the erased bounds cell reads `[0, 0)`, so the
 //! next push writes index 0. Reuse is safe — every pre-clear row is erased by
 //! the clear, and a later write to a reused coordinate out-stamps any earlier
-//! tombstone (single writer, monotonic timestamps). Co-stamping keeps the
-//! window move and its entry mutation together: one invocation stages them into
-//! one journal, they buffer as one op and stage under one settle marker with
-//! one write TS/TTL (see
-//! [`KeyedStateSession::finalize`](crate::state::session)), recoverable
-//! together whatever the batching — and a mid-handler [`DequeHandle::commit`]
-//! drains them resolved and marker-free: one atomic batch within the batch
-//! budget, but an over-budget commit can crash mid-split (the collection-grain
-//! over-budget residual on `CellStore`,
-//! shared with the Map keyset).
+//! tombstone (single writer, monotonic timestamps).
+//!
+//! Co-stamping keeps the window move and its entry mutation together. One
+//! invocation stages both into one journal. They buffer as one op, and they
+//! stage under one settle marker with one write TS/TTL (see
+//! [`KeyedStateSession::finalize`](crate::state::session)). Recovery therefore
+//! restores both together, whatever the batching does.
+//!
+//! A mid-handler [`DequeHandle::commit`] drains them resolved and marker-free,
+//! as one atomic batch within the batch budget. An over-budget commit can crash
+//! mid-split. That is the collection-grain over-budget residual on `CellStore`,
+//! which the Map keyset shares.
 //!
 //! **Without a TTL the window is also dense**: every index in `[head, tail)`
 //! maps to a present entry cell, so `len` is exact and iteration yields exactly
 //! `len` elements. **With a TTL** an entry's expiry is anchored at its push, so
 //! entries can expire *inside* the window while it stays put — the window
-//! develops holes. The bounds cell is rewritten by every mutating op, so it
-//! outlives the entries and `head`/`tail` are unaffected. Under holes `len` is
-//! an **upper bound** on the live count, and `get`/`stream` **skip** an expired
-//! index — an absent cell resolves as skipped (`get` → `None`, `stream` omits
-//! it), never an error. This is acceptable time-window semantics: a TTL'd deque
-//! is a sliding window of not-yet-expired elements.
+//! develops holes. Every mutating op rewrites the bounds cell, so the bounds
+//! cell outlives the entries and holes do not move `head` or `tail`.
+//!
+//! Under holes `len` is an **upper bound** on the live count. `get` and
+//! `stream` **skip** an expired index: an absent cell resolves as skipped
+//! (`get` → `None`, `stream` omits it), never as an error. These are the
+//! time-window semantics a TTL asks for. A TTL'd deque is a sliding window of
+//! elements that have not expired.
 //!
 //! # Invariant: capacity
 //!
@@ -61,8 +66,8 @@
 //! enforced **lazily, on push only**: reads, `len`, iteration, `pop`, and
 //! `clear` never enforce it. A bounded [`DequeHandle::push_back`] evicts from
 //! the **front** and [`DequeHandle::push_front`] from the **back**, at most
-//! `TRIM_MAX` slots per push and decode-free / resolver-free — each a
-//! single-cell clear staged beside the append and the bounds move. So a
+//! `TRIM_MAX` slots per push and decode-free / resolver-free. Each eviction is
+//! one single-cell clear, staged beside the append and the bounds move. So a
 //! persisted window may exceed the cap; for a **measurable** window a reduction
 //! of excess `D` converges in `⌈D / (TRIM_MAX − 1)⌉` pushes. An unmeasurable
 //! span (only reachable from a corrupt or hand-seeded bounds cell) under an
@@ -97,11 +102,12 @@ use thiserror::Error;
 use tracing::{Instrument, Span, field::Empty, info_span, instrument};
 
 collection_layout! {
-    /// The Deque collection kind: one head/tail bounds cell plus one cell per
-    /// live element, addressed by the sign-flipped big-endian index. The index
-    /// encoding is pinned by the kind ([`I64KeyCodec`]) — never a registration
-    /// choice — and rides the identity's key-codec token like any other key
-    /// axis.
+    /// The Deque collection kind: one head/tail bounds cell, plus one cell per
+    /// live element at the sign-flipped big-endian index.
+    ///
+    /// The kind pins the index encoding to [`I64KeyCodec`]. A registration
+    /// cannot choose it. That encoding rides the identity's key-codec token,
+    /// like every other key axis.
     pub struct DequeKind<T> {
         /// The head/tail bounds cell (see the module's window invariant).
         #[id(0)]
@@ -119,10 +125,10 @@ type MetaCodec = (I64Codec, I64Codec);
 /// The [`MetaCodec`] decode error — a corrupt (wrong-width) bounds frame.
 type MetaCodecError = PairCodecError<I64CodecError, I64CodecError>;
 
-/// The instantiation the frozen-layout pin and the test-only cell-address
-/// helpers read their sections and format tokens from. A family's durable
-/// section and its declared codecs come from the layout, never from the type
-/// parameters, so every instantiation answers identically.
+/// The instantiation that the frozen-layout pin and the test-only cell-address
+/// helpers read their sections and format tokens from. The layout supplies a
+/// family's durable section and its declared codecs, never the type parameters,
+/// so every instantiation answers the same.
 type FrozenLayout = DequeKind<JsonCodec>;
 
 /// Iteration shape threshold: a window of at most this many entries streams
@@ -146,12 +152,13 @@ const _: () = assert!(
     "an eviction count is returned as a `u8`"
 );
 
-/// Deque's declared per-invocation mutation maximum: a bounded push stages one
-/// entry set, at most [`TRIM_MAX`] point clears, and one bounds set; a pop
-/// stages one clear and one bounds set; `clear` stages one whole-layout reset.
-/// The assertion below pins the declaration against [`JOURNAL_INLINE`]'s
-/// budget. The runtime half — that a push never stages more than `TRIM_MAX`
-/// clears — is pinned by `prop_deque_capacity_convergence`.
+/// Deque's declared per-invocation mutation maximum. A bounded push stages one
+/// entry set, at most [`TRIM_MAX`] point clears, and one bounds set. A pop
+/// stages one clear and one bounds set. `clear` stages one whole-layout reset.
+///
+/// The assertion below pins this declaration against [`JOURNAL_INLINE`]'s
+/// budget. `prop_deque_capacity_convergence` pins the runtime half: a push
+/// never stages more than `TRIM_MAX` clears.
 const DEQUE_MAX_MUTATIONS: usize = TRIM_MAX + 2;
 
 const _: () = assert!(
@@ -160,12 +167,14 @@ const _: () = assert!(
 );
 
 /// Deque's durable layout, frozen. The ids and the bounds family's format
-/// tokens below address every Deque cell ever written; changing one silently
-/// re-points existing rows, and no type can compare this crate against
-/// yesterday's schema. The entries family's *payload* token is the user's
-/// choice and rides the collection's structural identity instead — its key
-/// token is the kind's, so it is pinned here. The pin is a compile-time
-/// assertion rather than a test so it cannot be filtered out of a run.
+/// tokens below address every Deque cell ever written. A change to one silently
+/// re-points the existing rows, and no type can compare this crate against
+/// yesterday's schema.
+///
+/// The entries family's *payload* token is the user's choice, and it rides the
+/// collection's structural identity instead. Its *key* token belongs to the
+/// kind, so this block pins it. The pin is a compile-time assertion, not a
+/// test, so no run can filter it out.
 const _: () = {
     let families = <FrozenLayout as CollectionLayout>::DESCRIPTOR;
     assert!(
@@ -236,23 +245,24 @@ impl<T: CellType<Key = UnitKey>> CollectionSpec for DequeKind<T> {
 
 /// Typed, owned handle over a codec-backed deque.
 ///
-/// Owns the bound collection, whose session clone is `Clone + Send + Sync +
-/// 'static` (an FFI requirement). Each method opens exactly one scoped
-/// operation; [`stream`](Self::stream) runs a short planning operation and then
-/// drives the plan it returns. Cheap `Clone`.
+/// The handle owns the bound collection. That collection's session clone is
+/// `Clone + Send + Sync + 'static`, which FFI requires. Each method opens
+/// exactly one scoped operation. [`stream`](Self::stream) runs a short planning
+/// operation, then drives the plan it returns. `Clone` is cheap.
 #[derive(Educe)]
 #[educe(Clone(bound = "S: Clone"))]
 pub struct DequeHandle<S, T> {
     cells: Collection<S, DequeKind<T>>,
 }
 
-/// The arm [`DequeHandle::stream`] takes, as the owned plan its planning
-/// invocation captured: point-get each position's absolute index, or — for a
-/// window wider than [`DEQUE_POINT_ITERATION_MAX`] — one durable range scan
-/// over exactly `[head, tail − 1]`.
+/// The arm that [`DequeHandle::stream`] takes, as the owned plan that its
+/// planning invocation captured. One arm point-gets each position's absolute
+/// index. The other arm runs one durable range scan over exactly
+/// `[head, tail − 1]`, and serves a window wider than
+/// [`DEQUE_POINT_ITERATION_MAX`].
 enum DequePlan<S: StateSession, T: CellType<Key = UnitKey>> {
-    /// Point-get each planned absolute index (already reversed for a backward
-    /// stream).
+    /// Point-get each planned absolute index. A backward stream reverses the
+    /// index list at plan time.
     Points(CoordinatePlan<S, Keyed<I64KeyCodec, T>>),
 
     /// One durable range scan anchored on the window.
@@ -264,7 +274,7 @@ where
     S: StateSession,
     T: CellType<Key = UnitKey>,
 {
-    /// Drives the planned arm, resolving each live entry.
+    /// Drives the planned arm and resolves each live entry.
     fn entries(self) -> impl Stream<Item = ScanItem<Keyed<I64KeyCodec, T>>> + Send
     where
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
@@ -402,13 +412,16 @@ where
         Ok(op.get(DequeKind::<T>::ENTRIES, &last).await?)
     }
 
-    /// Reads the bounds cell and captures the stream's arm as an owned plan: a
-    /// window of at most [`DEQUE_POINT_ITERATION_MAX`] entries becomes the
-    /// chunked point-get arm over the window's absolute indices in `dir` order;
-    /// a wider one becomes a single durable range scan over exactly
-    /// `[head, tail − 1]` under the window's own limit, so the walk never wades
-    /// rows outside the window. An empty window becomes an empty point-get
-    /// plan — zero reads, and its exhaustion still passes the stream fence.
+    /// Reads the bounds cell and captures the stream's arm as an owned plan.
+    ///
+    /// A window of at most [`DEQUE_POINT_ITERATION_MAX`] entries gives the
+    /// chunked point-get arm over the window's absolute indices in `dir` order.
+    /// A wider window gives one durable range scan over exactly
+    /// `[head, tail − 1]`, under the window's own limit. That scan therefore
+    /// reads no row outside the window.
+    ///
+    /// An empty window gives an empty point-get plan. It does zero reads, and
+    /// its exhaustion still passes the stream fence.
     #[read(op)]
     async fn stream_plan(
         &self,
@@ -417,9 +430,9 @@ where
         let window = bounds(op).await?;
         let len = window.len()?;
         if len > DEQUE_POINT_ITERATION_MAX {
-            // Wide window: one durable range scan, anchored on the window —
-            // front `head` to back `tail − 1` (`len > 0` proves `tail − 1` does
-            // not underflow), mirrored backward.
+            // Wide window: one durable range scan, anchored on the window.
+            // It runs from the front `head` to the back `tail − 1`, and
+            // mirrors backward. `len > 0` proves `tail − 1` does not underflow.
             let last = window
                 .tail
                 .checked_sub(1)
@@ -436,17 +449,17 @@ where
                 len,
             )));
         }
-        // Point-get arm. `absolute` is monotone in the position, so validating
-        // the extreme index ONCE proves every position in `[0, len)` is in
-        // range and the coordinate list is infallible.
+        // Point-get arm. `absolute` is monotone in the position. One check of
+        // the extreme index therefore proves that every position in `[0, len)`
+        // is in range, and that the coordinate list cannot fail.
         if len > 0 {
             window.absolute(len - 1)?;
         }
         let head = window.head;
-        // Bounded by `DEQUE_POINT_ITERATION_MAX` (128 × 8 B ≈ 1 KiB), sized
-        // once, and paid once per stream construction — never the per-item
-        // steady state. Owning the indices is what lets one driver serve owner
-        // and reader with no runtime branch.
+        // `DEQUE_POINT_ITERATION_MAX` bounds this buffer at 128 × 8 B ≈ 1 KiB.
+        // This code sizes it once and pays it once per stream construction,
+        // never in the per-item steady state. Owned indices are what let one
+        // driver serve the owner and the reader with no runtime branch.
         let mut indices: Vec<i64> = Vec::with_capacity(len);
         indices.extend((0..len).map(|position| head + position as i64));
         if dir == Direction::Backward {
@@ -463,28 +476,31 @@ where
     ///
     /// # Per-arm consistency (position identity, a paged read, not a snapshot)
     ///
-    /// The **position window** `[head, tail)` is snapshotted at init (the one
-    /// bounds read) — **position identity, not element identity**: each
-    /// position yields whatever the cell holds when its chunk is fetched, so a
-    /// pop observed before the fetch reads absent and is **skipped** (the same
-    /// skip a TTL hole already requires, never an error), and a pop-then-push
-    /// reusing the position yields the new occupant. A window of at most
-    /// `DEQUE_POINT_ITERATION_MAX` entries point-reads each absolute index in
-    /// chunks of `STREAM_CHUNK`; a wider one falls back to one durable range
-    /// scan over the same window — identical items in identical order, live
-    /// pages, same skip-absent semantics.
+    /// The one bounds read at init snapshots the **position window**
+    /// `[head, tail)`. That gives **position identity, not element identity**.
+    /// Each position yields what its cell holds when the stream fetches its
+    /// chunk. A pop before that fetch therefore reads absent, and the stream
+    /// **skips** the position. This is the skip that a TTL hole already
+    /// requires, never an error. A pop and then a push that reuses the position
+    /// yields the new occupant.
     ///
-    /// A bounded-arm read failure may surface **after** a yielded prefix
-    /// (chunked point gets yield the prior chunks before a later chunk's read
-    /// fails, exactly as the scan arm yields a prefix before failing at a page
-    /// boundary); within a chunk the error is atomic — a failing chunk yields
-    /// none of its items.
+    /// A window of at most `DEQUE_POINT_ITERATION_MAX` entries point-reads each
+    /// absolute index in chunks of `STREAM_CHUNK`. A wider window falls back to
+    /// one durable range scan over the same window. Both arms give identical
+    /// items in identical order, live pages, and the same skip-absent rule.
     ///
-    /// Session admission is taken only for the init bounds read and per chunk
-    /// (≤ `STREAM_CHUNK` point reads each): a chunk's admission covers its
-    /// batch fetch and is released before the chunk is decoded and resolved —
-    /// so it is never held across a yield (items and errors alike), and a
-    /// handler may mutate this deque between stream items without deadlock
+    /// A bounded-arm read failure can surface **after** a yielded prefix.
+    /// Chunked point gets yield the earlier chunks before a later chunk's read
+    /// fails. The scan arm behaves the same way: it yields a prefix before it
+    /// fails at a page boundary. Within a chunk the error is atomic, so a
+    /// failing chunk yields none of its items.
+    ///
+    /// The stream takes session admission only for the init bounds read and
+    /// once per chunk, at most `STREAM_CHUNK` point reads each. A chunk's
+    /// admission covers its batch fetch, and the stream releases that admission
+    /// before it decodes and resolves the chunk. The stream therefore holds no
+    /// admission across a yield, for items and errors alike. A handler may
+    /// mutate this deque between stream items without deadlock
     /// (`StreamYieldFree`; see [`SessionGate`](crate::state::session)).
     pub fn stream(
         &self,
@@ -505,14 +521,14 @@ where
             direction = ?dir,
         );
         try_stream! {
-            // Init: `stream_plan` reads the bounds cell under an admission it
-            // drops as it returns, before this `?` observes the result.
+            // Init: `stream_plan` reads the bounds cell under an admission
+            // that it drops as it returns, before this `?` sees the result.
             let inner = self.stream_plan(dir).instrument(span.clone()).await?.entries();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
-                // The driver yields the decoded index; the module's window
-                // invariant makes it redundant, so only the resolved element is
-                // exposed.
+                // The driver yields the decoded index. The module's window
+                // invariant makes that index redundant, so expose only the
+                // resolved element.
                 let (_, value) = item?;
                 yield value;
             }
@@ -523,13 +539,15 @@ where
     ///
     /// # Bounded capacity
     ///
-    /// On a deque registered with a `capacity`,
-    /// this first evicts from the **front** toward the cap (see the module's
-    /// capacity invariant): up to `TRIM_MAX` slots per push, each a single-cell
-    /// clear staged beside the append and the bounds move — no decode, no
-    /// resolver, the evicted value discarded. The evictions and the append
-    /// stage as one transaction (`ReadCommitted` rollback restores the
-    /// evicted front slots; `ReadUncommitted` applies them eagerly).
+    /// On a deque registered with a `capacity`, a push first evicts from the
+    /// **front** toward the cap (see the module's capacity invariant). It
+    /// evicts up to `TRIM_MAX` slots per push. Each eviction is one single-cell
+    /// clear, staged beside the append and the bounds move. It runs no decode
+    /// and no resolver, and it discards the evicted value.
+    ///
+    /// The evictions and the append stage as one transaction. A
+    /// `ReadCommitted` rollback restores the evicted front slots.
+    /// `ReadUncommitted` applies them eagerly.
     ///
     /// # Errors
     ///
@@ -551,9 +569,9 @@ where
             .head
             .checked_add(evict)
             .ok_or(MetaDecodeError::IndexOverflow)?;
-        // Append first (the sole encode); then evict the front. `evict ≤ span`
-        // (see `evictions`), so `new_head ≤ tail`: the cleared half-open range
-        // never contains the slot just appended.
+        // Append first, the sole encode, then evict the front. `evict ≤ span`
+        // (see `evictions`), so `new_head ≤ tail`. The cleared half-open range
+        // therefore never holds the slot this push appended.
         op.set(DequeKind::<T>::ENTRIES, &window.tail, value)?;
         for index in window.head..new_head {
             op.clear(DequeKind::<T>::ENTRIES, &index);
@@ -563,8 +581,8 @@ where
 
     /// Prepends `value` at the front, extending the window to `head − 1`.
     ///
-    /// The mirror of [`Self::push_back`]: on a bounded deque this evicts from
-    /// the **back** toward the cap.
+    /// This is the mirror of [`Self::push_back`]. On a bounded deque it evicts
+    /// from the **back** toward the cap.
     ///
     /// # Errors
     ///
@@ -592,19 +610,19 @@ where
         write_bounds(op, Window::new(prev_head, new_tail)?)
     }
 
-    /// Removes and returns the front element, advancing `head` past it (`None`
-    /// when empty). The element resolves *before* the clear and head move, so a
-    /// resolve failure stages nothing at all.
+    /// Removes and returns the front element, and moves `head` past it. Returns
+    /// `None` when the deque is empty. The element resolves *before* the clear
+    /// and the head move, so a resolve failure stages nothing at all.
     ///
     /// A pop is an endpoint-slot mutation. Under a TTL an expired front slot
-    /// yields `None` and is still consumed — the slot is cleared and `head`
-    /// advances — so a `while let Some(v) = pop_front()` drain stops at the
-    /// first hole. See [`peek_front`](Self::peek_front)'s endpoint-slot
-    /// contract.
+    /// yields `None`, and the pop still consumes that slot: it clears the slot
+    /// and moves `head` on. A `while let Some(v) = pop_front()` drain therefore
+    /// stops at the first hole. See [`peek_front`](Self::peek_front) for the
+    /// endpoint-slot contract.
     ///
     /// A cancelled or failed pop is atomic for a structural reason, not a
-    /// checked one: the whole invocation's mutations live in one journal that
-    /// replays only on a successful return.
+    /// checked one. One journal holds the whole invocation's mutations, and
+    /// that journal replays only on a successful return.
     ///
     /// # Errors
     ///
@@ -620,7 +638,7 @@ where
             return Ok(None);
         }
         // `head < tail` bounds `head` strictly below `i64::MAX`, so the move
-        // cannot overflow; the check keeps the arithmetic total.
+        // cannot overflow. The check keeps the arithmetic total.
         let next_head = window
             .head
             .checked_add(1)
@@ -630,9 +648,9 @@ where
         Ok(value)
     }
 
-    /// Removes and returns the back element, retracting `tail` past it (`None`
-    /// when empty). Symmetric with [`Self::pop_front`]: the element resolves
-    /// before the mutation.
+    /// Removes and returns the back element, and moves `tail` back past it.
+    /// Returns `None` when the deque is empty. This mirrors
+    /// [`Self::pop_front`]: the element resolves before the mutation.
     ///
     /// # Errors
     ///
@@ -655,12 +673,14 @@ where
         Ok(value)
     }
 
-    /// Removes every element and the window bounds, **resetting the index
-    /// space** (see the module's window invariant): within the event the
-    /// deque reads empty from this program point, and the next push writes
-    /// index 0. Committed, exactly the repopulated elements survive; aborted,
-    /// the deque is untouched. O(handler writes) — one whole-layout reset
-    /// covers both declared sections, so no cell takes a per-cell path.
+    /// Removes every element and the window bounds, and **resets the index
+    /// space** (see the module's window invariant). Within the event the deque
+    /// reads empty from this program point, and the next push writes index 0.
+    /// After a commit, exactly the repopulated elements survive. After an
+    /// abort, the deque is untouched.
+    ///
+    /// The cost is O(handler writes). One whole-layout reset covers both
+    /// declared sections, so no cell takes a per-cell path.
     ///
     /// # Errors
     ///
@@ -731,11 +751,13 @@ impl<T> Descriptor<DequeKind<T>> {
     }
 }
 
-/// Reads the bounds cell, lifting it to a validated [`Window`] (`[0, 0)` when
-/// absent — a fresh or cleared deque). [`Window::new`] validates `head ≤ tail`.
+/// Reads the bounds cell and lifts it to a validated [`Window`]. An absent
+/// cell reads `[0, 0)`, which is a fresh or cleared deque. [`Window::new`]
+/// validates `head ≤ tail`.
 ///
-/// No `FromSession` bound is needed: [`MetaCodec`] is a plain codec, so its
-/// resolver context normalizes to `()`, which every session satisfies.
+/// This function needs no `FromSession` bound. [`MetaCodec`] is a plain codec,
+/// so its resolver context normalizes to `()`, and every session satisfies
+/// that.
 async fn bounds<C, T>(op: &mut C) -> Result<Window, DequeStateError<CellCodecError<T>>>
 where
     C: CollectionRead<Layout = DequeKind<T>>,
@@ -751,9 +773,9 @@ where
     }
 }
 
-/// Stages the bounds cell. Staged in the same invocation as the entry mutation
-/// it accompanies, so the window move and its entry replay together (module
-/// docs).
+/// Stages the bounds cell. The caller stages it in the same invocation as the
+/// entry mutation it accompanies. The window move and its entry therefore
+/// replay together (see the module docs).
 fn write_bounds<C, T>(op: &mut C, window: Window) -> Result<(), DequeStateError<CellCodecError<T>>>
 where
     C: CollectionWrite<Layout = DequeKind<T>>,
@@ -770,10 +792,11 @@ where
 /// `len + 1` slots exist after the append and the trim is that count over
 /// `capacity`.
 ///
-/// The count never exceeds the window's own span, in either branch — which is
-/// what proves a push's eviction range cannot reach the slot it just appended.
-/// Measurably it is `min(len − (cap − 1), TRIM_MAX) ≤ len`; unmeasurably the
-/// span is at least `i64::MAX as usize`, which is `≥ TRIM_MAX`.
+/// In both branches the count stays at or below the window's own span. That is
+/// what proves a push's eviction range cannot reach the slot it appended. The
+/// measurable branch gives `min(len − (cap − 1), TRIM_MAX) ≤ len`. The
+/// unmeasurable branch has a span of at least `i64::MAX as usize`, which is
+/// `≥ TRIM_MAX`.
 ///
 /// See the module's capacity invariant: enforcement is lazy and push-only, so a
 /// persisted window may exceed `capacity`.
@@ -803,11 +826,13 @@ fn evictions(window: Window, capacity: Option<NonZeroUsize>) -> u8 {
 }
 
 /// Re-homes a bounds-cell access or codec error under the deque's entry-codec
-/// error parameter. The bounds family is typed by the [`MetaCodec`] pair, so
-/// its codec half is a corrupt (wrong-width) bounds frame routed to
-/// [`DequeStateError::MetaFrame`]; its access half joins the entries' [`Cell`]
-/// arm. The key half cannot arise (the bounds cell is unit-addressed) but is
-/// forwarded for exhaustiveness.
+/// error parameter.
+///
+/// The [`MetaCodec`] pair types the bounds family. Its codec half is a corrupt
+/// bounds frame of the wrong width, which this function routes to
+/// [`DequeStateError::MetaFrame`]. Its access half joins the entries' [`Cell`]
+/// arm. The key half cannot arise, because the bounds cell is unit-addressed,
+/// but the match forwards it for exhaustiveness.
 ///
 /// [`Cell`]: DequeStateError::Cell
 fn meta_err<E>(err: CellStateError<MetaCodecError>) -> DequeStateError<E>
@@ -835,7 +860,7 @@ struct Window {
 }
 
 impl Window {
-    /// The empty window a fresh or cleared deque reads.
+    /// The empty window that a fresh or cleared deque reads.
     const EMPTY: Self = Self { head: 0, tail: 0 };
 
     /// Lifts a decoded `(head, tail)` pair into a validated window, failing
@@ -868,9 +893,9 @@ impl Window {
     }
 }
 
-/// Test-only: the single bounds cell at its frozen address (section 0, the
-/// empty coordinate), so a test can read the stored bounds frame directly and
-/// pin the deque's binding to the [`MetaCodec`] frame.
+/// Test-only: the single bounds cell at its frozen address, which is section 0
+/// at the empty coordinate. A test reads the stored bounds frame directly
+/// through it, and pins the deque's binding to the [`MetaCodec`] frame.
 #[cfg(test)]
 pub(crate) fn meta_cell() -> CellKey {
     CellKey {
@@ -879,10 +904,10 @@ pub(crate) fn meta_cell() -> CellKey {
     }
 }
 
-/// Test-only: the entry cell at index `coordinate` (already encoded through
-/// [`I64KeyCodec`]), so a test can seed a sparse window directly — entries with
-/// holes a live deque never produces — and prove the TTL'd-hole tolerance
-/// against the real store.
+/// Test-only: the entry cell at index `coordinate`, which [`I64KeyCodec`] has
+/// already encoded. A test seeds a sparse window directly through it. A live
+/// deque never produces such holes, so this is how a test proves the
+/// TTL'd-hole tolerance against the real store.
 #[cfg(test)]
 pub(crate) fn entry_cell_for(coordinate: &Coordinate) -> CellKey {
     CellKey {
@@ -891,19 +916,19 @@ pub(crate) fn entry_cell_for(coordinate: &Coordinate) -> CellKey {
     }
 }
 
-/// Test-only: the frozen `head ‖ tail` bounds frame as raw bytes — two plain
-/// big-endian `i64`s, the [`MetaCodec`] layout pinned by
-/// `deque_meta_cell_bytes_are_frozen` — so a test can seed the bounds cell
-/// directly.
+/// Test-only: the frozen `head ‖ tail` bounds frame as raw bytes. The frame is
+/// two plain big-endian `i64`s, the [`MetaCodec`] layout that
+/// `deque_meta_cell_bytes_are_frozen` pins. A test seeds the bounds cell
+/// directly through it.
 #[cfg(test)]
 pub(crate) fn seed_frame(head: i64, tail: i64) -> Vec<u8> {
     [head.to_be_bytes(), tail.to_be_bytes()].concat()
 }
 
-/// Error deriving the deque's window bookkeeping. Always `Permanent`: a
-/// disordered or overflowing window will not start being valid on retry. A
-/// corrupt bounds *frame* (wrong width) is the `MetaCodec`'s own error,
-/// surfaced as [`DequeStateError::MetaFrame`].
+/// Error from the deque's window bookkeeping. It is always `Permanent`,
+/// because a retry cannot make a disordered or overflowing window valid. A
+/// corrupt bounds *frame* of the wrong width is the `MetaCodec`'s own error,
+/// which the handle reports as [`DequeStateError::MetaFrame`].
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum MetaDecodeError {
     /// The decoded bounds violated `head ≤ tail`.
@@ -946,8 +971,8 @@ where
     MetaFrame(#[from] MetaCodecError),
 }
 
-/// A raw access refusal reaches the handle as the access arm of a cell error —
-/// the shape the scoped write invocation's final fence reports.
+/// A raw access refusal reaches the handle as the access arm of a cell error.
+/// That is the shape the scoped write invocation's final fence reports.
 impl<E> From<StateAccessError> for DequeStateError<E>
 where
     E: Error + Send + Sync + 'static,

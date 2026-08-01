@@ -20,18 +20,18 @@
 //! view cannot occur. A probe is concurrent across *sources*, never across
 //! reads: `probe_batch` fans one batch out to every source at once, and still
 //! resolves to one pin. On every engine path the invocation's
-//! `&mut Option<PinnedSource>` (see [`engine`]) makes two overlapping unpinned
-//! reads not compile; the `&self` bridge paths below stay convention-based.
+//! `&mut Option<PinnedSource>` (see [`engine`]) stops two overlapping unpinned
+//! reads from compiling. The `&self` bridge paths below rely on convention.
 //!
 //! The selection reaches the read paths two ways, and the two agree. A scoped
 //! collection operation carries its own invocation-local selection: the reader
 //! engine seeds it from the session-shared [`PinnedSource`] and publishes the
 //! first one it makes back to that shared cell. A managed stream carries the
 //! selection its planning command captured. The `CellRead` bridge paths (`get`,
-//! `get_many`, `scan`) read the shared cell directly; no collection calls them
-//! any more, but they stay correct because the surface outlives its callers.
-//! The precedence is uniform: a captured selection wins, an uncaptured one
-//! defers to the shared cell, and only a wholly unselected read probes.
+//! `get_many`, `scan`) read the shared cell directly. No collection calls them
+//! now, but they stay correct, because the surface outlives its callers. The
+//! precedence is uniform: a captured selection wins, an uncaptured one defers
+//! to the shared cell, and only a wholly unselected read probes.
 //!
 //! Probe-and-pin is the reader's source-selection strategy:
 //!
@@ -90,7 +90,7 @@ pub struct ReadSession<C: Codec, B> {
     key: Key,
     /// Bridge: the session-shared selection, so every call after the first
     /// data-bearing probe addresses one source. The engine seeds each
-    /// invocation from it and publishes back; the `CellRead` paths read it
+    /// invocation from it and publishes back. The `CellRead` paths read it
     /// directly. It dies with the `CellRead` surface.
     pin: Arc<OnceLock<PinnedSource>>,
 }
@@ -234,12 +234,12 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
             }
             Some(ttl) => {
                 // A stream chunk is up to `CELL_BATCH`, well past
-                // `CELLS_INLINE`, so this buffer heap-spills on the common
-                // path. Accepted: one allocation, sized once from the batch and
-                // bounded by it, in front of a network- or fjall-bound store
-                // read — and the keys ARE the cache lookup. Widening
-                // `CELLS_INLINE` to avoid it is the wrong fix; it would inflate
-                // every `CellBuffer` on every path.
+                // `CELLS_INLINE`, so this buffer spills to the heap on the
+                // common path. Accepted: it is one allocation, sized once from
+                // the batch and bounded by it, in front of a network-bound or
+                // fjall-bound store read. The keys ARE the cache lookup. A
+                // wider `CELLS_INLINE` is the wrong fix, because it would
+                // inflate every `CellBuffer` on every path.
                 let keys: CellBuffer<CacheKey> = batch
                     .iter()
                     .map(|coordinate| {
@@ -448,7 +448,7 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
             }
             // Unselected sequential probe: sources are tried in preference
             // order and the first to yield a cell pins. Map's untracked-keyset
-            // degrade arm is the only production caller — every other stream
+            // degrade arm is the only production caller. Every other stream
             // reaches a scan only after a meta point read that already pinned.
             let sources = self.snapshot.sources();
             let mut first_err = None;

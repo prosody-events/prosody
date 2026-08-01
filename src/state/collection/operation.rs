@@ -120,14 +120,15 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         )
     }
 
-    /// Plans a managed durable range over the inclusive typed span
-    /// `[start, end]` of `family`'s section, in `dir` order, yielding at most
-    /// `limit` cells — what a collection with a contiguous coordinate window
-    /// takes instead of enumerating every coordinate in it.
+    /// Plans a managed durable range over one inclusive typed span of
+    /// `family`'s section. The plan walks `[start, end]` in `dir` order and
+    /// yields at most `limit` cells.
     ///
-    /// `start`/`end` are direction-relative, exactly as
+    /// A collection with a contiguous coordinate window takes this plan instead
+    /// of an enumeration of every coordinate in the window. `start` and `end`
+    /// are direction-relative, exactly as
     /// [`Scan`](crate::state::cell_key::Scan) defines them. Only inclusive
-    /// edges are offered: a collection that knows its window knows both of
+    /// edges exist here: a collection that knows its window also knows both of
     /// its occupied endpoints.
     pub(crate) fn range_within<T: CellType>(
         &self,
@@ -456,8 +457,8 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         let Self {
             collection, inner, ..
         } = self;
-        // The owned cell moves into the future, so only it — never the borrowed
-        // key — crosses the engine await.
+        // The owned cell moves into the future. Only the cell crosses the
+        // engine await, never the borrowed key.
         async move { read_staged::<S, T, L>(collection, &mut **inner, staged, &cell).await }
     }
 }
@@ -481,9 +482,8 @@ impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
         } = self;
         async move {
             let value = read_staged::<S, T, L>(collection, &mut **inner, staged, &cell).await?;
-            // Only a completed read stages the clear; a read error leaves the
-            // journal silent, while `Ok(None)` still clears the addressed
-            // residue.
+            // Only a completed read stages the clear. A read error leaves the
+            // journal silent. `Ok(None)` still clears the addressed residue.
             journal.push(Mutation::Clear { cell });
             Ok(value)
         }
@@ -521,11 +521,12 @@ impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
     }
 }
 
-/// The typed point read a write invocation performs: the journal's answer when
-/// it has one, else one engine point read, then the shared decode and resolve.
+/// The typed point read of a write invocation. It returns the journal's answer
+/// when the journal has one. If not, it does one engine point read. Both paths
+/// then run the shared decode and resolve.
 ///
-/// Written in the desugared `-> impl Future + Send` form for the reason
-/// [`resolve_cell`] states — the future holds the resolver's [`ContextOf`]
+/// This function uses the desugared `-> impl Future + Send` form for the reason
+/// [`resolve_cell`] states: the future holds the resolver's [`ContextOf`]
 /// projection across the resolve await.
 ///
 /// # Errors

@@ -1,12 +1,14 @@
 //! Bridge: the raw [`CellRead`] surface over a read session.
 //!
-//! Every collection now reaches cells through a scoped operation, so nothing
-//! here answers a collection command. The impl survives because binding does:
+//! Every collection reaches cells through a scoped operation, so nothing here
+//! answers a collection command. The impl survives because binding needs it:
 //! [`Descriptor::bind`](crate::state::descriptor::StateDescriptor::bind)
 //! validates through [`CellRead`], so a reader session must offer that surface
-//! to be bindable at all. Its read paths therefore stay honest — each reads and
-//! publishes the session-shared selection rather than an invocation-local
-//! one — and the whole file dies with the old cell-command architecture.
+//! to be bindable at all.
+//!
+//! Its read paths therefore stay honest. Each one reads and publishes the
+//! session-shared selection, not an invocation-local one. The whole file dies
+//! with the old cell-command architecture.
 
 use super::ReadSession;
 use crate::codec::Codec;

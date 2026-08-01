@@ -1618,12 +1618,12 @@ async fn drain_deque_stream(
 
 /// Seeds a committed deque window of `width` entries named `name` directly into
 /// `counting`'s lower store, valued by its own index so a stream-order
-/// assertion is possible — **plus one entry at index `width`, deliberately
-/// outside the seeded `[0, width)` bounds**.
+/// assertion is possible. It also seeds **one entry at index `width`, which
+/// sits deliberately outside the seeded `[0, width)` bounds**.
 ///
-/// That extra row is what makes the wide arm's range bound falsifiable: the
-/// entries section then holds a row the window does not, so a scan that walked
-/// the whole section instead of exactly `[head, tail − 1]` would yield it.
+/// That extra row makes the wide arm's range bound falsifiable. The entries
+/// section then holds a row that the window does not. A scan over the whole
+/// section, instead of exactly `[head, tail − 1]`, would yield that row.
 async fn seed_wide_deque(
     counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
     state_key: &StateKey,
@@ -1640,7 +1640,7 @@ async fn seed_wide_deque(
         deque::meta_cell(),
         Some(Bytes::from(deque::seed_frame(0, i64::try_from(width)?))),
     )];
-    // `0..=width`: the last one sits past `tail`, outside the window.
+    // `0..=width`: the last entry sits past `tail`, outside the window.
     for i in 0..=width {
         let index = i64::try_from(i)?;
         seeded.push((
@@ -1654,8 +1654,8 @@ async fn seed_wide_deque(
 
 /// Sub-threshold deque iteration streams through the batch verb: a small
 /// committed deque issues **zero** lower-store scans, one bounds point-get, and
-/// one batch read for the entries, in both directions. It then hands the same
-/// fixture to [`assert_wide_deque_scan_is_window_bounded`], which pins the
+/// one batch read for the entries, in both directions. The test then hands the
+/// same fixture to [`assert_wide_deque_scan_is_window_bounded`], which pins the
 /// fallback arm.
 #[test]
 fn deque_stream_issues_no_scans() -> Result<()> {
@@ -1736,17 +1736,17 @@ fn deque_stream_issues_no_scans() -> Result<()> {
     })
 }
 
-/// The wide-window companion of [`deque_stream_issues_no_scans`]: a
+/// The wide-window companion of [`deque_stream_issues_no_scans`]. A
 /// directly-seeded window one entry wider than
-/// [`deque::DEQUE_POINT_ITERATION_MAX`] falls back to exactly one lower scan —
-/// proving the sub-threshold zero is a live counter — and that scan is bounded
-/// by the window, not the section.
+/// [`deque::DEQUE_POINT_ITERATION_MAX`] falls back to exactly one lower scan.
+/// That count proves the sub-threshold zero is a live counter. The window
+/// bounds that scan, not the section.
 ///
-/// [`seed_wide_deque`] plants one row past `tail`, so a scan that walked the
-/// whole section rather than `[head, tail − 1]` would yield it. Both directions
-/// are drained because a regression that kept the limit but dropped the edges
-/// is masked forward (the limit stops the walk short of the extra row) and
-/// immediately visible backward (the extra row becomes the first item).
+/// [`seed_wide_deque`] plants one row past `tail`. A scan over the whole
+/// section, rather than `[head, tail − 1]`, would yield that row. This helper
+/// drains both directions, because a regression that keeps the limit but drops
+/// the edges hides forward and shows backward. Forward, the limit stops the
+/// walk short of the extra row. Backward, the extra row becomes the first item.
 async fn assert_wide_deque_scan_is_window_bounded(
     counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
     oracle: &ScriptedOracle,

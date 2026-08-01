@@ -1,11 +1,13 @@
-//! Contract pins for the managed stream plans a `#[read(op)]` planning
-//! invocation hands back.
+//! Contract pins for the managed stream plans that a `#[read(op)]` planning
+//! invocation returns.
 //!
-//! The subject is the driver, not any one collection: two one-family probe
-//! layouts stand in for every collection that embeds them. [`GatedLayout`]'s
-//! cells resolve through a gate ladder, so a test controls the completion order
-//! of a plan's resolutions and can pin ordering and fan-out; [`PlainLayout`]'s
-//! resolve trivially, which is what the decode-failure and fence pins need.
+//! The subject is the driver, not any one collection. Two one-family probe
+//! layouts stand in for every collection that embeds them.
+//!
+//! [`GatedLayout`]'s cells resolve through a gate ladder. A test therefore
+//! controls the completion order of a plan's resolutions, and can pin order and
+//! fan-out. [`PlainLayout`]'s cells resolve trivially, which is what the
+//! decode-failure and fence pins need.
 
 use crate::codec::{I64Codec, I64CodecError};
 use crate::consumer::middleware::RepinProof;
@@ -47,12 +49,12 @@ const GATE_PROBE: &str = "gate-probe";
 const PLAIN_PROBE: &str = "plain-probe";
 
 /// The gated cell type: an `i64`-addressed cell whose payload is the same
-/// `i64`, resolved through the gate ladder.
+/// `i64`. The gate ladder resolves it.
 type GatedCell = Keyed<I64KeyCodec, WithResolver<I64Codec, GateResolver>>;
 
 collection_layout! {
-    /// A one-family probe layout whose cells resolve through a gate ladder, so
-    /// a test controls the completion order of a plan's resolutions.
+    /// A one-family probe layout whose cells resolve through a gate ladder. A
+    /// test therefore controls the completion order of a plan's resolutions.
     struct GatedLayout {
         /// The gated cells. A staged write lowers through the resolver's
         /// `stored_from` and never runs the gate, so this family seeds itself.
@@ -62,9 +64,9 @@ collection_layout! {
 }
 
 collection_layout! {
-    /// A one-family probe layout over plain, resolver-free `i64` cells — what
-    /// the ordering-independent pins (decode failure, the per-emission fence)
-    /// run on.
+    /// A one-family probe layout over plain, resolver-free `i64` cells. The
+    /// order-independent pins run on it: decode failure and the per-emission
+    /// fence.
     struct PlainLayout {
         /// The probe cells.
         #[id(0)]
@@ -72,17 +74,20 @@ collection_layout! {
     }
 }
 
-/// The session type the gated fixture binds over: the standard memory backend
-/// with the [`GateLoader`] capability slot.
+/// The session type the gated fixture binds over. It is the standard memory
+/// backend with the [`GateLoader`] capability slot.
 type GateSession = KeyedStateSession<TestBackend, GateLoader>;
 
 /// The session type the plain probes bind over.
 type PlainSession = KeyedStateSession<TestBackend, MemoryLoader<Value>>;
 
-/// A per-index resolution ladder: `wait(i)` parks until `release(i)` fires gate
-/// `i`. Rides the session's loader slot so a resolver reads it as its
-/// [`CellResolver::Context`], exercising the custom-context [`FromSession`]
-/// extension point (a local context struct, not the built-in loader borrow).
+/// A per-index resolution ladder. `wait(i)` parks until `release(i)` fires gate
+/// `i`.
+///
+/// The ladder rides the session's loader slot, so a resolver reads it as its
+/// [`CellResolver::Context`]. This exercises the custom-context
+/// [`FromSession`] extension point: a local context struct, not the built-in
+/// loader borrow.
 struct GateLadder {
     gates: Vec<Notify>,
     parked: AtomicUsize,
@@ -99,15 +104,15 @@ impl GateLadder {
     async fn wait(&self, idx: usize) {
         if let Some(gate) = self.gates.get(idx) {
             // On the current-thread runtime the count-then-park pair runs
-            // uninterrupted, so `parked` equals the number of resolutions
-            // waiting on their gates whenever another task observes it.
+            // without interruption. When another task observes `parked`, it
+            // equals the number of resolutions that wait on their gates.
             let notified = gate.notified();
             self.parked.fetch_add(1, Ordering::SeqCst);
             notified.await;
         }
     }
 
-    /// How many resolutions are currently parked on their gates.
+    /// The number of resolutions that park on their gates now.
     fn parked(&self) -> usize {
         self.parked.load(Ordering::SeqCst)
     }
@@ -119,8 +124,8 @@ impl GateLadder {
     }
 }
 
-/// Session capability slot carrying the [`GateLadder`] the [`GateResolver`]
-/// awaits through its context.
+/// The session capability slot that carries the [`GateLadder`]. The
+/// [`GateResolver`] awaits that ladder through its context.
 #[derive(Clone)]
 struct GateLoader(Arc<GateLadder>);
 
@@ -130,10 +135,10 @@ impl GateLoader {
     }
 }
 
-/// Custom resolver context borrowing the gate ladder from the session — the
-/// [`FromSession`] extension a resolver author writes for their own capability.
-/// Coherence-disjoint from the built-in `()` and `&S::Loader` impls by being a
-/// distinct local struct.
+/// A custom resolver context that borrows the gate ladder from the session.
+/// This is the [`FromSession`] extension a resolver author writes for their own
+/// capability. It is a distinct local struct, so it stays coherence-disjoint
+/// from the built-in `()` and `&S::Loader` impls.
 struct GateContext<'s>(&'s GateLadder);
 
 impl<'s> FromSession<'s, GateSession> for GateContext<'s> {
@@ -142,8 +147,8 @@ impl<'s> FromSession<'s, GateSession> for GateContext<'s> {
     }
 }
 
-/// A resolver whose `resolve` blocks on the stored index's gate, so a test
-/// controls the completion order of a plan's in-flight resolutions.
+/// A resolver whose `resolve` blocks on the stored index's gate. A test
+/// therefore controls the completion order of a plan's live resolutions.
 struct GateResolver;
 
 impl CellResolver for GateResolver {
@@ -154,8 +159,8 @@ impl CellResolver for GateResolver {
 
     const RESOLVER_ID: Option<&'static str> = Some("gate");
 
-    // Desugared `-> impl Future + Send` (the house style guarding rustc
-    // #100013): the future holds the borrowed context across the await.
+    // Desugared `-> impl Future + Send`, the house style that guards against
+    // rustc #100013. The future holds the borrowed context across the await.
     fn resolve(
         ctx: Self::Context<'_>,
         stored: i64,
@@ -173,8 +178,8 @@ impl CellResolver for GateResolver {
     }
 }
 
-/// A release order over `0..n`, `n` bounded by the range driver's `buffered`
-/// window so every seeded resolution is in flight at once.
+/// A release order over `0..n`. The range driver's `buffered` window bounds
+/// `n`, so every seeded resolution runs at the same time.
 #[derive(Clone, Debug)]
 struct ReleaseOrder(Vec<usize>);
 
@@ -182,8 +187,8 @@ impl Arbitrary for ReleaseOrder {
     fn arbitrary(g: &mut Gen) -> Self {
         let n = usize::arbitrary(g) % (SHARD_FANOUT_CONCURRENCY + 1);
         let mut order: Vec<usize> = (0..n).collect();
-        // Fisher–Yates over the generator: a uniform permutation of `0..n`,
-        // which includes the fully-reversed worst case.
+        // Fisher–Yates over the generator gives a uniform permutation of
+        // `0..n`. That includes the fully reversed worst case.
         for i in (1..n).rev() {
             let j = usize::arbitrary(g) % (i + 1);
             order.swap(i, j);
@@ -192,19 +197,21 @@ impl Arbitrary for ReleaseOrder {
     }
 }
 
-/// Ordered-window invariant: however the concurrent resolutions of a range plan
-/// complete, its driver (a `buffered` window, never `buffer_unordered`) yields
-/// the cells in key order. The seed count is held at or below
-/// [`SHARD_FANOUT_CONCURRENCY`] so every resolution is in flight at once and
-/// the release order is the completion order.
+/// Ordered-window invariant: a range plan yields its cells in key order under
+/// every completion order of its concurrent resolutions. Its driver is a
+/// `buffered` window, never `buffer_unordered`.
+///
+/// The seed count stays at or below [`SHARD_FANOUT_CONCURRENCY`]. Every
+/// resolution therefore runs at the same time, and the release order is the
+/// completion order.
 #[test]
 fn prop_range_plan_yields_key_order_under_any_release_order() {
     fn prop(order: ReleaseOrder) -> TestResult {
         let ReleaseOrder(order) = order;
         let expected: Vec<i64> = (0..order.len() as i64).collect();
         let debug = format!("release={order:?}");
-        // A fresh current-thread runtime per iteration: the fixture's parked
-        // count is only meaningful when the collector and the releaser share
+        // One fresh current-thread runtime per iteration. The fixture's parked
+        // count means something only when the collector and the releaser share
         // one thread.
         let runtime = match Builder::new_current_thread().enable_all().build() {
             Ok(runtime) => runtime,
@@ -219,9 +226,9 @@ fn prop_range_plan_yields_key_order_under_any_release_order() {
     QuickCheck::new().quickcheck(prop as fn(ReleaseOrder) -> TestResult);
 }
 
-/// The strongest ordered-window case, pinned directly: releasing every
-/// resolution in fully reversed order still yields ascending keys. This is the
-/// case a `buffer_unordered` regression fails hardest.
+/// The strongest ordered-window case, pinned directly. The plan yields
+/// ascending keys even when the test releases every resolution in fully
+/// reversed order. A `buffer_unordered` regression fails this case hardest.
 #[tokio::test(flavor = "current_thread")]
 async fn range_plan_yields_key_order_under_full_reverse_release() -> Result<()> {
     let n = SHARD_FANOUT_CONCURRENCY;
@@ -236,15 +243,15 @@ async fn range_plan_yields_key_order_under_full_reverse_release() -> Result<()> 
     Ok(())
 }
 
-/// Terminate-at-first-error: a range plan over three ascending cells whose
-/// middle payload does not decode yields the low cell, then the decode error,
-/// then ends — the high cell beyond the error is never produced.
+/// Terminate-at-first-error. A range plan runs over three ascending cells, and
+/// the middle payload does not decode. The plan yields the low cell, then the
+/// decode error, then ends. It never produces the high cell past the error.
 #[test]
 fn range_plan_terminates_at_first_error() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let session = plain_session()?;
         let name = StateName::try_new(PLAIN_PROBE)?;
-        // Ascending keys; the middle cell's bytes are not a valid `i64` frame.
+        // Ascending keys. The middle cell's bytes are not a valid `i64` frame.
         for (key, bytes) in [
             (-1_i64, [0_u8; 8].as_slice()),
             (0, b"not an i64".as_slice()),
@@ -284,10 +291,10 @@ fn range_plan_terminates_at_first_error() -> Result<()> {
     })
 }
 
-/// The coordinate driver's fence runs on the exhaustion `None`, not only on
-/// items: a plan whose attempt epoch is bumped after its last item then yields
-/// `Terminated`, never a clean end. The plan is captured before the bump, so
-/// the error can only come from the per-emission fence.
+/// The coordinate driver's fence runs on the exhaustion `None`, not on items
+/// alone. The test bumps the attempt epoch after the plan's last item, and the
+/// plan then yields `Terminated` rather than a clean end. The test captures the
+/// plan before the bump, so only the per-emission fence can raise that error.
 ///
 /// Its empty-plan twin is `empty_coordinate_plan_fences_on_exhaustion` in the
 /// parent module.
@@ -309,7 +316,7 @@ async fn coordinate_plan_fences_after_its_last_item() -> Result<()> {
         Some(Ok((7, 7))) => {}
         other => return Err(eyre!("first pull must be the seeded item, got {other:?}")),
     }
-    // Bump the attempt epoch; the buffered chunk is already drained, so the
+    // Bump the attempt epoch. The buffered chunk is already drained, so the
     // next pull drives the source to exhaustion and the fence catches it.
     session.reset(RepinProof::for_test()).await;
     match stream.next().await {
@@ -320,17 +327,17 @@ async fn coordinate_plan_fences_after_its_last_item() -> Result<()> {
     }
 }
 
-/// One full resolve window runs concurrently: every gated resolver of a
-/// `get_many` parks before any is released.
+/// One full resolve window runs concurrently. Every gated resolver of a
+/// `get_many` parks before the test releases the first gate.
 #[tokio::test(flavor = "current_thread")]
 async fn get_many_resolves_full_window_concurrently() -> Result<()> {
     let n = RESOLVE_FANOUT;
     let ladder = Arc::new(GateLadder::new(n));
     let session = gate_session(ladder.clone())?;
     let cells = bind_gated(&session)?;
-    // Seed all n as staged writes in the same session (payload == key), so the
-    // batch read answers from the overlay — the pin isolates resolve
-    // scheduling.
+    // Seed all n as staged writes in the same session, with payload == key.
+    // The batch read then answers from the overlay, so the pin isolates the
+    // resolve schedule.
     seed_gated(&cells, n).await?;
 
     let keys: Vec<i64> = (0..n as i64).collect();
@@ -339,8 +346,8 @@ async fn get_many_resolves_full_window_concurrently() -> Result<()> {
             .await
             .map_err(|e| eyre!("get_many: {e}"))
     };
-    // With the collector polled first, the full window parks under the one
-    // buffered(RESOLVE_FANOUT) window before any release.
+    // The join polls the collector first. The full window therefore parks
+    // under the one buffered(RESOLVE_FANOUT) window before any release.
     let releaser = async {
         if ladder.parked() != n {
             bail!(
@@ -373,10 +380,10 @@ async fn get_many_resolves_full_window_concurrently() -> Result<()> {
     Ok(())
 }
 
-/// Compile-time regression pin for the `-> impl Future + Send` desugar (rustc
-/// #100013): both managed plan drivers must stay `Send`, since a collection's
-/// stream method returns one out of a `Send` future. A regression to a source
-/// whose `Send` cannot be proven would fail to compile here.
+/// Compile-time regression pin for the `-> impl Future + Send` desugar, which
+/// guards against rustc #100013. Both managed plan drivers must stay `Send`,
+/// because a collection's stream method returns one out of a `Send` future. A
+/// source whose `Send` the compiler cannot prove fails to compile here.
 #[test]
 fn plan_streams_are_send() -> Result<()> {
     fn assert_send<T: Send>(_value: T) {}
@@ -396,8 +403,8 @@ fn plan_streams_are_send() -> Result<()> {
     })
 }
 
-/// Builds a [`GateSession`] over a fresh memory store carrying `ladder`, with
-/// the gated probe registered.
+/// Builds a [`GateSession`] over a fresh memory store that carries `ladder`,
+/// and registers the gated probe.
 fn gate_session(ladder: Arc<GateLadder>) -> Result<GateSession> {
     let descriptor: ValueDescriptor<WithResolver<I64Codec, GateResolver>> = value_state(GATE_PROBE);
     let (parts, _) = session_parts(
@@ -420,8 +427,8 @@ fn plain_session() -> Result<PlainSession> {
 }
 
 /// Binds the gated probe collection over `session`. A layout brand is
-/// independent of the durable identity, so a Value-kind registration admits the
-/// one-family probe layout.
+/// independent of the durable identity, so a Value-kind registration accepts
+/// the one-family probe layout.
 fn bind_gated(session: &GateSession) -> Result<Collection<GateSession, GatedLayout>> {
     Collection::bind(
         session,
@@ -443,8 +450,8 @@ fn bind_plain(session: &PlainSession) -> Result<Collection<PlainSession, PlainLa
     .map_err(|e| eyre!("plain bind failed: {e}"))
 }
 
-/// Seeds cells `0..n` (payload == key) through the collection's own write
-/// scope.
+/// Seeds cells `0..n` through the collection's own write scope, with
+/// payload == key.
 async fn seed_gated(cells: &Collection<GateSession, GatedLayout>, n: usize) -> Result<()> {
     cells
         .write(async |op| {
@@ -457,8 +464,8 @@ async fn seed_gated(cells: &Collection<GateSession, GatedLayout>, n: usize) -> R
         .map_err(|e| eyre!("seeding the gated cells failed: {e}"))
 }
 
-/// Seeds `0..n`, plans a whole-section range, and drains it while releasing the
-/// resolutions in `release` order. The returned keys are what the ordered
+/// Seeds `0..n`, plans a whole-section range, and drains it. The releaser fires
+/// the resolutions in `release` order. The returned keys are what the ordered
 /// `buffered` window yielded.
 async fn ranged_keys(release: &[usize]) -> Result<Vec<i64>> {
     let n = release.len();
@@ -476,8 +483,8 @@ async fn ranged_keys(release: &[usize]) -> Result<Vec<i64>> {
         let mut keys = Vec::new();
         while let Some(item) = stream.next().await {
             let (key, value) = item.map_err(|e| eyre!("range plan: {e}"))?;
-            // The resolver returns the stored payload, which equals the key;
-            // tie them so the decode-and-resolve path is actually exercised.
+            // The resolver returns the stored payload, which equals the key.
+            // Tie them, so the run exercises the decode-and-resolve path.
             if key != value {
                 return Err(eyre!("resolver desync: key {key} != resolved {value}"));
             }
@@ -485,13 +492,15 @@ async fn ranged_keys(release: &[usize]) -> Result<Vec<i64>> {
         }
         Ok::<Vec<i64>, color_eyre::Report>(keys)
     };
-    // `join!` polls the collector first, so all `n <= SHARD_FANOUT_CONCURRENCY`
-    // resolutions register on their gates before the releaser fires them; the
-    // wakes queue in `release` order, which `buffer_unordered` would surface but
-    // `buffered` must not. The releaser PINS that assumption: were any
-    // resolution not yet parked, its release would become a stored permit and
-    // the release order would stop being the completion order — silently
-    // degrading this fixture to a detector that cannot detect.
+    // `join!` polls the collector first. All `n <= SHARD_FANOUT_CONCURRENCY`
+    // resolutions therefore register on their gates before the releaser fires
+    // them. The wakes queue in `release` order, which `buffer_unordered` would
+    // show but `buffered` must not.
+    //
+    // The releaser PINS that assumption. If one resolution were not yet parked,
+    // its release would become a stored permit. The release order would stop
+    // being the completion order, and this fixture would silently become a
+    // detector that cannot detect.
     let releaser = async {
         if ladder.parked() != n {
             bail!(
@@ -504,7 +513,7 @@ async fn ranged_keys(release: &[usize]) -> Result<Vec<i64>> {
         }
         Ok(())
     };
-    // The deadline is a hang-guard, never the assertion; boxed to keep the
+    // The deadline is a hang-guard, never the assertion. The box keeps the
     // joined future off the caller's stack (clippy::large_futures).
     let (collected, outcome) = timeout(
         Duration::from_secs(30),

@@ -5,10 +5,10 @@
 //! the consumer to mint a [`Registered`] capability handle. A handler binds
 //! that handle via
 //! [`EventContext::state`](crate::consumer::event_context::EventContext::state)
-//! to get a typed handle whose `get` reads the value visible to this event and
-//! whose `set` stages a write into the invocation's journal. `state` takes the
-//! handle, never a raw descriptor, so a handler can reach only collections it
-//! registered.
+//! to get a typed handle. That handle's `get` reads the value visible to this
+//! event, and its `set` stages a write into the invocation's journal. `state`
+//! takes the handle, never a raw descriptor, so a handler can reach only the
+//! collections it registered.
 //!
 //! # Composed cell types
 //!
@@ -56,10 +56,10 @@
 //! # Exposure
 //!
 //! Users define codecs, resolvers, and cell types (all public). Defining
-//! collection *kinds* is deliberately unexposed: [`CollectionSpec`] — nameable
-//! downstream because it names a public associated type — is *sealed* by a
-//! marker only the layout macro emits, so a kind can only be declared inside
-//! this crate, and never without a declared durable layout.
+//! collection *kinds* stays deliberately unexposed. [`CollectionSpec`] is
+//! nameable downstream, because it names a public associated type, but a marker
+//! that only the layout macro emits *seals* it. A kind can therefore exist only
+//! inside this crate, and never without a declared durable layout.
 //!
 //! [`StateDescriptor`] is sealed the same way (by the crate-private
 //! `SealedDescriptor` supertrait): a downstream crate can register and bind the
@@ -100,9 +100,9 @@ pub use value::{ValueDescriptor, ValueHandle, ValueKind, value_state};
 /// batch read (one Cassandra query / one fjall hop), whose typed resolves then
 /// fan out under `RESOLVE_FANOUT`. Admission covers that raw batch read only:
 /// the owner takes one per chunk and releases it before the chunk's resolves,
-/// and a published reader holds no gate at all. Owned by the managed
-/// coordinate stream driver, which is what every collection's point-get stream
-/// arm runs on.
+/// and a published reader holds no gate at all. The managed coordinate stream
+/// driver owns this width, and every collection's point-get stream arm runs on
+/// that driver.
 ///
 /// An alias of [`CELL_BATCH`] — the point-get
 /// stream chunk width and the store batch-read width are one number, and the
@@ -128,10 +128,11 @@ pub(crate) const STREAM_CHUNK: usize = CELL_BATCH;
 /// `"message-ref"` format is its own codec and its resolver merely fetches.
 ///
 /// A resolver must never issue a session or collection operation. A point get
-/// resolves while it holds the session gate, so a resolver that re-entered the
-/// non-reentrant gate would deadlock. Other paths release admission first — a
-/// point-get stream chunk before its resolve fan-out, a range page gate-free —
-/// but the contract binds every resolver on every path.
+/// resolves while it holds the session gate. A resolver that re-entered the
+/// non-reentrant gate would therefore deadlock. Other paths release admission
+/// first: a point-get stream chunk releases it before its resolve fan-out, and
+/// a range page runs gate-free. The contract still binds every resolver on
+/// every path.
 pub trait CellResolver {
     /// The decoded cell type this resolver maps from — pinned to the codec's
     /// payload by [`CellType`].
@@ -382,8 +383,9 @@ pub(crate) use sealed::SealedDescriptor;
 /// which binds against the context's per-event session. Binding validates
 /// registration + structural identity through the session's
 /// [`verify_state_registration`] and returns an owned, `Clone` handle over the
-/// bound collection, whose methods each run as one scoped operation; a stream
-/// method runs a planning operation and then drives its plan outside it.
+/// bound collection. Each of that handle's methods runs as one scoped
+/// operation. A stream method runs a planning operation, then drives its plan
+/// outside that operation.
 ///
 /// Sealed by the crate-private `SealedDescriptor` supertrait: the only impls
 /// are the framework's own [`Descriptor<K>`] and its crate-internal access
@@ -540,19 +542,20 @@ impl<D> Registered<D> {
 /// `collection_def`/`with_collection_def`, and `bind` body.
 ///
 /// The framework reads every [`StructuralIdentity`] token straight off
-/// `Cell`'s axes. `Cell` itself is hand-written and could name a family the
-/// layout does not declare, so each kind's frozen-layout assertion pins it to
-/// the key and payload tokens of the data family it addresses.
+/// `Cell`'s axes. `Cell` itself is hand-written, so it could name a family that
+/// the layout does not declare. Each kind's frozen-layout assertion therefore
+/// pins `Cell` to the key and payload tokens of the data family it addresses.
 ///
 /// # Exposure
 ///
 /// This trait names the [`StateDescriptor`] impl's `Handle` associated type, a
-/// public interface, so it is `pub` — but defining collection kinds is
-/// deliberately unexposed, and structurally so: the trait is sealed by a
-/// crate-internal marker that only
-/// [`collection_layout!`](crate::state::collection::collection_layout) emits,
-/// so a kind cannot exist without a declared durable layout. Users compose cell
-/// types (codec + resolver) instead — that surface is fully public.
+/// public interface, so it is `pub`. Defining collection kinds stays
+/// deliberately unexposed, and structurally so. A crate-internal marker seals
+/// the trait, and only
+/// [`collection_layout!`](crate::state::collection::collection_layout) emits
+/// that marker, so a kind cannot exist without a declared durable layout.
+/// Users compose cell types (codec + resolver) instead. That surface is fully
+/// public.
 pub trait CollectionSpec: SealedSpec + Sized {
     /// This kind's durable discriminator.
     const KIND: CollectionKindId;
@@ -646,7 +649,8 @@ impl<K: CollectionSpec> StateDescriptor for Descriptor<K> {
     }
 }
 
-/// Error returned by a typed cell operation — one scoped collection command.
+/// Error returned by a typed cell operation, which is one scoped collection
+/// command.
 #[derive(Debug, Error)]
 pub enum CellStateError<E>
 where
@@ -661,8 +665,8 @@ where
     Codec(#[source] E),
 
     /// A stored key coordinate did not decode back to a logical key. Only a
-    /// coordinate decode can produce it — that is, a stream. Every point
-    /// command encodes the caller's key and never decodes a stored one.
+    /// coordinate decode produces this error, so only a stream can raise it.
+    /// Every point command encodes the caller's key and decodes no stored one.
     #[error(transparent)]
     Key(#[from] KeyCodecError),
 }

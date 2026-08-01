@@ -21,9 +21,9 @@
 //!
 //! # The byte boundary
 //!
-//! Cell bytes are spoken here and nowhere else: one decode/encode pair is what
-//! every collection's values pass through, and a command's typed key is lowered
-//! to its order-preserving coordinate before any engine sees it. Collection
+//! This module speaks cell bytes, and no other module does. One decode/encode
+//! pair carries every collection's values. A command lowers its typed key to
+//! the order-preserving coordinate before any engine sees the key. Collection
 //! code names no `Bytes`, `CellKey`, permit, or source.
 
 use crate::codec::{Codec, SerializeBufGuard};
@@ -538,9 +538,9 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
     /// settings; no I/O.
     fn keyset_limit(&self) -> usize;
 
-    /// The Deque push cap: at most this many window slots before a push evicts
-    /// from the far end, or `None` when unbounded. Read from the binding's
-    /// captured settings; no I/O.
+    /// The Deque push cap. A push evicts from the far end above this many
+    /// window slots. `None` means unbounded. Reads the binding's captured
+    /// settings, with no I/O.
     fn capacity(&self) -> Option<NonZeroUsize>;
 
     /// Reads, decodes, and resolves the visible value at `key`.
@@ -596,21 +596,20 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
 
 /// The mutation commands, implemented only by the write operation.
 ///
-/// `set` and `clear` are synchronous: encoding and staging perform no I/O, so
-/// representing them as futures would add suspension points without work. `set`
-/// is fallible only at typed encoding; a point clear cannot fail after
-/// admission. [`take`](Self::take) is the one exception, because it reads
-/// first.
+/// `set` and `clear` are synchronous. They encode and stage, and do no I/O, so
+/// a future would add a suspension point without work. `set` can fail only at
+/// typed encoding, and a point clear cannot fail after admission.
+/// [`take`](Self::take) is the one exception, because it reads first.
 pub(crate) trait CollectionWrite: CollectionRead {
     /// Reads, decodes, and resolves the value at `key`, then stages a clear of
-    /// it — the one supported read-then-mutate composite.
+    /// that cell. This is the one supported read-then-mutate composite.
     ///
-    /// The read completes first: a read error stages nothing, while `Ok(None)`
-    /// still clears the addressed residue.
+    /// The read completes first. A read error stages nothing. `Ok(None)` still
+    /// clears the addressed residue.
     ///
-    /// Declared rather than provided: a default body over an opaque `Self`
-    /// cannot prove the returned future `Send` for its `&mut Self` and
-    /// `&KeyOf<T>` captures.
+    /// The trait declares this method and gives no default body. A default body
+    /// over an opaque `Self` cannot prove the returned future `Send` for its
+    /// `&mut Self` and `&KeyOf<T>` captures.
     ///
     /// # Errors
     ///

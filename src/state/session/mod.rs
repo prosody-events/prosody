@@ -115,8 +115,8 @@ mod tests;
 /// [`KeyedStateSession`] and the published reader's
 /// [`ReadSession`](crate::state_reader::ReadSession) share one implementation.
 ///
-/// `CellRead` is the raw cell surface. The collection engine and the reader
-/// bridge are its only callers, and binding is what names the pair.
+/// `CellRead` is the raw cell surface. Only the collection engine and the
+/// reader bridge call it, and binding is what names the pair.
 ///
 /// `get`/`get_many`/`scan` describe the session's **visible committed bytes**
 /// for a cell — [`KeyedStateSession`] realises that through the dirty overlay +
@@ -209,9 +209,9 @@ pub trait CellRead: ReadAdmission + StateSession {
 pub trait CellWrite: CellRead + StateLifecycle + MarkerIdentity + WritableStateSession {
     /// A held gate permit that additionally witnesses a session **mutation**,
     /// returned by [`Self::mutate_permit`] after the ordered admission. The
-    /// owner's `sealed::MutatePermit` states the read-under-mutate rule this
-    /// `Deref` bound encodes. `Sync` because the permit is held across
-    /// `.await`s inside a `Send` mutator future.
+    /// owner's `sealed::MutatePermit` states the read-under-mutate rule that
+    /// this `Deref` bound encodes. It is `Sync` because a `Send` mutator future
+    /// holds the permit across its `.await`s.
     type MutatePermit<'s>: Send + Sync + DerefMut<Target = <Self as ReadAdmission>::Permit<'s>>
     where
         Self: 's;
@@ -595,9 +595,9 @@ pub(crate) mod sealed {
     /// termination — see
     /// [`CellWrite::mutate_permit`](super::CellWrite::mutate_permit)). The
     /// write engine's `validate_write` and journal `apply`
-    /// (`crate::state::collection::owner`) demand
-    /// `&S::MutatePermit<'_>`; the owner session's is this struct. A read
-    /// permit at a write does not compile. A scoped write invocation holds one
+    /// (`crate::state::collection::owner`) demand `&S::MutatePermit<'_>`, and
+    /// the owner session's is this struct. A read permit at a write does not
+    /// compile. A scoped write invocation holds one
     /// across its whole body and hands its [`Deref`] target to the
     /// journal-replay sinks [`OpPermit`] names at replay.
     /// It [`Deref`]s to [`OpPermit`], so a mutator's

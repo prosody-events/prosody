@@ -3,20 +3,19 @@
 //! The behavioral invariants (the dense window, crash atomicity, residue
 //! skipping) are proven by the memory-backed `run_deque_trace` property in
 //! [`crate::state::tests`]; the frozen `head ‖ tail` frame bytes are pinned by
-//! the pair codec's own goldens (`crate::codec`). These pin the durable cell
-//! addresses and the collection-owned `head ≤ tail` window check.
+//! the pair codec's own goldens (`crate::codec`). The tests here pin the
+//! durable cell addresses and the collection-owned `head ≤ tail` window check.
 
 use super::*;
 use quickcheck::{QuickCheck, TestResult};
 
-/// The frozen cell addresses (a durable contract — the bounds family lowers to
-/// section `0` at the empty coordinate, the entries family to section `1`) and
-/// the reset domain a `clear` covers.
+/// The frozen cell addresses and the reset domain that a `clear` covers. The
+/// addresses are a durable contract: the bounds family lowers to section `0` at
+/// the empty coordinate, and the entries family lowers to section `1`.
 ///
-/// The declared ids, format tokens, and section count are additionally pinned
-/// by the `const` assertion beside the layout; this test pins what the two
-/// cell-address helpers resolve to, which is the address every seeded-cell test
-/// writes through.
+/// The `const` assertion beside the layout also pins the declared ids, format
+/// tokens, and section count. This test pins what the two cell-address helpers
+/// resolve to, which is the address every seeded-cell test writes through.
 #[test]
 fn deque_layout_is_frozen() {
     let sections = <FrozenLayout as CollectionLayout>::SECTIONS;

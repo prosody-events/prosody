@@ -11,9 +11,9 @@
 //! must leave the event overlay exactly at the model, and every other exit must
 //! leave the overlay exactly as the invocation found it.
 //!
-//! The managed stream drivers a plan feeds — ordering, error termination, the
-//! per-emission fence, and the resolve fan-out — are in the sibling
-//! [`plans`] module.
+//! The sibling [`plans`] module pins the managed stream drivers that a plan
+//! feeds. It covers order, error termination, the per-emission fence, and the
+//! resolve fan-out.
 
 mod plans;
 
@@ -135,12 +135,13 @@ where
         Err(CellStateError::Access(StateAccessError::Unavailable))
     }
 
-    /// Takes `LEFT[key]`, **swallows** whatever it returns, then stages an
-    /// unrelated write and returns whether the take succeeded — so the
-    /// invocation merges either way and the take's staging (or its absence) is
-    /// observable on the overlay. The only shape in which a *failed* command's
-    /// journal contribution can be inspected: an invocation that propagates the
-    /// error drops the whole journal.
+    /// Takes `LEFT[key]`, **swallows** the result, stages an unrelated write,
+    /// and reports whether the take succeeded. The invocation therefore merges
+    /// on both paths, and the overlay shows what the take staged.
+    ///
+    /// This is the only shape that exposes a *failed* command's journal
+    /// contribution. An invocation that propagates the error drops the whole
+    /// journal.
     #[write(op)]
     async fn take_swallowing(&self, key: i64, marker: i64) -> Result<bool, ProbeError> {
         let took = op.take(PairLayout::LEFT, &key).await.is_ok();
@@ -591,16 +592,14 @@ fn failed_write_leaves_the_overlay_unchanged() -> Result<()> {
     })
 }
 
-/// A `take` whose read fails stages nothing: the addressed cell still holds the
-/// bytes that would not decode, rather than the absence a staged clear would
-/// have replayed.
+/// A `take` whose read fails stages nothing. The addressed cell keeps the bytes
+/// that did not decode. A staged clear would instead have replayed an absence.
 ///
-/// Observed through a probe that **swallows** the take's error and returns
-/// `Ok` — the only shape in which a failed command's journal contribution is
-/// observable, since an invocation that propagates the error drops the whole
-/// journal. The seeded bytes go straight into the overlay, and the assertion
-/// reads the overlay back raw, so nothing in between could heal a clear that
-/// should not be there.
+/// The probe **swallows** the take's error and returns `Ok`. That is the only
+/// shape that exposes a failed command's journal contribution, because an
+/// invocation that propagates the error drops the whole journal. The test seeds
+/// the bytes straight into the overlay, then reads the overlay back raw. No
+/// layer between them can heal a clear that must not be there.
 #[test]
 fn take_error_does_not_clear() -> Result<()> {
     /// Bytes no `I64Codec` cell can decode.
