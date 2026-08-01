@@ -694,8 +694,9 @@ where
 
     /// Durably commits this deque's buffered ops mid-handler — entries and
     /// the window bounds together. At-least-once; see
-    /// [`CellWrite::commit`](crate::state::session::CellWrite::commit) for the
-    /// contract, including the over-budget batch split.
+    /// the mid-handler durability section on the
+    /// [`collection`](crate::state::collection) module for the contract,
+    /// including the over-budget batch split.
     ///
     /// # Errors
     ///
@@ -711,8 +712,8 @@ where
     /// Discards this deque's buffered uncommitted ops — entries and the window
     /// bounds together — reverting reads to the last [`commit`](Self::commit),
     /// or the pre-event committed state if none. Infallible; see
-    /// [`CellWrite::rollback`](crate::state::session::CellWrite::rollback) for
-    /// the contract.
+    /// the mid-handler durability section on the
+    /// [`collection`](crate::state::collection) module for the contract.
     #[instrument(name = "deque.rollback", skip_all, fields(collection = self.cells.name().as_str()))]
     pub async fn rollback(&self) -> StoreOutcome
     where

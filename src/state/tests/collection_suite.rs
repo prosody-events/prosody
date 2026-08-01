@@ -34,6 +34,7 @@ use super::support::assert_no_settlement_residue;
 use crate::codec::{Codec, JsonCodec};
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
+use crate::state::collection::StateSession;
 use crate::state::descriptor::map::{entry_cell_for, keyset_cell};
 use crate::state::descriptor::{
     DequeHandle, MapHandle, StateDescriptor, deque, deque_state, map_state,
@@ -46,9 +47,7 @@ use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::resolve::sweep_provisional;
 use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
-use crate::state::session::{
-    CellRead, Finalized, KeyedStateSession, SessionParts, TerminationWatch,
-};
+use crate::state::session::{Finalized, KeyedStateSession, SessionParts, TerminationWatch};
 use crate::state::store::{CELL_BATCH, CellStore};
 use crate::state::{
     CollectionId, CollectionRef, CommitMode, Direction, EventRef, PartitionBackend, StateKey,
@@ -1419,7 +1418,7 @@ fn assert_keyset_present(
 /// endpoint peeks (`peek_front == get(0)`, `peek_back == get(len-1)`).
 async fn assert_deque<S, C>(handle: &DequeHandle<S, C>, model: &VecDeque<Value>) -> Result<bool>
 where
-    S: CellRead,
+    S: StateSession,
     C: Codec<Payload = Value>,
 {
     if handle.len().await? != model.len() || handle.is_empty().await? != model.is_empty() {
@@ -1449,7 +1448,7 @@ where
 /// `len` is separately pinned to the model at every call site.
 async fn assert_peeks<S, C>(handle: &DequeHandle<S, C>) -> Result<bool>
 where
-    S: CellRead,
+    S: StateSession,
     C: Codec<Payload = Value>,
 {
     if handle.peek_front().await? != handle.get(0).await? {
@@ -1480,7 +1479,7 @@ where
 /// Collects a deque handle's `stream(dir)` into a vector.
 async fn collect_deque<S, C>(handle: &DequeHandle<S, C>, dir: Direction) -> Result<Vec<Value>>
 where
-    S: CellRead,
+    S: StateSession,
     C: Codec<Payload = Value>,
 {
     drain(handle.stream(dir)).await
@@ -1494,7 +1493,7 @@ async fn assert_map<S>(
     model: &BTreeMap<i64, Value>,
 ) -> Result<bool>
 where
-    S: CellRead,
+    S: StateSession,
 {
     for key in KEY_POOL {
         let got = handle.get(&key).await?;
@@ -1529,7 +1528,7 @@ async fn collect_map<S>(
     dir: Direction,
 ) -> Result<Vec<(i64, Value)>>
 where
-    S: CellRead,
+    S: StateSession,
 {
     drain(handle.stream(dir)).await
 }
@@ -1540,7 +1539,7 @@ async fn collect_map_keys<S>(
     dir: Direction,
 ) -> Result<Vec<i64>>
 where
-    S: CellRead,
+    S: StateSession,
 {
     drain(handle.keys(dir)).await
 }

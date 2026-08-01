@@ -37,7 +37,6 @@ use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::sealed::StateLifecycle;
-use crate::state::session::{CellRead, CellWrite};
 use crate::state::store::CELL_BATCH;
 use crate::state::tests::support::{CountingCellStore, FixedOracle};
 use crate::state::{CollectionKindId, StateAccessError, StateKey, StateType};
@@ -158,7 +157,7 @@ fn probe_descriptor() -> ValueDescriptor<I64Codec> {
 }
 
 /// Binds the probe handle over `session`.
-fn bind_probe<S: CellRead>(session: &S) -> Result<PairHandle<S>> {
+fn bind_probe<S: StateSession>(session: &S) -> Result<PairHandle<S>> {
     let collection = Collection::bind(
         session,
         PROBE,
@@ -618,9 +617,8 @@ fn take_error_does_not_clear() -> Result<()> {
             coordinate: I64KeyCodec::encode(&KEY),
         };
         session
-            .set(StateType::Application, &name, &left, BAD)
-            .await
-            .map_err(|e| eyre!("seeding the undecodable cell failed: {e}"))?;
+            .seed(StateType::Application, &name, &left, Some(BAD))
+            .await;
 
         assert!(
             !handle.take_swallowing(KEY, 42).await?,

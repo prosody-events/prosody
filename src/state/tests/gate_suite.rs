@@ -6,10 +6,9 @@
 //! seam withholding one lower response so the racing op is **forced** into
 //! the bad interleaving (a post-race assert alone proves nothing). Each pin
 //! asserts the outcome equals *some* serial order of the two ops; each goes
-//! red by removing the relevant op's admission — deleting the handle-level
-//! permit acquisition for the kinds that still take one, or making
-//! `OwnerEngine::begin_write` hand back a witness over an already-released
-//! permit for the kinds that run as scoped operations. A
+//! red by removing the relevant op's admission — making
+//! `OwnerEngine::begin_read` or `OwnerEngine::begin_write` hand back a witness
+//! over an already-released permit. A
 //! cancel-safety pin covers the futurelock posture's safe half (dropping a
 //! holding or queued session-op future releases the gate), and the closure
 //! pin proves settlement fences mutators while post-settle reads still

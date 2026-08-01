@@ -64,8 +64,7 @@
 //! [`StateDescriptor`] is sealed the same way (by the crate-private
 //! `SealedDescriptor` supertrait): a downstream crate can register and bind the
 //! framework's descriptors but cannot add its own impl, so no custom descriptor
-//! can receive the raw, gate-free [`CellRead`] session from `bind` and reach
-//! cells outside the per-event session gate. The two seals cover different
+//! can receive the raw session from `bind`. The two seals cover different
 //! things — [`CollectionSpec`] seals cell *reach* for kinds, this seals
 //! descriptor *authorship*.
 
@@ -76,7 +75,6 @@ use crate::state::collection::sealed_spec::SealedSpec;
 use crate::state::collection::{Collection, StateSession};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::registry::{CollectionDef, ReadCachePolicy, StateVisibility};
-use crate::state::session::CellRead;
 use crate::state::store::CELL_BATCH;
 use crate::state::{CollectionKindId, CommitMode, StateType};
 use crate::timers::duration::CompactDuration;
@@ -362,8 +360,7 @@ pub trait DescriptorIdentity {
 /// crate-internal access tunnels (`LifecycleAccess` and `MarkerAccess` in
 /// [`crate::state::session`]). A downstream crate can name [`StateDescriptor`]
 /// in bounds and call `bind`, but cannot add an impl — so it can never hand its
-/// own `bind` the raw, gate-free [`CellRead`] session and reach cells outside
-/// the KV4 session gate.
+/// own `bind` a raw session and reach cells outside a scoped operation.
 pub(crate) mod sealed {
     use super::Descriptor;
 
@@ -376,34 +373,28 @@ pub(crate) mod sealed {
 pub(crate) use sealed::SealedDescriptor;
 
 /// A typed view over one keyed-state collection, bindable to any
-/// [`CellRead`] session.
+/// [`StateSession`].
 ///
 /// Handlers reach this through
 /// [`EventContext::state`](crate::consumer::event_context::EventContext::state),
-/// which binds against the context's per-event session. Binding validates
-/// registration + structural identity through the session's
-/// [`verify_state_registration`] and returns an owned, `Clone` handle over the
-/// bound collection. Each of that handle's methods runs as one scoped
-/// operation. A stream method runs a planning operation, then drives its plan
-/// outside that operation.
+/// which binds against the context's per-event session. Binding validates the
+/// collection through the session's engine — registration and structural
+/// identity for the owner, the acquisition-validated descriptor for a published
+/// reader — and returns an owned, `Clone` handle over the bound collection.
+/// Each of that handle's methods runs as one scoped operation. A stream method
+/// runs a planning operation, then drives its plan outside that operation.
 ///
 /// Sealed by the crate-private `SealedDescriptor` supertrait: the only impls
 /// are the framework's own [`Descriptor<K>`] and its crate-internal access
 /// tunnels, so `bind`'s raw-session access stays framework-only (see the
 /// module's Exposure note).
-///
-/// [`verify_state_registration`]: CellRead::verify_state_registration
 pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     /// Typed handle returned by [`Self::bind`]; owns a clone of the binding
-    /// [`CellRead`] session.
-    ///
-    /// The bound stays [`CellRead`] rather than [`StateSession`] — which
-    /// [`CollectionSpec::Handle`] uses — because `bind` is what *validates* the
-    /// session, through [`CellRead::verify_state_registration`].
-    type Handle<S: CellRead>;
+    /// session.
+    type Handle<S: StateSession>;
 
-    /// Validates registration + structural identity and returns the typed
-    /// handle.
+    /// Validates the collection against the session's engine and returns the
+    /// typed handle.
     ///
     /// Consumes the descriptor — descriptors are cheap `Copy` declarations.
     /// Handlers never call this directly; they pass the [`Registered`] handle
@@ -416,7 +407,7 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     /// collection is unregistered, or
     /// [`StateAccessError::IdentityMismatch`] when it is registered with a
     /// different identity.
-    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
+    fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
 
     /// The operational settings this descriptor carries into registration, set
     /// via its fluent methods (see [`Self::ttl`]).
@@ -625,9 +616,9 @@ impl<K: CollectionSpec> DescriptorIdentity for Descriptor<K> {
 }
 
 impl<K: CollectionSpec> StateDescriptor for Descriptor<K> {
-    type Handle<S: CellRead> = K::Handle<S>;
+    type Handle<S: StateSession> = K::Handle<S>;
 
-    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
+    fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
         // The binding carries the descriptor's `state_type`, so the
         // collection's commands address the right namespace.
         let collection = Collection::bind(

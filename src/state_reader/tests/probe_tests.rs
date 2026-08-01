@@ -21,14 +21,11 @@ use crate::Key;
 use crate::codec::JsonCodec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::ReadCachePolicy;
-use crate::state::StateType;
-use crate::state::cell_key::{Direction, Scan, ScanEdge};
-use crate::state::descriptor::map::{entry_cell_for, keyset_cell};
+use crate::state::cell_key::Direction;
 use crate::state::descriptor::{
     DequeDescriptor, StateDescriptor, deque_state, map_state, value_state,
 };
-use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
-use crate::state::session::CellRead;
+use crate::state::order_codec::I64KeyCodec;
 use crate::state_reader::backend::ScriptedReaderBackend;
 use crate::state_reader::{StateReader, StateReaderError};
 use color_eyre::eyre::{Result, bail, eyre};
@@ -546,72 +543,6 @@ async fn one_session_selects_its_source_once() -> Result<()> {
         (env.cells.reads(empty), env.cells.reads(answering)),
         (1, 2),
         "the second read addressed the selection without probing again"
-    );
-    Ok(())
-}
-
-/// A [`CellRead::scan`] stream built before anything pinned still addresses the
-/// selection a sibling read makes afterwards, instead of opening a second
-/// source. The session pin is sampled at the stream's FIRST POLL, not at
-/// construction, so `SingleSourceCoherence` holds even for a caller that defers
-/// the poll.
-///
-/// Source A holds only its keyset cell (its one entry was removed); source B
-/// holds two entries. The entries scan is built while nothing is selected, a
-/// keyset read then pins A, and the deferred scan must answer from A — empty —
-/// never B's entries.
-///
-/// Falsify: sample the pin at `scan_from`'s call site (`self.pin.get()` as the
-/// `selected` argument) instead of inside its `try_stream!` body. The stream
-/// then probes, falls through the entry-free A, and yields B's two entries.
-#[tokio::test]
-async fn deferred_scan_addresses_a_later_pin() -> Result<()> {
-    let env = ScriptedEnv::new(map_state::<I64KeyCodec, JsonCodec>("m-deferred-scan"))?;
-    let key = Key::from("user-1");
-    let (tp_a, tp_b) = (topic("topic-a"), topic("topic-b"));
-
-    // A keeps a keyset cell but no entry cell; B (the decoy) holds two entries.
-    env.commit(GROUP_A, tp_a, &key, 1, |h| async move {
-        h.set(0, Value::from("A0"))
-            .await
-            .map_err(|e| eyre!("{e}"))?;
-        h.remove(&0).await.map_err(|e| eyre!("{e}"))
-    })
-    .await?;
-    env.commit(GROUP_B, tp_b, &key, 2, |h| async move {
-        for k in [1_i64, 2] {
-            h.set(k, Value::from("B")).await.map_err(|e| eyre!("{e}"))?;
-        }
-        Ok(())
-    })
-    .await?;
-    env.publish(GROUP_A, tp_a).await;
-    env.publish(GROUP_B, tp_b).await;
-
-    let session = env.reader_eager()?.session(key).await?;
-    let entries = entry_cell_for(&I64KeyCodec::encode(&0)).section;
-    let scan = Scan {
-        section: entries,
-        start: ScanEdge::Unbounded,
-        dir: Direction::Forward,
-        end: ScanEdge::Unbounded,
-        limit: None,
-    };
-    // Built, deliberately not polled: nothing is selected yet.
-    let deferred = session.scan(StateType::Application, &env.name, scan);
-
-    // A sibling read pins A — it is the lowest source holding the keyset cell.
-    let pinned = session
-        .get(StateType::Application, &env.name, &keyset_cell())
-        .await?;
-    assert!(pinned.is_some(), "the keyset read must pin a source");
-
-    let scanned: Vec<_> = deferred.collect::<Vec<_>>().await;
-    assert!(
-        scanned.is_empty(),
-        "the deferred scan must address the pinned entry-free source A, not probe into B (yielded \
-         {} cells)",
-        scanned.len()
     );
     Ok(())
 }

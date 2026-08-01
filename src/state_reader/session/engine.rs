@@ -2,11 +2,11 @@
 //! call.
 //!
 //! Its whole invocation state is that call's own source selection, seeded from
-//! and published back to the session-shared [`PinnedSource`] so the invocation
-//! and the `CellRead` bridge paths never disagree about which source answers.
-//! An invocation that never selected one falls back to the shared cell before
-//! it will probe. Two operations on one reader otherwise share nothing and
-//! overlap freely.
+//! and published back to the session-shared [`PinnedSource`], so two
+//! invocations on one session never disagree about which source answers. An
+//! invocation that never selected one falls back to the shared cell before it
+//! will probe. Two operations on one reader otherwise share nothing and overlap
+//! freely.
 //!
 //! There is deliberately **no** [`WriteEngine`](sealed::WriteEngine) impl here:
 //! the write scope exists only for a session whose engine has one, so a reader
@@ -20,6 +20,8 @@ use crate::codec::Codec;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::collection::{StateSession, sealed};
+use crate::state::descriptor::StructuralIdentity;
+use crate::state::registry::{CollectionDef, MAX_KEYSET_LIMIT};
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::ReaderBackend;
@@ -53,6 +55,34 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
     /// Operation-local source selection: the session's already-published
     /// selection, or `None` until a command first finds stored data.
     type ReadInner<'a> = Option<PinnedSource>;
+
+    /// Identity was validated at acquisition against every source. The
+    /// descriptor is the source of both this session's collection and the
+    /// handle's asserted identity, so a self-check is redundant.
+    fn verify_registration(
+        session: &ReadSession<C, B>,
+        _name: &'static str,
+        _state_type: StateType,
+        _identity: &StructuralIdentity,
+    ) -> Result<StateName, StateAccessError> {
+        Ok(session.context.name.clone())
+    }
+
+    /// The reader's own descriptor settings, except the keyset bound: the
+    /// persisted keyset records its own overflow, and the global validated
+    /// ceiling safely admits every tracked keyset regardless of the reader's
+    /// local operational setting — so binding can never change a reader
+    /// stream's tracked-versus-scan arm.
+    fn collection_def(
+        session: &ReadSession<C, B>,
+        _state_type: StateType,
+        _name: &StateName,
+    ) -> CollectionDef {
+        CollectionDef {
+            keyset_limit: MAX_KEYSET_LIMIT,
+            ..session.context.def.collection
+        }
+    }
 
     async fn begin_read(session: &ReadSession<C, B>) -> Self::ReadInner<'_> {
         // Admission is not a concept here: the invocation starts from whatever
@@ -117,10 +147,10 @@ impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for Re
     }
 }
 
-/// Publishes an invocation's first selection to the session-shared cell, so the
-/// bridge paths address the same source. Discarding the `set` result is safe:
-/// one operation's reads are sequential, so no other selection can have landed
-/// in between.
+/// Publishes an invocation's first selection to the session-shared cell, so a
+/// later invocation on the same session addresses the same source. Discarding
+/// the `set` result is safe: one operation's reads are sequential, so no other
+/// selection can have landed in between.
 fn publish<C: Codec, B: ReaderBackend<C>>(
     session: &ReadSession<C, B>,
     selection: Option<&PinnedSource>,

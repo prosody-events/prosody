@@ -1,9 +1,8 @@
 //! The per-operation read session that runs probe-and-pin.
 //!
-//! A [`ReadSession`] implements [`CellRead`](crate::state::session::CellRead)
-//! only. It has no mutator bound, so a handle built from a reader cannot
-//! express a mutation. Call this the `ReadOnlyHandleCannotMutate` invariant.
-//! One session is built per
+//! A [`ReadSession`] binds an engine with no write half, so a handle built from
+//! a reader cannot express a mutation. Call this the
+//! `ReadOnlyHandleCannotMutate` invariant. One session is built per
 //! `StateReader` operation and captures an immutable snapshot. One logical
 //! operation therefore resolves against one exact source set and pins at most
 //! one source. Call this the `SingleSourceCoherence` invariant.
@@ -21,17 +20,15 @@
 //! reads: `probe_batch` fans one batch out to every source at once, and still
 //! resolves to one pin. On every engine path the invocation's
 //! `&mut Option<PinnedSource>` (see [`engine`]) stops two overlapping unpinned
-//! reads from compiling. The `&self` bridge paths below rely on convention.
+//! reads from compiling.
 //!
 //! The selection reaches the read paths two ways, and the two agree. A scoped
 //! collection operation carries its own invocation-local selection: the reader
 //! engine seeds it from the session-shared [`PinnedSource`] and publishes the
 //! first one it makes back to that shared cell. A managed stream carries the
-//! selection its planning command captured. The `CellRead` bridge paths (`get`,
-//! `get_many`, `scan`) read the shared cell directly. No collection calls them
-//! now, but they stay correct, because the surface outlives its callers. The
-//! precedence is uniform: a captured selection wins, an uncaptured one defers
-//! to the shared cell, and only a wholly unselected read probes.
+//! selection its planning command captured. The precedence is uniform: a
+//! captured selection wins, an uncaptured one defers to the shared cell, and
+//! only a wholly unselected read probes.
 //!
 //! Probe-and-pin is the reader's source-selection strategy:
 //!
@@ -70,14 +67,14 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::task::coop::cooperative;
 
-mod bridge;
 mod context;
 pub(crate) mod engine;
 
 pub(crate) use context::{ReaderCollectionDef, ReaderContext};
 
 /// A per-operation read-only session over a collection's validated publication
-/// snapshot. Implements [`CellRead`](crate::state::session::CellRead) only.
+/// snapshot. Its engine carries no write half, so a handle built from one
+/// cannot express a mutation (`ReadOnlyHandleCannotMutate`).
 ///
 /// It is public because it appears in the `FromSession` bounds on
 /// [`StateReader`](super::StateReader)'s read methods, mirroring the owner's
@@ -88,10 +85,9 @@ pub struct ReadSession<C: Codec, B> {
     context: ReaderContext<C, B>,
     snapshot: Arc<ValidatedPublications>,
     key: Key,
-    /// Bridge: the session-shared selection, so every call after the first
+    /// The session-shared selection, so every invocation after the first
     /// data-bearing probe addresses one source. The engine seeds each
-    /// invocation from it and publishes back. The `CellRead` paths read it
-    /// directly. It dies with the `CellRead` surface.
+    /// invocation from it and publishes the first selection back.
     pin: Arc<OnceLock<PinnedSource>>,
 }
 
@@ -427,6 +423,12 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     /// difference today: a range plan pages exactly once and issues nothing
     /// after, and a coordinate plan only has keys because its keyset read
     /// already pinned.
+    // Ruling: the unselected arms below (the session-pin fallback, then the
+    // sequential probe) are this function's total-domain answer for a plan
+    // captured before any selection. No planning command builds one today —
+    // every range arm follows a metadata point read that pins — so they are
+    // unreached rather than dead. Encoding that in the plan type belongs with
+    // the reader's snapshot work, not here.
     fn scan_from<'a>(
         &'a self,
         selected: Option<&'a PinnedSource>,

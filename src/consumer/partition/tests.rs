@@ -611,7 +611,7 @@ mod unwind {
     use crate::state::dirty::DirtyStore;
     use crate::state::manager::EventStateScope;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::{CellRead, KeyedStateSession, SessionParts, TerminationWatch};
+    use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
     use crate::state::tests::cell_suite::value_cell;
     use crate::state::{EventRef, StateKey, StateName, StateType};
     use crate::timers::duration::CompactDuration;
@@ -680,7 +680,7 @@ mod unwind {
         /// non-terminated session over the same overlay — the residue probe.
         async fn residue(&self) -> Result<Option<Bytes>> {
             self.session()
-                .get(
+                .peek(
                     StateType::Application,
                     &StateName::try_new(NAME)?,
                     &value_cell(),

@@ -178,8 +178,8 @@ where
 
     /// Durably commits the staged write mid-handler, so it survives a restart
     /// after failure. At-least-once; see
-    /// [`CellWrite::commit`](crate::state::session::CellWrite::commit) for the
-    /// contract.
+    /// the mid-handler durability section on the
+    /// [`collection`](crate::state::collection) module for the contract.
     ///
     /// # Errors
     ///
@@ -195,8 +195,8 @@ where
     /// Discards the staged uncommitted write, reverting reads to the last
     /// [`commit`](Self::commit) — or the pre-event committed value if none.
     /// Infallible; see
-    /// [`CellWrite::rollback`](crate::state::session::CellWrite::rollback) for
-    /// the contract.
+    /// the mid-handler durability section on the
+    /// [`collection`](crate::state::collection) module for the contract.
     #[instrument(name = "value.rollback", skip_all, fields(collection = self.cells.name().as_str()))]
     pub async fn rollback(&self) -> StoreOutcome
     where

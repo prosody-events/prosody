@@ -12,7 +12,7 @@ use crate::consumer::{Managers, ProsodyConsumer, RuntimeState, WatermarkVersion}
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
-use crate::state::session::CellWrite;
+use crate::state::session::EventSession;
 use crate::telemetry::Telemetry;
 use crate::timers::store::TriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType, MOCK_CLUSTER_BOOTSTRAP};
@@ -72,7 +72,7 @@ where
     P: TriggerStoreProvider,
     SP: PartitionStateProvider<P::Store>,
     <SP::Manager as PartitionStateManager>::Session:
-        CellWrite<Loader: MessageLoader<Payload = C::Payload>>,
+        EventSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
 {

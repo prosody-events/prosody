@@ -22,8 +22,8 @@ use crate::state::descriptor::{
     WithResolver, value_state,
 };
 use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
+use crate::state::session::KeyedStateSession;
 use crate::state::session::sealed::StateLifecycle;
-use crate::state::session::{CellWrite, KeyedStateSession};
 use crate::state::{
     CollectionKindId, RESOLVE_FANOUT, SHARD_FANOUT_CONCURRENCY, StateAccessError, StateKey,
     StateName, StateType,
@@ -262,9 +262,8 @@ fn range_plan_terminates_at_first_error() -> Result<()> {
                 coordinate: I64KeyCodec::encode(&key),
             };
             session
-                .set(StateType::Application, &name, &cell, bytes)
-                .await
-                .map_err(|e| eyre!("seed {key}: {e}"))?;
+                .seed(StateType::Application, &name, &cell, Some(bytes))
+                .await;
         }
 
         let cells = bind_plain(&session)?;

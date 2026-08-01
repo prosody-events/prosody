@@ -1,16 +1,20 @@
 //! The owner engine: collection operations over a per-event session.
 //!
 //! Read admission is the session gate's read permit and write admission its
-//! mutate permit, so a scoped operation holds exactly the hold the old
-//! per-method acquire took. Reads keep the existing storage-tier order — event
-//! dirty overlay, then the committed cache, then the cold path — and an
-//! operation neither owns nor warms that cache: creating or dropping one has no
-//! effect on cache warmth.
+//! mutate permit, so a scoped operation holds exactly one hold for its whole
+//! body. Reads keep the existing storage-tier order — event dirty overlay, then
+//! the committed cache, then the cold path — and an operation neither owns nor
+//! warms that cache: creating or dropping one has no effect on cache warmth.
+//!
+//! The engine is the only caller of the session's crate-private commands, which
+//! is what keeps every cell reachable through a scoped operation alone.
 
-use super::{Mutation, MutationJournal, StateSession, WritableStateSession, ensure_live, sealed};
+use super::{Mutation, MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::{CellKey, Scan, Section};
-use crate::state::session::{CellRead, CellWrite, KeyedStateSession};
+use crate::state::descriptor::StructuralIdentity;
+use crate::state::registry::CollectionDef;
+use crate::state::session::{KeyedStateSession, MutatePermit, OpPermit};
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{StateBackend, StateName, StateType, StoreOutcome};
 use bytes::Bytes;
@@ -24,20 +28,41 @@ use futures::stream::Stream;
 /// trait a downstream crate cannot name.
 pub struct OwnerEngine;
 
-/// The owner engine drives the session's raw cell surface, and is that
-/// surface's only caller. The surface is `get`, `mutate_permit`, `commit`,
-/// `rollback`, and the synchronous overlay staging.
-impl<S: CellRead> sealed::ReadEngine<S> for OwnerEngine {
+impl<B, L> sealed::ReadEngine<KeyedStateSession<B, L>> for OwnerEngine
+where
+    B: StateBackend,
+    L: Clone + Send + Sync + 'static,
+{
     /// The owner keeps nothing across a stream continuation: a chunk
     /// reacquires the gate from the session, which is what keeps the gate off
     /// the yield path.
     type Plan = ();
     type ReadInner<'a>
-        = S::Permit<'a>
+        = OpPermit<'a>
     where
-        S: 'a;
+        KeyedStateSession<B, L>: 'a;
 
-    async fn begin_read(session: &S) -> S::Permit<'_> {
+    /// Validates the name against the partition's collection registry, and the
+    /// asserted structural identity against the registered one.
+    fn verify_registration(
+        session: &KeyedStateSession<B, L>,
+        name: &'static str,
+        state_type: StateType,
+        identity: &StructuralIdentity,
+    ) -> Result<StateName, StateAccessError> {
+        session.verify_state_registration(name, state_type, identity)
+    }
+
+    /// The registry's definition for the name, defaults included.
+    fn collection_def(
+        session: &KeyedStateSession<B, L>,
+        state_type: StateType,
+        name: &StateName,
+    ) -> CollectionDef {
+        session.collection_def(state_type, name)
+    }
+
+    async fn begin_read(session: &KeyedStateSession<B, L>) -> OpPermit<'_> {
         session.permit().await
     }
 
@@ -45,8 +70,8 @@ impl<S: CellRead> sealed::ReadEngine<S> for OwnerEngine {
     /// session call does not take it, but the returned future captures the
     /// borrow, so the gate stays held while the read runs.
     async fn read_point(
-        session: &S,
-        _inner: &mut S::Permit<'_>,
+        session: &KeyedStateSession<B, L>,
+        _inner: &mut Self::ReadInner<'_>,
         state_type: StateType,
         name: &StateName,
         cell: &CellKey,
@@ -58,8 +83,8 @@ impl<S: CellRead> sealed::ReadEngine<S> for OwnerEngine {
     /// The batch twin of [`Self::read_point`], with the same witness and the
     /// same guard.
     async fn read_batch(
-        session: &S,
-        _inner: &mut S::Permit<'_>,
+        session: &KeyedStateSession<B, L>,
+        _inner: &mut Self::ReadInner<'_>,
         state_type: StateType,
         name: &StateName,
         section: Section,
@@ -69,17 +94,17 @@ impl<S: CellRead> sealed::ReadEngine<S> for OwnerEngine {
         session.get_many(state_type, name, section, batch).await
     }
 
-    fn capture(_inner: &S::Permit<'_>) {}
+    fn capture(_inner: &OpPermit<'_>) {}
 
     /// Reacquires the gate for one continuation — the same acquire
     /// [`Self::begin_read`] performs, which is what makes a coordinate stream
     /// free of a gate hold across its yields.
-    async fn resume<'a>(session: &'a S, (): &()) -> S::Permit<'a> {
+    async fn resume<'a>(session: &'a KeyedStateSession<B, L>, (): &()) -> OpPermit<'a> {
         session.permit().await
     }
 
     fn page<'a>(
-        session: &'a S,
+        session: &'a KeyedStateSession<B, L>,
         (): &'a (),
         state_type: StateType,
         name: &'a StateName,
@@ -90,24 +115,33 @@ impl<S: CellRead> sealed::ReadEngine<S> for OwnerEngine {
         session.scan(state_type, name, scan)
     }
 
-    fn fence(session: &S) -> Result<(), StateAccessError> {
+    fn fence(session: &KeyedStateSession<B, L>) -> Result<(), StateAccessError> {
         ensure_live(session)
     }
 }
 
-impl<S: CellWrite> sealed::WriteEngine<S> for OwnerEngine {
+impl<B, L> sealed::WriteEngine<KeyedStateSession<B, L>> for OwnerEngine
+where
+    B: StateBackend,
+    L: Clone + Send + Sync + 'static,
+{
     type WriteInner<'a>
-        = S::MutatePermit<'a>
+        = MutatePermit<'a>
     where
-        S: 'a;
+        KeyedStateSession<B, L>: 'a;
 
-    async fn begin_write(session: &S) -> Result<S::MutatePermit<'_>, StateAccessError> {
+    async fn begin_write(
+        session: &KeyedStateSession<B, L>,
+    ) -> Result<MutatePermit<'_>, StateAccessError> {
         session.mutate_permit().await
     }
 
-    /// The same total admission order [`CellWrite::mutate_permit`] applied at
+    /// The same total admission order the session's `mutate_permit` applied at
     /// the start of the invocation, re-applied under the still-held permit.
-    fn validate_write(session: &S, inner: &S::MutatePermit<'_>) -> Result<(), StateAccessError> {
+    fn validate_write(
+        session: &KeyedStateSession<B, L>,
+        inner: &MutatePermit<'_>,
+    ) -> Result<(), StateAccessError> {
         if !session.attempt_current() {
             return Err(StateAccessError::Terminated);
         }
@@ -121,10 +155,10 @@ impl<S: CellWrite> sealed::WriteEngine<S> for OwnerEngine {
     }
 
     fn apply(
-        session: &S,
+        session: &KeyedStateSession<B, L>,
         state_type: StateType,
         name: &StateName,
-        inner: &S::MutatePermit<'_>,
+        inner: &MutatePermit<'_>,
         journal: MutationJournal,
     ) {
         // The mutate permit derefs to the read permit the staging sink demands
@@ -148,7 +182,7 @@ impl<S: CellWrite> sealed::WriteEngine<S> for OwnerEngine {
     }
 
     async fn commit(
-        session: &S,
+        session: &KeyedStateSession<B, L>,
         state_type: StateType,
         name: &StateName,
     ) -> Result<StoreOutcome, StateAccessError> {
@@ -157,7 +191,11 @@ impl<S: CellWrite> sealed::WriteEngine<S> for OwnerEngine {
         session.commit(state_type, name).await
     }
 
-    async fn rollback(session: &S, state_type: StateType, name: &StateName) -> StoreOutcome {
+    async fn rollback(
+        session: &KeyedStateSession<B, L>,
+        state_type: StateType,
+        name: &StateName,
+    ) -> StoreOutcome {
         // Unwitnessed by design: the session owns rollback's gate acquire, so
         // taking a permit here would re-enter the non-reentrant gate.
         session.rollback(state_type, name).await
@@ -196,4 +234,23 @@ where
     B: StateBackend,
     L: Clone + Send + Sync + 'static,
 {
+}
+
+/// Guards every owner command: a session whose partition is shutting down,
+/// whose event is cancelled, or whose pinned attempt epoch no longer matches
+/// the live one (a handle or stream leaked past its dispatch attempt) refuses
+/// with [`StateAccessError::Terminated`]. The published reader has no such
+/// state, so its engine needs no counterpart.
+///
+/// # Errors
+///
+/// [`StateAccessError::Terminated`], as above.
+fn ensure_live<B, L>(session: &KeyedStateSession<B, L>) -> Result<(), StateAccessError>
+where
+    B: StateBackend,
+{
+    if session.is_terminated() || !session.attempt_current() {
+        return Err(StateAccessError::Terminated);
+    }
+    Ok(())
 }

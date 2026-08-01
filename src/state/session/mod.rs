@@ -13,31 +13,23 @@
 //! backstop, the event, the registry), so repeated descriptor binds of one
 //! collection accumulate into one write.
 //!
-//! # The capability split
+//! # The session surface
 //!
-//! The session surface is two capability traits, sealed by crate-internal
-//! supertraits:
+//! The session's reads and staged mutations are crate-private inherent methods
+//! on [`KeyedStateSession`]. Their only caller is the owner engine
+//! (`crate::state::collection::owner`): a collection handle opens one scoped
+//! operation, and the engine turns that operation into those calls. No trait
+//! carries one, so nothing outside `crate::state` can reach a cell.
 //!
-//! - [`CellRead`] — the complete non-mutating surface. Handlers reach it
-//!   through collection handles: `get`/`get_many`/`scan` plus
-//!   `is_terminated`/`verify_state_registration` and the collection-metadata
-//!   queries. The resolver capability slot lives one layer up, on
-//!   [`StateSession`], which every session type implements. Every read method
-//!   is written **once** here, so the owner session and the published reader's
-//!   `ReadSession` share one implementation. Sealed by `sealed::ReadAdmission`.
-//! - [`CellWrite`] — the mutating remainder: the buffering mutators
-//!   `set`/`clear`/`clear_section` and the mid-handler transactional pair
-//!   `commit`/`rollback`. It extends [`CellRead`], `StateLifecycle`, and
-//!   `MarkerIdentity`. A read-only handle cannot express a mutation, because
-//!   the mutators live only on `CellWrite`. [`EventContext::State`] bounds
-//!   this.
-//! - `sealed::StateLifecycle` — the sealed, manager-driven lifecycle
-//!   (`finalize` and the attempt/teardown verbs — settling moved onto the
-//!   receipt `finalize` returns) — and `sealed::MarkerIdentity` — the
-//!   boundary-readable message-marker identity. Both are `pub(crate)`
-//!   supertraits of [`CellWrite`] that seal it: downstream crates can name the
-//!   capability traits in bounds but can neither implement them nor reach
-//!   either surface.
+//! Two sealed traits hold the framework's own moves. `sealed::StateLifecycle`
+//! is the manager-driven lifecycle (`finalize` and the attempt/teardown verbs —
+//! settling moved onto the receipt `finalize` returns).
+//! `sealed::MarkerIdentity` is the boundary-readable message-marker identity.
+//!
+//! [`EventSession`] bundles those two with [`WritableStateSession`]. It is the
+//! bound the framework threads through every per-event signature, including
+//! [`EventContext::State`]. It names no cell and no permit, and its sealed
+//! supertraits mean a downstream crate can name it but can never supply one.
 //!
 //! # Lifecycle
 //!
@@ -93,12 +85,12 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use parking_lot::{Mutex as SyncMutex, RwLock};
-pub(crate) use sealed::{Finalized, MessageMarker, MutatePermit, OpPermit, SessionGate};
-use sealed::{MarkerIdentity, ReadAdmission, StagedCollection, StagedState, StateLifecycle};
+pub(in crate::state) use sealed::MutatePermit;
+pub(crate) use sealed::{Finalized, MessageMarker, OpPermit, SessionGate};
+use sealed::{MarkerIdentity, StagedCollection, StagedState, StateLifecycle};
 use std::fmt;
 use std::future::Future;
 use std::iter::from_fn;
-use std::ops::DerefMut;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -110,282 +102,29 @@ use uuid::Uuid;
 #[cfg(test)]
 mod tests;
 
-/// The complete non-mutating surface of a per-event session — every read a
-/// collection handle performs, written **once** here so the owner
-/// [`KeyedStateSession`] and the published reader's
-/// [`ReadSession`](crate::state_reader::ReadSession) share one implementation.
+/// The per-event session bound: a writable collection session that also
+/// carries the settle boundary's sealed lifecycle and message-marker identity.
 ///
-/// `CellRead` is the raw cell surface. Only the collection engine and the
-/// reader bridge call it, and binding is what names the pair.
+/// Method-free by design — it names no cell, permit, or command. The framework
+/// threads it wherever a signature needs a whole per-event session, and
+/// [`EventContext::State`] is the one downstream crates name. Sealed by its
+/// supertraits: a downstream crate can bound on it but can implement none of
+/// the three, so it can never supply one.
+pub trait EventSession: StateLifecycle + MarkerIdentity + WritableStateSession {}
+
+impl<S: StateLifecycle + MarkerIdentity + WritableStateSession> EventSession for S {}
+
+/// The framework-only halves of a per-event session: the settlement lifecycle
+/// and the message-marker identity.
 ///
-/// `get`/`get_many`/`scan` describe the session's **visible committed bytes**
-/// for a cell — [`KeyedStateSession`] realises that through the dirty overlay +
-/// oracle resolution. The buffering mutators live on the [`CellWrite`]
-/// subtrait, so a read-only handle cannot express a mutation. Sealed by the
-/// crate-internal `sealed::ReadAdmission`: downstream crates can name
-/// `CellRead` in bounds but can neither implement it nor forge a session.
-pub trait CellRead: ReadAdmission + StateSession {
-    /// Returns `true` once the partition is shutting down or the event has been
-    /// cancelled. Descriptor handles guard every operation on this.
-    fn is_terminated(&self) -> bool;
-
-    /// Validates that the keyed-state collection named `(state_type, name)` is
-    /// registered with the asserted structural identity, returning the
-    /// canonical [`StateName`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session,
-    /// [`StateAccessError::Unregistered`] for an unknown name, or
-    /// [`StateAccessError::IdentityMismatch`] when the registered identity
-    /// differs from the asserted one.
-    fn verify_state_registration(
-        &self,
-        name: &'static str,
-        state_type: StateType,
-        identity: &StructuralIdentity,
-    ) -> Result<StateName, StateAccessError>;
-
-    /// Reads a cell's currently visible committed value within this event's
-    /// transaction (cleared/absent → `None`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
-    /// [`StateAccessError::Store`] when the underlying store fails.
-    fn get(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-        cell: &CellKey,
-    ) -> impl Future<Output = Result<Option<Bytes>, StateAccessError>> + Send;
-
-    /// Batch twin of [`Self::get`]: reads one `section`'s coordinates in one
-    /// backend hop, aligned index-wise (`result[i]` answers `batch[i]`;
-    /// duplicate coordinates co-observe; absent → `None`). The section is
-    /// explicit alongside the batch — the point `get` carries it inside the
-    /// [`CellKey`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
-    /// [`StateAccessError::Store`] when the underlying store fails.
-    fn get_many(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-        section: Section,
-        batch: &CoordinateBatch,
-    ) -> impl Future<Output = Result<CellBuffer<Option<Bytes>>, StateAccessError>> + Send;
-
-    /// The single-section, start-anchored, bidirectional range primitive: a
-    /// lazy stream of the visible committed cells in `coordinate` byte order.
-    fn scan<'a>(
-        &'a self,
-        state_type: StateType,
-        name: &'a StateName,
-        scan: Scan<'a>,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a;
-}
-
-/// The mutating remainder of a per-event session: the buffering mutators and
-/// the mid-handler transactional pair, over the mutate-permit GAT. A read-only
-/// handle cannot express any of these — they live only on `CellWrite` bounds,
-/// while every read is inherited unchanged from [`CellRead`].
-///
-/// `set`/`clear`/`clear_section` buffer this event's mutations. `commit`
-/// writes them through mid-handler; `rollback` discards them. After the
-/// settle boundary's stage drains the buffer on a `finalize` success, a
-/// handle's reads fall through to the lower store. The apply hooks then
-/// observe the per-cell committed projection, not the event's pre-settle
-/// overlay; an own-event provisional cell reads as its committed base `prev`.
-///
-/// Sealed on both halves. The crate-internal `sealed::ReadAdmission` seals
-/// the [`CellRead`] half. `StateLifecycle` and `MarkerIdentity` — the
-/// manager-driven lifecycle and the message-marker identity — seal the
-/// lifecycle and marker halves. Downstream crates can name `CellWrite` in
-/// bounds (e.g. [`EventContext::State`]) but can neither implement it nor
-/// reach either sealed surface.
-pub trait CellWrite: CellRead + StateLifecycle + MarkerIdentity + WritableStateSession {
-    /// A held gate permit that additionally witnesses a session **mutation**,
-    /// returned by [`Self::mutate_permit`] after the ordered admission. The
-    /// owner's `sealed::MutatePermit` states the read-under-mutate rule that
-    /// this `Deref` bound encodes. It is `Sync` because a `Send` mutator future
-    /// holds the permit across its `.await`s.
-    type MutatePermit<'s>: Send + Sync + DerefMut<Target = <Self as ReadAdmission>::Permit<'s>>
-    where
-        Self: 's;
-
-    /// Acquires the operation gate for a mutator, then applies the one total
-    /// admission order under the held permit before returning the witness:
-    ///
-    /// 1. **pin** — a stale attempt (this handle outlived its dispatch and the
-    ///    epoch was bumped) errors [`StateAccessError::Terminated`].
-    /// 2. **closed** — the settle boundary already closed the session, so an
-    ///    own-event mutation past the settle window errors
-    ///    [`StateAccessError::SessionClosed`].
-    /// 3. **termination** — shutdown or cancellation errors
-    ///    [`StateAccessError::Terminated`].
-    ///
-    /// The pin check runs first. So a mutation under a still-current pin
-    /// classifies `SessionClosed` rather than `Terminated`, even under
-    /// shutdown or cancellation.
-    ///
-    /// The permit is held across all three checks. The epoch bump needs the
-    /// gate exclusively, so the pin stays stable between the check and the
-    /// return.
-    ///
-    /// # Errors
-    ///
-    /// [`StateAccessError::Terminated`] on a stale attempt or a
-    /// shutting-down/cancelled session, or [`StateAccessError::SessionClosed`]
-    /// once the settle boundary has closed the session.
-    fn mutate_permit(
-        &self,
-    ) -> impl Future<Output = Result<Self::MutatePermit<'_>, StateAccessError>> + Send;
-
-    /// Buffers a set of the cell's bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session.
-    fn set(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-        cell: &CellKey,
-        value: &[u8],
-    ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
-
-    /// Buffers a clear of the cell.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session.
-    fn clear(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-        cell: &CellKey,
-    ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
-
-    /// Buffers an in-RAM dirty clear marker for one section of the
-    /// collection: within this event the section reads as "deleted at this
-    /// program point" — `get` answers absence, `scan` yields only cells set
-    /// after the clear — and later `set`s repopulate it. Committed, the
-    /// section holds exactly the survivors; aborted, it is untouched.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session.
-    fn clear_section(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-        section: Section,
-    ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
-
-    /// Durably commits the collection's buffered changes mid-handler, so they
-    /// survive a restart after failure. This is why it exists: a complex or
-    /// large handler (a materialization handler fanning one message into
-    /// thousands of writes) commits incremental progress and resumes from
-    /// it on retry or redelivery instead of starting from scratch. Handler
-    /// idempotence across the resume is the contract.
-    ///
-    /// Every currently-buffered op of the collection is written straight to
-    /// committed state (`write_resolved`) and dropped from the dirty buffer,
-    /// so multi-cell kinds commit data and bookkeeping together (a Map's
-    /// entries and keyset, a Deque's entries and window bounds). Within the
-    /// batch budget those cells ride one atomic same-partition batch; an
-    /// over-budget commit splits into the fewest fitting batches, and —
-    /// `write_resolved` being marker-free — a crash mid-split can leave a
-    /// torn committed write the store cannot reconstruct (the over-budget
-    /// residual on the collection-grain atomicity invariant, `CellStore`),
-    /// reconstructed only when the idempotent handler re-run re-issues the same
-    /// ops. The guarantee is **at-least-once**: a
-    /// `commit()`-landed write is durable and visible immediately — never
-    /// provisional, never listed in any event marker, never rolled back (the
-    /// bottom store resolves any standing clears-bearing marker before the
-    /// write lands — the write-side committed-unapplied window on
-    /// `write_resolved` — ordering the write after that resolution so a stale
-    /// clear's replay cannot erase it, subject to the concurrent-resolver
-    /// residual noted there). Ops
-    /// buffered *after* the commit ride the collection's normal stage→settle
-    /// path; reads already see buffered
-    /// writes without committing.
-    ///
-    /// **Orthogonal to [`CommitMode`]:** the mode governs how *un-committed*
-    /// writes settle at the event boundary — staged provisionally for
-    /// `ReadCommitted` (external readers observe committed values only after
-    /// the event commits), applied immediately for `ReadUncommitted`.
-    /// `commit()` bypasses that staging entirely: a `commit()`-landed write
-    /// on a `ReadCommitted` collection is externally visible at once and
-    /// survives an event abort.
-    ///
-    /// Every collection handle exposes `commit()` — Value, Map, and Deque
-    /// all do, and future collection kinds must too; the handles' docs link
-    /// back here. [`Self::rollback`] is its discard twin.
-    ///
-    /// Returns [`StoreOutcome::Applied`] when buffered ops were written, or
-    /// [`StoreOutcome::NoOp`] when nothing was buffered.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateAccessError::Unavailable`] on a stateless session, or
-    /// [`StateAccessError::Store`] when the underlying store fails (the
-    /// buffer is left intact, so the ops still ride the normal commit path).
-    fn commit(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-    ) -> impl Future<Output = Result<StoreOutcome, StateAccessError>> + Send;
-
-    /// Discards the collection's buffered uncommitted ops mid-handler — cells
-    /// *and* dirty clear markers — reverting reads to the last
-    /// [`Self::commit`], or the pre-event committed value if none. It is
-    /// `commit()` minus the durable write: the same whole-collection drain,
-    /// to nothing.
-    ///
-    /// **It cannot cross a `commit()` floor.** A `commit()`-landed row is
-    /// durable and unreachable by rollback — only ops buffered since the last
-    /// `commit()` are discarded.
-    ///
-    /// Async because it joins the session operation gate (`SessionGate`): a
-    /// buffer drain racing `commit()`'s snapshot→write→drain could otherwise
-    /// persist a partial set no serial order explains. Still infallible: it
-    /// touches only the in-memory dirty buffer and cannot fail. A terminated
-    /// session (partition shutting down, or the event cancelled) and a
-    /// **closed** session (the settle boundary already snapshotted it) both
-    /// discard nothing and return [`StoreOutcome::NoOp`] — the containment
-    /// every other cell op gets from the live-guard and the gate's closure
-    /// check, expressed as a `NoOp` because the infallible signature cannot
-    /// surface an error. It keeps a stale clone that outlived its event from
-    /// draining a later same-key event's buffer.
-    ///
-    /// Distinct from the settle boundary's rollback of staged provisional cells
-    /// (the receipt's `StagedState::rollback`, framework-only, after the
-    /// handler returns): this is the handler-facing mid-flight discard.
-    ///
-    /// Returns [`StoreOutcome::Applied`] when buffered ops were discarded, or
-    /// [`StoreOutcome::NoOp`] on an empty buffer.
-    fn rollback(
-        &self,
-        state_type: StateType,
-        name: &StateName,
-    ) -> impl Future<Output = StoreOutcome> + Send;
-}
-
-/// Crate-sealed halves of the [`CellRead`]/[`CellWrite`] capability pair.
-///
-/// The module is `pub(crate)`, so downstream crates can name the capability
-/// traits in bounds but can neither implement them nor reach the sealed
-/// surfaces: read admission is crate plumbing, and staging, promoting, and
-/// discarding are framework-only moves.
+/// The module is `pub(crate)`, so downstream crates can name [`EventSession`]
+/// in bounds but can neither implement its supertraits nor reach the sealed
+/// surfaces: staging, promoting, and discarding are framework-only moves.
 pub(crate) mod sealed {
     use super::{
-        Bytes, CellKey, CellStore, CollectionDef, CollectionRef, CompactDateTime, CompactDuration,
-        Duration, Future, MarkerWrite, ProvisionalWrite, RepinProof, Section, SectionClear,
-        StateAccessError, StateName, StateType, Uuid, resolve_collections,
+        CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Duration, Future,
+        MarkerWrite, ProvisionalWrite, RepinProof, SectionClear, StateAccessError, Uuid,
+        resolve_collections,
     };
     use opentelemetry::global::meter;
     use opentelemetry::metrics::Counter;
@@ -560,15 +299,13 @@ pub(crate) mod sealed {
 
     /// A held [`SessionGate`] permit (RAII: dropping it releases the gate).
     ///
-    /// Witnesses admission for a session **read**: the descriptor's cell-op
-    /// sinks and the engine's journal-replay sinks
-    /// ([`StateLifecycle::stage_cell`] and
-    /// [`StateLifecycle::stage_section_clear`]) all demand `&S::Permit<'_>`
-    /// (the owner's is this `OpPermit`), so "forgot to acquire the gate" and
-    /// "let the acquire outlive the op" cannot compile. The same type is
-    /// both the owner's [`ReadAdmission::Permit`] and the hold
-    /// [`SessionGate::close`] returns, and a mutator's [`MutatePermit`]
-    /// derefs to it. The read-vs-mutate split encodes the gate's closure
+    /// Witnesses admission for a session **read**: the owner engine's
+    /// journal-replay sinks (`stage_cell` and `stage_section_clear`) demand
+    /// `&OpPermit<'_>`, so "forgot to acquire the gate" and "let the acquire
+    /// outlive the op" cannot compile. The same type is both the owner
+    /// engine's read state and the hold [`SessionGate::close`] returns, and a
+    /// mutator's [`MutatePermit`] derefs to it. The read-vs-mutate split
+    /// encodes the gate's closure
     /// check, **not** shared-vs-exclusive access: both permits are
     /// exclusive holds (a session read is not pure — a point-get miss does
     /// durable read-repair and publishes a cache fill, which KV4's
@@ -580,9 +317,8 @@ pub(crate) mod sealed {
 
     impl OpPermit<'_> {
         /// Whether the settle boundary has closed the session — consulted by
-        /// [`CellWrite::rollback`](super::CellWrite::rollback), whose
-        /// infallible contract answers a closed session with `NoOp` instead of
-        /// an error.
+        /// the session's `rollback`, whose infallible contract answers a closed
+        /// session with `NoOp` instead of an error.
         pub(crate) fn is_closed(&self) -> bool {
             matches!(*self.0, SessionPhase::Closed)
         }
@@ -592,11 +328,10 @@ pub(crate) mod sealed {
     ///
     /// Minted only through [`Self::witness`], from a held read permit once the
     /// caller has sequenced the mutator admission order (pin → closed →
-    /// termination — see
-    /// [`CellWrite::mutate_permit`](super::CellWrite::mutate_permit)). The
-    /// write engine's `validate_write` and journal `apply`
-    /// (`crate::state::collection::owner`) demand `&S::MutatePermit<'_>`, and
-    /// the owner session's is this struct. A read permit at a write does not
+    /// termination — see the session's `mutate_permit`). The write engine's
+    /// `validate_write` and journal `apply`
+    /// (`crate::state::collection::owner`) demand `&MutatePermit<'_>`, which is
+    /// the owner engine's write state. A read permit at a write does not
     /// compile. A scoped write invocation holds one
     /// across its whole body and hands its [`Deref`] target to the
     /// journal-replay sinks [`OpPermit`] names at replay.
@@ -609,11 +344,11 @@ pub(crate) mod sealed {
     pub struct MutatePermit<'a>(OpPermit<'a>);
 
     impl<'a> MutatePermit<'a> {
-        /// Wraps a held read permit as a mutation witness. The caller
-        /// ([`CellWrite::mutate_permit`](super::CellWrite::mutate_permit)) has
-        /// already sequenced the pin/closed/termination admission checks under
-        /// this same permit, so possessing a `MutatePermit` proves the session
-        /// admitted the mutation.
+        /// Wraps a held read permit as a mutation witness. The caller (the
+        /// session's `mutate_permit`) has already sequenced the
+        /// pin/closed/termination admission checks under this same permit, so
+        /// possessing a `MutatePermit` proves the session admitted the
+        /// mutation.
         pub(in crate::state) fn witness(permit: OpPermit<'a>) -> Self {
             Self(permit)
         }
@@ -799,54 +534,9 @@ pub(crate) mod sealed {
         Incomplete,
     }
 
-    /// Owns the read-permit associated type and the epoch-pin check, and seals
-    /// [`CellRead`](super::CellRead). Admission is crate plumbing: a sealed
-    /// supertrait's methods are not implementable by a downstream crate, so no
-    /// external crate can forge a session.
-    ///
-    /// Sealing prevents a downstream crate from implementing the trait, not
-    /// from calling its methods through the public [`CellRead`] subtrait — so
-    /// the trait also homes the operational settings, which are crate plumbing
-    /// for the same reason admission is. Living here keeps them unreachable
-    /// from a handler: the module is `pub(crate)`, while every in-crate
-    /// `S: CellRead` bound still reaches all three. All are safe to call:
-    /// [`Self::permit`] returns an opaque witness,
-    /// [`Self::attempt_current`] returns a `bool`, and
-    /// [`Self::collection_def`] returns a `Copy` settings snapshot.
-    pub trait ReadAdmission: Clone + Send + Sync + 'static {
-        /// Witness that this session's read admission (if any) is held. Never
-        /// inspected — a pure witness the view's read sinks demand. `Sync`
-        /// because read futures capture `&Permit` across awaits.
-        type Permit<'s>: Send + Sync
-        where
-            Self: 's;
-
-        /// Acquires the read admission — the owner's gate read guard; the
-        /// published reader, having no gate, hands back `()`.
-        fn permit(&self) -> impl Future<Output = Self::Permit<'_>> + Send;
-
-        /// The operational settings for `(state_type, name)` **as this
-        /// session's engine sees them**; each impl documents its own source. A
-        /// collection binding captures it once, so every configuration query
-        /// inside a scoped operation answers from one snapshot. No default
-        /// impl: silently defaulted settings would mis-size a real session's
-        /// keyset or disable its TTL refresh.
-        fn collection_def(&self, state_type: StateType, name: &StateName) -> CollectionDef;
-
-        /// Whether this handle/session clone's pinned epoch still equals the
-        /// live session epoch. `false` once a later attempt boundary
-        /// ([`StateLifecycle::reset`]) bumped it — the pin half of
-        /// `ensure_live`, the mutator admission order, and `rollback`'s `NoOp`
-        /// guard. It lives here (not on [`StateLifecycle`]) so
-        /// `ensure_live<S: CellRead>` can consult it; the published reader,
-        /// having no attempt epoch, is always current.
-        fn attempt_current(&self) -> bool;
-    }
-
-    /// Framework-only lifecycle over a per-event session. The bound
-    /// `Permit<'s> = OpPermit<'s>` lets a generic mutator hand
-    /// `&*mutate_permit` (a `&OpPermit`) to a `&S::Permit<'_>` read sink.
-    pub trait StateLifecycle: for<'s> ReadAdmission<Permit<'s> = OpPermit<'s>> {
+    /// Framework-only lifecycle over a per-event session: the settle boundary's
+    /// stage/record/promote moves plus the attempt and teardown verbs.
+    pub trait StateLifecycle: Clone + Send + Sync + 'static {
         /// The uniform durable cell store the session settles against —
         /// [`KeyedStateSession`](super::KeyedStateSession) projects its
         /// backend's store (`B::Cell`).
@@ -891,38 +581,6 @@ pub(crate) mod sealed {
             proof: MarkerWrite,
         ) -> impl Future<Output = Result<(), StateAccessError>> + Send;
 
-        /// Stages one already-encoded mutation into this event's dirty overlay
-        /// — the synchronous, infallible sink a scoped collection invocation
-        /// replays its journal through. `Some(bytes)` stages a write, `None` an
-        /// absence.
-        ///
-        /// `permit` is the admission witness: the replay runs under the write
-        /// hold the invocation took, and a `&MutatePermit` derefs to one, so
-        /// "staged without the gate" does not compile. It is never inspected.
-        ///
-        /// The buffering cell commands only *look* asynchronous: this is the
-        /// same overlay write without the future the replay cannot await.
-        fn stage_cell(
-            &self,
-            permit: &OpPermit<'_>,
-            state_type: StateType,
-            name: &StateName,
-            cell: &CellKey,
-            value: Option<Bytes>,
-        );
-
-        /// Stages one section's dirty clear marker — the sink a whole-layout
-        /// reset replays through, one entry per declared section. Same
-        /// admission witness and the same "only looks asynchronous" rationale
-        /// as [`Self::stage_cell`].
-        fn stage_section_clear(
-            &self,
-            permit: &OpPermit<'_>,
-            state_type: StateType,
-            name: &StateName,
-            section: Section,
-        );
-
         /// Discards just this event's buffered dirty cells — the isolation step
         /// of the attempt-boundary [`Self::reset`] transition (which then bumps
         /// the epoch under the same gate hold), and the failure-path backstop
@@ -940,8 +598,7 @@ pub(crate) mod sealed {
         fn discard_dirty(&self);
 
         /// Flips this session terminated, synchronously and idempotently — the
-        /// teardown half of
-        /// [`CellRead::is_terminated`](super::CellRead::is_terminated).
+        /// teardown half of the session's `is_terminated`.
         /// The [`EventStateScope`](crate::state::manager::EventStateScope)'s
         /// `Drop` calls it on every dispatch exit (including a future dropped
         /// mid-flight, where no gated teardown runs), and the panic-unwind
@@ -1159,7 +816,7 @@ where
     reload_marker: SyncMutex<Option<MessageMarker>>,
     /// Session-owned termination flag, flipped synchronously by
     /// [`StateLifecycle::terminate`]. It is
-    /// the teardown half of [`is_terminated`](CellRead::is_terminated): the
+    /// the teardown half of the session's `is_terminated`: the
     /// [`EventStateScope`](crate::state::manager::EventStateScope)'s `Drop`
     /// runs on every dispatch exit — including a future dropped mid-flight
     /// (task cancellation), where no other teardown runs — so a handle leaked
@@ -1320,42 +977,49 @@ where
         let mut epoch = self.inner.epoch.write();
         *epoch = epoch.next();
     }
-}
 
-impl<B, L> ReadAdmission for KeyedStateSession<B, L>
-where
-    B: StateBackend,
-    L: Clone + Send + Sync + 'static,
-{
-    type Permit<'s>
-        = OpPermit<'s>
-    where
-        Self: 's;
-
-    async fn permit(&self) -> OpPermit<'_> {
+    /// Acquires the session operation gate for one command — the owner
+    /// engine's read state. See [`SessionGate`].
+    pub(in crate::state) async fn permit(&self) -> OpPermit<'_> {
         self.inner.gate.read().await
     }
 
-    fn attempt_current(&self) -> bool {
+    /// Whether this handle/session clone's pinned epoch still equals the live
+    /// session epoch. `false` once a later attempt boundary
+    /// ([`StateLifecycle::reset`]) bumped it — the pin half of the owner
+    /// engine's live guard, of the mutator admission order, and of
+    /// [`Self::rollback`]'s `NoOp` guard.
+    pub(in crate::state) fn attempt_current(&self) -> bool {
         self.pinned == self.current_epoch()
     }
 
-    /// The registry's definition for the name, defaults included.
-    fn collection_def(&self, state_type: StateType, name: &StateName) -> CollectionDef {
+    /// The registry's operational settings for the name, defaults included. A
+    /// collection binding captures it once, so every configuration query
+    /// inside a scoped operation answers from one snapshot.
+    pub(in crate::state) fn collection_def(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+    ) -> CollectionDef {
         self.inner.registry.def_for(state_type, name)
     }
-}
 
-impl<B, L> CellRead for KeyedStateSession<B, L>
-where
-    B: StateBackend,
-    L: Clone + Send + Sync + 'static,
-{
-    fn is_terminated(&self) -> bool {
+    /// Returns `true` once the partition is shutting down or the event has been
+    /// cancelled. The owner engine guards every command on this.
+    pub(in crate::state) fn is_terminated(&self) -> bool {
         self.inner.termination.is_terminated() || self.inner.terminated.load(Ordering::Relaxed)
     }
 
-    fn verify_state_registration(
+    /// Validates that the keyed-state collection named `(state_type, name)` is
+    /// registered with the asserted structural identity, returning the
+    /// canonical [`StateName`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Unregistered`] for an unknown name, or
+    /// [`StateAccessError::IdentityMismatch`] when the registered identity
+    /// differs from the asserted one.
+    pub(in crate::state) fn verify_state_registration(
         &self,
         name: &'static str,
         state_type: StateType,
@@ -1373,7 +1037,14 @@ where
         Ok(state_name.clone())
     }
 
-    async fn get(
+    /// Reads a cell's currently visible committed value within this event's
+    /// transaction (cleared/absent → `None`) — the dirty overlay resolved
+    /// against the oracle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Store`] when the underlying store fails.
+    pub(in crate::state) async fn get(
         &self,
         state_type: StateType,
         name: &StateName,
@@ -1389,7 +1060,16 @@ where
         Ok(committed.into_inner())
     }
 
-    async fn get_many(
+    /// Batch twin of [`Self::get`]: reads one `section`'s coordinates in one
+    /// backend hop, aligned index-wise (`result[i]` answers `batch[i]`;
+    /// duplicate coordinates co-observe; absent → `None`). The section is
+    /// explicit alongside the batch — the point read carries it inside the
+    /// [`CellKey`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Store`] when the underlying store fails.
+    pub(in crate::state) async fn get_many(
         &self,
         state_type: StateType,
         name: &StateName,
@@ -1406,7 +1086,9 @@ where
         Ok(committed.into_iter().map(Committed::into_inner).collect())
     }
 
-    fn scan<'a>(
+    /// The single-section, start-anchored, bidirectional range primitive: a
+    /// lazy stream of the visible committed cells in `coordinate` byte order.
+    pub(in crate::state) fn scan<'a>(
         &'a self,
         state_type: StateType,
         name: &'a StateName,
@@ -1426,20 +1108,35 @@ where
             }
         }
     }
-}
 
-impl<B, L> CellWrite for KeyedStateSession<B, L>
-where
-    B: StateBackend,
-    L: Clone + Send + Sync + 'static,
-{
-    type MutatePermit<'s>
-        = MutatePermit<'s>
-    where
-        Self: 's;
-
-    async fn mutate_permit(&self) -> Result<MutatePermit<'_>, StateAccessError> {
-        // The one total admission order (see the trait doc), applied under the
+    /// Acquires the operation gate for a mutator, then applies the one total
+    /// admission order under the held permit before returning the witness:
+    ///
+    /// 1. **pin** — a stale attempt (this handle outlived its dispatch and the
+    ///    epoch was bumped) errors [`StateAccessError::Terminated`].
+    /// 2. **closed** — the settle boundary already closed the session, so an
+    ///    own-event mutation past the settle window errors
+    ///    [`StateAccessError::SessionClosed`].
+    /// 3. **termination** — shutdown or cancellation errors
+    ///    [`StateAccessError::Terminated`].
+    ///
+    /// The pin check runs first. So a mutation under a still-current pin
+    /// classifies `SessionClosed` rather than `Terminated`, even under
+    /// shutdown or cancellation.
+    ///
+    /// The permit is held across all three checks. The epoch bump needs the
+    /// gate exclusively, so the pin stays stable between the check and the
+    /// return.
+    ///
+    /// # Errors
+    ///
+    /// [`StateAccessError::Terminated`] on a stale attempt or a
+    /// shutting-down/cancelled session, or [`StateAccessError::SessionClosed`]
+    /// once the settle boundary has closed the session.
+    pub(in crate::state) async fn mutate_permit(
+        &self,
+    ) -> Result<MutatePermit<'_>, StateAccessError> {
+        // The one total admission order (see the doc above), applied under the
         // held permit. The epoch bump needs the gate exclusively, so the pin is
         // stable between the check and the return.
         let permit = self.inner.gate.read().await;
@@ -1455,41 +1152,58 @@ where
         Ok(MutatePermit::witness(permit))
     }
 
-    async fn set(
+    /// Stages one already-encoded mutation into this event's dirty overlay —
+    /// the synchronous, infallible sink a scoped collection invocation replays
+    /// its journal through. `Some(bytes)` stages a write, `None` an absence.
+    ///
+    /// `permit` is the admission witness: the replay runs under the write hold
+    /// the invocation took, and a `&MutatePermit` derefs to one, so "staged
+    /// without the gate" does not compile. It is never inspected.
+    pub(in crate::state) fn stage_cell(
         &self,
+        _permit: &OpPermit<'_>,
         state_type: StateType,
         name: &StateName,
         cell: &CellKey,
-        value: &[u8],
-    ) -> Result<(), StateAccessError> {
+        value: Option<Bytes>,
+    ) {
         let id = self.id_for(state_type, name);
-        self.inner.overlay.dirty().set(&id, cell, value);
-        Ok(())
+        let dirty = self.inner.overlay.dirty();
+        match value {
+            Some(bytes) => dirty.set_owned(&id, cell, bytes),
+            None => dirty.clear(&id, cell),
+        }
     }
 
-    async fn clear(
+    /// Stages one section's dirty clear marker — the sink a whole-layout reset
+    /// replays through, one entry per declared section. Within this event the
+    /// section reads as "deleted at this program point": a read answers
+    /// absence, a scan yields only cells staged after the clear, and later
+    /// writes repopulate it. Same admission witness as [`Self::stage_cell`].
+    pub(in crate::state) fn stage_section_clear(
         &self,
-        state_type: StateType,
-        name: &StateName,
-        cell: &CellKey,
-    ) -> Result<(), StateAccessError> {
-        let id = self.id_for(state_type, name);
-        self.inner.overlay.dirty().clear(&id, cell);
-        Ok(())
-    }
-
-    async fn clear_section(
-        &self,
+        _permit: &OpPermit<'_>,
         state_type: StateType,
         name: &StateName,
         section: Section,
-    ) -> Result<(), StateAccessError> {
+    ) {
         let id = self.id_for(state_type, name);
         self.inner.overlay.dirty().clear_section(&id, section);
-        Ok(())
     }
 
-    async fn commit(
+    /// Durably commits the collection's buffered changes mid-handler — the
+    /// engine command behind every handle's `commit()`. The contract lives on
+    /// the [`collection`](crate::state::collection) module's mid-handler
+    /// durability section.
+    ///
+    /// Returns [`StoreOutcome::Applied`] when buffered ops were written, or
+    /// [`StoreOutcome::NoOp`] when nothing was buffered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateAccessError::Store`] when the underlying store fails (the
+    /// buffer is left intact, so the ops still ride the normal commit path).
+    pub(in crate::state) async fn commit(
         &self,
         state_type: StateType,
         name: &StateName,
@@ -1538,8 +1252,21 @@ where
         Ok(StoreOutcome::Applied)
     }
 
-    async fn rollback(&self, state_type: StateType, name: &StateName) -> StoreOutcome {
-        // The gate acquire for rollback lives HERE, not in the handles (every
+    /// Discards the collection's buffered uncommitted ops mid-handler — the
+    /// engine command behind every handle's `rollback()`, and
+    /// [`Self::commit`]'s discard twin. The contract lives on the
+    /// [`collection`](crate::state::collection) module's mid-handler durability
+    /// section.
+    ///
+    /// Returns [`StoreOutcome::Applied`] when buffered ops were discarded, or
+    /// [`StoreOutcome::NoOp`] on an empty, closed, stale-pinned, or terminated
+    /// session.
+    pub(in crate::state) async fn rollback(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+    ) -> StoreOutcome {
+        // The gate acquire for rollback lives HERE, not in the engine (every
         // handle path is a single delegating call): the drain must serialize
         // with commit()'s snapshot→write→drain (KV4), and rollback's
         // infallible contract needs the gate's phase — a CLOSED session (the
@@ -1567,6 +1294,68 @@ where
         }
         dirty.remove_collection(&id);
         StoreOutcome::Applied
+    }
+}
+
+/// Seeding and inspection seams for the suites, so a test can arrange overlay
+/// state without a collection handle.
+///
+/// The seams **arrange** state; they never model a mutation. Each one takes the
+/// operation gate — so a seed serializes against a concurrent scoped operation
+/// rather than tearing one — but deliberately skips the mutator admission order
+/// (stale pin, closed session, termination), which is what the real handles
+/// exercise in the gate suite. A seed therefore succeeds on a session a handle
+/// would refuse, which is the point: a test can seed the state a refusal is
+/// asserted against. Consecutive seeds are not one atomic unit; each releases
+/// the gate.
+#[cfg(test)]
+impl<B, L> KeyedStateSession<B, L>
+where
+    B: StateBackend,
+{
+    /// Stages one cell (or an absence) into this event's dirty overlay. Must
+    /// not be called while a permit is already held: the gate is not reentrant.
+    pub(crate) async fn seed(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        cell: &CellKey,
+        value: Option<&[u8]>,
+    ) {
+        let permit = self.permit().await;
+        self.stage_cell(
+            &permit,
+            state_type,
+            name,
+            cell,
+            value.map(Bytes::copy_from_slice),
+        );
+    }
+
+    /// [`Self::seed`]'s section-clear twin.
+    pub(crate) async fn seed_section_clear(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        section: Section,
+    ) {
+        let permit = self.permit().await;
+        self.stage_section_clear(&permit, state_type, name, section);
+    }
+
+    /// The visible committed bytes of one cell, gate-free — the read seam for
+    /// suites outside `crate::state`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get`].
+    pub(crate) async fn peek(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        cell: &CellKey,
+    ) -> Result<Option<Bytes>, StateAccessError> {
+        self.get(state_type, name, cell).await
     }
 }
 
@@ -1662,33 +1451,6 @@ where
             .record_message(marker.into_uuid())
             .await
             .map_err(|e| StateAccessError::store(&e))
-    }
-
-    fn stage_cell(
-        &self,
-        _permit: &OpPermit<'_>,
-        state_type: StateType,
-        name: &StateName,
-        cell: &CellKey,
-        value: Option<Bytes>,
-    ) {
-        let id = self.id_for(state_type, name);
-        let dirty = self.inner.overlay.dirty();
-        match value {
-            Some(bytes) => dirty.set_owned(&id, cell, bytes),
-            None => dirty.clear(&id, cell),
-        }
-    }
-
-    fn stage_section_clear(
-        &self,
-        _permit: &OpPermit<'_>,
-        state_type: StateType,
-        name: &StateName,
-        section: Section,
-    ) {
-        let id = self.id_for(state_type, name);
-        self.inner.overlay.dirty().clear_section(&id, section);
     }
 
     fn discard_dirty(&self) {
@@ -2077,13 +1839,13 @@ impl DescriptorIdentity for LifecycleAccess {
 impl SealedDescriptor for LifecycleAccess {}
 
 impl StateDescriptor for LifecycleAccess {
-    type Handle<S: CellRead> = S;
+    type Handle<S: StateSession> = S;
 
     /// Returns the session itself — the lifecycle tunnel binds no typed handle
     /// and validates no registration; the boundary drives the sealed
     /// [`StateLifecycle`] on the returned session. Every real caller binds a
-    /// [`CellWrite`] session, so the returned `S` carries the full lifecycle.
-    fn bind<S: CellRead>(self, session: &S) -> Result<S, StateAccessError> {
+    /// [`EventSession`], so the returned `S` carries the full lifecycle.
+    fn bind<S: StateSession>(self, session: &S) -> Result<S, StateAccessError> {
         Ok(session.clone())
     }
 
@@ -2152,11 +1914,11 @@ impl DescriptorIdentity for MarkerAccess {
 impl SealedDescriptor for MarkerAccess {}
 
 impl StateDescriptor for MarkerAccess {
-    type Handle<S: CellRead> = MarkerHandle<S>;
+    type Handle<S: StateSession> = MarkerHandle<S>;
 
     /// Wraps the session in a [`MarkerHandle`], validating no registration —
     /// the marker tunnel carries no typed collection.
-    fn bind<S: CellRead>(self, session: &S) -> Result<MarkerHandle<S>, StateAccessError> {
+    fn bind<S: StateSession>(self, session: &S) -> Result<MarkerHandle<S>, StateAccessError> {
         Ok(MarkerHandle(session.clone()))
     }
 

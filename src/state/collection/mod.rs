@@ -25,6 +25,70 @@
 //! pair carries every collection's values. A command lowers its typed key to
 //! the order-preserving coordinate before any engine sees the key. Collection
 //! code names no `Bytes`, `CellKey`, permit, or source.
+//!
+//! # Mid-handler durability
+//!
+//! Every collection handle exposes `commit()` and `rollback()` — Value, Map,
+//! and Deque all do, and future collection kinds must too. This is their one
+//! contract; the handles' docs link back here.
+//!
+//! `commit()` durably commits the collection's buffered changes mid-handler, so
+//! they survive a restart after failure. This is why it exists: a complex or
+//! large handler (a materialization handler fanning one message into thousands
+//! of writes) commits incremental progress and resumes from it on retry or
+//! redelivery instead of starting from scratch. Handler idempotence across the
+//! resume is the contract.
+//!
+//! Every currently-buffered op of the collection is written straight to
+//! committed state (`write_resolved`) and dropped from the dirty buffer, so
+//! multi-cell kinds commit data and bookkeeping together (a Map's entries and
+//! keyset, a Deque's entries and window bounds). Within the batch budget those
+//! cells ride one atomic same-partition batch; an over-budget commit splits
+//! into the fewest fitting batches, and — `write_resolved` being marker-free —
+//! a crash mid-split can leave a torn committed write the store cannot
+//! reconstruct (the over-budget residual on the collection-grain atomicity
+//! invariant, on the crate-internal `CellStore` trait), reconstructed
+//! only when the idempotent handler re-run re-issues the same ops. The
+//! guarantee is **at-least-once**: a `commit()`-landed write is durable and
+//! visible immediately — never provisional, never listed in any event marker,
+//! never rolled back (the bottom store resolves any standing clears-bearing
+//! marker before the write lands — the write-side committed-unapplied window on
+//! `write_resolved` — ordering the write after that resolution so a stale
+//! clear's replay cannot erase it, subject to the concurrent-resolver residual
+//! noted there). Ops buffered *after* the commit ride the collection's normal
+//! stage→settle path; reads already see buffered writes without committing.
+//!
+//! **Orthogonal to [`CommitMode`](crate::state::CommitMode):** the mode governs
+//! how *un-committed* writes settle at the event boundary — staged
+//! provisionally for `ReadCommitted` (external readers observe committed values
+//! only after the event commits), applied immediately for `ReadUncommitted`.
+//! `commit()` bypasses that staging entirely: a `commit()`-landed write on a
+//! `ReadCommitted` collection is externally visible at once and survives an
+//! event abort.
+//!
+//! `rollback()` discards the collection's buffered uncommitted ops mid-handler
+//! — cells *and* dirty clear markers — reverting reads to the last `commit()`,
+//! or the pre-event committed value if none. It is `commit()` minus the durable
+//! write: the same whole-collection drain, to nothing.
+//!
+//! **It cannot cross a `commit()` floor.** A `commit()`-landed row is durable
+//! and unreachable by rollback — only ops buffered since the last `commit()`
+//! are discarded.
+//!
+//! `rollback()` is async because it joins the session operation gate: a buffer
+//! drain racing `commit()`'s snapshot→write→drain could otherwise persist a
+//! partial set no serial order explains. It is still infallible: it touches
+//! only the in-memory dirty buffer and cannot fail. A terminated session
+//! (partition shutting down, or the event cancelled) and a **closed** session
+//! (the settle boundary already snapshotted it) both discard nothing and return
+//! [`StoreOutcome::NoOp`] — the containment every other command gets from the
+//! live guard and the gate's closure check, expressed as a `NoOp` because the
+//! infallible signature cannot surface an error. It keeps a stale clone that
+//! outlived its event from draining a later same-key event's buffer.
+//!
+//! This is distinct from the settle boundary's rollback of staged provisional
+//! cells (framework-only, after the handler returns): this is the
+//! handler-facing mid-flight discard.
 
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::access::StateAccessError;
@@ -35,7 +99,6 @@ use crate::state::descriptor::{
 };
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::registry::CollectionDef;
-use crate::state::session::CellRead;
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{RESOLVE_FANOUT, StateName, StateType, StoreOutcome};
 use bytes::Bytes;
@@ -59,8 +122,8 @@ pub(crate) use operation::{
 pub(crate) use prosody_macros::{collection_layout, collection_methods};
 pub(crate) use stream::{CoordinatePlan, KeyItem, RangePlan, ScanItem};
 
-/// Framework-internal engine authority: admission, raw cell commands, mutation
-/// replay, and durable repair.
+/// Framework-internal engine authority: admission, the raw byte reads,
+/// mutation replay, and the mid-handler durable pair.
 ///
 /// These traits are `pub` only so the public session bounds above them do not
 /// trip `private_bounds`; the module's own `pub(crate)` visibility is the seal.
@@ -72,8 +135,8 @@ pub(crate) use stream::{CoordinatePlan, KeyItem, RangePlan, ScanItem};
 /// authority lives one layer below anything a caller can name.
 pub(crate) mod sealed {
     use super::{
-        Bytes, CellBuffer, CellKey, CoordinateBatch, MutationJournal, Scan, Section,
-        StateAccessError, StateName, StateType, StoreOutcome, Stream,
+        Bytes, CellBuffer, CellKey, CollectionDef, CoordinateBatch, MutationJournal, Scan, Section,
+        StateAccessError, StateName, StateType, StoreOutcome, Stream, StructuralIdentity,
     };
     use std::future::Future;
     use std::ops::DerefMut;
@@ -104,6 +167,29 @@ pub(crate) mod sealed {
         /// admission); the reader keeps its selected source, so a chunk resumes
         /// on exactly the source the planning command chose.
         type Plan: Clone + Send + Sync + 'static;
+
+        /// Validates the collection named `name` against this engine's
+        /// authority and returns its canonical name. The owner validates
+        /// registration and structural identity against the registry; the
+        /// published reader consumes the validation its source acquisition
+        /// already performed.
+        ///
+        /// # Errors
+        ///
+        /// Whatever the engine's validation refuses — for the owner, an
+        /// unregistered name or a structural-identity mismatch.
+        fn verify_registration(
+            session: &S,
+            name: &'static str,
+            state_type: StateType,
+            identity: &StructuralIdentity,
+        ) -> Result<StateName, StateAccessError>;
+
+        /// The collection's operational settings **as this engine sees them**;
+        /// each impl documents its own source. Captured once at bind, so every
+        /// configuration query inside a scoped operation answers from one
+        /// snapshot.
+        fn collection_def(session: &S, state_type: StateType, name: &StateName) -> CollectionDef;
 
         /// Acquires this invocation's read state.
         fn begin_read(session: &S) -> impl Future<Output = Self::ReadInner<'_>> + Send;
@@ -425,9 +511,12 @@ impl<S, L> Collection<S, L> {
     }
 }
 
-impl<S: CellRead, L> Collection<S, L> {
-    /// Validates `session` against the registered collection named `name` and
-    /// binds it. The sole owner-side constructor.
+impl<S: StateSession, L> Collection<S, L> {
+    /// Validates `session` against the collection named `name` and binds it.
+    /// The sole constructor for either engine: the owner validates registration
+    /// and structural identity against the registry, while the published reader
+    /// consumes the validation its source acquisition already performed. Which
+    /// happens is the engine's choice, never the caller's.
     ///
     /// # Errors
     ///
@@ -441,8 +530,10 @@ impl<S: CellRead, L> Collection<S, L> {
         state_type: StateType,
         identity: &StructuralIdentity,
     ) -> Result<Self, StateAccessError> {
-        let name = session.verify_state_registration(name, state_type, identity)?;
-        let def = session.collection_def(state_type, &name);
+        let name = <S::Engine as sealed::ReadEngine<S>>::verify_registration(
+            session, name, state_type, identity,
+        )?;
+        let def = <S::Engine as sealed::ReadEngine<S>>::collection_def(session, state_type, &name);
         Ok(Self {
             session: session.clone(),
             state_type,
@@ -451,9 +542,7 @@ impl<S: CellRead, L> Collection<S, L> {
             _layout: PhantomData,
         })
     }
-}
 
-impl<S: StateSession, L> Collection<S, L> {
     /// Runs `f` as one scoped read invocation.
     ///
     /// Both of the operation's lifetimes are higher-ranked: the closure must
@@ -757,24 +846,4 @@ pub(in crate::state) fn encode_cell<C: Codec>(
     let mut buf = SerializeBufGuard::acquire();
     C::with_cached_local(|codec| codec.serialize(payload, &mut buf))?;
     Ok(buf)
-}
-
-/// Guards every cell operation on either session kind: a session whose
-/// partition is shutting down, whose event is cancelled, or whose pinned
-/// attempt epoch no longer matches the live one (a handle or stream leaked past
-/// its dispatch attempt) refuses state access with
-/// [`StateAccessError::Terminated`]. Only the per-event session can be in any
-/// of those states, so the guard is vacuous on the published reader.
-///
-/// # Errors
-///
-/// [`StateAccessError::Terminated`], as above.
-pub(in crate::state) fn ensure_live<S>(session: &S) -> Result<(), StateAccessError>
-where
-    S: CellRead,
-{
-    if session.is_terminated() || !session.attempt_current() {
-        return Err(StateAccessError::Terminated);
-    }
-    Ok(())
 }

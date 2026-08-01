@@ -773,8 +773,9 @@ where
 
     /// Durably commits this map's buffered ops mid-handler — entries and keyset
     /// together. At-least-once; see
-    /// [`CellWrite::commit`](crate::state::session::CellWrite::commit) for the
-    /// contract, including the over-budget batch split.
+    /// the mid-handler durability section on the
+    /// [`collection`](crate::state::collection) module for the contract,
+    /// including the over-budget batch split.
     ///
     /// # Errors
     ///
@@ -795,8 +796,8 @@ where
     /// Discards this map's buffered uncommitted ops — entries and keyset
     /// together — reverting reads to the last [`commit`](Self::commit), or the
     /// pre-event committed state if none. Infallible; see
-    /// [`CellWrite::rollback`](crate::state::session::CellWrite::rollback) for
-    /// the contract.
+    /// the mid-handler durability section on the
+    /// [`collection`](crate::state::collection) module for the contract.
     #[instrument(
         name = "map.rollback",
         skip_all,
