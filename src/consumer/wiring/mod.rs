@@ -128,7 +128,10 @@ where
 {
     Ok(StateReaderDependencies::cassandra_with_loader(
         config,
-        LoaderConfiguration::for_consumer(setup.consumer),
+        LoaderConfiguration::for_consumer(
+            setup.consumer,
+            setup.common.keyed_state.subsystem.as_ref(),
+        ),
         setup.common.keyed_state.reader_cache_size(),
         setup.consumer.stall_threshold,
     )

@@ -12,7 +12,7 @@ environment variables for unset fields, so you can mix both approaches.
 | `PROSODY_SUBSCRIBED_TOPICS` | Topics to read from                                | -            | ✓        |          |
 | `PROSODY_ALLOWED_EVENTS`    | Only process events matching these prefixes        | (all)        | ✓        |          |
 | `PROSODY_SOURCE_SYSTEM`     | Tag for outgoing messages (prevents reprocessing)  | `<group id>` |          | ✓        |
-| `PROSODY_SUBSYSTEM`         | Subsystem name used to advertise published JSON collections | -    | ✓        |          |
+| `PROSODY_SUBSYSTEM`         | This consumer's subsystem name — advertises published collections and is the name peer requests address | - | ✓ |          |
 | `PROSODY_MOCK`              | Use in-memory Kafka for testing                    | false        | ✓        | ✓        |
 | `PROSODY_LOG`               | Log level (e.g., `info`, `prosody=debug`)          | info         | ✓        | ✓        |
 

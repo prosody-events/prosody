@@ -91,6 +91,7 @@ where
             telemetry: &telemetry,
             heartbeats,
             observer: KafkaObserver::new(&consumer_config.group_id),
+            responder: keyed_state.subsystem().cloned(),
         };
 
         match (consumer_config.mock, trigger_store_config) {

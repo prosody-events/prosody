@@ -34,6 +34,7 @@ use crate::heartbeat::Heartbeat;
 use crate::otel::SpanRelation;
 use crate::propagator::new_propagator;
 use crate::related_span;
+use crate::subsystem::SubsystemName;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -84,6 +85,10 @@ where
 
     /// Span relation for message execution spans
     pub message_spans: SpanRelation,
+
+    /// The subsystem this consumer answers peer requests for, or `None` when
+    /// it answers none.
+    pub responder: Option<SubsystemName>,
 }
 
 /// Runs the main Kafka message polling and processing loop.
@@ -115,6 +120,7 @@ where
         heartbeat,
         shutdown,
         message_spans,
+        responder,
     } = config;
 
     // Initialize distributed tracing propagator for context extraction
@@ -172,7 +178,8 @@ where
         );
 
         // Decode message through extraction, validation, and filtering
-        let maybe_decoded = decode_message(&mut message, &propagator, &mut codec);
+        let maybe_decoded =
+            decode_message(&mut message, &propagator, &mut codec, responder.as_ref());
 
         // Create consumer message with processing state and dispatch
         if let Some(decoded) = maybe_decoded {

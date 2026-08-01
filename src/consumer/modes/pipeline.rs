@@ -77,6 +77,7 @@ impl PipelineMiddlewareStack {
         );
 
         let version: Arc<str> = Arc::from(self.common_config.dedup.version.as_str());
+        let responder = self.common_config.keyed_state.subsystem.clone();
 
         // This stack runs outer→inner as:
         //
@@ -112,6 +113,7 @@ impl PipelineMiddlewareStack {
                 telemetry: &self.telemetry,
                 heartbeats: self.heartbeats,
                 observer: self.observer,
+                responder,
             },
         )
         .await

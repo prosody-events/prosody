@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
 
+mod request_tag;
+
 fn test_topic(name: &str) -> String {
     format!("loader_test_{name}_{}", uuid::Uuid::new_v4())
 }
@@ -34,6 +36,7 @@ fn loader_config() -> LoaderConfiguration {
         seek_timeout: Duration::from_secs(5),
         discard_threshold: 10,
         message_spans: SpanRelation::default(),
+        responder: None,
     }
 }
 
@@ -296,14 +299,8 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
         let topic = Topic::from(topic_name);
 
         let config = LoaderConfiguration {
-            bootstrap_servers: vec!["localhost:9094".to_owned()],
-            group_id: "prosody-test".to_owned(),
-            max_permits: 10,
-            cache_size: 1, // Minimal size to stress test deadlock prevention and eviction
-            poll_interval: Duration::from_millis(50),
-            seek_timeout: Duration::from_secs(5),
             discard_threshold: 5, // Small threshold for testing
-            message_spans: SpanRelation::default(),
+            ..loader_config()
         };
         let loader = KafkaLoader::<JsonCodec>::new(config, &HeartbeatRegistry::test())?;
 
@@ -516,14 +513,9 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
 
         // Small cache to force evictions
         let config = LoaderConfiguration {
-            bootstrap_servers: vec!["localhost:9094".to_owned()],
-            group_id: "prosody-test".to_owned(),
             max_permits: 20, // Allow many concurrent loads
             cache_size: 2,   // But only 2 cache permits
-            poll_interval: Duration::from_millis(50),
-            seek_timeout: Duration::from_secs(5),
-            discard_threshold: 10,
-            message_spans: SpanRelation::default(),
+            ..loader_config()
         };
         let loader = Arc::new(KafkaLoader::<JsonCodec>::new(
             config,

@@ -5,7 +5,7 @@
 //! process includes:
 //!
 //! - Distributed tracing context extraction
-//! - Message header parsing (source system)
+//! - Message header parsing (source system, and the reserved response headers)
 //! - JSON payload validation and parsing
 //! - Key extraction and UTF-8 validation
 //! - Timestamp resolution from Kafka metadata
@@ -21,11 +21,13 @@ use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::{Message, Timestamp};
 use std::str;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::ConsumerMessageValue;
+use crate::response::headers::{RequestTag, parse_request_tag};
+use crate::subsystem::SubsystemName;
 use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
 /// A decoded Kafka message without live span references.
@@ -61,13 +63,18 @@ pub struct DecodedMessage<P> {
 ///
 /// This function performs comprehensive message processing:
 /// 1. Extracts distributed tracing context from message headers
-/// 2. Parses and validates the payload via the provided codec
-/// 3. Extracts and validates the message key
-/// 4. Resolves the message timestamp from Kafka metadata
+/// 2. Reads the reserved response headers into a request tag
+/// 3. Parses and validates the payload via the provided codec
+/// 4. Extracts and validates the message key
+/// 5. Resolves the message timestamp from Kafka metadata
 ///
 /// The decoded message contains immutable data and parent trace context.
 /// Callers create their own spans from the context, ensuring span lifecycles
 /// are independent of cache eviction.
+///
+/// `responder` is the subsystem this consumer answers peer requests for, or
+/// `None` when it answers none. It is a required argument so no decode site can
+/// silently forget it and strip a request of its destination.
 ///
 /// `message` is taken as `&mut` so the codec can parse the payload in place
 /// via `payload_mut`, avoiding a copy; its payload bytes are left in an
@@ -76,6 +83,7 @@ pub fn decode_message<C: Codec>(
     message: &mut BorrowedMessage,
     propagator: &TextMapCompositePropagator,
     codec: &mut C,
+    responder: Option<&SubsystemName>,
 ) -> Option<DecodedMessage<C::Payload>> {
     let topic: Topic = Intern::from(message.topic());
     let partition = message.partition();
@@ -84,6 +92,7 @@ pub fn decode_message<C: Codec>(
     let parent_context = propagator.extract(&MessageExtractor::new(message));
 
     let source_system = extract_source_system(message);
+    let request = extract_request_tag(message, responder);
     let timestamp = resolve_timestamp(message);
 
     let Some(key_data) = message.key() else {
@@ -149,6 +158,7 @@ pub fn decode_message<C: Codec>(
         key,
         timestamp,
         payload,
+        request,
     });
 
     Some(DecodedMessage {
@@ -173,6 +183,31 @@ fn extract_source_system(message: &BorrowedMessage) -> Option<SourceSystem> {
         Ok(source_system) => source_system.map(SourceSystem::from),
         Err(error) => {
             error!("invalid source system encoding: {error:#}; ignoring");
+            None
+        }
+    }
+}
+
+/// Reads the reserved response headers, or nothing when this consumer answers
+/// no requests.
+///
+/// An unusable header set is counted and dropped rather than failing the event:
+/// a record that asks for a response badly is still a record to process.
+fn extract_request_tag(
+    message: &BorrowedMessage,
+    responder: Option<&SubsystemName>,
+) -> Option<RequestTag> {
+    let responder = responder?;
+    let headers = message.headers()?;
+
+    match parse_request_tag(
+        headers.iter().map(|header| (header.key, header.value)),
+        responder,
+    ) {
+        Ok(tag) => tag,
+        Err(rejection) => {
+            warn!("unusable response headers: {rejection}; no response will be sent");
+            rejection.record();
             None
         }
     }

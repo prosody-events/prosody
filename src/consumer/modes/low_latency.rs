@@ -110,6 +110,7 @@ where
             telemetry: &telemetry,
             heartbeats,
             observer,
+            responder: keyed_state.subsystem().cloned(),
         };
         let provider = build_common_middleware::<_, C::Payload>(
             setup.common,

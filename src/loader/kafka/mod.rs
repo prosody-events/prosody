@@ -77,6 +77,7 @@ use crate::Codec;
 use crate::otel::SpanRelation;
 use crate::related_span;
 use crate::state::RESOLVE_FANOUT;
+use crate::subsystem::SubsystemName;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use derive_builder::Builder;
 use tokio::select;
@@ -173,6 +174,14 @@ pub struct LoaderConfiguration {
 
     /// Span relation for loaded message spans.
     pub message_spans: SpanRelation,
+
+    /// The subsystem this consumer answers peer requests for, or `None` when
+    /// it answers none.
+    ///
+    /// A reloaded record is decoded here rather than on the poll path, so a
+    /// deferred request keeps its destination only while this matches what the
+    /// poll loop was given.
+    pub responder: Option<SubsystemName>,
 }
 
 impl LoaderConfiguration {
@@ -184,7 +193,10 @@ impl LoaderConfiguration {
     /// (`cache_size`, `seek_timeout`, `discard_threshold`) comes from its
     /// [`KafkaLoaderConfiguration`].
     #[must_use]
-    pub(crate) fn for_consumer(consumer_config: &ConsumerConfiguration) -> Self {
+    pub(crate) fn for_consumer(
+        consumer_config: &ConsumerConfiguration,
+        responder: Option<&SubsystemName>,
+    ) -> Self {
         Self {
             bootstrap_servers: consumer_config.bootstrap_servers.clone(),
             group_id: consumer_config.group_id.clone(),
@@ -194,6 +206,7 @@ impl LoaderConfiguration {
             seek_timeout: consumer_config.loader.seek_timeout,
             discard_threshold: consumer_config.loader.discard_threshold,
             message_spans: consumer_config.message_spans,
+            responder: responder.cloned(),
         }
     }
 }
@@ -416,10 +429,11 @@ where
     /// Returns an error if the underlying `BaseConsumer` cannot be created.
     pub fn for_consumer(
         consumer_config: &ConsumerConfiguration,
+        responder: Option<&SubsystemName>,
         heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, KafkaLoaderError> {
         Self::new(
-            LoaderConfiguration::for_consumer(consumer_config),
+            LoaderConfiguration::for_consumer(consumer_config, responder),
             heartbeats,
         )
     }
@@ -641,7 +655,14 @@ fn poll_loop<C: Codec>(
             continue;
         };
 
-        process_poll_result::<C>(result, &propagator, &mut codec, &mut active, consumer);
+        process_poll_result::<C>(
+            result,
+            &propagator,
+            &mut codec,
+            &mut active,
+            consumer,
+            config.responder.as_ref(),
+        );
     }
 }
 
@@ -657,6 +678,7 @@ fn process_poll_result<C: Codec>(
     codec: &mut C,
     active: &mut ActiveRequests<C::Payload>,
     consumer: &BaseConsumer,
+    responder: Option<&SubsystemName>,
 ) where
     C::Payload: Clone,
 {
@@ -725,8 +747,7 @@ fn process_poll_result<C: Codec>(
         propagator,
         codec,
         msg_topic,
-        msg_partition,
-        msg_offset,
+        responder,
     );
 
     cleanup_if_empty(active, consumer, msg_topic, msg_partition);
@@ -767,16 +788,20 @@ fn fulfill_requests<C: Codec>(
     propagator: &TextMapCompositePropagator,
     codec: &mut C,
     topic: Topic,
-    partition: Partition,
-    offset: Offset,
+    responder: Option<&SubsystemName>,
 ) where
     C::Payload: Clone,
 {
+    // Read before the `&mut` borrow the decode takes; the caller already
+    // matched this message to these senders by both coordinates.
+    let partition = message.partition();
+    let offset = message.offset();
+
     let request_count = senders.len();
     debug!(topic = %topic, partition = partition, offset = offset, request_count = request_count,
         "Fulfilling active requests for message");
 
-    let decoded_message = decode_message(message, propagator, codec);
+    let decoded_message = decode_message(message, propagator, codec, responder);
 
     if let Some(decoded) = decoded_message {
         debug!(topic = %topic, partition = partition, offset = offset, request_count = request_count,

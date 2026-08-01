@@ -13,6 +13,7 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::CellWrite;
+use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::timers::store::TriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType, MOCK_CLUSTER_BOOTSTRAP};
@@ -44,6 +45,10 @@ pub(in crate::consumer) struct StartupServices<'a> {
     /// primary consumer's context holds, which updates it from the statistics
     /// callback.
     pub(in crate::consumer) observer: KafkaObserver,
+    /// The subsystem this consumer answers peer requests for, or `None` when
+    /// it answers none. Taken from
+    /// [`KeyedStateInputs::subsystem`](super::state::KeyedStateInputs::subsystem).
+    pub(in crate::consumer) responder: Option<SubsystemName>,
 }
 
 /// Initializes a Prosody consumer with a trigger store provider, wiring the
@@ -83,6 +88,7 @@ where
         telemetry,
         heartbeats,
         observer,
+        responder,
     } = services;
 
     let watermark_version: Arc<WatermarkVersion> = Arc::default();
@@ -167,6 +173,7 @@ where
             heartbeat: &heartbeat,
             shutdown: &cloned_shutdown,
             message_spans,
+            responder,
         });
     });
 

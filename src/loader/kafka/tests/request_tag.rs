@@ -1,0 +1,127 @@
+//! A deferred message is re-read through this loader, so the destination a
+//! record asked its response to go to survives a retry only when the loader
+//! decodes under the same subsystem the poll loop was given. The message-defer
+//! store persists offsets alone — never the record — so that reload is the
+//! whole of "the request tag round-trips message defer".
+
+use super::{
+    HeartbeatRegistry, JsonCodec, KafkaLoader, LoaderConfiguration, Offset, Topic, loader_config,
+    producer, with_topic,
+};
+use crate::response::RequestId;
+use crate::response::headers::{
+    RESPONSE_AWAITED_HEADER, RESPONSE_NODE_HEADER, RESPONSE_REQUEST_ID_HEADER,
+    RESPONSE_VERSION_HEADER, RequestTag,
+};
+use crate::router::NodeId;
+use crate::subsystem::SubsystemName;
+use crate::tracing::init_test_logging;
+use rdkafka::message::{Header, OwnedHeaders};
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use std::time::Duration;
+use tokio::time::timeout;
+
+/// The subsystem the loader under test answers for. It is deliberately the
+/// **second** awaited name on the tagged record, so a parse that stops at the
+/// first awaited header loses the tag.
+const RESPONDER: &str = "billing";
+
+#[tokio::test]
+async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
+    let _ = color_eyre::install();
+    init_test_logging();
+
+    with_topic("request_tag", async |topic_name| {
+        let id = RequestId::new();
+        let node = NodeId::new();
+        let (id_text, node_text) = (id.to_string(), node.to_string());
+        let producer = producer()?;
+
+        let tagged_offset = produce(
+            &producer,
+            topic_name,
+            "tagged",
+            OwnedHeaders::new()
+                .insert(Header {
+                    key: RESPONSE_VERSION_HEADER,
+                    value: Some("1"),
+                })
+                .insert(Header {
+                    key: RESPONSE_REQUEST_ID_HEADER,
+                    value: Some(id_text.as_str()),
+                })
+                .insert(Header {
+                    key: RESPONSE_NODE_HEADER,
+                    value: Some(node_text.as_str()),
+                })
+                .insert(Header {
+                    key: RESPONSE_AWAITED_HEADER,
+                    value: Some("ledger"),
+                })
+                .insert(Header {
+                    key: RESPONSE_AWAITED_HEADER,
+                    value: Some(RESPONDER),
+                }),
+        )
+        .await?;
+        let plain_offset = produce(&producer, topic_name, "plain", OwnedHeaders::new()).await?;
+
+        let config = LoaderConfiguration {
+            responder: Some(SubsystemName::try_new(RESPONDER)?),
+            ..loader_config()
+        };
+        let loader = KafkaLoader::<JsonCodec>::new(config, &HeartbeatRegistry::test())?;
+        let topic = Topic::from(topic_name);
+
+        assert_eq!(
+            load(&loader, topic, tagged_offset).await?,
+            Some(RequestTag::new(id, node)),
+            "the reloaded record lost the destination its headers named"
+        );
+        // The negative control: without it, a loader that reported the same tag
+        // for every record would satisfy the assertion above.
+        assert_eq!(
+            load(&loader, topic, plain_offset).await?,
+            None,
+            "a record that asked for no response must carry no destination"
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// Produces one record and reports the offset it landed at.
+async fn produce(
+    producer: &FutureProducer,
+    topic: &str,
+    key: &str,
+    headers: OwnedHeaders,
+) -> color_eyre::Result<Offset> {
+    let delivery = producer
+        .send(
+            FutureRecord::to(topic)
+                .partition(0)
+                .key(key)
+                .payload(r#"{"test_id":1,"data":"request-tag"}"#)
+                .headers(headers),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(error, _)| error)?;
+    Ok(delivery.offset)
+}
+
+/// Reads one offset back through the loader's own decode. The deadline is a
+/// hang guard, never the assertion.
+async fn load(
+    loader: &KafkaLoader<JsonCodec>,
+    topic: Topic,
+    offset: Offset,
+) -> color_eyre::Result<Option<RequestTag>> {
+    let decoded = timeout(
+        Duration::from_mins(1),
+        loader.load_from_kafka(topic, 0, offset),
+    )
+    .await??;
+    Ok(decoded.value.request)
+}

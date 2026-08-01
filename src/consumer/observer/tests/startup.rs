@@ -87,6 +87,7 @@ pub(super) async fn initialize_with(
             telemetry: &telemetry,
             heartbeats,
             observer,
+            responder: keyed_state.subsystem().cloned(),
         },
     )
     .await)

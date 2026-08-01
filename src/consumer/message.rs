@@ -20,6 +20,7 @@ use tracing::{Span, debug};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::{Keyed, Uncommitted};
+use crate::response::headers::RequestTag;
 use crate::timers::PendingTimer;
 use crate::timers::store::TriggerStore;
 use crate::{EventIdentity, Key, Offset, Partition, ProcessScope, SourceSystem, Topic};
@@ -247,6 +248,21 @@ pub struct ConsumerMessageValue<P> {
     /// Deserialized message payload.
     #[educe(Debug(ignore))]
     pub payload: P,
+
+    /// Where a response to this message must go, when the record asked for one
+    /// and this consumer answers for one of the subsystems it awaits.
+    ///
+    /// Crate-internal deliberately: it is framework routing, not something
+    /// every cross-language binding has to express.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the responder middleware is this field's production reader; the parse that \
+                      fills it is exercised by the decode and loader tests"
+        )
+    )]
+    pub(crate) request: Option<RequestTag>,
 }
 
 #[cfg(test)]
@@ -260,6 +276,7 @@ impl Default for ConsumerMessageValue<serde_json::Value> {
             key: "test-key".into(),
             timestamp: Utc::now(),
             payload: serde_json::json!({}),
+            request: None,
         }
     }
 }
@@ -395,6 +412,7 @@ impl<P> ConsumerMessage<P> {
                 key,
                 timestamp: Utc::now(),
                 payload,
+                request: None,
             },
             Span::current(),
             permit,

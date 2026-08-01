@@ -111,7 +111,7 @@ where
     ) -> Result<Self, StateReaderError> {
         Ok(Self::cassandra_with_loader(
             cassandra,
-            LoaderConfiguration::for_consumer(consumer),
+            LoaderConfiguration::for_consumer(consumer, keyed_state.subsystem.as_ref()),
             keyed_state.reader_cache_size(),
             consumer.stall_threshold,
         )

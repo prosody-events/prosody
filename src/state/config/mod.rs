@@ -158,11 +158,18 @@ pub struct KeyedStateConfiguration {
     #[validate(custom(function = "validate_read_cache_ttl"))]
     pub read_cache_ttl: Option<Duration>,
 
-    /// Subsystem this consumer publishes keyed state under. Required whenever
-    /// any registered collection is `.published(true)`. A published collection
-    /// with no subsystem is rejected at build
+    /// This consumer's subsystem name. It identifies the consumer generally,
+    /// not keyed state alone: a record asking for a peer response names the
+    /// subsystems it awaits, and this consumer answers only when one of them is
+    /// this name. Setting it is what opts a consumer into answering, even when
+    /// it publishes no state.
+    ///
+    /// It is also the subsystem this consumer publishes keyed state under, and
+    /// is required whenever any registered collection is `.published(true)`. A
+    /// published collection with no subsystem is rejected at build
     /// ([`RegisterStateError::PublishedWithoutSubsystem`]). `None` (the
-    /// default) is valid for consumers that publish nothing.
+    /// default) is valid for consumers that neither publish state nor answer
+    /// requests.
     ///
     /// Keep this set across the deploy that un-publishes a collection. Startup
     /// reconciliation withdraws a collection's routing row only while it is

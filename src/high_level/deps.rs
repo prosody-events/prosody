@@ -38,7 +38,7 @@ impl ReaderConfiguration {
             } => (consumer, &common.keyed_state),
         };
         Self {
-            loader: LoaderConfiguration::for_consumer(consumer),
+            loader: LoaderConfiguration::for_consumer(consumer, keyed_state.subsystem.as_ref()),
             group_id: consumer.group_id.clone(),
             stall_threshold: consumer.stall_threshold,
             cache_size: keyed_state.reader_cache_size(),
