@@ -373,6 +373,35 @@ fn canonical_headers_parse_to_their_ids() -> color_eyre::Result<()> {
     Ok(())
 }
 
+/// A responder answers for its own name and for no other, so a name that only
+/// overlaps it addresses a different subsystem.
+///
+/// Every row is a well-formed request whose one awaited name is a near miss:
+/// `billing` holds it, it holds `billing`, or it differs only in case. Each
+/// refuses one weakening of the name match — a prefix, suffix or substring test
+/// either way round, and a case-insensitive compare — that the generated cases
+/// cannot reach, since they draw the responder from the awaited list itself.
+#[test]
+fn a_name_that_only_overlaps_the_responder_is_another_subsystem() -> color_eyre::Result<()> {
+    let responder = SubsystemName::try_new("billing")?;
+
+    for awaited in ["bill", "illing", "billings", "autobilling", "BILLING"] {
+        let headers = [
+            (RESPONSE_VERSION_HEADER, Some(b"1".as_slice())),
+            (RESPONSE_REQUEST_ID_HEADER, Some(REQUEST_ID_TEXT.as_bytes())),
+            (RESPONSE_NODE_HEADER, Some(NODE_ID_TEXT.as_bytes())),
+            (RESPONSE_AWAITED_HEADER, Some(awaited.as_bytes())),
+        ];
+
+        assert_eq!(
+            parse_request_tag(headers, &responder),
+            Ok(None),
+            "{awaited} is not this responder's name"
+        );
+    }
+    Ok(())
+}
+
 /// Every rejection counts under its own label, so one reason can never be read
 /// as another in a dashboard.
 #[test]

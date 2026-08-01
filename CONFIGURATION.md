@@ -84,7 +84,8 @@ reloads and keyed-state message resolution.
 | `PROSODY_STATE_READ_CACHE_TTL` | Default read-cache TTL for composed readers: how long a `StateReader` may serve a collection's reads from its cache before re-reading the store. A humantime duration (`5s`, `750ms`); `none` disables the inherited default. A descriptor can replace it with `.read_cache(duration)` or bypass it with `.read_cache(ReadCachePolicy::Disabled)`. Reader-only — never affects the owning consumer's writes or a collection's durable TTL. | 5s |
 
 `PROSODY_SUBSYSTEM` names the service's published keyed state. Set it whenever
-any collection uses `.published(true)`.
+any collection uses `.published(true)`. Prosody trims the name, and refuses it
+at startup when it is blank or longer than 64 bytes.
 
 To make a published collection private, change it to `.published(false)` but
 keep the collection registered and retain the same subsystem name for one
