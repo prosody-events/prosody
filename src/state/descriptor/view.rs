@@ -1,5 +1,5 @@
-//! Bridge: the raw cell-command byte boundary of the collection kinds that
-//! still thread permits by hand. [`CellScope`] forwards a collection
+//! Bridge: the raw cell-command byte boundary of the one collection kind that
+//! still threads permits by hand. [`CellScope`] forwards a collection
 //! partition's raw cell ops and [`CellView`] wraps them in a [`CellType`]'s
 //! codecs and resolver; the raw sinks are **private to this module**, so a
 //! collection kind (a sibling module) can reach a cell only through the typed
@@ -16,7 +16,7 @@ use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Sec
 use crate::state::collection::{ScanItem, encode_cell, ensure_live, resolve_batch, resolve_cell};
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::session::{CellRead, CellWrite};
-use crate::state::store::{CELL_BATCH, CellBuffer, CoordinateBatch};
+use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{SHARD_FANOUT_CONCURRENCY, StateName, StateType, StoreOutcome};
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -62,7 +62,7 @@ impl<S> CellScope<S> {
 
     /// Projects a typed view over this scope's cells in `section` for cell type
     /// `T`. A kind projects one view per cell family, each in its own section
-    /// (a Map projects its entries and its meta cells from the same scope
+    /// (a Deque projects its entries and its bounds cell from the same scope
     /// into different sections).
     pub(in crate::state::descriptor) fn typed<T>(&self, section: Section) -> CellView<S, T>
     where
@@ -84,7 +84,7 @@ impl<S> CellScope<S> {
 impl<S: CellRead> CellScope<S> {
     /// This collection's Deque push capacity (`None` unbounded) — a cheap
     /// settings lookup the Deque `push_*` enforcement consults per push.
-    pub(in crate::state::descriptor) fn capacity(&self) -> Option<NonZeroUsize> {
+    fn capacity(&self) -> Option<NonZeroUsize> {
         self.session
             .collection_def(self.state_type, &self.name)
             .capacity
@@ -227,9 +227,9 @@ impl<S: CellRead, T: CellType> CellView<S, T> {
         &self.scope.name
     }
 
-    /// Acquires the session operation gate for a read — the top of every Map
-    /// and Deque public read wrapper (their `get`/`len`/stream inits). The
-    /// returned `S::Permit` is the witness the view's read sinks demand.
+    /// Acquires the session operation gate for a read — the top of every Deque
+    /// public read wrapper (`get`/`len`/stream init). The returned `S::Permit`
+    /// is the witness the view's read sinks demand.
     pub(in crate::state::descriptor) async fn read_permit(&self) -> S::Permit<'_> {
         self.scope.session().permit().await
     }
@@ -249,31 +249,12 @@ impl<S: CellRead, T: CellType> CellView<S, T> {
         self.scope.capacity()
     }
 
-    /// The scan shell's fence adapter — the shell's one uniform piece and the
-    /// SOLE home of a scan's per-emission attempt fence. Wraps a source's item
-    /// stream (the resolving range and coordinate sources of [`Self::scan`] /
-    /// [`Self::scan_at`]) and runs [`ensure_live`] after EVERY `inner.next()`
-    /// completion — `Some`, `Err`, and the exhaustion `None` alike — BEFORE
-    /// matching it, so a scan leaked past its handler attempt (a spawned task,
-    /// an un-awaited future, a foreign promise) errors
-    /// [`StateAccessError::Terminated`] at its next emission; the source's own
-    /// buffer sits below the fence, so no item whose emission check follows the
-    /// bump crosses. Empty sources still pass the fence on
-    /// exhaustion, so a leaked empty-plan stream errors rather than reporting a
-    /// clean end.
-    ///
-    /// # Invariant — no await, no buffering between the fence and the caller
-    ///
-    /// Every source buffer (a coordinate chunk's buffer, the range source's
-    /// `buffered` resolution window) sits BELOW this adapter; a collection adds
-    /// only synchronous per-item transforms above it (`map_err` into its
-    /// collection error, dropping the coordinate for a deque). The check is a
-    /// LINEARIZATION point, not a wall-clock wall: a completion whose
-    /// synchronous `ensure_live` passed linearized before any concurrent
-    /// attempt boundary. It holds no permit (the check is sync); a concurrent
-    /// reset — which needs the gate exclusively and, for the coordinate source,
-    /// queues behind the whole chunk's permit — is ordered relative to a
-    /// completion by whether its bump landed before that completion's check.
+    /// The bridge twin of the managed stream fence adapter (`fenced` in
+    /// `crate::state::collection::stream`) — read that one for the
+    /// per-emission attempt fence and its no-await-above invariant, which this
+    /// copy reproduces with [`ensure_live`] in place of the engine fence. It
+    /// exists only because Deque's scan shell has not moved onto the engine
+    /// yet, and dies with this module.
     fn fenced<'a, X: Send + 'a>(
         &'a self,
         inner: impl Stream<Item = Result<X, CellStateError<CellCodecError<T>>>> + Send + 'a,
@@ -305,8 +286,7 @@ impl<S: CellRead, T: CellType> CellView<S, T> {
     /// [`Self::get_many`]'s PHASE 1: lower each key to its coordinate in input
     /// order, split via [`CoordinateBatch::chunks`], and read the sub-batches
     /// SEQUENTIALLY. Aligned to `keys` (`result[i]` answers `keys[i]`). **No
-    /// decode, no resolver** — the result is raw `Option<Bytes>`, so it sits in
-    /// the resolver-free impl block.
+    /// decode, no resolver** — the result is raw `Option<Bytes>`.
     ///
     /// # Errors
     ///
@@ -316,19 +296,17 @@ impl<S: CellRead, T: CellType> CellView<S, T> {
         permit: &S::Permit<'_>,
         keys: &[KeyOf<T>],
     ) -> Result<CellBuffer<Option<Bytes>>, CellStateError<CellCodecError<T>>> {
-        // The per-chunk coordinate buffer stays inline (`≤ CELL_BATCH`); only
-        // the owned coordinates cross the store await, never a borrow of `self`.
+        // Mapped as a function item, so the lazy coordinate lowering carries no
+        // closure borrowing `self` across the store await, and no scratch
+        // buffer duplicates what `CoordinateBatch::chunks` already collects.
+        let coordinates = keys.iter().map(<T::Key as OrderedKeyCodec>::encode);
         let mut bytes: CellBuffer<Option<Bytes>> = SmallVec::with_capacity(keys.len());
-        for key_chunk in keys.chunks(CELL_BATCH) {
-            let coords: CellBuffer<Coordinate> =
-                key_chunk.iter().map(|k| self.cell(k).coordinate).collect();
-            for batch in CoordinateBatch::chunks(coords) {
-                bytes.extend(
-                    self.scope
-                        .raw_get_many(permit, self.section, &batch)
-                        .await?,
-                );
-            }
+        for batch in CoordinateBatch::chunks(coordinates) {
+            bytes.extend(
+                self.scope
+                    .raw_get_many(permit, self.section, &batch)
+                    .await?,
+            );
         }
         debug_assert_eq!(
             bytes.len(),
@@ -471,9 +449,7 @@ where
     /// Reads, decodes, and resolves the visible committed values for `keys` as
     /// one aligned batch (`result[i]` answers `keys[i]`; duplicate keys are
     /// answered per position under the observation rules; absent → `None`).
-    /// Owns the chunking and takes the read permit, exactly as [`Self::get`]
-    /// does. The scan coordinate source is its only caller, composing it per
-    /// chunk under one chunk permit.
+    /// Owns the chunking, exactly as [`Self::get`] does.
     ///
     /// Runs in two decoupled phases. PHASE 1 — the sub-batched store reads (the
     /// cheap part; carries marker-help + cache-fill writes beneath the cache,
@@ -483,16 +459,22 @@ where
     /// help): the shared [`resolve_batch`], whose ordered fan-out keeps the
     /// output aligned to `keys`.
     ///
+    /// **Admission spans PHASE 1 only.** The permit is taken **by value** and
+    /// dropped at the phase boundary, so a caller structurally cannot hold the
+    /// gate across the resolves — which touch no cell state and may reach a
+    /// loader.
+    ///
     /// # Errors
     ///
     /// Returns an access error from the session, a codec error (Permanent) when
     /// a cell's bytes do not decode, or a resolution error from the resolver.
     pub(in crate::state::descriptor) async fn get_many(
         &self,
-        permit: &S::Permit<'_>,
+        permit: S::Permit<'_>,
         keys: &[KeyOf<T>],
     ) -> Result<CellBuffer<Option<ResolvedOf<T>>>, CellStateError<CellCodecError<T>>> {
-        let bytes = self.read_bytes(permit, keys).await?;
+        let bytes = self.read_bytes(&permit, keys).await?;
+        drop(permit);
         resolve_batch::<S, T>(self.scope.session(), bytes).await
     }
 
@@ -543,13 +525,13 @@ where
     /// holes, popped positions, membership races). Each `≤ STREAM_CHUNK` chunk
     /// is read gate-witnessed by ONE [`Self::get_many`] call — one read permit
     /// per chunk, one lower batch read on any miss (a chunk is one
-    /// [`CoordinateBatch`] since `STREAM_CHUNK == CELL_BATCH`) — with the
-    /// permit released before the first yield (`StreamYieldFree`). The
-    /// permit spans the whole chunk's fetch and resolve, so an attempt
-    /// boundary (which needs the gate exclusively) serializes AFTER a chunk
-    /// and never tears it. Fenced per emission by [`Self::fenced`]; an
-    /// empty `coords` yields nothing but still passes the fence on
-    /// exhaustion.
+    /// [`CoordinateBatch`] since `STREAM_CHUNK == CELL_BATCH`). The permit
+    /// spans that batch fetch only ([`Self::get_many`] consumes it at the phase
+    /// boundary), so an attempt boundary (which needs the gate exclusively)
+    /// serializes AFTER a chunk's fetch and never tears it, and no permit is
+    /// ever held across a yield (`StreamYieldFree`). Fenced per emission by
+    /// [`Self::fenced`]; an empty `coords` yields nothing but still passes the
+    /// fence on exhaustion.
     pub(in crate::state::descriptor) fn scan_at<'a, I>(
         &'a self,
         coords: I,
@@ -572,15 +554,15 @@ where
             // `iter::empty()`).
             let chunks = unfold(coords.peekable(), |mut coords| async move {
                 coords.peek()?; // exhausted ⇒ unfold ends
-                // One read permit per chunk, dropped with this future's scope —
-                // never held across a yield (StreamYieldFree). It spans the
-                // whole batch fetch + resolve.
+                // One read permit per chunk, moved into `get_many`, which
+                // drops it after the batch fetch and before the resolves —
+                // so it is never held across a yield (StreamYieldFree).
                 let permit = self.read_permit().await;
                 // Collect the chunk's ≤ STREAM_CHUNK keys, then ONE batch
                 // fetch + resolve; `get_many` keeps `vals` aligned to `keys`.
                 let keys: CellBuffer<KeyOf<T>> =
                     coords.by_ref().take(STREAM_CHUNK).collect();
-                let chunk = self.get_many(&permit, &keys).await.map(|vals| {
+                let chunk = self.get_many(permit, &keys).await.map(|vals| {
                     // A `None` is an absent cell: skipped, never an error.
                     keys.into_iter()
                         .zip(vals)
@@ -611,7 +593,6 @@ where
     ) -> impl Stream<Item = ScanItem<T>> + Send + 'a {
         try_stream! {
             ensure_live(self.scope.session())?;
-            let this = self;
             // Encode the direction-relative edges once, here — the owned
             // coordinates outlive the scan the generator drives to completion
             // below. (`Scan::start`/`end` follow `dir`; `Scan` itself derives
@@ -638,7 +619,7 @@ where
                         let (cell, bytes) = item?;
                         let key = <T::Key as OrderedKeyCodec>::decode(cell.coordinate.as_bytes())
                             .map_err(CellStateError::Key)?;
-                        let resolved = this.resolve_bytes(bytes).await?;
+                        let resolved = self.resolve_bytes(bytes).await?;
                         Ok::<_, CellStateError<CellCodecError<T>>>((key, resolved))
                     })
                 })

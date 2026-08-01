@@ -17,7 +17,8 @@
 //! * `KEYSET` holds **one** cell: the keyset, at the fixed coordinate `[2]`.
 //!   Coordinates `[0]`/`[1]` are a deliberately retired gap (they once held two
 //!   min/max bound cells; re-using a retired coordinate would let a stale
-//!   artifact alias an old frame). An empty Map has no keyset cell.
+//!   artifact alias an old frame). A Map that has never been written has no
+//!   keyset cell.
 //! * `ENTRIES` holds one cell per key, addressed by the key codec's
 //!   order-preserving coordinate and typed by the entries cell type
 //!   [`Keyed`]`<KC, V>`.
@@ -38,13 +39,15 @@
 //! ones that read absent, so a stale entry costs at most one cached absent
 //! read, never a wrong or dropped answer.
 //!
-//! A `Tracked` keyset holds at most the registered `keyset_limit` distinct
-//! keys, stored sorted by their order-preserving coordinate, so iteration is
-//! key order in both directions with no read-time sort. A `set` that would push
-//! a `Tracked` frame past the limit (or past the module's encoded-byte ceiling)
-//! writes the one-way `Overflowed` sentinel — until `clear` or TTL death of the
-//! whole map — and iteration falls back to the full-section (`Unbounded`-edged)
-//! scan. The bound is the **live distinct-key count**: because `remove`
+//! A `Tracked` keyset stores its keys sorted by their order-preserving
+//! coordinate, so iteration is key order in both directions with no read-time
+//! sort. A `set` that would push a `Tracked` frame past the registered
+//! `keyset_limit` (or past the module's encoded-byte ceiling) writes the
+//! one-way `Overflowed` sentinel — until `clear` or TTL death of the whole
+//! map — and iteration falls back to the full-section (`Unbounded`-edged)
+//! scan — as does a frame a *lowered* `keyset_limit` left above the new bound,
+//! until removals shrink it back under. The bound is the **live distinct-key
+//! count**: because `remove`
 //! subtracts, a rotating map whose live size stays under the limit keeps cached
 //! iteration forever (and a `remove` that drops a `Tracked` frame back under
 //! the limit heals it — removal heals). A map that ever exceeds the limit in
@@ -123,8 +126,10 @@ collection_layout! {
 /// parameters, so every instantiation answers identically.
 type FrozenLayout = MapKind<I64KeyCodec, JsonCodec>;
 
-/// Map's per-invocation mutation maximum: `set` and `remove` each stage one
-/// entry mutation plus one keyset write; `clear` stages one whole-layout reset.
+/// Map's declared per-invocation mutation maximum: `set` and `remove` each
+/// stage one entry mutation plus one keyset write; `clear` stages one
+/// whole-layout reset. The assertion below pins the declaration against
+/// [`JOURNAL_INLINE`]'s budget.
 const MAP_MAX_MUTATIONS: usize = 2;
 
 const _: () = assert!(
@@ -242,12 +247,16 @@ impl Codec for MapKeysetKey {
 
 /// A map's decoded keyset cell — its current tracked membership.
 ///
-/// `Tracked` lists at most the registered `keyset_limit` coordinates,
-/// **strictly ascending bytewise** (sorted and unique), bounded by the limit
-/// and the [`KEYSET_BYTE_CEILING`] at write time. `Overflowed` is the one-way
-/// sentinel: once a `set` past the bound writes it, iteration falls back to the
+/// `Tracked` lists coordinates **strictly ascending bytewise** (sorted and
+/// unique). The count and [`KEYSET_BYTE_CEILING`] bounds are enforced at
+/// `set`: a `set` that would push the frame past either writes `Overflowed`
+/// instead — the one-way sentinel, after which iteration falls back to the
 /// full-section (`Unbounded`-edged) scan until `clear` (or TTL death of the
-/// whole map). See the module's current-membership invariant.
+/// whole map). Because the bound is read from the *current* registration, a
+/// redeploy that lowers `keyset_limit` can leave a stored `Tracked` frame above
+/// it; reads then degrade to the same full-section scan until removals shrink
+/// the frame back under the bound or a `set` collapses it. See the module's
+/// current-membership invariant.
 ///
 /// # Invariant: `KeysetPresence`
 ///
@@ -485,10 +494,7 @@ where
         &self,
         key: &KC::Key,
     ) -> Result<bool, MapStateError<CellCodecError<V>>> {
-        Ok(op
-            .contains(MapKind::<KC, V>::ENTRIES, key)
-            .await
-            .map_err(CellStateError::Access)?)
+        Ok(op.contains(MapKind::<KC, V>::ENTRIES, key).await?)
     }
 
     /// Reads the values for `keys` as one isolated batch — one result per input
@@ -551,6 +557,12 @@ where
     ) -> Result<(), MapStateError<CellCodecError<V>>> {
         // Read the keyset *before* staging the entry: own writes are visible to
         // own reads, and the transition depends on the pre-set frame.
+        //
+        // `KC::encode` runs twice per mutation (here, and again inside
+        // `op.set`'s cell-key lowering) — one bounded extra coordinate.
+        // Collapsing it needs a coordinate-addressed mutation command on
+        // `CollectionWrite`, which gains its second caller when Deque's
+        // endpoint writes migrate; decide it there, not for one caller.
         let coordinate = KC::encode(&key);
         let prior = read_keyset_state(op).await?;
         op.set(MapKind::<KC, V>::ENTRIES, &key, value)?;
@@ -682,14 +694,13 @@ where
     /// stream yields nothing with zero entry reads (no scan).
     ///
     /// Session admission is taken only for the init keyset read and per chunk
-    /// (≤ `STREAM_CHUNK` point reads each): each chunk is fetched, decoded, and
-    /// resolved under one admission that dies with the chunk future's scope
-    /// before any of its items reach user code, so admission is never held
-    /// across a yield (items and errors alike) — a handler may mutate this map
-    /// between stream items without deadlock (`StreamYieldFree`; see
-    /// [`SessionGate`](crate::state::session)). Errors are chunk-atomic: a
-    /// failing chunk yields none of its items (all its live entries, or only
-    /// its error).
+    /// (≤ `STREAM_CHUNK` point reads each): a chunk's admission covers its
+    /// batch fetch, and is released before the chunk is decoded and resolved —
+    /// so it is never held across a yield (items and errors alike), and a
+    /// handler may mutate this map between stream items without deadlock
+    /// (`StreamYieldFree`; see [`SessionGate`](crate::state::session)). Errors
+    /// are chunk-atomic: a failing chunk yields none of its items (all its live
+    /// entries, or only its error).
     pub fn stream(&self, dir: Direction) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
@@ -874,8 +885,8 @@ where
 /// `remove`-side transition table for the module's current-membership
 /// invariant). A `Tracked` frame containing the coordinate is rewritten without
 /// it — unconditionally, so a `remove` that drops an oversized frame back under
-/// the bound heals it (removal heals); the rewrite only shrinks the frame, so
-/// the byte ceiling can never be exceeded by it. A `Tracked` frame that does
+/// the bound heals it (removal heals) and a still-oversized one shrinks toward
+/// it rather than forfeiting tracked iteration. A `Tracked` frame that does
 /// not contain the coordinate, an `Overflowed` sentinel (membership unknown;
 /// one-way until `clear`), and an absent keyset are all left untouched; a
 /// malformed frame heals to `Overflowed`, exactly as `set` does.
@@ -1016,6 +1027,11 @@ fn is_oversized(keys: &[Coordinate], limit: usize) -> bool {
 /// onto one key and yield an entry twice). The caller degrades the stream to
 /// the scan on `None`. Sized once (`with_capacity`), bounded by the keyset
 /// limit.
+///
+/// The canonicality re-encode costs one [`Coordinate`] per tracked key —
+/// bounded by the registered limit and paid once per stream construction, not
+/// per item — and is accepted over trusting the codec's byte-identity law,
+/// because an aliasing codec would otherwise silently double-yield an entry.
 fn decoded_key_list<KC: OrderedKeyCodec>(coordinates: &[Coordinate]) -> Option<Vec<KC::Key>> {
     let mut keys = Vec::with_capacity(coordinates.len());
     for coordinate in coordinates {

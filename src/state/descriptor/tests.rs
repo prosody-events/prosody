@@ -1430,7 +1430,7 @@ mod typed_cell_view {
         let keys: Vec<i64> = (0..n as i64).collect();
         let collector = async {
             let read = view.read_permit().await;
-            let out = Box::pin(view.get_many(&read, &keys))
+            let out = Box::pin(view.get_many(read, &keys))
                 .await
                 .map_err(|e| eyre!("get_many: {e}"))?;
             Ok::<_, color_eyre::Report>(out)

@@ -130,14 +130,6 @@ pub trait CellRead: ReadAdmission + StateSession {
     /// cancelled. Descriptor handles guard every operation on this.
     fn is_terminated(&self) -> bool;
 
-    /// The operational settings for `(state_type, name)` **as this session's
-    /// engine sees them** — the registry definition for a per-event session,
-    /// the descriptor's own for a published reader. A collection binding
-    /// captures it once, so every configuration query inside a scoped operation
-    /// answers from one snapshot. No default impl: silently defaulted settings
-    /// would mis-size a real session's keyset or disable its TTL refresh.
-    fn collection_def(&self, state_type: StateType, name: &StateName) -> CollectionDef;
-
     /// Validates that the keyed-state collection named `(state_type, name)` is
     /// registered with the asserted structural identity, returning the
     /// canonical [`StateName`].
@@ -393,9 +385,9 @@ pub trait CellWrite: CellRead + StateLifecycle + MarkerIdentity + WritableStateS
 /// discarding are framework-only moves.
 pub(crate) mod sealed {
     use super::{
-        Bytes, CellKey, CellStore, CollectionRef, CompactDateTime, CompactDuration, Duration,
-        Future, MarkerWrite, ProvisionalWrite, RepinProof, Section, SectionClear, StateAccessError,
-        StateName, StateType, Uuid, resolve_collections,
+        Bytes, CellKey, CellStore, CollectionDef, CollectionRef, CompactDateTime, CompactDuration,
+        Duration, Future, MarkerWrite, ProvisionalWrite, RepinProof, Section, SectionClear,
+        StateAccessError, StateName, StateType, Uuid, resolve_collections,
     };
     use opentelemetry::global::meter;
     use opentelemetry::metrics::Counter;
@@ -496,10 +488,11 @@ pub(crate) mod sealed {
     ///   `ensure_live` / `mutate_permit`'s ordered admission;
     /// * **apply-hook mutations** past the settle window — the closed gate and
     ///   attempt teardown;
-    /// * **scans and streams** — the scan shell's per-emission fence
-    ///   (`CellView::fenced`), which runs `ensure_live` after every stream
-    ///   completion, so a leaked stream errors at its next emission and no
-    ///   buffered item crosses the boundary.
+    /// * **scans and streams** — the managed stream fence adapter (`fenced` in
+    ///   `crate::state::collection::stream`), which runs the engine fence after
+    ///   every stream completion, so a leaked stream errors at its next
+    ///   emission and no buffered item crosses the boundary. Deque's scan shell
+    ///   still carries a pre-engine twin of it, and dies with the bridge.
     ///
     /// Keep every session op inside the handler future that owns the event all
     /// the same; the fence is the backstop, not a license to detach.
@@ -571,11 +564,12 @@ pub(crate) mod sealed {
     /// A held [`SessionGate`] permit (RAII: dropping it releases the gate).
     ///
     /// Witnesses admission for a session **read**: the descriptor's cell-op
-    /// sinks and the engine's journal-replay sink
-    /// ([`StateLifecycle::stage_cell`]) all demand `&S::Permit<'_>` (the
-    /// owner's is this `OpPermit`), so "forgot to acquire the gate" and "let
-    /// the acquire outlive the op" cannot compile. The same type is both the
-    /// owner's [`ReadAdmission::Permit`] and the hold
+    /// sinks and the engine's journal-replay sinks
+    /// ([`StateLifecycle::stage_cell`] and
+    /// [`StateLifecycle::stage_section_clear`]) all demand `&S::Permit<'_>`
+    /// (the owner's is this `OpPermit`), so "forgot to acquire the gate" and
+    /// "let the acquire outlive the op" cannot compile. The same type is
+    /// both the owner's [`ReadAdmission::Permit`] and the hold
     /// [`SessionGate::close`] returns, and a mutator's [`MutatePermit`]
     /// derefs to it. The read-vs-mutate split encodes the gate's closure
     /// check, **not** shared-vs-exclusive access: both permits are
@@ -607,8 +601,8 @@ pub(crate) mod sealed {
     /// `raw_set`/`raw_clear`/`clear_section`/`raw_commit` demand
     /// `&S::MutatePermit<'_>`; the owner session's is this struct. A read
     /// permit at a write does not compile. A scoped write invocation holds one
-    /// across its whole body and hands its [`Deref`] target to
-    /// [`StateLifecycle::stage_cell`] at replay.
+    /// across its whole body and hands its [`Deref`] target to the
+    /// journal-replay sinks [`OpPermit`] names at replay.
     /// It [`Deref`]s to [`OpPermit`], so a mutator's
     /// one permit also witnesses the reads inside its body — the read-under-
     /// mutate grade subtyping is one-directional and deliberate: a read is
@@ -814,9 +808,14 @@ pub(crate) mod sealed {
     /// external crate can forge a session.
     ///
     /// Sealing prevents a downstream crate from implementing the trait, not
-    /// from calling its methods through the public [`CellRead`] subtrait. Both
-    /// methods are safe to call: [`Self::permit`] returns an opaque witness,
-    /// and [`Self::attempt_current`] returns a `bool`.
+    /// from calling its methods through the public [`CellRead`] subtrait — so
+    /// the trait also homes the operational settings, which are crate plumbing
+    /// for the same reason admission is. Living here keeps them unreachable
+    /// from a handler: the module is `pub(crate)`, while every in-crate
+    /// `S: CellRead` bound still reaches all three. All are safe to call:
+    /// [`Self::permit`] returns an opaque witness,
+    /// [`Self::attempt_current`] returns a `bool`, and
+    /// [`Self::collection_def`] returns a `Copy` settings snapshot.
     pub trait ReadAdmission: Clone + Send + Sync + 'static {
         /// Witness that this session's read admission (if any) is held. Never
         /// inspected — a pure witness the view's read sinks demand. `Sync`
@@ -828,6 +827,14 @@ pub(crate) mod sealed {
         /// Acquires the read admission — the owner's gate read guard; the
         /// published reader, having no gate, hands back `()`.
         fn permit(&self) -> impl Future<Output = Self::Permit<'_>> + Send;
+
+        /// The operational settings for `(state_type, name)` **as this
+        /// session's engine sees them**; each impl documents its own source. A
+        /// collection binding captures it once, so every configuration query
+        /// inside a scoped operation answers from one snapshot. No default
+        /// impl: silently defaulted settings would mis-size a real session's
+        /// keyset or disable its TTL refresh.
+        fn collection_def(&self, state_type: StateType, name: &StateName) -> CollectionDef;
 
         /// Whether this handle/session clone's pinned epoch still equals the
         /// live session epoch. `false` once a later attempt boundary
@@ -1335,6 +1342,11 @@ where
     fn attempt_current(&self) -> bool {
         self.pinned == self.current_epoch()
     }
+
+    /// The registry's definition for the name, defaults included.
+    fn collection_def(&self, state_type: StateType, name: &StateName) -> CollectionDef {
+        self.inner.registry.def_for(state_type, name)
+    }
 }
 
 impl<B, L> CellRead for KeyedStateSession<B, L>
@@ -1344,10 +1356,6 @@ where
 {
     fn is_terminated(&self) -> bool {
         self.inner.termination.is_terminated() || self.inner.terminated.load(Ordering::Relaxed)
-    }
-
-    fn collection_def(&self, state_type: StateType, name: &StateName) -> CollectionDef {
-        self.inner.registry.def_for(state_type, name)
     }
 
     fn verify_state_registration(

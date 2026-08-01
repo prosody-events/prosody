@@ -13,8 +13,8 @@
 //! source its planning command selected, so a chunk can never re-probe or
 //! change source mid-stream.
 
-use super::operation::{read_keys_bytes, read_keys_resolved};
-use super::{StateSession, resolve_cell, sealed};
+use super::operation::read_keys_bytes;
+use super::{StateSession, resolve_batch, resolve_cell, sealed};
 use crate::state::cell_key::{CellKey, Direction, Scan, ScanEdge, Section};
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
@@ -116,8 +116,8 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
         fenced::<S, _, T>(session, self.key_source())
     }
 
-    /// The unfenced resolving body: one admission, one aligned batch read, and
-    /// one bounded resolve fan-out per chunk.
+    /// The unfenced resolving body: one admission-scoped batch read, then one
+    /// bounded resolve fan-out, per chunk.
     fn entry_source(self) -> impl Stream<Item = ScanItem<T>> + Send
     where
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
@@ -127,30 +127,43 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
             let base = &base;
             let chunks = stream::unfold(keys.into_iter().peekable(), |mut keys| async move {
                 keys.peek()?; // exhausted ⇒ unfold ends
-                // Admission per chunk, dropped with this future's scope before
-                // any of the chunk's items reach the caller. It spans the whole
-                // fetch and resolve, so an attempt boundary serializes after a
-                // chunk and never tears one.
-                let mut inner =
-                    <S::Engine as sealed::ReadEngine<S>>::resume(&base.session, &base.plan).await;
                 let chunk: CellBuffer<KeyOf<T>> = keys.by_ref().take(STREAM_CHUNK).collect();
-                let entries = read_keys_resolved::<S, T>(
-                    &base.session,
-                    &mut inner,
-                    base.state_type,
-                    &base.name,
-                    base.section,
-                    &chunk,
-                )
-                .await
-                .map(|values| {
+                // Admission spans the chunk's raw batch read ONLY: it is
+                // released before the chunk's bounded resolve fan-out — which
+                // touches no collection state and may reach a loader — and so
+                // long before any of the chunk's items reach the caller. An
+                // attempt boundary therefore serializes after a chunk's read
+                // and never tears one; a boundary during resolution is caught
+                // by the per-emission fence before any item escapes.
+                let entries = async {
+                    let bytes = {
+                        let mut inner = <S::Engine as sealed::ReadEngine<S>>::resume(
+                            &base.session,
+                            &base.plan,
+                        )
+                        .await;
+                        read_keys_bytes::<S, T>(
+                            &base.session,
+                            &mut inner,
+                            base.state_type,
+                            &base.name,
+                            base.section,
+                            &chunk,
+                        )
+                        .await
+                        .map_err(CellStateError::Access)?
+                    };
+                    let values = resolve_batch::<S, T>(&base.session, bytes).await?;
                     // A `None` is an absent cell: skipped, never an error.
-                    chunk
-                        .into_iter()
-                        .zip(values)
-                        .filter_map(|(key, value)| value.map(|v| (key, v)))
-                        .collect::<CellBuffer<_>>()
-                });
+                    Ok::<_, CellStateError<CellCodecError<T>>>(
+                        chunk
+                            .into_iter()
+                            .zip(values)
+                            .filter_map(|(key, value)| value.map(|v| (key, v)))
+                            .collect::<CellBuffer<_>>(),
+                    )
+                }
+                .await;
                 Some((entries, keys))
             });
             futures::pin_mut!(chunks);
@@ -327,8 +340,8 @@ fn page<S: StateSession>(
     )
 }
 
-/// The managed stream fence adapter — the SOLE home of a stream's per-emission
-/// attempt fence. Wraps a driver's source and runs
+/// The managed stream fence adapter — the SOLE home of a managed stream's
+/// per-emission attempt fence. Wraps a driver's source and runs
 /// [`ReadEngine::fence`](sealed::ReadEngine::fence) after EVERY
 /// `inner.next()` completion — `Some`, `Err`, and the exhaustion `None`
 /// alike — BEFORE matching it, so a stream leaked past its handler attempt (a
@@ -345,9 +358,9 @@ fn page<S: StateSession>(
 /// point, not a wall-clock wall: a completion whose synchronous fence passed
 /// linearized before any concurrent attempt boundary. It holds no admission
 /// (the check is sync); a concurrent reset — which needs the gate exclusively
-/// and, for a coordinate source, queues behind the whole chunk's admission — is
-/// ordered relative to a completion by whether its bump landed before that
-/// completion's check.
+/// and, for a coordinate source, queues behind the chunk's batch-read
+/// admission — is ordered relative to a completion by whether its bump landed
+/// before that completion's check.
 fn fenced<S, X, T>(
     session: S,
     inner: impl Stream<Item = Result<X, CellStateError<CellCodecError<T>>>> + Send,

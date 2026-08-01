@@ -76,7 +76,7 @@ pub(crate) const CELL_BATCH: usize = 128;
 
 const _: () = assert!(
     CELL_BATCH > 0,
-    "CELL_BATCH must be positive or both stream-unfold chunk sources stall on empty chunks"
+    "CELL_BATCH must be positive or every stream-unfold chunk source stalls on empty chunks"
 );
 
 /// A non-empty, bounded (`1..=CELL_BATCH`) run of coordinates for one batch

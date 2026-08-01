@@ -98,18 +98,18 @@ pub use value::{ValueDescriptor, ValueHandle, ValueKind, value_state};
 pub(crate) use view::{CellScope, CellView};
 
 /// The point-get streams' chunk width: the granularity of both the per-chunk
-/// gate hold (one read permit per chunk, dropped with the chunk future's scope
-/// before any yield) and the batch read — each chunk's cells are fetched by
-/// ONE aligned batch read (one Cassandra query / one fjall hop), whose typed
-/// resolves then fan out under `RESOLVE_FANOUT`. Shared by the managed
+/// admission and the batch read — each chunk's cells are fetched by ONE aligned
+/// batch read (one Cassandra query / one fjall hop), whose typed resolves then
+/// fan out under `RESOLVE_FANOUT`. Admission covers that raw batch read only:
+/// the owner takes one per chunk and releases it before the chunk's resolves,
+/// and a published reader holds no gate at all. Shared by the managed
 /// coordinate stream driver and
 /// [`DequeHandle::stream`](deque::DequeHandle::stream).
 ///
 /// An alias of [`CELL_BATCH`] — the point-get
 /// stream chunk width and the store batch-read width are one number, and the
-/// `> 0` invariant both chunk sources rely on
-/// (`keys.by_ref().take(STREAM_CHUNK)` must take ≥ 1 key per chunk) is
-/// enforced once on `CELL_BATCH`.
+/// `> 0` invariant every stream-unfold chunk source relies on (a chunk must
+/// take ≥ 1 key, or the unfold spins) is enforced once on `CELL_BATCH`.
 pub(crate) const STREAM_CHUNK: usize = CELL_BATCH;
 
 /// A resolver: how a decoded cell (`Stored`) maps to and from the value a
@@ -648,7 +648,7 @@ impl<K: CollectionSpec> StateDescriptor for Descriptor<K> {
 }
 
 /// Error returned by typed cell operations — a scoped collection command, or
-/// the bridge `CellView` the kinds that have not migrated still use.
+/// the bridge `CellView` the one kind that has not migrated still uses.
 #[derive(Debug, Error)]
 pub enum CellStateError<E>
 where

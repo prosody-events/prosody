@@ -1036,8 +1036,8 @@ fn map_set_fenced_at_the_final_check_stages_nothing() -> Result<()> {
         );
 
         let fenced = parked_set("fence_journal_fenced", true).await?;
-        match fenced.outcome {
-            Err(MapStateError::Cell(CellStateError::Access(StateAccessError::Terminated))) => {}
+        match &fenced.outcome {
+            Err(error) if map_item_terminated(error) => {}
             other => bail!(
                 "the fenced set must report Terminated, got ok={}",
                 other.is_ok()
@@ -1853,7 +1853,8 @@ fn racing_set_never_joins_next_attempt() -> Result<()> {
     })
 }
 
-/// Whether a fenced map stream item is the `Terminated` access error.
+/// Whether a fenced map outcome — a stream item or a call's error — is the
+/// `Terminated` access error.
 fn map_item_terminated(item: &MapStateError<JsonCodecError>) -> bool {
     matches!(
         item,

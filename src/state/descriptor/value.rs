@@ -26,8 +26,9 @@ collection_layout! {
     }
 }
 
-/// Value's per-invocation mutation maximum: `set` and `clear` each stage
-/// exactly one, and no Value method stages twice.
+/// Value's declared per-invocation mutation maximum: `set` and `clear` each
+/// stage exactly one, and no Value method stages twice. The assertion below
+/// pins the declaration against [`JOURNAL_INLINE`]'s budget.
 const VALUE_MAX_MUTATIONS: usize = 1;
 
 const _: () = assert!(

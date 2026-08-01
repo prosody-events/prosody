@@ -49,7 +49,7 @@ use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
 use crate::state::session::{
     CellRead, Finalized, KeyedStateSession, SessionParts, TerminationWatch,
 };
-use crate::state::store::CellStore;
+use crate::state::store::{CELL_BATCH, CellStore};
 use crate::state::{
     CollectionId, CollectionRef, CommitMode, Direction, EventRef, PartitionBackend, StateKey,
     StateName, StateType,
@@ -904,8 +904,10 @@ const GET_MANY_POPULATE_KEYS: u8 = 20;
 /// the absent-key path.
 const GET_MANY_QUERY_LO: i64 = -4;
 const GET_MANY_QUERY_HI: i64 = 24;
-/// Max query-list length — `> CELL_BATCH` so multi-sub-batch calls occur often.
-const GET_MANY_MAX_QUERIES: usize = 40;
+/// Max query-list length. Derived from [`CELL_BATCH`] rather than hand-numbered
+/// so the "spans more than one sub-batch" claim below cannot rot when the store
+/// batch width moves.
+const GET_MANY_MAX_QUERIES: usize = CELL_BATCH + 32;
 
 /// A random map population plus a random query list for the `Map::get_many`
 /// parity property. The independent pools guarantee absent keys; a small query
@@ -1997,11 +1999,11 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
 /// and a later set repopulates a fresh single-key `Tracked` keyset (clear
 /// resets the tracking, not just the entries — not a stale pre-clear list).
 ///
-/// It also pins the reset's **scope**: a directly-seeded cell at the retired
-/// meta coordinate `[0]` — a legacy row from the removed min/max bounds design,
-/// unreachable through any handle method — is erased too, because `clear()` is
-/// one whole-layout reset over the declared sections rather than a point clear
-/// of the keyset cell.
+/// It also pins the reset's **scope**: directly-seeded cells at BOTH retired
+/// meta coordinates `[0]` and `[1]` — legacy rows from the removed min/max
+/// bounds design, unreachable through any handle method — are erased too,
+/// because `clear()` is one whole-layout reset over the declared sections
+/// rather than a point clear of the keyset cell.
 #[test]
 fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
     use crate::state::cell_key::{CellKey, Coordinate};
@@ -2029,17 +2031,20 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
 
-    // A legacy artifact at the retired meta coordinate `[0]`, seeded straight
-    // through the store because no handle method can address it.
-    let legacy = CellKey {
-        section: keyset_cell().section,
-        coordinate: Coordinate::from_bytes(vec![0]),
-    };
-    block_on(store.write_resolved(
-        &collection_ref,
-        &[(legacy.clone(), Some(bytes::Bytes::from_static(&[0xAB])))],
-        &[],
-    ))?;
+    // Legacy artifacts at BOTH retired meta coordinates, seeded straight
+    // through the store because no handle method can address them.
+    let legacy: Vec<CellKey> = [0u8, 1]
+        .into_iter()
+        .map(|byte| CellKey {
+            section: keyset_cell().section,
+            coordinate: Coordinate::from_bytes(vec![byte]),
+        })
+        .collect();
+    let seeded: Vec<_> = legacy
+        .iter()
+        .map(|cell| (cell.clone(), Some(bytes::Bytes::from_static(&[0xAB]))))
+        .collect();
+    block_on(store.write_resolved(&collection_ref, &seeded, &[]))?;
 
     // Event 2: committed clear — one whole-layout reset over both sections.
     let event2 = EventRef::Message {
@@ -2057,11 +2062,13 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
         None,
         "the committed clear must erase the keyset cell"
     );
-    assert_eq!(
-        block_on(store.get(id, &legacy, read_event(0)))?.into_inner(),
-        None,
-        "the whole-layout reset must erase the retired meta coordinate too"
-    );
+    for cell in &legacy {
+        assert_eq!(
+            block_on(store.get(id, cell, read_event(0)))?.into_inner(),
+            None,
+            "the whole-layout reset must erase every retired meta coordinate too"
+        );
+    }
 
     // Event 3: one committed set repopulates a fresh single-key Tracked keyset
     // (keyset absent after clear ⇒ the empty map ⇒ a fresh singleton, not a

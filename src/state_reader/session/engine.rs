@@ -4,7 +4,9 @@
 //! Its whole invocation state is that call's own source selection, seeded from
 //! and published back to the session-shared [`PinnedSource`] so the invocation
 //! and the `CellRead` bridge paths never disagree about which source answers.
-//! Two operations on one reader otherwise share nothing and overlap freely.
+//! An invocation that never selected one falls back to the shared cell before
+//! it will probe. Two operations on one reader otherwise share nothing and
+//! overlap freely.
 //!
 //! There is deliberately **no** [`WriteEngine`](sealed::WriteEngine) impl here:
 //! the write scope exists only for a session whose engine has one, so a reader
@@ -42,9 +44,11 @@ impl<C: Codec, B: ReaderBackend<C>> StateSession for ReadSession<C, B> {
 }
 
 impl<C: Codec, B: ReaderBackend<C>> sealed::ReadEngine<ReadSession<C, B>> for ReaderEngine {
-    /// A managed stream carries the invocation's selection, so every
-    /// continuation addresses the source the planning command chose — never the
-    /// session-shared cell, and never a fresh probe.
+    /// A managed stream carries the invocation's selection, so a continuation
+    /// that captured one addresses exactly the source the planning command
+    /// chose. A plan captured before anything was selected falls back to the
+    /// session-shared selection at the moment it runs, and probes only when
+    /// that is empty too.
     type Plan = Option<PinnedSource>;
     /// Operation-local source selection: the session's already-published
     /// selection, or `None` until a command first finds stored data.

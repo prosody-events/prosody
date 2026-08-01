@@ -177,6 +177,18 @@ impl CollectionDefRegistry {
             .any(|c| c.def.visibility == StateVisibility::Published)
     }
 
+    /// Returns the operational settings registered for `(state_type, name)` —
+    /// the whole definition a collection binding captures once, and the single
+    /// lookup every per-setting accessor below reads its field from, so none of
+    /// them can disagree about an unregistered name. An unregistered name
+    /// yields the same defaults each setting carries on its own
+    /// ([`CollectionDef::new`] with no TTL).
+    #[must_use]
+    pub(crate) fn def_for(&self, state_type: StateType, name: &StateName) -> CollectionDef {
+        self.lookup_collection(state_type, name)
+            .map_or_else(|| CollectionDef::new(None), |c| c.def)
+    }
+
     /// Returns the TTL registered for `(state_type, name)`; an unregistered
     /// name yields `None`.
     #[must_use]
@@ -185,26 +197,14 @@ impl CollectionDefRegistry {
         state_type: StateType,
         name: &StateName,
     ) -> Option<CompactDuration> {
-        self.lookup_collection(state_type, name)
-            .and_then(|c| c.def.ttl)
-    }
-
-    /// Returns the operational settings registered for `(state_type, name)` —
-    /// the whole definition a collection binding captures once. An unregistered
-    /// name yields the same defaults each setting carries on its own
-    /// ([`CollectionDef::new`] with no TTL).
-    #[must_use]
-    pub(crate) fn def_for(&self, state_type: StateType, name: &StateName) -> CollectionDef {
-        self.lookup_collection(state_type, name)
-            .map_or_else(|| CollectionDef::new(None), |c| c.def)
+        self.def_for(state_type, name).ttl
     }
 
     /// Returns the commit mode bound to `(state_type, name)`, falling back to
     /// [`CommitMode::ReadCommitted`] for names not in the registry.
     #[must_use]
     pub(crate) fn commit_mode_for(&self, state_type: StateType, name: &StateName) -> CommitMode {
-        self.lookup_collection(state_type, name)
-            .map_or(CommitMode::ReadCommitted, |c| c.def.commit_mode)
+        self.def_for(state_type, name).commit_mode
     }
 
     /// Returns the recovery-convergence bound declared for `(state_type,
@@ -217,8 +217,7 @@ impl CollectionDefRegistry {
         state_type: StateType,
         name: &StateName,
     ) -> Option<CompactDuration> {
-        self.lookup_collection(state_type, name)
-            .and_then(|c| c.def.recovery_within)
+        self.def_for(state_type, name).recovery_within
     }
 
     fn lookup_collection(

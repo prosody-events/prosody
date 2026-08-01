@@ -28,15 +28,6 @@ impl<C: Codec, B: ReaderBackend<C>> ReadAdmission for ReadSession<C, B> {
     fn attempt_current(&self) -> bool {
         true
     }
-}
-
-impl<C: Codec, B: ReaderBackend<C>> CellRead for ReadSession<C, B>
-where
-    C::Payload: Clone,
-{
-    fn is_terminated(&self) -> bool {
-        false
-    }
 
     fn collection_def(&self, _state_type: StateType, _name: &StateName) -> CollectionDef {
         // The reader's own descriptor settings, except the keyset bound: the
@@ -48,6 +39,15 @@ where
             keyset_limit: MAX_KEYSET_LIMIT,
             ..self.context.def.collection
         }
+    }
+}
+
+impl<C: Codec, B: ReaderBackend<C>> CellRead for ReadSession<C, B>
+where
+    C::Payload: Clone,
+{
+    fn is_terminated(&self) -> bool {
+        false
     }
 
     fn verify_state_registration(
@@ -68,13 +68,14 @@ where
         _name: &StateName,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, StateAccessError> {
-        // Publishing a selection the read already had is a no-op `set`: the
-        // cell is write-once, and unpinned reads in one operation are issued
-        // sequentially (`SingleSourceCoherence`), so a selection that was
-        // absent when the read began is this session's first.
+        // Publish only what this read selected: unpinned reads in one operation
+        // are issued sequentially (`SingleSourceCoherence`), so a selection that
+        // was absent when the read began is this session's first, and the
+        // write-once cell accepts it.
         let mut selection = self.pin.get().cloned();
+        let unselected = selection.is_none();
         let result = self.point_read(&mut selection, cell).await;
-        if let Some(pin) = selection {
+        if unselected && let Some(pin) = selection {
             let _ = self.pin.set(pin);
         }
         result
@@ -88,8 +89,9 @@ where
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
         let mut selection = self.pin.get().cloned();
+        let unselected = selection.is_none();
         let result = self.batch_read(&mut selection, section, batch).await;
-        if let Some(pin) = selection {
+        if unselected && let Some(pin) = selection {
             let _ = self.pin.set(pin);
         }
         result
@@ -101,6 +103,9 @@ where
         _name: &'a StateName,
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
-        self.scan_from(self.pin.get(), scan)
+        // No captured selection: `scan_from` samples the session pin itself, at
+        // first poll rather than here, so a stream built before a sibling read
+        // pins still addresses that selection.
+        self.scan_from(None, scan)
     }
 }

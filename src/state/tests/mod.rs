@@ -681,8 +681,9 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
             1,
             "a cold full-width chunk is ONE lower batch read"
         );
-        assert!(
-            counting.lower_reads() <= 1,
+        assert_eq!(
+            counting.lower_reads(),
+            1,
             "only the keyset meta read is a point read (lower_reads={})",
             counting.lower_reads()
         );
@@ -818,7 +819,7 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
 /// one.
 /// FALSIFICATION: routing `MapHandle::keys` through `self.stream(dir)` (mapping
 /// `(k, _)`) resolves every drained key → `resolves() == n > 0` on either arm →
-/// red; routing only the `StreamPlan::Scan` arm through the resolving `scan`
+/// red; routing only the `MapPlan::Scan` arm through the resolving `scan`
 /// reddens the degrade arm alone. Both revert to green.
 #[test]
 fn map_keys_no_resolve() -> Result<()> {
@@ -1896,8 +1897,9 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         "a lazy map take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
         counting.batch_reads()
     );
-    assert!(
-        counting.lower_reads() <= 1,
+    assert_eq!(
+        counting.lower_reads(),
+        1,
         "entries flow through the batch verb, not point get; only the keyset meta read remains a \
          point read (lower_reads={})",
         counting.lower_reads()
@@ -1996,8 +1998,9 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         "a lazy deque take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
         counting.batch_reads()
     );
-    assert!(
-        counting.lower_reads() <= 1,
+    assert_eq!(
+        counting.lower_reads(),
+        1,
         "entries flow through the batch verb, not point get; only the bounds meta read remains a \
          point read (lower_reads={})",
         counting.lower_reads()

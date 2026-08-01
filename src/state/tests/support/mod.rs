@@ -177,6 +177,12 @@ where
         // Inert: every op errors `Unavailable` before the pin is consulted.
         true
     }
+
+    fn collection_def(&self, _state_type: StateType, _name: &StateName) -> CollectionDef {
+        // Unreachable in practice: every op on this stub errors `Unavailable`
+        // first. `CollectionDef`'s own defaults keep the trait total.
+        CollectionDef::new(None)
+    }
 }
 
 impl<P> sealed::Session for UnavailableState<P>
@@ -207,12 +213,6 @@ where
 {
     fn is_terminated(&self) -> bool {
         true
-    }
-
-    fn collection_def(&self, _state_type: StateType, _name: &StateName) -> CollectionDef {
-        // Unreachable in practice: every op on this stub errors `Unavailable`
-        // first. The registry defaults keep the trait total.
-        CollectionDef::new(None)
     }
 
     fn verify_state_registration(

@@ -24,10 +24,11 @@
 //! collection operation carries its own invocation-local selection: the reader
 //! engine seeds it from the session-shared [`PinnedSource`] and publishes the
 //! first one it makes back to that shared cell. A managed stream carries the
-//! selection its planning command captured, so a continuation can never
-//! re-probe. The `CellRead` bridge paths (`get`, `get_many`, `scan`) read the
-//! shared cell directly, and serve the collection kinds that do not run through
-//! the engine yet.
+//! selection its planning command captured. The `CellRead` bridge paths (`get`,
+//! `get_many`, `scan`) read the shared cell directly, and serve the collection
+//! kinds that do not run through the engine yet. The precedence is uniform: a
+//! captured selection wins, an uncaptured one defers to the shared cell, and
+//! only a wholly unselected read probes.
 //!
 //! Probe-and-pin is the reader's source-selection strategy:
 //!
@@ -368,7 +369,6 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
             }));
         }
         let mut first_err = None;
-        let mut all_none: Option<CellBuffer<Option<Bytes>>> = None;
         while let Some((source, result)) = cooperative(ordered.next()).await {
             match result {
                 Ok(buffer) => {
@@ -380,9 +380,6 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                         });
                         return Ok(buffer);
                     }
-                    if all_none.is_none() {
-                        all_none = Some(buffer);
-                    }
                 }
                 Err(error) => {
                     if first_err.is_none() {
@@ -391,12 +388,13 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
                 }
             }
         }
-        match (all_none, first_err) {
-            (_, Some(error)) => Err(error),
-            (Some(buffer), None) => Ok(buffer),
-            // Unreachable: the snapshot is non-empty, so at least one source
-            // answered with data, all-absent, or an error.
-            (None, None) => Ok((0..batch.len()).map(|_| None).collect()),
+        match first_err {
+            Some(error) => Err(error),
+            // Every source that answered answered all-absent, which the
+            // index-aligned contract makes exactly `batch.len()` `None`s — so
+            // no buffer needs keeping. This is also the empty-source arm, which
+            // the non-empty snapshot forbids.
+            None => Ok((0..batch.len()).map(|_| None).collect()),
         }
     }
 
@@ -404,15 +402,32 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
     /// has selected a source yet — probe the sources sequentially and pin the
     /// first that yields a cell.
     ///
+    /// A captured `Some(selected)` always wins: a continuation addresses the
+    /// source its planning command chose. A `None` falls back to the
+    /// session-shared pin **sampled at first poll**, and only probes when that
+    /// is empty too — so a stream constructed before a sibling read pinned
+    /// still addresses that selection rather than opening a second source.
+    ///
     /// A mid-stream error after the pin terminates the stream, because a
     /// restart would double-yield. An error before any yield is remembered and
     /// falls through to the next source; an empty source falls through too.
+    ///
+    /// The unselected branch publishes its pin to the session-shared cell, not
+    /// back to the caller's selection. Fixing that needs a
+    /// `&mut Option<PinnedSource>` parameter, and no caller can observe the
+    /// difference today: a range plan pages exactly once and issues nothing
+    /// after, and a coordinate plan only has keys because its keyset read
+    /// already pinned.
     fn scan_from<'a>(
         &'a self,
         selected: Option<&'a PinnedSource>,
         scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         async_stream::try_stream! {
+            // Sample the session pin at first poll, not at construction: a
+            // stream built before a sibling read pinned must still address that
+            // selection. A captured `Some` keeps precedence.
+            let selected = selected.or_else(|| self.pin.get());
             if let Some(pin) = selected {
                 let id = pin.collection.clone();
                 let inner = self.context.backend.cells().scan(&id, scan);

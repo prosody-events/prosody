@@ -23,11 +23,12 @@ use std::future::Future;
 ///
 /// Four is the current maximum across the built-in collections: a Deque push
 /// stages one entry, at most `TRIM_MAX` point clears, and one bounds set; Map
-/// needs two, Value one. Each collection proves its own statically bounded
-/// maximum fits with a compile-time assertion beside its layout, so a method or
-/// bound change cannot silently add a steady-state allocation. A spill is still
-/// semantically correct — Rust cannot derive a sound maximum from an arbitrary
-/// async body, so the inline bound is an allocation budget, never a limit.
+/// needs two, Value one. Each collection *declares* its own maximum beside its
+/// layout, and a compile-time assertion there pins that declaration against
+/// this budget — so widening a collection past four is a build error, not a
+/// silent steady-state allocation. A spill is still semantically correct —
+/// Rust cannot derive a sound maximum from an arbitrary async body, so the
+/// inline bound is an allocation budget, never a limit.
 pub const JOURNAL_INLINE: usize = 4;
 
 /// One invocation's staged mutations, in authored order.
@@ -484,7 +485,8 @@ enum Slot {
 
 /// Fills every pending slot from the engine and returns the answers aligned to
 /// `slots` — the journal-aware batch read a write invocation performs, where
-/// only the journal-silent positions reach the engine.
+/// only the journal-silent positions reach the engine. Its sub-batches are
+/// issued sequentially for the reason [`read_keys_bytes`] states.
 async fn batched_bytes<S: StateSession>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
@@ -569,8 +571,8 @@ where
     Ok(bytes)
 }
 
-/// [`read_keys_bytes`] plus the typed decode and resolution — what one
-/// coordinate-stream chunk performs under its admission.
+/// [`read_keys_bytes`] plus the typed decode and resolution — the whole of a
+/// journal-free batch get, performed under the invocation's admission.
 ///
 /// # Errors
 ///
