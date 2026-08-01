@@ -1,5 +1,5 @@
-//! Turning one response into frame bytes, against a scratch buffer that is
-//! allocated once and never grows in steady state.
+//! Turning one response into frame bytes, against a bounded scratch buffer the
+//! encoder allocates once and never reserves again.
 
 use super::{
     FIELD_CATEGORY, FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE,
@@ -13,8 +13,17 @@ use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, k
 use std::error::Error;
 use thiserror::Error;
 
-/// Encodes responses into frames against one bounded scratch buffer, allocated
-/// once at construction and reused for every response.
+/// Encodes responses into frames against one bounded scratch buffer.
+///
+/// The encoder allocates once, at construction — a scratch sized to the cap —
+/// and [`FrameEncoder::stage`] never reserves, so a codec that appends cannot
+/// grow it with any response the cap admits. A codec that instead takes
+/// [`Codec::serialize`]'s sanctioned move into an empty buffer hands its own
+/// buffer over in place of the scratch, and the encoder reuses that one from
+/// then on; either way nothing here allocates per response. Beyond that the
+/// frozen `serialize` signature promises nothing — a codec free to allocate
+/// internally is equally free to alternate moving and appending, and would then
+/// regrow the buffer it handed over.
 ///
 /// Staging and framing are two steps because a protobuf `bytes` field writes
 /// its varint length *before* its contents: the payload must be serialized
@@ -38,7 +47,7 @@ pub(crate) struct Staged<'a> {
 }
 
 impl<C: Codec> FrameEncoder<C> {
-    /// Builds an encoder whose scratch is sized once, to the cap.
+    /// Builds an encoder, making its one allocation: a scratch at the cap.
     pub(crate) fn new(codec: C, cap: FrameCap) -> Self {
         Self {
             codec,
@@ -77,12 +86,12 @@ impl<C: Codec> FrameEncoder<C> {
             });
         }
 
-        // The scratch enters every response at exactly the cap. Only a response
-        // the cap will refuse can have grown it — `Codec::serialize` writes into
-        // a `Vec`, so nothing can stop it growing one — and that memory is given
-        // back here. Reclaiming at the top rather than on each failure arm is
-        // one site instead of three, at the cost of holding an oversized buffer
-        // until this encoder's next response.
+        // Give back whatever a response the cap refused grew the scratch to —
+        // `Codec::serialize` writes into a `Vec`, so nothing can stop it growing
+        // one. Reclaiming at the top rather than on each failure arm is one site
+        // instead of three, at the cost of holding an oversized buffer until
+        // this encoder's next response. `shrink_to` never grows, so a codec that
+        // moved a smaller buffer of its own in keeps it.
         self.scratch.clear();
         self.scratch.shrink_to(self.cap.bytes());
         self.codec
@@ -104,7 +113,8 @@ impl<C: Codec> FrameEncoder<C> {
         })
     }
 
-    /// The scratch's live capacity, for the tests that pin it to the cap.
+    /// The scratch's live capacity, for the tests that pin what the encoder is
+    /// left holding after a response.
     #[cfg(test)]
     pub(crate) fn scratch_capacity(&self) -> usize {
         self.scratch.capacity()

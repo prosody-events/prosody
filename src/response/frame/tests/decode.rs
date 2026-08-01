@@ -1,4 +1,4 @@
-use super::{CountingCodec, RawFrame, UNKNOWN_TAG};
+use super::{CountingCodec, RAW_ID, RawFrame, UNKNOWN_TAG, raw_bytes_field, raw_varint_field};
 use crate::codec::Codec;
 use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::frame::decode::{FrameDecodeError, decode_frame};
@@ -227,6 +227,49 @@ fn a_malformed_frame_is_refused_by_the_field_that_broke_it() -> Result<()> {
         match decode_frame(&mut raw.encode(), cap) {
             Err(actual) => assert_eq!(actual, expected, "the frame was refused for another reason"),
             Ok(_) => bail!("the frame must be refused as {expected}"),
+        }
+    }
+    Ok(())
+}
+
+/// Protobuf permits a repeated singular field and takes the last; this decoder
+/// refuses it instead — for `payload` a repeat would otherwise buy an
+/// allocate-and-discard per occurrence, and for the rest a contradiction the
+/// frame cannot resolve. An empty occurrence counts: it is protobuf's spelling
+/// of the field, not its absence.
+#[test]
+fn a_repeated_field_is_refused() -> Result<()> {
+    let cap = FrameCap::new(1024)?;
+    let cases = [
+        (FIELD_PROTOCOL_VERSION, "protocol_version"),
+        (FIELD_TARGET_NODE, "target_node"),
+        (FIELD_REQUEST_ID, "request_id"),
+        (FIELD_SUBSYSTEM, "subsystem"),
+        (FIELD_FORMAT, "format"),
+        (FIELD_CATEGORY, "category"),
+        (FIELD_PAYLOAD, "payload"),
+        (FIELD_RELAY_NODE, "relay_node"),
+    ];
+    for (tag, field) in cases {
+        let mut wire = RawFrame {
+            relay: Some(&RAW_ID),
+            ..RawFrame::default()
+        }
+        .encode();
+        // Empty for every field, so the repeat is refused for being a second
+        // occurrence rather than for anything the occurrence carries.
+        if tag == FIELD_PROTOCOL_VERSION || tag == FIELD_CATEGORY {
+            raw_varint_field(tag, 1, &mut wire);
+        } else {
+            raw_bytes_field(tag, b"", &mut wire);
+        }
+        match decode_frame(&mut wire, cap) {
+            Err(actual) => assert_eq!(
+                actual,
+                FrameDecodeError::RepeatedField(field),
+                "a repeated {field} was refused for another reason"
+            ),
+            Ok(_) => bail!("a frame repeating {field} must be refused"),
         }
     }
     Ok(())

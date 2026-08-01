@@ -20,8 +20,32 @@ use prost::encoding::{
 use std::str::{Utf8Error, from_utf8};
 use thiserror::Error;
 
+/// Every field this frame defines, paired with the bit that records having read
+/// it. A tag absent from here belongs to a later protocol version and is
+/// skipped.
+const fn known_field(tag: u32) -> Option<(&'static str, u8)> {
+    Some(match tag {
+        FIELD_PROTOCOL_VERSION => ("protocol_version", 0b0000_0001),
+        FIELD_TARGET_NODE => ("target_node", 0b0000_0010),
+        FIELD_REQUEST_ID => ("request_id", 0b0000_0100),
+        FIELD_SUBSYSTEM => ("subsystem", 0b0000_1000),
+        FIELD_FORMAT => ("format", 0b0001_0000),
+        FIELD_CATEGORY => ("category", 0b0010_0000),
+        FIELD_PAYLOAD => ("payload", 0b0100_0000),
+        FIELD_RELAY_NODE => ("relay_node", 0b1000_0000),
+        _ => return None,
+    })
+}
+
 /// Decodes one frame, bounding the whole encoded message before any per-field
 /// work so nothing is allocated on behalf of a length a peer merely claimed.
+///
+/// Each field may appear once. Protobuf lets a sender repeat a singular field
+/// and take the last, but every repeat here would be either a contradiction or
+/// an amplifier — a capped frame packed with tiny `payload` fields would buy
+/// millions of allocate-and-discard pairs for a few bytes each. Refusing the
+/// repeat is the same posture this decoder already takes toward an empty
+/// `subsystem` or a zero `category`.
 ///
 /// # Errors
 ///
@@ -54,9 +78,16 @@ pub(crate) fn decode_frame<B: Buf>(
     // the default", so the decoder does.
     let mut payload = BytesMut::new();
     let mut relay = None;
+    let mut seen = 0u8;
 
     while src.has_remaining() {
         let (tag, wire_type) = decode_key(src)?;
+        if let Some((field, bit)) = known_field(tag) {
+            if seen & bit != 0 {
+                return Err(FrameDecodeError::RepeatedField(field));
+            }
+            seen |= bit;
+        }
         match tag {
             FIELD_PROTOCOL_VERSION => {
                 check_wire_type(WireType::Varint, wire_type)?;
@@ -218,6 +249,10 @@ pub(crate) enum FrameDecodeError {
     /// A field whose absence cannot be a legal default is absent.
     #[error("frame is missing {0}")]
     MissingField(&'static str),
+
+    /// A field appears more than once.
+    #[error("frame repeats {0}")]
+    RepeatedField(&'static str),
 
     /// The frame states a protocol version this build does not speak.
     #[error("unsupported response protocol version {0}")]

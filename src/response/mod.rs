@@ -31,31 +31,30 @@ pub(crate) type FormatToken = Flexstr<{ FORMAT_MAX_BYTES + 1 }>;
 /// in a trace. On the wire it is 16 opaque bytes, so a peer that mints ids some
 /// other way is still answerable.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct RequestId(Uuid);
+pub(crate) struct RequestId(Uuid);
 
 impl RequestId {
     /// Mints an id for one request.
-    #[must_use]
-    pub fn new() -> Self {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the requester is this constructor's production caller; it is exercised by \
+                      this module's tests"
+        )
+    )]
+    pub(crate) fn new() -> Self {
         Self(Uuid::now_v7())
     }
 
     /// Reads an id from its 16-byte wire form.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+    pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(Uuid::from_bytes(bytes))
     }
 
     /// The 16-byte wire form.
-    #[must_use]
-    pub const fn into_bytes(self) -> [u8; 16] {
+    pub(crate) const fn into_bytes(self) -> [u8; 16] {
         self.0.into_bytes()
-    }
-}
-
-impl Default for RequestId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -116,6 +115,10 @@ pub(crate) enum ResponseDisposition {
 )]
 impl ResponseDisposition {
     /// The gRPC status this disposition is reported as.
+    ///
+    /// The mapping lives with the dispositions rather than with the transport,
+    /// so a disposition added later cannot reach the wire without being given a
+    /// status here.
     pub(crate) const fn status(self) -> Code {
         match self {
             Self::Accepted => Code::Ok,

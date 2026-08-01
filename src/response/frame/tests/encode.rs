@@ -27,15 +27,29 @@ const FROZEN: [u8; 65] = [
 /// The steady state allocates nothing: over a run of encodes up to the
 /// configured maximum, a destination buffer sized at the cap never grows, the
 /// payload is serialized exactly once per response, and the frame is exactly as
-/// long as the staging said it would be. The encoder's scratch is back at the
-/// cap for every response it accepts, even after one big enough to have grown
-/// it.
+/// long as the staging said it would be. After every accepted response the
+/// encoder is left holding the buffer it started with — even after one big
+/// enough to have grown it — or, for a codec that moves its own buffer into the
+/// empty scratch, exactly that buffer: the encoder never reserves either way.
+///
+/// Both codec shapes run, because the copy shape alone would leave half of
+/// [`Codec::serialize`]'s contract untested.
 #[quickcheck]
 fn steady_state_encodes_never_reallocate(lengths: Vec<u16>, relay: bool) -> TestResult {
+    let lengths: Vec<usize> = lengths.into_iter().map(usize::from).collect();
+    for codec in [CountingCodec::default(), CountingCodec::moving()] {
+        let outcome = encodes_without_reserving(&codec, &lengths, relay);
+        if outcome.is_failure() || outcome.is_error() {
+            return outcome;
+        }
+    }
+    TestResult::passed()
+}
+
+fn encodes_without_reserving(codec: &CountingCodec, lengths: &[usize], relay: bool) -> TestResult {
     let Ok(cap) = FrameCap::new(64 * 1024) else {
         return TestResult::error("64 KiB is a supported cap");
     };
-    let codec = CountingCodec::default();
     let mut encoder = FrameEncoder::new(codec.clone(), cap);
     let mut dst = BytesMut::with_capacity(cap.bytes());
     let scratch_capacity = encoder.scratch_capacity();
@@ -66,13 +80,14 @@ fn steady_state_encodes_never_reallocate(lengths: Vec<u16>, relay: bool) -> Test
         largest,
         largest - 1,
     ];
-    let generated = lengths.into_iter().map(usize::from);
-    for length in boundaries.into_iter().chain(generated) {
+    for length in boundaries.into_iter().chain(lengths.iter().copied()) {
         let payload: Vec<u8> = (0..length).map(|index| index as u8).collect();
+        let handed = payload.clone();
+        let expected_scratch = codec.expected_scratch(handed.capacity(), scratch_capacity);
         let serializes = codec.serializes();
         dst.clear();
 
-        match encoder.stage(&header, payload.clone()) {
+        match encoder.stage(&header, handed) {
             Err(EncodeError::TooLarge { bytes, limit }) => {
                 assert!(
                     bytes > limit as u64,
@@ -105,12 +120,13 @@ fn steady_state_encodes_never_reallocate(lengths: Vec<u16>, relay: bool) -> Test
                     "the payload must be framed verbatim"
                 );
                 // Only a response the cap refuses can grow the scratch, and
-                // `stage` gives that memory back before the next one, so every
-                // accepted response finds the scratch at exactly the cap.
+                // `stage` gives that memory back before the next one, so the
+                // encoder is left holding exactly the buffer its codec's shape
+                // implies and never one it had to reserve.
                 assert_eq!(
                     encoder.scratch_capacity(),
-                    scratch_capacity,
-                    "the scratch must be back at the cap"
+                    expected_scratch,
+                    "the encoder reserved a scratch instead of reusing one"
                 );
             }
         }

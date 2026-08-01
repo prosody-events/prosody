@@ -30,10 +30,16 @@ const RELAY_FIELD_BYTES: usize = 18;
 /// The call counters are what make "the payload was serialized exactly once"
 /// and "a mismatched frame never reached the codec" observable; a clone shares
 /// them with the encoder that owns the codec.
+///
+/// `moves` picks between the two shapes [`Codec::serialize`] sanctions: append
+/// into the caller's buffer, or — when that buffer is empty — hand the
+/// payload's own buffer over instead, as [`BinaryCodec`](crate::BinaryCodec)
+/// does.
 #[derive(Clone, Debug, Default)]
 struct CountingCodec {
     serializes: Arc<AtomicUsize>,
     deserializes: Arc<AtomicUsize>,
+    moves: bool,
 }
 
 /// A frame assembled field by field, so a case can omit one field or make one
@@ -65,12 +71,31 @@ impl Codec for CountingCodec {
 
     fn serialize(&mut self, payload: Vec<u8>, buf: &mut Vec<u8>) -> Result<(), Infallible> {
         self.serializes.fetch_add(1, Relaxed);
-        buf.extend_from_slice(&payload);
+        if self.moves && buf.is_empty() {
+            *buf = payload;
+        } else {
+            buf.extend_from_slice(&payload);
+        }
         Ok(())
     }
 }
 
 impl CountingCodec {
+    /// The move-into-an-empty-buffer shape.
+    fn moving() -> Self {
+        Self {
+            moves: true,
+            ..Self::default()
+        }
+    }
+
+    /// The scratch capacity the encoder is left holding once this codec has
+    /// serialized: the payload's own buffer when it moved one in, otherwise the
+    /// buffer the encoder built.
+    fn expected_scratch(&self, handed: usize, built: usize) -> usize {
+        if self.moves { handed } else { built }
+    }
+
     fn serializes(&self) -> usize {
         self.serializes.load(Relaxed)
     }

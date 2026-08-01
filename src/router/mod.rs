@@ -30,31 +30,30 @@ pub(crate) type Host = Flexstr<64>;
 /// On the wire it is 16 opaque bytes, so a peer that mints ids some other way
 /// is still addressable.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct NodeId(Uuid);
+pub(crate) struct NodeId(Uuid);
 
 impl NodeId {
     /// Mints an id for one incarnation of one process.
-    #[must_use]
-    pub fn new() -> Self {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "process identity is this constructor's production caller; it is exercised \
+                      by this module's tests"
+        )
+    )]
+    pub(crate) fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
     /// Reads an id from its 16-byte wire form.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+    pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(Uuid::from_bytes(bytes))
     }
 
     /// The 16-byte wire form.
-    #[must_use]
-    pub const fn into_bytes(self) -> [u8; 16] {
+    pub(crate) const fn into_bytes(self) -> [u8; 16] {
         self.0.into_bytes()
-    }
-}
-
-impl Default for NodeId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
