@@ -19,8 +19,12 @@ use validator::Validate;
 /// The Cassandra contact point the routed-address probe aims at.
 const CONTACT: &str = "localhost:9042";
 
+/// The same contact point written as an address. A probe against it exercises
+/// no name resolution, so it always aims at one address family.
+const NUMERIC_CONTACT: &str = "127.0.0.1:9042";
+
 /// The lease the runtime tests read under. It equals the default a runtime
-/// starts with, and its refresh delay is at least a third of it, so no refresh
+/// starts with, and its refresh delay is at least a fifth of it, so no refresh
 /// runs while a test observes the first write.
 const LEASE: Duration = Duration::from_secs(30);
 
@@ -187,11 +191,12 @@ fn a_configured_entry_point_never_reaches_the_direct_endpoint() -> Result<()> {
     Ok(())
 }
 
-/// A refresh always lands inside the lease with room to spare: between a third
-/// and a half of it, so two consecutive refreshes can be lost before a row
-/// expires.
+/// Three refresh delays fit inside the lease with a quarter of it unspent,
+/// which is the margin two lost refreshes need to heal. The delay also stays
+/// above a fifth of the lease, which caps what the margin costs at five
+/// refreshes per lease.
 #[quickcheck]
-fn prop_refresh_delay_stays_inside_the_lease(seconds: u64) -> TestResult {
+fn prop_two_lost_refreshes_still_heal_inside_the_lease(seconds: u64) -> TestResult {
     let span = RegistrationTtl::MAX.as_secs() - RegistrationTtl::MIN.as_secs();
     let lease = Duration::from_secs(RegistrationTtl::MIN.as_secs() + seconds % (span + 1));
     let Ok(ttl) = RegistrationTtl::try_from(lease) else {
@@ -199,8 +204,14 @@ fn prop_refresh_delay_stays_inside_the_lease(seconds: u64) -> TestResult {
     };
     let delay = refresh_delay(ttl);
     assert!(
-        delay >= lease / 3 && delay <= lease / 2,
-        "a {lease:?} lease produced a refresh delay of {delay:?}"
+        delay * 3 + lease / 4 <= lease,
+        "a {lease:?} lease produced a refresh delay of {delay:?}, so a third attempt lands too \
+         late to heal two lost refreshes"
+    );
+    assert!(
+        delay >= lease / 5,
+        "a {lease:?} lease produced a refresh delay of {delay:?}, which renews more often than \
+         the lease is worth"
     );
     TestResult::passed()
 }
@@ -217,6 +228,38 @@ fn routed_host_answers_for_the_cassandra_contact_point() -> Result<()> {
     host.as_str()
         .parse::<IpAddr>()
         .map_err(|error| eyre!("the routed probe returned {host}, not an address: {error}"))?;
+    Ok(())
+}
+
+/// The direct host is the routed address, and this machine's name where the
+/// probe finds none. Both sources are checked against a registration, because
+/// the order between them decides the address peers dial.
+///
+/// The target is written as an address so that two probes cannot land on
+/// different address families of one name. A contact point with no port in it
+/// resolves to nothing, so the second source is reached without a network of
+/// any kind.
+#[test]
+fn the_direct_host_is_the_routed_address_then_this_machine() -> Result<()> {
+    init_test_logging();
+    let config = RouterConfiguration::default();
+    let routed =
+        routed_host(NUMERIC_CONTACT).ok_or_else(|| eyre!("the routed probe found no address"))?;
+    let registration = discover_registration(NodeId::new(), 7777, NUMERIC_CONTACT, &config, None)?;
+    ensure!(
+        routed != registration.hostname,
+        "this machine answers {routed} to both sources, so the two cannot be told apart"
+    );
+    assert_eq!(
+        registration.direct.host, routed,
+        "the direct endpoint must publish the routed address while the probe answers"
+    );
+
+    let unrouted = discover_registration(NodeId::new(), 7777, "no-port-here", &config, None)?;
+    assert_eq!(
+        unrouted.direct.host, unrouted.hostname,
+        "the direct endpoint must fall back to this machine's name"
+    );
     Ok(())
 }
 

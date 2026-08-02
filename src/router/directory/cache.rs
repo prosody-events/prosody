@@ -36,19 +36,22 @@ type Inner = Cache<NodeId, Entry, UnitWeighter, ahash::RandomState>;
 /// Two bounds make it safe to key by something an outsider chooses.
 /// **Capacity** is fixed at construction and `quick_cache` evicts to stay
 /// inside it, so the map cannot grow with traffic; eviction and staleness are
-/// its removal paths. **Age** is one registration lease, because the cache is
-/// built from the same [`RegistrationTtl`] the writer uses, and there is no
-/// second TTL to configure wrongly. The stamp is taken when the read is
-/// issued, so an entry filled from a row that was about to expire outlives
-/// that row by up to one lease — the address is then dialed and the response
-/// is dropped, which is what the best-effort posture already accepts.
+/// its removal paths. **Age** is this process's own configured
+/// [`RegistrationTtl`], so there is no second TTL to configure wrongly. It
+/// bounds how long an entry is served, never how closely that entry tracks the
+/// row. The stamp is taken when the read is issued, so an entry filled from a
+/// row that was about to expire outlives that row by nearly a whole lease. A
+/// process configured with a longer lease than the writer applies to its row
+/// keeps the entry longer still. The address is then dialed and the response is
+/// dropped, which is what the best-effort posture already accepts.
 ///
 /// Its single-flight behaviour is what matters on the response path: every
-/// caller after the first parks on the placeholder until the winner inserts, so
-/// a burst for one cold node issues one directory read. **Retention is
-/// best-effort and single flight is not.** `quick_cache` may evict an entry it
-/// has just admitted into a full cache, so a repeat request can miss; what the
-/// cache guarantees is one read per burst, never that a value stays.
+/// caller after the first parks on the placeholder until the fill finishes, so
+/// a burst for one cold node issues one directory read. **Retention and single
+/// flight are both best-effort.** `quick_cache` may evict an entry it has just
+/// admitted into a full cache, so a repeat request can miss. A fill that fails
+/// inserts nothing and the next waiter reads again, so a burst against a
+/// failing directory issues one read per waiter, one at a time.
 #[derive(Clone)]
 pub(crate) struct AddressCache {
     inner: Arc<Inner>,

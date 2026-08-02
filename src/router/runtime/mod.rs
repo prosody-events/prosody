@@ -303,12 +303,16 @@ fn discover_registration(
 /// A refresh delay inside the lease, jittered so a fleet does not renew into
 /// the same partitions at the same instant.
 ///
-/// Always between a third and a half of the lease, so two consecutive refreshes
-/// can be lost before a row expires.
+/// Always between a fifth and a quarter of the lease. Three delays therefore
+/// leave a quarter of the lease unspent, so two lost refreshes still heal while
+/// the writes between them return inside that spare. Nothing bounds a write's
+/// own round trip, which is why the margin is a quarter of the lease and not
+/// the last instant of it. The lower bound caps what the margin costs at five
+/// refreshes per lease.
 fn refresh_delay(ttl: RegistrationTtl) -> Duration {
     let millis = ttl.duration().as_secs() * 1000;
-    let base = millis / 3;
-    let span = millis / 6;
+    let base = millis / 5;
+    let span = millis / 20;
     Duration::from_millis(base + rand::rng().random_range(0..=span))
 }
 

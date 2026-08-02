@@ -117,14 +117,16 @@ pub(crate) struct NodeDirectory {
 }
 
 impl RegistrationTtl {
-    /// The lease a process publishes when an operator asks for none. A refresh
-    /// and its jitter fit twice inside it, so two lost writes still heal.
+    /// The lease a process publishes when an operator asks for none. Long
+    /// enough that a refresher paces itself well inside it, short enough that a
+    /// dead process's row expires within half a minute.
     pub(crate) const DEFAULT: Self = Self(30);
     /// Longest lease a caller can ask for. A dead process stays resolvable for
     /// at most this long, and each stale resolution costs one dropped response.
     pub(crate) const MAX: Duration = Duration::from_hours(1);
-    /// Shortest lease a caller can ask for. Below this, a refresh and its
-    /// jitter leave no room for a lost write to heal.
+    /// Shortest lease a caller can ask for. Below this, a refresh falls due
+    /// less than a second after the one before it, and each write's own round
+    /// trip then takes a large part of the margin the jitter leaves.
     pub(crate) const MIN: Duration = Duration::from_secs(5);
 
     /// The lease in seconds, ready to bind to a `USING TTL` placeholder.
