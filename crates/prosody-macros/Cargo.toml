@@ -1,10 +1,12 @@
 [package]
 categories = ["asynchronous", "development-tools::procedural-macro-helpers"]
-description = "Internal procedural macros for the prosody keyed-state collection authors"
+description = "Procedural macros for Prosody keyed-state collections"
+documentation = "https://docs.rs/prosody-macros"
 edition = "2024"
 keywords = ["distributed-systems", "macros", "prosody"]
 license = "MIT"
 name = "prosody-macros"
+publish = ["crates-io"]
 readme = "README.md"
 repository = "https://github.com/prosody-events/prosody"
 version = "0.5.0"
