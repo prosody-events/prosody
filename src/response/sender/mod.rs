@@ -24,9 +24,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use thiserror::Error;
+use tokio::select;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::time::{Instant, sleep_until, timeout_at};
+use tokio::time::{Instant, sleep_until};
 use tracing::warn;
 
 #[cfg(test)]
@@ -45,11 +46,11 @@ mod tests;
 /// revoked is still delivered.
 pub(crate) struct TypedSender<C: Codec, R> {
     router: R,
-    /// One cell per fleet cell, allocated once and never pushed. A lane is
-    /// replaced when its generation no longer matches the reservation's, which
-    /// is both how an evicted destination's lane is removed and how a lane
-    /// whose worker ended is rebuilt.
-    lanes: Mutex<Vec<Option<Lane<C>>>>,
+    /// One cell per fleet cell. The boxed slice has no `push`, so no send can
+    /// grow it. A lane is replaced when its generation no longer matches the
+    /// reservation's, which is both how an evicted destination's lane is
+    /// removed and how a lane whose worker ended is rebuilt.
+    lanes: Mutex<Box<[Option<Lane<C>>]>>,
     cap: FrameCap,
     config: FleetConfiguration,
     counters: Arc<SendCounters>,
@@ -65,10 +66,10 @@ struct LaneContext<R> {
 /// One destination's queue, and which occupant of its cell it feeds.
 ///
 /// One worker per destination, not several. `tokio::sync::mpsc` has exactly one
-/// receiver, so more workers would need either a shared receiver behind an
-/// async lock or a round robin over private queues, and the second strands jobs
-/// behind one stalled worker. Per-destination concurrency would only buy
-/// throughput against a slow peer, which the rate limit already bounds.
+/// receiver. More workers would therefore need a shared receiver behind an
+/// async lock, or a round robin over private queues. A round robin strands jobs
+/// behind one stalled worker. Concurrency per destination would only buy
+/// throughput against a slow peer, and the rate limit already bounds that.
 struct Lane<C: Codec> {
     generation: u64,
     jobs: Sender<Job<C>>,
@@ -85,6 +86,10 @@ struct Job<C: Codec> {
 }
 
 /// What one sender's deliveries came to.
+///
+/// Every job a worker dequeues moves exactly one of these. A response the
+/// destination's queue could not take moves `dropped` alone, because no worker
+/// ever sees it.
 #[derive(Debug, Default)]
 pub(crate) struct SendCounters {
     sent: AtomicU64,
@@ -97,8 +102,7 @@ impl<C: Codec, R: Router> TypedSender<C, R> {
     /// # Errors
     ///
     /// Returns [`FleetConfigurationError::ScratchBudget`] when one encode
-    /// buffer per destination at `cap` exceeds what the process may commit
-    /// to.
+    /// buffer per destination at `cap` exceeds what one sender may commit to.
     pub(crate) fn new(router: R, cap: FrameCap) -> Result<Self, FleetConfigurationError> {
         let config = router.fleet().config();
         validate_scratch_budget(config.max_destinations, cap)?;
@@ -106,7 +110,7 @@ impl<C: Codec, R: Router> TypedSender<C, R> {
         lanes.resize_with(config.max_destinations, || None);
         Ok(Self {
             router,
-            lanes: Mutex::new(lanes),
+            lanes: Mutex::new(lanes.into_boxed_slice()),
             cap,
             config,
             counters: Arc::new(SendCounters::default()),
@@ -136,11 +140,12 @@ impl<C: Codec, R: Router> TypedSender<C, R> {
                 expires_at,
             };
             if jobs.try_send(job).is_err() {
-                // `Full` cannot happen: every lane on one destination draws
+                // `Full` cannot happen. Every lane on one destination draws
                 // from that destination's one set of slots, and every queued
-                // job holds one, so a job that got a slot always has room.
-                // `Closed` means the worker ended between the lane check and
-                // here. Dropping the returned job releases its slot.
+                // job holds one of them. A job that got a slot therefore always
+                // has room. `Closed` means the worker ended between the lane
+                // check and here. Dropping the returned job releases its slot.
+                // This is the one drop that no dequeued job accounts for.
                 self.counters.dropped.fetch_add(1, Relaxed);
                 return Err(Refused::Queue);
             }
@@ -148,18 +153,25 @@ impl<C: Codec, R: Router> TypedSender<C, R> {
         })
     }
 
-    /// What this sender's deliveries came to.
-    pub(crate) fn counters(&self) -> &Arc<SendCounters> {
-        &self.counters
+    /// What this sender's deliveries came to. The counters outlive this sender,
+    /// so a caller may hold them while the workers finish.
+    pub(crate) fn counters(&self) -> Arc<SendCounters> {
+        Arc::clone(&self.counters)
     }
 
     /// The lane for this reservation's destination, built when the cell holds
     /// none or holds one for an earlier occupant.
     ///
+    /// Building one allocates: a queue of `slots_each` and one task, per
+    /// admission. The live lanes are bounded by `max_destinations`, because a
+    /// lane's cell is the fleet cell its destination occupies.
+    ///
     /// Replacing a lane drops its queue handle; the retired worker delivers
     /// what it already holds and then exits. That is a lane's removal path.
     fn lane(&self, reservation: &Reservation<'_>) -> Sender<Job<C>> {
         let mut lanes = self.lanes.lock();
+        // `Reservation::slot` indexes the same fleet table this sender was
+        // sized from, so the cell always exists.
         let cell = &mut lanes[reservation.slot()];
         if let Some(lane) = cell.as_ref()
             && lane.generation == reservation.generation()
@@ -202,8 +214,14 @@ impl SendCounters {
 /// own scratch, and delivers it.
 ///
 /// The codec and the scratch are built once here, so the steady-state send path
-/// allocates nothing. The loop keeps draining after its queue handle drops,
-/// which is what makes a queued response outlive the layer that queued it.
+/// allocates nothing. The loop keeps draining after its queue handle drops, so
+/// a queued response outlives the layer that queued it.
+///
+/// Exactly one counter moves per dequeued job. The deadline is the biased arm
+/// of the select, so a job whose deadline has already passed is dropped before
+/// the pipeline is polled at all — nothing is paced, encoded or sent for it.
+/// Work already inside one poll still finishes: this is a deadline the pipeline
+/// is measured against between polls, never an absolute wall-clock cut.
 async fn run_lane<C: Codec, R: Router>(
     mut queue: Receiver<Job<C>>,
     destination: Arc<Destination>,
@@ -220,10 +238,17 @@ async fn run_lane<C: Codec, R: Router>(
         } = job;
         // One deadline over the whole pipeline — the pacing wait, the address
         // read, the encode and every attempt — so a transport that never
-        // answers still releases the slot. A job that sat in the queue past its
-        // deadline is refused here rather than encoded.
-        let pipeline = deliver_job(&mut encoder, &destination, &context, header, payload);
-        if timeout_at(expires_at, pipeline).await.is_err() {
+        // answers still releases the slot.
+        let delivered = select! {
+            biased;
+            () = sleep_until(expires_at) => false,
+            delivered = deliver_job(&mut encoder, &destination, &context, header, payload) => {
+                delivered
+            }
+        };
+        if delivered {
+            context.counters.sent.fetch_add(1, Relaxed);
+        } else {
             context.counters.dropped.fetch_add(1, Relaxed);
         }
         drop(slot);
@@ -232,36 +257,31 @@ async fn run_lane<C: Codec, R: Router>(
 
 /// Paces one response, resolves its destination, frames it and delivers it.
 ///
-/// The pacing wait comes first, so a response whose deadline expires while it
-/// waits is never encoded at all.
+/// Returns `true` only when the destination accepted the frame. The caller
+/// counts the outcome, so one dequeued job moves one counter.
 async fn deliver_job<C: Codec, R: Router>(
     encoder: &mut FrameEncoder<C>,
     destination: &Destination,
     context: &LaneContext<R>,
     header: FrameHeader,
     payload: C::Payload,
-) {
+) -> bool {
     sleep_until(destination.next_send()).await;
     // No address originates anywhere but a registration: a node the directory
     // does not hold is not dialed at all.
     let address = match context.router.address(header.target).await {
         Ok(Some(address)) => address,
-        Ok(None) => {
-            context.counters.dropped.fetch_add(1, Relaxed);
-            return;
-        }
+        Ok(None) => return false,
         Err(error) => {
             warn!(%error, node = %header.target, "peer address lookup failed");
-            context.counters.dropped.fetch_add(1, Relaxed);
-            return;
+            return false;
         }
     };
     let staged = match encoder.stage(&header, payload) {
         Ok(staged) => staged,
         Err(error) => {
             warn!(%error, node = %header.target, "response could not be framed");
-            context.counters.dropped.fetch_add(1, Relaxed);
-            return;
+            return false;
         }
     };
     match deliver(
@@ -273,12 +293,10 @@ async fn deliver_job<C: Codec, R: Router>(
     )
     .await
     {
-        Ok(()) => {
-            context.counters.sent.fetch_add(1, Relaxed);
-        }
+        Ok(()) => true,
         Err(failure) => {
             warn!(%failure, node = %header.target, "response delivery failed");
-            context.counters.dropped.fetch_add(1, Relaxed);
+            false
         }
     }
 }
@@ -287,7 +305,7 @@ async fn deliver_job<C: Codec, R: Router>(
 /// fix.
 ///
 /// Every retry claims the destination's pacing too, so the rate limit bounds
-/// what one destination receives rather than what it is asked for.
+/// what one destination is asked for rather than what it receives.
 async fn deliver<S: ResponseSender, F: Framed + Sync>(
     sender: &S,
     destination: &Destination,

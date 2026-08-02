@@ -52,7 +52,7 @@ thread_local! {
 /// payload's own buffer over instead, as [`BinaryCodec`](crate::BinaryCodec)
 /// does.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct CountingCodec {
+pub(in crate::response) struct CountingCodec {
     serializes: Arc<AtomicUsize>,
     deserializes: Arc<AtomicUsize>,
     moves: bool,
@@ -139,7 +139,7 @@ impl Default for RawFrame {
 }
 
 /// How many payloads [`CountingCodec`] has serialized on this thread.
-pub(crate) fn serialized_on_this_thread() -> usize {
+pub(in crate::response) fn serialized_on_this_thread() -> usize {
     SERIALIZED_HERE.get()
 }
 

@@ -8,6 +8,7 @@ use crate::router::loopback::LoopbackSender;
 use crate::test_util::TEST_RUNTIME;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
+use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::{Uuid, Version};
@@ -53,7 +54,7 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
                 AddressCache::new(CACHE_CAPACITY, RegistrationTtl::try_from(LEASE)?),
                 directory,
             ),
-            Arc::new(DestinationFleet::new(FleetConfiguration::default())),
+            Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
             Arc::new(transport),
         );
 
@@ -69,6 +70,58 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
             router.address(NodeId::new()).await?,
             None,
             "a node the directory does not hold must reach no address"
+        );
+        Ok(())
+    })
+}
+
+/// A router answers from its own cache, and every clone of it shares the one
+/// cache, fleet and transport the process owns.
+///
+/// The row is removed after the first resolution, so a router that read the
+/// directory again would answer nothing. The lease is far longer than this test
+/// runs, so the cached entry cannot age out first.
+#[test]
+fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let directory = directory(LEASE).await?;
+        let published = registration(NodeId::new(), membership());
+        directory.register(&published).await?;
+
+        let (transport, _recorded) = LoopbackSender::new();
+        let router = RouterHandle::new(
+            AddressResolver::new(
+                AddressCache::new(CACHE_CAPACITY, RegistrationTtl::try_from(LEASE)?),
+                directory.clone(),
+            ),
+            Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
+            Arc::new(transport),
+        );
+
+        assert_eq!(
+            router.address(published.node).await?,
+            Some(published.direct.clone()),
+            "a published node must resolve"
+        );
+        directory.deregister(&published).await?;
+        assert!(
+            directory.read(published.node).await?.is_none(),
+            "the row must be gone before the cached answer is asserted"
+        );
+        assert_eq!(
+            router.address(published.node).await?,
+            Some(published.direct.clone()),
+            "a router must answer from its cache once the row is gone"
+        );
+
+        let clone = router.clone();
+        assert!(
+            ptr::eq(router.fleet(), clone.fleet()),
+            "a clone must share the one fleet the process owns"
+        );
+        assert!(
+            ptr::eq(router.sender(), clone.sender()),
+            "a clone must share the one transport the process owns"
         );
         Ok(())
     })

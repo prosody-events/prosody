@@ -76,7 +76,7 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
             "a started runtime must occupy exactly one index shard"
         );
         assert_eq!(
-            runtime.resolve(node).await?.as_deref(),
+            runtime.addresses().resolve(node).await?.as_deref(),
             Some(&registered),
             "the runtime must resolve its own node through its cache"
         );
@@ -112,7 +112,7 @@ fn a_resolved_address_stops_being_served_once_its_row_is_gone() -> Result<()> {
             PeerRuntime::start(store().await?.clone(), 7777, CONTACT, &config, None).await?;
         let node = runtime.node();
         assert!(
-            runtime.resolve(node).await?.is_some(),
+            runtime.addresses().resolve(node).await?.is_some(),
             "a started runtime must resolve its own node"
         );
         // The shutdown removes the row and stops the refresher, so only the
@@ -126,7 +126,7 @@ fn a_resolved_address_stops_being_served_once_its_row_is_gone() -> Result<()> {
         let mut ticker = interval(Duration::from_millis(200));
         loop {
             ticker.tick().await;
-            let resolved = runtime.resolve(node).await?;
+            let resolved = runtime.addresses().resolve(node).await?;
             if resolved.is_none() {
                 break;
             }

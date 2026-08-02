@@ -7,10 +7,11 @@ use tokio::time::Instant;
 /// One destination's send pacing.
 ///
 /// Slots bound the work outstanding against a destination; this bounds its
-/// throughput, which is what bounds amplification. Pacing is strict with a
-/// burst of one: the first send goes at once, and each later send goes one
-/// period after the one before it. Times are [`tokio::time::Instant`], so a
-/// paused-time test observes the pacing exactly.
+/// throughput. Pacing is strict with a burst of one: the first send goes at
+/// once, and each later send goes one period after the one before it. A
+/// destination left idle for many periods gets no burst — the next claim starts
+/// from the present, not from the schedule it stopped at. Times are
+/// [`tokio::time::Instant`], so a paused-time test observes the pacing exactly.
 pub(crate) struct RateLimit {
     period: Duration,
     next: Mutex<Option<Instant>>,
@@ -19,9 +20,10 @@ pub(crate) struct RateLimit {
 impl RateLimit {
     /// A limit of `sends_per_second` sends to one destination.
     ///
-    /// A rate of zero yields no pacing at all. The fleet's configuration
-    /// refuses that value, so the fallback is unreachable rather than a
-    /// silently degraded mode.
+    /// A rate of zero yields no pacing at all.
+    /// [`DestinationFleet::new`](crate::router::fleet::DestinationFleet::new)
+    /// refuses that value before it builds a fleet, so the fallback is
+    /// unreachable rather than a silently degraded mode.
     pub(crate) fn new(sends_per_second: u32) -> Self {
         Self {
             period: Duration::from_secs(1)
@@ -32,6 +34,9 @@ impl RateLimit {
     }
 
     /// Claims the instant the next send may go at.
+    ///
+    /// A claimed turn is spent whether or not the send happens, so a
+    /// destination receives less than the limit and never more.
     ///
     /// Synchronous by design: the caller sleeps until the instant it gets, so
     /// the lock is never held across an await.

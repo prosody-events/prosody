@@ -9,7 +9,7 @@ use validator::{Validate, ValidationError, ValidationErrors};
 
 /// Most destinations one process may hold live at once. The table is scanned
 /// linearly, so this bounds the scan too.
-const MAX_DESTINATIONS: usize = 1024;
+pub(super) const MAX_DESTINATIONS: usize = 1024;
 
 /// Most send slots one destination may hold.
 const MAX_SLOTS_EACH: usize = 256;
@@ -17,15 +17,19 @@ const MAX_SLOTS_EACH: usize = 256;
 /// Most send slots one process may commit to in total. A slot holds one moved
 /// handler result and one frame header, so this bounds committed memory the way
 /// the address cache's capacity bounds its entries.
-const MAX_TOTAL_SLOTS: usize = 8_192;
+pub(super) const MAX_TOTAL_SLOTS: usize = 8_192;
 
-/// Most bytes one process may commit to per-destination encode scratch.
-const MAX_SCRATCH_BYTES: u64 = 64 * 1024 * 1024;
+/// Most bytes one sender may commit to per-destination encode scratch.
+///
+/// One sender holds one encode buffer per destination. A process builds one
+/// sender per handler-result type, so what the process commits to is this
+/// number multiplied by the number of senders it builds.
+const MAX_SCRATCH_BYTES_PER_SENDER: u64 = 64 * 1024 * 1024;
 
 /// Fastest one destination may be sent to.
 const MAX_SENDS_PER_SECOND: u32 = 1_000_000;
 
-/// Longest one response may spend between its hook and its answer.
+/// Longest deadline an operator may set on one response.
 const MAX_SEND_DEADLINE: Duration = Duration::from_mins(5);
 
 /// Most attempts one response may take, the first included.
@@ -49,9 +53,9 @@ const DEFAULT_SEND_ATTEMPTS: u32 = 3;
 /// What an operator sets for response delivery.
 ///
 /// Every field has a working default, so a deployment that answers peers needs
-/// no configuration at all. The product of the first two fields is what the
-/// process commits to, so it is checked against a ceiling of its own rather
-/// than left to two independently plausible numbers.
+/// no configuration at all. `max_destinations` multiplied by `slots_each` is
+/// what the process commits to, so that product is checked against a ceiling of
+/// its own rather than left to two independently plausible numbers.
 #[derive(Builder, Clone, Copy, Debug, Validate)]
 #[builder(setter(into), default)]
 #[validate(schema(function = "validate_total_slots"))]
@@ -99,24 +103,26 @@ impl FleetConfiguration {
     }
 }
 
-/// Refuses a frame ceiling the process cannot afford.
+/// Refuses a frame ceiling one sender cannot afford.
 ///
 /// One worker per destination holds one encode buffer at the ceiling for its
-/// whole life, so the two numbers together are what the process commits to.
+/// whole life, so the two numbers together are what one sender commits to. The
+/// check runs once per sender, so a process that builds several pays the budget
+/// once for each of them.
 ///
 /// # Errors
 ///
 /// Returns [`FleetConfigurationError::ScratchBudget`] when the product exceeds
-/// what one process may commit to.
+/// what one sender may commit to.
 pub(crate) fn validate_scratch_budget(
     max_destinations: usize,
     cap: FrameCap,
 ) -> Result<(), FleetConfigurationError> {
     let bytes = (max_destinations as u64).saturating_mul(cap.bytes() as u64);
-    if bytes > MAX_SCRATCH_BYTES {
+    if bytes > MAX_SCRATCH_BYTES_PER_SENDER {
         return Err(FleetConfigurationError::ScratchBudget {
             bytes,
-            limit: MAX_SCRATCH_BYTES,
+            limit: MAX_SCRATCH_BYTES_PER_SENDER,
         });
     }
     Ok(())
@@ -154,13 +160,13 @@ pub(crate) enum FleetConfigurationError {
     #[error("fleet configuration is invalid: {0:#}")]
     Invalid(#[from] ValidationErrors),
 
-    /// One encode buffer per destination would need more than the process may
+    /// One encode buffer per destination would need more than one sender may
     /// commit to.
     #[error("encode buffers would need {bytes} bytes, over the {limit}-byte budget")]
     ScratchBudget {
         /// What the configuration asks for.
         bytes: u64,
-        /// The most a process may commit to.
+        /// The most one sender may commit to.
         limit: u64,
     },
 }

@@ -59,6 +59,11 @@ fn a_held_destination_never_delays_a_healthy_one() -> Result<()> {
             SLOTS - 1,
             "the held destination's remaining response must arrive once released"
         );
+        assert_eq!(
+            drained.sent,
+            SLOTS as u64 + 1,
+            "every response must be delivered, not merely attempted"
+        );
         Ok(())
     })
 }

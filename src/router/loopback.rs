@@ -45,6 +45,10 @@ pub(crate) enum Script {
 /// transport is given, and each test node binds a distinct port.
 pub(crate) struct LoopbackSender {
     deliveries: UnboundedSender<Delivery>,
+    /// A `Mutex<HashMap>` rather than `scc`: a script's read, decrement and
+    /// answer must be one step, and this map holds a few ports in one test.
+    /// The rule against a mutex-wrapped map targets contended keyed production
+    /// state, which this is not.
     scripts: Mutex<HashMap<u16, Script>>,
 }
 

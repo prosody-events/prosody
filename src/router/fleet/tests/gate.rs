@@ -3,8 +3,9 @@
 use crate::router::fleet::gate::AdmissionGate;
 use color_eyre::Result;
 use futures::poll;
-use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck::{Arbitrary, Gen, TestResult, empty_shrinker};
 use quickcheck_macros::quickcheck;
+use std::iter::once;
 use std::pin::pin;
 use tokio::runtime::Builder;
 
@@ -28,6 +29,17 @@ impl Arbitrary for GateOp {
             0 => Self::Close,
             1..=3 => Self::Leave(usize::arbitrary(g)),
             _ => Self::Enter,
+        }
+    }
+
+    /// Entering is the simplest step: it needs no ticket already held and it
+    /// closes nothing. Every other step therefore reduces toward it, and a
+    /// `Leave` also reduces its position.
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        match *self {
+            Self::Enter => empty_shrinker(),
+            Self::Close => Box::new(once(Self::Enter)),
+            Self::Leave(at) => Box::new(once(Self::Enter).chain(at.shrink().map(Self::Leave))),
         }
     }
 }

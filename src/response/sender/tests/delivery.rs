@@ -8,7 +8,9 @@ use crate::router::SendFailure;
 use crate::router::loopback::Script;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tonic::Code;
 
 /// The destination these suites address.
@@ -157,6 +159,76 @@ fn an_expired_response_is_dropped_before_it_is_encoded() -> Result<()> {
             Some(SLOTS),
             "every slot must go back once the workers finish"
         );
+        Ok(())
+    })
+}
+
+/// A response whose deadline has already passed when its worker reaches it is
+/// dropped before anything is encoded, even when nothing in its own pipeline
+/// waits.
+///
+/// The destination holds the job ahead of this one until both deadlines have
+/// passed. Pacing is left unsaturated, so this job's pacing claim, its address
+/// read and its encode would all complete inside one poll — only a check that
+/// runs before the pipeline is polled can refuse it. Counting what this thread
+/// serialized is what makes that claim one the test risks.
+#[test]
+fn a_response_dequeued_after_its_deadline_is_never_encoded() -> Result<()> {
+    let runtime = paused()?;
+    runtime.block_on(async {
+        let harness = Harness::new(config(CELLS, SLOTS))?;
+        // Nothing ever releases the barrier: the first job's own deadline ends
+        // it, and reaching that deadline is what puts the second job past its
+        // own.
+        harness.script(TARGET, Script::Hold(Arc::new(Semaphore::new(0))));
+        let serialized = serialized_on_this_thread();
+        harness.send(TARGET)?;
+        harness.send(TARGET)?;
+
+        let drained = harness.drain().await?;
+        assert_eq!(
+            serialized_on_this_thread() - serialized,
+            1,
+            "the response dequeued after its deadline must never be encoded"
+        );
+        assert_eq!(
+            attempts(&drained.deliveries, TARGET),
+            1,
+            "the response dequeued after its deadline must never reach the transport"
+        );
+        assert_eq!(drained.sent, 0, "neither response reached its destination");
+        Ok(())
+    })
+}
+
+/// A retry that succeeds is the last attempt. The remaining attempts are an
+/// allowance, not a schedule.
+#[test]
+fn a_retry_that_succeeds_stops_the_attempts() -> Result<()> {
+    let runtime = paused()?;
+    runtime.block_on(async {
+        let settings = config(CELLS, SLOTS);
+        let harness = Harness::new(settings)?;
+        harness.script(
+            TARGET,
+            Script::Fail {
+                failure: SendFailure::Status(Code::Unavailable),
+                times: 1,
+            },
+        );
+        harness.send(TARGET)?;
+
+        let drained = harness.drain().await?;
+        assert!(
+            settings.max_send_attempts > 2,
+            "the allowance must exceed the two attempts this response needs"
+        );
+        assert_eq!(
+            attempts(&drained.deliveries, TARGET),
+            2,
+            "a response that succeeds on its retry must not be attempted again"
+        );
+        assert_eq!(drained.sent, 1, "the successful retry must count as sent");
         Ok(())
     })
 }

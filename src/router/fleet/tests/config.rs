@@ -1,16 +1,20 @@
 //! What a configuration must satisfy before a process builds a fleet from it.
 
 use crate::response::frame::FrameCap;
+use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::{
-    FleetConfiguration, FleetConfigurationError, validate_scratch_budget,
+    FleetConfiguration, FleetConfigurationError, MAX_DESTINATIONS, MAX_TOTAL_SLOTS,
+    validate_scratch_budget,
 };
 use color_eyre::Result;
 use std::time::Duration;
 use validator::Validate;
 
 /// The largest table and the largest slot count the ceiling admits together.
-const CEILING_DESTINATIONS: usize = 1024;
-const CEILING_SLOTS: usize = 8;
+/// Derived from the production ceilings, so raising one cannot leave this suite
+/// probing the number it used to be.
+const CEILING_DESTINATIONS: usize = MAX_DESTINATIONS;
+const CEILING_SLOTS: usize = MAX_TOTAL_SLOTS / MAX_DESTINATIONS;
 
 /// A frame ceiling one process can afford at the default table size.
 const AFFORDABLE_CAP: usize = 1024 * 1024;
@@ -39,9 +43,10 @@ fn the_startup_ceiling_refuses_an_over_large_fleet() -> Result<()> {
     Ok(())
 }
 
-/// Every field that can express a degenerate value refuses it, so no fleet is
-/// built with a table of no cells, a destination of no slots, no rate, no
-/// deadline, or no attempts.
+/// Every field that can express a degenerate value refuses it at the one place
+/// a fleet is built. No fleet exists with a table of no cells, a destination of
+/// no slots, no rate, no deadline, no attempts, or a deadline longer than a
+/// process should hold a slot for.
 #[test]
 fn a_degenerate_field_is_refused() -> Result<()> {
     let degenerate = [
@@ -64,8 +69,8 @@ fn a_degenerate_field_is_refused() -> Result<()> {
     ];
     for config in degenerate {
         assert!(
-            config.validate().is_err(),
-            "{config:?} must be refused before a fleet is built from it"
+            DestinationFleet::new(config).is_err(),
+            "{config:?} must not build a fleet"
         );
     }
     Ok(())

@@ -20,7 +20,6 @@ use crate::router::{Host, NodeId};
 use derive_builder::Builder;
 use rand::RngExt;
 use std::net::{ToSocketAddrs, UdpSocket};
-use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::select;
@@ -42,8 +41,9 @@ const DEFAULT_ADDRESS_CACHE_CAPACITY: usize = 1024;
 /// worth; the bound stops a typo from asking for a heap the process lacks.
 const MAX_ADDRESS_CACHE_CAPACITY: usize = 1_048_576;
 
-/// Longest label an operator can configure for a host or a network. One byte
-/// under [`Host`]'s inline limit, so a configured label never reaches the heap.
+/// Longest label an operator can configure for a host or a network. The largest
+/// label that stays inline in [`Host`], so a configured label never reaches the
+/// heap.
 const MAX_LABEL_BYTES: usize = 63;
 
 /// What an operator sets for peer routing.
@@ -93,8 +93,14 @@ pub(crate) struct RouterConfiguration {
 /// shutdown. Nothing here is conditional on a peer feature: every process
 /// registers, always, which is what makes any node reachable from any other.
 /// The consumer wiring owns construction and shutdown order.
+///
+/// Dropping the runtime without a shutdown ends the refresh task through the
+/// stop channel and leaves this process's row to expire on its lease.
 pub(crate) struct PeerRuntime {
     addresses: AddressResolver,
+    /// The write side of the directory. The resolver beside it only reads, so
+    /// the two directions stay separate types rather than one that does both.
+    directory: NodeDirectory,
     registration: NodeRegistration,
     stop: watch::Sender<bool>,
     refresh: Mutex<Option<JoinHandle<()>>>,
@@ -179,8 +185,9 @@ impl PeerRuntime {
         Ok(Self {
             addresses: AddressResolver::new(
                 AddressCache::new(config.address_cache_capacity, ttl),
-                directory,
+                directory.clone(),
             ),
+            directory,
             registration,
             stop,
             refresh: Mutex::new(Some(refresh)),
@@ -192,16 +199,10 @@ impl PeerRuntime {
         self.registration.node
     }
 
-    /// Resolves another node through the bounded address cache.
-    ///
-    /// # Errors
-    ///
-    /// Returns the directory's error when a cache miss cannot be filled.
-    pub(crate) async fn resolve(
-        &self,
-        node: NodeId,
-    ) -> Result<Option<Arc<NodeRegistration>>, CassandraStoreError> {
-        self.addresses.resolve(node).await
+    /// How this process resolves another node, through the bounded address
+    /// cache.
+    pub(crate) const fn addresses(&self) -> &AddressResolver {
+        &self.addresses
     }
 
     /// Stops refreshing and removes this process's rows.
@@ -230,10 +231,7 @@ impl PeerRuntime {
             // A `JoinHandle` cannot be polled again once it has completed.
             *refresh = None;
         }
-        self.addresses
-            .directory()
-            .deregister(&self.registration)
-            .await
+        self.directory.deregister(&self.registration).await
     }
 }
 

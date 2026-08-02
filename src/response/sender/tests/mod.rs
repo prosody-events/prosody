@@ -14,6 +14,7 @@ use crate::router::{Host, NodeId, Router};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
@@ -60,6 +61,9 @@ pub(super) struct Harness {
     sender: TypedSender<CountingCodec, TestRouter>,
     deliveries: UnboundedReceiver<Delivery>,
     header: FrameHeader,
+    /// Responses this harness queued, counted so [`Harness::drain`] can hold
+    /// the sender's counters to their conservation rule.
+    queued: Cell<u64>,
 }
 
 /// What one harness came to once every worker had finished.
@@ -106,7 +110,7 @@ impl Harness {
             })
             .collect();
         let router = TestRouter {
-            fleet: Arc::new(DestinationFleet::new(config)),
+            fleet: Arc::new(DestinationFleet::new(config)?),
             transport: Arc::new(transport),
             addresses: Arc::new(addresses),
         };
@@ -115,6 +119,7 @@ impl Harness {
             router,
             deliveries,
             header: header()?,
+            queued: Cell::new(0),
         })
     }
 
@@ -128,15 +133,19 @@ impl Harness {
         Arc::clone(&self.router.fleet)
     }
 
-    /// Queues one response for `index`.
+    /// Queues one response for `index`, and counts it when it was queued.
     pub(super) fn send(&self, index: u8) -> Result<(), Refused> {
-        self.sender.send(
+        let queued = self.sender.send(
             FrameHeader {
                 target: node(index),
                 ..self.header.clone()
             },
             PAYLOAD.to_vec(),
-        )
+        );
+        if queued.is_ok() {
+            self.queued.set(self.queued.get() + 1);
+        }
+        queued
     }
 
     /// The next attempt the transport recorded.
@@ -148,20 +157,26 @@ impl Harness {
         }
     }
 
-    /// Drops the sender and collects every attempt its workers still make.
+    /// Drops the sender, collects every attempt its workers still make, and
+    /// holds the counters to their conservation rule.
     ///
     /// A worker exits when its queue is empty and its handle is gone, so the
     /// recording stream closing is the signal that delivery is finished. That
     /// is what makes a complete record of one run observable without waiting on
     /// a clock.
+    ///
+    /// Every queued response then ends as exactly one of sent or dropped. The
+    /// one drop these suites cannot produce is [`Refused::Queue`], which needs
+    /// a worker to end between the lane check and the queue.
     pub(super) async fn drain(self) -> Result<Drained> {
         let Self {
             router,
             sender,
             mut deliveries,
+            queued,
             ..
         } = self;
-        let counters = Arc::clone(sender.counters());
+        let counters = sender.counters();
         drop(sender);
         drop(router);
 
@@ -175,11 +190,20 @@ impl Harness {
         if finished.is_err() {
             bail!("the destination workers did not finish");
         }
-        Ok(Drained {
+        let drained = Drained {
             deliveries: recorded,
             sent: counters.sent(),
             dropped: counters.dropped(),
-        })
+        };
+        let queued = queued.get();
+        if drained.sent + drained.dropped != queued {
+            bail!(
+                "{queued} queued responses came to {} sent and {} dropped",
+                drained.sent,
+                drained.dropped
+            );
+        }
+        Ok(drained)
     }
 }
 

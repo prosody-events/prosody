@@ -4,8 +4,8 @@
     not(test),
     expect(
         dead_code,
-        reason = "the destination fleet and the process runtime are this module's production \
-                  callers; every item here is exercised by this module's tests"
+        reason = "the response path and the process runtime are this module's production callers; \
+                  the cache is exercised by this module's tests and the resolver by the router's"
     )
 )]
 
@@ -70,7 +70,8 @@ pub(crate) struct AddressCache {
 /// cache.
 ///
 /// One type, so every caller that needs an address holds one thing rather than
-/// a cache and a directory it must remember to pair.
+/// a cache and a directory it must remember to pair. It only reads, and every
+/// read goes through the cache: it exposes no write and no direct row access.
 #[derive(Clone)]
 pub(crate) struct AddressResolver {
     cache: AddressCache,
@@ -162,6 +163,7 @@ impl AddressCache {
 
 impl AddressResolver {
     /// Reads `directory` through `cache`.
+    #[must_use]
     pub(crate) const fn new(cache: AddressCache, directory: NodeDirectory) -> Self {
         Self { cache, directory }
     }
@@ -176,11 +178,5 @@ impl AddressResolver {
         node: NodeId,
     ) -> Result<Option<Arc<NodeRegistration>>, CassandraStoreError> {
         self.cache.resolve(node, || self.directory.read(node)).await
-    }
-
-    /// The directory behind the cache, for the writes a process makes about
-    /// itself.
-    pub(crate) const fn directory(&self) -> &NodeDirectory {
-        &self.directory
     }
 }

@@ -161,7 +161,7 @@ impl Framed for Staged<'_> {
     }
 }
 
-/// The exact length [`Staged::write`] produces, summed in `u64` so no addition
+/// The exact length [`Framed::write`] produces, summed in `u64` so no addition
 /// can overflow whatever a codec emitted.
 fn frame_len(header: &FrameHeader, format: &str, payload: usize) -> u64 {
     varint_field_len(FIELD_PROTOCOL_VERSION, u64::from(RESPONSE_PROTOCOL_VERSION))

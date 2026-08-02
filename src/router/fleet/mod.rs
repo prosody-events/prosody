@@ -1,20 +1,21 @@
 //! The process-wide table of destinations a response may be sent to.
 //!
-//! One fleet serves every consumer in the process. That is what makes a
-//! per-destination bound a bound: a private allowance per consumer would let
-//! one dead peer occupy a fresh set of slots for each of them.
+//! One fleet serves every consumer in the process. A private allowance per
+//! consumer would let one dead peer hold a fresh set of slots for each of them,
+//! so the per-destination bound holds only because the table is shared.
 
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "the respond layer is this module's production caller; every item here is \
-                  exercised by this module's tests"
+        reason = "the respond layer and the shutdown path are this module's production callers; \
+                  the reservation accessors and `Destination::next_send` are exercised from the \
+                  response sender's suites, and the rest from this module's own"
     )
 )]
 
 use crate::router::NodeId;
-use crate::router::fleet::config::FleetConfiguration;
+use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
 use crate::router::fleet::gate::{AdmissionGate, GateTicket};
 use crate::router::fleet::rate::RateLimit;
 use parking_lot::Mutex;
@@ -24,6 +25,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
+use validator::Validate;
 
 pub(crate) mod config;
 mod gate;
@@ -37,19 +39,18 @@ mod tests;
 /// The set of destinations is open — any node may be named — so the fleet is
 /// bounded rather than preallocated. A new node takes an empty cell, else
 /// evicts the least recently used cell whose destination has nothing in flight.
-/// When every cell holds a busy destination the new one is refused and counted,
-/// which is what keeps the maximum a maximum rather than a target.
+/// When every cell holds a busy destination, the fleet refuses the new one and
+/// counts the refusal. The table never holds more than the configured maximum.
 pub(crate) struct DestinationFleet {
-    /// Fixed length: one cell per configured destination, allocated once and
-    /// never pushed. That is what makes "no reservation allocates" structural
-    /// rather than asserted.
+    /// One cell per configured destination. The boxed slice has no `push`, so
+    /// the length is fixed by the type and no reservation can grow it.
     ///
     /// One lock rather than a sharded map, because the bound and the eviction
     /// are global facts: "find or admit, evicting an idle cell" and "take one
     /// of that destination's slots" must be one atomic step against
     /// eviction. The scan is linear over 16-byte ids and bounded by the
     /// configured maximum.
-    table: Mutex<Vec<Option<Arc<Destination>>>>,
+    table: Mutex<Box<[Option<Arc<Destination>>]>>,
     gate: AdmissionGate,
     /// One monotonic source for both the use order and the generation, so a
     /// re-admitted node can never look like the occupant it replaced.
@@ -62,6 +63,11 @@ pub(crate) struct DestinationFleet {
 
 /// One live destination: what bounds its outstanding sends, what paces them,
 /// and when it was last used.
+///
+/// It holds no transport channel and no drain state on purpose. The channel
+/// sits behind the [`ResponseSender`](crate::router::ResponseSender) seam and
+/// the drain is per lane in the typed sender. That is what keeps the fleet
+/// untyped and free of transport vocabulary.
 pub(crate) struct Destination {
     node: NodeId,
     /// Tells this occupant of a table cell from every earlier one. A sender
@@ -87,20 +93,28 @@ pub(crate) struct Reservation<'a> {
 }
 
 impl DestinationFleet {
-    /// Builds the table at its configured length.
+    /// Validates `config` and builds the table at its configured length.
     ///
-    /// This is the fleet's only allocation: no reservation afterwards grows
-    /// anything.
-    pub(crate) fn new(config: FleetConfiguration) -> Self {
-        Self {
-            table: Mutex::new(vec![None; config.max_destinations]),
+    /// This is the only way to make a fleet, so an unvalidated one does not
+    /// exist. The table is allocated once and never grows. One destination
+    /// record is allocated when a node is admitted and freed when its cell is
+    /// evicted. No reservation on a live destination allocates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FleetConfigurationError::Invalid`] when a field is outside its
+    /// supported range, or when the slot total is.
+    pub(crate) fn new(config: FleetConfiguration) -> Result<Self, FleetConfigurationError> {
+        config.validate()?;
+        Ok(Self {
+            table: Mutex::new(vec![None; config.max_destinations].into_boxed_slice()),
             gate: AdmissionGate::new(),
             stamp: AtomicU64::new(0),
             admitted: AtomicU64::new(0),
             evicted: AtomicU64::new(0),
             refused: AtomicU64::new(0),
             config,
-        }
+        })
     }
 
     /// Takes one send slot on `node`, admitting the destination when the table
@@ -167,6 +181,18 @@ impl DestinationFleet {
             })
     }
 
+    /// How many cells hold `node`. Never more than one — see
+    /// [`DestinationFleet::find_or_admit`].
+    #[cfg(test)]
+    pub(crate) fn cells_holding(&self, node: NodeId) -> usize {
+        self.table
+            .lock()
+            .iter()
+            .flatten()
+            .filter(|destination| destination.node == node)
+            .count()
+    }
+
     /// How many cells the table holds. Constant for the fleet's whole life.
     #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
@@ -201,12 +227,17 @@ impl DestinationFleet {
         ticket: GateTicket<'a>,
     ) -> Result<Reservation<'a>, Refusal> {
         let (slot, destination) = self.find_or_admit(table, node)?;
+        // Stamped before the permit attempt, so the stamp means "last reserved
+        // against". A destination whose slots are all taken would otherwise
+        // never refresh it, and would be the first eviction candidate the
+        // moment it went idle — it would lose its cell under exactly the load
+        // that wants it kept.
+        destination.last_used.store(self.next_stamp(), Relaxed);
         // Taken under the table lock, so "nothing in flight" is an observation
         // eviction can trust: no slot can be taken on a cell being evicted.
         let permit = Arc::clone(&destination.slots)
             .try_acquire_owned()
             .map_err(|_| Refusal::NoSlot)?;
-        destination.last_used.store(self.next_stamp(), Relaxed);
         Ok(Reservation {
             slot,
             generation: destination.generation,
@@ -217,6 +248,11 @@ impl DestinationFleet {
     }
 
     /// Finds `node`'s cell, or gives it one.
+    ///
+    /// At most one cell holds a given node. A second cell for the same node
+    /// would hand it a second semaphore, and its slot bound would be twice what
+    /// the operator configured. The search below runs before every admission,
+    /// which is what keeps that true.
     fn find_or_admit(
         &self,
         table: &mut [Option<Arc<Destination>>],

@@ -8,18 +8,17 @@ use tokio::sync::Notify;
 /// Set once admission is closed.
 const CLOSED: u64 = 1 << 63;
 
-/// The tickets currently held.
-const COUNT: u64 = CLOSED - 1;
+/// Mask over the ticket count, which occupies every bit below [`CLOSED`].
+const COUNT_MASK: u64 = CLOSED - 1;
 
 /// Admission with a count, not a flag.
 ///
 /// A caller enters before it reserves and leaves once it has committed or
 /// dropped the reservation. Shutdown closes the gate and then waits for the
-/// count to reach zero, so "no reservation survives the close" is a property of
-/// the gate rather than of timing. A boolean cannot give that: a caller can
-/// already sit between its check and its reservation. Here the closed bit and
-/// the count share one word, so the check and the increment are one
-/// compare-and-exchange.
+/// count to reach zero, so no reservation survives the close whatever the
+/// timing. A boolean cannot give that: a caller can already sit between its
+/// check and its reservation. Here the closed bit and the count share one word,
+/// so the check and the increment are one compare-and-exchange.
 pub(crate) struct AdmissionGate {
     state: AtomicU64,
     drained: Notify,
@@ -43,11 +42,14 @@ impl AdmissionGate {
     ///
     /// The count also refuses at its 63-bit ceiling. One ticket per caller in
     /// flight puts that out of reach; the arm exists so an overflow can never
-    /// reach the closed bit.
+    /// reach the closed bit. A caller may therefore read `None` as "closed".
+    ///
+    /// The check and the increment are one word and one compare-exchange, so
+    /// their atomicity is a property of the instruction and owes no test.
     pub(crate) fn enter(&self) -> Option<GateTicket<'_>> {
         let mut state = self.state.load(Acquire);
         loop {
-            if state & CLOSED != 0 || state & COUNT == COUNT {
+            if state & CLOSED != 0 || state & COUNT_MASK == COUNT_MASK {
                 return None;
             }
             match self
@@ -69,7 +71,7 @@ impl AdmissionGate {
         loop {
             let mut drained = pin!(self.drained.notified());
             drained.as_mut().enable();
-            if self.state.load(Acquire) & COUNT == 0 {
+            if self.state.load(Acquire) & COUNT_MASK == 0 {
                 return;
             }
             drained.await;
@@ -79,7 +81,7 @@ impl AdmissionGate {
     /// How many tickets are held.
     #[cfg(test)]
     pub(crate) fn count(&self) -> u64 {
-        self.state.load(Acquire) & COUNT
+        self.state.load(Acquire) & COUNT_MASK
     }
 
     /// Whether admission is closed.
@@ -91,7 +93,7 @@ impl AdmissionGate {
 
 impl Drop for GateTicket<'_> {
     fn drop(&mut self) {
-        if self.gate.state.fetch_sub(1, Release) & COUNT == 1 {
+        if self.gate.state.fetch_sub(1, Release) & COUNT_MASK == 1 {
             self.gate.drained.notify_waiters();
         }
     }
