@@ -30,8 +30,8 @@ struct ReleaseGate {
 pub(crate) struct ParkedRead(Arc<ReleaseGate>);
 
 impl ParkedRead {
-    /// Releases the parked read.
-    pub(crate) fn release(&self) {
+    /// Releases the parked read, consuming the handle: a park is released once.
+    pub(crate) fn release(self) {
         self.0.released.add_permits(1);
     }
 }

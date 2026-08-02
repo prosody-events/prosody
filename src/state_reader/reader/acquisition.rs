@@ -1,7 +1,8 @@
 //! Publication-source acquisition: identity admission, the cached refresh, and
 //! retry pacing.
 //!
-//! [`SnapshotState`] is what one reader remembers between operations, and
+//! [`PublicationSnapshot`] is the collection's published acquisition state,
+//! shared by every reader resolving that collection, and
 //! [`StateReader::snapshot`] is the refresh-if-stale entry point every read
 //! goes through.
 
@@ -129,9 +130,9 @@ enum Published {
 
 impl SnapshotState {
     /// The sources the last refresh acquired, if it acquired any.
-    fn sources(&self) -> Option<Arc<ValidatedPublications>> {
+    fn sources(&self) -> Option<&ValidatedPublications> {
         match &self.acquired {
-            Some(Acquired::Sources(sources)) => Some(sources.clone()),
+            Some(Acquired::Sources(sources)) => Some(sources),
             _ => None,
         }
     }
@@ -185,21 +186,21 @@ where
     /// held sticky until a refresh re-validates it away (see [`Fault`]). A
     /// missing identity skips that source with a `warn!`.
     ///
-    /// A read loads the published state without a lock. A stale read refreshes
-    /// and publishes the result with a compare-and-swap. A caller that loses
-    /// that race adopts the winner's state, so no caller waits for another
-    /// caller's refresh. Every stale caller that starts before a winner
-    /// publishes may issue one routing read.
+    /// Publication follows [`PublicationSnapshot`]'s rule, so no caller waits
+    /// for another caller's refresh: every stale caller that starts before a
+    /// winner publishes may issue one routing read.
     pub(super) async fn snapshot(&self) -> Result<Arc<ValidatedPublications>, StateReaderError> {
-        // The owned handle is held across the refresh, so the observed
-        // allocation stays alive and its address cannot be recycled under the
-        // pointer compare-and-swap that publishes the replacement.
-        let observed = self.publication.0.load_full();
+        // A fresh read only borrows, so it takes the guard instead of a
+        // reference count on the allocation every reader of this collection
+        // shares. A stale read converts it to an owned handle first: that
+        // handle keeps the observed allocation alive across the refresh, so
+        // its address cannot be recycled under the publishing compare-and-swap.
+        let observed = self.publication.0.load();
         let now = self.clock.now();
         if observed.within_pacing(now) || observed.is_fresh(now, self.refresh_interval) {
             return self.serve_state(&observed);
         }
-        self.refresh(&observed, now).await
+        self.refresh(&Guard::into_inner(observed), now).await
     }
 
     /// The outcome a read resolves to for `acquired`.
@@ -231,7 +232,6 @@ where
         observed: &Arc<SnapshotState>,
         now: Instant,
     ) -> Result<Arc<ValidatedPublications>, StateReaderError> {
-        let prior = observed.sources();
         let rows = match self
             .context
             .backend
@@ -263,7 +263,7 @@ where
         let Admission {
             admitted,
             diagnostics,
-        } = match self.admit(&rows, prior.as_deref()).await {
+        } = match self.admit(&rows, observed.sources()).await {
             Ok(admission) => admission,
             // An identity-read failure mid-admit is a transient outage, on the
             // same footing as a failed routing read.

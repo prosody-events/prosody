@@ -6,17 +6,20 @@ use crate::codec::JsonCodec;
 use crate::error::ErrorCategory;
 use crate::state::StateType;
 use crate::state::descriptor::{ValueDescriptor, value_state};
-use crate::state::publication::PublicationStore;
+use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::tests::support::{ParkedRead, ScriptedPublicationStore};
 use crate::state_reader::StateReaderError;
 use crate::state_reader::reader::acquisition::{ABSENT_BACKOFF, REFRESH_BACKOFF};
 use crate::state_reader::tests::support::{GROUP_A, GROUP_B, ScriptedEnv, mock_clock_cache, topic};
+use crate::test_util::capture_events;
 use crate::{Key, Topic};
 use color_eyre::eyre::{Result, bail, eyre};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tracing::Level;
 
 /// The scripted environment every schedule here drives.
 type JsonEnv = ScriptedEnv<ValueDescriptor<JsonCodec>>;
@@ -416,6 +419,69 @@ async fn an_absence_deadline_is_sampled_after_the_read_returns() -> Result<()> {
         env.publications.reads() - before,
         1,
         "the window ends exactly one absent backoff after the read returned"
+    );
+    Ok(())
+}
+
+/// A refresh's admission warnings are emitted once, by the caller that
+/// publishes them.
+///
+/// Both callers observe a group that has frozen no identity, so both record the
+/// diagnostic. Only the winner of the publication may log it: a burst of
+/// speculative refreshers must not multiply the warning.
+///
+/// Falsify: emit the diagnostics before the publication attempt in `acquire`,
+/// or add an emit to the `Lost` arm → the warning is logged twice.
+#[tokio::test(start_paused = true)]
+async fn only_the_publishing_caller_logs_its_admission_warnings() -> Result<()> {
+    let descriptor = value_state::<JsonCodec>("publication-warn-once");
+    let env = ScriptedEnv::new(descriptor)?;
+    let key = Key::from("user-1");
+    // Advertised with no frozen identity, so admission skips the group and
+    // records the missing-identity diagnostic.
+    env.publications
+        .seed(
+            &env.sub,
+            StateType::Application,
+            &env.name,
+            &StatePublication {
+                group_id: Arc::from(GROUP_A),
+                topic: topic(GROUP_A),
+                partition_count: env.count,
+            },
+        )
+        .await;
+
+    let (cache, _mock) = mock_clock_cache(1 << 20);
+    let (parked, other) = env.shared_readers(cache, Duration::ZERO)?;
+    let (warnings, _capture) = capture_events(Level::WARN);
+
+    let parked_key = key.clone();
+    let (task, held) = park(
+        &env.publications,
+        async move { parked.get(parked_key).await },
+    )
+    .await?;
+
+    match timeout(HANG_GUARD, other.get(key))
+        .await
+        .map_err(|_| eyre!("the winner waited for the parked caller's refresh"))?
+    {
+        Err(StateReaderError::IdentityUnavailable { .. }) => {}
+        other => {
+            bail!("a group with no frozen identity must answer IdentityUnavailable, got {other:?}")
+        }
+    }
+
+    held.release();
+    match join(task).await? {
+        Err(StateReaderError::IdentityUnavailable { .. }) => {}
+        other => bail!("the losing caller must adopt the winner's absence, got {other:?}"),
+    }
+    assert_eq!(
+        warnings.count("publication source has no frozen identity yet"),
+        1,
+        "only the winning publication may emit its admission warnings"
     );
     Ok(())
 }
