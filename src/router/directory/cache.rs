@@ -34,16 +34,22 @@ type Inner = Cache<NodeId, Entry, UnitWeighter, ahash::RandomState>;
 /// Node id to registration, read through to the directory.
 ///
 /// Two bounds make it safe to key by something an outsider chooses.
+///
 /// **Capacity** is fixed at construction and `quick_cache` evicts to stay
-/// inside it, so the map cannot grow with traffic; eviction and staleness are
-/// its removal paths. **Age** is this process's own configured
-/// [`RegistrationTtl`], so there is no second TTL to configure wrongly. It
-/// bounds how long an entry is served, never how closely that entry tracks the
-/// row. The stamp is taken when the read is issued, so an entry filled from a
-/// row that was about to expire outlives that row by nearly a whole lease. A
-/// process configured with a longer lease than the writer applies to its row
-/// keeps the entry longer still. The address is then dialed and the response is
-/// dropped, which is what the best-effort posture already accepts.
+/// inside it, so the entries it holds cannot grow with traffic. Eviction and
+/// staleness are their removal paths. The capacity bounds resident entries,
+/// never process RSS: a miss also holds a placeholder, which goes when its fill
+/// inserts or drops. The callers in flight bound the placeholders, so traffic
+/// does not.
+///
+/// **Age** is this process's own configured [`RegistrationTtl`], so there is no
+/// second TTL to configure wrongly. It bounds how long an entry is served,
+/// never how closely that entry tracks the row. The stamp is taken when the
+/// read is issued, so an entry filled from a row that was about to expire
+/// outlives that row by nearly a whole lease. A process configured with a
+/// longer lease than the writer applies to its row keeps the entry longer
+/// still. The address is then dialed and the response is dropped, which is what
+/// the best-effort posture already accepts.
 ///
 /// Its single-flight behaviour is what matters on the response path: every
 /// caller after the first parks on the placeholder until the fill finishes, so
