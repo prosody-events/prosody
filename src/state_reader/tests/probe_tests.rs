@@ -2,18 +2,22 @@
 //! source.
 //!
 //! Selection picks the lowest-`SourceId` source that has data, and skips a
-//! source that errored on open. Data always beats a skipped error. If every
-//! source is empty the read is `None`/empty; if there is no data but some
-//! source errored, the read is `Err`. [`prop_probe_and_pin`] proves all of
-//! this together over random fault scripts, for both the point fan-out
-//! (`get`/`len`) and the pinned scan (`stream`).
+//! source that errored on open. Data always beats a skipped error. An
+//! all-empty source set reads `None` or empty. No data plus at least one
+//! source error reads `Err`. [`prop_probe_and_pin`] proves all of this
+//! together over random fault scripts, for both the point fan-out (`get` and
+//! `len`) and the pinned scan (`stream`).
 //!
-//! The focused tests below cover invariants the script model does not
-//! express: `get_many` batch error precedence, `get_many` single-source
-//! splicing, a mid-stream scan error after a source has pinned, a source-call
-//! trace proving a pinned scan never opens the decoy source, the overlap of two
-//! concurrent reads on one reader, and the session-wide reuse of one selection
-//! across scoped operations.
+//! The focused tests below cover invariants the script model does not express:
+//!
+//! * `get_many` batch error precedence;
+//! * the batch alignment check on the uncached read path;
+//! * `get_many` single-source splicing;
+//! * a mid-stream scan error after a source has pinned;
+//! * a source-call trace that proves a pinned scan never opens the decoy
+//!   source;
+//! * the overlap of two concurrent reads on one reader;
+//! * the session-wide reuse of one selection across scoped operations.
 
 use super::support::{
     FaultPoint, GROUP_A, GROUP_B, ScriptedEnv, collect_stream, source_state_key, topic,
@@ -323,6 +327,43 @@ async fn get_many_error_beats_all_none() -> Result<()> {
     match reader.get_many(key, &[0, 1]).await {
         Err(error) if error.classify_error() == ErrorCategory::Transient => Ok(()),
         other => bail!("expected a Transient store error, got {other:?}"),
+    }
+}
+
+/// A contract-violating source answers a batch read with fewer values than
+/// the batch requested. The uncached batch path checks that alignment in
+/// every build, so the read fails instead of zipping the short buffer into a
+/// truncated, misaligned answer. `CommittedCellSource` is a downstream trait,
+/// so a debug assertion cannot hold this line in a release build.
+///
+/// Falsify: remove the length check from the uncached arm of `cached_batch`.
+/// `get_many` then answers a two-cell batch with one value.
+#[tokio::test]
+async fn short_batch_buffer_fails_the_uncached_read() -> Result<()> {
+    let env = ScriptedEnv::new(map_state::<I64KeyCodec, JsonCodec>("m-short-batch"))?;
+    let key = Key::from("user-1");
+    let tp_a = topic("topic-a");
+
+    env.commit(GROUP_A, tp_a, &key, 1, |h| async move {
+        h.set(0, Value::from("A0"))
+            .await
+            .map_err(|e| eyre!("set: {e}"))
+    })
+    .await?;
+    env.publish(GROUP_A, tp_a).await;
+    // Arm the fault after seeding: `commit` writes through the same source.
+    env.fault(GROUP_A, tp_a, &key, FaultPoint::ShortBatch)?;
+    let reader = env.reader_eager()?;
+
+    match reader.get_many(key, &[0, 1]).await {
+        Err(error) if error.classify_error() == ErrorCategory::Permanent => {
+            assert!(
+                error.to_string().contains("batch read returned 1 values"),
+                "expected the alignment error, got {error}"
+            );
+            Ok(())
+        }
+        other => bail!("expected a Permanent alignment error, got {other:?}"),
     }
 }
 

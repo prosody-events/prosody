@@ -27,14 +27,13 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::cell_key::Direction;
 use crate::state::descriptor::tests::{TestBackend, test_session, test_session_for};
-use crate::state::descriptor::{
-    Registered, STREAM_CHUNK, StateDescriptor, deque_state, map_state, value_state,
-};
+use crate::state::descriptor::{Registered, StateDescriptor, deque_state, map_state, value_state};
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::store::CELL_BATCH;
 use crate::state::tests::support::{CountingCellStore, FixedOracle};
 use crate::state::{EventRef, PartitionBackend, StateKey};
 use crate::test_util::ArbJson;
@@ -1130,7 +1129,7 @@ fn counting_context(registry: CollectionDefRegistry) -> (CountingContext, Counti
 #[tokio::test]
 async fn map_cursor_is_lazy() -> Result<()> {
     // Seed enough entries that a full drain far exceeds one chunk.
-    let entries = STREAM_CHUNK * 3;
+    let entries = CELL_BATCH * 3;
     let mut registry = CollectionDefRegistry::default();
     registry.register(
         &map_state::<Utf8KeyCodec, JsonCodec>(MAP_NAME),
@@ -1160,9 +1159,9 @@ async fn map_cursor_is_lazy() -> Result<()> {
     let reads = counting.lower_reads();
     // One keyset read plus at most one chunk of point reads.
     assert!(
-        reads <= STREAM_CHUNK + 1,
+        reads <= CELL_BATCH + 1,
         "one next() read {reads} cells; expected <= one chunk ({}) plus the keyset",
-        STREAM_CHUNK + 1
+        CELL_BATCH + 1
     );
     assert!(
         reads < entries,

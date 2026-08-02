@@ -8,10 +8,10 @@
 use super::{
     CellCodecError, CellStateError, CellType, CollectionSpec, Descriptor, ResolvedOf, WriteOf,
 };
-use crate::codec::{Codec, JsonCodec};
+use crate::codec::JsonCodec;
 use crate::state::collection::{
     Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE, StateSession,
-    WritableStateSession, collection_layout, collection_methods, same_token,
+    WritableStateSession, collection_layout, collection_methods, same_token, spec_matches,
 };
 use crate::state::order_codec::UnitKey;
 use crate::state::{CollectionKindId, StoreOutcome};
@@ -62,18 +62,8 @@ const _: () = {
         "the default Value cell is durably JSON-encoded"
     );
     assert!(
-        same_token(
-            <<<ValueKind<JsonCodec> as CollectionSpec>::Cell as CellType>::Key as Codec>::FORMAT_ID,
-            families[0].key_format()
-        ),
-        "the spec's cell type addresses the entries family"
-    );
-    assert!(
-        same_token(
-            <<<ValueKind<JsonCodec> as CollectionSpec>::Cell as CellType>::Codec as Codec>::FORMAT_ID,
-            families[0].format()
-        ),
-        "the spec's cell type encodes the entries family"
+        spec_matches::<ValueKind<JsonCodec>>(families[0]),
+        "the spec's cell type addresses and encodes the entries family"
     );
     assert!(
         <ValueKind<JsonCodec> as CollectionLayout>::SECTIONS.len() == 1,
@@ -177,9 +167,8 @@ where
     }
 
     /// Durably commits the staged write mid-handler, so it survives a restart
-    /// after failure. At-least-once; see
-    /// the mid-handler durability section on the
-    /// [`collection`](crate::state::collection) module for the contract.
+    /// after failure. At-least-once; the mid-handler durability section of the
+    /// [`collection`](crate::state::collection) module states the contract.
     ///
     /// # Errors
     ///
@@ -194,9 +183,8 @@ where
 
     /// Discards the staged uncommitted write, reverting reads to the last
     /// [`commit`](Self::commit) — or the pre-event committed value if none.
-    /// Infallible; see
-    /// the mid-handler durability section on the
-    /// [`collection`](crate::state::collection) module for the contract.
+    /// Infallible; the mid-handler durability section of the
+    /// [`collection`](crate::state::collection) module states the contract.
     #[instrument(name = "value.rollback", skip_all, fields(collection = self.cells.name().as_str()))]
     pub async fn rollback(&self) -> StoreOutcome
     where

@@ -73,12 +73,13 @@ enum Staged {
 /// One admitted read invocation, valid only inside the scope that created it.
 ///
 /// The scope lends `&mut ReadOperation` through a higher-ranked closure, so the
-/// operation's borrow lifetime is unnameable by the caller: the operation can
-/// be neither returned from the scope nor stored in a slot declared outside it,
-/// and only owned data crosses the boundary. The type is neither `Clone` nor
-/// `Copy`, and its only constructor acquires engine state and builds the
-/// complete value — there is no API pairing an independently obtained guard,
-/// permit, or inner value with a collection.
+/// caller cannot name the operation's borrow lifetime. The caller can therefore
+/// neither return the operation from the scope nor store it in a slot declared
+/// outside it. Only owned data crosses the boundary.
+///
+/// The type is neither `Clone` nor `Copy`. Its only constructor acquires engine
+/// state and builds the complete value, so no API pairs an independently
+/// obtained guard, permit, or inner value with a collection.
 pub struct ReadOperation<'a, S: StateSession, L> {
     collection: &'a Collection<S, L>,
     inner: <S::Engine as sealed::ReadEngine<S>>::ReadInner<'a>,
@@ -580,8 +581,8 @@ enum Slot {
 
 /// Fills every pending slot from the engine and returns the answers aligned to
 /// `slots` — the journal-aware batch read a write invocation performs, where
-/// only the journal-silent positions reach the engine. Its sub-batches are
-/// issued sequentially for the reason [`read_keys_bytes`] states.
+/// only the journal-silent positions reach the engine. It reads them through
+/// [`read_coordinate_bytes`].
 async fn batched_bytes<S: StateSession>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
@@ -598,20 +599,8 @@ async fn batched_bytes<S: StateSession>(
         })
         .collect();
     let expected = pending.len();
-    let mut answers: CellBuffer<Option<Bytes>> = SmallVec::with_capacity(expected);
-    for batch in CoordinateBatch::chunks(pending) {
-        answers.extend(
-            <S::Engine as sealed::ReadEngine<S>>::read_batch(
-                session, inner, state_type, name, section, &batch,
-            )
-            .await?,
-        );
-    }
-    debug_assert_eq!(
-        answers.len(),
-        expected,
-        "batch read answers every input position"
-    );
+    let answers =
+        read_coordinate_bytes(session, inner, state_type, name, section, pending, expected).await?;
     let mut answers = answers.into_iter();
     Ok(slots
         .into_iter()
@@ -627,9 +616,6 @@ async fn batched_bytes<S: StateSession>(
 /// Reads `keys`' visible committed bytes as one aligned batch — the whole read
 /// a journal-free invocation performs, and the presence-only half a key-scan
 /// chunk needs, with no decode and no resolver.
-///
-/// The lower reads are split into maximal batches and issued **sequentially**:
-/// two repair-capable owner reads over one collection must not overlap.
 ///
 /// # Errors
 ///
@@ -649,7 +635,38 @@ where
     // Mapped as a function item, so the lowering carries no closure whose
     // higher-ranked capture would defeat the future's `Send` proof.
     let coordinates = keys.iter().map(<T::Key as OrderedKeyCodec>::encode);
-    let mut bytes: CellBuffer<Option<Bytes>> = SmallVec::with_capacity(keys.len());
+    read_coordinate_bytes(
+        session,
+        inner,
+        state_type,
+        name,
+        section,
+        coordinates,
+        keys.len(),
+    )
+    .await
+}
+
+/// Reads `coordinates` from the engine and returns the bytes, index-aligned to
+/// the input. `expected` is the coordinate count, known to every caller.
+///
+/// The read is split into maximal batches and the batches are issued
+/// **sequentially**: two repair-capable owner reads over one collection must
+/// not overlap.
+async fn read_coordinate_bytes<S, I>(
+    session: &S,
+    inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
+    state_type: StateType,
+    name: &StateName,
+    section: Section,
+    coordinates: I,
+    expected: usize,
+) -> Result<CellBuffer<Option<Bytes>>, StateAccessError>
+where
+    S: StateSession,
+    I: IntoIterator<Item = Coordinate>,
+{
+    let mut bytes: CellBuffer<Option<Bytes>> = SmallVec::with_capacity(expected);
     for batch in CoordinateBatch::chunks(coordinates) {
         bytes.extend(
             <S::Engine as sealed::ReadEngine<S>>::read_batch(
@@ -660,7 +677,7 @@ where
     }
     debug_assert_eq!(
         bytes.len(),
-        keys.len(),
+        expected,
         "batch read answers every input position"
     );
     Ok(bytes)

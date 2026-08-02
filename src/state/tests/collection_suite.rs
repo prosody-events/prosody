@@ -1992,17 +1992,18 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
     Ok(())
 }
 
-/// Map clear, pinned at the physical grain the `BTreeMap` model cannot reach: a
-/// committed `clear()` erases the keyset cell with the entries, so the
-/// absent-keyset ⇒ empty-map reading (`KeysetPresence`) survives a cleared map,
-/// and a later set repopulates a fresh single-key `Tracked` keyset (clear
-/// resets the tracking, not just the entries — not a stale pre-clear list).
+/// Map clear, pinned at the physical grain the `BTreeMap` model cannot reach. A
+/// committed `clear()` erases the keyset cell with the entries. The
+/// absent-keyset ⇒ empty-map reading (`KeysetPresence`) therefore survives a
+/// cleared map. A later set repopulates a fresh single-key `Tracked` keyset:
+/// clear resets the tracking, not just the entries, so no stale pre-clear list
+/// remains.
 ///
-/// It also pins the reset's **scope**: directly-seeded cells at BOTH retired
-/// meta coordinates `[0]` and `[1]` — legacy rows from the removed min/max
-/// bounds design, unreachable through any handle method — are erased too,
-/// because `clear()` is one whole-layout reset over the declared sections
-/// rather than a point clear of the keyset cell.
+/// It also pins the reset's **scope**. Directly-seeded cells at BOTH retired
+/// meta coordinates `[0]` and `[1]` are erased too. Those are legacy rows from
+/// the removed min/max bounds design, and no handle method reaches them.
+/// `clear()` erases them because it is one whole-layout reset over the declared
+/// sections, not a point clear of the keyset cell.
 #[test]
 fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
     use crate::state::cell_key::{CellKey, Coordinate};

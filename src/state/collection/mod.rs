@@ -28,74 +28,38 @@
 //!
 //! # Mid-handler durability
 //!
-//! Every collection handle exposes `commit()` and `rollback()` — Value, Map,
-//! and Deque all do, and future collection kinds must too. This is their one
-//! contract; the handles' docs link back here.
+//! Every collection handle exposes `commit()` and `rollback()`. Value, Map, and
+//! Deque all do, and every future collection kind must too. The contract stays
+//! here rather than on `Collection::commit` and `Collection::rollback`: those
+//! two are `pub(crate)`, so the public handle docs cannot link to them.
 //!
 //! `commit()` durably commits the collection's buffered changes mid-handler, so
-//! they survive a restart after failure. This is why it exists: a complex or
-//! large handler (a materialization handler fanning one message into thousands
-//! of writes) commits incremental progress and resumes from it on retry or
-//! redelivery instead of starting from scratch. Handler idempotence across the
-//! resume is the contract.
+//! they survive a restart after failure. A large or complex handler keeps
+//! incremental progress with it. It writes every currently-buffered op straight
+//! to committed state and drops it from the dirty buffer, so a multi-cell kind
+//! commits data and bookkeeping together. Handler idempotence across the resume
+//! is the contract.
 //!
-//! Every currently-buffered op of the collection is written straight to
-//! committed state (`write_resolved`) and dropped from the dirty buffer, so
-//! multi-cell kinds commit data and bookkeeping together (a Map's entries and
-//! keyset, a Deque's entries and window bounds). Within the batch budget those
-//! cells ride one atomic same-partition batch; an over-budget commit splits
-//! into the fewest fitting batches. `write_resolved` is marker-free, so a
-//! crash mid-split can leave a torn committed write the store cannot
-//! reconstruct — the over-budget residual on the collection-grain atomicity
-//! invariant, stated in the `store` module. Only the idempotent handler re-run
-//! repairs it, by re-issuing the same ops. The
-//! guarantee is **at-least-once**: a `commit()`-landed write is durable and
-//! visible immediately — never provisional, never listed in any event marker,
-//! never rolled back (the bottom store resolves any standing clears-bearing
-//! marker before the write lands — the write-side committed-unapplied window on
-//! `write_resolved` — ordering the write after that resolution so a stale
-//! clear's replay cannot erase it, subject to the concurrent-resolver residual
-//! noted there). Ops buffered *after* the commit ride the collection's normal
-//! stage→settle path; reads already see buffered writes without committing.
-//!
-//! **Orthogonal to [`CommitMode`](crate::state::CommitMode):** the mode governs
-//! how *un-committed* writes settle at the event boundary — staged
-//! provisionally for `ReadCommitted` (external readers observe committed values
-//! only after the event commits), applied immediately for `ReadUncommitted`.
-//! `commit()` bypasses that staging entirely: a `commit()`-landed write on a
-//! `ReadCommitted` collection is externally visible at once and survives an
+//! The guarantee is **at-least-once**. A committed write is durable and visible
+//! at once, and no rollback reaches it. Ops buffered *after* the commit ride
+//! the normal stage→settle path. This is **orthogonal to
+//! [`CommitMode`](crate::state::CommitMode)**, which governs only how
+//! *un-committed* writes settle at the event boundary. A committed write on a
+//! `ReadCommitted` collection is externally visible at once, and it survives an
 //! event abort.
 //!
-//! `rollback()` discards the collection's buffered uncommitted ops mid-handler
-//! — cells *and* dirty clear markers — reverting reads to the last `commit()`,
-//! or the pre-event committed value if none. It is `commit()` minus the durable
-//! write: the same whole-collection drain, to nothing.
-//!
-//! **It cannot cross a `commit()` floor.** A `commit()`-landed row is durable
-//! and unreachable by rollback — only ops buffered since the last `commit()`
-//! are discarded.
-//!
-//! `rollback()` is async because it joins the session operation gate: a buffer
-//! drain racing `commit()`'s snapshot→write→drain could otherwise persist a
-//! partial set no serial order explains. It is still infallible: it touches
-//! only the in-memory dirty buffer and cannot fail. A terminated session
-//! (partition shutting down, or the event cancelled) and a **closed** session
-//! (the settle boundary already snapshotted it) both discard nothing and return
-//! [`StoreOutcome::NoOp`] — the containment every other command gets from the
-//! live guard and the gate's closure check, expressed as a `NoOp` because the
-//! infallible signature cannot surface an error. It keeps a stale clone that
-//! outlived its event from draining a later same-key event's buffer.
-//!
-//! This is distinct from the settle boundary's rollback of staged provisional
-//! cells (framework-only, after the handler returns): this is the
-//! handler-facing mid-flight discard.
+//! `rollback()` discards the collection's buffered uncommitted ops — cells and
+//! dirty clear markers alike. Reads revert to the last `commit()`, or to the
+//! pre-event committed value if there was none. **It cannot cross a `commit()`
+//! floor.** The settle boundary also rolls back staged provisional cells, but
+//! that is a different, framework-only step after the handler returns.
 
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::{CellKey, Scan, Section};
 use crate::state::descriptor::{
-    CellCodecError, CellResolver, CellStateError, CellType, ContextOf, FromSession, KeyOf,
-    ResolvedOf, StructuralIdentity, WriteOf,
+    CellCodecError, CellResolver, CellStateError, CellType, CollectionSpec, ContextOf, FromSession,
+    KeyOf, ResolvedOf, StructuralIdentity, WriteOf,
 };
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::registry::CollectionDef;
@@ -120,19 +84,21 @@ pub(crate) use operation::{
     JOURNAL_INLINE, Mutation, MutationJournal, ReadOperation, WriteOperation,
 };
 pub(crate) use prosody_macros::{collection_layout, collection_methods};
-pub(crate) use stream::{CoordinatePlan, KeyItem, RangePlan, ScanItem};
+pub(crate) use stream::{CoordinatePlan, Plan, RangePlan};
 
 /// Framework-internal engine authority: admission, the raw byte reads,
 /// mutation replay, and the mid-handler durable pair.
 ///
-/// These traits are `pub` only so the public session bounds above them do not
-/// trip `private_bounds`; the module's own `pub(crate)` visibility is the seal.
-/// Downstream code can project and bound `S::Engine`, but cannot name the
-/// traits, so their associated functions are uncallable and no outside type can
-/// claim to have acquired owner admission. Putting callable commands on a
-/// private *supertrait* of a public trait would not seal them — Rust permits
-/// those calls through the public subtrait — so every command carrying
-/// authority lives one layer below anything a caller can name.
+/// These traits carry `pub` only to keep the public session bounds above them
+/// from tripping `private_bounds`. The module's own `pub(crate)` visibility is
+/// the seal. Downstream code can project and bound `S::Engine`, but it cannot
+/// name the traits. Their associated functions are therefore uncallable, and no
+/// outside type can claim to have acquired owner admission.
+///
+/// A private *supertrait* of a public trait would not seal a callable command,
+/// because Rust permits that call through the public subtrait. Every command
+/// that carries authority therefore lives one layer below anything a caller can
+/// name.
 pub(crate) mod sealed {
     use super::{
         Bytes, CellBuffer, CellKey, CollectionDef, CoordinateBatch, MutationJournal, Scan, Section,
@@ -424,6 +390,19 @@ pub(crate) const fn same_token(left: &str, right: &str) -> bool {
     true
 }
 
+/// True when `S`'s cell type both addresses and encodes `entry`. Every
+/// collection's frozen-layout block asserts this over its entries family, so
+/// the spec's `Cell` can never drift from the family it declares.
+pub(crate) const fn spec_matches<S: CollectionSpec>(entry: LayoutEntry) -> bool {
+    same_token(
+        <<S::Cell as CellType>::Key as Codec>::FORMAT_ID,
+        entry.key_format(),
+    ) && same_token(
+        <<S::Cell as CellType>::Codec as Codec>::FORMAT_ID,
+        entry.format(),
+    )
+}
+
 /// A declared cell family: the layout it belongs to, the durable section it
 /// addresses, and the cell type it stores.
 ///
@@ -583,7 +562,18 @@ impl<S: WritableStateSession, L> Collection<S, L> {
         Ok(value)
     }
 
-    /// Durably commits this collection's buffered changes mid-handler.
+    /// Durably commits this collection's buffered changes mid-handler. The
+    /// module's mid-handler durability section states the contract.
+    ///
+    /// Within the batch budget the drained cells ride one atomic
+    /// same-partition batch. An over-budget commit splits into the fewest
+    /// batches that fit. The write is marker-free, so a crash mid-split can
+    /// leave a torn committed write that the store cannot reconstruct. That is
+    /// the over-budget residual on the collection-grain atomicity invariant,
+    /// stated in the [`store`](crate::state::store) module. Only the idempotent
+    /// handler re-run repairs it, by re-issuing the same ops. The bottom store
+    /// resolves any standing clears-bearing marker before the write lands, so a
+    /// stale clear's replay cannot erase it.
     ///
     /// # Errors
     ///
@@ -593,7 +583,24 @@ impl<S: WritableStateSession, L> Collection<S, L> {
             .await
     }
 
-    /// Discards this collection's buffered changes mid-handler.
+    /// Discards this collection's buffered uncommitted ops mid-handler. It is
+    /// [`commit`](Self::commit) minus the durable write: the same
+    /// whole-collection drain, to nothing. The module's mid-handler durability
+    /// section states the contract.
+    ///
+    /// It is async because it joins the session operation gate. A buffer drain
+    /// that raced the commit's snapshot→write→drain could otherwise persist a
+    /// partial set that no serial order explains.
+    ///
+    /// It is still infallible, because it touches only the in-memory dirty
+    /// buffer. Two sessions discard nothing and return
+    /// [`StoreOutcome::NoOp`]: a terminated one (the partition shuts down, or
+    /// the event is cancelled) and a **closed** one (the settle boundary
+    /// already snapshotted it). That is the containment every other command
+    /// gets from the live guard and the gate's closure check. The infallible
+    /// signature cannot surface an error, so it reads as a `NoOp`. It stops a
+    /// stale clone that outlived its event from draining a later same-key
+    /// event's buffer.
     pub(crate) async fn rollback(&self) -> StoreOutcome {
         <S::Engine as sealed::WriteEngine<S>>::rollback(&self.session, self.state_type, &self.name)
             .await

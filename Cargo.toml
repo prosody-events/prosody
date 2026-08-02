@@ -1,4 +1,8 @@
 [workspace]
+# `default-members` makes bare `cargo clippy`, `cargo doc`, and `cargo nextest
+# run` cover the macro crate. Without it, cargo builds and tests only the root
+# package, so the member ships ungated.
+default-members = [".", "crates/prosody-macros"]
 members = ["crates/prosody-macros"]
 resolver = "3"
 

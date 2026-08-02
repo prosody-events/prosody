@@ -144,6 +144,10 @@ where
                 true
             } else {
                 match reads.next() {
+                    // A failed identity read discards the diagnostics recorded
+                    // for the earlier groups. The refresh outage warning covers
+                    // the failure, and the next successful refresh observes the
+                    // same diagnostics again.
                     Some(stored) => {
                         classify_identity(stored?, group, &asserted, &mut admission.diagnostics)
                     }

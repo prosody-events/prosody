@@ -2,11 +2,13 @@
 //! call.
 //!
 //! Its whole invocation state is that call's own source selection, seeded from
-//! and published back to the session-shared [`PinnedSource`], so two
-//! invocations on one session never disagree about which source answers. An
-//! invocation that never selected one falls back to the shared cell before it
-//! will probe. Two operations on one reader otherwise share nothing and overlap
-//! freely.
+//! and published back to the session-shared [`PinnedSource`]. Each invocation
+//! is internally coherent: it answers from one source. After a selection is
+//! published, every later invocation adopts it. Two invocations that both start
+//! unselected can each probe and can each answer from a different source,
+//! because only one of them wins the publication. An invocation that never
+//! selected a source falls back to the shared cell before it will probe. Two
+//! operations on one reader otherwise share nothing and overlap freely.
 //!
 //! There is deliberately **no** [`WriteEngine`](sealed::WriteEngine) impl here:
 //! the write scope exists only for a session whose engine has one, so a reader

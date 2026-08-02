@@ -18,7 +18,6 @@
 //! successful store result into an error.
 
 use crate::Key;
-use crate::error::ErrorCategory;
 use crate::state::access::StateAccessError;
 use crate::state::cell_key::CellKey;
 use crate::state::store::CellBuffer;
@@ -210,19 +209,10 @@ impl ReaderCache {
         // One shared issue time for the whole batch fill.
         let issued = self.clock.now();
         let fresh = fill().await?;
-        // The store's batch read returns values index-aligned to `keys`. Check
-        // that alignment here in every build, not just a debug assert. A shorter
-        // fill would `zip` to a truncated, misaligned result. An overlong one
-        // would cache only a prefix. Surface either as a store error instead.
+        // Check the fill alignment in every build, not just a debug assert:
+        // a misaligned fill would cache values under the wrong keys.
         if fresh.len() != keys.len() {
-            return Err(StateAccessError::Store {
-                message: format!(
-                    "batch fill returned {} values for {} keys",
-                    fresh.len(),
-                    keys.len()
-                ),
-                category: ErrorCategory::Permanent,
-            });
+            return Err(StateAccessError::misaligned_batch(fresh.len(), keys.len()));
         }
         for (key, value) in keys.iter().zip(fresh.iter()) {
             cooperative(self.write_through(key, issued, value.clone())).await;

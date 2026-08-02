@@ -169,24 +169,26 @@ pub(crate) mod sealed {
     /// deadlock the KV4 pins would surface as a hang.
     ///
     /// **Streams hold the gate only per chunk (`StreamYieldFree`).** A
-    /// point-get stream (a sub-threshold deque window, or a `Tracked` map
-    /// keyset within its bound) takes the gate for its init metadata read
-    /// (the map keyset cell / the deque window cell), releases it, then
-    /// fetches the listed entries in gate-scoped chunks — one permit per
-    /// chunk, ONE batch read each (only the init metadata read stays a point
-    /// read). Each chunk is fetched, decoded, and resolved under that one
-    /// permit, which is dropped with the
-    /// chunk future's scope before any of the chunk's items reach user code, so
-    /// the permit is **never held across a yield to user code (items and errors
-    /// alike)**. A *scan-path* stream takes the gate only for its init metadata
-    /// read and is per-item live thereafter — and its per-item resolution is a
-    /// pure **read** (a scan never writes a resolution back durably; the
-    /// point-read / first-touch / recovery-sweep paths own repair),
-    /// so a concurrent mid-stream `commit()` on a scanned cell is never
-    /// clobbered. A mutator racing a live stream (`join!`, or a handler
-    /// mutating its own collection between stream items) therefore waits at
-    /// most one chunk fetch+resolve — never a whole materialization — and
-    /// settle's closure acquire queues FIFO the same way.
+    /// point-get stream covers a sub-threshold deque window, or a `Tracked` map
+    /// keyset within its bound. It takes the gate for its init metadata read
+    /// (the map keyset cell, or the deque window cell) and releases it. It then
+    /// fetches the listed entries in gate-scoped chunks: one permit per chunk,
+    /// and ONE batch read each. Only the init metadata read stays a point read.
+    /// One permit covers a chunk's fetch, decode, and resolve. The chunk
+    /// future's scope drops that permit before any of the chunk's items reach
+    /// user code. The permit is therefore **never held across a yield to user
+    /// code, for items and errors alike**.
+    ///
+    /// A *scan-path* stream takes the gate only for its init metadata read, and
+    /// is per-item live thereafter. Its per-item resolution is a pure **read**:
+    /// a scan never writes a resolution back durably, because the point-read,
+    /// first-touch, and recovery-sweep paths own repair. A concurrent
+    /// mid-stream `commit()` on a scanned cell is therefore never clobbered.
+    ///
+    /// A mutator that races a live stream (`join!`, or a handler that mutates
+    /// its own collection between stream items) waits at most one chunk fetch
+    /// and resolve, never a whole materialization. Settle's closure acquire
+    /// queues FIFO the same way.
     ///
     /// **The gate also closes the session lifecycle**: settle acquires it once
     /// via [`close`](Self::close) and marks the session `Closed`, holding
@@ -216,11 +218,11 @@ pub(crate) mod sealed {
     /// attempts the gate is Open (closure happens only at settle), so a leaked
     /// clone's `set` landing after an attempt boundary would once have joined
     /// the NEXT attempt's transaction. The attempt boundary
-    /// ([`StateLifecycle::reset`]) bumps the
-    /// session epoch under this gate, and a detached clone keeps its stale pin,
-    /// so the leak errors at the point its op takes effect — uniformly across
-    /// the whole surface (`Terminated` on a crossed attempt boundary,
-    /// `SessionClosed` in the post-settle hook window):
+    /// ([`StateLifecycle::reset`]) bumps the session epoch under this gate. A
+    /// detached clone keeps its stale pin. The leak therefore errors at the
+    /// point its op takes effect. This holds uniformly across the whole
+    /// surface: `Terminated` on a crossed attempt boundary, and
+    /// `SessionClosed` in the post-settle hook window. Three seams enforce it:
     ///
     /// * **handle ops** (`get`/`set`/`clear`/…) — the pin compare in
     ///   `ensure_live` / `mutate_permit`'s ordered admission;

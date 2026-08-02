@@ -86,6 +86,17 @@ impl StateAccessError {
         }
     }
 
+    /// Reports a batch read whose buffer is not index-aligned to the requested
+    /// coordinates. Callers zip the two together, so a short buffer truncates
+    /// and misaligns the result, and a long one carries values nobody
+    /// requested. Both break the store contract, so the category is permanent.
+    pub(crate) fn misaligned_batch(returned: usize, requested: usize) -> Self {
+        Self::Store {
+            message: format!("batch read returned {returned} values for {requested} coordinates"),
+            category: ErrorCategory::Permanent,
+        }
+    }
+
     /// Type-erases a loader error into [`Self::Load`], capturing its
     /// classification.
     pub(crate) fn load<E>(error: &E) -> Self

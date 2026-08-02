@@ -80,7 +80,6 @@ use crate::state::collection::sealed_spec::SealedSpec;
 use crate::state::collection::{Collection, StateSession};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::registry::{CollectionDef, ReadCachePolicy, StateVisibility};
-use crate::state::store::CELL_BATCH;
 use crate::state::{CollectionKindId, CommitMode, StateType};
 use crate::timers::duration::CompactDuration;
 use educe::Educe;
@@ -97,21 +96,6 @@ mod value;
 pub use deque::{DequeDescriptor, DequeHandle, DequeStateError, deque_state};
 pub use map::{MapDescriptor, MapHandle, MapStateError, map_state};
 pub use value::{ValueDescriptor, ValueHandle, ValueKind, value_state};
-
-/// The point-get streams' chunk width: the granularity of both the per-chunk
-/// admission and the batch read — each chunk's cells are fetched by ONE aligned
-/// batch read (one Cassandra query / one fjall hop), whose typed resolves then
-/// fan out under `RESOLVE_FANOUT`. Admission covers that raw batch read only:
-/// the owner takes one per chunk and releases it before the chunk's resolves,
-/// and a published reader holds no gate at all. The managed coordinate stream
-/// driver owns this width, and every collection's point-get stream arm runs on
-/// that driver.
-///
-/// An alias of [`CELL_BATCH`] — the point-get
-/// stream chunk width and the store batch-read width are one number, and the
-/// `> 0` invariant every stream-unfold chunk source relies on (a chunk must
-/// take ≥ 1 key, or the unfold spins) is enforced once on `CELL_BATCH`.
-pub(crate) const STREAM_CHUNK: usize = CELL_BATCH;
 
 /// A resolver: how a decoded cell (`Stored`) maps to and from the value a
 /// handle exposes (`Resolved`/`Write`).

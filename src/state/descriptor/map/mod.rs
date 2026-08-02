@@ -39,18 +39,18 @@
 //! A `Tracked` keyset stores its keys sorted by their order-preserving
 //! coordinate, so iteration is key order in both directions with no read-time
 //! sort. A `set` that would push a `Tracked` frame past the registered
-//! `keyset_limit` (or past the module's encoded-byte ceiling) writes the
-//! one-way `Overflowed` sentinel — until `clear` or TTL death of the whole
-//! map — and iteration falls back to the full-section (`Unbounded`-edged)
-//! scan — as does a frame a *lowered* `keyset_limit` left above the new bound,
-//! until removals shrink it back under. The bound is the **live distinct-key
-//! count**: because `remove`
-//! subtracts, a rotating map whose live size stays under the limit keeps cached
-//! iteration forever (and a `remove` that drops a `Tracked` frame back under
-//! the limit heals it — removal heals). A map that ever exceeds the limit in
-//! one incarnation overflows permanently (scan-rebuild re-entry from
-//! `Overflowed` is deliberately not implemented; it needs `clear` or TTL death
-//! to recover).
+//! `keyset_limit`, or past the module's encoded-byte ceiling, writes the
+//! one-way `Overflowed` sentinel instead. Iteration then falls back to the
+//! full-section (`Unbounded`-edged) scan until `clear`, or until the whole map
+//! dies of TTL. A frame that a *lowered* `keyset_limit` left above the new
+//! bound degrades the same way, until removals shrink it back under.
+//!
+//! The bound is the **live distinct-key count**. Because `remove` subtracts, a
+//! rotating map whose live size stays under the limit keeps cached iteration
+//! forever, and a `remove` that drops a `Tracked` frame back under the limit
+//! heals it. Removal heals. A map that ever exceeds the limit in one
+//! incarnation overflows permanently: scan-rebuild re-entry from `Overflowed`
+//! is deliberately not implemented, so recovery needs `clear` or TTL death.
 //!
 //! The keyset is an optimization cell, so a malformed or oversized stored frame
 //! **degrades** iteration to the full-section scan (with a warning) and is
@@ -79,16 +79,15 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::CellKey;
 use crate::state::cell_key::{Coordinate, Direction};
 use crate::state::collection::{
-    Collection, CollectionLayout, CollectionRead, CollectionWrite, CoordinatePlan, JOURNAL_INLINE,
-    KeyItem, RangePlan, ScanItem, StateSession, WritableStateSession, collection_layout,
-    collection_methods, same_token,
+    Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE, Plan,
+    StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
+    spec_matches,
 };
 use crate::state::order_codec::{I64KeyCodec, KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
 use async_stream::try_stream;
 use bytes::Bytes;
 use educe::Educe;
-use futures::future::Either;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::fmt::Display;
@@ -157,18 +156,8 @@ const _: () = {
         "Map's entries family is durably section 1"
     );
     assert!(
-        same_token(
-            <<<FrozenLayout as CollectionSpec>::Cell as CellType>::Key as Codec>::FORMAT_ID,
-            families[1].key_format()
-        ),
-        "the spec's cell type addresses the entries family"
-    );
-    assert!(
-        same_token(
-            <<<FrozenLayout as CollectionSpec>::Cell as CellType>::Codec as Codec>::FORMAT_ID,
-            families[1].format()
-        ),
-        "the spec's cell type encodes the entries family"
+        spec_matches::<FrozenLayout>(families[1]),
+        "the spec's cell type addresses and encodes the entries family"
     );
     assert!(
         <FrozenLayout as CollectionLayout>::SECTIONS.len() == 2,
@@ -266,20 +255,20 @@ impl Codec for MapKeysetKey {
 ///
 /// A **live entry cell implies a present keyset cell** — equivalently, an
 /// absent keyset implies no live entries, so `stream` may return empty with
-/// zero entry reads (an empty [`Tracked`](MapPlan::Tracked) plan — zero
+/// zero entry reads (an empty [`Points`](Plan::Points) plan — zero
 /// coordinates, so no point gets and no scan). Three rules hold it:
 ///
-/// * every `set` leaves a keyset cell present — writing one whenever the
-///   pre-write read is `Absent`/`Malformed` or the frame must change, staged
-///   with its entry write in one collection-grain store write, and relying on
-///   the already-present cell otherwise. At the settle boundary that write is
-///   provisional under one recovery marker, so it is recoverable whatever the
-///   batching; mid-handler [`commit`](MapHandle::commit) writes them resolved
-///   and marker-free — one atomic batch within the batch budget, but an
-///   over-budget commit can crash mid-split and strand an entry ahead of its
-///   keyset (the collection-grain over-budget residual on
-///   [`CellStore`](crate::state::store::CellStore), reconstructed only by the
-///   idempotent handler re-run, never by the store);
+/// * every `set` leaves a keyset cell present. It writes one whenever the
+///   pre-write read is `Absent` or `Malformed`, or whenever the frame must
+///   change, staged with its entry write in one collection-grain store write.
+///   Otherwise it relies on the already-present cell. At the settle boundary
+///   that write is provisional under one recovery marker, so it is recoverable
+///   whatever the batching. A mid-handler [`commit`](MapHandle::commit) writes
+///   them resolved and marker-free, in one atomic batch within the batch
+///   budget. An over-budget commit can crash mid-split and strand an entry
+///   ahead of its keyset. That is the collection-grain over-budget residual on
+///   [`CellStore`](crate::state::store::CellStore): only the idempotent handler
+///   re-run reconstructs it, never the store;
 /// * [`clear`](MapHandle::clear) erases the whole layout, keyset included;
 /// * on a TTL'd map every `set` refreshes the keyset (above), so it expires no
 ///   earlier than the newest entry.
@@ -355,49 +344,6 @@ enum PriorKeyset {
 
     /// The stored frame did not decode — degrade reads, heal on the next `set`.
     Malformed,
-}
-
-/// The arm [`MapHandle::stream`] takes, as the owned plan its planning
-/// invocation captured: point-get the tracked keys' entries (in `dir` order),
-/// or degrade to the full-section scan. An absent keyset
-/// (⇒ [`KeysetPresence`](Keyset) ⇒ no live entries) arrives here as an empty
-/// [`Tracked`](Self::Tracked) plan — zero coordinates, so zero point gets and
-/// no scan, and its exhaustion still passes the stream fence.
-enum MapPlan<S: StateSession, KC: OrderedKeyCodec, V: CellType<Key = UnitKey>> {
-    /// Point-get each listed key (already reversed for a backward stream).
-    Tracked(CoordinatePlan<S, Keyed<KC, V>>),
-
-    /// Degrade to the full-section (`Unbounded`-edged) scan. Nothing anchors
-    /// its edges, so it may cross a one-time tombstone wave left by an earlier
-    /// incarnation, and it gets faster as those rows compact.
-    Scan(RangePlan<S, Keyed<KC, V>>),
-}
-
-impl<S, KC, V> MapPlan<S, KC, V>
-where
-    S: StateSession,
-    KC: OrderedKeyCodec,
-    V: CellType<Key = UnitKey>,
-{
-    /// Drives the planned arm, resolving each live entry.
-    fn entries(self) -> impl Stream<Item = ScanItem<Keyed<KC, V>>> + Send
-    where
-        for<'s> ContextOf<'s, V>: FromSession<'s, S>,
-    {
-        match self {
-            Self::Tracked(plan) => Either::Left(plan.entries()),
-            Self::Scan(plan) => Either::Right(plan.entries()),
-        }
-    }
-
-    /// Drives the planned arm presence-only, yielding keys and never touching a
-    /// value.
-    fn keys(self) -> impl Stream<Item = KeyItem<Keyed<KC, V>>> + Send {
-        match self {
-            Self::Tracked(plan) => Either::Left(plan.keys()),
-            Self::Scan(plan) => Either::Right(plan.keys()),
-        }
-    }
 }
 
 /// One item [`MapHandle::stream`] yields: a decoded key paired with its
@@ -623,33 +569,39 @@ where
         Ok(())
     }
 
-    /// Reads the keyset cell and captures the stream's arm as an owned plan: an
-    /// **absent** keyset means no live entries ([`KeysetPresence`](Keyset)), so
-    /// the stream takes an empty [`Tracked`](MapPlan::Tracked) plan — zero
-    /// coordinates, so zero point gets and no scan; a `Tracked` keyset within
-    /// the registered limit and byte ceiling whose every coordinate decodes to
-    /// a canonical key becomes the chunked point-get arm (keys in `dir` order);
-    /// anything else — `Overflowed`, malformed, oversized, or a coordinate that
-    /// fails to decode or re-encode — degrades to the full-section scan (with a
-    /// warning on the degradations that are not simply overflowed). A
-    /// keyset-read access error propagates; it never silently degrades.
+    /// Reads the keyset cell and captures the stream's arm as an owned plan.
+    ///
+    /// An **absent** keyset means no live entries
+    /// ([`KeysetPresence`](Keyset)). The stream then takes an empty
+    /// [`Points`](Plan::Points) plan: zero coordinates, so zero point gets and
+    /// no scan.
+    ///
+    /// A `Tracked` keyset becomes the chunked point-get arm, with the keys in
+    /// `dir` order. It must sit within the registered limit and the byte
+    /// ceiling, and every coordinate must decode to a canonical key.
+    ///
+    /// Anything else degrades to the full-section scan: `Overflowed`,
+    /// malformed, oversized, or a coordinate that fails to decode or re-encode.
+    /// Each degradation that is not simply overflowed also warns.
+    ///
+    /// A keyset-read access error propagates. It never silently degrades.
     #[read(op)]
     async fn stream_plan(
         &self,
         dir: Direction,
-    ) -> Result<MapPlan<S, KC, V>, MapStateError<CellCodecError<V>>> {
+    ) -> Result<Plan<S, Keyed<KC, V>>, MapStateError<CellCodecError<V>>> {
         let coordinates = match read_keyset_state(op).await? {
             // Absent ⇒ no live entries: an empty tracked plan — zero
             // coordinates, so zero point gets and no scan.
             PriorKeyset::Absent => {
-                return Ok(MapPlan::Tracked(
+                return Ok(Plan::Points(
                     op.coordinates(MapKind::<KC, V>::ENTRIES, Vec::new()),
                 ));
             }
             // Overflowed falls to the scan with no warning; Malformed already
             // warned in `read_keyset_state`.
             PriorKeyset::Malformed | PriorKeyset::Decoded(Keyset::Overflowed) => {
-                return Ok(MapPlan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
+                return Ok(Plan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
             }
             PriorKeyset::Decoded(Keyset::Tracked(coordinates)) => coordinates,
         };
@@ -659,7 +611,7 @@ where
                 "map keyset frame is oversized for the registered limit; degrading to the \
                  full-section scan until the next set heals it"
             );
-            return Ok(MapPlan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
+            return Ok(Plan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
         }
         let Some(mut keys) = decoded_key_list::<KC>(&coordinates) else {
             warn!(
@@ -667,14 +619,14 @@ where
                 "map keyset holds a coordinate that is not canonical for its key codec; degrading \
                  to the full-section scan until the next set heals it"
             );
-            return Ok(MapPlan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
+            return Ok(Plan::Scan(op.range(MapKind::<KC, V>::ENTRIES, dir)));
         };
         // Coordinates are stored strictly ascending, so forward is key order
         // and backward is its reverse — no read-time sort.
         if dir == Direction::Backward {
             keys.reverse();
         }
-        Ok(MapPlan::Tracked(
+        Ok(Plan::Points(
             op.coordinates(MapKind::<KC, V>::ENTRIES, keys),
         ))
     }
@@ -687,23 +639,27 @@ where
     ///
     /// A `Tracked` keyset within its bound is the fast arm: **key membership is
     /// snapshotted at init** (the one keyset read), then the listed keys are
-    /// point-got in chunks of `STREAM_CHUNK`. Keys added after init are not
+    /// point-got in chunks of `CELL_BATCH`. Keys added after init are not
     /// yielded; **values are read live, chunk by chunk** — a key
     /// removed/cleared/expired after init reads absent (skipped, the
     /// current-membership skip) and an overwritten key yields the newer value
     /// when its chunk is fetched. So a warm small map streams entirely from
-    /// cache with zero durable scans. An `Overflowed`, malformed, oversized, or
-    /// otherwise undecodable keyset degrades to a **full-section**
-    /// (`Unbounded`-edged) scan: live pages (own dirty writes snapshotted at
-    /// init, the durable leg lazily), hides cleared cells, and can observe
-    /// entries the handler itself mid-handler-commits ahead of the cursor (it
-    /// terminates because a finite handler inserts finitely many coordinates
-    /// ahead — a visibility semantic, not a termination hazard). An **absent**
-    /// keyset means no live entries (the current-membership invariant), so the
-    /// stream yields nothing with zero entry reads (no scan).
+    /// cache with zero durable scans.
+    ///
+    /// An `Overflowed`, malformed, oversized, or otherwise undecodable keyset
+    /// degrades to a **full-section** (`Unbounded`-edged) scan. That scan pages
+    /// live: it snapshots the own dirty writes at init and reads the durable
+    /// leg lazily. It hides cleared cells. It can also observe entries the
+    /// handler itself mid-handler-commits ahead of the cursor. It still
+    /// terminates, because a finite handler inserts finitely many coordinates
+    /// ahead. That is a visibility semantic, not a termination hazard.
+    ///
+    /// An **absent** keyset means no live entries (the current-membership
+    /// invariant), so the stream yields nothing with zero entry reads and no
+    /// scan.
     ///
     /// Session admission is taken at init for the keyset read. The tracked
-    /// (point) arm then takes it once per chunk, at most `STREAM_CHUNK` point
+    /// (point) arm then takes it once per chunk, at most `CELL_BATCH` point
     /// reads each: a chunk's admission covers its batch fetch, and is released
     /// before the chunk is decoded and resolved. The degraded scan arm takes no
     /// admission after init and pages gate-free. Neither arm holds admission
@@ -769,9 +725,8 @@ where
     }
 
     /// Durably commits this map's buffered ops mid-handler — entries and keyset
-    /// together. At-least-once; see
-    /// the mid-handler durability section on the
-    /// [`collection`](crate::state::collection) module for the contract,
+    /// together. At-least-once; the mid-handler durability section of the
+    /// [`collection`](crate::state::collection) module states the contract,
     /// including the over-budget batch split.
     ///
     /// # Errors
@@ -792,9 +747,9 @@ where
 
     /// Discards this map's buffered uncommitted ops — entries and keyset
     /// together — reverting reads to the last [`commit`](Self::commit), or the
-    /// pre-event committed state if none. Infallible; see
-    /// the mid-handler durability section on the
-    /// [`collection`](crate::state::collection) module for the contract.
+    /// pre-event committed state if none. Infallible; the mid-handler
+    /// durability section of the [`collection`](crate::state::collection)
+    /// module states the contract.
     #[instrument(
         name = "map.rollback",
         skip_all,

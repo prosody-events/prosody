@@ -21,8 +21,7 @@
 
 use super::super::cached::Cached;
 use super::super::descriptor::{
-    CellStateError, MapStateError, STREAM_CHUNK, StateDescriptor, deque, deque_state, map,
-    map_state, value_state,
+    CellStateError, MapStateError, StateDescriptor, deque, deque_state, map, map_state, value_state,
 };
 use super::super::dirty::DirtyStore;
 use super::super::manager::ArmedKeys;
@@ -65,11 +64,11 @@ const HANG_GUARD: Duration = Duration::from_secs(30);
 
 /// The `*_stream_error_yield_releases_the_gate` pins seed exactly two items and
 /// assert the first yielded item is the `Err` — chunk-atomicity, which requires
-/// both items to land in one point-get chunk. At `STREAM_CHUNK == 1` each key
+/// both items to land in one point-get chunk. At `CELL_BATCH == 1` each key
 /// is its own chunk, the valid entry's `Ok` surfaces first, and the pins would
 /// go red on correct code; enforce the premise so breaking it is uncompilable.
 const _: () = assert!(
-    STREAM_CHUNK >= 2,
+    CELL_BATCH >= 2,
     "the *_stream_error_yield pins need two items in one chunk to prove chunk-atomicity"
 );
 
@@ -839,16 +838,17 @@ fn map_absent_keyset_streams_zero_reads() -> Result<()> {
 /// The set-racing-stream pin (the chunked-stream contract): a mutator racing a
 /// live stream serializes against the CURRENT chunk fetch and lands **between
 /// chunks**, never mid-fetch. The stream snapshots key membership at its init
-/// keyset read, then releases the gate before fetching the entry chunk; a `set`
-/// parked on the gate during the init read therefore lands first (FIFO) and
-/// buffers `1→99` into the shared overlay, so the entry chunk — a fresh gate
-/// acquire — reads key 1 through the overlay = 99. Values are read live,
-/// chunk by chunk (the point-get arm's per-arm consistency contract); the
-/// interleaving property `run_map_stream_interleave` is the stronger successor
-/// (named in the commit). Red-proven by making `OwnerEngine::begin_write` (or
-/// `OwnerEngine::resume`, the stream's per-chunk acquire) hand back a witness
-/// over an already-released permit: without serialization the yield is
-/// nondeterministic and the stream can observe a torn state.
+/// keyset read, then releases the gate before it fetches the entry chunk. A
+/// `set` parked on the gate during the init read therefore lands first (FIFO)
+/// and buffers `1→99` into the shared overlay. The entry chunk is a fresh gate
+/// acquire, so it reads key 1 through the overlay and sees 99. Values are read
+/// live, chunk by chunk — the point-get arm's per-arm consistency contract.
+/// The interleaving property `run_map_stream_interleave` is the stronger
+/// successor (named in the commit). Red-proven by making
+/// `OwnerEngine::begin_write` (or `OwnerEngine::resume`, the stream's per-chunk
+/// acquire) hand back a witness over an already-released permit: without
+/// serialization the yield is nondeterministic and the stream can observe a
+/// torn state.
 #[test]
 fn gate_excludes_set_during_keyset_stream() -> Result<()> {
     runtime()?.block_on(async {
@@ -1912,7 +1912,7 @@ fn range_scan_stream_fences_after_bump() -> Result<()> {
 /// Scan-shell fence, COORDINATE source: the map tracked arm point-gets a chunk,
 /// collects it into a bounded buffer, and releases the permit before the first
 /// yield; a buffered entry never crosses the fence after an observed bump. Both
-/// keys land in one chunk (`STREAM_CHUNK >= 2`), so the first entry's fence
+/// keys land in one chunk (`CELL_BATCH >= 2`), so the first entry's fence
 /// check passes pre-bump and the second's runs post-bump. Red proven by
 /// dropping the `fenced(...)` wrapper in `CoordinatePlan::entries`: the
 /// buffered second entry then crosses as an `Ok`.

@@ -31,9 +31,7 @@ use self::support::{
 };
 use super::cell::{Committed, ProvisionalWrite};
 use super::cell_key::CellKey;
-use super::descriptor::{
-    STREAM_CHUNK, StateDescriptor, WithResolver, deque, deque_state, map_state,
-};
+use super::descriptor::{StateDescriptor, WithResolver, deque, deque_state, map_state};
 use super::manager::ArmedKeys;
 use super::marker::{EventMarker, SectionClear};
 use super::memory::{
@@ -1832,17 +1830,17 @@ fn resolve_session(
 }
 
 /// The stream-laziness property (map): a `stream(dir).take(k)` over a **dense**
-/// `n`-entry `Tracked` map is genuinely incremental — it issues at most one
-/// batch read beyond `k` (entries flow through the batch verb; only the keyset
-/// meta cell is a point read) and resolves at most `k + STREAM_CHUNK` values,
-/// never the whole `n`-entry collection. The counting store bounds fetches and
-/// the counting resolver bounds resolutions; both counters sit at the lowest
-/// layer, so nothing masks a materialization.
-/// FALSIFICATION: widen `keys.by_ref().take(STREAM_CHUNK)` in
+/// `n`-entry `Tracked` map is genuinely incremental. It issues at most one
+/// batch read beyond `k`, because entries flow through the batch verb and only
+/// the keyset meta cell is a point read. It resolves at most `k + CELL_BATCH`
+/// values, never the whole `n`-entry collection. The counting store bounds the
+/// fetches and the counting resolver bounds the resolutions. Both counters sit
+/// at the lowest layer, so nothing masks a materialization.
+/// FALSIFICATION: widen `keys.by_ref().take(CELL_BATCH)` in
 /// `CoordinatePlan::entry_source` to `.take(usize::MAX)` (drain every tracked
 /// key in one chunk) → `take(k)` fetches and resolves all `n` → `batch_reads ==
 /// n.div_ceil(16)` and `resolves == n`, both over their bounds for `n ≫ k` →
-/// red. (Inflating `STREAM_CHUNK` itself cannot falsify: the assertion bound
+/// red. (Inflating `CELL_BATCH` itself cannot falsify: the assertion bound
 /// moves with it.)
 async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
@@ -1924,7 +1922,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         "take(k) yields exactly k.min(n) entries"
     );
     assert!(
-        counting.batch_reads() <= k.div_ceil(STREAM_CHUNK) + 1,
+        counting.batch_reads() <= k.div_ceil(CELL_BATCH) + 1,
         "a lazy map take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
         counting.batch_reads()
     );
@@ -1936,7 +1934,7 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + STREAM_CHUNK,
+        resolves.resolves() <= k + CELL_BATCH,
         "a lazy map take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );
@@ -1947,11 +1945,11 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
 /// [`run_map_stream_prefix_lazy`] over a dense `n`-entry window on the
 /// point-get arm — at most one batch read beyond `k` (entries flow through the
 /// batch verb; only the bounds meta cell is a point read) and at most
-/// `k + STREAM_CHUNK` resolved. FALSIFICATION: widen
-/// `keys.by_ref().take(STREAM_CHUNK)` in `CoordinatePlan::entry_source` to
+/// `k + CELL_BATCH` resolved. FALSIFICATION: widen
+/// `keys.by_ref().take(CELL_BATCH)` in `CoordinatePlan::entry_source` to
 /// `.take(usize::MAX)` (fetch the whole window in one chunk) →
 /// `batch_reads == n.div_ceil(16)` and `resolves == n`, both over their bounds
-/// for `n ≫ k` → red. (Inflating `STREAM_CHUNK` itself cannot falsify: the
+/// for `n ≫ k` → red. (Inflating `CELL_BATCH` itself cannot falsify: the
 /// assertion bound moves with it.)
 async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
@@ -2025,7 +2023,7 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         "take(k) yields exactly k.min(n) elements"
     );
     assert!(
-        counting.batch_reads() <= k.div_ceil(STREAM_CHUNK) + 1,
+        counting.batch_reads() <= k.div_ceil(CELL_BATCH) + 1,
         "a lazy deque take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
         counting.batch_reads()
     );
@@ -2037,7 +2035,7 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + STREAM_CHUNK,
+        resolves.resolves() <= k + CELL_BATCH,
         "a lazy deque take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );

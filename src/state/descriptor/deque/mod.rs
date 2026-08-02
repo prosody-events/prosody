@@ -77,15 +77,15 @@ use super::{
     CellCodecError, CellStateError, CellType, CollectionSpec, ContextOf, Descriptor, FromSession,
     Keyed, ResolvedOf, WriteOf,
 };
-use crate::codec::{Codec, I64Codec, I64CodecError, JsonCodec, PairCodecError};
+use crate::codec::{I64Codec, I64CodecError, JsonCodec, PairCodecError};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::Direction;
 #[cfg(test)]
 use crate::state::cell_key::{CellKey, Coordinate};
 use crate::state::collection::{
-    Collection, CollectionLayout, CollectionRead, CollectionWrite, CoordinatePlan, JOURNAL_INLINE,
-    RangePlan, ScanItem, StateSession, WritableStateSession, collection_layout, collection_methods,
-    same_token,
+    Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE, Plan,
+    StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
+    spec_matches,
 };
 #[cfg(test)]
 use crate::state::order_codec::OrderedKeyCodec;
@@ -93,7 +93,6 @@ use crate::state::order_codec::{I64KeyCodec, UnitKey};
 use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
 use async_stream::try_stream;
 use educe::Educe;
-use futures::future::Either;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::num::NonZeroUsize;
@@ -201,18 +200,8 @@ const _: () = {
         "Deque entries are durably addressed by the kind's index codec"
     );
     assert!(
-        same_token(
-            <<<FrozenLayout as CollectionSpec>::Cell as CellType>::Key as Codec>::FORMAT_ID,
-            families[1].key_format()
-        ),
-        "the spec's cell type addresses the entries family"
-    );
-    assert!(
-        same_token(
-            <<<FrozenLayout as CollectionSpec>::Cell as CellType>::Codec as Codec>::FORMAT_ID,
-            families[1].format()
-        ),
-        "the spec's cell type encodes the entries family"
+        spec_matches::<FrozenLayout>(families[1]),
+        "the spec's cell type addresses and encodes the entries family"
     );
     assert!(
         <FrozenLayout as CollectionLayout>::SECTIONS.len() == 2,
@@ -225,8 +214,8 @@ const _: () = {
 };
 
 /// Descriptor for a codec-backed deque collection. Generic over an element
-/// [`CellType`] `T` — a plain [`Codec`] (JSON by default) or a codec paired
-/// with a resolver via [`WithResolver`](super::WithResolver).
+/// [`CellType`] `T` — a plain [`Codec`](crate::codec::Codec) (JSON by default),
+/// or a codec paired with a resolver via [`WithResolver`](super::WithResolver).
 /// There is no key-codec parameter: the index encoding is fixed by the kind.
 /// Declare via [`deque_state`].
 pub type DequeDescriptor<T = JsonCodec> = Descriptor<DequeKind<T>>;
@@ -252,37 +241,6 @@ impl<T: CellType<Key = UnitKey>> CollectionSpec for DequeKind<T> {
 #[educe(Clone(bound = "S: Clone"))]
 pub struct DequeHandle<S, T> {
     cells: Collection<S, DequeKind<T>>,
-}
-
-/// The arm that [`DequeHandle::stream`] takes, as the owned plan that its
-/// planning invocation captured. One arm point-gets each position's absolute
-/// index. The other arm runs one durable range scan over exactly
-/// `[head, tail − 1]`, and serves a window wider than
-/// [`DEQUE_POINT_ITERATION_MAX`].
-enum DequePlan<S: StateSession, T: CellType<Key = UnitKey>> {
-    /// Point-get each planned absolute index. A backward stream reverses the
-    /// index list at plan time.
-    Points(CoordinatePlan<S, Keyed<I64KeyCodec, T>>),
-
-    /// One durable range scan anchored on the window.
-    Range(RangePlan<S, Keyed<I64KeyCodec, T>>),
-}
-
-impl<S, T> DequePlan<S, T>
-where
-    S: StateSession,
-    T: CellType<Key = UnitKey>,
-{
-    /// Drives the planned arm and resolves each live entry.
-    fn entries(self) -> impl Stream<Item = ScanItem<Keyed<I64KeyCodec, T>>> + Send
-    where
-        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-    {
-        match self {
-            Self::Points(plan) => Either::Left(plan.entries()),
-            Self::Range(plan) => Either::Right(plan.entries()),
-        }
-    }
 }
 
 #[collection_methods(field = cells, session = S)]
@@ -425,7 +383,7 @@ where
     async fn stream_plan(
         &self,
         dir: Direction,
-    ) -> Result<DequePlan<S, T>, DequeStateError<CellCodecError<T>>> {
+    ) -> Result<Plan<S, Keyed<I64KeyCodec, T>>, DequeStateError<CellCodecError<T>>> {
         let window = bounds(op).await?;
         let len = window.len()?;
         if len > DEQUE_POINT_ITERATION_MAX {
@@ -440,7 +398,7 @@ where
                 Direction::Forward => (window.head, last),
                 Direction::Backward => (last, window.head),
             };
-            return Ok(DequePlan::Range(op.range_within(
+            return Ok(Plan::Scan(op.range_within(
                 DequeKind::<T>::ENTRIES,
                 &start,
                 dir,
@@ -464,7 +422,7 @@ where
         if dir == Direction::Backward {
             indices.reverse();
         }
-        Ok(DequePlan::Points(
+        Ok(Plan::Points(
             op.coordinates(DequeKind::<T>::ENTRIES, indices),
         ))
     }
@@ -484,7 +442,7 @@ where
     /// yields the new occupant.
     ///
     /// A window of at most `DEQUE_POINT_ITERATION_MAX` entries point-reads each
-    /// absolute index in chunks of `STREAM_CHUNK`. A wider window falls back to
+    /// absolute index in chunks of `CELL_BATCH`. A wider window falls back to
     /// one durable range scan over the same window. Both arms give identical
     /// items in identical order, live pages, and the same skip-absent rule.
     ///
@@ -495,7 +453,7 @@ where
     /// failing chunk yields none of its items.
     ///
     /// The stream takes session admission at init for the bounds read. The
-    /// point arm then takes it once per chunk, at most `STREAM_CHUNK` point
+    /// point arm then takes it once per chunk, at most `CELL_BATCH` point
     /// reads each: a chunk's admission covers its batch fetch, and the stream
     /// releases it before it decodes and resolves the chunk. The scan arm takes
     /// no admission after init and pages gate-free. Neither arm holds admission
@@ -690,10 +648,9 @@ where
     }
 
     /// Durably commits this deque's buffered ops mid-handler — entries and
-    /// the window bounds together. At-least-once; see
-    /// the mid-handler durability section on the
-    /// [`collection`](crate::state::collection) module for the contract,
-    /// including the over-budget batch split.
+    /// the window bounds together. At-least-once; the mid-handler durability
+    /// section of the [`collection`](crate::state::collection) module states
+    /// the contract, including the over-budget batch split.
     ///
     /// # Errors
     ///
@@ -708,9 +665,9 @@ where
 
     /// Discards this deque's buffered uncommitted ops — entries and the window
     /// bounds together — reverting reads to the last [`commit`](Self::commit),
-    /// or the pre-event committed state if none. Infallible; see
-    /// the mid-handler durability section on the
-    /// [`collection`](crate::state::collection) module for the contract.
+    /// or the pre-event committed state if none. Infallible; the mid-handler
+    /// durability section of the [`collection`](crate::state::collection)
+    /// module states the contract.
     #[instrument(name = "deque.rollback", skip_all, fields(collection = self.cells.name().as_str()))]
     pub async fn rollback(&self) -> StoreOutcome
     where

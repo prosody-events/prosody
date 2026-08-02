@@ -20,13 +20,13 @@ use super::{StateSession, resolve_batch, resolve_cell, sealed};
 use crate::state::cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, FromSession, KeyOf, ResolvedOf,
-    STREAM_CHUNK,
 };
 use crate::state::order_codec::OrderedKeyCodec;
-use crate::state::store::CellBuffer;
+use crate::state::store::{CELL_BATCH, CellBuffer};
 use crate::state::{SHARD_FANOUT_CONCURRENCY, StateAccessError, StateName, StateType};
 use async_stream::try_stream;
 use bytes::Bytes;
+use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt};
 use std::marker::PhantomData;
 use tokio::task::coop::cooperative;
@@ -74,8 +74,16 @@ impl<S: StateSession> PlanBase<S> {
 }
 
 /// A managed point-get plan: the keys a metadata command enumerated, read back
-/// in gate-scoped chunks of [`STREAM_CHUNK`], skipping the ones that read
-/// absent.
+/// in gate-scoped chunks of [`CELL_BATCH`], skipping the ones that read absent.
+/// This driver owns the point-get chunk width, and every collection's point-get
+/// stream arm runs on it.
+///
+/// The chunk width is the granularity of both the per-chunk admission and the
+/// batch read. ONE aligned batch read fetches a chunk's cells (one Cassandra
+/// query, or one fjall hop), and the typed resolves then fan out under
+/// `RESOLVE_FANOUT`. Admission covers that raw batch read only: the owner takes
+/// one per chunk and releases it before the chunk's resolves, and a published
+/// reader holds no gate at all.
 ///
 /// Membership is snapshotted at planning; values are read live, chunk by chunk.
 /// A key that disappears between planning and its chunk reads absent and is
@@ -105,6 +113,45 @@ pub(crate) struct RangePlan<S: StateSession, T> {
     end: ScanEdge<Coordinate>,
     limit: Option<usize>,
     _cell: PhantomData<fn() -> T>,
+}
+
+/// The arm a collection's stream method takes, as the owned plan its planning
+/// invocation captured. The two members carry the per-kind semantics; a
+/// collection chooses between them in its planning method and drives the choice
+/// through here.
+///
+/// A collection that enumerated no live coordinate plans an empty
+/// [`Points`](Self::Points) arm: zero point gets and no scan. Its exhaustion
+/// still passes the stream fence.
+pub(crate) enum Plan<S: StateSession, T: CellType> {
+    /// Point-get each planned coordinate, in plan order. A backward stream
+    /// reverses the coordinate list at plan time.
+    Points(CoordinatePlan<S, T>),
+
+    /// Walk one durable range.
+    Scan(RangePlan<S, T>),
+}
+
+impl<S: StateSession, T: CellType> Plan<S, T> {
+    /// Drives the planned arm and resolves each live entry.
+    pub(crate) fn entries(self) -> impl Stream<Item = ScanItem<T>> + Send
+    where
+        for<'s> ContextOf<'s, T>: FromSession<'s, S>,
+    {
+        match self {
+            Self::Points(plan) => Either::Left(plan.entries()),
+            Self::Scan(plan) => Either::Right(plan.entries()),
+        }
+    }
+
+    /// Drives the planned arm presence-only. It yields keys and never touches a
+    /// value.
+    pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
+        match self {
+            Self::Points(plan) => Either::Left(plan.keys()),
+            Self::Scan(plan) => Either::Right(plan.keys()),
+        }
+    }
 }
 
 impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
@@ -141,7 +188,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
             let base = &base;
             let chunks = stream::unfold(keys.into_iter().peekable(), |mut keys| async move {
                 keys.peek()?; // exhausted ⇒ unfold ends
-                let chunk: CellBuffer<KeyOf<T>> = keys.by_ref().take(STREAM_CHUNK).collect();
+                let chunk: CellBuffer<KeyOf<T>> = keys.by_ref().take(CELL_BATCH).collect();
                 // Admission spans the chunk's raw batch read ONLY: it is
                 // released before the chunk's bounded resolve fan-out — which
                 // touches no collection state and may reach a loader — and so
@@ -199,7 +246,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
                 keys.peek()?;
                 let mut inner =
                     <S::Engine as sealed::ReadEngine<S>>::resume(&base.session, &base.plan).await;
-                let chunk: CellBuffer<KeyOf<T>> = keys.by_ref().take(STREAM_CHUNK).collect();
+                let chunk: CellBuffer<KeyOf<T>> = keys.by_ref().take(CELL_BATCH).collect();
                 // Pair each key with its slot so the emission stage can drop
                 // absent keys AND checkpoint per key.
                 let paired = read_keys_bytes::<S, T>(
@@ -363,26 +410,29 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
 }
 
 /// The managed stream fence adapter — the SOLE home of a managed stream's
-/// per-emission attempt fence. Wraps a driver's source and runs
-/// [`ReadEngine::fence`](sealed::ReadEngine::fence) after EVERY
-/// `inner.next()` completion — `Some`, `Err`, and the exhaustion `None`
-/// alike — BEFORE matching it, so a stream leaked past its handler attempt (a
-/// spawned task, an un-awaited future, a foreign promise) errors
-/// [`Terminated`](crate::state::StateAccessError::Terminated) at its next
-/// emission. Empty sources still pass the fence on exhaustion, so a leaked
-/// empty-plan stream errors rather than reporting a clean end.
+/// per-emission attempt fence.
+///
+/// It wraps a driver's source. It then runs
+/// [`ReadEngine::fence`](sealed::ReadEngine::fence) after EVERY `inner.next()`
+/// completion — `Some`, `Err`, and the exhaustion `None` alike — and BEFORE it
+/// matches that completion. A stream leaked past its handler attempt therefore
+/// errors [`Terminated`](crate::state::StateAccessError::Terminated) at its
+/// next emission. A spawned task, an un-awaited future, and a foreign promise
+/// all leak this way. An empty source still passes the fence on exhaustion, so
+/// a leaked empty-plan stream errors instead of reporting a clean end.
 ///
 /// # Invariant — no await, no buffering between the fence and the caller
 ///
-/// Every source buffer (a coordinate chunk's buffer, a range source's
-/// `buffered` resolution window) sits BELOW this adapter; a collection adds
-/// only synchronous per-item transforms above it. The check is a LINEARIZATION
-/// point, not a wall-clock wall: a completion whose synchronous fence passed
-/// linearized before any concurrent attempt boundary. It holds no admission
-/// (the check is sync); a concurrent reset — which needs the gate exclusively
-/// and, for a coordinate source, queues behind the chunk's batch-read
-/// admission — is ordered relative to a completion by whether its bump landed
-/// before that completion's check.
+/// Every source buffer sits BELOW this adapter: a coordinate chunk's buffer,
+/// and a range source's `buffered` resolution window. A collection adds only
+/// synchronous per-item transforms above it.
+///
+/// The check is a LINEARIZATION point, not a wall-clock wall. A completion
+/// whose synchronous fence passed linearized before any concurrent attempt
+/// boundary. The check holds no admission, because it is synchronous. A
+/// concurrent reset needs the gate exclusively, and for a coordinate source it
+/// queues behind the chunk's batch-read admission. Whether its bump landed
+/// before a completion's check is what orders the two.
 fn fenced<S, X, T>(
     session: S,
     inner: impl Stream<Item = Result<X, CellStateError<CellCodecError<T>>>> + Send,

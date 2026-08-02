@@ -223,12 +223,23 @@ impl<C: Codec, B: ReaderBackend<C>> ReadSession<C, B> {
         match self.context.def.read_cache_ttl {
             None => {
                 let id = self.resolved_id(selected, source)?;
-                self.context
+                let buffer = self
+                    .context
                     .backend
                     .cells()
                     .load_many(&id, section, batch)
                     .await
-                    .map_err(|error| StateAccessError::store(&error))
+                    .map_err(|error| StateAccessError::store(&error))?;
+                // `CommittedCellSource` is a downstream trait, so check the
+                // alignment its contract promises in every build. The cached
+                // arm gets the same check inside `get_many_cached`.
+                if buffer.len() != batch.len() {
+                    return Err(StateAccessError::misaligned_batch(
+                        buffer.len(),
+                        batch.len(),
+                    ));
+                }
+                Ok(buffer)
             }
             Some(ttl) => {
                 // A stream chunk is up to `CELL_BATCH`, well past

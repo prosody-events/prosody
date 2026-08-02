@@ -84,11 +84,12 @@ pub fn collection_layout(input: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
-/// `field` names the handle field holding the bound collection; `session`
-/// names the impl's session type parameter, which the macro needs to attach
-/// the write and resolver bounds. Naming it is deliberate rather than inferred
-/// from the field's type tokens: an alias, a same-named foreign trait, or a
-/// multi-parameter impl all defeat token inference.
+/// `field` names the handle field that holds the bound collection.
+///
+/// `session` names the impl's session type parameter. The macro needs it to
+/// attach the write and resolver bounds. Naming it is deliberate rather than
+/// inferred from the field's type tokens: an alias, a same-named foreign
+/// trait, or a multi-parameter impl all defeat token inference.
 ///
 /// - `#[read(op)]` wraps the body in one read scope;
 /// - `#[write(op)]` wraps it in one write scope and adds a method-local
