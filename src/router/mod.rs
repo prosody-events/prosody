@@ -221,8 +221,8 @@ impl<S: ResponseSender> Router for RouterHandle<S> {
     type Error = CassandraStoreError;
     type Sender = S;
 
-    /// The direct endpoint the node published. An ordinary host stays inline in
-    /// [`Host`], so this clone copies and never allocates.
+    /// The direct endpoint the node published. [`Host`] holds an ordinary host
+    /// inline, so this clone copies one; only a longer host allocates.
     async fn address(&self, node: NodeId) -> Result<Option<Endpoint>, CassandraStoreError> {
         let registration = self.addresses.resolve(node).await?;
         Ok(registration.map(|registration| registration.direct.clone()))

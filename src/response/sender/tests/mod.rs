@@ -151,11 +151,21 @@ impl Harness {
 
     /// The next attempt the transport recorded.
     pub(super) async fn next_delivery(&mut self) -> Result<Delivery> {
-        match timeout(HANG_GUARD, self.deliveries.recv()).await {
-            Ok(Some(delivery)) => Ok(delivery),
-            Ok(None) => bail!("the transport stopped recording before a delivery arrived"),
-            Err(_) => bail!("no delivery arrived"),
-        }
+        next_delivery(&mut self.deliveries).await
+    }
+
+    /// Drops the sender without draining it, and keeps the record of what the
+    /// transport does afterwards.
+    ///
+    /// Every worker is a spawned task, so what goes away here is the queue
+    /// handles and nothing else. A test that wants the workers joined calls
+    /// [`Harness::drain`] instead.
+    pub(super) fn release(self) -> UnboundedReceiver<Delivery> {
+        let Self {
+            sender, deliveries, ..
+        } = self;
+        drop(sender);
+        deliveries
     }
 
     /// Drains the sender, collects every attempt its workers made, and holds
@@ -202,6 +212,17 @@ impl Harness {
             );
         }
         Ok(drained)
+    }
+}
+
+/// The next attempt `deliveries` records.
+pub(super) async fn next_delivery(
+    deliveries: &mut UnboundedReceiver<Delivery>,
+) -> Result<Delivery> {
+    match timeout(HANG_GUARD, deliveries.recv()).await {
+        Ok(Some(delivery)) => Ok(delivery),
+        Ok(None) => bail!("the transport stopped recording before a delivery arrived"),
+        Err(_) => bail!("no delivery arrived"),
     }
 }
 

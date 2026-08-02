@@ -54,9 +54,11 @@ pub(crate) struct TypedSender<C: Codec> {
     /// One worker per queue, not several. `tokio::sync::mpsc` has exactly one
     /// receiver. More workers would therefore need a shared receiver behind an
     /// async lock, or a round robin over private queues. A round robin strands
-    /// jobs behind one stalled worker. Concurrency per destination would only
-    /// buy throughput against a slow peer, and the rate limit already bounds
-    /// that.
+    /// jobs behind one stalled worker.
+    ///
+    /// One destination therefore sees at most one send in flight from this
+    /// sender. A process that runs several senders overlaps that many, still
+    /// under the destination's shared slot bound and its shared rate limit.
     ///
     /// A queue holds work for at most one destination at a time, whatever
     /// occupies its cell over the process's life: a queued job holds one of its
@@ -103,11 +105,12 @@ pub(crate) struct SendCounters {
 impl<C: Codec> TypedSender<C> {
     /// Builds a sender over `router`'s fleet, with `cap` as the frame ceiling.
     ///
-    /// One queue and one worker per fleet cell are built here, and each worker
-    /// builds its codec and its encode scratch at the cap. Everything a send
-    /// needs therefore exists before the first one, which is what leaves the
-    /// send path with nothing to allocate. Call this from inside a runtime: the
-    /// workers are spawned tasks.
+    /// One queue, one codec and one encode scratch at the cap are built here
+    /// per fleet cell, and one worker is spawned to drive each of them. A send
+    /// therefore reserves no buffer, no queue and no task. Admitting a
+    /// destination the fleet does not hold yet costs one record, which
+    /// [`DestinationFleet::new`] accounts for. Call this from inside a runtime:
+    /// the workers are spawned tasks.
     ///
     /// # Errors
     ///
@@ -133,7 +136,7 @@ impl<C: Codec> TypedSender<C> {
                     attempts: config.max_send_attempts,
                     counters: Arc::clone(&counters),
                 },
-                cap,
+                FrameEncoder::new(C::default(), cap),
             )));
         }
         Ok(Self {
@@ -195,10 +198,11 @@ impl<C: Codec> TypedSender<C> {
     /// Stops taking work and returns once every worker has finished what it
     /// holds.
     ///
-    /// Bounded by the configured deadline: each response a worker still holds
-    /// ends at its own expiry, so the wait is at most one deadline past the
-    /// last response queued. Shutdown runs this after the fleet's admission
-    /// gate has drained, so nothing can be queued while it waits.
+    /// Each response a worker still holds ends at its own expiry, so the wait
+    /// is at most one deadline past the last response queued. That deadline is
+    /// measured between polls: a codec that never returns holds its worker, and
+    /// this wait with it. Shutdown runs this after the fleet's admission gate
+    /// has drained, so nothing can be queued while it waits.
     pub(crate) async fn drain(self) {
         let Self {
             queues, workers, ..
@@ -220,7 +224,9 @@ impl SendCounters {
         self.sent.load(Relaxed)
     }
 
-    /// How many responses were given up on, for any reason.
+    /// How many responses this sender gave up on, for any reason. A response
+    /// the fleet refused a slot to never reaches a sender, so the fleet counts
+    /// that refusal itself.
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Relaxed)
     }
@@ -229,9 +235,10 @@ impl SendCounters {
 /// One cell's worker: it drains the queue, encodes each response into its own
 /// scratch, and delivers it.
 ///
-/// The codec and the scratch are built once here, so the send path allocates
-/// nothing. The loop keeps draining after its queue handle drops, so a queued
-/// response outlives the layer that queued it.
+/// `encoder` carries the codec and the scratch this worker keeps for its whole
+/// life, so a response is encoded into a buffer that already exists. The loop
+/// keeps draining after its queue handle drops, so a queued response outlives
+/// the layer that queued it.
 ///
 /// Exactly one counter moves per dequeued job. The deadline is the biased arm
 /// of the select, so a job whose deadline has already passed is dropped before
@@ -241,9 +248,8 @@ impl SendCounters {
 async fn run_worker<C: Codec, R: Router>(
     mut queue: Receiver<Job<C>>,
     context: WorkerContext<R>,
-    cap: FrameCap,
+    mut encoder: FrameEncoder<C>,
 ) {
-    let mut encoder = FrameEncoder::new(C::default(), cap);
     while let Some(job) = queue.recv().await {
         let Job {
             header,

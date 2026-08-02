@@ -72,13 +72,14 @@ pub(crate) struct FleetConfiguration {
     pub(crate) max_destinations: usize,
 
     /// How many responses one destination may have waiting and in flight
-    /// together. One destination is sent to one response at a time, so this is
-    /// how deep its queue runs rather than how many sends overlap.
+    /// together, over the whole process. Each sender drives one destination
+    /// with one worker. So a process that runs one sender overlaps no sends,
+    /// and this is purely queue depth.
     #[validate(range(min = 1_usize, max = MAX_SLOTS_EACH))]
     pub(crate) slots_each: usize,
 
-    /// How fast one destination may be sent to. A destination is sent to one
-    /// response at a time, so a rate faster than the round trip is unreachable.
+    /// How fast one destination may be sent to. The limit is the destination's
+    /// own, so it paces every send to it whatever queued them.
     #[validate(range(min = 1_u32, max = MAX_SENDS_PER_SECOND))]
     pub(crate) sends_per_second: u32,
 

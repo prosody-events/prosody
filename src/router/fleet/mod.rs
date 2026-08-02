@@ -101,8 +101,10 @@ pub(crate) struct Destination {
 
 /// One send slot, taken on one live destination.
 ///
-/// Holding one means the fleet is open, the destination is live, and one of its
-/// slots is taken. Dropping it releases the slot and leaves the admission gate.
+/// Holding one means the destination is live, one of its slots is taken, and
+/// the gate was open when the slot was taken. A close that has already begun
+/// cannot end while one is held. Dropping it releases the slot and leaves the
+/// admission gate.
 /// [`Reservation::commit`] is the only other way out, and it leaves the gate
 /// only after the slot has been handed on.
 pub(crate) struct Reservation<'a> {

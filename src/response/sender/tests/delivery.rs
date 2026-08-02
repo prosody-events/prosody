@@ -1,6 +1,9 @@
 //! What happens to a queued response between its hook and the wire.
 
-use super::{CAP_BYTES, Harness, PAYLOAD, UNPUBLISHED_NODE, attempts, config, node, paused, port};
+use super::{
+    CAP_BYTES, Harness, PAYLOAD, UNPUBLISHED_NODE, attempts, config, next_delivery, node, paused,
+    port,
+};
 use crate::response::frame::FrameCap;
 use crate::response::frame::decode::decode_frame;
 use crate::response::frame::tests::{CountingCodec, serialized_on_this_thread};
@@ -51,7 +54,9 @@ const AMBIGUOUS: [Code; 2] = [Code::Unavailable, Code::DeadlineExceeded];
 /// delivered, and what reaches the wire is the response that was queued.
 ///
 /// The event committed before its hook ran, so the response stays valid after
-/// ownership of the partition moves.
+/// ownership of the partition moves. The sender is dropped rather than drained,
+/// so nothing joins its workers on its behalf: only work that outlives the
+/// sender itself can reach the transport here.
 #[test]
 fn a_queued_response_survives_the_sender_that_queued_it() -> Result<()> {
     let runtime = paused()?;
@@ -59,14 +64,8 @@ fn a_queued_response_survives_the_sender_that_queued_it() -> Result<()> {
         let harness = Harness::new(config(CELLS, SLOTS))?;
         harness.send(TARGET)?;
 
-        let mut drained = harness.drain().await?;
-        assert_eq!(
-            drained.sent, 1,
-            "the queued response must be delivered after its sender is dropped"
-        );
-        let Some(mut delivery) = drained.deliveries.pop() else {
-            bail!("the queued response reached no destination at all");
-        };
+        let mut deliveries = harness.release();
+        let mut delivery = next_delivery(&mut deliveries).await?;
         assert_eq!(
             delivery.port,
             port(TARGET),
