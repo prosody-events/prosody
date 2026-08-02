@@ -38,7 +38,7 @@ const HELD: usize = CELLS * SLOTS;
 /// choose. Every step then re-reads the table directly: the length never
 /// changes, the live cells never exceed the configured maximum, no destination
 /// hands out more slots than it has, and the held node keeps the very cell and
-/// generation it started with.
+/// the very occupancy it started with.
 #[quickcheck]
 fn prop_the_fleet_stays_bounded_and_keeps_a_busy_destination(steps: Vec<u8>) -> TestResult {
     let Ok(fleet) = fleet(CELLS, SLOTS) else {
@@ -219,18 +219,19 @@ fn a_reservation_leaves_the_gate_only_after_its_slot_does() -> Result<()> {
             poll!(drain.as_mut()).is_pending(),
             "the drain must wait while a reservation is held"
         );
-        let slot = reservation.commit(|slot| {
+        let handed_on: Result<()> = reservation.commit(|slot| {
             assert!(
                 still_draining(drain.as_mut()),
                 "the gate must still hold the reservation while its slot is handed on"
             );
-            slot
+            drop(slot);
+            Ok(())
         });
+        handed_on?;
         assert!(
             poll!(drain.as_mut()).is_ready(),
             "the drain must finish once the slot has been handed on"
         );
-        drop(slot);
 
         let reservation = released.reserve(node(0))?;
         let mut drain = pin!(released.close());

@@ -22,14 +22,16 @@ use thiserror::Error;
 /// appends into a scratch at the cap therefore cannot grow it with any response
 /// the cap admits.
 ///
-/// What the scratch *is* between responses is the codec's doing, not the
+/// What the scratch *is* after a response is the codec's doing, not the
 /// encoder's. One that takes `serialize`'s sanctioned move into an empty buffer
 /// hands its own buffer over in place of the scratch, at whatever capacity that
 /// buffer came with — the cap bounds a payload's length, never its allocation.
-/// [`FrameEncoder::stage`] shrinks the scratch back toward the cap before each
-/// response, so nothing accumulates across them; that shrink is the only place
-/// the encoder itself can allocate after construction, and it does so only when
-/// the response before left the scratch over the cap.
+/// So the scratch is returned to the cap by [`FrameEncoder::release`], which
+/// the caller runs once the staged frame is written and [`FrameEncoder::stage`]
+/// runs again before each response. An encoder therefore holds no response's
+/// bytes between responses, however long it waits for the next one. That shrink
+/// is the only place the encoder itself can allocate after construction, and it
+/// does so only when the response before left the scratch over the cap.
 ///
 /// Staging and framing are two steps because a protobuf `bytes` field writes
 /// its varint length *before* its contents: the payload must be serialized
@@ -88,17 +90,10 @@ impl<C: Codec> FrameEncoder<C> {
                 "a codec used for responses must have a FORMAT_ID a frame can carry"
             );
         }
-        // Shrink back toward the cap: a response the cap refused can have grown
-        // this scratch, and a codec that moved its own buffer in can have handed
-        // over one larger still. `shrink_to` never grows, so a smaller moved-in
-        // buffer is kept as it is. Doing this here rather than at each of the
-        // three exits below is one site instead of three, at the cost of holding
-        // an oversized buffer until this encoder's next response. Clearing is
-        // also what keeps the move shape reachable — the codec sees an empty
-        // buffer every time — so a moving codec never reuses the buffer it
-        // handed over.
-        self.scratch.clear();
-        self.scratch.shrink_to(self.cap.bytes());
+        // Clearing here as well as in `release` is what keeps the move shape
+        // reachable whoever the caller is: the codec sees an empty buffer every
+        // time, so a moving codec never reuses the buffer it handed over.
+        self.release();
         self.codec
             .serialize(payload, &mut self.scratch)
             .map_err(EncodeError::Codec)?;
@@ -116,6 +111,18 @@ impl<C: Codec> FrameEncoder<C> {
             payload: &self.scratch,
             bytes: bytes as usize,
         })
+    }
+
+    /// Empties the scratch and returns it to the cap.
+    ///
+    /// Run this once the [`Staged`] frame is written. A response the cap
+    /// refused can have grown the scratch, and a codec that moved its own
+    /// buffer in can have handed over one larger still — or one holding the
+    /// response's bytes. `shrink_to` never grows, so a smaller moved-in
+    /// buffer is kept as it is.
+    pub(crate) fn release(&mut self) {
+        self.scratch.clear();
+        self.scratch.shrink_to(self.cap.bytes());
     }
 
     /// The scratch's live capacity, for the tests that pin what the encoder is

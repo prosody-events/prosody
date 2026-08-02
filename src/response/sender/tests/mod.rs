@@ -24,6 +24,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
 
+mod bounds;
 mod delivery;
 mod isolation;
 
@@ -32,7 +33,7 @@ mod isolation;
 const PORT_BASE: u16 = 9000;
 
 /// How many nodes the router publishes an address for.
-const PUBLISHED_NODES: u8 = 8;
+pub(super) const PUBLISHED_NODES: u8 = 8;
 
 /// A node the router publishes nothing for.
 pub(super) const UNPUBLISHED_NODE: u8 = 200;
@@ -58,7 +59,7 @@ pub(super) struct TestRouter {
 /// One fleet, one transport, and one typed sender over them.
 pub(super) struct Harness {
     router: TestRouter,
-    sender: TypedSender<CountingCodec, TestRouter>,
+    sender: TypedSender<CountingCodec>,
     deliveries: UnboundedReceiver<Delivery>,
     header: FrameHeader,
     /// Responses this harness queued, counted so [`Harness::drain`] can hold
@@ -89,7 +90,7 @@ impl Router for TestRouter {
         &self.transport
     }
 
-    fn fleet(&self) -> &DestinationFleet {
+    fn fleet(&self) -> &Arc<DestinationFleet> {
         &self.fleet
     }
 }
@@ -115,7 +116,7 @@ impl Harness {
             addresses: Arc::new(addresses),
         };
         Ok(Self {
-            sender: TypedSender::new(router.clone(), FrameCap::new(CAP_BYTES)?)?,
+            sender: TypedSender::new(&router, FrameCap::new(CAP_BYTES)?)?,
             router,
             deliveries,
             header: header()?,
@@ -157,17 +158,15 @@ impl Harness {
         }
     }
 
-    /// Drops the sender, collects every attempt its workers still make, and
-    /// holds the counters to their conservation rule.
+    /// Drains the sender, collects every attempt its workers made, and holds
+    /// the counters to their conservation rule.
     ///
-    /// A worker exits when its queue is empty and its handle is gone, so the
-    /// recording stream closing is the signal that delivery is finished. That
-    /// is what makes a complete record of one run observable without waiting on
-    /// a clock.
+    /// The drain returns once every worker has exited, so the record of one run
+    /// is complete without waiting on a clock.
     ///
     /// Every queued response then ends as exactly one of sent or dropped. The
     /// one drop these suites cannot produce is [`Refused::Queue`], which needs
-    /// a worker to end between the lane check and the queue.
+    /// a worker to end between the reservation and the queue.
     pub(super) async fn drain(self) -> Result<Drained> {
         let Self {
             router,
@@ -177,18 +176,17 @@ impl Harness {
             ..
         } = self;
         let counters = sender.counters();
-        drop(sender);
+        if timeout(HANG_GUARD, sender.drain()).await.is_err() {
+            bail!("the destination workers did not finish");
+        }
         drop(router);
 
+        // Closing first, so the collection ends at what the workers recorded
+        // rather than waiting for a stream that nothing else will write to.
+        deliveries.close();
         let mut recorded = Vec::new();
-        let collect = async {
-            while let Some(delivery) = deliveries.recv().await {
-                recorded.push(delivery);
-            }
-        };
-        let finished = timeout(HANG_GUARD, collect).await;
-        if finished.is_err() {
-            bail!("the destination workers did not finish");
+        while let Some(delivery) = deliveries.recv().await {
+            recorded.push(delivery);
         }
         let drained = Drained {
             deliveries: recorded,

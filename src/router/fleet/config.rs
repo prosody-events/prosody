@@ -14,16 +14,22 @@ pub(super) const MAX_DESTINATIONS: usize = 1024;
 /// Most send slots one destination may hold.
 const MAX_SLOTS_EACH: usize = 256;
 
-/// Most send slots one process may commit to in total. A slot holds one moved
-/// handler result and one frame header, so this bounds committed memory the way
-/// the address cache's capacity bounds its entries.
+/// Most send slots one process may commit to in total.
+///
+/// A slot holds one moved handler result and one frame header, so this bounds
+/// how many results a process holds at once, not how many bytes they come to: a
+/// result is the application's own type and nothing measures it before the
+/// codec runs. The frame ceiling bounds what one response puts on the wire;
+/// this bounds how many of them wait for their turn.
 pub(super) const MAX_TOTAL_SLOTS: usize = 8_192;
 
 /// Most bytes one sender may commit to per-destination encode scratch.
 ///
-/// One sender holds one encode buffer per destination. A process builds one
-/// sender per handler-result type, so what the process commits to is this
-/// number multiplied by the number of senders it builds.
+/// One sender builds one encode buffer per destination and holds it for the
+/// sender's whole life. A process builds one sender per handler-result type, so
+/// what the process commits to is this number multiplied by the number of
+/// senders it builds. A buffer is at the ceiling between responses; a codec may
+/// grow it beyond that while it serializes one.
 const MAX_SCRATCH_BYTES_PER_SENDER: u64 = 64 * 1024 * 1024;
 
 /// Fastest one destination may be sent to.
@@ -65,11 +71,14 @@ pub(crate) struct FleetConfiguration {
     #[validate(range(min = 1_usize, max = MAX_DESTINATIONS))]
     pub(crate) max_destinations: usize,
 
-    /// How many sends one destination may have outstanding.
+    /// How many responses one destination may have waiting and in flight
+    /// together. One destination is sent to one response at a time, so this is
+    /// how deep its queue runs rather than how many sends overlap.
     #[validate(range(min = 1_usize, max = MAX_SLOTS_EACH))]
     pub(crate) slots_each: usize,
 
-    /// How fast one destination may be sent to.
+    /// How fast one destination may be sent to. A destination is sent to one
+    /// response at a time, so a rate faster than the round trip is unreachable.
     #[validate(range(min = 1_u32, max = MAX_SENDS_PER_SECOND))]
     pub(crate) sends_per_second: u32,
 
@@ -105,10 +114,9 @@ impl FleetConfiguration {
 
 /// Refuses a frame ceiling one sender cannot afford.
 ///
-/// One worker per destination holds one encode buffer at the ceiling for its
-/// whole life, so the two numbers together are what one sender commits to. The
-/// check runs once per sender, so a process that builds several pays the budget
-/// once for each of them.
+/// A table size and a frame ceiling are each plausible alone; their product is
+/// what a sender commits to, so they are checked together. See
+/// [`MAX_SCRATCH_BYTES_PER_SENDER`] for what that product buys.
 ///
 /// # Errors
 ///

@@ -47,13 +47,11 @@ pub(crate) struct DestinationFleet {
     ///
     /// One lock rather than a sharded map, because the bound and the eviction
     /// are global facts: "find or admit, evicting an idle cell" and "take one
-    /// of that destination's slots" must be one atomic step against
-    /// eviction. The scan is linear over 16-byte ids and bounded by the
-    /// configured maximum.
-    table: Mutex<Box<[Option<Arc<Destination>>]>>,
+    /// of that destination's slots" must be one atomic step against eviction.
+    table: Mutex<Box<[Cell]>>,
     gate: AdmissionGate,
-    /// One monotonic source for both the use order and the generation, so a
-    /// re-admitted node can never look like the occupant it replaced.
+    /// One monotonic source for both the use order and the admission stamp, so
+    /// a re-admitted node can never look like the occupant it replaced.
     stamp: AtomicU64,
     admitted: AtomicU64,
     evicted: AtomicU64,
@@ -61,21 +59,44 @@ pub(crate) struct DestinationFleet {
     config: FleetConfiguration,
 }
 
-/// One live destination: what bounds its outstanding sends, what paces them,
-/// and when it was last used.
+/// One cell of the table: when it was last reserved against, and what occupies
+/// it.
 ///
-/// It holds no transport channel and no drain state on purpose. The channel
-/// sits behind the [`ResponseSender`](crate::router::ResponseSender) seam and
-/// the drain is per lane in the typed sender. That is what keeps the fleet
-/// untyped and free of transport vocabulary.
-pub(crate) struct Destination {
+/// Both scans a reservation runs — find this node, choose an eviction — read
+/// only the fields held here, so they walk the table's own memory. The
+/// destination record behind the pointer is reached for the cell a scan
+/// selects, and for no other.
+struct Cell {
+    last_used: u64,
+    occupant: Option<Occupant>,
+}
+
+/// What a live cell holds: which node it stands for, which occupancy this is,
+/// and the destination record itself.
+struct Occupant {
     node: NodeId,
-    /// Tells this occupant of a table cell from every earlier one. A sender
-    /// holding work for an earlier occupant sees the difference and rebuilds.
-    generation: u64,
+    /// The stamp this occupant was admitted at. It tells this occupancy of a
+    /// cell from every earlier one.
+    admitted_at: u64,
+    destination: Arc<Destination>,
+}
+
+/// One live destination: what bounds the work queued against it, and what paces
+/// that work.
+///
+/// It holds no transport channel and no queue on purpose. The channel sits
+/// behind the [`ResponseSender`](crate::router::ResponseSender) seam, and the
+/// queue and its worker belong to the typed sender. That is what keeps the
+/// fleet untyped and free of transport vocabulary.
+///
+/// A destination lives only while it occupies a cell. Its pacing goes with it:
+/// a destination evicted and admitted again starts from the present rather than
+/// from the schedule it left. What survives eviction is the operator's real
+/// ceiling — `max_destinations` multiplied by `sends_per_second` — because a
+/// live destination is what a cell is.
+pub(crate) struct Destination {
     slots: Arc<Semaphore>,
     rate: RateLimit,
-    last_used: AtomicU64,
 }
 
 /// One send slot, taken on one live destination.
@@ -86,7 +107,6 @@ pub(crate) struct Destination {
 /// only after the slot has been handed on.
 pub(crate) struct Reservation<'a> {
     slot: usize,
-    generation: u64,
     destination: Arc<Destination>,
     permit: OwnedSemaphorePermit,
     ticket: GateTicket<'a>,
@@ -107,7 +127,11 @@ impl DestinationFleet {
     pub(crate) fn new(config: FleetConfiguration) -> Result<Self, FleetConfigurationError> {
         config.validate()?;
         Ok(Self {
-            table: Mutex::new(vec![None; config.max_destinations].into_boxed_slice()),
+            table: Mutex::new(
+                (0..config.max_destinations)
+                    .map(|_| Cell::empty())
+                    .collect(),
+            ),
             gate: AdmissionGate::new(),
             stamp: AtomicU64::new(0),
             admitted: AtomicU64::new(0),
@@ -168,7 +192,9 @@ impl DestinationFleet {
         self.refused.load(Relaxed)
     }
 
-    /// The cell and generation `node` occupies, if it is live.
+    /// The cell `node` occupies and the stamp it was admitted at, if it is
+    /// live. Both together tell one occupancy from every other, so an eviction
+    /// and a re-admission into the same cell are observable.
     #[cfg(test)]
     pub(crate) fn live(&self, node: NodeId) -> Option<(usize, u64)> {
         self.table
@@ -176,8 +202,8 @@ impl DestinationFleet {
             .iter()
             .enumerate()
             .find_map(|(slot, cell)| {
-                let destination = cell.as_ref()?;
-                (destination.node == node).then_some((slot, destination.generation))
+                let occupant = cell.occupant.as_ref()?;
+                (occupant.node == node).then_some((slot, occupant.admitted_at))
             })
     }
 
@@ -188,8 +214,7 @@ impl DestinationFleet {
         self.table
             .lock()
             .iter()
-            .flatten()
-            .filter(|destination| destination.node == node)
+            .filter(|cell| cell.holds(node))
             .count()
     }
 
@@ -202,15 +227,19 @@ impl DestinationFleet {
     /// How many cells are occupied.
     #[cfg(test)]
     pub(crate) fn live_count(&self) -> usize {
-        self.table.lock().iter().flatten().count()
+        self.table
+            .lock()
+            .iter()
+            .filter(|cell| cell.occupant.is_some())
+            .count()
     }
 
     /// How many of `node`'s slots are free, if it is live.
     #[cfg(test)]
     pub(crate) fn available(&self, node: NodeId) -> Option<usize> {
         self.table.lock().iter().find_map(|cell| {
-            let destination = cell.as_ref()?;
-            (destination.node == node).then(|| destination.slots.available_permits())
+            let occupant = cell.occupant.as_ref()?;
+            (occupant.node == node).then(|| occupant.destination.slots.available_permits())
         })
     }
 
@@ -222,17 +251,11 @@ impl DestinationFleet {
 
     fn take_slot<'a>(
         &'a self,
-        table: &mut [Option<Arc<Destination>>],
+        table: &mut [Cell],
         node: NodeId,
         ticket: GateTicket<'a>,
     ) -> Result<Reservation<'a>, Refusal> {
         let (slot, destination) = self.find_or_admit(table, node)?;
-        // Stamped before the permit attempt, so the stamp means "last reserved
-        // against". A destination whose slots are all taken would otherwise
-        // never refresh it, and would be the first eviction candidate the
-        // moment it went idle — it would lose its cell under exactly the load
-        // that wants it kept.
-        destination.last_used.store(self.next_stamp(), Relaxed);
         // Taken under the table lock, so "nothing in flight" is an observation
         // eviction can trust: no slot can be taken on a cell being evicted.
         let permit = Arc::clone(&destination.slots)
@@ -240,35 +263,47 @@ impl DestinationFleet {
             .map_err(|_| Refusal::NoSlot)?;
         Ok(Reservation {
             slot,
-            generation: destination.generation,
             destination,
             permit,
             ticket,
         })
     }
 
-    /// Finds `node`'s cell, or gives it one.
+    /// Finds `node`'s cell or gives it one, and stamps it as reserved against.
     ///
     /// At most one cell holds a given node. A second cell for the same node
     /// would hand it a second semaphore, and its slot bound would be twice what
     /// the operator configured. The search below runs before every admission,
     /// which is what keeps that true.
+    ///
+    /// The stamp is taken before the caller tries for a permit, so it means
+    /// "last reserved against". A destination whose slots are all taken would
+    /// otherwise never refresh it, and would be the first eviction candidate
+    /// the moment it went idle — it would lose its cell under exactly the
+    /// load that wants it kept.
     fn find_or_admit(
         &self,
-        table: &mut [Option<Arc<Destination>>],
+        table: &mut [Cell],
         node: NodeId,
     ) -> Result<(usize, Arc<Destination>), Refusal> {
         let live = table.iter().enumerate().find_map(|(slot, cell)| {
-            let destination = cell.as_ref()?;
-            (destination.node == node).then(|| (slot, Arc::clone(destination)))
+            let occupant = cell.occupant.as_ref()?;
+            (occupant.node == node).then(|| (slot, Arc::clone(&occupant.destination)))
         });
-        if let Some(found) = live {
-            return Ok(found);
-        }
-        let slot = self.free_cell(table).ok_or(Refusal::NoDestination)?;
-        let destination = Arc::new(Destination::new(node, self.next_stamp(), self.config));
-        table[slot] = Some(Arc::clone(&destination));
-        self.admitted.fetch_add(1, Relaxed);
+        let (slot, destination) = if let Some(found) = live {
+            found
+        } else {
+            let slot = self.free_cell(table).ok_or(Refusal::NoDestination)?;
+            let destination = Arc::new(Destination::new(self.config));
+            table[slot].occupant = Some(Occupant {
+                node,
+                admitted_at: self.next_stamp(),
+                destination: Arc::clone(&destination),
+            });
+            self.admitted.fetch_add(1, Relaxed);
+            (slot, destination)
+        };
+        table[slot].last_used = self.next_stamp();
         Ok((slot, destination))
     }
 
@@ -277,20 +312,24 @@ impl DestinationFleet {
     /// A destination with a send in flight is never a candidate: evicting it
     /// would drop the table's reference while a worker still holds its slots,
     /// so a later admission of the same node would hand out a second set.
-    fn free_cell(&self, table: &mut [Option<Arc<Destination>>]) -> Option<usize> {
-        if let Some(slot) = table.iter().position(Option::is_none) {
+    ///
+    /// Whether a cell is idle is the one thing this walk cannot read from the
+    /// table, because a permit goes back outside the lock. So a cell is reached
+    /// for only while it improves on the best candidate so far, which leaves
+    /// the walk over the stamps themselves.
+    fn free_cell(&self, table: &mut [Cell]) -> Option<usize> {
+        if let Some(slot) = table.iter().position(|cell| cell.occupant.is_none()) {
             return Some(slot);
         }
-        let (_, idle) = table
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, cell)| {
-                let destination = cell.as_ref()?;
-                (destination.slots.available_permits() == self.config.slots_each)
-                    .then(|| (destination.last_used.load(Relaxed), slot))
-            })
-            .min()?;
-        table[idle] = None;
+        let mut candidate: Option<(u64, usize)> = None;
+        for (slot, cell) in table.iter().enumerate() {
+            if candidate.is_none_or(|(best, _)| cell.last_used < best) && cell.is_idle(self.config)
+            {
+                candidate = Some((cell.last_used, slot));
+            }
+        }
+        let (_, idle) = candidate?;
+        table[idle].occupant = None;
         self.evicted.fetch_add(1, Relaxed);
         Some(idle)
     }
@@ -300,14 +339,37 @@ impl DestinationFleet {
     }
 }
 
-impl Destination {
-    fn new(node: NodeId, generation: u64, config: FleetConfiguration) -> Self {
+impl Cell {
+    /// A cell no destination has ever occupied.
+    const fn empty() -> Self {
         Self {
-            node,
-            generation,
+            last_used: 0,
+            occupant: None,
+        }
+    }
+
+    /// Whether this cell holds `node`.
+    fn holds(&self, node: NodeId) -> bool {
+        self.occupant
+            .as_ref()
+            .is_some_and(|occupant| occupant.node == node)
+    }
+
+    /// Whether this cell's destination has nothing queued and nothing in
+    /// flight. An empty cell is not idle: it is free, which the caller finds
+    /// first.
+    fn is_idle(&self, config: FleetConfiguration) -> bool {
+        self.occupant.as_ref().is_some_and(|occupant| {
+            occupant.destination.slots.available_permits() == config.slots_each
+        })
+    }
+}
+
+impl Destination {
+    fn new(config: FleetConfiguration) -> Self {
+        Self {
             slots: Arc::new(Semaphore::new(config.slots_each)),
             rate: RateLimit::new(config.sends_per_second),
-            last_used: AtomicU64::new(generation),
         }
     }
 
@@ -324,11 +386,6 @@ impl Reservation<'_> {
         self.slot
     }
 
-    /// Which occupant of that cell this reservation belongs to.
-    pub(crate) const fn generation(&self) -> u64 {
-        self.generation
-    }
-
     /// The destination itself, for a sender that must keep it alive.
     pub(crate) const fn destination(&self) -> &Arc<Destination> {
         &self.destination
@@ -338,14 +395,14 @@ impl Reservation<'_> {
     ///
     /// The gate covers the whole hand-over, not the reservation alone. A
     /// shutdown that has seen the count reach zero must find nobody still about
-    /// to queue work, and passing the slot through a closure is what makes that
-    /// structural: the ticket cannot outlive the hand-over and cannot precede
-    /// it. The slot itself stays taken until the permit `queue` was given
-    /// drops, which is what keeps the destination unevictable while its send is
-    /// in flight.
-    pub(crate) fn commit<T, F>(self, queue: F) -> T
+    /// to queue work, so the hand-over runs inside a closure the gate outlives.
+    /// `queue` reports only whether it took the slot, so the slot cannot leave
+    /// through the return value. The slot itself stays taken until the permit
+    /// `queue` was given drops, which is what keeps the destination unevictable
+    /// while its send is in flight.
+    pub(crate) fn commit<E, F>(self, queue: F) -> Result<(), E>
     where
-        F: FnOnce(OwnedSemaphorePermit) -> T,
+        F: FnOnce(OwnedSemaphorePermit) -> Result<(), E>,
     {
         let Self { permit, ticket, .. } = self;
         let outcome = queue(permit);

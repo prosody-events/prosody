@@ -181,6 +181,37 @@ fn an_over_cap_response_is_refused_before_it_is_framed() -> Result<()> {
     Ok(())
 }
 
+/// A released encoder holds nothing of the response before it: the scratch is
+/// emptied and given back to the cap, whatever the codec left there.
+///
+/// What an encoder holds between responses is what the process holds, because a
+/// destination can go quiet for as long as it likes. The moving codec is the
+/// case that matters — it hands its own buffer over, at a capacity the cap
+/// never bounded.
+#[test]
+fn a_released_encoder_holds_nothing_of_the_response_before_it() -> Result<()> {
+    let cap = FrameCap::new(1024)?;
+    let header = header("billing", ErrorCategory::Permanent, None)?;
+    for codec in [CountingCodec::default(), CountingCodec::moving()] {
+        let mut encoder = FrameEncoder::new(codec, cap);
+        let mut dst = BytesMut::with_capacity(cap.bytes());
+        // Far more capacity than the cap, so a scratch left as the codec handed
+        // it over is unmistakable.
+        let mut payload = Vec::with_capacity(cap.bytes() * 4);
+        payload.extend_from_slice(b"hi");
+
+        encoder.stage(&header, payload)?.write(&mut dst);
+        encoder.release();
+        assert!(
+            encoder.scratch_capacity() <= cap.bytes(),
+            "a released encoder holds {} bytes, over the {}-byte cap",
+            encoder.scratch_capacity(),
+            cap.bytes()
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn one_response_frames_to_known_bytes() -> Result<()> {
     let cap = FrameCap::new(1024)?;

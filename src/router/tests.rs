@@ -116,7 +116,7 @@ fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<(
 
         let clone = router.clone();
         assert!(
-            ptr::eq(router.fleet(), clone.fleet()),
+            Arc::ptr_eq(router.fleet(), clone.fleet()),
             "a clone must share the one fleet the process owns"
         );
         assert!(

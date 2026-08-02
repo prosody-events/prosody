@@ -8,7 +8,6 @@ use crate::router::fleet::config::{
 };
 use color_eyre::Result;
 use std::time::Duration;
-use validator::Validate;
 
 /// The largest table and the largest slot count the ceiling admits together.
 /// Derived from the production ceilings, so raising one cannot leave this suite
@@ -28,7 +27,7 @@ fn the_startup_ceiling_refuses_an_over_large_fleet() -> Result<()> {
         .slots_each(CEILING_SLOTS + 1)
         .build()?;
     assert!(
-        over.validate().is_err(),
+        DestinationFleet::new(over).is_err(),
         "a fleet over the slot ceiling must be refused"
     );
 
@@ -37,7 +36,7 @@ fn the_startup_ceiling_refuses_an_over_large_fleet() -> Result<()> {
         .slots_each(CEILING_SLOTS)
         .build()?;
     assert!(
-        largest.validate().is_ok(),
+        DestinationFleet::new(largest).is_ok(),
         "the largest fleet inside the ceiling must be accepted"
     );
     Ok(())

@@ -14,19 +14,18 @@ use crate::codec::Codec;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::{FrameCap, FrameHeader};
 use crate::router::directory::Endpoint;
-use crate::router::fleet::config::{
-    FleetConfiguration, FleetConfigurationError, validate_scratch_budget,
-};
-use crate::router::fleet::{Destination, Refusal, Reservation};
+use crate::router::fleet::config::{FleetConfigurationError, validate_scratch_budget};
+use crate::router::fleet::{Destination, DestinationFleet, Refusal};
 use crate::router::{Framed, ResponseSender, Router, SendFailure};
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::select;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use tracing::warn;
 
@@ -44,41 +43,46 @@ mod tests;
 ///
 /// Because the fleet is process-owned, a response queued before a partition is
 /// revoked is still delivered.
-pub(crate) struct TypedSender<C: Codec, R> {
-    router: R,
-    /// One cell per fleet cell. The boxed slice has no `push`, so no send can
-    /// grow it. A lane is replaced when its generation no longer matches the
-    /// reservation's, which is both how an evicted destination's lane is
-    /// removed and how a lane whose worker ended is rebuilt.
-    lanes: Mutex<Box<[Option<Lane<C>>]>>,
-    cap: FrameCap,
-    config: FleetConfiguration,
+pub(crate) struct TypedSender<C: Codec> {
+    /// The fleet every send reserves from. Held rather than read from the
+    /// router on each send, so the cell a reservation names always indexes the
+    /// queues below: both are the length one configuration gave.
+    fleet: Arc<DestinationFleet>,
+    /// One queue per fleet cell, and one worker draining each of them. Both are
+    /// built once, so a send neither allocates a queue nor starts a task.
+    ///
+    /// One worker per queue, not several. `tokio::sync::mpsc` has exactly one
+    /// receiver. More workers would therefore need a shared receiver behind an
+    /// async lock, or a round robin over private queues. A round robin strands
+    /// jobs behind one stalled worker. Concurrency per destination would only
+    /// buy throughput against a slow peer, and the rate limit already bounds
+    /// that.
+    ///
+    /// A queue holds work for at most one destination at a time, whatever
+    /// occupies its cell over the process's life: a queued job holds one of its
+    /// destination's slots, and a cell is only evictable while every slot of it
+    /// is free.
+    queues: Box<[Sender<Job<C>>]>,
+    workers: Box<[JoinHandle<()>]>,
+    send_deadline: Duration,
     counters: Arc<SendCounters>,
 }
 
 /// What every worker of one sender shares.
-struct LaneContext<R> {
+struct WorkerContext<R> {
     router: R,
     attempts: u32,
     counters: Arc<SendCounters>,
-}
-
-/// One destination's queue, and which occupant of its cell it feeds.
-///
-/// One worker per destination, not several. `tokio::sync::mpsc` has exactly one
-/// receiver. More workers would therefore need a shared receiver behind an
-/// async lock, or a round robin over private queues. A round robin strands jobs
-/// behind one stalled worker. Concurrency per destination would only buy
-/// throughput against a slow peer, and the rate limit already bounds that.
-struct Lane<C: Codec> {
-    generation: u64,
-    jobs: Sender<Job<C>>,
 }
 
 /// One response, waiting for its turn on a destination.
 struct Job<C: Codec> {
     header: FrameHeader,
     payload: C::Payload,
+    /// The destination this response is paced against. Carried by the job
+    /// rather than by the queue, so a queue outlives every occupant of its cell
+    /// and a worker never paces one destination against another's schedule.
+    destination: Arc<Destination>,
     /// Released when the send ends: by delivery, by a terminal status, by the
     /// deadline, or by the drain.
     slot: OwnedSemaphorePermit,
@@ -96,24 +100,48 @@ pub(crate) struct SendCounters {
     dropped: AtomicU64,
 }
 
-impl<C: Codec, R: Router> TypedSender<C, R> {
+impl<C: Codec> TypedSender<C> {
     /// Builds a sender over `router`'s fleet, with `cap` as the frame ceiling.
+    ///
+    /// One queue and one worker per fleet cell are built here, and each worker
+    /// builds its codec and its encode scratch at the cap. Everything a send
+    /// needs therefore exists before the first one, which is what leaves the
+    /// send path with nothing to allocate. Call this from inside a runtime: the
+    /// workers are spawned tasks.
     ///
     /// # Errors
     ///
     /// Returns [`FleetConfigurationError::ScratchBudget`] when one encode
     /// buffer per destination at `cap` exceeds what one sender may commit to.
-    pub(crate) fn new(router: R, cap: FrameCap) -> Result<Self, FleetConfigurationError> {
-        let config = router.fleet().config();
+    pub(crate) fn new<R: Router>(
+        router: &R,
+        cap: FrameCap,
+    ) -> Result<Self, FleetConfigurationError> {
+        let fleet = Arc::clone(router.fleet());
+        let config = fleet.config();
         validate_scratch_budget(config.max_destinations, cap)?;
-        let mut lanes = Vec::with_capacity(config.max_destinations);
-        lanes.resize_with(config.max_destinations, || None);
+        let counters = Arc::new(SendCounters::default());
+        let mut queues = Vec::with_capacity(config.max_destinations);
+        let mut workers = Vec::with_capacity(config.max_destinations);
+        for _ in 0..config.max_destinations {
+            let (jobs, queue) = channel(config.slots_each);
+            queues.push(jobs);
+            workers.push(tokio::spawn(run_worker(
+                queue,
+                WorkerContext {
+                    router: router.clone(),
+                    attempts: config.max_send_attempts,
+                    counters: Arc::clone(&counters),
+                },
+                cap,
+            )));
+        }
         Ok(Self {
-            router,
-            lanes: Mutex::new(lanes.into_boxed_slice()),
-            cap,
-            config,
-            counters: Arc::new(SendCounters::default()),
+            fleet,
+            queues: queues.into_boxed_slice(),
+            workers: workers.into_boxed_slice(),
+            send_deadline: config.send_deadline,
+            counters,
         })
     }
 
@@ -121,31 +149,36 @@ impl<C: Codec, R: Router> TypedSender<C, R> {
     ///
     /// Never awaits. An apply hook calls this, and apply hooks are per-key
     /// serialized: the next event for the same key waits for the hook to
-    /// return. So every step here refuses rather than waits — the reservation,
-    /// the lane and the queue alike.
+    /// return. So every step here refuses rather than waits — the reservation
+    /// and the queue alike.
     ///
     /// # Errors
     ///
     /// Returns [`Refused::Fleet`] when the fleet refused a slot, and
-    /// [`Refused::Queue`] when the destination's lane could not take the job.
+    /// [`Refused::Queue`] when the destination's queue could not take the job.
     pub(crate) fn send(&self, header: FrameHeader, payload: C::Payload) -> Result<(), Refused> {
-        let reservation = self.router.fleet().reserve(header.target)?;
-        let jobs = self.lane(&reservation);
-        let expires_at = Instant::now() + self.config.send_deadline;
+        let reservation = self.fleet.reserve(header.target)?;
+        // The cell a reservation names is one of this fleet's, and this
+        // sender's queues are the same fleet's length.
+        let jobs = &self.queues[reservation.slot()];
+        let destination = Arc::clone(reservation.destination());
+        let expires_at = Instant::now() + self.send_deadline;
         reservation.commit(|slot| {
             let job = Job {
                 header,
                 payload,
+                destination,
                 slot,
                 expires_at,
             };
             if jobs.try_send(job).is_err() {
-                // `Full` cannot happen. Every lane on one destination draws
-                // from that destination's one set of slots, and every queued
-                // job holds one of them. A job that got a slot therefore always
-                // has room. `Closed` means the worker ended between the lane
-                // check and here. Dropping the returned job releases its slot.
-                // This is the one drop that no dequeued job accounts for.
+                // `Full` cannot happen. A queue is as deep as its destination
+                // has slots, every job in it holds one of them, and a cell only
+                // changes occupant while every slot of it is free. A job that
+                // got a slot therefore always has room. `Closed` means the
+                // worker ended, which only a drain or a panic does. Dropping
+                // the returned job releases its slot. This is the one drop that
+                // no dequeued job accounts for.
                 self.counters.dropped.fetch_add(1, Relaxed);
                 return Err(Refused::Queue);
             }
@@ -159,42 +192,25 @@ impl<C: Codec, R: Router> TypedSender<C, R> {
         Arc::clone(&self.counters)
     }
 
-    /// The lane for this reservation's destination, built when the cell holds
-    /// none or holds one for an earlier occupant.
+    /// Stops taking work and returns once every worker has finished what it
+    /// holds.
     ///
-    /// Building one allocates: a queue of `slots_each` and one task, per
-    /// admission. The live lanes are bounded by `max_destinations`, because a
-    /// lane's cell is the fleet cell its destination occupies.
-    ///
-    /// Replacing a lane drops its queue handle; the retired worker delivers
-    /// what it already holds and then exits. That is a lane's removal path.
-    fn lane(&self, reservation: &Reservation<'_>) -> Sender<Job<C>> {
-        let mut lanes = self.lanes.lock();
-        // `Reservation::slot` indexes the same fleet table this sender was
-        // sized from, so the cell always exists.
-        let cell = &mut lanes[reservation.slot()];
-        if let Some(lane) = cell.as_ref()
-            && lane.generation == reservation.generation()
-            && !lane.jobs.is_closed()
-        {
-            return lane.jobs.clone();
+    /// Bounded by the configured deadline: each response a worker still holds
+    /// ends at its own expiry, so the wait is at most one deadline past the
+    /// last response queued. Shutdown runs this after the fleet's admission
+    /// gate has drained, so nothing can be queued while it waits.
+    pub(crate) async fn drain(self) {
+        let Self {
+            queues, workers, ..
+        } = self;
+        // Dropping the queues is what tells a worker no more work is coming;
+        // it delivers what it already holds and then exits.
+        drop(queues);
+        for worker in Vec::from(workers) {
+            if let Err(error) = worker.await {
+                warn!(%error, "a response delivery worker did not exit cleanly");
+            }
         }
-        let (jobs, queue) = channel(self.config.slots_each);
-        drop(tokio::spawn(run_lane(
-            queue,
-            Arc::clone(reservation.destination()),
-            LaneContext {
-                router: self.router.clone(),
-                attempts: self.config.max_send_attempts,
-                counters: Arc::clone(&self.counters),
-            },
-            self.cap,
-        )));
-        *cell = Some(Lane {
-            generation: reservation.generation(),
-            jobs: jobs.clone(),
-        });
-        jobs
     }
 }
 
@@ -210,22 +226,21 @@ impl SendCounters {
     }
 }
 
-/// One destination's worker: it drains the lane, encodes each response into its
-/// own scratch, and delivers it.
+/// One cell's worker: it drains the queue, encodes each response into its own
+/// scratch, and delivers it.
 ///
-/// The codec and the scratch are built once here, so the steady-state send path
-/// allocates nothing. The loop keeps draining after its queue handle drops, so
-/// a queued response outlives the layer that queued it.
+/// The codec and the scratch are built once here, so the send path allocates
+/// nothing. The loop keeps draining after its queue handle drops, so a queued
+/// response outlives the layer that queued it.
 ///
 /// Exactly one counter moves per dequeued job. The deadline is the biased arm
 /// of the select, so a job whose deadline has already passed is dropped before
 /// the pipeline is polled at all — nothing is paced, encoded or sent for it.
 /// Work already inside one poll still finishes: this is a deadline the pipeline
 /// is measured against between polls, never an absolute wall-clock cut.
-async fn run_lane<C: Codec, R: Router>(
+async fn run_worker<C: Codec, R: Router>(
     mut queue: Receiver<Job<C>>,
-    destination: Arc<Destination>,
-    context: LaneContext<R>,
+    context: WorkerContext<R>,
     cap: FrameCap,
 ) {
     let mut encoder = FrameEncoder::new(C::default(), cap);
@@ -233,6 +248,7 @@ async fn run_lane<C: Codec, R: Router>(
         let Job {
             header,
             payload,
+            destination,
             slot,
             expires_at,
         } = job;
@@ -251,6 +267,9 @@ async fn run_lane<C: Codec, R: Router>(
         } else {
             context.counters.dropped.fetch_add(1, Relaxed);
         }
+        // A worker can wait for its next response for as long as its
+        // destination is quiet, so it gives the response's bytes back first.
+        encoder.release();
         drop(slot);
     }
 }
@@ -262,7 +281,7 @@ async fn run_lane<C: Codec, R: Router>(
 async fn deliver_job<C: Codec, R: Router>(
     encoder: &mut FrameEncoder<C>,
     destination: &Destination,
-    context: &LaneContext<R>,
+    context: &WorkerContext<R>,
     header: FrameHeader,
     payload: C::Payload,
 ) -> bool {
@@ -334,7 +353,7 @@ pub(crate) enum Refused {
     #[error(transparent)]
     Fleet(#[from] Refusal),
 
-    /// The destination's lane could not take the response.
+    /// The destination's queue could not take the response.
     #[error("the destination's queue could not take the response")]
     Queue,
 }

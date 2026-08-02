@@ -120,7 +120,10 @@ pub(crate) trait Router: Clone + Send + Sync + 'static {
     fn sender(&self) -> &Self::Sender;
 
     /// The process-wide fleet a response reserves a send slot from.
-    fn fleet(&self) -> &DestinationFleet;
+    ///
+    /// Shared rather than borrowed, so a sender sized from this fleet can hold
+    /// it and can never reserve from another one.
+    fn fleet(&self) -> &Arc<DestinationFleet>;
 }
 
 /// The production [`Router`]: addresses from the directory's bounded cache,
@@ -229,7 +232,7 @@ impl<S: ResponseSender> Router for RouterHandle<S> {
         &self.transport
     }
 
-    fn fleet(&self) -> &DestinationFleet {
+    fn fleet(&self) -> &Arc<DestinationFleet> {
         &self.fleet
     }
 }
