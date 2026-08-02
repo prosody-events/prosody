@@ -56,6 +56,40 @@ jobs:
           packages: cmake libcurl4-openssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Verify linked crate versions
+        run: |
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          prosody_version="$(
+            jq -r '
+              .packages[]
+              | select(.name == "prosody")
+              | .version
+            ' <<<"$metadata"
+          )"
+          macros_version="$(
+            jq -r '
+              .packages[]
+              | select(.name == "prosody-macros")
+              | .version
+            ' <<<"$metadata"
+          )"
+          macros_requirement="$(
+            jq -r '
+              .packages[]
+              | select(.name == "prosody")
+              | .dependencies[]
+              | select(.name == "prosody-macros")
+              | .req
+            ' <<<"$metadata"
+          )"
+          if [[ "$prosody_version" != "$macros_version" ]]; then
+            echo "prosody $prosody_version and prosody-macros $macros_version must match." >&2
+            exit 1
+          fi
+          if [[ "$macros_requirement" != "^$macros_version" ]]; then
+            echo "prosody requires prosody-macros $macros_requirement, not ^$macros_version." >&2
+            exit 1
+          fi
       - name: Authenticate with crates.io
         uses: rust-lang/crates-io-auth-action@v1
         id: auth

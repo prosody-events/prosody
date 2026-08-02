@@ -11,8 +11,11 @@ instead of this crate directly.
 
 ## Version compatibility
 
-Use the same version of `prosody-macros` and `prosody`. The `prosody` crate
-selects the correct version automatically.
+Release Please gives both crates the same version for each release. Cargo can
+select a newer compatible macro version.
+
+Each macro release must follow Cargo's compatibility rules. The `prosody` crate
+selects the compatible version automatically.
 
 ## License
 
