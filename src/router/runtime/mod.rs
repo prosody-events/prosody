@@ -238,10 +238,13 @@ impl PeerRuntime {
 /// The local address the operating system would use to reach `contact`.
 ///
 /// Connecting a UDP socket sends nothing: it only asks the routing table which
-/// interface would carry that traffic, so the answer is by construction an
-/// address on a network the rest of the deployment already shares. Any failure
-/// — an unresolvable contact point, no route — yields `None`, and the next
-/// source in the discovery order answers.
+/// interface would carry that traffic. The answer is the address that reaches
+/// the contact point, and nothing more. A loopback contact point answers with a
+/// loopback address, and a host that reaches Cassandra over a management
+/// interface answers with the management address. A peer elsewhere reaches
+/// neither, which is what [`RouterConfiguration::advertised_host`] is for. Any
+/// failure — an unresolvable contact point, no route — yields `None`, and the
+/// next source in the discovery order answers.
 fn routed_host(contact: &str) -> Option<Host> {
     let Ok(mut targets) = contact.to_socket_addrs() else {
         return None;
