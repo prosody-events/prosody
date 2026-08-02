@@ -37,14 +37,8 @@ jobs:
     needs: plan
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v6
-      - name: Install mold
-        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
-        with:
-          make-default: false
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@v1.6.0
         with:
