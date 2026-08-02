@@ -294,6 +294,9 @@ impl DescriptorIdentityStore for CountingIdentityStore {
     }
 }
 
+/// A reader over one scripted env's stores.
+type ScriptedReader<D> = StateReader<D, JsonCodec, ScriptedReaderBackend>;
+
 /// A scripted bundle: the fault source over its own backing cells, plus the
 /// scripted publication store and counting identity store the refresh/probe
 /// arms drive.
@@ -420,9 +423,7 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
     }
 
     /// An eager reader (refreshes every operation) on a wall-clock cache.
-    pub(in crate::state_reader::tests) fn reader_eager(
-        &self,
-    ) -> Result<StateReader<D, JsonCodec, ScriptedReaderBackend>> {
+    pub(in crate::state_reader::tests) fn reader_eager(&self) -> Result<ScriptedReader<D>> {
         self.reader_eager_with_cache(ReaderCache::with_budget(1 << 20))
     }
 
@@ -431,7 +432,7 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
     pub(in crate::state_reader::tests) fn reader_eager_with_cache(
         &self,
         cache: ReaderCache,
-    ) -> Result<StateReader<D, JsonCodec, ScriptedReaderBackend>> {
+    ) -> Result<ScriptedReader<D>> {
         let deps = self.deps_with_cache(cache);
         StateReader::new_eager(&deps, self.sub.clone(), self.descriptor)
             .map_err(|e| eyre!("reader: {e}"))
@@ -444,7 +445,7 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
         &self,
         cache: ReaderCache,
         refresh_interval: Duration,
-    ) -> Result<StateReader<D, JsonCodec, ScriptedReaderBackend>> {
+    ) -> Result<ScriptedReader<D>> {
         let deps = self.deps_with_cache(cache);
         StateReader::with_refresh_interval(
             &deps,
@@ -453,5 +454,26 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
             refresh_interval,
         )
         .map_err(|e| eyre!("reader: {e}"))
+    }
+
+    /// Two readers over one dependency bundle. Both resolve the same
+    /// publication-cache key, so they share one collection snapshot: that is
+    /// what lets a schedule race two callers against one generation.
+    pub(in crate::state_reader::tests) fn shared_readers(
+        &self,
+        cache: ReaderCache,
+        refresh_interval: Duration,
+    ) -> Result<(ScriptedReader<D>, ScriptedReader<D>)> {
+        let deps = self.deps_with_cache(cache);
+        let build = || {
+            StateReader::with_refresh_interval(
+                &deps,
+                self.sub.clone(),
+                self.descriptor,
+                refresh_interval,
+            )
+            .map_err(|e| eyre!("reader: {e}"))
+        };
+        Ok((build()?, build()?))
     }
 }

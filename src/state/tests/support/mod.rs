@@ -52,7 +52,7 @@ mod ttl;
 
 pub(crate) use counting::{CountingCellStore, CountingResolver, ResolveCounter};
 pub(crate) use holding::{HoldingCellStore, Holds};
-pub(crate) use publication::{PublicationCall, ScriptedPublicationStore};
+pub(crate) use publication::{ParkedRead, PublicationCall, ScriptedPublicationStore};
 pub(crate) use ttl::TtlStub;
 
 /// Get-out-of-the-way commit oracle: `record_message` is a no-op and every

@@ -24,6 +24,18 @@ struct ReleaseGate {
     released: Semaphore,
 }
 
+/// A read left parked at the read gate after gating stopped. A later read then
+/// runs to completion while this one stays parked, which is how a schedule
+/// proves an in-flight refresh blocks nobody.
+pub(crate) struct ParkedRead(Arc<ReleaseGate>);
+
+impl ParkedRead {
+    /// Releases the parked read.
+    pub(crate) fn release(&self) {
+        self.0.released.add_permits(1);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ScriptedPublicationStore {
     inner: MemoryPublicationStore,
@@ -118,10 +130,9 @@ impl ScriptedPublicationStore {
         }
     }
 
-    pub(crate) fn release_read(&self) {
-        if let Some(gate) = &*self.read_gate.lock() {
-            gate.released.add_permits(1);
-        }
+    /// Stops gating new reads and returns a handle to the read already parked.
+    pub(crate) fn stop_gating_reads(&self) -> Option<ParkedRead> {
+        self.read_gate.lock().take().map(ParkedRead)
     }
 
     pub(crate) async fn seed(

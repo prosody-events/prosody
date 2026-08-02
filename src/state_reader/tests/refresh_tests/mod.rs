@@ -11,6 +11,11 @@
 //! every read serves the held outcome without a store read, and past which the
 //! next read re-reads the routing table.
 //!
+//! [`publication`] owns the deterministic publication schedules: what two
+//! callers observe when they race one generation of the shared snapshot. Every
+//! schedule observes the overlap through the publication store's read gate,
+//! never through elapsed time.
+//!
 //! The two focused examples below cover what the properties cannot model: a
 //! frozen identity that is present but disagrees, and an oversized routing
 //! table. Both need precise interval and clock control. Both are the same
@@ -24,6 +29,7 @@
 //! Both properties drive a mocked clock, never a sleep.
 
 mod pacing;
+mod publication;
 mod snapshot;
 
 use super::support::{GROUP_A, GROUP_B, ScriptedEnv, mock_clock_cache, topic};
@@ -92,7 +98,7 @@ fn outcome_matches(expect: &Expect, observed: &Result<Option<Value>, StateReader
 ///
 /// Falsify: drop the sticky-mismatch cached-path branch in
 /// `StateReader::snapshot` → op 2 within the interval serves A's `Ok(None)`.
-/// Drop the failed-read sticky arm in `refresh` → op 3 serves A's subset.
+/// Drop the failed-read sticky arm in `failed` → op 3 serves A's subset.
 #[tokio::test]
 async fn identity_mismatch_sticky() -> Result<()> {
     let descriptor = value_state::<JsonCodec>("v-sticky");

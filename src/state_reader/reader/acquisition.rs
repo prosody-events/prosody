@@ -5,17 +5,17 @@
 //! [`StateReader::snapshot`] is the refresh-if-stale entry point every read
 //! goes through.
 
+use super::admission::{Admission, Diagnostics};
 use crate::state::descriptor::StateDescriptor;
 use crate::state::publication::PublicationStore;
 use crate::state_reader::ReaderBackend;
 use crate::state_reader::error::StateReaderError;
 use crate::state_reader::source::{MAX_PUBLICATION_SOURCES, NoSnapshot, ValidatedPublications};
 use crate::{Codec, state_reader::reader::StateReader};
-use parking_lot::RwLock;
+use arc_swap::{ArcSwap, Guard};
 use quanta::Instant;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tracing::warn;
 
 /// The default snapshot-refresh cadence: a source list changes rarely, so the
@@ -43,6 +43,7 @@ pub(in crate::state_reader) const ABSENT_BACKOFF: Duration = Duration::from_secs
 /// Exactly one of the three holds at a time, so the precedence a read needs is
 /// structural. A Permanent fault can never be masked by the admitted subset it
 /// was found alongside, because there is nowhere to hold both.
+#[derive(Clone)]
 enum Acquired {
     /// The validated snapshot reads resolve against.
     Sources(Arc<ValidatedPublications>),
@@ -56,6 +57,7 @@ enum Acquired {
 /// on every read until a refresh re-validates it away. Only an operator
 /// changing the deployment or the routing table can clear one, so re-reading
 /// the routing table per read buys nothing.
+#[derive(Clone)]
 enum Fault {
     /// A source's frozen identity disagrees with the reader's descriptor,
     /// carrying the publishing group.
@@ -96,7 +98,7 @@ enum Absence {
 /// The default is the never-refreshed state, which is why a fresh reader
 /// refreshes on its first read.
 #[derive(Default)]
-pub(crate) struct SnapshotState {
+struct SnapshotState {
     /// What the last refresh acquired; `None` until one completes.
     acquired: Option<Acquired>,
     /// When the last refresh completed.
@@ -108,11 +110,21 @@ pub(crate) struct SnapshotState {
     retry_after: Option<Instant>,
 }
 
-/// The cached publication state and its single-flight refresh gate.
+/// The collection's published acquisition state.
+///
+/// One immutable [`SnapshotState`] is published at a time. A read loads it
+/// without a lock. A stale read builds a replacement from the exact state it
+/// observed and publishes that replacement with a pointer compare-and-swap, so
+/// no read waits for another read's refresh.
 #[derive(Default)]
-pub(crate) struct PublicationSnapshot {
-    pub(super) state: RwLock<SnapshotState>,
-    pub(super) refresh: Mutex<()>,
+pub(crate) struct PublicationSnapshot(ArcSwap<SnapshotState>);
+
+/// The state a read resolves against after one publication attempt.
+enum Published {
+    /// This caller published its candidate.
+    Won(Arc<SnapshotState>),
+    /// Another caller published first. Its state is what every read now sees.
+    Lost(Arc<SnapshotState>),
 }
 
 impl SnapshotState {
@@ -173,50 +185,21 @@ where
     /// held sticky until a refresh re-validates it away (see [`Fault`]). A
     /// missing identity skips that source with a `warn!`.
     ///
-    /// One asynchronous gate single-flights refresh I/O. The held acquisition
-    /// remains separately readable while that I/O is in flight. A concurrent
-    /// read serves it immediately. Only the first acquisition waits because it
-    /// has no snapshot to serve.
+    /// A read loads the published state without a lock. A stale read refreshes
+    /// and publishes the result with a compare-and-swap. A caller that loses
+    /// that race adopts the winner's state, so no caller waits for another
+    /// caller's refresh. Every stale caller that starts before a winner
+    /// publishes may issue one routing read.
     pub(super) async fn snapshot(&self) -> Result<Arc<ValidatedPublications>, StateReaderError> {
+        // The owned handle is held across the refresh, so the observed
+        // allocation stays alive and its address cannot be recycled under the
+        // pointer compare-and-swap that publishes the replacement.
+        let observed = self.publication.0.load_full();
         let now = self.clock.now();
-        {
-            let state = self.publication.state.read();
-            if state.within_pacing(now) || state.is_fresh(now, self.refresh_interval) {
-                return match &state.acquired {
-                    Some(acquired) => self.serve(acquired),
-                    None => Err(self.refresh_unavailable()),
-                };
-            }
+        if observed.within_pacing(now) || observed.is_fresh(now, self.refresh_interval) {
+            return self.serve_state(&observed);
         }
-
-        let refresh = if let Ok(refresh) = self.publication.refresh.try_lock() {
-            refresh
-        } else {
-            let held = {
-                let state = self.publication.state.read();
-                state.acquired.as_ref().map(|acquired| self.serve(acquired))
-            };
-            if let Some(outcome) = held {
-                return outcome;
-            }
-            self.publication.refresh.lock().await
-        };
-
-        // A refresh may have completed while a first acquisition waited for
-        // the gate. Re-check before issuing another store read.
-        let now = self.clock.now();
-        {
-            let state = self.publication.state.read();
-            if state.within_pacing(now) || state.is_fresh(now, self.refresh_interval) {
-                return match &state.acquired {
-                    Some(acquired) => self.serve(acquired),
-                    None => Err(self.refresh_unavailable()),
-                };
-            }
-        }
-        let outcome = self.refresh(now).await;
-        drop(refresh);
-        outcome
+        self.refresh(&observed, now).await
     }
 
     /// The outcome a read resolves to for `acquired`.
@@ -228,10 +211,27 @@ where
         }
     }
 
-    /// Re-reads the routing table and applies the three-outcome rule, mutating
-    /// `state` in place (see [`Self::snapshot`]).
-    async fn refresh(&self, now: Instant) -> Result<Arc<ValidatedPublications>, StateReaderError> {
-        let prior = self.publication.state.read().sources();
+    /// The outcome a read resolves to for `state`: what its last refresh
+    /// acquired, or [`StateReaderError::RefreshUnavailable`] when no refresh
+    /// has completed.
+    fn serve_state(
+        &self,
+        state: &SnapshotState,
+    ) -> Result<Arc<ValidatedPublications>, StateReaderError> {
+        match &state.acquired {
+            Some(acquired) => self.serve(acquired),
+            None => Err(self.refresh_unavailable()),
+        }
+    }
+
+    /// Re-reads the routing table from the state this caller observed and
+    /// applies the three-outcome rule (see [`Self::snapshot`]).
+    async fn refresh(
+        &self,
+        observed: &Arc<SnapshotState>,
+        now: Instant,
+    ) -> Result<Arc<ValidatedPublications>, StateReaderError> {
+        let prior = observed.sources();
         let rows = match self
             .context
             .backend
@@ -244,7 +244,7 @@ where
             // A failed read keeps the previous acquisition untouched, not
             // merely its admitted subset. A transient outage is no evidence a
             // known mismatch was repaired, so a sticky fault survives it.
-            Err(error) => return self.failed("routing", error),
+            Err(error) => return self.failed(observed, "routing", error),
         };
 
         // The cap bounds the identity fan-out below, so it is checked against
@@ -252,24 +252,32 @@ where
         // afterwards. Checked late, an oversized routing table would first pay
         // one identity read per advertised group.
         if rows.len() > MAX_PUBLICATION_SOURCES {
-            return self.acquire(Acquired::Fault(Fault::TooManySources(rows.len())), now);
+            return self.acquire(
+                observed,
+                Acquired::Fault(Fault::TooManySources(rows.len())),
+                &Diagnostics::default(),
+                now,
+            );
         }
 
-        let admission = match self.admit(&rows, prior.as_deref()).await {
+        let Admission {
+            admitted,
+            diagnostics,
+        } = match self.admit(&rows, prior.as_deref()).await {
             Ok(admission) => admission,
             // An identity-read failure mid-admit is a transient outage, on the
             // same footing as a failed routing read.
-            Err(error) => return self.failed("identity", error),
+            Err(error) => return self.failed(observed, "identity", error),
         };
 
         // Withdrawals took effect on `admitted` regardless of outcome, so the
         // acquisition is published even when it surfaces a fault: a later
         // refresh must see the withdrawal.
-        let acquired = match admission.mismatch {
+        let acquired = match diagnostics.mismatch() {
             Some(group) => Acquired::Fault(Fault::IdentityMismatch(group)),
-            None => match ValidatedPublications::new(admission.admitted) {
+            None => match ValidatedPublications::new(admitted) {
                 Ok(sources) => Acquired::Sources(Arc::new(sources)),
-                Err(NoSnapshot::NoSource) if admission.any_missing => {
+                Err(NoSnapshot::NoSource) if diagnostics.any_missing() => {
                     Acquired::Absent(Absence::NoIdentity)
                 }
                 Err(NoSnapshot::NoSource) => Acquired::Absent(Absence::NoPublication),
@@ -278,7 +286,7 @@ where
                 }
             },
         };
-        self.acquire(acquired, now)
+        self.acquire(observed, acquired, &diagnostics, now)
     }
 
     /// Publishes what a completed refresh acquired and returns the outcome
@@ -288,22 +296,33 @@ where
     /// [`ABSENT_BACKOFF`]); one that found sources or a fault clears the
     /// pacing an earlier failure left behind. The pacing deadline is sampled
     /// here, after the refresh's reads returned, so a slow store cannot consume
-    /// the window.
+    /// the window. `at` stays the pre-refresh observation instant, so freshness
+    /// counts from when the caller decided to refresh.
+    ///
+    /// The winner of the publication emits the refresh's `diagnostics`, so a
+    /// burst of speculative refreshers reports each observation once.
     fn acquire(
         &self,
+        observed: &Arc<SnapshotState>,
         acquired: Acquired,
+        diagnostics: &Diagnostics,
         at: Instant,
     ) -> Result<Arc<ValidatedPublications>, StateReaderError> {
-        let outcome = self.serve(&acquired);
         let retry_after = matches!(acquired, Acquired::Absent(_))
             .then(|| self.clock.now().checked_add(ABSENT_BACKOFF))
             .flatten();
-        *self.publication.state.write() = SnapshotState {
+        let candidate = Arc::new(SnapshotState {
             acquired: Some(acquired),
             refreshed_at: Some(at),
             retry_after,
-        };
-        outcome
+        });
+        match self.publish(observed, candidate) {
+            Published::Won(state) => {
+                diagnostics.emit(self.context.name.as_str());
+                self.serve_state(&state)
+            }
+            Published::Lost(state) => self.serve_state(&state),
+        }
     }
 
     /// Applies a failed refresh: pace the next attempt, then serve whatever the
@@ -323,25 +342,63 @@ where
     /// refresh's two reads failed, the routing table or the identity admission.
     /// Reads inside the window get no cause of their own, so this is where an
     /// outage is diagnosed.
+    ///
+    /// A lost publication means another caller published while this read
+    /// failed. That newer outcome is served, and the failure installs no
+    /// pacing.
     fn failed(
         &self,
+        observed: &Arc<SnapshotState>,
         phase: &'static str,
         error: StateReaderError,
     ) -> Result<Arc<ValidatedPublications>, StateReaderError> {
-        warn!(
-            collection = %self.context.name.as_str(),
-            phase,
-            error = %error,
-            "publication refresh failed; pacing the retry"
-        );
-        let mut state = self.publication.state.write();
-        if matches!(state.acquired, Some(Acquired::Absent(_))) {
-            *state = SnapshotState::default();
+        let (acquired, refreshed_at) = match &observed.acquired {
+            Some(kept @ (Acquired::Sources(_) | Acquired::Fault(_))) => {
+                (Some(kept.clone()), observed.refreshed_at)
+            }
+            Some(Acquired::Absent(_)) | None => (None, None),
+        };
+        let candidate = Arc::new(SnapshotState {
+            acquired,
+            refreshed_at,
+            retry_after: self.clock.now().checked_add(REFRESH_BACKOFF),
+        });
+        match self.publish(observed, candidate) {
+            Published::Won(state) => {
+                warn!(
+                    collection = %self.context.name.as_str(),
+                    phase,
+                    error = %error,
+                    "publication refresh failed; pacing the retry"
+                );
+                match &state.acquired {
+                    Some(acquired) => self.serve(acquired),
+                    None => Err(error),
+                }
+            }
+            Published::Lost(state) => self.serve_state(&state),
         }
-        state.retry_after = self.clock.now().checked_add(REFRESH_BACKOFF);
-        match &state.acquired {
-            Some(acquired) => self.serve(acquired),
-            None => Err(error),
+    }
+
+    /// Publishes `candidate` if `observed` is still the published state.
+    ///
+    /// Publication is a pointer compare-and-swap from the exact state this
+    /// caller read. A caller that loses adopts the winner's state and never
+    /// republishes: its refresh observed a generation the winner superseded,
+    /// so a retry would roll a newer outcome back. A rule that lets a
+    /// successful loser replace a failure published from the same generation
+    /// was examined and rejected: it needs a generation marker and a second
+    /// compare-and-swap to shorten a window the failure backoff already bounds.
+    fn publish(&self, observed: &Arc<SnapshotState>, candidate: Arc<SnapshotState>) -> Published {
+        let previous = Guard::into_inner(
+            self.publication
+                .0
+                .compare_and_swap(observed, Arc::clone(&candidate)),
+        );
+        if Arc::ptr_eq(&previous, observed) {
+            Published::Won(candidate)
+        } else {
+            Published::Lost(previous)
         }
     }
 
