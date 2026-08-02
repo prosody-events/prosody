@@ -8,6 +8,7 @@ use super::{
 use crate::codec::Codec;
 use crate::error::ErrorCategory;
 use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION};
+use crate::router::Framed;
 use bytes::BufMut;
 use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len};
 use std::error::Error;
@@ -125,21 +126,20 @@ impl<C: Codec> FrameEncoder<C> {
     }
 }
 
-impl Staged<'_> {
-    /// The exact number of bytes [`Staged::write`] will produce.
-    pub(crate) const fn bytes(&self) -> usize {
+/// A staged response is what the router delivers, so the transport never sees
+/// the response vocabulary above it.
+impl Framed for Staged<'_> {
+    fn bytes(&self) -> usize {
         self.bytes
     }
 
     /// Writes the frame in field order. Field order is this encoder's choice,
     /// not a protobuf requirement; the decoder accepts any order.
     ///
-    /// `dst` must be able to take [`Staged::bytes`] more bytes, because
-    /// [`BufMut`]'s writes are infallible and panic instead of failing. Every
-    /// destination this crate writes into — tonic's encode buffer, a
+    /// Every destination this crate writes into — tonic's encode buffer, a
     /// [`BytesMut`](bytes::BytesMut) — reserves on demand, and sizing one at
     /// the frame cap keeps it from ever having to.
-    pub(crate) fn write<B: BufMut>(&self, dst: &mut B) {
+    fn write<B: BufMut>(&self, dst: &mut B) {
         write_varint_field(
             FIELD_PROTOCOL_VERSION,
             u64::from(RESPONSE_PROTOCOL_VERSION),

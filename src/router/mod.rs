@@ -1,13 +1,27 @@
 //! Reaching any prosody process by id.
 //!
 //! Every peer feature routes through here, and nothing in this module knows
-//! what a response is — [`NodeId`] is the only vocabulary it shares with them.
+//! what a response is — [`NodeId`] and a frame's bytes are the only vocabulary
+//! it shares with them.
 
+use crate::cassandra::errors::CassandraStoreError;
+use crate::router::directory::Endpoint;
+use crate::router::directory::cache::AddressResolver;
+use crate::router::fleet::DestinationFleet;
+use bytes::BufMut;
 use fixedstr::Flexstr;
+use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::future::Future;
+use std::sync::Arc;
+use thiserror::Error;
+use tonic::Code;
 use uuid::Uuid;
 
 pub(crate) mod directory;
+pub(crate) mod fleet;
+#[cfg(test)]
+pub(crate) mod loopback;
 pub(crate) mod runtime;
 
 /// The host a node publishes for its peers to dial. Any ordinary hostname or
@@ -34,6 +48,96 @@ pub(crate) type Host = Flexstr<64>;
 /// is still addressable.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct NodeId(Uuid);
+
+/// One frame, as bytes on the wire.
+///
+/// The router delivers frames without reading them, which is what keeps
+/// response vocabulary out of this module.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the peer transport is this trait's production caller; it is exercised by this \
+                  module's tests"
+    )
+)]
+pub(crate) trait Framed {
+    /// The exact number of bytes [`Framed::write`] produces.
+    fn bytes(&self) -> usize;
+
+    /// Writes the frame into `dst`.
+    ///
+    /// `dst` must be able to take [`Framed::bytes`] more bytes, because
+    /// [`BufMut`]'s writes are infallible and panic instead of failing.
+    fn write<B: BufMut>(&self, dst: &mut B);
+}
+
+/// The one outbound network path a responder has.
+///
+/// `Ok` means the destination accepted the frame. Everything else is a
+/// [`SendFailure`], and only an ambiguous one may be tried again.
+///
+/// The frame is borrowed, so a sender writes straight from the one scratch
+/// buffer its worker owns and nothing on this path allocates. A transport whose
+/// own encoder needs an owned item pays one bounded copy into it, which is the
+/// trade this borrow accepts: the copy precedes a network round trip, while an
+/// owned seam would put an allocation on every response.
+pub(crate) trait ResponseSender: Send + Sync + 'static {
+    /// Delivers one frame to one resolved address.
+    fn deliver<F: Framed + Sync>(
+        &self,
+        address: &Endpoint,
+        frame: &F,
+    ) -> impl Future<Output = Result<(), SendFailure>> + Send;
+}
+
+/// Everything the response path needs to reach a peer: a node's address, the
+/// transport that dials it, and the shared destination fleet.
+///
+/// One trait rather than three type parameters, so every signature on the
+/// response path names one `R`. Address resolution belongs here rather than at
+/// the apply hook that queues a response: reading the directory is an await,
+/// and an apply hook must not await.
+pub(crate) trait Router: Clone + Send + Sync + 'static {
+    /// The transport frames leave through.
+    type Sender: ResponseSender;
+
+    /// What can stop a node id from becoming an address.
+    type Error: Error + Send + Sync + 'static;
+
+    /// The address `node` published, or `None` when it published none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Router::Error`] when the lookup itself failed, which is
+    /// distinct from a node that is simply not published.
+    fn address(
+        &self,
+        node: NodeId,
+    ) -> impl Future<Output = Result<Option<Endpoint>, Self::Error>> + Send;
+
+    /// The transport.
+    fn sender(&self) -> &Self::Sender;
+
+    /// The process-wide fleet a response reserves a send slot from.
+    fn fleet(&self) -> &DestinationFleet;
+}
+
+/// The production [`Router`]: addresses from the directory's bounded cache,
+/// frames through one transport, slots from the one fleet the process owns.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the respond layer is this type's production caller; it is exercised by this \
+                  module's tests"
+    )
+)]
+pub(crate) struct RouterHandle<S> {
+    addresses: AddressResolver,
+    fleet: Arc<DestinationFleet>,
+    transport: Arc<S>,
+}
 
 impl NodeId {
     /// Mints an id for one incarnation of one process.
@@ -73,6 +177,97 @@ impl Display for NodeId {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         Display::fmt(&self.0, f)
     }
+}
+
+/// Cloning shares the cache, the fleet and the transport rather than copying
+/// them: one process has exactly one of each.
+impl<S> Clone for RouterHandle<S> {
+    fn clone(&self) -> Self {
+        Self {
+            addresses: self.addresses.clone(),
+            fleet: Arc::clone(&self.fleet),
+            transport: Arc::clone(&self.transport),
+        }
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the respond layer is this constructor's production caller; it is exercised by \
+                  this module's tests"
+    )
+)]
+impl<S> RouterHandle<S> {
+    /// Binds one process's resolver, fleet and transport together.
+    pub(crate) fn new(
+        addresses: AddressResolver,
+        fleet: Arc<DestinationFleet>,
+        transport: Arc<S>,
+    ) -> Self {
+        Self {
+            addresses,
+            fleet,
+            transport,
+        }
+    }
+}
+
+impl<S: ResponseSender> Router for RouterHandle<S> {
+    type Error = CassandraStoreError;
+    type Sender = S;
+
+    /// The direct endpoint the node published. An ordinary host stays inline in
+    /// [`Host`], so this clone copies and never allocates.
+    async fn address(&self, node: NodeId) -> Result<Option<Endpoint>, CassandraStoreError> {
+        let registration = self.addresses.resolve(node).await?;
+        Ok(registration.map(|registration| registration.direct.clone()))
+    }
+
+    fn sender(&self) -> &S {
+        &self.transport
+    }
+
+    fn fleet(&self) -> &DestinationFleet {
+        &self.fleet
+    }
+}
+
+impl SendFailure {
+    /// Whether another attempt could still get an answer.
+    ///
+    /// A destination that never answered may or may not have received the
+    /// frame, so a retry is the only way to find out. A retry is safe because a
+    /// requester accepts at most one response per request and subsystem: a
+    /// duplicate is dropped, never counted twice. Every other status is the
+    /// destination's own answer, and repeating the send would only repeat it.
+    pub(crate) const fn is_ambiguous(self) -> bool {
+        matches!(
+            self,
+            Self::Unreachable | Self::Status(Code::Unavailable | Code::DeadlineExceeded)
+        )
+    }
+}
+
+/// Why one delivery attempt did not reach its destination.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the peer transport is this enum's production producer; the retry rule is \
+                  exercised by this module's tests"
+    )
+)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SendFailure {
+    /// The destination answered with a status other than `OK`.
+    #[error("destination answered {0:?}")]
+    Status(Code),
+
+    /// The destination could not be reached at all.
+    #[error("destination could not be reached")]
+    Unreachable,
 }
 
 #[cfg(test)]

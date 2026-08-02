@@ -8,7 +8,7 @@ use crate::response::frame::{
     FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, PayloadError,
 };
 use crate::response::{FormatToken, RequestId};
-use crate::router::NodeId;
+use crate::router::{Framed, NodeId};
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use bytes::BytesMut;
 use color_eyre::Result;

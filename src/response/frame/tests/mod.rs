@@ -38,7 +38,7 @@ const RELAY_FIELD_BYTES: usize = 18;
 /// payload's own buffer over instead, as [`BinaryCodec`](crate::BinaryCodec)
 /// does.
 #[derive(Clone, Debug, Default)]
-struct CountingCodec {
+pub(crate) struct CountingCodec {
     serializes: Arc<AtomicUsize>,
     deserializes: Arc<AtomicUsize>,
     moves: bool,

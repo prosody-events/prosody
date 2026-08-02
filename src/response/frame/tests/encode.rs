@@ -2,7 +2,7 @@ use super::{CountingCodec, RAW_ID, RELAY_FIELD_BYTES, expected_frame_len, header
 use crate::error::ErrorCategory;
 use crate::response::frame::FrameCap;
 use crate::response::frame::encode::{EncodeError, FrameEncoder};
-use crate::router::NodeId;
+use crate::router::{Framed, NodeId};
 use bytes::BytesMut;
 use color_eyre::Result;
 use color_eyre::eyre::bail;

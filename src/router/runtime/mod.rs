@@ -12,7 +12,7 @@
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
-use crate::router::directory::cache::AddressCache;
+use crate::router::directory::cache::{AddressCache, AddressResolver};
 use crate::router::directory::{
     Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
 };
@@ -94,8 +94,7 @@ pub(crate) struct RouterConfiguration {
 /// registers, always, which is what makes any node reachable from any other.
 /// The consumer wiring owns construction and shutdown order.
 pub(crate) struct PeerRuntime {
-    directory: NodeDirectory,
-    addresses: AddressCache,
+    addresses: AddressResolver,
     registration: NodeRegistration,
     stop: watch::Sender<bool>,
     refresh: Mutex<Option<JoinHandle<()>>>,
@@ -178,8 +177,10 @@ impl PeerRuntime {
             }
         });
         Ok(Self {
-            addresses: AddressCache::new(config.address_cache_capacity, ttl),
-            directory,
+            addresses: AddressResolver::new(
+                AddressCache::new(config.address_cache_capacity, ttl),
+                directory,
+            ),
             registration,
             stop,
             refresh: Mutex::new(Some(refresh)),
@@ -200,9 +201,7 @@ impl PeerRuntime {
         &self,
         node: NodeId,
     ) -> Result<Option<Arc<NodeRegistration>>, CassandraStoreError> {
-        self.addresses
-            .resolve(node, || self.directory.read(node))
-            .await
+        self.addresses.resolve(node).await
     }
 
     /// Stops refreshing and removes this process's rows.
@@ -231,7 +230,10 @@ impl PeerRuntime {
             // A `JoinHandle` cannot be polled again once it has completed.
             *refresh = None;
         }
-        self.directory.deregister(&self.registration).await
+        self.addresses
+            .directory()
+            .deregister(&self.registration)
+            .await
     }
 }
 

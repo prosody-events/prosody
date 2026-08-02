@@ -9,8 +9,9 @@
     )
 )]
 
+use crate::cassandra::errors::CassandraStoreError;
 use crate::router::NodeId;
-use crate::router::directory::{NodeRegistration, RegistrationTtl};
+use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
 use quanta::{Clock, Instant};
 use quick_cache::UnitWeighter;
 use quick_cache::sync::{Cache, DefaultLifecycle};
@@ -63,6 +64,17 @@ pub(crate) struct AddressCache {
     inner: Arc<Inner>,
     clock: Clock,
     ttl: Duration,
+}
+
+/// A node id resolved to what that node published, read through the bounded
+/// cache.
+///
+/// One type, so every caller that needs an address holds one thing rather than
+/// a cache and a directory it must remember to pair.
+#[derive(Clone)]
+pub(crate) struct AddressResolver {
+    cache: AddressCache,
+    directory: NodeDirectory,
 }
 
 impl AddressCache {
@@ -145,5 +157,30 @@ impl AddressCache {
                 }
             }
         }
+    }
+}
+
+impl AddressResolver {
+    /// Reads `directory` through `cache`.
+    pub(crate) const fn new(cache: AddressCache, directory: NodeDirectory) -> Self {
+        Self { cache, directory }
+    }
+
+    /// What `node` published, or `None` when the directory holds no row for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the directory's error when a cache miss cannot be filled.
+    pub(crate) async fn resolve(
+        &self,
+        node: NodeId,
+    ) -> Result<Option<Arc<NodeRegistration>>, CassandraStoreError> {
+        self.cache.resolve(node, || self.directory.read(node)).await
+    }
+
+    /// The directory behind the cache, for the writes a process makes about
+    /// itself.
+    pub(crate) const fn directory(&self) -> &NodeDirectory {
+        &self.directory
     }
 }

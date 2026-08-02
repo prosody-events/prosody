@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 pub(crate) mod frame;
 pub(crate) mod headers;
+pub(crate) mod sender;
 
 /// Version of the response frame both ends of a peer link must agree on.
 pub(crate) const RESPONSE_PROTOCOL_VERSION: u32 = 1;

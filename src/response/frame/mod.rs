@@ -178,5 +178,7 @@ pub(crate) enum PayloadError<E: Error> {
     Codec(E),
 }
 
+// Visible to the crate's other test modules: the sender's tests reuse this
+// module's codec rather than writing a second one.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
