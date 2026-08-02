@@ -21,11 +21,14 @@ use std::time::Duration;
 /// One entry: when the read that produced it was issued, and what it found.
 ///
 /// A known-absent node is cached too, so a burst of traffic for an id that the
-/// directory does not hold issues one read rather than one per message.
-type Entry = (Instant, Option<NodeRegistration>);
+/// directory does not hold issues one read rather than one per message. The
+/// registration sits behind an [`Arc`], so serving a hit costs a reference
+/// count and never an allocation.
+type Entry = (Instant, Option<Arc<NodeRegistration>>);
 
-/// The concrete `quick_cache` instance. Entries are fixed-size — every string
-/// is inline — so items are weighed by count rather than by bytes.
+/// The concrete `quick_cache` instance. Items are weighed by count: capacity
+/// bounds how many registrations are held, and each one holds only what the
+/// directory row held — a host, a machine name, and two optional labels.
 type Inner = Cache<NodeId, Entry, UnitWeighter, ahash::RandomState>;
 
 /// Node id to registration, read through to the directory.
@@ -33,10 +36,12 @@ type Inner = Cache<NodeId, Entry, UnitWeighter, ahash::RandomState>;
 /// Two bounds make it safe to key by something an outsider chooses.
 /// **Capacity** is fixed at construction and `quick_cache` evicts to stay
 /// inside it, so the map cannot grow with traffic; eviction and staleness are
-/// its removal paths. **Age** is bounded by the registration lease itself,
-/// because the cache is built from the same [`RegistrationTtl`] the writer
-/// uses. A cached address can therefore never outlive the row that justified
-/// it, and there is no second TTL to configure wrongly.
+/// its removal paths. **Age** is one registration lease, because the cache is
+/// built from the same [`RegistrationTtl`] the writer uses, and there is no
+/// second TTL to configure wrongly. The stamp is taken when the read is
+/// issued, so an entry filled from a row that was about to expire outlives
+/// that row by up to one lease — the address is then dialed and the response
+/// is dropped, which is what the best-effort posture already accepts.
 ///
 /// Its single-flight behaviour is what matters on the response path: every
 /// caller after the first parks on the placeholder until the winner inserts, so
@@ -102,7 +107,7 @@ impl AddressCache {
         &self,
         node: NodeId,
         fill: F,
-    ) -> Result<Option<NodeRegistration>, E>
+    ) -> Result<Option<Arc<NodeRegistration>>, E>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<Option<NodeRegistration>, E>>,
@@ -123,7 +128,7 @@ impl AddressCache {
                     // is taken before the read, so a slow fill enters already
                     // aged and cannot pass an old value off as fresh.
                     let issued = self.clock.now();
-                    let registration = fill().await?;
+                    let registration = fill().await?.map(Arc::new);
                     // The directory's answer stays valid when admission loses
                     // a race.
                     drop(guard.insert((issued, registration.clone())));

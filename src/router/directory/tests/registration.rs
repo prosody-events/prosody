@@ -193,6 +193,41 @@ fn directory_statements_run_at_local_one() -> Result<()> {
     })
 }
 
+/// A lease exists only inside the range the type publishes, and it carries
+/// exactly what the caller asked for. Outside that range there is no
+/// [`RegistrationTtl`] at all, so no configuration and no write can hold one.
+///
+/// The values are fixed rather than generated: both bounds and the default are
+/// three points out of 3600, and a generator reaches them too rarely to fail on
+/// a bound that goes missing.
+#[test]
+fn a_lease_exists_only_inside_its_range() -> Result<()> {
+    let second = Duration::from_secs(1);
+    for asked in [
+        RegistrationTtl::MIN,
+        RegistrationTtl::DEFAULT.duration(),
+        RegistrationTtl::MAX,
+    ] {
+        let ttl = RegistrationTtl::try_from(asked)?;
+        assert_eq!(
+            ttl.duration(),
+            asked,
+            "a lease must publish the duration it was asked for"
+        );
+    }
+    for refused in [
+        Duration::ZERO,
+        RegistrationTtl::MIN.saturating_sub(second),
+        RegistrationTtl::MAX + second,
+    ] {
+        assert!(
+            RegistrationTtl::try_from(refused).is_err(),
+            "{refused:?} is outside the accepted range but converted"
+        );
+    }
+    Ok(())
+}
+
 /// A node's index shard is always one of the partitions the index has, so no
 /// membership row lands where a listing never reads.
 #[quickcheck]

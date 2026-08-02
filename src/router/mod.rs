@@ -16,8 +16,8 @@ pub(crate) mod runtime;
     not(test),
     expect(
         dead_code,
-        reason = "the node directory is this alias's production caller; the selection it feeds is \
-                  exercised by this module's tests"
+        reason = "the node directory and the process runtime are this alias's production users; \
+                  both are exercised by this module's tests"
     )
 )]
 pub(crate) type Host = Flexstr<64>;
@@ -41,8 +41,8 @@ impl NodeId {
         not(test),
         expect(
             dead_code,
-            reason = "process identity is this constructor's production caller; it is exercised \
-                      by this module's tests"
+            reason = "`PeerRuntime::start` is this constructor's production caller; it is \
+                      exercised by this module's tests"
         )
     )]
     pub(crate) fn new() -> Self {
@@ -73,45 +73,6 @@ impl Display for NodeId {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         Display::fmt(&self.0, f)
     }
-}
-
-/// Picks the host a node publishes for its peers, in the order a deployment can
-/// supply it: the operator's configured host, else the local address the
-/// operating system would route to the cluster's own dependencies, else this
-/// machine's hostname.
-///
-/// Each fallback is consulted only when the one before it is absent, so a
-/// configured host never costs a route probe and a routable local address never
-/// costs a name lookup.
-///
-/// # Errors
-///
-/// Returns the hostname lookup's error, and only when neither earlier source
-/// supplied a host.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the node directory is this function's production caller; it is exercised by \
-                  this module's tests"
-    )
-)]
-pub(crate) fn select_host<R, H, E>(
-    configured: Option<Host>,
-    routed: R,
-    hostname: H,
-) -> Result<Host, E>
-where
-    R: FnOnce() -> Option<Host>,
-    H: FnOnce() -> Result<Host, E>,
-{
-    if let Some(host) = configured {
-        return Ok(host);
-    }
-    if let Some(host) = routed() {
-        return Ok(host);
-    }
-    hostname()
 }
 
 #[cfg(test)]

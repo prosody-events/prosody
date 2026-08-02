@@ -10,20 +10,21 @@
     )
 )]
 
+use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
 use crate::router::directory::cache::AddressCache;
 use crate::router::directory::{
     Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
 };
-use crate::router::{Host, NodeId, select_host};
+use crate::router::{Host, NodeId};
 use derive_builder::Builder;
-use parking_lot::Mutex;
 use rand::RngExt;
 use std::net::{ToSocketAddrs, UdpSocket};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::select;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{error, warn};
@@ -33,14 +34,17 @@ use whoami::hostname;
 #[cfg(test)]
 mod tests;
 
-/// How long a registration survives without a refresh, by default.
-const DEFAULT_REGISTRATION_TTL: Duration = Duration::from_secs(30);
-
 /// How many peer registrations stay cached at once, by default.
 const DEFAULT_ADDRESS_CACHE_CAPACITY: usize = 1024;
 
-/// Longest label an operator can configure for a host or a network.
-const MAX_LABEL_BYTES: usize = 64;
+/// Most peer registrations a process may hold at once. A registration is a few
+/// short strings, so a million of them is already more memory than the cache is
+/// worth; the bound stops a typo from asking for a heap the process lacks.
+const MAX_ADDRESS_CACHE_CAPACITY: usize = 1_048_576;
+
+/// Longest label an operator can configure for a host or a network. One byte
+/// under [`Host`]'s inline limit, so a configured label never reaches the heap.
+const MAX_LABEL_BYTES: usize = 63;
 
 /// What an operator sets for peer routing.
 ///
@@ -48,16 +52,23 @@ const MAX_LABEL_BYTES: usize = 64;
 /// configuration at all.
 #[derive(Builder, Clone, Debug, Validate)]
 #[builder(setter(into, strip_option), default)]
+#[validate(schema(function = "validate_entry_point"))]
 pub(crate) struct RouterConfiguration {
     /// The host that peers on another network use to reach this process — a
     /// gateway, an ingress, a translated address. Unset means intra-network
     /// only.
+    ///
+    /// Folding this and `advertised_port` into one optional pair would make a
+    /// port with no host beside it unrepresentable. The two stay separate
+    /// because every cross-field rule in this crate is a schema validation, and
+    /// one flat builder setter per field is the shape an operator expects.
     #[validate(custom(function = "validate_label"))]
     pub(crate) advertised_host: Option<String>,
 
     /// The port to publish beside `advertised_host`. Unset publishes the
     /// listener's own port, which is what an entry point that forwards a port
-    /// unchanged wants.
+    /// unchanged wants. Set with no host beside it, the configuration is
+    /// refused.
     #[validate(custom(function = "validate_port"))]
     pub(crate) advertised_port: Option<u16>,
 
@@ -66,12 +77,12 @@ pub(crate) struct RouterConfiguration {
     #[validate(custom(function = "validate_label"))]
     pub(crate) network: Option<String>,
 
-    /// How long a registration survives without a refresh.
-    #[validate(custom(function = "validate_registration_ttl"))]
-    pub(crate) registration_ttl: Duration,
+    /// How long a registration survives without a refresh. The type carries the
+    /// range, so a lease outside it never reaches a configuration at all.
+    pub(crate) registration_ttl: RegistrationTtl,
 
     /// How many peer registrations stay cached at once.
-    #[validate(range(min = 1_usize))]
+    #[validate(range(min = 1_usize, max = MAX_ADDRESS_CACHE_CAPACITY))]
     pub(crate) address_cache_capacity: usize,
 }
 
@@ -81,6 +92,7 @@ pub(crate) struct RouterConfiguration {
 /// rewrites the registration on a jittered interval, and deletes it on
 /// shutdown. Nothing here is conditional on a peer feature: every process
 /// registers, always, which is what makes any node reachable from any other.
+/// The consumer wiring owns construction and shutdown order.
 pub(crate) struct PeerRuntime {
     directory: NodeDirectory,
     addresses: AddressCache,
@@ -95,7 +107,7 @@ impl Default for RouterConfiguration {
             advertised_host: None,
             advertised_port: None,
             network: None,
-            registration_ttl: DEFAULT_REGISTRATION_TTL,
+            registration_ttl: RegistrationTtl::DEFAULT,
             address_cache_capacity: DEFAULT_ADDRESS_CACHE_CAPACITY,
         }
     }
@@ -115,22 +127,26 @@ impl PeerRuntime {
     ///
     /// `listener_port` is the port this process's peer listener bound, and
     /// `contact` is a Cassandra contact point the routed-address probe aims at.
-    /// The first write is awaited here rather than left to the refresh task, so
-    /// a returned runtime is one whose node is already resolvable.
+    /// The lease comes from `config` and reaches the directory, the refresh
+    /// pace and the address cache from there, so one configured value governs
+    /// all three. The first write is awaited here rather than left to the
+    /// refresh task, so a returned runtime is one whose node is already
+    /// published.
     ///
     /// # Errors
     ///
     /// Returns [`PeerRuntimeError`] when the configuration is invalid, or when
-    /// discovery or the first write fails.
+    /// discovery, statement preparation, or the first write fails.
     pub(crate) async fn start(
-        directory: NodeDirectory,
+        store: CassandraStore,
         listener_port: u16,
         contact: &str,
         config: &RouterConfiguration,
         group: Option<GroupMembership>,
     ) -> Result<Self, PeerRuntimeError> {
         config.validate()?;
-        let ttl = directory.ttl();
+        let ttl = config.registration_ttl;
+        let directory = NodeDirectory::new(store, ttl).await?;
         let registration =
             discover_registration(NodeId::new(), listener_port, contact, config, group)?;
         directory.register(&registration).await?;
@@ -183,7 +199,7 @@ impl PeerRuntime {
     pub(crate) async fn resolve(
         &self,
         node: NodeId,
-    ) -> Result<Option<NodeRegistration>, CassandraStoreError> {
+    ) -> Result<Option<Arc<NodeRegistration>>, CassandraStoreError> {
         self.addresses
             .resolve(node, || self.directory.read(node))
             .await
@@ -193,8 +209,12 @@ impl PeerRuntime {
     ///
     /// The refresh task is signalled and **joined before** the deletes are
     /// issued, so a refresh cannot land after a delete and resurrect this node
-    /// for a whole lease. A second call finds the task already gone and
-    /// re-issues deletes that change nothing.
+    /// for a whole lease. The join and the deletes run under one lock, and the
+    /// handle is cleared only after the join returns. A second caller therefore
+    /// waits for the first, and a call dropped at the join leaves the handle
+    /// for the next call to join — neither can delete while the refresher is
+    /// still live. Repeating a completed shutdown re-issues deletes that change
+    /// nothing.
     ///
     /// # Errors
     ///
@@ -203,11 +223,13 @@ impl PeerRuntime {
         // `send_replace` rather than `send`: a refresh task that already exited
         // leaves no receiver, and that is not a failure.
         self.stop.send_replace(true);
-        let refresh = self.refresh.lock().take();
-        if let Some(refresh) = refresh
-            && let Err(error) = refresh.await
-        {
-            error!(%error, "node registration refresh task did not exit cleanly");
+        let mut refresh = self.refresh.lock().await;
+        if let Some(handle) = refresh.as_mut() {
+            if let Err(error) = handle.await {
+                error!(%error, "node registration refresh task did not exit cleanly");
+            }
+            // A `JoinHandle` cannot be polled again once it has completed.
+            *refresh = None;
         }
         self.directory.deregister(&self.registration).await
     }
@@ -246,10 +268,12 @@ fn routed_host(contact: &str) -> Option<Host> {
 
 /// Builds this process's registration.
 ///
-/// The host follows the order a deployment can supply it: the operator's
-/// configured host, else the routed local address, else this machine's name.
-/// The port is the listener's own, unless the operator published a different
-/// one beside `advertised_host`.
+/// Each configured field reaches only the endpoint it describes. `direct` is
+/// discovered and never configured: the local address the operating system
+/// would route to the contact point, else this machine's name, on the port the
+/// listener bound. That is what makes an equal network label an optimization —
+/// a neighbour dials an address it reaches without the entry point. The
+/// configured host and port reach `advertised` alone.
 fn discover_registration(
     node: NodeId,
     listener_port: u16,
@@ -258,19 +282,17 @@ fn discover_registration(
     group: Option<GroupMembership>,
 ) -> Result<NodeRegistration, whoami::Error> {
     // The machine name is published in its own right, so the lookup is paid
-    // once and reused as the last source of the discovery order.
+    // once and reused where the routed probe finds no address.
     let hostname = Host::make(&hostname()?);
-    let port = config.advertised_port.unwrap_or(listener_port);
-    let configured = config.advertised_host.as_deref().map(Host::make);
     Ok(NodeRegistration {
         node,
         direct: Endpoint {
-            host: select_host(configured, || routed_host(contact), || Ok(hostname.clone()))?,
-            port,
+            host: routed_host(contact).unwrap_or_else(|| hostname.clone()),
+            port: listener_port,
         },
         advertised: config.advertised_host.as_deref().map(|host| Endpoint {
             host: Host::make(host),
-            port,
+            port: config.advertised_port.unwrap_or(listener_port),
         }),
         network: config.network.as_deref().map(NetworkId::make),
         group,
@@ -311,13 +333,13 @@ fn validate_port(port: u16) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Delegates to [`RegistrationTtl`], so the lease bound lives in one place.
-fn validate_registration_ttl(ttl: &Duration) -> Result<(), ValidationError> {
-    RegistrationTtl::try_from(*ttl).map(drop).map_err(|error| {
-        let mut failure = ValidationError::new("registration_ttl_out_of_range");
-        failure.message = Some(error.to_string().into());
-        failure
-    })
+/// Refuses a published port with no host beside it. An entry point is a host
+/// and a port together, and a port alone reaches nothing.
+fn validate_entry_point(config: &RouterConfiguration) -> Result<(), ValidationError> {
+    if config.advertised_port.is_some() && config.advertised_host.is_none() {
+        return Err(ValidationError::new("advertised_port_without_host"));
+    }
+    Ok(())
 }
 
 /// What can stop a process from taking its place in the directory.

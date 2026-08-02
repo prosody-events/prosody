@@ -76,8 +76,9 @@ pub(crate) struct GroupMembership {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NodeRegistration {
     pub(crate) node: NodeId,
-    /// Where this process is reachable on its own network. Always present, so
-    /// "a node with no reachable address" is unrepresentable.
+    /// Where this process is reachable on its own network: the address it
+    /// discovered for itself, on the port its listener bound. Always present,
+    /// so "a node with no reachable address" is unrepresentable.
     pub(crate) direct: Endpoint,
     /// An entry point that reaches this process from another network. Present
     /// only where an operator arranged one; absent means intra-network only.
@@ -106,8 +107,8 @@ pub(crate) struct RegistrationTtl(i32);
 /// Every statement runs at `LOCAL_ONE`. A registration is idempotent and
 /// rewritten every interval, so a write that reaches one replica and is then
 /// lost heals on the next refresh, well inside the lease. A quorum would make
-/// every cache miss on the response path pay an inter-datacentre round trip and
-/// would buy nothing on top of single-replica writes.
+/// every cache miss on the response path wait for a second replica and would
+/// buy nothing on top of a row that is rewritten every interval.
 #[derive(Clone, Debug)]
 pub(crate) struct NodeDirectory {
     store: CassandraStore,
@@ -116,6 +117,9 @@ pub(crate) struct NodeDirectory {
 }
 
 impl RegistrationTtl {
+    /// The lease a process publishes when an operator asks for none. A refresh
+    /// and its jitter fit twice inside it, so two lost writes still heal.
+    pub(crate) const DEFAULT: Self = Self(30);
     /// Longest lease a caller can ask for. A dead process stays resolvable for
     /// at most this long, and each stale resolution costs one dropped response.
     pub(crate) const MAX: Duration = Duration::from_hours(1);
@@ -202,9 +206,14 @@ impl NodeDirectory {
     /// statement lists every column, so a partial update is unwritable.
     ///
     /// The node row is written first and the membership index second. The two
-    /// are deliberately not batched — they are different partitions. A reader
-    /// depends on the order: it may find an index entry whose node row is
-    /// missing, and treats that as a stale entry, but never the reverse.
+    /// are deliberately not batched — they are different partitions.
+    /// [`deregister`](Self::deregister) mirrors the order. What the order buys
+    /// is the size of the window in which the index names a node whose row is
+    /// missing: a failure between the two statements leaves a live process
+    /// unlisted, never a dangling entry. A listing must still tolerate one,
+    /// because the two rows carry separate leases stamped in write order, so
+    /// after a crash the index outlives the node row by the gap between the two
+    /// writes.
     ///
     /// # Errors
     ///
@@ -317,6 +326,10 @@ impl NodeDirectory {
 
     /// Removes `registration`'s rows.
     ///
+    /// The index entry goes first and the node row second, which mirrors
+    /// [`register`](Self::register): a process on the way out stops being
+    /// listed before it stops being readable.
+    ///
     /// Idempotent: a CQL delete of an absent row is a no-op, so a repeated
     /// shutdown costs two writes and changes nothing.
     ///
@@ -328,9 +341,6 @@ impl NodeDirectory {
         &self,
         registration: &NodeRegistration,
     ) -> Result<(), CassandraStoreError> {
-        self.store
-            .execute_unpaged_discard(&self.queries.remove_node, (Uuid::from(registration.node),))
-            .await?;
         if let Some(membership) = &registration.group {
             self.store
                 .execute_unpaged_discard(
@@ -344,6 +354,9 @@ impl NodeDirectory {
                 )
                 .await?;
         }
+        self.store
+            .execute_unpaged_discard(&self.queries.remove_node, (Uuid::from(registration.node),))
+            .await?;
         Ok(())
     }
 }

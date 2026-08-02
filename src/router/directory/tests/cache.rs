@@ -9,6 +9,7 @@ use color_eyre::eyre::eyre;
 use futures::future::join_all;
 use quanta::Clock;
 use quickcheck::{QuickCheck, TestResult};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::OnceCell;
@@ -202,7 +203,7 @@ async fn resolve(
     directory: &NodeDirectory,
     reads: &AtomicUsize,
     node: NodeId,
-) -> Result<Option<NodeRegistration>> {
+) -> Result<Option<Arc<NodeRegistration>>> {
     Ok(cache
         .resolve(node, || async move {
             reads.fetch_add(1, Ordering::Relaxed);

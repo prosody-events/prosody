@@ -1,21 +1,27 @@
-use super::{PeerRuntime, PeerRuntimeError, RouterConfiguration, refresh_delay, routed_host};
-use crate::router::directory::RegistrationTtl;
-use crate::router::directory::tests::support::{directory, member_shards, membership};
+use super::{
+    MAX_ADDRESS_CACHE_CAPACITY, PeerRuntime, PeerRuntimeError, RouterConfiguration,
+    discover_registration, refresh_delay, routed_host,
+};
+use crate::router::directory::tests::support::{directory, member_shards, membership, store};
+use crate::router::directory::{Endpoint, RegistrationTtl};
+use crate::router::{Host, NodeId};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
-use color_eyre::eyre::eyre;
+use color_eyre::eyre::{ensure, eyre};
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use std::net::IpAddr;
 use std::time::Duration;
+use tokio::time::{Instant, interval};
 use validator::Validate;
 
 /// The Cassandra contact point the routed-address probe aims at.
 const CONTACT: &str = "localhost:9042";
 
-/// The lease the runtime tests register under. Its refresh delay is at least a
-/// third of it, so no refresh runs while a test observes the first write.
+/// The lease the runtime tests read under. It equals the default a runtime
+/// starts with, and its refresh delay is at least a third of it, so no refresh
+/// runs while a test observes the first write.
 const LEASE: Duration = Duration::from_secs(30);
 
 /// A process that enables no peer feature still takes its place in the
@@ -30,7 +36,7 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
         let directory = directory(LEASE).await?;
         let membership = membership();
         let runtime = PeerRuntime::start(
-            directory.clone(),
+            store().await?.clone(),
             7777,
             CONTACT,
             &config,
@@ -66,8 +72,8 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
             "a started runtime must occupy exactly one index shard"
         );
         assert_eq!(
-            runtime.resolve(node).await?,
-            Some(registered),
+            runtime.resolve(node).await?.as_deref(),
+            Some(&registered),
             "the runtime must resolve its own node through its cache"
         );
 
@@ -86,6 +92,49 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
     })
 }
 
+/// A removed node stops being served: the cached address ages out on the same
+/// lease the row carried, so resolution reports the node unreachable instead of
+/// handing back an address to dial. This is the path a dialer takes, cache and
+/// all.
+#[test]
+fn a_resolved_address_stops_being_served_once_its_row_is_gone() -> Result<()> {
+    init_test_logging();
+    TEST_RUNTIME.block_on(async {
+        let config = RouterConfiguration {
+            registration_ttl: RegistrationTtl::try_from(RegistrationTtl::MIN)?,
+            ..RouterConfiguration::default()
+        };
+        let runtime =
+            PeerRuntime::start(store().await?.clone(), 7777, CONTACT, &config, None).await?;
+        let node = runtime.node();
+        assert!(
+            runtime.resolve(node).await?.is_some(),
+            "a started runtime must resolve its own node"
+        );
+        // The shutdown removes the row and stops the refresher, so only the
+        // cached entry can still answer.
+        runtime.shutdown().await?;
+
+        // A cache entry ages out on the process clock and emits no event, so a
+        // bounded poll is the only observation available. The deadline is a
+        // hang guard; the assertion is the absence below it.
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let mut ticker = interval(Duration::from_millis(200));
+        loop {
+            ticker.tick().await;
+            let resolved = runtime.resolve(node).await?;
+            if resolved.is_none() {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "a removed node stayed resolvable: {resolved:?}"
+            );
+        }
+        Ok(())
+    })
+}
+
 /// `start` refuses a configuration its own rules reject. A bound that nothing
 /// enforces at startup is not a bound.
 #[test]
@@ -96,14 +145,46 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
             address_cache_capacity: 0,
             ..RouterConfiguration::default()
         };
-        let directory = directory(LEASE).await?;
-        let outcome = PeerRuntime::start(directory, 7777, CONTACT, &config, None).await;
+        let outcome =
+            PeerRuntime::start(store().await?.clone(), 7777, CONTACT, &config, None).await;
         assert!(
             matches!(outcome, Err(PeerRuntimeError::Configuration(_))),
             "a cache capacity of zero must stop the runtime from starting"
         );
         Ok(())
     })
+}
+
+/// A configured entry point never reaches `direct`. `direct` is what a
+/// neighbour on the same network dials, so it stays the discovered address on
+/// the port the listener bound, however the entry point is configured.
+#[test]
+fn a_configured_entry_point_never_reaches_the_direct_endpoint() -> Result<()> {
+    init_test_logging();
+    let config = RouterConfiguration::builder()
+        .advertised_host("gateway.example")
+        .advertised_port(443_u16)
+        .network("east")
+        .build()?;
+    let registration = discover_registration(NodeId::new(), 7777, CONTACT, &config, None)?;
+    assert_eq!(
+        registration.direct.port, 7777,
+        "the direct endpoint must publish the port the listener bound"
+    );
+    assert_ne!(
+        registration.direct.host,
+        Host::make("gateway.example"),
+        "the direct endpoint must not publish the configured entry point"
+    );
+    assert_eq!(
+        registration.advertised,
+        Some(Endpoint {
+            host: Host::make("gateway.example"),
+            port: 443,
+        }),
+        "the entry point must publish exactly what the operator configured"
+    );
+    Ok(())
 }
 
 /// A refresh always lands inside the lease with room to spare: between a third
@@ -124,8 +205,8 @@ fn prop_refresh_delay_stays_inside_the_lease(seconds: u64) -> TestResult {
     TestResult::passed()
 }
 
-/// The routed probe answers on this platform, which is what the discovery
-/// order relies on when no host is configured.
+/// The routed probe answers on this platform, which is what discovery relies on
+/// for the direct endpoint.
 ///
 /// It cannot tell a local address from a peer one against a loopback target —
 /// both are `127.0.0.1` — so swapping the two is out of this test's reach.
@@ -140,8 +221,8 @@ fn routed_host_answers_for_the_cassandra_contact_point() -> Result<()> {
 }
 
 /// The configuration refuses the degenerate values its fields can express: a
-/// blank or oversized label, port zero, and a lease outside the range a
-/// registration accepts.
+/// blank or oversized label, port zero, a published port with no host beside
+/// it, and a cache capacity outside the range one process can hold.
 #[test]
 fn configuration_refuses_degenerate_values() -> Result<()> {
     let default = RouterConfiguration::default();
@@ -175,28 +256,22 @@ fn configuration_refuses_degenerate_values() -> Result<()> {
         (
             "oversized network",
             RouterConfiguration {
-                network: Some("n".repeat(65)),
+                network: Some("n".repeat(64)),
                 ..RouterConfiguration::default()
             },
         ),
         (
             "port zero",
             RouterConfiguration {
+                advertised_host: Some("gateway.example".to_owned()),
                 advertised_port: Some(0),
                 ..RouterConfiguration::default()
             },
         ),
         (
-            "lease below the minimum",
+            "published port with no host",
             RouterConfiguration {
-                registration_ttl: Duration::from_secs(1),
-                ..RouterConfiguration::default()
-            },
-        ),
-        (
-            "lease above the maximum",
-            RouterConfiguration {
-                registration_ttl: Duration::from_hours(2),
+                advertised_port: Some(443),
                 ..RouterConfiguration::default()
             },
         ),
@@ -204,6 +279,13 @@ fn configuration_refuses_degenerate_values() -> Result<()> {
             "no cache capacity",
             RouterConfiguration {
                 address_cache_capacity: 0,
+                ..RouterConfiguration::default()
+            },
+        ),
+        (
+            "cache capacity past the maximum",
+            RouterConfiguration {
+                address_cache_capacity: MAX_ADDRESS_CACHE_CAPACITY + 1,
                 ..RouterConfiguration::default()
             },
         ),
