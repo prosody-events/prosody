@@ -3,7 +3,7 @@
 use super::{CAP_BYTES, Harness, PAYLOAD, UNPUBLISHED_NODE, attempts, config, node, paused, port};
 use crate::response::frame::FrameCap;
 use crate::response::frame::decode::decode_frame;
-use crate::response::frame::tests::CountingCodec;
+use crate::response::frame::tests::{CountingCodec, serialized_on_this_thread};
 use crate::router::SendFailure;
 use crate::router::loopback::Script;
 use color_eyre::Result;
@@ -123,7 +123,10 @@ fn only_ambiguous_statuses_are_retried() -> Result<()> {
 /// encoded, and its slot goes back.
 ///
 /// The destination is paced at one send per second and the deadline is half of
-/// that, so the second response's turn is provably past its expiry.
+/// that, so the second response's turn is provably past its expiry. Counting
+/// what the worker's codec serialized is what makes "before it is encoded" a
+/// claim the test risks: reaching no transport alone would still hold if the
+/// pacing wait moved after the encode.
 #[test]
 fn an_expired_response_is_dropped_before_it_is_encoded() -> Result<()> {
     let runtime = paused()?;
@@ -133,10 +136,16 @@ fn an_expired_response_is_dropped_before_it_is_encoded() -> Result<()> {
         settings.send_deadline = Duration::from_millis(500);
         let harness = Harness::new(settings)?;
         let fleet = harness.fleet();
+        let serialized = serialized_on_this_thread();
         harness.send(TARGET)?;
         harness.send(TARGET)?;
 
         let drained = harness.drain().await?;
+        assert_eq!(
+            serialized_on_this_thread() - serialized,
+            1,
+            "the expired response must never be encoded"
+        );
         assert_eq!(
             attempts(&drained.deliveries, TARGET),
             1,
