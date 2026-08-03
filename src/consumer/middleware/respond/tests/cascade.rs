@@ -64,52 +64,47 @@ fn at_most_one_response_per_final_invocation() {
     QuickCheck::new().quickcheck(property as fn(RetrySession) -> Result<bool>);
 }
 
-/// A transient error that exhausts its retries answers its requester once.
+/// A retried cascade answers once, and the answer states the outcome that
+/// settled it.
 ///
-/// This is the row a category check would silently break: the last attempt's
-/// error is still transient, so a responder that answered only permanent
-/// rejections would leave the requester waiting for its own timeout.
+/// Both settling directions run over the same retry ceiling: a first attempt
+/// that fails and then succeeds, and a transient error that exhausts its
+/// retries. Each direction must reach the wire, so an arm that drops its
+/// response metadata loses its answer here.
+///
+/// The exhaustion direction is the row a category check would silently break:
+/// the last attempt's error is still transient, so a responder that answered
+/// only permanent rejections would leave the requester waiting for its own
+/// timeout.
 #[test]
-fn retry_exhaustion_responds_exactly_once() -> Result<()> {
-    let session = RetrySession {
-        max_retries: 1,
-        script: vec![ErrorCategory::Transient, ErrorCategory::Transient],
-    };
-    let (drained, invocations) = run(session)?;
+fn a_retried_cascade_answers_once_with_the_settled_outcome() -> Result<()> {
+    let directions = [
+        (vec![ErrorCategory::Transient], ResponseStatus::Success),
+        (
+            vec![ErrorCategory::Transient, ErrorCategory::Transient],
+            ResponseStatus::Error(ErrorCategory::Transient),
+        ),
+    ];
+    for (script, settled) in directions {
+        let session = RetrySession {
+            max_retries: 1,
+            script,
+        };
+        let (mut drained, invocations) = run(session)?;
 
-    assert_eq!(invocations, 2, "the leaf runs one attempt and one retry");
-    assert_eq!(
-        drained.deliveries.len(),
-        1,
-        "the exhausted session answers exactly once",
-    );
-    assert_eq!(drained.sent, 1);
-    Ok(())
-}
-
-/// The attempts before the last one stay silent, and the answer states the
-/// outcome that actually settled.
-#[test]
-fn retried_attempts_stay_silent() -> Result<()> {
-    let session = RetrySession {
-        max_retries: 2,
-        script: vec![ErrorCategory::Transient],
-    };
-    let (mut drained, invocations) = run(session)?;
-
-    assert_eq!(invocations, 2, "the leaf fails once and then succeeds");
-    assert_eq!(
-        drained.deliveries.len(),
-        1,
-        "only the attempt that settled answers",
-    );
-    let mut delivery = drained.deliveries.remove(0);
-    let frame = decode_frame(&mut delivery.bytes, cap()?)?;
-    assert_eq!(
-        frame.header.status,
-        ResponseStatus::Success,
-        "the answer states the settled outcome, not the failed attempt",
-    );
+        assert_eq!(invocations, 2, "the leaf runs one attempt and one retry");
+        assert_eq!(
+            (drained.deliveries.len(), drained.sent),
+            (1, 1),
+            "only the attempt that settled answers: {settled:?}",
+        );
+        let mut delivery = drained.deliveries.remove(0);
+        let frame = decode_frame(&mut delivery.bytes, cap()?)?;
+        assert_eq!(
+            frame.header.status, settled,
+            "the answer states the settled outcome, not an earlier attempt",
+        );
+    }
     Ok(())
 }
 

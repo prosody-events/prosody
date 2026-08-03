@@ -23,11 +23,17 @@ use tokio::time::timeout;
 /// The apply hook returns while the transport still holds a response, so the
 /// next event for the same key dispatches.
 ///
-/// Queuing a response is a synchronous step, so waiting on the network inside
-/// the hook is already close to unwritable. What this pin buys is a harness
-/// that can observe such a stall at all: the two dispatches run one after the
-/// other on one key, exactly as the partition serializes them, and the deadline
-/// turns a stall into a failure instead of a hang.
+/// The two dispatches run one after the other on one key, exactly as the
+/// partition serializes them. Two shapes of the defect are writable: a hook
+/// that awaits the delivery outcome, and a sender that frames and delivers
+/// inline instead of queuing. Either one holds the response over the hook, so
+/// the counters read after both dispatches state the invariant positively: no
+/// response had finished. The deadline only turns a full stall into a failure
+/// instead of a hang.
+///
+/// A full queue is not one of them. A destination's queue is as deep as that
+/// destination has slots, so a response that holds a slot always has room, and
+/// the queue push cannot wait however it is written.
 #[test]
 fn the_hook_does_not_block_on_the_network() -> Result<()> {
     paused()?.block_on(async {
@@ -61,6 +67,12 @@ fn the_hook_does_not_block_on_the_network() -> Result<()> {
             leaf.call_count(),
             2,
             "the second event dispatched while the first response was held",
+        );
+        let counters = fixture.responder.counters();
+        assert_eq!(
+            (counters.sent(), counters.dropped()),
+            (0, 0),
+            "the queued response was still in flight when both hooks had returned",
         );
         // Releasing the held attempt lets the drain finish rather than wait out
         // the send deadline.
