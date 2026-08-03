@@ -1,8 +1,8 @@
 //! Where each arrival is filed, and what the waiter reads back.
 
 use super::{
-    MAX_TIMEOUT, POOL, TestCodec, TestError, body, formatted_frame, frame, names, register,
-    registry, success,
+    MAX_RESPONSE_BYTES, MAX_TIMEOUT, POOL, TestCodec, TestError, body, formatted_frame, frame,
+    names, register, registry, success,
 };
 use crate::error::ErrorCategory;
 use crate::requester::collect::decode;
@@ -122,13 +122,10 @@ impl Answer {
     const fn outcome(self) -> Outcome<u32, TestError> {
         match self.category {
             None => Outcome::Ok(self.value),
-            Some(category) => Outcome::Handler {
-                error: TestError {
-                    value: self.value,
-                    category,
-                },
+            Some(category) => Outcome::Handler(TestError {
+                value: self.value,
                 category,
-            },
+            }),
         }
     }
 }
@@ -217,6 +214,61 @@ fn a_frame_in_another_format_is_refused_and_reported() -> Result<()> {
     })
 }
 
+/// A payload over the configured response ceiling is refused rather than held,
+/// and one exactly at the ceiling is held. The refusal ends the request, so the
+/// caller reads it instead of waiting out its deadline.
+#[test]
+fn a_payload_over_the_response_ceiling_is_refused() -> Result<()> {
+    let runtime = paused()?;
+    runtime.block_on(async {
+        let registry = registry(4, MAX_AWAITED)?;
+        let awaited = names(&["billing", "ledger"])?;
+        let registration = register(&registry, &awaited, TIMEOUT)?;
+        let id = registration.id();
+
+        let dispositions = [
+            registry.accept(frame(
+                id,
+                &awaited[0],
+                ResponseStatus::Success,
+                BytesMut::zeroed(MAX_RESPONSE_BYTES + 1),
+            )),
+            registry.accept(frame(
+                id,
+                &awaited[1],
+                ResponseStatus::Success,
+                BytesMut::zeroed(MAX_RESPONSE_BYTES),
+            )),
+        ];
+        assert_eq!(
+            dispositions,
+            [
+                ResponseDisposition::ResponseTooLarge,
+                ResponseDisposition::Accepted,
+            ],
+            "the ceiling must refuse the payload above it and hold the one at it"
+        );
+
+        let finished = registration.finish();
+        assert_eq!(
+            finished.status,
+            Status::Complete,
+            "the request must end on the refusal, not at its deadline"
+        );
+        let outcomes = decode::<TestCodec, u32, TestError, _>(finished.awaited);
+        assert_eq!(
+            outcomes,
+            vec![
+                Outcome::Failed(ResponseFailure::TooLarge),
+                // A thousand zero bytes are a payload the codec cannot read.
+                Outcome::Failed(ResponseFailure::Malformed),
+            ],
+            "the refused payload reached the position it was too large for"
+        );
+        Ok(())
+    })
+}
+
 /// A frame whose wire status disagrees with its decoded arm is malformed, and
 /// one whose status agrees reaches the caller as a handler failure.
 #[test]
@@ -268,10 +320,7 @@ fn a_status_that_disagrees_with_its_payload_is_malformed() -> Result<()> {
             vec![
                 Outcome::Failed(ResponseFailure::Malformed),
                 Outcome::Failed(ResponseFailure::Malformed),
-                Outcome::Handler {
-                    error: failure,
-                    category: ErrorCategory::Transient,
-                },
+                Outcome::Handler(failure),
             ]
         );
         Ok(())

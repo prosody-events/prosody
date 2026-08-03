@@ -21,6 +21,10 @@ fn each_disposition_reports_its_documented_status() {
             ResponseDisposition::FormatMismatch,
             Code::FailedPrecondition,
         ),
+        (
+            ResponseDisposition::ResponseTooLarge,
+            Code::ResourceExhausted,
+        ),
         (ResponseDisposition::MalformedTarget, Code::InvalidArgument),
         (
             ResponseDisposition::AlreadyRelayed,

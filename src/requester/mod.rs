@@ -14,9 +14,8 @@ mod config;
 mod registry;
 
 use self::collect::collect;
-use self::config::MIN_TIMEOUT;
-use self::registry::{Admission, Caps, PendingRegistry};
-use crate::error::{ClassifyError, ErrorCategory};
+use self::registry::{Admission, PendingRegistry};
+use crate::error::ClassifyError;
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::response::RequestId;
 use crate::response::headers::{
@@ -53,26 +52,13 @@ pub enum Outcome<V, E> {
     /// The handler succeeded and the payload decoded.
     Ok(V),
     /// The handler failed and its error decoded.
-    Handler {
-        /// The application error returned by the handler.
-        error: E,
-        /// The category the responder wrote on the wire.
-        category: ErrorCategory,
-    },
+    ///
+    /// The wire status agrees with what this error classifies as, because a
+    /// frame whose two accounts disagree is [`ResponseFailure::Malformed`].
+    /// So the category is read off the error and is never stored beside it.
+    Handler(E),
     /// The subsystem produced no usable answer.
     Failed(ResponseFailure),
-}
-
-/// Proof that one request's subsystems and timeout are inside the registry
-/// caps.
-///
-/// Only [`validate`] mints one, so an unchecked request cannot be registered.
-/// [`PendingRegistry::register`](registry::PendingRegistry::register) reads the
-/// fields directly, and nothing outside this module can build the witness.
-#[derive(Clone, Copy)]
-pub(in crate::requester) struct ValidatedRequest<'a> {
-    subsystems: &'a [SubsystemName],
-    timeout: Duration,
 }
 
 /// Why one requested subsystem produced no usable answer.
@@ -84,6 +70,9 @@ pub enum ResponseFailure {
     /// The responder used a different response format.
     #[error("the responder answered in another format")]
     FormatMismatch,
+    /// The response was larger than this process accepts.
+    #[error("the response was over the configured response ceiling")]
+    TooLarge,
     /// The response payload did not decode or disagreed with its status.
     #[error("the response did not decode")]
     Malformed,
@@ -137,6 +126,20 @@ pub enum RequestError<E: Error> {
     /// Kafka did not accept the request and no response arrived first.
     #[error(transparent)]
     Produce(#[from] ProducerError<E>),
+}
+
+/// Maps a registry refusal onto the error a caller sees.
+///
+/// An id already in use reads as exhausted capacity: a fresh `UUIDv7` puts a
+/// collision out of reach, and refusing is what keeps the live request under
+/// that id from being overwritten.
+impl<E: Error> From<Admission> for RequestError<E> {
+    fn from(admission: Admission) -> Self {
+        match admission {
+            Admission::Exhausted | Admission::IdInUse => Self::AdmissionExhausted,
+            Admission::ShuttingDown => Self::ShuttingDown,
+        }
+    }
 }
 
 /// Sends requests and returns responses in subsystem order.
@@ -194,8 +197,6 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         R: Codec<Payload = Result<V, E>>,
         E: ClassifyError,
     {
-        let validated = validate(subsystems, timeout, self.registry.caps())?;
-
         // The two id texts are declared before the header list, so they outlive
         // the borrows the list holds on them.
         let mut request_buf = [0_u8; ID_TEXT_LEN];
@@ -214,10 +215,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             record_headers.push((name, value));
         }
 
-        let registration = self
-            .registry
-            .register(validated, R::FORMAT_ID)
-            .map_err(map_admission)?;
+        let registration = self.registry.register(subsystems, timeout, R::FORMAT_ID)?;
         Span::current().record("request.id", display(registration.id()));
 
         append_request_headers(
@@ -265,62 +263,4 @@ fn append_request_headers<'a>(
             .iter()
             .map(|subsystem| (RESPONSE_AWAITED_HEADER, subsystem.as_str())),
     );
-}
-
-/// Checks the arguments before anything is registered or produced.
-///
-/// Two positions with one name could not be told apart, because a response
-/// names its subsystem. So a repeated name is refused here rather than left to
-/// fill one position and time out in the other. The validated awaited limit
-/// keeps the count small, so the pairwise scan needs no set and no allocation.
-///
-/// # Errors
-///
-/// Returns [`RequestError`] naming the first limit the arguments break.
-pub(in crate::requester) fn validate<E: Error>(
-    subsystems: &[SubsystemName],
-    timeout: Duration,
-    caps: Caps,
-) -> Result<ValidatedRequest<'_>, RequestError<E>> {
-    if subsystems.is_empty() {
-        return Err(RequestError::NoSubsystems);
-    }
-    if subsystems.len() > caps.max_awaited {
-        return Err(RequestError::TooManySubsystems {
-            count: subsystems.len(),
-            max: caps.max_awaited,
-        });
-    }
-    for i in 0..subsystems.len() {
-        for j in (i + 1)..subsystems.len() {
-            if subsystems[i] == subsystems[j] {
-                return Err(RequestError::DuplicateSubsystem {
-                    name: subsystems[i].clone(),
-                });
-            }
-        }
-    }
-    if !(MIN_TIMEOUT..=caps.max_timeout).contains(&timeout) {
-        return Err(RequestError::TimeoutOutOfRange {
-            timeout,
-            min: MIN_TIMEOUT,
-            max: caps.max_timeout,
-        });
-    }
-    Ok(ValidatedRequest {
-        subsystems,
-        timeout,
-    })
-}
-
-/// Maps a registry refusal onto the error a caller sees.
-///
-/// An id already in use reads as exhausted capacity: a fresh `UUIDv7` puts a
-/// collision out of reach, and refusing is what keeps the live request under
-/// that id from being overwritten.
-fn map_admission<E: Error>(admission: Admission) -> RequestError<E> {
-    match admission {
-        Admission::Exhausted | Admission::IdInUse => RequestError::AdmissionExhausted,
-        Admission::ShuttingDown => RequestError::ShuttingDown,
-    }
 }

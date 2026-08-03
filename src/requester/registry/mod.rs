@@ -5,8 +5,8 @@ mod pending;
 pub(in crate::requester) use self::pending::{
     Arrival, Awaited, Finished, PendingRequest, Status, Terminal,
 };
-use crate::requester::ValidatedRequest;
-use crate::requester::config::RequesterConfiguration;
+use crate::requester::RequestError;
+use crate::requester::config::{MIN_TIMEOUT, RequesterConfiguration};
 use crate::response::frame::ResponseFrame;
 use crate::response::{RequestId, ResponseDisposition};
 use crate::subsystem::SubsystemName;
@@ -14,6 +14,7 @@ use ahash::RandomState;
 use parking_lot::Mutex;
 use scc::HashMap;
 use smallvec::SmallVec;
+use std::error::Error;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::{Arc, Weak};
@@ -36,11 +37,11 @@ pub(in crate::requester) const SWEEP_BATCH: usize = 64;
 /// # What bounds the memory
 ///
 /// Admission bounds how many entries exist. The validated awaited limit bounds
-/// how many positions one entry holds. The validated response ceiling bounds
-/// each payload, and the peer transport applies it when it decodes a frame.
-/// The configuration refuses the product of the three. So what an operator
-/// commits to is checked at startup, rather than left to three numbers that are
-/// each plausible alone.
+/// how many positions one entry holds. A payload over the validated response
+/// ceiling is refused rather than stored, so that ceiling bounds each filled
+/// position. The configuration refuses the product of the three. So what an
+/// operator commits to is checked at startup, rather than left to three numbers
+/// that are each plausible alone.
 ///
 /// # Removal paths, all of them
 ///
@@ -57,7 +58,12 @@ pub(in crate::requester) const SWEEP_BATCH: usize = 64;
 pub(crate) struct PendingRegistry {
     entries: HashMap<RequestId, Entry, RandomState>,
     admission: Arc<Semaphore>,
-    caps: Caps,
+    /// Most subsystems one request may await.
+    max_awaited: usize,
+    /// Longest timeout one request may use.
+    max_timeout: Duration,
+    /// Most bytes one accepted payload may carry.
+    max_response_bytes: usize,
     grace: Duration,
     closed: AtomicBool,
     /// A `OnceLock` cannot replace this: [`shutdown`](Self::shutdown) awaits
@@ -69,18 +75,8 @@ pub(crate) struct PendingRegistry {
 struct Entry {
     request: Arc<PendingRequest>,
     /// Held only for its `Drop`. Removing the record is therefore what returns
-    /// the request's capacity, so a waiter that never runs again costs nothing
-    /// once the sweep has removed it.
+    /// the request's capacity, whether or not the waiting call runs again.
     _permit: OwnedSemaphorePermit,
-}
-
-/// Limits that every request validates before registration.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Caps {
-    /// Most subsystems one request may await.
-    pub(crate) max_awaited: usize,
-    /// Longest timeout one request may use.
-    pub(crate) max_timeout: Duration,
 }
 
 /// Removes one request from the registry when its call ends, however it ends.
@@ -110,10 +106,9 @@ impl PendingRegistry {
                 RandomState::default(),
             ),
             admission: Arc::new(Semaphore::new(config.max_in_flight)),
-            caps: Caps {
-                max_awaited: config.max_awaited,
-                max_timeout: config.max_timeout,
-            },
+            max_awaited: config.max_awaited,
+            max_timeout: config.max_timeout,
+            max_response_bytes: config.max_response_bytes,
             grace: config.sweep_grace,
             closed: AtomicBool::new(false),
             sweeper: Mutex::new(None),
@@ -123,29 +118,52 @@ impl PendingRegistry {
         Ok(registry)
     }
 
-    /// Returns the request limits owned by this registry.
-    pub(crate) const fn caps(&self) -> Caps {
-        self.caps
-    }
-
-    /// Registers one request before its Kafka record is produced.
+    /// Checks one call's arguments against this registry's own caps and
+    /// registers it, before its Kafka record is produced.
     ///
-    /// The [`ValidatedRequest`] witness is the enforcement of the caps this
-    /// registry documents: nothing else can mint one.
+    /// Checking and registering are one operation, so a request cannot enter
+    /// under any caps but this registry's.
+    ///
+    /// Two positions with one name could not be told apart, because a response
+    /// names its subsystem. So a repeated name is refused here rather than left
+    /// to fill one position and time out in the other. The awaited limit keeps
+    /// the count small, so the pairwise scan needs no set and no allocation.
     ///
     /// # Errors
     ///
-    /// Returns [`Admission`] when capacity is full, shutdown has started, or
-    /// a generated id already exists.
-    pub(in crate::requester) fn register(
+    /// Returns [`RequestError`] naming the first limit the arguments break, or
+    /// the refusal admission gave.
+    pub(in crate::requester) fn register<E: Error>(
         self: &Arc<Self>,
-        request: ValidatedRequest<'_>,
+        subsystems: &[SubsystemName],
+        timeout: Duration,
         expects: &'static str,
-    ) -> Result<Registration, Admission> {
-        let ValidatedRequest {
-            subsystems,
-            timeout,
-        } = request;
+    ) -> Result<Registration, RequestError<E>> {
+        if subsystems.is_empty() {
+            return Err(RequestError::NoSubsystems);
+        }
+        if subsystems.len() > self.max_awaited {
+            return Err(RequestError::TooManySubsystems {
+                count: subsystems.len(),
+                max: self.max_awaited,
+            });
+        }
+        for i in 0..subsystems.len() {
+            for j in (i + 1)..subsystems.len() {
+                if subsystems[i] == subsystems[j] {
+                    return Err(RequestError::DuplicateSubsystem {
+                        name: subsystems[i].clone(),
+                    });
+                }
+            }
+        }
+        if !(MIN_TIMEOUT..=self.max_timeout).contains(&timeout) {
+            return Err(RequestError::TimeoutOutOfRange {
+                timeout,
+                min: MIN_TIMEOUT,
+                max: self.max_timeout,
+            });
+        }
         let (id, request) = self.insert(subsystems, expects, timeout)?;
         Ok(Registration {
             registry: Arc::clone(self),
@@ -156,8 +174,9 @@ impl PendingRegistry {
 
     /// Hands one arriving response to the call waiting for it.
     ///
-    /// A frame written in another format fills its position with the refusal,
-    /// so the caller learns at once instead of waiting out its deadline.
+    /// The response ceiling travels from here, so what one position may hold is
+    /// this registry's configured limit rather than a promise about the code
+    /// that decoded the frame.
     ///
     /// The lookup clones the request out and releases the map guard, so the
     /// entry lock is never taken under it. That order is fixed: map guard
@@ -170,7 +189,7 @@ impl PendingRegistry {
         else {
             return ResponseDisposition::UnknownRequest;
         };
-        request.deposit(frame)
+        request.deposit(frame, self.max_response_bytes)
     }
 
     /// Removes every entry at least one grace period past its deadline.

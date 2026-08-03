@@ -284,6 +284,41 @@ async fn a_valid_call_registers_first_and_gives_its_record_back() -> Result<()> 
     Ok(())
 }
 
+/// A call dropped before it finishes leaves no map record and no permit behind,
+/// because the record belongs to the call rather than to the future's progress.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_call_leaves_the_registry_empty() -> Result<()> {
+    let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
+    let requester = requester(Arc::clone(&registry))?;
+    let awaited = names(&["billing", "ledger"])?;
+    let no_headers: Vec<(&'static str, &'static str)> = Vec::new();
+
+    // Boxed rather than pinned on the stack, so dropping the handle drops the
+    // call itself. That drop is what this case is about.
+    let mut call = Box::pin(requester.request::<_, u32, TestError>(
+        no_headers,
+        Topic::from("requests"),
+        "key",
+        RequestPayload,
+        &awaited,
+        TIMEOUT,
+    ));
+    assert!(
+        poll_once(call.as_mut()).await.is_pending(),
+        "the call must park until a response or its deadline"
+    );
+    assert_eq!(registry.len(), 1, "the call registered no record to cancel");
+
+    drop(call);
+    assert_eq!(registry.len(), 0, "a cancelled call kept its map record");
+    assert_eq!(
+        registry.available_permits(),
+        IN_FLIGHT,
+        "a cancelled call kept its admission permit"
+    );
+    Ok(())
+}
+
 /// Drives one generated header trace.
 fn run_headers(trace: HeaderTrace) -> Result<()> {
     let HeaderTrace {

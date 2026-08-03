@@ -54,6 +54,8 @@ pub(in crate::requester) enum Arrival {
     },
     /// A response written in a format this request does not read.
     FormatMismatch,
+    /// A response whose payload is over this process's response ceiling.
+    TooLarge,
 }
 
 /// A state a request may be moved into from outside.
@@ -122,8 +124,10 @@ impl PendingRequest {
     /// A wait that ends with the request still open ended at the deadline, so
     /// the status this function writes is always [`Status::TimedOut`]. The take
     /// is unconditional, so only the first call receives the positions; a later
-    /// call reads the same status and an empty list.
-    pub(in crate::requester) fn finish(&self) -> Finished {
+    /// call reads the same status and an empty list. Only
+    /// [`Registration::finish`](super::Registration::finish) reaches this, and
+    /// one call owns one registration.
+    pub(super) fn finish(&self) -> Finished {
         let (finished, transitioned) = {
             let mut state = self.state.lock();
             let transitioned = state.status == Status::Open;
@@ -190,19 +194,21 @@ impl PendingRequest {
 
     /// Stores the first response for its named subsystem.
     ///
-    /// A frame written in another format fills its position with the refusal,
-    /// so the caller learns at once instead of waiting out its deadline. The
-    /// refusal is the position's first writer, and one duplicate delivery of
-    /// the same response is absorbed by first-writer-wins, so a second frame
-    /// does not replace it. That trade is deliberate: a responder that answers
-    /// in another format is misconfigured rather than late. The refusal is also
-    /// evidence that the record reached a responder, so
+    /// A frame over `max_payload`, and a frame written in another format, fill
+    /// their position with the refusal rather than the response. So the caller
+    /// learns at once instead of waiting out its deadline, and the position
+    /// never holds more than the ceiling. The refusal is the position's first
+    /// writer, and one duplicate delivery of the same response is absorbed by
+    /// first-writer-wins, so a second frame does not replace it. That trade is
+    /// deliberate: a responder that answers over the ceiling or in another
+    /// format is misconfigured rather than late. A refusal is also evidence
+    /// that the record reached a responder, so
     /// [`abandon_unanswered`](Self::abandon_unanswered) reads it as an answer
     /// and a failed delivery report does not fail the call.
     ///
     /// The caller releases the map guard before this function takes the state
     /// lock. This function releases the state lock before it notifies.
-    pub(super) fn deposit(&self, frame: ResponseFrame) -> ResponseDisposition {
+    pub(super) fn deposit(&self, frame: ResponseFrame, max_payload: usize) -> ResponseDisposition {
         let (disposition, completed) = {
             let mut state = self.state.lock();
             if state.status != Status::Open {
@@ -218,7 +224,10 @@ impl PendingRequest {
             if position.arrival.is_some() {
                 return ResponseDisposition::DuplicateSubsystem;
             }
-            let disposition = if frame.format.to_str() == self.expects {
+            let disposition = if frame.payload.len() > max_payload {
+                position.arrival = Some(Arrival::TooLarge);
+                ResponseDisposition::ResponseTooLarge
+            } else if frame.format.to_str() == self.expects {
                 position.arrival = Some(Arrival::Response {
                     status: frame.header.status,
                     payload: frame.payload,

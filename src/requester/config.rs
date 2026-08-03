@@ -60,10 +60,10 @@ pub(crate) struct RequesterConfiguration {
     #[validate(range(min = 1_usize, max = MAX_AWAITED))]
     pub(crate) max_awaited: usize,
 
-    /// Most bytes one response may carry.
+    /// Most bytes one response payload may carry.
     ///
-    /// The peer transport builds its frame ceiling from this value, so it is
-    /// also what one filled position holds.
+    /// The registry refuses a larger payload, so this is what one filled
+    /// position holds.
     #[validate(custom(function = "validate_response_bytes"))]
     pub(crate) max_response_bytes: usize,
 
@@ -120,7 +120,10 @@ fn validate_grace(grace: &Duration) -> Result<(), ValidationError> {
     )
 }
 
-/// Refuses a response ceiling the peer transport could not carry.
+/// Refuses a response ceiling outside the range one peer frame may carry.
+///
+/// A payload no frame could hold is unreachable, and one above the frame
+/// ceiling would let a single response exhaust the receive budget.
 fn validate_response_bytes(bytes: usize) -> Result<(), ValidationError> {
     FrameCap::new(bytes)
         .map(drop)

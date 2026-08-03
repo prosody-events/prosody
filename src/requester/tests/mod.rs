@@ -6,7 +6,6 @@
 
 use super::config::RequesterConfiguration;
 use super::registry::{PendingRegistry, Registration};
-use super::validate;
 use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::response::frame::ResponseFrame;
@@ -158,8 +157,7 @@ pub(super) fn register(
     awaited: &[SubsystemName],
     timeout: Duration,
 ) -> Result<Registration> {
-    let validated = validate::<TestCodecError>(awaited, timeout, registry.caps())?;
-    Ok(registry.register(validated, TestCodec::FORMAT_ID)?)
+    Ok(registry.register::<TestCodecError>(awaited, timeout, TestCodec::FORMAT_ID)?)
 }
 
 /// Builds subsystem names, refusing any the crate would refuse.

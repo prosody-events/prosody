@@ -130,6 +130,8 @@ pub(crate) enum ResponseDisposition {
     UnexpectedSubsystem,
     /// The frame's format token is not the one the waiter's codec speaks.
     FormatMismatch,
+    /// The payload is larger than the waiting process retains for one response.
+    ResponseTooLarge,
     /// The frame names no target node, or one that is not 16 bytes.
     MalformedTarget,
     /// The frame is for another node and has already been relayed once.
@@ -165,7 +167,7 @@ impl ResponseDisposition {
                 Code::FailedPrecondition
             }
             Self::MalformedTarget => Code::InvalidArgument,
-            Self::NoRelayCapacity => Code::ResourceExhausted,
+            Self::ResponseTooLarge | Self::NoRelayCapacity => Code::ResourceExhausted,
             Self::RelayDeadlineExceeded => Code::DeadlineExceeded,
             Self::Unreachable => Code::Unavailable,
         }

@@ -69,6 +69,7 @@ where
             let outcome = match awaited.arrival {
                 None => Outcome::Failed(ResponseFailure::Timeout),
                 Some(Arrival::FormatMismatch) => Outcome::Failed(ResponseFailure::FormatMismatch),
+                Some(Arrival::TooLarge) => Outcome::Failed(ResponseFailure::TooLarge),
                 Some(Arrival::Response {
                     status,
                     mut payload,
@@ -76,7 +77,7 @@ where
                     Ok(Ok(value)) if status == ResponseStatus::Success => Outcome::Ok(value),
                     Ok(Err(error)) => match status {
                         ResponseStatus::Error(category) if category == error.classify_error() => {
-                            Outcome::Handler { error, category }
+                            Outcome::Handler(error)
                         }
                         ResponseStatus::Success | ResponseStatus::Error(_) => {
                             Outcome::Failed(ResponseFailure::Malformed)
