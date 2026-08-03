@@ -282,6 +282,19 @@ impl Default for ConsumerMessageValue<serde_json::Value> {
 }
 
 impl<P> ConsumerMessage<P> {
+    /// Where a response to this message must go, when the record asked for one.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the respond layer is this method's production caller; it is exercised by \
+                      the respond layer's tests"
+        )
+    )]
+    pub(crate) fn request(&self) -> Option<RequestTag> {
+        self.value.request
+    }
+
     /// Create a new `ConsumerMessage` from a message value and processing state
     /// components.
     #[must_use]

@@ -7,7 +7,7 @@ use crate::response::frame::{
     FIELD_CATEGORY, FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE,
     FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, PayloadError,
 };
-use crate::response::{FormatToken, RequestId};
+use crate::response::{FormatToken, RequestId, ResponseStatus};
 use crate::router::{Framed, NodeId};
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use bytes::BytesMut;
@@ -48,7 +48,7 @@ fn a_framed_response_round_trips(
     target: u128,
     request: u128,
     subsystem: usize,
-    category: u8,
+    status: u8,
     relay: Option<u128>,
     mut payload: Vec<u8>,
 ) -> TestResult {
@@ -62,10 +62,11 @@ fn a_framed_response_round_trips(
         target: node(target),
         request: RequestId::from_bytes(request.to_le_bytes()),
         subsystem,
-        category: match category % 3 {
-            0 => ErrorCategory::Transient,
-            1 => ErrorCategory::Permanent,
-            _ => ErrorCategory::Terminal,
+        status: match status % 4 {
+            0 => ResponseStatus::Error(ErrorCategory::Transient),
+            1 => ResponseStatus::Error(ErrorCategory::Permanent),
+            2 => ResponseStatus::Error(ErrorCategory::Terminal),
+            _ => ResponseStatus::Success,
         },
         relay: relay.map(node),
     };
@@ -115,9 +116,9 @@ fn the_raw_fixture_is_a_well_formed_frame() -> Result<()> {
         "the fixture carries its subsystem"
     );
     assert_eq!(
-        decoded.header.category,
-        ErrorCategory::Permanent,
-        "the fixture carries its category"
+        decoded.header.status,
+        ResponseStatus::Error(ErrorCategory::Permanent),
+        "the fixture carries its status"
     );
     assert_eq!(
         &decoded.payload[..],

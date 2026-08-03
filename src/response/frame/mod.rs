@@ -18,9 +18,8 @@
     )
 )]
 
-use super::{FormatToken, RequestId};
+use super::{FormatToken, RequestId, ResponseStatus};
 use crate::codec::Codec;
-use crate::error::ErrorCategory;
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
@@ -65,7 +64,7 @@ pub(crate) struct FrameHeader {
     /// The subsystem the response is for.
     pub(crate) subsystem: SubsystemName,
     /// How the responder classified the result.
-    pub(crate) category: ErrorCategory,
+    pub(crate) status: ResponseStatus,
     /// Set only by a relay, which always writes its own id and never preserves
     /// one it received. A responder always leaves this `None`.
     pub(crate) relay: Option<NodeId>,

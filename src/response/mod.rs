@@ -1,6 +1,7 @@
 //! Synchrony recovery's own half: what a response is, how it is framed, and
 //! how one delivery attempt is answered.
 
+use crate::error::{ErrorCategory, UnknownErrorCategory};
 use fixedstr::Flexstr;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use tonic::Code;
@@ -20,6 +21,19 @@ pub(crate) const FORMAT_MAX_BYTES: usize = 128;
 /// [`FORMAT_MAX_BYTES`].
 pub(crate) type FormatToken = Flexstr<{ FORMAT_MAX_BYTES + 1 }>;
 
+/// How a responder classified the result one frame carries.
+///
+/// The wire keeps the error categories and adds one discriminant for a
+/// success. Thus, a frame never states a category for a successful result.
+/// Zero stays reserved, so an omitted field is malformed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResponseStatus {
+    /// The handler succeeded.
+    Success,
+    /// The handler failed, with this classification.
+    Error(ErrorCategory),
+}
+
 /// Identifies one request across the fleet.
 ///
 /// Minted as a `UUIDv7`, so ids sort by creation time and read chronologically
@@ -27,6 +41,27 @@ pub(crate) type FormatToken = Flexstr<{ FORMAT_MAX_BYTES + 1 }>;
 /// other way is still answerable.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RequestId(Uuid);
+
+impl From<ResponseStatus> for i32 {
+    fn from(status: ResponseStatus) -> Self {
+        match status {
+            ResponseStatus::Success => 4,
+            ResponseStatus::Error(category) => Self::from(category),
+        }
+    }
+}
+
+impl TryFrom<i32> for ResponseStatus {
+    type Error = UnknownErrorCategory;
+
+    fn try_from(value: i32) -> Result<Self, UnknownErrorCategory> {
+        if value == 4 {
+            Ok(Self::Success)
+        } else {
+            ErrorCategory::try_from(value).map(Self::Error)
+        }
+    }
+}
 
 impl RequestId {
     /// Mints an id for one request.

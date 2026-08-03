@@ -6,8 +6,8 @@ use super::{
     FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, ID_BYTES,
     ResponseFrame,
 };
-use crate::error::{ErrorCategory, UnknownErrorCategory};
-use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION, RequestId};
+use crate::error::UnknownErrorCategory;
+use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION, RequestId, ResponseStatus};
 use crate::router::NodeId;
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use bytes::{Buf, BufMut, BytesMut};
@@ -66,7 +66,7 @@ pub(crate) fn decode_frame<B: Buf>(
     let mut request = None;
     let mut subsystem = None;
     let mut format = None;
-    let mut category = None;
+    let mut status = None;
     // A codec may legally serialize to zero bytes, and a frame no relay has
     // touched carries no relay node, so a peer that omits these proto3 defaults
     // is sending a well-formed frame. The six fields above exclude their default
@@ -112,7 +112,7 @@ pub(crate) fn decode_frame<B: Buf>(
             }
             FIELD_CATEGORY => {
                 check_wire_type(WireType::Varint, wire_type)?;
-                category = Some(ErrorCategory::try_from(decode_varint(src)? as u32 as i32)?);
+                status = Some(ResponseStatus::try_from(decode_varint(src)? as u32 as i32)?);
             }
             FIELD_PAYLOAD => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
@@ -138,7 +138,7 @@ pub(crate) fn decode_frame<B: Buf>(
             target: target.ok_or(FrameDecodeError::MissingField("target_node"))?,
             request: request.ok_or(FrameDecodeError::MissingField("request_id"))?,
             subsystem: subsystem.ok_or(FrameDecodeError::MissingField("subsystem"))?,
-            category: category.ok_or(FrameDecodeError::MissingField("category"))?,
+            status: status.ok_or(FrameDecodeError::MissingField("category"))?,
             relay,
         },
         format: format.ok_or(FrameDecodeError::MissingField("format"))?,
@@ -289,7 +289,7 @@ pub(crate) enum FrameDecodeError {
     #[error(transparent)]
     Subsystem(#[from] SubsystemNameError),
 
-    /// The category field names no error category.
+    /// The category field names no response status.
     #[error(transparent)]
     Category(#[from] UnknownErrorCategory),
 

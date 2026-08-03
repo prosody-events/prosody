@@ -6,7 +6,7 @@ use super::{
     FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, ID_BYTES,
 };
 use crate::codec::Codec;
-use crate::error::ErrorCategory;
+use crate::response::ResponseStatus;
 use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION};
 use crate::router::Framed;
 use bytes::BufMut;
@@ -160,7 +160,7 @@ impl Framed for Staged<'_> {
             dst,
         );
         write_bytes_field(FIELD_FORMAT, self.format.as_bytes(), dst);
-        write_varint_field(FIELD_CATEGORY, category_varint(self.header.category), dst);
+        write_varint_field(FIELD_CATEGORY, status_varint(self.header.status), dst);
         write_bytes_field(FIELD_PAYLOAD, self.payload, dst);
         if let Some(relay) = self.header.relay {
             write_bytes_field(FIELD_RELAY_NODE, &relay.into_bytes(), dst);
@@ -176,7 +176,7 @@ fn frame_len(header: &FrameHeader, format: &str, payload: usize) -> u64 {
         + bytes_field_len(FIELD_REQUEST_ID, ID_BYTES)
         + bytes_field_len(FIELD_SUBSYSTEM, header.subsystem.as_str().len())
         + bytes_field_len(FIELD_FORMAT, format.len())
-        + varint_field_len(FIELD_CATEGORY, category_varint(header.category))
+        + varint_field_len(FIELD_CATEGORY, status_varint(header.status))
         + bytes_field_len(FIELD_PAYLOAD, payload)
         + if header.relay.is_some() {
             bytes_field_len(FIELD_RELAY_NODE, ID_BYTES)
@@ -193,10 +193,10 @@ const fn bytes_field_len(tag: u32, len: usize) -> u64 {
     key_len(tag) as u64 + encoded_len_varint(len as u64) as u64 + len as u64
 }
 
-/// An `int32` sign-extends to 64 bits on the wire. Every category is positive,
+/// An `int32` sign-extends to 64 bits on the wire. Every status is positive,
 /// so this is always the one- or two-byte form.
-fn category_varint(category: ErrorCategory) -> u64 {
-    i64::from(i32::from(category)) as u64
+fn status_varint(status: ResponseStatus) -> u64 {
+    i64::from(i32::from(status)) as u64
 }
 
 // These two are all it takes to emit a complete frame, so they stay private:

@@ -1,15 +1,35 @@
 //! An in-process transport, so delivery can be driven without a socket.
 
 use crate::router::directory::Endpoint;
-use crate::router::{Framed, ResponseSender, SendFailure};
+use crate::router::fleet::DestinationFleet;
+use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
+use crate::router::{Framed, Host, NodeId, ResponseSender, Router, SendFailure};
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::future::Future;
+use std::io::Error as IoError;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
+
+/// Port of the first test node. Each node binds one of its own, which is also
+/// the transport's script key.
+const PORT_BASE: u16 = 9000;
+
+/// How many nodes the test router publishes.
+pub(crate) const PUBLISHED_NODES: u8 = 8;
+
+/// A node the test router does not publish.
+pub(crate) const UNPUBLISHED_NODE: u8 = 200;
+
+/// A deadline on every wait, so a hang fails the test instead of hanging the
+/// binary. It is never the assertion.
+pub(crate) const HANG_GUARD: Duration = Duration::from_secs(30);
 
 /// One delivery attempt, as the transport saw it.
 ///
@@ -50,6 +70,17 @@ pub(crate) struct LoopbackSender {
     /// The rule against a mutex-wrapped map targets contended keyed production
     /// state, which this is not.
     scripts: Mutex<HashMap<u16, Script>>,
+}
+
+/// A router over an in-process transport, addressing a fixed set of nodes.
+///
+/// Every suite that drives delivery builds one of these, so a router double
+/// exists once rather than once per test tree.
+#[derive(Clone)]
+pub(crate) struct TestRouter {
+    fleet: Arc<DestinationFleet>,
+    transport: Arc<LoopbackSender>,
+    addresses: Arc<HashMap<NodeId, Endpoint>>,
 }
 
 /// What one attempt gets, once the script has been consulted.
@@ -95,6 +126,60 @@ impl LoopbackSender {
     }
 }
 
+impl TestRouter {
+    /// Builds the fleet, transport, published addresses, and delivery stream.
+    pub(crate) fn new(
+        config: FleetConfiguration,
+    ) -> Result<(Self, UnboundedReceiver<Delivery>), FleetConfigurationError> {
+        let (transport, deliveries) = LoopbackSender::new();
+        let addresses = (0..PUBLISHED_NODES)
+            .map(|index| {
+                (
+                    node(index),
+                    Endpoint {
+                        host: Host::make("10.0.0.1"),
+                        port: port(index),
+                    },
+                )
+            })
+            .collect();
+        Ok((
+            Self {
+                fleet: Arc::new(DestinationFleet::new(config)?),
+                transport: Arc::new(transport),
+                addresses: Arc::new(addresses),
+            },
+            deliveries,
+        ))
+    }
+
+    /// Sets what the destination for `index` answers.
+    pub(crate) fn script(&self, index: u8, script: Script) {
+        self.transport.script(port(index), script);
+    }
+}
+
+impl Router for TestRouter {
+    type Error = Infallible;
+    type Sender = LoopbackSender;
+
+    fn address(
+        &self,
+        node: NodeId,
+    ) -> impl Future<Output = Result<Option<Endpoint>, Infallible>> + Send {
+        let address = self.addresses.get(&node).cloned();
+        async move { Ok(address) }
+    }
+
+    fn sender(&self) -> &LoopbackSender {
+        &self.transport
+    }
+
+    fn fleet(&self) -> &Arc<DestinationFleet> {
+        &self.fleet
+    }
+}
+
 impl ResponseSender for LoopbackSender {
     fn deliver<F: Framed + Sync>(
         &self,
@@ -126,5 +211,32 @@ impl ResponseSender for LoopbackSender {
                 },
             }
         }
+    }
+}
+
+/// A node id from one repeated byte.
+pub(crate) fn node(index: u8) -> NodeId {
+    NodeId::from_bytes([index; 16])
+}
+
+/// The port that belongs to `index`.
+pub(crate) fn port(index: u8) -> u16 {
+    PORT_BASE + u16::from(index)
+}
+
+/// Builds a current-thread runtime with paused time.
+pub(crate) fn paused() -> Result<Runtime, IoError> {
+    Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+}
+
+/// Builds a fleet configuration for the requested capacity.
+pub(crate) fn config(max_destinations: usize, slots_each: usize) -> FleetConfiguration {
+    FleetConfiguration {
+        max_destinations,
+        slots_each,
+        ..FleetConfiguration::default()
     }
 }

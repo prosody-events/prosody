@@ -1,5 +1,6 @@
 use super::{CountingCodec, RAW_ID, RELAY_FIELD_BYTES, expected_frame_len, header};
 use crate::error::ErrorCategory;
+use crate::response::ResponseStatus;
 use crate::response::frame::FrameCap;
 use crate::response::frame::encode::{EncodeError, FrameEncoder};
 use crate::router::{Framed, NodeId};
@@ -23,6 +24,10 @@ const FROZEN: [u8; 65] = [
     0x30, 0x02, // category = Permanent
     0x3a, 0x02, b'h', b'i', // payload
 ];
+
+/// Where the status value sits in [`FROZEN`]. The assertion in the frozen-bytes
+/// test holds this to the key that precedes it.
+const FROZEN_STATUS: usize = 60;
 
 /// The encoder never reserves: over a run of encodes up to the configured
 /// maximum, a destination buffer sized at the cap never grows, the payload is
@@ -59,7 +64,7 @@ fn encodes_without_reserving(codec: &CountingCodec, lengths: &[usize], relay: bo
     let subsystem = "billing";
     let Ok(header) = header(
         subsystem,
-        ErrorCategory::Transient,
+        ResponseStatus::Error(ErrorCategory::Transient),
         relay.then(|| NodeId::from_bytes(RAW_ID)),
     ) else {
         return TestResult::error("the fixture subsystem is a legal name");
@@ -161,7 +166,11 @@ fn encodes_without_reserving(codec: &CountingCodec, lengths: &[usize], relay: bo
 fn an_over_cap_response_is_refused_before_it_is_framed() -> Result<()> {
     let cap = FrameCap::new(1024)?;
     let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
-    let header = header("billing", ErrorCategory::Permanent, None)?;
+    let header = header(
+        "billing",
+        ResponseStatus::Error(ErrorCategory::Permanent),
+        None,
+    )?;
 
     let staged = encoder.stage(&header, vec![0u8; 960])?;
     assert_eq!(
@@ -191,7 +200,11 @@ fn an_over_cap_response_is_refused_before_it_is_framed() -> Result<()> {
 #[test]
 fn a_released_encoder_holds_nothing_of_the_response_before_it() -> Result<()> {
     let cap = FrameCap::new(1024)?;
-    let header = header("billing", ErrorCategory::Permanent, None)?;
+    let header = header(
+        "billing",
+        ResponseStatus::Error(ErrorCategory::Permanent),
+        None,
+    )?;
     for codec in [CountingCodec::default(), CountingCodec::moving()] {
         let mut encoder = FrameEncoder::new(codec, cap);
         let mut dst = BytesMut::with_capacity(cap.bytes());
@@ -214,12 +227,26 @@ fn a_released_encoder_holds_nothing_of_the_response_before_it() -> Result<()> {
 
 #[test]
 fn one_response_frames_to_known_bytes() -> Result<()> {
+    assert_eq!(
+        FROZEN[FROZEN_STATUS - 1],
+        0x30,
+        "the status byte must follow its own field key",
+    );
     let cap = FrameCap::new(1024)?;
-    let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
-    let header = header("billing", ErrorCategory::Permanent, None)?;
-    let mut dst = BytesMut::with_capacity(cap.bytes());
+    // The error row is the frame a peer of another release already reads. The
+    // success row is the same frame with the one byte a success changes.
+    for (status, byte) in [
+        (ResponseStatus::Error(ErrorCategory::Permanent), 0x02),
+        (ResponseStatus::Success, 0x04),
+    ] {
+        let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
+        let header = header("billing", status, None)?;
+        let mut dst = BytesMut::with_capacity(cap.bytes());
+        let mut expected = FROZEN;
+        expected[FROZEN_STATUS] = byte;
 
-    encoder.stage(&header, b"hi".to_vec())?.write(&mut dst);
-    assert_eq!(&dst[..], &FROZEN[..], "the frame's bytes are frozen");
+        encoder.stage(&header, b"hi".to_vec())?.write(&mut dst);
+        assert_eq!(&dst[..], &expected[..], "the frame's bytes are frozen");
+    }
     Ok(())
 }

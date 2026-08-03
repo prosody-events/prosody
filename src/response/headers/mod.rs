@@ -17,7 +17,8 @@
 //! record — a poll, a deferred reload and a state read each decode the same
 //! record — so read the counter as a rate, never as a population.
 
-use crate::response::RequestId;
+use crate::response::frame::FrameHeader;
+use crate::response::{RequestId, ResponseStatus};
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use opentelemetry::KeyValue;
@@ -87,6 +88,28 @@ impl RequestTag {
     /// Pairs a request with the node awaiting its response.
     pub(crate) const fn new(id: RequestId, node: NodeId) -> Self {
         Self { id, node }
+    }
+
+    /// The frame header a response to this request must carry.
+    ///
+    /// The sender resolves the node through the directory. A Kafka header can
+    /// never supply an address. A responder never sets the relay.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the respond layer is this method's production caller; it is exercised by \
+                      this module's tests"
+        )
+    )]
+    pub(crate) fn header(self, subsystem: SubsystemName, status: ResponseStatus) -> FrameHeader {
+        FrameHeader {
+            target: self.node,
+            request: self.id,
+            subsystem,
+            status,
+            relay: None,
+        }
     }
 }
 

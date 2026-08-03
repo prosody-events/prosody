@@ -91,6 +91,15 @@ struct Job<C: Codec> {
     expires_at: Instant,
 }
 
+/// A response the sender could not take.
+///
+/// The sender returns the payload so its caller can dispose of it. Nothing is
+/// encoded for a refused response.
+pub(crate) struct Rejected<P> {
+    pub(crate) reason: Refused,
+    pub(crate) payload: P,
+}
+
 /// What one sender's deliveries came to.
 ///
 /// Every job a worker dequeues moves exactly one of these. A response the
@@ -159,8 +168,20 @@ impl<C: Codec> TypedSender<C> {
     ///
     /// Returns [`Refused::Fleet`] when the fleet refused a slot, and
     /// [`Refused::Queue`] when the destination's queue could not take the job.
-    pub(crate) fn send(&self, header: FrameHeader, payload: C::Payload) -> Result<(), Refused> {
-        let reservation = self.fleet.reserve(header.target)?;
+    pub(crate) fn send(
+        &self,
+        header: FrameHeader,
+        payload: C::Payload,
+    ) -> Result<(), Rejected<C::Payload>> {
+        let reservation = match self.fleet.reserve(header.target) {
+            Ok(reservation) => reservation,
+            Err(refusal) => {
+                return Err(Rejected {
+                    reason: Refused::Fleet(refusal),
+                    payload,
+                });
+            }
+        };
         // The cell a reservation names is one of this fleet's, and this
         // sender's queues are the same fleet's length.
         let jobs = &self.queues[reservation.slot()];
@@ -174,7 +195,7 @@ impl<C: Codec> TypedSender<C> {
                 slot,
                 expires_at,
             };
-            if jobs.try_send(job).is_err() {
+            if let Err(error) = jobs.try_send(job) {
                 // `Full` cannot happen. A queue is as deep as its destination
                 // has slots, every job in it holds one of them, and a cell only
                 // changes occupant while every slot of it is free. A job that
@@ -183,7 +204,11 @@ impl<C: Codec> TypedSender<C> {
                 // the returned job releases its slot. This is the one drop that
                 // no dequeued job accounts for.
                 self.counters.dropped.fetch_add(1, Relaxed);
-                return Err(Refused::Queue);
+                let job = error.into_inner();
+                return Err(Rejected {
+                    reason: Refused::Queue,
+                    payload: job.payload,
+                });
             }
             Ok(())
         })

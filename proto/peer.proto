@@ -22,7 +22,7 @@ message ResponseFrame {
   bytes  request_id       = 3;  // 16 bytes
   string subsystem        = 4;
   string format           = 5;  // the responder's Codec::FORMAT_ID
-  int32  category         = 6;  // ClassifyError category; 0 is reserved
+  int32  category         = 6;  // Responder classification, including success; 0 is reserved
   bytes  payload          = 7;
   // Empty until a relay forwards the frame, then the relay's own node id. A
   // frame that already names a relay is never forwarded again. A relay always
