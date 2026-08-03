@@ -209,13 +209,14 @@ impl NodeDirectory {
     ///
     /// The node row is written first and the membership index second. The two
     /// are deliberately not batched — they are different partitions.
-    /// [`deregister`](Self::deregister) mirrors the order. What the order buys
-    /// is the size of the window in which the index names a node whose row is
-    /// missing: a failure between the two statements leaves a live process
-    /// unlisted, never a dangling entry. A listing must still tolerate one,
-    /// because the two rows carry separate leases stamped in write order, so
-    /// after a crash the index outlives the node row by the gap between the two
-    /// writes.
+    /// [`deregister`](Self::deregister) mirrors the order.
+    ///
+    /// The order decides what a failure between the two statements leaves
+    /// behind. It leaves a live process unlisted, never an index entry that
+    /// names a missing row. A listing must still tolerate such an entry, for a
+    /// second reason: the two rows carry separate leases stamped in write
+    /// order. So after a crash the index outlives the node row by the gap
+    /// between the two writes.
     ///
     /// # Errors
     ///

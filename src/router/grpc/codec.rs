@@ -25,10 +25,9 @@ const GRPC_HEADER_BYTES: usize = 5;
 ///
 /// tonic's encoder must be `'static`, so it cannot borrow the worker's scratch.
 /// A response therefore pays one right-sized copy into this value immediately
-/// before a network round trip. That is the trade
-/// [`ResponseSender`](crate::router::ResponseSender) documents, and it is not
-/// re-litigated here: a pool cannot reclaim the bytes, because tonic owns them
-/// until the write completes.
+/// before a network round trip. A pool cannot reclaim those bytes, because
+/// tonic owns them until the write completes.
+/// [`ResponseSender`](crate::router::ResponseSender) owns that trade.
 pub(crate) struct FrameBytes(Bytes);
 
 /// The listener's codec: it reads a frame and writes nothing.
@@ -81,7 +80,8 @@ impl Encoder for ServerFrameCodec {
     }
 
     /// The answer is always the header alone, so the per-call buffer is sized
-    /// to it rather than to tonic's 8 KiB default.
+    /// to it rather than to tonic's 8 KiB default. The second number is the
+    /// streaming yield threshold, which one unary message never reaches.
     fn buffer_settings(&self) -> BufferSettings {
         BufferSettings::new(GRPC_HEADER_BYTES, GRPC_HEADER_BYTES)
     }
@@ -93,10 +93,10 @@ impl Decoder for ServerFrameCodec {
 
     /// Reads one frame, and counts what it refuses.
     ///
-    /// The ceiling passed here is the type's own upper bound, not the
-    /// listener's configured one: the listener sets `max_decoding_message_size`
-    /// to that ceiling, so a message over it is refused before a byte reaches
-    /// this reader.
+    /// The listener's configured ceiling refuses an over-cap message before a
+    /// byte reaches this reader, and answers the peer `OUT_OF_RANGE` itself. So
+    /// the ceiling passed here is the type's own upper bound, and the size arm
+    /// of [`refusal`] answers only a reader driven directly.
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<ResponseFrame>, Status> {
         match decode_frame(src, FrameCap::MAX) {
             Ok(frame) => Ok(Some(frame)),
@@ -140,7 +140,8 @@ impl Encoder for ClientFrameCodec {
     }
 
     /// Exactly one frame plus its gRPC header, so tonic's per-call buffer is
-    /// allocated once at the right size and never grows.
+    /// allocated once at the right size and never grows. The second number is
+    /// the streaming yield threshold, which one unary message never reaches.
     fn buffer_settings(&self) -> BufferSettings {
         let bytes = self.frame_len.saturating_add(GRPC_HEADER_BYTES);
         BufferSettings::new(bytes, bytes)
@@ -151,11 +152,18 @@ impl Decoder for ClientFrameCodec {
     type Error = Status;
     type Item = ();
 
-    /// The peer method has no response body. Anything a peer sent anyway is
-    /// consumed so the stream stays aligned, and is never read.
+    /// The peer method answers with the gRPC status and no body. The client's
+    /// zero decoding ceiling refuses a larger answer before this reader runs,
+    /// so what it consumes is always empty.
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<()>, Status> {
         src.advance(src.remaining());
         Ok(Some(()))
+    }
+
+    /// The answer is the header alone, so the receive buffer is sized to it
+    /// rather than to tonic's 8 KiB default.
+    fn buffer_settings(&self) -> BufferSettings {
+        BufferSettings::new(GRPC_HEADER_BYTES, GRPC_HEADER_BYTES)
     }
 }
 
@@ -167,6 +175,16 @@ impl Decoder for ClientFrameCodec {
 fn refusal(error: &FrameDecodeError) -> Status {
     match error {
         FrameDecodeError::FrameTooLarge { .. } => Status::out_of_range(error.to_string()),
-        _ => Status::invalid_argument(error.to_string()),
+        FrameDecodeError::Truncated { .. }
+        | FrameDecodeError::MissingField(_)
+        | FrameDecodeError::RepeatedField(_)
+        | FrameDecodeError::UnsupportedVersion(_)
+        | FrameDecodeError::MalformedId { .. }
+        | FrameDecodeError::StringTooLong { .. }
+        | FrameDecodeError::InvalidUtf8(_)
+        | FrameDecodeError::Subsystem(_)
+        | FrameDecodeError::StatusTooWide(_)
+        | FrameDecodeError::Status(_)
+        | FrameDecodeError::Wire(_) => Status::invalid_argument(error.to_string()),
     }
 }

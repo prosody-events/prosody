@@ -28,6 +28,11 @@ const SHORT: usize = 8;
 ///
 /// It is sent through the wide sender on purpose: that sender's own encoding
 /// ceiling is above the frame, so the refusal cannot be the client's.
+///
+/// What refuses it is the transport's configured ceiling, before a byte reaches
+/// the frame reader. So this case asserts the status and the service counter
+/// only. The version case below refuses inside the reader, which is why that
+/// one can also assert the rejected-frame counter.
 #[test]
 fn an_oversized_frame_is_refused_by_the_server() -> Result<()> {
     init_test_logging();
@@ -102,8 +107,8 @@ fn the_client_refuses_an_over_cap_frame_before_it_sends() -> Result<()> {
             Ok(())
         }
         .await;
-        harness.stop().await;
-        outcome
+        let stopped = harness.stop().await;
+        outcome.and(stopped)
     })
 }
 

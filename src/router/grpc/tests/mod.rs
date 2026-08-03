@@ -100,7 +100,7 @@ pub(super) struct TestHealth {
 
 /// Bytes already framed, so a suite can put a frame on the wire that no encoder
 /// would produce.
-pub(super) struct RawFramed(pub(super) BytesMut);
+struct RawFramed(BytesMut);
 
 impl Harness {
     /// The listener every suite shares.
@@ -126,7 +126,6 @@ impl Harness {
             bound,
             PeerService::new(node, Arc::clone(&served_registry)),
             TestHealth::new(true, true),
-            &config,
             // A signal stops the listener; so does dropping the sender, which
             // is what a harness that is simply dropped does.
             async move { stopped.await.unwrap_or(()) },
@@ -171,11 +170,15 @@ impl Harness {
     }
 
     /// Stops the listener and waits for it to finish.
-    pub(super) async fn stop(mut self) {
+    ///
+    /// The listener task logs its own serve error, so a join failure here is a
+    /// panic inside that task and is reported rather than dropped.
+    pub(super) async fn stop(mut self) -> Result<()> {
         drop(self.stop.take());
         if let Some(served) = self.served.take() {
-            drop(served.await);
+            served.await?;
         }
+        Ok(())
     }
 }
 

@@ -14,9 +14,9 @@
 //! module and nowhere else in the router.
 
 // The `not(test)` gate is what makes this an *expectation* rather than a
-// blanket permission: it holds only while these items really are
-// production-dead, so the day the process runtime builds the listener, the gate
-// reports it unfulfilled and demands the attribute be deleted.
+// blanket permission. It holds while any item in this module is
+// production-dead, and it is deleted the day the process runtime builds the
+// listener.
 #![cfg_attr(
     not(test),
     expect(
@@ -30,7 +30,7 @@ pub(crate) mod client;
 pub(crate) mod codec;
 mod conn;
 pub(crate) mod health;
-pub(crate) mod inject;
+mod inject;
 pub(crate) mod service;
 
 /// The peer service, written from `proto/peer.proto` at build time.
@@ -42,7 +42,7 @@ pub(crate) mod generated {
 mod tests;
 
 use self::conn::admitted;
-use self::generated::peer_server::{PeerServer, SERVICE_NAME};
+use self::generated::peer_server::PeerServer;
 use self::health::{PeerHealth, ProcessHealth};
 use self::service::PeerService;
 use crate::response::frame::FrameCap;
@@ -64,13 +64,28 @@ use validator::{Validate, ValidationErrors};
 /// The peer schema, embedded so reflection can publish it without a file.
 const DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/peer_descriptor.bin"));
 
-/// How long the listener waits before it accepts again after a failed accept.
-const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+/// How often the listener pings a connection that carries nothing.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Most concurrent connections one listener may be configured to hold.
+/// How long a pinged peer has to answer before its connection is closed.
+///
+/// Together with [`KEEPALIVE_INTERVAL`] this is what bounds a permit whose peer
+/// stopped answering. A peer that dies without a FIN would otherwise hold its
+/// admission permit for the life of the process.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most one health or reflection request may carry. Both messages are a service
+/// name at most, so this ceiling is small and fixed rather than configurable.
+const CONTROL_MESSAGE_BYTES: usize = 4 * 1024;
+
+/// Most concurrent connections one listener may be configured to hold. Each one
+/// costs a file descriptor, so this ceiling is the file-descriptor budget one
+/// process is given.
 const MAX_CONNECTIONS: usize = 4_096;
 
-/// Most concurrent streams one connection may be configured to open.
+/// Most concurrent streams one connection may be configured to open. Each open
+/// stream holds h2 buffers of its own, so this ceiling is what one connection
+/// may make this process hold.
 const MAX_STREAMS: u32 = 1_024;
 
 /// Connections one listener holds when an operator sets no number.
@@ -121,14 +136,18 @@ pub(crate) struct TransportConfiguration {
     pub(crate) reflection: bool,
 }
 
-/// A listener that is already bound, and the address it bound.
+/// A listener that is already bound, the address it bound, and the
+/// configuration it was bound under.
 ///
 /// The address is the one the operating system assigned. There is no configured
 /// address to read from this type, so publishing a port nothing listens on is
-/// unwritable rather than merely discouraged.
+/// unwritable rather than merely discouraged. [`serve`] reads its caps from the
+/// configuration carried here, so serving a listener under caps nothing
+/// validated is unwritable in the same way.
 pub(crate) struct BoundListener {
     listener: TcpListener,
     address: SocketAddr,
+    config: TransportConfiguration,
 }
 
 /// Counts kept by the peer listener.
@@ -175,10 +194,14 @@ impl BoundListener {
         config.validate()?;
         let listener = TcpListener::bind(config.bind).await?;
         let address = listener.local_addr()?;
-        Ok(Self { listener, address })
+        Ok(Self {
+            listener,
+            address,
+            config: *config,
+        })
     }
 
-    /// The address the operating system assigned. This is what registration
+    /// The address the operating system assigned. Its port is what registration
     /// publishes.
     pub(crate) const fn address(&self) -> SocketAddr {
         self.address
@@ -206,6 +229,10 @@ impl TransportCounters {
     }
 
     /// How many frames the reader refused before the service could run.
+    ///
+    /// A frame over the listener's configured ceiling is not one of them: the
+    /// transport refuses it before the reader sees it, and the `OUT_OF_RANGE`
+    /// the peer is answered is the signal for that refusal.
     pub(crate) fn rejected_frames(&self) -> u64 {
         self.rejected_frames.load(Relaxed)
     }
@@ -250,13 +277,13 @@ pub(crate) fn serve<H, F>(
     bound: BoundListener,
     service: PeerService,
     health: H,
-    config: &TransportConfiguration,
     shutdown: F,
 ) -> Result<JoinHandle<()>, TransportError>
 where
     H: ProcessHealth,
     F: Future<Output = ()> + Send + 'static,
 {
+    let config = bound.config;
     let reflection = config
         .reflection
         .then(|| {
@@ -264,12 +291,18 @@ where
                 .register_encoded_file_descriptor_set(DESCRIPTOR_SET)
                 .build_v1()
         })
-        .transpose()?;
+        .transpose()?
+        .map(|service| service.max_decoding_message_size(CONTROL_MESSAGE_BYTES));
     let incoming = admitted(bound.listener, config.max_connections);
     let router = Server::builder()
+        .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .max_concurrent_streams(config.max_concurrent_streams)
         .add_service(PeerServer::new(service).max_decoding_message_size(config.frame_cap.bytes()))
-        .add_service(HealthServer::new(PeerHealth::new(health, SERVICE_NAME)))
+        .add_service(
+            HealthServer::new(PeerHealth::new(health))
+                .max_decoding_message_size(CONTROL_MESSAGE_BYTES),
+        )
         .add_optional_service(reflection);
     Ok(tokio::spawn(async move {
         if let Err(error) = router

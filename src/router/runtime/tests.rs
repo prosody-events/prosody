@@ -20,14 +20,6 @@ use validator::Validate;
 /// The Cassandra contact point the routed-address probe aims at.
 const CONTACT: &str = "localhost:9042";
 
-/// A peer listener on a port the operating system chooses.
-///
-/// Registration reads the bound listener rather than a port number, so a test
-/// binds a real one and the published port is always a port that exists.
-async fn listener() -> Result<BoundListener> {
-    Ok(BoundListener::bind(&TransportConfiguration::default()).await?)
-}
-
 /// The same contact point written as an address. A probe against it exercises
 /// no name resolution, so it always aims at one address family.
 const NUMERIC_CONTACT: &str = "127.0.0.1:9042";
@@ -36,6 +28,14 @@ const NUMERIC_CONTACT: &str = "127.0.0.1:9042";
 /// starts with, and its refresh delay is at least a fifth of it, so no refresh
 /// runs while a test observes the first write.
 const LEASE: Duration = Duration::from_secs(30);
+
+/// A peer listener on a port the operating system chooses.
+///
+/// Registration reads the bound listener rather than a port number, so a test
+/// binds a real one and the published port is always a port that exists.
+async fn listener() -> Result<BoundListener> {
+    Ok(BoundListener::bind(&TransportConfiguration::default()).await?)
+}
 
 /// A process that enables no peer feature still takes its place in the
 /// directory: it registers before `start` returns, and a clean shutdown
@@ -182,40 +182,57 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
     })
 }
 
-/// A configured entry point never reaches `direct`. `direct` is what a
-/// neighbour on the same network dials, so it stays the discovered address on
-/// the port the listener bound, however the entry point is configured.
-#[test]
-fn a_configured_entry_point_never_reaches_the_direct_endpoint() -> Result<()> {
+/// No configured value ever reaches the direct endpoint.
+///
+/// `direct` is what a neighbour on the same network dials, so it stays the
+/// discovered address on the port the listener bound, however the entry point
+/// is configured. The bound port is never zero either: port zero is a request
+/// the operating system answers, and the answer is the only port registration
+/// can publish. What the operator configured reaches `advertised` alone.
+#[quickcheck]
+fn prop_the_direct_endpoint_publishes_only_what_it_discovered(label: u8, port: u16) -> TestResult {
     init_test_logging();
-    TEST_RUNTIME.block_on(async {
+    let host = format!("gateway-{label}.example");
+    // Port zero is refused by the configuration, so it is not a case this
+    // property covers; `configuration_refuses_degenerate_values` owns it.
+    let advertised_port = port.max(1);
+    let outcome: Result<()> = TEST_RUNTIME.block_on(async {
         let config = RouterConfiguration::builder()
-            .advertised_host("gateway.example")
-            .advertised_port(443_u16)
-            .network("east")
+            .advertised_host(host.clone())
+            .advertised_port(advertised_port)
             .build()?;
+        config.validate()?;
         let bound = listener().await?;
         let registration = discover_registration(NodeId::new(), &bound, CONTACT, &config, None)?;
-        assert_eq!(
+        ensure!(
+            bound.address().port() != 0,
+            "a listener bound to port zero must report the port it was given"
+        );
+        ensure!(
+            registration.direct.port == bound.address().port(),
+            "the direct endpoint published port {}, not the {} the listener bound",
             registration.direct.port,
-            bound.address().port(),
-            "the direct endpoint must publish the port the listener bound"
+            bound.address().port()
         );
-        assert_ne!(
-            registration.direct.host,
-            Host::make("gateway.example"),
-            "the direct endpoint must not publish the configured entry point"
+        ensure!(
+            registration.direct.host != Host::make(&host),
+            "the direct endpoint published the configured entry point {host}"
         );
-        assert_eq!(
-            registration.advertised,
-            Some(Endpoint {
-                host: Host::make("gateway.example"),
-                port: 443,
-            }),
-            "the entry point must publish exactly what the operator configured"
+        ensure!(
+            registration.advertised
+                == Some(Endpoint {
+                    host: Host::make(&host),
+                    port: advertised_port,
+                }),
+            "the entry point must publish exactly what the operator configured, not {:?}",
+            registration.advertised
         );
         Ok(())
-    })
+    });
+    match outcome {
+        Ok(()) => TestResult::passed(),
+        Err(error) => TestResult::error(format!("{error:#}")),
+    }
 }
 
 /// Three refresh delays fit inside the lease with a quarter of it unspent,

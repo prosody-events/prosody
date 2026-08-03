@@ -179,19 +179,22 @@ impl PendingRegistry {
     /// The response ceiling travels from here, so what one position may hold is
     /// this registry's configured limit rather than a promise about the code
     /// that decoded the frame.
-    ///
-    /// The lookup clones the request out and releases the map guard, so the
-    /// entry lock is never taken under it. That order is fixed: map guard
-    /// released before the entry lock, entry lock released before map removal,
-    /// and never a wakeup while the entry lock is held.
     pub(crate) fn accept(&self, frame: ResponseFrame) -> ResponseDisposition {
-        let Some(request) = self
-            .entries
-            .read_sync(&frame.header.request, |_, entry| Arc::clone(&entry.request))
-        else {
+        let Some(request) = self.request(frame.header.request) else {
             return ResponseDisposition::UnknownRequest;
         };
         request.deposit(frame, self.max_response_bytes)
+    }
+
+    /// The request one id names, cloned out of the map.
+    ///
+    /// Every reader goes through here, so the lock order has one owner: the
+    /// clone releases the map guard before any caller can take the entry lock.
+    /// The rest of that order is fixed too — entry lock released before map
+    /// removal, and never a wakeup while the entry lock is held.
+    fn request(&self, id: RequestId) -> Option<Arc<PendingRequest>> {
+        self.entries
+            .read_sync(&id, |_, entry| Arc::clone(&entry.request))
     }
 
     /// Removes every entry at least one grace period past its deadline.
@@ -214,10 +217,7 @@ impl PendingRegistry {
             }
             let full_batch = expired.len() == SWEEP_BATCH;
             for id in expired {
-                if let Some(request) = self
-                    .entries
-                    .read_sync(&id, |_, entry| Arc::clone(&entry.request))
-                {
+                if let Some(request) = self.request(id) {
                     self.close_and_remove(id, &request, Terminal::TimedOut);
                 }
             }
@@ -274,15 +274,18 @@ impl PendingRegistry {
 
     /// The payload stored for one request's subsystem, when a response filled
     /// that position.
+    ///
+    /// `None` collapses three states: no such request, a position nothing
+    /// filled, and a position a refusal filled. So a test that asserts `None`
+    /// must name the state it drives; the absence alone does not distinguish
+    /// them, and a misspelled subsystem answers `None` too.
     #[cfg(test)]
     pub(crate) fn stored_payload(
         &self,
         id: RequestId,
         subsystem: &SubsystemName,
     ) -> Option<BytesMut> {
-        self.entries
-            .read_sync(&id, |_, entry| Arc::clone(&entry.request))?
-            .stored_payload(subsystem)
+        self.request(id)?.stored_payload(subsystem)
     }
 
     /// Registers an entry without a waiter guard.

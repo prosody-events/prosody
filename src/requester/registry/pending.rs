@@ -275,8 +275,8 @@ impl PendingRequest {
 
     /// The payload stored for one awaited position, when a response filled it.
     ///
-    /// Tests read the bytes back so that "the delivery was accepted" is proved
-    /// by what the position holds, not only by the position being filled.
+    /// A position a refusal filled answers `None`: a mismatched format and an
+    /// oversized payload both mark the position without storing bytes.
     #[cfg(test)]
     pub(super) fn stored_payload(&self, subsystem: &SubsystemName) -> Option<BytesMut> {
         let state = self.state.lock();

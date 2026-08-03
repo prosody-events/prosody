@@ -69,8 +69,9 @@ pub(crate) struct RouterConfiguration {
     /// The port to publish beside `advertised_host`. Unset publishes the
     /// listener's own port, which is what an entry point that forwards a port
     /// unchanged wants. Set with no host beside it, the configuration is
-    /// refused.
-    #[validate(custom(function = "validate_port"))]
+    /// refused. Zero is refused too: an advertised port is a port peers dial,
+    /// never a request for one the operating system chooses.
+    #[validate(range(min = 1_u16))]
     pub(crate) advertised_port: Option<u16>,
 
     /// The operator's name for the set of processes that reach each other
@@ -136,6 +137,7 @@ impl PeerRuntime {
     /// listener is taken rather than a port number so the published port is
     /// always the one the operating system assigned: there is no other port to
     /// pass.
+    ///
     /// The lease comes from `config` and reaches the directory, the refresh
     /// pace and the address cache from there, so one configured value governs
     /// all three. The first write is awaited here rather than left to the
@@ -325,21 +327,16 @@ fn refresh_delay(ttl: RegistrationTtl) -> Duration {
 
 /// Refuses a blank label and one longer than a host or network name may be.
 /// An absent label never reaches this function.
+///
+/// A `length` rule cannot replace this one: `validator` counts characters,
+/// while [`MAX_LABEL_BYTES`] is the byte capacity that keeps a label inline in
+/// [`Host`].
 fn validate_label(label: &str) -> Result<(), ValidationError> {
     if label.is_empty() {
         return Err(ValidationError::new("label_empty"));
     }
     if label.len() > MAX_LABEL_BYTES {
         return Err(ValidationError::new("label_too_long"));
-    }
-    Ok(())
-}
-
-/// Refuses port zero: an advertised port is a port peers dial, never a request
-/// for one the operating system chooses.
-fn validate_port(port: u16) -> Result<(), ValidationError> {
-    if port == 0 {
-        return Err(ValidationError::new("advertised_port_zero"));
     }
     Ok(())
 }

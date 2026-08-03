@@ -13,15 +13,15 @@ use async_trait::async_trait;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use std::sync::Arc;
 use tonic::{Code, Request, Response, Status};
-use tracing::field::{Empty, debug as debug_field, display};
+use tracing::field::{Empty, display};
 use tracing::{Span, debug, debug_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Serves [`DeliverResponse`](Peer::deliver_response) for one node.
 ///
-/// The node id it carries is what makes "a node that is not the target never
-/// accepts a frame" structural: the check reads this process's own id, which no
-/// frame can supply.
+/// The target check in [`accept`](Self::accept) is the guard that keeps a node
+/// which is not the target from accepting a frame. The id it compares against
+/// is the one this service was built with, and no frame can supply that id.
 pub(crate) struct PeerService {
     node: NodeId,
     registry: Arc<PendingRegistry>,
@@ -46,20 +46,24 @@ impl PeerService {
         // This node does not relay, so a frame for another node is one whose
         // target it cannot reach. Forwarding replaces this arm; until then the
         // registry never sees a frame addressed elsewhere.
+        //
+        // `Unreachable` maps to UNAVAILABLE, which `SendFailure::is_ambiguous`
+        // treats as worth another attempt, so a misroute is repeated for the
+        // sender's whole attempt budget. That is deliberate: a stale directory
+        // entry is what puts a frame here, and the retry is what carries it
+        // through the moment the entry is corrected.
         let disposition = if frame.header.target == self.node {
             self.registry.accept(frame)
         } else {
             TRANSPORT.record_misrouted();
             ResponseDisposition::Unreachable
         };
-        span.record("peer.disposition", debug_field(disposition));
+        span.record("peer.disposition", display(disposition.message()));
         // Matched on the status rather than on the disposition, so a
-        // disposition added later cannot fall into the accepting arm. The
-        // message allocates, on the refused path only: an accepted response
-        // carries no message at all.
+        // disposition added later cannot fall into the accepting arm.
         match disposition.status() {
             Code::Ok => Ok(Response::new(())),
-            code => Err(Status::new(code, format!("{disposition:?}"))),
+            code => Err(Status::new(code, disposition.message())),
         }
     }
 }

@@ -11,14 +11,14 @@ use tonic::metadata::{Ascii, KeyRef, MetadataKey, MetadataMap, MetadataValue};
 use tracing::debug;
 
 /// Writes propagation headers into an outbound call's metadata.
-pub(crate) struct MetadataInjector<'a>(&'a mut MetadataMap);
+pub(super) struct MetadataInjector<'a>(&'a mut MetadataMap);
 
 /// Reads propagation headers from an inbound call's metadata.
-pub(crate) struct MetadataExtractor<'a>(&'a MetadataMap);
+pub(super) struct MetadataExtractor<'a>(&'a MetadataMap);
 
 impl<'a> MetadataInjector<'a> {
     /// Injects into `metadata`.
-    pub(crate) fn new(metadata: &'a mut MetadataMap) -> Self {
+    pub(super) const fn new(metadata: &'a mut MetadataMap) -> Self {
         Self(metadata)
     }
 }
@@ -42,14 +42,18 @@ impl Injector for MetadataInjector<'_> {
 
 impl<'a> MetadataExtractor<'a> {
     /// Extracts from `metadata`.
-    pub(crate) const fn new(metadata: &'a MetadataMap) -> Self {
+    pub(super) const fn new(metadata: &'a MetadataMap) -> Self {
         Self(metadata)
     }
 }
 
 impl Extractor for MetadataExtractor<'_> {
+    /// A value that is not printable ASCII carries no context this build can
+    /// read. Dropping it silently would lose a peer's trace with no sign of
+    /// why, so the rejection is logged, mirroring [`MetadataInjector::set`].
     fn get(&self, key: &str) -> Option<&str> {
         let Ok(value) = self.0.get(key)?.to_str() else {
+            debug!(key, "a propagation value is not readable gRPC metadata");
             return None;
         };
         Some(value)

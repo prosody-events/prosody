@@ -51,7 +51,7 @@ const UNREACHABLE: &[ResponseDisposition] = &[
 
 /// One registry outcome, together with the seeding and the deliveries that
 /// reach it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::VariantArray)]
 enum Scenario {
     Accepted,
     UnknownRequest,
@@ -231,6 +231,15 @@ fn a_frame_for_another_node_is_never_accepted() -> Result<()> {
 /// stop being covered silently.
 #[test]
 fn every_disposition_has_a_reachable_wire_case() -> Result<()> {
+    // The generator draws from `SCENARIOS`, and both `seed` and `deliveries`
+    // have a catch-all arm, so a case left out of that list would be
+    // unreachable and invisible.
+    ensure!(
+        SCENARIOS.len() == Scenario::VARIANTS.len(),
+        "every scenario must be listed in SCENARIOS, but {} of {} are",
+        SCENARIOS.len(),
+        Scenario::VARIANTS.len()
+    );
     for disposition in ResponseDisposition::VARIANTS {
         let covered = SCENARIOS
             .iter()

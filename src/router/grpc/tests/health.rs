@@ -29,8 +29,19 @@ const UNSERVED: &str = "prosody.peer.v1.NotAService";
 fn the_grpc_health_answer_follows_the_predicates() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
+        // Neither answer depends on the predicates, so both are asserted once
+        // rather than inside the loop that varies them.
+        let health = PeerHealth::new(TestHealth::new(false, false));
+        ensure!(
+            check(&health, SERVICE_NAME).await? == Some(i32::from(ServingStatus::Serving)),
+            "a listener that answers at all serves the peer method"
+        );
+        ensure!(
+            check(&health, UNSERVED).await?.is_none(),
+            "a name this listener does not serve must be NOT_FOUND"
+        );
         for (ready, live) in [(true, true), (true, false), (false, true), (false, false)] {
-            let health = PeerHealth::new(TestHealth::new(ready, live), SERVICE_NAME);
+            let health = PeerHealth::new(TestHealth::new(ready, live));
             let expected = if ready && live {
                 ServingStatus::Serving
             } else {
@@ -40,21 +51,18 @@ fn the_grpc_health_answer_follows_the_predicates() -> Result<()> {
                 check(&health, "").await? == Some(i32::from(expected)),
                 "ready = {ready} and live = {live} must answer {expected:?} for the process"
             );
-            ensure!(
-                check(&health, SERVICE_NAME).await? == Some(i32::from(ServingStatus::Serving)),
-                "a listener that answers at all serves the peer method"
-            );
-            ensure!(
-                check(&health, UNSERVED).await?.is_none(),
-                "a name this listener does not serve must be NOT_FOUND"
-            );
         }
         Ok(())
     })
 }
 
-/// The two health surfaces cannot disagree, because they read the same
-/// predicates: a consumer with no partitions assigned is unready on both.
+/// One consumer with no partitions assigned, read over both surfaces.
+///
+/// The two read the same predicates, so `/readyz` and the empty gRPC name must
+/// agree that it is unready. They agree by folding, not by matching: `/livez`
+/// calls the same process live, while the empty name answers `NOT_SERVING`
+/// because it reports ready **and** live. That is the fold the empty name
+/// documents, pinned here so a liveness probe is never wired to it by mistake.
 #[test]
 fn the_two_health_surfaces_agree() -> Result<()> {
     init_test_logging();
@@ -63,24 +71,34 @@ fn the_two_health_surfaces_agree() -> Result<()> {
         let heartbeats = HeartbeatRegistry::test();
         let server = ProbeServer::new(0, Arc::clone(&managers), heartbeats.clone())?;
         let address = server.local_addr();
-        let health = PeerHealth::new(ConsumerHealth::new(managers, heartbeats), SERVICE_NAME);
-        let over_http = Client::new()
-            .get(format!("http://127.0.0.1:{}/readyz", address.port()))
-            .send()
-            .await
-            .map(|response| response.status());
+        let health = PeerHealth::new(ConsumerHealth::new(managers, heartbeats));
+        let ready_over_http = probe(address.port(), "/readyz").await;
+        let live_over_http = probe(address.port(), "/livez").await;
         let over_grpc = check(&health, "").await;
         server.shutdown().await;
         ensure!(
-            over_http? == StatusCode::SERVICE_UNAVAILABLE,
+            ready_over_http? == StatusCode::SERVICE_UNAVAILABLE,
             "a consumer with no partitions assigned is unready over HTTP"
         );
         ensure!(
+            live_over_http? == StatusCode::OK,
+            "the same consumer is live over HTTP"
+        );
+        ensure!(
             over_grpc? == Some(i32::from(ServingStatus::NotServing)),
-            "the same consumer must be unready over gRPC"
+            "the empty gRPC name reports ready and live together, so it must not serve"
         );
         Ok(())
     })
+}
+
+/// The status one HTTP probe answered.
+async fn probe(port: u16, path: &str) -> Result<StatusCode> {
+    Ok(Client::new()
+        .get(format!("http://127.0.0.1:{port}{path}"))
+        .send()
+        .await?
+        .status())
 }
 
 /// The serving status one `Check` answered, or `None` when the name is not

@@ -111,6 +111,27 @@ pub(crate) fn captured_spans(f: impl FnOnce()) -> Vec<SpanData> {
 /// span-level invariant: application-facing spans at INFO, framework-internal
 /// spans at DEBUG.
 pub(crate) fn captured_spans_filtered(max_level: LevelFilter, f: impl FnOnce()) -> Vec<SpanData> {
+    let (exporter, provider, subscriber) = span_pipeline(max_level);
+
+    with_default(subscriber, f);
+    drop(provider);
+
+    let spans = exporter.0.lock();
+    spans.clone()
+}
+
+/// One `OpenTelemetry` capture pipeline: the exporter to read spans from, the
+/// provider that must outlive the capture, and the subscriber to install.
+///
+/// Both capture surfaces build it here, so the pipeline cannot change for the
+/// thread-local one and not for the process-wide one.
+fn span_pipeline(
+    max_level: LevelFilter,
+) -> (
+    TestExporter,
+    SdkTracerProvider,
+    impl Subscriber + Send + Sync + 'static,
+) {
     let exporter = TestExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -120,12 +141,7 @@ pub(crate) fn captured_spans_filtered(max_level: LevelFilter, f: impl FnOnce()) 
             .with_tracer(provider.tracer("test"))
             .with_filter(max_level),
     );
-
-    with_default(subscriber, f);
-    drop(provider);
-
-    let spans = exporter.0.lock();
-    spans.clone()
+    (exporter, provider, subscriber)
 }
 
 /// Captures spans opened on **any** thread, for a test whose subject runs in a
@@ -149,15 +165,7 @@ impl GlobalSpans {
     ///
     /// Returns an error when a default subscriber is already installed.
     pub(crate) fn install() -> Result<Self> {
-        let exporter = TestExporter::default();
-        let provider = SdkTracerProvider::builder()
-            .with_simple_exporter(exporter.clone())
-            .build();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_opentelemetry::layer()
-                .with_tracer(provider.tracer("test"))
-                .with_filter(LevelFilter::TRACE),
-        );
+        let (exporter, provider, subscriber) = span_pipeline(LevelFilter::TRACE);
         set_global_default(subscriber)?;
         Ok(Self {
             exporter,

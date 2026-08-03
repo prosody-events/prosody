@@ -65,15 +65,14 @@ impl GrpcSender {
 
     /// The channel for `address`, dialling one on a miss.
     ///
-    /// The dial is lazy, so it cannot fail here and a dead peer surfaces as the
-    /// call's own status. Only a miss builds the URI, so a hit allocates
-    /// nothing.
+    /// The connect is lazy, so a dead peer surfaces as the call's own status.
+    /// The address is parsed here, though, so an address no URI can hold fails
+    /// here. Only a miss builds the URI, so a hit allocates nothing.
     async fn channel(&self, address: &Endpoint) -> Result<Channel, SendFailure> {
         match self.channels.get_value_or_guard_async(address).await {
             Ok(channel) => Ok(channel),
             Err(guard) => {
-                let uri = format!("http://{}:{}", address.host.as_str(), address.port);
-                let Ok(dialled) = Dialled::from_shared(uri) else {
+                let Ok(dialled) = Dialled::from_shared(peer_uri(address)) else {
                     warn!(host = %address.host, port = address.port, "a published address is not dialable");
                     return Err(SendFailure::Unreachable);
                 };
@@ -88,9 +87,7 @@ impl GrpcSender {
 impl ResponseSender for GrpcSender {
     /// Copies the staged frame into one right-sized buffer and delivers it.
     ///
-    /// That copy is the trade [`ResponseSender`] documents: tonic's encoder
-    /// must own what it writes, so the borrowed frame is materialized once,
-    /// immediately before a network round trip, and never per byte.
+    /// [`FrameBytes`] owns that copy and the trade it accepts.
     async fn deliver<F: Framed + Sync>(
         &self,
         address: &Endpoint,
@@ -129,5 +126,19 @@ impl ResponseSender for GrpcSender {
             Ok(_) => Ok(()),
             Err(status) => Err(SendFailure::Status(status.code())),
         }
+    }
+}
+
+/// The URI one endpoint is dialled with.
+///
+/// An IPv6 literal must be bracketed. Without the brackets the authority
+/// carries more than one colon, no URI parser accepts it, and every response to
+/// that node is reported unreachable.
+pub(super) fn peer_uri(address: &Endpoint) -> String {
+    let host = address.host.as_str();
+    if host.contains(':') {
+        format!("http://[{host}]:{}", address.port)
+    } else {
+        format!("http://{host}:{}", address.port)
     }
 }

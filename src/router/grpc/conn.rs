@@ -5,20 +5,24 @@
 //! admission is consulted, so the listener refuses a connection over the cap
 //! rather than queueing it.
 
-use super::{ACCEPT_BACKOFF, TRANSPORT};
+use super::TRANSPORT;
 use async_stream::stream;
 use futures::Stream;
 use std::convert::Infallible;
-use std::io::Result as IoResult;
+use std::io::{IoSlice, Result as IoResult};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 use tonic::transport::server::{Connected, TcpConnectInfo};
 use tracing::warn;
+
+/// How long the listener waits before it accepts again after a failed accept.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// One connection the listener admitted.
 ///
@@ -57,6 +61,21 @@ impl AsyncWrite for Admitted {
         Pin::new(&mut self.inner).poll_write(context, buf)
     }
 
+    /// Forwarded, like every other method here: a wrapper that answered for
+    /// itself would report no vectored support and make the writer above it
+    /// copy every frame into one buffer before it writes.
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<IoResult<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(context, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<IoResult<()>> {
         Pin::new(&mut self.inner).poll_flush(context)
     }
@@ -70,7 +89,9 @@ impl AsyncWrite for Admitted {
 ///
 /// A connection over the cap is closed at once and counted, so nothing
 /// unbounded waits for a permit. The permit is released when the connection's
-/// task drops it, which is the only removal path there is.
+/// task ends and drops it. A peer that dies without a FIN leaves that task with
+/// nothing to end it, which is what the listener's keepalive is for: it closes
+/// a connection whose peer stopped answering, and the permit returns with it.
 ///
 /// The stream never yields an error. tonic reads one as an accept failure and
 /// keeps looping, so a persistent failure would spin the accept path; a failed
@@ -90,6 +111,12 @@ pub(super) fn admitted(
                         drop(inner);
                         continue;
                     };
+                    // tonic ignores its own `tcp_nodelay` under a supplied
+                    // stream, so the listener sets it here or Nagle delays
+                    // every frame this connection carries.
+                    if let Err(error) = inner.set_nodelay(true) {
+                        warn!(%error, %peer, "the peer listener could not disable Nagle on a connection");
+                    }
                     yield Ok(Admitted { inner, _permit: permit });
                 }
                 Err(error) => {

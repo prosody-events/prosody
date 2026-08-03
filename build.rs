@@ -1,9 +1,9 @@
 //! Compiles the peer wire contract in `proto/peer.proto`.
 //!
 //! `protoc` must be on `PATH` — see the build prerequisites in `README.md`.
-//! The generated descriptor set is written beside the generated code so gRPC
-//! reflection can embed it and tests can check the hand-written frame codec
-//! against the `.proto` it must agree with.
+//! The generated descriptor set is written beside the generated code. gRPC
+//! reflection embeds that set to publish the schema. The tests read it to check
+//! the hand-written frame codec against the `.proto` it must agree with.
 
 use std::env::var;
 use std::io::{Error, Result};
@@ -11,8 +11,12 @@ use std::path::PathBuf;
 
 /// Lints the generated server module trips, listed rather than blanketed so a
 /// lint that stops firing is reported instead of silently permitted. The
-/// generated code writes absolute paths and a unit binding, and documents
+/// generated code writes absolute paths and a unit binding. It documents
 /// nothing.
+///
+/// `dead_code` does not belong on this list. The generated module opens with an
+/// inner `allow(dead_code)` of its own, so an expectation here can never see a
+/// diagnostic and is reported unfulfilled.
 const GENERATED_LINTS: &str = concat!(
     "#[expect(clippy::absolute_paths, clippy::default_constructed_unit_structs, ",
     "clippy::default_trait_access, clippy::doc_markdown, unused_qualifications, ",

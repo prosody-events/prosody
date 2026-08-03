@@ -138,7 +138,7 @@ fn reflection_is_served_only_when_it_is_configured() -> Result<()> {
             }))
             .await?;
             let answered = reflect(harness.address.port).await;
-            harness.stop().await;
+            harness.stop().await?;
             ensure!(
                 (answered? == Code::Unimplemented) == served,
                 "reflection enabled = {reflection} must not answer UNIMPLEMENTED = {served}"
@@ -148,10 +148,12 @@ fn reflection_is_served_only_when_it_is_configured() -> Result<()> {
     })
 }
 
-/// A stream cap of zero would admit unbounded streams, so the configuration
-/// refuses it before a listener can be built with one.
+/// A cap of zero is refused before a listener can be built with it. Zero is not
+/// "no limit" on either field: h2 reads a stream cap of zero as "open no
+/// streams", and a connection cap of zero admits nothing, so a listener built
+/// with either would be wedged rather than unbounded.
 #[test]
-fn a_transport_configuration_with_no_stream_cap_is_refused() -> Result<()> {
+fn a_transport_configuration_with_no_cap_is_refused() -> Result<()> {
     let refused = TransportConfiguration::builder()
         .max_concurrent_streams(0_u32)
         .build()?;

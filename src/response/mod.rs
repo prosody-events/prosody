@@ -172,6 +172,28 @@ impl ResponseDisposition {
             Self::Unreachable => Code::Unavailable,
         }
     }
+
+    /// What the sending node is told this disposition was.
+    ///
+    /// The wording lives beside the status mapping, so the two travel together
+    /// and a `Debug` rendering of a crate-internal name never reaches the wire.
+    /// Every message is a literal, so a refusal formats nothing.
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::Accepted => "the response was accepted",
+            Self::UnknownRequest => "no request by that id is registered here",
+            Self::ClosedRequest => "that request has already finished",
+            Self::DuplicateSubsystem => "that subsystem already answered this request",
+            Self::UnexpectedSubsystem => "this request does not await that subsystem",
+            Self::FormatMismatch => "the payload format is not the one this request expects",
+            Self::ResponseTooLarge => "the payload is over this process's response ceiling",
+            Self::MalformedTarget => "the frame names no valid target node",
+            Self::AlreadyRelayed => "the frame has already been relayed once",
+            Self::NoRelayCapacity => "this node has no capacity to relay the frame",
+            Self::RelayDeadlineExceeded => "no time is left to relay the frame",
+            Self::Unreachable => "the target node could not be reached from here",
+        }
+    }
 }
 
 #[cfg(test)]
