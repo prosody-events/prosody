@@ -1,7 +1,8 @@
 //! What ends a request, what it costs, and what the map holds afterwards.
 
-use super::{MAX_TIMEOUT, POOL, SWEEP_GRACE, TestCodec, TestError, names, registry, success};
-use crate::Codec;
+use super::{
+    MAX_TIMEOUT, POOL, SWEEP_GRACE, TestCodec, TestError, names, register, registry, success,
+};
 use crate::requester::collect::decode;
 use crate::requester::registry::{PendingRegistry, Registration, Status};
 use crate::requester::{Outcome, ResponseFailure};
@@ -156,7 +157,7 @@ fn run_terminal(trace: TerminalTrace) -> Result<()> {
     runtime.block_on(async {
         let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
         let awaited = names(&POOL[..count])?;
-        let registration = registry.register(&awaited, TestCodec::FORMAT_ID, MAX_TIMEOUT)?;
+        let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
         let id = registration.id();
 
         let before = &order[..cut];
@@ -169,7 +170,7 @@ fn run_terminal(trace: TerminalTrace) -> Result<()> {
             );
         }
 
-        let finished = registration.finish(Status::TimedOut);
+        let finished = registration.finish();
 
         for position in &order[cut..] {
             let disposition = registry.accept(success(id, &awaited[*position], VALUES[*position])?);
@@ -207,7 +208,7 @@ fn run_steps(steps: Vec<Step>) -> Result<()> {
     runtime.block_on(async {
         let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
         let awaited = names(&POOL[..1])?;
-        let registration = registry.register(&awaited, TestCodec::FORMAT_ID, TIMEOUT)?;
+        let registration = register(&registry, &awaited, TIMEOUT)?;
         let id = registration.id();
         let expired = registration.deadline() + SWEEP_GRACE;
         let mut first = None;
@@ -226,7 +227,7 @@ fn run_steps(steps: Vec<Step>) -> Result<()> {
                     first = first.or(Some(Status::TimedOut));
                 }
                 Step::Timeout => {
-                    registration.finish(Status::TimedOut);
+                    registration.finish();
                     first = first.or(Some(Status::TimedOut));
                 }
                 Step::Shutdown => {
@@ -241,7 +242,7 @@ fn run_steps(steps: Vec<Step>) -> Result<()> {
         }
 
         assert_eq!(
-            registration.finish(Status::TimedOut).status,
+            registration.finish().status,
             first.unwrap_or(Status::TimedOut),
             "a later trigger overwrote the transition that ended the request"
         );
@@ -269,9 +270,7 @@ fn run_drain(steps: Vec<DrainStep>) -> Result<()> {
         for step in steps {
             match step {
                 DrainStep::Register => {
-                    if let Ok(registration) =
-                        registry.register(&awaited, TestCodec::FORMAT_ID, TIMEOUT)
-                    {
+                    if let Ok(registration) = register(&registry, &awaited, TIMEOUT) {
                         live.push(registration);
                     }
                 }
@@ -295,7 +294,7 @@ fn run_drain(steps: Vec<DrainStep>) -> Result<()> {
         if live.len() == IN_FLIGHT {
             live.pop();
         }
-        live.push(registry.register(&awaited, TestCodec::FORMAT_ID, TIMEOUT)?);
+        live.push(register(&registry, &awaited, TIMEOUT)?);
         registry.sweep(Instant::now());
         check_live(&registry, &live, DrainStep::Sweep);
 

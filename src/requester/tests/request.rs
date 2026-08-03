@@ -1,13 +1,17 @@
 //! What one call refuses before it produces anything, and what it puts on the
 //! record when it does produce.
 
-use super::{MAX_TIMEOUT, NODE, POOL, TestCodec, TestCodecError, names, registry};
+use super::{
+    MAX_TIMEOUT, NODE, POOL, TestCodec, TestCodecError, TestError, names, poll_once, registry,
+};
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::requester::registry::PendingRegistry;
-use crate::requester::{HEADER_INLINE, ProsodyRequester, RequestError, append_request_headers};
+use crate::requester::{
+    HEADER_INLINE, Outcome, ProsodyRequester, RequestError, ResponseFailure, append_request_headers,
+};
 use crate::response::RequestId;
 use crate::response::headers::{
-    ID_TEXT_LEN, RESPONSE_NODE_HEADER, RequestTag, id_text, parse_request_tag,
+    ID_TEXT_LEN, RESERVED_REQUEST_HEADERS, RequestTag, parse_request_tag,
 };
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
@@ -18,6 +22,7 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use smallvec::SmallVec;
 use std::iter::{empty, once};
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -138,6 +143,7 @@ async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
     let none = names(&[])?;
     let repeated = names(&["billing", "ledger", "billing"])?;
     let one = names(&["billing"])?;
+    let over_cap = names(&POOL[..=MAX_AWAITED])?;
     let no_headers: Vec<(&'static str, &'static str)> = Vec::new();
 
     match requester
@@ -174,6 +180,23 @@ async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
 
     match requester
         .request(
+            no_headers.clone(),
+            topic,
+            "key",
+            RequestPayload,
+            &over_cap,
+            TIMEOUT,
+        )
+        .await
+    {
+        Err(RequestError::TooManySubsystems { count, max }) => {
+            assert_eq!((count, max), (MAX_AWAITED + 1, MAX_AWAITED));
+        }
+        other => bail!("a request over the awaited limit must be refused, not {other:?}"),
+    }
+
+    match requester
+        .request(
             no_headers,
             topic,
             "key",
@@ -187,25 +210,76 @@ async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
         other => bail!("a timeout over the configured ceiling must be refused, not {other:?}"),
     }
 
-    match requester
-        .request(
-            vec![(RESPONSE_NODE_HEADER, "mine")],
-            topic,
-            "key",
-            RequestPayload,
-            &one,
-            TIMEOUT,
-        )
-        .await
-    {
-        Err(RequestError::ReservedHeader { name }) => assert_eq!(name, RESPONSE_NODE_HEADER),
-        other => bail!("a caller header naming a reserved header must be refused, not {other:?}"),
+    for reserved in RESERVED_REQUEST_HEADERS {
+        match requester
+            .request(
+                vec![(reserved, "mine")],
+                topic,
+                "key",
+                RequestPayload,
+                &one,
+                TIMEOUT,
+            )
+            .await
+        {
+            Err(RequestError::ReservedHeader { name }) => assert_eq!(name, reserved),
+            other => bail!("the reserved header {reserved} must be refused, not {other:?}"),
+        }
     }
 
     assert_eq!(
         registry.len(),
         0,
         "a refused request left a record in the registry"
+    );
+    Ok(())
+}
+
+/// One valid call holds a registry record before its record reaches Kafka,
+/// answers one outcome per named subsystem, and then leaves the registry empty.
+#[tokio::test(start_paused = true)]
+async fn a_valid_call_registers_first_and_gives_its_record_back() -> Result<()> {
+    let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
+    let requester = requester(Arc::clone(&registry))?;
+    let awaited = names(&["billing", "ledger"])?;
+    let no_headers: Vec<(&'static str, &'static str)> = Vec::new();
+
+    let mut call = pin!(requester.request::<_, u32, TestError>(
+        no_headers,
+        Topic::from("requests"),
+        "key",
+        RequestPayload,
+        &awaited,
+        TIMEOUT,
+    ));
+    assert!(
+        poll_once(call.as_mut()).await.is_pending(),
+        "the call must park until a response or its deadline"
+    );
+    assert_eq!(
+        registry.len(),
+        1,
+        "the record reached the producer before the registry could answer for it"
+    );
+    assert_eq!(
+        registry.available_permits(),
+        IN_FLIGHT - 1,
+        "the call produced a record without taking an admission permit"
+    );
+
+    assert_eq!(
+        call.await?,
+        vec![
+            Outcome::Failed(ResponseFailure::Timeout),
+            Outcome::Failed(ResponseFailure::Timeout),
+        ],
+        "one unanswered outcome must come back per named subsystem"
+    );
+    assert_eq!(registry.len(), 0, "the finished call kept its map record");
+    assert_eq!(
+        registry.available_permits(),
+        IN_FLIGHT,
+        "the finished call kept its admission permit"
     );
     Ok(())
 }
@@ -229,8 +303,10 @@ fn run_headers(trace: HeaderTrace) -> Result<()> {
     }
     append_request_headers(
         &mut headers,
-        id_text(id.into(), &mut request_buf),
-        id_text(NODE.into(), &mut node_buf),
+        id,
+        &mut request_buf,
+        NODE,
+        &mut node_buf,
         &awaited,
     );
 

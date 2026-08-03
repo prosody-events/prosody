@@ -1,9 +1,9 @@
 //! Where each arrival is filed, and what the waiter reads back.
 
 use super::{
-    MAX_TIMEOUT, POOL, TestCodec, TestError, body, formatted_frame, frame, names, registry, success,
+    MAX_TIMEOUT, POOL, TestCodec, TestError, body, formatted_frame, frame, names, register,
+    registry, success,
 };
-use crate::Codec;
 use crate::error::ErrorCategory;
 use crate::requester::collect::decode;
 use crate::requester::registry::Status;
@@ -27,9 +27,9 @@ const MAX_AWAITED: usize = 4;
 /// One request's awaited names, plus the order and the content of its
 /// arrivals.
 ///
-/// The arrival order is an independent permutation of the answering positions,
-/// so a response filed by arrival order rather than by name lands in the wrong
-/// place and the value assertion sees it.
+/// The arrival order is an independent permutation of the answering positions.
+/// Thus a response filed by arrival order lands in the wrong place, and the
+/// value assertion sees it.
 #[derive(Clone, Debug)]
 struct PositionTrace {
     /// Distinct pool indices, in the order the caller names them.
@@ -154,7 +154,7 @@ fn a_repeated_subsystem_never_takes_another_position() -> Result<()> {
     runtime.block_on(async {
         let registry = registry(4, MAX_AWAITED)?;
         let awaited = names(&["billing", "ledger"])?;
-        let registration = registry.register(&awaited, TestCodec::FORMAT_ID, TIMEOUT)?;
+        let registration = register(&registry, &awaited, TIMEOUT)?;
         let id = registration.id();
 
         let dispositions = [
@@ -172,7 +172,7 @@ fn a_repeated_subsystem_never_takes_another_position() -> Result<()> {
             "the second billing answer must be the only refused one"
         );
 
-        let finished = registration.finish(Status::TimedOut);
+        let finished = registration.finish();
         let outcomes = decode::<TestCodec, u32, TestError, _>(finished.awaited);
         assert_eq!(
             outcomes,
@@ -191,7 +191,7 @@ fn a_frame_in_another_format_is_refused_and_reported() -> Result<()> {
     runtime.block_on(async {
         let registry = registry(4, MAX_AWAITED)?;
         let awaited = names(&["billing"])?;
-        let registration = registry.register(&awaited, TestCodec::FORMAT_ID, TIMEOUT)?;
+        let registration = register(&registry, &awaited, TIMEOUT)?;
 
         let disposition = registry.accept(formatted_frame(
             registration.id(),
@@ -202,7 +202,7 @@ fn a_frame_in_another_format_is_refused_and_reported() -> Result<()> {
         ));
         assert_eq!(disposition, ResponseDisposition::FormatMismatch);
 
-        let finished = registration.finish(Status::TimedOut);
+        let finished = registration.finish();
         assert_eq!(
             finished.status,
             Status::Complete,
@@ -225,36 +225,43 @@ fn a_status_that_disagrees_with_its_payload_is_malformed() -> Result<()> {
     runtime.block_on(async {
         let registry = registry(4, MAX_AWAITED)?;
         let awaited = names(&["billing", "ledger", "audit"])?;
-        let registration = registry.register(&awaited, TestCodec::FORMAT_ID, TIMEOUT)?;
+        let registration = register(&registry, &awaited, TIMEOUT)?;
         let id = registration.id();
 
         let failure = TestError {
             value: 4,
             category: ErrorCategory::Transient,
         };
-        // A success status over a failing arm.
-        registry.accept(frame(
-            id,
-            &awaited[0],
-            ResponseStatus::Success,
-            body(Err(failure))?,
-        ));
-        // A failure status over a successful arm.
-        registry.accept(frame(
-            id,
-            &awaited[1],
-            ResponseStatus::Error(ErrorCategory::Permanent),
-            body(Ok(5))?,
-        ));
-        // A failure status that names the category the arm classifies as.
-        registry.accept(frame(
-            id,
-            &awaited[2],
-            ResponseStatus::Error(ErrorCategory::Transient),
-            body(Err(failure))?,
-        ));
+        let dispositions = [
+            // A success status over a failing arm.
+            registry.accept(frame(
+                id,
+                &awaited[0],
+                ResponseStatus::Success,
+                body(Err(failure))?,
+            )),
+            // A failure status over a successful arm.
+            registry.accept(frame(
+                id,
+                &awaited[1],
+                ResponseStatus::Error(ErrorCategory::Permanent),
+                body(Ok(5))?,
+            )),
+            // A failure status that names the category the arm classifies as.
+            registry.accept(frame(
+                id,
+                &awaited[2],
+                ResponseStatus::Error(ErrorCategory::Transient),
+                body(Err(failure))?,
+            )),
+        ];
+        assert_eq!(
+            dispositions,
+            [ResponseDisposition::Accepted; 3],
+            "a frame the waiter's own codec reads must be filed, whatever its status says"
+        );
 
-        let finished = registration.finish(Status::TimedOut);
+        let finished = registration.finish();
         let outcomes = decode::<TestCodec, u32, TestError, _>(finished.awaited);
         assert_eq!(
             outcomes,
@@ -283,7 +290,7 @@ fn run_positional(trace: PositionTrace) -> Result<()> {
         let registry = registry(4, MAX_AWAITED)?;
         let pool: Vec<&str> = chosen.iter().map(|index| POOL[*index]).collect();
         let awaited = names(&pool)?;
-        let registration = registry.register(&awaited, TestCodec::FORMAT_ID, MAX_TIMEOUT)?;
+        let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
         let id = registration.id();
 
         for position in &order {
@@ -301,7 +308,7 @@ fn run_positional(trace: PositionTrace) -> Result<()> {
             );
         }
 
-        let finished = registration.finish(Status::TimedOut);
+        let finished = registration.finish();
         let outcomes = decode::<TestCodec, u32, TestError, _>(finished.awaited);
         assert_eq!(
             outcomes.len(),

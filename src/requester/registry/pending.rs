@@ -1,6 +1,5 @@
 //! State owned by one waiting request.
 
-use crate::requester::ResponseFailure;
 use crate::response::frame::ResponseFrame;
 use crate::response::{ResponseDisposition, ResponseStatus};
 use crate::subsystem::SubsystemName;
@@ -13,7 +12,7 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 /// Subsystems a request awaits before the list uses the heap.
-pub(super) const INLINE_AWAITED: usize = 1;
+const INLINE_AWAITED: usize = 1;
 
 /// One in-flight request.
 ///
@@ -24,6 +23,9 @@ pub(in crate::requester) struct PendingRequest {
     notify: Notify,
     /// The sweep reads this immutable deadline without the state lock.
     pub(super) deadline: Instant,
+    /// The waiting codec's `FORMAT_ID`. A `&'static str` keeps the arrival
+    /// check free of storage and allocation. It belongs to the request
+    /// because one listener serves requesters whose codecs differ.
     expects: &'static str,
 }
 
@@ -50,11 +52,14 @@ pub(in crate::requester) enum Arrival {
         /// The encoded response payload.
         payload: BytesMut,
     },
-    /// A response that this request cannot decode.
-    Unreadable(ResponseFailure),
+    /// A response written in a format this request does not read.
+    FormatMismatch,
 }
 
 /// The lifecycle state of one pending request.
+///
+/// [`Open`](Self::Open) is the only state a request can leave. A transition out
+/// of it is one way, so a second terminal transition changes nothing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::requester) enum Status {
     /// The request can accept responses.
@@ -97,12 +102,17 @@ impl PendingRequest {
     }
 
     /// Ends an open request and takes its positions in one lock scope.
-    pub(in crate::requester) fn finish(&self, status: Status) -> Finished {
+    ///
+    /// A wait that ends with the request still open ended at the deadline, so
+    /// the status this function writes is always [`Status::TimedOut`]. The take
+    /// is unconditional, so only the first call receives the positions; a later
+    /// call reads the same status and an empty list.
+    pub(in crate::requester) fn finish(&self) -> Finished {
         let (finished, transitioned) = {
             let mut state = self.state.lock();
             let transitioned = state.status == Status::Open;
             if transitioned {
-                state.status = status;
+                state.status = Status::TimedOut;
             }
             let finished = Finished {
                 status: state.status,
@@ -160,6 +170,12 @@ impl PendingRequest {
 
     /// Stores the first response for its named subsystem.
     ///
+    /// A frame written in another format fills its position with the refusal.
+    /// One responder answers per subsystem, so no later frame can repair that
+    /// position. The refusal is still evidence that the record reached a
+    /// responder, so [`abandon_if_empty`](Self::abandon_if_empty) counts it and
+    /// a failed delivery report does not fail the call.
+    ///
     /// The caller releases the map guard before this function takes the state
     /// lock. This function releases the state lock before it notifies.
     pub(super) fn deposit(&self, frame: ResponseFrame) -> ResponseDisposition {
@@ -168,24 +184,24 @@ impl PendingRequest {
             if state.status != Status::Open {
                 return ResponseDisposition::ClosedRequest;
             }
-            let Some(slot) = state
+            let Some(position) = state
                 .awaited
                 .iter_mut()
                 .find(|awaited| awaited.name == frame.header.subsystem)
             else {
                 return ResponseDisposition::UnexpectedSubsystem;
             };
-            if slot.arrival.is_some() {
+            if position.arrival.is_some() {
                 return ResponseDisposition::DuplicateSubsystem;
             }
             let disposition = if frame.format.to_str() == self.expects {
-                slot.arrival = Some(Arrival::Response {
+                position.arrival = Some(Arrival::Response {
                     status: frame.header.status,
                     payload: frame.payload,
                 });
                 ResponseDisposition::Accepted
             } else {
-                slot.arrival = Some(Arrival::Unreadable(ResponseFailure::FormatMismatch));
+                position.arrival = Some(Arrival::FormatMismatch);
                 ResponseDisposition::FormatMismatch
             };
             let completed = state
@@ -220,7 +236,7 @@ impl PendingRequest {
     }
 
     /// Reports whether the request can still accept a response.
-    pub(super) fn is_open(&self) -> bool {
+    fn is_open(&self) -> bool {
         self.state.lock().status == Status::Open
     }
 }

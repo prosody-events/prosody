@@ -3,6 +3,7 @@
 mod pending;
 
 pub(in crate::requester) use self::pending::{Arrival, Awaited, Finished, PendingRequest, Status};
+use crate::requester::ValidatedRequest;
 use crate::requester::config::RequesterConfiguration;
 use crate::response::frame::ResponseFrame;
 use crate::response::{RequestId, ResponseDisposition};
@@ -23,7 +24,7 @@ use tracing::warn;
 use validator::{Validate, ValidationErrors};
 
 /// Ids one sweep pass carries between its scan and removals.
-const SWEEP_BATCH: usize = 64;
+pub(in crate::requester) const SWEEP_BATCH: usize = 64;
 
 /// Where a waiting request and an arriving response meet.
 ///
@@ -53,6 +54,8 @@ pub(crate) struct PendingRegistry {
     caps: Caps,
     grace: Duration,
     closed: AtomicBool,
+    /// A `OnceLock` cannot replace this: [`shutdown`](Self::shutdown) awaits
+    /// the handle, and that needs ownership a shared reference cannot give.
     sweeper: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -62,11 +65,7 @@ struct Entry {
     /// Held only for its `Drop`. Removing the record is therefore what returns
     /// the request's capacity, so a waiter that never runs again costs nothing
     /// once the sweep has removed it.
-    #[cfg_attr(
-        test,
-        expect(dead_code, reason = "the permit is held for its Drop, never read")
-    )]
-    permit: OwnedSemaphorePermit,
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Limits that every request validates before registration.
@@ -119,23 +118,29 @@ impl PendingRegistry {
     }
 
     /// Returns the request limits owned by this registry.
-    pub(crate) const fn caps(&self) -> &Caps {
-        &self.caps
+    pub(crate) const fn caps(&self) -> Caps {
+        self.caps
     }
 
     /// Registers one request before its Kafka record is produced.
+    ///
+    /// The [`ValidatedRequest`] witness is the enforcement of the caps this
+    /// registry documents: nothing else can mint one.
     ///
     /// # Errors
     ///
     /// Returns [`Admission`] when capacity is full, shutdown has started, or
     /// a generated id already exists.
-    pub(crate) fn register(
+    pub(in crate::requester) fn register(
         self: &Arc<Self>,
-        awaited: &[SubsystemName],
+        request: ValidatedRequest<'_>,
         expects: &'static str,
-        timeout: Duration,
     ) -> Result<Registration, Admission> {
-        let (id, request) = self.insert(awaited, expects, timeout)?;
+        let ValidatedRequest {
+            subsystems,
+            timeout,
+        } = request;
+        let (id, request) = self.insert(subsystems, expects, timeout)?;
         Ok(Registration {
             registry: Arc::clone(self),
             id,
@@ -144,6 +149,9 @@ impl PendingRegistry {
     }
 
     /// Hands one arriving response to the call waiting for it.
+    ///
+    /// A frame written in another format fills its position with the refusal,
+    /// so the caller learns at once instead of waiting out its deadline.
     ///
     /// The lookup clones the request out and releases the map guard, so the
     /// entry lock is never taken under it. That order is fixed: map guard
@@ -270,11 +278,13 @@ impl PendingRegistry {
         ));
         let entry = Entry {
             request: Arc::clone(&request),
-            permit,
+            _permit: permit,
         };
         if self.entries.insert_sync(id, entry).is_err() {
             return Err(Admission::IdInUse);
         }
+        // The check that closes the race: it reverses an insert that overlapped
+        // a drain already in progress.
         if self.closed.load(Acquire) {
             self.close_and_remove(id, &request, Status::ShuttingDown);
             return Err(Admission::ShuttingDown);
@@ -309,8 +319,8 @@ impl Registration {
     }
 
     /// Ends the request and takes its positions in one operation.
-    pub(in crate::requester) fn finish(&self, status: Status) -> Finished {
-        self.request.finish(status)
+    pub(in crate::requester) fn finish(&self) -> Finished {
+        self.request.finish()
     }
 }
 

@@ -5,7 +5,8 @@
 //! nothing and every schedule is the same on every machine.
 
 use super::config::RequesterConfiguration;
-use super::registry::PendingRegistry;
+use super::registry::{PendingRegistry, Registration};
+use super::validate;
 use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::response::frame::ResponseFrame;
@@ -52,8 +53,8 @@ const MAX_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Grace the suites configure.
 ///
-/// It is long enough that the registry's own sweep task never ticks inside a
-/// suite, so every sweep a suite observes is one it called itself.
+/// It is longer than any deadline a suite waits out, so the registry's own
+/// sweep task only reclaims a record for a suite that advances time on purpose.
 const SWEEP_GRACE: Duration = Duration::from_mins(10);
 
 /// Subsystem names the property generators draw from.
@@ -143,6 +144,18 @@ pub(super) fn registry(max_in_flight: usize, max_awaited: usize) -> Result<Arc<P
         max_timeout: MAX_TIMEOUT,
         sweep_grace: SWEEP_GRACE,
     })?)
+}
+
+/// Registers one request through the validation a real call goes through.
+///
+/// Every suite speaks [`TestCodec`], so the awaited format is not a parameter.
+pub(super) fn register(
+    registry: &Arc<PendingRegistry>,
+    awaited: &[SubsystemName],
+    timeout: Duration,
+) -> Result<Registration> {
+    let validated = validate::<TestCodecError>(awaited, timeout, registry.caps())?;
+    Ok(registry.register(validated, TestCodec::FORMAT_ID)?)
 }
 
 /// Builds subsystem names, refusing any the crate would refuse.

@@ -6,17 +6,22 @@
 
 use super::{
     MAX_TIMEOUT, POOL, SWEEP_GRACE, TestCodec, TestCodecError, TestError, names, poll_once,
-    registry,
+    register, registry,
 };
 use crate::Codec;
 use crate::producer::ProducerError;
 use crate::requester::collect::collect;
+use crate::requester::registry::SWEEP_BATCH;
 use color_eyre::Result;
 use std::pin::pin;
-use tokio::time::Instant;
+use tokio::task::yield_now;
+use tokio::time::{Instant, advance};
 
 /// Requests one registry in these suites admits.
-const IN_FLIGHT: usize = 4;
+///
+/// One more than a sweep batch, so the drain here fills two batches and the
+/// batch loop's continuation is not dead under test.
+const IN_FLIGHT: usize = SWEEP_BATCH + 1;
 
 /// Most subsystems one request here names.
 const MAX_AWAITED: usize = 2;
@@ -27,7 +32,7 @@ const MAX_AWAITED: usize = 2;
 async fn the_sweep_reclaims_a_call_that_stopped() -> Result<()> {
     let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
     let awaited = names(&POOL[..1])?;
-    let registration = registry.register(&awaited, TestCodec::FORMAT_ID, MAX_TIMEOUT)?;
+    let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
     let deadline = registration.deadline();
 
     let produce = async { Ok::<(), ProducerError<TestCodecError>>(()) };
@@ -86,6 +91,33 @@ async fn the_map_empties_without_a_caller_guard() -> Result<()> {
         registry.available_permits(),
         IN_FLIGHT,
         "the sweep did not return every permit"
+    );
+    Ok(())
+}
+
+/// The registry's own sweep task reclaims an expired record, so a caller that
+/// never runs again needs nothing else to run either.
+///
+/// Nothing here calls `sweep`. The task the registry spawned is the only thing
+/// that can empty the map.
+#[tokio::test(start_paused = true)]
+async fn the_spawned_sweep_reclaims_an_expired_record() -> Result<()> {
+    let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
+    let awaited = names(&POOL[..1])?;
+    registry.register_unguarded(&awaited, TestCodec::FORMAT_ID, MAX_TIMEOUT)?;
+
+    advance(MAX_TIMEOUT + 2 * SWEEP_GRACE).await;
+    yield_now().await;
+
+    assert_eq!(
+        registry.len(),
+        0,
+        "the spawned sweep left a record a full grace period past its deadline"
+    );
+    assert_eq!(
+        registry.available_permits(),
+        IN_FLIGHT,
+        "the spawned sweep removed the record but not its permit"
     );
     Ok(())
 }

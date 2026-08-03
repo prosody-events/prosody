@@ -6,7 +6,7 @@ use std::time::Duration;
 use validator::{Validate, ValidationError};
 
 /// Most requests one process may hold at once.
-const MAX_IN_FLIGHT: usize = 65_536;
+pub(in crate::requester) const MAX_IN_FLIGHT: usize = 65_536;
 
 /// Longest request timeout or sweep grace.
 const MAX_TIMEOUT_CEILING: Duration = Duration::from_mins(10);

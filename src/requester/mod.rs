@@ -17,6 +17,7 @@ use self::collect::collect;
 use self::registry::{Admission, Caps, PendingRegistry};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::producer::{ProducerError, ProsodyProducer};
+use crate::response::RequestId;
 use crate::response::headers::{
     ID_TEXT_LEN, REQUEST_REVISION, RESPONSE_AWAITED_HEADER, RESPONSE_NODE_HEADER,
     RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, id_text, is_reserved,
@@ -64,6 +65,18 @@ pub enum Outcome<V, E> {
     Failed(ResponseFailure),
 }
 
+/// Proof that one request's subsystems and timeout are inside the registry
+/// caps.
+///
+/// Only [`validate`] mints one, so an unchecked request cannot be registered.
+/// [`PendingRegistry::register`](registry::PendingRegistry::register) reads the
+/// fields directly, and nothing outside this module can build the witness.
+#[derive(Clone, Copy)]
+pub(in crate::requester) struct ValidatedRequest<'a> {
+    subsystems: &'a [SubsystemName],
+    timeout: Duration,
+}
+
 /// Why one requested subsystem produced no usable answer.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ResponseFailure {
@@ -79,6 +92,9 @@ pub enum ResponseFailure {
 }
 
 /// Why one complete request failed before it could return subsystem outcomes.
+///
+/// This enum has no [`ClassifyError`] impl on purpose. Nothing retries a
+/// request for the caller, so a classification would have no consumer.
 #[derive(Debug, Error)]
 pub enum RequestError<E: Error> {
     /// The request named no subsystem.
@@ -180,7 +196,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         R: Codec<Payload = Result<V, E>>,
         E: ClassifyError,
     {
-        validate(subsystems, timeout, self.registry.caps())?;
+        let validated = validate(subsystems, timeout, self.registry.caps())?;
 
         // The two id texts are declared before the header list, so they outlive
         // the borrows the list holds on them.
@@ -191,25 +207,27 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             .len()
             .saturating_add(subsystems.len())
             .saturating_add(RESERVED_SINGLETONS);
-        let mut headers =
+        let mut record_headers =
             SmallVec::<[(&'static str, &str); HEADER_INLINE]>::with_capacity(capacity);
         for (name, value) in user_headers {
             if is_reserved(name) {
                 return Err(RequestError::ReservedHeader { name });
             }
-            headers.push((name, value));
+            record_headers.push((name, value));
         }
 
         let registration = self
             .registry
-            .register(subsystems, R::FORMAT_ID, timeout)
+            .register(validated, R::FORMAT_ID)
             .map_err(map_admission)?;
         Span::current().record("request.id", display(registration.id()));
 
         append_request_headers(
-            &mut headers,
-            id_text(registration.id().into(), &mut request_buf),
-            id_text(self.node.into(), &mut node_buf),
+            &mut record_headers,
+            registration.id(),
+            &mut request_buf,
+            self.node,
+            &mut node_buf,
             subsystems,
         );
 
@@ -217,7 +235,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         collect::<R, V, E, _, _>(
             &registration,
             self.producer
-                .send(headers.iter().copied(), topic, key, payload),
+                .send(record_headers.iter().copied(), topic, key, payload),
             deadline,
         )
         .await
@@ -226,17 +244,24 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
 
 /// Appends the reserved headers that tell a responder where to answer.
 ///
-/// One `response-awaited` header carries one name. A comma is legal in a
-/// subsystem name, so one joined header could not be read back.
+/// Each id arrives as its own type and is rendered here, so the two cannot be
+/// written to each other's header. One `response-awaited` header carries one
+/// name. A comma is legal in a subsystem name, so one joined header could not
+/// be read back.
 fn append_request_headers<'a>(
     headers: &mut SmallVec<[(&'static str, &'a str); HEADER_INLINE]>,
-    request: &'a str,
-    node: &'a str,
+    request: RequestId,
+    request_buf: &'a mut [u8; ID_TEXT_LEN],
+    node: NodeId,
+    node_buf: &'a mut [u8; ID_TEXT_LEN],
     subsystems: &'a [SubsystemName],
 ) {
     headers.push((RESPONSE_VERSION_HEADER, REQUEST_REVISION));
-    headers.push((RESPONSE_REQUEST_ID_HEADER, request));
-    headers.push((RESPONSE_NODE_HEADER, node));
+    headers.push((
+        RESPONSE_REQUEST_ID_HEADER,
+        id_text(request.into(), request_buf),
+    ));
+    headers.push((RESPONSE_NODE_HEADER, id_text(node.into(), node_buf)));
     headers.extend(
         subsystems
             .iter()
@@ -250,11 +275,15 @@ fn append_request_headers<'a>(
 /// names its subsystem. So a repeated name is refused here rather than left to
 /// fill one position and time out in the other. The validated awaited limit
 /// keeps the count small, so the pairwise scan needs no set and no allocation.
-fn validate<E: Error>(
+///
+/// # Errors
+///
+/// Returns [`RequestError`] naming the first limit the arguments break.
+pub(in crate::requester) fn validate<E: Error>(
     subsystems: &[SubsystemName],
     timeout: Duration,
-    caps: &Caps,
-) -> Result<(), RequestError<E>> {
+    caps: Caps,
+) -> Result<ValidatedRequest<'_>, RequestError<E>> {
     if subsystems.is_empty() {
         return Err(RequestError::NoSubsystems);
     }
@@ -280,7 +309,10 @@ fn validate<E: Error>(
             max: caps.max_timeout,
         });
     }
-    Ok(())
+    Ok(ValidatedRequest {
+        subsystems,
+        timeout,
+    })
 }
 
 /// Maps a registry refusal onto the error a caller sees.

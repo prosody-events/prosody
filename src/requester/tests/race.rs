@@ -4,9 +4,9 @@
 //! assertion is exact.
 
 use super::{
-    MAX_TIMEOUT, TestCodec, TestCodecError, TestError, names, poll_once, registry, success,
+    MAX_TIMEOUT, TestCodec, TestCodecError, TestError, names, poll_once, register, registry,
+    success,
 };
-use crate::Codec;
 use crate::producer::ProducerError;
 use crate::requester::collect::collect;
 use crate::requester::{Outcome, RequestError, ResponseFailure};
@@ -43,7 +43,7 @@ fn report_failure() -> ProducerError<TestCodecError> {
 async fn a_complete_response_set_returns_before_the_report() -> Result<()> {
     let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
     let awaited = names(&["billing", "ledger"])?;
-    let registration = registry.register(&awaited, TestCodec::FORMAT_ID, MAX_TIMEOUT)?;
+    let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
     let id = registration.id();
     let first = success(id, &awaited[0], 1)?;
     let second = success(id, &awaited[1], 2)?;
@@ -77,7 +77,7 @@ async fn a_complete_response_set_returns_before_the_report() -> Result<()> {
 async fn a_failed_report_with_no_response_fails_at_once() -> Result<()> {
     let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
     let awaited = names(&["billing"])?;
-    let registration = registry.register(&awaited, TestCodec::FORMAT_ID, MAX_TIMEOUT)?;
+    let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
     let start = Instant::now();
 
     let produce = async { Err::<(), _>(report_failure()) };
@@ -105,7 +105,7 @@ async fn a_failed_report_with_no_response_fails_at_once() -> Result<()> {
 async fn a_failed_report_after_a_response_keeps_waiting() -> Result<()> {
     let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
     let awaited = names(&["billing", "ledger"])?;
-    let registration = registry.register(&awaited, TestCodec::FORMAT_ID, MAX_TIMEOUT)?;
+    let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
     let id = registration.id();
     let first = success(id, &awaited[0], 3)?;
     let second = success(id, &awaited[1], 4)?;
@@ -148,7 +148,7 @@ async fn a_failed_report_after_a_response_keeps_waiting() -> Result<()> {
 async fn a_response_racing_the_report_is_not_discarded() -> Result<()> {
     let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
     let awaited = names(&["billing", "ledger"])?;
-    let registration = registry.register(&awaited, TestCodec::FORMAT_ID, MAX_TIMEOUT)?;
+    let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
     let answer = success(registration.id(), &awaited[0], 5)?;
     let start = Instant::now();
 
@@ -185,7 +185,7 @@ async fn a_response_racing_the_report_is_not_discarded() -> Result<()> {
 async fn a_successful_report_keeps_waiting() -> Result<()> {
     let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
     let awaited = names(&["billing", "ledger"])?;
-    let registration = registry.register(&awaited, TestCodec::FORMAT_ID, MAX_TIMEOUT)?;
+    let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
     let start = Instant::now();
 
     let produce = async { Ok::<(), ProducerError<TestCodecError>>(()) };
@@ -217,7 +217,7 @@ async fn a_successful_report_keeps_waiting() -> Result<()> {
 async fn shutdown_discards_partial_results() -> Result<()> {
     let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
     let awaited = names(&["billing", "ledger"])?;
-    let registration = registry.register(&awaited, TestCodec::FORMAT_ID, MAX_TIMEOUT)?;
+    let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
     let answer = success(registration.id(), &awaited[0], 6)?;
     assert_eq!(registry.accept(answer), ResponseDisposition::Accepted);
 

@@ -14,8 +14,9 @@ use tokio::time::{Instant, timeout_at};
 
 /// Races the delivery report against request completion, then decodes results.
 ///
-/// The producer future runs first in each ready tie. Thus, Kafka receives the
-/// record before this function can observe a response completion.
+/// The produce arm runs first in each ready tie. Thus this function hands the
+/// record to the producer, and reads a report that already resolved, before the
+/// completion arm can close the request out from under it.
 ///
 /// # Errors
 ///
@@ -33,28 +34,21 @@ where
     PE: Error,
 {
     let request = registration.request();
-    let mut produce = pin!(produce);
+    let produce = pin!(produce);
     let mut parked = pin!(timeout_at(deadline, request.park()));
-    let mut reported = false;
-    loop {
-        if reported {
-            drop(parked.as_mut().await);
-            break;
-        }
-        select! {
-            biased;
-            report = &mut produce => {
-                if let Err(error) = report
-                    && request.abandon_if_empty(Status::Cancelled)
-                {
-                    return Err(RequestError::Produce(error));
-                }
-                reported = true;
+    select! {
+        biased;
+        report = produce => {
+            if let Err(error) = report
+                && request.abandon_if_empty(Status::Cancelled)
+            {
+                return Err(RequestError::Produce(error));
             }
-            _ = parked.as_mut() => break,
+            drop(parked.as_mut().await);
         }
+        _ = parked.as_mut() => {}
     }
-    let finished = registration.finish(Status::TimedOut);
+    let finished = registration.finish();
     if finished.status == Status::ShuttingDown {
         return Err(RequestError::ShuttingDown);
     }
@@ -74,7 +68,7 @@ where
         for awaited in awaited {
             let outcome = match awaited.arrival {
                 None => Outcome::Failed(ResponseFailure::Timeout),
-                Some(Arrival::Unreadable(failure)) => Outcome::Failed(failure),
+                Some(Arrival::FormatMismatch) => Outcome::Failed(ResponseFailure::FormatMismatch),
                 Some(Arrival::Response {
                     status,
                     mut payload,

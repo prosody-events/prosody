@@ -1,6 +1,6 @@
 //! The limits an operator may set, and the ones the registry refuses.
 
-use crate::requester::config::RequesterConfiguration;
+use crate::requester::config::{MAX_IN_FLIGHT, RequesterConfiguration};
 use crate::requester::registry::PendingRegistry;
 use crate::response::headers::MAX_AWAITED;
 use color_eyre::Result;
@@ -22,6 +22,14 @@ async fn a_degenerate_limit_never_builds_a_registry() -> Result<()> {
     let refused = [
         RequesterConfiguration {
             max_in_flight: 0,
+            ..working.clone()
+        },
+        RequesterConfiguration {
+            max_in_flight: MAX_IN_FLIGHT + 1,
+            ..working.clone()
+        },
+        RequesterConfiguration {
+            max_awaited: 0,
             ..working.clone()
         },
         RequesterConfiguration {

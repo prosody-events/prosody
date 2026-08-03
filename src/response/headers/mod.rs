@@ -16,6 +16,10 @@
 //! processing the message. The count is per decode, not per
 //! record — a poll, a deferred reload and a state read each decode the same
 //! record — so read the counter as a rate, never as a population.
+//!
+//! [`ProsodyRequester`](crate::requester::ProsodyRequester) writes these
+//! headers through the same names this module reserves, so the writer and this
+//! parser cannot drift apart.
 
 use crate::response::frame::FrameHeader;
 use crate::response::{RequestId, ResponseStatus};
@@ -28,13 +32,16 @@ use std::str;
 use std::sync::LazyLock;
 use thiserror::Error;
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 #[cfg(test)]
 mod tests;
 
-// The four header names this protocol reserves. `parse_request_tag` matches a
-// record header against these and skips every other name, so this is the one
-// place they are written and none can be forgotten.
+// The four header names this protocol reserves. Two sites must agree on the
+// set: the `match key` arms of `parse_request_tag`, and
+// RESERVED_REQUEST_HEADERS below, which `is_reserved` reads. A name the parser
+// matches but the array omits is one a caller can inject, so add every new name
+// to both.
 pub(crate) const RESPONSE_VERSION_HEADER: &str = "response-version";
 pub(crate) const RESPONSE_REQUEST_ID_HEADER: &str = "response-request-id";
 pub(crate) const RESPONSE_NODE_HEADER: &str = "response-node";
@@ -61,10 +68,10 @@ pub(crate) const RESERVED_REQUEST_HEADERS: [&str; 4] = [
 /// writes this value, so the writer and reader cannot differ.
 pub(crate) const REQUEST_REVISION: &str = "1";
 
-/// The only accepted length of an id header value: the 36-character hyphenated
-/// UUID. Fixing the length rejects the simple, braced and URN forms, so one id
-/// has one text form.
-pub(crate) const ID_TEXT_LEN: usize = 36;
+/// The only accepted length of an id header value: the hyphenated UUID that
+/// [`id_text`] writes. Fixing the length rejects the simple, braced and URN
+/// forms, so one id has one text form.
+pub(crate) const ID_TEXT_LEN: usize = Hyphenated::LENGTH;
 
 /// Most `response-awaited` headers one record may carry.
 ///
