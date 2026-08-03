@@ -2,7 +2,9 @@
 
 mod pending;
 
-pub(in crate::requester) use self::pending::{Arrival, Awaited, Finished, PendingRequest, Status};
+pub(in crate::requester) use self::pending::{
+    Arrival, Awaited, Finished, PendingRequest, Status, Terminal,
+};
 use crate::requester::ValidatedRequest;
 use crate::requester::config::RequesterConfiguration;
 use crate::response::frame::ResponseFrame;
@@ -34,7 +36,11 @@ pub(in crate::requester) const SWEEP_BATCH: usize = 64;
 /// # What bounds the memory
 ///
 /// Admission bounds how many entries exist. The validated awaited limit bounds
-/// how many positions one entry holds. The frame decoder bounds each payload.
+/// how many positions one entry holds. The validated response ceiling bounds
+/// each payload, and the peer transport applies it when it decodes a frame.
+/// The configuration refuses the product of the three. So what an operator
+/// commits to is checked at startup, rather than left to three numbers that are
+/// each plausible alone.
 ///
 /// # Removal paths, all of them
 ///
@@ -170,7 +176,9 @@ impl PendingRegistry {
     /// Removes every entry at least one grace period past its deadline.
     ///
     /// Each scan reads only immutable deadlines into a stack batch. It releases
-    /// every map guard before it takes an entry lock.
+    /// every map guard before it takes an entry lock. The deadline stays on the
+    /// request rather than beside the map record: one scan per grace period
+    /// does not pay for a second copy of it.
     pub(crate) fn sweep(&self, now: Instant) {
         loop {
             let mut expired = SmallVec::<[RequestId; SWEEP_BATCH]>::new();
@@ -189,7 +197,7 @@ impl PendingRegistry {
                     .entries
                     .read_sync(&id, |_, entry| Arc::clone(&entry.request))
                 {
-                    self.close_and_remove(id, &request, Status::TimedOut);
+                    self.close_and_remove(id, &request, Terminal::TimedOut);
                 }
             }
             if !full_batch {
@@ -211,7 +219,7 @@ impl PendingRegistry {
                 break;
             }
             for (id, request) in batch {
-                self.close_and_remove(id, &request, Status::ShuttingDown);
+                self.close_and_remove(id, &request, Terminal::ShuttingDown);
             }
         }
         let sweeper = self.sweeper.lock().take();
@@ -286,14 +294,18 @@ impl PendingRegistry {
         // The check that closes the race: it reverses an insert that overlapped
         // a drain already in progress.
         if self.closed.load(Acquire) {
-            self.close_and_remove(id, &request, Status::ShuttingDown);
+            self.close_and_remove(id, &request, Terminal::ShuttingDown);
             return Err(Admission::ShuttingDown);
         }
         Ok((id, request))
     }
 
     /// Closes one exact request and then removes its map record.
-    fn close_and_remove(&self, id: RequestId, request: &Arc<PendingRequest>, status: Status) {
+    ///
+    /// The identity test is what makes the removal exact. Nothing is recycled,
+    /// so it is not a fence against a stale reference: it keeps a late guard
+    /// from removing a record another request owns under the same id.
+    fn close_and_remove(&self, id: RequestId, request: &Arc<PendingRequest>, status: Terminal) {
         request.close(status);
         drop(
             self.entries
@@ -327,7 +339,7 @@ impl Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         self.registry
-            .close_and_remove(self.id, &self.request, Status::Cancelled);
+            .close_and_remove(self.id, &self.request, Terminal::Cancelled);
     }
 }
 

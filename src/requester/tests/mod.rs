@@ -51,6 +51,9 @@ const NODE: NodeId = NodeId::from_bytes([7_u8; 16]);
 /// Longest timeout the suites may ask for.
 const MAX_TIMEOUT: Duration = Duration::from_mins(1);
 
+/// Response ceiling the suites configure, far above the bodies they build.
+const MAX_RESPONSE_BYTES: usize = 1024;
+
 /// Grace the suites configure.
 ///
 /// It is longer than any deadline a suite waits out, so the registry's own
@@ -141,6 +144,7 @@ pub(super) fn registry(max_in_flight: usize, max_awaited: usize) -> Result<Arc<P
     Ok(PendingRegistry::new(&RequesterConfiguration {
         max_in_flight,
         max_awaited,
+        max_response_bytes: MAX_RESPONSE_BYTES,
         max_timeout: MAX_TIMEOUT,
         sweep_grace: SWEEP_GRACE,
     })?)

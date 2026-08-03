@@ -4,8 +4,8 @@
 //! assertion is exact.
 
 use super::{
-    MAX_TIMEOUT, TestCodec, TestCodecError, TestError, names, poll_once, register, registry,
-    success,
+    MAX_TIMEOUT, SWEEP_GRACE, TestCodec, TestCodecError, TestError, names, poll_once, register,
+    registry, success,
 };
 use crate::producer::ProducerError;
 use crate::requester::collect::collect;
@@ -96,6 +96,31 @@ async fn a_failed_report_with_no_response_fails_at_once() -> Result<()> {
         Duration::ZERO,
         "the call spent its deadline waiting for a response that could not come"
     );
+    Ok(())
+}
+
+/// A failed delivery report still fails a call the sweep already closed,
+/// because the rule reads the request's own answers rather than which path
+/// closed it.
+///
+/// This is the call a foreign runtime polls late: the sweep transitioned the
+/// request before the report was ever observed.
+#[tokio::test(start_paused = true)]
+async fn a_failed_report_fails_a_call_the_sweep_already_closed() -> Result<()> {
+    let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
+    let awaited = names(&["billing"])?;
+    let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
+    let deadline = registration.deadline();
+    registry.sweep(deadline + SWEEP_GRACE);
+
+    let produce = async { Err::<(), _>(report_failure()) };
+    let outcome =
+        collect::<TestCodec, u32, TestError, _, TestCodecError>(&registration, produce, deadline)
+            .await;
+
+    let Err(RequestError::Produce(_)) = outcome else {
+        bail!("a produce failure with no answer must fail the call, whatever closed the request");
+    };
     Ok(())
 }
 

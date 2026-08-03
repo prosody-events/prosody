@@ -14,6 +14,7 @@ mod config;
 mod registry;
 
 use self::collect::collect;
+use self::config::MIN_TIMEOUT;
 use self::registry::{Admission, Caps, PendingRegistry};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::producer::{ProducerError, ProsodyProducer};
@@ -36,9 +37,6 @@ use tracing::{Span, instrument};
 
 #[cfg(test)]
 mod tests;
-
-/// Shortest timeout one request accepts.
-const MIN_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// Reserved headers that occur exactly once in every request.
 const RESERVED_SINGLETONS: usize = 3;

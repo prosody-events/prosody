@@ -1,6 +1,6 @@
 //! Completion and response decoding for one request.
 
-use super::registry::{Arrival, Awaited, Registration, Status};
+use super::registry::{Arrival, Awaited, Registration, Status, Terminal};
 use super::{Outcome, RequestError, ResponseFailure};
 use crate::Codec;
 use crate::error::ClassifyError;
@@ -40,7 +40,7 @@ where
         biased;
         report = produce => {
             if let Err(error) = report
-                && request.abandon_if_empty(Status::Cancelled)
+                && request.abandon_unanswered(Terminal::Cancelled)
             {
                 return Err(RequestError::Produce(error));
             }

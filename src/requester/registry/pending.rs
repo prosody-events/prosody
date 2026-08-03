@@ -56,6 +56,22 @@ pub(in crate::requester) enum Arrival {
     FormatMismatch,
 }
 
+/// A state a request may be moved into from outside.
+///
+/// [`Status::Open`] and [`Status::Complete`] are absent by design: a request
+/// never reopens, and only an arrival that fills the last position completes
+/// one. So a caller cannot write either of them, and the one-way rule needs no
+/// runtime check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::requester) enum Terminal {
+    /// The request deadline passed.
+    TimedOut,
+    /// The caller or a failed produce operation cancelled the request.
+    Cancelled,
+    /// Registry shutdown ended the request.
+    ShuttingDown,
+}
+
 /// The lifecycle state of one pending request.
 ///
 /// [`Open`](Self::Open) is the only state a request can leave. A transition out
@@ -127,11 +143,11 @@ impl PendingRequest {
     }
 
     /// Ends an open request without taking its positions.
-    pub(super) fn close(&self, status: Status) -> bool {
+    pub(super) fn close(&self, status: Terminal) -> bool {
         let transitioned = {
             let mut state = self.state.lock();
             if state.status == Status::Open {
-                state.status = status;
+                state.status = status.into();
                 true
             } else {
                 false
@@ -143,38 +159,46 @@ impl PendingRequest {
         transitioned
     }
 
-    /// Ends an open request only when no response has arrived.
+    /// Reports whether the request is still unanswered, and ends it when it is
+    /// and it is still open.
     ///
-    /// The emptiness test and transition share one lock scope. An accepted
-    /// response cannot fall between them and get discarded.
-    pub(in crate::requester) fn abandon_if_empty(&self, status: Status) -> bool {
-        let transitioned = {
+    /// The test and the transition share one lock scope. An accepted response
+    /// cannot fall between them and get discarded.
+    ///
+    /// The answer describes the positions, not this call. A request another
+    /// path already closed still reports the truth about its arrivals, so a
+    /// failed delivery report is judged by the evidence rather than by which
+    /// path closed the request first.
+    pub(in crate::requester) fn abandon_unanswered(&self, status: Terminal) -> bool {
+        let (unanswered, transitioned) = {
             let mut state = self.state.lock();
-            if state.status != Status::Open
-                || state
-                    .awaited
-                    .iter()
-                    .any(|awaited| awaited.arrival.is_some())
-            {
-                false
-            } else {
-                state.status = status;
-                true
+            let unanswered = state
+                .awaited
+                .iter()
+                .all(|awaited| awaited.arrival.is_none());
+            let transitioned = unanswered && state.status == Status::Open;
+            if transitioned {
+                state.status = status.into();
             }
+            (unanswered, transitioned)
         };
         if transitioned {
             self.notify.notify_waiters();
         }
-        transitioned
+        unanswered
     }
 
     /// Stores the first response for its named subsystem.
     ///
-    /// A frame written in another format fills its position with the refusal.
-    /// One responder answers per subsystem, so no later frame can repair that
-    /// position. The refusal is still evidence that the record reached a
-    /// responder, so [`abandon_if_empty`](Self::abandon_if_empty) counts it and
-    /// a failed delivery report does not fail the call.
+    /// A frame written in another format fills its position with the refusal,
+    /// so the caller learns at once instead of waiting out its deadline. The
+    /// refusal is the position's first writer, and one duplicate delivery of
+    /// the same response is absorbed by first-writer-wins, so a second frame
+    /// does not replace it. That trade is deliberate: a responder that answers
+    /// in another format is misconfigured rather than late. The refusal is also
+    /// evidence that the record reached a responder, so
+    /// [`abandon_unanswered`](Self::abandon_unanswered) reads it as an answer
+    /// and a failed delivery report does not fail the call.
     ///
     /// The caller releases the map guard before this function takes the state
     /// lock. This function releases the state lock before it notifies.
@@ -238,5 +262,15 @@ impl PendingRequest {
     /// Reports whether the request can still accept a response.
     fn is_open(&self) -> bool {
         self.state.lock().status == Status::Open
+    }
+}
+
+impl From<Terminal> for Status {
+    fn from(terminal: Terminal) -> Self {
+        match terminal {
+            Terminal::TimedOut => Self::TimedOut,
+            Terminal::Cancelled => Self::Cancelled,
+            Terminal::ShuttingDown => Self::ShuttingDown,
+        }
     }
 }
