@@ -47,7 +47,7 @@ const GROUP_SHARDS: u64 = 16;
 /// A tagged pair rather than a `host:port` string, because an entry point may
 /// later need a TLS server name or a scheme. Those are ordinary columns, so
 /// the set can grow without a key change.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Endpoint {
     pub(crate) host: Host,
     pub(crate) port: u16,

@@ -18,7 +18,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 use tracing::field::{Field, Visit};
-use tracing::subscriber::{DefaultGuard, set_default, with_default};
+use tracing::subscriber::{DefaultGuard, set_default, set_global_default, with_default};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::LevelFilter;
@@ -126,6 +126,49 @@ pub(crate) fn captured_spans_filtered(max_level: LevelFilter, f: impl FnOnce()) 
 
     let spans = exporter.0.lock();
     spans.clone()
+}
+
+/// Captures spans opened on **any** thread, for a test whose subject runs in a
+/// spawned task.
+///
+/// [`captured_spans`] installs its subscriber with `with_default`, which is
+/// thread-local, so it cannot see a span a server task opened. This installs
+/// the same pipeline as the process default instead — which one test process
+/// may do exactly once, so it belongs to tests that own their process.
+pub(crate) struct GlobalSpans {
+    exporter: TestExporter,
+    /// Held so the pipeline outlives the capture. The simple processor exports
+    /// on span end, so nothing has to be flushed before a read.
+    _provider: SdkTracerProvider,
+}
+
+impl GlobalSpans {
+    /// Installs the pipeline as this process's default subscriber.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a default subscriber is already installed.
+    pub(crate) fn install() -> Result<Self> {
+        let exporter = TestExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("test"))
+                .with_filter(LevelFilter::TRACE),
+        );
+        set_global_default(subscriber)?;
+        Ok(Self {
+            exporter,
+            _provider: provider,
+        })
+    }
+
+    /// Every span that has ended so far, on every thread.
+    pub(crate) fn ended(&self) -> Vec<SpanData> {
+        self.exporter.0.lock().clone()
+    }
 }
 
 /// Accumulates every captured tracing event, rendered field-by-field, into a

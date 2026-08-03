@@ -16,6 +16,7 @@ use crate::router::directory::cache::{AddressCache, AddressResolver};
 use crate::router::directory::{
     Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
 };
+use crate::router::grpc::BoundListener;
 use crate::router::{Host, NodeId};
 use derive_builder::Builder;
 use rand::RngExt;
@@ -130,8 +131,11 @@ impl PeerRuntime {
     /// Mints this process's node id, publishes what it discovers about itself,
     /// and starts refreshing that publication.
     ///
-    /// `listener_port` is the port this process's peer listener bound, and
-    /// `contact` is a Cassandra contact point the routed-address probe aims at.
+    /// `listener` is this process's already-bound peer listener, and `contact`
+    /// is a Cassandra contact point the routed-address probe aims at. The
+    /// listener is taken rather than a port number so the published port is
+    /// always the one the operating system assigned: there is no other port to
+    /// pass.
     /// The lease comes from `config` and reaches the directory, the refresh
     /// pace and the address cache from there, so one configured value governs
     /// all three. The first write is awaited here rather than left to the
@@ -144,7 +148,7 @@ impl PeerRuntime {
     /// discovery, statement preparation, or the first write fails.
     pub(crate) async fn start(
         store: CassandraStore,
-        listener_port: u16,
+        listener: &BoundListener,
         contact: &str,
         config: &RouterConfiguration,
         group: Option<GroupMembership>,
@@ -152,8 +156,7 @@ impl PeerRuntime {
         config.validate()?;
         let ttl = config.registration_ttl;
         let directory = NodeDirectory::new(store, ttl).await?;
-        let registration =
-            discover_registration(NodeId::new(), listener_port, contact, config, group)?;
+        let registration = discover_registration(NodeId::new(), listener, contact, config, group)?;
         directory.register(&registration).await?;
         let (stop, mut stopped) = watch::channel(false);
         let refresh = tokio::spawn({
@@ -274,16 +277,17 @@ fn routed_host(contact: &str) -> Option<Host> {
 /// Each configured field reaches only the endpoint it describes. `direct` is
 /// discovered and never configured: the local address the operating system
 /// would route to the contact point, else this machine's name, on the port the
-/// listener bound. That is what makes an equal network label an optimization —
-/// a neighbour dials an address it reaches without the entry point. The
-/// configured host and port reach `advertised` alone.
+/// listener actually bound. That is what makes an equal network label an
+/// optimization — a neighbour dials an address it reaches without the entry
+/// point. The configured host and port reach `advertised` alone.
 fn discover_registration(
     node: NodeId,
-    listener_port: u16,
+    listener: &BoundListener,
     contact: &str,
     config: &RouterConfiguration,
     group: Option<GroupMembership>,
 ) -> Result<NodeRegistration, whoami::Error> {
+    let listener_port = listener.address().port();
     // The machine name is published in its own right, so the lookup is paid
     // once and reused where the routed probe finds no address.
     let hostname = Host::make(&hostname()?);

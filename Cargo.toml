@@ -77,7 +77,9 @@ thiserror = "2.0"
 tokio = { version = "1.50", features = ["macros", "parking_lot", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["time"] }
-tonic = { version = "0.14.6", default-features = false }
+tonic = "0.14.6"
+tonic-health = "0.14.6"
+tonic-reflection = "0.14.6"
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = [

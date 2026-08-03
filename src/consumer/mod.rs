@@ -171,7 +171,9 @@ mod modes;
 pub(crate) mod observer;
 pub(crate) mod partition;
 mod poll;
-mod probes;
+// Crate-wide: the peer listener's health service answers from the same
+// readiness and liveness predicates this module's HTTP probes serve.
+pub(crate) mod probes;
 pub mod storage;
 mod wiring;
 
@@ -186,7 +188,7 @@ type WatermarkVersion = CachePadded<AtomicUsize>;
 /// Maps (Topic, Partition) pairs to their corresponding `PartitionManager`
 /// instances. Protected by a `RwLock` to allow concurrent reads with exclusive
 /// writes.
-type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManager<P>>>;
+pub(crate) type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManager<P>>>;
 
 /// Holds the runtime state of the consumer.
 ///

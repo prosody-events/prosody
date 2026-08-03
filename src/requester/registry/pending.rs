@@ -272,6 +272,23 @@ impl PendingRequest {
     fn is_open(&self) -> bool {
         self.state.lock().status == Status::Open
     }
+
+    /// The payload stored for one awaited position, when a response filled it.
+    ///
+    /// Tests read the bytes back so that "the delivery was accepted" is proved
+    /// by what the position holds, not only by the position being filled.
+    #[cfg(test)]
+    pub(super) fn stored_payload(&self, subsystem: &SubsystemName) -> Option<BytesMut> {
+        let state = self.state.lock();
+        let position = state
+            .awaited
+            .iter()
+            .find(|awaited| &awaited.name == subsystem)?;
+        match &position.arrival {
+            Some(Arrival::Response { payload, .. }) => Some(payload.clone()),
+            Some(Arrival::FormatMismatch | Arrival::TooLarge) | None => None,
+        }
+    }
 }
 
 impl From<Terminal> for Status {

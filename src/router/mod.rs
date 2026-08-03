@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 pub(crate) mod directory;
 pub(crate) mod fleet;
+pub(crate) mod grpc;
 #[cfg(test)]
 pub(crate) mod loopback;
 pub(crate) mod runtime;

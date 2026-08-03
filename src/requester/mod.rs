@@ -10,8 +10,8 @@
 )]
 
 mod collect;
-mod config;
-mod registry;
+pub(crate) mod config;
+pub(crate) mod registry;
 
 use self::collect::collect;
 use self::registry::{Admission, PendingRegistry};

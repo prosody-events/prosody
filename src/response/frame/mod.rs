@@ -86,6 +86,14 @@ pub(crate) struct ResponseFrame {
 }
 
 impl FrameCap {
+    /// The ceiling a process publishes when an operator asks for none.
+    pub(crate) const DEFAULT: Self = Self(64 * 1024);
+    /// The widest ceiling this type admits.
+    ///
+    /// A reader that is already bounded by its transport passes this, so its
+    /// own check is the type's upper bound rather than a second ceiling to
+    /// configure.
+    pub(crate) const MAX: Self = Self(Self::MAX_BYTES);
     /// Above this one frame could exhaust a receiver's whole buffer budget.
     pub(crate) const MAX_BYTES: usize = 16 * 1024 * 1024;
     /// Below this a frame's own routing fields would not fit.
@@ -177,7 +185,8 @@ pub(crate) enum PayloadError<E: Error> {
     Codec(E),
 }
 
-// Visible to the response layer's other test modules: the sender's tests reuse
-// this module's codec rather than writing a second one.
+// Visible crate-wide to test modules: the sender's suites and the peer
+// transport's reuse this module's codec and its hand-built frame builder rather
+// than writing a second one of either.
 #[cfg(test)]
-pub(in crate::response) mod tests;
+pub(crate) mod tests;

@@ -51,7 +51,7 @@ thread_local! {
 /// payload's own buffer over instead, as [`BinaryCodec`](crate::BinaryCodec)
 /// does.
 #[derive(Clone, Debug, Default)]
-pub(in crate::response) struct CountingCodec {
+pub(crate) struct CountingCodec {
     serializes: Arc<AtomicUsize>,
     deserializes: Arc<AtomicUsize>,
     moves: bool,
@@ -60,17 +60,17 @@ pub(in crate::response) struct CountingCodec {
 /// A frame assembled field by field, so a case can omit one field or make one
 /// malformed. Every field defaults to a well-formed value, and `None` leaves
 /// the field out of the encoding entirely.
-struct RawFrame {
-    version: Option<u64>,
-    target: Option<&'static [u8]>,
-    request: Option<&'static [u8]>,
-    subsystem: Option<&'static [u8]>,
-    format: Option<&'static [u8]>,
-    status: Option<u64>,
-    payload: Option<&'static [u8]>,
-    relay: Option<&'static [u8]>,
+pub(crate) struct RawFrame<'a> {
+    pub(crate) version: Option<u64>,
+    pub(crate) target: Option<&'a [u8]>,
+    pub(crate) request: Option<&'a [u8]>,
+    pub(crate) subsystem: Option<&'a [u8]>,
+    pub(crate) format: Option<&'a [u8]>,
+    pub(crate) status: Option<u64>,
+    pub(crate) payload: Option<&'a [u8]>,
+    pub(crate) relay: Option<&'a [u8]>,
     /// Stands in for a field a later protocol version might add.
-    unknown: Option<u64>,
+    pub(crate) unknown: Option<u64>,
 }
 
 impl Codec for CountingCodec {
@@ -121,7 +121,7 @@ impl CountingCodec {
     }
 }
 
-impl Default for RawFrame {
+impl Default for RawFrame<'_> {
     fn default() -> Self {
         Self {
             version: Some(1),
@@ -138,7 +138,7 @@ impl Default for RawFrame {
 }
 
 /// How many payloads [`CountingCodec`] has serialized on this thread.
-pub(in crate::response) fn serialized_on_this_thread() -> usize {
+pub(crate) fn serialized_on_this_thread() -> usize {
     SERIALIZED_HERE.get()
 }
 
@@ -156,8 +156,8 @@ fn raw_bytes_field(tag: u32, value: &[u8], dst: &mut BytesMut) {
     dst.extend_from_slice(value);
 }
 
-impl RawFrame {
-    fn encode(&self) -> BytesMut {
+impl RawFrame<'_> {
+    pub(crate) fn encode(&self) -> BytesMut {
         let mut dst = BytesMut::new();
         if let Some(version) = self.version {
             raw_varint_field(FIELD_PROTOCOL_VERSION, version, &mut dst);

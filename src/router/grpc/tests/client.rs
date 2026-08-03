@@ -1,0 +1,121 @@
+//! What the sender does with the status a real listener answered.
+
+use super::{ALPHA, GrpcSender, Harness, header, payload, register};
+use crate::codec::Codec;
+use crate::response::frame::tests::CountingCodec;
+use crate::response::sender::TypedSender;
+use crate::router::directory::Endpoint;
+use crate::router::fleet::DestinationFleet;
+use crate::router::grpc::TRANSPORT;
+use crate::router::grpc::client::DELIVER_RESPONSE;
+use crate::router::grpc::generated::peer_server::SERVICE_NAME;
+use crate::router::loopback::config;
+use crate::router::{NodeId, Router};
+use crate::test_util::TEST_RUNTIME;
+use crate::tracing::init_test_logging;
+use color_eyre::Result;
+use color_eyre::eyre::{ensure, eyre};
+use std::convert::Infallible;
+use std::future::Future;
+use std::sync::Arc;
+
+/// Destinations the retry pin's fleet holds: this node and the one a stale
+/// entry points elsewhere.
+const DESTINATIONS: usize = 2;
+
+/// Responses one destination may hold at once.
+const SLOTS: usize = 2;
+
+/// A short payload, for the cases whose size is not the subject.
+const SHORT: usize = 8;
+
+/// Every node resolves to the one listener under test.
+///
+/// That is not a contrivance: it is exactly what a stale directory entry looks
+/// like, which is the case the misrouted arm exists for.
+#[derive(Clone)]
+struct OneListener {
+    fleet: Arc<DestinationFleet>,
+    transport: Arc<GrpcSender>,
+    address: Endpoint,
+}
+
+impl Router for OneListener {
+    type Error = Infallible;
+    type Sender = GrpcSender;
+
+    fn address(
+        &self,
+        _node: NodeId,
+    ) -> impl Future<Output = Result<Option<Endpoint>, Infallible>> + Send {
+        let address = self.address.clone();
+        async move { Ok(Some(address)) }
+    }
+
+    fn sender(&self) -> &GrpcSender {
+        &self.transport
+    }
+
+    fn fleet(&self) -> &Arc<DestinationFleet> {
+        &self.fleet
+    }
+}
+
+/// The path the client calls names the generated service, so a renamed proto
+/// cannot leave the client misrouting quietly.
+#[test]
+fn the_method_path_names_the_generated_service() -> Result<()> {
+    ensure!(
+        DELIVER_RESPONSE.as_str() == format!("/{SERVICE_NAME}/DeliverResponse"),
+        "the client calls {}, which is not the generated service's method",
+        DELIVER_RESPONSE.as_str()
+    );
+    Ok(())
+}
+
+/// A status the destination answered decides whether the response is tried
+/// again: `NOT_FOUND` is the destination's own answer and is never repeated,
+/// while `UNAVAILABLE` may or may not have landed and is.
+///
+/// The count is taken at the service, after the network, so no client-side
+/// bookkeeping can stand in for it, and it is read after `drain`, which awaits
+/// every worker.
+#[test]
+fn a_terminal_status_is_attempted_once_and_an_ambiguous_one_is_retried() -> Result<()> {
+    init_test_logging();
+    TEST_RUNTIME.block_on(async {
+        let harness = Harness::shared().await?;
+        let router = OneListener {
+            fleet: Arc::new(DestinationFleet::new(config(DESTINATIONS, SLOTS))?),
+            transport: Arc::new(GrpcSender::new(harness.cap, DESTINATIONS)),
+            address: harness.address.clone(),
+        };
+        let attempts = router.fleet().config().max_send_attempts;
+
+        // Nothing is registered under this id, so the node answers NOT_FOUND.
+        let terminal = TypedSender::<CountingCodec>::new(&router, harness.cap)?;
+        let served = TRANSPORT.served();
+        let unregistered = register(&harness.oracle, &[ALPHA], CountingCodec::FORMAT_ID)?;
+        terminal
+            .send(header(harness.node, unregistered, ALPHA)?, payload(SHORT))
+            .map_err(|_| eyre!("the fleet refused a slot"))?;
+        terminal.drain().await;
+        ensure!(
+            TRANSPORT.served() == served + 1,
+            "a terminal status must be attempted exactly once"
+        );
+
+        // Addressed to another node, so this one answers UNAVAILABLE.
+        let ambiguous = TypedSender::<CountingCodec>::new(&router, harness.cap)?;
+        let served = TRANSPORT.served();
+        ambiguous
+            .send(header(NodeId::new(), unregistered, ALPHA)?, payload(SHORT))
+            .map_err(|_| eyre!("the fleet refused a slot"))?;
+        ambiguous.drain().await;
+        ensure!(
+            TRANSPORT.served() == served + u64::from(attempts),
+            "an ambiguous status must be attempted {attempts} times"
+        );
+        Ok(())
+    })
+}

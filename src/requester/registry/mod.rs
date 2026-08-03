@@ -11,6 +11,8 @@ use crate::response::frame::ResponseFrame;
 use crate::response::{RequestId, ResponseDisposition};
 use crate::subsystem::SubsystemName;
 use ahash::RandomState;
+#[cfg(test)]
+use bytes::BytesMut;
 use parking_lot::Mutex;
 use scc::HashMap;
 use smallvec::SmallVec;
@@ -268,6 +270,19 @@ impl PendingRegistry {
     #[cfg(test)]
     pub(crate) fn contains(&self, id: RequestId) -> bool {
         self.entries.read_sync(&id, |_, _| ()).is_some()
+    }
+
+    /// The payload stored for one request's subsystem, when a response filled
+    /// that position.
+    #[cfg(test)]
+    pub(crate) fn stored_payload(
+        &self,
+        id: RequestId,
+        subsystem: &SubsystemName,
+    ) -> Option<BytesMut> {
+        self.entries
+            .read_sync(&id, |_, entry| Arc::clone(&entry.request))?
+            .stored_payload(subsystem)
     }
 
     /// Registers an entry without a waiter guard.

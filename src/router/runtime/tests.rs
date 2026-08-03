@@ -4,6 +4,7 @@ use super::{
 };
 use crate::router::directory::tests::support::{directory, member_shards, membership, store};
 use crate::router::directory::{Endpoint, RegistrationTtl};
+use crate::router::grpc::{BoundListener, TransportConfiguration};
 use crate::router::{Host, NodeId};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -18,6 +19,14 @@ use validator::Validate;
 
 /// The Cassandra contact point the routed-address probe aims at.
 const CONTACT: &str = "localhost:9042";
+
+/// A peer listener on a port the operating system chooses.
+///
+/// Registration reads the bound listener rather than a port number, so a test
+/// binds a real one and the published port is always a port that exists.
+async fn listener() -> Result<BoundListener> {
+    Ok(BoundListener::bind(&TransportConfiguration::default()).await?)
+}
 
 /// The same contact point written as an address. A probe against it exercises
 /// no name resolution, so it always aims at one address family.
@@ -39,9 +48,10 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
         let config = RouterConfiguration::default();
         let directory = directory(LEASE).await?;
         let membership = membership();
+        let bound = listener().await?;
         let runtime = PeerRuntime::start(
             store().await?.clone(),
-            7777,
+            &bound,
             CONTACT,
             &config,
             Some(membership.clone()),
@@ -58,8 +68,9 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
             "the published row must belong to this process"
         );
         assert_eq!(
-            registered.direct.port, 7777,
-            "the runtime must publish the listener's port"
+            registered.direct.port,
+            bound.address().port(),
+            "the runtime must publish the port the listener bound"
         );
         assert_eq!(
             registered.group.as_ref(),
@@ -108,8 +119,14 @@ fn a_resolved_address_stops_being_served_once_its_row_is_gone() -> Result<()> {
             registration_ttl: RegistrationTtl::try_from(RegistrationTtl::MIN)?,
             ..RouterConfiguration::default()
         };
-        let runtime =
-            PeerRuntime::start(store().await?.clone(), 7777, CONTACT, &config, None).await?;
+        let runtime = PeerRuntime::start(
+            store().await?.clone(),
+            &listener().await?,
+            CONTACT,
+            &config,
+            None,
+        )
+        .await?;
         let node = runtime.node();
         assert!(
             runtime.addresses().resolve(node).await?.is_some(),
@@ -149,8 +166,14 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
             address_cache_capacity: 0,
             ..RouterConfiguration::default()
         };
-        let outcome =
-            PeerRuntime::start(store().await?.clone(), 7777, CONTACT, &config, None).await;
+        let outcome = PeerRuntime::start(
+            store().await?.clone(),
+            &listener().await?,
+            CONTACT,
+            &config,
+            None,
+        )
+        .await;
         assert!(
             matches!(outcome, Err(PeerRuntimeError::Configuration(_))),
             "a cache capacity of zero must stop the runtime from starting"
@@ -165,30 +188,34 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
 #[test]
 fn a_configured_entry_point_never_reaches_the_direct_endpoint() -> Result<()> {
     init_test_logging();
-    let config = RouterConfiguration::builder()
-        .advertised_host("gateway.example")
-        .advertised_port(443_u16)
-        .network("east")
-        .build()?;
-    let registration = discover_registration(NodeId::new(), 7777, CONTACT, &config, None)?;
-    assert_eq!(
-        registration.direct.port, 7777,
-        "the direct endpoint must publish the port the listener bound"
-    );
-    assert_ne!(
-        registration.direct.host,
-        Host::make("gateway.example"),
-        "the direct endpoint must not publish the configured entry point"
-    );
-    assert_eq!(
-        registration.advertised,
-        Some(Endpoint {
-            host: Host::make("gateway.example"),
-            port: 443,
-        }),
-        "the entry point must publish exactly what the operator configured"
-    );
-    Ok(())
+    TEST_RUNTIME.block_on(async {
+        let config = RouterConfiguration::builder()
+            .advertised_host("gateway.example")
+            .advertised_port(443_u16)
+            .network("east")
+            .build()?;
+        let bound = listener().await?;
+        let registration = discover_registration(NodeId::new(), &bound, CONTACT, &config, None)?;
+        assert_eq!(
+            registration.direct.port,
+            bound.address().port(),
+            "the direct endpoint must publish the port the listener bound"
+        );
+        assert_ne!(
+            registration.direct.host,
+            Host::make("gateway.example"),
+            "the direct endpoint must not publish the configured entry point"
+        );
+        assert_eq!(
+            registration.advertised,
+            Some(Endpoint {
+                host: Host::make("gateway.example"),
+                port: 443,
+            }),
+            "the entry point must publish exactly what the operator configured"
+        );
+        Ok(())
+    })
 }
 
 /// Three refresh delays fit inside the lease with a quarter of it unspent,
@@ -242,25 +269,29 @@ fn routed_host_answers_for_the_cassandra_contact_point() -> Result<()> {
 #[test]
 fn the_direct_host_is_the_routed_address_then_this_machine() -> Result<()> {
     init_test_logging();
-    let config = RouterConfiguration::default();
-    let routed =
-        routed_host(NUMERIC_CONTACT).ok_or_else(|| eyre!("the routed probe found no address"))?;
-    let registration = discover_registration(NodeId::new(), 7777, NUMERIC_CONTACT, &config, None)?;
-    ensure!(
-        routed != registration.hostname,
-        "this machine answers {routed} to both sources, so the two cannot be told apart"
-    );
-    assert_eq!(
-        registration.direct.host, routed,
-        "the direct endpoint must publish the routed address while the probe answers"
-    );
+    TEST_RUNTIME.block_on(async {
+        let config = RouterConfiguration::default();
+        let routed = routed_host(NUMERIC_CONTACT)
+            .ok_or_else(|| eyre!("the routed probe found no address"))?;
+        let bound = listener().await?;
+        let registration =
+            discover_registration(NodeId::new(), &bound, NUMERIC_CONTACT, &config, None)?;
+        ensure!(
+            routed != registration.hostname,
+            "this machine answers {routed} to both sources, so the two cannot be told apart"
+        );
+        assert_eq!(
+            registration.direct.host, routed,
+            "the direct endpoint must publish the routed address while the probe answers"
+        );
 
-    let unrouted = discover_registration(NodeId::new(), 7777, "no-port-here", &config, None)?;
-    assert_eq!(
-        unrouted.direct.host, unrouted.hostname,
-        "the direct endpoint must fall back to this machine's name"
-    );
-    Ok(())
+        let unrouted = discover_registration(NodeId::new(), &bound, "no-port-here", &config, None)?;
+        assert_eq!(
+            unrouted.direct.host, unrouted.hostname,
+            "the direct endpoint must fall back to this machine's name"
+        );
+        Ok(())
+    })
 }
 
 /// The configuration refuses the degenerate values its fields can express: a

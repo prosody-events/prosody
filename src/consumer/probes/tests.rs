@@ -3,7 +3,7 @@ use color_eyre::Result;
 use reqwest::Client;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn test_probe_server_endpoints_respond() -> Result<()> {
@@ -19,9 +19,8 @@ async fn test_probe_server_endpoints_respond() -> Result<()> {
     // Create an HTTP client for testing
     let client = Client::new();
 
-    // Give the server a moment to start up
-    sleep(Duration::from_millis(100)).await;
-
+    // `ProbeServer::new` binds the listener before it returns, so a connection
+    // to `local_addr` is accepted from here on. Nothing has to be waited for.
     // Verify both endpoints respond
     let readyz_result = check_endpoint(&client, address, "/readyz").await;
     let livez_result = check_endpoint(&client, address, "/livez").await;
