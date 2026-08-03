@@ -79,10 +79,11 @@ pub(crate) trait Framed {
 /// [`SendFailure`], and only an ambiguous one may be tried again.
 ///
 /// The frame is borrowed, so a sender writes straight from the one scratch
-/// buffer its worker owns and nothing on this path allocates. A transport whose
-/// own encoder needs an owned item pays one bounded copy into it, which is the
-/// trade this borrow accepts: the copy precedes a network round trip, while an
-/// owned seam would put an allocation on every response.
+/// buffer its worker owns rather than building a frame per response. A
+/// transport whose own encoder needs an owned item still pays for one: it
+/// copies the scratch into a buffer of its own, and that buffer is what the
+/// borrow keeps bounded by the frame ceiling. An owned seam here would put that
+/// allocation on every response whatever the transport needs.
 pub(crate) trait ResponseSender: Send + Sync + 'static {
     /// Delivers one frame to one resolved address.
     fn deliver<F: Framed + Sync>(
@@ -246,11 +247,16 @@ impl SendFailure {
     /// requester accepts at most one response per request and subsystem: a
     /// duplicate is dropped, never counted twice. Every other status is the
     /// destination's own answer, and repeating the send would only repeat it.
+    ///
+    /// An address the transport cannot dial is not ambiguous either: the
+    /// address is resolved once per response, so the next attempt would be
+    /// given the same one and fail the same way, having spent the
+    /// destination's pacing on nothing.
     pub(crate) const fn is_ambiguous(self) -> bool {
-        matches!(
-            self,
-            Self::Unreachable | Self::Status(Code::Unavailable | Code::DeadlineExceeded)
-        )
+        match self {
+            Self::Unreachable | Self::Status(Code::Unavailable | Code::DeadlineExceeded) => true,
+            Self::Undialable | Self::Status(_) => false,
+        }
     }
 }
 
@@ -272,6 +278,11 @@ pub(crate) enum SendFailure {
     /// The destination could not be reached at all.
     #[error("destination could not be reached")]
     Unreachable,
+
+    /// The address the destination published is not one this transport can
+    /// dial, so nothing left this process.
+    #[error("destination published an address that cannot be dialed")]
+    Undialable,
 }
 
 #[cfg(test)]

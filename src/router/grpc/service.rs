@@ -12,7 +12,7 @@ use crate::router::NodeId;
 use async_trait::async_trait;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use std::sync::Arc;
-use tonic::{Code, Request, Response, Status};
+use tonic::{Request, Response, Status};
 use tracing::field::{Empty, display};
 use tracing::{Span, debug, debug_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -48,10 +48,11 @@ impl PeerService {
         // registry never sees a frame addressed elsewhere.
         //
         // `Unreachable` maps to UNAVAILABLE, which `SendFailure::is_ambiguous`
-        // treats as worth another attempt, so a misroute is repeated for the
-        // sender's whole attempt budget. That is deliberate: a stale directory
-        // entry is what puts a frame here, and the retry is what carries it
-        // through the moment the entry is corrected.
+        // treats as worth another attempt, so the sender spends its whole
+        // budget on a misroute. Every one of those attempts goes back to this
+        // node: the sender resolves the address once per response, so no retry
+        // can pick up a corrected directory entry. The next response is what
+        // reaches the right node.
         let disposition = if frame.header.target == self.node {
             self.registry.accept(frame)
         } else {
@@ -59,11 +60,24 @@ impl PeerService {
             ResponseDisposition::Unreachable
         };
         span.record("peer.disposition", display(disposition.message()));
-        // Matched on the status rather than on the disposition, so a
-        // disposition added later cannot fall into the accepting arm.
-        match disposition.status() {
-            Code::Ok => Ok(Response::new(())),
-            code => Err(Status::new(code, disposition.message())),
+        // Every refusal is named rather than caught, so a disposition added
+        // later does not compile until somebody decides here whether it means
+        // the response was stored. That decision is what `OK` reports.
+        match disposition {
+            ResponseDisposition::Accepted => Ok(Response::new(())),
+            ResponseDisposition::UnknownRequest
+            | ResponseDisposition::ClosedRequest
+            | ResponseDisposition::DuplicateSubsystem
+            | ResponseDisposition::UnexpectedSubsystem
+            | ResponseDisposition::FormatMismatch
+            | ResponseDisposition::ResponseTooLarge
+            | ResponseDisposition::MalformedTarget
+            | ResponseDisposition::AlreadyRelayed
+            | ResponseDisposition::NoRelayCapacity
+            | ResponseDisposition::RelayDeadlineExceeded
+            | ResponseDisposition::Unreachable => {
+                Err(Status::new(disposition.status(), disposition.message()))
+            }
         }
     }
 }

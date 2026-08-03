@@ -30,9 +30,8 @@ const SHORT: usize = 8;
 /// ceiling is above the frame, so the refusal cannot be the client's.
 ///
 /// What refuses it is the transport's configured ceiling, before a byte reaches
-/// the frame reader. So this case asserts the status and the service counter
-/// only. The version case below refuses inside the reader, which is why that
-/// one can also assert the rejected-frame counter.
+/// the frame reader. An operator sees it all the same: the refusal is counted
+/// as a transport rejection, exactly like the one the reader makes below.
 #[test]
 fn an_oversized_frame_is_refused_by_the_server() -> Result<()> {
     init_test_logging();
@@ -40,6 +39,7 @@ fn an_oversized_frame_is_refused_by_the_server() -> Result<()> {
         let harness = Harness::shared().await?;
         let request = register(&harness.registry, &[ALPHA], CountingCodec::FORMAT_ID)?;
         let served = TRANSPORT.served();
+        let rejected = TRANSPORT.rejected_frames();
         let refused = harness
             .deliver_under(
                 &harness.wide,
@@ -51,6 +51,10 @@ fn an_oversized_frame_is_refused_by_the_server() -> Result<()> {
         ensure!(
             refused == Code::OutOfRange,
             "an over-cap frame must be refused as out of range, not {refused:?}"
+        );
+        ensure!(
+            TRANSPORT.rejected_frames() == rejected + 1,
+            "a frame refused for its size must be counted as a transport rejection"
         );
         ensure!(
             TRANSPORT.served() == served,
@@ -81,7 +85,8 @@ fn the_client_refuses_an_over_cap_frame_before_it_sends() -> Result<()> {
         let harness = Harness::with(transport(WIDE_FRAME_CAP)).await?;
         let outcome = async {
             let request = register(&harness.registry, &[ALPHA], CountingCodec::FORMAT_ID)?;
-            let narrow = super::super::client::GrpcSender::new(FrameCap::new(FRAME_CAP)?, 2);
+            let narrow =
+                super::super::client::GrpcSender::new(FrameCap::new(FRAME_CAP)?, &super::fleet(1)?);
             let served = TRANSPORT.served();
             let refused = harness
                 .deliver_under(

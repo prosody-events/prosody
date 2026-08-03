@@ -1,4 +1,4 @@
-use super::{NodeId, Router, RouterHandle};
+use super::{NodeId, Router, RouterHandle, SendFailure};
 use crate::router::directory::RegistrationTtl;
 use crate::router::directory::cache::{AddressCache, AddressResolver};
 use crate::router::directory::tests::support::{directory, membership, registration};
@@ -11,6 +11,7 @@ use color_eyre::eyre::eyre;
 use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
+use tonic::Code;
 use uuid::{Uuid, Version};
 
 /// The lease the router's own read runs under.
@@ -31,6 +32,34 @@ fn every_minted_node_id_is_a_fresh_random_uuid() {
             Uuid::from_bytes(id.into_bytes()).get_version(),
             Some(Version::Random),
             "{id} must be a random UUID"
+        );
+    }
+}
+
+/// Only a failure another attempt could fix is tried again.
+///
+/// Every failure is named, so a failure added later is classified here rather
+/// than inheriting a catch-all. The two that are worth repeating are the ones
+/// where the destination may still answer; a status the destination itself
+/// chose, and an address this process cannot dial, are the same next time.
+#[test]
+fn only_an_unanswered_send_is_worth_another_attempt() {
+    for failure in [
+        SendFailure::Unreachable,
+        SendFailure::Status(Code::Unavailable),
+        SendFailure::Status(Code::DeadlineExceeded),
+    ] {
+        assert!(failure.is_ambiguous(), "{failure} may still have landed");
+    }
+    for failure in [
+        SendFailure::Undialable,
+        SendFailure::Status(Code::NotFound),
+        SendFailure::Status(Code::ResourceExhausted),
+        SendFailure::Status(Code::Ok),
+    ] {
+        assert!(
+            !failure.is_ambiguous(),
+            "{failure} answers the same way every time"
         );
     }
 }

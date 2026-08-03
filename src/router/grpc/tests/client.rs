@@ -105,9 +105,10 @@ fn a_terminal_status_is_attempted_once_and_an_ambiguous_one_is_retried() -> Resu
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
+        let fleet = Arc::new(DestinationFleet::new(config(DESTINATIONS, SLOTS))?);
         let router = OneListener {
-            fleet: Arc::new(DestinationFleet::new(config(DESTINATIONS, SLOTS))?),
-            transport: Arc::new(GrpcSender::new(harness.cap, DESTINATIONS)),
+            transport: Arc::new(GrpcSender::new(harness.cap, &fleet)),
+            fleet,
             address: harness.address.clone(),
         };
         let attempts = router.fleet().config().max_send_attempts;

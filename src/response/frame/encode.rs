@@ -143,9 +143,9 @@ impl Framed for Staged<'_> {
     /// Writes the frame in field order. Field order is this encoder's choice,
     /// not a protobuf requirement; the decoder accepts any order.
     ///
-    /// Every destination this crate writes into — tonic's encode buffer, a
-    /// [`BytesMut`](bytes::BytesMut) — reserves on demand, and sizing one at
-    /// the frame cap keeps it from ever having to.
+    /// Every destination this crate writes into is a
+    /// [`BytesMut`](bytes::BytesMut), which reserves on demand, and sizing one
+    /// at the frame cap keeps it from ever having to.
     fn write<B: BufMut>(&self, dst: &mut B) {
         write_varint_field(
             FIELD_PROTOCOL_VERSION,

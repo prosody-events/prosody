@@ -24,9 +24,11 @@ const GRPC_HEADER_BYTES: usize = 5;
 /// One framed response, owned.
 ///
 /// tonic's encoder must be `'static`, so it cannot borrow the worker's scratch.
-/// A response therefore pays one right-sized copy into this value immediately
-/// before a network round trip. A pool cannot reclaim those bytes, because
-/// tonic owns them until the write completes.
+/// A response therefore pays a right-sized allocation and a copy into this
+/// value, and tonic then copies it again into the per-call buffer it owns. Both
+/// copies precede one network round trip, and both buffers are bounded by the
+/// frame ceiling. A pool cannot reclaim either, because tonic owns its buffer
+/// until the write completes.
 /// [`ResponseSender`](crate::router::ResponseSender) owns that trade.
 pub(crate) struct FrameBytes(Bytes);
 
@@ -95,8 +97,16 @@ impl Decoder for ServerFrameCodec {
     ///
     /// The listener's configured ceiling refuses an over-cap message before a
     /// byte reaches this reader, and answers the peer `OUT_OF_RANGE` itself. So
-    /// the ceiling passed here is the type's own upper bound, and the size arm
-    /// of [`refusal`] answers only a reader driven directly.
+    /// the ceiling passed here is the type's own upper bound, the size arm of
+    /// [`refusal`] answers only a reader driven directly, and
+    /// [`Counted`](super::counted::Counted) is what counts the refusal the
+    /// transport made.
+    ///
+    /// This direction keeps tonic's own receive buffer, which grows to the
+    /// message once and is freed with the call. Sizing it to the configured
+    /// ceiling instead would hold that ceiling open on every idle stream, and
+    /// the codec is built through [`Default`] and could not read the ceiling
+    /// anyway.
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<ResponseFrame>, Status> {
         match decode_frame(src, FrameCap::MAX) {
             Ok(frame) => Ok(Some(frame)),

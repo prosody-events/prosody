@@ -5,6 +5,7 @@ use super::inject::MetadataInjector;
 use crate::propagator::new_propagator;
 use crate::response::frame::FrameCap;
 use crate::router::directory::Endpoint;
+use crate::router::fleet::DestinationFleet;
 use crate::router::{Framed, ResponseSender, SendFailure};
 use ahash::RandomState;
 use bytes::BytesMut;
@@ -36,10 +37,11 @@ type Channels = Cache<Endpoint, Channel, UnitWeighter, RandomState>;
 ///
 /// # What bounds the memory
 ///
-/// The channel cache holds at most as many channels as the fleet holds
-/// destinations, and `quick_cache` evicts to stay inside that. Eviction is the
-/// removal path: nothing else holds a channel, so an evicted one closes its
-/// connections when its last clone drops.
+/// The channel cache is built at the fleet's own destination count, so the two
+/// cannot disagree and a live destination never has to redial. `quick_cache`
+/// evicts to stay inside that count, and eviction is the removal path: nothing
+/// else holds a channel, so an evicted one closes its connections when its last
+/// clone drops.
 pub(crate) struct GrpcSender {
     channels: Arc<Channels>,
     cap: FrameCap,
@@ -47,9 +49,12 @@ pub(crate) struct GrpcSender {
 }
 
 impl GrpcSender {
-    /// A sender that holds up to `destinations` channels and refuses to encode
-    /// a frame over `cap`.
-    pub(crate) fn new(cap: FrameCap, destinations: usize) -> Self {
+    /// A sender for `fleet`, refusing to encode a frame over `cap`.
+    ///
+    /// The fleet is read rather than held: only its size is needed here, and a
+    /// destination's slots and pacing belong to the fleet itself.
+    pub(crate) fn new(cap: FrameCap, fleet: &DestinationFleet) -> Self {
+        let destinations = fleet.config().max_destinations;
         Self {
             channels: Arc::new(Cache::with(
                 destinations,
@@ -67,14 +72,16 @@ impl GrpcSender {
     ///
     /// The connect is lazy, so a dead peer surfaces as the call's own status.
     /// The address is parsed here, though, so an address no URI can hold fails
-    /// here. Only a miss builds the URI, so a hit allocates nothing.
+    /// here — and fails the same way every time, which is why it is not
+    /// [`SendFailure::Unreachable`]. Only a miss builds the URI, so a hit
+    /// allocates nothing.
     async fn channel(&self, address: &Endpoint) -> Result<Channel, SendFailure> {
         match self.channels.get_value_or_guard_async(address).await {
             Ok(channel) => Ok(channel),
             Err(guard) => {
                 let Ok(dialled) = Dialled::from_shared(peer_uri(address)) else {
                     warn!(host = %address.host, port = address.port, "a published address is not dialable");
-                    return Err(SendFailure::Unreachable);
+                    return Err(SendFailure::Undialable);
                 };
                 let channel = dialled.connect_lazy();
                 drop(guard.insert(channel.clone()));

@@ -26,6 +26,8 @@ use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader, ResponseFrame};
 use crate::response::{FormatToken, RequestId, ResponseStatus};
 use crate::router::directory::Endpoint;
+use crate::router::fleet::DestinationFleet;
+use crate::router::loopback::config;
 use crate::router::{Framed, Host, NodeId, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
 use bytes::{BufMut, BytesMut};
@@ -65,6 +67,14 @@ const BETA: &str = "beta";
 /// How long a request in these suites stays open. Long enough that no
 /// assertion races the deadline sweep.
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Destinations a suite's fleet holds, which is what sizes the channel cache of
+/// the senders built from it. Every suite reaches one listener, so one channel
+/// is enough and the second is slack.
+const SUITE_DESTINATIONS: usize = 2;
+
+/// Responses one destination in a suite's fleet may hold at once.
+const SUITE_SLOTS: usize = 2;
 
 /// The one listener every suite that needs a wire shares.
 static SHARED: OnceCell<Harness> = OnceCell::const_new();
@@ -134,8 +144,8 @@ impl Harness {
             node,
             registry: served_registry,
             oracle: registry()?,
-            sender: GrpcSender::new(config.frame_cap, 4),
-            wide: GrpcSender::new(FrameCap::new(WIDE_FRAME_CAP)?, 4),
+            sender: GrpcSender::new(config.frame_cap, &fleet(SUITE_DESTINATIONS)?),
+            wide: GrpcSender::new(FrameCap::new(WIDE_FRAME_CAP)?, &fleet(SUITE_DESTINATIONS)?),
             address,
             cap: config.frame_cap,
             stop: Some(stop),
@@ -218,6 +228,12 @@ pub(super) fn transport(cap: usize) -> Result<TransportConfiguration> {
     })
 }
 
+/// A fleet of `destinations` destinations, which is what sizes a sender's
+/// channel cache.
+pub(super) fn fleet(destinations: usize) -> Result<DestinationFleet> {
+    Ok(DestinationFleet::new(config(destinations, SUITE_SLOTS))?)
+}
+
 /// A registry with a response ceiling below the frame ceiling.
 pub(super) fn registry() -> Result<Arc<PendingRegistry>> {
     Ok(PendingRegistry::new(&RequesterConfiguration {
@@ -270,6 +286,6 @@ fn status(outcome: Result<(), SendFailure>) -> Result<Code> {
     match outcome {
         Ok(()) => Ok(Code::Ok),
         Err(SendFailure::Status(code)) => Ok(code),
-        Err(SendFailure::Unreachable) => bail!("the peer listener could not be reached at all"),
+        Err(failure) => bail!("the peer listener answered nothing at all: {failure}"),
     }
 }

@@ -4,9 +4,13 @@
 //! This directory is the only place in the crate that names tonic's transport,
 //! service, codec, metadata, health and reflection surface. One type is shared
 //! outside it — [`tonic::Code`] — because a gRPC status is the wire's own
-//! vocabulary for an outcome, and
-//! [`ResponseDisposition`](crate::response::ResponseDisposition) owns the
-//! mapping onto it.
+//! vocabulary for an outcome. Two rules are written in that vocabulary and stay
+//! outside: [`ResponseDisposition`](crate::response::ResponseDisposition) maps
+//! each outcome onto a status, and
+//! [`SendFailure::is_ambiguous`](crate::router::SendFailure::is_ambiguous)
+//! reads the status a destination answered to decide whether to try again. A
+//! status enum of this crate's own would translate at both ends and say
+//! nothing more, so the code itself travels.
 //!
 //! The router carries no response vocabulary except here, at the wire seam it
 //! owns: the peer method's message *is* the response frame, so the frame, the
@@ -29,6 +33,7 @@
 pub(crate) mod client;
 pub(crate) mod codec;
 mod conn;
+mod counted;
 pub(crate) mod health;
 mod inject;
 pub(crate) mod service;
@@ -42,6 +47,7 @@ pub(crate) mod generated {
 mod tests;
 
 use self::conn::admitted;
+use self::counted::Counted;
 use self::generated::peer_server::PeerServer;
 use self::health::{PeerHealth, ProcessHealth};
 use self::service::PeerService;
@@ -59,7 +65,7 @@ use tonic::transport::Server;
 use tonic_health::pb::health_server::HealthServer;
 use tonic_reflection::server::{Builder as ReflectionBuilder, Error as ReflectionError};
 use tracing::error;
-use validator::{Validate, ValidationErrors};
+use validator::{Validate, ValidationError, ValidationErrors};
 
 /// The peer schema, embedded so reflection can publish it without a file.
 const DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/peer_descriptor.bin"));
@@ -88,11 +94,32 @@ const MAX_CONNECTIONS: usize = 4_096;
 /// may make this process hold.
 const MAX_STREAMS: u32 = 1_024;
 
+/// Most bytes of half-read frames one listener may commit to.
+///
+/// A stream holds the frame it is reading until the message completes, so what
+/// the listener commits to is the connection cap multiplied by the stream cap
+/// multiplied by what one stream buffers. Each of the three is plausible alone;
+/// the product is the memory, so the three are checked together. A quarter of
+/// the process's memory budget is what the peer port may take from the consumer
+/// that shares it. The listener accepts no compression, so a stream buffers one
+/// message rather than a compressed one and its expansion.
+const MAX_RECEIVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// What one stream buffers however small the frame ceiling is: the transport
+/// allocates its receive buffer before it can know the message's length, and
+/// grows it to the message from there.
+const STREAM_BUFFER_FLOOR: usize = 8 * 1024;
+
 /// Connections one listener holds when an operator sets no number.
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 /// Streams one connection opens by default.
-const DEFAULT_MAX_STREAMS: u32 = 64;
+///
+/// A destination's worker sends one response at a time, so a peer needs one
+/// stream per response type it sends this node, not one per response. The
+/// receive budget is spent on connections rather than on streams because a
+/// connection over the cap is refused where a stream over the cap only waits.
+const DEFAULT_MAX_STREAMS: u32 = 8;
 
 /// What this process's peer listener refused, and how often its service ran.
 ///
@@ -108,9 +135,11 @@ pub(crate) static TRANSPORT: TransportCounters = TransportCounters::new();
 /// Every field has a working default, so a process that serves peers needs no
 /// configuration at all. The per-message ceiling bounds one frame; the two
 /// concurrency caps bound how many of them can be in flight before any registry
-/// admission is consulted.
+/// admission is consulted; and [`MAX_RECEIVE_BYTES`] bounds what the three come
+/// to together.
 #[derive(Builder, Clone, Copy, Debug, Validate)]
 #[builder(setter(into), default)]
+#[validate(schema(function = "validate_receive_budget"))]
 pub(crate) struct TransportConfiguration {
     /// The address the listener binds. Port zero asks the operating system for
     /// one, and [`BoundListener`] is then the only place that port can be read.
@@ -139,11 +168,11 @@ pub(crate) struct TransportConfiguration {
 /// A listener that is already bound, the address it bound, and the
 /// configuration it was bound under.
 ///
-/// The address is the one the operating system assigned. There is no configured
-/// address to read from this type, so publishing a port nothing listens on is
-/// unwritable rather than merely discouraged. [`serve`] reads its caps from the
-/// configuration carried here, so serving a listener under caps nothing
-/// validated is unwritable in the same way.
+/// The address is the one the operating system assigned, and it is the only
+/// address this type will give up: a caller cannot reach the configured one, so
+/// registration can only publish a port something bound. [`serve`] reads its
+/// caps from the configuration carried here, so serving a listener under caps
+/// nothing validated is unwritable in the same way.
 pub(crate) struct BoundListener {
     listener: TcpListener,
     address: SocketAddr,
@@ -228,11 +257,11 @@ impl TransportCounters {
         self.refused_connections.load(Relaxed)
     }
 
-    /// How many frames the reader refused before the service could run.
+    /// How many frames the listener refused before the service could run.
     ///
-    /// A frame over the listener's configured ceiling is not one of them: the
-    /// transport refuses it before the reader sees it, and the `OUT_OF_RANGE`
-    /// the peer is answered is the signal for that refusal.
+    /// Both refusals are here: a frame the reader could not read, and one over
+    /// the configured ceiling, which the transport refuses above the reader and
+    /// [`Counted`] counts from its answer.
     pub(crate) fn rejected_frames(&self) -> u64 {
         self.rejected_frames.load(Relaxed)
     }
@@ -298,7 +327,9 @@ where
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .max_concurrent_streams(config.max_concurrent_streams)
-        .add_service(PeerServer::new(service).max_decoding_message_size(config.frame_cap.bytes()))
+        .add_service(Counted::new(
+            PeerServer::new(service).max_decoding_message_size(config.frame_cap.bytes()),
+        ))
         .add_service(
             HealthServer::new(PeerHealth::new(health))
                 .max_decoding_message_size(CONTROL_MESSAGE_BYTES),
@@ -312,6 +343,21 @@ where
             error!(%error, "the peer listener stopped with an error");
         }
     }))
+}
+
+/// Refuses caps whose product is more memory than one listener may commit to.
+///
+/// A product that overflows is over the ceiling by definition. See
+/// [`MAX_RECEIVE_BYTES`] for what the product buys.
+fn validate_receive_budget(config: &TransportConfiguration) -> Result<(), ValidationError> {
+    let each = config.frame_cap.bytes().max(STREAM_BUFFER_FLOOR) as u64;
+    let bytes = (config.max_connections as u64)
+        .checked_mul(u64::from(config.max_concurrent_streams))
+        .and_then(|streams| streams.checked_mul(each));
+    if bytes.is_none_or(|bytes| bytes > MAX_RECEIVE_BYTES) {
+        return Err(ValidationError::new("receive_budget"));
+    }
+    Ok(())
 }
 
 /// Why a peer listener could not be built or bound.
