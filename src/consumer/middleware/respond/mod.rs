@@ -11,8 +11,8 @@
 //! that exhausts its retries answers its requester while the attempts before it
 //! stay silent. The category rides the frame as a label only.
 //!
-//! [`responding_provider`] is the only way to build the layer, and it states
-//! what that placement guarantees.
+//! [`responding_provider`] is the only way to build the layer from outside this
+//! module, and it states what that placement guarantees.
 
 #![cfg_attr(
     not(test),
@@ -71,6 +71,9 @@ pub(crate) struct Responded<T> {
 ///
 /// A transparent error cannot hold a second field. This form preserves the
 /// inner display text and exposes the inner error as its source.
+///
+/// This sits beside [`Responded`] rather than at the end of the file: the two
+/// are one pair, the arms of one result.
 #[derive(Debug, Error)]
 #[error("{inner}")]
 pub(crate) struct RespondError<E> {
@@ -211,29 +214,35 @@ where
     where
         C2: EventContext<Payload = Self::Payload>,
     {
-        let (result, meta) = split(result);
+        let (result, meta) = match result {
+            Ok(Responded { inner, meta }) => (Ok(inner), meta),
+            Err(RespondError { inner, meta }) => (Err(inner), meta),
+        };
         let Some(meta) = meta else {
             return self.handler.after_commit(context, result).await;
         };
         let header = meta.header(self.responder.subsystem.clone(), status(&result));
         // Nothing is encoded here. The hook moves the typed result into the
         // slot. The worker encodes it against its own scratch.
-        if let Err(rejected) = self.responder.sender.send(header, result) {
+        if let Err(payload) = self.responder.sender.send(header, result) {
             // Nothing was sent or encoded. The handler still owns the result.
-            self.handler.after_commit(context, rejected.payload).await;
+            self.handler.after_commit(context, payload).await;
         }
     }
 
     /// Forwards a non-final invocation's result to the inner hook.
     ///
     /// Another invocation is coming for this event, so nothing is answered
-    /// here. The tag is dropped with the carrier, and this arm reaches no
-    /// sender at all.
+    /// here. This arm drops the tag with the carrier and never binds it, so it
+    /// holds nothing a frame header could be built from.
     async fn after_abort<C2>(&self, context: C2, result: Result<Self::Output, Self::Error>)
     where
         C2: EventContext<Payload = Self::Payload>,
     {
-        let (result, _tag) = split(result);
+        let result = match result {
+            Ok(Responded { inner, .. }) => Ok(inner),
+            Err(RespondError { inner, .. }) => Err(inner),
+        };
         self.handler.after_abort(context, result).await;
     }
 
@@ -265,8 +274,9 @@ where
 /// Terminates a middleware stack with a responding application handler.
 ///
 /// This is the mirror of [`HandlerMiddleware::into_provider`], and the only way
-/// to build the layer. It mints the chain's leaf adapter itself, so the layer
-/// always sits directly outside the application handler.
+/// to build the layer from outside this module. It mints the chain's leaf
+/// adapter itself, so the layer always sits directly outside the application
+/// handler.
 ///
 /// The layer wraps that adapter rather than the raw handler, because only the
 /// adapter classifies a result for the settlement boundary. The other nesting
@@ -291,17 +301,6 @@ where
         LeafHandler::new(handler),
         responder,
     )))
-}
-
-/// Takes one result apart into the inner handler's own result and the tag the
-/// carriers held.
-fn split<O, E>(
-    result: Result<Responded<O>, RespondError<E>>,
-) -> (Result<O, E>, Option<RequestTag>) {
-    match result {
-        Ok(Responded { inner, meta }) => (Ok(inner), meta),
-        Err(RespondError { inner, meta }) => (Err(inner), meta),
-    }
 }
 
 /// The label one result puts on its frame.

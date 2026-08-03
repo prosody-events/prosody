@@ -2,7 +2,6 @@
 //! per cell that serves every occupant of it, and no response unaccounted for.
 
 use super::{Harness, PUBLISHED_NODES, config, node, paused, port};
-use crate::response::sender::Refused;
 use color_eyre::Result;
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
@@ -47,20 +46,19 @@ fn prop_a_stream_of_many_nodes_stays_bounded_and_is_accounted_for(targets: Vec<u
             let index = target % PUBLISHED_NODES;
             match harness.send(index) {
                 Ok(()) => targeted.push(port(index)),
-                Err(Refused::Fleet(_)) => refused += 1,
-                Err(Refused::Queue) => {
-                    return TestResult::error("a slot was taken but the queue would not hold it");
-                }
+                Err(_) => refused += 1,
             }
             assert!(
                 fleet.live_count() <= CELLS,
                 "{} destinations are live, more than the {CELLS} cells the table has",
                 fleet.live_count()
             );
+            // A refusal the fleet did not count is the queue turning a response
+            // away after it held a slot, which cannot happen.
             assert_eq!(
                 fleet.refused(),
                 refused,
-                "every refusal must be counted, and nothing else"
+                "every refusal must be the fleet's own, and every one must be counted"
             );
             yield_now().await;
         }

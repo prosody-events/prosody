@@ -15,13 +15,12 @@ use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::{FrameCap, FrameHeader};
 use crate::router::directory::Endpoint;
 use crate::router::fleet::config::{FleetConfigurationError, validate_scratch_budget};
-use crate::router::fleet::{Destination, DestinationFleet, Refusal};
+use crate::router::fleet::{Destination, DestinationFleet};
 use crate::router::{Framed, ResponseSender, Router, SendFailure};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
-use thiserror::Error;
 use tokio::select;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
@@ -91,17 +90,6 @@ struct Job<C: Codec> {
     expires_at: Instant,
 }
 
-/// A response the sender could not take.
-///
-/// The sender returns the payload so its caller can dispose of it. Nothing is
-/// encoded for a refused response.
-pub(crate) struct Rejected<P> {
-    /// Which refusal this was. The counters give the rate of each class, while
-    /// this names the class for one response.
-    pub(crate) reason: Refused,
-    pub(crate) payload: P,
-}
-
 /// What one sender's deliveries came to.
 ///
 /// Every job a worker dequeues moves exactly one of these. A response the
@@ -168,22 +156,14 @@ impl<C: Codec> TypedSender<C> {
     ///
     /// # Errors
     ///
-    /// Returns the payload in a [`Rejected`] whose reason is
-    /// [`Refused::Fleet`] when the fleet refused a slot, or [`Refused::Queue`]
-    /// when the destination's queue could not take the job.
-    pub(crate) fn send(
-        &self,
-        header: FrameHeader,
-        payload: C::Payload,
-    ) -> Result<(), Rejected<C::Payload>> {
-        let reservation = match self.fleet.reserve(header.target) {
-            Ok(reservation) => reservation,
-            Err(refusal) => {
-                return Err(Rejected {
-                    reason: Refused::Fleet(refusal),
-                    payload,
-                });
-            }
+    /// Returns the payload, unencoded, when the fleet refused a slot or when
+    /// the destination's queue could not take the job. The caller owns the
+    /// result again and disposes of it. The rate of each refusal is already
+    /// counted: a fleet refusal by the fleet, a queue refusal by
+    /// [`SendCounters::dropped`].
+    pub(crate) fn send(&self, header: FrameHeader, payload: C::Payload) -> Result<(), C::Payload> {
+        let Ok(reservation) = self.fleet.reserve(header.target) else {
+            return Err(payload);
         };
         // The cell a reservation names is one of this fleet's, and this
         // sender's queues are the same fleet's length.
@@ -207,11 +187,7 @@ impl<C: Codec> TypedSender<C> {
                 // the returned job releases its slot. This is the one drop that
                 // no dequeued job accounts for.
                 self.counters.dropped.fetch_add(1, Relaxed);
-                let job = error.into_inner();
-                return Err(Rejected {
-                    reason: Refused::Queue,
-                    payload: job.payload,
-                });
+                return Err(error.into_inner().payload);
             }
             Ok(())
         })
@@ -379,16 +355,4 @@ async fn deliver<S: ResponseSender, F: Framed + Sync>(
         }
     }
     outcome
-}
-
-/// Why a response could not be queued.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(crate) enum Refused {
-    /// The fleet refused a send slot.
-    #[error(transparent)]
-    Fleet(#[from] Refusal),
-
-    /// The destination's queue could not take the response.
-    #[error("the destination's queue could not take the response")]
-    Queue,
 }

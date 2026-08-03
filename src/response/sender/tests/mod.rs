@@ -1,7 +1,7 @@
 //! What the typed sender's own suites share: a router over an in-process
 //! transport, and a harness that records every attempt it makes.
 
-use super::{Refused, TypedSender};
+use super::TypedSender;
 use crate::error::ErrorCategory;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader};
@@ -73,21 +73,23 @@ impl Harness {
     }
 
     /// Queues one response for `index`, and counts it when it was queued.
-    pub(super) fn send(&self, index: u8) -> Result<(), Refused> {
-        let queued = self
-            .sender
-            .send(
-                FrameHeader {
-                    target: node(index),
-                    ..self.header.clone()
-                },
-                PAYLOAD.to_vec(),
-            )
-            .map_err(|rejected| rejected.reason);
-        if queued.is_ok() {
-            self.queued.set(self.queued.get() + 1);
+    ///
+    /// A refusal hands the payload back. These suites never need it again, so a
+    /// refusal reads as an error here and the fleet's own counter names which
+    /// class it was.
+    pub(super) fn send(&self, index: u8) -> Result<()> {
+        let queued = self.sender.send(
+            FrameHeader {
+                target: node(index),
+                ..self.header.clone()
+            },
+            PAYLOAD.to_vec(),
+        );
+        if queued.is_err() {
+            bail!("the sender refused the response");
         }
-        queued
+        self.queued.set(self.queued.get() + 1);
+        Ok(())
     }
 
     /// The next attempt the transport recorded.
@@ -116,8 +118,8 @@ impl Harness {
     /// is complete without waiting on a clock.
     ///
     /// Every queued response then ends as exactly one of sent or dropped. The
-    /// one drop these suites cannot produce is [`Refused::Queue`], which needs
-    /// a worker to end between the reservation and the queue.
+    /// one drop these suites cannot produce is a queue refusal, which needs a
+    /// worker to end between the reservation and the queue.
     pub(super) async fn drain(self) -> Result<Drained> {
         let Self {
             router,
