@@ -48,6 +48,9 @@ const SETTINGS_ACK: u8 = 0x01;
 /// The SETTINGS parameter that carries the stream cap.
 const MAX_CONCURRENT_STREAMS: u16 = 0x03;
 
+/// The SETTINGS parameter that carries the per-stream receive window.
+const INITIAL_WINDOW_SIZE: u16 = 0x04;
+
 /// Bytes in one HTTP/2 frame header.
 const FRAME_HEADER_BYTES: usize = 9;
 
@@ -58,9 +61,28 @@ const SETTING_BYTES: usize = 6;
 /// cap can only have come from the configuration.
 const STREAM_CAP: u32 = 3;
 
-/// Streams that fit the receive budget at the smallest frame ceiling only if a
-/// stream is assumed to buffer that ceiling and nothing more.
+/// The frame ceiling the announced-caps case configures. Above what one stream
+/// buffers by default and unequal to any library default, so an announced
+/// window can only have come from this ceiling.
+const WINDOW_CAP: usize = 32 * 1024;
+
+/// Connections and streams that fit the receive budget at the smallest frame
+/// ceiling only if a stream is assumed to buffer that ceiling and nothing more.
+const FLOOR_CONNECTIONS: usize = 2_048;
+
+/// Streams beside [`FLOOR_CONNECTIONS`].
 const FLOOR_STREAMS: u32 = 64;
+
+/// Connections and streams whose single-copy product is inside the receive
+/// budget but whose peak is not.
+const PEAK_CONNECTIONS: usize = 256;
+
+/// Streams beside [`PEAK_CONNECTIONS`].
+const PEAK_STREAMS: u32 = 8;
+
+/// One stream per connection, so a connection buffers far less than HTTP/2
+/// grants it anyway.
+const SPARSE_STREAMS: u32 = 1;
 
 /// How long the silence case waits for a connection the listener must close.
 ///
@@ -68,6 +90,12 @@ const FLOOR_STREAMS: u32 = 64;
 /// always comes first. It is the hang guard, never the assertion: a connection
 /// that is never closed fails this test instead of hanging it.
 const SILENCE_GUARD: Duration = Duration::from_hours(1);
+
+/// What one connection read out of the server's opening SETTINGS frame.
+struct Announced {
+    streams: Option<u32>,
+    window: Option<u32>,
+}
 
 /// A listener bound to port zero publishes the port the operating system
 /// assigned, because that is the only port registration can read.
@@ -205,13 +233,16 @@ async fn a_connection_that_falls_silent_is_closed() -> Result<()> {
 }
 
 /// The caps an operator configured are the caps the listener serves under: it
-/// announces the stream cap to every peer that connects, and it holds no more
-/// connections than it was given.
+/// announces the stream cap and a receive window from its own frame ceiling to
+/// every peer that connects, and it holds no more connections than it was
+/// given.
 ///
-/// Both are read off a real socket rather than off the configuration, so a cap
-/// that never reaches the server is a red test. The first connection is the one
-/// that reads the announcement, which is also what proves it holds the only
-/// permit while the second one is refused.
+/// All three are read off a real socket rather than off the configuration, so a
+/// cap that never reaches the server is a red test. The window matters most
+/// here, because the transport leaves it at a megabyte per stream when nothing
+/// sets it and no configuration field reaches that default. The first
+/// connection is the one that reads the announcement, which is also what proves
+/// it holds the only permit while the second one is refused.
 #[test]
 fn the_listener_serves_the_caps_it_was_configured_with() -> Result<()> {
     init_test_logging();
@@ -219,19 +250,25 @@ fn the_listener_serves_the_caps_it_was_configured_with() -> Result<()> {
         let harness = Harness::with(Ok(TransportConfiguration {
             max_connections: 1,
             max_concurrent_streams: STREAM_CAP,
-            ..transport(FRAME_CAP)?
+            ..transport(WINDOW_CAP)?
         }))
         .await?;
         let port = harness.address.port;
         let refused = TRANSPORT.refused_connections();
         let outcome = async {
-            let (held, advertised) = select! {
+            let (held, announced) = select! {
                 settled = settled(port) => settled?,
                 () = sleep(HANG_GUARD) => bail!("the listener announced no settings"),
             };
             ensure!(
-                advertised == Some(STREAM_CAP),
-                "the listener must announce the configured stream cap, not {advertised:?}"
+                announced.streams == Some(STREAM_CAP),
+                "the listener must announce the configured stream cap, not {:?}",
+                announced.streams
+            );
+            ensure!(
+                announced.window == Some(u32::try_from(WINDOW_CAP)?),
+                "the listener must announce a receive window from its own frame ceiling, not {:?}",
+                announced.window
             );
             let mut over_the_cap = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
             let mut byte = [0u8; 1];
@@ -301,6 +338,11 @@ fn a_transport_configuration_with_no_cap_is_refused() -> Result<()> {
 /// Caps that are each inside their own range can still ask for more memory than
 /// one listener may hold, so the product is refused. The defaults are inside
 /// that budget, which is what makes a listener with no configuration usable.
+///
+/// Each case names one term of the peak the budget is checked against, and each
+/// fits without that term: the copies a stream holds beyond the one it
+/// assembles, the window HTTP/2 grants a connection whatever its streams
+/// buffer, and the floor under what one stream buffers.
 #[test]
 fn a_transport_configuration_over_the_receive_budget_is_refused() -> Result<()> {
     let refused = TransportConfiguration::builder()
@@ -312,8 +354,26 @@ fn a_transport_configuration_over_the_receive_budget_is_refused() -> Result<()> 
         refused.validate().is_err(),
         "caps whose product is over the receive budget must be refused"
     );
-    let floor = TransportConfiguration::builder()
+    let peaked = TransportConfiguration::builder()
+        .max_connections(PEAK_CONNECTIONS)
+        .max_concurrent_streams(PEAK_STREAMS)
+        .frame_cap(FrameCap::DEFAULT)
+        .build()?;
+    ensure!(
+        peaked.validate().is_err(),
+        "caps that fit only while a stream is counted once must be refused"
+    );
+    let sparse = TransportConfiguration::builder()
         .max_connections(super::super::MAX_CONNECTIONS)
+        .max_concurrent_streams(SPARSE_STREAMS)
+        .frame_cap(FrameCap::new(FrameCap::MIN_BYTES)?)
+        .build()?;
+    ensure!(
+        sparse.validate().is_err(),
+        "a connection holds the window HTTP/2 grants it, however little it buffers"
+    );
+    let floor = TransportConfiguration::builder()
+        .max_connections(FLOOR_CONNECTIONS)
         .max_concurrent_streams(FLOOR_STREAMS)
         .frame_cap(FrameCap::new(FrameCap::MIN_BYTES)?)
         .build()?;
@@ -329,9 +389,9 @@ fn a_transport_configuration_over_the_receive_budget_is_refused() -> Result<()> 
 }
 
 /// Connects, completes the client's half of the HTTP/2 handshake, and reports
-/// the stream cap the server announced together with the connection that read
-/// it. The connection is returned so a caller can hold the permit it took.
-async fn settled(port: u16) -> Result<(TcpStream, Option<u32>)> {
+/// what the server announced together with the connection that read it. The
+/// connection is returned so a caller can hold the permit it took.
+async fn settled(port: u16) -> Result<(TcpStream, Announced)> {
     let mut socket = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
     socket.write_all(PREFACE).await?;
     loop {
@@ -341,8 +401,13 @@ async fn settled(port: u16) -> Result<(TcpStream, Option<u32>)> {
         let mut payload = vec![0u8; length];
         socket.read_exact(&mut payload).await?;
         if kind == SETTINGS_FRAME && flags & SETTINGS_ACK == 0 {
-            let cap = payload.chunks_exact(SETTING_BYTES).find_map(stream_cap);
-            return Ok((socket, cap));
+            return Ok((
+                socket,
+                Announced {
+                    streams: setting(&payload, MAX_CONCURRENT_STREAMS),
+                    window: setting(&payload, INITIAL_WINDOW_SIZE),
+                },
+            ));
         }
     }
 }
@@ -354,12 +419,14 @@ fn frame_head(head: [u8; FRAME_HEADER_BYTES]) -> Result<(usize, u8, u8)> {
     Ok((length, kind, flags))
 }
 
-/// The stream cap one SETTINGS entry carries, or `None` for any other setting.
-fn stream_cap(entry: &[u8]) -> Option<u32> {
-    let (id, value) = entry.split_at_checked(2)?;
-    let id = u16::from_be_bytes(id.try_into().ok()?);
-    let value = u32::from_be_bytes(value.try_into().ok()?);
-    (id == MAX_CONCURRENT_STREAMS).then_some(value)
+/// The value one SETTINGS payload announced for `wanted`, when it announced it.
+fn setting(payload: &[u8], wanted: u16) -> Option<u32> {
+    payload.chunks_exact(SETTING_BYTES).find_map(|entry| {
+        let (id, value) = entry.split_at_checked(2)?;
+        let id = u16::from_be_bytes(id.try_into().ok()?);
+        let value = u32::from_be_bytes(value.try_into().ok()?);
+        (id == wanted).then_some(value)
+    })
 }
 
 /// Opens the reflection method with no request messages and reports the status

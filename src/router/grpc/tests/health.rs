@@ -1,6 +1,6 @@
 //! What the gRPC health service answers, and whose verdict it is.
 
-use super::TestHealth;
+use super::{Harness, TestHealth};
 use crate::consumer::Managers;
 use crate::consumer::probes::ProbeServer;
 use crate::heartbeat::HeartbeatRegistry;
@@ -14,9 +14,11 @@ use reqwest::Client;
 use reqwest::StatusCode;
 use serde_json::Value;
 use std::sync::Arc;
+use tonic::transport::Endpoint as Dialled;
 use tonic::{Code, Request};
 use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_check_response::ServingStatus;
+use tonic_health::pb::health_client::HealthClient;
 use tonic_health::pb::health_server::Health;
 
 /// A name this listener serves nothing under.
@@ -92,6 +94,43 @@ fn the_two_health_surfaces_agree() -> Result<()> {
     })
 }
 
+/// `grpc.health.v1` is routed on the peer port itself, not merely built.
+///
+/// A generic client dials the shared listener and reads all three answers off
+/// the socket: the process, the peer service, and a name nothing serves. A
+/// listener that never added the health service answers `UNIMPLEMENTED` to the
+/// first of them, which no other test would see.
+#[test]
+fn the_health_service_answers_on_the_peer_port() -> Result<()> {
+    init_test_logging();
+    TEST_RUNTIME.block_on(async {
+        let harness = Harness::shared().await?;
+        let channel = Dialled::from_shared(format!("http://127.0.0.1:{}", harness.address.port))?
+            .connect_lazy();
+        let mut client = HealthClient::new(channel);
+        for name in ["", SERVICE_NAME] {
+            let answered = client.check(request(name)).await?.into_inner().status;
+            ensure!(
+                answered == i32::from(ServingStatus::Serving),
+                "the listener serves a ready and live process, so {name:?} must be SERVING"
+            );
+        }
+        let refused = client.check(request(UNSERVED)).await;
+        ensure!(
+            matches!(&refused, Err(status) if status.code() == Code::NotFound),
+            "a name this listener does not serve must be NOT_FOUND over the wire"
+        );
+        Ok(())
+    })
+}
+
+/// One health request for `service`.
+fn request(service: &str) -> HealthCheckRequest {
+    HealthCheckRequest {
+        service: service.to_owned(),
+    }
+}
+
 /// The status one HTTP probe answered.
 async fn probe(port: u16, path: &str) -> Result<StatusCode> {
     Ok(Client::new()
@@ -104,10 +143,7 @@ async fn probe(port: u16, path: &str) -> Result<StatusCode> {
 /// The serving status one `Check` answered, or `None` when the name is not
 /// served here.
 async fn check<H: Health>(health: &H, service: &str) -> Result<Option<i32>> {
-    let request = Request::new(HealthCheckRequest {
-        service: service.to_owned(),
-    });
-    match health.check(request).await {
+    match health.check(Request::new(request(service))).await {
         Ok(response) => Ok(Some(response.into_inner().status)),
         Err(status) if status.code() == Code::NotFound => Ok(None),
         Err(status) => Err(status.into()),

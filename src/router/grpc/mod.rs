@@ -96,10 +96,13 @@ const MAX_STREAMS: u32 = 1_024;
 
 /// Most bytes of half-read frames one listener may commit to.
 ///
-/// A stream holds the frame it is reading until the message completes, so what
-/// the listener commits to is the connection cap multiplied by the stream cap
-/// multiplied by what one stream buffers. Each of the three is plausible alone;
-/// the product is the memory, so the three are checked together. A quarter of
+/// Three copies of one message are live at the peak of a delivery: the bytes
+/// HTTP/2 admits before the transport reads them, the message the transport
+/// assembles from them, and the one right-sized copy the reader takes. So what
+/// the listener commits to is the connection cap multiplied by that peak, and
+/// [`serve`] sets the HTTP/2 windows from the same peak rather than leaving
+/// them at a library default no configuration reaches. Each cap is plausible
+/// alone; the product is the memory, so they are checked together. A quarter of
 /// the process's memory budget is what the peer port may take from the consumer
 /// that shares it. The listener accepts no compression, so a stream buffers one
 /// message rather than a compressed one and its expansion.
@@ -110,8 +113,23 @@ const MAX_RECEIVE_BYTES: u64 = 256 * 1024 * 1024;
 /// grows it to the message from there.
 const STREAM_BUFFER_FLOOR: usize = 8 * 1024;
 
+/// The connection window HTTP/2 grants before either end asks for another.
+///
+/// A listener cannot ask for less. A window is granted by not being taken back,
+/// so a smaller configured one is never grown to rather than being enforced.
+/// This is therefore the floor under what one connection holds, whatever the
+/// caps come to.
+const SPEC_CONNECTION_WINDOW: u64 = 65_535;
+
+/// The largest window HTTP/2 can carry.
+const MAX_WINDOW: u32 = u32::MAX >> 1;
+
 /// Connections one listener holds when an operator sets no number.
-const DEFAULT_MAX_CONNECTIONS: usize = 256;
+///
+/// One peer holds one connection, so this is how many peers may answer this
+/// node at once. It is well above the destinations one process dials by
+/// default, and it keeps the default caps inside [`MAX_RECEIVE_BYTES`].
+const DEFAULT_MAX_CONNECTIONS: usize = 128;
 
 /// Streams one connection opens by default.
 ///
@@ -294,9 +312,11 @@ impl TransportCounters {
 /// This is the one place the peer server is built. Transport security and peer
 /// authorization are designed separately, and they attach here.
 ///
-/// Only the stream cap is set per connection: for a unary method a concurrency
-/// limit beside it would bound service execution inside a connection h2 already
-/// limits to that many streams.
+/// The stream cap and the two HTTP/2 windows are what one connection is held
+/// to, and the windows come from the same peak [`MAX_RECEIVE_BYTES`] is checked
+/// against. No concurrency limit is set beside them: for a unary method it
+/// would bound service execution inside a connection HTTP/2 already limits to
+/// that many streams.
 ///
 /// # Errors
 ///
@@ -327,6 +347,8 @@ where
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .max_concurrent_streams(config.max_concurrent_streams)
+        .initial_stream_window_size(window(stream_bytes(&config)))
+        .initial_connection_window_size(window(connection_bytes(&config)))
         .add_service(Counted::new(
             PeerServer::new(service).max_decoding_message_size(config.frame_cap.bytes()),
         ))
@@ -345,16 +367,40 @@ where
     }))
 }
 
+/// What one stream may buffer: the frame ceiling, or the floor under it.
+fn stream_bytes(config: &TransportConfiguration) -> u64 {
+    config.frame_cap.bytes().max(STREAM_BUFFER_FLOOR) as u64
+}
+
+/// What the streams of one connection may buffer together.
+fn connection_bytes(config: &TransportConfiguration) -> u64 {
+    u64::from(config.max_concurrent_streams).saturating_mul(stream_bytes(config))
+}
+
+/// What one connection may make this process hold at its peak: the two buffers
+/// the transport fills per stream, and the HTTP/2 window granted beside them.
+fn connection_peak(config: &TransportConfiguration) -> u64 {
+    let buffered = connection_bytes(config);
+    buffered
+        .saturating_mul(2)
+        .saturating_add(buffered.max(SPEC_CONNECTION_WINDOW))
+}
+
+/// One HTTP/2 window, held to the largest the protocol can carry.
+///
+/// A configuration the receive budget accepts is far under that ceiling, so the
+/// clamp states a fact of the type rather than one of the caller.
+fn window(bytes: u64) -> u32 {
+    bytes.min(u64::from(MAX_WINDOW)) as u32
+}
+
 /// Refuses caps whose product is more memory than one listener may commit to.
 ///
-/// A product that overflows is over the ceiling by definition. See
+/// Arithmetic that saturates is over the ceiling by definition. See
 /// [`MAX_RECEIVE_BYTES`] for what the product buys.
 fn validate_receive_budget(config: &TransportConfiguration) -> Result<(), ValidationError> {
-    let each = config.frame_cap.bytes().max(STREAM_BUFFER_FLOOR) as u64;
-    let bytes = (config.max_connections as u64)
-        .checked_mul(u64::from(config.max_concurrent_streams))
-        .and_then(|streams| streams.checked_mul(each));
-    if bytes.is_none_or(|bytes| bytes > MAX_RECEIVE_BYTES) {
+    let bytes = (config.max_connections as u64).saturating_mul(connection_peak(config));
+    if bytes > MAX_RECEIVE_BYTES {
         return Err(ValidationError::new("receive_budget"));
     }
     Ok(())

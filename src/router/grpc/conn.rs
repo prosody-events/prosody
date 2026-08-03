@@ -29,12 +29,16 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///
 /// This is the backstop under the HTTP/2 keepalive, not a copy of it: the
 /// keepalive can only bound a connection that already exists, so a peer that
-/// connects and never completes the HTTP/2 handshake would otherwise hold its
-/// admission permit for the life of the process. A peer that did complete it
-/// answers the listener's ping once every
+/// connects and then stops would otherwise hold its admission permit for the
+/// life of the process. A peer that did complete the handshake answers the
+/// listener's ping once every
 /// [`KEEPALIVE_INTERVAL`](super::KEEPALIVE_INTERVAL), and that answer is a
 /// read, so two intervals always contain one and this deadline never reaches a
 /// live connection.
+///
+/// It bounds silence alone. Any read restarts the period, so a peer that keeps
+/// sending bytes without ever completing the handshake stays admitted, and what
+/// bounds those is the connection cap rather than this deadline.
 const SILENCE_TIMEOUT: Duration = super::KEEPALIVE_INTERVAL.saturating_mul(2);
 
 /// One connection the listener admitted.
@@ -137,9 +141,9 @@ impl AsyncWrite for Admitted {
 ///
 /// A connection over the cap is closed at once and counted, so nothing
 /// unbounded waits for a permit. The permit is released when the connection's
-/// task ends and drops it. A peer that stops answering — because it died
-/// without a FIN, or because it never spoke HTTP/2 at all — is closed by the
-/// listener's keepalive or by [`SILENCE_TIMEOUT`] under it.
+/// task ends and drops it. A peer that stops sending — because it died without
+/// a FIN, or because it never spoke HTTP/2 at all — is closed by the listener's
+/// keepalive or by [`SILENCE_TIMEOUT`] under it.
 ///
 /// The stream never yields an error. tonic reads one as an accept failure and
 /// keeps looping, so a persistent failure would spin the accept path; a failed

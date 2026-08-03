@@ -19,7 +19,7 @@ use super::health::ProcessHealth;
 use super::service::PeerService;
 use super::{BoundListener, TransportConfiguration, serve};
 use crate::codec::Codec;
-use crate::requester::config::RequesterConfiguration;
+use crate::requester::config::{MAX_IN_FLIGHT, RequesterConfiguration};
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
@@ -235,8 +235,15 @@ pub(super) fn fleet(destinations: usize) -> Result<DestinationFleet> {
 }
 
 /// A registry with a response ceiling below the frame ceiling.
+///
+/// Admission is the registry's own ceiling rather than its default. These
+/// suites register without a waiter guard, so nothing removes an entry inside a
+/// run, and the property below registers one per iteration under a count the
+/// environment raises. At the ceiling no run over a real socket can exhaust it,
+/// so the property fails on its subject rather than on admission.
 pub(super) fn registry() -> Result<Arc<PendingRegistry>> {
     Ok(PendingRegistry::new(&RequesterConfiguration {
+        max_in_flight: MAX_IN_FLIGHT,
         max_response_bytes: MAX_RESPONSE_BYTES,
         ..RequesterConfiguration::default()
     })?)

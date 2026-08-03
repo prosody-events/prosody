@@ -7,7 +7,7 @@ use std::time::Duration;
 use validator::{Validate, ValidationError};
 
 /// Most requests one process may hold at once.
-pub(in crate::requester) const MAX_IN_FLIGHT: usize = 65_536;
+pub(crate) const MAX_IN_FLIGHT: usize = 65_536;
 
 /// Shortest timeout one request may ask for.
 pub(in crate::requester) const MIN_TIMEOUT: Duration = Duration::from_millis(1);
