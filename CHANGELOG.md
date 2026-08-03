@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/prosody-events/prosody/compare/prosody-v0.5.0...prosody-v0.6.0) (2026-08-03)
+
+
+### Features
+
+* **state:** expose published keyed state ([#51](https://github.com/prosody-events/prosody/issues/51)) ([1add1b7](https://github.com/prosody-events/prosody/commit/1add1b742a4118142ea536b96d3dc8237ae16897))
+* **tracing:** retain OTel provider handles and add flush/shutdown ([#49](https://github.com/prosody-events/prosody/issues/49)) ([e9b492f](https://github.com/prosody-events/prosody/commit/e9b492fc6c75bafce4d28bbea205aebf5baaa2d3))
+
 ## [0.5.0](https://github.com/prosody-events/prosody/compare/prosody-v0.4.0...prosody-v0.5.0) (2026-07-21)
 
 
