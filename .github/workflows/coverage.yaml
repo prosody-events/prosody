@@ -12,9 +12,27 @@ permissions:
   pages: write
   id-token: write
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      infra: ${{ steps.rail.outputs.infra }}
+      test: ${{ steps.rail.outputs.test }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Plan affected work
+        id: rail
+        uses: loadingalias/cargo-rail-action@ebc8ef2740efefe2cd5c42826344a8f1213113ae # v6
+        with:
+          since: ${{ github.event.before }}
+
   coverage:
     name: Test Coverage
+    needs: plan
+    if: needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
     services:
       kafka:
         image: apache/kafka:latest
@@ -49,6 +67,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+      - name: Install mold
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+        with:
+          make-default: false
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@v1.6.0
         with:
