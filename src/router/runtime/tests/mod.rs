@@ -178,7 +178,7 @@ impl Process {
         Ok(Self {
             shared: Shared {
                 fleet: Arc::clone(runtime.fleet()),
-                pending: runtime.pending(),
+                pending: Arc::clone(runtime.pending()),
                 counters: sender.counters(),
                 destination,
                 barrier,

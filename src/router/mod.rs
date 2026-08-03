@@ -25,6 +25,11 @@ pub(crate) mod grpc;
 pub(crate) mod loopback;
 pub(crate) mod runtime;
 
+/// Inline capacity of an operator-configured label. One byte holds the length,
+/// so a label of `LABEL_CAPACITY - 1` bytes never reaches the heap — which is
+/// what keeps a resolved address off the response path's allocator.
+pub(crate) const LABEL_CAPACITY: usize = 64;
+
 /// The host a node publishes for its peers to dial. Any ordinary hostname or
 /// address stays inline; a longer one spills to the heap.
 #[cfg_attr(
@@ -35,7 +40,7 @@ pub(crate) mod runtime;
                   both are exercised by this module's tests"
     )
 )]
-pub(crate) type Host = Flexstr<64>;
+pub(crate) type Host = Flexstr<LABEL_CAPACITY>;
 
 /// Identifies one live prosody process.
 ///
@@ -134,8 +139,8 @@ pub(crate) trait Router: Clone + Send + Sync + 'static {
     not(test),
     expect(
         dead_code,
-        reason = "the respond layer is this type's production caller; it is exercised by this \
-                  module's tests"
+        reason = "no production caller yet: the respond layer will own this; every item here is \
+                  exercised by this module's tests"
     )
 )]
 pub(crate) struct RouterHandle<S> {
@@ -150,11 +155,11 @@ impl NodeId {
         not(test),
         expect(
             dead_code,
-            reason = "the process runtime is production-dead until consumer wiring owns it; this \
-                      constructor is exercised by this module's tests"
+            reason = "no production caller yet: consumer wiring will own the process runtime; \
+                      every item here is exercised by this module's tests"
         )
     )]
-    pub(crate) fn new() -> Self {
+    pub(in crate::router) fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
@@ -200,8 +205,8 @@ impl<S> Clone for RouterHandle<S> {
     not(test),
     expect(
         dead_code,
-        reason = "the process runtime is production-dead until consumer wiring owns it; this \
-                  constructor is exercised by this module's tests"
+        reason = "no production caller yet: the respond layer will own this; every item here is \
+                  exercised by this module's tests"
     )
 )]
 impl<S> RouterHandle<S> {

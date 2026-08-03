@@ -18,8 +18,8 @@
     not(test),
     expect(
         dead_code,
-        reason = "the consumer wiring that hands a consumer its peer runtime is this module's \
-                  production caller; every item here is exercised by this module's tests"
+        reason = "no production caller yet: the consumer wiring that hands a consumer its peer \
+                  runtime will own this; every item here is exercised by this module's tests"
     )
 )]
 
@@ -108,8 +108,8 @@ impl<C: Codec> Responder<C> {
 
     /// Waits until all queued responses finish.
     ///
-    /// The process runtime calls this from its shutdown drain closure. It calls
-    /// the closure after the fleet admission gate drains.
+    /// Call this from the shutdown drain closure, which runs once the fleet
+    /// admission gate has closed and emptied.
     ///
     /// This takes the responder by value, and every partition handler holds a
     /// clone behind an [`Arc`]. So the drain can start only after the last
@@ -305,9 +305,8 @@ where
 
 /// The label one result puts on its frame.
 ///
-/// The category labels a frame and never gates a send. Which apply hook fired
-/// decides whether a response happens at all. A category test here would turn
-/// retry exhaustion into a silent timeout for the requester.
+/// The category labels a frame and never gates a send. A category test here
+/// would turn retry exhaustion into a silent timeout for the requester.
 fn status<O, E: ClassifyError>(result: &Result<O, E>) -> ResponseStatus {
     match result {
         Ok(_) => ResponseStatus::Success,

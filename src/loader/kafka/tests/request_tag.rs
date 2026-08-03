@@ -33,7 +33,7 @@ async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
 
     with_topic("request_tag", async |topic_name| {
         let id = RequestId::new();
-        let node = NodeId::new();
+        let node = NodeId::from_bytes([7; 16]);
         let (id_text, node_text) = (id.to_string(), node.to_string());
         let producer = producer()?;
 

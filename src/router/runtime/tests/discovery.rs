@@ -49,7 +49,9 @@ fn prop_the_direct_endpoint_publishes_only_what_it_discovered(label: u8, port: u
         );
         ensure!(
             registration.direct.port == bound.address().port(),
-            "the direct endpoint did not publish the bound port"
+            "the direct endpoint published port {}, not the {} the listener bound",
+            registration.direct.port,
+            bound.address().port()
         );
         ensure!(
             registration.direct.host != Host::make(&host),
@@ -108,7 +110,10 @@ fn the_direct_host_is_the_routed_address_then_this_machine() -> Result<()> {
             routed != registration.hostname,
             "the two discovery sources must differ for this test"
         );
-        assert_eq!(registration.direct.host, routed);
+        assert_eq!(
+            registration.direct.host, routed,
+            "the direct endpoint must publish the routed address while the probe answers"
+        );
 
         let unrouted = discover_registration(NodeId::new(), &bound, "no-port-here", &config, None)?;
         assert_eq!(unrouted.direct.host, unrouted.hostname);

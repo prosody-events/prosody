@@ -5,7 +5,7 @@
     not(test),
     expect(
         dead_code,
-        reason = "the consumer wiring is this module's production caller; every item here is \
+        reason = "no production caller yet: consumer wiring will own this; every item here is \
                   exercised by this module's tests"
     )
 )]
@@ -41,8 +41,6 @@ use whoami::hostname;
 
 mod config;
 
-#[cfg(test)]
-use self::config::MAX_ADDRESS_CACHE_CAPACITY;
 pub(crate) use self::config::RouterConfiguration;
 
 #[cfg(test)]
@@ -53,9 +51,9 @@ mod tests;
 /// The runtime holds this node's registration, the resolver it reads peers
 /// through, the bound listener, the destination fleet, the pending request
 /// registry, and the transport responses leave by. Consumers and requesters
-/// take handles from it and construct none of these themselves. It mints this
-/// process's [`NodeId`] once, and the listener answers for that same id, so one
-/// process has one identity by construction.
+/// take handles from it and construct none of these themselves. It mints one
+/// [`NodeId`] and the listener answers for that same id, so one runtime has one
+/// identity. One process runs one runtime.
 ///
 /// The router names no response vocabulary except at the wire seam it owns.
 /// This type is inside that seam: the listener's service is the pending
@@ -88,9 +86,9 @@ pub(crate) struct PeerRuntime {
 
 /// Everything one peer runtime is built from.
 ///
-/// This type has no `Clone` implementation on purpose. One value serves one
-/// process, so two runtimes cannot come from one set of inputs without a
-/// second, grep-visible call to [`PeerRuntime::start`].
+/// The bound listener inside is a unique resource, so one value serves one
+/// process. Two runtimes need a second, grep-visible call to
+/// [`PeerRuntime::start`].
 pub(crate) struct PeerInputs<'a, H> {
     pub(crate) store: CassandraStore,
     /// The already-bound peer listener. The runtime serves this listener and
@@ -118,7 +116,9 @@ impl PeerRuntime {
     ///
     /// Returns [`PeerRuntimeError`] when the configuration, discovery, the
     /// directory, the registry, the fleet, or the listener refuses to start.
-    /// A failed first write stops the listener again before it returns.
+    /// A failed first write stops the listener again before it returns. It
+    /// issues no delete: a row the failed write still applied expires on its
+    /// lease.
     pub(crate) async fn start<H: ProcessHealth>(
         inputs: PeerInputs<'_, H>,
     ) -> Result<Self, PeerRuntimeError> {
@@ -143,7 +143,8 @@ impl PeerRuntime {
             async move { drop(stopped.await) },
         )?;
         if let Err(error) = directory.register(&registration).await {
-            return Err(abandon(stop_listener, listener, error.into()).await);
+            abandon(stop_listener, listener).await;
+            return Err(error.into());
         }
         let (stop_refresh, mut stopped) = watch::channel(false);
         let refresh = tokio::spawn({
@@ -205,9 +206,9 @@ impl PeerRuntime {
         &self.fleet
     }
 
-    /// A handle to the process-wide pending registry.
-    pub(crate) fn pending(&self) -> Arc<PendingRegistry> {
-        Arc::clone(&self.pending)
+    /// The process-wide pending request registry.
+    pub(crate) const fn pending(&self) -> &Arc<PendingRegistry> {
+        &self.pending
     }
 
     /// The router every responder in this process sends through.
@@ -228,32 +229,22 @@ impl PeerRuntime {
     /// call runs it once the gate has closed and emptied, and nothing else
     /// calls it.
     ///
-    /// The order, and why each step is where it is:
+    /// The body reads as the order. Three of its steps are where they are for a
+    /// reason the code cannot show:
     ///
-    /// 1. Stop the refresher, join it, then delete this node's rows. The join
-    ///    comes first: a refresh that landed after the delete would republish
-    ///    this node under a fresh lease and outlive the process. The delete's
-    ///    outcome is returned, but every later step runs whatever it was — a
-    ///    failed delete heals on the lease, and an abandoned teardown does not.
-    /// 2. Signal the listener to stop accepting new connections. Tonic's
-    ///    graceful shutdown lets an RPC already in flight run to completion.
-    ///    Its frame can still reach the registry after the next step. The
-    ///    registry refuses that frame.
-    /// 3. Move every open request to `ShuttingDown` and wake its waiter. This
-    ///    runs before the listener is joined: one long-lived inbound call could
-    ///    hold graceful shutdown open, and every parked caller would then wait
-    ///    behind it.
-    /// 4. Close the counted admission gate and wait for admitted hooks to
-    ///    leave.
-    /// 5. Run the response drain, which is only safe once nothing can reserve.
-    /// 6. Join the listener task.
-    ///
-    /// Closing the gate before the drain is the ordering that matters:
-    /// reversed, a hook could reserve a slot on a fleet whose workers had
-    /// already stopped, and its response would be dropped instead of
-    /// delivered. A flag could not give that — a hook can already sit
-    /// between its check and its reservation — so admission is counted and
-    /// the close waits for the count to reach zero.
+    /// - **Join the refresher before the delete.** A refresh that landed after
+    ///   the delete would republish this node under a fresh lease and outlive
+    ///   the process. The delete's outcome is returned, but every later step
+    ///   runs whatever it was — a failed delete heals on the lease, and an
+    ///   abandoned teardown does not.
+    /// - **Wake every parked request before the listener is joined.** One
+    ///   long-lived inbound call could hold tonic's graceful shutdown open, and
+    ///   every parked caller would then wait behind it. That call's own frame
+    ///   can still reach the registry afterwards, and the registry refuses it.
+    /// - **Close the gate before the drain.** Reversed, a hook could reserve a
+    ///   slot on a fleet whose workers had already stopped, and its response
+    ///   would be dropped instead of delivered. [`DestinationFleet`]'s counted
+    ///   admission is what makes that an order rather than a race.
     ///
     /// Drive this to completion. A dropped shutdown future stops between two
     /// steps, and the tasks the remaining steps would have joined detach.
@@ -275,9 +266,15 @@ impl PeerRuntime {
             refresh,
             stop_listener,
             listener,
-            ..
+            addresses,
+            transport,
         } = self;
 
+        // Neither needs a step: the resolver only reads, and every sender the
+        // drain flushes holds its own clone of the transport.
+        drop((addresses, transport));
+        // `send_replace` rather than `send`: a refresh task that already exited
+        // leaves no receiver, and that is not a failure.
         stop_refresh.send_replace(true);
         if let Err(error) = refresh.await {
             error!(%error, "node registration refresh task did not exit cleanly");
@@ -299,20 +296,15 @@ impl PeerRuntime {
     }
 }
 
-/// Stops the listener that this start served, then returns `error`.
+/// Stops the listener that this start served.
 ///
 /// A dropped handle leaves its task live. A retry could then fail to bind the
 /// same port.
-async fn abandon(
-    stop: oneshot::Sender<()>,
-    listener: JoinHandle<()>,
-    error: PeerRuntimeError,
-) -> PeerRuntimeError {
+async fn abandon(stop: oneshot::Sender<()>, listener: JoinHandle<()>) {
     drop(stop);
     if let Err(join_error) = listener.await {
         error!(%join_error, "the abandoned peer listener task did not exit cleanly");
     }
-    error
 }
 
 /// The local address the operating system would use to reach `contact`.

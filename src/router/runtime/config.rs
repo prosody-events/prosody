@@ -1,6 +1,7 @@
 //! What an operator sets for peer routing, and the rules that refuse a
 //! degenerate value at startup.
 
+use crate::router::LABEL_CAPACITY;
 use crate::router::directory::RegistrationTtl;
 use derive_builder::Builder;
 use validator::{Validate, ValidationError};
@@ -9,14 +10,15 @@ use validator::{Validate, ValidationError};
 const DEFAULT_ADDRESS_CACHE_CAPACITY: usize = 1024;
 
 /// Most peer registrations a process may hold at once. A registration is a few
-/// short strings, so a million of them is already more memory than the cache is
-/// worth; the bound stops a typo from asking for a heap the process lacks.
+/// short strings. A million of them is already more memory than the cache is
+/// worth. The bound stops a typo from asking for a heap the process lacks.
 pub(super) const MAX_ADDRESS_CACHE_CAPACITY: usize = 1_048_576;
 
-/// Longest label an operator can configure for a host or a network. The largest
-/// label that stays inline in [`Host`](crate::router::Host), so a configured
-/// label never reaches the heap.
-const MAX_LABEL_BYTES: usize = 63;
+/// Longest label an operator can configure for a host or a network. It is the
+/// largest label that stays inline in [`Host`](crate::router::Host) and
+/// [`NetworkId`](crate::router::directory::NetworkId), which both hold
+/// [`LABEL_CAPACITY`] bytes with one of them spent on the length.
+const MAX_LABEL_BYTES: usize = LABEL_CAPACITY - 1;
 
 /// What an operator sets for peer routing.
 ///
@@ -39,9 +41,9 @@ pub(crate) struct RouterConfiguration {
 
     /// The port to publish beside `advertised_host`. Unset publishes the
     /// listener's own port, which is what an entry point that forwards a port
-    /// unchanged wants. Set with no host beside it, the configuration is
-    /// refused. Zero is refused too: an advertised port is a port peers dial,
-    /// never a request for one the operating system chooses.
+    /// unchanged wants. Validation refuses a port with no host beside it. It
+    /// refuses port zero too: an advertised port is a port peers dial, never a
+    /// request for one the operating system chooses.
     #[validate(range(min = 1_u16))]
     pub(crate) advertised_port: Option<u16>,
 
@@ -54,7 +56,8 @@ pub(crate) struct RouterConfiguration {
     /// range, so a lease outside it never reaches a configuration at all.
     pub(crate) registration_ttl: RegistrationTtl,
 
-    /// How many peer registrations stay cached at once.
+    /// How many peer registrations stay cached at once, up to
+    /// [`MAX_ADDRESS_CACHE_CAPACITY`].
     #[validate(range(min = 1_usize, max = MAX_ADDRESS_CACHE_CAPACITY))]
     pub(crate) address_cache_capacity: usize,
 }
@@ -85,6 +88,10 @@ impl RouterConfiguration {
 /// A `length` rule cannot replace this one: `validator` counts characters,
 /// while [`MAX_LABEL_BYTES`] is the byte capacity that keeps a label inline in
 /// [`Host`](crate::router::Host).
+///
+/// Length and blankness are the only rules here, and a dialability rule does
+/// not belong beside them: an advertised host may be an IPv6 literal, so a rule
+/// that refused a colon would refuse a legal address.
 fn validate_label(label: &str) -> Result<(), ValidationError> {
     if label.is_empty() {
         return Err(ValidationError::new("label_empty"));

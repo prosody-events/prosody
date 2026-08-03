@@ -148,12 +148,13 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
 /// every generated mix of held reservations, queued responses and parked
 /// requests.
 ///
-/// The gate is what makes that an ordering rather than a race: a hook can
-/// already sit between a flag check and its reservation, so admission is
-/// counted, and the close waits for the count to reach zero. Every one of these
-/// is then true when shutdown returns: no reservation survives, every waiter
-/// was woken, every queued response was delivered, this node's rows are gone,
-/// and the listener's socket is closed.
+/// See [`PeerRuntime::shutdown`](super::super::PeerRuntime::shutdown) for why
+/// the gate closes before the drain.
+/// Every one of these is true when shutdown returns: no reservation survives,
+/// every parked request was released, every queued response was delivered, this
+/// node's rows are gone, and the listener's socket is closed. That a released
+/// request reports `ShuttingDown` to its caller is pinned by
+/// `shutdown_discards_partial_results`.
 #[test]
 fn prop_shutdown_leaves_no_registration_and_no_reservation() {
     /// Runs one generated schedule against live Cassandra and a real listener.
@@ -180,7 +181,7 @@ fn prop_shutdown_leaves_no_registration_and_no_reservation() {
                 let witness = Arc::clone(&witness);
                 move || async move {
                     witness.store(
-                        if fleet.is_closed() && fleet.admitted_now() == 0 {
+                        if fleet.is_closed() && fleet.tickets_held() == 0 {
                             CLOSED_AND_DRAINED
                         } else {
                             GATE_STILL_OPEN
@@ -211,7 +212,7 @@ fn prop_shutdown_leaves_no_registration_and_no_reservation() {
                 "the response drain began while a reservation still held the gate"
             );
             ensure!(
-                shared.fleet.admitted_now() == u64::try_from(hooks)?,
+                shared.fleet.tickets_held() == u64::try_from(hooks)?,
                 "the gate must still count every held reservation"
             );
 

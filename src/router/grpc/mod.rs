@@ -9,23 +9,20 @@
 //! each outcome onto a status, and
 //! [`SendFailure::is_ambiguous`](crate::router::SendFailure::is_ambiguous)
 //! reads the status a destination answered to decide whether to try again. A
-//! status enum of this crate's own would translate at both ends and say
-//! nothing more, so the code itself travels.
+//! status enum of this crate's own would need a translation at both ends and
+//! would say nothing more. So the gRPC code itself travels.
 //!
 //! The router carries no response vocabulary except here, at the wire seam it
 //! owns: the peer method's message *is* the response frame, so the frame, the
 //! subsystem it names and the registry that waits for it appear under this
 //! module and nowhere else in the router.
 
-// The `not(test)` gate is what makes this an *expectation* rather than a
-// blanket permission. It holds while the process runtime remains
-// production-dead before consumer wiring owns it.
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "the process runtime is this module's production caller; every item here is \
-                  exercised by this module's tests"
+        reason = "no production caller yet: consumer wiring will own the process runtime; every \
+                  item here is exercised by this module's and the process runtime's tests"
     )
 )]
 
@@ -114,10 +111,10 @@ const STREAM_BUFFER_FLOOR: usize = 8 * 1024;
 
 /// The connection window HTTP/2 grants before either end asks for another.
 ///
-/// A listener cannot ask for less. A window is granted by not being taken back,
-/// so a smaller configured one is never grown to rather than being enforced.
-/// This is therefore the floor under what one connection holds, whatever the
-/// caps come to.
+/// HTTP/2 grants this much at the start of every connection, and no endpoint
+/// can take a granted window back. A listener that configures less therefore
+/// only sets the value the window grows from. So this is the floor under what
+/// one connection holds, whatever the caps come to.
 const SPEC_CONNECTION_WINDOW: u64 = 65_535;
 
 /// The largest window HTTP/2 can carry.
@@ -134,8 +131,8 @@ const DEFAULT_MAX_CONNECTIONS: usize = 128;
 ///
 /// A destination's worker sends one response at a time, so a peer needs one
 /// stream per response type it sends this node, not one per response. The
-/// receive budget is spent on connections rather than on streams because a
-/// connection over the cap is refused where a stream over the cap only waits.
+/// receive budget goes to connections rather than to streams: the listener
+/// refuses a connection over the cap, but a stream over the cap only waits.
 const DEFAULT_MAX_STREAMS: u32 = 8;
 
 /// What this process's peer listener refused, and how often its service ran.
@@ -326,7 +323,7 @@ impl TransportCounters {
 ///
 /// Returns [`TransportError::Reflection`] when the embedded schema cannot be
 /// published.
-pub(crate) fn serve<H, F>(
+pub(in crate::router) fn serve<H, F>(
     bound: BoundListener,
     service: PeerService,
     health: H,
@@ -392,8 +389,8 @@ fn connection_peak(config: &TransportConfiguration) -> u64 {
 
 /// One HTTP/2 window, held to the largest the protocol can carry.
 ///
-/// A configuration the receive budget accepts is far under that ceiling, so the
-/// clamp states a fact of the type rather than one of the caller.
+/// The receive budget accepts no configuration near that ceiling. The clamp
+/// therefore keeps the cast safe; it limits no operator.
 fn window(bytes: u64) -> u32 {
     bytes.min(u64::from(MAX_WINDOW)) as u32
 }

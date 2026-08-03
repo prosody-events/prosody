@@ -4,16 +4,6 @@
 //! consumer would let one dead peer hold a fresh set of slots for each of them,
 //! so the per-destination bound holds only because the table is shared.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the respond layer and the shutdown path are this module's production callers; \
-                  the reservation accessors and `Destination::next_send` are exercised from the \
-                  response sender's suites, and the rest from this module's own"
-    )
-)]
-
 use crate::router::NodeId;
 use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
 use crate::router::fleet::gate::{AdmissionGate, GateTicket};
@@ -76,7 +66,16 @@ struct Cell {
 struct Occupant {
     node: NodeId,
     /// The stamp this occupant was admitted at. It tells this occupancy of a
-    /// cell from every earlier one.
+    /// cell from every earlier one, which is what makes an eviction and a
+    /// re-admission into the same cell observable.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no production reader: the fleet's own suites read this through \
+                      `DestinationFleet::live`"
+        )
+    )]
     admitted_at: u64,
     destination: Arc<Destination>,
 }
@@ -102,13 +101,17 @@ pub(crate) struct Destination {
 /// One send slot, taken on one live destination.
 ///
 /// Holding one means the destination is live, one of its slots is taken, and
-/// the gate was open when the slot was taken. A close that has already begun
-/// cannot end while one is held. Dropping it releases the slot and leaves the
-/// admission gate. [`Reservation::commit`] is the only other way out, and it
-/// leaves the gate only after the slot has been handed on.
+/// the reservation holds a [`GateTicket`]. A close that has already begun
+/// cannot end while one ticket is held. Dropping the reservation releases the
+/// slot and then the ticket. [`Reservation::commit`] is the only other way out,
+/// and it releases the ticket only after the slot has been handed on.
 ///
 /// Never hold one across an await. Shutdown waits for every live ticket, so a
 /// reservation held across an await holds the whole process's shutdown with it.
+///
+/// `permit` is declared before `ticket` on purpose: fields drop in declaration
+/// order, so the slot goes back before the gate is left, and a gate count of
+/// zero really means no slot is held.
 pub(crate) struct Reservation<'a> {
     slot: usize,
     destination: Arc<Destination>,
@@ -168,10 +171,7 @@ impl DestinationFleet {
         reservation
     }
 
-    /// Closes admission and returns once every caller already inside has left.
-    ///
-    /// Shutdown runs this before it stops the workers. Reversing the two would
-    /// let a hook reserve a slot on a fleet that has stopped draining.
+    /// Closes admission and returns once every ticket has been released.
     pub(in crate::router) async fn close(&self) {
         self.gate.close_and_drain().await;
     }
@@ -182,16 +182,19 @@ impl DestinationFleet {
     }
 
     /// How many destinations have been admitted since construction.
+    #[cfg(test)]
     pub(crate) fn admitted(&self) -> u64 {
         self.admitted.load(Relaxed)
     }
 
     /// How many destinations have been evicted to make room.
+    #[cfg(test)]
     pub(crate) fn evicted(&self) -> u64 {
         self.evicted.load(Relaxed)
     }
 
     /// How many reservations the fleet refused for want of capacity.
+    #[cfg(test)]
     pub(crate) fn refused(&self) -> u64 {
         self.refused.load(Relaxed)
     }
@@ -255,7 +258,7 @@ impl DestinationFleet {
 
     /// How many reservations have entered the gate and have not left it.
     #[cfg(test)]
-    pub(crate) fn admitted_now(&self) -> u64 {
+    pub(crate) fn tickets_held(&self) -> u64 {
         self.gate.count()
     }
 
@@ -359,6 +362,7 @@ impl Cell {
     }
 
     /// Whether this cell holds `node`.
+    #[cfg(test)]
     fn holds(&self, node: NodeId) -> bool {
         self.occupant
             .as_ref()

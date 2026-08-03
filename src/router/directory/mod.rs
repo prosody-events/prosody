@@ -20,7 +20,7 @@
 use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraStore, TABLE_NODE_DIRECTORY, TABLE_NODES_BY_GROUP};
 use crate::cassandra_queries;
-use crate::router::{Host, NodeId};
+use crate::router::{Host, LABEL_CAPACITY, NodeId};
 use fixedstr::Flexstr;
 use scylla::statement::Consistency;
 use std::sync::Arc;
@@ -58,7 +58,7 @@ pub(crate) struct Endpoint {
 ///
 /// Not a CIDR and not a Kubernetes object: a label that two nodes either share
 /// or do not. Absent means "unknown", which never counts as a match.
-pub(crate) type NetworkId = Flexstr<64>;
+pub(crate) type NetworkId = Flexstr<LABEL_CAPACITY>;
 
 /// The consumer group a process belongs to, and the Kafka cluster that scopes
 /// it.
