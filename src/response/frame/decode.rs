@@ -112,7 +112,10 @@ pub(crate) fn decode_frame<B: Buf>(
             }
             FIELD_CATEGORY => {
                 check_wire_type(WireType::Varint, wire_type)?;
-                status = Some(ResponseStatus::try_from(decode_varint(src)? as u32 as i32)?);
+                let raw = decode_varint(src)?;
+                let category =
+                    i32::try_from(raw).map_err(|_| FrameDecodeError::CategoryTooWide(raw))?;
+                status = Some(ResponseStatus::try_from(category)?);
             }
             FIELD_PAYLOAD => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
@@ -288,6 +291,11 @@ pub(crate) enum FrameDecodeError {
     /// empty on the wire and is blank after the trim.
     #[error(transparent)]
     Subsystem(#[from] SubsystemNameError),
+
+    /// The category field carries a varint too wide to be a status. Narrowing
+    /// it would fold a value no status can be onto one that is.
+    #[error("category varint {0} does not fit int32")]
+    CategoryTooWide(u64),
 
     /// The category field names no response status.
     #[error(transparent)]

@@ -11,10 +11,8 @@
 //! that exhausts its retries answers its requester while the attempts before it
 //! stay silent. The category rides the frame as a label only.
 //!
-//! [`into_responding_provider`] is the only way to build the layer, and it
-//! mints the chain's leaf adapter itself. So the layer sits directly around the
-//! application handler by construction, where it sees the handler's own result
-//! and never runs for a dispatch the handler never reached.
+//! [`responding_provider`] is the only way to build the layer, and it states
+//! what that placement guarantees.
 
 #![cfg_attr(
     not(test),
@@ -82,9 +80,9 @@ pub(crate) struct RespondError<E> {
 /// Wraps one handler and moves its final message result to a responder.
 ///
 /// The bounds this layer's [`FallibleHandler`] impl carries narrow the handlers
-/// it accepts: the codec's payload must be `Sync + 'static`, and the error must
-/// be `'static` to ride as an error source. A bare `FallibleHandler` needs
-/// neither.
+/// it accepts. The codec's payload is the handler's own `Result`, and a
+/// [`Codec::Payload`] must be `Send + Sync + 'static`. So both halves of that
+/// result need `Sync + 'static`, which a bare `FallibleHandler` does not.
 pub(crate) struct RespondHandler<H, C: Codec> {
     handler: H,
     responder: Arc<Responder<C>>,
@@ -107,6 +105,10 @@ impl<C: Codec> Responder<C> {
     ///
     /// The process runtime owns this call. A handler must not call it during
     /// shutdown because response delivery outlives a partition.
+    ///
+    /// This takes the responder by value, and every partition handler holds a
+    /// clone behind an [`Arc`]. So the drain can start only after the last
+    /// handler is dropped.
     pub(crate) async fn drain(self) {
         self.sender.drain().await;
     }

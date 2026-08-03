@@ -1,8 +1,9 @@
 //! What the hook does when the transport cannot take a response.
 //!
-//! Every suite here holds the transport open with a barrier, or refuses the
-//! response before a frame byte is written, and reads the outcome after an
-//! explicit drain.
+//! Every suite here keeps a response off the wire in one of four ways: a
+//! barrier holds the transport open, the fleet refuses the response, the
+//! encoder drops it for the frame cap, or the directory names no address for
+//! its node. Each reads the outcome after an explicit drain.
 
 use super::{
     Fixture, OversizedProbeCodec, ResultProbeCodec, offset_tracker, serialize_count, tagged,

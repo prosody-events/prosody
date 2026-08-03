@@ -98,8 +98,8 @@ impl RequestTag {
         not(test),
         expect(
             dead_code,
-            reason = "the respond layer is this method's production caller; it is exercised by \
-                      this module's tests"
+            reason = "the respond layer is this method's production caller, and the respond \
+                      suites exercise it"
         )
     )]
     pub(crate) fn header(self, subsystem: SubsystemName, status: ResponseStatus) -> FrameHeader {

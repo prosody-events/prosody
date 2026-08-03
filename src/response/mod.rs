@@ -34,14 +34,6 @@ pub(crate) enum ResponseStatus {
     Error(ErrorCategory),
 }
 
-/// Identifies one request across the fleet.
-///
-/// Minted as a `UUIDv7`, so ids sort by creation time and read chronologically
-/// in a trace. On the wire it is 16 opaque bytes, so a peer that mints ids some
-/// other way is still answerable.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct RequestId(Uuid);
-
 impl From<ResponseStatus> for i32 {
     fn from(status: ResponseStatus) -> Self {
         match status {
@@ -62,6 +54,14 @@ impl TryFrom<i32> for ResponseStatus {
         }
     }
 }
+
+/// Identifies one request across the fleet.
+///
+/// Minted as a `UUIDv7`, so ids sort by creation time and read chronologically
+/// in a trace. On the wire it is 16 opaque bytes, so a peer that mints ids some
+/// other way is still answerable.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RequestId(Uuid);
 
 impl RequestId {
     /// Mints an id for one request.

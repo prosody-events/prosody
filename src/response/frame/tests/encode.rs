@@ -226,7 +226,7 @@ fn a_released_encoder_holds_nothing_of_the_response_before_it() -> Result<()> {
 }
 
 #[test]
-fn one_response_frames_to_known_bytes() -> Result<()> {
+fn known_responses_frame_to_known_bytes() -> Result<()> {
     assert_eq!(
         FROZEN[FROZEN_STATUS - 1],
         0x30,

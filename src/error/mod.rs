@@ -46,6 +46,11 @@ pub trait ClassifyError {
 /// **Zero is reserved and no category claims it.** Protobuf decodes a missing
 /// `int32` field as `0`, so an omitted category reads as malformed rather than
 /// as a silent [`Transient`](ErrorCategory::Transient).
+///
+/// **Four is reserved too.** A peer response frame gives `4` to a successful
+/// result, and reads that discriminant before it consults this mapping. So a
+/// category numbered `4` here would decode as a success. Give the next category
+/// `5`.
 impl From<ErrorCategory> for i32 {
     fn from(category: ErrorCategory) -> Self {
         match category {

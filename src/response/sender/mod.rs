@@ -96,6 +96,8 @@ struct Job<C: Codec> {
 /// The sender returns the payload so its caller can dispose of it. Nothing is
 /// encoded for a refused response.
 pub(crate) struct Rejected<P> {
+    /// Which refusal this was. The counters give the rate of each class, while
+    /// this names the class for one response.
     pub(crate) reason: Refused,
     pub(crate) payload: P,
 }
@@ -166,8 +168,9 @@ impl<C: Codec> TypedSender<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`Refused::Fleet`] when the fleet refused a slot, and
-    /// [`Refused::Queue`] when the destination's queue could not take the job.
+    /// Returns the payload in a [`Rejected`] whose reason is
+    /// [`Refused::Fleet`] when the fleet refused a slot, or [`Refused::Queue`]
+    /// when the destination's queue could not take the job.
     pub(crate) fn send(
         &self,
         header: FrameHeader,
@@ -249,9 +252,10 @@ impl SendCounters {
         self.sent.load(Relaxed)
     }
 
-    /// How many responses this sender gave up on, for any reason. A response
-    /// the fleet refused a slot to never reaches a sender, so the fleet counts
-    /// that refusal itself.
+    /// How many responses this sender gave up on: what a worker dequeued and
+    /// could not deliver, plus a job the destination's queue could not take.
+    /// A fleet refusal is not here, because the fleet counts its own. A queue
+    /// refusal counts here and still hands its payload back to the caller.
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Relaxed)
     }

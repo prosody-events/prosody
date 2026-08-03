@@ -204,6 +204,16 @@ fn a_malformed_frame_is_refused_by_the_field_that_broke_it() -> Result<()> {
             },
             FrameDecodeError::Category(UnknownErrorCategory(0)),
         ),
+        // A varint wider than the field's `int32`. Narrowing it would fold this
+        // one onto `Success`, which is the status that decides what a requester
+        // believes happened to its request.
+        (
+            RawFrame {
+                category: Some((1_u64 << 32_u32) | 4),
+                ..RawFrame::default()
+            },
+            FrameDecodeError::CategoryTooWide(4_294_967_300),
+        ),
         (
             RawFrame {
                 subsystem: None,

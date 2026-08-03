@@ -120,6 +120,10 @@ fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
         assert_eq!(frame.header.target, node(TARGET));
         assert_eq!(frame.header.request, RequestId::from_bytes([REQUEST; 16]));
         assert_eq!(frame.header.status, ResponseStatus::Success);
+        assert!(
+            frame.header.relay.is_none(),
+            "a responder never sets the relay"
+        );
         Ok(())
     })
 }
