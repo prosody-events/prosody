@@ -18,9 +18,8 @@
 //! module and nowhere else in the router.
 
 // The `not(test)` gate is what makes this an *expectation* rather than a
-// blanket permission. It holds while any item in this module is
-// production-dead, and it is deleted the day the process runtime builds the
-// listener.
+// blanket permission. It holds while the process runtime remains
+// production-dead before consumer wiring owns it.
 #![cfg_attr(
     not(test),
     expect(
@@ -252,6 +251,11 @@ impl BoundListener {
     /// publishes.
     pub(crate) const fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// The frame ceiling that the listener enforces.
+    pub(crate) const fn frame_cap(&self) -> FrameCap {
+        self.config.frame_cap
     }
 }
 

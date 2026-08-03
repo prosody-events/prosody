@@ -150,8 +150,8 @@ impl NodeId {
         not(test),
         expect(
             dead_code,
-            reason = "`PeerRuntime::start` is this constructor's production caller; it is \
-                      exercised by this module's tests"
+            reason = "the process runtime is production-dead until consumer wiring owns it; this \
+                      constructor is exercised by this module's tests"
         )
     )]
     pub(crate) fn new() -> Self {
@@ -200,13 +200,13 @@ impl<S> Clone for RouterHandle<S> {
     not(test),
     expect(
         dead_code,
-        reason = "the respond layer is this constructor's production caller; it is exercised by \
-                  this module's tests"
+        reason = "the process runtime is production-dead until consumer wiring owns it; this \
+                  constructor is exercised by this module's tests"
     )
 )]
 impl<S> RouterHandle<S> {
     /// Binds one process's resolver, fleet and transport together.
-    pub(crate) fn new(
+    pub(in crate::router) fn new(
         addresses: AddressResolver,
         fleet: Arc<DestinationFleet>,
         transport: Arc<S>,

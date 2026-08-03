@@ -2,13 +2,15 @@
 //! connections it holds, and what it discloses.
 
 use super::{FRAME_CAP, Harness, transport};
+use crate::requester::config::RequesterConfiguration;
 use crate::response::frame::FrameCap;
 use crate::router::directory::tests::support::{directory, store};
+use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::codec::ClientFrameCodec;
 use crate::router::grpc::conn::admitted;
 use crate::router::grpc::{BoundListener, TRANSPORT, TransportConfiguration};
-use crate::router::loopback::HANG_GUARD;
-use crate::router::runtime::{PeerRuntime, RouterConfiguration};
+use crate::router::loopback::{HANG_GUARD, TestHealth};
+use crate::router::runtime::{PeerInputs, PeerRuntime, RouterConfiguration};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
@@ -105,15 +107,19 @@ fn a_registration_publishes_the_port_the_listener_bound() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let bound = BoundListener::bind(&transport(FRAME_CAP)?).await?;
         let expected = bound.address().port();
-        let directory =
-            directory(RouterConfiguration::default().registration_ttl.duration()).await?;
-        let runtime = PeerRuntime::start(
-            store().await?.clone(),
-            &bound,
-            CONTACT,
-            &RouterConfiguration::default(),
-            None,
-        )
+        let router = RouterConfiguration::default();
+        let requester = RequesterConfiguration::default();
+        let directory = directory(router.registration_ttl.duration()).await?;
+        let runtime = PeerRuntime::start(PeerInputs {
+            store: store().await?.clone(),
+            listener: bound,
+            health: TestHealth::new(true, true),
+            contact: CONTACT,
+            group: None,
+            router: &router,
+            fleet: FleetConfiguration::default(),
+            requester: &requester,
+        })
         .await?;
         let outcome = async {
             let published = directory
@@ -131,7 +137,7 @@ fn a_registration_publishes_the_port_the_listener_bound() -> Result<()> {
             Ok(())
         }
         .await;
-        let shutdown = runtime.shutdown().await;
+        let shutdown = runtime.shutdown(|| async {}).await;
         outcome.and(shutdown.map_err(Into::into))
     })
 }

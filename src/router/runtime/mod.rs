@@ -1,5 +1,5 @@
-//! This process's identity in the node directory: what it publishes, how it
-//! keeps the publication alive, and how it resolves other nodes.
+//! One process's peer machinery: what it publishes about itself, what it hands
+//! consumers and requesters, and the order it stops in.
 
 #![cfg_attr(
     not(test),
@@ -12,155 +12,140 @@
 
 use crate::cassandra::CassandraStore;
 use crate::cassandra::errors::CassandraStoreError;
+use crate::requester::config::RequesterConfiguration;
+use crate::requester::registry::{PendingRegistry, RegistryError};
 use crate::router::directory::cache::{AddressCache, AddressResolver};
 use crate::router::directory::{
     Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
 };
-use crate::router::grpc::BoundListener;
-use crate::router::{Host, NodeId};
-use derive_builder::Builder;
+use crate::router::fleet::DestinationFleet;
+use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
+use crate::router::grpc::client::GrpcSender;
+use crate::router::grpc::health::ProcessHealth;
+use crate::router::grpc::service::PeerService;
+use crate::router::grpc::{BoundListener, TransportError, serve};
+use crate::router::{Host, NodeId, RouterHandle};
 use rand::RngExt;
+use std::future::Future;
 use std::net::{ToSocketAddrs, UdpSocket};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::select;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{error, warn};
-use validator::{Validate, ValidationError, ValidationErrors};
+use validator::{Validate, ValidationErrors};
 use whoami::hostname;
+
+mod config;
+
+#[cfg(test)]
+use self::config::MAX_ADDRESS_CACHE_CAPACITY;
+pub(crate) use self::config::RouterConfiguration;
 
 #[cfg(test)]
 mod tests;
 
-/// How many peer registrations stay cached at once, by default.
-const DEFAULT_ADDRESS_CACHE_CAPACITY: usize = 1024;
-
-/// Most peer registrations a process may hold at once. A registration is a few
-/// short strings, so a million of them is already more memory than the cache is
-/// worth; the bound stops a typo from asking for a heap the process lacks.
-const MAX_ADDRESS_CACHE_CAPACITY: usize = 1_048_576;
-
-/// Longest label an operator can configure for a host or a network. The largest
-/// label that stays inline in [`Host`], so a configured label never reaches the
-/// heap.
-const MAX_LABEL_BYTES: usize = 63;
-
-/// What an operator sets for peer routing.
+/// Everything one process shares for peer traffic, under one owner.
 ///
-/// Every field has a working default, so a deployment on one network needs no
-/// configuration at all.
-#[derive(Builder, Clone, Debug, Validate)]
-#[builder(setter(into, strip_option), default)]
-#[validate(schema(function = "validate_entry_point"))]
-pub(crate) struct RouterConfiguration {
-    /// The host that peers on another network use to reach this process — a
-    /// gateway, an ingress, a translated address. Unset means intra-network
-    /// only.
-    ///
-    /// Folding this and `advertised_port` into one optional pair would make a
-    /// port with no host beside it unrepresentable. The two stay separate
-    /// because every cross-field rule in this crate is a schema validation, and
-    /// one flat builder setter per field is the shape an operator expects.
-    #[validate(custom(function = "validate_label"))]
-    pub(crate) advertised_host: Option<String>,
-
-    /// The port to publish beside `advertised_host`. Unset publishes the
-    /// listener's own port, which is what an entry point that forwards a port
-    /// unchanged wants. Set with no host beside it, the configuration is
-    /// refused. Zero is refused too: an advertised port is a port peers dial,
-    /// never a request for one the operating system chooses.
-    #[validate(range(min = 1_u16))]
-    pub(crate) advertised_port: Option<u16>,
-
-    /// The operator's name for the set of processes that reach each other
-    /// directly. Two processes that share it skip the entry point.
-    #[validate(custom(function = "validate_label"))]
-    pub(crate) network: Option<String>,
-
-    /// How long a registration survives without a refresh. The type carries the
-    /// range, so a lease outside it never reaches a configuration at all.
-    pub(crate) registration_ttl: RegistrationTtl,
-
-    /// How many peer registrations stay cached at once.
-    #[validate(range(min = 1_usize, max = MAX_ADDRESS_CACHE_CAPACITY))]
-    pub(crate) address_cache_capacity: usize,
-}
-
-/// This process's identity and its place in the directory.
+/// The runtime holds this node's registration, the resolver it reads peers
+/// through, the bound listener, the destination fleet, the pending request
+/// registry, and the transport responses leave by. Consumers and requesters
+/// take handles from it and construct none of these themselves. It mints this
+/// process's [`NodeId`] once, and the listener answers for that same id, so one
+/// process has one identity by construction.
 ///
-/// The runtime mints the node id, publishes a registration before it returns,
-/// rewrites the registration on a jittered interval, and deletes it on
-/// shutdown. Nothing here is conditional on a peer feature: every process
-/// registers, always, which is what makes any node reachable from any other.
-/// The consumer wiring owns construction and shutdown order.
+/// The router names no response vocabulary except at the wire seam it owns.
+/// This type is inside that seam: the listener's service is the pending
+/// registry's server side, so the runtime must name both.
 ///
-/// Dropping the runtime without a shutdown ends the refresh task through the
-/// stop channel and leaves this process's row to expire on its lease.
+/// [`shutdown`](Self::shutdown) is the ordered teardown, and it must be driven
+/// to completion. A dropped shutdown future stops between two steps and leaves
+/// the remaining tasks detached.
+///
+/// A runtime that is dropped instead still ends: the refresher stops when the
+/// watch channel closes, the listener stops when the one-shot sender drops, the
+/// registry's sweep stops when its last [`Arc`] drops, and this node's row
+/// expires on its lease. What a plain drop cannot do is wake a parked waiter or
+/// wait for a reservation, which is why shutdown exists.
 pub(crate) struct PeerRuntime {
     addresses: AddressResolver,
     /// The write side of the directory. The resolver beside it only reads, so
     /// the two directions stay separate types rather than one that does both.
     directory: NodeDirectory,
     registration: NodeRegistration,
-    stop: watch::Sender<bool>,
-    refresh: Mutex<Option<JoinHandle<()>>>,
+    fleet: Arc<DestinationFleet>,
+    pending: Arc<PendingRegistry>,
+    transport: Arc<GrpcSender>,
+    stop_refresh: watch::Sender<bool>,
+    refresh: JoinHandle<()>,
+    /// Dropping it resolves the listener's shutdown future.
+    stop_listener: oneshot::Sender<()>,
+    listener: JoinHandle<()>,
 }
 
-impl Default for RouterConfiguration {
-    fn default() -> Self {
-        Self {
-            advertised_host: None,
-            advertised_port: None,
-            network: None,
-            registration_ttl: RegistrationTtl::DEFAULT,
-            address_cache_capacity: DEFAULT_ADDRESS_CACHE_CAPACITY,
-        }
-    }
-}
-
-impl RouterConfiguration {
-    /// Creates a configuration builder.
-    #[must_use]
-    pub(crate) fn builder() -> RouterConfigurationBuilder {
-        RouterConfigurationBuilder::default()
-    }
+/// Everything one peer runtime is built from.
+///
+/// This type has no `Clone` implementation on purpose. One value serves one
+/// process, so two runtimes cannot come from one set of inputs without a
+/// second, grep-visible call to [`PeerRuntime::start`].
+pub(crate) struct PeerInputs<'a, H> {
+    pub(crate) store: CassandraStore,
+    /// The already-bound peer listener. The runtime serves this listener and
+    /// publishes the port that the operating system assigned.
+    pub(crate) listener: BoundListener,
+    pub(crate) health: H,
+    /// A Cassandra contact point that the routed-address probe aims at.
+    pub(crate) contact: &'a str,
+    pub(crate) group: Option<GroupMembership>,
+    pub(crate) router: &'a RouterConfiguration,
+    pub(crate) fleet: FleetConfiguration,
+    pub(crate) requester: &'a RequesterConfiguration,
 }
 
 impl PeerRuntime {
-    /// Mints this process's node id, publishes what it discovers about itself,
-    /// and starts refreshing that publication.
+    /// Builds every shared piece, serves the listener, and publishes this
+    /// process.
     ///
-    /// `listener` is this process's already-bound peer listener, and `contact`
-    /// is a Cassandra contact point the routed-address probe aims at. The
-    /// listener is taken rather than a port number so the published port is
-    /// always the one the operating system assigned: there is no other port to
-    /// pass.
-    ///
-    /// The lease comes from `config` and reaches the directory, the refresh
-    /// pace and the address cache from there, so one configured value governs
-    /// all three. The first write is awaited here rather than left to the
-    /// refresh task, so a returned runtime is one whose node is already
-    /// published.
+    /// The listener is served before the registration is written, so no peer
+    /// can learn a port before that port accepts connections. The first write
+    /// is awaited here rather than left to the refresh task, so a returned
+    /// runtime is one whose node is already published.
     ///
     /// # Errors
     ///
-    /// Returns [`PeerRuntimeError`] when the configuration is invalid, or when
-    /// discovery, statement preparation, or the first write fails.
-    pub(crate) async fn start(
-        store: CassandraStore,
-        listener: &BoundListener,
-        contact: &str,
-        config: &RouterConfiguration,
-        group: Option<GroupMembership>,
+    /// Returns [`PeerRuntimeError`] when the configuration, discovery, the
+    /// directory, the registry, the fleet, or the listener refuses to start.
+    /// A failed first write stops the listener again before it returns.
+    pub(crate) async fn start<H: ProcessHealth>(
+        inputs: PeerInputs<'_, H>,
     ) -> Result<Self, PeerRuntimeError> {
-        config.validate()?;
-        let ttl = config.registration_ttl;
-        let directory = NodeDirectory::new(store, ttl).await?;
-        let registration = discover_registration(NodeId::new(), listener, contact, config, group)?;
-        directory.register(&registration).await?;
-        let (stop, mut stopped) = watch::channel(false);
+        inputs.router.validate()?;
+        let fleet = Arc::new(DestinationFleet::new(inputs.fleet)?);
+        let pending = PendingRegistry::new(inputs.requester)?;
+        let transport = Arc::new(GrpcSender::new(inputs.listener.frame_cap(), &fleet));
+        let ttl = inputs.router.registration_ttl;
+        let directory = NodeDirectory::new(inputs.store, ttl).await?;
+        let registration = discover_registration(
+            NodeId::new(),
+            &inputs.listener,
+            inputs.contact,
+            inputs.router,
+            inputs.group,
+        )?;
+        let (stop_listener, stopped) = oneshot::channel();
+        let listener = serve(
+            inputs.listener,
+            PeerService::new(registration.node, Arc::clone(&pending)),
+            inputs.health,
+            async move { drop(stopped.await) },
+        )?;
+        if let Err(error) = directory.register(&registration).await {
+            return Err(abandon(stop_listener, listener, error.into()).await);
+        }
+        let (stop_refresh, mut stopped) = watch::channel(false);
         let refresh = tokio::spawn({
             let directory = directory.clone();
             let registration = registration.clone();
@@ -189,13 +174,18 @@ impl PeerRuntime {
         });
         Ok(Self {
             addresses: AddressResolver::new(
-                AddressCache::new(config.address_cache_capacity, ttl),
+                AddressCache::new(inputs.router.address_cache_capacity, ttl),
                 directory.clone(),
             ),
             directory,
             registration,
-            stop,
-            refresh: Mutex::new(Some(refresh)),
+            fleet,
+            pending,
+            transport,
+            stop_refresh,
+            refresh,
+            stop_listener,
+            listener,
         })
     }
 
@@ -210,34 +200,119 @@ impl PeerRuntime {
         &self.addresses
     }
 
-    /// Stops refreshing and removes this process's rows.
+    /// The process-wide destination fleet.
+    pub(crate) const fn fleet(&self) -> &Arc<DestinationFleet> {
+        &self.fleet
+    }
+
+    /// A handle to the process-wide pending registry.
+    pub(crate) fn pending(&self) -> Arc<PendingRegistry> {
+        Arc::clone(&self.pending)
+    }
+
+    /// The router every responder in this process sends through.
+    pub(crate) fn router(&self) -> RouterHandle<GrpcSender> {
+        RouterHandle::new(
+            self.addresses.clone(),
+            Arc::clone(&self.fleet),
+            Arc::clone(&self.transport),
+        )
+    }
+
+    /// Shuts this process's peer machinery down, in the one order that cannot
+    /// leave a reservation behind.
     ///
-    /// The refresh task is signalled and **joined before** the deletes are
-    /// issued, so a refresh cannot land after a delete and resurrect this node
-    /// for a whole lease. The join and the deletes run under one lock, and the
-    /// handle is cleared only after the join returns. A second caller therefore
-    /// waits for the first, and a call dropped at the join leaves the handle
-    /// for the next call to join — neither can delete while the refresher is
-    /// still live. Repeating a completed shutdown re-issues deletes that change
-    /// nothing.
+    /// Takes `self`, so a second shutdown is unwritable and no handle has to be
+    /// taken out from behind a lock. `drain` is a closure rather than a future,
+    /// so the response drain cannot have begun before the gate closed: this
+    /// call runs it once the gate has closed and emptied, and nothing else
+    /// calls it.
+    ///
+    /// The order, and why each step is where it is:
+    ///
+    /// 1. Stop the refresher, join it, then delete this node's rows. The join
+    ///    comes first: a refresh that landed after the delete would republish
+    ///    this node under a fresh lease and outlive the process. The delete's
+    ///    outcome is returned, but every later step runs whatever it was — a
+    ///    failed delete heals on the lease, and an abandoned teardown does not.
+    /// 2. Signal the listener to stop accepting new connections. Tonic's
+    ///    graceful shutdown lets an RPC already in flight run to completion.
+    ///    Its frame can still reach the registry after the next step. The
+    ///    registry refuses that frame.
+    /// 3. Move every open request to `ShuttingDown` and wake its waiter. This
+    ///    runs before the listener is joined: one long-lived inbound call could
+    ///    hold graceful shutdown open, and every parked caller would then wait
+    ///    behind it.
+    /// 4. Close the counted admission gate and wait for admitted hooks to
+    ///    leave.
+    /// 5. Run the response drain, which is only safe once nothing can reserve.
+    /// 6. Join the listener task.
+    ///
+    /// Closing the gate before the drain is the ordering that matters:
+    /// reversed, a hook could reserve a slot on a fleet whose workers had
+    /// already stopped, and its response would be dropped instead of
+    /// delivered. A flag could not give that — a hook can already sit
+    /// between its check and its reservation — so admission is counted and
+    /// the close waits for the count to reach zero.
+    ///
+    /// Drive this to completion. A dropped shutdown future stops between two
+    /// steps, and the tasks the remaining steps would have joined detach.
     ///
     /// # Errors
     ///
     /// Returns the directory's error when a delete fails.
-    pub(crate) async fn shutdown(&self) -> Result<(), CassandraStoreError> {
-        // `send_replace` rather than `send`: a refresh task that already exited
-        // leaves no receiver, and that is not a failure.
-        self.stop.send_replace(true);
-        let mut refresh = self.refresh.lock().await;
-        if let Some(handle) = refresh.as_mut() {
-            if let Err(error) = handle.await {
-                error!(%error, "node registration refresh task did not exit cleanly");
-            }
-            // A `JoinHandle` cannot be polled again once it has completed.
-            *refresh = None;
+    pub(crate) async fn shutdown<F, D>(self, drain: F) -> Result<(), CassandraStoreError>
+    where
+        F: FnOnce() -> D,
+        D: Future<Output = ()>,
+    {
+        let Self {
+            directory,
+            registration,
+            fleet,
+            pending,
+            stop_refresh,
+            refresh,
+            stop_listener,
+            listener,
+            ..
+        } = self;
+
+        stop_refresh.send_replace(true);
+        if let Err(error) = refresh.await {
+            error!(%error, "node registration refresh task did not exit cleanly");
         }
-        self.directory.deregister(&self.registration).await
+        let deregistered = directory.deregister(&registration).await;
+
+        drop(stop_listener);
+        pending.shutdown().await;
+        fleet.close().await;
+        // An unforgeable `Drained` token that a drain required would make this
+        // order uncompilable. It was examined and rejected: it would also
+        // require every caller that flushes one sender to close the process's
+        // fleet, and one fleet serves several senders.
+        drain().await;
+        if let Err(error) = listener.await {
+            error!(%error, "the peer listener task did not exit cleanly");
+        }
+        deregistered
     }
+}
+
+/// Stops the listener that this start served, then returns `error`.
+///
+/// A dropped handle leaves its task live. A retry could then fail to bind the
+/// same port.
+async fn abandon(
+    stop: oneshot::Sender<()>,
+    listener: JoinHandle<()>,
+    error: PeerRuntimeError,
+) -> PeerRuntimeError {
+    drop(stop);
+    if let Err(join_error) = listener.await {
+        error!(%join_error, "the abandoned peer listener task did not exit cleanly");
+    }
+    error
 }
 
 /// The local address the operating system would use to reach `contact`.
@@ -325,31 +400,6 @@ fn refresh_delay(ttl: RegistrationTtl) -> Duration {
     Duration::from_millis(base + rand::rng().random_range(0..=span))
 }
 
-/// Refuses a blank label and one longer than a host or network name may be.
-/// An absent label never reaches this function.
-///
-/// A `length` rule cannot replace this one: `validator` counts characters,
-/// while [`MAX_LABEL_BYTES`] is the byte capacity that keeps a label inline in
-/// [`Host`].
-fn validate_label(label: &str) -> Result<(), ValidationError> {
-    if label.is_empty() {
-        return Err(ValidationError::new("label_empty"));
-    }
-    if label.len() > MAX_LABEL_BYTES {
-        return Err(ValidationError::new("label_too_long"));
-    }
-    Ok(())
-}
-
-/// Refuses a published port with no host beside it. An entry point is a host
-/// and a port together, and a port alone reaches nothing.
-fn validate_entry_point(config: &RouterConfiguration) -> Result<(), ValidationError> {
-    if config.advertised_port.is_some() && config.advertised_host.is_none() {
-        return Err(ValidationError::new("advertised_port_without_host"));
-    }
-    Ok(())
-}
-
 /// What can stop a process from taking its place in the directory.
 #[derive(Debug, Error)]
 pub(crate) enum PeerRuntimeError {
@@ -362,7 +412,20 @@ pub(crate) enum PeerRuntimeError {
     #[error("host discovery failed: {0:#}")]
     Discovery(#[from] whoami::Error),
 
-    /// The directory rejected this process's first registration.
+    /// The directory could not prepare its statements, or it rejected this
+    /// process's first registration.
     #[error("node registration failed: {0:#}")]
     Directory(#[from] CassandraStoreError),
+
+    /// The destination limits were invalid.
+    #[error("the destination fleet could not be built: {0:#}")]
+    Fleet(#[from] FleetConfigurationError),
+
+    /// The pending request limits were invalid.
+    #[error("the pending registry could not be built: {0:#}")]
+    Registry(#[from] RegistryError),
+
+    /// The bound peer listener could not start its service.
+    #[error("the peer listener could not be served: {0:#}")]
+    Listener(#[from] TransportError),
 }

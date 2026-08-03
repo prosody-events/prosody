@@ -3,6 +3,7 @@
 use crate::router::directory::Endpoint;
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
+use crate::router::grpc::health::ProcessHealth;
 use crate::router::{Framed, Host, NodeId, ResponseSender, Router, SendFailure};
 use bytes::BytesMut;
 use parking_lot::Mutex;
@@ -30,6 +31,12 @@ pub(crate) const UNPUBLISHED_NODE: u8 = 200;
 /// A deadline on every wait, so a hang fails the test instead of hanging the
 /// binary. It is never the assertion.
 pub(crate) const HANG_GUARD: Duration = Duration::from_secs(30);
+
+/// A health source whose two values a test sets directly.
+pub(crate) struct TestHealth {
+    ready: bool,
+    live: bool,
+}
 
 /// One delivery attempt, as the transport saw it.
 ///
@@ -88,6 +95,23 @@ enum Answer {
     Accepted,
     Failed(SendFailure),
     Held(Arc<Semaphore>),
+}
+
+impl TestHealth {
+    /// A source that answers `ready` and `live`.
+    pub(crate) const fn new(ready: bool, live: bool) -> Self {
+        Self { ready, live }
+    }
+}
+
+impl ProcessHealth for TestHealth {
+    fn ready(&self) -> bool {
+        self.ready
+    }
+
+    fn live(&self) -> bool {
+        self.live
+    }
 }
 
 impl LoopbackSender {

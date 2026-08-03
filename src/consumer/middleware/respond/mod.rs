@@ -108,8 +108,8 @@ impl<C: Codec> Responder<C> {
 
     /// Waits until all queued responses finish.
     ///
-    /// The process runtime owns this call. A handler must not call it during
-    /// shutdown because response delivery outlives a partition.
+    /// The process runtime calls this from its shutdown drain closure. It calls
+    /// the closure after the fleet admission gate drains.
     ///
     /// This takes the responder by value, and every partition handler holds a
     /// clone behind an [`Arc`]. So the drain can start only after the last

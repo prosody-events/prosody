@@ -104,9 +104,11 @@ pub(crate) struct Destination {
 /// Holding one means the destination is live, one of its slots is taken, and
 /// the gate was open when the slot was taken. A close that has already begun
 /// cannot end while one is held. Dropping it releases the slot and leaves the
-/// admission gate.
-/// [`Reservation::commit`] is the only other way out, and it leaves the gate
-/// only after the slot has been handed on.
+/// admission gate. [`Reservation::commit`] is the only other way out, and it
+/// leaves the gate only after the slot has been handed on.
+///
+/// Never hold one across an await. Shutdown waits for every live ticket, so a
+/// reservation held across an await holds the whole process's shutdown with it.
 pub(crate) struct Reservation<'a> {
     slot: usize,
     destination: Arc<Destination>,
@@ -170,7 +172,7 @@ impl DestinationFleet {
     ///
     /// Shutdown runs this before it stops the workers. Reversing the two would
     /// let a hook reserve a slot on a fleet that has stopped draining.
-    pub(crate) async fn close(&self) {
+    pub(in crate::router) async fn close(&self) {
         self.gate.close_and_drain().await;
     }
 
@@ -249,6 +251,12 @@ impl DestinationFleet {
     #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.gate.is_closed()
+    }
+
+    /// How many reservations have entered the gate and have not left it.
+    #[cfg(test)]
+    pub(crate) fn admitted_now(&self) -> u64 {
+        self.gate.count()
     }
 
     fn take_slot<'a>(

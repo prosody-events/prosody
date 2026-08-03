@@ -15,7 +15,6 @@ mod listener;
 mod transport;
 
 use super::client::GrpcSender;
-use super::health::ProcessHealth;
 use super::service::PeerService;
 use super::{BoundListener, TransportConfiguration, serve};
 use crate::codec::Codec;
@@ -27,7 +26,7 @@ use crate::response::frame::{FrameCap, FrameHeader, ResponseFrame};
 use crate::response::{FormatToken, RequestId, ResponseStatus};
 use crate::router::directory::Endpoint;
 use crate::router::fleet::DestinationFleet;
-use crate::router::loopback::config;
+use crate::router::loopback::{TestHealth, config};
 use crate::router::{Framed, Host, NodeId, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
 use bytes::{BufMut, BytesMut};
@@ -99,13 +98,6 @@ pub(super) struct Harness {
     pub(super) cap: FrameCap,
     stop: Option<Sender<()>>,
     served: Option<JoinHandle<()>>,
-}
-
-/// A health source a test sets directly, so the status mapping is tested apart
-/// from the predicates that feed it.
-pub(super) struct TestHealth {
-    ready: bool,
-    live: bool,
 }
 
 /// Bytes already framed, so a suite can put a frame on the wire that no encoder
@@ -189,23 +181,6 @@ impl Harness {
             served.await?;
         }
         Ok(())
-    }
-}
-
-impl ProcessHealth for TestHealth {
-    fn ready(&self) -> bool {
-        self.ready
-    }
-
-    fn live(&self) -> bool {
-        self.live
-    }
-}
-
-impl TestHealth {
-    /// A source that answers `ready` and `live`.
-    pub(super) const fn new(ready: bool, live: bool) -> Self {
-        Self { ready, live }
     }
 }
 
