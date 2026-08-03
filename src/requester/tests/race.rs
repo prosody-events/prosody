@@ -139,12 +139,18 @@ async fn a_failed_report_after_a_response_keeps_waiting() -> Result<()> {
 
 /// A response that lands after the call has parked, and before the failed
 /// report is observed, still reaches the caller.
+///
+/// One of the two subsystems stays silent, so the failed report meets a
+/// request that is still open and already holds one answer. That is the one
+/// state the emptiness test decides: a single awaited subsystem would end the
+/// request on arrival and never reach the test at all.
 #[tokio::test(start_paused = true)]
 async fn a_response_racing_the_report_is_not_discarded() -> Result<()> {
     let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
-    let awaited = names(&["billing"])?;
+    let awaited = names(&["billing", "ledger"])?;
     let registration = registry.register(&awaited, TestCodec::FORMAT_ID, MAX_TIMEOUT)?;
     let answer = success(registration.id(), &awaited[0], 5)?;
+    let start = Instant::now();
 
     let produce = async {
         yield_now().await;
@@ -161,7 +167,15 @@ async fn a_response_racing_the_report_is_not_discarded() -> Result<()> {
     );
 
     assert_eq!(registry.accept(answer), ResponseDisposition::Accepted);
-    assert_eq!(call.await?, vec![Outcome::Ok(5)]);
+    assert_eq!(
+        call.await?,
+        vec![Outcome::Ok(5), Outcome::Failed(ResponseFailure::Timeout)]
+    );
+    assert_eq!(
+        Instant::now() - start,
+        MAX_TIMEOUT,
+        "the failed report ended a request that had already accepted an answer"
+    );
     Ok(())
 }
 
