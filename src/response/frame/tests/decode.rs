@@ -4,8 +4,8 @@ use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::frame::decode::{FrameDecodeError, decode_frame};
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::{
-    FIELD_CATEGORY, FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE,
-    FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, PayloadError,
+    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
+    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, PayloadError,
 };
 use crate::response::{FormatToken, RequestId, ResponseStatus};
 use crate::router::{Framed, NodeId};
@@ -199,20 +199,20 @@ fn a_malformed_frame_is_refused_by_the_field_that_broke_it() -> Result<()> {
         ),
         (
             RawFrame {
-                category: Some(0),
+                status: Some(0),
                 ..RawFrame::default()
             },
-            FrameDecodeError::Category(UnknownErrorCategory(0)),
+            FrameDecodeError::Status(UnknownErrorCategory(0)),
         ),
         // A varint wider than the field's `int32`. Narrowing it would fold this
         // one onto `Success`, which is the status that decides what a requester
         // believes happened to its request.
         (
             RawFrame {
-                category: Some((1_u64 << 32_u32) | 4),
+                status: Some((1_u64 << 32_u32) | 4),
                 ..RawFrame::default()
             },
-            FrameDecodeError::CategoryTooWide(4_294_967_300),
+            FrameDecodeError::StatusTooWide(4_294_967_300),
         ),
         (
             RawFrame {
@@ -270,7 +270,7 @@ fn a_repeated_field_is_refused() -> Result<()> {
         (FIELD_REQUEST_ID, "request_id"),
         (FIELD_SUBSYSTEM, "subsystem"),
         (FIELD_FORMAT, "format"),
-        (FIELD_CATEGORY, "category"),
+        (FIELD_STATUS, "status"),
         (FIELD_PAYLOAD, "payload"),
         (FIELD_RELAY_NODE, "relay_node"),
     ];
@@ -282,7 +282,7 @@ fn a_repeated_field_is_refused() -> Result<()> {
         .encode();
         // Empty for every field, so the repeat is refused for being a second
         // occurrence rather than for anything the occurrence carries.
-        if tag == FIELD_PROTOCOL_VERSION || tag == FIELD_CATEGORY {
+        if tag == FIELD_PROTOCOL_VERSION || tag == FIELD_STATUS {
             raw_varint_field(tag, 1, &mut wire);
         } else {
             raw_bytes_field(tag, b"", &mut wire);
@@ -419,7 +419,7 @@ fn the_frame_fields_match_the_proto() -> Result<()> {
         ("request_id", FIELD_REQUEST_ID, Type::Bytes),
         ("subsystem", FIELD_SUBSYSTEM, Type::String),
         ("format", FIELD_FORMAT, Type::String),
-        ("category", FIELD_CATEGORY, Type::Int32),
+        ("status", FIELD_STATUS, Type::Int32),
         ("payload", FIELD_PAYLOAD, Type::Bytes),
         ("relay_node", FIELD_RELAY_NODE, Type::Bytes),
     ];

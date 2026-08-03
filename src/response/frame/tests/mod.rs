@@ -1,6 +1,6 @@
 use super::{
-    FIELD_CATEGORY, FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE,
-    FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameCapError, FrameHeader,
+    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
+    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameCapError, FrameHeader,
 };
 use crate::codec::Codec;
 use crate::response::{RequestId, ResponseStatus};
@@ -66,7 +66,7 @@ struct RawFrame {
     request: Option<&'static [u8]>,
     subsystem: Option<&'static [u8]>,
     format: Option<&'static [u8]>,
-    category: Option<u64>,
+    status: Option<u64>,
     payload: Option<&'static [u8]>,
     relay: Option<&'static [u8]>,
     /// Stands in for a field a later protocol version might add.
@@ -129,7 +129,7 @@ impl Default for RawFrame {
             request: Some(&RAW_ID),
             subsystem: Some(b"billing"),
             format: Some(CountingCodec::FORMAT_ID.as_bytes()),
-            category: Some(2),
+            status: Some(2),
             payload: Some(b"hi"),
             relay: None,
             unknown: None,
@@ -174,8 +174,8 @@ impl RawFrame {
         if let Some(format) = self.format {
             raw_bytes_field(FIELD_FORMAT, format, &mut dst);
         }
-        if let Some(category) = self.category {
-            raw_varint_field(FIELD_CATEGORY, category, &mut dst);
+        if let Some(status) = self.status {
+            raw_varint_field(FIELD_STATUS, status, &mut dst);
         }
         if let Some(payload) = self.payload {
             raw_bytes_field(FIELD_PAYLOAD, payload, &mut dst);
@@ -214,7 +214,7 @@ fn expected_frame_len(subsystem: &str, payload: usize, relay: bool) -> usize {
         + 18 + 18                                     // target_node, request_id: key + len + 16
         + 2 + subsystem.len()                         // subsystem: key + len + bytes
         + 2 + format                                  // format: key + len + bytes
-        + 2                                           // category: key + value
+        + 2                                           // status: key + value
         + 1 + varint_len(payload) + payload           // payload: key + len + bytes
         + if relay { RELAY_FIELD_BYTES } else { 0 }
 }

@@ -49,8 +49,10 @@ mod tests;
 /// Construction requires the process router. Thus, a responder cannot detach
 /// from the directory and fleet that route its work.
 ///
-/// `subsystem` must match the name that admitted the request tag. Otherwise,
-/// the frame would claim a subsystem that the requester did not await.
+/// `subsystem` is the name this consumer answers peer requests for. Read it
+/// from [`KeyedStateInputs::subsystem`](crate::consumer::wiring::state::KeyedStateInputs::subsystem),
+/// the one source the decode path reads to admit a request tag. A second source
+/// would let a frame claim a subsystem that the requester never awaited.
 pub(crate) struct Responder<C: Codec> {
     sender: TypedSender<C>,
     subsystem: SubsystemName,

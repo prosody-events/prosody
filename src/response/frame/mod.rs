@@ -34,7 +34,7 @@ const FIELD_TARGET_NODE: u32 = 2;
 const FIELD_REQUEST_ID: u32 = 3;
 const FIELD_SUBSYSTEM: u32 = 4;
 const FIELD_FORMAT: u32 = 5;
-const FIELD_CATEGORY: u32 = 6;
+const FIELD_STATUS: u32 = 6;
 const FIELD_PAYLOAD: u32 = 7;
 const FIELD_RELAY_NODE: u32 = 8;
 

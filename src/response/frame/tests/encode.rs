@@ -21,7 +21,7 @@ const FROZEN: [u8; 65] = [
     0x1a, 0x10, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, // request_id
     0x22, 0x07, b'b', b'i', b'l', b'l', b'i', b'n', b'g', // subsystem
     0x2a, 0x0a, b't', b'e', b's', b't', b'-', b'b', b'y', b't', b'e', b's', // format
-    0x30, 0x02, // category = Permanent
+    0x30, 0x02, // status = Permanent
     0x3a, 0x02, b'h', b'i', // payload
 ];
 

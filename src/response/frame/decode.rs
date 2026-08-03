@@ -2,8 +2,8 @@
 //! behalf of a length that peer merely claimed.
 
 use super::{
-    FIELD_CATEGORY, FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE,
-    FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, ID_BYTES,
+    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
+    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, ID_BYTES,
     ResponseFrame,
 };
 use crate::error::UnknownErrorCategory;
@@ -29,7 +29,7 @@ const fn known_field(tag: u32) -> Option<(&'static str, u8)> {
         FIELD_REQUEST_ID => ("request_id", 0b0000_0100),
         FIELD_SUBSYSTEM => ("subsystem", 0b0000_1000),
         FIELD_FORMAT => ("format", 0b0001_0000),
-        FIELD_CATEGORY => ("category", 0b0010_0000),
+        FIELD_STATUS => ("status", 0b0010_0000),
         FIELD_PAYLOAD => ("payload", 0b0100_0000),
         FIELD_RELAY_NODE => ("relay_node", 0b1000_0000),
         _ => return None,
@@ -44,7 +44,7 @@ const fn known_field(tag: u32) -> Option<(&'static str, u8)> {
 /// an amplifier — a capped frame packed with tiny `payload` fields would buy
 /// millions of allocate-and-discard pairs for a few bytes each. Refusing the
 /// repeat is the same posture this decoder already takes toward an empty
-/// `subsystem` or a zero `category`.
+/// `subsystem` or a zero `status`.
 ///
 /// # Errors
 ///
@@ -72,7 +72,7 @@ pub(crate) fn decode_frame<B: Buf>(
     // is sending a well-formed frame. The six fields above exclude their default
     // by construction — the version is at least 1, the ids are 16 bytes, a
     // response is never for an unnamed subsystem or in an unnamed format, and
-    // the category reserves 0 — so their absence is malformed. That is stricter
+    // the status reserves 0 — so their absence is malformed. That is stricter
     // than the `.proto` can state, which is the point: a schema cannot say "not
     // the default", so the decoder does.
     let mut payload = BytesMut::new();
@@ -110,12 +110,12 @@ pub(crate) fn decode_frame<B: Buf>(
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
                 format = decode_text::<B, { FORMAT_MAX_BYTES + 1 }>(src, "format")?;
             }
-            FIELD_CATEGORY => {
+            FIELD_STATUS => {
                 check_wire_type(WireType::Varint, wire_type)?;
                 let raw = decode_varint(src)?;
-                let category =
-                    i32::try_from(raw).map_err(|_| FrameDecodeError::CategoryTooWide(raw))?;
-                status = Some(ResponseStatus::try_from(category)?);
+                let narrowed =
+                    i32::try_from(raw).map_err(|_| FrameDecodeError::StatusTooWide(raw))?;
+                status = Some(ResponseStatus::try_from(narrowed)?);
             }
             FIELD_PAYLOAD => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
@@ -141,7 +141,7 @@ pub(crate) fn decode_frame<B: Buf>(
             target: target.ok_or(FrameDecodeError::MissingField("target_node"))?,
             request: request.ok_or(FrameDecodeError::MissingField("request_id"))?,
             subsystem: subsystem.ok_or(FrameDecodeError::MissingField("subsystem"))?,
-            status: status.ok_or(FrameDecodeError::MissingField("category"))?,
+            status: status.ok_or(FrameDecodeError::MissingField("status"))?,
             relay,
         },
         format: format.ok_or(FrameDecodeError::MissingField("format"))?,
@@ -292,14 +292,14 @@ pub(crate) enum FrameDecodeError {
     #[error(transparent)]
     Subsystem(#[from] SubsystemNameError),
 
-    /// The category field carries a varint too wide to be a status. Narrowing
-    /// it would fold a value no status can be onto one that is.
-    #[error("category varint {0} does not fit int32")]
-    CategoryTooWide(u64),
+    /// The status field carries a varint too wide for its `int32`. Narrowing it
+    /// would fold a value no status can be onto one that is.
+    #[error("status varint {0} does not fit int32")]
+    StatusTooWide(u64),
 
-    /// The category field names no response status.
+    /// The status field names neither a success nor an error category.
     #[error(transparent)]
-    Category(#[from] UnknownErrorCategory),
+    Status(#[from] UnknownErrorCategory),
 
     /// The bytes are not well-formed protobuf.
     #[error(transparent)]

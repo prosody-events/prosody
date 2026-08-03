@@ -2,8 +2,8 @@
 //! cap that only the codec ever grows.
 
 use super::{
-    FIELD_CATEGORY, FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE,
-    FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, ID_BYTES,
+    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
+    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, ID_BYTES,
 };
 use crate::codec::Codec;
 use crate::response::ResponseStatus;
@@ -160,7 +160,7 @@ impl Framed for Staged<'_> {
             dst,
         );
         write_bytes_field(FIELD_FORMAT, self.format.as_bytes(), dst);
-        write_varint_field(FIELD_CATEGORY, status_varint(self.header.status), dst);
+        write_varint_field(FIELD_STATUS, status_varint(self.header.status), dst);
         write_bytes_field(FIELD_PAYLOAD, self.payload, dst);
         if let Some(relay) = self.header.relay {
             write_bytes_field(FIELD_RELAY_NODE, &relay.into_bytes(), dst);
@@ -176,7 +176,7 @@ fn frame_len(header: &FrameHeader, format: &str, payload: usize) -> u64 {
         + bytes_field_len(FIELD_REQUEST_ID, ID_BYTES)
         + bytes_field_len(FIELD_SUBSYSTEM, header.subsystem.as_str().len())
         + bytes_field_len(FIELD_FORMAT, format.len())
-        + varint_field_len(FIELD_CATEGORY, status_varint(header.status))
+        + varint_field_len(FIELD_STATUS, status_varint(header.status))
         + bytes_field_len(FIELD_PAYLOAD, payload)
         + if header.relay.is_some() {
             bytes_field_len(FIELD_RELAY_NODE, ID_BYTES)
