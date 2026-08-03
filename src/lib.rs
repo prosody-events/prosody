@@ -50,6 +50,7 @@ pub mod otel;
 pub mod prelude;
 pub mod producer;
 pub mod propagator;
+mod requester;
 mod response;
 mod router;
 mod segment;

@@ -94,6 +94,13 @@ impl Display for RequestId {
     }
 }
 
+/// Gives the request header writer the UUID without another conversion API.
+impl From<RequestId> for Uuid {
+    fn from(request: RequestId) -> Self {
+        request.0
+    }
+}
+
 /// How a node answered one delivery attempt.
 ///
 /// Each disposition names exactly one gRPC status and only

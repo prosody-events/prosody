@@ -1,0 +1,296 @@
+//! Sends one Kafka request and collects one response per named subsystem.
+
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the process client wiring and peer listener are this module's production \
+                  callers; the requester tests exercise every item"
+    )
+)]
+
+mod collect;
+mod config;
+mod registry;
+
+use self::collect::collect;
+use self::registry::{Admission, Caps, PendingRegistry};
+use crate::error::{ClassifyError, ErrorCategory};
+use crate::producer::{ProducerError, ProsodyProducer};
+use crate::response::headers::{
+    ID_TEXT_LEN, REQUEST_REVISION, RESPONSE_AWAITED_HEADER, RESPONSE_NODE_HEADER,
+    RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, id_text, is_reserved,
+};
+use crate::router::NodeId;
+use crate::subsystem::SubsystemName;
+use crate::{Codec, EventIdentity, Topic};
+use smallvec::SmallVec;
+use std::error::Error;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use std::time::Duration;
+use thiserror::Error;
+use tracing::field::{Empty, display};
+use tracing::{Span, instrument};
+
+#[cfg(test)]
+mod tests;
+
+/// Shortest timeout one request accepts.
+const MIN_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// Reserved headers that occur exactly once in every request.
+const RESERVED_SINGLETONS: usize = 3;
+
+/// Headers one request carries before the list uses the heap.
+const HEADER_INLINE: usize = 8;
+
+/// One answer for one requested subsystem.
+///
+/// This flat union can cross the JavaScript, Python, Ruby, and C boundaries as
+/// a value. Its order matches the requested subsystem slice.
+#[derive(Debug, PartialEq)]
+pub enum Outcome<V, E> {
+    /// The handler succeeded and the payload decoded.
+    Ok(V),
+    /// The handler failed and its error decoded.
+    Handler {
+        /// The application error returned by the handler.
+        error: E,
+        /// The category the responder wrote on the wire.
+        category: ErrorCategory,
+    },
+    /// The subsystem produced no usable answer.
+    Failed(ResponseFailure),
+}
+
+/// Why one requested subsystem produced no usable answer.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ResponseFailure {
+    /// No response arrived before the deadline.
+    #[error("no response arrived before the deadline")]
+    Timeout,
+    /// The responder used a different response format.
+    #[error("the responder answered in another format")]
+    FormatMismatch,
+    /// The response payload did not decode or disagreed with its status.
+    #[error("the response did not decode")]
+    Malformed,
+}
+
+/// Why one complete request failed before it could return subsystem outcomes.
+#[derive(Debug, Error)]
+pub enum RequestError<E: Error> {
+    /// The request named no subsystem.
+    #[error("a request must name at least one subsystem")]
+    NoSubsystems,
+    /// The request named one subsystem more than once.
+    #[error("subsystem {name} occurs more than once")]
+    DuplicateSubsystem {
+        /// The repeated subsystem name.
+        name: SubsystemName,
+    },
+    /// The request named more subsystems than the configured limit.
+    #[error("the request names {count} subsystems; the limit is {max}")]
+    TooManySubsystems {
+        /// Number of requested subsystems.
+        count: usize,
+        /// Configured subsystem limit.
+        max: usize,
+    },
+    /// The timeout is shorter or longer than the configured range.
+    #[error("the request timeout {timeout:?} is outside {min:?}..={max:?}")]
+    TimeoutOutOfRange {
+        /// Requested timeout.
+        timeout: Duration,
+        /// Shortest accepted timeout.
+        min: Duration,
+        /// Longest accepted timeout.
+        max: Duration,
+    },
+    /// A caller-supplied header belongs to the request protocol.
+    #[error("header {name} is reserved for response requests")]
+    ReservedHeader {
+        /// The reserved header name.
+        name: &'static str,
+    },
+    /// Every in-flight request permit is in use.
+    #[error("request admission is exhausted")]
+    AdmissionExhausted,
+    /// Registry shutdown has started.
+    #[error("the requester is shutting down")]
+    ShuttingDown,
+    /// Kafka did not accept the request and no response arrived first.
+    #[error(transparent)]
+    Produce(#[from] ProducerError<E>),
+}
+
+/// Sends requests and returns responses in subsystem order.
+pub(crate) struct ProsodyRequester<C: Codec, R: Codec> {
+    producer: ProsodyProducer<C>,
+    node: NodeId,
+    registry: Arc<PendingRegistry>,
+    _response: PhantomData<fn() -> R>,
+}
+
+impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
+    /// Creates a requester for one node and one response codec.
+    pub(crate) fn new(
+        producer: ProsodyProducer<C>,
+        node: NodeId,
+        registry: Arc<PendingRegistry>,
+    ) -> Self {
+        Self {
+            producer,
+            node,
+            registry,
+            _response: PhantomData,
+        }
+    }
+
+    /// Sends one request and waits for one answer per subsystem.
+    ///
+    /// A complete response set can return before Kafka reports delivery. In
+    /// that case, producer telemetry and deduplication after the report do not
+    /// run because this function drops the send future.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestError`] for invalid arguments, failed admission, a
+    /// produce failure without a response, or shutdown.
+    #[instrument(
+        name = "peer.request",
+        skip_all,
+        fields(request.id = Empty, subsystems = subsystems.len() as i64),
+        err
+    )]
+    pub(crate) async fn request<'a, H, V, E>(
+        &'a self,
+        headers: H,
+        topic: Topic,
+        key: &'a str,
+        payload: C::Payload,
+        subsystems: &'a [SubsystemName],
+        timeout: Duration,
+    ) -> Result<Vec<Outcome<V, E>>, RequestError<C::Error>>
+    where
+        H: IntoIterator<Item = (&'static str, &'a str)>,
+        H::IntoIter: ExactSizeIterator,
+        C::Payload: EventIdentity,
+        R: Codec<Payload = Result<V, E>>,
+        E: ClassifyError,
+    {
+        validate(subsystems, timeout, self.registry.caps())?;
+
+        // The two id texts are declared before the header list, so they outlive
+        // the borrows the list holds on them.
+        let mut request_buf = [0_u8; ID_TEXT_LEN];
+        let mut node_buf = [0_u8; ID_TEXT_LEN];
+        let user_headers = headers.into_iter();
+        let capacity = user_headers
+            .len()
+            .saturating_add(subsystems.len())
+            .saturating_add(RESERVED_SINGLETONS);
+        let mut headers =
+            SmallVec::<[(&'static str, &str); HEADER_INLINE]>::with_capacity(capacity);
+        for (name, value) in user_headers {
+            if is_reserved(name) {
+                return Err(RequestError::ReservedHeader { name });
+            }
+            headers.push((name, value));
+        }
+
+        let registration = self
+            .registry
+            .register(subsystems, R::FORMAT_ID, timeout)
+            .map_err(map_admission)?;
+        Span::current().record("request.id", display(registration.id()));
+
+        append_request_headers(
+            &mut headers,
+            id_text(registration.id().into(), &mut request_buf),
+            id_text(self.node.into(), &mut node_buf),
+            subsystems,
+        );
+
+        let deadline = registration.deadline();
+        collect::<R, V, E, _, _>(
+            &registration,
+            self.producer
+                .send(headers.iter().copied(), topic, key, payload),
+            deadline,
+        )
+        .await
+    }
+}
+
+/// Appends the reserved headers that tell a responder where to answer.
+///
+/// One `response-awaited` header carries one name. A comma is legal in a
+/// subsystem name, so one joined header could not be read back.
+fn append_request_headers<'a>(
+    headers: &mut SmallVec<[(&'static str, &'a str); HEADER_INLINE]>,
+    request: &'a str,
+    node: &'a str,
+    subsystems: &'a [SubsystemName],
+) {
+    headers.push((RESPONSE_VERSION_HEADER, REQUEST_REVISION));
+    headers.push((RESPONSE_REQUEST_ID_HEADER, request));
+    headers.push((RESPONSE_NODE_HEADER, node));
+    headers.extend(
+        subsystems
+            .iter()
+            .map(|subsystem| (RESPONSE_AWAITED_HEADER, subsystem.as_str())),
+    );
+}
+
+/// Checks the arguments before anything is registered or produced.
+///
+/// Two positions with one name could not be told apart, because a response
+/// names its subsystem. So a repeated name is refused here rather than left to
+/// fill one position and time out in the other. The validated awaited limit
+/// keeps the count small, so the pairwise scan needs no set and no allocation.
+fn validate<E: Error>(
+    subsystems: &[SubsystemName],
+    timeout: Duration,
+    caps: &Caps,
+) -> Result<(), RequestError<E>> {
+    if subsystems.is_empty() {
+        return Err(RequestError::NoSubsystems);
+    }
+    if subsystems.len() > caps.max_awaited {
+        return Err(RequestError::TooManySubsystems {
+            count: subsystems.len(),
+            max: caps.max_awaited,
+        });
+    }
+    for i in 0..subsystems.len() {
+        for j in (i + 1)..subsystems.len() {
+            if subsystems[i] == subsystems[j] {
+                return Err(RequestError::DuplicateSubsystem {
+                    name: subsystems[i].clone(),
+                });
+            }
+        }
+    }
+    if !(MIN_TIMEOUT..=caps.max_timeout).contains(&timeout) {
+        return Err(RequestError::TimeoutOutOfRange {
+            timeout,
+            min: MIN_TIMEOUT,
+            max: caps.max_timeout,
+        });
+    }
+    Ok(())
+}
+
+/// Maps a registry refusal onto the error a caller sees.
+///
+/// An id already in use reads as exhausted capacity: a fresh `UUIDv7` puts a
+/// collision out of reach, and refusing is what keeps the live request under
+/// that id from being overwritten.
+fn map_admission<E: Error>(admission: Admission) -> RequestError<E> {
+    match admission {
+        Admission::Exhausted | Admission::IdInUse => RequestError::AdmissionExhausted,
+        Admission::ShuttingDown => RequestError::ShuttingDown,
+    }
+}

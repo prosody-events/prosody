@@ -40,6 +40,15 @@ pub(crate) const RESPONSE_REQUEST_ID_HEADER: &str = "response-request-id";
 pub(crate) const RESPONSE_NODE_HEADER: &str = "response-node";
 pub(crate) const RESPONSE_AWAITED_HEADER: &str = "response-awaited";
 
+/// Header names that [`ProsodyRequester`](crate::requester::ProsodyRequester)
+/// refuses in caller-supplied headers.
+pub(crate) const RESERVED_REQUEST_HEADERS: [&str; 4] = [
+    RESPONSE_VERSION_HEADER,
+    RESPONSE_REQUEST_ID_HEADER,
+    RESPONSE_NODE_HEADER,
+    RESPONSE_AWAITED_HEADER,
+];
+
 /// The one request-metadata revision this responder understands, in the exact
 /// text a producer must write.
 ///
@@ -48,13 +57,14 @@ pub(crate) const RESPONSE_AWAITED_HEADER: &str = "response-awaited";
 /// which versions the response frame between two peers. This one freezes what
 /// the headers *mean*, so a later revision that redefines a header cannot be
 /// read under the old rules and answered confidently. One revision has one text
-/// form, as one id has one text form: `01` and `+1` are refused.
-const REQUEST_REVISION: &str = "1";
+/// form, as one id has one text form: `01` and `+1` are refused. The requester
+/// writes this value, so the writer and reader cannot differ.
+pub(crate) const REQUEST_REVISION: &str = "1";
 
 /// The only accepted length of an id header value: the 36-character hyphenated
 /// UUID. Fixing the length rejects the simple, braced and URN forms, so one id
 /// has one text form.
-const ID_TEXT_LEN: usize = 36;
+pub(crate) const ID_TEXT_LEN: usize = 36;
 
 /// Most `response-awaited` headers one record may carry.
 ///
@@ -198,6 +208,16 @@ where
     }
 
     Ok(addressed.then_some(RequestTag::new(id, node)))
+}
+
+/// Renders one id in its 36-character header form without an allocation.
+pub(crate) fn id_text(id: Uuid, buf: &mut [u8; ID_TEXT_LEN]) -> &str {
+    id.hyphenated().encode_lower(buf)
+}
+
+/// Reports whether `name` belongs to the request protocol.
+pub(crate) fn is_reserved(name: &str) -> bool {
+    RESERVED_REQUEST_HEADERS.contains(&name)
 }
 
 /// Reads one awaited subsystem name.
