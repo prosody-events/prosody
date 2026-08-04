@@ -109,9 +109,11 @@ pub(crate) struct Destination {
 /// Never hold one across an await. Shutdown waits for every live ticket, so a
 /// reservation held across an await holds the whole process's shutdown with it.
 ///
-/// `permit` is declared before `ticket` on purpose: fields drop in declaration
-/// order, so the slot goes back before the gate is left, and a gate count of
-/// zero really means no slot is held.
+/// Both ways out get that order from where they are written. `commit` gets it
+/// from its statements, which is the path a sender takes and the one the suite
+/// pins. A plain drop gets it from the field order here, because fields drop in
+/// declaration order: keep `permit` before `ticket`. A field drop order is a
+/// language rule rather than an observable step, so no test pins that one.
 pub(crate) struct Reservation<'a> {
     slot: usize,
     destination: Arc<Destination>,

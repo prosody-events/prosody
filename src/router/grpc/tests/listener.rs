@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::mpsc::unbounded_channel;
-use tokio::time::sleep;
+use tokio::time::{pause, resume, sleep};
 use tonic::client::Grpc;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::transport::Endpoint as Dialled;
@@ -202,9 +202,9 @@ fn a_connection_over_the_cap_is_refused_and_counted() -> Result<()> {
 /// HTTP/2 handshake would otherwise hold one for the life of the process, and
 /// enough of them would close the port to every real peer. One byte must not
 /// buy that, which is why the case that speaks once is here beside the case
-/// that never speaks. Time is paused, so the deadline is the only thing that
-/// can complete the server's read.
-#[tokio::test(start_paused = true)]
+/// that never speaks. Time is paused only for the wait the deadline must end,
+/// so the deadline is the only thing that can complete that read.
+#[tokio::test]
 async fn a_connection_that_falls_silent_is_closed() -> Result<()> {
     init_test_logging();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -223,12 +223,19 @@ async fn a_connection_that_falls_silent_is_closed() -> Result<()> {
                 "the byte the peer sent must be read"
             );
         }
+        // Every step above waits for a byte the kernel carries, so it runs in
+        // real time: a clock that may jump would reach the listener's deadline
+        // while the byte was still in flight, and the read would fail for a
+        // silence that never happened. Nothing below waits for the network, so
+        // the clock is free to jump to the deadline here.
+        pause();
         let closed = select! {
             read = connection.read(&mut byte) => read,
             () = sleep(SILENCE_GUARD) => {
                 bail!("the silent connection was never closed (spoke = {spoke})")
             }
         };
+        resume();
         ensure!(
             closed.is_err(),
             "a connection that sends nothing more must be closed, not held (spoke = {spoke})"

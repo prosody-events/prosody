@@ -36,9 +36,9 @@ const HELD: usize = CELLS * SLOTS;
 /// provably busy. The trace also keeps a bounded set of further reservations,
 /// so several destinations are busy at once and the eviction scan has to
 /// choose. Every step then re-reads the table directly: the length never
-/// changes, the live cells never exceed the configured maximum, no destination
-/// hands out more slots than it has, and the held node keeps the very cell and
-/// the very occupancy it started with.
+/// changes, the live cells are exactly the admissions no eviction has taken
+/// back, no destination hands out more slots than it has, and the held node
+/// keeps the very cell and the very occupancy it started with.
 #[quickcheck]
 fn prop_the_fleet_stays_bounded_and_keeps_a_busy_destination(steps: Vec<u8>) -> TestResult {
     let Ok(fleet) = fleet(CELLS, SLOTS) else {
@@ -74,9 +74,10 @@ fn prop_the_fleet_stays_bounded_and_keeps_a_busy_destination(steps: Vec<u8>) -> 
             "every refusal is counted, and nothing else is"
         );
         assert_eq!(fleet.capacity(), CELLS, "the table never grows");
-        assert!(
-            fleet.live_count() <= CELLS,
-            "live destinations must stay inside the table"
+        assert_eq!(
+            fleet.live_count() as u64,
+            fleet.admitted() - fleet.evicted(),
+            "a live cell is an admission no eviction has taken back"
         );
         assert_eq!(
             fleet.live(held_node),
@@ -205,8 +206,11 @@ fn a_closed_fleet_refuses_every_reservation() -> Result<()> {
 ///
 /// This is what a shutdown depends on. A drain that has seen the gate empty
 /// must find nobody still about to queue work, so the hand-over has to finish
-/// inside the gate. The drain is polled from inside the hand-over itself, which
-/// is the only place that ordering is observable.
+/// inside the gate. Every observation below reads the gate and the destination
+/// together, because the claim is about the two of them: while the slot is
+/// still somewhere, the gate holds the reservation, and once the gate is empty
+/// every slot is back. The hand-over is polled from inside itself, which is the
+/// only place that order is observable.
 #[test]
 fn a_reservation_leaves_the_gate_only_after_its_slot_does() -> Result<()> {
     let runtime = Builder::new_current_thread().enable_time().build()?;
@@ -224,6 +228,11 @@ fn a_reservation_leaves_the_gate_only_after_its_slot_does() -> Result<()> {
                 still_draining(drain.as_mut()),
                 "the gate must still hold the reservation while its slot is handed on"
             );
+            assert_eq!(
+                handed.available(node(0)),
+                Some(SLOTS - 1),
+                "the slot must still be taken while it is handed on"
+            );
             drop(slot);
             Ok(())
         });
@@ -232,8 +241,18 @@ fn a_reservation_leaves_the_gate_only_after_its_slot_does() -> Result<()> {
             poll!(drain.as_mut()).is_ready(),
             "the drain must finish once the slot has been handed on"
         );
+        assert_eq!(
+            handed.available(node(0)),
+            Some(SLOTS),
+            "an empty gate must mean every slot is back"
+        );
 
         let reservation = released.reserve(node(0))?;
+        assert_eq!(
+            released.available(node(0)),
+            Some(SLOTS - 1),
+            "a held reservation must hold one of its destination's slots"
+        );
         let mut drain = pin!(released.close());
         assert!(
             poll!(drain.as_mut()).is_pending(),
@@ -243,6 +262,11 @@ fn a_reservation_leaves_the_gate_only_after_its_slot_does() -> Result<()> {
         assert!(
             poll!(drain.as_mut()).is_ready(),
             "the drain must finish once the reservation is released"
+        );
+        assert_eq!(
+            released.available(node(0)),
+            Some(SLOTS),
+            "an empty gate must mean every slot is back"
         );
         Ok(())
     })
