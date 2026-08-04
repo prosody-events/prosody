@@ -206,6 +206,13 @@ impl PendingRequest {
     /// [`abandon_unanswered`](Self::abandon_unanswered) reads it as an answer
     /// and a failed delivery report does not fail the call.
     ///
+    /// A response that arrives after the deadline but before the waiter wakes
+    /// is still stored, because the only thing tested here is the record's
+    /// status. Reading the clock instead would turn a delivered answer into a
+    /// discard, and an answer is worth more to the caller than a timeout. The
+    /// window is the gap between the deadline elapsing and the waiter task
+    /// being scheduled.
+    ///
     /// The caller releases the map guard before this function takes the state
     /// lock. This function releases the state lock before it notifies.
     pub(super) fn deposit(&self, frame: ResponseFrame, max_payload: usize) -> ResponseDisposition {

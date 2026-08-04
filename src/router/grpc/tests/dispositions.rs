@@ -37,12 +37,6 @@ const SCENARIOS: &[Scenario] = &[
     Scenario::ResponseTooLarge,
 ];
 
-/// Dispositions no delivery can reach, and why.
-///
-/// A target that is not 16 bytes is a frame the reader refuses, so it never
-/// reaches the service at all and no decoded frame can carry it.
-const UNREACHABLE: &[ResponseDisposition] = &[ResponseDisposition::MalformedTarget];
-
 /// Dispositions the relay suites cover, because each one needs a forward this
 /// listener's relay never completes.
 ///
@@ -236,8 +230,8 @@ fn a_frame_for_another_node_is_never_accepted() -> Result<()> {
 }
 
 /// Every disposition is reached by a case above, or named as one the relay
-/// suites reach, or named as one nothing can reach. Without this, a case
-/// dropped from the generator would stop being covered silently.
+/// suites reach. Without this, a case dropped from the generator would stop
+/// being covered silently.
 #[test]
 fn every_disposition_has_a_reachable_wire_case() -> Result<()> {
     // The generator draws from `SCENARIOS`, and both `seed` and `deliveries`
@@ -254,12 +248,10 @@ fn every_disposition_has_a_reachable_wire_case() -> Result<()> {
             .iter()
             .any(|scenario| scenario.expected() == *disposition)
             || *disposition == ResponseDisposition::Unreachable
-            || RELAYED.contains(disposition)
-            || UNREACHABLE.contains(disposition);
+            || RELAYED.contains(disposition);
         ensure!(
             covered,
-            "{disposition:?} is reached by no case here, and is named neither a relay outcome nor \
-             an unreachable one"
+            "{disposition:?} is reached by no case here, and is not named as a relay outcome"
         );
     }
     Ok(())

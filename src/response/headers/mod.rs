@@ -286,14 +286,14 @@ pub(crate) enum HeaderRejection {
 impl HeaderRejection {
     /// Counts one refused decode under this rejection's fixed label.
     pub(crate) fn record(self) {
-        REJECTED.add(1, &[KeyValue::new("reason", self.reason())]);
+        REJECTED.add(1, &[KeyValue::new("reason", self.label())]);
     }
 
     /// The metric label for this rejection.
     ///
     /// A fixed string per variant: nothing a topic writer supplies ever
     /// becomes a label.
-    const fn reason(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::DuplicateSingleton => "duplicate",
             Self::MissingSingleton => "missing",

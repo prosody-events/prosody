@@ -1,7 +1,7 @@
 //! What an operator sets for peer routing, and the rules that refuse a
 //! degenerate value at startup.
 
-use crate::router::LABEL_CAPACITY;
+use crate::router::MAX_LABEL_BYTES;
 use crate::router::directory::RegistrationTtl;
 use derive_builder::Builder;
 use validator::{Validate, ValidationError};
@@ -13,12 +13,6 @@ const DEFAULT_ADDRESS_CACHE_CAPACITY: usize = 1024;
 /// short strings. A million of them is already more memory than the cache is
 /// worth. The bound stops a typo from asking for a heap the process lacks.
 pub(super) const MAX_ADDRESS_CACHE_CAPACITY: usize = 1_048_576;
-
-/// Longest label an operator can configure for a host or a network. It is the
-/// largest label that stays inline in [`Host`](crate::router::Host) and
-/// [`NetworkId`](crate::router::directory::NetworkId), which both hold
-/// [`LABEL_CAPACITY`] bytes with one of them spent on the length.
-const MAX_LABEL_BYTES: usize = LABEL_CAPACITY - 1;
 
 /// What an operator sets for peer routing.
 ///

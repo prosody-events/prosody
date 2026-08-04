@@ -8,7 +8,9 @@
 //! runtime can hold either argument.
 
 use super::super::{PeerInputs, PeerRuntime, RouterConfiguration};
-use super::{ALPHA, CONTACT, LEASE, NUMERIC_CONTACT, TIMEOUT, frame_cap, header, listener};
+use super::{
+    ALPHA, CONTACT, LEASE, NUMERIC_CONTACT, TIMEOUT, frame_cap, header, listener, requester,
+};
 use crate::codec::Codec;
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
@@ -75,7 +77,7 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
     TEST_RUNTIME.block_on(async {
         let directory = directory(LEASE).await?;
         let config = RouterConfiguration::builder().network(NETWORK).build()?;
-        let requester = RequesterConfiguration::default();
+        let requester = requester();
         let runtime = PeerRuntime::start(PeerInputs {
             store: store().await?.clone(),
             listener: listener().await?,
@@ -216,7 +218,7 @@ async fn start_over(
     let bound = bind().await?;
     let here = local(bound.address().port());
     let config = RouterConfiguration::default();
-    let requester = RequesterConfiguration::default();
+    let requester = requester();
     let runtime = PeerRuntime::start(PeerInputs {
         store: store().await?.clone(),
         listener: bound,

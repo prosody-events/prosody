@@ -31,55 +31,183 @@ const ATTEMPTS: u32 = 1;
 const PACED: u32 = 1;
 const PERIOD: Duration = Duration::from_secs(1);
 
-/// A direct endpoint that does not answer is retried on the advertised endpoint
-/// inside the same response, and the next response to that node starts where
-/// the last one succeeded.
+/// Every candidate walk two responses to one destination can make.
 ///
-/// The two endpoints are distinct ports, so the counts below say which endpoint
-/// each attempt reached. Three attempts in total is what separates a remembered
-/// preference from a route decided again: without the memory the second
-/// response would try the dead endpoint once more, and there would be four.
-#[test]
-fn a_failed_direct_endpoint_falls_back_and_is_then_remembered() -> Result<()> {
-    let runtime = paused()?;
-    runtime.block_on(async {
-        let harness = Harness::dual_homed(settings())?;
-        let fleet = harness.fleet();
-        harness.script(
-            TARGET,
-            Script::Fail {
+/// Each row states what the two endpoints answer, and the four numbers the walk
+/// must come to. Together they cover every arm of the walk:
+///
+/// - **A wrong endpoint moves on, and the endpoint that answered is
+///   remembered.** `remembers` and `refusal_is_remembered`, whose second
+///   response starts at the remembered endpoint and so touches the other one
+///   fewer times.
+/// - **A status stops the walk.** `refusal_is_remembered` and
+///   `refused_entry_point`: the entry point is never tried in the first, and
+///   the direct endpoint is tried once in the second.
+/// - **A walk with no answer at all remembers nothing.** `forgets`, which
+///   clears a preference the response before it set, and `nothing_answers`,
+///   which never sets one.
+const CASES: &[Case] = &[
+    Case {
+        name: "remembers",
+        first: (Answer::Silent, Answer::Takes),
+        attempts: 2,
+        second: (Answer::Silent, Answer::Takes),
+        direct: 1,
+        advertised: 2,
+        sent: 2,
+        remembered: 1,
+    },
+    Case {
+        name: "refusal_is_remembered",
+        first: (Answer::Refuses(Code::ResourceExhausted), Answer::Takes),
+        attempts: 1,
+        second: (Answer::Refuses(Code::ResourceExhausted), Answer::Takes),
+        direct: 2,
+        advertised: 0,
+        sent: 0,
+        remembered: 1,
+    },
+    Case {
+        name: "forgets",
+        first: (Answer::Silent, Answer::Takes),
+        attempts: 2,
+        second: (Answer::Silent, Answer::Silent),
+        direct: 2,
+        advertised: 2,
+        sent: 1,
+        remembered: 0,
+    },
+    Case {
+        name: "nothing_answers",
+        first: (Answer::Silent, Answer::Silent),
+        attempts: 2,
+        second: (Answer::Silent, Answer::Silent),
+        direct: 2,
+        advertised: 2,
+        sent: 0,
+        remembered: 0,
+    },
+    Case {
+        name: "refused_entry_point",
+        first: (Answer::Silent, Answer::Refuses(Code::Internal)),
+        attempts: 2,
+        second: (Answer::Silent, Answer::Refuses(Code::Internal)),
+        direct: 1,
+        advertised: 2,
+        sent: 0,
+        remembered: 1,
+    },
+];
+
+/// What one endpoint answers.
+#[derive(Clone, Copy, Debug)]
+enum Answer {
+    /// Accepts the response.
+    Takes,
+    /// Says nothing at all, which is a wrong endpoint.
+    Silent,
+    /// Answers this status, which is a process on the path speaking.
+    Refuses(Code),
+}
+
+/// One candidate walk: two responses to the same destination, each answered by
+/// the scripts the row states.
+struct Case {
+    name: &'static str,
+    /// What the direct and the advertised endpoint answer the first response.
+    first: (Answer, Answer),
+    /// Attempts the first response makes. Waiting for exactly this many is what
+    /// lets the second response's scripts be set after the first has finished:
+    /// one worker serves one destination, so nothing else can be in flight.
+    attempts: usize,
+    /// What the two endpoints answer the second response.
+    second: (Answer, Answer),
+    /// Attempts each endpoint took over both responses. The two endpoints are
+    /// distinct ports, so these say which endpoint each attempt reached.
+    direct: usize,
+    advertised: usize,
+    /// Responses delivered, and destinations left remembering an endpoint.
+    sent: u64,
+    remembered: usize,
+}
+
+impl Answer {
+    /// The transport script this answer is driven by.
+    fn script(self) -> Script {
+        match self {
+            Self::Takes => Script::Fail {
+                failure: SendFailure::Unreachable,
+                times: 0,
+            },
+            Self::Silent => Script::Fail {
                 failure: SendFailure::Unreachable,
                 times: usize::MAX,
             },
-        );
+            Self::Refuses(status) => Script::Fail {
+                failure: SendFailure::Status(status),
+                times: usize::MAX,
+            },
+        }
+    }
+}
 
-        harness.send(TARGET)?;
-        harness.send(TARGET)?;
+/// A route is walked until something answers, and the destination remembers the
+/// endpoint that spoke — a refusal included, because a status is a process on
+/// the path speaking rather than an endpoint failing.
+///
+/// The next response starts at the remembered endpoint, and a walk that reaches
+/// no answer at all leaves nothing remembered. That memory lives in the
+/// destination's own cell, which
+/// `an_evicted_destination_forgets_which_endpoint_answered` pins.
+///
+/// Which statuses count as a wrong endpoint is not this suite's subject:
+/// `every_failure_answers_the_two_questions_the_send_path_asks` states that per
+/// status, so one refusing status is enough here.
+#[test]
+fn a_route_is_walked_until_something_answers_and_that_endpoint_is_remembered() -> Result<()> {
+    for case in CASES {
+        let runtime = paused()?;
+        runtime.block_on(async {
+            let mut harness = Harness::dual_homed(settings())?;
+            let fleet = harness.fleet();
+            apply(&harness, case.first);
+            harness.send(TARGET)?;
+            // Taken from the stream rather than left for the drain, because
+            // reading them is what says the first response is over.
+            let mut recorded = Vec::with_capacity(case.attempts);
+            for _ in 0..case.attempts {
+                recorded.push(harness.next_delivery().await?);
+            }
+            apply(&harness, case.second);
+            harness.send(TARGET)?;
 
-        let drained = harness.drain().await?;
-        assert_eq!(
-            attempts_on(&drained.deliveries, port(TARGET)),
-            1,
-            "the dead endpoint must be tried once, by the first response alone"
-        );
-        assert_eq!(
-            attempts_on(&drained.deliveries, advertised_port(TARGET)),
-            2,
-            "the answering endpoint must serve the first response's fallback and the whole of the \
-             second"
-        );
-        assert_eq!(drained.sent, 2, "both responses must be delivered");
-        assert_eq!(
-            fleet.remembered(),
-            1,
-            "the destination that answered must remember which endpoint did"
-        );
-        assert!(
-            fleet.live(node(TARGET)).is_some(),
-            "the preference must live in the destination's own cell"
-        );
-        Ok(())
-    })
+            let drained = harness.drain().await?;
+            recorded.extend(drained.deliveries);
+            let name = case.name;
+            assert_eq!(
+                attempts_on(&recorded, port(TARGET)),
+                case.direct,
+                "{name}: wrong number of attempts on the direct endpoint"
+            );
+            assert_eq!(
+                attempts_on(&recorded, advertised_port(TARGET)),
+                case.advertised,
+                "{name}: wrong number of attempts on the entry point"
+            );
+            assert_eq!(drained.sent, case.sent, "{name}: wrong number delivered");
+            assert_eq!(
+                fleet.remembered(),
+                case.remembered,
+                "{name}: wrong number of destinations remembering an endpoint"
+            );
+            assert!(
+                fleet.live(node(TARGET)).is_some(),
+                "{name}: the destination must still hold its cell"
+            );
+            Ok::<(), color_eyre::Report>(())
+        })?;
+    }
+    Ok(())
 }
 
 /// A remembered endpoint dies with the cell that holds it.
@@ -204,131 +332,10 @@ fn every_attempt_of_one_response_claims_the_destination_pacing() -> Result<()> {
     })
 }
 
-/// A destination that refused the response still names the endpoint that
-/// refused it.
-///
-/// A status is a process on the path speaking rather than the endpoint failing.
-/// So the walk stops there — the entry point is never tried — and the endpoint
-/// that spoke is what the destination remembers, though nothing was delivered.
-/// A responder that only remembered a delivery would forget it here and try the
-/// whole route again next time.
-///
-/// Three of the four statuses are ones a relay gives as well: a process that
-/// may not send the frame on answers `FAILED_PRECONDITION`, one that cannot
-/// answers `RESOURCE_EXHAUSTED`, and one out of time answers
-/// `DEADLINE_EXCEEDED`. Nothing on the wire says which process answered, so all
-/// of them are read as the endpoint's own word.
-#[test]
-fn an_endpoint_that_refused_the_response_is_still_the_one_that_answered() -> Result<()> {
-    let runtime = paused()?;
-    runtime.block_on(async {
-        for refusal in [
-            Code::Internal,
-            Code::FailedPrecondition,
-            Code::ResourceExhausted,
-            Code::DeadlineExceeded,
-        ] {
-            let harness = Harness::dual_homed(settings())?;
-            let fleet = harness.fleet();
-            harness.script(
-                TARGET,
-                Script::Fail {
-                    failure: SendFailure::Status(refusal),
-                    times: usize::MAX,
-                },
-            );
-            harness.send(TARGET)?;
-
-            let drained = harness.drain().await?;
-            assert_eq!(
-                attempts_on(&drained.deliveries, port(TARGET)),
-                1,
-                "the endpoint that answered {refusal:?} must be tried once and not again"
-            );
-            assert_eq!(
-                attempts_on(&drained.deliveries, advertised_port(TARGET)),
-                0,
-                "a node that answered {refusal:?} for itself must not have its other endpoint \
-                 tried"
-            );
-            assert_eq!(
-                drained.sent, 0,
-                "the response refused {refusal:?} must not count as sent"
-            );
-            assert_eq!(
-                fleet.remembered(),
-                1,
-                "the destination must remember the endpoint that answered {refusal:?}"
-            );
-        }
-        Ok(())
-    })
-}
-
-/// A destination forgets an endpoint that stops answering.
-///
-/// The first response falls back and is delivered, so the destination remembers
-/// the entry point. That entry point then goes silent too, and the next
-/// response walks the whole route without an answer. A verdict kept past that
-/// would send every later response to a dead address first, for as long as the
-/// cell lived.
-///
-/// The runtime is single threaded, so the worker is not running while the
-/// assertions are. A recorded attempt therefore means the response that made it
-/// has gone as far as it can, and what it left in the cell is settled.
-#[test]
-fn a_destination_forgets_an_endpoint_that_stopped_answering() -> Result<()> {
-    let runtime = paused()?;
-    runtime.block_on(async {
-        let mut harness = Harness::dual_homed(settings())?;
-        let fleet = harness.fleet();
-        harness.script(
-            TARGET,
-            Script::Fail {
-                failure: SendFailure::Unreachable,
-                times: usize::MAX,
-            },
-        );
-
-        harness.send(TARGET)?;
-        assert_eq!(
-            harness.next_delivery().await?.port,
-            port(TARGET),
-            "the first response must try the direct endpoint first"
-        );
-        assert_eq!(
-            harness.next_delivery().await?.port,
-            advertised_port(TARGET),
-            "the first response must fall back to the endpoint that answers"
-        );
-        assert_eq!(
-            fleet.remembered(),
-            1,
-            "the delivered response must leave the endpoint that took it remembered"
-        );
-
-        harness.script_advertised(
-            TARGET,
-            Script::Fail {
-                failure: SendFailure::Unreachable,
-                times: usize::MAX,
-            },
-        );
-        harness.send(TARGET)?;
-
-        let drained = harness.drain().await?;
-        assert_eq!(drained.sent, 1, "only the first response must be delivered");
-        assert!(
-            fleet.live(node(TARGET)).is_some(),
-            "the destination must still hold its cell"
-        );
-        assert_eq!(
-            fleet.remembered(),
-            0,
-            "an endpoint that answered nothing must not stay remembered"
-        );
-        Ok(())
-    })
+/// Scripts what each of the target's two endpoints answers next.
+fn apply(harness: &Harness, (direct, advertised): (Answer, Answer)) {
+    harness.script(TARGET, direct.script());
+    harness.script_advertised(TARGET, advertised.script());
 }
 
 /// The fleet every case here runs against.

@@ -7,7 +7,7 @@
 //! re-parents `peer.response.receive`, and "it is not a root span" would not
 //! notice.
 
-use super::{ALPHA, Harness, OneListener, SUITE_DESTINATIONS, SUITE_SLOTS, header, register};
+use super::{ALPHA, Harness, SUITE_DESTINATIONS, SUITE_SLOTS, header, reaching, register};
 use crate::codec::Codec;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::sender::TypedSender;
@@ -39,7 +39,7 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
     let spans = GlobalSpans::install()?;
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
-        let router = OneListener::reaching(
+        let router = reaching(
             harness.cap,
             &harness.address,
             SUITE_DESTINATIONS,

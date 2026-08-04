@@ -18,9 +18,9 @@
 )]
 
 use crate::cassandra::errors::CassandraStoreError;
-use crate::cassandra::{CassandraStore, TABLE_NODE_DIRECTORY, TABLE_NODES_BY_GROUP};
+use crate::cassandra::{CassandraStore, TABLE_NODE_DIRECTORY};
 use crate::cassandra_queries;
-use crate::router::{Host, LABEL_CAPACITY, NodeId};
+use crate::router::{Host, LABEL_CAPACITY, MAX_LABEL_BYTES, NodeId};
 use fixedstr::Flexstr;
 use scylla::statement::Consistency;
 use std::sync::Arc;
@@ -28,19 +28,11 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{instrument, warn};
 use uuid::Uuid;
-use xxhash_rust::xxh3::xxh3_64;
 
 pub(crate) mod cache;
 
 #[cfg(test)]
 pub(crate) mod tests;
-
-/// Number of partitions one group's membership index is spread over.
-///
-/// A group has no ceiling, so a single partition would bound neither the write
-/// rate nor the size of the index, and every listing would read the one
-/// partition that every renewal, expiry and shutdown tombstone lands in.
-const GROUP_SHARDS: u64 = 16;
 
 /// Where a process can be reached: a host and the port peers dial there.
 ///
@@ -63,13 +55,13 @@ pub(crate) type NetworkId = Flexstr<LABEL_CAPACITY>;
 /// The consumer group a process belongs to, and the Kafka cluster that scopes
 /// it.
 ///
-/// Both parts are required because both sit in the membership index's partition
-/// key: Kafka scopes a group id to its cluster, so two unrelated clusters can
-/// each run a group of the same name.
+/// Both parts are required because Kafka scopes a group id to its cluster: two
+/// unrelated clusters can each run a group of the same name, so the group alone
+/// names no set of processes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GroupMembership {
-    pub(crate) cluster: Flexstr<64>,
-    pub(crate) group: Flexstr<64>,
+    pub(crate) cluster: Flexstr<LABEL_CAPACITY>,
+    pub(crate) group: Flexstr<LABEL_CAPACITY>,
 }
 
 /// One live process, as the directory publishes it.
@@ -169,11 +161,9 @@ impl NodeDirectory {
     ) -> Result<Self, CassandraStoreError> {
         let mut queries = DirectoryQueries::new(store.session(), store.keyspace()).await?;
         for statement in [
-            &mut queries.register_node,
-            &mut queries.register_member,
-            &mut queries.read_node,
-            &mut queries.remove_node,
-            &mut queries.remove_member,
+            &mut queries.register,
+            &mut queries.read,
+            &mut queries.remove,
         ] {
             statement.set_consistency(Consistency::LocalOne);
         }
@@ -191,13 +181,11 @@ impl NodeDirectory {
 
     /// The consistency each prepared statement carries.
     #[cfg(test)]
-    pub(crate) fn statement_consistencies(&self) -> [Option<Consistency>; 5] {
+    pub(crate) fn statement_consistencies(&self) -> [Option<Consistency>; 3] {
         [
-            self.queries.register_node.get_consistency(),
-            self.queries.register_member.get_consistency(),
-            self.queries.read_node.get_consistency(),
-            self.queries.remove_node.get_consistency(),
-            self.queries.remove_member.get_consistency(),
+            self.queries.register.get_consistency(),
+            self.queries.read.get_consistency(),
+            self.queries.remove.get_consistency(),
         ]
     }
 
@@ -207,20 +195,9 @@ impl NodeDirectory {
     /// rewrites every cell that shares the lease" true by construction: one
     /// statement lists every column, so a partial update is unwritable.
     ///
-    /// The node row is written first and the membership index second. The two
-    /// are deliberately not batched — they are different partitions.
-    /// [`deregister`](Self::deregister) mirrors the order.
-    ///
-    /// The order decides what a failure between the two statements leaves
-    /// behind. It leaves a live process unlisted, never an index entry that
-    /// names a missing row. A listing must still tolerate such an entry, for a
-    /// second reason: the two rows carry separate leases stamped in write
-    /// order. So after a crash the index outlives the node row by the gap
-    /// between the two writes.
-    ///
     /// # Errors
     ///
-    /// Returns the driver's error when either write fails.
+    /// Returns the driver's error when the write fails.
     #[instrument(level = "debug", skip_all, fields(node = %registration.node), err)]
     pub(crate) async fn register(
         &self,
@@ -243,7 +220,7 @@ impl NodeDirectory {
         // has half vanished.
         self.store
             .execute_unpaged_discard(
-                &self.queries.register_node,
+                &self.queries.register,
                 (
                     Uuid::from(registration.node),
                     registration.direct.host.as_str(),
@@ -257,30 +234,16 @@ impl NodeDirectory {
                     self.ttl.seconds(),
                 ),
             )
-            .await?;
-        if let Some(membership) = &registration.group {
-            self.store
-                .execute_unpaged_discard(
-                    &self.queries.register_member,
-                    (
-                        membership.cluster.as_str(),
-                        membership.group.as_str(),
-                        shard_for(registration.node),
-                        Uuid::from(registration.node),
-                        self.ttl.seconds(),
-                    ),
-                )
-                .await?;
-        }
-        Ok(())
+            .await
     }
 
     /// Reads one node's registration.
     ///
-    /// A row that has lost its direct endpoint or its hostname — a row that
-    /// half expired, or one written by something other than this code — reads
-    /// as absent. The caller then reports the node unreachable instead of
-    /// dialing a partial address.
+    /// A row that has lost its direct endpoint or its hostname, and a row
+    /// carrying a label over [`MAX_LABEL_BYTES`], read as absent. Both are rows
+    /// that half expired or that something other than this code wrote. The
+    /// caller then reports the node unreachable instead of dialing a partial
+    /// address.
     ///
     /// # Errors
     ///
@@ -294,7 +257,7 @@ impl NodeDirectory {
         let row = self
             .store
             .session()
-            .execute_unpaged(&self.queries.read_node, (Uuid::from(node),))
+            .execute_unpaged(&self.queries.read, (Uuid::from(node),))
             .await?
             .into_rows_result()?
             .maybe_first_row::<DirectoryColumns>()?;
@@ -313,7 +276,24 @@ impl NodeDirectory {
         else {
             return Ok(None);
         };
-        let (Some(direct), Some(hostname)) = (endpoint(direct_host, direct_port), hostname) else {
+        // A label longer than a registration may publish makes the whole row
+        // unresolvable rather than a shorter label: truncating would dial a
+        // different host, and keeping it would put an unbounded string in the
+        // address cache, which counts entries and not bytes.
+        let bounded = [
+            &direct_host,
+            &advertised_host,
+            &network,
+            &cluster,
+            &group,
+            &hostname,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|label| label.len() <= MAX_LABEL_BYTES);
+        let (true, Some(direct), Some(hostname)) =
+            (bounded, endpoint(direct_host, direct_port), hostname)
+        else {
             warn!(%node, "directory row is not resolvable");
             return Ok(None);
         };
@@ -327,40 +307,22 @@ impl NodeDirectory {
         }))
     }
 
-    /// Removes `registration`'s rows.
-    ///
-    /// The index entry goes first and the node row second, which mirrors
-    /// [`register`](Self::register): a process on the way out stops being
-    /// listed before it stops being readable.
+    /// Removes `registration`'s row.
     ///
     /// Idempotent: a CQL delete of an absent row is a no-op, so a repeated
-    /// shutdown costs two writes and changes nothing.
+    /// shutdown costs one write and changes nothing.
     ///
     /// # Errors
     ///
-    /// Returns the driver's error when either delete fails.
+    /// Returns the driver's error when the delete fails.
     #[instrument(level = "debug", skip_all, fields(node = %registration.node), err)]
     pub(crate) async fn deregister(
         &self,
         registration: &NodeRegistration,
     ) -> Result<(), CassandraStoreError> {
-        if let Some(membership) = &registration.group {
-            self.store
-                .execute_unpaged_discard(
-                    &self.queries.remove_member,
-                    (
-                        membership.cluster.as_str(),
-                        membership.group.as_str(),
-                        shard_for(registration.node),
-                        Uuid::from(registration.node),
-                    ),
-                )
-                .await?;
-        }
         self.store
-            .execute_unpaged_discard(&self.queries.remove_node, (Uuid::from(registration.node),))
-            .await?;
-        Ok(())
+            .execute_unpaged_discard(&self.queries.remove, (Uuid::from(registration.node),))
+            .await
     }
 }
 
@@ -370,38 +332,24 @@ cassandra_queries! {
     /// filtering, and no client-supplied write timestamp.
     pub(crate) struct DirectoryQueries {
         /// Writes every column of one node's row under one lease.
-        register_node: (
+        register: (
             "INSERT INTO $keyspace.{} (node_id, direct_host, direct_port, advertised_host, \
              advertised_port, network, kafka_cluster_id, group_id, hostname) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?",
             TABLE_NODE_DIRECTORY
         ),
 
-        /// Adds one node to its group's membership index, under the same lease.
-        register_member: (
-            "INSERT INTO $keyspace.{} (kafka_cluster_id, group_id, shard, node_id) \
-             VALUES (?, ?, ?, ?) USING TTL ?",
-            TABLE_NODES_BY_GROUP
-        ),
-
         /// Point-reads one node's row.
-        read_node: (
+        read: (
             "SELECT direct_host, direct_port, advertised_host, advertised_port, network, \
              kafka_cluster_id, group_id, hostname FROM $keyspace.{} WHERE node_id = ?",
             TABLE_NODE_DIRECTORY
         ),
 
         /// Removes one node's row on a clean shutdown.
-        remove_node: (
+        remove: (
             "DELETE FROM $keyspace.{} WHERE node_id = ?",
             TABLE_NODE_DIRECTORY
-        ),
-
-        /// Removes one node from its group's membership index.
-        remove_member: (
-            "DELETE FROM $keyspace.{} WHERE kafka_cluster_id = ? AND group_id = ? \
-             AND shard = ? AND node_id = ?",
-            TABLE_NODES_BY_GROUP
         ),
     }
 }
@@ -417,16 +365,6 @@ type DirectoryColumns = (
     Option<String>,
     Option<String>,
 );
-
-/// The index partition a node's membership row lands in.
-///
-/// Derived from the node id and nothing else, so registration and
-/// deregistration compute the same partition without reading anything. The hash
-/// makes the spread independent of which UUID version minted the id.
-fn shard_for(node: NodeId) -> i32 {
-    // The remainder is below `GROUP_SHARDS`, so the cast cannot truncate.
-    (xxh3_64(&node.into_bytes()) % GROUP_SHARDS) as i32
-}
 
 /// An endpoint from its two columns, or nothing when either is missing or the
 /// port is outside the range a port can hold.

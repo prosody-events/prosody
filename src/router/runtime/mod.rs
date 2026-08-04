@@ -24,7 +24,7 @@ use crate::router::grpc::health::ProcessHealth;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, TransportError, serve};
 use crate::router::relay::Relay;
-use crate::router::{Host, NodeId, RouterHandle};
+use crate::router::{Host, MAX_LABEL_BYTES, NodeId, RouterHandle};
 use rand::RngExt;
 use std::future::Future;
 use std::net::{ToSocketAddrs, UdpSocket};
@@ -123,11 +123,21 @@ impl PeerRuntime {
         inputs: PeerInputs<'_, H>,
     ) -> Result<Self, PeerRuntimeError> {
         inputs.router.validate()?;
-        let fleet = Arc::new(DestinationFleet::new(inputs.fleet)?);
-        let pending = PendingRegistry::new(inputs.requester)?;
         // One ceiling for both seams: the frames this process sends and the
         // frames its listener admits.
         let frame_cap = inputs.listener.frame_cap();
+        // The requester's ceiling and the listener's are validated apart and
+        // meet here for the first time. A requester that admits a payload no
+        // frame this listener accepts could carry would never receive one, and
+        // the caller would learn that only from its own timeout.
+        if inputs.requester.max_response_bytes > frame_cap.bytes() {
+            return Err(PeerRuntimeError::ResponseCeiling {
+                bytes: inputs.requester.max_response_bytes,
+                cap: frame_cap.bytes(),
+            });
+        }
+        let fleet = Arc::new(DestinationFleet::new(inputs.fleet)?);
+        let pending = PendingRegistry::new(inputs.requester)?;
         let transport = Arc::new(GrpcSender::new(frame_cap, &fleet));
         let ttl = inputs.router.registration_ttl;
         let directory = NodeDirectory::new(inputs.store, ttl).await?;
@@ -363,17 +373,29 @@ fn routed_host(contact: &str) -> Option<Host> {
 /// listener actually bound. That is what makes an equal network label an
 /// optimization — a neighbour dials an address it reaches without the entry
 /// point. The configured host and port reach `advertised` alone.
+///
+/// Every label this returns is inside [`MAX_LABEL_BYTES`], which is what lets a
+/// reader treat a longer one as a row this code did not write. The configured
+/// labels are validated; the routed probe answers with an address literal,
+/// which is far shorter; and the machine name is checked here.
 fn discover_registration(
     node: NodeId,
     listener: &BoundListener,
     contact: &str,
     config: &RouterConfiguration,
     group: Option<GroupMembership>,
-) -> Result<NodeRegistration, whoami::Error> {
+) -> Result<NodeRegistration, PeerRuntimeError> {
     let listener_port = listener.address().port();
     // The machine name is published in its own right, so the lookup is paid
     // once and reused where the routed probe finds no address.
-    let hostname = Host::make(&hostname()?);
+    let machine = hostname()?;
+    if machine.len() > MAX_LABEL_BYTES {
+        return Err(PeerRuntimeError::HostnameTooLong {
+            bytes: machine.len(),
+            limit: MAX_LABEL_BYTES,
+        });
+    }
+    let hostname = Host::make(&machine);
     Ok(NodeRegistration {
         node,
         direct: Endpoint {
@@ -418,6 +440,17 @@ pub(crate) enum PeerRuntimeError {
     #[error("host discovery failed: {0:#}")]
     Discovery(#[from] whoami::Error),
 
+    /// The machine's own name is longer than a published label may be.
+    /// Refusing to start is preferable to publishing a shortened name, which
+    /// would be a different machine's name.
+    #[error("the machine name is {bytes} bytes, over the {limit}-byte label limit")]
+    HostnameTooLong {
+        /// The machine name's length.
+        bytes: usize,
+        /// The longest label a registration may publish.
+        limit: usize,
+    },
+
     /// The directory could not prepare its statements, or it rejected this
     /// process's first registration.
     #[error("node registration failed: {0:#}")]
@@ -434,4 +467,14 @@ pub(crate) enum PeerRuntimeError {
     /// The bound peer listener could not start its service.
     #[error("the peer listener could not be served: {0:#}")]
     Listener(#[from] TransportError),
+
+    /// This process would admit a response no frame its own listener accepts
+    /// could carry.
+    #[error("responses of up to {bytes} bytes are admitted behind a {cap}-byte frame cap")]
+    ResponseCeiling {
+        /// What the requester admits for one response payload.
+        bytes: usize,
+        /// What one frame this listener accepts may carry in total.
+        cap: usize,
+    },
 }

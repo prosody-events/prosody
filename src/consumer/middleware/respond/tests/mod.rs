@@ -21,7 +21,7 @@ use crate::response::RequestId;
 use crate::response::frame::FrameCap;
 use crate::response::headers::RequestTag;
 use crate::router::RelayHop;
-use crate::router::loopback::{Delivery, TestRouter, config, node};
+use crate::router::loopback::{Delivery, Drained, TestRouter, collect_deliveries, config, node};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
@@ -85,13 +85,6 @@ struct Fixture<C: Codec<Payload = Result<(), TestError>>> {
     router: TestRouter,
     responder: Arc<Responder<C>>,
     deliveries: UnboundedReceiver<Delivery>,
-}
-
-/// What one fixture came to once every delivery worker had finished.
-struct Drained {
-    deliveries: Vec<Delivery>,
-    sent: u64,
-    dropped: u64,
 }
 
 impl Codec for ResultProbeCodec {
@@ -220,15 +213,8 @@ impl<C: Codec<Payload = Result<(), TestError>>> Fixture<C> {
         responder.drain().await;
         drop(router);
 
-        // Closing first, so the collection ends at what the workers recorded
-        // rather than waiting for a stream nothing else will write to.
-        deliveries.close();
-        let mut recorded = Vec::new();
-        while let Some(delivery) = deliveries.recv().await {
-            recorded.push(delivery);
-        }
         Ok(Drained {
-            deliveries: recorded,
+            deliveries: collect_deliveries(&mut deliveries).await,
             sent: counters.sent(),
             dropped: counters.dropped(),
         })

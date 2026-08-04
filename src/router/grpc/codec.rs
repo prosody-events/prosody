@@ -17,6 +17,7 @@ use crate::response::frame::{FrameCap, ResponseFrame};
 use bytes::{Buf, BufMut, Bytes};
 use tonic::Status;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tracing::warn;
 
 /// The compression flag and the length prefix gRPC writes before each message.
 const GRPC_HEADER_BYTES: usize = 5;
@@ -112,6 +113,9 @@ impl Decoder for ServerFrameCodec {
             Ok(frame) => Ok(Some(frame)),
             Err(error) => {
                 TRANSPORT.record_rejected_frame();
+                // The only record of why: the status carries a literal, so the
+                // detail the `Display` form names stays on this node.
+                warn!(%error, "peer frame could not be read");
                 Err(refusal(&error))
             }
         }
@@ -182,9 +186,14 @@ impl Decoder for ClientFrameCodec {
 /// A frame over the ceiling is a size fault and a `RESOURCE`-shaped answer
 /// would invite a retry, so it is `OUT_OF_RANGE`. Everything else is a peer
 /// that sent bytes this build cannot read, which no retry fixes.
+///
+/// The wording is [`FrameDecodeError::message`] rather than the `Display` form,
+/// because this port is unauthenticated: a formatted status would allocate per
+/// refused frame at a rate the sender chooses, and would echo back the lengths
+/// and versions that sender claimed.
 fn refusal(error: &FrameDecodeError) -> Status {
     match error {
-        FrameDecodeError::FrameTooLarge { .. } => Status::out_of_range(error.to_string()),
+        FrameDecodeError::FrameTooLarge { .. } => Status::out_of_range(error.message()),
         FrameDecodeError::Truncated { .. }
         | FrameDecodeError::MissingField(_)
         | FrameDecodeError::RepeatedField(_)
@@ -195,6 +204,6 @@ fn refusal(error: &FrameDecodeError) -> Status {
         | FrameDecodeError::Subsystem(_)
         | FrameDecodeError::StatusTooWide(_)
         | FrameDecodeError::Status(_)
-        | FrameDecodeError::Wire(_) => Status::invalid_argument(error.to_string()),
+        | FrameDecodeError::Wire(_) => Status::invalid_argument(error.message()),
     }
 }

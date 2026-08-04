@@ -145,8 +145,6 @@ pub(crate) enum ResponseDisposition {
     FormatMismatch,
     /// The payload is larger than the waiting process retains for one response.
     ResponseTooLarge,
-    /// The frame names no target node, or one that is not 16 bytes.
-    MalformedTarget,
     /// The frame is for another node and has already been relayed once.
     AlreadyRelayed,
     /// The relay has no capacity to forward the frame.
@@ -190,7 +188,6 @@ impl ResponseDisposition {
             Self::UnexpectedSubsystem | Self::FormatMismatch | Self::AlreadyRelayed => {
                 Code::FailedPrecondition
             }
-            Self::MalformedTarget => Code::InvalidArgument,
             Self::ResponseTooLarge | Self::NoRelayCapacity => Code::ResourceExhausted,
             Self::RelayDeadlineExceeded => Code::DeadlineExceeded,
             Self::Unreachable => Code::Unavailable,
@@ -211,7 +208,6 @@ impl ResponseDisposition {
             Self::UnexpectedSubsystem => "this request does not await that subsystem",
             Self::FormatMismatch => "the payload format is not the one this request expects",
             Self::ResponseTooLarge => "the payload is over this process's response ceiling",
-            Self::MalformedTarget => "the frame names no valid target node",
             Self::AlreadyRelayed => "the frame has already been relayed once",
             Self::NoRelayCapacity => "this node has no capacity to relay the frame",
             Self::RelayDeadlineExceeded => "no time is left to relay the frame",
@@ -242,7 +238,6 @@ impl ResponseDisposition {
             Self::UnexpectedSubsystem => "unexpected_subsystem",
             Self::FormatMismatch => "format_mismatch",
             Self::ResponseTooLarge => "response_too_large",
-            Self::MalformedTarget => "malformed_target",
             Self::AlreadyRelayed => "already_relayed",
             Self::NoRelayCapacity => "no_relay_capacity",
             Self::RelayDeadlineExceeded => "relay_deadline_exceeded",

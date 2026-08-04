@@ -1,11 +1,12 @@
 //! What the gRPC health service answers, and whose verdict it is.
 
-use super::{Harness, TestHealth};
+use super::Harness;
 use crate::consumer::Managers;
 use crate::consumer::probes::ProbeServer;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::router::grpc::generated::peer_server::SERVICE_NAME;
 use crate::router::grpc::health::{ConsumerHealth, PeerHealth};
+use crate::router::loopback::TestHealth;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;

@@ -25,11 +25,16 @@ pub(super) const MAX_TOTAL_SLOTS: usize = 8_192;
 
 /// Most bytes one sender may commit to per-destination encode scratch.
 ///
-/// One sender builds one encode buffer per destination and holds it for the
-/// sender's whole life. A process builds one sender per handler-result type, so
-/// what the process commits to is this number multiplied by the number of
-/// senders it builds. A buffer is at the ceiling between responses; a codec may
-/// grow it beyond that while it serializes one.
+/// One sender builds one encode buffer per destination, and one task beside it,
+/// and holds both for the sender's whole life. A buffer is at the ceiling
+/// between responses; a codec may grow it beyond that while it serializes one.
+///
+/// **The budget is per sender, and nothing counts senders.** That exposure is
+/// accepted rather than overlooked. At the defaults one sender is 4 MiB and 64
+/// tasks; at this ceiling it is 64 MiB and 1024 tasks. A process builds one
+/// sender per handler-result type, which is a small deployment constant that no
+/// traffic moves, so the multiplier is knowable by whoever writes the handlers
+/// and is not a configuration value any validator could read.
 const MAX_SCRATCH_BYTES_PER_SENDER: u64 = 64 * 1024 * 1024;
 
 /// Fastest one destination may be sent to.

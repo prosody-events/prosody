@@ -305,3 +305,29 @@ pub(crate) enum FrameDecodeError {
     #[error(transparent)]
     Wire(#[from] DecodeError),
 }
+
+impl FrameDecodeError {
+    /// What the sending peer is told about a frame this reader refused.
+    ///
+    /// Separate from `Display`, which is the local diagnostic and names the
+    /// lengths and versions the peer itself claimed. Every message here is a
+    /// literal, so a refusal on an unauthenticated port allocates nothing and
+    /// echoes nothing back.
+    pub(crate) const fn message(&self) -> &'static str {
+        match self {
+            Self::FrameTooLarge { .. } => "the frame is over this listener's size cap",
+            Self::Truncated { .. } => "a frame field claims more bytes than the frame carries",
+            Self::MissingField(_) => "the frame omits a field it must carry",
+            Self::RepeatedField(_) => "the frame repeats a field it may carry once",
+            Self::UnsupportedVersion(_) => {
+                "the frame states a protocol version this node does not speak"
+            }
+            Self::MalformedId { .. } => "a frame identifier is not 16 bytes",
+            Self::StringTooLong { .. } => "a frame text field is over its limit",
+            Self::InvalidUtf8(_) => "a frame text field is not UTF-8",
+            Self::Subsystem(_) => "the frame names no subsystem a responder could hold",
+            Self::StatusTooWide(_) | Self::Status(_) => "the frame states no known outcome",
+            Self::Wire(_) => "the frame is not well-formed protobuf",
+        }
+    }
+}

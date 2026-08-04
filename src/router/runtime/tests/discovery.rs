@@ -3,8 +3,7 @@
 use super::super::{
     PeerInputs, PeerRuntime, RouterConfiguration, discover_registration, routed_host,
 };
-use super::{CONTACT, NUMERIC_CONTACT, listener};
-use crate::requester::config::RequesterConfiguration;
+use super::{CONTACT, NUMERIC_CONTACT, listener, requester};
 use crate::router::directory::tests::support::store;
 use crate::router::directory::{Endpoint, RegistrationTtl};
 use crate::router::fleet::config::FleetConfiguration;
@@ -133,7 +132,7 @@ fn a_resolved_address_stops_being_served_once_its_row_is_gone() -> Result<()> {
             registration_ttl: RegistrationTtl::try_from(RegistrationTtl::MIN)?,
             ..RouterConfiguration::default()
         };
-        let requester = RequesterConfiguration::default();
+        let requester = requester();
         let runtime = PeerRuntime::start(PeerInputs {
             store: store().await?.clone(),
             listener: listener().await?,

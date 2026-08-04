@@ -267,10 +267,14 @@ async fn deliver_job<C: Codec, R: Router>(
 /// Every attempt claims the destination's pacing, so the rate limit bounds what
 /// one destination is asked for rather than what it receives. A response that
 /// falls back enters here a second time, and that endpoint's attempts claim
-/// too. A pacing wait is this process's own queue rather than anything the
-/// endpoint did, so it sits outside this endpoint's share: a destination whose
-/// schedule is far ahead would otherwise read as an endpoint that answered
-/// nothing. A claimed turn is spent whether or not the send happens, so a
+/// too.
+///
+/// The first attempt's pacing wait sits outside this endpoint's share: the
+/// share is read after that wait, so a destination whose schedule is far ahead
+/// does not read as an endpoint that answered nothing. A retry's wait is inside
+/// the share, because the share is fixed once. That is deliberate — recomputing
+/// it would let the first candidate spend past what [`Share`] leaves for the
+/// fallback. A claimed turn is spent whether or not the send happens, so a
 /// retry into a share that is already gone is not made at all.
 async fn deliver<S: ResponseSender, F: Framed + Sync>(
     sender: &S,

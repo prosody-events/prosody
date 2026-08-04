@@ -5,14 +5,13 @@
 //! answer arriving, because the answer is this call returning.
 
 use super::{KEY, NODE, TOPIC, unanswered_call};
+use crate::router::loopback::paused;
 use crate::test_util::{captured_spans, named};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::Value;
 use opentelemetry::trace::SpanKind;
 use opentelemetry_sdk::trace::SpanData;
-use std::io::Error as IoError;
-use tokio::runtime::{Builder, Runtime};
 use uuid::Uuid;
 
 /// The span `request` opens. `#[instrument]` with no explicit name takes the
@@ -66,15 +65,6 @@ fn one_call_opens_a_client_span_naming_its_request_and_its_answers() -> Result<(
 /// [`captured_spans`] scopes a synchronous closure.
 fn run_unanswered_call() -> Result<()> {
     paused()?.block_on(unanswered_call())
-}
-
-/// A current-thread runtime with paused time and the whole driver set, because
-/// the producer this call uses has its own I/O.
-fn paused() -> Result<Runtime, IoError> {
-    Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
 }
 
 /// One span attribute, by key.

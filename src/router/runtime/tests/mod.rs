@@ -85,7 +85,6 @@ struct Shared {
     listener: Endpoint,
     /// The id the runtime minted.
     node: NodeId,
-    membership: GroupMembership,
     directory: NodeDirectory,
 }
 
@@ -106,7 +105,6 @@ impl Process {
     /// already stopped this process's listener.
     async fn new() -> Result<Self> {
         let directory = directory(LEASE).await?;
-        let membership = membership();
         let cap = frame_cap()?;
         let bound = BoundListener::bind(&TransportConfiguration {
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -119,7 +117,7 @@ impl Process {
             port: bound.address().port(),
         };
         let router = RouterConfiguration::default();
-        let requester = RequesterConfiguration::default();
+        let requester = requester();
         let runtime = PeerRuntime::start(PeerInputs {
             store: store().await?.clone(),
             listener: bound,
@@ -128,7 +126,7 @@ impl Process {
             // probe answers with, so the discovered host is the loopback
             // address this listener bound and a process can reach itself.
             contact: NUMERIC_CONTACT,
-            group: Some(membership.clone()),
+            group: Some(membership()),
             router: &router,
             fleet: FleetConfiguration {
                 max_destinations: DESTINATIONS,
@@ -186,7 +184,6 @@ impl Process {
                 barrier,
                 listener,
                 node: runtime.node(),
-                membership,
                 directory,
             },
             runtime,
@@ -210,7 +207,7 @@ async fn plain_process() -> Result<PlainProcess> {
     let bound = listener().await?;
     let bound_port = bound.address().port();
     let router = RouterConfiguration::default();
-    let requester = RequesterConfiguration::default();
+    let requester = requester();
     let runtime = PeerRuntime::start(PeerInputs {
         store: store().await?.clone(),
         listener: bound,
@@ -233,6 +230,18 @@ async fn plain_process() -> Result<PlainProcess> {
 /// The frame ceiling one process's listener and senders share.
 fn frame_cap() -> Result<FrameCap> {
     Ok(FrameCap::new(FRAME_BYTES)?)
+}
+
+/// The requester limits one process under test runs with.
+///
+/// The response ceiling matches the frame ceiling, because `start` refuses a
+/// process that would admit a response no frame its own listener accepts could
+/// carry.
+fn requester() -> RequesterConfiguration {
+    RequesterConfiguration {
+        max_response_bytes: FRAME_BYTES,
+        ..RequesterConfiguration::default()
+    }
 }
 
 /// A header for one successful response to `request`, addressed to `target`.

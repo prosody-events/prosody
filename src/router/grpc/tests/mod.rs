@@ -19,7 +19,7 @@ mod transport;
 
 use super::client::GrpcSender;
 use super::service::PeerService;
-use super::{BoundListener, TransportConfiguration, serve};
+use super::{BoundListener, TransportConfiguration};
 use crate::codec::Codec;
 use crate::requester::config::{MAX_IN_FLIGHT, RequesterConfiguration};
 use crate::requester::registry::PendingRegistry;
@@ -27,25 +27,19 @@ use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader, ResponseFrame};
 use crate::response::{FormatToken, RequestId, ResponseStatus};
-use crate::router::directory::{Endpoint, NodeRegistration};
+use crate::router::directory::Endpoint;
 use crate::router::fleet::DestinationFleet;
-use crate::router::loopback::{TestHealth, TestRouter, config as fleet_config};
+use crate::router::loopback::listener::{FixedRouter, Served, endpoint, transport};
+use crate::router::loopback::{TestRouter, config as fleet_config, registration};
 use crate::router::relay::Relay;
-use crate::router::{
-    Framed, Host, NodeId, RelayHop, ResponseSender, Route, Router, SendFailure, choose_route,
-};
+use crate::router::{Framed, NodeId, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
 use bytes::{BufMut, BytesMut};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
-use std::convert::Infallible;
-use std::future::Future;
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::OnceCell;
-use tokio::sync::oneshot::{Sender, channel};
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tonic::Code;
 
@@ -114,23 +108,7 @@ pub(super) struct Harness {
     pub(super) address: Endpoint,
     /// The ceiling the listener and its matching sender share.
     pub(super) cap: FrameCap,
-    stop: Option<Sender<()>>,
-    served: Option<JoinHandle<()>>,
-}
-
-/// A router whose every node resolves to one listener, over a real socket.
-///
-/// That is not a contrivance: it is exactly what a stale directory entry looks
-/// like. It is also the shape a suite needs to drive a [`TypedSender`] all the
-/// way to a listener, which is the only place the outbound trace context is
-/// really written.
-///
-/// [`TypedSender`]: crate::response::sender::TypedSender
-#[derive(Clone)]
-pub(super) struct OneListener {
-    fleet: Arc<DestinationFleet>,
-    transport: Arc<GrpcSender>,
-    registration: NodeRegistration,
+    served: Served,
 }
 
 /// Bytes already framed, so a suite can put a frame on the wire that no encoder
@@ -152,14 +130,10 @@ impl Harness {
         let served_registry = registry()?;
         let node = NodeId::new();
         let bound = BoundListener::bind(&config).await?;
-        let address = Endpoint {
-            host: Host::make("127.0.0.1"),
-            port: bound.address().port(),
-        };
-        let (stop, stopped) = channel();
+        let address = endpoint(&bound);
         let (relay_router, _relay_deliveries) =
             TestRouter::new(fleet_config(SUITE_DESTINATIONS, SUITE_SLOTS))?;
-        let served = serve(
+        let served = Served::start(
             bound,
             PeerService::new(
                 node,
@@ -168,10 +142,6 @@ impl Harness {
                 config.frame_cap,
                 BUDGET,
             ),
-            TestHealth::new(true, true),
-            // A signal stops the listener; so does dropping the sender, which
-            // is what a harness that is simply dropped does.
-            async move { stopped.await.unwrap_or(()) },
         )?;
         Ok(Self {
             node,
@@ -181,8 +151,7 @@ impl Harness {
             wide: GrpcSender::new(FrameCap::new(WIDE_FRAME_CAP)?, &fleet(SUITE_DESTINATIONS)?),
             address,
             cap: config.frame_cap,
-            stop: Some(stop),
-            served: Some(served),
+            served,
         })
     }
 
@@ -221,72 +190,25 @@ impl Harness {
     }
 
     /// Stops the listener and waits for it to finish.
-    ///
-    /// The listener task logs its own serve error, so a join failure here is a
-    /// panic inside that task and is reported rather than dropped.
-    pub(super) async fn stop(mut self) -> Result<()> {
-        drop(self.stop.take());
-        if let Some(served) = self.served.take() {
-            served.await?;
-        }
-        Ok(())
+    pub(super) async fn stop(self) -> Result<()> {
+        Ok(self.served.stop().await?)
     }
 }
 
-impl OneListener {
-    /// A router that reaches `address` and nothing else, over a fleet of
-    /// `destinations` cells with `slots` slots each.
-    pub(super) fn reaching(
-        cap: FrameCap,
-        address: &Endpoint,
-        destinations: usize,
-        slots: usize,
-    ) -> Result<Self> {
-        let fleet = Arc::new(DestinationFleet::new(fleet_config(destinations, slots))?);
-        Ok(Self {
-            transport: Arc::new(GrpcSender::new(cap, &fleet)),
-            fleet,
-            registration: NodeRegistration {
-                node: NodeId::new(),
-                direct: address.clone(),
-                advertised: None,
-                network: None,
-                group: None,
-                hostname: Host::make("one-listener"),
-            },
-        })
-    }
-}
-
-impl Router for OneListener {
-    fn route(
-        &self,
-        _node: NodeId,
-    ) -> impl Future<Output = Result<Option<Route>, Infallible>> + Send {
-        let route = choose_route(None, &self.registration);
-        async move { Ok(route) }
-    }
-}
-
-impl RelayHop for OneListener {
-    type Error = Infallible;
-    type Sender = GrpcSender;
-
-    fn direct(
-        &self,
-        _node: NodeId,
-    ) -> impl Future<Output = Result<Option<Endpoint>, Infallible>> + Send {
-        let direct = self.registration.direct.clone();
-        async move { Ok(Some(direct)) }
-    }
-
-    fn sender(&self) -> &GrpcSender {
-        &self.transport
-    }
-
-    fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
-    }
+/// A router that reaches `address` and nothing else, over a fleet of
+/// `destinations` cells with `slots` slots each.
+pub(super) fn reaching(
+    cap: FrameCap,
+    address: &Endpoint,
+    destinations: usize,
+    slots: usize,
+) -> Result<FixedRouter> {
+    FixedRouter::new(
+        cap,
+        fleet_config(destinations, slots),
+        Some(registration(address.clone())),
+        None,
+    )
 }
 
 impl Framed for RawFramed {
@@ -297,15 +219,6 @@ impl Framed for RawFramed {
     fn write<B: BufMut>(&self, dst: &mut B) {
         dst.put_slice(&self.0);
     }
-}
-
-/// The listener configuration these suites bind, with `cap` as its ceiling.
-pub(super) fn transport(cap: usize) -> Result<TransportConfiguration> {
-    Ok(TransportConfiguration {
-        bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        frame_cap: FrameCap::new(cap)?,
-        ..TransportConfiguration::default()
-    })
 }
 
 /// A fleet of `destinations` destinations, which is what sizes a sender's

@@ -89,10 +89,6 @@ pub const TABLE_KEYED_STATE_PUBLICATION: &str = "keyed_state_publication";
 /// process rewrites its own row inside that TTL.
 pub const TABLE_NODE_DIRECTORY: &str = "node_directory";
 
-/// Group listing index over [`TABLE_NODE_DIRECTORY`]. The rows carry no column
-/// beyond their key: a listing resolves each member through the directory.
-pub const TABLE_NODES_BY_GROUP: &str = "nodes_by_group";
-
 /// Cassandra's maximum TTL in seconds (~20 years).
 pub const MAX_CASSANDRA_TTL_SECS: i64 = 630_720_000;
 

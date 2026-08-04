@@ -1,15 +1,15 @@
-use super::support::{
-    ArbRegistration, directory, finish, member_shards, membership, registration, store, token,
-};
+use super::support::{ArbRegistration, directory, finish, membership, registration, store, token};
 use crate::cassandra::TABLE_NODE_DIRECTORY;
-use crate::router::NodeId;
-use crate::router::directory::{GROUP_SHARDS, RegistrationTtl, shard_for};
+use crate::router::directory::{
+    Endpoint, GroupMembership, NetworkId, NodeRegistration, RegistrationTtl,
+};
+use crate::router::{Host, MAX_LABEL_BYTES, NodeId};
 use crate::test_util::{TEST_KEYSPACE, TEST_RUNTIME, integration_test_count};
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
-use quickcheck::{QuickCheck, TestResult};
-use quickcheck_macros::quickcheck;
+use fixedstr::Flexstr;
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use scylla::statement::Consistency;
 use std::time::Duration;
 use tokio::time::{Instant, interval};
@@ -18,10 +18,37 @@ use uuid::Uuid;
 /// A lease long enough that nothing under test expires while it runs.
 const STABLE_LEASE: Duration = Duration::from_mins(10);
 
+/// Every label a registration carries. One case pushes one of them over the
+/// bound; the rest stay at it.
+const LABELS: &[Label] = &[
+    Label::DirectHost,
+    Label::AdvertisedHost,
+    Label::Network,
+    Label::Cluster,
+    Label::Group,
+    Label::Hostname,
+];
+
+/// One label of a registration, named so a case can push exactly one of them
+/// over the bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Label {
+    DirectHost,
+    AdvertisedHost,
+    Network,
+    Cluster,
+    Group,
+    Hostname,
+}
+
+impl Arbitrary for Label {
+    fn arbitrary(g: &mut Gen) -> Self {
+        *g.choose(LABELS).unwrap_or(&Self::DirectHost)
+    }
+}
+
 /// What a node publishes is what another process reads back: every field of a
-/// registration survives the round trip, and a registration that names a group
-/// lands in exactly one shard of that group's index while one that names none
-/// lands in no shard at all.
+/// registration survives the round trip.
 #[test]
 fn prop_registration_round_trip() {
     fn property(ArbRegistration(written): ArbRegistration) -> TestResult {
@@ -36,16 +63,6 @@ fn prop_registration_round_trip() {
                 read, written,
                 "the registration did not survive the round trip"
             );
-            let shards = match &written.group {
-                Some(membership) => member_shards(membership, written.node).await?,
-                None => Vec::new(),
-            };
-            let expected = usize::from(written.group.is_some());
-            ensure!(
-                shards.len() == expected,
-                "a registration naming {:?} must occupy {expected} index shard(s), not {shards:?}",
-                written.group
-            );
             Ok(())
         }))
     }
@@ -55,10 +72,60 @@ fn prop_registration_round_trip() {
         .quickcheck(property as fn(ArbRegistration) -> TestResult);
 }
 
+/// A label is bounded at both ends of a row: one at the bound resolves and
+/// stays off the heap, and one byte more makes the whole row unresolvable.
+///
+/// The bound is what makes the address cache bounded in bytes as well as in
+/// entries. The cache charges one unit per entry however many bytes that entry
+/// holds, so a label that reached the heap would let one entry grow to whatever
+/// the process that published it chose. Shortening the label instead would
+/// resolve a different host, which is why the row goes rather than the label.
+#[test]
+fn prop_a_label_over_the_bound_makes_a_row_unresolvable() {
+    fn property(over: Label) -> TestResult {
+        finish(TEST_RUNTIME.block_on(async {
+            let directory = directory(STABLE_LEASE).await?;
+            let bounded = labelled(NodeId::new(), None);
+            directory.register(&bounded).await?;
+            let read = directory
+                .read(bounded.node)
+                .await?
+                .ok_or_else(|| eyre!("a registration at the bound must resolve"))?;
+            ensure!(
+                read == bounded,
+                "a registration at the bound did not survive the round trip"
+            );
+            let inline = read.direct.host.is_fixed()
+                && read.hostname.is_fixed()
+                && read.network.as_ref().is_some_and(Flexstr::is_fixed)
+                && read
+                    .advertised
+                    .as_ref()
+                    .is_some_and(|entry| entry.host.is_fixed());
+            ensure!(
+                inline,
+                "a resolved registration must hold no label on the heap"
+            );
+
+            let oversized = labelled(NodeId::new(), Some(over));
+            directory.register(&oversized).await?;
+            ensure!(
+                directory.read(oversized.node).await?.is_none(),
+                "a row whose {over:?} is one byte over the bound must not resolve"
+            );
+            Ok(())
+        }))
+    }
+    init_test_logging();
+    QuickCheck::new()
+        .tests(integration_test_count(25))
+        .quickcheck(property as fn(Label) -> TestResult);
+}
+
 /// A registration lives on a lease and nothing else. Every cell a node writes
-/// carries a TTL inside the lease, and past the lease with no refresh both the
-/// node row and its index entry are gone — so resolution finds nothing and the
-/// node reads as unreachable rather than as a stale address to dial.
+/// carries a TTL inside the lease, and past the lease with no refresh the node
+/// row is gone — so resolution finds nothing and the node reads as unreachable
+/// rather than as a stale address to dial.
 #[test]
 fn registration_cells_carry_a_ttl_and_expire() -> Result<()> {
     init_test_logging();
@@ -102,13 +169,12 @@ fn registration_cells_carry_a_ttl_and_expire() -> Result<()> {
         loop {
             ticker.tick().await;
             let resolved = directory.read(node).await?;
-            let shards = member_shards(&membership, node).await?;
-            if resolved.is_none() && shards.is_empty() {
+            if resolved.is_none() {
                 break;
             }
             ensure!(
                 Instant::now() < deadline,
-                "the registration outlived its lease: node {resolved:?}, shards {shards:?}"
+                "the registration outlived its lease: node {resolved:?}"
             );
         }
         Ok(())
@@ -144,10 +210,10 @@ fn half_written_row_reads_as_absent() -> Result<()> {
     })
 }
 
-/// A shutdown delete removes both rows, and repeating it changes nothing: a
+/// A shutdown delete removes the node row, and repeating it changes nothing: a
 /// delete of an absent row is a no-op.
 #[test]
-fn deregister_removes_both_rows_and_repeats_harmlessly() -> Result<()> {
+fn deregister_removes_the_row_and_repeats_harmlessly() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let directory = directory(STABLE_LEASE).await?;
@@ -165,10 +231,6 @@ fn deregister_removes_both_rows_and_repeats_harmlessly() -> Result<()> {
             assert!(
                 directory.read(node).await?.is_none(),
                 "attempt {attempt}: the node row must be gone"
-            );
-            assert!(
-                member_shards(&membership, node).await?.is_empty(),
-                "attempt {attempt}: the index entry must be gone"
             );
         }
         Ok(())
@@ -228,17 +290,25 @@ fn a_lease_exists_only_inside_its_range() -> Result<()> {
     Ok(())
 }
 
-/// A node's index shard is always one of the partitions the index has, so no
-/// membership row lands where a listing never reads.
-#[quickcheck]
-fn prop_shard_is_in_range(high: u64, low: u64) -> TestResult {
-    let mut id = [0_u8; 16];
-    id[..8].copy_from_slice(&high.to_be_bytes());
-    id[8..].copy_from_slice(&low.to_be_bytes());
-    let shard = shard_for(NodeId::from_bytes(id));
-    assert!(
-        (0_i32..GROUP_SHARDS as i32).contains(&shard),
-        "shard {shard} is outside the {GROUP_SHARDS} index partitions"
-    );
-    TestResult::passed()
+/// A registration for `node` whose every label is exactly [`MAX_LABEL_BYTES`]
+/// long, except `over`, which is one byte longer.
+fn labelled(node: NodeId, over: Option<Label>) -> NodeRegistration {
+    let text = |label: Label| "n".repeat(MAX_LABEL_BYTES + usize::from(over == Some(label)));
+    NodeRegistration {
+        node,
+        direct: Endpoint {
+            host: Host::make(&text(Label::DirectHost)),
+            port: 7777,
+        },
+        advertised: Some(Endpoint {
+            host: Host::make(&text(Label::AdvertisedHost)),
+            port: 443,
+        }),
+        network: Some(NetworkId::make(&text(Label::Network))),
+        group: Some(GroupMembership {
+            cluster: Flexstr::make(&text(Label::Cluster)),
+            group: Flexstr::make(&text(Label::Group)),
+        }),
+        hostname: Host::make(&text(Label::Hostname)),
+    }
 }

@@ -61,7 +61,7 @@ fn checksums_match_baseline() -> Result<()> {
         ),
         (
             "20260801_create_node_directory.cql",
-            "a4ac7d032b90e54238d5aac0acaca7fca17d1bf549d9b6b245a3dadb93fbc6df",
+            "e4ae4c62095cac674f4fe27dfe11df32338f238f0911bb176b86fa4858cbd4b6",
         ),
     ]
     .into();

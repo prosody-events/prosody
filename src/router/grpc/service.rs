@@ -191,7 +191,6 @@ fn answer(span: &Span, disposition: ResponseDisposition) -> Result<Response<()>,
         | ResponseDisposition::UnexpectedSubsystem
         | ResponseDisposition::FormatMismatch
         | ResponseDisposition::ResponseTooLarge
-        | ResponseDisposition::MalformedTarget
         | ResponseDisposition::AlreadyRelayed
         | ResponseDisposition::NoRelayCapacity
         | ResponseDisposition::RelayDeadlineExceeded

@@ -1,4 +1,7 @@
-//! An in-process transport, so delivery can be driven without a socket.
+//! Test doubles every suite that drives delivery shares: an in-process
+//! transport, the routers over it, and the collected record of one run.
+//!
+//! A helper any two suites both need lives here rather than in either of them.
 
 use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
@@ -19,6 +22,8 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
+
+pub(crate) mod listener;
 
 /// Port of the first test node. Each node binds one of its own, which is also
 /// the transport's script key.
@@ -54,6 +59,14 @@ pub(crate) struct Delivery {
     pub(crate) bytes: BytesMut,
     pub(crate) at: Instant,
     pub(crate) deadline: Instant,
+}
+
+/// What one sender or responder came to, once every delivery worker had
+/// finished.
+pub(crate) struct Drained {
+    pub(crate) deliveries: Vec<Delivery>,
+    pub(crate) sent: u64,
+    pub(crate) dropped: u64,
 }
 
 /// What one destination answers.
@@ -296,6 +309,18 @@ impl ResponseSender for LoopbackSender {
     }
 }
 
+/// A registration publishing `direct` and nothing else.
+pub(crate) fn registration(direct: Endpoint) -> NodeRegistration {
+    NodeRegistration {
+        node: NodeId::new(),
+        direct,
+        advertised: None,
+        network: None,
+        group: None,
+        hostname: Host::make("test-node"),
+    }
+}
+
 /// A node id from one repeated byte.
 pub(crate) fn node(index: u8) -> NodeId {
     NodeId::from_bytes([index; 16])
@@ -314,12 +339,30 @@ pub(crate) fn advertised_port(index: u8) -> u16 {
     ADVERTISED_PORT_BASE + u16::from(index)
 }
 
-/// Builds a current-thread runtime with paused time.
+/// Builds a current-thread runtime with paused time and the whole driver set.
+///
+/// The drivers are all enabled because some subjects driven here have I/O of
+/// their own; paused time costs nothing to the rest.
 pub(crate) fn paused() -> Result<Runtime, IoError> {
     Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .start_paused(true)
         .build()
+}
+
+/// Every attempt `deliveries` still holds, once nothing else can write to it.
+///
+/// The stream is closed first, so the collection ends at what the workers
+/// recorded rather than waiting for a sender that will never write again.
+pub(crate) async fn collect_deliveries(
+    deliveries: &mut UnboundedReceiver<Delivery>,
+) -> Vec<Delivery> {
+    deliveries.close();
+    let mut recorded = Vec::new();
+    while let Some(delivery) = deliveries.recv().await {
+        recorded.push(delivery);
+    }
+    recorded
 }
 
 /// Builds a fleet configuration for the requested capacity.

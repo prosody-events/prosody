@@ -185,10 +185,9 @@ fn slot(
 
 /// Why one forward did not deliver.
 ///
-/// [`Target`](Self::Target) carries the gRPC status the target itself answered.
-/// The status code travels rather than a code of this crate's own, for the
-/// reason the peer wire module states: a status enum here would need a
-/// translation at both ends and would say nothing more.
+/// [`Target`](Self::Target) carries the gRPC status the target itself answered,
+/// rather than a code of this crate's own, for the reason
+/// [`crate::router::grpc`] states.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum RelayFailure {
     /// This process has no send capacity for the target.

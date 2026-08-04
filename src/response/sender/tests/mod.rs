@@ -10,8 +10,8 @@ use crate::router::RelayHop;
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{
-    Delivery, HANG_GUARD, PUBLISHED_NODES, Script, TestRouter, UNPUBLISHED_NODE, config, node,
-    paused, port,
+    Delivery, Drained, HANG_GUARD, PUBLISHED_NODES, Script, TestRouter, UNPUBLISHED_NODE,
+    collect_deliveries, config, node, paused, port,
 };
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
@@ -44,13 +44,6 @@ pub(super) struct Harness {
     /// Responses this harness queued, counted so [`Harness::drain`] can hold
     /// the sender's counters to their conservation rule.
     queued: Cell<u64>,
-}
-
-/// What one harness came to once every worker had finished.
-pub(super) struct Drained {
-    pub(super) deliveries: Vec<Delivery>,
-    pub(super) sent: u64,
-    pub(super) dropped: u64,
 }
 
 impl Harness {
@@ -163,15 +156,8 @@ impl Harness {
         }
         drop(router);
 
-        // Closing first, so the collection ends at what the workers recorded
-        // rather than waiting for a stream that nothing else will write to.
-        deliveries.close();
-        let mut recorded = Vec::new();
-        while let Some(delivery) = deliveries.recv().await {
-            recorded.push(delivery);
-        }
         let drained = Drained {
-            deliveries: recorded,
+            deliveries: collect_deliveries(&mut deliveries).await,
             sent: counters.sent(),
             dropped: counters.dropped(),
         };

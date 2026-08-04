@@ -1,6 +1,6 @@
 //! What crosses a real hop: the loop stop, the caller's budget, and the trace.
 
-use super::{ALPHA, BUDGET, CAP_BYTES, FixedRouter, Live, PAYLOAD, Pair, TargetRoute};
+use super::{ALPHA, BUDGET, CAP_BYTES, Live, PAYLOAD, Pair, TargetRoute};
 use crate::codec::Codec;
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::encode::{FrameEncoder, Staged};
@@ -14,6 +14,7 @@ use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::TRANSPORT;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::HANG_GUARD;
+use crate::router::loopback::listener::FixedRouter;
 use crate::router::{Host, NodeId, Preference, ResponseSender, Router, SendFailure};
 use crate::subsystem::SubsystemName;
 use crate::test_util::{GlobalMetrics, GlobalSpans, TEST_RUNTIME, label, named};
@@ -255,7 +256,12 @@ async fn crossing(pair: &Pair) -> Result<()> {
         group: None,
         hostname: Host::make("crossing"),
     };
-    let router = FixedRouter::new(cap, Some(elsewhere), Some(NetworkId::make(HERE)))?;
+    let router = FixedRouter::new(
+        cap,
+        FleetConfiguration::default(),
+        Some(elsewhere),
+        Some(NetworkId::make(HERE)),
+    )?;
     let route = router
         .route(pair.target.node)
         .await?

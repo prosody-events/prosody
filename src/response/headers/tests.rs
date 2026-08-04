@@ -425,14 +425,14 @@ fn a_name_that_only_overlaps_the_responder_is_another_subsystem() -> color_eyre:
     Ok(())
 }
 
-/// Every rejection counts under its own label, so one reason can never be read
-/// as another in a dashboard.
+/// Every rejection counts under its own label, so one rejection can never be
+/// read as another in a dashboard.
 #[test]
-fn each_rejection_has_a_distinct_reason() -> color_eyre::Result<()> {
+fn each_rejection_has_a_distinct_label() -> color_eyre::Result<()> {
     assert_distinct_labels(
         HeaderRejection::VARIANTS
             .iter()
-            .map(|rejection| rejection.reason()),
+            .map(|rejection| rejection.label()),
     )
 }
 

@@ -45,6 +45,46 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
     })
 }
 
+/// `start` refuses a response ceiling no frame its own listener accepts could
+/// carry.
+///
+/// Each configuration is valid on its own and neither can see the other, so
+/// this is the one place the product of the two is checkable. Without the
+/// refusal every response at the admitted size would be dropped at the
+/// listener, and the caller would read that only as its own timeout. The
+/// accepting side needs no case here: every other runtime suite starts under
+/// the default requester, whose ceiling equals the default frame cap.
+#[test]
+fn start_refuses_a_response_ceiling_above_the_frame_cap() -> Result<()> {
+    init_test_logging();
+    TEST_RUNTIME.block_on(async {
+        let bound = listener().await?;
+        let cap = bound.frame_cap().bytes();
+        let router = RouterConfiguration::default();
+        let requester = RequesterConfiguration {
+            max_response_bytes: cap + 1,
+            ..RequesterConfiguration::default()
+        };
+        requester.validate()?;
+        let outcome = PeerRuntime::start(PeerInputs {
+            store: store().await?.clone(),
+            listener: bound,
+            health: TestHealth::new(true, true),
+            contact: CONTACT,
+            group: None,
+            router: &router,
+            fleet: FleetConfiguration::default(),
+            requester: &requester,
+        })
+        .await;
+        assert!(
+            matches!(outcome, Err(PeerRuntimeError::ResponseCeiling { .. })),
+            "a response ceiling above the frame cap must stop the runtime from starting"
+        );
+        Ok(())
+    })
+}
+
 /// Three refresh delays fit inside the lease with a quarter of it unspent,
 /// which is the margin two lost refreshes need to heal. The delay also stays
 /// above a fifth of the lease, which caps what the margin costs at five

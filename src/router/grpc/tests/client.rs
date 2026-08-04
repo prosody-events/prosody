@@ -1,6 +1,6 @@
 //! What the sender does with the status a real listener answered.
 
-use super::{ALPHA, Harness, OneListener, header, payload, register};
+use super::{ALPHA, Harness, header, payload, reaching, register};
 use crate::codec::Codec;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::sender::TypedSender;
@@ -69,7 +69,7 @@ fn a_terminal_status_is_attempted_once_and_an_ambiguous_one_is_retried() -> Resu
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
-        let router = OneListener::reaching(harness.cap, &harness.address, DESTINATIONS, SLOTS)?;
+        let router = reaching(harness.cap, &harness.address, DESTINATIONS, SLOTS)?;
         let attempts = router.fleet().config().max_send_attempts;
 
         // Nothing is registered under this id, so the node answers NOT_FOUND.

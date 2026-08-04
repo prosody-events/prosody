@@ -1,18 +1,16 @@
 //! Live-Cassandra harness shared by the directory's tests and the process
 //! runtime's.
 //!
-//! Isolation follows the Cassandra row rule: every test mints fresh node ids
-//! and prefixes each generated group id with a fresh token, so rows are
-//! disjoint in the shared `prosody_test` keyspace and no test creates a
-//! keyspace of its own.
+//! Isolation follows the Cassandra row rule: a directory row is keyed by node
+//! id alone and every test mints fresh ids, so rows are disjoint in the shared
+//! `prosody_test` keyspace and no test creates a keyspace of its own.
 
-use crate::cassandra::{CassandraStore, TABLE_NODES_BY_GROUP};
+use crate::cassandra::CassandraStore;
 use crate::router::directory::{
-    Endpoint, GROUP_SHARDS, GroupMembership, NetworkId, NodeDirectory, NodeRegistration,
-    RegistrationTtl,
+    Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
 };
-use crate::router::{Host, NodeId};
-use crate::test_util::{TEST_KEYSPACE, test_cassandra_config};
+use crate::router::{Host, MAX_LABEL_BYTES, NodeId};
+use crate::test_util::test_cassandra_config;
 use color_eyre::Result;
 use fixedstr::Flexstr;
 use quickcheck::{Arbitrary, Gen, TestResult};
@@ -23,9 +21,10 @@ use uuid::Uuid;
 /// Characters a generated host, hostname or label is built from.
 const LABEL_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789.:-";
 
-/// Longest generated label. It spans both sides of `Flexstr<64>`'s inline
-/// limit, so the heap-spilling representation round-trips too.
-const MAX_LABEL: usize = 70;
+/// Longest generated label. Every label the directory resolves is inside
+/// [`MAX_LABEL_BYTES`], so a generated registration stays resolvable.
+/// `prop_a_label_over_the_bound_makes_a_row_unresolvable` owns the other side.
+const MAX_LABEL: usize = MAX_LABEL_BYTES;
 
 /// One store per test process. `CassandraStore::new` runs the migrator, so a
 /// store per property iteration would spend the run on schema checks.
@@ -38,10 +37,9 @@ pub(crate) struct ArbRegistration(pub(crate) NodeRegistration);
 
 impl Arbitrary for ArbRegistration {
     fn arbitrary(g: &mut Gen) -> Self {
-        let token = token();
         let group = bool::arbitrary(g).then(|| GroupMembership {
-            cluster: Flexstr::make(&format!("{token}-cluster")),
-            group: Flexstr::make(&format!("{token}-{}", label(g))),
+            cluster: Flexstr::make(&label(g)),
+            group: Flexstr::make(&label(g)),
         });
         Self(NodeRegistration {
             node: node_id(g),
@@ -99,40 +97,6 @@ pub(crate) fn registration(node: NodeId, group: GroupMembership) -> NodeRegistra
         group: Some(group),
         hostname: Host::make("worker-7"),
     }
-}
-
-/// The membership index shards that hold `node`, found by scanning every
-/// shard.
-///
-/// Scanning rather than recomputing the production derivation is deliberate:
-/// an expectation built on `shard_for` would move with a wrong derivation and
-/// could never observe one.
-pub(crate) async fn member_shards(membership: &GroupMembership, node: NodeId) -> Result<Vec<i32>> {
-    let session = store().await?.session();
-    let cql = format!(
-        "SELECT node_id FROM {TEST_KEYSPACE}.{TABLE_NODES_BY_GROUP} WHERE kafka_cluster_id = ? \
-         AND group_id = ? AND shard = ? AND node_id = ?"
-    );
-    let mut found = Vec::new();
-    for shard in 0_i32..GROUP_SHARDS as i32 {
-        let row = session
-            .query_unpaged(
-                cql.as_str(),
-                (
-                    membership.cluster.as_str(),
-                    membership.group.as_str(),
-                    shard,
-                    Uuid::from(node),
-                ),
-            )
-            .await?
-            .into_rows_result()?
-            .maybe_first_row::<(Uuid,)>()?;
-        if row.is_some() {
-            found.push(shard);
-        }
-    }
-    Ok(found)
 }
 
 /// Converts a property body's `Result<()>` into a `TestResult`: a store or

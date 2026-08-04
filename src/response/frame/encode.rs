@@ -34,6 +34,12 @@ use thiserror::Error;
 /// is the only place the encoder itself can allocate after construction, and it
 /// does so only when the response before left the scratch over the cap.
 ///
+/// The framework's own response codec never takes that move, and
+/// [`ResultCodec`](crate::codec::ResultCodec) states why: its leading
+/// discriminant means the inner codec is never handed an empty buffer, so the
+/// scratch this encoder allocated once is the buffer every response is written
+/// into.
+///
 /// Staging and framing are two steps because a protobuf `bytes` field writes
 /// its varint length *before* its contents: the payload must be serialized
 /// somewhere before that length is known. [`FrameEncoder::stage`] serializes

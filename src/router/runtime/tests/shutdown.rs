@@ -13,7 +13,7 @@ use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::sender::TypedSender;
 use crate::router::ResponseSender;
-use crate::router::directory::tests::support::{finish, member_shards};
+use crate::router::directory::tests::support::finish;
 use crate::router::fleet::{Refusal, Reservation};
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::HANG_GUARD;
@@ -121,10 +121,6 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
                 "an unconfigured process publishes no entry point and no network"
             );
             ensure!(
-                member_shards(&membership, node).await?.len() == 1,
-                "a started runtime must occupy exactly one index shard"
-            );
-            ensure!(
                 runtime.addresses().resolve(node).await?.as_deref() == Some(&registered),
                 "the runtime must resolve its own node through its cache"
             );
@@ -136,10 +132,6 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
         ensure!(
             directory.read(node).await?.is_none(),
             "shutdown must remove the node row"
-        );
-        ensure!(
-            member_shards(&membership, node).await?.is_empty(),
-            "shutdown must remove the index entry"
         );
         Ok(())
     })
@@ -244,10 +236,7 @@ fn shutdown_from_a_quiet_process_terminates_clean() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let PlainProcess {
-            runtime,
-            directory,
-            membership,
-            ..
+            runtime, directory, ..
         } = plain_process().await?;
         let node = runtime.node();
         let fleet = Arc::clone(runtime.fleet());
@@ -256,10 +245,6 @@ fn shutdown_from_a_quiet_process_terminates_clean() -> Result<()> {
         ensure!(
             directory.read(node).await?.is_none(),
             "shutdown must remove the node row"
-        );
-        ensure!(
-            member_shards(&membership, node).await?.is_empty(),
-            "shutdown must remove the index entry"
         );
         ensure!(
             matches!(fleet.reserve(node), Err(Refusal::ShuttingDown)),
@@ -361,12 +346,6 @@ async fn settled(shared: &Shared, queued: usize) -> Result<()> {
     ensure!(
         shared.directory.read(shared.node).await?.is_none(),
         "shutdown must remove the node row"
-    );
-    ensure!(
-        member_shards(&shared.membership, shared.node)
-            .await?
-            .is_empty(),
-        "shutdown must remove the index entry"
     );
     let transport = GrpcSender::new(frame_cap()?, &shared.fleet);
     let mut encoder = FrameEncoder::new(CountingCodec::default(), frame_cap()?);

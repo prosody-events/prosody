@@ -18,27 +18,21 @@ use crate::requester::registry::PendingRegistry;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader, ResponseFrame};
 use crate::response::{FormatToken, RequestId, ResponseStatus};
-use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
-use crate::router::fleet::DestinationFleet;
+use crate::router::NodeId;
+use crate::router::directory::Endpoint;
 use crate::router::fleet::config::FleetConfiguration;
-use crate::router::grpc::client::GrpcSender;
+use crate::router::grpc::BoundListener;
 use crate::router::grpc::generated::peer_server::Peer;
 use crate::router::grpc::service::PeerService;
-use crate::router::grpc::{BoundListener, TransportConfiguration, serve};
-use crate::router::loopback::{Delivery, TestHealth, TestRouter, node};
-use crate::router::{Host, NodeId, RelayHop, Route, Router, choose_route};
+use crate::router::loopback::listener::{FixedRouter, Served, bind, endpoint};
+use crate::router::loopback::{Delivery, TestRouter, node, registration};
 use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
 use color_eyre::Result;
-use std::convert::Infallible;
-use std::future::Future;
-use std::net::{Ipv4Addr, SocketAddr};
 use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::oneshot::{Sender, channel};
-use tokio::task::JoinHandle;
 use tonic::{Code, Request};
 
 /// The node the in-process suites run as. The test router publishes it, so a
@@ -82,8 +76,7 @@ pub(super) struct Live {
     pub(super) node: NodeId,
     pub(super) registry: Arc<PendingRegistry>,
     pub(super) address: Endpoint,
-    stop: Option<Sender<()>>,
-    served: Option<JoinHandle<()>>,
+    served: Served,
 }
 
 /// Where the target process's own router points.
@@ -93,21 +86,6 @@ pub(super) enum TargetRoute {
     Relay,
     /// Nowhere. The target then forwards nothing and reaches nothing.
     Nowhere,
-}
-
-/// A router that resolves every node to one registration, or to none at all.
-///
-/// One registration for every node is not a contrivance: it is what a stale
-/// directory entry looks like, which is the case forwarding exists for. `here`
-/// is the label the process holding this router was configured with, so
-/// [`Router::route`] applies the declared rules exactly as the production
-/// router does.
-#[derive(Clone)]
-pub(super) struct FixedRouter {
-    fleet: Arc<DestinationFleet>,
-    transport: Arc<GrpcSender>,
-    registration: Option<NodeRegistration>,
-    here: Option<NetworkId>,
 }
 
 impl Process {
@@ -193,8 +171,8 @@ impl Pair {
         targeted: Duration,
         route: TargetRoute,
     ) -> Result<Self> {
-        let relay_bound = bind().await?;
-        let target_bound = bind().await?;
+        let relay_bound = bind(CAP_BYTES).await?;
+        let target_bound = bind(CAP_BYTES).await?;
         let relay_address = endpoint(&relay_bound);
         let target_address = endpoint(&target_bound);
         let relay = Live::serve(relay_bound, Some(target_address), relaying)?;
@@ -226,85 +204,27 @@ impl Live {
         let address = endpoint(&bound);
         let cap = bound.frame_cap();
         let registry = PendingRegistry::new(&RequesterConfiguration::default())?;
-        let router = FixedRouter::new(cap, seen.map(registration), None)?;
-        let (stop, stopped) = channel();
-        let served = serve(
+        let router = FixedRouter::new(
+            cap,
+            FleetConfiguration::default(),
+            seen.map(registration),
+            None,
+        )?;
+        let served = Served::start(
             bound,
             PeerService::new(node, Arc::clone(&registry), Relay::new(router), cap, budget),
-            TestHealth::new(true, true),
-            async move { stopped.await.unwrap_or(()) },
         )?;
         Ok(Self {
             node,
             registry,
             address,
-            stop: Some(stop),
-            served: Some(served),
+            served,
         })
     }
 
     /// Stops this listener and waits for it to finish.
-    async fn stop(mut self) -> Result<()> {
-        drop(self.stop.take());
-        if let Some(served) = self.served.take() {
-            served.await?;
-        }
-        Ok(())
-    }
-}
-
-impl FixedRouter {
-    /// A router over its own fleet and transport, resolving every node to
-    /// `registration` from a process labelled `here`.
-    pub(super) fn new(
-        cap: FrameCap,
-        registration: Option<NodeRegistration>,
-        here: Option<NetworkId>,
-    ) -> Result<Self> {
-        let fleet = Arc::new(DestinationFleet::new(FleetConfiguration::default())?);
-        Ok(Self {
-            transport: Arc::new(GrpcSender::new(cap, &fleet)),
-            fleet,
-            registration,
-            here,
-        })
-    }
-}
-
-impl Router for FixedRouter {
-    fn route(
-        &self,
-        _node: NodeId,
-    ) -> impl Future<Output = Result<Option<Route>, Infallible>> + Send {
-        let route = self
-            .registration
-            .as_ref()
-            .and_then(|registration| choose_route(self.here.as_ref(), registration));
-        async move { Ok(route) }
-    }
-}
-
-impl RelayHop for FixedRouter {
-    type Error = Infallible;
-    type Sender = GrpcSender;
-
-    fn direct(
-        &self,
-        _node: NodeId,
-    ) -> impl Future<Output = Result<Option<Endpoint>, Infallible>> + Send {
-        let direct = self
-            .registration
-            .as_ref()
-            .map(|registration| registration.direct.clone());
-        async move { Ok(direct) }
-    }
-
-    fn sender(&self) -> &GrpcSender {
-        &self.transport
-    }
-
-    fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
+    async fn stop(self) -> Result<()> {
+        Ok(self.served.stop().await?)
     }
 }
 
@@ -325,34 +245,4 @@ pub(super) fn frame(
         format: FormatToken::make(CountingCodec::FORMAT_ID),
         payload: BytesMut::from(PAYLOAD),
     })
-}
-
-/// A listener bound on a port the operating system chooses.
-async fn bind() -> Result<BoundListener> {
-    Ok(BoundListener::bind(&TransportConfiguration {
-        bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        frame_cap: FrameCap::new(CAP_BYTES)?,
-        ..TransportConfiguration::default()
-    })
-    .await?)
-}
-
-/// Where a bound listener is, as a peer dials it.
-fn endpoint(bound: &BoundListener) -> Endpoint {
-    Endpoint {
-        host: Host::make("127.0.0.1"),
-        port: bound.address().port(),
-    }
-}
-
-/// A registration publishing `direct` and nothing else.
-fn registration(direct: Endpoint) -> NodeRegistration {
-    NodeRegistration {
-        node: NodeId::new(),
-        direct,
-        advertised: None,
-        network: None,
-        group: None,
-        hostname: Host::make("relay-suite"),
-    }
 }

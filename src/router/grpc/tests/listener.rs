@@ -108,7 +108,13 @@ fn a_registration_publishes_the_port_the_listener_bound() -> Result<()> {
         let bound = BoundListener::bind(&transport(FRAME_CAP)?).await?;
         let expected = bound.address().port();
         let router = RouterConfiguration::default();
-        let requester = RequesterConfiguration::default();
+        // The response ceiling matches this suite's frame ceiling: `start`
+        // refuses a process that would admit a response its own listener could
+        // not carry.
+        let requester = RequesterConfiguration {
+            max_response_bytes: FRAME_CAP,
+            ..RequesterConfiguration::default()
+        };
         let directory = directory(router.registration_ttl.duration()).await?;
         let runtime = PeerRuntime::start(PeerInputs {
             store: store().await?.clone(),

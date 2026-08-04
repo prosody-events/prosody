@@ -27,13 +27,24 @@ pub(crate) mod loopback;
 pub(crate) mod relay;
 pub(crate) mod runtime;
 
-/// Inline capacity of an operator-configured label. One byte holds the length,
-/// so a label of `LABEL_CAPACITY - 1` bytes never reaches the heap — which is
-/// what keeps a resolved address off the response path's allocator.
-pub(crate) const LABEL_CAPACITY: usize = 64;
+/// Inline capacity of a label. One byte holds the length, so a label of
+/// [`MAX_LABEL_BYTES`] never reaches the heap.
+const LABEL_CAPACITY: usize = 64;
 
-/// The host a node publishes for its peers to dial. Any ordinary hostname or
-/// address stays inline; a longer one spills to the heap.
+/// Longest label this crate publishes or resolves.
+///
+/// It is the largest label that stays inline in [`Host`] and
+/// [`NetworkId`](directory::NetworkId), and both ends of the directory hold to
+/// it: a process refuses to publish a longer one, and a row carrying a longer
+/// one reads as unresolvable. That is what makes the address cache bounded in
+/// bytes as well as in entries — the cache charges one unit per entry however
+/// many bytes it holds, so an unbounded label would make a bounded entry count
+/// buy nothing.
+pub(crate) const MAX_LABEL_BYTES: usize = LABEL_CAPACITY - 1;
+
+/// The host a node publishes for its peers to dial. Every host that reaches the
+/// directory is bounded by [`MAX_LABEL_BYTES`], so a resolved address stays off
+/// the response path's allocator.
 pub(crate) type Host = Flexstr<LABEL_CAPACITY>;
 
 /// Identifies one live prosody process.
