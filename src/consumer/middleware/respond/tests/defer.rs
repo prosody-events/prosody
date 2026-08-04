@@ -27,7 +27,7 @@ use crate::response::frame::decode::decode_frame;
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::loopback::{node, paused};
 use crate::telemetry::Telemetry;
-use crate::test_util::{SAMPLED_REMOTE_TRACE, captured_spans, sampled_remote_context};
+use crate::test_util::{captured_spans, named, sampled_remote_context};
 use crate::timers::TimerType;
 use crate::{Key, Offset, Partition, Topic};
 use color_eyre::Result;
@@ -52,10 +52,9 @@ const REQUEST: u8 = 44;
 /// The span a worker opens for one outbound response.
 const SENT: &str = "peer.response.send";
 
-/// The trace the reloaded record belongs to: the one
-/// [`sampled_remote_context`] names, which the loader's `load` span is a child
-/// of.
-const RECORD_TRACE: TraceId = SAMPLED_REMOTE_TRACE;
+/// The span the loader opens for the record it rebuilds. It is the reloaded
+/// record's own span, so the answer must hang directly under it.
+const RELOADED: &str = "load";
 
 /// A loader whose reloaded record still asks for a response.
 ///
@@ -143,31 +142,35 @@ fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
     })
 }
 
-/// The answer belongs to the reloaded record's trace, not to the trace of the
-/// timer that carried the reload.
+/// The answer hangs under the reloaded record's own span, not under the timer
+/// that carried the reload.
 ///
 /// That distinction is load-bearing rather than cosmetic. A deferred retry
 /// fires as a timer, and a timer dispatch starts a trace of its own under the
 /// shipped defaults. So a context taken where the answer is queued would put
 /// every deferred response outside the requester's trace. The context travels
 /// with the tag instead, read from the record both came from.
+///
+/// The parent edge is read span to span, never against a constant the fixture
+/// also seeds the loader from: a comparison of one constant with itself would
+/// hold whatever the code under test carried.
 #[test]
 fn a_deferred_reload_answers_inside_the_records_own_trace() -> Result<()> {
     let mut dispatched: Result<TraceId> = Err(eyre!("the deferred reload never ran"));
     let spans = captured_spans(|| dispatched = reload_under_a_fresh_timer_trace());
     let timer_trace = dispatched?;
+
+    let record = named(&spans, RELOADED)?;
+    let sent = named(&spans, SENT)?;
     ensure!(
-        timer_trace != RECORD_TRACE,
+        record.span_context.trace_id() != timer_trace,
         "the timer must dispatch in a different trace, or this proves nothing"
     );
-
-    let sent = spans
-        .iter()
-        .find(|span| span.name == SENT)
-        .ok_or_else(|| eyre!("span {SENT} was not exported"))?;
     ensure!(
-        sent.span_context.trace_id() == RECORD_TRACE,
-        "{SENT} landed in {:?}, not in the reloaded record's own trace",
+        sent.parent_span_id == record.span_context.span_id()
+            && sent.span_context.trace_id() == record.span_context.trace_id(),
+        "{SENT} hangs under {:?} in {:?}, not under the reloaded record's own span",
+        sent.parent_span_id,
         sent.span_context.trace_id()
     );
     Ok(())

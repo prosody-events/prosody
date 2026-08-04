@@ -37,9 +37,8 @@ use tracing_subscriber::registry::LookupSpan;
 /// group ids, topics) instead.
 pub const TEST_KEYSPACE: &str = "prosody_test";
 
-/// The trace id [`sampled_remote_context`] carries, for a test that must name
-/// the trace a reloaded record belongs to.
-pub(crate) const SAMPLED_REMOTE_TRACE: TraceId =
+/// The trace id [`sampled_remote_context`] carries.
+const SAMPLED_REMOTE_TRACE: TraceId =
     TraceId::from_bytes(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10_u128.to_be_bytes());
 
 /// Shared multi-threaded runtime for all unit tests in the crate.

@@ -1,14 +1,17 @@
 //! What ends a request, what it costs, and what the map holds afterwards.
 
 use super::{
-    MAX_TIMEOUT, POOL, SWEEP_GRACE, TestCodec, TestError, names, register, registry, success,
+    MAX_TIMEOUT, POOL, SWEEP_GRACE, TestCodec, TestCodecError, TestError, names, register,
+    registry, success,
 };
+use crate::codec::Codec;
 use crate::requester::collect::decode;
 use crate::requester::registry::{PendingRegistry, Registration, Status};
-use crate::requester::{Outcome, ResponseFailure};
+use crate::requester::{Outcome, RequestError, ResponseFailure};
 use crate::response::ResponseDisposition;
 use crate::router::loopback::paused;
 use color_eyre::Result;
+use color_eyre::eyre::bail;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::iter::{empty, once};
@@ -144,6 +147,33 @@ fn the_registry_holds_live_requests_and_drains(steps: Vec<DrainStep>) -> TestRes
         Ok(()) => TestResult::passed(),
         Err(error) => TestResult::error(format!("{error:#}")),
     }
+}
+
+/// A request that starts after shutdown is refused, and it leaves neither a map
+/// record nor a held permit behind.
+///
+/// This drives the one check that closes the shutdown race, on the schedule a
+/// test can name: the registry is already closed, so the check reads the flag
+/// the drain set and reverses its own insert. See
+/// [`PendingRegistry`](crate::requester::registry::PendingRegistry) for the
+/// interleaving that same check covers.
+#[tokio::test(start_paused = true)]
+async fn a_registration_after_shutdown_is_refused_and_leaves_nothing() -> Result<()> {
+    let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
+    let awaited = names(&POOL[..1])?;
+    registry.shutdown().await;
+
+    let refused = registry.register::<TestCodecError>(&awaited, TIMEOUT, TestCodec::FORMAT_ID);
+    let Err(RequestError::ShuttingDown) = refused else {
+        bail!("a closed registry must refuse a request that starts after it closed");
+    };
+    assert_eq!(registry.len(), 0, "the refused request kept a map record");
+    assert_eq!(
+        registry.available_permits(),
+        IN_FLIGHT,
+        "the refused request kept its admission permit"
+    );
+    Ok(())
 }
 
 /// Drives one generated terminal-transition trace.

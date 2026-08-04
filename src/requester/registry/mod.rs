@@ -324,6 +324,15 @@ impl PendingRegistry {
     }
 
     /// Inserts one map record and reverses an insert that races shutdown.
+    ///
+    /// One check does that, and it reads the closed flag after the record is
+    /// published. Either the check sees the close and removes the record, or
+    /// the close comes later and the drain behind it finds the record. So a
+    /// closed registry keeps no entry, however the two interleave.
+    ///
+    /// Do not add a second check before the insert. It refuses no request this
+    /// one lets through, and it would leave this check reachable only by a
+    /// race, which no test can drive on purpose.
     fn insert(
         self: &Arc<Self>,
         awaited: &[SubsystemName],
@@ -333,9 +342,6 @@ impl PendingRegistry {
         let permit = Arc::clone(&self.admission)
             .try_acquire_owned()
             .map_err(|_| Admission::Exhausted)?;
-        if self.closed.load(Acquire) {
-            return Err(Admission::ShuttingDown);
-        }
         let id = RequestId::new();
         let request = Arc::new(PendingRequest::new(
             awaited,
@@ -353,8 +359,6 @@ impl PendingRegistry {
             PENDING.add(-1, &[]);
             return Err(Admission::IdInUse);
         }
-        // The check that closes the race: it reverses an insert that overlapped
-        // a drain already in progress.
         if self.closed.load(Acquire) {
             self.close_and_remove(id, &request, Terminal::ShuttingDown);
             return Err(Admission::ShuttingDown);
