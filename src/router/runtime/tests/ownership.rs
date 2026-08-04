@@ -1,9 +1,10 @@
 //! What the runtime owns, and what its handles reach.
 //!
-//! One process has one node identity. These tests read that identity from all
-//! three places it appears — the listener the runtime serves, the row the
+//! One process has one node identity. Two tests here read that identity from
+//! all three places it appears — the listener the runtime serves, the row the
 //! directory holds, and the address the runtime's own router resolves — and
-//! require them to agree.
+//! require them to agree. The third reads the lease those answers are served
+//! within.
 
 use super::super::{PeerInputs, PeerRuntime, RouterConfiguration};
 use super::{ALPHA, CONTACT, Process, Shared, TIMEOUT, frame_cap, header, listener, requester};
@@ -26,9 +27,8 @@ use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::Context;
 use std::slice::from_ref;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::task::yield_now;
-use tokio::time::{Instant, interval};
+use tokio::time::Instant;
 
 /// The payload one delivered response carries.
 const PAYLOAD: &[u8] = b"through the runtime's own router";
@@ -140,16 +140,28 @@ fn a_response_through_the_runtime_router_reaches_this_process() -> Result<()> {
     })
 }
 
-/// A removed node stops being served: the cached address ages out on the same
-/// lease the row carried, so resolution reports the node unreachable instead of
-/// handing back an address to dial. This is the path a dialer takes, cache and
-/// all.
+/// The runtime resolves through a cache aged on the lease it publishes under.
+///
+/// One configured lease governs both halves of reachability: how long this
+/// node's own row survives without a refresh, and how long a peer's address is
+/// still served after that peer's row is gone. A cache built with any other
+/// lease would hand a dialer an address that answers for nobody, for a time no
+/// operator asked for.
+///
+/// The bound is read rather than waited out. What the bound *means* — an entry
+/// is served until it, and read again past it — belongs to
+/// [`AddressCache`](crate::router::directory::cache::AddressCache) and is
+/// proved on a mock clock by the cache's own property. What is left for this
+/// test is the wiring, and equality proves that exactly, where a wall clock
+/// could only bracket it.
 #[test]
-fn a_resolved_address_stops_being_served_once_its_row_is_gone() -> Result<()> {
+fn the_resolver_ages_entries_on_the_lease_this_process_publishes_under() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
+        // Not the default lease, so a cache aged on a constant fails here.
+        let lease = RegistrationTtl::try_from(RegistrationTtl::MIN)?;
         let router = RouterConfiguration {
-            registration_ttl: RegistrationTtl::try_from(RegistrationTtl::MIN)?,
+            registration_ttl: lease,
             ..RouterConfiguration::default()
         };
         let requester = requester();
@@ -165,32 +177,23 @@ fn a_resolved_address_stops_being_served_once_its_row_is_gone() -> Result<()> {
         })
         .await?;
         let node = runtime.node();
-        let addresses = runtime.addresses().clone();
-        assert!(
-            addresses.resolve(node).await?.is_some(),
-            "a started runtime must resolve its own node"
-        );
-        // The shutdown removes the row and stops the refresher, so only the
-        // cached entry can still answer.
-        runtime.shutdown(|| async {}).await?;
-
-        // A cache entry ages out on the process clock and emits no event, so a
-        // bounded poll is the only observation available. The deadline is a
-        // hang guard; the assertion is the absence below it.
-        let deadline = Instant::now() + Duration::from_mins(1);
-        let mut ticker = interval(Duration::from_millis(200));
-        loop {
-            ticker.tick().await;
-            let resolved = addresses.resolve(node).await?;
-            if resolved.is_none() {
-                break;
-            }
+        let outcome: Result<()> = async {
+            let addresses = runtime.addresses();
             ensure!(
-                Instant::now() < deadline,
-                "a removed node stayed resolvable: {resolved:?}"
+                addresses.resolve(node).await?.is_some(),
+                "a started runtime must resolve its own node"
             );
+            ensure!(
+                addresses.ttl() == lease.duration(),
+                "the resolver serves an entry for {:?}, not the {:?} this process publishes under",
+                addresses.ttl(),
+                lease.duration()
+            );
+            Ok(())
         }
-        Ok(())
+        .await;
+        runtime.shutdown(|| async {}).await?;
+        outcome
     })
 }
 

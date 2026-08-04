@@ -115,6 +115,13 @@ impl AddressCache {
         self.inner.len()
     }
 
+    /// The age an entry is served within. It is the value `resolve` compares
+    /// against, so a caller that reads it reads the bound itself.
+    #[cfg(test)]
+    pub(crate) const fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     /// Serves a fresh entry, or fills single-flight through `fill`.
     ///
     /// A stale entry is removed only when it still carries the issue time this
@@ -166,6 +173,13 @@ impl AddressResolver {
     #[must_use]
     pub(crate) const fn new(cache: AddressCache, directory: NodeDirectory) -> Self {
         Self { cache, directory }
+    }
+
+    /// The age this resolver serves an entry within, from the cache it reads
+    /// through.
+    #[cfg(test)]
+    pub(crate) const fn ttl(&self) -> Duration {
+        self.cache.ttl()
     }
 
     /// What `node` published, or `None` when the directory holds no row for it.
