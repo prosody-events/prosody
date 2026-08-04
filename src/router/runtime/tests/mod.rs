@@ -27,17 +27,16 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 mod config;
-mod discovery;
 mod ownership;
 mod shutdown;
 mod wiring;
 
 /// The Cassandra contact point the routed-address probe aims at.
-const CONTACT: &str = "localhost:9042";
+pub(super) const CONTACT: &str = "localhost:9042";
 
 /// The same contact point written as an address. A probe against it exercises
 /// no name resolution, so it always aims at one address family.
-const NUMERIC_CONTACT: &str = "127.0.0.1:9042";
+pub(super) const NUMERIC_CONTACT: &str = "127.0.0.1:9042";
 
 /// The lease these tests read under. It equals the default a runtime starts
 /// with, and its refresh delay is at least a fifth of it, so no refresh runs
@@ -196,7 +195,7 @@ impl Process {
 ///
 /// Registration reads the bound listener rather than a port number, so a test
 /// binds a real one and the published port is always a port that exists.
-async fn listener() -> Result<BoundListener> {
+pub(super) async fn listener() -> Result<BoundListener> {
     Ok(BoundListener::bind(&TransportConfiguration::default()).await?)
 }
 

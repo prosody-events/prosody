@@ -5,14 +5,18 @@
 //! directory holds, and the address the runtime's own router resolves — and
 //! require them to agree.
 
-use super::{ALPHA, Process, Shared, TIMEOUT, frame_cap, header};
+use super::super::{PeerInputs, PeerRuntime, RouterConfiguration};
+use super::{ALPHA, CONTACT, Process, Shared, TIMEOUT, frame_cap, header, listener, requester};
 use crate::codec::Codec;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::sender::TypedSender;
+use crate::router::directory::RegistrationTtl;
+use crate::router::directory::tests::support::store;
+use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::TRANSPORT;
 use crate::router::grpc::client::GrpcSender;
-use crate::router::loopback::HANG_GUARD;
+use crate::router::loopback::{HANG_GUARD, TestHealth};
 use crate::router::{NodeId, ResponseSender, Router, SendFailure};
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
@@ -22,8 +26,9 @@ use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::Context;
 use std::slice::from_ref;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::task::yield_now;
-use tokio::time::Instant;
+use tokio::time::{Instant, interval};
 
 /// The payload one delivered response carries.
 const PAYLOAD: &[u8] = b"through the runtime's own router";
@@ -132,6 +137,60 @@ fn a_response_through_the_runtime_router_reaches_this_process() -> Result<()> {
             })
             .await?;
         outcome
+    })
+}
+
+/// A removed node stops being served: the cached address ages out on the same
+/// lease the row carried, so resolution reports the node unreachable instead of
+/// handing back an address to dial. This is the path a dialer takes, cache and
+/// all.
+#[test]
+fn a_resolved_address_stops_being_served_once_its_row_is_gone() -> Result<()> {
+    init_test_logging();
+    TEST_RUNTIME.block_on(async {
+        let router = RouterConfiguration {
+            registration_ttl: RegistrationTtl::try_from(RegistrationTtl::MIN)?,
+            ..RouterConfiguration::default()
+        };
+        let requester = requester();
+        let runtime = PeerRuntime::start(PeerInputs {
+            store: store().await?.clone(),
+            listener: listener().await?,
+            health: TestHealth::new(true, true),
+            contact: CONTACT,
+            group: None,
+            router: &router,
+            fleet: FleetConfiguration::default(),
+            requester: &requester,
+        })
+        .await?;
+        let node = runtime.node();
+        let addresses = runtime.addresses().clone();
+        assert!(
+            addresses.resolve(node).await?.is_some(),
+            "a started runtime must resolve its own node"
+        );
+        // The shutdown removes the row and stops the refresher, so only the
+        // cached entry can still answer.
+        runtime.shutdown(|| async {}).await?;
+
+        // A cache entry ages out on the process clock and emits no event, so a
+        // bounded poll is the only observation available. The deadline is a
+        // hang guard; the assertion is the absence below it.
+        let deadline = Instant::now() + Duration::from_mins(1);
+        let mut ticker = interval(Duration::from_millis(200));
+        loop {
+            ticker.tick().await;
+            let resolved = addresses.resolve(node).await?;
+            if resolved.is_none() {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "a removed node stayed resolvable: {resolved:?}"
+            );
+        }
+        Ok(())
     })
 }
 

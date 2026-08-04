@@ -1,13 +1,9 @@
 //! What a process discovers about itself, and what it publishes from it.
 
-use super::super::{
-    PeerInputs, PeerRuntime, RouterConfiguration, discover_host, discover_registration, routed_host,
-};
-use super::{CONTACT, NUMERIC_CONTACT, listener, requester};
-use crate::router::directory::tests::support::store;
-use crate::router::directory::{Endpoint, RegistrationTtl};
-use crate::router::fleet::config::FleetConfiguration;
-use crate::router::loopback::TestHealth;
+use super::super::tests::{CONTACT, NUMERIC_CONTACT, listener};
+use super::super::{PeerRuntimeError, RouterConfiguration, discover_registration};
+use super::{DiscoveredHost, discover_host, join_discovery, routed_host};
+use crate::router::directory::Endpoint;
 use crate::router::{Host, NodeId};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -15,9 +11,8 @@ use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
+use std::future::pending;
 use std::net::IpAddr;
-use std::time::Duration;
-use tokio::time::{Instant, interval};
 use validator::Validate;
 
 /// No configured value ever reaches the direct endpoint.
@@ -137,56 +132,25 @@ fn the_direct_host_is_the_routed_address_then_this_machine() -> Result<()> {
     })
 }
 
-/// A removed node stops being served: the cached address ages out on the same
-/// lease the row carried, so resolution reports the node unreachable instead of
-/// handing back an address to dial. This is the path a dialer takes, cache and
-/// all.
+/// A discovery task that does not join is reported, not swallowed.
+///
+/// An aborted task is that failure in deterministic form: a task that can never
+/// complete answers with a cancelled join error, without a timer and without a
+/// panic. The process then has no host for its direct endpoint, so the outcome
+/// must name the task rather than read as a discovery that found nothing.
 #[test]
-fn a_resolved_address_stops_being_served_once_its_row_is_gone() -> Result<()> {
+fn a_discovery_task_that_does_not_join_is_reported() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
-        let router = RouterConfiguration {
-            registration_ttl: RegistrationTtl::try_from(RegistrationTtl::MIN)?,
-            ..RouterConfiguration::default()
-        };
-        let requester = requester();
-        let runtime = PeerRuntime::start(PeerInputs {
-            store: store().await?.clone(),
-            listener: listener().await?,
-            health: TestHealth::new(true, true),
-            contact: CONTACT,
-            group: None,
-            router: &router,
-            fleet: FleetConfiguration::default(),
-            requester: &requester,
-        })
-        .await?;
-        let node = runtime.node();
-        let addresses = runtime.addresses().clone();
-        assert!(
-            addresses.resolve(node).await?.is_some(),
-            "a started runtime must resolve its own node"
+        let task = tokio::spawn(pending::<Result<DiscoveredHost, PeerRuntimeError>>());
+        task.abort();
+        ensure!(
+            matches!(
+                join_discovery(task).await,
+                Err(PeerRuntimeError::DiscoveryTask(_))
+            ),
+            "a discovery task that did not join was not reported as a task failure"
         );
-        // The shutdown removes the row and stops the refresher, so only the
-        // cached entry can still answer.
-        runtime.shutdown(|| async {}).await?;
-
-        // A cache entry ages out on the process clock and emits no event, so a
-        // bounded poll is the only observation available. The deadline is a
-        // hang guard; the assertion is the absence below it.
-        let deadline = Instant::now() + Duration::from_mins(1);
-        let mut ticker = interval(Duration::from_millis(200));
-        loop {
-            ticker.tick().await;
-            let resolved = addresses.resolve(node).await?;
-            if resolved.is_none() {
-                break;
-            }
-            ensure!(
-                Instant::now() < deadline,
-                "a removed node stayed resolvable: {resolved:?}"
-            );
-        }
         Ok(())
     })
 }

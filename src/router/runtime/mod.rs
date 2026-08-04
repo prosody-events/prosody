@@ -24,24 +24,24 @@ use crate::router::grpc::health::ProcessHealth;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, TransportError, serve};
 use crate::router::relay::Relay;
-use crate::router::{Host, MAX_LABEL_BYTES, NodeId, RouterHandle};
+use crate::router::{Host, NodeId, RouterHandle};
 use rand::RngExt;
 use std::future::Future;
-use std::net::{ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::select;
 use tokio::sync::{oneshot, watch};
-use tokio::task::{JoinError, JoinHandle, spawn_blocking};
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time::sleep;
 use tracing::{error, warn};
 use validator::{Validate, ValidationErrors};
-use whoami::hostname;
 
 mod config;
+mod discovery;
 
 pub(crate) use self::config::RouterConfiguration;
+use self::discovery::{DiscoveredHost, discover};
 
 #[cfg(test)]
 mod tests;
@@ -103,19 +103,6 @@ pub(crate) struct PeerInputs<'a, H> {
     pub(crate) requester: &'a RequesterConfiguration,
 }
 
-/// The two host values a process can only learn by asking the machine it runs
-/// on, and the network beneath it.
-///
-/// [`discover_host`] produces one of these, and [`discover_registration`]
-/// spends it.
-struct DiscoveredHost {
-    /// This machine's name, checked by [`discover_host`].
-    hostname: Host,
-    /// The local address that reaches the contact point, where the probe found
-    /// one.
-    routed: Option<Host>,
-}
-
 impl PeerRuntime {
     /// Builds every shared piece, serves the listener, and publishes this
     /// process.
@@ -155,10 +142,9 @@ impl PeerRuntime {
         let ttl = inputs.router.registration_ttl;
         let directory = NodeDirectory::new(inputs.store, ttl).await?;
         // The blocking pool owns the resolver wait; a runtime thread must not.
-        // The spawn stays beside its await: an early return between them would
-        // detach a blocking task that tokio cannot abort.
-        let contact = inputs.contact.to_owned();
-        let discovered = spawn_blocking(move || discover_host(&contact)).await??;
+        // The resolver call and the machine-name lookup are private to
+        // `discovery`, so this file reaches them only through `discover`.
+        let discovered = discover(inputs.contact).await?;
         let registration = discover_registration(
             NodeId::new(),
             &inputs.listener,
@@ -349,68 +335,6 @@ async fn abandon(stop: oneshot::Sender<()>, listener: JoinHandle<()>) {
     }
 }
 
-/// The local address the operating system would use to reach `contact`.
-///
-/// Connecting a UDP socket sends nothing: it only asks the routing table which
-/// interface would carry that traffic. The answer is the address that reaches
-/// the contact point, and nothing more. A loopback contact point answers with a
-/// loopback address, and a host that reaches Cassandra over a management
-/// interface answers with the management address. A peer elsewhere reaches
-/// neither, which is what [`RouterConfiguration::advertised_host`] is for. Any
-/// failure — an unresolvable contact point, no route — yields `None`, and the
-/// next source in the discovery order answers.
-fn routed_host(contact: &str) -> Option<Host> {
-    let Ok(mut targets) = contact.to_socket_addrs() else {
-        return None;
-    };
-    let target = targets.next()?;
-    // An IPv4-bound socket cannot discover an IPv6 route, so the probe binds
-    // the family of the address it aims at.
-    let unspecified = if target.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let Ok(probe) = UdpSocket::bind(unspecified) else {
-        return None;
-    };
-    let Ok(()) = probe.connect(target) else {
-        return None;
-    };
-    let Ok(local) = probe.local_addr() else {
-        return None;
-    };
-    Some(Host::make(&local.ip().to_string()))
-}
-
-/// Reads the machine name and the address that reaches `contact`.
-///
-/// This is discovery's blocking half, so [`PeerRuntime::start`] runs it
-/// through [`spawn_blocking`]: resolving `contact` can wait on a name server
-/// for as long as that resolver retries.
-///
-/// # Errors
-///
-/// Returns [`PeerRuntimeError`] when the machine name cannot be read, or when
-/// it is longer than a published label may be. The routed probe's own failure
-/// is not an error: it answers `None`, and [`discover_registration`] then
-/// publishes the machine name.
-fn discover_host(contact: &str) -> Result<DiscoveredHost, PeerRuntimeError> {
-    // The machine name is published in its own right, so the lookup is paid
-    // once and reused where the routed probe finds no address.
-    let machine = hostname()?;
-    if machine.len() > MAX_LABEL_BYTES {
-        return Err(PeerRuntimeError::HostnameTooLong {
-            bytes: machine.len(),
-            limit: MAX_LABEL_BYTES,
-        });
-    }
-    Ok(DiscoveredHost {
-        hostname: Host::make(&machine),
-        routed: routed_host(contact),
-    })
-}
-
 /// Builds this process's registration.
 ///
 /// Each configured field reaches only the endpoint it describes. `direct` is
@@ -420,11 +344,12 @@ fn discover_host(contact: &str) -> Result<DiscoveredHost, PeerRuntimeError> {
 /// optimization — a neighbour dials an address it reaches without the entry
 /// point. The configured host and port reach `advertised` alone.
 ///
-/// Every label this returns is inside [`MAX_LABEL_BYTES`], which is what lets a
+/// Every label this returns is inside
+/// [`MAX_LABEL_BYTES`](crate::router::MAX_LABEL_BYTES), which is what lets a
 /// reader treat a longer one as a row this code did not write.
 /// [`PeerRuntime::start`] validates the configured labels before it calls this
 /// function, the routed probe answers with an address literal, and
-/// [`discover_host`] checks the machine name.
+/// [`discover`] checks the machine name.
 fn discover_registration(
     node: NodeId,
     listener: &BoundListener,
@@ -481,16 +406,18 @@ pub(crate) enum PeerRuntimeError {
     Discovery(#[from] whoami::Error),
 
     /// The blocking discovery task returned no result — it was cancelled, or it
-    /// panicked. This process then knows no address to publish, so startup
-    /// stops rather than registering a guess.
+    /// panicked. The direct endpoint then has no host, so startup stops rather
+    /// than registering a guess.
     #[error("the host discovery task returned no result: {0:#}")]
     DiscoveryTask(#[from] JoinError),
 
-    /// The machine's own name is longer than a published label may be.
-    /// Refusing to start is preferable to publishing a shortened name, which
-    /// would be a different machine's name.
-    #[error("the machine name is {bytes} bytes, over the {limit}-byte label limit")]
-    HostnameTooLong {
+    /// The machine's own name is not a label a registration may publish: it is
+    /// empty, or it is longer than a label may be. The same rule refuses a
+    /// configured label, so the two sources of a published host agree. A blank
+    /// name reaches no machine, and a longer one reads back as unresolvable, so
+    /// startup stops instead.
+    #[error("the machine name is {bytes} bytes, outside the 1 to {limit} byte label range")]
+    HostnameUnpublishable {
         /// The machine name's length.
         bytes: usize,
         /// The longest label a registration may publish.

@@ -79,6 +79,10 @@ impl RouterConfiguration {
 /// Refuses a blank label and one longer than a host or network name may be.
 /// An absent label never reaches this function.
 ///
+/// It is the one label rule this crate publishes under. Discovery holds the
+/// machine name to it as well, so a configured host and a discovered one are
+/// accepted on the same terms.
+///
 /// A `length` rule cannot replace this one: `validator` counts characters,
 /// while [`MAX_LABEL_BYTES`] is the byte capacity that keeps a label inline in
 /// [`Host`](crate::router::Host).
@@ -86,7 +90,7 @@ impl RouterConfiguration {
 /// Length and blankness are the only rules here, and a dialability rule does
 /// not belong beside them: an advertised host may be an IPv6 literal, so a rule
 /// that refused a colon would refuse a legal address.
-fn validate_label(label: &str) -> Result<(), ValidationError> {
+pub(super) fn validate_label(label: &str) -> Result<(), ValidationError> {
     if label.is_empty() {
         return Err(ValidationError::new("label_empty"));
     }
