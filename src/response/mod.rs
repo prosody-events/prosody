@@ -219,7 +219,11 @@ impl ResponseDisposition {
         }
     }
 
-    /// Counts one answered delivery attempt under this disposition's label.
+    /// Counts one delivery attempt this process **decided**, under this
+    /// disposition's label.
+    ///
+    /// A frame this process only sent on is counted at the node that decided
+    /// it, so a relay never adds a second point for one delivery.
     pub(crate) fn record(self) {
         DISPOSITIONS.add(1, &[KeyValue::new("disposition", self.label())]);
     }

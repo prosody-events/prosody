@@ -13,10 +13,9 @@
 use super::super::metrics::{DropReason, Stage};
 use super::Harness;
 use crate::router::loopback::{UNPUBLISHED_NODE, config, node, paused};
-use crate::test_util::GlobalMetrics;
+use crate::test_util::{GlobalMetrics, assert_distinct_labels, label};
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
-use std::collections::BTreeMap;
 use strum::VariantArray;
 
 /// Destinations the fleet holds: the node that answers, and the one no
@@ -89,28 +88,12 @@ fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
 
 /// Every stage and every drop reason counts under its own label, so one outcome
 /// can never be read as another in a dashboard.
+///
+/// Each enum is checked in its own namespace. They are different instruments
+/// under different attribute keys, so a name they happen to share is not a
+/// collision a dashboard could misread.
 #[test]
 fn every_outcome_has_a_distinct_lowercase_label() -> Result<()> {
-    let labels: Vec<&str> = Stage::VARIANTS
-        .iter()
-        .map(|stage| stage.label())
-        .chain(DropReason::VARIANTS.iter().map(|reason| reason.label()))
-        .collect();
-    for (index, label) in labels.iter().enumerate() {
-        ensure!(
-            !label.is_empty() && label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-            "{label} is not a plain lowercase label"
-        );
-        ensure!(
-            !labels[..index].contains(label),
-            "{label} names more than one outcome"
-        );
-    }
-    Ok(())
-}
-
-/// One data point's whole attribute set, for a comparison that catches an extra
-/// attribute as well as a wrong one.
-fn label(key: &str, value: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([(key.to_owned(), value.to_owned())])
+    assert_distinct_labels(Stage::VARIANTS.iter().map(|stage| stage.label()))?;
+    assert_distinct_labels(DropReason::VARIANTS.iter().map(|reason| reason.label()))
 }

@@ -14,13 +14,13 @@ use ahash::RandomState;
 #[cfg(test)]
 use bytes::BytesMut;
 use opentelemetry::global::meter;
-use opentelemetry::metrics::Gauge;
+use opentelemetry::metrics::UpDownCounter;
 use parking_lot::Mutex;
 use scc::HashMap;
 use smallvec::SmallVec;
 use std::error::Error;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::Duration;
 use thiserror::Error;
@@ -35,12 +35,18 @@ pub(in crate::requester) const SWEEP_BATCH: usize = 64;
 
 /// Requests this process is waiting on right now.
 ///
-/// One series for the registry, with no attributes at all: everything that
-/// could name a request — its id, its awaited subsystems — is either minted per
-/// call or arrives from the network.
-static PENDING: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+/// One series with no attributes at all: everything that could name a request —
+/// its id, its awaited subsystems — is either minted per call or arrives from
+/// the network.
+///
+/// A sum rather than a last value. One published map record adds one, and the
+/// single removal funnel [`PendingRegistry::close_and_remove`] subtracts one,
+/// so the series is the count of live records however the adds and the
+/// subtracts interleave. Two registries in one process then read as their total
+/// rather than as whichever recorded last.
+static PENDING: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
     meter("prosody")
-        .u64_gauge("prosody.peer.requests.pending")
+        .i64_up_down_counter("prosody.peer.requests.pending")
         .with_description("Requests this process is waiting for answers to")
         .with_unit("{request}")
         .build()
@@ -82,10 +88,6 @@ pub(crate) struct PendingRegistry {
     /// Most bytes one accepted payload may carry.
     max_response_bytes: usize,
     grace: Duration,
-    /// Live map records. Held rather than read from the map: a scan of the
-    /// bucket array on every registration and every completion would cost more
-    /// than the gauge is worth.
-    pending: AtomicU64,
     closed: AtomicBool,
     /// A `OnceLock` cannot replace this: [`shutdown`](Self::shutdown) awaits
     /// the handle, and that needs ownership a shared reference cannot give.
@@ -131,7 +133,6 @@ impl PendingRegistry {
             max_timeout: config.max_timeout,
             max_response_bytes: config.max_response_bytes,
             grace: config.sweep_grace,
-            pending: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             sweeper: Mutex::new(None),
         });
@@ -345,10 +346,13 @@ impl PendingRegistry {
             request: Arc::clone(&request),
             _permit: permit,
         };
+        // Added before the record is published, so every entry a drain can find
+        // is already counted and no exporter reads a transient subtract.
+        PENDING.add(1, &[]);
         if self.entries.insert_sync(id, entry).is_err() {
+            PENDING.add(-1, &[]);
             return Err(Admission::IdInUse);
         }
-        PENDING.record(self.pending.fetch_add(1, Relaxed) + 1, &[]);
         // The check that closes the race: it reverses an insert that overlapped
         // a drain already in progress.
         if self.closed.load(Acquire) {
@@ -369,7 +373,7 @@ impl PendingRegistry {
             .entries
             .remove_if_sync(&id, |entry| Arc::ptr_eq(&entry.request, request));
         if removed.is_some() {
-            PENDING.record(self.pending.fetch_sub(1, Relaxed) - 1, &[]);
+            PENDING.add(-1, &[]);
         }
     }
 }

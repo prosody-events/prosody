@@ -1,5 +1,6 @@
-//! What the requester suites share: one response codec, one registry factory,
-//! and the frames and produce futures the delivery race is driven with.
+//! What the requester suites share: a request codec and its payload, one
+//! response codec, a registry factory, a requester over a mock cluster, and the
+//! frames and produce futures the delivery race is driven with.
 //!
 //! Every suite runs on a paused-time runtime, so a virtual second costs
 //! nothing and every schedule is the same on every machine.
@@ -68,7 +69,7 @@ const SWEEP_GRACE: Duration = Duration::from_mins(10);
 const POOL: [&str; 6] = ["billing", "ledger", "audit", "search", "mailer", "a,b"];
 
 /// The request payload every suite that reaches the real `request` body sends.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct RequestPayload;
 
 /// The codec that request is produced with.

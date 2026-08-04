@@ -8,7 +8,7 @@
 use super::{ALPHA, Harness, header, payload, register};
 use crate::codec::Codec;
 use crate::response::frame::tests::CountingCodec;
-use crate::test_util::{GlobalSpans, TEST_RUNTIME};
+use crate::test_util::{GlobalSpans, TEST_RUNTIME, named};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use opentelemetry_sdk::trace::SpanData;
@@ -72,12 +72,4 @@ fn the_metadata_hop_carries_the_trace_context() -> Result<()> {
         );
         Ok(())
     })
-}
-
-/// The one exported span with `name`.
-fn named<'a>(spans: &'a [SpanData], name: &str) -> Result<&'a SpanData> {
-    spans
-        .iter()
-        .find(|span| span.name == name)
-        .ok_or_else(|| eyre!("span {name} was not exported"))
 }

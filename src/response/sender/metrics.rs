@@ -4,14 +4,19 @@
 //! arrive in a Kafka header a topic writer controls, so a series keyed by one
 //! is a cardinality attack on the metrics pipeline. One fixed label per outcome
 //! is the whole attribute set here, which is why every label below is a
-//! `&'static str` a `const fn` chose. Per-destination occupancy is derivable
-//! without such a label: it is `stages{enqueued}` less `stages{delivered}` less
-//! the drops.
+//! `&'static str` a `const fn` chose. What the queues hold across the process
+//! is still derivable: it is `stages{enqueued}` less `stages{delivered}` less
+//! the reasons a worker reports — `deadline`, `encode_failed`,
+//! `unresolvable_node`, `lookup_failed` and `send_failed`. Every other reason
+//! is recorded before a response is enqueued, so a subtraction of the whole
+//! `dropped` total counts those twice and goes negative. What the fleet itself
+//! holds is `prosody.peer.fleet.destinations`.
 //!
 //! These counters are the operator's account of delivery.
-//! [`SendCounters`](super::SendCounters) is the in-process one that the
-//! sender's own suites read, and the two are kept apart on purpose: a test
-//! asserts on a value it owns rather than on a global meter provider.
+//! [`SendCounters`](super::SendCounters) is the in-process one, and it is the
+//! per-sender total the delivery suites assert on. The series here are asserted
+//! through a meter provider installed in `tests/metrics.rs`, one per test
+//! process.
 //!
 //! Each instrument binds to whatever meter provider is global when it is first
 //! touched, so a process installs its provider before it queues a response.
@@ -52,7 +57,7 @@ static RATE_LIMITED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 /// How far one response got.
 ///
-/// Every queued response passes `Attempted`, and each later stage is reached
+/// Every offered response passes `Attempted`, and each later stage is reached
 /// only from the one before it. So the differences between these counters are
 /// where responses are lost, and [`DropReason`] says why.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,7 +87,10 @@ pub(super) enum DropReason {
     NoSlot,
     /// Fleet admission was closed.
     ShuttingDown,
-    /// The destination's queue was full.
+    /// The destination's queue was full. This arm exists because the channel
+    /// error is total, not because the send path can reach it: a job that holds
+    /// a slot always has room. A non-zero `queue_full` series therefore reports
+    /// that the slot accounting broke.
     QueueFull,
     /// The destination's worker had already exited.
     QueueClosed,

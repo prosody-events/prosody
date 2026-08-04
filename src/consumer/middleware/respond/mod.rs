@@ -73,22 +73,32 @@ pub(crate) struct Responder<C: Codec> {
 /// A [`Context`] rather than a [`Span`](tracing::Span): the response is framed
 /// in one task and sent from another, and a span finishes when any clone of it
 /// finishes.
+///
+/// The capture happens at dispatch entry, while the processing state is live,
+/// so `message.span()` is never `Span::none()` and the response leg can never
+/// open as a root of a trace of its own.
+///
+/// One per in-flight event, and both exits are here:
+/// [`after_commit`](FallibleHandler::after_commit) moves it into the sender,
+/// and [`after_abort`](FallibleHandler::after_abort) drops it.
 #[derive(Debug)]
 pub(crate) struct Answering {
     tag: RequestTag,
     trace: Context,
 }
 
-/// A successful result and its optional response metadata.
+/// A successful result and the [`Answering`] carrier, when the message asked
+/// for a response.
 ///
-/// The metadata rides the output because an event context has no request tag.
-/// One middleware field cannot hold it because different keys dispatch at once.
+/// The carrier rides the result because an event context has no request tag,
+/// and one middleware field cannot hold it because different keys dispatch at
+/// once.
 pub(crate) struct Responded<T> {
     inner: T,
     meta: Option<Answering>,
 }
 
-/// A failed result and its optional response metadata.
+/// A failed result and the same [`Answering`] carrier.
 ///
 /// A transparent error cannot hold a second field. This form preserves the
 /// inner display text and exposes the inner error as its source.
@@ -191,15 +201,15 @@ where
     where
         C2: EventContext<Payload = Self::Payload>,
     {
-        // The message's own span, named directly rather than taken from the
-        // ambient one: a middleware span between the dispatch and this layer
-        // must not become the response's parent.
+        // The message's own span, not the ambient one: a middleware span
+        // between the dispatch and this layer must not become the response's
+        // parent.
         let meta = message.request().map(|tag| Answering {
             tag,
             trace: message.span().context(),
         });
-        // Matched rather than mapped: the carrier moves into exactly one arm,
-        // so answering never costs a second copy of the trace.
+        // Matched rather than mapped: a `map` / `map_err` pair would move the
+        // carrier into two closures.
         match self.handler.on_message(context, message, demand_type).await {
             Ok(inner) => Ok(Responded { inner, meta }),
             Err(inner) => Err(RespondError { inner, meta }),

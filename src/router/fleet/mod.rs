@@ -31,7 +31,14 @@ mod tests;
 ///
 /// One series for the whole table, never one per destination. A node id arrives
 /// in a Kafka header and is admitted before the directory is consulted, so a
-/// per-destination series would let a topic writer choose the cardinality.
+/// per-destination series would let a topic writer choose the cardinality. The
+/// empty attribute set relies on one fleet per process, which this module's
+/// header states.
+///
+/// Recorded on admission alone. An eviction is always followed by the admission
+/// into the cell it freed, so a record on each of the two would publish a dip
+/// the table never rests at. A closed fleet is deliberately not zeroed: a fleet
+/// closes only at process shutdown, so there is no live process to read a zero.
 static DESTINATIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     meter("prosody")
         .u64_gauge("prosody.peer.fleet.destinations")
@@ -62,10 +69,6 @@ pub(crate) struct DestinationFleet {
     admitted: AtomicU64,
     evicted: AtomicU64,
     refused: AtomicU64,
-    /// Occupied cells. Kept beside the table rather than counted from it: both
-    /// writers already hold the table lock, so this reads the same as a walk
-    /// and costs nothing per admission.
-    occupied: AtomicU64,
     config: FleetConfiguration,
 }
 
@@ -148,7 +151,6 @@ impl DestinationFleet {
             admitted: AtomicU64::new(0),
             evicted: AtomicU64::new(0),
             refused: AtomicU64::new(0),
-            occupied: AtomicU64::new(0),
             config,
         })
     }
@@ -332,7 +334,11 @@ impl DestinationFleet {
                 destination: Arc::clone(&destination),
             });
             self.admitted.fetch_add(1, Relaxed);
-            DESTINATIONS.record(self.occupied.fetch_add(1, Relaxed) + 1, &[]);
+            // Both loads run under the table lock, so the difference is exact.
+            DESTINATIONS.record(
+                self.admitted.load(Relaxed) - self.evicted.load(Relaxed),
+                &[],
+            );
             (slot, destination)
         };
         table[slot].last_used = self.next_stamp();
@@ -363,7 +369,6 @@ impl DestinationFleet {
         let (_, idle) = candidate?;
         table[idle].occupant = None;
         self.evicted.fetch_add(1, Relaxed);
-        DESTINATIONS.record(self.occupied.fetch_sub(1, Relaxed) - 1, &[]);
         Some(idle)
     }
 

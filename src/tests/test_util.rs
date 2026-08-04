@@ -1,7 +1,7 @@
 use crate::cassandra::CassandraConfiguration;
 use crate::otel::SpanRelation;
 use color_eyre::Result;
-use color_eyre::eyre::eyre;
+use color_eyre::eyre::{bail, ensure, eyre};
 use opentelemetry::global::set_meter_provider;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::trace::{
@@ -36,6 +36,11 @@ use tracing_subscriber::registry::LookupSpan;
 /// tests). Isolation comes from fresh per-test identifiers (segment ids,
 /// group ids, topics) instead.
 pub const TEST_KEYSPACE: &str = "prosody_test";
+
+/// The trace id [`sampled_remote_context`] carries, for a test that must name
+/// the trace a reloaded record belongs to.
+pub(crate) const SAMPLED_REMOTE_TRACE: TraceId =
+    TraceId::from_bytes(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10_u128.to_be_bytes());
 
 /// Shared multi-threaded runtime for all unit tests in the crate.
 #[expect(
@@ -229,7 +234,7 @@ impl GlobalMetrics {
         for resource in self.exporter.get_finished_metrics()? {
             for scope in resource.scope_metrics() {
                 for metric in scope.metrics().filter(|metric| metric.name() == name) {
-                    collect_points(metric.data(), &mut points);
+                    collect_points(name, metric.data(), &mut points)?;
                 }
             }
         }
@@ -240,9 +245,20 @@ impl GlobalMetrics {
 /// Reads one metric's `u64` sum or gauge points into `points`, keeping the last
 /// value seen for each attribute set. The exporter is cumulative, so a later
 /// export of one series supersedes an earlier one.
-fn collect_points(data: &AggregatedMetrics, points: &mut BTreeMap<BTreeMap<String, String>, u64>) {
+///
+/// # Errors
+///
+/// Returns an error for an instrument this harness cannot read — a signed or
+/// floating-point one, or a histogram. Reporting it is the point: a silent
+/// empty read would let `assert!(points(..)?.is_empty())` pass while proving
+/// nothing.
+fn collect_points(
+    name: &str,
+    data: &AggregatedMetrics,
+    points: &mut BTreeMap<BTreeMap<String, String>, u64>,
+) -> Result<()> {
     let AggregatedMetrics::U64(data) = data else {
-        return;
+        bail!("{name} is not a u64 instrument, so this harness cannot read its points");
     };
     match data {
         MetricData::Sum(sum) => {
@@ -255,8 +271,43 @@ fn collect_points(data: &AggregatedMetrics, points: &mut BTreeMap<BTreeMap<Strin
                 let _ = points.insert(attribute_map(point.attributes()), point.value());
             }
         }
-        MetricData::Histogram(_) | MetricData::ExponentialHistogram(_) => {}
+        MetricData::Histogram(_) | MetricData::ExponentialHistogram(_) => {
+            bail!("{name} is a histogram, so this harness cannot read its points");
+        }
     }
+    Ok(())
+}
+
+/// One data point's whole attribute set, for a comparison that catches an extra
+/// attribute as well as a wrong one.
+pub(crate) fn label(key: &str, value: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([(key.to_owned(), value.to_owned())])
+}
+
+/// Asserts that every label is a plain lowercase token and that no two are
+/// equal, so one outcome can never be read as another in a dashboard.
+///
+/// Check one enum's labels per call. Two enums under different attribute keys
+/// share no namespace, so merging them can red on a legitimate future label.
+///
+/// # Errors
+///
+/// Returns an error naming the first label that is not lowercase, or the first
+/// one that repeats.
+pub(crate) fn assert_distinct_labels<'a>(labels: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut seen: Vec<&str> = Vec::new();
+    for label in labels {
+        ensure!(
+            !label.is_empty() && label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "{label} is not a plain lowercase label"
+        );
+        ensure!(
+            !seen.contains(&label),
+            "{label} labels more than one outcome"
+        );
+        seen.push(label);
+    }
+    Ok(())
 }
 
 /// One data point's attributes, rendered as plain strings so a test can compare
@@ -354,13 +405,34 @@ pub(crate) fn capture_events(max_level: Level) -> (CapturedEvents, DefaultGuard)
 /// span derived from it exportable through [`captured_spans`].
 pub(crate) fn sampled_remote_context() -> Context {
     let span_context = SpanContext::new(
-        TraceId::from(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10),
+        SAMPLED_REMOTE_TRACE,
         SpanId::from(0x1122_3344_5566_7788),
         TraceFlags::SAMPLED,
         true,
         TraceState::NONE,
     );
     Context::current().with_remote_span_context(span_context)
+}
+
+/// The one exported span named `name`.
+///
+/// Exactly one must exist: a test that reads "the" span of a name is asserting
+/// on a second one it never saw as soon as two are exported.
+///
+/// # Errors
+///
+/// Returns an error when no span of that name was exported, or when more than
+/// one was.
+pub(crate) fn named<'a>(spans: &'a [SpanData], name: &str) -> Result<&'a SpanData> {
+    let mut found = spans.iter().filter(|span| span.name == name);
+    let span = found
+        .next()
+        .ok_or_else(|| eyre!("span {name} was not exported"))?;
+    ensure!(
+        found.next().is_none(),
+        "more than one {name} span was exported"
+    );
+    Ok(span)
 }
 
 /// Asserts, by id equality rather than any `is_some()`/validity proxy, that the

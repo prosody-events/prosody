@@ -1,4 +1,6 @@
 use super::{RequestId, ResponseDisposition};
+use crate::test_util::assert_distinct_labels;
+use color_eyre::Result;
 use strum::VariantArray;
 use tonic::Code;
 use uuid::{Uuid, Version};
@@ -55,25 +57,18 @@ fn each_disposition_reports_its_documented_status() {
 }
 
 /// Every disposition counts under its own label, so one answer can never be
-/// read as another in a dashboard, and nothing an arriving frame carries can
-/// reach a label.
+/// read as another in a dashboard.
+///
+/// That an arriving frame reaches no label at all is the receive leg's own
+/// claim, pinned by `every_answer_counts_once_under_a_fixed_label` in
+/// `src/router/grpc/tests/metrics.rs`.
 #[test]
-fn each_disposition_has_a_distinct_label() {
-    let labels: Vec<&str> = ResponseDisposition::VARIANTS
-        .iter()
-        .map(|disposition| disposition.label())
-        .collect();
-
-    for (index, label) in labels.iter().enumerate() {
-        assert!(
-            !label.is_empty() && label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-            "{label} is not a plain lowercase label"
-        );
-        assert!(
-            !labels[..index].contains(label),
-            "{label} labels more than one disposition"
-        );
-    }
+fn each_disposition_has_a_distinct_label() -> Result<()> {
+    assert_distinct_labels(
+        ResponseDisposition::VARIANTS
+            .iter()
+            .map(|disposition| disposition.label()),
+    )
 }
 
 /// Request ids are `UUIDv7`, so the id a trace carries places the request in
@@ -86,7 +81,7 @@ fn every_minted_request_id_is_a_uuid_v7() {
     assert_ne!(first, second, "two mints must not collide");
     for id in [first, second] {
         assert_eq!(
-            Uuid::from_bytes(id.into_bytes()).get_version(),
+            Uuid::from(id).get_version(),
             Some(Version::SortRand),
             "{id} must be a UUIDv7"
         );

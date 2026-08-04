@@ -11,11 +11,10 @@ use super::{ALPHA, Harness, OneListener, SUITE_DESTINATIONS, SUITE_SLOTS, header
 use crate::codec::Codec;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::sender::TypedSender;
-use crate::test_util::{GlobalSpans, TEST_RUNTIME};
+use crate::test_util::{GlobalSpans, TEST_RUNTIME, named};
 use color_eyre::Result;
 use color_eyre::eyre::{bail, ensure, eyre};
 use opentelemetry::trace::{SpanKind, TraceContextExt};
-use opentelemetry_sdk::trace::SpanData;
 use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -28,9 +27,13 @@ const RECEIVED: &str = "peer.response.receive";
 /// The response body this suite queues.
 const PAYLOAD: &[u8] = b"traced";
 
+/// The attribute naming what became of the response.
+const DISPOSITION: &str = "peer.disposition";
+
 /// One response delivered through the whole send path lands in the caller's
-/// trace, with `peer.response.receive` directly under `peer.response.send`, and
-/// the send span is a client call rather than a consumer continuation.
+/// trace, with `peer.response.receive` directly under `peer.response.send`, the
+/// send span is a client call rather than a consumer continuation, and that
+/// span says what became of the response.
 #[test]
 fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
     let spans = GlobalSpans::install()?;
@@ -86,19 +89,16 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
                 && received.span_context.trace_id() == caller_span.trace_id(),
             "{RECEIVED} must be a child of {SENT}, in the caller's trace"
         );
+        let disposition = sent
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == DISPOSITION)
+            .ok_or_else(|| eyre!("{SENT} records no {DISPOSITION}"))?;
+        ensure!(
+            disposition.value.as_str() == "delivered",
+            "{SENT} must say what became of the response, not {}",
+            disposition.value
+        );
         Ok(())
     })
-}
-
-/// The one exported span with `name`.
-fn named<'a>(spans: &'a [SpanData], name: &str) -> Result<&'a SpanData> {
-    let mut found = spans.iter().filter(|span| span.name == name);
-    let span = found
-        .next()
-        .ok_or_else(|| eyre!("span {name} was not exported"))?;
-    ensure!(
-        found.next().is_none(),
-        "one delivery must export exactly one {name} span"
-    );
-    Ok(span)
 }

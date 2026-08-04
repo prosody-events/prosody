@@ -7,7 +7,7 @@
 use super::{MAX_TIMEOUT, NODE, RequestPayload, TestError, names, registry, requester};
 use crate::Topic;
 use crate::requester::{Outcome, ResponseFailure};
-use crate::test_util::captured_spans;
+use crate::test_util::{captured_spans, named};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::Value;
@@ -108,14 +108,6 @@ fn paused() -> Result<Runtime, IoError> {
         .enable_all()
         .start_paused(true)
         .build()
-}
-
-/// The one exported span with `name`.
-fn named<'a>(spans: &'a [SpanData], name: &str) -> Result<&'a SpanData> {
-    spans
-        .iter()
-        .find(|span| span.name == name)
-        .ok_or_else(|| eyre!("span {name} was not exported"))
 }
 
 /// One span attribute, by key.

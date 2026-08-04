@@ -27,7 +27,7 @@ use crate::response::frame::decode::decode_frame;
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::loopback::{node, paused};
 use crate::telemetry::Telemetry;
-use crate::test_util::{captured_spans, sampled_remote_context};
+use crate::test_util::{SAMPLED_REMOTE_TRACE, captured_spans, sampled_remote_context};
 use crate::timers::TimerType;
 use crate::{Key, Offset, Partition, Topic};
 use color_eyre::Result;
@@ -55,9 +55,7 @@ const SENT: &str = "peer.response.send";
 /// The trace the reloaded record belongs to: the one
 /// [`sampled_remote_context`] names, which the loader's `load` span is a child
 /// of.
-const RECORD_TRACE: TraceId = TraceId::from_bytes([
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-]);
+const RECORD_TRACE: TraceId = SAMPLED_REMOTE_TRACE;
 
 /// A loader whose reloaded record still asks for a response.
 ///

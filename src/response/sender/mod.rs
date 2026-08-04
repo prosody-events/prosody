@@ -1,15 +1,6 @@
 //! The typed half of delivery: what holds a queued result, encodes it, and
 //! hands it to the transport.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the respond layer is this module's production caller; every item here is \
-                  exercised by this module's tests"
-    )
-)]
-
 mod metrics;
 mod worker;
 
@@ -135,10 +126,8 @@ impl<C: Codec> TypedSender<C> {
 
     /// Queues one response for delivery, in the trace `trace` names.
     ///
-    /// `trace` is the trace of the message that asked for the response, read
-    /// from that message rather than from the caller's ambient span. A
-    /// deferred reload answers under whatever span the settle boundary runs, so
-    /// an ambient context would put that answer in a trace of its own.
+    /// `trace` is the requester's trace, captured by `Answering` in the respond
+    /// layer, which states why it is a context rather than an ambient span.
     ///
     /// Never awaits. An apply hook calls this, and apply hooks are per-key
     /// serialized: the next event for the same key waits for the hook to
@@ -226,6 +215,15 @@ impl<C: Codec> TypedSender<C> {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no production reader yet: the consumer wiring that hands a consumer its \
+                  responder will report these totals; the sender's and the respond layer's suites \
+                  read them today"
+    )
+)]
 impl SendCounters {
     /// How many responses reached their destination.
     pub(crate) fn sent(&self) -> u64 {

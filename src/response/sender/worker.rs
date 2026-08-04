@@ -16,6 +16,7 @@ use tokio::select;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::{Instant, sleep_until, timeout_at};
+use tracing::field::Empty;
 use tracing::{Instrument, debug_span, warn};
 
 use super::SendCounters;
@@ -36,9 +37,9 @@ pub(super) struct WorkerContext<R> {
 pub(super) struct Job<C: Codec> {
     pub(super) header: FrameHeader,
     pub(super) payload: C::Payload,
-    /// The trace the message that asked for this response belongs to. Carried
-    /// rather than read from the ambient span: a response is framed in one task
-    /// and sent from another, and a `Span` cannot cross that boundary.
+    /// The trace the message that asked for this response belongs to.
+    /// [`Answering`](crate::consumer::middleware::respond::Answering) states
+    /// why it travels as a context.
     pub(super) trace: Context,
     /// The destination this response is paced against. Carried by the job
     /// rather than by the queue, so a queue outlives every occupant of its cell
@@ -95,7 +96,9 @@ impl Share {
 /// keeps draining after its queue handle drops, so a queued response outlives
 /// the layer that queued it.
 ///
-/// Exactly one counter moves per dequeued job. The deadline is the biased arm
+/// Every dequeued job ends as exactly one outcome: it moves one stage or one
+/// drop reason, one of this sender's two counters, and the `peer.disposition`
+/// attribute on its own span. The deadline is the biased arm
 /// of the select, so a job whose deadline has already passed is dropped before
 /// the pipeline is polled at all — nothing is paced, encoded or sent for it.
 /// Work already inside one poll still finishes: this is a deadline the pipeline
@@ -124,7 +127,8 @@ pub(super) async fn run_worker<C: Codec, R: Router>(
             otel.kind = "client",
             peer.target = %header.target,
             peer.request = %header.request,
-            peer.subsystem = %header.subsystem.as_str(),
+            peer.subsystem = %header.subsystem,
+            peer.disposition = Empty,
         );
         carry_parent(&span, trace);
         // One deadline over the whole pipeline — the pacing wait, the address
@@ -140,16 +144,21 @@ pub(super) async fn run_worker<C: Codec, R: Router>(
                 header,
                 payload,
                 expires_at,
-            ).instrument(span) => {
+            ).instrument(span.clone()) => {
                 outcome
             }
         };
+        // Recorded through the owned handle rather than the current span: a
+        // level-disabled span never becomes current, and the deadline arm has
+        // already left the instrumented future in any case.
         match outcome {
             Ok(()) => {
+                span.record("peer.disposition", "delivered");
                 Stage::Delivered.record();
                 context.counters.sent.fetch_add(1, Relaxed);
             }
             Err(reason) => {
+                span.record("peer.disposition", reason.label());
                 reason.record();
                 context.counters.dropped.fetch_add(1, Relaxed);
             }

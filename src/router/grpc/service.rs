@@ -109,16 +109,18 @@ impl<R: RelayHop> Peer for PeerService<R> {
         let frame = request.into_inner();
         async {
             span.record("peer.request", display(frame.header.request));
-            span.record("peer.subsystem", display(frame.header.subsystem.as_str()));
+            span.record("peer.subsystem", display(&frame.header.subsystem));
             let target = frame.header.target;
-            match routing(self.node, target, frame.header.relay) {
+            let routing = routing(self.node, target, frame.header.relay);
+            // Counted here rather than inside the arms, so a routing outcome
+            // added later cannot reach the wire without being counted.
+            if routing != Routing::Accept {
+                TRANSPORT.record_misrouted();
+            }
+            match routing {
                 Routing::Accept => answer(&span, self.registry.accept(frame)),
-                Routing::AlreadyRelayed => {
-                    TRANSPORT.record_misrouted();
-                    answer(&span, ResponseDisposition::AlreadyRelayed)
-                }
+                Routing::AlreadyRelayed => answer(&span, ResponseDisposition::AlreadyRelayed),
                 Routing::Forward => {
-                    TRANSPORT.record_misrouted();
                     TRANSPORT.record_forwarded();
                     // The forwarded form carries this process's own id, so a
                     // relay id the caller supplied cannot survive the hop.
@@ -139,7 +141,14 @@ impl<R: RelayHop> Peer for PeerService<R> {
                         .instrument(forward)
                         .await
                     {
-                        Ok(()) => answer(&span, ResponseDisposition::Accepted),
+                        // The target decided this one and counted it there.
+                        Ok(()) => {
+                            span.record(
+                                "peer.disposition",
+                                ResponseDisposition::Accepted.message(),
+                            );
+                            Ok(Response::new(()))
+                        }
                         Err(RelayFailure::NoCapacity) => {
                             answer(&span, ResponseDisposition::NoRelayCapacity)
                         }
@@ -152,8 +161,7 @@ impl<R: RelayHop> Peer for PeerService<R> {
                         // The target read the frame and answered. Its status is
                         // passed through as it gave it, because rewriting a code
                         // here would silently change the responder's own retry
-                        // decision. It is counted where it was decided — at the
-                        // target — so this relay adds no second count.
+                        // decision.
                         Err(RelayFailure::Target(code)) => {
                             span.record("peer.disposition", code.description());
                             Err(Status::new(code, code.description()))
@@ -172,10 +180,6 @@ impl<R: RelayHop> Peer for PeerService<R> {
 /// Every refusal is named rather than caught, so a disposition added later does
 /// not compile until somebody decides here whether it means the response was
 /// stored. That decision is what `OK` reports.
-///
-/// One answer moves one counter. A relayed frame is answered twice, once by
-/// each process that reads it — which is exactly what [`ResponseDisposition`]
-/// counts: one delivery attempt answered.
 fn answer(span: &Span, disposition: ResponseDisposition) -> Result<Response<()>, Status> {
     span.record("peer.disposition", disposition.message());
     disposition.record();

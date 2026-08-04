@@ -13,6 +13,7 @@ mod dispositions;
 mod health;
 mod inject;
 mod listener;
+mod metrics;
 mod trace;
 mod transport;
 

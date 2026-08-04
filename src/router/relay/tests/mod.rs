@@ -30,8 +30,6 @@ use crate::router::{Host, NodeId, RelayHop, Route, Router, choose_route};
 use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
 use color_eyre::Result;
-use color_eyre::eyre::eyre;
-use opentelemetry_sdk::trace::SpanData;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -327,14 +325,6 @@ pub(super) fn frame(
         format: FormatToken::make(CountingCodec::FORMAT_ID),
         payload: BytesMut::from(PAYLOAD),
     })
-}
-
-/// The one exported span with `name`.
-pub(super) fn named<'a>(spans: &'a [SpanData], name: &str) -> Result<&'a SpanData> {
-    spans
-        .iter()
-        .find(|span| span.name == name)
-        .ok_or_else(|| eyre!("span {name} was not exported"))
 }
 
 /// A listener bound on a port the operating system chooses.

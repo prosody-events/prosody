@@ -5,6 +5,7 @@ use super::{
 use crate::response::RequestId;
 use crate::router::NodeId;
 use crate::subsystem::{SubsystemName, SubsystemNameError};
+use crate::test_util::assert_distinct_labels;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use strum::VariantArray;
 
@@ -427,22 +428,12 @@ fn a_name_that_only_overlaps_the_responder_is_another_subsystem() -> color_eyre:
 /// Every rejection counts under its own label, so one reason can never be read
 /// as another in a dashboard.
 #[test]
-fn each_rejection_has_a_distinct_reason() {
-    let reasons: Vec<&str> = HeaderRejection::VARIANTS
-        .iter()
-        .map(|rejection| rejection.reason())
-        .collect();
-
-    for (index, reason) in reasons.iter().enumerate() {
-        assert!(
-            !reason.is_empty() && reason.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-            "{reason} is not a plain lowercase label"
-        );
-        assert!(
-            !reasons[..index].contains(reason),
-            "{reason} labels more than one rejection"
-        );
-    }
+fn each_rejection_has_a_distinct_reason() -> color_eyre::Result<()> {
+    assert_distinct_labels(
+        HeaderRejection::VARIANTS
+            .iter()
+            .map(|rejection| rejection.reason()),
+    )
 }
 
 /// Runs the parser over one case's headers.

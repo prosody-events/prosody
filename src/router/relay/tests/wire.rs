@@ -1,6 +1,6 @@
 //! What crosses a real hop: the loop stop, the caller's budget, and the trace.
 
-use super::{ALPHA, BUDGET, CAP_BYTES, FixedRouter, Live, PAYLOAD, Pair, TargetRoute, named};
+use super::{ALPHA, BUDGET, CAP_BYTES, FixedRouter, Live, PAYLOAD, Pair, TargetRoute};
 use crate::codec::Codec;
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::encode::{FrameEncoder, Staged};
@@ -16,7 +16,7 @@ use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::HANG_GUARD;
 use crate::router::{Host, NodeId, Preference, ResponseSender, Router, SendFailure};
 use crate::subsystem::SubsystemName;
-use crate::test_util::{GlobalSpans, TEST_RUNTIME};
+use crate::test_util::{GlobalMetrics, GlobalSpans, TEST_RUNTIME, label, named};
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use opentelemetry::Context;
@@ -41,6 +41,9 @@ const FORWARDED: &str = "peer.response.forward";
 
 /// The attribute carrying what is left of the caller's budget.
 const DEADLINE_MS: &str = "peer.deadline_ms";
+
+/// The counter of delivery attempts a process decided.
+const DISPOSITIONS: &str = "prosody.response.dispositions";
 
 /// The budget a caller states. Well under the ceiling a process applies on its
 /// own, so a hop that inherited nothing is unmistakable.
@@ -211,13 +214,26 @@ fn a_relayed_response_reads_as_one_trace() -> Result<()> {
 /// to the target's direct endpoint, and the target stores it. The label rule on
 /// its own dials nothing, and a relay on its own is never the address the rules
 /// picked.
+///
+/// Both processes are live in this test process, so the disposition counter is
+/// the second claim: one delivery is one point. The relay decided nothing, so
+/// it counts nothing, and only the target's `accepted` is there.
 #[test]
 fn a_response_crosses_two_networks_through_a_relay() -> Result<()> {
+    let metrics = GlobalMetrics::install();
     TEST_RUNTIME.block_on(async {
         let pair = Pair::start(PROCESS_BUDGET, PROCESS_BUDGET, TargetRoute::Nowhere).await?;
         let outcome = crossing(&pair).await;
         pair.stop().await?;
-        outcome
+        outcome?;
+        let counted = metrics.points(DISPOSITIONS)?;
+        ensure(
+            counted == vec![(label("disposition", "accepted"), 1)],
+            format!(
+                "one relayed delivery is decided once, so it counts once, but {DISPOSITIONS} \
+                 reads {counted:?}"
+            ),
+        )
     })
 }
 
