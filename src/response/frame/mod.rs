@@ -23,6 +23,7 @@ use crate::codec::Codec;
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
+use prost::encoding::{encoded_len_varint, key_len};
 use std::error::Error;
 use thiserror::Error;
 
@@ -40,6 +41,10 @@ const FIELD_RELAY_NODE: u32 = 8;
 
 /// Width of every identifier on the wire.
 const ID_BYTES: usize = 16;
+
+/// The encoded size of one relay identifier field.
+const RELAY_FIELD_BYTES: usize =
+    key_len(FIELD_RELAY_NODE) + encoded_len_varint(ID_BYTES as u64) + ID_BYTES;
 
 /// The one configured ceiling on an encoded frame.
 ///

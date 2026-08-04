@@ -30,6 +30,7 @@ pub(crate) mod client;
 pub(crate) mod codec;
 mod conn;
 mod counted;
+mod deadline;
 pub(crate) mod health;
 mod inject;
 pub(crate) mod service;
@@ -48,6 +49,7 @@ use self::generated::peer_server::PeerServer;
 use self::health::{PeerHealth, ProcessHealth};
 use self::service::PeerService;
 use crate::response::frame::FrameCap;
+use crate::router::Router;
 use derive_builder::Builder;
 use std::io::Error as IoError;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -204,6 +206,7 @@ pub(crate) struct TransportCounters {
     refused_connections: AtomicU64,
     rejected_frames: AtomicU64,
     misrouted: AtomicU64,
+    forwarded: AtomicU64,
 }
 
 impl Default for TransportConfiguration {
@@ -263,6 +266,7 @@ impl TransportCounters {
             refused_connections: AtomicU64::new(0),
             rejected_frames: AtomicU64::new(0),
             misrouted: AtomicU64::new(0),
+            forwarded: AtomicU64::new(0),
         }
     }
 
@@ -290,6 +294,11 @@ impl TransportCounters {
         self.misrouted.load(Relaxed)
     }
 
+    /// How many frames this process forwarded.
+    pub(crate) fn forwarded(&self) -> u64 {
+        self.forwarded.load(Relaxed)
+    }
+
     fn record_served(&self) {
         self.served.fetch_add(1, Relaxed);
     }
@@ -304,6 +313,10 @@ impl TransportCounters {
 
     fn record_misrouted(&self) {
         self.misrouted.fetch_add(1, Relaxed);
+    }
+
+    fn record_forwarded(&self) {
+        self.forwarded.fetch_add(1, Relaxed);
     }
 }
 
@@ -323,13 +336,14 @@ impl TransportCounters {
 ///
 /// Returns [`TransportError::Reflection`] when the embedded schema cannot be
 /// published.
-pub(in crate::router) fn serve<H, F>(
+pub(in crate::router) fn serve<R, H, F>(
     bound: BoundListener,
-    service: PeerService,
+    service: PeerService<R>,
     health: H,
     shutdown: F,
 ) -> Result<JoinHandle<()>, TransportError>
 where
+    R: Router,
     H: ProcessHealth,
     F: Future<Output = ()> + Send + 'static,
 {

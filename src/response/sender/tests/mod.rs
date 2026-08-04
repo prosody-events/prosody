@@ -23,6 +23,7 @@ use tokio::time::timeout;
 
 mod bounds;
 mod delivery;
+mod fallback;
 mod isolation;
 
 /// The frame ceiling these suites encode against.
@@ -50,9 +51,21 @@ pub(super) struct Drained {
 }
 
 impl Harness {
-    /// A harness over a fleet built from `config`.
+    /// A harness over a fleet built from `config`, where every node publishes a
+    /// direct endpoint alone.
     pub(super) fn new(config: FleetConfiguration) -> Result<Self> {
         let (router, deliveries) = TestRouter::new(config)?;
+        Self::over(router, deliveries)
+    }
+
+    /// A harness whose nodes publish both endpoints under a label the dialer
+    /// shares, so every route offers a fallback.
+    pub(super) fn dual_homed(config: FleetConfiguration) -> Result<Self> {
+        let (router, deliveries) = TestRouter::dual_homed(config)?;
+        Self::over(router, deliveries)
+    }
+
+    fn over(router: TestRouter, deliveries: UnboundedReceiver<Delivery>) -> Result<Self> {
         Ok(Self {
             sender: TypedSender::new(&router, FrameCap::new(CAP_BYTES)?)?,
             router,
@@ -62,7 +75,7 @@ impl Harness {
         })
     }
 
-    /// Sets what the destination for `index` answers.
+    /// Sets what the destination for `index` answers on its direct endpoint.
     pub(super) fn script(&self, index: u8, script: Script) {
         self.router.script(index, script);
     }
@@ -169,11 +182,18 @@ pub(super) async fn next_delivery(
     }
 }
 
-/// How many of `deliveries` went to the node for `index`.
+/// How many of `deliveries` went to the direct endpoint of the node for
+/// `index`.
 pub(super) fn attempts(deliveries: &[Delivery], index: u8) -> usize {
+    attempts_on(deliveries, port(index))
+}
+
+/// How many of `deliveries` reached one exact endpoint port. A node's two
+/// endpoints have distinct ports, so this is what tells them apart.
+pub(super) fn attempts_on(deliveries: &[Delivery], port: u16) -> usize {
     deliveries
         .iter()
-        .filter(|delivery| delivery.port == port(index))
+        .filter(|delivery| delivery.port == port)
         .count()
 }
 

@@ -1,6 +1,7 @@
 use super::{
     FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
     FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameCapError, FrameHeader,
+    RELAY_FIELD_BYTES,
 };
 use crate::codec::Codec;
 use crate::response::{RequestId, ResponseStatus};
@@ -23,9 +24,6 @@ const UNKNOWN_TAG: u32 = 99;
 
 /// A well-formed 16-byte identifier.
 const RAW_ID: [u8; 16] = [0x11; 16];
-
-/// What a relay node costs a frame: key + length + the 16 identifier bytes.
-const RELAY_FIELD_BYTES: usize = 18;
 
 thread_local! {
     /// Payloads serialized on this thread, by every [`CountingCodec`] on it.

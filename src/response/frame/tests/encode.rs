@@ -2,13 +2,20 @@ use super::{CountingCodec, RAW_ID, RELAY_FIELD_BYTES, expected_frame_len, header
 use crate::error::ErrorCategory;
 use crate::response::ResponseStatus;
 use crate::response::frame::FrameCap;
-use crate::response::frame::encode::{EncodeError, FrameEncoder};
+use crate::response::frame::decode::decode_frame;
+use crate::response::frame::encode::{EncodeError, Forwarded, FrameEncoder};
 use crate::router::{Framed, NodeId};
 use bytes::BytesMut;
 use color_eyre::Result;
-use color_eyre::eyre::bail;
+use color_eyre::eyre::{bail, eyre};
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
+
+/// The id a relay writes into a frame it sends on.
+const RELAY_ID: [u8; 16] = [0x77; 16];
+
+/// The id a frame already carried before it reached that relay.
+const EARLIER_RELAY_ID: [u8; 16] = [0x33; 16];
 
 /// The exact bytes one deterministic response frames to.
 ///
@@ -32,11 +39,12 @@ const FROZEN_STATUS: usize = 60;
 /// The encoder never reserves: over a run of encodes up to the configured
 /// maximum, a destination buffer sized at the cap never grows, the payload is
 /// serialized exactly once per response, and the frame is exactly as long as
-/// the staging said it would be. After every accepted response the encoder is
-/// left holding a scratch the size of the one it started with — even after a
-/// response big enough to have grown it — or, for a codec that moves its own
-/// buffer into the empty scratch, exactly that buffer, at whatever capacity it
-/// came with.
+/// the staging said it would be. The ceiling covers the frame's forwarded form,
+/// so the largest accepted payload leaves room for one relay id. After every
+/// accepted response the encoder is left holding a scratch the size of the one
+/// it started with — even after a response big enough to have grown it — or,
+/// for a codec that moves its own buffer into the empty scratch, exactly that
+/// buffer, at whatever capacity it came with.
 ///
 /// Both codec shapes run and every payload is handed over with slack past the
 /// cap, because the copy shape alone — or a buffer whose capacity is only its
@@ -76,10 +84,9 @@ fn encodes_without_reserving(codec: &CountingCodec, lengths: &[usize], relay: bo
     // covers giving that memory back. The largest is found through the model
     // rather than restated as a literal, so a change to the header cannot
     // silently move it.
-    let Some(largest) = (0..=cap.bytes())
-        .rev()
-        .find(|&length| expected_frame_len(subsystem, length, relay) <= cap.bytes())
-    else {
+    let Some(largest) = (0..=cap.bytes()).rev().find(|&length| {
+        expected_frame_len(subsystem, length, relay) + RELAY_FIELD_BYTES <= cap.bytes()
+    }) else {
         return TestResult::error("the cap admits some payload");
     };
     let boundaries = [
@@ -159,9 +166,10 @@ fn encodes_without_reserving(codec: &CountingCodec, lengths: &[usize], relay: bo
     TestResult::passed()
 }
 
-/// The cap covers the complete frame, and it is checked before anything is
-/// framed. The two lengths are the exact boundary for this header: a 960-byte
-/// payload frames to precisely 1024 bytes, and one more byte costs two.
+/// The cap covers the frame's forwarded form, and it is checked before anything
+/// is framed. The two lengths are the exact boundary for this header: a
+/// 942-byte payload frames to 1006 bytes, which is the cap once room for one
+/// relay id is set aside, and one more byte costs two.
 #[test]
 fn an_over_cap_response_is_refused_before_it_is_framed() -> Result<()> {
     let cap = FrameCap::new(1024)?;
@@ -172,20 +180,21 @@ fn an_over_cap_response_is_refused_before_it_is_framed() -> Result<()> {
         None,
     )?;
 
-    let staged = encoder.stage(&header, vec![0u8; 960])?;
+    let staged = encoder.stage(&header, vec![0_u8; 942])?;
     assert_eq!(
         staged.bytes(),
-        1024,
-        "the largest accepted response must frame to exactly the cap"
+        1024 - RELAY_FIELD_BYTES,
+        "the largest accepted response must frame to the cap less one relay id"
     );
 
-    let Err(EncodeError::TooLarge { bytes, limit }) = encoder.stage(&header, vec![0u8; 961]) else {
+    let Err(EncodeError::TooLarge { bytes, limit }) = encoder.stage(&header, vec![0_u8; 943])
+    else {
         bail!("a response one byte past the boundary must be refused");
     };
     assert_eq!(
         (bytes, limit),
         (1025, 1024),
-        "the refusal must name the complete frame's length"
+        "the refusal must name the forwarded frame's length"
     );
     Ok(())
 }
@@ -248,5 +257,81 @@ fn known_responses_frame_to_known_bytes() -> Result<()> {
         encoder.stage(&header, b"hi".to_vec())?.write(&mut dst);
         assert_eq!(&dst[..], &expected[..], "the frame's bytes are frozen");
     }
+    Ok(())
+}
+
+/// Every frame this build emits can be sent on: the ceiling covers the
+/// forwarded form, so one relay id always fits.
+///
+/// That is what makes a relay's own refusal reachable only for a frame some
+/// other build produced. Without the reservation, a payload at the ceiling
+/// stages here and then cannot be sent on at all.
+#[quickcheck]
+fn a_staged_frame_always_fits_its_forwarded_form(lengths: Vec<u16>) -> TestResult {
+    match staged_frames_all_forward(lengths) {
+        Ok(()) => TestResult::passed(),
+        Err(error) => TestResult::error(format!("{error:#}")),
+    }
+}
+
+fn staged_frames_all_forward(lengths: Vec<u16>) -> Result<()> {
+    let cap = FrameCap::new(1024)?;
+    let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
+    let header = header(
+        "billing",
+        ResponseStatus::Error(ErrorCategory::Permanent),
+        None,
+    )?;
+    // The boundary leads every run, so the largest payload the cap admits is
+    // covered whatever quickcheck generated.
+    for length in [942_usize, 941, 0]
+        .into_iter()
+        .chain(lengths.into_iter().map(usize::from))
+    {
+        let Ok(staged) = encoder.stage(&header, vec![0_u8; length]) else {
+            continue;
+        };
+        let mut bytes = BytesMut::with_capacity(staged.bytes());
+        staged.write(&mut bytes);
+        let frame = decode_frame(&mut bytes, cap)?;
+        if Forwarded::new(frame, NodeId::from_bytes(RELAY_ID), cap).is_none() {
+            bail!("a {length}-byte payload staged, but its forwarded form did not fit the cap");
+        }
+    }
+    Ok(())
+}
+
+/// A relay writes its own id over whatever the frame already carried.
+///
+/// The constructor is unconditional, so no caller has to remember to clear the
+/// field. That is what the loop stop rests on: a frame this process sends on
+/// always names this process.
+#[test]
+fn a_forwarded_frame_never_keeps_the_relay_id_it_arrived_with() -> Result<()> {
+    let cap = FrameCap::new(1024)?;
+    let earlier = NodeId::from_bytes(EARLIER_RELAY_ID);
+    let relay = NodeId::from_bytes(RELAY_ID);
+    let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
+    let header = header("billing", ResponseStatus::Success, Some(earlier))?;
+
+    let staged = encoder.stage(&header, b"hi".to_vec())?;
+    let mut bytes = BytesMut::with_capacity(staged.bytes());
+    staged.write(&mut bytes);
+    let arrived = decode_frame(&mut bytes, cap)?;
+    assert_eq!(
+        arrived.header.relay,
+        Some(earlier),
+        "the fixture must arrive already naming another relay"
+    );
+
+    let forwarded = Forwarded::new(arrived, relay, cap)
+        .ok_or_else(|| eyre!("a short frame must fit the cap once forwarded"))?;
+    let mut sent = BytesMut::with_capacity(forwarded.bytes());
+    forwarded.write(&mut sent);
+    assert_eq!(
+        decode_frame(&mut sent, cap)?.header.relay,
+        Some(relay),
+        "the frame must name {relay}, the relay that sent it on, not {earlier}"
+    );
     Ok(())
 }

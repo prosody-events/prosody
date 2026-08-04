@@ -269,7 +269,14 @@ async fn run_worker<C: Codec, R: Router>(
         let delivered = select! {
             biased;
             () = sleep_until(expires_at) => false,
-            delivered = deliver_job(&mut encoder, &destination, &context, header, payload) => {
+            delivered = deliver_job(
+                &mut encoder,
+                &destination,
+                &context,
+                header,
+                payload,
+                expires_at,
+            ) => {
                 delivered
             }
         };
@@ -289,21 +296,32 @@ async fn run_worker<C: Codec, R: Router>(
 ///
 /// Returns `true` only when the destination accepted the frame. The caller
 /// counts the outcome, so one dequeued job moves one counter.
+///
+/// The route is walked in order, and the destination remembers which endpoint
+/// answered so the next response starts there. An endpoint that stops answering
+/// is forgotten, because a preference that no longer answers is not one.
+///
+/// The attempt budget applies to each endpoint rather than to both together.
+/// Sharing it would make the fallback unreachable whenever one attempt is
+/// configured. Both endpoints together stay inside the job's single deadline,
+/// which the worker's biased select already enforces.
 async fn deliver_job<C: Codec, R: Router>(
     encoder: &mut FrameEncoder<C>,
     destination: &Destination,
     context: &WorkerContext<R>,
     header: FrameHeader,
     payload: C::Payload,
+    expires_at: Instant,
 ) -> bool {
     sleep_until(destination.next_send()).await;
     // No address originates anywhere but a registration: a node the directory
-    // does not hold is not dialed at all.
-    let address = match context.router.address(header.target).await {
-        Ok(Some(address)) => address,
+    // does not hold is not dialed at all, and a node the rules refuse to reach
+    // from here is not dialed either.
+    let route = match context.router.route(header.target).await {
+        Ok(Some(route)) => route,
         Ok(None) => return false,
         Err(error) => {
-            warn!(%error, node = %header.target, "peer address lookup failed");
+            warn!(%error, node = %header.target, "peer route lookup failed");
             return false;
         }
     };
@@ -314,21 +332,39 @@ async fn deliver_job<C: Codec, R: Router>(
             return false;
         }
     };
-    match deliver(
-        context.router.sender(),
-        destination,
-        &address,
-        &staged,
-        context.attempts,
-    )
-    .await
+    let mut last_failure = None;
+    for (preference, address) in route
+        .candidates(destination.preferred())
+        .into_iter()
+        .flatten()
     {
-        Ok(()) => true,
-        Err(failure) => {
-            warn!(%failure, node = %header.target, "response delivery failed");
-            false
+        match deliver(
+            context.router.sender(),
+            destination,
+            address,
+            &staged,
+            context.attempts,
+            expires_at,
+        )
+        .await
+        {
+            Ok(()) => {
+                destination.prefer(Some(preference));
+                return true;
+            }
+            Err(failure) => {
+                last_failure = Some(failure);
+                if !failure.is_wrong_endpoint() {
+                    break;
+                }
+            }
         }
     }
+    destination.prefer(None);
+    if let Some(failure) = last_failure {
+        warn!(%failure, node = %header.target, "response delivery failed");
+    }
+    false
 }
 
 /// Delivers one frame, trying again only for a failure another attempt could
@@ -342,15 +378,16 @@ async fn deliver<S: ResponseSender, F: Framed + Sync>(
     address: &Endpoint,
     frame: &F,
     attempts: u32,
+    expires_at: Instant,
 ) -> Result<(), SendFailure> {
-    let mut outcome = sender.deliver(address, frame).await;
+    let mut outcome = sender.deliver(address, frame, expires_at).await;
     for _ in 1..attempts {
         match outcome {
             Ok(()) => return Ok(()),
             Err(failure) if !failure.is_ambiguous() => return Err(failure),
             Err(_) => {
                 sleep_until(destination.next_send()).await;
-                outcome = sender.deliver(address, frame).await;
+                outcome = sender.deliver(address, frame, expires_at).await;
             }
         }
     }

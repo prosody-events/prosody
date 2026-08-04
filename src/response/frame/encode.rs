@@ -4,11 +4,12 @@
 use super::{
     FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
     FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, ID_BYTES,
+    RELAY_FIELD_BYTES, ResponseFrame,
 };
 use crate::codec::Codec;
 use crate::response::ResponseStatus;
 use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION};
-use crate::router::Framed;
+use crate::router::{Framed, NodeId};
 use bytes::BufMut;
 use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len};
 use std::error::Error;
@@ -54,6 +55,12 @@ pub(crate) struct Staged<'a> {
     bytes: usize,
 }
 
+/// One frame on its way to its target, with this relay's identifier.
+///
+/// Construction always replaces `relay_node`. A received value cannot survive
+/// this hop, so loop prevention does not depend on caller cleanup.
+pub(crate) struct Forwarded(ResponseFrame);
+
 impl<C: Codec> FrameEncoder<C> {
     /// Builds an encoder over a scratch big enough for a payload at the cap.
     pub(crate) fn new(codec: C, cap: FrameCap) -> Self {
@@ -65,12 +72,12 @@ impl<C: Codec> FrameEncoder<C> {
     }
 
     /// Serializes one response into the scratch and checks the complete frame
-    /// length against the cap.
+    /// forwarded length against the cap.
     ///
     /// # Errors
     ///
     /// Returns [`EncodeError::Codec`] when the codec fails, and
-    /// [`EncodeError::TooLarge`] when the framed response would exceed the cap.
+    /// [`EncodeError::TooLarge`] when the forwarded frame would exceed the cap.
     /// The subsystem needs no check here: a [`SubsystemName`] is one a decoder
     /// accepts by construction.
     ///
@@ -99,9 +106,10 @@ impl<C: Codec> FrameEncoder<C> {
             .map_err(EncodeError::Codec)?;
 
         let bytes = frame_len(header, C::FORMAT_ID, self.scratch.len());
-        if bytes > self.cap.bytes() as u64 {
+        let forwarded = bytes + RELAY_FIELD_BYTES as u64;
+        if forwarded > self.cap.bytes() as u64 {
             return Err(EncodeError::TooLarge {
-                bytes,
+                bytes: forwarded,
                 limit: self.cap.bytes(),
             });
         }
@@ -147,24 +155,44 @@ impl Framed for Staged<'_> {
     /// [`BytesMut`](bytes::BytesMut), which reserves on demand, and sizing one
     /// at the frame cap keeps it from ever having to.
     fn write<B: BufMut>(&self, dst: &mut B) {
-        write_varint_field(
-            FIELD_PROTOCOL_VERSION,
-            u64::from(RESPONSE_PROTOCOL_VERSION),
-            dst,
-        );
-        write_bytes_field(FIELD_TARGET_NODE, &self.header.target.into_bytes(), dst);
-        write_bytes_field(FIELD_REQUEST_ID, &self.header.request.into_bytes(), dst);
-        write_bytes_field(
-            FIELD_SUBSYSTEM,
-            self.header.subsystem.as_str().as_bytes(),
-            dst,
-        );
-        write_bytes_field(FIELD_FORMAT, self.format.as_bytes(), dst);
-        write_varint_field(FIELD_STATUS, status_varint(self.header.status), dst);
-        write_bytes_field(FIELD_PAYLOAD, self.payload, dst);
-        if let Some(relay) = self.header.relay {
-            write_bytes_field(FIELD_RELAY_NODE, &relay.into_bytes(), dst);
-        }
+        write_frame(self.header, self.format, self.payload, dst);
+    }
+}
+
+impl Forwarded {
+    /// Builds a forwarded frame when its encoded form fits `cap`.
+    pub(crate) fn new(mut frame: ResponseFrame, relay: NodeId, cap: FrameCap) -> Option<Self> {
+        frame.header.relay = Some(relay);
+        (frame_len(&frame.header, frame.format.to_str(), frame.payload.len()) <= cap.bytes() as u64)
+            .then_some(Self(frame))
+    }
+}
+
+impl Framed for Forwarded {
+    fn bytes(&self) -> usize {
+        frame_len(&self.0.header, self.0.format.to_str(), self.0.payload.len()) as usize
+    }
+
+    fn write<B: BufMut>(&self, dst: &mut B) {
+        write_frame(&self.0.header, self.0.format.to_str(), &self.0.payload, dst);
+    }
+}
+
+/// Writes one complete frame in the stable field order.
+fn write_frame<B: BufMut>(header: &FrameHeader, format: &str, payload: &[u8], dst: &mut B) {
+    write_varint_field(
+        FIELD_PROTOCOL_VERSION,
+        u64::from(RESPONSE_PROTOCOL_VERSION),
+        dst,
+    );
+    write_bytes_field(FIELD_TARGET_NODE, &header.target.into_bytes(), dst);
+    write_bytes_field(FIELD_REQUEST_ID, &header.request.into_bytes(), dst);
+    write_bytes_field(FIELD_SUBSYSTEM, header.subsystem.as_str().as_bytes(), dst);
+    write_bytes_field(FIELD_FORMAT, format.as_bytes(), dst);
+    write_varint_field(FIELD_STATUS, status_varint(header.status), dst);
+    write_bytes_field(FIELD_PAYLOAD, payload, dst);
+    if let Some(relay) = header.relay {
+        write_bytes_field(FIELD_RELAY_NODE, &relay.into_bytes(), dst);
     }
 }
 
@@ -221,10 +249,10 @@ pub(crate) enum EncodeError<E: Error> {
     #[error(transparent)]
     Codec(E),
 
-    /// The complete frame would exceed the configured ceiling.
+    /// The forwarded frame would exceed the configured ceiling.
     #[error("framed response is {bytes} bytes, over the {limit}-byte cap")]
     TooLarge {
-        /// The length the complete frame would have had.
+        /// The length the forwarded frame would have had.
         bytes: u64,
         /// The configured ceiling.
         limit: usize,

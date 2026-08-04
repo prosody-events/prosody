@@ -23,6 +23,7 @@ use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::health::ProcessHealth;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, TransportError, serve};
+use crate::router::relay::Relay;
 use crate::router::{Host, NodeId, RouterHandle};
 use rand::RngExt;
 use std::future::Future;
@@ -69,6 +70,7 @@ mod tests;
 /// wait for a reservation, which is why shutdown exists.
 pub(crate) struct PeerRuntime {
     addresses: AddressResolver,
+    router: RouterHandle<GrpcSender>,
     /// The write side of the directory. The resolver beside it only reads, so
     /// the two directions stay separate types rather than one that does both.
     directory: NodeDirectory,
@@ -134,10 +136,27 @@ impl PeerRuntime {
             inputs.router,
             inputs.group,
         )?;
+        let addresses = AddressResolver::new(
+            AddressCache::new(inputs.router.address_cache_capacity, ttl),
+            directory.clone(),
+        );
+        let router = RouterHandle::new(
+            addresses.clone(),
+            Arc::clone(&fleet),
+            Arc::clone(&transport),
+            registration.network.clone(),
+        );
+        let frame_cap = inputs.listener.frame_cap();
         let (stop_listener, stopped) = oneshot::channel();
         let listener = serve(
             inputs.listener,
-            PeerService::new(registration.node, Arc::clone(&pending)),
+            PeerService::new(
+                registration.node,
+                Arc::clone(&pending),
+                Relay::new(router.clone()),
+                frame_cap,
+                inputs.fleet.send_deadline,
+            ),
             inputs.health,
             async move { drop(stopped.await) },
         )?;
@@ -173,10 +192,8 @@ impl PeerRuntime {
             }
         });
         Ok(Self {
-            addresses: AddressResolver::new(
-                AddressCache::new(inputs.router.address_cache_capacity, ttl),
-                directory.clone(),
-            ),
+            addresses,
+            router,
             directory,
             registration,
             fleet,
@@ -212,11 +229,7 @@ impl PeerRuntime {
 
     /// The router every responder in this process sends through.
     pub(crate) fn router(&self) -> RouterHandle<GrpcSender> {
-        RouterHandle::new(
-            self.addresses.clone(),
-            Arc::clone(&self.fleet),
-            Arc::clone(&self.transport),
-        )
+        self.router.clone()
     }
 
     /// Shuts this process's peer machinery down, in the one order that cannot
@@ -267,12 +280,13 @@ impl PeerRuntime {
             stop_listener,
             listener,
             addresses,
+            router,
             transport,
         } = self;
 
         // Neither needs a step: the resolver only reads, and every sender the
         // drain flushes holds its own clone of the transport.
-        drop((addresses, transport));
+        drop((addresses, router, transport));
         // `send_replace` rather than `send`: a refresh task that already exited
         // leaves no receiver, and that is not a failure.
         stop_refresh.send_replace(true);

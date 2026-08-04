@@ -1,13 +1,16 @@
-use super::{NodeId, Router, RouterHandle, SendFailure};
-use crate::router::directory::RegistrationTtl;
+use super::{NodeId, Preference, Router, RouterHandle, SendFailure, choose_route};
+use crate::router::Host;
 use crate::router::directory::cache::{AddressCache, AddressResolver};
 use crate::router::directory::tests::support::{directory, membership, registration};
+use crate::router::directory::{Endpoint, NetworkId, NodeRegistration, RegistrationTtl};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::LoopbackSender;
 use crate::test_util::TEST_RUNTIME;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
+use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck_macros::quickcheck;
 use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -85,20 +88,43 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
             ),
             Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
             Arc::new(transport),
+            None,
         );
 
-        let address = router
-            .address(published.node)
+        let route = router
+            .route(published.node)
             .await?
             .ok_or_else(|| eyre!("a published node must resolve"))?;
+        let walked: Vec<&_> = route
+            .candidates(None)
+            .into_iter()
+            .flatten()
+            .map(|(_, endpoint)| endpoint)
+            .collect();
+        assert!(
+            !walked.is_empty(),
+            "a published node must reach at least one endpoint"
+        );
+        for address in walked {
+            assert!(
+                *address == published.direct || Some(address) == published.advertised.as_ref(),
+                "a router handed out {address:?}, which the node never published"
+            );
+        }
         assert_eq!(
-            address, published.direct,
-            "a router must hand out the endpoint the node published"
+            router.direct(published.node).await?.as_ref(),
+            Some(&published.direct),
+            "the lookup a forward uses must hand out the endpoint the node published"
         );
         assert_eq!(
-            router.address(NodeId::new()).await?,
+            router.route(NodeId::new()).await?,
             None,
             "a node the directory does not hold must reach no address"
+        );
+        assert_eq!(
+            router.direct(NodeId::new()).await?,
+            None,
+            "a node the directory does not hold must reach no endpoint to forward to"
         );
         Ok(())
     })
@@ -125,10 +151,11 @@ fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<(
             ),
             Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
             Arc::new(transport),
+            None,
         );
 
         assert_eq!(
-            router.address(published.node).await?,
+            router.direct(published.node).await?,
             Some(published.direct.clone()),
             "a published node must resolve"
         );
@@ -138,7 +165,7 @@ fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<(
             "the row must be gone before the cached answer is asserted"
         );
         assert_eq!(
-            router.address(published.node).await?,
+            router.direct(published.node).await?,
             Some(published.direct.clone()),
             "a router must answer from its cache once the row is gone"
         );
@@ -154,4 +181,168 @@ fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<(
         );
         Ok(())
     })
+}
+
+/// How the two labels stand to each other.
+///
+/// The rules read only whether both labels are present and whether they match,
+/// so a case is one of these five shapes rather than a pair of free strings.
+#[derive(Clone, Copy, Debug)]
+enum Labels {
+    /// Both processes carry the same label.
+    Agree,
+    /// Both carry a label, and the two differ.
+    Differ,
+    /// Only the dialer carries one.
+    DialerOnly,
+    /// Only the target carries one.
+    TargetOnly,
+    /// Neither carries one.
+    Neither,
+}
+
+/// What the target published beside its direct endpoint.
+#[derive(Clone, Copy, Debug)]
+enum Published {
+    /// A direct endpoint alone.
+    DirectOnly,
+    /// A direct endpoint and an entry point that reaches it.
+    WithAdvertised,
+}
+
+/// One case: the label pair, and what the target published.
+#[derive(Clone, Copy, Debug)]
+struct Declared {
+    labels: Labels,
+    published: Published,
+}
+
+impl Arbitrary for Declared {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            labels: *g
+                .choose(&[
+                    Labels::Agree,
+                    Labels::Differ,
+                    Labels::DialerOnly,
+                    Labels::TargetOnly,
+                    Labels::Neither,
+                ])
+                .unwrap_or(&Labels::Neither),
+            published: *g
+                .choose(&[Published::DirectOnly, Published::WithAdvertised])
+                .unwrap_or(&Published::DirectOnly),
+        }
+    }
+}
+
+impl Labels {
+    /// The dialer's own label.
+    fn here(self) -> Option<NetworkId> {
+        match self {
+            Self::Agree | Self::Differ | Self::DialerOnly => Some(NetworkId::make("here")),
+            Self::TargetOnly | Self::Neither => None,
+        }
+    }
+
+    /// The label the target published.
+    fn there(self) -> Option<NetworkId> {
+        match self {
+            Self::Agree => Some(NetworkId::make("here")),
+            Self::Differ | Self::TargetOnly => Some(NetworkId::make("elsewhere")),
+            Self::DialerOnly | Self::Neither => None,
+        }
+    }
+
+    /// Whether both processes carry a label.
+    const fn both(self) -> bool {
+        matches!(self, Self::Agree | Self::Differ)
+    }
+}
+
+/// The declared rules decide a route, and a remembered endpoint decides only
+/// the order the route is walked in.
+///
+/// The expected route is written out here as data. Every row is a decision an
+/// operator can read off the labels alone: neighbours use the direct address, a
+/// node known to be elsewhere is reached only through its entry point or not at
+/// all, and an unknown label prefers the entry point where one exists.
+#[quickcheck]
+fn prop_a_route_follows_the_declared_labels(declared: Declared) -> TestResult {
+    let advertised = matches!(declared.published, Published::WithAdvertised);
+    let direct = endpoint(7000);
+    let entry = endpoint(7001);
+    let published = NodeRegistration {
+        node: NodeId::new(),
+        direct: direct.clone(),
+        advertised: advertised.then(|| entry.clone()),
+        network: declared.labels.there(),
+        group: None,
+        hostname: Host::make("declared"),
+    };
+
+    // The table, as an operator reads it off the two labels.
+    let expected: Vec<(Preference, Endpoint)> = match (declared.labels, advertised) {
+        (Labels::Agree, true) => vec![
+            (Preference::Direct, direct.clone()),
+            (Preference::Advertised, entry.clone()),
+        ],
+        (Labels::Agree, false) => vec![(Preference::Direct, direct.clone())],
+        (labels, true) if labels.both() => vec![(Preference::Advertised, entry.clone())],
+        (labels, false) if labels.both() => Vec::new(),
+        (_, true) => vec![(Preference::Advertised, entry.clone())],
+        (_, false) => vec![(Preference::Direct, direct.clone())],
+    };
+
+    let Some(route) = choose_route(declared.labels.here().as_ref(), &published) else {
+        return if expected.is_empty() {
+            TestResult::passed()
+        } else {
+            TestResult::error(format!(
+                "{declared:?} must reach {expected:?}, but reached nothing"
+            ))
+        };
+    };
+    if expected.is_empty() {
+        return TestResult::error(format!(
+            "{declared:?} must reach nothing, but reached {route:?}"
+        ));
+    }
+    let walked: Vec<(Preference, Endpoint)> = route
+        .candidates(None)
+        .into_iter()
+        .flatten()
+        .map(|(preference, endpoint)| (preference, endpoint.clone()))
+        .collect();
+    assert_eq!(
+        walked, expected,
+        "{declared:?} must reach exactly the endpoints the rules name"
+    );
+
+    // A remembered endpoint the route offers is walked first; one it does not
+    // offer changes nothing.
+    for remembered in [Preference::Direct, Preference::Advertised] {
+        let ordered: Vec<Preference> = route
+            .candidates(Some(remembered))
+            .into_iter()
+            .flatten()
+            .map(|(preference, _)| preference)
+            .collect();
+        let mut names: Vec<Preference> = walked.iter().map(|(preference, _)| *preference).collect();
+        names.sort_by_key(|preference| *preference != remembered);
+        assert_eq!(
+            ordered, names,
+            "a remembered {remembered:?} must lead a route that offers it, and change nothing \
+             otherwise"
+        );
+    }
+    TestResult::passed()
+}
+
+/// One endpoint on `port`. Its host is not the subject here.
+fn endpoint(port: u16) -> Endpoint {
+    Endpoint {
+        host: Host::make("10.0.0.9"),
+        port,
+    }
 }

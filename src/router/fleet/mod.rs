@@ -7,19 +7,20 @@
 use crate::router::NodeId;
 use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
 use crate::router::fleet::gate::{AdmissionGate, GateTicket};
-use crate::router::fleet::rate::RateLimit;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::time::Instant;
+use tokio::sync::OwnedSemaphorePermit;
 use validator::Validate;
 
 pub(crate) mod config;
+mod destination;
 mod gate;
 mod rate;
+
+pub(crate) use self::destination::Destination;
 
 #[cfg(test)]
 mod tests;
@@ -78,24 +79,6 @@ struct Occupant {
     )]
     admitted_at: u64,
     destination: Arc<Destination>,
-}
-
-/// One live destination: what bounds the work queued against it, and what paces
-/// that work.
-///
-/// It holds no transport channel and no queue on purpose. The channel sits
-/// behind the [`ResponseSender`](crate::router::ResponseSender) seam, and the
-/// queue and its worker belong to the typed sender. That is what keeps the
-/// fleet untyped and free of transport vocabulary.
-///
-/// A destination lives only while it occupies a cell. Its pacing goes with it:
-/// a destination evicted and admitted again starts from the present rather than
-/// from the schedule it left. What survives eviction is the operator's real
-/// ceiling — `max_destinations` multiplied by `sends_per_second` — because a
-/// live destination is what a cell is.
-pub(crate) struct Destination {
-    slots: Arc<Semaphore>,
-    rate: RateLimit,
 }
 
 /// One send slot, taken on one live destination.
@@ -243,12 +226,29 @@ impl DestinationFleet {
             .count()
     }
 
+    /// Returns how many live cells remember a preference.
+    ///
+    /// This count cannot exceed [`DestinationFleet::live_count`]. A preference
+    /// exists only inside its live destination.
+    #[cfg(test)]
+    pub(crate) fn remembered(&self) -> usize {
+        self.table
+            .lock()
+            .iter()
+            .filter(|cell| {
+                cell.occupant
+                    .as_ref()
+                    .is_some_and(|occupant| occupant.destination.preferred().is_some())
+            })
+            .count()
+    }
+
     /// How many of `node`'s slots are free, if it is live.
     #[cfg(test)]
     pub(crate) fn available(&self, node: NodeId) -> Option<usize> {
         self.table.lock().iter().find_map(|cell| {
             let occupant = cell.occupant.as_ref()?;
-            (occupant.node == node).then(|| occupant.destination.slots.available_permits())
+            (occupant.node == node).then(|| occupant.destination.free_slots())
         })
     }
 
@@ -273,9 +273,7 @@ impl DestinationFleet {
         let (slot, destination) = self.find_or_admit(table, node)?;
         // Taken under the table lock, so "nothing in flight" is an observation
         // eviction can trust: no slot can be taken on a cell being evicted.
-        let permit = Arc::clone(&destination.slots)
-            .try_acquire_owned()
-            .map_err(|_| Refusal::NoSlot)?;
+        let permit = destination.take_slot().map_err(|_| Refusal::NoSlot)?;
         Ok(Reservation {
             slot,
             destination,
@@ -375,23 +373,9 @@ impl Cell {
     /// flight. An empty cell is not idle: it is free, which the caller finds
     /// first.
     fn is_idle(&self, config: FleetConfiguration) -> bool {
-        self.occupant.as_ref().is_some_and(|occupant| {
-            occupant.destination.slots.available_permits() == config.slots_each
-        })
-    }
-}
-
-impl Destination {
-    fn new(config: FleetConfiguration) -> Self {
-        Self {
-            slots: Arc::new(Semaphore::new(config.slots_each)),
-            rate: RateLimit::new(config.sends_per_second),
-        }
-    }
-
-    /// Claims the instant this destination's next send may go at.
-    pub(crate) fn next_send(&self) -> Instant {
-        self.rate.claim()
+        self.occupant
+            .as_ref()
+            .is_some_and(|occupant| occupant.destination.free_slots() == config.slots_each)
     }
 }
 
@@ -417,9 +401,9 @@ impl Reservation<'_> {
     /// caller's contract rather than this one's. The slot itself stays taken
     /// until the permit `queue` was given drops, which is what keeps the
     /// destination unevictable while its send is in flight.
-    pub(crate) fn commit<E, F>(self, queue: F) -> Result<(), E>
+    pub(crate) fn commit<T, F>(self, queue: F) -> T
     where
-        F: FnOnce(OwnedSemaphorePermit) -> Result<(), E>,
+        F: FnOnce(OwnedSemaphorePermit) -> T,
     {
         let Self { permit, ticket, .. } = self;
         let outcome = queue(permit);

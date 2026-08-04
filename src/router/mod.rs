@@ -5,8 +5,8 @@
 //! it shares with them.
 
 use crate::cassandra::errors::CassandraStoreError;
-use crate::router::directory::Endpoint;
 use crate::router::directory::cache::AddressResolver;
+use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use bytes::BufMut;
 use fixedstr::Flexstr;
@@ -15,6 +15,7 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::time::Instant;
 use tonic::Code;
 use uuid::Uuid;
 
@@ -23,6 +24,7 @@ pub(crate) mod fleet;
 pub(crate) mod grpc;
 #[cfg(test)]
 pub(crate) mod loopback;
+pub(crate) mod relay;
 pub(crate) mod runtime;
 
 /// Inline capacity of an operator-configured label. One byte holds the length,
@@ -32,14 +34,6 @@ pub(crate) const LABEL_CAPACITY: usize = 64;
 
 /// The host a node publishes for its peers to dial. Any ordinary hostname or
 /// address stays inline; a longer one spills to the heap.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the node directory and the process runtime are this alias's production users; \
-                  both are exercised by this module's tests"
-    )
-)]
 pub(crate) type Host = Flexstr<LABEL_CAPACITY>;
 
 /// Identifies one live prosody process.
@@ -54,6 +48,38 @@ pub(crate) type Host = Flexstr<LABEL_CAPACITY>;
 /// is still addressable.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct NodeId(Uuid);
+
+/// Which of a node's two endpoints answered last.
+///
+/// A destination remembers one of these and never an [`Endpoint`]. A remembered
+/// address would outlive the registration that published it, and would be
+/// dialed after the node moved. The route is resolved for every response; the
+/// preference only orders the candidates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the response sender is this enum's production reader; the order it decides is \
+                  exercised by this module's tests"
+    )
+)]
+pub(crate) enum Preference {
+    /// The address the node discovered for itself on its own network.
+    Direct,
+    /// The entry point that reaches the node from another network.
+    Advertised,
+}
+
+/// The endpoints one node may be dialed on, in the order the rules put them.
+///
+/// Never more than two, and the second exists only where a failed first attempt
+/// has somewhere else to go. [`choose_route`] is the only way to build one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Route {
+    first: (Preference, Endpoint),
+    second: Option<(Preference, Endpoint)>,
+}
 
 /// One frame, as bytes on the wire.
 ///
@@ -90,11 +116,17 @@ pub(crate) trait Framed {
 /// borrow keeps bounded by the frame ceiling. An owned seam here would put that
 /// allocation on every response whatever the transport needs.
 pub(crate) trait ResponseSender: Send + Sync + 'static {
-    /// Delivers one frame to one resolved address.
+    /// Delivers one frame to one resolved address, and gives up at `deadline`.
+    ///
+    /// The deadline is an instant rather than a duration because the sender
+    /// still has a channel lookup and a readiness wait in front of it, and
+    /// every attempt is given the same argument. A duration the caller computed
+    /// would be stale by the time the header is written.
     fn deliver<F: Framed + Sync>(
         &self,
         address: &Endpoint,
         frame: &F,
+        deadline: Instant,
     ) -> impl Future<Output = Result<(), SendFailure>> + Send;
 }
 
@@ -112,13 +144,31 @@ pub(crate) trait Router: Clone + Send + Sync + 'static {
     /// What can stop a node id from becoming an address.
     type Error: Error + Send + Sync + 'static;
 
-    /// The address `node` published, or `None` when it published none.
+    /// The endpoints `node` may be dialed on from this process, in order. This
+    /// is the responder's lookup, and [`choose_route`] decides what it answers.
+    ///
+    /// `None` means "do not dial", which covers both a node the directory does
+    /// not hold and one the rules refuse to reach from here.
     ///
     /// # Errors
     ///
     /// Returns [`Router::Error`] when the lookup itself failed, which is
     /// distinct from a node that is simply not published.
-    fn address(
+    fn route(
+        &self,
+        node: NodeId,
+    ) -> impl Future<Output = Result<Option<Route>, Self::Error>> + Send;
+
+    /// The direct endpoint alone. This is the lookup a process uses when it
+    /// sends a frame on to the process that frame names.
+    ///
+    /// A process that forwards stands beside its target already, so it reads no
+    /// declared label. This lookup gives it none to read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Router::Error`] when the lookup itself failed.
+    fn direct(
         &self,
         node: NodeId,
     ) -> impl Future<Output = Result<Option<Endpoint>, Self::Error>> + Send;
@@ -147,6 +197,7 @@ pub(crate) struct RouterHandle<S> {
     addresses: AddressResolver,
     fleet: Arc<DestinationFleet>,
     transport: Arc<S>,
+    here: Option<NetworkId>,
 }
 
 impl NodeId {
@@ -197,6 +248,7 @@ impl<S> Clone for RouterHandle<S> {
             addresses: self.addresses.clone(),
             fleet: Arc::clone(&self.fleet),
             transport: Arc::clone(&self.transport),
+            here: self.here.clone(),
         }
     }
 }
@@ -215,11 +267,13 @@ impl<S> RouterHandle<S> {
         addresses: AddressResolver,
         fleet: Arc<DestinationFleet>,
         transport: Arc<S>,
+        here: Option<NetworkId>,
     ) -> Self {
         Self {
             addresses,
             fleet,
             transport,
+            here,
         }
     }
 }
@@ -228,9 +282,14 @@ impl<S: ResponseSender> Router for RouterHandle<S> {
     type Error = CassandraStoreError;
     type Sender = S;
 
-    /// The direct endpoint the node published. [`Host`] holds an ordinary host
-    /// inline, so this clone copies one; only a longer host allocates.
-    async fn address(&self, node: NodeId) -> Result<Option<Endpoint>, CassandraStoreError> {
+    async fn route(&self, node: NodeId) -> Result<Option<Route>, CassandraStoreError> {
+        let registration = self.addresses.resolve(node).await?;
+        Ok(registration
+            .as_deref()
+            .and_then(|registration| choose_route(self.here.as_ref(), registration)))
+    }
+
+    async fn direct(&self, node: NodeId) -> Result<Option<Endpoint>, CassandraStoreError> {
         let registration = self.addresses.resolve(node).await?;
         Ok(registration.map(|registration| registration.direct.clone()))
     }
@@ -262,6 +321,103 @@ impl SendFailure {
             Self::Unreachable | Self::Status(Code::Unavailable | Code::DeadlineExceeded) => true,
             Self::Undialable | Self::Status(_) => false,
         }
+    }
+
+    /// Whether the *endpoint* is what failed, so the node's other endpoint is
+    /// worth trying inside the same response.
+    ///
+    /// Nothing served the frame when the address could not be dialed or nothing
+    /// answered on it. `UNAVAILABLE` and `UNIMPLEMENTED` mean something
+    /// answered that does not serve this method, which is what a misapplied
+    /// label looks like: a direct address that belongs to something unrelated
+    /// here. Every other status is an answer from a node that read the frame,
+    /// and sending it to that node's other address would only repeat it.
+    pub(crate) const fn is_wrong_endpoint(self) -> bool {
+        match self {
+            Self::Unreachable
+            | Self::Undialable
+            | Self::Status(Code::Unavailable | Code::Unimplemented) => true,
+            Self::Status(_) => false,
+        }
+    }
+}
+
+impl Route {
+    /// The candidates to try, the remembered one first when this route offers
+    /// it.
+    ///
+    /// A fixed-size array, so walking a route allocates nothing.
+    pub(crate) fn candidates(
+        &self,
+        remembered: Option<Preference>,
+    ) -> [Option<(Preference, &Endpoint)>; 2] {
+        let first = Some((self.first.0, &self.first.1));
+        let second = self
+            .second
+            .as_ref()
+            .map(|(preference, endpoint)| (*preference, endpoint));
+        if second.is_some_and(|(preference, _)| Some(preference) == remembered) {
+            [second, first]
+        } else {
+            [first, second]
+        }
+    }
+}
+
+/// The endpoints `registration` is dialed on from a process labelled `here`.
+///
+/// A label names the set of processes that reach each other on their direct
+/// endpoints. An operator declares it; nothing infers it. Three rules follow
+/// from that, and this is the one function in the crate that reads a label:
+///
+/// - **Both present and equal.** Dial `direct`, and fall back to `advertised`
+///   when the node published one. Neighbours skip the entry point, which
+///   matters less for latency than for load.
+/// - **Both present and unequal.** Dial `advertised` alone, and `None` when the
+///   node published none. The node is known to be elsewhere, so its direct
+///   address is a foreign one that most likely belongs to something unrelated
+///   here. Refusing to dial is only expressible because the labels were
+///   declared.
+/// - **Either absent.** That means "cannot tell", never "different". Dial
+///   `advertised` if the node published one, else `direct`. With nothing
+///   configured anywhere, every node resolves to `direct`, which is the
+///   single-network case working with no configuration at all.
+///
+/// `None` means "do not dial".
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the response path is this rule's production caller, through `Router::route`; \
+                  each label shape is exercised by this module's tests"
+    )
+)]
+pub(crate) fn choose_route(
+    here: Option<&NetworkId>,
+    registration: &NodeRegistration,
+) -> Option<Route> {
+    match (here, registration.network.as_ref()) {
+        (Some(here), Some(there)) if here == there => Some(Route {
+            first: (Preference::Direct, registration.direct.clone()),
+            second: registration
+                .advertised
+                .clone()
+                .map(|endpoint| (Preference::Advertised, endpoint)),
+        }),
+        (Some(_), Some(_)) => registration.advertised.clone().map(|endpoint| Route {
+            first: (Preference::Advertised, endpoint),
+            second: None,
+        }),
+        (None, _) | (_, None) => Some(match registration.advertised.clone() {
+            Some(endpoint) => Route {
+                first: (Preference::Advertised, endpoint),
+                second: None,
+            },
+            None => Route {
+                first: (Preference::Direct, registration.direct.clone()),
+                second: None,
+            },
+        }),
     }
 }
 

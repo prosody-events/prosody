@@ -371,7 +371,10 @@ async fn settled(shared: &Shared, queued: usize) -> Result<()> {
     let probe = header(shared.node, RequestId::new(), ALPHA)?;
     let staged = encoder.stage(&probe, vec![0xA5])?;
     ensure!(
-        transport.deliver(&shared.listener, &staged).await.is_err(),
+        transport
+            .deliver(&shared.listener, &staged, Instant::now() + HANG_GUARD,)
+            .await
+            .is_err(),
         "the listener socket must be closed once shutdown has returned"
     );
     Ok(())

@@ -13,10 +13,11 @@ use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use quick_cache::UnitWeighter;
 use quick_cache::sync::{Cache, DefaultLifecycle};
 use std::sync::{Arc, LazyLock};
-use tonic::Request;
+use tokio::time::Instant;
 use tonic::client::Grpc;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::transport::{Channel, Endpoint as Dialled};
+use tonic::{Code, Request};
 use tracing::{Span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -101,6 +102,7 @@ impl ResponseSender for GrpcSender {
         &self,
         address: &Endpoint,
         frame: &F,
+        deadline: Instant,
     ) -> Result<(), SendFailure> {
         let channel = self.channel(address).await?;
         let bytes = frame.bytes();
@@ -121,6 +123,15 @@ impl ResponseSender for GrpcSender {
             warn!(%error, host = %address.host, port = address.port, "a peer channel never became ready");
             return Err(SendFailure::Unreachable);
         }
+        // The outbound budget is written here rather than earlier, because
+        // everything above it — the channel lookup and the readiness wait —
+        // spends against the same deadline. No time left is a deadline, not a
+        // dial.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SendFailure::Status(Code::DeadlineExceeded));
+        }
+        request.set_timeout(remaining);
         // The status is passed through as the destination gave it. Rewriting a
         // code here would silently change a retry decision, because
         // `SendFailure::is_ambiguous` reads exactly this code.

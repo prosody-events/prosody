@@ -4,13 +4,13 @@ use super::{ALPHA, GrpcSender, Harness, header, payload, register};
 use crate::codec::Codec;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::sender::TypedSender;
-use crate::router::directory::Endpoint;
+use crate::router::directory::{Endpoint, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::grpc::TRANSPORT;
 use crate::router::grpc::client::{DELIVER_RESPONSE, peer_uri};
 use crate::router::grpc::generated::peer_server::SERVICE_NAME;
 use crate::router::loopback::config;
-use crate::router::{Host, NodeId, Router};
+use crate::router::{Host, NodeId, Route, Router, choose_route};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
@@ -38,19 +38,27 @@ const SHORT: usize = 8;
 struct OneListener {
     fleet: Arc<DestinationFleet>,
     transport: Arc<GrpcSender>,
-    address: Endpoint,
+    registration: NodeRegistration,
 }
 
 impl Router for OneListener {
     type Error = Infallible;
     type Sender = GrpcSender;
 
-    fn address(
+    fn route(
+        &self,
+        _node: NodeId,
+    ) -> impl Future<Output = Result<Option<Route>, Infallible>> + Send {
+        let route = choose_route(None, &self.registration);
+        async move { Ok(route) }
+    }
+
+    fn direct(
         &self,
         _node: NodeId,
     ) -> impl Future<Output = Result<Option<Endpoint>, Infallible>> + Send {
-        let address = self.address.clone();
-        async move { Ok(Some(address)) }
+        let direct = self.registration.direct.clone();
+        async move { Ok(Some(direct)) }
     }
 
     fn sender(&self) -> &GrpcSender {
@@ -109,7 +117,14 @@ fn a_terminal_status_is_attempted_once_and_an_ambiguous_one_is_retried() -> Resu
         let router = OneListener {
             transport: Arc::new(GrpcSender::new(harness.cap, &fleet)),
             fleet,
-            address: harness.address.clone(),
+            registration: NodeRegistration {
+                node: NodeId::new(),
+                direct: harness.address.clone(),
+                advertised: None,
+                network: None,
+                group: None,
+                hostname: Host::make("one-listener"),
+            },
         };
         let attempts = router.fleet().config().max_send_attempts;
 

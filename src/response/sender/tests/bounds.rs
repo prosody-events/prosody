@@ -2,6 +2,8 @@
 //! per cell that serves every occupant of it, and no response unaccounted for.
 
 use super::{Harness, PUBLISHED_NODES, config, node, paused, port};
+use crate::router::SendFailure;
+use crate::router::loopback::Script;
 use color_eyre::Result;
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
@@ -121,5 +123,67 @@ fn a_new_destination_takes_an_idle_cell_and_is_still_delivered() -> Result<()> {
             "the one cell must hold the destination named last"
         );
         Ok(())
+    })
+}
+
+/// However many nodes a stream names, and however many of their endpoints fail,
+/// nothing outside the bounded table remembers which endpoint answered.
+///
+/// Every node's direct endpoint fails and its advertised endpoint answers, so
+/// every delivered response leaves a preference behind. The count of those
+/// preferences can never exceed the count of live cells, because a preference
+/// lives in a cell and nowhere else. A record kept beside the table would grow
+/// with the number of distinct nodes instead.
+#[quickcheck]
+fn prop_no_endpoint_verdict_is_remembered_outside_the_fleet(targets: Vec<u8>) -> TestResult {
+    let Ok(runtime) = paused() else {
+        return TestResult::error("a paused runtime must be buildable");
+    };
+    runtime.block_on(async {
+        let Ok(harness) = Harness::dual_homed(config(CELLS, SLOTS)) else {
+            return TestResult::error("a fleet inside every ceiling must be buildable");
+        };
+        let fleet = harness.fleet();
+        for index in 0..PUBLISHED_NODES {
+            harness.script(
+                index,
+                Script::Fail {
+                    failure: SendFailure::Unreachable,
+                    times: usize::MAX,
+                },
+            );
+        }
+
+        // A capacity refusal is the fleet doing its job. Either way the bounds
+        // below are the subject, so a refusal is counted rather than failed on.
+        let mut refused = 0_usize;
+        for target in targets {
+            if harness.send(target % PUBLISHED_NODES).is_err() {
+                refused += 1;
+            }
+            yield_now().await;
+        }
+        assert!(
+            u64::try_from(refused).is_ok_and(|refused| refused <= fleet.refused()),
+            "{refused} responses were refused, more than the fleet counted"
+        );
+        if harness.drain().await.is_err() {
+            return TestResult::error("every accepted response must be accounted for");
+        }
+
+        assert!(
+            fleet.live_count() <= fleet.capacity(),
+            "{} destinations are live, more than the {} cells the table has",
+            fleet.live_count(),
+            fleet.capacity()
+        );
+        assert!(
+            fleet.remembered() <= fleet.live_count(),
+            "{} endpoint verdicts are remembered, more than the {} live destinations that can \
+             hold one",
+            fleet.remembered(),
+            fleet.live_count()
+        );
+        TestResult::passed()
     })
 }

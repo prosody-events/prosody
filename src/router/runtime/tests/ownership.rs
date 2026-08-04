@@ -55,7 +55,7 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
             let addressed_here = header(shared.node, request, ALPHA)?;
             let mine = encoder.stage(&addressed_here, PAYLOAD.to_vec())?;
             transport
-                .deliver(&shared.listener, &mine)
+                .deliver(&shared.listener, &mine, Instant::now() + HANG_GUARD)
                 .await
                 .map_err(|failure| {
                     eyre!("the listener refused a frame for its own node: {failure}")
@@ -70,7 +70,9 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
             let foreign = encoder.stage(&addressed_elsewhere, PAYLOAD.to_vec())?;
             ensure!(
                 matches!(
-                    transport.deliver(&shared.listener, &foreign).await,
+                    transport
+                        .deliver(&shared.listener, &foreign, Instant::now() + HANG_GUARD)
+                        .await,
                     Err(SendFailure::Status(_))
                 ),
                 "the listener must refuse a frame addressed to another node"
@@ -148,7 +150,7 @@ async fn delivered_to_itself<R: Router>(
     );
     ensure!(
         router
-            .address(shared.node)
+            .direct(shared.node)
             .await
             .map_err(|error| eyre!("{error}"))?
             .as_ref()

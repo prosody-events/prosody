@@ -8,6 +8,7 @@
 //! difference across the call under test rather than an absolute.
 
 mod client;
+mod deadline;
 mod dispositions;
 mod health;
 mod inject;
@@ -26,7 +27,8 @@ use crate::response::frame::{FrameCap, FrameHeader, ResponseFrame};
 use crate::response::{FormatToken, RequestId, ResponseStatus};
 use crate::router::directory::Endpoint;
 use crate::router::fleet::DestinationFleet;
-use crate::router::loopback::{TestHealth, config};
+use crate::router::loopback::{TestHealth, TestRouter, config as fleet_config};
+use crate::router::relay::Relay;
 use crate::router::{Framed, Host, NodeId, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
 use bytes::{BufMut, BytesMut};
@@ -38,6 +40,7 @@ use std::time::Duration;
 use tokio::sync::OnceCell;
 use tokio::sync::oneshot::{Sender, channel};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tonic::Code;
 
 /// The listener's frame ceiling. Small enough that an over-cap frame costs one
@@ -75,10 +78,19 @@ const SUITE_DESTINATIONS: usize = 2;
 /// Responses one destination in a suite's fleet may hold at once.
 const SUITE_SLOTS: usize = 2;
 
+/// The budget a suite gives one delivery, and one forward. Far longer than any
+/// call here takes, so no assertion races a deadline.
+const BUDGET: Duration = Duration::from_secs(30);
+
 /// The one listener every suite that needs a wire shares.
 static SHARED: OnceCell<Harness> = OnceCell::const_new();
 
 /// A live listener, the registry it serves, and the senders that reach it.
+///
+/// The listener sends a frame for another node on, exactly as a live process
+/// does. Its relay resolves nothing for any id these suites use, because every
+/// "another node" here is a freshly minted id and the test router publishes a
+/// fixed set. So such a frame reaches no target and answers `UNAVAILABLE`.
 pub(super) struct Harness {
     /// The node the listener answers for.
     pub(super) node: NodeId,
@@ -124,9 +136,17 @@ impl Harness {
             port: bound.address().port(),
         };
         let (stop, stopped) = channel();
+        let (relay_router, _relay_deliveries) =
+            TestRouter::new(fleet_config(SUITE_DESTINATIONS, SUITE_SLOTS))?;
         let served = serve(
             bound,
-            PeerService::new(node, Arc::clone(&served_registry)),
+            PeerService::new(
+                node,
+                Arc::clone(&served_registry),
+                Relay::new(relay_router),
+                config.frame_cap,
+                BUDGET,
+            ),
             TestHealth::new(true, true),
             // A signal stops the listener; so does dropping the sender, which
             // is what a harness that is simply dropped does.
@@ -163,12 +183,20 @@ impl Harness {
     ) -> Result<Code> {
         let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
         let staged = encoder.stage(header, payload)?;
-        status(sender.deliver(&self.address, &staged).await)
+        status(
+            sender
+                .deliver(&self.address, &staged, Instant::now() + BUDGET)
+                .await,
+        )
     }
 
     /// Delivers bytes exactly as given.
     pub(super) async fn deliver_raw(&self, sender: &GrpcSender, bytes: BytesMut) -> Result<Code> {
-        status(sender.deliver(&self.address, &RawFramed(bytes)).await)
+        status(
+            sender
+                .deliver(&self.address, &RawFramed(bytes), Instant::now() + BUDGET)
+                .await,
+        )
     }
 
     /// Stops the listener and waits for it to finish.
@@ -206,7 +234,10 @@ pub(super) fn transport(cap: usize) -> Result<TransportConfiguration> {
 /// A fleet of `destinations` destinations, which is what sizes a sender's
 /// channel cache.
 pub(super) fn fleet(destinations: usize) -> Result<DestinationFleet> {
-    Ok(DestinationFleet::new(config(destinations, SUITE_SLOTS))?)
+    Ok(DestinationFleet::new(fleet_config(
+        destinations,
+        SUITE_SLOTS,
+    ))?)
 }
 
 /// A registry with a response ceiling below the frame ceiling.

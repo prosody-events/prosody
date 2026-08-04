@@ -14,6 +14,7 @@ use color_eyre::eyre::bail;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use tokio::time::Instant;
 use tonic::Code;
 
 /// The destination these suites address.
@@ -275,4 +276,48 @@ async fn attempts_against(failure: SendFailure) -> Result<usize> {
         .iter()
         .filter(|delivery| delivery.port == port(TARGET))
         .count())
+}
+
+/// Every attempt one response makes is given the same instant to finish by.
+///
+/// The deadline is the job's own, so a retry is not handed a fresh budget: what
+/// the first attempt did not spend is all the second one has. The destination
+/// answers an ambiguous status, so the response makes its whole allowance of
+/// attempts and there is more than one deadline to compare.
+#[test]
+fn every_attempt_of_one_response_carries_the_same_deadline() -> Result<()> {
+    let runtime = paused()?;
+    runtime.block_on(async {
+        let settings = config(CELLS, SLOTS);
+        let harness = Harness::new(settings)?;
+        let queued = Instant::now();
+        harness.script(
+            TARGET,
+            Script::Fail {
+                failure: SendFailure::Status(Code::Unavailable),
+                times: usize::MAX,
+            },
+        );
+        harness.send(TARGET)?;
+
+        let drained = harness.drain().await?;
+        let deadlines: Vec<Instant> = drained
+            .deliveries
+            .iter()
+            .map(|delivery| delivery.deadline)
+            .collect();
+        assert_eq!(
+            deadlines.len(),
+            settings.max_send_attempts as usize,
+            "the response must spend its whole allowance against one destination"
+        );
+        let expected = queued + settings.send_deadline;
+        for deadline in deadlines {
+            assert_eq!(
+                deadline, expected,
+                "every attempt must be given the deadline the response was queued with"
+            );
+        }
+        Ok(())
+    })
 }

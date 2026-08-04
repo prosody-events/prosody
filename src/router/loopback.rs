@@ -1,10 +1,12 @@
 //! An in-process transport, so delivery can be driven without a socket.
 
-use crate::router::directory::Endpoint;
+use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
 use crate::router::grpc::health::ProcessHealth;
-use crate::router::{Framed, Host, NodeId, ResponseSender, Router, SendFailure};
+use crate::router::{
+    Framed, Host, NodeId, ResponseSender, Route, Router, SendFailure, choose_route,
+};
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -21,6 +23,9 @@ use tokio::time::Instant;
 /// Port of the first test node. Each node binds one of its own, which is also
 /// the transport's script key.
 const PORT_BASE: u16 = 9000;
+
+/// Port of the first advertised test endpoint.
+const ADVERTISED_PORT_BASE: u16 = 9300;
 
 /// How many nodes the test router publishes.
 pub(crate) const PUBLISHED_NODES: u8 = 8;
@@ -48,6 +53,7 @@ pub(crate) struct Delivery {
     pub(crate) port: u16,
     pub(crate) bytes: BytesMut,
     pub(crate) at: Instant,
+    pub(crate) deadline: Instant,
 }
 
 /// What one destination answers.
@@ -87,7 +93,8 @@ pub(crate) struct LoopbackSender {
 pub(crate) struct TestRouter {
     fleet: Arc<DestinationFleet>,
     transport: Arc<LoopbackSender>,
-    addresses: Arc<HashMap<NodeId, Endpoint>>,
+    registrations: Arc<HashMap<NodeId, NodeRegistration>>,
+    here: Option<NetworkId>,
 }
 
 /// What one attempt gets, once the script has been consulted.
@@ -155,14 +162,39 @@ impl TestRouter {
     pub(crate) fn new(
         config: FleetConfiguration,
     ) -> Result<(Self, UnboundedReceiver<Delivery>), FleetConfigurationError> {
+        Self::build(config, None)
+    }
+
+    /// Builds a router whose nodes publish direct and advertised endpoints.
+    pub(crate) fn dual_homed(
+        config: FleetConfiguration,
+    ) -> Result<(Self, UnboundedReceiver<Delivery>), FleetConfigurationError> {
+        Self::build(config, Some(NetworkId::make("test")))
+    }
+
+    /// Builds the requested test endpoint shape.
+    fn build(
+        config: FleetConfiguration,
+        here: Option<NetworkId>,
+    ) -> Result<(Self, UnboundedReceiver<Delivery>), FleetConfigurationError> {
         let (transport, deliveries) = LoopbackSender::new();
-        let addresses = (0..PUBLISHED_NODES)
+        let registrations = (0..PUBLISHED_NODES)
             .map(|index| {
                 (
                     node(index),
-                    Endpoint {
-                        host: Host::make("10.0.0.1"),
-                        port: port(index),
+                    NodeRegistration {
+                        node: node(index),
+                        direct: Endpoint {
+                            host: Host::make("10.0.0.1"),
+                            port: port(index),
+                        },
+                        advertised: here.as_ref().map(|_| Endpoint {
+                            host: Host::make("10.0.0.1"),
+                            port: advertised_port(index),
+                        }),
+                        network: here.clone(),
+                        group: None,
+                        hostname: Host::make("test"),
                     },
                 )
             })
@@ -171,7 +203,8 @@ impl TestRouter {
             Self {
                 fleet: Arc::new(DestinationFleet::new(config)?),
                 transport: Arc::new(transport),
-                addresses: Arc::new(addresses),
+                registrations: Arc::new(registrations),
+                here,
             },
             deliveries,
         ))
@@ -187,12 +220,26 @@ impl Router for TestRouter {
     type Error = Infallible;
     type Sender = LoopbackSender;
 
-    fn address(
+    fn route(
+        &self,
+        node: NodeId,
+    ) -> impl Future<Output = Result<Option<Route>, Infallible>> + Send {
+        let route = self
+            .registrations
+            .get(&node)
+            .and_then(|registration| choose_route(self.here.as_ref(), registration));
+        async move { Ok(route) }
+    }
+
+    fn direct(
         &self,
         node: NodeId,
     ) -> impl Future<Output = Result<Option<Endpoint>, Infallible>> + Send {
-        let address = self.addresses.get(&node).cloned();
-        async move { Ok(address) }
+        let direct = self
+            .registrations
+            .get(&node)
+            .map(|registration| registration.direct.clone());
+        async move { Ok(direct) }
     }
 
     fn sender(&self) -> &LoopbackSender {
@@ -209,6 +256,7 @@ impl ResponseSender for LoopbackSender {
         &self,
         address: &Endpoint,
         frame: &F,
+        deadline: Instant,
     ) -> impl Future<Output = Result<(), SendFailure>> + Send {
         let port = address.port;
         let mut bytes = BytesMut::with_capacity(frame.bytes());
@@ -221,6 +269,7 @@ impl ResponseSender for LoopbackSender {
             port,
             bytes,
             at: Instant::now(),
+            deadline,
         }));
         async move {
             match answer {
@@ -246,6 +295,14 @@ pub(crate) fn node(index: u8) -> NodeId {
 /// The port that belongs to `index`.
 pub(crate) fn port(index: u8) -> u16 {
     PORT_BASE + u16::from(index)
+}
+
+/// Returns the advertised port for `index`.
+///
+/// This range cannot overlap direct ports. Scripts use ports as keys, so tests
+/// identify which endpoint received an attempt.
+pub(crate) fn advertised_port(index: u8) -> u16 {
+    ADVERTISED_PORT_BASE + u16::from(index)
 }
 
 /// Builds a current-thread runtime with paused time.
