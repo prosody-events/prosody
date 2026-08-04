@@ -7,6 +7,7 @@ use crate::router::loopback::{Script, advertised_port, node, port};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use std::time::Duration;
+use tonic::Code;
 
 /// The node the responses in this suite are addressed to.
 const TARGET: u8 = 1;
@@ -198,6 +199,119 @@ fn every_attempt_of_one_response_claims_the_destination_pacing() -> Result<()> {
             second.at.duration_since(first.at),
             PERIOD,
             "the fallback attempt must wait its own turn on the destination's rate limit"
+        );
+        Ok(())
+    })
+}
+
+/// A destination that refused the response still names the endpoint that
+/// refused it.
+///
+/// The direct endpoint answers a status of its own, which is the node speaking
+/// rather than the endpoint failing. So the walk stops there — the entry point
+/// is never tried — and the endpoint that spoke is what the destination
+/// remembers, though nothing was delivered. A responder that only remembered a
+/// delivery would forget it here and try the whole route again next time.
+#[test]
+fn an_endpoint_that_refused_the_response_is_still_the_one_that_answered() -> Result<()> {
+    let runtime = paused()?;
+    runtime.block_on(async {
+        let harness = Harness::dual_homed(settings())?;
+        let fleet = harness.fleet();
+        harness.script(
+            TARGET,
+            Script::Fail {
+                failure: SendFailure::Status(Code::Internal),
+                times: usize::MAX,
+            },
+        );
+        harness.send(TARGET)?;
+
+        let drained = harness.drain().await?;
+        assert_eq!(
+            attempts_on(&drained.deliveries, port(TARGET)),
+            1,
+            "the endpoint that answered must be tried once and not again"
+        );
+        assert_eq!(
+            attempts_on(&drained.deliveries, advertised_port(TARGET)),
+            0,
+            "a node that answered for itself must not have its other endpoint tried"
+        );
+        assert_eq!(
+            drained.sent, 0,
+            "the refused response must not count as sent"
+        );
+        assert_eq!(
+            fleet.remembered(),
+            1,
+            "the destination must remember the endpoint that answered, refusal and all"
+        );
+        Ok(())
+    })
+}
+
+/// A destination forgets an endpoint that stops answering.
+///
+/// The first response falls back and is delivered, so the destination remembers
+/// the entry point. That entry point then goes silent too, and the next
+/// response walks the whole route without an answer. A verdict kept past that
+/// would send every later response to a dead address first, for as long as the
+/// cell lived.
+///
+/// The runtime is single threaded, so the worker is not running while the
+/// assertions are. A recorded attempt therefore means the response that made it
+/// has gone as far as it can, and what it left in the cell is settled.
+#[test]
+fn a_destination_forgets_an_endpoint_that_stopped_answering() -> Result<()> {
+    let runtime = paused()?;
+    runtime.block_on(async {
+        let mut harness = Harness::dual_homed(settings())?;
+        let fleet = harness.fleet();
+        harness.script(
+            TARGET,
+            Script::Fail {
+                failure: SendFailure::Unreachable,
+                times: usize::MAX,
+            },
+        );
+
+        harness.send(TARGET)?;
+        assert_eq!(
+            harness.next_delivery().await?.port,
+            port(TARGET),
+            "the first response must try the direct endpoint first"
+        );
+        assert_eq!(
+            harness.next_delivery().await?.port,
+            advertised_port(TARGET),
+            "the first response must fall back to the endpoint that answers"
+        );
+        assert_eq!(
+            fleet.remembered(),
+            1,
+            "the delivered response must leave the endpoint that took it remembered"
+        );
+
+        harness.script_advertised(
+            TARGET,
+            Script::Fail {
+                failure: SendFailure::Unreachable,
+                times: usize::MAX,
+            },
+        );
+        harness.send(TARGET)?;
+
+        let drained = harness.drain().await?;
+        assert_eq!(drained.sent, 1, "only the first response must be delivered");
+        assert!(
+            fleet.live(node(TARGET)).is_some(),
+            "the destination must still hold its cell"
+        );
+        assert_eq!(
+            fleet.remembered(),
+            0,
+            "an endpoint that answered nothing must not stay remembered"
         );
         Ok(())
     })

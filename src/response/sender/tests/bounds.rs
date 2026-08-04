@@ -1,9 +1,9 @@
 //! What an open set of destinations costs a sender: a bounded table, a queue
 //! per cell that serves every occupant of it, and no response unaccounted for.
 
-use super::{Harness, PUBLISHED_NODES, config, node, paused, port};
+use super::{Harness, PUBLISHED_NODES, attempts_on, config, node, paused, port};
 use crate::router::SendFailure;
-use crate::router::loopback::Script;
+use crate::router::loopback::{Script, advertised_port};
 use color_eyre::Result;
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
@@ -159,21 +159,47 @@ fn prop_a_stream_that_falls_back_stays_inside_the_table(targets: Vec<u8>) -> Tes
 
         // A capacity refusal is the fleet doing its job. Either way the bounds
         // below are the subject, so a refusal is counted rather than failed on.
-        let mut refused = 0_usize;
+        let mut refused = 0;
         for target in targets {
-            if harness.send(target % PUBLISHED_NODES).is_err() {
+            let index = target % PUBLISHED_NODES;
+            if harness.send(index).is_ok() {
+                // Nothing has awaited since the reservation, so the response is
+                // still queued and holds one of its destination's slots. That
+                // makes the cell unevictable, so the node is live in exactly
+                // one of them — a second cell would double what the operator
+                // allowed this node.
+                assert_eq!(
+                    fleet.cells_holding(node(index)),
+                    1,
+                    "a node with a response queued against it must occupy one cell"
+                );
+            } else {
                 refused += 1;
             }
             yield_now().await;
         }
-        assert!(
-            u64::try_from(refused).is_ok_and(|refused| refused <= fleet.refused()),
-            "{refused} responses were refused, more than the fleet counted"
+        assert_eq!(
+            fleet.refused(),
+            refused,
+            "every refusal must be the fleet's own, and every one must be counted"
         );
-        if harness.drain().await.is_err() {
+        let Ok(drained) = harness.drain().await else {
             return TestResult::error("every accepted response must be accounted for");
-        }
+        };
 
+        // Every direct endpoint is dead and every entry point answers, so a
+        // delivered response is one that reached its entry point exactly once.
+        // Fewer means a response was lost between the two endpoints; more means
+        // one was delivered twice.
+        let fallbacks: usize = (0..PUBLISHED_NODES)
+            .map(|index| attempts_on(&drained.deliveries, advertised_port(index)))
+            .sum();
+        assert_eq!(
+            Ok(fallbacks),
+            usize::try_from(drained.sent),
+            "{} responses were delivered over {fallbacks} attempts on an entry point",
+            drained.sent
+        );
         assert!(
             fleet.live_count() <= fleet.capacity(),
             "{} destinations are live, more than the {} cells the table has",

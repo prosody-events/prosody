@@ -210,9 +210,16 @@ impl TestRouter {
         ))
     }
 
-    /// Sets what the destination for `index` answers.
+    /// Sets what the destination for `index` answers on its direct endpoint.
     pub(crate) fn script(&self, index: u8, script: Script) {
         self.transport.script(port(index), script);
+    }
+
+    /// Sets what the destination for `index` answers on its advertised
+    /// endpoint. Scripting both is what makes a route whose every candidate
+    /// fails reachable.
+    pub(crate) fn script_advertised(&self, index: u8, script: Script) {
+        self.transport.script(advertised_port(index), script);
     }
 }
 

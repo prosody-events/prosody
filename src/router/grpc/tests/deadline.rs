@@ -20,6 +20,10 @@ use tonic::metadata::MetadataValue;
 /// table, so nothing in the table is clamped by it.
 const CAP: Duration = Duration::from_hours(24);
 
+/// A budget under [`CAP`], and the header value a caller states it in. Only an
+/// unclamped read gives this duration back.
+const UNDER_CEILING: (&str, Duration) = ("86399S", Duration::from_secs(86_399));
+
 /// Budgets spanning every unit tonic writes: nanoseconds under a tenth of a
 /// second, microseconds up to a hundred seconds, milliseconds above that.
 const BUDGETS: [Duration; 8] = [
@@ -85,9 +89,25 @@ async fn an_absent_or_unreadable_budget_becomes_this_process_ceiling() -> Result
 
 /// A caller that asks for years gets this process's ceiling, and the instant it
 /// asks for never overflows.
+///
+/// The last row is the one the ceiling alone can satisfy. Every other row here
+/// reads back as the ceiling, which is also what a caller that stated nothing
+/// gets, so those rows cannot tell a clamped budget from a rejected one. A
+/// budget one second under the ceiling reads back unclamped, and a parser that
+/// held it to the ceiling anyway — or that refused it for its size — is refused
+/// here.
 #[tokio::test(start_paused = true)]
-async fn a_budget_beyond_the_ceiling_is_held_to_the_ceiling() -> Result<()> {
-    for value in ["99999999H", "99999999M", "99999999S"] {
+async fn a_budget_is_held_to_the_ceiling_only_when_it_is_over_it() -> Result<()> {
+    assert!(
+        UNDER_CEILING.1 < CAP,
+        "the row that proves the ceiling is a clamp must state a budget under it"
+    );
+    for (value, expected) in [
+        ("99999999H", CAP),
+        ("99999999M", CAP),
+        ("99999999S", CAP),
+        UNDER_CEILING,
+    ] {
         let mut request = Request::new(());
         drop(
             request
@@ -96,8 +116,8 @@ async fn a_budget_beyond_the_ceiling_is_held_to_the_ceiling() -> Result<()> {
         );
         let recovered = remaining(inbound_deadline(request.metadata(), CAP));
         assert_eq!(
-            recovered, CAP,
-            "the budget {value:?} read back as {recovered:?} rather than the {CAP:?} ceiling"
+            recovered, expected,
+            "the budget {value:?} read back as {recovered:?} rather than {expected:?}"
         );
     }
     Ok(())

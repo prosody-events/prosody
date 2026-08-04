@@ -80,6 +80,12 @@ impl Harness {
         self.router.script(index, script);
     }
 
+    /// Sets what the destination for `index` answers on its advertised
+    /// endpoint.
+    pub(super) fn script_advertised(&self, index: u8, script: Script) {
+        self.router.script_advertised(index, script);
+    }
+
     /// The fleet, for the assertions that outlive the harness.
     pub(super) fn fleet(&self) -> Arc<DestinationFleet> {
         Arc::clone(self.router.fleet())
