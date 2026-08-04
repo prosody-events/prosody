@@ -107,10 +107,9 @@ pub(crate) struct PeerInputs<'a, H> {
 /// on, and the network beneath it.
 ///
 /// [`discover_host`] produces one of these, and [`discover_registration`]
-/// spends it: the machine name is published in its own right, and the routed
-/// address is what a neighbour on the same network dials.
+/// spends it.
 struct DiscoveredHost {
-    /// This machine's name, already inside [`MAX_LABEL_BYTES`].
+    /// This machine's name, checked by [`discover_host`].
     hostname: Host,
     /// The local address that reaches the contact point, where the probe found
     /// one.
@@ -156,6 +155,8 @@ impl PeerRuntime {
         let ttl = inputs.router.registration_ttl;
         let directory = NodeDirectory::new(inputs.store, ttl).await?;
         // The blocking pool owns the resolver wait; a runtime thread must not.
+        // The spawn stays beside its await: an early return between them would
+        // detach a blocking task that tokio cannot abort.
         let contact = inputs.contact.to_owned();
         let discovered = spawn_blocking(move || discover_host(&contact)).await??;
         let registration = discover_registration(
@@ -384,11 +385,9 @@ fn routed_host(contact: &str) -> Option<Host> {
 
 /// Reads the machine name and the address that reaches `contact`.
 ///
-/// This is discovery's synchronous half, and [`PeerRuntime::start`] runs it
-/// through [`spawn_blocking`]. The routed probe is the reason: resolving
-/// `contact` can send a query to a name server, and then wait for that
-/// resolver's retries and timeouts. Reading the machine name is synchronous
-/// too, and it stays here because it belongs to the same discovery step.
+/// This is discovery's blocking half, so [`PeerRuntime::start`] runs it
+/// through [`spawn_blocking`]: resolving `contact` can wait on a name server
+/// for as long as that resolver retries.
 ///
 /// # Errors
 ///
@@ -433,6 +432,8 @@ fn discover_registration(
     config: &RouterConfiguration,
     group: Option<GroupMembership>,
 ) -> NodeRegistration {
+    // A listener rather than a port number: a `u16` would make port zero, and
+    // a port that no listener owns, representable.
     let listener_port = listener.address().port();
     let DiscoveredHost { hostname, routed } = discovered;
     NodeRegistration {
@@ -476,7 +477,7 @@ pub(crate) enum PeerRuntimeError {
 
     /// The machine's own name could not be read. Every registration publishes
     /// it, so the lookup is not optional.
-    #[error("host discovery failed: {0:#}")]
+    #[error("the machine name could not be read: {0:#}")]
     Discovery(#[from] whoami::Error),
 
     /// The blocking discovery task returned no result — it was cancelled, or it
