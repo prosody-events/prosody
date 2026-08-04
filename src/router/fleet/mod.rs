@@ -226,10 +226,8 @@ impl DestinationFleet {
             .count()
     }
 
-    /// Returns how many live cells remember a preference.
-    ///
-    /// This count cannot exceed [`DestinationFleet::live_count`]. A preference
-    /// exists only inside its live destination.
+    /// How many live cells remember which endpoint answered. [`Destination`]
+    /// owns what that memory is and how it ends.
     #[cfg(test)]
     pub(crate) fn remembered(&self) -> usize {
         self.table
@@ -273,7 +271,7 @@ impl DestinationFleet {
         let (slot, destination) = self.find_or_admit(table, node)?;
         // Taken under the table lock, so "nothing in flight" is an observation
         // eviction can trust: no slot can be taken on a cell being evicted.
-        let permit = destination.take_slot().map_err(|_| Refusal::NoSlot)?;
+        let permit = destination.take_slot()?;
         Ok(Reservation {
             slot,
             destination,
@@ -397,7 +395,7 @@ impl Reservation<'_> {
     /// shutdown that has seen the count reach zero must find nobody still about
     /// to queue work, so the hand-over runs inside a closure the gate outlives.
     /// The ticket is released after `queue` returns, whatever `queue` returns.
-    /// The error type is the caller's, so where the slot ends up is the
+    /// The return type is the caller's, so where the slot ends up is the
     /// caller's contract rather than this one's. The slot itself stays taken
     /// until the permit `queue` was given drops, which is what keeps the
     /// destination unevictable while its send is in flight.

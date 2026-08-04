@@ -12,31 +12,31 @@ const MAX_DIGITS: usize = 8;
 
 /// The absolute instant a caller's `grpc-timeout` runs out, held to `cap`.
 ///
-/// A caller that set no timeout, or one this build cannot read, gets `cap`.
-/// That is what bounds the work done on a caller's behalf even for a caller
-/// that bounded nothing. The clamp is applied to the duration before it is
-/// added to the present, so a caller that asks for years cannot overflow the
-/// instant.
+/// `cap` is this process's own ceiling, and it applies twice: a caller that set
+/// no timeout, or one this build cannot read, gets `cap`, and a caller that
+/// asked for more than `cap` gets `cap` too. That is what bounds the work done
+/// on a caller's behalf whatever the caller stated. The clamp is applied to the
+/// duration before it is added to the present, so a caller that asks for years
+/// cannot overflow the instant.
 ///
 /// This crate parses the header itself because tonic parses it privately and
 /// never puts the parsed value anywhere a service can read it.
 pub(super) fn inbound_deadline(metadata: &MetadataMap, cap: Duration) -> Instant {
-    let stated = match metadata.get(TIMEOUT_HEADER) {
+    let stated = metadata
+        .get(TIMEOUT_HEADER)
         // A header this build cannot read states nothing this build can spend
         // against, so it reads as absent rather than as a failure.
-        Some(value) => match value.to_str() {
+        .and_then(|value| match value.to_str() {
             Ok(value) => parse_timeout(value, cap),
             Err(_) => None,
-        },
-        None => None,
-    };
+        });
     Instant::now() + stated.unwrap_or(cap)
 }
 
 /// One `grpc-timeout` value: up to eight digits, then one unit character.
 ///
-/// A value outside that shape reads as absent. A value over `cap` reads as
-/// `cap`, so the multiplication below can never overflow.
+/// A value outside that shape reads as absent, and a value over `cap` reads as
+/// `cap`. Arithmetic that saturates is over `cap` by definition.
 fn parse_timeout(value: &str, cap: Duration) -> Option<Duration> {
     let (&unit, digits) = value.as_bytes().split_last()?;
     if digits.is_empty() || digits.len() > MAX_DIGITS || !digits.iter().all(u8::is_ascii_digit) {
@@ -54,8 +54,5 @@ fn parse_timeout(value: &str, cap: Duration) -> Option<Duration> {
         b'n' => Duration::from_nanos(1),
         _ => return None,
     };
-    if u128::from(amount) > cap.as_nanos() / quantum.as_nanos() {
-        return Some(cap);
-    }
-    quantum.checked_mul(amount).map(|granted| granted.min(cap))
+    Some(quantum.saturating_mul(amount).min(cap))
 }

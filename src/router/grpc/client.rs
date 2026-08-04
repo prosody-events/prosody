@@ -14,10 +14,10 @@ use quick_cache::UnitWeighter;
 use quick_cache::sync::{Cache, DefaultLifecycle};
 use std::sync::{Arc, LazyLock};
 use tokio::time::Instant;
+use tonic::Request;
 use tonic::client::Grpc;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::transport::{Channel, Endpoint as Dialled};
-use tonic::{Code, Request};
 use tracing::{Span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -125,11 +125,11 @@ impl ResponseSender for GrpcSender {
         }
         // The outbound budget is written here rather than earlier, because
         // everything above it — the channel lookup and the readiness wait —
-        // spends against the same deadline. No time left is a deadline, not a
-        // dial.
+        // spends against the same deadline. Nothing has left this process yet,
+        // so no time left is this process's own expiry rather than an answer.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(SendFailure::Status(Code::DeadlineExceeded));
+            return Err(SendFailure::Expired);
         }
         request.set_timeout(remaining);
         // The status is passed through as the destination gave it. Rewriting a

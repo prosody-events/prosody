@@ -75,7 +75,7 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
                         .await,
                     Err(SendFailure::Status(_))
                 ),
-                "the listener must refuse a frame addressed to another node"
+                "a frame addressed to another node must never be accepted here"
             );
             ensure!(
                 TRANSPORT.misrouted() == before + 1,

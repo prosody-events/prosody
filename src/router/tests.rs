@@ -39,30 +39,49 @@ fn every_minted_node_id_is_a_fresh_random_uuid() {
     }
 }
 
-/// Only a failure another attempt could fix is tried again.
+/// What each failure means to the three questions the send path asks it.
 ///
-/// Every failure is named, so a failure added later is classified here rather
-/// than inheriting a catch-all. The two that are worth repeating are the ones
-/// where the destination may still answer; a status the destination itself
-/// chose, and an address this process cannot dial, are the same next time.
+/// The answers are written out here as data rather than read back from the
+/// classifiers, so a classifier that changed its mind about a failure fails
+/// this test. Each column is a different decision, and no two of them can be
+/// read off each other:
+///
+/// - **Ambiguous.** Another attempt on this endpoint could still get an answer.
+/// - **Wrong endpoint.** The node's other endpoint is worth trying instead.
+/// - **Answered.** The node itself spoke, so this endpoint is the one that
+///   reaches it.
 #[test]
-fn only_an_unanswered_send_is_worth_another_attempt() {
-    for failure in [
-        SendFailure::Unreachable,
-        SendFailure::Status(Code::Unavailable),
-        SendFailure::Status(Code::DeadlineExceeded),
-    ] {
-        assert!(failure.is_ambiguous(), "{failure} may still have landed");
-    }
-    for failure in [
-        SendFailure::Undialable,
-        SendFailure::Status(Code::NotFound),
-        SendFailure::Status(Code::ResourceExhausted),
-        SendFailure::Status(Code::Ok),
-    ] {
-        assert!(
-            !failure.is_ambiguous(),
-            "{failure} answers the same way every time"
+fn every_failure_answers_the_three_questions_the_send_path_asks() {
+    // failure, ambiguous, wrong endpoint, answered
+    let table = [
+        (SendFailure::Unreachable, true, true, false),
+        (SendFailure::Undialable, false, true, false),
+        (SendFailure::Expired, false, false, false),
+        (answer(Code::Unavailable), true, true, true),
+        (answer(Code::Unimplemented), false, true, true),
+        (answer(Code::DeadlineExceeded), true, false, true),
+        (answer(Code::NotFound), false, false, true),
+        (answer(Code::ResourceExhausted), false, false, true),
+        (answer(Code::Ok), false, false, true),
+    ];
+    for (failure, ambiguous, wrong_endpoint, answered) in table {
+        assert_eq!(
+            failure.is_ambiguous(),
+            ambiguous,
+            "{failure} must{} be worth another attempt",
+            if ambiguous { "" } else { " not" }
+        );
+        assert_eq!(
+            failure.is_wrong_endpoint(),
+            wrong_endpoint,
+            "{failure} must{} send the response to the node's other endpoint",
+            if wrong_endpoint { "" } else { " not" }
+        );
+        assert_eq!(
+            failure.answered(),
+            answered,
+            "{failure} must{} count as the node's own answer",
+            if answered { "" } else { " not" }
         );
     }
 }
@@ -337,6 +356,11 @@ fn prop_a_route_follows_the_declared_labels(declared: Declared) -> TestResult {
         );
     }
     TestResult::passed()
+}
+
+/// The failure a destination that answered `code` produces.
+fn answer(code: Code) -> SendFailure {
+    SendFailure::Status(code)
 }
 
 /// One endpoint on `port`. Its host is not the subject here.

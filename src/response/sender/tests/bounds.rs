@@ -126,16 +126,19 @@ fn a_new_destination_takes_an_idle_cell_and_is_still_delivered() -> Result<()> {
     })
 }
 
-/// However many nodes a stream names, and however many of their endpoints fail,
-/// nothing outside the bounded table remembers which endpoint answered.
+/// A stream that falls back on every response stays inside the table and is
+/// accounted for.
 ///
 /// Every node's direct endpoint fails and its advertised endpoint answers, so
-/// every delivered response leaves a preference behind. The count of those
-/// preferences can never exceed the count of live cells, because a preference
-/// lives in a cell and nowhere else. A record kept beside the table would grow
-/// with the number of distinct nodes instead.
+/// every response walks its whole route rather than stopping at the first
+/// candidate. That is what this adds to the stream above: falling back must not
+/// admit a second cell for one node, and it must not lose a response between
+/// the two endpoints.
+///
+/// Where the endpoint verdict lives is not observable from these counters. Its
+/// removal path is proved where it can go red, in the fallback suite.
 #[quickcheck]
-fn prop_no_endpoint_verdict_is_remembered_outside_the_fleet(targets: Vec<u8>) -> TestResult {
+fn prop_a_stream_that_falls_back_stays_inside_the_table(targets: Vec<u8>) -> TestResult {
     let Ok(runtime) = paused() else {
         return TestResult::error("a paused runtime must be buildable");
     };
@@ -176,13 +179,6 @@ fn prop_no_endpoint_verdict_is_remembered_outside_the_fleet(targets: Vec<u8>) ->
             "{} destinations are live, more than the {} cells the table has",
             fleet.live_count(),
             fleet.capacity()
-        );
-        assert!(
-            fleet.remembered() <= fleet.live_count(),
-            "{} endpoint verdicts are remembered, more than the {} live destinations that can \
-             hold one",
-            fleet.remembered(),
-            fleet.live_count()
         );
         TestResult::passed()
     })

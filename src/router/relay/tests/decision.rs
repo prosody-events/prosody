@@ -96,14 +96,14 @@ async fn play(routed: &Routed) -> Result<()> {
                 routed.target
             );
         }
-        let forwarded = decode_frame(&mut sent.bytes, FrameCap::new(CAP_BYTES)?)?;
-        if forwarded.header.relay != Some(process.node) {
+        let sent_frame = decode_frame(&mut sent.bytes, FrameCap::new(CAP_BYTES)?)?;
+        if sent_frame.header.relay != Some(process.node) {
             bail!(
                 "the sent frame names relay {:?}, not the process that sent it on",
-                forwarded.header.relay
+                sent_frame.header.relay
             );
         }
-        if forwarded.header.target != target {
+        if sent_frame.header.target != target {
             bail!("the sent frame no longer names the process it was addressed to");
         }
     }
@@ -116,6 +116,9 @@ async fn play(routed: &Routed) -> Result<()> {
     }
     if accepted && answered != Code::Ok {
         bail!("a stored response must answer OK, not {answered:?}");
+    }
+    if forwarded && answered != Code::Ok {
+        bail!("a forwarded frame that reached its target must answer OK, not {answered:?}");
     }
     Ok(())
 }

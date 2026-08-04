@@ -21,12 +21,14 @@ const SLOTS: usize = 2;
 /// target never answers, so the budget is what ends the forward.
 const GRANTED: Duration = Duration::from_millis(500);
 
-/// A process answers for a forward only once that forward is over.
+/// A process answers for a forward only once that forward is over, and it makes
+/// one attempt at it.
 ///
-/// The target refuses every attempt, so an `OK` here could only mean the
-/// process answered before it knew. Counting the attempt as well is what makes
-/// "it answered without forwarding at all" separable from "it forwarded and the
-/// forward failed".
+/// The target refuses every attempt for as long as anything asks, so an `OK`
+/// here could only mean the process answered before it knew. Counting the
+/// attempts is what makes three cases separable: it answered without forwarding
+/// at all, it forwarded once and the forward failed, or it forwarded again on
+/// an attempt budget of its own.
 #[test]
 fn a_failed_forward_is_never_answered_as_a_delivery() -> Result<()> {
     let runtime = paused()?;
@@ -54,6 +56,11 @@ fn a_failed_forward_is_never_answered_as_a_delivery() -> Result<()> {
             recorded.map(|delivery| delivery.port),
             Some(port(ELSEWHERE)),
             "the process must have attempted the forward before it answered"
+        );
+        assert!(
+            process.recorded().is_none(),
+            "a relay must make one attempt: the responder that sent this frame keeps its own \
+             attempt budget, and a relay that retried would multiply it"
         );
         assert!(
             !process.stored(request)?,

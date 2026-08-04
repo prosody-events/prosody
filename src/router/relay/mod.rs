@@ -22,11 +22,16 @@ use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tonic::Code;
+use tracing::warn;
 
 #[cfg(test)]
 mod tests;
 
 /// What a process does with a frame that named some node.
+///
+/// [`Forward`](Self::Forward) carries no node id. Carrying one was examined and
+/// rejected: the caller holds the target already, so the field would only add a
+/// binding at every arm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Routing {
     /// The frame names this process. Hand it to the waiter.
@@ -39,15 +44,21 @@ pub(crate) enum Routing {
 
 /// Sends a frame on to the process it names, inside the caller's budget.
 ///
-/// A relay holds the router alone. It never stamps a frame itself: the frame's
-/// forwarded form carries the relay id by construction, so no code path here
-/// can send one on unstamped.
+/// A relay holds the router alone, and it stamps no frame itself. The caller
+/// passes the forwarded form, which carries the relay id by construction. A
+/// parameter typed as that form would make the router name a response, which
+/// this module's own rule forbids, and a marker trait would signal the
+/// requirement rather than carry it.
 pub(crate) struct Relay<R> {
     router: R,
 }
 
 impl<R: Router> Relay<R> {
     /// Forwards through `router`.
+    ///
+    /// The whole [`Router`] rather than a narrower trait over the three items a
+    /// hop reads. That trait was examined and rejected: it would have one
+    /// implementor and would only save a grep.
     pub(crate) const fn new(router: R) -> Self {
         Self { router }
     }
@@ -102,7 +113,13 @@ impl<R: Router> Relay<R> {
             .router
             .direct(target)
             .await
-            .map_err(|_| RelayFailure::Unreachable)?
+            .map_err(|error| {
+                // A directory that is down and a node that published nothing
+                // both reach the caller as one status, so the difference
+                // between them is only readable here.
+                warn!(%error, node = %target, "peer route lookup failed");
+                RelayFailure::Unreachable
+            })?
             .ok_or(RelayFailure::Unreachable)?;
         match self
             .router
@@ -112,6 +129,7 @@ impl<R: Router> Relay<R> {
         {
             Ok(()) => Ok(()),
             Err(SendFailure::Status(code)) => Err(RelayFailure::Target(code)),
+            Err(SendFailure::Expired) => Err(RelayFailure::DeadlineExceeded),
             Err(SendFailure::Unreachable | SendFailure::Undialable) => {
                 Err(RelayFailure::Unreachable)
             }

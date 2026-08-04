@@ -45,9 +45,9 @@ pub(crate) struct TestHealth {
 
 /// One delivery attempt, as the transport saw it.
 ///
-/// The frame bytes are copied out at the moment of the attempt, and the instant
-/// is the virtual one a paused-time test advances, so the record answers both
-/// "what went where" and "when".
+/// The frame bytes are copied out at the moment of the attempt. `at` is the
+/// virtual instant a paused-time test advances to, and `deadline` is the
+/// instant the caller gave this attempt to finish by.
 #[derive(Debug)]
 pub(crate) struct Delivery {
     pub(crate) port: u16,

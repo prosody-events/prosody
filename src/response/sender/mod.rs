@@ -292,14 +292,10 @@ async fn run_worker<C: Codec, R: Router>(
     }
 }
 
-/// Paces one response, resolves its destination, frames it and delivers it.
+/// Resolves one response's route, frames it and delivers it.
 ///
 /// Returns `true` only when the destination accepted the frame. The caller
 /// counts the outcome, so one dequeued job moves one counter.
-///
-/// The route is walked in order, and the destination remembers which endpoint
-/// answered so the next response starts there. An endpoint that stops answering
-/// is forgotten, because a preference that no longer answers is not one.
 ///
 /// The attempt budget applies to each endpoint rather than to both together.
 /// Sharing it would make the fallback unreachable whenever one attempt is
@@ -313,7 +309,6 @@ async fn deliver_job<C: Codec, R: Router>(
     payload: C::Payload,
     expires_at: Instant,
 ) -> bool {
-    sleep_until(destination.next_send()).await;
     // No address originates anywhere but a registration: a node the directory
     // does not hold is not dialed at all, and a node the rules refuse to reach
     // from here is not dialed either.
@@ -332,6 +327,7 @@ async fn deliver_job<C: Codec, R: Router>(
             return false;
         }
     };
+    let mut remembered = None;
     let mut last_failure = None;
     for (preference, address) in route
         .candidates(destination.preferred())
@@ -355,12 +351,16 @@ async fn deliver_job<C: Codec, R: Router>(
             Err(failure) => {
                 last_failure = Some(failure);
                 if !failure.is_wrong_endpoint() {
+                    // Only an answer from the node proves this endpoint is the
+                    // reachable one. Whatever the last candidate did, an
+                    // endpoint that said nothing is not worth remembering.
+                    remembered = failure.answered().then_some(preference);
                     break;
                 }
             }
         }
     }
-    destination.prefer(None);
+    destination.prefer(remembered);
     if let Some(failure) = last_failure {
         warn!(%failure, node = %header.target, "response delivery failed");
     }
@@ -370,8 +370,10 @@ async fn deliver_job<C: Codec, R: Router>(
 /// Delivers one frame, trying again only for a failure another attempt could
 /// fix.
 ///
-/// Every retry claims the destination's pacing too, so the rate limit bounds
-/// what one destination is asked for rather than what it receives.
+/// Every attempt claims the destination's pacing, so the rate limit bounds what
+/// one destination is asked for rather than what it receives. A response that
+/// falls back enters here a second time, and that endpoint's attempts claim
+/// too.
 async fn deliver<S: ResponseSender, F: Framed + Sync>(
     sender: &S,
     destination: &Destination,
@@ -380,6 +382,7 @@ async fn deliver<S: ResponseSender, F: Framed + Sync>(
     attempts: u32,
     expires_at: Instant,
 ) -> Result<(), SendFailure> {
+    sleep_until(destination.next_send()).await;
     let mut outcome = sender.deliver(address, frame, expires_at).await;
     for _ in 1..attempts {
         match outcome {

@@ -30,6 +30,7 @@ mod config;
 mod discovery;
 mod ownership;
 mod shutdown;
+mod wiring;
 
 /// The Cassandra contact point the routed-address probe aims at.
 const CONTACT: &str = "localhost:9042";

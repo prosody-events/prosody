@@ -34,8 +34,8 @@ pub(crate) struct PeerService<R> {
     registry: Arc<PendingRegistry>,
     relay: Relay<R>,
     cap: FrameCap,
-    /// This process's own ceiling on one forward, applied when a caller states
-    /// no budget of its own.
+    /// This process's own ceiling on one forward. [`inbound_deadline`] owns
+    /// what it does to the budget a caller stated.
     budget: Duration,
     propagator: TextMapCompositePropagator,
 }

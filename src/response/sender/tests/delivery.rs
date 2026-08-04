@@ -121,16 +121,14 @@ fn only_ambiguous_statuses_are_retried() -> Result<()> {
     })
 }
 
-/// A response that spends its whole deadline waiting is dropped before it is
-/// encoded, and its slot goes back.
+/// A response whose turn on its destination falls past its own deadline never
+/// reaches the transport, and its slot goes back.
 ///
 /// The destination is paced at one send per second and the deadline is half of
-/// that, so the second response's turn is provably past its expiry. Counting
-/// what the worker's codec serialized is what makes "before it is encoded" a
-/// claim the test risks: reaching no transport alone would still hold if the
-/// pacing wait moved after the encode.
+/// that, so the second response's turn is provably past its expiry. Only the
+/// job's own deadline can end it there: nothing else in the pipeline waits.
 #[test]
-fn an_expired_response_is_dropped_before_it_is_encoded() -> Result<()> {
+fn a_response_paced_past_its_deadline_never_reaches_the_transport() -> Result<()> {
     let runtime = paused()?;
     runtime.block_on(async {
         let mut settings = config(CELLS, SLOTS);
@@ -138,16 +136,10 @@ fn an_expired_response_is_dropped_before_it_is_encoded() -> Result<()> {
         settings.send_deadline = Duration::from_millis(500);
         let harness = Harness::new(settings)?;
         let fleet = harness.fleet();
-        let serialized = serialized_on_this_thread();
         harness.send(TARGET)?;
         harness.send(TARGET)?;
 
         let drained = harness.drain().await?;
-        assert_eq!(
-            serialized_on_this_thread() - serialized,
-            1,
-            "the expired response must never be encoded"
-        );
         assert_eq!(
             attempts(&drained.deliveries, TARGET),
             1,

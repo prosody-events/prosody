@@ -4,13 +4,11 @@
 //! This directory is the only place in the crate that names tonic's transport,
 //! service, codec, metadata, health and reflection surface. One type is shared
 //! outside it — [`tonic::Code`] — because a gRPC status is the wire's own
-//! vocabulary for an outcome. Two rules are written in that vocabulary and stay
-//! outside: [`ResponseDisposition`](crate::response::ResponseDisposition) maps
-//! each outcome onto a status, and
-//! [`SendFailure::is_ambiguous`](crate::router::SendFailure::is_ambiguous)
-//! reads the status a destination answered to decide whether to try again. A
-//! status enum of this crate's own would need a translation at both ends and
-//! would say nothing more. So the gRPC code itself travels.
+//! vocabulary for an outcome. That is the rule rather than a list of sites: any
+//! item outside this directory that must name what a destination answered names
+//! it as a [`tonic::Code`] and carries the code itself. A status enum of this
+//! crate's own would need a translation at both ends and would say nothing
+//! more.
 //!
 //! The router carries no response vocabulary except here, at the wire seam it
 //! owns: the peer method's message *is* the response frame, so the frame, the
@@ -104,6 +102,11 @@ const MAX_STREAMS: u32 = 1_024;
 /// the process's memory budget is what the peer port may take from the consumer
 /// that shares it. The listener accepts no compression, so a stream buffers one
 /// message rather than a compressed one and its expansion.
+///
+/// A frame this process sends on is held past that peak: the decoded frame
+/// moves into the forwarded form and stays live for the whole outbound round
+/// trip, beside the outbound encode buffer. A forward needs a send slot, so the
+/// destination fleet is what bounds how many of those are live at once.
 const MAX_RECEIVE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// What one stream buffers however small the frame ceiling is: the transport
@@ -294,7 +297,12 @@ impl TransportCounters {
         self.misrouted.load(Relaxed)
     }
 
-    /// How many frames this process forwarded.
+    /// How many frames this process decided to send on.
+    ///
+    /// Counted at the decision rather than at the outcome, so a forward that
+    /// then found no capacity, no target or no time left is here too. Every one
+    /// of them is in [`misrouted`](Self::misrouted) as well: a frame sent on is
+    /// a frame that named another node.
     pub(crate) fn forwarded(&self) -> u64 {
         self.forwarded.load(Relaxed)
     }

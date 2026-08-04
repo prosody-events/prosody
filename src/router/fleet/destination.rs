@@ -1,12 +1,12 @@
-//! One live destination: what bounds the work queued against it, what paces
-//! that work, and which of its endpoints answered last.
+//! What one cell of the destination fleet holds.
 
+use super::Refusal;
 use super::config::FleetConfiguration;
 use super::rate::RateLimit;
 use crate::router::Preference;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 /// One live destination: what bounds the work queued against it, what paces
@@ -18,15 +18,20 @@ use tokio::time::Instant;
 /// fleet untyped and free of transport vocabulary.
 ///
 /// A destination lives only while it occupies a cell. Its pacing and its
-/// remembered [`Preference`] go with it: a destination evicted and admitted
-/// again starts from the present and decides its endpoint again. Eviction is
-/// therefore the preference's removal path, and it is the right one — a peer
-/// worth re-dialing from scratch is a peer worth re-deciding. What survives
-/// eviction is the operator's real ceiling — `max_destinations` multiplied by
-/// `sends_per_second` — because a live destination is what a cell is.
+/// remembered [`Preference`] live inside it and nowhere else. Eviction is
+/// therefore the removal path for both. A destination admitted again starts
+/// from the present and decides its endpoint again. What survives eviction is
+/// the operator's ceiling: `max_destinations` multiplied by `sends_per_second`.
 pub(crate) struct Destination {
     slots: Arc<Semaphore>,
     rate: RateLimit,
+    /// Which endpoint answered last.
+    ///
+    /// A [`Mutex`] rather than an `AtomicU8`, examined and kept. The write
+    /// happens once per delivered response, after a pacing sleep and a network
+    /// round trip, so an atomic would buy a `u8` encoding and a fallible decode
+    /// for nothing. Several senders share one fleet, so "one worker per cell"
+    /// is not the reason.
     preferred: Mutex<Option<Preference>>,
 }
 
@@ -44,9 +49,13 @@ impl Destination {
     ///
     /// # Errors
     ///
-    /// Returns the semaphore's error when every slot is already taken.
-    pub(super) fn take_slot(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
-        Arc::clone(&self.slots).try_acquire_owned()
+    /// Returns [`Refusal::NoSlot`] when every slot is already taken. That is
+    /// the only refusal reachable here: the semaphore is never closed, only
+    /// dropped with the cell it belongs to.
+    pub(super) fn take_slot(&self) -> Result<OwnedSemaphorePermit, Refusal> {
+        Arc::clone(&self.slots)
+            .try_acquire_owned()
+            .map_err(|_| Refusal::NoSlot)
     }
 
     /// How many of this destination's slots are free.

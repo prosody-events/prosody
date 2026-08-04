@@ -50,7 +50,7 @@ mod tests;
 ///
 /// The runtime holds this node's registration, the resolver it reads peers
 /// through, the bound listener, the destination fleet, the pending request
-/// registry, and the transport responses leave by. Consumers and requesters
+/// registry, and the router responses leave by. Consumers and requesters
 /// take handles from it and construct none of these themselves. It mints one
 /// [`NodeId`] and the listener answers for that same id, so one runtime has one
 /// identity. One process runs one runtime.
@@ -77,7 +77,6 @@ pub(crate) struct PeerRuntime {
     registration: NodeRegistration,
     fleet: Arc<DestinationFleet>,
     pending: Arc<PendingRegistry>,
-    transport: Arc<GrpcSender>,
     stop_refresh: watch::Sender<bool>,
     refresh: JoinHandle<()>,
     /// Dropping it resolves the listener's shutdown future.
@@ -126,7 +125,10 @@ impl PeerRuntime {
         inputs.router.validate()?;
         let fleet = Arc::new(DestinationFleet::new(inputs.fleet)?);
         let pending = PendingRegistry::new(inputs.requester)?;
-        let transport = Arc::new(GrpcSender::new(inputs.listener.frame_cap(), &fleet));
+        // One ceiling for both seams: the frames this process sends and the
+        // frames its listener admits.
+        let frame_cap = inputs.listener.frame_cap();
+        let transport = Arc::new(GrpcSender::new(frame_cap, &fleet));
         let ttl = inputs.router.registration_ttl;
         let directory = NodeDirectory::new(inputs.store, ttl).await?;
         let registration = discover_registration(
@@ -143,10 +145,9 @@ impl PeerRuntime {
         let router = RouterHandle::new(
             addresses.clone(),
             Arc::clone(&fleet),
-            Arc::clone(&transport),
+            transport,
             registration.network.clone(),
         );
-        let frame_cap = inputs.listener.frame_cap();
         let (stop_listener, stopped) = oneshot::channel();
         let listener = serve(
             inputs.listener,
@@ -198,7 +199,6 @@ impl PeerRuntime {
             registration,
             fleet,
             pending,
-            transport,
             stop_refresh,
             refresh,
             stop_listener,
@@ -281,12 +281,11 @@ impl PeerRuntime {
             listener,
             addresses,
             router,
-            transport,
         } = self;
 
-        // Neither needs a step: the resolver only reads, and every sender the
-        // drain flushes holds its own clone of the transport.
-        drop((addresses, router, transport));
+        // Neither needs a step: the resolver only reads, and the transport the
+        // router carries is cloned into every sender the drain flushes.
+        drop((addresses, router));
         // `send_replace` rather than `send`: a refresh task that already exited
         // leaves no receiver, and that is not a failure.
         stop_refresh.send_replace(true);

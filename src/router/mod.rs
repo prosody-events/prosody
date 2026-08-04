@@ -319,7 +319,7 @@ impl SendFailure {
     pub(crate) const fn is_ambiguous(self) -> bool {
         match self {
             Self::Unreachable | Self::Status(Code::Unavailable | Code::DeadlineExceeded) => true,
-            Self::Undialable | Self::Status(_) => false,
+            Self::Undialable | Self::Expired | Self::Status(_) => false,
         }
     }
 
@@ -337,8 +337,17 @@ impl SendFailure {
             Self::Unreachable
             | Self::Undialable
             | Self::Status(Code::Unavailable | Code::Unimplemented) => true,
-            Self::Status(_) => false,
+            Self::Expired | Self::Status(_) => false,
         }
+    }
+
+    /// Whether the destination itself answered.
+    ///
+    /// Only an answer proves which of a node's endpoints serves it. A budget
+    /// that ran out here proves nothing about either one, so it must not be
+    /// read as the node's own word.
+    pub(crate) const fn answered(self) -> bool {
+        matches!(self, Self::Status(_))
     }
 }
 
@@ -444,6 +453,11 @@ pub(crate) enum SendFailure {
     /// dial, so nothing left this process.
     #[error("destination published an address that cannot be dialed")]
     Undialable,
+
+    /// The budget ran out before the frame left this process, so nothing
+    /// reached the destination and the destination said nothing.
+    #[error("the send budget ran out before the frame left this process")]
+    Expired,
 }
 
 #[cfg(test)]

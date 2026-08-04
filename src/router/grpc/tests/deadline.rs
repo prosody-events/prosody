@@ -3,6 +3,11 @@
 //! Every case reads the budget back through the same function the service uses,
 //! from metadata tonic's own writer produced. A round trip through a parser of
 //! this crate's own would prove only that it agrees with itself.
+//!
+//! Time is paused, so the two clock readings inside one case are the same
+//! instant and each recovered budget is exact. Every row of the table then
+//! bites: under a wall-clock tolerance a parser that answered zero, or one that
+//! read milliseconds as microseconds, would satisfy most of them.
 
 use crate::router::grpc::deadline::inbound_deadline;
 use color_eyre::Result;
@@ -14,11 +19,6 @@ use tonic::metadata::MetadataValue;
 /// The ceiling every case here is read under. Far above every budget in the
 /// table, so nothing in the table is clamped by it.
 const CAP: Duration = Duration::from_hours(24);
-
-/// How much wall clock one round trip may spend. It is a measurement tolerance
-/// on two readings of the clock, never the assertion: every case also holds the
-/// recovered budget to the one the caller stated.
-const SLACK: Duration = Duration::from_secs(1);
 
 /// Budgets spanning every unit tonic writes: nanoseconds under a tenth of a
 /// second, microseconds up to a hundred seconds, milliseconds above that.
@@ -40,21 +40,17 @@ const MALFORMED: [&str; 6] = ["", "S", "abc", "12X", "999999999S", "1.5S"];
 ///
 /// Each case is written by tonic and read by this crate, so a unit either side
 /// reads differently is a real disagreement rather than a self-consistent
-/// mistake. A parser that read one unit as another would recover a budget
-/// larger than the caller stated, which the first assertion refuses.
-#[test]
-fn a_stated_budget_reads_back_as_the_budget_the_caller_stated() {
+/// mistake. A parser that read one unit as another would recover a different
+/// budget, which the assertion refuses whichever way the two disagree.
+#[tokio::test(start_paused = true)]
+async fn a_stated_budget_reads_back_as_the_budget_the_caller_stated() {
     for budget in BUDGETS {
         let mut request = Request::new(());
         request.set_timeout(budget);
         let recovered = remaining(inbound_deadline(request.metadata(), CAP));
-        assert!(
-            recovered <= budget,
-            "a {budget:?} budget read back as {recovered:?}, which is more than the caller granted"
-        );
-        assert!(
-            budget.saturating_sub(recovered) < SLACK,
-            "a {budget:?} budget read back as {recovered:?}, far short of what the caller granted"
+        assert_eq!(
+            recovered, budget,
+            "a {budget:?} budget read back as {recovered:?}"
         );
     }
 }
@@ -62,12 +58,12 @@ fn a_stated_budget_reads_back_as_the_budget_the_caller_stated() {
 /// A caller that states no budget, or one this build cannot read, gets this
 /// process's own ceiling. That is what bounds a forward for a caller that
 /// bounded nothing.
-#[test]
-fn an_absent_or_unreadable_budget_becomes_this_process_ceiling() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn an_absent_or_unreadable_budget_becomes_this_process_ceiling() -> Result<()> {
     let plain: Request<()> = Request::new(());
     let recovered = remaining(inbound_deadline(plain.metadata(), CAP));
-    assert!(
-        CAP.saturating_sub(recovered) < SLACK,
+    assert_eq!(
+        recovered, CAP,
         "an absent budget read back as {recovered:?} rather than the {CAP:?} ceiling"
     );
 
@@ -79,8 +75,8 @@ fn an_absent_or_unreadable_budget_becomes_this_process_ceiling() -> Result<()> {
                 .insert("grpc-timeout", MetadataValue::try_from(value)?),
         );
         let recovered = remaining(inbound_deadline(request.metadata(), CAP));
-        assert!(
-            CAP.saturating_sub(recovered) < SLACK,
+        assert_eq!(
+            recovered, CAP,
             "the unreadable budget {value:?} read back as {recovered:?} rather than the ceiling"
         );
     }
@@ -89,8 +85,8 @@ fn an_absent_or_unreadable_budget_becomes_this_process_ceiling() -> Result<()> {
 
 /// A caller that asks for years gets this process's ceiling, and the instant it
 /// asks for never overflows.
-#[test]
-fn a_budget_beyond_the_ceiling_is_held_to_the_ceiling() -> Result<()> {
+#[tokio::test(start_paused = true)]
+async fn a_budget_beyond_the_ceiling_is_held_to_the_ceiling() -> Result<()> {
     for value in ["99999999H", "99999999M", "99999999S"] {
         let mut request = Request::new(());
         drop(
@@ -99,13 +95,9 @@ fn a_budget_beyond_the_ceiling_is_held_to_the_ceiling() -> Result<()> {
                 .insert("grpc-timeout", MetadataValue::try_from(value)?),
         );
         let recovered = remaining(inbound_deadline(request.metadata(), CAP));
-        assert!(
-            recovered <= CAP,
-            "the budget {value:?} read back as {recovered:?}, past the {CAP:?} ceiling"
-        );
-        assert!(
-            CAP.saturating_sub(recovered) < SLACK,
-            "the budget {value:?} read back as {recovered:?} rather than the ceiling"
+        assert_eq!(
+            recovered, CAP,
+            "the budget {value:?} read back as {recovered:?} rather than the {CAP:?} ceiling"
         );
     }
     Ok(())
