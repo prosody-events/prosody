@@ -1,7 +1,7 @@
 //! What a process discovers about itself, and what it publishes from it.
 
 use super::super::{
-    PeerInputs, PeerRuntime, RouterConfiguration, discover_registration, routed_host,
+    PeerInputs, PeerRuntime, RouterConfiguration, discover_host, discover_registration, routed_host,
 };
 use super::{CONTACT, NUMERIC_CONTACT, listener, requester};
 use crate::router::directory::tests::support::store;
@@ -41,7 +41,13 @@ fn prop_the_direct_endpoint_publishes_only_what_it_discovered(label: u8, port: u
             .build()?;
         config.validate()?;
         let bound = listener().await?;
-        let registration = discover_registration(NodeId::new(), &bound, CONTACT, &config, None)?;
+        let registration = discover_registration(
+            NodeId::new(),
+            &bound,
+            discover_host(CONTACT)?,
+            &config,
+            None,
+        );
         ensure!(
             bound.address().port() != 0,
             "the bound port must not be zero"
@@ -103,8 +109,13 @@ fn the_direct_host_is_the_routed_address_then_this_machine() -> Result<()> {
         let routed = routed_host(NUMERIC_CONTACT)
             .ok_or_else(|| eyre!("the routed probe found no address"))?;
         let bound = listener().await?;
-        let registration =
-            discover_registration(NodeId::new(), &bound, NUMERIC_CONTACT, &config, None)?;
+        let registration = discover_registration(
+            NodeId::new(),
+            &bound,
+            discover_host(NUMERIC_CONTACT)?,
+            &config,
+            None,
+        );
         ensure!(
             routed != registration.hostname,
             "the two discovery sources must differ for this test"
@@ -114,7 +125,13 @@ fn the_direct_host_is_the_routed_address_then_this_machine() -> Result<()> {
             "the direct endpoint must publish the routed address while the probe answers"
         );
 
-        let unrouted = discover_registration(NodeId::new(), &bound, "no-port-here", &config, None)?;
+        let unrouted = discover_registration(
+            NodeId::new(),
+            &bound,
+            discover_host("no-port-here")?,
+            &config,
+            None,
+        );
         assert_eq!(unrouted.direct.host, unrouted.hostname);
         Ok(())
     })

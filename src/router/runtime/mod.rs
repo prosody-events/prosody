@@ -33,7 +33,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::select;
 use tokio::sync::{oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle, spawn_blocking};
 use tokio::time::sleep;
 use tracing::{error, warn};
 use validator::{Validate, ValidationErrors};
@@ -103,6 +103,20 @@ pub(crate) struct PeerInputs<'a, H> {
     pub(crate) requester: &'a RequesterConfiguration,
 }
 
+/// The two host values a process can only learn by asking the machine it runs
+/// on, and the network beneath it.
+///
+/// [`discover_host`] produces one of these, and [`discover_registration`]
+/// spends it: the machine name is published in its own right, and the routed
+/// address is what a neighbour on the same network dials.
+struct DiscoveredHost {
+    /// This machine's name, already inside [`MAX_LABEL_BYTES`].
+    hostname: Host,
+    /// The local address that reaches the contact point, where the probe found
+    /// one.
+    routed: Option<Host>,
+}
+
 impl PeerRuntime {
     /// Builds every shared piece, serves the listener, and publishes this
     /// process.
@@ -141,13 +155,16 @@ impl PeerRuntime {
         let transport = Arc::new(GrpcSender::new(frame_cap, &fleet));
         let ttl = inputs.router.registration_ttl;
         let directory = NodeDirectory::new(inputs.store, ttl).await?;
+        // The blocking pool owns the resolver wait; a runtime thread must not.
+        let contact = inputs.contact.to_owned();
+        let discovered = spawn_blocking(move || discover_host(&contact)).await??;
         let registration = discover_registration(
             NodeId::new(),
             &inputs.listener,
-            inputs.contact,
+            discovered,
             inputs.router,
             inputs.group,
-        )?;
+        );
         let addresses = AddressResolver::new(
             AddressCache::new(inputs.router.address_cache_capacity, ttl),
             directory.clone(),
@@ -365,6 +382,36 @@ fn routed_host(contact: &str) -> Option<Host> {
     Some(Host::make(&local.ip().to_string()))
 }
 
+/// Reads the machine name and the address that reaches `contact`.
+///
+/// This is discovery's synchronous half, and [`PeerRuntime::start`] runs it
+/// through [`spawn_blocking`]. The routed probe is the reason: resolving
+/// `contact` can send a query to a name server, and then wait for that
+/// resolver's retries and timeouts. Reading the machine name is synchronous
+/// too, and it stays here because it belongs to the same discovery step.
+///
+/// # Errors
+///
+/// Returns [`PeerRuntimeError`] when the machine name cannot be read, or when
+/// it is longer than a published label may be. The routed probe's own failure
+/// is not an error: it answers `None`, and [`discover_registration`] then
+/// publishes the machine name.
+fn discover_host(contact: &str) -> Result<DiscoveredHost, PeerRuntimeError> {
+    // The machine name is published in its own right, so the lookup is paid
+    // once and reused where the routed probe finds no address.
+    let machine = hostname()?;
+    if machine.len() > MAX_LABEL_BYTES {
+        return Err(PeerRuntimeError::HostnameTooLong {
+            bytes: machine.len(),
+            limit: MAX_LABEL_BYTES,
+        });
+    }
+    Ok(DiscoveredHost {
+        hostname: Host::make(&machine),
+        routed: routed_host(contact),
+    })
+}
+
 /// Builds this process's registration.
 ///
 /// Each configured field reaches only the endpoint it describes. `direct` is
@@ -375,31 +422,23 @@ fn routed_host(contact: &str) -> Option<Host> {
 /// point. The configured host and port reach `advertised` alone.
 ///
 /// Every label this returns is inside [`MAX_LABEL_BYTES`], which is what lets a
-/// reader treat a longer one as a row this code did not write. The configured
-/// labels are validated; the routed probe answers with an address literal,
-/// which is far shorter; and the machine name is checked here.
+/// reader treat a longer one as a row this code did not write.
+/// [`PeerRuntime::start`] validates the configured labels before it calls this
+/// function, the routed probe answers with an address literal, and
+/// [`discover_host`] checks the machine name.
 fn discover_registration(
     node: NodeId,
     listener: &BoundListener,
-    contact: &str,
+    discovered: DiscoveredHost,
     config: &RouterConfiguration,
     group: Option<GroupMembership>,
-) -> Result<NodeRegistration, PeerRuntimeError> {
+) -> NodeRegistration {
     let listener_port = listener.address().port();
-    // The machine name is published in its own right, so the lookup is paid
-    // once and reused where the routed probe finds no address.
-    let machine = hostname()?;
-    if machine.len() > MAX_LABEL_BYTES {
-        return Err(PeerRuntimeError::HostnameTooLong {
-            bytes: machine.len(),
-            limit: MAX_LABEL_BYTES,
-        });
-    }
-    let hostname = Host::make(&machine);
-    Ok(NodeRegistration {
+    let DiscoveredHost { hostname, routed } = discovered;
+    NodeRegistration {
         node,
         direct: Endpoint {
-            host: routed_host(contact).unwrap_or_else(|| hostname.clone()),
+            host: routed.unwrap_or_else(|| hostname.clone()),
             port: listener_port,
         },
         advertised: config.advertised_host.as_deref().map(|host| Endpoint {
@@ -409,7 +448,7 @@ fn discover_registration(
         network: config.network.as_deref().map(NetworkId::make),
         group,
         hostname,
-    })
+    }
 }
 
 /// A refresh delay inside the lease, jittered so a fleet does not renew into
@@ -439,6 +478,12 @@ pub(crate) enum PeerRuntimeError {
     /// it, so the lookup is not optional.
     #[error("host discovery failed: {0:#}")]
     Discovery(#[from] whoami::Error),
+
+    /// The blocking discovery task returned no result — it was cancelled, or it
+    /// panicked. This process then knows no address to publish, so startup
+    /// stops rather than registering a guess.
+    #[error("the host discovery task returned no result: {0:#}")]
+    DiscoveryTask(#[from] JoinError),
 
     /// The machine's own name is longer than a published label may be.
     /// Refusing to start is preferable to publishing a shortened name, which
