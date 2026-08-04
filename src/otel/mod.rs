@@ -119,7 +119,9 @@ macro_rules! related_span {
 /// carries the parent. A function rather than a second exported macro, because
 /// the kind differs per call site — an outbound peer call is `client` and the
 /// listener that receives it is `server` — and no call site needs the macro's
-/// source location.
+/// source location. Taking the kind as a parameter here would move nothing: a
+/// tracing call site declares its own fields, so `otel.kind` is written where
+/// the span is written whatever this function takes.
 ///
 /// A context that cannot be attached is logged rather than propagated. A broken
 /// trace never fails the work it describes; the span simply appears at the root

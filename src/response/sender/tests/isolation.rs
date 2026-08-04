@@ -2,8 +2,10 @@
 
 use super::{Harness, attempts, config, paused, port};
 use crate::router::loopback::Script;
+use crate::test_util::GlobalMetrics;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -68,13 +70,17 @@ fn a_held_destination_never_delays_a_healthy_one() -> Result<()> {
     })
 }
 
-/// A destination's rate limit paces that destination and no other.
+/// A destination's rate limit paces that destination and no other, and every
+/// send it held back is counted.
 ///
 /// Both destinations are configured at the same rate, so a limiter shared
 /// between them would interleave their sends onto one schedule and neither
-/// would keep its own. Paused time makes the instants exact.
+/// would keep its own. Paused time makes the instants exact, so the number of
+/// sends that really waited is exact too: each destination's first send goes at
+/// once and every one after it waits.
 #[test]
 fn a_rate_limit_bounds_only_its_own_destination() -> Result<()> {
+    let metrics = GlobalMetrics::install();
     let runtime = paused()?;
     runtime.block_on(async {
         let mut settings = config(CELLS, PACED_RESPONSES);
@@ -101,6 +107,11 @@ fn a_rate_limit_bounds_only_its_own_destination() -> Result<()> {
             if paced != expected {
                 bail!("node {index} was paced at {paced:?}, not at {expected:?}");
             }
+        }
+        let waited = metrics.points("prosody.response.rate_limited")?;
+        let held_back = 2 * (PACED_RESPONSES as i64 - 1);
+        if waited != vec![(BTreeMap::new(), held_back)] {
+            bail!("{held_back} sends waited for their turn, but the counter reads {waited:?}");
         }
         Ok(())
     })

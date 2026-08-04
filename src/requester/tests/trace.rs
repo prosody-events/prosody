@@ -4,9 +4,7 @@
 //! it covers the whole wait: there is deliberately no second span for the
 //! answer arriving, because the answer is this call returning.
 
-use super::{MAX_TIMEOUT, NODE, RequestPayload, TestError, names, registry, requester};
-use crate::Topic;
-use crate::requester::{Outcome, ResponseFailure};
+use super::{KEY, NODE, TOPIC, unanswered_call};
 use crate::test_util::{captured_spans, named};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
@@ -21,17 +19,6 @@ use uuid::Uuid;
 /// function's name, so anything naming it `peer.request` is wrong.
 const CALL: &str = "request";
 
-/// Requests this suite's registry admits.
-const IN_FLIGHT: usize = 2;
-
-/// Most subsystems this suite's registry accepts.
-const MAX_AWAITED: usize = 2;
-
-/// The topic, key and subsystem the call names, asserted back off the span.
-const TOPIC: &str = "requests";
-const KEY: &str = "the-key";
-const SUBSYSTEM: &str = "billing";
-
 /// One unanswered call opens a client span carrying the request's identity, the
 /// Kafka system it travelled over, and the count of answers it received.
 ///
@@ -41,7 +28,7 @@ const SUBSYSTEM: &str = "billing";
 #[test]
 fn one_call_opens_a_client_span_naming_its_request_and_its_answers() -> Result<()> {
     let mut outcome: Result<()> = Err(eyre!("the call never ran"));
-    let spans = captured_spans(|| outcome = unanswered_call());
+    let spans = captured_spans(|| outcome = run_unanswered_call());
     outcome?;
 
     let span = named(&spans, CALL)?;
@@ -75,30 +62,10 @@ fn one_call_opens_a_client_span_naming_its_request_and_its_answers() -> Result<(
     Ok(())
 }
 
-/// Drives one call that nothing answers, on a paused clock that walks past its
-/// deadline.
-fn unanswered_call() -> Result<()> {
-    paused()?.block_on(async {
-        let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
-        let requester = requester(registry)?;
-        let awaited = names(&[SUBSYSTEM])?;
-        let no_headers: Vec<(&'static str, &'static str)> = Vec::new();
-        let outcomes = requester
-            .request::<_, u32, TestError>(
-                no_headers,
-                Topic::from(TOPIC),
-                KEY,
-                RequestPayload,
-                &awaited,
-                MAX_TIMEOUT,
-            )
-            .await?;
-        ensure!(
-            outcomes == vec![Outcome::Failed(ResponseFailure::Timeout)],
-            "nothing answered this call, so its one outcome must be a timeout"
-        );
-        Ok(())
-    })
+/// Drives the shared unanswered call on a paused clock of its own, because
+/// [`captured_spans`] scopes a synchronous closure.
+fn run_unanswered_call() -> Result<()> {
+    paused()?.block_on(unanswered_call())
 }
 
 /// A current-thread runtime with paused time and the whole driver set, because

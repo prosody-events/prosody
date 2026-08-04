@@ -100,13 +100,19 @@ impl Harness {
     /// refusal reads as an error here and the fleet's own counter names which
     /// class it was.
     pub(super) fn send(&self, index: u8) -> Result<()> {
+        self.send_payload(index, PAYLOAD.to_vec())
+    }
+
+    /// Queues one response of `payload` for `index`, for a case whose subject
+    /// is the size of the body rather than its content.
+    pub(super) fn send_payload(&self, index: u8, payload: Vec<u8>) -> Result<()> {
         let queued = self.sender.send(
             FrameHeader {
                 target: node(index),
                 ..self.header.clone()
             },
             Context::current(),
-            PAYLOAD.to_vec(),
+            payload,
         );
         if queued.is_err() {
             bail!("the sender refused the response");

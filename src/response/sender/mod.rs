@@ -169,6 +169,10 @@ impl<C: Codec> TypedSender<C> {
                 slot,
                 expires_at,
             };
+            // Recorded before the job is published, so a worker cannot deliver
+            // it and count that before this stage is counted. An exporter would
+            // otherwise read more delivered than enqueued.
+            Stage::Enqueued.record();
             if let Err(error) = jobs.try_send(job) {
                 // `Full` cannot happen. A queue is as deep as its destination
                 // has slots, every job in it holds one of them, and a cell only
@@ -181,7 +185,6 @@ impl<C: Codec> TypedSender<C> {
                 self.counters.dropped.fetch_add(1, Relaxed);
                 return Err(error.into_inner().payload);
             }
-            Stage::Enqueued.record();
             Ok(())
         })
     }

@@ -6,11 +6,13 @@
 //! is the whole attribute set here, which is why every label below is a
 //! `&'static str` a `const fn` chose. What the queues hold across the process
 //! is still derivable: it is `stages{enqueued}` less `stages{delivered}` less
-//! the reasons a worker reports — `deadline`, `encode_failed`,
-//! `unresolvable_node`, `lookup_failed` and `send_failed`. Every other reason
-//! is recorded before a response is enqueued, so a subtraction of the whole
-//! `dropped` total counts those twice and goes negative. What the fleet itself
-//! holds is `prosody.peer.fleet.destinations`.
+//! every reason a response can meet once it counts as enqueued —
+//! `queue_closed`, `queue_full`, `deadline`, `encode_failed`,
+//! `unresolvable_node`, `lookup_failed` and `send_failed`. The three refusals
+//! before that point — `no_destination`, `no_slot` and `shutting_down` — reach
+//! no queue, so a subtraction of the whole `dropped` total counts them twice
+//! and reads negative. What the fleet itself holds is
+//! `prosody.peer.fleet.destinations`.
 //!
 //! These counters are the operator's account of delivery.
 //! [`SendCounters`](super::SendCounters) is the in-process one, and it is the
@@ -65,7 +67,8 @@ static RATE_LIMITED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 pub(super) enum Stage {
     /// A response was offered to the sender.
     Attempted,
-    /// It took a slot and entered its destination's queue.
+    /// It took a slot and was offered to its destination's queue. Counted
+    /// before the offer, so no worker can report a later stage first.
     Enqueued,
     /// A worker framed it into that worker's own scratch.
     Framed,

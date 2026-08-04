@@ -7,19 +7,20 @@
 
 use super::config::RequesterConfiguration;
 use super::registry::{PendingRegistry, Registration};
-use crate::EventIdentity;
 use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
-use crate::requester::ProsodyRequester;
+use crate::requester::{Outcome, ProsodyRequester, ResponseFailure};
 use crate::response::frame::ResponseFrame;
 use crate::response::headers::RequestTag;
 use crate::response::{FormatToken, RequestId, ResponseStatus};
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
+use crate::{EventIdentity, Topic};
 use bytes::BytesMut;
 use color_eyre::Result;
+use color_eyre::eyre::ensure;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,6 +30,7 @@ use thiserror::Error;
 
 mod config;
 mod lifecycle;
+mod metrics;
 mod race;
 mod registry;
 mod request;
@@ -67,6 +69,17 @@ const SWEEP_GRACE: Duration = Duration::from_mins(10);
 
 /// Subsystem names the property generators draw from.
 const POOL: [&str; 6] = ["billing", "ledger", "audit", "search", "mailer", "a,b"];
+
+/// Requests the registry behind [`unanswered_call`] admits.
+pub(super) const IN_FLIGHT: usize = 2;
+
+/// Most subsystems that registry accepts.
+pub(super) const MAX_AWAITED: usize = 2;
+
+/// The topic, key and subsystem [`unanswered_call`] names.
+pub(super) const TOPIC: &str = "requests";
+pub(super) const KEY: &str = "the-key";
+pub(super) const SUBSYSTEM: &str = "billing";
 
 /// The request payload every suite that reaches the real `request` body sends.
 #[derive(Debug)]
@@ -211,6 +224,38 @@ pub(super) fn requester(
         .build()?;
     let producer = ProsodyProducer::new(&config, Telemetry::new().sender())?;
     Ok(ProsodyRequester::new(producer, NODE, registry))
+}
+
+/// Drives one real call that nothing answers, to its deadline.
+///
+/// Run it on a paused clock: the clock then walks past the deadline, so the one
+/// outcome is a timeout the body computed rather than a constant. What the call
+/// leaves behind — its span, and the latency it recorded — is each suite's own
+/// assertion.
+///
+/// # Errors
+///
+/// Returns an error when the call fails or answers anything but a timeout.
+pub(super) async fn unanswered_call() -> Result<()> {
+    let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
+    let requester = requester(registry)?;
+    let awaited = names(&[SUBSYSTEM])?;
+    let no_headers: Vec<(&'static str, &'static str)> = Vec::new();
+    let outcomes = requester
+        .request::<_, u32, TestError>(
+            no_headers,
+            Topic::from(TOPIC),
+            KEY,
+            RequestPayload,
+            &awaited,
+            MAX_TIMEOUT,
+        )
+        .await?;
+    ensure!(
+        outcomes == vec![Outcome::Failed(ResponseFailure::Timeout)],
+        "nothing answered this call, so its one outcome must be a timeout"
+    );
+    Ok(())
 }
 
 /// Builds subsystem names, refusing any the crate would refuse.

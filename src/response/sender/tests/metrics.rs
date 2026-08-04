@@ -11,11 +11,12 @@
 //! when they are first touched, and nextest gives each case its own process.
 
 use super::super::metrics::{DropReason, Stage};
-use super::Harness;
+use super::{CAP_BYTES, Harness};
 use crate::router::loopback::{UNPUBLISHED_NODE, config, node, paused};
 use crate::test_util::{GlobalMetrics, assert_distinct_labels, label};
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
+use std::collections::BTreeMap;
 use strum::VariantArray;
 
 /// Destinations the fleet holds: the node that answers, and the one no
@@ -27,6 +28,9 @@ const SLOTS: usize = 2;
 
 /// A node every suite router publishes.
 const PUBLISHED: u8 = 0;
+
+/// A body no frame at the cap can carry: the whole cap, before any header.
+const OVER_CAP: usize = CAP_BYTES;
 
 /// One response to a node no registration names is dropped under a fixed
 /// reason, and the node's id appears nowhere in the metrics it moved.
@@ -68,6 +72,12 @@ fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
         metrics.points("prosody.response.stages")?
     );
 
+    ensure!(
+        metrics.points("prosody.peer.fleet.destinations")? == vec![(BTreeMap::new(), 2)],
+        "both destinations must be counted live, under no attribute at all: {:?}",
+        metrics.points("prosody.peer.fleet.destinations")?
+    );
+
     let unresolvable = node(UNPUBLISHED_NODE).to_string();
     for name in [
         "prosody.response.dropped",
@@ -83,6 +93,59 @@ fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// A response the frame cap cannot carry is counted under its own reason and
+/// gives its slot back.
+///
+/// The encoder refuses it, so this is the one drop reason a worker reports
+/// without reaching the transport at all. The response queued beside it is
+/// delivered, which is what makes the stage counters a progression: both are
+/// enqueued and only one is framed.
+///
+/// Both responses name the same destination, so the free slots read after the
+/// drain are that destination's own: a worker that kept the refused response's
+/// slot would leave one of them missing.
+#[test]
+fn a_response_the_cap_refuses_is_counted_and_gives_its_slot_back() -> Result<()> {
+    let metrics = GlobalMetrics::install();
+    let (fleet, drained) = paused()?.block_on(async {
+        let harness = Harness::new(config(DESTINATIONS, SLOTS))?;
+        let fleet = harness.fleet();
+        harness.send_payload(PUBLISHED, vec![0; OVER_CAP])?;
+        harness.send(PUBLISHED)?;
+        let drained = harness.drain().await?;
+        Ok::<_, color_eyre::Report>((fleet, drained))
+    })?;
+    ensure!(
+        (drained.sent, drained.dropped) == (1, 1),
+        "one response must reach the listener and one must be refused, not {} and {}",
+        drained.sent,
+        drained.dropped
+    );
+
+    ensure!(
+        metrics.points("prosody.response.dropped")? == vec![(label("reason", "encode_failed"), 1)],
+        "the refusal must be counted under its own reason alone: {:?}",
+        metrics.points("prosody.response.dropped")?
+    );
+    ensure!(
+        metrics.points("prosody.response.stages")?
+            == vec![
+                (label("stage", "attempted"), 2),
+                (label("stage", "delivered"), 1),
+                (label("stage", "enqueued"), 2),
+                (label("stage", "framed"), 1),
+            ],
+        "a response the cap refuses must stop at enqueued: {:?}",
+        metrics.points("prosody.response.stages")?
+    );
+    ensure!(
+        fleet.available(node(PUBLISHED)) == Some(SLOTS),
+        "every slot must come back, not {:?}",
+        fleet.available(node(PUBLISHED))
+    );
     Ok(())
 }
 

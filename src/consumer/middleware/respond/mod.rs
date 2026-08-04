@@ -78,6 +78,12 @@ pub(crate) struct Responder<C: Codec> {
 /// so `message.span()` is never `Span::none()` and the response leg can never
 /// open as a root of a trace of its own.
 ///
+/// Which trace that is follows the message span. Under the default message
+/// relation the message span is a child of the requester's own span, so the
+/// answer lands in the caller's trace. An operator who asks for follows-from
+/// message spans puts message work in a linked trace of its own, and the answer
+/// follows the message there.
+///
 /// One per in-flight event, and both exits are here:
 /// [`after_commit`](FallibleHandler::after_commit) moves it into the sender,
 /// and [`after_abort`](FallibleHandler::after_abort) drops it.
