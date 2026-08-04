@@ -1,5 +1,6 @@
 //! Admission to the destination fleet, counted rather than flagged.
 
+use std::marker::PhantomData;
 use std::pin::pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
@@ -25,8 +26,14 @@ pub(crate) struct AdmissionGate {
 }
 
 /// Proof that one caller is inside the gate. Dropping it leaves.
+///
+/// A ticket is `!Send`, so no task that must be `Send` can hold one across an
+/// await. Shutdown waits, without a deadline, for every live ticket, so a
+/// ticket parked on an await would hold the whole process's shutdown. The
+/// marker below makes that unwritable rather than a rule to remember.
 pub(crate) struct GateTicket<'a> {
     gate: &'a AdmissionGate,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl AdmissionGate {
@@ -56,7 +63,12 @@ impl AdmissionGate {
                 .state
                 .compare_exchange_weak(state, state + 1, AcqRel, Acquire)
             {
-                Ok(_) => return Some(GateTicket { gate: self }),
+                Ok(_) => {
+                    return Some(GateTicket {
+                        gate: self,
+                        _not_send: PhantomData,
+                    });
+                }
                 Err(observed) => state = observed,
             }
         }

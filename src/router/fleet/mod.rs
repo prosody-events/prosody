@@ -106,8 +106,8 @@ pub(crate) struct Destination {
 /// slot and then the ticket. [`Reservation::commit`] is the only other way out,
 /// and it releases the ticket only after the slot has been handed on.
 ///
-/// Never hold one across an await. Shutdown waits for every live ticket, so a
-/// reservation held across an await holds the whole process's shutdown with it.
+/// The ticket makes a reservation `!Send`, so no task that must be `Send` can
+/// hold one across an await. [`GateTicket`] owns that rule and states why.
 ///
 /// Both ways out get that order from where they are written. `commit` gets it
 /// from its statements, which is the path a sender takes and the one the suite
@@ -412,10 +412,11 @@ impl Reservation<'_> {
     /// The gate covers the whole hand-over, not the reservation alone. A
     /// shutdown that has seen the count reach zero must find nobody still about
     /// to queue work, so the hand-over runs inside a closure the gate outlives.
-    /// `queue` reports only whether it took the slot, so the slot cannot leave
-    /// through the return value. The slot itself stays taken until the permit
-    /// `queue` was given drops, which is what keeps the destination unevictable
-    /// while its send is in flight.
+    /// The ticket is released after `queue` returns, whatever `queue` returns.
+    /// The error type is the caller's, so where the slot ends up is the
+    /// caller's contract rather than this one's. The slot itself stays taken
+    /// until the permit `queue` was given drops, which is what keeps the
+    /// destination unevictable while its send is in flight.
     pub(crate) fn commit<E, F>(self, queue: F) -> Result<(), E>
     where
         F: FnOnce(OwnedSemaphorePermit) -> Result<(), E>,

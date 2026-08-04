@@ -5,8 +5,7 @@
     not(test),
     expect(
         dead_code,
-        reason = "no production caller yet: consumer wiring will own this; every item here is \
-                  exercised by this module's tests"
+        reason = "no production caller yet: consumer wiring will own this"
     )
 )]
 
@@ -225,9 +224,10 @@ impl PeerRuntime {
     ///
     /// Takes `self`, so a second shutdown is unwritable and no handle has to be
     /// taken out from behind a lock. `drain` is a closure rather than a future,
-    /// so the response drain cannot have begun before the gate closed: this
-    /// call runs it once the gate has closed and emptied, and nothing else
-    /// calls it.
+    /// so this call alone decides when the drain starts. It runs it once the
+    /// gate has closed and emptied. A caller that flushes a sender elsewhere
+    /// still drains that sender early; `TypedSender::drain` takes `self`, so it
+    /// cannot then drain the same sender twice.
     ///
     /// The body reads as the order. Three of its steps are where they are for a
     /// reason the code cannot show:
@@ -284,10 +284,11 @@ impl PeerRuntime {
         drop(stop_listener);
         pending.shutdown().await;
         fleet.close().await;
-        // An unforgeable `Drained` token that a drain required would make this
-        // order uncompilable. It was examined and rejected: it would also
-        // require every caller that flushes one sender to close the process's
-        // fleet, and one fleet serves several senders.
+        // A `Drained` token minted by the close, and demanded by every drain,
+        // would make the reversed order uncompilable. It was examined and
+        // rejected: a caller that flushes one sender outside process shutdown
+        // holds no token to give it, so the token would reach callers that
+        // never close a fleet.
         drain().await;
         if let Err(error) = listener.await {
             error!(%error, "the peer listener task did not exit cleanly");
