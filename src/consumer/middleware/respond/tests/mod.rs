@@ -34,6 +34,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tracing::Span;
 
 mod carriage;
 mod cascade;
@@ -236,21 +237,37 @@ impl<C: Codec<Payload = Result<(), TestError>>> Fixture<C> {
 
 /// A message asking node `index` for a response to request `request_byte`.
 fn tagged(index: u8, request_byte: u8, key: &str) -> Result<ConsumerMessage<Value>> {
+    tagged_under(index, request_byte, key, Span::current())
+}
+
+/// [`tagged`] with the record's own span named, for a suite whose claim is
+/// which trace the answer lands in.
+fn tagged_under(
+    index: u8,
+    request_byte: u8,
+    key: &str,
+    span: Span,
+) -> Result<ConsumerMessage<Value>> {
     create_message(
         key,
         Some(RequestTag::new(
             RequestId::from_bytes([request_byte; 16]),
             node(index),
         )),
+        span,
     )
 }
 
 /// A message that asks for nothing — ordinary traffic.
 fn untagged(key: &str) -> Result<ConsumerMessage<Value>> {
-    create_message(key, None)
+    create_message(key, None, Span::current())
 }
 
-fn create_message(key: &str, request: Option<RequestTag>) -> Result<ConsumerMessage<Value>> {
+fn create_message(
+    key: &str,
+    request: Option<RequestTag>,
+    span: Span,
+) -> Result<ConsumerMessage<Value>> {
     let semaphore = Arc::new(Semaphore::new(1));
     let permit = semaphore.try_acquire_owned()?;
     Ok(ConsumerMessage::new(
@@ -261,7 +278,7 @@ fn create_message(key: &str, request: Option<RequestTag>) -> Result<ConsumerMess
             request,
             ..Default::default()
         },
-        tracing::Span::current(),
+        span,
         permit,
     ))
 }

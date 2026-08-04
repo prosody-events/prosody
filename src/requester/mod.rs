@@ -25,12 +25,16 @@ use crate::response::headers::{
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use crate::{Codec, EventIdentity, Topic};
+use opentelemetry::KeyValue;
+use opentelemetry::global::meter;
+use opentelemetry::metrics::Histogram;
 use smallvec::SmallVec;
 use std::error::Error;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::time::Instant;
 use tracing::field::{Empty, display};
 use tracing::{Span, instrument};
 
@@ -42,6 +46,18 @@ const RESERVED_SINGLETONS: usize = 3;
 
 /// Headers one request carries before the list uses the heap.
 const HEADER_INLINE: usize = 8;
+
+/// How long one request waited, by how complete its answers were.
+///
+/// A sustained `none` is what says synchrony waiting has stopped working:
+/// callers are paying full deadlines for answers that never come.
+static LATENCY: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    meter("prosody")
+        .f64_histogram("prosody.peer.request.latency")
+        .with_description("How long one peer request waited for its answers")
+        .with_unit("s")
+        .build()
+});
 
 /// One answer for one requested subsystem.
 ///
@@ -171,14 +187,27 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
     /// that case, producer telemetry and deduplication after the report do not
     /// run because this function drops the send future.
     ///
+    /// The span is named for the function, exactly as
+    /// [`ProsodyProducer::send`] is, and it covers the whole wait. A client
+    /// span covers a request and its response together, so nothing opens a
+    /// second span for the answer arriving. The produce nests inside it.
+    ///
     /// # Errors
     ///
     /// Returns [`RequestError`] for invalid arguments, failed admission, a
     /// produce failure without a response, or shutdown.
     #[instrument(
-        name = "peer.request",
         skip_all,
-        fields(request.id = Empty, subsystems = subsystems.len() as i64),
+        fields(
+            otel.kind = "client",
+            messaging.system = "kafka",
+            topic = topic.as_ref(),
+            key = %key,
+            response.node = %self.node,
+            request.id = Empty,
+            responses.received = Empty,
+            subsystems = subsystems.len() as i64,
+        ),
         err
     )]
     pub(crate) async fn request<'a, H, V, E>(
@@ -228,13 +257,57 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         );
 
         let deadline = registration.deadline();
-        collect::<R, V, E, _, _>(
+        let started = Instant::now();
+        let collected = collect::<R, V, E, _, _>(
             &registration,
             self.producer
                 .send(record_headers.iter().copied(), topic, key, payload),
             deadline,
         )
-        .await
+        .await;
+        // A request refused before this point sent nothing, so it has no
+        // latency to report. Only a call that really waited records one.
+        let waited = started.elapsed().as_secs_f64();
+        match &collected {
+            Ok(outcomes) => {
+                let answered = outcomes.iter().filter(|outcome| outcome.answered()).count();
+                Span::current().record("responses.received", answered as i64);
+                LATENCY.record(
+                    waited,
+                    &[KeyValue::new(
+                        "outcome",
+                        completeness(answered, outcomes.len()),
+                    )],
+                );
+            }
+            Err(_) => LATENCY.record(waited, &[KeyValue::new("outcome", "failed")]),
+        }
+        collected
+    }
+}
+
+impl<V, E> Outcome<V, E> {
+    /// Whether the subsystem this outcome stands for answered at all.
+    ///
+    /// Every other failure is an answer that could not be used, which is a
+    /// different fact from silence.
+    const fn answered(&self) -> bool {
+        !matches!(self, Self::Failed(ResponseFailure::Timeout))
+    }
+}
+
+/// How complete one request's answers were, as the fixed label its latency is
+/// recorded under.
+///
+/// A label rather than a subsystem name or a node id: those arrive from the
+/// network, and a metric keyed by one is a cardinality attack.
+const fn completeness(answered: usize, awaited: usize) -> &'static str {
+    if answered == 0 {
+        "none"
+    } else if answered == awaited {
+        "complete"
+    } else {
+        "partial"
     }
 }
 

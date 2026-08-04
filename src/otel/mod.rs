@@ -3,9 +3,12 @@
 //! Shared across both the consumer and timer subsystems so neither has to
 //! depend on the other's module for a common configuration type.
 
+use opentelemetry::Context;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
+use tracing::{Span, debug};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Controls how a new span relates to a propagated OpenTelemetry context.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +110,24 @@ macro_rules! related_span {
             }
         }
     }};
+}
+
+/// Makes `span` the child of a carried `OTel` context.
+///
+/// The sibling of [`related_span!`] for a span that is not a consumer-side
+/// continuation: the call site writes the span and names its kind, and this
+/// carries the parent. A function rather than a second exported macro, because
+/// the kind differs per call site — an outbound peer call is `client` and the
+/// listener that receives it is `server` — and no call site needs the macro's
+/// source location.
+///
+/// A context that cannot be attached is logged rather than propagated. A broken
+/// trace never fails the work it describes; the span simply appears at the root
+/// of its own trace, which is what makes missing propagation visible.
+pub(crate) fn carry_parent(span: &Span, context: Context) {
+    if let Err(error) = span.set_parent(context) {
+        debug!(%error, "a carried trace context could not be attached");
+    }
 }
 
 /// Error returned when parsing a [`SpanRelation`] from a string fails.

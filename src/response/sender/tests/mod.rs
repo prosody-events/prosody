@@ -16,6 +16,7 @@ use crate::router::loopback::{
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
+use opentelemetry::Context;
 use std::cell::Cell;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -26,6 +27,7 @@ mod budget;
 mod delivery;
 mod fallback;
 mod isolation;
+mod metrics;
 
 /// The frame ceiling these suites encode against.
 pub(super) const CAP_BYTES: usize = 4096;
@@ -103,6 +105,7 @@ impl Harness {
                 target: node(index),
                 ..self.header.clone()
             },
+            Context::current(),
             PAYLOAD.to_vec(),
         );
         if queued.is_err() {

@@ -2,9 +2,10 @@
 //!
 //! A Kafka record can name a request, a node and the subsystems it awaits. When
 //! this consumer answers for one of them, the parsed tag rides the message.
-//! This layer reads that tag, carries it on both result arms, and — from
-//! [`after_commit`](FallibleHandler::after_commit) and nowhere else — moves the
-//! typed result into a destination slot.
+//! This layer reads that tag and the record's own trace into an [`Answering`],
+//! carries it on both result arms, and — from
+//! [`after_commit`](FallibleHandler::after_commit) and nowhere else — moves
+//! the typed result into a destination slot.
 //!
 //! **Which apply hook fired decides whether a response happens.** The layer
 //! never reads an error category to make that decision, so a transient failure
@@ -38,8 +39,10 @@ use crate::router::Router;
 use crate::router::fleet::config::FleetConfigurationError;
 use crate::subsystem::SubsystemName;
 use crate::timers::Trigger;
+use opentelemetry::Context;
 use std::sync::Arc;
 use thiserror::Error;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[cfg(test)]
 mod tests;
@@ -58,13 +61,31 @@ pub(crate) struct Responder<C: Codec> {
     subsystem: SubsystemName,
 }
 
+/// The request one message asked this consumer to answer, and the trace that
+/// request belongs to.
+///
+/// Both are read from the message rather than from the invocation that answers
+/// it. A deferred reload answers the request its own record names, in that
+/// record's trace, whatever span the settle boundary later runs under — and by
+/// default a timer dispatch starts a trace of its own, so an ambient context
+/// would answer outside the requester's trace.
+///
+/// A [`Context`] rather than a [`Span`](tracing::Span): the response is framed
+/// in one task and sent from another, and a span finishes when any clone of it
+/// finishes.
+#[derive(Debug)]
+pub(crate) struct Answering {
+    tag: RequestTag,
+    trace: Context,
+}
+
 /// A successful result and its optional response metadata.
 ///
 /// The metadata rides the output because an event context has no request tag.
 /// One middleware field cannot hold it because different keys dispatch at once.
 pub(crate) struct Responded<T> {
     inner: T,
-    meta: Option<RequestTag>,
+    meta: Option<Answering>,
 }
 
 /// A failed result and its optional response metadata.
@@ -79,7 +100,7 @@ pub(crate) struct Responded<T> {
 pub(crate) struct RespondError<E> {
     #[source]
     inner: E,
-    meta: Option<RequestTag>,
+    meta: Option<Answering>,
 }
 
 /// Wraps one handler and moves its final message result to a responder.
@@ -170,12 +191,19 @@ where
     where
         C2: EventContext<Payload = Self::Payload>,
     {
-        let meta = message.request();
-        self.handler
-            .on_message(context, message, demand_type)
-            .await
-            .map(|inner| Responded { inner, meta })
-            .map_err(|inner| RespondError { inner, meta })
+        // The message's own span, named directly rather than taken from the
+        // ambient one: a middleware span between the dispatch and this layer
+        // must not become the response's parent.
+        let meta = message.request().map(|tag| Answering {
+            tag,
+            trace: message.span().context(),
+        });
+        // Matched rather than mapped: the carrier moves into exactly one arm,
+        // so answering never costs a second copy of the trace.
+        match self.handler.on_message(context, message, demand_type).await {
+            Ok(inner) => Ok(Responded { inner, meta }),
+            Err(inner) => Err(RespondError { inner, meta }),
+        }
     }
 
     /// Forwards a timer without response metadata.
@@ -218,13 +246,13 @@ where
             Ok(Responded { inner, meta }) => (Ok(inner), meta),
             Err(RespondError { inner, meta }) => (Err(inner), meta),
         };
-        let Some(meta) = meta else {
+        let Some(Answering { tag, trace }) = meta else {
             return self.handler.after_commit(context, result).await;
         };
-        let header = meta.header(self.responder.subsystem.clone(), status(&result));
+        let header = tag.header(self.responder.subsystem.clone(), status(&result));
         // Nothing is encoded here. The hook moves the typed result into the
         // slot. The worker encodes it against its own scratch.
-        if let Err(payload) = self.responder.sender.send(header, result) {
+        if let Err(payload) = self.responder.sender.send(header, trace, result) {
             // Nothing was sent or encoded. The handler still owns the result.
             self.handler.after_commit(context, payload).await;
         }

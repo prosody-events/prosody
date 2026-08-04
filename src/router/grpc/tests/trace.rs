@@ -1,0 +1,104 @@
+//! The return leg reads as one nested client call.
+//!
+//! The assertion spans the **real** delivery: a worker opens
+//! `peer.response.send`, the client injects that span's context into the
+//! outbound metadata, and the listener extracts it in another task. Asserting
+//! the *immediate* parent is what makes it falsifiable — dropping the injection
+//! re-parents `peer.response.receive`, and "it is not a root span" would not
+//! notice.
+
+use super::{ALPHA, Harness, OneListener, SUITE_DESTINATIONS, SUITE_SLOTS, header, register};
+use crate::codec::Codec;
+use crate::response::frame::tests::CountingCodec;
+use crate::response::sender::TypedSender;
+use crate::test_util::{GlobalSpans, TEST_RUNTIME};
+use color_eyre::Result;
+use color_eyre::eyre::{bail, ensure, eyre};
+use opentelemetry::trace::{SpanKind, TraceContextExt};
+use opentelemetry_sdk::trace::SpanData;
+use tracing::info_span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+/// The span a worker opens for one outbound response.
+const SENT: &str = "peer.response.send";
+
+/// The span the listener opens for the response it receives.
+const RECEIVED: &str = "peer.response.receive";
+
+/// The response body this suite queues.
+const PAYLOAD: &[u8] = b"traced";
+
+/// One response delivered through the whole send path lands in the caller's
+/// trace, with `peer.response.receive` directly under `peer.response.send`, and
+/// the send span is a client call rather than a consumer continuation.
+#[test]
+fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
+    let spans = GlobalSpans::install()?;
+    TEST_RUNTIME.block_on(async {
+        let harness = Harness::shared().await?;
+        let router = OneListener::reaching(
+            harness.cap,
+            &harness.address,
+            SUITE_DESTINATIONS,
+            SUITE_SLOTS,
+        )?;
+        let sender = TypedSender::<CountingCodec>::new(&router, harness.cap)?;
+        let request = register(&harness.registry, &[ALPHA], CountingCodec::FORMAT_ID)?;
+
+        // The caller's span is opened, read, and closed here: the send carries
+        // its context, not the span itself.
+        let caller = info_span!("peer.test.call");
+        let trace = caller.context();
+        let caller_span = trace.span().span_context().clone();
+        let counters = sender.counters();
+        if sender
+            .send(
+                header(harness.node, request, ALPHA)?,
+                trace,
+                PAYLOAD.to_vec(),
+            )
+            .is_err()
+        {
+            bail!("the fleet refused the response");
+        }
+        drop(caller);
+        sender.drain().await;
+        ensure!(
+            counters.sent() == 1,
+            "the response must have reached the listener before its trace is read"
+        );
+
+        let ended = spans.ended();
+        let sent = named(&ended, SENT)?;
+        let received = named(&ended, RECEIVED)?;
+        ensure!(
+            sent.span_kind == SpanKind::Client,
+            "{SENT} is an outbound call, not a consumer continuation: it is {:?}",
+            sent.span_kind
+        );
+        ensure!(
+            sent.parent_span_id == caller_span.span_id()
+                && sent.span_context.trace_id() == caller_span.trace_id(),
+            "{SENT} must be a child of the span the response was queued under"
+        );
+        ensure!(
+            received.parent_span_id == sent.span_context.span_id()
+                && received.span_context.trace_id() == caller_span.trace_id(),
+            "{RECEIVED} must be a child of {SENT}, in the caller's trace"
+        );
+        Ok(())
+    })
+}
+
+/// The one exported span with `name`.
+fn named<'a>(spans: &'a [SpanData], name: &str) -> Result<&'a SpanData> {
+    let mut found = spans.iter().filter(|span| span.name == name);
+    let span = found
+        .next()
+        .ok_or_else(|| eyre!("span {name} was not exported"))?;
+    ensure!(
+        found.next().is_none(),
+        "one delivery must export exactly one {name} span"
+    );
+    Ok(span)
+}

@@ -1,23 +1,19 @@
 //! What the sender does with the status a real listener answered.
 
-use super::{ALPHA, GrpcSender, Harness, header, payload, register};
+use super::{ALPHA, Harness, OneListener, header, payload, register};
 use crate::codec::Codec;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::sender::TypedSender;
-use crate::router::directory::{Endpoint, NodeRegistration};
-use crate::router::fleet::DestinationFleet;
+use crate::router::directory::Endpoint;
 use crate::router::grpc::TRANSPORT;
 use crate::router::grpc::client::{DELIVER_RESPONSE, peer_uri};
 use crate::router::grpc::generated::peer_server::SERVICE_NAME;
-use crate::router::loopback::config;
-use crate::router::{Host, NodeId, RelayHop, Route, Router, choose_route};
+use crate::router::{Host, NodeId, RelayHop};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
-use std::convert::Infallible;
-use std::future::Future;
-use std::sync::Arc;
+use opentelemetry::Context;
 use tonic::transport::Endpoint as Dialled;
 
 /// Destinations the retry pin's fleet holds: this node and the one a stale
@@ -29,48 +25,6 @@ const SLOTS: usize = 2;
 
 /// A short payload, for the cases whose size is not the subject.
 const SHORT: usize = 8;
-
-/// Every node resolves to the one listener under test.
-///
-/// That is not a contrivance: it is exactly what a stale directory entry looks
-/// like, which is the case the misrouted arm exists for.
-#[derive(Clone)]
-struct OneListener {
-    fleet: Arc<DestinationFleet>,
-    transport: Arc<GrpcSender>,
-    registration: NodeRegistration,
-}
-
-impl Router for OneListener {
-    fn route(
-        &self,
-        _node: NodeId,
-    ) -> impl Future<Output = Result<Option<Route>, Infallible>> + Send {
-        let route = choose_route(None, &self.registration);
-        async move { Ok(route) }
-    }
-}
-
-impl RelayHop for OneListener {
-    type Error = Infallible;
-    type Sender = GrpcSender;
-
-    fn direct(
-        &self,
-        _node: NodeId,
-    ) -> impl Future<Output = Result<Option<Endpoint>, Infallible>> + Send {
-        let direct = self.registration.direct.clone();
-        async move { Ok(Some(direct)) }
-    }
-
-    fn sender(&self) -> &GrpcSender {
-        &self.transport
-    }
-
-    fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
-    }
-}
 
 /// Every host a node can publish makes a URI the dialer parses.
 ///
@@ -115,19 +69,7 @@ fn a_terminal_status_is_attempted_once_and_an_ambiguous_one_is_retried() -> Resu
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
-        let fleet = Arc::new(DestinationFleet::new(config(DESTINATIONS, SLOTS))?);
-        let router = OneListener {
-            transport: Arc::new(GrpcSender::new(harness.cap, &fleet)),
-            fleet,
-            registration: NodeRegistration {
-                node: NodeId::new(),
-                direct: harness.address.clone(),
-                advertised: None,
-                network: None,
-                group: None,
-                hostname: Host::make("one-listener"),
-            },
-        };
+        let router = OneListener::reaching(harness.cap, &harness.address, DESTINATIONS, SLOTS)?;
         let attempts = router.fleet().config().max_send_attempts;
 
         // Nothing is registered under this id, so the node answers NOT_FOUND.
@@ -135,7 +77,11 @@ fn a_terminal_status_is_attempted_once_and_an_ambiguous_one_is_retried() -> Resu
         let served = TRANSPORT.served();
         let unregistered = register(&harness.oracle, &[ALPHA], CountingCodec::FORMAT_ID)?;
         terminal
-            .send(header(harness.node, unregistered, ALPHA)?, payload(SHORT))
+            .send(
+                header(harness.node, unregistered, ALPHA)?,
+                Context::current(),
+                payload(SHORT),
+            )
             .map_err(|_| eyre!("the fleet refused a slot"))?;
         terminal.drain().await;
         ensure!(
@@ -147,7 +93,11 @@ fn a_terminal_status_is_attempted_once_and_an_ambiguous_one_is_retried() -> Resu
         let ambiguous = TypedSender::<CountingCodec>::new(&router, harness.cap)?;
         let served = TRANSPORT.served();
         ambiguous
-            .send(header(NodeId::new(), unregistered, ALPHA)?, payload(SHORT))
+            .send(
+                header(NodeId::new(), unregistered, ALPHA)?,
+                Context::current(),
+                payload(SHORT),
+            )
             .map_err(|_| eyre!("the fleet refused a slot"))?;
         ambiguous.drain().await;
         ensure!(

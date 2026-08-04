@@ -19,6 +19,7 @@ use crate::subsystem::SubsystemName;
 use crate::test_util::{GlobalSpans, TEST_RUNTIME};
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
+use opentelemetry::Context;
 use opentelemetry::Value;
 use opentelemetry_sdk::trace::SpanData;
 use std::slice::from_ref;
@@ -260,6 +261,7 @@ async fn crossing(pair: &Pair) -> Result<()> {
                 status: ResponseStatus::Success,
                 relay: None,
             },
+            Context::current(),
             PAYLOAD.to_vec(),
         )
         .map_err(|_| eyre!("the fleet refused the response"))?;

@@ -13,6 +13,7 @@ mod dispositions;
 mod health;
 mod inject;
 mod listener;
+mod trace;
 mod transport;
 
 use super::client::GrpcSender;
@@ -25,15 +26,19 @@ use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader, ResponseFrame};
 use crate::response::{FormatToken, RequestId, ResponseStatus};
-use crate::router::directory::Endpoint;
+use crate::router::directory::{Endpoint, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::loopback::{TestHealth, TestRouter, config as fleet_config};
 use crate::router::relay::Relay;
-use crate::router::{Framed, Host, NodeId, ResponseSender, SendFailure};
+use crate::router::{
+    Framed, Host, NodeId, RelayHop, ResponseSender, Route, Router, SendFailure, choose_route,
+};
 use crate::subsystem::SubsystemName;
 use bytes::{BufMut, BytesMut};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
+use std::convert::Infallible;
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,6 +115,21 @@ pub(super) struct Harness {
     pub(super) cap: FrameCap,
     stop: Option<Sender<()>>,
     served: Option<JoinHandle<()>>,
+}
+
+/// A router whose every node resolves to one listener, over a real socket.
+///
+/// That is not a contrivance: it is exactly what a stale directory entry looks
+/// like. It is also the shape a suite needs to drive a [`TypedSender`] all the
+/// way to a listener, which is the only place the outbound trace context is
+/// really written.
+///
+/// [`TypedSender`]: crate::response::sender::TypedSender
+#[derive(Clone)]
+pub(super) struct OneListener {
+    fleet: Arc<DestinationFleet>,
+    transport: Arc<GrpcSender>,
+    registration: NodeRegistration,
 }
 
 /// Bytes already framed, so a suite can put a frame on the wire that no encoder
@@ -209,6 +229,62 @@ impl Harness {
             served.await?;
         }
         Ok(())
+    }
+}
+
+impl OneListener {
+    /// A router that reaches `address` and nothing else, over a fleet of
+    /// `destinations` cells with `slots` slots each.
+    pub(super) fn reaching(
+        cap: FrameCap,
+        address: &Endpoint,
+        destinations: usize,
+        slots: usize,
+    ) -> Result<Self> {
+        let fleet = Arc::new(DestinationFleet::new(fleet_config(destinations, slots))?);
+        Ok(Self {
+            transport: Arc::new(GrpcSender::new(cap, &fleet)),
+            fleet,
+            registration: NodeRegistration {
+                node: NodeId::new(),
+                direct: address.clone(),
+                advertised: None,
+                network: None,
+                group: None,
+                hostname: Host::make("one-listener"),
+            },
+        })
+    }
+}
+
+impl Router for OneListener {
+    fn route(
+        &self,
+        _node: NodeId,
+    ) -> impl Future<Output = Result<Option<Route>, Infallible>> + Send {
+        let route = choose_route(None, &self.registration);
+        async move { Ok(route) }
+    }
+}
+
+impl RelayHop for OneListener {
+    type Error = Infallible;
+    type Sender = GrpcSender;
+
+    fn direct(
+        &self,
+        _node: NodeId,
+    ) -> impl Future<Output = Result<Option<Endpoint>, Infallible>> + Send {
+        let direct = self.registration.direct.clone();
+        async move { Ok(Some(direct)) }
+    }
+
+    fn sender(&self) -> &GrpcSender {
+        &self.transport
+    }
+
+    fn fleet(&self) -> &Arc<DestinationFleet> {
+        &self.fleet
     }
 }
 

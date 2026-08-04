@@ -23,6 +23,7 @@ use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use futures::poll;
+use opentelemetry::Context;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::future::Future;
 use std::pin::{Pin, pin};
@@ -283,6 +284,7 @@ fn arrange<'a>(
         sender
             .send(
                 header(shared.destination, RequestId::new(), ALPHA)?,
+                Context::current(),
                 payload,
             )
             .map_err(|_| eyre!("response {index} was refused before shutdown began"))?;

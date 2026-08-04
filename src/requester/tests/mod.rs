@@ -6,13 +6,17 @@
 
 use super::config::RequesterConfiguration;
 use super::registry::{PendingRegistry, Registration};
+use crate::EventIdentity;
 use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::producer::{ProducerConfiguration, ProsodyProducer};
+use crate::requester::ProsodyRequester;
 use crate::response::frame::ResponseFrame;
 use crate::response::headers::RequestTag;
 use crate::response::{FormatToken, RequestId, ResponseStatus};
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
+use crate::telemetry::Telemetry;
 use bytes::BytesMut;
 use color_eyre::Result;
 use std::future::{Future, poll_fn};
@@ -28,6 +32,7 @@ mod race;
 mod registry;
 mod request;
 mod sweep;
+mod trace;
 
 /// Bytes one test response occupies: one arm tag and one little-endian `u32`.
 const RESPONSE_BYTES: usize = 5;
@@ -61,6 +66,14 @@ const SWEEP_GRACE: Duration = Duration::from_mins(10);
 
 /// Subsystem names the property generators draw from.
 const POOL: [&str; 6] = ["billing", "ledger", "audit", "search", "mailer", "a,b"];
+
+/// The request payload every suite that reaches the real `request` body sends.
+#[derive(Debug, Default)]
+pub(super) struct RequestPayload;
+
+/// The codec that request is produced with.
+#[derive(Debug, Default)]
+pub(super) struct RequestCodec;
 
 /// The response codec every requester suite speaks.
 ///
@@ -130,6 +143,32 @@ impl Codec for TestCodec {
     }
 }
 
+impl EventIdentity for RequestPayload {
+    fn event_id(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl Codec for RequestCodec {
+    type Error = TestCodecError;
+    type Payload = RequestPayload;
+
+    const FORMAT_ID: &'static str = "requester-test-request";
+
+    fn deserialize(&mut self, _buf: &mut [u8]) -> Result<RequestPayload, TestCodecError> {
+        Ok(RequestPayload)
+    }
+
+    fn serialize(
+        &mut self,
+        _payload: RequestPayload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), TestCodecError> {
+        buf.push(0);
+        Ok(())
+    }
+}
+
 impl ClassifyError for TestError {
     fn classify_error(&self) -> ErrorCategory {
         self.category
@@ -158,6 +197,19 @@ pub(super) fn register(
     timeout: Duration,
 ) -> Result<Registration> {
     Ok(registry.register::<TestCodecError>(awaited, timeout, TestCodec::FORMAT_ID)?)
+}
+
+/// A requester over a mock cluster, so a case reaches the real `request` body.
+pub(super) fn requester(
+    registry: Arc<PendingRegistry>,
+) -> Result<ProsodyRequester<RequestCodec, TestCodec>> {
+    let config = ProducerConfiguration::builder()
+        .bootstrap_servers(vec!["localhost:9094".to_owned()])
+        .source_system("requester-tests")
+        .mock(true)
+        .build()?;
+    let producer = ProsodyProducer::new(&config, Telemetry::new().sender())?;
+    Ok(ProsodyRequester::new(producer, NODE, registry))
 }
 
 /// Builds subsystem names, refusing any the crate would refuse.

@@ -2,20 +2,17 @@
 //! record when it does produce.
 
 use super::{
-    MAX_TIMEOUT, NODE, POOL, TestCodec, TestCodecError, TestError, names, poll_once, registry,
+    MAX_TIMEOUT, NODE, POOL, RequestPayload, TestError, names, poll_once, registry, requester,
 };
-use crate::producer::{ProducerConfiguration, ProsodyProducer};
-use crate::requester::registry::PendingRegistry;
+use crate::Topic;
 use crate::requester::{
-    HEADER_INLINE, Outcome, ProsodyRequester, RequestError, ResponseFailure, append_request_headers,
+    HEADER_INLINE, Outcome, RequestError, ResponseFailure, append_request_headers,
 };
 use crate::response::RequestId;
 use crate::response::headers::{
     ID_TEXT_LEN, RESERVED_REQUEST_HEADERS, RequestTag, parse_request_tag,
 };
 use crate::subsystem::SubsystemName;
-use crate::telemetry::Telemetry;
-use crate::{Codec, EventIdentity, Topic};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use quickcheck::{Arbitrary, Gen, TestResult};
@@ -54,40 +51,6 @@ struct HeaderTrace {
     awaited: Vec<usize>,
     /// Caller headers, as indices into the name and value pools.
     user: Vec<(usize, usize)>,
-}
-
-/// The request payload these cases produce.
-#[derive(Debug, Default)]
-struct RequestPayload;
-
-/// The request codec these cases produce with.
-#[derive(Debug, Default)]
-struct RequestCodec;
-
-impl EventIdentity for RequestPayload {
-    fn event_id(&self) -> Option<&str> {
-        None
-    }
-}
-
-impl Codec for RequestCodec {
-    type Error = TestCodecError;
-    type Payload = RequestPayload;
-
-    const FORMAT_ID: &'static str = "requester-test-request";
-
-    fn deserialize(&mut self, _buf: &mut [u8]) -> Result<RequestPayload, TestCodecError> {
-        Ok(RequestPayload)
-    }
-
-    fn serialize(
-        &mut self,
-        _payload: RequestPayload,
-        buf: &mut Vec<u8>,
-    ) -> Result<(), TestCodecError> {
-        buf.push(0);
-        Ok(())
-    }
 }
 
 impl Arbitrary for HeaderTrace {
@@ -364,15 +327,4 @@ fn run_headers(trace: HeaderTrace) -> Result<()> {
         "a subsystem the request never named read a tag"
     );
     Ok(())
-}
-
-/// A requester over a mock cluster, so a case reaches the real `request` body.
-fn requester(registry: Arc<PendingRegistry>) -> Result<ProsodyRequester<RequestCodec, TestCodec>> {
-    let config = ProducerConfiguration::builder()
-        .bootstrap_servers(vec!["localhost:9094".to_owned()])
-        .source_system("requester-tests")
-        .mock(true)
-        .build()?;
-    let producer = ProsodyProducer::new(&config, Telemetry::new().sender())?;
-    Ok(ProsodyRequester::new(producer, NODE, registry))
 }

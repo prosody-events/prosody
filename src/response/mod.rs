@@ -3,7 +3,11 @@
 
 use crate::error::{ErrorCategory, UnknownErrorCategory};
 use fixedstr::Flexstr;
+use opentelemetry::KeyValue;
+use opentelemetry::global::meter;
+use opentelemetry::metrics::Counter;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::sync::LazyLock;
 use tonic::Code;
 use uuid::Uuid;
 
@@ -20,6 +24,15 @@ pub(crate) const FORMAT_MAX_BYTES: usize = 128;
 /// The format token a frame's payload was encoded with, bounded by
 /// [`FORMAT_MAX_BYTES`].
 pub(crate) type FormatToken = Flexstr<{ FORMAT_MAX_BYTES + 1 }>;
+
+/// Delivery attempts this node answered, by fixed disposition label.
+static DISPOSITIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    meter("prosody")
+        .u64_counter("prosody.response.dispositions")
+        .with_description("Response delivery attempts this node answered")
+        .with_unit("{response}")
+        .build()
+});
 
 /// How a responder classified the result one frame carries.
 ///
@@ -203,6 +216,33 @@ impl ResponseDisposition {
             Self::NoRelayCapacity => "this node has no capacity to relay the frame",
             Self::RelayDeadlineExceeded => "no time is left to relay the frame",
             Self::Unreachable => "the target node could not be reached from here",
+        }
+    }
+
+    /// Counts one answered delivery attempt under this disposition's label.
+    pub(crate) fn record(self) {
+        DISPOSITIONS.add(1, &[KeyValue::new("disposition", self.label())]);
+    }
+
+    /// The metric label for this disposition.
+    ///
+    /// A fixed string per variant. The frame that produced the disposition
+    /// arrived from the network, so nothing it carries — no node id, no claimed
+    /// subsystem — is ever a label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::UnknownRequest => "unknown_request",
+            Self::ClosedRequest => "closed_request",
+            Self::DuplicateSubsystem => "duplicate_subsystem",
+            Self::UnexpectedSubsystem => "unexpected_subsystem",
+            Self::FormatMismatch => "format_mismatch",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::MalformedTarget => "malformed_target",
+            Self::AlreadyRelayed => "already_relayed",
+            Self::NoRelayCapacity => "no_relay_capacity",
+            Self::RelayDeadlineExceeded => "relay_deadline_exceeded",
+            Self::Unreachable => "unreachable",
         }
     }
 }

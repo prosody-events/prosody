@@ -5,6 +5,7 @@ use super::TRANSPORT;
 use super::deadline::inbound_deadline;
 use super::generated::peer_server::Peer;
 use super::inject::MetadataExtractor;
+use crate::otel::carry_parent;
 use crate::propagator::new_propagator;
 use crate::requester::registry::PendingRegistry;
 use crate::response::ResponseDisposition;
@@ -20,8 +21,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::field::{Empty, display};
-use tracing::{Instrument, Span, debug, debug_span};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing::{Instrument, Span, debug_span};
 
 /// Serves [`DeliverResponse`](Peer::deliver_response) for one node.
 ///
@@ -90,12 +90,11 @@ impl<R: RelayHop> Peer for PeerService<R> {
         );
         // A caller that sent no propagation headers, or broken ones, still gets
         // its response delivered: the span is simply unparented.
-        if let Err(error) = span.set_parent(
+        carry_parent(
+            &span,
             self.propagator
                 .extract(&MetadataExtractor::new(request.metadata())),
-        ) {
-            debug!(%error, "the peer call carried no usable trace context");
-        }
+        );
         // The caller's budget becomes an instant on arrival, and everything
         // this call does is spent against it. A duration passed on unchanged
         // would hand a second hop a fresh full budget.
@@ -153,7 +152,8 @@ impl<R: RelayHop> Peer for PeerService<R> {
                         // The target read the frame and answered. Its status is
                         // passed through as it gave it, because rewriting a code
                         // here would silently change the responder's own retry
-                        // decision.
+                        // decision. It is counted where it was decided — at the
+                        // target — so this relay adds no second count.
                         Err(RelayFailure::Target(code)) => {
                             span.record("peer.disposition", code.description());
                             Err(Status::new(code, code.description()))
@@ -172,8 +172,13 @@ impl<R: RelayHop> Peer for PeerService<R> {
 /// Every refusal is named rather than caught, so a disposition added later does
 /// not compile until somebody decides here whether it means the response was
 /// stored. That decision is what `OK` reports.
+///
+/// One answer moves one counter. A relayed frame is answered twice, once by
+/// each process that reads it — which is exactly what [`ResponseDisposition`]
+/// counts: one delivery attempt answered.
 fn answer(span: &Span, disposition: ResponseDisposition) -> Result<Response<()>, Status> {
     span.record("peer.disposition", disposition.message());
+    disposition.record();
     match disposition {
         ResponseDisposition::Accepted => Ok(Response::new(())),
         ResponseDisposition::UnknownRequest

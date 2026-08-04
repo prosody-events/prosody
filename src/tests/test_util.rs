@@ -2,16 +2,20 @@ use crate::cassandra::CassandraConfiguration;
 use crate::otel::SpanRelation;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
-use opentelemetry::Context;
+use opentelemetry::global::set_meter_provider;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::trace::{
     SpanContext, SpanId, SpanKind, TraceContextExt as _, TraceFlags, TraceId, TraceState,
 };
+use opentelemetry::{Context, KeyValue};
 use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::{Debug, Write as _};
 use std::sync::{Arc, LazyLock};
@@ -177,6 +181,95 @@ impl GlobalSpans {
     pub(crate) fn ended(&self) -> Vec<SpanData> {
         self.exporter.0.lock().clone()
     }
+}
+
+/// Captures every metric this process records, for a test whose claim is the
+/// attribute set a counter carries rather than an in-process oracle.
+///
+/// The peer instruments are `LazyLock` statics bound to whatever meter provider
+/// is global when they are first touched, so install this **before** the code
+/// under test records anything. One process installs one meter provider, so
+/// this belongs to tests that own their process — nextest gives each test one.
+///
+/// This is a deliberate process-global install, for the same reason
+/// [`GlobalSpans`] is one: the recording sites are free functions, spawned
+/// workers, and a `Default`-constructed codec, so there is no owner to inject a
+/// `Meter` into.
+pub(crate) struct GlobalMetrics {
+    exporter: InMemoryMetricExporter,
+    /// Read directly for its `force_flush`, which is what moves a recorded
+    /// value into the exporter before a test reads it.
+    provider: SdkMeterProvider,
+}
+
+impl GlobalMetrics {
+    /// Installs the pipeline as this process's global meter provider.
+    pub(crate) fn install() -> Self {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        set_meter_provider(provider.clone());
+        Self { exporter, provider }
+    }
+
+    /// Every point recorded on the counter or gauge named `name`, as its exact
+    /// attribute map and its latest value.
+    ///
+    /// The attributes are returned verbatim, so a test can assert on the whole
+    /// set and catch an identity that leaked into a label.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot flush or the exporter cannot
+    /// be read.
+    pub(crate) fn points(&self, name: &str) -> Result<Vec<(BTreeMap<String, String>, u64)>> {
+        self.provider.force_flush()?;
+        let mut points: BTreeMap<BTreeMap<String, String>, u64> = BTreeMap::new();
+        for resource in self.exporter.get_finished_metrics()? {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics().filter(|metric| metric.name() == name) {
+                    collect_points(metric.data(), &mut points);
+                }
+            }
+        }
+        Ok(points.into_iter().collect())
+    }
+}
+
+/// Reads one metric's `u64` sum or gauge points into `points`, keeping the last
+/// value seen for each attribute set. The exporter is cumulative, so a later
+/// export of one series supersedes an earlier one.
+fn collect_points(data: &AggregatedMetrics, points: &mut BTreeMap<BTreeMap<String, String>, u64>) {
+    let AggregatedMetrics::U64(data) = data else {
+        return;
+    };
+    match data {
+        MetricData::Sum(sum) => {
+            for point in sum.data_points() {
+                let _ = points.insert(attribute_map(point.attributes()), point.value());
+            }
+        }
+        MetricData::Gauge(gauge) => {
+            for point in gauge.data_points() {
+                let _ = points.insert(attribute_map(point.attributes()), point.value());
+            }
+        }
+        MetricData::Histogram(_) | MetricData::ExponentialHistogram(_) => {}
+    }
+}
+
+/// One data point's attributes, rendered as plain strings so a test can compare
+/// the whole set.
+fn attribute_map<'a>(attributes: impl Iterator<Item = &'a KeyValue>) -> BTreeMap<String, String> {
+    attributes
+        .map(|attribute| {
+            (
+                attribute.key.as_str().to_owned(),
+                attribute.value.as_str().into_owned(),
+            )
+        })
+        .collect()
 }
 
 /// Accumulates every captured tracing event, rendered field-by-field, into a

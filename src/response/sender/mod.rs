@@ -10,31 +10,29 @@
     )
 )]
 
+mod metrics;
+mod worker;
+
+use self::metrics::{DropReason, Stage};
+use self::worker::{Job, WorkerContext, run_worker};
 use crate::codec::Codec;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::{FrameCap, FrameHeader};
-use crate::router::directory::Endpoint;
+use crate::router::Router;
+use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::{FleetConfigurationError, validate_scratch_budget};
-use crate::router::fleet::{Destination, DestinationFleet};
-use crate::router::{Framed, ResponseSender, Router, SendFailure};
+use opentelemetry::Context;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
-use tokio::select;
-use tokio::sync::OwnedSemaphorePermit;
-use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep_until, timeout_at};
+use tokio::time::Instant;
 use tracing::warn;
 
 #[cfg(test)]
 mod tests;
-
-/// One in this many of the deadline that is left is what an endpoint keeps for
-/// the fallback behind it — and all an endpoint that has never answered may
-/// spend. See [`Share`].
-const FALLBACK_DIVISOR: u32 = 4;
 
 /// The typed half of delivery.
 ///
@@ -74,56 +72,19 @@ pub(crate) struct TypedSender<C: Codec> {
     counters: Arc<SendCounters>,
 }
 
-/// What every worker of one sender shares.
-struct WorkerContext<R> {
-    router: R,
-    attempts: u32,
-    counters: Arc<SendCounters>,
-}
-
-/// One response, waiting for its turn on a destination.
-struct Job<C: Codec> {
-    header: FrameHeader,
-    payload: C::Payload,
-    /// The destination this response is paced against. Carried by the job
-    /// rather than by the queue, so a queue outlives every occupant of its cell
-    /// and a worker never paces one destination against another's schedule.
-    destination: Arc<Destination>,
-    /// Released when the send ends: by delivery, by a terminal status, by the
-    /// deadline, or by the drain.
-    slot: OwnedSemaphorePermit,
-    expires_at: Instant,
-}
-
 /// What one sender's deliveries came to.
 ///
 /// Every job a worker dequeues moves exactly one of these. A response the
 /// destination's queue could not take moves `dropped` alone, because no worker
 /// ever sees it.
+///
+/// This is the in-process account, which this module's suites assert on. The
+/// operator's account is in [`metrics`], and it names each outcome rather than
+/// totalling two.
 #[derive(Debug, Default)]
 pub(crate) struct SendCounters {
     sent: AtomicU64,
     dropped: AtomicU64,
-}
-
-/// How much of what is left of a response's deadline one endpoint may spend.
-///
-/// While a route still has a candidate untried, no endpoint gets the whole
-/// budget. An address which drops packets instead of refusing them would
-/// otherwise spend the deadline unanswered and leave the endpoint that works
-/// untried — and that is exactly what a misapplied label reaches.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Share {
-    /// An endpoint with a fallback behind it that this destination has never
-    /// answered on. One [`FALLBACK_DIVISOR`]th of what is left.
-    Probe,
-    /// An endpoint with a fallback behind it that this destination answered on
-    /// before. Everything but the [`FALLBACK_DIVISOR`]th it keeps for that
-    /// fallback, because an endpoint that already answered is worth waiting
-    /// for.
-    Most,
-    /// The last endpoint of a route. Everything that is left.
-    Rest,
 }
 
 impl<C: Codec> TypedSender<C> {
@@ -172,7 +133,12 @@ impl<C: Codec> TypedSender<C> {
         })
     }
 
-    /// Queues one response for delivery.
+    /// Queues one response for delivery, in the trace `trace` names.
+    ///
+    /// `trace` is the trace of the message that asked for the response, read
+    /// from that message rather than from the caller's ambient span. A
+    /// deferred reload answers under whatever span the settle boundary runs, so
+    /// an ambient context would put that answer in a trace of its own.
     ///
     /// Never awaits. An apply hook calls this, and apply hooks are per-key
     /// serialized: the next event for the same key waits for the hook to
@@ -185,10 +151,20 @@ impl<C: Codec> TypedSender<C> {
     /// the destination's queue could not take the job. The caller owns the
     /// result again and disposes of it. The rate of each refusal is already
     /// counted: a fleet refusal by the fleet, a queue refusal by
-    /// [`SendCounters::dropped`].
-    pub(crate) fn send(&self, header: FrameHeader, payload: C::Payload) -> Result<(), C::Payload> {
-        let Ok(reservation) = self.fleet.reserve(header.target) else {
-            return Err(payload);
+    /// [`SendCounters::dropped`], and both by name in [`metrics`].
+    pub(crate) fn send(
+        &self,
+        header: FrameHeader,
+        trace: Context,
+        payload: C::Payload,
+    ) -> Result<(), C::Payload> {
+        Stage::Attempted.record();
+        let reservation = match self.fleet.reserve(header.target) {
+            Ok(reservation) => reservation,
+            Err(refusal) => {
+                DropReason::from(refusal).record();
+                return Err(payload);
+            }
         };
         // The cell a reservation names is one of this fleet's, and this
         // sender's queues are the same fleet's length.
@@ -199,6 +175,7 @@ impl<C: Codec> TypedSender<C> {
             let job = Job {
                 header,
                 payload,
+                trace,
                 destination,
                 slot,
                 expires_at,
@@ -211,9 +188,11 @@ impl<C: Codec> TypedSender<C> {
                 // worker ended, which only a drain or a panic does. Dropping
                 // the returned job releases its slot. This is the one drop that
                 // no dequeued job accounts for.
+                DropReason::from(&error).record();
                 self.counters.dropped.fetch_add(1, Relaxed);
                 return Err(error.into_inner().payload);
             }
+            Stage::Enqueued.record();
             Ok(())
         })
     }
@@ -259,227 +238,5 @@ impl SendCounters {
     /// refusal counts here and still hands its payload back to the caller.
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Relaxed)
-    }
-}
-
-impl Share {
-    /// The instant this endpoint must give up at, measured from now.
-    ///
-    /// Read after the pacing wait rather than before it, so a share is a slice
-    /// of the time that is left to reach the network with.
-    fn until(self, expires_at: Instant) -> Instant {
-        let now = Instant::now();
-        let left = expires_at.saturating_duration_since(now);
-        let reserved = left / FALLBACK_DIVISOR;
-        match self {
-            Self::Probe => now + reserved,
-            Self::Most => now + left.saturating_sub(reserved),
-            Self::Rest => expires_at,
-        }
-    }
-}
-
-/// One cell's worker: it drains the queue, encodes each response into its own
-/// scratch, and delivers it.
-///
-/// `encoder` carries the codec and the scratch this worker keeps for its whole
-/// life, so a response is encoded into a buffer that already exists. The loop
-/// keeps draining after its queue handle drops, so a queued response outlives
-/// the layer that queued it.
-///
-/// Exactly one counter moves per dequeued job. The deadline is the biased arm
-/// of the select, so a job whose deadline has already passed is dropped before
-/// the pipeline is polled at all — nothing is paced, encoded or sent for it.
-/// Work already inside one poll still finishes: this is a deadline the pipeline
-/// is measured against between polls, never an absolute wall-clock cut.
-async fn run_worker<C: Codec, R: Router>(
-    mut queue: Receiver<Job<C>>,
-    context: WorkerContext<R>,
-    mut encoder: FrameEncoder<C>,
-) {
-    while let Some(job) = queue.recv().await {
-        let Job {
-            header,
-            payload,
-            destination,
-            slot,
-            expires_at,
-        } = job;
-        // One deadline over the whole pipeline — the pacing wait, the address
-        // read, the encode and every attempt — so a transport that never
-        // answers still releases the slot.
-        let delivered = select! {
-            biased;
-            () = sleep_until(expires_at) => false,
-            delivered = deliver_job(
-                &mut encoder,
-                &destination,
-                &context,
-                header,
-                payload,
-                expires_at,
-            ) => {
-                delivered
-            }
-        };
-        if delivered {
-            context.counters.sent.fetch_add(1, Relaxed);
-        } else {
-            context.counters.dropped.fetch_add(1, Relaxed);
-        }
-        // A worker can wait for its next response for as long as its
-        // destination is quiet, so it gives the response's bytes back first.
-        encoder.release();
-        drop(slot);
-    }
-}
-
-/// Resolves one response's route, frames it and delivers it.
-///
-/// Returns `true` only when the destination accepted the frame. The caller
-/// counts the outcome, so one dequeued job moves one counter.
-///
-/// The attempt budget applies to each endpoint rather than to both together.
-/// Sharing it would make the fallback unreachable whenever one attempt is
-/// configured. Both endpoints together stay inside the job's single deadline,
-/// which the worker's biased select already enforces.
-///
-/// The *time* budget is split the same way, and for the same reason. [`Share`]
-/// owns how much of it one endpoint may spend, and the endpoint this
-/// destination remembers is the one that gets the larger part.
-async fn deliver_job<C: Codec, R: Router>(
-    encoder: &mut FrameEncoder<C>,
-    destination: &Destination,
-    context: &WorkerContext<R>,
-    header: FrameHeader,
-    payload: C::Payload,
-    expires_at: Instant,
-) -> bool {
-    // No address originates anywhere but a registration: a node the directory
-    // does not hold is not dialed at all, and a node the rules refuse to reach
-    // from here is not dialed either.
-    let route = match context.router.route(header.target).await {
-        Ok(Some(route)) => route,
-        Ok(None) => return false,
-        Err(error) => {
-            warn!(%error, node = %header.target, "peer route lookup failed");
-            return false;
-        }
-    };
-    let staged = match encoder.stage(&header, payload) {
-        Ok(staged) => staged,
-        Err(error) => {
-            warn!(%error, node = %header.target, "response could not be framed");
-            return false;
-        }
-    };
-    let mut remembered = None;
-    let mut last_failure = None;
-    let preferred = destination.preferred();
-    let candidates = route.candidates(preferred);
-    let fallback = candidates[1].is_some();
-    let proven = candidates[0].is_some_and(|(preference, _)| Some(preference) == preferred);
-    for (index, (preference, address)) in candidates.into_iter().flatten().enumerate() {
-        let share = if index > 0 || !fallback {
-            Share::Rest
-        } else if proven {
-            Share::Most
-        } else {
-            Share::Probe
-        };
-        match deliver(
-            context.router.sender(),
-            destination,
-            address,
-            &staged,
-            context.attempts,
-            expires_at,
-            share,
-        )
-        .await
-        {
-            Ok(()) => {
-                destination.prefer(Some(preference));
-                return true;
-            }
-            Err(failure) => {
-                last_failure = Some(failure);
-                if !failure.is_wrong_endpoint() {
-                    // A failure that is not a wrong endpoint is a status the
-                    // path answered, so this endpoint is the one that reaches
-                    // the node — refusal and all. Every other failure leaves
-                    // nothing remembered: nothing served the frame there, so
-                    // nothing proves which endpoint serves it.
-                    remembered = Some(preference);
-                    break;
-                }
-            }
-        }
-    }
-    destination.prefer(remembered);
-    if let Some(failure) = last_failure {
-        warn!(%failure, node = %header.target, "response delivery failed");
-    }
-    false
-}
-
-/// Delivers one frame to one endpoint, trying again only for a failure another
-/// attempt could fix, and giving up on this endpoint at what `share` allows.
-///
-/// Every attempt claims the destination's pacing, so the rate limit bounds what
-/// one destination is asked for rather than what it receives. A response that
-/// falls back enters here a second time, and that endpoint's attempts claim
-/// too. A pacing wait is this process's own queue rather than anything the
-/// endpoint did, so it sits outside this endpoint's share: a destination whose
-/// schedule is far ahead would otherwise read as an endpoint that answered
-/// nothing. A claimed turn is spent whether or not the send happens, so a
-/// retry into a share that is already gone is not made at all.
-async fn deliver<S: ResponseSender, F: Framed + Sync>(
-    sender: &S,
-    destination: &Destination,
-    address: &Endpoint,
-    frame: &F,
-    attempts: u32,
-    expires_at: Instant,
-    share: Share,
-) -> Result<(), SendFailure> {
-    sleep_until(destination.next_send()).await;
-    let until = share.until(expires_at);
-    let mut outcome = attempt(sender, address, frame, expires_at, until).await;
-    for _ in 1..attempts {
-        match outcome {
-            Ok(()) => return Ok(()),
-            Err(failure) if !failure.is_ambiguous() => return Err(failure),
-            Err(_) if Instant::now() >= until => return outcome,
-            Err(_) => {
-                sleep_until(destination.next_send()).await;
-                outcome = attempt(sender, address, frame, expires_at, until).await;
-            }
-        }
-    }
-    outcome
-}
-
-/// One attempt, bounded twice over: by `expires_at` on the wire and by `until`
-/// here.
-///
-/// The two deadlines are different on purpose. `expires_at` is what the peer is
-/// told to answer inside, so a `DEADLINE_EXCEEDED` still means what it says —
-/// the whole response ran out of time — rather than "this process moved on".
-/// `until` is what this process spends on this one endpoint, and it covers the
-/// channel lookup and the readiness wait as well, neither of which the
-/// `grpc-timeout` header reaches. Giving up on it therefore reads as
-/// [`SendFailure::Unreachable`]: nothing was served here, and the next
-/// candidate keeps what the response has left.
-async fn attempt<S: ResponseSender, F: Framed + Sync>(
-    sender: &S,
-    address: &Endpoint,
-    frame: &F,
-    expires_at: Instant,
-    until: Instant,
-) -> Result<(), SendFailure> {
-    match timeout_at(until, sender.deliver(address, frame, expires_at)).await {
-        Ok(outcome) => outcome,
-        Err(_) => Err(SendFailure::Unreachable),
     }
 }

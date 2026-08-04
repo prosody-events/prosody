@@ -19,6 +19,7 @@ use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
+use opentelemetry::Context;
 use std::slice::from_ref;
 use std::sync::Arc;
 use tokio::task::yield_now;
@@ -163,8 +164,12 @@ async fn delivered_to_itself<R: Router>(
         CountingCodec::FORMAT_ID,
         TIMEOUT,
     )?;
-    own.send(header(shared.node, request, ALPHA)?, PAYLOAD.to_vec())
-        .map_err(|_| eyre!("the runtime's own router refused the response"))?;
+    own.send(
+        header(shared.node, request, ALPHA)?,
+        Context::current(),
+        PAYLOAD.to_vec(),
+    )
+    .map_err(|_| eyre!("the runtime's own router refused the response"))?;
 
     let deadline = Instant::now() + HANG_GUARD;
     loop {

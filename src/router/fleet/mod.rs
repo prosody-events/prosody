@@ -7,10 +7,12 @@
 use crate::router::NodeId;
 use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
 use crate::router::fleet::gate::{AdmissionGate, GateTicket};
+use opentelemetry::global::meter;
+use opentelemetry::metrics::Gauge;
 use parking_lot::Mutex;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, LazyLock};
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 use validator::Validate;
@@ -24,6 +26,19 @@ pub(crate) use self::destination::Destination;
 
 #[cfg(test)]
 mod tests;
+
+/// How many destinations the process holds live.
+///
+/// One series for the whole table, never one per destination. A node id arrives
+/// in a Kafka header and is admitted before the directory is consulted, so a
+/// per-destination series would let a topic writer choose the cardinality.
+static DESTINATIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter("prosody")
+        .u64_gauge("prosody.peer.fleet.destinations")
+        .with_description("Destinations the process holds live in its response fleet")
+        .with_unit("{destination}")
+        .build()
+});
 
 /// The destinations one process holds live, and what each of them is allowed.
 ///
@@ -47,6 +62,10 @@ pub(crate) struct DestinationFleet {
     admitted: AtomicU64,
     evicted: AtomicU64,
     refused: AtomicU64,
+    /// Occupied cells. Kept beside the table rather than counted from it: both
+    /// writers already hold the table lock, so this reads the same as a walk
+    /// and costs nothing per admission.
+    occupied: AtomicU64,
     config: FleetConfiguration,
 }
 
@@ -129,6 +148,7 @@ impl DestinationFleet {
             admitted: AtomicU64::new(0),
             evicted: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            occupied: AtomicU64::new(0),
             config,
         })
     }
@@ -312,6 +332,7 @@ impl DestinationFleet {
                 destination: Arc::clone(&destination),
             });
             self.admitted.fetch_add(1, Relaxed);
+            DESTINATIONS.record(self.occupied.fetch_add(1, Relaxed) + 1, &[]);
             (slot, destination)
         };
         table[slot].last_used = self.next_stamp();
@@ -342,6 +363,7 @@ impl DestinationFleet {
         let (_, idle) = candidate?;
         table[idle].occupant = None;
         self.evicted.fetch_add(1, Relaxed);
+        DESTINATIONS.record(self.occupied.fetch_sub(1, Relaxed) - 1, &[]);
         Some(idle)
     }
 

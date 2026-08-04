@@ -6,7 +6,7 @@
 //! trip has to carry the tag: the answer follows the message, not the attempt.
 
 use super::super::RespondHandler;
-use super::{Drained, Fixture, ResultProbeCodec, cap, offset_tracker, tagged};
+use super::{Drained, Fixture, ResultProbeCodec, cap, offset_tracker, tagged, tagged_under};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleEventHandler;
 use crate::consumer::middleware::defer::DeferConfiguration;
@@ -21,17 +21,24 @@ use crate::consumer::middleware::tests::test_support::{
 use crate::consumer::{DemandType, EventHandler};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
+use crate::otel::SpanRelation;
+use crate::related_span;
 use crate::response::frame::decode::decode_frame;
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::loopback::{node, paused};
 use crate::telemetry::Telemetry;
+use crate::test_util::{captured_spans, sampled_remote_context};
 use crate::timers::TimerType;
 use crate::{Key, Offset, Partition, Topic};
 use color_eyre::Result;
+use color_eyre::eyre::{ensure, eyre};
+use opentelemetry::trace::{TraceContextExt, TraceId};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tracing::{Instrument, info_span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// The key both the deferred message and its retry timer carry.
 const KEY: &str = "deferred";
@@ -41,6 +48,16 @@ const TARGET: u8 = 3;
 
 /// The request the deferred record names.
 const REQUEST: u8 = 44;
+
+/// The span a worker opens for one outbound response.
+const SENT: &str = "peer.response.send";
+
+/// The trace the reloaded record belongs to: the one
+/// [`sampled_remote_context`] names, which the loader's `load` span is a child
+/// of.
+const RECORD_TRACE: TraceId = TraceId::from_bytes([
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+]);
 
 /// A loader whose reloaded record still asks for a response.
 ///
@@ -128,6 +145,84 @@ fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
     })
 }
 
+/// The answer belongs to the reloaded record's trace, not to the trace of the
+/// timer that carried the reload.
+///
+/// That distinction is load-bearing rather than cosmetic. A deferred retry
+/// fires as a timer, and a timer dispatch starts a trace of its own under the
+/// shipped defaults. So a context taken where the answer is queued would put
+/// every deferred response outside the requester's trace. The context travels
+/// with the tag instead, read from the record both came from.
+#[test]
+fn a_deferred_reload_answers_inside_the_records_own_trace() -> Result<()> {
+    let mut dispatched: Result<TraceId> = Err(eyre!("the deferred reload never ran"));
+    let spans = captured_spans(|| dispatched = reload_under_a_fresh_timer_trace());
+    let timer_trace = dispatched?;
+    ensure!(
+        timer_trace != RECORD_TRACE,
+        "the timer must dispatch in a different trace, or this proves nothing"
+    );
+
+    let sent = spans
+        .iter()
+        .find(|span| span.name == SENT)
+        .ok_or_else(|| eyre!("span {SENT} was not exported"))?;
+    ensure!(
+        sent.span_context.trace_id() == RECORD_TRACE,
+        "{SENT} landed in {:?}, not in the reloaded record's own trace",
+        sent.span_context.trace_id()
+    );
+    Ok(())
+}
+
+/// Defers one tagged message, then reloads it from a timer that runs in a trace
+/// of its own. Returns that timer's trace id.
+fn reload_under_a_fresh_timer_trace() -> Result<TraceId> {
+    paused()?.block_on(async {
+        let fixture = Fixture::<ResultProbeCodec>::new(1, 2)?;
+        let leaf = ScriptedHandler::failing_then_success(vec![ErrorCategory::Transient]);
+        let handler = defer_handler(&fixture, leaf, MemoryMessageDeferStore::new())?;
+
+        let tracker = offset_tracker();
+        let message = tagged(TARGET, REQUEST, KEY)?.into_uncommitted(tracker.take(0).await?);
+        EventHandler::on_message(
+            &handler,
+            MockEventContext::new().with_timer_tracking(),
+            message,
+            DemandType::Normal,
+        )
+        .await;
+
+        let dispatch = info_span!("peer.test.timer");
+        let timer_trace = dispatch.context().span().span_context().trace_id();
+        let (timer, ..) = RecordingTimer::new(create_test_trigger_with(
+            KEY,
+            1000,
+            TimerType::DeferredMessage,
+        ));
+        async {
+            EventHandler::on_timer(
+                &handler,
+                MockEventContext::new().with_timer_tracking(),
+                timer,
+                DemandType::Normal,
+            )
+            .await;
+        }
+        .instrument(dispatch)
+        .await;
+        drop(handler);
+
+        let drained: Drained = fixture.drain().await?;
+        ensure!(
+            drained.sent == 1,
+            "the reload must have answered exactly once, not {} times",
+            drained.sent
+        );
+        Ok(timer_trace)
+    })
+}
+
 /// The defer layer over the respond layer, with a store the test can read.
 fn defer_handler(
     fixture: &Fixture<ResultProbeCodec>,
@@ -166,7 +261,11 @@ impl MessageLoader for TaggedLoader {
         _partition: Partition,
         _offset: Offset,
     ) -> Result<ConsumerMessage<Value>, TaggedLoaderError> {
-        tagged(TARGET, REQUEST, KEY).map_err(|_| TaggedLoaderError::Unavailable)
+        // The Kafka loader parents a reloaded record's span on the record's own
+        // propagated context, so a reload rejoins the trace the request began
+        // in. This double does the same, from one fixed remote context.
+        let load = related_span!(SpanRelation::Child, sampled_remote_context(), "load");
+        tagged_under(TARGET, REQUEST, KEY, load).map_err(|_| TaggedLoaderError::Unavailable)
     }
 
     async fn try_load_message(

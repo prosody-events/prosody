@@ -13,13 +13,15 @@ use crate::subsystem::SubsystemName;
 use ahash::RandomState;
 #[cfg(test)]
 use bytes::BytesMut;
+use opentelemetry::global::meter;
+use opentelemetry::metrics::Gauge;
 use parking_lot::Mutex;
 use scc::HashMap;
 use smallvec::SmallVec;
 use std::error::Error;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::{Acquire, Release};
-use std::sync::{Arc, Weak};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -30,6 +32,19 @@ use validator::{Validate, ValidationErrors};
 
 /// Ids one sweep pass carries between its scan and removals.
 pub(in crate::requester) const SWEEP_BATCH: usize = 64;
+
+/// Requests this process is waiting on right now.
+///
+/// One series for the registry, with no attributes at all: everything that
+/// could name a request — its id, its awaited subsystems — is either minted per
+/// call or arrives from the network.
+static PENDING: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter("prosody")
+        .u64_gauge("prosody.peer.requests.pending")
+        .with_description("Requests this process is waiting for answers to")
+        .with_unit("{request}")
+        .build()
+});
 
 /// Where a waiting request and an arriving response meet.
 ///
@@ -67,6 +82,10 @@ pub(crate) struct PendingRegistry {
     /// Most bytes one accepted payload may carry.
     max_response_bytes: usize,
     grace: Duration,
+    /// Live map records. Held rather than read from the map: a scan of the
+    /// bucket array on every registration and every completion would cost more
+    /// than the gauge is worth.
+    pending: AtomicU64,
     closed: AtomicBool,
     /// A `OnceLock` cannot replace this: [`shutdown`](Self::shutdown) awaits
     /// the handle, and that needs ownership a shared reference cannot give.
@@ -112,6 +131,7 @@ impl PendingRegistry {
             max_timeout: config.max_timeout,
             max_response_bytes: config.max_response_bytes,
             grace: config.sweep_grace,
+            pending: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             sweeper: Mutex::new(None),
         });
@@ -328,6 +348,7 @@ impl PendingRegistry {
         if self.entries.insert_sync(id, entry).is_err() {
             return Err(Admission::IdInUse);
         }
+        PENDING.record(self.pending.fetch_add(1, Relaxed) + 1, &[]);
         // The check that closes the race: it reverses an insert that overlapped
         // a drain already in progress.
         if self.closed.load(Acquire) {
@@ -344,10 +365,12 @@ impl PendingRegistry {
     /// from removing a record another request owns under the same id.
     fn close_and_remove(&self, id: RequestId, request: &Arc<PendingRequest>, status: Terminal) {
         request.close(status);
-        drop(
-            self.entries
-                .remove_if_sync(&id, |entry| Arc::ptr_eq(&entry.request, request)),
-        );
+        let removed = self
+            .entries
+            .remove_if_sync(&id, |entry| Arc::ptr_eq(&entry.request, request));
+        if removed.is_some() {
+            PENDING.record(self.pending.fetch_sub(1, Relaxed) - 1, &[]);
+        }
     }
 }
 

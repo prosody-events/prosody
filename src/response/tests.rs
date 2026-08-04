@@ -54,6 +54,28 @@ fn each_disposition_reports_its_documented_status() {
     }
 }
 
+/// Every disposition counts under its own label, so one answer can never be
+/// read as another in a dashboard, and nothing an arriving frame carries can
+/// reach a label.
+#[test]
+fn each_disposition_has_a_distinct_label() {
+    let labels: Vec<&str> = ResponseDisposition::VARIANTS
+        .iter()
+        .map(|disposition| disposition.label())
+        .collect();
+
+    for (index, label) in labels.iter().enumerate() {
+        assert!(
+            !label.is_empty() && label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "{label} is not a plain lowercase label"
+        );
+        assert!(
+            !labels[..index].contains(label),
+            "{label} labels more than one disposition"
+        );
+    }
+}
+
 /// Request ids are `UUIDv7`, so the id a trace carries places the request in
 /// time and two ids minted in order sort in that order. Two mints already
 /// differ.

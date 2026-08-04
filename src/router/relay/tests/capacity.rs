@@ -14,6 +14,7 @@ use crate::router::relay::{Relay, RelayFailure};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
+use opentelemetry::Context;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Builder;
@@ -65,7 +66,7 @@ fn a_flood_of_forwards_cannot_take_a_busy_cell() -> Result<()> {
         // This process's own response takes the first cell and holds it.
         let sender = TypedSender::<CountingCodec>::new(&router, FrameCap::new(CAP_BYTES)?)?;
         sender
-            .send(header(OWN)?, PAYLOAD.to_vec())
+            .send(header(OWN)?, Context::current(), PAYLOAD.to_vec())
             .map_err(|_| eyre!("the fleet refused this process's own response"))?;
         expect_port(&mut deliveries, port(OWN)).await?;
         let held = fleet
