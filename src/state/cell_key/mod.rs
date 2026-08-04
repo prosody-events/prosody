@@ -127,8 +127,9 @@ pub enum Direction {
 /// `Direction` × `ScanEdge` comparator dispatch in the Cassandra cell
 /// store, and property tests drive all three variants.
 ///
-/// Generic over the borrowed inner so the same type serves a [`Scan`]'s
-/// `ScanEdge<&Coordinate>` and the typed cell view's `ScanEdge<&Key>`.
+/// Generic over the inner so one type serves both an owned plan edge
+/// (`ScanEdge<Coordinate>`) and a borrowed store-facing edge
+/// (`ScanEdge<&Coordinate>`, what a [`Scan`] carries).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanEdge<T> {
     /// The endpoint coordinate is part of the range.

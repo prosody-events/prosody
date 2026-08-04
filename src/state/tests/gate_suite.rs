@@ -6,7 +6,9 @@
 //! seam withholding one lower response so the racing op is **forced** into
 //! the bad interleaving (a post-race assert alone proves nothing). Each pin
 //! asserts the outcome equals *some* serial order of the two ops; each goes
-//! red by deleting the permit acquisition in the relevant handle op. A
+//! red by removing the relevant op's admission — making
+//! `OwnerEngine::begin_read` or `OwnerEngine::begin_write` hand back a witness
+//! over an already-released permit. A
 //! cancel-safety pin covers the futurelock posture's safe half (dropping a
 //! holding or queued session-op future releases the gate), and the closure
 //! pin proves settlement fences mutators while post-settle reads still
@@ -19,9 +21,9 @@
 
 use super::super::cached::Cached;
 use super::super::descriptor::{
-    CellStateError, MapStateError, STREAM_CHUNK, StateDescriptor, deque, deque_state, map,
-    map_state, value_state,
+    CellStateError, MapStateError, StateDescriptor, deque, deque_state, map, map_state, value_state,
 };
+use super::super::dirty::DirtyStore;
 use super::super::manager::ArmedKeys;
 use super::super::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use super::super::order_codec::{I64KeyCodec, OrderedKeyCodec};
@@ -62,11 +64,11 @@ const HANG_GUARD: Duration = Duration::from_secs(30);
 
 /// The `*_stream_error_yield_releases_the_gate` pins seed exactly two items and
 /// assert the first yielded item is the `Err` — chunk-atomicity, which requires
-/// both items to land in one point-get chunk. At `STREAM_CHUNK == 1` each key
+/// both items to land in one point-get chunk. At `CELL_BATCH == 1` each key
 /// is its own chunk, the valid entry's `Ok` surfaces first, and the pins would
 /// go red on correct code; enforce the premise so breaking it is uncompilable.
 const _: () = assert!(
-    STREAM_CHUNK >= 2,
+    CELL_BATCH >= 2,
     "the *_stream_error_yield pins need two items in one chunk to prove chunk-atomicity"
 );
 
@@ -142,11 +144,21 @@ impl GateFixture {
     /// Mints a session for dedup id `n`. Dropped senders are fine —
     /// `watch::Receiver::borrow` keeps returning the last value.
     fn session(&self, n: u128) -> KeyedStateSession<GateBackend, MemoryLoader<Value>> {
+        self.session_with_dirty(n, Arc::default())
+    }
+
+    /// [`Self::session`] over a caller-owned dirty workspace, so a pin can read
+    /// exactly what an invocation staged.
+    fn session_with_dirty(
+        &self,
+        n: u128,
+        dirty: Arc<DirtyStore>,
+    ) -> KeyedStateSession<GateBackend, MemoryLoader<Value>> {
         let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownPhase::default());
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         KeyedStateSession::new(SessionParts::<GateBackend, _> {
             cell: self.cached.clone(),
-            dirty: Arc::default(),
+            dirty,
             oracle: self.oracle.clone(),
             loader: MemoryLoader::new(),
             registry: self.registry.clone(),
@@ -181,9 +193,9 @@ fn runtime() -> Result<Runtime> {
 /// the commit's write-through would land, then the fill resumes. With the
 /// gate, the commit parks until the whole get (read + publish) completes, so
 /// the re-get answers the committed value WARM (zero lower reads). Red-proven
-/// by deleting the handle-level permit acquisition: the stale fill publish
-/// overwrites the commit's write-through and the warm re-get answers the
-/// pre-commit value.
+/// by making `OwnerEngine::begin_read` hand back a witness over an
+/// already-released permit: the stale fill publish overwrites the commit's
+/// write-through and the warm re-get answers the pre-commit value.
 #[test]
 fn gate_serializes_fill_against_commit() -> Result<()> {
     runtime()?.block_on(async {
@@ -263,8 +275,9 @@ fn gate_serializes_fill_against_commit() -> Result<()> {
 /// KV4 — a `set` racing `commit()`'s snapshot→drain window. The
 /// commit's lower write is withheld after it lands; the racing set parks on
 /// the gate, so its cell is buffered strictly after the drain and survives to
-/// the settle — nothing is lost. Red-proven by deleting the permit
-/// acquisition: the set buffers into the snapshot→drain window and the drain
+/// the settle — nothing is lost. Red-proven by making
+/// `OwnerEngine::begin_write` hand back a witness over an already-released
+/// permit: the set buffers into the snapshot→drain window and the drain
 /// silently drops it (the pre-existing lost-update this gate closes).
 #[test]
 fn gate_serializes_set_against_commit_drain() -> Result<()> {
@@ -343,8 +356,9 @@ fn gate_serializes_set_against_commit_drain() -> Result<()> {
 /// at its cold keyset read HOLDING the gate. `clear()` is polled exactly once:
 /// with the gate it parks (a single deterministic `Poll::Pending`, no scheduler
 /// heuristic) and runs only after the set completes — set-then-clear leaves the
-/// map empty. Red-proven by deleting the permit acquisition in `set` OR
-/// `clear`: the first poll runs `clear` to completion, then the resumed `set`
+/// map empty. Red-proven by making `OwnerEngine::begin_write` return a witness
+/// over an already-released permit (so `set` and `clear` no longer exclude each
+/// other): the first poll runs `clear` to completion, then the resumed `set`
 /// writes ONLY the entry (its keyset write suppressed), stranding a live entry
 /// with an absent keyset — the invariant the gate protects.
 #[test]
@@ -445,7 +459,8 @@ fn gate_serializes_set_against_clear() -> Result<()> {
 /// The keyset read-modify-write race pin (the pre-existing lost-update the gate
 /// closes): two racing fresh-key sets serialize under the gate, so the keyset
 /// is the UNION of both keys (not a last-wins singleton) and a stream yields
-/// both entries. Red-proven by deleting the permit acquisition: the parked
+/// both entries. Red-proven by making `OwnerEngine::begin_write` return a
+/// witness over an already-released permit: the parked
 /// set's stale keyset read overwrites the other's update, the keyset loses a
 /// key, and the current-membership invariant breaks.
 #[test]
@@ -823,15 +838,17 @@ fn map_absent_keyset_streams_zero_reads() -> Result<()> {
 /// The set-racing-stream pin (the chunked-stream contract): a mutator racing a
 /// live stream serializes against the CURRENT chunk fetch and lands **between
 /// chunks**, never mid-fetch. The stream snapshots key membership at its init
-/// keyset read, then releases the gate before fetching the entry chunk; a `set`
-/// parked on the gate during the init read therefore lands first (FIFO) and
-/// buffers `1→99` into the shared overlay, so the entry chunk — a fresh gate
-/// acquire — reads key 1 through the overlay = 99. Values are read live,
-/// chunk by chunk (the point-get arm's per-arm consistency contract); the
-/// interleaving property `run_map_stream_interleave` is the stronger successor
-/// (named in the commit). Red-proven by deleting the permit acquisition in
-/// `set` OR the stream's chunk fetch: without serialization the yield is
-/// nondeterministic and the stream can observe a torn state.
+/// keyset read, then releases the gate before it fetches the entry chunk. A
+/// `set` parked on the gate during the init read therefore lands first (FIFO)
+/// and buffers `1→99` into the shared overlay. The entry chunk is a fresh gate
+/// acquire, so it reads key 1 through the overlay and sees 99. Values are read
+/// live, chunk by chunk — the point-get arm's per-arm consistency contract.
+/// The interleaving property `run_map_stream_interleave` is the stronger
+/// successor (named in the commit). Red-proven by making
+/// `OwnerEngine::begin_write` (or `OwnerEngine::resume`, the stream's per-chunk
+/// acquire) hand back a witness over an already-released permit: without
+/// serialization the yield is nondeterministic and the stream can observe a
+/// torn state.
 #[test]
 fn gate_excludes_set_during_keyset_stream() -> Result<()> {
     runtime()?.block_on(async {
@@ -924,7 +941,7 @@ fn gate_excludes_set_during_keyset_stream() -> Result<()> {
 /// sub-batch-2 key is queued (FIFO); on release `get_many` finishes both
 /// sub-batches — reading the committed pre-set value for that key — before the
 /// set runs. Red-proven by rewriting `Map::get_many` to acquire the read permit
-/// PER `CELL_BATCH` chunk (drop + reacquire between sub-batches): the queued
+/// PER `CELL_BATCH` sub-batch (drop + reacquire between them): the queued
 /// set then wins the gate at the boundary and buffers its dirty write, so
 /// sub-batch 2's overlay read answers the NEW value.
 #[test]
@@ -992,6 +1009,106 @@ fn map_get_many_holds_gate_across_sub_batches() -> Result<()> {
              after the whole get_many"
         );
         Ok(())
+    })
+}
+
+/// Journal atomicity at the invocation's final fence: a `set` that reaches
+/// **both** of its stages and only then meets a terminated session stages
+/// nothing at all — neither the entry nor the keyset write reaches the event
+/// overlay.
+///
+/// The schedule parks the invocation inside its cold keyset read, which sits
+/// *below* the read's own liveness guard, so the read still returns `Ok` and
+/// the body runs to completion holding write admission. The control run — the
+/// identical schedule without the termination — proves the park point is really
+/// past both stages: it leaves exactly two staged cells. Red-proven by moving
+/// the journal replay above the final validation in `WriteOperation::merge`:
+/// the fenced run then stages the same two cells the control does.
+#[test]
+fn map_set_fenced_at_the_final_check_stages_nothing() -> Result<()> {
+    runtime()?.block_on(async {
+        let control = parked_set("fence_journal_control", false).await?;
+        assert!(control.outcome.is_ok(), "the control set must succeed");
+        assert_eq!(
+            control.staged, 2,
+            "the control stages the entry write and the keyset write"
+        );
+
+        let fenced = parked_set("fence_journal_fenced", true).await?;
+        match &fenced.outcome {
+            Err(error) if map_item_terminated(error) => {}
+            other => bail!(
+                "the fenced set must report Terminated, got ok={}",
+                other.is_ok()
+            ),
+        }
+        assert_eq!(
+            fenced.staged, 0,
+            "a fenced invocation replays nothing: both staged mutations are discarded"
+        );
+        assert_eq!(
+            fenced.cleared, 0,
+            "a fenced invocation stages no section clear either"
+        );
+        Ok(())
+    })
+}
+
+/// What one parked-`set` run produced: the call's outcome and what its event
+/// overlay holds afterwards, read straight off the dirty store.
+struct ParkedSet {
+    outcome: Result<(), MapStateError<JsonCodecError>>,
+    staged: usize,
+    cleared: usize,
+}
+
+/// Seeds a two-key tracked map cold, parks a `set` of a fresh key inside its
+/// keyset read, optionally terminates the session while it is parked, and
+/// reports what the invocation left behind.
+async fn parked_set(name: &str, terminate: bool) -> Result<ParkedSet> {
+    let fx = GateFixture::new(name)?;
+    let id = fx.id("m")?;
+    let cref = CollectionRef::new(id.clone(), None);
+    let mut seed = vec![(
+        map::keyset_cell(),
+        Some(Bytes::from(tracked_frame(&[1, 2]))),
+    )];
+    for k in 1..=2_i64 {
+        seed.push((
+            map::entry_cell_for(&I64KeyCodec::encode(&k)),
+            Some(json_entry(k)?),
+        ));
+    }
+    fx.counting.write_resolved(&cref, &seed, &[]).await?;
+
+    let dirty: Arc<DirtyStore> = Arc::default();
+    let session = fx.session_with_dirty(1, dirty.clone());
+    let map = map_state::<I64KeyCodec, JsonCodec>("m")
+        .bind(&session)
+        .map_err(|e| eyre!("bind: {e}"))?;
+
+    // Park in the keyset read's cold cache-fill: past the read's liveness
+    // guard, holding write admission, with both stages still ahead.
+    fx.holds.get_for_cache().arm(1);
+    let writer = tokio::spawn({
+        let map = map.clone();
+        async move { map.set(9, Value::from(9_i64)).await }
+    });
+    timeout(HANG_GUARD, fx.holds.get_for_cache().entered())
+        .await
+        .map_err(|_| eyre!("the set never reached the keyset-read hold"))?;
+    if terminate {
+        session.terminate();
+    }
+    fx.holds.get_for_cache().release();
+    let outcome = timeout(HANG_GUARD, writer)
+        .await
+        .map_err(|_| eyre!("the set hung"))??;
+
+    Ok(ParkedSet {
+        outcome,
+        staged: dirty.collection_snapshot(&id).len(),
+        cleared: dirty.cleared_sections(&id).len(),
     })
 }
 
@@ -1735,7 +1852,8 @@ fn racing_set_never_joins_next_attempt() -> Result<()> {
     })
 }
 
-/// Whether a fenced map stream item is the `Terminated` access error.
+/// Whether a fenced map outcome — a stream item or a call's error — is the
+/// `Terminated` access error.
 fn map_item_terminated(item: &MapStateError<JsonCodecError>) -> bool {
     matches!(
         item,
@@ -1745,11 +1863,11 @@ fn map_item_terminated(item: &MapStateError<JsonCodecError>) -> bool {
 
 /// Scan-shell fence, RANGE source: the map degrade arm streams through the
 /// gate-free range source, and an emission after an observed attempt bump
-/// errors `Terminated` — the per-emission `CellView::fenced` check catches it,
+/// errors `Terminated` — the managed stream's per-emission fence catches it,
 /// not the source (which keeps producing). The first item crosses pre-bump; the
-/// range source holds no permit, so the `reset` between pulls bumps
-/// immediately. Red proven by dropping the `self.fenced(...)` wrapper in
-/// `CellView::scan` (return the raw `range_source`): the post-bump pull then
+/// range source holds no admission, so the `reset` between pulls bumps
+/// immediately. Red proven by dropping the `fenced(...)` wrapper in
+/// `RangePlan::entries` (return the raw source): the post-bump pull then
 /// yields a second `Ok` item.
 #[test]
 fn range_scan_stream_fences_after_bump() -> Result<()> {
@@ -1794,10 +1912,10 @@ fn range_scan_stream_fences_after_bump() -> Result<()> {
 /// Scan-shell fence, COORDINATE source: the map tracked arm point-gets a chunk,
 /// collects it into a bounded buffer, and releases the permit before the first
 /// yield; a buffered entry never crosses the fence after an observed bump. Both
-/// keys land in one chunk (`STREAM_CHUNK >= 2`), so the first entry's fence
+/// keys land in one chunk (`CELL_BATCH >= 2`), so the first entry's fence
 /// check passes pre-bump and the second's runs post-bump. Red proven by
-/// dropping the `self.fenced(...)` wrapper in `CellView::scan_at`: the buffered
-/// second entry then crosses as an `Ok`.
+/// dropping the `fenced(...)` wrapper in `CoordinatePlan::entries`: the
+/// buffered second entry then crosses as an `Ok`.
 #[test]
 fn coordinate_stream_fences_buffered_entries_after_bump() -> Result<()> {
     runtime()?.block_on(async {

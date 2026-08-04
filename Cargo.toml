@@ -1,3 +1,11 @@
+[workspace]
+# `default-members` makes bare `cargo clippy`, `cargo doc`, and `cargo nextest
+# run` cover the macro crate. Without it, cargo builds and tests only the root
+# package, so the member ships ungated.
+default-members = [".", "crates/prosody-macros"]
+members = ["crates/prosody-macros"]
+resolver = "3"
+
 [package]
 categories = ["asynchronous", "network-programming"]
 description = "Event sourcing library with persistent timers that isolates per-key failures"
@@ -53,6 +61,7 @@ parse-size = "1.1"
 paste = "1.0"
 pin-project = "1.1"
 portable-atomic = { version = "1.3", features = ["float"] }
+prosody-macros = { version = "0.5.0", path = "crates/prosody-macros" }
 quanta = "0.12"
 quick_cache = "0.7"
 rand = "0.10"
@@ -129,12 +138,19 @@ tempfile = "3"
 tokio = { version = "1.44", features = ["rt-multi-thread", "test-util"] }
 uuid = { version = "1.16", features = ["v4"] }
 
-[lints.rust]
+[lints]
+workspace = true
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+
+[workspace.lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
 unused_qualifications = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 absolute_paths = "warn"
 blocks_in_conditions = "allow"
 cargo = { level = "warn", priority = -1 }
@@ -178,7 +194,3 @@ unneeded_field_pattern = "warn"
 unreachable = "warn"
 unwrap_used = "deny"
 verbose_file_reads = "warn"
-
-[profile.release]
-codegen-units = 1
-lto = "fat"

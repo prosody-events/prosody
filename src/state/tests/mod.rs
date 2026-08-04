@@ -31,9 +31,7 @@ use self::support::{
 };
 use super::cell::{Committed, ProvisionalWrite};
 use super::cell_key::CellKey;
-use super::descriptor::{
-    STREAM_CHUNK, StateDescriptor, WithResolver, deque, deque_state, map_state,
-};
+use super::descriptor::{StateDescriptor, WithResolver, deque, deque_state, map_state};
 use super::manager::ArmedKeys;
 use super::marker::{EventMarker, SectionClear};
 use super::memory::{
@@ -597,7 +595,8 @@ fn memory_overlay_precedence_set_beats_section_clear() -> Result<()> {
 /// exactly ONE lower batch read for its entries — a full-width scan chunk is
 /// one [`CoordinateBatch`], one lower `get_many`; only the keyset meta cell
 /// stays a point read.
-/// FALSIFICATION: revert `coordinate_source` to the per-key point-`get` loop →
+/// FALSIFICATION: revert `CoordinatePlan`'s chunk source to a per-key point
+/// `get` loop →
 /// `batch_reads == 0` and `lower_reads == CELL_BATCH` (+ keyset) → both asserts
 /// red. Counters are read after the full drain, so nothing masks them.
 #[test]
@@ -680,8 +679,9 @@ fn map_cold_chunk_is_one_batch_read() -> Result<()> {
             1,
             "a cold full-width chunk is ONE lower batch read"
         );
-        assert!(
-            counting.lower_reads() <= 1,
+        assert_eq!(
+            counting.lower_reads(),
+            1,
             "only the keyset meta read is a point read (lower_reads={})",
             counting.lower_reads()
         );
@@ -817,7 +817,7 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
 /// one.
 /// FALSIFICATION: routing `MapHandle::keys` through `self.stream(dir)` (mapping
 /// `(k, _)`) resolves every drained key → `resolves() == n > 0` on either arm →
-/// red; routing only the `StreamPlan::Scan` arm through the resolving `scan`
+/// red; routing only the `MapPlan::Scan` arm through the resolving `scan`
 /// reddens the degrade arm alone. Both revert to green.
 #[test]
 fn map_keys_no_resolve() -> Result<()> {
@@ -1616,7 +1616,12 @@ async fn drain_deque_stream(
 
 /// Seeds a committed deque window of `width` entries named `name` directly into
 /// `counting`'s lower store, valued by its own index so a stream-order
-/// assertion is possible.
+/// assertion is possible. It also seeds **one entry at index `width`, which
+/// sits deliberately outside the seeded `[0, width)` bounds**.
+///
+/// That extra row makes the wide arm's range bound falsifiable. The entries
+/// section then holds a row that the window does not. A scan over the whole
+/// section, instead of exactly `[head, tail − 1]`, would yield that row.
 async fn seed_wide_deque(
     counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
     state_key: &StateKey,
@@ -1633,7 +1638,8 @@ async fn seed_wide_deque(
         deque::meta_cell(),
         Some(Bytes::from(deque::seed_frame(0, i64::try_from(width)?))),
     )];
-    for i in 0..width {
+    // `0..=width`: the last entry sits past `tail`, outside the window.
+    for i in 0..=width {
         let index = i64::try_from(i)?;
         seeded.push((
             deque::entry_cell_for(&I64KeyCodec::encode(&index)),
@@ -1646,11 +1652,9 @@ async fn seed_wide_deque(
 
 /// Sub-threshold deque iteration streams through the batch verb: a small
 /// committed deque issues **zero** lower-store scans, one bounds point-get, and
-/// one batch read for the entries, in both directions. The companion
-/// wide-window assertions prove the counters are live and pin the fallback: a
-/// directly-seeded window wider than [`deque::DEQUE_POINT_ITERATION_MAX`]
-/// streams every entry in order through exactly one lower scan (plus the one
-/// bounds get).
+/// one batch read for the entries, in both directions. The test then hands the
+/// same fixture to [`assert_wide_deque_scan_is_window_bounded`], which pins the
+/// fallback arm.
 #[test]
 fn deque_stream_issues_no_scans() -> Result<()> {
     executor::block_on(async {
@@ -1725,28 +1729,55 @@ fn deque_stream_issues_no_scans() -> Result<()> {
             );
         }
 
-        // Companion: a directly-seeded window one wider than the threshold
-        // falls back to exactly one lower scan — proving the zero above is a
-        // live counter and pinning the fallback arm streams every entry in
-        // order.
-        let width = deque::DEQUE_POINT_ITERATION_MAX + 1;
-        seed_wide_deque(&counting, &state_key, "dq-wide", width).await?;
+        assert_wide_deque_scan_is_window_bounded(&counting, &oracle, &registry, &state_key, &armed)
+            .await
+    })
+}
 
+/// The wide-window companion of [`deque_stream_issues_no_scans`]. A
+/// directly-seeded window one entry wider than
+/// [`deque::DEQUE_POINT_ITERATION_MAX`] falls back to exactly one lower scan.
+/// That count proves the sub-threshold zero is a live counter. The window
+/// bounds that scan, not the section.
+///
+/// [`seed_wide_deque`] plants one row past `tail`. A scan over the whole
+/// section, rather than `[head, tail − 1]`, would yield that row. This helper
+/// drains both directions, because a regression that keeps the limit but drops
+/// the edges hides forward and shows backward. Forward, the limit stops the
+/// walk short of the extra row. Backward, the extra row becomes the first item.
+async fn assert_wide_deque_scan_is_window_bounded(
+    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    oracle: &ScriptedOracle,
+    registry: &Arc<CollectionDefRegistry>,
+    state_key: &StateKey,
+    armed: &ArmedKeys,
+) -> Result<()> {
+    let width = deque::DEQUE_POINT_ITERATION_MAX + 1;
+    seed_wide_deque(counting, state_key, "dq-wide", width).await?;
+    let ascending: Vec<Value> = (0..width)
+        .map(i64::try_from)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(Value::from)
+        .collect();
+
+    for (n, dir) in [Direction::Forward, Direction::Backward]
+        .into_iter()
+        .enumerate()
+    {
         counting.reset();
         let event = EventRef::Message {
-            dedup_id: Uuid::from_u128(u128::MAX - 2),
+            dedup_id: Uuid::from_u128(u128::MAX - 2 - n as u128),
         };
-        let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
-        let drained = drain_deque_stream(&session, "dq-wide", Direction::Forward).await?;
-        let expected: Vec<Value> = (0..width)
-            .map(i64::try_from)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(Value::from)
-            .collect();
+        let session = counting_session(counting, oracle, registry, state_key, armed, event);
+        let drained = drain_deque_stream(&session, "dq-wide", dir).await?;
+        let mut expected = ascending.clone();
+        if dir == Direction::Backward {
+            expected.reverse();
+        }
         assert_eq!(
             drained, expected,
-            "the wide window streams every seeded entry in order"
+            "the wide {dir:?} scan streams exactly the window's entries, in order"
         );
         assert_eq!(
             counting.lower_scans(),
@@ -1758,8 +1789,8 @@ fn deque_stream_issues_no_scans() -> Result<()> {
             1,
             "the wide arm reads only the bounds cell"
         );
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 /// A dense stream-laziness case: a collection of `n` entries drained
@@ -1799,17 +1830,17 @@ fn resolve_session(
 }
 
 /// The stream-laziness property (map): a `stream(dir).take(k)` over a **dense**
-/// `n`-entry `Tracked` map is genuinely incremental — it issues at most one
-/// batch read beyond `k` (entries flow through the batch verb; only the keyset
-/// meta cell is a point read) and resolves at most `k + STREAM_CHUNK` values,
-/// never the whole `n`-entry collection. The counting store bounds fetches and
-/// the counting resolver bounds resolutions; both counters sit at the lowest
-/// layer, so nothing masks a materialization.
-/// FALSIFICATION: widen `coords.by_ref().take(STREAM_CHUNK)` in
-/// `coordinate_source` to `.take(usize::MAX)` (drain every tracked key in one
-/// chunk) → `take(k)` fetches and resolves all `n` → `batch_reads ==
+/// `n`-entry `Tracked` map is genuinely incremental. It issues at most one
+/// batch read beyond `k`, because entries flow through the batch verb and only
+/// the keyset meta cell is a point read. It resolves at most `k + CELL_BATCH`
+/// values, never the whole `n`-entry collection. The counting store bounds the
+/// fetches and the counting resolver bounds the resolutions. Both counters sit
+/// at the lowest layer, so nothing masks a materialization.
+/// FALSIFICATION: widen `keys.by_ref().take(CELL_BATCH)` in
+/// `CoordinatePlan::entry_source` to `.take(usize::MAX)` (drain every tracked
+/// key in one chunk) → `take(k)` fetches and resolves all `n` → `batch_reads ==
 /// n.div_ceil(16)` and `resolves == n`, both over their bounds for `n ≫ k` →
-/// red. (Inflating `STREAM_CHUNK` itself cannot falsify: the assertion bound
+/// red. (Inflating `CELL_BATCH` itself cannot falsify: the assertion bound
 /// moves with it.)
 async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
@@ -1891,18 +1922,19 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
         "take(k) yields exactly k.min(n) entries"
     );
     assert!(
-        counting.batch_reads() <= k.div_ceil(STREAM_CHUNK) + 1,
+        counting.batch_reads() <= k.div_ceil(CELL_BATCH) + 1,
         "a lazy map take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
         counting.batch_reads()
     );
-    assert!(
-        counting.lower_reads() <= 1,
+    assert_eq!(
+        counting.lower_reads(),
+        1,
         "entries flow through the batch verb, not point get; only the keyset meta read remains a \
          point read (lower_reads={})",
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + STREAM_CHUNK,
+        resolves.resolves() <= k + CELL_BATCH,
         "a lazy map take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );
@@ -1913,11 +1945,11 @@ async fn run_map_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Resul
 /// [`run_map_stream_prefix_lazy`] over a dense `n`-entry window on the
 /// point-get arm — at most one batch read beyond `k` (entries flow through the
 /// batch verb; only the bounds meta cell is a point read) and at most
-/// `k + STREAM_CHUNK` resolved. FALSIFICATION: widen
-/// `coords.by_ref().take(STREAM_CHUNK)` in `coordinate_source` to
+/// `k + CELL_BATCH` resolved. FALSIFICATION: widen
+/// `keys.by_ref().take(CELL_BATCH)` in `CoordinatePlan::entry_source` to
 /// `.take(usize::MAX)` (fetch the whole window in one chunk) →
 /// `batch_reads == n.div_ceil(16)` and `resolves == n`, both over their bounds
-/// for `n ≫ k` → red. (Inflating `STREAM_CHUNK` itself cannot falsify: the
+/// for `n ≫ k` → red. (Inflating `CELL_BATCH` itself cannot falsify: the
 /// assertion bound moves with it.)
 async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Result<()> {
     let oracle = ScriptedOracle::default();
@@ -1991,18 +2023,19 @@ async fn run_deque_stream_prefix_lazy(n: usize, k: usize, dir: Direction) -> Res
         "take(k) yields exactly k.min(n) elements"
     );
     assert!(
-        counting.batch_reads() <= k.div_ceil(STREAM_CHUNK) + 1,
+        counting.batch_reads() <= k.div_ceil(CELL_BATCH) + 1,
         "a lazy deque take(k) issues at most one batch read beyond k (batches={}, k={k}, n={n})",
         counting.batch_reads()
     );
-    assert!(
-        counting.lower_reads() <= 1,
+    assert_eq!(
+        counting.lower_reads(),
+        1,
         "entries flow through the batch verb, not point get; only the bounds meta read remains a \
          point read (lower_reads={})",
         counting.lower_reads()
     );
     assert!(
-        resolves.resolves() <= k + STREAM_CHUNK,
+        resolves.resolves() <= k + CELL_BATCH,
         "a lazy deque take(k) resolves at most k + one chunk (resolves={}, k={k}, n={n})",
         resolves.resolves()
     );

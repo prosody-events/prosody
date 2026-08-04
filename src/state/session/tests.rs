@@ -46,7 +46,7 @@
 //! real boundary is driven.)
 
 use super::sealed::{ApplyOutcome, StagedState, StateLifecycle};
-use super::{CellRead, CellWrite, Finalized, KeyedStateSession, SessionParts, TerminationWatch};
+use super::{Finalized, KeyedStateSession, SessionParts, StateBackend, TerminationWatch};
 use crate::codec::JsonCodec;
 use crate::consumer::partition::ShutdownPhase;
 use crate::error::ErrorCategory;
@@ -303,8 +303,8 @@ async fn staged_fire_delay(
     });
     for name in &names {
         session
-            .set(StateType::Application, name, &value_cell(), b"v")
-            .await?;
+            .seed(StateType::Application, name, &value_cell(), Some(b"v"))
+            .await;
     }
     match session.finalize().await? {
         Finalized::Staged(staged) => Ok(Some(staged.recovery_delay())),
@@ -362,16 +362,19 @@ async fn commit_drains_only_its_collection() -> Result<()> {
     let cart = StateName::try_new("cart")?;
     let wishlist = StateName::try_new("wishlist")?;
     session
-        .set(StateType::Application, &cart, &value_cell(), b"a")
-        .await?;
+        .seed(StateType::Application, &cart, &value_cell(), Some(b"a"))
+        .await;
     session
-        .set(StateType::Application, &wishlist, &value_cell(), b"b")
-        .await?;
+        .seed(StateType::Application, &wishlist, &value_cell(), Some(b"b"))
+        .await;
 
-    assert_eq!(
-        session.commit(StateType::Application, &cart).await?,
-        StoreOutcome::Applied,
-    );
+    let outcome = {
+        let permit = session.permit().await;
+        session
+            .commit(&permit, StateType::Application, &cart)
+            .await?
+    };
+    assert_eq!(outcome, StoreOutcome::Applied);
 
     // Cart's write is committed durably; wishlist's is still only buffered.
     let probe = EventRef::Message {
@@ -422,20 +425,23 @@ async fn rollback_restores_the_commit_floor_without_durable_writes() -> Result<(
 
     // Commit V as the floor.
     session
-        .set(StateType::Application, &cart, &value_cell(), b"V")
-        .await?;
-    assert_eq!(
-        session.commit(StateType::Application, &cart).await?,
-        StoreOutcome::Applied,
-    );
+        .seed(StateType::Application, &cart, &value_cell(), Some(b"V"))
+        .await;
+    let outcome = {
+        let permit = session.permit().await;
+        session
+            .commit(&permit, StateType::Application, &cart)
+            .await?
+    };
+    assert_eq!(outcome, StoreOutcome::Applied);
 
     // Buffer W over cart, and X over the sibling.
     session
-        .set(StateType::Application, &cart, &value_cell(), b"W")
-        .await?;
+        .seed(StateType::Application, &cart, &value_cell(), Some(b"W"))
+        .await;
     session
-        .set(StateType::Application, &wishlist, &value_cell(), b"X")
-        .await?;
+        .seed(StateType::Application, &wishlist, &value_cell(), Some(b"X"))
+        .await;
 
     // Rollback cart: the buffered W vanishes.
     assert_eq!(
@@ -505,8 +511,13 @@ async fn rollback_on_a_terminated_session_is_noop() -> Result<()> {
     let scope2 = fx.session_with_cancel(message(2).0, cancel_rx2);
     let session = scope2.handle();
     session
-        .set(StateType::Application, &fx.value_name, &value_cell(), b"W")
-        .await?;
+        .seed(
+            StateType::Application,
+            &fx.value_name,
+            &value_cell(),
+            Some(b"W"),
+        )
+        .await;
 
     // The stale clone's rollback finds a terminated session: NoOp, no drain.
     assert_eq!(
@@ -712,15 +723,15 @@ async fn apply_value_op(
     match op {
         ValueOp::Set(byte) => {
             session
-                .set(StateType::Application, name, &value_cell(), &[byte])
-                .await?;
+                .seed(StateType::Application, name, &value_cell(), Some(&[byte]))
+                .await;
             model.scratch = Some(Bytes::copy_from_slice(&[byte]));
             model.buffered = true;
         }
         ValueOp::Clear => {
             session
-                .clear(StateType::Application, name, &value_cell())
-                .await?;
+                .seed(StateType::Application, name, &value_cell(), None)
+                .await;
             model.scratch = None;
             model.buffered = true;
         }
@@ -728,13 +739,18 @@ async fn apply_value_op(
             // The value cell lives in section 0, so the dirty clear marker
             // masks it to absent within the event.
             session
-                .clear_section(StateType::Application, name, Section::new(0))
-                .await?;
+                .seed_section_clear(StateType::Application, name, Section::new(0))
+                .await;
             model.scratch = None;
             model.buffered = true;
         }
         ValueOp::Commit => {
-            let outcome = session.commit(StateType::Application, name).await?;
+            let outcome = {
+                let permit = session.permit().await;
+                session
+                    .commit(&permit, StateType::Application, name)
+                    .await?
+            };
             if outcome != expected_outcome(model.buffered) {
                 return Ok(false);
             }
@@ -992,11 +1008,16 @@ async fn failed_finalize_keeps_the_buffer_whole_for_retry() -> Result<()> {
     let session = scope.handle();
 
     session
-        .set(StateType::Application, &cart, &value_cell(), b"c1")
-        .await?;
+        .seed(StateType::Application, &cart, &value_cell(), Some(b"c1"))
+        .await;
     session
-        .set(StateType::Application, &wishlist, &value_cell(), b"w1")
-        .await?;
+        .seed(
+            StateType::Application,
+            &wishlist,
+            &value_cell(),
+            Some(b"w1"),
+        )
+        .await;
 
     assert!(
         session.finalize().await.is_err(),
@@ -1078,8 +1099,8 @@ async fn clears_only_session_boundary(a_committed: bool) -> Result<()> {
     let (b, b_dedup) = message(2);
     let session = fx.session(b).handle();
     session
-        .clear_section(StateType::Application, &fx.value_name, Section::new(0))
-        .await?;
+        .seed_section_clear(StateType::Application, &fx.value_name, Section::new(0))
+        .await;
     // The receipt is held across the raw probes below, then consumed.
     let Finalized::Staged(staged) = session.finalize().await? else {
         bail!("the clears-only event must stage");
@@ -1149,8 +1170,13 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
     let extra = cell_at(7);
 
     session
-        .set(StateType::Application, &fx.value_name, &value_cell(), b"v1")
-        .await?;
+        .seed(
+            StateType::Application,
+            &fx.value_name,
+            &value_cell(),
+            Some(b"v1"),
+        )
+        .await;
     // Attempt one's receipt is deliberately dropped — the discarded stage the
     // retry boundary pairs with `reset`.
     assert!(matches!(session.finalize().await?, Finalized::Staged(_)));
@@ -1162,11 +1188,16 @@ async fn retry_refinalize_overwrites_the_same_event_marker() -> Result<()> {
     // The retry stages a superset — the Value cell again plus one more cell —
     // so the rebuilt marker's coordinate list differs from attempt one's.
     session
-        .set(StateType::Application, &fx.value_name, &value_cell(), b"v2")
-        .await?;
+        .seed(
+            StateType::Application,
+            &fx.value_name,
+            &value_cell(),
+            Some(b"v2"),
+        )
+        .await;
     session
-        .set(StateType::Application, &fx.value_name, &extra, b"w")
-        .await?;
+        .seed(StateType::Application, &fx.value_name, &extra, Some(b"w"))
+        .await;
     let Finalized::Staged(staged) = session.finalize().await? else {
         bail!("the retry re-stage must mint a receipt");
     };
@@ -1506,12 +1537,12 @@ fn replay_dirty(ops: &[StageOp]) -> (HashMap<CellKey, DirtyVal>, HashSet<Section
 }
 
 /// Applies `ops` to `session` in order — the same sequence [`replay_dirty`]
-/// models. Generic over the session so both fixtures drive it.
-async fn apply_stage_ops<S: CellWrite>(
-    session: &S,
+/// models. Generic over the backend so both fixtures drive it.
+async fn apply_stage_ops<B: StateBackend>(
+    session: &KeyedStateSession<B, ()>,
     name: &StateName,
     ops: &[StageOp],
-) -> Result<()> {
+) {
     for op in ops {
         match *op {
             StageOp::Set {
@@ -1520,27 +1551,31 @@ async fn apply_stage_ops<S: CellWrite>(
                 byte,
             } => {
                 session
-                    .set(
+                    .seed(
                         StateType::Application,
                         name,
                         &cell_in(section as i8, coord),
-                        &[byte],
+                        Some(&[byte]),
                     )
-                    .await?;
+                    .await;
             }
             StageOp::Clear { section, coord } => {
                 session
-                    .clear(StateType::Application, name, &cell_in(section as i8, coord))
-                    .await?;
+                    .seed(
+                        StateType::Application,
+                        name,
+                        &cell_in(section as i8, coord),
+                        None,
+                    )
+                    .await;
             }
             StageOp::ClearSection { section } => {
                 session
-                    .clear_section(StateType::Application, name, Section::new(section as i8))
-                    .await?;
+                    .seed_section_clear(StateType::Application, name, Section::new(section as i8))
+                    .await;
             }
         }
     }
-    Ok(())
 }
 
 /// Every cell a set/clear op names (a section-clear names no cell).
@@ -1580,7 +1615,7 @@ impl Arbitrary for StagePop {
 /// query-count law plus the committed projection.
 async fn run_stage_query_counts(pop: StagePop) -> Result<()> {
     let fx = CountingFixture::new(pop.ru, "qc")?;
-    apply_stage_ops(&fx.session, &fx.name, &pop.ops).await?;
+    apply_stage_ops(&fx.session, &fx.name, &pop.ops).await;
 
     // The expected batch count, derived from the stage's dirty input.
     let expected_batches = fx.expected_batches();
@@ -1642,8 +1677,13 @@ async fn stage_query_count_section_size(n: usize, expected_batches: usize) -> Re
     let fx = CountingFixture::new(false, "qc")?;
     for c in 0..n {
         fx.session
-            .set(StateType::Application, &fx.name, &cell_in(0, c as u8), b"v")
-            .await?;
+            .seed(
+                StateType::Application,
+                &fx.name,
+                &cell_in(0, c as u8),
+                Some(b"v"),
+            )
+            .await;
     }
     fx.counting.reset();
     let finalized = fx.session.finalize().await?;
@@ -1675,13 +1715,18 @@ async fn stage_query_count_splits_per_section() -> Result<()> {
     let fx = CountingFixture::new(false, "qc")?;
     for c in 0..130u16 {
         fx.session
-            .set(StateType::Application, &fx.name, &cell_in(0, c as u8), b"v")
-            .await?;
+            .seed(
+                StateType::Application,
+                &fx.name,
+                &cell_in(0, c as u8),
+                Some(b"v"),
+            )
+            .await;
     }
     for c in 0..5u8 {
         fx.session
-            .set(StateType::Application, &fx.name, &cell_in(1, c), b"v")
-            .await?;
+            .seed(StateType::Application, &fx.name, &cell_in(1, c), Some(b"v"))
+            .await;
     }
     fx.counting.reset();
     let finalized = fx.session.finalize().await?;
@@ -1702,11 +1747,11 @@ async fn stage_query_count_splits_per_section() -> Result<()> {
 async fn stage_clears_only_issues_no_read() -> Result<()> {
     let fx = CountingFixture::new(false, "qc")?;
     fx.session
-        .clear_section(StateType::Application, &fx.name, Section::new(0))
-        .await?;
+        .seed_section_clear(StateType::Application, &fx.name, Section::new(0))
+        .await;
     fx.session
-        .clear(StateType::Application, &fx.name, &cell_in(0, 7))
-        .await?;
+        .seed(StateType::Application, &fx.name, &cell_in(0, 7), None)
+        .await;
     fx.counting.reset();
     let finalized = fx.session.finalize().await?;
     assert_eq!(
@@ -1732,11 +1777,11 @@ async fn stage_restores_distinct_bases_on_abort() -> Result<()> {
     let (event, dedup) = message(1);
     let session = fx.session(event).handle();
     session
-        .set(StateType::Application, &fx.value_name, &c0, b"A")
-        .await?;
+        .seed(StateType::Application, &fx.value_name, &c0, Some(b"A"))
+        .await;
     session
-        .set(StateType::Application, &fx.value_name, &c1, b"B")
-        .await?;
+        .seed(StateType::Application, &fx.value_name, &c1, Some(b"B"))
+        .await;
     let Finalized::Staged(staged) = session.finalize().await? else {
         bail!("the seeding event must stage");
     };
@@ -1747,11 +1792,11 @@ async fn stage_restores_distinct_bases_on_abort() -> Result<()> {
     let (event, _dedup) = message(2);
     let session = fx.session(event).handle();
     session
-        .set(StateType::Application, &fx.value_name, &c0, b"X")
-        .await?;
+        .seed(StateType::Application, &fx.value_name, &c0, Some(b"X"))
+        .await;
     session
-        .set(StateType::Application, &fx.value_name, &c1, b"Y")
-        .await?;
+        .seed(StateType::Application, &fx.value_name, &c1, Some(b"Y"))
+        .await;
     let Finalized::Staged(staged) = session.finalize().await? else {
         bail!("the overwriting event must stage");
     };
@@ -1875,25 +1920,24 @@ fn concrete_ops(ops: &[StageOp], next: &mut u8) -> Vec<ConcreteOp> {
 }
 
 /// Applies concrete ops to the session.
-async fn apply_concrete(session: &Session, name: &StateName, ops: &[ConcreteOp]) -> Result<()> {
+async fn apply_concrete(session: &Session, name: &StateName, ops: &[ConcreteOp]) {
     for op in ops {
         match op {
             ConcreteOp::Set(cell, byte) => {
                 session
-                    .set(StateType::Application, name, cell, &[*byte])
-                    .await?;
+                    .seed(StateType::Application, name, cell, Some(&[*byte]))
+                    .await;
             }
             ConcreteOp::Clear(cell) => {
-                session.clear(StateType::Application, name, cell).await?;
+                session.seed(StateType::Application, name, cell, None).await;
             }
             ConcreteOp::ClearSection(section) => {
                 session
-                    .clear_section(StateType::Application, name, *section)
-                    .await?;
+                    .seed_section_clear(StateType::Application, name, *section)
+                    .await;
             }
         }
     }
-    Ok(())
 }
 
 /// The event's net surviving `Set` cells and cleared sections (mirroring
@@ -1978,7 +2022,7 @@ async fn run_multi_section(trace: MultiTrace) -> Result<()> {
         {
             let scope = fx.session(event);
             let session = scope.handle();
-            apply_concrete(&session, &name, &concrete).await?;
+            apply_concrete(&session, &name, &concrete).await;
 
             match ev.outcome {
                 MultiOutcome::Commit { fail_promote } => {
@@ -2013,7 +2057,7 @@ async fn run_multi_section(trace: MultiTrace) -> Result<()> {
                 MultiOutcome::Retry => {
                     drop(session.finalize().await?);
                     session.discard_dirty();
-                    apply_concrete(&session, &name, &concrete).await?;
+                    apply_concrete(&session, &name, &concrete).await;
                     let finalized = session.finalize().await?;
                     fx.oracle.record_message(dedup).await?;
                     if let Finalized::Staged(staged) = finalized {

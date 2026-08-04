@@ -20,3 +20,5 @@ Thumbs.db
 .agents/
 docs/
 specs/
+.clients
+.codex

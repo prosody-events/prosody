@@ -2,23 +2,34 @@
 //! source.
 //!
 //! Selection picks the lowest-`SourceId` source that has data, and skips a
-//! source that errored on open. Data always beats a skipped error. If every
-//! source is empty the read is `None`/empty; if there is no data but some
-//! source errored, the read is `Err`. [`prop_probe_and_pin`] proves all of
-//! this together over random fault scripts, for both the point fan-out
-//! (`get`/`len`) and the pinned scan (`stream`).
+//! source that errored on open. Data always beats a skipped error. An
+//! all-empty source set reads `None` or empty. No data plus at least one
+//! source error reads `Err`. [`prop_probe_and_pin`] proves all of this
+//! together over random fault scripts, for both the point fan-out (`get` and
+//! `len`) and the pinned scan (`stream`).
 //!
-//! The focused tests below cover invariants the script model does not
-//! express: `get_many` batch error precedence, `get_many` single-source
-//! splicing, a mid-stream scan error after a source has pinned, and a
-//! source-call trace proving a pinned scan never opens the decoy source.
+//! The focused tests below cover invariants the script model does not express:
+//!
+//! * `get_many` batch error precedence;
+//! * the batch alignment check on the uncached read path;
+//! * `get_many` single-source splicing;
+//! * a mid-stream scan error after a source has pinned;
+//! * a source-call trace that proves a pinned scan never opens the decoy
+//!   source;
+//! * the overlap of two concurrent reads on one reader;
+//! * the session-wide reuse of one selection across scoped operations.
 
-use super::support::{FaultPoint, GROUP_A, GROUP_B, ScriptedEnv, collect_stream, topic};
+use super::support::{
+    FaultPoint, GROUP_A, GROUP_B, ScriptedEnv, collect_stream, source_state_key, topic,
+};
 use crate::Key;
 use crate::codec::JsonCodec;
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::state::ReadCachePolicy;
 use crate::state::cell_key::Direction;
-use crate::state::descriptor::{DequeDescriptor, deque_state, map_state};
+use crate::state::descriptor::{
+    DequeDescriptor, StateDescriptor, deque_state, map_state, value_state,
+};
 use crate::state::order_codec::I64KeyCodec;
 use crate::state_reader::backend::ScriptedReaderBackend;
 use crate::state_reader::{StateReader, StateReaderError};
@@ -28,6 +39,8 @@ use futures::executor::block_on;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use serde_json::Value;
 use std::iter::{empty, once};
+use std::time::Duration;
+use tokio::time::timeout;
 
 /// A deque length above the point-get ceiling, forcing the range-scan stream
 /// arm to be exercised.
@@ -153,10 +166,10 @@ fn selection(script: &FaultScript) -> Selection {
 /// holds for the point fan-out (`get`/`len`) and for the pinned scan,
 /// `stream` in both directions.
 ///
-/// FALSIFICATION: short-circuit `Err` at the first source in `ReadSession::get`
-/// (session.rs) instead of skipping. A `FaultOpen`-then-`Data` script then
-/// errors where data exists. Reverse the snapshot source order and a higher
-/// source pins instead, so the tagged value diverges.
+/// FALSIFICATION: short-circuit `Err` at the first source in
+/// `ReadSession::probe_point` instead of skipping. A `FaultOpen`-then-`Data`
+/// script then errors where data exists. Reverse the snapshot source order and
+/// a higher source pins instead, so the tagged value diverges.
 #[test]
 fn prop_probe_and_pin() {
     fn property(script: FaultScript) -> Result<bool> {
@@ -317,6 +330,43 @@ async fn get_many_error_beats_all_none() -> Result<()> {
     }
 }
 
+/// A contract-violating source answers a batch read with fewer values than
+/// the batch requested. The uncached batch path checks that alignment in
+/// every build, so the read fails instead of zipping the short buffer into a
+/// truncated, misaligned answer. `CommittedCellSource` is a downstream trait,
+/// so a debug assertion cannot hold this line in a release build.
+///
+/// Falsify: remove the length check from the uncached arm of `cached_batch`.
+/// `get_many` then answers a two-cell batch with one value.
+#[tokio::test]
+async fn short_batch_buffer_fails_the_uncached_read() -> Result<()> {
+    let env = ScriptedEnv::new(map_state::<I64KeyCodec, JsonCodec>("m-short-batch"))?;
+    let key = Key::from("user-1");
+    let tp_a = topic("topic-a");
+
+    env.commit(GROUP_A, tp_a, &key, 1, |h| async move {
+        h.set(0, Value::from("A0"))
+            .await
+            .map_err(|e| eyre!("set: {e}"))
+    })
+    .await?;
+    env.publish(GROUP_A, tp_a).await;
+    // Arm the fault after seeding: `commit` writes through the same source.
+    env.fault(GROUP_A, tp_a, &key, FaultPoint::ShortBatch)?;
+    let reader = env.reader_eager()?;
+
+    match reader.get_many(key, &[0, 1]).await {
+        Err(error) if error.classify_error() == ErrorCategory::Permanent => {
+            assert!(
+                error.to_string().contains("batch read returned 1 values"),
+                "expected the alignment error, got {error}"
+            );
+            Ok(())
+        }
+        other => bail!("expected a Permanent alignment error, got {other:?}"),
+    }
+}
+
 /// The lowest-ordered source with any `Some` answers the entire `get_many`
 /// batch. There is no per-cell splice from a different source. Source A
 /// (lowest) holds only key 0; source B holds only key 1. The batch resolves
@@ -418,6 +468,123 @@ async fn scan_reads_only_pinned_source() -> Result<()> {
         env.cells.reads(segment_b),
         0,
         "source B (decoy) was never opened"
+    );
+    Ok(())
+}
+
+/// Two reads on one reader overlap: they drive cell I/O concurrently, sharing
+/// no admission.
+///
+/// The source holds every committed point read at a two-party meeting point,
+/// so both reads must arrive before either returns. Serializing them would
+/// park the first there forever; the deadline is only the hang guard, and the
+/// rendezvous is the assertion. The read cache is disabled so its same-key
+/// single-flight cannot collapse the two reads into one.
+///
+/// Falsify: route both reads through one shared admission — take a single
+/// session-wide permit around the read instead of building an independent
+/// session per operation. The second read then never reaches the meeting
+/// point and the deadline fires.
+#[tokio::test]
+async fn concurrent_reads_on_one_reader_overlap() -> Result<()> {
+    let mut env = ScriptedEnv::new(
+        value_state::<JsonCodec>("probe-concurrent").read_cache(ReadCachePolicy::Disabled),
+    )?;
+    env.cells.rendezvous(2);
+    let key = Key::from("user-1");
+    let tp = topic(GROUP_A);
+    env.commit(GROUP_A, tp, &key, 1, |handle| async move {
+        handle
+            .set(Value::from(7_i64))
+            .await
+            .map_err(|e| eyre!("set: {e}"))?;
+        Ok(())
+    })
+    .await?;
+    env.publish(GROUP_A, tp).await;
+    let reader = env.reader_eager()?;
+
+    let both = timeout(Duration::from_secs(30), async {
+        tokio::join!(reader.get(key.clone()), reader.get(key.clone()))
+    })
+    .await
+    .map_err(|_| eyre!("the two reads never met: they did not overlap"))?;
+
+    assert_eq!(
+        both.0.map_err(|e| eyre!("first read: {e}"))?,
+        Some(Value::from(7_i64)),
+        "the first concurrent read"
+    );
+    assert_eq!(
+        both.1.map_err(|e| eyre!("second read: {e}"))?,
+        Some(Value::from(7_i64)),
+        "the second concurrent read"
+    );
+    Ok(())
+}
+
+/// One session selects its source once. The first scoped operation probes for
+/// a source and publishes its selection onto the session; every later
+/// operation on that session seeds from that selection and addresses it
+/// directly, so no source below it is probed again.
+///
+/// The lowest source is published but holds nothing, which is what makes the
+/// re-probe observable: the probe must read it (and get `None`) before
+/// reaching the source that answers, so a second probe shows up as a second
+/// read of the empty source.
+///
+/// Falsify: have the reader engine start each invocation unselected, or stop
+/// publishing the first selection back to the session. The second `get` then
+/// re-probes and the empty source's read count rises to two.
+#[tokio::test]
+async fn one_session_selects_its_source_once() -> Result<()> {
+    /// Sorts below [`GROUP_A`], so this source is probed first.
+    const EMPTY_GROUP: &str = "group-000";
+
+    let env = ScriptedEnv::new(
+        value_state::<JsonCodec>("probe-select").read_cache(ReadCachePolicy::Disabled),
+    )?;
+    let key = Key::from("user-1");
+    let tp_empty = topic("topic-empty");
+    let tp_a = topic("topic-a");
+
+    let empty = source_state_key(tp_empty, EMPTY_GROUP, &key, env.count)?.segment_id;
+    env.publish(EMPTY_GROUP, tp_empty).await;
+    let answering = env
+        .commit(GROUP_A, tp_a, &key, 1, |handle| async move {
+            handle
+                .set(Value::from("A"))
+                .await
+                .map_err(|e| eyre!("set: {e}"))
+        })
+        .await?
+        .segment_id;
+    env.publish(GROUP_A, tp_a).await;
+
+    let reader = env.reader_eager()?;
+    let session = reader.session(key).await?;
+    let handle = env.descriptor.bind(&session)?;
+
+    assert_eq!(
+        handle.get().await.map_err(|e| eyre!("first read: {e}"))?,
+        Some(Value::from("A")),
+        "the first source with data answers the first read"
+    );
+    assert_eq!(
+        (env.cells.reads(empty), env.cells.reads(answering)),
+        (1, 1),
+        "the probe read the empty source, then the one that answered"
+    );
+
+    assert_eq!(
+        handle.get().await.map_err(|e| eyre!("second read: {e}"))?,
+        Some(Value::from("A")),
+        "the selected source answers the second read"
+    );
+    assert_eq!(
+        (env.cells.reads(empty), env.cells.reads(answering)),
+        (1, 2),
+        "the second read addressed the selection without probing again"
     );
     Ok(())
 }

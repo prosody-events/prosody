@@ -895,14 +895,13 @@ mod hook_visibility {
     use crate::consumer::middleware::tests::test_support::TestLifecycleAccess;
     use crate::consumer::partition::ShutdownPhase;
     use crate::loader::MemoryLoader;
+    use crate::state::collection::sealed::{ReadEngine, Session};
     use crate::state::descriptor::value_state;
     use crate::state::dirty::DirtyStore;
     use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
     use crate::state::oracle::CommitOracle;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-    use crate::state::session::{
-        CellRead, CellWrite, KeyedStateSession, SessionParts, TerminationWatch,
-    };
+    use crate::state::session::{KeyedStateSession, SessionParts, TerminationWatch};
     use crate::state::store::CellStore;
     use crate::state::tests::cell_suite::{FailingCellStore, value_cell};
     use crate::state::{
@@ -954,15 +953,25 @@ mod hook_visibility {
         where
             C: EventContext,
         {
+            type Engine<S> = <S as Session>::Engine;
             let mut values = Vec::with_capacity(self.names.len());
             match context.test_lifecycle() {
                 Ok(session) => {
+                    // One raw point read per probed collection, through the
+                    // session's own engine — the same command a user hook's
+                    // typed handle runs, minus the decode.
+                    let mut inner = Engine::<C::State>::begin_read(&session).await;
                     for name in &self.names {
                         values.push(
-                            session
-                                .get(StateType::Application, name, &value_cell())
-                                .await
-                                .map_err(|e| e.to_string()),
+                            Engine::<C::State>::read_point(
+                                &session,
+                                &mut inner,
+                                StateType::Application,
+                                name,
+                                &value_cell(),
+                            )
+                            .await
+                            .map_err(|e| e.to_string()),
                         );
                     }
                 }
@@ -1152,8 +1161,13 @@ mod hook_visibility {
                 publisher: None,
             });
         session
-            .set(StateType::Application, &cart, &value_cell(), b"staged")
-            .await?;
+            .seed(
+                StateType::Application,
+                &cart,
+                &value_cell(),
+                Some(b"staged"),
+            )
+            .await;
         let context = base.with_session(session);
 
         let handler = HookProbe::new(vec![cart]);
@@ -1245,11 +1259,16 @@ mod hook_visibility {
                 publisher: None,
             });
         session
-            .set(StateType::Application, &cart, &value_cell(), b"A1")
-            .await?;
+            .seed(StateType::Application, &cart, &value_cell(), Some(b"A1"))
+            .await;
         session
-            .set(StateType::Application, &wishlist, &value_cell(), b"B1")
-            .await?;
+            .seed(
+                StateType::Application,
+                &wishlist,
+                &value_cell(),
+                Some(b"B1"),
+            )
+            .await;
         let context = MockEventContext::new().with_session(session);
 
         let handler = HookProbe::new(vec![cart, wishlist]);

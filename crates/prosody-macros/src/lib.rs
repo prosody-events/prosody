@@ -1,0 +1,115 @@
+//! Framework-internal procedural macros for prosody's keyed-state collection
+//! authors.
+//!
+//! Two entry points, both generating `crate::state::collection::…` paths, so
+//! they expand correctly only inside `prosody` itself:
+//!
+//! - [`collection_layout!`] declares a collection kind's durable section
+//!   layout: one explicitly numbered field per cell family. It emits the
+//!   zero-sized kind type, its family tokens, and the generated layout
+//!   descriptor the frozen-layout tests pin.
+//! - [`collection_methods`] rewrites the marked methods of one handle `impl`
+//!   block so each public invocation runs as exactly one scoped collection
+//!   operation.
+//!
+//! Diagnostics are part of the interface: every rejection is a `syn::Error`
+//! spanned at the smallest responsible token and states the correction.
+
+use proc_macro::TokenStream;
+use syn::Error;
+
+mod layout;
+mod methods;
+mod selfban;
+
+#[cfg(test)]
+mod tests;
+
+/// Accumulates independent rejections into one diagnostic, so a malformed
+/// declaration reports every mistake instead of one per rebuild.
+pub(crate) fn combine(slot: &mut Option<Error>, error: Error) {
+    match slot {
+        Some(accumulated) => accumulated.combine(error),
+        None => *slot = Some(error),
+    }
+}
+
+/// Declares one collection kind's durable layout.
+///
+/// ```ignore
+/// collection_layout! {
+///     /// A two-family collection.
+///     #[reserved_ids(2)]
+///     pub struct QueueKind<T> {
+///         #[id(0)]
+///         BOUNDS: BoundsCell,
+///         #[id(1)]
+///         ITEMS: T,
+///     }
+/// }
+/// ```
+///
+/// Every field needs an explicit protobuf-style `#[id(n)]` in `0..=127`, and a
+/// removed field reserves its number through `#[reserved_ids(…)]`. What those
+/// ids guarantee, and why one may never change, is documented on the
+/// `CollectionLayout` trait they implement; a malformed one is rejected here,
+/// spanned at the token that owns the mistake.
+///
+/// The expansion is the kind type itself (zero-sized), one `CellFamily`
+/// associated constant per field, the `CollectionLayout` implementation
+/// carrying the canonical section set (`SECTIONS`), the layout descriptor
+/// (`DESCRIPTOR`) and the reserved ids (`RESERVED`), and the marker that seals
+/// `CollectionSpec`.
+#[proc_macro]
+pub fn collection_layout(input: TokenStream) -> TokenStream {
+    layout::expand(input.into())
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+/// Rewrites one collection handle `impl` block so each marked method runs as
+/// exactly one scoped operation.
+///
+/// ```ignore
+/// #[collection_methods(field = cells, session = S)]
+/// impl<S, T> QueueHandle<S, T>
+/// where
+///     S: StateSession,
+///     T: CellType<Key = QueueIndex>,
+/// {
+///     #[read(op)]
+///     pub async fn front(&self) -> Result<Option<ResolvedOf<T>>, QueueError> {
+///         Ok(op.get(QueueKind::<T>::ITEMS, &0).await?)
+///     }
+/// }
+/// ```
+///
+/// `field` names the handle field that holds the bound collection.
+///
+/// `session` names the impl's session type parameter. The macro needs it to
+/// attach the write and resolver bounds. Naming it is deliberate rather than
+/// inferred from the field's type tokens: an alias, a same-named foreign
+/// trait, or a multi-parameter impl all defeat token inference.
+///
+/// - `#[read(op)]` wraps the body in one read scope;
+/// - `#[write(op)]` wraps it in one write scope and adds a method-local
+///   writable-session bound;
+/// - unmarked methods are copied through untouched.
+///
+/// A marked method is `async`: admission is acquired once per invocation.
+///
+/// The written method stays the public method: visibility, name, receiver,
+/// arguments, return type, generics, `where` clauses, rustdoc, and tracing
+/// attributes are preserved verbatim with their source spans. A resolver
+/// context bound is added for every type the method resolves, detected by the
+/// name `ResolvedOf` in the written return type; when that type is aliased or
+/// constructed elsewhere, name it explicitly with `#[read(op, resolve(T))]`.
+///
+/// A marked body may not name `self`: recursive acquisition of the admission
+/// the body already holds is made unexpressible rather than checked at
+/// runtime. Stateful helpers take `&mut impl CollectionRead` or
+/// `&mut impl CollectionWrite` instead.
+#[proc_macro_attribute]
+pub fn collection_methods(args: TokenStream, item: TokenStream) -> TokenStream {
+    methods::expand(args.into(), item.into()).into()
+}

@@ -9,17 +9,16 @@ use crate::loader::MemoryLoader;
 use crate::state::access::StateAccessError;
 use crate::state::cell::{Committed, ProvisionalCell, ProvisionalWrite};
 use crate::state::cell_key::{CellKey, Coordinate, Scan, Section};
+use crate::state::collection::{MutationJournal, StateSession, WritableStateSession, sealed};
 use crate::state::descriptor::{CellResolver, StructuralIdentity};
 use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::memory::MemoryPublicationStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells};
 use crate::state::oracle::CommitOracle;
 use crate::state::publication::{PublicationRows, PublicationStore, StatePublication};
-use crate::state::registry::DEFAULT_KEYSET_LIMIT;
-use crate::state::session::sealed::{MarkerIdentity, ReadAdmission, StateLifecycle};
-use crate::state::session::{
-    CellRead, CellWrite, Finalized, MessageMarker, MutatePermit, OpPermit, SessionGate,
-};
+use crate::state::registry::CollectionDef;
+use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
+use crate::state::session::{Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::{
     CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, provisional_point_loop,
 };
@@ -39,7 +38,7 @@ use serde_json::Value;
 use std::convert::Infallible;
 use std::fmt;
 use std::future::{Future, ready};
-use std::num::NonZeroUsize;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use thiserror::Error;
@@ -53,7 +52,7 @@ mod ttl;
 
 pub(crate) use counting::{CountingCellStore, CountingResolver, ResolveCounter};
 pub(crate) use holding::{HoldingCellStore, Holds};
-pub(crate) use publication::{PublicationCall, ScriptedPublicationStore};
+pub(crate) use publication::{ParkedRead, PublicationCall, ScriptedPublicationStore};
 pub(crate) use ttl::TtlStub;
 
 /// Get-out-of-the-way commit oracle: `record_message` is a no-op and every
@@ -159,61 +158,41 @@ impl<P> fmt::Debug for UnavailableState<P> {
     }
 }
 
-impl<P> ReadAdmission for UnavailableState<P>
-where
-    P: Clone + Send + Sync + 'static,
-{
-    type Permit<'s>
-        = OpPermit<'s>
-    where
-        Self: 's;
+/// The stateless stub's engine. Every command is unreachable by construction:
+/// `verify_registration` refuses before any operation can open over the stub.
+///
+/// `pub` for the same reason `OwnerEngine` is: it is the value of the sealed
+/// `Session::Engine` associated type. The test module's own visibility is the
+/// seal.
+pub struct UnavailableEngine;
 
-    async fn permit(&self) -> OpPermit<'_> {
-        self.gate.read().await
-    }
+/// The stub's write state. `begin_write` always refuses, so one is never built;
+/// the type is uninhabited, so it cannot be built any other way either.
+pub enum NoWrite {}
 
-    fn attempt_current(&self) -> bool {
-        // Inert: every op errors `Unavailable` before the pin is consulted.
-        true
+impl Deref for NoWrite {
+    type Target = ();
+
+    fn deref(&self) -> &() {
+        match *self {}
     }
 }
 
-impl<P> CellRead for UnavailableState<P>
+impl DerefMut for NoWrite {
+    fn deref_mut(&mut self) -> &mut () {
+        match *self {}
+    }
+}
+
+impl<P> sealed::ReadEngine<UnavailableState<P>> for UnavailableEngine
 where
     P: Clone + Send + Sync + 'static,
 {
-    type Loader = MemoryLoader<P>;
+    type Plan = ();
+    type ReadInner<'a> = ();
 
-    fn loader(&self) -> &Self::Loader {
-        &self.loader
-    }
-
-    fn is_terminated(&self) -> bool {
-        true
-    }
-
-    fn collection_has_ttl(&self, _state_type: StateType, _name: &StateName) -> bool {
-        false
-    }
-
-    fn collection_keyset_limit(&self, _state_type: StateType, _name: &StateName) -> usize {
-        // Unreachable in practice: every op on this stub errors `Unavailable`
-        // first. The default keeps the trait total.
-        DEFAULT_KEYSET_LIMIT
-    }
-
-    fn collection_capacity(
-        &self,
-        _state_type: StateType,
-        _name: &StateName,
-    ) -> Option<NonZeroUsize> {
-        // Unreachable in practice (see `collection_keyset_limit`); unbounded
-        // keeps the trait total.
-        None
-    }
-
-    fn verify_state_registration(
-        &self,
+    fn verify_registration(
+        _session: &UnavailableState<P>,
         _name: &'static str,
         _state_type: StateType,
         _identity: &StructuralIdentity,
@@ -221,8 +200,21 @@ where
         Err(StateAccessError::Unavailable)
     }
 
-    async fn get(
-        &self,
+    fn collection_def(
+        _session: &UnavailableState<P>,
+        _state_type: StateType,
+        _name: &StateName,
+    ) -> CollectionDef {
+        // Unreachable: a bind against the stub refuses first. `CollectionDef`'s
+        // own defaults keep the engine total.
+        CollectionDef::new(None)
+    }
+
+    async fn begin_read(_session: &UnavailableState<P>) {}
+
+    async fn read_point(
+        _session: &UnavailableState<P>,
+        _inner: &mut Self::ReadInner<'_>,
         _state_type: StateType,
         _name: &StateName,
         _cell: &CellKey,
@@ -230,8 +222,9 @@ where
         Err(StateAccessError::Unavailable)
     }
 
-    async fn get_many(
-        &self,
+    async fn read_batch(
+        _session: &UnavailableState<P>,
+        _inner: &mut Self::ReadInner<'_>,
         _state_type: StateType,
         _name: &StateName,
         _section: Section,
@@ -240,72 +233,90 @@ where
         Err(StateAccessError::Unavailable)
     }
 
-    fn scan<'a>(
-        &'a self,
+    fn capture((): &()) {}
+
+    async fn resume(_session: &UnavailableState<P>, (): &()) {}
+
+    fn page<'a>(
+        _session: &'a UnavailableState<P>,
+        (): &'a (),
         _state_type: StateType,
         _name: &'a StateName,
         _scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
         stream::once(async { Err(StateAccessError::Unavailable) })
     }
+
+    fn fence(_session: &UnavailableState<P>) -> Result<(), StateAccessError> {
+        Ok(())
+    }
 }
 
-impl<P> CellWrite for UnavailableState<P>
+impl<P> sealed::WriteEngine<UnavailableState<P>> for UnavailableEngine
 where
     P: Clone + Send + Sync + 'static,
 {
-    type MutatePermit<'s>
-        = MutatePermit<'s>
-    where
-        Self: 's;
+    type WriteInner<'a> = NoWrite;
 
-    async fn mutate_permit(&self) -> Result<MutatePermit<'_>, StateAccessError> {
-        // Inert stub: every op fails with `Unavailable` first, so this never
-        // returns a witness.
+    async fn begin_write(_session: &UnavailableState<P>) -> Result<NoWrite, StateAccessError> {
         Err(StateAccessError::Unavailable)
     }
 
-    async fn set(
-        &self,
-        _state_type: StateType,
-        _name: &StateName,
-        _cell: &CellKey,
-        _value: &[u8],
+    fn validate_write(
+        _session: &UnavailableState<P>,
+        _inner: &NoWrite,
     ) -> Result<(), StateAccessError> {
         Err(StateAccessError::Unavailable)
     }
 
-    async fn clear(
-        &self,
+    fn apply(
+        _session: &UnavailableState<P>,
         _state_type: StateType,
         _name: &StateName,
-        _cell: &CellKey,
-    ) -> Result<(), StateAccessError> {
-        Err(StateAccessError::Unavailable)
-    }
-
-    async fn clear_section(
-        &self,
-        _state_type: StateType,
-        _name: &StateName,
-        _section: Section,
-    ) -> Result<(), StateAccessError> {
-        Err(StateAccessError::Unavailable)
+        _inner: &NoWrite,
+        _journal: MutationJournal,
+    ) {
     }
 
     async fn commit(
-        &self,
+        _session: &UnavailableState<P>,
         _state_type: StateType,
         _name: &StateName,
     ) -> Result<StoreOutcome, StateAccessError> {
         Err(StateAccessError::Unavailable)
     }
 
-    async fn rollback(&self, _state_type: StateType, _name: &StateName) -> StoreOutcome {
+    async fn rollback(
+        _session: &UnavailableState<P>,
+        _state_type: StateType,
+        _name: &StateName,
+    ) -> StoreOutcome {
         // Stateless: nothing is ever buffered, so the discard is a NoOp.
         StoreOutcome::NoOp
     }
 }
+
+impl<P> sealed::Session for UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
+    type Engine = UnavailableEngine;
+}
+
+impl<P> sealed::WritableSession for UnavailableState<P> where P: Clone + Send + Sync + 'static {}
+
+impl<P> StateSession for UnavailableState<P>
+where
+    P: Clone + Send + Sync + 'static,
+{
+    type Loader = MemoryLoader<P>;
+
+    fn loader(&self) -> &MemoryLoader<P> {
+        &self.loader
+    }
+}
+
+impl<P> WritableStateSession for UnavailableState<P> where P: Clone + Send + Sync + 'static {}
 
 impl<P> StateLifecycle for UnavailableState<P>
 where

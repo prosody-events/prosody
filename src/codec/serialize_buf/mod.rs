@@ -1,10 +1,12 @@
 //! Pooled, thread-local serialize buffer.
 //!
-//! Hot serialize paths (the Kafka producer's record encoding, the keyed-state
-//! `CellView::set` cell encoding) borrow a reusable `Vec<u8>` instead of
-//! allocating a fresh one per call. [`SerializeBufGuard::acquire`] takes the
-//! per-thread buffer; on drop the guard clears it and returns it, keeping the
-//! larger of the two capacities so steady-state encoding stops allocating.
+//! A hot serialize path borrows a reusable `Vec<u8>` instead of a fresh
+//! allocation per call. The Kafka producer's record encoding and the cell
+//! encoding of a collection's `set` command are two such paths.
+//!
+//! [`SerializeBufGuard::acquire`] takes the per-thread buffer. On drop the
+//! guard clears the buffer and returns it. The guard keeps the larger of the
+//! two capacities, so steady-state encoding stops allocation.
 
 use std::cell::RefCell;
 use std::mem::take;

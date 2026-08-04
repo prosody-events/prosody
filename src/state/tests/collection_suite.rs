@@ -34,6 +34,7 @@ use super::support::assert_no_settlement_residue;
 use crate::codec::{Codec, JsonCodec};
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
+use crate::state::collection::StateSession;
 use crate::state::descriptor::map::{entry_cell_for, keyset_cell};
 use crate::state::descriptor::{
     DequeHandle, MapHandle, StateDescriptor, deque, deque_state, map_state,
@@ -46,10 +47,8 @@ use crate::state::order_codec::{I64KeyCodec, OrderedKeyCodec};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::resolve::sweep_provisional;
 use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
-use crate::state::session::{
-    CellRead, Finalized, KeyedStateSession, SessionParts, TerminationWatch,
-};
-use crate::state::store::CellStore;
+use crate::state::session::{Finalized, KeyedStateSession, SessionParts, TerminationWatch};
+use crate::state::store::{CELL_BATCH, CellStore};
 use crate::state::{
     CollectionId, CollectionRef, CommitMode, Direction, EventRef, PartitionBackend, StateKey,
     StateName, StateType,
@@ -904,8 +903,10 @@ const GET_MANY_POPULATE_KEYS: u8 = 20;
 /// the absent-key path.
 const GET_MANY_QUERY_LO: i64 = -4;
 const GET_MANY_QUERY_HI: i64 = 24;
-/// Max query-list length — `> CELL_BATCH` so multi-sub-batch calls occur often.
-const GET_MANY_MAX_QUERIES: usize = 40;
+/// Max query-list length. Derived from [`CELL_BATCH`] rather than hand-numbered
+/// so the "spans more than one sub-batch" claim below cannot rot when the store
+/// batch width moves.
+const GET_MANY_MAX_QUERIES: usize = CELL_BATCH + 32;
 
 /// A random map population plus a random query list for the `Map::get_many`
 /// parity property. The independent pools guarantee absent keys; a small query
@@ -1417,7 +1418,7 @@ fn assert_keyset_present(
 /// endpoint peeks (`peek_front == get(0)`, `peek_back == get(len-1)`).
 async fn assert_deque<S, C>(handle: &DequeHandle<S, C>, model: &VecDeque<Value>) -> Result<bool>
 where
-    S: CellRead,
+    S: StateSession,
     C: Codec<Payload = Value>,
 {
     if handle.len().await? != model.len() || handle.is_empty().await? != model.is_empty() {
@@ -1447,7 +1448,7 @@ where
 /// `len` is separately pinned to the model at every call site.
 async fn assert_peeks<S, C>(handle: &DequeHandle<S, C>) -> Result<bool>
 where
-    S: CellRead,
+    S: StateSession,
     C: Codec<Payload = Value>,
 {
     if handle.peek_front().await? != handle.get(0).await? {
@@ -1478,7 +1479,7 @@ where
 /// Collects a deque handle's `stream(dir)` into a vector.
 async fn collect_deque<S, C>(handle: &DequeHandle<S, C>, dir: Direction) -> Result<Vec<Value>>
 where
-    S: CellRead,
+    S: StateSession,
     C: Codec<Payload = Value>,
 {
     drain(handle.stream(dir)).await
@@ -1492,7 +1493,7 @@ async fn assert_map<S>(
     model: &BTreeMap<i64, Value>,
 ) -> Result<bool>
 where
-    S: CellRead,
+    S: StateSession,
 {
     for key in KEY_POOL {
         let got = handle.get(&key).await?;
@@ -1527,7 +1528,7 @@ async fn collect_map<S>(
     dir: Direction,
 ) -> Result<Vec<(i64, Value)>>
 where
-    S: CellRead,
+    S: StateSession,
 {
     drain(handle.stream(dir)).await
 }
@@ -1538,7 +1539,7 @@ async fn collect_map_keys<S>(
     dir: Direction,
 ) -> Result<Vec<i64>>
 where
-    S: CellRead,
+    S: StateSession,
 {
     drain(handle.keys(dir)).await
 }
@@ -1991,13 +1992,21 @@ fn deque_push_on_an_over_wide_window_succeeds() -> Result<()> {
     Ok(())
 }
 
-/// Map clear, pinned at the physical grain the `BTreeMap` model cannot reach: a
-/// committed `clear()` erases the keyset cell with the entries, so the
-/// absent-keyset ⇒ empty-map reading (`KeysetPresence`) survives a cleared map,
-/// and a later set repopulates a fresh single-key `Tracked` keyset (clear
-/// resets the tracking, not just the entries — not a stale pre-clear list).
+/// Map clear, pinned at the physical grain the `BTreeMap` model cannot reach. A
+/// committed `clear()` erases the keyset cell with the entries. The
+/// absent-keyset ⇒ empty-map reading (`KeysetPresence`) therefore survives a
+/// cleared map. A later set repopulates a fresh single-key `Tracked` keyset:
+/// clear resets the tracking, not just the entries, so no stale pre-clear list
+/// remains.
+///
+/// It also pins the reset's **scope**. Directly-seeded cells at BOTH retired
+/// meta coordinates `[0]` and `[1]` are erased too. Those are legacy rows from
+/// the removed min/max bounds design, and no handle method reaches them.
+/// `clear()` erases them because it is one whole-layout reset over the declared
+/// sections, not a point clear of the keyset cell.
 #[test]
 fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
+    use crate::state::cell_key::{CellKey, Coordinate};
     use futures::executor::block_on;
 
     let oracle = ScriptedOracle::default();
@@ -2022,8 +2031,22 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
         Ok::<_, color_eyre::Report>(())
     })?;
 
-    // Event 2: committed clear — stages the entries' section clear plus the
-    // Cleared keyset cell.
+    // Legacy artifacts at BOTH retired meta coordinates, seeded straight
+    // through the store because no handle method can address them.
+    let legacy: Vec<CellKey> = [0u8, 1]
+        .into_iter()
+        .map(|byte| CellKey {
+            section: keyset_cell().section,
+            coordinate: Coordinate::from_bytes(vec![byte]),
+        })
+        .collect();
+    let seeded: Vec<_> = legacy
+        .iter()
+        .map(|cell| (cell.clone(), Some(bytes::Bytes::from_static(&[0xAB]))))
+        .collect();
+    block_on(store.write_resolved(&collection_ref, &seeded, &[]))?;
+
+    // Event 2: committed clear — one whole-layout reset over both sections.
     let event2 = EventRef::Message {
         dedup_id: Uuid::from_u128(2),
     };
@@ -2039,6 +2062,13 @@ fn map_clear_erases_keyset_and_repopulates() -> Result<()> {
         None,
         "the committed clear must erase the keyset cell"
     );
+    for cell in &legacy {
+        assert_eq!(
+            block_on(store.get(id, cell, read_event(0)))?.into_inner(),
+            None,
+            "the whole-layout reset must erase every retired meta coordinate too"
+        );
+    }
 
     // Event 3: one committed set repopulates a fresh single-key Tracked keyset
     // (keyset absent after clear ⇒ the empty map ⇒ a fresh singleton, not a
@@ -2762,10 +2792,11 @@ fn check_map_yield(
 /// before any mutator runs, so a yielded key must be a seed key and its value
 /// one held there at some point (values are read live, chunk by chunk). Every
 /// op is bounded by [`INTERLEAVE_HANG_GUARD`] — the only deadline, never the
-/// assertion. FALSIFICATION: hold the permit across the yield by returning it
-/// in the unfold state (`Some((chunk, permit, keys))`) so it lives into the
-/// forwarding loop → the first mutator after an `Advance` blocks on the gate
-/// the suspended generator holds → the hang-guard elapses → red.
+/// assertion. FALSIFICATION: hold the chunk's admission across the yield by
+/// returning it in `CoordinatePlan`'s unfold state (`Some((entries, inner,
+/// keys))`) so it lives into the forwarding loop → the first mutator after an
+/// `Advance` blocks on the gate the suspended generator holds → the hang-guard
+/// elapses → red.
 pub(crate) async fn run_map_stream_interleave(input: MapInterleave) -> Result<bool> {
     let MapInterleave { steps, backward } = input;
     let dir = if backward {

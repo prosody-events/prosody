@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Barrier;
 
 /// [`publish_source`](super::publish_source) against the scripted control-plane
 /// stores, freezing an identity that matches `descriptor`.
@@ -83,6 +84,10 @@ pub(in crate::state_reader::tests) enum FaultPoint {
     AtOpen,
     /// Yield `n` present cells, then error (scan only).
     AfterYields(usize),
+    /// Drop the last value from the returned buffer (batch read only). It
+    /// models a downstream `CommittedCellSource` that breaks the index
+    /// alignment its contract promises.
+    ShortBatch,
 }
 
 /// A committed cell source that can fault deterministically per source. It
@@ -97,6 +102,11 @@ pub(crate) struct ScriptedCellSource {
     /// shares it, so a test reads the count after moving the source into a
     /// bundle.
     reads: Arc<scc::HashMap<SegmentId, usize, RandomState>>,
+    /// A meeting point at the committed point read: when installed, every
+    /// arriving read waits there until the configured number of readers has
+    /// arrived. It is how a concurrency test proves overlap without a clock —
+    /// if the reads serialize, the first one never leaves the meeting point.
+    rendezvous: Option<Arc<Barrier>>,
 }
 
 impl ScriptedCellSource {
@@ -107,6 +117,19 @@ impl ScriptedCellSource {
     /// The backing cells, for the owner harness to seed committed values into.
     pub(in crate::state_reader::tests) fn cells(&self) -> MemoryCells {
         self.inner.clone()
+    }
+
+    /// Installs a meeting point that `parties` concurrent committed point
+    /// reads must all reach before any of them returns.
+    pub(in crate::state_reader::tests) fn rendezvous(&mut self, parties: usize) {
+        self.rendezvous = Some(Arc::new(Barrier::new(parties)));
+    }
+
+    /// Waits at the installed meeting point, if any.
+    pub(crate) async fn meet(&self) {
+        if let Some(barrier) = &self.rendezvous {
+            barrier.wait().await;
+        }
     }
 
     /// Arms a fault for the source addressed by `segment`.
@@ -158,10 +181,15 @@ impl ScriptedCellSource {
     ) -> Result<CellBuffer<Option<Bytes>>, StateAccessError> {
         let segment = id.state_key().segment_id;
         self.record_read(segment);
-        if matches!(self.fault_of(segment), Some(FaultPoint::AtOpen)) {
+        let fault = self.fault_of(segment);
+        if matches!(fault, Some(FaultPoint::AtOpen)) {
             return Err(StateAccessError::store(&ScriptedFaultError));
         }
-        Ok(self.inner.read_committed_many(id, section, batch))
+        let mut buffer = self.inner.read_committed_many(id, section, batch);
+        if matches!(fault, Some(FaultPoint::ShortBatch)) {
+            buffer.pop();
+        }
+        Ok(buffer)
     }
 
     pub(crate) fn scan_committed<'a>(
@@ -274,6 +302,9 @@ impl DescriptorIdentityStore for CountingIdentityStore {
         self.inner.register_identity(group_id, row).await
     }
 }
+
+/// A reader over one scripted env's stores.
+type ScriptedReader<D> = StateReader<D, JsonCodec, ScriptedReaderBackend>;
 
 /// A scripted bundle: the fault source over its own backing cells, plus the
 /// scripted publication store and counting identity store the refresh/probe
@@ -401,9 +432,7 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
     }
 
     /// An eager reader (refreshes every operation) on a wall-clock cache.
-    pub(in crate::state_reader::tests) fn reader_eager(
-        &self,
-    ) -> Result<StateReader<D, JsonCodec, ScriptedReaderBackend>> {
+    pub(in crate::state_reader::tests) fn reader_eager(&self) -> Result<ScriptedReader<D>> {
         self.reader_eager_with_cache(ReaderCache::with_budget(1 << 20))
     }
 
@@ -412,7 +441,7 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
     pub(in crate::state_reader::tests) fn reader_eager_with_cache(
         &self,
         cache: ReaderCache,
-    ) -> Result<StateReader<D, JsonCodec, ScriptedReaderBackend>> {
+    ) -> Result<ScriptedReader<D>> {
         let deps = self.deps_with_cache(cache);
         StateReader::new_eager(&deps, self.sub.clone(), self.descriptor)
             .map_err(|e| eyre!("reader: {e}"))
@@ -425,7 +454,7 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
         &self,
         cache: ReaderCache,
         refresh_interval: Duration,
-    ) -> Result<StateReader<D, JsonCodec, ScriptedReaderBackend>> {
+    ) -> Result<ScriptedReader<D>> {
         let deps = self.deps_with_cache(cache);
         StateReader::with_refresh_interval(
             &deps,
@@ -434,5 +463,26 @@ impl<D: StateDescriptor> ScriptedEnv<D> {
             refresh_interval,
         )
         .map_err(|e| eyre!("reader: {e}"))
+    }
+
+    /// Two readers over one dependency bundle. Both resolve the same
+    /// publication-cache key, so they share one collection snapshot: that is
+    /// what lets a schedule race two callers against one generation.
+    pub(in crate::state_reader::tests) fn shared_readers(
+        &self,
+        cache: ReaderCache,
+        refresh_interval: Duration,
+    ) -> Result<(ScriptedReader<D>, ScriptedReader<D>)> {
+        let deps = self.deps_with_cache(cache);
+        let build = || {
+            StateReader::with_refresh_interval(
+                &deps,
+                self.sub.clone(),
+                self.descriptor,
+                refresh_interval,
+            )
+            .map_err(|e| eyre!("reader: {e}"))
+        };
+        Ok((build()?, build()?))
     }
 }

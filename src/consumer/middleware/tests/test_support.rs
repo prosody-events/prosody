@@ -34,7 +34,7 @@ use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentit
 use crate::state::oracle::CommitOracle;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state::session::{
-    CellWrite, KeyedStateSession, LifecycleAccess, SessionParts, TerminationWatch,
+    EventSession, KeyedStateSession, LifecycleAccess, SessionParts, TerminationWatch,
 };
 use crate::state::store::CellStore;
 use crate::state::tests::support::UnavailableState;
@@ -332,7 +332,7 @@ impl<P, S> TerminationSignals for MockEventContext<P, S> {
 impl<P, S> EventContext for MockEventContext<P, S>
 where
     P: Send + Sync + 'static,
-    S: CellWrite<Loader: MessageLoader<Payload = P>>,
+    S: EventSession<Loader: MessageLoader<Payload = P>>,
 {
     type Error = MockTimerError;
     type Payload = P;

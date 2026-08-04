@@ -137,7 +137,16 @@ impl CapturedEvents {
     /// Whether any captured event's rendering contains `needle` (matches its
     /// message or any field value).
     pub(crate) fn contains(&self, needle: &str) -> bool {
-        self.0.lock().iter().any(|event| event.contains(needle))
+        self.count(needle) > 0
+    }
+
+    /// How many captured events' renderings contain `needle`.
+    pub(crate) fn count(&self, needle: &str) -> usize {
+        self.0
+            .lock()
+            .iter()
+            .filter(|event| event.contains(needle))
+            .count()
     }
 }
 
