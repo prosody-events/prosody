@@ -33,9 +33,19 @@ const PERIOD: Duration = Duration::from_secs(1);
 /// these cases tell apart is seconds wide, so a millisecond hides nothing.
 const GRANULARITY: Duration = Duration::from_millis(1);
 
-/// Responses the paced case queues at once. Enough that the last one's turn
-/// falls past the share an unproven endpoint would get.
+/// Responses the paced case queues at once. Enough that turns are claimed
+/// ahead of the last one, so its own turn is what that case is about.
 const BACKLOG: u32 = 4;
+
+/// The deadline every response of the paced backlog carries.
+///
+/// It is what makes the last response of the backlog the subject. Two turns go
+/// before that response, so it has 1.2 s left when its worker reaches it. Its
+/// own turn is 1 s away, so it still has time to send. The first response
+/// proved its endpoint, so the share that endpoint gets is 0.9 s — less than
+/// the wait. A wait charged to the share would therefore end that response
+/// before it dialed.
+const PACED_DEADLINE: Duration = Duration::from_millis(3_200);
 
 /// Attempts one response may make against one endpoint. One, so a case that
 /// counts attempts counts endpoints. The silent case below asks for more, and
@@ -159,9 +169,9 @@ fn a_remembered_endpoint_keeps_the_larger_share() -> Result<()> {
 /// endpoint did, so it is not spent against the endpoint's share. Every
 /// response here reaches the direct endpoint, which answers at once. A wait
 /// charged to the share would end the last response's first attempt before it
-/// dialed: that response would report an endpoint that answered nothing, take
-/// the entry point instead, and claim a second turn from a destination whose
-/// queue is already the problem.
+/// dialed: that response would report an endpoint that answered nothing, and
+/// claim a second turn for the entry point from a destination whose queue is
+/// already the problem.
 ///
 /// The turns are the second half of the claim. One claimed turn per delivered
 /// response is what the rate limit promises; a turn claimed with no send makes
@@ -172,6 +182,7 @@ fn a_paced_backlog_still_dials_the_endpoint_the_route_prefers() -> Result<()> {
     runtime.block_on(async {
         let harness = Harness::dual_homed(FleetConfiguration {
             sends_per_second: PACED,
+            send_deadline: PACED_DEADLINE,
             ..settings()
         })?;
         for _ in 0..BACKLOG {
