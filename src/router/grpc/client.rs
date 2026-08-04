@@ -38,13 +38,15 @@ type Channels = Cache<Endpoint, Channel, UnitWeighter, RandomState>;
 ///
 /// # What bounds the memory
 ///
-/// The cache holds one channel per destination the fleet it was built from can
-/// hold, so a process whose senders and fleet come from the same configuration
-/// keeps every live destination dialled. `quick_cache` evicts to stay inside
-/// that count, and eviction is the removal path: nothing else holds a channel,
-/// so an evicted one closes its connections when its last clone drops. The key
-/// is the published address rather than the node, so a node that restarts on
-/// another port leaves an entry behind that only eviction removes.
+/// The cache holds as many channels as the fleet it was built from holds
+/// destinations. `quick_cache` evicts to stay inside that count, and eviction
+/// is the removal path: nothing else holds a channel, so an evicted one closes
+/// its connections when its last clone drops. The key is the published address
+/// rather than the node, so a node reached on both of its endpoints — while a
+/// response probes one and falls back to the other — occupies two entries, as
+/// does a node that restarts on another port. Neither grows the cache: the
+/// count is the bound, and the entry that stops being dialled goes cold and is
+/// evicted first.
 pub(crate) struct GrpcSender {
     channels: Arc<Channels>,
     cap: FrameCap,

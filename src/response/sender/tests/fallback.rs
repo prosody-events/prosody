@@ -6,7 +6,9 @@ use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{Script, advertised_port, node, port};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tonic::Code;
 
 /// The node the responses in this suite are addressed to.
@@ -313,6 +315,75 @@ fn a_destination_forgets_an_endpoint_that_stopped_answering() -> Result<()> {
             0,
             "an endpoint that answered nothing must not stay remembered"
         );
+        Ok(())
+    })
+}
+
+/// An endpoint that answers nothing at all still leaves the other one tried.
+///
+/// The direct endpoint never answers and never refuses, which is what a
+/// firewall that drops packets looks like — and it is the failure the fallback
+/// exists for, because an address that belongs to something unrelated here is
+/// exactly what a misapplied label reaches. It is given a slice of the response
+/// deadline rather than all of it, so the entry point is still reachable inside
+/// the same response. Handing the first endpoint the whole deadline would end
+/// the response there with the working endpoint untried.
+#[test]
+fn a_direct_endpoint_that_answers_nothing_still_leaves_the_entry_point_tried() -> Result<()> {
+    let runtime = paused()?;
+    runtime.block_on(async {
+        let harness = Harness::dual_homed(settings())?;
+        // Nothing ever releases the barrier: only the slice of the deadline
+        // this endpoint was given can end the attempt.
+        harness.script(TARGET, Script::Hold(Arc::new(Semaphore::new(0))));
+        harness.send(TARGET)?;
+
+        let drained = harness.drain().await?;
+        assert_eq!(
+            attempts_on(&drained.deliveries, port(TARGET)),
+            1,
+            "the silent endpoint must be tried once"
+        );
+        assert_eq!(
+            attempts_on(&drained.deliveries, advertised_port(TARGET)),
+            1,
+            "the response must reach the entry point while its own deadline still has room"
+        );
+        assert_eq!(drained.sent, 1, "the response must be delivered");
+        Ok(())
+    })
+}
+
+/// A refusal from a process that is not the target does not end the walk.
+///
+/// A relay that already sent the frame on answers `FAILED_PRECONDITION`, and a
+/// relay with no capacity answers `RESOURCE_EXHAUSTED`. Both reach a responder
+/// as the status of the endpoint it dialed, so reading either as the target's
+/// own word would leave the entry point — the one address that works — untried
+/// for every response to that node.
+#[test]
+fn a_status_only_a_relay_answers_does_not_end_the_walk() -> Result<()> {
+    let runtime = paused()?;
+    runtime.block_on(async {
+        for refusal in [Code::FailedPrecondition, Code::ResourceExhausted] {
+            let harness = Harness::dual_homed(settings())?;
+            harness.script(
+                TARGET,
+                Script::Fail {
+                    failure: SendFailure::Status(refusal),
+                    times: usize::MAX,
+                },
+            );
+            harness.send(TARGET)?;
+
+            let drained = harness.drain().await?;
+            assert_eq!(
+                attempts_on(&drained.deliveries, advertised_port(TARGET)),
+                1,
+                "a response refused {refusal:?} must still reach the entry point"
+            );
+            assert_eq!(drained.sent, 1, "the entry point must deliver it");
+        }
         Ok(())
     })
 }

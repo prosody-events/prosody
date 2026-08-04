@@ -25,11 +25,16 @@ use tokio::select;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, sleep_until, timeout_at};
 use tracing::warn;
 
 #[cfg(test)]
 mod tests;
+
+/// What fraction of a response's remaining budget the first of two endpoints
+/// may spend. The rest is left for the second, so an endpoint that answers
+/// nothing at all cannot make the fallback unreachable.
+const PROBE_DIVISOR: u32 = 4;
 
 /// The typed half of delivery.
 ///
@@ -301,6 +306,13 @@ async fn run_worker<C: Codec, R: Router>(
 /// Sharing it would make the fallback unreachable whenever one attempt is
 /// configured. Both endpoints together stay inside the job's single deadline,
 /// which the worker's biased select already enforces.
+///
+/// The *time* budget is split the same way, and for the same reason. Where a
+/// route offers a second endpoint, the first one gets [`PROBE_DIVISOR`] of what
+/// is left and the second gets the rest. An address that drops packets instead
+/// of refusing them would otherwise spend the whole deadline unanswered, and
+/// the endpoint that works would never be tried — which is exactly the
+/// misapplied label the fallback exists for.
 async fn deliver_job<C: Codec, R: Router>(
     encoder: &mut FrameEncoder<C>,
     destination: &Destination,
@@ -329,18 +341,21 @@ async fn deliver_job<C: Codec, R: Router>(
     };
     let mut remembered = None;
     let mut last_failure = None;
-    for (preference, address) in route
-        .candidates(destination.preferred())
-        .into_iter()
-        .flatten()
-    {
+    let candidates = route.candidates(destination.preferred());
+    let probed = candidates[1].is_some();
+    for (index, (preference, address)) in candidates.into_iter().flatten().enumerate() {
+        let until = if probed && index == 0 {
+            probe_deadline(expires_at)
+        } else {
+            expires_at
+        };
         match deliver(
             context.router.sender(),
             destination,
             address,
             &staged,
             context.attempts,
-            expires_at,
+            until,
         )
         .await
         {
@@ -367,32 +382,50 @@ async fn deliver_job<C: Codec, R: Router>(
     false
 }
 
-/// Delivers one frame, trying again only for a failure another attempt could
-/// fix.
+/// Delivers one frame to one endpoint, trying again only for a failure another
+/// attempt could fix, and giving up at `until`.
 ///
 /// Every attempt claims the destination's pacing, so the rate limit bounds what
 /// one destination is asked for rather than what it receives. A response that
 /// falls back enters here a second time, and that endpoint's attempts claim
 /// too.
+///
+/// `until` bounds this endpoint as a whole, rather than only the `grpc-timeout`
+/// each attempt states. The channel lookup and the readiness wait both run
+/// before that header is written, so an address that drops packets instead of
+/// refusing them answers nothing and states nothing. Giving up therefore reads
+/// as [`SendFailure::Unreachable`], which is what it is.
 async fn deliver<S: ResponseSender, F: Framed + Sync>(
     sender: &S,
     destination: &Destination,
     address: &Endpoint,
     frame: &F,
     attempts: u32,
-    expires_at: Instant,
+    until: Instant,
 ) -> Result<(), SendFailure> {
-    sleep_until(destination.next_send()).await;
-    let mut outcome = sender.deliver(address, frame, expires_at).await;
-    for _ in 1..attempts {
-        match outcome {
-            Ok(()) => return Ok(()),
-            Err(failure) if !failure.is_ambiguous() => return Err(failure),
-            Err(_) => {
-                sleep_until(destination.next_send()).await;
-                outcome = sender.deliver(address, frame, expires_at).await;
+    let walk = async {
+        sleep_until(destination.next_send()).await;
+        let mut outcome = sender.deliver(address, frame, until).await;
+        for _ in 1..attempts {
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(failure) if !failure.is_ambiguous() => return Err(failure),
+                Err(_) => {
+                    sleep_until(destination.next_send()).await;
+                    outcome = sender.deliver(address, frame, until).await;
+                }
             }
         }
+        outcome
+    };
+    match timeout_at(until, walk).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(SendFailure::Unreachable),
     }
-    outcome
+}
+
+/// What the first of two endpoints may spend of what is left.
+fn probe_deadline(expires_at: Instant) -> Instant {
+    let now = Instant::now();
+    now + expires_at.saturating_duration_since(now) / PROBE_DIVISOR
 }

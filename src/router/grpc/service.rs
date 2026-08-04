@@ -12,7 +12,7 @@ use crate::response::frame::FrameCap;
 use crate::response::frame::ResponseFrame;
 use crate::response::frame::encode::Forwarded;
 use crate::router::relay::{Relay, RelayFailure, Routing, routing};
-use crate::router::{NodeId, Router};
+use crate::router::{NodeId, RelayHop};
 use async_trait::async_trait;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use std::sync::Arc;
@@ -62,7 +62,7 @@ impl<R> PeerService<R> {
 }
 
 #[async_trait]
-impl<R: Router> Peer for PeerService<R> {
+impl<R: RelayHop> Peer for PeerService<R> {
     /// Hands one frame to the waiter it names, sends it on to the process it
     /// names, or refuses it — and answers with the status the whole path came
     /// to.

@@ -130,44 +130,27 @@ pub(crate) trait ResponseSender: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), SendFailure>> + Send;
 }
 
-/// Everything the response path needs to reach a peer: a node's address, the
-/// transport that dials it, and the shared destination fleet.
+/// What one forward reads: the endpoint a node published for its neighbours,
+/// the transport that dials it, and the shared destination fleet.
 ///
-/// One trait rather than three type parameters, so every signature on the
-/// response path names one `R`. Address resolution belongs here rather than at
-/// the apply hook that queues a response: reading the directory is an await,
-/// and an apply hook must not await.
-pub(crate) trait Router: Clone + Send + Sync + 'static {
+/// A process that forwards stands beside its target already, so it reads no
+/// declared label. This trait offers none, and that is why a relay is bound by
+/// it rather than by [`Router`]: [`Router::route`] is the one function that
+/// applies the operator's rules, so a forward that consulted them does not
+/// compile.
+pub(crate) trait RelayHop: Clone + Send + Sync + 'static {
     /// The transport frames leave through.
     type Sender: ResponseSender;
 
     /// What can stop a node id from becoming an address.
     type Error: Error + Send + Sync + 'static;
 
-    /// The endpoints `node` may be dialed on from this process, in order. This
-    /// is the responder's lookup, and [`choose_route`] decides what it answers.
-    ///
-    /// `None` means "do not dial", which covers both a node the directory does
-    /// not hold and one the rules refuse to reach from here.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Router::Error`] when the lookup itself failed, which is
-    /// distinct from a node that is simply not published.
-    fn route(
-        &self,
-        node: NodeId,
-    ) -> impl Future<Output = Result<Option<Route>, Self::Error>> + Send;
-
     /// The direct endpoint alone. This is the lookup a process uses when it
     /// sends a frame on to the process that frame names.
     ///
-    /// A process that forwards stands beside its target already, so it reads no
-    /// declared label. This lookup gives it none to read.
-    ///
     /// # Errors
     ///
-    /// Returns [`Router::Error`] when the lookup itself failed.
+    /// Returns [`RelayHop::Error`] when the lookup itself failed.
     fn direct(
         &self,
         node: NodeId,
@@ -181,6 +164,31 @@ pub(crate) trait Router: Clone + Send + Sync + 'static {
     /// Shared rather than borrowed, so a sender sized from this fleet can hold
     /// it and can never reserve from another one.
     fn fleet(&self) -> &Arc<DestinationFleet>;
+}
+
+/// Everything the response path needs to reach a peer: every endpoint a node
+/// may be dialed on, the transport that dials them, and the shared destination
+/// fleet.
+///
+/// One trait rather than three type parameters, so every signature on the
+/// response path names one `R`. Address resolution belongs here rather than at
+/// the apply hook that queues a response: reading the directory is an await,
+/// and an apply hook must not await.
+pub(crate) trait Router: RelayHop {
+    /// The endpoints `node` may be dialed on from this process, in order. This
+    /// is the responder's lookup, and [`choose_route`] decides what it answers.
+    ///
+    /// `None` means "do not dial", which covers both a node the directory does
+    /// not hold and one the rules refuse to reach from here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelayHop::Error`] when the lookup itself failed, which is
+    /// distinct from a node that is simply not published.
+    fn route(
+        &self,
+        node: NodeId,
+    ) -> impl Future<Output = Result<Option<Route>, Self::Error>> + Send;
 }
 
 /// The production [`Router`]: addresses from the directory's bounded cache,
@@ -278,16 +286,9 @@ impl<S> RouterHandle<S> {
     }
 }
 
-impl<S: ResponseSender> Router for RouterHandle<S> {
+impl<S: ResponseSender> RelayHop for RouterHandle<S> {
     type Error = CassandraStoreError;
     type Sender = S;
-
-    async fn route(&self, node: NodeId) -> Result<Option<Route>, CassandraStoreError> {
-        let registration = self.addresses.resolve(node).await?;
-        Ok(registration
-            .as_deref()
-            .and_then(|registration| choose_route(self.here.as_ref(), registration)))
-    }
 
     async fn direct(&self, node: NodeId) -> Result<Option<Endpoint>, CassandraStoreError> {
         let registration = self.addresses.resolve(node).await?;
@@ -300,6 +301,15 @@ impl<S: ResponseSender> Router for RouterHandle<S> {
 
     fn fleet(&self) -> &Arc<DestinationFleet> {
         &self.fleet
+    }
+}
+
+impl<S: ResponseSender> Router for RouterHandle<S> {
+    async fn route(&self, node: NodeId) -> Result<Option<Route>, CassandraStoreError> {
+        let registration = self.addresses.resolve(node).await?;
+        Ok(registration
+            .as_deref()
+            .and_then(|registration| choose_route(self.here.as_ref(), registration)))
     }
 }
 
@@ -326,17 +336,31 @@ impl SendFailure {
     /// Whether the *endpoint* is what failed, so the node's other endpoint is
     /// worth trying inside the same response.
     ///
-    /// Nothing served the frame when the address could not be dialed or nothing
-    /// answered on it. `UNAVAILABLE` and `UNIMPLEMENTED` mean something
-    /// answered that does not serve this method, which is what a misapplied
-    /// label looks like: a direct address that belongs to something unrelated
-    /// here. Every other status is an answer from a node that read the frame,
-    /// and sending it to that node's other address would only repeat it.
+    /// Nothing served the frame when the address could not be dialed, or when
+    /// nothing answered on it. Every status here is one that a process which is
+    /// not the target can answer. That is what a misapplied label reaches: an
+    /// address which belongs to something unrelated on this network.
+    /// `UNAVAILABLE` and `UNIMPLEMENTED` mean something answered that does not
+    /// serve this method. `FAILED_PRECONDITION` and `RESOURCE_EXHAUSTED` are
+    /// what a process that read the frame and refused to send it on answers.
+    ///
+    /// The target itself answers those last two as well. The cost of reading
+    /// them this way is one repeated attempt, on a response the target already
+    /// rejected, inside the same response and never a second one. The gain is
+    /// that a misapplied label always reaches the entry point.
+    ///
+    /// `DEADLINE_EXCEEDED` is deliberately absent: no budget is left to reach
+    /// the other endpoint with.
     pub(crate) const fn is_wrong_endpoint(self) -> bool {
         match self {
             Self::Unreachable
             | Self::Undialable
-            | Self::Status(Code::Unavailable | Code::Unimplemented) => true,
+            | Self::Status(
+                Code::Unavailable
+                | Code::Unimplemented
+                | Code::FailedPrecondition
+                | Code::ResourceExhausted,
+            ) => true,
             Self::Expired | Self::Status(_) => false,
         }
     }

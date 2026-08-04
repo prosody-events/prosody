@@ -47,7 +47,7 @@ use self::generated::peer_server::PeerServer;
 use self::health::{PeerHealth, ProcessHealth};
 use self::service::PeerService;
 use crate::response::frame::FrameCap;
-use crate::router::Router;
+use crate::router::RelayHop;
 use derive_builder::Builder;
 use std::io::Error as IoError;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -351,7 +351,7 @@ pub(in crate::router) fn serve<R, H, F>(
     shutdown: F,
 ) -> Result<JoinHandle<()>, TransportError>
 where
-    R: Router,
+    R: RelayHop,
     H: ProcessHealth,
     F: Future<Output = ()> + Send + 'static,
 {

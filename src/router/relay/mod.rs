@@ -16,7 +16,7 @@
 )]
 
 use crate::router::fleet::{Destination, DestinationFleet, Refusal};
-use crate::router::{Framed, NodeId, ResponseSender, Router, SendFailure};
+use crate::router::{Framed, NodeId, RelayHop, ResponseSender, SendFailure};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
@@ -44,21 +44,21 @@ pub(crate) enum Routing {
 
 /// Sends a frame on to the process it names, inside the caller's budget.
 ///
-/// A relay holds the router alone, and it stamps no frame itself. The caller
-/// passes the forwarded form, which carries the relay id by construction. A
-/// parameter typed as that form would make the router name a response, which
-/// this module's own rule forbids, and a marker trait would signal the
-/// requirement rather than carry it.
+/// A relay holds one [`RelayHop`] alone, and it stamps no frame itself. The
+/// caller passes the forwarded form, which carries the relay id by
+/// construction. A parameter typed as that form would make the router name a
+/// response, which this module's own rule forbids, and a marker trait would
+/// signal the requirement rather than carry it.
 pub(crate) struct Relay<R> {
     router: R,
 }
 
-impl<R: Router> Relay<R> {
+impl<R: RelayHop> Relay<R> {
     /// Forwards through `router`.
     ///
-    /// The whole [`Router`] rather than a narrower trait over the three items a
-    /// hop reads. That trait was examined and rejected: it would have one
-    /// implementor and would only save a grep.
+    /// [`RelayHop`] rather than the whole [`Router`](crate::router::Router):
+    /// the narrower trait offers no lookup that reads a declared label, so
+    /// "a forwarder consulted the labels" is not writable here.
     pub(crate) const fn new(router: R) -> Self {
         Self { router }
     }
@@ -83,6 +83,13 @@ impl<R: Router> Relay<R> {
         deadline: Instant,
         frame: &F,
     ) -> Result<(), RelayFailure> {
+        // A frame whose budget was already spent when it arrived reserves
+        // nothing. Answering first is what stops a caller from admitting one
+        // destination after another into the table with frames that could never
+        // have been delivered.
+        if Instant::now() >= deadline {
+            return Err(RelayFailure::DeadlineExceeded);
+        }
         // The slot is taken before the lookup and held to the end of this
         // scope, so a flood of frames for other nodes buys no unmetered channel
         // into this process's send capacity.

@@ -10,7 +10,7 @@ use crate::router::grpc::TRANSPORT;
 use crate::router::grpc::client::{DELIVER_RESPONSE, peer_uri};
 use crate::router::grpc::generated::peer_server::SERVICE_NAME;
 use crate::router::loopback::config;
-use crate::router::{Host, NodeId, Route, Router, choose_route};
+use crate::router::{Host, NodeId, RelayHop, Route, Router, choose_route};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
@@ -42,9 +42,6 @@ struct OneListener {
 }
 
 impl Router for OneListener {
-    type Error = Infallible;
-    type Sender = GrpcSender;
-
     fn route(
         &self,
         _node: NodeId,
@@ -52,6 +49,11 @@ impl Router for OneListener {
         let route = choose_route(None, &self.registration);
         async move { Ok(route) }
     }
+}
+
+impl RelayHop for OneListener {
+    type Error = Infallible;
+    type Sender = GrpcSender;
 
     fn direct(
         &self,

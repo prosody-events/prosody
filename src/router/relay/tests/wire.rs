@@ -1,19 +1,20 @@
 //! What crosses a real hop: the loop stop, the caller's budget, and the trace.
 
-use super::{ALPHA, BUDGET, CAP_BYTES, Live, PAYLOAD, Pair, TargetRoute, named};
+use super::{ALPHA, BUDGET, CAP_BYTES, FixedRouter, Live, PAYLOAD, Pair, TargetRoute, named};
 use crate::codec::Codec;
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::encode::{FrameEncoder, Staged};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader};
+use crate::response::sender::TypedSender;
 use crate::response::{RequestId, ResponseStatus};
-use crate::router::directory::Endpoint;
+use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::TRANSPORT;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::HANG_GUARD;
-use crate::router::{NodeId, ResponseSender, SendFailure};
+use crate::router::{Host, NodeId, Preference, ResponseSender, Router, SendFailure};
 use crate::subsystem::SubsystemName;
 use crate::test_util::{GlobalSpans, TEST_RUNTIME};
 use color_eyre::Result;
@@ -40,13 +41,21 @@ const FORWARDED: &str = "peer.response.forward";
 /// The attribute carrying what is left of the caller's budget.
 const DEADLINE_MS: &str = "peer.deadline_ms";
 
-/// The budget a caller states. Well under the ceiling each process would apply
-/// on its own, so a hop that inherited nothing is unmistakable.
-const CALLER_BUDGET: Duration = Duration::from_secs(5);
+/// The budget a caller states. Well under the ceiling a process applies on its
+/// own, so a hop that inherited nothing is unmistakable.
+const CALLER_BUDGET: Duration = Duration::from_secs(30);
 
-/// The ceiling each process would apply if a caller stated none. Far above the
-/// caller's own budget.
+/// The ceiling the relaying process applies to one forward. Well under the
+/// budget its caller states, so what the relay hands on is a number no caller
+/// stated and no process would apply on its own.
+const RELAY_CEILING: Duration = Duration::from_secs(5);
+
+/// The ceiling a process applies if a caller stated none. Far above both.
 const PROCESS_BUDGET: Duration = Duration::from_mins(1);
+
+/// The two network labels the crossing case declares.
+const HERE: &str = "here";
+const THERE: &str = "there";
 
 /// Two processes whose directory entries name each other pass a frame neither
 /// owns exactly once.
@@ -59,7 +68,7 @@ const PROCESS_BUDGET: Duration = Duration::from_mins(1);
 #[test]
 fn a_frame_this_process_already_relayed_is_never_relayed_again() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let pair = Pair::start(PROCESS_BUDGET, TargetRoute::Relay).await?;
+        let pair = Pair::start(PROCESS_BUDGET, PROCESS_BUDGET, TargetRoute::Relay).await?;
         let forwarded = TRANSPORT.forwarded();
         let outcome = async {
             let answered = call(&pair.relay, NodeId::new(), RequestId::new(), BUDGET).await?;
@@ -85,22 +94,24 @@ fn a_frame_this_process_already_relayed_is_never_relayed_again() -> Result<()> {
 }
 
 /// The budget a process states on the hop it makes is what is left of the
-/// budget its caller stated, never a fresh one.
+/// budget it is spending itself, never a budget it was handed.
 ///
 /// The frame names a third node, so the second process refuses it — but it
 /// refuses it after reading the budget it was given, which is the number this
-/// case is about. Both processes would apply a far larger ceiling of their own
-/// if a caller stated none, so a hop that inherited nothing records that
-/// ceiling instead. The two hops are compared with `<=` rather than `<` because
-/// the attribute is whole milliseconds and two instants microseconds apart
-/// round onto one number. The strict claim rests on the ceiling: a hop that
-/// inherited nothing records it, and a hop that inherited the caller's budget
-/// cannot.
+/// case is about. Three budgets are deliberately distinct, so each way of
+/// getting the number wrong records a different one: the caller states 30 s,
+/// the relaying process holds that to its own 5 s ceiling, and a process given
+/// no budget at all would apply a 60 s ceiling. So a hop that copied the
+/// caller's stated duration through records 30 s, one that stated nothing
+/// leaves the target recording 60 s, and only a recomputed one records what is
+/// left of the relay's own 5 s. The two hops are compared with `<=` rather than
+/// `<` because the attribute is whole milliseconds and two instants
+/// microseconds apart round onto one number.
 #[test]
 fn a_forward_carries_what_is_left_of_the_caller_budget() -> Result<()> {
     let spans = GlobalSpans::install()?;
     TEST_RUNTIME.block_on(async {
-        let pair = Pair::start(PROCESS_BUDGET, TargetRoute::Nowhere).await?;
+        let pair = Pair::start(RELAY_CEILING, PROCESS_BUDGET, TargetRoute::Nowhere).await?;
         let outcome = async {
             let answered =
                 call(&pair.relay, NodeId::new(), RequestId::new(), CALLER_BUDGET).await?;
@@ -124,8 +135,8 @@ fn a_forward_carries_what_is_left_of_the_caller_budget() -> Result<()> {
             ensure(
                 target_ms <= relay_ms,
                 format!(
-                    "the second hop was given {target_ms} ms, more than the first hop's \
-                     {relay_ms} ms"
+                    "the second hop was given {target_ms} ms, more than the {relay_ms} ms the \
+                     first hop was spending, so the budget was handed on rather than recomputed"
                 ),
             )?;
             ensure(
@@ -156,7 +167,7 @@ fn a_forward_carries_what_is_left_of_the_caller_budget() -> Result<()> {
 fn a_relayed_response_reads_as_one_trace() -> Result<()> {
     let spans = GlobalSpans::install()?;
     TEST_RUNTIME.block_on(async {
-        let pair = Pair::start(PROCESS_BUDGET, TargetRoute::Nowhere).await?;
+        let pair = Pair::start(PROCESS_BUDGET, PROCESS_BUDGET, TargetRoute::Nowhere).await?;
         let outcome = async {
             let request = awaited(&pair.target.registry)?;
             let answered = call(&pair.relay, pair.target.node, request, BUDGET).await?;
@@ -188,6 +199,87 @@ fn a_relayed_response_reads_as_one_trace() -> Result<()> {
         pair.stop().await?;
         outcome
     })
+}
+
+/// A response crosses two networks and is stored by the process it names.
+///
+/// This is the whole path the two halves exist for, and neither half shows it
+/// alone. The target publishes a label this responder does not share, so the
+/// declared rules refuse its direct address and choose its entry point — and
+/// that entry point is a process which is not the target. It sends the frame on
+/// to the target's direct endpoint, and the target stores it. The label rule on
+/// its own dials nothing, and a relay on its own is never the address the rules
+/// picked.
+#[test]
+fn a_response_crosses_two_networks_through_a_relay() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let pair = Pair::start(PROCESS_BUDGET, PROCESS_BUDGET, TargetRoute::Nowhere).await?;
+        let outcome = crossing(&pair).await;
+        pair.stop().await?;
+        outcome
+    })
+}
+
+/// Resolves the target the declared way, sends one response, and reports what
+/// the target holds.
+///
+/// The responder's own fleet and transport are the production ones, so the
+/// response is queued, paced, framed and dialed exactly as a responder does it.
+/// `drain` returns once every worker has finished, so what the target holds is
+/// settled without waiting on a clock.
+async fn crossing(pair: &Pair) -> Result<()> {
+    let cap = FrameCap::new(CAP_BYTES)?;
+    let request = awaited(&pair.target.registry)?;
+    let elsewhere = NodeRegistration {
+        node: pair.target.node,
+        direct: pair.target.address.clone(),
+        advertised: Some(pair.relay.address.clone()),
+        network: Some(NetworkId::make(THERE)),
+        group: None,
+        hostname: Host::make("crossing"),
+    };
+    let router = FixedRouter::new(cap, Some(elsewhere), Some(NetworkId::make(HERE)))?;
+    let route = router
+        .route(pair.target.node)
+        .await?
+        .ok_or_else(|| eyre!("a node in another network must be reachable through its entry"))?;
+    let [first, second] = route.candidates(None);
+    ensure(
+        first == Some((Preference::Advertised, &pair.relay.address)) && second.is_none(),
+        format!("the rules chose {route:?}, which is not the target's entry point alone"),
+    )?;
+
+    let forwarded = TRANSPORT.forwarded();
+    let sender = TypedSender::<CountingCodec>::new(&router, cap)?;
+    sender
+        .send(
+            FrameHeader {
+                target: pair.target.node,
+                request,
+                subsystem: SubsystemName::try_new(ALPHA)?,
+                status: ResponseStatus::Success,
+                relay: None,
+            },
+            PAYLOAD.to_vec(),
+        )
+        .map_err(|_| eyre!("the fleet refused the response"))?;
+    if timeout(HANG_GUARD, sender.drain()).await.is_err() {
+        bail!("the delivery workers did not finish");
+    }
+    ensure(
+        pair.target
+            .registry
+            .stored_payload(request, &SubsystemName::try_new(ALPHA)?)
+            .is_some(),
+        "the response never reached the process it named".to_owned(),
+    )?;
+    ensure(
+        TRANSPORT.forwarded() == forwarded + 1,
+        format!(
+            "the entry point must send the frame on once, but {} frames were sent on",
+            TRANSPORT.forwarded() - forwarded
+        ),
+    )
 }
 
 /// Delivers one frame for `target` into `live`, under a budget of `granted`.

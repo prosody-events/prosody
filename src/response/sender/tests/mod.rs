@@ -6,7 +6,7 @@ use crate::error::ErrorCategory;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader};
 use crate::response::{RequestId, ResponseStatus};
-use crate::router::Router;
+use crate::router::RelayHop;
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{

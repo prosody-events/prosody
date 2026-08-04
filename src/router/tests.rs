@@ -1,4 +1,4 @@
-use super::{NodeId, Preference, Router, RouterHandle, SendFailure, choose_route};
+use super::{NodeId, Preference, RelayHop, Router, RouterHandle, SendFailure, choose_route};
 use crate::router::Host;
 use crate::router::directory::cache::{AddressCache, AddressResolver};
 use crate::router::directory::tests::support::{directory, membership, registration};
@@ -47,7 +47,8 @@ fn every_minted_node_id_is_a_fresh_random_uuid() {
 /// read off each other:
 ///
 /// - **Ambiguous.** Another attempt on this endpoint could still get an answer.
-/// - **Wrong endpoint.** The node's other endpoint is worth trying instead.
+/// - **Wrong endpoint.** The node's other endpoint is worth trying instead,
+///   because a process that is not the target can answer this.
 /// - **Answered.** The node itself spoke, so this endpoint is the one that
 ///   reaches it.
 #[test]
@@ -59,9 +60,10 @@ fn every_failure_answers_the_three_questions_the_send_path_asks() {
         (SendFailure::Expired, false, false, false),
         (answer(Code::Unavailable), true, true, true),
         (answer(Code::Unimplemented), false, true, true),
+        (answer(Code::FailedPrecondition), false, true, true),
+        (answer(Code::ResourceExhausted), false, true, true),
         (answer(Code::DeadlineExceeded), true, false, true),
         (answer(Code::NotFound), false, false, true),
-        (answer(Code::ResourceExhausted), false, false, true),
         (answer(Code::Ok), false, false, true),
     ];
     for (failure, ambiguous, wrong_endpoint, answered) in table {

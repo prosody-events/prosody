@@ -20,7 +20,7 @@ use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::RequestId;
 use crate::response::frame::FrameCap;
 use crate::response::headers::RequestTag;
-use crate::router::Router;
+use crate::router::RelayHop;
 use crate::router::loopback::{Delivery, TestRouter, config, node};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;

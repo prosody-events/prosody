@@ -18,7 +18,7 @@ use crate::requester::registry::PendingRegistry;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader, ResponseFrame};
 use crate::response::{FormatToken, RequestId, ResponseStatus};
-use crate::router::directory::{Endpoint, NodeRegistration};
+use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::client::GrpcSender;
@@ -26,7 +26,7 @@ use crate::router::grpc::generated::peer_server::Peer;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, TransportConfiguration, serve};
 use crate::router::loopback::{Delivery, TestHealth, TestRouter, node};
-use crate::router::{Host, NodeId, Route, Router, choose_route};
+use crate::router::{Host, NodeId, RelayHop, Route, Router, choose_route};
 use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
 use color_eyre::Result;
@@ -97,15 +97,19 @@ pub(super) enum TargetRoute {
     Nowhere,
 }
 
-/// A router that resolves every node to one endpoint, or to none at all.
+/// A router that resolves every node to one registration, or to none at all.
 ///
-/// One endpoint for every node is not a contrivance: it is what a stale
-/// directory entry looks like, which is the case forwarding exists for.
+/// One registration for every node is not a contrivance: it is what a stale
+/// directory entry looks like, which is the case forwarding exists for. `here`
+/// is the label the process holding this router was configured with, so
+/// [`Router::route`] applies the declared rules exactly as the production
+/// router does.
 #[derive(Clone)]
 pub(super) struct FixedRouter {
     fleet: Arc<DestinationFleet>,
     transport: Arc<GrpcSender>,
     registration: Option<NodeRegistration>,
+    here: Option<NetworkId>,
 }
 
 impl Process {
@@ -181,19 +185,26 @@ impl Pair {
     /// Binds and serves two listeners: a relay that resolves every node to the
     /// target, and a target whose own router points where `route` says.
     ///
+    /// Each process is given its own ceiling on one forward, because what one
+    /// hop hands the next is only readable where the two differ.
+    ///
     /// Both are bound before either is served, because the two routers name
     /// each other.
-    pub(super) async fn start(budget: Duration, route: TargetRoute) -> Result<Self> {
+    pub(super) async fn start(
+        relaying: Duration,
+        targeted: Duration,
+        route: TargetRoute,
+    ) -> Result<Self> {
         let relay_bound = bind().await?;
         let target_bound = bind().await?;
         let relay_address = endpoint(&relay_bound);
         let target_address = endpoint(&target_bound);
-        let relay = Live::serve(relay_bound, Some(target_address), budget)?;
+        let relay = Live::serve(relay_bound, Some(target_address), relaying)?;
         let seen = match route {
             TargetRoute::Relay => Some(relay_address),
             TargetRoute::Nowhere => None,
         };
-        match Live::serve(target_bound, seen, budget) {
+        match Live::serve(target_bound, seen, targeted) {
             Ok(target) => Ok(Self { relay, target }),
             Err(error) => {
                 relay.stop().await?;
@@ -217,12 +228,7 @@ impl Live {
         let address = endpoint(&bound);
         let cap = bound.frame_cap();
         let registry = PendingRegistry::new(&RequesterConfiguration::default())?;
-        let fleet = Arc::new(DestinationFleet::new(FleetConfiguration::default())?);
-        let router = FixedRouter {
-            transport: Arc::new(GrpcSender::new(cap, &fleet)),
-            fleet,
-            registration: seen.map(registration),
-        };
+        let router = FixedRouter::new(cap, seen.map(registration), None)?;
         let (stop, stopped) = channel();
         let served = serve(
             bound,
@@ -249,10 +255,25 @@ impl Live {
     }
 }
 
-impl Router for FixedRouter {
-    type Error = Infallible;
-    type Sender = GrpcSender;
+impl FixedRouter {
+    /// A router over its own fleet and transport, resolving every node to
+    /// `registration` from a process labelled `here`.
+    pub(super) fn new(
+        cap: FrameCap,
+        registration: Option<NodeRegistration>,
+        here: Option<NetworkId>,
+    ) -> Result<Self> {
+        let fleet = Arc::new(DestinationFleet::new(FleetConfiguration::default())?);
+        Ok(Self {
+            transport: Arc::new(GrpcSender::new(cap, &fleet)),
+            fleet,
+            registration,
+            here,
+        })
+    }
+}
 
+impl Router for FixedRouter {
     fn route(
         &self,
         _node: NodeId,
@@ -260,9 +281,14 @@ impl Router for FixedRouter {
         let route = self
             .registration
             .as_ref()
-            .and_then(|registration| choose_route(None, registration));
+            .and_then(|registration| choose_route(self.here.as_ref(), registration));
         async move { Ok(route) }
     }
+}
+
+impl RelayHop for FixedRouter {
+    type Error = Infallible;
+    type Sender = GrpcSender;
 
     fn direct(
         &self,

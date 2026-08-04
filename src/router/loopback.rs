@@ -5,7 +5,7 @@ use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
 use crate::router::grpc::health::ProcessHealth;
 use crate::router::{
-    Framed, Host, NodeId, ResponseSender, Route, Router, SendFailure, choose_route,
+    Framed, Host, NodeId, RelayHop, ResponseSender, Route, Router, SendFailure, choose_route,
 };
 use bytes::BytesMut;
 use parking_lot::Mutex;
@@ -224,9 +224,6 @@ impl TestRouter {
 }
 
 impl Router for TestRouter {
-    type Error = Infallible;
-    type Sender = LoopbackSender;
-
     fn route(
         &self,
         node: NodeId,
@@ -237,6 +234,11 @@ impl Router for TestRouter {
             .and_then(|registration| choose_route(self.here.as_ref(), registration));
         async move { Ok(route) }
     }
+}
+
+impl RelayHop for TestRouter {
+    type Error = Infallible;
+    type Sender = LoopbackSender;
 
     fn direct(
         &self,
