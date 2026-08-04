@@ -158,6 +158,17 @@ impl ResponseDisposition {
     /// The mapping lives with the dispositions rather than with the transport,
     /// so a disposition added later cannot reach the wire without being given a
     /// status here.
+    ///
+    /// Three of these are also the answer of a process that is not the target:
+    /// a relay refuses a frame it may not send on with
+    /// [`AlreadyRelayed`](Self::AlreadyRelayed), and refuses one it cannot send
+    /// on with [`NoRelayCapacity`](Self::NoRelayCapacity) or
+    /// [`RelayDeadlineExceeded`](Self::RelayDeadlineExceeded). Their statuses
+    /// are shared with a verdict the target itself gives, and nothing on the
+    /// wire says which process answered — so a sender reads any of them as the
+    /// endpoint's own word and stops there. That is the deliberate cost of
+    /// naming each outcome by what gRPC statuses mean rather than by who sent
+    /// it; a per-process origin would need a wire field.
     pub(crate) const fn status(self) -> Code {
         match self {
             Self::Accepted => Code::Ok,

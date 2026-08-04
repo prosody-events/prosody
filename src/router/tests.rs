@@ -39,34 +39,37 @@ fn every_minted_node_id_is_a_fresh_random_uuid() {
     }
 }
 
-/// What each failure means to the three questions the send path asks it.
+/// What each failure means to the two questions the send path asks it.
 ///
 /// The answers are written out here as data rather than read back from the
 /// classifiers, so a classifier that changed its mind about a failure fails
-/// this test. Each column is a different decision, and no two of them can be
-/// read off each other:
+/// this test. The two columns are different decisions and neither can be read
+/// off the other:
 ///
 /// - **Ambiguous.** Another attempt on this endpoint could still get an answer.
-/// - **Wrong endpoint.** The node's other endpoint is worth trying instead,
-///   because a process that is not the target can answer this.
-/// - **Answered.** The node itself spoke, so this endpoint is the one that
-///   reaches it.
+/// - **Wrong endpoint.** Nothing served the frame here, so the node's other
+///   endpoint is worth trying instead.
+///
+/// The second column carries a third claim the send path depends on: a failure
+/// that is not a wrong endpoint is always a status, so the walk may record the
+/// endpoint that gave it without asking anything else.
 #[test]
-fn every_failure_answers_the_three_questions_the_send_path_asks() {
-    // failure, ambiguous, wrong endpoint, answered
+fn every_failure_answers_the_two_questions_the_send_path_asks() {
+    // failure, ambiguous, wrong endpoint
     let table = [
-        (SendFailure::Unreachable, true, true, false),
-        (SendFailure::Undialable, false, true, false),
-        (SendFailure::Expired, false, false, false),
-        (answer(Code::Unavailable), true, true, true),
-        (answer(Code::Unimplemented), false, true, true),
-        (answer(Code::FailedPrecondition), false, true, true),
-        (answer(Code::ResourceExhausted), false, true, true),
-        (answer(Code::DeadlineExceeded), true, false, true),
-        (answer(Code::NotFound), false, false, true),
-        (answer(Code::Ok), false, false, true),
+        (SendFailure::Unreachable, true, true),
+        (SendFailure::Undialable, false, true),
+        (SendFailure::Expired, false, true),
+        (answer(Code::Unavailable), true, true),
+        (answer(Code::Unimplemented), false, true),
+        (answer(Code::Cancelled), false, true),
+        (answer(Code::DeadlineExceeded), true, false),
+        (answer(Code::FailedPrecondition), false, false),
+        (answer(Code::ResourceExhausted), false, false),
+        (answer(Code::NotFound), false, false),
+        (answer(Code::Ok), false, false),
     ];
-    for (failure, ambiguous, wrong_endpoint, answered) in table {
+    for (failure, ambiguous, wrong_endpoint) in table {
         assert_eq!(
             failure.is_ambiguous(),
             ambiguous,
@@ -79,11 +82,9 @@ fn every_failure_answers_the_three_questions_the_send_path_asks() {
             "{failure} must{} send the response to the node's other endpoint",
             if wrong_endpoint { "" } else { " not" }
         );
-        assert_eq!(
-            failure.answered(),
-            answered,
-            "{failure} must{} count as the node's own answer",
-            if answered { "" } else { " not" }
+        assert!(
+            wrong_endpoint || matches!(failure, SendFailure::Status(_)),
+            "{failure} is not a wrong endpoint, so it must be a status the node itself answered"
         );
     }
 }

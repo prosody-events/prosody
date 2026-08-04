@@ -31,10 +31,10 @@ use tracing::warn;
 #[cfg(test)]
 mod tests;
 
-/// What fraction of a response's remaining budget the first of two endpoints
-/// may spend. The rest is left for the second, so an endpoint that answers
-/// nothing at all cannot make the fallback unreachable.
-const PROBE_DIVISOR: u32 = 4;
+/// One in this many of the deadline that is left is what an endpoint keeps for
+/// the fallback behind it — and all an endpoint that has never answered may
+/// spend. See [`Share`].
+const FALLBACK_DIVISOR: u32 = 4;
 
 /// The typed half of delivery.
 ///
@@ -104,6 +104,26 @@ struct Job<C: Codec> {
 pub(crate) struct SendCounters {
     sent: AtomicU64,
     dropped: AtomicU64,
+}
+
+/// How much of what is left of a response's deadline one endpoint may spend.
+///
+/// While a route still has a candidate untried, no endpoint gets the whole
+/// budget. An address which drops packets instead of refusing them would
+/// otherwise spend the deadline unanswered and leave the endpoint that works
+/// untried — and that is exactly what a misapplied label reaches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Share {
+    /// An endpoint with a fallback behind it that this destination has never
+    /// answered on. One [`FALLBACK_DIVISOR`]th of what is left.
+    Probe,
+    /// An endpoint with a fallback behind it that this destination answered on
+    /// before. Everything but the [`FALLBACK_DIVISOR`]th it keeps for that
+    /// fallback, because an endpoint that already answered is worth waiting
+    /// for.
+    Most,
+    /// The last endpoint of a route. Everything that is left.
+    Rest,
 }
 
 impl<C: Codec> TypedSender<C> {
@@ -242,6 +262,23 @@ impl SendCounters {
     }
 }
 
+impl Share {
+    /// The instant this endpoint must give up at, measured from now.
+    ///
+    /// Read after the pacing wait rather than before it, so a share is a slice
+    /// of the time that is left to reach the network with.
+    fn until(self, expires_at: Instant) -> Instant {
+        let now = Instant::now();
+        let left = expires_at.saturating_duration_since(now);
+        let reserved = left / FALLBACK_DIVISOR;
+        match self {
+            Self::Probe => now + reserved,
+            Self::Most => now + left.saturating_sub(reserved),
+            Self::Rest => expires_at,
+        }
+    }
+}
+
 /// One cell's worker: it drains the queue, encodes each response into its own
 /// scratch, and delivers it.
 ///
@@ -307,12 +344,9 @@ async fn run_worker<C: Codec, R: Router>(
 /// configured. Both endpoints together stay inside the job's single deadline,
 /// which the worker's biased select already enforces.
 ///
-/// The *time* budget is split the same way, and for the same reason. Where a
-/// route offers a second endpoint, the first one gets [`PROBE_DIVISOR`] of what
-/// is left and the second gets the rest. An address that drops packets instead
-/// of refusing them would otherwise spend the whole deadline unanswered, and
-/// the endpoint that works would never be tried — which is exactly the
-/// misapplied label the fallback exists for.
+/// The *time* budget is split the same way, and for the same reason. [`Share`]
+/// owns how much of it one endpoint may spend, and the endpoint this
+/// destination remembers is the one that gets the larger part.
 async fn deliver_job<C: Codec, R: Router>(
     encoder: &mut FrameEncoder<C>,
     destination: &Destination,
@@ -341,13 +375,17 @@ async fn deliver_job<C: Codec, R: Router>(
     };
     let mut remembered = None;
     let mut last_failure = None;
-    let candidates = route.candidates(destination.preferred());
-    let probed = candidates[1].is_some();
+    let preferred = destination.preferred();
+    let candidates = route.candidates(preferred);
+    let fallback = candidates[1].is_some();
+    let proven = candidates[0].is_some_and(|(preference, _)| Some(preference) == preferred);
     for (index, (preference, address)) in candidates.into_iter().flatten().enumerate() {
-        let until = if probed && index == 0 {
-            probe_deadline(expires_at)
+        let share = if index > 0 || !fallback {
+            Share::Rest
+        } else if proven {
+            Share::Most
         } else {
-            expires_at
+            Share::Probe
         };
         match deliver(
             context.router.sender(),
@@ -355,7 +393,8 @@ async fn deliver_job<C: Codec, R: Router>(
             address,
             &staged,
             context.attempts,
-            until,
+            expires_at,
+            share,
         )
         .await
         {
@@ -366,10 +405,12 @@ async fn deliver_job<C: Codec, R: Router>(
             Err(failure) => {
                 last_failure = Some(failure);
                 if !failure.is_wrong_endpoint() {
-                    // Only an answer from the node proves this endpoint is the
-                    // reachable one. Whatever the last candidate did, an
-                    // endpoint that said nothing is not worth remembering.
-                    remembered = failure.answered().then_some(preference);
+                    // A failure that is not a wrong endpoint is a status the
+                    // path answered, so this endpoint is the one that reaches
+                    // the node — refusal and all. Every other failure leaves
+                    // nothing remembered: nothing served the frame there, so
+                    // nothing proves which endpoint serves it.
+                    remembered = Some(preference);
                     break;
                 }
             }
@@ -383,49 +424,62 @@ async fn deliver_job<C: Codec, R: Router>(
 }
 
 /// Delivers one frame to one endpoint, trying again only for a failure another
-/// attempt could fix, and giving up at `until`.
+/// attempt could fix, and giving up on this endpoint at what `share` allows.
 ///
 /// Every attempt claims the destination's pacing, so the rate limit bounds what
 /// one destination is asked for rather than what it receives. A response that
 /// falls back enters here a second time, and that endpoint's attempts claim
-/// too.
-///
-/// `until` bounds this endpoint as a whole, rather than only the `grpc-timeout`
-/// each attempt states. The channel lookup and the readiness wait both run
-/// before that header is written, so an address that drops packets instead of
-/// refusing them answers nothing and states nothing. Giving up therefore reads
-/// as [`SendFailure::Unreachable`], which is what it is.
+/// too. A pacing wait is this process's own queue rather than anything the
+/// endpoint did, so it sits outside this endpoint's share: a destination whose
+/// schedule is far ahead would otherwise read as an endpoint that answered
+/// nothing. A claimed turn is spent whether or not the send happens, so a
+/// retry into a share that is already gone is not made at all.
 async fn deliver<S: ResponseSender, F: Framed + Sync>(
     sender: &S,
     destination: &Destination,
     address: &Endpoint,
     frame: &F,
     attempts: u32,
-    until: Instant,
+    expires_at: Instant,
+    share: Share,
 ) -> Result<(), SendFailure> {
-    let walk = async {
-        sleep_until(destination.next_send()).await;
-        let mut outcome = sender.deliver(address, frame, until).await;
-        for _ in 1..attempts {
-            match outcome {
-                Ok(()) => return Ok(()),
-                Err(failure) if !failure.is_ambiguous() => return Err(failure),
-                Err(_) => {
-                    sleep_until(destination.next_send()).await;
-                    outcome = sender.deliver(address, frame, until).await;
-                }
+    sleep_until(destination.next_send()).await;
+    let until = share.until(expires_at);
+    let mut outcome = attempt(sender, address, frame, expires_at, until).await;
+    for _ in 1..attempts {
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(failure) if !failure.is_ambiguous() => return Err(failure),
+            Err(_) if Instant::now() >= until => return outcome,
+            Err(_) => {
+                sleep_until(destination.next_send()).await;
+                outcome = attempt(sender, address, frame, expires_at, until).await;
             }
         }
-        outcome
-    };
-    match timeout_at(until, walk).await {
+    }
+    outcome
+}
+
+/// One attempt, bounded twice over: by `expires_at` on the wire and by `until`
+/// here.
+///
+/// The two deadlines are different on purpose. `expires_at` is what the peer is
+/// told to answer inside, so a `DEADLINE_EXCEEDED` still means what it says —
+/// the whole response ran out of time — rather than "this process moved on".
+/// `until` is what this process spends on this one endpoint, and it covers the
+/// channel lookup and the readiness wait as well, neither of which the
+/// `grpc-timeout` header reaches. Giving up on it therefore reads as
+/// [`SendFailure::Unreachable`]: nothing was served here, and the next
+/// candidate keeps what the response has left.
+async fn attempt<S: ResponseSender, F: Framed + Sync>(
+    sender: &S,
+    address: &Endpoint,
+    frame: &F,
+    expires_at: Instant,
+    until: Instant,
+) -> Result<(), SendFailure> {
+    match timeout_at(until, sender.deliver(address, frame, expires_at)).await {
         Ok(outcome) => outcome,
         Err(_) => Err(SendFailure::Unreachable),
     }
-}
-
-/// What the first of two endpoints may spend of what is left.
-fn probe_deadline(expires_at: Instant) -> Instant {
-    let now = Instant::now();
-    now + expires_at.saturating_duration_since(now) / PROBE_DIVISOR
 }

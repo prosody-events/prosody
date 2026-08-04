@@ -333,45 +333,34 @@ impl SendFailure {
         }
     }
 
-    /// Whether the *endpoint* is what failed, so the node's other endpoint is
+    /// Whether nothing served the frame here, so the node's other endpoint is
     /// worth trying inside the same response.
     ///
-    /// Nothing served the frame when the address could not be dialed, or when
-    /// nothing answered on it. Every status here is one that a process which is
-    /// not the target can answer. That is what a misapplied label reaches: an
-    /// address which belongs to something unrelated on this network.
-    /// `UNAVAILABLE` and `UNIMPLEMENTED` mean something answered that does not
-    /// serve this method. `FAILED_PRECONDITION` and `RESOURCE_EXHAUSTED` are
-    /// what a process that read the frame and refused to send it on answers.
+    /// Every failure that answers `false` is a status some process gave the
+    /// frame after reading it, which is what lets the send path remember the
+    /// endpoint that gave it. The rest are these:
     ///
-    /// The target itself answers those last two as well. The cost of reading
-    /// them this way is one repeated attempt, on a response the target already
-    /// rejected, inside the same response and never a second one. The gain is
-    /// that a misapplied label always reaches the entry point.
+    /// - **Nothing was dialed, or nothing answered.** The address could not be
+    ///   dialed, or the endpoint said nothing at all. `UNAVAILABLE` and
+    ///   `UNIMPLEMENTED` are the same fact from something that answered but
+    ///   does not serve this method — which is what a misapplied label reaches,
+    ///   an address that belongs to something unrelated on this network.
+    /// - **This process gave up first.** `CANCELLED` is what the transport's
+    ///   own timer reads as, and [`SendFailure::Expired`] is the same fact
+    ///   before anything left. Neither is the destination's word.
     ///
-    /// `DEADLINE_EXCEEDED` is deliberately absent: no budget is left to reach
-    /// the other endpoint with.
+    /// `DEADLINE_EXCEEDED` is deliberately not here. It is the answer of a peer
+    /// that read the frame and ran out of the budget this response stated, so
+    /// it is that peer speaking about the whole path rather than about the
+    /// address. The other endpoint has no more time to spend than this one had.
     pub(crate) const fn is_wrong_endpoint(self) -> bool {
         match self {
             Self::Unreachable
             | Self::Undialable
-            | Self::Status(
-                Code::Unavailable
-                | Code::Unimplemented
-                | Code::FailedPrecondition
-                | Code::ResourceExhausted,
-            ) => true,
-            Self::Expired | Self::Status(_) => false,
+            | Self::Expired
+            | Self::Status(Code::Unavailable | Code::Unimplemented | Code::Cancelled) => true,
+            Self::Status(_) => false,
         }
-    }
-
-    /// Whether the destination itself answered.
-    ///
-    /// Only an answer proves which of a node's endpoints serves it. A budget
-    /// that ran out here proves nothing about either one, so it must not be
-    /// read as the node's own word.
-    pub(crate) const fn answered(self) -> bool {
-        matches!(self, Self::Status(_))
     }
 }
 

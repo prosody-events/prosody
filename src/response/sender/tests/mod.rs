@@ -22,6 +22,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
 
 mod bounds;
+mod budget;
 mod delivery;
 mod fallback;
 mod isolation;
