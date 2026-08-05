@@ -264,8 +264,9 @@ async fn the_prepared_responder_is_sized_by_the_runtimes_frame_cap() -> Result<(
 
 /// One pipeline test proves the shared constructor path.
 ///
-/// The other mode tails differ only in their concrete outer middleware. The
-/// compiler proves that each tail terminates with the responding provider.
+/// The other mode tails differ only in their concrete outer middleware. Each
+/// tail takes its provider from `PreparedResponder::terminate`, and that
+/// return type puts the responder inside every layer a mode adds.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_responding_consumer_starts_and_stops() -> Result<()> {
     let log: EventLog = Arc::new(Mutex::new(Vec::new()));

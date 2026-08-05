@@ -75,11 +75,19 @@ pub(in crate::consumer) struct NoPeer;
 /// A served peer runtime waiting for the cluster id only a live client knows.
 pub(in crate::consumer) struct PreparedPeer<D: NodeDirectory> {
     prepared: PreparedPeerRuntime<D>,
-    workers: Option<ResponseWorkers>,
-    /// Read back from the responder this peer was prepared with, so a consumer
-    /// that answers nothing carries `None` here. See
+    /// `None` for a consumer that answers no request. See
     /// [`PeerAttachment::responder`].
-    responder: Option<SubsystemName>,
+    answering: Option<Answering>,
+}
+
+/// What a consumer needs to answer a request: the delivery workers its teardown
+/// joins, and the name its answers claim.
+///
+/// One value carries both. So an attachment that admits a name always holds the
+/// workers that answer under it.
+struct Answering {
+    workers: ResponseWorkers,
+    subsystem: SubsystemName,
 }
 
 /// A prepared peer that also holds the responder its consumer answers with.
@@ -107,6 +115,19 @@ pub(in crate::consumer) struct PeerHandles {
     /// Held so a caller that asked for the report can also observe a
     /// coordinator that ended without one.
     coordinator: JoinHandle<()>,
+}
+
+impl Answering {
+    /// Pairs `workers` with the name `responder` frames its answers with.
+    ///
+    /// The name comes off the responder, never off a caller. So the decode path
+    /// admits the name this consumer's own answers claim.
+    fn new<R: Codec>(responder: &Responder<R>, workers: ResponseWorkers) -> Self {
+        Self {
+            workers,
+            subsystem: responder.subsystem().clone(),
+        }
+    }
 }
 
 impl PeerHandles {
@@ -176,8 +197,7 @@ impl<D: NodeDirectory, R: Codec> PreparedResponder<D, R> {
         responder: Responder<R>,
         workers: ResponseWorkers,
     ) -> Self {
-        peer.workers = Some(workers);
-        peer.responder = Some(responder.subsystem().clone());
+        peer.answering = Some(Answering::new(&responder, workers));
         Self {
             peer,
             responder: Arc::new(responder),
@@ -220,7 +240,9 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
     }
 
     fn responder(&self) -> Option<SubsystemName> {
-        self.responder.clone()
+        self.answering
+            .as_ref()
+            .map(|answering| answering.subsystem.clone())
     }
 
     async fn activate(
@@ -229,8 +251,7 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
     ) -> Result<Option<PeerHandles>, (Self, ConsumerError)> {
         let Self {
             prepared,
-            workers,
-            responder,
+            answering,
         } = self;
         let runtime = match prepared.activate(group).await {
             Ok(runtime) => runtime,
@@ -238,8 +259,7 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
                 return Err((
                     Self {
                         prepared,
-                        workers,
-                        responder,
+                        answering,
                     },
                     PeerInitError::Directory {
                         message: format!("{error:#}"),
@@ -248,6 +268,7 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
                 ));
             }
         };
+        let workers = answering.map(|answering| answering.workers);
         let pending = Arc::clone(runtime.pending());
         let (stop, stopped) = oneshot::channel();
         let coordinator = tokio::spawn(run_coordinator(runtime, workers, stopped));
@@ -262,8 +283,8 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
         // Stop the listener and registry first. Join workers after the caller
         // releases the provider that holds the last responder clone.
         self.prepared.abandon().await;
-        if let Some(workers) = self.workers {
-            workers.join().await;
+        if let Some(answering) = self.answering {
+            answering.workers.join().await;
         }
     }
 }
@@ -312,8 +333,7 @@ where
     .map_err(PeerInitError::from)?;
     Ok(PreparedPeer {
         prepared,
-        workers: None,
-        responder: None,
+        answering: None,
     })
 }
 
@@ -341,10 +361,7 @@ where
     let mut peer = prepare_requester(peer, backend, managers, heartbeats).await?;
     match peer.prepared.responder(subsystem) {
         Ok((responder, workers)) => {
-            // Read back from the responder, so the decode path admits the name
-            // this consumer's own answers claim.
-            peer.responder = Some(responder.subsystem().clone());
-            peer.workers = Some(workers);
+            peer.answering = Some(Answering::new(&responder, workers));
             Ok(PreparedResponder {
                 peer,
                 responder: Arc::new(responder),

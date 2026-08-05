@@ -363,8 +363,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
     /// so this call alone decides when the drain starts. It runs it once the
     /// gate has closed and emptied. A drain that joins response workers
     /// terminates only after the last send handle drops; that precondition
-    /// belongs to
-    /// [`ResponseWorkers`](crate::response::sender::ResponseWorkers).
+    /// belongs to [`ResponseWorkers`].
     ///
     /// The body reads as the order. Three of its steps are where they are for a
     /// reason the code cannot show:
