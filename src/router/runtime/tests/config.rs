@@ -143,7 +143,10 @@ fn configuration_refuses_degenerate_values() -> Result<()> {
         .network("east")
         .build()?;
     assert!(built.validate().is_ok(), "the entry point must validate");
-    assert_eq!(built.registration_ttl, default.registration_ttl);
+    assert_eq!(
+        built.address_cache_capacity, default.address_cache_capacity,
+        "a field the builder was not given must keep its default"
+    );
 
     let cases = [
         RouterConfiguration {

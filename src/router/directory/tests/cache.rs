@@ -1,6 +1,7 @@
-use super::support::{cassandra_directory, finish, membership, registration, token};
+use super::support::{
+    cassandra_directory, finish, membership, memory_directory_holding, registration, token,
+};
 use crate::router::directory::cache::AddressCache;
-use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::directory::{Endpoint, NodeDirectory, NodeRegistration, RegistrationTtl};
 use crate::router::{Host, NodeId};
 use crate::test_util::{TEST_RUNTIME, integration_test_count};
@@ -10,6 +11,7 @@ use color_eyre::eyre::eyre;
 use futures::future::join_all;
 use quanta::Clock;
 use quickcheck::{QuickCheck, TestResult};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -22,6 +24,17 @@ const CAPACITY: usize = 8;
 /// stream can push the cache past its bound.
 const POOL: usize = 12;
 
+/// What the memory directory under test holds: the whole pool, so no answer
+/// here can be given by an eviction inside the directory rather than by the
+/// cache.
+///
+/// `match`, not `NonZeroUsize::new(..).unwrap_or(..)`: `Option::unwrap_or` is
+/// not const, and the tests forbid `unwrap`.
+const POOL_CAPACITY: NonZeroUsize = match NonZeroUsize::new(POOL) {
+    Some(capacity) => capacity,
+    None => NonZeroUsize::MIN,
+};
+
 /// The head of every request stream. Nine distinct ids exceed [`CAPACITY`], so
 /// the occupancy bound is exercised on every iteration.
 const PREFIX: [usize; 10] = [0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -32,8 +45,8 @@ const CONCURRENT: usize = 16;
 /// The lease the cached entries age on.
 const POOL_LEASE: Duration = Duration::from_hours(1);
 
-/// The pool, registered once for the whole test process under a lease long
-/// enough to outlive the run.
+/// The Cassandra pool, registered once for the whole test process under a lease
+/// long enough to outlive the run.
 static POOL_NODES: OnceCell<Vec<(NodeId, u16)>> = OnceCell::const_new();
 
 /// The three bounds that make the address cache safe to key by a node id an
@@ -54,19 +67,33 @@ static POOL_NODES: OnceCell<Vec<(NodeId, u16)>> = OnceCell::const_new();
 ///
 /// **Absence.** A node the directory does not hold is cached as absent, so a
 /// burst for an unknown id issues one read and not one per request.
+///
+/// The cache reads through a [`NodeDirectory`] and nothing more, so this is the
+/// default loop and it needs no cluster.
 #[test]
 fn prop_address_cache_bounded_single_flight() {
     fn property(generated: Vec<usize>) -> TestResult {
         finish(TEST_RUNTIME.block_on(async {
-            let directory = cassandra_directory(POOL_LEASE).await?;
-            let pool = pool(&directory).await?;
-            let ttl = directory.ttl();
+            let directory = memory_directory_holding(POOL_CAPACITY, POOL_LEASE)?;
+            let pool = register_pool(&directory).await?;
+            run_address_cache_cases(&directory, &pool, directory.ttl(), generated).await
+        }))
+    }
+    init_test_logging();
+    QuickCheck::new().quickcheck(property as fn(Vec<usize>) -> TestResult);
+}
 
-            occupancy_holds(&directory, pool, ttl, generated).await?;
-            one_read_per_cold_burst(&directory, pool, ttl).await?;
-            a_fresh_entry_is_served_until_the_lease_ends(&directory, pool, ttl).await?;
-            absence_is_cached(&directory, ttl).await?;
-            Ok(())
+/// The same four bounds over the Cassandra directory, so a read that crosses
+/// the wire is held to them too.
+#[test]
+fn prop_address_cache_bounded_single_flight_over_cassandra() {
+    fn property(generated: Vec<usize>) -> TestResult {
+        finish(TEST_RUNTIME.block_on(async {
+            let directory = cassandra_directory(POOL_LEASE).await?;
+            let pool = POOL_NODES
+                .get_or_try_init(|| register_pool(&directory))
+                .await?;
+            run_address_cache_cases(&directory, pool, directory.ttl(), generated).await
         }))
     }
     init_test_logging();
@@ -75,11 +102,24 @@ fn prop_address_cache_bounded_single_flight() {
         .quickcheck(property as fn(Vec<usize>) -> TestResult);
 }
 
+/// Runs every address-cache case against one directory and one pool.
+async fn run_address_cache_cases<D: NodeDirectory>(
+    directory: &D,
+    pool: &[(NodeId, u16)],
+    ttl: RegistrationTtl,
+    generated: Vec<usize>,
+) -> Result<()> {
+    occupancy_holds(directory, pool, ttl, generated).await?;
+    one_read_per_cold_burst(directory, pool, ttl).await?;
+    a_fresh_entry_is_served_until_the_lease_ends(directory, pool, ttl).await?;
+    absence_is_cached(directory, ttl).await
+}
+
 /// Drives the generated stream and checks the two bounds that hold at every
 /// position: occupancy, and one read per request at most. Each served value is
 /// checked against the port its node registered, so a mixed-up entry is caught.
-async fn occupancy_holds(
-    directory: &CassandraNodeDirectory,
+async fn occupancy_holds<D: NodeDirectory>(
+    directory: &D,
     pool: &[(NodeId, u16)],
     ttl: RegistrationTtl,
     generated: Vec<usize>,
@@ -117,8 +157,8 @@ async fn occupancy_holds(
 
 /// A burst of callers for one cold node issues one read: the winner takes the
 /// placeholder and every other caller parks on it.
-async fn one_read_per_cold_burst(
-    directory: &CassandraNodeDirectory,
+async fn one_read_per_cold_burst<D: NodeDirectory>(
+    directory: &D,
     pool: &[(NodeId, u16)],
     ttl: RegistrationTtl,
 ) -> Result<()> {
@@ -145,8 +185,8 @@ async fn one_read_per_cold_burst(
 /// A fresh entry is served without a read; past the lease the same entry is
 /// read again. The cache holds one entry here, so admission cannot be undone
 /// by an eviction and the hit is deterministic.
-async fn a_fresh_entry_is_served_until_the_lease_ends(
-    directory: &CassandraNodeDirectory,
+async fn a_fresh_entry_is_served_until_the_lease_ends<D: NodeDirectory>(
+    directory: &D,
     pool: &[(NodeId, u16)],
     ttl: RegistrationTtl,
 ) -> Result<()> {
@@ -179,7 +219,7 @@ async fn a_fresh_entry_is_served_until_the_lease_ends(
 
 /// A node the directory does not hold is cached as absent, so repeated
 /// requests for an unknown id issue one read and not one per request.
-async fn absence_is_cached(directory: &CassandraNodeDirectory, ttl: RegistrationTtl) -> Result<()> {
+async fn absence_is_cached<D: NodeDirectory>(directory: &D, ttl: RegistrationTtl) -> Result<()> {
     let (clock, _mock) = Clock::mock();
     let cache = AddressCache::with_clock(CAPACITY, ttl, clock);
     let reads = AtomicUsize::new(0);
@@ -199,9 +239,9 @@ async fn absence_is_cached(directory: &CassandraNodeDirectory, ttl: Registration
 }
 
 /// Resolves `node`, counting the directory reads the cache actually issues.
-async fn resolve(
+async fn resolve<D: NodeDirectory>(
     cache: &AddressCache,
-    directory: &CassandraNodeDirectory,
+    directory: &D,
     reads: &AtomicUsize,
     node: NodeId,
 ) -> Result<Option<Arc<NodeRegistration>>> {
@@ -213,27 +253,23 @@ async fn resolve(
         .await?)
 }
 
-/// The shared pool: [`POOL`] registered nodes, each with a distinct direct
-/// port so a mixed-up cache entry serves an observably wrong value.
-async fn pool(directory: &CassandraNodeDirectory) -> Result<&'static Vec<(NodeId, u16)>> {
-    POOL_NODES
-        .get_or_try_init(|| async {
-            let membership = membership();
-            let mut nodes = Vec::with_capacity(POOL);
-            for index in 0..POOL {
-                let node = NodeId::new();
-                // The port is the value the assertions join on, so it must
-                // differ per node.
-                let port = 20_000 + index as u16;
-                let mut written = registration(node, membership.clone());
-                written.direct = Endpoint {
-                    host: Host::make(&format!("pool-{}", token())),
-                    port,
-                };
-                directory.register(&written).await?;
-                nodes.push((node, port));
-            }
-            Ok::<_, color_eyre::Report>(nodes)
-        })
-        .await
+/// Registers [`POOL`] nodes, each with a distinct direct port so a mixed-up
+/// cache entry serves an observably wrong value.
+async fn register_pool<D: NodeDirectory>(directory: &D) -> Result<Vec<(NodeId, u16)>> {
+    let membership = membership();
+    let mut nodes = Vec::with_capacity(POOL);
+    for index in 0..POOL {
+        let node = NodeId::new();
+        // The port is the value the assertions join on, so it must differ per
+        // node.
+        let port = 20_000 + index as u16;
+        let mut written = registration(node, membership.clone());
+        written.direct = Endpoint {
+            host: Host::make(&format!("pool-{}", token())),
+            port,
+        };
+        directory.register(&written).await?;
+        nodes.push((node, port));
+    }
+    Ok(nodes)
 }

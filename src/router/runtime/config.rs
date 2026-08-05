@@ -2,7 +2,6 @@
 //! degenerate value at startup.
 
 use crate::router::MAX_LABEL_BYTES;
-use crate::router::directory::RegistrationTtl;
 use derive_builder::Builder;
 use validator::{Validate, ValidationError};
 
@@ -46,10 +45,6 @@ pub(crate) struct RouterConfiguration {
     #[validate(custom(function = "validate_label"))]
     pub(crate) network: Option<String>,
 
-    /// How long a registration survives without a refresh. The type carries the
-    /// range, so a lease outside it never reaches a configuration at all.
-    pub(crate) registration_ttl: RegistrationTtl,
-
     /// How many peer registrations stay cached at once, up to
     /// [`MAX_ADDRESS_CACHE_CAPACITY`].
     #[validate(range(min = 1_usize, max = MAX_ADDRESS_CACHE_CAPACITY))]
@@ -62,7 +57,6 @@ impl Default for RouterConfiguration {
             advertised_host: None,
             advertised_port: None,
             network: None,
-            registration_ttl: RegistrationTtl::DEFAULT,
             address_cache_capacity: DEFAULT_ADDRESS_CACHE_CAPACITY,
         }
     }

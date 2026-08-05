@@ -1,10 +1,8 @@
 use super::{NodeId, Preference, RelayHop, Router, RouterHandle, SendFailure, choose_route};
 use crate::router::Host;
-use crate::router::directory::cache::{AddressCache, AddressResolver};
+use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::tests::support::{membership, memory_directory, registration};
-use crate::router::directory::{
-    Endpoint, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
-};
+use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::LoopbackSender;
@@ -106,10 +104,7 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
 
         let (transport, _recorded) = LoopbackSender::new();
         let router = RouterHandle::new(
-            AddressResolver::new(
-                AddressCache::new(CACHE_CAPACITY, RegistrationTtl::try_from(LEASE)?),
-                directory,
-            ),
+            AddressResolver::new(CACHE_CAPACITY, directory),
             Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
             Arc::new(transport),
             None,
@@ -169,10 +164,7 @@ fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<(
 
         let (transport, _recorded) = LoopbackSender::new();
         let router = RouterHandle::new(
-            AddressResolver::new(
-                AddressCache::new(CACHE_CAPACITY, RegistrationTtl::try_from(LEASE)?),
-                directory.clone(),
-            ),
+            AddressResolver::new(CACHE_CAPACITY, directory.clone()),
             Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
             Arc::new(transport),
             None,

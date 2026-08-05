@@ -16,6 +16,7 @@ use crate::test_util::test_cassandra_config;
 use color_eyre::Result;
 use fixedstr::Flexstr;
 use quickcheck::{Arbitrary, Gen, TestResult};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
@@ -72,8 +73,17 @@ pub(crate) async fn cassandra_directory(lease: Duration) -> Result<CassandraNode
 /// An in-process directory holding [`SUITE_CAPACITY`] registrations under
 /// `lease`.
 pub(crate) fn memory_directory(lease: Duration) -> Result<MemoryNodeDirectory> {
+    memory_directory_holding(SUITE_CAPACITY, lease)
+}
+
+/// An in-process directory holding `capacity` registrations under `lease`, for
+/// a suite whose pool is larger than [`SUITE_CAPACITY`].
+pub(crate) fn memory_directory_holding(
+    capacity: NonZeroUsize,
+    lease: Duration,
+) -> Result<MemoryNodeDirectory> {
     Ok(MemoryNodeDirectory::new(
-        SUITE_CAPACITY,
+        capacity,
         RegistrationTtl::try_from(lease)?,
     ))
 }

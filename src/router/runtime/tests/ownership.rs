@@ -1,24 +1,19 @@
 //! What the runtime owns, and what its handles reach.
 //!
-//! One process has one node identity. Two tests here read that identity from
-//! all three places it appears — the listener the runtime serves, the row the
+//! One process has one node identity. The tests here read that identity from
+//! all three places it appears — the listener the runtime serves, the entry the
 //! directory holds, and the address the runtime's own router resolves — and
-//! require them to agree. The third reads the lease those answers are served
-//! within.
+//! require them to agree.
 
-use super::super::{PeerInputs, PeerRuntime, RouterConfiguration};
-use super::{ALPHA, CONTACT, Process, Shared, TIMEOUT, frame_cap, header, listener, requester};
+use super::{ALPHA, Process, Shared, TIMEOUT, frame_cap, header};
 use crate::codec::Codec;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::sender::TypedSender;
 use crate::router::directory::NodeDirectory;
-use crate::router::directory::RegistrationTtl;
-use crate::router::directory::tests::support::cassandra_directory;
-use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::TRANSPORT;
 use crate::router::grpc::client::GrpcSender;
-use crate::router::loopback::{HANG_GUARD, TestHealth};
+use crate::router::loopback::HANG_GUARD;
 use crate::router::{NodeId, ResponseSender, Router, SendFailure};
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
@@ -137,60 +132,6 @@ fn a_response_through_the_runtime_router_reaches_this_process() -> Result<()> {
                 sender.drain().await;
             })
             .await?;
-        outcome
-    })
-}
-
-/// The runtime resolves through a cache aged on the lease it publishes under.
-///
-/// The directory carries that one lease, and it governs both halves of
-/// reachability: how long this node's own row survives without a refresh, and
-/// how long a peer's address is still served after that peer's row is gone. A
-/// cache built with any other lease would hand a dialer an address that answers
-/// for nobody, for a time no operator asked for.
-///
-/// The bound is read rather than waited out. What the bound *means* — an entry
-/// is served until it, and read again past it — belongs to
-/// [`AddressCache`](crate::router::directory::cache::AddressCache) and is
-/// proved on a mock clock by the cache's own property. What is left for this
-/// test is the wiring, and equality proves that exactly, where a wall clock
-/// could only bracket it.
-#[test]
-fn the_resolver_ages_entries_on_the_lease_this_process_publishes_under() -> Result<()> {
-    init_test_logging();
-    TEST_RUNTIME.block_on(async {
-        // Not the default lease, so a cache aged on a constant fails here.
-        let lease = RegistrationTtl::try_from(RegistrationTtl::MIN)?;
-        let router = RouterConfiguration::default();
-        let requester = requester();
-        let runtime = PeerRuntime::start(PeerInputs {
-            directory: cassandra_directory(lease.duration()).await?,
-            listener: listener().await?,
-            health: TestHealth::new(true, true),
-            contact: CONTACT,
-            group: None,
-            router: &router,
-            fleet: FleetConfiguration::default(),
-            requester: &requester,
-        })
-        .await?;
-        let node = runtime.node();
-        let outcome: Result<()> = async {
-            let addresses = runtime.addresses();
-            ensure!(
-                addresses.resolve(node).await?.is_some(),
-                "a started runtime must resolve its own node"
-            );
-            ensure!(
-                addresses.ttl() == lease.duration(),
-                "the resolver serves an entry for {:?}, not the {:?} this process publishes under",
-                addresses.ttl(),
-                lease.duration()
-            );
-            Ok(())
-        }
-        .await;
-        runtime.shutdown(|| async {}).await?;
         outcome
     })
 }

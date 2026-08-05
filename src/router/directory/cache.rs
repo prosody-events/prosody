@@ -28,7 +28,7 @@ type Entry = (Instant, Option<Arc<NodeRegistration>>);
 
 /// The concrete `quick_cache` instance. Items are weighed by count: capacity
 /// bounds how many registrations are held, and each one holds only what the
-/// directory row held — a host, a machine name, and two optional labels.
+/// directory entry held — a host, a machine name, and two optional labels.
 type Inner = Cache<NodeId, Entry, UnitWeighter, ahash::RandomState>;
 
 /// Node id to registration, read through to the directory.
@@ -42,14 +42,14 @@ type Inner = Cache<NodeId, Entry, UnitWeighter, ahash::RandomState>;
 /// inserts or drops. The callers in flight bound the placeholders, so traffic
 /// does not.
 ///
-/// **Age** is this process's own configured [`RegistrationTtl`], so there is no
-/// second TTL to configure wrongly. It bounds how long an entry is served,
-/// never how closely that entry tracks the row. The stamp is taken when the
-/// read is issued, so an entry filled from a row that was about to expire
-/// outlives that row by nearly a whole lease. A process configured with a
-/// longer lease than the writer applies to its row keeps the entry longer
-/// still. The address is then dialed and the response is dropped, which is what
-/// the best-effort posture already accepts.
+/// **Age** is the [`RegistrationTtl`] of the directory the cache reads, so
+/// there is no second lease to configure wrongly. It bounds how long an entry
+/// is served, never how closely that entry tracks the directory. The stamp is
+/// taken when the read is issued, so an entry filled from a registration that
+/// was about to expire outlives it by nearly a whole lease. A peer that
+/// publishes under a shorter lease than this process reads on keeps the entry
+/// longer still. The address is then dialed and the response is dropped, which
+/// is what the best-effort posture already accepts.
 ///
 /// Its single-flight behaviour is what matters on the response path: every
 /// caller after the first parks on the placeholder until the fill finishes, so
@@ -70,7 +70,8 @@ pub(crate) struct AddressCache {
 ///
 /// One type, so every caller that needs an address holds one thing rather than
 /// a cache and a directory it must remember to pair. It only reads, and every
-/// read goes through the cache: it exposes no write and no direct row access.
+/// read goes through the cache: it exposes no write and no direct directory
+/// access.
 #[derive(Clone)]
 pub(crate) struct AddressResolver<D> {
     cache: AddressCache,
@@ -112,13 +113,6 @@ impl AddressCache {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.inner.len()
-    }
-
-    /// The age an entry is served within. It is the value `resolve` compares
-    /// against, so a caller that reads it reads the bound itself.
-    #[cfg(test)]
-    pub(crate) const fn ttl(&self) -> Duration {
-        self.ttl
     }
 
     /// Serves a fresh entry, or fills single-flight through `fill`.
@@ -167,23 +161,23 @@ impl AddressCache {
     }
 }
 
-impl<D> AddressResolver<D> {
-    /// Reads `directory` through `cache`.
-    #[must_use]
-    pub(crate) const fn new(cache: AddressCache, directory: D) -> Self {
-        Self { cache, directory }
-    }
-
-    /// The age this resolver serves an entry within, from the cache it reads
-    /// through.
-    #[cfg(test)]
-    pub(crate) const fn ttl(&self) -> Duration {
-        self.cache.ttl()
-    }
-}
-
 impl<D: NodeDirectory> AddressResolver<D> {
-    /// What `node` published, or `None` when the directory holds no row for it.
+    /// Reads `directory` through a cache of up to `capacity` registrations.
+    ///
+    /// The cache is built here, from the lease `directory` publishes, rather
+    /// than taken as an argument. A resolver that served an entry past the
+    /// lease its registrations were written under is therefore unwritable, and
+    /// no call site has to pair the two values by hand.
+    #[must_use]
+    pub(crate) fn new(capacity: usize, directory: D) -> Self {
+        Self {
+            cache: AddressCache::new(capacity, directory.ttl()),
+            directory,
+        }
+    }
+
+    /// What `node` published, or `None` when the directory holds no entry for
+    /// it.
     ///
     /// # Errors
     ///

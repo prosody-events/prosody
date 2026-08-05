@@ -11,7 +11,7 @@
 
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::{PendingRegistry, RegistryError};
-use crate::router::directory::cache::{AddressCache, AddressResolver};
+use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::{
     Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
 };
@@ -63,14 +63,17 @@ mod tests;
 ///
 /// A runtime that is dropped instead still ends: the refresher stops when the
 /// watch channel closes, the listener stops when the one-shot sender drops, the
-/// registry's sweep stops when its last [`Arc`] drops, and this node's row
+/// registry's sweep stops when its last [`Arc`] drops, and this node's entry
 /// expires on its lease. What a plain drop cannot do is wake a parked waiter or
 /// wait for a reservation, which is why shutdown exists.
 ///
-/// The directory backend travels with this type and stops here. Every handle
-/// the runtime gives out is either free of it, or is taken by a constructor
-/// that erases the router. An owner above therefore never has to name `D`: it
-/// moves the whole runtime into a task of its own and keeps the handles.
+/// The directory backend travels with this type and stops here.
+/// [`router`](Self::router) is the one handle that carries `D`, and every
+/// consumer of it takes it by reference into a constructor that returns a type
+/// naming no `D`. [`addresses`](Self::addresses) hands back a borrow, so it
+/// reaches no owner that outlives the runtime. An owner above therefore never
+/// writes `D`: it infers it where it builds the runtime, and moves the whole
+/// runtime into a task of its own.
 pub(crate) struct PeerRuntime<D> {
     addresses: AddressResolver<D>,
     router: RouterHandle<GrpcSender, D>,
@@ -123,7 +126,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
     /// Returns [`PeerRuntimeError`] when the configuration, discovery, the
     /// directory, the registry, the fleet, or the listener refuses to start.
     /// A failed first write stops the listener again before it returns. It
-    /// issues no delete: a row the failed write still applied expires on its
+    /// issues no delete: an entry the failed write still applied expires on its
     /// lease.
     pub(crate) async fn start<H: ProcessHealth>(
         inputs: PeerInputs<'_, H, D>,
@@ -158,10 +161,8 @@ impl<D: NodeDirectory> PeerRuntime<D> {
             inputs.router,
             inputs.group,
         );
-        let addresses = AddressResolver::new(
-            AddressCache::new(inputs.router.address_cache_capacity, ttl),
-            directory.clone(),
-        );
+        let addresses =
+            AddressResolver::new(inputs.router.address_cache_capacity, directory.clone());
         let router = RouterHandle::new(
             addresses.clone(),
             Arc::clone(&fleet),
@@ -352,7 +353,7 @@ async fn abandon(stop: oneshot::Sender<()>, listener: JoinHandle<()>) {
 ///
 /// Every label this returns is inside
 /// [`MAX_LABEL_BYTES`](crate::router::MAX_LABEL_BYTES), which is what lets a
-/// reader treat a longer one as a row this code did not write.
+/// reader treat a longer one as an entry this code did not write.
 /// [`PeerRuntime::start`] validates the configured labels before it calls this
 /// function, the routed probe answers with an address literal, and
 /// [`discover`] checks the machine name.
