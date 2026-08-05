@@ -31,10 +31,12 @@ use crate::timers::duration::CompactDuration;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use crate::{JsonCodec, Partition, PeerConfiguration, Topic};
 use color_eyre::Result;
+use color_eyre::eyre::eyre;
 use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::array::from_fn;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
@@ -42,6 +44,7 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Semaphore;
+use tokio::time::timeout;
 
 mod lifecycle;
 
@@ -53,6 +56,20 @@ const RETAINED_TOPIC: &str = "peer-lifecycle-retained";
 
 /// The partition of that manager.
 const RETAINED_PARTITION: Partition = 0;
+
+/// The deadline for each consumer lifecycle step these tests await.
+///
+/// A consumer that starts or stops finishes each step at once. So this deadline
+/// is a hang-guard and never the assertion. Without it, a step that never
+/// finishes reports nothing: the poll loop only ends when the shutdown flag is
+/// set, and an await on its join handle has no other detector.
+///
+/// The deadline names the failure; it cannot end the process. The poll loop
+/// runs on a blocking task, and a runtime drop waits for one, so a defect that
+/// makes the loop immortal hangs the test binary after this deadline already
+/// failed the test. The `slow-timeout` backstop in `.config/nextest.toml` is
+/// what bounds that.
+const HANG_GUARD: Duration = Duration::from_secs(30);
 
 type EventLog = Arc<Mutex<Vec<Event>>>;
 
@@ -286,6 +303,14 @@ fn retain_manager(
         .write()
         .insert((topic, RETAINED_PARTITION), manager);
     Ok(())
+}
+
+/// Awaits one consumer lifecycle step under [`HANG_GUARD`]. The error names the
+/// step that did not finish.
+async fn bounded<F: Future>(step: &'static str, future: F) -> Result<F::Output> {
+    timeout(HANG_GUARD, future)
+        .await
+        .map_err(|_| eyre!("hang-guard: {step} did not finish"))
 }
 
 fn peer_config(bind: SocketAddr) -> Result<PeerConfiguration> {

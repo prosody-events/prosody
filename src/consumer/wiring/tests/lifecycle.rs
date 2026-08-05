@@ -1,7 +1,7 @@
 //! What a consumer does about the peer runtime at startup and at shutdown.
 
 use super::{
-    Event, EventLog, RecordingBackend, RecordingDirectory, consumer_config, peer_config,
+    Event, EventLog, RecordingBackend, RecordingDirectory, bounded, consumer_config, peer_config,
     retain_manager, start,
 };
 use crate::consumer::Managers;
@@ -24,9 +24,13 @@ async fn a_consumer_without_a_peer_starts_and_stops() -> Result<()> {
     let config = consumer_config("peer-lifecycle-none")?;
     let managers: Arc<Managers<Value>> = Arc::default();
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
-    let consumer = start(&config, managers, heartbeats, Arc::clone(&log), NoPeer).await?;
+    let consumer = bounded(
+        "startup",
+        start(&config, managers, heartbeats, Arc::clone(&log), NoPeer),
+    )
+    .await??;
 
-    consumer.shutdown().await?;
+    bounded("shutdown", consumer.shutdown()).await??;
 
     // The poll task drops the provider, and nothing else records anything. An
     // equality rather than a predicate: a predicate over an empty log would
@@ -54,14 +58,17 @@ async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let attachment = prepare_requester(&peer, &backend, Arc::clone(&managers), &heartbeats).await?;
-    let consumer = start(
-        &config,
-        Arc::clone(&managers),
-        heartbeats,
-        Arc::clone(&log),
-        attachment,
+    let consumer = bounded(
+        "startup",
+        start(
+            &config,
+            Arc::clone(&managers),
+            heartbeats,
+            Arc::clone(&log),
+            attachment,
+        ),
     )
-    .await?;
+    .await??;
     assert!(
         log.lock()
             .iter()
@@ -70,7 +77,7 @@ async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
     );
     retain_manager(&config, &managers, Arc::clone(&log))?;
 
-    consumer.shutdown().await?;
+    bounded("shutdown", consumer.shutdown()).await??;
 
     let events = log.lock();
     let position = |wanted: &Event| events.iter().position(|event| event == wanted);
@@ -107,20 +114,23 @@ async fn a_second_shutdown_sweeps_nothing() -> Result<()> {
     let config = consumer_config("peer-lifecycle-second")?;
     let managers: Arc<Managers<Value>> = Arc::default();
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
-    let consumer = start(
-        &config,
-        Arc::clone(&managers),
-        heartbeats,
-        Arc::clone(&log),
-        NoPeer,
+    let consumer = bounded(
+        "startup",
+        start(
+            &config,
+            Arc::clone(&managers),
+            heartbeats,
+            Arc::clone(&log),
+            NoPeer,
+        ),
     )
-    .await?;
+    .await??;
     let loser = consumer.clone();
 
-    consumer.shutdown().await?;
+    bounded("the winning shutdown", consumer.shutdown()).await??;
     // Retained after the winner finished, so only the loser could sweep it.
     retain_manager(&config, &managers, Arc::clone(&log))?;
-    loser.shutdown().await?;
+    bounded("the losing shutdown", loser.shutdown()).await??;
 
     assert_eq!(
         managers.read().len(),
@@ -150,10 +160,13 @@ async fn failed_activation_rolls_back_and_releases_the_listener() -> Result<()> 
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let attachment = prepare_requester(&peer, &backend, Arc::clone(&managers), &heartbeats).await?;
 
-    let error = start(&config, managers, heartbeats, Arc::clone(&log), attachment)
-        .await
-        .err()
-        .ok_or_else(|| eyre!("activation succeeded despite the scripted failure"))?;
+    let error = bounded(
+        "startup",
+        start(&config, managers, heartbeats, Arc::clone(&log), attachment),
+    )
+    .await?
+    .err()
+    .ok_or_else(|| eyre!("activation succeeded despite the scripted failure"))?;
     assert!(
         matches!(error, ConsumerError::Peer(PeerInitError::Directory { .. })),
         "activation returned the wrong error: {error:#}"
