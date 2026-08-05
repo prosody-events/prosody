@@ -34,7 +34,7 @@ jobs:
     if: needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      RUSTFLAGS: -C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=mold
     services:
       kafka:
         image: apache/kafka:latest
@@ -114,7 +114,7 @@ jobs:
     if: needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      RUSTFLAGS: -C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v6
       - name: Install mold
@@ -140,7 +140,7 @@ jobs:
     if: needs.plan.outputs.docs == 'true' || needs.plan.outputs.build == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      RUSTFLAGS: -C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v6
       - name: Install mold
