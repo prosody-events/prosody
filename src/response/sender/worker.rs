@@ -99,9 +99,11 @@ impl Share {
 /// Every dequeued job ends as exactly one outcome: it moves one stage or one
 /// drop reason, one of this sender's two counters, and the `peer.disposition`
 /// attribute on its own span. A delivered job also records `peer.preference`
-/// and may count one fallback transition. The deadline is the biased arm
-/// of the select, so a job whose deadline has already passed is dropped before
-/// the pipeline is polled at all — nothing is paced, encoded or sent for it.
+/// and counts one fallback transition when its walk made one. Every count of
+/// one job sits in this one match, so no two of them can disagree about what
+/// that job came to. The deadline is the biased arm of the select, so a job
+/// whose deadline has already passed is dropped before the pipeline is polled
+/// at all — nothing is paced, encoded or sent for it.
 /// Work already inside one poll still finishes: this is a deadline the pipeline
 /// is measured against between polls, never an absolute wall-clock cut.
 ///
@@ -154,9 +156,12 @@ pub(super) async fn run_worker<C: Codec, R: Router>(
         // level-disabled span never becomes current, and the deadline arm has
         // already left the instrumented future in any case.
         match outcome {
-            Ok(preference) => {
+            Ok((preference, from)) => {
                 span.record("peer.disposition", "delivered");
                 span.record("peer.preference", preference.label());
+                if let Some(from) = from {
+                    record_fallback(from, preference);
+                }
                 Stage::Delivered.record();
                 context.counters.sent.fetch_add(1, Relaxed);
             }
@@ -175,9 +180,11 @@ pub(super) async fn run_worker<C: Codec, R: Router>(
 
 /// Resolves one response's route, frames it and delivers it.
 ///
-/// `Ok` carries the preference of the candidate that accepted the frame; every
-/// other outcome names why the response was dropped. The caller counts that
-/// outcome, so one dequeued job moves one of the sender's two counters.
+/// `Ok` carries the candidate that accepted the frame, and the candidate tried
+/// before it when the walk fell back; every other outcome names why the
+/// response was dropped. The transition travels out rather than being counted
+/// here, so the caller counts the whole outcome of one dequeued job in one
+/// place.
 ///
 /// The attempt budget applies to each endpoint rather than to both together.
 /// Sharing it would make the fallback unreachable whenever one attempt is
@@ -194,7 +201,7 @@ async fn deliver_job<C: Codec, R: Router>(
     header: FrameHeader,
     payload: C::Payload,
     expires_at: Instant,
-) -> Result<Preference, DropReason> {
+) -> Result<(Preference, Option<Preference>), DropReason> {
     // No address originates anywhere but a registration: a node the directory
     // does not hold is not dialed at all, and a node the rules refuse to reach
     // from here is not dialed either.
@@ -216,15 +223,16 @@ async fn deliver_job<C: Codec, R: Router>(
     Stage::Framed.record();
     let mut remembered = None;
     let mut last_failure = None;
-    // The candidate tried before this one: the `from` of a fallback, and the
-    // proof this is no longer the first candidate.
+    // The candidate that failed the turn before this one. Inside the loop it
+    // proves this is no longer the first candidate, and it is the `from` of a
+    // fallback.
     let mut previous = None;
     let preferred = destination.preferred();
     let candidates = route.candidates(preferred);
-    let fallback = candidates[1].is_some();
+    let has_fallback = candidates[1].is_some();
     let proven = candidates[0].is_some_and(|(preference, _)| Some(preference) == preferred);
     for (preference, address) in candidates.into_iter().flatten() {
-        let share = if previous.is_some() || !fallback {
+        let share = if previous.is_some() || !has_fallback {
             Share::Rest
         } else if proven {
             Share::Most
@@ -243,11 +251,8 @@ async fn deliver_job<C: Codec, R: Router>(
         .await
         {
             Ok(()) => {
-                if let Some(from) = previous {
-                    record_fallback(from, preference);
-                }
                 destination.prefer(Some(preference));
-                return Ok(preference);
+                return Ok((preference, previous));
             }
             Err(failure) => {
                 last_failure = Some((preference, failure));
@@ -266,11 +271,13 @@ async fn deliver_job<C: Codec, R: Router>(
     }
     destination.prefer(remembered);
     if let Some((preference, failure)) = last_failure {
+        // What the walk did, not what the route offered. The last turn sets
+        // `previous` as well, so a route of one candidate needs both terms.
         warn!(
             %failure,
             node = %header.target,
             preference = preference.label(),
-            fallback,
+            fell_back = has_fallback && previous.is_some(),
             "response delivery failed"
         );
     }
@@ -340,8 +347,8 @@ async fn pace(destination: &Destination) {
 /// `until` is what this process spends on this one endpoint, and it covers the
 /// channel lookup and the readiness wait as well, neither of which the
 /// `grpc-timeout` header reaches. Giving up on it therefore reads as
-/// [`SendFailure::Unreachable`]: nothing was served here, and the next
-/// candidate keeps what the response has left.
+/// [`SendFailure::Unreachable`]: nothing answered here, and the next candidate
+/// keeps what the response has left.
 async fn attempt<S: ResponseSender, F: Framed + Sync>(
     sender: &S,
     address: &Endpoint,

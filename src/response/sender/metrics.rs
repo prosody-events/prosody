@@ -83,7 +83,9 @@ pub(super) enum Stage {
     Enqueued,
     /// A worker framed it into that worker's own scratch.
     Framed,
-    /// The destination accepted the frame.
+    /// The destination accepted the frame. A worker records this stage only
+    /// where the transport answered `Ok`, so a job the deadline ended is never
+    /// counted here — not even when the peer holds its frame.
     Delivered,
 }
 
@@ -118,7 +120,9 @@ pub(super) enum DropReason {
     UnresolvableNode,
     /// The directory lookup itself failed.
     LookupFailed,
-    /// Every endpoint of the route refused or never answered.
+    /// No endpoint of the route answered `Ok`, which does not prove that none
+    /// of them read the frame. A failure that is not a wrong endpoint also ends
+    /// the walk, so the candidate behind it can stay undialed.
     SendFailed,
 }
 
@@ -194,16 +198,19 @@ pub(super) fn record_rate_limited() {
 /// it failed.
 ///
 /// A route offers a second candidate only where the dialer's network label and
-/// the node's are equal. A series that stays non-zero therefore says the first
-/// candidate does not reach that node from here. A network label put on the
-/// wrong process is one cause of that. A dead direct endpoint and a node that
-/// moved are others, so read this series as a question, not as a verdict.
+/// the node's are equal. Each count therefore says the first candidate did not
+/// serve the response from here. A network label put on the wrong process is
+/// one cause of that. A dead direct endpoint, a node that moved and a node that
+/// answered `UNAVAILABLE` are others, so read this series as a question, not as
+/// a verdict.
 ///
-/// It counts transitions, not responses. The destination remembers the
-/// candidate that answered, so the responses behind the first one start there
-/// and count nothing. `from` and `to` are recorded together, so one series
-/// names the whole transition. A reader does not need to know which endpoints
-/// a route offers.
+/// It counts transitions, not responses, and a steady fault does not count once
+/// per response. The destination remembers the candidate that answered, so the
+/// responses behind the first one start there and count nothing. A further
+/// count needs that remembered candidate to fail too, or the destination to be
+/// evicted and the walk to start over. `from` and `to` are recorded together,
+/// so one series names the whole transition. A reader does not need to know
+/// which endpoints a route offers.
 pub(super) fn record_fallback(from: Preference, to: Preference) {
     FALLBACKS.add(
         1,

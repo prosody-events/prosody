@@ -119,8 +119,9 @@ fn the_last_endpoint_of_a_route_spends_what_is_left() -> Result<()> {
     runtime.block_on(async {
         let harness = Harness::dual_homed(settings())?;
         harness.script(TARGET, dead(usize::MAX));
-        // Nothing ever releases the barrier: only the share this endpoint was
-        // given can end the attempt.
+        // Nothing ever releases the barrier. The share of the last endpoint is
+        // everything that is left, so the job's own deadline is what ends this
+        // response.
         harness.script_advertised(TARGET, Script::Hold(Arc::new(Semaphore::new(0))));
         harness.send(TARGET)?;
 

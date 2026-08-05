@@ -467,7 +467,7 @@ pub(crate) fn choose_route(
 
 /// Why one delivery attempt did not succeed.
 ///
-/// [`Status`](Self::Status) carries the gRPC status the destination itself
+/// [`Status`](Self::Status) carries the gRPC status the target address
 /// answered, rather than a code of this crate's own, for the reason
 /// [`crate::router::grpc`] states.
 #[cfg_attr(
@@ -480,12 +480,14 @@ pub(crate) fn choose_route(
 )]
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SendFailure {
-    /// The destination answered with a status other than `OK`.
-    #[error("destination answered {0:?}")]
+    /// The target address answered with a status other than `OK`. Which
+    /// process at that address answered is not knowable here.
+    #[error("the address answered {0:?}")]
     Status(Code),
 
-    /// The destination could not be reached at all.
-    #[error("destination could not be reached")]
+    /// Nothing answered before the send gave up. The frame may never have left
+    /// this process, or it may be in flight, so [`Self::is_ambiguous`] holds.
+    #[error("nothing answered before the send gave up")]
     Unreachable,
 
     /// The address the destination published is not one this transport can

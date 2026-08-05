@@ -225,7 +225,11 @@ impl<C: Codec> TypedSender<C> {
     )
 )]
 impl SendCounters {
-    /// How many responses a destination accepted.
+    /// How many responses this sender saw the transport accept.
+    ///
+    /// The deadline can end a job whose frame the peer already holds, and that
+    /// job counts as dropped. So this is what the sender observed, never what
+    /// every destination received.
     pub(crate) fn sent(&self) -> u64 {
         self.sent.load(Relaxed)
     }
