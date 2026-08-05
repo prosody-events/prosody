@@ -75,9 +75,9 @@ fn an_endpoint_that_answers_nothing_gives_the_fallback_what_it_kept() -> Result<
             max_send_attempts: RETRIED,
             ..settings()
         })?;
-        // Nothing ever releases the barrier: only the share of the deadline
-        // this endpoint was given can end the attempt.
-        harness.script(TARGET, Script::Hold(Arc::new(Semaphore::new(0))));
+        // Only the share of the deadline this endpoint was given can end the
+        // attempt.
+        harness.script(TARGET, held());
         harness.send(TARGET)?;
 
         let drained = harness.drain().await?;
@@ -107,51 +107,39 @@ fn an_endpoint_that_answers_nothing_gives_the_fallback_what_it_kept() -> Result<
 
 /// The last endpoint of a route spends everything the response has left.
 ///
-/// The direct endpoint answers at once that it is the wrong endpoint, so the
-/// walk reaches the entry point with nearly the whole deadline. Nothing answers
-/// there either, and there is no candidate behind it to keep time for, so it
-/// must hold the response until the deadline itself. An endpoint given a share
-/// of what is left would give up with time the response could still have spent
-/// and nowhere left to spend it.
+/// Nothing answers there, and there is no candidate behind it to keep time for,
+/// so it must hold the response until the deadline itself. A partial share
+/// would give the response up with time it could still spend, and nowhere left
+/// to spend it.
+///
+/// Every shape of route ends at such an endpoint, and each is checked here. A
+/// route of one candidate has it first, whether or not this destination
+/// answered there before. A route of two reaches it once the first fails.
 #[test]
 fn the_last_endpoint_of_a_route_spends_what_is_left() -> Result<()> {
     let runtime = paused()?;
     runtime.block_on(async {
-        let harness = Harness::dual_homed(settings())?;
-        harness.script(TARGET, dead(usize::MAX));
-        // Nothing ever releases the barrier. The share of the last endpoint is
-        // everything that is left, so the job's own deadline is what ends this
-        // response.
-        harness.script_advertised(TARGET, Script::Hold(Arc::new(Semaphore::new(0))));
-        harness.send(TARGET)?;
+        let alone = Harness::new(settings())?;
+        alone.script(TARGET, held());
+        spends_what_is_left(alone, &[port(TARGET)]).await?;
 
-        let drained = harness.drain().await?;
-        // The drain returns once the one worker has exited, and this response
-        // is the only work the runtime holds, so nothing moves the clock
-        // between the last attempt ending and this instant.
-        let ended = Instant::now();
-        let [wrong, last] = drained.deliveries.as_slice() else {
-            bail!(
-                "one response over two endpoints must make two attempts, not {}",
-                drained.deliveries.len()
-            );
-        };
+        // The same route, once its one endpoint is the one the destination
+        // remembers. What it answered before decides nothing here: there is
+        // still no candidate behind it to keep time for.
+        let mut remembered = Harness::new(settings())?;
+        remembered.send(TARGET)?;
         assert_eq!(
-            (wrong.port, last.port),
-            (port(TARGET), advertised_port(TARGET)),
-            "the response must try the direct endpoint and then the entry point"
+            remembered.next_delivery().await?.port,
+            port(TARGET),
+            "the first response must reach the one endpoint the route offers"
         );
-        assert_eq!(
-            drained.dropped, 1,
-            "no endpoint answered, so the response must be dropped"
-        );
-        let spent = ended.duration_since(last.at);
-        assert!(
-            is_about(spent, left(last)),
-            "the last endpoint gave the response up after {spent:?} of the {:?} it had left",
-            left(last)
-        );
-        Ok(())
+        remembered.script(TARGET, held());
+        spends_what_is_left(remembered, &[port(TARGET)]).await?;
+
+        let walked = Harness::dual_homed(settings())?;
+        walked.script(TARGET, dead(usize::MAX));
+        walked.script_advertised(TARGET, held());
+        spends_what_is_left(walked, &[port(TARGET), advertised_port(TARGET)]).await
     })
 }
 
@@ -184,7 +172,7 @@ fn a_remembered_endpoint_keeps_the_larger_share() -> Result<()> {
         // The next response is queued only once the first has finished, so the
         // endpoint it starts at is the one the first response left remembered.
         harness.script(TARGET, dead(0));
-        harness.script_advertised(TARGET, Script::Hold(Arc::new(Semaphore::new(0))));
+        harness.script_advertised(TARGET, held());
         harness.send(TARGET)?;
 
         let drained = harness.drain().await?;
@@ -269,6 +257,44 @@ fn a_paced_backlog_still_dials_the_endpoint_the_route_prefers() -> Result<()> {
     })
 }
 
+/// Sends one response, and proves the last endpoint of its route spent
+/// everything that response had left.
+///
+/// `route` names every endpoint the walk must reach, in the order it must reach
+/// them. The caller scripts the last of them to answer nothing, so the job's
+/// own deadline is what ends the response.
+async fn spends_what_is_left(harness: Harness, route: &[u16]) -> Result<()> {
+    harness.send(TARGET)?;
+    let drained = harness.drain().await?;
+    // The drain returns once the one worker has exited. This response is the
+    // only work the runtime holds, so nothing moves the clock between the last
+    // attempt ending and this instant.
+    let ended = Instant::now();
+    let Some(last) = drained.deliveries.last() else {
+        bail!("the response must reach the endpoints its route offers");
+    };
+    let walked: Vec<u16> = drained
+        .deliveries
+        .iter()
+        .map(|delivery| delivery.port)
+        .collect();
+    assert_eq!(
+        walked, route,
+        "the response must try the endpoints of its route in order"
+    );
+    assert_eq!(
+        drained.dropped, 1,
+        "nothing delivered the response, so it must be dropped"
+    );
+    let spent = ended.duration_since(last.at);
+    assert!(
+        is_about(spent, left(last)),
+        "the sender gave the last endpoint up after {spent:?} of the {:?} the response had left",
+        left(last)
+    );
+    Ok(())
+}
+
 /// What one attempt had left of its response's deadline when it was made.
 fn left(delivery: &Delivery) -> Duration {
     delivery.deadline.duration_since(delivery.at)
@@ -285,6 +311,12 @@ const fn dead(times: usize) -> Script {
         failure: SendFailure::Unreachable,
         times,
     }
+}
+
+/// An endpoint that answers nothing at all: nothing ever releases the barrier,
+/// so only a deadline can end an attempt made against it.
+fn held() -> Script {
+    Script::Hold(Arc::new(Semaphore::new(0)))
 }
 
 /// The fleet every case here runs against.
