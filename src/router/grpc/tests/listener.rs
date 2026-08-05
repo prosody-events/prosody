@@ -4,7 +4,8 @@
 use super::{FRAME_CAP, Harness, transport};
 use crate::requester::config::RequesterConfiguration;
 use crate::response::frame::FrameCap;
-use crate::router::directory::tests::support::{directory, store};
+use crate::router::directory::NodeDirectory;
+use crate::router::directory::tests::support::cassandra_directory;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::codec::ClientFrameCodec;
 use crate::router::grpc::conn::admitted;
@@ -115,9 +116,9 @@ fn a_registration_publishes_the_port_the_listener_bound() -> Result<()> {
             max_response_bytes: FRAME_CAP,
             ..RequesterConfiguration::default()
         };
-        let directory = directory(router.registration_ttl.duration()).await?;
+        let directory = cassandra_directory(router.registration_ttl.duration()).await?;
         let runtime = PeerRuntime::start(PeerInputs {
-            store: store().await?.clone(),
+            directory: directory.clone(),
             listener: bound,
             health: TestHealth::new(true, true),
             contact: CONTACT,

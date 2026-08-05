@@ -1,8 +1,10 @@
 use super::{NodeId, Preference, RelayHop, Router, RouterHandle, SendFailure, choose_route};
 use crate::router::Host;
 use crate::router::directory::cache::{AddressCache, AddressResolver};
-use crate::router::directory::tests::support::{directory, membership, registration};
-use crate::router::directory::{Endpoint, NetworkId, NodeRegistration, RegistrationTtl};
+use crate::router::directory::tests::support::{membership, memory_directory, registration};
+use crate::router::directory::{
+    Endpoint, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
+};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::LoopbackSender;
@@ -98,7 +100,7 @@ fn every_failure_answers_the_two_questions_the_send_path_asks() {
 #[test]
 fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let directory = directory(LEASE).await?;
+        let directory = memory_directory(LEASE)?;
         let published = registration(NodeId::new(), membership());
         directory.register(&published).await?;
 
@@ -155,13 +157,13 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
 /// A router answers from its own cache, and every clone of it shares the one
 /// cache, fleet and transport the process owns.
 ///
-/// The row is removed after the first resolution, so a router that read the
+/// The entry is removed after the first resolution, so a router that read the
 /// directory again would answer nothing. The lease is far longer than this test
 /// runs, so the cached entry cannot age out first.
 #[test]
 fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let directory = directory(LEASE).await?;
+        let directory = memory_directory(LEASE)?;
         let published = registration(NodeId::new(), membership());
         directory.register(&published).await?;
 
@@ -184,12 +186,12 @@ fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<(
         directory.deregister(&published).await?;
         assert!(
             directory.read(published.node).await?.is_none(),
-            "the row must be gone before the cached answer is asserted"
+            "the entry must be gone before the cached answer is asserted"
         );
         assert_eq!(
             router.direct(published.node).await?,
             Some(published.direct.clone()),
-            "a router must answer from its cache once the row is gone"
+            "a router must answer from its cache once the entry is gone"
         );
 
         let clone = router.clone();

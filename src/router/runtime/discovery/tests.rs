@@ -1,8 +1,8 @@
 //! What a process discovers about itself, and what it publishes from it.
 
 use super::super::tests::{CONTACT, NUMERIC_CONTACT, listener};
-use super::super::{PeerRuntimeError, RouterConfiguration, discover_registration};
-use super::{DiscoveredHost, discover_host, join_discovery, routed_host};
+use super::super::{RouterConfiguration, discover_registration};
+use super::{DiscoveredHost, DiscoveryError, discover_host, join_discovery, routed_host};
 use crate::router::directory::Endpoint;
 use crate::router::{Host, NodeId};
 use crate::test_util::TEST_RUNTIME;
@@ -142,13 +142,10 @@ fn the_direct_host_is_the_routed_address_then_this_machine() -> Result<()> {
 fn a_discovery_task_that_does_not_join_is_reported() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
-        let task = tokio::spawn(pending::<Result<DiscoveredHost, PeerRuntimeError>>());
+        let task = tokio::spawn(pending::<Result<DiscoveredHost, DiscoveryError>>());
         task.abort();
         ensure!(
-            matches!(
-                join_discovery(task).await,
-                Err(PeerRuntimeError::DiscoveryTask(_))
-            ),
+            matches!(join_discovery(task).await, Err(DiscoveryError::Task(_))),
             "a discovery task that did not join was not reported as a task failure"
         );
         Ok(())

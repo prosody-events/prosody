@@ -4,9 +4,8 @@
 //! what a response is — [`NodeId`] and a frame's bytes are the only vocabulary
 //! it shares with them.
 
-use crate::cassandra::errors::CassandraStoreError;
 use crate::router::directory::cache::AddressResolver;
-use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
+use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use bytes::BufMut;
 use fixedstr::Flexstr;
@@ -213,8 +212,8 @@ pub(crate) trait Router: RelayHop {
                   exercised by this module's tests"
     )
 )]
-pub(crate) struct RouterHandle<S> {
-    addresses: AddressResolver,
+pub(crate) struct RouterHandle<S, D> {
+    addresses: AddressResolver<D>,
     fleet: Arc<DestinationFleet>,
     transport: Arc<S>,
     here: Option<NetworkId>,
@@ -262,7 +261,7 @@ impl Display for NodeId {
 
 /// Cloning shares the cache, the fleet and the transport rather than copying
 /// them: one process has exactly one of each.
-impl<S> Clone for RouterHandle<S> {
+impl<S, D: Clone> Clone for RouterHandle<S, D> {
     fn clone(&self) -> Self {
         Self {
             addresses: self.addresses.clone(),
@@ -281,10 +280,10 @@ impl<S> Clone for RouterHandle<S> {
                   exercised by this module's tests"
     )
 )]
-impl<S> RouterHandle<S> {
+impl<S, D> RouterHandle<S, D> {
     /// Binds one process's resolver, fleet and transport together.
     pub(in crate::router) fn new(
-        addresses: AddressResolver,
+        addresses: AddressResolver<D>,
         fleet: Arc<DestinationFleet>,
         transport: Arc<S>,
         here: Option<NetworkId>,
@@ -298,11 +297,11 @@ impl<S> RouterHandle<S> {
     }
 }
 
-impl<S: ResponseSender> RelayHop for RouterHandle<S> {
-    type Error = CassandraStoreError;
+impl<S: ResponseSender, D: NodeDirectory> RelayHop for RouterHandle<S, D> {
+    type Error = D::Error;
     type Sender = S;
 
-    async fn direct(&self, node: NodeId) -> Result<Option<Endpoint>, CassandraStoreError> {
+    async fn direct(&self, node: NodeId) -> Result<Option<Endpoint>, D::Error> {
         let registration = self.addresses.resolve(node).await?;
         Ok(registration.map(|registration| registration.direct.clone()))
     }
@@ -316,8 +315,8 @@ impl<S: ResponseSender> RelayHop for RouterHandle<S> {
     }
 }
 
-impl<S: ResponseSender> Router for RouterHandle<S> {
-    async fn route(&self, node: NodeId) -> Result<Option<Route>, CassandraStoreError> {
+impl<S: ResponseSender, D: NodeDirectory> Router for RouterHandle<S, D> {
+    async fn route(&self, node: NodeId) -> Result<Option<Route>, D::Error> {
         let registration = self.addresses.resolve(node).await?;
         Ok(registration
             .as_deref()

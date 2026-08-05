@@ -8,11 +8,11 @@
 //! Inside this module the rule is read rather than compiled: a function added
 //! here could call them on a runtime thread.
 
-use super::PeerRuntimeError;
 use super::config::validate_label;
 use crate::router::{Host, MAX_LABEL_BYTES};
 use std::net::{ToSocketAddrs, UdpSocket};
-use tokio::task::{JoinHandle, spawn_blocking};
+use thiserror::Error;
+use tokio::task::{JoinError, JoinHandle, spawn_blocking};
 use whoami::hostname;
 
 #[cfg(test)]
@@ -39,9 +39,9 @@ pub(super) struct DiscoveredHost {
 ///
 /// # Errors
 ///
-/// Returns [`PeerRuntimeError`] when the machine name cannot be read or
+/// Returns [`DiscoveryError`] when the machine name cannot be read or
 /// published, or when the blocking task does not join.
-pub(super) async fn discover(contact: &str) -> Result<DiscoveredHost, PeerRuntimeError> {
+pub(super) async fn discover(contact: &str) -> Result<DiscoveredHost, DiscoveryError> {
     let contact = contact.to_owned();
     join_discovery(spawn_blocking(move || discover_host(&contact))).await
 }
@@ -49,17 +49,17 @@ pub(super) async fn discover(contact: &str) -> Result<DiscoveredHost, PeerRuntim
 /// Reports what the blocking task returned.
 ///
 /// A task that does not join — one that was cancelled, or that panicked —
-/// becomes [`PeerRuntimeError::DiscoveryTask`]. It never becomes an absent
+/// becomes [`DiscoveryError::Task`]. It never becomes an absent
 /// address that a later step fills with a guess. This is a function of its own
 /// because that is the claim a test can drive: give it a task that cannot join,
 /// and read what it reports.
 ///
 /// # Errors
 ///
-/// Returns [`PeerRuntimeError`] from the task, or for the task.
+/// Returns [`DiscoveryError`] from the task, or for the task.
 async fn join_discovery(
-    task: JoinHandle<Result<DiscoveredHost, PeerRuntimeError>>,
-) -> Result<DiscoveredHost, PeerRuntimeError> {
+    task: JoinHandle<Result<DiscoveredHost, DiscoveryError>>,
+) -> Result<DiscoveredHost, DiscoveryError> {
     task.await?
 }
 
@@ -70,17 +70,17 @@ async fn join_discovery(
 ///
 /// # Errors
 ///
-/// Returns [`PeerRuntimeError`] when the machine name cannot be read, or when
+/// Returns [`DiscoveryError`] when the machine name cannot be read, or when
 /// it is not a label a registration may publish. The routed probe's own failure
 /// is not an error: it answers `None`, and `discover_registration` then
 /// publishes the machine name.
-fn discover_host(contact: &str) -> Result<DiscoveredHost, PeerRuntimeError> {
+fn discover_host(contact: &str) -> Result<DiscoveredHost, DiscoveryError> {
     // The machine name is published in its own right, so the lookup is paid
     // once and reused where the routed probe finds no address.
     let machine = hostname()?;
     // One label rule for both sources. A name an operator may not configure is
     // not a name this machine may publish either.
-    validate_label(&machine).map_err(|_| PeerRuntimeError::HostnameUnpublishable {
+    validate_label(&machine).map_err(|_| DiscoveryError::Unpublishable {
         bytes: machine.len(),
         limit: MAX_LABEL_BYTES,
     })?;
@@ -123,4 +123,28 @@ fn routed_host(contact: &str) -> Option<Host> {
         return None;
     };
     Some(Host::make(&local.ip().to_string()))
+}
+
+/// What can stop a process from learning what only its machine knows.
+#[derive(Debug, Error)]
+pub(crate) enum DiscoveryError {
+    /// The machine's own name could not be read. Every registration publishes
+    /// it, so the lookup is not optional.
+    #[error("the machine name could not be read: {0:#}")]
+    Name(#[from] whoami::Error),
+
+    /// The blocking discovery task returned no result. The task was cancelled
+    /// or panicked. Startup stops because the direct endpoint has no host.
+    #[error("the host discovery task returned no result: {0:#}")]
+    Task(#[from] JoinError),
+
+    /// The machine name is not a label that a registration can publish.
+    /// Startup stops because an oversized label would not resolve.
+    #[error("the machine name is {bytes} bytes, outside the 1 to {limit} byte label range")]
+    Unpublishable {
+        /// The machine name's length.
+        bytes: usize,
+        /// The longest label a registration may publish.
+        limit: usize,
+    },
 }

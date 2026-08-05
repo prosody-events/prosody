@@ -9,8 +9,6 @@
     )
 )]
 
-use crate::cassandra::CassandraStore;
-use crate::cassandra::errors::CassandraStoreError;
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::{PendingRegistry, RegistryError};
 use crate::router::directory::cache::{AddressCache, AddressResolver};
@@ -32,7 +30,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::select;
 use tokio::sync::{oneshot, watch};
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{error, warn};
 use validator::{Validate, ValidationErrors};
@@ -41,7 +39,7 @@ mod config;
 mod discovery;
 
 pub(crate) use self::config::RouterConfiguration;
-use self::discovery::{DiscoveredHost, discover};
+use self::discovery::{DiscoveredHost, DiscoveryError, discover};
 
 #[cfg(test)]
 mod tests;
@@ -68,12 +66,17 @@ mod tests;
 /// registry's sweep stops when its last [`Arc`] drops, and this node's row
 /// expires on its lease. What a plain drop cannot do is wake a parked waiter or
 /// wait for a reservation, which is why shutdown exists.
-pub(crate) struct PeerRuntime {
-    addresses: AddressResolver,
-    router: RouterHandle<GrpcSender>,
+///
+/// The directory backend travels with this type and stops here. Every handle
+/// the runtime gives out is either free of it, or is taken by a constructor
+/// that erases the router. An owner above therefore never has to name `D`: it
+/// moves the whole runtime into a task of its own and keeps the handles.
+pub(crate) struct PeerRuntime<D> {
+    addresses: AddressResolver<D>,
+    router: RouterHandle<GrpcSender, D>,
     /// The write side of the directory. The resolver beside it only reads, so
     /// the two directions stay separate types rather than one that does both.
-    directory: NodeDirectory,
+    directory: D,
     registration: NodeRegistration,
     fleet: Arc<DestinationFleet>,
     pending: Arc<PendingRegistry>,
@@ -89,8 +92,11 @@ pub(crate) struct PeerRuntime {
 /// The bound listener inside is a unique resource, so one value serves one
 /// process. Two runtimes need a second, grep-visible call to
 /// [`PeerRuntime::start`].
-pub(crate) struct PeerInputs<'a, H> {
-    pub(crate) store: CassandraStore,
+pub(crate) struct PeerInputs<'a, H, D> {
+    /// Where this process publishes itself, and how it resolves a peer. Its
+    /// lease is the single source: the runtime ages its address cache on it and
+    /// paces its refresher inside it.
+    pub(crate) directory: D,
     /// The already-bound peer listener. The runtime serves this listener and
     /// publishes the port that the operating system assigned.
     pub(crate) listener: BoundListener,
@@ -103,7 +109,7 @@ pub(crate) struct PeerInputs<'a, H> {
     pub(crate) requester: &'a RequesterConfiguration,
 }
 
-impl PeerRuntime {
+impl<D: NodeDirectory> PeerRuntime<D> {
     /// Builds every shared piece, serves the listener, and publishes this
     /// process.
     ///
@@ -120,8 +126,8 @@ impl PeerRuntime {
     /// issues no delete: a row the failed write still applied expires on its
     /// lease.
     pub(crate) async fn start<H: ProcessHealth>(
-        inputs: PeerInputs<'_, H>,
-    ) -> Result<Self, PeerRuntimeError> {
+        inputs: PeerInputs<'_, H, D>,
+    ) -> Result<Self, PeerRuntimeError<D::Error>> {
         inputs.router.validate()?;
         // One ceiling for both seams: the frames this process sends and the
         // frames its listener admits.
@@ -139,8 +145,8 @@ impl PeerRuntime {
         let fleet = Arc::new(DestinationFleet::new(inputs.fleet)?);
         let pending = PendingRegistry::new(inputs.requester)?;
         let transport = Arc::new(GrpcSender::new(frame_cap, &fleet));
-        let ttl = inputs.router.registration_ttl;
-        let directory = NodeDirectory::new(inputs.store, ttl).await?;
+        let directory = inputs.directory;
+        let ttl = directory.ttl();
         // The blocking pool owns the resolver wait; a runtime thread must not.
         // The resolver call and the machine-name lookup are private to
         // `discovery`, so this file reaches them only through `discover`.
@@ -177,7 +183,7 @@ impl PeerRuntime {
         )?;
         if let Err(error) = directory.register(&registration).await {
             abandon(stop_listener, listener).await;
-            return Err(error.into());
+            return Err(PeerRuntimeError::Directory(error));
         }
         let (stop_refresh, mut stopped) = watch::channel(false);
         let refresh = tokio::spawn({
@@ -227,7 +233,7 @@ impl PeerRuntime {
 
     /// How this process resolves another node, through the bounded address
     /// cache.
-    pub(crate) const fn addresses(&self) -> &AddressResolver {
+    pub(crate) const fn addresses(&self) -> &AddressResolver<D> {
         &self.addresses
     }
 
@@ -242,7 +248,7 @@ impl PeerRuntime {
     }
 
     /// The router every responder in this process sends through.
-    pub(crate) fn router(&self) -> RouterHandle<GrpcSender> {
+    pub(crate) fn router(&self) -> RouterHandle<GrpcSender, D> {
         self.router.clone()
     }
 
@@ -279,10 +285,10 @@ impl PeerRuntime {
     /// # Errors
     ///
     /// Returns the directory's error when a delete fails.
-    pub(crate) async fn shutdown<F, D>(self, drain: F) -> Result<(), CassandraStoreError>
+    pub(crate) async fn shutdown<F, Fut>(self, drain: F) -> Result<(), D::Error>
     where
-        F: FnOnce() -> D,
-        D: Future<Output = ()>,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ()>,
     {
         let Self {
             directory,
@@ -395,39 +401,21 @@ fn refresh_delay(ttl: RegistrationTtl) -> Duration {
 
 /// What can stop a process from taking its place in the directory.
 #[derive(Debug, Error)]
-pub(crate) enum PeerRuntimeError {
+pub(crate) enum PeerRuntimeError<E> {
     /// The configuration this process was started with is invalid.
     #[error("router configuration is invalid: {0:#}")]
     Configuration(#[from] ValidationErrors),
 
-    /// The machine's own name could not be read. Every registration publishes
-    /// it, so the lookup is not optional.
-    #[error("the machine name could not be read: {0:#}")]
-    Discovery(#[from] whoami::Error),
+    /// This process could not learn what only its machine knows.
+    #[error("this process could not read what only its machine knows: {0:#}")]
+    Discovery(#[from] DiscoveryError),
 
-    /// The blocking discovery task returned no result — it was cancelled, or it
-    /// panicked. The direct endpoint then has no host, so startup stops rather
-    /// than registering a guess.
-    #[error("the host discovery task returned no result: {0:#}")]
-    DiscoveryTask(#[from] JoinError),
-
-    /// The machine's own name is not a label a registration may publish: it is
-    /// empty, or it is longer than a label may be. The same rule refuses a
-    /// configured label, so the two sources of a published host agree. A blank
-    /// name reaches no machine, and a longer one reads back as unresolvable, so
-    /// startup stops instead.
-    #[error("the machine name is {bytes} bytes, outside the 1 to {limit} byte label range")]
-    HostnameUnpublishable {
-        /// The machine name's length.
-        bytes: usize,
-        /// The longest label a registration may publish.
-        limit: usize,
-    },
-
-    /// The directory could not prepare its statements, or it rejected this
-    /// process's first registration.
+    /// The directory rejected this process's first registration.
+    ///
+    /// This variant uses `source` because a generic `from` implementation
+    /// would overlap the conversions for the concrete variants.
     #[error("node registration failed: {0:#}")]
-    Directory(#[from] CassandraStoreError),
+    Directory(#[source] E),
 
     /// The destination limits were invalid.
     #[error("the destination fleet could not be built: {0:#}")]

@@ -9,7 +9,6 @@
     )
 )]
 
-use crate::cassandra::errors::CassandraStoreError;
 use crate::router::NodeId;
 use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
 use quanta::{Clock, Instant};
@@ -73,9 +72,9 @@ pub(crate) struct AddressCache {
 /// a cache and a directory it must remember to pair. It only reads, and every
 /// read goes through the cache: it exposes no write and no direct row access.
 #[derive(Clone)]
-pub(crate) struct AddressResolver {
+pub(crate) struct AddressResolver<D> {
     cache: AddressCache,
-    directory: NodeDirectory,
+    directory: D,
 }
 
 impl AddressCache {
@@ -168,10 +167,10 @@ impl AddressCache {
     }
 }
 
-impl AddressResolver {
+impl<D> AddressResolver<D> {
     /// Reads `directory` through `cache`.
     #[must_use]
-    pub(crate) const fn new(cache: AddressCache, directory: NodeDirectory) -> Self {
+    pub(crate) const fn new(cache: AddressCache, directory: D) -> Self {
         Self { cache, directory }
     }
 
@@ -181,7 +180,9 @@ impl AddressResolver {
     pub(crate) const fn ttl(&self) -> Duration {
         self.cache.ttl()
     }
+}
 
+impl<D: NodeDirectory> AddressResolver<D> {
     /// What `node` published, or `None` when the directory holds no row for it.
     ///
     /// # Errors
@@ -190,7 +191,7 @@ impl AddressResolver {
     pub(crate) async fn resolve(
         &self,
         node: NodeId,
-    ) -> Result<Option<Arc<NodeRegistration>>, CassandraStoreError> {
+    ) -> Result<Option<Arc<NodeRegistration>>, D::Error> {
         self.cache.resolve(node, || self.directory.read(node)).await
     }
 }

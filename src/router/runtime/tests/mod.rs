@@ -12,7 +12,8 @@ use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader};
 use crate::response::sender::{SendCounters, TypedSender};
 use crate::response::{RequestId, ResponseStatus};
-use crate::router::directory::tests::support::{directory, membership, store};
+use crate::router::directory::cassandra::CassandraNodeDirectory;
+use crate::router::directory::tests::support::{cassandra_directory, membership};
 use crate::router::directory::{Endpoint, GroupMembership, NodeDirectory, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
@@ -64,7 +65,7 @@ const SLOTS_EACH: usize = 8;
 /// One process under test: a live runtime, and one typed sender over the
 /// handles that runtime hands out.
 struct Process {
-    runtime: PeerRuntime,
+    runtime: PeerRuntime<CassandraNodeDirectory>,
     sender: TypedSender<CountingCodec>,
     shared: Shared,
 }
@@ -84,13 +85,13 @@ struct Shared {
     listener: Endpoint,
     /// The id the runtime minted.
     node: NodeId,
-    directory: NodeDirectory,
+    directory: CassandraNodeDirectory,
 }
 
 /// One runtime with the default peer configuration, and no sender.
 struct PlainProcess {
-    runtime: PeerRuntime,
-    directory: NodeDirectory,
+    runtime: PeerRuntime<CassandraNodeDirectory>,
+    directory: CassandraNodeDirectory,
     membership: GroupMembership,
     bound_port: u16,
 }
@@ -103,7 +104,7 @@ impl Process {
     /// itself would be delivered by the drain, which runs after shutdown has
     /// already stopped this process's listener.
     async fn new() -> Result<Self> {
-        let directory = directory(LEASE).await?;
+        let directory = cassandra_directory(LEASE).await?;
         let cap = frame_cap()?;
         let bound = BoundListener::bind(&TransportConfiguration {
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -118,7 +119,7 @@ impl Process {
         let router = RouterConfiguration::default();
         let requester = requester();
         let runtime = PeerRuntime::start(PeerInputs {
-            store: store().await?.clone(),
+            directory: directory.clone(),
             listener: bound,
             health: TestHealth::new(true, true),
             // The numeric contact point pins the address family the routed
@@ -201,14 +202,14 @@ pub(super) async fn listener() -> Result<BoundListener> {
 
 /// Starts one runtime with every peer field left at its default.
 async fn plain_process() -> Result<PlainProcess> {
-    let directory = directory(LEASE).await?;
+    let directory = cassandra_directory(LEASE).await?;
     let membership = membership();
     let bound = listener().await?;
     let bound_port = bound.address().port();
     let router = RouterConfiguration::default();
     let requester = requester();
     let runtime = PeerRuntime::start(PeerInputs {
-        store: store().await?.clone(),
+        directory: directory.clone(),
         listener: bound,
         health: TestHealth::new(true, true),
         contact: CONTACT,

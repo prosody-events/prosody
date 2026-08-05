@@ -12,8 +12,9 @@ use crate::codec::Codec;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::sender::TypedSender;
+use crate::router::directory::NodeDirectory;
 use crate::router::directory::RegistrationTtl;
-use crate::router::directory::tests::support::store;
+use crate::router::directory::tests::support::cassandra_directory;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::TRANSPORT;
 use crate::router::grpc::client::GrpcSender;
@@ -142,11 +143,11 @@ fn a_response_through_the_runtime_router_reaches_this_process() -> Result<()> {
 
 /// The runtime resolves through a cache aged on the lease it publishes under.
 ///
-/// One configured lease governs both halves of reachability: how long this
-/// node's own row survives without a refresh, and how long a peer's address is
-/// still served after that peer's row is gone. A cache built with any other
-/// lease would hand a dialer an address that answers for nobody, for a time no
-/// operator asked for.
+/// The directory carries that one lease, and it governs both halves of
+/// reachability: how long this node's own row survives without a refresh, and
+/// how long a peer's address is still served after that peer's row is gone. A
+/// cache built with any other lease would hand a dialer an address that answers
+/// for nobody, for a time no operator asked for.
 ///
 /// The bound is read rather than waited out. What the bound *means* — an entry
 /// is served until it, and read again past it — belongs to
@@ -160,13 +161,10 @@ fn the_resolver_ages_entries_on_the_lease_this_process_publishes_under() -> Resu
     TEST_RUNTIME.block_on(async {
         // Not the default lease, so a cache aged on a constant fails here.
         let lease = RegistrationTtl::try_from(RegistrationTtl::MIN)?;
-        let router = RouterConfiguration {
-            registration_ttl: lease,
-            ..RouterConfiguration::default()
-        };
+        let router = RouterConfiguration::default();
         let requester = requester();
         let runtime = PeerRuntime::start(PeerInputs {
-            store: store().await?.clone(),
+            directory: cassandra_directory(lease.duration()).await?,
             listener: listener().await?,
             health: TestHealth::new(true, true),
             contact: CONTACT,

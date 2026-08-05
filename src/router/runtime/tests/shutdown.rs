@@ -13,6 +13,7 @@ use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::sender::TypedSender;
 use crate::router::ResponseSender;
+use crate::router::directory::NodeDirectory;
 use crate::router::directory::tests::support::finish;
 use crate::router::fleet::{Refusal, Reservation};
 use crate::router::grpc::client::GrpcSender;

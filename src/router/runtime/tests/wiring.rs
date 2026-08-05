@@ -16,7 +16,8 @@ use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
-use crate::router::directory::tests::support::{directory, store};
+use crate::router::directory::cassandra::CassandraNodeDirectory;
+use crate::router::directory::tests::support::cassandra_directory;
 use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
@@ -75,11 +76,11 @@ struct Elsewhere {
 fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
-        let directory = directory(LEASE).await?;
+        let directory = cassandra_directory(LEASE).await?;
         let config = RouterConfiguration::builder().network(NETWORK).build()?;
         let requester = requester();
         let runtime = PeerRuntime::start(PeerInputs {
-            store: store().await?.clone(),
+            directory: directory.clone(),
             listener: listener().await?,
             health: TestHealth::new(true, true),
             contact: CONTACT,
@@ -139,7 +140,7 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
 fn a_frame_for_another_node_leaves_the_runtime_listener_again() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
-        let directory = directory(LEASE).await?;
+        let directory = cassandra_directory(LEASE).await?;
         let elsewhere = Elsewhere::start().await?;
         let started = start_over(&directory, &elsewhere).await;
         let (runtime, here) = match started {
@@ -202,9 +203,9 @@ impl Elsewhere {
 /// Publishes `elsewhere` and starts the process under test, reporting where its
 /// own listener is.
 async fn start_over(
-    directory: &NodeDirectory,
+    directory: &CassandraNodeDirectory,
     elsewhere: &Elsewhere,
-) -> Result<(PeerRuntime, Endpoint), Report> {
+) -> Result<(PeerRuntime<CassandraNodeDirectory>, Endpoint), Report> {
     directory
         .register(&NodeRegistration {
             node: elsewhere.node,
@@ -220,7 +221,7 @@ async fn start_over(
     let config = RouterConfiguration::default();
     let requester = requester();
     let runtime = PeerRuntime::start(PeerInputs {
-        store: store().await?.clone(),
+        directory: directory.clone(),
         listener: bound,
         health: TestHealth::new(true, true),
         contact: NUMERIC_CONTACT,
