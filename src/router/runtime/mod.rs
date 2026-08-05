@@ -1,9 +1,12 @@
 //! One process's peer machinery: what it publishes about itself, what it hands
 //! consumers and requesters, and the order it stops in.
 
+use crate::codec::Codec;
+use crate::consumer::middleware::respond::Responder;
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::{PendingRegistry, RegistryError};
 use crate::response::frame::FrameCap;
+use crate::response::sender::ResponseWorkers;
 use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::{
     Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
@@ -16,6 +19,7 @@ use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, TransportError, serve};
 use crate::router::relay::Relay;
 use crate::router::{Host, NodeId, RouterHandle};
+use crate::subsystem::SubsystemName;
 use rand::RngExt;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -289,18 +293,26 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         })
     }
 
-    /// Returns the router used to build a responder before activation.
+    /// Builds the responder this process answers peer requests with.
     ///
-    /// Read this value before activation because the responder must exist
-    /// before the Kafka client starts.
-    pub(crate) const fn router(&self) -> &RouterHandle<GrpcSender, D> {
-        &self.router
-    }
-
-    /// Returns the one frame ceiling this process uses, so a responder's
-    /// encoder and the listener never disagree about it.
-    pub(crate) const fn frame_cap(&self) -> FrameCap {
-        self.frame_cap
+    /// The router and the frame ceiling come from this runtime, and the caller
+    /// selects neither. So a responder's encoder cannot disagree with the
+    /// ceiling this process's listener admits. No code outside this module
+    /// builds a router, so no caller can pair a responder with another
+    /// runtime's.
+    ///
+    /// Call this before activation: the responder must exist before the Kafka
+    /// client starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FleetConfigurationError`] when one encode buffer per
+    /// destination at this ceiling exceeds what one sender may commit to.
+    pub(crate) fn responder<C: Codec>(
+        &self,
+        subsystem: SubsystemName,
+    ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
+        Responder::new(&self.router, self.frame_cap, subsystem)
     }
 
     /// Stops every local resource without publishing the node.

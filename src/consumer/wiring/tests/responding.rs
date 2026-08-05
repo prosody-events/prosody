@@ -20,7 +20,9 @@ use crate::consumer::middleware::tests::test_support::{
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::wiring::build_common_middleware;
 use crate::consumer::wiring::memory_deps;
-use crate::consumer::wiring::peer::{PeerAttachment, PreparedResponder, prepare_requester};
+use crate::consumer::wiring::peer::{
+    PeerAttachment, PreparedResponder, prepare_requester, prepare_responding,
+};
 use crate::consumer::{
     ConsumerSetup, DemandType, EventHandler, HandlerProvider, Managers,
     PipelineMiddlewareConfiguration, ProsodyConsumer, TypedConsumerSetup,
@@ -51,6 +53,11 @@ use tokio::sync::Semaphore;
 use tracing::Span;
 
 const RESPONSE_CAP_BYTES: usize = 4096;
+
+/// Destinations enough that one encode scratch each, at the widest ceiling a
+/// frame may carry, is over the budget one sender may commit to.
+const SCRATCH_DESTINATIONS: usize = 8;
+
 const SUBSYSTEM: &str = "billing";
 const TOPIC: &str = "responding-wiring";
 const PARTITION: Partition = 0;
@@ -151,6 +158,55 @@ async fn the_responding_wiring_answers_a_tagged_message() -> Result<()> {
     assert_eq!(frame.header.subsystem, SubsystemName::try_new(SUBSYSTEM)?);
     assert_eq!(frame.header.status, ResponseStatus::Success);
     Ok(())
+}
+
+/// The responder is sized by the runtime's own frame ceiling.
+///
+/// A sender commits to one encode scratch per destination, at the ceiling it
+/// frames against. This peer names a ceiling and a destination table whose
+/// product is over that budget. So preparation refuses, and the refusal states
+/// that product. Only the ceiling the prepared runtime carries gives the number
+/// this test reads.
+#[tokio::test]
+async fn the_prepared_responder_is_sized_by_the_runtimes_frame_cap() -> Result<()> {
+    let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+    let backend = RecordingBackend {
+        directory: RecordingDirectory::new(log, false),
+    };
+    let consumer = consumer_config("responding-wiring-scratch")?;
+    // One connection of one stream keeps the widest ceiling inside the
+    // listener's receive budget, so the scratch budget is the one rule this
+    // configuration breaks.
+    let peer = PeerConfiguration::builder()
+        .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .reflection(false)
+        .frame_bytes(FrameCap::MAX_BYTES)
+        .max_connections(1_usize)
+        .max_concurrent_streams(1_u32)
+        .max_destinations(SCRATCH_DESTINATIONS)
+        .build()?;
+    let managers: Arc<Managers<Value>> = Arc::default();
+    let heartbeats = HeartbeatRegistry::new(consumer.group_id.clone(), consumer.stall_threshold);
+    let prepared = prepare_responding::<SomeResponseCodec, _, _>(
+        &peer,
+        &backend,
+        SubsystemName::try_new(SUBSYSTEM)?,
+        managers,
+        &heartbeats,
+    )
+    .await;
+    match prepared {
+        Err(ConsumerError::Peer(PeerInitError::Fleet { message })) => {
+            let asked = SCRATCH_DESTINATIONS * FrameCap::MAX_BYTES;
+            ensure!(
+                message.contains(&asked.to_string()),
+                "the responder asks for {asked} bytes of scratch: {message}",
+            );
+            Ok(())
+        }
+        Err(error) => bail!("preparation failed for another reason: {error}"),
+        Ok(_) => bail!("preparation took a scratch budget one sender cannot commit to"),
+    }
 }
 
 /// One pipeline test proves the shared constructor path.
