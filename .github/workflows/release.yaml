@@ -43,7 +43,7 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      RUSTFLAGS: -C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=mold
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created }}
     environment: release
