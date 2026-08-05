@@ -2,12 +2,11 @@
 //!
 //! **No identity is ever an attribute.** A node id and a claimed subsystem name
 //! arrive in a Kafka header a topic writer controls, so a series keyed by one
-//! is a cardinality attack on the metrics pipeline. One fixed label per outcome
-//! is the whole attribute set here, which is why every label below is a
-//! `&'static str` a `const fn` chose. What the queues hold across the process
-//! is still derivable: it is `stages{enqueued}` less `stages{delivered}` less
-//! every reason a response can meet once it counts as enqueued —
-//! `queue_closed`, `queue_full`, `deadline`, `encode_failed`,
+//! is a cardinality attack on the metrics pipeline. Every attribute here is one
+//! fixed `&'static str` a `const fn` chose. What the queues hold across the
+//! process is still derivable: it is `stages{enqueued}` less
+//! `stages{delivered}` less every reason a response can meet once it counts as
+//! enqueued — `queue_closed`, `queue_full`, `deadline`, `encode_failed`,
 //! `unresolvable_node`, `lookup_failed` and `send_failed`. The three refusals
 //! before that point — `no_destination`, `no_slot` and `shutting_down` — reach
 //! no queue, so a subtraction of the whole `dropped` total counts them twice
@@ -23,6 +22,7 @@
 //! Each instrument binds to whatever meter provider is global when it is first
 //! touched, so a process installs its provider before it queues a response.
 
+use crate::router::Preference;
 use crate::router::fleet::Refusal;
 use opentelemetry::KeyValue;
 use opentelemetry::global::meter;
@@ -39,11 +39,22 @@ static STAGES: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Responses that never reached their destination, by fixed reason label.
+/// Responses the sender gave up on, by fixed reason label.
 static DROPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter("prosody")
         .u64_counter("prosody.response.dropped")
-        .with_description("Responses that never reached their destination")
+        .with_description("Responses the sender gave up on")
+        .with_unit("{response}")
+        .build()
+});
+
+/// Responses a route's next candidate answered after the one before it failed.
+static FALLBACKS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    meter("prosody")
+        .u64_counter("prosody.response.fallback")
+        .with_description(
+            "Responses a route's next candidate answered after the one before it failed",
+        )
         .with_unit("{response}")
         .build()
 });
@@ -61,7 +72,7 @@ static RATE_LIMITED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 ///
 /// Every offered response passes `Attempted`, and each later stage is reached
 /// only from the one before it. So the differences between these counters are
-/// where responses are lost, and [`DropReason`] says why.
+/// where responses stop, and [`DropReason`] says why.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(strum::VariantArray))]
 pub(super) enum Stage {
@@ -76,7 +87,7 @@ pub(super) enum Stage {
     Delivered,
 }
 
-/// Why one response never reached its destination.
+/// Why the sender gave up on one response.
 ///
 /// One vocabulary for both halves of the path: the refusals the queueing side
 /// gives, and the outcomes a worker reports. Every response that is not
@@ -97,7 +108,9 @@ pub(super) enum DropReason {
     QueueFull,
     /// The destination's worker had already exited.
     QueueClosed,
-    /// The response ran out of its send deadline.
+    /// The sender gave up before the delivery finished. This can cancel a
+    /// delivery the transport already accepted, so it does not say the peer
+    /// never got the response.
     Deadline,
     /// The codec could not frame the result inside the ceiling.
     EncodeFailed,
@@ -175,4 +188,28 @@ impl<T> From<&TrySendError<T>> for DropReason {
 /// Counts one attempt that had to wait for its destination's next turn.
 pub(super) fn record_rate_limited() {
     RATE_LIMITED.add(1, &[]);
+}
+
+/// Counts one response the route's next candidate answered after the one before
+/// it failed.
+///
+/// A route offers a second candidate only where the dialer's network label and
+/// the node's are equal. A series that stays non-zero therefore says the first
+/// candidate does not reach that node from here. A network label put on the
+/// wrong process is one cause of that. A dead direct endpoint and a node that
+/// moved are others, so read this series as a question, not as a verdict.
+///
+/// It counts transitions, not responses. The destination remembers the
+/// candidate that answered, so the responses behind the first one start there
+/// and count nothing. `from` and `to` are recorded together so one series names
+/// the whole transition, and a reader does not have to know which endpoints a
+/// route offers.
+pub(super) fn record_fallback(from: Preference, to: Preference) {
+    FALLBACKS.add(
+        1,
+        &[
+            KeyValue::new("from", from.label()),
+            KeyValue::new("to", to.label()),
+        ],
+    );
 }

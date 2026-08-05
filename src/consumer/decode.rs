@@ -21,7 +21,7 @@ use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::{Message, Timestamp};
 use std::str;
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
@@ -198,7 +198,6 @@ fn extract_request_tag(
     ) {
         Ok(tag) => tag,
         Err(rejection) => {
-            warn!("unusable response headers: {rejection}; no response will be sent");
             rejection.record();
             None
         }

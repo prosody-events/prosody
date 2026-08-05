@@ -67,6 +67,7 @@ pub(crate) struct NodeId(Uuid);
 /// dialed after the node moved. The route is resolved for every response; the
 /// preference only orders the candidates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(test, derive(strum::VariantArray))]
 #[cfg_attr(
     not(test),
     expect(
@@ -375,6 +376,16 @@ impl SendFailure {
     }
 }
 
+impl Preference {
+    /// The fixed label this endpoint is counted and traced under.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Advertised => "advertised",
+        }
+    }
+}
+
 impl Route {
     /// The candidates to try, the remembered one first when this route offers
     /// it.
@@ -455,6 +466,10 @@ pub(crate) fn choose_route(
 }
 
 /// Why one delivery attempt did not reach its destination.
+///
+/// [`Status`](Self::Status) carries the gRPC status the destination itself
+/// answered, rather than a code of this crate's own, for the reason
+/// [`crate::router::grpc`] states.
 #[cfg_attr(
     not(test),
     expect(

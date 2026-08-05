@@ -1,14 +1,14 @@
 //! One cell's delivery worker: what it dequeues, how it frames it, and how far
 //! it will chase a destination that does not answer.
 
-use super::metrics::{DropReason, Stage, record_rate_limited};
+use super::metrics::{DropReason, Stage, record_fallback, record_rate_limited};
 use crate::codec::Codec;
 use crate::otel::carry_parent;
 use crate::response::frame::FrameHeader;
 use crate::response::frame::encode::FrameEncoder;
 use crate::router::directory::Endpoint;
 use crate::router::fleet::Destination;
-use crate::router::{Framed, ResponseSender, Router, SendFailure};
+use crate::router::{Framed, Preference, ResponseSender, Router, SendFailure};
 use opentelemetry::Context;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -129,6 +129,7 @@ pub(super) async fn run_worker<C: Codec, R: Router>(
             peer.request = %header.request,
             peer.subsystem = %header.subsystem,
             peer.disposition = Empty,
+            peer.preference = Empty,
         );
         carry_parent(&span, trace);
         // One deadline over the whole pipeline — the pacing wait, the address
@@ -152,8 +153,9 @@ pub(super) async fn run_worker<C: Codec, R: Router>(
         // level-disabled span never becomes current, and the deadline arm has
         // already left the instrumented future in any case.
         match outcome {
-            Ok(()) => {
+            Ok(preference) => {
                 span.record("peer.disposition", "delivered");
+                span.record("peer.preference", preference.label());
                 Stage::Delivered.record();
                 context.counters.sent.fetch_add(1, Relaxed);
             }
@@ -172,9 +174,9 @@ pub(super) async fn run_worker<C: Codec, R: Router>(
 
 /// Resolves one response's route, frames it and delivers it.
 ///
-/// `Ok` means the destination accepted the frame; every other outcome names why
-/// the response was dropped. The caller counts that outcome, so one dequeued
-/// job moves one counter.
+/// `Ok` carries the preference of the candidate that accepted the frame; every
+/// other outcome names why the response was dropped. The caller counts that
+/// outcome, so one dequeued job moves one counter.
 ///
 /// The attempt budget applies to each endpoint rather than to both together.
 /// Sharing it would make the fallback unreachable whenever one attempt is
@@ -191,7 +193,7 @@ async fn deliver_job<C: Codec, R: Router>(
     header: FrameHeader,
     payload: C::Payload,
     expires_at: Instant,
-) -> Result<(), DropReason> {
+) -> Result<Preference, DropReason> {
     // No address originates anywhere but a registration: a node the directory
     // does not hold is not dialed at all, and a node the rules refuse to reach
     // from here is not dialed either.
@@ -213,12 +215,14 @@ async fn deliver_job<C: Codec, R: Router>(
     Stage::Framed.record();
     let mut remembered = None;
     let mut last_failure = None;
+    // The candidate tried before this one, and so the `from` of a fallback.
+    let mut previous = None;
     let preferred = destination.preferred();
     let candidates = route.candidates(preferred);
     let fallback = candidates[1].is_some();
     let proven = candidates[0].is_some_and(|(preference, _)| Some(preference) == preferred);
-    for (index, (preference, address)) in candidates.into_iter().flatten().enumerate() {
-        let share = if index > 0 || !fallback {
+    for (preference, address) in candidates.into_iter().flatten() {
+        let share = if previous.is_some() || !fallback {
             Share::Rest
         } else if proven {
             Share::Most
@@ -237,8 +241,11 @@ async fn deliver_job<C: Codec, R: Router>(
         .await
         {
             Ok(()) => {
+                if let Some(from) = previous {
+                    record_fallback(from, preference);
+                }
                 destination.prefer(Some(preference));
-                return Ok(());
+                return Ok(preference);
             }
             Err(failure) => {
                 last_failure = Some(failure);
@@ -251,6 +258,7 @@ async fn deliver_job<C: Codec, R: Router>(
                     remembered = Some(preference);
                     break;
                 }
+                previous = Some(preference);
             }
         }
     }

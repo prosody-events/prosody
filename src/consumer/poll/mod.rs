@@ -36,7 +36,7 @@ use crate::propagator::new_propagator;
 use crate::related_span;
 use crate::subsystem::SubsystemName;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 #[cfg(test)]
 mod tests;
@@ -137,8 +137,20 @@ where
         // Periodically commit watermark offsets to Kafka
         store_watermarks(&consumer, watermark_version, managers, &mut last_version);
 
-        // Attempt to acquire semaphore to buffer a new message
-        let maybe_permit = semaphore.clone().try_acquire_owned().ok();
+        // Take one of the message buffer's permits, or find out why not.
+        //
+        // `Closed` cannot happen: this loop creates the semaphore, and nothing
+        // in the crate closes it. If it ever were closed, no record could be
+        // buffered again, so the loop stops rather than beating its heartbeat
+        // over a buffer that can take nothing.
+        let maybe_permit = match Arc::clone(&semaphore).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(TryAcquireError::NoPermits) => None,
+            Err(TryAcquireError::Closed) => {
+                error!("the message buffer was closed; stopping the poll loop");
+                break;
+            }
+        };
 
         // Pause/resume partitions based on their buffer capacity
         if let Err(error) =

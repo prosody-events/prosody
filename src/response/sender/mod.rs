@@ -228,7 +228,7 @@ impl<C: Codec> TypedSender<C> {
     )
 )]
 impl SendCounters {
-    /// How many responses reached their destination.
+    /// How many responses a destination accepted.
     pub(crate) fn sent(&self) -> u64 {
         self.sent.load(Relaxed)
     }

@@ -12,15 +12,16 @@
 
 use super::super::metrics::{DropReason, Stage};
 use super::{CAP_BYTES, Harness};
-use crate::router::loopback::{UNPUBLISHED_NODE, config, node, paused};
+use crate::router::loopback::{Script, UNPUBLISHED_NODE, config, node, paused};
+use crate::router::{Preference, SendFailure};
 use crate::test_util::{GlobalMetrics, assert_distinct_labels, label};
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
 use std::collections::BTreeMap;
 use strum::VariantArray;
 
-/// Destinations the fleet holds: the node that answers, and the one no
-/// registration names.
+/// Destinations the fleet holds. Each case here addresses two nodes, so two
+/// cells hold them all.
 const DESTINATIONS: usize = 2;
 
 /// Responses one destination may hold at once.
@@ -28,6 +29,12 @@ const SLOTS: usize = 2;
 
 /// A node every suite router publishes.
 const PUBLISHED: u8 = 0;
+
+/// The node whose direct endpoint does not answer, so its responses fall back.
+const FALLS_BACK: u8 = PUBLISHED;
+
+/// The node neither of whose endpoints answers.
+const SILENT: u8 = 1;
 
 /// A body no frame at the cap can carry: the whole cap, before any header.
 const OVER_CAP: usize = CAP_BYTES;
@@ -149,8 +156,57 @@ fn a_response_the_cap_refuses_is_counted_and_gives_its_slot_back() -> Result<()>
     Ok(())
 }
 
-/// Every stage and every drop reason counts under its own label, so one outcome
-/// can never be read as another in a dashboard.
+/// A fallback counts the transition it made, and only when the next candidate
+/// answered.
+///
+/// Three responses drive the whole claim on one meter. The first falls back,
+/// and it is the one transition. The second reaches the same node, which now
+/// remembers the endpoint that answered. It starts there and counts nothing, so
+/// a counter that moved once per delivery would read two. The third reaches a
+/// node where nothing answers. Its walk leaves both candidates behind and still
+/// counts nothing, so a counter that moved once per candidate would read two as
+/// well.
+///
+/// One worker drains one destination's queue in order, so the second response
+/// is dequeued after the first stored its preference. No wait is needed for
+/// that.
+#[test]
+fn a_fallback_counts_the_transition_and_only_when_the_next_candidate_answers() -> Result<()> {
+    let metrics = GlobalMetrics::install();
+    let drained = paused()?.block_on(async {
+        let harness = Harness::dual_homed(config(DESTINATIONS, SLOTS))?;
+        harness.script(FALLS_BACK, never_answers());
+        harness.script(SILENT, never_answers());
+        harness.script_advertised(SILENT, never_answers());
+        harness.send(FALLS_BACK)?;
+        harness.send(FALLS_BACK)?;
+        harness.send(SILENT)?;
+        harness.drain().await
+    })?;
+    ensure!(
+        (drained.sent, drained.dropped) == (2, 1),
+        "two responses must be accepted and one must be dropped, not {} and {}",
+        drained.sent,
+        drained.dropped
+    );
+
+    ensure!(
+        metrics.points("prosody.response.fallback")?
+            == vec![(
+                BTreeMap::from([
+                    ("from".to_owned(), "direct".to_owned()),
+                    ("to".to_owned(), "advertised".to_owned()),
+                ]),
+                1,
+            )],
+        "only the answered direct-to-advertised transition must be counted: {:?}",
+        metrics.points("prosody.response.fallback")?
+    );
+    Ok(())
+}
+
+/// Every stage, every drop reason and every fallback endpoint counts under its
+/// own label, so one outcome can never be read as another in a dashboard.
 ///
 /// Each enum is checked in its own namespace. They are different instruments
 /// under different attribute keys, so a name they happen to share is not a
@@ -158,5 +214,19 @@ fn a_response_the_cap_refuses_is_counted_and_gives_its_slot_back() -> Result<()>
 #[test]
 fn every_outcome_has_a_distinct_lowercase_label() -> Result<()> {
     assert_distinct_labels(Stage::VARIANTS.iter().map(|stage| stage.label()))?;
+    assert_distinct_labels(
+        Preference::VARIANTS
+            .iter()
+            .map(|preference| preference.label()),
+    )?;
     assert_distinct_labels(DropReason::VARIANTS.iter().map(|reason| reason.label()))
+}
+
+/// An endpoint that says nothing at all, which is what a wrong network label
+/// reaches.
+const fn never_answers() -> Script {
+    Script::Fail {
+        failure: SendFailure::Unreachable,
+        times: usize::MAX,
+    }
 }

@@ -314,7 +314,7 @@ fn the_listener_serves_the_caps_it_was_configured_with() -> Result<()> {
 fn reflection_is_served_only_when_it_is_configured() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
-        for (reflection, served) in [(true, false), (false, true)] {
+        for (reflection, unimplemented) in [(true, false), (false, true)] {
             let harness = Harness::with(Ok(TransportConfiguration {
                 reflection,
                 ..transport(FRAME_CAP)?
@@ -323,8 +323,8 @@ fn reflection_is_served_only_when_it_is_configured() -> Result<()> {
             let answered = reflect(harness.address.port).await;
             harness.stop().await?;
             ensure!(
-                (answered? == Code::Unimplemented) == served,
-                "reflection enabled = {reflection} must not answer UNIMPLEMENTED = {served}"
+                (answered? == Code::Unimplemented) == unimplemented,
+                "reflection enabled = {reflection} must answer UNIMPLEMENTED = {unimplemented}"
             );
         }
         Ok(())
