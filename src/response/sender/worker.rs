@@ -98,7 +98,8 @@ impl Share {
 ///
 /// Every dequeued job ends as exactly one outcome: it moves one stage or one
 /// drop reason, one of this sender's two counters, and the `peer.disposition`
-/// attribute on its own span. The deadline is the biased arm
+/// attribute on its own span. A delivered job also records `peer.preference`
+/// and may count one fallback transition. The deadline is the biased arm
 /// of the select, so a job whose deadline has already passed is dropped before
 /// the pipeline is polled at all — nothing is paced, encoded or sent for it.
 /// Work already inside one poll still finishes: this is a deadline the pipeline
@@ -176,7 +177,7 @@ pub(super) async fn run_worker<C: Codec, R: Router>(
 ///
 /// `Ok` carries the preference of the candidate that accepted the frame; every
 /// other outcome names why the response was dropped. The caller counts that
-/// outcome, so one dequeued job moves one counter.
+/// outcome, so one dequeued job moves one of the sender's two counters.
 ///
 /// The attempt budget applies to each endpoint rather than to both together.
 /// Sharing it would make the fallback unreachable whenever one attempt is
@@ -215,7 +216,8 @@ async fn deliver_job<C: Codec, R: Router>(
     Stage::Framed.record();
     let mut remembered = None;
     let mut last_failure = None;
-    // The candidate tried before this one, and so the `from` of a fallback.
+    // The candidate tried before this one: the `from` of a fallback, and the
+    // proof this is no longer the first candidate.
     let mut previous = None;
     let preferred = destination.preferred();
     let candidates = route.candidates(preferred);
@@ -248,7 +250,7 @@ async fn deliver_job<C: Codec, R: Router>(
                 return Ok(preference);
             }
             Err(failure) => {
-                last_failure = Some(failure);
+                last_failure = Some((preference, failure));
                 if !failure.is_wrong_endpoint() {
                     // A failure that is not a wrong endpoint is a status the
                     // path answered, so this endpoint is the one that reaches
@@ -263,8 +265,14 @@ async fn deliver_job<C: Codec, R: Router>(
         }
     }
     destination.prefer(remembered);
-    if let Some(failure) = last_failure {
-        warn!(%failure, node = %header.target, "response delivery failed");
+    if let Some((preference, failure)) = last_failure {
+        warn!(
+            %failure,
+            node = %header.target,
+            preference = preference.label(),
+            fallback,
+            "response delivery failed"
+        );
     }
     Err(DropReason::SendFailed)
 }

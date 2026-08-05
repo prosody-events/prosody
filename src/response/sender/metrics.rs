@@ -174,8 +174,8 @@ impl From<Refusal> for DropReason {
     }
 }
 
-/// Names a queue refusal the same way. The payload the error carries is the
-/// caller's again, so only which refusal it was matters here.
+/// Names a queue refusal the same way. The error carries the caller's payload,
+/// so only the refusal matters here.
 impl<T> From<&TrySendError<T>> for DropReason {
     fn from(error: &TrySendError<T>) -> Self {
         match error {
@@ -201,9 +201,9 @@ pub(super) fn record_rate_limited() {
 ///
 /// It counts transitions, not responses. The destination remembers the
 /// candidate that answered, so the responses behind the first one start there
-/// and count nothing. `from` and `to` are recorded together so one series names
-/// the whole transition, and a reader does not have to know which endpoints a
-/// route offers.
+/// and count nothing. `from` and `to` are recorded together, so one series
+/// names the whole transition. A reader does not need to know which endpoints
+/// a route offers.
 pub(super) fn record_fallback(from: Preference, to: Preference) {
     FALLBACKS.add(
         1,

@@ -188,7 +188,10 @@ fn a_response_dequeued_after_its_deadline_is_never_encoded() -> Result<()> {
             1,
             "the response dequeued after its deadline must never reach the transport"
         );
-        assert_eq!(drained.sent, 0, "neither response may be delivered");
+        assert_eq!(
+            drained.sent, 0,
+            "no response must be delivered while the barrier holds"
+        );
         Ok(())
     })
 }

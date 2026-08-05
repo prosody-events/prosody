@@ -14,7 +14,9 @@ use crate::response::sender::TypedSender;
 use crate::test_util::{GlobalSpans, TEST_RUNTIME, named};
 use color_eyre::Result;
 use color_eyre::eyre::{bail, ensure, eyre};
+use opentelemetry::Value;
 use opentelemetry::trace::{SpanKind, TraceContextExt};
+use opentelemetry_sdk::trace::SpanData;
 use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -30,10 +32,13 @@ const PAYLOAD: &[u8] = b"traced";
 /// The attribute naming what became of the response.
 const DISPOSITION: &str = "peer.disposition";
 
+/// The attribute naming the endpoint that answered.
+const PREFERENCE: &str = "peer.preference";
+
 /// One response delivered through the whole send path lands in the caller's
 /// trace, with `peer.response.receive` directly under `peer.response.send`, the
 /// send span is a client call rather than a consumer continuation, and that
-/// span says what became of the response.
+/// span says what became of the response and which endpoint answered.
 #[test]
 fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
     let spans = GlobalSpans::install()?;
@@ -89,16 +94,25 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
                 && received.span_context.trace_id() == caller_span.trace_id(),
             "{RECEIVED} must be a child of {SENT}, in the caller's trace"
         );
-        let disposition = sent
-            .attributes
-            .iter()
-            .find(|attribute| attribute.key.as_str() == DISPOSITION)
-            .ok_or_else(|| eyre!("{SENT} records no {DISPOSITION}"))?;
+        let disposition = attribute(sent, DISPOSITION)?;
         ensure!(
-            disposition.value.as_str() == "delivered",
-            "{SENT} must say what became of the response, not {}",
-            disposition.value
+            disposition.as_str() == "delivered",
+            "{SENT} must say what became of the response, not {disposition}"
+        );
+        let preference = attribute(sent, PREFERENCE)?;
+        ensure!(
+            preference.as_str() == "direct",
+            "{SENT} must name the endpoint that answered, not {preference}"
         );
         Ok(())
     })
+}
+
+/// One span attribute, by key.
+fn attribute<'a>(span: &'a SpanData, key: &str) -> Result<&'a Value> {
+    span.attributes
+        .iter()
+        .find(|attribute| attribute.key.as_str() == key)
+        .map(|attribute| &attribute.value)
+        .ok_or_else(|| eyre!("the {} span carries no {key}", span.name))
 }

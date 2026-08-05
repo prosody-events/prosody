@@ -345,8 +345,8 @@ impl SendFailure {
         }
     }
 
-    /// Whether nothing served the frame here, so the node's other endpoint is
-    /// worth trying inside the same response.
+    /// Whether this attempt got no proof that this address serves the node, so
+    /// the other endpoint is worth trying inside the same response.
     ///
     /// Every failure that answers `false` is a status some process gave the
     /// frame after reading it, which is what lets the send path remember the
@@ -377,7 +377,7 @@ impl SendFailure {
 }
 
 impl Preference {
-    /// The fixed label this endpoint is counted and traced under.
+    /// The fixed metric attribute this preference is counted and traced under.
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Direct => "direct",
@@ -465,7 +465,7 @@ pub(crate) fn choose_route(
     }
 }
 
-/// Why one delivery attempt did not reach its destination.
+/// Why one delivery attempt did not succeed.
 ///
 /// [`Status`](Self::Status) carries the gRPC status the destination itself
 /// answered, rather than a code of this crate's own, for the reason

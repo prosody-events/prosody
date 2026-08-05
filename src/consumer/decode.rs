@@ -13,7 +13,7 @@
 //! The main entry point is [`decode_message`], which performs all validation
 //! and returns `None` if the message is invalid or should be filtered out.
 
-use chrono::{MappedLocalTime, TimeZone, Utc};
+use chrono::{TimeZone, Utc};
 use internment::Intern;
 use opentelemetry::Context;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
@@ -137,7 +137,12 @@ pub fn decode_message<C: Codec>(
     let payload = match codec.deserialize(payload_bytes) {
         Ok(p) => p,
         Err(error) => {
-            error!("invalid payload: {error:#}; discarding message");
+            error!(
+                topic = %topic,
+                partition = partition,
+                offset = offset,
+                "invalid payload: {error:#}; discarding message"
+            );
             return None;
         }
     };
@@ -183,8 +188,8 @@ fn extract_source_system(message: &BorrowedMessage) -> Option<SourceSystem> {
 /// Reads the reserved response headers, or nothing when this consumer answers
 /// no requests.
 ///
-/// An unusable header set is counted and dropped rather than failing the event:
-/// a record that asks for a response badly is still a record to process.
+/// An unusable header set is counted and dropped, never failed.
+/// [`HeaderRejection`](crate::response::headers::HeaderRejection) states why.
 fn extract_request_tag(
     message: &BorrowedMessage,
     responder: Option<&SubsystemName>,
@@ -206,19 +211,15 @@ fn extract_request_tag(
 
 /// Resolves the message timestamp from Kafka metadata.
 ///
-/// Handles different timestamp types and fallback scenarios:
-/// - Uses `CreateTime` or `LogAppendTime` if available
-/// - Falls back to current time if timestamp is not available
-/// - Handles ambiguous timestamps by selecting the earliest
+/// Uses `CreateTime` or `LogAppendTime` when the value is in range. Falls back
+/// to the current time when Kafka gives no timestamp, or when the value is out
+/// of range.
 fn resolve_timestamp(message: &BorrowedMessage) -> chrono::DateTime<Utc> {
     match message.timestamp() {
         Timestamp::NotAvailable => Utc::now(),
-        Timestamp::CreateTime(millis) | Timestamp::LogAppendTime(millis) => {
-            match Utc.timestamp_millis_opt(millis) {
-                MappedLocalTime::Single(ts) => ts,
-                MappedLocalTime::Ambiguous(earliest, ..) => earliest,
-                MappedLocalTime::None => Utc::now(),
-            }
-        }
+        Timestamp::CreateTime(millis) | Timestamp::LogAppendTime(millis) => Utc
+            .timestamp_millis_opt(millis)
+            .single()
+            .unwrap_or_else(Utc::now),
     }
 }

@@ -10,7 +10,7 @@
 //! - Dispatches messages to the appropriate partition managers
 //!
 //! The main entry point is the [`poll`] function, which orchestrates all these
-//! operations within a continuous loop until shutdown is signaled.
+//! operations within a continuous loop.
 
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
 use rdkafka::error::KafkaError;
@@ -102,7 +102,8 @@ where
 /// 6. Processes valid messages through validation and filtering
 /// 7. Dispatches messages to their respective partition managers
 ///
-/// The loop continues until the shutdown flag is set to true.
+/// The loop continues until the shutdown flag is set, or until the message
+/// buffer's semaphore reports closed.
 pub fn poll<Ctx, C>(config: PollConfig<Ctx, C>)
 where
     Ctx: ConsumerContext,
@@ -140,9 +141,9 @@ where
         // Take one of the message buffer's permits, or find out why not.
         //
         // `Closed` cannot happen: this loop creates the semaphore, and nothing
-        // in the crate closes it. If it ever were closed, no record could be
-        // buffered again, so the loop stops rather than beating its heartbeat
-        // over a buffer that can take nothing.
+        // in the crate closes it. A closed semaphore takes no record again.
+        // The loop then stops, rather than beat its heartbeat over a buffer
+        // that can take nothing.
         let maybe_permit = match Arc::clone(&semaphore).try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(TryAcquireError::NoPermits) => None,

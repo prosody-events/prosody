@@ -138,9 +138,8 @@ impl<C: Codec> TypedSender<C> {
     ///
     /// Returns the payload, unencoded, when the fleet refused a slot or when
     /// the destination's queue could not take the job. The caller owns the
-    /// result again and disposes of it. The rate of each refusal is already
-    /// counted: a fleet refusal by the fleet, a queue refusal by
-    /// [`SendCounters::dropped`], and both by name in [`metrics`].
+    /// result again and disposes of it. [`metrics`] counts every refusal by
+    /// name, and a queue refusal also moves [`SendCounters::dropped`].
     pub(crate) fn send(
         &self,
         header: FrameHeader,
@@ -155,8 +154,6 @@ impl<C: Codec> TypedSender<C> {
                 return Err(payload);
             }
         };
-        // The cell a reservation names is one of this fleet's, and this
-        // sender's queues are the same fleet's length.
         let jobs = &self.queues[reservation.slot()];
         let destination = Arc::clone(reservation.destination());
         let expires_at = Instant::now() + self.send_deadline;
@@ -210,7 +207,7 @@ impl<C: Codec> TypedSender<C> {
         // Dropping the queues is what tells a worker no more work is coming;
         // it delivers what it already holds and then exits.
         drop(queues);
-        for worker in Vec::from(workers) {
+        for worker in workers {
             if let Err(error) = worker.await {
                 warn!(%error, "a response delivery worker did not exit cleanly");
             }
@@ -233,9 +230,9 @@ impl SendCounters {
         self.sent.load(Relaxed)
     }
 
-    /// How many responses this sender gave up on: what a worker dequeued and
-    /// could not deliver, plus a job the destination's queue could not take.
-    /// A fleet refusal is not here, because the fleet counts its own. A queue
+    /// How many responses this sender gave up on: a job a worker dequeued and
+    /// dropped, plus a job the destination's queue could not take.
+    /// A fleet refusal is not here: [`metrics`] names every refusal. A queue
     /// refusal counts here and still hands its payload back to the caller.
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Relaxed)
