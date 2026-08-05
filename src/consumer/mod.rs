@@ -150,10 +150,7 @@ use crate::{Codec, JsonCodec, Partition, Topic};
 use ahash::HashMap;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
-use futures::StreamExt;
 use futures::executor::block_on;
-use futures::future::ready;
-use futures::stream::FuturesUnordered;
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -181,6 +178,7 @@ mod poll;
 // readiness and liveness predicates this module's HTTP probes serve.
 pub(crate) mod probes;
 pub mod storage;
+mod sweep;
 mod wiring;
 
 /// Atomic counter for tracking changes in partition watermarks.
@@ -235,7 +233,7 @@ struct Teardown {
 ///
 /// The `C` type parameter is the [`Codec`] used to deserialize incoming
 /// payloads; the consumer's payload type is `C::Payload`.
-#[derive(Clone, Educe)]
+#[derive(Educe)]
 #[educe(Debug)]
 pub struct ProsodyConsumer<C: Codec = JsonCodec> {
     /// Flag to signal consumer shutdown.
@@ -259,6 +257,25 @@ pub struct ProsodyConsumer<C: Codec = JsonCodec> {
     /// Heartbeat registry for consumer-level actors.
     #[educe(Debug(ignore))]
     heartbeats: HeartbeatRegistry,
+}
+
+/// Every clone reaches the same consumer, so a clone is a second owner and
+/// never a passive view. The first clone to
+/// [`shutdown`](ProsodyConsumer::shutdown) stops the consumer, and so does the
+/// first clone to drop.
+///
+/// Written out rather than derived, because a derive would demand `C: Clone`.
+/// No field holds a `C`, so the codec never has to be cloneable.
+impl<C: Codec> Clone for ProsodyConsumer<C> {
+    fn clone(&self) -> Self {
+        Self {
+            shutdown: Arc::clone(&self.shutdown),
+            managers: Arc::clone(&self.managers),
+            assignment: self.assignment.clone(),
+            runtime_state: Arc::clone(&self.runtime_state),
+            heartbeats: self.heartbeats.clone(),
+        }
+    }
 }
 
 impl<C: Codec> ProsodyConsumer<C> {
@@ -318,7 +335,9 @@ impl<C: Codec> ProsodyConsumer<C> {
     /// The peer runtime stays live through steps 1 to 4, because a partition
     /// handler's commit hook can still queue an owed response. Tear the peer
     /// down earlier and the process drops responses it already owes, and fails
-    /// requests it could still answer. Step 3 is what bounds step 5.
+    /// requests it could still answer. Step 3 is what bounds step 5. The
+    /// compiler keeps that order: step 3 mints the proof steps 4 and 5 demand,
+    /// so neither can be written ahead of it.
     ///
     /// This is the supported teardown, and it is the only one that waits. A
     /// consumer that is dropped instead runs every step but the sweep, and does
@@ -330,15 +349,15 @@ impl<C: Codec> ProsodyConsumer<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`ShutdownError`] when the peer teardown could not remove this
-    /// node from the directory, or could not report what it did. A row that
-    /// survives expires on its lease.
+    /// Returns [`ShutdownError`] when the peer teardown could not confirm the
+    /// removal of this node from the directory, or could not report what it
+    /// did. A row that survives expires on its lease.
     pub async fn shutdown(mut self) -> Result<(), ShutdownError> {
         let Some(teardown) = self.stop_polling().await else {
             return Ok(());
         };
-        self.drain_managers().await;
-        match teardown.release().await {
+        let swept = sweep::drain_managers(&self.managers).await;
+        match teardown.release(swept).await {
             Some(peer) => peer.stop().await,
             None => Ok(()),
         }
@@ -370,33 +389,29 @@ impl<C: Codec> ProsodyConsumer<C> {
             peer,
         })
     }
-
-    /// Shuts down every partition manager the final revoke left behind.
-    ///
-    /// rdkafka skips its close-poll loop when the queue cannot be closed, and
-    /// the final revoke never dispatches then. Each retained manager holds a
-    /// handler clone, so this drain is what bounds the peer teardown that
-    /// follows. After a normal revoke the map is already empty.
-    ///
-    /// A `Swept` witness minted here and demanded by [`Teardown::release`]
-    /// would make the reversed order uncompilable. It was examined and
-    /// rejected: [`Drop`](Self::drop) releases without sweeping, so it would
-    /// hold no witness to give.
-    async fn drain_managers(&self) {
-        let draining: FuturesUnordered<_> = self
-            .managers
-            .write()
-            .drain()
-            .map(|(_, manager)| manager.shutdown())
-            .collect();
-        draining.for_each(|_| ready(())).await;
-    }
 }
 
 impl Teardown {
     /// Retires the observation gauges, stops the probe server, and hands the
     /// still-live peer handles back.
-    async fn release(self) -> Option<PeerHandles> {
+    ///
+    /// The [`Swept`](sweep::Swept) proof is the parameter, and only the sweep
+    /// mints one, so this step cannot be written ahead of the sweep. The peer
+    /// teardown reads the return value, so neither can that.
+    async fn release(mut self, _swept: sweep::Swept) -> Option<PeerHandles> {
+        let peer = self.peer.take();
+        self.stop_observation().await;
+        peer
+    }
+
+    /// Retires the observation gauges and stops the probe server.
+    ///
+    /// This consumes the value, so any peer handles it still holds drop here.
+    /// Dropping them asks the coordinator to tear the peer runtime down, and
+    /// nothing here waits for that teardown.
+    /// [`Drop`](ProsodyConsumer::drop) calls this instead of
+    /// [`release`](Self::release), because it runs no sweep and holds no proof.
+    async fn stop_observation(self) {
         // The `BaseConsumer` is dropped inside the poll task, so its close-time
         // polling — which can deliver one last statistics sample — finished
         // before the join handle resolved. Nothing can record over this.
@@ -405,7 +420,6 @@ impl Teardown {
         if let Some(probe_server) = self.probe_server {
             probe_server.shutdown().await;
         }
-        self.peer
     }
 }
 
@@ -416,16 +430,20 @@ impl Teardown {
 /// expires.
 ///
 /// `Drop` also runs no partition sweep, which
-/// [`shutdown`](ProsodyConsumer::shutdown) makes step 3. A foreign executor
-/// drives this path, and it cannot drive a spawned task on a current-thread
-/// runtime; `PartitionManager::shutdown` awaits one. So a teardown started here
-/// is not bounded by the sweep, and a manager the final revoke left behind can
-/// hold a response send handle open.
+/// [`shutdown`](ProsodyConsumer::shutdown) makes step 3. This path blocks the
+/// thread that drops the consumer, and the sweep waits for the work every
+/// retained manager still runs. So a teardown started here is not bounded by
+/// the sweep. A manager the final revoke left behind can hold a response send
+/// handle open.
+///
+/// This path does await the probe server task. A current-thread runtime cannot
+/// drive that task while this blocks its only thread, so call `shutdown` from
+/// such a runtime.
 impl<C: Codec> Drop for ProsodyConsumer<C> {
     fn drop(&mut self) {
         block_on(async {
             if let Some(teardown) = self.stop_polling().await {
-                drop(teardown.release().await);
+                teardown.stop_observation().await;
             }
         });
     }

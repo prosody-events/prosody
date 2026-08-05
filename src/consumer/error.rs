@@ -180,8 +180,9 @@ impl From<PeerRuntimeError> for PeerInitError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ShutdownError {
-    /// This node could not be removed from the peer directory.
-    #[error("this node could not be removed from the peer directory: {message}")]
+    /// The peer directory did not confirm the removal of this node. The row
+    /// may or may not survive, and one that survives expires on its lease.
+    #[error("the peer directory did not confirm the removal of this node: {message}")]
     Directory {
         /// The rendered source chain.
         message: String,

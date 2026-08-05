@@ -24,12 +24,12 @@ use thiserror::Error;
 ///
 /// **This type derives no `Validate`, and that is deliberate.** Every field
 /// that can express a degenerate value carries a rule at the section that
-/// consumes it, and every one of those sections is built on the startup path.
-/// The three that carry none — the two addresses and the reflection switch —
-/// have no degenerate value to refuse. A derive here would restate those rules
-/// in a second place or promise a check it does not make. The cost is that
-/// `build` accepts a degenerate value and the operator learns of it when the
-/// consumer starts.
+/// consumes it. The startup path builds every one of those sections. The three
+/// fields that carry none — the two addresses and the reflection switch — have
+/// no degenerate value to refuse. A derive here would restate those rules in a
+/// second place or promise a check it does not make. The cost is that `build`
+/// accepts a degenerate value and the operator learns of it when the consumer
+/// starts.
 #[derive(Builder, Clone, Debug)]
 #[builder(setter(into, strip_option), default)]
 pub struct PeerConfiguration {

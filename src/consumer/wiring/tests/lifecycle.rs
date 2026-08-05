@@ -4,10 +4,9 @@ use super::{
     Event, EventLog, RecordingBackend, RecordingDirectory, consumer_config, peer_config,
     retain_manager, start,
 };
-use crate::JsonCodec;
+use crate::consumer::Managers;
 use crate::consumer::error::{ConsumerError, PeerInitError};
 use crate::consumer::wiring::peer::{NoPeer, prepare_requester};
-use crate::consumer::{Managers, ProsodyConsumer};
 use crate::heartbeat::HeartbeatRegistry;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
@@ -116,15 +115,7 @@ async fn a_second_shutdown_sweeps_nothing() -> Result<()> {
         NoPeer,
     )
     .await?;
-    // What `#[derive(Clone)]` writes. It is spelled out because the derive
-    // demands `C: Clone`, and this suite's codec is not.
-    let loser = ProsodyConsumer::<JsonCodec> {
-        shutdown: Arc::clone(&consumer.shutdown),
-        managers: Arc::clone(&consumer.managers),
-        assignment: consumer.assignment.clone(),
-        runtime_state: Arc::clone(&consumer.runtime_state),
-        heartbeats: consumer.heartbeats.clone(),
-    };
+    let loser = consumer.clone();
 
     consumer.shutdown().await?;
     // Retained after the winner finished, so only the loser could sweep it.
