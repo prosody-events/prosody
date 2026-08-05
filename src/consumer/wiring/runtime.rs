@@ -17,7 +17,6 @@ use crate::router::directory::GroupMembership;
 use crate::router::label_fits;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::CellWrite;
-use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::timers::store::TriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType, MOCK_CLUSTER_BOOTSTRAP};
@@ -52,11 +51,6 @@ pub(in crate::consumer) struct StartupServices<'a, P> {
     pub(in crate::consumer) observer: KafkaObserver,
     /// The partition managers shared by startup, health, and shutdown.
     pub(in crate::consumer) managers: Arc<Managers<P>>,
-    /// The subsystem this consumer answers peer requests for.
-    ///
-    /// The responding entry point supplies this value. A consumer that answers
-    /// no requests supplies `None`.
-    pub(in crate::consumer) responder: Option<SubsystemName>,
 }
 
 /// Initializes a Prosody consumer with a trigger store provider, wiring the
@@ -67,9 +61,9 @@ pub(in crate::consumer) struct StartupServices<'a, P> {
 /// client configured to report statistics, and its first observation is seeded
 /// by [`KafkaObserver::install_startup_metadata`], which owns that contract.
 ///
-/// `peer` decides whether this consumer joins the peer fleet. It is activated
-/// after the client subscribes, which is the last step that can fail, and every
-/// earlier failure arm abandons it.
+/// `peer` decides whether this consumer joins the peer fleet, and whether it
+/// answers peer requests. It is activated after the client subscribes, which is
+/// the last step that can fail, and every earlier failure arm abandons it.
 ///
 /// Fails if the configuration is invalid, the probe server can't be started
 /// (if enabled), the consumer context can't be created, the hostname can't be
@@ -107,7 +101,6 @@ where
         heartbeats,
         observer,
         managers,
-        responder,
     } = services;
 
     let watermark_version: Arc<WatermarkVersion> = Arc::default();
@@ -174,6 +167,9 @@ where
     // context holds a response send handle, and a release that ran while it
     // lives would wait for a sender this task still owns.
     let group = checked_membership(cluster.as_deref(), &consumer_config.group_id);
+    // The attachment names what the poll loop admits, so a consumer reads a
+    // request tag only when it holds the responder that answers it.
+    let responder = peer.responder();
     let peer = match peer.activate(group).await {
         Ok(peer) => peer,
         Err((peer, error)) => {

@@ -97,7 +97,6 @@ where
             heartbeats,
             observer: KafkaObserver::new(&consumer_config.group_id),
             managers,
-            responder: None,
         };
 
         match (consumer_config.mock, trigger_store_config) {

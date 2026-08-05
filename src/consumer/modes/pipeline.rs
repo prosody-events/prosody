@@ -113,7 +113,6 @@ impl PipelineMiddlewareStack {
             heartbeats: self.heartbeats,
             observer: self.observer,
             managers: Arc::clone(&managers),
-            responder: None,
         };
         // Preparation is the last fallible step of this mode: no `?` after it
         // could drop a served listener.
@@ -208,7 +207,6 @@ impl PipelineMiddlewareStack {
             heartbeats: self.heartbeats,
             observer: self.observer,
             managers: Arc::clone(&managers),
-            responder: Some(subsystem.clone()),
         };
         // Preparation is the last fallible step of this mode, and no `?` runs
         // between it and the termination below.

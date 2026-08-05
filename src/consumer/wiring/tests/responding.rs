@@ -86,6 +86,9 @@ impl Codec for SomeResponseCodec {
 }
 
 /// Production termination captures a request tag and delivers one response.
+///
+/// The attachment also reports the name the decode path admits. That name is
+/// read from the responder, so it is the one the delivered frame claims.
 #[tokio::test]
 async fn the_responding_wiring_answers_a_tagged_message() -> Result<()> {
     let log: EventLog = Arc::new(Mutex::new(Vec::new()));
@@ -114,6 +117,7 @@ async fn the_responding_wiring_answers_a_tagged_message() -> Result<()> {
     )?
     .layer(LogMiddleware::new());
     let (provider, peer) = prepared.terminate(&middleware, ScriptedHandler::success());
+    let admitted = peer.responder();
     let handler = provider.handler_for_partition(Topic::from(TOPIC), PARTITION);
     let tracker = OffsetTracker::new(
         Topic::from(TOPIC),
@@ -157,6 +161,55 @@ async fn the_responding_wiring_answers_a_tagged_message() -> Result<()> {
     assert_eq!(frame.header.request, RequestId::from_bytes([9; 16]));
     assert_eq!(frame.header.subsystem, SubsystemName::try_new(SUBSYSTEM)?);
     assert_eq!(frame.header.status, ResponseStatus::Success);
+    ensure!(
+        admitted.as_ref() == Some(&frame.header.subsystem),
+        "the consumer admits a request under a name its own answer does not claim"
+    );
+    Ok(())
+}
+
+/// Preparation carries the responder's own name out to startup.
+///
+/// The decode path admits a request tag for the name the attachment reports,
+/// and preparation is the only production step that fills it. A consumer whose
+/// attachment reports nothing parses no tag and answers nothing.
+#[tokio::test]
+async fn the_prepared_peer_admits_the_name_its_responder_answers_with() -> Result<()> {
+    let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+    let backend = RecordingBackend {
+        directory: RecordingDirectory::new(log, false),
+    };
+    let consumer = consumer_config("responding-wiring-admits")?;
+    let peer_config = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let subsystem = SubsystemName::try_new(SUBSYSTEM)?;
+    let managers: Arc<Managers<Value>> = Arc::default();
+    let heartbeats = HeartbeatRegistry::new(consumer.group_id.clone(), consumer.stall_threshold);
+    let prepared = prepare_responding::<SomeResponseCodec, _, _>(
+        &peer_config,
+        &backend,
+        subsystem.clone(),
+        managers,
+        &heartbeats,
+    )
+    .await?;
+    let common = common_config(None, Some(subsystem.clone()))?;
+    let middleware = build_common_middleware::<_, Value>(
+        &common,
+        &consumer,
+        Telemetry::new(),
+        MemoryDeduplicationStoreProvider::new(),
+    )?
+    .layer(LogMiddleware::new());
+    let (provider, peer) = prepared.terminate(&middleware, ScriptedHandler::success());
+    let admitted = peer.responder();
+    // The provider holds the last responder clone, and abandonment joins the
+    // workers that clone keeps open.
+    drop(provider);
+    bounded("prepared peer abandonment", peer.abandon()).await?;
+    ensure!(
+        admitted == Some(subsystem),
+        "the prepared peer admits {admitted:?}, not the name its responder answers with"
+    );
     Ok(())
 }
 

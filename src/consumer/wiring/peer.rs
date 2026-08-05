@@ -47,6 +47,15 @@ pub(in crate::consumer) trait PeerAttachment: Sized + Send {
         observer: &KafkaObserver,
     ) -> Option<String>;
 
+    /// The subsystem the decode path admits a request tag for, or `None` when
+    /// this consumer answers none.
+    ///
+    /// The attachment is the one source of it, and only a prepared responder
+    /// fills it. So a consumer admits a request exactly when a responder exists
+    /// to answer it, and it admits the name that responder frames its answers
+    /// with.
+    fn responder(&self) -> Option<SubsystemName>;
+
     /// Publishes this node and starts the coordinator.
     ///
     /// A failure hands the attachment back unspent, so the caller releases what
@@ -67,6 +76,10 @@ pub(in crate::consumer) struct NoPeer;
 pub(in crate::consumer) struct PreparedPeer<D: NodeDirectory> {
     prepared: PreparedPeerRuntime<D>,
     workers: Option<ResponseWorkers>,
+    /// Read back from the responder this peer was prepared with, so a consumer
+    /// that answers nothing carries `None` here. See
+    /// [`PeerAttachment::responder`].
+    responder: Option<SubsystemName>,
 }
 
 /// A prepared peer that also holds the responder its consumer answers with.
@@ -164,6 +177,7 @@ impl<D: NodeDirectory, R: Codec> PreparedResponder<D, R> {
         workers: ResponseWorkers,
     ) -> Self {
         peer.workers = Some(workers);
+        peer.responder = Some(responder.subsystem().clone());
         Self {
             peer,
             responder: Arc::new(responder),
@@ -176,6 +190,10 @@ impl PeerAttachment for NoPeer {
         _consumer: &BaseConsumer<Ctx>,
         _observer: &KafkaObserver,
     ) -> Option<String> {
+        None
+    }
+
+    fn responder(&self) -> Option<SubsystemName> {
         None
     }
 
@@ -201,16 +219,28 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
         cluster
     }
 
+    fn responder(&self) -> Option<SubsystemName> {
+        self.responder.clone()
+    }
+
     async fn activate(
         self,
         group: Option<GroupMembership>,
     ) -> Result<Option<PeerHandles>, (Self, ConsumerError)> {
-        let Self { prepared, workers } = self;
+        let Self {
+            prepared,
+            workers,
+            responder,
+        } = self;
         let runtime = match prepared.activate(group).await {
             Ok(runtime) => runtime,
             Err((prepared, error)) => {
                 return Err((
-                    Self { prepared, workers },
+                    Self {
+                        prepared,
+                        workers,
+                        responder,
+                    },
                     PeerInitError::Directory {
                         message: format!("{error:#}"),
                     }
@@ -283,6 +313,7 @@ where
     Ok(PreparedPeer {
         prepared,
         workers: None,
+        responder: None,
     })
 }
 
@@ -310,6 +341,9 @@ where
     let mut peer = prepare_requester(peer, backend, managers, heartbeats).await?;
     match peer.prepared.responder(subsystem) {
         Ok((responder, workers)) => {
+            // Read back from the responder, so the decode path admits the name
+            // this consumer's own answers claim.
+            peer.responder = Some(responder.subsystem().clone());
             peer.workers = Some(workers);
             Ok(PreparedResponder {
                 peer,

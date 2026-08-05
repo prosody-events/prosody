@@ -94,7 +94,6 @@ pub(super) async fn initialize_with(
             heartbeats,
             observer,
             managers,
-            responder: keyed_state.subsystem().cloned(),
         },
         NoPeer,
     ))

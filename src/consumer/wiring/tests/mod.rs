@@ -458,7 +458,6 @@ async fn start<A: PeerAttachment + 'static>(
             heartbeats,
             observer: KafkaObserver::new(&config.group_id),
             managers,
-            responder: None,
         },
         peer,
     ))

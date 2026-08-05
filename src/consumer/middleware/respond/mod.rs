@@ -21,6 +21,11 @@
 //! commit and this hook loses the answer, and the marker suppresses the
 //! redelivery. A requester therefore always needs its own deadline.
 //!
+//! One live path answers a record whose keyed-state writes did not last. A
+//! permanently rejected stage still commits and still fires this hook, so the
+//! answer leaves with the label the handler's own result gives. The label
+//! reports the handler result, never the durability of the writes behind it.
+//!
 //! [`responding_provider`] is the only way to build the layer from outside this
 //! module, and it states what that placement guarantees. Its production caller
 //! is
@@ -57,10 +62,12 @@ mod tests;
 /// Construction requires the process router. Thus, a responder cannot detach
 /// from the directory and fleet that route its work.
 ///
-/// `subsystem` is the name this consumer answers peer requests for. A
-/// responding entry point reads it from the keyed-state configuration and
-/// carries the same value to the decode path. One source keeps the tag a
-/// record is admitted by and the subsystem a frame claims in agreement.
+/// `subsystem` is the name this consumer answers peer requests for. The decode
+/// path admits a request tag for one name, and it reads that name back from
+/// this responder through
+/// [`PeerAttachment::responder`](crate::consumer::wiring::peer::PeerAttachment::responder).
+/// So the name a record is admitted by and the name its answer claims are one
+/// value.
 pub(crate) struct Responder<C: Codec> {
     sender: TypedSender<C>,
     subsystem: SubsystemName,
@@ -141,6 +148,11 @@ impl<C: Codec> Responder<C> {
     ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
         let (sender, workers) = TypedSender::new(router, cap)?;
         Ok((Self { sender, subsystem }, workers))
+    }
+
+    /// The name this responder answers for, and the one the decode path admits.
+    pub(crate) fn subsystem(&self) -> &SubsystemName {
+        &self.subsystem
     }
 
     /// Returns the response outcome counters.
@@ -254,7 +266,7 @@ where
         let Some(Answering { tag, trace }) = meta else {
             return self.handler.after_commit(context, result).await;
         };
-        let header = tag.header(self.responder.subsystem.clone(), status(&result));
+        let header = tag.header(self.responder.subsystem().clone(), status(&result));
         // Nothing is encoded here. The hook moves the typed result into the
         // slot. The worker encodes it against its own scratch.
         if let Err(payload) = self.responder.sender.send(header, trace, result) {
