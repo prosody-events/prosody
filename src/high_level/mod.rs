@@ -18,7 +18,6 @@ use crate::high_level::state::{ConsumerState, ConsumerStateView};
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state_reader::ConsumerReaderBackend;
-#[cfg(test)]
 use crate::state_reader::StateReaderDependencies;
 use crate::state_reader::{StateReader, StateReaderClient};
 use crate::subsystem::SubsystemName;
@@ -26,6 +25,7 @@ use crate::telemetry::Telemetry;
 use crate::{Codec, Topic};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
+use std::future::Future;
 use std::mem::take;
 use tokio::sync::{Mutex, OnceCell};
 use tracing::info;
@@ -219,19 +219,173 @@ where
             .map_err(HighLevelClientError::StateReader)
     }
 
-    /// Subscribes the consumer with the provided handler.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `HighLevelClientError` if:
-    /// - The consumer is unconfigured.
-    /// - The consumer is already subscribed.
-    /// - Consumer initialization fails.
-    async fn subscribe_inner(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>
+    async fn build_consumer(
+        config: ModeConfiguration,
+        shared: StateReaderDependencies<C, B::Reader>,
+        producer: ProsodyProducer<C>,
+        telemetry: Telemetry,
+        handler: T,
+    ) -> (
+        Result<ProsodyConsumer<C>, HighLevelClientError<C::Error>>,
+        ModeConfiguration,
+    )
     where
         T: FallibleHandler<Payload = C::Payload> + Clone,
         C::Payload: crate::EventType + Clone,
         B::Reader: ConsumerReaderBackend<C>,
+    {
+        let built = match &config {
+            ModeConfiguration::Pipeline {
+                consumer,
+                retry,
+                monopolization,
+                defer,
+                common,
+            } => Box::pin(ProsodyConsumer::<C>::pipeline_consumer_with_backend::<
+                T,
+                B::Reader,
+            >(
+                deps::consumer_setup::<C, B>(consumer, common, &shared),
+                PipelineMiddlewareConfiguration {
+                    retry: retry.clone(),
+                    monopolization: monopolization.clone(),
+                    defer: defer.clone(),
+                },
+                telemetry,
+                handler,
+            ))
+            .await
+            .map_err(Into::into),
+            ModeConfiguration::LowLatency {
+                consumer,
+                retry,
+                failure_topic,
+                common,
+            } => Box::pin(ProsodyConsumer::low_latency_consumer_with_backend::<
+                T,
+                B::Reader,
+            >(
+                deps::consumer_setup::<C, B>(consumer, common, &shared),
+                LowLatencyMiddlewareConfiguration {
+                    retry: retry.clone(),
+                    failure_topic: failure_topic.clone(),
+                },
+                producer,
+                telemetry,
+                handler,
+            ))
+            .await
+            .map_err(Into::into),
+            ModeConfiguration::BestEffort { consumer, common } => {
+                Box::pin(ProsodyConsumer::<C>::best_effort_consumer::<T, B::Reader>(
+                    deps::consumer_setup::<C, B>(consumer, common, &shared),
+                    telemetry,
+                    handler,
+                ))
+                .await
+                .map_err(Into::into)
+            }
+        };
+        (built, config)
+    }
+
+    async fn build_responding_consumer<R>(
+        config: ModeConfiguration,
+        shared: StateReaderDependencies<C, B::Reader>,
+        producer: ProsodyProducer<C>,
+        telemetry: Telemetry,
+        handler: T,
+    ) -> (
+        Result<ProsodyConsumer<C>, HighLevelClientError<C::Error>>,
+        ModeConfiguration,
+    )
+    where
+        T: FallibleHandler<Payload = C::Payload> + Clone,
+        T::Output: Sync + 'static,
+        T::Error: Sync + 'static,
+        C::Payload: crate::EventType + Clone,
+        B::Reader: ConsumerReaderBackend<C>,
+        R: Codec<Payload = Result<T::Output, T::Error>>,
+    {
+        let built = match &config {
+            ModeConfiguration::Pipeline {
+                consumer,
+                retry,
+                monopolization,
+                defer,
+                common,
+            } => Box::pin(
+                ProsodyConsumer::<C>::pipeline_responding_consumer_with_backend::<T, R, B::Reader>(
+                    deps::consumer_setup::<C, B>(consumer, common, &shared),
+                    PipelineMiddlewareConfiguration {
+                        retry: retry.clone(),
+                        monopolization: monopolization.clone(),
+                        defer: defer.clone(),
+                    },
+                    telemetry,
+                    handler,
+                ),
+            )
+            .await
+            .map_err(Into::into),
+            ModeConfiguration::LowLatency {
+                consumer,
+                retry,
+                failure_topic,
+                common,
+            } => Box::pin(
+                ProsodyConsumer::low_latency_responding_consumer_with_backend::<T, R, B::Reader>(
+                    deps::consumer_setup::<C, B>(consumer, common, &shared),
+                    LowLatencyMiddlewareConfiguration {
+                        retry: retry.clone(),
+                        failure_topic: failure_topic.clone(),
+                    },
+                    producer,
+                    telemetry,
+                    handler,
+                ),
+            )
+            .await
+            .map_err(Into::into),
+            ModeConfiguration::BestEffort { consumer, common } => {
+                Box::pin(ProsodyConsumer::<C>::best_effort_responding_consumer::<
+                    T,
+                    R,
+                    B::Reader,
+                >(
+                    deps::consumer_setup::<C, B>(consumer, common, &shared),
+                    telemetry,
+                    handler,
+                ))
+                .await
+                .map_err(Into::into)
+            }
+        };
+        (built, config)
+    }
+
+    async fn subscribe_with<F, Fut>(
+        &self,
+        handler: T,
+        assemble: F,
+    ) -> Result<(), HighLevelClientError<C::Error>>
+    where
+        T: FallibleHandler<Payload = C::Payload> + Clone,
+        C::Payload: crate::EventType + Clone,
+        B::Reader: ConsumerReaderBackend<C>,
+        F: FnOnce(
+            ModeConfiguration,
+            StateReaderDependencies<C, B::Reader>,
+            ProsodyProducer<C>,
+            Telemetry,
+            T,
+        ) -> Fut,
+        Fut: Future<
+            Output = (
+                Result<ProsodyConsumer<C>, HighLevelClientError<C::Error>>,
+                ModeConfiguration,
+            ),
+        >,
     {
         let mut guard = self.consumer.lock().await;
 
@@ -257,61 +411,14 @@ where
             }
         };
 
-        // Build the consumer. `take` moved the config out, so any failure must
-        // undo both: the match below restores `Configured` and drops the
-        // bundle. See there for why each step is needed.
-        let built: Result<_, HighLevelClientError<C::Error>> = match &config {
-            ModeConfiguration::Pipeline {
-                consumer,
-                retry,
-                monopolization,
-                defer,
-                common,
-            } => Box::pin(ProsodyConsumer::<C>::pipeline_consumer_with_backend::<
-                T,
-                B::Reader,
-            >(
-                deps::consumer_setup::<C, B>(consumer, common, &shared),
-                PipelineMiddlewareConfiguration {
-                    retry: retry.clone(),
-                    monopolization: monopolization.clone(),
-                    defer: defer.clone(),
-                },
-                self.telemetry.clone(),
-                handler.clone(),
-            ))
-            .await
-            .map_err(Into::into),
-            ModeConfiguration::LowLatency {
-                consumer,
-                retry,
-                failure_topic,
-                common,
-            } => Box::pin(ProsodyConsumer::low_latency_consumer_with_backend::<
-                T,
-                B::Reader,
-            >(
-                deps::consumer_setup::<C, B>(consumer, common, &shared),
-                LowLatencyMiddlewareConfiguration {
-                    retry: retry.clone(),
-                    failure_topic: failure_topic.clone(),
-                },
-                self.producer.clone(),
-                self.telemetry.clone(),
-                handler.clone(),
-            ))
-            .await
-            .map_err(Into::into),
-            ModeConfiguration::BestEffort { consumer, common } => {
-                Box::pin(ProsodyConsumer::<C>::best_effort_consumer::<T, B::Reader>(
-                    deps::consumer_setup::<C, B>(consumer, common, &shared),
-                    self.telemetry.clone(),
-                    handler.clone(),
-                ))
-                .await
-                .map_err(Into::into)
-            }
-        };
+        let (built, config) = assemble(
+            config,
+            shared,
+            self.producer.clone(),
+            self.telemetry.clone(),
+            handler.clone(),
+        )
+        .await;
 
         let consumer = match built {
             Ok(consumer) => consumer,
@@ -330,6 +437,36 @@ where
         };
 
         Ok(())
+    }
+
+    async fn subscribe_inner(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>
+    where
+        T: FallibleHandler<Payload = C::Payload> + Clone,
+        C::Payload: crate::EventType + Clone,
+        B::Reader: ConsumerReaderBackend<C>,
+    {
+        self.subscribe_with(handler, |config, shared, producer, telemetry, handler| {
+            Self::build_consumer(config, shared, producer, telemetry, handler)
+        })
+        .await
+    }
+
+    async fn subscribe_responding_inner<R>(
+        &self,
+        handler: T,
+    ) -> Result<(), HighLevelClientError<C::Error>>
+    where
+        T: FallibleHandler<Payload = C::Payload> + Clone,
+        T::Output: Sync + 'static,
+        T::Error: Sync + 'static,
+        C::Payload: crate::EventType + Clone,
+        B::Reader: ConsumerReaderBackend<C>,
+        R: Codec<Payload = Result<T::Output, T::Error>>,
+    {
+        self.subscribe_with(handler, |config, shared, producer, telemetry, handler| {
+            Self::build_responding_consumer::<R>(config, shared, producer, telemetry, handler)
+        })
+        .await
     }
 
     /// Unsubscribes the consumer.
@@ -409,6 +546,24 @@ macro_rules! impl_subscribe {
                 handler: T,
             ) -> impl Future<Output = Result<(), HighLevelClientError<C::Error>>> + Send + '_ {
                 self.subscribe_inner(handler)
+            }
+
+            /// Subscribes a consumer that answers peer requests.
+            ///
+            /// # Errors
+            ///
+            /// Returns an error when the consumer is unconfigured, already
+            /// subscribed, or cannot be initialized.
+            pub async fn subscribe_responding<R>(
+                &self,
+                handler: T,
+            ) -> Result<(), HighLevelClientError<C::Error>>
+            where
+                T::Output: Sync + 'static,
+                T::Error: Sync + 'static,
+                R: Codec<Payload = Result<T::Output, T::Error>>,
+            {
+                self.subscribe_responding_inner::<R>(handler).await
             }
         }
     };

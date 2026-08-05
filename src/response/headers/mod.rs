@@ -111,14 +111,6 @@ impl RequestTag {
     ///
     /// The sender resolves the node through the directory. A Kafka header can
     /// never supply an address. A responder never sets the relay.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the respond layer is this method's production caller, and the respond \
-                      suites exercise it"
-        )
-    )]
     pub(crate) fn header(self, subsystem: SubsystemName, status: ResponseStatus) -> FrameHeader {
         FrameHeader {
             target: self.node,

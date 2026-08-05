@@ -1,7 +1,7 @@
 //! What the typed sender's own suites share: a router over an in-process
 //! transport, and a harness that records every attempt it makes.
 
-use super::TypedSender;
+use super::{ResponseWorkers, TypedSender};
 use crate::error::ErrorCategory;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader};
@@ -39,6 +39,7 @@ pub(super) const PAYLOAD: &[u8] = b"response";
 pub(super) struct Harness {
     router: TestRouter,
     sender: TypedSender<CountingCodec>,
+    workers: ResponseWorkers,
     deliveries: UnboundedReceiver<Delivery>,
     header: FrameHeader,
     /// Responses this harness queued, counted so [`Harness::drain`] can hold
@@ -62,8 +63,10 @@ impl Harness {
     }
 
     fn over(router: TestRouter, deliveries: UnboundedReceiver<Delivery>) -> Result<Self> {
+        let (sender, workers) = TypedSender::new(&router, FrameCap::new(CAP_BYTES)?)?;
         Ok(Self {
-            sender: TypedSender::new(&router, FrameCap::new(CAP_BYTES)?)?,
+            sender,
+            workers,
             router,
             deliveries,
             header: header()?,
@@ -146,12 +149,14 @@ impl Harness {
         let Self {
             router,
             sender,
+            workers,
             mut deliveries,
             queued,
             ..
         } = self;
         let counters = sender.counters();
-        if timeout(HANG_GUARD, sender.drain()).await.is_err() {
+        drop(sender);
+        if timeout(HANG_GUARD, workers.join()).await.is_err() {
             bail!("the destination workers did not finish");
         }
         drop(router);

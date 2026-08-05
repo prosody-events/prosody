@@ -58,10 +58,23 @@ pub(crate) struct TypedSender<C: Codec> {
     /// destination's slots, and a cell is only evictable while every slot of it
     /// is free.
     queues: Box<[Sender<Job<C>>]>,
-    workers: Box<[JoinHandle<()>]>,
     send_deadline: Duration,
     counters: Arc<SendCounters>,
 }
+
+/// The response delivery workers, joined once every send handle is gone.
+///
+/// This value holds no sender. A worker ends when the last [`Sender`] clone for
+/// its queue drops, and every one of those lives inside a responder clone a
+/// partition handler holds. So the join is what waits for delivery, and the
+/// drop of the last responder is what starts it.
+///
+/// No deadline guards the join. The shutdown order is the whole guarantee:
+/// [`ProsodyConsumer::shutdown`](crate::consumer::ProsodyConsumer::shutdown)
+/// sweeps every partition manager before the peer teardown runs, which is what
+/// makes the wait finite. A consumer dropped without that shutdown runs no
+/// sweep; that consumer's `Drop` states what it leaves behind.
+pub(crate) struct ResponseWorkers(Box<[JoinHandle<()>]>);
 
 /// What one sender's deliveries came to.
 ///
@@ -72,6 +85,10 @@ pub(crate) struct TypedSender<C: Codec> {
 /// This is the in-process account, which this module's suites assert on. The
 /// operator's account is in [`metrics`], and it names each outcome rather than
 /// totalling two.
+///
+/// A log of these totals at [`ResponseWorkers::join`] was examined and
+/// rejected. It would give the accessors a production reader, and [`metrics`]
+/// already names every outcome.
 #[derive(Debug, Default)]
 pub(crate) struct SendCounters {
     sent: AtomicU64,
@@ -95,7 +112,7 @@ impl<C: Codec> TypedSender<C> {
     pub(crate) fn new<R: Router>(
         router: &R,
         cap: FrameCap,
-    ) -> Result<Self, FleetConfigurationError> {
+    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
         let fleet = Arc::clone(router.fleet());
         let config = fleet.config();
         validate_scratch_budget(config.max_destinations, cap)?;
@@ -115,13 +132,15 @@ impl<C: Codec> TypedSender<C> {
                 FrameEncoder::new(C::default(), cap),
             )));
         }
-        Ok(Self {
-            fleet,
-            queues: queues.into_boxed_slice(),
-            workers: workers.into_boxed_slice(),
-            send_deadline: config.send_deadline,
-            counters,
-        })
+        Ok((
+            Self {
+                fleet,
+                queues: queues.into_boxed_slice(),
+                send_deadline: config.send_deadline,
+                counters,
+            },
+            ResponseWorkers(workers.into_boxed_slice()),
+        ))
     }
 
     /// Queues one response for delivery, in the trace `trace` names.
@@ -188,26 +207,23 @@ impl<C: Codec> TypedSender<C> {
 
     /// What this sender's deliveries came to. The counters outlive this sender,
     /// so a caller may hold them while the workers finish.
+    #[cfg(test)]
     pub(crate) fn counters(&self) -> Arc<SendCounters> {
         Arc::clone(&self.counters)
     }
+}
 
-    /// Stops taking work and returns once every worker has finished what it
-    /// holds.
+impl ResponseWorkers {
+    /// Waits until every worker has finished what it holds.
     ///
-    /// Each response a worker still holds ends at its own expiry, so the wait
-    /// is at most one deadline past the last response queued. That deadline is
-    /// measured between polls: a codec that never returns holds its worker, and
-    /// this wait with it. Shutdown runs this after the fleet's admission gate
-    /// has drained, so nothing can be queued while it waits.
-    pub(crate) async fn drain(self) {
-        let Self {
-            queues, workers, ..
-        } = self;
-        // Dropping the queues is what tells a worker no more work is coming;
-        // it delivers what it already holds and then exits.
-        drop(queues);
-        for worker in workers {
+    /// A dropped queue sender tells its worker that no more work can arrive.
+    /// The worker then delivers what it already holds and exits. Each of those
+    /// responses ends at its own expiry, so this wait is at most one send
+    /// deadline past the last response queued. That deadline is measured
+    /// between polls: a codec that never returns holds its worker, and this
+    /// wait with it.
+    pub(crate) async fn join(self) {
+        for worker in self.0 {
             if let Err(error) = worker.await {
                 warn!(%error, "a response delivery worker did not exit cleanly");
             }
@@ -215,21 +231,13 @@ impl<C: Codec> TypedSender<C> {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no production reader yet: the consumer wiring that hands a consumer its \
-                  responder will report these totals; the sender's and the respond layer's suites \
-                  read them today"
-    )
-)]
 impl SendCounters {
     /// How many responses this sender saw the transport accept.
     ///
     /// The deadline can end a job whose frame the peer already holds, and that
     /// job counts as dropped. So this is what the sender observed, never what
     /// every destination received.
+    #[cfg(test)]
     pub(crate) fn sent(&self) -> u64 {
         self.sent.load(Relaxed)
     }
@@ -238,6 +246,7 @@ impl SendCounters {
     /// dropped, plus a job the destination's queue could not take.
     /// A fleet refusal is not here: [`metrics`] names every refusal. A queue
     /// refusal counts here and still hands its payload back to the caller.
+    #[cfg(test)]
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Relaxed)
     }

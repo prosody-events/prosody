@@ -8,13 +8,13 @@
 // The `not(test)` gate is what makes this an *expectation* rather than a
 // blanket permission: it holds only while these items really are
 // production-dead, so the day the transport calls the last one, the gate
-// reports it unfulfilled and demands the attribute be deleted.
+// reports it unfulfilled and demands the attribute be deleted. The encoder
+// left this list that way.
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "the decoder is live; the encoder waits for the production responder, and both \
-                  conversions have tests"
+        reason = "`ResponseFrame::decode_with` and `PayloadError` serve the frame suites alone"
     )
 )]
 

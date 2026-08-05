@@ -50,7 +50,7 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
             SUITE_DESTINATIONS,
             SUITE_SLOTS,
         )?;
-        let sender = TypedSender::<CountingCodec>::new(&router, harness.cap)?;
+        let (sender, workers) = TypedSender::<CountingCodec>::new(&router, harness.cap)?;
         let request = register(&harness.registry, &[ALPHA], CountingCodec::FORMAT_ID)?;
 
         // The caller's span is opened, read, and closed here: the send carries
@@ -70,7 +70,8 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
             bail!("the fleet refused the response");
         }
         drop(caller);
-        sender.drain().await;
+        drop(sender);
+        workers.join().await;
         ensure!(
             counters.sent() == 1,
             "the response must have reached the listener before its trace is read"

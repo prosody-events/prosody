@@ -273,7 +273,7 @@ async fn crossing(pair: &Pair) -> Result<()> {
     )?;
 
     let forwarded = TRANSPORT.forwarded();
-    let sender = TypedSender::<CountingCodec>::new(&router, cap)?;
+    let (sender, workers) = TypedSender::<CountingCodec>::new(&router, cap)?;
     sender
         .send(
             FrameHeader {
@@ -287,7 +287,8 @@ async fn crossing(pair: &Pair) -> Result<()> {
             PAYLOAD.to_vec(),
         )
         .map_err(|_| eyre!("the fleet refused the response"))?;
-    if timeout(HANG_GUARD, sender.drain()).await.is_err() {
+    drop(sender);
+    if timeout(HANG_GUARD, workers.join()).await.is_err() {
         bail!("the delivery workers did not finish");
     }
     ensure(

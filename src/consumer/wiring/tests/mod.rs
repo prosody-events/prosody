@@ -10,11 +10,15 @@ use crate::consumer::kafka_context::PartitionProviders;
 use crate::consumer::message::UncommittedMessage;
 use crate::consumer::middleware::CloneProvider;
 use crate::consumer::middleware::deduplication::{
-    DEFAULT_IDEMPOTENCE_VERSION, MemoryDeduplicationStoreProvider,
+    DEFAULT_IDEMPOTENCE_VERSION, DeduplicationConfiguration, MemoryDeduplicationStoreProvider,
 };
+use crate::consumer::middleware::scheduler::SchedulerConfiguration;
+use crate::consumer::middleware::timeout::TimeoutConfiguration;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
+use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
 use crate::consumer::{
-    ConsumerConfiguration, ConsumerError, KafkaObserver, Managers, ProsodyConsumer,
+    CommonConfiguration, ConsumerConfiguration, ConsumerError, KafkaObserver, Managers,
+    ProsodyConsumer,
 };
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
@@ -25,6 +29,8 @@ use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl}
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state_reader::PeerDirectoryBackend;
+use crate::state_reader::{MemoryReaderBackend, ReaderBackend, StateReaderDependencies};
+use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
 use crate::timers::duration::CompactDuration;
@@ -47,6 +53,7 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 mod lifecycle;
+mod responding;
 
 const TOPIC: &str = "peer-lifecycle";
 
@@ -91,6 +98,12 @@ struct RecordingDirectory {
 
 #[derive(Clone)]
 struct RecordingBackend {
+    directory: RecordingDirectory,
+}
+
+#[derive(Clone)]
+struct RecordingMemoryBackend {
+    inner: Arc<MemoryReaderBackend<JsonCodec>>,
     directory: RecordingDirectory,
 }
 
@@ -164,6 +177,60 @@ impl NodeDirectory for RecordingDirectory {
 }
 
 impl PeerDirectoryBackend for RecordingBackend {
+    type Directory = RecordingDirectory;
+
+    async fn node_directory(
+        &self,
+        _lease: RegistrationTtl,
+    ) -> Result<Self::Directory, ConsumerError> {
+        Ok(self.directory.clone())
+    }
+}
+
+impl ReaderBackend<JsonCodec> for RecordingMemoryBackend {
+    type Cells = <MemoryReaderBackend<JsonCodec> as ReaderBackend<JsonCodec>>::Cells;
+    type Identities = <MemoryReaderBackend<JsonCodec> as ReaderBackend<JsonCodec>>::Identities;
+    type Loader = <MemoryReaderBackend<JsonCodec> as ReaderBackend<JsonCodec>>::Loader;
+    type Publications = <MemoryReaderBackend<JsonCodec> as ReaderBackend<JsonCodec>>::Publications;
+
+    fn cells(&self) -> &Self::Cells {
+        self.inner.cells()
+    }
+
+    fn publications(&self) -> &Self::Publications {
+        self.inner.publications()
+    }
+
+    fn identities(&self) -> &Self::Identities {
+        self.inner.identities()
+    }
+
+    fn loader(&self) -> &Self::Loader {
+        self.inner.loader()
+    }
+}
+
+impl ConsumerStorageBackend<JsonCodec> for RecordingMemoryBackend {
+    type Dedup = <MemoryReaderBackend<JsonCodec> as ConsumerStorageBackend<JsonCodec>>::Dedup;
+    type EventLoader =
+        <MemoryReaderBackend<JsonCodec> as ConsumerStorageBackend<JsonCodec>>::EventLoader;
+    type Messages = <MemoryReaderBackend<JsonCodec> as ConsumerStorageBackend<JsonCodec>>::Messages;
+    type State = <MemoryReaderBackend<JsonCodec> as ConsumerStorageBackend<JsonCodec>>::State;
+    type Timers = <MemoryReaderBackend<JsonCodec> as ConsumerStorageBackend<JsonCodec>>::Timers;
+    type Trigger = <MemoryReaderBackend<JsonCodec> as ConsumerStorageBackend<JsonCodec>>::Trigger;
+
+    fn build_consumer_components(
+        &self,
+        inputs: ConsumerStorageInputs,
+        keyed_state: &KeyedStateInputs,
+        observer: KafkaObserver,
+    ) -> impl Future<Output = Result<ComponentsOf<JsonCodec, Self>, ConsumerError>> + Send {
+        self.inner
+            .build_consumer_components(inputs, keyed_state, observer)
+    }
+}
+
+impl PeerDirectoryBackend for RecordingMemoryBackend {
     type Directory = RecordingDirectory;
 
     async fn node_directory(
@@ -328,6 +395,33 @@ fn consumer_config(group: &str) -> Result<ConsumerConfiguration> {
         .mock(true)
         .probe_port(None)
         .build()?)
+}
+
+fn common_config(
+    peer: Option<PeerConfiguration>,
+    subsystem: Option<SubsystemName>,
+) -> Result<CommonConfiguration> {
+    let keyed_state = KeyedStateConfiguration::builder()
+        .subsystem(subsystem)
+        .build()?;
+    Ok(CommonConfiguration {
+        scheduler: SchedulerConfiguration::builder().build()?,
+        timeout: TimeoutConfiguration::builder().build()?,
+        dedup: DeduplicationConfiguration::builder().build()?,
+        keyed_state,
+        peer,
+    })
+}
+
+fn recording_memory_deps(
+    deps: &StateReaderDependencies<JsonCodec, MemoryReaderBackend<JsonCodec>>,
+    directory: RecordingDirectory,
+) -> StateReaderDependencies<JsonCodec, RecordingMemoryBackend> {
+    let backend = RecordingMemoryBackend {
+        inner: Arc::clone(deps.backend()),
+        directory,
+    };
+    StateReaderDependencies::from_parts(backend, deps.cache().clone())
 }
 
 async fn start<A: PeerAttachment + 'static>(

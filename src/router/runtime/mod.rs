@@ -3,6 +3,7 @@
 
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::{PendingRegistry, RegistryError};
+use crate::response::frame::FrameCap;
 use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::{
     Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
@@ -101,6 +102,7 @@ pub(crate) struct PeerRuntime<D> {
 pub(crate) struct PreparedPeerRuntime<D> {
     addresses: AddressResolver<D>,
     router: RouterHandle<GrpcSender, D>,
+    frame_cap: FrameCap,
     directory: D,
     registration: NodeRegistration,
     fleet: Arc<DestinationFleet>,
@@ -207,6 +209,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         Ok(Self {
             addresses,
             router,
+            frame_cap,
             directory,
             registration,
             fleet,
@@ -286,6 +289,19 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         })
     }
 
+    /// Returns the router used to build a responder before activation.
+    ///
+    /// Read this value before activation because the responder must exist
+    /// before the Kafka client starts.
+    pub(crate) fn router(&self) -> RouterHandle<GrpcSender, D> {
+        self.router.clone()
+    }
+
+    /// Returns the frame ceiling that the listener uses.
+    pub(crate) const fn frame_cap(&self) -> FrameCap {
+        self.frame_cap
+    }
+
     /// Stops every local resource without publishing the node.
     pub(crate) async fn abandon(self) {
         self.pending.terminate().await;
@@ -320,7 +336,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
 
     /// The router every responder in this process sends through.
     ///
-    /// The responder is the production caller that will enable this method.
+    /// Production reads the prepared runtime. This accessor serves the suites.
     #[cfg(test)]
     pub(crate) fn router(&self) -> RouterHandle<GrpcSender, D> {
         self.router.clone()
@@ -332,9 +348,8 @@ impl<D: NodeDirectory> PeerRuntime<D> {
     /// Takes `self`, so a second shutdown is unwritable and no handle has to be
     /// taken out from behind a lock. `drain` is a closure rather than a future,
     /// so this call alone decides when the drain starts. It runs it once the
-    /// gate has closed and emptied. A caller that flushes a sender elsewhere
-    /// still drains that sender early; `TypedSender::drain` takes `self`, so it
-    /// cannot then drain the same sender twice.
+    /// gate has closed and emptied. Response workers hold no sender, so the
+    /// caller can join each worker set only once.
     ///
     /// The body reads as the order. Three of its steps are where they are for a
     /// reason the code cannot show:

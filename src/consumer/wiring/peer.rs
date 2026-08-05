@@ -6,23 +6,31 @@
 //! one its backend selected. So the directory backend stops at the coordinator
 //! task and never reaches the consumer's own type parameters.
 
+use crate::Codec;
 use crate::PeerConfiguration;
 use crate::consumer::Managers;
 use crate::consumer::error::{ConsumerError, PeerInitError, ShutdownError};
+use crate::consumer::middleware::providers::{FallibleCloneProvider, LeafHandler};
+use crate::consumer::middleware::respond::{RespondHandler, Responder, responding_provider};
+use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::observer::KafkaObserver;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::registry::PendingRegistry;
+use crate::response::sender::ResponseWorkers;
 use crate::router::directory::{GroupMembership, NodeDirectory};
 use crate::router::grpc::BoundListener;
 use crate::router::grpc::health::ConsumerHealth;
 use crate::router::runtime::{PeerInputs, PeerRuntime, PreparedPeerRuntime};
 use crate::state_reader::PeerDirectoryBackend;
+use crate::subsystem::SubsystemName;
 use rdkafka::consumer::{BaseConsumer, ConsumerContext};
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
+
+type RespondingLeaf<H, R> = FallibleCloneProvider<RespondHandler<LeafHandler<H>, R>>;
 
 /// What one consumer does about the peer fleet.
 ///
@@ -58,6 +66,21 @@ pub(in crate::consumer) struct NoPeer;
 /// A served peer runtime waiting for the cluster id only a live client knows.
 pub(in crate::consumer) struct PreparedPeer<D: NodeDirectory> {
     prepared: PreparedPeerRuntime<D>,
+    workers: Option<ResponseWorkers>,
+}
+
+/// A prepared peer that also holds the responder its consumer answers with.
+///
+/// The fields are private and [`terminate`](Self::terminate) takes them by
+/// value. So the responder can reach one chain and nothing else, and the mode
+/// keeps no clone of it. That is what lets the peer teardown join the delivery
+/// workers: a surviving clone would hold a send handle open forever.
+///
+/// This value has no abandon method. Every construction site calls `terminate`
+/// next, so an abandon would have no caller.
+pub(in crate::consumer) struct PreparedResponder<D: NodeDirectory, R: Codec> {
+    peer: PreparedPeer<D>,
+    responder: Arc<Responder<R>>,
 }
 
 /// The running peer coordinator, and the one way to ask it for its report.
@@ -105,6 +128,49 @@ impl PeerHandles {
     }
 }
 
+impl<D: NodeDirectory, R: Codec> PreparedResponder<D, R> {
+    /// Terminates `chain` with a handler that answers peer requests, and hands
+    /// back the attachment startup activates.
+    ///
+    /// This step cannot fail, so a mode calls it after its last `?`.
+    pub(in crate::consumer) fn terminate<M, H>(
+        self,
+        chain: &M,
+        handler: H,
+    ) -> (M::Provider<RespondingLeaf<H, R>>, PreparedPeer<D>)
+    where
+        M: HandlerMiddleware<H::Payload>,
+        H: FallibleHandler + Clone + Send + Sync + 'static,
+        H::Output: Sync + 'static,
+        H::Error: Sync + 'static,
+        R: Codec<Payload = Result<H::Output, H::Error>>,
+    {
+        (
+            responding_provider(chain, handler, self.responder),
+            self.peer,
+        )
+    }
+
+    /// Pairs a responder built elsewhere with a prepared peer.
+    ///
+    /// This is the one way to pair a responder with workers that
+    /// [`prepare_responding`] did not build. A suite uses it to answer over an
+    /// in-process transport rather than over gRPC. It is test-only for exactly
+    /// that reason: in production the two are built together.
+    #[cfg(test)]
+    pub(in crate::consumer) fn from_parts(
+        mut peer: PreparedPeer<D>,
+        responder: Responder<R>,
+        workers: ResponseWorkers,
+    ) -> Self {
+        peer.workers = Some(workers);
+        Self {
+            peer,
+            responder: Arc::new(responder),
+        }
+    }
+}
+
 impl PeerAttachment for NoPeer {
     fn cluster_id<Ctx: ConsumerContext>(
         _consumer: &BaseConsumer<Ctx>,
@@ -139,11 +205,12 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
         self,
         group: Option<GroupMembership>,
     ) -> Result<Option<PeerHandles>, (Self, ConsumerError)> {
-        let runtime = match self.prepared.activate(group).await {
+        let Self { prepared, workers } = self;
+        let runtime = match prepared.activate(group).await {
             Ok(runtime) => runtime,
             Err((prepared, error)) => {
                 return Err((
-                    Self { prepared },
+                    Self { prepared, workers },
                     PeerInitError::Directory {
                         message: format!("{error:#}"),
                     }
@@ -153,7 +220,7 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
         };
         let pending = Arc::clone(runtime.pending());
         let (stop, stopped) = oneshot::channel();
-        let coordinator = tokio::spawn(run_coordinator(runtime, stopped));
+        let coordinator = tokio::spawn(run_coordinator(runtime, workers, stopped));
         Ok(Some(PeerHandles {
             pending,
             stop,
@@ -162,7 +229,12 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
     }
 
     async fn abandon(self) {
+        // Stop the listener and registry first. Join workers after the caller
+        // releases the provider that holds the last responder clone.
         self.prepared.abandon().await;
+        if let Some(workers) = self.workers {
+            workers.join().await;
+        }
     }
 }
 
@@ -208,7 +280,56 @@ where
     })
     .await
     .map_err(PeerInitError::from)?;
-    Ok(PreparedPeer { prepared })
+    Ok(PreparedPeer {
+        prepared,
+        workers: None,
+    })
+}
+
+/// Prepares a peer that also answers requests for `subsystem`.
+///
+/// This function takes the subsystem by value. Thus, preparation cannot start
+/// without a subsystem. It reads the frame cap from the prepared runtime, so
+/// the listener and sender use one ceiling. A responder failure releases the
+/// prepared peer.
+///
+/// # Errors
+///
+/// Returns [`ConsumerError::Peer`] when preparation or the responder fails.
+pub(in crate::consumer) async fn prepare_responding<R, B, P>(
+    peer: &PeerConfiguration,
+    backend: &B,
+    subsystem: SubsystemName,
+    managers: Arc<Managers<P>>,
+    heartbeats: &HeartbeatRegistry,
+) -> Result<PreparedResponder<B::Directory, R>, ConsumerError>
+where
+    R: Codec,
+    B: PeerDirectoryBackend,
+    P: Send + Sync + 'static,
+{
+    let mut peer = prepare_requester(peer, backend, managers, heartbeats).await?;
+    let responder = Responder::new(
+        &peer.prepared.router(),
+        peer.prepared.frame_cap(),
+        subsystem,
+    );
+    match responder {
+        Ok((responder, workers)) => {
+            peer.workers = Some(workers);
+            Ok(PreparedResponder {
+                peer,
+                responder: Arc::new(responder),
+            })
+        }
+        Err(error) => {
+            peer.abandon().await;
+            Err(PeerInitError::Fleet {
+                message: format!("{error:#}"),
+            }
+            .into())
+        }
+    }
 }
 
 /// Owns the peer runtime until its owner asks for the teardown.
@@ -220,23 +341,34 @@ where
 /// the log.
 async fn run_coordinator<D: NodeDirectory>(
     runtime: PeerRuntime<D>,
+    workers: Option<ResponseWorkers>,
     stopped: oneshot::Receiver<oneshot::Sender<Result<(), ShutdownError>>>,
 ) {
     match stopped.await {
         Ok(reply) => {
-            let report =
-                runtime
-                    .shutdown(|| async {})
-                    .await
-                    .map_err(|error| ShutdownError::Directory {
-                        message: format!("{error:#}"),
-                    });
+            let report = runtime
+                .shutdown(|| async move {
+                    if let Some(workers) = workers {
+                        workers.join().await;
+                    }
+                })
+                .await
+                .map_err(|error| ShutdownError::Directory {
+                    message: format!("{error:#}"),
+                });
             if let Err(report) = reply.send(report) {
                 error!(?report, "peer teardown report receiver closed");
             }
         }
         Err(_) => {
-            if let Err(error) = runtime.shutdown(|| async {}).await {
+            if let Err(error) = runtime
+                .shutdown(|| async move {
+                    if let Some(workers) = workers {
+                        workers.join().await;
+                    }
+                })
+                .await
+            {
                 error!(%error, "peer teardown failed after its owner dropped");
             }
         }

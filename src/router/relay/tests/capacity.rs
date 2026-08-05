@@ -64,7 +64,8 @@ fn a_flood_of_forwards_cannot_take_a_busy_cell() -> Result<()> {
         }
 
         // This process's own response takes the first cell and holds it.
-        let sender = TypedSender::<CountingCodec>::new(&router, FrameCap::new(CAP_BYTES)?)?;
+        let (sender, workers) =
+            TypedSender::<CountingCodec>::new(&router, FrameCap::new(CAP_BYTES)?)?;
         sender
             .send(header(OWN)?, Context::current(), PAYLOAD.to_vec())
             .map_err(|_| eyre!("the fleet refused this process's own response"))?;
@@ -120,7 +121,8 @@ fn a_flood_of_forwards_cannot_take_a_busy_cell() -> Result<()> {
         if timeout(HANG_GUARD, first).await??.is_err() {
             bail!("the held forward must deliver once it is released");
         }
-        if timeout(HANG_GUARD, sender.drain()).await.is_err() {
+        drop(sender);
+        if timeout(HANG_GUARD, workers.join()).await.is_err() {
             bail!("the delivery workers did not finish");
         }
         Ok(())

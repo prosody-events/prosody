@@ -254,14 +254,6 @@ pub struct ConsumerMessageValue<P> {
     ///
     /// Crate-internal deliberately: it is framework routing, not something
     /// every cross-language binding has to express.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the responder middleware is this field's production reader; the parse that \
-                      fills it is exercised by the decode and loader tests"
-        )
-    )]
     pub(crate) request: Option<RequestTag>,
 }
 
@@ -283,14 +275,6 @@ impl Default for ConsumerMessageValue<serde_json::Value> {
 
 impl<P> ConsumerMessage<P> {
     /// Where a response to this message must go, when the record asked for one.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the respond layer is this method's production caller; it is exercised by \
-                      the respond layer's tests"
-        )
-    )]
     pub(crate) fn request(&self) -> Option<RequestTag> {
         self.value.request
     }

@@ -10,7 +10,7 @@ use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader};
-use crate::response::sender::{SendCounters, TypedSender};
+use crate::response::sender::{ResponseWorkers, SendCounters, TypedSender};
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::directory::tests::support::{cassandra_directory, membership};
@@ -65,6 +65,7 @@ const SLOTS_EACH: usize = 8;
 struct Process {
     runtime: PeerRuntime<CassandraNodeDirectory>,
     sender: TypedSender<CountingCodec>,
+    workers: ResponseWorkers,
     shared: Shared,
 }
 
@@ -168,8 +169,8 @@ impl Process {
             Ok(TypedSender::<CountingCodec>::new(&router, cap)?)
         }
         .await;
-        let sender: TypedSender<CountingCodec> = match prepared {
-            Ok(sender) => sender,
+        let (sender, workers) = match prepared {
+            Ok(parts) => parts,
             Err(error) => {
                 runtime.shutdown(|| async {}).await?;
                 return Err(error);
@@ -188,6 +189,7 @@ impl Process {
             },
             runtime,
             sender,
+            workers,
         })
     }
 }

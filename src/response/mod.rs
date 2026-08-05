@@ -124,8 +124,7 @@ impl From<RequestId> for Uuid {
     not(test),
     expect(
         dead_code,
-        reason = "some dispositions wait for the production requester and responder paths; this \
-                  module's tests exercise all variants"
+        reason = "request outcome variants with no production constructor remain test-only"
     )
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,8 +158,7 @@ pub(crate) enum ResponseDisposition {
     not(test),
     expect(
         dead_code,
-        reason = "some dispositions wait for the production requester and responder paths; this \
-                  module's tests exercise the complete mapping"
+        reason = "status mappings for test-only request outcomes remain test-only"
     )
 )]
 impl ResponseDisposition {

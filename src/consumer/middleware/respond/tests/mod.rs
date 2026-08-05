@@ -20,6 +20,7 @@ use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::RequestId;
 use crate::response::frame::FrameCap;
 use crate::response::headers::RequestTag;
+use crate::response::sender::ResponseWorkers;
 use crate::router::RelayHop;
 use crate::router::loopback::{Delivery, Drained, TestRouter, collect_deliveries, config, node};
 use crate::subsystem::SubsystemName;
@@ -40,6 +41,7 @@ mod carriage;
 mod cascade;
 mod defer;
 mod delivery;
+mod ordering;
 
 /// The subsystem every fixture answers for.
 const SUBSYSTEM: &str = "billing";
@@ -84,6 +86,7 @@ struct OversizedProbeCodec;
 struct Fixture<C: Codec<Payload = Result<(), TestError>>> {
     router: TestRouter,
     responder: Arc<Responder<C>>,
+    workers: ResponseWorkers,
     deliveries: UnboundedReceiver<Delivery>,
 }
 
@@ -143,14 +146,12 @@ impl<C: Codec<Payload = Result<(), TestError>>> Fixture<C> {
 
     fn with_cap(max_destinations: usize, slots_each: usize, cap: FrameCap) -> Result<Self> {
         let (router, deliveries) = TestRouter::new(config(max_destinations, slots_each))?;
-        let responder = Arc::new(Responder::new(
-            &router,
-            cap,
-            SubsystemName::try_new(SUBSYSTEM)?,
-        )?);
+        let (responder, workers) =
+            Responder::new(&router, cap, SubsystemName::try_new(SUBSYSTEM)?)?;
         Ok(Self {
             router,
-            responder,
+            responder: Arc::new(responder),
+            workers,
             deliveries,
         })
     }
@@ -203,14 +204,15 @@ impl<C: Codec<Payload = Result<(), TestError>>> Fixture<C> {
         let Self {
             router,
             responder,
+            workers,
             mut deliveries,
-            ..
         } = self;
         let counters = responder.counters();
         let Some(responder) = Arc::into_inner(responder) else {
             bail!("a responder handle outlived the stack");
         };
-        responder.drain().await;
+        drop(responder);
+        workers.join().await;
         drop(router);
 
         Ok(Drained {

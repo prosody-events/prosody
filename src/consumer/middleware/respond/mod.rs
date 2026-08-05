@@ -13,16 +13,10 @@
 //! stay silent. The category rides the frame as a label only.
 //!
 //! [`responding_provider`] is the only way to build the layer from outside this
-//! module, and it states what that placement guarantees.
-
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no production caller yet: the consumer wiring that hands a consumer its peer \
-                  runtime will own this; every item here is exercised by this module's tests"
-    )
-)]
+//! module, and it states what that placement guarantees. Its production caller
+//! is
+//! [`PreparedResponder::terminate`](crate::consumer::wiring::peer::PreparedResponder::terminate),
+//! which a responding consumer reaches through its own entry point.
 
 use super::providers::{FallibleCloneProvider, LeafHandler};
 use super::{FallibleHandler, HandlerMiddleware, Settlement, SettlementHandler};
@@ -34,7 +28,9 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::response::ResponseStatus;
 use crate::response::frame::FrameCap;
 use crate::response::headers::RequestTag;
-use crate::response::sender::{SendCounters, TypedSender};
+#[cfg(test)]
+use crate::response::sender::SendCounters;
+use crate::response::sender::{ResponseWorkers, TypedSender};
 use crate::router::Router;
 use crate::router::fleet::config::FleetConfigurationError;
 use crate::subsystem::SubsystemName;
@@ -52,10 +48,10 @@ mod tests;
 /// Construction requires the process router. Thus, a responder cannot detach
 /// from the directory and fleet that route its work.
 ///
-/// `subsystem` is the name this consumer answers peer requests for. Read it
-/// from [`KeyedStateInputs::subsystem`](crate::consumer::wiring::state::KeyedStateInputs::subsystem),
-/// the one source the decode path reads to admit a request tag. A second source
-/// would let a frame claim a subsystem that the requester never awaited.
+/// `subsystem` is the name this consumer answers peer requests for. A
+/// responding entry point reads it from the keyed-state configuration and
+/// carries the same value to the decode path. One source keeps the tag a
+/// record is admitted by and the subsystem a frame claims in agreement.
 pub(crate) struct Responder<C: Codec> {
     sender: TypedSender<C>,
     subsystem: SubsystemName,
@@ -136,26 +132,13 @@ impl<C: Codec> Responder<C> {
         router: &R,
         cap: FrameCap,
         subsystem: SubsystemName,
-    ) -> Result<Self, FleetConfigurationError> {
-        Ok(Self {
-            sender: TypedSender::new(router, cap)?,
-            subsystem,
-        })
-    }
-
-    /// Waits until all queued responses finish.
-    ///
-    /// Call this from the shutdown drain closure, which runs once the fleet
-    /// admission gate has closed and emptied.
-    ///
-    /// This takes the responder by value, and every partition handler holds a
-    /// clone behind an [`Arc`]. So the drain can start only after the last
-    /// handler is dropped.
-    pub(crate) async fn drain(self) {
-        self.sender.drain().await;
+    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
+        let (sender, workers) = TypedSender::new(router, cap)?;
+        Ok((Self { sender, subsystem }, workers))
     }
 
     /// Returns the response outcome counters.
+    #[cfg(test)]
     pub(crate) fn counters(&self) -> Arc<SendCounters> {
         self.sender.counters()
     }

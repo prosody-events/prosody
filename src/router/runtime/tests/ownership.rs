@@ -42,6 +42,7 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
         let Process {
             runtime,
             sender,
+            workers,
             shared,
         } = Process::new().await?;
         let outcome: Result<()> = async {
@@ -96,7 +97,12 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
             Ok(())
         }
         .await;
-        runtime.shutdown(|| sender.drain()).await?;
+        runtime
+            .shutdown(|| async move {
+                drop(sender);
+                workers.join().await;
+            })
+            .await?;
         outcome
     })
 }
@@ -115,21 +121,28 @@ fn a_response_through_the_runtime_router_reaches_this_process() -> Result<()> {
         let Process {
             runtime,
             sender,
+            workers,
             shared,
         } = Process::new().await?;
         let router = runtime.router();
-        let own = match TypedSender::<CountingCodec>::new(&router, frame_cap()?) {
-            Ok(own) => own,
+        let (own, own_workers) = match TypedSender::<CountingCodec>::new(&router, frame_cap()?) {
+            Ok(parts) => parts,
             Err(error) => {
-                runtime.shutdown(|| sender.drain()).await?;
+                runtime
+                    .shutdown(|| async move {
+                        drop(sender);
+                        workers.join().await;
+                    })
+                    .await?;
                 return Err(error.into());
             }
         };
         let outcome = delivered_to_itself(&router, &own, &shared).await;
         runtime
             .shutdown(|| async {
-                own.drain().await;
-                sender.drain().await;
+                drop((own, sender));
+                own_workers.join().await;
+                workers.join().await;
             })
             .await?;
         outcome

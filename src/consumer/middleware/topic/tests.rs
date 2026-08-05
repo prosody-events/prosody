@@ -359,7 +359,7 @@ mod settlement_pins {
     use crate::consumer::message::UncommittedMessage;
     use crate::consumer::middleware::tests::test_support::{
         MockEventContext as SessionContext, RecordingParts, StagingError, StagingHook,
-        StagingTransientHandler, committed_value, recording_session,
+        StagingTransientHandler, committed_json_value, recording_session,
     };
     use crate::consumer::middleware::{FallibleEventHandler, Settlement, SettlementHandler};
     use crate::consumer::partition::offsets::OffsetTracker;
@@ -433,7 +433,7 @@ mod settlement_pins {
         // had the error surfaced instead (no route), the boundary would have
         // recorded the Permanent marker or re-driven.
         assert_eq!(
-            committed_value(&cell_store, state_key, "cart").await?,
+            committed_json_value(&cell_store, state_key, "cart").await?,
             None,
             "the failed attempt's buffered write must not commit",
         );

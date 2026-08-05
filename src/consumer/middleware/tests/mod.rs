@@ -435,89 +435,21 @@ async fn pass_through_middleware_forwards_after_abort_on_terminal() -> color_eyr
 /// is unwritable rather than tested.
 mod staged_rollback {
     use super::*;
+    use crate::consumer::middleware::tests::test_support::{
+        Ctx, buffered, cart, committed_value, is_provisional,
+    };
     use crate::loader::MemoryLoader;
-    use crate::state::cell::Committed;
-    use crate::state::descriptor::tests::{FixedOracle, TestSession, test_session_parts};
-    use crate::state::descriptor::{Registered, ValueDescriptor, value_state};
+    use crate::state::descriptor::Registered;
     use crate::state::memory::MemoryCellStore;
     use crate::state::registry::{CollectionDef, CollectionDefRegistry};
     use crate::state::store::CellStore;
-    use crate::state::tests::cell_suite::value_cell;
-    use crate::state::{CollectionId, EventRef, StateKey, StateName, StateType};
-    use bytes::Bytes;
+    use crate::state::{EventRef, StateKey, StateName};
     use color_eyre::eyre::{Result, bail, eyre};
     use futures::StreamExt;
     use quickcheck::{QuickCheck, TestResult};
     use serde_json::json;
     use tokio::runtime::Builder;
     use uuid::Uuid;
-
-    /// Whether the durable cell at `id` is still provisional — the public,
-    /// non-resolving way to distinguish a staged cell from a resolved one (the
-    /// resolving `get` would mutate a provisional cell).
-    pub(super) async fn is_provisional(
-        cell_store: &MemoryCellStore<FixedOracle>,
-        id: &CollectionId,
-    ) -> Result<bool> {
-        let stream = cell_store.provisional_cells(id);
-        futures::pin_mut!(stream);
-        Ok(stream.next().await.transpose()?.is_some())
-    }
-
-    /// The resolved committed value of the collection's single Value cell —
-    /// call only on a known-settled cell (a resolving `get` heals a
-    /// still-provisional one). Distinguishes "rolled back to the absent
-    /// base" (`None`) from "wrongly committed the staged value"
-    /// (`Some(..)`), which `is_provisional` alone cannot: both settle the
-    /// cell.
-    async fn committed_value(
-        cell_store: &MemoryCellStore<FixedOracle>,
-        id: &CollectionId,
-    ) -> Result<Option<Bytes>> {
-        let probe = EventRef::Message {
-            dedup_id: Uuid::from_u128(u128::MAX),
-        };
-        cell_store
-            .get(id, &value_cell(), probe)
-            .await
-            .map(Committed::into_inner)
-            .map_err(|e| eyre!("read committed: {e}"))
-    }
-
-    pub(super) type Ctx = MockEventContext<serde_json::Value, TestSession>;
-
-    /// The `cart` descriptor with the default JSON codec.
-    fn cart() -> ValueDescriptor {
-        value_state("cart")
-    }
-
-    /// Buffers one value write on `cart` through a real session — no finalize:
-    /// `settle` owns the only stage, from the intact dirty buffer. Returns the
-    /// context (ready to settle), the durable store, and the cell id.
-    /// `configure` applies context modifiers (`with_timer_failures`,
-    /// `with_shutdown`, ...) before the write.
-    pub(super) async fn buffered(
-        configure: impl FnOnce(Ctx) -> Ctx,
-    ) -> Result<(Ctx, MemoryCellStore<FixedOracle>, CollectionId)> {
-        let mut registry = CollectionDefRegistry::default();
-        registry.register(&cart(), CollectionDef::new(None))?;
-        let state_key = StateKey::new(Uuid::from_u128(0x7), Arc::from("user-1"));
-        let (session, cell_store) =
-            test_session_parts(MemoryLoader::new(), registry, state_key.clone());
-        let context: Ctx = configure(MockEventContext::new().with_session(session));
-
-        let handle = context
-            .state(Registered::new(cart()))
-            .map_err(|e| eyre!("bind cart: {e}"))?;
-        handle.set(json!({ "x": 1_i32 })).await?;
-
-        let cart_id = CollectionId::new(
-            state_key,
-            StateType::Application,
-            StateName::try_new("cart")?,
-        );
-        Ok((context, cell_store, cart_id))
-    }
 
     /// Shutdown between a successful stage and the backstop arm drives
     /// settle's ONE reachable rollback: the guard aborts, the staged cell
@@ -888,11 +820,11 @@ mod publication;
 /// the `Incomplete`-promote `after_commit` reads the mixed per-cell view
 /// (promoted cells the new values, un-promoted cells `prev`).
 mod hook_visibility {
-    use super::staged_rollback::{Ctx, buffered, is_provisional};
     use super::*;
     use crate::codec::JsonCodec;
     use crate::consumer::middleware::tests::test_support::RecordingOracle;
     use crate::consumer::middleware::tests::test_support::TestLifecycleAccess;
+    use crate::consumer::middleware::tests::test_support::{Ctx, buffered, is_provisional};
     use crate::consumer::partition::ShutdownPhase;
     use crate::loader::MemoryLoader;
     use crate::state::descriptor::value_state;

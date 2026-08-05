@@ -157,6 +157,7 @@ fn prop_shutdown_leaves_no_registration_and_no_reservation() {
             let Process {
                 runtime,
                 sender,
+                workers,
                 shared,
             } = Process::new().await?;
             let hooks = schedule.hooks;
@@ -164,7 +165,12 @@ fn prop_shutdown_leaves_no_registration_and_no_reservation() {
                 Ok(held) => held,
                 Err(error) => {
                     shared.barrier.add_permits(1);
-                    runtime.shutdown(|| sender.drain()).await?;
+                    runtime
+                        .shutdown(|| async move {
+                            drop(sender);
+                            workers.join().await;
+                        })
+                        .await?;
                     return Err(error);
                 }
             };
@@ -182,7 +188,8 @@ fn prop_shutdown_leaves_no_registration_and_no_reservation() {
                         },
                         Release,
                     );
-                    sender.drain().await;
+                    drop(sender);
+                    workers.join().await;
                 }
             };
             let mut shutting = pin!(runtime.shutdown(drain));

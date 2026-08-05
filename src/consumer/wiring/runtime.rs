@@ -8,6 +8,7 @@ use crate::consumer::kafka_context::{ContextHandles, PartitionProviders, new_con
 use crate::consumer::observer::KafkaObserver;
 use crate::consumer::poll::{PollConfig, poll};
 use crate::consumer::probes::ProbeServer;
+use crate::consumer::sweep::drain_managers;
 use crate::consumer::wiring::peer::PeerAttachment;
 use crate::consumer::{Managers, ProsodyConsumer, RuntimeState, WatermarkVersion};
 use crate::heartbeat::HeartbeatRegistry;
@@ -51,9 +52,10 @@ pub(in crate::consumer) struct StartupServices<'a, P> {
     pub(in crate::consumer) observer: KafkaObserver,
     /// The partition managers shared by startup, health, and shutdown.
     pub(in crate::consumer) managers: Arc<Managers<P>>,
-    /// The subsystem this consumer answers peer requests for, or `None` when
-    /// it answers none. Taken from
-    /// [`KeyedStateInputs::subsystem`](super::state::KeyedStateInputs::subsystem).
+    /// The subsystem this consumer answers peer requests for.
+    ///
+    /// The responding entry point supplies this value. A consumer that answers
+    /// no requests supplies `None`.
     pub(in crate::consumer) responder: Option<SubsystemName>,
 }
 
@@ -93,6 +95,9 @@ where
     A: PeerAttachment + 'static,
 {
     if let Err(error) = consumer_config.validate() {
+        // Release the last responder clone before peer abandonment joins its
+        // workers. Otherwise, this provider keeps every queue open.
+        drop(handler_provider);
         peer.abandon().await;
         return Err(error.into());
     }
@@ -122,6 +127,7 @@ where
     {
         Ok(probe_server) => probe_server,
         Err(error) => {
+            drop(handler_provider);
             peer.abandon().await;
             return Err(error.into());
         }
@@ -144,13 +150,20 @@ where
     .await;
 
     // The failure arm for every step after the probe bound: the observation is
-    // discarded, the prepared peer released, and the probe port freed. Clearing
-    // after the task, rather than inside it, also covers a fetch that panicked
-    // — see `KafkaObserver::clear`.
+    // discarded, the partition managers swept, the prepared peer released, and
+    // the probe port freed. Clearing after the task, rather than inside it,
+    // also covers a fetch that panicked — see `KafkaObserver::clear`.
+    //
+    // The sweep precedes the release, and both arms below run it for the same
+    // reason. Each retained manager holds a handler clone, and that clone holds
+    // a response send handle. The release joins the response workers, so it
+    // would wait for a sender a retained manager still owns. After a normal
+    // revoke the map is empty and the sweep does nothing.
     let (consumer, cluster) = match started {
         Ok(started) => started,
         Err(error) => {
             observer.clear();
+            drain_managers(&managers).await;
             peer.abandon().await;
             return Err(release_probe(probe_server, error).await);
         }
@@ -166,6 +179,7 @@ where
         Err((peer, error)) => {
             drop_client(consumer).await;
             observer.clear();
+            drain_managers(&managers).await;
             peer.abandon().await;
             return Err(release_probe(probe_server, error).await);
         }
