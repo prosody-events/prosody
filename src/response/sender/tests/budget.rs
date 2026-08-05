@@ -9,6 +9,7 @@ use color_eyre::eyre::bail;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use tokio::time::Instant;
 
 /// The node the responses in this suite are addressed to.
 const TARGET: u8 = 1;
@@ -100,6 +101,55 @@ fn an_endpoint_that_answers_nothing_gives_the_fallback_what_it_kept() -> Result<
             left(fallback)
         );
         assert_eq!(drained.sent, 1, "the response must be delivered");
+        Ok(())
+    })
+}
+
+/// The last endpoint of a route spends everything the response has left.
+///
+/// The direct endpoint answers at once that it is the wrong endpoint, so the
+/// walk reaches the entry point with nearly the whole deadline. Nothing answers
+/// there either, and there is no candidate behind it to keep time for, so it
+/// must hold the response until the deadline itself. An endpoint given a share
+/// of what is left would give up with time the response could still have spent
+/// and nowhere left to spend it.
+#[test]
+fn the_last_endpoint_of_a_route_spends_what_is_left() -> Result<()> {
+    let runtime = paused()?;
+    runtime.block_on(async {
+        let harness = Harness::dual_homed(settings())?;
+        harness.script(TARGET, dead(usize::MAX));
+        // Nothing ever releases the barrier: only the share this endpoint was
+        // given can end the attempt.
+        harness.script_advertised(TARGET, Script::Hold(Arc::new(Semaphore::new(0))));
+        harness.send(TARGET)?;
+
+        let drained = harness.drain().await?;
+        // The drain returns once the one worker has exited, and this response
+        // is the only work the runtime holds, so nothing moves the clock
+        // between the last attempt ending and this instant.
+        let ended = Instant::now();
+        let [wrong, last] = drained.deliveries.as_slice() else {
+            bail!(
+                "one response over two endpoints must make two attempts, not {}",
+                drained.deliveries.len()
+            );
+        };
+        assert_eq!(
+            (wrong.port, last.port),
+            (port(TARGET), advertised_port(TARGET)),
+            "the response must try the direct endpoint and then the entry point"
+        );
+        assert_eq!(
+            drained.dropped, 1,
+            "no endpoint answered, so the response must be dropped"
+        );
+        let spent = ended.duration_since(last.at);
+        assert!(
+            is_about(spent, left(last)),
+            "the last endpoint gave the response up after {spent:?} of the {:?} it had left",
+            left(last)
+        );
         Ok(())
     })
 }
