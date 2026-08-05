@@ -7,6 +7,8 @@ use crate::consumer::middleware::scheduler::SchedulerInitError;
 use crate::consumer::middleware::timeout::TimeoutInitError;
 use crate::consumer::storage::StoreCreationError;
 use crate::error::ErrorCategory;
+use crate::router::config::PeerConfigurationError;
+use crate::router::runtime::PeerRuntimeError;
 use crate::state::config::KeyedStateConfigurationBuilderError;
 use crate::state::registry::RegisterStateError;
 use crate::state_reader::StateReaderError;
@@ -85,6 +87,108 @@ pub enum ConsumerError {
     /// Indicates a keyed-state initialization failure.
     #[error("Keyed-state initialization failed: {0:#}")]
     KeyedState(#[from] KeyedStateInitError),
+
+    /// The peer runtime could not start.
+    #[error("peer initialization failed: {0:#}")]
+    Peer(#[from] PeerInitError),
+}
+
+/// Errors raised while the peer runtime starts.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum PeerInitError {
+    /// The peer configuration is invalid.
+    #[error("invalid peer configuration: {message}")]
+    Configuration {
+        /// The rendered source chain.
+        message: String,
+    },
+    /// The process could not discover its host.
+    #[error("peer host discovery failed: {message}")]
+    Discovery {
+        /// The rendered source chain.
+        message: String,
+    },
+    /// The node directory could not start or register this process.
+    #[error("peer directory failed: {message}")]
+    Directory {
+        /// The rendered source chain.
+        message: String,
+    },
+    /// The destination fleet could not start.
+    #[error("peer destination fleet failed: {message}")]
+    Fleet {
+        /// The rendered source chain.
+        message: String,
+    },
+    /// The pending request registry could not start.
+    #[error("peer request registry failed: {message}")]
+    Registry {
+        /// The rendered source chain.
+        message: String,
+    },
+    /// The peer listener could not start.
+    #[error("peer listener failed: {message}")]
+    Listener {
+        /// The rendered source chain.
+        message: String,
+    },
+    /// The response ceiling exceeds the frame ceiling.
+    #[error("the {bytes}-byte response ceiling exceeds the {cap}-byte frame ceiling")]
+    ResponseCeiling {
+        /// The configured response size.
+        bytes: usize,
+        /// The configured frame size.
+        cap: usize,
+    },
+}
+
+impl From<PeerConfigurationError> for PeerInitError {
+    fn from(error: PeerConfigurationError) -> Self {
+        Self::Configuration {
+            message: format!("{error:#}"),
+        }
+    }
+}
+
+impl From<PeerRuntimeError> for PeerInitError {
+    fn from(error: PeerRuntimeError) -> Self {
+        match error {
+            PeerRuntimeError::Configuration(error) => Self::Configuration {
+                message: format!("{error:#}"),
+            },
+            PeerRuntimeError::Discovery(error) => Self::Discovery {
+                message: format!("{error:#}"),
+            },
+            PeerRuntimeError::Fleet(error) => Self::Fleet {
+                message: format!("{error:#}"),
+            },
+            PeerRuntimeError::Registry(error) => Self::Registry {
+                message: format!("{error:#}"),
+            },
+            PeerRuntimeError::Listener(error) => Self::Listener {
+                message: format!("{error:#}"),
+            },
+            PeerRuntimeError::ResponseCeiling { bytes, cap } => {
+                Self::ResponseCeiling { bytes, cap }
+            }
+        }
+    }
+}
+
+/// Errors raised while a consumer stops.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ShutdownError {
+    /// This node could not be removed from the peer directory.
+    #[error("this node could not be removed from the peer directory: {message}")]
+    Directory {
+        /// The rendered source chain.
+        message: String,
+    },
+    /// The peer teardown ended without reporting.
+    #[error("the peer teardown ended without reporting")]
+    Teardown,
 }
 
 /// Errors raised while wiring the keyed-state layer into a pipeline

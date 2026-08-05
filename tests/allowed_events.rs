@@ -93,7 +93,7 @@ async fn test_allowed_events_filtering() -> Result<()> {
         received.ok_or_else(|| eyre!("Timeout waiting for a delivered message"))?;
 
     // Shut down the consumer and assert the filtering behavior
-    consumer.shutdown().await;
+    consumer.shutdown().await?;
 
     ensure!(received_key == key);
     ensure!(received_payload == payload_allowed);

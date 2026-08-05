@@ -8,9 +8,12 @@ use crate::consumer::kafka_context::{ContextHandles, PartitionProviders, new_con
 use crate::consumer::observer::KafkaObserver;
 use crate::consumer::poll::{PollConfig, poll};
 use crate::consumer::probes::ProbeServer;
+use crate::consumer::wiring::peer::PeerAttachment;
 use crate::consumer::{Managers, ProsodyConsumer, RuntimeState, WatermarkVersion};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
+use crate::router::directory::GroupMembership;
+use crate::router::label_fits;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::CellWrite;
 use crate::subsystem::SubsystemName;
@@ -20,11 +23,12 @@ use crate::{Codec, EventIdentity, EventType, MOCK_CLUSTER_BOOTSTRAP};
 use parking_lot::Mutex;
 use rdkafka::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
-use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::watch;
 use tokio::task::spawn_blocking;
+use tracing::{error, warn};
 use validator::Validate;
 use whoami::hostname;
 
@@ -34,7 +38,7 @@ use whoami::hostname;
 /// Deliberately not `Clone`: one value can serve only one consumer, so a mode
 /// cannot hand two consumers two different observers without a second,
 /// grep-visible [`KafkaObserver::new`] call.
-pub(in crate::consumer) struct StartupServices<'a> {
+pub(in crate::consumer) struct StartupServices<'a, P> {
     /// Idempotence version stamped into the partition configuration.
     pub(in crate::consumer) version: Arc<str>,
     /// Telemetry the partitions and middleware publish through.
@@ -45,6 +49,8 @@ pub(in crate::consumer) struct StartupServices<'a> {
     /// primary consumer's context holds, which updates it from the statistics
     /// callback.
     pub(in crate::consumer) observer: KafkaObserver,
+    /// The partition managers shared by startup, health, and shutdown.
+    pub(in crate::consumer) managers: Arc<Managers<P>>,
     /// The subsystem this consumer answers peer requests for, or `None` when
     /// it answers none. Taken from
     /// [`KeyedStateInputs::subsystem`](super::state::KeyedStateInputs::subsystem).
@@ -59,17 +65,21 @@ pub(in crate::consumer) struct StartupServices<'a> {
 /// client configured to report statistics, and its first observation is seeded
 /// by [`KafkaObserver::install_startup_metadata`], which owns that contract.
 ///
+/// `peer` decides whether this consumer joins the peer fleet. It is activated
+/// after the client subscribes, which is the last step that can fail, and every
+/// earlier failure arm abandons it.
+///
 /// Fails if the configuration is invalid, the probe server can't be started
 /// (if enabled), the consumer context can't be created, the hostname can't be
 /// retrieved for the client ID, the Kafka consumer can't be created with the
-/// provided configuration, topic subscription fails, or the startup metadata
-/// fetch fails.
-pub(in crate::consumer) async fn initialize_consumer<T, P, SP, C>(
+/// provided configuration, topic subscription fails, the startup metadata
+/// fetch fails, or the peer node cannot be published.
+pub(in crate::consumer) async fn initialize_consumer<T, P, SP, C, A>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
-    trigger_provider: P,
-    state_provider: SP,
-    services: StartupServices<'_>,
+    providers: PartitionProviders<P, SP>,
+    services: StartupServices<'_, C::Payload>,
+    peer: A,
 ) -> Result<ProsodyConsumer<C>, ConsumerError>
 where
     T: HandlerProvider,
@@ -80,19 +90,22 @@ where
         CellWrite<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
+    A: PeerAttachment + 'static,
 {
-    consumer_config.validate()?;
-
+    if let Err(error) = consumer_config.validate() {
+        peer.abandon().await;
+        return Err(error.into());
+    }
     let StartupServices {
         version,
         telemetry,
         heartbeats,
         observer,
+        managers,
         responder,
     } = services;
 
     let watermark_version: Arc<WatermarkVersion> = Arc::default();
-    let managers: Arc<Managers<C::Payload>> = Arc::default();
     let shutdown: Arc<AtomicBool> = Arc::default();
     let (assignment_tx, assignment) = watch::channel(0u32);
 
@@ -101,56 +114,59 @@ where
     // an unreachable thread that holds the Kafka client forever. The probe
     // server binds first: a misconfigured port fails in microseconds, ahead of
     // the client's network round trips, and no consumer exists yet to release.
-    let probe_server = consumer_config
+    let probe_server = match consumer_config
         .probe_port
         .filter(|_| !consumer_config.mock)
         .map(|port| ProbeServer::new(port, managers.clone(), heartbeats.clone()))
-        .transpose()?;
+        .transpose()
+    {
+        Ok(probe_server) => probe_server,
+        Err(error) => {
+            peer.abandon().await;
+            return Err(error.into());
+        }
+    };
 
-    // Build the client, subscribe, and seed the observer, so a running consumer
-    // always has an observation before it can dispatch a handler. Subscribing
-    // and fetching both block, and dropping a `BaseConsumer` poll-loops until
-    // its queue closes, so the client lives and dies inside the blocking task.
-    let started: Result<BaseConsumer<_>, ConsumerError> = async {
-        let context = new_context(
-            consumer_config,
-            handler_provider,
-            PartitionProviders {
-                triggers: trigger_provider,
-                state: state_provider,
-            },
-            watermark_version.clone(),
-            ContextHandles {
-                managers: managers.clone(),
-                assignment_tx,
-                telemetry: telemetry.sender(),
-                observer: observer.clone(),
-            },
-            version,
-        )?;
-        let consumer: BaseConsumer<_> =
-            client_config(consumer_config)?.create_with_context(context)?;
-        let topics = consumer_config.subscribed_topics.clone();
-        let fetch_observer = observer.clone();
-        spawn_blocking(move || {
-            let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
-            consumer.subscribe(&topics)?;
-            fetch_observer.install_startup_metadata(&consumer)?;
-            Ok::<_, ConsumerError>(consumer)
-        })
-        .await
-        .map_err(ConsumerError::StartupTask)?
-    }
+    let started = start_client::<T, P, SP, C, A>(
+        consumer_config,
+        handler_provider,
+        providers,
+        watermark_version.clone(),
+        ContextHandles {
+            managers: managers.clone(),
+            assignment_tx,
+            telemetry: telemetry.sender(),
+            observer: observer.clone(),
+        },
+        version,
+        observer.clone(),
+    )
     .await;
 
-    // One failure arm for every step after the probe bound: the observation is
-    // discarded and the probe port released. Clearing after the task, rather
-    // than inside it, also covers a fetch that panicked — see
-    // `KafkaObserver::clear`.
-    let consumer = match started {
-        Ok(consumer) => consumer,
+    // The failure arm for every step after the probe bound: the observation is
+    // discarded, the prepared peer released, and the probe port freed. Clearing
+    // after the task, rather than inside it, also covers a fetch that panicked
+    // — see `KafkaObserver::clear`.
+    let (consumer, cluster) = match started {
+        Ok(started) => started,
         Err(error) => {
             observer.clear();
+            peer.abandon().await;
+            return Err(release_probe(probe_server, error).await);
+        }
+    };
+
+    // Activation is the last step that can fail, so nothing after it can strand
+    // a published node. Its own arm surrenders the client first: that client's
+    // context holds a response send handle, and a release that ran while it
+    // lives would wait for a sender this task still owns.
+    let group = checked_membership(cluster.as_deref(), &consumer_config.group_id);
+    let peer = match peer.activate(group).await {
+        Ok(peer) => peer,
+        Err((peer, error)) => {
+            drop_client(consumer).await;
+            observer.clear();
+            peer.abandon().await;
             return Err(release_probe(probe_server, error).await);
         }
     };
@@ -181,6 +197,7 @@ where
         poll_handle,
         probe_server,
         observer,
+        peer,
     })));
 
     Ok(ProsodyConsumer {
@@ -189,6 +206,100 @@ where
         assignment,
         runtime_state,
         heartbeats,
+    })
+}
+
+/// Builds the client, subscribes it, seeds the observer, and reads the cluster
+/// id.
+///
+/// All four run inside one blocking task. Subscribing and fetching block, and
+/// dropping a `BaseConsumer` poll-loops until its queue closes, so the client
+/// lives and dies inside that task. The returned context type captures no
+/// borrow, which is what lets a failure arm surrender the client to a blocking
+/// drop.
+///
+/// # Errors
+///
+/// Returns [`ConsumerError`] when the context, the client, the subscription or
+/// the metadata fetch fails, or when the blocking task does not join.
+async fn start_client<T, P, SP, C, A>(
+    consumer_config: &ConsumerConfiguration,
+    handler_provider: T,
+    providers: PartitionProviders<P, SP>,
+    watermark_version: Arc<WatermarkVersion>,
+    handles: ContextHandles<C::Payload>,
+    version: Arc<str>,
+    observer: KafkaObserver,
+) -> Result<
+    (
+        BaseConsumer<impl ConsumerContext + use<T, P, SP, C, A>>,
+        Option<String>,
+    ),
+    ConsumerError,
+>
+where
+    T: HandlerProvider,
+    T::Handler: EventHandler<Payload = C::Payload>,
+    P: TriggerStoreProvider,
+    SP: PartitionStateProvider<P::Store>,
+    <SP::Manager as PartitionStateManager>::Session:
+        CellWrite<Loader: MessageLoader<Payload = C::Payload>>,
+    C: Codec,
+    C::Payload: EventType + Clone + EventIdentity,
+    A: PeerAttachment + 'static,
+{
+    let context = new_context(
+        consumer_config,
+        handler_provider,
+        providers,
+        watermark_version,
+        handles,
+        version,
+    )?;
+    let consumer: BaseConsumer<_> = client_config(consumer_config)?.create_with_context(context)?;
+    let topics = consumer_config.subscribed_topics.clone();
+    spawn_blocking(move || {
+        let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
+        consumer.subscribe(&topics)?;
+        observer.install_startup_metadata(&consumer)?;
+        let cluster = A::cluster_id(&consumer, &observer);
+        Ok::<_, ConsumerError>((consumer, cluster))
+    })
+    .await
+    .map_err(ConsumerError::StartupTask)?
+}
+
+/// Surrenders a built client to the blocking pool and waits for it to close.
+///
+/// Dropping a `BaseConsumer` polls until the consumer group closes, so it must
+/// not run on a runtime thread. The wait is what lets the next failure step
+/// drain a response path the client's own context still holds a handle to.
+async fn drop_client<Ctx: ConsumerContext + 'static>(consumer: BaseConsumer<Ctx>) {
+    if let Err(error) = spawn_blocking(move || drop(consumer)).await {
+        error!(%error, "Kafka client teardown task did not finish");
+    }
+}
+
+/// The group membership this node publishes, when both labels fit.
+///
+/// A node that cannot name its cluster names no cluster-scoped group, and
+/// `None` says exactly that. The column routes nothing, so an oversized label
+/// warns rather than refusing to consume.
+fn checked_membership(cluster: Option<&str>, group_id: &str) -> Option<GroupMembership> {
+    cluster.and_then(|cluster| {
+        let membership = GroupMembership::checked(cluster, group_id);
+        if membership.is_none() {
+            let part = if label_fits(cluster) {
+                "consumer group id"
+            } else {
+                "Kafka cluster id"
+            };
+            warn!(
+                part,
+                "peer group membership is omitted: the label is empty or too long"
+            );
+        }
+        membership
     })
 }
 

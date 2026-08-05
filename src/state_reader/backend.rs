@@ -14,9 +14,13 @@ use crate::consumer::storage::components::{cassandra, memory};
 use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
 use crate::consumer::{
     CassandraStateProvider, ConsumerError, KafkaObserver, KeyedStateInputs, MemoryStateProvider,
+    PeerInitError,
 };
 use crate::error::ClassifyError;
 use crate::loader::{KafkaLoader, MemoryLoader, MessageLoader};
+use crate::router::directory::cassandra::CassandraNodeDirectory;
+use crate::router::directory::memory::{MEMORY_DIRECTORY_CAPACITY, MemoryNodeDirectory};
+use crate::router::directory::{NodeDirectory, RegistrationTtl};
 use crate::state::cassandra::{
     CassandraCellResources, CassandraCellStoreError, CassandraDescriptorIdentityStore,
     CassandraPublicationStore,
@@ -172,9 +176,19 @@ where
     fn loader(&self) -> &Self::Loader;
 }
 
+/// A backend that supplies the node directory for its storage family.
+pub(crate) trait PeerDirectoryBackend: Send + Sync + 'static {
+    type Directory: NodeDirectory;
+
+    fn node_directory(
+        &self,
+        lease: RegistrationTtl,
+    ) -> impl Future<Output = Result<Self::Directory, ConsumerError>> + Send;
+}
+
 /// Reader family that can also supply a consumer's matching stores.
 pub(crate) trait ConsumerReaderBackend<C>:
-    ReaderBackend<C> + ConsumerStorageBackend<C>
+    ReaderBackend<C> + ConsumerStorageBackend<C> + PeerDirectoryBackend
 where
     C: Codec,
 {
@@ -183,7 +197,7 @@ where
 impl<C, B> ConsumerReaderBackend<C> for B
 where
     C: Codec,
-    B: ReaderBackend<C> + ConsumerStorageBackend<C>,
+    B: ReaderBackend<C> + ConsumerStorageBackend<C> + PeerDirectoryBackend,
 {
 }
 
@@ -256,6 +270,34 @@ pub type MemoryReaderBackend<C> = ReaderComponents<
     MemoryDescriptorIdentityStore,
     MemoryLoader<<C as Codec>::Payload>,
 >;
+
+impl<C: Codec> PeerDirectoryBackend for CassandraReaderBackend<C> {
+    type Directory = CassandraNodeDirectory;
+
+    async fn node_directory(
+        &self,
+        lease: RegistrationTtl,
+    ) -> Result<Self::Directory, ConsumerError> {
+        CassandraNodeDirectory::new(self.cells.session.clone(), lease)
+            .await
+            .map_err(|error| {
+                ConsumerError::Peer(PeerInitError::Directory {
+                    message: format!("{error:#}"),
+                })
+            })
+    }
+}
+
+impl<C: Codec> PeerDirectoryBackend for MemoryReaderBackend<C> {
+    type Directory = MemoryNodeDirectory;
+
+    async fn node_directory(
+        &self,
+        lease: RegistrationTtl,
+    ) -> Result<Self::Directory, ConsumerError> {
+        Ok(MemoryNodeDirectory::new(MEMORY_DIRECTORY_CAPACITY, lease))
+    }
+}
 
 impl<C> ConsumerStorageBackend<C> for CassandraReaderBackend<C>
 where

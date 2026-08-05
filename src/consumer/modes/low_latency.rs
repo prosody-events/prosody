@@ -6,23 +6,26 @@
 //! outermost retry re-dispatches that routing forever, since there is nothing
 //! left to fall back to.
 
-use crate::consumer::ProsodyConsumer;
 use crate::consumer::config::{
     ConsumerSetup, LowLatencyMiddlewareConfiguration, TypedConsumerSetup,
 };
 use crate::consumer::error::ConsumerError;
+use crate::consumer::kafka_context::PartitionProviders;
 use crate::consumer::middleware::retry::RetryMiddleware;
 use crate::consumer::middleware::topic::FailureTopicMiddleware;
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
+use crate::consumer::wiring::peer::{NoPeer, prepare_requester};
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::{
     build_common_middleware, build_typed_state, cassandra_deps, memory_deps,
 };
+use crate::consumer::{Managers, ProsodyConsumer};
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::producer::ProsodyProducer;
 use crate::state_reader::ConsumerReaderBackend;
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity, EventType};
+use std::sync::Arc;
 
 impl<C: Codec> ProsodyConsumer<C>
 where
@@ -105,14 +108,7 @@ where
             setup.consumer.group_id.clone(),
             producer,
         )?;
-        let services = StartupServices {
-            version: keyed_state.version.clone(),
-            telemetry: &telemetry,
-            heartbeats,
-            observer,
-            responder: keyed_state.subsystem().cloned(),
-        };
-        let provider = build_common_middleware::<_, C::Payload>(
+        let middleware = build_common_middleware::<_, C::Payload>(
             setup.common,
             setup.consumer,
             telemetry.clone(),
@@ -120,15 +116,51 @@ where
         )?
         .layer(retry.clone())
         .layer(topic)
-        .layer(retry)
-        .into_provider(handler);
-        initialize_consumer::<_, _, _, C>(
-            setup.consumer,
-            provider,
-            components.trigger,
-            components.state,
-            services,
-        )
-        .await
+        .layer(retry);
+        let managers: Arc<Managers<C::Payload>> = Arc::default();
+        let provider = middleware.into_provider(handler);
+        let providers = PartitionProviders {
+            triggers: components.trigger,
+            state: components.state,
+        };
+        let services = StartupServices {
+            version: keyed_state.version.clone(),
+            telemetry: &telemetry,
+            heartbeats,
+            observer,
+            managers: Arc::clone(&managers),
+            responder: keyed_state.subsystem().cloned(),
+        };
+        // Preparation is the last fallible step of this mode: no `?` after it
+        // could drop a served listener.
+        match setup.common.peer.as_ref() {
+            Some(peer) => {
+                let attach = prepare_requester(
+                    peer,
+                    setup.deps.backend().as_ref(),
+                    managers,
+                    &services.heartbeats,
+                )
+                .await?;
+                Box::pin(initialize_consumer::<_, _, _, C, _>(
+                    setup.consumer,
+                    provider,
+                    providers,
+                    services,
+                    attach,
+                ))
+                .await
+            }
+            None => {
+                Box::pin(initialize_consumer::<_, _, _, C, _>(
+                    setup.consumer,
+                    provider,
+                    providers,
+                    services,
+                    NoPeer,
+                ))
+                .await
+            }
+        }
     }
 }

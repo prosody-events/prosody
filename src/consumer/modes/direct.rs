@@ -7,11 +7,13 @@ use crate::consumer::ProsodyConsumer;
 use crate::consumer::config::ConsumerConfiguration;
 use crate::consumer::error::{ConsumerError, KeyedStateInitError};
 use crate::consumer::handler::{EventHandler, HandlerProvider};
+use crate::consumer::kafka_context::PartitionProviders;
 use crate::consumer::middleware::deduplication::{
     DEFAULT_IDEMPOTENCE_VERSION, MemoryDeduplicationStoreProvider,
 };
 use crate::consumer::observer::KafkaObserver;
 use crate::consumer::storage::StoreCreationError;
+use crate::consumer::wiring::peer::NoPeer;
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::state::{KeyedStateInputs, memory_state_provider};
 use crate::heartbeat::HeartbeatRegistry;
@@ -24,6 +26,7 @@ use crate::timers::store::TriggerStoreProvider;
 use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType};
+use std::sync::Arc;
 use validator::Validate;
 
 impl<C: Codec> ProsodyConsumer<C>
@@ -86,11 +89,14 @@ where
             DEFAULT_IDEMPOTENCE_VERSION,
         )?;
 
+        let managers = Arc::default();
+
         let services = StartupServices {
             version: keyed_state.version.clone(),
             telemetry: &telemetry,
             heartbeats,
             observer: KafkaObserver::new(&consumer_config.group_id),
+            managers,
             responder: keyed_state.subsystem().cloned(),
         };
 
@@ -129,7 +135,7 @@ async fn initialize_direct<T, P, C>(
     handler: T,
     trigger: P,
     keyed_state: &KeyedStateInputs,
-    services: StartupServices<'_>,
+    services: StartupServices<'_, C::Payload>,
 ) -> Result<ProsodyConsumer<C>, ConsumerError>
 where
     T: HandlerProvider,
@@ -146,5 +152,15 @@ where
         MemoryLoader::new(),
         None,
     );
-    initialize_consumer::<_, _, _, C>(consumer, handler, trigger, state, services).await
+    Box::pin(initialize_consumer::<_, _, _, C, _>(
+        consumer,
+        handler,
+        PartitionProviders {
+            triggers: trigger,
+            state,
+        },
+        services,
+        NoPeer,
+    ))
+    .await
 }

@@ -71,7 +71,7 @@ static PENDING: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
 /// 1. resolution — [`Registration`]'s `Drop`, once every position is filled;
 /// 2. the request's own deadline, through the same guard;
 /// 3. cancellation — the same guard again, when the call is dropped unfinished;
-/// 4. [`shutdown`](Self::shutdown), which closes every live request at once;
+/// 4. [`terminate`](Self::terminate), which closes every live request at once;
 /// 5. [`sweep`](Self::sweep), the only path that does not need the waiting call
 ///    to run again.
 ///
@@ -89,7 +89,7 @@ pub(crate) struct PendingRegistry {
     max_response_bytes: usize,
     grace: Duration,
     closed: AtomicBool,
-    /// A `OnceLock` cannot replace this: [`shutdown`](Self::shutdown) awaits
+    /// A `OnceLock` cannot replace this: [`terminate`](Self::terminate) awaits
     /// the handle, and that needs ownership a shared reference cannot give.
     sweeper: Mutex<Option<JoinHandle<()>>>,
 }
@@ -248,9 +248,14 @@ impl PendingRegistry {
         }
     }
 
-    /// Refuses new requests, closes all entries, and stops the sweep task.
-    pub(crate) async fn shutdown(&self) {
+    /// Refuses new requests.
+    pub(crate) fn close_admission(&self) {
         self.closed.store(true, Release);
+    }
+
+    /// Refuses new requests, closes all entries, and stops the sweep task.
+    pub(crate) async fn terminate(&self) {
+        self.close_admission();
         loop {
             let mut batch = SmallVec::<[(RequestId, Arc<PendingRequest>); SWEEP_BATCH]>::new();
             self.entries.iter_sync(|id, entry| {

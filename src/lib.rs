@@ -65,6 +65,9 @@ mod util;
 
 pub use crate::codec::{Codec, JsonCodec};
 pub use crate::error::{ClassifyError, ErrorCategory};
+pub use crate::router::config::{
+    PeerConfiguration, PeerConfigurationBuilder, PeerConfigurationBuilderError,
+};
 
 /// A lazily initialized mock Kafka cluster for testing.
 ///

@@ -123,6 +123,7 @@ impl CartEnv {
             timeout: TimeoutConfigurationBuilder::default().build()?,
             dedup: DeduplicationConfigurationBuilder::default().build()?,
             keyed_state,
+            peer: None,
         };
         let trigger_store = common::create_cassandra_trigger_store_config();
 
@@ -197,13 +198,13 @@ impl CartEnv {
         }
         .await;
 
-        self.consumer.shutdown().await;
+        let shutdown: Result<()> = self.consumer.shutdown().await.map_err(Into::into);
         let cleanup: Result<()> = self
             .admin
             .delete_topic(&self.topic)
             .await
             .map_err(Into::into);
-        outcome.and(cleanup)
+        outcome.and(shutdown).and(cleanup)
     }
 }
 

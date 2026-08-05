@@ -10,7 +10,7 @@
 
 use super::config::validate_label;
 use crate::router::{Host, MAX_LABEL_BYTES};
-use std::net::{ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle, spawn_blocking};
 use whoami::hostname;
@@ -25,12 +25,12 @@ mod tests;
 pub(super) struct DiscoveredHost {
     /// This machine's name. It is a label a registration may publish.
     pub(super) hostname: Host,
-    /// The local address that reaches the contact point, where the probe found
+    /// The local address that reaches the probe address, when the probe found
     /// one.
     pub(super) routed: Option<Host>,
 }
 
-/// Reads this machine's name and the address that reaches `contact`, on the
+/// Reads this machine's name and the address that reaches `probe`, on the
 /// blocking pool.
 ///
 /// The spawn sits inside the awaited expression, so no early return stands
@@ -41,9 +41,8 @@ pub(super) struct DiscoveredHost {
 ///
 /// Returns [`DiscoveryError`] when the machine name cannot be read or
 /// published, or when the blocking task does not join.
-pub(super) async fn discover(contact: &str) -> Result<DiscoveredHost, DiscoveryError> {
-    let contact = contact.to_owned();
-    join_discovery(spawn_blocking(move || discover_host(&contact))).await
+pub(super) async fn discover(probe: Option<SocketAddr>) -> Result<DiscoveredHost, DiscoveryError> {
+    join_discovery(spawn_blocking(move || discover_host(probe))).await
 }
 
 /// Reports what the blocking task returned.
@@ -63,7 +62,7 @@ async fn join_discovery(
     task.await?
 }
 
-/// Reads the machine name and the address that reaches `contact`.
+/// Reads the machine name and the address that reaches `probe`.
 ///
 /// This is discovery's blocking half. [`discover`] is what runs it, and it runs
 /// it on the blocking pool.
@@ -74,7 +73,7 @@ async fn join_discovery(
 /// it is not a label a registration may publish. The routed probe's own failure
 /// is not an error: it answers `None`, and `discover_registration` then
 /// publishes the machine name.
-fn discover_host(contact: &str) -> Result<DiscoveredHost, DiscoveryError> {
+fn discover_host(probe: Option<SocketAddr>) -> Result<DiscoveredHost, DiscoveryError> {
     // The machine name is published in its own right, so the lookup is paid
     // once and reused where the routed probe finds no address.
     let machine = hostname()?;
@@ -86,26 +85,20 @@ fn discover_host(contact: &str) -> Result<DiscoveredHost, DiscoveryError> {
     })?;
     Ok(DiscoveredHost {
         hostname: Host::make(&machine),
-        routed: routed_host(contact),
+        routed: probe.and_then(routed_host),
     })
 }
 
-/// The local address the operating system would use to reach `contact`.
+/// The local address the operating system would use to reach `target`.
 ///
 /// Connecting a UDP socket sends nothing: it only asks the routing table which
 /// interface would carry that traffic. The answer is the address that reaches
-/// the contact point, and nothing more. A loopback contact point answers with a
-/// loopback address, and a host that reaches Cassandra over a management
-/// interface answers with the management address. A peer elsewhere reaches
-/// neither, which is what
+/// the target, and nothing more. A loopback target answers with a loopback
+/// address, and a target behind a management interface answers with the
+/// management address. A peer elsewhere reaches neither, which is what
 /// [`RouterConfiguration::advertised_host`](super::RouterConfiguration::advertised_host)
-/// is for. Any failure — an unresolvable contact point, no route — yields
-/// `None`, and the next source in the discovery order answers.
-fn routed_host(contact: &str) -> Option<Host> {
-    let Ok(mut targets) = contact.to_socket_addrs() else {
-        return None;
-    };
-    let target = targets.next()?;
+/// is for. A bind, route, or address read failure yields `None`.
+fn routed_host(target: SocketAddr) -> Option<Host> {
     // An IPv4-bound socket cannot discover an IPv6 route, so the probe binds
     // the family of the address it aims at.
     let unspecified = if target.is_ipv4() {

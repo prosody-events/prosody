@@ -107,7 +107,7 @@ async fn test_backpressure() -> Result<()> {
     info!("Total processing time: {total_elapsed:?}");
 
     // Shutdown the consumer and clean up resources
-    consumer.shutdown().await;
+    consumer.shutdown().await?;
     admin_client.delete_topic(&topic).await?;
     Ok(())
 }

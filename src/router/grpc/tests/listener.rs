@@ -11,13 +11,13 @@ use crate::router::grpc::codec::ClientFrameCodec;
 use crate::router::grpc::conn::admitted;
 use crate::router::grpc::{BoundListener, TRANSPORT, TransportConfiguration};
 use crate::router::loopback::{HANG_GUARD, TestHealth};
-use crate::router::runtime::{PeerInputs, PeerRuntime, RouterConfiguration};
+use crate::router::runtime::{PeerInputs, RouterConfiguration, start_runtime};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::{bail, ensure, eyre};
 use futures::StreamExt;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::pin;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,8 +31,8 @@ use tonic::transport::Endpoint as Dialled;
 use tonic::{Code, Request};
 use validator::Validate;
 
-/// The Cassandra contact point the routed-address probe aims at.
-const CONTACT: &str = "localhost:9042";
+/// The address the routed-address probe aims at.
+const CONTACT: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9042));
 
 /// The reflection method a generic client calls to learn what a port serves.
 const REFLECTION: &str = "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo";
@@ -117,16 +117,18 @@ fn a_registration_publishes_the_port_the_listener_bound() -> Result<()> {
             ..RequesterConfiguration::default()
         };
         let directory = cassandra_directory(RegistrationTtl::DEFAULT.duration()).await?;
-        let runtime = PeerRuntime::start(PeerInputs {
-            directory: directory.clone(),
-            listener: bound,
-            health: TestHealth::new(true, true),
-            contact: CONTACT,
-            group: None,
-            router: &router,
-            fleet: FleetConfiguration::default(),
-            requester: &requester,
-        })
+        let runtime = start_runtime(
+            PeerInputs {
+                directory: directory.clone(),
+                listener: bound,
+                health: TestHealth::new(true, true),
+                probe: Some(CONTACT),
+                router: &router,
+                fleet: FleetConfiguration::default(),
+                requester: &requester,
+            },
+            None,
+        )
         .await?;
         let outcome = async {
             let published = directory

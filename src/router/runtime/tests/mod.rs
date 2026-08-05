@@ -5,7 +5,7 @@
 //! id and a fresh group id, so rows are disjoint in the shared `prosody_test`
 //! keyspace and no test creates a keyspace of its own.
 
-use super::{PeerInputs, PeerRuntime, RouterConfiguration};
+use super::{PeerInputs, PeerRuntime, PreparedPeerRuntime, RouterConfiguration};
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::tests::CountingCodec;
@@ -17,12 +17,13 @@ use crate::router::directory::tests::support::{cassandra_directory, membership};
 use crate::router::directory::{Endpoint, GroupMembership, NodeDirectory, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
+use crate::router::grpc::health::ProcessHealth;
 use crate::router::grpc::{BoundListener, TransportConfiguration};
 use crate::router::loopback::{LoopbackSender, Script, TestHealth, port};
 use crate::router::{Host, NodeId, RouterHandle};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -32,12 +33,9 @@ mod ownership;
 mod shutdown;
 mod wiring;
 
-/// The Cassandra contact point the routed-address probe aims at.
-pub(super) const CONTACT: &str = "localhost:9042";
-
-/// The same contact point written as an address. A probe against it exercises
-/// no name resolution, so it always aims at one address family.
-pub(super) const NUMERIC_CONTACT: &str = "127.0.0.1:9042";
+/// The address the routed-address probe aims at. It is an address literal, so
+/// the probe resolves no name and always aims at one address family.
+pub(super) const CONTACT: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9042));
 
 /// The lease these tests read under. It equals the default a runtime starts
 /// with, and its refresh delay is at least a fifth of it, so no refresh runs
@@ -118,28 +116,30 @@ impl Process {
         };
         let router = RouterConfiguration::default();
         let requester = requester();
-        let runtime = PeerRuntime::start(PeerInputs {
-            directory: directory.clone(),
-            listener: bound,
-            health: TestHealth::new(true, true),
-            // The numeric contact point pins the address family the routed
-            // probe answers with, so the discovered host is the loopback
-            // address this listener bound and a process can reach itself.
-            contact: NUMERIC_CONTACT,
-            group: Some(membership()),
-            router: &router,
-            fleet: FleetConfiguration {
-                max_destinations: DESTINATIONS,
-                slots_each: SLOTS_EACH,
-                // Far longer than any test runs, and a rate no test reaches, so
-                // neither the send deadline nor pacing can end a queued
-                // response before the drain does.
-                send_deadline: Duration::from_mins(1),
-                sends_per_second: 10_000,
-                ..FleetConfiguration::default()
+        let runtime = start_runtime(
+            PeerInputs {
+                directory: directory.clone(),
+                listener: bound,
+                health: TestHealth::new(true, true),
+                // The probe address pins the address family it answers with,
+                // so the discovered host is the loopback address this listener
+                // bound and a process can reach itself.
+                probe: Some(CONTACT),
+                router: &router,
+                fleet: FleetConfiguration {
+                    max_destinations: DESTINATIONS,
+                    slots_each: SLOTS_EACH,
+                    // Far longer than any test runs, and a rate no test reaches, so
+                    // neither the send deadline nor pacing can end a queued
+                    // response before the drain does.
+                    send_deadline: Duration::from_mins(1),
+                    sends_per_second: 10_000,
+                    ..FleetConfiguration::default()
+                },
+                requester: &requester,
             },
-            requester: &requester,
-        })
+            Some(membership()),
+        )
         .await?;
         let barrier = Arc::new(Semaphore::new(0));
         let destination = NodeId::new();
@@ -208,16 +208,18 @@ async fn plain_process() -> Result<PlainProcess> {
     let bound_port = bound.address().port();
     let router = RouterConfiguration::default();
     let requester = requester();
-    let runtime = PeerRuntime::start(PeerInputs {
-        directory: directory.clone(),
-        listener: bound,
-        health: TestHealth::new(true, true),
-        contact: CONTACT,
-        group: Some(membership.clone()),
-        router: &router,
-        fleet: FleetConfiguration::default(),
-        requester: &requester,
-    })
+    let runtime = start_runtime(
+        PeerInputs {
+            directory: directory.clone(),
+            listener: bound,
+            health: TestHealth::new(true, true),
+            probe: Some(CONTACT),
+            router: &router,
+            fleet: FleetConfiguration::default(),
+            requester: &requester,
+        },
+        Some(membership.clone()),
+    )
     .await?;
     Ok(PlainProcess {
         runtime,
@@ -225,6 +227,24 @@ async fn plain_process() -> Result<PlainProcess> {
         membership,
         bound_port,
     })
+}
+
+pub(in crate::router) async fn start_runtime<H, D>(
+    inputs: PeerInputs<'_, H, D>,
+    group: Option<GroupMembership>,
+) -> Result<PeerRuntime<D>>
+where
+    H: ProcessHealth,
+    D: NodeDirectory,
+{
+    let prepared = PreparedPeerRuntime::start(inputs).await?;
+    match prepared.activate(group).await {
+        Ok(runtime) => Ok(runtime),
+        Err((prepared, error)) => {
+            prepared.abandon().await;
+            Err(error.into())
+        }
+    }
 }
 
 /// The frame ceiling one process's listener and senders share.

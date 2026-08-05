@@ -122,7 +122,9 @@ pub use crate::consumer::config::{
     ConsumerConfigurationBuilderError, ConsumerSetup, LowLatencyMiddlewareConfiguration,
     MockConfigurationError, PipelineMiddlewareConfiguration, RecoveryTtlMarginError,
 };
-pub use crate::consumer::error::{ConsumerError, KeyedStateInitError};
+pub use crate::consumer::error::{
+    ConsumerError, KeyedStateInitError, PeerInitError, ShutdownError,
+};
 pub use crate::consumer::event_context::{EventContext, TerminationSignals};
 pub use crate::consumer::handler::{DemandType, EventHandler, HandlerProvider, Keyed, Uncommitted};
 pub use crate::consumer::kafka_state::{
@@ -134,6 +136,7 @@ pub use crate::consumer::middleware::{FallibleHandler, RepinProof};
 pub(crate) use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::probes::ProbeServer;
+use crate::consumer::wiring::peer::PeerHandles;
 pub(crate) use crate::consumer::wiring::state::{
     CassandraStateProvider, KeyedStateInputs, MemoryStateProvider,
 };
@@ -147,7 +150,10 @@ use crate::{Codec, JsonCodec, Partition, Topic};
 use ahash::HashMap;
 use crossbeam_utils::CachePadded;
 use educe::Educe;
+use futures::StreamExt;
 use futures::executor::block_on;
+use futures::future::ready;
+use futures::stream::FuturesUnordered;
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -200,6 +206,7 @@ struct RuntimeState {
     /// The consumer's Kafka observation handle. Shutdown retires its gauge
     /// series so a stopped consumer stops contributing to `sum` aggregations.
     observer: KafkaObserver,
+    peer: Option<PeerHandles>,
 }
 
 /// High-level Kafka consumer implementation.
@@ -282,29 +289,64 @@ impl<C: Codec> ProsodyConsumer<C> {
         get_is_stalled(&self.managers) || self.heartbeats.any_stalled()
     }
 
-    /// Initiates a graceful shutdown of the Kafka consumer.
+    /// Stops this consumer, in the one order that does not drop work it already
+    /// owes.
     ///
-    /// This method stops polling for new messages and waits for any in-flight
-    /// message processing to complete or timeout.
-    pub async fn shutdown(mut self) {
-        self.execute_shutdown().await;
+    /// It stops polling, waits for in-flight message processing, sweeps any
+    /// partition manager the final revoke left behind, and only then tears the
+    /// peer runtime down. The crate-internal `execute_shutdown` owns that
+    /// order and states why.
+    ///
+    /// This is the supported teardown, and it is the only one that waits. A
+    /// consumer that is dropped instead starts the same teardown and does not
+    /// wait for it.
+    ///
+    /// A second call, or a call on a clone whose sibling already ran, finds no
+    /// runtime state and answers `Ok(())`. That success is not an observation:
+    /// the other caller made it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShutdownError`] when the peer teardown could not remove this
+    /// node from the directory, or could not report what it did. Both leave a
+    /// row that expires on its lease.
+    pub async fn shutdown(mut self) -> Result<(), ShutdownError> {
+        let peer = self.execute_shutdown().await;
+        self.drain_managers().await;
+        match peer {
+            Some(peer) => peer.stop().await,
+            None => Ok(()),
+        }
     }
 
-    /// Executes the consumer shutdown process.
+    /// Stops every Kafka step, and hands the still-live peer handles back.
     ///
-    /// This method is used by both the public shutdown method and the drop
-    /// handler to ensure resources are properly cleaned up.
-    async fn execute_shutdown(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-
-        let Some(RuntimeState {
+    /// **This function owns the teardown order.** It closes peer request
+    /// admission first, so no new request enters while handlers finish. It then
+    /// stops the poll loop and waits for it. The peer runtime stays live
+    /// throughout, because a partition handler's commit hook can still queue an
+    /// owed response. Tear the peer down first and the process drops responses
+    /// it already owes, and fails requests it could still answer.
+    ///
+    /// It does not sweep the partition managers, and the caller does.
+    /// [`Drop`](Self::drop) runs this function through a foreign executor,
+    /// which cannot drive a spawned task on a current-thread runtime, and
+    /// `PartitionManager::shutdown` awaits one.
+    /// [`shutdown`](Self::shutdown) runs the sweep between this function and
+    /// the peer teardown, which keeps the sweep ahead of that teardown and adds
+    /// no await to `Drop`.
+    async fn execute_shutdown(&mut self) -> Option<PeerHandles> {
+        let RuntimeState {
             poll_handle,
             probe_server,
             observer,
-        }) = self.runtime_state.lock().take()
-        else {
-            return;
-        };
+            peer,
+        } = self.runtime_state.lock().take()?;
+
+        if let Some(peer) = &peer {
+            peer.close_admission();
+        }
+        self.shutdown.store(true, Ordering::Relaxed);
 
         if let Err(error) = poll_handle.await {
             error!("consumer shutdown failed: {error:#}");
@@ -318,16 +360,33 @@ impl<C: Codec> ProsodyConsumer<C> {
         if let Some(probe_server) = probe_server {
             probe_server.shutdown().await;
         }
+        peer
+    }
+
+    /// Shuts down every partition manager the final revoke left behind.
+    ///
+    /// rdkafka skips its close-poll loop when the queue cannot be closed, and
+    /// the final revoke never dispatches then. Each retained manager holds a
+    /// handler clone, so this drain is what bounds the peer teardown that
+    /// follows. After a normal revoke the map is already empty.
+    async fn drain_managers(&self) {
+        let draining: FuturesUnordered<_> = self
+            .managers
+            .write()
+            .drain()
+            .map(|(_, manager)| manager.shutdown())
+            .collect();
+        draining.for_each(|_| ready(())).await;
     }
 }
 
 /// Ensures graceful shutdown when the consumer is dropped.
 ///
-/// This implementation guarantees that resources are cleaned up even if
-/// the consumer is dropped without explicitly calling `shutdown()`.
+/// Dropping the peer stop sender starts peer teardown. `Drop` does not wait for
+/// it. A process that exits at once can leave a row until its lease expires.
 impl<C: Codec> Drop for ProsodyConsumer<C> {
     fn drop(&mut self) {
-        block_on(self.execute_shutdown());
+        drop(block_on(self.execute_shutdown()));
     }
 }
 

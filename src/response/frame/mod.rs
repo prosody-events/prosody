@@ -13,8 +13,8 @@
     not(test),
     expect(
         dead_code,
-        reason = "the peer transport is this module's production caller; the conversions are \
-                  exercised by this module's tests"
+        reason = "the decoder is live; the encoder waits for the production responder, and both \
+                  conversions have tests"
     )
 )]
 

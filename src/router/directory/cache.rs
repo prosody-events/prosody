@@ -1,14 +1,5 @@
 //! The read-through address cache in front of the node directory.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the response path and the process runtime are this module's production callers; \
-                  the cache is exercised by this module's tests and the resolver by the router's"
-    )
-)]
-
 use crate::router::NodeId;
 use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
 use quanta::{Clock, Instant};

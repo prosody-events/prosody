@@ -1,4 +1,4 @@
-//! An in-process node directory for tests.
+//! An in-process node directory.
 
 use super::{NodeDirectory, NodeRegistration, RegistrationTtl};
 use crate::router::{MAX_LABEL_BYTES, NodeId};
@@ -9,12 +9,17 @@ use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-/// A node directory held in this process's memory, for tests that need peer
-/// behaviour without a Cassandra cluster.
+/// The number of registrations held by a default memory directory.
+pub(crate) const MEMORY_DIRECTORY_CAPACITY: NonZeroUsize = match NonZeroUsize::new(16) {
+    Some(capacity) => capacity,
+    None => NonZeroUsize::MIN,
+};
+
+/// A node directory held in this process's memory.
 ///
-/// **It cannot discover a peer in another process.** Two processes each hold
-/// their own map and neither sees the other's registrations, so this is a test
-/// double and never a deployment option.
+/// Each call builds a fresh bounded map. A node resolves only registrations it
+/// wrote to its own map. This serves one process that asks itself. It also
+/// serves tests that do not use Docker.
 ///
 /// Two bounds make it safe to key by a node id.
 ///
@@ -38,29 +43,39 @@ impl MemoryNodeDirectory {
     /// Creates a bounded directory under `ttl` with the process clock.
     #[must_use]
     pub(crate) fn new(capacity: NonZeroUsize, ttl: RegistrationTtl) -> Self {
-        Self::with_clock(capacity, ttl, Clock::new())
+        memory_directory(capacity, ttl, Clock::new())
     }
 
     /// Creates a bounded directory with an injected clock.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn with_clock(capacity: NonZeroUsize, ttl: RegistrationTtl, clock: Clock) -> Self {
-        let inner = Cache::with(
-            capacity.get(),
-            capacity.get() as u64,
-            UnitWeighter,
-            ahash::RandomState::default(),
-            DefaultLifecycle::default(),
-        );
-        Self {
-            inner: Arc::new(inner),
-            clock,
-            ttl,
-        }
+        memory_directory(capacity, ttl, clock)
     }
 
     /// How many registrations the directory holds.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.inner.len()
+    }
+}
+
+fn memory_directory(
+    capacity: NonZeroUsize,
+    ttl: RegistrationTtl,
+    clock: Clock,
+) -> MemoryNodeDirectory {
+    let inner = Cache::with(
+        capacity.get(),
+        capacity.get() as u64,
+        UnitWeighter,
+        ahash::RandomState::default(),
+        DefaultLifecycle::default(),
+    );
+    MemoryNodeDirectory {
+        inner: Arc::new(inner),
+        clock,
+        ttl,
     }
 }
 

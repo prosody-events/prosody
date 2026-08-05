@@ -140,7 +140,7 @@ pub(super) fn new_context<T, P, SP, PL>(
     watermark_version: Arc<WatermarkVersion>,
     shared: ContextHandles<PL>,
     version: Arc<str>,
-) -> Result<Context<impl MakeManager<PL>, PL>, ContextError>
+) -> Result<Context<impl MakeManager<PL> + use<T, P, SP, PL>, PL>, ContextError>
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = PL>,

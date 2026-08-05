@@ -1,6 +1,6 @@
 //! What a process discovers about itself, and what it publishes from it.
 
-use super::super::tests::{CONTACT, NUMERIC_CONTACT, listener};
+use super::super::tests::{CONTACT, listener};
 use super::super::{RouterConfiguration, discover_registration};
 use super::{DiscoveredHost, DiscoveryError, discover_host, join_discovery, routed_host};
 use crate::router::directory::Endpoint;
@@ -39,9 +39,8 @@ fn prop_the_direct_endpoint_publishes_only_what_it_discovered(label: u8, port: u
         let registration = discover_registration(
             NodeId::new(),
             &bound,
-            discover_host(CONTACT)?,
+            discover_host(Some(CONTACT))?,
             &config,
-            None,
         );
         ensure!(
             bound.address().port() != 0,
@@ -79,7 +78,7 @@ fn prop_the_direct_endpoint_publishes_only_what_it_discovered(label: u8, port: u
 /// It cannot tell a local address from a peer one against a loopback target —
 /// both are `127.0.0.1` — so swapping the two is out of this test's reach.
 #[test]
-fn routed_host_answers_for_the_cassandra_contact_point() -> Result<()> {
+fn routed_host_answers_for_the_configured_probe_address() -> Result<()> {
     init_test_logging();
     let host = routed_host(CONTACT).ok_or_else(|| eyre!("the routed probe found no address"))?;
     host.as_str()
@@ -92,24 +91,22 @@ fn routed_host_answers_for_the_cassandra_contact_point() -> Result<()> {
 /// probe finds none. Both sources are checked against a registration, because
 /// the order between them decides the address peers dial.
 ///
-/// The target is written as an address so that two probes cannot land on
-/// different address families of one name. A contact point with no port in it
-/// resolves to nothing, so the second source is reached without a network of
-/// any kind.
+/// The probe target is a `SocketAddr`, so two probes cannot land on different
+/// address families of one name. An absent probe skips the lookup altogether,
+/// so the second source is reached without a network of any kind.
 #[test]
 fn the_direct_host_is_the_routed_address_then_this_machine() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let config = RouterConfiguration::default();
-        let routed = routed_host(NUMERIC_CONTACT)
-            .ok_or_else(|| eyre!("the routed probe found no address"))?;
+        let routed =
+            routed_host(CONTACT).ok_or_else(|| eyre!("the routed probe found no address"))?;
         let bound = listener().await?;
         let registration = discover_registration(
             NodeId::new(),
             &bound,
-            discover_host(NUMERIC_CONTACT)?,
+            discover_host(Some(CONTACT))?,
             &config,
-            None,
         );
         ensure!(
             routed != registration.hostname,
@@ -120,13 +117,7 @@ fn the_direct_host_is_the_routed_address_then_this_machine() -> Result<()> {
             "the direct endpoint must publish the routed address while the probe answers"
         );
 
-        let unrouted = discover_registration(
-            NodeId::new(),
-            &bound,
-            discover_host("no-port-here")?,
-            &config,
-            None,
-        );
+        let unrouted = discover_registration(NodeId::new(), &bound, discover_host(None)?, &config);
         assert_eq!(unrouted.direct.host, unrouted.hostname);
         Ok(())
     })

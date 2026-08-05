@@ -240,7 +240,7 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     }
 
     // Clean up resources
-    consumer.shutdown().await;
+    consumer.shutdown().await?;
     admin_client.delete_topic(&topic).await?;
     Ok(())
 }

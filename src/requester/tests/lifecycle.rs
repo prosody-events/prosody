@@ -161,7 +161,7 @@ fn the_registry_holds_live_requests_and_drains(steps: Vec<DrainStep>) -> TestRes
 async fn a_registration_after_shutdown_is_refused_and_leaves_nothing() -> Result<()> {
     let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
     let awaited = names(&POOL[..1])?;
-    registry.shutdown().await;
+    registry.terminate().await;
 
     let refused = registry.register::<TestCodecError>(&awaited, TIMEOUT, TestCodec::FORMAT_ID);
     let Err(RequestError::ShuttingDown) = refused else {
@@ -261,7 +261,7 @@ fn run_steps(steps: Vec<Step>) -> Result<()> {
                     first = first.or(Some(Status::TimedOut));
                 }
                 Step::Shutdown => {
-                    registry.shutdown().await;
+                    registry.terminate().await;
                     first = first.or(Some(Status::ShuttingDown));
                 }
             }

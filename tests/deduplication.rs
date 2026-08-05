@@ -88,6 +88,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         timeout: TimeoutConfigurationBuilder::default().build()?,
         dedup: DeduplicationConfigurationBuilder::default().build()?,
         keyed_state: KeyedStateConfiguration::builder().build()?,
+        peer: None,
     };
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
@@ -129,7 +130,8 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         Ok(())
     }
     .await;
-    consumer.shutdown().await;
+    let shutdown = consumer.shutdown().await;
     admin_client.delete_topic(&topic).await?;
+    shutdown?;
     outcome
 }

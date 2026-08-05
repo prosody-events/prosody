@@ -259,7 +259,7 @@ async fn startup_installs_metadata_into_the_callers_observer() -> Result<()> {
             Ok(())
         },
     );
-    consumer.shutdown().await;
+    consumer.shutdown().await?;
     outcome
 }
 
@@ -334,7 +334,7 @@ async fn expect_unreachable_startup(
 ) -> Result<()> {
     match initialize_with(config, observer).await? {
         Ok(consumer) => {
-            consumer.shutdown().await;
+            consumer.shutdown().await?;
             bail!("construction succeeded without a startup observation");
         }
         Err(error) => ensure!(

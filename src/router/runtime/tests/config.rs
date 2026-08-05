@@ -1,6 +1,8 @@
 //! What the router configuration accepts, and the refresh pace it sets.
 
-use super::super::{PeerInputs, PeerRuntime, PeerRuntimeError, RouterConfiguration, refresh_delay};
+use super::super::{
+    PeerInputs, PeerRuntimeError, PreparedPeerRuntime, RouterConfiguration, refresh_delay,
+};
 use super::{CONTACT, listener};
 use crate::requester::config::RequesterConfiguration;
 use crate::router::directory::RegistrationTtl;
@@ -32,12 +34,11 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
         let requester = RequesterConfiguration::default();
         // `start` refuses before it publishes anything, so an in-process
         // directory is enough and this case needs no cluster.
-        let outcome = PeerRuntime::start(PeerInputs {
+        let outcome = PreparedPeerRuntime::start(PeerInputs {
             directory: memory_directory(REFUSED_LEASE)?,
             listener: listener().await?,
             health: TestHealth::new(true, true),
-            contact: CONTACT,
-            group: None,
+            probe: Some(CONTACT),
             router: &router,
             fleet: FleetConfiguration::default(),
             requester: &requester,
@@ -72,12 +73,11 @@ fn start_refuses_a_response_ceiling_above_the_frame_cap() -> Result<()> {
             ..RequesterConfiguration::default()
         };
         requester.validate()?;
-        let outcome = PeerRuntime::start(PeerInputs {
+        let outcome = PreparedPeerRuntime::start(PeerInputs {
             directory: memory_directory(REFUSED_LEASE)?,
             listener: bound,
             health: TestHealth::new(true, true),
-            contact: CONTACT,
-            group: None,
+            probe: Some(CONTACT),
             router: &router,
             fleet: FleetConfiguration::default(),
             requester: &requester,

@@ -54,7 +54,7 @@ async fn stateless_cassandra_consumer_does_not_create_the_fjall_cache_dir() -> R
     // torn down even if the assertion below fails (a dropped-but-not-shutdown
     // consumer hangs the test binary).
     let created = cache_dir.exists();
-    consumer.shutdown().await;
+    consumer.shutdown().await?;
 
     ensure!(
         !created,

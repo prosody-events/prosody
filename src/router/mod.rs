@@ -18,6 +18,7 @@ use tokio::time::Instant;
 use tonic::Code;
 use uuid::Uuid;
 
+pub(crate) mod config;
 pub(crate) mod directory;
 pub(crate) mod fleet;
 pub(crate) mod grpc;
@@ -40,6 +41,11 @@ const LABEL_CAPACITY: usize = 64;
 /// entry however many bytes it holds, so an unbounded label would make a
 /// bounded entry count buy nothing.
 pub(crate) const MAX_LABEL_BYTES: usize = LABEL_CAPACITY - 1;
+
+/// Reports whether a nonempty label fits the directory label bound.
+pub(crate) fn label_fits(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_LABEL_BYTES
+}
 
 /// The host a node publishes for its peers to dial. Every host that reaches the
 /// directory is bounded by [`MAX_LABEL_BYTES`], so a resolved address stays off
@@ -67,14 +73,6 @@ pub(crate) struct NodeId(Uuid);
 /// preference only orders the candidates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(strum::VariantArray))]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the response sender is this enum's production reader; the order it decides is \
-                  exercised by this module's tests"
-    )
-)]
 pub(crate) enum Preference {
     /// The address the node discovered for itself on its own network.
     Direct,
@@ -96,14 +94,6 @@ pub(crate) struct Route {
 ///
 /// The router delivers frames without reading them, which is what keeps
 /// response vocabulary out of this module.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the peer transport is this trait's production caller; it is exercised by this \
-                  module's tests"
-    )
-)]
 pub(crate) trait Framed {
     /// The exact number of bytes [`Framed::write`] produces.
     fn bytes(&self) -> usize;
@@ -204,14 +194,6 @@ pub(crate) trait Router: RelayHop {
 
 /// The production [`Router`]: addresses from the directory's bounded cache,
 /// frames through one transport, slots from the one fleet the process owns.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no production caller yet: the respond layer will own this; every item here is \
-                  exercised by this module's tests"
-    )
-)]
 pub(crate) struct RouterHandle<S, D> {
     addresses: AddressResolver<D>,
     fleet: Arc<DestinationFleet>,
@@ -221,14 +203,6 @@ pub(crate) struct RouterHandle<S, D> {
 
 impl NodeId {
     /// Mints an id for one incarnation of one process.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no production caller yet: consumer wiring will own the process runtime; \
-                      every item here is exercised by this module's tests"
-        )
-    )]
     pub(in crate::router) fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -272,14 +246,6 @@ impl<S, D: Clone> Clone for RouterHandle<S, D> {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no production caller yet: the respond layer will own this; every item here is \
-                  exercised by this module's tests"
-    )
-)]
 impl<S, D> RouterHandle<S, D> {
     /// Binds one process's resolver, fleet and transport together.
     pub(in crate::router) fn new(
@@ -427,14 +393,6 @@ impl Route {
 ///   single-network case working with no configuration at all.
 ///
 /// `None` means "do not dial".
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the response path is this rule's production caller, through `Router::route`; \
-                  each label shape is exercised by this module's tests"
-    )
-)]
 pub(crate) fn choose_route(
     here: Option<&NetworkId>,
     registration: &NodeRegistration,
@@ -469,14 +427,6 @@ pub(crate) fn choose_route(
 /// [`Status`](Self::Status) carries the gRPC status the attempt came to, rather
 /// than a code of this crate's own, for the reason [`crate::router::grpc`]
 /// states.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the peer transport is this enum's production producer; the retry rule is \
-                  exercised by this module's tests"
-    )
-)]
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SendFailure {
     /// The attempt came to a gRPC status other than `OK`. It may be what

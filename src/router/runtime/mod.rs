@@ -1,14 +1,6 @@
 //! One process's peer machinery: what it publishes about itself, what it hands
 //! consumers and requesters, and the order it stops in.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no production caller yet: consumer wiring will own this"
-    )
-)]
-
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::{PendingRegistry, RegistryError};
 use crate::router::directory::cache::AddressResolver;
@@ -25,6 +17,7 @@ use crate::router::relay::Relay;
 use crate::router::{Host, NodeId, RouterHandle};
 use rand::RngExt;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -43,19 +36,25 @@ use self::discovery::{DiscoveredHost, DiscoveryError, discover};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(in crate::router) use tests::start_runtime;
 
 /// Everything one process shares for peer traffic, under one owner.
 ///
-/// The runtime holds this node's registration, the resolver it reads peers
-/// through, the bound listener, the destination fleet, the pending request
-/// registry, and the router responses leave by. Consumers and requesters
-/// take handles from it and construct none of these themselves. It mints one
-/// [`NodeId`] and the listener answers for that same id, so one runtime has one
-/// identity. One process runs one runtime.
+/// The runtime holds this node's published registration, the resolver it reads
+/// peers through, the bound listener, the destination fleet, the pending
+/// request registry, and the router responses leave by. Consumers and
+/// requesters take handles from it and construct none of these themselves. It
+/// mints one [`NodeId`] and the listener answers for that same id, so one
+/// runtime has one identity. One process runs one runtime.
 ///
 /// The router names no response vocabulary except at the wire seam it owns.
 /// This type is inside that seam: the listener's service is the pending
 /// registry's server side, so the runtime must name both.
+///
+/// A runtime exists only after a directory write.
+/// [`PreparedPeerRuntime`] holds the same parts before that write, and
+/// [`PreparedPeerRuntime::activate`] is the one way to reach this type.
 ///
 /// [`shutdown`](Self::shutdown) is the ordered teardown, and it must be driven
 /// to completion. A dropped shutdown future stops between two steps and leaves
@@ -67,14 +66,12 @@ mod tests;
 /// expires on its lease. What a plain drop cannot do is wake a parked waiter or
 /// wait for a reservation, which is why shutdown exists.
 ///
-/// The directory backend travels with this type and stops here.
-/// [`router`](Self::router) and [`addresses`](Self::addresses) both hand out a
-/// value that names `D`, and both of those values are `Clone`, so no borrow
-/// confines either one. What keeps `D` out of the code above is inference: a
-/// consumer passes a handle to a constructor that returns a type naming no `D`,
-/// or calls a method on it, and writes the parameter nowhere. An owner infers
-/// `D` where it builds the runtime, and moves the whole runtime into a task of
-/// its own.
+/// The directory backend travels with this type and stops here. Its handles
+/// hand out values that name `D`, and those values are `Clone`, so no borrow
+/// confines them. What keeps `D` out of the code above is inference: a consumer
+/// passes a handle to a constructor that returns a type naming no `D`, or calls
+/// a method on it, and writes the parameter nowhere. An owner infers `D` where
+/// it prepares the runtime, and moves the whole runtime into a task of its own.
 pub(crate) struct PeerRuntime<D> {
     addresses: AddressResolver<D>,
     router: RouterHandle<GrpcSender, D>,
@@ -91,11 +88,32 @@ pub(crate) struct PeerRuntime<D> {
     listener: JoinHandle<()>,
 }
 
+/// One process's peer machinery, served but not yet published.
+///
+/// [`start`](Self::start) builds and serves every local part and writes
+/// nothing. The directory learns this node only at
+/// [`activate`](Self::activate). So the first write is the last step that can
+/// fail, and an owner that fails after preparation publishes nothing to undo.
+///
+/// This value owns a listening socket. Spend it exactly once, through
+/// `activate` or [`abandon`](Self::abandon). A plain drop detaches the listener
+/// task, and a retry on the same port then fails to bind.
+pub(crate) struct PreparedPeerRuntime<D> {
+    addresses: AddressResolver<D>,
+    router: RouterHandle<GrpcSender, D>,
+    directory: D,
+    registration: NodeRegistration,
+    fleet: Arc<DestinationFleet>,
+    pending: Arc<PendingRegistry>,
+    stop_listener: oneshot::Sender<()>,
+    listener: JoinHandle<()>,
+}
+
 /// Everything one peer runtime is built from.
 ///
 /// The bound listener inside is a unique resource, so one value serves one
 /// process. Two runtimes need a second, grep-visible call to
-/// [`PeerRuntime::start`].
+/// [`PreparedPeerRuntime::start`].
 pub(crate) struct PeerInputs<'a, H, D> {
     /// Where this process publishes itself, and how it resolves a peer. Its
     /// lease is the single source: the runtime ages its address cache on it and
@@ -105,33 +123,30 @@ pub(crate) struct PeerInputs<'a, H, D> {
     /// publishes the port that the operating system assigned.
     pub(crate) listener: BoundListener,
     pub(crate) health: H,
-    /// A Cassandra contact point that the routed-address probe aims at.
-    pub(crate) contact: &'a str,
-    pub(crate) group: Option<GroupMembership>,
+    /// The address that the routed-address probe aims at.
+    pub(crate) probe: Option<SocketAddr>,
     pub(crate) router: &'a RouterConfiguration,
     pub(crate) fleet: FleetConfiguration,
     pub(crate) requester: &'a RequesterConfiguration,
 }
 
-impl<D: NodeDirectory> PeerRuntime<D> {
-    /// Builds every shared piece, serves the listener, and publishes this
-    /// process.
+impl<D: NodeDirectory> PreparedPeerRuntime<D> {
+    /// Builds every shared piece and serves the listener.
     ///
-    /// The listener is served before the registration is written, so no peer
-    /// can learn a port before that port accepts connections. The first write
-    /// is awaited here rather than left to the refresh task, so a returned
-    /// runtime is one whose node is already published.
+    /// The listener is served here rather than at activation, so no peer can
+    /// learn a port before that port accepts connections. This function writes
+    /// nothing to the directory.
+    ///
+    /// Each failure arm releases what the earlier steps took, so a failure
+    /// leaves no task behind and returns nothing to release.
     ///
     /// # Errors
     ///
     /// Returns [`PeerRuntimeError`] when the configuration, discovery, the
-    /// directory, the registry, the fleet, or the listener refuses to start.
-    /// A failed first write stops the listener again before it returns. It
-    /// issues no delete: an entry the failed write still applied expires on its
-    /// lease.
+    /// registry, the fleet, or the listener refuses to start.
     pub(crate) async fn start<H: ProcessHealth>(
         inputs: PeerInputs<'_, H, D>,
-    ) -> Result<Self, PeerRuntimeError<D::Error>> {
+    ) -> Result<Self, PeerRuntimeError> {
         inputs.router.validate()?;
         // One ceiling for both seams: the frames this process sends and the
         // frames its listener admits.
@@ -150,18 +165,18 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         let pending = PendingRegistry::new(inputs.requester)?;
         let transport = Arc::new(GrpcSender::new(frame_cap, &fleet));
         let directory = inputs.directory;
-        let ttl = directory.ttl();
         // The blocking pool owns the resolver wait; a runtime thread must not.
         // The resolver call and the machine-name lookup are private to
         // `discovery`, so this file reaches them only through `discover`.
-        let discovered = discover(inputs.contact).await?;
-        let registration = discover_registration(
-            NodeId::new(),
-            &inputs.listener,
-            discovered,
-            inputs.router,
-            inputs.group,
-        );
+        let discovered = match discover(inputs.probe).await {
+            Ok(discovered) => discovered,
+            Err(error) => {
+                pending.terminate().await;
+                return Err(PeerRuntimeError::Discovery(error));
+            }
+        };
+        let registration =
+            discover_registration(NodeId::new(), &inputs.listener, discovered, inputs.router);
         let addresses =
             AddressResolver::new(inputs.router.address_cache_capacity, directory.clone());
         let router = RouterHandle::new(
@@ -171,7 +186,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
             registration.network.clone(),
         );
         let (stop_listener, stopped) = oneshot::channel();
-        let listener = serve(
+        let listener = match serve(
             inputs.listener,
             PeerService::new(
                 registration.node,
@@ -182,15 +197,58 @@ impl<D: NodeDirectory> PeerRuntime<D> {
             ),
             inputs.health,
             async move { drop(stopped.await) },
-        )?;
-        if let Err(error) = directory.register(&registration).await {
-            abandon(stop_listener, listener).await;
-            return Err(PeerRuntimeError::Directory(error));
+        ) {
+            Ok(listener) => listener,
+            Err(error) => {
+                pending.terminate().await;
+                return Err(PeerRuntimeError::Listener(error));
+            }
+        };
+        Ok(Self {
+            addresses,
+            router,
+            directory,
+            registration,
+            fleet,
+            pending,
+            stop_listener,
+            listener,
+        })
+    }
+
+    /// Publishes this node and starts its registration refresh task.
+    ///
+    /// The group label is set here because only the running Kafka client knows
+    /// the cluster that scopes it. It is the one registration field that
+    /// preparation leaves unset.
+    ///
+    /// A failed write issues one delete before it gives up. Node ids are minted
+    /// fresh and never reused, so this process is the only writer of its own
+    /// row and the delete can remove no other. The delete is best effort, not a
+    /// guarantee: a delete that also fails leaves a row that expires on its
+    /// lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns this value and the directory's error when the first write fails.
+    /// The caller then owns the release order, because only the caller knows
+    /// what else it holds.
+    pub(crate) async fn activate(
+        mut self,
+        group: Option<GroupMembership>,
+    ) -> Result<PeerRuntime<D>, (Self, D::Error)> {
+        self.registration.group = group;
+        if let Err(error) = self.directory.register(&self.registration).await {
+            if let Err(delete_error) = self.directory.deregister(&self.registration).await {
+                warn!(%delete_error, node = %self.registration.node, "failed peer registration rollback");
+            }
+            return Err((self, error));
         }
+        let ttl = self.directory.ttl();
         let (stop_refresh, mut stopped) = watch::channel(false);
         let refresh = tokio::spawn({
-            let directory = directory.clone();
-            let registration = registration.clone();
+            let directory = self.directory.clone();
+            let registration = self.registration.clone();
             async move {
                 loop {
                     select! {
@@ -214,32 +272,43 @@ impl<D: NodeDirectory> PeerRuntime<D> {
                 }
             }
         });
-        Ok(Self {
-            addresses,
-            router,
-            directory,
-            registration,
-            fleet,
-            pending,
+        Ok(PeerRuntime {
+            addresses: self.addresses,
+            router: self.router,
+            directory: self.directory,
+            registration: self.registration,
+            fleet: self.fleet,
+            pending: self.pending,
             stop_refresh,
             refresh,
-            stop_listener,
-            listener,
+            stop_listener: self.stop_listener,
+            listener: self.listener,
         })
     }
 
+    /// Stops every local resource without publishing the node.
+    pub(crate) async fn abandon(self) {
+        self.pending.terminate().await;
+        abandon(self.stop_listener, self.listener).await;
+    }
+}
+
+impl<D: NodeDirectory> PeerRuntime<D> {
     /// This process's node id.
+    #[cfg(test)]
     pub(crate) fn node(&self) -> NodeId {
         self.registration.node
     }
 
     /// How this process resolves another node, through the bounded address
     /// cache.
+    #[cfg(test)]
     pub(crate) const fn addresses(&self) -> &AddressResolver<D> {
         &self.addresses
     }
 
     /// The process-wide destination fleet.
+    #[cfg(test)]
     pub(crate) const fn fleet(&self) -> &Arc<DestinationFleet> {
         &self.fleet
     }
@@ -250,6 +319,9 @@ impl<D: NodeDirectory> PeerRuntime<D> {
     }
 
     /// The router every responder in this process sends through.
+    ///
+    /// The responder is the production caller that will enable this method.
+    #[cfg(test)]
     pub(crate) fn router(&self) -> RouterHandle<GrpcSender, D> {
         self.router.clone()
     }
@@ -317,7 +389,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         let deregistered = directory.deregister(&registration).await;
 
         drop(stop_listener);
-        pending.shutdown().await;
+        pending.terminate().await;
         fleet.close().await;
         // A `Drained` token minted by the close, and demanded by every drain,
         // would make the reversed order uncompilable. It was examined and
@@ -332,7 +404,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
     }
 }
 
-/// Stops the listener that this start served.
+/// Stops the listener that preparation served.
 ///
 /// A dropped handle leaves its task live. A retry could then fail to bind the
 /// same port.
@@ -347,23 +419,25 @@ async fn abandon(stop: oneshot::Sender<()>, listener: JoinHandle<()>) {
 ///
 /// Each configured field reaches only the endpoint it describes. `direct` is
 /// discovered and never configured: the local address the operating system
-/// would route to the contact point, else this machine's name, on the port the
+/// would route to the probe address, else this machine's name, on the port the
 /// listener actually bound. That is what makes an equal network label an
 /// optimization — a neighbour dials an address it reaches without the entry
 /// point. The configured host and port reach `advertised` alone.
 ///
+/// `group` is left unset. Only the running Kafka client knows the cluster that
+/// scopes it, so [`PreparedPeerRuntime::activate`] fills it in.
+///
 /// Every label this returns is inside
 /// [`MAX_LABEL_BYTES`](crate::router::MAX_LABEL_BYTES), which is what lets a
 /// reader treat a longer one as an entry this code did not write.
-/// [`PeerRuntime::start`] validates the configured labels before it calls this
-/// function, the routed probe answers with an address literal, and
+/// [`PreparedPeerRuntime::start`] validates the configured labels before it
+/// calls this function, the routed probe answers with an address literal, and
 /// [`discover`] checks the machine name.
 fn discover_registration(
     node: NodeId,
     listener: &BoundListener,
     discovered: DiscoveredHost,
     config: &RouterConfiguration,
-    group: Option<GroupMembership>,
 ) -> NodeRegistration {
     // A listener rather than a port number: a `u16` would make port zero, and
     // a port that no listener owns, representable.
@@ -380,7 +454,7 @@ fn discover_registration(
             port: config.advertised_port.unwrap_or(listener_port),
         }),
         network: config.network.as_deref().map(NetworkId::make),
-        group,
+        group: None,
         hostname,
     }
 }
@@ -401,9 +475,13 @@ fn refresh_delay(ttl: RegistrationTtl) -> Duration {
     Duration::from_millis(base + rand::rng().random_range(0..=span))
 }
 
-/// What can stop a process from taking its place in the directory.
+/// What can stop a process from serving its peer machinery.
+///
+/// It names no directory error. Preparation writes nothing, and the first write
+/// belongs to [`PreparedPeerRuntime::activate`], which returns the directory's
+/// own error beside the value it could not spend.
 #[derive(Debug, Error)]
-pub(crate) enum PeerRuntimeError<E> {
+pub(crate) enum PeerRuntimeError {
     /// The configuration this process was started with is invalid.
     #[error("router configuration is invalid: {0:#}")]
     Configuration(#[from] ValidationErrors),
@@ -411,13 +489,6 @@ pub(crate) enum PeerRuntimeError<E> {
     /// This process could not learn what only its machine knows.
     #[error("this process could not read what only its machine knows: {0:#}")]
     Discovery(#[from] DiscoveryError),
-
-    /// The directory rejected this process's first registration.
-    ///
-    /// This variant uses `source` because a generic `from` implementation
-    /// would overlap the conversions for the concrete variants.
-    #[error("node registration failed: {0:#}")]
-    Directory(#[source] E),
 
     /// The destination limits were invalid.
     #[error("the destination fleet could not be built: {0:#}")]

@@ -2,6 +2,7 @@
 //! keyed-state commit oracle depends on.
 
 use crate::Codec;
+use crate::PeerConfiguration;
 use crate::consumer::middleware::deduplication::DeduplicationConfiguration;
 use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::consumer::middleware::monopolization::MonopolizationConfiguration;
@@ -298,6 +299,8 @@ pub struct CommonConfiguration {
     /// Keyed-state configuration (mode-independent, always-on; inert when no
     /// collections are registered).
     pub keyed_state: KeyedStateConfiguration,
+    /// How this process joins the peer fleet, or `None` when it joins none.
+    pub peer: Option<PeerConfiguration>,
 }
 
 /// Configuration for middleware specific to pipeline consumers.

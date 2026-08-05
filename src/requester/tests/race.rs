@@ -257,7 +257,7 @@ async fn shutdown_discards_partial_results() -> Result<()> {
         "the call must park while one subsystem is still unanswered"
     );
 
-    registry.shutdown().await;
+    registry.terminate().await;
     let Err(RequestError::ShuttingDown) = call.await else {
         bail!("shutdown must fail the call rather than return one answer");
     };

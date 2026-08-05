@@ -113,14 +113,7 @@ impl Default for FleetConfiguration {
 impl FleetConfiguration {
     /// Creates a configuration builder.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no caller yet: consumer wiring will let an operator build a fleet \
-                      configuration; every other item in this module has one"
-        )
-    )]
+    #[cfg(test)]
     pub(crate) fn builder() -> FleetConfigurationBuilder {
         FleetConfigurationBuilder::default()
     }

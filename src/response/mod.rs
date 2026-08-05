@@ -82,8 +82,8 @@ impl RequestId {
         not(test),
         expect(
             dead_code,
-            reason = "the requester is this constructor's production caller; it is exercised by \
-                      this module's tests"
+            reason = "the requester client waits for the production request entry point; its \
+                      tests exercise this constructor"
         )
     )]
     pub(crate) fn new() -> Self {
@@ -124,8 +124,8 @@ impl From<RequestId> for Uuid {
     not(test),
     expect(
         dead_code,
-        reason = "the peer service is this enum's production caller; the mapping is exercised by \
-                  this module's tests"
+        reason = "some dispositions wait for the production requester and responder paths; this \
+                  module's tests exercise all variants"
     )
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,8 +159,8 @@ pub(crate) enum ResponseDisposition {
     not(test),
     expect(
         dead_code,
-        reason = "the peer service is this mapping's production caller; it is exercised by this \
-                  module's tests"
+        reason = "some dispositions wait for the production requester and responder paths; this \
+                  module's tests exercise the complete mapping"
     )
 )]
 impl ResponseDisposition {

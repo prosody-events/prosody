@@ -37,6 +37,8 @@ pub use crate::error::ErrorCategory;
 
 // ── Wire up the high-level client ────────────────────────────────────────────
 
+/// Peer listener, routing, and request configuration.
+pub use crate::PeerConfiguration;
 /// Cassandra connection configuration (required for production timer storage).
 pub use crate::cassandra::config::CassandraConfigurationBuilder;
 /// Consumer bootstrap and subscription configuration.

@@ -8,16 +8,7 @@
 //! its whole life. That is why a backend needs no lightweight transaction and
 //! nothing to fence: every write is an unconditional upsert or delete.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the destination fleet and the process runtime are this module's production \
-                  callers; every item here is exercised by this module's tests"
-    )
-)]
-
-use crate::router::{Host, LABEL_CAPACITY, NodeId};
+use crate::router::{Host, LABEL_CAPACITY, NodeId, label_fits};
 use fixedstr::Flexstr;
 use std::error::Error;
 use std::future::Future;
@@ -26,7 +17,6 @@ pub(crate) mod cache;
 pub(crate) mod cassandra;
 mod lease;
 
-#[cfg(test)]
 pub(crate) mod memory;
 
 #[cfg(test)]
@@ -35,7 +25,7 @@ pub(crate) mod tests;
 /// The lease lives in its own module so that no write site is a descendant of
 /// it. Its range is then the constructor's alone, rather than a convention the
 /// write sites keep.
-pub(crate) use self::lease::RegistrationTtl;
+pub(crate) use self::lease::{RegistrationTtl, RegistrationTtlError};
 
 /// Where a process can be reached: a host and the port peers dial there.
 ///
@@ -65,6 +55,19 @@ pub(crate) type NetworkId = Flexstr<LABEL_CAPACITY>;
 pub(crate) struct GroupMembership {
     pub(crate) cluster: Flexstr<LABEL_CAPACITY>,
     pub(crate) group: Flexstr<LABEL_CAPACITY>,
+}
+
+impl GroupMembership {
+    /// Builds a membership when both labels fit the directory label bound.
+    ///
+    /// `Flexstr::make` truncates long labels. This function rejects them
+    /// instead.
+    pub(crate) fn checked(cluster: &str, group: &str) -> Option<Self> {
+        (label_fits(cluster) && label_fits(group)).then(|| Self {
+            cluster: Flexstr::make(cluster),
+            group: Flexstr::make(group),
+        })
+    }
 }
 
 /// One live process, as the directory publishes it.

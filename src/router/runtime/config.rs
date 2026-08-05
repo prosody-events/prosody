@@ -1,7 +1,7 @@
 //! What an operator sets for peer routing, and the rules that refuse a
 //! degenerate value at startup.
 
-use crate::router::MAX_LABEL_BYTES;
+use crate::router::label_fits;
 use derive_builder::Builder;
 use validator::{Validate, ValidationError};
 
@@ -65,6 +65,7 @@ impl Default for RouterConfiguration {
 impl RouterConfiguration {
     /// Creates a configuration builder.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn builder() -> RouterConfigurationBuilder {
         RouterConfigurationBuilder::default()
     }
@@ -73,9 +74,10 @@ impl RouterConfiguration {
 /// Refuses a blank label and one longer than a host or network name may be.
 /// An absent label never reaches this function.
 ///
-/// It is the one label rule this crate publishes under. Discovery holds the
-/// machine name to it as well, so a configured host and a discovered one are
-/// accepted on the same terms.
+/// The rule itself is [`label_fits`], which the directory's checked group
+/// constructor also reads. This function is its `validator` adapter, so a
+/// configured host, a discovered machine name and a published group label are
+/// all accepted on the same terms.
 ///
 /// A `length` rule cannot replace this one: `validator` counts characters,
 /// while [`MAX_LABEL_BYTES`] is the byte capacity that keeps a label inline in
@@ -88,7 +90,7 @@ pub(super) fn validate_label(label: &str) -> Result<(), ValidationError> {
     if label.is_empty() {
         return Err(ValidationError::new("label_empty"));
     }
-    if label.len() > MAX_LABEL_BYTES {
+    if !label_fits(label) {
         return Err(ValidationError::new("label_too_long"));
     }
     Ok(())

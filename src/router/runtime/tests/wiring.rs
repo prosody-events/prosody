@@ -9,7 +9,7 @@
 
 use super::super::{PeerInputs, PeerRuntime, RouterConfiguration};
 use super::{
-    ALPHA, CONTACT, LEASE, NUMERIC_CONTACT, TIMEOUT, frame_cap, header, listener, requester,
+    ALPHA, CONTACT, LEASE, TIMEOUT, frame_cap, header, listener, requester, start_runtime,
 };
 use crate::codec::Codec;
 use crate::requester::config::RequesterConfiguration;
@@ -79,16 +79,18 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
         let directory = cassandra_directory(LEASE).await?;
         let config = RouterConfiguration::builder().network(NETWORK).build()?;
         let requester = requester();
-        let runtime = PeerRuntime::start(PeerInputs {
-            directory: directory.clone(),
-            listener: listener().await?,
-            health: TestHealth::new(true, true),
-            contact: CONTACT,
-            group: None,
-            router: &config,
-            fleet: FleetConfiguration::default(),
-            requester: &requester,
-        })
+        let runtime = start_runtime(
+            PeerInputs {
+                directory: directory.clone(),
+                listener: listener().await?,
+                health: TestHealth::new(true, true),
+                probe: Some(CONTACT),
+                router: &config,
+                fleet: FleetConfiguration::default(),
+                requester: &requester,
+            },
+            None,
+        )
         .await?;
         let neighbour = NodeRegistration {
             node: NodeId::new(),
@@ -220,16 +222,18 @@ async fn start_over(
     let here = local(bound.address().port());
     let config = RouterConfiguration::default();
     let requester = requester();
-    let runtime = PeerRuntime::start(PeerInputs {
-        directory: directory.clone(),
-        listener: bound,
-        health: TestHealth::new(true, true),
-        contact: NUMERIC_CONTACT,
-        group: None,
-        router: &config,
-        fleet: FleetConfiguration::default(),
-        requester: &requester,
-    })
+    let runtime = start_runtime(
+        PeerInputs {
+            directory: directory.clone(),
+            listener: bound,
+            health: TestHealth::new(true, true),
+            probe: Some(CONTACT),
+            router: &config,
+            fleet: FleetConfiguration::default(),
+            requester: &requester,
+        },
+        None,
+    )
     .await?;
     Ok((runtime, here))
 }

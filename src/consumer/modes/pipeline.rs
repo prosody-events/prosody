@@ -1,12 +1,12 @@
 //! The pipeline mode: retry, defer, and monopolization middleware layered
 //! outside the common block.
 
-use crate::consumer::ProsodyConsumer;
 use crate::consumer::config::{
     CommonConfiguration, ConsumerConfiguration, ConsumerSetup, PipelineMiddlewareConfiguration,
     TypedConsumerSetup,
 };
 use crate::consumer::error::ConsumerError;
+use crate::consumer::kafka_context::PartitionProviders;
 use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
 use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStoreProvider;
@@ -17,10 +17,12 @@ use crate::consumer::middleware::monopolization::MonopolizationMiddleware;
 use crate::consumer::middleware::retry::RetryMiddleware;
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::observer::KafkaObserver;
+use crate::consumer::wiring::peer::{NoPeer, prepare_requester};
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::{
     build_common_middleware, build_typed_state, cassandra_deps, memory_deps,
 };
+use crate::consumer::{Managers, ProsodyConsumer};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MessageLoader;
@@ -48,14 +50,14 @@ struct PipelineMiddlewareStack {
 }
 
 impl PipelineMiddlewareStack {
-    async fn into_consumer<T, MP, TP, DP, PP, SP, L, C>(
+    async fn into_consumer<T, MP, TP, DP, PP, SP, L, C, B>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
         dedup_provider: DP,
-        trigger_provider: PP,
-        state_provider: SP,
+        partition_providers: PartitionProviders<PP, SP>,
         handler: T,
+        backend: &B,
     ) -> Result<ProsodyConsumer<C>, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
@@ -69,6 +71,7 @@ impl PipelineMiddlewareStack {
         L: MessageLoader<Payload = C::Payload> + 'static,
         C: Codec,
         C::Payload: Send + Sync + 'static + EventIdentity + EventType + Clone,
+        B: ConsumerReaderBackend<C>,
     {
         let timer_defer_middleware = TimerDeferMiddleware::new(
             self.defer_config,
@@ -91,33 +94,53 @@ impl PipelineMiddlewareStack {
         // so every attempt is a fresh dispatch. The dedup filter sits INSIDE
         // message-defer so a deferred reload's duplicate check sees the reload
         // identity override.
-        let common_middleware = build_common_middleware::<DP, C::Payload>(
+        let common_middleware = build_common_middleware::<_, C::Payload>(
             &self.common_config,
             &self.consumer_config,
             self.telemetry.clone(),
             dedup_provider,
         )?;
-        let provider = common_middleware
+        let middleware = common_middleware
             .layer(self.monopolization_middleware)
             .layer(timer_defer_middleware)
             .layer(message_defer_middleware)
-            .layer(self.retry_middleware)
-            .into_provider(handler);
-
-        initialize_consumer::<_, _, _, C>(
-            &self.consumer_config,
-            provider,
-            trigger_provider,
-            state_provider,
-            StartupServices {
-                version,
-                telemetry: &self.telemetry,
-                heartbeats: self.heartbeats,
-                observer: self.observer,
-                responder: self.responder,
-            },
-        )
-        .await
+            .layer(self.retry_middleware);
+        let managers: Arc<Managers<C::Payload>> = Arc::default();
+        let provider = middleware.into_provider(handler);
+        let services = StartupServices {
+            version,
+            telemetry: &self.telemetry,
+            heartbeats: self.heartbeats,
+            observer: self.observer,
+            managers: Arc::clone(&managers),
+            responder: self.responder,
+        };
+        // Preparation is the last fallible step of this mode: no `?` after it
+        // could drop a served listener.
+        match self.common_config.peer.as_ref() {
+            Some(peer) => {
+                let attach =
+                    prepare_requester(peer, backend, managers, &services.heartbeats).await?;
+                Box::pin(initialize_consumer::<_, _, _, C, _>(
+                    &self.consumer_config,
+                    provider,
+                    partition_providers,
+                    services,
+                    attach,
+                ))
+                .await
+            }
+            None => {
+                Box::pin(initialize_consumer::<_, _, _, C, _>(
+                    &self.consumer_config,
+                    provider,
+                    partition_providers,
+                    services,
+                    NoPeer,
+                ))
+                .await
+            }
+        }
     }
 }
 
@@ -223,13 +246,16 @@ where
             &stack.telemetry,
         )?;
         stack
-            .into_consumer::<_, _, _, _, _, _, _, C>(
+            .into_consumer::<_, _, _, _, _, _, _, C, B>(
                 message_defer,
                 components.timers,
                 components.dedup,
-                components.trigger,
-                components.state,
+                PartitionProviders {
+                    triggers: components.trigger,
+                    state: components.state,
+                },
                 handler,
+                setup.deps.backend().as_ref(),
             )
             .await
     }

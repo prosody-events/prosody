@@ -4,8 +4,8 @@
     not(test),
     expect(
         dead_code,
-        reason = "the process client wiring and peer listener are this module's production \
-                  callers; the requester tests exercise every item"
+        reason = "the pending registry is live; the requester client waits for the production \
+                  request entry point"
     )
 )]
 

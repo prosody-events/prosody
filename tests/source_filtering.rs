@@ -124,7 +124,8 @@ async fn run_scenario(
     // Shutdown the consumer and delete the topic on every path — an early
     // return above would leak rdkafka threads that hang the test binary and
     // orphan the topic.
-    consumer.shutdown().await;
+    let shutdown = consumer.shutdown().await;
     admin_client.delete_topic(&topic).await?;
+    shutdown?;
     outcome
 }

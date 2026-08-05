@@ -6,15 +6,6 @@
 //! correct even where the labels are unset, wrong, or disagreed upon, which is
 //! what makes it the fallback that always works.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no production caller yet: consumer wiring will own the process runtime; every \
-                  item here is exercised by this module's tests"
-    )
-)]
-
 use crate::router::fleet::{Destination, DestinationFleet, Refusal};
 use crate::router::{Framed, NodeId, RelayHop, ResponseSender, SendFailure};
 use std::sync::Arc;

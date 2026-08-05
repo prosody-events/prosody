@@ -267,7 +267,10 @@ where
                 monopolization,
                 defer,
                 common,
-            } => ProsodyConsumer::<C>::pipeline_consumer_with_backend::<T, B::Reader>(
+            } => Box::pin(ProsodyConsumer::<C>::pipeline_consumer_with_backend::<
+                T,
+                B::Reader,
+            >(
                 deps::consumer_setup::<C, B>(consumer, common, &shared),
                 PipelineMiddlewareConfiguration {
                     retry: retry.clone(),
@@ -276,7 +279,7 @@ where
                 },
                 self.telemetry.clone(),
                 handler.clone(),
-            )
+            ))
             .await
             .map_err(Into::into),
             ModeConfiguration::LowLatency {
@@ -284,7 +287,10 @@ where
                 retry,
                 failure_topic,
                 common,
-            } => ProsodyConsumer::low_latency_consumer_with_backend::<T, B::Reader>(
+            } => Box::pin(ProsodyConsumer::low_latency_consumer_with_backend::<
+                T,
+                B::Reader,
+            >(
                 deps::consumer_setup::<C, B>(consumer, common, &shared),
                 LowLatencyMiddlewareConfiguration {
                     retry: retry.clone(),
@@ -293,15 +299,15 @@ where
                 self.producer.clone(),
                 self.telemetry.clone(),
                 handler.clone(),
-            )
+            ))
             .await
             .map_err(Into::into),
             ModeConfiguration::BestEffort { consumer, common } => {
-                ProsodyConsumer::<C>::best_effort_consumer::<T, B::Reader>(
+                Box::pin(ProsodyConsumer::<C>::best_effort_consumer::<T, B::Reader>(
                     deps::consumer_setup::<C, B>(consumer, common, &shared),
                     self.telemetry.clone(),
                     handler.clone(),
-                )
+                ))
                 .await
                 .map_err(Into::into)
             }
@@ -355,7 +361,7 @@ where
         };
 
         info!("shutting down consumer");
-        consumer.shutdown().await;
+        consumer.shutdown().await?;
         Ok(())
     }
 

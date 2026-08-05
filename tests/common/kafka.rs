@@ -165,7 +165,9 @@ impl ConsumerEnv {
     /// Callers must invoke this before propagating a test failure — dropping
     /// a live consumer leaves rdkafka threads hanging.
     pub(crate) async fn shutdown(self) {
-        self.consumer.shutdown().await;
+        if let Err(error) = self.consumer.shutdown().await {
+            error!(%error, "Failed to shut down consumer");
+        }
         if let Err(e) = self.admin.delete_topic(&self.topic).await {
             error!("Failed to clean up topic {}: {e}", self.topic);
         }

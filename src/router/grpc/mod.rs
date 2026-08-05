@@ -15,15 +15,6 @@
 //! subsystem it names and the registry that waits for it appear under this
 //! module and nowhere else in the router.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no production caller yet: consumer wiring will own the process runtime; every \
-                  item here is exercised by this module's and the process runtime's tests"
-    )
-)]
-
 pub(crate) mod client;
 pub(crate) mod codec;
 mod conn;
@@ -227,6 +218,7 @@ impl Default for TransportConfiguration {
 impl TransportConfiguration {
     /// Creates a transport configuration builder.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn builder() -> TransportConfigurationBuilder {
         TransportConfigurationBuilder::default()
     }
@@ -274,11 +266,13 @@ impl TransportCounters {
     }
 
     /// How often the peer method ran, whatever it then answered.
+    #[cfg(test)]
     pub(crate) fn served(&self) -> u64 {
         self.served.load(Relaxed)
     }
 
     /// How many connections were refused over the concurrency cap.
+    #[cfg(test)]
     pub(crate) fn refused_connections(&self) -> u64 {
         self.refused_connections.load(Relaxed)
     }
@@ -288,11 +282,13 @@ impl TransportCounters {
     /// Both refusals are here: a frame the reader could not read, and one over
     /// the configured ceiling, which the transport refuses above the reader and
     /// [`Counted`] counts from its answer.
+    #[cfg(test)]
     pub(crate) fn rejected_frames(&self) -> u64 {
         self.rejected_frames.load(Relaxed)
     }
 
     /// How many frames named a node other than this one.
+    #[cfg(test)]
     pub(crate) fn misrouted(&self) -> u64 {
         self.misrouted.load(Relaxed)
     }
@@ -303,6 +299,7 @@ impl TransportCounters {
     /// then found no capacity, no target or no time left is here too. Every one
     /// of them is in [`misrouted`](Self::misrouted) as well: a frame sent on is
     /// a frame that named another node.
+    #[cfg(test)]
     pub(crate) fn forwarded(&self) -> u64 {
         self.forwarded.load(Relaxed)
     }

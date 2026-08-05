@@ -5,6 +5,7 @@
 //! methods for building and accessing configuration details. It also includes a
 //! custom error type for handling configuration-related errors.
 
+use crate::PeerConfiguration;
 use crate::Topic;
 use crate::cassandra::{CassandraConfiguration, config::CassandraConfigurationBuilderError};
 use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
@@ -63,6 +64,8 @@ pub struct ConsumerBuilders {
     /// Keyed-state configuration (always-on; carries collection
     /// registrations). Mode-independent — every mode threads it through.
     pub keyed_state: KeyedStateConfiguration,
+    /// Peer configuration, or `None` when this process joins no peer fleet.
+    pub peer: Option<PeerConfiguration>,
     /// Telemetry emitter configuration.
     pub emitter: TelemetryEmitterConfiguration,
 }
@@ -92,6 +95,7 @@ impl ConsumerBuilders {
             dedup: DeduplicationConfigurationBuilder::default(),
             timeout: TimeoutConfigurationBuilder::default(),
             keyed_state: KeyedStateConfiguration::builder().build()?,
+            peer: None,
             emitter: TelemetryEmitterConfiguration::default(),
         })
     }
@@ -172,6 +176,7 @@ impl ModeConfiguration {
             timeout,
             dedup,
             keyed_state: builders.keyed_state.clone(),
+            peer: builders.peer.clone(),
         };
 
         Ok(match params.mode {
