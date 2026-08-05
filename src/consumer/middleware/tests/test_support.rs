@@ -29,7 +29,6 @@ use crate::consumer::{Keyed, Uncommitted};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::{MemoryLoader, MessageLoader};
 use crate::state::cell::Committed;
-use crate::state::cell_key::{CellKey, Coordinate, Section};
 use crate::state::descriptor::tests::{FixedOracle, TestSession, test_session_parts};
 use crate::state::descriptor::{Registered, StateDescriptor, ValueDescriptor, value_state};
 use crate::state::dirty::DirtyStore;
@@ -1110,14 +1109,10 @@ pub async fn committed_json_value(
     name: &str,
 ) -> color_eyre::Result<Option<Value>> {
     let id = CollectionId::new(state_key, StateType::Application, StateName::try_new(name)?);
-    let cell = CellKey {
-        section: Section::new(0),
-        coordinate: Coordinate::empty(),
-    };
     let probe = EventRef::Message {
         dedup_id: Uuid::from_u128(u128::MAX),
     };
-    match Committed::into_inner(cell_store.get(&id, &cell, probe).await?) {
+    match Committed::into_inner(cell_store.get(&id, &value_cell(), probe).await?) {
         Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         None => Ok(None),
     }

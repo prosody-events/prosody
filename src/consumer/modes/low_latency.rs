@@ -91,6 +91,9 @@ where
 
     /// Creates a low-latency consumer that answers peer requests.
     ///
+    /// The answer moves the handler's final result, so an answered record fires
+    /// no `after_commit` on `handler`. See [`FallibleHandler`].
+    ///
     /// # Errors
     ///
     /// Returns [`PeerInitError::PeerRequired`] without peer configuration.

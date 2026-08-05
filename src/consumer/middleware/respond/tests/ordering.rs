@@ -53,7 +53,9 @@ fn the_response_leaves_only_after_the_durable_commit() -> Result<()> {
                 "a response left before the durable commit"
             );
 
-            let _send_result = release.send(());
+            if release.send(()).is_err() {
+                bail!("the guard stopped waiting before the release");
+            }
             settled.await;
             Ok::<(), Report>(())
         }

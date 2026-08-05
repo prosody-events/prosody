@@ -1,6 +1,8 @@
-use super::{RequestId, ResponseDisposition};
+use super::{RequestId, ResponseDisposition, ResponseStatus, SUCCESS};
+use crate::error::ErrorCategory;
 use crate::test_util::assert_distinct_labels;
 use color_eyre::Result;
+use color_eyre::eyre::ensure;
 use strum::VariantArray;
 use tonic::Code;
 use uuid::{Uuid, Version};
@@ -55,19 +57,61 @@ fn each_disposition_reports_its_documented_status() {
     }
 }
 
-/// Every disposition counts under its own label, so one answer can never be
-/// read as another in a dashboard.
+/// Every disposition counts under its own label and answers the sender in its
+/// own words. So one answer can never be read as another, in a dashboard or on
+/// the wire.
 ///
 /// That an arriving frame reaches no label at all is the receive leg's own
 /// claim, pinned by `every_answer_counts_once_under_a_fixed_label` in
 /// `src/router/grpc/tests/metrics.rs`.
 #[test]
-fn each_disposition_has_a_distinct_label() -> Result<()> {
+fn each_disposition_has_a_distinct_label_and_message() -> Result<()> {
     assert_distinct_labels(
         ResponseDisposition::VARIANTS
             .iter()
             .map(|disposition| disposition.label()),
-    )
+    )?;
+    let mut seen: Vec<&str> = Vec::new();
+    for disposition in ResponseDisposition::VARIANTS {
+        let message = disposition.message();
+        ensure!(!message.is_empty(), "{disposition:?} answers with nothing");
+        ensure!(
+            !seen.contains(&message),
+            "{message:?} answers more than one disposition"
+        );
+        seen.push(message);
+    }
+    Ok(())
+}
+
+/// A response status round trips through its wire discriminant, and no error
+/// category claims the success discriminant.
+///
+/// The two conversions read one `SUCCESS` const, so this proves the whole
+/// mapping. A fourth [`ErrorCategory`] given `4` would read a handler failure
+/// back as a success, and the second half of this test refuses it.
+#[test]
+fn every_response_status_round_trips_and_none_collides_with_success() -> Result<()> {
+    let statuses = [ResponseStatus::Success].into_iter().chain(
+        ErrorCategory::VARIANTS
+            .iter()
+            .copied()
+            .map(ResponseStatus::Error),
+    );
+    for status in statuses {
+        let wire = i32::from(status);
+        ensure!(
+            ResponseStatus::try_from(wire)? == status,
+            "{status:?} did not survive its wire form {wire}"
+        );
+    }
+    for category in ErrorCategory::VARIANTS {
+        ensure!(
+            i32::from(*category) != SUCCESS,
+            "{category:?} claims the success discriminant"
+        );
+    }
+    Ok(())
 }
 
 /// Request ids are `UUIDv7`, so the id a trace carries places the request in

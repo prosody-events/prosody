@@ -21,6 +21,13 @@ pub(crate) const RESPONSE_PROTOCOL_VERSION: u32 = 1;
 /// Longest [`Codec::FORMAT_ID`](crate::Codec::FORMAT_ID) a frame may carry.
 pub(crate) const FORMAT_MAX_BYTES: usize = 128;
 
+/// The wire discriminant of a successful result.
+///
+/// Named once, so both directions of [`ResponseStatus`]'s conversion read the
+/// same value. [`ErrorCategory`] reserves it, and a test pins that no category
+/// claims it.
+const SUCCESS: i32 = 4;
+
 /// The format token a frame's payload was encoded with, bounded by
 /// [`FORMAT_MAX_BYTES`].
 pub(crate) type FormatToken = Flexstr<{ FORMAT_MAX_BYTES + 1 }>;
@@ -50,7 +57,7 @@ pub(crate) enum ResponseStatus {
 impl From<ResponseStatus> for i32 {
     fn from(status: ResponseStatus) -> Self {
         match status {
-            ResponseStatus::Success => 4,
+            ResponseStatus::Success => SUCCESS,
             ResponseStatus::Error(category) => Self::from(category),
         }
     }
@@ -60,7 +67,7 @@ impl TryFrom<i32> for ResponseStatus {
     type Error = UnknownErrorCategory;
 
     fn try_from(value: i32) -> Result<Self, UnknownErrorCategory> {
-        if value == 4 {
+        if value == SUCCESS {
             Ok(Self::Success)
         } else {
             ErrorCategory::try_from(value).map(Self::Error)
@@ -78,14 +85,6 @@ pub(crate) struct RequestId(Uuid);
 
 impl RequestId {
     /// Mints an id for one request.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the requester client waits for the production request entry point; its \
-                      tests exercise this constructor"
-        )
-    )]
     pub(crate) fn new() -> Self {
         Self(Uuid::now_v7())
     }
@@ -120,13 +119,6 @@ impl From<RequestId> for Uuid {
 /// [`Accepted`](Self::Accepted) names `OK`. There is deliberately no status
 /// field in the response body: with no body at all, success is carried in the
 /// HTTP/2 trailer and cannot be produced by an omitted field.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "request outcome variants with no production constructor remain test-only"
-    )
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(strum::VariantArray))]
 pub(crate) enum ResponseDisposition {
@@ -154,13 +146,6 @@ pub(crate) enum ResponseDisposition {
     Unreachable,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "status mappings for test-only request outcomes remain test-only"
-    )
-)]
 impl ResponseDisposition {
     /// The gRPC status this disposition is reported as.
     ///
@@ -168,16 +153,11 @@ impl ResponseDisposition {
     /// so a disposition added later cannot reach the wire without being given a
     /// status here.
     ///
-    /// Three of these are also the answer of a process that is not the target:
-    /// a relay refuses a frame it may not send on with
-    /// [`AlreadyRelayed`](Self::AlreadyRelayed), and refuses one it cannot send
-    /// on with [`NoRelayCapacity`](Self::NoRelayCapacity) or
-    /// [`RelayDeadlineExceeded`](Self::RelayDeadlineExceeded). Their statuses
-    /// are shared with a verdict the target itself gives, and nothing on the
-    /// wire says which process answered — so a sender reads any of them as the
-    /// endpoint's own word and stops there. That is the deliberate cost of
-    /// naming each outcome by what gRPC statuses mean rather than by who sent
-    /// it; a per-process origin would need a wire field.
+    /// A relay answers some of these, and the target answers the same statuses.
+    /// Nothing on the wire says which process spoke, so a sender reads every
+    /// status as the endpoint's own word. A per-process origin would need a
+    /// wire field, and this mapping names each outcome by what gRPC statuses
+    /// mean rather than by who sent it.
     pub(crate) const fn status(self) -> Code {
         match self {
             Self::Accepted => Code::Ok,

@@ -550,6 +550,10 @@ macro_rules! impl_subscribe {
 
             /// Subscribes a consumer that answers peer requests.
             ///
+            /// The answer moves the handler's final result, so an answered
+            /// record fires no `after_commit` on `handler`. See
+            /// [`FallibleHandler`](crate::consumer::middleware::FallibleHandler).
+            ///
             /// # Errors
             ///
             /// Returns an error when the consumer is unconfigured, already

@@ -288,10 +288,8 @@ where
 
 /// Prepares a peer that also answers requests for `subsystem`.
 ///
-/// This function takes the subsystem by value. Thus, preparation cannot start
-/// without a subsystem. It reads the frame cap from the prepared runtime, so
-/// the listener and sender use one ceiling. A responder failure releases the
-/// prepared peer.
+/// It reads the frame cap from the prepared runtime, so the listener and sender
+/// use one ceiling. A responder failure releases the prepared peer.
 ///
 /// # Errors
 ///
@@ -309,11 +307,7 @@ where
     P: Send + Sync + 'static,
 {
     let mut peer = prepare_requester(peer, backend, managers, heartbeats).await?;
-    let responder = Responder::new(
-        &peer.prepared.router(),
-        peer.prepared.frame_cap(),
-        subsystem,
-    );
+    let responder = Responder::new(peer.prepared.router(), peer.prepared.frame_cap(), subsystem);
     match responder {
         Ok((responder, workers)) => {
             peer.workers = Some(workers);

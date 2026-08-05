@@ -62,8 +62,8 @@ fn the_method_path_names_the_generated_service() -> Result<()> {
 /// while `UNAVAILABLE` may or may not have landed and is.
 ///
 /// The count is taken at the service, after the network, so no client-side
-/// bookkeeping can stand in for it, and it is read after `drain`, which awaits
-/// every worker.
+/// bookkeeping can stand in for it, and it is read after the worker join, which
+/// returns once every worker has finished.
 #[test]
 fn a_terminal_status_is_attempted_once_and_an_ambiguous_one_is_retried() -> Result<()> {
     init_test_logging();

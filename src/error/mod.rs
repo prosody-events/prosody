@@ -20,6 +20,7 @@ pub mod kafka;
 
 /// Categorizes errors in message processing.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(test, derive(strum::VariantArray))]
 #[serde(rename_all = "camelCase")]
 pub enum ErrorCategory {
     /// Error is temporary and recovery is possible.

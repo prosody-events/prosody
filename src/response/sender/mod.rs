@@ -64,16 +64,19 @@ pub(crate) struct TypedSender<C: Codec> {
 
 /// The response delivery workers, joined once every send handle is gone.
 ///
-/// This value holds no sender. A worker ends when the last [`Sender`] clone for
-/// its queue drops, and every one of those lives inside a responder clone a
-/// partition handler holds. So the join is what waits for delivery, and the
-/// drop of the last responder is what starts it.
+/// This value holds no sender. Each queue has exactly one [`Sender`], all of
+/// them live in the [`TypedSender`] this value was built beside, and that
+/// sender is never cloned. A worker ends when its queue closes, so every worker
+/// ends together with that one sender. In a consumer the sender sits inside the
+/// shared responder, which a partition handler clones instead. The drop of the
+/// last responder clone therefore starts the join.
 ///
 /// No deadline guards the join. The shutdown order is the whole guarantee:
 /// [`ProsodyConsumer::shutdown`](crate::consumer::ProsodyConsumer::shutdown)
 /// sweeps every partition manager before the peer teardown runs, which is what
 /// makes the wait finite. A consumer dropped without that shutdown runs no
 /// sweep; that consumer's `Drop` states what it leaves behind.
+#[must_use = "dropping this detaches every delivery worker, so the wait is lost"]
 pub(crate) struct ResponseWorkers(Box<[JoinHandle<()>]>);
 
 /// What one sender's deliveries came to.
@@ -82,13 +85,13 @@ pub(crate) struct ResponseWorkers(Box<[JoinHandle<()>]>);
 /// destination's queue could not take moves `dropped` alone, because no worker
 /// ever sees it.
 ///
-/// This is the in-process account, which this module's suites assert on. The
+/// This is the in-process account, which the delivery suites assert on. The
 /// operator's account is in [`metrics`], and it names each outcome rather than
 /// totalling two.
 ///
-/// A log of these totals at [`ResponseWorkers::join`] was examined and
-/// rejected. It would give the accessors a production reader, and [`metrics`]
-/// already names every outcome.
+/// The suites need both. A process installs one meter provider, so concurrent
+/// suites cannot attribute a [`metrics`] series to one sender; these counters
+/// are per sender.
 #[derive(Debug, Default)]
 pub(crate) struct SendCounters {
     sent: AtomicU64,
@@ -97,6 +100,9 @@ pub(crate) struct SendCounters {
 
 impl<C: Codec> TypedSender<C> {
     /// Builds a sender over `router`'s fleet, with `cap` as the frame ceiling.
+    ///
+    /// Returns the sender and its [`ResponseWorkers`]. The caller owes that
+    /// second value the join, in the order [`ResponseWorkers`] states.
     ///
     /// One queue, one codec and one encode scratch at the cap are built here
     /// per fleet cell, and one worker is spawned to drive each of them. A send

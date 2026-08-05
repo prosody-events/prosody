@@ -293,11 +293,12 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
     ///
     /// Read this value before activation because the responder must exist
     /// before the Kafka client starts.
-    pub(crate) fn router(&self) -> RouterHandle<GrpcSender, D> {
-        self.router.clone()
+    pub(crate) const fn router(&self) -> &RouterHandle<GrpcSender, D> {
+        &self.router
     }
 
-    /// Returns the frame ceiling that the listener uses.
+    /// Returns the one frame ceiling this process uses, so a responder's
+    /// encoder and the listener never disagree about it.
     pub(crate) const fn frame_cap(&self) -> FrameCap {
         self.frame_cap
     }
@@ -348,8 +349,10 @@ impl<D: NodeDirectory> PeerRuntime<D> {
     /// Takes `self`, so a second shutdown is unwritable and no handle has to be
     /// taken out from behind a lock. `drain` is a closure rather than a future,
     /// so this call alone decides when the drain starts. It runs it once the
-    /// gate has closed and emptied. Response workers hold no sender, so the
-    /// caller can join each worker set only once.
+    /// gate has closed and emptied. A drain that joins response workers
+    /// terminates only after the last send handle drops; that precondition
+    /// belongs to
+    /// [`ResponseWorkers`](crate::response::sender::ResponseWorkers).
     ///
     /// The body reads as the order. Three of its steps are where they are for a
     /// reason the code cannot show:
@@ -393,7 +396,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         } = self;
 
         // Neither needs a step: the resolver only reads, and the transport the
-        // router carries is cloned into every sender the drain flushes.
+        // router carries is already cloned into every response delivery worker.
         drop((addresses, router));
         // `send_replace` rather than `send`: a refresh task that already exited
         // leaves no receiver, and that is not a failure.
@@ -408,9 +411,9 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         fleet.close().await;
         // A `Drained` token minted by the close, and demanded by every drain,
         // would make the reversed order uncompilable. It was examined and
-        // rejected: a caller that flushes one sender outside process shutdown
-        // holds no token to give it, so the token would reach callers that
-        // never close a fleet.
+        // rejected: a consumer that abandons a prepared peer joins its response
+        // workers and closes no fleet, so the token would reach a caller that
+        // holds none.
         drain().await;
         if let Err(error) = listener.await {
             error!(%error, "the peer listener task did not exit cleanly");

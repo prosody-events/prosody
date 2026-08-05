@@ -7,10 +7,19 @@
 //! [`after_commit`](FallibleHandler::after_commit) and nowhere else — moves
 //! the typed result into a destination slot.
 //!
-//! **Which apply hook fired decides whether a response happens.** The layer
-//! never reads an error category to make that decision, so a transient failure
-//! that exhausts its retries answers its requester while the attempts before it
-//! stay silent. The category rides the frame as a label only.
+//! **A dispatch that never reaches the final apply hook is never answered.**
+//! The layer never reads an error category to make that decision, so a
+//! transient failure that exhausts its retries answers its requester while the
+//! attempts before it stay silent. The category rides the frame as a label
+//! only.
+//!
+//! Three live paths commit a tagged record and answer nothing. The dedup layer
+//! fires no inner hook for a duplicate, so a redelivery of an answered record
+//! stays silent and its requester waits out its own deadline. A send this layer
+//! cannot queue — the fleet refuses a slot, or the destination's queue is full
+//! — returns the result to the inner hook instead. A crash between the durable
+//! commit and this hook loses the answer, and the marker suppresses the
+//! redelivery. A requester therefore always needs its own deadline.
 //!
 //! [`responding_provider`] is the only way to build the layer from outside this
 //! module, and it states what that placement guarantees. Its production caller
@@ -70,15 +79,9 @@ pub(crate) struct Responder<C: Codec> {
 /// in one task and sent from another, and a span finishes when any clone of it
 /// finishes.
 ///
-/// The capture happens at dispatch entry, while the processing state is live,
-/// so `message.span()` is never `Span::none()` and the response leg can never
-/// open as a root of a trace of its own.
-///
-/// Which trace that is follows the message span. Under the default message
-/// relation the message span is a child of the requester's own span, so the
-/// answer lands in the caller's trace. An operator who asks for follows-from
-/// message spans puts message work in a linked trace of its own, and the answer
-/// follows the message there.
+/// The capture happens while the message's processing state is still live, so
+/// `message.span()` is never `Span::none()` and the response leg can never open
+/// as a root of a trace of its own.
 ///
 /// One per in-flight event, and both exits are here:
 /// [`after_commit`](FallibleHandler::after_commit) moves it into the sender,
@@ -128,6 +131,9 @@ pub(crate) struct RespondHandler<H, C: Codec> {
 
 impl<C: Codec> Responder<C> {
     /// Builds a responder from the process router and the response frame cap.
+    ///
+    /// Returns the responder and its [`ResponseWorkers`], which owns the order
+    /// the caller must join them in.
     pub(crate) fn new<R: Router>(
         router: &R,
         cap: FrameCap,

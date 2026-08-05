@@ -243,8 +243,8 @@ fn a_response_crosses_two_networks_through_a_relay() -> Result<()> {
 ///
 /// The responder's own fleet and transport are the production ones, so the
 /// response is queued, paced, framed and dialed exactly as a responder does it.
-/// `drain` returns once every worker has finished, so what the target holds is
-/// settled without waiting on a clock.
+/// The worker join returns once every worker has finished, so what the target
+/// holds is settled without waiting on a clock.
 async fn crossing(pair: &Pair) -> Result<()> {
     let cap = FrameCap::new(CAP_BYTES)?;
     let request = awaited(&pair.target.registry)?;

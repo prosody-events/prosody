@@ -8,8 +8,7 @@
 // The `not(test)` gate is what makes this an *expectation* rather than a
 // blanket permission: it holds only while these items really are
 // production-dead, so the day the transport calls the last one, the gate
-// reports it unfulfilled and demands the attribute be deleted. The encoder
-// left this list that way.
+// reports it unfulfilled and demands the attribute be deleted.
 #![cfg_attr(
     not(test),
     expect(
