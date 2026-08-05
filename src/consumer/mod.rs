@@ -209,6 +209,19 @@ struct RuntimeState {
     peer: Option<PeerHandles>,
 }
 
+/// What one teardown still holds after the Kafka poll loop stops.
+///
+/// Only the caller that takes [`RuntimeState`] out of the shared mutex builds
+/// one, and exactly one caller ever does. So holding this value is what proves
+/// a caller owns the teardown, and every other caller gets `None` and touches
+/// nothing shared. Whether this consumer joined the peer fleet is the separate
+/// question `peer` answers.
+struct Teardown {
+    probe_server: Option<ProbeServer>,
+    observer: KafkaObserver,
+    peer: Option<PeerHandles>,
+}
+
 /// High-level Kafka consumer implementation.
 ///
 /// `ProsodyConsumer` is the main entry point for consuming messages from Kafka
@@ -292,50 +305,50 @@ impl<C: Codec> ProsodyConsumer<C> {
     /// Stops this consumer, in the one order that does not drop work it already
     /// owes.
     ///
-    /// It stops polling, waits for in-flight message processing, sweeps any
-    /// partition manager the final revoke left behind, and only then tears the
-    /// peer runtime down. The crate-internal `execute_shutdown` owns that
-    /// order and states why.
+    /// **This function owns the teardown order**, and its body reads as that
+    /// order:
+    ///
+    /// 1. Close peer request admission, so no new request enters while the
+    ///    handlers finish.
+    /// 2. Stop the poll loop and wait for in-flight message processing.
+    /// 3. Sweep every partition manager the final revoke left behind.
+    /// 4. Retire the observation gauges and stop the probe server.
+    /// 5. Tear the peer runtime down and report what it found.
+    ///
+    /// The peer runtime stays live through steps 1 to 4, because a partition
+    /// handler's commit hook can still queue an owed response. Tear the peer
+    /// down earlier and the process drops responses it already owes, and fails
+    /// requests it could still answer. Step 3 is what bounds step 5.
     ///
     /// This is the supported teardown, and it is the only one that waits. A
-    /// consumer that is dropped instead starts the same teardown and does not
-    /// wait for it.
+    /// consumer that is dropped instead runs every step but the sweep, and does
+    /// not wait for the peer teardown it starts.
     ///
     /// A second call, or a call on a clone whose sibling already ran, finds no
-    /// runtime state and answers `Ok(())`. That success is not an observation:
-    /// the other caller made it.
+    /// runtime state and answers `Ok(())` without touching anything shared.
+    /// That success is not an observation: the other caller made it.
     ///
     /// # Errors
     ///
     /// Returns [`ShutdownError`] when the peer teardown could not remove this
-    /// node from the directory, or could not report what it did. Both leave a
-    /// row that expires on its lease.
+    /// node from the directory, or could not report what it did. A row that
+    /// survives expires on its lease.
     pub async fn shutdown(mut self) -> Result<(), ShutdownError> {
-        let peer = self.execute_shutdown().await;
+        let Some(teardown) = self.stop_polling().await else {
+            return Ok(());
+        };
         self.drain_managers().await;
-        match peer {
+        match teardown.release().await {
             Some(peer) => peer.stop().await,
             None => Ok(()),
         }
     }
 
-    /// Stops every Kafka step, and hands the still-live peer handles back.
+    /// Closes peer request admission, stops the poll loop, and waits for it.
     ///
-    /// **This function owns the teardown order.** It closes peer request
-    /// admission first, so no new request enters while handlers finish. It then
-    /// stops the poll loop and waits for it. The peer runtime stays live
-    /// throughout, because a partition handler's commit hook can still queue an
-    /// owed response. Tear the peer down first and the process drops responses
-    /// it already owes, and fails requests it could still answer.
-    ///
-    /// It does not sweep the partition managers, and the caller does.
-    /// [`Drop`](Self::drop) runs this function through a foreign executor,
-    /// which cannot drive a spawned task on a current-thread runtime, and
-    /// `PartitionManager::shutdown` awaits one.
-    /// [`shutdown`](Self::shutdown) runs the sweep between this function and
-    /// the peer teardown, which keeps the sweep ahead of that teardown and adds
-    /// no await to `Drop`.
-    async fn execute_shutdown(&mut self) -> Option<PeerHandles> {
+    /// Answers `None` to every caller but the one that takes the runtime state,
+    /// so a losing caller runs no step of the teardown at all.
+    async fn stop_polling(&mut self) -> Option<Teardown> {
         let RuntimeState {
             poll_handle,
             probe_server,
@@ -351,16 +364,11 @@ impl<C: Codec> ProsodyConsumer<C> {
         if let Err(error) = poll_handle.await {
             error!("consumer shutdown failed: {error:#}");
         }
-
-        // The `BaseConsumer` is dropped inside the poll task, so its close-time
-        // polling — which can deliver one last statistics sample — finished
-        // before the join handle resolved. Nothing can record over this.
-        observer.retire_gauges();
-
-        if let Some(probe_server) = probe_server {
-            probe_server.shutdown().await;
-        }
-        peer
+        Some(Teardown {
+            probe_server,
+            observer,
+            peer,
+        })
     }
 
     /// Shuts down every partition manager the final revoke left behind.
@@ -369,6 +377,11 @@ impl<C: Codec> ProsodyConsumer<C> {
     /// the final revoke never dispatches then. Each retained manager holds a
     /// handler clone, so this drain is what bounds the peer teardown that
     /// follows. After a normal revoke the map is already empty.
+    ///
+    /// A `Swept` witness minted here and demanded by [`Teardown::release`]
+    /// would make the reversed order uncompilable. It was examined and
+    /// rejected: [`Drop`](Self::drop) releases without sweeping, so it would
+    /// hold no witness to give.
     async fn drain_managers(&self) {
         let draining: FuturesUnordered<_> = self
             .managers
@@ -380,13 +393,41 @@ impl<C: Codec> ProsodyConsumer<C> {
     }
 }
 
-/// Ensures graceful shutdown when the consumer is dropped.
+impl Teardown {
+    /// Retires the observation gauges, stops the probe server, and hands the
+    /// still-live peer handles back.
+    async fn release(self) -> Option<PeerHandles> {
+        // The `BaseConsumer` is dropped inside the poll task, so its close-time
+        // polling — which can deliver one last statistics sample — finished
+        // before the join handle resolved. Nothing can record over this.
+        self.observer.retire_gauges();
+
+        if let Some(probe_server) = self.probe_server {
+            probe_server.shutdown().await;
+        }
+        self.peer
+    }
+}
+
+/// Starts the teardown when a consumer is dropped without a shutdown.
 ///
-/// Dropping the peer stop sender starts peer teardown. `Drop` does not wait for
-/// it. A process that exits at once can leave a row until its lease expires.
+/// Dropping the peer stop sender starts the peer teardown. `Drop` does not wait
+/// for it, so a process that exits at once can leave a row until its lease
+/// expires.
+///
+/// `Drop` also runs no partition sweep, which
+/// [`shutdown`](ProsodyConsumer::shutdown) makes step 3. A foreign executor
+/// drives this path, and it cannot drive a spawned task on a current-thread
+/// runtime; `PartitionManager::shutdown` awaits one. So a teardown started here
+/// is not bounded by the sweep, and a manager the final revoke left behind can
+/// hold a response send handle open.
 impl<C: Codec> Drop for ProsodyConsumer<C> {
     fn drop(&mut self) {
-        drop(block_on(self.execute_shutdown()));
+        block_on(async {
+            if let Some(teardown) = self.stop_polling().await {
+                drop(teardown.release().await);
+            }
+        });
     }
 }
 

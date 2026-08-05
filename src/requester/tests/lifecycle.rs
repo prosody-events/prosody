@@ -176,6 +176,47 @@ async fn a_registration_after_shutdown_is_refused_and_leaves_nothing() -> Result
     Ok(())
 }
 
+/// Closing admission refuses the next request and leaves every live request
+/// open. Terminating then closes them.
+///
+/// This is what the split exists for: a consumer closes admission before its
+/// handlers finish, and terminates only after. A `close_admission` that also
+/// closed live entries would answer the first `accept` below with
+/// `UnknownRequest`.
+#[tokio::test(start_paused = true)]
+async fn closing_admission_keeps_live_requests_open() -> Result<()> {
+    let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
+    let awaited = names(&POOL[..1])?;
+    let registration = register(&registry, &awaited, TIMEOUT)?;
+    let id = registration.id();
+
+    registry.close_admission();
+
+    let refused = registry.register::<TestCodecError>(&awaited, TIMEOUT, TestCodec::FORMAT_ID);
+    let Err(RequestError::ShuttingDown) = refused else {
+        bail!("a closed registry must refuse a request that starts after it closed");
+    };
+    assert_eq!(
+        registry.len(),
+        1,
+        "closing admission removed a live request"
+    );
+    assert_eq!(
+        registry.accept(success(id, &awaited[0], VALUES[0])?),
+        ResponseDisposition::Accepted,
+        "closing admission refused an answer to a live request"
+    );
+
+    registry.terminate().await;
+    assert_eq!(registry.len(), 0, "terminate left a live request behind");
+    assert_eq!(
+        registry.accept(success(id, &awaited[0], VALUES[0])?),
+        ResponseDisposition::UnknownRequest,
+        "terminate left the request reachable"
+    );
+    Ok(())
+}
+
 /// Drives one generated terminal-transition trace.
 fn run_terminal(trace: TerminalTrace) -> Result<()> {
     let TerminalTrace {

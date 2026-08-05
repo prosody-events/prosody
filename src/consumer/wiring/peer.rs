@@ -85,8 +85,10 @@ impl PeerHandles {
     /// # Errors
     ///
     /// Returns [`ShutdownError::Directory`] when this node could not be
-    /// removed, and [`ShutdownError::Teardown`] when the coordinator ended
-    /// without a report. Both leave a row that expires on its lease.
+    /// removed, which leaves a row that expires on its lease. Returns
+    /// [`ShutdownError::Teardown`] when the coordinator ended without a report,
+    /// which leaves the outcome unknown: the delete runs before the steps that
+    /// follow it, so a row may or may not survive.
     pub(in crate::consumer) async fn stop(self) -> Result<(), ShutdownError> {
         let (reply, report) = oneshot::channel();
         // A closed receiver means the coordinator already ended, which the

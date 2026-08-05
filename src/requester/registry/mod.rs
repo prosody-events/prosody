@@ -248,7 +248,12 @@ impl PendingRegistry {
         }
     }
 
-    /// Refuses new requests.
+    /// Refuses new requests. Every live request stays open, and the deadline
+    /// sweep keeps running.
+    ///
+    /// This is a strict prefix of [`terminate`](Self::terminate). A shutdown
+    /// that must let in-flight work finish calls this first and `terminate`
+    /// last.
     pub(crate) fn close_admission(&self) {
         self.closed.store(true, Release);
     }

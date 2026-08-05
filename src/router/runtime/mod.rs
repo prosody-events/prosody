@@ -223,9 +223,9 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
     /// preparation leaves unset.
     ///
     /// A failed write issues one delete before it gives up. Node ids are minted
-    /// fresh and never reused, so this process is the only writer of its own
-    /// row and the delete can remove no other. The delete is best effort, not a
-    /// guarantee: a delete that also fails leaves a row that expires on its
+    /// fresh and never reused. So this process is the only writer of its own
+    /// row, and the delete can remove no other. The delete is best effort, not
+    /// a guarantee: a delete that also fails leaves a row that expires on its
     /// lease.
     ///
     /// # Errors

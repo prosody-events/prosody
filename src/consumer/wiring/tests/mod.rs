@@ -12,11 +12,13 @@ use crate::consumer::middleware::CloneProvider;
 use crate::consumer::middleware::deduplication::{
     DEFAULT_IDEMPOTENCE_VERSION, MemoryDeduplicationStoreProvider,
 };
+use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::{
     ConsumerConfiguration, ConsumerError, KafkaObserver, Managers, ProsodyConsumer,
 };
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
+use crate::otel::SpanRelation;
 use crate::router::NodeId;
 use crate::router::directory::memory::{MEMORY_DIRECTORY_CAPACITY, MemoryNodeDirectory};
 use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
@@ -25,18 +27,32 @@ use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state_reader::PeerDirectoryBackend;
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
+use crate::timers::duration::CompactDuration;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
 use crate::{JsonCodec, Partition, PeerConfiguration, Topic};
 use color_eyre::Result;
+use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 use serde_json::Value;
+use std::array::from_fn;
+use std::marker::PhantomData;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 mod lifecycle;
 
 const TOPIC: &str = "peer-lifecycle";
+
+/// The topic of the manager [`retain_manager`] leaves in the shared map. No
+/// rebalance names it, so only the shutdown sweep can end it.
+const RETAINED_TOPIC: &str = "peer-lifecycle-retained";
+
+/// The partition of that manager.
+const RETAINED_PARTITION: Partition = 0;
 
 type EventLog = Arc<Mutex<Vec<Event>>>;
 
@@ -46,6 +62,7 @@ enum Event {
     RegisterFailed { port: u16, port_held: bool },
     Deregistered,
     ProviderDropped,
+    ManagerSwept,
 }
 
 #[derive(Clone)]
@@ -67,6 +84,13 @@ struct RecordingProvider {
 
 #[derive(Clone)]
 struct SilentHandler;
+
+/// The handler of the retained partition manager. It records the one moment
+/// the shutdown sweep ends that manager.
+#[derive(Clone)]
+struct SweptHandler {
+    log: EventLog,
+}
 
 impl RecordingDirectory {
     fn new(log: EventLog, fail_register: bool) -> Self {
@@ -180,6 +204,88 @@ impl EventHandler for SilentHandler {
     }
 
     async fn shutdown(self) {}
+}
+
+impl EventHandler for SweptHandler {
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<Value>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        let (_, uncommitted) = message.into_inner();
+        uncommitted.commit().await;
+    }
+
+    async fn on_timer<C, T>(&self, _context: C, timer: T, _demand_type: DemandType)
+    where
+        C: EventContext<Payload = Self::Payload>,
+        T: UncommittedTimer,
+    {
+        timer.commit().await;
+    }
+
+    async fn shutdown(self) {
+        self.log.lock().push(Event::ManagerSwept);
+    }
+}
+
+/// Leaves one partition manager in the shared map that no rebalance will
+/// remove, so the shutdown sweep has something to shut down.
+///
+/// This is the state a failed `close_queue` leaves behind: rdkafka skips its
+/// close-poll loop, the final revoke never dispatches, and the manager stays.
+/// Its handler records the end of its task, which is what makes the sweep's
+/// position in the shutdown order observable.
+fn retain_manager(
+    config: &ConsumerConfiguration,
+    managers: &Managers<Value>,
+    log: EventLog,
+) -> Result<()> {
+    let keyed_state = KeyedStateInputs::new(
+        KeyedStateConfiguration::builder().build()?,
+        config,
+        DEFAULT_IDEMPOTENCE_VERSION,
+    )?;
+    let partition_config = PartitionConfiguration {
+        group_id: Arc::from(config.group_id.as_str()),
+        buffer_size: 1,
+        max_uncommitted: 1,
+        allowed_events: None,
+        shutdown_timeout: Duration::from_secs(1),
+        stall_threshold: config.stall_threshold,
+        watermark_version: Arc::new(CachePadded::new(AtomicUsize::new(0))),
+        version: keyed_state.version.clone(),
+        trigger_provider: InMemoryTriggerStoreProvider::new(),
+        state_provider: memory_state_provider::<JsonCodec>(
+            &keyed_state,
+            MemoryDeduplicationStoreProvider::new(),
+            MemoryCells::new(),
+            MemoryDescriptorIdentityStore::new(),
+            MemoryLoader::new(),
+            None,
+        ),
+        timer_slab_size: CompactDuration::new(30),
+        timer_semaphores: Arc::new(from_fn(|_| Arc::new(Semaphore::new(1)))),
+        telemetry_sender: Telemetry::new().sender(),
+        timer_spans: SpanRelation::default(),
+        _payload: PhantomData,
+    };
+    let topic = Topic::from(RETAINED_TOPIC);
+    let manager = PartitionManager::new(
+        partition_config,
+        SweptHandler { log },
+        topic,
+        RETAINED_PARTITION,
+    );
+    managers
+        .write()
+        .insert((topic, RETAINED_PARTITION), manager);
+    Ok(())
 }
 
 fn peer_config(bind: SocketAddr) -> Result<PeerConfiguration> {
