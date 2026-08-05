@@ -165,9 +165,10 @@ impl<D: NodeDirectory> AddressResolver<D> {
     /// Reads `directory` through a cache of up to `capacity` registrations.
     ///
     /// The cache is built here, from the lease `directory` publishes, rather
-    /// than taken as an argument. A resolver that served an entry past the
-    /// lease its registrations were written under is therefore unwritable, and
-    /// no call site has to pair the two values by hand.
+    /// than taken as an argument. A resolver that ages its entries on any other
+    /// lease is therefore unwritable, and no call site has to pair the two
+    /// values by hand. What that lease does and does not bound is
+    /// [`AddressCache`]'s own **Age** rule.
     #[must_use]
     pub(crate) fn new(capacity: usize, directory: D) -> Self {
         Self {

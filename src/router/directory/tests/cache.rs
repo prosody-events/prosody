@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::OnceCell;
+use tokio::task::yield_now;
 
 /// How many registrations the cache under test admits.
 const CAPACITY: usize = 8;
@@ -239,6 +240,14 @@ async fn absence_is_cached<D: NodeDirectory>(directory: &D, ttl: RegistrationTtl
 }
 
 /// Resolves `node`, counting the directory reads the cache actually issues.
+///
+/// The fill suspends once before it reads. That is what makes
+/// [`one_read_per_cold_burst`] a detector: the memory directory answers without
+/// ever suspending, so a fill that never yields would run to completion before
+/// the second caller of a burst is polled, and every later caller would find a
+/// fresh entry however the cache filled it. With the yield the first caller
+/// parks holding the placeholder, so a cache that lost single flight issues one
+/// read per caller and the count reds.
 async fn resolve<D: NodeDirectory>(
     cache: &AddressCache,
     directory: &D,
@@ -248,6 +257,7 @@ async fn resolve<D: NodeDirectory>(
     Ok(cache
         .resolve(node, || async move {
             reads.fetch_add(1, Ordering::Relaxed);
+            yield_now().await;
             directory.read(node).await
         })
         .await?)

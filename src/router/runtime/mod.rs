@@ -68,12 +68,13 @@ mod tests;
 /// wait for a reservation, which is why shutdown exists.
 ///
 /// The directory backend travels with this type and stops here.
-/// [`router`](Self::router) is the one handle that carries `D`, and every
-/// consumer of it takes it by reference into a constructor that returns a type
-/// naming no `D`. [`addresses`](Self::addresses) hands back a borrow, so it
-/// reaches no owner that outlives the runtime. An owner above therefore never
-/// writes `D`: it infers it where it builds the runtime, and moves the whole
-/// runtime into a task of its own.
+/// [`router`](Self::router) and [`addresses`](Self::addresses) both hand out a
+/// value that names `D`, and both of those values are `Clone`, so no borrow
+/// confines either one. What keeps `D` out of the code above is inference: a
+/// consumer passes a handle to a constructor that returns a type naming no `D`,
+/// or calls a method on it, and writes the parameter nowhere. An owner infers
+/// `D` where it builds the runtime, and moves the whole runtime into a task of
+/// its own.
 pub(crate) struct PeerRuntime<D> {
     addresses: AddressResolver<D>,
     router: RouterHandle<GrpcSender, D>,

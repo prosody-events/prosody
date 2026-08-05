@@ -7,18 +7,18 @@ use thiserror::Error;
 ///
 /// The range is checked once, in the only constructor, and this module holds
 /// no other way to build one. A write site outside it therefore cannot forge a
-/// lease of zero, a negative one, or one above Cassandra's maximum TTL: the
-/// value is always a positive number of seconds, and every statement binds
+/// lease of zero or one above [`RegistrationTtl::MAX`], and the unsigned field
+/// makes a negative lease unrepresentable. Every statement binds
 /// [`RegistrationTtl::seconds`] directly. This is a fixed lease rather than a
 /// retention window anchored on a natural end time, so a write site needs no
 /// lease arithmetic and no overflow check of its own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegistrationTtl(i32);
+pub(crate) struct RegistrationTtl(u16);
 
 impl RegistrationTtl {
     /// The lease a process publishes when an operator asks for none. Long
     /// enough that a refresher paces itself well inside it, short enough that a
-    /// dead process's row expires within half a minute.
+    /// dead process's entry expires within half a minute.
     pub(crate) const DEFAULT: Self = Self(30);
     /// Longest lease a caller can ask for. A dead process stays resolvable for
     /// at most this long, and each stale resolution costs one dropped response.
@@ -29,13 +29,13 @@ impl RegistrationTtl {
     pub(crate) const MIN: Duration = Duration::from_secs(5);
 
     /// The lease in seconds, ready to bind to a `USING TTL` placeholder.
-    pub(crate) const fn seconds(self) -> i32 {
-        self.0
+    pub(crate) fn seconds(self) -> i32 {
+        i32::from(self.0)
     }
 
     /// The lease as a duration, for callers that pace themselves against it.
     pub(crate) fn duration(self) -> Duration {
-        Duration::from_secs(u64::from(self.0.unsigned_abs()))
+        Duration::from_secs(u64::from(self.0))
     }
 }
 
@@ -51,7 +51,7 @@ impl TryFrom<Duration> for RegistrationTtl {
             });
         }
         // The check above caps the value at 3600, so the cast cannot truncate.
-        Ok(Self(lease.as_secs() as i32))
+        Ok(Self(lease.as_secs() as u16))
     }
 }
 

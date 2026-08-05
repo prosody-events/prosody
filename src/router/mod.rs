@@ -34,11 +34,11 @@ const LABEL_CAPACITY: usize = 64;
 ///
 /// It is the largest label that stays inline in [`Host`] and
 /// [`NetworkId`](directory::NetworkId), and both ends of the directory hold to
-/// it: a process refuses to publish a longer one, and a row carrying a longer
-/// one reads as unresolvable. That is what makes the address cache bounded in
-/// bytes as well as in entries — the cache charges one unit per entry however
-/// many bytes it holds, so an unbounded label would make a bounded entry count
-/// buy nothing.
+/// it: a process refuses to publish a longer one, and an entry carrying a
+/// longer one reads as unresolvable. That is what makes the address cache
+/// bounded in bytes as well as in entries — the cache charges one unit per
+/// entry however many bytes it holds, so an unbounded label would make a
+/// bounded entry count buy nothing.
 pub(crate) const MAX_LABEL_BYTES: usize = LABEL_CAPACITY - 1;
 
 /// The host a node publishes for its peers to dial. Every host that reaches the

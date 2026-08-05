@@ -282,8 +282,8 @@ pub(crate) async fn run_idempotent_deregister_case<D: NodeDirectory>(directory: 
 }
 
 /// One generated registration for `node`. Every field but the id is drawn
-/// afresh, so two shapes of one node differ in their optional fields as well as
-/// in their endpoint.
+/// afresh, so two shapes of one node can differ in their optional fields as
+/// well as in their endpoint.
 fn shape(g: &mut Gen, node: NodeId) -> NodeRegistration {
     let ArbRegistration(mut registration) = ArbRegistration::arbitrary(g);
     registration.node = node;
