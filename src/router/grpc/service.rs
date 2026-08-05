@@ -158,10 +158,9 @@ impl<R: RelayHop> Peer for PeerService<R> {
                         Err(RelayFailure::Unreachable) => {
                             answer(&span, ResponseDisposition::Unreachable)
                         }
-                        // The target read the frame and answered. Its status is
-                        // passed through as it gave it, because rewriting a code
-                        // here would silently change the responder's own retry
-                        // decision.
+                        // The hop came to a status. It is passed through
+                        // unchanged: rewriting a code here can silently change
+                        // the responder's own retry decision.
                         Err(RelayFailure::Target(code)) => {
                             span.record("peer.disposition", code.description());
                             Err(Status::new(code, code.description()))

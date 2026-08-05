@@ -198,11 +198,12 @@ pub(super) fn record_rate_limited() {
 /// it failed.
 ///
 /// A route offers a second candidate only where the dialer's network label and
-/// the node's are equal. Each count therefore says the first candidate did not
-/// serve the response from here. A network label put on the wrong process is
-/// one cause of that. A dead direct endpoint, a node that moved and a node that
-/// answered `UNAVAILABLE` are others, so read this series as a question, not as
-/// a verdict.
+/// the node's are equal. Each count therefore says the first candidate gave no
+/// proof that it serves the node. That is not proof it never read the frame:
+/// the share it was given can simply have run out. A network label put on the
+/// wrong process is one cause. A dead direct endpoint, a node that moved and a
+/// node that answered `UNAVAILABLE` are others, so read this series as a
+/// question, not as a verdict.
 ///
 /// It counts transitions, not responses, and a steady fault does not count once
 /// per response. The destination remembers the candidate that answered, so the

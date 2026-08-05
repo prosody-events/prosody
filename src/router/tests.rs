@@ -47,8 +47,8 @@ fn every_minted_node_id_is_a_fresh_random_uuid() {
 /// off the other:
 ///
 /// - **Ambiguous.** Another attempt on this endpoint could still get an answer.
-/// - **Wrong endpoint.** Nothing served the frame here, so the node's other
-///   endpoint is worth trying instead.
+/// - **Wrong endpoint.** Nothing proved this endpoint serves the node, so the
+///   node's other endpoint is worth trying instead.
 ///
 /// The second column carries a third claim the send path depends on: a failure
 /// that is not a wrong endpoint is always a status, so the walk may record the

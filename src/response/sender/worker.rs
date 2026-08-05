@@ -99,11 +99,11 @@ impl Share {
 /// Every dequeued job ends as exactly one outcome: it moves one stage or one
 /// drop reason, one of this sender's two counters, and the `peer.disposition`
 /// attribute on its own span. A delivered job also records `peer.preference`
-/// and counts one fallback transition when its walk made one. Every count of
-/// one job sits in this one match, so no two of them can disagree about what
-/// that job came to. The deadline is the biased arm of the select, so a job
-/// whose deadline has already passed is dropped before the pipeline is polled
-/// at all — nothing is paced, encoded or sent for it.
+/// and counts one fallback transition when its walk made one. Every count of a
+/// job's outcome sits in this one match, so no two of them can disagree about
+/// what that job came to. The deadline is the biased arm of the select, so a
+/// job whose deadline has already passed is dropped before the pipeline is
+/// polled at all — nothing is paced, encoded or sent for it.
 /// Work already inside one poll still finishes: this is a deadline the pipeline
 /// is measured against between polls, never an absolute wall-clock cut.
 ///
@@ -259,9 +259,9 @@ async fn deliver_job<C: Codec, R: Router>(
                 if !failure.is_wrong_endpoint() {
                     // A failure that is not a wrong endpoint is a status the
                     // path answered, so this endpoint is the one that reaches
-                    // the node — refusal and all. Every other failure leaves
-                    // nothing remembered: nothing served the frame there, so
-                    // nothing proves which endpoint serves it.
+                    // the node — refusal and all. Every other failure proves
+                    // nothing about which endpoint serves the node, so it
+                    // leaves nothing remembered.
                     remembered = Some(preference);
                     break;
                 }

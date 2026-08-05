@@ -134,9 +134,9 @@ impl ResponseSender for GrpcSender {
             return Err(SendFailure::Expired);
         }
         request.set_timeout(remaining);
-        // The status is passed through as the destination gave it. Rewriting a
-        // code here would silently change a retry decision, because
-        // `SendFailure::is_ambiguous` reads exactly this code.
+        // The status is passed through as it arrived. Rewriting a code here can
+        // silently change a retry decision, because `SendFailure::is_ambiguous`
+        // reads exactly this code.
         match client
             .unary(
                 request,

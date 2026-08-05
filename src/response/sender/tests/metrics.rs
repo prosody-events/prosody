@@ -10,7 +10,7 @@
 //! reads a metric: the instruments bind to whatever meter provider is global
 //! when they are first touched, and nextest gives each case its own process.
 
-use super::super::metrics::{DropReason, Stage};
+use super::super::metrics::{DropReason, Stage, record_fallback};
 use super::{CAP_BYTES, Harness};
 use crate::router::loopback::{Script, UNPUBLISHED_NODE, config, node, paused};
 use crate::router::{Preference, SendFailure};
@@ -200,6 +200,33 @@ fn a_fallback_counts_the_transition_and_only_when_the_next_candidate_answers() -
                 1,
             )],
         "only the answered direct-to-advertised transition must be counted: {:?}",
+        metrics.points("prosody.response.fallback")?
+    );
+    Ok(())
+}
+
+/// A transition is counted under the pair it is given, in that order.
+///
+/// The case above reaches the direct-to-advertised transition alone. A
+/// [`Script`] fails a fixed count of first attempts, so an endpoint that
+/// answers and then stops cannot be scripted, and the walk back to direct needs
+/// exactly that. A counter that named one fixed pair would therefore pass that
+/// case. This one records the other direction directly, so the labels are
+/// proved to be read rather than fixed.
+#[test]
+fn a_fallback_names_the_pair_it_is_given() -> Result<()> {
+    let metrics = GlobalMetrics::install();
+    record_fallback(Preference::Advertised, Preference::Direct);
+    ensure!(
+        metrics.points("prosody.response.fallback")?
+            == vec![(
+                BTreeMap::from([
+                    ("from".to_owned(), "advertised".to_owned()),
+                    ("to".to_owned(), "direct".to_owned()),
+                ]),
+                1,
+            )],
+        "the count must name the pair it was given: {:?}",
         metrics.points("prosody.response.fallback")?
     );
     Ok(())

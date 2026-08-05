@@ -331,8 +331,8 @@ impl SendFailure {
     /// A destination that never answered may or may not have received the
     /// frame, so a retry is the only way to find out. A retry is safe because a
     /// requester accepts at most one response per request and subsystem: a
-    /// duplicate is dropped, never counted twice. Every other status is the
-    /// destination's own answer, and repeating the send would only repeat it.
+    /// duplicate is dropped, never counted twice. Every other status is one
+    /// another attempt on this endpoint would only meet again.
     ///
     /// An address the transport cannot dial is not ambiguous either: the
     /// address is resolved once per response, so the next attempt would be
@@ -467,9 +467,9 @@ pub(crate) fn choose_route(
 
 /// Why one delivery attempt did not succeed.
 ///
-/// [`Status`](Self::Status) carries the gRPC status the target address
-/// answered, rather than a code of this crate's own, for the reason
-/// [`crate::router::grpc`] states.
+/// [`Status`](Self::Status) carries the gRPC status the attempt came to, rather
+/// than a code of this crate's own, for the reason [`crate::router::grpc`]
+/// states.
 #[cfg_attr(
     not(test),
     expect(
@@ -480,9 +480,12 @@ pub(crate) fn choose_route(
 )]
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SendFailure {
-    /// The target address answered with a status other than `OK`. Which
-    /// process at that address answered is not knowable here.
-    #[error("the address answered {0:?}")]
+    /// The attempt came to a gRPC status other than `OK`. It may be what
+    /// something at the address answered, or what this transport produced on
+    /// its own, and which process at that address answered is not knowable
+    /// here. [`Self::is_wrong_endpoint`] says which of these codes make the
+    /// other endpoint worth trying.
+    #[error("the attempt came to {0:?}")]
     Status(Code),
 
     /// Nothing answered before the send gave up. The frame may never have left

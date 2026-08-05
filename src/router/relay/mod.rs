@@ -185,9 +185,9 @@ fn slot(
 
 /// Why one forward did not deliver.
 ///
-/// [`Target`](Self::Target) carries the gRPC status the target itself answered,
-/// rather than a code of this crate's own, for the reason
-/// [`crate::router::grpc`] states.
+/// [`Target`](Self::Target) carries the gRPC status the hop came to, rather
+/// than a code of this crate's own, for the reason [`crate::router::grpc`]
+/// states.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum RelayFailure {
     /// This process has no send capacity for the target.
@@ -202,7 +202,9 @@ pub(crate) enum RelayFailure {
     #[error("the relay target could not be reached")]
     Unreachable,
 
-    /// The target read the frame and answered with this status.
-    #[error("the relay target answered {0:?}")]
+    /// The hop came to this status. A status this process's own transport
+    /// produced reads the same as one the target answered, so this does not
+    /// prove the target read the frame.
+    #[error("the relay hop came to {0:?}")]
     Target(Code),
 }
