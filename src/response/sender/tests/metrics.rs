@@ -11,7 +11,7 @@
 //! when they are first touched, and nextest gives each case its own process.
 
 use super::super::metrics::{DropReason, Stage, record_fallback};
-use super::{CAP_BYTES, Harness};
+use super::{CAP_BYTES, Harness, attempts};
 use crate::router::loopback::{Script, UNPUBLISHED_NODE, config, node, paused};
 use crate::router::{Preference, SendFailure};
 use crate::test_util::{GlobalMetrics, assert_distinct_labels, label};
@@ -48,17 +48,27 @@ const OVER_CAP: usize = CAP_BYTES;
 #[test]
 fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
     let metrics = GlobalMetrics::install();
-    let drained = paused()?.block_on(async {
+    let (fleet, drained) = paused()?.block_on(async {
         let harness = Harness::new(config(DESTINATIONS, SLOTS))?;
+        let fleet = harness.fleet();
         harness.send(PUBLISHED)?;
         harness.send(UNPUBLISHED_NODE)?;
-        harness.drain().await
+        let drained = harness.drain().await?;
+        Ok::<_, color_eyre::Report>((fleet, drained))
     })?;
     ensure!(
         (drained.sent, drained.dropped) == (1, 1),
         "one response must reach the listener and one must be dropped, not {} and {}",
         drained.sent,
         drained.dropped
+    );
+    ensure!(
+        attempts(&drained.deliveries, UNPUBLISHED_NODE) == 0,
+        "an unpublished node must reach no address"
+    );
+    ensure!(
+        fleet.available(node(UNPUBLISHED_NODE)) == Some(SLOTS),
+        "the unpublished node must return its slot"
     );
 
     ensure!(

@@ -1,9 +1,6 @@
 //! What happens to a queued response between its hook and the wire.
 
-use super::{
-    CAP_BYTES, Harness, PAYLOAD, UNPUBLISHED_NODE, attempts, config, next_delivery, node, paused,
-    port,
-};
+use super::{CAP_BYTES, Harness, PAYLOAD, attempts, config, next_delivery, node, paused, port};
 use crate::Codec;
 use crate::response::frame::FrameCap;
 use crate::response::frame::decode::decode_frame;
@@ -225,31 +222,6 @@ fn a_retry_that_succeeds_stops_the_attempts() -> Result<()> {
             "a response that succeeds on its retry must not be attempted again"
         );
         assert_eq!(drained.sent, 1, "the successful retry must count as sent");
-        Ok(())
-    })
-}
-
-/// A node the directory publishes nothing for is not dialed at all: no address
-/// is invented, nothing is sent, and the slot goes back.
-#[test]
-fn an_unpublished_node_is_never_dialed() -> Result<()> {
-    let runtime = paused()?;
-    runtime.block_on(async {
-        let harness = Harness::new(config(CELLS, SLOTS))?;
-        let fleet = harness.fleet();
-        harness.send(UNPUBLISHED_NODE)?;
-
-        let drained = harness.drain().await?;
-        assert!(
-            drained.deliveries.is_empty(),
-            "an unpublished node must reach no address at all"
-        );
-        assert_eq!(drained.dropped, 1, "the undeliverable response is counted");
-        assert_eq!(
-            fleet.available(node(UNPUBLISHED_NODE)),
-            Some(SLOTS),
-            "the slot must go back when no address is found"
-        );
         Ok(())
     })
 }

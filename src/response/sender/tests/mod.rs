@@ -10,8 +10,8 @@ use crate::router::RelayHop;
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{
-    Delivery, Drained, PUBLISHED_NODES, Script, TestRouter, UNPUBLISHED_NODE, collect_deliveries,
-    config, node, paused, port,
+    Delivery, Drained, PUBLISHED_NODES, Script, TestRouter, collect_deliveries, config, node,
+    paused, port,
 };
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
