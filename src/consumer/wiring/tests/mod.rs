@@ -181,6 +181,7 @@ impl PeerDirectoryBackend for RecordingBackend {
     async fn node_directory(
         &self,
         _lease: RegistrationTtl,
+        _mock: bool,
     ) -> Result<Self::Directory, ConsumerError> {
         Ok(self.directory.clone())
     }
@@ -235,6 +236,7 @@ impl PeerDirectoryBackend for RecordingMemoryBackend {
     async fn node_directory(
         &self,
         _lease: RegistrationTtl,
+        _mock: bool,
     ) -> Result<Self::Directory, ConsumerError> {
         Ok(self.directory.clone())
     }

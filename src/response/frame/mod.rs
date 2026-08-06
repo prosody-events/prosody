@@ -5,25 +5,11 @@
 //! the version of the message peers of different releases must agree on. A test
 //! decodes the generated descriptor set so the two cannot drift apart.
 
-// The `not(test)` gate is what makes this an *expectation* rather than a
-// blanket permission: it holds only while these items really are
-// production-dead, so the day the transport calls the last one, the gate
-// reports it unfulfilled and demands the attribute be deleted.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "`ResponseFrame::decode_with` and `PayloadError` serve the frame suites alone"
-    )
-)]
-
 use super::{FormatToken, RequestId, ResponseStatus};
-use crate::codec::Codec;
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
 use prost::encoding::{encoded_len_varint, key_len};
-use std::error::Error;
 use thiserror::Error;
 
 pub(crate) mod decode;
@@ -100,8 +86,21 @@ impl FrameCap {
     pub(crate) const MAX: Self = Self(Self::MAX_BYTES);
     /// Above this one frame could exhaust a receiver's whole buffer budget.
     pub(crate) const MAX_BYTES: usize = 16 * 1024 * 1024;
-    /// Below this a frame's own routing fields would not fit.
-    pub(crate) const MIN_BYTES: usize = 256;
+    /// Below this a frame's largest legal header and relay field would not fit.
+    pub(crate) const MIN_BYTES: usize = key_len(FIELD_PROTOCOL_VERSION)
+        + 1
+        + 2 * (key_len(FIELD_TARGET_NODE) + 1 + ID_BYTES)
+        + key_len(FIELD_SUBSYSTEM)
+        + 1
+        + SubsystemName::MAX_BYTES
+        + key_len(FIELD_FORMAT)
+        + 2
+        + super::FORMAT_MAX_BYTES
+        + key_len(FIELD_STATUS)
+        + 1
+        + key_len(FIELD_PAYLOAD)
+        + 1
+        + RELAY_FIELD_BYTES;
 
     /// Accepts a configured ceiling within the supported range.
     ///
@@ -127,34 +126,6 @@ impl FrameCap {
     }
 }
 
-impl ResponseFrame {
-    /// Decodes the payload with `codec`, refusing a frame whose format token is
-    /// not the one `codec` speaks — before a payload byte is parsed.
-    ///
-    /// A matching token is a protocol identifier, not a proof: two unrelated
-    /// schemas may pick the same one. What it catches is the ordinary mistake
-    /// of a responder upgraded ahead of its requesters.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PayloadError::FormatMismatch`] when the tokens differ, and
-    /// [`PayloadError::Codec`] when the codec rejects the bytes.
-    pub(crate) fn decode_with<C: Codec>(
-        &mut self,
-        codec: &mut C,
-    ) -> Result<C::Payload, PayloadError<C::Error>> {
-        if self.format.to_str() != C::FORMAT_ID {
-            return Err(PayloadError::FormatMismatch {
-                expected: C::FORMAT_ID,
-                actual: Box::new(self.format.clone()),
-            });
-        }
-        codec
-            .deserialize(&mut self.payload)
-            .map_err(PayloadError::Codec)
-    }
-}
-
 /// A configured frame ceiling the transport cannot use.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum FrameCapError {
@@ -168,25 +139,6 @@ pub(crate) enum FrameCapError {
         /// The largest usable ceiling.
         max: usize,
     },
-}
-
-/// Why a frame's payload could not be handed back to the application.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub(crate) enum PayloadError<E: Error> {
-    /// The frame was encoded with a format this codec does not speak. The token
-    /// is boxed so one mismatch's diagnostic does not widen every result this
-    /// error rides in; the allocation is on a path that already failed.
-    #[error("frame is in format {actual}, not {expected}")]
-    FormatMismatch {
-        /// The token the reading codec speaks.
-        expected: &'static str,
-        /// The token the frame carries.
-        actual: Box<FormatToken>,
-    },
-
-    /// The application's codec rejected the payload.
-    #[error(transparent)]
-    Codec(E),
 }
 
 // Visible crate-wide to test modules: the sender's suites and the peer

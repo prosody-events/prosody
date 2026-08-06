@@ -51,7 +51,6 @@ thread_local! {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CountingCodec {
     serializes: Arc<AtomicUsize>,
-    deserializes: Arc<AtomicUsize>,
     moves: bool,
 }
 
@@ -78,7 +77,6 @@ impl Codec for CountingCodec {
     const FORMAT_ID: &'static str = "test-bytes";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Vec<u8>, Infallible> {
-        self.deserializes.fetch_add(1, Relaxed);
         Ok(buf.to_vec())
     }
 
@@ -112,10 +110,6 @@ impl CountingCodec {
 
     fn serializes(&self) -> usize {
         self.serializes.load(Relaxed)
-    }
-
-    fn deserializes(&self) -> usize {
-        self.deserializes.load(Relaxed)
     }
 }
 

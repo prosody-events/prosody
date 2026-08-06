@@ -34,7 +34,7 @@ use crate::util::{
     DEFAULT_IDEMPOTENCE_CACHE_SIZE, from_env, from_env_with_fallback,
     from_option_duration_env_with_fallback, from_vec_env,
 };
-use crate::{Codec, EventIdentity, Key, MOCK_CLUSTER_BOOTSTRAP, SOURCE_SYSTEM_HEADER, Topic};
+use crate::{Codec, EventIdentity, Key, SOURCE_SYSTEM_HEADER, Topic, mock_cluster_bootstrap};
 use std::marker::PhantomData;
 use tracing::field::debug;
 use tracing::info;
@@ -196,7 +196,7 @@ impl<C: Codec> ProsodyProducer<C> {
         let send_timeout = config.send_timeout.map_or(Timeout::Never, Timeout::After);
 
         let bootstrap = if config.mock {
-            MOCK_CLUSTER_BOOTSTRAP.clone()
+            mock_cluster_bootstrap()
         } else {
             config.bootstrap_servers.join(",")
         };

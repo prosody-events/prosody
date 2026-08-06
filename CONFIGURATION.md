@@ -41,6 +41,19 @@ environment variables for unset fields, so you can mix both approaches.
 | `PROSODY_SEND_TIMEOUT`              | Give up sending after this long                      | 1s      |
 | `PROSODY_IDEMPOTENCE_CACHE_SIZE`    | Producer dedup cache capacity (0 to disable)         | 8192    |
 
+## Peer Requests
+
+Peer settings have no environment variables. Set `ConsumerBuilders.peer` with
+`PeerConfiguration::builder()`. Leave it as `None` to disable the peer runtime.
+
+The builder sets the listener address, frame size, connection limits, and
+route labels. It also sets directory leases, destination limits, request
+limits, response limits, and timeouts.
+
+Call `HighLevelClient::subscribe_responding` to answer requests for
+`PROSODY_SUBSYSTEM`. Call `HighLevelClient::subscribe` for a client that only
+sends requests. Both methods start the response listener.
+
 ## Retry
 
 Retry backoff applies in pipeline and low-latency modes. `PROSODY_MAX_RETRIES` controls how many retries low-latency mode performs before routing the failure to `PROSODY_FAILURE_TOPIC`. Pipeline mode uses deferral and does not use this limit.

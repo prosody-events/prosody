@@ -1,8 +1,11 @@
 //! What a process discovers about itself, and what it publishes from it.
 
+use super::super::RouterConfiguration;
 use super::super::tests::{CONTACT, listener};
-use super::super::{RouterConfiguration, discover_registration};
-use super::{DiscoveredHost, DiscoveryError, discover_host, join_discovery, routed_host};
+use super::{
+    DiscoveredHost, DiscoveryError, discover_host, join_discovery,
+    registration as discover_registration, routed_host,
+};
 use crate::router::directory::Endpoint;
 use crate::router::{Host, NodeId};
 use crate::test_util::TEST_RUNTIME;

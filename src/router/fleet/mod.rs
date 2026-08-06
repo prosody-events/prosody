@@ -91,14 +91,7 @@ struct Occupant {
     /// The stamp this occupant was admitted at. It tells this occupancy of a
     /// cell from every earlier one, which is what makes an eviction and a
     /// re-admission into the same cell observable.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no production reader: the fleet's own suites read this through \
-                      `DestinationFleet::live`"
-        )
-    )]
+    #[cfg(test)]
     admitted_at: u64,
     destination: Arc<Destination>,
 }
@@ -330,6 +323,7 @@ impl DestinationFleet {
             let destination = Arc::new(Destination::new(self.config));
             table[slot].occupant = Some(Occupant {
                 node,
+                #[cfg(test)]
                 admitted_at: self.next_stamp(),
                 destination: Arc::clone(&destination),
             });

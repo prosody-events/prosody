@@ -8,8 +8,10 @@
 //! Inside this module the rule is read rather than compiled: a function added
 //! here could call them on a runtime thread.
 
-use super::config::validate_label;
-use crate::router::{Host, MAX_LABEL_BYTES};
+use super::config::{RouterConfiguration, validate_label};
+use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
+use crate::router::grpc::BoundListener;
+use crate::router::{Host, MAX_LABEL_BYTES, NodeId};
 use std::net::{SocketAddr, UdpSocket};
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle, spawn_blocking};
@@ -21,7 +23,7 @@ mod tests;
 /// The two host values a process can only learn by asking the machine it runs
 /// on, and the network beneath it.
 ///
-/// [`discover`] produces one of these, and `discover_registration` spends it.
+/// [`discover`] produces one of these, and [`registration`] spends it.
 pub(super) struct DiscoveredHost {
     /// This machine's name. It is a label a registration may publish.
     pub(super) hostname: Host,
@@ -43,6 +45,36 @@ pub(super) struct DiscoveredHost {
 /// published, or when the blocking task does not join.
 pub(super) async fn discover(probe: Option<SocketAddr>) -> Result<DiscoveredHost, DiscoveryError> {
     join_discovery(spawn_blocking(move || discover_host(probe))).await
+}
+
+/// Builds the registration from the bound listener and discovered host.
+///
+/// The direct endpoint uses the routed host or the machine name. The
+/// advertised endpoint uses only configured values. The registration omits
+/// group membership because only the running Kafka client knows the cluster.
+/// Runtime activation adds that membership.
+pub(super) fn registration(
+    node: NodeId,
+    listener: &BoundListener,
+    discovered: DiscoveredHost,
+    config: &RouterConfiguration,
+) -> NodeRegistration {
+    let listener_port = listener.address().port();
+    let DiscoveredHost { hostname, routed } = discovered;
+    NodeRegistration {
+        node,
+        direct: Endpoint {
+            host: routed.unwrap_or_else(|| hostname.clone()),
+            port: listener_port,
+        },
+        advertised: config.advertised_host.as_deref().map(|host| Endpoint {
+            host: Host::make(host),
+            port: config.advertised_port.unwrap_or(listener_port),
+        }),
+        network: config.network.as_deref().map(NetworkId::make),
+        group: None,
+        hostname,
+    }
 }
 
 /// Reports what the blocking task returned.

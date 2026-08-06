@@ -14,6 +14,7 @@ use std::time::Duration as StdDuration;
 use ahash::{HashMap, HashMapExt};
 use color_eyre::eyre::{Result, eyre};
 use derive_quickcheck_arbitrary::Arbitrary;
+use futures::future::join_all;
 use itertools::Itertools;
 use parking_lot::Mutex;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient};
@@ -112,25 +113,37 @@ fn receives_all_in_key_order() -> Result<()> {
     init_test_logging();
 
     // Use QuickCheck to run property-based tests that validate message ordering.
-    // Local default 3 (owner ruling): each iteration costs ~14s of intrinsic
-    // multi-consumer rebalance coverage, so the default trades iterations,
-    // never coverage; CI overrides via INTEGRATION_TESTS.
-    QuickCheck::new()
-        .tests(common::integration_test_count_or(3))
-        .quickcheck(prop as fn(TestInput) -> TestResult);
+    // One iteration costs about 14 seconds of live multi-consumer rebalances.
+    // CI sets INTEGRATION_TESTS to increase the count.
+    let result = QuickCheck::new()
+        .tests(common::integration_test_count_or(1))
+        .quicktest(prop as fn(TestInput) -> TestResult);
 
     // Delete the pooled topics minted during the run.
     let slots: Vec<(Topic, String)> = ENV_POOL.lock().drain().map(|(_, slot)| slot).collect();
-    TEST_RUNTIME.block_on(async {
+    let cleanup = TEST_RUNTIME.block_on(async {
         let admin = ProsodyAdminClient::cached(&AdminConfiguration::new(vec![
             "localhost:9094".to_owned(),
         ])?)?;
-        for (topic, _group) in slots {
-            admin.delete_topic(&topic).await?;
-            info!("deleted pooled test topic: {topic}");
-        }
-        Ok(())
-    })
+        join_all(
+            slots
+                .iter()
+                .map(|(topic, _group)| admin.delete_topic(topic)),
+        )
+        .await
+        .into_iter()
+        .map(|result| result.map_err(Into::into))
+        .collect::<Result<Vec<()>>>()?;
+        Ok::<(), color_eyre::Report>(())
+    });
+    match (result, cleanup) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(failure), Ok(())) => Err(eyre!("the ordering property failed: {failure:?}")),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(failure), Err(cleanup)) => Err(eyre!(
+            "the ordering property failed: {failure:?}; cleanup failed: {cleanup:#}"
+        )),
+    }
 }
 
 /// Property function for `QuickCheck` to verify message ordering.

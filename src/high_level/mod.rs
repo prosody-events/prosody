@@ -10,12 +10,14 @@ use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::{
     LowLatencyMiddlewareConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
+use crate::error::ClassifyError;
 pub use crate::high_level::config::ConsumerBuilders;
 use crate::high_level::config::ModeConfiguration;
 pub use crate::high_level::error::HighLevelClientError;
 pub use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
+use crate::requester::{Outcome, RequestError};
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state_reader::ConsumerReaderBackend;
 use crate::state_reader::StateReaderDependencies;
@@ -27,6 +29,7 @@ use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::future::Future;
 use std::mem::take;
+use std::time::Duration;
 use tokio::sync::{Mutex, OnceCell};
 use tracing::info;
 
@@ -149,6 +152,43 @@ where
     ) -> Result<(), HighLevelClientError<C::Error>> {
         self.producer.send([], topic, key, payload).await?;
         Ok(())
+    }
+
+    /// Sends one request and returns one outcome per subsystem.
+    ///
+    /// Subscribe the client first. The subscription starts the peer runtime
+    /// that owns this process's response listener and request registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestError`] for an unavailable runtime, invalid arguments,
+    /// failed admission, a produce failure without a response, or shutdown.
+    pub async fn request<'a, R, H, V, E>(
+        &'a self,
+        headers: H,
+        topic: Topic,
+        key: &'a str,
+        payload: C::Payload,
+        subsystems: &'a [SubsystemName],
+        timeout: Duration,
+    ) -> Result<Vec<Outcome<V, E>>, RequestError<C::Error>>
+    where
+        H: IntoIterator<Item = (&'static str, &'a str)>,
+        H::IntoIter: ExactSizeIterator,
+        R: Codec<Payload = Result<V, E>>,
+        E: ClassifyError,
+    {
+        let requester = {
+            let guard = self.consumer.lock().await;
+            let ConsumerState::Running { consumer, .. } = &*guard else {
+                return Err(RequestError::NotRunning);
+            };
+            consumer.requester::<R>(self.producer.clone())
+        }
+        .ok_or(RequestError::NotRunning)?;
+        requester
+            .request(headers, topic, key, payload, subsystems, timeout)
+            .await
     }
 
     /// Registers a keyed-state collection, returning the [`Registered`]

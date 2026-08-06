@@ -2,6 +2,7 @@
 //! process sent it.
 
 use super::TRANSPORT;
+use super::counted::SERVICE_STATUS;
 use super::deadline::inbound_deadline;
 use super::generated::peer_server::Peer;
 use super::inject::MetadataExtractor;
@@ -19,6 +20,7 @@ use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
+use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span, debug_span};
@@ -163,7 +165,7 @@ impl<R: RelayHop> Peer for PeerService<R> {
                         // the responder's own retry decision.
                         Err(RelayFailure::Target(code)) => {
                             span.record("peer.disposition", code.description());
-                            Err(Status::new(code, code.description()))
+                            Err(service_status(code, code.description()))
                         }
                     }
                 }
@@ -194,7 +196,16 @@ fn answer(span: &Span, disposition: ResponseDisposition) -> Result<Response<()>,
         | ResponseDisposition::NoRelayCapacity
         | ResponseDisposition::RelayDeadlineExceeded
         | ResponseDisposition::Unreachable => {
-            Err(Status::new(disposition.status(), disposition.message()))
+            Err(service_status(disposition.status(), disposition.message()))
         }
     }
+}
+
+/// Marks one status as a service result, not a transport refusal.
+fn service_status(code: tonic::Code, message: &'static str) -> Status {
+    let mut status = Status::new(code, message);
+    status
+        .metadata_mut()
+        .insert(SERVICE_STATUS, MetadataValue::from_static("1"));
+    status
 }

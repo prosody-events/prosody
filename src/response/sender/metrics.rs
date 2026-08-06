@@ -49,6 +49,7 @@ static DROPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 });
 
 /// Responses a route's next candidate answered after the one before it failed.
+/// Concurrent senders can count the same shared preference change once each.
 static FALLBACKS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter("prosody")
         .u64_counter("prosody.response.fallback")

@@ -142,6 +142,8 @@ pub(crate) use crate::consumer::wiring::state::{
 };
 use crate::heartbeat::HeartbeatRegistry;
 pub use crate::otel::SpanRelation;
+use crate::producer::ProsodyProducer;
+use crate::requester::ProsodyRequester;
 pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
 // `descriptor::Keyed` (the key-axis lifter) is deliberately not re-exported
 // here: it would shadow the message-routing `Keyed` trait re-exported here.
@@ -279,6 +281,19 @@ impl<C: Codec> Clone for ProsodyConsumer<C> {
 }
 
 impl<C: Codec> ProsodyConsumer<C> {
+    /// Builds a requester over this consumer's peer runtime.
+    pub(crate) fn requester<R: Codec>(
+        &self,
+        producer: ProsodyProducer<C>,
+    ) -> Option<ProsodyRequester<C, R>> {
+        self.runtime_state
+            .lock()
+            .as_ref()?
+            .peer
+            .as_ref()
+            .map(|peer| peer.requester(producer))
+    }
+
     /// Returns the number of currently assigned partitions.
     ///
     /// This method is useful for monitoring how many partitions have been

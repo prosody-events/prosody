@@ -100,7 +100,7 @@ async fn the_responding_wiring_answers_a_tagged_message() -> Result<()> {
     let peer_config = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let managers: Arc<Managers<Value>> = Arc::default();
     let heartbeats = HeartbeatRegistry::new(consumer.group_id.clone(), consumer.stall_threshold);
-    let peer = prepare_requester(&peer_config, &backend, managers, &heartbeats).await?;
+    let peer = prepare_requester(&peer_config, &backend, true, managers, &heartbeats).await?;
     let (router, mut deliveries) = TestRouter::new(config(1, 1))?;
     let (responder, workers) = Responder::<SomeResponseCodec>::new(
         &router,
@@ -187,6 +187,7 @@ async fn the_prepared_peer_admits_the_name_its_responder_answers_with() -> Resul
     let prepared = prepare_responding::<SomeResponseCodec, _, _>(
         &peer_config,
         &backend,
+        true,
         subsystem.clone(),
         managers,
         &heartbeats,
@@ -243,6 +244,7 @@ async fn the_prepared_responder_is_sized_by_the_runtimes_frame_cap() -> Result<(
     let prepared = prepare_responding::<SomeResponseCodec, _, _>(
         &peer,
         &backend,
+        true,
         SubsystemName::try_new(SUBSYSTEM)?,
         managers,
         &heartbeats,
@@ -280,7 +282,7 @@ async fn a_responding_consumer_starts_and_stops() -> Result<()> {
         trigger_store: &trigger_store,
         common: &common,
     };
-    let memory = memory_deps(&setup)?;
+    let memory = memory_deps(&setup);
     let deps = recording_memory_deps(&memory, directory);
     let typed = TypedConsumerSetup {
         consumer: &consumer_config,
@@ -352,7 +354,7 @@ async fn refused_consumer(
         trigger_store: &trigger_store,
         common: &common,
     };
-    let deps: StateReaderDependencies<JsonCodec, _> = memory_deps(&setup)?;
+    let deps: StateReaderDependencies<JsonCodec, _> = memory_deps(&setup);
     let result = ProsodyConsumer::<JsonCodec>::pipeline_responding_consumer_with_backend::<
         ScriptedHandler,
         SomeResponseCodec,

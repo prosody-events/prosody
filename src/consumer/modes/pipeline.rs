@@ -118,8 +118,14 @@ impl PipelineMiddlewareStack {
         // could drop a served listener.
         match self.common_config.peer.as_ref() {
             Some(peer) => {
-                let attach =
-                    prepare_requester(peer, backend, managers, &services.heartbeats).await?;
+                let attach = prepare_requester(
+                    peer,
+                    backend,
+                    self.consumer_config.mock,
+                    managers,
+                    &services.heartbeats,
+                )
+                .await?;
                 Box::pin(initialize_consumer::<_, _, _, C, _>(
                     &self.consumer_config,
                     provider,
@@ -210,9 +216,15 @@ impl PipelineMiddlewareStack {
         };
         // Preparation is the last fallible step of this mode, and no `?` runs
         // between it and the termination below.
-        let prepared =
-            prepare_responding::<R, _, _>(peer, backend, subsystem, managers, &services.heartbeats)
-                .await?;
+        let prepared = prepare_responding::<R, _, _>(
+            peer,
+            backend,
+            self.consumer_config.mock,
+            subsystem,
+            managers,
+            &services.heartbeats,
+        )
+        .await?;
         let (provider, attach) = prepared.terminate(&middleware, handler);
         Box::pin(initialize_consumer::<_, _, _, C, _>(
             &self.consumer_config,
@@ -252,7 +264,7 @@ where
     {
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
-                let deps = memory_deps(&setup)?;
+                let deps = memory_deps(&setup);
                 Self::pipeline_consumer_with_backend(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
@@ -307,7 +319,7 @@ where
     {
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
-                let deps = memory_deps(&setup)?;
+                let deps = memory_deps(&setup);
                 Self::pipeline_responding_consumer_with_backend::<T, R, _>(
                     TypedConsumerSetup {
                         consumer: setup.consumer,

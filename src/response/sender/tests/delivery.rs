@@ -4,6 +4,7 @@ use super::{
     CAP_BYTES, Harness, PAYLOAD, UNPUBLISHED_NODE, attempts, config, next_delivery, node, paused,
     port,
 };
+use crate::Codec;
 use crate::response::frame::FrameCap;
 use crate::response::frame::decode::decode_frame;
 use crate::response::frame::tests::{CountingCodec, serialized_on_this_thread};
@@ -80,7 +81,7 @@ fn a_queued_response_survives_the_sender_that_queued_it() -> Result<()> {
             "the frame must name the node it was queued for"
         );
         assert_eq!(
-            frame.decode_with(&mut CountingCodec::default())?,
+            CountingCodec::default().deserialize(&mut frame.payload)?,
             PAYLOAD,
             "the frame must carry the response that was queued"
         );

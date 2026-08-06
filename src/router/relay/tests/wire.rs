@@ -62,6 +62,45 @@ const PROCESS_BUDGET: Duration = Duration::from_mins(1);
 const HERE: &str = "here";
 const THERE: &str = "there";
 
+/// One byte more than the smallest response ceiling can retain.
+const OVER_RESPONSE_CAP: [u8; FrameCap::MIN_BYTES + 1] = [0; FrameCap::MIN_BYTES + 1];
+
+/// A target transport's size refusal is not counted again at the relay.
+#[test]
+fn a_relayed_out_of_range_does_not_count_as_a_transport_refusal() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let pair = Pair::start_with_target_frame_cap(FrameCap::MIN_BYTES).await?;
+        let request = awaited(&pair.target.registry)?;
+        let served = TRANSPORT.served();
+        let rejected = TRANSPORT.rejected_frames();
+        let outcome = async {
+            let answered = call_with_payload(
+                &pair.relay,
+                pair.target.node,
+                request,
+                BUDGET,
+                &OVER_RESPONSE_CAP,
+            )
+            .await?;
+            ensure(
+                answered == Code::OutOfRange,
+                format!("the target must pass its size refusal through, not {answered:?}"),
+            )?;
+            ensure(
+                TRANSPORT.served() == served + 1,
+                "only the relay peer method must serve the frame".to_owned(),
+            )?;
+            ensure(
+                TRANSPORT.rejected_frames() == rejected + 1,
+                "only the target transport must count the size refusal".to_owned(),
+            )
+        }
+        .await;
+        pair.stop().await?;
+        outcome
+    })
+}
+
 /// Two processes whose directory entries name each other pass a frame neither
 /// owns exactly once.
 ///
@@ -309,6 +348,16 @@ async fn crossing(pair: &Pair) -> Result<()> {
 
 /// Delivers one frame for `target` into `live`, under a budget of `granted`.
 async fn call(live: &Live, target: NodeId, request: RequestId, granted: Duration) -> Result<Code> {
+    call_with_payload(live, target, request, granted, PAYLOAD).await
+}
+
+async fn call_with_payload(
+    live: &Live,
+    target: NodeId,
+    request: RequestId,
+    granted: Duration,
+    payload: &[u8],
+) -> Result<Code> {
     let cap = FrameCap::new(CAP_BYTES)?;
     let fleet = DestinationFleet::new(FleetConfiguration::default())?;
     let sender = GrpcSender::new(cap, &fleet);
@@ -320,7 +369,7 @@ async fn call(live: &Live, target: NodeId, request: RequestId, granted: Duration
         status: ResponseStatus::Success,
         relay: None,
     };
-    let staged = encoder.stage(&header, PAYLOAD.to_vec())?;
+    let staged = encoder.stage(&header, payload.to_vec())?;
     let delivered = timeout(
         HANG_GUARD,
         deliver(&sender, &live.address, &staged, granted).instrument(info_span!("peer.test.call")),

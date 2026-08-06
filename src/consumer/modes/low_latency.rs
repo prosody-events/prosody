@@ -57,7 +57,7 @@ where
     {
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
-                let deps = memory_deps(&setup)?;
+                let deps = memory_deps(&setup);
                 Self::low_latency_consumer_with_backend(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
@@ -115,7 +115,7 @@ where
     {
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
-                let deps = memory_deps(&setup)?;
+                let deps = memory_deps(&setup);
                 Self::low_latency_responding_consumer_with_backend::<T, R, _>(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
@@ -195,6 +195,7 @@ where
                 let attach = prepare_requester(
                     peer,
                     setup.deps.backend().as_ref(),
+                    setup.consumer.mock,
                     managers,
                     &services.heartbeats,
                 )
@@ -278,6 +279,7 @@ where
         let prepared = prepare_responding::<R, _, _>(
             peer,
             setup.deps.backend().as_ref(),
+            setup.consumer.mock,
             subsystem,
             managers,
             &services.heartbeats,

@@ -1,21 +1,67 @@
 use super::{CountingCodec, RAW_ID, RELAY_FIELD_BYTES, expected_frame_len, header};
+use crate::Codec;
 use crate::error::ErrorCategory;
-use crate::response::ResponseStatus;
 use crate::response::frame::FrameCap;
 use crate::response::frame::decode::decode_frame;
 use crate::response::frame::encode::{EncodeError, Forwarded, FrameEncoder};
+use crate::response::{FORMAT_MAX_BYTES, ResponseStatus};
 use crate::router::{Framed, NodeId};
+use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
+use std::convert::Infallible;
 
 /// The id a relay writes into a frame it sends on.
 const RELAY_ID: [u8; 16] = [0x77; 16];
 
 /// The id a frame already carried before it reached that relay.
 const EARLIER_RELAY_ID: [u8; 16] = [0x33; 16];
+
+/// Eight visible 16-byte blocks make the protocol's 128-byte format limit.
+const WIDEST_FORMAT: &str = concat!(
+    "0000000000000000",
+    "1111111111111111",
+    "2222222222222222",
+    "3333333333333333",
+    "4444444444444444",
+    "5555555555555555",
+    "6666666666666666",
+    "7777777777777777",
+);
+
+#[derive(Default)]
+struct WidestHeaderCodec;
+
+impl Codec for WidestHeaderCodec {
+    type Error = Infallible;
+    type Payload = ();
+
+    const FORMAT_ID: &'static str = WIDEST_FORMAT;
+
+    fn deserialize(&mut self, _buf: &mut [u8]) -> Result<(), Infallible> {
+        Ok(())
+    }
+
+    fn serialize(&mut self, (): (), _buf: &mut Vec<u8>) -> Result<(), Infallible> {
+        Ok(())
+    }
+}
+
+/// The minimum cap accepts the widest legal header and an empty payload.
+#[test]
+fn the_minimum_cap_carries_the_widest_legal_header() -> Result<()> {
+    assert_eq!(WidestHeaderCodec::FORMAT_ID.len(), FORMAT_MAX_BYTES);
+    let cap = FrameCap::new(FrameCap::MIN_BYTES)?;
+    let subsystem = "s".repeat(SubsystemName::MAX_BYTES);
+    let header = header(&subsystem, ResponseStatus::Success, None)?;
+    let mut encoder = FrameEncoder::new(WidestHeaderCodec, cap);
+    let staged = encoder.stage(&header, ())?;
+    assert_eq!(staged.bytes() + RELAY_FIELD_BYTES, cap.bytes());
+    Ok(())
+}
 
 /// The exact bytes one deterministic response frames to.
 ///

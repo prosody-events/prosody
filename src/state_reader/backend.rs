@@ -183,6 +183,7 @@ pub(crate) trait PeerDirectoryBackend: Send + Sync + 'static {
     fn node_directory(
         &self,
         lease: RegistrationTtl,
+        mock: bool,
     ) -> impl Future<Output = Result<Self::Directory, ConsumerError>> + Send;
 }
 
@@ -277,6 +278,7 @@ impl<C: Codec> PeerDirectoryBackend for CassandraReaderBackend<C> {
     async fn node_directory(
         &self,
         lease: RegistrationTtl,
+        _mock: bool,
     ) -> Result<Self::Directory, ConsumerError> {
         CassandraNodeDirectory::new(self.cells.session.clone(), lease)
             .await
@@ -289,15 +291,19 @@ impl<C: Codec> PeerDirectoryBackend for CassandraReaderBackend<C> {
 }
 
 /// The caller gets a directory that resolves only what this process registered.
-/// See [`MemoryNodeDirectory`]. A consumer that joins a real fleet on this
-/// backend is refused at startup, outside mock mode.
+/// See [`MemoryNodeDirectory`]. This boundary refuses its use outside mock
+/// mode.
 impl<C: Codec> PeerDirectoryBackend for MemoryReaderBackend<C> {
     type Directory = MemoryNodeDirectory;
 
     async fn node_directory(
         &self,
         lease: RegistrationTtl,
+        mock: bool,
     ) -> Result<Self::Directory, ConsumerError> {
+        if !mock {
+            return Err(PeerInitError::MemoryDirectory.into());
+        }
         Ok(MemoryNodeDirectory::new(MEMORY_DIRECTORY_CAPACITY, lease))
     }
 }

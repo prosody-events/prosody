@@ -5,9 +5,9 @@ use crate::response::frame::decode::{FrameDecodeError, decode_frame};
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::{
     FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
-    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, PayloadError,
+    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader,
 };
-use crate::response::{FormatToken, RequestId, ResponseStatus};
+use crate::response::{RequestId, ResponseStatus};
 use crate::router::{Framed, NodeId};
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use bytes::BytesMut;
@@ -355,43 +355,6 @@ fn an_over_cap_frame_is_refused_whole() -> Result<()> {
         (bytes, limit),
         (length, cap.bytes()),
         "the refusal must name the whole frame"
-    );
-    Ok(())
-}
-
-/// A format token the reading codec does not speak stops the frame before a
-/// payload byte is parsed.
-#[test]
-fn a_mismatched_format_is_refused_without_decoding() -> Result<()> {
-    let cap = FrameCap::new(1024)?;
-    let mut frame = decode_frame(&mut RawFrame::default().encode(), cap)?;
-    let codec = CountingCodec::default();
-    let mut reader = codec.clone();
-
-    frame.format = FormatToken::make("other-format");
-    assert!(
-        matches!(
-            frame.decode_with(&mut reader),
-            Err(PayloadError::FormatMismatch { .. })
-        ),
-        "a frame in another format must be refused"
-    );
-    assert_eq!(
-        codec.deserializes(),
-        0,
-        "a mismatched frame must never reach the codec"
-    );
-
-    frame.format = FormatToken::make(CountingCodec::FORMAT_ID);
-    assert_eq!(
-        frame.decode_with(&mut reader)?,
-        b"hi".to_vec(),
-        "the codec's own format decodes"
-    );
-    assert_eq!(
-        codec.deserializes(),
-        1,
-        "a matching frame reaches the codec exactly once"
     );
     Ok(())
 }

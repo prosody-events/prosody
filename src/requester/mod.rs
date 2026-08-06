@@ -1,14 +1,5 @@
 //! Sends one Kafka request and collects one response per named subsystem.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the pending registry is live; the requester client waits for the production \
-                  request entry point"
-    )
-)]
-
 mod collect;
 pub(crate) mod config;
 pub(crate) mod registry;
@@ -100,6 +91,9 @@ pub enum ResponseFailure {
 /// request for the caller, so a classification would have no consumer.
 #[derive(Debug, Error)]
 pub enum RequestError<E: Error> {
+    /// The client has no running peer runtime.
+    #[error("the peer requester is not running")]
+    NotRunning,
     /// The request named no subsystem.
     #[error("a request must name at least one subsystem")]
     NoSubsystems,
@@ -159,7 +153,7 @@ impl<E: Error> From<Admission> for RequestError<E> {
 }
 
 /// Sends requests and returns responses in subsystem order.
-pub(crate) struct ProsodyRequester<C: Codec, R: Codec> {
+pub struct ProsodyRequester<C: Codec, R: Codec> {
     producer: ProsodyProducer<C>,
     node: NodeId,
     registry: Arc<PendingRegistry>,
@@ -210,8 +204,8 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         ),
         err
     )]
-    pub(crate) async fn request<'a, H, V, E>(
-        &'a self,
+    pub async fn request<'a, H, V, E>(
+        &self,
         headers: H,
         topic: Topic,
         key: &'a str,

@@ -4,40 +4,40 @@
 use crate::codec::Codec;
 use crate::consumer::middleware::respond::Responder;
 use crate::requester::config::RequesterConfiguration;
-use crate::requester::registry::{PendingRegistry, RegistryError};
+use crate::requester::registry::PendingRegistry;
 use crate::response::frame::FrameCap;
 use crate::response::sender::ResponseWorkers;
 use crate::router::directory::cache::AddressResolver;
-use crate::router::directory::{
-    Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
-};
+use crate::router::directory::{GroupMembership, NodeDirectory, NodeRegistration, RegistrationTtl};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
 use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::health::ProcessHealth;
 use crate::router::grpc::service::PeerService;
-use crate::router::grpc::{BoundListener, TransportError, serve};
+use crate::router::grpc::{BoundListener, serve};
 use crate::router::relay::Relay;
-use crate::router::{Host, NodeId, RouterHandle};
+use crate::router::{NodeId, RouterHandle};
 use crate::subsystem::SubsystemName;
 use rand::RngExt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use thiserror::Error;
 use tokio::select;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{error, warn};
-use validator::{Validate, ValidationErrors};
+use validator::Validate;
 
 mod config;
 mod discovery;
+mod error;
+
+pub(crate) use self::error::PeerRuntimeError;
 
 pub(crate) use self::config::RouterConfiguration;
-use self::discovery::{DiscoveredHost, DiscoveryError, discover};
+use self::discovery::{discover, registration};
 
 #[cfg(test)]
 mod tests;
@@ -137,6 +137,11 @@ pub(crate) struct PeerInputs<'a, H, D> {
 }
 
 impl<D: NodeDirectory> PreparedPeerRuntime<D> {
+    /// This process's node id.
+    pub(crate) fn node(&self) -> NodeId {
+        self.registration.node
+    }
+
     /// Builds every shared piece and serves the listener.
     ///
     /// The listener is served here rather than at activation, so no peer can
@@ -181,8 +186,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
                 return Err(PeerRuntimeError::Discovery(error));
             }
         };
-        let registration =
-            discover_registration(NodeId::new(), &inputs.listener, discovered, inputs.router);
+        let registration = registration(NodeId::new(), &inputs.listener, discovered, inputs.router);
         let addresses =
             AddressResolver::new(inputs.router.address_cache_capacity, directory.clone());
         let router = RouterHandle::new(
@@ -444,50 +448,6 @@ async fn abandon(stop: oneshot::Sender<()>, listener: JoinHandle<()>) {
     }
 }
 
-/// Builds this process's registration.
-///
-/// Each configured field reaches only the endpoint it describes. `direct` is
-/// discovered and never configured: the local address the operating system
-/// would route to the probe address, else this machine's name, on the port the
-/// listener actually bound. That is what makes an equal network label an
-/// optimization — a neighbour dials an address it reaches without the entry
-/// point. The configured host and port reach `advertised` alone.
-///
-/// `group` is left unset. Only the running Kafka client knows the cluster that
-/// scopes it, so [`PreparedPeerRuntime::activate`] fills it in.
-///
-/// Every label this returns is inside
-/// [`MAX_LABEL_BYTES`](crate::router::MAX_LABEL_BYTES), which is what lets a
-/// reader treat a longer one as an entry this code did not write.
-/// [`PreparedPeerRuntime::start`] validates the configured labels before it
-/// calls this function, the routed probe answers with an address literal, and
-/// [`discover`] checks the machine name.
-fn discover_registration(
-    node: NodeId,
-    listener: &BoundListener,
-    discovered: DiscoveredHost,
-    config: &RouterConfiguration,
-) -> NodeRegistration {
-    // A listener rather than a port number: a `u16` would make port zero, and
-    // a port that no listener owns, representable.
-    let listener_port = listener.address().port();
-    let DiscoveredHost { hostname, routed } = discovered;
-    NodeRegistration {
-        node,
-        direct: Endpoint {
-            host: routed.unwrap_or_else(|| hostname.clone()),
-            port: listener_port,
-        },
-        advertised: config.advertised_host.as_deref().map(|host| Endpoint {
-            host: Host::make(host),
-            port: config.advertised_port.unwrap_or(listener_port),
-        }),
-        network: config.network.as_deref().map(NetworkId::make),
-        group: None,
-        hostname,
-    }
-}
-
 /// A refresh delay inside the lease, jittered so a fleet does not renew into
 /// the same partitions at the same instant.
 ///
@@ -502,42 +462,4 @@ fn refresh_delay(ttl: RegistrationTtl) -> Duration {
     let base = millis / 5;
     let span = millis / 20;
     Duration::from_millis(base + rand::rng().random_range(0..=span))
-}
-
-/// What can stop a process from serving its peer machinery.
-///
-/// It names no directory error. Preparation writes nothing, and the first write
-/// belongs to [`PreparedPeerRuntime::activate`], which returns the directory's
-/// own error beside the value it could not spend.
-#[derive(Debug, Error)]
-pub(crate) enum PeerRuntimeError {
-    /// The configuration this process was started with is invalid.
-    #[error("router configuration is invalid: {0:#}")]
-    Configuration(#[from] ValidationErrors),
-
-    /// This process could not learn what only its machine knows.
-    #[error("this process could not read what only its machine knows: {0:#}")]
-    Discovery(#[from] DiscoveryError),
-
-    /// The destination limits were invalid.
-    #[error("the destination fleet could not be built: {0:#}")]
-    Fleet(#[from] FleetConfigurationError),
-
-    /// The pending request limits were invalid.
-    #[error("the pending registry could not be built: {0:#}")]
-    Registry(#[from] RegistryError),
-
-    /// The bound peer listener could not start its service.
-    #[error("the peer listener could not be served: {0:#}")]
-    Listener(#[from] TransportError),
-
-    /// This process would admit a response no frame its own listener accepts
-    /// could carry.
-    #[error("responses of up to {bytes} bytes are admitted behind a {cap}-byte frame cap")]
-    ResponseCeiling {
-        /// What the requester admits for one response payload.
-        bytes: usize,
-        /// What one frame this listener accepts may carry in total.
-        cap: usize,
-    },
 }

@@ -19,7 +19,7 @@ use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::CellWrite;
 use crate::telemetry::Telemetry;
 use crate::timers::store::TriggerStoreProvider;
-use crate::{Codec, EventIdentity, EventType, MOCK_CLUSTER_BOOTSTRAP};
+use crate::{Codec, EventIdentity, EventType};
 use parking_lot::Mutex;
 use rdkafka::ClientConfig;
 use rdkafka::config::RDKafkaLogLevel;
@@ -338,7 +338,11 @@ async fn release_probe(probe_server: Option<ProbeServer>, error: ConsumerError) 
 /// [`ConsumerError::Hostname`] when the client id cannot be derived.
 fn client_config(consumer_config: &ConsumerConfiguration) -> Result<ClientConfig, ConsumerError> {
     let bootstrap = if consumer_config.mock {
-        MOCK_CLUSTER_BOOTSTRAP.clone()
+        for topic in &consumer_config.subscribed_topics {
+            crate::create_mock_topic(topic)
+                .map_err(|message| ConsumerError::MockCluster { message })?;
+        }
+        crate::mock_cluster_bootstrap()
     } else {
         consumer_config.bootstrap_servers.join(",")
     };

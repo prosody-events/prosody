@@ -171,16 +171,50 @@ impl Pair {
         targeted: Duration,
         route: TargetRoute,
     ) -> Result<Self> {
+        Self::start_with_target_config(
+            relaying,
+            targeted,
+            route,
+            &RequesterConfiguration::default(),
+            CAP_BYTES,
+        )
+        .await
+    }
+
+    /// Starts a pair whose target transport accepts at most `bytes` per frame.
+    pub(super) async fn start_with_target_frame_cap(bytes: usize) -> Result<Self> {
+        Self::start_with_target_config(
+            BUDGET,
+            BUDGET,
+            TargetRoute::Nowhere,
+            &RequesterConfiguration::default(),
+            bytes,
+        )
+        .await
+    }
+
+    async fn start_with_target_config(
+        relaying: Duration,
+        targeted: Duration,
+        route: TargetRoute,
+        requester: &RequesterConfiguration,
+        target_frame_bytes: usize,
+    ) -> Result<Self> {
         let relay_bound = bind(CAP_BYTES).await?;
-        let target_bound = bind(CAP_BYTES).await?;
+        let target_bound = bind(target_frame_bytes).await?;
         let relay_address = endpoint(&relay_bound);
         let target_address = endpoint(&target_bound);
-        let relay = Live::serve(relay_bound, Some(target_address), relaying)?;
+        let relay = Live::serve(
+            relay_bound,
+            Some(target_address),
+            relaying,
+            &RequesterConfiguration::default(),
+        )?;
         let seen = match route {
             TargetRoute::Relay => Some(relay_address),
             TargetRoute::Nowhere => None,
         };
-        match Live::serve(target_bound, seen, targeted) {
+        match Live::serve(target_bound, seen, targeted, requester) {
             Ok(target) => Ok(Self { relay, target }),
             Err(error) => {
                 relay.stop().await?;
@@ -199,11 +233,16 @@ impl Pair {
 
 impl Live {
     /// Serves `bound`, sending every frame it does not own on to `seen`.
-    fn serve(bound: BoundListener, seen: Option<Endpoint>, budget: Duration) -> Result<Self> {
+    fn serve(
+        bound: BoundListener,
+        seen: Option<Endpoint>,
+        budget: Duration,
+        requester: &RequesterConfiguration,
+    ) -> Result<Self> {
         let node = NodeId::new();
         let address = endpoint(&bound);
         let cap = bound.frame_cap();
-        let registry = PendingRegistry::new(&RequesterConfiguration::default())?;
+        let registry = PendingRegistry::new(requester)?;
         let router = FixedRouter::new(
             cap,
             FleetConfiguration::default(),

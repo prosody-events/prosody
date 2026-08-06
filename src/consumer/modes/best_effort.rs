@@ -66,6 +66,7 @@ where
                 let attach = prepare_requester(
                     peer,
                     setup.deps.backend().as_ref(),
+                    setup.consumer.mock,
                     managers,
                     &services.heartbeats,
                 )
@@ -146,6 +147,7 @@ where
         let prepared = prepare_responding::<R, _, _>(
             peer,
             setup.deps.backend().as_ref(),
+            setup.consumer.mock,
             subsystem,
             managers,
             &services.heartbeats,

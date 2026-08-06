@@ -7,7 +7,10 @@ use crate::consumer::error::{ConsumerError, PeerInitError};
 use crate::consumer::wiring::memory_deps;
 use crate::consumer::{CommonConfiguration, ConsumerConfiguration, ConsumerSetup};
 use crate::high_level::config::TriggerStoreConfiguration;
+use crate::router::directory::RegistrationTtl;
+use crate::state_reader::{MemoryReaderBackend, PeerDirectoryBackend, StateReaderDependencies};
 use crate::subsystem::SubsystemName;
+use crate::test_util::TEST_RUNTIME;
 use color_eyre::Result;
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -18,31 +21,38 @@ use std::net::{Ipv4Addr, SocketAddr};
 /// still builds, because a mock fleet asks itself.
 #[test]
 fn a_peer_fleet_on_memory_storage_is_refused_outside_mock_mode() -> Result<()> {
-    let mut config = consumer_config("peer-memory-selection")?;
+    let config = consumer_config("peer-memory-selection")?;
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let common = common_config(Some(peer), Some(SubsystemName::try_new("orders")?))?;
 
-    config.mock = false;
-    assert!(matches!(
-        select(&config, &common),
-        Err(ConsumerError::Peer(PeerInitError::MemoryDirectory))
-    ));
-
-    config.mock = true;
-    assert!(select(&config, &common).is_ok());
-    Ok(())
+    TEST_RUNTIME.block_on(async {
+        let deps = select(&config, &common);
+        assert!(matches!(
+            deps.backend()
+                .node_directory(RegistrationTtl::DEFAULT, false)
+                .await,
+            Err(ConsumerError::Peer(PeerInitError::MemoryDirectory))
+        ));
+        assert!(
+            deps.backend()
+                .node_directory(RegistrationTtl::DEFAULT, true)
+                .await
+                .is_ok()
+        );
+        Ok(())
+    })
 }
 
-/// Runs the shared memory arm and drops the dependencies it builds.
+/// Runs the shared memory arm and returns the dependencies it builds.
 fn select(
     consumer: &ConsumerConfiguration,
     common: &CommonConfiguration,
-) -> Result<(), ConsumerError> {
+) -> StateReaderDependencies<JsonCodec, MemoryReaderBackend<JsonCodec>> {
     let trigger_store = TriggerStoreConfiguration::InMemory;
     let setup = ConsumerSetup {
         consumer,
         trigger_store: &trigger_store,
         common,
     };
-    memory_deps::<JsonCodec>(&setup).map(drop)
+    memory_deps::<JsonCodec>(&setup)
 }

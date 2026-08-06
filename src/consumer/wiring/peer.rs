@@ -15,8 +15,11 @@ use crate::consumer::middleware::respond::{RespondHandler, Responder, responding
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::observer::KafkaObserver;
 use crate::heartbeat::HeartbeatRegistry;
+use crate::producer::ProsodyProducer;
+use crate::requester::ProsodyRequester;
 use crate::requester::registry::PendingRegistry;
 use crate::response::sender::ResponseWorkers;
+use crate::router::NodeId;
 use crate::router::directory::{GroupMembership, NodeDirectory};
 use crate::router::grpc::BoundListener;
 use crate::router::grpc::health::ConsumerHealth;
@@ -106,6 +109,7 @@ pub(in crate::consumer) struct PreparedResponder<D: NodeDirectory, R: Codec> {
 
 /// The running peer coordinator, and the one way to ask it for its report.
 pub(in crate::consumer) struct PeerHandles {
+    node: NodeId,
     /// Read at the first shutdown step: no new request enters while the
     /// partition handlers finish.
     pending: Arc<PendingRegistry>,
@@ -131,6 +135,14 @@ impl Answering {
 }
 
 impl PeerHandles {
+    /// Builds a requester over this runtime's identity and registry.
+    pub(in crate::consumer) fn requester<C: Codec, R: Codec>(
+        &self,
+        producer: ProsodyProducer<C>,
+    ) -> ProsodyRequester<C, R> {
+        ProsodyRequester::new(producer, self.node, Arc::clone(&self.pending))
+    }
+
     /// Refuses new requests. Requests already in flight stay open.
     pub(in crate::consumer) fn close_admission(&self) {
         self.pending.close_admission();
@@ -253,6 +265,7 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
             prepared,
             answering,
         } = self;
+        let node = prepared.node();
         let runtime = match prepared.activate(group).await {
             Ok(runtime) => runtime,
             Err((prepared, error)) => {
@@ -273,6 +286,7 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
         let (stop, stopped) = oneshot::channel();
         let coordinator = tokio::spawn(run_coordinator(runtime, workers, stopped));
         Ok(Some(PeerHandles {
+            node,
             pending,
             stop,
             coordinator,
@@ -306,6 +320,7 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
 pub(in crate::consumer) async fn prepare_requester<B, P>(
     peer: &PeerConfiguration,
     backend: &B,
+    mock: bool,
     managers: Arc<Managers<P>>,
     heartbeats: &HeartbeatRegistry,
 ) -> Result<PreparedPeer<B::Directory>, ConsumerError>
@@ -319,7 +334,7 @@ where
         .map_err(|error| PeerInitError::Listener {
             message: format!("{error:#}"),
         })?;
-    let directory = backend.node_directory(parts.lease).await?;
+    let directory = backend.node_directory(parts.lease, mock).await?;
     let prepared = PreparedPeerRuntime::start(PeerInputs {
         directory,
         listener,
@@ -349,6 +364,7 @@ where
 pub(in crate::consumer) async fn prepare_responding<R, B, P>(
     peer: &PeerConfiguration,
     backend: &B,
+    mock: bool,
     subsystem: SubsystemName,
     managers: Arc<Managers<P>>,
     heartbeats: &HeartbeatRegistry,
@@ -358,7 +374,7 @@ where
     B: PeerDirectoryBackend,
     P: Send + Sync + 'static,
 {
-    let mut peer = prepare_requester(peer, backend, managers, heartbeats).await?;
+    let mut peer = prepare_requester(peer, backend, mock, managers, heartbeats).await?;
     match peer.prepared.responder(subsystem) {
         Ok((responder, workers)) => {
             peer.answering = Some(Answering::new(&responder, workers));

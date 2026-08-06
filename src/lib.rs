@@ -31,9 +31,10 @@
 use ::tracing::info;
 use fixedstr::Flexstr;
 use internment::Intern;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::mocking::MockCluster;
 use std::env;
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, LazyLock};
 use std::thread::{self, park};
 
@@ -50,7 +51,7 @@ pub mod otel;
 pub mod prelude;
 pub mod producer;
 pub mod propagator;
-mod requester;
+pub mod requester;
 mod response;
 mod router;
 mod segment;
@@ -78,17 +79,28 @@ pub use crate::router::config::{
 ///
 /// `rdkafka::MockCluster` holds a raw `*mut` pointer and is therefore not
 /// `Sync` — it can't live inside a `static`. Instead, a dedicated owner
-/// thread holds the cluster on its stack and parks indefinitely; the
-/// bootstrap servers are returned through a channel. This keeps the
+/// thread holds the cluster on its stack and waits for topic commands. The
+/// bootstrap servers return through a channel. This keeps the
 /// resource owned by a real stack frame (no `mem::forget`, no `Box::leak`,
 /// no `unsafe` Sync impl) while keeping the cluster alive for the lifetime
 /// of the process.
+struct MockClusterState {
+    bootstrap: String,
+    topics: SyncSender<MockTopic>,
+}
+
+struct MockTopic {
+    name: String,
+    ready: SyncSender<Result<(), String>>,
+}
+
 #[expect(
     clippy::expect_used,
     reason = "LazyLock requires non-fallible closure; test infra cannot recover from failure"
 )]
-static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
+static MOCK_CLUSTER: LazyLock<MockClusterState> = LazyLock::new(|| {
     let (tx, rx) = sync_channel::<String>(1);
+    let (topics, topic_rx) = sync_channel::<MockTopic>(1);
     thread::Builder::new()
         .name("prosody-mock-cluster".into())
         .spawn(move || {
@@ -109,11 +121,21 @@ static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
 
             tx.send(bootstrap)
                 .expect("Failed to publish mock cluster bootstrap");
-            // Park indefinitely so the cluster (owned by this stack frame)
-            // outlives every caller. The OS reclaims the thread on process
-            // exit.
             loop {
-                park();
+                if let Ok(topic) = topic_rx.recv() {
+                    let created = match cluster.create_topic(&topic.name, 3, 3) {
+                        Ok(())
+                        | Err(KafkaError::MockCluster(RDKafkaErrorCode::TopicAlreadyExists)) => {
+                            Ok(())
+                        }
+                        Err(error) => Err(error.to_string()),
+                    };
+                    drop(topic.ready.send(created));
+                } else {
+                    loop {
+                        park();
+                    }
+                }
             }
         })
         .expect("Failed to spawn mock-cluster owner thread");
@@ -121,8 +143,24 @@ static MOCK_CLUSTER_BOOTSTRAP: LazyLock<String> = LazyLock::new(|| {
         .recv()
         .expect("mock-cluster owner thread failed to start");
     info!("started mock cluster on {bootstrap}");
-    bootstrap
+    MockClusterState { bootstrap, topics }
 });
+
+fn mock_cluster_bootstrap() -> String {
+    MOCK_CLUSTER.bootstrap.clone()
+}
+
+fn create_mock_topic(name: &str) -> Result<(), String> {
+    let (ready, created) = sync_channel(1);
+    MOCK_CLUSTER
+        .topics
+        .send(MockTopic {
+            name: name.to_owned(),
+            ready,
+        })
+        .map_err(|error| error.to_string())?;
+    created.recv().map_err(|error| error.to_string())?
+}
 
 /// The length of a UUID string (36 characters) plus one byte for length.
 const UUID_STR_LEN: usize = 36 + 1;

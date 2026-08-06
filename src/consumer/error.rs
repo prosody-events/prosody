@@ -47,6 +47,13 @@ pub enum ConsumerError {
     #[error("Kafka operation failed: {0:#}")]
     Kafka(#[from] KafkaError),
 
+    /// The mock Kafka cluster could not create a subscribed topic.
+    #[error("mock Kafka topic creation failed: {message}")]
+    MockCluster {
+        /// The mock cluster's error report.
+        message: String,
+    },
+
     /// A blocking startup step — the initial Kafka metadata fetch — did not
     /// finish.
     #[error("consumer startup task failed: {0:#}")]

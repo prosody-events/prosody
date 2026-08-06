@@ -1,11 +1,13 @@
 use super::*;
 use crate::JsonCodec;
 use crate::Key;
+use crate::PeerConfiguration;
 use crate::cassandra::config::CassandraConfigurationBuilder;
+use crate::codec::ResultCodec;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
-use crate::consumer::{ConsumerConfiguration, DemandType};
+use crate::consumer::{ConsumerConfiguration, DemandType, KeyedStateConfiguration};
 use crate::high_level::erased::{
     ErasedConsumerState, ErasedReadCache, ErasedReaderBuildError, new_erased,
 };
@@ -20,10 +22,14 @@ use crate::state_reader::tests::support::{
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use crate::timers::Trigger;
+use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use serde_json::{Value, json};
 use std::convert::Infallible;
+use std::time::Duration;
+use thiserror::Error;
+use tokio::time::timeout;
 
 struct ClientFixture<T> {
     client: MemoryHighLevelClient<T>,
@@ -55,6 +61,142 @@ fn create_test_client<T>(group_id: &str, source_system: Option<&str>) -> Result<
     let client =
         MemoryHighLevelClient::new(Mode::Pipeline, &mut producer_builder, &consumer_builders)?;
     Ok(ClientFixture { client })
+}
+
+fn create_peer_test_client<T>(group_id: &str) -> Result<ClientFixture<T>> {
+    let mut producer = ProducerConfiguration::builder();
+    producer
+        .bootstrap_servers(vec!["unused-in-mock-mode:9092".to_owned()])
+        .source_system("peer-requester");
+    let mut consumer = ConsumerConfiguration::builder();
+    consumer
+        .bootstrap_servers(vec!["unused-in-mock-mode:9092".to_owned()])
+        .group_id(group_id)
+        .subscribed_topics(&["test-topic".to_owned()])
+        .poll_interval(Duration::from_millis(1));
+    let builders = ConsumerBuilders {
+        consumer,
+        keyed_state: KeyedStateConfiguration::builder()
+            .subsystem(Some(SubsystemName::try_new("echo")?))
+            .build()?,
+        peer: Some(
+            PeerConfiguration::builder()
+                .advertised_host("127.0.0.1")
+                .build()?,
+        ),
+        ..ConsumerBuilders::new()?
+    };
+    Ok(ClientFixture {
+        client: MemoryHighLevelClient::new(Mode::Pipeline, &mut producer, &builders)?,
+    })
+}
+
+#[derive(Default)]
+struct NeverCodec;
+
+impl Codec for NeverCodec {
+    type Error = NeverCodecError;
+    type Payload = Infallible;
+
+    const FORMAT_ID: &'static str = "never";
+
+    fn deserialize(&mut self, _buf: &mut [u8]) -> Result<Infallible, NeverCodecError> {
+        Err(NeverCodecError)
+    }
+
+    fn serialize(&mut self, value: Infallible, _buf: &mut Vec<u8>) -> Result<(), NeverCodecError> {
+        match value {}
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error)]
+#[error("an infallible handler cannot produce this value")]
+struct NeverCodecError;
+
+type PeerResponseCodec = ResultCodec<JsonCodec, NeverCodec>;
+
+#[derive(Clone)]
+struct EchoHandler;
+
+impl FallibleHandler for EchoHandler {
+    type Error = Infallible;
+    type Output = Value;
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        _ctx: C,
+        message: ConsumerMessage<Value>,
+        _demand: DemandType,
+    ) -> Result<Value, Infallible>
+    where
+        C: EventContext<Payload = Value>,
+    {
+        Ok(message.payload().clone())
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _ctx: C,
+        _trigger: Trigger,
+        _demand: DemandType,
+    ) -> Result<Value, Infallible>
+    where
+        C: EventContext<Payload = Value>,
+    {
+        Ok(Value::Null)
+    }
+
+    async fn shutdown(self) {}
+}
+
+/// A mock client asks itself through Kafka, its listener, and the response
+/// wire.
+#[test]
+fn a_mock_client_round_trips_one_peer_request() -> Result<()> {
+    init_test_logging();
+    let fixture = create_peer_test_client::<EchoHandler>("peer-round-trip")?;
+    TEST_RUNTIME.block_on(async {
+        fixture
+            .client
+            .subscribe_responding::<PeerResponseCodec>(EchoHandler)
+            .await?;
+        let outcome: Result<()> = async {
+            let state = fixture.client.consumer_state().await;
+            let ConsumerState::Running { consumer, .. } = &*state else {
+                return Err(eyre!("the subscribed client is not running"));
+            };
+            let assigned = timeout(
+                Duration::from_secs(10),
+                consumer.wait_for_assigned_partitions(3),
+            )
+            .await
+            .map_err(|_| eyre!("the mock consumer did not receive its partition"))?;
+            ensure!(
+                assigned == 3,
+                "the mock consumer does not own all partitions"
+            );
+            drop(state);
+            let payload = json!({"answer": 42_i32});
+            let subsystem = SubsystemName::try_new("echo")?;
+            let outcomes = fixture
+                .client
+                .request::<PeerResponseCodec, _, Value, Infallible>(
+                    [],
+                    Topic::from("test-topic"),
+                    "key",
+                    payload.clone(),
+                    &[subsystem],
+                    Duration::from_secs(1),
+                )
+                .await?;
+            assert_eq!(outcomes, vec![Outcome::Ok(payload)]);
+            Ok(())
+        }
+        .await;
+        fixture.client.unsubscribe().await?;
+        outcome
+    })
 }
 
 #[test]

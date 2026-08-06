@@ -16,6 +16,9 @@ use tonic::codegen::http::{Request, Response};
 use tonic::server::NamedService;
 use tonic::{Code, Status};
 
+/// Marks a status that the peer method returned after transport admission.
+pub(super) const SERVICE_STATUS: &str = "prosody-service-status";
+
 /// What one call answered, before it reaches the peer that made it.
 type Answer<E> = Result<Response<Body>, E>;
 
@@ -65,6 +68,7 @@ where
 /// different status.
 fn count_refused<E>(answer: Answer<E>) -> Answer<E> {
     if let Ok(response) = &answer
+        && !response.headers().contains_key(SERVICE_STATUS)
         && Status::from_header_map(response.headers())
             .is_some_and(|status| status.code() == Code::OutOfRange)
     {

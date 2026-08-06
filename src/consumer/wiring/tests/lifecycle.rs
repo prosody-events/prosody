@@ -57,7 +57,8 @@ async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
     let managers: Arc<Managers<Value>> = Arc::default();
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let attachment = prepare_requester(&peer, &backend, Arc::clone(&managers), &heartbeats).await?;
+    let attachment =
+        prepare_requester(&peer, &backend, true, Arc::clone(&managers), &heartbeats).await?;
     let consumer = bounded(
         "startup",
         start(
@@ -158,7 +159,8 @@ async fn failed_activation_rolls_back_and_releases_the_listener() -> Result<()> 
     let managers: Arc<Managers<Value>> = Arc::default();
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let attachment = prepare_requester(&peer, &backend, Arc::clone(&managers), &heartbeats).await?;
+    let attachment =
+        prepare_requester(&peer, &backend, true, Arc::clone(&managers), &heartbeats).await?;
 
     let error = bounded(
         "startup",
