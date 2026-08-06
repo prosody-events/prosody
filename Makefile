@@ -17,7 +17,7 @@ console:
 
 # Format Rust code and TOML files
 format:
-	cargo fmt
+	cargo +nightly fmt
 	taplo fmt
 
 # Build the project
