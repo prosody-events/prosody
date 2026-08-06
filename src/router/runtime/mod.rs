@@ -180,12 +180,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         // meet here for the first time. A requester that admits a payload no
         // frame this listener accepts could carry would never receive one, and
         // the caller would learn that only from its own timeout.
-        if inputs.requester.max_response_bytes > frame_cap.bytes() {
-            return Err(PeerRuntimeError::ResponseCeiling {
-                bytes: inputs.requester.max_response_bytes,
-                cap: frame_cap.bytes(),
-            });
-        }
+        validate_response_ceiling(inputs.requester.max_response_bytes, frame_cap.bytes())?;
         let fleet = Arc::new(DestinationFleet::new(inputs.fleet)?);
         let pending = PendingRegistry::new(inputs.requester)?;
         let transport = Arc::new(GrpcSender::new(frame_cap, &fleet));
@@ -349,12 +344,7 @@ impl PreparedLocalPeerRuntime {
         fleet: FleetConfiguration,
         requester: &RequesterConfiguration,
     ) -> Result<Self, PeerRuntimeError> {
-        if requester.max_response_bytes > frame_cap.bytes() {
-            return Err(PeerRuntimeError::ResponseCeiling {
-                bytes: requester.max_response_bytes,
-                cap: frame_cap.bytes(),
-            });
-        }
+        validate_response_ceiling(requester.max_response_bytes, frame_cap.bytes())?;
         Ok(Self {
             node: NodeId::new(),
             frame_cap,
@@ -533,6 +523,12 @@ async fn abandon(stop: oneshot::Sender<()>, listener: JoinHandle<()>) {
     if let Err(join_error) = listener.await {
         error!(%join_error, "the abandoned peer listener task did not exit cleanly");
     }
+}
+
+fn validate_response_ceiling(bytes: usize, cap: usize) -> Result<(), PeerRuntimeError> {
+    (bytes <= cap)
+        .then_some(())
+        .ok_or(PeerRuntimeError::ResponseCeiling { bytes, cap })
 }
 
 /// A refresh delay inside the lease, jittered so a fleet does not renew into
