@@ -1,7 +1,6 @@
 //! Scaffolding for the peer lifecycle tests: a recording directory, a
 //! recording handler provider, and one `initialize_consumer` runner.
 
-use super::peer::PeerAttachment;
 use super::runtime::{StartupServices, initialize_consumer};
 use super::state::{KeyedStateInputs, memory_state_provider};
 use crate::consumer::event_context::EventContext;
@@ -24,13 +23,14 @@ use crate::consumer::{
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
 use crate::otel::SpanRelation;
+use crate::peer::PeerAttachment;
+use crate::peer::{NetworkPeerBackend, NetworkPeerMode, PeerBackend};
 use crate::router::NodeId;
 use crate::router::directory::tests::support::TestDirectory;
 use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state_reader::{MemoryReaderBackend, ReaderBackend, StateReaderDependencies};
-use crate::state_reader::{NetworkPeerBackend, NetworkPeerMode, PeerBackend};
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;

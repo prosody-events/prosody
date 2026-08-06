@@ -136,12 +136,12 @@ pub use crate::consumer::middleware::{FallibleHandler, RepinProof};
 pub(crate) use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::probes::ProbeServer;
-use crate::consumer::wiring::peer::PeerHandles;
 pub(crate) use crate::consumer::wiring::state::{
     CassandraStateProvider, KeyedStateInputs, MemoryStateProvider,
 };
 use crate::heartbeat::HeartbeatRegistry;
 pub use crate::otel::SpanRelation;
+use crate::peer::PeerHandles;
 use crate::producer::ProsodyProducer;
 use crate::requester::ProsodyRequester;
 pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
@@ -182,7 +182,6 @@ pub(crate) mod probes;
 pub mod storage;
 mod sweep;
 mod wiring;
-pub(crate) use wiring::peer::PreparePeer;
 
 /// Atomic counter for tracking changes in partition watermarks.
 ///

@@ -6,7 +6,7 @@ use crate::requester::registry::PendingRegistry;
 use crate::router::Host;
 use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::tests::support::TestDirectory;
-use crate::router::directory::tests::support::{membership, registration, test_directory};
+use crate::router::directory::tests::support::{registration, test_directory};
 use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
@@ -104,7 +104,7 @@ fn every_failure_answers_the_two_questions_the_send_path_asks() {
 fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let directory = test_directory(LEASE)?;
-        let published = registration(NodeId::new(), membership());
+        let published = registration(NodeId::new());
         directory.register(&published).await?;
 
         let router = test_router(directory)?;
@@ -158,7 +158,7 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
 fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let directory = test_directory(LEASE)?;
-        let published = registration(NodeId::new(), membership());
+        let published = registration(NodeId::new());
         directory.register(&published).await?;
 
         let router = test_router(directory.clone())?;
@@ -286,7 +286,6 @@ fn prop_a_route_follows_the_declared_labels(declared: Declared) -> TestResult {
         direct: direct.clone(),
         advertised: advertised.then(|| entry.clone()),
         network: declared.labels.there(),
-        group: None,
         hostname: Host::make("declared"),
     };
 
@@ -358,7 +357,7 @@ fn test_router(directory: TestDirectory) -> Result<RouterHandle<LoopbackSender, 
     Ok(RouterHandle::new(
         LocalTarget::new(
             NodeId::new(),
-            PendingRegistry::new(&RequesterConfiguration::default())?,
+            PendingRegistry::test(&RequesterConfiguration::default())?,
         ),
         AddressResolver::new(CACHE_CAPACITY, directory),
         Arc::new(DestinationFleet::new(FleetConfiguration::default())?),

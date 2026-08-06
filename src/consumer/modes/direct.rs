@@ -13,12 +13,12 @@ use crate::consumer::middleware::deduplication::{
 };
 use crate::consumer::observer::KafkaObserver;
 use crate::consumer::storage::StoreCreationError;
-use crate::consumer::wiring::peer::NoPeer;
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::state::{KeyedStateInputs, memory_state_provider};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MemoryLoader;
+use crate::peer::NoPeer;
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::telemetry::Telemetry;

@@ -20,8 +20,8 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 use tracing::field::Empty;
 use tracing::{Instrument, debug_span, warn};
 
-use super::LocalTarget;
 use super::witness::DeliveryWitness;
+use crate::router::LocalTarget;
 
 /// One in this many of the deadline that is left is what an endpoint keeps for
 /// the fallback behind it — and all an endpoint that has never answered may
@@ -36,7 +36,7 @@ pub(super) struct WorkerContext<R> {
 }
 
 /// One response route in a statically composed route chain.
-pub(super) trait ResponseRoute: Clone + Send + Sync + 'static {
+pub(crate) trait ResponseRoute: Clone + Send + Sync + 'static {
     /// Tries this route. `Declined` lets the next route try the same frame.
     fn deliver<C: Codec>(
         &self,
@@ -51,7 +51,7 @@ pub(super) trait ResponseRoute: Clone + Send + Sync + 'static {
 
 /// Two routes evaluated in order.
 #[derive(Clone)]
-pub(super) struct Then<A, B>(pub(super) A, pub(super) B);
+pub(crate) struct Then<A, B>(pub(crate) A, pub(crate) B);
 
 /// One response, waiting for its turn on a destination.
 pub(super) struct Job<C: Codec> {
@@ -386,7 +386,7 @@ impl<A: ResponseRoute, B: ResponseRoute> ResponseRoute for Then<A, B> {
 }
 
 /// How a response reached its requester.
-pub(super) enum Delivery {
+pub(crate) enum Delivery {
     /// The local registry accepted it without transport work.
     Local,
     /// A remote endpoint accepted it, after an optional fallback.
@@ -397,7 +397,7 @@ pub(super) enum Delivery {
 }
 
 /// Whether one route accepted a frame or left it for the next route.
-pub(super) enum RouteOutcome<P> {
+pub(crate) enum RouteOutcome<P> {
     Declined(P),
     Delivered(Delivery),
 }

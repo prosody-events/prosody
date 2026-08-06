@@ -1,8 +1,6 @@
 //! The Cassandra node directory.
 
-use super::{
-    Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
-};
+use super::{Endpoint, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl};
 use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraStore, TABLE_NODE_DIRECTORY};
 use crate::cassandra_queries;
@@ -21,15 +19,15 @@ cassandra_queries! {
         /// Writes every column of one node's row under one lease.
         register: (
             "INSERT INTO $keyspace.{} (node_id, direct_host, direct_port, advertised_host, \
-             advertised_port, network, kafka_cluster_id, group_id, hostname) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL ?",
+             advertised_port, network, hostname) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) USING TTL ?",
             TABLE_NODE_DIRECTORY
         ),
 
         /// Point-reads one node's row.
         read: (
             "SELECT direct_host, direct_port, advertised_host, advertised_port, network, \
-             kafka_cluster_id, group_id, hostname FROM $keyspace.{} WHERE node_id = ?",
+             hostname FROM $keyspace.{} WHERE node_id = ?",
             TABLE_NODE_DIRECTORY
         ),
 
@@ -47,8 +45,6 @@ type DirectoryColumns = (
     Option<i32>,
     Option<String>,
     Option<i32>,
-    Option<String>,
-    Option<String>,
     Option<String>,
     Option<String>,
 );
@@ -126,13 +122,6 @@ impl NodeDirectory for CassandraNodeDirectory {
             Some(endpoint) => (Some(endpoint.host.as_str()), Some(i32::from(endpoint.port))),
             None => (None, None),
         };
-        let (cluster, group) = match &registration.group {
-            Some(membership) => (
-                Some(membership.cluster.as_str()),
-                Some(membership.group.as_str()),
-            ),
-            None => (None, None),
-        };
         // An absent column binds CQL NULL, never `MaybeUnset::Unset`. An unset
         // column would keep its previous cell, and that cell would then expire
         // on its own older lease while the rest of the row lives — the row that
@@ -147,8 +136,6 @@ impl NodeDirectory for CassandraNodeDirectory {
                     advertised_host,
                     advertised_port,
                     registration.network.as_ref().map(Flexstr::as_str),
-                    cluster,
-                    group,
                     registration.hostname.as_str(),
                     self.ttl.seconds(),
                 ),
@@ -179,16 +166,8 @@ impl NodeDirectory for CassandraNodeDirectory {
             .maybe_first_row::<DirectoryColumns>()?;
         // Every column decodes as `Option`: a row can carry NULLs, and a
         // deserialization error would be Terminal where "absent" is the answer.
-        let Some((
-            direct_host,
-            direct_port,
-            advertised_host,
-            advertised_port,
-            network,
-            cluster,
-            group,
-            hostname,
-        )) = row
+        let Some((direct_host, direct_port, advertised_host, advertised_port, network, hostname)) =
+            row
         else {
             return Ok(None);
         };
@@ -196,17 +175,10 @@ impl NodeDirectory for CassandraNodeDirectory {
         // unresolvable rather than a shorter label: truncating would dial a
         // different host, and keeping it would put an unbounded string in the
         // address cache, which counts entries and not bytes.
-        let bounded = [
-            &direct_host,
-            &advertised_host,
-            &network,
-            &cluster,
-            &group,
-            &hostname,
-        ]
-        .into_iter()
-        .flatten()
-        .all(|label| label.len() <= MAX_LABEL_BYTES);
+        let bounded = [&direct_host, &advertised_host, &network, &hostname]
+            .into_iter()
+            .flatten()
+            .all(|label| label.len() <= MAX_LABEL_BYTES);
         let (true, Some(direct), Some(hostname)) =
             (bounded, endpoint(direct_host, direct_port), hostname)
         else {
@@ -218,7 +190,6 @@ impl NodeDirectory for CassandraNodeDirectory {
             direct,
             advertised: endpoint(advertised_host, advertised_port),
             network: network.map(|network| NetworkId::make(&network)),
-            group: membership(cluster, group),
             hostname: Host::make(&hostname),
         }))
     }
@@ -251,17 +222,5 @@ fn endpoint(host: Option<String>, port: Option<i32>) -> Option<Endpoint> {
     Some(Endpoint {
         host: Host::make(&host),
         port,
-    })
-}
-
-/// A group membership from its two columns. Both are written together, so one
-/// without the other names no group at all.
-fn membership(cluster: Option<String>, group: Option<String>) -> Option<GroupMembership> {
-    let (Some(cluster), Some(group)) = (cluster, group) else {
-        return None;
-    };
-    Some(GroupMembership {
-        cluster: Flexstr::make(&cluster),
-        group: Flexstr::make(&group),
     })
 }

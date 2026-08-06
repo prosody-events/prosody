@@ -6,9 +6,7 @@
 //! follows a `LOCAL_ONE` write in this suite.
 
 use super::support::{ArbRegistration, endpoint, label, node_id};
-use crate::router::directory::{
-    Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration,
-};
+use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
 use crate::router::{Host, MAX_LABEL_BYTES, NodeId};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
@@ -49,12 +47,10 @@ const SHAPES: usize = 2;
 /// two backends' clocks cannot disagree.
 pub(crate) const STABLE_LEASE: Duration = Duration::from_mins(10);
 
-const LABELS: [Label; 6] = [
+const LABELS: [Label; 4] = [
     Label::DirectHost,
     Label::AdvertisedHost,
     Label::Network,
-    Label::Cluster,
-    Label::Group,
     Label::Hostname,
 ];
 
@@ -82,8 +78,6 @@ enum Label {
     DirectHost,
     AdvertisedHost,
     Network,
-    Cluster,
-    Group,
     Hostname,
 }
 
@@ -242,11 +236,7 @@ pub(crate) async fn run_label_bound_case<D: NodeDirectory>(directory: &D) -> Res
         && read
             .advertised
             .as_ref()
-            .is_some_and(|entry| entry.host.is_fixed())
-        && read
-            .group
-            .as_ref()
-            .is_some_and(|membership| membership.cluster.is_fixed() && membership.group.is_fixed());
+            .is_some_and(|entry| entry.host.is_fixed());
     ensure!(
         inline,
         "a resolved registration must hold no label on the heap"
@@ -306,10 +296,6 @@ fn labelled(node: NodeId, over: Option<Label>) -> NodeRegistration {
             port: 443,
         }),
         network: Some(NetworkId::make(&text(Label::Network))),
-        group: Some(GroupMembership {
-            cluster: Flexstr::make(&text(Label::Cluster)),
-            group: Flexstr::make(&text(Label::Group)),
-        }),
         hostname: Host::make(&text(Label::Hostname)),
     }
 }

@@ -4,11 +4,11 @@ use super::super::{
     PeerInputs, PeerRuntimeError, PreparedPeerRuntime, RouterConfiguration, refresh_delay,
 };
 use super::{CONTACT, listener};
+use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::config::RequesterConfiguration;
 use crate::router::directory::RegistrationTtl;
 use crate::router::directory::tests::support::test_directory;
 use crate::router::fleet::config::FleetConfiguration;
-use crate::router::loopback::TestHealth;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
@@ -37,7 +37,7 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
         let outcome = PreparedPeerRuntime::start(PeerInputs {
             directory: test_directory(REFUSED_LEASE)?,
             listener: listener().await?,
-            health: TestHealth::new(true, true),
+            heartbeats: HeartbeatRegistry::test(),
             probe: Some(CONTACT),
             router: &router,
             fleet: FleetConfiguration::default(),
@@ -76,7 +76,7 @@ fn start_refuses_a_response_ceiling_above_the_frame_cap() -> Result<()> {
         let outcome = PreparedPeerRuntime::start(PeerInputs {
             directory: test_directory(REFUSED_LEASE)?,
             listener: bound,
-            health: TestHealth::new(true, true),
+            heartbeats: HeartbeatRegistry::test(),
             probe: Some(CONTACT),
             router: &router,
             fleet: FleetConfiguration::default(),

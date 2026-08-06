@@ -7,13 +7,18 @@ mod worker;
 
 use self::metrics::{DropReason, Stage};
 use self::witness::DeliveryWitness;
-use self::worker::{Job, ResponseRoute, Then, WorkerContext, run_worker};
+use self::worker::{Job, WorkerContext, run_worker};
 use crate::codec::Codec;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::{FrameCap, FrameHeader};
+#[cfg(test)]
+use crate::router::Router;
+#[cfg(test)]
+use crate::router::directory::NodeDirectory;
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::{FleetConfigurationError, validate_scratch_budget};
-use crate::router::{LocalTarget, RelayHop, Router, RouterHandle};
+#[cfg(test)]
+use crate::router::{RelayHop, ResponseSender, RouterHandle};
 use opentelemetry::Context;
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,6 +86,7 @@ pub(crate) struct ResponseWorkers(Box<[JoinHandle<()>]>);
 
 #[cfg(test)]
 pub(crate) use witness::SendCounters;
+pub(crate) use worker::{ResponseRoute, Then};
 
 impl<C: Codec> TypedSender<C> {
     /// Builds a sender over `router`'s fleet, with `cap` as the frame ceiling.
@@ -107,28 +113,26 @@ impl<C: Codec> TypedSender<C> {
         Self::build(router.fleet(), router, cap)
     }
 
-    /// Builds a sender that deposits responses for `local` without gRPC.
-    pub(crate) fn new<S, D>(
+    /// Builds the production route shape for ownership tests.
+    #[cfg(test)]
+    pub(crate) fn new<S: ResponseSender, D: NodeDirectory>(
         router: &RouterHandle<S, D>,
         cap: FrameCap,
-    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError>
-    where
-        RouterHandle<S, D>: Router,
-    {
-        Self::build(
-            router.fleet(),
+    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
+        Self::new_route(
             &Then(router.local().clone(), router.clone()),
+            router.fleet(),
             cap,
         )
     }
 
-    /// Builds a sender that can only reach this process.
-    pub(crate) fn new_local(
-        local: &LocalTarget,
+    /// Builds a sender from one statically composed response route.
+    pub(crate) fn new_route<R: ResponseRoute>(
+        route: &R,
         fleet: &Arc<DestinationFleet>,
         cap: FrameCap,
     ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
-        Self::build(fleet, local, cap)
+        Self::build(fleet, route, cap)
     }
 
     fn build<R: ResponseRoute>(

@@ -9,10 +9,6 @@
 --          dead process expires with no application logic. A clean shutdown
 --          deletes the row.
 --
---          kafka_cluster_id sits beside group_id because Kafka scopes a group
---          id to its cluster: two unrelated clusters can each run a group named
---          `orders`, and the group alone names no set of processes.
---
 --          No conditional write appears here, and no statement supplies its own
 --          write timestamp: the session's monotonic generator stamps every
 --          write. The deployment's general-purpose compaction applies.
@@ -28,8 +24,6 @@ CREATE TABLE {{KEYSPACE}}.{{TABLE_NODE_DIRECTORY}} (
     advertised_host  text,
     advertised_port  int,
     network          text,
-    kafka_cluster_id text,
-    group_id         text,
     hostname         text
 ) WITH compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }
   AND compression = { 'class': 'ZstdCompressor' };

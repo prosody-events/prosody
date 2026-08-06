@@ -291,7 +291,6 @@ async fn crossing(pair: &Pair) -> Result<()> {
         direct: pair.target.address.clone(),
         advertised: Some(pair.relay.address.clone()),
         network: Some(NetworkId::make(THERE)),
-        group: None,
         hostname: Host::make("crossing"),
     };
     let router = FixedRouter::new(

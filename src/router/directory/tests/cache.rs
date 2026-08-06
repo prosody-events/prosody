@@ -1,6 +1,4 @@
-use super::support::{
-    cassandra_directory, finish, membership, registration, test_directory_holding, token,
-};
+use super::support::{cassandra_directory, finish, registration, test_directory_holding, token};
 use crate::router::directory::cache::AddressCache;
 use crate::router::directory::{Endpoint, NodeDirectory, NodeRegistration, RegistrationTtl};
 use crate::router::{Host, NodeId};
@@ -266,14 +264,13 @@ async fn resolve<D: NodeDirectory>(
 /// Registers [`POOL`] nodes, each with a distinct direct port so a mixed-up
 /// cache entry serves an observably wrong value.
 async fn register_pool<D: NodeDirectory>(directory: &D) -> Result<Vec<(NodeId, u16)>> {
-    let membership = membership();
     let mut nodes = Vec::with_capacity(POOL);
     for index in 0..POOL {
         let node = NodeId::new();
         // The port is the value the assertions join on, so it must differ per
         // node.
         let port = 20_000 + index as u16;
-        let mut written = registration(node, membership.clone());
+        let mut written = registration(node);
         written.direct = Endpoint {
             host: Host::make(&format!("pool-{}", token())),
             port,

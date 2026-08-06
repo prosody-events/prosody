@@ -3,16 +3,18 @@
 
 use crate::codec::Codec;
 use crate::consumer::middleware::respond::Responder;
+use crate::heartbeat::HeartbeatRegistry;
+use crate::peer::PeerResponder;
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::FrameCap;
-use crate::response::sender::ResponseWorkers;
+use crate::response::sender::{ResponseWorkers, Then};
 use crate::router::directory::cache::AddressResolver;
-use crate::router::directory::{GroupMembership, NodeDirectory, NodeRegistration, RegistrationTtl};
+use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
 use crate::router::grpc::client::GrpcSender;
-use crate::router::grpc::health::ProcessHealth;
+use crate::router::grpc::health::RuntimeHealth;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
 use crate::router::relay::Relay;
@@ -105,6 +107,7 @@ pub(crate) struct PreparedPeerRuntime<D> {
     frame_cap: FrameCap,
     directory: D,
     registration: NodeRegistration,
+    heartbeats: HeartbeatRegistry,
     stop_listener: oneshot::Sender<()>,
     listener: JoinHandle<()>,
 }
@@ -127,7 +130,7 @@ pub(crate) struct LocalPeerRuntime {
 /// The bound listener inside is a unique resource, so one value serves one
 /// process. Two runtimes need a second, grep-visible call to
 /// [`PreparedPeerRuntime::start`].
-pub(crate) struct PeerInputs<'a, H, D> {
+pub(crate) struct PeerInputs<'a, D> {
     /// Where this process publishes itself, and how it resolves a peer. Its
     /// lease is the single source: the runtime ages its address cache on it and
     /// paces its refresher inside it.
@@ -135,7 +138,8 @@ pub(crate) struct PeerInputs<'a, H, D> {
     /// The already-bound peer listener. The runtime serves this listener and
     /// publishes the port that the operating system assigned.
     pub(crate) listener: BoundListener,
-    pub(crate) health: H,
+    /// Heartbeats owned by this peer runtime.
+    pub(crate) heartbeats: HeartbeatRegistry,
     /// The address that the routed-address probe aims at.
     pub(crate) probe: Option<SocketAddr>,
     pub(crate) router: &'a RouterConfiguration,
@@ -162,9 +166,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
     ///
     /// Returns [`PeerRuntimeError`] when the configuration, discovery, the
     /// registry, the fleet, or the listener refuses to start.
-    pub(crate) async fn start<H: ProcessHealth>(
-        inputs: PeerInputs<'_, H, D>,
-    ) -> Result<Self, PeerRuntimeError> {
+    pub(crate) async fn start(inputs: PeerInputs<'_, D>) -> Result<Self, PeerRuntimeError> {
         inputs.router.validate()?;
         // One ceiling for both seams: the frames this process sends and the
         // frames its listener admits.
@@ -175,7 +177,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         // the caller would learn that only from its own timeout.
         validate_response_ceiling(inputs.requester.max_response_bytes, frame_cap.bytes())?;
         let fleet = Arc::new(DestinationFleet::new(inputs.fleet)?);
-        let pending = PendingRegistry::new(inputs.requester)?;
+        let pending = PendingRegistry::new(inputs.requester, &inputs.heartbeats)?;
         let transport = Arc::new(GrpcSender::new(frame_cap, &fleet));
         let directory = inputs.directory;
         // The blocking pool owns this wait; a runtime thread must not. The
@@ -207,7 +209,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
                 frame_cap,
                 inputs.fleet.send_deadline,
             ),
-            inputs.health,
+            RuntimeHealth::new(inputs.heartbeats.clone()),
             async move { drop(stopped.await) },
         ) {
             Ok(listener) => listener,
@@ -221,6 +223,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
             frame_cap,
             directory,
             registration,
+            heartbeats: inputs.heartbeats,
             stop_listener,
             listener,
         })
@@ -243,11 +246,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
     /// Returns this value and the directory's error when the first write fails.
     /// The caller then owns the release order, because only the caller knows
     /// what else it holds.
-    pub(crate) async fn activate(
-        mut self,
-        group: Option<GroupMembership>,
-    ) -> Result<PeerRuntime<D>, (Self, D::Error)> {
-        self.registration.group = group;
+    pub(crate) async fn activate(self) -> Result<PeerRuntime<D>, (Self, D::Error)> {
         if let Err(error) = self.directory.register(&self.registration).await {
             if let Err(delete_error) = self.directory.deregister(&self.registration).await {
                 warn!(%delete_error, node = %self.registration.node, "failed peer registration rollback");
@@ -259,10 +258,16 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         let refresh = tokio::spawn({
             let directory = self.directory.clone();
             let registration = self.registration.clone();
+            let heartbeat = self.heartbeats.register("directory refresh");
             async move {
+                heartbeat.beat();
                 loop {
                     select! {
                         () = sleep(refresh_delay(ttl)) => {}
+                        () = heartbeat.next() => {
+                            heartbeat.beat();
+                            continue;
+                        }
                         outcome = stopped.changed() => {
                             if outcome.is_err() {
                                 break;
@@ -279,6 +284,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
                     if let Err(error) = directory.register(&registration).await {
                         warn!(%error, node = %registration.node, "node registration refresh failed");
                     }
+                    heartbeat.beat();
                 }
             }
         });
@@ -312,7 +318,18 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         &self,
         subsystem: SubsystemName,
     ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
-        Responder::new(&self.router, self.frame_cap, subsystem)
+        self.responder_factory().responder(subsystem)
+    }
+
+    /// Shares the route that typed consumer responders bind to.
+    pub(crate) fn responder_factory(
+        &self,
+    ) -> PeerResponder<Then<LocalTarget, RouterHandle<GrpcSender, D>>> {
+        PeerResponder::new(
+            Then(self.router.local().clone(), self.router.clone()),
+            Arc::clone(&self.router.fleet),
+            self.frame_cap,
+        )
     }
 
     /// Stops every local resource without publishing the node.
@@ -328,11 +345,12 @@ impl PreparedLocalPeerRuntime {
         frame_cap: FrameCap,
         fleet: FleetConfiguration,
         requester: &RequesterConfiguration,
+        heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, PeerRuntimeError> {
         validate_response_ceiling(requester.max_response_bytes, frame_cap.bytes())?;
         let fleet = Arc::new(DestinationFleet::new(fleet)?);
         Ok(Self {
-            local: LocalTarget::new(NodeId::new(), PendingRegistry::new(requester)?),
+            local: LocalTarget::new(NodeId::new(), PendingRegistry::new(requester, heartbeats)?),
             frame_cap,
             fleet,
         })
@@ -348,7 +366,12 @@ impl PreparedLocalPeerRuntime {
         &self,
         subsystem: SubsystemName,
     ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
-        Responder::new_local(&self.local, &self.fleet, self.frame_cap, subsystem)
+        self.responder_factory().responder(subsystem)
+    }
+
+    /// Shares the local route that typed consumer responders bind to.
+    pub(crate) fn responder_factory(&self) -> PeerResponder<LocalTarget> {
+        PeerResponder::new(self.local.clone(), Arc::clone(&self.fleet), self.frame_cap)
     }
 
     /// Starts the local runtime. No external activation is necessary.

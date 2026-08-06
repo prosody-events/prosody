@@ -5,6 +5,7 @@ mod pending;
 pub(in crate::requester) use self::pending::{
     Arrival, Awaited, Finished, PendingRequest, Status, Terminal,
 };
+use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::requester::RequestError;
 use crate::requester::config::{MIN_TIMEOUT, RequesterConfiguration};
 use crate::response::frame::ResponseFrame;
@@ -24,6 +25,7 @@ use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::select;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval};
@@ -121,7 +123,10 @@ impl PendingRegistry {
     /// # Errors
     ///
     /// Returns [`RegistryError::InvalidConfiguration`] when a limit is invalid.
-    pub(crate) fn new(config: &RequesterConfiguration) -> Result<Arc<Self>, RegistryError> {
+    pub(crate) fn new(
+        config: &RequesterConfiguration,
+        heartbeats: &HeartbeatRegistry,
+    ) -> Result<Arc<Self>, RegistryError> {
         config.validate()?;
         let registry = Arc::new(Self {
             entries: HashMap::with_capacity_and_hasher(
@@ -136,9 +141,19 @@ impl PendingRegistry {
             closed: AtomicBool::new(false),
             sweeper: Mutex::new(None),
         });
-        let sweep = spawn_sweep(Arc::downgrade(&registry), config.sweep_grace);
+        let sweep = spawn_sweep(
+            Arc::downgrade(&registry),
+            config.sweep_grace,
+            heartbeats.register("request sweep"),
+        );
         *registry.sweeper.lock() = Some(sweep);
         Ok(registry)
+    }
+
+    /// Builds a registry with a test-owned heartbeat registry.
+    #[cfg(test)]
+    pub(crate) fn test(config: &RequesterConfiguration) -> Result<Arc<Self>, RegistryError> {
+        Self::new(config, &HeartbeatRegistry::test())
     }
 
     /// Checks one call's arguments against this registry's own caps and
@@ -434,12 +449,23 @@ impl Drop for Registration {
 }
 
 /// Starts the task that removes entries after their grace period.
-fn spawn_sweep(registry: Weak<PendingRegistry>, grace: Duration) -> JoinHandle<()> {
+fn spawn_sweep(
+    registry: Weak<PendingRegistry>,
+    grace: Duration,
+    heartbeat: Heartbeat,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticks = interval(grace);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        heartbeat.beat();
         loop {
-            ticks.tick().await;
+            select! {
+                _ = ticks.tick() => {}
+                () = heartbeat.next() => {
+                    heartbeat.beat();
+                    continue;
+                }
+            }
             let Some(registry) = registry.upgrade() else {
                 return;
             };
@@ -447,6 +473,7 @@ fn spawn_sweep(registry: Weak<PendingRegistry>, grace: Duration) -> JoinHandle<(
                 return;
             }
             registry.sweep(Instant::now());
+            heartbeat.beat();
         }
     })
 }

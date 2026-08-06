@@ -52,6 +52,7 @@ pub mod heartbeat;
 pub mod high_level;
 pub mod loader;
 pub mod otel;
+pub mod peer;
 pub mod prelude;
 pub mod producer;
 pub mod propagator;
@@ -70,9 +71,7 @@ mod util;
 
 pub use crate::codec::{Codec, JsonCodec};
 pub use crate::error::{ClassifyError, ErrorCategory};
-pub use crate::router::config::{
-    PeerConfiguration, PeerConfigurationBuilder, PeerConfigurationBuilderError,
-};
+pub use crate::peer::{PeerConfiguration, PeerConfigurationBuilder, PeerConfigurationBuilderError};
 
 /// A lazily initialized mock Kafka cluster for testing.
 ///

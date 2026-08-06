@@ -6,61 +6,39 @@ use super::{
 };
 use crate::codec::Codec;
 use crate::consumer::error::{ConsumerError, PeerInitError};
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::HandlerMiddleware;
 use crate::consumer::middleware::deduplication::MemoryDeduplicationStoreProvider;
 use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::monopolization::MonopolizationConfiguration;
-use crate::consumer::middleware::respond::Responder;
 use crate::consumer::middleware::retry::RetryConfiguration;
-use crate::consumer::middleware::tests::test_support::{
-    MockEventContext, ScriptedHandler, TestError,
-};
-use crate::consumer::partition::offsets::OffsetTracker;
+use crate::consumer::middleware::tests::test_support::{ScriptedHandler, TestError};
 use crate::consumer::wiring::build_common_middleware;
 use crate::consumer::wiring::memory_deps;
-use crate::consumer::wiring::peer::{
-    PeerAttachment, PreparedResponder, prepare_requester, prepare_responding,
-};
 use crate::consumer::{
-    ConsumerSetup, DemandType, EventHandler, HandlerProvider, Managers,
-    PipelineMiddlewareConfiguration, ProsodyConsumer, TypedConsumerSetup,
+    ConsumerSetup, PipelineMiddlewareConfiguration, ProsodyConsumer, TypedConsumerSetup,
 };
 use crate::error::ErrorCategory;
-use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
+use crate::peer::{PeerAttachment, prepare_responding};
 use crate::response::frame::FrameCap;
-use crate::response::frame::decode::decode_frame;
-use crate::response::headers::RequestTag;
-use crate::response::{RequestId, ResponseStatus};
-use crate::router::loopback::{TestRouter, collect_deliveries, config, node};
 use crate::state_reader::StateReaderDependencies;
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
-use crate::{JsonCodec, Partition, PeerConfiguration, Topic};
+use crate::{JsonCodec, PeerConfiguration};
 use color_eyre::Result;
 use color_eyre::eyre::{bail, ensure, eyre};
-use crossbeam_utils::CachePadded;
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::Semaphore;
-use tracing::Span;
-
-const RESPONSE_CAP_BYTES: usize = 4096;
 
 /// Destinations enough that one encode scratch each, at the widest ceiling a
 /// frame may carry, is over the budget one sender may commit to.
 const SCRATCH_DESTINATIONS: usize = 8;
 
 const SUBSYSTEM: &str = "billing";
-const TOPIC: &str = "responding-wiring";
-const PARTITION: Partition = 0;
 
 #[derive(Default)]
 struct SomeResponseCodec;
@@ -85,89 +63,6 @@ impl Codec for SomeResponseCodec {
     }
 }
 
-/// Production termination captures a request tag and delivers one response.
-///
-/// The attachment also reports the name the decode path admits. That name is
-/// read from the responder, so it is the one the delivered frame claims.
-#[tokio::test]
-async fn the_responding_wiring_answers_a_tagged_message() -> Result<()> {
-    let log: EventLog = Arc::new(Mutex::new(Vec::new()));
-    let directory = RecordingDirectory::new(Arc::clone(&log), false);
-    let backend = RecordingBackend {
-        directory: directory.clone(),
-    };
-    let consumer = consumer_config("responding-wiring-termination")?;
-    let peer_config = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let managers: Arc<Managers<Value>> = Arc::default();
-    let heartbeats = HeartbeatRegistry::new(consumer.group_id.clone(), consumer.stall_threshold);
-    let peer = prepare_requester(&peer_config, &backend, true, managers, &heartbeats).await?;
-    let (router, mut deliveries) = TestRouter::new(config(1, 1))?;
-    let (responder, workers) = Responder::<SomeResponseCodec>::new_without_local(
-        &router,
-        FrameCap::new(RESPONSE_CAP_BYTES)?,
-        SubsystemName::try_new(SUBSYSTEM)?,
-    )?;
-    let prepared = PreparedResponder::from_parts(peer, responder, workers);
-    let common = common_config(None, Some(SubsystemName::try_new(SUBSYSTEM)?))?;
-    let middleware = build_common_middleware::<_, Value>(
-        &common,
-        &consumer,
-        Telemetry::new(),
-        MemoryDeduplicationStoreProvider::new(),
-    )?
-    .layer(LogMiddleware::new());
-    let (provider, peer) = prepared.terminate(&middleware, ScriptedHandler::success());
-    let admitted = peer.responder();
-    let handler = provider.handler_for_partition(Topic::from(TOPIC), PARTITION);
-    let tracker = OffsetTracker::new(
-        Topic::from(TOPIC),
-        PARTITION,
-        10,
-        Duration::from_secs(5),
-        Arc::new(CachePadded::new(AtomicUsize::new(0))),
-    );
-    let semaphore = Arc::new(Semaphore::new(1));
-    let message = ConsumerMessage::new(
-        ConsumerMessageValue {
-            key: "request-key".into(),
-            topic: Topic::from(TOPIC),
-            partition: PARTITION,
-            request: Some(RequestTag::new(RequestId::from_bytes([9; 16]), node(1))),
-            ..Default::default()
-        },
-        Span::current(),
-        semaphore.try_acquire_owned()?,
-    )
-    .into_uncommitted(tracker.take(0).await?);
-    EventHandler::on_message(
-        &handler,
-        MockEventContext::new(),
-        message,
-        DemandType::Normal,
-    )
-    .await;
-    drop(handler);
-    drop(provider);
-    peer.abandon().await;
-    drop(router);
-
-    let mut recorded = collect_deliveries(&mut deliveries).await;
-    ensure!(
-        recorded.len() == 1,
-        "the transport did not receive one response"
-    );
-    let mut delivery = recorded.remove(0);
-    let frame = decode_frame(&mut delivery.bytes, FrameCap::new(RESPONSE_CAP_BYTES)?)?;
-    assert_eq!(frame.header.request, RequestId::from_bytes([9; 16]));
-    assert_eq!(frame.header.subsystem, SubsystemName::try_new(SUBSYSTEM)?);
-    assert_eq!(frame.header.status, ResponseStatus::Success);
-    ensure!(
-        admitted.as_ref() == Some(&frame.header.subsystem),
-        "the consumer admits a request under a name its own answer does not claim"
-    );
-    Ok(())
-}
-
 /// Preparation carries the responder's own name out to startup.
 ///
 /// The decode path admits a request tag for the name the attachment reports,
@@ -182,17 +77,9 @@ async fn the_prepared_peer_admits_the_name_its_responder_answers_with() -> Resul
     let consumer = consumer_config("responding-wiring-admits")?;
     let peer_config = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let subsystem = SubsystemName::try_new(SUBSYSTEM)?;
-    let managers: Arc<Managers<Value>> = Arc::default();
-    let heartbeats = HeartbeatRegistry::new(consumer.group_id.clone(), consumer.stall_threshold);
-    let prepared = prepare_responding::<SomeResponseCodec, _, _>(
-        &peer_config,
-        &backend,
-        true,
-        subsystem.clone(),
-        managers,
-        &heartbeats,
-    )
-    .await?;
+    let prepared =
+        prepare_responding::<SomeResponseCodec, _>(&peer_config, &backend, true, subsystem.clone())
+            .await?;
     let common = common_config(None, Some(subsystem.clone()))?;
     let middleware = build_common_middleware::<_, Value>(
         &common,
@@ -227,7 +114,6 @@ async fn the_prepared_responder_is_sized_by_the_runtimes_frame_cap() -> Result<(
     let backend = RecordingBackend {
         directory: RecordingDirectory::new(log, false),
     };
-    let consumer = consumer_config("responding-wiring-scratch")?;
     // One connection of one stream keeps the widest ceiling inside the
     // listener's receive budget, so the scratch budget is the one rule this
     // configuration breaks.
@@ -239,15 +125,11 @@ async fn the_prepared_responder_is_sized_by_the_runtimes_frame_cap() -> Result<(
         .max_concurrent_streams(1_u32)
         .max_destinations(SCRATCH_DESTINATIONS)
         .build()?;
-    let managers: Arc<Managers<Value>> = Arc::default();
-    let heartbeats = HeartbeatRegistry::new(consumer.group_id.clone(), consumer.stall_threshold);
-    let prepared = prepare_responding::<SomeResponseCodec, _, _>(
+    let prepared = prepare_responding::<SomeResponseCodec, _>(
         &peer,
         &backend,
         true,
         SubsystemName::try_new(SUBSYSTEM)?,
-        managers,
-        &heartbeats,
     )
     .await;
     match prepared {

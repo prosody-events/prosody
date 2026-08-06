@@ -2,6 +2,7 @@
 //! connections it holds, and what it discloses.
 
 use super::{FRAME_CAP, Harness, transport};
+use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::config::RequesterConfiguration;
 use crate::response::frame::FrameCap;
 use crate::router::directory::tests::support::cassandra_directory;
@@ -10,7 +11,6 @@ use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::codec::ClientFrameCodec;
 use crate::router::grpc::conn::admitted;
 use crate::router::grpc::{BoundListener, TRANSPORT, TransportConfiguration};
-use crate::router::loopback::TestHealth;
 use crate::router::runtime::{PeerInputs, RouterConfiguration, start_runtime};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -107,18 +107,15 @@ fn a_registration_publishes_the_port_the_listener_bound() -> Result<()> {
             ..RequesterConfiguration::default()
         };
         let directory = cassandra_directory(RegistrationTtl::DEFAULT.duration()).await?;
-        let runtime = start_runtime(
-            PeerInputs {
-                directory: directory.clone(),
-                listener: bound,
-                health: TestHealth::new(true, true),
-                probe: Some(CONTACT),
-                router: &router,
-                fleet: FleetConfiguration::default(),
-                requester: &requester,
-            },
-            None,
-        )
+        let runtime = start_runtime(PeerInputs {
+            directory: directory.clone(),
+            listener: bound,
+            heartbeats: HeartbeatRegistry::test(),
+            probe: Some(CONTACT),
+            router: &router,
+            fleet: FleetConfiguration::default(),
+            requester: &requester,
+        })
         .await?;
         let outcome = async {
             let published = directory

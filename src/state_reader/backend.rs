@@ -1,7 +1,6 @@
 //! Concrete component families used by standalone readers.
 
 use crate::codec::Codec;
-use crate::consumer::PreparePeer;
 use crate::consumer::middleware::deduplication::{
     CassandraDeduplicationStoreProvider, MemoryDeduplicationStoreProvider,
 };
@@ -15,12 +14,10 @@ use crate::consumer::storage::components::{cassandra, memory};
 use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
 use crate::consumer::{
     CassandraStateProvider, ConsumerError, KafkaObserver, KeyedStateInputs, MemoryStateProvider,
-    PeerInitError,
 };
 use crate::error::ClassifyError;
 use crate::loader::{KafkaLoader, MemoryLoader, MessageLoader};
-use crate::router::directory::cassandra::CassandraNodeDirectory;
-use crate::router::directory::{NodeDirectory, RegistrationTtl};
+use crate::peer::PeerBackend;
 use crate::state::cassandra::{
     CassandraCellResources, CassandraCellStoreError, CassandraDescriptorIdentityStore,
     CassandraPublicationStore,
@@ -180,27 +177,6 @@ where
     fn loader(&self) -> &Self::Loader;
 }
 
-/// Selects a peer runtime with local and gRPC routes.
-pub(crate) struct NetworkPeerMode;
-
-/// Selects a peer runtime with only the local route.
-pub(crate) struct LocalPeerMode;
-
-/// A backend that selects its peer runtime at compile time.
-pub(crate) trait PeerBackend: Send + Sync + Sized + 'static {
-    type PeerMode: PreparePeer<Self>;
-}
-
-/// A backend that supplies a directory to the network peer runtime.
-pub(crate) trait NetworkPeerBackend: PeerBackend {
-    type Directory: NodeDirectory;
-
-    fn node_directory(
-        &self,
-        lease: RegistrationTtl,
-    ) -> impl Future<Output = Result<Self::Directory, ConsumerError>> + Send;
-}
-
 /// Reader family that can also supply a consumer's matching stores.
 pub(crate) trait ConsumerReaderBackend<C>:
     ReaderBackend<C> + ConsumerStorageBackend<C> + PeerBackend
@@ -235,6 +211,11 @@ impl<C, S, P, I, L> ReaderComponents<C, S, P, I, L> {
             loader,
             codec: PhantomData,
         }
+    }
+
+    /// Returns the cell component for another shared client component.
+    pub(crate) const fn cells_ref(&self) -> &S {
+        &self.cells
     }
 }
 
@@ -285,31 +266,6 @@ pub type MemoryReaderBackend<C> = ReaderComponents<
     MemoryDescriptorIdentityStore,
     MemoryLoader<<C as Codec>::Payload>,
 >;
-
-impl<C: Codec> PeerBackend for CassandraReaderBackend<C> {
-    type PeerMode = NetworkPeerMode;
-}
-
-impl<C: Codec> NetworkPeerBackend for CassandraReaderBackend<C> {
-    type Directory = CassandraNodeDirectory;
-
-    async fn node_directory(
-        &self,
-        lease: RegistrationTtl,
-    ) -> Result<Self::Directory, ConsumerError> {
-        CassandraNodeDirectory::new(self.cells.session.clone(), lease)
-            .await
-            .map_err(|error| {
-                ConsumerError::Peer(PeerInitError::Directory {
-                    message: format!("{error:#}"),
-                })
-            })
-    }
-}
-
-impl<C: Codec> PeerBackend for MemoryReaderBackend<C> {
-    type PeerMode = LocalPeerMode;
-}
 
 impl<C> ConsumerStorageBackend<C> for CassandraReaderBackend<C>
 where

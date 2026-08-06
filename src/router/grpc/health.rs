@@ -9,12 +9,9 @@
 //! the second opinion this service exists to avoid.
 
 use super::generated::peer_server::SERVICE_NAME;
-use crate::consumer::Managers;
-use crate::consumer::probes::{is_live, is_ready};
 use crate::heartbeat::HeartbeatRegistry;
 use async_trait::async_trait;
 use futures::stream::Empty;
-use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tonic_health::ServingStatus;
 use tonic_health::pb::health_check_response::ServingStatus as WireStatus;
@@ -34,9 +31,8 @@ pub(crate) trait ProcessHealth: Send + Sync + 'static {
     fn live(&self) -> bool;
 }
 
-/// A consumer's health, read from the same state the HTTP probes read.
-pub(crate) struct ConsumerHealth<P> {
-    managers: Arc<Managers<P>>,
+/// Health of a peer runtime that is serving this check.
+pub(crate) struct RuntimeHealth {
     heartbeats: HeartbeatRegistry,
 }
 
@@ -45,23 +41,20 @@ pub(crate) struct PeerHealth<H> {
     health: H,
 }
 
-impl<P> ConsumerHealth<P> {
-    /// Reads the consumer that owns `managers` and `heartbeats`.
-    pub(crate) const fn new(managers: Arc<Managers<P>>, heartbeats: HeartbeatRegistry) -> Self {
-        Self {
-            managers,
-            heartbeats,
-        }
+impl RuntimeHealth {
+    /// Reads liveness from the peer runtime's own heartbeat registry.
+    pub(crate) const fn new(heartbeats: HeartbeatRegistry) -> Self {
+        Self { heartbeats }
     }
 }
 
-impl<P: Send + Sync + 'static> ProcessHealth for ConsumerHealth<P> {
+impl ProcessHealth for RuntimeHealth {
     fn ready(&self) -> bool {
-        is_ready(&self.managers)
+        !self.heartbeats.any_stalled()
     }
 
     fn live(&self) -> bool {
-        is_live(&self.managers, &self.heartbeats)
+        true
     }
 }
 

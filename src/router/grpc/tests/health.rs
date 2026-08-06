@@ -1,20 +1,13 @@
 //! What the gRPC health service answers, and whose verdict it is.
 
 use super::Harness;
-use crate::consumer::Managers;
-use crate::consumer::probes::ProbeServer;
-use crate::heartbeat::HeartbeatRegistry;
 use crate::router::grpc::generated::peer_server::SERVICE_NAME;
-use crate::router::grpc::health::{ConsumerHealth, PeerHealth};
+use crate::router::grpc::health::PeerHealth;
 use crate::router::loopback::TestHealth;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
-use reqwest::Client;
-use reqwest::StatusCode;
-use serde_json::Value;
-use std::sync::Arc;
 use tonic::transport::Endpoint as Dialled;
 use tonic::{Code, Request};
 use tonic_health::pb::HealthCheckRequest;
@@ -59,42 +52,6 @@ fn the_grpc_health_answer_follows_the_predicates() -> Result<()> {
     })
 }
 
-/// One consumer with no partitions assigned, read over both surfaces.
-///
-/// The two read the same predicates, so `/readyz` and the empty gRPC name must
-/// agree that it is unready. They agree by folding, not by matching: `/livez`
-/// calls the same process live, while the empty name answers `NOT_SERVING`
-/// because it reports ready **and** live. That is the fold the empty name
-/// documents, pinned here so a liveness probe is never wired to it by mistake.
-#[test]
-fn the_two_health_surfaces_agree() -> Result<()> {
-    init_test_logging();
-    TEST_RUNTIME.block_on(async {
-        let managers: Arc<Managers<Value>> = Arc::default();
-        let heartbeats = HeartbeatRegistry::test();
-        let server = ProbeServer::new(0, Arc::clone(&managers), heartbeats.clone())?;
-        let address = server.local_addr();
-        let health = PeerHealth::new(ConsumerHealth::new(managers, heartbeats));
-        let ready_over_http = probe(address.port(), "/readyz").await;
-        let live_over_http = probe(address.port(), "/livez").await;
-        let over_grpc = check(&health, "").await;
-        server.shutdown().await;
-        ensure!(
-            ready_over_http? == StatusCode::SERVICE_UNAVAILABLE,
-            "a consumer with no partitions assigned is unready over HTTP"
-        );
-        ensure!(
-            live_over_http? == StatusCode::OK,
-            "the same consumer is live over HTTP"
-        );
-        ensure!(
-            over_grpc? == Some(i32::from(ServingStatus::NotServing)),
-            "the empty gRPC name reports ready and live together, so it must not serve"
-        );
-        Ok(())
-    })
-}
-
 /// `grpc.health.v1` is routed on the peer port itself, not merely built.
 ///
 /// A generic client dials the shared listener and reads all three answers off
@@ -130,15 +87,6 @@ fn request(service: &str) -> HealthCheckRequest {
     HealthCheckRequest {
         service: service.to_owned(),
     }
-}
-
-/// The status one HTTP probe answered.
-async fn probe(port: u16, path: &str) -> Result<StatusCode> {
-    Ok(Client::new()
-        .get(format!("http://127.0.0.1:{port}{path}"))
-        .send()
-        .await?
-        .status())
 }
 
 /// The serving status one `Check` answered, or `None` when the name is not

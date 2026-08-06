@@ -29,7 +29,7 @@
 //! [`responding_provider`] is the only way to build the layer from outside this
 //! module, and it states what that placement guarantees. Its production caller
 //! is
-//! [`PreparedResponder::terminate`](crate::consumer::wiring::peer::PreparedResponder::terminate),
+//! [`PreparedResponder::terminate`](crate::peer::runtime::PreparedResponder::terminate),
 //! which a responding consumer reaches through its own entry point.
 
 use super::providers::{FallibleCloneProvider, LeafHandler};
@@ -42,15 +42,14 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::response::ResponseStatus;
 use crate::response::frame::FrameCap;
 use crate::response::headers::RequestTag;
+use crate::response::sender::ResponseRoute;
 #[cfg(test)]
 use crate::response::sender::SendCounters;
 use crate::response::sender::{ResponseWorkers, TypedSender};
 #[cfg(test)]
 use crate::router::Router;
-use crate::router::directory::NodeDirectory;
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfigurationError;
-use crate::router::{LocalTarget, ResponseSender, RouterHandle};
 use crate::subsystem::SubsystemName;
 use crate::timers::Trigger;
 use opentelemetry::Context;
@@ -69,7 +68,7 @@ mod tests;
 /// `subsystem` is the name this consumer answers peer requests for. The decode
 /// path admits a request tag for one name, and it reads that name back from
 /// this responder through
-/// [`PeerAttachment::responder`](crate::consumer::wiring::peer::PeerAttachment::responder).
+/// [`PeerAttachment::responder`](crate::peer::PeerAttachment::responder).
 /// So the name a record is admitted by and the name its answer claims are one
 /// value.
 pub(crate) struct Responder<C: Codec> {
@@ -128,6 +127,17 @@ pub(crate) struct RespondHandler<H, C: Codec> {
 }
 
 impl<C: Codec> Responder<C> {
+    /// Builds a responder from one statically composed response route.
+    pub(crate) fn new_route<R: ResponseRoute>(
+        route: &R,
+        fleet: &Arc<DestinationFleet>,
+        cap: FrameCap,
+        subsystem: SubsystemName,
+    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
+        let (sender, workers) = TypedSender::new_route(route, fleet, cap)?;
+        Ok((Self { sender, subsystem }, workers))
+    }
+
     /// Builds a responder from the process router and the response frame cap.
     ///
     /// Returns the responder and its [`ResponseWorkers`], which owns the order
@@ -139,27 +149,6 @@ impl<C: Codec> Responder<C> {
         subsystem: SubsystemName,
     ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
         let (sender, workers) = TypedSender::new_without_local(router, cap)?;
-        Ok((Self { sender, subsystem }, workers))
-    }
-
-    /// Builds a responder that deposits same-node responses without gRPC.
-    pub(crate) fn new<S: ResponseSender, D: NodeDirectory>(
-        router: &RouterHandle<S, D>,
-        cap: FrameCap,
-        subsystem: SubsystemName,
-    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
-        let (sender, workers) = TypedSender::new(router, cap)?;
-        Ok((Self { sender, subsystem }, workers))
-    }
-
-    /// Builds a responder that can only deposit same-node responses.
-    pub(crate) fn new_local(
-        local: &LocalTarget,
-        fleet: &Arc<DestinationFleet>,
-        cap: FrameCap,
-        subsystem: SubsystemName,
-    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
-        let (sender, workers) = TypedSender::new_local(local, fleet, cap)?;
         Ok((Self { sender, subsystem }, workers))
     }
 

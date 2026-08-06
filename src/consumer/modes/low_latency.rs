@@ -14,13 +14,13 @@ use crate::consumer::kafka_context::PartitionProviders;
 use crate::consumer::middleware::retry::RetryMiddleware;
 use crate::consumer::middleware::topic::FailureTopicMiddleware;
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
-use crate::consumer::wiring::peer::{NoPeer, prepare_requester, prepare_responding};
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::{
     build_common_middleware, build_typed_state, cassandra_deps, memory_deps,
 };
 use crate::consumer::{Managers, ProsodyConsumer};
 use crate::high_level::config::TriggerStoreConfiguration;
+use crate::peer::{NoPeer, prepare_requester, prepare_responding};
 use crate::producer::ProsodyProducer;
 use crate::state_reader::ConsumerReaderBackend;
 use crate::telemetry::Telemetry;
@@ -192,14 +192,9 @@ where
         // could drop a served listener.
         match setup.common.peer.as_ref() {
             Some(peer) => {
-                let attach = prepare_requester(
-                    peer,
-                    setup.deps.backend().as_ref(),
-                    setup.consumer.mock,
-                    managers,
-                    &services.heartbeats,
-                )
-                .await?;
+                let attach =
+                    prepare_requester(peer, setup.deps.backend().as_ref(), setup.consumer.mock)
+                        .await?;
                 Box::pin(initialize_consumer::<_, _, _, C, _>(
                     setup.consumer,
                     provider,
@@ -276,13 +271,11 @@ where
         };
         // Preparation is the last fallible step of this mode, and no `?` runs
         // between it and the termination below.
-        let prepared = prepare_responding::<R, _, _>(
+        let prepared = prepare_responding::<R, _>(
             peer,
             setup.deps.backend().as_ref(),
             setup.consumer.mock,
             subsystem,
-            managers,
-            &services.heartbeats,
         )
         .await?;
         let (provider, attach) = prepared.terminate(&middleware, handler);

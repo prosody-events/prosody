@@ -6,8 +6,8 @@ use super::{
 };
 use crate::consumer::Managers;
 use crate::consumer::error::{ConsumerError, PeerInitError};
-use crate::consumer::wiring::peer::{NoPeer, prepare_requester};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::peer::{NoPeer, prepare_requester};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use parking_lot::Mutex;
@@ -53,8 +53,7 @@ async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
     let managers: Arc<Managers<Value>> = Arc::default();
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let attachment =
-        prepare_requester(&peer, &backend, true, Arc::clone(&managers), &heartbeats).await?;
+    let attachment = prepare_requester(&peer, &backend, true).await?;
     let consumer = start(
         &config,
         Arc::clone(&managers),
@@ -145,17 +144,11 @@ async fn failed_activation_rolls_back_and_releases_the_listener() -> Result<()> 
     let backend = RecordingBackend {
         directory: directory.clone(),
     };
-    let config = consumer_config("peer-lifecycle-rollback")?;
-    let managers: Arc<Managers<Value>> = Arc::default();
-    let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let attachment =
-        prepare_requester(&peer, &backend, true, Arc::clone(&managers), &heartbeats).await?;
-
-    let error = start(&config, managers, heartbeats, Arc::clone(&log), attachment)
+    let error = prepare_requester(&peer, &backend, true)
         .await
         .err()
-        .ok_or_else(|| eyre!("activation succeeded despite the scripted failure"))?;
+        .ok_or_else(|| eyre!("peer startup succeeded despite the scripted failure"))?;
     assert!(
         matches!(&error, ConsumerError::Peer(PeerInitError::Directory { message }) if message == "scripted registration failure"),
         "activation wrapped or changed the directory error: {error:#}"
@@ -176,11 +169,7 @@ async fn failed_activation_rolls_back_and_releases_the_listener() -> Result<()> 
     assert!(
         matches!(
             events.as_slice(),
-            [
-                Event::RegisterFailed { .. },
-                Event::Deregistered,
-                Event::ProviderDropped
-            ]
+            [Event::RegisterFailed { .. }, Event::Deregistered]
         ),
         "activation rollback events were {events:?}"
     );

@@ -34,7 +34,6 @@ use crate::{Codec, EventIdentity};
 use std::sync::Arc;
 use validator::Validate;
 
-pub(in crate::consumer) mod peer;
 pub(in crate::consumer) mod runtime;
 pub(in crate::consumer) mod state;
 

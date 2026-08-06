@@ -2,7 +2,7 @@ use super::suite::{
     DirectoryTrace, STABLE_LEASE, expected_answers, first_divergence, run_directory_trace,
     run_idempotent_deregister_case, run_label_bound_case,
 };
-use super::support::{cassandra_directory, finish, membership, registration, store, token};
+use super::support::{cassandra_directory, finish, registration, store, token};
 use crate::cassandra::TABLE_NODE_DIRECTORY;
 use crate::router::NodeId;
 use crate::router::directory::{NodeDirectory, RegistrationTtl};
@@ -65,9 +65,8 @@ fn registration_cells_carry_a_ttl_and_expire() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let directory = cassandra_directory(RegistrationTtl::MIN).await?;
         let session = store().await?.session();
-        let membership = membership();
         let node = NodeId::new();
-        let written = registration(node, membership.clone());
+        let written = registration(node);
         directory.register(&written).await?;
 
         // Only non-NULL regular columns are asked. `TTL()` of a NULL column is

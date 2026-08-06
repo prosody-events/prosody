@@ -203,16 +203,6 @@ impl KafkaObserver {
         Ok(())
     }
 
-    /// Reads the Kafka cluster id with the startup timeout.
-    pub(in crate::consumer) fn cluster_id<Ctx: ConsumerContext>(
-        &self,
-        consumer: &BaseConsumer<Ctx>,
-    ) -> Option<String> {
-        consumer
-            .client()
-            .fetch_cluster_id(self.inner.startup_timeout)
-    }
-
     /// Discards the observation, leaving the observer as constructed.
     ///
     /// Construction calls this when it fails, once the primary consumer has

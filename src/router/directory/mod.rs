@@ -8,7 +8,7 @@
 //! its whole life. That is why a backend needs no lightweight transaction and
 //! nothing to fence: every write is an unconditional upsert or delete.
 
-use crate::router::{Host, LABEL_CAPACITY, NodeId, label_fits};
+use crate::router::{Host, LABEL_CAPACITY, NodeId};
 use fixedstr::Flexstr;
 use std::error::Error;
 use std::future::Future;
@@ -43,31 +43,6 @@ pub(crate) struct Endpoint {
 /// or do not. Absent means "unknown", which never counts as a match.
 pub(crate) type NetworkId = Flexstr<LABEL_CAPACITY>;
 
-/// The consumer group a process belongs to, and the Kafka cluster that scopes
-/// it.
-///
-/// Both parts are required because Kafka scopes a group id to its cluster: two
-/// unrelated clusters can each run a group of the same name, so the group alone
-/// names no set of processes.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GroupMembership {
-    pub(crate) cluster: Flexstr<LABEL_CAPACITY>,
-    pub(crate) group: Flexstr<LABEL_CAPACITY>,
-}
-
-impl GroupMembership {
-    /// Builds a membership when both labels fit the directory label bound.
-    ///
-    /// `Flexstr::make` truncates long labels. This function rejects them
-    /// instead.
-    pub(crate) fn checked(cluster: &str, group: &str) -> Option<Self> {
-        (label_fits(cluster) && label_fits(group)).then(|| Self {
-            cluster: Flexstr::make(cluster),
-            group: Flexstr::make(group),
-        })
-    }
-}
-
 /// One live process, as the directory publishes it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NodeRegistration {
@@ -80,9 +55,6 @@ pub(crate) struct NodeRegistration {
     /// only where an operator arranged one; absent means intra-network only.
     pub(crate) advertised: Option<Endpoint>,
     pub(crate) network: Option<NetworkId>,
-    /// Carried for operators and for the peer features that route on it, never
-    /// for addressing.
-    pub(crate) group: Option<GroupMembership>,
     /// The name a person would recognise this machine by.
     pub(crate) hostname: Host,
 }

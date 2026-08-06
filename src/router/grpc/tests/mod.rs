@@ -237,7 +237,7 @@ pub(super) fn fleet(destinations: usize) -> Result<DestinationFleet> {
 /// environment raises. At the ceiling no run over a real socket can exhaust it,
 /// so the property fails on its subject rather than on admission.
 pub(super) fn registry() -> Result<Arc<PendingRegistry>> {
-    Ok(PendingRegistry::new(&RequesterConfiguration {
+    Ok(PendingRegistry::test(&RequesterConfiguration {
         max_in_flight: MAX_IN_FLIGHT,
         max_response_bytes: MAX_RESPONSE_BYTES,
         ..RequesterConfiguration::default()

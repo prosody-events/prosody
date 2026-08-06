@@ -21,7 +21,7 @@ const UNDER_GRACE_FLOOR: Duration = Duration::from_millis(1);
 async fn a_degenerate_limit_never_builds_a_registry() -> Result<()> {
     let working = RequesterConfiguration::builder().build()?;
     working.validate()?;
-    PendingRegistry::new(&working)?;
+    PendingRegistry::test(&working)?;
 
     let refused = [
         RequesterConfiguration {
@@ -88,7 +88,7 @@ async fn a_degenerate_limit_never_builds_a_registry() -> Result<()> {
         },
     ];
     for config in refused {
-        if PendingRegistry::new(&config).is_ok() {
+        if PendingRegistry::test(&config).is_ok() {
             bail!("a registry was built from {config:?}");
         }
     }

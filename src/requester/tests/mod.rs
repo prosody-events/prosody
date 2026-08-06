@@ -195,7 +195,7 @@ impl ClassifyError for TestError {
 ///
 /// Call this inside a runtime, because the registry spawns its sweep.
 pub(super) fn registry(max_in_flight: usize, max_awaited: usize) -> Result<Arc<PendingRegistry>> {
-    Ok(PendingRegistry::new(&RequesterConfiguration {
+    Ok(PendingRegistry::test(&RequesterConfiguration {
         max_in_flight,
         max_awaited,
         max_response_bytes: MAX_RESPONSE_BYTES,

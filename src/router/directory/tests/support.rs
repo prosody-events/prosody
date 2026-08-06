@@ -8,12 +8,11 @@ use super::suite::SUITE_CAPACITY;
 use crate::cassandra::CassandraStore;
 use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::directory::{
-    Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
+    Endpoint, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
 };
 use crate::router::{Host, MAX_LABEL_BYTES, NodeId};
 use crate::test_util::test_cassandra_config;
 use color_eyre::Result;
-use fixedstr::Flexstr;
 use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use std::convert::Infallible;
@@ -98,23 +97,17 @@ impl NodeDirectory for TestDirectory {
     }
 }
 
-/// A registration whose every field is generated, including the absent forms
-/// of the three optional ones.
+/// A registration whose every field is generated.
 #[derive(Clone, Debug)]
 pub(crate) struct ArbRegistration(pub(crate) NodeRegistration);
 
 impl Arbitrary for ArbRegistration {
     fn arbitrary(g: &mut Gen) -> Self {
-        let group = bool::arbitrary(g).then(|| GroupMembership {
-            cluster: Flexstr::make(&label(g)),
-            group: Flexstr::make(&label(g)),
-        });
         Self(NodeRegistration {
             node: node_id(g),
             direct: endpoint(g),
             advertised: bool::arbitrary(g).then(|| endpoint(g)),
             network: bool::arbitrary(g).then(|| NetworkId::make(&label(g))),
-            group,
             hostname: Host::make(&label(g)),
         })
     }
@@ -152,23 +145,13 @@ pub(crate) fn test_directory_holding(
     ))
 }
 
-/// A token unique to one evaluation, so generated group ids collide neither
-/// across iterations nor across runs.
+/// A token unique to one evaluation.
 pub(crate) fn token() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
-/// A membership under a fresh token.
-pub(crate) fn membership() -> GroupMembership {
-    let token = token();
-    GroupMembership {
-        cluster: Flexstr::make(&format!("{token}-cluster")),
-        group: Flexstr::make(&format!("{token}-group")),
-    }
-}
-
 /// A fixed registration for `node`, with every optional field present.
-pub(crate) fn registration(node: NodeId, group: GroupMembership) -> NodeRegistration {
+pub(crate) fn registration(node: NodeId) -> NodeRegistration {
     NodeRegistration {
         node,
         direct: Endpoint {
@@ -180,7 +163,6 @@ pub(crate) fn registration(node: NodeId, group: GroupMembership) -> NodeRegistra
             port: 443,
         }),
         network: Some(NetworkId::make("east")),
-        group: Some(group),
         hostname: Host::make("worker-7"),
     }
 }

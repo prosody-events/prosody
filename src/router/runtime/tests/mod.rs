@@ -6,6 +6,7 @@
 //! keyspace and no test creates a keyspace of its own.
 
 use super::{PeerInputs, PeerRuntime, PreparedPeerRuntime, RouterConfiguration};
+use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::tests::CountingCodec;
@@ -13,13 +14,12 @@ use crate::response::frame::{FrameCap, FrameHeader};
 use crate::response::sender::{ResponseWorkers, SendCounters, TypedSender};
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
-use crate::router::directory::tests::support::{cassandra_directory, membership};
-use crate::router::directory::{Endpoint, GroupMembership, NodeDirectory, NodeRegistration};
+use crate::router::directory::tests::support::cassandra_directory;
+use crate::router::directory::{Endpoint, NodeDirectory, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
-use crate::router::grpc::health::ProcessHealth;
 use crate::router::grpc::{BoundListener, TransportConfiguration};
-use crate::router::loopback::{LoopbackSender, Script, TestHealth, port};
+use crate::router::loopback::{LoopbackSender, Script, port};
 use crate::router::{Host, LocalTarget, NodeId, RouterHandle};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
@@ -91,7 +91,6 @@ struct Shared {
 struct PlainProcess {
     runtime: PeerRuntime<CassandraNodeDirectory>,
     directory: CassandraNodeDirectory,
-    membership: GroupMembership,
     bound_port: u16,
 }
 
@@ -117,30 +116,27 @@ impl Process {
         };
         let router = RouterConfiguration::default();
         let requester = requester();
-        let runtime = start_runtime(
-            PeerInputs {
-                directory: directory.clone(),
-                listener: bound,
-                health: TestHealth::new(true, true),
-                // The probe address pins the address family it answers with,
-                // so the discovered host is the loopback address this listener
-                // bound and a process can reach itself.
-                probe: Some(CONTACT),
-                router: &router,
-                fleet: FleetConfiguration {
-                    max_destinations: DESTINATIONS,
-                    slots_each: SLOTS_EACH,
-                    // Far longer than any test runs, and a rate no test reaches, so
-                    // neither the send deadline nor pacing can end a queued
-                    // response before the drain does.
-                    send_deadline: Duration::from_mins(1),
-                    sends_per_second: 10_000,
-                    ..FleetConfiguration::default()
-                },
-                requester: &requester,
+        let runtime = start_runtime(PeerInputs {
+            directory: directory.clone(),
+            listener: bound,
+            heartbeats: HeartbeatRegistry::test(),
+            // The probe address pins the address family it answers with,
+            // so the discovered host is the loopback address this listener
+            // bound and a process can reach itself.
+            probe: Some(CONTACT),
+            router: &router,
+            fleet: FleetConfiguration {
+                max_destinations: DESTINATIONS,
+                slots_each: SLOTS_EACH,
+                // Far longer than any test runs, and a rate no test reaches, so
+                // neither the send deadline nor pacing can end a queued
+                // response before the drain does.
+                send_deadline: Duration::from_mins(1),
+                sends_per_second: 10_000,
+                ..FleetConfiguration::default()
             },
-            Some(membership()),
-        )
+            requester: &requester,
+        })
         .await?;
         let barrier = Arc::new(Semaphore::new(0));
         let destination = NodeId::new();
@@ -154,7 +150,6 @@ impl Process {
                     },
                     advertised: None,
                     network: None,
-                    group: None,
                     hostname: Host::make("test-destination"),
                 })
                 .await?;
@@ -208,42 +203,33 @@ pub(super) async fn listener() -> Result<BoundListener> {
 /// Starts one runtime with every peer field left at its default.
 async fn plain_process() -> Result<PlainProcess> {
     let directory = cassandra_directory(LEASE).await?;
-    let membership = membership();
     let bound = listener().await?;
     let bound_port = bound.address().port();
     let router = RouterConfiguration::default();
     let requester = requester();
-    let runtime = start_runtime(
-        PeerInputs {
-            directory: directory.clone(),
-            listener: bound,
-            health: TestHealth::new(true, true),
-            probe: Some(CONTACT),
-            router: &router,
-            fleet: FleetConfiguration::default(),
-            requester: &requester,
-        },
-        Some(membership.clone()),
-    )
+    let runtime = start_runtime(PeerInputs {
+        directory: directory.clone(),
+        listener: bound,
+        heartbeats: HeartbeatRegistry::test(),
+        probe: Some(CONTACT),
+        router: &router,
+        fleet: FleetConfiguration::default(),
+        requester: &requester,
+    })
     .await?;
     Ok(PlainProcess {
         runtime,
         directory,
-        membership,
         bound_port,
     })
 }
 
-pub(in crate::router) async fn start_runtime<H, D>(
-    inputs: PeerInputs<'_, H, D>,
-    group: Option<GroupMembership>,
-) -> Result<PeerRuntime<D>>
+pub(in crate::router) async fn start_runtime<D>(inputs: PeerInputs<'_, D>) -> Result<PeerRuntime<D>>
 where
-    H: ProcessHealth,
     D: NodeDirectory,
 {
     let prepared = PreparedPeerRuntime::start(inputs).await?;
-    match prepared.activate(group).await {
+    match prepared.activate().await {
         Ok(runtime) => Ok(runtime),
         Err((prepared, error)) => {
             prepared.abandon().await;

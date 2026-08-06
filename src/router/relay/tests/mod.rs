@@ -94,7 +94,7 @@ impl Process {
     pub(super) fn new(config: FleetConfiguration, budget: Duration) -> Result<Self> {
         let node = node(THIS);
         let (router, deliveries) = TestRouter::new(config)?;
-        let registry = PendingRegistry::new(&RequesterConfiguration::default())?;
+        let registry = PendingRegistry::test(&RequesterConfiguration::default())?;
         let service = PeerService::new(
             LocalTarget::new(node, Arc::clone(&registry)),
             Relay::new(router.clone()),
@@ -241,7 +241,7 @@ impl Live {
         let node = NodeId::new();
         let address = endpoint(&bound);
         let cap = bound.frame_cap();
-        let registry = PendingRegistry::new(requester)?;
+        let registry = PendingRegistry::test(requester)?;
         let router = FixedRouter::new(
             cap,
             FleetConfiguration::default(),

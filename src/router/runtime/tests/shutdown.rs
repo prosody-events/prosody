@@ -96,7 +96,6 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
         let PlainProcess {
             runtime,
             directory,
-            membership,
             bound_port,
         } = plain_process().await?;
         let node = runtime.node();
@@ -112,10 +111,6 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
             ensure!(
                 registered.direct.port == bound_port,
                 "the runtime must publish the port the listener bound"
-            );
-            ensure!(
-                registered.group.as_ref() == Some(&membership),
-                "the runtime must publish the group it was started with"
             );
             ensure!(
                 registered.advertised.is_none() && registered.network.is_none(),

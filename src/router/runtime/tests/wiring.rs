@@ -12,6 +12,7 @@ use super::{
     ALPHA, CONTACT, LEASE, TIMEOUT, frame_cap, header, listener, requester, start_runtime,
 };
 use crate::codec::Codec;
+use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::encode::FrameEncoder;
@@ -79,18 +80,15 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
         let directory = cassandra_directory(LEASE).await?;
         let config = RouterConfiguration::builder().network(NETWORK).build()?;
         let requester = requester();
-        let runtime = start_runtime(
-            PeerInputs {
-                directory: directory.clone(),
-                listener: listener().await?,
-                health: TestHealth::new(true, true),
-                probe: Some(CONTACT),
-                router: &config,
-                fleet: FleetConfiguration::default(),
-                requester: &requester,
-            },
-            None,
-        )
+        let runtime = start_runtime(PeerInputs {
+            directory: directory.clone(),
+            listener: listener().await?,
+            heartbeats: HeartbeatRegistry::test(),
+            probe: Some(CONTACT),
+            router: &config,
+            fleet: FleetConfiguration::default(),
+            requester: &requester,
+        })
         .await?;
         let neighbour = NodeRegistration {
             node: NodeId::new(),
@@ -103,7 +101,6 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
                 port: NEIGHBOUR_ENTRY,
             }),
             network: Some(NetworkId::make(NETWORK)),
-            group: None,
             hostname: Host::make("neighbour"),
         };
         let outcome: Result<()> = async {
@@ -166,7 +163,7 @@ impl Elsewhere {
     /// Its own relay never runs: every frame this suite sends it names it.
     async fn start() -> Result<Self> {
         let node = NodeId::new();
-        let registry = PendingRegistry::new(&RequesterConfiguration::default())?;
+        let registry = PendingRegistry::test(&RequesterConfiguration::default())?;
         let bound = bind().await?;
         let address = local(bound.address().port());
         let cap = bound.frame_cap();
@@ -214,7 +211,6 @@ async fn start_over(
             direct: elsewhere.address.clone(),
             advertised: None,
             network: None,
-            group: None,
             hostname: Host::make("elsewhere"),
         })
         .await?;
@@ -222,18 +218,15 @@ async fn start_over(
     let here = local(bound.address().port());
     let config = RouterConfiguration::default();
     let requester = requester();
-    let runtime = start_runtime(
-        PeerInputs {
-            directory: directory.clone(),
-            listener: bound,
-            health: TestHealth::new(true, true),
-            probe: Some(CONTACT),
-            router: &config,
-            fleet: FleetConfiguration::default(),
-            requester: &requester,
-        },
-        None,
-    )
+    let runtime = start_runtime(PeerInputs {
+        directory: directory.clone(),
+        listener: bound,
+        heartbeats: HeartbeatRegistry::test(),
+        probe: Some(CONTACT),
+        router: &config,
+        fleet: FleetConfiguration::default(),
+        requester: &requester,
+    })
     .await?;
     Ok((runtime, here))
 }

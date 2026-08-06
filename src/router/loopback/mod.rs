@@ -206,7 +206,6 @@ impl TestRouter {
                             port: advertised_port(index),
                         }),
                         network: here.clone(),
-                        group: None,
                         hostname: Host::make("test"),
                     },
                 )
@@ -316,7 +315,6 @@ pub(crate) fn registration(direct: Endpoint) -> NodeRegistration {
         direct,
         advertised: None,
         network: None,
-        group: None,
         hostname: Host::make("test-node"),
     }
 }

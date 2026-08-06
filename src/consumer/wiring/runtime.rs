@@ -9,12 +9,10 @@ use crate::consumer::observer::KafkaObserver;
 use crate::consumer::poll::{PollConfig, poll};
 use crate::consumer::probes::ProbeServer;
 use crate::consumer::sweep::drain_managers;
-use crate::consumer::wiring::peer::PeerAttachment;
 use crate::consumer::{Managers, ProsodyConsumer, RuntimeState, WatermarkVersion};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
-use crate::router::directory::GroupMembership;
-use crate::router::label_fits;
+use crate::peer::PeerAttachment;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
 use crate::telemetry::Telemetry;
@@ -28,7 +26,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::watch;
 use tokio::task::spawn_blocking;
-use tracing::{error, warn};
 use validator::Validate;
 use whoami::hostname;
 
@@ -130,7 +127,7 @@ where
         }
     };
 
-    let started = start_client::<T, P, SP, C, A>(
+    let started = start_client::<T, P, SP, C>(
         consumer_config,
         handler_provider,
         providers,
@@ -156,8 +153,8 @@ where
     // a response send handle. The release joins the response workers, so it
     // would wait for a sender a retained manager still owns. After a normal
     // revoke the map is empty and the sweep does nothing.
-    let (consumer, cluster) = match started {
-        Ok(started) => started,
+    let consumer = match started {
+        Ok(consumer) => consumer,
         Err(error) => {
             observer.clear();
             drain_managers(&managers).await;
@@ -166,24 +163,10 @@ where
         }
     };
 
-    // Activation is the last step that can fail, so nothing after it can strand
-    // a published node. Its own arm surrenders the client first: that client's
-    // context holds a response send handle, and a release that ran while it
-    // lives would wait for a sender this task still owns.
-    let group = checked_membership(cluster.as_deref(), &consumer_config.group_id);
     // The attachment names what the poll loop admits, so a consumer reads a
     // request tag only when it holds the responder that answers it.
     let responder = peer.responder();
-    let peer = match peer.activate(group).await {
-        Ok(peer) => peer,
-        Err((peer, error)) => {
-            drop_client(consumer).await;
-            observer.clear();
-            drain_managers(&managers).await;
-            peer.abandon().await;
-            return Err(release_probe(probe_server, error).await);
-        }
-    };
+    let peer = peer.attach();
 
     let poll_interval = consumer_config.poll_interval;
     let heartbeat = heartbeats.register("Kafka poll loop");
@@ -236,7 +219,7 @@ where
 ///
 /// Returns [`ConsumerError`] when the context, the client, the subscription or
 /// the metadata fetch fails, or when the blocking task does not join.
-async fn start_client<T, P, SP, C, A>(
+async fn start_client<T, P, SP, C>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
     providers: PartitionProviders<P, SP>,
@@ -244,13 +227,7 @@ async fn start_client<T, P, SP, C, A>(
     handles: ContextHandles<C::Payload>,
     version: Arc<str>,
     observer: KafkaObserver,
-) -> Result<
-    (
-        BaseConsumer<impl ConsumerContext + use<T, P, SP, C, A>>,
-        Option<String>,
-    ),
-    ConsumerError,
->
+) -> Result<BaseConsumer<impl ConsumerContext + use<T, P, SP, C>>, ConsumerError>
 where
     T: HandlerProvider,
     T::Handler: EventHandler<Payload = C::Payload>,
@@ -260,7 +237,6 @@ where
         EventSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
-    A: PeerAttachment + 'static,
 {
     let context = new_context(
         consumer_config,
@@ -276,45 +252,10 @@ where
         let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
         consumer.subscribe(&topics)?;
         observer.install_startup_metadata(&consumer)?;
-        let cluster = A::cluster_id(&consumer, &observer);
-        Ok::<_, ConsumerError>((consumer, cluster))
+        Ok::<_, ConsumerError>(consumer)
     })
     .await
     .map_err(ConsumerError::StartupTask)?
-}
-
-/// Surrenders a built client to the blocking pool and waits for it to close.
-///
-/// Dropping a `BaseConsumer` polls until the consumer group closes, so it must
-/// not run on a runtime thread. The wait is what lets the next failure step
-/// drain a response path the client's own context still holds a handle to.
-async fn drop_client<Ctx: ConsumerContext + 'static>(consumer: BaseConsumer<Ctx>) {
-    if let Err(error) = spawn_blocking(move || drop(consumer)).await {
-        error!(%error, "Kafka client teardown task did not finish");
-    }
-}
-
-/// The group membership this node publishes, when both labels fit.
-///
-/// A node that cannot name its cluster names no cluster-scoped group, and
-/// `None` says exactly that. The column routes nothing, so an oversized label
-/// warns rather than refusing to consume.
-fn checked_membership(cluster: Option<&str>, group_id: &str) -> Option<GroupMembership> {
-    cluster.and_then(|cluster| {
-        let membership = GroupMembership::checked(cluster, group_id);
-        if membership.is_none() {
-            let part = if label_fits(cluster) {
-                "consumer group id"
-            } else {
-                "Kafka cluster id"
-            };
-            warn!(
-                part,
-                "peer group membership is omitted: the label is empty or too long"
-            );
-        }
-        membership
-    })
 }
 
 /// Releases the probe port, then returns `error` for construction to fail with.

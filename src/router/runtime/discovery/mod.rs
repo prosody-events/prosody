@@ -51,8 +51,6 @@ pub(super) async fn discover(probe: Option<SocketAddr>) -> Result<DiscoveredHost
 ///
 /// The direct endpoint uses the routed host or the machine name. The
 /// advertised endpoint uses only configured values. The registration omits
-/// group membership because only the running Kafka client knows the cluster.
-/// Runtime activation adds that membership.
 pub(super) fn registration(
     node: NodeId,
     listener: &BoundListener,
@@ -72,7 +70,6 @@ pub(super) fn registration(
             port: config.advertised_port.unwrap_or(listener_port),
         }),
         network: config.network.as_deref().map(NetworkId::make),
-        group: None,
         hostname,
     }
 }

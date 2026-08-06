@@ -94,7 +94,7 @@ pub(super) enum Stage {
 /// delivered moves exactly one of these.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(strum::VariantArray))]
-pub(super) enum DropReason {
+pub(crate) enum DropReason {
     /// Every destination cell held a destination with sends in flight.
     NoDestination,
     /// This destination's slots were all taken.
