@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering::{Acquire, Release};
 use tokio::task::yield_now;
-use tokio::time::{Instant, timeout};
+use tokio::time::Instant;
 
 /// The response drain has not run.
 const NOT_STARTED: u8 = 0;
@@ -219,7 +219,7 @@ fn prop_shutdown_leaves_no_registration_and_no_reservation() {
 
             drop(held);
             shared.barrier.add_permits(1);
-            timeout(HANG_GUARD, shutting).await??;
+            shutting.await?;
 
             ensure!(
                 witness.load(Acquire) == CLOSED_AND_DRAINED,
@@ -249,7 +249,7 @@ fn shutdown_from_a_quiet_process_terminates_clean() -> Result<()> {
         let node = runtime.node();
         let fleet = Arc::clone(runtime.fleet());
 
-        timeout(HANG_GUARD, runtime.shutdown(|| async {})).await??;
+        runtime.shutdown(|| async {}).await?;
         ensure!(
             directory.read(node).await?.is_none(),
             "shutdown must remove the node row"

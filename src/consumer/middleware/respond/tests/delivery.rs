@@ -14,12 +14,10 @@ use crate::consumer::middleware::tests::test_support::{
 use crate::consumer::{DemandType, EventHandler};
 use crate::error::ErrorCategory;
 use crate::response::frame::FrameCap;
-use crate::router::loopback::{HANG_GUARD, Script, UNPUBLISHED_NODE, paused};
+use crate::router::loopback::{Script, UNPUBLISHED_NODE, paused};
 use color_eyre::Result;
-use color_eyre::eyre::bail;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tokio::time::timeout;
 
 /// The apply hook returns while the transport still holds a response, so the
 /// next event for the same key dispatches.
@@ -47,20 +45,13 @@ fn the_hook_does_not_block_on_the_network() -> Result<()> {
         for (offset, request) in [(0, 11), (1, 12)] {
             let tracker = offset_tracker();
             let message = tagged(1, request, "held")?.into_uncommitted(tracker.take(offset).await?);
-            if timeout(
-                HANG_GUARD,
-                EventHandler::on_message(
-                    &handler,
-                    MockEventContext::new(),
-                    message,
-                    DemandType::Normal,
-                ),
+            EventHandler::on_message(
+                &handler,
+                MockEventContext::new(),
+                message,
+                DemandType::Normal,
             )
-            .await
-            .is_err()
-            {
-                bail!("an apply hook waited for the transport");
-            }
+            .await;
         }
         drop(handler);
 

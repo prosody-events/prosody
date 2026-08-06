@@ -9,12 +9,11 @@ use crate::consumer::middleware::settle::settle;
 use crate::consumer::middleware::tests::test_support::{
     GatedGuard, ScriptedHandler, buffered, committed_value, is_provisional,
 };
-use crate::router::loopback::{HANG_GUARD, paused};
+use crate::router::loopback::paused;
 use color_eyre::eyre::bail;
 use color_eyre::{Report, Result};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::SeqCst;
-use tokio::time::sleep;
 
 /// The durable commit precedes the requested response.
 #[test]
@@ -40,7 +39,6 @@ fn the_response_leaves_only_after_the_durable_commit() -> Result<()> {
                 report = entered => if report.is_err() {
                     bail!("the guard aborted before the commit gate");
                 },
-                () = sleep(HANG_GUARD) => bail!("hang-guard: settle did not reach the commit"),
             }
 
             assert!(

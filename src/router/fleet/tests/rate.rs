@@ -7,7 +7,7 @@ use quickcheck_macros::quickcheck;
 use std::iter::once;
 use std::time::Duration;
 use tokio::runtime::Builder;
-use tokio::time::{Instant, sleep, sleep_until};
+use tokio::time::{Instant, advance, sleep_until};
 
 /// Sends per second the generated schedules are paced at.
 const RATE: u32 = 4;
@@ -77,7 +77,7 @@ fn prop_pacing_keeps_its_period_and_never_bursts(schedule: Vec<Step>) -> TestRes
         let mut previous: Option<Instant> = None;
 
         for step in schedule {
-            sleep(PERIOD * u32::from(step.idle)).await;
+            advance(PERIOD * u32::from(step.idle)).await;
             for _ in 0..step.claims {
                 let now = Instant::now();
                 let at = limit.claim();
