@@ -103,29 +103,16 @@ pub(crate) struct Answering {
     trace: Context,
 }
 
-/// A successful result and the [`Answering`] carrier, when the message asked
-/// for a response.
+/// One result arm and its [`Answering`] carrier.
 ///
-/// The carrier rides the result because an event context has no request tag,
-/// and one middleware field cannot hold it because different keys dispatch at
-/// once.
-pub(crate) struct Responded<T> {
-    inner: T,
-    meta: Option<Answering>,
-}
-
-/// A failed result and the same [`Answering`] carrier.
-///
-/// A transparent error cannot hold a second field. This form preserves the
-/// inner display text and exposes the inner error as its source.
-///
-/// This sits beside [`Responded`] rather than at the end of the file: the two
-/// are one pair, the arms of one result.
+/// The enclosing [`Result`] distinguishes success from failure. This carrier
+/// keeps the same metadata shape on both arms. Its error implementation keeps
+/// a failed arm's display text and source.
 #[derive(Debug, Error)]
 #[error("{inner}")]
-pub(crate) struct RespondError<E> {
+pub(crate) struct Responded<T> {
     #[source]
-    inner: E,
+    inner: T,
     meta: Option<Answering>,
 }
 
@@ -206,7 +193,7 @@ impl<H, C: Codec> RespondHandler<H, C> {
     }
 }
 
-impl<E: ClassifyError> ClassifyError for RespondError<E> {
+impl<E: ClassifyError> ClassifyError for Responded<E> {
     /// This delegation is what keeps every retry, defer, settlement and marker
     /// decision exactly what it was without the layer.
     fn classify_error(&self) -> ErrorCategory {
@@ -221,7 +208,7 @@ where
     H::Error: Sync + 'static,
     C: Codec<Payload = Result<H::Output, H::Error>>,
 {
-    type Error = RespondError<H::Error>;
+    type Error = Responded<H::Error>;
     type Output = Responded<H::Output>;
     type Payload = H::Payload;
 
@@ -245,7 +232,7 @@ where
         // carrier into two closures.
         match self.handler.on_message(context, message, demand_type).await {
             Ok(inner) => Ok(Responded { inner, meta }),
-            Err(inner) => Err(RespondError { inner, meta }),
+            Err(inner) => Err(Responded { inner, meta }),
         }
     }
 
@@ -270,7 +257,7 @@ where
             .on_timer(context, trigger, demand_type)
             .await
             .map(|inner| Responded { inner, meta: None })
-            .map_err(|inner| RespondError { inner, meta: None })
+            .map_err(|inner| Responded { inner, meta: None })
     }
 
     /// Queues a requested response after a final invocation.
@@ -287,7 +274,7 @@ where
     {
         let (result, meta) = match result {
             Ok(Responded { inner, meta }) => (Ok(inner), meta),
-            Err(RespondError { inner, meta }) => (Err(inner), meta),
+            Err(Responded { inner, meta }) => (Err(inner), meta),
         };
         let Some(Answering { tag, trace }) = meta else {
             return self.handler.after_commit(context, result).await;
@@ -312,7 +299,7 @@ where
     {
         let result = match result {
             Ok(Responded { inner, .. }) => Ok(inner),
-            Err(RespondError { inner, .. }) => Err(inner),
+            Err(Responded { inner, .. }) => Err(inner),
         };
         self.handler.after_abort(context, result).await;
     }

@@ -1,7 +1,7 @@
-//! What the layer's two result carriers hold, and what it tells the settlement
+//! What the layer's result carrier holds, and what it tells the settlement
 //! boundary.
 
-use super::super::{RespondError, RespondHandler, Responded};
+use super::super::{RespondHandler, Responded};
 use super::{Fixture, ResultProbeCodec, cap, offset_tracker, tagged};
 use crate::consumer::middleware::tests::test_support::{
     BypassedHandler, MockEventContext, ScriptedHandler, TestError,
@@ -78,7 +78,7 @@ fn settlement_delegates_both_result_arms() {
         inner: (),
         meta: None,
     };
-    let failure = RespondError {
+    let failure = Responded {
         inner: TestError(ErrorCategory::Permanent),
         meta: None,
     };
