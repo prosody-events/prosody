@@ -124,11 +124,11 @@ impl<C: Codec> TypedSender<C> {
 
     /// Builds a sender that can only reach this process.
     pub(crate) fn new_local(
-        local: LocalTarget,
+        local: &LocalTarget,
         fleet: &Arc<DestinationFleet>,
         cap: FrameCap,
     ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
-        Self::build(fleet, &local, cap)
+        Self::build(fleet, local, cap)
     }
 
     fn build<R: ResponseRoute>(
@@ -139,7 +139,7 @@ impl<C: Codec> TypedSender<C> {
         let fleet = Arc::clone(fleet);
         let config = fleet.config();
         validate_scratch_budget(config.max_destinations, cap)?;
-        let witness = DeliveryWitness::default();
+        let witness = DeliveryWitness::new();
         let mut queues = Vec::with_capacity(config.max_destinations);
         let mut workers = Vec::with_capacity(config.max_destinations);
         for _ in 0..config.max_destinations {

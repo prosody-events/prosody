@@ -374,7 +374,7 @@ impl PreparedLocalPeerRuntime {
         subsystem: SubsystemName,
     ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
         Responder::new_local(
-            LocalTarget::new(self.node, Arc::clone(&self.pending)),
+            &LocalTarget::new(self.node, Arc::clone(&self.pending)),
             &self.fleet,
             self.frame_cap,
             subsystem,

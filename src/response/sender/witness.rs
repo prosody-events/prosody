@@ -1,56 +1,66 @@
 //! Test delivery accounting with no production cost.
 
 #[cfg(test)]
-mod imp {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    #[derive(Clone, Debug, Default)]
-    pub(crate) struct DeliveryWitness(Arc<SendCounters>);
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(super) struct DeliveryWitness(Arc<SendCounters>);
 
-    #[derive(Debug, Default)]
-    pub(crate) struct SendCounters {
-        sent: AtomicU64,
-        dropped: AtomicU64,
+#[cfg(not(test))]
+#[derive(Clone, Debug, Default)]
+pub(super) struct DeliveryWitness;
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct SendCounters {
+    sent: AtomicU64,
+    dropped: AtomicU64,
+}
+
+#[cfg(test)]
+impl DeliveryWitness {
+    pub(super) fn new() -> Self {
+        Self::default()
     }
 
-    impl DeliveryWitness {
-        pub(in crate::response::sender) fn sent(&self) {
-            self.0.sent.fetch_add(1, Relaxed);
-        }
-
-        pub(in crate::response::sender) fn dropped(&self) {
-            self.0.dropped.fetch_add(1, Relaxed);
-        }
-
-        pub(in crate::response::sender) fn counters(&self) -> Arc<SendCounters> {
-            Arc::clone(&self.0)
-        }
+    pub(super) fn sent(&self) {
+        self.0.sent.fetch_add(1, Relaxed);
     }
 
-    impl SendCounters {
-        pub(crate) fn sent(&self) -> u64 {
-            self.sent.load(Relaxed)
-        }
+    pub(super) fn dropped(&self) {
+        self.0.dropped.fetch_add(1, Relaxed);
+    }
 
-        pub(crate) fn dropped(&self) -> u64 {
-            self.dropped.load(Relaxed)
-        }
+    pub(super) fn counters(&self) -> Arc<SendCounters> {
+        Arc::clone(&self.0)
     }
 }
 
 #[cfg(not(test))]
-mod imp {
-    #[derive(Clone, Debug, Default)]
-    pub(crate) struct DeliveryWitness;
+impl DeliveryWitness {
+    pub(super) const fn new() -> Self {
+        Self
+    }
 
-    impl DeliveryWitness {
-        pub(in crate::response::sender) const fn sent(&self) {}
+    pub(super) const fn sent(&self) {
+        let _ = self;
+    }
 
-        pub(in crate::response::sender) const fn dropped(&self) {}
+    pub(super) const fn dropped(&self) {
+        let _ = self;
     }
 }
 
-pub(super) use imp::DeliveryWitness;
 #[cfg(test)]
-pub(crate) use imp::SendCounters;
+impl SendCounters {
+    pub(crate) fn sent(&self) -> u64 {
+        self.sent.load(Relaxed)
+    }
+
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Relaxed)
+    }
+}

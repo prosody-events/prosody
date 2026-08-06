@@ -167,7 +167,7 @@ impl<C: Codec> Responder<C> {
 
     /// Builds a responder that can only deposit same-node responses.
     pub(crate) fn new_local(
-        local: LocalTarget,
+        local: &LocalTarget,
         fleet: &Arc<DestinationFleet>,
         cap: FrameCap,
         subsystem: SubsystemName,
