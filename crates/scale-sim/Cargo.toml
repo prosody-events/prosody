@@ -1,0 +1,36 @@
+[package]
+description = "Independent plant and validation laboratory for Prosody autoscaling"
+edition = "2024"
+categories = ["algorithms", "simulation"]
+keywords = ["autoscaling", "kafka", "simulation"]
+license = "MIT"
+name = "prosody-scale-sim"
+publish = false
+repository = "https://github.com/prosody-events/prosody"
+version = "0.1.0"
+
+[dependencies]
+paste.workspace = true
+plotters.workspace = true
+prosody-scale-core = { path = "../scale-core" }
+rayon.workspace = true
+statrs.workspace = true
+thiserror.workspace = true
+typst-as-lib.workspace = true
+typst-pdf.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+quickcheck.workspace = true
+quickcheck_macros.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+harness = false
+name = "batch"
+
+[[bench]]
+harness = false
+name = "model_graph"

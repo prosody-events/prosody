@@ -1,0 +1,30 @@
+[package]
+description = "Bounded predictive autoscaling algorithm for Prosody"
+edition = "2024"
+categories = ["algorithms"]
+keywords = ["autoscaling", "bayesian", "kafka", "simd"]
+license = "MIT"
+name = "prosody-scale-core"
+publish = false
+repository = "https://github.com/prosody-events/prosody"
+version = "0.1.0"
+
+[dependencies]
+fearless_simd.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+rand_xoshiro.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+allocation-counter.workspace = true
+criterion.workspace = true
+quickcheck.workspace = true
+quickcheck_macros.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+harness = false
+name = "step"

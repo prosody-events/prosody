@@ -1,0 +1,1311 @@
+//! Independent virtual-time plant for predictive autoscaling tests.
+//!
+//! The plant uses fixed-capacity arrays and intrusive per-key queues. It does
+//! not call controller equations.
+
+use prosody_scale_core::RandomStream;
+use rayon::prelude::*;
+use thiserror::Error;
+
+const PLOT_FONT_FAMILY: &str = "Charter";
+const DEFAULT_CONCURRENCY_PER_REPLICA: u32 = 32;
+
+mod batch;
+mod batch_plot;
+mod calibration;
+mod calibration_plot;
+mod capacity_plot;
+mod controller;
+mod harness;
+mod input;
+mod metrics;
+mod model;
+mod plot;
+mod posterior_plot;
+mod regime;
+mod report;
+mod result_metrics;
+mod series;
+mod snapshot;
+mod story_plot;
+
+pub use batch::{
+    BatchInputs, BatchSloError, BatchSloSummary, run_batch_regime, run_batch_slo,
+    run_batch_slo_with_inputs,
+};
+pub use batch_plot::{write_batch_actuation_svg, write_batch_slo_svg};
+pub use calibration::{
+    CalibrationError, CapacityCalibration, CapacityCalibrationTrial,
+    CapacitySensitivityCalibration, CapacitySensitivityTrial, DemandCalibration,
+    DemandCalibrationTrial, LeadTimeCalibration, LeadTimeCalibrationTrial, PartitionCalibration,
+    PartitionCalibrationTrial, predictive_coverage_levels, run_capacity_calibration,
+    run_capacity_sensitivity, run_demand_calibration, run_lead_time_calibration,
+    run_partition_calibration,
+};
+pub use calibration_plot::{
+    write_capacity_calibration_figures, write_capacity_sensitivity_figures,
+    write_demand_calibration_figures, write_lead_time_calibration_data,
+    write_partition_calibration_data,
+};
+pub use capacity_plot::write_capacity_belief_svg;
+pub use controller::{
+    ArrivalEvidenceSample, ArrivalWindowSample, CapacityEvidenceKind, CapacityEvidenceSample,
+    CapacityWindowSample, ClosedLoop, ClosedLoopError, ControllerSample, ControllerTrace,
+    LeadTimeEvidenceSample,
+};
+pub use harness::{
+    EventContext, EventInputs, ReporterDirective, ScaleDirective, SimulationHarness, TickContext,
+    TickGenerator, TickHistory, TickHistoryView, TickInputs,
+};
+pub use input::{ConcurrencyLatencyCurve, InputError, QuantileTable, StepSeries, WorkloadSeries};
+pub use metrics::{MetricPoint, MetricTrace};
+pub use model::{
+    AttemptContext, AttemptFrame, AttemptGenerator, AttemptHistory, AttemptHistoryView,
+    AttemptModel, AttemptParameters, HistoricalAttemptModel, SeriesAttemptModel,
+};
+pub use plot::{PlotError, write_metric_svg};
+pub use posterior_plot::{write_model_belief_figures, write_model_belief_snapshot_figures};
+pub use regime::{
+    CapacitySensitivity, PrincipalRegime, PrincipalRun, PrincipalRunError, RegimeExperiment,
+    RegimeValidationError, RunStop, RunStopReason, run_capacity_evidence_regime,
+    run_capacity_evidence_regime_seeded, run_principal_regime, run_principal_regime_seeded,
+    validate_principal_regime,
+};
+pub use report::{
+    ExperimentReport, RegimeReport, ReportError, write_batch_report_pdf,
+    write_capacity_calibration_report_pdf, write_demand_calibration_report_pdf,
+    write_lead_time_calibration_report_pdf, write_partition_calibration_report_pdf,
+    write_regime_report_pdf,
+};
+pub use series::{
+    OutputFunction, RecordedSeries, SeriesCell, SeriesContext, SeriesFunction, SeriesHistory,
+    SeriesHistoryView, SeriesKey, SeriesValue,
+};
+pub use snapshot::{
+    ArrivalInterval, FaultPattern, ReporterState, Snapshot, SnapshotChannel, SnapshotCursor,
+    SnapshotTable,
+};
+pub use story_plot::{RegimeStory, write_regime_story_figures};
+
+const NO_EVENT: u32 = u32::MAX;
+
+/// KIP-848 timing inputs for one moved partition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Kip848Rebalance {
+    notification_micros: QuantileTable,
+    revocation_micros: QuantileTable,
+    assignment_micros: QuantileTable,
+    warmup_micros: QuantileTable,
+    seed: u64,
+}
+
+impl Kip848Rebalance {
+    /// Constructs independent empirical timing distributions.
+    #[must_use]
+    pub const fn new(
+        notification_micros: QuantileTable,
+        revocation_micros: QuantileTable,
+        assignment_micros: QuantileTable,
+        warmup_micros: QuantileTable,
+        seed: u64,
+    ) -> Self {
+        Self {
+            notification_micros,
+            revocation_micros,
+            assignment_micros,
+            warmup_micros,
+            seed,
+        }
+    }
+
+    fn sample(&self, change: u32, partition: u32) -> ReconciliationTiming {
+        let domain = u64::from(change) << 32_u32 | u64::from(partition);
+        let mut random = RandomStream::new(self.seed).domain(domain);
+        ReconciliationTiming {
+            notification_micros: self.notification_micros.sample(&mut random),
+            revocation_micros: self.revocation_micros.sample(&mut random),
+            assignment_micros: self.assignment_micros.sample(&mut random),
+            warmup_micros: self.warmup_micros.sample(&mut random),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReconciliationTiming {
+    notification_micros: u64,
+    revocation_micros: u64,
+    assignment_micros: u64,
+    warmup_micros: u64,
+}
+
+/// Fixed plant bounds and service constants.
+#[derive(Clone, Debug)]
+pub struct PlantConfiguration {
+    partition_count: u32,
+    key_count: u32,
+    event_count_max: u32,
+    change_count_max: u32,
+    slots_per_replica: u32,
+    dependency_slots: u32,
+    dependency_operation_micros: StepSeries<u64>,
+    dependency_latency_curve: ConcurrencyLatencyCurve,
+    retry_backoff_micros: u64,
+    rebalance: Kip848Rebalance,
+    handler_latency_curve: ConcurrencyLatencyCurve,
+}
+
+impl PlantConfiguration {
+    /// Constructs validated fixed bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a required bound is zero.
+    pub fn new(
+        partition_count: u32,
+        key_count: u32,
+        event_count_max: u32,
+        change_count_max: u32,
+        slots_per_replica: u32,
+        dependency_slots: u32,
+    ) -> Result<Self, PlantError> {
+        validate_positive(partition_count, "partition_count")?;
+        validate_positive(key_count, "key_count")?;
+        validate_positive(event_count_max, "event_count_max")?;
+        validate_positive(change_count_max, "change_count_max")?;
+        validate_positive(slots_per_replica, "slots_per_replica")?;
+        validate_positive(dependency_slots, "dependency_slots")?;
+        Ok(Self {
+            partition_count,
+            key_count,
+            event_count_max,
+            change_count_max,
+            slots_per_replica,
+            dependency_slots,
+            dependency_operation_micros: StepSeries::constant(1_000),
+            dependency_latency_curve: ConcurrencyLatencyCurve::zero(),
+            retry_backoff_micros: 10_000,
+            rebalance: Kip848Rebalance::new(
+                QuantileTable::constant(0),
+                QuantileTable::constant(100_000),
+                QuantileTable::constant(0),
+                QuantileTable::constant(100_000),
+                0,
+            ),
+            handler_latency_curve: ConcurrencyLatencyCurve::zero(),
+        })
+    }
+
+    /// Sets the duration of one dependency operation.
+    #[must_use]
+    pub fn with_dependency_operation_micros(mut self, micros: u64) -> Self {
+        self.dependency_operation_micros = StepSeries::constant(micros);
+        self
+    }
+
+    /// Sets base dependency latency as a virtual-time series.
+    #[must_use]
+    pub fn with_dependency_latency_series(mut self, series: StepSeries<u64>) -> Self {
+        self.dependency_operation_micros = series;
+        self
+    }
+
+    /// Sets added resource latency as an active-handler response curve.
+    #[must_use]
+    pub fn with_dependency_latency_curve(mut self, curve: ConcurrencyLatencyCurve) -> Self {
+        self.dependency_latency_curve = curve;
+        self
+    }
+
+    /// Sets retry backoff.
+    #[must_use]
+    pub const fn with_retry_backoff_micros(mut self, micros: u64) -> Self {
+        self.retry_backoff_micros = micros;
+        self
+    }
+
+    /// Sets deterministic KIP-848 revocation and warm-up durations.
+    #[must_use]
+    pub fn with_rebalance(mut self, pause_micros: u64, warmup_micros: u64) -> Self {
+        self.rebalance = Kip848Rebalance::new(
+            QuantileTable::constant(0),
+            QuantileTable::constant(pause_micros),
+            QuantileTable::constant(0),
+            QuantileTable::constant(warmup_micros),
+            0,
+        );
+        self
+    }
+
+    /// Sets KIP-848 timing distributions for moved partitions.
+    #[must_use]
+    pub fn with_kip848_rebalance(mut self, rebalance: Kip848Rebalance) -> Self {
+        self.rebalance = rebalance;
+        self
+    }
+
+    /// Sets added handler time as a function of active concurrency.
+    #[must_use]
+    pub fn with_handler_latency_curve(mut self, curve: ConcurrencyLatencyCurve) -> Self {
+        self.handler_latency_curve = curve;
+        self
+    }
+}
+
+/// One event offered to the plant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventSpec {
+    /// Virtual arrival or timer release time.
+    pub release_micros: u64,
+    /// Kafka partition.
+    pub partition: u32,
+    /// Serialized key index.
+    pub key: u32,
+    /// Non-preemptive handler time for each attempt.
+    pub handler_micros: u64,
+    /// Dependency operations for each attempt.
+    pub dependency_operations: u32,
+    /// Transient failures before the final outcome.
+    pub transient_failures: u8,
+    /// Whether the final outcome is a permanent rejection.
+    pub permanent_rejection: bool,
+    /// Whether a timer released this event.
+    pub timer: bool,
+}
+
+/// One requested replica change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScaleChange {
+    /// Command time in virtual microseconds.
+    pub at_micros: u64,
+    /// New replica count.
+    pub replicas: u32,
+}
+
+/// One desired replica change before actuator delay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScaleRequest {
+    /// Decision time in virtual microseconds.
+    pub at_micros: u64,
+    /// Desired replica count.
+    pub replicas: u32,
+}
+
+/// One scale request paired with its sampled readiness time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Actuation {
+    /// Original desired replica change.
+    pub request: ScaleRequest,
+    /// Time when the desired replicas become actual replicas.
+    pub ready_micros: u64,
+}
+
+/// Bounded plant state at one virtual-time controller tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlantSnapshot {
+    /// Snapshot time.
+    pub at_micros: u64,
+    /// Actual ready replicas.
+    pub replicas: u32,
+    /// Events released by this time.
+    pub released: u32,
+    /// Events settled by this time.
+    pub settled: u32,
+    /// Released events that have not settled.
+    pub backlog: u32,
+    /// Handler attempts that currently hold slots.
+    pub active_handlers: u32,
+    /// Cumulative handler occupancy in handler-microseconds.
+    pub handler_occupancy_micros: u64,
+    /// Cumulative successful final completions.
+    pub useful_completions: u32,
+    /// Whether all assigned partitions are ready at this time.
+    pub partitions_ready: bool,
+    /// Count of partitions in an incomplete assignment change.
+    pub reconciling_partitions: u32,
+    /// Count of partitions that currently reject new dispatches.
+    pub paused_partitions: u32,
+    /// Exact time when the first moved partition stopped dispatches.
+    pub reconciliation_started_micros: Option<u64>,
+    /// Exact time when the last moved partition resumed dispatches.
+    pub reconciliation_completed_micros: Option<u64>,
+}
+
+/// Final event outcome from the plant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Settlement {
+    /// Event index in insertion order.
+    pub event: u32,
+    /// Original release time.
+    pub release_micros: u64,
+    /// Final settle time.
+    pub settle_micros: u64,
+    /// Number of attempts.
+    pub attempts: u32,
+    /// Time from release until the first handler slot starts work.
+    pub permit_wait_micros: u64,
+    /// Total dependency service time across all attempts.
+    pub dependency_micros: u64,
+    /// Total measured handler service time across all attempts.
+    pub handler_micros: u64,
+    /// Active requests when the first attempt started.
+    pub in_flight_at_dispatch: u32,
+    /// Queued events when the first attempt started.
+    pub queue_at_dispatch: u32,
+    /// Whether the outcome was a permanent rejection.
+    pub permanent_rejection: bool,
+}
+
+impl Settlement {
+    /// Returns elapsed handler-slot time from dispatch through settlement.
+    #[must_use]
+    pub const fn handler_elapsed_micros(self) -> u64 {
+        self.settle_micros
+            .saturating_sub(self.release_micros)
+            .saturating_sub(self.permit_wait_micros)
+    }
+}
+
+/// Bounded virtual-time plant.
+pub struct Plant<M = SeriesAttemptModel> {
+    configuration: PlantConfiguration,
+    attempt_model: M,
+    replicas: u32,
+    events: Vec<EventSpec>,
+    changes: Vec<ScaleChange>,
+    change_active: Vec<bool>,
+    applied_changes: Vec<ScaleChange>,
+    pending_target_change: Option<u32>,
+    heap: Vec<Scheduled>,
+    next_by_event: Vec<u32>,
+    attempts_by_event: Vec<u32>,
+    settled_by_event: Vec<bool>,
+    first_dispatch_micros: Vec<u64>,
+    dependency_micros: Vec<u64>,
+    handler_micros: Vec<u64>,
+    in_flight_at_dispatch: Vec<u32>,
+    queue_at_dispatch: Vec<u32>,
+    key_head: Vec<u32>,
+    key_tail: Vec<u32>,
+    key_active: Vec<bool>,
+    owner_at_dispatch: Vec<u32>,
+    partition_owner: Vec<u32>,
+    partition_target_owner: Vec<u32>,
+    partition_epoch: Vec<u32>,
+    partition_reconciliation: Vec<PartitionReconciliation>,
+    partition_active_handlers: Vec<u32>,
+    active_handlers_by_owner: Vec<u32>,
+    assignment_counts: Vec<u32>,
+    reconciliation_started_micros: Option<u64>,
+    reconciliation_completed_micros: Option<u64>,
+    settlements: Vec<Settlement>,
+    active_handlers: u32,
+    handler_occupancy_micros: u64,
+    active_dependency_operations: u32,
+    useful_completions: u32,
+    queued_events: u32,
+    initial_replicas: u32,
+    now_micros: u64,
+    started: bool,
+}
+
+impl Plant {
+    /// Allocates all bounded plant memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bound does not fit this platform.
+    pub fn new(
+        configuration: PlantConfiguration,
+        initial_replicas: u32,
+    ) -> Result<Self, PlantError> {
+        let attempt_model = SeriesAttemptModel::new(
+            configuration.dependency_operation_micros.clone(),
+            configuration.dependency_latency_curve.clone(),
+            configuration.handler_latency_curve.clone(),
+            configuration.event_count_max,
+        )?;
+        Self::with_attempt_model(configuration, initial_replicas, attempt_model)
+    }
+}
+
+impl<M: AttemptModel> Plant<M> {
+    /// Allocates all bounded plant memory with one regime calculation model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bound does not fit this platform.
+    pub fn with_attempt_model(
+        configuration: PlantConfiguration,
+        initial_replicas: u32,
+        attempt_model: M,
+    ) -> Result<Self, PlantError> {
+        validate_positive(initial_replicas, "initial_replicas")?;
+        let event_count_max = to_usize(configuration.event_count_max)?;
+        let change_count_max = to_usize(configuration.change_count_max)?;
+        let key_count = to_usize(configuration.key_count)?;
+        let partition_count = to_usize(configuration.partition_count)?;
+        let reconciliation_capacity = change_count_max
+            .checked_mul(partition_count)
+            .and_then(|count| count.checked_mul(2))
+            .ok_or(PlantError::PlatformLimit)?;
+        let heap_capacity = event_count_max
+            .checked_mul(2)
+            .and_then(|capacity| capacity.checked_add(change_count_max))
+            .and_then(|capacity| capacity.checked_add(reconciliation_capacity))
+            .ok_or(PlantError::PlatformLimit)?;
+        Ok(Self {
+            configuration,
+            attempt_model,
+            replicas: initial_replicas,
+            events: Vec::with_capacity(event_count_max),
+            changes: Vec::with_capacity(change_count_max),
+            change_active: Vec::with_capacity(change_count_max),
+            applied_changes: Vec::with_capacity(change_count_max),
+            pending_target_change: None,
+            heap: Vec::with_capacity(heap_capacity),
+            next_by_event: vec![NO_EVENT; event_count_max],
+            attempts_by_event: vec![0; event_count_max],
+            settled_by_event: vec![false; event_count_max],
+            first_dispatch_micros: vec![u64::MAX; event_count_max],
+            dependency_micros: vec![0; event_count_max],
+            handler_micros: vec![0; event_count_max],
+            in_flight_at_dispatch: vec![0; event_count_max],
+            queue_at_dispatch: vec![0; event_count_max],
+            key_head: vec![NO_EVENT; key_count],
+            key_tail: vec![NO_EVENT; key_count],
+            key_active: vec![false; key_count],
+            owner_at_dispatch: vec![0; event_count_max],
+            partition_owner: initial_assignment(partition_count, initial_replicas),
+            partition_target_owner: vec![0; partition_count],
+            partition_epoch: vec![0; partition_count],
+            partition_reconciliation: vec![PartitionReconciliation::Serving; partition_count],
+            partition_active_handlers: vec![0; partition_count],
+            active_handlers_by_owner: vec![0; partition_count],
+            assignment_counts: vec![0; partition_count],
+            reconciliation_started_micros: None,
+            reconciliation_completed_micros: None,
+            settlements: Vec::with_capacity(event_count_max),
+            active_handlers: 0,
+            handler_occupancy_micros: 0,
+            active_dependency_operations: 0,
+            useful_completions: 0,
+            queued_events: 0,
+            initial_replicas,
+            now_micros: 0,
+            started: false,
+        })
+    }
+
+    /// Adds one event without growing retained memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid index or full event buffer.
+    pub fn add_event(&mut self, event: EventSpec) -> Result<(), PlantError> {
+        if self.started && event.release_micros < self.now_micros {
+            return Err(PlantError::EventTimeRegressed);
+        }
+        if event.partition >= self.configuration.partition_count {
+            return Err(PlantError::PartitionIndex);
+        }
+        if event.key >= self.configuration.key_count {
+            return Err(PlantError::KeyIndex);
+        }
+        if self.events.len() == self.events.capacity() {
+            return Err(PlantError::EventCapacity);
+        }
+        let event_index = self.events.len() as u32;
+        self.events.push(event);
+        if self.started {
+            heap_push(
+                &mut self.heap,
+                Scheduled {
+                    at_micros: event.release_micros,
+                    ordinal: event_index,
+                    kind: ScheduledKind::Arrival(event_index),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Adds one replica change without growing retained memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero replicas or a full change buffer.
+    pub fn add_scale_change(&mut self, change: ScaleChange) -> Result<(), PlantError> {
+        validate_positive(change.replicas, "replicas")?;
+        if self.changes.len() == self.changes.capacity() {
+            return Err(PlantError::ChangeCapacity);
+        }
+        self.changes.push(change);
+        self.change_active.push(true);
+        if self.started {
+            let change_index = self.changes.len() - 1;
+            let ordinal = self.events.len().saturating_add(change_index);
+            let ordinal = u32::try_from(ordinal).map_err(|_| PlantError::PlatformLimit)?;
+            heap_push(
+                &mut self.heap,
+                Scheduled {
+                    at_micros: change.at_micros,
+                    ordinal,
+                    kind: ScheduledKind::Scale(change_index as u32),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Replaces the pending desired target with one new target.
+    ///
+    /// The latest desired target is the only target that the actuator applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero replicas or a full change buffer.
+    pub(crate) fn replace_scale_target(&mut self, change: ScaleChange) -> Result<(), PlantError> {
+        if let Some(index) = self.pending_target_change.take() {
+            self.change_active[index as usize] = false;
+        }
+        let index = u32::try_from(self.changes.len()).map_err(|_| PlantError::PlatformLimit)?;
+        self.add_scale_change(change)?;
+        self.pending_target_change = Some(index);
+        Ok(())
+    }
+
+    /// Samples actuator delay and schedules one desired replica change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero replicas or a full change buffer.
+    pub fn add_scale_request(
+        &mut self,
+        request: ScaleRequest,
+        delays_micros: &QuantileTable,
+        random: &mut RandomStream,
+    ) -> Result<Actuation, PlantError> {
+        let ready_micros = request
+            .at_micros
+            .saturating_add(delays_micros.sample(random));
+        self.add_scale_change(ScaleChange {
+            at_micros: ready_micros,
+            replicas: request.replicas,
+        })?;
+        Ok(Actuation {
+            request,
+            ready_micros,
+        })
+    }
+
+    /// Advances scheduled work through one inclusive virtual-time boundary.
+    #[must_use]
+    pub fn advance_until(&mut self, until_micros: u64) -> PlantSnapshot {
+        if !self.started {
+            self.seed_heap();
+            self.started = true;
+        }
+        while self
+            .heap
+            .first()
+            .is_some_and(|scheduled| scheduled.at_micros <= until_micros)
+        {
+            let Some(scheduled) = heap_pop(&mut self.heap) else {
+                break;
+            };
+            self.advance_clock(scheduled.at_micros);
+            match scheduled.kind {
+                ScheduledKind::Arrival(event) => self.enqueue(event),
+                ScheduledKind::AttemptDone(event) => {
+                    self.finish_attempt(event, scheduled.at_micros);
+                }
+                ScheduledKind::DependencyDone => {
+                    self.active_dependency_operations =
+                        self.active_dependency_operations.saturating_sub(1);
+                }
+                ScheduledKind::Scale(change) if self.change_active[change as usize] => {
+                    self.apply_scale(change, scheduled.at_micros);
+                }
+                ScheduledKind::Scale(_) => {}
+                ScheduledKind::ReconcileStart { partition, epoch } => {
+                    self.start_reconciliation(partition, epoch);
+                }
+                ScheduledKind::ReconcileReady { partition, epoch } => {
+                    self.finish_reconciliation(partition, epoch, scheduled.at_micros);
+                }
+            }
+            self.dispatch(scheduled.at_micros);
+        }
+        self.advance_clock(until_micros);
+        self.snapshot(until_micros)
+    }
+
+    /// Runs all events to settlement with virtual time.
+    #[must_use]
+    pub fn run(mut self) -> SimulationResult {
+        let _snapshot = self.advance_until(u64::MAX);
+        SimulationResult {
+            events: self.events,
+            settlements: self.settlements,
+            changes: self.applied_changes,
+            initial_replicas: self.initial_replicas,
+            slots_per_replica: self.configuration.slots_per_replica,
+            dependency_slots: self.configuration.dependency_slots,
+        }
+    }
+
+    /// Writes released unsettled event counts by Kafka partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the output does not match the partition count.
+    pub fn write_partition_backlog(
+        &self,
+        at_micros: u64,
+        output: &mut [u32],
+    ) -> Result<(), PlantError> {
+        if output.len() != self.partition_reconciliation.len() {
+            return Err(PlantError::PartitionCount);
+        }
+        output.fill(0);
+        for (event_index, event) in self.events.iter().enumerate() {
+            if event.release_micros <= at_micros && !self.settled_by_event[event_index] {
+                let partition = event.partition as usize;
+                output[partition] = output[partition].saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the oldest released unsettled event time by Kafka partition.
+    ///
+    /// A zero value means that the partition has no released backlog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the output does not match the partition count.
+    pub fn write_partition_oldest_release(
+        &self,
+        at_micros: u64,
+        output: &mut [u64],
+    ) -> Result<(), PlantError> {
+        if output.len() != self.partition_reconciliation.len() {
+            return Err(PlantError::PartitionCount);
+        }
+        output.fill(u64::MAX);
+        for (event_index, event) in self.events.iter().enumerate() {
+            if event.release_micros <= at_micros && !self.settled_by_event[event_index] {
+                let oldest = &mut output[event.partition as usize];
+                *oldest = (*oldest).min(event.release_micros);
+            }
+        }
+        for oldest in output {
+            if *oldest == u64::MAX {
+                *oldest = 0;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns settlements completed through the current virtual time.
+    #[must_use]
+    pub fn completed_settlements(&self) -> &[Settlement] {
+        &self.settlements
+    }
+
+    fn seed_heap(&mut self) {
+        for event in 0..self.events.len() {
+            let scheduled = Scheduled {
+                at_micros: self.events[event].release_micros,
+                ordinal: event as u32,
+                kind: ScheduledKind::Arrival(event as u32),
+            };
+            heap_push(&mut self.heap, scheduled);
+        }
+        let ordinal_base = self.events.len() as u32;
+        for change in 0..self.changes.len() {
+            let scheduled = Scheduled {
+                at_micros: self.changes[change].at_micros,
+                ordinal: ordinal_base + change as u32,
+                kind: ScheduledKind::Scale(change as u32),
+            };
+            heap_push(&mut self.heap, scheduled);
+        }
+    }
+
+    fn enqueue(&mut self, event: u32) {
+        let key = self.events[event as usize].key as usize;
+        let tail = self.key_tail[key];
+        if tail == NO_EVENT {
+            self.key_head[key] = event;
+        } else {
+            self.next_by_event[tail as usize] = event;
+        }
+        self.key_tail[key] = event;
+        self.queued_events += 1;
+    }
+
+    fn dispatch(&mut self, now_micros: u64) {
+        for key in 0..self.key_head.len() {
+            let event = self.key_head[key];
+            if event == NO_EVENT || self.key_active[key] {
+                continue;
+            }
+            let spec = self.events[event as usize];
+            let partition = spec.partition as usize;
+            if matches!(
+                self.partition_reconciliation[partition],
+                PartitionReconciliation::Paused { .. }
+            ) {
+                continue;
+            }
+            let owner = self.partition_owner[partition] as usize;
+            if self.active_handlers_by_owner[owner] >= self.configuration.slots_per_replica {
+                continue;
+            }
+            self.key_active[key] = true;
+            self.active_handlers += 1;
+            self.active_handlers_by_owner[owner] += 1;
+            self.partition_active_handlers[partition] += 1;
+            self.owner_at_dispatch[event as usize] = owner as u32;
+            if self.first_dispatch_micros[event as usize] == u64::MAX {
+                self.first_dispatch_micros[event as usize] = now_micros;
+                self.in_flight_at_dispatch[event as usize] = self.active_handlers;
+                self.queue_at_dispatch[event as usize] = self.queued_events;
+            }
+            self.attempts_by_event[event as usize] = 1;
+            let finish = self.attempt_finish(event, now_micros);
+            heap_push(
+                &mut self.heap,
+                Scheduled {
+                    at_micros: finish,
+                    ordinal: event,
+                    kind: ScheduledKind::AttemptDone(event),
+                },
+            );
+        }
+    }
+
+    fn attempt_finish(&mut self, event: u32, now_micros: u64) -> u64 {
+        let event_index = event as usize;
+        let spec = self.events[event_index];
+        self.active_dependency_operations = self
+            .active_dependency_operations
+            .saturating_add(u32::from(spec.dependency_operations > 0));
+        let attempt = self.attempt_model.calculate(AttemptFrame {
+            now_micros,
+            event_index: event,
+            attempt: self.attempts_by_event[event_index],
+            replicas: self.replicas,
+            active_handlers: self.active_handlers,
+            dependency_concurrency: self.active_dependency_operations,
+            queued_events: self.queued_events,
+        });
+        let dependency_operation_micros = attempt.dependency_operation_micros;
+        let dependency_micros =
+            dependency_operation_micros.saturating_mul(u64::from(spec.dependency_operations));
+        let dependency_finish = now_micros.saturating_add(dependency_micros);
+        if spec.dependency_operations > 0 {
+            heap_push(
+                &mut self.heap,
+                Scheduled {
+                    at_micros: dependency_finish,
+                    ordinal: event,
+                    kind: ScheduledKind::DependencyDone,
+                },
+            );
+        }
+        self.dependency_micros[event_index] =
+            self.dependency_micros[event_index].saturating_add(dependency_micros);
+        let handler_micros = spec
+            .handler_micros
+            .saturating_add(attempt.handler_added_micros);
+        self.handler_micros[event_index] =
+            self.handler_micros[event_index].saturating_add(handler_micros);
+        dependency_finish.saturating_add(handler_micros)
+    }
+
+    fn finish_attempt(&mut self, event: u32, now_micros: u64) {
+        let event_index = event as usize;
+        let spec = self.events[event_index];
+        if spec.transient_failures > 0 {
+            self.events[event_index].transient_failures -= 1;
+            self.attempts_by_event[event_index] += 1;
+            let next_start = now_micros.saturating_add(self.configuration.retry_backoff_micros);
+            let finish = self.attempt_finish(event, next_start);
+            heap_push(
+                &mut self.heap,
+                Scheduled {
+                    at_micros: finish,
+                    ordinal: event,
+                    kind: ScheduledKind::AttemptDone(event),
+                },
+            );
+            return;
+        }
+        let key = spec.key as usize;
+        self.settlements.push(Settlement {
+            event,
+            release_micros: spec.release_micros,
+            settle_micros: now_micros,
+            attempts: self.attempts_by_event[event_index],
+            permit_wait_micros: self.first_dispatch_micros[event_index]
+                .saturating_sub(spec.release_micros),
+            dependency_micros: self.dependency_micros[event_index],
+            handler_micros: self.handler_micros[event_index],
+            in_flight_at_dispatch: self.in_flight_at_dispatch[event_index],
+            queue_at_dispatch: self.queue_at_dispatch[event_index],
+            permanent_rejection: spec.permanent_rejection,
+        });
+        self.useful_completions = self
+            .useful_completions
+            .saturating_add(u32::from(!spec.permanent_rejection));
+        self.settled_by_event[event_index] = true;
+        self.active_handlers -= 1;
+        let partition = spec.partition as usize;
+        let owner = self.owner_at_dispatch[event_index] as usize;
+        self.active_handlers_by_owner[owner] -= 1;
+        self.partition_active_handlers[partition] -= 1;
+        self.key_active[key] = false;
+        self.remove_head(key);
+        self.complete_reconciliation_if_ready(partition, now_micros);
+    }
+
+    fn remove_head(&mut self, key: usize) {
+        let event = self.key_head[key];
+        if event == NO_EVENT {
+            return;
+        }
+        self.key_head[key] = self.next_by_event[event as usize];
+        self.queued_events -= 1;
+        self.next_by_event[event as usize] = NO_EVENT;
+        if self.key_head[key] == NO_EVENT {
+            self.key_tail[key] = NO_EVENT;
+        }
+    }
+
+    fn apply_scale(&mut self, change: u32, now_micros: u64) {
+        let applied = self.changes[change as usize];
+        self.replicas = applied.replicas;
+        self.change_active[change as usize] = false;
+        if self.pending_target_change == Some(change) {
+            self.pending_target_change = None;
+        }
+        self.applied_changes.push(applied);
+        sticky_assignment(
+            &self.partition_owner,
+            applied.replicas,
+            &mut self.partition_target_owner,
+            &mut self.assignment_counts,
+        );
+        self.reconciliation_started_micros = None;
+        self.reconciliation_completed_micros = None;
+        let mut moved = 0_u32;
+        for partition in 0..self.partition_owner.len() {
+            self.partition_epoch[partition] = self.partition_epoch[partition].wrapping_add(1);
+            let epoch = self.partition_epoch[partition];
+            if self.partition_owner[partition] == self.partition_target_owner[partition] {
+                self.partition_reconciliation[partition] = PartitionReconciliation::Serving;
+                continue;
+            }
+            moved = moved.saturating_add(1);
+            let timing = self
+                .configuration
+                .rebalance
+                .sample(change, partition as u32);
+            let pause_micros = now_micros.saturating_add(timing.notification_micros);
+            let ready_micros = pause_micros
+                .saturating_add(timing.revocation_micros)
+                .saturating_add(timing.assignment_micros)
+                .saturating_add(timing.warmup_micros);
+            let reconciliation = PartitionReconciliation::Scheduled {
+                target_owner: self.partition_target_owner[partition],
+                ready_micros,
+            };
+            self.partition_reconciliation[partition] = if pause_micros == now_micros {
+                reconciliation.pause()
+            } else {
+                reconciliation
+            };
+            heap_push(
+                &mut self.heap,
+                Scheduled {
+                    at_micros: pause_micros,
+                    ordinal: partition as u32,
+                    kind: ScheduledKind::ReconcileStart {
+                        partition: partition as u32,
+                        epoch,
+                    },
+                },
+            );
+            heap_push(
+                &mut self.heap,
+                Scheduled {
+                    at_micros: ready_micros,
+                    ordinal: partition as u32,
+                    kind: ScheduledKind::ReconcileReady {
+                        partition: partition as u32,
+                        epoch,
+                    },
+                },
+            );
+        }
+        if moved == 0 {
+            self.reconciliation_completed_micros = Some(now_micros);
+        }
+    }
+
+    fn start_reconciliation(&mut self, partition: u32, epoch: u32) {
+        let partition = partition as usize;
+        if self.partition_epoch[partition] == epoch {
+            self.partition_reconciliation[partition] =
+                self.partition_reconciliation[partition].pause();
+            self.reconciliation_started_micros = Some(
+                self.reconciliation_started_micros
+                    .map_or(self.now_micros, |started| started.min(self.now_micros)),
+            );
+        }
+    }
+
+    fn complete_reconciliation_if_ready(&mut self, partition: usize, now_micros: u64) {
+        let PartitionReconciliation::Paused {
+            target_owner,
+            ready_micros,
+            ..
+        } = self.partition_reconciliation[partition]
+        else {
+            return;
+        };
+        if self.partition_active_handlers[partition] == 0 && ready_micros <= now_micros {
+            self.partition_owner[partition] = target_owner;
+            self.partition_reconciliation[partition] = PartitionReconciliation::Serving;
+            if self
+                .partition_reconciliation
+                .iter()
+                .all(|state| matches!(state, PartitionReconciliation::Serving))
+            {
+                self.reconciliation_completed_micros = Some(now_micros);
+            }
+        }
+    }
+
+    fn finish_reconciliation(&mut self, partition: u32, epoch: u32, now_micros: u64) {
+        let partition = partition as usize;
+        if self.partition_epoch[partition] == epoch {
+            self.complete_reconciliation_if_ready(partition, now_micros);
+        }
+    }
+
+    fn advance_clock(&mut self, now_micros: u64) {
+        let elapsed = now_micros.saturating_sub(self.now_micros);
+        self.handler_occupancy_micros = self
+            .handler_occupancy_micros
+            .saturating_add(elapsed.saturating_mul(u64::from(self.active_handlers)));
+        self.now_micros = self.now_micros.max(now_micros);
+    }
+
+    fn snapshot(&self, at_micros: u64) -> PlantSnapshot {
+        let mut released = 0_u32;
+        let mut settled = 0_u32;
+        for (event_index, event) in self.events.iter().enumerate() {
+            released = released.saturating_add(u32::from(event.release_micros <= at_micros));
+            settled = settled.saturating_add(u32::from(
+                event.release_micros <= at_micros && self.settled_by_event[event_index],
+            ));
+        }
+        let reconciling_partitions = self
+            .partition_reconciliation
+            .iter()
+            .filter(|state| !matches!(state, PartitionReconciliation::Serving))
+            .count() as u32;
+        let paused_partitions = self
+            .partition_reconciliation
+            .iter()
+            .filter(|state| matches!(state, PartitionReconciliation::Paused { .. }))
+            .count() as u32;
+        PlantSnapshot {
+            at_micros,
+            replicas: self.replicas,
+            released,
+            settled,
+            backlog: released.saturating_sub(settled),
+            active_handlers: self.active_handlers,
+            handler_occupancy_micros: self.handler_occupancy_micros,
+            useful_completions: self.useful_completions,
+            partitions_ready: self
+                .partition_reconciliation
+                .iter()
+                .all(|state| matches!(state, PartitionReconciliation::Serving)),
+            reconciling_partitions,
+            paused_partitions,
+            reconciliation_started_micros: self.reconciliation_started_micros,
+            reconciliation_completed_micros: self.reconciliation_completed_micros,
+        }
+    }
+}
+
+/// Runs independent plants in parallel and preserves their input order.
+#[must_use]
+pub fn run_parallel(plants: Vec<Plant>) -> Vec<SimulationResult> {
+    plants.into_par_iter().map(Plant::run).collect()
+}
+
+/// Completed deterministic trace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimulationResult {
+    events: Vec<EventSpec>,
+    settlements: Vec<Settlement>,
+    changes: Vec<ScaleChange>,
+    initial_replicas: u32,
+    slots_per_replica: u32,
+    dependency_slots: u32,
+}
+
+/// Service state for one partition during KIP-848 reconciliation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PartitionReconciliation {
+    Serving,
+    Scheduled {
+        target_owner: u32,
+        ready_micros: u64,
+    },
+    Paused {
+        target_owner: u32,
+        ready_micros: u64,
+    },
+}
+
+impl PartitionReconciliation {
+    const fn pause(self) -> Self {
+        match self {
+            Self::Scheduled {
+                target_owner,
+                ready_micros,
+            } => Self::Paused {
+                target_owner,
+                ready_micros,
+            },
+            state => state,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Scheduled {
+    at_micros: u64,
+    ordinal: u32,
+    kind: ScheduledKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScheduledKind {
+    Arrival(u32),
+    AttemptDone(u32),
+    DependencyDone,
+    Scale(u32),
+    ReconcileStart { partition: u32, epoch: u32 },
+    ReconcileReady { partition: u32, epoch: u32 },
+}
+
+fn heap_push(heap: &mut Vec<Scheduled>, value: Scheduled) {
+    assert!(
+        heap.len() < heap.capacity(),
+        "the event heap exceeded its fixed bound"
+    );
+    heap.push(value);
+    let mut child = heap.len() - 1;
+    while child > 0 {
+        let parent = (child - 1) / 2;
+        if schedule_key(heap[parent]) <= schedule_key(heap[child]) {
+            break;
+        }
+        heap.swap(parent, child);
+        child = parent;
+    }
+}
+
+fn heap_pop(heap: &mut Vec<Scheduled>) -> Option<Scheduled> {
+    if heap.is_empty() {
+        return None;
+    }
+    let root = heap[0];
+    let final_index = heap.len() - 1;
+    let final_value = heap[final_index];
+    heap.truncate(final_index);
+    if !heap.is_empty() {
+        heap[0] = final_value;
+        heap_sift_down(heap);
+    }
+    Some(root)
+}
+
+fn heap_sift_down(heap: &mut [Scheduled]) {
+    let mut parent = 0_usize;
+    loop {
+        let left = parent * 2 + 1;
+        if left >= heap.len() {
+            break;
+        }
+        let right = left + 1;
+        let child = if right < heap.len() && schedule_key(heap[right]) < schedule_key(heap[left]) {
+            right
+        } else {
+            left
+        };
+        if schedule_key(heap[parent]) <= schedule_key(heap[child]) {
+            break;
+        }
+        heap.swap(parent, child);
+        parent = child;
+    }
+}
+
+fn schedule_key(value: Scheduled) -> (u64, u8, u32) {
+    let phase = match value.kind {
+        ScheduledKind::DependencyDone => 0,
+        ScheduledKind::Scale(_) | ScheduledKind::ReconcileStart { .. } => 1,
+        ScheduledKind::AttemptDone(_) | ScheduledKind::ReconcileReady { .. } => 2,
+        ScheduledKind::Arrival(_) => 3,
+    };
+    (value.at_micros, phase, value.ordinal)
+}
+
+fn initial_assignment(partition_count: usize, replicas: u32) -> Vec<u32> {
+    let owner_count = replicas.min(partition_count as u32);
+    (0..partition_count)
+        .map(|partition| partition as u32 % owner_count)
+        .collect()
+}
+
+/// Keeps valid owners and moves only partitions needed for a balanced target.
+fn sticky_assignment(current: &[u32], replicas: u32, target: &mut [u32], counts: &mut [u32]) {
+    let owner_count = replicas.min(current.len() as u32);
+    counts.fill(0);
+    for (partition, &owner) in current.iter().enumerate() {
+        if owner < owner_count {
+            target[partition] = owner;
+            counts[owner as usize] += 1;
+        } else {
+            target[partition] = NO_EVENT;
+        }
+    }
+
+    let base = current.len() as u32 / owner_count;
+    let remainder = current.len() as u32 % owner_count;
+    for owner in 0..owner_count {
+        let desired = base + u32::from(owner < remainder);
+        let mut excess = counts[owner as usize].saturating_sub(desired);
+        if excess == 0 {
+            continue;
+        }
+        for target_owner in target.iter_mut().rev() {
+            if excess == 0 {
+                break;
+            }
+            if *target_owner == owner {
+                *target_owner = NO_EVENT;
+                counts[owner as usize] -= 1;
+                excess -= 1;
+            }
+        }
+    }
+
+    let mut owner = 0_u32;
+    for target_owner in target {
+        if *target_owner != NO_EVENT {
+            continue;
+        }
+        while owner < owner_count {
+            let desired = base + u32::from(owner < remainder);
+            if counts[owner as usize] < desired {
+                break;
+            }
+            owner += 1;
+        }
+        assert!(owner < owner_count, "a balanced owner must exist");
+        *target_owner = owner;
+        counts[owner as usize] += 1;
+    }
+}
+
+fn validate_positive(value: u32, name: &'static str) -> Result<(), PlantError> {
+    if value == 0 {
+        return Err(PlantError::ZeroBound { name });
+    }
+    Ok(())
+}
+
+fn to_usize(value: u32) -> Result<usize, PlantError> {
+    usize::try_from(value).map_err(|_| PlantError::PlatformLimit)
+}
+
+/// Invalid plant input or capacity.
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum PlantError {
+    /// A simulator input table is invalid.
+    #[error(transparent)]
+    Input(#[from] InputError),
+    /// A generated controller observation is invalid.
+    #[error(transparent)]
+    ControllerObservation(#[from] prosody_scale_core::ObservationError),
+    /// A reconstructed controller state is invalid.
+    #[error(transparent)]
+    ControllerConfiguration(#[from] prosody_scale_core::ConfigurationError),
+    /// Generated capacity evidence is invalid.
+    #[error(transparent)]
+    ResourceWindow(#[from] prosody_scale_core::ResourceWindowError),
+    /// A posterior output buffer has an invalid length.
+    #[error(transparent)]
+    Posterior(#[from] prosody_scale_core::PosteriorError),
+    /// A decision curve output buffer is invalid.
+    #[error(transparent)]
+    DecisionCurve(#[from] prosody_scale_core::DecisionCurveError),
+    /// A predictive distribution parameter is invalid.
+    #[error(transparent)]
+    PredictiveDistribution(#[from] statrs::distribution::PoissonError),
+    /// A paired predictive distribution parameter is invalid.
+    #[error(transparent)]
+    PairedPredictiveDistribution(#[from] statrs::distribution::BinomialError),
+    /// An arrival predictive distribution parameter is invalid.
+    #[error(transparent)]
+    ArrivalPredictiveDistribution(#[from] statrs::distribution::NegativeBinomialError),
+    /// Generated actuation evidence is invalid.
+    #[error(transparent)]
+    TransitionEvidence(#[from] prosody_scale_core::TransitionEvidenceError),
+    /// A fixed bound is zero.
+    #[error("{name} must be positive")]
+    ZeroBound {
+        /// Name of the invalid bound.
+        name: &'static str,
+    },
+    /// A count does not fit this platform.
+    #[error("a plant count exceeds this platform's address space")]
+    PlatformLimit,
+    /// The event buffer is full.
+    #[error("the event buffer is full")]
+    EventCapacity,
+    /// The scale-change buffer is full.
+    #[error("the scale-change buffer is full")]
+    ChangeCapacity,
+    /// A new event precedes the plant's current virtual time.
+    #[error("an event release cannot precede current plant time")]
+    EventTimeRegressed,
+    /// An event names an unknown partition.
+    #[error("the event partition is outside the configured range")]
+    PartitionIndex,
+    /// A partition output does not match the plant partition count.
+    #[error("a partition output must match the plant partition count")]
+    PartitionCount,
+    /// An event names an unknown key.
+    #[error("the event key is outside the configured range")]
+    KeyIndex,
+    /// The pending snapshot delivery buffer is full.
+    #[error("the pending snapshot delivery buffer is full")]
+    DeliveryCapacity,
+    /// The metric trace is full.
+    #[error("the metric trace is full")]
+    MetricCapacity,
+}
+
+#[cfg(test)]
+mod tests;
