@@ -12,8 +12,6 @@ use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
-use quickcheck::{Arbitrary, Gen, TestResult};
-use quickcheck_macros::quickcheck;
 use std::sync::Arc;
 use strum::VariantArray;
 use tonic::Code;
@@ -23,19 +21,6 @@ const OTHER_FORMAT: &str = "not-the-test-format";
 
 /// A short payload, for the cases whose size is not the subject.
 const SHORT: usize = 8;
-
-/// Every case the wire can reach. The property draws from this list, so a case
-/// deleted from it is a case the property stops covering — which
-/// `every_disposition_has_a_reachable_wire_case` then reports.
-const SCENARIOS: &[Scenario] = &[
-    Scenario::Accepted,
-    Scenario::UnknownRequest,
-    Scenario::ClosedRequest,
-    Scenario::DuplicateSubsystem,
-    Scenario::UnexpectedSubsystem,
-    Scenario::FormatMismatch,
-    Scenario::ResponseTooLarge,
-];
 
 /// Dispositions the relay suites cover, because each one needs a forward this
 /// listener's relay never completes.
@@ -62,12 +47,6 @@ enum Scenario {
     UnexpectedSubsystem,
     FormatMismatch,
     ResponseTooLarge,
-}
-
-impl Arbitrary for Scenario {
-    fn arbitrary(g: &mut Gen) -> Self {
-        *g.choose(SCENARIOS).unwrap_or(&Self::Accepted)
-    }
 }
 
 impl Scenario {
@@ -120,13 +99,21 @@ impl Scenario {
 ///
 /// It also proves `OK` means stored: every accepting answer is followed by the
 /// same delivery again, which must no longer be accepted.
-#[quickcheck]
-fn the_wire_status_is_the_registry_disposition(scenario: Scenario) -> TestResult {
+#[test]
+fn every_wire_status_is_the_registry_disposition() -> Result<()> {
     init_test_logging();
-    match TEST_RUNTIME.block_on(play(scenario)) {
-        Ok(()) => TestResult::passed(),
-        Err(error) => TestResult::error(format!("{scenario:?}: {error:#}")),
+    let mut covered = Vec::with_capacity(Scenario::VARIANTS.len());
+    for &scenario in Scenario::VARIANTS {
+        TEST_RUNTIME.block_on(play(scenario))?;
+        covered.push(scenario.expected());
     }
+    for disposition in ResponseDisposition::VARIANTS {
+        let has_case = covered.contains(disposition)
+            || *disposition == ResponseDisposition::Unreachable
+            || RELAYED.contains(disposition);
+        ensure!(has_case, "{disposition:?} has no direct or relay case");
+    }
+    Ok(())
 }
 
 /// Drives `scenario` over the wire and against the oracle, and compares.
@@ -227,32 +214,4 @@ fn a_frame_for_another_node_is_never_accepted() -> Result<()> {
         );
         Ok(())
     })
-}
-
-/// Every disposition is reached by a case above, or named as one the relay
-/// suites reach. Without this, a case dropped from the generator would stop
-/// being covered silently.
-#[test]
-fn every_disposition_has_a_reachable_wire_case() -> Result<()> {
-    // The generator draws from `SCENARIOS`, and both `seed` and `deliveries`
-    // have a catch-all arm, so a case left out of that list would be
-    // unreachable and invisible.
-    ensure!(
-        SCENARIOS.len() == Scenario::VARIANTS.len(),
-        "every scenario must be listed in SCENARIOS, but {} of {} are",
-        SCENARIOS.len(),
-        Scenario::VARIANTS.len()
-    );
-    for disposition in ResponseDisposition::VARIANTS {
-        let covered = SCENARIOS
-            .iter()
-            .any(|scenario| scenario.expected() == *disposition)
-            || *disposition == ResponseDisposition::Unreachable
-            || RELAYED.contains(disposition);
-        ensure!(
-            covered,
-            "{disposition:?} is reached by no case here, and is not named as a relay outcome"
-        );
-    }
-    Ok(())
 }
