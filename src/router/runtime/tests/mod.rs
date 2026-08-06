@@ -163,7 +163,7 @@ impl Process {
             let router = RouterHandle::new(
                 runtime.node(),
                 Arc::clone(runtime.pending()),
-                runtime.addresses().clone(),
+                runtime.router.addresses.clone(),
                 Arc::clone(runtime.fleet()),
                 Arc::new(transport),
                 None,

@@ -109,7 +109,8 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
         let outcome: Result<()> = async {
             directory.register(&neighbour).await?;
             let route = runtime
-                .router()
+                .router
+                .clone()
                 .route(neighbour.node)
                 .await?
                 .ok_or_else(|| eyre!("a published neighbour must resolve"))?;

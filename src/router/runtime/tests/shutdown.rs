@@ -122,7 +122,7 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
                 "an unconfigured process publishes no entry point and no network"
             );
             ensure!(
-                runtime.addresses().resolve(node).await?.as_deref() == Some(&registered),
+                runtime.router.addresses.resolve(node).await?.as_deref() == Some(&registered),
                 "the runtime must resolve its own node through its cache"
             );
             Ok(())

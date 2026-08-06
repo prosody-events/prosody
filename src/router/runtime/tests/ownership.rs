@@ -121,7 +121,7 @@ fn a_same_node_response_uses_the_local_registry() -> Result<()> {
             workers,
             shared,
         } = Process::new().await?;
-        let router = runtime.router();
+        let router = runtime.router.clone();
         let (own, own_workers) = match TypedSender::<CountingCodec>::new(&router, frame_cap()?) {
             Ok(parts) => parts,
             Err(error) => {

@@ -78,7 +78,6 @@ pub(in crate::router) use tests::start_runtime;
 /// a method on it, and writes the parameter nowhere. An owner infers `D` where
 /// it prepares the runtime, and moves the whole runtime into a task of its own.
 pub(crate) struct PeerRuntime<D> {
-    addresses: AddressResolver<D>,
     router: RouterHandle<GrpcSender, D>,
     /// The write side of the directory. The resolver beside it only reads, so
     /// the two directions stay separate types rather than one that does both.
@@ -104,7 +103,6 @@ pub(crate) struct PeerRuntime<D> {
 /// `activate` or [`abandon`](Self::abandon). A plain drop detaches the listener
 /// task, and a retry on the same port then fails to bind.
 pub(crate) struct PreparedPeerRuntime<D> {
-    addresses: AddressResolver<D>,
     router: RouterHandle<GrpcSender, D>,
     frame_cap: FrameCap,
     directory: D,
@@ -226,7 +224,6 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
             }
         };
         Ok(Self {
-            addresses,
             router,
             frame_cap,
             directory,
@@ -295,7 +292,6 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
             }
         });
         Ok(PeerRuntime {
-            addresses: self.addresses,
             router: self.router,
             directory: self.directory,
             registration: self.registration,
@@ -410,13 +406,6 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         self.registration.node
     }
 
-    /// How this process resolves another node, through the bounded address
-    /// cache.
-    #[cfg(test)]
-    pub(crate) const fn addresses(&self) -> &AddressResolver<D> {
-        &self.addresses
-    }
-
     /// The process-wide destination fleet.
     #[cfg(test)]
     pub(crate) const fn fleet(&self) -> &Arc<DestinationFleet> {
@@ -426,14 +415,6 @@ impl<D: NodeDirectory> PeerRuntime<D> {
     /// The process-wide pending request registry.
     pub(crate) const fn pending(&self) -> &Arc<PendingRegistry> {
         &self.pending
-    }
-
-    /// The router every responder in this process sends through.
-    ///
-    /// Production reads the prepared runtime. This accessor serves the suites.
-    #[cfg(test)]
-    pub(crate) fn router(&self) -> RouterHandle<GrpcSender, D> {
-        self.router.clone()
     }
 
     /// Shuts this process's peer machinery down, in the one order that cannot
@@ -483,13 +464,12 @@ impl<D: NodeDirectory> PeerRuntime<D> {
             refresh,
             stop_listener,
             listener,
-            addresses,
             router,
         } = self;
 
-        // Neither needs a step: the resolver only reads, and the transport the
-        // router carries is already cloned into every response delivery worker.
-        drop((addresses, router));
+        // The resolver only reads. The transport is already cloned into every
+        // response delivery worker.
+        drop(router);
         // `send_replace` rather than `send`: a refresh task that already exited
         // leaves no receiver, and that is not a failure.
         stop_refresh.send_replace(true);
