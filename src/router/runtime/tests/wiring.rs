@@ -26,7 +26,7 @@ use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, TransportConfiguration, serve};
 use crate::router::loopback::{HANG_GUARD, TestHealth, TestRouter, config as fleet_config};
 use crate::router::relay::Relay;
-use crate::router::{Host, NodeId, Preference, ResponseSender, Router};
+use crate::router::{Host, LocalTarget, NodeId, Preference, ResponseSender, Router};
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -175,8 +175,7 @@ impl Elsewhere {
         let served = serve(
             bound,
             PeerService::new(
-                node,
-                Arc::clone(&registry),
+                LocalTarget::new(node, Arc::clone(&registry)),
                 Relay::new(unused),
                 cap,
                 TIMEOUT,

@@ -8,16 +8,14 @@ use super::generated::peer_server::Peer;
 use super::inject::MetadataExtractor;
 use crate::otel::carry_parent;
 use crate::propagator::new_propagator;
-use crate::requester::registry::PendingRegistry;
 use crate::response::ResponseDisposition;
 use crate::response::frame::FrameCap;
 use crate::response::frame::ResponseFrame;
 use crate::response::frame::encode::Forwarded;
 use crate::router::relay::{Relay, RelayFailure, Routing, routing};
-use crate::router::{NodeId, RelayHop};
+use crate::router::{LocalTarget, RelayHop};
 use async_trait::async_trait;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tonic::metadata::MetadataValue;
@@ -32,8 +30,7 @@ use tracing::{Instrument, Span, debug_span};
 /// frame is compared against is the one this service was built with, and no
 /// frame can supply that id.
 pub(crate) struct PeerService<R> {
-    node: NodeId,
-    registry: Arc<PendingRegistry>,
+    local: LocalTarget,
     relay: Relay<R>,
     cap: FrameCap,
     /// This process's own ceiling on one forward. [`inbound_deadline`] owns
@@ -43,18 +40,15 @@ pub(crate) struct PeerService<R> {
 }
 
 impl<R> PeerService<R> {
-    /// Serves `registry` on behalf of `node`, and sends every other frame on
-    /// through `relay`.
+    /// Serves `local` and sends every other frame through `relay`.
     pub(crate) fn new(
-        node: NodeId,
-        registry: Arc<PendingRegistry>,
+        local: LocalTarget,
         relay: Relay<R>,
         cap: FrameCap,
         budget: Duration,
     ) -> Self {
         Self {
-            node,
-            registry,
+            local,
             relay,
             cap,
             budget,
@@ -113,20 +107,20 @@ impl<R: RelayHop> Peer for PeerService<R> {
             span.record("peer.request", display(frame.header.request));
             span.record("peer.subsystem", display(&frame.header.subsystem));
             let target = frame.header.target;
-            let routing = routing(self.node, target, frame.header.relay);
+            let routing = routing(self.local.node, target, frame.header.relay);
             // Counted here rather than inside the arms, so a routing outcome
             // added later cannot reach the wire without being counted.
             if routing != Routing::Accept {
                 TRANSPORT.record_misrouted();
             }
             match routing {
-                Routing::Accept => answer(&span, self.registry.accept(frame)),
+                Routing::Accept => answer(&span, self.local.accept(frame)),
                 Routing::AlreadyRelayed => answer(&span, ResponseDisposition::AlreadyRelayed),
                 Routing::Forward => {
                     TRANSPORT.record_forwarded();
                     // The forwarded form carries this process's own id, so a
                     // relay id the caller supplied cannot survive the hop.
-                    let Some(forwarded) = Forwarded::new(frame, self.node, self.cap) else {
+                    let Some(forwarded) = Forwarded::new(frame, self.local.node, self.cap) else {
                         return answer(&span, ResponseDisposition::ResponseTooLarge);
                     };
                     let forward = debug_span!(

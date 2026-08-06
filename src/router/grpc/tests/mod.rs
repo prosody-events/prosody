@@ -32,7 +32,7 @@ use crate::router::fleet::DestinationFleet;
 use crate::router::loopback::listener::{FixedRouter, Served, endpoint, transport};
 use crate::router::loopback::{TestRouter, config as fleet_config, registration};
 use crate::router::relay::Relay;
-use crate::router::{Framed, NodeId, ResponseSender, SendFailure};
+use crate::router::{Framed, LocalTarget, NodeId, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
 use bytes::{BufMut, BytesMut};
 use color_eyre::Result;
@@ -136,8 +136,7 @@ impl Harness {
         let served = Served::start(
             bound,
             PeerService::new(
-                node,
-                Arc::clone(&served_registry),
+                LocalTarget::new(node, Arc::clone(&served_registry)),
                 Relay::new(relay_router),
                 config.frame_cap,
                 BUDGET,

@@ -18,7 +18,6 @@ use crate::requester::registry::PendingRegistry;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader, ResponseFrame};
 use crate::response::{FormatToken, RequestId, ResponseStatus};
-use crate::router::NodeId;
 use crate::router::directory::Endpoint;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::BoundListener;
@@ -26,6 +25,7 @@ use crate::router::grpc::generated::peer_server::Peer;
 use crate::router::grpc::service::PeerService;
 use crate::router::loopback::listener::{FixedRouter, Served, bind, endpoint};
 use crate::router::loopback::{Delivery, TestRouter, node, registration};
+use crate::router::{LocalTarget, NodeId};
 use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
 use color_eyre::Result;
@@ -96,8 +96,7 @@ impl Process {
         let (router, deliveries) = TestRouter::new(config)?;
         let registry = PendingRegistry::new(&RequesterConfiguration::default())?;
         let service = PeerService::new(
-            node,
-            Arc::clone(&registry),
+            LocalTarget::new(node, Arc::clone(&registry)),
             Relay::new(router.clone()),
             FrameCap::new(CAP_BYTES)?,
             budget,
@@ -251,7 +250,12 @@ impl Live {
         )?;
         let served = Served::start(
             bound,
-            PeerService::new(node, Arc::clone(&registry), Relay::new(router), cap, budget),
+            PeerService::new(
+                LocalTarget::new(node, Arc::clone(&registry)),
+                Relay::new(router),
+                cap,
+                budget,
+            ),
         )?;
         Ok(Self {
             node,

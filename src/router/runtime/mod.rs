@@ -203,8 +203,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         let listener = match serve(
             inputs.listener,
             PeerService::new(
-                registration.node,
-                Arc::clone(&pending),
+                router.local().clone(),
                 Relay::new(router.clone()),
                 frame_cap,
                 inputs.fleet.send_deadline,
