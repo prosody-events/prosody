@@ -1,7 +1,7 @@
 //! Responding consumer wiring from termination through shutdown.
 
 use super::{
-    Event, EventLog, RecordingBackend, RecordingDirectory, bounded, common_config, consumer_config,
+    Event, EventLog, RecordingBackend, RecordingDirectory, common_config, consumer_config,
     peer_config, recording_memory_deps,
 };
 use crate::codec::Codec;
@@ -148,7 +148,7 @@ async fn the_responding_wiring_answers_a_tagged_message() -> Result<()> {
     .await;
     drop(handler);
     drop(provider);
-    bounded("prepared peer abandonment", peer.abandon()).await?;
+    peer.abandon().await;
     drop(router);
 
     let mut recorded = collect_deliveries(&mut deliveries).await;
@@ -206,7 +206,7 @@ async fn the_prepared_peer_admits_the_name_its_responder_answers_with() -> Resul
     // The provider holds the last responder clone, and abandonment joins the
     // workers that clone keeps open.
     drop(provider);
-    bounded("prepared peer abandonment", peer.abandon()).await?;
+    peer.abandon().await;
     ensure!(
         admitted == Some(subsystem),
         "the prepared peer admits {admitted:?}, not the name its responder answers with"
@@ -289,20 +289,17 @@ async fn a_responding_consumer_starts_and_stops() -> Result<()> {
         common: &common,
         deps,
     };
-    let consumer = Box::pin(bounded(
-        "responding consumer startup",
-        ProsodyConsumer::<JsonCodec>::pipeline_responding_consumer_with_backend::<
-            ScriptedHandler,
-            SomeResponseCodec,
-            _,
-        >(
-            typed,
-            pipeline_config()?,
-            Telemetry::new(),
-            ScriptedHandler::success(),
-        ),
-    ))
-    .await??;
+    let consumer = ProsodyConsumer::<JsonCodec>::pipeline_responding_consumer_with_backend::<
+        ScriptedHandler,
+        SomeResponseCodec,
+        _,
+    >(
+        typed,
+        pipeline_config()?,
+        Telemetry::new(),
+        ScriptedHandler::success(),
+    )
+    .await?;
     let outcome: Result<()> = async {
         ensure!(
             log.lock()
@@ -313,7 +310,7 @@ async fn a_responding_consumer_starts_and_stops() -> Result<()> {
         Ok(())
     }
     .await;
-    bounded("responding consumer shutdown", consumer.shutdown()).await??;
+    consumer.shutdown().await?;
     outcome
 }
 
