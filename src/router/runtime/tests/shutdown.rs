@@ -23,7 +23,7 @@ use crate::test_util::{TEST_RUNTIME, integration_test_count};
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
-use futures::poll;
+use futures::future::poll_fn;
 use opentelemetry::Context;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use std::future::Future;
@@ -31,7 +31,7 @@ use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering::{Acquire, Release};
-use tokio::task::yield_now;
+use std::task::Poll::{Pending, Ready};
 use tokio::time::Instant;
 
 /// The response drain has not run.
@@ -194,20 +194,8 @@ fn prop_shutdown_leaves_no_registration_and_no_reservation() {
             };
             let mut shutting = pin!(runtime.shutdown(drain));
             // The registry emptying is what says the steps before the gate ran.
-            drive_until(
-                &mut shutting,
-                &witness,
-                "shutdown never woke the waiting requests",
-                || shared.pending.len() == 0,
-            )
-            .await?;
-            drive_until(
-                &mut shutting,
-                &witness,
-                "shutdown never closed the admission gate",
-                || shared.fleet.is_closed(),
-            )
-            .await?;
+            drive_until(&mut shutting, &witness, || shared.pending.len() == 0).await?;
+            drive_until(&mut shutting, &witness, || shared.fleet.is_closed()).await?;
             ensure!(
                 witness.load(Acquire) == NOT_STARTED,
                 "the response drain began while a reservation still held the gate"
@@ -300,30 +288,30 @@ fn arrange<'a>(
 
 /// Polls `shutting` until `reached` answers true.
 ///
-/// Fails when shutdown finishes first, when the response drain starts first, or
-/// when `stalled` describes a step that never happened. The deadline is a hang
-/// guard on a step that has no signal to wait on; the assertion is the state
-/// each poll reads.
+/// The shutdown future supplies the wakeup. No wall-clock delay controls the
+/// test.
 async fn drive_until<F: Future, C: FnMut() -> bool>(
     shutting: &mut Pin<&mut F>,
     witness: &AtomicU8,
-    stalled: &'static str,
     mut reached: C,
 ) -> Result<()> {
-    let deadline = Instant::now() + HANG_GUARD;
-    while !reached() {
-        ensure!(
-            poll!(shutting.as_mut()).is_pending(),
-            "shutdown finished while a reservation still held the gate"
-        );
-        ensure!(
-            witness.load(Acquire) == NOT_STARTED,
-            "the response drain began before the admission gate closed"
-        );
-        ensure!(Instant::now() < deadline, "{stalled}");
-        yield_now().await;
-    }
-    Ok(())
+    poll_fn(|context| {
+        if reached() {
+            return Ready(Ok(()));
+        }
+        if shutting.as_mut().poll(context).is_ready() {
+            return Ready(Err(eyre!(
+                "shutdown finished while a reservation still held the gate"
+            )));
+        }
+        if witness.load(Acquire) != NOT_STARTED {
+            return Ready(Err(eyre!(
+                "the response drain began before the admission gate closed"
+            )));
+        }
+        if reached() { Ready(Ok(())) } else { Pending }
+    })
+    .await
 }
 
 /// Asserts everything one finished shutdown leaves behind.
