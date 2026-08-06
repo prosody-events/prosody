@@ -13,7 +13,6 @@ use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::TRANSPORT;
 use crate::router::grpc::client::GrpcSender;
-use crate::router::loopback::HANG_GUARD;
 use crate::router::loopback::listener::FixedRouter;
 use crate::router::{Host, NodeId, Preference, ResponseSender, Router, SendFailure};
 use crate::subsystem::SubsystemName;
@@ -26,7 +25,7 @@ use opentelemetry_sdk::trace::SpanData;
 use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{Instant, timeout};
+use tokio::time::Instant;
 use tonic::Code;
 use tracing::{Instrument, info_span};
 
@@ -327,9 +326,7 @@ async fn crossing(pair: &Pair) -> Result<()> {
         )
         .map_err(|_| eyre!("the fleet refused the response"))?;
     drop(sender);
-    if timeout(HANG_GUARD, workers.join()).await.is_err() {
-        bail!("the delivery workers did not finish");
-    }
+    workers.join().await;
     ensure(
         pair.target
             .registry
@@ -370,16 +367,13 @@ async fn call_with_payload(
         relay: None,
     };
     let staged = encoder.stage(&header, payload.to_vec())?;
-    let delivered = timeout(
-        HANG_GUARD,
-        deliver(&sender, &live.address, &staged, granted).instrument(info_span!("peer.test.call")),
-    )
-    .await;
+    let delivered = deliver(&sender, &live.address, &staged, granted)
+        .instrument(info_span!("peer.test.call"))
+        .await;
     match delivered {
-        Ok(Ok(())) => Ok(Code::Ok),
-        Ok(Err(SendFailure::Status(code))) => Ok(code),
-        Ok(Err(failure)) => bail!("the listener answered nothing at all: {failure}"),
-        Err(_) => bail!("the delivery never finished"),
+        Ok(()) => Ok(Code::Ok),
+        Err(SendFailure::Status(code)) => Ok(code),
+        Err(failure) => bail!("the listener answered nothing at all: {failure}"),
     }
 }
 

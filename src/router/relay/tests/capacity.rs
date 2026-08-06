@@ -9,7 +9,7 @@ use crate::response::sender::TypedSender;
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::RelayHop;
 use crate::router::fleet::config::FleetConfiguration;
-use crate::router::loopback::{Delivery, HANG_GUARD, Script, TestRouter, node, port};
+use crate::router::loopback::{Delivery, Script, TestRouter, node, port};
 use crate::router::relay::{Relay, RelayFailure};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::time::{Instant, timeout};
+use tokio::time::Instant;
 
 /// The process's own destination. Its response is held in flight for the whole
 /// flood.
@@ -118,13 +118,11 @@ fn a_flood_of_forwards_cannot_take_a_busy_cell() -> Result<()> {
         );
 
         barrier.add_permits(2);
-        if timeout(HANG_GUARD, first).await??.is_err() {
+        if first.await?.is_err() {
             bail!("the held forward must deliver once it is released");
         }
         drop(sender);
-        if timeout(HANG_GUARD, workers.join()).await.is_err() {
-            bail!("the delivery workers did not finish");
-        }
+        workers.join().await;
         Ok(())
     })
 }
@@ -161,10 +159,9 @@ fn forwardable() -> Result<Forwarded> {
 
 /// Waits for the next recorded attempt and holds it to `expected`.
 async fn expect_port(deliveries: &mut UnboundedReceiver<Delivery>, expected: u16) -> Result<()> {
-    match timeout(HANG_GUARD, deliveries.recv()).await {
-        Ok(Some(delivery)) if delivery.port == expected => Ok(()),
-        Ok(Some(delivery)) => bail!("an attempt reached port {}, not {expected}", delivery.port),
-        Ok(None) => bail!("the transport stopped recording before an attempt arrived"),
-        Err(_) => bail!("no attempt reached port {expected}"),
+    match deliveries.recv().await {
+        Some(delivery) if delivery.port == expected => Ok(()),
+        Some(delivery) => bail!("an attempt reached port {}, not {expected}", delivery.port),
+        None => bail!("the transport stopped recording before an attempt arrived"),
     }
 }

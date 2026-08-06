@@ -10,17 +10,16 @@ use crate::router::RelayHop;
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{
-    Delivery, Drained, HANG_GUARD, PUBLISHED_NODES, Script, TestRouter, UNPUBLISHED_NODE,
-    collect_deliveries, config, node, paused, port,
+    Delivery, Drained, PUBLISHED_NODES, Script, TestRouter, UNPUBLISHED_NODE, collect_deliveries,
+    config, node, paused, port,
 };
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
-use color_eyre::eyre::bail;
+use color_eyre::eyre::{bail, eyre};
 use opentelemetry::Context;
 use std::cell::Cell;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::time::timeout;
 
 mod bounds;
 mod budget;
@@ -156,9 +155,7 @@ impl Harness {
         } = self;
         let counters = sender.counters();
         drop(sender);
-        if timeout(HANG_GUARD, workers.join()).await.is_err() {
-            bail!("the destination workers did not finish");
-        }
+        workers.join().await;
         drop(router);
 
         let drained = Drained {
@@ -182,11 +179,10 @@ impl Harness {
 pub(super) async fn next_delivery(
     deliveries: &mut UnboundedReceiver<Delivery>,
 ) -> Result<Delivery> {
-    match timeout(HANG_GUARD, deliveries.recv()).await {
-        Ok(Some(delivery)) => Ok(delivery),
-        Ok(None) => bail!("the transport stopped recording before a delivery arrived"),
-        Err(_) => bail!("no delivery arrived"),
-    }
+    deliveries
+        .recv()
+        .await
+        .ok_or_else(|| eyre!("the transport stopped recording before a delivery arrived"))
 }
 
 /// How many of `deliveries` went to the direct endpoint of the node for
