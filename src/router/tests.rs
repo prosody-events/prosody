@@ -1,4 +1,6 @@
-use super::{NodeId, Preference, RelayHop, Router, RouterHandle, SendFailure, choose_route};
+use super::{
+    LocalTarget, NodeId, Preference, RelayHop, Router, RouterHandle, SendFailure, choose_route,
+};
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
 use crate::router::Host;
@@ -354,8 +356,10 @@ fn answer(code: Code) -> SendFailure {
 fn test_router(directory: TestDirectory) -> Result<RouterHandle<LoopbackSender, TestDirectory>> {
     let (transport, _recorded) = LoopbackSender::new();
     Ok(RouterHandle::new(
-        NodeId::new(),
-        PendingRegistry::new(&RequesterConfiguration::default())?,
+        LocalTarget::new(
+            NodeId::new(),
+            PendingRegistry::new(&RequesterConfiguration::default())?,
+        ),
         AddressResolver::new(CACHE_CAPACITY, directory),
         Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
         Arc::new(transport),

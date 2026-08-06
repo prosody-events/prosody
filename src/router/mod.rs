@@ -280,15 +280,14 @@ impl<S, D: Clone> Clone for RouterHandle<S, D> {
 impl<S, D> RouterHandle<S, D> {
     /// Binds one process's resolver, fleet and transport together.
     pub(in crate::router) fn new(
-        local: NodeId,
-        registry: Arc<PendingRegistry>,
+        local: LocalTarget,
         addresses: AddressResolver<D>,
         fleet: Arc<DestinationFleet>,
         transport: Arc<S>,
         here: Option<NetworkId>,
     ) -> Self {
         Self {
-            local: LocalTarget::new(local, registry),
+            local,
             addresses,
             fleet,
             transport,

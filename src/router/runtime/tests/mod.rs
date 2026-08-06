@@ -20,7 +20,7 @@ use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::health::ProcessHealth;
 use crate::router::grpc::{BoundListener, TransportConfiguration};
 use crate::router::loopback::{LoopbackSender, Script, TestHealth, port};
-use crate::router::{Host, NodeId, RouterHandle};
+use crate::router::{Host, LocalTarget, NodeId, RouterHandle};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -161,8 +161,7 @@ impl Process {
             let (transport, _deliveries) = LoopbackSender::new();
             transport.script(port(0), Script::Hold(Arc::clone(&barrier)));
             let router = RouterHandle::new(
-                runtime.node(),
-                Arc::clone(runtime.pending()),
+                LocalTarget::new(runtime.node(), Arc::clone(runtime.pending())),
                 runtime.router.addresses.clone(),
                 Arc::clone(&runtime.router.fleet),
                 Arc::new(transport),

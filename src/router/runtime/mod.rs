@@ -192,8 +192,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         let addresses =
             AddressResolver::new(inputs.router.address_cache_capacity, directory.clone());
         let router = RouterHandle::new(
-            registration.node,
-            Arc::clone(&pending),
+            LocalTarget::new(registration.node, Arc::clone(&pending)),
             addresses.clone(),
             Arc::clone(&fleet),
             transport,
