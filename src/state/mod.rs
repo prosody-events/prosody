@@ -18,6 +18,9 @@
 //! * [`cell`] — the provisional-cell durability model ([`Cell`], [`Committed`],
 //!   [`ProvisionalCell`], [`ProvisionalWrite`]).
 //! * `store` — the uniform `CellStore` backend trait (crate-internal).
+//! * [`collection`] — the collection-operation core: one bound [`Collection`],
+//!   one scoped operation per public invocation, and the two sealed engines
+//!   (owner session and published reader) behind it.
 //! * [`descriptor`] — typed collection handles bound over the raw byte cells
 //!   the stores persist.
 //! * [`registry`] — per-collection operational settings ([`CommitMode`],
@@ -84,6 +87,7 @@ pub(crate) mod cached;
 pub mod cassandra;
 pub mod cell;
 pub mod cell_key;
+pub mod collection;
 pub(crate) mod commit;
 pub mod config;
 pub mod descriptor;
@@ -111,6 +115,7 @@ pub(crate) mod tests;
 
 pub use access::StateAccessError;
 pub use cell_key::{CellKey, Coordinate, Direction, Scan, ScanEdge, Section};
+pub use collection::{Collection, StateSession, WritableStateSession};
 pub use event_ref::{CommitDecision, EventRef, StoreOutcome, TimerEventRef};
 pub use identity::{
     CollectionId, CollectionKindId, CollectionRef, StateKey, StateName, StateNameError, StateType,
@@ -156,8 +161,8 @@ pub(crate) const STATE_FANOUT_CONCURRENCY: usize = 16;
 /// deployment-dependent, a separately validated config field is the follow-up.
 pub(crate) const SHARD_FANOUT_CONCURRENCY: usize = 8;
 
-/// Maximum concurrent typed resolves in flight within one `CellView::get_many`
-/// call — the loader (Kafka message) fan-out for a batch read. A resolve reads
+/// Maximum concurrent typed resolves in flight within one aligned batch read —
+/// the loader (Kafka message) fan-out for that read. A resolve reads
 /// the collection's source (a Kafka message for a loader-backed collection),
 /// which does not contend on the
 /// collection's Scylla shard, so it is not bounded by

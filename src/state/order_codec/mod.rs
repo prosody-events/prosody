@@ -59,11 +59,13 @@ pub trait OrderedKeyCodec: Codec<Payload = Self::Key, Error = KeyCodecError> {
 /// The unit address: the single cell of a one-cell collection, at the empty
 /// coordinate.
 ///
-/// Its logical key is `()`, so a single-cell kind (Value, and any meta cell a
-/// keyed kind pins to a fixed address) is addressed the same way a keyed kind
-/// is — through the typed cell view — without a key of its own. The empty
-/// coordinate is byte-identical to a Value cell's historical fixed address, so
-/// adopting it changes no durable bytes. Like every key axis, its
+/// Its logical key is `()`. A scoped operation's typed cell surface therefore
+/// addresses a single-cell kind the same way it addresses a keyed kind. The
+/// single-cell kind needs no key of its own. Value is one such kind. So is any
+/// meta cell that a keyed kind pins to a fixed address.
+///
+/// The empty coordinate is byte-identical to a Value cell's historical fixed
+/// address, so this address changes no durable bytes. Like every key axis, its
 /// [`FORMAT_ID`](Codec::FORMAT_ID) rides a single-cell collection's identity as
 /// the key-codec token.
 #[derive(Clone, Copy, Debug, Default)]

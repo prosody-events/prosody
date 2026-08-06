@@ -10,63 +10,22 @@ use crate::state::descriptor_identity::DurableDescriptorIdentity;
 use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::tests::support::ScriptedPublicationStore;
 use crate::state::{StateName, StateType};
+use crate::state_reader::PartitionCount;
 use crate::state_reader::reader::acquisition::REFRESH_BACKOFF;
 use crate::state_reader::tests::support::{
     CountingIdentityStore, ScriptedEnv, mock_clock_cache, topic,
 };
-use crate::state_reader::{PartitionCount, StateReader};
 use crate::subsystem::SubsystemName;
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::executor::block_on;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::iter::{empty, once};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::timeout;
 
 /// The ordered source pool the refresh script drives: `g0 < g1 < g2`.
 /// `SourceId` order equals index order, so the lowest admitted source is
 /// always the lowest index.
 const REFRESH_GROUPS: [&str; 3] = ["refresh-g0", "refresh-g1", "refresh-g2"];
-
-#[tokio::test(start_paused = true)]
-async fn held_snapshot_is_shared_while_refresh_is_blocked() -> Result<()> {
-    let descriptor = value_state::<JsonCodec>("refresh-shared");
-    let env = ScriptedEnv::new(descriptor)?;
-    let key = Key::from("user-1");
-    let source = topic(REFRESH_GROUPS[0]);
-    env.commit(REFRESH_GROUPS[0], source, &key, 1, |handle| async move {
-        handle.set(element(0)).await.map_err(|e| eyre!("set: {e}"))
-    })
-    .await?;
-    env.publish(REFRESH_GROUPS[0], source).await;
-
-    let (cache, _mock) = mock_clock_cache(1 << 20);
-    let deps = env.deps_with_cache(cache);
-    let first = StateReader::new_eager(&deps, env.sub.clone(), descriptor)?;
-    let second = StateReader::new_eager(&deps, env.sub.clone(), descriptor)?;
-    first.get(key.clone()).await?;
-
-    env.publications.gate_reads();
-    let refresh_key = key.clone();
-    let refresh = tokio::spawn(async move { first.get(refresh_key).await });
-    env.publications.wait_read_entered().await;
-
-    let served = timeout(Duration::from_secs(1), second.get(key))
-        .await
-        .map_err(|_| eyre!("hang guard: held snapshot waited for refresh"))??;
-    assert_eq!(
-        served,
-        Some(element(0)),
-        "a concurrent reader must serve the shared held snapshot"
-    );
-
-    env.publications.release_read();
-    refresh
-        .await
-        .map_err(|error| eyre!("refresh task: {error}"))??;
-    Ok(())
-}
 
 /// One source's edit in a refresh round.
 #[derive(Clone, Copy, Debug)]

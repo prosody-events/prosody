@@ -65,9 +65,9 @@ use std::slice;
 
 /// The maximum number of coordinates a batch read carries in one hop — one
 /// Cassandra `IN` query, or one fjall blocking-pool round-trip. It owns the
-/// batch bound: [`CoordinateBatch`] is unrepresentable above it, and
-/// [`STREAM_CHUNK`](super::descriptor::STREAM_CHUNK) aliases it so the
-/// point-get stream chunk width and the batch-read width are one number.
+/// batch bound: [`CoordinateBatch`] is unrepresentable above it, and the
+/// point-get stream driver chunks on it too, so the stream chunk width and the
+/// batch-read width are one number.
 ///
 /// Sized to amortize durable round-trips without widening one Cassandra
 /// response past the measured latency elbow. Buffers use the small keyed-state
@@ -76,7 +76,7 @@ pub(crate) const CELL_BATCH: usize = 128;
 
 const _: () = assert!(
     CELL_BATCH > 0,
-    "CELL_BATCH must be positive or both stream-unfold chunk sources stall on empty chunks"
+    "CELL_BATCH must be positive or every stream-unfold chunk source stalls on empty chunks"
 );
 
 /// A non-empty, bounded (`1..=CELL_BATCH`) run of coordinates for one batch

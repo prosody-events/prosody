@@ -152,7 +152,7 @@ where
     /// Builds a per-operation [`ReadSession`] over the current snapshot, with a
     /// fresh source pin. Rejects an empty key first: an empty or NULL key has
     /// no deterministic partition to route to.
-    async fn session(&self, key: Key) -> Result<ReadSession<C, B>, StateReaderError> {
+    pub(crate) async fn session(&self, key: Key) -> Result<ReadSession<C, B>, StateReaderError> {
         if key.is_empty() {
             return Err(StateReaderError::EmptyKey);
         }

@@ -2248,6 +2248,7 @@ dependencies = [
  "paste",
  "pin-project",
  "portable-atomic",
+ "prosody-macros",
  "prost",
  "prost-types",
  "quanta",
@@ -2285,6 +2286,15 @@ dependencies = [
  "whoami",
  "xxhash-rust",
  "zstd",
+]
+
+[[package]]
+name = "prosody-macros"
+version = "0.5.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]

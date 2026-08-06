@@ -16,8 +16,25 @@ concurrency:
   group: deploy
   cancel-in-progress: false
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.rail.outputs.build }}
+      docs: ${{ steps.rail.outputs.docs }}
+      infra: ${{ steps.rail.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Plan affected work
+        id: rail
+        uses: loadingalias/cargo-rail-action@ebc8ef2740efefe2cd5c42826344a8f1213113ae # v6
+        with:
+          since: ${{ github.event.before }}
+
   build:
     name: Build
+    needs: plan
+    if: needs.plan.outputs.docs == 'true' || needs.plan.outputs.build == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

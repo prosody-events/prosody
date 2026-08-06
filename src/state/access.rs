@@ -14,8 +14,10 @@ use thiserror::Error;
 /// [`ErrorCategory`]) so the error type needs no generics.
 #[derive(Debug, Error)]
 pub enum StateAccessError {
-    /// This context does not provide keyed state (the default for every
-    /// context outside the keyed-state middleware).
+    /// Keyed state is not reachable. Two paths raise it: a context that
+    /// provides no keyed state, and a reader range read that reached execution
+    /// with no selected source. The second path is unconstructable through the
+    /// collection API.
     #[error("keyed state is unavailable on this context")]
     Unavailable,
 
@@ -81,6 +83,17 @@ impl StateAccessError {
         Self::Store {
             message: error.to_string(),
             category: error.classify_error(),
+        }
+    }
+
+    /// Reports a batch read whose buffer is not index-aligned to the requested
+    /// coordinates. Callers zip the two together, so a short buffer truncates
+    /// and misaligns the result, and a long one carries values nobody
+    /// requested. Both break the store contract, so the category is permanent.
+    pub(crate) fn misaligned_batch(returned: usize, requested: usize) -> Self {
+        Self::Store {
+            message: format!("batch read returned {returned} values for {requested} coordinates"),
+            category: ErrorCategory::Permanent,
         }
     }
 

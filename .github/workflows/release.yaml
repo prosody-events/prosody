@@ -42,6 +42,8 @@ jobs:
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=mold
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created }}
     environment: release
@@ -50,16 +52,88 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
+      - name: Install mold
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+        with:
+          make-default: false
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@v1.6.0
         with:
           packages: cmake libcurl4-openssl-dev protobuf-compiler
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Verify linked crate versions
+        run: |
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          prosody_version="$(
+            jq -r '
+              .packages[]
+              | select(.name == "prosody")
+              | .version
+            ' <<<"$metadata"
+          )"
+          macros_version="$(
+            jq -r '
+              .packages[]
+              | select(.name == "prosody-macros")
+              | .version
+            ' <<<"$metadata"
+          )"
+          macros_requirement="$(
+            jq -r '
+              .packages[]
+              | select(.name == "prosody")
+              | .dependencies[]
+              | select(.name == "prosody-macros")
+              | .req
+            ' <<<"$metadata"
+          )"
+          if [[ "$prosody_version" != "$macros_version" ]]; then
+            echo "prosody $prosody_version and prosody-macros $macros_version must match." >&2
+            exit 1
+          fi
+          if [[ "$macros_requirement" != "^$macros_version" ]]; then
+            echo "prosody requires prosody-macros $macros_requirement, not ^$macros_version." >&2
+            exit 1
+          fi
       - name: Authenticate with crates.io
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
-      - name: Publish to crates.io
-        run: cargo publish
+      - name: Publish prosody-macros
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "prosody-macros") | .version')"
+          if cargo info "prosody-macros@$version" --registry crates-io >/dev/null 2>&1; then
+            echo "prosody-macros $version is already available."
+            exit 0
+          fi
+          if cargo publish -p prosody-macros; then
+            exit 0
+          fi
+          cargo info "prosody-macros@$version" --registry crates-io >/dev/null
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Wait for prosody-macros
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "prosody-macros") | .version')"
+          for attempt in {1..30}; do
+            if cargo info "prosody-macros@$version" --registry crates-io >/dev/null; then
+              exit 0
+            fi
+            echo "prosody-macros $version is not available. Attempt $attempt of 30."
+            sleep 10
+          done
+          echo "prosody-macros $version is not available after 30 attempts." >&2
+          exit 1
+      - name: Publish prosody
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "prosody") | .version')"
+          if cargo info "prosody@$version" --registry crates-io >/dev/null 2>&1; then
+            echo "prosody $version is already available."
+            exit 0
+          fi
+          cargo publish -p prosody
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

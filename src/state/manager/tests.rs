@@ -23,10 +23,12 @@ use crate::state::descriptor::{ValueDescriptor, value_state};
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::registry::CollectionDef;
 use crate::state::session::sealed::{ApplyOutcome, StateLifecycle};
-use crate::state::session::{CellWrite, Finalized};
+use crate::state::session::{Finalized, KeyedStateSession};
 use crate::state::tests::cell_suite::{FailingCellStore, bytes, value_cell};
 use crate::state::tests::support::FixedOracle;
-use crate::state::{CommitMode, EventRef, PartitionBackend, SharedStateBackend, TimerEventRef};
+use crate::state::{
+    CommitMode, EventRef, PartitionBackend, SharedStateBackend, StateBackend, TimerEventRef,
+};
 use crate::telemetry::Telemetry;
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::store::adapter::TableAdapter;
@@ -261,6 +263,19 @@ fn timer_event(key: &Key) -> EventRef {
     ))
 }
 
+/// Stages one Value cell into `session`'s dirty overlay — the seed every
+/// staging test starts from.
+async fn seed_value<B: StateBackend, L>(
+    session: &KeyedStateSession<B, L>,
+    name: &StateName,
+    value: u8,
+) {
+    let value = bytes(value);
+    session
+        .seed(StateType::Application, name, &value_cell(), Some(&value))
+        .await;
+}
+
 /// Stages a `cart` provisional cell under a timer `EventRef` through a real
 /// session (the crash window: the cell is staged, its promote never ran), and
 /// marks the key armed as the durability boundary would have.
@@ -270,14 +285,7 @@ async fn stage_under_timer(
     key: &Key,
     value: u8,
 ) -> Result<()> {
-    session
-        .set(
-            StateType::Application,
-            &StateName::try_new("cart")?,
-            &value_cell(),
-            &bytes(value),
-        )
-        .await?;
+    seed_value(&session, &StateName::try_new("cart")?, value).await;
     // The receipt is deliberately dropped: the crash window under test is
     // "staged, its promote never ran".
     assert!(matches!(session.finalize().await?, Finalized::Staged(_)));
@@ -439,9 +447,7 @@ fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
         let session = manager
             .session(key.clone(), timer_event(&key), termination())
             .handle();
-        session
-            .set(StateType::Application, &cart, &value_cell(), &bytes(7))
-            .await?;
+        seed_value(&session, &cart, 7).await;
         if !matches!(session.finalize().await?, Finalized::Staged(_)) {
             return Ok(TestResult::error("expected the cell to stage"));
         }
@@ -542,30 +548,9 @@ fn prop_recover_commits_unless_shutdown_interrupts_reschedule() {
 async fn write_mixed(manager: &TestManager, key: &Key) -> Result<(TestSession, EventRef)> {
     let event = timer_event(key);
     let session = manager.session(key.clone(), event, termination()).handle();
-    session
-        .set(
-            StateType::Application,
-            &StateName::try_new("cart")?,
-            &value_cell(),
-            &bytes(7),
-        )
-        .await?;
-    session
-        .set(
-            StateType::Application,
-            &StateName::try_new("wishlist")?,
-            &value_cell(),
-            &bytes(13),
-        )
-        .await?;
-    session
-        .set(
-            StateType::Application,
-            &StateName::try_new("last_seen")?,
-            &value_cell(),
-            &bytes(42),
-        )
-        .await?;
+    seed_value(&session, &StateName::try_new("cart")?, 7).await;
+    seed_value(&session, &StateName::try_new("wishlist")?, 13).await;
+    seed_value(&session, &StateName::try_new("last_seen")?, 42).await;
     Ok((session, event))
 }
 
@@ -694,22 +679,8 @@ async fn promote_is_best_effort_when_one_fails() -> Result<()> {
 
     let event = timer_event(&key);
     let session = manager.session(key.clone(), event, termination()).handle();
-    session
-        .set(
-            StateType::Application,
-            &StateName::try_new("cart")?,
-            &value_cell(),
-            &bytes(7),
-        )
-        .await?;
-    session
-        .set(
-            StateType::Application,
-            &StateName::try_new("wishlist")?,
-            &value_cell(),
-            &bytes(13),
-        )
-        .await?;
+    seed_value(&session, &StateName::try_new("cart")?, 7).await;
+    seed_value(&session, &StateName::try_new("wishlist")?, 13).await;
     let Finalized::Staged(staged) = session.finalize().await? else {
         bail!("expected a staged receipt");
     };

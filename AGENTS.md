@@ -636,3 +636,10 @@ When launching multi-agent workflows:
 ## Research
 
 - Automatically use context7 for code generation and library documentation.
+
+## CI planning
+
+- Check Cargo Rail after each CI path or repository layout change.
+- Confirm that README-only changes select documentation jobs only.
+- Confirm that source changes select all required build and test jobs.
+- Add `rail.toml` only when the default rules classify a path incorrectly.

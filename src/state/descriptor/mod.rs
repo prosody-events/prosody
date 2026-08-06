@@ -5,9 +5,10 @@
 //! the consumer to mint a [`Registered`] capability handle. A handler binds
 //! that handle via
 //! [`EventContext::state`](crate::consumer::event_context::EventContext::state)
-//! to get a typed handle whose `get`/`set` read and write the cell committed
-//! by the previous event on the key. `state` takes the handle, never a raw
-//! descriptor, so a handler can reach only collections it registered.
+//! to get a typed handle. That handle's `get` reads the value visible to this
+//! event, and its `set` stages a write into the invocation's journal. `state`
+//! takes the handle, never a raw descriptor, so a handler can reach only the
+//! collections it registered.
 //!
 //! # Composed cell types
 //!
@@ -29,9 +30,9 @@
 //! [`WithResolver`]; the consumer layer's Kafka message cell is exactly that
 //! pairing. To address a family of cells by a key, lift a single-cell type
 //! through [`Keyed`]. `src/state` never speaks a cell's bytes — key or
-//! value — directly; only its codecs do, and the compiler now enforces this:
-//! the byte-level sinks live in the private `view` submodule as items private
-//! to it, unreachable from the sibling collection kinds.
+//! value — directly; only its codecs do. The one decode/encode pair every
+//! typed cell passes through lives in [`crate::state::collection`], which owns
+//! that boundary.
 //!
 //! A [`CellResolver`] is **session-free**: it declares the capability it needs
 //! as [`CellResolver::Context`] and the framework extracts that context from
@@ -41,10 +42,12 @@
 //! resolver trait as a plain const, symmetric with [`Codec::FORMAT_ID`].
 //!
 //! Every descriptor asserts a [`StructuralIdentity`] — the frozen
-//! `(kind, codec id, resolver id, key codec id)` tuple. Codec, resolver, and
-//! key codec are all part of the durable contract: the codec types the stored
-//! cell, the resolver maps it to and from the exposed value, and the key codec
-//! orders keyed kinds, so swapping any silently would change what a cell means.
+//! `(kind, codec id, resolver id, key codec id)` tuple. Swapping any of them
+//! silently would change what a cell means: the codec types the stored cell,
+//! the resolver maps it to and from the exposed value, and the key codec orders
+//! keyed kinds. The codec and key-codec tokens are part of the *durable*
+//! contract; the resolver token is checked in process only (see
+//! [`StructuralIdentity::resolver_id`]).
 //! The identity is checked at registration (same `(state_type, name)` ⇒ same
 //! identity), at bind, and against the group-global durable identity table on
 //! first use, so a process carrying an incompatible descriptor fails loudly
@@ -53,29 +56,31 @@
 //! # Exposure
 //!
 //! Users define codecs, resolvers, and cell types (all public). Defining
-//! collection *kinds* is deliberately unexposed for now: `CellView` is
-//! crate-internal, and while [`CellScope`] and [`CollectionSpec`] are
-//! nameable downstream (they ride public signatures), the scope's
-//! view-minting surface is not — the structure is authoring-ready and opening
-//! it later is purely additive visibility.
+//! collection *kinds* stays deliberately unexposed. [`CollectionSpec`] is
+//! nameable downstream, because it names a public associated type, but a marker
+//! that only the layout macro emits *seals* it. A kind can therefore exist only
+//! inside this crate, and never without a declared durable layout.
 //!
-//! [`StateDescriptor`] itself is **sealed** (by the crate-private
-//! `SealedDescriptor` supertrait): a downstream crate can register and bind the
-//! framework's descriptors but cannot add its own impl, so no custom descriptor
-//! can receive the raw, gate-free [`CellRead`] session from `bind` and reach
-//! cells outside the KV4 session gate. This closes the one hole
-//! `CollectionSpec`'s Exposure note (on [`CollectionSpec`]) does not — that
-//! seals cell *reach* for kinds, this seals descriptor *authorship*.
+//! [`StateDescriptor`] is sealed the same way, by the crate-private
+//! `SealedDescriptor` supertrait. A downstream crate can register and bind the
+//! framework's descriptors but cannot add its own impl. That is what keeps
+//! identity honest: [`DescriptorIdentity`] is unsealed and
+//! [`StructuralIdentity`]'s fields are `pub`, so without the seal a downstream
+//! type could claim any (kind, format, resolver, key format) tuple for any name
+//! and hand it to
+//! [`KeyedStateConfiguration::register`](crate::consumer::KeyedStateConfiguration::register)
+//! or [`EventContext::state`](crate::consumer::event_context::EventContext::state).
+//! The two seals cover different things — [`CollectionSpec`] seals cell *reach*
+//! for kinds, this seals descriptor *authorship*.
 
-use crate::codec::{Codec, JsonCodec};
+use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::StateAccessError;
-use crate::state::cell_key::Section;
+use crate::state::collection::sealed_spec::SealedSpec;
+use crate::state::collection::{Collection, StateSession};
 use crate::state::order_codec::{KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::registry::{CollectionDef, ReadCachePolicy, StateVisibility};
-use crate::state::session::{CellRead, CellWrite};
-use crate::state::store::CELL_BATCH;
-use crate::state::{CollectionKindId, CommitMode, StateType, StoreOutcome};
+use crate::state::{CollectionKindId, CommitMode, StateType};
 use crate::timers::duration::CompactDuration;
 use educe::Educe;
 use internment::Intern;
@@ -83,42 +88,14 @@ use std::error::Error;
 use std::future::{Future, ready};
 use std::marker::PhantomData;
 use thiserror::Error;
-use tracing::instrument;
 
 pub mod deque;
 pub mod map;
-mod view;
+mod value;
 
 pub use deque::{DequeDescriptor, DequeHandle, DequeStateError, deque_state};
 pub use map::{MapDescriptor, MapHandle, MapStateError, map_state};
-pub use view::CellScope;
-pub(crate) use view::CellView;
-
-/// Value's own section enum, lowered to the opaque [`Section`]. Value is a
-/// one-cell collection, so it has exactly one section and addresses its single
-/// cell at the empty coordinate.
-#[repr(i8)]
-enum ValueNs {
-    Entries = 0,
-}
-
-/// The section holding a Value collection's single [`UnitKey`]-addressed cell.
-const VALUE_SECTION: Section = Section::new(ValueNs::Entries as i8);
-
-/// The point-get streams' chunk width: the granularity of both the per-chunk
-/// gate hold (one read permit per chunk, dropped with the chunk future's scope
-/// before any yield) and the batch read — each chunk's cells are fetched by
-/// ONE `CellView::get_many` call (one Cassandra query / one fjall hop), whose
-/// typed resolves then fan out under `RESOLVE_FANOUT`. Shared by
-/// [`MapHandle::stream`](map::MapHandle::stream) and
-/// [`DequeHandle::stream`](deque::DequeHandle::stream).
-///
-/// An alias of [`CELL_BATCH`] — the point-get
-/// stream chunk width and the store batch-read width are one number, and the
-/// `> 0` invariant the shared `CellView::scan_at` chunk source relies on
-/// (`coords.by_ref().take(STREAM_CHUNK)` must take ≥ 1 coordinate per chunk) is
-/// enforced once on `CELL_BATCH`.
-pub(crate) const STREAM_CHUNK: usize = CELL_BATCH;
+pub use value::{ValueDescriptor, ValueHandle, ValueKind, value_state};
 
 /// A resolver: how a decoded cell (`Stored`) maps to and from the value a
 /// handle exposes (`Resolved`/`Write`).
@@ -137,10 +114,12 @@ pub(crate) const STREAM_CHUNK: usize = CELL_BATCH;
 /// pointer) belongs in a dedicated codec, the way the message cell's
 /// `"message-ref"` format is its own codec and its resolver merely fetches.
 ///
-/// A resolver must never issue a session or collection operation: point gets
-/// and point-get stream chunks resolve while holding the session gate (a scan
-/// resolves gate-free, but the contract binds every resolver regardless of
-/// path), so a resolver that re-entered the non-reentrant gate would deadlock.
+/// A resolver must never issue a session or collection operation. A point get
+/// resolves while it holds the session gate. A resolver that re-entered the
+/// non-reentrant gate would therefore deadlock. Other paths release admission
+/// first: a point-get stream chunk releases it before its resolve fan-out, and
+/// a range page runs gate-free. The contract still binds every resolver on
+/// every path.
 pub trait CellResolver {
     /// The decoded cell type this resolver maps from — pinned to the codec's
     /// payload by [`CellType`].
@@ -197,7 +176,7 @@ impl<'s, S> FromSession<'s, S> for () {
     fn from_session(_session: &'s S) -> Self {}
 }
 
-impl<'s, S: CellRead> FromSession<'s, S> for &'s S::Loader {
+impl<'s, S: StateSession> FromSession<'s, S> for &'s S::Loader {
     fn from_session(session: &'s S) -> Self {
         session.loader()
     }
@@ -364,14 +343,9 @@ pub trait DescriptorIdentity {
 /// Seals [`StateDescriptor`]. The trait is crate-internal (declared `pub`
 /// inside a `pub(crate)` module so it caps at crate visibility yet reads as the
 /// supertrait of the `pub` [`StateDescriptor`] without the `private_bounds`
-/// lint), so only the framework's two descriptor carriers implement it —
-/// [`Descriptor<K>`] (with its public
-/// [`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`] aliases) and the
-/// crate-internal lifecycle tunnel (`LifecycleAccess` in
-/// [`crate::state::session`]). A downstream crate can name [`StateDescriptor`]
-/// in bounds and call `bind`, but cannot add an impl — so it can never hand its
-/// own `bind` the raw, gate-free [`CellRead`] session and reach cells outside
-/// the KV4 session gate.
+/// lint), so no impl can exist outside this crate. A downstream crate can name
+/// [`StateDescriptor`] in bounds and call `bind`, but cannot add an impl. See
+/// the module's Exposure note for what that buys.
 pub(crate) mod sealed {
     use super::Descriptor;
 
@@ -384,27 +358,26 @@ pub(crate) mod sealed {
 pub(crate) use sealed::SealedDescriptor;
 
 /// A typed view over one keyed-state collection, bindable to any
-/// [`CellRead`] session.
+/// [`StateSession`].
 ///
 /// Handlers reach this through
 /// [`EventContext::state`](crate::consumer::event_context::EventContext::state),
-/// which binds against the context's per-event session. Binding validates
-/// registration + structural identity through the session's
-/// [`verify_state_registration`] and returns an owned, `Clone` handle that
-/// wraps the session's byte cells with the descriptor's typing.
+/// which binds against the context's per-event session. Binding validates the
+/// collection through the session's engine — registration and structural
+/// identity for the owner, the acquisition-validated descriptor for a published
+/// reader — and returns an owned, `Clone` handle over the bound collection.
+/// Each of that handle's methods runs as one scoped operation. A stream method
+/// runs a planning operation, then drives its plan outside that operation.
 ///
-/// Sealed by the crate-private `SealedDescriptor` supertrait: the two impls are
-/// the framework's own [`Descriptor<K>`] and the lifecycle tunnel, so `bind`'s
-/// raw-session access stays framework-only (see the module's Exposure note).
-///
-/// [`verify_state_registration`]: CellRead::verify_state_registration
+/// Sealed by the crate-private `SealedDescriptor` supertrait; see the module's
+/// Exposure note.
 pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     /// Typed handle returned by [`Self::bind`]; owns a clone of the binding
-    /// [`CellRead`] session.
-    type Handle<S: CellRead>;
+    /// session.
+    type Handle<S: StateSession>;
 
-    /// Validates registration + structural identity and returns the typed
-    /// handle.
+    /// Validates the collection against the session's engine and returns the
+    /// typed handle.
     ///
     /// Consumes the descriptor — descriptors are cheap `Copy` declarations.
     /// Handlers never call this directly; they pass the [`Registered`] handle
@@ -417,7 +390,7 @@ pub trait StateDescriptor: DescriptorIdentity + Copy + SealedDescriptor {
     /// collection is unregistered, or
     /// [`StateAccessError::IdentityMismatch`] when it is registered with a
     /// different identity.
-    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
+    fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError>;
 
     /// The operational settings this descriptor carries into registration, set
     /// via its fluent methods (see [`Self::ttl`]).
@@ -536,25 +509,28 @@ impl<D> Registered<D> {
 
 /// Per-kind specialization for the shared [`Descriptor`] skeleton: the cell
 /// type a kind stores, its kind discriminator and optional key codec, and the
-/// typed handle a bind mints from a [`CellScope`]. One zero-sized impl per
-/// collection kind ([`ValueKind`], [`map::MapKind`], [`deque::DequeKind`]); the
-/// public [`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`] aliases
+/// typed handle a bind mints from the bound [`Collection`]. One zero-sized impl
+/// per collection kind ([`ValueKind`], [`map::MapKind`], [`deque::DequeKind`]);
+/// the public [`ValueDescriptor`]/[`MapDescriptor`]/[`DequeDescriptor`] aliases
 /// pick the spec, so every descriptor shares one `new`, `name`,
 /// `collection_def`/`with_collection_def`, and `bind` body.
 ///
 /// The framework reads every [`StructuralIdentity`] token straight off
-/// `Cell`'s axes, so a kind cannot misstate the identity it registers.
+/// `Cell`'s axes. `Cell` itself is hand-written, so it could name a family that
+/// the layout does not declare. Each kind's frozen-layout assertion therefore
+/// pins `Cell` to the key and payload tokens of the data family it addresses.
 ///
 /// # Exposure
 ///
 /// This trait names the [`StateDescriptor`] impl's `Handle` associated type, a
-/// public interface, so it is `pub` — but defining collection kinds is
-/// deliberately unexposed: a kind's `handle` receives a [`CellScope`], and the
-/// scope's view-minting surface (`CellScope::typed`) is crate-internal, so
-/// while a downstream impl can be registered and bound, the handle it mints
-/// cannot reach any cell. Users compose cell types (codec + resolver) instead
-/// — that surface is fully public.
-pub trait CollectionSpec {
+/// public interface, so it is `pub`. Defining collection kinds stays
+/// deliberately unexposed, and structurally so. A crate-internal marker seals
+/// the trait, and only
+/// [`collection_layout!`](crate::state::collection::collection_layout) emits
+/// that marker, so a kind cannot exist without a declared durable layout.
+/// Users compose cell types (codec + resolver) instead. That surface is fully
+/// public.
+pub trait CollectionSpec: SealedSpec + Sized {
     /// This kind's durable discriminator.
     const KIND: CollectionKindId;
 
@@ -563,12 +539,11 @@ pub trait CollectionSpec {
     type Cell: CellType;
 
     /// The typed handle [`Descriptor::bind`] returns over session `S`.
-    type Handle<S: CellRead>;
+    type Handle<S: StateSession>;
 
-    /// Mints the handle over a bound [`CellScope`]. The scope pins the
-    /// collection's partition; the kind projects the typed views it needs from
-    /// it (see `CellScope::typed`).
-    fn handle<S: CellRead>(scope: CellScope<S>) -> Self::Handle<S>;
+    /// Mints the handle over the already-validated binding. Infallible: every
+    /// check the collection needs happened while the [`Collection`] was built.
+    fn handle<S: StateSession>(collection: Collection<S, Self>) -> Self::Handle<S>;
 }
 
 /// The one descriptor skeleton every collection kind shares: an interned name,
@@ -624,21 +599,18 @@ impl<K: CollectionSpec> DescriptorIdentity for Descriptor<K> {
 }
 
 impl<K: CollectionSpec> StateDescriptor for Descriptor<K> {
-    type Handle<S: CellRead> = K::Handle<S>;
+    type Handle<S: StateSession> = K::Handle<S>;
 
-    fn bind<S: CellRead>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
-        // The scope carries the binding descriptor's `state_type` so its cell
-        // ops address the right namespace.
-        let name = session.verify_state_registration(
+    fn bind<S: StateSession>(self, session: &S) -> Result<Self::Handle<S>, StateAccessError> {
+        // The binding carries the descriptor's `state_type`, so the
+        // collection's commands address the right namespace.
+        let collection = Collection::bind(
+            session,
             self.name,
             self.state_type(),
             &self.structural_identity(),
         )?;
-        Ok(K::handle(CellScope::new(
-            session.clone(),
-            self.state_type(),
-            name,
-        )))
+        Ok(K::handle(collection))
     }
 
     fn collection_def(&self) -> CollectionDef {
@@ -651,142 +623,8 @@ impl<K: CollectionSpec> StateDescriptor for Descriptor<K> {
     }
 }
 
-/// Descriptor for a codec-backed single value collection.
-///
-/// Generic over a [`CellType`] `T` — a plain [`Codec`] (the default
-/// [`JsonCodec`] stores [`serde_json::Value`] cells, the same default as the
-/// consumer's message payload) or a codec paired with a resolver via
-/// [`WithResolver`]. Declare via [`value_state`] (see [`Descriptor::new`] for
-/// the `name` contract); for a typed cell, declare a codec
-/// (`CartCodec: Codec<Payload = Cart>`) and annotate the binding
-/// `ValueDescriptor<CartCodec>`.
-pub type ValueDescriptor<T = JsonCodec> = Descriptor<ValueKind<T>>;
-
-/// The Value [`CollectionSpec`]: a single [`UnitKey`]-addressed cell of type
-/// `T`.
-pub struct ValueKind<T>(PhantomData<fn() -> T>);
-
-impl<T: CellType<Key = UnitKey>> CollectionSpec for ValueKind<T> {
-    type Cell = T;
-    type Handle<S: CellRead> = ValueHandle<S, T>;
-
-    const KIND: CollectionKindId = CollectionKindId::Value;
-
-    fn handle<S: CellRead>(scope: CellScope<S>) -> ValueHandle<S, T> {
-        ValueHandle::new(&scope)
-    }
-}
-
-/// Declares a codec-backed value collection named `name` (JSON by
-/// default — annotate the binding with `ValueDescriptor<MyCell>` to pick
-/// another cell type). See [`Descriptor::new`] for the `name` contract.
-#[must_use]
-pub fn value_state<T>(name: &str) -> ValueDescriptor<T>
-where
-    T: CellType<Key = UnitKey>,
-{
-    ValueDescriptor::new(name)
-}
-
-/// Typed, owned handle over a codec-backed value collection — a thin newtype
-/// over a `CellView` addressing the single Value cell.
-///
-/// Owns a clone of the binding session (`Clone + Send + Sync + 'static` — an
-/// FFI requirement); the cell type's codec runs only at the edges (`get`
-/// decodes, `set` encodes) and its resolver maps the decoded cell to and from
-/// the exposed value. Every operation guards on session termination.
-#[derive(Educe)]
-#[educe(Clone(bound = "S: Clone"))]
-pub struct ValueHandle<S, T> {
-    view: CellView<S, T>,
-}
-
-impl<S: CellRead, T> ValueHandle<S, T> {
-    /// Wraps a bound [`CellScope`] as the typed view over the single
-    /// [`UnitKey`]-addressed Value cell. Bound-free in `T` so
-    /// [`StateDescriptor::bind`] can mint it without the op bound.
-    fn new(scope: &CellScope<S>) -> Self {
-        Self {
-            view: scope.typed(VALUE_SECTION),
-        }
-    }
-}
-
-impl<S, T> ValueHandle<S, T>
-where
-    S: CellRead,
-    T: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-{
-    /// Reads, decodes, and resolves the current visible value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an access error from the session, a codec error (Permanent)
-    /// when the cell bytes do not decode, or a resolution error from the
-    /// resolver.
-    #[instrument(name = "value.get", skip_all, fields(collection = self.view.name().as_str()), err)]
-    pub async fn get(&self) -> Result<Option<ResolvedOf<T>>, CellStateError<CellCodecError<T>>> {
-        let permit = self.view.read_permit().await;
-        self.view.get(&permit, &()).await
-    }
-}
-
-impl<S, T> ValueHandle<S, T>
-where
-    S: CellWrite,
-    T: CellType<Key = UnitKey>,
-    for<'s> ContextOf<'s, T>: FromSession<'s, S>,
-{
-    /// Lowers `value` through the resolver, encodes it, and buffers a set.
-    ///
-    /// # Errors
-    ///
-    /// Returns a codec error (Permanent) when the cell fails to encode, or
-    /// an access error from the session.
-    #[instrument(name = "value.set", skip_all, fields(collection = self.view.name().as_str()), err)]
-    pub async fn set(
-        &self,
-        value: WriteOf<'_, T>,
-    ) -> Result<(), CellStateError<CellCodecError<T>>> {
-        let permit = self.view.mutate_permit().await?;
-        self.view.set(&permit, &(), value).await
-    }
-
-    /// Buffers a clear operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an access error from the session.
-    #[instrument(name = "value.clear", skip_all, fields(collection = self.view.name().as_str()), err)]
-    pub async fn clear(&self) -> Result<(), CellStateError<CellCodecError<T>>> {
-        let permit = self.view.mutate_permit().await?;
-        self.view.clear(&permit, &()).await
-    }
-
-    /// Durably commits the buffered op mid-handler, so it survives a restart
-    /// after failure. At-least-once; see [`CellWrite::commit`] for the
-    /// contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns an access error from the session.
-    #[instrument(name = "value.commit", skip_all, fields(collection = self.view.name().as_str()), err)]
-    pub async fn commit(&self) -> Result<StoreOutcome, CellStateError<CellCodecError<T>>> {
-        let permit = self.view.mutate_permit().await?;
-        self.view.commit(&permit).await
-    }
-
-    /// Discards the buffered uncommitted op, reverting reads to the last
-    /// [`commit`](Self::commit) — or the pre-event committed value if none.
-    /// Infallible; see [`CellWrite::rollback`] for the contract.
-    #[instrument(name = "value.rollback", skip_all, fields(collection = self.view.name().as_str()))]
-    pub async fn rollback(&self) -> StoreOutcome {
-        self.view.rollback().await
-    }
-}
-
-/// Error returned by typed cell operations ([`ValueHandle`], `CellView`).
+/// Error returned by a typed cell operation, which is one scoped collection
+/// command.
 #[derive(Debug, Error)]
 pub enum CellStateError<E>
 where
@@ -800,9 +638,9 @@ where
     #[error("state codec failed")]
     Codec(#[source] E),
 
-    /// A stored key coordinate did not decode back to a logical key. A scan
-    /// alone surfaces this — `get`/`set`/`clear` only *encode* the caller's
-    /// key, they never decode a stored one.
+    /// A stored key coordinate did not decode back to a logical key. Only a
+    /// coordinate decode produces this error, so only a stream can raise it.
+    /// Every point command encodes the caller's key and decodes no stored one.
     #[error(transparent)]
     Key(#[from] KeyCodecError),
 }

@@ -16,7 +16,7 @@ use crate::loader::MessageLoader;
 use crate::router::directory::GroupMembership;
 use crate::router::label_fits;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
-use crate::state::session::CellWrite;
+use crate::state::session::EventSession;
 use crate::telemetry::Telemetry;
 use crate::timers::store::TriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType};
@@ -87,7 +87,7 @@ where
     P: TriggerStoreProvider,
     SP: PartitionStateProvider<P::Store>,
     <SP::Manager as PartitionStateManager>::Session:
-        CellWrite<Loader: MessageLoader<Payload = C::Payload>>,
+        EventSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
     A: PeerAttachment + 'static,
@@ -257,7 +257,7 @@ where
     P: TriggerStoreProvider,
     SP: PartitionStateProvider<P::Store>,
     <SP::Manager as PartitionStateManager>::Session:
-        CellWrite<Loader: MessageLoader<Payload = C::Payload>>,
+        EventSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
     A: PeerAttachment + 'static,

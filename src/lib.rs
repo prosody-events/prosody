@@ -27,6 +27,10 @@
     clippy::multiple_crate_versions,
     reason = "Transitive dependencies have version conflicts outside our control"
 )]
+// The scoped collection operations nest one engine projection per session
+// bound, and the middleware test futures compose them several layers deep;
+// the default 128 is not enough to lay out those types.
+#![recursion_limit = "256"]
 
 use ::tracing::info;
 use fixedstr::Flexstr;

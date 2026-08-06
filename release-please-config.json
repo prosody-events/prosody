@@ -2,7 +2,23 @@
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "packages": {
     ".": {
+      "component": "prosody",
+      "release-type": "rust"
+    },
+    "crates/prosody-macros": {
+      "component": "prosody-macros",
       "release-type": "rust"
     }
-  }
+  },
+  "plugins": [
+    {
+      "type": "cargo-workspace",
+      "merge": false
+    },
+    {
+      "type": "linked-versions",
+      "groupName": "prosody",
+      "components": ["prosody", "prosody-macros"]
+    }
+  ]
 }

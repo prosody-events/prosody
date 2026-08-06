@@ -2,11 +2,11 @@
 //!
 //! The flagship is the **read-path uniqueness invariant**: a present cell read
 //! back from the fjall decode path is uniquely owned
-//! (`try_into_mut().is_ok()`). This pins the production fast path
-//! `CellView::get` relies on — the fjall cache decode mints a fresh `Bytes`,
-//! so the read parses in place with zero copy — and guards against a future
-//! layer re-introducing a shared clone that would silently demote the read to
-//! the copying fallback.
+//! (`try_into_mut().is_ok()`). This pins the production fast path that a
+//! collection's typed read relies on. The fjall cache decode mints a fresh
+//! `Bytes`, so the read parses in place with zero copy. It also guards against
+//! a future layer that re-introduces a shared clone, which would silently
+//! demote the read to the copying fallback.
 
 use super::codec::cell_key;
 use super::test_db;

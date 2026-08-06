@@ -30,7 +30,7 @@ use crate::state::cassandra::{
 };
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
-use crate::state::session::CellWrite;
+use crate::state::session::EventSession;
 use crate::timers::store::TriggerStoreProvider;
 use crate::timers::store::cassandra::CassandraTriggerStoreProvider;
 use crate::timers::store::memory::InMemoryTriggerStoreProvider;
@@ -62,7 +62,7 @@ where
     C: Codec,
     <<Self::State as PartitionStateProvider<
         <Self::Trigger as TriggerStoreProvider>::Store,
-    >>::Manager as PartitionStateManager>::Session: CellWrite<Loader = Self::EventLoader>,
+    >>::Manager as PartitionStateManager>::Session: EventSession<Loader = Self::EventLoader>,
 {
     type Trigger: TriggerStoreProvider;
     type Messages: MessageDeferStoreProvider;

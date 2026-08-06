@@ -17,8 +17,25 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.rail.outputs.build }}
+      infra: ${{ steps.rail.outputs.infra }}
+      test: ${{ steps.rail.outputs.test }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Plan affected work
+        id: rail
+        uses: loadingalias/cargo-rail-action@ebc8ef2740efefe2cd5c42826344a8f1213113ae # v6
+        with:
+          since: ${{ github.event_name == 'push' && github.event.before || '' }}
+
   clippy:
     name: Clippy
+    needs: plan
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
