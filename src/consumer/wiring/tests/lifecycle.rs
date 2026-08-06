@@ -157,8 +157,8 @@ async fn failed_activation_rolls_back_and_releases_the_listener() -> Result<()> 
         .err()
         .ok_or_else(|| eyre!("activation succeeded despite the scripted failure"))?;
     assert!(
-        matches!(error, ConsumerError::Peer(PeerInitError::Directory { .. })),
-        "activation returned the wrong error: {error:#}"
+        matches!(&error, ConsumerError::Peer(PeerInitError::Directory { message }) if message == "scripted registration failure"),
+        "activation wrapped or changed the directory error: {error:#}"
     );
 
     let events = log.lock();

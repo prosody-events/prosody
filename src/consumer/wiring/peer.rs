@@ -319,10 +319,7 @@ impl<P: PreparedRuntime> PeerAttachment for PreparedPeer<P> {
                         prepared,
                         answering,
                     },
-                    PeerInitError::Directory {
-                        message: format!("{error:#}"),
-                    }
-                    .into(),
+                    error,
                 ));
             }
         };
