@@ -336,12 +336,13 @@ impl<C: Codec> ProsodyConsumer<C> {
     /// handler's commit hook can still queue an owed response. Tear the peer
     /// down earlier and the process drops responses it already owes, and fails
     /// requests it could still answer. Step 3 is what bounds step 5. The
-    /// compiler keeps that order: step 3 mints the proof steps 4 and 5 demand,
-    /// so neither can be written ahead of it.
+    /// compiler keeps that order: step 3 mints the proof step 5 demands, so
+    /// step 5 cannot be written ahead of it.
     ///
     /// This is the supported teardown, and it is the only one that waits. A
-    /// consumer that is dropped instead runs every step but the sweep, and does
-    /// not wait for the peer teardown it starts.
+    /// consumer that is dropped instead runs steps 1, 2 and 4, and only *asks*
+    /// the coordinator to run step 5. It runs no sweep and waits for no peer
+    /// step, so a runtime that already stops may run none of them.
     ///
     /// A second call, or a call on a clone whose sibling already ran, finds no
     /// runtime state and answers `Ok(())` without touching anything shared.
@@ -349,25 +350,37 @@ impl<C: Codec> ProsodyConsumer<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`ShutdownError`] when the peer teardown could not confirm the
+    /// Returns [`ShutdownError::PollLoop`] when the poll loop task did not end
+    /// cleanly. Returns [`ShutdownError::Directory`] or
+    /// [`ShutdownError::Teardown`] when the peer teardown could not confirm the
     /// removal of this node from the directory, or could not report what it
     /// did. A row that survives expires on its lease.
+    ///
+    /// A poll failure wins over a peer report. It happens first, and it is the
+    /// more surprising of the two.
     pub async fn shutdown(mut self) -> Result<(), ShutdownError> {
-        let Some(teardown) = self.stop_polling().await else {
+        let Some((teardown, poll_failure)) = self.stop_polling().await else {
             return Ok(());
         };
         let swept = sweep::drain_managers(&self.managers).await;
-        match teardown.release(swept).await {
+        let peer_report = match teardown.release(swept).await {
             Some(peer) => peer.stop().await,
             None => Ok(()),
+        };
+        match poll_failure {
+            Some(failure) => Err(failure),
+            None => peer_report,
         }
     }
 
     /// Closes peer request admission, stops the poll loop, and waits for it.
     ///
     /// Answers `None` to every caller but the one that takes the runtime state,
-    /// so a losing caller runs no step of the teardown at all.
-    async fn stop_polling(&mut self) -> Option<Teardown> {
+    /// so a losing caller runs no step of the teardown at all. The winner also
+    /// gets the poll loop's join failure, because
+    /// [`shutdown`](Self::shutdown) reports it and [`Drop`](Self::drop) can
+    /// only log it.
+    async fn stop_polling(&mut self) -> Option<(Teardown, Option<ShutdownError>)> {
         let RuntimeState {
             poll_handle,
             probe_server,
@@ -380,14 +393,20 @@ impl<C: Codec> ProsodyConsumer<C> {
         }
         self.shutdown.store(true, Ordering::Relaxed);
 
-        if let Err(error) = poll_handle.await {
-            error!("consumer shutdown failed: {error:#}");
-        }
-        Some(Teardown {
-            probe_server,
-            observer,
-            peer,
-        })
+        let poll_failure = match poll_handle.await {
+            Ok(()) => None,
+            Err(error) => Some(ShutdownError::PollLoop {
+                message: format!("{error:#}"),
+            }),
+        };
+        Some((
+            Teardown {
+                probe_server,
+                observer,
+                peer,
+            },
+            poll_failure,
+        ))
     }
 }
 
@@ -439,10 +458,16 @@ impl Teardown {
 /// This path does await the probe server task. A current-thread runtime cannot
 /// drive that task while this blocks its only thread, so call `shutdown` from
 /// such a runtime.
+///
+/// `Drop` cannot return, so it logs the poll loop's join failure that
+/// [`shutdown`](ProsodyConsumer::shutdown) reports.
 impl<C: Codec> Drop for ProsodyConsumer<C> {
     fn drop(&mut self) {
         block_on(async {
-            if let Some(teardown) = self.stop_polling().await {
+            if let Some((teardown, poll_failure)) = self.stop_polling().await {
+                if let Some(error) = poll_failure {
+                    error!("consumer shutdown failed: {error:#}");
+                }
                 teardown.stop_observation().await;
             }
         });

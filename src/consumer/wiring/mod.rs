@@ -11,7 +11,7 @@ use crate::consumer::config::TypedConsumerSetup;
 use crate::consumer::config::{
     CommonConfiguration, ConsumerConfiguration, ConsumerSetup, validate_recovery_ttl_margin,
 };
-use crate::consumer::error::{ConsumerError, KeyedStateInitError};
+use crate::consumer::error::{ConsumerError, KeyedStateInitError, PeerInitError};
 use crate::consumer::middleware::cancellation::CancellationMiddleware;
 use crate::consumer::middleware::deduplication::{
     DeduplicationMiddleware, DeduplicationStoreProvider,
@@ -103,14 +103,25 @@ where
     Ok((components, keyed_state, heartbeats, observer))
 }
 
+/// Builds the in-memory reader dependencies, and refuses the one combination
+/// they cannot serve.
+///
+/// Every memory arm of every mode passes through here, so this is where a peer
+/// fleet on in-memory storage is refused. The memory
+/// [`NodeDirectory`](crate::router::directory::NodeDirectory) resolves only
+/// what this process wrote, and a peer answers a request by resolving the node
+/// that asked. Mock mode is exempt because a mock fleet asks itself.
 pub(in crate::consumer) fn memory_deps<C>(
     setup: &ConsumerSetup<'_>,
-) -> StateReaderDependencies<C, MemoryReaderBackend<C>>
+) -> Result<StateReaderDependencies<C, MemoryReaderBackend<C>>, ConsumerError>
 where
     C: Codec,
     C::Payload: Clone,
 {
-    StateReaderDependencies::memory(
+    if setup.common.peer.is_some() && !setup.consumer.mock {
+        return Err(PeerInitError::MemoryDirectory.into());
+    }
+    Ok(StateReaderDependencies::memory(
         setup.consumer.group_id.clone(),
         setup.consumer.stall_threshold,
         MemoryCells::new(),
@@ -119,7 +130,7 @@ where
         MemoryLoader::new(),
         setup.common.keyed_state.reader_cache_size(),
     )
-    .with_default_read_cache_ttl(setup.common.keyed_state.read_cache_ttl)
+    .with_default_read_cache_ttl(setup.common.keyed_state.read_cache_ttl))
 }
 
 pub(in crate::consumer) async fn cassandra_deps<C>(

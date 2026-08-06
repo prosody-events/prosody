@@ -153,11 +153,19 @@ impl ResponseDisposition {
     /// so a disposition added later cannot reach the wire without being given a
     /// status here.
     ///
-    /// A relay answers some of these, and the target answers the same statuses.
-    /// Nothing on the wire says which process spoke, so a sender reads every
-    /// status as the endpoint's own word. A per-process origin would need a
-    /// wire field, and this mapping names each outcome by what gRPC statuses
-    /// mean rather than by who sent it.
+    /// A relay answers five of these on its own: [`AlreadyRelayed`],
+    /// [`ResponseTooLarge`], [`NoRelayCapacity`], [`RelayDeadlineExceeded`] and
+    /// [`Unreachable`]. It passes the target's status through unchanged for
+    /// every other outcome. Nothing on the wire says which process spoke, so a
+    /// sender reads every status as the endpoint's own word. A per-process
+    /// origin would need a wire field, and this mapping names each outcome by
+    /// what gRPC statuses mean rather than by who sent it.
+    ///
+    /// [`AlreadyRelayed`]: Self::AlreadyRelayed
+    /// [`ResponseTooLarge`]: Self::ResponseTooLarge
+    /// [`NoRelayCapacity`]: Self::NoRelayCapacity
+    /// [`RelayDeadlineExceeded`]: Self::RelayDeadlineExceeded
+    /// [`Unreachable`]: Self::Unreachable
     pub(crate) const fn status(self) -> Code {
         match self {
             Self::Accepted => Code::Ok,

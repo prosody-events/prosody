@@ -55,6 +55,16 @@ async fn test_backpressure() -> Result<()> {
         .subscribed_topics(&[topic.to_string()])
         .build()?;
 
+    // Set up the producer configuration. Every fallible step sits before the
+    // consumer starts, so nothing between its start and its shutdown can
+    // return early and leak the consumer or the topic.
+    let producer_config = ProducerConfiguration::builder()
+        .bootstrap_servers(bootstrap.clone())
+        .source_system("test-producer")
+        .build()?;
+
+    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
+
     let slow_handler = ChannelHandler::with_delay(messages_tx, Duration::from_secs(1));
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
@@ -64,14 +74,6 @@ async fn test_backpressure() -> Result<()> {
         Telemetry::new(),
     )
     .await?;
-
-    // Set up the producer configuration
-    let producer_config = ProducerConfiguration::builder()
-        .bootstrap_servers(bootstrap.clone())
-        .source_system("test-producer")
-        .build()?;
-
-    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
     // Produce a large number of messages
     let total = 1_000u32;
@@ -107,7 +109,8 @@ async fn test_backpressure() -> Result<()> {
     info!("Total processing time: {total_elapsed:?}");
 
     // Shutdown the consumer and clean up resources
-    consumer.shutdown().await?;
+    let shutdown = consumer.shutdown().await;
     admin_client.delete_topic(&topic).await?;
+    shutdown?;
     Ok(())
 }

@@ -252,7 +252,7 @@ where
     {
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
-                let deps = memory_deps(&setup);
+                let deps = memory_deps(&setup)?;
                 Self::pipeline_consumer_with_backend(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
@@ -307,7 +307,7 @@ where
     {
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
-                let deps = memory_deps(&setup);
+                let deps = memory_deps(&setup)?;
                 Self::pipeline_responding_consumer_with_backend::<T, R, _>(
                     TypedConsumerSetup {
                         consumer: setup.consumer,

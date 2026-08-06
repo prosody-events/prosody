@@ -195,6 +195,10 @@ pub(crate) struct BoundListener {
 /// refused, and how often the peer method actually ran. A frame the transport
 /// refuses leaves [`served`](Self::served) alone, which is what separates a
 /// transport rejection from a registry outcome.
+///
+/// The writes run in production and only the listener suites read them. A
+/// process installs one meter provider, so concurrent suites cannot attribute a
+/// `metrics` series to one listener; these counters are per listener.
 pub(crate) struct TransportCounters {
     served: AtomicU64,
     refused_connections: AtomicU64,

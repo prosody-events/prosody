@@ -280,7 +280,7 @@ async fn a_responding_consumer_starts_and_stops() -> Result<()> {
         trigger_store: &trigger_store,
         common: &common,
     };
-    let memory = memory_deps(&setup);
+    let memory = memory_deps(&setup)?;
     let deps = recording_memory_deps(&memory, directory);
     let typed = TypedConsumerSetup {
         consumer: &consumer_config,
@@ -352,7 +352,7 @@ async fn refused_consumer(
         trigger_store: &trigger_store,
         common: &common,
     };
-    let deps: StateReaderDependencies<JsonCodec, _> = memory_deps(&setup);
+    let deps: StateReaderDependencies<JsonCodec, _> = memory_deps(&setup)?;
     let result = ProsodyConsumer::<JsonCodec>::pipeline_responding_consumer_with_backend::<
         ScriptedHandler,
         SomeResponseCodec,

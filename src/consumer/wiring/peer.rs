@@ -389,31 +389,27 @@ async fn run_coordinator<D: NodeDirectory>(
     workers: Option<ResponseWorkers>,
     stopped: oneshot::Receiver<oneshot::Sender<Result<(), ShutdownError>>>,
 ) {
-    match stopped.await {
+    // The join closure moves the workers, so one teardown call is the only
+    // shape both arms can share. Who asked decides where the report goes.
+    let reply = stopped.await;
+    let report = runtime
+        .shutdown(|| async move {
+            if let Some(workers) = workers {
+                workers.join().await;
+            }
+        })
+        .await
+        .map_err(|error| ShutdownError::Directory {
+            message: format!("{error:#}"),
+        });
+    match reply {
         Ok(reply) => {
-            let report = runtime
-                .shutdown(|| async move {
-                    if let Some(workers) = workers {
-                        workers.join().await;
-                    }
-                })
-                .await
-                .map_err(|error| ShutdownError::Directory {
-                    message: format!("{error:#}"),
-                });
             if let Err(report) = reply.send(report) {
                 error!(?report, "peer teardown report receiver closed");
             }
         }
         Err(_) => {
-            if let Err(error) = runtime
-                .shutdown(|| async move {
-                    if let Some(workers) = workers {
-                        workers.join().await;
-                    }
-                })
-                .await
-            {
+            if let Err(error) = report {
                 error!(%error, "peer teardown failed after its owner dropped");
             }
         }

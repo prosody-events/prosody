@@ -288,6 +288,9 @@ impl<C: Codec> PeerDirectoryBackend for CassandraReaderBackend<C> {
     }
 }
 
+/// The caller gets a directory that resolves only what this process registered.
+/// See [`MemoryNodeDirectory`]. A consumer that joins a real fleet on this
+/// backend is refused at startup, outside mock mode.
 impl<C: Codec> PeerDirectoryBackend for MemoryReaderBackend<C> {
     type Directory = MemoryNodeDirectory;
 

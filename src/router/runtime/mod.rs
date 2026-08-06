@@ -171,9 +171,9 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         let pending = PendingRegistry::new(inputs.requester)?;
         let transport = Arc::new(GrpcSender::new(frame_cap, &fleet));
         let directory = inputs.directory;
-        // The blocking pool owns the resolver wait; a runtime thread must not.
-        // The resolver call and the machine-name lookup are private to
-        // `discovery`, so this file reaches them only through `discover`.
+        // The blocking pool owns this wait; a runtime thread must not. The
+        // machine-name lookup and the route probe are private to `discovery`,
+        // so this file reaches them only through `discover`.
         let discovered = match discover(inputs.probe).await {
             Ok(discovered) => discovered,
             Err(error) => {

@@ -94,6 +94,10 @@ pub enum ConsumerError {
 }
 
 /// Errors raised while the peer runtime starts.
+///
+/// Most variants carry a rendered message instead of a `#[source]` field. The
+/// source types are crate-private, so a public error cannot name them, and this
+/// crate does not box an error as a trait object.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum PeerInitError {
@@ -106,6 +110,12 @@ pub enum PeerInitError {
     /// A responding consumer needs a keyed-state subsystem name.
     #[error("a consumer that answers peer requests needs a keyed-state subsystem name")]
     SubsystemRequired,
+    /// A peer fleet was configured on in-memory storage outside mock mode.
+    #[error(
+        "a peer fleet needs a directory every process can read; in-memory storage outside mock \
+         mode serves only this process"
+    )]
+    MemoryDirectory,
     /// The peer configuration is invalid.
     #[error("invalid peer configuration: {message}")]
     Configuration {
@@ -189,6 +199,13 @@ impl From<PeerRuntimeError> for PeerInitError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ShutdownError {
+    /// The poll loop task did not end cleanly. It panicked, or something
+    /// aborted it, so in-flight message processing may not have finished.
+    #[error("the consumer poll loop did not end cleanly: {message}")]
+    PollLoop {
+        /// The rendered join failure.
+        message: String,
+    },
     /// The peer directory did not confirm the removal of this node. The row
     /// may or may not survive, and one that survives expires on its lease.
     #[error("the peer directory did not confirm the removal of this node: {message}")]

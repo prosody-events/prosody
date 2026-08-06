@@ -214,33 +214,39 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     )
     .await?;
 
-    // Configure and create the producer
-    let producer_config = ProducerConfiguration::builder()
-        .bootstrap_servers(bootstrap.clone())
-        .source_system("test-producer")
-        .build()?;
-    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
+    let outcome: Result<()> = async {
+        // Configure and create the producer
+        let producer_config = ProducerConfiguration::builder()
+            .bootstrap_servers(bootstrap.clone())
+            .source_system("test-producer")
+            .build()?;
+        let producer =
+            ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
-    // Produce messages with varying keys to distribute across partitions
-    produce_messages(&producer, topic, total_messages, num_keys).await?;
+        // Produce messages with varying keys to distribute across partitions
+        produce_messages(&producer, topic, total_messages, num_keys).await?;
 
-    // Signal all handlers to complete processing
-    release_tx.send(true)?;
+        // Signal all handlers to complete processing
+        release_tx.send(true)?;
 
-    // Wait for all messages to be processed
-    handler.notify.notified().await;
+        // Wait for all messages to be processed
+        handler.notify.notified().await;
 
-    // Verify that the concurrency limit was respected
-    let max_observed = handler.max_concurrent.load(Ordering::SeqCst);
-    if max_observed > global_limit {
-        return Err(eyre!(
-            "Maximum concurrent tasks observed ({max_observed}) exceeded global limit \
-             ({global_limit})"
-        ));
+        // Verify that the concurrency limit was respected
+        let max_observed = handler.max_concurrent.load(Ordering::SeqCst);
+        if max_observed > global_limit {
+            return Err(eyre!(
+                "Maximum concurrent tasks observed ({max_observed}) exceeded global limit \
+                 ({global_limit})"
+            ));
+        }
+        Ok(())
     }
+    .await;
 
-    // Clean up resources
-    consumer.shutdown().await?;
+    // Clean up resources on every path
+    let shutdown = consumer.shutdown().await;
     admin_client.delete_topic(&topic).await?;
-    Ok(())
+    shutdown?;
+    outcome
 }

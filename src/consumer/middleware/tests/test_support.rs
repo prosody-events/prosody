@@ -20,7 +20,8 @@ use uuid::Uuid;
 
 use crate::Key;
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
+use crate::consumer::handler::EventHandler;
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, UncommittedMessage};
 use crate::consumer::middleware::{
     DemandType, FallibleHandler, RepinProof, Settlement, SettlementHandler,
 };
@@ -590,6 +591,39 @@ impl ClassifyError for TestError {
     fn classify_error(&self) -> ErrorCategory {
         self.0
     }
+}
+
+/// An [`EventHandler`] that commits every event and records nothing.
+///
+/// Startup and lifecycle tests build a real consumer and deliver nothing to it.
+/// This is the handler they give it.
+#[derive(Clone)]
+pub struct SilentHandler;
+
+impl EventHandler for SilentHandler {
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<Value>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        let (_, uncommitted) = message.into_inner();
+        uncommitted.commit().await;
+    }
+
+    async fn on_timer<C, T>(&self, _context: C, timer: T, _demand_type: DemandType)
+    where
+        C: EventContext<Payload = Self::Payload>,
+        T: UncommittedTimer,
+    {
+        timer.commit().await;
+    }
+
+    async fn shutdown(self) {}
 }
 
 /// A hook firing recorded by [`ScriptedHandler`], projected onto

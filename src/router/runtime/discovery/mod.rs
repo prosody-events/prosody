@@ -1,9 +1,9 @@
 //! What one process can only learn by asking the machine it runs on.
 //!
-//! Both lookups block. A name server can hold a resolver for as long as it
-//! retries, and the machine name is a system call. Both are private to this
-//! module, so no code outside it can call either one. [`discover`] is what the
-//! rest of the crate has instead, and it runs them on the blocking pool.
+//! Both lookups block. The machine name is a system call, and the route probe
+//! binds a UDP socket and connects it. Both are private to this module, so no
+//! code outside it can call either one. [`discover`] is what the rest of the
+//! crate has instead, and it runs them on the blocking pool.
 //!
 //! Inside this module the rule is read rather than compiled: a function added
 //! here could call them on a runtime thread.

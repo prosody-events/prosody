@@ -10,6 +10,11 @@ use futures::stream::FuturesUnordered;
 /// [`drain_managers`] mints this after the last manager stops, and the field is
 /// private to this module. So a step that demands this value cannot be written
 /// ahead of the sweep, and no caller can fabricate the proof.
+///
+/// The proof names no map on purpose. Carrying the swept map's identity would
+/// add a type parameter to both the sweep and the step that spends the proof,
+/// to refuse a caller that does not exist: one map is in scope at the one call
+/// site, and nothing else in the crate mints or spends a `Swept`.
 pub(in crate::consumer) struct Swept(());
 
 /// Shuts down every partition manager the final revoke left behind.

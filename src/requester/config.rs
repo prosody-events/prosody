@@ -91,6 +91,7 @@ impl Default for RequesterConfiguration {
 impl RequesterConfiguration {
     /// Creates a requester configuration builder.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn builder() -> RequesterConfigurationBuilder {
         RequesterConfigurationBuilder::default()
     }

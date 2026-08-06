@@ -13,6 +13,7 @@ use crate::consumer::middleware::deduplication::{
     DEFAULT_IDEMPOTENCE_VERSION, DeduplicationConfiguration, MemoryDeduplicationStoreProvider,
 };
 use crate::consumer::middleware::scheduler::SchedulerConfiguration;
+use crate::consumer::middleware::tests::test_support::SilentHandler;
 use crate::consumer::middleware::timeout::TimeoutConfiguration;
 use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
@@ -54,6 +55,7 @@ use tokio::time::timeout;
 
 mod lifecycle;
 mod responding;
+mod selection;
 
 const TOPIC: &str = "peer-lifecycle";
 
@@ -111,9 +113,6 @@ struct RecordingProvider {
     inner: CloneProvider<SilentHandler>,
     log: EventLog,
 }
-
-#[derive(Clone)]
-struct SilentHandler;
 
 /// The handler of the retained partition manager. It records the one moment
 /// the shutdown sweep ends that manager.
@@ -262,32 +261,6 @@ impl Drop for RecordingProvider {
     fn drop(&mut self) {
         self.log.lock().push(Event::ProviderDropped);
     }
-}
-
-impl EventHandler for SilentHandler {
-    type Payload = Value;
-
-    async fn on_message<C>(
-        &self,
-        _context: C,
-        message: UncommittedMessage<Value>,
-        _demand_type: DemandType,
-    ) where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        let (_, uncommitted) = message.into_inner();
-        uncommitted.commit().await;
-    }
-
-    async fn on_timer<C, T>(&self, _context: C, timer: T, _demand_type: DemandType)
-    where
-        C: EventContext<Payload = Self::Payload>,
-        T: UncommittedTimer,
-    {
-        timer.commit().await;
-    }
-
-    async fn shutdown(self) {}
 }
 
 impl EventHandler for SweptHandler {

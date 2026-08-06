@@ -93,8 +93,9 @@ pub(crate) struct NodeRegistration {
 ///
 /// Two implementations exist:
 /// [`CassandraNodeDirectory`](cassandra::CassandraNodeDirectory), which
-/// publishes through a Cassandra store, and `MemoryNodeDirectory`, which holds
-/// a bounded map for same-process tests.
+/// publishes through a Cassandra store, and
+/// [`MemoryNodeDirectory`](memory::MemoryNodeDirectory), which holds a bounded
+/// map for same-process tests.
 ///
 /// Construction is each implementation's own: one is opened over a Cassandra
 /// store and prepares statements, the other holds a bounded map. A process

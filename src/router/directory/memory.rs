@@ -111,6 +111,11 @@ impl NodeDirectory for MemoryNodeDirectory {
 }
 
 /// Whether all six labels fit inside the directory's byte bound.
+///
+/// This backend filters a registration its own `register` accepted, and this
+/// process wrote it. The filter is here for backend parity: the shared
+/// directory suite asks both backends the same question, and Cassandra must
+/// answer it because something other than this code can write a row.
 fn labels_are_bounded(registration: &NodeRegistration) -> bool {
     registration.direct.host.len() <= MAX_LABEL_BYTES
         && registration
