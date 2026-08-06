@@ -111,10 +111,9 @@ pub(crate) struct PreparedPeerRuntime<D> {
 
 /// Local peer machinery that has no listener, directory, or remote transport.
 pub(crate) struct PreparedLocalPeerRuntime {
-    node: NodeId,
+    local: LocalTarget,
     frame_cap: FrameCap,
     fleet: Arc<DestinationFleet>,
-    pending: Arc<PendingRegistry>,
 }
 
 /// A running local-only peer runtime.
@@ -333,17 +332,17 @@ impl PreparedLocalPeerRuntime {
         requester: &RequesterConfiguration,
     ) -> Result<Self, PeerRuntimeError> {
         validate_response_ceiling(requester.max_response_bytes, frame_cap.bytes())?;
+        let fleet = Arc::new(DestinationFleet::new(fleet)?);
         Ok(Self {
-            node: NodeId::new(),
+            local: LocalTarget::new(NodeId::new(), PendingRegistry::new(requester)?),
             frame_cap,
-            fleet: Arc::new(DestinationFleet::new(fleet)?),
-            pending: PendingRegistry::new(requester)?,
+            fleet,
         })
     }
 
     /// This process's node id.
     pub(crate) const fn node(&self) -> NodeId {
-        self.node
+        self.local.node
     }
 
     /// Builds a responder over the local route only.
@@ -351,25 +350,20 @@ impl PreparedLocalPeerRuntime {
         &self,
         subsystem: SubsystemName,
     ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
-        Responder::new_local(
-            &LocalTarget::new(self.node, Arc::clone(&self.pending)),
-            &self.fleet,
-            self.frame_cap,
-            subsystem,
-        )
+        Responder::new_local(&self.local, &self.fleet, self.frame_cap, subsystem)
     }
 
     /// Starts the local runtime. No external activation is necessary.
     pub(crate) fn activate(self) -> LocalPeerRuntime {
         LocalPeerRuntime {
-            pending: self.pending,
+            pending: self.local.registry,
             fleet: self.fleet,
         }
     }
 
     /// Stops local resources before activation.
     pub(crate) async fn abandon(self) {
-        self.pending.terminate().await;
+        self.local.registry.terminate().await;
     }
 }
 
