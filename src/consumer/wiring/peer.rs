@@ -128,7 +128,8 @@ pub(in crate::consumer) struct PeerHandles {
 pub(crate) trait PreparedRuntime: Sized + Send {
     type Running: RunningRuntime;
 
-    fn needs_cluster_id() -> bool;
+    const NEEDS_CLUSTER_ID: bool;
+
     fn prepared_node(&self) -> NodeId;
     fn build_responder<C: Codec>(
         &self,
@@ -286,7 +287,7 @@ impl<P: PreparedRuntime> PeerAttachment for PreparedPeer<P> {
         consumer: &BaseConsumer<Ctx>,
         observer: &KafkaObserver,
     ) -> Option<String> {
-        if !P::needs_cluster_id() {
+        if !P::NEEDS_CLUSTER_ID {
             return None;
         }
         let cluster = observer.cluster_id(consumer);
@@ -348,9 +349,7 @@ impl<P: PreparedRuntime> PeerAttachment for PreparedPeer<P> {
 impl<D: NodeDirectory> PreparedRuntime for PreparedPeerRuntime<D> {
     type Running = PeerRuntime<D>;
 
-    fn needs_cluster_id() -> bool {
-        true
-    }
+    const NEEDS_CLUSTER_ID: bool = true;
 
     fn prepared_node(&self) -> NodeId {
         self.node()
@@ -386,9 +385,7 @@ impl<D: NodeDirectory> PreparedRuntime for PreparedPeerRuntime<D> {
 impl PreparedRuntime for PreparedLocalPeerRuntime {
     type Running = LocalPeerRuntime;
 
-    fn needs_cluster_id() -> bool {
-        false
-    }
+    const NEEDS_CLUSTER_ID: bool = false;
 
     fn prepared_node(&self) -> NodeId {
         self.node()
