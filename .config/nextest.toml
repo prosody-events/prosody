@@ -1,21 +1,2 @@
 [profile.default]
 status-level = "pass"
-
-# Report a test that runs longer than a minute. This is a report, not a gate:
-# a cranked `QUICKCHECK_TESTS` or `INTEGRATION_TESTS` run ends no test early.
-slow-timeout = { period = "60s" }
-
-# A hang backstop for the consumer lifecycle tests, never a performance gate.
-#
-# A test that blocks forever otherwise blocks the whole run: nextest reports it
-# as slow and waits for it. One consumer test held a runner for 55 minutes this
-# way, because a defect made a `spawn_blocking` poll loop immortal and the
-# runtime drop then waited on it. A per-test deadline cannot catch that: the
-# test already failed, and the process is what hangs.
-#
-# These tests start and stop a real consumer, so they are the ones that hang
-# that way. Each finishes in seconds, and none reads an iteration count from the
-# environment, so a cranked run does not move their runtime.
-[[profile.default.overrides]]
-filter = 'test(/^consumer::wiring::tests::/)'
-slow-timeout = { period = "60s", terminate-after = 15 }
