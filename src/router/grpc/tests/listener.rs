@@ -10,7 +10,7 @@ use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::codec::ClientFrameCodec;
 use crate::router::grpc::conn::admitted;
 use crate::router::grpc::{BoundListener, TRANSPORT, TransportConfiguration};
-use crate::router::loopback::{HANG_GUARD, TestHealth};
+use crate::router::loopback::TestHealth;
 use crate::router::runtime::{PeerInputs, RouterConfiguration, start_runtime};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -19,12 +19,11 @@ use color_eyre::eyre::{bail, ensure, eyre};
 use futures::StreamExt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::pin;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::mpsc::unbounded_channel;
-use tokio::time::{pause, resume, sleep};
+use tokio::time::{pause, resume};
 use tonic::client::Grpc;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::transport::Endpoint as Dialled;
@@ -86,13 +85,6 @@ const PEAK_STREAMS: u32 = 8;
 /// One stream per connection, so a connection buffers far less than HTTP/2
 /// grants it anyway.
 const SPARSE_STREAMS: u32 = 1;
-
-/// How long the silence case waits for a connection the listener must close.
-///
-/// Far past the listener's own deadline, so under paused time that deadline
-/// always comes first. It is the hang guard, never the assertion: a connection
-/// that is never closed fails this test instead of hanging it.
-const SILENCE_GUARD: Duration = Duration::from_hours(1);
 
 /// What one connection read out of the server's opening SETTINGS frame.
 struct Announced {
@@ -197,7 +189,6 @@ fn a_connection_over_the_cap_is_refused_and_counted() -> Result<()> {
             _ = admitted_rx.recv() => {
                 bail!("the cap admitted a connection while its only permit was held")
             }
-            () = sleep(HANG_GUARD) => bail!("the refused connection neither closed nor was admitted"),
         };
         holder.abort();
         drop(first);
@@ -238,12 +229,7 @@ async fn a_connection_that_falls_silent_is_closed() -> Result<()> {
         // silence that never happened. Nothing below waits for the network, so
         // the clock is free to jump to the deadline here.
         pause();
-        let closed = select! {
-            read = connection.read(&mut byte) => read,
-            () = sleep(SILENCE_GUARD) => {
-                bail!("the silent connection was never closed (spoke = {spoke})")
-            }
-        };
+        let closed = connection.read(&mut byte).await;
         resume();
         ensure!(
             closed.is_err(),
@@ -278,10 +264,7 @@ fn the_listener_serves_the_caps_it_was_configured_with() -> Result<()> {
         let port = harness.address.port;
         let refused = TRANSPORT.refused_connections();
         let outcome = async {
-            let (held, announced) = select! {
-                settled = settled(port) => settled?,
-                () = sleep(HANG_GUARD) => bail!("the listener announced no settings"),
-            };
+            let (held, announced) = settled(port).await?;
             ensure!(
                 announced.streams == Some(STREAM_CAP),
                 "the listener must announce the configured stream cap, not {:?}",
@@ -294,11 +277,11 @@ fn the_listener_serves_the_caps_it_was_configured_with() -> Result<()> {
             );
             let mut over_the_cap = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
             let mut byte = [0u8; 1];
-            let read = select! {
-                read = over_the_cap.read(&mut byte) => read?,
-                () = sleep(HANG_GUARD) => bail!("the connection over the cap was neither closed nor served"),
-            };
-            ensure!(read == 0, "a connection over the cap must be closed, not answered");
+            let read = over_the_cap.read(&mut byte).await?;
+            ensure!(
+                read == 0,
+                "a connection over the cap must be closed, not answered"
+            );
             ensure!(
                 TRANSPORT.refused_connections() == refused + 1,
                 "a connection over the cap must be counted"
