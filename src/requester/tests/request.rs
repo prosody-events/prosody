@@ -104,17 +104,8 @@ async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
     let repeated = names(&["billing", "ledger", "billing"])?;
     let one = names(&["billing"])?;
     let over_cap = names(&POOL[..=MAX_AWAITED])?;
-    let no_headers: Vec<(&'static str, &'static str)> = Vec::new();
-
     match requester
-        .request(
-            no_headers.clone(),
-            topic,
-            "key",
-            RequestPayload,
-            &none,
-            TIMEOUT,
-        )
+        .request(empty(), topic, "key", RequestPayload, &none, TIMEOUT)
         .await
     {
         Err(RequestError::NoSubsystems) => {}
@@ -122,14 +113,7 @@ async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
     }
 
     match requester
-        .request(
-            no_headers.clone(),
-            topic,
-            "key",
-            RequestPayload,
-            &repeated,
-            TIMEOUT,
-        )
+        .request(empty(), topic, "key", RequestPayload, &repeated, TIMEOUT)
         .await
     {
         Err(RequestError::DuplicateSubsystem { name }) => {
@@ -139,14 +123,7 @@ async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
     }
 
     match requester
-        .request(
-            no_headers.clone(),
-            topic,
-            "key",
-            RequestPayload,
-            &over_cap,
-            TIMEOUT,
-        )
+        .request(empty(), topic, "key", RequestPayload, &over_cap, TIMEOUT)
         .await
     {
         Err(RequestError::TooManySubsystems { count, max }) => {
@@ -157,7 +134,7 @@ async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
 
     match requester
         .request(
-            no_headers,
+            empty(),
             topic,
             "key",
             RequestPayload,
@@ -202,10 +179,8 @@ async fn a_valid_call_registers_first_and_gives_its_record_back() -> Result<()> 
     let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
     let requester = requester(Arc::clone(&registry))?;
     let awaited = names(&["billing", "ledger"])?;
-    let no_headers: Vec<(&'static str, &'static str)> = Vec::new();
-
     let mut call = pin!(requester.request::<_, u32, TestError>(
-        no_headers,
+        empty(),
         Topic::from("requests"),
         "key",
         RequestPayload,
@@ -251,12 +226,10 @@ async fn a_cancelled_call_leaves_the_registry_empty() -> Result<()> {
     let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
     let requester = requester(Arc::clone(&registry))?;
     let awaited = names(&["billing", "ledger"])?;
-    let no_headers: Vec<(&'static str, &'static str)> = Vec::new();
-
     // Boxed rather than pinned on the stack, so dropping the handle drops the
     // call itself. That drop is what this case is about.
     let mut call = Box::pin(requester.request::<_, u32, TestError>(
-        no_headers,
+        empty(),
         Topic::from("requests"),
         "key",
         RequestPayload,

@@ -23,6 +23,7 @@ use color_eyre::Result;
 use color_eyre::eyre::ensure;
 use quickcheck::{Arbitrary, Gen};
 use std::future::{Future, poll_fn};
+use std::iter::empty;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
@@ -241,10 +242,9 @@ pub(super) async fn unanswered_call() -> Result<()> {
     let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
     let requester = requester(registry)?;
     let awaited = names(&[SUBSYSTEM])?;
-    let no_headers: Vec<(&'static str, &'static str)> = Vec::new();
     let outcomes = requester
         .request::<_, u32, TestError>(
-            no_headers,
+            empty(),
             Topic::from(TOPIC),
             KEY,
             RequestPayload,
