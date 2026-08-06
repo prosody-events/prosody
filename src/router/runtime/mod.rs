@@ -83,7 +83,6 @@ pub(crate) struct PeerRuntime<D> {
     /// the two directions stay separate types rather than one that does both.
     directory: D,
     registration: NodeRegistration,
-    pending: Arc<PendingRegistry>,
     stop_refresh: watch::Sender<bool>,
     refresh: JoinHandle<()>,
     /// Dropping it resolves the listener's shutdown future.
@@ -106,7 +105,6 @@ pub(crate) struct PreparedPeerRuntime<D> {
     frame_cap: FrameCap,
     directory: D,
     registration: NodeRegistration,
-    pending: Arc<PendingRegistry>,
     stop_listener: oneshot::Sender<()>,
     listener: JoinHandle<()>,
 }
@@ -226,7 +224,6 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
             frame_cap,
             directory,
             registration,
-            pending,
             stop_listener,
             listener,
         })
@@ -292,7 +289,6 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
             router: self.router,
             directory: self.directory,
             registration: self.registration,
-            pending: self.pending,
             stop_refresh,
             refresh,
             stop_listener: self.stop_listener,
@@ -324,7 +320,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
 
     /// Stops every local resource without publishing the node.
     pub(crate) async fn abandon(self) {
-        self.pending.terminate().await;
+        self.router.local.registry.terminate().await;
         abandon(self.stop_listener, self.listener).await;
     }
 }
@@ -404,7 +400,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
 
     /// The process-wide pending request registry.
     pub(crate) const fn pending(&self) -> &Arc<PendingRegistry> {
-        &self.pending
+        &self.router.local.registry
     }
 
     /// Shuts this process's peer machinery down, in the one order that cannot
@@ -448,7 +444,6 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         let Self {
             directory,
             registration,
-            pending,
             stop_refresh,
             refresh,
             stop_listener,
@@ -457,6 +452,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         } = self;
 
         let fleet = Arc::clone(&router.fleet);
+        let pending = Arc::clone(&router.local.registry);
         // The resolver only reads. The transport is already cloned into every
         // response delivery worker.
         drop(router);
