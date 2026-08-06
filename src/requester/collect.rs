@@ -61,10 +61,11 @@ where
     R: Codec<Payload = Result<V, E>>,
     E: ClassifyError,
     I: IntoIterator<Item = Awaited>,
+    I::IntoIter: ExactSizeIterator,
 {
     R::with_cached_local(|codec| {
         let awaited = awaited.into_iter();
-        let mut outcomes = Vec::with_capacity(awaited.size_hint().0);
+        let mut outcomes = Vec::with_capacity(awaited.len());
         for awaited in awaited {
             let outcome = match awaited.arrival {
                 None => Outcome::Failed(ResponseFailure::Timeout),
