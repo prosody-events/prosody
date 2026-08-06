@@ -1,25 +1,20 @@
-//! One process's peer machinery: what it publishes about itself, what it hands
-//! consumers and requesters, and the order it stops in.
+//! One process's peer transport, registration, routing, and shutdown order.
 
-use crate::codec::Codec;
-use crate::consumer::middleware::respond::Responder;
 use crate::heartbeat::HeartbeatRegistry;
-use crate::peer::PeerResponder;
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::FrameCap;
-use crate::response::sender::{ResponseWorkers, Then};
+use crate::response::sender::Then;
 use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
 use crate::router::fleet::DestinationFleet;
-use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
+use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::health::RuntimeHealth;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
 use crate::router::relay::Relay;
 use crate::router::{LocalTarget, NodeId, RouterHandle};
-use crate::subsystem::SubsystemName;
 use rand::RngExt;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -231,10 +226,6 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
 
     /// Publishes this node and starts its registration refresh task.
     ///
-    /// The group label is set here because only the running Kafka client knows
-    /// the cluster that scopes it. It is the one registration field that
-    /// preparation leaves unset.
-    ///
     /// A failed write issues one delete before it gives up. Node ids are minted
     /// fresh and never reused. So this process is the only writer of its own
     /// row, and the delete can remove no other. The delete is best effort, not
@@ -299,37 +290,19 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         })
     }
 
-    /// Builds the responder this process answers peer requests with.
-    ///
-    /// The router and the frame ceiling come from this runtime, and the caller
-    /// selects neither. So a responder's encoder cannot disagree with the
-    /// ceiling this process's listener admits. No code outside this module
-    /// builds a router, so no caller can pair a responder with another
-    /// runtime's.
-    ///
-    /// Call this before activation: the responder must exist before the Kafka
-    /// client starts.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FleetConfigurationError`] when one encode buffer per
-    /// destination at this ceiling exceeds what one sender may commit to.
-    pub(crate) fn responder<C: Codec>(
-        &self,
-        subsystem: SubsystemName,
-    ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
-        self.responder_factory().responder(subsystem)
+    /// Returns the local-first response route for this runtime.
+    pub(crate) fn response_route(&self) -> Then<LocalTarget, RouterHandle<GrpcSender, D>> {
+        Then(self.router.local().clone(), self.router.clone())
     }
 
-    /// Shares the route that typed consumer responders bind to.
-    pub(crate) fn responder_factory(
-        &self,
-    ) -> PeerResponder<Then<LocalTarget, RouterHandle<GrpcSender, D>>> {
-        PeerResponder::new(
-            Then(self.router.local().clone(), self.router.clone()),
-            Arc::clone(&self.router.fleet),
-            self.frame_cap,
-        )
+    /// Returns the destination fleet shared by this runtime.
+    pub(crate) fn fleet(&self) -> &Arc<DestinationFleet> {
+        &self.router.fleet
+    }
+
+    /// Returns the frame limit shared by this runtime.
+    pub(crate) const fn frame_cap(&self) -> FrameCap {
+        self.frame_cap
     }
 
     /// Stops every local resource without publishing the node.
@@ -361,17 +334,19 @@ impl PreparedLocalPeerRuntime {
         self.local.node
     }
 
-    /// Builds a responder over the local route only.
-    pub(crate) fn responder<C: Codec>(
-        &self,
-        subsystem: SubsystemName,
-    ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
-        self.responder_factory().responder(subsystem)
+    /// Returns the local response route for this runtime.
+    pub(crate) fn response_route(&self) -> LocalTarget {
+        self.local.clone()
     }
 
-    /// Shares the local route that typed consumer responders bind to.
-    pub(crate) fn responder_factory(&self) -> PeerResponder<LocalTarget> {
-        PeerResponder::new(self.local.clone(), Arc::clone(&self.fleet), self.frame_cap)
+    /// Returns the destination fleet shared by this runtime.
+    pub(crate) const fn fleet(&self) -> &Arc<DestinationFleet> {
+        &self.fleet
+    }
+
+    /// Returns the frame limit shared by this runtime.
+    pub(crate) const fn frame_cap(&self) -> FrameCap {
+        self.frame_cap
     }
 
     /// Starts the local runtime. No external activation is necessary.
@@ -484,9 +459,8 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         fleet.close().await;
         // A `Drained` token minted by the close, and demanded by every drain,
         // would make the reversed order uncompilable. It was examined and
-        // rejected: a consumer that abandons a prepared peer joins its response
-        // workers and closes no fleet, so the token would reach a caller that
-        // holds none.
+        // rejected: an owner can abandon a prepared peer without closing its
+        // fleet, so the token would reach a caller that holds none.
         drain().await;
         if let Err(error) = listener.await {
             error!(%error, "the peer listener task did not exit cleanly");

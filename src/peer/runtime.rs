@@ -13,7 +13,8 @@ use crate::consumer::middleware::respond::{RespondHandler, Responder, responding
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::{ConsumerError, PeerInitError, ShutdownError};
 use crate::peer::{
-    LocalPeerMode, NetworkPeerBackend, NetworkPeerMode, PeerBackend, heartbeat_registry,
+    LocalPeerMode, NetworkPeerBackend, NetworkPeerMode, PeerBackend, PeerResponder,
+    heartbeat_registry,
 };
 use crate::producer::ProsodyProducer;
 use crate::requester::ProsodyRequester;
@@ -230,7 +231,12 @@ impl<D: NodeDirectory> PreparedRuntime for PreparedPeerRuntime<D> {
         &self,
         subsystem: SubsystemName,
     ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
-        self.responder(subsystem)
+        PeerResponder::new(
+            self.response_route(),
+            Arc::clone(self.fleet()),
+            self.frame_cap(),
+        )
+        .responder(subsystem)
     }
 
     async fn launch(self) -> Result<Self::Running, (Self, ConsumerError)> {
@@ -261,7 +267,12 @@ impl PreparedRuntime for PreparedLocalPeerRuntime {
         &self,
         subsystem: SubsystemName,
     ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
-        self.responder(subsystem)
+        PeerResponder::new(
+            self.response_route(),
+            Arc::clone(self.fleet()),
+            self.frame_cap(),
+        )
+        .responder(subsystem)
     }
 
     async fn launch(self) -> Result<Self::Running, (Self, ConsumerError)> {
