@@ -1,7 +1,6 @@
 //! The delivery race: what one call waits for, and what it stops waiting for.
 //!
-//! Time is paused, so a virtual delay costs nothing and every elapsed
-//! assertion is exact.
+//! Time is paused, so each deadline assertion is exact.
 
 use super::{
     MAX_TIMEOUT, SWEEP_GRACE, TestCodec, TestCodecError, TestError, names, poll_once, register,
@@ -14,23 +13,17 @@ use crate::response::ResponseDisposition;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use rdkafka::error::KafkaError;
+use std::future::pending;
 use std::pin::pin;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::yield_now;
-use tokio::time::{Instant, sleep};
+use tokio::time::Instant;
 
 /// Requests one registry in these suites admits.
 const IN_FLIGHT: usize = 4;
 
 /// Most subsystems one request here names.
 const MAX_AWAITED: usize = 4;
-
-/// How long the delivery report takes when a case makes it slow.
-const REPORT_DELAY: Duration = Duration::from_secs(10);
-
-/// How long a peer takes to answer when a case makes it late.
-const ANSWER_DELAY: Duration = Duration::from_secs(1);
 
 /// The failure a case gives the delivery report.
 fn report_failure() -> ProducerError<TestCodecError> {
@@ -52,8 +45,7 @@ async fn a_complete_response_set_returns_before_the_report() -> Result<()> {
     let produce = async {
         assert_eq!(registry.accept(first), ResponseDisposition::Accepted);
         assert_eq!(registry.accept(second), ResponseDisposition::Accepted);
-        sleep(REPORT_DELAY).await;
-        Ok::<(), ProducerError<TestCodecError>>(())
+        pending::<Result<(), ProducerError<TestCodecError>>>().await
     };
     let outcomes = collect::<TestCodec, u32, TestError, _, TestCodecError>(
         &registration,
@@ -134,31 +126,23 @@ async fn a_failed_report_after_a_response_keeps_waiting() -> Result<()> {
     let id = registration.id();
     let first = success(id, &awaited[0], 3)?;
     let second = success(id, &awaited[1], 4)?;
-    let start = Instant::now();
-
-    let late = Arc::clone(&registry);
-    let responder = tokio::spawn(async move {
-        sleep(ANSWER_DELAY).await;
-        late.accept(second)
-    });
     let produce = async {
         assert_eq!(registry.accept(first), ResponseDisposition::Accepted);
         Err::<(), _>(report_failure())
     };
-    let outcomes = collect::<TestCodec, u32, TestError, _, TestCodecError>(
+    let mut call = pin!(collect::<TestCodec, u32, TestError, _, TestCodecError>(
         &registration,
         produce,
         registration.deadline(),
-    )
-    .await?;
-
-    assert_eq!(responder.await?, ResponseDisposition::Accepted);
-    assert_eq!(outcomes, vec![Outcome::Ok(3), Outcome::Ok(4)]);
-    assert_eq!(
-        Instant::now() - start,
-        ANSWER_DELAY,
-        "the call stopped waiting when the report failed"
+    ));
+    assert!(
+        poll_once(call.as_mut()).await.is_pending(),
+        "the failed report must not end a request that holds one answer"
     );
+    assert_eq!(registry.accept(second), ResponseDisposition::Accepted);
+    let outcomes = call.await?;
+
+    assert_eq!(outcomes, vec![Outcome::Ok(3), Outcome::Ok(4)]);
     Ok(())
 }
 
