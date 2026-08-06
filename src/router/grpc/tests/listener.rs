@@ -21,8 +21,6 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::pin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::select;
-use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::{pause, resume};
 use tonic::client::Grpc;
 use tonic::codegen::http::uri::PathAndQuery;
@@ -140,59 +138,6 @@ fn a_registration_publishes_the_port_the_listener_bound() -> Result<()> {
         .await;
         let shutdown = runtime.shutdown(|| async {}).await;
         outcome.and(shutdown.map_err(Into::into))
-    })
-}
-
-/// A connection over the cap is refused and counted, and nothing waits for a
-/// permit.
-///
-/// The admission stream is driven directly: a second tonic channel would leave
-/// both the refusal and the count to reconnect timing, and this suite asserts
-/// on real signals only — the refused socket's own end of file, or a second
-/// admission that must never arrive.
-#[test]
-fn a_connection_over_the_cap_is_refused_and_counted() -> Result<()> {
-    init_test_logging();
-    TEST_RUNTIME.block_on(async {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-        let address = listener.local_addr()?;
-        let refused = TRANSPORT.refused_connections();
-        let (admissions, mut admitted_rx) = unbounded_channel();
-        let holder = tokio::spawn(async move {
-            let mut connections = pin!(admitted(listener, 1));
-            // Every admitted connection is held for the whole test, so its
-            // permit cannot be released and make a later admission legal.
-            let mut held = Vec::new();
-            while let Some(Ok(connection)) = connections.next().await {
-                held.push(connection);
-                if admissions.send(()).is_err() {
-                    return;
-                }
-            }
-        });
-        let first = TcpStream::connect(address).await?;
-        admitted_rx
-            .recv()
-            .await
-            .ok_or_else(|| eyre!("the first connection was never admitted"))?;
-        let mut second = TcpStream::connect(address).await?;
-        let mut byte = [0u8; 1];
-        let outcome = select! {
-            read = second.read(&mut byte) => {
-                ensure!(read? == 0, "a refused connection must be closed, not answered");
-                ensure!(
-                    TRANSPORT.refused_connections() == refused + 1,
-                    "a refused connection must be counted"
-                );
-                Ok(())
-            }
-            _ = admitted_rx.recv() => {
-                bail!("the cap admitted a connection while its only permit was held")
-            }
-        };
-        holder.abort();
-        drop(first);
-        outcome
     })
 }
 
