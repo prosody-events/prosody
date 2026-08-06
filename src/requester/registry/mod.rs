@@ -319,6 +319,18 @@ impl PendingRegistry {
         self.request(id)?.stored_payload(subsystem)
     }
 
+    /// Waits for one test request to finish, then returns one stored payload.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_payload(
+        &self,
+        id: RequestId,
+        subsystem: &SubsystemName,
+    ) -> Option<BytesMut> {
+        let request = self.request(id)?;
+        request.park().await;
+        request.stored_payload(subsystem)
+    }
+
     /// Registers an entry without a waiter guard.
     ///
     /// Tests use this constructor to reproduce a waiter that never removes its

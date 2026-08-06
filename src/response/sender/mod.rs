@@ -5,7 +5,7 @@ mod metrics;
 mod worker;
 
 use self::metrics::{DropReason, Stage};
-use self::worker::{GrpcRoute, Job, LocalRoute, ResponseRoute, Then, WorkerContext, run_worker};
+use self::worker::{Job, ResponseRoute, Then, WorkerContext, run_worker};
 use crate::codec::Codec;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::{FrameCap, FrameHeader};
@@ -120,7 +120,7 @@ impl<C: Codec> TypedSender<C> {
         router: &R,
         cap: FrameCap,
     ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
-        Self::build(router.fleet(), &GrpcRoute::new(router.clone()), cap)
+        Self::build(router.fleet(), router, cap)
     }
 
     /// Builds a sender that deposits responses for `local` without gRPC.
@@ -133,10 +133,7 @@ impl<C: Codec> TypedSender<C> {
     {
         Self::build(
             router.fleet(),
-            &Then::new(
-                LocalRoute::new(router.local().clone()),
-                GrpcRoute::new(router.clone()),
-            ),
+            &Then(router.local().clone(), router.clone()),
             cap,
         )
     }
@@ -147,7 +144,7 @@ impl<C: Codec> TypedSender<C> {
         fleet: &Arc<DestinationFleet>,
         cap: FrameCap,
     ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
-        Self::build(fleet, &LocalRoute::new(local), cap)
+        Self::build(fleet, &local, cap)
     }
 
     fn build<R: ResponseRoute>(

@@ -49,38 +49,9 @@ pub(super) trait ResponseRoute: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<RouteOutcome<C::Payload>, DropReason>> + Send;
 }
 
-/// A route that deposits frames into this process's request registry.
-#[derive(Clone)]
-pub(super) struct LocalRoute(LocalTarget);
-
-/// A route that resolves and sends frames through gRPC.
-#[derive(Clone)]
-pub(super) struct GrpcRoute<R>(R);
-
 /// Two routes evaluated in order.
 #[derive(Clone)]
-pub(super) struct Then<A, B> {
-    first: A,
-    next: B,
-}
-
-impl LocalRoute {
-    pub(super) fn new(target: LocalTarget) -> Self {
-        Self(target)
-    }
-}
-
-impl<R> GrpcRoute<R> {
-    pub(super) fn new(router: R) -> Self {
-        Self(router)
-    }
-}
-
-impl<A, B> Then<A, B> {
-    pub(super) fn new(first: A, next: B) -> Self {
-        Self { first, next }
-    }
-}
+pub(super) struct Then<A, B>(pub(super) A, pub(super) B);
 
 /// One response, waiting for its turn on a destination.
 pub(super) struct Job<C: Codec> {
@@ -205,17 +176,18 @@ pub(super) async fn run_worker<C: Codec, R: ResponseRoute>(
         // level-disabled span never becomes current, and the deadline arm has
         // already left the instrumented future in any case.
         match outcome {
-            Ok(Delivery::Local) => {
+            Ok(delivery) => {
                 span.record("peer.disposition", "delivered");
-                span.record("peer.preference", "local");
-                Stage::Delivered.record();
-                context.counters.sent.fetch_add(1, Relaxed);
-            }
-            Ok(Delivery::Remote { preference, from }) => {
-                span.record("peer.disposition", "delivered");
-                span.record("peer.preference", preference.label());
-                if let Some(from) = from {
-                    record_fallback(from, preference);
+                match delivery {
+                    Delivery::Local => {
+                        span.record("peer.preference", "local");
+                    }
+                    Delivery::Remote { preference, from } => {
+                        span.record("peer.preference", preference.label());
+                        if let Some(from) = from {
+                            record_fallback(from, preference);
+                        }
+                    }
                 }
                 Stage::Delivered.record();
                 context.counters.sent.fetch_add(1, Relaxed);
@@ -274,22 +246,21 @@ async fn deliver_job<C: Codec, R: ResponseRoute>(
     }
 }
 
-impl ResponseRoute for LocalRoute {
+impl ResponseRoute for LocalTarget {
     async fn deliver<C: Codec>(
         &self,
         encoder: &mut FrameEncoder<C>,
         header: &FrameHeader,
         payload: C::Payload,
-        destination: &Destination,
+        _destination: &Destination,
         _attempts: u32,
         _expires_at: Instant,
     ) -> Result<RouteOutcome<C::Payload>, DropReason> {
-        if !self.0.owns(header.target) {
+        if !self.owns(header.target) {
             return Ok(RouteOutcome::Declined(payload));
         }
         let staged = stage(encoder, header, payload)?;
-        pace(destination).await;
-        let disposition = self.0.accept(staged.local_frame());
+        let disposition = self.accept(staged.local_frame());
         disposition.record();
         if disposition == ResponseDisposition::Accepted {
             Ok(RouteOutcome::Delivered(Delivery::Local))
@@ -299,7 +270,7 @@ impl ResponseRoute for LocalRoute {
     }
 }
 
-impl<R: Router> ResponseRoute for GrpcRoute<R> {
+impl<R: Router> ResponseRoute for R {
     async fn deliver<C: Codec>(
         &self,
         encoder: &mut FrameEncoder<C>,
@@ -313,7 +284,7 @@ impl<R: Router> ResponseRoute for GrpcRoute<R> {
         // No address originates anywhere but a registration: a node the directory
         // does not hold is not dialed at all, and a node the rules refuse to reach
         // from here is not dialed either.
-        let route = match self.0.route(target).await {
+        let route = match self.route(target).await {
             Ok(Some(route)) => route,
             Ok(None) => return Ok(RouteOutcome::Declined(payload)),
             Err(error) => {
@@ -341,7 +312,7 @@ impl<R: Router> ResponseRoute for GrpcRoute<R> {
                 Share::Probe
             };
             match deliver(
-                self.0.sender(),
+                self.sender(),
                 destination,
                 address,
                 &staged,
@@ -400,12 +371,12 @@ impl<A: ResponseRoute, B: ResponseRoute> ResponseRoute for Then<A, B> {
         expires_at: Instant,
     ) -> Result<RouteOutcome<C::Payload>, DropReason> {
         match self
-            .first
+            .0
             .deliver(encoder, header, payload, destination, attempts, expires_at)
             .await?
         {
             RouteOutcome::Declined(payload) => {
-                self.next
+                self.1
                     .deliver(encoder, header, payload, destination, attempts, expires_at)
                     .await
             }

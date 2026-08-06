@@ -23,7 +23,6 @@ use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::Context;
 use std::slice::from_ref;
 use std::sync::Arc;
-use tokio::task::yield_now;
 use tokio::time::Instant;
 
 /// The payload one delivered response carries.
@@ -147,11 +146,7 @@ fn a_same_node_response_uses_the_local_registry() -> Result<()> {
     })
 }
 
-/// Sends one response to this process's own node id and waits for the registry
-/// to hold it.
-///
-/// The deadline is a hang guard on a delivery that reports through the registry
-/// rather than through a signal; the assertion is the stored payload.
+/// Sends one response to this process's own node id and waits for the registry.
 async fn delivered_to_itself<D: NodeDirectory>(
     router: &RouterHandle<GrpcSender, D>,
     own: &TypedSender<CountingCodec>,
@@ -184,23 +179,18 @@ async fn delivered_to_itself<D: NodeDirectory>(
     )
     .map_err(|_| eyre!("the runtime's own router refused the response"))?;
 
-    let deadline = Instant::now() + HANG_GUARD;
-    loop {
-        if let Some(stored) = shared.pending.stored_payload(request, &subsystem) {
-            ensure!(
-                stored.as_ref() == PAYLOAD,
-                "the registry stored a payload the sender never wrote"
-            );
-            ensure!(
-                router.sender().attempts() == attempted,
-                "a same-node response must not enter the gRPC sender"
-            );
-            return Ok(());
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "a same-node response never reached the local registry"
-        );
-        yield_now().await;
-    }
+    let stored = shared
+        .pending
+        .wait_for_payload(request, &subsystem)
+        .await
+        .ok_or_else(|| eyre!("the same-node response stored no payload"))?;
+    ensure!(
+        stored.as_ref() == PAYLOAD,
+        "the registry stored a payload the sender never wrote"
+    );
+    ensure!(
+        router.sender().attempts() == attempted,
+        "a same-node response must not enter the gRPC sender"
+    );
+    Ok(())
 }
