@@ -2,9 +2,11 @@
 //! hands it to the transport.
 
 mod metrics;
+mod witness;
 mod worker;
 
 use self::metrics::{DropReason, Stage};
+use self::witness::DeliveryWitness;
 use self::worker::{Job, ResponseRoute, Then, WorkerContext, run_worker};
 use crate::codec::Codec;
 use crate::response::frame::encode::FrameEncoder;
@@ -14,8 +16,6 @@ use crate::router::fleet::config::{FleetConfigurationError, validate_scratch_bud
 use crate::router::{LocalTarget, RelayHop, Router, RouterHandle};
 use opentelemetry::Context;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::task::JoinHandle;
@@ -59,7 +59,7 @@ pub(crate) struct TypedSender<C: Codec> {
     /// is free.
     queues: Box<[Sender<Job<C>>]>,
     send_deadline: Duration,
-    counters: Arc<SendCounters>,
+    witness: DeliveryWitness,
 }
 
 /// The response delivery workers, joined once every send handle is gone.
@@ -79,24 +79,8 @@ pub(crate) struct TypedSender<C: Codec> {
 #[must_use = "dropping this detaches every delivery worker, so the wait is lost"]
 pub(crate) struct ResponseWorkers(Box<[JoinHandle<()>]>);
 
-/// What one sender's deliveries came to.
-///
-/// Every job a worker dequeues moves exactly one of these. A response the
-/// destination's queue could not take moves `dropped` alone, because no worker
-/// ever sees it.
-///
-/// This is the in-process account, which the delivery suites assert on. The
-/// operator's account is in [`metrics`], and it names each outcome rather than
-/// totalling two.
-///
-/// The suites need both. A process installs one meter provider, so concurrent
-/// suites cannot attribute a [`metrics`] series to one sender; these counters
-/// are per sender.
-#[derive(Debug, Default)]
-pub(crate) struct SendCounters {
-    sent: AtomicU64,
-    dropped: AtomicU64,
-}
+#[cfg(test)]
+pub(crate) use witness::SendCounters;
 
 impl<C: Codec> TypedSender<C> {
     /// Builds a sender over `router`'s fleet, with `cap` as the frame ceiling.
@@ -155,7 +139,7 @@ impl<C: Codec> TypedSender<C> {
         let fleet = Arc::clone(fleet);
         let config = fleet.config();
         validate_scratch_budget(config.max_destinations, cap)?;
-        let counters = Arc::new(SendCounters::default());
+        let witness = DeliveryWitness::default();
         let mut queues = Vec::with_capacity(config.max_destinations);
         let mut workers = Vec::with_capacity(config.max_destinations);
         for _ in 0..config.max_destinations {
@@ -166,7 +150,7 @@ impl<C: Codec> TypedSender<C> {
                 WorkerContext {
                     router: router.clone(),
                     attempts: config.max_send_attempts,
-                    counters: Arc::clone(&counters),
+                    witness: witness.clone(),
                 },
                 FrameEncoder::new(C::default(), cap),
             )));
@@ -176,7 +160,7 @@ impl<C: Codec> TypedSender<C> {
                 fleet,
                 queues: queues.into_boxed_slice(),
                 send_deadline: config.send_deadline,
-                counters,
+                witness,
             },
             ResponseWorkers(workers.into_boxed_slice()),
         ))
@@ -197,7 +181,7 @@ impl<C: Codec> TypedSender<C> {
     /// Returns the payload, unencoded, when the fleet refused a slot or when
     /// the destination's queue could not take the job. The caller owns the
     /// result again and disposes of it. [`metrics`] counts every refusal by
-    /// name, and a queue refusal also moves [`SendCounters::dropped`].
+    /// name. The test witness also counts a queue refusal as dropped.
     pub(crate) fn send(
         &self,
         header: FrameHeader,
@@ -237,7 +221,7 @@ impl<C: Codec> TypedSender<C> {
                 // the returned job releases its slot. This is the one drop that
                 // no dequeued job accounts for.
                 DropReason::from(&error).record();
-                self.counters.dropped.fetch_add(1, Relaxed);
+                self.witness.dropped();
                 return Err(error.into_inner().payload);
             }
             Ok(())
@@ -248,7 +232,7 @@ impl<C: Codec> TypedSender<C> {
     /// so a caller may hold them while the workers finish.
     #[cfg(test)]
     pub(crate) fn counters(&self) -> Arc<SendCounters> {
-        Arc::clone(&self.counters)
+        self.witness.counters()
     }
 }
 
@@ -267,26 +251,5 @@ impl ResponseWorkers {
                 warn!(%error, "a response delivery worker did not exit cleanly");
             }
         }
-    }
-}
-
-impl SendCounters {
-    /// How many responses this sender saw the transport accept.
-    ///
-    /// The deadline can end a job whose frame the peer already holds, and that
-    /// job counts as dropped. So this is what the sender observed, never what
-    /// every destination received.
-    #[cfg(test)]
-    pub(crate) fn sent(&self) -> u64 {
-        self.sent.load(Relaxed)
-    }
-
-    /// How many responses this sender gave up on: a job a worker dequeued and
-    /// dropped, plus a job the destination's queue could not take.
-    /// A fleet refusal is not here: [`metrics`] names every refusal. A queue
-    /// refusal counts here and still hands its payload back to the caller.
-    #[cfg(test)]
-    pub(crate) fn dropped(&self) -> u64 {
-        self.dropped.load(Relaxed)
     }
 }

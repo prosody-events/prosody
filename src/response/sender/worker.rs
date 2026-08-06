@@ -13,7 +13,6 @@ use crate::router::{Framed, Preference, ResponseSender, Router, SendFailure};
 use opentelemetry::Context;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
 use tokio::select;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc::Receiver;
@@ -21,7 +20,8 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 use tracing::field::Empty;
 use tracing::{Instrument, debug_span, warn};
 
-use super::{LocalTarget, SendCounters};
+use super::LocalTarget;
+use super::witness::DeliveryWitness;
 
 /// One in this many of the deadline that is left is what an endpoint keeps for
 /// the fallback behind it — and all an endpoint that has never answered may
@@ -32,7 +32,7 @@ const FALLBACK_DIVISOR: u32 = 4;
 pub(super) struct WorkerContext<R> {
     pub(super) router: R,
     pub(super) attempts: u32,
-    pub(super) counters: Arc<SendCounters>,
+    pub(super) witness: DeliveryWitness,
 }
 
 /// One response route in a statically composed route chain.
@@ -190,12 +190,12 @@ pub(super) async fn run_worker<C: Codec, R: ResponseRoute>(
                     }
                 }
                 Stage::Delivered.record();
-                context.counters.sent.fetch_add(1, Relaxed);
+                context.witness.sent();
             }
             Err(reason) => {
                 span.record("peer.disposition", reason.label());
                 reason.record();
-                context.counters.dropped.fetch_add(1, Relaxed);
+                context.witness.dropped();
             }
         }
         // A worker can wait for its next response for as long as its

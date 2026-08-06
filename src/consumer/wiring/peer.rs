@@ -27,7 +27,7 @@ use crate::router::grpc::health::ConsumerHealth;
 use crate::router::runtime::{
     LocalPeerRuntime, PeerInputs, PeerRuntime, PreparedLocalPeerRuntime, PreparedPeerRuntime,
 };
-use crate::state_reader::{LocalPeerMode, NetworkPeerMode, PeerDirectoryBackend};
+use crate::state_reader::{LocalPeerMode, NetworkPeerBackend, NetworkPeerMode, PeerBackend};
 use crate::subsystem::SubsystemName;
 use rdkafka::consumer::{BaseConsumer, ConsumerContext};
 use std::future::Future;
@@ -151,7 +151,7 @@ pub(crate) trait RunningRuntime: Sized + Send + 'static {
 }
 
 /// Prepares the runtime selected by one backend family.
-pub(crate) trait PreparePeer<B: PeerDirectoryBackend> {
+pub(crate) trait PreparePeer<B: PeerBackend> {
     type Runtime: PreparedRuntime;
 
     fn prepare<P: Send + Sync + 'static>(
@@ -449,13 +449,13 @@ impl RunningRuntime for LocalPeerRuntime {
     }
 }
 
-impl<B: PeerDirectoryBackend> PreparePeer<B> for NetworkPeerMode {
+impl<B: NetworkPeerBackend> PreparePeer<B> for NetworkPeerMode {
     type Runtime = PreparedPeerRuntime<B::Directory>;
 
     async fn prepare<P: Send + Sync + 'static>(
         peer: &PeerConfiguration,
         backend: &B,
-        mock: bool,
+        _mock: bool,
         managers: Arc<Managers<P>>,
         heartbeats: &HeartbeatRegistry,
     ) -> Result<Self::Runtime, ConsumerError> {
@@ -465,7 +465,7 @@ impl<B: PeerDirectoryBackend> PreparePeer<B> for NetworkPeerMode {
             .map_err(|error| PeerInitError::Listener {
                 message: format!("{error:#}"),
             })?;
-        let directory = backend.node_directory(parts.lease, mock).await?;
+        let directory = backend.node_directory(parts.lease).await?;
         PreparedPeerRuntime::start(PeerInputs {
             directory,
             listener,
@@ -481,7 +481,7 @@ impl<B: PeerDirectoryBackend> PreparePeer<B> for NetworkPeerMode {
     }
 }
 
-impl<B: PeerDirectoryBackend> PreparePeer<B> for LocalPeerMode {
+impl<B: PeerBackend> PreparePeer<B> for LocalPeerMode {
     type Runtime = PreparedLocalPeerRuntime;
 
     async fn prepare<P: Send + Sync + 'static>(
@@ -523,7 +523,7 @@ pub(in crate::consumer) async fn prepare_requester<B, P>(
     heartbeats: &HeartbeatRegistry,
 ) -> Result<PreparedPeer<<B::PeerMode as PreparePeer<B>>::Runtime>, ConsumerError>
 where
-    B: PeerDirectoryBackend,
+    B: PeerBackend,
     B::PeerMode: PreparePeer<B>,
     P: Send + Sync + 'static,
 {
@@ -553,7 +553,7 @@ pub(in crate::consumer) async fn prepare_responding<R, B, P>(
 ) -> Result<PreparedResponder<<B::PeerMode as PreparePeer<B>>::Runtime, R>, ConsumerError>
 where
     R: Codec,
-    B: PeerDirectoryBackend,
+    B: PeerBackend,
     B::PeerMode: PreparePeer<B>,
     P: Send + Sync + 'static,
 {

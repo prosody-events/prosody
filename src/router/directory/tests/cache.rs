@@ -1,5 +1,5 @@
 use super::support::{
-    cassandra_directory, finish, membership, memory_directory_holding, registration, token,
+    cassandra_directory, finish, membership, registration, test_directory_holding, token,
 };
 use crate::router::directory::cache::AddressCache;
 use crate::router::directory::{Endpoint, NodeDirectory, NodeRegistration, RegistrationTtl};
@@ -25,7 +25,7 @@ const CAPACITY: usize = 8;
 /// stream can push the cache past its bound.
 const POOL: usize = 12;
 
-/// What the memory directory under test holds: the whole pool, so no answer
+/// What the test directory holds: the whole pool, so no answer
 /// here can be given by an eviction inside the directory rather than by the
 /// cache.
 ///
@@ -75,7 +75,7 @@ static POOL_NODES: OnceCell<Vec<(NodeId, u16)>> = OnceCell::const_new();
 fn prop_address_cache_bounded_single_flight() {
     fn property(generated: Vec<usize>) -> TestResult {
         finish(TEST_RUNTIME.block_on(async {
-            let directory = memory_directory_holding(POOL_CAPACITY, POOL_LEASE)?;
+            let directory = test_directory_holding(POOL_CAPACITY, POOL_LEASE)?;
             let pool = register_pool(&directory).await?;
             run_address_cache_cases(&directory, &pool, directory.ttl(), generated).await
         }))
@@ -242,7 +242,7 @@ async fn absence_is_cached<D: NodeDirectory>(directory: &D, ttl: RegistrationTtl
 /// Resolves `node`, counting the directory reads the cache actually issues.
 ///
 /// The fill suspends once before it reads. That is what makes
-/// [`one_read_per_cold_burst`] a detector: the memory directory answers without
+/// [`one_read_per_cold_burst`] a detector: the test directory answers without
 /// ever suspending, so a fill that never yields would run to completion before
 /// the second caller of a burst is polled, and every later caller would find a
 /// fresh entry however the cache filled it. With the yield the first caller

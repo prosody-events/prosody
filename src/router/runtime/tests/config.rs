@@ -6,7 +6,7 @@ use super::super::{
 use super::{CONTACT, listener};
 use crate::requester::config::RequesterConfiguration;
 use crate::router::directory::RegistrationTtl;
-use crate::router::directory::tests::support::memory_directory;
+use crate::router::directory::tests::support::test_directory;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::TestHealth;
 use crate::test_util::TEST_RUNTIME;
@@ -35,7 +35,7 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
         // `start` refuses before it publishes anything, so an in-process
         // directory is enough and this case needs no cluster.
         let outcome = PreparedPeerRuntime::start(PeerInputs {
-            directory: memory_directory(REFUSED_LEASE)?,
+            directory: test_directory(REFUSED_LEASE)?,
             listener: listener().await?,
             health: TestHealth::new(true, true),
             probe: Some(CONTACT),
@@ -74,7 +74,7 @@ fn start_refuses_a_response_ceiling_above_the_frame_cap() -> Result<()> {
         };
         requester.validate()?;
         let outcome = PreparedPeerRuntime::start(PeerInputs {
-            directory: memory_directory(REFUSED_LEASE)?,
+            directory: test_directory(REFUSED_LEASE)?,
             listener: bound,
             health: TestHealth::new(true, true),
             probe: Some(CONTACT),

@@ -17,8 +17,6 @@ pub(crate) mod cache;
 pub(crate) mod cassandra;
 mod lease;
 
-pub(crate) mod memory;
-
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -91,16 +89,8 @@ pub(crate) struct NodeRegistration {
 
 /// What a process publishes about itself, and how it resolves another node.
 ///
-/// Two implementations exist:
-/// [`CassandraNodeDirectory`](cassandra::CassandraNodeDirectory), which
-/// publishes through a Cassandra store, and
-/// [`MemoryNodeDirectory`](memory::MemoryNodeDirectory), which holds a bounded
-/// map for same-process tests.
-///
-/// Construction is each implementation's own: one is opened over a Cassandra
-/// store and prepares statements, the other holds a bounded map. A process
-/// picks one at its construction boundary, and the choice travels from there as
-/// a type.
+/// [`CassandraNodeDirectory`](cassandra::CassandraNodeDirectory) is the
+/// production implementation. Tests use small in-process implementations.
 pub(crate) trait NodeDirectory: Clone + Send + Sync + 'static {
     /// What can stop a directory operation.
     ///

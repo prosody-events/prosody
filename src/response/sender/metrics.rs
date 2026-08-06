@@ -13,11 +13,8 @@
 //! and reads negative. What the fleet itself holds is
 //! `prosody.peer.fleet.destinations`.
 //!
-//! These counters are the operator's account of delivery.
-//! [`SendCounters`](super::SendCounters) is the in-process one, and it is the
-//! per-sender total the delivery suites assert on. The series here are asserted
-//! through a meter provider installed in `tests/metrics.rs`, one per test
-//! process.
+//! These counters are the operator's account of delivery. Tests also use a
+//! per-sender witness because one process shares one meter provider.
 //!
 //! Each instrument binds to whatever meter provider is global when it is first
 //! touched, so a process installs its provider before it queues a response.

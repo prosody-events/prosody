@@ -25,12 +25,12 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
 use crate::otel::SpanRelation;
 use crate::router::NodeId;
-use crate::router::directory::memory::{MEMORY_DIRECTORY_CAPACITY, MemoryNodeDirectory};
+use crate::router::directory::tests::support::TestDirectory;
 use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state_reader::{MemoryReaderBackend, ReaderBackend, StateReaderDependencies};
-use crate::state_reader::{NetworkPeerMode, PeerDirectoryBackend};
+use crate::state_reader::{NetworkPeerBackend, NetworkPeerMode, PeerBackend};
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
@@ -46,6 +46,7 @@ use std::array::from_fn;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -94,7 +95,7 @@ enum Event {
 #[derive(Clone)]
 struct RecordingDirectory {
     log: EventLog,
-    inner: MemoryNodeDirectory,
+    inner: TestDirectory,
     fail_register: bool,
 }
 
@@ -125,7 +126,7 @@ impl RecordingDirectory {
     fn new(log: EventLog, fail_register: bool) -> Self {
         Self {
             log,
-            inner: MemoryNodeDirectory::new(MEMORY_DIRECTORY_CAPACITY, RegistrationTtl::DEFAULT),
+            inner: TestDirectory::new(NonZeroUsize::MIN, RegistrationTtl::DEFAULT),
             fail_register,
         }
     }
@@ -175,14 +176,16 @@ impl NodeDirectory for RecordingDirectory {
     }
 }
 
-impl PeerDirectoryBackend for RecordingBackend {
-    type Directory = RecordingDirectory;
+impl PeerBackend for RecordingBackend {
     type PeerMode = NetworkPeerMode;
+}
+
+impl NetworkPeerBackend for RecordingBackend {
+    type Directory = RecordingDirectory;
 
     async fn node_directory(
         &self,
         _lease: RegistrationTtl,
-        _mock: bool,
     ) -> Result<Self::Directory, ConsumerError> {
         Ok(self.directory.clone())
     }
@@ -231,14 +234,16 @@ impl ConsumerStorageBackend<JsonCodec> for RecordingMemoryBackend {
     }
 }
 
-impl PeerDirectoryBackend for RecordingMemoryBackend {
-    type Directory = RecordingDirectory;
+impl PeerBackend for RecordingMemoryBackend {
     type PeerMode = NetworkPeerMode;
+}
+
+impl NetworkPeerBackend for RecordingMemoryBackend {
+    type Directory = RecordingDirectory;
 
     async fn node_directory(
         &self,
         _lease: RegistrationTtl,
-        _mock: bool,
     ) -> Result<Self::Directory, ConsumerError> {
         Ok(self.directory.clone())
     }

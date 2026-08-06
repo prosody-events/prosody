@@ -30,7 +30,7 @@ pub use backend::{
     CassandraReaderBackend, CommittedCellSource, MemoryReaderBackend, ReaderBackend,
 };
 pub(crate) use backend::{
-    ConsumerReaderBackend, LocalPeerMode, NetworkPeerMode, PeerDirectoryBackend,
+    ConsumerReaderBackend, LocalPeerMode, NetworkPeerBackend, NetworkPeerMode, PeerBackend,
 };
 pub use client::{CassandraStateReaderClient, StateReaderClient};
 pub use deps::StateReaderDependencies;

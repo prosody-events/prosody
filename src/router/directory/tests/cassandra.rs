@@ -2,9 +2,7 @@ use super::suite::{
     DirectoryTrace, STABLE_LEASE, expected_answers, first_divergence, run_directory_trace,
     run_idempotent_deregister_case, run_label_bound_case,
 };
-use super::support::{
-    cassandra_directory, finish, membership, memory_directory, registration, store, token,
-};
+use super::support::{cassandra_directory, finish, membership, registration, store, token};
 use crate::cassandra::TABLE_NODE_DIRECTORY;
 use crate::router::NodeId;
 use crate::router::directory::{NodeDirectory, RegistrationTtl};
@@ -18,30 +16,17 @@ use std::time::Duration;
 use tokio::time::{Instant, interval};
 use uuid::Uuid;
 
-/// Both directories and the map oracle answer one trace alike.
-///
-/// One generated trace drives both backends, so this compares them against the
-/// same operations rather than against two independent runs. The oracle is a
-/// plain map, so a rule both backends broke the same way is still caught.
+/// The Cassandra directory answers each trace as the map oracle answers it.
 #[test]
-fn prop_both_directories_answer_one_trace_alike() {
+fn prop_cassandra_directory_matches_the_model() {
     fn property(trace: DirectoryTrace) -> TestResult {
         finish(TEST_RUNTIME.block_on(async move {
-            let memory = memory_directory(STABLE_LEASE)?;
             let cassandra = cassandra_directory(STABLE_LEASE).await?;
-            let memory_answers = run_directory_trace(&memory, &trace).await?;
             let cassandra_answers = run_directory_trace(&cassandra, &trace).await?;
             let expected = expected_answers(&trace);
 
-            if let Some(divergence) = first_divergence(&trace, &memory_answers, &expected) {
-                return Err(eyre!("memory and model: {divergence}"));
-            }
             if let Some(divergence) = first_divergence(&trace, &cassandra_answers, &expected) {
                 return Err(eyre!("Cassandra and model: {divergence}"));
-            }
-            if let Some(divergence) = first_divergence(&trace, &memory_answers, &cassandra_answers)
-            {
-                return Err(eyre!("memory and Cassandra: {divergence}"));
             }
             Ok(())
         }))

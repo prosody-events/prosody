@@ -3,7 +3,7 @@ use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
 use crate::router::Host;
 use crate::router::directory::cache::AddressResolver;
-use crate::router::directory::tests::support::{membership, memory_directory, registration};
+use crate::router::directory::tests::support::{membership, registration, test_directory};
 use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
@@ -100,7 +100,7 @@ fn every_failure_answers_the_two_questions_the_send_path_asks() {
 #[test]
 fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let directory = memory_directory(LEASE)?;
+        let directory = test_directory(LEASE)?;
         let published = registration(NodeId::new(), membership());
         directory.register(&published).await?;
 
@@ -162,7 +162,7 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
 #[test]
 fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let directory = memory_directory(LEASE)?;
+        let directory = test_directory(LEASE)?;
         let published = registration(NodeId::new(), membership());
         directory.register(&published).await?;
 

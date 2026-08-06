@@ -7,16 +7,18 @@
 use super::suite::SUITE_CAPACITY;
 use crate::cassandra::CassandraStore;
 use crate::router::directory::cassandra::CassandraNodeDirectory;
-use crate::router::directory::memory::MemoryNodeDirectory;
 use crate::router::directory::{
-    Endpoint, GroupMembership, NetworkId, NodeRegistration, RegistrationTtl,
+    Endpoint, GroupMembership, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
 };
 use crate::router::{Host, MAX_LABEL_BYTES, NodeId};
 use crate::test_util::test_cassandra_config;
 use color_eyre::Result;
 use fixedstr::Flexstr;
+use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen, TestResult};
+use std::convert::Infallible;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
@@ -33,6 +35,68 @@ const MAX_LABEL: usize = MAX_LABEL_BYTES;
 /// One store per test process. `CassandraStore::new` runs the migrator, so a
 /// store per property iteration would spend the run on schema checks.
 static STORE: OnceCell<CassandraStore> = OnceCell::const_new();
+
+/// A bounded in-process directory for tests that do not need Cassandra.
+#[derive(Clone)]
+pub(crate) struct TestDirectory {
+    registrations: Arc<Mutex<Vec<NodeRegistration>>>,
+    capacity: usize,
+    ttl: RegistrationTtl,
+}
+
+impl TestDirectory {
+    pub(crate) fn new(capacity: NonZeroUsize, ttl: RegistrationTtl) -> Self {
+        Self {
+            registrations: Arc::new(Mutex::new(Vec::with_capacity(capacity.get()))),
+            capacity: capacity.get(),
+            ttl,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.registrations.lock().len()
+    }
+}
+
+impl NodeDirectory for TestDirectory {
+    type Error = Infallible;
+
+    fn ttl(&self) -> RegistrationTtl {
+        self.ttl
+    }
+
+    async fn register(&self, registration: &NodeRegistration) -> Result<(), Self::Error> {
+        let mut registrations = self.registrations.lock();
+        if let Some(stored) = registrations
+            .iter_mut()
+            .find(|stored| stored.node == registration.node)
+        {
+            stored.clone_from(registration);
+        } else {
+            if registrations.len() == self.capacity {
+                registrations.remove(0);
+            }
+            registrations.push(registration.clone());
+        }
+        Ok(())
+    }
+
+    async fn read(&self, node: NodeId) -> Result<Option<NodeRegistration>, Self::Error> {
+        Ok(self
+            .registrations
+            .lock()
+            .iter()
+            .find(|registration| registration.node == node)
+            .cloned())
+    }
+
+    async fn deregister(&self, registration: &NodeRegistration) -> Result<(), Self::Error> {
+        self.registrations
+            .lock()
+            .retain(|stored| stored.node != registration.node);
+        Ok(())
+    }
+}
 
 /// A registration whose every field is generated, including the absent forms
 /// of the three optional ones.
@@ -72,17 +136,17 @@ pub(crate) async fn cassandra_directory(lease: Duration) -> Result<CassandraNode
 
 /// An in-process directory holding [`SUITE_CAPACITY`] registrations under
 /// `lease`.
-pub(crate) fn memory_directory(lease: Duration) -> Result<MemoryNodeDirectory> {
-    memory_directory_holding(SUITE_CAPACITY, lease)
+pub(crate) fn test_directory(lease: Duration) -> Result<TestDirectory> {
+    test_directory_holding(SUITE_CAPACITY, lease)
 }
 
 /// An in-process directory holding `capacity` registrations under `lease`, for
 /// a suite whose pool is larger than [`SUITE_CAPACITY`].
-pub(crate) fn memory_directory_holding(
+pub(crate) fn test_directory_holding(
     capacity: NonZeroUsize,
     lease: Duration,
-) -> Result<MemoryNodeDirectory> {
-    Ok(MemoryNodeDirectory::new(
+) -> Result<TestDirectory> {
+    Ok(TestDirectory::new(
         capacity,
         RegistrationTtl::try_from(lease)?,
     ))

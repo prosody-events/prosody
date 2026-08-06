@@ -23,6 +23,9 @@ mod deadline;
 pub(crate) mod health;
 mod inject;
 pub(crate) mod service;
+mod witness;
+
+pub(crate) use witness::TRANSPORT;
 
 /// The peer service, written from `proto/peer.proto` at build time.
 pub(crate) mod generated {
@@ -42,8 +45,6 @@ use crate::router::RelayHop;
 use derive_builder::Builder;
 use std::io::Error as IoError;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -131,15 +132,6 @@ const DEFAULT_MAX_CONNECTIONS: usize = 128;
 /// refuses a connection over the cap, but a stream over the cap only waits.
 const DEFAULT_MAX_STREAMS: u32 = 8;
 
-/// What this process's peer listener refused, and how often its service ran.
-///
-/// One process serves one peer listener, so these are the process's counters.
-/// They are reached through this static rather than held as fields because the
-/// generated service builds the frame codec through [`Default`] and can pass it
-/// nothing — and the codec is the only place that can see a frame the transport
-/// refuses.
-pub(crate) static TRANSPORT: TransportCounters = TransportCounters::new();
-
 /// What an operator sets for the peer listener.
 ///
 /// Every field has a working default, so a process that serves peers needs no
@@ -187,24 +179,6 @@ pub(crate) struct BoundListener {
     listener: TcpListener,
     address: SocketAddr,
     config: TransportConfiguration,
-}
-
-/// Counts kept by the peer listener.
-///
-/// Every count is monotonic and read as a difference: what the transport
-/// refused, and how often the peer method actually ran. A frame the transport
-/// refuses leaves [`served`](Self::served) alone, which is what separates a
-/// transport rejection from a registry outcome.
-///
-/// The writes run in production and only the listener suites read them. A
-/// process installs one meter provider, so concurrent suites cannot attribute a
-/// `metrics` series to one listener; these counters are per listener.
-pub(crate) struct TransportCounters {
-    served: AtomicU64,
-    refused_connections: AtomicU64,
-    rejected_frames: AtomicU64,
-    misrouted: AtomicU64,
-    forwarded: AtomicU64,
 }
 
 impl Default for TransportConfiguration {
@@ -255,77 +229,6 @@ impl BoundListener {
     /// The frame ceiling that the listener enforces.
     pub(crate) const fn frame_cap(&self) -> FrameCap {
         self.config.frame_cap
-    }
-}
-
-impl TransportCounters {
-    const fn new() -> Self {
-        Self {
-            served: AtomicU64::new(0),
-            refused_connections: AtomicU64::new(0),
-            rejected_frames: AtomicU64::new(0),
-            misrouted: AtomicU64::new(0),
-            forwarded: AtomicU64::new(0),
-        }
-    }
-
-    /// How often the peer method ran, whatever it then answered.
-    #[cfg(test)]
-    pub(crate) fn served(&self) -> u64 {
-        self.served.load(Relaxed)
-    }
-
-    /// How many connections were refused over the concurrency cap.
-    #[cfg(test)]
-    pub(crate) fn refused_connections(&self) -> u64 {
-        self.refused_connections.load(Relaxed)
-    }
-
-    /// How many frames the listener refused before the service could run.
-    ///
-    /// Both refusals are here: a frame the reader could not read, and one over
-    /// the configured ceiling, which the transport refuses above the reader and
-    /// [`Counted`] counts from its answer.
-    #[cfg(test)]
-    pub(crate) fn rejected_frames(&self) -> u64 {
-        self.rejected_frames.load(Relaxed)
-    }
-
-    /// How many frames named a node other than this one.
-    #[cfg(test)]
-    pub(crate) fn misrouted(&self) -> u64 {
-        self.misrouted.load(Relaxed)
-    }
-
-    /// How many frames this process decided to send on.
-    ///
-    /// Counted at the decision rather than at the outcome, so a forward that
-    /// then found no capacity, no target or no time left is here too. Every one
-    /// of them is in [`misrouted`](Self::misrouted) as well: a frame sent on is
-    /// a frame that named another node.
-    #[cfg(test)]
-    pub(crate) fn forwarded(&self) -> u64 {
-        self.forwarded.load(Relaxed)
-    }
-
-    fn record_served(&self) {
-        self.served.fetch_add(1, Relaxed);
-    }
-
-    fn record_refused_connection(&self) {
-        self.refused_connections.fetch_add(1, Relaxed);
-    }
-
-    fn record_rejected_frame(&self) {
-        self.rejected_frames.fetch_add(1, Relaxed);
-    }
-
-    fn record_misrouted(&self) {
-        self.misrouted.fetch_add(1, Relaxed);
-    }
-
-    fn record_forwarded(&self) {
-        self.forwarded.fetch_add(1, Relaxed);
     }
 }
 

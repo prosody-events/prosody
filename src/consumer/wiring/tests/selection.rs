@@ -9,10 +9,7 @@ use crate::consumer::{CommonConfiguration, ConsumerConfiguration, ConsumerSetup}
 use crate::consumer::{Managers, PreparePeer};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
-use crate::router::directory::RegistrationTtl;
-use crate::state_reader::{
-    LocalPeerMode, MemoryReaderBackend, PeerDirectoryBackend, StateReaderDependencies,
-};
+use crate::state_reader::{LocalPeerMode, MemoryReaderBackend, StateReaderDependencies};
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use color_eyre::Result;
@@ -27,22 +24,27 @@ use std::sync::Arc;
 fn a_peer_fleet_on_memory_storage_is_refused_outside_mock_mode() -> Result<()> {
     let config = consumer_config("peer-memory-selection")?;
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let common = common_config(Some(peer), Some(SubsystemName::try_new("orders")?))?;
+    let common = common_config(Some(peer.clone()), Some(SubsystemName::try_new("orders")?))?;
 
     TEST_RUNTIME.block_on(async {
         let deps = select(&config, &common);
+        let managers = Arc::<Managers<serde_json::Value>>::default();
+        let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
         assert!(matches!(
-            deps.backend()
-                .node_directory(RegistrationTtl::DEFAULT, false)
-                .await,
+            LocalPeerMode::prepare(
+                &peer,
+                deps.backend().as_ref(),
+                false,
+                Arc::clone(&managers),
+                &heartbeats,
+            )
+            .await,
             Err(ConsumerError::Peer(PeerInitError::MemoryDirectory))
         ));
-        assert!(
-            deps.backend()
-                .node_directory(RegistrationTtl::DEFAULT, true)
-                .await
-                .is_ok()
-        );
+        LocalPeerMode::prepare(&peer, deps.backend().as_ref(), true, managers, &heartbeats)
+            .await?
+            .abandon()
+            .await;
         Ok(())
     })
 }

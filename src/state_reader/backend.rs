@@ -20,7 +20,6 @@ use crate::consumer::{
 use crate::error::ClassifyError;
 use crate::loader::{KafkaLoader, MemoryLoader, MessageLoader};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
-use crate::router::directory::memory::{MEMORY_DIRECTORY_CAPACITY, MemoryNodeDirectory};
 use crate::router::directory::{NodeDirectory, RegistrationTtl};
 use crate::state::cassandra::{
     CassandraCellResources, CassandraCellStoreError, CassandraDescriptorIdentityStore,
@@ -187,22 +186,24 @@ pub(crate) struct NetworkPeerMode;
 /// Selects a peer runtime with only the local route.
 pub(crate) struct LocalPeerMode;
 
-/// A backend that supplies the node directory for its storage family.
-pub(crate) trait PeerDirectoryBackend: Send + Sync + Sized + 'static {
-    type Directory: NodeDirectory;
-    /// The peer runtime that matches this storage family.
+/// A backend that selects its peer runtime at compile time.
+pub(crate) trait PeerBackend: Send + Sync + Sized + 'static {
     type PeerMode: PreparePeer<Self>;
+}
+
+/// A backend that supplies a directory to the network peer runtime.
+pub(crate) trait NetworkPeerBackend: PeerBackend {
+    type Directory: NodeDirectory;
 
     fn node_directory(
         &self,
         lease: RegistrationTtl,
-        mock: bool,
     ) -> impl Future<Output = Result<Self::Directory, ConsumerError>> + Send;
 }
 
 /// Reader family that can also supply a consumer's matching stores.
 pub(crate) trait ConsumerReaderBackend<C>:
-    ReaderBackend<C> + ConsumerStorageBackend<C> + PeerDirectoryBackend
+    ReaderBackend<C> + ConsumerStorageBackend<C> + PeerBackend
 where
     C: Codec,
 {
@@ -211,7 +212,7 @@ where
 impl<C, B> ConsumerReaderBackend<C> for B
 where
     C: Codec,
-    B: ReaderBackend<C> + ConsumerStorageBackend<C> + PeerDirectoryBackend,
+    B: ReaderBackend<C> + ConsumerStorageBackend<C> + PeerBackend,
 {
 }
 
@@ -285,14 +286,16 @@ pub type MemoryReaderBackend<C> = ReaderComponents<
     MemoryLoader<<C as Codec>::Payload>,
 >;
 
-impl<C: Codec> PeerDirectoryBackend for CassandraReaderBackend<C> {
-    type Directory = CassandraNodeDirectory;
+impl<C: Codec> PeerBackend for CassandraReaderBackend<C> {
     type PeerMode = NetworkPeerMode;
+}
+
+impl<C: Codec> NetworkPeerBackend for CassandraReaderBackend<C> {
+    type Directory = CassandraNodeDirectory;
 
     async fn node_directory(
         &self,
         lease: RegistrationTtl,
-        _mock: bool,
     ) -> Result<Self::Directory, ConsumerError> {
         CassandraNodeDirectory::new(self.cells.session.clone(), lease)
             .await
@@ -304,23 +307,8 @@ impl<C: Codec> PeerDirectoryBackend for CassandraReaderBackend<C> {
     }
 }
 
-/// The caller gets a directory that resolves only what this process registered.
-/// See [`MemoryNodeDirectory`]. This boundary refuses its use outside mock
-/// mode.
-impl<C: Codec> PeerDirectoryBackend for MemoryReaderBackend<C> {
-    type Directory = MemoryNodeDirectory;
+impl<C: Codec> PeerBackend for MemoryReaderBackend<C> {
     type PeerMode = LocalPeerMode;
-
-    async fn node_directory(
-        &self,
-        lease: RegistrationTtl,
-        mock: bool,
-    ) -> Result<Self::Directory, ConsumerError> {
-        if !mock {
-            return Err(PeerInitError::MemoryDirectory.into());
-        }
-        Ok(MemoryNodeDirectory::new(MEMORY_DIRECTORY_CAPACITY, lease))
-    }
 }
 
 impl<C> ConsumerStorageBackend<C> for CassandraReaderBackend<C>
