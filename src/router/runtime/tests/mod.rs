@@ -164,7 +164,7 @@ impl Process {
                 runtime.node(),
                 Arc::clone(runtime.pending()),
                 runtime.router.addresses.clone(),
-                Arc::clone(runtime.fleet()),
+                Arc::clone(&runtime.router.fleet),
                 Arc::new(transport),
                 None,
             );
@@ -182,7 +182,7 @@ impl Process {
         };
         Ok(Self {
             shared: Shared {
-                fleet: Arc::clone(runtime.fleet()),
+                fleet: Arc::clone(&runtime.router.fleet),
                 pending: Arc::clone(runtime.pending()),
                 counters: sender.counters(),
                 destination,

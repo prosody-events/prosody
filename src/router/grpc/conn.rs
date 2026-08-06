@@ -50,6 +50,8 @@ pub(super) struct Admitted {
     inner: TcpStream,
     /// Fires once per [`SILENCE_TIMEOUT`], and closes the connection at the
     /// first expiry that finds nothing was read since the one before.
+    /// The box keeps `Admitted` `Unpin`, which tonic requires from incoming
+    /// I/O.
     silence: Pin<Box<Sleep>>,
     /// Whether anything was read in this period. Cleared at every expiry, so
     /// the deadline is reset once a period rather than once a read.

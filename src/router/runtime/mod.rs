@@ -83,7 +83,6 @@ pub(crate) struct PeerRuntime<D> {
     /// the two directions stay separate types rather than one that does both.
     directory: D,
     registration: NodeRegistration,
-    fleet: Arc<DestinationFleet>,
     pending: Arc<PendingRegistry>,
     stop_refresh: watch::Sender<bool>,
     refresh: JoinHandle<()>,
@@ -107,7 +106,6 @@ pub(crate) struct PreparedPeerRuntime<D> {
     frame_cap: FrameCap,
     directory: D,
     registration: NodeRegistration,
-    fleet: Arc<DestinationFleet>,
     pending: Arc<PendingRegistry>,
     stop_listener: oneshot::Sender<()>,
     listener: JoinHandle<()>,
@@ -228,7 +226,6 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
             frame_cap,
             directory,
             registration,
-            fleet,
             pending,
             stop_listener,
             listener,
@@ -295,7 +292,6 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
             router: self.router,
             directory: self.directory,
             registration: self.registration,
-            fleet: self.fleet,
             pending: self.pending,
             stop_refresh,
             refresh,
@@ -406,12 +402,6 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         self.registration.node
     }
 
-    /// The process-wide destination fleet.
-    #[cfg(test)]
-    pub(crate) const fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
-    }
-
     /// The process-wide pending request registry.
     pub(crate) const fn pending(&self) -> &Arc<PendingRegistry> {
         &self.pending
@@ -458,7 +448,6 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         let Self {
             directory,
             registration,
-            fleet,
             pending,
             stop_refresh,
             refresh,
@@ -467,6 +456,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
             router,
         } = self;
 
+        let fleet = Arc::clone(&router.fleet);
         // The resolver only reads. The transport is already cloned into every
         // response delivery worker.
         drop(router);

@@ -247,7 +247,7 @@ fn shutdown_from_a_quiet_process_terminates_clean() -> Result<()> {
             runtime, directory, ..
         } = plain_process().await?;
         let node = runtime.node();
-        let fleet = Arc::clone(runtime.fleet());
+        let fleet = Arc::clone(&runtime.router.fleet);
 
         runtime.shutdown(|| async {}).await?;
         ensure!(
