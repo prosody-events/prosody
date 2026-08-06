@@ -1,8 +1,8 @@
 //! What ends a request, what it costs, and what the map holds afterwards.
 
 use super::{
-    MAX_TIMEOUT, POOL, SWEEP_GRACE, TestCodec, TestCodecError, TestError, names, register,
-    registry, success,
+    MAX_TIMEOUT, POOL, SWEEP_GRACE, TestCodec, TestCodecError, TestError, names,
+    partial_permutation, register, registry, success,
 };
 use crate::codec::Codec;
 use crate::requester::collect::decode;
@@ -70,12 +70,7 @@ enum DrainStep {
 impl Arbitrary for TerminalTrace {
     fn arbitrary(g: &mut Gen) -> Self {
         let awaited = usize::arbitrary(g) % MAX_AWAITED + 1;
-        let mut unanswered: Vec<usize> = (0..awaited).collect();
-        let answering = usize::arbitrary(g) % (awaited + 1);
-        let mut order = Vec::with_capacity(answering);
-        for _ in 0..answering {
-            order.push(unanswered.swap_remove(usize::arbitrary(g) % unanswered.len()));
-        }
+        let order = partial_permutation(g, awaited);
         let cut = usize::arbitrary(g) % (order.len() + 1);
         Self {
             awaited,

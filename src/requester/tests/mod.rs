@@ -21,6 +21,7 @@ use crate::{EventIdentity, Topic};
 use bytes::BytesMut;
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
+use quickcheck::{Arbitrary, Gen};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -264,6 +265,22 @@ pub(super) fn names(names: &[&str]) -> Result<Vec<SubsystemName>> {
         .iter()
         .map(|name| Ok(SubsystemName::try_new(name)?))
         .collect()
+}
+
+/// Chooses `count` distinct indices from `0..length` in random order.
+pub(super) fn distinct_indices(g: &mut Gen, length: usize, count: usize) -> Vec<usize> {
+    let mut pool: Vec<usize> = (0..length).collect();
+    let mut chosen = Vec::with_capacity(count);
+    for _ in 0..count {
+        chosen.push(pool.swap_remove(usize::arbitrary(g) % pool.len()));
+    }
+    chosen
+}
+
+/// Chooses a random-length ordered subset of `0..length`.
+pub(super) fn partial_permutation(g: &mut Gen, length: usize) -> Vec<usize> {
+    let count = usize::arbitrary(g) % (length + 1);
+    distinct_indices(g, length, count)
 }
 
 /// Encodes one response body through the codec that reads it back.

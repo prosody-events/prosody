@@ -2,7 +2,8 @@
 //! record when it does produce.
 
 use super::{
-    MAX_TIMEOUT, NODE, POOL, RequestPayload, TestError, names, poll_once, registry, requester,
+    MAX_TIMEOUT, NODE, POOL, RequestPayload, TestError, distinct_indices, names, poll_once,
+    registry, requester,
 };
 use crate::Topic;
 use crate::requester::{
@@ -58,11 +59,7 @@ impl Arbitrary for HeaderTrace {
         // The last pool name carries a comma and is always awaited, so the
         // one-header-per-name rule is under test on every iteration.
         let extra = usize::arbitrary(g) % MAX_AWAITED;
-        let mut pool: Vec<usize> = (0..POOL.len() - 1).collect();
-        let mut awaited = Vec::with_capacity(extra);
-        for _ in 0..extra {
-            awaited.push(pool.swap_remove(usize::arbitrary(g) % pool.len()));
-        }
+        let awaited = distinct_indices(g, POOL.len() - 1, extra);
         let user = (0..usize::arbitrary(g) % (USER_NAMES.len() + 1))
             .map(|_| {
                 (

@@ -1,8 +1,8 @@
 //! Where each arrival is filed, and what the waiter reads back.
 
 use super::{
-    MAX_RESPONSE_BYTES, MAX_TIMEOUT, POOL, TestCodec, TestError, body, formatted_frame, frame,
-    names, register, registry, success,
+    MAX_RESPONSE_BYTES, MAX_TIMEOUT, POOL, TestCodec, TestError, body, distinct_indices,
+    formatted_frame, frame, names, partial_permutation, register, registry, success,
 };
 use crate::error::ErrorCategory;
 use crate::requester::collect::decode;
@@ -52,20 +52,9 @@ struct Answer {
 impl Arbitrary for PositionTrace {
     fn arbitrary(g: &mut Gen) -> Self {
         let count = usize::arbitrary(g) % MAX_AWAITED + 1;
-        let mut pool: Vec<usize> = (0..POOL.len()).collect();
-        let mut awaited = Vec::with_capacity(count);
-        for _ in 0..count {
-            awaited.push(pool.swap_remove(usize::arbitrary(g) % pool.len()));
-        }
-
+        let awaited = distinct_indices(g, POOL.len(), count);
         let answers = (0..count).map(|_| Answer::arbitrary(g)).collect();
-
-        let mut unanswered: Vec<usize> = (0..count).collect();
-        let answering = usize::arbitrary(g) % (count + 1);
-        let mut order = Vec::with_capacity(answering);
-        for _ in 0..answering {
-            order.push(unanswered.swap_remove(usize::arbitrary(g) % unanswered.len()));
-        }
+        let order = partial_permutation(g, count);
 
         Self {
             awaited,
