@@ -3,6 +3,7 @@ use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
 use crate::router::Host;
 use crate::router::directory::cache::AddressResolver;
+use crate::router::directory::tests::support::TestDirectory;
 use crate::router::directory::tests::support::{membership, registration, test_directory};
 use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
@@ -104,15 +105,7 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
         let published = registration(NodeId::new(), membership());
         directory.register(&published).await?;
 
-        let (transport, _recorded) = LoopbackSender::new();
-        let router = RouterHandle::new(
-            NodeId::new(),
-            PendingRegistry::new(&RequesterConfiguration::default())?,
-            AddressResolver::new(CACHE_CAPACITY, directory),
-            Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
-            Arc::new(transport),
-            None,
-        );
+        let router = test_router(directory)?;
 
         let route = router
             .route(published.node)
@@ -166,15 +159,7 @@ fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<(
         let published = registration(NodeId::new(), membership());
         directory.register(&published).await?;
 
-        let (transport, _recorded) = LoopbackSender::new();
-        let router = RouterHandle::new(
-            NodeId::new(),
-            PendingRegistry::new(&RequesterConfiguration::default())?,
-            AddressResolver::new(CACHE_CAPACITY, directory.clone()),
-            Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
-            Arc::new(transport),
-            None,
-        );
+        let router = test_router(directory.clone())?;
 
         assert_eq!(
             router.direct(published.node).await?,
@@ -364,6 +349,18 @@ fn prop_a_route_follows_the_declared_labels(declared: Declared) -> TestResult {
 /// The failure a destination that answered `code` produces.
 fn answer(code: Code) -> SendFailure {
     SendFailure::Status(code)
+}
+
+fn test_router(directory: TestDirectory) -> Result<RouterHandle<LoopbackSender, TestDirectory>> {
+    let (transport, _recorded) = LoopbackSender::new();
+    Ok(RouterHandle::new(
+        NodeId::new(),
+        PendingRegistry::new(&RequesterConfiguration::default())?,
+        AddressResolver::new(CACHE_CAPACITY, directory),
+        Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
+        Arc::new(transport),
+        None,
+    ))
 }
 
 /// One endpoint on `port`. Its host is not the subject here.
