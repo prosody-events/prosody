@@ -147,7 +147,7 @@ impl<C: Codec<Payload = Result<(), TestError>>> Fixture<C> {
     fn with_cap(max_destinations: usize, slots_each: usize, cap: FrameCap) -> Result<Self> {
         let (router, deliveries) = TestRouter::new(config(max_destinations, slots_each))?;
         let (responder, workers) =
-            Responder::new(&router, cap, SubsystemName::try_new(SUBSYSTEM)?)?;
+            Responder::new_without_local(&router, cap, SubsystemName::try_new(SUBSYSTEM)?)?;
         Ok(Self {
             router,
             responder: Arc::new(responder),

@@ -16,7 +16,7 @@ use crate::router::grpc::health::ProcessHealth;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
 use crate::router::relay::Relay;
-use crate::router::{NodeId, RouterHandle};
+use crate::router::{LocalTarget, NodeId, RouterHandle};
 use crate::subsystem::SubsystemName;
 use rand::RngExt;
 use std::future::Future;
@@ -115,6 +115,20 @@ pub(crate) struct PreparedPeerRuntime<D> {
     listener: JoinHandle<()>,
 }
 
+/// Local peer machinery that has no listener, directory, or remote transport.
+pub(crate) struct PreparedLocalPeerRuntime {
+    node: NodeId,
+    frame_cap: FrameCap,
+    fleet: Arc<DestinationFleet>,
+    pending: Arc<PendingRegistry>,
+}
+
+/// A running local-only peer runtime.
+pub(crate) struct LocalPeerRuntime {
+    pending: Arc<PendingRegistry>,
+    fleet: Arc<DestinationFleet>,
+}
+
 /// Everything one peer runtime is built from.
 ///
 /// The bound listener inside is a unique resource, so one value serves one
@@ -190,6 +204,8 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         let addresses =
             AddressResolver::new(inputs.router.address_cache_capacity, directory.clone());
         let router = RouterHandle::new(
+            registration.node,
+            Arc::clone(&pending),
             addresses.clone(),
             Arc::clone(&fleet),
             transport,
@@ -323,6 +339,77 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
     pub(crate) async fn abandon(self) {
         self.pending.terminate().await;
         abandon(self.stop_listener, self.listener).await;
+    }
+}
+
+impl PreparedLocalPeerRuntime {
+    /// Builds local peer machinery without network resources.
+    pub(crate) fn start(
+        frame_cap: FrameCap,
+        fleet: FleetConfiguration,
+        requester: &RequesterConfiguration,
+    ) -> Result<Self, PeerRuntimeError> {
+        if requester.max_response_bytes > frame_cap.bytes() {
+            return Err(PeerRuntimeError::ResponseCeiling {
+                bytes: requester.max_response_bytes,
+                cap: frame_cap.bytes(),
+            });
+        }
+        Ok(Self {
+            node: NodeId::new(),
+            frame_cap,
+            fleet: Arc::new(DestinationFleet::new(fleet)?),
+            pending: PendingRegistry::new(requester)?,
+        })
+    }
+
+    /// This process's node id.
+    pub(crate) const fn node(&self) -> NodeId {
+        self.node
+    }
+
+    /// Builds a responder over the local route only.
+    pub(crate) fn responder<C: Codec>(
+        &self,
+        subsystem: SubsystemName,
+    ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
+        Responder::new_local(
+            LocalTarget::new(self.node, Arc::clone(&self.pending)),
+            &self.fleet,
+            self.frame_cap,
+            subsystem,
+        )
+    }
+
+    /// Starts the local runtime. No external activation is necessary.
+    pub(crate) fn activate(self) -> LocalPeerRuntime {
+        LocalPeerRuntime {
+            pending: self.pending,
+            fleet: self.fleet,
+        }
+    }
+
+    /// Stops local resources before activation.
+    pub(crate) async fn abandon(self) {
+        self.pending.terminate().await;
+    }
+}
+
+impl LocalPeerRuntime {
+    /// The process-wide request registry.
+    pub(crate) const fn pending(&self) -> &Arc<PendingRegistry> {
+        &self.pending
+    }
+
+    /// Shuts the local peer machinery down in delivery order.
+    pub(crate) async fn shutdown<F, Fut>(self, drain: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.pending.terminate().await;
+        self.fleet.close().await;
+        drain().await;
     }
 }
 

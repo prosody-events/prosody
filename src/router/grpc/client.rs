@@ -12,6 +12,8 @@ use bytes::BytesMut;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use quick_cache::UnitWeighter;
 use quick_cache::sync::{Cache, DefaultLifecycle};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock};
 use tokio::time::Instant;
 use tonic::Request;
@@ -51,6 +53,8 @@ pub(crate) struct GrpcSender {
     channels: Arc<Channels>,
     cap: FrameCap,
     propagator: TextMapCompositePropagator,
+    #[cfg(test)]
+    attempts: AtomicU64,
 }
 
 impl GrpcSender {
@@ -70,7 +74,15 @@ impl GrpcSender {
             )),
             cap,
             propagator: new_propagator(),
+            #[cfg(test)]
+            attempts: AtomicU64::new(0),
         }
+    }
+
+    /// How many frames this sender handed to gRPC.
+    #[cfg(test)]
+    pub(crate) fn attempts(&self) -> u64 {
+        self.attempts.load(Relaxed)
     }
 
     /// The channel for `address`, dialling one on a miss.
@@ -106,6 +118,8 @@ impl ResponseSender for GrpcSender {
         frame: &F,
         deadline: Instant,
     ) -> Result<(), SendFailure> {
+        #[cfg(test)]
+        self.attempts.fetch_add(1, Relaxed);
         let channel = self.channel(address).await?;
         let bytes = frame.bytes();
         let mut buffer = BytesMut::with_capacity(bytes);

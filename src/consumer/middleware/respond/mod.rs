@@ -45,8 +45,12 @@ use crate::response::headers::RequestTag;
 #[cfg(test)]
 use crate::response::sender::SendCounters;
 use crate::response::sender::{ResponseWorkers, TypedSender};
+#[cfg(test)]
 use crate::router::Router;
+use crate::router::directory::NodeDirectory;
+use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfigurationError;
+use crate::router::{LocalTarget, ResponseSender, RouterHandle};
 use crate::subsystem::SubsystemName;
 use crate::timers::Trigger;
 use opentelemetry::Context;
@@ -141,12 +145,34 @@ impl<C: Codec> Responder<C> {
     ///
     /// Returns the responder and its [`ResponseWorkers`], which owns the order
     /// the caller must join them in.
-    pub(crate) fn new<R: Router>(
+    #[cfg(test)]
+    pub(crate) fn new_without_local<R: Router>(
         router: &R,
         cap: FrameCap,
         subsystem: SubsystemName,
     ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
+        let (sender, workers) = TypedSender::new_without_local(router, cap)?;
+        Ok((Self { sender, subsystem }, workers))
+    }
+
+    /// Builds a responder that deposits same-node responses without gRPC.
+    pub(crate) fn new<S: ResponseSender, D: NodeDirectory>(
+        router: &RouterHandle<S, D>,
+        cap: FrameCap,
+        subsystem: SubsystemName,
+    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
         let (sender, workers) = TypedSender::new(router, cap)?;
+        Ok((Self { sender, subsystem }, workers))
+    }
+
+    /// Builds a responder that can only deposit same-node responses.
+    pub(crate) fn new_local(
+        local: LocalTarget,
+        fleet: &Arc<DestinationFleet>,
+        cap: FrameCap,
+        subsystem: SubsystemName,
+    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
+        let (sender, workers) = TypedSender::new_local(local, fleet, cap)?;
         Ok((Self { sender, subsystem }, workers))
     }
 

@@ -14,7 +14,7 @@ use crate::router::directory::NodeDirectory;
 use crate::router::grpc::TRANSPORT;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::HANG_GUARD;
-use crate::router::{NodeId, ResponseSender, Router, SendFailure};
+use crate::router::{NodeId, RelayHop, ResponseSender, RouterHandle, SendFailure};
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -107,15 +107,13 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
     })
 }
 
-/// A response sent through the router the runtime hands out reaches this
-/// process's own listener.
+/// A response for this process reaches its registry without gRPC.
 ///
-/// The router is not a second set of machinery: it reserves from the process's
-/// one fleet, so closing that fleet at shutdown governs it too. The delivery
-/// then proves the rest of the handle — the resolver reads this node's own
-/// published address, and the transport dials it.
+/// The response still reserves from the process's fleet and uses its bounded
+/// queue. An explicit lookup preserves the router ownership proof. The local
+/// worker itself skips address resolution and transport work.
 #[test]
-fn a_response_through_the_runtime_router_reaches_this_process() -> Result<()> {
+fn a_same_node_response_uses_the_local_registry() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let Process {
@@ -154,8 +152,8 @@ fn a_response_through_the_runtime_router_reaches_this_process() -> Result<()> {
 ///
 /// The deadline is a hang guard on a delivery that reports through the registry
 /// rather than through a signal; the assertion is the stored payload.
-async fn delivered_to_itself<R: Router>(
-    router: &R,
+async fn delivered_to_itself<D: NodeDirectory>(
+    router: &RouterHandle<GrpcSender, D>,
     own: &TypedSender<CountingCodec>,
     shared: &Shared,
 ) -> Result<()> {
@@ -178,6 +176,7 @@ async fn delivered_to_itself<R: Router>(
         CountingCodec::FORMAT_ID,
         TIMEOUT,
     )?;
+    let attempted = router.sender().attempts();
     own.send(
         header(shared.node, request, ALPHA)?,
         Context::current(),
@@ -192,11 +191,15 @@ async fn delivered_to_itself<R: Router>(
                 stored.as_ref() == PAYLOAD,
                 "the registry stored a payload the sender never wrote"
             );
+            ensure!(
+                router.sender().attempts() == attempted,
+                "a same-node response must not enter the gRPC sender"
+            );
             return Ok(());
         }
         ensure!(
             Instant::now() < deadline,
-            "a response sent through the runtime's router never reached its own listener"
+            "a same-node response never reached the local registry"
         );
         yield_now().await;
     }

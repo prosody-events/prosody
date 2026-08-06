@@ -7,10 +7,11 @@ use super::{
     RELAY_FIELD_BYTES, ResponseFrame,
 };
 use crate::codec::Codec;
+use crate::response::FormatToken;
 use crate::response::ResponseStatus;
 use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION};
 use crate::router::{Framed, NodeId};
-use bytes::BufMut;
+use bytes::{BufMut, BytesMut};
 use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len};
 use std::error::Error;
 use thiserror::Error;
@@ -162,6 +163,20 @@ impl Framed for Staged<'_> {
     /// at the frame cap keeps it from ever having to.
     fn write<B: BufMut>(&self, dst: &mut B) {
         write_frame(self.header, self.format, self.payload, dst);
+    }
+}
+
+impl Staged<'_> {
+    /// Moves this process's response into the local request registry.
+    ///
+    /// Only the payload needs owned storage. The local path skips the protobuf
+    /// header, transport buffer, socket, and receive-side decode.
+    pub(in crate::response) fn local_frame(&self) -> ResponseFrame {
+        ResponseFrame {
+            header: self.header.clone(),
+            format: FormatToken::make(self.format),
+            payload: BytesMut::from(self.payload),
+        }
     }
 }
 

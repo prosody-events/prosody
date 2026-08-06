@@ -73,7 +73,8 @@ fn a_terminal_status_is_attempted_once_and_an_ambiguous_one_is_retried() -> Resu
         let attempts = router.fleet().config().max_send_attempts;
 
         // Nothing is registered under this id, so the node answers NOT_FOUND.
-        let (terminal, terminal_workers) = TypedSender::<CountingCodec>::new(&router, harness.cap)?;
+        let (terminal, terminal_workers) =
+            TypedSender::<CountingCodec>::new_without_local(&router, harness.cap)?;
         let served = TRANSPORT.served();
         let unregistered = register(&harness.oracle, &[ALPHA], CountingCodec::FORMAT_ID)?;
         terminal
@@ -92,7 +93,7 @@ fn a_terminal_status_is_attempted_once_and_an_ambiguous_one_is_retried() -> Resu
 
         // Addressed to another node, so this one answers UNAVAILABLE.
         let (ambiguous, ambiguous_workers) =
-            TypedSender::<CountingCodec>::new(&router, harness.cap)?;
+            TypedSender::<CountingCodec>::new_without_local(&router, harness.cap)?;
         let served = TRANSPORT.served();
         ambiguous
             .send(

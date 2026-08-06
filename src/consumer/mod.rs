@@ -182,6 +182,7 @@ pub(crate) mod probes;
 pub mod storage;
 mod sweep;
 mod wiring;
+pub(crate) use wiring::peer::PreparePeer;
 
 /// Atomic counter for tracking changes in partition watermarks.
 ///

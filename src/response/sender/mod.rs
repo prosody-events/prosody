@@ -5,13 +5,13 @@ mod metrics;
 mod worker;
 
 use self::metrics::{DropReason, Stage};
-use self::worker::{Job, WorkerContext, run_worker};
+use self::worker::{GrpcRoute, Job, LocalRoute, ResponseRoute, Then, WorkerContext, run_worker};
 use crate::codec::Codec;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::{FrameCap, FrameHeader};
-use crate::router::Router;
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::{FleetConfigurationError, validate_scratch_budget};
+use crate::router::{LocalTarget, RelayHop, Router, RouterHandle};
 use opentelemetry::Context;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -115,11 +115,47 @@ impl<C: Codec> TypedSender<C> {
     ///
     /// Returns [`FleetConfigurationError::ScratchBudget`] when one encode
     /// buffer per destination at `cap` exceeds what one sender may commit to.
-    pub(crate) fn new<R: Router>(
+    #[cfg(test)]
+    pub(crate) fn new_without_local<R: Router>(
         router: &R,
         cap: FrameCap,
     ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
-        let fleet = Arc::clone(router.fleet());
+        Self::build(router.fleet(), &GrpcRoute::new(router.clone()), cap)
+    }
+
+    /// Builds a sender that deposits responses for `local` without gRPC.
+    pub(crate) fn new<S, D>(
+        router: &RouterHandle<S, D>,
+        cap: FrameCap,
+    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError>
+    where
+        RouterHandle<S, D>: Router,
+    {
+        Self::build(
+            router.fleet(),
+            &Then::new(
+                LocalRoute::new(router.local().clone()),
+                GrpcRoute::new(router.clone()),
+            ),
+            cap,
+        )
+    }
+
+    /// Builds a sender that can only reach this process.
+    pub(crate) fn new_local(
+        local: LocalTarget,
+        fleet: &Arc<DestinationFleet>,
+        cap: FrameCap,
+    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
+        Self::build(fleet, &LocalRoute::new(local), cap)
+    }
+
+    fn build<R: ResponseRoute>(
+        fleet: &Arc<DestinationFleet>,
+        router: &R,
+        cap: FrameCap,
+    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
+        let fleet = Arc::clone(fleet);
         let config = fleet.config();
         validate_scratch_budget(config.max_destinations, cap)?;
         let counters = Arc::new(SendCounters::default());

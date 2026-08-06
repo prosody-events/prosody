@@ -21,10 +21,13 @@ use crate::requester::registry::PendingRegistry;
 use crate::response::sender::ResponseWorkers;
 use crate::router::NodeId;
 use crate::router::directory::{GroupMembership, NodeDirectory};
+use crate::router::fleet::config::FleetConfigurationError;
 use crate::router::grpc::BoundListener;
 use crate::router::grpc::health::ConsumerHealth;
-use crate::router::runtime::{PeerInputs, PeerRuntime, PreparedPeerRuntime};
-use crate::state_reader::PeerDirectoryBackend;
+use crate::router::runtime::{
+    LocalPeerRuntime, PeerInputs, PeerRuntime, PreparedLocalPeerRuntime, PreparedPeerRuntime,
+};
+use crate::state_reader::{LocalPeerMode, NetworkPeerMode, PeerDirectoryBackend};
 use crate::subsystem::SubsystemName;
 use rdkafka::consumer::{BaseConsumer, ConsumerContext};
 use std::future::Future;
@@ -76,8 +79,8 @@ pub(in crate::consumer) trait PeerAttachment: Sized + Send {
 pub(in crate::consumer) struct NoPeer;
 
 /// A served peer runtime waiting for the cluster id only a live client knows.
-pub(in crate::consumer) struct PreparedPeer<D: NodeDirectory> {
-    prepared: PreparedPeerRuntime<D>,
+pub(in crate::consumer) struct PreparedPeer<P: PreparedRuntime> {
+    prepared: P,
     /// `None` for a consumer that answers no request. See
     /// [`PeerAttachment::responder`].
     answering: Option<Answering>,
@@ -102,8 +105,8 @@ struct Answering {
 ///
 /// This value has no abandon method. Every construction site calls `terminate`
 /// next, so an abandon would have no caller.
-pub(in crate::consumer) struct PreparedResponder<D: NodeDirectory, R: Codec> {
-    peer: PreparedPeer<D>,
+pub(in crate::consumer) struct PreparedResponder<P: PreparedRuntime, R: Codec> {
+    peer: PreparedPeer<P>,
     responder: Arc<Responder<R>>,
 }
 
@@ -119,6 +122,45 @@ pub(in crate::consumer) struct PeerHandles {
     /// Held so a caller that asked for the report can also observe a
     /// coordinator that ended without one.
     coordinator: JoinHandle<()>,
+}
+
+/// A prepared runtime selected by the backend type.
+pub(crate) trait PreparedRuntime: Sized + Send {
+    type Running: RunningRuntime;
+
+    fn needs_cluster_id() -> bool;
+    fn prepared_node(&self) -> NodeId;
+    fn build_responder<C: Codec>(
+        &self,
+        subsystem: SubsystemName,
+    ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError>;
+    fn launch(
+        self,
+        group: Option<GroupMembership>,
+    ) -> impl Future<Output = Result<Self::Running, (Self, ConsumerError)>> + Send;
+    fn release(self) -> impl Future<Output = ()> + Send;
+}
+
+/// A running runtime with the common shutdown contract.
+pub(crate) trait RunningRuntime: Sized + Send + 'static {
+    fn registry(&self) -> &Arc<PendingRegistry>;
+    fn stop<F, Fut>(self, drain: F) -> impl Future<Output = Result<(), ShutdownError>> + Send
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = ()> + Send;
+}
+
+/// Prepares the runtime selected by one backend family.
+pub(crate) trait PreparePeer<B: PeerDirectoryBackend> {
+    type Runtime: PreparedRuntime;
+
+    fn prepare<P: Send + Sync + 'static>(
+        peer: &PeerConfiguration,
+        backend: &B,
+        mock: bool,
+        managers: Arc<Managers<P>>,
+        heartbeats: &HeartbeatRegistry,
+    ) -> impl Future<Output = Result<Self::Runtime, ConsumerError>> + Send;
 }
 
 impl Answering {
@@ -174,7 +216,7 @@ impl PeerHandles {
     }
 }
 
-impl<D: NodeDirectory, R: Codec> PreparedResponder<D, R> {
+impl<P: PreparedRuntime, R: Codec> PreparedResponder<P, R> {
     /// Terminates `chain` with a handler that answers peer requests, and hands
     /// back the attachment startup activates.
     ///
@@ -183,7 +225,7 @@ impl<D: NodeDirectory, R: Codec> PreparedResponder<D, R> {
         self,
         chain: &M,
         handler: H,
-    ) -> (M::Provider<RespondingLeaf<H, R>>, PreparedPeer<D>)
+    ) -> (M::Provider<RespondingLeaf<H, R>>, PreparedPeer<P>)
     where
         M: HandlerMiddleware<H::Payload>,
         H: FallibleHandler + Clone + Send + Sync + 'static,
@@ -205,7 +247,7 @@ impl<D: NodeDirectory, R: Codec> PreparedResponder<D, R> {
     /// that reason: in production the two are built together.
     #[cfg(test)]
     pub(in crate::consumer) fn from_parts(
-        mut peer: PreparedPeer<D>,
+        mut peer: PreparedPeer<P>,
         responder: Responder<R>,
         workers: ResponseWorkers,
     ) -> Self {
@@ -239,11 +281,14 @@ impl PeerAttachment for NoPeer {
     async fn abandon(self) {}
 }
 
-impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
+impl<P: PreparedRuntime> PeerAttachment for PreparedPeer<P> {
     fn cluster_id<Ctx: ConsumerContext>(
         consumer: &BaseConsumer<Ctx>,
         observer: &KafkaObserver,
     ) -> Option<String> {
+        if !P::needs_cluster_id() {
+            return None;
+        }
         let cluster = observer.cluster_id(consumer);
         if cluster.is_none() {
             warn!("Kafka cluster id is missing; peer registration omits group membership");
@@ -265,8 +310,8 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
             prepared,
             answering,
         } = self;
-        let node = prepared.node();
-        let runtime = match prepared.activate(group).await {
+        let node = prepared.prepared_node();
+        let runtime = match prepared.launch(group).await {
             Ok(runtime) => runtime,
             Err((prepared, error)) => {
                 return Err((
@@ -282,7 +327,7 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
             }
         };
         let workers = answering.map(|answering| answering.workers);
-        let pending = Arc::clone(runtime.pending());
+        let pending = Arc::clone(runtime.registry());
         let (stop, stopped) = oneshot::channel();
         let coordinator = tokio::spawn(run_coordinator(runtime, workers, stopped));
         Ok(Some(PeerHandles {
@@ -296,10 +341,163 @@ impl<D: NodeDirectory> PeerAttachment for PreparedPeer<D> {
     async fn abandon(self) {
         // Stop the listener and registry first. Join workers after the caller
         // releases the provider that holds the last responder clone.
-        self.prepared.abandon().await;
+        self.prepared.release().await;
         if let Some(answering) = self.answering {
             answering.workers.join().await;
         }
+    }
+}
+
+impl<D: NodeDirectory> PreparedRuntime for PreparedPeerRuntime<D> {
+    type Running = PeerRuntime<D>;
+
+    fn needs_cluster_id() -> bool {
+        true
+    }
+
+    fn prepared_node(&self) -> NodeId {
+        self.node()
+    }
+
+    fn build_responder<C: Codec>(
+        &self,
+        subsystem: SubsystemName,
+    ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
+        self.responder(subsystem)
+    }
+
+    async fn launch(
+        self,
+        group: Option<GroupMembership>,
+    ) -> Result<Self::Running, (Self, ConsumerError)> {
+        self.activate(group).await.map_err(|(prepared, error)| {
+            (
+                prepared,
+                PeerInitError::Directory {
+                    message: format!("{error:#}"),
+                }
+                .into(),
+            )
+        })
+    }
+
+    async fn release(self) {
+        self.abandon().await;
+    }
+}
+
+impl PreparedRuntime for PreparedLocalPeerRuntime {
+    type Running = LocalPeerRuntime;
+
+    fn needs_cluster_id() -> bool {
+        false
+    }
+
+    fn prepared_node(&self) -> NodeId {
+        self.node()
+    }
+
+    fn build_responder<C: Codec>(
+        &self,
+        subsystem: SubsystemName,
+    ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
+        self.responder(subsystem)
+    }
+
+    async fn launch(
+        self,
+        _group: Option<GroupMembership>,
+    ) -> Result<Self::Running, (Self, ConsumerError)> {
+        Ok(self.activate())
+    }
+
+    async fn release(self) {
+        self.abandon().await;
+    }
+}
+
+impl<D: NodeDirectory> RunningRuntime for PeerRuntime<D> {
+    fn registry(&self) -> &Arc<PendingRegistry> {
+        self.pending()
+    }
+
+    async fn stop<F, Fut>(self, drain: F) -> Result<(), ShutdownError>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = ()> + Send,
+    {
+        self.shutdown(drain)
+            .await
+            .map_err(|error| ShutdownError::Directory {
+                message: format!("{error:#}"),
+            })
+    }
+}
+
+impl RunningRuntime for LocalPeerRuntime {
+    fn registry(&self) -> &Arc<PendingRegistry> {
+        self.pending()
+    }
+
+    async fn stop<F, Fut>(self, drain: F) -> Result<(), ShutdownError>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = ()> + Send,
+    {
+        self.shutdown(drain).await;
+        Ok(())
+    }
+}
+
+impl<B: PeerDirectoryBackend> PreparePeer<B> for NetworkPeerMode {
+    type Runtime = PreparedPeerRuntime<B::Directory>;
+
+    async fn prepare<P: Send + Sync + 'static>(
+        peer: &PeerConfiguration,
+        backend: &B,
+        mock: bool,
+        managers: Arc<Managers<P>>,
+        heartbeats: &HeartbeatRegistry,
+    ) -> Result<Self::Runtime, ConsumerError> {
+        let parts = peer.parts().map_err(PeerInitError::from)?;
+        let listener = BoundListener::bind(&parts.transport)
+            .await
+            .map_err(|error| PeerInitError::Listener {
+                message: format!("{error:#}"),
+            })?;
+        let directory = backend.node_directory(parts.lease, mock).await?;
+        PreparedPeerRuntime::start(PeerInputs {
+            directory,
+            listener,
+            health: ConsumerHealth::new(managers, heartbeats.clone()),
+            probe: parts.probe,
+            router: &parts.router,
+            fleet: parts.fleet,
+            requester: &parts.requester,
+        })
+        .await
+        .map_err(PeerInitError::from)
+        .map_err(ConsumerError::from)
+    }
+}
+
+impl<B: PeerDirectoryBackend> PreparePeer<B> for LocalPeerMode {
+    type Runtime = PreparedLocalPeerRuntime;
+
+    async fn prepare<P: Send + Sync + 'static>(
+        peer: &PeerConfiguration,
+        _backend: &B,
+        mock: bool,
+        _managers: Arc<Managers<P>>,
+        _heartbeats: &HeartbeatRegistry,
+    ) -> Result<Self::Runtime, ConsumerError> {
+        if !mock {
+            return Err(PeerInitError::MemoryDirectory.into());
+        }
+        let parts = peer.parts().map_err(PeerInitError::from)?;
+        PreparedLocalPeerRuntime::start(parts.transport.frame_cap, parts.fleet, &parts.requester)
+            .map_err(PeerInitError::from)
+            .map_err(ConsumerError::from)
     }
 }
 
@@ -323,29 +521,13 @@ pub(in crate::consumer) async fn prepare_requester<B, P>(
     mock: bool,
     managers: Arc<Managers<P>>,
     heartbeats: &HeartbeatRegistry,
-) -> Result<PreparedPeer<B::Directory>, ConsumerError>
+) -> Result<PreparedPeer<<B::PeerMode as PreparePeer<B>>::Runtime>, ConsumerError>
 where
     B: PeerDirectoryBackend,
+    B::PeerMode: PreparePeer<B>,
     P: Send + Sync + 'static,
 {
-    let parts = peer.parts().map_err(PeerInitError::from)?;
-    let listener = BoundListener::bind(&parts.transport)
-        .await
-        .map_err(|error| PeerInitError::Listener {
-            message: format!("{error:#}"),
-        })?;
-    let directory = backend.node_directory(parts.lease, mock).await?;
-    let prepared = PreparedPeerRuntime::start(PeerInputs {
-        directory,
-        listener,
-        health: ConsumerHealth::new(managers, heartbeats.clone()),
-        probe: parts.probe,
-        router: &parts.router,
-        fleet: parts.fleet,
-        requester: &parts.requester,
-    })
-    .await
-    .map_err(PeerInitError::from)?;
+    let prepared = B::PeerMode::prepare(peer, backend, mock, managers, heartbeats).await?;
     Ok(PreparedPeer {
         prepared,
         answering: None,
@@ -368,14 +550,15 @@ pub(in crate::consumer) async fn prepare_responding<R, B, P>(
     subsystem: SubsystemName,
     managers: Arc<Managers<P>>,
     heartbeats: &HeartbeatRegistry,
-) -> Result<PreparedResponder<B::Directory, R>, ConsumerError>
+) -> Result<PreparedResponder<<B::PeerMode as PreparePeer<B>>::Runtime, R>, ConsumerError>
 where
     R: Codec,
     B: PeerDirectoryBackend,
+    B::PeerMode: PreparePeer<B>,
     P: Send + Sync + 'static,
 {
     let mut peer = prepare_requester(peer, backend, mock, managers, heartbeats).await?;
-    match peer.prepared.responder(subsystem) {
+    match peer.prepared.build_responder(subsystem) {
         Ok((responder, workers)) => {
             peer.answering = Some(Answering::new(&responder, workers));
             Ok(PreparedResponder {
@@ -400,8 +583,8 @@ where
 /// is also a request to stop, so a consumer dropped without a shutdown still
 /// tears the peer down. Nothing waits for that teardown, so its report goes to
 /// the log.
-async fn run_coordinator<D: NodeDirectory>(
-    runtime: PeerRuntime<D>,
+async fn run_coordinator<R: RunningRuntime>(
+    runtime: R,
     workers: Option<ResponseWorkers>,
     stopped: oneshot::Receiver<oneshot::Sender<Result<(), ShutdownError>>>,
 ) {
@@ -409,15 +592,12 @@ async fn run_coordinator<D: NodeDirectory>(
     // shape both arms can share. Who asked decides where the report goes.
     let reply = stopped.await;
     let report = runtime
-        .shutdown(|| async move {
+        .stop(|| async move {
             if let Some(workers) = workers {
                 workers.join().await;
             }
         })
-        .await
-        .map_err(|error| ShutdownError::Directory {
-            message: format!("{error:#}"),
-        });
+        .await;
     match reply {
         Ok(reply) => {
             if let Err(report) = reply.send(report) {

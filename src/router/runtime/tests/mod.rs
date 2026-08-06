@@ -161,12 +161,16 @@ impl Process {
             let (transport, _deliveries) = LoopbackSender::new();
             transport.script(port(0), Script::Hold(Arc::clone(&barrier)));
             let router = RouterHandle::new(
+                runtime.node(),
+                Arc::clone(runtime.pending()),
                 runtime.addresses().clone(),
                 Arc::clone(runtime.fleet()),
                 Arc::new(transport),
                 None,
             );
-            Ok(TypedSender::<CountingCodec>::new(&router, cap)?)
+            Ok(TypedSender::<CountingCodec>::new_without_local(
+                &router, cap,
+            )?)
         }
         .await;
         let (sender, workers) = match prepared {

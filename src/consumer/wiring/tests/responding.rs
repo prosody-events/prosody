@@ -102,7 +102,7 @@ async fn the_responding_wiring_answers_a_tagged_message() -> Result<()> {
     let heartbeats = HeartbeatRegistry::new(consumer.group_id.clone(), consumer.stall_threshold);
     let peer = prepare_requester(&peer_config, &backend, true, managers, &heartbeats).await?;
     let (router, mut deliveries) = TestRouter::new(config(1, 1))?;
-    let (responder, workers) = Responder::<SomeResponseCodec>::new(
+    let (responder, workers) = Responder::<SomeResponseCodec>::new_without_local(
         &router,
         FrameCap::new(RESPONSE_CAP_BYTES)?,
         SubsystemName::try_new(SUBSYSTEM)?,

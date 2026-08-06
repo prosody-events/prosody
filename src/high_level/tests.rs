@@ -150,8 +150,7 @@ impl FallibleHandler for EchoHandler {
     async fn shutdown(self) {}
 }
 
-/// A mock client asks itself through Kafka, its listener, and the response
-/// wire.
+/// A mock client asks itself through Kafka and the bounded local response path.
 #[test]
 fn a_mock_client_round_trips_one_peer_request() -> Result<()> {
     init_test_logging();

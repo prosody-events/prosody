@@ -29,7 +29,9 @@ pub(crate) mod tests;
 pub use backend::{
     CassandraReaderBackend, CommittedCellSource, MemoryReaderBackend, ReaderBackend,
 };
-pub(crate) use backend::{ConsumerReaderBackend, PeerDirectoryBackend};
+pub(crate) use backend::{
+    ConsumerReaderBackend, LocalPeerMode, NetworkPeerMode, PeerDirectoryBackend,
+};
 pub use client::{CassandraStateReaderClient, StateReaderClient};
 pub use deps::StateReaderDependencies;
 pub use error::StateReaderError;

@@ -29,8 +29,8 @@ use crate::router::directory::memory::{MEMORY_DIRECTORY_CAPACITY, MemoryNodeDire
 use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
-use crate::state_reader::PeerDirectoryBackend;
 use crate::state_reader::{MemoryReaderBackend, ReaderBackend, StateReaderDependencies};
+use crate::state_reader::{NetworkPeerMode, PeerDirectoryBackend};
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::timers::UncommittedTimer;
@@ -177,6 +177,7 @@ impl NodeDirectory for RecordingDirectory {
 
 impl PeerDirectoryBackend for RecordingBackend {
     type Directory = RecordingDirectory;
+    type PeerMode = NetworkPeerMode;
 
     async fn node_directory(
         &self,
@@ -232,6 +233,7 @@ impl ConsumerStorageBackend<JsonCodec> for RecordingMemoryBackend {
 
 impl PeerDirectoryBackend for RecordingMemoryBackend {
     type Directory = RecordingDirectory;
+    type PeerMode = NetworkPeerMode;
 
     async fn node_directory(
         &self,

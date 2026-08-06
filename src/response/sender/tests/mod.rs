@@ -63,7 +63,7 @@ impl Harness {
     }
 
     fn over(router: TestRouter, deliveries: UnboundedReceiver<Delivery>) -> Result<Self> {
-        let (sender, workers) = TypedSender::new(&router, FrameCap::new(CAP_BYTES)?)?;
+        let (sender, workers) = TypedSender::new_without_local(&router, FrameCap::new(CAP_BYTES)?)?;
         Ok(Self {
             sender,
             workers,

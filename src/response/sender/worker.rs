@@ -4,12 +4,14 @@
 use super::metrics::{DropReason, Stage, record_fallback, record_rate_limited};
 use crate::codec::Codec;
 use crate::otel::carry_parent;
+use crate::response::ResponseDisposition;
 use crate::response::frame::FrameHeader;
-use crate::response::frame::encode::FrameEncoder;
+use crate::response::frame::encode::{FrameEncoder, Staged};
 use crate::router::directory::Endpoint;
 use crate::router::fleet::Destination;
 use crate::router::{Framed, Preference, ResponseSender, Router, SendFailure};
 use opentelemetry::Context;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use tokio::select;
@@ -19,7 +21,7 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 use tracing::field::Empty;
 use tracing::{Instrument, debug_span, warn};
 
-use super::SendCounters;
+use super::{LocalTarget, SendCounters};
 
 /// One in this many of the deadline that is left is what an endpoint keeps for
 /// the fallback behind it — and all an endpoint that has never answered may
@@ -31,6 +33,53 @@ pub(super) struct WorkerContext<R> {
     pub(super) router: R,
     pub(super) attempts: u32,
     pub(super) counters: Arc<SendCounters>,
+}
+
+/// One response route in a statically composed route chain.
+pub(super) trait ResponseRoute: Clone + Send + Sync + 'static {
+    /// Tries this route. `Declined` lets the next route try the same frame.
+    fn deliver<C: Codec>(
+        &self,
+        encoder: &mut FrameEncoder<C>,
+        header: &FrameHeader,
+        payload: C::Payload,
+        destination: &Destination,
+        attempts: u32,
+        expires_at: Instant,
+    ) -> impl Future<Output = Result<RouteOutcome<C::Payload>, DropReason>> + Send;
+}
+
+/// A route that deposits frames into this process's request registry.
+#[derive(Clone)]
+pub(super) struct LocalRoute(LocalTarget);
+
+/// A route that resolves and sends frames through gRPC.
+#[derive(Clone)]
+pub(super) struct GrpcRoute<R>(R);
+
+/// Two routes evaluated in order.
+#[derive(Clone)]
+pub(super) struct Then<A, B> {
+    first: A,
+    next: B,
+}
+
+impl LocalRoute {
+    pub(super) fn new(target: LocalTarget) -> Self {
+        Self(target)
+    }
+}
+
+impl<R> GrpcRoute<R> {
+    pub(super) fn new(router: R) -> Self {
+        Self(router)
+    }
+}
+
+impl<A, B> Then<A, B> {
+    pub(super) fn new(first: A, next: B) -> Self {
+        Self { first, next }
+    }
 }
 
 /// One response, waiting for its turn on a destination.
@@ -111,7 +160,7 @@ impl Share {
 /// It is a child of the trace the job carries, so the listener's
 /// `peer.response.receive` — parented on the context this span's own injection
 /// writes — lands under the call that asked for the response.
-pub(super) async fn run_worker<C: Codec, R: Router>(
+pub(super) async fn run_worker<C: Codec, R: ResponseRoute>(
     mut queue: Receiver<Job<C>>,
     context: WorkerContext<R>,
     mut encoder: FrameEncoder<C>,
@@ -156,7 +205,13 @@ pub(super) async fn run_worker<C: Codec, R: Router>(
         // level-disabled span never becomes current, and the deadline arm has
         // already left the instrumented future in any case.
         match outcome {
-            Ok((preference, from)) => {
+            Ok(Delivery::Local) => {
+                span.record("peer.disposition", "delivered");
+                span.record("peer.preference", "local");
+                Stage::Delivered.record();
+                context.counters.sent.fetch_add(1, Relaxed);
+            }
+            Ok(Delivery::Remote { preference, from }) => {
                 span.record("peer.disposition", "delivered");
                 span.record("peer.preference", preference.label());
                 if let Some(from) = from {
@@ -194,94 +249,204 @@ pub(super) async fn run_worker<C: Codec, R: Router>(
 /// The *time* budget is split the same way, and for the same reason. [`Share`]
 /// owns how much of it one endpoint may spend, and the endpoint this
 /// destination remembers is the one that gets the larger part.
-async fn deliver_job<C: Codec, R: Router>(
+async fn deliver_job<C: Codec, R: ResponseRoute>(
     encoder: &mut FrameEncoder<C>,
     destination: &Destination,
     context: &WorkerContext<R>,
     header: FrameHeader,
     payload: C::Payload,
     expires_at: Instant,
-) -> Result<(Preference, Option<Preference>), DropReason> {
-    // No address originates anywhere but a registration: a node the directory
-    // does not hold is not dialed at all, and a node the rules refuse to reach
-    // from here is not dialed either.
-    let route = match context.router.route(header.target).await {
-        Ok(Some(route)) => route,
-        Ok(None) => return Err(DropReason::UnresolvableNode),
-        Err(error) => {
-            warn!(%error, node = %header.target, "peer route lookup failed");
-            return Err(DropReason::LookupFailed);
-        }
-    };
-    let staged = match encoder.stage(&header, payload) {
-        Ok(staged) => staged,
-        Err(error) => {
-            warn!(%error, node = %header.target, "response could not be framed");
-            return Err(DropReason::EncodeFailed);
-        }
-    };
-    Stage::Framed.record();
-    let mut remembered = None;
-    let mut last_failure = None;
-    // The candidate that failed the turn before this one. Inside the loop it
-    // proves this is no longer the first candidate, and it is the `from` of a
-    // fallback.
-    let mut previous = None;
-    let preferred = destination.preferred();
-    let candidates = route.candidates(preferred);
-    let has_fallback = candidates[1].is_some();
-    let proven = candidates[0].is_some_and(|(preference, _)| Some(preference) == preferred);
-    for (preference, address) in candidates.into_iter().flatten() {
-        let share = if previous.is_some() || !has_fallback {
-            Share::Rest
-        } else if proven {
-            Share::Most
-        } else {
-            Share::Probe
-        };
-        match deliver(
-            context.router.sender(),
+) -> Result<Delivery, DropReason> {
+    match context
+        .router
+        .deliver(
+            encoder,
+            &header,
+            payload,
             destination,
-            address,
-            &staged,
             context.attempts,
             expires_at,
-            share,
         )
-        .await
-        {
-            Ok(()) => {
-                destination.prefer(Some(preference));
-                return Ok((preference, previous));
-            }
-            Err(failure) => {
-                last_failure = Some((preference, failure));
-                if !failure.is_wrong_endpoint() {
-                    // A failure that is not a wrong endpoint is a status the
-                    // path answered, so this endpoint is the one that reaches
-                    // the node — refusal and all. Every other failure proves
-                    // nothing about which endpoint serves the node, so it
-                    // leaves nothing remembered.
-                    remembered = Some(preference);
-                    break;
-                }
-                previous = Some(preference);
-            }
+        .await?
+    {
+        RouteOutcome::Delivered(delivery) => Ok(delivery),
+        RouteOutcome::Declined(_) => Err(DropReason::UnresolvableNode),
+    }
+}
+
+impl ResponseRoute for LocalRoute {
+    async fn deliver<C: Codec>(
+        &self,
+        encoder: &mut FrameEncoder<C>,
+        header: &FrameHeader,
+        payload: C::Payload,
+        destination: &Destination,
+        _attempts: u32,
+        _expires_at: Instant,
+    ) -> Result<RouteOutcome<C::Payload>, DropReason> {
+        if !self.0.owns(header.target) {
+            return Ok(RouteOutcome::Declined(payload));
+        }
+        let staged = stage(encoder, header, payload)?;
+        pace(destination).await;
+        let disposition = self.0.accept(staged.local_frame());
+        disposition.record();
+        if disposition == ResponseDisposition::Accepted {
+            Ok(RouteOutcome::Delivered(Delivery::Local))
+        } else {
+            Err(DropReason::SendFailed)
         }
     }
-    destination.prefer(remembered);
-    if let Some((preference, failure)) = last_failure {
-        // What the walk did, not what the route offered. The last turn sets
-        // `previous` as well, so a route of one candidate needs both terms.
-        warn!(
-            %failure,
-            node = %header.target,
-            preference = preference.label(),
-            fell_back = has_fallback && previous.is_some(),
-            "response delivery failed"
-        );
+}
+
+impl<R: Router> ResponseRoute for GrpcRoute<R> {
+    async fn deliver<C: Codec>(
+        &self,
+        encoder: &mut FrameEncoder<C>,
+        header: &FrameHeader,
+        payload: C::Payload,
+        destination: &Destination,
+        attempts: u32,
+        expires_at: Instant,
+    ) -> Result<RouteOutcome<C::Payload>, DropReason> {
+        let target = header.target;
+        // No address originates anywhere but a registration: a node the directory
+        // does not hold is not dialed at all, and a node the rules refuse to reach
+        // from here is not dialed either.
+        let route = match self.0.route(target).await {
+            Ok(Some(route)) => route,
+            Ok(None) => return Ok(RouteOutcome::Declined(payload)),
+            Err(error) => {
+                warn!(%error, node = %target, "peer route lookup failed");
+                return Err(DropReason::LookupFailed);
+            }
+        };
+        let staged = stage(encoder, header, payload)?;
+        let mut remembered = None;
+        let mut last_failure = None;
+        // The candidate that failed the turn before this one. Inside the loop it
+        // proves this is no longer the first candidate, and it is the `from` of a
+        // fallback.
+        let mut previous = None;
+        let preferred = destination.preferred();
+        let candidates = route.candidates(preferred);
+        let has_fallback = candidates[1].is_some();
+        let proven = candidates[0].is_some_and(|(preference, _)| Some(preference) == preferred);
+        for (preference, address) in candidates.into_iter().flatten() {
+            let share = if previous.is_some() || !has_fallback {
+                Share::Rest
+            } else if proven {
+                Share::Most
+            } else {
+                Share::Probe
+            };
+            match deliver(
+                self.0.sender(),
+                destination,
+                address,
+                &staged,
+                attempts,
+                expires_at,
+                share,
+            )
+            .await
+            {
+                Ok(()) => {
+                    destination.prefer(Some(preference));
+                    return Ok(RouteOutcome::Delivered(Delivery::Remote {
+                        preference,
+                        from: previous,
+                    }));
+                }
+                Err(failure) => {
+                    last_failure = Some((preference, failure));
+                    if !failure.is_wrong_endpoint() {
+                        // A failure that is not a wrong endpoint is a status the
+                        // path answered, so this endpoint is the one that reaches
+                        // the node — refusal and all. Every other failure proves
+                        // nothing about which endpoint serves the node, so it
+                        // leaves nothing remembered.
+                        remembered = Some(preference);
+                        break;
+                    }
+                    previous = Some(preference);
+                }
+            }
+        }
+        destination.prefer(remembered);
+        if let Some((preference, failure)) = last_failure {
+            // What the walk did, not what the route offered. The last turn sets
+            // `previous` as well, so a route of one candidate needs both terms.
+            warn!(
+                %failure,
+                node = %target,
+                preference = preference.label(),
+                fell_back = has_fallback && previous.is_some(),
+                "response delivery failed"
+            );
+        }
+        Err(DropReason::SendFailed)
     }
-    Err(DropReason::SendFailed)
+}
+
+impl<A: ResponseRoute, B: ResponseRoute> ResponseRoute for Then<A, B> {
+    async fn deliver<C: Codec>(
+        &self,
+        encoder: &mut FrameEncoder<C>,
+        header: &FrameHeader,
+        payload: C::Payload,
+        destination: &Destination,
+        attempts: u32,
+        expires_at: Instant,
+    ) -> Result<RouteOutcome<C::Payload>, DropReason> {
+        match self
+            .first
+            .deliver(encoder, header, payload, destination, attempts, expires_at)
+            .await?
+        {
+            RouteOutcome::Declined(payload) => {
+                self.next
+                    .deliver(encoder, header, payload, destination, attempts, expires_at)
+                    .await
+            }
+            delivered @ RouteOutcome::Delivered(_) => Ok(delivered),
+        }
+    }
+}
+
+/// How a response reached its requester.
+pub(super) enum Delivery {
+    /// The local registry accepted it without transport work.
+    Local,
+    /// A remote endpoint accepted it, after an optional fallback.
+    Remote {
+        preference: Preference,
+        from: Option<Preference>,
+    },
+}
+
+/// Whether one route accepted a frame or left it for the next route.
+pub(super) enum RouteOutcome<P> {
+    Declined(P),
+    Delivered(Delivery),
+}
+
+/// Encodes one payload and records the common frame stage.
+fn stage<'a, C: Codec>(
+    encoder: &'a mut FrameEncoder<C>,
+    header: &'a FrameHeader,
+    payload: C::Payload,
+) -> Result<Staged<'a>, DropReason> {
+    match encoder.stage(header, payload) {
+        Ok(staged) => {
+            Stage::Framed.record();
+            Ok(staged)
+        }
+        Err(error) => {
+            warn!(%error, node = %header.target, "response could not be framed");
+            Err(DropReason::EncodeFailed)
+        }
+    }
 }
 
 /// Delivers one frame to one endpoint, trying again only for a failure another

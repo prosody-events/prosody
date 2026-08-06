@@ -1,4 +1,6 @@
 use super::{NodeId, Preference, RelayHop, Router, RouterHandle, SendFailure, choose_route};
+use crate::requester::config::RequesterConfiguration;
+use crate::requester::registry::PendingRegistry;
 use crate::router::Host;
 use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::tests::support::{membership, memory_directory, registration};
@@ -104,6 +106,8 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
 
         let (transport, _recorded) = LoopbackSender::new();
         let router = RouterHandle::new(
+            NodeId::new(),
+            PendingRegistry::new(&RequesterConfiguration::default())?,
             AddressResolver::new(CACHE_CAPACITY, directory),
             Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
             Arc::new(transport),
@@ -164,6 +168,8 @@ fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<(
 
         let (transport, _recorded) = LoopbackSender::new();
         let router = RouterHandle::new(
+            NodeId::new(),
+            PendingRegistry::new(&RequesterConfiguration::default())?,
             AddressResolver::new(CACHE_CAPACITY, directory.clone()),
             Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
             Arc::new(transport),

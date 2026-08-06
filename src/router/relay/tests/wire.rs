@@ -312,7 +312,7 @@ async fn crossing(pair: &Pair) -> Result<()> {
     )?;
 
     let forwarded = TRANSPORT.forwarded();
-    let (sender, workers) = TypedSender::<CountingCodec>::new(&router, cap)?;
+    let (sender, workers) = TypedSender::<CountingCodec>::new_without_local(&router, cap)?;
     sender
         .send(
             FrameHeader {

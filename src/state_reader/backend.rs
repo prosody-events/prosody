@@ -1,6 +1,7 @@
 //! Concrete component families used by standalone readers.
 
 use crate::codec::Codec;
+use crate::consumer::PreparePeer;
 use crate::consumer::middleware::deduplication::{
     CassandraDeduplicationStoreProvider, MemoryDeduplicationStoreProvider,
 };
@@ -180,9 +181,17 @@ where
     fn loader(&self) -> &Self::Loader;
 }
 
+/// Selects a peer runtime with local and gRPC routes.
+pub(crate) struct NetworkPeerMode;
+
+/// Selects a peer runtime with only the local route.
+pub(crate) struct LocalPeerMode;
+
 /// A backend that supplies the node directory for its storage family.
-pub(crate) trait PeerDirectoryBackend: Send + Sync + 'static {
+pub(crate) trait PeerDirectoryBackend: Send + Sync + Sized + 'static {
     type Directory: NodeDirectory;
+    /// The peer runtime that matches this storage family.
+    type PeerMode: PreparePeer<Self>;
 
     fn node_directory(
         &self,
@@ -278,6 +287,7 @@ pub type MemoryReaderBackend<C> = ReaderComponents<
 
 impl<C: Codec> PeerDirectoryBackend for CassandraReaderBackend<C> {
     type Directory = CassandraNodeDirectory;
+    type PeerMode = NetworkPeerMode;
 
     async fn node_directory(
         &self,
@@ -299,6 +309,7 @@ impl<C: Codec> PeerDirectoryBackend for CassandraReaderBackend<C> {
 /// mode.
 impl<C: Codec> PeerDirectoryBackend for MemoryReaderBackend<C> {
     type Directory = MemoryNodeDirectory;
+    type PeerMode = LocalPeerMode;
 
     async fn node_directory(
         &self,

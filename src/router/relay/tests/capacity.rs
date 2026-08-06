@@ -65,7 +65,7 @@ fn a_flood_of_forwards_cannot_take_a_busy_cell() -> Result<()> {
 
         // This process's own response takes the first cell and holds it.
         let (sender, workers) =
-            TypedSender::<CountingCodec>::new(&router, FrameCap::new(CAP_BYTES)?)?;
+            TypedSender::<CountingCodec>::new_without_local(&router, FrameCap::new(CAP_BYTES)?)?;
         sender
             .send(header(OWN)?, Context::current(), PAYLOAD.to_vec())
             .map_err(|_| eyre!("the fleet refused this process's own response"))?;

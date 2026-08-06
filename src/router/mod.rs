@@ -1,9 +1,11 @@
 //! Reaching any prosody process by id.
 //!
-//! Every peer feature routes through here, and nothing in this module knows
-//! what a response is — [`NodeId`] and a frame's bytes are the only vocabulary
-//! it shares with them.
+//! Every peer feature routes through here. Remote paths know only a [`NodeId`]
+//! and frame bytes. The local target owns this process's request registry.
 
+use crate::requester::registry::PendingRegistry;
+use crate::response::ResponseDisposition;
+use crate::response::frame::ResponseFrame;
 use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
@@ -88,6 +90,33 @@ pub(crate) enum Preference {
 pub(crate) struct Route {
     first: (Preference, Endpoint),
     second: Option<(Preference, Endpoint)>,
+}
+
+/// This process's node id and the request registry that serves it.
+///
+/// Both values exist together. Thus, a production router always has a local
+/// delivery path, and no caller can pair its node with another registry.
+#[derive(Clone)]
+pub(crate) struct LocalTarget {
+    node: NodeId,
+    registry: Arc<PendingRegistry>,
+}
+
+impl LocalTarget {
+    /// Binds one process identity to its request registry.
+    pub(in crate::router) fn new(node: NodeId, registry: Arc<PendingRegistry>) -> Self {
+        Self { node, registry }
+    }
+
+    /// Whether this target owns `node`.
+    pub(crate) fn owns(&self, node: NodeId) -> bool {
+        self.node == node
+    }
+
+    /// Deposits one same-node response into this process's registry.
+    pub(crate) fn accept(&self, frame: ResponseFrame) -> ResponseDisposition {
+        self.registry.accept(frame)
+    }
 }
 
 /// One frame, as bytes on the wire.
@@ -192,9 +221,10 @@ pub(crate) trait Router: RelayHop {
     ) -> impl Future<Output = Result<Option<Route>, Self::Error>> + Send;
 }
 
-/// The production [`Router`]: addresses from the directory's bounded cache,
-/// frames through one transport, slots from the one fleet the process owns.
+/// The production [`Router`]: one required local target, cached peer addresses,
+/// one remote transport, and the process's destination fleet.
 pub(crate) struct RouterHandle<S, D> {
+    local: LocalTarget,
     addresses: AddressResolver<D>,
     fleet: Arc<DestinationFleet>,
     transport: Arc<S>,
@@ -238,6 +268,7 @@ impl Display for NodeId {
 impl<S, D: Clone> Clone for RouterHandle<S, D> {
     fn clone(&self) -> Self {
         Self {
+            local: self.local.clone(),
             addresses: self.addresses.clone(),
             fleet: Arc::clone(&self.fleet),
             transport: Arc::clone(&self.transport),
@@ -249,17 +280,25 @@ impl<S, D: Clone> Clone for RouterHandle<S, D> {
 impl<S, D> RouterHandle<S, D> {
     /// Binds one process's resolver, fleet and transport together.
     pub(in crate::router) fn new(
+        local: NodeId,
+        registry: Arc<PendingRegistry>,
         addresses: AddressResolver<D>,
         fleet: Arc<DestinationFleet>,
         transport: Arc<S>,
         here: Option<NetworkId>,
     ) -> Self {
         Self {
+            local: LocalTarget::new(local, registry),
             addresses,
             fleet,
             transport,
             here,
         }
+    }
+
+    /// This process's node id.
+    pub(crate) const fn local(&self) -> &LocalTarget {
+        &self.local
     }
 }
 
