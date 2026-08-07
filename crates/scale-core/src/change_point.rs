@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 /// A continuous-time persistence-or-redraw transition kernel.
 ///
 /// The retained probability is `exp(-rate * elapsed)`. This definition makes
@@ -31,4 +33,3 @@ pub(crate) struct TransitionProbabilities {
     pub(crate) retained: f64,
     pub(crate) redrawn: f64,
 }
-use std::time::Duration;
