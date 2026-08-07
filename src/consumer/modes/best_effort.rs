@@ -10,7 +10,7 @@ use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::{build_common_middleware, build_typed_state};
 use crate::consumer::{Managers, ProsodyConsumer};
-use crate::peer::{NoPeer, prepare_requester, prepare_responding};
+use crate::peer::{NoPeer, Router};
 use crate::state_reader::ConsumerReaderBackend;
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity, EventType};
@@ -27,10 +27,11 @@ where
     /// messages once, logs any failures, and moves on. This approach should
     /// only be used for development or for services where occasional
     /// message loss is acceptable.
-    pub(crate) async fn best_effort_consumer<T, B>(
+    pub(crate) async fn best_effort_consumer<T, B, RT: Router>(
         setup: TypedConsumerSetup<'_, C, B>,
         telemetry: Telemetry,
         handler: T,
+        _router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
@@ -59,46 +60,27 @@ where
             observer,
             managers: Arc::clone(&managers),
         };
-        // Preparation is the last fallible step of this mode: no `?` after it
-        // could drop a served listener.
-        match setup.common.peer.as_ref() {
-            Some(peer) => {
-                let attach =
-                    prepare_requester(peer, setup.deps.backend().as_ref(), setup.consumer.mock)
-                        .await?;
-                Box::pin(initialize_consumer::<_, _, _, C, _>(
-                    setup.consumer,
-                    provider,
-                    providers,
-                    services,
-                    attach,
-                ))
-                .await
-            }
-            None => {
-                Box::pin(initialize_consumer::<_, _, _, C, _>(
-                    setup.consumer,
-                    provider,
-                    providers,
-                    services,
-                    NoPeer,
-                ))
-                .await
-            }
-        }
+        Box::pin(initialize_consumer::<_, _, _, C, _>(
+            setup.consumer,
+            provider,
+            providers,
+            services,
+            NoPeer,
+        ))
+        .await
     }
 
     /// Creates a best-effort consumer that answers peer requests.
     ///
     /// # Errors
     ///
-    /// Returns [`PeerInitError::PeerRequired`] without peer configuration.
     /// Returns [`PeerInitError::SubsystemRequired`] without a subsystem name.
     /// Returns [`ConsumerError`] when another startup step fails.
-    pub(crate) async fn best_effort_responding_consumer<T, R, B>(
+    pub(crate) async fn best_effort_responding_consumer<T, R, B, RT: Router>(
         setup: TypedConsumerSetup<'_, C, B>,
         telemetry: Telemetry,
         handler: T,
+        router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
@@ -117,11 +99,6 @@ where
         )?
         .layer(LogMiddleware::new());
         let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let peer = setup
-            .common
-            .peer
-            .as_ref()
-            .ok_or(PeerInitError::PeerRequired)?;
         let subsystem = keyed_state
             .subsystem()
             .cloned()
@@ -139,20 +116,14 @@ where
         };
         // Preparation is the last fallible step of this mode, and no `?` runs
         // between it and the termination below.
-        let prepared = prepare_responding::<R, _>(
-            peer,
-            setup.deps.backend().as_ref(),
-            setup.consumer.mock,
-            subsystem,
-        )
-        .await?;
-        let (provider, attach) = prepared.terminate(&middleware, handler);
+        let prepared = router.responder::<R>(subsystem)?;
+        let (provider, resources) = prepared.terminate(&middleware, handler);
         Box::pin(initialize_consumer::<_, _, _, C, _>(
             setup.consumer,
             provider,
             providers,
             services,
-            attach,
+            resources,
         ))
         .await
     }

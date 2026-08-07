@@ -1,26 +1,58 @@
 use super::{
     LocalTarget, NodeId, Preference, RelayHop, Router, RouterHandle, SendFailure, choose_route,
 };
+use crate::Codec;
 use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
+use crate::response::ResponseStatus;
+use crate::response::frame::encode::FrameEncoder;
+use crate::response::frame::tests::CountingCodec;
+use crate::response::frame::{FrameCap, FrameHeader};
+use crate::response::sender::{DropReason, ResponseRoute, RouteDelivery, RouteOutcome, Then};
 use crate::router::Host;
 use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::tests::support::TestDirectory;
 use crate::router::directory::tests::support::{registration, test_directory};
 use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
+use crate::router::fleet::Destination;
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::LoopbackSender;
+use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::ptr;
+use std::slice;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::time::Instant;
 use tonic::Code;
 use uuid::{Uuid, Version};
+
+#[derive(Clone)]
+struct CountedNetwork(Arc<AtomicUsize>);
+
+impl ResponseRoute for CountedNetwork {
+    async fn deliver<C: Codec>(
+        &self,
+        _encoder: &mut FrameEncoder<C>,
+        _header: &FrameHeader,
+        _payload: C::Payload,
+        _destination: &Destination,
+        _attempts: u32,
+        _expires_at: Instant,
+    ) -> Result<RouteOutcome<C::Payload>, DropReason> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(RouteOutcome::Delivered(RouteDelivery::Remote {
+            preference: Preference::Direct,
+            from: None,
+        }))
+    }
+}
 
 /// The lease the router's own read runs under.
 const LEASE: Duration = Duration::from_secs(30);
@@ -350,6 +382,51 @@ fn prop_a_route_follows_the_declared_labels(declared: Declared) -> TestResult {
 /// The failure a destination that answered `code` produces.
 fn answer(code: Code) -> SendFailure {
     SendFailure::Status(code)
+}
+
+#[test]
+fn a_local_target_never_reaches_the_network_route() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let node = NodeId::new();
+        let subsystem = SubsystemName::try_new("local")?;
+        let registry = PendingRegistry::test(&RequesterConfiguration::default())?;
+        let request = registry.register_unguarded(
+            slice::from_ref(&subsystem),
+            CountingCodec::FORMAT_ID,
+            Duration::from_secs(1),
+        )?;
+        let network_calls = Arc::new(AtomicUsize::new(0));
+        let route = Then(
+            LocalTarget::new(node, registry),
+            CountedNetwork(Arc::clone(&network_calls)),
+        );
+        let fleet = DestinationFleet::new(FleetConfiguration::default())?;
+        let reservation = fleet.reserve(node)?;
+        let mut encoder = FrameEncoder::new(CountingCodec::default(), FrameCap::new(4096)?);
+        let delivered = route
+            .deliver(
+                &mut encoder,
+                &FrameHeader {
+                    target: node,
+                    request,
+                    subsystem,
+                    status: ResponseStatus::Success,
+                    relay: None,
+                },
+                Vec::new(),
+                reservation.destination(),
+                1,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+
+        assert!(matches!(
+            delivered,
+            Ok(RouteOutcome::Delivered(RouteDelivery::Local))
+        ));
+        assert_eq!(network_calls.load(Ordering::Relaxed), 0);
+        Ok(())
+    })
 }
 
 fn test_router(directory: TestDirectory) -> Result<RouterHandle<LoopbackSender, TestDirectory>> {

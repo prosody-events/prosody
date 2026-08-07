@@ -125,7 +125,8 @@ async fn handlers_run_inside_their_event_spans() -> Result<()> {
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-    )?;
+    )
+    .await?;
 
     let fire_at = CompactDateTime::now()?.add_duration(CompactDuration::new(2))?;
     client.subscribe(AmbientProbe { sender, fire_at }).await?;

@@ -2,8 +2,10 @@
 
 use crate::cassandra::config::CassandraConfiguration;
 use crate::codec::Codec;
+use crate::consumer::ConsumerError;
 use crate::high_level::deps::ReaderConfiguration;
 use crate::loader::MemoryLoader;
+use crate::peer::{GrpcRouter, LocalRouter, PeerConfiguration, Router};
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state_reader::{
     CassandraReaderBackend, MemoryReaderBackend, ReaderBackend, StateReaderDependencies,
@@ -26,12 +28,21 @@ where
 {
     /// Reader components shared with the consumer.
     type Reader: ReaderBackend<C>;
+    /// Peer route selected with this backend.
+    type Router: Router;
 
     /// Builds the shared reader components.
     fn build_reader(
         &self,
         config: &ReaderConfiguration,
     ) -> impl Future<Output = Result<StateReaderDependencies<C, Self::Reader>, StateReaderError>> + Send;
+
+    /// Builds the peer route over the shared reader backend.
+    fn build_router(
+        &self,
+        config: &PeerConfiguration,
+        reader: &StateReaderDependencies<C, Self::Reader>,
+    ) -> impl Future<Output = Result<Self::Router, ConsumerError>> + Send;
 }
 
 /// In-memory high-level client backend.
@@ -90,6 +101,7 @@ where
     C::Payload: Clone,
 {
     type Reader = MemoryReaderBackend<C>;
+    type Router = LocalRouter;
 
     async fn build_reader(
         &self,
@@ -105,6 +117,14 @@ where
             config.cache_size,
         )
         .with_default_read_cache_ttl(config.cache_ttl))
+    }
+
+    async fn build_router(
+        &self,
+        config: &PeerConfiguration,
+        _reader: &StateReaderDependencies<C, Self::Reader>,
+    ) -> Result<Self::Router, ConsumerError> {
+        LocalRouter::new(config).await
     }
 }
 
@@ -139,6 +159,7 @@ where
     C::Payload: Clone,
 {
     type Reader = CassandraReaderBackend<C>;
+    type Router = GrpcRouter;
 
     async fn build_reader(
         &self,
@@ -152,5 +173,13 @@ where
         )
         .await?
         .with_default_read_cache_ttl(config.cache_ttl))
+    }
+
+    async fn build_router(
+        &self,
+        config: &PeerConfiguration,
+        reader: &StateReaderDependencies<C, Self::Reader>,
+    ) -> Result<Self::Router, ConsumerError> {
+        GrpcRouter::start(config, reader.backend().as_ref()).await
     }
 }

@@ -777,7 +777,7 @@ async fn assert_no_telemetry_events(consumer: &StreamConsumer, wait: Duration) -
 }
 
 /// Build a `HighLevelClient` in the given mode with a custom telemetry topic.
-fn build_client_with<T: FallibleHandler>(
+async fn build_client_with<T: FallibleHandler>(
     mode: Mode,
     source_topic: &str,
     telemetry_topic: &str,
@@ -814,12 +814,13 @@ fn build_client_with<T: FallibleHandler>(
         mode,
         &mut producer_builder,
         &consumer_builders,
-    )?;
+    )
+    .await?;
     Ok(client)
 }
 
 /// Best-effort-mode client using the shared forward-to-channel handler.
-fn build_client(
+async fn build_client(
     source_topic: &str,
     telemetry_topic: &str,
     emitter_enabled: bool,
@@ -831,9 +832,10 @@ fn build_client(
         emitter_enabled,
         DeferConfigurationBuilder::default(),
     )
+    .await
 }
 
-fn build_typed_client<T: FallibleHandler>(
+async fn build_typed_client<T: FallibleHandler>(
     source_topic: &str,
     telemetry_topic: &str,
 ) -> Result<CassandraHighLevelClient<T>> {
@@ -844,14 +846,15 @@ fn build_typed_client<T: FallibleHandler>(
         true,
         DeferConfigurationBuilder::default(),
     )
+    .await
 }
 
-fn build_typed_client_with_defer<T: FallibleHandler>(
+async fn build_typed_client_with_defer<T: FallibleHandler>(
     source_topic: &str,
     telemetry_topic: &str,
     defer: DeferConfigurationBuilder,
 ) -> Result<CassandraHighLevelClient<T>> {
-    build_client_with(Mode::Pipeline, source_topic, telemetry_topic, true, defer)
+    build_client_with(Mode::Pipeline, source_topic, telemetry_topic, true, defer).await
 }
 
 // ── Integration Tests ────────────────────────────────────────────────────────
@@ -864,7 +867,7 @@ async fn message_lifecycle_events_on_kafka() -> Result<()> {
         let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
 
-        let client = build_client(&source_topic, &telemetry_topic, true)?;
+        let client = build_client(&source_topic, &telemetry_topic, true).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
         client
@@ -905,7 +908,7 @@ async fn producer_message_sent_on_kafka() -> Result<()> {
         let (admin, telemetry_topic, dest_topic) = create_telemetry_topics().await?;
         let dest: Topic = dest_topic.as_str().into();
 
-        let client = build_client(&dest_topic, &telemetry_topic, true)?;
+        let client = build_client(&dest_topic, &telemetry_topic, true).await?;
         let telemetry_consumer = create_telemetry_consumer(&telemetry_topic)?;
 
         client.send(dest, "sent-key", json!({"v": 1_i32})).await?;
@@ -972,7 +975,7 @@ async fn emitter_disabled_no_events() -> Result<()> {
         let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
 
-        let client = build_client(&source_topic, &telemetry_topic, false)?;
+        let client = build_client(&source_topic, &telemetry_topic, false).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
         client
@@ -1007,7 +1010,7 @@ async fn json_payload_contract_validation() -> Result<()> {
         let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
         let source: Topic = source_topic.as_str().into();
 
-        let client = build_client(&source_topic, &telemetry_topic, true)?;
+        let client = build_client(&source_topic, &telemetry_topic, true).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
         client
@@ -1133,7 +1136,7 @@ async fn message_failed_event_on_kafka() -> Result<()> {
         let source: Topic = source_topic.as_str().into();
 
         let client: CassandraHighLevelClient<FailingHandler> =
-            build_typed_client(&source_topic, &telemetry_topic)?;
+            build_typed_client(&source_topic, &telemetry_topic).await?;
 
         let (fail_tx, mut fail_rx) = channel(16);
         client.subscribe(FailingHandler { tx: fail_tx }).await?;
@@ -1171,7 +1174,7 @@ async fn timer_lifecycle_events_on_kafka() -> Result<()> {
         let source: Topic = source_topic.as_str().into();
 
         let client: CassandraHighLevelClient<TimerSchedulingHandler> =
-            build_typed_client(&source_topic, &telemetry_topic)?;
+            build_typed_client(&source_topic, &telemetry_topic).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
         let (timer_tx, mut timer_rx) = channel(16);
@@ -1223,7 +1226,7 @@ async fn timer_failed_event_on_kafka() -> Result<()> {
         let source: Topic = source_topic.as_str().into();
 
         let client: CassandraHighLevelClient<TimerFailingHandler> =
-            build_typed_client(&source_topic, &telemetry_topic)?;
+            build_typed_client(&source_topic, &telemetry_topic).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
         let (timer_tx, mut timer_rx) = channel(16);
@@ -1277,7 +1280,7 @@ async fn deferred_message_timer_three_event_invariant() -> Result<()> {
         let mut defer = DeferConfigurationBuilder::default();
         defer.failure_threshold(1.0_f64);
         let client: CassandraHighLevelClient<TransientMessageHandler> =
-            build_typed_client_with_defer(&source_topic, &telemetry_topic, defer)?;
+            build_typed_client_with_defer(&source_topic, &telemetry_topic, defer).await?;
 
         let (done_tx, mut done_rx) = channel(16);
         client
@@ -1338,7 +1341,7 @@ async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
         let mut defer = DeferConfigurationBuilder::default();
         defer.failure_threshold(1.0_f64);
         let client: CassandraHighLevelClient<TransientTimerHandler> =
-            build_typed_client_with_defer(&source_topic, &telemetry_topic, defer)?;
+            build_typed_client_with_defer(&source_topic, &telemetry_topic, defer).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
         let (done_tx, mut done_rx) = channel(16);
@@ -1404,7 +1407,7 @@ async fn timer_cancelled_event_on_kafka() -> Result<()> {
         let source: Topic = source_topic.as_str().into();
 
         let client: CassandraHighLevelClient<TimerCancellingHandler> =
-            build_typed_client(&source_topic, &telemetry_topic)?;
+            build_typed_client(&source_topic, &telemetry_topic).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
         client.subscribe(TimerCancellingHandler { msg_tx }).await?;
@@ -1473,7 +1476,7 @@ async fn clear_and_schedule_emits_cancelled_and_scheduled() -> Result<()> {
         let source: Topic = source_topic.as_str().into();
 
         let client: CassandraHighLevelClient<ClearAndScheduleHandler> =
-            build_typed_client(&source_topic, &telemetry_topic)?;
+            build_typed_client(&source_topic, &telemetry_topic).await?;
 
         let (msg_tx, mut msg_rx) = channel(16);
         client.subscribe(ClearAndScheduleHandler { msg_tx }).await?;

@@ -450,7 +450,7 @@ where
 /// Build a `HighLevelClient` for the inline-replacement test — the one test
 /// in this file that must drive `clear_and_schedule` through the full
 /// pipeline-mode middleware stack rather than the direct-consumer harness.
-fn build_inline_replacement_client(
+async fn build_inline_replacement_client(
     source_topic: &str,
     telemetry_topic: &str,
 ) -> Result<CassandraHighLevelClient<InlineReplacementHandler>> {
@@ -483,7 +483,8 @@ fn build_inline_replacement_client(
         Mode::Pipeline,
         &mut producer_builder,
         &consumer_builders,
-    )?;
+    )
+    .await?;
     Ok(client)
 }
 
@@ -788,7 +789,7 @@ async fn inline_replacement_fires_once_at_replacement_time() -> Result<()> {
         let source_topic = source.to_string();
 
         let client: CassandraHighLevelClient<InlineReplacementHandler> =
-            build_inline_replacement_client(&source_topic, telemetry_topic.as_ref())?;
+            build_inline_replacement_client(&source_topic, telemetry_topic.as_ref()).await?;
 
         let (messages, mut msg_rx) = channel(16);
         let (replacement_time, mut replacement_time_rx) = channel(16);

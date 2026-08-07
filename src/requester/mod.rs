@@ -91,9 +91,6 @@ pub enum ResponseFailure {
 /// request for the caller, so a classification would have no consumer.
 #[derive(Debug, Error)]
 pub enum RequestError<E: Error> {
-    /// The client has no running peer runtime.
-    #[error("the peer requester is not running")]
-    NotRunning,
     /// The request named no subsystem.
     #[error("a request must name at least one subsystem")]
     NoSubsystems,

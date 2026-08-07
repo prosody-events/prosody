@@ -25,7 +25,7 @@ use crate::consumer::{Managers, ProsodyConsumer};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MessageLoader;
-use crate::peer::{NoPeer, prepare_requester, prepare_responding};
+use crate::peer::{NoPeer, Router};
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
 use crate::state_reader::ConsumerReaderBackend;
@@ -50,14 +50,13 @@ struct PipelineMiddlewareStack {
 }
 
 impl PipelineMiddlewareStack {
-    async fn into_consumer<T, MP, TP, DP, PP, SP, L, C, B>(
+    async fn into_consumer<T, MP, TP, DP, PP, SP, L, C>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
         dedup_provider: DP,
         partition_providers: PartitionProviders<PP, SP>,
         handler: T,
-        backend: &B,
     ) -> Result<ProsodyConsumer<C>, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
@@ -71,7 +70,6 @@ impl PipelineMiddlewareStack {
         L: MessageLoader<Payload = C::Payload> + 'static,
         C: Codec,
         C::Payload: Send + Sync + 'static + EventIdentity + EventType + Clone,
-        B: ConsumerReaderBackend<C>,
     {
         let timer_defer_middleware = TimerDeferMiddleware::new(
             self.defer_config,
@@ -116,43 +114,28 @@ impl PipelineMiddlewareStack {
         };
         // Preparation is the last fallible step of this mode: no `?` after it
         // could drop a served listener.
-        match self.common_config.peer.as_ref() {
-            Some(peer) => {
-                let attach = prepare_requester(peer, backend, self.consumer_config.mock).await?;
-                Box::pin(initialize_consumer::<_, _, _, C, _>(
-                    &self.consumer_config,
-                    provider,
-                    partition_providers,
-                    services,
-                    attach,
-                ))
-                .await
-            }
-            None => {
-                Box::pin(initialize_consumer::<_, _, _, C, _>(
-                    &self.consumer_config,
-                    provider,
-                    partition_providers,
-                    services,
-                    NoPeer,
-                ))
-                .await
-            }
-        }
+        Box::pin(initialize_consumer::<_, _, _, C, _>(
+            &self.consumer_config,
+            provider,
+            partition_providers,
+            services,
+            NoPeer,
+        ))
+        .await
     }
 
     /// Builds a responding consumer without a shared tail helper.
     ///
     /// The telemetry borrow overlaps moves from this value. Keep this tail in
     /// one function so the borrow remains clear.
-    async fn into_responding_consumer<T, R, MP, TP, DP, PP, SP, L, C, B>(
+    async fn into_responding_consumer<T, R, MP, TP, DP, PP, SP, L, C, RT: Router>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
         dedup_provider: DP,
         partition_providers: PartitionProviders<PP, SP>,
         handler: T,
-        backend: &B,
+        router: &RT,
     ) -> Result<ProsodyConsumer<C>, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
@@ -169,7 +152,6 @@ impl PipelineMiddlewareStack {
         L: MessageLoader<Payload = C::Payload> + 'static,
         C: Codec,
         C::Payload: Send + Sync + 'static + EventIdentity + EventType + Clone,
-        B: ConsumerReaderBackend<C>,
     {
         let timer_defer_middleware = TimerDeferMiddleware::new(
             self.defer_config,
@@ -191,11 +173,6 @@ impl PipelineMiddlewareStack {
             .layer(message_defer_middleware)
             .layer(self.retry_middleware);
         let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let peer = self
-            .common_config
-            .peer
-            .as_ref()
-            .ok_or(PeerInitError::PeerRequired)?;
         let subsystem = self
             .subsystem
             .clone()
@@ -209,15 +186,14 @@ impl PipelineMiddlewareStack {
         };
         // Preparation is the last fallible step of this mode, and no `?` runs
         // between it and the termination below.
-        let prepared =
-            prepare_responding::<R, _>(peer, backend, self.consumer_config.mock, subsystem).await?;
-        let (provider, attach) = prepared.terminate(&middleware, handler);
+        let prepared = router.responder::<R>(subsystem)?;
+        let (provider, resources) = prepared.terminate(&middleware, handler);
         Box::pin(initialize_consumer::<_, _, _, C, _>(
             &self.consumer_config,
             provider,
             partition_providers,
             services,
-            attach,
+            resources,
         ))
         .await
     }
@@ -238,11 +214,12 @@ where
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub async fn pipeline_consumer<T>(
+    pub async fn pipeline_consumer<T, RT: Router>(
         setup: ConsumerSetup<'_>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
         handler: T,
+        router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity,
@@ -260,6 +237,7 @@ where
                     pipeline_config,
                     telemetry,
                     handler,
+                    router,
                 )
                 .await
             }
@@ -274,6 +252,7 @@ where
                     pipeline_config,
                     telemetry,
                     handler,
+                    router,
                 )
                 .await
             }
@@ -287,14 +266,14 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`PeerInitError::PeerRequired`] without peer configuration.
     /// Returns [`PeerInitError::SubsystemRequired`] without a subsystem name.
     /// Returns [`ConsumerError`] when another startup step fails.
-    pub async fn pipeline_responding_consumer<T, R>(
+    pub async fn pipeline_responding_consumer<T, R, RT: Router>(
         setup: ConsumerSetup<'_>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
         handler: T,
+        router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity,
@@ -306,7 +285,7 @@ where
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
                 let deps = memory_deps(&setup);
-                Self::pipeline_responding_consumer_with_backend::<T, R, _>(
+                Self::pipeline_responding_consumer_with_backend::<T, R, _, RT>(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
                         common: setup.common,
@@ -315,12 +294,13 @@ where
                     pipeline_config,
                     telemetry,
                     handler,
+                    router,
                 )
                 .await
             }
             (false, TriggerStoreConfiguration::Cassandra(config)) => {
                 let deps = cassandra_deps(&setup, config).await?;
-                Self::pipeline_responding_consumer_with_backend::<T, R, _>(
+                Self::pipeline_responding_consumer_with_backend::<T, R, _, RT>(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
                         common: setup.common,
@@ -329,17 +309,19 @@ where
                     pipeline_config,
                     telemetry,
                     handler,
+                    router,
                 )
                 .await
             }
         }
     }
 
-    pub(crate) async fn pipeline_consumer_with_backend<T, B>(
+    pub(crate) async fn pipeline_consumer_with_backend<T, B, RT: Router>(
         setup: TypedConsumerSetup<'_, C, B>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
         handler: T,
+        _router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
@@ -380,7 +362,7 @@ where
             &stack.telemetry,
         )?;
         stack
-            .into_consumer::<_, _, _, _, _, _, _, C, B>(
+            .into_consumer::<_, _, _, _, _, _, _, C>(
                 message_defer,
                 components.timers,
                 components.dedup,
@@ -389,16 +371,16 @@ where
                     state: components.state,
                 },
                 handler,
-                setup.deps.backend().as_ref(),
             )
             .await
     }
 
-    pub(crate) async fn pipeline_responding_consumer_with_backend<T, R, B>(
+    pub(crate) async fn pipeline_responding_consumer_with_backend<T, R, B, RT: Router>(
         setup: TypedConsumerSetup<'_, C, B>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
         handler: T,
+        router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
@@ -442,7 +424,7 @@ where
             &stack.telemetry,
         )?;
         stack
-            .into_responding_consumer::<_, R, _, _, _, _, _, _, C, B>(
+            .into_responding_consumer::<_, R, _, _, _, _, _, _, C, RT>(
                 message_defer,
                 components.timers,
                 components.dedup,
@@ -451,7 +433,7 @@ where
                     state: components.state,
                 },
                 handler,
-                setup.deps.backend().as_ref(),
+                router,
             )
             .await
     }

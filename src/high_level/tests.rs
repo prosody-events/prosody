@@ -8,9 +8,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::{ConsumerConfiguration, DemandType, KeyedStateConfiguration};
-use crate::high_level::erased::{
-    ErasedConsumerState, ErasedReadCache, ErasedReaderBuildError, new_erased,
-};
+use crate::high_level::erased::{ErasedReadCache, ErasedReaderBuildError, new_erased};
 use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;
 use crate::state::descriptor::value_state;
@@ -56,10 +54,16 @@ fn create_test_client<T>(group_id: &str, source_system: Option<&str>) -> Result<
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_builder,
+        peer: PeerConfiguration::builder()
+            .advertised_host("127.0.0.1")
+            .build()?,
         ..ConsumerBuilders::new()?
     };
-    let client =
-        MemoryHighLevelClient::new(Mode::Pipeline, &mut producer_builder, &consumer_builders)?;
+    let client = TEST_RUNTIME.block_on(MemoryHighLevelClient::new(
+        Mode::Pipeline,
+        &mut producer_builder,
+        &consumer_builders,
+    ))?;
     Ok(ClientFixture { client })
 }
 
@@ -79,15 +83,17 @@ fn create_peer_test_client<T>(group_id: &str) -> Result<ClientFixture<T>> {
         keyed_state: KeyedStateConfiguration::builder()
             .subsystem(Some(SubsystemName::try_new("echo")?))
             .build()?,
-        peer: Some(
-            PeerConfiguration::builder()
-                .advertised_host("127.0.0.1")
-                .build()?,
-        ),
+        peer: PeerConfiguration::builder()
+            .advertised_host("127.0.0.1")
+            .build()?,
         ..ConsumerBuilders::new()?
     };
     Ok(ClientFixture {
-        client: MemoryHighLevelClient::new(Mode::Pipeline, &mut producer, &builders)?,
+        client: TEST_RUNTIME.block_on(MemoryHighLevelClient::new(
+            Mode::Pipeline,
+            &mut producer,
+            &builders,
+        ))?,
     })
 }
 
@@ -198,6 +204,30 @@ fn a_mock_client_round_trips_one_peer_request() -> Result<()> {
     })
 }
 
+/// Request validation uses the router before the consumer starts.
+#[test]
+fn a_request_does_not_require_subscription() -> Result<()> {
+    let fixture = create_peer_test_client::<EchoHandler>("peer-before-subscribe")?;
+    let subsystems = [];
+    let error = TEST_RUNTIME
+        .block_on(
+            fixture
+                .client
+                .request::<PeerResponseCodec, _, Value, Infallible>(
+                    [],
+                    Topic::from("test-topic"),
+                    "key",
+                    Value::Null,
+                    &subsystems,
+                    Duration::from_secs(1),
+                ),
+        )
+        .err()
+        .ok_or_else(|| eyre!("the request accepted an empty subsystem list"))?;
+    assert!(matches!(error, RequestError::NoSubsystems));
+    Ok(())
+}
+
 #[test]
 fn test_source_system_defaults_to_consumer_group() -> Result<()> {
     let group_id = "my-test-group";
@@ -262,11 +292,9 @@ impl FallibleHandler for NoOpHandler {
     async fn shutdown(self) {}
 }
 
-/// Erased backend selection reads only mock mode. Invalid consumer-only fields
-/// remain deferred, so the producer half constructs and subscription reports
-/// the retained configuration error.
+/// Erased construction rejects an invalid consumer configuration.
 #[test]
-fn erased_client_retains_consumer_failure_until_subscribe() -> Result<()> {
+fn erased_client_rejects_consumer_failure_at_construction() -> Result<()> {
     let mut producer = ProducerConfiguration::builder();
     producer
         .bootstrap_servers(vec!["unused-in-mock-mode:9092".to_owned()])
@@ -275,22 +303,21 @@ fn erased_client_retains_consumer_failure_until_subscribe() -> Result<()> {
     consumer.mock(true);
     let consumers = ConsumerBuilders {
         consumer,
+        peer: PeerConfiguration::builder().build()?,
         ..ConsumerBuilders::new()?
     };
 
-    let client = new_erased::<NoOpHandler, JsonCodec>(
+    let built = TEST_RUNTIME.block_on(new_erased::<NoOpHandler, JsonCodec>(
         Mode::Pipeline,
         &mut producer,
         &consumers,
         &CassandraConfigurationBuilder::default(),
-    )?;
-    assert_eq!(client.source_system(), "producer-only");
-    let state = TEST_RUNTIME.block_on(client.consumer_state());
-    assert!(matches!(state, ErasedConsumerState::ConfigurationFailed(_)));
-    let subscribed = TEST_RUNTIME.block_on(client.subscribe(NoOpHandler));
+    ));
     assert!(matches!(
-        subscribed,
-        Err(HighLevelClientError::ConsumerConfiguration(_))
+        built,
+        Err(erased::ErasedClientBuildError::Client(
+            HighLevelClientError::ConsumerConfiguration(_)
+        ))
     ));
     Ok(())
 }
@@ -310,14 +337,15 @@ fn erased_reader_kinds_share_subsystem_validation() -> Result<()> {
         .mock(true);
     let consumers = ConsumerBuilders {
         consumer,
+        peer: PeerConfiguration::builder().build()?,
         ..ConsumerBuilders::new()?
     };
-    let client = new_erased::<NoOpHandler, JsonCodec>(
+    let client = TEST_RUNTIME.block_on(new_erased::<NoOpHandler, JsonCodec>(
         Mode::Pipeline,
         &mut producer,
         &consumers,
         &CassandraConfigurationBuilder::default(),
-    )?;
+    ))?;
 
     TEST_RUNTIME.block_on(async {
         let value = client
@@ -439,8 +467,7 @@ fn unsubscribe_retains_bundle_on_resubscribe() -> Result<()> {
         // Configured: build and retain the first bundle.
         let first = fixture
             .client
-            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
-            .await?;
+            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))?;
         let id_first = first.deps_instance_id();
 
         fixture.client.subscribe(NoOpHandler).await?;
@@ -451,8 +478,7 @@ fn unsubscribe_retains_bundle_on_resubscribe() -> Result<()> {
 
         let second = fixture
             .client
-            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
-            .await?;
+            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))?;
         assert_eq!(
             id_first,
             second.deps_instance_id(),
@@ -479,8 +505,7 @@ fn state_before_and_after_subscribe_share_one_bundle() -> Result<()> {
         // Configured: builds and retains the bundle.
         let before = fixture
             .client
-            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
-            .await?;
+            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))?;
         let id_before = before.deps_instance_id();
 
         fixture.client.subscribe(NoOpHandler).await?;
@@ -488,8 +513,7 @@ fn state_before_and_after_subscribe_share_one_bundle() -> Result<()> {
         // Running: must reuse the retained bundle, not build a second one.
         let after = fixture
             .client
-            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
-            .await;
+            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"));
 
         // Shut the consumer down before asserting: a failed assertion must not
         // leave rdkafka client threads alive and hang the test binary.
@@ -534,10 +558,7 @@ fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
         // always runs, even if the scenario fails.
         let outcome: Result<()> = async {
             // The bundle the running consumer and the client's readers share.
-            let deps = fixture
-                .client
-                .retained_deps()
-                .ok_or_else(|| eyre!("client retained no shared bundle after subscribe"))?;
+            let deps = fixture.client.retained_deps();
             let backend = deps.backend();
             let cells = backend.cells();
             let publications = backend.publications();
@@ -584,8 +605,7 @@ fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
             // the shared cells.
             let reader = fixture
                 .client
-                .state(sub.clone(), value_state::<JsonCodec>("cart"))
-                .await?;
+                .state(sub.clone(), value_state::<JsonCodec>("cart"))?;
             let observed = reader.get("user-1").await?;
             ensure!(
                 observed == Some(json!(["apple"])),

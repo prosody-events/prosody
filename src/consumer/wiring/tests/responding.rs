@@ -20,7 +20,8 @@ use crate::consumer::{
 };
 use crate::error::ErrorCategory;
 use crate::high_level::config::TriggerStoreConfiguration;
-use crate::peer::{PeerAttachment, prepare_responding};
+use crate::peer::runtime::prepare_router;
+use crate::peer::{ConsumerResources, Router};
 use crate::response::frame::FrameCap;
 use crate::state_reader::StateReaderDependencies;
 use crate::subsystem::SubsystemName;
@@ -65,9 +66,8 @@ impl Codec for SomeResponseCodec {
 
 /// Preparation carries the responder's own name out to startup.
 ///
-/// The decode path admits a request tag for the name the attachment reports,
-/// and preparation is the only production step that fills it. A consumer whose
-/// attachment reports nothing parses no tag and answers nothing.
+/// The decode path admits the responder's subsystem. A consumer without
+/// response resources parses no request tag.
 #[tokio::test]
 async fn the_prepared_peer_admits_the_name_its_responder_answers_with() -> Result<()> {
     let log: EventLog = Arc::new(Mutex::new(Vec::new()));
@@ -77,10 +77,9 @@ async fn the_prepared_peer_admits_the_name_its_responder_answers_with() -> Resul
     let consumer = consumer_config("responding-wiring-admits")?;
     let peer_config = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let subsystem = SubsystemName::try_new(SUBSYSTEM)?;
-    let prepared =
-        prepare_responding::<SomeResponseCodec, _>(&peer_config, &backend, true, subsystem.clone())
-            .await?;
-    let common = common_config(None, Some(subsystem.clone()))?;
+    let router = prepare_router(&peer_config, &backend).await?;
+    let prepared = router.build_responder::<SomeResponseCodec>(subsystem.clone())?;
+    let common = common_config(Some(subsystem.clone()))?;
     let middleware = build_common_middleware::<_, Value>(
         &common,
         &consumer,
@@ -89,13 +88,14 @@ async fn the_prepared_peer_admits_the_name_its_responder_answers_with() -> Resul
     )?
     .layer(LogMiddleware::new());
     let (provider, peer) = prepared.terminate(&middleware, ScriptedHandler::success());
-    let admitted = peer.responder();
+    let admitted = peer.admission().0;
     // The provider holds the last responder clone, and abandonment joins the
     // workers that clone keeps open.
     drop(provider);
-    peer.abandon().await;
+    peer.workers().join().await;
+    router.shutdown().await?;
     ensure!(
-        admitted == Some(subsystem),
+        admitted == subsystem,
         "the prepared peer admits {admitted:?}, not the name its responder answers with"
     );
     Ok(())
@@ -125,25 +125,20 @@ async fn the_prepared_responder_is_sized_by_the_runtimes_frame_cap() -> Result<(
         .max_concurrent_streams(1_u32)
         .max_destinations(SCRATCH_DESTINATIONS)
         .build()?;
-    let prepared = prepare_responding::<SomeResponseCodec, _>(
-        &peer,
-        &backend,
-        true,
-        SubsystemName::try_new(SUBSYSTEM)?,
-    )
-    .await;
-    match prepared {
-        Err(ConsumerError::Peer(PeerInitError::Fleet { message })) => {
-            let asked = SCRATCH_DESTINATIONS * FrameCap::MAX_BYTES;
-            ensure!(
-                message.contains(&asked.to_string()),
-                "the responder asks for {asked} bytes of scratch: {message}",
-            );
-            Ok(())
-        }
-        Err(error) => bail!("preparation failed for another reason: {error}"),
-        Ok(_) => bail!("preparation took a scratch budget one sender cannot commit to"),
-    }
+    let router = prepare_router(&peer, &backend).await?;
+    let prepared = router.build_responder::<SomeResponseCodec>(SubsystemName::try_new(SUBSYSTEM)?);
+    let Err(error) = prepared else {
+        router.shutdown().await?;
+        bail!("preparation took a scratch budget one sender cannot commit to");
+    };
+    let message = format!("{error:#}");
+    let asked = SCRATCH_DESTINATIONS * FrameCap::MAX_BYTES;
+    ensure!(
+        message.contains(&asked.to_string()),
+        "the responder asks for {asked} bytes of scratch: {message}",
+    );
+    router.shutdown().await?;
+    Ok(())
 }
 
 /// One pipeline test proves the shared constructor path.
@@ -157,7 +152,7 @@ async fn a_responding_consumer_starts_and_stops() -> Result<()> {
     let directory = RecordingDirectory::new(Arc::clone(&log), false);
     let consumer_config = consumer_config("responding-wiring-start")?;
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let common = common_config(Some(peer), Some(SubsystemName::try_new(SUBSYSTEM)?))?;
+    let common = common_config(Some(SubsystemName::try_new(SUBSYSTEM)?))?;
     let trigger_store = TriggerStoreConfiguration::InMemory;
     let setup = ConsumerSetup {
         consumer: &consumer_config,
@@ -171,15 +166,18 @@ async fn a_responding_consumer_starts_and_stops() -> Result<()> {
         common: &common,
         deps,
     };
+    let router = prepare_router(&peer, typed.deps.backend().as_ref()).await?;
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_responding_consumer_with_backend::<
         ScriptedHandler,
         SomeResponseCodec,
+        _,
         _,
     >(
         typed,
         pipeline_config()?,
         Telemetry::new(),
         ScriptedHandler::success(),
+        &router,
     )
     .await?;
     let outcome: Result<()> = async {
@@ -193,25 +191,14 @@ async fn a_responding_consumer_starts_and_stops() -> Result<()> {
     }
     .await;
     consumer.shutdown().await?;
+    router.shutdown().await?;
     outcome
-}
-
-#[tokio::test]
-async fn a_responding_consumer_without_peer_configuration_is_refused() -> Result<()> {
-    let error = refused_consumer(None, Some(SubsystemName::try_new(SUBSYSTEM)?))
-        .await?
-        .ok_or_else(|| eyre!("the responding consumer started without peer configuration"))?;
-    assert!(matches!(
-        error,
-        ConsumerError::Peer(PeerInitError::PeerRequired)
-    ));
-    Ok(())
 }
 
 #[tokio::test]
 async fn a_responding_consumer_without_a_subsystem_is_refused() -> Result<()> {
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let error = refused_consumer(Some(peer), None)
+    let error = refused_consumer(peer, None)
         .await?
         .ok_or_else(|| eyre!("the responding consumer started without a subsystem"))?;
     assert!(matches!(
@@ -222,11 +209,11 @@ async fn a_responding_consumer_without_a_subsystem_is_refused() -> Result<()> {
 }
 
 async fn refused_consumer(
-    peer: Option<PeerConfiguration>,
+    peer: PeerConfiguration,
     subsystem: Option<SubsystemName>,
 ) -> Result<Option<ConsumerError>> {
     let consumer_config = consumer_config("responding-wiring-refused")?;
-    let common = common_config(peer, subsystem)?;
+    let common = common_config(subsystem)?;
     let trigger_store = TriggerStoreConfiguration::InMemory;
     let setup = ConsumerSetup {
         consumer: &consumer_config,
@@ -234,9 +221,11 @@ async fn refused_consumer(
         common: &common,
     };
     let deps: StateReaderDependencies<JsonCodec, _> = memory_deps(&setup);
+    let router = prepare_router(&peer, deps.backend().as_ref()).await?;
     let result = ProsodyConsumer::<JsonCodec>::pipeline_responding_consumer_with_backend::<
         ScriptedHandler,
         SomeResponseCodec,
+        _,
         _,
     >(
         TypedConsumerSetup {
@@ -247,6 +236,7 @@ async fn refused_consumer(
         pipeline_config()?,
         Telemetry::new(),
         ScriptedHandler::success(),
+        &router,
     )
     .await;
     match result {
@@ -255,9 +245,13 @@ async fn refused_consumer(
             if let Err(error) = shutdown {
                 bail!("unexpected consumer shutdown failed: {error}");
             }
+            router.shutdown().await?;
             Ok(None)
         }
-        Err(error) => Ok(Some(error)),
+        Err(error) => {
+            router.shutdown().await?;
+            Ok(Some(error))
+        }
     }
 }
 

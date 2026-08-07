@@ -18,16 +18,17 @@ use crate::consumer::partition::{PartitionConfiguration, PartitionManager};
 use crate::consumer::storage::{ComponentsOf, ConsumerStorageBackend, ConsumerStorageInputs};
 use crate::consumer::{
     CommonConfiguration, ConsumerConfiguration, ConsumerError, KafkaObserver, Managers,
-    ProsodyConsumer,
+    PeerInitError, ProsodyConsumer,
 };
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
 use crate::otel::SpanRelation;
-use crate::peer::PeerAttachment;
-use crate::peer::{NetworkPeerBackend, NetworkPeerMode, PeerBackend};
+use crate::peer::runtime::prepare_network;
+use crate::peer::{ConsumerResources, PeerBackend};
 use crate::router::NodeId;
 use crate::router::directory::tests::support::TestDirectory;
 use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
+use crate::router::runtime::PreparedPeerRuntime;
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state_reader::{MemoryReaderBackend, ReaderBackend, StateReaderDependencies};
@@ -161,17 +162,11 @@ impl NodeDirectory for RecordingDirectory {
 }
 
 impl PeerBackend for RecordingBackend {
-    type PeerMode = NetworkPeerMode;
-}
+    type Runtime = PreparedPeerRuntime<RecordingDirectory>;
 
-impl NetworkPeerBackend for RecordingBackend {
-    type Directory = RecordingDirectory;
-
-    async fn node_directory(
-        &self,
-        _lease: RegistrationTtl,
-    ) -> Result<Self::Directory, ConsumerError> {
-        Ok(self.directory.clone())
+    async fn prepare(&self, config: &PeerConfiguration) -> Result<Self::Runtime, ConsumerError> {
+        let parts = config.parts().map_err(PeerInitError::from)?;
+        prepare_network(parts, self.directory.clone()).await
     }
 }
 
@@ -219,17 +214,11 @@ impl ConsumerStorageBackend<JsonCodec> for RecordingMemoryBackend {
 }
 
 impl PeerBackend for RecordingMemoryBackend {
-    type PeerMode = NetworkPeerMode;
-}
+    type Runtime = PreparedPeerRuntime<RecordingDirectory>;
 
-impl NetworkPeerBackend for RecordingMemoryBackend {
-    type Directory = RecordingDirectory;
-
-    async fn node_directory(
-        &self,
-        _lease: RegistrationTtl,
-    ) -> Result<Self::Directory, ConsumerError> {
-        Ok(self.directory.clone())
+    async fn prepare(&self, config: &PeerConfiguration) -> Result<Self::Runtime, ConsumerError> {
+        let parts = config.parts().map_err(PeerInitError::from)?;
+        prepare_network(parts, self.directory.clone()).await
     }
 }
 
@@ -355,10 +344,7 @@ fn consumer_config(group: &str) -> Result<ConsumerConfiguration> {
         .build()?)
 }
 
-fn common_config(
-    peer: Option<PeerConfiguration>,
-    subsystem: Option<SubsystemName>,
-) -> Result<CommonConfiguration> {
+fn common_config(subsystem: Option<SubsystemName>) -> Result<CommonConfiguration> {
     let keyed_state = KeyedStateConfiguration::builder()
         .subsystem(subsystem)
         .build()?;
@@ -367,7 +353,6 @@ fn common_config(
         timeout: TimeoutConfiguration::builder().build()?,
         dedup: DeduplicationConfiguration::builder().build()?,
         keyed_state,
-        peer,
     })
 }
 
@@ -382,7 +367,7 @@ fn recording_memory_deps(
     StateReaderDependencies::from_parts(backend, deps.cache().clone())
 }
 
-async fn start<A: PeerAttachment + 'static>(
+async fn start<A: ConsumerResources>(
     config: &ConsumerConfiguration,
     managers: Arc<Managers<Value>>,
     heartbeats: HeartbeatRegistry,

@@ -151,10 +151,10 @@ pub enum ErasedReaderBuildError<E> {
     Client(#[from] HighLevelClientError<E>),
 }
 
-pub(super) async fn value<T, C, B>(
+pub(super) fn value<T, C, B>(
     client: &HighLevelClient<T, C, B>,
     subsystem: String,
-    name: String,
+    name: &str,
     cache: ErasedReadCache,
 ) -> Result<SharedValueReader<C>, ErasedReaderBuildError<C::Error>>
 where
@@ -163,15 +163,15 @@ where
     B: ClientBackend<C>,
     B::Reader: ConsumerReaderBackend<C>,
 {
-    let descriptor = value_state::<C>(&name).read_cache(cache);
-    let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
+    let descriptor = value_state::<C>(name).read_cache(cache);
+    let reader = client.state(subsystem_name(subsystem)?, descriptor)?;
     Ok(Arc::new(ValueReader(reader)))
 }
 
-pub(super) async fn map<T, C, B>(
+pub(super) fn map<T, C, B>(
     client: &HighLevelClient<T, C, B>,
     subsystem: String,
-    name: String,
+    name: &str,
     cache: ErasedReadCache,
 ) -> Result<SharedMapReader<C>, ErasedReaderBuildError<C::Error>>
 where
@@ -180,15 +180,15 @@ where
     B: ClientBackend<C>,
     B::Reader: ConsumerReaderBackend<C>,
 {
-    let descriptor = map_state::<Utf8KeyCodec, C>(&name).read_cache(cache);
-    let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
+    let descriptor = map_state::<Utf8KeyCodec, C>(name).read_cache(cache);
+    let reader = client.state(subsystem_name(subsystem)?, descriptor)?;
     Ok(Arc::new(MapReader(reader)))
 }
 
-pub(super) async fn deque<T, C, B>(
+pub(super) fn deque<T, C, B>(
     client: &HighLevelClient<T, C, B>,
     subsystem: String,
-    name: String,
+    name: &str,
     cache: ErasedReadCache,
 ) -> Result<SharedDequeReader<C>, ErasedReaderBuildError<C::Error>>
 where
@@ -197,8 +197,8 @@ where
     B: ClientBackend<C>,
     B::Reader: ConsumerReaderBackend<C>,
 {
-    let descriptor = deque_state::<C>(&name).read_cache(cache);
-    let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
+    let descriptor = deque_state::<C>(name).read_cache(cache);
+    let reader = client.state(subsystem_name(subsystem)?, descriptor)?;
     Ok(Arc::new(DequeReader(reader)))
 }
 

@@ -141,9 +141,7 @@ pub(crate) use crate::consumer::wiring::state::{
 };
 use crate::heartbeat::HeartbeatRegistry;
 pub use crate::otel::SpanRelation;
-use crate::peer::PeerHandles;
-use crate::producer::ProsodyProducer;
-use crate::requester::ProsodyRequester;
+use crate::response::sender::ResponseWorkers;
 pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
 // `descriptor::Keyed` (the key-axis lifter) is deliberately not re-exported
 // here: it would shadow the message-routing `Keyed` trait re-exported here.
@@ -206,7 +204,7 @@ struct RuntimeState {
     /// The consumer's Kafka observation handle. Shutdown retires its gauge
     /// series so a stopped consumer stops contributing to `sum` aggregations.
     observer: KafkaObserver,
-    peer: Option<PeerHandles>,
+    responses: ResponseWorkers,
 }
 
 /// What one teardown still holds after the Kafka poll loop stops.
@@ -214,12 +212,11 @@ struct RuntimeState {
 /// Only the caller that takes [`RuntimeState`] out of the shared mutex builds
 /// one, and exactly one caller ever does. So holding this value is what proves
 /// a caller owns the teardown, and every other caller gets `None` and touches
-/// nothing shared. Whether this consumer joined the peer fleet is the separate
-/// question `peer` answers.
+/// nothing shared.
 struct Teardown {
     probe_server: Option<ProbeServer>,
     observer: KafkaObserver,
-    peer: Option<PeerHandles>,
+    responses: ResponseWorkers,
 }
 
 /// High-level Kafka consumer implementation.
@@ -281,19 +278,6 @@ impl<C: Codec> Clone for ProsodyConsumer<C> {
 }
 
 impl<C: Codec> ProsodyConsumer<C> {
-    /// Builds a requester over this consumer's peer runtime.
-    pub(crate) fn requester<R: Codec>(
-        &self,
-        producer: ProsodyProducer<C>,
-    ) -> Option<ProsodyRequester<C, R>> {
-        self.runtime_state
-            .lock()
-            .as_ref()?
-            .peer
-            .as_ref()
-            .map(|peer| peer.requester(producer))
-    }
-
     /// Returns the number of currently assigned partitions.
     ///
     /// This method is useful for monitoring how many partitions have been
@@ -334,30 +318,10 @@ impl<C: Codec> ProsodyConsumer<C> {
         get_is_stalled(&self.managers) || self.heartbeats.any_stalled()
     }
 
-    /// Stops this consumer, in the one order that does not drop work it already
-    /// owes.
+    /// Stops this consumer after it sends all owed responses.
     ///
-    /// **This function owns the teardown order**, and its body reads as that
-    /// order:
-    ///
-    /// 1. Close peer request admission, so no new request enters while the
-    ///    handlers finish.
-    /// 2. Stop the poll loop and wait for in-flight message processing.
-    /// 3. Sweep every partition manager the final revoke left behind.
-    /// 4. Retire the observation gauges and stop the probe server.
-    /// 5. Tear the peer runtime down and report what it found.
-    ///
-    /// The peer runtime stays live through steps 1 to 4, because a partition
-    /// handler's commit hook can still queue an owed response. Tear the peer
-    /// down earlier and the process drops responses it already owes, and fails
-    /// requests it could still answer. Step 3 is what bounds step 5. The
-    /// compiler keeps that order: step 3 mints the proof step 5 demands, so
-    /// step 5 cannot be written ahead of it.
-    ///
-    /// This is the supported teardown, and it is the only one that waits. A
-    /// consumer that is dropped instead runs steps 1, 2 and 4, and only *asks*
-    /// the coordinator to run step 5. It runs no sweep and waits for no peer
-    /// step, so a runtime that already stops may run none of them.
+    /// It stops the poll loop, sweeps each partition, retires observations,
+    /// and joins response workers. The sweep closes every response sender.
     ///
     /// A second call, or a call on a clone whose sibling already ran, finds no
     /// runtime state and answers `Ok(())` without touching anything shared.
@@ -365,26 +329,16 @@ impl<C: Codec> ProsodyConsumer<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`ShutdownError::PollLoop`] when the poll loop task did not end
-    /// cleanly. Returns [`ShutdownError::Directory`] or
-    /// [`ShutdownError::Teardown`] when the peer teardown could not confirm the
-    /// removal of this node from the directory, or could not report what it
-    /// did. A row that survives expires on its lease.
-    ///
-    /// A poll failure wins over a peer report. It happens first, and it is the
-    /// more surprising of the two.
+    /// Returns [`ShutdownError::PollLoop`] when the poll loop task fails.
     pub async fn shutdown(mut self) -> Result<(), ShutdownError> {
         let Some((teardown, poll_failure)) = self.stop_polling().await else {
             return Ok(());
         };
         let swept = sweep::drain_managers(&self.managers).await;
-        let peer_report = match teardown.release(swept).await {
-            Some(peer) => peer.stop().await,
-            None => Ok(()),
-        };
+        teardown.release(swept).await.join().await;
         match poll_failure {
             Some(failure) => Err(failure),
-            None => peer_report,
+            None => Ok(()),
         }
     }
 
@@ -400,12 +354,9 @@ impl<C: Codec> ProsodyConsumer<C> {
             poll_handle,
             probe_server,
             observer,
-            peer,
+            responses,
         } = self.runtime_state.lock().take()?;
 
-        if let Some(peer) = &peer {
-            peer.close_admission();
-        }
         self.shutdown.store(true, Ordering::Relaxed);
 
         let poll_failure = match poll_handle.await {
@@ -418,7 +369,7 @@ impl<C: Codec> ProsodyConsumer<C> {
             Teardown {
                 probe_server,
                 observer,
-                peer,
+                responses,
             },
             poll_failure,
         ))
@@ -426,23 +377,26 @@ impl<C: Codec> ProsodyConsumer<C> {
 }
 
 impl Teardown {
-    /// Retires the observation gauges, stops the probe server, and hands the
-    /// still-live peer handles back.
+    /// Retires observation resources and returns the response workers.
     ///
     /// The [`Swept`](sweep::Swept) proof is the parameter, and only the sweep
-    /// mints one, so this step cannot be written ahead of the sweep. The peer
-    /// teardown reads the return value, so neither can that.
-    async fn release(mut self, _swept: sweep::Swept) -> Option<PeerHandles> {
-        let peer = self.peer.take();
-        self.stop_observation().await;
-        peer
+    /// mints one, so this step cannot run before the sweep.
+    async fn release(self, _swept: sweep::Swept) -> ResponseWorkers {
+        let Self {
+            probe_server,
+            observer,
+            responses,
+        } = self;
+        observer.retire_gauges();
+        if let Some(probe_server) = probe_server {
+            probe_server.shutdown().await;
+        }
+        responses
     }
 
     /// Retires the observation gauges and stops the probe server.
     ///
-    /// This consumes the value, so any peer handles it still holds drop here.
-    /// Dropping them asks the coordinator to tear the peer runtime down, and
-    /// nothing here waits for that teardown.
+    /// This consumes the value. Dropping its workers detaches their tasks.
     /// [`Drop`](ProsodyConsumer::drop) calls this instead of
     /// [`release`](Self::release), because it runs no sweep and holds no proof.
     async fn stop_observation(self) {
@@ -457,18 +411,11 @@ impl Teardown {
     }
 }
 
-/// Starts the teardown when a consumer is dropped without a shutdown.
-///
-/// Dropping the peer stop sender starts the peer teardown. `Drop` does not wait
-/// for it, so a process that exits at once can leave a row until its lease
-/// expires.
+/// Stops the poll loop when a consumer drops without a shutdown.
 ///
 /// `Drop` also runs no partition sweep, which
-/// [`shutdown`](ProsodyConsumer::shutdown) makes step 3. This path blocks the
-/// thread that drops the consumer, and the sweep waits for the work every
-/// retained manager still runs. So a teardown started here is not bounded by
-/// the sweep. A manager the final revoke left behind can hold a response send
-/// handle open.
+/// [`shutdown`](ProsodyConsumer::shutdown) performs. A retained manager can
+/// therefore keep a detached response worker open.
 ///
 /// This path does await the probe server task. A current-thread runtime cannot
 /// drive that task while this blocks its only thread, so call `shutdown` from

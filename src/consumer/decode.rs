@@ -59,6 +59,18 @@ pub struct DecodedMessage<P> {
     pub parent_context: Context,
 }
 
+/// Selects whether this consumer accepts peer request headers.
+pub(crate) trait RequestAdmission: Send {
+    /// Reads a request tag admitted by this consumer.
+    fn request(&self, message: &BorrowedMessage) -> Option<RequestTag>;
+}
+
+/// Rejects all peer request headers.
+pub(crate) struct NoRequests;
+
+/// Accepts peer requests for one subsystem.
+pub(crate) struct SubsystemRequests(pub(crate) SubsystemName);
+
 /// Decodes and validates a Kafka message into a `DecodedMessage`.
 ///
 /// The decoded message contains immutable data and parent trace context.
@@ -71,11 +83,11 @@ pub struct DecodedMessage<P> {
 /// `message` is taken as `&mut` so the codec can parse the payload in place
 /// via `payload_mut`, avoiding a copy; its payload bytes are left in an
 /// unspecified state after this call.
-pub fn decode_message<C: Codec>(
+pub fn decode_message<C: Codec, A: RequestAdmission>(
     message: &mut BorrowedMessage,
     propagator: &TextMapCompositePropagator,
     codec: &mut C,
-    responder: Option<&SubsystemName>,
+    admission: &A,
 ) -> Option<DecodedMessage<C::Payload>> {
     let topic: Topic = Intern::from(message.topic());
     let partition = message.partition();
@@ -84,7 +96,7 @@ pub fn decode_message<C: Codec>(
     let parent_context = propagator.extract(&MessageExtractor::new(message));
 
     let source_system = extract_source_system(message);
-    let request = extract_request_tag(message, responder);
+    let request = admission.request(message);
     let timestamp = resolve_timestamp(message);
 
     let Some(key_data) = message.key() else {
@@ -190,22 +202,33 @@ fn extract_source_system(message: &BorrowedMessage) -> Option<SourceSystem> {
 ///
 /// An unusable header set is counted and dropped, never failed.
 /// [`HeaderRejection`](crate::response::headers::HeaderRejection) states why.
-fn extract_request_tag(
-    message: &BorrowedMessage,
-    responder: Option<&SubsystemName>,
-) -> Option<RequestTag> {
-    let responder = responder?;
-    let headers = message.headers()?;
+impl RequestAdmission for NoRequests {
+    fn request(&self, _message: &BorrowedMessage) -> Option<RequestTag> {
+        None
+    }
+}
 
-    match parse_request_tag(
-        headers.iter().map(|header| (header.key, header.value)),
-        responder,
-    ) {
-        Ok(tag) => tag,
-        Err(rejection) => {
-            rejection.record();
-            None
+impl RequestAdmission for SubsystemRequests {
+    fn request(&self, message: &BorrowedMessage) -> Option<RequestTag> {
+        let headers = message.headers()?;
+
+        match parse_request_tag(
+            headers.iter().map(|header| (header.key, header.value)),
+            &self.0,
+        ) {
+            Ok(tag) => tag,
+            Err(rejection) => {
+                rejection.record();
+                None
+            }
         }
+    }
+}
+
+impl RequestAdmission for Option<&SubsystemName> {
+    fn request(&self, message: &BorrowedMessage) -> Option<RequestTag> {
+        let subsystem = self.as_ref()?;
+        SubsystemRequests((*subsystem).clone()).request(message)
     }
 }
 

@@ -18,6 +18,7 @@ use prosody::consumer::{
     CommonConfiguration, ConsumerConfiguration, ConsumerSetup, KeyedStateConfiguration,
     PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
+use prosody::peer::{LocalRouter, PeerConfiguration, Router};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
 use prosody::tracing::init_test_logging;
@@ -88,8 +89,8 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         timeout: TimeoutConfigurationBuilder::default().build()?,
         dedup: DeduplicationConfigurationBuilder::default().build()?,
         keyed_state: KeyedStateConfiguration::builder().build()?,
-        peer: None,
     };
+    let router = LocalRouter::new(&PeerConfiguration::default()).await?;
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
         ConsumerSetup {
@@ -100,6 +101,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         pipeline_config,
         telemetry,
         handler,
+        &router,
     )
     .await?;
 
@@ -131,7 +133,9 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
     }
     .await;
     let shutdown = consumer.shutdown().await;
+    let router_shutdown = router.shutdown().await;
     admin_client.delete_topic(&topic).await?;
     shutdown?;
+    router_shutdown?;
     outcome
 }

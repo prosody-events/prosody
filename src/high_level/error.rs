@@ -34,10 +34,6 @@ pub enum HighLevelClientError<E> {
     #[error("invalid scheduler configuration: {0:#}")]
     SchedulerConfiguration(#[from] SchedulerInitError),
 
-    /// Error when attempting to use an unconfigured consumer.
-    #[error("unconfigured consumer; client does not have a valid consumer configuration")]
-    UnconfiguredConsumer,
-
     /// Error when the consumer configuration failed during build.
     #[error("consumer configuration failed: {0:#}")]
     ConsumerConfiguration(ModeConfigurationError),

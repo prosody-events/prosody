@@ -66,11 +66,7 @@ mod tests;
 /// from the directory and fleet that route its work.
 ///
 /// `subsystem` is the name this consumer answers peer requests for. The decode
-/// path admits a request tag for one name, and it reads that name back from
-/// this responder through
-/// [`PeerAttachment::responder`](crate::peer::PeerAttachment::responder).
-/// So the name a record is admitted by and the name its answer claims are one
-/// value.
+/// path and this responder use the same subsystem value.
 pub(crate) struct Responder<C: Codec> {
     sender: TypedSender<C>,
     subsystem: SubsystemName,

@@ -104,7 +104,8 @@ async fn quickstart() -> Result<()> {
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-    )?;
+    )
+    .await?;
 
     client.subscribe(MyHandler { sender }).await?;
 

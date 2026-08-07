@@ -12,7 +12,7 @@ use crate::consumer::sweep::drain_managers;
 use crate::consumer::{Managers, ProsodyConsumer, RuntimeState, WatermarkVersion};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
-use crate::peer::PeerAttachment;
+use crate::peer::ConsumerResources;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
 use crate::telemetry::Telemetry;
@@ -58,9 +58,7 @@ pub(in crate::consumer) struct StartupServices<'a, P> {
 /// client configured to report statistics, and its first observation is seeded
 /// by [`KafkaObserver::install_startup_metadata`], which owns that contract.
 ///
-/// `peer` decides whether this consumer joins the peer fleet, and whether it
-/// answers peer requests. It is activated after the client subscribes, which is
-/// the last step that can fail, and every earlier failure arm abandons it.
+/// `peer` selects request admission and response workers by type.
 ///
 /// Every caller wraps this future in `Box::pin`, because
 /// `clippy::large_futures` warns otherwise. The allocation is one per consumer
@@ -70,7 +68,7 @@ pub(in crate::consumer) struct StartupServices<'a, P> {
 /// (if enabled), the consumer context can't be created, the hostname can't be
 /// retrieved for the client ID, the Kafka consumer can't be created with the
 /// provided configuration, topic subscription fails, the startup metadata
-/// fetch fails, or the peer node cannot be published.
+/// fetch fails.
 pub(in crate::consumer) async fn initialize_consumer<T, P, SP, C, A>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
@@ -87,13 +85,13 @@ where
         EventSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
-    A: PeerAttachment + 'static,
+    A: ConsumerResources,
 {
     if let Err(error) = consumer_config.validate() {
         // Release the last responder clone before peer abandonment joins its
         // workers. Otherwise, this provider keeps every queue open.
         drop(handler_provider);
-        peer.abandon().await;
+        peer.workers().join().await;
         return Err(error.into());
     }
     let StartupServices {
@@ -122,7 +120,7 @@ where
         Ok(probe_server) => probe_server,
         Err(error) => {
             drop(handler_provider);
-            peer.abandon().await;
+            peer.workers().join().await;
             return Err(error.into());
         }
     };
@@ -144,7 +142,7 @@ where
     .await;
 
     // The failure arm for every step after the probe bound: the observation is
-    // discarded, the partition managers swept, the prepared peer released, and
+    // discarded, the partition managers swept, the response workers joined, and
     // the probe port freed. Clearing after the task, rather than inside it,
     // also covers a fetch that panicked — see `KafkaObserver::clear`.
     //
@@ -158,15 +156,14 @@ where
         Err(error) => {
             observer.clear();
             drain_managers(&managers).await;
-            peer.abandon().await;
+            peer.workers().join().await;
             return Err(release_probe(probe_server, error).await);
         }
     };
 
-    // The attachment names what the poll loop admits, so a consumer reads a
-    // request tag only when it holds the responder that answers it.
-    let responder = peer.responder();
-    let peer = peer.attach();
+    // The resource type admits only the request tags it can answer.
+    let admission = peer.admission();
+    let responses = peer.workers();
 
     let poll_interval = consumer_config.poll_interval;
     let heartbeat = heartbeats.register("Kafka poll loop");
@@ -186,7 +183,7 @@ where
             heartbeat: &heartbeat,
             shutdown: &cloned_shutdown,
             message_spans,
-            responder,
+            admission,
         });
     });
 
@@ -194,7 +191,7 @@ where
         poll_handle,
         probe_server,
         observer,
-        peer,
+        responses,
     })));
 
     Ok(ProsodyConsumer {

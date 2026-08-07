@@ -86,7 +86,7 @@ async fn create_test_topics(
 }
 
 /// Creates a configured `HighLevelClient` for regex subscription testing.
-fn create_high_level_client(
+async fn create_high_level_client(
     regex_pattern: String,
     consumer_group: String,
 ) -> Result<CassandraHighLevelClient<FallibleTestHandler>, HighLevelClientError<JsonCodecError>> {
@@ -123,6 +123,7 @@ fn create_high_level_client(
         &mut producer_builder,
         &consumer_builders,
     )
+    .await
 }
 
 /// Sends test messages to all topics and returns expected matching count.
@@ -237,7 +238,7 @@ async fn test_regex_topic_subscription() -> Result<()> {
     let (messages_tx, mut messages_rx) = channel(10);
 
     // Create and configure high-level client
-    let client = create_high_level_client(regex_pattern, consumer_group)?;
+    let client = create_high_level_client(regex_pattern, consumer_group).await?;
     client
         .subscribe(FallibleTestHandler { messages_tx })
         .await?;

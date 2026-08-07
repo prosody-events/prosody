@@ -7,7 +7,8 @@ use super::{
 use crate::consumer::Managers;
 use crate::consumer::error::{ConsumerError, PeerInitError};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::peer::{NoPeer, prepare_requester};
+use crate::peer::runtime::prepare_router;
+use crate::peer::{NoPeer, Router};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use parking_lot::Mutex;
@@ -15,11 +16,10 @@ use serde_json::Value;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 
-/// A consumer that carries no peer configuration starts, runs and stops
-/// exactly as it did before the peer runtime existed: it touches no directory,
-/// and its shutdown reports success.
+/// A consumer without response resources starts and stops without directory
+/// access.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_consumer_without_a_peer_starts_and_stops() -> Result<()> {
+async fn a_consumer_without_responses_starts_and_stops() -> Result<()> {
     let log: EventLog = Arc::new(Mutex::new(Vec::new()));
     let config = consumer_config("peer-lifecycle-none")?;
     let managers: Arc<Managers<Value>> = Arc::default();
@@ -35,10 +35,8 @@ async fn a_consumer_without_a_peer_starts_and_stops() -> Result<()> {
     Ok(())
 }
 
-/// The peer runtime outlives the handlers. Shutdown joins the poll loop, which
-/// drops the client and therefore the handler provider, then sweeps the
-/// partition manager the final revoke left behind, and only then lets the
-/// coordinator deregister this node.
+/// The router outlives the handlers. Consumer shutdown joins the poll loop and
+/// sweeps the partition manager before router shutdown deregisters the node.
 ///
 /// The sweep is what bounds the peer teardown, so its position between the two
 /// is asserted rather than its occurrence.
@@ -53,13 +51,13 @@ async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
     let managers: Arc<Managers<Value>> = Arc::default();
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let attachment = prepare_requester(&peer, &backend, true).await?;
+    let router = prepare_router(&peer, &backend).await?;
     let consumer = start(
         &config,
         Arc::clone(&managers),
         heartbeats,
         Arc::clone(&log),
-        attachment,
+        NoPeer,
     )
     .await?;
     assert!(
@@ -71,6 +69,7 @@ async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
     retain_manager(&config, &managers, Arc::clone(&log))?;
 
     consumer.shutdown().await?;
+    router.shutdown().await?;
 
     let events = log.lock();
     let position = |wanted: &Event| events.iter().position(|event| event == wanted);
@@ -145,7 +144,7 @@ async fn failed_activation_rolls_back_and_releases_the_listener() -> Result<()> 
         directory: directory.clone(),
     };
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let error = prepare_requester(&peer, &backend, true)
+    let error = prepare_router(&peer, &backend)
         .await
         .err()
         .ok_or_else(|| eyre!("peer startup succeeded despite the scripted failure"))?;

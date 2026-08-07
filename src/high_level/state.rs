@@ -1,20 +1,11 @@
-//! State management for the consumer in a message processing system.
-//!
-//! This module defines the `ConsumerState` enum to represent different states
-//! of the consumer, along with methods for building and displaying the state.
-//! It also includes a custom error type for handling state-related errors.
+//! High-level consumer subscription state.
 
 use crate::Codec;
 use crate::consumer::ProsodyConsumer;
-use crate::high_level::config::{
-    ModeConfiguration, ModeConfigurationBuildParams, ModeConfigurationError,
-};
+use crate::high_level::config::ModeConfiguration;
 use educe::Educe;
-use std::fmt;
-use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use tokio::sync::MutexGuard;
-use tracing::info;
 
 /// A wrapper around a mutex guard for `ConsumerState`.
 ///
@@ -34,14 +25,9 @@ impl<T, C: Codec> Deref for ConsumerStateView<'_, T, C> {
 ///
 /// Reader infrastructure belongs to the high-level client's reader component,
 /// not this subscription state machine.
-#[derive(Educe, Default)]
+#[derive(Educe)]
 #[educe(Debug)]
 pub enum ConsumerState<T, C: Codec> {
-    /// The consumer is not yet configured.
-    #[default]
-    Unconfigured,
-    /// The consumer configuration failed during build.
-    ConfigurationFailed(ModeConfigurationError),
     /// The consumer is configured but not running.
     Configured {
         /// The configuration to run when subscribed.
@@ -56,34 +42,4 @@ pub enum ConsumerState<T, C: Codec> {
         /// The handler for processing messages.
         handler: T,
     },
-}
-
-impl<T, C: Codec> ConsumerState<T, C> {
-    /// Builds a new `ConsumerState` from the given configuration, returning
-    /// [`ConsumerState::Configured`] on success or
-    /// [`ConsumerState::ConfigurationFailed`] with the error otherwise.
-    pub(crate) fn build(params: &ModeConfigurationBuildParams) -> Self {
-        match ModeConfiguration::build(params) {
-            Ok(configuration) => Self::Configured {
-                config: configuration,
-            },
-            Err(error) => {
-                info!("disabling consumer (safe to ignore if you're only producing): {error:#}");
-                Self::ConfigurationFailed(error)
-            }
-        }
-    }
-}
-
-impl<T, C: Codec> Display for ConsumerState<T, C> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let state = match self {
-            ConsumerState::Unconfigured => "unconfigured",
-            ConsumerState::ConfigurationFailed(_) => "configuration failed",
-            ConsumerState::Configured { .. } => "configured",
-            ConsumerState::Running { .. } => "running",
-        };
-
-        f.write_str(state)
-    }
 }

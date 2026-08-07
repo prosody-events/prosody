@@ -16,6 +16,7 @@ use crate::high_level::config::ModeConfiguration;
 pub use crate::high_level::error::HighLevelClientError;
 pub use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
+use crate::peer::Router;
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::requester::{Outcome, RequestError};
 use crate::state::descriptor::{Registered, StateDescriptor};
@@ -28,9 +29,8 @@ use crate::{Codec, Topic};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::future::Future;
-use std::mem::take;
 use std::time::Duration;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 use tracing::info;
 
 mod backend;
@@ -71,10 +71,9 @@ where
     producer_config: ProducerConfiguration,
     consumer: Mutex<ConsumerState<T, C>>,
     #[educe(Debug(ignore))]
-    reader: OnceCell<StateReaderClient<C, B::Reader>>,
+    reader: StateReaderClient<C, B::Reader>,
     #[educe(Debug(ignore))]
-    reader_config: Option<ReaderConfiguration>,
-    backend: B,
+    router: B::Router,
     propagator: TextMapCompositePropagator,
     telemetry: Telemetry,
 }
@@ -85,26 +84,6 @@ where
     C::Payload: crate::EventIdentity,
     B: ClientBackend<C>,
 {
-    async fn reader(
-        &self,
-    ) -> Result<StateReaderClient<C, B::Reader>, HighLevelClientError<C::Error>>
-    where
-        C::Payload: Clone,
-    {
-        let config = self
-            .reader_config
-            .as_ref()
-            .ok_or(HighLevelClientError::UnconfiguredConsumer)?;
-        self.reader
-            .get_or_try_init(|| async {
-                deps::build(config, &self.backend)
-                    .await
-                    .map(StateReaderClient::new)
-            })
-            .await
-            .cloned()
-    }
-
     /// Returns a reference to the internal `ProsodyProducer`.
     pub fn producer(&self) -> &ProsodyProducer<C> {
         &self.producer
@@ -156,9 +135,6 @@ where
 
     /// Sends one request and returns one outcome per subsystem.
     ///
-    /// Subscribe the client first. The subscription starts the peer runtime
-    /// that owns this process's response listener and request registry.
-    ///
     /// # Errors
     ///
     /// Returns [`RequestError`] for an unavailable runtime, invalid arguments,
@@ -178,14 +154,7 @@ where
         R: Codec<Payload = Result<V, E>>,
         E: ClassifyError,
     {
-        let requester = {
-            let guard = self.consumer.lock().await;
-            let ConsumerState::Running { consumer, .. } = &*guard else {
-                return Err(RequestError::NotRunning);
-            };
-            consumer.requester::<R>(self.producer.clone())
-        }
-        .ok_or(RequestError::NotRunning)?;
+        let requester = self.router.requester::<C, R>(self.producer.clone());
         requester
             .request(headers, topic, key, payload, subsystems, timeout)
             .await
@@ -202,9 +171,7 @@ where
     /// # Errors
     ///
     /// Returns [`HighLevelClientError::AlreadySubscribed`] when the consumer
-    /// is already running (registrations are frozen), or
-    /// [`HighLevelClientError::UnconfiguredConsumer`] when there is no valid
-    /// consumer configuration to register against. A published descriptor
+    /// is already running (registrations are frozen). A published descriptor
     /// without a configured subsystem returns
     /// [`HighLevelClientError::StateRegistration`].
     pub async fn register<D>(
@@ -218,9 +185,6 @@ where
         match &mut *guard {
             ConsumerState::Configured { config } => config.register(descriptor).map_err(Into::into),
             ConsumerState::Running { .. } => Err(HighLevelClientError::AlreadySubscribed),
-            ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => {
-                Err(HighLevelClientError::UnconfiguredConsumer)
-            }
         }
     }
 
@@ -228,8 +192,8 @@ where
     /// hook lets the composition suite seed committed state into the exact
     /// stores that the running consumer and the client's readers share.
     #[cfg(test)]
-    pub(crate) fn retained_deps(&self) -> Option<StateReaderDependencies<C, B::Reader>> {
-        self.reader.get().map(StateReaderClient::deps)
+    pub(crate) fn retained_deps(&self) -> StateReaderDependencies<C, B::Reader> {
+        self.reader.deps()
     }
 
     /// Composes a standalone [`StateReader`] over this client's one shared
@@ -241,10 +205,9 @@ where
     ///
     /// # Errors
     ///
-    /// [`HighLevelClientError::UnconfiguredConsumer`] if the client has no
-    /// consumer configuration; [`HighLevelClientError::StateReader`] if the
-    /// dependencies cannot be constructed or the descriptor is rejected.
-    pub async fn state<D>(
+    /// Returns [`HighLevelClientError::StateReader`] when the descriptor is
+    /// rejected.
+    pub fn state<D>(
         &self,
         subsystem: SubsystemName,
         descriptor: D,
@@ -253,8 +216,8 @@ where
         D: StateDescriptor,
         C::Payload: Clone,
     {
-        self.reader()
-            .await?
+        self.reader
+            .clone()
             .state(subsystem, descriptor)
             .map_err(HighLevelClientError::StateReader)
     }
@@ -265,6 +228,7 @@ where
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
+        router: &B::Router,
     ) -> (
         Result<ProsodyConsumer<C>, HighLevelClientError<C::Error>>,
         ModeConfiguration,
@@ -284,6 +248,7 @@ where
             } => Box::pin(ProsodyConsumer::<C>::pipeline_consumer_with_backend::<
                 T,
                 B::Reader,
+                B::Router,
             >(
                 deps::consumer_setup::<C, B>(consumer, common, &shared),
                 PipelineMiddlewareConfiguration {
@@ -293,6 +258,7 @@ where
                 },
                 telemetry,
                 handler,
+                router,
             ))
             .await
             .map_err(Into::into),
@@ -304,6 +270,7 @@ where
             } => Box::pin(ProsodyConsumer::low_latency_consumer_with_backend::<
                 T,
                 B::Reader,
+                B::Router,
             >(
                 deps::consumer_setup::<C, B>(consumer, common, &shared),
                 LowLatencyMiddlewareConfiguration {
@@ -313,14 +280,20 @@ where
                 producer,
                 telemetry,
                 handler,
+                router,
             ))
             .await
             .map_err(Into::into),
             ModeConfiguration::BestEffort { consumer, common } => {
-                Box::pin(ProsodyConsumer::<C>::best_effort_consumer::<T, B::Reader>(
+                Box::pin(ProsodyConsumer::<C>::best_effort_consumer::<
+                    T,
+                    B::Reader,
+                    B::Router,
+                >(
                     deps::consumer_setup::<C, B>(consumer, common, &shared),
                     telemetry,
                     handler,
+                    router,
                 ))
                 .await
                 .map_err(Into::into)
@@ -335,6 +308,7 @@ where
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
+        router: &B::Router,
     ) -> (
         Result<ProsodyConsumer<C>, HighLevelClientError<C::Error>>,
         ModeConfiguration,
@@ -355,7 +329,12 @@ where
                 defer,
                 common,
             } => Box::pin(
-                ProsodyConsumer::<C>::pipeline_responding_consumer_with_backend::<T, R, B::Reader>(
+                ProsodyConsumer::<C>::pipeline_responding_consumer_with_backend::<
+                    T,
+                    R,
+                    B::Reader,
+                    B::Router,
+                >(
                     deps::consumer_setup::<C, B>(consumer, common, &shared),
                     PipelineMiddlewareConfiguration {
                         retry: retry.clone(),
@@ -364,6 +343,7 @@ where
                     },
                     telemetry,
                     handler,
+                    router,
                 ),
             )
             .await
@@ -374,7 +354,12 @@ where
                 failure_topic,
                 common,
             } => Box::pin(
-                ProsodyConsumer::low_latency_responding_consumer_with_backend::<T, R, B::Reader>(
+                ProsodyConsumer::low_latency_responding_consumer_with_backend::<
+                    T,
+                    R,
+                    B::Reader,
+                    B::Router,
+                >(
                     deps::consumer_setup::<C, B>(consumer, common, &shared),
                     LowLatencyMiddlewareConfiguration {
                         retry: retry.clone(),
@@ -383,6 +368,7 @@ where
                     producer,
                     telemetry,
                     handler,
+                    router,
                 ),
             )
             .await
@@ -392,10 +378,12 @@ where
                     T,
                     R,
                     B::Reader,
+                    B::Router,
                 >(
                     deps::consumer_setup::<C, B>(consumer, common, &shared),
                     telemetry,
                     handler,
+                    router,
                 ))
                 .await
                 .map_err(Into::into)
@@ -429,27 +417,12 @@ where
     {
         let mut guard = self.consumer.lock().await;
 
-        // Take the state out. Only `Configured` proceeds; the others restore
-        // themselves (or leave `Unconfigured`) and return their errors.
-        let config = match take(&mut *guard) {
-            ConsumerState::Unconfigured => return Err(HighLevelClientError::UnconfiguredConsumer),
-            ConsumerState::ConfigurationFailed(error) => {
-                return Err(HighLevelClientError::ConsumerConfiguration(error));
-            }
-            ConsumerState::Configured { config } => config,
-            running @ ConsumerState::Running { .. } => {
-                *guard = running;
-                return Err(HighLevelClientError::AlreadySubscribed);
-            }
+        let config = match &*guard {
+            ConsumerState::Configured { config } => config.clone(),
+            ConsumerState::Running { .. } => return Err(HighLevelClientError::AlreadySubscribed),
         };
 
-        let shared = match self.reader().await {
-            Ok(reader) => reader.deps(),
-            Err(error) => {
-                *guard = ConsumerState::Configured { config };
-                return Err(error);
-            }
-        };
+        let shared = self.reader.deps();
 
         let (built, config) = assemble(
             config,
@@ -465,7 +438,6 @@ where
             Err(error) => {
                 // Restore the configured state so a transient build failure
                 // stays retryable.
-                *guard = ConsumerState::Configured { config };
                 return Err(error);
             }
         };
@@ -486,7 +458,7 @@ where
         B::Reader: ConsumerReaderBackend<C>,
     {
         self.subscribe_with(handler, |config, shared, producer, telemetry, handler| {
-            Self::build_consumer(config, shared, producer, telemetry, handler)
+            Self::build_consumer(config, shared, producer, telemetry, handler, &self.router)
         })
         .await
     }
@@ -504,7 +476,14 @@ where
         R: Codec<Payload = Result<T::Output, T::Error>>,
     {
         self.subscribe_with(handler, |config, shared, producer, telemetry, handler| {
-            Self::build_responding_consumer::<R>(config, shared, producer, telemetry, handler)
+            Self::build_responding_consumer::<R>(
+                config,
+                shared,
+                producer,
+                telemetry,
+                handler,
+                &self.router,
+            )
         })
         .await
     }
@@ -521,17 +500,17 @@ where
 
             // Restore `Configured`. Dropping the running consumer removes its
             // heartbeat registrations from the retained shared registry.
-            match take(&mut *guard) {
-                state @ (ConsumerState::Unconfigured
-                | ConsumerState::ConfigurationFailed(_)
-                | ConsumerState::Configured { .. }) => {
-                    *guard = state;
+            match &*guard {
+                ConsumerState::Configured { .. } => {
                     return Err(HighLevelClientError::NotSubscribed);
                 }
                 ConsumerState::Running {
                     consumer, config, ..
                 } => {
-                    *guard = ConsumerState::Configured { config };
+                    let consumer = consumer.clone();
+                    *guard = ConsumerState::Configured {
+                        config: config.clone(),
+                    };
                     consumer
                 }
             }
@@ -540,6 +519,22 @@ where
         info!("shutting down consumer");
         consumer.shutdown().await?;
         Ok(())
+    }
+
+    /// Stops the consumer, then stops the shared router.
+    ///
+    /// # Errors
+    ///
+    /// Returns the consumer error first. Otherwise, returns the router error.
+    pub async fn shutdown(self) -> Result<(), HighLevelClientError<C::Error>> {
+        let running = matches!(*self.consumer_state().await, ConsumerState::Running { .. });
+        let consumer = if running {
+            self.unsubscribe().await
+        } else {
+            Ok(())
+        };
+        let router = self.router.shutdown().await.map_err(Into::into);
+        consumer.and(router)
     }
 
     /// Returns the number of partitions assigned to the consumer.

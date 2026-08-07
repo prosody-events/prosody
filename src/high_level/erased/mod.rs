@@ -28,10 +28,6 @@ pub use readers::{
 /// Consumer lifecycle state materialized across an FFI boundary.
 #[derive(Clone, Debug)]
 pub enum ErasedConsumerState<T> {
-    /// No valid consumer configuration exists.
-    Unconfigured,
-    /// Consumer configuration failed.
-    ConfigurationFailed(String),
     /// The consumer is ready to subscribe.
     Configured(ErasedConsumerConfiguration),
     /// The consumer is running.
@@ -117,7 +113,7 @@ pub type SharedHighLevelClient<T, C> = Arc<dyn ErasedHighLevelClient<T, C>>;
 ///
 /// Backend selection and backend-specific configuration validation happen
 /// here so every foreign-language client follows the same construction path.
-pub fn new_erased<T, C>(
+pub async fn new_erased<T, C>(
     mode: Mode,
     producer: &mut ProducerConfigurationBuilder,
     consumers: &ConsumerBuilders,
@@ -131,14 +127,14 @@ where
     let mock = consumers.consumer.configured_mock()?;
 
     if mock {
-        Ok(Arc::new(ErasedClient(MemoryHighLevelClient::new(
-            mode, producer, consumers,
-        )?)))
+        Ok(Arc::new(ErasedClient(
+            MemoryHighLevelClient::new(mode, producer, consumers).await?,
+        )))
     } else {
         let cassandra = cassandra.build()?;
-        Ok(Arc::new(ErasedClient(CassandraHighLevelClient::new(
-            cassandra, mode, producer, consumers,
-        )?)))
+        Ok(Arc::new(ErasedClient(
+            CassandraHighLevelClient::new(cassandra, mode, producer, consumers).await?,
+        )))
     }
 }
 
@@ -176,10 +172,6 @@ where
 
     async fn consumer_state(&self) -> ErasedConsumerState<T> {
         match &*self.0.consumer_state().await {
-            ConsumerState::Unconfigured => ErasedConsumerState::Unconfigured,
-            ConsumerState::ConfigurationFailed(error) => {
-                ErasedConsumerState::ConfigurationFailed(error.to_string())
-            }
             ConsumerState::Configured { config, .. } => {
                 ErasedConsumerState::Configured(erased_config(config))
             }
@@ -198,7 +190,7 @@ where
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedValueReader<C>, ErasedReaderBuildError<C::Error>> {
-        readers::value(&self.0, subsystem, name, cache).await
+        readers::value(&self.0, subsystem, &name, cache)
     }
 
     async fn map_state(
@@ -207,7 +199,7 @@ where
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedMapReader<C>, ErasedReaderBuildError<C::Error>> {
-        readers::map(&self.0, subsystem, name, cache).await
+        readers::map(&self.0, subsystem, &name, cache)
     }
 
     async fn deque_state(
@@ -216,7 +208,7 @@ where
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedDequeReader<C>, ErasedReaderBuildError<C::Error>> {
-        readers::deque(&self.0, subsystem, name, cache).await
+        readers::deque(&self.0, subsystem, &name, cache)
     }
 
     async fn assigned_partition_count(&self) -> u32 {

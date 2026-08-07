@@ -260,7 +260,8 @@ async fn main() -> Result<()> {
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-    )?;
+    )
+    .await?;
 
     // One shared absolute fire time lands every timer in the same instant, so
     // the fires dispatch concurrently across the runtime's worker threads.

@@ -807,7 +807,7 @@ fn fulfill_requests<C: Codec>(
     debug!(topic = %topic, partition = partition, offset = offset, request_count = request_count,
         "Fulfilling active requests for message");
 
-    let decoded_message = decode_message(message, propagator, codec, responder);
+    let decoded_message = decode_message(message, propagator, codec, &responder);
 
     if let Some(decoded) = decoded_message {
         debug!(topic = %topic, partition = partition, offset = offset, request_count = request_count,

@@ -1,11 +1,10 @@
-//! Lazy construction of the client's shared reader family.
+//! Shared reader components for the high-level client.
 
 use crate::Codec;
 use crate::consumer::TypedConsumerSetup;
 use crate::consumer::{CommonConfiguration, ConsumerConfiguration};
 use crate::high_level::ClientBackend;
 use crate::high_level::config::ModeConfiguration;
-use crate::high_level::error::HighLevelClientError;
 use crate::loader::LoaderConfiguration;
 use crate::state_reader::StateReaderDependencies;
 use std::num::NonZeroU64;
@@ -45,21 +44,6 @@ impl ReaderConfiguration {
             cache_ttl: keyed_state.read_cache_ttl,
         }
     }
-}
-
-pub(super) async fn build<C, B>(
-    config: &ReaderConfiguration,
-    backend: &B,
-) -> Result<StateReaderDependencies<C, B::Reader>, HighLevelClientError<C::Error>>
-where
-    C: Codec,
-    C::Payload: Clone,
-    B: ClientBackend<C>,
-{
-    backend
-        .build_reader(config)
-        .await
-        .map_err(HighLevelClientError::StateReader)
 }
 
 pub(super) fn consumer_setup<'a, C, B>(

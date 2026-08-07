@@ -103,9 +103,6 @@ where
 }
 
 /// Builds the in-memory reader dependencies.
-///
-/// The backend selects a local-only peer runtime in mock mode. Peer startup
-/// refuses this backend outside mock mode.
 pub(in crate::consumer) fn memory_deps<C>(
     setup: &ConsumerSetup<'_>,
 ) -> StateReaderDependencies<C, MemoryReaderBackend<C>>

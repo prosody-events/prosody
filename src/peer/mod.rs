@@ -5,17 +5,17 @@
 //! client constructs one runtime and shares it with both.
 
 mod backend;
+mod router;
 pub(crate) mod runtime;
 
-pub(crate) use backend::{LocalPeerMode, NetworkPeerBackend, NetworkPeerMode, PeerBackend};
-pub(crate) use runtime::{
-    NoPeer, PeerAttachment, PeerHandles, PreparePeer, prepare_requester, prepare_responding,
-};
+pub(crate) use backend::PeerBackend;
+pub(crate) use runtime::{ConsumerResources, NoPeer};
 
 pub use crate::requester::{Outcome, ProsodyRequester, RequestError, ResponseFailure};
 pub use crate::router::config::{
     PeerConfiguration, PeerConfigurationBuilder, PeerConfigurationBuilderError,
 };
+pub use router::{GrpcRouter, LocalRouter, Router};
 
 use crate::codec::Codec;
 use crate::consumer::middleware::respond::Responder;

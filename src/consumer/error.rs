@@ -108,21 +108,9 @@ pub enum ConsumerError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum PeerInitError {
-    /// A responding consumer needs peer configuration.
-    ///
-    /// A public witness type would move one startup comparison to callers and
-    /// add public surface. Keep this precondition at startup.
-    #[error("a consumer that answers peer requests needs peer configuration")]
-    PeerRequired,
     /// A responding consumer needs a keyed-state subsystem name.
     #[error("a consumer that answers peer requests needs a keyed-state subsystem name")]
     SubsystemRequired,
-    /// A peer fleet was configured on in-memory storage outside mock mode.
-    #[error(
-        "a peer fleet needs a directory every process can read; in-memory storage outside mock \
-         mode serves only this process"
-    )]
-    MemoryDirectory,
     /// The peer configuration is invalid.
     #[error("invalid peer configuration: {message}")]
     Configuration {

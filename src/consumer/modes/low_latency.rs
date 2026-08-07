@@ -20,7 +20,7 @@ use crate::consumer::wiring::{
 };
 use crate::consumer::{Managers, ProsodyConsumer};
 use crate::high_level::config::TriggerStoreConfiguration;
-use crate::peer::{NoPeer, prepare_requester, prepare_responding};
+use crate::peer::{NoPeer, Router};
 use crate::producer::ProsodyProducer;
 use crate::state_reader::ConsumerReaderBackend;
 use crate::telemetry::Telemetry;
@@ -44,12 +44,13 @@ where
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub async fn low_latency_consumer<T>(
+    pub async fn low_latency_consumer<T, RT: Router>(
         setup: ConsumerSetup<'_>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
+        router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
@@ -68,6 +69,7 @@ where
                     producer,
                     telemetry,
                     handler,
+                    router,
                 )
                 .await
             }
@@ -83,6 +85,7 @@ where
                     producer,
                     telemetry,
                     handler,
+                    router,
                 )
                 .await
             }
@@ -96,15 +99,15 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`PeerInitError::PeerRequired`] without peer configuration.
     /// Returns [`PeerInitError::SubsystemRequired`] without a subsystem name.
     /// Returns [`ConsumerError`] when another startup step fails.
-    pub async fn low_latency_responding_consumer<T, R>(
+    pub async fn low_latency_responding_consumer<T, R, RT: Router>(
         setup: ConsumerSetup<'_>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
+        router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
@@ -116,7 +119,7 @@ where
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
                 let deps = memory_deps(&setup);
-                Self::low_latency_responding_consumer_with_backend::<T, R, _>(
+                Self::low_latency_responding_consumer_with_backend::<T, R, _, RT>(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
                         common: setup.common,
@@ -126,12 +129,13 @@ where
                     producer,
                     telemetry,
                     handler,
+                    router,
                 )
                 .await
             }
             (false, TriggerStoreConfiguration::Cassandra(config)) => {
                 let deps = cassandra_deps(&setup, config).await?;
-                Self::low_latency_responding_consumer_with_backend::<T, R, _>(
+                Self::low_latency_responding_consumer_with_backend::<T, R, _, RT>(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
                         common: setup.common,
@@ -141,18 +145,20 @@ where
                     producer,
                     telemetry,
                     handler,
+                    router,
                 )
                 .await
             }
         }
     }
 
-    pub(crate) async fn low_latency_consumer_with_backend<T, B>(
+    pub(crate) async fn low_latency_consumer_with_backend<T, B, RT: Router>(
         setup: TypedConsumerSetup<'_, C, B>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
+        _router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
@@ -188,41 +194,23 @@ where
             observer,
             managers: Arc::clone(&managers),
         };
-        // Preparation is the last fallible step of this mode: no `?` after it
-        // could drop a served listener.
-        match setup.common.peer.as_ref() {
-            Some(peer) => {
-                let attach =
-                    prepare_requester(peer, setup.deps.backend().as_ref(), setup.consumer.mock)
-                        .await?;
-                Box::pin(initialize_consumer::<_, _, _, C, _>(
-                    setup.consumer,
-                    provider,
-                    providers,
-                    services,
-                    attach,
-                ))
-                .await
-            }
-            None => {
-                Box::pin(initialize_consumer::<_, _, _, C, _>(
-                    setup.consumer,
-                    provider,
-                    providers,
-                    services,
-                    NoPeer,
-                ))
-                .await
-            }
-        }
+        Box::pin(initialize_consumer::<_, _, _, C, _>(
+            setup.consumer,
+            provider,
+            providers,
+            services,
+            NoPeer,
+        ))
+        .await
     }
 
-    pub(crate) async fn low_latency_responding_consumer_with_backend<T, R, B>(
+    pub(crate) async fn low_latency_responding_consumer_with_backend<T, R, B, RT: Router>(
         setup: TypedConsumerSetup<'_, C, B>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
+        router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
@@ -249,11 +237,6 @@ where
         .layer(topic)
         .layer(retry);
         let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let peer = setup
-            .common
-            .peer
-            .as_ref()
-            .ok_or(PeerInitError::PeerRequired)?;
         let subsystem = keyed_state
             .subsystem()
             .cloned()
@@ -271,20 +254,14 @@ where
         };
         // Preparation is the last fallible step of this mode, and no `?` runs
         // between it and the termination below.
-        let prepared = prepare_responding::<R, _>(
-            peer,
-            setup.deps.backend().as_ref(),
-            setup.consumer.mock,
-            subsystem,
-        )
-        .await?;
-        let (provider, attach) = prepared.terminate(&middleware, handler);
+        let prepared = router.responder::<R>(subsystem)?;
+        let (provider, resources) = prepared.terminate(&middleware, handler);
         Box::pin(initialize_consumer::<_, _, _, C, _>(
             setup.consumer,
             provider,
             providers,
             services,
-            attach,
+            resources,
         ))
         .await
     }

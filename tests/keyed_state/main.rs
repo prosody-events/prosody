@@ -28,6 +28,7 @@ use prosody::consumer::{
     PipelineMiddlewareConfiguration, ProsodyConsumer, message_state,
 };
 use prosody::loader::KafkaLoader;
+use prosody::peer::{LocalRouter, PeerConfiguration, Router};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::state::descriptor::StateDescriptor;
 use prosody::subsystem::SubsystemName;
@@ -63,6 +64,7 @@ struct CartEnv {
     topic: Topic,
     admin: &'static ProsodyAdminClient,
     consumer: ProsodyConsumer<JsonCodec>,
+    router: LocalRouter,
     producer: ProsodyProducer<JsonCodec>,
     observations: Receiver<Observation>,
     consumer_config: ConsumerConfiguration,
@@ -123,7 +125,6 @@ impl CartEnv {
             timeout: TimeoutConfigurationBuilder::default().build()?,
             dedup: DeduplicationConfigurationBuilder::default().build()?,
             keyed_state,
-            peer: None,
         };
         let trigger_store = common::create_cassandra_trigger_store_config();
 
@@ -136,6 +137,7 @@ impl CartEnv {
             telemetry.sender(),
         )?;
 
+        let router = LocalRouter::new(&PeerConfiguration::default()).await?;
         let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
             ConsumerSetup {
                 consumer: &consumer_config,
@@ -152,6 +154,7 @@ impl CartEnv {
                 observations_tx,
                 cart,
             },
+            &router,
         )
         .await?;
 
@@ -159,6 +162,7 @@ impl CartEnv {
             topic,
             admin,
             consumer,
+            router,
             producer,
             observations,
             consumer_config,
@@ -199,12 +203,13 @@ impl CartEnv {
         .await;
 
         let shutdown: Result<()> = self.consumer.shutdown().await.map_err(Into::into);
+        let router_shutdown: Result<()> = self.router.shutdown().await.map_err(Into::into);
         let cleanup: Result<()> = self
             .admin
             .delete_topic(&self.topic)
             .await
             .map_err(Into::into);
-        outcome.and(shutdown).and(cleanup)
+        outcome.and(shutdown).and(router_shutdown).and(cleanup)
     }
 }
 

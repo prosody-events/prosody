@@ -5,7 +5,8 @@ mod metrics;
 mod witness;
 mod worker;
 
-use self::metrics::{DropReason, Stage};
+pub(crate) use self::metrics::DropReason;
+use self::metrics::Stage;
 use self::witness::DeliveryWitness;
 use self::worker::{Job, WorkerContext, run_worker};
 use crate::codec::Codec;
@@ -86,6 +87,8 @@ pub(crate) struct ResponseWorkers(Box<[JoinHandle<()>]>);
 
 #[cfg(test)]
 pub(crate) use witness::SendCounters;
+#[cfg(test)]
+pub(crate) use worker::{Delivery as RouteDelivery, RouteOutcome};
 pub(crate) use worker::{ResponseRoute, Then};
 
 impl<C: Codec> TypedSender<C> {
@@ -241,6 +244,11 @@ impl<C: Codec> TypedSender<C> {
 }
 
 impl ResponseWorkers {
+    /// Builds an empty worker set for a consumer that sends no responses.
+    pub(crate) fn empty() -> Self {
+        Self(Box::new([]))
+    }
+
     /// Waits until every worker has finished what it holds.
     ///
     /// A dropped queue sender tells its worker that no more work can arrive.
