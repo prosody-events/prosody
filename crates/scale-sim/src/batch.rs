@@ -2,9 +2,9 @@ use std::num::TryFromIntError;
 use std::time::Duration;
 
 use prosody_scale_core::{
-    CapacityGrid, CapacityGridError, Cohort, Configuration, ConfigurationError, ModelTime,
-    ObservationBuffer, ObservationError, RandomStream, ScaleDecision, ScaleScratch, ScaleState,
-    ServiceObjective, step,
+    CapacityGrid, CapacityGridError, Cohort, Configuration, ConfigurationError, DemandClass,
+    ModelTime, ObservationBuffer, ObservationError, RandomStream, ReliabilityPrior, ScaleDecision,
+    ScaleScratch, ScaleState, ServiceObjective, TransitionPrior, step,
 };
 use thiserror::Error;
 
@@ -100,10 +100,16 @@ pub fn run_batch_slo_with_inputs(
     let objective = ServiceObjective::new(budget_micros, epsilon)?;
     let configuration = Configuration {
         cohort_count_max: PARTITION_COUNT,
+        calendar_segment_count_max: PARTITION_COUNT,
         partition_count: PARTITION_COUNT,
         replica_count_max: REPLICA_COUNT_MAX,
         slots_per_replica: DEFAULT_CONCURRENCY_PER_REPLICA,
         posterior_sample_count: 1_024,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
         objective,
     };
     let grid = CapacityGrid::new(
@@ -126,6 +132,7 @@ pub fn run_batch_slo_with_inputs(
             deadline_micros: budget_micros,
             offered_events: f64::from(partition_events[partition as usize]),
             partition,
+            demand_class: DemandClass::Normal,
         })?;
     }
     let decision = step(
@@ -207,9 +214,8 @@ const fn batch_event(event_index: u32) -> crate::EventSpec {
         key: event_index % 1_024,
         handler_micros: duration_seconds * 1_000_000,
         dependency_operations: 0,
-        transient_failures: 0,
-        permanent_rejection: false,
-        timer: false,
+        outcome: crate::EventOutcome::Final(crate::FinalOutcome::Success),
+        source: crate::EventSource::Message,
     }
 }
 
@@ -235,23 +241,21 @@ impl TickGenerator for BatchGraph {
             dependency_operations: 0,
             dependency_operation_micros: 0,
             handler_added_micros: 0,
-            transient_failures: 0,
-            permanent_rejection_every: 0,
+            outcome: crate::EventOutcomeRule::Success,
             launch_delay_micros: self.delay_micros,
             scale,
         })
     }
 
-    fn event(&self, context: EventContext<'_>) -> EventInputs {
+    fn event(&self, context: EventContext<'_>) -> Result<EventInputs, PlantError> {
         let event = batch_event(context.event_index);
-        EventInputs {
+        Ok(EventInputs {
             partition: event.partition,
             key: event.key,
             handler_micros: event.handler_micros,
             dependency_operations: event.dependency_operations,
-            transient_failures: event.transient_failures,
-            permanent_rejection: event.permanent_rejection,
-        }
+            outcome: event.outcome,
+        })
     }
 }
 

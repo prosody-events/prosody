@@ -17,7 +17,7 @@ use crate::{
 
 const WIDTH: u32 = 1_240;
 const PANEL_HEIGHT: u32 = 340;
-const PANEL_COUNT: u32 = 18;
+const PANEL_COUNT: u32 = 19;
 const LABEL_SPAN_DIVISOR: u64 = 6;
 const LABEL_GAP_FRACTION: f64 = 0.08_f64;
 const COLORS: [RGBColor; 4] = [
@@ -42,9 +42,10 @@ const STORY_FILES: [&str; PANEL_COUNT as usize] = [
     "13-reporter-coverage.svg",
     "14-snapshot-age.svg",
     "15-reliability-evidence.svg",
-    "16-decision-loss.svg",
-    "17-capacity-predictive.svg",
-    "18-capacity-coverage.svg",
+    "16-decision-pass.svg",
+    "17-decision-loss.svg",
+    "18-capacity-predictive.svg",
+    "19-capacity-coverage.svg",
 ];
 
 /// Evidence for one regime story.
@@ -314,6 +315,7 @@ fn story_panels(story: &RegimeStory<'_>) -> Result<[StoryPanel; PANEL_COUNT as u
         reporter_coverage_panel(trace),
         snapshot_age_panel(trace),
         reliability_evidence_panel(trace),
+        decision_pass_panel(trace, story.controller),
         decision_loss_panel(trace, story.controller),
         capacity_predictive_panel(story.controller),
         capacity_predictive_coverage_panel(story.controller),
@@ -514,8 +516,8 @@ fn shared_resource_panel(trace: &MetricTrace, inputs: &SeriesHistory) -> StoryPa
             ),
             metric_f64(
                 trace,
-                "useful throughput",
-                &trace.useful_throughput_per_second,
+                "completed attempts",
+                &trace.attempt_throughput_per_second,
             )
             .activity()
             .points(),
@@ -590,6 +592,45 @@ fn decision_loss_panel(trace: &MetricTrace, controller: &ControllerTrace) -> Sto
         ],
     )
     .with_heatmap(decision_loss_heatmap(controller))
+}
+
+fn decision_pass_panel(trace: &MetricTrace, controller: &ControllerTrace) -> StoryPanel {
+    StoryPanel::new(
+        "replicas; light color means higher SLO pass probability",
+        vec![
+            metric_u32(trace, "actual", &trace.replicas).step(),
+            metric_u32(trace, "selected target", &trace.target).points(),
+        ],
+    )
+    .with_heatmap(decision_pass_heatmap(controller))
+}
+
+fn decision_pass_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
+    let Some(first) = controller.decision_pass_probabilities(0) else {
+        return PosteriorHeatmap {
+            at_micros: Vec::new(),
+            values: Vec::new(),
+            probabilities: Vec::new(),
+        };
+    };
+    let values = (1..=first.len()).map(|replicas| replicas as f64).collect();
+    let mut at_micros = Vec::with_capacity(controller.len());
+    let mut probabilities = Vec::with_capacity(controller.len().saturating_mul(first.len()));
+    for index in 0..controller.len() {
+        let Some(sample) = controller.sample(index) else {
+            continue;
+        };
+        let Some(passes) = controller.decision_pass_probabilities(index) else {
+            continue;
+        };
+        at_micros.push(sample.at_micros);
+        probabilities.extend_from_slice(passes);
+    }
+    PosteriorHeatmap {
+        at_micros,
+        values,
+        probabilities,
+    }
 }
 
 fn decision_loss_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {

@@ -51,6 +51,8 @@ pub struct MetricPoint {
     pub dependency_utilization: f64,
     /// Useful throughput per second.
     pub useful_throughput_per_second: f64,
+    /// Completed handler attempts per second.
+    pub attempt_throughput_per_second: f64,
     /// Live operation concurrency for resource inference.
     pub resource_concurrency: f64,
     /// Low posterior capacity rate.
@@ -135,6 +137,7 @@ impl MetricPoint {
             handler_utilization_cv: 0.0_f64,
             dependency_utilization: 0.0_f64,
             useful_throughput_per_second: 0.0_f64,
+            attempt_throughput_per_second: 0.0_f64,
             resource_concurrency: 0.0_f64,
             capacity_low_per_second: 0.0_f64,
             capacity_median_per_second: 0.0_f64,
@@ -194,6 +197,7 @@ pub struct MetricTrace {
     pub(crate) handler_utilization_cv: Vec<f64>,
     pub(crate) dependency_utilization: Vec<f64>,
     pub(crate) useful_throughput_per_second: Vec<f64>,
+    pub(crate) attempt_throughput_per_second: Vec<f64>,
     pub(crate) resource_concurrency: Vec<f64>,
     pub(crate) capacity_low_per_second: Vec<f64>,
     pub(crate) capacity_median_per_second: Vec<f64>,
@@ -263,6 +267,7 @@ impl MetricTrace {
             handler_utilization_cv: Vec::with_capacity(capacity),
             dependency_utilization: Vec::with_capacity(capacity),
             useful_throughput_per_second: Vec::with_capacity(capacity),
+            attempt_throughput_per_second: Vec::with_capacity(capacity),
             resource_concurrency: Vec::with_capacity(capacity),
             capacity_low_per_second: Vec::with_capacity(capacity),
             capacity_median_per_second: Vec::with_capacity(capacity),
@@ -334,6 +339,8 @@ impl MetricTrace {
             .push(point.dependency_utilization);
         self.useful_throughput_per_second
             .push(point.useful_throughput_per_second);
+        self.attempt_throughput_per_second
+            .push(point.attempt_throughput_per_second);
         self.resource_concurrency.push(point.resource_concurrency);
         self.capacity_low_per_second
             .push(point.capacity_low_per_second);
@@ -408,6 +415,7 @@ impl MetricTrace {
             handler_utilization_cv: self.handler_utilization_cv[index],
             dependency_utilization: self.dependency_utilization[index],
             useful_throughput_per_second: self.useful_throughput_per_second[index],
+            attempt_throughput_per_second: self.attempt_throughput_per_second[index],
             resource_concurrency: self.resource_concurrency[index],
             capacity_low_per_second: self.capacity_low_per_second[index],
             capacity_median_per_second: self.capacity_median_per_second[index],

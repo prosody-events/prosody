@@ -1,6 +1,5 @@
-use rand_distr::{Distribution, StandardNormal};
-
 use crate::RandomStream;
+use crate::random::sample_gamma;
 
 const WINDOW_COUNT: usize = 64;
 const PRIOR_CONCENTRATION: f64 = 1.0_f64;
@@ -135,35 +134,4 @@ impl PartitionFactor {
         }
         true
     }
-}
-
-fn sample_gamma(shape: f64, random: &mut RandomStream) -> f64 {
-    let adjusted_shape = shape.max(1.0_f64);
-    let d = adjusted_shape - 1.0_f64 / 3.0_f64;
-    let c = (9.0_f64 * d).sqrt().recip();
-    let sample = loop {
-        let normal = standard_normal(random);
-        let base = 1.0_f64 + c * normal;
-        if base <= 0.0_f64 {
-            continue;
-        }
-        let value = base * base * base;
-        let uniform = random.open_unit_f64();
-        let normal_squared = normal * normal;
-        if uniform < 1.0_f64 - 0.0331_f64 * normal_squared * normal_squared {
-            break d * value;
-        }
-        if uniform.ln() < 0.5_f64 * normal_squared + d * (1.0_f64 - value + value.ln()) {
-            break d * value;
-        }
-    };
-    if shape < 1.0_f64 {
-        sample * random.open_unit_f64().powf(shape.recip())
-    } else {
-        sample
-    }
-}
-
-fn standard_normal(random: &mut RandomStream) -> f64 {
-    StandardNormal.sample(random)
 }

@@ -117,9 +117,8 @@ impl WorkloadSeries {
                     key: event_index % self.key_count,
                     handler_micros: self.handler_micros.sample(&mut random),
                     dependency_operations: self.dependency_operations,
-                    transient_failures: 0,
-                    permanent_rejection: false,
-                    timer: false,
+                    outcome: crate::EventOutcome::Final(crate::FinalOutcome::Success),
+                    source: crate::EventSource::Message,
                 })?;
                 event_index = event_index.saturating_add(1);
             }

@@ -1,18 +1,19 @@
 use std::time::Duration;
 
 use prosody_scale_core::{
-    ArrivalPosterior, CapacityGrid, Cohort, Configuration, ConfigurationError, HoldReason,
-    ModelTime, ObservationBuffer, PosteriorQuery, RandomStream, ResourceWindow, ScaleDecision,
-    ScaleScratch, ScaleState, ThroughputPosteriorCell, TransitionDirection, TransitionEvidence,
-    step,
+    ActuationCommitment, ArrivalPosterior, AttemptOutcomeCounts, AttemptOutcomeEvidence,
+    BacklogCohort, CapacityGrid, Cohort, Configuration, ConfigurationError, DemandClass,
+    HoldReason, ModelTime, ObservationBuffer, PosteriorQuery, RandomStream, ResourceWindow,
+    ScaleDecision, ScaleScratch, ScaleState, ThroughputPosteriorCell, TransitionDirection,
+    TransitionEvidence, step,
 };
 use statrs::distribution::{DiscreteCDF, NegativeBinomial, Poisson};
 use thiserror::Error;
 
 use crate::{
-    EventContext, EventInputs, FaultPattern, MetricTrace, PlantError, ReporterDirective,
-    ScaleDirective, Snapshot, SnapshotChannel, SnapshotCursor, SnapshotTable, TickContext,
-    TickGenerator, TickInputs,
+    CalendarForecastInput, EventContext, EventInputs, FaultPattern, MetricTrace, PlantError,
+    ReporterDirective, ScaleDirective, Snapshot, SnapshotChannel, SnapshotCursor, SnapshotTable,
+    TickContext, TickGenerator, TickInputs,
 };
 
 const HANDLER_COVERAGE_LEVELS: [f64; 4] = [0.5_f64, 0.8_f64, 0.9_f64, 0.95_f64];
@@ -87,8 +88,8 @@ pub struct ControllerSample {
     pub lead_time_seconds: f64,
     /// Mean live handler concurrency for the latest eligible window.
     pub resource_concurrency: f64,
-    /// Useful completion rate for the latest eligible window.
-    pub useful_throughput_per_second: f64,
+    /// Completed attempt rate for the latest eligible window.
+    pub attempt_throughput_per_second: f64,
     /// Capacity evidence emitted at this controller tick.
     pub capacity_evidence: CapacityEvidenceSample,
     /// Lower prequential throughput quantile at the accepted concurrency.
@@ -162,15 +163,15 @@ pub struct CapacityWindowSample {
     pub concurrency: f64,
     /// Eligible exposure duration.
     pub exposure_seconds: f64,
-    /// Useful completions during the exposure.
-    pub useful_completions: u32,
+    /// Handler attempts completed during the exposure.
+    pub completed_attempts: u32,
 }
 
 impl CapacityWindowSample {
     /// Returns useful completions per second.
     #[must_use]
     pub fn throughput_per_second(self) -> f64 {
-        f64::from(self.useful_completions) / self.exposure_seconds
+        f64::from(self.completed_attempts) / self.exposure_seconds
     }
 }
 
@@ -231,11 +232,11 @@ pub struct ControllerTrace {
     lead_time_down_seconds: Vec<f64>,
     lead_time_seconds: Vec<f64>,
     resource_concurrency: Vec<f64>,
-    useful_throughput_per_second: Vec<f64>,
+    attempt_throughput_per_second: Vec<f64>,
     capacity_evidence: Vec<CapacityEvidenceKind>,
     capacity_after_concurrency: Vec<f64>,
     capacity_after_exposure_seconds: Vec<f64>,
-    capacity_after_useful_completions: Vec<u32>,
+    capacity_after_completed_attempts: Vec<u32>,
     reporter: Vec<ReporterDirective>,
     capacity_predictive_low_per_second: Vec<f64>,
     capacity_predictive_median_per_second: Vec<f64>,
@@ -248,6 +249,8 @@ pub struct ControllerTrace {
     collapse_posterior: DiscretePosteriorTrace,
     knee_posterior: DiscretePosteriorTrace,
     saturation_state_posterior: DiscretePosteriorTrace,
+    normal_retry_posterior: DiscretePosteriorTrace,
+    failure_retry_posterior: DiscretePosteriorTrace,
     partition_share_posterior: DiscretePosteriorTrace,
     lead_time_up_posterior: DiscretePosteriorTrace,
     lead_time_down_posterior: DiscretePosteriorTrace,
@@ -258,6 +261,7 @@ pub struct ControllerTrace {
     arrival_rate: Vec<f64>,
     decision_candidate_count: usize,
     decision_expected_losses: Vec<f64>,
+    decision_pass_probabilities: Vec<f64>,
 }
 
 struct DiscretePosteriorTrace {
@@ -298,6 +302,10 @@ impl ControllerTrace {
         let knee_posterior = DiscretePosteriorTrace::new(state, PosteriorQuery::Knee, capacity)?;
         let saturation_state_posterior =
             DiscretePosteriorTrace::new(state, PosteriorQuery::SaturationState, capacity)?;
+        let normal_retry_posterior =
+            DiscretePosteriorTrace::new(state, PosteriorQuery::NormalRetryProbability, capacity)?;
+        let failure_retry_posterior =
+            DiscretePosteriorTrace::new(state, PosteriorQuery::FailureRetryProbability, capacity)?;
         let partition_share_posterior =
             DiscretePosteriorTrace::new(state, PosteriorQuery::PartitionShare, capacity)?;
         let lead_time_up_posterior = DiscretePosteriorTrace::new(
@@ -368,11 +376,11 @@ impl ControllerTrace {
             lead_time_down_seconds: Vec::with_capacity(capacity),
             lead_time_seconds: Vec::with_capacity(capacity),
             resource_concurrency: Vec::with_capacity(capacity),
-            useful_throughput_per_second: Vec::with_capacity(capacity),
+            attempt_throughput_per_second: Vec::with_capacity(capacity),
             capacity_evidence: Vec::with_capacity(capacity),
             capacity_after_concurrency: Vec::with_capacity(capacity),
             capacity_after_exposure_seconds: Vec::with_capacity(capacity),
-            capacity_after_useful_completions: Vec::with_capacity(capacity),
+            capacity_after_completed_attempts: Vec::with_capacity(capacity),
             reporter: Vec::with_capacity(capacity),
             capacity_predictive_low_per_second: Vec::with_capacity(capacity),
             capacity_predictive_median_per_second: Vec::with_capacity(capacity),
@@ -385,6 +393,8 @@ impl ControllerTrace {
             collapse_posterior,
             knee_posterior,
             saturation_state_posterior,
+            normal_retry_posterior,
+            failure_retry_posterior,
             partition_share_posterior,
             lead_time_up_posterior,
             lead_time_down_posterior,
@@ -395,6 +405,7 @@ impl ControllerTrace {
             arrival_rate: Vec::with_capacity(capacity),
             decision_candidate_count,
             decision_expected_losses: Vec::with_capacity(decision_cell_count),
+            decision_pass_probabilities: Vec::with_capacity(decision_cell_count),
         })
     }
 
@@ -451,7 +462,7 @@ impl ControllerTrace {
             lead_time_down_seconds: self.lead_time_down_seconds[index],
             lead_time_seconds: self.lead_time_seconds[index],
             resource_concurrency: self.resource_concurrency[index],
-            useful_throughput_per_second: self.useful_throughput_per_second[index],
+            attempt_throughput_per_second: self.attempt_throughput_per_second[index],
             capacity_evidence: self.evidence_sample(index),
             capacity_predictive_low_per_second: self.capacity_predictive_low_per_second[index],
             capacity_predictive_median_per_second: self.capacity_predictive_median_per_second
@@ -529,6 +540,14 @@ impl ControllerTrace {
         self.decision_expected_losses.get(start..end)
     }
 
+    /// Returns the SLO pass probability for each replica candidate.
+    #[must_use]
+    pub fn decision_pass_probabilities(&self, index: usize) -> Option<&[f64]> {
+        let start = index.checked_mul(self.decision_candidate_count)?;
+        let end = start.checked_add(self.decision_candidate_count)?;
+        self.decision_pass_probabilities.get(start..end)
+    }
+
     /// Returns the arrival-rate prior before the first observation.
     #[must_use]
     pub const fn arrival_prior(&self) -> ArrivalPosterior {
@@ -561,6 +580,8 @@ impl ControllerTrace {
             PosteriorQuery::Collapse => Some(&self.collapse_posterior),
             PosteriorQuery::Knee => Some(&self.knee_posterior),
             PosteriorQuery::SaturationState => Some(&self.saturation_state_posterior),
+            PosteriorQuery::NormalRetryProbability => Some(&self.normal_retry_posterior),
+            PosteriorQuery::FailureRetryProbability => Some(&self.failure_retry_posterior),
             PosteriorQuery::PartitionShare => Some(&self.partition_share_posterior),
             PosteriorQuery::LeadTime {
                 direction: TransitionDirection::Up,
@@ -588,7 +609,7 @@ impl ControllerTrace {
         let after = CapacityWindowSample {
             concurrency: self.capacity_after_concurrency[index],
             exposure_seconds: self.capacity_after_exposure_seconds[index],
-            useful_completions: self.capacity_after_useful_completions[index],
+            completed_attempts: self.capacity_after_completed_attempts[index],
         };
         match self.capacity_evidence[index] {
             CapacityEvidenceKind::None => CapacityEvidenceSample::None,
@@ -625,8 +646,8 @@ impl ControllerTrace {
             trace.expected_loss[metric_index] = self.expected_loss[controller_index];
             trace.prediction_median[metric_index] = f64::NAN;
             trace.resource_concurrency[metric_index] = self.resource_concurrency[controller_index];
-            trace.useful_throughput_per_second[metric_index] =
-                self.useful_throughput_per_second[controller_index];
+            trace.attempt_throughput_per_second[metric_index] =
+                self.attempt_throughput_per_second[controller_index];
             trace.capacity_low_per_second[metric_index] =
                 self.capacity_low_per_second[controller_index];
             trace.capacity_median_per_second[metric_index] =
@@ -720,15 +741,15 @@ impl ControllerTrace {
             .push(sample.lead_time_down_seconds);
         self.lead_time_seconds.push(sample.lead_time_seconds);
         self.resource_concurrency.push(sample.resource_concurrency);
-        self.useful_throughput_per_second
-            .push(sample.useful_throughput_per_second);
+        self.attempt_throughput_per_second
+            .push(sample.attempt_throughput_per_second);
         let (kind, after) = evidence_columns(sample.capacity_evidence);
         self.capacity_evidence.push(kind);
         self.capacity_after_concurrency.push(after.concurrency);
         self.capacity_after_exposure_seconds
             .push(after.exposure_seconds);
-        self.capacity_after_useful_completions
-            .push(after.useful_completions);
+        self.capacity_after_completed_attempts
+            .push(after.completed_attempts);
         self.reporter.push(sample.reporter);
         self.capacity_predictive_low_per_second
             .push(sample.capacity_predictive_low_per_second);
@@ -746,8 +767,14 @@ impl ControllerTrace {
             return Err(PlantError::MetricCapacity);
         }
         self.decision_expected_losses.resize(decision_end, f64::NAN);
-        match scratch.write_expected_loss_curve(
+        if decision_end > self.decision_pass_probabilities.capacity() {
+            return Err(PlantError::MetricCapacity);
+        }
+        self.decision_pass_probabilities
+            .resize(decision_end, f64::NAN);
+        match scratch.write_decision_curve(
             &mut self.decision_expected_losses[decision_start..decision_end],
+            &mut self.decision_pass_probabilities[decision_start..decision_end],
         ) {
             Ok(()) | Err(prosody_scale_core::DecisionCurveError::Unavailable) => {}
             Err(error) => return Err(error.into()),
@@ -769,6 +796,8 @@ impl ControllerTrace {
         self.collapse_posterior.push(state)?;
         self.knee_posterior.push(state)?;
         self.saturation_state_posterior.push(state)?;
+        self.normal_retry_posterior.push(state)?;
+        self.failure_retry_posterior.push(state)?;
         self.partition_share_posterior.push(state)?;
         self.lead_time_up_posterior.push(state)?;
         self.lead_time_down_posterior.push(state)?;
@@ -833,7 +862,7 @@ fn evidence_columns(
     const EMPTY: CapacityWindowSample = CapacityWindowSample {
         concurrency: f64::NAN,
         exposure_seconds: f64::NAN,
-        useful_completions: 0,
+        completed_attempts: 0,
     };
     match evidence {
         CapacityEvidenceSample::None => (CapacityEvidenceKind::None, EMPTY),
@@ -844,7 +873,7 @@ fn evidence_columns(
 /// A workload graph composed with the production controller transition.
 pub struct ClosedLoop<Workload> {
     workload: Workload,
-    configuration: Configuration,
+    configuration: ClosedLoopConfiguration,
     capacity_grid: CapacityGrid,
     state: ScaleState,
     scratch: ScaleScratch,
@@ -864,20 +893,40 @@ pub struct ClosedLoop<Workload> {
     capacity_evidence_sample: CapacityEvidenceSample,
     throughput_posterior_scratch: Vec<ThroughputPosteriorCell>,
     last_observed_replicas: Option<u32>,
-    inflight_transition: Option<PendingTransition>,
+    inflight_transitions: Vec<PendingTransition>,
     pending_transition_observation: Option<PendingTransitionObservation>,
     lead_time_evidence_sample: LeadTimeEvidenceSample,
     trace: ControllerTrace,
-    actuation_start_micros: u64,
-    actuation_interval_micros: u64,
     diagnostic_seed: u64,
+}
+
+/// Controller configuration with capacity for every partition and demand class.
+///
+/// The cohort bound always covers one aggregate cohort per class and partition.
+#[derive(Clone)]
+struct ClosedLoopConfiguration(Configuration);
+
+impl ClosedLoopConfiguration {
+    fn new(mut configuration: Configuration) -> Result<Self, ConfigurationError> {
+        let required = configuration
+            .partition_count
+            .checked_mul(DemandClass::COUNT)
+            .ok_or(ConfigurationError::PlatformLimit)?;
+        configuration.cohort_count_max = configuration.cohort_count_max.max(required);
+        configuration.validate()?;
+        Ok(Self(configuration))
+    }
+
+    const fn core(&self) -> &Configuration {
+        &self.0
+    }
 }
 
 #[derive(Clone, Copy)]
 struct CapacityWindow {
     concurrency: f64,
     exposure_seconds: f64,
-    useful_completions: u32,
+    completed_attempts: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -954,7 +1003,7 @@ impl CapacityWindow {
         Ok(ResourceWindow::new(
             self.concurrency,
             self.exposure_seconds,
-            self.useful_completions,
+            self.completed_attempts,
         )?)
     }
 
@@ -962,7 +1011,7 @@ impl CapacityWindow {
         CapacityWindowSample {
             concurrency: self.concurrency,
             exposure_seconds: self.exposure_seconds,
-            useful_completions: self.useful_completions,
+            completed_attempts: self.completed_attempts,
         }
     }
 }
@@ -997,21 +1046,26 @@ impl<Workload> ClosedLoop<Workload> {
         capacity_grid: CapacityGrid,
         trace_count_max: u32,
     ) -> Result<Self, ClosedLoopError> {
-        let partition_count = usize::try_from(configuration.partition_count)
+        let configuration = ClosedLoopConfiguration::new(configuration.clone())?;
+        let core_configuration = configuration.core();
+        let partition_count = usize::try_from(core_configuration.partition_count)
             .map_err(|_| ConfigurationError::PlatformLimit)?;
-        let budget_micros = configuration.objective.budget_micros();
-        let state = ScaleState::new(configuration.clone(), capacity_grid.clone())?;
+        let budget_micros = core_configuration.objective.budget_micros();
+        let state = ScaleState::new(core_configuration.clone(), capacity_grid.clone())?;
         let trace = ControllerTrace::new(trace_count_max, &state)?;
         let throughput_posterior_count = usize::try_from(state.throughput_posterior_value_count())
             .map_err(|_| ConfigurationError::PlatformLimit)?;
         let partition_posterior_count = trace.partition_share_posterior.values.len();
+        let scratch = ScaleScratch::new(core_configuration)?;
+        let observation = ObservationBuffer::new(core_configuration)?;
+        let slots_per_replica = core_configuration.slots_per_replica;
         Ok(Self {
             workload,
-            configuration: configuration.clone(),
+            configuration,
             capacity_grid,
             state,
-            scratch: ScaleScratch::new(configuration)?,
-            observation: ObservationBuffer::new(configuration)?,
+            scratch,
+            observation,
             arrival_counts: vec![0; partition_count],
             generated_counts: vec![0; partition_count],
             arrival_evidence_sample: ArrivalEvidenceSample::None,
@@ -1022,7 +1076,7 @@ impl<Workload> ClosedLoop<Workload> {
             snapshot_pipeline: None,
             event_count: 0,
             budget_micros,
-            slots_per_replica: configuration.slots_per_replica,
+            slots_per_replica,
             latest_capacity_window: None,
             capacity_evidence_sample: CapacityEvidenceSample::None,
             throughput_posterior_scratch: vec![
@@ -1030,12 +1084,12 @@ impl<Workload> ClosedLoop<Workload> {
                 throughput_posterior_count
             ],
             last_observed_replicas: None,
-            inflight_transition: None,
+            inflight_transitions: Vec::with_capacity(
+                usize::try_from(trace_count_max).map_err(|_| ConfigurationError::PlatformLimit)?,
+            ),
             pending_transition_observation: None,
             lead_time_evidence_sample: LeadTimeEvidenceSample::None,
             trace,
-            actuation_start_micros: 0,
-            actuation_interval_micros: 1,
             diagnostic_seed: 0,
         })
     }
@@ -1068,30 +1122,6 @@ impl<Workload> ClosedLoop<Workload> {
         Ok(self)
     }
 
-    /// Sets the virtual-time schedule for controller actions.
-    ///
-    /// Model updates and diagnostics still run at every simulator tick.
-    pub(crate) fn with_controller_actuation_schedule(
-        mut self,
-        start_micros: u64,
-        interval_micros: u64,
-    ) -> Result<Self, PlantError> {
-        if interval_micros == 0 {
-            return Err(PlantError::ZeroBound {
-                name: "controller_actuation_interval",
-            });
-        }
-        self.actuation_start_micros = start_micros;
-        self.actuation_interval_micros = interval_micros;
-        Ok(self)
-    }
-
-    fn controller_actuation_due(&self, now_micros: u64) -> bool {
-        now_micros >= self.actuation_start_micros
-            && (now_micros - self.actuation_start_micros)
-                .is_multiple_of(self.actuation_interval_micros)
-    }
-
     /// Returns every retained controller decision.
     #[must_use]
     pub const fn trace(&self) -> &ControllerTrace {
@@ -1113,6 +1143,7 @@ impl<Workload> ClosedLoop<Workload> {
         context: TickContext<'_>,
         inputs: TickInputs,
         reporter: ReporterDirective,
+        calendar: Option<CalendarForecastInput>,
     ) -> Result<(), PlantError>
     where
         Workload: TickGenerator,
@@ -1120,6 +1151,21 @@ impl<Workload> ClosedLoop<Workload> {
         self.observation.clear();
         self.observation
             .set_current_replicas(context.plant.replicas)?;
+        if let Some(calendar) = calendar {
+            self.observation.set_calendar_forecast(
+                calendar.artifact(),
+                calendar.prior_probability(),
+                calendar.segments(),
+            )?;
+        }
+        for pending in &self.inflight_transitions {
+            self.observation
+                .push_actuation_commitment(ActuationCommitment::new(
+                    pending.from_replicas,
+                    pending.target_replicas,
+                    ModelTime::from_micros(pending.requested_at_micros),
+                )?)?;
+        }
         self.latest_capacity_window = None;
         self.capacity_evidence_sample = CapacityEvidenceSample::None;
         self.arrival_counts.fill(0);
@@ -1127,10 +1173,21 @@ impl<Workload> ClosedLoop<Workload> {
         self.arrival_evidence_sample = ArrivalEvidenceSample::None;
         self.partition_evidence_accepted = false;
         self.lead_time_evidence_sample = LeadTimeEvidenceSample::None;
-        self.count_generated(context, inputs, false, inputs.message_count)?;
-        self.count_generated(context, inputs, true, inputs.timer_count)?;
+        self.count_generated(
+            context,
+            inputs,
+            crate::EventSource::Message,
+            inputs.message_count,
+        )?;
+        self.count_generated(
+            context,
+            inputs,
+            crate::EventSource::Timer,
+            inputs.timer_count,
+        )?;
         self.prepare_arrival_evidence(context, reporter)?;
         self.push_backlog_cohorts(context)?;
+        self.prepare_attempt_outcomes(context)?;
         self.prepare_capacity_evidence(context)?;
         self.prepare_transition_evidence(context)?;
         Ok(())
@@ -1210,11 +1267,14 @@ impl<Workload> ClosedLoop<Workload> {
     }
 
     fn replace_aggregator(&mut self) -> Result<(), PlantError> {
-        self.state = ScaleState::new(self.configuration.clone(), self.capacity_grid.clone())?;
+        self.state = ScaleState::new(
+            self.configuration.core().clone(),
+            self.capacity_grid.clone(),
+        )?;
         self.latest_capacity_window = None;
         self.capacity_evidence_sample = CapacityEvidenceSample::None;
         self.last_observed_replicas = None;
-        self.inflight_transition = None;
+        self.inflight_transitions.clear();
         self.pending_transition_observation = None;
         self.lead_time_evidence_sample = LeadTimeEvidenceSample::None;
         Ok(())
@@ -1226,10 +1286,16 @@ impl<Workload> ClosedLoop<Workload> {
             self.lead_time_evidence_sample = pending.sample;
             return Ok(());
         }
-        let Some(transition) = self.inflight_transition else {
+        let Some((index, transition)) = self
+            .inflight_transitions
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_index, transition)| transition.reached(context.plant.replicas))
+        else {
             return Ok(());
         };
-        if context.plant.replicas != transition.target_replicas || !context.plant.partitions_ready {
+        if !context.plant.partitions_ready {
             return Ok(());
         }
         let completed_micros = context
@@ -1238,7 +1304,7 @@ impl<Workload> ClosedLoop<Workload> {
             .unwrap_or(context.now_micros);
         let elapsed_micros = completed_micros.saturating_sub(transition.requested_at_micros);
         if elapsed_micros == 0 {
-            self.inflight_transition = None;
+            self.inflight_transitions.remove(index);
             return Ok(());
         }
         let evidence = context
@@ -1269,7 +1335,82 @@ impl<Workload> ClosedLoop<Workload> {
             replica_delta: transition.replica_delta(),
             elapsed_seconds: Duration::from_micros(elapsed_micros).as_secs_f64(),
         };
-        self.inflight_transition = None;
+        self.inflight_transitions.remove(index);
+        Ok(())
+    }
+
+    fn prepare_attempt_outcomes(&mut self, context: TickContext<'_>) -> Result<(), PlantError> {
+        let Some(previous_normal_successes) = context.history.normal_successes(0) else {
+            return Ok(());
+        };
+        let Some(previous_normal_transient) = context.history.normal_transient_failures(0) else {
+            return Ok(());
+        };
+        let Some(previous_normal_terminal) = context.history.normal_terminal_failures(0) else {
+            return Ok(());
+        };
+        let Some(previous_normal_permanent) = context.history.normal_permanent_failures(0) else {
+            return Ok(());
+        };
+        let Some(previous_failure_successes) = context.history.failure_successes(0) else {
+            return Ok(());
+        };
+        let Some(previous_failure_transient) = context.history.failure_transient_failures(0) else {
+            return Ok(());
+        };
+        let Some(previous_failure_terminal) = context.history.failure_terminal_failures(0) else {
+            return Ok(());
+        };
+        let Some(previous_failure_permanent) = context.history.failure_permanent_failures(0) else {
+            return Ok(());
+        };
+        let normal_success = context
+            .plant
+            .normal_successes
+            .saturating_sub(previous_normal_successes);
+        let normal_transient = context
+            .plant
+            .normal_transient_failures
+            .saturating_sub(previous_normal_transient);
+        let normal_terminal = context
+            .plant
+            .normal_terminal_failures
+            .saturating_sub(previous_normal_terminal);
+        let normal_permanent = context
+            .plant
+            .normal_permanent_failures
+            .saturating_sub(previous_normal_permanent);
+        let failure_success = context
+            .plant
+            .failure_successes
+            .saturating_sub(previous_failure_successes);
+        let failure_transient = context
+            .plant
+            .failure_transient_failures
+            .saturating_sub(previous_failure_transient);
+        let failure_terminal = context
+            .plant
+            .failure_terminal_failures
+            .saturating_sub(previous_failure_terminal);
+        let failure_permanent = context
+            .plant
+            .failure_permanent_failures
+            .saturating_sub(previous_failure_permanent);
+        let evidence = AttemptOutcomeEvidence::new(
+            AttemptOutcomeCounts::new(
+                normal_success,
+                normal_permanent,
+                normal_transient,
+                normal_terminal,
+            ),
+            AttemptOutcomeCounts::new(
+                failure_success,
+                failure_permanent,
+                failure_transient,
+                failure_terminal,
+            ),
+        );
+        self.observation.set_attempt_outcomes(evidence)?;
         Ok(())
     }
 
@@ -1304,15 +1445,15 @@ impl<Workload> ClosedLoop<Workload> {
         if occupancy == 0 {
             return Ok(());
         }
-        let previous_completions = context.history.useful_completions(0).unwrap_or(0);
+        let previous_attempts = context.history.completed_attempts(0).unwrap_or(0);
         let exposure_seconds = Duration::from_micros(exposure_micros).as_secs_f64();
         let current = CapacityWindow {
             concurrency: Duration::from_micros(occupancy).as_secs_f64() / exposure_seconds,
             exposure_seconds,
-            useful_completions: context
+            completed_attempts: context
                 .plant
-                .useful_completions
-                .saturating_sub(previous_completions),
+                .completed_attempts
+                .saturating_sub(previous_attempts),
         };
         self.latest_capacity_window = Some(current);
         self.observation.set_resource_window(current.evidence()?)?;
@@ -1324,7 +1465,7 @@ impl<Workload> ClosedLoop<Workload> {
         &mut self,
         context: TickContext<'_>,
         inputs: TickInputs,
-        timer: bool,
+        source: crate::EventSource,
         count: u32,
     ) -> Result<(), PlantError>
     where
@@ -1339,15 +1480,15 @@ impl<Workload> ClosedLoop<Workload> {
                 event_index,
                 partition_count: self.arrival_counts.len() as u32,
                 key_count: 1,
-                timer,
-            });
+                source,
+            })?;
             let partition =
                 usize::try_from(event.partition).map_err(|_| PlantError::PlatformLimit)?;
             let Some(generated) = self.generated_counts.get_mut(partition) else {
                 return Err(PlantError::PartitionIndex);
             };
             *generated = generated.saturating_add(1);
-            if !timer {
+            if source == crate::EventSource::Message {
                 self.arrival_counts[partition] = self.arrival_counts[partition].saturating_add(1);
             }
         }
@@ -1357,24 +1498,46 @@ impl<Workload> ClosedLoop<Workload> {
 
     fn push_backlog_cohorts(&mut self, context: TickContext<'_>) -> Result<(), PlantError> {
         for partition in 0..self.generated_counts.len() {
-            let demand = context.partition_backlog[partition]
-                .saturating_add(self.generated_counts[partition]);
-            if demand == 0 {
+            let Some(normal) = context.normal_backlog.get(partition) else {
+                return Err(PlantError::PartitionIndex);
+            };
+            if normal.count > 0 {
+                self.observation.set_backlog(BacklogCohort::new(
+                    context.now_micros,
+                    normal.oldest_release_micros,
+                    normal.count,
+                    partition as u32,
+                    DemandClass::Normal,
+                )?)?;
+            }
+            let generated = self.generated_counts[partition];
+            if generated > 0 {
+                self.observation.push_cohort(Cohort {
+                    release_micros: context.now_micros,
+                    deadline_micros: context.now_micros.saturating_add(self.budget_micros),
+                    offered_events: f64::from(generated),
+                    partition: partition as u32,
+                    demand_class: DemandClass::Normal,
+                })?;
+            }
+
+            let Some(failure) = context.failure_backlog.get(partition) else {
+                return Err(PlantError::PartitionIndex);
+            };
+            if failure.count == 0 {
                 continue;
             }
-            let oldest = if context.partition_backlog[partition] > 0 {
-                context.partition_oldest_release_micros[partition]
-            } else {
-                context.now_micros
-            };
-            let deadline_micros = oldest
+            let scheduled_release = failure.release_micros;
+            let release_micros = scheduled_release.max(context.now_micros);
+            let deadline_micros = scheduled_release
                 .saturating_add(self.budget_micros)
-                .max(context.now_micros.saturating_add(1));
+                .max(release_micros.saturating_add(1));
             self.observation.push_cohort(Cohort {
-                release_micros: context.now_micros,
+                release_micros,
                 deadline_micros,
-                offered_events: f64::from(demand),
+                offered_events: f64::from(failure.count),
                 partition: partition as u32,
+                demand_class: DemandClass::Failure,
             })?;
         }
         Ok(())
@@ -1410,22 +1573,22 @@ impl<Workload> ClosedLoop<Workload> {
                 .map(|sample| sample.cap)
                 .filter(|cap| *cap > 0)
         });
-        let held_cap = last_cap.map_or(self.configuration.replica_count_max, |cap| cap);
+        let held_cap = last_cap.map_or(self.configuration.core().replica_count_max, |cap| cap);
         let external_scale = matches!(
             inputs.scale,
             ScaleDirective::ExternalHold | ScaleDirective::Request { .. }
         );
-        let (resource_concurrency, useful_throughput_per_second) = self
+        let (resource_concurrency, attempt_throughput_per_second) = self
             .latest_capacity_window
             .map_or((f64::NAN, f64::NAN), |window| {
                 (
                     window.concurrency,
-                    f64::from(window.useful_completions) / window.exposure_seconds,
+                    f64::from(window.completed_attempts) / window.exposure_seconds,
                 )
             });
         let sample = match decision {
             ScaleDecision::Apply(apply) => {
-                if !external_scale && self.controller_actuation_due(context.now_micros) {
+                if !external_scale {
                     inputs.scale = if apply.target == desired {
                         ScaleDirective::Hold
                     } else {
@@ -1469,7 +1632,7 @@ impl<Workload> ClosedLoop<Workload> {
                     lead_time_down_seconds: apply.diagnostics.lead_time_down_seconds,
                     lead_time_seconds: apply.diagnostics.lead_time_seconds,
                     resource_concurrency,
-                    useful_throughput_per_second,
+                    attempt_throughput_per_second,
                     capacity_evidence: self.capacity_evidence_sample,
                     capacity_predictive_low_per_second: capacity_predictive.quantiles[0],
                     capacity_predictive_median_per_second: capacity_predictive.quantiles[1],
@@ -1516,7 +1679,7 @@ impl<Workload> ClosedLoop<Workload> {
                     lead_time_down_seconds: hold.diagnostics.lead_time_down_seconds,
                     lead_time_seconds: hold.diagnostics.lead_time_seconds,
                     resource_concurrency,
-                    useful_throughput_per_second,
+                    attempt_throughput_per_second,
                     capacity_evidence: self.capacity_evidence_sample,
                     capacity_predictive_low_per_second: capacity_predictive.quantiles[0],
                     capacity_predictive_median_per_second: capacity_predictive.quantiles[1],
@@ -1666,7 +1829,7 @@ impl<Workload> ClosedLoop<Workload> {
                     &self.throughput_posterior_scratch,
                     window.exposure_seconds,
                 )?;
-                let observed = u64::from(window.useful_completions);
+                let observed = u64::from(window.completed_attempts);
                 let upper = predictive_throughput_cdf(
                     &self.throughput_posterior_scratch,
                     window.exposure_seconds,
@@ -1697,56 +1860,85 @@ impl<Workload> ClosedLoop<Workload> {
         let ScaleDirective::Request { replicas, .. } = directive else {
             return Ok(());
         };
-        if self
-            .inflight_transition
-            .is_some_and(|transition| transition.target_replicas == replicas)
+        let requested = PendingTransition {
+            from_replicas: context.plant.replicas,
+            target_replicas: replicas,
+            requested_at_micros: context.now_micros,
+        };
+        if replicas == context.plant.replicas
+            && !context.plant.partitions_ready
+            && self
+                .inflight_transitions
+                .iter()
+                .any(|pending| pending.target_replicas == replicas)
         {
             return Ok(());
         }
-        if let Some(superseded) = self.inflight_transition.take() {
-            let exposure_micros = context
-                .now_micros
-                .saturating_sub(superseded.requested_at_micros);
-            if exposure_micros > 0 {
-                let evidence = context
-                    .plant
-                    .reconciliation_started_micros
-                    .filter(|started| *started > superseded.requested_at_micros)
-                    .filter(|started| context.now_micros > *started)
-                    .map_or_else(
-                        || {
-                            TransitionEvidence::censored(
-                                superseded.direction(),
-                                superseded.replica_delta(),
-                                exposure_micros,
-                            )
-                        },
-                        |started| {
-                            TransitionEvidence::censored_rebalance(
-                                superseded.direction(),
-                                superseded.replica_delta(),
-                                started.saturating_sub(superseded.requested_at_micros),
-                                context.now_micros.saturating_sub(started),
-                            )
-                        },
-                    )?;
-                self.pending_transition_observation = Some(PendingTransitionObservation {
-                    evidence,
-                    sample: LeadTimeEvidenceSample::Censored {
-                        direction: superseded.direction(),
-                        replica_delta: superseded.replica_delta(),
-                        exposure_seconds: Duration::from_micros(exposure_micros).as_secs_f64(),
-                    },
-                });
+        let mut index = 0_usize;
+        let mut exact = false;
+        while index < self.inflight_transitions.len() {
+            let mut pending = self.inflight_transitions[index];
+            if replicas == context.plant.replicas || pending.direction() != requested.direction() {
+                self.record_censored_transition(context, pending)?;
+                self.inflight_transitions.remove(index);
+                continue;
             }
+            match requested.direction() {
+                TransitionDirection::Up if pending.target_replicas > replicas => {
+                    pending.target_replicas = replicas;
+                }
+                TransitionDirection::Down if pending.target_replicas < replicas => {
+                    pending.target_replicas = replicas;
+                }
+                TransitionDirection::Up | TransitionDirection::Down => {}
+            }
+            if pending.target_replicas == replicas {
+                if exact {
+                    self.inflight_transitions.remove(index);
+                    continue;
+                }
+                exact = true;
+            }
+            self.inflight_transitions[index] = pending;
+            index += 1;
         }
-        if replicas != context.plant.replicas {
-            self.inflight_transition = Some(PendingTransition {
-                from_replicas: context.plant.replicas,
-                target_replicas: replicas,
-                requested_at_micros: context.now_micros,
-            });
+        if replicas == context.plant.replicas || exact {
+            return Ok(());
         }
+        if self.inflight_transitions.len() == self.inflight_transitions.capacity() {
+            return Err(PlantError::ChangeCapacity);
+        }
+        self.inflight_transitions.push(requested);
+        Ok(())
+    }
+
+    fn record_censored_transition(
+        &mut self,
+        context: TickContext<'_>,
+        transition: PendingTransition,
+    ) -> Result<(), PlantError> {
+        if self.pending_transition_observation.is_some() {
+            return Ok(());
+        }
+        let exposure_micros = context
+            .now_micros
+            .saturating_sub(transition.requested_at_micros);
+        if exposure_micros == 0 {
+            return Ok(());
+        }
+        let evidence = TransitionEvidence::censored(
+            transition.direction(),
+            transition.replica_delta(),
+            exposure_micros,
+        )?;
+        self.pending_transition_observation = Some(PendingTransitionObservation {
+            evidence,
+            sample: LeadTimeEvidenceSample::Censored {
+                direction: transition.direction(),
+                replica_delta: transition.replica_delta(),
+                exposure_seconds: Duration::from_micros(exposure_micros).as_secs_f64(),
+            },
+        });
         Ok(())
     }
 }
@@ -1830,7 +2022,7 @@ fn posterior_predictive_throughput_quantiles(
 fn predictive_throughput_cdf(
     cells: &[ThroughputPosteriorCell],
     exposure_seconds: f64,
-    useful_completions: u64,
+    completed_attempts: u64,
 ) -> Result<f64, PlantError> {
     let mut cumulative = 0.0_f64;
     for cell in cells {
@@ -1838,7 +2030,7 @@ fn predictive_throughput_cdf(
         let probability = if mean <= f64::EPSILON {
             1.0_f64
         } else {
-            Poisson::new(mean)?.cdf(useful_completions)
+            Poisson::new(mean)?.cdf(completed_attempts)
         };
         cumulative += cell.probability * probability;
     }
@@ -1846,6 +2038,13 @@ fn predictive_throughput_cdf(
 }
 
 impl PendingTransition {
+    const fn reached(self, replicas: u32) -> bool {
+        match self.direction() {
+            TransitionDirection::Up => replicas >= self.target_replicas,
+            TransitionDirection::Down => replicas <= self.target_replicas,
+        }
+    }
+
     const fn direction(self) -> TransitionDirection {
         if self.target_replicas > self.from_replicas {
             TransitionDirection::Up
@@ -1862,13 +2061,21 @@ impl PendingTransition {
 impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
     fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError> {
         let reporter = self.workload.reporter(context);
+        let calendar = self.workload.calendar_forecast(context)?;
         let inputs = self.workload.calculate(context)?;
-        self.prepare_observation(context, inputs, reporter)?;
+        self.prepare_observation(context, inputs, reporter, calendar)?;
         self.apply_decision(context, inputs, reporter)
     }
 
-    fn event(&self, context: EventContext<'_>) -> EventInputs {
+    fn event(&self, context: EventContext<'_>) -> Result<EventInputs, PlantError> {
         self.workload.event(context)
+    }
+
+    fn calendar_forecast(
+        &self,
+        context: TickContext<'_>,
+    ) -> Result<Option<CalendarForecastInput>, PlantError> {
+        self.workload.calendar_forecast(context)
     }
 }
 

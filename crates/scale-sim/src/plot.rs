@@ -333,8 +333,8 @@ fn model_panels(trace: &MetricTrace) -> [Panel<'_>; 7] {
             "operations per second",
             [
                 series(
-                    "throughput",
-                    Values::F64(&trace.useful_throughput_per_second),
+                    "completed attempts",
+                    Values::F64(&trace.attempt_throughput_per_second),
                 ),
                 series("capacity low", Values::F64(&trace.capacity_low_per_second)),
                 series(

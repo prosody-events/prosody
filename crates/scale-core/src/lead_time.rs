@@ -10,13 +10,66 @@ const DIRECTION_COUNT: usize = 2;
 const DELTA_BUCKET_COUNT: usize = 4;
 const GRID_CELL_COUNT: usize = 12;
 const DRIFT_PROBABILITY: f64 = 0.01_f64;
-const MU_LOG_SECONDS: [f64; 4] = [
-    2.708_050_201_102_21,
-    3.401_197_381_662_155_5,
-    4.094_344_562_222_1,
-    4.787_491_742_782_046,
-];
-const SIGMA_LOG_SECONDS: [f64; 3] = [0.1_f64, 0.3_f64, 0.6_f64];
+const AXIS_COUNT: usize = 4;
+const SCALE_COUNT: usize = 3;
+
+/// One versioned population prior for a positive transition duration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransitionPrior {
+    mu_log_seconds: [f64; AXIS_COUNT],
+    sigma_log_seconds: [f64; SCALE_COUNT],
+    probabilities: [f64; GRID_CELL_COUNT],
+}
+
+impl TransitionPrior {
+    /// Constructs a normalized mixture over twelve log-normal hypotheses.
+    ///
+    /// The probability order is median-major and then deviation-major.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a value is invalid or the mass is not positive.
+    pub fn new(
+        median_seconds: [f64; AXIS_COUNT],
+        log_standard_deviations: [f64; SCALE_COUNT],
+        mut probabilities: [f64; GRID_CELL_COUNT],
+    ) -> Result<Self, TransitionPriorError> {
+        if !median_seconds
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0_f64)
+            || !log_standard_deviations
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0_f64)
+            || !probabilities
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0_f64)
+        {
+            return Err(TransitionPriorError::InvalidValue);
+        }
+        let total = probabilities.iter().sum::<f64>();
+        if total <= f64::EPSILON {
+            return Err(TransitionPriorError::EmptyMass);
+        }
+        for probability in &mut probabilities {
+            *probability /= total;
+        }
+        Ok(Self {
+            mu_log_seconds: median_seconds.map(f64::ln),
+            sigma_log_seconds: log_standard_deviations,
+            probabilities,
+        })
+    }
+
+    /// Returns the explicit broad fallback for callers without an artifact.
+    #[must_use]
+    pub fn broad_fallback() -> Self {
+        Self {
+            mu_log_seconds: [15.0_f64.ln(), 30.0_f64.ln(), 60.0_f64.ln(), 120.0_f64.ln()],
+            sigma_log_seconds: [0.1_f64, 0.3_f64, 0.6_f64],
+            probabilities: [1.0_f64 / GRID_CELL_COUNT as f64; GRID_CELL_COUNT],
+        }
+    }
+}
 
 /// Direction of one replica transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,23 +279,26 @@ pub(crate) struct LeadTimeFactor {
 }
 
 impl LeadTimeFactor {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(prior: &TransitionPrior) -> Self {
         let mut mu_log_seconds = [0.0_f64; GRID_CELL_COUNT];
         let mut sigma_log_seconds = [0.0_f64; GRID_CELL_COUNT];
         let mut cell = 0_usize;
-        for &mu in &MU_LOG_SECONDS {
-            for &sigma in &SIGMA_LOG_SECONDS {
+        for &mu in &prior.mu_log_seconds {
+            for &sigma in &prior.sigma_log_seconds {
                 mu_log_seconds[cell] = mu;
                 sigma_log_seconds[cell] = sigma;
                 cell += 1;
             }
         }
         let factor_count = DIRECTION_COUNT * DELTA_BUCKET_COUNT;
-        let weight = 1.0_f64 / 12.0_f64;
+        let mut weights = Vec::with_capacity(factor_count * GRID_CELL_COUNT);
+        for _factor in 0..factor_count {
+            weights.extend_from_slice(&prior.probabilities);
+        }
         Self {
             mu_log_seconds,
             sigma_log_seconds,
-            weights: vec![weight; factor_count * GRID_CELL_COUNT],
+            weights,
             weights_next: vec![0.0_f64; factor_count * GRID_CELL_COUNT],
             likelihoods: [0.0_f64; GRID_CELL_COUNT],
             last_direction: TransitionDirection::Up,
@@ -255,13 +311,13 @@ impl LeadTimeFactor {
         for factor in 0..DIRECTION_COUNT * DELTA_BUCKET_COUNT {
             let factor_start = factor * GRID_CELL_COUNT;
             for cell in 0..GRID_CELL_COUNT {
-                let mu = cell / SIGMA_LOG_SECONDS.len();
-                let sigma = cell % SIGMA_LOG_SECONDS.len();
+                let mu = cell / SCALE_COUNT;
+                let sigma = cell % SCALE_COUNT;
                 let neighbors = [
-                    (mu > 0).then(|| cell - SIGMA_LOG_SECONDS.len()),
-                    (mu + 1 < MU_LOG_SECONDS.len()).then(|| cell + SIGMA_LOG_SECONDS.len()),
+                    (mu > 0).then(|| cell - SCALE_COUNT),
+                    (mu + 1 < AXIS_COUNT).then(|| cell + SCALE_COUNT),
                     (sigma > 0).then(|| cell - 1),
-                    (sigma + 1 < SIGMA_LOG_SECONDS.len()).then(|| cell + 1),
+                    (sigma + 1 < SCALE_COUNT).then(|| cell + 1),
                 ];
                 let neighbor_count = neighbors.iter().flatten().count();
                 let weight = self.weights[factor_start + cell];
@@ -399,8 +455,23 @@ impl LeadTimeFactor {
         probability: f64,
     ) -> f64 {
         let probability = probability.clamp(0.0_f64, 1.0_f64);
-        let mut low_log = MU_LOG_SECONDS[0] - 8.0_f64 * SIGMA_LOG_SECONDS[2];
-        let mut high_log = MU_LOG_SECONDS[3] + 8.0_f64 * SIGMA_LOG_SECONDS[2];
+        let sigma_max = self
+            .sigma_log_seconds
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max);
+        let mut low_log = self
+            .mu_log_seconds
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min)
+            - 8.0_f64 * sigma_max;
+        let mut high_log = self
+            .mu_log_seconds
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max)
+            + 8.0_f64 * sigma_max;
         for _ in 0_u32..64 {
             let middle_log = f64::midpoint(low_log, high_log);
             if self.predictive_cdf(direction, replica_delta, middle_log.exp()) < probability {
@@ -412,8 +483,22 @@ impl LeadTimeFactor {
         f64::midpoint(low_log, high_log).exp()
     }
 
+    pub(crate) fn sample_remaining_seconds(
+        &self,
+        direction: TransitionDirection,
+        replica_delta: u32,
+        elapsed_seconds: f64,
+        random: &mut RandomStream,
+    ) -> f64 {
+        let elapsed_cdf = self.predictive_cdf(direction, replica_delta, elapsed_seconds);
+        let probability = elapsed_cdf + random.open_unit_f64() * (1.0_f64 - elapsed_cdf);
+        self.predictive_quantile(direction, replica_delta, probability)
+            .max(elapsed_seconds)
+            - elapsed_seconds
+    }
+
     pub(crate) const fn posterior_value_count() -> u32 {
-        MU_LOG_SECONDS.len() as u32
+        AXIS_COUNT as u32
     }
 
     pub(crate) fn write_posterior(
@@ -423,17 +508,15 @@ impl LeadTimeFactor {
         values: &mut [f64],
         probabilities: &mut [f64],
     ) -> bool {
-        if values.len() != MU_LOG_SECONDS.len() || probabilities.len() != MU_LOG_SECONDS.len() {
+        if values.len() != AXIS_COUNT || probabilities.len() != AXIS_COUNT {
             return false;
         }
         probabilities.fill(0.0_f64);
         let start = factor_index(direction, replica_delta) * GRID_CELL_COUNT;
-        for (mu, &mu_log_seconds) in MU_LOG_SECONDS.iter().enumerate() {
-            values[mu] = mu_log_seconds.exp();
-            let cell = start + mu * SIGMA_LOG_SECONDS.len();
-            probabilities[mu] = self.weights[cell..cell + SIGMA_LOG_SECONDS.len()]
-                .iter()
-                .sum();
+        for mu in 0..AXIS_COUNT {
+            values[mu] = self.mu_log_seconds[mu * SCALE_COUNT].exp();
+            let cell = start + mu * SCALE_COUNT;
+            probabilities[mu] = self.weights[cell..cell + SCALE_COUNT].iter().sum();
         }
         true
     }
@@ -540,4 +623,15 @@ pub enum TransitionEvidenceError {
     /// The transition supplied no elapsed exposure.
     #[error("a transition elapsed time must be positive")]
     ZeroElapsedTime,
+}
+
+/// Invalid population duration prior.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum TransitionPriorError {
+    /// A median, deviation, or probability is invalid.
+    #[error("a transition prior value is invalid")]
+    InvalidValue,
+    /// The hypothesis probabilities have no positive mass.
+    #[error("transition prior probability mass must be positive")]
+    EmptyMass,
 }

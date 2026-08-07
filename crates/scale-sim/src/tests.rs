@@ -1,5 +1,6 @@
 use prosody_scale_core::{
-    CapacityGrid, Configuration as ControllerConfiguration, RandomStream, ServiceObjective,
+    CapacityGrid, Configuration as ControllerConfiguration, RandomStream, ReliabilityPrior,
+    ServiceObjective, TransitionPrior,
 };
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
@@ -12,17 +13,24 @@ use crate::series::{
 };
 use crate::{
     AttemptContext, AttemptFrame, AttemptGenerator, AttemptModel, AttemptParameters, ClosedLoop,
-    ClosedLoopError, ConcurrencyLatencyCurve, EventSpec, FaultPattern, HistoricalAttemptModel,
-    Kip848Rebalance, Plant, PlantConfiguration, PlantError, PrincipalRegime, PrincipalRunError,
-    QuantileTable, RegimeExperiment, RegimeValidationError, ReporterDirective, RunStopReason,
-    ScaleChange, ScaleDirective, ScaleRequest, SimulationHarness, Snapshot, SnapshotChannel,
-    SnapshotCursor, SnapshotTable, StepSeries, TickContext, TickGenerator, TickInputs,
-    WorkloadSeries, run_batch_regime, run_batch_slo, run_capacity_evidence_regime, run_parallel,
-    run_principal_regime, validate_principal_regime,
+    ClosedLoopError, ConcurrencyLatencyCurve, EventOutcome, EventOutcomeRule, EventSource,
+    EventSpec, FaultPattern, FinalOutcome, HistoricalAttemptModel, Kip848Rebalance, Plant,
+    PlantConfiguration, PlantError, PrincipalRegime, PrincipalRunError, QuantileTable,
+    RegimeExperiment, RegimeValidationError, ReporterDirective, RetryCount, RetryOutcome,
+    RunStopReason, ScaleChange, ScaleDirective, ScaleRequest, SimulationHarness, Snapshot,
+    SnapshotChannel, SnapshotCursor, SnapshotTable, StepSeries, TickContext, TickGenerator,
+    TickInputs, WorkloadSeries, run_batch_regime, run_batch_slo, run_capacity_evidence_regime,
+    run_parallel, run_principal_regime, validate_principal_regime,
 };
 use crate::{CapacityEvidenceKind, CapacityEvidenceSample};
 
 const PRINCIPAL_EVENT_COUNT: usize = 2_000;
+
+#[test]
+fn generated_outcome_rules_reject_zero_sentinels() {
+    assert!(EventOutcomeRule::permanent_every(0).is_none());
+    assert!(EventOutcomeRule::transient_then_success(0).is_err());
+}
 
 #[test]
 fn graph_validation_accepts_unordered_dags_and_rejects_cycles() {
@@ -123,7 +131,7 @@ fn incremental_virtual_time_matches_one_shot_replay() -> Result<(), TestError> {
     assert_eq!(snapshot.released, 2);
     assert_eq!(snapshot.settled, 0);
     let mut partition_backlog = [0_u32; 4];
-    incremental.write_partition_backlog(1_500, &mut partition_backlog)?;
+    incremental.write_partition_normal_backlog(1_500, &mut partition_backlog)?;
     assert_eq!(partition_backlog.iter().sum::<u32>(), snapshot.backlog);
     assert_eq!(incremental.run(), expected);
     Ok(())
@@ -314,10 +322,16 @@ fn one_harness_calculates_time_history_and_function_dependencies() -> Result<(),
 fn uncertain_late_capacity_does_not_change_the_target() -> Result<(), TestError> {
     let controller_configuration = ControllerConfiguration {
         cohort_count_max: 4,
+        calendar_segment_count_max: 4,
         partition_count: 4,
         replica_count_max: 8,
         slots_per_replica: 2,
         posterior_sample_count: 64,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
         objective: ServiceObjective::new(1_000_000, 0.01)?,
     };
     let capacity_grid = CapacityGrid::new(&[0.04_f64], &[1_000_000.0_f64], &[0.0_f64, 1.0_f64])?;
@@ -356,10 +370,16 @@ fn uncertain_late_capacity_does_not_change_the_target() -> Result<(), TestError>
 fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
     let controller_configuration = ControllerConfiguration {
         cohort_count_max: 4,
+        calendar_segment_count_max: 4,
         partition_count: 4,
         replica_count_max: 8,
         slots_per_replica: 2,
         posterior_sample_count: 64,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
         objective: ServiceObjective::new(1_000_000, 0.01)?,
     };
     let capacity_grid = CapacityGrid::new(
@@ -390,13 +410,19 @@ fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
 }
 
 #[test]
-fn retargeted_actuation_emits_right_censored_lead_time() -> Result<(), TestError> {
+fn higher_retarget_preserves_each_completed_lead_time() -> Result<(), TestError> {
     let controller_configuration = ControllerConfiguration {
         cohort_count_max: 4,
+        calendar_segment_count_max: 4,
         partition_count: 4,
         replica_count_max: 8,
         slots_per_replica: 2,
         posterior_sample_count: 64,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
         objective: ServiceObjective::new(1_000_000, 0.01)?,
     };
     let capacity_grid = CapacityGrid::new(&[0.001_f64], &[1_000.0_f64], &[0.0_f64, 1.0_f64])?;
@@ -404,23 +430,31 @@ fn retargeted_actuation_emits_right_censored_lead_time() -> Result<(), TestError
         RetargetWorkload,
         &controller_configuration,
         capacity_grid,
-        4,
+        8,
     )?;
     let plant_configuration = PlantConfiguration::new(4, 16, 16, 4, 2, 8)?;
     let mut harness = SimulationHarness::new(plant_configuration, 1, 4, closed_loop)?;
 
     let _first = harness.tick(0)?;
     let _retarget = harness.tick(10_000_000)?;
-    let _evidence = harness.tick(20_000_000)?;
+    let _first_launch = harness.tick(100_000_000)?;
+    let first_ready = harness.tick(100_200_000)?;
+    let _second_launch = harness.tick(110_000_000)?;
+    let second_ready = harness.tick(110_200_000)?;
     let (_result, closed_loop) = harness.finish_with_graph();
-    let Some(before) = closed_loop.trace().sample(0) else {
-        return Err(TestError::MissingControllerSample);
-    };
-    let Some(after) = closed_loop.trace().sample(2) else {
-        return Err(TestError::MissingControllerSample);
-    };
+    let completed = (0..closed_loop.trace().len())
+        .filter_map(|index| closed_loop.trace().sample(index))
+        .filter(|sample| {
+            matches!(
+                sample.lead_time_evidence,
+                crate::LeadTimeEvidenceSample::Completed { .. }
+            )
+        })
+        .count();
 
-    assert!(after.lead_time_up_seconds > before.lead_time_up_seconds);
+    assert_eq!(first_ready.replicas, 2);
+    assert_eq!(second_ready.replicas, 3);
+    assert_eq!(completed, 2);
     Ok(())
 }
 
@@ -435,8 +469,7 @@ impl TickGenerator for RetargetWorkload {
             dependency_operations: 1,
             dependency_operation_micros: 1,
             handler_added_micros: 0,
-            transient_failures: 0,
-            permanent_rejection_every: 0,
+            outcome: EventOutcomeRule::Success,
             launch_delay_micros: 100_000_000,
             scale: ScaleDirective::Request {
                 replicas: if context.tick_index == 0 { 2 } else { 3 },
@@ -457,8 +490,7 @@ impl TickGenerator for CapacityWorkload {
             dependency_operations: 1,
             dependency_operation_micros: 1,
             handler_added_micros: 0,
-            transient_failures: 0,
-            permanent_rejection_every: 0,
+            outcome: EventOutcomeRule::Success,
             launch_delay_micros: 0,
             scale: ScaleDirective::Request {
                 replicas: u32::from(context.tick_index >= 3) + 1,
@@ -485,8 +517,7 @@ impl TickGenerator for ReportedArrivalWorkload {
             dependency_operations: 0,
             dependency_operation_micros: 0,
             handler_added_micros: 0,
-            transient_failures: 0,
-            permanent_rejection_every: 0,
+            outcome: EventOutcomeRule::Success,
             launch_delay_micros: 0,
             scale: ScaleDirective::Hold,
         })
@@ -510,8 +541,7 @@ impl TickGenerator for ClosedLoopWorkload {
             dependency_operations: 1,
             dependency_operation_micros: 1,
             handler_added_micros: 0,
-            transient_failures: 0,
-            permanent_rejection_every: 0,
+            outcome: EventOutcomeRule::Success,
             launch_delay_micros: 30_000,
             scale: ScaleDirective::Hold,
         })
@@ -557,8 +587,7 @@ impl OutputFunction<TickContext<'_>, (u32, u64, u64)> for RegimeOutput {
             dependency_operations: 1,
             dependency_operation_micros: values.2,
             handler_added_micros: 0,
-            transient_failures: 0,
-            permanent_rejection_every: 0,
+            outcome: EventOutcomeRule::Success,
             launch_delay_micros: 30_000,
             scale: if context.frame.tick_index == 0 {
                 ScaleDirective::Request {
@@ -725,7 +754,9 @@ fn principal_regimes_exercise_distinct_failure_mechanisms() -> Result<(), TestEr
         rejected
             .settlements()
             .iter()
-            .filter(|settlement| settlement.permanent_rejection)
+            .filter(|settlement| {
+                matches!(settlement.final_outcome, FinalOutcome::PermanentFailure)
+            })
             .count(),
         200
     );
@@ -759,7 +790,7 @@ fn extended_principal_regimes_enforce_their_physical_invariants() -> Result<(), 
         .map(|event| event.release_micros)
         .collect::<Vec<_>>();
     release_times.dedup();
-    assert_eq!(release_times, [0, 500_000, 1_000_000, 1_500_000]);
+    assert_eq!(release_times, [120_000_000, 240_000_000, 360_000_000]);
     assert!(
         hot_partition
             .events()
@@ -825,7 +856,7 @@ fn capacity_regimes_record_passive_resource_windows() -> Result<(), TestError> {
             if let CapacityEvidenceSample::Window(window) = sample.capacity_evidence {
                 recorded_windows += 1;
                 assert!(window.exposure_seconds > 0.0_f64);
-                assert!(window.useful_completions > 0);
+                assert!(window.completed_attempts > 0);
                 assert!(window.concurrency > 0.0_f64);
                 assert!(window.throughput_per_second().is_finite());
             }
@@ -933,11 +964,67 @@ fn hot_partition_exposes_unavoidable_placement_loss() -> Result<(), TestError> {
 fn lead_time_diagnostics_use_prequential_predictive_distributions() -> Result<(), TestError> {
     let run = run_principal_regime(PrincipalRegime::LinearThroughput)?;
     let mut completed = 0_u32;
+    let mut maximum_target = 0_u32;
+    let mut minimum_loss = f64::INFINITY;
+    let mut maximum_loss = 0.0_f64;
+    let mut target_streak = 0_u32;
+    let mut maximum_target_streak = 0_u32;
+    let mut first_two = None;
+    let mut after_two = None;
+    let mut target_two_count = 0_u32;
+    let mut last_two = None;
+    let mut final_state = None;
     for index in 0..run.controller().len() {
         let sample = run
             .controller()
             .sample(index)
             .ok_or(TestError::MissingControllerSample)?;
+        maximum_target = maximum_target.max(sample.target);
+        target_streak = if sample.target > 1 {
+            target_streak.saturating_add(1)
+        } else {
+            0
+        };
+        maximum_target_streak = maximum_target_streak.max(target_streak);
+        let losses = run.controller().decision_expected_losses(index);
+        let passes = run.controller().decision_pass_probabilities(index);
+        if sample.target == 2 && first_two.is_none() {
+            first_two = Some((
+                index,
+                losses.and_then(|values| values.first()).copied(),
+                losses.and_then(|values| values.get(1)).copied(),
+                passes.and_then(|values| values.first()).copied(),
+                passes.and_then(|values| values.get(1)).copied(),
+                sample.cap,
+                sample.arrival_predictive_median_count,
+                sample.capacity_median_per_second,
+            ));
+        } else if first_two.is_some() && sample.target == 1 && after_two.is_none() {
+            after_two = Some((
+                index,
+                losses.and_then(|values| values.first()).copied(),
+                losses.and_then(|values| values.get(1)).copied(),
+                passes.and_then(|values| values.first()).copied(),
+                passes.and_then(|values| values.get(1)).copied(),
+                sample.cap,
+                sample.arrival_predictive_median_count,
+                sample.capacity_median_per_second,
+            ));
+        }
+        if sample.target == 2 {
+            target_two_count = target_two_count.saturating_add(1);
+            last_two = Some((index, sample.arrival_predictive_median_count));
+        }
+        final_state = Some((
+            index,
+            sample.target,
+            sample.cap,
+            sample.arrival_predictive_median_count,
+            sample.capacity_median_per_second,
+            sample.no_knee_probability,
+        ));
+        minimum_loss = minimum_loss.min(sample.expected_loss);
+        maximum_loss = maximum_loss.max(sample.expected_loss);
         if matches!(
             sample.lead_time_evidence,
             crate::LeadTimeEvidenceSample::Completed { .. }
@@ -952,7 +1039,14 @@ fn lead_time_diagnostics_use_prequential_predictive_distributions() -> Result<()
             assert!((0.0_f64..=1.0_f64).contains(&sample.lead_time_predictive_rank));
         }
     }
-    assert!(completed > 0, "the regime must complete a scale transition");
+    assert!(
+        completed > 0,
+        "the regime must complete a scale transition: applied={:?}, target_max={maximum_target}, \
+         target_two_count={target_two_count}, target_streak_max={maximum_target_streak}, \
+         loss_min={minimum_loss}, loss_max={maximum_loss}, first_two={first_two:?}, \
+         after_two={after_two:?}, last_two={last_two:?}, final={final_state:?}",
+        run.applied_changes(),
+    );
     Ok(())
 }
 
@@ -967,6 +1061,48 @@ fn linear_closed_loop_uses_only_controller_scale_targets() -> Result<(), TestErr
             Some(SeriesCell::Unsigned32(0))
         );
     }
+    Ok(())
+}
+
+#[test]
+fn linear_closed_loop_satisfies_its_declared_outcome() -> Result<(), TestError> {
+    let run = run_principal_regime(PrincipalRegime::LinearThroughput)?;
+    let misses = run
+        .settlements()
+        .iter()
+        .filter(|settlement| {
+            settlement
+                .settle_micros
+                .saturating_sub(settlement.release_micros)
+                > PrincipalRegime::LinearThroughput.budget_micros()
+        })
+        .count();
+    let mut misses_by_step = [0_usize; 8];
+    let mut settlements_by_step = [0_usize; 8];
+    for settlement in run.settlements() {
+        let step =
+            usize::try_from(settlement.release_micros / 90_000_000).map_or(7, |index| index.min(7));
+        settlements_by_step[step] = settlements_by_step[step].saturating_add(1);
+        if settlement
+            .settle_micros
+            .saturating_sub(settlement.release_micros)
+            > PrincipalRegime::LinearThroughput.budget_micros()
+        {
+            misses_by_step[step] = misses_by_step[step].saturating_add(1);
+        }
+    }
+    assert!(
+        misses.saturating_mul(100) <= run.settlements().len(),
+        "linear SLO misses={misses}, settlements={}, misses_by_step={misses_by_step:?}, \
+         settlements_by_step={settlements_by_step:?}, applied={:?}",
+        run.settlements().len(),
+        run.applied_changes(),
+    );
+    validate_principal_regime(
+        PrincipalRegime::LinearThroughput,
+        RegimeExperiment::ClosedLoop,
+        &run,
+    )?;
     Ok(())
 }
 
@@ -1029,8 +1165,8 @@ fn looser_batch_budget_reduces_the_replica_target() -> Result<(), TestError> {
     let medium = run_batch_slo(12 * 60 * 60 * 1_000_000, 0.05)?;
     let long = run_batch_slo(24 * 60 * 60 * 1_000_000, 0.05)?;
 
-    assert!(short.target > medium.target);
-    assert!(medium.target >= long.target);
+    assert!(short.target > medium.target, "{short:?} {medium:?}");
+    assert!(medium.target >= long.target, "{medium:?} {long:?}");
     assert!([short, medium, long].iter().all(|summary| {
         (30_000_000..=90_000_000).contains(&summary.actuation_micros)
             && summary.initial_replicas == 1
@@ -1169,7 +1305,7 @@ fn pending_pod_readiness_does_not_pause_existing_work() -> Result<(), TestError>
     )?;
     assert_eq!(actuation.ready_micros, 55_000);
     plant.add_event(event(10_000, 0, 10_000))?;
-    plant.add_event(event(60_000, 1, 10_000))?;
+    plant.add_event(event(60_000, 2, 10_000))?;
     let result = plant.run();
     assert_eq!(result.settlements()[0].settle_micros, 21_000);
     assert_eq!(result.settlements()[1].settle_micros, 266_000);
@@ -1177,7 +1313,7 @@ fn pending_pod_readiness_does_not_pause_existing_work() -> Result<(), TestError>
 }
 
 #[test]
-fn latest_pending_scale_target_replaces_older_target() -> Result<(), TestError> {
+fn higher_target_preserves_earlier_capacity() -> Result<(), TestError> {
     let mut plant = Plant::new(configuration()?, 1)?;
     plant.replace_scale_target(ScaleChange {
         at_micros: 100_000,
@@ -1188,8 +1324,40 @@ fn latest_pending_scale_target_replaces_older_target() -> Result<(), TestError> 
         replicas: 3,
     })?;
 
-    assert_eq!(plant.advance_until(150_000).replicas, 1);
+    assert_eq!(plant.advance_until(150_000).replicas, 2);
     assert_eq!(plant.advance_until(200_000).replicas, 3);
+    Ok(())
+}
+
+#[test]
+fn lower_target_preserves_its_pending_replica_subset() -> Result<(), TestError> {
+    let mut plant = Plant::new(configuration()?, 1)?;
+    plant.replace_scale_target(ScaleChange {
+        at_micros: 100_000,
+        replicas: 3,
+    })?;
+    plant.replace_scale_target(ScaleChange {
+        at_micros: 200_000,
+        replicas: 2,
+    })?;
+
+    assert_eq!(plant.advance_until(100_000).replicas, 2);
+    Ok(())
+}
+
+#[test]
+fn repeated_pending_scale_target_keeps_original_readiness() -> Result<(), TestError> {
+    let mut plant = Plant::new(configuration()?, 1)?;
+    plant.replace_scale_target(ScaleChange {
+        at_micros: 100_000,
+        replicas: 2,
+    })?;
+    plant.replace_scale_target(ScaleChange {
+        at_micros: 200_000,
+        replicas: 2,
+    })?;
+
+    assert_eq!(plant.advance_until(100_000).replicas, 2);
     Ok(())
 }
 
@@ -1197,11 +1365,87 @@ fn latest_pending_scale_target_replaces_older_target() -> Result<(), TestError> 
 fn transient_failures_consume_attempts_and_backoff() -> Result<(), TestError> {
     let mut plant = Plant::new(configuration()?, 1)?;
     let mut retried = event(0, 0, 2_000);
-    retried.transient_failures = 2;
+    retried.outcome = EventOutcome::from_transient_failures(2, FinalOutcome::Success)
+        .map_err(PlantError::from)?;
     plant.add_event(retried)?;
+    let during_backoff = plant.advance_until(500_000);
+    assert_eq!(during_backoff.active_handlers, 0);
+    assert_eq!(during_backoff.backlog, 1);
+    let mut normal_backlog = [0_u32; 4];
+    plant.write_partition_normal_backlog(500_000, &mut normal_backlog)?;
+    assert_eq!(normal_backlog.iter().sum::<u32>(), 0);
+    let mut failure_backlog = [0_u32; 4];
+    let mut failure_release = [0_u64; 4];
+    plant.write_partition_failure_backlog(&mut failure_backlog)?;
+    plant.write_partition_failure_release(&mut failure_release)?;
+    assert_eq!(failure_backlog.iter().sum::<u32>(), 1);
+    assert!(failure_release[0] > 500_000);
     let result = plant.run();
     assert_eq!(result.settlements()[0].attempts, 3);
-    assert_eq!(result.settlements()[0].settle_micros, 29_000);
+    assert_eq!(result.settlements()[0].settle_micros, 1_009_000);
+    Ok(())
+}
+
+#[test]
+fn failure_attempts_use_the_configured_service_share() -> Result<(), TestError> {
+    let mut configuration = PlantConfiguration::new(1, 100, 100, 1, 1, 1)?
+        .with_dependency_operation_micros(0)
+        .with_retry_backoff_micros(0);
+    configuration.retry_policy.defer_threshold = 0.0_f64;
+    let mut plant = Plant::new(configuration, 1)?;
+    for key in 0_u32..100 {
+        let mut work = event(0, key, 1_000);
+        work.partition = 0;
+        work.outcome = EventOutcome::from_transient_failures(1, FinalOutcome::Success)
+            .map_err(PlantError::from)?;
+        plant.add_event(work)?;
+    }
+
+    let _snapshot = plant.advance_until(80_000);
+    let total = plant
+        .normal_service_micros
+        .saturating_add(plant.failure_service_micros);
+    let weighted_failure = plant.failure_service_micros.saturating_mul(10);
+    assert!(weighted_failure >= total.saturating_mul(2));
+    assert!(weighted_failure <= total.saturating_mul(4));
+    Ok(())
+}
+
+#[test]
+fn message_and_timer_failures_share_retry_semantics() -> Result<(), TestError> {
+    let mut message_plant = Plant::new(configuration()?, 1)?;
+    let mut timer_plant = Plant::new(configuration()?, 1)?;
+    let mut message = event(0, 0, 2_000);
+    message.outcome = EventOutcome::from_transient_failures(2, FinalOutcome::Success)
+        .map_err(PlantError::from)?;
+    let mut timer = message;
+    timer.source = EventSource::Timer;
+    message_plant.add_event(message)?;
+    timer_plant.add_event(timer)?;
+
+    assert_eq!(
+        message_plant.run().settlements(),
+        timer_plant.run().settlements()
+    );
+    Ok(())
+}
+
+#[test]
+fn terminal_outcome_creates_failure_demand_without_losing_its_category() -> Result<(), TestError> {
+    let mut plant = Plant::new(configuration()?, 1)?;
+    let count = RetryCount::new(1).map_err(PlantError::from)?;
+    let mut terminated = event(0, 0, 2_000);
+    terminated.outcome = EventOutcome::Retry {
+        outcome: RetryOutcome::Terminal,
+        count,
+        final_outcome: FinalOutcome::Success,
+    };
+    plant.add_event(terminated)?;
+
+    let snapshot = plant.advance_until(u64::MAX);
+    assert_eq!(snapshot.normal_terminal_failures, 1);
+    assert_eq!(snapshot.failure_successes, 1);
+    assert_eq!(snapshot.normal_transient_failures, 0);
     Ok(())
 }
 
@@ -1209,11 +1453,14 @@ fn transient_failures_consume_attempts_and_backoff() -> Result<(), TestError> {
 fn permanent_rejection_settles_without_retry() -> Result<(), TestError> {
     let mut plant = Plant::new(configuration()?, 1)?;
     let mut rejected = event(0, 0, 2_000);
-    rejected.permanent_rejection = true;
+    rejected.outcome = EventOutcome::Final(FinalOutcome::PermanentFailure);
     plant.add_event(rejected)?;
     let result = plant.run();
     assert_eq!(result.settlements()[0].attempts, 1);
-    assert!(result.settlements()[0].permanent_rejection);
+    assert_eq!(
+        result.settlements()[0].final_outcome,
+        FinalOutcome::PermanentFailure
+    );
     Ok(())
 }
 
@@ -1378,10 +1625,16 @@ fn run_reported_arrivals(
 ) -> Result<crate::ControllerTrace, TestError> {
     let controller_configuration = ControllerConfiguration {
         cohort_count_max: 4,
+        calendar_segment_count_max: 4,
         partition_count: 4,
         replica_count_max: 8,
         slots_per_replica: 2,
         posterior_sample_count: 64,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
         objective: ServiceObjective::new(1_000_000, 0.01)?,
     };
     let capacity_grid = CapacityGrid::new(&[0.001_f64], &[1_000.0_f64], &[0.0_f64, 1.0_f64])?;
@@ -1428,9 +1681,8 @@ fn event(release_micros: u64, key: u32, handler_micros: u64) -> EventSpec {
         key,
         handler_micros,
         dependency_operations: 1,
-        transient_failures: 0,
-        permanent_rejection: false,
-        timer: false,
+        outcome: EventOutcome::Final(FinalOutcome::Success),
+        source: EventSource::Message,
     }
 }
 
@@ -1461,15 +1713,28 @@ impl Arbitrary for EventTrace {
         let count = usize::arbitrary(generator) % 64 + 1;
         let mut events = Vec::with_capacity(count);
         for _ in 0..count {
+            let final_outcome = if bool::arbitrary(generator) {
+                FinalOutcome::PermanentFailure
+            } else {
+                FinalOutcome::Success
+            };
+            let retry_count = u8::arbitrary(generator) % 3;
+            let outcome = match EventOutcome::from_transient_failures(retry_count, final_outcome) {
+                Ok(outcome) => outcome,
+                Err(_) => return Self(events),
+            };
             events.push(EventSpec {
                 release_micros: u64::arbitrary(generator) % 1_000_000,
                 partition: u32::arbitrary(generator) % 8,
                 key: u32::arbitrary(generator) % 8,
                 handler_micros: u64::arbitrary(generator) % 100_000,
                 dependency_operations: u32::arbitrary(generator) % 8,
-                transient_failures: u8::arbitrary(generator) % 4,
-                permanent_rejection: bool::arbitrary(generator),
-                timer: bool::arbitrary(generator),
+                outcome,
+                source: if bool::arbitrary(generator) {
+                    EventSource::Timer
+                } else {
+                    EventSource::Message
+                },
             });
         }
         Self(events)

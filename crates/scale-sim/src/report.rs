@@ -15,7 +15,7 @@ use crate::{
 };
 use prosody_scale_core::{PosteriorQuery, TransitionDirection};
 
-const STORY_FIGURES: [FlowFigure; 18] = [
+const STORY_FIGURES: [FlowFigure; 19] = [
     FlowFigure::new(
         "Demand and history",
         "01-demand.svg",
@@ -72,7 +72,7 @@ const STORY_FIGURES: [FlowFigure; 18] = [
     FlowFigure::new(
         "Shared resource response",
         "11-shared-resource.svg",
-        "Nominal resource capacity and useful throughput show whether overload limits completions.",
+        "Nominal resource capacity and completed attempts show whether overload limits service.",
     ),
     FlowFigure::new(
         "Actuation delay",
@@ -93,31 +93,37 @@ const STORY_FIGURES: [FlowFigure; 18] = [
     FlowFigure::new(
         "Reliability evidence",
         "15-reliability-evidence.svg",
-        "Failure and rejection counts show accepted plant outcomes. The current model has no \
-         reliability posterior.",
+        "Final and retry-producing outcome counts show evidence for the reliability posterior.",
+    ),
+    FlowFigure::new(
+        "SLO pass probability by replica candidate",
+        "16-decision-pass.svg",
+        "Light cells have high posterior pass probability. A candidate is feasible when its mass \
+         +         reaches the declared SLO probability. The lines show the selected target and \
+         actual +         replicas.",
     ),
     FlowFigure::new(
         "Decision loss by replica candidate",
-        "16-decision-loss.svg",
+        "17-decision-loss.svg",
         "Dark cells have low expected loss. Light cells have high expected loss. The lines show \
          the selected target, saturation cap, and actual replicas.",
     ),
     FlowFigure::new(
         "Capacity posterior predictive check",
-        "17-capacity-predictive.svg",
+        "18-capacity-predictive.svg",
         "Accepted throughput should behave like a draw from the joint posterior predictive. Each \
          interval uses the posterior from before its evidence. It reproduces the Poisson or \
          conditional Binomial observation model that accepted the window.",
     ),
     FlowFigure::new(
         "Capacity predictive coverage",
-        "18-capacity-coverage.svg",
+        "19-capacity-coverage.svg",
         "Each point records whether the accepted outcome entered its stated 80% interval. The \
          cumulative line shows empirical prequential coverage for this experiment.",
     ),
 ];
 
-const MODEL_FACTORS: [ModelFactor; 10] = [
+const MODEL_FACTORS: [ModelFactor; 12] = [
     ModelFactor::new(
         "Arrival rate",
         "arrival-rate",
@@ -147,6 +153,16 @@ const MODEL_FACTORS: [ModelFactor; 10] = [
         "Knee concurrency",
         "knee-concurrency",
         "The heatmap shows the concurrency range where saturation begins.",
+    ),
+    ModelFactor::new(
+        "Normal retry probability",
+        "normal-retry-probability",
+        "The heatmap shows retry probability after a normal attempt.",
+    ),
+    ModelFactor::new(
+        "Failure retry probability",
+        "failure-retry-probability",
+        "The heatmap shows retry probability after a failure attempt.",
     ),
     ModelFactor::new(
         "Scale-up lead time",
@@ -1214,12 +1230,16 @@ const fn known_limitation(regime: PrincipalRegime) -> Option<&'static str> {
              timer scaling.",
         ),
         PrincipalRegime::HotSerializedKey => Some(
-            "The core has no key-serialization factor. It cannot represent the one-key \
-             concurrency limit.",
+            "This run cannot distinguish key serialization from indivisible partition placement. \
+             Compare it with an equal many-key control.",
         ),
-        PrincipalRegime::TransientFailures | PrincipalRegime::PermanentRejections => Some(
-            "The core has no failure posterior. Counts cannot prove calibrated reliability \
-             inference.",
+        PrincipalRegime::TransientFailures => Some(
+            "The adapter separates Normal backlog from known Failure timers. This report does not \
+             include its paired failure-free control.",
+        ),
+        PrincipalRegime::PermanentRejections => Some(
+            "The retry factor treats permanent failure as final. The report lacks the separate \
+             application-correctness posterior.",
         ),
         PrincipalRegime::SnapshotFaults | PrincipalRegime::MissingReporter => Some(
             "The core does not export the decision change caused by missing evidence. Snapshot \
@@ -1297,7 +1317,7 @@ fn write_capacity_evidence_summary(
     )?;
     writeln!(
         source,
-        "\nObserved useful throughput ranged from {:.1} to {:.1} operations per second.",
+        "\nObserved attempt throughput ranged from {:.1} to {:.1} operations per second.",
         summary.minimum_throughput, summary.maximum_throughput
     )?;
     writeln!(

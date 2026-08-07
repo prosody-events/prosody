@@ -9,17 +9,31 @@ use thiserror::Error;
 use crate::arrival::{ArrivalEvidence, ArrivalFactor};
 use crate::capacity::CapacityFactor;
 use crate::edf::{
-    CandidateLoss, CandidateSupply, EdfScratch, prepare, shortfall,
+    ArrivalPath, CandidateLoss, CandidateSupply, EdfScratch, prepare, shortfall,
     shortfall_prepared_common_release_candidates,
 };
 use crate::lead_time::LeadTimeFactor;
+use crate::model::mixed_event_supply;
 use crate::partition::PartitionFactor;
-use crate::types::WorkCohort;
+use crate::types::{CalendarForecast, WorkCohort};
 use crate::{
-    CapacityCurve, CapacityGrid, CapacityPrior, Cohort, Configuration, HoldReason, ModelTime,
-    ObservationBuffer, PosteriorQuery, RandomStream, ResourceWindow, ScaleDecision, ScaleScratch,
-    ScaleState, ServiceObjective, ThroughputPosteriorCell, TransitionDirection, TransitionEvidence,
-    step,
+    ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
+    CalendarArtifactId, CalendarRateSegment, CapacityCurve, CapacityGrid, CapacityPrior, Cohort,
+    Configuration, DemandClass, HoldReason, ModelTime, ObservationBuffer, PosteriorQuery,
+    RandomStream, ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleScratch, ScaleState,
+    ServiceObjective, ThroughputPosteriorCell, TransitionDirection, TransitionEvidence,
+    TransitionPrior, step,
+};
+
+const NO_FUTURE_ARRIVALS: ArrivalPath<'static> = ArrivalPath {
+    start_seconds: 0.0_f64,
+    end_seconds: &[f64::MAX],
+    rates: &[0.0_f64],
+};
+const TEN_FUTURE_ARRIVALS_PER_SECOND: ArrivalPath<'static> = ArrivalPath {
+    start_seconds: 0.0_f64,
+    end_seconds: &[f64::MAX],
+    rates: &[10.0_f64],
 };
 
 #[derive(Clone, Debug)]
@@ -120,9 +134,25 @@ fn counter_stream_replays_and_separates_domains() {
 }
 
 #[test]
+fn backlog_evidence_has_one_positive_observation_per_partition_and_class() -> Result<(), TestError>
+{
+    assert!(BacklogCohort::new(10, 0, 0, 0, DemandClass::Normal).is_err());
+    assert!(BacklogCohort::new(10, 11, 1, 0, DemandClass::Normal).is_err());
+    let configuration = configuration()?;
+    let mut observation = ObservationBuffer::new(&configuration)?;
+    let backlog = BacklogCohort::new(10, 0, 1, 0, DemandClass::Normal)?;
+
+    observation.set_backlog(backlog)?;
+
+    assert!(observation.set_backlog(backlog).is_err());
+    Ok(())
+}
+
+#[test]
 fn lead_time_updates_only_the_matching_direction_and_delta() -> Result<(), TestError> {
     let simd_level = Level::new();
-    let mut factor = LeadTimeFactor::new();
+    let prior = TransitionPrior::broad_fallback();
+    let mut factor = LeadTimeFactor::new(&prior);
     let up_one_prior = factor.expected_seconds(TransitionDirection::Up, 1);
     let up_four_prior = factor.expected_seconds(TransitionDirection::Up, 4);
     let down_prior = factor.expected_seconds(TransitionDirection::Down, 1);
@@ -273,12 +303,87 @@ fn partition_arrival_update_is_consumed_once() -> Result<(), TestError> {
 
 #[test]
 fn arrival_posterior_predictive_mass_normalizes() {
-    let mut factor = ArrivalFactor::new();
-    factor.update(ArrivalEvidence::new(4, 1_000_000));
+    let mut factor = ArrivalFactor::new(crate::ArrivalPrior::broad_fallback());
+    factor.update(ArrivalEvidence::new(4, 1_000_000), None, 1_000_000);
     let mass = (0_u32..128)
         .map(|count| factor.predictive_probability(count, 1.0_f64))
         .sum::<f64>();
     assert!((mass - 1.0_f64).abs() < 1.0e-12_f64);
+}
+
+#[test]
+fn arrival_change_point_replaces_stale_rate_evidence() -> Result<(), TestError> {
+    let prior = crate::ArrivalPrior::new(100.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64, 1_024)?;
+    let mut factor = ArrivalFactor::new(prior);
+    for _ in 0..100 {
+        factor.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
+    }
+    let old_rate = factor.expected_rate();
+    for _ in 0..8 {
+        factor.update(ArrivalEvidence::new(400, 1_000_000), None, 1_000_000);
+    }
+    assert!(
+        old_rate < 110.0_f64 && factor.expected_rate() > 350.0_f64,
+        "contrary evidence must replace a stale segment"
+    );
+    Ok(())
+}
+
+#[test]
+fn arrival_change_point_normalizes_after_an_extreme_rate_change() -> Result<(), TestError> {
+    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64, 1_024)?;
+    let mut factor = ArrivalFactor::new(prior);
+
+    factor.update(ArrivalEvidence::new(10_000, 1_000_000), None, 1_000_000);
+
+    assert!(factor.expected_rate() > 4_000.0_f64);
+    Ok(())
+}
+
+#[test]
+fn live_evidence_selects_a_supported_calendar_model() -> Result<(), TestError> {
+    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64, 1_024)?;
+    let segment = CalendarRateSegment::new(7, 0, 60_000_000, 1_000.0_f64, 10.0_f64)?;
+    let forecast = CalendarForecast {
+        artifact: CalendarArtifactId(11),
+        prior_probability: 0.5_f64,
+        segments: std::slice::from_ref(&segment),
+    };
+    let mut factor = ArrivalFactor::new(prior);
+
+    for second in 1_u64..=10 {
+        factor.update(
+            ArrivalEvidence::new(100, 1_000_000),
+            Some(forecast),
+            second * 1_000_000,
+        );
+    }
+
+    assert!(factor.calendar_model_probability() > 0.9_f64);
+    Ok(())
+}
+
+#[test]
+fn live_evidence_rejects_a_stale_calendar_model() -> Result<(), TestError> {
+    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64, 1_024)?;
+    let segment = CalendarRateSegment::new(7, 0, 60_000_000, 1_000.0_f64, 10.0_f64)?;
+    let forecast = CalendarForecast {
+        artifact: CalendarArtifactId(11),
+        prior_probability: 0.5_f64,
+        segments: std::slice::from_ref(&segment),
+    };
+    let mut factor = ArrivalFactor::new(prior);
+
+    for second in 1_u64..=10 {
+        factor.update(
+            ArrivalEvidence::new(1_000, 1_000_000),
+            Some(forecast),
+            second * 1_000_000,
+        );
+    }
+
+    assert!(factor.calendar_model_probability() < 0.1_f64);
+    Ok(())
 }
 
 #[test]
@@ -431,6 +536,8 @@ fn every_discrete_posterior_has_an_ordered_normalized_view() -> Result<(), TestE
         PosteriorQuery::Collapse,
         PosteriorQuery::Knee,
         PosteriorQuery::SaturationState,
+        PosteriorQuery::NormalRetryProbability,
+        PosteriorQuery::FailureRetryProbability,
         PosteriorQuery::PartitionShare,
         PosteriorQuery::LeadTime {
             direction: TransitionDirection::Up,
@@ -454,6 +561,39 @@ fn every_discrete_posterior_has_an_ordered_normalized_view() -> Result<(), TestE
     assert!(arrival.shape > 0.0_f64);
     assert!(arrival.rate > 0.0_f64);
     Ok(())
+}
+
+#[test]
+fn attempt_outcomes_update_only_their_retry_factors() -> Result<(), TestError> {
+    let configuration = configuration()?;
+    let mut state = ScaleState::new(configuration.clone(), grid()?)?;
+    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut observation = ObservationBuffer::new(&configuration)?;
+    observation.set_attempt_outcomes(AttemptOutcomeEvidence::new(
+        AttemptOutcomeCounts::new(80, 10, 10, 0),
+        AttemptOutcomeCounts::new(10, 5, 0, 5),
+    ))?;
+    let _decision = step(
+        &mut state,
+        &mut scratch,
+        observation.observation(),
+        ModelTime::from_micros(1),
+    );
+
+    let normal = posterior_mean(&state, PosteriorQuery::NormalRetryProbability)?;
+    let failure = posterior_mean(&state, PosteriorQuery::FailureRetryProbability)?;
+    assert!(normal < failure);
+    assert!(failure < 0.5_f64);
+    Ok(())
+}
+
+#[test]
+fn mixed_demand_supply_respects_work_conservation_and_failure_share() {
+    let failure_only = mixed_event_supply(100.0_f64, 0.2_f64, 0.5_f64, 0.3_f64, 0.0_f64, 10.0_f64);
+    assert!(close_relative(failure_only, 50.0_f64));
+
+    let mixed = mixed_event_supply(100.0_f64, 0.2_f64, 0.5_f64, 0.3_f64, 10.0_f64, 10.0_f64);
+    assert!(close_relative(mixed, 25.0_f64));
 }
 
 #[test]
@@ -578,7 +718,7 @@ fn linear_windows_below_the_knee_cannot_create_a_cap() -> Result<(), TestError> 
 }
 
 #[test]
-fn fewer_useful_completions_cannot_loosen_a_cap() -> Result<(), TestError> {
+fn fewer_completed_attempts_cannot_loosen_a_cap() -> Result<(), TestError> {
     let simd_level = Level::new();
     let grid = CapacityGrid::new(
         &[0.1_f64],
@@ -626,7 +766,52 @@ fn partial_observation_returns_a_decision() -> Result<(), TestError> {
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
-    assert!(apply.diagnostics.saturation_probability <= f64::EPSILON);
+    assert!((1..=configuration.replica_count_max).contains(&apply.target));
+    Ok(())
+}
+
+#[test]
+fn predictive_arrivals_request_capacity_before_work_is_released() -> Result<(), TestError> {
+    let configuration = Configuration {
+        cohort_count_max: 1,
+        calendar_segment_count_max: 1,
+        partition_count: 4,
+        replica_count_max: 4,
+        slots_per_replica: 1,
+        posterior_sample_count: 1_024,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: crate::ArrivalPrior::broad_fallback(),
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
+    };
+    let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
+    let mut state = ScaleState::new(configuration.clone(), grid)?;
+    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut observation = ObservationBuffer::new(&configuration)?;
+    observation.set_arrivals(200, 10_000_000)?;
+    observation.set_attempt_outcomes(AttemptOutcomeEvidence::new(
+        AttemptOutcomeCounts::new(1_000_000, 0, 0, 0),
+        AttemptOutcomeCounts::new(1_000_000, 0, 0, 0),
+    ))?;
+    let decision = step(
+        &mut state,
+        &mut scratch,
+        observation.observation(),
+        ModelTime::from_micros(1),
+    );
+    let ScaleDecision::Apply(apply) = decision else {
+        return Err(TestError::UnexpectedHold);
+    };
+
+    assert!(
+        apply.target > 1,
+        "target={}, cap={}, loss={}",
+        apply.target,
+        apply.cap,
+        apply.diagnostics.expected_loss
+    );
     Ok(())
 }
 
@@ -634,10 +819,16 @@ fn partial_observation_returns_a_decision() -> Result<(), TestError> {
 fn joint_capacity_samples_match_direct_enumeration() -> Result<(), TestError> {
     let configuration = Configuration {
         cohort_count_max: 1,
+        calendar_segment_count_max: 1,
         partition_count: 1,
         replica_count_max: 1,
         slots_per_replica: 1,
         posterior_sample_count: 1_024,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: crate::ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64, 1_024)?,
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
         objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
     };
     let grid = CapacityGrid::new(&[0.001_f64], &[50.0_f64, 100.0_f64], &[0.0_f64])?;
@@ -649,7 +840,13 @@ fn joint_capacity_samples_match_direct_enumeration() -> Result<(), TestError> {
         deadline_micros: 1_000_000,
         offered_events: 75.0_f64,
         partition: 0,
+        demand_class: DemandClass::Normal,
     })?;
+    observation.set_attempt_outcomes(AttemptOutcomeEvidence::new(
+        AttemptOutcomeCounts::new(1_000_000, 0, 0, 0),
+        AttemptOutcomeCounts::new(1_000_000, 0, 0, 0),
+    ))?;
+    observation.set_arrivals(0, u64::MAX)?;
 
     let decision = step(
         &mut state,
@@ -660,9 +857,13 @@ fn joint_capacity_samples_match_direct_enumeration() -> Result<(), TestError> {
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
-    let exact_loss = 0.25_f64 * ((75.0_f64 - 50.0_f64) / 75.0_f64);
+    let no_knee_area = 75.0_f64 * 75.0_f64 / (2.0_f64 * 1_000.0_f64);
+    let low_knee_area = 75.0_f64 * 75.0_f64 / (2.0_f64 * 50.0_f64);
+    let high_knee_area = 75.0_f64 * 75.0_f64 / (2.0_f64 * 100.0_f64);
+    let exact_loss =
+        (0.5_f64 * no_knee_area + 0.25_f64 * low_knee_area + 0.25_f64 * high_knee_area) / 75.0_f64;
 
-    assert!(close_relative(apply.diagnostics.expected_loss, exact_loss));
+    assert!((apply.diagnostics.expected_loss - exact_loss).abs() < 1.0e-5_f64);
     assert!(close_relative(
         apply.diagnostics.saturation_probability,
         0.5_f64,
@@ -674,10 +875,16 @@ fn joint_capacity_samples_match_direct_enumeration() -> Result<(), TestError> {
 fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), TestError> {
     let configuration = Configuration {
         cohort_count_max: 2,
+        calendar_segment_count_max: 2,
         partition_count: 2,
         replica_count_max: 2,
         slots_per_replica: 1,
         posterior_sample_count: 64,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: negligible_arrival_prior()?,
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
         objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
     };
     let grid = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64])?;
@@ -690,6 +897,7 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
             deadline_micros: 1_000_000,
             offered_events: 1.0_f64,
             partition,
+            demand_class: DemandClass::Normal,
         })?;
     }
 
@@ -718,6 +926,7 @@ fn partition_pause_removes_service_from_candidate_supply() -> Result<(), TestErr
     prepare(&cohorts, &mut scratch);
     let mut credit = [0.0_f64];
     let mut loss = [0.0_f64];
+    let mut delay_area = [0.0_f64];
 
     let supply = CandidateSupply {
         before: 1.0_f64,
@@ -727,18 +936,143 @@ fn partition_pause_removes_service_from_candidate_supply() -> Result<(), TestErr
         ready_seconds: &[1.0_f64],
     };
     let mut results = CandidateLoss {
-        service_credit: &mut credit,
+        service_balance: &mut credit,
         shortfall: &mut loss,
+        delay_area: &mut delay_area,
     };
     shortfall_prepared_common_release_candidates(
         Level::new(),
         &cohorts,
         &supply,
+        0.0_f64,
+        &NO_FUTURE_ARRIVALS,
+        0.0_f64,
+        1.0_f64,
         &mut results,
         &scratch,
     );
 
     assert!(close_relative(loss[0], 1.0_f64 / 3.0_f64));
+    Ok(())
+}
+
+#[test]
+fn missed_work_remains_service_debt_and_rewards_faster_recovery() -> Result<(), TestError> {
+    let cohorts = [WorkCohort {
+        release_micros: 0,
+        deadline_micros: 1_000_000,
+        work_slot_seconds: 1.0_f64,
+        partition: 0,
+    }];
+    let mut scratch = EdfScratch::new(1)?;
+    prepare(&cohorts, &mut scratch);
+    let supply = CandidateSupply {
+        before: 1.0_f64,
+        during: &[1.0_f64, 2.0_f64],
+        after: &[1.0_f64, 2.0_f64],
+        pause_seconds: &[0.0_f64; 2],
+        ready_seconds: &[0.0_f64; 2],
+    };
+    let mut balance = [0.0_f64; 2];
+    let mut shortfall = [0.0_f64; 2];
+    let mut delay_area = [0.0_f64; 2];
+    let mut results = CandidateLoss {
+        service_balance: &mut balance,
+        shortfall: &mut shortfall,
+        delay_area: &mut delay_area,
+    };
+
+    shortfall_prepared_common_release_candidates(
+        Level::new(),
+        &cohorts,
+        &supply,
+        0.75_f64,
+        &NO_FUTURE_ARRIVALS,
+        0.0_f64,
+        1.0_f64,
+        &mut results,
+        &scratch,
+    );
+
+    assert!(shortfall[0] > shortfall[1], "shortfall: {shortfall:?}");
+    assert!(delay_area[0] > delay_area[1]);
+    assert!(balance[0] < 0.0_f64);
+    Ok(())
+}
+
+#[test]
+fn debt_only_observation_rewards_faster_recovery() -> Result<(), TestError> {
+    let cohorts = [];
+    let mut scratch = EdfScratch::new(1)?;
+    prepare(&cohorts, &mut scratch);
+    let supply = CandidateSupply {
+        before: 1.0_f64,
+        during: &[1.0_f64, 2.0_f64],
+        after: &[1.0_f64, 2.0_f64],
+        pause_seconds: &[0.0_f64; 2],
+        ready_seconds: &[0.0_f64; 2],
+    };
+    let mut balance = [0.0_f64; 2];
+    let mut shortfall = [0.0_f64; 2];
+    let mut delay_area = [0.0_f64; 2];
+    let mut results = CandidateLoss {
+        service_balance: &mut balance,
+        shortfall: &mut shortfall,
+        delay_area: &mut delay_area,
+    };
+
+    shortfall_prepared_common_release_candidates(
+        Level::new(),
+        &cohorts,
+        &supply,
+        2.0_f64,
+        &NO_FUTURE_ARRIVALS,
+        0.0_f64,
+        2.0_f64,
+        &mut results,
+        &scratch,
+    );
+
+    assert!(delay_area[0] > 0.0_f64);
+    assert!(delay_area[0] > delay_area[1]);
+    Ok(())
+}
+
+#[test]
+fn predictive_arrivals_consume_service_while_debt_drains() -> Result<(), TestError> {
+    let cohorts = [];
+    let mut scratch = EdfScratch::new(1)?;
+    prepare(&cohorts, &mut scratch);
+    let supply = CandidateSupply {
+        before: 10.0_f64,
+        during: &[10.0_f64, 20.0_f64],
+        after: &[10.0_f64, 20.0_f64],
+        pause_seconds: &[0.0_f64; 2],
+        ready_seconds: &[0.0_f64; 2],
+    };
+    let mut balance = [0.0_f64; 2];
+    let mut shortfall = [0.0_f64; 2];
+    let mut delay_area = [0.0_f64; 2];
+    let mut results = CandidateLoss {
+        service_balance: &mut balance,
+        shortfall: &mut shortfall,
+        delay_area: &mut delay_area,
+    };
+
+    shortfall_prepared_common_release_candidates(
+        Level::new(),
+        &cohorts,
+        &supply,
+        100.0_f64,
+        &TEN_FUTURE_ARRIVALS_PER_SECOND,
+        0.0_f64,
+        10.0_f64,
+        &mut results,
+        &scratch,
+    );
+
+    assert!(close_relative(delay_area[0], 1_000.0_f64));
+    assert!(close_relative(delay_area[1], 500.0_f64));
     Ok(())
 }
 
@@ -753,6 +1087,7 @@ fn decision_curve_contains_the_selected_expected_loss() -> Result<(), TestError>
         deadline_micros: 1_000_000,
         offered_events: 100.0_f64,
         partition: 0,
+        demand_class: DemandClass::Normal,
     })?;
 
     let decision = step(
@@ -765,12 +1100,26 @@ fn decision_curve_contains_the_selected_expected_loss() -> Result<(), TestError>
         return Err(TestError::UnexpectedHold);
     };
     let mut losses = vec![0.0_f64; scratch.decision_candidate_count()];
-    scratch.write_expected_loss_curve(&mut losses)?;
+    let mut probabilities = vec![0.0_f64; configuration.replica_count_max as usize];
+    scratch.write_decision_curve(&mut losses, &mut probabilities)?;
 
     assert!(close_relative(
         losses[apply.target as usize - 1],
         apply.diagnostics.expected_loss,
     ));
+    assert!(
+        probabilities
+            .iter()
+            .all(|probability| (0.0_f64..=1.0_f64).contains(probability)),
+        "each candidate pass probability must be normalized"
+    );
+    let required = 1.0_f64 - configuration.objective.epsilon();
+    if let Some(first_feasible) = probabilities
+        .iter()
+        .position(|probability| *probability >= required)
+    {
+        assert_eq!(apply.target as usize - 1, first_feasible);
+    }
     Ok(())
 }
 
@@ -814,6 +1163,7 @@ fn steady_state_step_allocates_no_memory() -> Result<(), TestError> {
             deadline_micros: 2_000_000 + u64::from(partition) * 10_000,
             offered_events: 50.0_f64,
             partition,
+            demand_class: DemandClass::Normal,
         })?;
     }
 
@@ -862,7 +1212,8 @@ fn regressed_model_time_returns_hold() -> Result<(), TestError> {
 
 #[test]
 fn one_hot_partition_cannot_claim_capacity_from_other_replicas() -> Result<(), TestError> {
-    let configuration = configuration()?;
+    let mut configuration = configuration()?;
+    configuration.arrival_prior = negligible_arrival_prior()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
     let mut scratch = ScaleScratch::new(&configuration)?;
     let mut observation = ObservationBuffer::new(&configuration)?;
@@ -871,6 +1222,7 @@ fn one_hot_partition_cannot_claim_capacity_from_other_replicas() -> Result<(), T
         deadline_micros: 1_000_000,
         offered_events: 160.0_f64,
         partition: 0,
+        demand_class: DemandClass::Normal,
     })?;
 
     let decision = step(
@@ -889,7 +1241,8 @@ fn one_hot_partition_cannot_claim_capacity_from_other_replicas() -> Result<(), T
 
 #[test]
 fn wide_cohort_cannot_hide_one_hot_partition_deadline() -> Result<(), TestError> {
-    let configuration = configuration()?;
+    let mut configuration = configuration()?;
+    configuration.arrival_prior = negligible_arrival_prior()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
     let mut scratch = ScaleScratch::new(&configuration)?;
     let mut observation = ObservationBuffer::new(&configuration)?;
@@ -898,12 +1251,14 @@ fn wide_cohort_cannot_hide_one_hot_partition_deadline() -> Result<(), TestError>
         deadline_micros: 100_000_000,
         offered_events: 0.0_f64,
         partition: 0,
+        demand_class: DemandClass::Normal,
     })?;
     observation.push_cohort(Cohort {
         release_micros: 50_000_000,
         deadline_micros: 51_000_000,
         offered_events: 160.0_f64,
         partition: 0,
+        demand_class: DemandClass::Normal,
     })?;
 
     let decision = step(
@@ -941,6 +1296,7 @@ fn extra_replicas_cannot_fix_one_hot_partition_overload(
                 * (1.0_f64 + excess)
                 / 0.05_f64,
             partition: 0,
+            demand_class: DemandClass::Normal,
         })?;
         let decision = step(
             &mut state,
@@ -1003,20 +1359,94 @@ fn lead_time_predictive_quantile_inverts_the_predictive_cdf() -> Result<(), Test
     Ok(())
 }
 
+#[test]
+fn incomplete_actuation_uses_the_conditional_remaining_time() {
+    let factor = LeadTimeFactor::new(&TransitionPrior::broad_fallback());
+    let elapsed_seconds = 20.0_f64;
+    let direction = TransitionDirection::Up;
+    let delta = 1;
+    let mut coordinate = RandomStream::new(91);
+    let uniform = coordinate.open_unit_f64();
+    let elapsed_cdf = factor.predictive_cdf(direction, delta, elapsed_seconds);
+    let expected_cdf = elapsed_cdf + uniform * (1.0_f64 - elapsed_cdf);
+    let mut draw = RandomStream::new(91);
+    let remaining = factor.sample_remaining_seconds(direction, delta, elapsed_seconds, &mut draw);
+    let actual_cdf = factor.predictive_cdf(direction, delta, elapsed_seconds + remaining);
+
+    assert!(
+        (actual_cdf - expected_cdf).abs() < 1.0e-12_f64,
+        "the remaining-time draw must invert the conditional survival distribution"
+    );
+}
+
+#[test]
+fn larger_candidates_inherit_useful_pending_capacity() -> Result<(), TestError> {
+    let configuration = configuration()?;
+    let mut state = ScaleState::new(configuration.clone(), grid()?)?;
+    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut observation = ObservationBuffer::new(&configuration)?;
+    observation.set_current_replicas(2)?;
+    observation.push_actuation_commitment(ActuationCommitment::new(
+        2,
+        3,
+        ModelTime::from_micros(1),
+    )?)?;
+
+    let _decision = step(
+        &mut state,
+        &mut scratch,
+        observation.observation(),
+        ModelTime::from_micros(20_000_000),
+    );
+
+    assert_eq!(scratch.trajectory_targets(2), Some([].as_slice()));
+    assert_eq!(scratch.trajectory_targets(3), Some([3].as_slice()));
+    assert_eq!(scratch.trajectory_targets(4), Some([3, 4].as_slice()));
+    Ok(())
+}
+
 fn close_relative(left: f64, right: f64) -> bool {
     let scale = left.abs().max(right.abs()).max(1.0_f64);
     (left - right).abs() <= 1.0e-12_f64 * scale
 }
 
+fn posterior_mean(state: &ScaleState, query: PosteriorQuery) -> Result<f64, TestError> {
+    let count = usize::try_from(state.posterior_value_count(query)?)
+        .map_err(|_| crate::ConfigurationError::PlatformLimit)?;
+    let mut values = vec![0.0_f64; count];
+    let mut probabilities = vec![0.0_f64; count];
+    state.write_posterior(query, &mut values, &mut probabilities)?;
+    Ok(values
+        .iter()
+        .zip(probabilities)
+        .map(|(value, probability)| value * probability)
+        .sum())
+}
+
 fn configuration() -> Result<Configuration, TestError> {
     Ok(Configuration {
         cohort_count_max: 16,
+        calendar_segment_count_max: 16,
         partition_count: 16,
         replica_count_max: 32,
         slots_per_replica: 4,
         posterior_sample_count: 64,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: crate::ArrivalPrior::broad_fallback(),
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
         objective: ServiceObjective::new(1_000_000, 0.01)?,
     })
+}
+
+fn negligible_arrival_prior() -> Result<crate::ArrivalPrior, TestError> {
+    Ok(crate::ArrivalPrior::new(
+        1.0_f64,
+        1.0e12_f64,
+        1.0e-12_f64,
+        1_024,
+    )?)
 }
 
 fn grid() -> Result<CapacityGrid, TestError> {
@@ -1029,6 +1459,8 @@ fn grid() -> Result<CapacityGrid, TestError> {
 
 #[derive(Debug, Error)]
 enum TestError {
+    #[error(transparent)]
+    ArrivalPrior(#[from] crate::ArrivalPriorError),
     #[error(transparent)]
     ResourceWindow(#[from] crate::ResourceWindowError),
     #[error(transparent)]

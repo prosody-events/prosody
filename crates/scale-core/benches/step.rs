@@ -2,9 +2,9 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use prosody_scale_core::{
-    CapacityGrid, CapacityGridError, Cohort, Configuration, ConfigurationError, ModelTime,
-    ObservationBuffer, ObservationError, ResourceWindow, ScaleScratch, ScaleState,
-    ServiceObjective, step,
+    CapacityGrid, CapacityGridError, Cohort, Configuration, ConfigurationError, DemandClass,
+    ModelTime, ObservationBuffer, ObservationError, ReliabilityPrior, ResourceWindow, ScaleScratch,
+    ScaleState, ServiceObjective, TransitionPrior, step,
 };
 use std::hint::black_box;
 use thiserror::Error;
@@ -235,10 +235,16 @@ fn capacity_grid(criterion: &mut Criterion) {
 fn configuration(case: BenchmarkCase) -> Result<Configuration, ConfigurationError> {
     Ok(Configuration {
         cohort_count_max: case.cohort_count_max,
+        calendar_segment_count_max: case.cohort_count_max,
         partition_count: 64,
         replica_count_max: case.replica_count_max,
         slots_per_replica: case.slots_per_replica,
         posterior_sample_count: case.posterior_sample_count,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
         objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
     })
 }
@@ -268,6 +274,7 @@ fn populate(
             deadline_micros: u64::from(HORIZON_SECONDS) * 1_000_000,
             offered_events: events_per_cohort,
             partition: cohort % 64,
+            demand_class: DemandClass::Normal,
         })?;
     }
     Ok(())

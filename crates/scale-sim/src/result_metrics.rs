@@ -58,7 +58,7 @@ impl SimulationResult {
             for event in &self.events {
                 if event.release_micros >= start && event.release_micros < end {
                     point.arrivals += 1;
-                    point.timers += u64::from(event.timer);
+                    point.timers += u64::from(event.source == crate::EventSource::Timer);
                 }
             }
             let mut released = 0_u64;
@@ -74,7 +74,10 @@ impl SimulationResult {
                 if settlement.settle_micros >= start && settlement.settle_micros < end {
                     point.useful_completions += 1;
                     point.transient_failures += u64::from(settlement.attempts.saturating_sub(1));
-                    point.permanent_rejections += u64::from(settlement.permanent_rejection);
+                    point.permanent_rejections += u64::from(matches!(
+                        settlement.final_outcome,
+                        crate::FinalOutcome::PermanentFailure
+                    ));
                     let latency = settlement
                         .settle_micros
                         .saturating_sub(settlement.release_micros);

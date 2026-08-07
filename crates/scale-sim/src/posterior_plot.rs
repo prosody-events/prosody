@@ -294,6 +294,16 @@ fn model_panels(controller: &ControllerTrace) -> Vec<PosteriorPanel> {
         ("collapse-strength", "fraction", PosteriorQuery::Collapse),
         ("knee-concurrency", "operations", PosteriorQuery::Knee),
         (
+            "normal-retry-probability",
+            "probability",
+            PosteriorQuery::NormalRetryProbability,
+        ),
+        (
+            "failure-retry-probability",
+            "probability",
+            PosteriorQuery::FailureRetryProbability,
+        ),
+        (
             "scale-up-lead-time",
             "seconds",
             PosteriorQuery::LeadTime {
@@ -326,7 +336,7 @@ fn model_panels(controller: &ControllerTrace) -> Vec<PosteriorPanel> {
             },
         ),
     ];
-    let mut panels = Vec::with_capacity(10);
+    let mut panels = Vec::with_capacity(12);
     panels.push(PosteriorPanel {
         file: "arrival-rate",
         unit: "events/s",

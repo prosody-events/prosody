@@ -1,6 +1,7 @@
 use super::{
-    ArrivalSeries, HISTORY_EVENT_COUNT_MAX, PrincipalDefinition, PrincipalRegime, RunSchedule,
-    SharedResourcePolicy, StopCondition, run_principal_regime_seeded,
+    ArrivalSeries, HISTORY_EVENT_COUNT_MAX, IndexSeries, PrincipalDefinition, PrincipalRegime,
+    RunSchedule, SharedResourcePolicy, StopCondition, run_principal_definition,
+    run_principal_regime_seeded,
 };
 use crate::model::{AttemptFrame, AttemptModel};
 use crate::{ConcurrencyLatencyCurve, PrincipalRunError, SeriesCell};
@@ -159,6 +160,119 @@ fn historical_definitions_sustain_their_relationships() {
         ));
         assert_eq!(definition.event_count_max, HISTORY_EVENT_COUNT_MAX);
     }
+}
+
+#[test]
+fn key_count_changes_one_partition_throughput() -> Result<(), PrincipalRunError> {
+    let schedule = RunSchedule {
+        start_micros: 0,
+        workload_end_micros: 5_000_000,
+        workload_interval_micros: 1_000_000,
+        followup_interval_micros: 1_000_000,
+        maximum_micros: 5_000_000,
+        stop: StopCondition::FixedDuration {
+            reason: super::RunStopReason::DurationComplete,
+        },
+    };
+    let one_key = PrincipalDefinition::for_regime(PrincipalRegime::HotSerializedKey)
+        .messages(ArrivalSeries::Rate {
+            per_second: 200,
+            count_max: 1_000,
+        })
+        .schedule(schedule)
+        .event_count_max(1_000);
+    let many_keys = one_key.keys(IndexSeries::Striped);
+
+    let serialized = run_principal_definition(PrincipalRegime::HotSerializedKey, one_key, None)?;
+    let parallel = run_principal_definition(PrincipalRegime::HotSerializedKey, many_keys, None)?;
+
+    let parallel_final = parallel
+        .settlements()
+        .last()
+        .map_or(0, |settlement| settlement.settle_micros);
+    let serialized_final = serialized
+        .settlements()
+        .last()
+        .map_or(0, |settlement| settlement.settle_micros);
+    assert!(parallel_final < serialized_final);
+    assert!(parallel.events().iter().all(|event| event.partition == 0));
+    assert!(serialized.events().iter().all(|event| event.key == 0));
+    Ok(())
+}
+
+#[test]
+fn retry_outcomes_increase_loss_without_creating_physical_saturation()
+-> Result<(), PrincipalRunError> {
+    let schedule = RunSchedule {
+        start_micros: 0,
+        workload_end_micros: 10_000_000,
+        workload_interval_micros: 1_000_000,
+        followup_interval_micros: 1_000_000,
+        maximum_micros: 10_000_000,
+        stop: StopCondition::FixedDuration {
+            reason: super::RunStopReason::DurationComplete,
+        },
+    };
+    let failures = PrincipalDefinition::for_regime(PrincipalRegime::TransientFailures)
+        .messages(ArrivalSeries::Rate {
+            per_second: 300,
+            count_max: 3_000,
+        })
+        .schedule(schedule)
+        .event_count_max(3_000);
+    let control = failures.transient_failures(super::FailureSeries::None);
+    let failed = run_principal_definition(PrincipalRegime::TransientFailures, failures, None)?;
+    let healthy = run_principal_definition(PrincipalRegime::TransientFailures, control, None)?;
+    let failed_attempts = failed
+        .settlements()
+        .iter()
+        .map(|settlement| settlement.attempts)
+        .sum::<u32>();
+    let healthy_attempts = healthy
+        .settlements()
+        .iter()
+        .map(|settlement| settlement.attempts)
+        .sum::<u32>();
+    let failed_clear_micros = failed
+        .settlements()
+        .last()
+        .map_or(0, |settlement| settlement.settle_micros);
+    let healthy_clear_micros = healthy
+        .settlements()
+        .last()
+        .map_or(0, |settlement| settlement.settle_micros);
+    let failed_final = failed
+        .controller()
+        .len()
+        .checked_sub(1)
+        .and_then(|index| failed.controller().sample(index));
+    let healthy_final = healthy
+        .controller()
+        .len()
+        .checked_sub(1)
+        .and_then(|index| healthy.controller().sample(index));
+    let saturation_delta = failed_final
+        .zip(healthy_final)
+        .map_or(f64::INFINITY, |(failed, healthy)| {
+            (failed.saturation_probability - healthy.saturation_probability).abs()
+        });
+    let reliability_increases_loss = (1..failed.controller().len().min(healthy.controller().len()))
+        .any(|index| {
+            failed
+                .controller()
+                .decision_expected_losses(index)
+                .zip(healthy.controller().decision_expected_losses(index))
+                .is_some_and(|(failed, healthy)| failed[0] > healthy[0] + 1.0e-9_f64)
+        });
+
+    assert!(failed_attempts > healthy_attempts);
+    assert!(failed_clear_micros > healthy_clear_micros);
+    assert!(
+        saturation_delta <= 0.01_f64,
+        "retry outcomes changed the saturation probability by {saturation_delta:.3}"
+    );
+    assert!(reliability_increases_loss);
+    Ok(())
 }
 
 #[test]

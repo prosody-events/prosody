@@ -1,7 +1,8 @@
 use std::ops::Deref;
 
 use prosody_scale_core::{
-    CapacityGrid, CapacityPrior, Configuration, RandomStream, ServiceObjective,
+    CalendarArtifactId, CalendarRateSegment, CapacityGrid, CapacityPrior, Configuration,
+    RandomStream, ReliabilityPrior, ServiceObjective, TransitionPrior,
 };
 
 use crate::harness::TickDrivenAttemptModel;
@@ -9,20 +10,27 @@ use crate::series::{
     OutputFunction, RecordedSeries, SeriesContext, SeriesFunction, SeriesHistory, series_graph,
 };
 use crate::{
-    AttemptFrame, AttemptModel, AttemptParameters, ClosedLoop, ClosedLoopError,
-    ConcurrencyLatencyCurve, ControllerTrace, DEFAULT_CONCURRENCY_PER_REPLICA, EventContext,
-    EventInputs, FaultPattern, MetricTrace, PlantConfiguration, PlantError, ReporterDirective,
-    ScaleDirective, SeriesCell, SimulationHarness, SimulationResult, TickContext, TickGenerator,
-    TickInputs,
+    AttemptFrame, AttemptModel, AttemptParameters, CalendarForecastInput, ClosedLoop,
+    ClosedLoopError, ConcurrencyLatencyCurve, ControllerTrace, DEFAULT_CONCURRENCY_PER_REPLICA,
+    DEFAULT_FAILURE_WEIGHT, EventContext, EventInputs, FaultPattern, MetricTrace,
+    PlantConfiguration, PlantError, ReporterDirective, ScaleDirective, SeriesCell,
+    SimulationHarness, SimulationResult, TickContext, TickGenerator, TickInputs,
 };
 
 const CAPACITY_COLLAPSE_GRID: &[f64] = &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64];
 
 const EVENT_COUNT: u32 = 2_000;
+const HOT_KEY_EVENT_COUNT: u32 = 6_000;
 const HOT_PARTITION_EVENT_COUNT: u32 = 60_000;
 const SEASONAL_EVENT_COUNT: u32 = 3_000;
+const TRANSIENT_EVENT_COUNT: u32 = 36_000;
 const CAPACITY_EVENT_COUNT_MAX: u32 = 300_000;
+const CAPACITY_RESPONSE_EVENT_COUNT: u32 = 231_000;
 const HISTORY_EVENT_COUNT_MAX: u32 = 64_000;
+const CALENDAR_HISTORY_EXPOSURE_SECONDS: u32 = 900;
+const CALENDAR_PRIOR_SHAPE: f64 = 4.0_f64;
+const CALENDAR_PRIOR_RATE_SECONDS: f64 = 0.01_f64;
+const CALENDAR_MODEL_PRIOR_PROBABILITY: f64 = 0.5_f64;
 
 /// A principal deterministic plant regime for plot review.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -305,26 +313,37 @@ fn validate_closed_loop_stimulus(
         PrincipalRegime::HotPartition => run.events().iter().all(|event| event.partition == 0),
         PrincipalRegime::TimerWave => {
             run.events().len() == EVENT_COUNT as usize
+                && run.events().iter().all(|event| {
+                    event.source == crate::EventSource::Timer && event.release_micros == 120_000_000
+                })
+        }
+        PrincipalRegime::HotSerializedKey => {
+            run.events().len() == HOT_KEY_EVENT_COUNT as usize
                 && run
                     .events()
                     .iter()
-                    .all(|event| event.timer && event.release_micros == 120_000_000)
-        }
-        PrincipalRegime::HotSerializedKey => {
-            run.events().iter().all(|event| event.key == 0)
+                    .all(|event| event.key == 0 && event.partition == 0)
                 && run
                     .settlements()
                     .iter()
                     .all(|settlement| settlement.in_flight_at_dispatch <= 1)
         }
-        PrincipalRegime::TransientFailures => run
-            .settlements()
-            .iter()
-            .any(|settlement| settlement.attempts > 1),
-        PrincipalRegime::PermanentRejections => run
-            .settlements()
-            .iter()
-            .any(|settlement| settlement.permanent_rejection),
+        PrincipalRegime::TransientFailures => {
+            let settlement_count = run.settlements().len();
+            let retry_count = run
+                .settlements()
+                .iter()
+                .filter(|settlement| settlement.attempts > 1)
+                .count();
+            run.events().len() == TRANSIENT_EVENT_COUNT as usize
+                && retry_count.saturating_mul(10) >= settlement_count
+        }
+        PrincipalRegime::PermanentRejections => run.settlements().iter().any(|settlement| {
+            matches!(
+                settlement.final_outcome,
+                crate::FinalOutcome::PermanentFailure
+            )
+        }),
         PrincipalRegime::RebalanceStorm => {
             input_distinct_positive_count(run.inputs(), "external_target") >= 2
         }
@@ -378,6 +397,12 @@ fn validate_closed_loop_claim(
     run: &PrincipalRun,
 ) -> Result<(), RegimeValidationError> {
     let invariant = match regime {
+        PrincipalRegime::LinearThroughput => (
+            run.settlements().len() == run.events().len()
+                && slo_miss_count(run, regime.budget_micros()).saturating_mul(100)
+                    <= run.settlements().len(),
+            "the controller did not complete the linear workload within its SLO allowance",
+        ),
         PrincipalRegime::ShortBurst => (
             (0..run.controller.len()).all(|index| {
                 run.controller
@@ -387,7 +412,7 @@ fn validate_closed_loop_claim(
             "the controller requested capacity that cannot arrive before the burst deadlines",
         ),
         PrincipalRegime::HotPartition => (
-            placement_constraint_binds(run),
+            single_worker_constraint_binds(run),
             "the decision did not expose the binding partition-placement loss",
         ),
         PrincipalRegime::SeasonalWaves => (
@@ -406,6 +431,10 @@ fn validate_closed_loop_claim(
             }),
             "the controller did not request capacity before the known timer wave",
         ),
+        PrincipalRegime::HotSerializedKey => (
+            single_worker_constraint_binds(run),
+            "the decision did not expose the binding serialized-key loss",
+        ),
         _ => return Ok(()),
     };
     require_regime(
@@ -416,7 +445,19 @@ fn validate_closed_loop_claim(
     )
 }
 
-fn placement_constraint_binds(run: &PrincipalRun) -> bool {
+fn slo_miss_count(run: &PrincipalRun, budget_micros: u64) -> usize {
+    run.settlements()
+        .iter()
+        .filter(|settlement| {
+            settlement
+                .settle_micros
+                .saturating_sub(settlement.release_micros)
+                > budget_micros
+        })
+        .count()
+}
+
+fn single_worker_constraint_binds(run: &PrincipalRun) -> bool {
     (0..run.controller.len()).any(|index| {
         let Some(sample) = run.controller.sample(index) else {
             return false;
@@ -598,7 +639,6 @@ fn run_principal_definition(
     let capacity_regime = is_capacity_regime(regime);
     let slots_per_replica = DEFAULT_CONCURRENCY_PER_REPLICA;
     let plant_configuration = principal_plant_configuration(
-        capacity_regime,
         definition.event_count_max,
         slots_per_replica,
         definition.inputs.shared_resource.parallelism,
@@ -644,24 +684,18 @@ fn is_capacity_regime(regime: PrincipalRegime) -> bool {
 }
 
 fn principal_plant_configuration(
-    capacity_regime: bool,
     event_count_max: u32,
     slots_per_replica: u32,
     shared_resource_parallelism: u32,
 ) -> Result<PlantConfiguration, PlantError> {
-    let configuration = PlantConfiguration::new(
+    PlantConfiguration::new(
         64,
         1_024,
         event_count_max,
         event_count_max,
         slots_per_replica,
         shared_resource_parallelism,
-    )?;
-    Ok(if capacity_regime {
-        configuration.with_rebalance(0, 0)
-    } else {
-        configuration
-    })
+    )
 }
 
 fn principal_handler_curve(regime: PrincipalRegime) -> Result<ConcurrencyLatencyCurve, PlantError> {
@@ -688,10 +722,21 @@ fn principal_graph(
     };
     let controller_configuration = Configuration {
         cohort_count_max: 64,
+        calendar_segment_count_max: 64,
         partition_count: 64,
         replica_count_max,
         slots_per_replica,
         posterior_sample_count: 1_024,
+        failure_service_weight: DEFAULT_FAILURE_WEIGHT,
+        arrival_prior: prosody_scale_core::ArrivalPrior::new(
+            4.0_f64,
+            0.01_f64,
+            1.0_f64 / 90.0_f64,
+            1_024,
+        )?,
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: transition_prior([30.0_f64, 45.0_f64, 60.0_f64, 90.0_f64])?,
+        rebalance_time_prior: transition_prior([0.05_f64, 0.1_f64, 0.2_f64, 0.4_f64])?,
         objective: ServiceObjective::new(regime.budget_micros(), 0.01)?,
     };
     let capacity_grid = capacity_grid(capacity_regime, sensitivity)?;
@@ -702,11 +747,6 @@ fn principal_graph(
         definition.schedule.controller_sample_count_max()?,
     )?
     .with_diagnostic_seed(definition.inputs.seed);
-    let graph = if capacity_regime {
-        graph.with_controller_actuation_schedule(0, 15_000_000)?
-    } else {
-        graph
-    };
     match regime {
         PrincipalRegime::SnapshotFaults => Ok(graph.with_snapshot_transport(
             512,
@@ -722,6 +762,12 @@ fn principal_graph(
         }
         _ => Ok(graph),
     }
+}
+
+fn transition_prior(
+    median_seconds: [f64; 4],
+) -> Result<TransitionPrior, prosody_scale_core::TransitionPriorError> {
+    TransitionPrior::new(median_seconds, [0.1_f64, 0.2_f64, 0.3_f64], [1.0_f64; 12])
 }
 
 fn capacity_grid(
@@ -812,9 +858,7 @@ fn run_schedule(
                     });
                 }
             }
-            StopCondition::FixedDuration { reason }
-                if at_micros >= schedule.workload_end_micros =>
-            {
+            StopCondition::FixedDuration { reason } if at_micros >= schedule.maximum_micros => {
                 return Ok(RunStop { at_micros, reason });
             }
             StopCondition::FixedDuration { .. } => {}
@@ -845,6 +889,11 @@ pub struct PrincipalRun {
 }
 
 impl PrincipalRun {
+    #[cfg(test)]
+    pub(crate) fn applied_changes(&self) -> &[crate::ScaleChange] {
+        &self.simulation.changes
+    }
+
     /// Returns the regime interval for metric aggregation.
     #[must_use]
     pub const fn metric_window_micros(&self) -> u64 {
@@ -903,6 +952,12 @@ pub enum PrincipalRunError {
     /// The capacity grid is invalid.
     #[error(transparent)]
     CapacityGrid(#[from] prosody_scale_core::CapacityGridError),
+    /// A transition population prior is invalid.
+    #[error(transparent)]
+    TransitionPrior(#[from] prosody_scale_core::TransitionPriorError),
+    /// The arrival population prior is invalid.
+    #[error(transparent)]
+    ArrivalPrior(#[from] prosody_scale_core::ArrivalPriorError),
     /// The closed-loop controller is invalid.
     #[error(transparent)]
     ClosedLoop(#[from] ClosedLoopError),
@@ -1103,6 +1158,7 @@ impl OutputFunction<AttemptFrame, (u64, u64)> for AttemptOutput {
 struct PrincipalGraph {
     events: EventPolicy,
     reporter: ReporterPolicy,
+    calendar: HistoricalSeries,
     inputs: PrincipalInputGraph,
 }
 
@@ -1112,6 +1168,7 @@ impl PrincipalGraph {
         Ok(Self {
             events: definition.events,
             reporter: definition.reporter,
+            calendar: definition.inputs.history,
             inputs: PrincipalInputGraph::new(definition.inputs, history_count_max)?,
         })
     }
@@ -1122,16 +1179,30 @@ impl TickGenerator for PrincipalGraph {
         Ok(self.inputs.evaluate(context.now_micros, context))
     }
 
-    fn event(&self, context: EventContext<'_>) -> EventInputs {
+    fn event(&self, context: EventContext<'_>) -> Result<EventInputs, PlantError> {
         let event_index = context.event_index;
-        EventInputs {
+        let final_outcome = if self.events.permanent_rejections.matches(event_index) {
+            crate::FinalOutcome::PermanentFailure
+        } else {
+            crate::FinalOutcome::Success
+        };
+        Ok(EventInputs {
             partition: self.events.partitions.index(event_index, 64),
             key: self.events.keys.index(event_index, 1_024),
             handler_micros: context.inputs.handler_micros,
             dependency_operations: context.inputs.dependency_operations,
-            transient_failures: self.events.transient_failures.at(event_index),
-            permanent_rejection: self.events.permanent_rejections.matches(event_index),
-        }
+            outcome: crate::EventOutcome::from_transient_failures(
+                self.events.transient_failures.at(event_index),
+                final_outcome,
+            )?,
+        })
+    }
+
+    fn calendar_forecast(
+        &self,
+        _context: TickContext<'_>,
+    ) -> Result<Option<CalendarForecastInput>, PlantError> {
+        self.calendar.forecast()
     }
 
     fn reporter(&self, context: TickContext<'_>) -> ReporterDirective {
@@ -1218,13 +1289,30 @@ impl PrincipalDefinition {
                 .handler(100_000)
                 .schedule(RunSchedule::timer_wave())
                 .initial_replicas(1),
-            PrincipalRegime::HotSerializedKey => standard.keys(IndexSeries::Single),
-            PrincipalRegime::TransientFailures => {
-                standard.transient_failures(FailureSeries::Every {
+            PrincipalRegime::HotSerializedKey => standard
+                .messages(ArrivalSeries::Rate {
+                    per_second: 50,
+                    count_max: HOT_KEY_EVENT_COUNT,
+                })
+                .partitions(IndexSeries::Single)
+                .keys(IndexSeries::Single)
+                .handler(100_000)
+                .schedule(RunSchedule::hot_partition())
+                .event_count_max(HOT_KEY_EVENT_COUNT)
+                .initial_replicas(1),
+            PrincipalRegime::TransientFailures => standard
+                .messages(ArrivalSeries::Rate {
+                    per_second: 300,
+                    count_max: TRANSIENT_EVENT_COUNT,
+                })
+                .handler(100_000)
+                .transient_failures(FailureSeries::Every {
                     interval: 10,
                     transient_count: 2,
                 })
-            }
+                .schedule(RunSchedule::hot_partition())
+                .event_count_max(TRANSIENT_EVENT_COUNT)
+                .initial_replicas(1),
             PrincipalRegime::PermanentRejections => {
                 standard.permanent_rejections(OccurrenceSeries::Every(10))
             }
@@ -1256,32 +1344,40 @@ impl PrincipalDefinition {
                     count_max: HISTORY_EVENT_COUNT_MAX,
                 })
                 .history(HistoricalSeries::standard())
+                .handler(100_000)
                 .schedule(RunSchedule::history())
-                .event_count_max(HISTORY_EVENT_COUNT_MAX),
+                .event_count_max(HISTORY_EVENT_COUNT_MAX)
+                .initial_replicas(1),
             PrincipalRegime::HistoricalExceeded => standard
                 .messages(ArrivalSeries::Rate {
                     per_second: 2_000,
                     count_max: HISTORY_EVENT_COUNT_MAX,
                 })
                 .history(HistoricalSeries::standard())
+                .handler(100_000)
                 .schedule(RunSchedule::history())
-                .event_count_max(HISTORY_EVENT_COUNT_MAX),
+                .event_count_max(HISTORY_EVENT_COUNT_MAX)
+                .initial_replicas(1),
             PrincipalRegime::HistoricalUnder => standard
                 .messages(ArrivalSeries::Rate {
                     per_second: 500,
                     count_max: HISTORY_EVENT_COUNT_MAX,
                 })
                 .history(HistoricalSeries::standard())
+                .handler(100_000)
                 .schedule(RunSchedule::history())
-                .event_count_max(HISTORY_EVENT_COUNT_MAX),
+                .event_count_max(HISTORY_EVENT_COUNT_MAX)
+                .initial_replicas(1),
             PrincipalRegime::HistoricalMissing => standard
                 .messages(ArrivalSeries::Rate {
                     per_second: 1_000,
                     count_max: HISTORY_EVENT_COUNT_MAX,
                 })
                 .history(HistoricalSeries::missing())
+                .handler(100_000)
                 .schedule(RunSchedule::history())
-                .event_count_max(HISTORY_EVENT_COUNT_MAX),
+                .event_count_max(HISTORY_EVENT_COUNT_MAX)
+                .initial_replicas(1),
         }
     }
 
@@ -1357,7 +1453,7 @@ impl PrincipalDefinition {
                 initial_per_second: initial_demand_per_second,
                 increment_per_second: demand_step,
                 step_interval_micros: 90_000_000,
-                count_max: CAPACITY_EVENT_COUNT_MAX,
+                count_max: CAPACITY_RESPONSE_EVENT_COUNT,
             })
             .launch_delay(LaunchDelaySeries::Uniform {
                 minimum_micros: 30_000_000,
@@ -1489,6 +1585,23 @@ impl HistoricalSeries {
             demand: ArrivalSeries::None,
             replicas: 0,
         }
+    }
+
+    fn forecast(self) -> Result<Option<CalendarForecastInput>, PlantError> {
+        let ArrivalSeries::Rate { per_second, .. } = self.demand else {
+            return Ok(None);
+        };
+        let historical_count =
+            u64::from(per_second).saturating_mul(u64::from(CALENDAR_HISTORY_EXPOSURE_SECONDS));
+        let shape = CALENDAR_PRIOR_SHAPE + historical_count as f64;
+        let rate_seconds =
+            CALENDAR_PRIOR_RATE_SECONDS + f64::from(CALENDAR_HISTORY_EXPOSURE_SECONDS);
+        let segment = CalendarRateSegment::new(0, 0, u64::MAX, shape, rate_seconds)?;
+        Ok(Some(CalendarForecastInput::new(
+            CalendarArtifactId(1),
+            CALENDAR_MODEL_PRIOR_PROBABILITY,
+            std::slice::from_ref(&segment),
+        )?))
     }
 }
 
@@ -1897,7 +2010,7 @@ impl RunSchedule {
             workload_end_micros: 600_000_000,
             workload_interval_micros: 1_000_000,
             followup_interval_micros: 1_000_000,
-            maximum_micros: 630_000_000,
+            maximum_micros: 690_000_000,
             stop: StopCondition::FixedDuration {
                 reason: RunStopReason::DurationComplete,
             },
@@ -1964,8 +2077,8 @@ impl RunSchedule {
             start_micros: 0,
             workload_end_micros: 30_000_000,
             workload_interval_micros: 100_000,
-            followup_interval_micros: 100_000,
-            maximum_micros: 30_000_000,
+            followup_interval_micros: 1_000_000,
+            maximum_micros: 120_000_000,
             stop: StopCondition::FixedDuration {
                 reason: RunStopReason::DurationComplete,
             },
@@ -2211,8 +2324,7 @@ impl OutputFunction<TickContext<'_>, (u32, u32, u32, bool, u64, u64, u64)> for P
             dependency_operations: 1,
             dependency_operation_micros: values.5,
             handler_added_micros: 0,
-            transient_failures: 0,
-            permanent_rejection_every: 0,
+            outcome: crate::EventOutcomeRule::Success,
             launch_delay_micros: values.6,
             scale: if values.2 == 0 {
                 ScaleDirective::Hold

@@ -1,8 +1,9 @@
 //! Thin WebAssembly adapter for deterministic laboratory decisions.
 
 use prosody_scale_core::{
-    CapacityGrid, Cohort, Configuration, ModelTime, ObservationBuffer, ScaleDecision, ScaleScratch,
-    ScaleState, ServiceObjective, step,
+    CapacityGrid, Cohort, Configuration, DemandClass, ModelTime, ObservationBuffer,
+    ReliabilityPrior, ScaleDecision, ScaleScratch, ScaleState, ServiceObjective, TransitionPrior,
+    step,
 };
 
 #[cfg(all(target_arch = "wasm32", feature = "threads"))]
@@ -22,10 +23,16 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
     };
     let configuration = Configuration {
         cohort_count_max: 8,
+        calendar_segment_count_max: 8,
         partition_count: 8,
         replica_count_max: 32,
         slots_per_replica: 4,
         posterior_sample_count: 64,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
         objective,
     };
     let Ok(grid) = CapacityGrid::new(
@@ -54,6 +61,7 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
             deadline_micros: 1_000_000,
             offered_events: events,
             partition: 0,
+            demand_class: DemandClass::Normal,
         })
         .is_err()
     {

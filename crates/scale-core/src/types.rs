@@ -20,10 +20,60 @@ impl ModelTime {
     }
 }
 
+/// One desired replica target that has not reached warm membership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActuationCommitment {
+    from_replicas: u32,
+    target_replicas: u32,
+    requested_at: ModelTime,
+}
+
+impl ActuationCommitment {
+    /// Constructs one incomplete replica transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero or equal replica counts.
+    pub fn new(
+        from_replicas: u32,
+        target_replicas: u32,
+        requested_at: ModelTime,
+    ) -> Result<Self, ObservationError> {
+        if from_replicas == 0 || target_replicas == 0 || from_replicas == target_replicas {
+            return Err(ObservationError::ActuationCommitment);
+        }
+        Ok(Self {
+            from_replicas,
+            target_replicas,
+            requested_at,
+        })
+    }
+
+    pub(crate) const fn target_replicas(self) -> u32 {
+        self.target_replicas
+    }
+
+    pub(crate) const fn direction(self) -> TransitionDirection {
+        if self.target_replicas > self.from_replicas {
+            TransitionDirection::Up
+        } else {
+            TransitionDirection::Down
+        }
+    }
+
+    pub(crate) const fn replica_delta(self) -> u32 {
+        self.target_replicas.abs_diff(self.from_replicas)
+    }
+
+    pub(crate) const fn requested_at(self) -> ModelTime {
+        self.requested_at
+    }
+}
+
 /// One discrete posterior view for diagnostics and calibration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PosteriorQuery {
-    /// Peak useful throughput.
+    /// Peak completed-attempt throughput.
     Capacity,
     /// Uncongested operation time.
     ServiceTime,
@@ -33,6 +83,10 @@ pub enum PosteriorQuery {
     Knee,
     /// Whether a finite knee exists in the supported range.
     SaturationState,
+    /// Retry probability after a normal attempt.
+    NormalRetryProbability,
+    /// Retry probability after a failure attempt.
+    FailureRetryProbability,
     /// Expected Kafka partition share.
     PartitionShare,
     /// Actuation duration for one transition class.
@@ -58,6 +112,59 @@ pub struct ArrivalPosterior {
     pub shape: f64,
     /// Gamma rate parameter in seconds.
     pub rate: f64,
+}
+
+/// Stable identity for one frozen calendar artifact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CalendarArtifactId(pub u64);
+
+/// One Gamma rate posterior for a future calendar interval.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CalendarRateSegment {
+    pub(crate) position: u32,
+    pub(crate) start_micros: u64,
+    pub(crate) end_micros: u64,
+    pub(crate) shape: f64,
+    pub(crate) rate_seconds: f64,
+}
+
+impl CalendarRateSegment {
+    /// Constructs one frozen calendar posterior interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid interval or Gamma distribution.
+    pub fn new(
+        position: u32,
+        start_micros: u64,
+        end_micros: u64,
+        shape: f64,
+        rate_seconds: f64,
+    ) -> Result<Self, ObservationError> {
+        if start_micros >= end_micros {
+            return Err(ObservationError::InvalidCalendarInterval);
+        }
+        if !shape.is_finite() || shape <= 0.0_f64 {
+            return Err(ObservationError::InvalidCalendarShape);
+        }
+        if !rate_seconds.is_finite() || rate_seconds <= 0.0_f64 {
+            return Err(ObservationError::InvalidCalendarRate);
+        }
+        Ok(Self {
+            position,
+            start_micros,
+            end_micros,
+            shape,
+            rate_seconds,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CalendarForecast<'a> {
+    pub(crate) artifact: CalendarArtifactId,
+    pub(crate) prior_probability: f64,
+    pub(crate) segments: &'a [CalendarRateSegment],
 }
 
 /// One latency objective supplied by a user.
@@ -104,6 +211,8 @@ impl ServiceObjective {
 pub struct Configuration {
     /// Maximum number of cohorts in one observation.
     pub cohort_count_max: u32,
+    /// Maximum calendar intervals supplied in one observation.
+    pub calendar_segment_count_max: u32,
     /// Configured Kafka partition count.
     pub partition_count: u32,
     /// Maximum allowed replica count.
@@ -112,6 +221,16 @@ pub struct Configuration {
     pub slots_per_replica: u32,
     /// Number of posterior samples per decision.
     pub posterior_sample_count: u32,
+    /// Maximum failure-service fraction while normal work waits.
+    pub failure_service_weight: f64,
+    /// Prior for live arrival-rate segments.
+    pub arrival_prior: crate::ArrivalPrior,
+    /// Population prior for class-specific retry probabilities.
+    pub reliability_prior: crate::ReliabilityPrior,
+    /// Population prior for replica launch time.
+    pub launch_time_prior: crate::TransitionPrior,
+    /// Population prior for KIP-848 pause time.
+    pub rebalance_time_prior: crate::TransitionPrior,
     /// User latency objective.
     pub objective: ServiceObjective,
 }
@@ -127,6 +246,14 @@ impl Configuration {
             return Err(ConfigurationError::ZeroBound {
                 name: "cohort_count_max",
             });
+        }
+        if self.calendar_segment_count_max == 0 {
+            return Err(ConfigurationError::ZeroBound {
+                name: "calendar_segment_count_max",
+            });
+        }
+        if self.calendar_segment_count_max > self.arrival_prior.path_segment_count_max() as u32 {
+            return Err(ConfigurationError::CalendarPathCapacity);
         }
         if self.partition_count == 0 {
             return Err(ConfigurationError::ZeroBound {
@@ -148,7 +275,136 @@ impl Configuration {
                 name: "posterior_sample_count",
             });
         }
+        if !self.failure_service_weight.is_finite()
+            || !(0.0_f64..=1.0_f64).contains(&self.failure_service_weight)
+        {
+            return Err(ConfigurationError::InvalidFailureServiceWeight {
+                weight: self.failure_service_weight,
+            });
+        }
         Ok(())
+    }
+}
+
+/// Final outcome counts for one demand class and observation window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AttemptOutcomeCounts {
+    /// Attempts that completed successfully.
+    pub success: u32,
+    /// Attempts that ended with a permanent failure.
+    pub permanent: u32,
+    /// Attempts that ended with a transient failure.
+    pub transient: u32,
+    /// Attempts that ended with a terminal failure.
+    pub terminal: u32,
+}
+
+impl AttemptOutcomeCounts {
+    /// Constructs one complete outcome table row.
+    #[must_use]
+    pub const fn new(success: u32, permanent: u32, transient: u32, terminal: u32) -> Self {
+        Self {
+            success,
+            permanent,
+            transient,
+            terminal,
+        }
+    }
+}
+
+/// Attempt outcomes for both demand classes in one observation window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptOutcomeEvidence {
+    pub(crate) normal: AttemptOutcomeCounts,
+    pub(crate) failure: AttemptOutcomeCounts,
+}
+
+impl AttemptOutcomeEvidence {
+    /// Constructs one class-separated outcome window.
+    #[must_use]
+    pub const fn new(normal: AttemptOutcomeCounts, failure: AttemptOutcomeCounts) -> Self {
+        Self { normal, failure }
+    }
+}
+
+/// Scheduler demand class for one work cohort.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DemandClass {
+    /// A first attempt from Kafka or the timer store.
+    Normal,
+    /// A later attempt caused by a retry-producing outcome.
+    Failure,
+}
+
+impl DemandClass {
+    /// Number of scheduler demand classes.
+    pub const COUNT: u32 = 2;
+    pub(crate) const COUNT_USIZE: usize = 2;
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Normal => 0,
+            Self::Failure => 1,
+        }
+    }
+}
+
+/// Observable queued work with unknown individual arrival times.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BacklogCohort {
+    observed_at_micros: u64,
+    oldest_arrival_micros: u64,
+    event_count: std::num::NonZeroU32,
+    partition: u32,
+    demand_class: DemandClass,
+}
+
+impl BacklogCohort {
+    /// Constructs one observable backlog cohort.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero work or an arrival after the observation.
+    pub fn new(
+        observed_at_micros: u64,
+        oldest_arrival_micros: u64,
+        event_count: u32,
+        partition: u32,
+        demand_class: DemandClass,
+    ) -> Result<Self, ObservationError> {
+        let Some(event_count) = std::num::NonZeroU32::new(event_count) else {
+            return Err(ObservationError::EmptyBacklog);
+        };
+        if oldest_arrival_micros > observed_at_micros {
+            return Err(ObservationError::FutureBacklogArrival);
+        }
+        Ok(Self {
+            observed_at_micros,
+            oldest_arrival_micros,
+            event_count,
+            partition,
+            demand_class,
+        })
+    }
+
+    pub(crate) const fn observed_at_micros(self) -> u64 {
+        self.observed_at_micros
+    }
+
+    pub(crate) const fn oldest_arrival_micros(self) -> u64 {
+        self.oldest_arrival_micros
+    }
+
+    pub(crate) const fn event_count(self) -> u32 {
+        self.event_count.get()
+    }
+
+    pub(crate) const fn partition(self) -> u32 {
+        self.partition
+    }
+
+    pub(crate) const fn demand_class(self) -> DemandClass {
+        self.demand_class
     }
 }
 
@@ -163,6 +419,8 @@ pub struct Cohort {
     pub offered_events: f64,
     /// Partition that owns this work.
     pub partition: u32,
+    /// Scheduler class that serves this work.
+    pub demand_class: DemandClass,
 }
 
 impl Cohort {
@@ -200,11 +458,15 @@ impl WorkCohort {
 #[derive(Debug)]
 pub struct GroupObservation<'a> {
     pub(crate) cohorts: &'a [Cohort],
+    pub(crate) backlog: &'a [Option<BacklogCohort>],
     pub(crate) arrivals: Option<ArrivalEvidence>,
+    pub(crate) calendar: Option<CalendarForecast<'a>>,
     pub(crate) partition_arrivals: Option<PartitionArrivalEvidence<'a>>,
     pub(crate) resource_window: Option<ResourceWindow>,
+    pub(crate) attempt_outcomes: Option<AttemptOutcomeEvidence>,
     pub(crate) transition: Option<TransitionEvidence>,
     pub(crate) current_replicas: Option<u32>,
+    pub(crate) actuation_commitments: &'a [ActuationCommitment],
 }
 
 /// Reusable owner for one [`GroupObservation`] view.
@@ -213,12 +475,18 @@ pub struct ObservationBuffer {
     partition_count: u32,
     replica_count_max: u32,
     cohorts: Vec<Cohort>,
+    backlog: Vec<Option<BacklogCohort>>,
     arrivals: Option<ArrivalEvidence>,
+    calendar_artifact: Option<CalendarArtifactId>,
+    calendar_prior_probability: f64,
+    calendar_segments: Vec<CalendarRateSegment>,
     partition_arrival_counts: Vec<u32>,
     partition_arrival_token: Option<UpdateToken>,
     resource_window: Option<ResourceWindow>,
+    attempt_outcomes: Option<AttemptOutcomeEvidence>,
     transition: Option<TransitionEvidence>,
     current_replicas: Option<u32>,
+    actuation_commitments: Vec<ActuationCommitment>,
 }
 
 impl ObservationBuffer {
@@ -233,28 +501,47 @@ impl ObservationBuffer {
             .map_err(|_| ConfigurationError::PlatformLimit)?;
         let partition_count = usize::try_from(configuration.partition_count)
             .map_err(|_| ConfigurationError::PlatformLimit)?;
+        let calendar_segment_count = usize::try_from(configuration.calendar_segment_count_max)
+            .map_err(|_| ConfigurationError::PlatformLimit)?;
+        let replica_count_max = usize::try_from(configuration.replica_count_max)
+            .map_err(|_| ConfigurationError::PlatformLimit)?;
+        let backlog_count = partition_count
+            .checked_mul(DemandClass::COUNT_USIZE)
+            .ok_or(ConfigurationError::PlatformLimit)?;
         Ok(Self {
             partition_count: configuration.partition_count,
             replica_count_max: configuration.replica_count_max,
             cohorts: Vec::with_capacity(cohort_count_max),
+            backlog: vec![None; backlog_count],
             arrivals: None,
+            calendar_artifact: None,
+            calendar_prior_probability: 0.0_f64,
+            calendar_segments: Vec::with_capacity(calendar_segment_count),
             partition_arrival_counts: vec![0; partition_count],
             partition_arrival_token: None,
             resource_window: None,
+            attempt_outcomes: None,
             transition: None,
             current_replicas: None,
+            actuation_commitments: Vec::with_capacity(replica_count_max),
         })
     }
 
     /// Clears values without releasing capacity.
     pub fn clear(&mut self) {
         self.cohorts.clear();
+        self.backlog.fill(None);
         self.arrivals = None;
+        self.calendar_artifact = None;
+        self.calendar_prior_probability = 0.0_f64;
+        self.calendar_segments.clear();
         self.partition_arrival_counts.fill(0);
         self.partition_arrival_token = None;
         self.resource_window = None;
+        self.attempt_outcomes = None;
         self.transition = None;
         self.current_replicas = None;
+        self.actuation_commitments.clear();
     }
 
     /// Adds one cohort without growing the buffer.
@@ -271,6 +558,24 @@ impl ObservationBuffer {
             return Err(ObservationError::CohortCapacity);
         }
         self.cohorts.push(cohort);
+        Ok(())
+    }
+
+    /// Sets one partition and class backlog observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown partition or a duplicate observation.
+    pub fn set_backlog(&mut self, backlog: BacklogCohort) -> Result<(), ObservationError> {
+        if backlog.partition() >= self.partition_count {
+            return Err(ObservationError::PartitionIndex);
+        }
+        let index = backlog.partition() as usize * DemandClass::COUNT_USIZE
+            + backlog.demand_class().index();
+        if self.backlog[index].is_some() {
+            return Err(ObservationError::BacklogPending);
+        }
+        self.backlog[index] = Some(backlog);
         Ok(())
     }
 
@@ -291,6 +596,38 @@ impl ObservationBuffer {
             return Err(ObservationError::ArrivalEvidencePending);
         }
         self.arrivals = Some(ArrivalEvidence::new(count, exposure_micros));
+        Ok(())
+    }
+
+    /// Sets one frozen calendar forecast without growing the buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid probability, order, overlap, or capacity.
+    pub fn set_calendar_forecast(
+        &mut self,
+        artifact: CalendarArtifactId,
+        prior_probability: f64,
+        segments: &[CalendarRateSegment],
+    ) -> Result<(), ObservationError> {
+        if self.calendar_artifact.is_some() {
+            return Err(ObservationError::CalendarForecastPending);
+        }
+        if !prior_probability.is_finite() || !(0.0_f64..1.0_f64).contains(&prior_probability) {
+            return Err(ObservationError::InvalidCalendarProbability);
+        }
+        if segments.is_empty() || segments.len() > self.calendar_segments.capacity() {
+            return Err(ObservationError::CalendarCapacity);
+        }
+        if segments
+            .windows(2)
+            .any(|pair| pair[0].end_micros != pair[1].start_micros)
+        {
+            return Err(ObservationError::CalendarContinuity);
+        }
+        self.calendar_segments.extend_from_slice(segments);
+        self.calendar_artifact = Some(artifact);
+        self.calendar_prior_probability = prior_probability;
         Ok(())
     }
 
@@ -336,6 +673,22 @@ impl ObservationBuffer {
         Ok(())
     }
 
+    /// Sets one complete attempt-outcome window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when unconsumed outcome evidence is present.
+    pub fn set_attempt_outcomes(
+        &mut self,
+        evidence: AttemptOutcomeEvidence,
+    ) -> Result<(), ObservationError> {
+        if self.attempt_outcomes.is_some() {
+            return Err(ObservationError::AttemptOutcomePending);
+        }
+        self.attempt_outcomes = Some(evidence);
+        Ok(())
+    }
+
     /// Sets one actuation lead-time update token.
     ///
     /// # Errors
@@ -362,6 +715,25 @@ impl ObservationBuffer {
         Ok(())
     }
 
+    /// Adds one observed incomplete replica transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a replica count is outside the configured range.
+    pub fn push_actuation_commitment(
+        &mut self,
+        commitment: ActuationCommitment,
+    ) -> Result<(), ObservationError> {
+        if commitment.from_replicas > self.replica_count_max
+            || commitment.target_replicas > self.replica_count_max
+            || self.actuation_commitments.len() == self.actuation_commitments.capacity()
+        {
+            return Err(ObservationError::ActuationCommitment);
+        }
+        self.actuation_commitments.push(commitment);
+        Ok(())
+    }
+
     /// Borrows the current values for one controller transition.
     #[must_use]
     pub fn observation(&mut self) -> GroupObservation<'_> {
@@ -374,11 +746,19 @@ impl ObservationBuffer {
                 });
         GroupObservation {
             cohorts: &self.cohorts,
+            backlog: &self.backlog,
             arrivals: self.arrivals.take(),
+            calendar: self.calendar_artifact.map(|artifact| CalendarForecast {
+                artifact,
+                prior_probability: self.calendar_prior_probability,
+                segments: &self.calendar_segments,
+            }),
             partition_arrivals,
             resource_window: self.resource_window.take(),
+            attempt_outcomes: self.attempt_outcomes.take(),
             transition: self.transition.take(),
             current_replicas: self.current_replicas.take(),
+            actuation_commitments: &self.actuation_commitments,
         }
     }
 }
@@ -466,6 +846,15 @@ pub enum ConfigurationError {
         /// Invalid miss fraction.
         epsilon: f64,
     },
+    /// The failure-service weight is not in the closed unit interval.
+    #[error("failure service weight {weight} must be between zero and one")]
+    InvalidFailureServiceWeight {
+        /// Invalid failure-service weight.
+        weight: f64,
+    },
+    /// A reliability-prior shape is not positive and finite.
+    #[error("reliability prior shapes must be positive and finite")]
+    InvalidReliabilityPrior,
     /// A fixed capacity bound is zero.
     #[error("{name} must be positive")]
     ZeroBound {
@@ -475,17 +864,50 @@ pub enum ConfigurationError {
     /// A validated count does not fit this platform.
     #[error("a validated count exceeds this platform's address space")]
     PlatformLimit,
+    /// Calendar input exceeds the bounded arrival-path representation.
+    #[error("calendar segment capacity exceeds arrival path capacity")]
+    CalendarPathCapacity,
 }
 
 /// Invalid observation input.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum ObservationError {
+    /// An incomplete actuation has invalid replica counts or exceeds its bound.
+    #[error("an actuation commitment is invalid or exceeds its fixed bound")]
+    ActuationCommitment,
     /// The buffer contains an unconsumed arrival update token.
     #[error("consume the pending arrival evidence before replacement")]
     ArrivalEvidencePending,
+    /// The buffer contains an unconsumed calendar forecast.
+    #[error("consume the pending calendar forecast before replacement")]
+    CalendarForecastPending,
+    /// A calendar forecast has no segment or exceeds its fixed bound.
+    #[error("the calendar forecast is empty or exceeds its fixed bound")]
+    CalendarCapacity,
+    /// Calendar segments do not form one continuous ordered path.
+    #[error("calendar forecast intervals must be continuous and ordered")]
+    CalendarContinuity,
+    /// A calendar interval is empty or reversed.
+    #[error("a calendar interval start must precede its end")]
+    InvalidCalendarInterval,
+    /// A calendar Gamma shape is not positive and finite.
+    #[error("calendar shape must be positive and finite")]
+    InvalidCalendarShape,
+    /// A calendar Gamma rate is not positive and finite.
+    #[error("calendar rate must be positive and finite")]
+    InvalidCalendarRate,
+    /// Calendar prior probability is outside the open unit interval.
+    #[error("calendar prior probability must be between zero and one")]
+    InvalidCalendarProbability,
     /// The buffer contains an unconsumed resource window.
     #[error("consume the pending resource window before replacement")]
     ResourceWindowPending,
+    /// Attempt outcome evidence was not consumed.
+    #[error("consume the pending attempt outcomes before replacement")]
+    AttemptOutcomePending,
+    /// A partition and class backlog observation was not consumed.
+    #[error("backlog evidence is already pending for this partition and class")]
+    BacklogPending,
     /// An actuation lead-time update was not consumed.
     #[error("transition evidence is already pending")]
     TransitionEvidencePending,
@@ -510,6 +932,12 @@ pub enum ObservationError {
     /// Cohort work is negative or non-finite.
     #[error("cohort work must be finite and nonnegative")]
     InvalidWork,
+    /// A backlog observation contains no work.
+    #[error("backlog work must be positive")]
+    EmptyBacklog,
+    /// The oldest backlog arrival is after the observation time.
+    #[error("the oldest backlog arrival must not follow its observation")]
+    FutureBacklogArrival,
     /// An arrival interval has no exposure.
     #[error("arrival exposure must be positive")]
     ZeroExposure,

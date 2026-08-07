@@ -1,6 +1,7 @@
 use core::convert::Infallible;
 
 use rand::{Rng, SeedableRng, TryRng};
+use rand_distr::{Distribution, StandardNormal};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
 const UNIT_SCALE: f64 = 1.0_f64 / 9_007_199_254_740_992.0_f64;
@@ -67,6 +68,33 @@ impl RandomStream {
     #[must_use]
     pub const fn counter(&self) -> u64 {
         self.counter
+    }
+}
+
+pub(crate) fn sample_gamma(shape: f64, random: &mut RandomStream) -> f64 {
+    let adjusted_shape = shape.max(1.0_f64);
+    let d = adjusted_shape - 1.0_f64 / 3.0_f64;
+    let c = (9.0_f64 * d).sqrt().recip();
+    let sample = loop {
+        let normal: f64 = StandardNormal.sample(&mut *random);
+        let base = 1.0_f64 + c * normal;
+        if base <= 0.0_f64 {
+            continue;
+        }
+        let value = base * base * base;
+        let uniform = random.open_unit_f64();
+        let normal_squared = normal * normal;
+        if uniform < 1.0_f64 - 0.0331_f64 * normal_squared * normal_squared {
+            break d * value;
+        }
+        if uniform.ln() < 0.5_f64 * normal_squared + d * (1.0_f64 - value + value.ln()) {
+            break d * value;
+        }
+    };
+    if shape < 1.0_f64 {
+        sample * random.open_unit_f64().powf(shape.recip())
+    } else {
+        sample
     }
 }
 

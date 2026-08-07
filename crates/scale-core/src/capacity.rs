@@ -18,7 +18,7 @@ pub enum CapacityCurve {
     Knee {
         /// Uncongested operation time in seconds.
         service_time_seconds: f64,
-        /// Peak useful operation rate available to this group.
+        /// Peak completed-attempt rate available to this group.
         capacity_per_second: f64,
         /// Post-knee collapse strength.
         collapse: f64,
@@ -28,14 +28,14 @@ pub enum CapacityCurve {
 /// One weighted throughput value from the joint capacity posterior.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ThroughputPosteriorCell {
-    /// Predicted useful operations per second.
+    /// Predicted completed attempts per second.
     pub throughput_per_second: f64,
     /// Joint posterior probability for this curve.
     pub probability: f64,
 }
 
 impl CapacityCurve {
-    /// Returns useful throughput at one live concurrency.
+    /// Returns completed-attempt throughput at one live concurrency.
     #[must_use]
     pub fn throughput(self, concurrency: f64) -> f64 {
         if concurrency <= 0.0_f64 {
@@ -241,7 +241,7 @@ impl CapacityGrid {
 pub struct ResourceWindow {
     concurrency: f64,
     exposure_seconds: f64,
-    useful_completions: u32,
+    completed_attempts: u32,
 }
 
 impl ResourceWindow {
@@ -254,14 +254,14 @@ impl ResourceWindow {
     pub fn new(
         concurrency: f64,
         exposure_seconds: f64,
-        useful_completions: u32,
+        completed_attempts: u32,
     ) -> Result<Self, ResourceWindowError> {
         validate_positive(concurrency, "concurrency")?;
         validate_positive(exposure_seconds, "exposure_seconds")?;
         Ok(Self {
             concurrency,
             exposure_seconds,
-            useful_completions,
+            completed_attempts,
         })
     }
 }
@@ -682,7 +682,7 @@ impl CapacityFactor {
                     self.grid.no_knee[index] > 0.0_f64,
                     window.concurrency,
                 );
-            *likelihood = poisson_log_kernel(window.useful_completions, mean);
+            *likelihood = poisson_log_kernel(window.completed_attempts, mean);
         }
         self.apply_likelihood(simd_level);
     }
@@ -945,6 +945,9 @@ pub enum PosteriorError {
     /// A lead-time query contains no replica change.
     #[error("a lead-time posterior query must change replicas")]
     ZeroReplicaDelta,
+    /// Reliability posterior parameters are invalid.
+    #[error("reliability posterior parameters must be positive and finite")]
+    ReliabilityDistribution,
 }
 
 fn multiply_weights<S: Simd>(simd: S, weights: &mut [f64], likelihoods: &[f64]) {

@@ -3,8 +3,10 @@
 //! The plant uses fixed-capacity arrays and intrusive per-key queues. It does
 //! not call controller equations.
 
-use prosody_scale_core::RandomStream;
+use prosody_scale_core::{DemandClass, RandomStream};
 use rayon::prelude::*;
+use std::collections::VecDeque;
+use std::num::NonZeroU8;
 use thiserror::Error;
 
 const PLOT_FONT_FAMILY: &str = "Charter";
@@ -54,8 +56,9 @@ pub use controller::{
     LeadTimeEvidenceSample,
 };
 pub use harness::{
-    EventContext, EventInputs, ReporterDirective, ScaleDirective, SimulationHarness, TickContext,
-    TickGenerator, TickHistory, TickHistoryView, TickInputs,
+    CalendarForecastInput, EventContext, EventInputs, EventOutcomeRule, FailureBacklog,
+    FailureBacklogView, NormalBacklog, NormalBacklogView, ReporterDirective, ScaleDirective,
+    SimulationHarness, TickContext, TickGenerator, TickHistory, TickHistoryView, TickInputs,
 };
 pub use input::{ConcurrencyLatencyCurve, InputError, QuantileTable, StepSeries, WorkloadSeries};
 pub use metrics::{MetricPoint, MetricTrace};
@@ -88,6 +91,14 @@ pub use snapshot::{
 pub use story_plot::{RegimeStory, write_regime_story_figures};
 
 const NO_EVENT: u32 = u32::MAX;
+const DEFAULT_FAILURE_WEIGHT: f64 = 0.3_f64;
+const DEFAULT_DEFER_THRESHOLD: f64 = 0.9_f64;
+const DEFAULT_FAILURE_WINDOW_MICROS: u64 = 300_000_000;
+const DEFAULT_RETRY_BASE_MICROS: u64 = 20_000;
+const DEFAULT_RETRY_MAX_MICROS: u64 = 300_000_000;
+const DEFAULT_DEFER_BASE_MICROS: u64 = 1_000_000;
+const DEFAULT_DEFER_MAX_MICROS: u64 = 86_400_000_000;
+const MAX_RETRY_FAILURES: u8 = 2;
 
 /// KIP-848 timing inputs for one moved partition.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,6 +149,33 @@ struct ReconciliationTiming {
     warmup_micros: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RetryPolicy {
+    failure_weight: f64,
+    defer_threshold: f64,
+    failure_window_micros: u64,
+    inline_base_micros: u64,
+    inline_max_micros: u64,
+    deferred_base_micros: u64,
+    deferred_max_micros: u64,
+    seed: u64,
+}
+
+impl RetryPolicy {
+    const fn prosody_default() -> Self {
+        Self {
+            failure_weight: DEFAULT_FAILURE_WEIGHT,
+            defer_threshold: DEFAULT_DEFER_THRESHOLD,
+            failure_window_micros: DEFAULT_FAILURE_WINDOW_MICROS,
+            inline_base_micros: DEFAULT_RETRY_BASE_MICROS,
+            inline_max_micros: DEFAULT_RETRY_MAX_MICROS,
+            deferred_base_micros: DEFAULT_DEFER_BASE_MICROS,
+            deferred_max_micros: DEFAULT_DEFER_MAX_MICROS,
+            seed: 0,
+        }
+    }
+}
+
 /// Fixed plant bounds and service constants.
 #[derive(Clone, Debug)]
 pub struct PlantConfiguration {
@@ -149,7 +187,7 @@ pub struct PlantConfiguration {
     dependency_slots: u32,
     dependency_operation_micros: StepSeries<u64>,
     dependency_latency_curve: ConcurrencyLatencyCurve,
-    retry_backoff_micros: u64,
+    retry_policy: RetryPolicy,
     rebalance: Kip848Rebalance,
     handler_latency_curve: ConcurrencyLatencyCurve,
 }
@@ -183,7 +221,7 @@ impl PlantConfiguration {
             dependency_slots,
             dependency_operation_micros: StepSeries::constant(1_000),
             dependency_latency_curve: ConcurrencyLatencyCurve::zero(),
-            retry_backoff_micros: 10_000,
+            retry_policy: RetryPolicy::prosody_default(),
             rebalance: Kip848Rebalance::new(
                 QuantileTable::constant(0),
                 QuantileTable::constant(100_000),
@@ -219,7 +257,8 @@ impl PlantConfiguration {
     /// Sets retry backoff.
     #[must_use]
     pub const fn with_retry_backoff_micros(mut self, micros: u64) -> Self {
-        self.retry_backoff_micros = micros;
+        self.retry_policy.inline_base_micros = micros;
+        self.retry_policy.inline_max_micros = micros;
         self
     }
 
@@ -251,6 +290,111 @@ impl PlantConfiguration {
     }
 }
 
+/// One final attempt outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalOutcome {
+    /// The handler completed successfully.
+    Success,
+    /// The handler rejected the event permanently.
+    PermanentFailure,
+}
+
+/// One outcome that creates later Failure demand.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetryOutcome {
+    /// The attempt failed transiently.
+    Transient,
+    /// The attempt terminated the current client.
+    Terminal,
+}
+
+/// A positive retry count within the simulator bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryCount(NonZeroU8);
+
+impl RetryCount {
+    /// Constructs one bounded retry count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the count is zero or exceeds the simulator bound.
+    pub fn new(count: u8) -> Result<Self, RetryCountError> {
+        let Some(count) = NonZeroU8::new(count) else {
+            return Err(RetryCountError::Zero);
+        };
+        if count.get() > MAX_RETRY_FAILURES {
+            return Err(RetryCountError::Bound {
+                maximum: MAX_RETRY_FAILURES,
+            });
+        }
+        Ok(Self(count))
+    }
+
+    const fn get(self) -> u8 {
+        self.0.get()
+    }
+
+    fn after_one(self) -> Option<Self> {
+        NonZeroU8::new(self.get() - 1).map(Self)
+    }
+}
+
+/// Complete outcome plan for one logical event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventOutcome {
+    /// The first attempt ends the event.
+    Final(FinalOutcome),
+    /// One or more outcomes create Failure demand before the final attempt.
+    Retry {
+        /// Outcome for each retry-producing attempt.
+        outcome: RetryOutcome,
+        /// Number of retry-producing attempts.
+        count: RetryCount,
+        /// Outcome that ends the event.
+        final_outcome: FinalOutcome,
+    },
+}
+
+/// Durable source that released one event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventSource {
+    /// Kafka released a message.
+    Message,
+    /// The timer store released a timer.
+    Timer,
+}
+
+impl EventOutcome {
+    /// Constructs a transient retry sequence or one final outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retry count exceeds the simulator bound.
+    pub fn from_transient_failures(
+        count: u8,
+        final_outcome: FinalOutcome,
+    ) -> Result<Self, RetryCountError> {
+        if count == 0 {
+            return Ok(Self::Final(final_outcome));
+        }
+        Ok(Self::Retry {
+            outcome: RetryOutcome::Transient,
+            count: RetryCount::new(count)?,
+            final_outcome,
+        })
+    }
+
+    const fn final_outcome(self) -> FinalOutcome {
+        match self {
+            Self::Final(outcome)
+            | Self::Retry {
+                final_outcome: outcome,
+                ..
+            } => outcome,
+        }
+    }
+}
+
 /// One event offered to the plant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventSpec {
@@ -264,12 +408,10 @@ pub struct EventSpec {
     pub handler_micros: u64,
     /// Dependency operations for each attempt.
     pub dependency_operations: u32,
-    /// Transient failures before the final outcome.
-    pub transient_failures: u8,
-    /// Whether the final outcome is a permanent rejection.
-    pub permanent_rejection: bool,
-    /// Whether a timer released this event.
-    pub timer: bool,
+    /// Complete sequence of attempt outcomes.
+    pub outcome: EventOutcome,
+    /// Durable source that released this event.
+    pub source: EventSource,
 }
 
 /// One requested replica change.
@@ -318,6 +460,28 @@ pub struct PlantSnapshot {
     pub handler_occupancy_micros: u64,
     /// Cumulative successful final completions.
     pub useful_completions: u32,
+    /// Cumulative completed handler attempts for all outcomes.
+    pub completed_attempts: u32,
+    /// Cumulative completed normal attempts.
+    pub normal_attempts: u32,
+    /// Cumulative successes from normal attempts.
+    pub normal_successes: u32,
+    /// Cumulative transient failures from normal attempts.
+    pub normal_transient_failures: u32,
+    /// Cumulative terminal failures from normal attempts.
+    pub normal_terminal_failures: u32,
+    /// Cumulative permanent failures from normal attempts.
+    pub normal_permanent_failures: u32,
+    /// Cumulative completed failure attempts.
+    pub failure_attempts: u32,
+    /// Cumulative successes from failure attempts.
+    pub failure_successes: u32,
+    /// Cumulative transient failures from failure attempts.
+    pub failure_transient_failures: u32,
+    /// Cumulative terminal failures from failure attempts.
+    pub failure_terminal_failures: u32,
+    /// Cumulative permanent failures from failure attempts.
+    pub failure_permanent_failures: u32,
     /// Whether all assigned partitions are ready at this time.
     pub partitions_ready: bool,
     /// Count of partitions in an incomplete assignment change.
@@ -351,8 +515,8 @@ pub struct Settlement {
     pub in_flight_at_dispatch: u32,
     /// Queued events when the first attempt started.
     pub queue_at_dispatch: u32,
-    /// Whether the outcome was a permanent rejection.
-    pub permanent_rejection: bool,
+    /// Outcome that ended the event.
+    pub final_outcome: FinalOutcome,
 }
 
 impl Settlement {
@@ -365,6 +529,39 @@ impl Settlement {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttemptState {
+    Pending,
+    Ready(DemandClass),
+    Running(DemandClass),
+    Backoff(RetryWait),
+    Settled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryWait {
+    Inline,
+    Deferred,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryMode {
+    Inline,
+    Deferred,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AttemptOutcome {
+    at_micros: u64,
+    result: AttemptResult,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttemptResult {
+    Success,
+    Failure,
+}
+
 /// Bounded virtual-time plant.
 pub struct Plant<M = SeriesAttemptModel> {
     configuration: PlantConfiguration,
@@ -374,10 +571,15 @@ pub struct Plant<M = SeriesAttemptModel> {
     changes: Vec<ScaleChange>,
     change_active: Vec<bool>,
     applied_changes: Vec<ScaleChange>,
-    pending_target_change: Option<u32>,
+    desired_replicas: u32,
     heap: Vec<Scheduled>,
     next_by_event: Vec<u32>,
     attempts_by_event: Vec<u32>,
+    attempt_state: Vec<AttemptState>,
+    attempt_started_micros: Vec<u64>,
+    retry_ready_micros: Vec<u64>,
+    deferred_retry_count: Vec<u32>,
+    retry_mode_by_event: Vec<RetryMode>,
     settled_by_event: Vec<bool>,
     first_dispatch_micros: Vec<u64>,
     dependency_micros: Vec<u64>,
@@ -401,7 +603,21 @@ pub struct Plant<M = SeriesAttemptModel> {
     active_handlers: u32,
     handler_occupancy_micros: u64,
     active_dependency_operations: u32,
+    normal_service_micros: u64,
+    failure_service_micros: u64,
+    attempt_outcomes: VecDeque<AttemptOutcome>,
     useful_completions: u32,
+    completed_attempts: u32,
+    normal_attempts: u32,
+    normal_successes: u32,
+    normal_transient_failures: u32,
+    normal_terminal_failures: u32,
+    normal_permanent_failures: u32,
+    failure_attempts: u32,
+    failure_successes: u32,
+    failure_transient_failures: u32,
+    failure_terminal_failures: u32,
+    failure_permanent_failures: u32,
     queued_events: u32,
     initial_replicas: u32,
     now_micros: u64,
@@ -449,7 +665,7 @@ impl<M: AttemptModel> Plant<M> {
             .and_then(|count| count.checked_mul(2))
             .ok_or(PlantError::PlatformLimit)?;
         let heap_capacity = event_count_max
-            .checked_mul(2)
+            .checked_mul(4)
             .and_then(|capacity| capacity.checked_add(change_count_max))
             .and_then(|capacity| capacity.checked_add(reconciliation_capacity))
             .ok_or(PlantError::PlatformLimit)?;
@@ -461,10 +677,15 @@ impl<M: AttemptModel> Plant<M> {
             changes: Vec::with_capacity(change_count_max),
             change_active: Vec::with_capacity(change_count_max),
             applied_changes: Vec::with_capacity(change_count_max),
-            pending_target_change: None,
+            desired_replicas: initial_replicas,
             heap: Vec::with_capacity(heap_capacity),
             next_by_event: vec![NO_EVENT; event_count_max],
             attempts_by_event: vec![0; event_count_max],
+            attempt_state: vec![AttemptState::Pending; event_count_max],
+            attempt_started_micros: vec![0; event_count_max],
+            retry_ready_micros: vec![0; event_count_max],
+            deferred_retry_count: vec![0; event_count_max],
+            retry_mode_by_event: vec![RetryMode::Inline; event_count_max],
             settled_by_event: vec![false; event_count_max],
             first_dispatch_micros: vec![u64::MAX; event_count_max],
             dependency_micros: vec![0; event_count_max],
@@ -488,7 +709,23 @@ impl<M: AttemptModel> Plant<M> {
             active_handlers: 0,
             handler_occupancy_micros: 0,
             active_dependency_operations: 0,
+            normal_service_micros: 0,
+            failure_service_micros: 0,
+            attempt_outcomes: VecDeque::with_capacity(
+                event_count_max.saturating_mul(usize::from(MAX_RETRY_FAILURES) + 1),
+            ),
             useful_completions: 0,
+            completed_attempts: 0,
+            normal_attempts: 0,
+            normal_successes: 0,
+            normal_transient_failures: 0,
+            normal_terminal_failures: 0,
+            normal_permanent_failures: 0,
+            failure_attempts: 0,
+            failure_successes: 0,
+            failure_transient_failures: 0,
+            failure_terminal_failures: 0,
+            failure_permanent_failures: 0,
             queued_events: 0,
             initial_replicas,
             now_micros: 0,
@@ -557,21 +794,53 @@ impl<M: AttemptModel> Plant<M> {
         Ok(())
     }
 
-    /// Replaces the pending desired target with one new target.
+    /// Reconciles pending replica capacity with one new desired target.
     ///
-    /// The latest desired target is the only target that the actuator applies.
+    /// A new target preserves each pending replica subset that it still needs.
     ///
     /// # Errors
     ///
     /// Returns an error for zero replicas or a full change buffer.
     pub(crate) fn replace_scale_target(&mut self, change: ScaleChange) -> Result<(), PlantError> {
-        if let Some(index) = self.pending_target_change.take() {
-            self.change_active[index as usize] = false;
+        validate_positive(change.replicas, "replicas")?;
+        if self.desired_replicas == change.replicas {
+            return Ok(());
         }
-        let index = u32::try_from(self.changes.len()).map_err(|_| PlantError::PlatformLimit)?;
-        self.add_scale_change(change)?;
-        self.pending_target_change = Some(index);
-        Ok(())
+        self.desired_replicas = change.replicas;
+
+        if change.replicas <= self.replicas {
+            for active in &mut self.change_active {
+                *active = false;
+            }
+            if change.replicas == self.replicas {
+                return Ok(());
+            }
+            return self.add_scale_change(change);
+        }
+
+        let mut preserved_target = self.replicas;
+        let mut preserved_exact = false;
+        for (index, active) in self.change_active.iter_mut().enumerate() {
+            if !*active {
+                continue;
+            }
+            let pending = &mut self.changes[index];
+            if pending.replicas > change.replicas {
+                pending.replicas = change.replicas;
+            }
+            if pending.replicas == change.replicas {
+                if preserved_exact {
+                    *active = false;
+                    continue;
+                }
+                preserved_exact = true;
+            }
+            preserved_target = preserved_target.max(pending.replicas);
+        }
+        if preserved_target == change.replicas {
+            return Ok(());
+        }
+        self.add_scale_change(change)
     }
 
     /// Samples actuator delay and schedules one desired replica change.
@@ -619,6 +888,16 @@ impl<M: AttemptModel> Plant<M> {
                 ScheduledKind::AttemptDone(event) => {
                     self.finish_attempt(event, scheduled.at_micros);
                 }
+                ScheduledKind::RetryReady(event) => {
+                    if let AttemptState::Backoff(wait) = self.attempt_state[event as usize] {
+                        if wait == RetryWait::Inline {
+                            let key = self.events[event as usize].key as usize;
+                            self.key_active[key] = true;
+                        }
+                        self.attempt_state[event as usize] =
+                            AttemptState::Ready(DemandClass::Failure);
+                    }
+                }
                 ScheduledKind::DependencyDone => {
                     self.active_dependency_operations =
                         self.active_dependency_operations.saturating_sub(1);
@@ -654,12 +933,14 @@ impl<M: AttemptModel> Plant<M> {
         }
     }
 
-    /// Writes released unsettled event counts by Kafka partition.
+    /// Writes observable Normal backlog counts by partition.
+    ///
+    /// A deferred event leaves this backlog after its retry timer persists.
     ///
     /// # Errors
     ///
     /// Returns an error when the output does not match the partition count.
-    pub fn write_partition_backlog(
+    pub fn write_partition_normal_backlog(
         &self,
         at_micros: u64,
         output: &mut [u32],
@@ -669,7 +950,10 @@ impl<M: AttemptModel> Plant<M> {
         }
         output.fill(0);
         for (event_index, event) in self.events.iter().enumerate() {
-            if event.release_micros <= at_micros && !self.settled_by_event[event_index] {
+            if event.release_micros <= at_micros
+                && !self.settled_by_event[event_index]
+                && self.retry_mode_by_event[event_index] == RetryMode::Inline
+            {
                 let partition = event.partition as usize;
                 output[partition] = output[partition].saturating_add(1);
             }
@@ -677,14 +961,14 @@ impl<M: AttemptModel> Plant<M> {
         Ok(())
     }
 
-    /// Writes the oldest released unsettled event time by Kafka partition.
+    /// Writes the oldest observable Normal release by partition.
     ///
     /// A zero value means that the partition has no released backlog.
     ///
     /// # Errors
     ///
     /// Returns an error when the output does not match the partition count.
-    pub fn write_partition_oldest_release(
+    pub fn write_partition_normal_oldest_release(
         &self,
         at_micros: u64,
         output: &mut [u64],
@@ -694,7 +978,10 @@ impl<M: AttemptModel> Plant<M> {
         }
         output.fill(u64::MAX);
         for (event_index, event) in self.events.iter().enumerate() {
-            if event.release_micros <= at_micros && !self.settled_by_event[event_index] {
+            if event.release_micros <= at_micros
+                && !self.settled_by_event[event_index]
+                && self.retry_mode_by_event[event_index] == RetryMode::Inline
+            {
                 let oldest = &mut output[event.partition as usize];
                 *oldest = (*oldest).min(event.release_micros);
             }
@@ -702,6 +989,63 @@ impl<M: AttemptModel> Plant<M> {
         for oldest in output {
             if *oldest == u64::MAX {
                 *oldest = 0;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes known deferred Failure backlog counts by partition.
+    ///
+    /// Running attempts do not enter this backlog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the output does not match the partition count.
+    pub fn write_partition_failure_backlog(&self, output: &mut [u32]) -> Result<(), PlantError> {
+        if output.len() != self.partition_reconciliation.len() {
+            return Err(PlantError::PartitionCount);
+        }
+        output.fill(0);
+        for (event_index, event) in self.events.iter().enumerate() {
+            let queued = matches!(
+                self.attempt_state[event_index],
+                AttemptState::Backoff(RetryWait::Deferred)
+                    | AttemptState::Ready(DemandClass::Failure)
+            );
+            if self.retry_mode_by_event[event_index] == RetryMode::Deferred && queued {
+                let partition = event.partition as usize;
+                output[partition] = output[partition].saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the earliest known deferred Failure release by partition.
+    ///
+    /// A zero value means that the partition has no known Failure backlog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the output does not match the partition count.
+    pub fn write_partition_failure_release(&self, output: &mut [u64]) -> Result<(), PlantError> {
+        if output.len() != self.partition_reconciliation.len() {
+            return Err(PlantError::PartitionCount);
+        }
+        output.fill(u64::MAX);
+        for (event_index, event) in self.events.iter().enumerate() {
+            let queued = matches!(
+                self.attempt_state[event_index],
+                AttemptState::Backoff(RetryWait::Deferred)
+                    | AttemptState::Ready(DemandClass::Failure)
+            );
+            if self.retry_mode_by_event[event_index] == RetryMode::Deferred && queued {
+                let release = &mut output[event.partition as usize];
+                *release = (*release).min(self.retry_ready_micros[event_index]);
+            }
+        }
+        for release in output {
+            if *release == u64::MAX {
+                *release = 0;
             }
         }
         Ok(())
@@ -742,17 +1086,31 @@ impl<M: AttemptModel> Plant<M> {
             self.next_by_event[tail as usize] = event;
         }
         self.key_tail[key] = event;
+        self.attempt_state[event as usize] = AttemptState::Ready(DemandClass::Normal);
         self.queued_events += 1;
     }
 
     fn dispatch(&mut self, now_micros: u64) {
+        while let Some((event, class)) = self.next_dispatch_candidate() {
+            self.start_attempt(event, class, now_micros);
+        }
+    }
+
+    fn next_dispatch_candidate(&self) -> Option<(u32, DemandClass)> {
+        let mut normal = None;
+        let mut failure = None;
         for key in 0..self.key_head.len() {
             let event = self.key_head[key];
-            if event == NO_EVENT || self.key_active[key] {
+            if event == NO_EVENT {
                 continue;
             }
-            let spec = self.events[event as usize];
-            let partition = spec.partition as usize;
+            let AttemptState::Ready(class) = self.attempt_state[event as usize] else {
+                continue;
+            };
+            if class == DemandClass::Normal && self.key_active[key] {
+                continue;
+            }
+            let partition = self.events[event as usize].partition as usize;
             if matches!(
                 self.partition_reconciliation[partition],
                 PartitionReconciliation::Paused { .. }
@@ -763,27 +1121,64 @@ impl<M: AttemptModel> Plant<M> {
             if self.active_handlers_by_owner[owner] >= self.configuration.slots_per_replica {
                 continue;
             }
-            self.key_active[key] = true;
-            self.active_handlers += 1;
-            self.active_handlers_by_owner[owner] += 1;
-            self.partition_active_handlers[partition] += 1;
-            self.owner_at_dispatch[event as usize] = owner as u32;
-            if self.first_dispatch_micros[event as usize] == u64::MAX {
-                self.first_dispatch_micros[event as usize] = now_micros;
-                self.in_flight_at_dispatch[event as usize] = self.active_handlers;
-                self.queue_at_dispatch[event as usize] = self.queued_events;
+            match class {
+                DemandClass::Normal if normal.is_none() => normal = Some(event),
+                DemandClass::Failure if failure.is_none() => failure = Some(event),
+                _ => {}
             }
-            self.attempts_by_event[event as usize] = 1;
-            let finish = self.attempt_finish(event, now_micros);
-            heap_push(
-                &mut self.heap,
-                Scheduled {
-                    at_micros: finish,
-                    ordinal: event,
-                    kind: ScheduledKind::AttemptDone(event),
-                },
-            );
         }
+        match (normal, failure) {
+            (Some(normal), Some(_)) if self.prefer_normal() => Some((normal, DemandClass::Normal)),
+            (Some(_), Some(failure)) => Some((failure, DemandClass::Failure)),
+            (Some(normal), None) => Some((normal, DemandClass::Normal)),
+            (None, Some(failure)) => Some((failure, DemandClass::Failure)),
+            (None, None) => None,
+        }
+    }
+
+    fn prefer_normal(&self) -> bool {
+        let failure_weight = self.configuration.retry_policy.failure_weight;
+        let normal_weight = 1.0_f64 - failure_weight;
+        if failure_weight == 0.0_f64 {
+            return true;
+        }
+        if normal_weight == 0.0_f64 {
+            return false;
+        }
+        self.normal_service_micros as f64 / normal_weight
+            <= self.failure_service_micros as f64 / failure_weight
+    }
+
+    fn start_attempt(&mut self, event: u32, class: DemandClass, now_micros: u64) {
+        let event_index = event as usize;
+        let spec = self.events[event_index];
+        let key = spec.key as usize;
+        let partition = spec.partition as usize;
+        let owner = self.partition_owner[partition] as usize;
+        self.key_active[key] = true;
+        self.active_handlers += 1;
+        self.active_handlers_by_owner[owner] += 1;
+        self.partition_active_handlers[partition] += 1;
+        self.owner_at_dispatch[event_index] = owner as u32;
+        if self.first_dispatch_micros[event_index] == u64::MAX {
+            self.first_dispatch_micros[event_index] = now_micros;
+            self.in_flight_at_dispatch[event_index] = self.active_handlers;
+            self.queue_at_dispatch[event_index] = self.queued_events;
+        }
+        if self.attempts_by_event[event_index] == 0 {
+            self.attempts_by_event[event_index] = 1;
+        }
+        self.attempt_state[event_index] = AttemptState::Running(class);
+        self.attempt_started_micros[event_index] = now_micros;
+        let finish = self.attempt_finish(event, now_micros);
+        heap_push(
+            &mut self.heap,
+            Scheduled {
+                at_micros: finish,
+                ordinal: event,
+                kind: ScheduledKind::AttemptDone(event),
+            },
+        );
     }
 
     fn attempt_finish(&mut self, event: u32, now_micros: u64) -> u64 {
@@ -828,21 +1223,122 @@ impl<M: AttemptModel> Plant<M> {
     fn finish_attempt(&mut self, event: u32, now_micros: u64) {
         let event_index = event as usize;
         let spec = self.events[event_index];
-        if spec.transient_failures > 0 {
-            self.events[event_index].transient_failures -= 1;
+        let AttemptState::Running(class) = self.attempt_state[event_index] else {
+            return;
+        };
+        self.finish_running_attempt(event, class, now_micros);
+        self.completed_attempts = self.completed_attempts.saturating_add(1);
+        let retry = match spec.outcome {
+            EventOutcome::Final(_) => None,
+            EventOutcome::Retry {
+                outcome,
+                count,
+                final_outcome,
+            } => Some((outcome, count, final_outcome)),
+        };
+        match class {
+            DemandClass::Normal => {
+                self.normal_attempts = self.normal_attempts.saturating_add(1);
+            }
+            DemandClass::Failure => {
+                self.failure_attempts = self.failure_attempts.saturating_add(1);
+            }
+        }
+        if let Some((outcome, count, final_outcome)) = retry {
+            match (class, outcome) {
+                (DemandClass::Normal, RetryOutcome::Transient) => {
+                    self.normal_transient_failures =
+                        self.normal_transient_failures.saturating_add(1);
+                }
+                (DemandClass::Normal, RetryOutcome::Terminal) => {
+                    self.normal_terminal_failures = self.normal_terminal_failures.saturating_add(1);
+                }
+                (DemandClass::Failure, RetryOutcome::Transient) => {
+                    self.failure_transient_failures =
+                        self.failure_transient_failures.saturating_add(1);
+                }
+                (DemandClass::Failure, RetryOutcome::Terminal) => {
+                    self.failure_terminal_failures =
+                        self.failure_terminal_failures.saturating_add(1);
+                }
+            }
+            let defer = self.retry_mode_by_event[event_index] == RetryMode::Deferred
+                || self.should_defer(now_micros);
+            self.record_attempt_outcome(now_micros, AttemptResult::Failure);
+            self.events[event_index].outcome =
+                count
+                    .after_one()
+                    .map_or(EventOutcome::Final(final_outcome), |count| {
+                        EventOutcome::Retry {
+                            outcome,
+                            count,
+                            final_outcome,
+                        }
+                    });
             self.attempts_by_event[event_index] += 1;
-            let next_start = now_micros.saturating_add(self.configuration.retry_backoff_micros);
-            let finish = self.attempt_finish(event, next_start);
+            let delay = if defer {
+                let retry_count = if self.retry_mode_by_event[event_index] == RetryMode::Deferred {
+                    self.deferred_retry_count[event_index].saturating_add(1)
+                } else {
+                    0
+                };
+                self.retry_mode_by_event[event_index] = RetryMode::Deferred;
+                self.deferred_retry_count[event_index] = retry_count;
+                self.key_active[spec.key as usize] = false;
+                self.deferred_retry_delay(event, retry_count)
+            } else {
+                self.inline_retry_delay(
+                    event,
+                    self.attempts_by_event[event_index].saturating_sub(1),
+                )
+            };
+            let wait = if defer {
+                RetryWait::Deferred
+            } else {
+                RetryWait::Inline
+            };
+            self.attempt_state[event_index] = AttemptState::Backoff(wait);
+            self.retry_ready_micros[event_index] = now_micros.saturating_add(delay);
             heap_push(
                 &mut self.heap,
                 Scheduled {
-                    at_micros: finish,
+                    at_micros: self.retry_ready_micros[event_index],
                     ordinal: event,
-                    kind: ScheduledKind::AttemptDone(event),
+                    kind: ScheduledKind::RetryReady(event),
                 },
             );
             return;
         }
+        let final_outcome = spec.outcome.final_outcome();
+        self.record_attempt_outcome(
+            now_micros,
+            match final_outcome {
+                FinalOutcome::Success => AttemptResult::Success,
+                FinalOutcome::PermanentFailure => AttemptResult::Failure,
+            },
+        );
+        if matches!(final_outcome, FinalOutcome::PermanentFailure) {
+            match class {
+                DemandClass::Normal => {
+                    self.normal_permanent_failures =
+                        self.normal_permanent_failures.saturating_add(1);
+                }
+                DemandClass::Failure => {
+                    self.failure_permanent_failures =
+                        self.failure_permanent_failures.saturating_add(1);
+                }
+            }
+        } else {
+            match class {
+                DemandClass::Normal => {
+                    self.normal_successes = self.normal_successes.saturating_add(1);
+                }
+                DemandClass::Failure => {
+                    self.failure_successes = self.failure_successes.saturating_add(1);
+                }
+            }
+        }
+        self.attempt_state[event_index] = AttemptState::Settled;
         let key = spec.key as usize;
         self.settlements.push(Settlement {
             event,
@@ -855,20 +1351,89 @@ impl<M: AttemptModel> Plant<M> {
             handler_micros: self.handler_micros[event_index],
             in_flight_at_dispatch: self.in_flight_at_dispatch[event_index],
             queue_at_dispatch: self.queue_at_dispatch[event_index],
-            permanent_rejection: spec.permanent_rejection,
+            final_outcome,
         });
         self.useful_completions = self
             .useful_completions
-            .saturating_add(u32::from(!spec.permanent_rejection));
+            .saturating_add(u32::from(matches!(final_outcome, FinalOutcome::Success)));
         self.settled_by_event[event_index] = true;
-        self.active_handlers -= 1;
-        let partition = spec.partition as usize;
-        let owner = self.owner_at_dispatch[event_index] as usize;
-        self.active_handlers_by_owner[owner] -= 1;
-        self.partition_active_handlers[partition] -= 1;
         self.key_active[key] = false;
         self.remove_head(key);
+    }
+
+    fn finish_running_attempt(&mut self, event: u32, class: DemandClass, now_micros: u64) {
+        let event_index = event as usize;
+        let elapsed = now_micros.saturating_sub(self.attempt_started_micros[event_index]);
+        match class {
+            DemandClass::Normal => {
+                self.normal_service_micros = self.normal_service_micros.saturating_add(elapsed);
+            }
+            DemandClass::Failure => {
+                self.failure_service_micros = self.failure_service_micros.saturating_add(elapsed);
+            }
+        }
+        self.active_handlers = self.active_handlers.saturating_sub(1);
+        let spec = self.events[event_index];
+        let partition = spec.partition as usize;
+        let owner = self.owner_at_dispatch[event_index] as usize;
+        self.active_handlers_by_owner[owner] =
+            self.active_handlers_by_owner[owner].saturating_sub(1);
+        self.partition_active_handlers[partition] =
+            self.partition_active_handlers[partition].saturating_sub(1);
         self.complete_reconciliation_if_ready(partition, now_micros);
+    }
+
+    fn should_defer(&mut self, now_micros: u64) -> bool {
+        let cutoff =
+            now_micros.saturating_sub(self.configuration.retry_policy.failure_window_micros);
+        while self
+            .attempt_outcomes
+            .front()
+            .is_some_and(|outcome| outcome.at_micros < cutoff)
+        {
+            self.attempt_outcomes.pop_front();
+        }
+        let failures = self
+            .attempt_outcomes
+            .iter()
+            .filter(|outcome| outcome.result == AttemptResult::Failure)
+            .count();
+        let rate = if self.attempt_outcomes.is_empty() {
+            0.0_f64
+        } else {
+            failures as f64 / self.attempt_outcomes.len() as f64
+        };
+        rate < self.configuration.retry_policy.defer_threshold
+    }
+
+    fn record_attempt_outcome(&mut self, at_micros: u64, result: AttemptResult) {
+        self.attempt_outcomes
+            .push_back(AttemptOutcome { at_micros, result });
+    }
+
+    fn inline_retry_delay(&self, event: u32, attempt: u32) -> u64 {
+        let policy = self.configuration.retry_policy;
+        let upper = policy
+            .inline_base_micros
+            .saturating_mul(2_u64.saturating_pow(attempt))
+            .min(policy.inline_max_micros);
+        full_jitter(policy.seed, event, attempt, 0, upper)
+    }
+
+    fn deferred_retry_delay(&self, event: u32, retry_count: u32) -> u64 {
+        if retry_count == 0 {
+            return 0;
+        }
+        let policy = self.configuration.retry_policy;
+        let upper_micros = policy
+            .deferred_base_micros
+            .saturating_mul(2_u64.saturating_pow(retry_count - 1))
+            .min(policy.deferred_max_micros)
+            .max(1_000_000);
+        let upper_seconds = upper_micros / 1_000_000;
+        bounded_random(policy.seed, event, retry_count, 1, upper_seconds)
+            .saturating_add(1)
+            .saturating_mul(1_000_000)
     }
 
     fn remove_head(&mut self, key: usize) {
@@ -888,9 +1453,6 @@ impl<M: AttemptModel> Plant<M> {
         let applied = self.changes[change as usize];
         self.replicas = applied.replicas;
         self.change_active[change as usize] = false;
-        if self.pending_target_change == Some(change) {
-            self.pending_target_change = None;
-        }
         self.applied_changes.push(applied);
         sticky_assignment(
             &self.partition_owner,
@@ -1032,6 +1594,17 @@ impl<M: AttemptModel> Plant<M> {
             active_handlers: self.active_handlers,
             handler_occupancy_micros: self.handler_occupancy_micros,
             useful_completions: self.useful_completions,
+            completed_attempts: self.completed_attempts,
+            normal_attempts: self.normal_attempts,
+            normal_successes: self.normal_successes,
+            normal_transient_failures: self.normal_transient_failures,
+            normal_terminal_failures: self.normal_terminal_failures,
+            normal_permanent_failures: self.normal_permanent_failures,
+            failure_attempts: self.failure_attempts,
+            failure_successes: self.failure_successes,
+            failure_transient_failures: self.failure_transient_failures,
+            failure_terminal_failures: self.failure_terminal_failures,
+            failure_permanent_failures: self.failure_permanent_failures,
             partitions_ready: self
                 .partition_reconciliation
                 .iter()
@@ -1101,10 +1674,33 @@ struct Scheduled {
 enum ScheduledKind {
     Arrival(u32),
     AttemptDone(u32),
+    RetryReady(u32),
     DependencyDone,
     Scale(u32),
     ReconcileStart { partition: u32, epoch: u32 },
     ReconcileReady { partition: u32, epoch: u32 },
+}
+
+fn full_jitter(seed: u64, event: u32, attempt: u32, mode: u64, upper: u64) -> u64 {
+    if upper == 0 {
+        return 0;
+    }
+    bounded_random(seed, event, attempt, mode, upper)
+}
+
+fn bounded_random(seed: u64, event: u32, attempt: u32, mode: u64, bound: u64) -> u64 {
+    if bound == 0 {
+        return 0;
+    }
+    let domain = (u64::from(event) << 32_u32) ^ u64::from(attempt) ^ mode.rotate_left(17);
+    let mut random = RandomStream::new(seed).domain(domain);
+    let threshold = bound.wrapping_neg() % bound;
+    loop {
+        let product = u128::from(random.next_u64()) * u128::from(bound);
+        if product as u64 >= threshold {
+            return (product >> 64) as u64;
+        }
+    }
 }
 
 fn heap_push(heap: &mut Vec<Scheduled>, value: Scheduled) {
@@ -1164,7 +1760,9 @@ fn schedule_key(value: Scheduled) -> (u64, u8, u32) {
     let phase = match value.kind {
         ScheduledKind::DependencyDone => 0,
         ScheduledKind::Scale(_) | ScheduledKind::ReconcileStart { .. } => 1,
-        ScheduledKind::AttemptDone(_) | ScheduledKind::ReconcileReady { .. } => 2,
+        ScheduledKind::AttemptDone(_)
+        | ScheduledKind::RetryReady(_)
+        | ScheduledKind::ReconcileReady { .. } => 2,
         ScheduledKind::Arrival(_) => 3,
     };
     (value.at_micros, phase, value.ordinal)
@@ -1245,6 +1843,9 @@ pub enum PlantError {
     /// A simulator input table is invalid.
     #[error(transparent)]
     Input(#[from] InputError),
+    /// An event retry count is invalid.
+    #[error(transparent)]
+    RetryCount(#[from] RetryCountError),
     /// A generated controller observation is invalid.
     #[error(transparent)]
     ControllerObservation(#[from] prosody_scale_core::ObservationError),
@@ -1287,6 +1888,9 @@ pub enum PlantError {
     /// The scale-change buffer is full.
     #[error("the scale-change buffer is full")]
     ChangeCapacity,
+    /// The calendar forecast exceeds its simulator bound.
+    #[error("the calendar forecast buffer is full")]
+    CalendarCapacity,
     /// A new event precedes the plant's current virtual time.
     #[error("an event release cannot precede current plant time")]
     EventTimeRegressed,
@@ -1305,6 +1909,20 @@ pub enum PlantError {
     /// The metric trace is full.
     #[error("the metric trace is full")]
     MetricCapacity,
+}
+
+/// Invalid retry count.
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum RetryCountError {
+    /// A retry sequence has no retry-producing outcome.
+    #[error("a retry count must be positive")]
+    Zero,
+    /// A retry sequence exceeds the fixed simulator bound.
+    #[error("a retry count exceeds the simulator maximum of {maximum}")]
+    Bound {
+        /// Largest accepted retry count.
+        maximum: u8,
+    },
 }
 
 #[cfg(test)]

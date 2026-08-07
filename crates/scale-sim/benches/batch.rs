@@ -40,9 +40,14 @@ fn plants() -> Result<Vec<Plant>, PlantError> {
                 key: event.wrapping_mul(2_654_435_761).wrapping_add(replication) % 1_024,
                 handler_micros: 5_000,
                 dependency_operations: 1,
-                transient_failures: 0,
-                permanent_rejection: false,
-                timer: event % 20 == 0,
+                outcome: prosody_scale_sim::EventOutcome::Final(
+                    prosody_scale_sim::FinalOutcome::Success,
+                ),
+                source: if event % 20 == 0 {
+                    prosody_scale_sim::EventSource::Timer
+                } else {
+                    prosody_scale_sim::EventSource::Message
+                },
             })?;
         }
         plants.push(plant);
