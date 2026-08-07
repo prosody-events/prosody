@@ -138,9 +138,11 @@ impl BetaFactor {
         let distribution = Beta::new(self.retrying, self.final_outcome)
             .map_err(|_| PosteriorError::ReliabilityDistribution)?;
         let width = f64::from(RELIABILITY_BIN_COUNT).recip();
-        for (index, (value, probability)) in values.iter_mut().zip(probabilities).enumerate() {
-            let lower = index as f64 * width;
-            let upper = (index + 1) as f64 * width;
+        for (index, (value, probability)) in
+            (0_u32..RELIABILITY_BIN_COUNT).zip(values.iter_mut().zip(probabilities))
+        {
+            let lower = f64::from(index) * width;
+            let upper = f64::from(index + 1) * width;
             *value = (lower + upper) * 0.5_f64;
             *probability = distribution.cdf(upper) - distribution.cdf(lower);
         }

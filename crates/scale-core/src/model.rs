@@ -14,7 +14,7 @@ use crate::edf::{
 use crate::lead_time::{LeadTimeFactor, sample_index};
 use crate::partition::PartitionFactor;
 use crate::reliability::{RELIABILITY_BIN_COUNT, ReliabilityFactor};
-use crate::types::WorkCohort;
+use crate::types::{CalendarForecast, WorkCohort};
 use crate::{
     ActuationCommitment, ApplyDecision, ArrivalPosterior, CapacityGrid, Configuration,
     ConfigurationError, DecisionDiagnostics, GroupObservation, HoldDecision, HoldReason, ModelTime,
@@ -54,12 +54,14 @@ impl ScaleState {
         let lead_time = LeadTimeFactor::new(&configuration.launch_time_prior);
         let rebalance_time = LeadTimeFactor::new(&configuration.rebalance_time_prior);
         let arrivals = ArrivalFactor::new(configuration.arrival_prior);
+        let capacity =
+            CapacityFactor::new(capacity_grid, configuration.capacity_change_rate_per_second);
         Ok(Self {
             simd_level: Level::new(),
             configuration,
             model_time: ModelTime::from_micros(0),
             arrivals,
-            capacity: CapacityFactor::new(capacity_grid),
+            capacity,
             reliability,
             partition_placement,
             lead_time,
@@ -116,7 +118,7 @@ impl ScaleState {
     /// Returns exact Gamma parameters for the arrival-rate posterior.
     #[must_use]
     pub fn arrival_posterior(&self) -> ArrivalPosterior {
-        self.arrivals.posterior()
+        self.arrivals.posterior(self.model_time.as_micros())
     }
 
     /// Returns the posterior predictive CDF for one actuation duration.
@@ -449,10 +451,13 @@ pub fn step(
         current_replicas,
         actuation_commitments,
     } = observation;
+    let elapsed_seconds =
+        Duration::from_micros(now.as_micros().saturating_sub(state.model_time.as_micros()))
+            .as_secs_f64();
     state.model_time = now;
-    state.capacity.transition();
-    state.lead_time.transition();
-    state.rebalance_time.transition();
+    state.capacity.transition(elapsed_seconds);
+    state.lead_time.transition(elapsed_seconds);
+    state.rebalance_time.transition(elapsed_seconds);
     state.arrivals.prepare_calendar(calendar, now.as_micros());
     if let Some(window) = resource_window {
         state.capacity.update(state.simd_level, &window);
@@ -492,13 +497,13 @@ fn select_target(
     scratch: &mut ScaleScratch,
     cohorts: &[crate::Cohort],
     backlog: &[Option<crate::BacklogCohort>],
-    calendar: Option<crate::types::CalendarForecast<'_>>,
+    calendar: Option<CalendarForecast<'_>>,
     actuation_commitments: &[ActuationCommitment],
 ) -> ScaleDecision {
     let (normal_events, failure_events) = demand_class_totals(cohorts, backlog);
     prepare_work_cohorts(state, scratch, cohorts, backlog);
     prepare_partition_work(state, scratch);
-    if state.arrivals.expected_rate() > f64::EPSILON {
+    if state.arrivals.expected_rate(state.model_time.as_micros()) > f64::EPSILON {
         scratch.active_partition_count = scratch
             .active_partition_count
             .max(state.configuration.partition_count);
@@ -1191,7 +1196,7 @@ fn diagnostics(
 }
 
 fn arrival_rate(state: &ScaleState) -> f64 {
-    state.arrivals.expected_rate()
+    state.arrivals.expected_rate(state.model_time.as_micros())
 }
 
 /// Error from a caller-owned decision curve buffer.

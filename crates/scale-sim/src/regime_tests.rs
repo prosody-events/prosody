@@ -1,6 +1,6 @@
 use super::{
     ArrivalSeries, HISTORY_EVENT_COUNT_MAX, IndexSeries, PrincipalDefinition, PrincipalRegime,
-    RunSchedule, SharedResourcePolicy, StopCondition, run_principal_definition,
+    RunSchedule, RunStopReason, SharedResourcePolicy, StopCondition, run_principal_definition,
     run_principal_regime_seeded,
 };
 use crate::model::{AttemptFrame, AttemptModel};
@@ -111,7 +111,7 @@ fn capacity_experiment_uses_controller_actuation_for_a_fixed_duration() {
     assert!(matches!(
         definition.schedule.stop,
         StopCondition::FixedDuration {
-            reason: super::RunStopReason::DurationComplete
+            reason: RunStopReason::DurationComplete
         }
     ));
 }
@@ -123,7 +123,7 @@ fn declining_capacity_experiment_has_a_fixed_duration() {
     assert!(matches!(
         definition.schedule.stop,
         StopCondition::FixedDuration {
-            reason: super::RunStopReason::DurationComplete
+            reason: RunStopReason::DurationComplete
         }
     ));
 }
@@ -163,6 +163,40 @@ fn historical_definitions_sustain_their_relationships() {
 }
 
 #[test]
+fn historical_match_changes_the_prearrival_decision() -> Result<(), PrincipalRunError> {
+    let one_tick = RunSchedule {
+        start_micros: 0,
+        workload_end_micros: 0,
+        workload_interval_micros: 1,
+        followup_interval_micros: 1,
+        maximum_micros: 0,
+        stop: StopCondition::FixedDuration {
+            reason: RunStopReason::DurationComplete,
+        },
+    };
+    let mut matched = PrincipalDefinition::for_regime(PrincipalRegime::HistoricalMatch);
+    let mut missing = PrincipalDefinition::for_regime(PrincipalRegime::HistoricalMissing);
+    matched.schedule = one_tick;
+    missing.schedule = one_tick;
+    let matched = run_principal_definition(PrincipalRegime::HistoricalMatch, matched, None)?;
+    let missing = run_principal_definition(PrincipalRegime::HistoricalMissing, missing, None)?;
+    let matched_target = matched
+        .controller()
+        .sample(0)
+        .map_or(0, |sample| sample.target);
+    let missing_target = missing
+        .controller()
+        .sample(0)
+        .map_or(0, |sample| sample.target);
+
+    assert!(
+        matched_target > missing_target,
+        "matched target={matched_target}, missing target={missing_target}"
+    );
+    Ok(())
+}
+
+#[test]
 fn key_count_changes_one_partition_throughput() -> Result<(), PrincipalRunError> {
     let schedule = RunSchedule {
         start_micros: 0,
@@ -171,7 +205,7 @@ fn key_count_changes_one_partition_throughput() -> Result<(), PrincipalRunError>
         followup_interval_micros: 1_000_000,
         maximum_micros: 5_000_000,
         stop: StopCondition::FixedDuration {
-            reason: super::RunStopReason::DurationComplete,
+            reason: RunStopReason::DurationComplete,
         },
     };
     let one_key = PrincipalDefinition::for_regime(PrincipalRegime::HotSerializedKey)
@@ -210,7 +244,7 @@ fn retry_outcomes_increase_loss_without_creating_physical_saturation()
         followup_interval_micros: 1_000_000,
         maximum_micros: 10_000_000,
         stop: StopCondition::FixedDuration {
-            reason: super::RunStopReason::DurationComplete,
+            reason: RunStopReason::DurationComplete,
         },
     };
     let failures = PrincipalDefinition::for_regime(PrincipalRegime::TransientFailures)

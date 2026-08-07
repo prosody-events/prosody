@@ -242,6 +242,7 @@ fn configuration(case: BenchmarkCase) -> Result<Configuration, ConfigurationErro
         posterior_sample_count: case.posterior_sample_count,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),

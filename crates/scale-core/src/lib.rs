@@ -6,6 +6,7 @@
 
 mod arrival;
 mod capacity;
+mod change_point;
 mod edf;
 mod lead_time;
 mod model;

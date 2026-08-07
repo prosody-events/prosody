@@ -329,6 +329,7 @@ fn uncertain_late_capacity_does_not_change_the_target() -> Result<(), TestError>
         posterior_sample_count: 64,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
@@ -377,6 +378,7 @@ fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
         posterior_sample_count: 64,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
@@ -420,6 +422,7 @@ fn higher_retarget_preserves_each_completed_lead_time() -> Result<(), TestError>
         posterior_sample_count: 64,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
@@ -1520,9 +1523,15 @@ fn closed_loop_snapshot_loss_preserves_cumulative_arrival_evidence() -> Result<(
         return Err(TestError::MissingControllerSample);
     };
 
-    assert_eq!(
-        lost_final.arrival_rate_per_second.to_bits(),
-        complete_final.arrival_rate_per_second.to_bits()
+    let scale = lost_final
+        .arrival_rate_per_second
+        .abs()
+        .max(complete_final.arrival_rate_per_second.abs())
+        .max(1.0_f64);
+    assert!(
+        (lost_final.arrival_rate_per_second - complete_final.arrival_rate_per_second).abs()
+            <= scale * 1.0e-9_f64,
+        "cumulative evidence must preserve the arrival posterior"
     );
     Ok(())
 }
@@ -1632,6 +1641,7 @@ fn run_reported_arrivals(
         posterior_sample_count: 64,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),

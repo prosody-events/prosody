@@ -1,8 +1,9 @@
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use thiserror::Error;
 
+use crate::change_point::ChangePointKernel;
+
 const CAPACITY_CELL_COUNT_MAX: u32 = 4_096;
-const DRIFT_PROBABILITY: f64 = 0.01;
 const NO_KNEE_PRIOR_PROBABILITY: f64 = 0.5_f64;
 const NO_COLLAPSE_PRIOR_PROBABILITY: f64 = 0.5_f64;
 
@@ -270,20 +271,20 @@ pub(crate) struct CapacityFactor {
     grid: CapacityGrid,
     prior_weights: Vec<f64>,
     weights: Vec<f64>,
-    weights_next: Vec<f64>,
     likelihoods: Vec<f64>,
+    change_kernel: ChangePointKernel,
 }
 
 impl CapacityFactor {
-    pub(crate) fn new(grid: CapacityGrid) -> Self {
+    pub(crate) fn new(grid: CapacityGrid, change_rate_per_second: f64) -> Self {
         let cell_count = grid.service_times_seconds.len();
         let prior_weights = capacity_prior(&grid);
         Self {
             grid,
             weights: prior_weights.clone(),
             prior_weights,
-            weights_next: vec![0.0; cell_count],
             likelihoods: vec![0.0; cell_count],
+            change_kernel: ChangePointKernel::new(change_rate_per_second),
         }
     }
 
@@ -330,24 +331,12 @@ impl CapacityFactor {
         self.grid.knee_values.len() as u32
     }
 
-    pub(crate) fn transition(&mut self) {
-        self.weights_next.fill(0.0_f64);
-        let cell_count = self.grid.service_times_seconds.len();
-        for cell_index in 0..cell_count {
-            let neighbors = self.neighbors(cell_index);
-            let weight = self.weights[cell_index];
-            let proposal = weight * DRIFT_PROBABILITY / 7.0_f64;
-            let mut retained = weight;
-            for neighbor in neighbors.into_iter().flatten() {
-                let acceptance =
-                    (self.prior_weights[neighbor] / self.prior_weights[cell_index]).min(1.0_f64);
-                let moved = proposal * acceptance;
-                self.weights_next[neighbor] += moved;
-                retained -= moved;
-            }
-            self.weights_next[cell_index] += retained;
+    pub(crate) fn transition(&mut self, elapsed_seconds: f64) {
+        let transition = self.change_kernel.probabilities(elapsed_seconds);
+        for index in 0..self.weights.len() {
+            self.weights[index] = transition.retained * self.weights[index]
+                + transition.redrawn * self.prior_weights[index];
         }
-        self.weights.copy_from_slice(&self.weights_next);
     }
 
     pub(crate) fn update(&mut self, simd_level: Level, window: &ResourceWindow) {
@@ -703,40 +692,6 @@ impl CapacityFactor {
                 *weight /= total;
             }
         }
-    }
-
-    fn neighbors(&self, cell_index: usize) -> [Option<usize>; 7] {
-        let capacity_count = self.grid.capacity_count as usize;
-        let collapse_count = self.grid.collapse_count as usize;
-        let service_time_count = self.grid.service_time_count as usize;
-        let service_stride = capacity_count * collapse_count;
-        let knee_cell_count = self.grid.knee_cell_count as usize;
-        if cell_index >= knee_cell_count {
-            let service_index = cell_index - knee_cell_count;
-            let boundary = service_index * service_stride + (capacity_count - 1) * collapse_count;
-            return [
-                (service_index > 0).then(|| cell_index - 1),
-                (service_index + 1 < service_time_count).then(|| cell_index + 1),
-                Some(boundary),
-                None,
-                None,
-                None,
-                None,
-            ];
-        }
-        let service_index = cell_index / service_stride;
-        let capacity_index = (cell_index / collapse_count) % capacity_count;
-        let collapse_index = cell_index % collapse_count;
-        [
-            (service_index > 0).then(|| cell_index - service_stride),
-            (service_index + 1 < service_time_count).then(|| cell_index + service_stride),
-            (capacity_index > 0).then(|| cell_index - collapse_count),
-            (capacity_index + 1 < capacity_count).then(|| cell_index + collapse_count),
-            (collapse_index > 0).then(|| cell_index - 1),
-            (collapse_index + 1 < collapse_count).then(|| cell_index + 1),
-            (capacity_index + 1 == capacity_count && collapse_index == 0)
-                .then(|| knee_cell_count + service_index),
-        ]
     }
 }
 

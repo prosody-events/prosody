@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use thiserror::Error;
 
 use crate::{ArrivalEvidence, ResourceWindow, TransitionDirection, TransitionEvidence};
@@ -225,6 +227,8 @@ pub struct Configuration {
     pub failure_service_weight: f64,
     /// Prior for live arrival-rate segments.
     pub arrival_prior: crate::ArrivalPrior,
+    /// Prior rate for physical capacity-curve changes.
+    pub capacity_change_rate_per_second: f64,
     /// Population prior for class-specific retry probabilities.
     pub reliability_prior: crate::ReliabilityPrior,
     /// Population prior for replica launch time.
@@ -281,6 +285,11 @@ impl Configuration {
             return Err(ConfigurationError::InvalidFailureServiceWeight {
                 weight: self.failure_service_weight,
             });
+        }
+        if !self.capacity_change_rate_per_second.is_finite()
+            || self.capacity_change_rate_per_second < 0.0_f64
+        {
+            return Err(ConfigurationError::InvalidCapacityChangeRate);
         }
         Ok(())
     }
@@ -354,7 +363,7 @@ impl DemandClass {
 pub struct BacklogCohort {
     observed_at_micros: u64,
     oldest_arrival_micros: u64,
-    event_count: std::num::NonZeroU32,
+    event_count: NonZeroU32,
     partition: u32,
     demand_class: DemandClass,
 }
@@ -372,7 +381,7 @@ impl BacklogCohort {
         partition: u32,
         demand_class: DemandClass,
     ) -> Result<Self, ObservationError> {
-        let Some(event_count) = std::num::NonZeroU32::new(event_count) else {
+        let Some(event_count) = NonZeroU32::new(event_count) else {
             return Err(ObservationError::EmptyBacklog);
         };
         if oldest_arrival_micros > observed_at_micros {
@@ -855,6 +864,9 @@ pub enum ConfigurationError {
     /// A reliability-prior shape is not positive and finite.
     #[error("reliability prior shapes must be positive and finite")]
     InvalidReliabilityPrior,
+    /// The physical capacity change rate is negative or non-finite.
+    #[error("capacity change rate must be finite and nonnegative")]
+    InvalidCapacityChangeRate,
     /// A fixed capacity bound is zero.
     #[error("{name} must be positive")]
     ZeroBound {

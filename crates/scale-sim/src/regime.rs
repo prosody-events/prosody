@@ -734,12 +734,13 @@ fn principal_graph(
             1.0_f64 / 90.0_f64,
             1_024,
         )?,
+        capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: transition_prior([30.0_f64, 45.0_f64, 60.0_f64, 90.0_f64])?,
         rebalance_time_prior: transition_prior([0.05_f64, 0.1_f64, 0.2_f64, 0.4_f64])?,
         objective: ServiceObjective::new(regime.budget_micros(), 0.01)?,
     };
-    let capacity_grid = capacity_grid(capacity_regime, sensitivity)?;
+    let capacity_grid = capacity_grid(regime, capacity_regime, sensitivity)?;
     let graph = ClosedLoop::new(
         PrincipalGraph::new(definition)?,
         &controller_configuration,
@@ -767,10 +768,16 @@ fn principal_graph(
 fn transition_prior(
     median_seconds: [f64; 4],
 ) -> Result<TransitionPrior, prosody_scale_core::TransitionPriorError> {
-    TransitionPrior::new(median_seconds, [0.1_f64, 0.2_f64, 0.3_f64], [1.0_f64; 12])
+    TransitionPrior::new(
+        median_seconds,
+        [0.1_f64, 0.2_f64, 0.3_f64],
+        [1.0_f64; 12],
+        0.0_f64,
+    )
 }
 
 fn capacity_grid(
+    regime: PrincipalRegime,
     capacity_regime: bool,
     sensitivity: Option<CapacitySensitivity>,
 ) -> Result<CapacityGrid, prosody_scale_core::CapacityGridError> {
@@ -788,7 +795,14 @@ fn capacity_grid(
             .map(|value| f64::from(value) * 2_000.0_f64)
             .collect::<Vec<_>>()
     };
-    let service_times_seconds: &[f64] = if capacity_regime {
+    let historical_regime = matches!(
+        regime,
+        PrincipalRegime::HistoricalMatch
+            | PrincipalRegime::HistoricalExceeded
+            | PrincipalRegime::HistoricalUnder
+            | PrincipalRegime::HistoricalMissing
+    );
+    let service_times_seconds: &[f64] = if capacity_regime || historical_regime {
         &[0.025_f64, 0.05_f64, 0.1_f64, 0.2_f64]
     } else {
         &[
@@ -803,7 +817,13 @@ fn capacity_grid(
             600.0_f64,
         ]
     };
-    let prior = if capacity_regime {
+    let prior = if historical_regime {
+        CapacityPrior::LogNormal {
+            service_time_median_seconds: 0.1_f64,
+            capacity_median_per_second: 1_280.0_f64,
+            log_standard_deviation: 2.0_f64.ln(),
+        }
+    } else if capacity_regime {
         sensitivity.map_or(CapacityPrior::LogUniform, |variant| {
             let factor: f64 = match variant {
                 CapacitySensitivity::NarrowPrior => 2.0_f64,

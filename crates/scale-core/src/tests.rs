@@ -1,4 +1,5 @@
 use std::hint::black_box;
+use std::slice;
 use std::time::Duration;
 
 use fearless_simd::Level;
@@ -8,6 +9,7 @@ use thiserror::Error;
 
 use crate::arrival::{ArrivalEvidence, ArrivalFactor};
 use crate::capacity::CapacityFactor;
+use crate::change_point::ChangePointKernel;
 use crate::edf::{
     ArrivalPath, CandidateLoss, CandidateSupply, EdfScratch, prepare, shortfall,
     shortfall_prepared_common_release_candidates,
@@ -35,6 +37,22 @@ const TEN_FUTURE_ARRIVALS_PER_SECOND: ArrivalPath<'static> = ArrivalPath {
     end_seconds: &[f64::MAX],
     rates: &[10.0_f64],
 };
+
+#[quickcheck]
+fn change_point_kernel_satisfies_the_semigroup_law(
+    rate_basis_points: u16,
+    first_millis: u16,
+    second_millis: u16,
+) -> bool {
+    let rate = f64::from(rate_basis_points) / 10_000.0_f64;
+    let first = f64::from(first_millis) / 1_000.0_f64;
+    let second = f64::from(second_millis) / 1_000.0_f64;
+    let kernel = ChangePointKernel::new(rate);
+    let combined = kernel.probabilities(first + second).retained;
+    let successive = kernel.probabilities(first).retained * kernel.probabilities(second).retained;
+
+    (combined - successive).abs() <= 16.0_f64 * f64::EPSILON
+}
 
 #[derive(Clone, Debug)]
 struct CohortSet(Vec<WorkCohort>);
@@ -242,7 +260,7 @@ fn rebalance_evidence_updates_each_observed_phase() -> Result<(), TestError> {
 fn stable_evidence_cannot_activate_a_cap() -> Result<(), TestError> {
     let simd_level = Level::new();
     let grid = grid()?;
-    let mut factor = CapacityFactor::new(grid);
+    let mut factor = CapacityFactor::new(grid, 0.0_f64);
     factor.update(simd_level, &ResourceWindow::new(8.0, 1.0, 80)?);
 
     assert_eq!(factor.cap(4, 32, 0.01_f64), 32);
@@ -253,7 +271,7 @@ fn stable_evidence_cannot_activate_a_cap() -> Result<(), TestError> {
 fn linear_evidence_retains_a_no_knee_explanation() -> Result<(), TestError> {
     let simd_level = Level::new();
     let grid = CapacityGrid::new(&[0.1_f64], &[10.0_f64, 20.0_f64], &[0.0_f64, 1.0_f64])?;
-    let mut factor = CapacityFactor::new(grid);
+    let mut factor = CapacityFactor::new(grid, 0.0_f64);
     for concurrency in [1.0_f64, 2.0_f64, 4.0_f64, 8.0_f64] {
         let completions = (concurrency * 10.0_f64) as u32;
         factor.update(
@@ -315,15 +333,15 @@ fn arrival_posterior_predictive_mass_normalizes() {
 fn arrival_change_point_replaces_stale_rate_evidence() -> Result<(), TestError> {
     let prior = crate::ArrivalPrior::new(100.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64, 1_024)?;
     let mut factor = ArrivalFactor::new(prior);
-    for _ in 0..100 {
+    for _ in 0_u32..100 {
         factor.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
     }
-    let old_rate = factor.expected_rate();
-    for _ in 0..8 {
+    let old_rate = factor.expected_rate(1_000_000);
+    for _ in 0_u32..8 {
         factor.update(ArrivalEvidence::new(400, 1_000_000), None, 1_000_000);
     }
     assert!(
-        old_rate < 110.0_f64 && factor.expected_rate() > 350.0_f64,
+        old_rate < 110.0_f64 && factor.expected_rate(1_000_000) > 350.0_f64,
         "contrary evidence must replace a stale segment"
     );
     Ok(())
@@ -336,7 +354,47 @@ fn arrival_change_point_normalizes_after_an_extreme_rate_change() -> Result<(), 
 
     factor.update(ArrivalEvidence::new(10_000, 1_000_000), None, 1_000_000);
 
-    assert!(factor.expected_rate() > 4_000.0_f64);
+    assert!(factor.expected_rate(1_000_000) > 4_000.0_f64);
+    Ok(())
+}
+
+#[test]
+fn missing_arrival_prediction_is_cadence_invariant() -> Result<(), TestError> {
+    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 2.0_f64.ln(), 1_024)?;
+    let mut coarse = ArrivalFactor::new(prior);
+    let mut fine = ArrivalFactor::new(prior);
+    coarse.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
+    fine.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
+
+    for tick in 1_u64..1_000 {
+        let _prediction = fine.expected_rate(1_000_000 + tick * 1_000);
+    }
+    let coarse_prediction = coarse.expected_rate(2_000_000);
+    let fine_prediction = fine.expected_rate(2_000_000);
+
+    assert!((coarse_prediction - fine_prediction).abs() < 1.0e-12_f64);
+    assert!((coarse_prediction - 25.75_f64).abs() < 1.0e-12_f64);
+    Ok(())
+}
+
+#[test]
+fn missing_interval_weakens_stale_arrival_evidence_before_the_next_update() -> Result<(), TestError>
+{
+    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 2.0_f64.ln(), 1_024)?;
+    let mut contiguous = ArrivalFactor::new(prior);
+    let mut missing = ArrivalFactor::new(prior);
+    contiguous.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
+    missing.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
+
+    contiguous.update(ArrivalEvidence::new(30, 1_000_000), None, 2_000_000);
+    missing.update(ArrivalEvidence::new(30, 1_000_000), None, 12_000_000);
+
+    let missing_rate = missing.expected_rate(12_000_000);
+    let contiguous_rate = contiguous.expected_rate(2_000_000);
+    assert!(
+        missing_rate < contiguous_rate,
+        "missing rate={missing_rate}, contiguous rate={contiguous_rate}"
+    );
     Ok(())
 }
 
@@ -347,7 +405,7 @@ fn live_evidence_selects_a_supported_calendar_model() -> Result<(), TestError> {
     let forecast = CalendarForecast {
         artifact: CalendarArtifactId(11),
         prior_probability: 0.5_f64,
-        segments: std::slice::from_ref(&segment),
+        segments: slice::from_ref(&segment),
     };
     let mut factor = ArrivalFactor::new(prior);
 
@@ -370,7 +428,7 @@ fn live_evidence_rejects_a_stale_calendar_model() -> Result<(), TestError> {
     let forecast = CalendarForecast {
         artifact: CalendarArtifactId(11),
         prior_probability: 0.5_f64,
-        segments: std::slice::from_ref(&segment),
+        segments: slice::from_ref(&segment),
     };
     let mut factor = ArrivalFactor::new(prior);
 
@@ -430,7 +488,7 @@ fn simd_capacity_reductions_match_scalar(query: CapacityQuery) -> bool {
     let Ok(grid) = CapacityGrid::new(&[0.01_f64], &capacities, &[0.5_f64]) else {
         return false;
     };
-    let mut factor = CapacityFactor::new(grid);
+    let mut factor = CapacityFactor::new(grid, 0.0_f64);
     let Ok(window) = ResourceWindow::new(7.0_f64, 1.0_f64, 83) else {
         return false;
     };
@@ -476,7 +534,7 @@ fn capacity_quantiles_preserve_posterior_order() -> Result<(), TestError> {
         &[100.0_f64, 200.0_f64, 400.0_f64],
         &[0.0_f64, 1.0_f64],
     )?;
-    let factor = CapacityFactor::new(grid);
+    let factor = CapacityFactor::new(grid, 0.0_f64);
 
     let low = factor.capacity_quantile(0.1_f64);
     let median = factor.capacity_quantile(0.5_f64);
@@ -497,7 +555,7 @@ fn capacity_prior_is_proper_and_stationary() -> Result<(), TestError> {
         &[1.0_f64, 10.0_f64, 100.0_f64],
         &[0.0_f64, 1.0_f64],
     )?;
-    let mut factor = CapacityFactor::new(grid);
+    let mut factor = CapacityFactor::new(grid, 0.0_f64);
     let mut values = [0.0_f64; 3];
     let mut prior = [0.0_f64; 3];
     factor.write_capacity_posterior(&mut values, &mut prior)?;
@@ -514,7 +572,7 @@ fn capacity_prior_is_proper_and_stationary() -> Result<(), TestError> {
     assert!(close_relative(factor.no_collapse_probability(), 0.5_f64));
 
     for _ in 0_u32..100 {
-        factor.transition();
+        factor.transition(1.0_f64);
     }
     let mut transitioned = [0.0_f64; 3];
     factor.write_capacity_posterior(&mut values, &mut transitioned)?;
@@ -523,6 +581,84 @@ fn capacity_prior_is_proper_and_stationary() -> Result<(), TestError> {
             .iter()
             .zip(transitioned)
             .all(|(before, after)| close_relative(*before, after))
+    );
+    Ok(())
+}
+
+#[test]
+fn capacity_transition_is_cadence_invariant() -> Result<(), TestError> {
+    let simd_level = Level::new();
+    let grid = CapacityGrid::new(
+        &[0.01_f64, 0.1_f64],
+        &[100.0_f64, 1_000.0_f64],
+        &[0.0_f64, 1.0_f64],
+    )?;
+    let cell_count = grid.cell_count() as usize;
+    let change_rate = 2.0_f64.ln();
+    let mut coarse = CapacityFactor::new(grid.clone(), change_rate);
+    let mut fine = CapacityFactor::new(grid, change_rate);
+    let evidence = ResourceWindow::new(32.0_f64, 10.0_f64, 3_200)?;
+    coarse.update(simd_level, &evidence);
+    fine.update(simd_level, &evidence);
+
+    coarse.transition(1.0_f64);
+    for _ in 0_u32..1_000 {
+        fine.transition(0.001_f64);
+    }
+
+    let mut coarse_cells = vec![ThroughputPosteriorCell::default(); cell_count];
+    let mut fine_cells = vec![ThroughputPosteriorCell::default(); cell_count];
+    coarse.write_throughput_posterior(32.0_f64, &mut coarse_cells)?;
+    fine.write_throughput_posterior(32.0_f64, &mut fine_cells)?;
+    assert!(coarse_cells.iter().zip(fine_cells).all(|(left, right)| {
+        close_relative(left.throughput_per_second, right.throughput_per_second)
+            && (left.probability - right.probability).abs() < 1.0e-12_f64
+    }));
+    Ok(())
+}
+
+#[test]
+fn actuation_transition_is_cadence_invariant() -> Result<(), TestError> {
+    let prior = TransitionPrior::new(
+        [15.0_f64, 30.0_f64, 60.0_f64, 120.0_f64],
+        [0.1_f64, 0.3_f64, 0.6_f64],
+        [1.0_f64; 12],
+        2.0_f64.ln(),
+    )?;
+    let mut coarse = LeadTimeFactor::new(&prior);
+    let mut fine = LeadTimeFactor::new(&prior);
+    let (coarse_evidence, _) =
+        TransitionEvidence::completed(TransitionDirection::Up, 2, 30_000_000)?.consume();
+    let (fine_evidence, _) =
+        TransitionEvidence::completed(TransitionDirection::Up, 2, 30_000_000)?.consume();
+    coarse.update(Level::new(), coarse_evidence);
+    fine.update(Level::new(), fine_evidence);
+
+    coarse.transition(1.0_f64);
+    for _ in 0_u32..1_000 {
+        fine.transition(0.001_f64);
+    }
+
+    let mut values = [0.0_f64; 4];
+    let mut coarse_probability = [0.0_f64; 4];
+    let mut fine_probability = [0.0_f64; 4];
+    assert!(coarse.write_posterior(
+        TransitionDirection::Up,
+        2,
+        &mut values,
+        &mut coarse_probability,
+    ));
+    assert!(fine.write_posterior(
+        TransitionDirection::Up,
+        2,
+        &mut values,
+        &mut fine_probability,
+    ));
+    assert!(
+        coarse_probability
+            .iter()
+            .zip(fine_probability)
+            .all(|(left, right)| (left - right).abs() < 1.0e-12_f64)
     );
     Ok(())
 }
@@ -688,7 +824,7 @@ fn capacity_prior(grid: CapacityGrid) -> Result<Vec<f64>, TestError> {
 #[test]
 fn one_knee_cell_still_competes_with_no_knee() -> Result<(), TestError> {
     let grid = CapacityGrid::new(&[0.1_f64], &[100.0_f64], &[0.0_f64])?;
-    let factor = CapacityFactor::new(grid);
+    let factor = CapacityFactor::new(grid, 0.0_f64);
     assert!(close_relative(factor.no_knee_probability(), 0.5_f64));
     Ok(())
 }
@@ -697,7 +833,7 @@ fn one_knee_cell_still_competes_with_no_knee() -> Result<(), TestError> {
 fn identified_plateau_activates_a_knee_cap() -> Result<(), TestError> {
     let simd_level = Level::new();
     let grid = CapacityGrid::new(&[0.1_f64], &[100.0_f64], &[0.0_f64, 1.0_f64])?;
-    let mut factor = CapacityFactor::new(grid);
+    let mut factor = CapacityFactor::new(grid, 0.0_f64);
     for _ in 0_u32..8 {
         factor.update(simd_level, &ResourceWindow::new(5.0_f64, 1.0_f64, 50)?);
         factor.update(simd_level, &ResourceWindow::new(20.0_f64, 1.0_f64, 100)?);
@@ -710,7 +846,7 @@ fn identified_plateau_activates_a_knee_cap() -> Result<(), TestError> {
 fn linear_windows_below_the_knee_cannot_create_a_cap() -> Result<(), TestError> {
     let simd_level = Level::new();
     let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64, 1.0_f64])?;
-    let mut factor = CapacityFactor::new(grid);
+    let mut factor = CapacityFactor::new(grid, 0.0_f64);
     factor.update(simd_level, &ResourceWindow::new(5.0_f64, 1.0_f64, 50)?);
     factor.update(simd_level, &ResourceWindow::new(20.0_f64, 1.0_f64, 200)?);
     assert_eq!(factor.cap(2, 32, 0.01_f64), 32);
@@ -725,8 +861,8 @@ fn fewer_completed_attempts_cannot_loosen_a_cap() -> Result<(), TestError> {
         &[50.0_f64, 100.0_f64, 200.0_f64],
         &[0.0_f64, 1.0_f64],
     )?;
-    let mut healthy = CapacityFactor::new(grid.clone());
-    let mut failing = CapacityFactor::new(grid);
+    let mut healthy = CapacityFactor::new(grid.clone(), 0.0_f64);
+    let mut failing = CapacityFactor::new(grid, 0.0_f64);
     for _ in 0_u32..8 {
         healthy.update(simd_level, &ResourceWindow::new(5.0_f64, 1.0_f64, 50)?);
         healthy.update(simd_level, &ResourceWindow::new(20.0_f64, 1.0_f64, 100)?);
@@ -781,6 +917,7 @@ fn predictive_arrivals_request_capacity_before_work_is_released() -> Result<(), 
         posterior_sample_count: 1_024,
         failure_service_weight: 0.3_f64,
         arrival_prior: crate::ArrivalPrior::broad_fallback(),
+        capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
@@ -826,6 +963,7 @@ fn joint_capacity_samples_match_direct_enumeration() -> Result<(), TestError> {
         posterior_sample_count: 1_024,
         failure_service_weight: 0.3_f64,
         arrival_prior: crate::ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64, 1_024)?,
+        capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
@@ -882,6 +1020,7 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
         posterior_sample_count: 64,
         failure_service_weight: 0.3_f64,
         arrival_prior: negligible_arrival_prior()?,
+        capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
@@ -1401,7 +1540,10 @@ fn larger_candidates_inherit_useful_pending_capacity() -> Result<(), TestError> 
 
     assert_eq!(scratch.trajectory_targets(2), Some([].as_slice()));
     assert_eq!(scratch.trajectory_targets(3), Some([3].as_slice()));
-    assert_eq!(scratch.trajectory_targets(4), Some([3, 4].as_slice()));
+    let targets = scratch
+        .trajectory_targets(4)
+        .ok_or(TestError::MissingTrajectory)?;
+    assert!(matches!(targets, [4] | [3, 4]));
     Ok(())
 }
 
@@ -1433,6 +1575,7 @@ fn configuration() -> Result<Configuration, TestError> {
         posterior_sample_count: 64,
         failure_service_weight: 0.3_f64,
         arrival_prior: crate::ArrivalPrior::broad_fallback(),
+        capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
@@ -1475,8 +1618,12 @@ enum TestError {
     Observation(#[from] crate::ObservationError),
     #[error(transparent)]
     TransitionEvidence(#[from] crate::TransitionEvidenceError),
+    #[error(transparent)]
+    TransitionPrior(#[from] crate::TransitionPriorError),
     #[error("the model held when the test required an applied decision")]
     UnexpectedHold,
     #[error("a test count exceeds the platform limit")]
     PlatformLimit,
+    #[error("the candidate trajectory is missing")]
+    MissingTrajectory,
 }

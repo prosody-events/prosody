@@ -5,11 +5,11 @@ use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use thiserror::Error;
 
 use crate::RandomStream;
+use crate::change_point::ChangePointKernel;
 
 const DIRECTION_COUNT: usize = 2;
 const DELTA_BUCKET_COUNT: usize = 4;
 const GRID_CELL_COUNT: usize = 12;
-const DRIFT_PROBABILITY: f64 = 0.01_f64;
 const AXIS_COUNT: usize = 4;
 const SCALE_COUNT: usize = 3;
 
@@ -19,6 +19,7 @@ pub struct TransitionPrior {
     mu_log_seconds: [f64; AXIS_COUNT],
     sigma_log_seconds: [f64; SCALE_COUNT],
     probabilities: [f64; GRID_CELL_COUNT],
+    change_kernel: ChangePointKernel,
 }
 
 impl TransitionPrior {
@@ -33,6 +34,7 @@ impl TransitionPrior {
         median_seconds: [f64; AXIS_COUNT],
         log_standard_deviations: [f64; SCALE_COUNT],
         mut probabilities: [f64; GRID_CELL_COUNT],
+        change_rate_per_second: f64,
     ) -> Result<Self, TransitionPriorError> {
         if !median_seconds
             .iter()
@@ -43,6 +45,8 @@ impl TransitionPrior {
             || !probabilities
                 .iter()
                 .all(|value| value.is_finite() && *value >= 0.0_f64)
+            || !change_rate_per_second.is_finite()
+            || change_rate_per_second < 0.0_f64
         {
             return Err(TransitionPriorError::InvalidValue);
         }
@@ -57,6 +61,7 @@ impl TransitionPrior {
             mu_log_seconds: median_seconds.map(f64::ln),
             sigma_log_seconds: log_standard_deviations,
             probabilities,
+            change_kernel: ChangePointKernel::new(change_rate_per_second),
         })
     }
 
@@ -66,7 +71,8 @@ impl TransitionPrior {
         Self {
             mu_log_seconds: [15.0_f64.ln(), 30.0_f64.ln(), 60.0_f64.ln(), 120.0_f64.ln()],
             sigma_log_seconds: [0.1_f64, 0.3_f64, 0.6_f64],
-            probabilities: [1.0_f64 / GRID_CELL_COUNT as f64; GRID_CELL_COUNT],
+            probabilities: [1.0_f64 / 12.0_f64; GRID_CELL_COUNT],
+            change_kernel: ChangePointKernel::new(0.0_f64),
         }
     }
 }
@@ -272,7 +278,8 @@ pub(crate) struct LeadTimeFactor {
     mu_log_seconds: [f64; GRID_CELL_COUNT],
     sigma_log_seconds: [f64; GRID_CELL_COUNT],
     weights: Vec<f64>,
-    weights_next: Vec<f64>,
+    prior_weights: [f64; GRID_CELL_COUNT],
+    change_kernel: ChangePointKernel,
     likelihoods: [f64; GRID_CELL_COUNT],
     last_direction: TransitionDirection,
     last_replica_delta: u32,
@@ -299,42 +306,24 @@ impl LeadTimeFactor {
             mu_log_seconds,
             sigma_log_seconds,
             weights,
-            weights_next: vec![0.0_f64; factor_count * GRID_CELL_COUNT],
+            prior_weights: prior.probabilities,
+            change_kernel: prior.change_kernel,
             likelihoods: [0.0_f64; GRID_CELL_COUNT],
             last_direction: TransitionDirection::Up,
             last_replica_delta: 1,
         }
     }
 
-    pub(crate) fn transition(&mut self) {
-        self.weights_next.fill(0.0_f64);
+    pub(crate) fn transition(&mut self, elapsed_seconds: f64) {
+        let transition = self.change_kernel.probabilities(elapsed_seconds);
         for factor in 0..DIRECTION_COUNT * DELTA_BUCKET_COUNT {
             let factor_start = factor * GRID_CELL_COUNT;
             for cell in 0..GRID_CELL_COUNT {
-                let mu = cell / SCALE_COUNT;
-                let sigma = cell % SCALE_COUNT;
-                let neighbors = [
-                    (mu > 0).then(|| cell - SCALE_COUNT),
-                    (mu + 1 < AXIS_COUNT).then(|| cell + SCALE_COUNT),
-                    (sigma > 0).then(|| cell - 1),
-                    (sigma + 1 < SCALE_COUNT).then(|| cell + 1),
-                ];
-                let neighbor_count = neighbors.iter().flatten().count();
-                let weight = self.weights[factor_start + cell];
-                self.weights_next[factor_start + cell] += weight * (1.0_f64 - DRIFT_PROBABILITY);
-                let divisor = match neighbor_count {
-                    2 => 2.0_f64,
-                    3 => 3.0_f64,
-                    4 => 4.0_f64,
-                    _ => 1.0_f64,
-                };
-                let moved = weight * DRIFT_PROBABILITY / divisor;
-                for neighbor in neighbors.into_iter().flatten() {
-                    self.weights_next[factor_start + neighbor] += moved;
-                }
+                let index = factor_start + cell;
+                self.weights[index] = transition.retained * self.weights[index]
+                    + transition.redrawn * self.prior_weights[cell];
             }
         }
-        self.weights.copy_from_slice(&self.weights_next);
     }
 
     pub(crate) fn update(&mut self, simd_level: Level, evidence: PhaseEvidence) {
