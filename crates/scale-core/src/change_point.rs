@@ -12,7 +12,8 @@ impl ChangePointKernel {
         Self { rate_per_second }
     }
 
-    pub(crate) fn probabilities(self, elapsed_seconds: f64) -> TransitionProbabilities {
+    pub(crate) fn probabilities(self, elapsed: Duration) -> TransitionProbabilities {
+        let elapsed_seconds = elapsed.as_secs_f64();
         let retained = (-self.rate_per_second * elapsed_seconds).exp();
         TransitionProbabilities {
             retained,
@@ -30,3 +31,4 @@ pub(crate) struct TransitionProbabilities {
     pub(crate) retained: f64,
     pub(crate) redrawn: f64,
 }
+use std::time::Duration;

@@ -45,8 +45,8 @@ fn change_point_kernel_satisfies_the_semigroup_law(
     second_millis: u16,
 ) -> bool {
     let rate = f64::from(rate_basis_points) / 10_000.0_f64;
-    let first = f64::from(first_millis) / 1_000.0_f64;
-    let second = f64::from(second_millis) / 1_000.0_f64;
+    let first = Duration::from_millis(u64::from(first_millis));
+    let second = Duration::from_millis(u64::from(second_millis));
     let kernel = ChangePointKernel::new(rate);
     let combined = kernel.probabilities(first + second).retained;
     let successive = kernel.probabilities(first).retained * kernel.probabilities(second).retained;
@@ -593,7 +593,7 @@ fn capacity_prior_is_proper_and_stationary() -> Result<(), TestError> {
     assert!(close_relative(factor.no_collapse_probability(), 0.5_f64));
 
     for _ in 0_u32..100 {
-        factor.transition(1.0_f64);
+        factor.transition(Duration::from_secs(1));
     }
     let mut transitioned = [0.0_f64; 3];
     factor.write_capacity_posterior(&mut values, &mut transitioned)?;
@@ -622,9 +622,9 @@ fn capacity_transition_is_cadence_invariant() -> Result<(), TestError> {
     coarse.update(simd_level, &evidence);
     fine.update(simd_level, &evidence);
 
-    coarse.transition(1.0_f64);
+    coarse.transition(Duration::from_secs(1));
     for _ in 0_u32..1_000 {
-        fine.transition(0.001_f64);
+        fine.transition(Duration::from_millis(1));
     }
 
     let mut coarse_cells = vec![ThroughputPosteriorCell::default(); cell_count];
@@ -655,9 +655,9 @@ fn actuation_transition_is_cadence_invariant() -> Result<(), TestError> {
     coarse.update(Level::new(), coarse_evidence);
     fine.update(Level::new(), fine_evidence);
 
-    coarse.transition(1.0_f64);
+    coarse.transition(Duration::from_secs(1));
     for _ in 0_u32..1_000 {
-        fine.transition(0.001_f64);
+        fine.transition(Duration::from_millis(1));
     }
 
     let mut values = [0.0_f64; 4];

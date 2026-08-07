@@ -314,8 +314,8 @@ impl LeadTimeFactor {
         }
     }
 
-    pub(crate) fn transition(&mut self, elapsed_seconds: f64) {
-        let transition = self.change_kernel.probabilities(elapsed_seconds);
+    pub(crate) fn transition(&mut self, elapsed: Duration) {
+        let transition = self.change_kernel.probabilities(elapsed);
         for factor in 0..DIRECTION_COUNT * DELTA_BUCKET_COUNT {
             let factor_start = factor * GRID_CELL_COUNT;
             for cell in 0..GRID_CELL_COUNT {

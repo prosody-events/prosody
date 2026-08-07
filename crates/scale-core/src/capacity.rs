@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use thiserror::Error;
 
@@ -331,8 +333,8 @@ impl CapacityFactor {
         self.grid.knee_values.len() as u32
     }
 
-    pub(crate) fn transition(&mut self, elapsed_seconds: f64) {
-        let transition = self.change_kernel.probabilities(elapsed_seconds);
+    pub(crate) fn transition(&mut self, elapsed: Duration) {
+        let transition = self.change_kernel.probabilities(elapsed);
         for index in 0..self.weights.len() {
             self.weights[index] = transition.retained * self.weights[index]
                 + transition.redrawn * self.prior_weights[index];

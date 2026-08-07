@@ -451,13 +451,12 @@ pub fn step(
         current_replicas,
         actuation_commitments,
     } = observation;
-    let elapsed_seconds =
-        Duration::from_micros(now.as_micros().saturating_sub(state.model_time.as_micros()))
-            .as_secs_f64();
+    let elapsed =
+        Duration::from_micros(now.as_micros().saturating_sub(state.model_time.as_micros()));
     state.model_time = now;
-    state.capacity.transition(elapsed_seconds);
-    state.lead_time.transition(elapsed_seconds);
-    state.rebalance_time.transition(elapsed_seconds);
+    state.capacity.transition(elapsed);
+    state.lead_time.transition(elapsed);
+    state.rebalance_time.transition(elapsed);
     state.arrivals.prepare_calendar(calendar, now.as_micros());
     if let Some(window) = resource_window {
         state.capacity.update(state.simd_level, &window);

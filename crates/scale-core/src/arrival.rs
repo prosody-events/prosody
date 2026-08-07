@@ -143,7 +143,8 @@ impl ArrivalFactor {
             exposure_micros,
             token,
         } = evidence;
-        let exposure = Duration::from_micros(exposure_micros).as_secs_f64();
+        let exposure_duration = Duration::from_micros(exposure_micros);
+        let exposure = exposure_duration.as_secs_f64();
         if exposure <= f64::EPSILON {
             drop(token);
             return;
@@ -151,7 +152,7 @@ impl ArrivalFactor {
         let exposure_micros = exposure_micros.min(now_micros);
         let evidence_start_micros = now_micros - exposure_micros;
         let missing_micros = evidence_start_micros.saturating_sub(self.last_evidence_micros);
-        self.propagate_missing(Duration::from_micros(missing_micros).as_secs_f64());
+        self.propagate_missing(Duration::from_micros(missing_micros));
         self.prepare_calendar(calendar, now_micros);
         if let Some(forecast) = calendar
             && calendar_segment_at(forecast.segments, now_micros).is_some()
@@ -162,13 +163,13 @@ impl ArrivalFactor {
             self.calendar_shape += f64::from(count);
             self.calendar_rate += exposure;
         }
-        self.update_local(count, exposure);
+        self.update_local(count, exposure_duration);
         self.last_evidence_micros = now_micros;
         drop(token);
     }
 
-    fn propagate_missing(&mut self, elapsed_seconds: f64) {
-        let transition = self.prior.change_kernel.probabilities(elapsed_seconds);
+    fn propagate_missing(&mut self, elapsed: Duration) {
+        let transition = self.prior.change_kernel.probabilities(elapsed);
         if transition.redrawn <= f64::EPSILON {
             return;
         }
@@ -218,8 +219,9 @@ impl ArrivalFactor {
         }
     }
 
-    fn update_local(&mut self, count: u32, exposure: f64) {
+    fn update_local(&mut self, count: u32, exposure: Duration) {
         let transition = self.prior.change_kernel.probabilities(exposure);
+        let exposure = exposure.as_secs_f64();
         let prior_mass =
             log_predictive_mass(self.prior.shape, self.prior.rate_seconds, count, exposure);
         let next_length = (self.length + 1).min(self.prior.run_length_max);
@@ -449,12 +451,11 @@ impl ArrivalFactor {
     }
 
     fn missing_change_probability(&self, now_micros: u64) -> f64 {
-        let elapsed_seconds =
-            Duration::from_micros(now_micros.saturating_sub(self.last_evidence_micros))
-                .as_secs_f64();
         self.prior
             .change_kernel
-            .probabilities(elapsed_seconds)
+            .probabilities(Duration::from_micros(
+                now_micros.saturating_sub(self.last_evidence_micros),
+            ))
             .redrawn
     }
 
