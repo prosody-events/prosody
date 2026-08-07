@@ -12,7 +12,7 @@ environment variables for unset fields, so you can mix both approaches.
 | `PROSODY_SUBSCRIBED_TOPICS` | Topics to read from                                | -            | ✓        |          |
 | `PROSODY_ALLOWED_EVENTS`    | Only process events matching these prefixes        | (all)        | ✓        |          |
 | `PROSODY_SOURCE_SYSTEM`     | Tag for outgoing messages (prevents reprocessing)  | `<group id>` |          | ✓        |
-| `PROSODY_SUBSYSTEM`         | This consumer's subsystem name — advertises published collections and is the name peer requests address | - | ✓ |          |
+| `PROSODY_SUBSYSTEM`         | This consumer's request and published-state subsystem | - | ✓ |          |
 | `PROSODY_MOCK`              | Use in-memory Kafka for testing                    | false        | ✓        | ✓        |
 | `PROSODY_LOG`               | Log level (e.g., `info`, `prosody=debug`)          | info         | ✓        | ✓        |
 
@@ -44,15 +44,15 @@ environment variables for unset fields, so you can mix both approaches.
 ## Peer Requests
 
 Peer settings have no environment variables. Set `ConsumerBuilders.peer` with
-`PeerConfiguration::builder()`. Leave it as `None` to disable the peer runtime.
+`PeerConfiguration::builder()`.
 
 The builder sets the listener address, frame size, connection limits, and
 route labels. It also sets directory leases, destination limits, request
 limits, response limits, and timeouts.
 
-Call `HighLevelClient::subscribe_responding` to answer requests for
-`PROSODY_SUBSYSTEM`. Call `HighLevelClient::subscribe` for a client that only
-sends requests. Both methods start the response listener.
+Set `PROSODY_SUBSYSTEM` to make the client answer requests for that subsystem.
+Without it, the client consumes messages but does not answer requests. A
+requestor can target one or more subsystems in either configuration.
 
 ## Retry
 

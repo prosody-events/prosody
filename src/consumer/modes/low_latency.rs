@@ -9,7 +9,7 @@
 use crate::consumer::config::{
     ConsumerSetup, LowLatencyMiddlewareConfiguration, TypedConsumerSetup,
 };
-use crate::consumer::error::{ConsumerError, PeerInitError};
+use crate::consumer::error::ConsumerError;
 use crate::consumer::kafka_context::PartitionProviders;
 use crate::consumer::middleware::retry::RetryMiddleware;
 use crate::consumer::middleware::topic::FailureTopicMiddleware;
@@ -23,6 +23,7 @@ use crate::high_level::config::TriggerStoreConfiguration;
 use crate::peer::{ConsumerRouter, NoPeer};
 use crate::producer::ProsodyProducer;
 use crate::state_reader::ConsumerReaderBackend;
+use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity, EventType};
 use std::sync::Arc;
@@ -99,7 +100,6 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`PeerInitError::SubsystemRequired`] without a subsystem name.
     /// Returns [`ConsumerError`] when another startup step fails.
     pub async fn low_latency_responding_consumer<T, R, RT: ConsumerRouter>(
         setup: ConsumerSetup<'_>,
@@ -108,6 +108,7 @@ where
         telemetry: Telemetry,
         handler: T,
         router: &RT,
+        subsystem: SubsystemName,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
@@ -130,6 +131,7 @@ where
                     telemetry,
                     handler,
                     router,
+                    subsystem,
                 )
                 .await
             }
@@ -146,6 +148,7 @@ where
                     telemetry,
                     handler,
                     router,
+                    subsystem,
                 )
                 .await
             }
@@ -211,6 +214,7 @@ where
         telemetry: Telemetry,
         handler: T,
         router: &RT,
+        subsystem: SubsystemName,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
@@ -237,10 +241,6 @@ where
         .layer(topic)
         .layer(retry);
         let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let subsystem = keyed_state
-            .subsystem()
-            .cloned()
-            .ok_or(PeerInitError::SubsystemRequired)?;
         let providers = PartitionProviders {
             triggers: components.trigger,
             state: components.state,

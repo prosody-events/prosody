@@ -23,7 +23,6 @@ use crate::state::production::{CassandraStateBackendFactory, MemoryStateBackendF
 use crate::state::publication::PublicationStore;
 use crate::state::registry::CollectionDefRegistry;
 use crate::state_reader::PartitionCount;
-use crate::subsystem::SubsystemName;
 use crate::timers::duration::CompactDuration;
 use crate::{ByteSize, Codec, ConsumerGroup, EventIdentity, EventType};
 use std::fs;
@@ -68,13 +67,6 @@ impl KeyedStateInputs {
             registry,
             mock: consumer_config.mock,
         })
-    }
-
-    /// The consumer's subsystem name, which is also the name peer requests
-    /// address it by. One source, so the decode path and the responder cannot
-    /// disagree about who this consumer answers for.
-    pub(in crate::consumer) fn subsystem(&self) -> Option<&SubsystemName> {
-        self.config.subsystem.as_ref()
     }
 
     /// Builds the per-partition keyed-state provider over a branch's

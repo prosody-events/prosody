@@ -2,16 +2,15 @@
 
 use crate::cassandra::config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError};
 use crate::consumer::MockConfigurationError;
-use crate::consumer::middleware::FallibleHandler;
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::state::ConsumerState;
 use crate::high_level::{
-    CassandraHighLevelClient, ClientBackend, ConsumerBuilders, HighLevelClient,
-    HighLevelClientError, MemoryHighLevelClient, Mode,
+    CassandraHighLevelClient, ClientBackend, ClientHandler, ConsumerBuilders, HighLevelClient,
+    HighLevelClientError, MemoryHighLevelClient, Mode, Wire, WireError,
 };
 use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder};
 use crate::state_reader::ConsumerReaderBackend;
-use crate::{Codec, EventIdentity, EventType, Topic};
+use crate::{EventIdentity, EventType, Topic};
 use async_trait::async_trait;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::error::Error as StdError;
@@ -54,21 +53,21 @@ pub struct ErasedConsumerConfiguration {
 ///
 /// Rust callers use [`HighLevelClient`] directly and pay no type-erasure cost.
 #[async_trait]
-pub trait ErasedHighLevelClient<T, C>: Send + Sync
+pub trait ErasedHighLevelClient<T>: Send + Sync
 where
-    C: Codec,
+    T: ClientHandler,
 {
     /// Sends one event.
     async fn send(
         &self,
         topic: Topic,
         key: String,
-        payload: C::Payload,
-    ) -> Result<(), HighLevelClientError<C::Error>>;
+        payload: T::Payload,
+    ) -> Result<(), HighLevelClientError<WireError<T>>>;
     /// Starts consuming.
-    async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>;
+    async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>>;
     /// Stops consuming.
-    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>>;
+    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<WireError<T>>>;
     /// Returns the current lifecycle state.
     async fn consumer_state(&self) -> ErasedConsumerState<T>;
     /// Builds a read-only view of one published value collection.
@@ -77,21 +76,21 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedValueReader<C>, ErasedReaderBuildError<C::Error>>;
+    ) -> Result<SharedValueReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>;
     /// Builds a read-only view of one published string-keyed map collection.
     async fn map_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<C>, ErasedReaderBuildError<C::Error>>;
+    ) -> Result<SharedMapReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>;
     /// Builds a read-only view of one published deque collection.
     async fn deque_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedDequeReader<C>, ErasedReaderBuildError<C::Error>>;
+    ) -> Result<SharedDequeReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>;
     /// Returns the assigned partition count.
     async fn assigned_partition_count(&self) -> u32;
     /// Reports whether any consumer heartbeat is stalled.
@@ -105,7 +104,7 @@ where
 }
 
 /// Shared erased client representation stored by native FFI wrappers.
-pub type SharedHighLevelClient<T, C> = Arc<dyn ErasedHighLevelClient<T, C>>;
+pub type SharedHighLevelClient<T> = Arc<dyn ErasedHighLevelClient<T>>;
 
 /// Constructs and erases the backend selected by an FFI configuration.
 ///
@@ -113,16 +112,17 @@ pub type SharedHighLevelClient<T, C> = Arc<dyn ErasedHighLevelClient<T, C>>;
 ///
 /// Backend selection and backend-specific configuration validation happen
 /// here so every foreign-language client follows the same construction path.
-pub async fn new_erased<T, C>(
+pub async fn new_erased<T>(
     mode: Mode,
     producer: &mut ProducerConfigurationBuilder,
     consumers: &ConsumerBuilders,
     cassandra: &CassandraConfigurationBuilder,
-) -> Result<SharedHighLevelClient<T, C>, ErasedClientBuildError<C::Error>>
+) -> Result<SharedHighLevelClient<T>, ErasedClientBuildError<WireError<T>>>
 where
-    T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-    C: Codec + Send + Sync,
-    C::Payload: EventIdentity + EventType + Clone,
+    T: ClientHandler + Clone + Send + Sync + 'static,
+    T::Payload: EventIdentity + EventType + Clone,
+    T::Output: Sync + 'static,
+    T::Error: Sync + 'static,
 {
     let mock = consumers.consumer.configured_mock()?;
 
@@ -138,35 +138,36 @@ where
     }
 }
 
-struct ErasedClient<T, C, B>(HighLevelClient<T, C, B>)
+struct ErasedClient<T, B>(HighLevelClient<T, B>)
 where
-    C: Codec,
-    C::Payload: EventIdentity,
-    B: ClientBackend<C>;
+    T: ClientHandler,
+    T::Payload: EventIdentity,
+    B: ClientBackend<Wire<T>>;
 
 #[async_trait]
-impl<T, C, B> ErasedHighLevelClient<T, C> for ErasedClient<T, C, B>
+impl<T, B> ErasedHighLevelClient<T> for ErasedClient<T, B>
 where
-    T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-    C: Codec + Send + Sync,
-    C::Payload: EventIdentity + EventType + Clone,
-    B: ClientBackend<C>,
-    B::Reader: ConsumerReaderBackend<C>,
+    T: ClientHandler + Clone + Send + Sync + 'static,
+    T::Payload: EventIdentity + EventType + Clone,
+    T::Output: Sync + 'static,
+    T::Error: Sync + 'static,
+    B: ClientBackend<Wire<T>>,
+    B::Reader: ConsumerReaderBackend<Wire<T>>,
 {
     async fn send(
         &self,
         topic: Topic,
         key: String,
-        payload: C::Payload,
-    ) -> Result<(), HighLevelClientError<C::Error>> {
+        payload: T::Payload,
+    ) -> Result<(), HighLevelClientError<WireError<T>>> {
         self.0.send(topic, &key, payload).await
     }
 
-    async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>> {
+    async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>> {
         self.0.subscribe_inner(handler).await
     }
 
-    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>> {
+    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<WireError<T>>> {
         self.0.unsubscribe().await
     }
 
@@ -189,7 +190,7 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedValueReader<C>, ErasedReaderBuildError<C::Error>> {
+    ) -> Result<SharedValueReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
         readers::value(&self.0, subsystem, &name, cache)
     }
 
@@ -198,7 +199,7 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<C>, ErasedReaderBuildError<C::Error>> {
+    ) -> Result<SharedMapReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
         readers::map(&self.0, subsystem, &name, cache)
     }
 
@@ -207,7 +208,7 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedDequeReader<C>, ErasedReaderBuildError<C::Error>> {
+    ) -> Result<SharedDequeReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
         readers::deque(&self.0, subsystem, &name, cache)
     }
 

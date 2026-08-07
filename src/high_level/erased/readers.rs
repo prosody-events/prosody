@@ -5,7 +5,9 @@ use crate::Key;
 use crate::codec::Codec;
 use crate::consumer::event_context::{BoxStateCursor, ErasedStateError, StateCursor};
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::high_level::{ClientBackend, HighLevelClient, HighLevelClientError};
+use crate::high_level::{
+    ClientBackend, ClientHandler, HighLevelClient, HighLevelClientError, Wire, WireError,
+};
 use crate::state::ReadCachePolicy;
 use crate::state::cell_key::Direction;
 use crate::state::descriptor::{
@@ -151,53 +153,53 @@ pub enum ErasedReaderBuildError<E> {
     Client(#[from] HighLevelClientError<E>),
 }
 
-pub(super) fn value<T, C, B>(
-    client: &HighLevelClient<T, C, B>,
+pub(super) fn value<T, B>(
+    client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
     cache: ErasedReadCache,
-) -> Result<SharedValueReader<C>, ErasedReaderBuildError<C::Error>>
+) -> Result<SharedValueReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>
 where
-    C: Codec + Send + Sync,
-    C::Payload: Clone + EventIdentity + Send + Sync + 'static,
-    B: ClientBackend<C>,
-    B::Reader: ConsumerReaderBackend<C>,
+    T: ClientHandler,
+    T::Payload: Clone + EventIdentity + Send + Sync + 'static,
+    B: ClientBackend<Wire<T>>,
+    B::Reader: ConsumerReaderBackend<Wire<T>>,
 {
-    let descriptor = value_state::<C>(name).read_cache(cache);
+    let descriptor = value_state::<Wire<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor)?;
     Ok(Arc::new(ValueReader(reader)))
 }
 
-pub(super) fn map<T, C, B>(
-    client: &HighLevelClient<T, C, B>,
+pub(super) fn map<T, B>(
+    client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
     cache: ErasedReadCache,
-) -> Result<SharedMapReader<C>, ErasedReaderBuildError<C::Error>>
+) -> Result<SharedMapReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>
 where
-    C: Codec + Send + Sync,
-    C::Payload: Clone + EventIdentity + Send + Sync + 'static,
-    B: ClientBackend<C>,
-    B::Reader: ConsumerReaderBackend<C>,
+    T: ClientHandler,
+    T::Payload: Clone + EventIdentity + Send + Sync + 'static,
+    B: ClientBackend<Wire<T>>,
+    B::Reader: ConsumerReaderBackend<Wire<T>>,
 {
-    let descriptor = map_state::<Utf8KeyCodec, C>(name).read_cache(cache);
+    let descriptor = map_state::<Utf8KeyCodec, Wire<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor)?;
     Ok(Arc::new(MapReader(reader)))
 }
 
-pub(super) fn deque<T, C, B>(
-    client: &HighLevelClient<T, C, B>,
+pub(super) fn deque<T, B>(
+    client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
     cache: ErasedReadCache,
-) -> Result<SharedDequeReader<C>, ErasedReaderBuildError<C::Error>>
+) -> Result<SharedDequeReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>
 where
-    C: Codec + Send + Sync,
-    C::Payload: Clone + EventIdentity + Send + Sync + 'static,
-    B: ClientBackend<C>,
-    B::Reader: ConsumerReaderBackend<C>,
+    T: ClientHandler,
+    T::Payload: Clone + EventIdentity + Send + Sync + 'static,
+    B: ClientBackend<Wire<T>>,
+    B::Reader: ConsumerReaderBackend<Wire<T>>,
 {
-    let descriptor = deque_state::<C>(name).read_cache(cache);
+    let descriptor = deque_state::<Wire<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor)?;
     Ok(Arc::new(DequeReader(reader)))
 }

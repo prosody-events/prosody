@@ -15,11 +15,12 @@
 #![recursion_limit = "256"]
 
 use color_eyre::eyre::{Result, eyre};
+use prosody::Topic;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
+use prosody::codec::JsonCodec;
 use prosody::high_level::CassandraHighLevelClient;
 use prosody::prelude::*;
 use prosody::timers::duration::CompactDuration;
-use prosody::{JsonCodec, Topic};
 use serde_json::json;
 use std::convert::Infallible;
 use tokio::sync::mpsc::{Sender, channel};
@@ -81,6 +82,10 @@ impl FallibleHandler for AmbientProbe {
     async fn shutdown(self) {}
 }
 
+impl ClientHandler for AmbientProbe {
+    type Codecs = Codecs<JsonCodec, UnitCodec, InfallibleCodec>;
+}
+
 #[tokio::test]
 async fn handlers_run_inside_their_event_spans() -> Result<()> {
     set_global_default(tracing_subscriber::registry())?;
@@ -120,7 +125,7 @@ async fn handlers_run_inside_their_event_spans() -> Result<()> {
     };
 
     let (sender, mut receiver) = channel(4);
-    let client = CassandraHighLevelClient::<AmbientProbe, JsonCodec>::new(
+    let client = CassandraHighLevelClient::<AmbientProbe>::new(
         cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,

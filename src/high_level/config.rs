@@ -71,13 +71,11 @@ pub struct ConsumerBuilders {
 }
 
 impl ConsumerBuilders {
-    /// Every builder at its default, with the keyed-state section resolved from
-    /// the environment.
+    /// Creates every builder at its default.
     ///
-    /// Fallible only because that section reads environment overrides: an
-    /// override the operator supplied but got wrong fails here instead of being
-    /// replaced by a default. A `Default` impl could not report that, so there
-    /// is none.
+    /// Construction reads keyed-state environment overrides. An invalid
+    /// override returns an error instead of a default. Therefore, this type
+    /// has no `Default` implementation.
     ///
     /// # Errors
     ///

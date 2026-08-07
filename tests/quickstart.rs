@@ -10,11 +10,12 @@
 #![recursion_limit = "256"]
 
 use color_eyre::eyre::{Result, eyre};
+use prosody::Topic;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
+use prosody::codec::JsonCodec;
 use prosody::high_level::CassandraHighLevelClient;
 use prosody::prelude::*;
 use prosody::tracing::init_test_logging;
-use prosody::{JsonCodec, Topic};
 use serde_json::json;
 use std::convert::Infallible;
 use tokio::sync::mpsc::{Sender, channel};
@@ -59,6 +60,10 @@ impl FallibleHandler for MyHandler {
     async fn shutdown(self) {}
 }
 
+impl ClientHandler for MyHandler {
+    type Codecs = Codecs<JsonCodec, UnitCodec, InfallibleCodec>;
+}
+
 #[tokio::test]
 async fn quickstart() -> Result<()> {
     init_test_logging();
@@ -99,7 +104,7 @@ async fn quickstart() -> Result<()> {
 
     let (sender, mut receiver) = channel(1);
 
-    let client = CassandraHighLevelClient::<MyHandler, JsonCodec>::new(
+    let client = CassandraHighLevelClient::<MyHandler>::new(
         cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,

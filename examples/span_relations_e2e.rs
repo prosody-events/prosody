@@ -160,6 +160,10 @@ impl FallibleHandler for SpanProbe {
     async fn shutdown(self) {}
 }
 
+impl ClientHandler for SpanProbe {
+    type Codecs = Codecs<JsonCodec, UnitCodec, InfallibleCodec>;
+}
+
 /// Per-key trace/span ids and thread spreads for the sched and disp phases.
 type ProbeEvents = (
     BTreeMap<String, String>,
@@ -255,7 +259,7 @@ async fn main() -> Result<()> {
     };
 
     let (sender, mut receiver) = channel(keys * 2 + 4);
-    let client = CassandraHighLevelClient::<SpanProbe, JsonCodec>::new(
+    let client = CassandraHighLevelClient::<SpanProbe>::new(
         cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,

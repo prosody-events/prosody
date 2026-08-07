@@ -5,7 +5,7 @@ use crate::consumer::config::{
     CommonConfiguration, ConsumerConfiguration, ConsumerSetup, PipelineMiddlewareConfiguration,
     TypedConsumerSetup,
 };
-use crate::consumer::error::{ConsumerError, PeerInitError};
+use crate::consumer::error::ConsumerError;
 use crate::consumer::kafka_context::PartitionProviders;
 use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
 use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
@@ -46,7 +46,13 @@ struct PipelineMiddlewareStack {
     heartbeats: HeartbeatRegistry,
     telemetry: Telemetry,
     observer: KafkaObserver,
-    subsystem: Option<SubsystemName>,
+}
+
+/// Groups the response route to keep consumer construction within seven
+/// arguments.
+struct ResponseTarget<'a, R> {
+    router: &'a R,
+    subsystem: SubsystemName,
 }
 
 impl PipelineMiddlewareStack {
@@ -135,7 +141,7 @@ impl PipelineMiddlewareStack {
         dedup_provider: DP,
         partition_providers: PartitionProviders<PP, SP>,
         handler: T,
-        router: &RT,
+        response: ResponseTarget<'_, RT>,
     ) -> Result<ProsodyConsumer<C>, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
@@ -173,10 +179,6 @@ impl PipelineMiddlewareStack {
             .layer(message_defer_middleware)
             .layer(self.retry_middleware);
         let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let subsystem = self
-            .subsystem
-            .clone()
-            .ok_or(PeerInitError::SubsystemRequired)?;
         let services = StartupServices {
             version,
             telemetry: &self.telemetry,
@@ -186,7 +188,7 @@ impl PipelineMiddlewareStack {
         };
         // Preparation is the last fallible step of this mode, and no `?` runs
         // between it and the termination below.
-        let prepared = router.responder::<R>(subsystem)?;
+        let prepared = response.router.responder::<R>(response.subsystem)?;
         let (provider, resources) = prepared.terminate(&middleware, handler);
         Box::pin(initialize_consumer::<_, _, _, C, _>(
             &self.consumer_config,
@@ -266,7 +268,6 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`PeerInitError::SubsystemRequired`] without a subsystem name.
     /// Returns [`ConsumerError`] when another startup step fails.
     pub async fn pipeline_responding_consumer<T, R, RT: ConsumerRouter>(
         setup: ConsumerSetup<'_>,
@@ -274,6 +275,7 @@ where
         telemetry: Telemetry,
         handler: T,
         router: &RT,
+        subsystem: SubsystemName,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity,
@@ -295,6 +297,7 @@ where
                     telemetry,
                     handler,
                     router,
+                    subsystem,
                 )
                 .await
             }
@@ -310,6 +313,7 @@ where
                     telemetry,
                     handler,
                     router,
+                    subsystem,
                 )
                 .await
             }
@@ -333,7 +337,7 @@ where
             monopolization,
             defer,
         } = pipeline_config;
-        let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
+        let (components, _keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
         let failure_tracker = FailureTracker::new(
             defer.failure_window,
             defer.failure_threshold,
@@ -350,7 +354,6 @@ where
             heartbeats,
             telemetry,
             observer,
-            subsystem: keyed_state.subsystem().cloned(),
         };
         let message_defer = MessageDeferMiddleware::new(
             defer,
@@ -381,6 +384,7 @@ where
         telemetry: Telemetry,
         handler: T,
         router: &RT,
+        subsystem: SubsystemName,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
@@ -395,7 +399,7 @@ where
             monopolization,
             defer,
         } = pipeline_config;
-        let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
+        let (components, _keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
         let failure_tracker = FailureTracker::new(
             defer.failure_window,
             defer.failure_threshold,
@@ -412,7 +416,6 @@ where
             heartbeats,
             telemetry,
             observer,
-            subsystem: keyed_state.subsystem().cloned(),
         };
         let message_defer = MessageDeferMiddleware::new(
             defer,
@@ -433,7 +436,7 @@ where
                     state: components.state,
                 },
                 handler,
-                router,
+                ResponseTarget { router, subsystem },
             )
             .await
     }

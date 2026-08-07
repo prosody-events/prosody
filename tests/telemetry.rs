@@ -5,16 +5,18 @@
 //! are serialized to JSON and produced to a dedicated Kafka telemetry topic.
 
 use color_eyre::eyre::{Result, ensure, eyre};
+use prosody::JsonCodec;
 use prosody::Topic;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use prosody::cassandra::config::CassandraConfigurationBuilder;
+use prosody::codec::UnitCodec;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
 use prosody::consumer::middleware::FallibleHandler;
 use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
 use prosody::consumer::{ConsumerConfigurationBuilder, DemandType, Keyed};
 use prosody::high_level::mode::Mode;
-use prosody::high_level::{CassandraHighLevelClient, ConsumerBuilders};
+use prosody::high_level::{CassandraHighLevelClient, ClientHandler, Codecs, ConsumerBuilders};
 use prosody::producer::ProducerConfigurationBuilder;
 use prosody::telemetry::TelemetryEmitterConfiguration;
 use prosody::timers::TimerType;
@@ -418,6 +420,26 @@ impl FallibleHandler for TransientTimerHandler {
     async fn shutdown(self) {}
 }
 
+macro_rules! impl_client_handlers {
+    ($codec:ty => $($handler:ty),+ $(,)?) => {
+        $(
+            impl ClientHandler for $handler {
+                type Codecs = Codecs<JsonCodec, UnitCodec, $codec>;
+            }
+        )+
+    };
+}
+
+impl_client_handlers!(
+    TestError =>
+        FailingHandler,
+        TimerSchedulingHandler,
+        TimerFailingHandler,
+        TimerCancellingHandler,
+        ClearAndScheduleHandler,
+);
+impl_client_handlers!(TransientError => TransientMessageHandler, TransientTimerHandler);
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn bootstrap_servers() -> Vec<String> {
@@ -777,7 +799,7 @@ async fn assert_no_telemetry_events(consumer: &StreamConsumer, wait: Duration) -
 }
 
 /// Build a `HighLevelClient` in the given mode with a custom telemetry topic.
-async fn build_client_with<T: FallibleHandler>(
+async fn build_client_with<T: ClientHandler<Payload = Value>>(
     mode: Mode,
     source_topic: &str,
     telemetry_topic: &str,
@@ -835,7 +857,7 @@ async fn build_client(
     .await
 }
 
-async fn build_typed_client<T: FallibleHandler>(
+async fn build_typed_client<T: ClientHandler<Payload = Value>>(
     source_topic: &str,
     telemetry_topic: &str,
 ) -> Result<CassandraHighLevelClient<T>> {
@@ -849,7 +871,7 @@ async fn build_typed_client<T: FallibleHandler>(
     .await
 }
 
-async fn build_typed_client_with_defer<T: FallibleHandler>(
+async fn build_typed_client_with_defer<T: ClientHandler<Payload = Value>>(
     source_topic: &str,
     telemetry_topic: &str,
     defer: DeferConfigurationBuilder,
@@ -1271,7 +1293,7 @@ async fn timer_failed_event_on_kafka() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deferred_message_timer_three_event_invariant() -> Result<()> {
-    timeout(DEFER_TEST_TIMEOUT, async {
+    Box::pin(timeout(DEFER_TEST_TIMEOUT, async {
         init_test_logging();
 
         let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
@@ -1325,14 +1347,14 @@ async fn deferred_message_timer_three_event_invariant() -> Result<()> {
         admin.delete_topic(&source_topic).await?;
         admin.delete_topic(&telemetry_topic).await?;
         Ok(())
-    })
+    }))
     .await
     .map_err(|_| eyre!("test timed out after {DEFER_TEST_TIMEOUT:?}"))?
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
-    timeout(DEFER_TEST_TIMEOUT, async {
+    Box::pin(timeout(DEFER_TEST_TIMEOUT, async {
         init_test_logging();
 
         let (admin, telemetry_topic, source_topic) = create_telemetry_topics().await?;
@@ -1393,7 +1415,7 @@ async fn deferred_timer_timer_three_event_invariant() -> Result<()> {
         admin.delete_topic(&source_topic).await?;
         admin.delete_topic(&telemetry_topic).await?;
         Ok(())
-    })
+    }))
     .await
     .map_err(|_| eyre!("test timed out after {DEFER_TEST_TIMEOUT:?}"))?
 }

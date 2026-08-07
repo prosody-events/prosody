@@ -10,13 +10,15 @@
 use ahash::HashSet;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::config::CassandraConfigurationBuilder;
+use prosody::codec::UnitCodec;
 use prosody::consumer::event_context::EventContext;
 use prosody::high_level::mode::Mode;
-use prosody::high_level::{CassandraHighLevelClient, ConsumerBuilders};
+use prosody::high_level::{CassandraHighLevelClient, ClientHandler, Codecs, ConsumerBuilders};
 use prosody::producer::ProducerConfigurationBuilder;
 use prosody::telemetry::TelemetryEmitterConfiguration;
 use prosody::tracing::init_test_logging;
 use prosody::{
+    JsonCodec,
     consumer::ConsumerConfigurationBuilder,
     consumer::message::{ConsumerMessage, UncommittedMessage},
     consumer::middleware::{CloneProvider, FallibleHandler},
@@ -255,6 +257,10 @@ impl FallibleHandler for InlineReplacementHandler {
     }
 
     async fn shutdown(self) {}
+}
+
+impl ClientHandler for InlineReplacementHandler {
+    type Codecs = Codecs<JsonCodec, UnitCodec, TestError>;
 }
 
 /// Test environment wrapping [`ConsumerEnv`] with the timer handler's event

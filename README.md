@@ -109,6 +109,10 @@ impl FallibleHandler for MyHandler {
     async fn shutdown(self) {}
 }
 
+impl ClientHandler for MyHandler {
+    type Codecs = Codecs<JsonCodec, UnitCodec, InfallibleCodec>;
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_servers = vec!["localhost:9094".to_owned()];
@@ -129,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_config,
-        ..ConsumerBuilders::default()
+        ..ConsumerBuilders::new()?
     };
 
     let client: CassandraHighLevelClient<MyHandler> = CassandraHighLevelClient::new(
@@ -137,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-    )?;
+    ).await?;
 
     client.subscribe(MyHandler).await?;
 

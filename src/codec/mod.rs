@@ -14,7 +14,10 @@ pub use binary::{
     JsonBinaryCodec, JsonExtractError, JsonExtractor, JsonFormat, JsonPassthroughStateCodec,
     NoopExtractor,
 };
-pub use fixed::{FixedCodec, I64Codec, I64CodecError, PairCodecError};
+pub use fixed::{
+    FixedCodec, I64Codec, I64CodecError, InfallibleCodec, InfallibleCodecError, PairCodecError,
+    UnitCodec, UnitCodecError,
+};
 pub use json::{JsonCodec, JsonCodecError, serialize_to_json};
 pub use response::{ResultCodec, ResultCodecError};
 

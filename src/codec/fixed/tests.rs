@@ -4,6 +4,23 @@
 use super::*;
 use quickcheck::{QuickCheck, TestResult};
 
+#[test]
+fn zero_sized_codecs_accept_only_valid_payloads() -> color_eyre::Result<()> {
+    let mut codec = UnitCodec;
+    let mut encoded = Vec::new();
+    codec.serialize((), &mut encoded)?;
+    assert!(encoded.is_empty());
+    assert_eq!(codec.deserialize(&mut encoded)?, ());
+    assert_eq!(
+        codec.deserialize(&mut [1]),
+        Err(UnitCodecError { actual: 1 })
+    );
+    let mut codec = InfallibleCodec;
+    assert_eq!(codec.deserialize(&mut []), Err(InfallibleCodecError));
+    assert_eq!(codec.deserialize(&mut [1]), Err(InfallibleCodecError));
+    Ok(())
+}
+
 /// The composed [`Codec::FORMAT_ID`] is `"(a,b)"` from the components' ids, and
 /// the composed width is the sum — both derived at compile time.
 #[test]

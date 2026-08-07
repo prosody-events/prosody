@@ -5,7 +5,6 @@ use super::{
     peer_config, recording_memory_deps,
 };
 use crate::codec::Codec;
-use crate::consumer::error::{ConsumerError, PeerInitError};
 use crate::consumer::middleware::HandlerMiddleware;
 use crate::consumer::middleware::deduplication::MemoryDeduplicationStoreProvider;
 use crate::consumer::middleware::defer::DeferConfiguration;
@@ -23,12 +22,11 @@ use crate::high_level::config::TriggerStoreConfiguration;
 use crate::peer::ConsumerResources;
 use crate::peer::runtime::prepare_router;
 use crate::response::frame::FrameCap;
-use crate::state_reader::StateReaderDependencies;
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::{JsonCodec, PeerConfiguration};
 use color_eyre::Result;
-use color_eyre::eyre::{bail, ensure, eyre};
+use color_eyre::eyre::{bail, ensure};
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -149,12 +147,12 @@ async fn the_prepared_responder_is_sized_by_the_runtimes_frame_cap() -> Result<(
 /// tail takes its provider from `PreparedResponder::terminate`, and that
 /// return type puts the responder inside every layer a mode adds.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_responding_consumer_starts_and_stops() -> Result<()> {
+async fn an_explicit_response_subsystem_needs_no_keyed_state_subsystem() -> Result<()> {
     let log: EventLog = Arc::new(Mutex::new(Vec::new()));
     let directory = RecordingDirectory::new(Arc::clone(&log), false);
     let consumer_config = consumer_config("responding-wiring-start")?;
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let common = common_config(Some(SubsystemName::try_new(SUBSYSTEM)?))?;
+    let common = common_config(None)?;
     let trigger_store = TriggerStoreConfiguration::InMemory;
     let setup = ConsumerSetup {
         consumer: &consumer_config,
@@ -181,6 +179,7 @@ async fn a_responding_consumer_starts_and_stops() -> Result<()> {
         Telemetry::new(),
         ScriptedHandler::success(),
         &router,
+        SubsystemName::try_new(SUBSYSTEM)?,
     )
     .await?;
     let outcome: Result<()> = async {
@@ -196,67 +195,6 @@ async fn a_responding_consumer_starts_and_stops() -> Result<()> {
     consumer.shutdown().await?;
     router_owner.shutdown().await?;
     outcome
-}
-
-#[tokio::test]
-async fn a_responding_consumer_without_a_subsystem_is_refused() -> Result<()> {
-    let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-    let error = refused_consumer(peer, None)
-        .await?
-        .ok_or_else(|| eyre!("the responding consumer started without a subsystem"))?;
-    assert!(matches!(
-        error,
-        ConsumerError::Peer(PeerInitError::SubsystemRequired)
-    ));
-    Ok(())
-}
-
-async fn refused_consumer(
-    peer: PeerConfiguration,
-    subsystem: Option<SubsystemName>,
-) -> Result<Option<ConsumerError>> {
-    let consumer_config = consumer_config("responding-wiring-refused")?;
-    let common = common_config(subsystem)?;
-    let trigger_store = TriggerStoreConfiguration::InMemory;
-    let setup = ConsumerSetup {
-        consumer: &consumer_config,
-        trigger_store: &trigger_store,
-        common: &common,
-    };
-    let deps: StateReaderDependencies<JsonCodec, _> = memory_deps(&setup);
-    let router = prepare_router(&peer, deps.backend().as_ref()).await?;
-    let (_, router, router_owner) = router.into_parts();
-    let result = ProsodyConsumer::<JsonCodec>::pipeline_responding_consumer_with_backend::<
-        ScriptedHandler,
-        SomeResponseCodec,
-        _,
-        _,
-    >(
-        TypedConsumerSetup {
-            consumer: &consumer_config,
-            common: &common,
-            deps,
-        },
-        pipeline_config()?,
-        Telemetry::new(),
-        ScriptedHandler::success(),
-        &router,
-    )
-    .await;
-    match result {
-        Ok(consumer) => {
-            let shutdown = consumer.shutdown().await;
-            if let Err(error) = shutdown {
-                bail!("unexpected consumer shutdown failed: {error}");
-            }
-            router_owner.shutdown().await?;
-            Ok(None)
-        }
-        Err(error) => {
-            router_owner.shutdown().await?;
-            Ok(Some(error))
-        }
-    }
 }
 
 fn pipeline_config() -> Result<PipelineMiddlewareConfiguration> {

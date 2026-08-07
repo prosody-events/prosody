@@ -14,12 +14,8 @@ use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     cassandra::config::CassandraConfigurationBuilder,
-    codec::JsonCodecError,
-    consumer::{ConsumerConfigurationBuilder, ConsumerError},
-    high_level::{
-        CassandraHighLevelClient, ConsumerBuilders, HighLevelClientError,
-        config::ModeConfigurationError, mode::Mode,
-    },
+    consumer::ConsumerConfigurationBuilder,
+    high_level::{CassandraHighLevelClient, ConsumerBuilders, mode::Mode},
     producer::ProducerConfigurationBuilder,
     telemetry::emitter::TelemetryEmitterConfiguration,
 };
@@ -89,7 +85,7 @@ async fn create_test_topics(
 async fn create_high_level_client(
     regex_pattern: String,
     consumer_group: String,
-) -> Result<CassandraHighLevelClient<FallibleTestHandler>, HighLevelClientError<JsonCodecError>> {
+) -> Result<CassandraHighLevelClient<FallibleTestHandler>> {
     let bootstrap = vec![BOOTSTRAP_SERVER.to_owned()];
 
     let mut producer_builder = ProducerConfigurationBuilder::default();
@@ -110,20 +106,18 @@ async fn create_high_level_client(
             enabled: false,
             ..Default::default()
         },
-        ..ConsumerBuilders::new().map_err(ConsumerError::from)?
+        ..ConsumerBuilders::new()?
     };
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
 
-    CassandraHighLevelClient::new(
-        cassandra_builder.build().map_err(|error| {
-            HighLevelClientError::ConsumerConfiguration(ModeConfigurationError::Cassandra(error))
-        })?,
+    Ok(CassandraHighLevelClient::new(
+        cassandra_builder.build()?,
         Mode::BestEffort,
         &mut producer_builder,
         &consumer_builders,
     )
-    .await
+    .await?)
 }
 
 /// Sends test messages to all topics and returns expected matching count.

@@ -10,6 +10,7 @@
 
 use crate::codec::Codec;
 use crate::codec::const_id::ConstId;
+use std::convert::Infallible;
 use std::error::Error;
 use thiserror::Error;
 
@@ -26,6 +27,56 @@ use thiserror::Error;
 pub trait FixedCodec: Codec {
     /// The exact byte width of this codec's wire form.
     const WIDTH: usize;
+}
+
+/// Codec for an empty success value.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnitCodec;
+
+impl Codec for UnitCodec {
+    type Error = UnitCodecError;
+    type Payload = ();
+
+    const FORMAT_ID: &'static str = "unit";
+
+    fn deserialize(&mut self, buf: &mut [u8]) -> Result<(), UnitCodecError> {
+        if buf.is_empty() {
+            Ok(())
+        } else {
+            Err(UnitCodecError { actual: buf.len() })
+        }
+    }
+
+    fn serialize(&mut self, (): (), _buf: &mut Vec<u8>) -> Result<(), UnitCodecError> {
+        Ok(())
+    }
+}
+
+impl FixedCodec for UnitCodec {
+    const WIDTH: usize = 0;
+}
+
+/// Codec for an error type that has no values.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InfallibleCodec;
+
+impl Codec for InfallibleCodec {
+    type Error = InfallibleCodecError;
+    type Payload = Infallible;
+
+    const FORMAT_ID: &'static str = "infallible";
+
+    fn deserialize(&mut self, _buf: &mut [u8]) -> Result<Infallible, InfallibleCodecError> {
+        Err(InfallibleCodecError)
+    }
+
+    fn serialize(
+        &mut self,
+        value: Infallible,
+        _buf: &mut Vec<u8>,
+    ) -> Result<(), InfallibleCodecError> {
+        match value {}
+    }
 }
 
 /// Plain big-endian `i64` payload codec (8 bytes).
@@ -147,6 +198,19 @@ pub struct I64CodecError {
     /// The width the cell actually had.
     pub actual: usize,
 }
+
+/// Error from a [`UnitCodec`] buffer that contains bytes.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("bad unit codec width: expected 0, got {actual}")]
+pub struct UnitCodecError {
+    /// The unexpected byte count.
+    pub actual: usize,
+}
+
+/// Error from an attempt to decode an [`Infallible`] value.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("an infallible value has no wire representation")]
+pub struct InfallibleCodecError;
 
 #[cfg(test)]
 mod tests;

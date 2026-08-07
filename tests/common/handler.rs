@@ -4,11 +4,14 @@
 //! Specialized handlers — error injection, timer scheduling, context capture —
 //! stay local to the test file that needs them.
 
+use prosody::JsonCodec;
+use prosody::codec::{Codec, UnitCodec, UnitCodecError};
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
 use prosody::consumer::middleware::FallibleHandler;
 use prosody::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use prosody::error::{ClassifyError, ErrorCategory};
+use prosody::high_level::{ClientHandler, Codecs};
 use prosody::timers::{Trigger, UncommittedTimer};
 use serde_json::Value;
 use std::time::Duration as StdDuration;
@@ -87,7 +90,7 @@ impl EventHandler for ChannelHandler {
 }
 
 /// A handler error that classifies [`ErrorCategory::Permanent`].
-#[derive(Clone, Debug, Error)]
+#[derive(Clone, Debug, Default, Error)]
 #[error("test error")]
 pub(crate) struct TestError;
 
@@ -98,7 +101,7 @@ impl ClassifyError for TestError {
 }
 
 /// A handler error that classifies [`ErrorCategory::Transient`].
-#[derive(Clone, Debug, Error)]
+#[derive(Clone, Debug, Default, Error)]
 #[error("transient test error")]
 pub(crate) struct TransientError;
 
@@ -107,6 +110,32 @@ impl ClassifyError for TransientError {
         ErrorCategory::Transient
     }
 }
+
+macro_rules! unit_error_codec {
+    ($error:ident, $format:literal) => {
+        impl Codec for $error {
+            type Error = UnitCodecError;
+            type Payload = $error;
+
+            const FORMAT_ID: &'static str = $format;
+
+            fn deserialize(&mut self, buf: &mut [u8]) -> Result<$error, UnitCodecError> {
+                UnitCodec.deserialize(buf).map(|()| $error)
+            }
+
+            fn serialize(
+                &mut self,
+                _payload: $error,
+                _buf: &mut Vec<u8>,
+            ) -> Result<(), UnitCodecError> {
+                Ok(())
+            }
+        }
+    };
+}
+
+unit_error_codec!(TestError, "test-permanent-error");
+unit_error_codec!(TransientError, "test-transient-error");
 
 /// A [`FallibleHandler`] that forwards every message to a channel.
 ///
@@ -155,4 +184,8 @@ impl FallibleHandler for FallibleTestHandler {
     }
 
     async fn shutdown(self) {}
+}
+
+impl ClientHandler for FallibleTestHandler {
+    type Codecs = Codecs<JsonCodec, UnitCodec, TestError>;
 }
