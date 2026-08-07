@@ -1,13 +1,15 @@
 //! Concrete router types selected by client backends.
 
 use super::PeerConfiguration;
+use super::backend::prepare_cassandra;
 use super::runtime::{
     ConsumerHandle, PeerRouter, ProducerHandle, RespondingLeaf, RespondingPeer, RouterOwner,
-    prepare_router, start_local_router,
+    prepare_router, start_local_router, start_router,
 };
 use crate::Codec;
-use crate::consumer::ConsumerError;
+use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
+use crate::consumer::{ConsumerError, PeerInitError};
 use crate::response::frame::FrameHeader;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::sender::{DropReason, ResponseRoute, RouteOutcome, Then};
@@ -94,6 +96,30 @@ impl LocalRouter {
 }
 
 impl GrpcRouter {
+    /// Starts a local-first gRPC router with its own Cassandra session.
+    ///
+    /// Use this constructor for a standalone producer or consumer. A combined
+    /// high-level client shares its existing Cassandra session instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Cassandra, peer configuration, or the listener
+    /// cannot start.
+    pub async fn new(
+        config: &PeerConfiguration,
+        cassandra: &CassandraConfiguration,
+    ) -> Result<Self, ConsumerError> {
+        let store =
+            CassandraStore::new(cassandra)
+                .await
+                .map_err(|error| PeerInitError::Directory {
+                    message: format!("{error:#}"),
+                })?;
+        Ok(Self {
+            inner: start_router(prepare_cassandra(config, store).await?).await?,
+        })
+    }
+
     pub(crate) async fn start<C: Codec>(
         config: &PeerConfiguration,
         backend: &CassandraReaderBackend<C>,
@@ -180,8 +206,8 @@ where
     C: Codec<Payload = Result<H::Output, H::Error>>,
     M: HandlerMiddleware<H::Payload>,
     H: FallibleHandler + Clone + Send + Sync + 'static,
-    H::Output: Sync + 'static,
-    H::Error: Sync + 'static,
+    H::Output: Clone + Sync + 'static,
+    H::Error: Clone + Sync + 'static,
 {
     router
         .handle()

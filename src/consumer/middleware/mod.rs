@@ -444,13 +444,6 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
 ///    On a skip path (the inner did not run), suppress both apply hooks
 ///    on the inner — there's no invocation to pair them with.
 ///
-/// A consumer that answers peer requests holds one exception to that rule. The
-/// response payload is the handler's own final `Result`, so answering moves
-/// that value out. A record that carried a request tag and was answered
-/// therefore fires no [`after_commit`](FallibleHandler::after_commit) on the
-/// handler. Every other record, and every record whose answer could not be
-/// queued, fires the hook as usual.
-///
 /// The blanket `FallibleEventHandler → EventHandler` impl is the default
 /// durability boundary for handlers without rescue middleware: each
 /// invocation maps 1:1 to a single dispatch, and resolving the marker

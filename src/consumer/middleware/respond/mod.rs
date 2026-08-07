@@ -101,10 +101,8 @@ pub(crate) struct Responded<T> {
 
 /// Wraps one handler and moves its final message result to a responder.
 ///
-/// The bounds this layer's [`FallibleHandler`] impl carries narrow the handlers
-/// it accepts. The codec's payload is the handler's own `Result`, and a
-/// [`Codec::Payload`] must be `Send + Sync + 'static`. So both halves of that
-/// result need `Sync + 'static`, which a bare `FallibleHandler` does not.
+/// Response-capable handlers clone each final result once. The response owns
+/// one copy, and the handler's apply hook owns the other copy.
 pub(crate) struct RespondHandler<H, C: Codec, R: ResponseRoute> {
     handler: H,
     responder: Arc<Responder<C, R>>,
@@ -159,8 +157,8 @@ impl<E: ClassifyError> ClassifyError for Responded<E> {
 impl<H, C, R> FallibleHandler for RespondHandler<H, C, R>
 where
     H: FallibleHandler,
-    H::Output: Sync + 'static,
-    H::Error: Sync + 'static,
+    H::Output: Clone + Sync + 'static,
+    H::Error: Clone + Sync + 'static,
     C: Codec<Payload = Result<H::Output, H::Error>>,
     R: ResponseRoute,
 {
@@ -218,11 +216,8 @@ where
 
     /// Sends a requested response after a final invocation.
     ///
-    /// When the sender takes the result, the inner hook does not run. The
-    /// response becomes the disposition of that value.
-    ///
-    /// The response becomes the disposition of the value. Thus, this method
-    /// does not call the inner hook.
+    /// The handler's hook runs before response delivery. Thus, the response
+    /// cannot report completion before the handler applies its final result.
     async fn after_commit<C2>(&self, context: C2, result: Result<Self::Output, Self::Error>)
     where
         C2: EventContext<Payload = Self::Payload>,
@@ -234,8 +229,10 @@ where
         let Some(Answering { tag, trace }) = meta else {
             return self.handler.after_commit(context, result).await;
         };
-        let header = tag.header(self.responder.subsystem().clone(), status(&result));
-        self.responder.sender.send(header, trace, result).await;
+        let response = result.clone();
+        let header = tag.header(self.responder.subsystem().clone(), status(&response));
+        self.handler.after_commit(context, result).await;
+        self.responder.sender.send(header, trace, response).await;
     }
 
     /// Forwards a non-final invocation's result to the inner hook.
@@ -262,8 +259,8 @@ where
 impl<H, C, R> SettlementHandler for RespondHandler<H, C, R>
 where
     H: SettlementHandler,
-    H::Output: Sync + 'static,
-    H::Error: Sync + 'static,
+    H::Output: Clone + Sync + 'static,
+    H::Error: Clone + Sync + 'static,
     C: Codec<Payload = Result<H::Output, H::Error>>,
     R: ResponseRoute,
 {
@@ -302,8 +299,8 @@ pub(crate) fn responding_provider<M, H, C, R>(
 where
     M: HandlerMiddleware<H::Payload>,
     H: FallibleHandler + Clone + Send + Sync + 'static,
-    H::Output: Sync + 'static,
-    H::Error: Sync + 'static,
+    H::Output: Clone + Sync + 'static,
+    H::Error: Clone + Sync + 'static,
     C: Codec<Payload = Result<H::Output, H::Error>>,
     R: ResponseRoute,
 {

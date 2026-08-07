@@ -163,8 +163,8 @@ impl<R: ResponseRoute> ConsumerHandle<R> {
         C: Codec<Payload = Result<H::Output, H::Error>>,
         M: HandlerMiddleware<H::Payload>,
         H: FallibleHandler + Clone + Send + Sync + 'static,
-        H::Output: Sync + 'static,
-        H::Error: Sync + 'static,
+        H::Output: Clone + Sync + 'static,
+        H::Error: Clone + Sync + 'static,
     {
         let responder = Arc::new(self.responses.responder(subsystem.clone()));
         (
@@ -381,7 +381,7 @@ pub(crate) async fn start_local_router(
     start_router(prepare_local(peer)?).await
 }
 
-async fn start_router<P: PreparedRuntime>(
+pub(super) async fn start_router<P: PreparedRuntime>(
     prepared: P,
 ) -> Result<PeerRouter<P::Route>, ConsumerError> {
     let node = prepared.prepared_node();

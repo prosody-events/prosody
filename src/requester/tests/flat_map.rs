@@ -1,8 +1,8 @@
 //! Flat waiter map lifecycle invariants.
 
 use super::{
-    MAX_TIMEOUT, POOL, TestCodec, TestCodecError, TestError, distinct_indices, names, register,
-    registry, success,
+    MAX_TIMEOUT, POOL, TestCodec, TestCodecError, TestError, distinct_indices, names, poll_once,
+    register, registry, success,
 };
 use crate::producer::ProducerError;
 use crate::requester::collect::collect;
@@ -16,6 +16,8 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use rdkafka::error::KafkaError;
 use std::future::pending;
+use std::pin::pin;
+use tokio::sync::oneshot;
 
 #[derive(Clone, Debug)]
 struct ArrivalTrace {
@@ -76,6 +78,37 @@ async fn each_waiter_is_removed_once() -> Result<()> {
     assert_eq!(outcomes, vec![Outcome::Ok(1), Outcome::Ok(2)]);
     drop(registration);
     assert_eq!(pending_len(&registry), 0);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn responses_do_not_cancel_producer_completion() -> Result<()> {
+    let registry = registry();
+    let names = names(&["billing"])?;
+    let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
+    let id = registration.id();
+    let (complete, completed) = oneshot::channel();
+    let produce = async {
+        completed
+            .await
+            .map_err(|_| ProducerError::Kafka(KafkaError::Canceled))?;
+        Ok::<(), ProducerError<TestCodecError>>(())
+    };
+    assert_eq!(
+        registry.accept(success(id, &names[0], 1)?),
+        ResponseDisposition::Accepted
+    );
+
+    let mut collected = pin!(collect::<TestCodec, u32, TestError, _, TestCodecError>(
+        &mut registration,
+        produce,
+    ));
+    assert!(
+        poll_once(collected.as_mut()).await.is_pending(),
+        "responses completed the request before producer completion"
+    );
+    assert!(complete.send(()).is_ok());
+    assert_eq!(collected.await?, vec![Outcome::Ok(1)]);
     Ok(())
 }
 

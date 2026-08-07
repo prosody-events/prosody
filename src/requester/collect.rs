@@ -17,6 +17,9 @@ use tokio::select;
 use tokio::time::sleep_until;
 
 /// Races Kafka delivery, subsystem responses, and the request deadline.
+///
+/// Before the deadline, completion requires both the Kafka report and every
+/// subsystem outcome. Thus, responses cannot cancel producer side effects.
 pub(crate) async fn collect<R, V, E, F, PE>(
     registration: &mut Registration,
     produce: F,
@@ -39,7 +42,7 @@ where
     let mut produce = pin!(produce);
     let mut deadline = pin!(sleep_until(deadline));
     let mut sent = false;
-    while !responses.is_empty() {
+    while !responses.is_empty() || !sent {
         select! {
             biased;
             report = &mut produce, if !sent => {

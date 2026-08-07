@@ -121,8 +121,8 @@ pub async fn new_erased<T>(
 where
     T: ClientHandler + Clone + Send + Sync + 'static,
     T::Payload: EventIdentity + EventType + Clone,
-    T::Output: Sync + 'static,
-    T::Error: Sync + 'static,
+    T::Output: Clone + Sync + 'static,
+    T::Error: Clone + Sync + 'static,
 {
     let mock = consumers.consumer.configured_mock()?;
 
@@ -149,8 +149,8 @@ impl<T, B> ErasedHighLevelClient<T> for ErasedClient<T, B>
 where
     T: ClientHandler + Clone + Send + Sync + 'static,
     T::Payload: EventIdentity + EventType + Clone,
-    T::Output: Sync + 'static,
-    T::Error: Sync + 'static,
+    T::Output: Clone + Sync + 'static,
+    T::Error: Clone + Sync + 'static,
     B: ClientBackend<Wire<T>>,
     B::Reader: ConsumerReaderBackend<Wire<T>>,
 {

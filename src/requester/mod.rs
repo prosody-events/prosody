@@ -135,9 +135,8 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
 
     /// Sends one request and waits for one answer per subsystem.
     ///
-    /// A complete response set can return before Kafka reports delivery. In
-    /// that case, producer telemetry and deduplication after the report do not
-    /// run because this function drops the send future.
+    /// A complete response set still waits for Kafka to report delivery. This
+    /// preserves the producer's telemetry and idempotence update.
     ///
     /// The span is named for the function, exactly as
     /// [`ProsodyProducer::send`] is, and it covers the whole wait. A client

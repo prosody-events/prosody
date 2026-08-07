@@ -3,6 +3,10 @@
 //! A peer runtime belongs to neither side. A producer uses it to wait for
 //! responses. A consumer uses the same runtime to send responses. A combined
 //! client constructs one runtime and shares it with both.
+//!
+//! Standalone code starts a [`LocalRouter`] or [`GrpcRouter`], then calls
+//! [`Router::split`]. Retain the owner until shutdown. Give the other two
+//! capabilities to the producer and consumer.
 
 mod backend;
 mod router;

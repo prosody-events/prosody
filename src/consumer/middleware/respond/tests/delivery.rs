@@ -39,6 +39,11 @@ fn the_hook_applies_network_backpressure() -> Result<()> {
             )),
             delivery = fixture.deliveries.recv() => assert!(delivery.is_some()),
         }
+        assert!(
+            leaf.hook_events()
+                .contains(&ScriptedHook::AfterCommit(Ok(()))),
+            "response delivery started before the handler's commit hook"
+        );
         barrier.add_permits(1);
         dispatch.await;
         drop(handler);
@@ -103,8 +108,7 @@ fn an_over_limit_response_sends_nothing() -> Result<()> {
 /// Kafka header without inventing a field. What stays testable is the
 /// unresolvable node itself.
 ///
-/// The handler's own hook does not fire here. The response is the disposition
-/// of the value, even when its route rejects it.
+/// The handler's own hook fires even when the response route rejects the value.
 #[test]
 fn an_unpublished_node_is_never_dialed() -> Result<()> {
     paused()?.block_on(async {
@@ -128,10 +132,10 @@ fn an_unpublished_node_is_never_dialed() -> Result<()> {
         let drained = fixture.drain().await?;
         assert!(drained.is_empty(), "an unresolvable node is never dialed");
         assert!(
-            !hooks
+            hooks
                 .iter()
-                .any(|hook| matches!(hook, ScriptedHook::AfterCommit(_))),
-            "the response result never returns to the handler's hook: {hooks:?}",
+                .any(|hook| matches!(hook, ScriptedHook::AfterCommit(Ok(())))),
+            "the handler's commit hook did not receive the result: {hooks:?}",
         );
         Ok(())
     })

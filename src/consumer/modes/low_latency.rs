@@ -95,9 +95,6 @@ where
 
     /// Creates a low-latency consumer that answers peer requests.
     ///
-    /// The answer moves the handler's final result, so an answered record fires
-    /// no `after_commit` on `handler`. See [`FallibleHandler`].
-    ///
     /// # Errors
     ///
     /// Returns [`ConsumerError`] when another startup step fails.
@@ -113,8 +110,8 @@ where
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-        T::Output: Sync + 'static,
-        T::Error: Sync + 'static,
+        T::Output: Clone + Sync + 'static,
+        T::Error: Clone + Sync + 'static,
         R: Codec<Payload = Result<T::Output, T::Error>>,
     {
         match (setup.consumer.mock, setup.trigger_store) {
@@ -220,8 +217,8 @@ where
         C::Payload: EventIdentity + Send + Sync + 'static,
         B: ConsumerReaderBackend<C>,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-        T::Output: Sync + 'static,
-        T::Error: Sync + 'static,
+        T::Output: Clone + Sync + 'static,
+        T::Error: Clone + Sync + 'static,
         R: Codec<Payload = Result<T::Output, T::Error>>,
     {
         let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
