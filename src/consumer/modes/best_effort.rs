@@ -10,7 +10,7 @@ use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::{build_common_middleware, build_typed_state};
 use crate::consumer::{Managers, ProsodyConsumer};
-use crate::peer::{NoPeer, Router};
+use crate::peer::{ConsumerRouter, NoPeer};
 use crate::state_reader::ConsumerReaderBackend;
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity, EventType};
@@ -27,7 +27,7 @@ where
     /// messages once, logs any failures, and moves on. This approach should
     /// only be used for development or for services where occasional
     /// message loss is acceptable.
-    pub(crate) async fn best_effort_consumer<T, B, RT: Router>(
+    pub(crate) async fn best_effort_consumer<T, B, RT: ConsumerRouter>(
         setup: TypedConsumerSetup<'_, C, B>,
         telemetry: Telemetry,
         handler: T,
@@ -76,7 +76,7 @@ where
     ///
     /// Returns [`PeerInitError::SubsystemRequired`] without a subsystem name.
     /// Returns [`ConsumerError`] when another startup step fails.
-    pub(crate) async fn best_effort_responding_consumer<T, R, B, RT: Router>(
+    pub(crate) async fn best_effort_responding_consumer<T, R, B, RT: ConsumerRouter>(
         setup: TypedConsumerSetup<'_, C, B>,
         telemetry: Telemetry,
         handler: T,

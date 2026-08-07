@@ -91,6 +91,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         keyed_state: KeyedStateConfiguration::builder().build()?,
     };
     let router = LocalRouter::new(&PeerConfiguration::default()).await?;
+    let (_, consumer_router, router_owner) = router.split();
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
         ConsumerSetup {
@@ -101,7 +102,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         pipeline_config,
         telemetry,
         handler,
-        &router,
+        &consumer_router,
     )
     .await?;
 
@@ -133,7 +134,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
     }
     .await;
     let shutdown = consumer.shutdown().await;
-    let router_shutdown = router.shutdown().await;
+    let router_shutdown = router_owner.shutdown().await;
     admin_client.delete_topic(&topic).await?;
     shutdown?;
     router_shutdown?;

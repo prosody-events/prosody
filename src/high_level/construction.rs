@@ -8,6 +8,7 @@ use crate::Codec;
 use crate::cassandra::config::CassandraConfiguration;
 use crate::high_level::config::ModeConfigurationBuildParams;
 use crate::high_level::topics::missing_topics;
+use crate::peer::Router;
 use crate::producer::{ProducerConfigurationBuilder, ProsodyProducer};
 use crate::propagator::new_propagator;
 use crate::state_reader::StateReaderClient;
@@ -82,13 +83,16 @@ where
         .await
         .map_err(HighLevelClientError::StateReader)?;
     let router = backend.build_router(peer, &reader).await?;
+    let (producer_peer, consumer_peer, router_owner) = router.split();
 
     Ok(HighLevelClient {
         producer,
         producer_config,
         consumer: Mutex::new(consumer_state),
         reader: StateReaderClient::new(reader),
-        router,
+        producer_peer,
+        consumer_peer,
+        router_owner,
         propagator: new_propagator(),
         telemetry,
     })

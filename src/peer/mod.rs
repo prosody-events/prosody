@@ -15,7 +15,8 @@ pub use crate::requester::{Outcome, ProsodyRequester, RequestError, ResponseFail
 pub use crate::router::config::{
     PeerConfiguration, PeerConfigurationBuilder, PeerConfigurationBuilderError,
 };
-pub use router::{GrpcRouter, LocalRouter, Router};
+pub use router::{ConsumerRouter, GrpcConsumer, GrpcRouter, LocalConsumer, LocalRouter, Router};
+pub use runtime::{ProducerHandle, RouterOwner};
 
 use crate::codec::Codec;
 use crate::consumer::middleware::respond::Responder;

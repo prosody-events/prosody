@@ -5,7 +5,6 @@ use crate::JsonCodec;
 use crate::consumer::wiring::memory_deps;
 use crate::consumer::{CommonConfiguration, ConsumerConfiguration, ConsumerSetup};
 use crate::high_level::config::TriggerStoreConfiguration;
-use crate::peer::Router;
 use crate::peer::runtime::prepare_router;
 use crate::state_reader::{MemoryReaderBackend, StateReaderDependencies};
 use crate::subsystem::SubsystemName;
@@ -30,6 +29,8 @@ fn a_mock_peer_uses_no_listener() -> Result<()> {
             second.node(),
             "each local peer must own a distinct identity"
         );
+        let (_, _, first) = first.into_parts();
+        let (_, _, second) = second.into_parts();
         first.shutdown().await?;
         second.shutdown().await?;
         Ok(())

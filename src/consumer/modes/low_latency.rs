@@ -20,7 +20,7 @@ use crate::consumer::wiring::{
 };
 use crate::consumer::{Managers, ProsodyConsumer};
 use crate::high_level::config::TriggerStoreConfiguration;
-use crate::peer::{NoPeer, Router};
+use crate::peer::{ConsumerRouter, NoPeer};
 use crate::producer::ProsodyProducer;
 use crate::state_reader::ConsumerReaderBackend;
 use crate::telemetry::Telemetry;
@@ -44,7 +44,7 @@ where
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub async fn low_latency_consumer<T, RT: Router>(
+    pub async fn low_latency_consumer<T, RT: ConsumerRouter>(
         setup: ConsumerSetup<'_>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
@@ -101,7 +101,7 @@ where
     ///
     /// Returns [`PeerInitError::SubsystemRequired`] without a subsystem name.
     /// Returns [`ConsumerError`] when another startup step fails.
-    pub async fn low_latency_responding_consumer<T, R, RT: Router>(
+    pub async fn low_latency_responding_consumer<T, R, RT: ConsumerRouter>(
         setup: ConsumerSetup<'_>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
@@ -152,7 +152,7 @@ where
         }
     }
 
-    pub(crate) async fn low_latency_consumer_with_backend<T, B, RT: Router>(
+    pub(crate) async fn low_latency_consumer_with_backend<T, B, RT: ConsumerRouter>(
         setup: TypedConsumerSetup<'_, C, B>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
@@ -204,7 +204,7 @@ where
         .await
     }
 
-    pub(crate) async fn low_latency_responding_consumer_with_backend<T, R, B, RT: Router>(
+    pub(crate) async fn low_latency_responding_consumer_with_backend<T, R, B, RT: ConsumerRouter>(
         setup: TypedConsumerSetup<'_, C, B>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,

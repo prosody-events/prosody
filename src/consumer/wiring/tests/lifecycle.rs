@@ -7,8 +7,8 @@ use super::{
 use crate::consumer::Managers;
 use crate::consumer::error::{ConsumerError, PeerInitError};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::peer::NoPeer;
 use crate::peer::runtime::prepare_router;
-use crate::peer::{NoPeer, Router};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use parking_lot::Mutex;
@@ -52,6 +52,7 @@ async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
     let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let router = prepare_router(&peer, &backend).await?;
+    let (_, _, router_owner) = router.into_parts();
     let consumer = start(
         &config,
         Arc::clone(&managers),
@@ -69,7 +70,7 @@ async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
     retain_manager(&config, &managers, Arc::clone(&log))?;
 
     consumer.shutdown().await?;
-    router.shutdown().await?;
+    router_owner.shutdown().await?;
 
     let events = log.lock();
     let position = |wanted: &Event| events.iter().position(|event| event == wanted);

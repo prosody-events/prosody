@@ -63,11 +63,27 @@ pub struct PreparedResponder<R: Codec> {
     responder: Arc<Responder<R>>,
 }
 
-/// One running router and its lifecycle owner.
-pub(crate) struct PeerRouter<R> {
+/// Request identity and pending requests from one router.
+pub struct ProducerHandle {
     node: NodeId,
     pending: Arc<PendingRegistry>,
+}
+
+/// Response route and fleet from one router.
+pub(crate) struct ConsumerHandle<R> {
     responses: PeerResponder<R>,
+}
+
+/// Exclusive lifecycle ownership of one router.
+pub struct RouterOwner {
+    pending: Arc<PendingRegistry>,
+    peer: PeerOwner,
+}
+
+/// One running router before its capabilities are separated.
+pub(crate) struct PeerRouter<R> {
+    producer: ProducerHandle,
+    consumer: ConsumerHandle<R>,
     owner: PeerOwner,
 }
 
@@ -110,24 +126,43 @@ pub(crate) type RouteFor<B> = <RuntimeFor<B> as PreparedRuntime>::Route;
 impl<R> PeerRouter<R> {
     #[cfg(test)]
     pub(crate) const fn node(&self) -> NodeId {
-        self.node
+        self.producer.node
     }
 
+    pub(crate) fn into_parts(self) -> (ProducerHandle, ConsumerHandle<R>, RouterOwner) {
+        let Self {
+            producer,
+            consumer,
+            owner,
+        } = self;
+        let pending = Arc::clone(&producer.pending);
+        (
+            producer,
+            consumer,
+            RouterOwner {
+                pending,
+                peer: owner,
+            },
+        )
+    }
+}
+
+impl ProducerHandle {
     /// Builds request access for a producer.
-    pub(crate) fn build_requester<C: Codec, RC: Codec>(
+    #[must_use]
+    pub fn requester<C: Codec, RC: Codec>(
         &self,
         producer: ProsodyProducer<C>,
     ) -> ProsodyRequester<C, RC> {
         ProsodyRequester::new(producer, self.node, Arc::clone(&self.pending))
     }
+}
 
+impl<R: ResponseRoute> ConsumerHandle<R> {
     pub(crate) fn build_responder<C: Codec>(
         &self,
         subsystem: SubsystemName,
-    ) -> Result<PreparedResponder<C>, ConsumerError>
-    where
-        R: ResponseRoute,
-    {
+    ) -> Result<PreparedResponder<C>, ConsumerError> {
         let (responder, workers) =
             self.responses
                 .responder(subsystem.clone())
@@ -139,11 +174,17 @@ impl<R> PeerRouter<R> {
             responder: Arc::new(responder),
         })
     }
+}
 
+impl RouterOwner {
     /// Stops this router and consumes its lifecycle owner.
-    pub(crate) async fn stop(self) -> Result<(), ShutdownError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when router teardown fails.
+    pub async fn shutdown(self) -> Result<(), ShutdownError> {
         self.pending.close_admission();
-        self.owner.stop().await
+        self.peer.stop().await
     }
 }
 
@@ -395,9 +436,8 @@ async fn start_router<P: PreparedRuntime>(
     let (stop, stopped) = oneshot::channel();
     let coordinator = tokio::spawn(run_coordinator(runtime, stopped));
     Ok(PeerRouter {
-        node,
-        pending,
-        responses,
+        producer: ProducerHandle { node, pending },
+        consumer: ConsumerHandle { responses },
         owner: PeerOwner { stop, coordinator },
     })
 }

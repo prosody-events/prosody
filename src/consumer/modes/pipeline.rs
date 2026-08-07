@@ -25,7 +25,7 @@ use crate::consumer::{Managers, ProsodyConsumer};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MessageLoader;
-use crate::peer::{NoPeer, Router};
+use crate::peer::{ConsumerRouter, NoPeer};
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
 use crate::state_reader::ConsumerReaderBackend;
@@ -128,7 +128,7 @@ impl PipelineMiddlewareStack {
     ///
     /// The telemetry borrow overlaps moves from this value. Keep this tail in
     /// one function so the borrow remains clear.
-    async fn into_responding_consumer<T, R, MP, TP, DP, PP, SP, L, C, RT: Router>(
+    async fn into_responding_consumer<T, R, MP, TP, DP, PP, SP, L, C, RT: ConsumerRouter>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
@@ -214,7 +214,7 @@ where
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub async fn pipeline_consumer<T, RT: Router>(
+    pub async fn pipeline_consumer<T, RT: ConsumerRouter>(
         setup: ConsumerSetup<'_>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
@@ -268,7 +268,7 @@ where
     ///
     /// Returns [`PeerInitError::SubsystemRequired`] without a subsystem name.
     /// Returns [`ConsumerError`] when another startup step fails.
-    pub async fn pipeline_responding_consumer<T, R, RT: Router>(
+    pub async fn pipeline_responding_consumer<T, R, RT: ConsumerRouter>(
         setup: ConsumerSetup<'_>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
@@ -316,7 +316,7 @@ where
         }
     }
 
-    pub(crate) async fn pipeline_consumer_with_backend<T, B, RT: Router>(
+    pub(crate) async fn pipeline_consumer_with_backend<T, B, RT: ConsumerRouter>(
         setup: TypedConsumerSetup<'_, C, B>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
@@ -375,7 +375,7 @@ where
             .await
     }
 
-    pub(crate) async fn pipeline_responding_consumer_with_backend<T, R, B, RT: Router>(
+    pub(crate) async fn pipeline_responding_consumer_with_backend<T, R, B, RT: ConsumerRouter>(
         setup: TypedConsumerSetup<'_, C, B>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,

@@ -20,8 +20,8 @@ use crate::consumer::{
 };
 use crate::error::ErrorCategory;
 use crate::high_level::config::TriggerStoreConfiguration;
+use crate::peer::ConsumerResources;
 use crate::peer::runtime::prepare_router;
-use crate::peer::{ConsumerResources, Router};
 use crate::response::frame::FrameCap;
 use crate::state_reader::StateReaderDependencies;
 use crate::subsystem::SubsystemName;
@@ -78,6 +78,7 @@ async fn the_prepared_peer_admits_the_name_its_responder_answers_with() -> Resul
     let peer_config = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let subsystem = SubsystemName::try_new(SUBSYSTEM)?;
     let router = prepare_router(&peer_config, &backend).await?;
+    let (_, router, router_owner) = router.into_parts();
     let prepared = router.build_responder::<SomeResponseCodec>(subsystem.clone())?;
     let common = common_config(Some(subsystem.clone()))?;
     let middleware = build_common_middleware::<_, Value>(
@@ -93,7 +94,7 @@ async fn the_prepared_peer_admits_the_name_its_responder_answers_with() -> Resul
     // workers that clone keeps open.
     drop(provider);
     peer.workers().join().await;
-    router.shutdown().await?;
+    router_owner.shutdown().await?;
     ensure!(
         admitted == subsystem,
         "the prepared peer admits {admitted:?}, not the name its responder answers with"
@@ -126,9 +127,10 @@ async fn the_prepared_responder_is_sized_by_the_runtimes_frame_cap() -> Result<(
         .max_destinations(SCRATCH_DESTINATIONS)
         .build()?;
     let router = prepare_router(&peer, &backend).await?;
+    let (_, router, router_owner) = router.into_parts();
     let prepared = router.build_responder::<SomeResponseCodec>(SubsystemName::try_new(SUBSYSTEM)?);
     let Err(error) = prepared else {
-        router.shutdown().await?;
+        router_owner.shutdown().await?;
         bail!("preparation took a scratch budget one sender cannot commit to");
     };
     let message = format!("{error:#}");
@@ -137,7 +139,7 @@ async fn the_prepared_responder_is_sized_by_the_runtimes_frame_cap() -> Result<(
         message.contains(&asked.to_string()),
         "the responder asks for {asked} bytes of scratch: {message}",
     );
-    router.shutdown().await?;
+    router_owner.shutdown().await?;
     Ok(())
 }
 
@@ -167,6 +169,7 @@ async fn a_responding_consumer_starts_and_stops() -> Result<()> {
         deps,
     };
     let router = prepare_router(&peer, typed.deps.backend().as_ref()).await?;
+    let (_, router, router_owner) = router.into_parts();
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_responding_consumer_with_backend::<
         ScriptedHandler,
         SomeResponseCodec,
@@ -191,7 +194,7 @@ async fn a_responding_consumer_starts_and_stops() -> Result<()> {
     }
     .await;
     consumer.shutdown().await?;
-    router.shutdown().await?;
+    router_owner.shutdown().await?;
     outcome
 }
 
@@ -222,6 +225,7 @@ async fn refused_consumer(
     };
     let deps: StateReaderDependencies<JsonCodec, _> = memory_deps(&setup);
     let router = prepare_router(&peer, deps.backend().as_ref()).await?;
+    let (_, router, router_owner) = router.into_parts();
     let result = ProsodyConsumer::<JsonCodec>::pipeline_responding_consumer_with_backend::<
         ScriptedHandler,
         SomeResponseCodec,
@@ -245,11 +249,11 @@ async fn refused_consumer(
             if let Err(error) = shutdown {
                 bail!("unexpected consumer shutdown failed: {error}");
             }
-            router.shutdown().await?;
+            router_owner.shutdown().await?;
             Ok(None)
         }
         Err(error) => {
-            router.shutdown().await?;
+            router_owner.shutdown().await?;
             Ok(Some(error))
         }
     }
