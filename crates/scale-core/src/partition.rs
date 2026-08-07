@@ -1,15 +1,11 @@
 use crate::RandomStream;
 use crate::random::sample_gamma;
 
-const WINDOW_COUNT: usize = 64;
 const PRIOR_CONCENTRATION: f64 = 1.0_f64;
 
 pub(crate) struct PartitionFactor {
-    retained_counts: Vec<u32>,
     count_sums: Vec<f64>,
     partition_count: u32,
-    cursor: usize,
-    length: usize,
 }
 
 impl PartitionFactor {
@@ -17,15 +13,9 @@ impl PartitionFactor {
         let partition_count_u32 = partition_count;
         let partition_count = usize::try_from(partition_count)
             .map_err(|_| crate::ConfigurationError::PlatformLimit)?;
-        let retained_count = partition_count
-            .checked_mul(WINDOW_COUNT)
-            .ok_or(crate::ConfigurationError::PlatformLimit)?;
         Ok(Self {
-            retained_counts: vec![0; retained_count],
             count_sums: vec![0.0_f64; partition_count],
             partition_count: partition_count_u32,
-            cursor: 0,
-            length: 0,
         })
     }
 
@@ -35,17 +25,9 @@ impl PartitionFactor {
             self.count_sums.len(),
             "partition evidence must match the configured partition count"
         );
-        let offset = self.cursor * self.count_sums.len();
         for (partition, &count) in counts.iter().enumerate() {
-            let retained = &mut self.retained_counts[offset + partition];
-            if self.length == WINDOW_COUNT {
-                self.count_sums[partition] -= f64::from(*retained);
-            }
-            *retained = count;
             self.count_sums[partition] += f64::from(count);
         }
-        self.cursor = (self.cursor + 1) % WINDOW_COUNT;
-        self.length = (self.length + 1).min(WINDOW_COUNT);
     }
 
     #[cfg(test)]

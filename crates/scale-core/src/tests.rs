@@ -457,6 +457,27 @@ fn partition_factor_learns_a_normalized_skew() -> Result<(), TestError> {
 }
 
 #[test]
+fn partition_posterior_does_not_depend_on_evidence_segmentation() -> Result<(), TestError> {
+    let mut combined = PartitionFactor::new(4)?;
+    let mut segmented = PartitionFactor::new(4)?;
+    combined.update(&[90, 10, 4, 0]);
+    segmented.update(&[40, 4, 1, 0]);
+    segmented.update(&[50, 6, 3, 0]);
+    let mut combined_shares = [0.0_f64; 4];
+    let mut segmented_shares = [0.0_f64; 4];
+
+    assert!(combined.write_expected_shares(&mut combined_shares));
+    assert!(segmented.write_expected_shares(&mut segmented_shares));
+    assert!(
+        combined_shares
+            .iter()
+            .zip(segmented_shares)
+            .all(|(left, right)| close_relative(*left, right))
+    );
+    Ok(())
+}
+
+#[test]
 fn moved_partition_draws_preserve_joint_skew_uncertainty() -> Result<(), TestError> {
     let mut factor = PartitionFactor::new(2)?;
     factor.update(&[1_000, 0]);
