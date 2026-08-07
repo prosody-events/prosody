@@ -1,16 +1,17 @@
 //! What an operator sets to join the peer fleet, and how it becomes the four
 //! sections the runtime is built from.
 
-use crate::requester::config::RequesterConfiguration;
 use crate::response::frame::{FrameCap, FrameCapError};
 use crate::router::directory::{RegistrationTtl, RegistrationTtlError};
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::TransportConfiguration;
 use crate::router::runtime::RouterConfiguration;
+use crate::util::{from_duration_env_with_fallback, from_env_with_fallback, from_option_env};
 use derive_builder::Builder;
 use std::net::SocketAddr;
 use std::time::Duration;
 use thiserror::Error;
+use validator::{Validate, ValidationError, ValidationErrors};
 
 /// How this process joins the peer fleet: what its listener binds, what it
 /// publishes about itself, how it answers, and what it may ask for.
@@ -22,59 +23,53 @@ use thiserror::Error;
 /// them, because a caller outside this crate cannot name a crate-private type.
 /// One crate-internal conversion turns it back into those sections.
 ///
-/// **This type derives no `Validate`, and that is deliberate.** Every field
-/// that can express a degenerate value carries a rule at the section that
-/// consumes it. The startup path builds every one of those sections. The three
-/// fields that carry none — the two addresses and the reflection switch — have
-/// no degenerate value to refuse. A derive here would restate those rules in a
-/// second place or promise a check it does not make. The cost is that `build`
-/// accepts a degenerate value and the operator learns of it when the peer
-/// starts.
-#[derive(Builder, Clone, Debug)]
+/// Validation delegates to the four sections that consume these values. This
+/// keeps each rule in one place while exposing the standard [`Validate`] API.
+#[derive(Builder, Clone, Debug, Validate)]
 #[builder(setter(into, strip_option), default)]
+#[validate(schema(function = "validate_peer"))]
 pub struct PeerConfiguration {
     /// The address for the peer listener.
-    pub bind: SocketAddr,
+    #[builder(default = "from_env_with_fallback(\"PROSODY_PEER_BIND_ADDRESS\", \
+                         PeerConfiguration::default().bind_address)?")]
+    pub bind_address: SocketAddr,
     /// The maximum encoded frame size.
-    pub frame_bytes: usize,
-    /// The maximum number of open peer connections.
-    pub max_connections: usize,
-    /// The maximum number of concurrent streams per connection.
-    pub max_concurrent_streams: u32,
+    #[builder(default = "from_env_with_fallback(\"PROSODY_PEER_MAX_FRAME_BYTES\", \
+                         PeerConfiguration::default().max_frame_bytes)?")]
+    pub max_frame_bytes: usize,
     /// Enables schema reflection on the peer listener.
-    pub reflection: bool,
+    #[builder(
+        default = "from_env_with_fallback(\"PROSODY_PEER_ENABLE_REFLECTION\", \
+                   PeerConfiguration::default().enable_reflection)?"
+    )]
+    pub enable_reflection: bool,
     /// The host that peers on another network use.
+    #[builder(default = "from_option_env(\"PROSODY_PEER_ADVERTISED_HOST\")?")]
     pub advertised_host: Option<String>,
     /// The advertised port, or the listener port when absent.
+    #[builder(default = "from_option_env(\"PROSODY_PEER_ADVERTISED_PORT\")?")]
     pub advertised_port: Option<u16>,
     /// The network label for direct routes.
-    pub network: Option<String>,
-    /// The maximum number of cached peer addresses.
-    pub address_cache_capacity: usize,
+    #[builder(default = "from_option_env(\"PROSODY_PEER_NETWORK_NAME\")?")]
+    pub network_name: Option<String>,
+    /// The maximum number of peers held in each node-keyed cache.
+    #[builder(default = "from_env_with_fallback(\"PROSODY_PEER_CACHE_CAPACITY\", \
+                         PeerConfiguration::default().peer_cache_capacity)?")]
+    pub peer_cache_capacity: usize,
     /// The duration of each directory registration lease.
-    pub registration_lease: Duration,
+    #[builder(
+        default = "from_duration_env_with_fallback(\"PROSODY_PEER_REGISTRATION_TTL\", \
+                   PeerConfiguration::default().registration_ttl)?"
+    )]
+    pub registration_ttl: Duration,
     /// The address used to find the routed host.
-    pub route_probe: Option<SocketAddr>,
-    /// The maximum number of active destinations.
-    pub max_destinations: usize,
-    /// The number of send slots for each destination.
-    pub slots_each: usize,
-    /// The send rate for each destination.
-    pub sends_per_second: u32,
+    #[builder(default = "from_option_env(\"PROSODY_PEER_ROUTE_PROBE_ADDRESS\")?")]
+    pub route_probe_address: Option<SocketAddr>,
     /// The deadline for one response delivery.
-    pub send_deadline: Duration,
-    /// The maximum number of send attempts.
-    pub max_send_attempts: u32,
-    /// The maximum number of active requests.
-    pub max_in_flight: usize,
-    /// The maximum number of awaited subsystems per request.
-    pub max_awaited: usize,
-    /// The maximum response payload size.
-    pub max_response_bytes: usize,
-    /// The maximum request timeout.
-    pub max_timeout: Duration,
-    /// The delay before an expired request is removed.
-    pub sweep_grace: Duration,
+    #[builder(default = "from_duration_env_with_fallback(\"\
+                         PROSODY_PEER_RESPONSE_DELIVERY_TIMEOUT\", \
+                         PeerConfiguration::default().response_delivery_timeout)?")]
+    pub response_delivery_timeout: Duration,
 }
 
 /// The four internal sections one peer configuration becomes, and the two
@@ -83,7 +78,6 @@ pub(crate) struct PeerParts {
     pub(crate) transport: TransportConfiguration,
     pub(crate) router: RouterConfiguration,
     pub(crate) fleet: FleetConfiguration,
-    pub(crate) requester: RequesterConfiguration,
     pub(crate) lease: RegistrationTtl,
     pub(crate) probe: Option<SocketAddr>,
 }
@@ -93,29 +87,17 @@ impl Default for PeerConfiguration {
         let transport = TransportConfiguration::default();
         let router = RouterConfiguration::default();
         let fleet = FleetConfiguration::default();
-        let requester = RequesterConfiguration::default();
         Self {
-            bind: transport.bind,
-            frame_bytes: transport.frame_cap.bytes(),
-            max_connections: transport.max_connections,
-            max_concurrent_streams: transport.max_concurrent_streams,
-            reflection: transport.reflection,
+            bind_address: transport.bind,
+            max_frame_bytes: transport.frame_cap.bytes(),
+            enable_reflection: transport.reflection,
             advertised_host: router.advertised_host,
             advertised_port: router.advertised_port,
-            network: router.network,
-            address_cache_capacity: router.address_cache_capacity,
-            registration_lease: RegistrationTtl::DEFAULT.duration(),
-            route_probe: None,
-            max_destinations: fleet.max_destinations,
-            slots_each: fleet.slots_each,
-            sends_per_second: fleet.sends_per_second,
-            send_deadline: fleet.send_deadline,
-            max_send_attempts: fleet.max_send_attempts,
-            max_in_flight: requester.max_in_flight,
-            max_awaited: requester.max_awaited,
-            max_response_bytes: requester.max_response_bytes,
-            max_timeout: requester.max_timeout,
-            sweep_grace: requester.sweep_grace,
+            network_name: router.network,
+            peer_cache_capacity: fleet.peer_capacity,
+            registration_ttl: RegistrationTtl::DEFAULT.duration(),
+            route_probe_address: None,
+            response_delivery_timeout: fleet.response_timeout,
         }
     }
 }
@@ -129,54 +111,63 @@ impl PeerConfiguration {
 
     /// Splits this configuration into the sections each component takes.
     ///
-    /// It runs no rule of its own beyond the two newtype conversions. Every
-    /// other rule belongs to the section that consumes the field, and each of
-    /// those sections validates itself where the runtime builds it.
-    ///
     /// # Errors
     ///
-    /// Returns [`PeerConfigurationError`] when the frame size or the
-    /// registration lease is outside its supported range.
+    /// Returns [`PeerConfigurationError`] when any peer value is invalid.
     pub(crate) fn parts(&self) -> Result<PeerParts, PeerConfigurationError> {
-        let frame_cap = FrameCap::new(self.frame_bytes)?;
-        let lease = RegistrationTtl::try_from(self.registration_lease)?;
+        self.validate()?;
+        self.unvalidated_parts()
+    }
+
+    fn unvalidated_parts(&self) -> Result<PeerParts, PeerConfigurationError> {
+        let frame_cap = FrameCap::new(self.max_frame_bytes)?;
+        let lease = RegistrationTtl::try_from(self.registration_ttl)?;
         Ok(PeerParts {
             transport: TransportConfiguration {
-                bind: self.bind,
+                bind: self.bind_address,
                 frame_cap,
-                max_connections: self.max_connections,
-                max_concurrent_streams: self.max_concurrent_streams,
-                reflection: self.reflection,
+                reflection: self.enable_reflection,
             },
             router: RouterConfiguration {
                 advertised_host: self.advertised_host.clone(),
                 advertised_port: self.advertised_port,
-                network: self.network.clone(),
-                address_cache_capacity: self.address_cache_capacity,
+                network: self.network_name.clone(),
             },
             fleet: FleetConfiguration {
-                max_destinations: self.max_destinations,
-                slots_each: self.slots_each,
-                sends_per_second: self.sends_per_second,
-                send_deadline: self.send_deadline,
-                max_send_attempts: self.max_send_attempts,
-            },
-            requester: RequesterConfiguration {
-                max_in_flight: self.max_in_flight,
-                max_awaited: self.max_awaited,
-                max_response_bytes: self.max_response_bytes,
-                max_timeout: self.max_timeout,
-                sweep_grace: self.sweep_grace,
+                peer_capacity: self.peer_cache_capacity,
+                response_timeout: self.response_delivery_timeout,
             },
             lease,
-            probe: self.route_probe,
+            probe: self.route_probe_address,
         })
     }
+}
+
+fn validate_peer(config: &PeerConfiguration) -> Result<(), ValidationError> {
+    let parts = config
+        .unvalidated_parts()
+        .map_err(|_| ValidationError::new("peer_parts"))?;
+    parts
+        .transport
+        .validate()
+        .map_err(|_| ValidationError::new("transport"))?;
+    parts
+        .router
+        .validate()
+        .map_err(|_| ValidationError::new("router"))?;
+    parts
+        .fleet
+        .validate()
+        .map_err(|_| ValidationError::new("fleet"))?;
+    Ok(())
 }
 
 /// Why a peer configuration cannot form its internal sections.
 #[derive(Debug, Error)]
 pub(crate) enum PeerConfigurationError {
+    /// One peer value or a combination of values is invalid.
+    #[error("peer configuration is invalid: {0:#}")]
+    Invalid(#[from] ValidationErrors),
     /// The frame size is outside its supported range.
     #[error("invalid frame size: {0:#}")]
     Frame(#[from] FrameCapError),

@@ -28,11 +28,10 @@ const RAW_ID: [u8; 16] = [0x11; 16];
 thread_local! {
     /// Payloads serialized on this thread, by every [`CountingCodec`] on it.
     ///
-    /// A delivery worker builds its own codec through `Default`. A suite that
-    /// drives delivery therefore holds no handle on the instance that encodes,
-    /// and cannot read that instance's own counter. Those suites run one
-    /// current-thread runtime, so the worker encodes on the thread that drives
-    /// it and this total includes what the worker serialized. Read it through
+    /// A response send builds its own codec through `Default`. A suite that
+    /// drives delivery holds no handle on the instance that encodes. Those
+    /// suites use one current-thread runtime. Thus, this total includes that
+    /// serialization. Read it through
     /// [`serialized_on_this_thread`] as a difference, never as an absolute:
     /// every other codec on the same thread counts here too.
     static SERIALIZED_HERE: Cell<usize> = const { Cell::new(0) };

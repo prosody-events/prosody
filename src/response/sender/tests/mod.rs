@@ -1,27 +1,28 @@
 //! What the typed sender's own suites share: a router over an in-process
 //! transport, and a harness that records every attempt it makes.
 
-use super::{ResponseWorkers, TypedSender};
+use super::TypedSender;
+use super::route::deliver_response;
 use crate::error::ErrorCategory;
+use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader};
 use crate::response::{RequestId, ResponseStatus};
-use crate::router::RelayHop;
-use crate::router::fleet::DestinationFleet;
+use crate::router::Router;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{
-    Delivery, Drained, PUBLISHED_NODES, Script, TestRouter, collect_deliveries, config, node,
-    paused, port,
+    Delivery, Drained, Script, TestRouter, collect_deliveries, config, node, paused, port,
 };
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use opentelemetry::Context;
-use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
-mod bounds;
 mod budget;
 mod delivery;
 mod fallback;
@@ -31,19 +32,32 @@ mod metrics;
 /// The frame ceiling these suites encode against.
 pub(super) const CAP_BYTES: usize = 4096;
 
-/// The response body every queued result in these suites carries.
+/// The response body every result in these suites carries.
 pub(super) const PAYLOAD: &[u8] = b"response";
 
 /// One fleet, one transport, and one typed sender over them.
 pub(super) struct Harness {
     router: TestRouter,
-    sender: TypedSender<CountingCodec>,
-    workers: ResponseWorkers,
+    sender: Arc<TypedSender<CountingCodec, TestRouter>>,
     deliveries: UnboundedReceiver<Delivery>,
     header: FrameHeader,
-    /// Responses this harness queued, counted so [`Harness::drain`] can hold
-    /// the sender's counters to their conservation rule.
-    queued: Cell<u64>,
+    outcomes: Arc<Outcomes>,
+}
+
+#[derive(Default)]
+struct Outcomes {
+    sent: AtomicU64,
+    dropped: AtomicU64,
+}
+
+impl Outcomes {
+    fn record(&self, delivered: bool) {
+        if delivered {
+            self.sent.fetch_add(1, Relaxed);
+        } else {
+            self.dropped.fetch_add(1, Relaxed);
+        }
+    }
 }
 
 impl Harness {
@@ -62,14 +76,14 @@ impl Harness {
     }
 
     fn over(router: TestRouter, deliveries: UnboundedReceiver<Delivery>) -> Result<Self> {
-        let (sender, workers) = TypedSender::new_without_local(&router, FrameCap::new(CAP_BYTES)?)?;
+        let sender =
+            TypedSender::new_route(router.clone(), router.fleet(), FrameCap::new(CAP_BYTES)?);
         Ok(Self {
-            sender,
-            workers,
+            sender: Arc::new(sender),
             router,
             deliveries,
             header: header()?,
-            queued: Cell::new(0),
+            outcomes: Arc::default(),
         })
     }
 
@@ -84,35 +98,64 @@ impl Harness {
         self.router.script_advertised(index, script);
     }
 
-    /// The fleet, for the assertions that outlive the harness.
-    pub(super) fn fleet(&self) -> Arc<DestinationFleet> {
-        Arc::clone(self.router.fleet())
+    /// Sends one response for `index`.
+    pub(super) async fn send(&self, index: u8) -> Result<()> {
+        self.send_payload(index, PAYLOAD.to_vec()).await
     }
 
-    /// Queues one response for `index`, and counts it when it was queued.
-    ///
-    /// A refusal hands the payload back. These suites never need it again, so a
-    /// refusal reads as an error here and the fleet's own counter names which
-    /// class it was.
-    pub(super) fn send(&self, index: u8) -> Result<()> {
-        self.send_payload(index, PAYLOAD.to_vec())
+    /// Sends `payload` for `index`.
+    pub(super) async fn send_payload(&self, index: u8, payload: Vec<u8>) -> Result<()> {
+        let delivered = self
+            .sender
+            .send(
+                FrameHeader {
+                    target: node(index),
+                    ..self.header.clone()
+                },
+                Context::current(),
+                payload,
+            )
+            .await;
+        self.outcomes.record(delivered);
+        Ok(())
     }
 
-    /// Queues one response of `payload` for `index`, for a case whose subject
-    /// is the size of the body rather than its content.
-    pub(super) fn send_payload(&self, index: u8, payload: Vec<u8>) -> Result<()> {
-        let queued = self.sender.send(
+    /// Starts one send that a test synchronizes through transport events.
+    pub(super) fn start_send(&self, index: u8) -> JoinHandle<Result<()>> {
+        let sender = Arc::clone(&self.sender);
+        let outcomes = Arc::clone(&self.outcomes);
+        let header = FrameHeader {
+            target: node(index),
+            ..self.header.clone()
+        };
+        tokio::spawn(async move {
+            let delivered = sender
+                .send(header, Context::current(), PAYLOAD.to_vec())
+                .await;
+            outcomes.record(delivered);
+            Ok(())
+        })
+    }
+
+    /// Runs one already-expired job without production-only test hooks.
+    pub(super) async fn run_expired(&self, index: u8) -> Result<()> {
+        let target = node(index);
+        let delivered = deliver_response(
+            &self.router,
+            FrameEncoder::new(CountingCodec::default(), FrameCap::new(CAP_BYTES)?),
             FrameHeader {
-                target: node(index),
+                target,
                 ..self.header.clone()
             },
+            PAYLOAD.to_vec(),
             Context::current(),
-            payload,
-        );
-        if queued.is_err() {
-            bail!("the sender refused the response");
+            &self.sender.fleet.destination(target),
+            Instant::now(),
+        )
+        .await;
+        if delivered {
+            bail!("the expired job did not stop at the deadline");
         }
-        self.queued.set(self.queued.get() + 1);
         Ok(())
     }
 
@@ -121,56 +164,23 @@ impl Harness {
         next_delivery(&mut self.deliveries).await
     }
 
-    /// Drops the sender without draining it, and keeps the record of what the
-    /// transport does afterwards.
-    ///
-    /// Every worker is a spawned task, so what goes away here is the queue
-    /// handles and nothing else. A test that wants the workers joined calls
-    /// [`Harness::drain`] instead.
-    pub(super) fn release(self) -> UnboundedReceiver<Delivery> {
-        let Self {
-            sender, deliveries, ..
-        } = self;
-        drop(sender);
-        deliveries
-    }
-
-    /// Drains the sender, collects every attempt its workers made, and holds
-    /// the counters to their conservation rule.
-    ///
-    /// The drain returns once every worker has exited, so the record of one run
-    /// is complete without waiting on a clock.
-    ///
-    /// Every queued response then ends as exactly one of sent or dropped. The
-    /// one drop these suites cannot produce is a queue refusal, which needs a
-    /// worker to end between the reservation and the queue.
+    /// Collects every completed attempt and checks response conservation.
     pub(super) async fn drain(self) -> Result<Drained> {
         let Self {
             router,
             sender,
-            workers,
             mut deliveries,
-            queued,
+            outcomes,
             ..
         } = self;
-        let counters = sender.counters();
         drop(sender);
-        workers.join().await;
         drop(router);
 
         let drained = Drained {
             deliveries: collect_deliveries(&mut deliveries).await,
-            sent: counters.sent(),
-            dropped: counters.dropped(),
+            sent: outcomes.sent.load(Relaxed),
+            dropped: outcomes.dropped.load(Relaxed),
         };
-        let queued = queued.get();
-        if drained.sent + drained.dropped != queued {
-            bail!(
-                "{queued} queued responses came to {} sent and {} dropped",
-                drained.sent,
-                drained.dropped
-            );
-        }
         Ok(drained)
     }
 }
@@ -200,7 +210,7 @@ pub(super) fn attempts_on(deliveries: &[Delivery], port: u16) -> usize {
         .count()
 }
 
-/// The header every queued response in these suites carries, except its target.
+/// The header every response in these suites carries, except its target.
 fn header() -> Result<FrameHeader> {
     Ok(FrameHeader {
         target: node(0),

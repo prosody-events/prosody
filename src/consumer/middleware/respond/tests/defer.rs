@@ -6,7 +6,9 @@
 //! trip has to carry the tag: the answer follows the message, not the attempt.
 
 use super::super::RespondHandler;
-use super::{Drained, Fixture, ResultProbeCodec, cap, offset_tracker, tagged, tagged_under};
+use super::{
+    Fixture, ResultProbeCodec, cap, offset_tracker, serialize_count, tagged, tagged_under,
+};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleEventHandler;
 use crate::consumer::middleware::defer::DeferConfiguration;
@@ -25,7 +27,7 @@ use crate::otel::SpanRelation;
 use crate::related_span;
 use crate::response::frame::decode::decode_frame;
 use crate::response::{RequestId, ResponseStatus};
-use crate::router::loopback::{node, paused};
+use crate::router::loopback::{TestRouter, node, paused};
 use crate::telemetry::Telemetry;
 use crate::test_util::{captured_spans, named, sampled_remote_context};
 use crate::timers::TimerType;
@@ -49,7 +51,7 @@ const TARGET: u8 = 3;
 /// The request the deferred record names.
 const REQUEST: u8 = 44;
 
-/// The span a worker opens for one outbound response.
+/// The span one outbound response opens.
 const SENT: &str = "peer.response.send";
 
 /// The span the loader opens for the record it rebuilds. It is the reloaded
@@ -67,7 +69,7 @@ struct TaggedLoader;
 /// The composition this suite drives: defer outside respond, respond directly
 /// around the leaf.
 type DeferStack = MessageDeferHandler<
-    RespondHandler<LeafHandler<ScriptedHandler>, ResultProbeCodec>,
+    RespondHandler<LeafHandler<ScriptedHandler>, ResultProbeCodec, TestRouter>,
     MemoryMessageDeferStore,
     TaggedLoader,
     TraceBasedDecider,
@@ -82,7 +84,7 @@ impl FallibleEventHandler for DeferStack {}
 #[test]
 fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
     paused()?.block_on(async {
-        let fixture = Fixture::<ResultProbeCodec>::new(1, 2)?;
+        let fixture = Fixture::<ResultProbeCodec>::new()?;
         let leaf = ScriptedHandler::failing_then_success(vec![ErrorCategory::Transient]);
         let store = MemoryMessageDeferStore::new();
         let handler = defer_handler(&fixture, leaf.clone(), store.clone())?;
@@ -103,9 +105,9 @@ fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
             "the transient failure is deferred rather than retried in place",
         );
         assert_eq!(
-            fixture.admitted(),
+            serialize_count(),
             0,
-            "a deferred attempt reaches after_abort, so it reserves no send slot",
+            "a deferred attempt reaches after_abort, so it sends no response",
         );
 
         let (timer, ..) = RecordingTimer::new(create_test_trigger_with(
@@ -123,13 +125,13 @@ fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
         drop(handler);
 
         assert_eq!(leaf.call_count(), 2, "the reload re-ran the leaf");
-        let mut drained: Drained = fixture.drain().await?;
+        let mut drained = fixture.drain().await?;
         assert_eq!(
-            drained.deliveries.len(),
+            drained.len(),
             1,
             "only the reload answers, and it answers once",
         );
-        let mut delivery = drained.deliveries.remove(0);
+        let mut delivery = drained.remove(0);
         let frame = decode_frame(&mut delivery.bytes, cap()?)?;
         assert_eq!(frame.header.target, node(TARGET));
         assert_eq!(frame.header.request, RequestId::from_bytes([REQUEST; 16]));
@@ -147,7 +149,7 @@ fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
 ///
 /// That distinction is load-bearing rather than cosmetic. A deferred retry
 /// fires as a timer, and a timer dispatch starts a trace of its own under the
-/// shipped defaults. So a context taken where the answer is queued would put
+/// shipped defaults. So a context taken when the answer is sent would put
 /// every deferred response outside the requester's trace. The context travels
 /// with the tag instead, read from the record both came from.
 ///
@@ -180,7 +182,7 @@ fn a_deferred_reload_answers_inside_the_records_own_trace() -> Result<()> {
 /// of its own. Returns that timer's trace id.
 fn reload_under_a_fresh_timer_trace() -> Result<TraceId> {
     paused()?.block_on(async {
-        let fixture = Fixture::<ResultProbeCodec>::new(1, 2)?;
+        let fixture = Fixture::<ResultProbeCodec>::new()?;
         let leaf = ScriptedHandler::failing_then_success(vec![ErrorCategory::Transient]);
         let handler = defer_handler(&fixture, leaf, MemoryMessageDeferStore::new())?;
 
@@ -214,11 +216,11 @@ fn reload_under_a_fresh_timer_trace() -> Result<TraceId> {
         .await;
         drop(handler);
 
-        let drained: Drained = fixture.drain().await?;
+        let drained = fixture.drain().await?;
         ensure!(
-            drained.sent == 1,
+            drained.len() == 1,
             "the reload must have answered exactly once, not {} times",
-            drained.sent
+            drained.len()
         );
         Ok(timer_trace)
     })

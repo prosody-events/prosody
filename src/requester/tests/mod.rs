@@ -5,7 +5,6 @@
 //! Every suite runs on a paused-time runtime, so a virtual second costs
 //! nothing and every schedule is the same on every machine.
 
-use super::config::RequesterConfiguration;
 use super::registry::{PendingRegistry, Registration};
 use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -30,13 +29,9 @@ use std::task::Poll;
 use std::time::Duration;
 use thiserror::Error;
 
-mod config;
-mod lifecycle;
+mod flat_map;
 mod metrics;
-mod race;
-mod registry;
 mod request;
-mod sweep;
 mod trace;
 
 /// Bytes one test response occupies: one arm tag and one little-endian `u32`.
@@ -60,23 +55,8 @@ const NODE: NodeId = NodeId::from_bytes([7_u8; 16]);
 /// Longest timeout the suites may ask for.
 const MAX_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Response ceiling the suites configure, far above the bodies they build.
-const MAX_RESPONSE_BYTES: usize = 1024;
-
-/// Grace the suites configure.
-///
-/// It is longer than any deadline a suite waits out, so the registry's own
-/// sweep task only reclaims a record for a suite that advances time on purpose.
-const SWEEP_GRACE: Duration = Duration::from_mins(10);
-
 /// Subsystem names the property generators draw from.
 const POOL: [&str; 6] = ["billing", "ledger", "audit", "search", "mailer", "a,b"];
-
-/// Requests the registry behind [`unanswered_call`] admits.
-pub(super) const IN_FLIGHT: usize = 2;
-
-/// Most subsystems that registry accepts.
-pub(super) const MAX_AWAITED: usize = 2;
 
 /// The topic, key and subsystem [`unanswered_call`] names.
 pub(super) const TOPIC: &str = "requests";
@@ -191,17 +171,9 @@ impl ClassifyError for TestError {
     }
 }
 
-/// Builds a registry and starts its sweep task.
-///
-/// Call this inside a runtime, because the registry spawns its sweep.
-pub(super) fn registry(max_in_flight: usize, max_awaited: usize) -> Result<Arc<PendingRegistry>> {
-    Ok(PendingRegistry::test(&RequesterConfiguration {
-        max_in_flight,
-        max_awaited,
-        max_response_bytes: MAX_RESPONSE_BYTES,
-        max_timeout: MAX_TIMEOUT,
-        sweep_grace: SWEEP_GRACE,
-    })?)
+/// Builds an empty registry.
+pub(super) fn registry() -> Arc<PendingRegistry> {
+    PendingRegistry::new()
 }
 
 /// Registers one request through the validation a real call goes through.
@@ -212,7 +184,7 @@ pub(super) fn register(
     awaited: &[SubsystemName],
     timeout: Duration,
 ) -> Result<Registration> {
-    Ok(registry.register::<TestCodecError>(awaited, timeout, TestCodec::FORMAT_ID)?)
+    Ok(registry.register::<TestCodecError>(awaited, timeout)?)
 }
 
 /// A requester over a mock cluster, so a case reaches the real `request` body.
@@ -239,7 +211,7 @@ pub(super) fn requester(
 ///
 /// Returns an error when the call fails or answers anything but a timeout.
 pub(super) async fn unanswered_call() -> Result<()> {
-    let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
+    let registry = registry();
     let requester = requester(registry)?;
     let awaited = names(&[SUBSYSTEM])?;
     let outcomes = requester
@@ -275,12 +247,6 @@ pub(super) fn distinct_indices(g: &mut Gen, length: usize, count: usize) -> Vec<
         chosen.push(pool.swap_remove(usize::arbitrary(g) % pool.len()));
     }
     chosen
-}
-
-/// Chooses a random-length ordered subset of `0..length`.
-pub(super) fn partial_permutation(g: &mut Gen, length: usize) -> Vec<usize> {
-    let count = usize::arbitrary(g) % (length + 1);
-    distinct_indices(g, length, count)
 }
 
 /// Encodes one response body through the codec that reads it back.

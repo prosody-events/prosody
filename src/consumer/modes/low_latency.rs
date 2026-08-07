@@ -20,7 +20,7 @@ use crate::consumer::wiring::{
 };
 use crate::consumer::{Managers, ProsodyConsumer};
 use crate::high_level::config::TriggerStoreConfiguration;
-use crate::peer::{ConsumerRouter, NoPeer};
+use crate::peer::{ConsumerRouter, NoPeer, responding_provider};
 use crate::producer::ProsodyProducer;
 use crate::state_reader::ConsumerReaderBackend;
 use crate::subsystem::SubsystemName;
@@ -254,8 +254,8 @@ where
         };
         // Preparation is the last fallible step of this mode, and no `?` runs
         // between it and the termination below.
-        let prepared = router.responder::<R>(subsystem)?;
-        let (provider, resources) = prepared.terminate(&middleware, handler);
+        let (provider, resources) =
+            responding_provider::<_, R, _, _>(router, subsystem, &middleware, handler);
         Box::pin(initialize_consumer::<_, _, _, C, _>(
             setup.consumer,
             provider,

@@ -88,6 +88,11 @@ impl FixedRouter {
 }
 
 impl Router for FixedRouter {
+    #[cfg(test)]
+    fn fleet(&self) -> &Arc<DestinationFleet> {
+        &self.fleet
+    }
+
     fn route(
         &self,
         _node: NodeId,
@@ -117,10 +122,6 @@ impl RelayHop for FixedRouter {
 
     fn sender(&self) -> &GrpcSender {
         &self.transport
-    }
-
-    fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
     }
 }
 

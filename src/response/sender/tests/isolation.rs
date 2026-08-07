@@ -2,117 +2,61 @@
 
 use super::{Harness, attempts, config, paused, port};
 use crate::router::loopback::Script;
-use crate::test_util::GlobalMetrics;
 use color_eyre::Result;
-use color_eyre::eyre::bail;
-use std::collections::BTreeMap;
+use std::array;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Semaphore;
-use tokio::time::Instant;
 
 /// The two destinations these suites address.
 const NODE_A: u8 = 1;
 const NODE_B: u8 = 2;
 
-/// Cells and slots the isolation fleets are built with.
-const CELLS: usize = 4;
-const SLOTS: usize = 2;
+/// Concurrent requests sent to the held destination.
+const HELD_REQUESTS: usize = 2;
 
-/// Sends per second the pacing suite configures, and the period that implies.
-const PACED_PER_SECOND: u32 = 2;
-const PERIOD: Duration = Duration::from_millis(500);
-
-/// Responses each destination is given in the pacing suite.
-const PACED_RESPONSES: usize = 4;
-
-/// A destination whose transport never answers holds only its own slots.
+/// A destination whose transport never answers does not delay another node.
 ///
 /// The held destination's first attempt is awaited before the healthy one is
-/// queued, so the barrier is provably up when the healthy delivery is asserted.
+/// sent, so the barrier is provably up when the healthy delivery is asserted.
 #[test]
 fn a_held_destination_never_delays_a_healthy_one() -> Result<()> {
     let runtime = paused()?;
     runtime.block_on(async {
-        let mut harness = Harness::new(config(CELLS, SLOTS))?;
+        let mut harness = Harness::new(config())?;
         let barrier = Arc::new(Semaphore::new(0));
         harness.script(NODE_A, Script::Hold(Arc::clone(&barrier)));
 
-        for _ in 0..SLOTS {
-            harness.send(NODE_A)?;
-        }
-        assert_eq!(
-            harness.next_delivery().await?.port,
-            port(NODE_A),
-            "the held destination must reach its transport first"
-        );
+        let held = array::from_fn::<_, HELD_REQUESTS, _>(|_| harness.start_send(NODE_A));
+        let mut held_attempts = usize::from(harness.next_delivery().await?.port == port(NODE_A));
 
-        harness.send(NODE_B)?;
-        assert_eq!(
-            harness.next_delivery().await?.port,
-            port(NODE_B),
+        let healthy = harness.start_send(NODE_B);
+        let mut healthy_attempted = false;
+        for _ in 0..HELD_REQUESTS {
+            let delivery = harness.next_delivery().await?;
+            held_attempts += usize::from(delivery.port == port(NODE_A));
+            healthy_attempted |= delivery.port == port(NODE_B);
+        }
+        assert!(
+            healthy_attempted,
             "a healthy destination must deliver while another one is held"
         );
 
         barrier.add_permits(1);
+        for send in held {
+            send.await??;
+        }
+        healthy.await??;
         let drained = harness.drain().await?;
         assert_eq!(
-            attempts(&drained.deliveries, NODE_A),
-            SLOTS - 1,
-            "the held destination's remaining response must arrive once released"
+            held_attempts + attempts(&drained.deliveries, NODE_A),
+            HELD_REQUESTS,
+            "each held response must make one attempt"
         );
         assert_eq!(
             drained.sent,
-            SLOTS as u64 + 1,
+            HELD_REQUESTS as u64 + 1,
             "every response must be delivered, not merely attempted"
         );
-        Ok(())
-    })
-}
-
-/// A destination's rate limit paces that destination and no other, and every
-/// send it held back is counted.
-///
-/// Both destinations are configured at the same rate, so a limiter shared
-/// between them would interleave their sends onto one schedule and neither
-/// would keep its own. Paused time makes the instants exact, so the number of
-/// sends that really waited is exact too: each destination's first send goes at
-/// once and every one after it waits.
-#[test]
-fn a_rate_limit_bounds_only_its_own_destination() -> Result<()> {
-    let metrics = GlobalMetrics::install();
-    let runtime = paused()?;
-    runtime.block_on(async {
-        let mut settings = config(CELLS, PACED_RESPONSES);
-        settings.sends_per_second = PACED_PER_SECOND;
-        let harness = Harness::new(settings)?;
-        let start = Instant::now();
-
-        for _ in 0..PACED_RESPONSES {
-            harness.send(NODE_A)?;
-            harness.send(NODE_B)?;
-        }
-
-        let drained = harness.drain().await?;
-        let expected: Vec<Duration> = (0..PACED_RESPONSES)
-            .map(|step| PERIOD * step as u32)
-            .collect();
-        for index in [NODE_A, NODE_B] {
-            let paced: Vec<Duration> = drained
-                .deliveries
-                .iter()
-                .filter(|delivery| delivery.port == port(index))
-                .map(|delivery| delivery.at.duration_since(start))
-                .collect();
-            if paced != expected {
-                bail!("node {index} was paced at {paced:?}, not at {expected:?}");
-            }
-        }
-        let waited = metrics.points("prosody.response.rate_limited")?;
-        let held_back = 2 * (PACED_RESPONSES as i64 - 1);
-        if waited != vec![(BTreeMap::new(), held_back)] {
-            bail!("{held_back} sends waited for their turn, but the counter reads {waited:?}");
-        }
         Ok(())
     })
 }

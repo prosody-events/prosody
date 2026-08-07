@@ -1,7 +1,6 @@
 //! One process's peer transport, registration, routing, and shutdown order.
 
 use crate::heartbeat::HeartbeatRegistry;
-use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::FrameCap;
 use crate::response::sender::Then;
@@ -64,9 +63,9 @@ pub(in crate::router) use tests::start_runtime;
 ///
 /// A runtime that is dropped instead still ends: the refresher stops when the
 /// watch channel closes, the listener stops when the one-shot sender drops, the
-/// registry's sweep stops when its last [`Arc`] drops, and this node's entry
-/// expires on its lease. What a plain drop cannot do is wake a parked waiter or
-/// wait for a reservation, which is why shutdown exists.
+/// registry drops when its last [`Arc`] drops, and this node's entry expires on
+/// its lease. What a plain drop cannot do is wake a parked waiter or wait for a
+/// reservation. This is why shutdown exists.
 ///
 /// The directory backend travels with this type and stops here. Its handles
 /// hand out values that name `D`, and those values are `Clone`, so no borrow
@@ -117,7 +116,6 @@ pub(crate) struct PreparedLocalPeerRuntime {
 /// A running local-only peer runtime.
 pub(crate) struct LocalPeerRuntime {
     pending: Arc<PendingRegistry>,
-    fleet: Arc<DestinationFleet>,
 }
 
 /// Everything one peer runtime is built from.
@@ -139,7 +137,6 @@ pub(crate) struct PeerInputs<'a, D> {
     pub(crate) probe: Option<SocketAddr>,
     pub(crate) router: &'a RouterConfiguration,
     pub(crate) fleet: FleetConfiguration,
-    pub(crate) requester: &'a RequesterConfiguration,
 }
 
 impl<D: NodeDirectory> PreparedPeerRuntime<D> {
@@ -166,13 +163,8 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         // One ceiling for both seams: the frames this process sends and the
         // frames its listener admits.
         let frame_cap = inputs.listener.frame_cap();
-        // The requester's ceiling and the listener's are validated apart and
-        // meet here for the first time. A requester that admits a payload no
-        // frame this listener accepts could carry would never receive one, and
-        // the caller would learn that only from its own timeout.
-        validate_response_ceiling(inputs.requester.max_response_bytes, frame_cap.bytes())?;
         let fleet = Arc::new(DestinationFleet::new(inputs.fleet)?);
-        let pending = PendingRegistry::new(inputs.requester, &inputs.heartbeats)?;
+        let pending = PendingRegistry::new();
         let transport = Arc::new(GrpcSender::new(frame_cap, &fleet));
         let directory = inputs.directory;
         // The blocking pool owns this wait; a runtime thread must not. The
@@ -181,13 +173,12 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         let discovered = match discover(inputs.probe).await {
             Ok(discovered) => discovered,
             Err(error) => {
-                pending.terminate().await;
+                pending.terminate();
                 return Err(PeerRuntimeError::Discovery(error));
             }
         };
         let registration = registration(NodeId::new(), &inputs.listener, discovered, inputs.router);
-        let addresses =
-            AddressResolver::new(inputs.router.address_cache_capacity, directory.clone());
+        let addresses = AddressResolver::new(inputs.fleet.peer_capacity, directory.clone());
         let router = RouterHandle::new(
             LocalTarget::new(registration.node, Arc::clone(&pending)),
             addresses.clone(),
@@ -202,14 +193,14 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
                 router.local().clone(),
                 Relay::new(router.clone()),
                 frame_cap,
-                inputs.fleet.send_deadline,
+                inputs.fleet.response_timeout,
             ),
             RuntimeHealth::new(inputs.heartbeats.clone()),
             async move { drop(stopped.await) },
         ) {
             Ok(listener) => listener,
             Err(error) => {
-                pending.terminate().await;
+                pending.terminate();
                 return Err(PeerRuntimeError::Listener(error));
             }
         };
@@ -307,7 +298,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
 
     /// Stops every local resource without publishing the node.
     pub(crate) async fn abandon(self) {
-        self.router.local.registry.terminate().await;
+        self.router.local.registry.terminate();
         abandon(self.stop_listener, self.listener).await;
     }
 }
@@ -317,13 +308,10 @@ impl PreparedLocalPeerRuntime {
     pub(crate) fn start(
         frame_cap: FrameCap,
         fleet: FleetConfiguration,
-        requester: &RequesterConfiguration,
-        heartbeats: &HeartbeatRegistry,
     ) -> Result<Self, PeerRuntimeError> {
-        validate_response_ceiling(requester.max_response_bytes, frame_cap.bytes())?;
         let fleet = Arc::new(DestinationFleet::new(fleet)?);
         Ok(Self {
-            local: LocalTarget::new(NodeId::new(), PendingRegistry::new(requester, heartbeats)?),
+            local: LocalTarget::new(NodeId::new(), PendingRegistry::new()),
             frame_cap,
             fleet,
         })
@@ -353,13 +341,12 @@ impl PreparedLocalPeerRuntime {
     pub(crate) fn activate(self) -> LocalPeerRuntime {
         LocalPeerRuntime {
             pending: self.local.registry,
-            fleet: self.fleet,
         }
     }
 
     /// Stops local resources before activation.
-    pub(crate) async fn abandon(self) {
-        self.local.registry.terminate().await;
+    pub(crate) fn abandon(self) {
+        self.local.registry.terminate();
     }
 }
 
@@ -375,8 +362,7 @@ impl LocalPeerRuntime {
         F: FnOnce() -> Fut,
         Fut: Future<Output = ()>,
     {
-        self.pending.terminate().await;
-        self.fleet.close().await;
+        self.pending.terminate();
         drain().await;
     }
 }
@@ -393,15 +379,10 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         &self.router.local.registry
     }
 
-    /// Shuts this process's peer machinery down, in the one order that cannot
-    /// leave a reservation behind.
+    /// Shuts this process's peer machinery down.
     ///
-    /// Takes `self`, so a second shutdown is unwritable and no handle has to be
-    /// taken out from behind a lock. `drain` is a closure rather than a future,
-    /// so this call alone decides when the drain starts. It runs it once the
-    /// gate has closed and emptied. A drain that joins response workers
-    /// terminates only after the last send handle drops; that precondition
-    /// belongs to [`ResponseWorkers`].
+    /// Takes `self`, so a second shutdown is unwritable. `drain` is a closure,
+    /// so this call alone decides when the drain starts.
     ///
     /// The body reads as the order. Three of its steps are where they are for a
     /// reason the code cannot show:
@@ -415,10 +396,6 @@ impl<D: NodeDirectory> PeerRuntime<D> {
     ///   long-lived inbound call could hold tonic's graceful shutdown open, and
     ///   every parked caller would then wait behind it. That call's own frame
     ///   can still reach the registry afterwards, and the registry refuses it.
-    /// - **Close the gate before the drain.** Reversed, a hook could reserve a
-    ///   slot on a fleet whose workers had already stopped, and its response
-    ///   would be dropped instead of delivered. [`DestinationFleet`]'s counted
-    ///   admission is what makes that an order rather than a race.
     ///
     /// Drive this to completion. A dropped shutdown future stops between two
     /// steps, and the tasks the remaining steps would have joined detach.
@@ -441,10 +418,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
             router,
         } = self;
 
-        let fleet = Arc::clone(&router.fleet);
         let pending = Arc::clone(&router.local.registry);
-        // The resolver only reads. The transport is already cloned into every
-        // response delivery worker.
         drop(router);
         // `send_replace` rather than `send`: a refresh task that already exited
         // leaves no receiver, and that is not a failure.
@@ -455,12 +429,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         let deregistered = directory.deregister(&registration).await;
 
         drop(stop_listener);
-        pending.terminate().await;
-        fleet.close().await;
-        // A `Drained` token minted by the close, and demanded by every drain,
-        // would make the reversed order uncompilable. It was examined and
-        // rejected: an owner can abandon a prepared peer without closing its
-        // fleet, so the token would reach a caller that holds none.
+        pending.terminate();
         drain().await;
         if let Err(error) = listener.await {
             error!(%error, "the peer listener task did not exit cleanly");
@@ -478,12 +447,6 @@ async fn abandon(stop: oneshot::Sender<()>, listener: JoinHandle<()>) {
     if let Err(join_error) = listener.await {
         error!(%join_error, "the abandoned peer listener task did not exit cleanly");
     }
-}
-
-fn validate_response_ceiling(bytes: usize, cap: usize) -> Result<(), PeerRuntimeError> {
-    (bytes <= cap)
-        .then_some(())
-        .ok_or(PeerRuntimeError::ResponseCeiling { bytes, cap })
 }
 
 /// A refresh delay inside the lease, jittered so a fleet does not renew into

@@ -2,10 +2,10 @@
 //! record when it does produce.
 
 use super::{
-    MAX_TIMEOUT, NODE, POOL, RequestPayload, TestError, distinct_indices, names, poll_once,
-    registry, requester,
+    NODE, POOL, RequestPayload, TestError, distinct_indices, names, poll_once, registry, requester,
 };
 use crate::Topic;
+use crate::requester::registry::tests::pending_len;
 use crate::requester::{
     HEADER_INLINE, Outcome, RequestError, ResponseFailure, append_request_headers,
 };
@@ -23,12 +23,6 @@ use std::iter::{empty, once};
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Requests one registry in these suites admits.
-const IN_FLIGHT: usize = 4;
-
-/// Most subsystems one request here names.
-const MAX_AWAITED: usize = 4;
 
 /// Timeout the accepted cases ask for.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -58,7 +52,7 @@ impl Arbitrary for HeaderTrace {
     fn arbitrary(g: &mut Gen) -> Self {
         // The last pool name carries a comma and is always awaited, so the
         // one-header-per-name rule is under test on every iteration.
-        let extra = usize::arbitrary(g) % MAX_AWAITED;
+        let extra = usize::arbitrary(g) % POOL.len();
         let awaited = distinct_indices(g, POOL.len() - 1, extra);
         let user = (0..usize::arbitrary(g) % (USER_NAMES.len() + 1))
             .map(|_| {
@@ -97,13 +91,12 @@ fn the_emitted_headers_parse_back(trace: HeaderTrace) -> TestResult {
 /// or produced.
 #[tokio::test]
 async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
-    let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
+    let registry = registry();
     let requester = requester(Arc::clone(&registry))?;
     let topic = Topic::from("requests");
     let none = names(&[])?;
     let repeated = names(&["billing", "ledger", "billing"])?;
     let one = names(&["billing"])?;
-    let over_cap = names(&POOL[..=MAX_AWAITED])?;
     match requester
         .request(empty(), topic, "key", RequestPayload, &none, TIMEOUT)
         .await
@@ -120,31 +113,6 @@ async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
             assert_eq!(name.as_str(), "billing");
         }
         other => bail!("a repeated subsystem must be refused, not {other:?}"),
-    }
-
-    match requester
-        .request(empty(), topic, "key", RequestPayload, &over_cap, TIMEOUT)
-        .await
-    {
-        Err(RequestError::TooManySubsystems { count, max }) => {
-            assert_eq!((count, max), (MAX_AWAITED + 1, MAX_AWAITED));
-        }
-        other => bail!("a request over the awaited limit must be refused, not {other:?}"),
-    }
-
-    match requester
-        .request(
-            empty(),
-            topic,
-            "key",
-            RequestPayload,
-            &one,
-            MAX_TIMEOUT + TIMEOUT,
-        )
-        .await
-    {
-        Err(RequestError::TimeoutOutOfRange { .. }) => {}
-        other => bail!("a timeout over the configured ceiling must be refused, not {other:?}"),
     }
 
     for reserved in RESERVED_REQUEST_HEADERS {
@@ -165,7 +133,7 @@ async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
     }
 
     assert_eq!(
-        registry.len(),
+        pending_len(&registry),
         0,
         "a refused request left a record in the registry"
     );
@@ -176,7 +144,7 @@ async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
 /// answers one outcome per named subsystem, and then leaves the registry empty.
 #[tokio::test(start_paused = true)]
 async fn a_valid_call_registers_first_and_gives_its_record_back() -> Result<()> {
-    let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
+    let registry = registry();
     let requester = requester(Arc::clone(&registry))?;
     let awaited = names(&["billing", "ledger"])?;
     let mut call = pin!(requester.request::<_, u32, TestError>(
@@ -192,14 +160,9 @@ async fn a_valid_call_registers_first_and_gives_its_record_back() -> Result<()> 
         "the call must park until a response or its deadline"
     );
     assert_eq!(
-        registry.len(),
-        1,
-        "the record reached the producer before the registry could answer for it"
-    );
-    assert_eq!(
-        registry.available_permits(),
-        IN_FLIGHT - 1,
-        "the call produced a record without taking an admission permit"
+        pending_len(&registry),
+        2,
+        "the record reached the producer before both waiters existed"
     );
 
     assert_eq!(
@@ -210,20 +173,19 @@ async fn a_valid_call_registers_first_and_gives_its_record_back() -> Result<()> 
         ],
         "one unanswered outcome must come back per named subsystem"
     );
-    assert_eq!(registry.len(), 0, "the finished call kept its map record");
     assert_eq!(
-        registry.available_permits(),
-        IN_FLIGHT,
-        "the finished call kept its admission permit"
+        pending_len(&registry),
+        0,
+        "the finished call kept its map record"
     );
     Ok(())
 }
 
-/// A call dropped before it finishes leaves no map record and no permit behind,
+/// A call dropped before it finishes leaves no map record behind,
 /// because the record belongs to the call rather than to the future's progress.
 #[tokio::test(start_paused = true)]
 async fn a_cancelled_call_leaves_the_registry_empty() -> Result<()> {
-    let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
+    let registry = registry();
     let requester = requester(Arc::clone(&registry))?;
     let awaited = names(&["billing", "ledger"])?;
     // Boxed rather than pinned on the stack, so dropping the handle drops the
@@ -240,14 +202,17 @@ async fn a_cancelled_call_leaves_the_registry_empty() -> Result<()> {
         poll_once(call.as_mut()).await.is_pending(),
         "the call must park until a response or its deadline"
     );
-    assert_eq!(registry.len(), 1, "the call registered no record to cancel");
+    assert_eq!(
+        pending_len(&registry),
+        2,
+        "the call registered no waiters to cancel"
+    );
 
     drop(call);
-    assert_eq!(registry.len(), 0, "a cancelled call kept its map record");
     assert_eq!(
-        registry.available_permits(),
-        IN_FLIGHT,
-        "a cancelled call kept its admission permit"
+        pending_len(&registry),
+        0,
+        "a cancelled call kept its map record"
     );
     Ok(())
 }

@@ -61,8 +61,7 @@ pub(crate) struct Delivery {
     pub(crate) deadline: Instant,
 }
 
-/// What one sender or responder came to, once every delivery worker had
-/// finished.
+/// What one sender or responder came to after all sends finished.
 pub(crate) struct Drained {
     pub(crate) deliveries: Vec<Delivery>,
     pub(crate) sent: u64,
@@ -236,6 +235,11 @@ impl TestRouter {
 }
 
 impl Router for TestRouter {
+    #[cfg(test)]
+    fn fleet(&self) -> &Arc<DestinationFleet> {
+        &self.fleet
+    }
+
     fn route(
         &self,
         node: NodeId,
@@ -265,10 +269,6 @@ impl RelayHop for TestRouter {
 
     fn sender(&self) -> &LoopbackSender {
         &self.transport
-    }
-
-    fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
     }
 }
 
@@ -350,7 +350,7 @@ pub(crate) fn paused() -> Result<Runtime, IoError> {
 
 /// Every attempt `deliveries` still holds, once nothing else can write to it.
 ///
-/// The stream is closed first, so the collection ends at what the workers
+/// The stream is closed first, so the collection ends at what the sender
 /// recorded rather than waiting for a sender that will never write again.
 pub(crate) async fn collect_deliveries(
     deliveries: &mut UnboundedReceiver<Delivery>,
@@ -363,11 +363,7 @@ pub(crate) async fn collect_deliveries(
     recorded
 }
 
-/// Builds a fleet configuration for the requested capacity.
-pub(crate) fn config(max_destinations: usize, slots_each: usize) -> FleetConfiguration {
-    FleetConfiguration {
-        max_destinations,
-        slots_each,
-        ..FleetConfiguration::default()
-    }
+/// Builds the response delivery configuration.
+pub(crate) fn config() -> FleetConfiguration {
+    FleetConfiguration::default()
 }

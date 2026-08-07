@@ -1,7 +1,6 @@
 //! Peer runtime startup errors.
 
 use super::discovery::DiscoveryError;
-use crate::requester::registry::RegistryError;
 use crate::router::fleet::config::FleetConfigurationError;
 use crate::router::grpc::TransportError;
 use thiserror::Error;
@@ -27,20 +26,7 @@ pub(crate) enum PeerRuntimeError {
     #[error("the destination fleet could not be built: {0:#}")]
     Fleet(#[from] FleetConfigurationError),
 
-    /// The pending request limits were invalid.
-    #[error("the pending registry could not be built: {0:#}")]
-    Registry(#[from] RegistryError),
-
     /// The bound peer listener could not start its service.
     #[error("the peer listener could not be served: {0:#}")]
     Listener(#[from] TransportError),
-
-    /// The response ceiling exceeds the listener's frame ceiling.
-    #[error("responses of up to {bytes} bytes are admitted behind a {cap}-byte frame cap")]
-    ResponseCeiling {
-        /// What the requester admits for one response payload.
-        bytes: usize,
-        /// What one frame this listener accepts may carry in total.
-        cap: usize,
-    },
 }

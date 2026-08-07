@@ -2,7 +2,6 @@
 
 use super::{BUDGET, Process, frame};
 use crate::response::ResponseDisposition;
-use crate::router::RelayHop;
 use crate::router::SendFailure;
 use crate::router::loopback::{Script, config, node, paused, port};
 use color_eyre::Result;
@@ -13,10 +12,6 @@ use tokio::sync::Semaphore;
 /// The node every case here sends a frame on to. It is not the process under
 /// test, so every frame is forwarded rather than accepted.
 const ELSEWHERE: u8 = 3;
-
-/// Cells and slots the fleet behind each case holds.
-const CELLS: usize = 4;
-const SLOTS: usize = 2;
 
 /// The budget one caller states in the deadline case. Any value works: the
 /// target never answers, so the budget is what ends the forward.
@@ -37,8 +32,8 @@ const SPENT: Duration = Duration::ZERO;
 fn a_failed_forward_is_never_answered_as_a_delivery() -> Result<()> {
     let runtime = paused()?;
     runtime.block_on(async {
-        let mut process = Process::new(config(CELLS, SLOTS), BUDGET)?;
-        let request = process.expects()?;
+        let mut process = Process::new(config(), BUDGET)?;
+        let mut request = process.expects()?;
         process.router.script(
             ELSEWHERE,
             Script::Fail {
@@ -48,7 +43,7 @@ fn a_failed_forward_is_never_answered_as_a_delivery() -> Result<()> {
         );
 
         let answered = process
-            .deliver(frame(node(ELSEWHERE), request, None)?, None)
+            .deliver(frame(node(ELSEWHERE), request.id(), None)?, None)
             .await?;
         assert_eq!(
             answered,
@@ -67,7 +62,7 @@ fn a_failed_forward_is_never_answered_as_a_delivery() -> Result<()> {
              attempt budget, and a relay that retried would multiply it"
         );
         assert!(
-            !process.stored(request)?,
+            !request.received(),
             "a frame for another process must never reach this one's registry"
         );
         Ok(())
@@ -85,12 +80,11 @@ fn a_failed_forward_is_never_answered_as_a_delivery() -> Result<()> {
 fn a_frame_that_arrives_with_no_budget_reserves_nothing() -> Result<()> {
     let runtime = paused()?;
     runtime.block_on(async {
-        let mut process = Process::new(config(CELLS, SLOTS), BUDGET)?;
+        let mut process = Process::new(config(), BUDGET)?;
         let request = process.expects()?;
-        let fleet = Arc::clone(process.router.fleet());
 
         let answered = process
-            .deliver(frame(node(ELSEWHERE), request, None)?, Some(SPENT))
+            .deliver(frame(node(ELSEWHERE), request.id(), None)?, Some(SPENT))
             .await?;
         assert_eq!(
             answered,
@@ -100,11 +94,6 @@ fn a_frame_that_arrives_with_no_budget_reserves_nothing() -> Result<()> {
         assert!(
             process.recorded().is_none(),
             "a frame with no budget left must reach no transport"
-        );
-        assert_eq!(
-            fleet.live_count(),
-            0,
-            "a frame with no budget left must admit no destination"
         );
         Ok(())
     })
@@ -120,14 +109,14 @@ fn a_frame_that_arrives_with_no_budget_reserves_nothing() -> Result<()> {
 fn a_forward_with_no_time_left_answers_deadline_exceeded() -> Result<()> {
     let runtime = paused()?;
     runtime.block_on(async {
-        let mut process = Process::new(config(CELLS, SLOTS), BUDGET)?;
+        let mut process = Process::new(config(), BUDGET)?;
         let request = process.expects()?;
         process
             .router
             .script(ELSEWHERE, Script::Hold(Arc::new(Semaphore::new(0))));
 
         let answered = process
-            .deliver(frame(node(ELSEWHERE), request, None)?, Some(GRANTED))
+            .deliver(frame(node(ELSEWHERE), request.id(), None)?, Some(GRANTED))
             .await?;
         assert_eq!(
             answered,

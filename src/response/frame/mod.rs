@@ -46,7 +46,7 @@ pub(crate) struct FrameCap(usize);
 /// [`Codec::FORMAT_ID`], so a frame cannot claim a format it was not encoded
 /// with. The protocol version is likewise the encoder's.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FrameHeader {
+pub struct FrameHeader {
     /// The node waiting for this response.
     pub(crate) target: NodeId,
     /// The request this response answers.

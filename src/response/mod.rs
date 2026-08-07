@@ -128,18 +128,10 @@ pub(crate) enum ResponseDisposition {
     UnknownRequest,
     /// The request existed but has already finished.
     ClosedRequest,
-    /// A response for that subsystem was already recorded.
-    DuplicateSubsystem,
-    /// The request is not awaiting that subsystem.
-    UnexpectedSubsystem,
-    /// The frame's format token is not the one the waiter's codec speaks.
-    FormatMismatch,
     /// The payload is larger than the waiting process retains for one response.
     ResponseTooLarge,
     /// The frame is for another node and has already been relayed once.
     AlreadyRelayed,
-    /// The relay has no capacity to forward the frame.
-    NoRelayCapacity,
     /// No time is left inside the caller's deadline to relay the frame.
     RelayDeadlineExceeded,
     /// The target node could not be resolved or could not be reached.
@@ -154,7 +146,7 @@ impl ResponseDisposition {
     /// status here.
     ///
     /// A relay answers five of these on its own: [`AlreadyRelayed`],
-    /// [`ResponseTooLarge`], [`NoRelayCapacity`], [`RelayDeadlineExceeded`] and
+    /// [`ResponseTooLarge`], [`RelayDeadlineExceeded`] and
     /// [`Unreachable`]. It passes the target's status through unchanged for
     /// every other outcome. Nothing on the wire says which process spoke, so a
     /// sender reads every status as the endpoint's own word. A per-process
@@ -163,18 +155,14 @@ impl ResponseDisposition {
     ///
     /// [`AlreadyRelayed`]: Self::AlreadyRelayed
     /// [`ResponseTooLarge`]: Self::ResponseTooLarge
-    /// [`NoRelayCapacity`]: Self::NoRelayCapacity
     /// [`RelayDeadlineExceeded`]: Self::RelayDeadlineExceeded
     /// [`Unreachable`]: Self::Unreachable
     pub(crate) const fn status(self) -> Code {
         match self {
             Self::Accepted => Code::Ok,
             Self::UnknownRequest | Self::ClosedRequest => Code::NotFound,
-            Self::DuplicateSubsystem => Code::AlreadyExists,
-            Self::UnexpectedSubsystem | Self::FormatMismatch | Self::AlreadyRelayed => {
-                Code::FailedPrecondition
-            }
-            Self::ResponseTooLarge | Self::NoRelayCapacity => Code::ResourceExhausted,
+            Self::AlreadyRelayed => Code::FailedPrecondition,
+            Self::ResponseTooLarge => Code::ResourceExhausted,
             Self::RelayDeadlineExceeded => Code::DeadlineExceeded,
             Self::Unreachable => Code::Unavailable,
         }
@@ -190,12 +178,8 @@ impl ResponseDisposition {
             Self::Accepted => "the response was accepted",
             Self::UnknownRequest => "no request by that id is registered here",
             Self::ClosedRequest => "that request has already finished",
-            Self::DuplicateSubsystem => "that subsystem already answered this request",
-            Self::UnexpectedSubsystem => "this request does not await that subsystem",
-            Self::FormatMismatch => "the payload format is not the one this request expects",
             Self::ResponseTooLarge => "the payload is over this process's response ceiling",
             Self::AlreadyRelayed => "the frame has already been relayed once",
-            Self::NoRelayCapacity => "this node has no capacity to relay the frame",
             Self::RelayDeadlineExceeded => "no time is left to relay the frame",
             Self::Unreachable => "the target node could not be reached from here",
         }
@@ -220,12 +204,8 @@ impl ResponseDisposition {
             Self::Accepted => "accepted",
             Self::UnknownRequest => "unknown_request",
             Self::ClosedRequest => "closed_request",
-            Self::DuplicateSubsystem => "duplicate_subsystem",
-            Self::UnexpectedSubsystem => "unexpected_subsystem",
-            Self::FormatMismatch => "format_mismatch",
             Self::ResponseTooLarge => "response_too_large",
             Self::AlreadyRelayed => "already_relayed",
-            Self::NoRelayCapacity => "no_relay_capacity",
             Self::RelayDeadlineExceeded => "relay_deadline_exceeded",
             Self::Unreachable => "unreachable",
         }

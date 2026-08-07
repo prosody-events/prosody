@@ -20,13 +20,6 @@ use color_eyre::eyre::ensure;
 use std::collections::BTreeMap;
 use strum::VariantArray;
 
-/// Destinations the fleet holds. Each case here addresses two nodes, so two
-/// cells hold them all.
-const DESTINATIONS: usize = 2;
-
-/// Responses one destination may hold at once.
-const SLOTS: usize = 2;
-
 /// A node every suite router publishes.
 const PUBLISHED: u8 = 0;
 
@@ -44,17 +37,15 @@ const OVER_CAP: usize = CAP_BYTES;
 ///
 /// The published response beside it is what makes the stage counters a
 /// progression rather than one number: it reaches `delivered`, and the
-/// unresolvable one stops after `enqueued`.
+/// unresolvable one stops after `attempted`.
 #[test]
 fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
     let metrics = GlobalMetrics::install();
-    let (fleet, drained) = paused()?.block_on(async {
-        let harness = Harness::new(config(DESTINATIONS, SLOTS))?;
-        let fleet = harness.fleet();
-        harness.send(PUBLISHED)?;
-        harness.send(UNPUBLISHED_NODE)?;
-        let drained = harness.drain().await?;
-        Ok::<_, color_eyre::Report>((fleet, drained))
+    let drained = paused()?.block_on(async {
+        let harness = Harness::new(config())?;
+        harness.send(PUBLISHED).await?;
+        harness.send(UNPUBLISHED_NODE).await?;
+        harness.drain().await
     })?;
     ensure!(
         (drained.sent, drained.dropped) == (1, 1),
@@ -67,11 +58,6 @@ fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
         "an unpublished node must reach no address"
     );
     ensure!(
-        fleet.available(node(UNPUBLISHED_NODE)) == Some(SLOTS),
-        "the unpublished node must return its slot"
-    );
-
-    ensure!(
         metrics.points("prosody.response.dropped")?
             == vec![(label("reason", "unresolvable_node"), 1)],
         "the drop must be counted under its reason alone: {:?}",
@@ -82,25 +68,14 @@ fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
             == vec![
                 (label("stage", "attempted"), 2),
                 (label("stage", "delivered"), 1),
-                (label("stage", "enqueued"), 2),
                 (label("stage", "framed"), 1),
             ],
         "the stages a response passes must each be counted once per response: {:?}",
         metrics.points("prosody.response.stages")?
     );
 
-    ensure!(
-        metrics.points("prosody.peer.fleet.destinations")? == vec![(BTreeMap::new(), 2)],
-        "both destinations must be counted live, under no attribute at all: {:?}",
-        metrics.points("prosody.peer.fleet.destinations")?
-    );
-
     let unresolvable = node(UNPUBLISHED_NODE).to_string();
-    for name in [
-        "prosody.response.dropped",
-        "prosody.response.stages",
-        "prosody.peer.fleet.destinations",
-    ] {
+    for name in ["prosody.response.dropped", "prosody.response.stages"] {
         for (attributes, _) in metrics.points(name)? {
             for (key, value) in attributes {
                 ensure!(
@@ -113,27 +88,18 @@ fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
     Ok(())
 }
 
-/// A response the frame cap cannot carry is counted under its own reason and
-/// gives its slot back.
+/// A response the frame cap cannot carry is counted under its own reason.
 ///
-/// The encoder refuses it, so this is the one drop reason a worker reports
-/// without reaching the transport at all. The response queued beside it is
-/// delivered, which is what makes the stage counters a progression: both are
-/// enqueued and only one is framed.
-///
-/// Both responses name the same destination, so the free slots read after the
-/// drain are that destination's own: a worker that kept the refused response's
-/// slot would leave one of them missing.
+/// The encoder refuses it before transport work. The other response completes.
+/// Thus, both are attempted and only one is framed.
 #[test]
-fn a_response_the_cap_refuses_is_counted_and_gives_its_slot_back() -> Result<()> {
+fn a_response_the_cap_refuses_is_counted() -> Result<()> {
     let metrics = GlobalMetrics::install();
-    let (fleet, drained) = paused()?.block_on(async {
-        let harness = Harness::new(config(DESTINATIONS, SLOTS))?;
-        let fleet = harness.fleet();
-        harness.send_payload(PUBLISHED, vec![0; OVER_CAP])?;
-        harness.send(PUBLISHED)?;
-        let drained = harness.drain().await?;
-        Ok::<_, color_eyre::Report>((fleet, drained))
+    let drained = paused()?.block_on(async {
+        let harness = Harness::new(config())?;
+        harness.send_payload(PUBLISHED, vec![0; OVER_CAP]).await?;
+        harness.send(PUBLISHED).await?;
+        harness.drain().await
     })?;
     ensure!(
         (drained.sent, drained.dropped) == (1, 1),
@@ -152,16 +118,10 @@ fn a_response_the_cap_refuses_is_counted_and_gives_its_slot_back() -> Result<()>
             == vec![
                 (label("stage", "attempted"), 2),
                 (label("stage", "delivered"), 1),
-                (label("stage", "enqueued"), 2),
                 (label("stage", "framed"), 1),
             ],
-        "a response the cap refuses must stop at enqueued: {:?}",
+        "a response the cap refuses must stop before framing: {:?}",
         metrics.points("prosody.response.stages")?
-    );
-    ensure!(
-        fleet.available(node(PUBLISHED)) == Some(SLOTS),
-        "every slot must come back, not {:?}",
-        fleet.available(node(PUBLISHED))
     );
     Ok(())
 }
@@ -177,20 +137,18 @@ fn a_response_the_cap_refuses_is_counted_and_gives_its_slot_back() -> Result<()>
 /// counts nothing, so a counter that moved once per candidate would read two as
 /// well.
 ///
-/// One worker drains one destination's queue in order, so the second response
-/// is dequeued after the first stored its preference. No wait is needed for
-/// that.
+/// The second response starts after the first response stores its preference.
 #[test]
 fn a_fallback_counts_the_transition_and_only_when_the_next_candidate_answers() -> Result<()> {
     let metrics = GlobalMetrics::install();
     let drained = paused()?.block_on(async {
-        let harness = Harness::dual_homed(config(DESTINATIONS, SLOTS))?;
+        let harness = Harness::dual_homed(config())?;
         harness.script(FALLS_BACK, never_answers());
         harness.script(SILENT, never_answers());
         harness.script_advertised(SILENT, never_answers());
-        harness.send(FALLS_BACK)?;
-        harness.send(FALLS_BACK)?;
-        harness.send(SILENT)?;
+        harness.send(FALLS_BACK).await?;
+        harness.send(FALLS_BACK).await?;
+        harness.send(SILENT).await?;
         harness.drain().await
     })?;
     ensure!(

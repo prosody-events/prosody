@@ -5,7 +5,6 @@ use super::super::{
 };
 use super::{CONTACT, listener};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::requester::config::RequesterConfiguration;
 use crate::router::directory::RegistrationTtl;
 use crate::router::directory::tests::support::test_directory;
 use crate::router::fleet::config::FleetConfiguration;
@@ -28,10 +27,9 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let router = RouterConfiguration {
-            address_cache_capacity: 0,
+            network: Some(String::new()),
             ..RouterConfiguration::default()
         };
-        let requester = RequesterConfiguration::default();
         // `start` refuses before it publishes anything, so an in-process
         // directory is enough and this case needs no cluster.
         let outcome = PreparedPeerRuntime::start(PeerInputs {
@@ -41,51 +39,11 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
             probe: Some(CONTACT),
             router: &router,
             fleet: FleetConfiguration::default(),
-            requester: &requester,
         })
         .await;
         assert!(
             matches!(outcome, Err(PeerRuntimeError::Configuration(_))),
-            "a cache capacity of zero must stop the runtime from starting"
-        );
-        Ok(())
-    })
-}
-
-/// `start` refuses a response ceiling no frame its own listener accepts could
-/// carry.
-///
-/// Each configuration is valid on its own and neither can see the other, so
-/// this is the one place the product of the two is checkable. Without the
-/// refusal every response at the admitted size would be dropped at the
-/// listener, and the caller would read that only as its own timeout. The
-/// accepting side needs no case here: every other runtime suite starts under
-/// the default requester, whose ceiling equals the default frame cap.
-#[test]
-fn start_refuses_a_response_ceiling_above_the_frame_cap() -> Result<()> {
-    init_test_logging();
-    TEST_RUNTIME.block_on(async {
-        let bound = listener().await?;
-        let cap = bound.frame_cap().bytes();
-        let router = RouterConfiguration::default();
-        let requester = RequesterConfiguration {
-            max_response_bytes: cap + 1,
-            ..RequesterConfiguration::default()
-        };
-        requester.validate()?;
-        let outcome = PreparedPeerRuntime::start(PeerInputs {
-            directory: test_directory(REFUSED_LEASE)?,
-            listener: bound,
-            heartbeats: HeartbeatRegistry::test(),
-            probe: Some(CONTACT),
-            router: &router,
-            fleet: FleetConfiguration::default(),
-            requester: &requester,
-        })
-        .await;
-        assert!(
-            matches!(outcome, Err(PeerRuntimeError::ResponseCeiling { .. })),
-            "a response ceiling above the frame cap must stop the runtime from starting"
+            "a blank network must stop the runtime from starting"
         );
         Ok(())
     })
@@ -117,8 +75,7 @@ fn prop_two_lost_refreshes_still_heal_inside_the_lease(seconds: u64) -> TestResu
 }
 
 /// The configuration refuses the degenerate values its fields can express: a
-/// blank or oversized label, port zero, a published port with no host beside
-/// it, and a cache capacity outside the range one process can hold.
+/// blank or oversized label, port zero, and a published port with no host.
 ///
 /// The label rule counts bytes, not characters, because bytes are what keeps a
 /// label inline. A label of 32 multi-byte characters is therefore refused,
@@ -143,10 +100,6 @@ fn configuration_refuses_degenerate_values() -> Result<()> {
         .network("east")
         .build()?;
     assert!(built.validate().is_ok(), "the entry point must validate");
-    assert_eq!(
-        built.address_cache_capacity, default.address_cache_capacity,
-        "a field the builder was not given must keep its default"
-    );
 
     let cases = [
         RouterConfiguration {
@@ -170,14 +123,6 @@ fn configuration_refuses_degenerate_values() -> Result<()> {
             advertised_port: Some(443),
             ..RouterConfiguration::default()
         },
-        RouterConfiguration {
-            address_cache_capacity: 0,
-            ..RouterConfiguration::default()
-        },
-        RouterConfiguration {
-            address_cache_capacity: super::super::config::MAX_ADDRESS_CACHE_CAPACITY + 1,
-            ..RouterConfiguration::default()
-        },
     ];
     for config in cases {
         assert!(
@@ -186,4 +131,24 @@ fn configuration_refuses_degenerate_values() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Peer caches accept every positive capacity and reject zero.
+#[test]
+fn peer_cache_capacity_is_positive() {
+    for capacity in [1, 100_000, usize::MAX] {
+        let config = FleetConfiguration {
+            peer_capacity: capacity,
+            ..FleetConfiguration::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "capacity {capacity} must validate"
+        );
+    }
+    let config = FleetConfiguration {
+        peer_capacity: 0,
+        ..FleetConfiguration::default()
+    };
+    assert!(config.validate().is_err(), "zero must be refused");
 }

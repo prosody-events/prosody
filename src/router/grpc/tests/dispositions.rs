@@ -1,216 +1,72 @@
-//! What a node answers for one delivery, and what that answer proves.
+//! Delivery status parity across the gRPC boundary.
 
-use super::{ALPHA, BETA, Harness, OVER_RESPONSE_BYTES, frame, header, payload, register};
-use crate::codec::Codec;
-use crate::requester::registry::PendingRegistry;
-use crate::response::frame::tests::CountingCodec;
-use crate::response::{RequestId, ResponseDisposition};
-use crate::router::NodeId;
-use crate::router::grpc::TRANSPORT;
-use crate::subsystem::SubsystemName;
+use super::{ALPHA, Harness, header, payload, register};
+use crate::response::RequestId;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
-use std::sync::Arc;
-use strum::VariantArray;
 use tonic::Code;
 
-/// A format token no codec in these suites speaks.
-const OTHER_FORMAT: &str = "not-the-test-format";
-
-/// A short payload, for the cases whose size is not the subject.
 const SHORT: usize = 8;
 
-/// Dispositions the relay suites cover, because each one needs a forward this
-/// listener's relay never completes.
-///
-/// `a_frame_this_process_already_relayed_is_never_relayed_again` reaches
-/// `AlreadyRelayed`, `a_flood_of_forwards_cannot_take_a_busy_cell` reaches
-/// `NoRelayCapacity`, and
-/// `a_forward_with_no_time_left_answers_deadline_exceeded`
-/// reaches `RelayDeadlineExceeded`.
-const RELAYED: &[ResponseDisposition] = &[
-    ResponseDisposition::AlreadyRelayed,
-    ResponseDisposition::NoRelayCapacity,
-    ResponseDisposition::RelayDeadlineExceeded,
-];
-
-/// One registry outcome, together with the seeding and the deliveries that
-/// reach it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::VariantArray)]
-enum Scenario {
-    Accepted,
-    UnknownRequest,
-    ClosedRequest,
-    DuplicateSubsystem,
-    UnexpectedSubsystem,
-    FormatMismatch,
-    ResponseTooLarge,
-}
-
-impl Scenario {
-    /// Seeds one registry and returns the request the deliveries name.
-    fn seed(self, registry: &Arc<PendingRegistry>) -> Result<RequestId> {
-        match self {
-            // Nothing is registered, so the id names no request anywhere.
-            Self::UnknownRequest => Ok(RequestId::new()),
-            Self::FormatMismatch => register(registry, &[ALPHA], OTHER_FORMAT),
-            // Two positions, so a repeat delivery finds the request still open
-            // and reports the duplicate rather than the closure.
-            Self::DuplicateSubsystem => {
-                register(registry, &[ALPHA, BETA], CountingCodec::FORMAT_ID)
-            }
-            _ => register(registry, &[ALPHA], CountingCodec::FORMAT_ID),
-        }
-    }
-
-    /// The deliveries this case makes, in order. The last one is the case.
-    fn deliveries(self) -> &'static [(&'static str, usize)] {
-        match self {
-            Self::ClosedRequest | Self::DuplicateSubsystem => &[(ALPHA, SHORT), (ALPHA, SHORT)],
-            Self::UnexpectedSubsystem => &[(BETA, SHORT)],
-            Self::ResponseTooLarge => &[(ALPHA, OVER_RESPONSE_BYTES)],
-            _ => &[(ALPHA, SHORT)],
-        }
-    }
-
-    /// What the last delivery must come to.
-    const fn expected(self) -> ResponseDisposition {
-        match self {
-            Self::Accepted => ResponseDisposition::Accepted,
-            Self::UnknownRequest => ResponseDisposition::UnknownRequest,
-            Self::ClosedRequest => ResponseDisposition::ClosedRequest,
-            Self::DuplicateSubsystem => ResponseDisposition::DuplicateSubsystem,
-            Self::UnexpectedSubsystem => ResponseDisposition::UnexpectedSubsystem,
-            Self::FormatMismatch => ResponseDisposition::FormatMismatch,
-            Self::ResponseTooLarge => ResponseDisposition::ResponseTooLarge,
-        }
-    }
-}
-
-/// Parity: the status a real listener returns for one frame is the status the
-/// registry's own disposition names for the same frame.
-///
-/// The scope is the transport and the mapping, not the registry: both sides
-/// call the same registry code, so what this proves is that nothing between the
-/// socket and the disposition changes the answer. The registry's own
-/// correctness is the requester suites'.
-///
-/// It also proves `OK` means stored: every accepting answer is followed by the
-/// same delivery again, which must no longer be accepted.
 #[test]
-fn every_wire_status_is_the_registry_disposition() -> Result<()> {
-    init_test_logging();
-    let mut covered = Vec::with_capacity(Scenario::VARIANTS.len());
-    for &scenario in Scenario::VARIANTS {
-        TEST_RUNTIME.block_on(play(scenario))?;
-        covered.push(scenario.expected());
-    }
-    for disposition in ResponseDisposition::VARIANTS {
-        let has_case = covered.contains(disposition)
-            || *disposition == ResponseDisposition::Unreachable
-            || RELAYED.contains(disposition);
-        ensure!(has_case, "{disposition:?} has no direct or relay case");
-    }
-    Ok(())
-}
-
-/// Drives `scenario` over the wire and against the oracle, and compares.
-async fn play(scenario: Scenario) -> Result<()> {
-    let harness = Harness::shared().await?;
-    let wire_request = scenario.seed(&harness.registry)?;
-    let oracle_request = scenario.seed(&harness.oracle)?;
-    let mut wire = Code::Ok;
-    let mut oracle = Code::Ok;
-    for (subsystem, bytes) in scenario.deliveries() {
-        wire = harness
-            .deliver(
-                &header(harness.node, wire_request, subsystem)?,
-                payload(*bytes),
-            )
-            .await?;
-        oracle = harness
-            .oracle
-            .accept(frame(
-                header(harness.node, oracle_request, subsystem)?,
-                &payload(*bytes),
-            ))
-            .status();
-    }
-    ensure!(
-        wire == oracle,
-        "the wire answered {wire:?} where the registry's disposition is {oracle:?}"
-    );
-    ensure!(
-        wire == scenario.expected().status(),
-        "{scenario:?} must answer {:?}, not {wire:?}",
-        scenario.expected().status()
-    );
-    if wire == Code::Ok {
-        let repeat = harness
-            .deliver(&header(harness.node, wire_request, ALPHA)?, payload(SHORT))
-            .await?;
-        ensure!(
-            repeat != Code::Ok,
-            "an accepted response must fill its position, so the same delivery again cannot be \
-             accepted"
-        );
-    }
-    Ok(())
-}
-
-/// An accepted response stores the bytes it carried, not merely a mark that a
-/// position was filled.
-#[test]
-fn an_accepted_response_stores_the_payload_it_carried() -> Result<()> {
+fn the_wire_reports_exact_waiter_consumption() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
-        let request = register(&harness.registry, &[ALPHA], CountingCodec::FORMAT_ID)?;
+        let mut request = register(&harness.registry, &[ALPHA])?;
+        let id = request.id();
+        let receiver = request.receiver()?;
         let sent = payload(SHORT);
-        let answered = harness
-            .deliver(&header(harness.node, request, ALPHA)?, sent.clone())
+
+        let accepted = harness
+            .deliver(&header(harness.node, id, ALPHA)?, sent.clone())
             .await?;
-        ensure!(answered == Code::Ok, "a well-formed response is accepted");
-        let stored = harness
-            .registry
-            .stored_payload(request, &SubsystemName::try_new(ALPHA)?);
         ensure!(
-            stored.as_deref() == Some(sent.as_slice()),
-            "the position must hold the bytes the frame carried, not {stored:?}"
+            accepted == Code::Ok,
+            "the matching waiter rejected its response"
         );
+
+        let frame = receiver.await?;
+        ensure!(
+            frame.payload.as_ref() == sent,
+            "the waiter received other bytes"
+        );
+
+        let repeated = harness
+            .deliver(&header(harness.node, id, ALPHA)?, payload(SHORT))
+            .await?;
+        ensure!(
+            repeated == Code::NotFound,
+            "a consumed waiter accepted twice"
+        );
+
+        let unknown = harness
+            .deliver(
+                &header(harness.node, RequestId::new(), ALPHA)?,
+                payload(SHORT),
+            )
+            .await?;
+        ensure!(unknown == Code::NotFound, "an unknown request was accepted");
         Ok(())
     })
 }
 
-/// A frame for another node forwards and finds no published target.
-///
-/// The failed forward never reaches the registry. The request remains fillable.
 #[test]
-fn a_frame_for_another_node_is_never_accepted() -> Result<()> {
+fn a_closed_receiver_reports_not_found() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
-        let request = register(&harness.registry, &[ALPHA], CountingCodec::FORMAT_ID)?;
-        let misrouted = TRANSPORT.misrouted();
-        let elsewhere = harness
-            .deliver(&header(NodeId::new(), request, ALPHA)?, payload(SHORT))
+        let mut request = register(&harness.registry, &[ALPHA])?;
+        let id = request.id();
+        drop(request.receiver()?);
+        let status = harness
+            .deliver(&header(harness.node, id, ALPHA)?, payload(SHORT))
             .await?;
         ensure!(
-            elsewhere == ResponseDisposition::Unreachable.status(),
-            "a frame for another node must answer UNAVAILABLE, not {elsewhere:?}"
-        );
-        ensure!(
-            TRANSPORT.misrouted() == misrouted + 1,
-            "a frame for another node must be counted as misrouted"
-        );
-        let here = harness
-            .deliver(&header(harness.node, request, ALPHA)?, payload(SHORT))
-            .await?;
-        ensure!(
-            here == Code::Ok,
-            "the misrouted frame must have left the request untouched, but it answered {here:?}"
+            status == Code::NotFound,
+            "a closed receiver reported another status"
         );
         Ok(())
     })

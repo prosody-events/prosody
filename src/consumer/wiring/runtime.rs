@@ -58,7 +58,7 @@ pub(in crate::consumer) struct StartupServices<'a, P> {
 /// client configured to report statistics, and its first observation is seeded
 /// by [`KafkaObserver::install_startup_metadata`], which owns that contract.
 ///
-/// `peer` selects request admission and response workers by type.
+/// `peer` selects request admission by type.
 ///
 /// Every caller wraps this future in `Box::pin`, because
 /// `clippy::large_futures` warns otherwise. The allocation is one per consumer
@@ -88,10 +88,7 @@ where
     A: ConsumerResources,
 {
     if let Err(error) = consumer_config.validate() {
-        // Release the last responder clone before peer abandonment joins its
-        // workers. Otherwise, this provider keeps every queue open.
         drop(handler_provider);
-        peer.workers().join().await;
         return Err(error.into());
     }
     let StartupServices {
@@ -120,7 +117,6 @@ where
         Ok(probe_server) => probe_server,
         Err(error) => {
             drop(handler_provider);
-            peer.workers().join().await;
             return Err(error.into());
         }
     };
@@ -142,28 +138,23 @@ where
     .await;
 
     // The failure arm for every step after the probe bound: the observation is
-    // discarded, the partition managers swept, the response workers joined, and
-    // the probe port freed. Clearing after the task, rather than inside it,
+    // discarded, the partition managers swept, and the probe port freed.
+    // Clearing after the task, rather than inside it,
     // also covers a fetch that panicked — see `KafkaObserver::clear`.
     //
-    // The sweep precedes the release, and both arms below run it for the same
-    // reason. Each retained manager holds a handler clone, and that clone holds
-    // a response send handle. The release joins the response workers, so it
-    // would wait for a sender a retained manager still owns. After a normal
-    // revoke the map is empty and the sweep does nothing.
+    // Both arms below sweep retained managers. After a normal revoke, the map
+    // is empty and the sweep does nothing.
     let consumer = match started {
         Ok(consumer) => consumer,
         Err(error) => {
             observer.clear();
             drain_managers(&managers).await;
-            peer.workers().join().await;
             return Err(release_probe(probe_server, error).await);
         }
     };
 
     // The resource type admits only the request tags it can answer.
     let admission = peer.admission();
-    let responses = peer.workers();
 
     let poll_interval = consumer_config.poll_interval;
     let heartbeat = heartbeats.register("Kafka poll loop");
@@ -191,7 +182,6 @@ where
         poll_handle,
         probe_server,
         observer,
-        responses,
     })));
 
     Ok(ProsodyConsumer {

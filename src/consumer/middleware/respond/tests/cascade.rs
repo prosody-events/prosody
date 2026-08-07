@@ -3,7 +3,7 @@
 //! Every suite here drives the real composed stack — log outside retry, retry
 //! outside respond — and reads the transport after an explicit drain.
 
-use super::{Drained, Fixture, ResultProbeCodec, cap, offset_tracker, tagged, untagged};
+use super::{Fixture, ResultProbeCodec, cap, offset_tracker, tagged, untagged};
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, RecordingTimer, ScriptedHandler, ScriptedHook, create_test_trigger,
 };
@@ -11,7 +11,7 @@ use crate::consumer::{DemandType, EventHandler};
 use crate::error::ErrorCategory;
 use crate::response::ResponseStatus;
 use crate::response::frame::decode::decode_frame;
-use crate::router::loopback::paused;
+use crate::router::loopback::{Delivery, paused};
 use color_eyre::Report;
 use color_eyre::Result;
 use quickcheck::{Arbitrary, Gen, QuickCheck};
@@ -56,9 +56,9 @@ fn at_most_one_response_per_final_invocation() {
         let (drained, invocations) = run(session)?;
         let seen = Expected {
             invocations,
-            responses: drained.deliveries.len(),
+            responses: drained.len(),
         };
-        Ok(seen == want && drained.sent == want.responses as u64)
+        Ok(seen == want)
     }
 
     QuickCheck::new().quickcheck(property as fn(RetrySession) -> Result<bool>);
@@ -94,11 +94,11 @@ fn a_retried_cascade_answers_once_with_the_settled_outcome() -> Result<()> {
 
         assert_eq!(invocations, 2, "the leaf runs one attempt and one retry");
         assert_eq!(
-            (drained.deliveries.len(), drained.sent),
-            (1, 1),
+            drained.len(),
+            1,
             "only the attempt that settled answers: {settled:?}",
         );
-        let mut delivery = drained.deliveries.remove(0);
+        let mut delivery = drained.remove(0);
         let frame = decode_frame(&mut delivery.bytes, cap()?)?;
         assert_eq!(
             frame.header.status, settled,
@@ -113,7 +113,7 @@ fn a_retried_cascade_answers_once_with_the_settled_outcome() -> Result<()> {
 #[test]
 fn an_untagged_message_forwards_its_result() -> Result<()> {
     paused()?.block_on(async {
-        let fixture = Fixture::<ResultProbeCodec>::new(1, 1)?;
+        let fixture = Fixture::<ResultProbeCodec>::new()?;
         let leaf = ScriptedHandler::success();
         let handler = fixture.stack(leaf.clone(), 0)?;
         let tracker = offset_tracker();
@@ -130,7 +130,7 @@ fn an_untagged_message_forwards_its_result() -> Result<()> {
 
         let hooks = leaf.hook_events();
         let drained = fixture.drain().await?;
-        assert!(drained.deliveries.is_empty(), "nothing was asked for");
+        assert!(drained.is_empty(), "nothing was asked for");
         assert!(
             hooks.contains(&ScriptedHook::AfterCommit(Ok(()))),
             "the handler's own hook still receives the result: {hooks:?}",
@@ -149,7 +149,7 @@ fn an_untagged_message_forwards_its_result() -> Result<()> {
 fn a_timer_dispatch_never_responds() -> Result<()> {
     for failure in [None, Some(ErrorCategory::Permanent)] {
         paused()?.block_on(async {
-            let fixture = Fixture::<ResultProbeCodec>::new(1, 1)?;
+            let fixture = Fixture::<ResultProbeCodec>::new()?;
             let leaf = failure.map_or_else(ScriptedHandler::success, |category| {
                 ScriptedHandler::always_failing(category)
             });
@@ -162,7 +162,7 @@ fn a_timer_dispatch_never_responds() -> Result<()> {
 
             let drained = fixture.drain().await?;
             assert!(
-                drained.deliveries.is_empty(),
+                drained.is_empty(),
                 "a timer dispatch must not respond, whatever the leaf answered",
             );
             assert_eq!(
@@ -214,9 +214,9 @@ fn category(g: &mut Gen) -> ErrorCategory {
 
 /// Runs one session against the real stack and reports what the transport saw,
 /// with the number of leaf invocations it took.
-fn run(session: RetrySession) -> Result<(Drained, usize)> {
+fn run(session: RetrySession) -> Result<(Vec<Delivery>, usize)> {
     paused()?.block_on(async {
-        let fixture = Fixture::<ResultProbeCodec>::new(1, 4)?;
+        let fixture = Fixture::<ResultProbeCodec>::new()?;
         let leaf = ScriptedHandler::failing_then_success(session.script);
         let handler = fixture.stack(leaf.clone(), session.max_retries)?;
         let tracker = offset_tracker();

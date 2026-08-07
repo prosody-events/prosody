@@ -14,11 +14,6 @@ use tonic::Code;
 /// that already names a relay both occur often.
 const POOL: u8 = 4;
 
-/// Cells and slots the fleet behind each case holds. One case forwards at most
-/// one frame, so both are small.
-const CELLS: usize = 4;
-const SLOTS: usize = 2;
-
 /// One frame's routing fields, drawn from a pool small enough that every arm of
 /// the decision is reached.
 #[derive(Clone, Copy, Debug)]
@@ -57,8 +52,8 @@ fn prop_a_frame_is_accepted_only_by_the_process_it_names(routed: Routed) -> Test
 
 /// Drives one case and holds it to the table.
 async fn play(routed: &Routed) -> Result<()> {
-    let mut process = Process::new(config(CELLS, SLOTS), super::BUDGET)?;
-    let request = process.expects()?;
+    let mut process = Process::new(config(), super::BUDGET)?;
+    let mut request = process.expects()?;
     let target = node(routed.target);
     let relay = routed.relay.map(node);
 
@@ -69,10 +64,10 @@ async fn play(routed: &Routed) -> Result<()> {
     let refused = !mine && relay.is_some();
 
     let answered = process
-        .deliver(frame(target, request, relay)?, None)
+        .deliver(frame(target, request.id(), relay)?, None)
         .await?;
 
-    if process.stored(request)? != accepted {
+    if request.received() != accepted {
         bail!(
             "the registry {} the response, and a frame is stored exactly when it names this \
              process",

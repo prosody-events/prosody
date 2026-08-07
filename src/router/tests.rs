@@ -2,8 +2,8 @@ use super::{
     LocalTarget, NodeId, Preference, RelayHop, Router, RouterHandle, SendFailure, choose_route,
 };
 use crate::Codec;
-use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
+use crate::requester::registry::tests::TestRegistration;
 use crate::response::ResponseStatus;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
@@ -43,7 +43,6 @@ impl ResponseRoute for CountedNetwork {
         _header: &FrameHeader,
         _payload: C::Payload,
         _destination: &Destination,
-        _attempts: u32,
         _expires_at: Instant,
     ) -> Result<RouteOutcome<C::Payload>, DropReason> {
         self.0.fetch_add(1, Ordering::Relaxed);
@@ -92,27 +91,21 @@ fn every_minted_node_id_is_a_fresh_random_uuid() {
 /// endpoint that gave it without asking anything else.
 #[test]
 fn every_failure_answers_the_two_questions_the_send_path_asks() {
-    // failure, ambiguous, wrong endpoint
+    // failure, wrong endpoint
     let table = [
-        (SendFailure::Unreachable, true, true),
-        (SendFailure::Undialable, false, true),
-        (SendFailure::Expired, false, true),
-        (answer(Code::Unavailable), true, true),
-        (answer(Code::Unimplemented), false, true),
-        (answer(Code::Cancelled), false, true),
-        (answer(Code::DeadlineExceeded), true, false),
-        (answer(Code::FailedPrecondition), false, false),
-        (answer(Code::ResourceExhausted), false, false),
-        (answer(Code::NotFound), false, false),
-        (answer(Code::Ok), false, false),
+        (SendFailure::Unreachable, true),
+        (SendFailure::Undialable, true),
+        (SendFailure::Expired, true),
+        (answer(Code::Unavailable), true),
+        (answer(Code::Unimplemented), true),
+        (answer(Code::Cancelled), true),
+        (answer(Code::DeadlineExceeded), false),
+        (answer(Code::FailedPrecondition), false),
+        (answer(Code::ResourceExhausted), false),
+        (answer(Code::NotFound), false),
+        (answer(Code::Ok), false),
     ];
-    for (failure, ambiguous, wrong_endpoint) in table {
-        assert_eq!(
-            failure.is_ambiguous(),
-            ambiguous,
-            "{failure} must{} be worth another attempt",
-            if ambiguous { "" } else { " not" }
-        );
+    for (failure, wrong_endpoint) in table {
         assert_eq!(
             failure.is_wrong_endpoint(),
             wrong_endpoint,
@@ -389,10 +382,10 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let node = NodeId::new();
         let subsystem = SubsystemName::try_new("local")?;
-        let registry = PendingRegistry::test(&RequesterConfiguration::default())?;
-        let request = registry.register_unguarded(
+        let registry = PendingRegistry::new();
+        let request = TestRegistration::new(
+            &registry,
             slice::from_ref(&subsystem),
-            CountingCodec::FORMAT_ID,
             Duration::from_secs(1),
         )?;
         let network_calls = Arc::new(AtomicUsize::new(0));
@@ -401,21 +394,20 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
             CountedNetwork(Arc::clone(&network_calls)),
         );
         let fleet = DestinationFleet::new(FleetConfiguration::default())?;
-        let reservation = fleet.reserve(node)?;
+        let destination = fleet.destination(node);
         let mut encoder = FrameEncoder::new(CountingCodec::default(), FrameCap::new(4096)?);
         let delivered = route
             .deliver(
                 &mut encoder,
                 &FrameHeader {
                     target: node,
-                    request,
+                    request: request.id(),
                     subsystem,
                     status: ResponseStatus::Success,
                     relay: None,
                 },
                 Vec::new(),
-                reservation.destination(),
-                1,
+                &destination,
                 Instant::now() + Duration::from_secs(1),
             )
             .await;
@@ -432,10 +424,7 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
 fn test_router(directory: TestDirectory) -> Result<RouterHandle<LoopbackSender, TestDirectory>> {
     let (transport, _recorded) = LoopbackSender::new();
     Ok(RouterHandle::new(
-        LocalTarget::new(
-            NodeId::new(),
-            PendingRegistry::test(&RequesterConfiguration::default())?,
-        ),
+        LocalTarget::new(NodeId::new(), PendingRegistry::new()),
         AddressResolver::new(CACHE_CAPACITY, directory),
         Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
         Arc::new(transport),

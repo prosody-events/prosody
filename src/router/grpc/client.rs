@@ -12,8 +12,6 @@ use bytes::BytesMut;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use quick_cache::UnitWeighter;
 use quick_cache::sync::{Cache, DefaultLifecycle};
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock};
 use tokio::time::Instant;
 use tonic::Request;
@@ -53,36 +51,23 @@ pub(crate) struct GrpcSender {
     channels: Arc<Channels>,
     cap: FrameCap,
     propagator: TextMapCompositePropagator,
-    #[cfg(test)]
-    attempts: AtomicU64,
 }
 
 impl GrpcSender {
     /// A sender for `fleet`, refusing to encode a frame over `cap`.
-    ///
-    /// The fleet is read rather than held: only its size is needed here, and a
-    /// destination's slots and pacing belong to the fleet itself.
     pub(crate) fn new(cap: FrameCap, fleet: &DestinationFleet) -> Self {
-        let destinations = fleet.config().max_destinations;
+        let capacity = fleet.config().peer_capacity;
         Self {
             channels: Arc::new(Cache::with(
-                destinations,
-                destinations as u64,
+                capacity,
+                capacity as u64,
                 UnitWeighter,
                 RandomState::default(),
                 DefaultLifecycle::default(),
             )),
             cap,
             propagator: new_propagator(),
-            #[cfg(test)]
-            attempts: AtomicU64::new(0),
         }
-    }
-
-    /// How many frames this sender handed to gRPC.
-    #[cfg(test)]
-    pub(crate) fn attempts(&self) -> u64 {
-        self.attempts.load(Relaxed)
     }
 
     /// The channel for `address`, dialling one on a miss.
@@ -118,8 +103,6 @@ impl ResponseSender for GrpcSender {
         frame: &F,
         deadline: Instant,
     ) -> Result<(), SendFailure> {
-        #[cfg(test)]
-        self.attempts.fetch_add(1, Relaxed);
         let channel = self.channel(address).await?;
         let bytes = frame.bytes();
         let mut buffer = BytesMut::with_capacity(bytes);
@@ -148,9 +131,7 @@ impl ResponseSender for GrpcSender {
             return Err(SendFailure::Expired);
         }
         request.set_timeout(remaining);
-        // The status is passed through as it arrived. Rewriting a code here can
-        // silently change a retry decision, because `SendFailure::is_ambiguous`
-        // reads exactly this code.
+        // The status is passed through as it arrived.
         match client
             .unary(
                 request,

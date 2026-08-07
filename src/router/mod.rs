@@ -75,7 +75,7 @@ pub(crate) struct NodeId(Uuid);
 /// preference only orders the candidates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(strum::VariantArray))]
-pub(crate) enum Preference {
+pub enum Preference {
     /// The address the node discovered for itself on its own network.
     Direct,
     /// The entry point that reaches the node from another network.
@@ -139,8 +139,8 @@ pub(crate) trait Framed {
 /// `Ok` means the destination accepted the frame. Everything else is a
 /// [`SendFailure`], and only an ambiguous one may be tried again.
 ///
-/// The frame is borrowed, so a sender writes straight from the one scratch
-/// buffer its worker owns rather than building a frame per response. A
+/// The frame is borrowed, so a sender writes straight from the encoder scratch
+/// rather than building another frame per response. A
 /// transport whose own encoder needs an owned item still pays for one: it
 /// copies the scratch into a buffer of its own, and that buffer is what the
 /// borrow keeps bounded by the frame ceiling. An owned seam here would put that
@@ -188,12 +188,6 @@ pub(crate) trait RelayHop: Clone + Send + Sync + 'static {
 
     /// The transport.
     fn sender(&self) -> &Self::Sender;
-
-    /// The process-wide fleet a response reserves a send slot from.
-    ///
-    /// Shared rather than borrowed, so a sender sized from this fleet can hold
-    /// it and can never reserve from another one.
-    fn fleet(&self) -> &Arc<DestinationFleet>;
 }
 
 /// Everything the response path needs to reach a peer: every endpoint a node
@@ -201,10 +195,13 @@ pub(crate) trait RelayHop: Clone + Send + Sync + 'static {
 /// fleet.
 ///
 /// One trait rather than three type parameters, so every signature on the
-/// response path names one `R`. Address resolution belongs here rather than at
-/// the apply hook that queues a response: reading the directory is an await,
-/// and an apply hook must not await.
+/// response path names one `R`. Address resolution belongs here, with the
+/// route call that can await it.
 pub(crate) trait Router: RelayHop {
+    /// The process-wide destination cache.
+    #[cfg(test)]
+    fn fleet(&self) -> &Arc<DestinationFleet>;
+
     /// The endpoints `node` may be dialed on from this process, in order. This
     /// is the responder's lookup, and [`choose_route`] decides what it answers.
     ///
@@ -313,13 +310,14 @@ impl<S: ResponseSender, D: NodeDirectory> RelayHop for RouterHandle<S, D> {
     fn sender(&self) -> &S {
         &self.transport
     }
-
-    fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
-    }
 }
 
 impl<S: ResponseSender, D: NodeDirectory> Router for RouterHandle<S, D> {
+    #[cfg(test)]
+    fn fleet(&self) -> &Arc<DestinationFleet> {
+        &self.fleet
+    }
+
     async fn route(&self, node: NodeId) -> Result<Option<Route>, D::Error> {
         let registration = self.addresses.resolve(node).await?;
         Ok(registration
@@ -329,25 +327,6 @@ impl<S: ResponseSender, D: NodeDirectory> Router for RouterHandle<S, D> {
 }
 
 impl SendFailure {
-    /// Whether another attempt could still get an answer.
-    ///
-    /// A destination that never answered may or may not have received the
-    /// frame, so a retry is the only way to find out. A retry is safe because a
-    /// requester accepts at most one response per request and subsystem: a
-    /// duplicate is dropped, never counted twice. Every other status is one
-    /// another attempt on this endpoint would only meet again.
-    ///
-    /// An address the transport cannot dial is not ambiguous either: the
-    /// address is resolved once per response, so the next attempt would be
-    /// given the same one and fail the same way, having spent the
-    /// destination's pacing on nothing.
-    pub(crate) const fn is_ambiguous(self) -> bool {
-        match self {
-            Self::Unreachable | Self::Status(Code::Unavailable | Code::DeadlineExceeded) => true,
-            Self::Undialable | Self::Expired | Self::Status(_) => false,
-        }
-    }
-
     /// Whether this attempt got no proof that this address serves the node, so
     /// the other endpoint is worth trying inside the same response.
     ///
@@ -476,7 +455,7 @@ pub(crate) enum SendFailure {
     Status(Code),
 
     /// Nothing answered before the send gave up. The frame may never have left
-    /// this process, or it may be in flight, so [`Self::is_ambiguous`] holds.
+    /// this process, or it may be in flight.
     #[error("nothing answered before the send gave up")]
     Unreachable,
 

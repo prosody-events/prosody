@@ -16,15 +16,6 @@ fn each_disposition_reports_its_documented_status() {
         (ResponseDisposition::Accepted, Code::Ok),
         (ResponseDisposition::UnknownRequest, Code::NotFound),
         (ResponseDisposition::ClosedRequest, Code::NotFound),
-        (ResponseDisposition::DuplicateSubsystem, Code::AlreadyExists),
-        (
-            ResponseDisposition::UnexpectedSubsystem,
-            Code::FailedPrecondition,
-        ),
-        (
-            ResponseDisposition::FormatMismatch,
-            Code::FailedPrecondition,
-        ),
         (
             ResponseDisposition::ResponseTooLarge,
             Code::ResourceExhausted,
@@ -32,10 +23,6 @@ fn each_disposition_reports_its_documented_status() {
         (
             ResponseDisposition::AlreadyRelayed,
             Code::FailedPrecondition,
-        ),
-        (
-            ResponseDisposition::NoRelayCapacity,
-            Code::ResourceExhausted,
         ),
         (
             ResponseDisposition::RelayDeadlineExceeded,

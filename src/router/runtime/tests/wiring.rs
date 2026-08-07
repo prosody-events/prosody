@@ -8,13 +8,10 @@
 //! runtime can hold either argument.
 
 use super::super::{PeerInputs, PeerRuntime, RouterConfiguration};
-use super::{
-    ALPHA, CONTACT, LEASE, TIMEOUT, frame_cap, header, listener, requester, start_runtime,
-};
-use crate::codec::Codec;
+use super::{ALPHA, CONTACT, LEASE, TIMEOUT, frame_cap, header, listener, start_runtime};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
+use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
 use crate::router::directory::cassandra::CassandraNodeDirectory;
@@ -53,10 +50,6 @@ const NEIGHBOUR_ENTRY: u16 = 9402;
 /// The payload the forwarded frame carries.
 const PAYLOAD: &[u8] = b"sent on by the listener the runtime served";
 
-/// Destinations and slots the fleets in this suite hold.
-const DESTINATIONS: usize = 2;
-const SLOTS: usize = 2;
-
 /// One more listener, answering for one more node.
 struct Elsewhere {
     node: NodeId,
@@ -79,7 +72,6 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
     TEST_RUNTIME.block_on(async {
         let directory = cassandra_directory(LEASE).await?;
         let config = RouterConfiguration::builder().network(NETWORK).build()?;
-        let requester = requester();
         let runtime = start_runtime(PeerInputs {
             directory: directory.clone(),
             listener: listener().await?,
@@ -87,7 +79,6 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
             probe: Some(CONTACT),
             router: &config,
             fleet: FleetConfiguration::default(),
-            requester: &requester,
         })
         .await?;
         let neighbour = NodeRegistration {
@@ -163,11 +154,11 @@ impl Elsewhere {
     /// Its own relay never runs: every frame this suite sends it names it.
     async fn start() -> Result<Self> {
         let node = NodeId::new();
-        let registry = PendingRegistry::test(&RequesterConfiguration::default())?;
+        let registry = PendingRegistry::new();
         let bound = bind().await?;
         let address = local(bound.address().port());
         let cap = bound.frame_cap();
-        let (unused, _deliveries) = TestRouter::new(fleet_config(DESTINATIONS, SLOTS))?;
+        let (unused, _deliveries) = TestRouter::new(fleet_config())?;
         let (stop, stopped) = channel();
         let served = serve(
             bound,
@@ -217,7 +208,6 @@ async fn start_over(
     let bound = bind().await?;
     let here = local(bound.address().port());
     let config = RouterConfiguration::default();
-    let requester = requester();
     let runtime = start_runtime(PeerInputs {
         directory: directory.clone(),
         listener: bound,
@@ -225,7 +215,6 @@ async fn start_over(
         probe: Some(CONTACT),
         router: &config,
         fleet: FleetConfiguration::default(),
-        requester: &requester,
     })
     .await?;
     Ok((runtime, here))
@@ -238,26 +227,22 @@ async fn start_over(
 /// readable the moment the delivery returns.
 async fn sent_on(elsewhere: &Elsewhere, here: &Endpoint) -> Result<()> {
     let subsystem = SubsystemName::try_new(ALPHA)?;
-    let request = elsewhere.registry.register_unguarded(
-        from_ref(&subsystem),
-        CountingCodec::FORMAT_ID,
-        TIMEOUT,
-    )?;
-    let fleet = DestinationFleet::new(fleet_config(DESTINATIONS, SLOTS))?;
+    let mut request = TestRegistration::new(&elsewhere.registry, from_ref(&subsystem), TIMEOUT)?;
+    let receiver = request.receiver()?;
+    let fleet = DestinationFleet::new(fleet_config())?;
     let sender = GrpcSender::new(frame_cap()?, &fleet);
     let mut encoder = FrameEncoder::new(CountingCodec::default(), frame_cap()?);
-    let addressed = header(elsewhere.node, request, ALPHA)?;
+    let addressed = header(elsewhere.node, request.id(), ALPHA)?;
     let staged = encoder.stage(&addressed, PAYLOAD.to_vec())?;
     sender
         .deliver(here, &staged, Instant::now() + HANG_GUARD)
         .await
         .map_err(|failure| eyre!("the listener did not send the frame on: {failure}"))?;
-    let stored = elsewhere
-        .registry
-        .stored_payload(request, &subsystem)
-        .ok_or_else(|| eyre!("the frame never reached the node it named"))?;
+    let stored = receiver
+        .await
+        .map_err(|_| eyre!("the frame never reached the node it named"))?;
     ensure!(
-        stored.as_ref() == PAYLOAD,
+        stored.payload.as_ref() == PAYLOAD,
         "the node the frame named stored a payload nothing sent"
     );
     Ok(())

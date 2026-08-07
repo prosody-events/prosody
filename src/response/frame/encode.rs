@@ -47,7 +47,7 @@ use thiserror::Error;
 /// into the scratch and refuses anything whose complete frame would exceed the
 /// cap; only a [`Staged`] can be written, so "framed before the cap was
 /// checked" is unrepresentable.
-pub(crate) struct FrameEncoder<C> {
+pub struct FrameEncoder<C> {
     codec: C,
     scratch: Vec<u8>,
     cap: FrameCap,

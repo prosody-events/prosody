@@ -1,30 +1,12 @@
-//! What the sender does with the status a real listener answered.
+//! gRPC client address and method construction.
 
-use super::{ALPHA, Harness, header, payload, reaching, register};
-use crate::codec::Codec;
-use crate::response::frame::tests::CountingCodec;
-use crate::response::sender::TypedSender;
+use crate::router::Host;
 use crate::router::directory::Endpoint;
-use crate::router::grpc::TRANSPORT;
 use crate::router::grpc::client::{DELIVER_RESPONSE, peer_uri};
 use crate::router::grpc::generated::peer_server::SERVICE_NAME;
-use crate::router::{Host, NodeId, RelayHop};
-use crate::test_util::TEST_RUNTIME;
-use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
-use opentelemetry::Context;
 use tonic::transport::Endpoint as Dialled;
-
-/// Destinations the retry pin's fleet holds: this node and the one a stale
-/// entry points elsewhere.
-const DESTINATIONS: usize = 2;
-
-/// Responses one destination may hold at once.
-const SLOTS: usize = 2;
-
-/// A short payload, for the cases whose size is not the subject.
-const SHORT: usize = 8;
 
 /// Every host a node can publish makes a URI the dialer parses.
 ///
@@ -55,59 +37,4 @@ fn the_method_path_names_the_generated_service() -> Result<()> {
         DELIVER_RESPONSE.as_str()
     );
     Ok(())
-}
-
-/// A status the destination answered decides whether the response is tried
-/// again: `NOT_FOUND` is the destination's own answer and is never repeated,
-/// while `UNAVAILABLE` may or may not have landed and is.
-///
-/// The count is taken at the service, after the network, so no client-side
-/// bookkeeping can stand in for it, and it is read after the worker join, which
-/// returns once every worker has finished.
-#[test]
-fn a_terminal_status_is_attempted_once_and_an_ambiguous_one_is_retried() -> Result<()> {
-    init_test_logging();
-    TEST_RUNTIME.block_on(async {
-        let harness = Harness::shared().await?;
-        let router = reaching(harness.cap, &harness.address, DESTINATIONS, SLOTS)?;
-        let attempts = router.fleet().config().max_send_attempts;
-
-        // Nothing is registered under this id, so the node answers NOT_FOUND.
-        let (terminal, terminal_workers) =
-            TypedSender::<CountingCodec>::new_without_local(&router, harness.cap)?;
-        let served = TRANSPORT.served();
-        let unregistered = register(&harness.oracle, &[ALPHA], CountingCodec::FORMAT_ID)?;
-        terminal
-            .send(
-                header(harness.node, unregistered, ALPHA)?,
-                Context::current(),
-                payload(SHORT),
-            )
-            .map_err(|_| eyre!("the fleet refused a slot"))?;
-        drop(terminal);
-        terminal_workers.join().await;
-        ensure!(
-            TRANSPORT.served() == served + 1,
-            "a terminal status must be attempted exactly once"
-        );
-
-        // Addressed to another node, so this one answers UNAVAILABLE.
-        let (ambiguous, ambiguous_workers) =
-            TypedSender::<CountingCodec>::new_without_local(&router, harness.cap)?;
-        let served = TRANSPORT.served();
-        ambiguous
-            .send(
-                header(NodeId::new(), unregistered, ALPHA)?,
-                Context::current(),
-                payload(SHORT),
-            )
-            .map_err(|_| eyre!("the fleet refused a slot"))?;
-        drop(ambiguous);
-        ambiguous_workers.join().await;
-        ensure!(
-            TRANSPORT.served() == served + u64::from(attempts),
-            "an ambiguous status must be attempted {attempts} times"
-        );
-        Ok(())
-    })
 }

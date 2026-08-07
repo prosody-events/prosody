@@ -73,13 +73,6 @@ pub(crate) const REQUEST_REVISION: &str = "1";
 /// forms, so one id has one text form.
 pub(crate) const ID_TEXT_LEN: usize = Hyphenated::LENGTH;
 
-/// Most `response-awaited` headers one record may carry.
-///
-/// The ceiling is the wire's, not a requester's: a record naming more
-/// subsystems than this is refused rather than scanned, so the parse stays
-/// bounded whatever a topic writer composes.
-pub(crate) const MAX_AWAITED: usize = 32;
-
 /// Decodes refused by their reserved headers, by fixed reason label.
 static REJECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter("prosody")
@@ -143,8 +136,7 @@ impl RequestTag {
 ///
 /// The parse allocates nothing — a handful of stack scalars and two 16-byte ids
 /// out — and is linear in the record's header count, which the broker's own
-/// record-size limit bounds. Only the awaited names carry a protocol cap, since
-/// they alone are a list a producer chooses the length of.
+/// record-size limit bounds.
 pub(crate) fn parse_request_tag<'h, H>(
     headers: H,
     responder: &SubsystemName,
@@ -162,9 +154,6 @@ where
         match key {
             RESPONSE_AWAITED_HEADER => {
                 awaited += 1;
-                if awaited > MAX_AWAITED {
-                    return Err(HeaderRejection::TooManyAwaited);
-                }
                 // Every name is validated even after a match is found: stopping
                 // early would make a later name's validity depend on where the
                 // producer put the match.
@@ -271,8 +260,6 @@ pub(crate) enum HeaderRejection {
     MalformedId,
     #[error("an awaited subsystem name is empty, not UTF-8, or too long")]
     MalformedAwaited,
-    #[error("more awaited subsystems than a request may name")]
-    TooManyAwaited,
 }
 
 impl HeaderRejection {
@@ -292,7 +279,6 @@ impl HeaderRejection {
             Self::UnsupportedVersion => "unsupported_version",
             Self::MalformedId => "malformed_id",
             Self::MalformedAwaited => "malformed_awaited",
-            Self::TooManyAwaited => "over_bound",
         }
     }
 }

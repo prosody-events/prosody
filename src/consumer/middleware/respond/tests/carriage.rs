@@ -11,7 +11,7 @@ use crate::consumer::{DemandType, EventHandler};
 use crate::error::ErrorCategory;
 use crate::response::frame::decode::decode_frame;
 use crate::response::{RequestId, ResponseStatus};
-use crate::router::loopback::{node, paused};
+use crate::router::loopback::{TestRouter, node, paused};
 use color_eyre::Result;
 
 /// The tag reaches the wire from the error arm as well as the success arm.
@@ -21,7 +21,7 @@ use color_eyre::Result;
 #[test]
 fn metadata_rides_the_error_arm() -> Result<()> {
     paused()?.block_on(async {
-        let fixture = Fixture::<ResultProbeCodec>::new(1, 1)?;
+        let fixture = Fixture::<ResultProbeCodec>::new()?;
         let leaf = ScriptedHandler::always_failing(ErrorCategory::Permanent);
         let handler = fixture.stack(leaf, 0)?;
         let tracker = offset_tracker();
@@ -37,11 +37,8 @@ fn metadata_rides_the_error_arm() -> Result<()> {
         drop(handler);
 
         let mut drained = fixture.drain().await?;
-        assert_eq!(
-            (drained.deliveries.len(), drained.sent, drained.dropped),
-            (1, 1, 0),
-        );
-        let mut delivery = drained.deliveries.remove(0);
+        assert_eq!(drained.len(), 1);
+        let mut delivery = drained.remove(0);
         let frame = decode_frame(&mut delivery.bytes, cap()?)?;
         assert_eq!(
             frame.header.target,
@@ -84,8 +81,8 @@ fn settlement_delegates_both_result_arms() {
     };
 
     let bypassed = [
-        RespondHandler::<BypassedHandler, ResultProbeCodec>::settlement(Ok(&output)),
-        RespondHandler::<BypassedHandler, ResultProbeCodec>::settlement(Err(&failure)),
+        RespondHandler::<BypassedHandler, ResultProbeCodec, TestRouter>::settlement(Ok(&output)),
+        RespondHandler::<BypassedHandler, ResultProbeCodec, TestRouter>::settlement(Err(&failure)),
     ];
     assert_eq!(
         bypassed,
@@ -94,8 +91,8 @@ fn settlement_delegates_both_result_arms() {
     );
 
     let settled = [
-        RespondHandler::<ScriptedHandler, ResultProbeCodec>::settlement(Ok(&output)),
-        RespondHandler::<ScriptedHandler, ResultProbeCodec>::settlement(Err(&failure)),
+        RespondHandler::<ScriptedHandler, ResultProbeCodec, TestRouter>::settlement(Ok(&output)),
+        RespondHandler::<ScriptedHandler, ResultProbeCodec, TestRouter>::settlement(Err(&failure)),
     ];
     assert_eq!(
         settled,

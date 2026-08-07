@@ -6,8 +6,6 @@
 //! would still pass with the injection deleted, so it would prove nothing.
 
 use super::{ALPHA, Harness, header, payload, register};
-use crate::codec::Codec;
-use crate::response::frame::tests::CountingCodec;
 use crate::test_util::{GlobalSpans, TEST_RUNTIME, named};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
@@ -32,16 +30,16 @@ fn the_metadata_hop_carries_the_trace_context() -> Result<()> {
     let spans = GlobalSpans::install()?;
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
-        let traced = register(&harness.registry, &[ALPHA], CountingCodec::FORMAT_ID)?;
+        let traced = register(&harness.registry, &[ALPHA])?;
         let answered = harness
-            .deliver(&header(harness.node, traced, ALPHA)?, payload(SHORT))
+            .deliver(&header(harness.node, traced.id(), ALPHA)?, payload(SHORT))
             .instrument(info_span!("peer.test.call"))
             .await?;
         ensure!(answered == Code::Ok, "the traced delivery must be accepted");
 
-        let untraced = register(&harness.registry, &[ALPHA], CountingCodec::FORMAT_ID)?;
+        let untraced = register(&harness.registry, &[ALPHA])?;
         let answered = harness
-            .deliver(&header(harness.node, untraced, ALPHA)?, payload(SHORT))
+            .deliver(&header(harness.node, untraced.id(), ALPHA)?, payload(SHORT))
             .await?;
         ensure!(
             answered == Code::Ok,

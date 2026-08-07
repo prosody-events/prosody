@@ -2,35 +2,40 @@
 
 use super::PeerConfiguration;
 use super::runtime::{
-    ConsumerHandle, PeerRouter, PreparedResponder, ProducerHandle, RouterOwner, prepare_router,
-    start_local_router,
+    ConsumerHandle, PeerRouter, ProducerHandle, RespondingLeaf, RespondingPeer, RouterOwner,
+    prepare_router, start_local_router,
 };
 use crate::Codec;
 use crate::consumer::ConsumerError;
-use crate::response::sender::{ResponseRoute, Then};
+use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
+use crate::response::frame::FrameHeader;
+use crate::response::frame::encode::FrameEncoder;
+use crate::response::sender::{DropReason, ResponseRoute, RouteOutcome, Then};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
+use crate::router::fleet::Destination;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::{LocalTarget, RouterHandle};
 use crate::state_reader::CassandraReaderBackend;
 use crate::subsystem::SubsystemName;
+use std::future::Future;
+use tokio::time::Instant;
 
 mod sealed {
+    use super::{ConsumerHandle, ResponseRoute};
+
     pub trait Router {}
-    pub trait Consumer {}
+    pub trait Consumer {
+        type Route: ResponseRoute;
+
+        fn handle(&self) -> &ConsumerHandle<Self::Route>;
+    }
 }
 
 /// A typed response capability from one router.
 ///
 /// Consumer constructors require this capability. It contains one response
 /// route and its matching fleet.
-pub trait ConsumerRouter: sealed::Consumer + Send + Sync + Sized + 'static {
-    /// Builds response access for one subsystem.
-    #[doc(hidden)]
-    fn responder<R: Codec>(
-        &self,
-        subsystem: SubsystemName,
-    ) -> Result<PreparedResponder<R>, ConsumerError>;
-}
+pub trait ConsumerRouter: sealed::Consumer + Send + Sync + Sized + 'static {}
 
 /// One peer route that separates into producer, consumer, and owner parts.
 ///
@@ -57,13 +62,23 @@ pub struct GrpcRouter {
 
 /// The local-only response capability.
 pub struct LocalConsumer {
-    inner: ConsumerHandle<LocalTarget>,
+    inner: ConsumerHandle<LocalResponseRoute>,
 }
 
 /// The local-first gRPC response capability.
 pub struct GrpcConsumer {
-    inner: ConsumerHandle<Then<LocalTarget, RouterHandle<GrpcSender, CassandraNodeDirectory>>>,
+    inner: ConsumerHandle<GrpcResponseRoute>,
 }
+
+/// The opaque local response route selected by [`LocalConsumer`].
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct LocalResponseRoute(LocalTarget);
+
+/// The opaque network response route selected by [`GrpcConsumer`].
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct GrpcResponseRoute(Then<LocalTarget, RouterHandle<GrpcSender, CassandraNodeDirectory>>);
 
 impl LocalRouter {
     /// Starts a local-only router.
@@ -91,35 +106,86 @@ impl GrpcRouter {
 
 impl sealed::Router for LocalRouter {}
 impl sealed::Router for GrpcRouter {}
-impl<R: ResponseRoute> sealed::Consumer for ConsumerHandle<R> {}
-impl sealed::Consumer for LocalConsumer {}
-impl sealed::Consumer for GrpcConsumer {}
+impl<R: ResponseRoute> sealed::Consumer for ConsumerHandle<R> {
+    type Route = R;
 
-impl<R: ResponseRoute> ConsumerRouter for ConsumerHandle<R> {
-    fn responder<RC: Codec>(
-        &self,
-        subsystem: SubsystemName,
-    ) -> Result<PreparedResponder<RC>, ConsumerError> {
-        self.build_responder(subsystem)
+    fn handle(&self) -> &ConsumerHandle<R> {
+        self
+    }
+}
+impl sealed::Consumer for LocalConsumer {
+    type Route = LocalResponseRoute;
+
+    fn handle(&self) -> &ConsumerHandle<Self::Route> {
+        &self.inner
     }
 }
 
-impl ConsumerRouter for LocalConsumer {
-    fn responder<R: Codec>(
-        &self,
-        subsystem: SubsystemName,
-    ) -> Result<PreparedResponder<R>, ConsumerError> {
-        self.inner.build_responder(subsystem)
+impl sealed::Consumer for GrpcConsumer {
+    type Route = GrpcResponseRoute;
+
+    fn handle(&self) -> &ConsumerHandle<Self::Route> {
+        &self.inner
     }
 }
 
-impl ConsumerRouter for GrpcConsumer {
-    fn responder<R: Codec>(
+impl<R: ResponseRoute> ConsumerRouter for ConsumerHandle<R> {}
+impl ConsumerRouter for LocalConsumer {}
+impl ConsumerRouter for GrpcConsumer {}
+
+impl ResponseRoute for LocalResponseRoute {
+    fn deliver<C: Codec>(
         &self,
-        subsystem: SubsystemName,
-    ) -> Result<PreparedResponder<R>, ConsumerError> {
-        self.inner.build_responder(subsystem)
+        encoder: &mut FrameEncoder<C>,
+        header: &FrameHeader,
+        payload: C::Payload,
+        destination: &Destination,
+        expires_at: Instant,
+    ) -> impl Future<Output = Result<RouteOutcome<C::Payload>, DropReason>> + Send {
+        self.0
+            .deliver(encoder, header, payload, destination, expires_at)
     }
+}
+
+impl ResponseRoute for GrpcResponseRoute {
+    fn deliver<C: Codec>(
+        &self,
+        encoder: &mut FrameEncoder<C>,
+        header: &FrameHeader,
+        payload: C::Payload,
+        destination: &Destination,
+        expires_at: Instant,
+    ) -> impl Future<Output = Result<RouteOutcome<C::Payload>, DropReason>> + Send {
+        self.0
+            .deliver(encoder, header, payload, destination, expires_at)
+    }
+}
+
+type RespondingParts<RT, C, M, H> = (
+    <M as HandlerMiddleware<<H as FallibleHandler>::Payload>>::Provider<
+        RespondingLeaf<H, C, <RT as sealed::Consumer>::Route>,
+    >,
+    RespondingPeer,
+);
+
+pub(crate) fn responding_provider<RT, C, M, H>(
+    router: &RT,
+    subsystem: SubsystemName,
+    middleware: &M,
+    handler: H,
+) -> RespondingParts<RT, C, M, H>
+where
+    RT: ConsumerRouter,
+    <RT as sealed::Consumer>::Route: ResponseRoute,
+    C: Codec<Payload = Result<H::Output, H::Error>>,
+    M: HandlerMiddleware<H::Payload>,
+    H: FallibleHandler + Clone + Send + Sync + 'static,
+    H::Output: Sync + 'static,
+    H::Error: Sync + 'static,
+{
+    router
+        .handle()
+        .responding_provider::<C, _, _>(subsystem, middleware, handler)
 }
 
 impl Router for LocalRouter {
@@ -127,7 +193,13 @@ impl Router for LocalRouter {
 
     fn split(self) -> (ProducerHandle, Self::Consumer, RouterOwner) {
         let (producer, consumer, owner) = self.inner.into_parts();
-        (producer, LocalConsumer { inner: consumer }, owner)
+        (
+            producer,
+            LocalConsumer {
+                inner: consumer.map_route(LocalResponseRoute),
+            },
+            owner,
+        )
     }
 }
 
@@ -136,6 +208,12 @@ impl Router for GrpcRouter {
 
     fn split(self) -> (ProducerHandle, Self::Consumer, RouterOwner) {
         let (producer, consumer, owner) = self.inner.into_parts();
-        (producer, GrpcConsumer { inner: consumer }, owner)
+        (
+            producer,
+            GrpcConsumer {
+                inner: consumer.map_route(GrpcResponseRoute),
+            },
+            owner,
+        )
     }
 }

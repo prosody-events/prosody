@@ -329,8 +329,8 @@ fn retain_manager(
 
 fn peer_config(bind: SocketAddr) -> Result<PeerConfiguration> {
     Ok(PeerConfiguration::builder()
-        .bind(bind)
-        .reflection(false)
+        .bind_address(bind)
+        .enable_reflection(false)
         .build()?)
 }
 

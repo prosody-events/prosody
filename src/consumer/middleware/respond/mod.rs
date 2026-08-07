@@ -5,7 +5,7 @@
 //! This layer reads that tag and the record's own trace into an [`Answering`],
 //! carries it on both result arms, and — from
 //! [`after_commit`](FallibleHandler::after_commit) and nowhere else — moves
-//! the typed result into a destination slot.
+//! the typed result to the response route.
 //!
 //! **A dispatch that never reaches the final apply hook is never answered.**
 //! The layer never reads an error category to make that decision, so a
@@ -13,24 +13,19 @@
 //! attempts before it stay silent. The category rides the frame as a label
 //! only.
 //!
-//! Three live paths commit a tagged record and answer nothing. The dedup layer
+//! Two live paths commit a tagged record and answer nothing. The dedup layer
 //! fires no inner hook for a duplicate, so a redelivery of an answered record
-//! stays silent and its requester waits out its own deadline. A send this layer
-//! cannot queue — the fleet refuses a slot, or the destination's queue is full
-//! — returns the result to the inner hook instead. A crash between the durable
-//! commit and this hook loses the answer, and the marker suppresses the
-//! redelivery. A requester therefore always needs its own deadline.
+//! stays silent and its requester waits out its own deadline. A crash between
+//! the durable commit and this hook loses the answer. The marker suppresses
+//! the redelivery. A requester therefore always needs its own deadline.
 //!
 //! One live path answers a record whose keyed-state writes did not last. A
 //! permanently rejected stage still commits and still fires this hook, so the
 //! answer leaves with the label the handler's own result gives. The label
 //! reports the handler result, never the durability of the writes behind it.
 //!
-//! [`responding_provider`] is the only way to build the layer from outside this
-//! module, and it states what that placement guarantees. Its production caller
-//! is
-//! [`PreparedResponder::terminate`](crate::peer::runtime::PreparedResponder::terminate),
-//! which a responding consumer reaches through its own entry point.
+//! [`responding_provider`] is the only way to build this layer outside this
+//! module.
 
 use super::providers::{FallibleCloneProvider, LeafHandler};
 use super::{FallibleHandler, HandlerMiddleware, Settlement, SettlementHandler};
@@ -43,13 +38,8 @@ use crate::response::ResponseStatus;
 use crate::response::frame::FrameCap;
 use crate::response::headers::RequestTag;
 use crate::response::sender::ResponseRoute;
-#[cfg(test)]
-use crate::response::sender::SendCounters;
-use crate::response::sender::{ResponseWorkers, TypedSender};
-#[cfg(test)]
-use crate::router::Router;
+use crate::response::sender::TypedSender;
 use crate::router::fleet::DestinationFleet;
-use crate::router::fleet::config::FleetConfigurationError;
 use crate::subsystem::SubsystemName;
 use crate::timers::Trigger;
 use opentelemetry::Context;
@@ -60,15 +50,15 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 #[cfg(test)]
 mod tests;
 
-/// Queues one typed response for a subsystem.
+/// Sends one typed response for a subsystem.
 ///
 /// Construction requires the process router. Thus, a responder cannot detach
 /// from the directory and fleet that route its work.
 ///
 /// `subsystem` is the name this consumer answers peer requests for. The decode
 /// path and this responder use the same subsystem value.
-pub(crate) struct Responder<C: Codec> {
-    sender: TypedSender<C>,
+pub(crate) struct Responder<C: Codec, R: ResponseRoute> {
+    sender: TypedSender<C, R>,
     subsystem: SubsystemName,
 }
 
@@ -81,9 +71,7 @@ pub(crate) struct Responder<C: Codec> {
 /// default a timer dispatch starts a trace of its own, so an ambient context
 /// would answer outside the requester's trace.
 ///
-/// A [`Context`] rather than a [`Span`](tracing::Span): the response is framed
-/// in one task and sent from another, and a span finishes when any clone of it
-/// finishes.
+/// A [`Context`] preserves the request trace across the final apply hook.
 ///
 /// The capture happens while the message's processing state is still live, so
 /// `message.span()` is never `Span::none()` and the response leg can never open
@@ -117,50 +105,32 @@ pub(crate) struct Responded<T> {
 /// it accepts. The codec's payload is the handler's own `Result`, and a
 /// [`Codec::Payload`] must be `Send + Sync + 'static`. So both halves of that
 /// result need `Sync + 'static`, which a bare `FallibleHandler` does not.
-pub(crate) struct RespondHandler<H, C: Codec> {
+pub(crate) struct RespondHandler<H, C: Codec, R: ResponseRoute> {
     handler: H,
-    responder: Arc<Responder<C>>,
+    responder: Arc<Responder<C, R>>,
 }
 
-impl<C: Codec> Responder<C> {
+impl<C: Codec, R: ResponseRoute> Responder<C, R> {
     /// Builds a responder from one statically composed response route.
-    pub(crate) fn new_route<R: ResponseRoute>(
-        route: &R,
+    pub(crate) fn new_route(
+        route: R,
         fleet: &Arc<DestinationFleet>,
         cap: FrameCap,
         subsystem: SubsystemName,
-    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
-        let (sender, workers) = TypedSender::new_route(route, fleet, cap)?;
-        Ok((Self { sender, subsystem }, workers))
-    }
-
-    /// Builds a responder from the process router and the response frame cap.
-    ///
-    /// Returns the responder and its [`ResponseWorkers`], which owns the order
-    /// the caller must join them in.
-    #[cfg(test)]
-    pub(crate) fn new_without_local<R: Router>(
-        router: &R,
-        cap: FrameCap,
-        subsystem: SubsystemName,
-    ) -> Result<(Self, ResponseWorkers), FleetConfigurationError> {
-        let (sender, workers) = TypedSender::new_without_local(router, cap)?;
-        Ok((Self { sender, subsystem }, workers))
+    ) -> Self {
+        Self {
+            sender: TypedSender::new_route(route, fleet, cap),
+            subsystem,
+        }
     }
 
     /// The name this responder answers for, and the one the decode path admits.
     pub(crate) fn subsystem(&self) -> &SubsystemName {
         &self.subsystem
     }
-
-    /// Returns the response outcome counters.
-    #[cfg(test)]
-    pub(crate) fn counters(&self) -> Arc<SendCounters> {
-        self.sender.counters()
-    }
 }
 
-impl<H, C: Codec> Clone for RespondHandler<H, C>
+impl<H, C: Codec, R: ResponseRoute> Clone for RespondHandler<H, C, R>
 where
     H: Clone,
 {
@@ -172,8 +142,8 @@ where
     }
 }
 
-impl<H, C: Codec> RespondHandler<H, C> {
-    fn new(handler: H, responder: Arc<Responder<C>>) -> Self {
+impl<H, C: Codec, R: ResponseRoute> RespondHandler<H, C, R> {
+    fn new(handler: H, responder: Arc<Responder<C, R>>) -> Self {
         Self { handler, responder }
     }
 }
@@ -186,12 +156,13 @@ impl<E: ClassifyError> ClassifyError for Responded<E> {
     }
 }
 
-impl<H, C> FallibleHandler for RespondHandler<H, C>
+impl<H, C, R> FallibleHandler for RespondHandler<H, C, R>
 where
     H: FallibleHandler,
     H::Output: Sync + 'static,
     H::Error: Sync + 'static,
     C: Codec<Payload = Result<H::Output, H::Error>>,
+    R: ResponseRoute,
 {
     type Error = Responded<H::Error>;
     type Output = Responded<H::Output>;
@@ -245,14 +216,13 @@ where
             .map_err(|inner| Responded { inner, meta: None })
     }
 
-    /// Queues a requested response after a final invocation.
+    /// Sends a requested response after a final invocation.
     ///
     /// When the sender takes the result, the inner hook does not run. The
     /// response becomes the disposition of that value.
     ///
-    /// A worker can later drop a queued response. In that case, neither the
-    /// wire nor the inner hook receives it. Apply hooks are best-effort, so
-    /// nothing above depends on either one running.
+    /// The response becomes the disposition of the value. Thus, this method
+    /// does not call the inner hook.
     async fn after_commit<C2>(&self, context: C2, result: Result<Self::Output, Self::Error>)
     where
         C2: EventContext<Payload = Self::Payload>,
@@ -265,12 +235,7 @@ where
             return self.handler.after_commit(context, result).await;
         };
         let header = tag.header(self.responder.subsystem().clone(), status(&result));
-        // Nothing is encoded here. The hook moves the typed result into the
-        // slot. The worker encodes it against its own scratch.
-        if let Err(payload) = self.responder.sender.send(header, trace, result) {
-            // Nothing was sent or encoded. The handler still owns the result.
-            self.handler.after_commit(context, payload).await;
-        }
+        self.responder.sender.send(header, trace, result).await;
     }
 
     /// Forwards a non-final invocation's result to the inner hook.
@@ -294,12 +259,13 @@ where
     }
 }
 
-impl<H, C> SettlementHandler for RespondHandler<H, C>
+impl<H, C, R> SettlementHandler for RespondHandler<H, C, R>
 where
     H: SettlementHandler,
     H::Output: Sync + 'static,
     H::Error: Sync + 'static,
     C: Codec<Payload = Result<H::Output, H::Error>>,
+    R: ResponseRoute,
 {
     /// Delegates the inner classification.
     ///
@@ -328,17 +294,18 @@ where
 /// The common middleware block deliberately excludes this layer: a consumer
 /// answers peer requests or it does not, while every member of that block is
 /// mandatory.
-pub(crate) fn responding_provider<M, H, C>(
+pub(crate) fn responding_provider<M, H, C, R>(
     middleware: &M,
     handler: H,
-    responder: Arc<Responder<C>>,
-) -> M::Provider<FallibleCloneProvider<RespondHandler<LeafHandler<H>, C>>>
+    responder: Arc<Responder<C, R>>,
+) -> M::Provider<FallibleCloneProvider<RespondHandler<LeafHandler<H>, C, R>>>
 where
     M: HandlerMiddleware<H::Payload>,
     H: FallibleHandler + Clone + Send + Sync + 'static,
     H::Output: Sync + 'static,
     H::Error: Sync + 'static,
     C: Codec<Payload = Result<H::Output, H::Error>>,
+    R: ResponseRoute,
 {
     middleware.with_provider(FallibleCloneProvider::new(RespondHandler::new(
         LeafHandler::new(handler),

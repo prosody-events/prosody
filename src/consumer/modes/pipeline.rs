@@ -25,7 +25,7 @@ use crate::consumer::{Managers, ProsodyConsumer};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MessageLoader;
-use crate::peer::{ConsumerRouter, NoPeer};
+use crate::peer::{ConsumerRouter, NoPeer, responding_provider};
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
 use crate::state_reader::ConsumerReaderBackend;
@@ -188,8 +188,12 @@ impl PipelineMiddlewareStack {
         };
         // Preparation is the last fallible step of this mode, and no `?` runs
         // between it and the termination below.
-        let prepared = response.router.responder::<R>(response.subsystem)?;
-        let (provider, resources) = prepared.terminate(&middleware, handler);
+        let (provider, resources) = responding_provider::<_, R, _, _>(
+            response.router,
+            response.subsystem,
+            &middleware,
+            handler,
+        );
         Box::pin(initialize_consumer::<_, _, _, C, _>(
             &self.consumer_config,
             provider,

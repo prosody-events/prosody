@@ -18,14 +18,10 @@
 pub(crate) mod client;
 pub(crate) mod codec;
 mod conn;
-mod counted;
 mod deadline;
 pub(crate) mod health;
 mod inject;
 pub(crate) mod service;
-mod witness;
-
-pub(crate) use witness::TRANSPORT;
 
 /// The peer service, written from `proto/peer.proto` at build time.
 pub(crate) mod generated {
@@ -35,8 +31,7 @@ pub(crate) mod generated {
 #[cfg(test)]
 mod tests;
 
-use self::conn::admitted;
-use self::counted::Counted;
+use self::conn::incoming;
 use self::generated::peer_server::PeerServer;
 use self::health::{PeerHealth, ProcessHealth};
 use self::service::PeerService;
@@ -53,7 +48,7 @@ use tonic::transport::Server;
 use tonic_health::pb::health_server::HealthServer;
 use tonic_reflection::server::{Builder as ReflectionBuilder, Error as ReflectionError};
 use tracing::error;
-use validator::{Validate, ValidationError, ValidationErrors};
+use validator::{Validate, ValidationErrors};
 
 /// The peer schema, embedded so reflection can publish it without a file.
 const DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/peer_descriptor.bin"));
@@ -62,86 +57,18 @@ const DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/peer_des
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How long a pinged peer has to answer before its connection is closed.
-///
-/// Together with [`KEEPALIVE_INTERVAL`] this is what bounds a permit whose peer
-/// stopped answering. A peer that dies without a FIN would otherwise hold its
-/// admission permit for the life of the process.
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Most one health or reflection request may carry. Both messages are a service
 /// name at most, so this ceiling is small and fixed rather than configurable.
 const CONTROL_MESSAGE_BYTES: usize = 4 * 1024;
 
-/// Most concurrent connections one listener may be configured to hold. Each one
-/// costs a file descriptor, so this ceiling is the file-descriptor budget one
-/// process is given.
-const MAX_CONNECTIONS: usize = 4_096;
-
-/// Most concurrent streams one connection may be configured to open. Each open
-/// stream holds h2 buffers of its own, so this ceiling is what one connection
-/// may make this process hold.
-const MAX_STREAMS: u32 = 1_024;
-
-/// Most bytes of half-read frames one listener may commit to.
-///
-/// Three copies of one message are live at the peak of a delivery: the bytes
-/// HTTP/2 admits before the transport reads them, the message the transport
-/// assembles from them, and the one right-sized copy the reader takes. So what
-/// the listener commits to is the connection cap multiplied by that peak, and
-/// [`serve`] sets the HTTP/2 windows from the same peak rather than leaving
-/// them at a library default no configuration reaches. Each cap is plausible
-/// alone; the product is the memory, so they are checked together. A quarter of
-/// the process's memory budget is what the peer port may take from the consumer
-/// that shares it. The listener accepts no compression, so a stream buffers one
-/// message rather than a compressed one and its expansion.
-///
-/// A frame this process sends on is held past that peak: the decoded frame
-/// moves into the forwarded form and stays live for the whole outbound round
-/// trip, beside the outbound encode buffer. A forward needs a send slot, so the
-/// destination fleet is what bounds how many of those are live at once.
-const MAX_RECEIVE_BYTES: u64 = 256 * 1024 * 1024;
-
-/// What one stream buffers however small the frame ceiling is: the transport
-/// allocates its receive buffer before it can know the message's length, and
-/// grows it to the message from there.
-const STREAM_BUFFER_FLOOR: usize = 8 * 1024;
-
-/// The connection window HTTP/2 grants before either end asks for another.
-///
-/// HTTP/2 grants this much at the start of every connection, and no endpoint
-/// can take a granted window back. A listener that configures less therefore
-/// only sets the value the window grows from. So this is the floor under what
-/// one connection holds, whatever the caps come to.
-const SPEC_CONNECTION_WINDOW: u64 = 65_535;
-
-/// The largest window HTTP/2 can carry.
-const MAX_WINDOW: u32 = u32::MAX >> 1;
-
-/// Connections one listener holds when an operator sets no number.
-///
-/// One peer holds one connection, so this is how many peers may answer this
-/// node at once. It is well above the destinations one process dials by
-/// default, and it keeps the default caps inside [`MAX_RECEIVE_BYTES`].
-const DEFAULT_MAX_CONNECTIONS: usize = 128;
-
-/// Streams one connection opens by default.
-///
-/// A destination's worker sends one response at a time, so a peer needs one
-/// stream per response type it sends this node, not one per response. The
-/// receive budget goes to connections rather than to streams: the listener
-/// refuses a connection over the cap, but a stream over the cap only waits.
-const DEFAULT_MAX_STREAMS: u32 = 8;
-
 /// What an operator sets for the peer listener.
 ///
 /// Every field has a working default, so a process that serves peers needs no
-/// configuration at all. The per-message ceiling bounds one frame; the two
-/// concurrency caps bound how many of them can be in flight before any registry
-/// admission is consulted; and [`MAX_RECEIVE_BYTES`] bounds what the three come
-/// to together.
+/// configuration. The frame ceiling bounds each request and response.
 #[derive(Builder, Clone, Copy, Debug, Validate)]
 #[builder(setter(into), default)]
-#[validate(schema(function = "validate_receive_budget"))]
 pub(crate) struct TransportConfiguration {
     /// The address the listener binds. Port zero asks the operating system for
     /// one, and [`BoundListener`] is then the only place that port can be read.
@@ -151,15 +78,6 @@ pub(crate) struct TransportConfiguration {
     /// refuses a larger message before it is decoded, and the client refuses
     /// one before it is sent.
     pub(crate) frame_cap: FrameCap,
-
-    /// How many connections the listener holds at once. One over the cap is
-    /// refused and counted, never queued.
-    #[validate(range(min = 1_usize, max = MAX_CONNECTIONS))]
-    pub(crate) max_connections: usize,
-
-    /// How many streams one connection may run at once.
-    #[validate(range(min = 1_u32, max = MAX_STREAMS))]
-    pub(crate) max_concurrent_streams: u32,
 
     /// Whether the listener publishes the peer schema through server
     /// reflection. It is the one thing here that hands an unauthenticated
@@ -186,19 +104,8 @@ impl Default for TransportConfiguration {
         Self {
             bind: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             frame_cap: FrameCap::DEFAULT,
-            max_connections: DEFAULT_MAX_CONNECTIONS,
-            max_concurrent_streams: DEFAULT_MAX_STREAMS,
             reflection: true,
         }
-    }
-}
-
-impl TransportConfiguration {
-    /// Creates a transport configuration builder.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn builder() -> TransportConfigurationBuilder {
-        TransportConfigurationBuilder::default()
     }
 }
 
@@ -238,11 +145,7 @@ impl BoundListener {
 /// This is the one place the peer server is built. Transport security and peer
 /// authorization are designed separately, and they attach here.
 ///
-/// The stream cap and the two HTTP/2 windows are what one connection is held
-/// to, and the windows come from the same peak [`MAX_RECEIVE_BYTES`] is checked
-/// against. No concurrency limit is set beside them: for a unary method it
-/// would bound service execution inside a connection HTTP/2 already limits to
-/// that many streams.
+/// Tonic and HTTP/2 provide flow control. Prosody adds no concurrency limit.
 ///
 /// # Errors
 ///
@@ -269,16 +172,11 @@ where
         })
         .transpose()?
         .map(|service| service.max_decoding_message_size(CONTROL_MESSAGE_BYTES));
-    let incoming = admitted(bound.listener, config.max_connections);
+    let incoming = incoming(bound.listener);
     let router = Server::builder()
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
-        .max_concurrent_streams(config.max_concurrent_streams)
-        .initial_stream_window_size(window(stream_bytes(&config)))
-        .initial_connection_window_size(window(connection_bytes(&config)))
-        .add_service(Counted::new(
-            PeerServer::new(service).max_decoding_message_size(config.frame_cap.bytes()),
-        ))
+        .add_service(PeerServer::new(service).max_decoding_message_size(config.frame_cap.bytes()))
         .add_service(
             HealthServer::new(PeerHealth::new(health))
                 .max_decoding_message_size(CONTROL_MESSAGE_BYTES),
@@ -292,45 +190,6 @@ where
             error!(%error, "the peer listener stopped with an error");
         }
     }))
-}
-
-/// What one stream may buffer: the frame ceiling, or the floor under it.
-fn stream_bytes(config: &TransportConfiguration) -> u64 {
-    config.frame_cap.bytes().max(STREAM_BUFFER_FLOOR) as u64
-}
-
-/// What the streams of one connection may buffer together.
-fn connection_bytes(config: &TransportConfiguration) -> u64 {
-    u64::from(config.max_concurrent_streams).saturating_mul(stream_bytes(config))
-}
-
-/// What one connection may make this process hold at its peak: the two buffers
-/// the transport fills per stream, and the HTTP/2 window granted beside them.
-fn connection_peak(config: &TransportConfiguration) -> u64 {
-    let buffered = connection_bytes(config);
-    buffered
-        .saturating_mul(2)
-        .saturating_add(buffered.max(SPEC_CONNECTION_WINDOW))
-}
-
-/// One HTTP/2 window, held to the largest the protocol can carry.
-///
-/// The receive budget accepts no configuration near that ceiling. The clamp
-/// therefore keeps the cast safe; it limits no operator.
-fn window(bytes: u64) -> u32 {
-    bytes.min(u64::from(MAX_WINDOW)) as u32
-}
-
-/// Refuses caps whose product is more memory than one listener may commit to.
-///
-/// Arithmetic that saturates is over the ceiling by definition. See
-/// [`MAX_RECEIVE_BYTES`] for what the product buys.
-fn validate_receive_budget(config: &TransportConfiguration) -> Result<(), ValidationError> {
-    let bytes = (config.max_connections as u64).saturating_mul(connection_peak(config));
-    if bytes > MAX_RECEIVE_BYTES {
-        return Err(ValidationError::new("receive_budget"));
-    }
-    Ok(())
 }
 
 /// Why a peer listener could not be built or bound.

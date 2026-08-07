@@ -5,19 +5,11 @@ use crate::router::label_fits;
 use derive_builder::Builder;
 use validator::{Validate, ValidationError};
 
-/// How many peer registrations stay cached at once, by default.
-const DEFAULT_ADDRESS_CACHE_CAPACITY: usize = 1024;
-
-/// Most peer registrations a process may hold at once. A registration is a few
-/// short strings. A million of them is already more memory than the cache is
-/// worth. The bound stops a typo from asking for a heap the process lacks.
-pub(super) const MAX_ADDRESS_CACHE_CAPACITY: usize = 1_048_576;
-
 /// What an operator sets for peer routing.
 ///
 /// Every field has a working default, so a deployment on one network needs no
 /// configuration at all.
-#[derive(Builder, Clone, Debug, Validate)]
+#[derive(Builder, Clone, Debug, Default, Validate)]
 #[builder(setter(into, strip_option), default)]
 #[validate(schema(function = "validate_entry_point"))]
 pub(crate) struct RouterConfiguration {
@@ -44,22 +36,6 @@ pub(crate) struct RouterConfiguration {
     /// directly. Two processes that share it skip the entry point.
     #[validate(custom(function = "validate_label"))]
     pub(crate) network: Option<String>,
-
-    /// How many peer registrations stay cached at once, up to
-    /// [`MAX_ADDRESS_CACHE_CAPACITY`].
-    #[validate(range(min = 1_usize, max = MAX_ADDRESS_CACHE_CAPACITY))]
-    pub(crate) address_cache_capacity: usize,
-}
-
-impl Default for RouterConfiguration {
-    fn default() -> Self {
-        Self {
-            advertised_host: None,
-            advertised_port: None,
-            network: None,
-            address_cache_capacity: DEFAULT_ADDRESS_CACHE_CAPACITY,
-        }
-    }
 }
 
 impl RouterConfiguration {

@@ -43,12 +43,21 @@ environment variables for unset fields, so you can mix both approaches.
 
 ## Peer Requests
 
-Peer settings have no environment variables. Set `ConsumerBuilders.peer` with
-`PeerConfiguration::builder()`.
+Set these values with environment variables or `PeerConfiguration::builder()`.
+An explicit builder value replaces its environment value.
 
-The builder sets the listener address, frame size, connection limits, and
-route labels. It also sets directory leases, destination limits, request
-limits, response limits, and timeouts.
+| Environment variable | Default | Why it is needed | What it controls | Validation |
+|---|---:|---|---|---|
+| `PROSODY_PEER_BIND_ADDRESS` | `0.0.0.0:0` | The peer server needs a local listener. | The IP address and port that the peer server binds. Port zero selects a free port. | Must be a socket address. |
+| `PROSODY_PEER_MAX_FRAME_BYTES` | 64 KiB | A fixed ceiling bounds transport buffers and peer messages. | The maximum encoded request or response frame size. | Must fit the protocol minimum through 16 MiB. The total receive budget must also fit. |
+| `PROSODY_PEER_ENABLE_REFLECTION` | `true` | Operators can choose whether the listener publishes its schema. | gRPC schema reflection on the peer listener. | Boolean. |
+| `PROSODY_PEER_ADVERTISED_HOST` | unset | Peers on another network need an entry point. | The host that remote networks use instead of the direct host. | 1 through 63 bytes when set. |
+| `PROSODY_PEER_ADVERTISED_PORT` | listener port | An entry point can forward to a different port. | The port published with the advertised host. | 1 through 65535. Requires an advertised host. |
+| `PROSODY_PEER_NETWORK_NAME` | unset | A shared label lets peers prefer direct routes. | The network group used to choose direct or advertised routes. | 1 through 63 bytes when set. |
+| `PROSODY_PEER_CACHE_CAPACITY` | 256 | Node-keyed caches need a fixed memory bound. | The entry count for address, channel, and route-preference caches. | Must be greater than zero. |
+| `PROSODY_PEER_REGISTRATION_TTL` | 30s | A lease removes dead nodes without a cleanup task. | The Cassandra TTL and refresh pace for this node registration. | 5s through 1h. |
+| `PROSODY_PEER_ROUTE_PROBE_ADDRESS` | unset | A probe can select the host that reaches a routed network. | The address used during local route discovery. | Must be a socket address when set. |
+| `PROSODY_PEER_RESPONSE_DELIVERY_TIMEOUT` | 5s | A timeout prevents a failed route from blocking a handler forever. | The total time for route lookup and delivery attempts. | Must be greater than zero. |
 
 Set `PROSODY_SUBSYSTEM` to make the client answer requests for that subsystem.
 Without it, the client consumes messages but does not answer requests. A

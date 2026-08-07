@@ -1,0 +1,173 @@
+//! Flat waiter map lifecycle invariants.
+
+use super::{
+    MAX_TIMEOUT, POOL, TestCodec, TestCodecError, TestError, distinct_indices, names, register,
+    registry, success,
+};
+use crate::producer::ProducerError;
+use crate::requester::collect::collect;
+use crate::requester::registry::tests::pending_len;
+use crate::requester::{Outcome, RequestError, ResponseFailure};
+use crate::response::ResponseDisposition;
+use crate::router::loopback::paused;
+use color_eyre::Result;
+use color_eyre::eyre::bail;
+use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck_macros::quickcheck;
+use rdkafka::error::KafkaError;
+use std::future::pending;
+
+#[derive(Clone, Debug)]
+struct ArrivalTrace {
+    awaited: Vec<usize>,
+    arrivals: Vec<(u8, u32)>,
+}
+
+impl Arbitrary for ArrivalTrace {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let count = usize::arbitrary(g) % POOL.len() + 1;
+        let awaited = distinct_indices(g, POOL.len(), count);
+        let mut arrivals = Vec::arbitrary(g);
+        arrivals.truncate(24);
+        Self { awaited, arrivals }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        let awaited = self.awaited.clone();
+        Box::new(self.arrivals.shrink().map(move |arrivals| Self {
+            awaited: awaited.clone(),
+            arrivals,
+        }))
+    }
+}
+
+/// Each subsystem owns one waiter, whatever order responses arrive in.
+#[quickcheck]
+fn arrivals_consume_only_their_exact_waiter(trace: ArrivalTrace) -> TestResult {
+    match run_arrivals(trace) {
+        Ok(()) => TestResult::passed(),
+        Err(error) => TestResult::error(format!("{error:#}")),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_waiter_is_removed_once() -> Result<()> {
+    let registry = registry();
+    let names = names(&["billing", "ledger"])?;
+    let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
+    let id = registration.id();
+
+    assert_eq!(
+        registry.accept(success(id, &names[1], 2)?),
+        ResponseDisposition::Accepted
+    );
+    assert_eq!(
+        registry.accept(success(id, &names[1], 3)?),
+        ResponseDisposition::UnknownRequest
+    );
+    assert_eq!(
+        registry.accept(success(id, &names[0], 1)?),
+        ResponseDisposition::Accepted
+    );
+
+    let outcomes =
+        collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, pending())
+            .await?;
+    assert_eq!(outcomes, vec![Outcome::Ok(1), Outcome::Ok(2)]);
+    drop(registration);
+    assert_eq!(pending_len(&registry), 0);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn every_request_exit_removes_remaining_waiters() -> Result<()> {
+    let names = names(&["billing", "ledger"])?;
+
+    let registry = registry();
+    drop(register(&registry, &names, MAX_TIMEOUT)?);
+    assert_eq!(pending_len(&registry), 0, "cancellation left waiters");
+
+    let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
+    let outcomes =
+        collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, async {
+            Ok::<(), ProducerError<TestCodecError>>(())
+        })
+        .await?;
+    assert_eq!(
+        outcomes,
+        vec![
+            Outcome::Failed(ResponseFailure::Timeout),
+            Outcome::Failed(ResponseFailure::Timeout),
+        ]
+    );
+    drop(registration);
+    assert_eq!(pending_len(&registry), 0, "timeout left waiters");
+
+    let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
+    let outcome =
+        collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, async {
+            Err(ProducerError::Kafka(KafkaError::Canceled))
+        })
+        .await;
+    if !matches!(outcome, Err(RequestError::Produce(_))) {
+        bail!("a send failure did not fail the request");
+    }
+    drop(registration);
+    assert_eq!(pending_len(&registry), 0, "send failure left waiters");
+
+    let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
+    registry.terminate();
+    let outcome =
+        collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, pending()).await;
+    if !matches!(outcome, Err(RequestError::ShuttingDown)) {
+        bail!("shutdown did not fail the request");
+    }
+    drop(registration);
+    assert_eq!(pending_len(&registry), 0, "shutdown left waiters");
+    Ok(())
+}
+
+fn run_arrivals(trace: ArrivalTrace) -> Result<()> {
+    let runtime = paused()?;
+    runtime.block_on(async {
+        let pool: Vec<_> = trace.awaited.iter().map(|index| POOL[*index]).collect();
+        let awaited = names(&pool)?;
+        let outsider = names(&["not-awaited"])?;
+        let registry = registry();
+        let mut registration = register(&registry, &awaited, MAX_TIMEOUT)?;
+        let mut expected = vec![None; awaited.len()];
+
+        for (raw, value) in trace.arrivals {
+            let position = usize::from(raw) % (awaited.len() + 1);
+            let (name, disposition) = if position == awaited.len() {
+                (&outsider[0], ResponseDisposition::UnknownRequest)
+            } else if expected[position].is_some() {
+                (&awaited[position], ResponseDisposition::UnknownRequest)
+            } else {
+                expected[position] = Some(value);
+                (&awaited[position], ResponseDisposition::Accepted)
+            };
+            assert_eq!(
+                registry.accept(success(registration.id(), name, value)?),
+                disposition
+            );
+        }
+
+        let outcomes =
+            collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, pending())
+                .await?;
+        assert_eq!(
+            outcomes,
+            expected
+                .into_iter()
+                .map(|value| match value {
+                    Some(value) => Outcome::Ok(value),
+                    None => Outcome::Failed(ResponseFailure::Timeout),
+                })
+                .collect::<Vec<_>>()
+        );
+        drop(registration);
+        assert_eq!(pending_len(&registry), 0);
+        Ok(())
+    })
+}

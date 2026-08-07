@@ -1,6 +1,6 @@
 //! The durable commit order for requested responses.
 
-use super::{Fixture, ResultProbeCodec, tagged};
+use super::{Fixture, ResultProbeCodec, serialize_count, tagged};
 use crate::consumer::DemandType;
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::providers::LeafHandler;
@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering::SeqCst;
 #[test]
 fn the_response_leaves_only_after_the_durable_commit() -> Result<()> {
     paused()?.block_on(async {
-        let fixture = Fixture::<ResultProbeCodec>::new(1, 1)?;
+        let fixture = Fixture::<ResultProbeCodec>::new()?;
         let (context, cell_store, cart_id) = buffered(|ctx| ctx).await?;
         let handler = RespondHandler::new(
             LeafHandler::new(ScriptedHandler::success()),
@@ -46,7 +46,7 @@ fn the_response_leaves_only_after_the_durable_commit() -> Result<()> {
                 "the staged value must remain provisional at the commit"
             );
             assert_eq!(
-                fixture.admitted(),
+                serialize_count(),
                 0,
                 "a response left before the durable commit"
             );
@@ -66,17 +66,13 @@ fn the_response_leaves_only_after_the_durable_commit() -> Result<()> {
             "the staged value was not promoted"
         );
         assert_eq!(
-            fixture.admitted(),
+            serialize_count(),
             1,
             "the response did not reach the sender"
         );
         drop(handler);
         let drained = fixture.drain().await?;
-        assert_eq!(
-            drained.deliveries.len(),
-            1,
-            "the response did not reach the transport"
-        );
+        assert_eq!(drained.len(), 1, "the response did not reach the transport");
         Ok(())
     })
 }

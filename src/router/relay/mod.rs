@@ -6,12 +6,9 @@
 //! correct even where the labels are unset, wrong, or disagreed upon, which is
 //! what makes it the fallback that always works.
 
-use crate::router::fleet::{Destination, DestinationFleet, Refusal};
 use crate::router::{Framed, NodeId, RelayHop, ResponseSender, SendFailure};
-use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::OwnedSemaphorePermit;
-use tokio::time::{Instant, sleep_until, timeout_at};
+use tokio::time::{Instant, timeout_at};
 use tonic::Code;
 use tracing::warn;
 
@@ -61,8 +58,7 @@ impl<R: RelayHop> Relay<R> {
     /// told it succeeded while the requester still waits.
     ///
     /// Nothing is spawned. The outbound call stays owned by the inbound one, so
-    /// a caller that goes away cancels the call and releases the send slot with
-    /// it.
+    /// a caller that goes away cancels the outbound call with it.
     ///
     /// # Errors
     ///
@@ -81,32 +77,24 @@ impl<R: RelayHop> Relay<R> {
         if Instant::now() >= deadline {
             return Err(RelayFailure::DeadlineExceeded);
         }
-        // The slot is taken before the lookup and held to the end of this
-        // scope, so a flood of frames for other nodes buys no unmetered channel
-        // into this process's send capacity.
-        let (destination, _permit) = slot(self.router.fleet(), target)?;
-        // One guard over the whole path — the pacing wait, the directory read
-        // and the dial — so a slow lookup cannot hold the slot past the
-        // caller's budget.
-        match timeout_at(deadline, self.hop(&destination, target, frame, deadline)).await {
+        // One deadline covers the directory read and the dial.
+        match timeout_at(deadline, self.hop(target, frame, deadline)).await {
             Err(_) => Err(RelayFailure::DeadlineExceeded),
             Ok(outcome) => outcome,
         }
     }
 
-    /// Paces, resolves the target's direct endpoint, and makes one attempt.
+    /// Resolves the target's direct endpoint and makes one attempt.
     ///
     /// One attempt rather than several: the responder that sent this frame
     /// keeps its own attempt budget, and a relay that retried would multiply
     /// that budget by its own.
     async fn hop<F: Framed + Sync>(
         &self,
-        destination: &Destination,
         target: NodeId,
         frame: &F,
         deadline: Instant,
     ) -> Result<(), RelayFailure> {
-        sleep_until(destination.next_send()).await;
         let address = self
             .router
             .direct(target)
@@ -150,30 +138,6 @@ pub(crate) fn routing(this: NodeId, target: NodeId, relay: Option<NodeId>) -> Ro
     }
 }
 
-/// Takes one send slot on `node` and hands the permit out.
-///
-/// Synchronous on purpose: a [`Reservation`](crate::router::fleet::Reservation)
-/// holds a gate ticket that is not `Send`, so it must never enter an async
-/// body. Here it is created and consumed inside one function, and only `Send`
-/// values leave.
-///
-/// # Errors
-///
-/// Returns [`RelayFailure::NoCapacity`] when the fleet has no room, and
-/// [`RelayFailure::Unreachable`] when admission has closed: a process on the
-/// way out is unavailable rather than short of capacity.
-fn slot(
-    fleet: &DestinationFleet,
-    node: NodeId,
-) -> Result<(Arc<Destination>, OwnedSemaphorePermit), RelayFailure> {
-    let reservation = fleet.reserve(node).map_err(|refusal| match refusal {
-        Refusal::NoDestination | Refusal::NoSlot => RelayFailure::NoCapacity,
-        Refusal::ShuttingDown => RelayFailure::Unreachable,
-    })?;
-    let destination = Arc::clone(reservation.destination());
-    Ok(reservation.commit(|permit| (destination, permit)))
-}
-
 /// Why one forward did not deliver.
 ///
 /// [`Target`](Self::Target) carries the gRPC status the hop came to, rather
@@ -181,10 +145,6 @@ fn slot(
 /// states.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum RelayFailure {
-    /// This process has no send capacity for the target.
-    #[error("the relay has no send capacity")]
-    NoCapacity,
-
     /// The caller's budget ran out before the hop finished.
     #[error("the relay budget ran out")]
     DeadlineExceeded,

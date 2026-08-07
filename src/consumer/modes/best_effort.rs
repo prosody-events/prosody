@@ -10,7 +10,7 @@ use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::{build_common_middleware, build_typed_state};
 use crate::consumer::{Managers, ProsodyConsumer};
-use crate::peer::{ConsumerRouter, NoPeer};
+use crate::peer::{ConsumerRouter, NoPeer, responding_provider};
 use crate::state_reader::ConsumerReaderBackend;
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
@@ -106,8 +106,8 @@ where
         };
         // Preparation is the last fallible step of this mode, and no `?` runs
         // between it and the termination below.
-        let prepared = router.responder::<R>(subsystem)?;
-        let (provider, resources) = prepared.terminate(&middleware, handler);
+        let (provider, resources) =
+            responding_provider::<_, R, _, _>(router, subsystem, &middleware, handler);
         Box::pin(initialize_consumer::<_, _, _, C, _>(
             setup.consumer,
             provider,

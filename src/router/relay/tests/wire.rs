@@ -1,8 +1,8 @@
 //! What crosses a real hop: the loop stop, the caller's budget, and the trace.
 
 use super::{ALPHA, BUDGET, CAP_BYTES, Live, PAYLOAD, Pair, TargetRoute};
-use crate::codec::Codec;
 use crate::requester::registry::PendingRegistry;
+use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::encode::{FrameEncoder, Staged};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader};
@@ -11,7 +11,6 @@ use crate::response::{RequestId, ResponseStatus};
 use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
-use crate::router::grpc::TRANSPORT;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::listener::FixedRouter;
 use crate::router::{Host, NodeId, Preference, ResponseSender, Router, SendFailure};
@@ -64,19 +63,17 @@ const THERE: &str = "there";
 /// One byte more than the smallest response ceiling can retain.
 const OVER_RESPONSE_CAP: [u8; FrameCap::MIN_BYTES + 1] = [0; FrameCap::MIN_BYTES + 1];
 
-/// A target transport's size refusal is not counted again at the relay.
+/// A target transport's size refusal reaches the original caller.
 #[test]
-fn a_relayed_out_of_range_does_not_count_as_a_transport_refusal() -> Result<()> {
+fn a_relayed_out_of_range_reaches_the_caller() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let pair = Pair::start_with_target_frame_cap(FrameCap::MIN_BYTES).await?;
         let request = awaited(&pair.target.registry)?;
-        let served = TRANSPORT.served();
-        let rejected = TRANSPORT.rejected_frames();
         let outcome = async {
             let answered = call_with_payload(
                 &pair.relay,
                 pair.target.node,
-                request,
+                request.id(),
                 BUDGET,
                 &OVER_RESPONSE_CAP,
             )
@@ -85,14 +82,7 @@ fn a_relayed_out_of_range_does_not_count_as_a_transport_refusal() -> Result<()> 
                 answered == Code::OutOfRange,
                 format!("the target must pass its size refusal through, not {answered:?}"),
             )?;
-            ensure(
-                TRANSPORT.served() == served + 1,
-                "only the relay peer method must serve the frame".to_owned(),
-            )?;
-            ensure(
-                TRANSPORT.rejected_frames() == rejected + 1,
-                "only the target transport must count the size refusal".to_owned(),
-            )
+            Ok(())
         }
         .await;
         pair.stop().await?;
@@ -112,7 +102,6 @@ fn a_relayed_out_of_range_does_not_count_as_a_transport_refusal() -> Result<()> 
 fn a_frame_this_process_already_relayed_is_never_relayed_again() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let pair = Pair::start(PROCESS_BUDGET, PROCESS_BUDGET, TargetRoute::Relay).await?;
-        let forwarded = TRANSPORT.forwarded();
         let outcome = async {
             let answered = call(&pair.relay, NodeId::new(), RequestId::new(), BUDGET).await?;
             ensure(
@@ -122,13 +111,7 @@ fn a_frame_this_process_already_relayed_is_never_relayed_again() -> Result<()> {
                      answered {answered:?}"
                 ),
             )?;
-            ensure(
-                TRANSPORT.forwarded() == forwarded + 1,
-                format!(
-                    "exactly one process may send the frame on, but {} did",
-                    TRANSPORT.forwarded() - forwarded
-                ),
-            )
+            Ok(())
         }
         .await;
         pair.stop().await?;
@@ -213,7 +196,7 @@ fn a_relayed_response_reads_as_one_trace() -> Result<()> {
         let pair = Pair::start(PROCESS_BUDGET, PROCESS_BUDGET, TargetRoute::Nowhere).await?;
         let outcome = async {
             let request = awaited(&pair.target.registry)?;
-            let answered = call(&pair.relay, pair.target.node, request, BUDGET).await?;
+            let answered = call(&pair.relay, pair.target.node, request.id(), BUDGET).await?;
             ensure(
                 answered == Code::Ok,
                 format!("the target must accept the relayed response, not answer {answered:?}"),
@@ -279,13 +262,12 @@ fn a_response_crosses_two_networks_through_a_relay() -> Result<()> {
 /// Resolves the target the declared way, sends one response, and reports what
 /// the target holds.
 ///
-/// The responder's own fleet and transport are the production ones, so the
-/// response is queued, paced, framed and dialed exactly as a responder does it.
-/// The worker join returns once every worker has finished, so what the target
-/// holds is settled without waiting on a clock.
+/// The responder uses the production fleet and transport. Thus, the response
+/// follows the same route as a production response.
 async fn crossing(pair: &Pair) -> Result<()> {
     let cap = FrameCap::new(CAP_BYTES)?;
-    let request = awaited(&pair.target.registry)?;
+    let mut request = awaited(&pair.target.registry)?;
+    let receiver = request.receiver()?;
     let elsewhere = NodeRegistration {
         node: pair.target.node,
         direct: pair.target.address.clone(),
@@ -309,13 +291,12 @@ async fn crossing(pair: &Pair) -> Result<()> {
         format!("the rules chose {route:?}, which is not the target's entry point alone"),
     )?;
 
-    let forwarded = TRANSPORT.forwarded();
-    let (sender, workers) = TypedSender::<CountingCodec>::new_without_local(&router, cap)?;
+    let sender = TypedSender::<CountingCodec, _>::new_route(router.clone(), router.fleet(), cap);
     sender
         .send(
             FrameHeader {
                 target: pair.target.node,
-                request,
+                request: request.id(),
                 subsystem: SubsystemName::try_new(ALPHA)?,
                 status: ResponseStatus::Success,
                 relay: None,
@@ -323,23 +304,12 @@ async fn crossing(pair: &Pair) -> Result<()> {
             Context::current(),
             PAYLOAD.to_vec(),
         )
-        .map_err(|_| eyre!("the fleet refused the response"))?;
+        .await;
     drop(sender);
-    workers.join().await;
-    ensure(
-        pair.target
-            .registry
-            .stored_payload(request, &SubsystemName::try_new(ALPHA)?)
-            .is_some(),
-        "the response never reached the process it named".to_owned(),
-    )?;
-    ensure(
-        TRANSPORT.forwarded() == forwarded + 1,
-        format!(
-            "the entry point must send the frame on once, but {} frames were sent on",
-            TRANSPORT.forwarded() - forwarded
-        ),
-    )
+    receiver
+        .await
+        .map_err(|_| eyre!("the response never reached the process it named"))?;
+    Ok(())
 }
 
 /// Delivers one frame for `target` into `live`, under a budget of `granted`.
@@ -390,9 +360,9 @@ async fn deliver(
 }
 
 /// Registers one request the target process waits for.
-fn awaited(registry: &Arc<PendingRegistry>) -> Result<RequestId> {
+fn awaited(registry: &Arc<PendingRegistry>) -> Result<TestRegistration> {
     let subsystem = SubsystemName::try_new(ALPHA)?;
-    Ok(registry.register_unguarded(from_ref(&subsystem), CountingCodec::FORMAT_ID, BUDGET)?)
+    TestRegistration::new(registry, from_ref(&subsystem), BUDGET)
 }
 
 /// The receive span of the process that forwarded, and of the one it forwarded

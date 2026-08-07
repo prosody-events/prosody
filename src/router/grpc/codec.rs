@@ -11,7 +11,6 @@
 //! so the client encodes bytes and decodes nothing while the server decodes a
 //! frame and encodes nothing.
 
-use super::TRANSPORT;
 use crate::response::frame::decode::{FrameDecodeError, decode_frame};
 use crate::response::frame::{FrameCap, ResponseFrame};
 use bytes::{Buf, BufMut, Bytes};
@@ -24,7 +23,7 @@ const GRPC_HEADER_BYTES: usize = 5;
 
 /// One framed response, owned.
 ///
-/// tonic's encoder must be `'static`, so it cannot borrow the worker's scratch.
+/// tonic's encoder must be `'static`, so it cannot borrow the sender's buffer.
 /// A response therefore pays a right-sized allocation and a copy into this
 /// value, and tonic then copies it again into the per-call buffer it owns. Both
 /// copies precede one network round trip, and both buffers are bounded by the
@@ -100,7 +99,6 @@ impl Decoder for ServerFrameCodec {
     /// byte reaches this reader, and answers the peer `OUT_OF_RANGE` itself. So
     /// the ceiling passed here is the type's own upper bound, the size arm of
     /// [`refusal`] answers only a reader driven directly, and
-    /// [`Counted`](super::counted::Counted) is what counts the refusal the
     /// transport made.
     ///
     /// This direction keeps tonic's own receive buffer, which grows to the
@@ -112,7 +110,6 @@ impl Decoder for ServerFrameCodec {
         match decode_frame(src, FrameCap::MAX) {
             Ok(frame) => Ok(Some(frame)),
             Err(error) => {
-                TRANSPORT.record_rejected_frame();
                 // The only record of why: the status carries a literal, so the
                 // detail the `Display` form names stays on this node.
                 warn!(%error, "peer frame could not be read");

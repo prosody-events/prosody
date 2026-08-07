@@ -4,8 +4,7 @@
 //!
 //! The transport records the whole frame of every attempt, so an assertion
 //! reads a decoded frame rather than bytes. Every transport assertion runs
-//! after an explicit drain, which joins the delivery workers: nothing can still
-//! be in flight when a count is read.
+//! after the direct router call returns.
 
 use super::{Responder, responding_provider};
 use crate::codec::Codec;
@@ -20,9 +19,8 @@ use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::RequestId;
 use crate::response::frame::FrameCap;
 use crate::response::headers::RequestTag;
-use crate::response::sender::ResponseWorkers;
-use crate::router::RelayHop;
-use crate::router::loopback::{Delivery, Drained, TestRouter, collect_deliveries, config, node};
+use crate::router::Router;
+use crate::router::loopback::{Delivery, TestRouter, collect_deliveries, config, node};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
@@ -60,10 +58,9 @@ const RETRY_BASE: Duration = Duration::from_millis(1);
 thread_local! {
     /// Payloads serialized on this thread, by every probe codec on it.
     ///
-    /// A delivery worker builds its own codec through `Default`, so a suite
-    /// holds no handle on the instance that encodes. These suites run one
-    /// current-thread runtime, so the worker encodes on the thread that drives
-    /// it and this total includes what the worker serialized. Read it as a
+    /// A response send builds its own codec through `Default`, so a suite holds
+    /// no handle on the instance that encodes. These suites use one
+    /// current-thread runtime. Thus, this total includes that serialization. Read it as a
     /// difference around one dispatch, never as an absolute.
     static SERIALIZES: Cell<usize> = const { Cell::new(0) };
 }
@@ -85,8 +82,7 @@ struct OversizedProbeCodec;
 /// One fleet, one loopback transport, and one responder over them.
 struct Fixture<C: Codec<Payload = Result<(), TestError>>> {
     router: TestRouter,
-    responder: Arc<Responder<C>>,
-    workers: ResponseWorkers,
+    responder: Arc<Responder<C, TestRouter>>,
     deliveries: UnboundedReceiver<Delivery>,
 }
 
@@ -138,20 +134,22 @@ impl Codec for OversizedProbeCodec {
 }
 
 impl<C: Codec<Payload = Result<(), TestError>>> Fixture<C> {
-    /// A fixture whose fleet holds `max_destinations` cells of `slots_each`
-    /// slots, encoding against `CAP_BYTES`.
-    fn new(max_destinations: usize, slots_each: usize) -> Result<Self> {
-        Self::with_cap(max_destinations, slots_each, FrameCap::new(CAP_BYTES)?)
+    /// Builds a fixture that encodes against `CAP_BYTES`.
+    fn new() -> Result<Self> {
+        Self::with_cap(FrameCap::new(CAP_BYTES)?)
     }
 
-    fn with_cap(max_destinations: usize, slots_each: usize, cap: FrameCap) -> Result<Self> {
-        let (router, deliveries) = TestRouter::new(config(max_destinations, slots_each))?;
-        let (responder, workers) =
-            Responder::new_without_local(&router, cap, SubsystemName::try_new(SUBSYSTEM)?)?;
+    fn with_cap(cap: FrameCap) -> Result<Self> {
+        let (router, deliveries) = TestRouter::new(config())?;
+        let responder = Responder::new_route(
+            router.clone(),
+            router.fleet(),
+            cap,
+            SubsystemName::try_new(SUBSYSTEM)?,
+        );
         Ok(Self {
             router,
             responder: Arc::new(responder),
-            workers,
             deliveries,
         })
     }
@@ -162,7 +160,11 @@ impl<C: Codec<Payload = Result<(), TestError>>> Fixture<C> {
     /// Log sits outermost so retry runs mid-stack with a retry ceiling. That is
     /// the only composition in which a transient error can exhaust its retries,
     /// which is the row these suites exist to pin.
-    fn stack<H>(&self, leaf: H, max_retries: u32) -> Result<impl EventHandler<Payload = Value>>
+    fn stack<H>(
+        &self,
+        leaf: H,
+        max_retries: u32,
+    ) -> Result<impl EventHandler<Payload = Value> + use<H, C>>
     where
         H: FallibleHandler<Payload = Value, Output = (), Error = TestError>
             + Clone
@@ -184,42 +186,20 @@ impl<C: Codec<Payload = Result<(), TestError>>> Fixture<C> {
         Ok(provider.handler_for_partition(TOPIC.into(), PARTITION))
     }
 
-    /// How many reservations the fleet has refused for want of capacity.
-    fn refused(&self) -> u64 {
-        self.router.fleet().refused()
-    }
-
-    /// How many destinations the fleet has admitted. A dispatch that reserved
-    /// no slot leaves this at zero, which is observable before any drain.
-    fn admitted(&self) -> u64 {
-        self.router.fleet().admitted()
-    }
-
-    /// Joins every delivery worker and collects what the transport recorded.
-    ///
-    /// Every handler built from this fixture must be dropped first: the drain
-    /// consumes the responder, so a surviving handle fails the test rather than
-    /// skipping the wait.
-    async fn drain(self) -> Result<Drained> {
+    /// Collects what the transport recorded.
+    async fn drain(self) -> Result<Vec<Delivery>> {
         let Self {
             router,
             responder,
-            workers,
             mut deliveries,
         } = self;
-        let counters = responder.counters();
         let Some(responder) = Arc::into_inner(responder) else {
             bail!("a responder handle outlived the stack");
         };
         drop(responder);
-        workers.join().await;
         drop(router);
 
-        Ok(Drained {
-            deliveries: collect_deliveries(&mut deliveries).await,
-            sent: counters.sent(),
-            dropped: counters.dropped(),
-        })
+        Ok(collect_deliveries(&mut deliveries).await)
     }
 }
 
@@ -283,7 +263,7 @@ fn serialize_count() -> usize {
 }
 
 /// The frame ceiling the ordinary fixtures encode against, so a decode in a
-/// suite cannot disagree with the encode in a worker.
+/// suite cannot disagree with the response encode.
 fn cap() -> Result<FrameCap> {
     Ok(FrameCap::new(CAP_BYTES)?)
 }

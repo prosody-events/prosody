@@ -10,7 +10,7 @@
 //! instruments bind to whatever meter provider is global when they are first
 //! touched, and nextest gives each case its own process.
 
-use super::{IN_FLIGHT, MAX_AWAITED, MAX_TIMEOUT, names, register, registry, unanswered_call};
+use super::{MAX_TIMEOUT, names, register, registry, unanswered_call};
 use crate::test_util::{GlobalMetrics, label};
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
@@ -33,7 +33,7 @@ const SUBSYSTEM: &str = "billing";
 #[tokio::test(start_paused = true)]
 async fn a_waiting_request_is_counted_until_it_is_over() -> Result<()> {
     let metrics = GlobalMetrics::install();
-    let registry = registry(IN_FLIGHT, MAX_AWAITED)?;
+    let registry = registry();
     let awaited = names(&[SUBSYSTEM])?;
     let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
     ensure!(

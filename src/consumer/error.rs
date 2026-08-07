@@ -132,25 +132,11 @@ pub enum PeerInitError {
         /// The rendered source chain.
         message: String,
     },
-    /// The pending request registry could not start.
-    #[error("peer request registry failed: {message}")]
-    Registry {
-        /// The rendered source chain.
-        message: String,
-    },
     /// The peer listener could not start.
     #[error("peer listener failed: {message}")]
     Listener {
         /// The rendered source chain.
         message: String,
-    },
-    /// The response ceiling exceeds the frame ceiling.
-    #[error("the {bytes}-byte response ceiling exceeds the {cap}-byte frame ceiling")]
-    ResponseCeiling {
-        /// The configured response size.
-        bytes: usize,
-        /// The configured frame size.
-        cap: usize,
     },
 }
 
@@ -174,15 +160,9 @@ impl From<PeerRuntimeError> for PeerInitError {
             PeerRuntimeError::Fleet(error) => Self::Fleet {
                 message: format!("{error:#}"),
             },
-            PeerRuntimeError::Registry(error) => Self::Registry {
-                message: format!("{error:#}"),
-            },
             PeerRuntimeError::Listener(error) => Self::Listener {
                 message: format!("{error:#}"),
             },
-            PeerRuntimeError::ResponseCeiling { bytes, cap } => {
-                Self::ResponseCeiling { bytes, cap }
-            }
         }
     }
 }

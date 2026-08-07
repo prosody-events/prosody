@@ -9,6 +9,7 @@ mod router;
 pub(crate) mod runtime;
 
 pub(crate) use backend::PeerBackend;
+pub(crate) use router::responding_provider;
 pub(crate) use runtime::{ConsumerResources, NoPeer};
 
 pub use crate::requester::{Outcome, ProsodyRequester, RequestError, ResponseFailure};
@@ -22,9 +23,8 @@ use crate::codec::Codec;
 use crate::consumer::middleware::respond::Responder;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::response::frame::FrameCap;
-use crate::response::sender::{ResponseRoute, ResponseWorkers};
+use crate::response::sender::ResponseRoute;
 use crate::router::fleet::DestinationFleet;
-use crate::router::fleet::config::FleetConfigurationError;
 use crate::subsystem::SubsystemName;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,10 +52,17 @@ impl<R: ResponseRoute> PeerResponder<R> {
     }
 
     /// Binds one response codec and subsystem to this peer route.
-    pub(crate) fn responder<C: Codec>(
-        &self,
-        subsystem: SubsystemName,
-    ) -> Result<(Responder<C>, ResponseWorkers), FleetConfigurationError> {
-        Responder::new_route(&self.route, &self.fleet, self.cap, subsystem)
+    pub(crate) fn responder<C: Codec>(&self, subsystem: SubsystemName) -> Responder<C, R> {
+        Responder::new_route(self.route.clone(), &self.fleet, self.cap, subsystem)
+    }
+}
+
+impl<R> PeerResponder<R> {
+    fn map_route<T>(self, map: impl FnOnce(R) -> T) -> PeerResponder<T> {
+        PeerResponder {
+            route: map(self.route),
+            fleet: self.fleet,
+            cap: self.cap,
+        }
     }
 }

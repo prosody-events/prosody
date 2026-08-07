@@ -10,9 +10,7 @@
 //! gives this case its own process.
 
 use super::{ALPHA, Harness, header, payload, register};
-use crate::codec::Codec;
 use crate::response::RequestId;
-use crate::response::frame::tests::CountingCodec;
 use crate::test_util::{GlobalMetrics, TEST_RUNTIME, label};
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
@@ -35,9 +33,9 @@ fn every_answer_counts_once_under_a_fixed_label() -> Result<()> {
     let metrics = GlobalMetrics::install();
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
-        let request = register(&harness.registry, &[ALPHA], CountingCodec::FORMAT_ID)?;
+        let request = register(&harness.registry, &[ALPHA])?;
         let accepted = harness
-            .deliver(&header(harness.node, request, ALPHA)?, payload(SHORT))
+            .deliver(&header(harness.node, request.id(), ALPHA)?, payload(SHORT))
             .await?;
         ensure!(accepted == Code::Ok, "a well-formed response is accepted");
 

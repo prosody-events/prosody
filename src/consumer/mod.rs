@@ -141,7 +141,6 @@ pub(crate) use crate::consumer::wiring::state::{
 };
 use crate::heartbeat::HeartbeatRegistry;
 pub use crate::otel::SpanRelation;
-use crate::response::sender::ResponseWorkers;
 pub use crate::state::config::{KeyedStateConfiguration, KeyedStateConfigurationBuilderError};
 // `descriptor::Keyed` (the key-axis lifter) is deliberately not re-exported
 // here: it would shadow the message-routing `Keyed` trait re-exported here.
@@ -204,7 +203,6 @@ struct RuntimeState {
     /// The consumer's Kafka observation handle. Shutdown retires its gauge
     /// series so a stopped consumer stops contributing to `sum` aggregations.
     observer: KafkaObserver,
-    responses: ResponseWorkers,
 }
 
 /// What one teardown still holds after the Kafka poll loop stops.
@@ -216,7 +214,6 @@ struct RuntimeState {
 struct Teardown {
     probe_server: Option<ProbeServer>,
     observer: KafkaObserver,
-    responses: ResponseWorkers,
 }
 
 /// High-level Kafka consumer implementation.
@@ -318,10 +315,9 @@ impl<C: Codec> ProsodyConsumer<C> {
         get_is_stalled(&self.managers) || self.heartbeats.any_stalled()
     }
 
-    /// Stops this consumer after it sends all owed responses.
+    /// Stops this consumer after all handlers finish.
     ///
-    /// It stops the poll loop, sweeps each partition, retires observations,
-    /// and joins response workers. The sweep closes every response sender.
+    /// It stops the poll loop, sweeps each partition, and retires observations.
     ///
     /// A second call, or a call on a clone whose sibling already ran, finds no
     /// runtime state and answers `Ok(())` without touching anything shared.
@@ -335,7 +331,7 @@ impl<C: Codec> ProsodyConsumer<C> {
             return Ok(());
         };
         let swept = sweep::drain_managers(&self.managers).await;
-        teardown.release(swept).await.join().await;
+        teardown.release(swept).await;
         match poll_failure {
             Some(failure) => Err(failure),
             None => Ok(()),
@@ -354,7 +350,6 @@ impl<C: Codec> ProsodyConsumer<C> {
             poll_handle,
             probe_server,
             observer,
-            responses,
         } = self.runtime_state.lock().take()?;
 
         self.shutdown.store(true, Ordering::Relaxed);
@@ -369,7 +364,6 @@ impl<C: Codec> ProsodyConsumer<C> {
             Teardown {
                 probe_server,
                 observer,
-                responses,
             },
             poll_failure,
         ))
@@ -377,26 +371,23 @@ impl<C: Codec> ProsodyConsumer<C> {
 }
 
 impl Teardown {
-    /// Retires observation resources and returns the response workers.
+    /// Retires observation resources after all partition handlers stop.
     ///
     /// The [`Swept`](sweep::Swept) proof is the parameter, and only the sweep
     /// mints one, so this step cannot run before the sweep.
-    async fn release(self, _swept: sweep::Swept) -> ResponseWorkers {
+    async fn release(self, _swept: sweep::Swept) {
         let Self {
             probe_server,
             observer,
-            responses,
         } = self;
         observer.retire_gauges();
         if let Some(probe_server) = probe_server {
             probe_server.shutdown().await;
         }
-        responses
     }
 
     /// Retires the observation gauges and stops the probe server.
     ///
-    /// This consumes the value. Dropping its workers detaches their tasks.
     /// [`Drop`](ProsodyConsumer::drop) calls this instead of
     /// [`release`](Self::release), because it runs no sweep and holds no proof.
     async fn stop_observation(self) {
@@ -414,8 +405,7 @@ impl Teardown {
 /// Stops the poll loop when a consumer drops without a shutdown.
 ///
 /// `Drop` also runs no partition sweep, which
-/// [`shutdown`](ProsodyConsumer::shutdown) performs. A retained manager can
-/// therefore keep a detached response worker open.
+/// [`shutdown`](ProsodyConsumer::shutdown) performs.
 ///
 /// This path does await the probe server task. A current-thread runtime cannot
 /// drive that task while this blocks its only thread, so call `shutdown` from

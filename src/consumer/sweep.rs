@@ -21,7 +21,7 @@ pub(in crate::consumer) struct Swept(());
 ///
 /// rdkafka skips its close-poll loop when the queue cannot be closed, and the
 /// final revoke never dispatches then. Each retained manager holds a handler
-/// clone, so this drain is what bounds the response worker join. After a
+/// clone, so this drain bounds consumer shutdown. After a
 /// normal revoke the map is already empty.
 pub(in crate::consumer) async fn drain_managers<P: Send + 'static>(
     managers: &Managers<P>,

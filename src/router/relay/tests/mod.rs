@@ -6,15 +6,14 @@
 //! deadline crossing a hop, and a trace crossing a hop are all facts about two
 //! processes and cannot be seen inside one.
 
-mod capacity;
 mod decision;
 mod forward;
 mod wire;
 
 use super::Relay;
 use crate::codec::Codec;
-use crate::requester::config::RequesterConfiguration;
 use crate::requester::registry::PendingRegistry;
+use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader, ResponseFrame};
 use crate::response::{FormatToken, RequestId, ResponseStatus};
@@ -94,7 +93,7 @@ impl Process {
     pub(super) fn new(config: FleetConfiguration, budget: Duration) -> Result<Self> {
         let node = node(THIS);
         let (router, deliveries) = TestRouter::new(config)?;
-        let registry = PendingRegistry::test(&RequesterConfiguration::default())?;
+        let registry = PendingRegistry::new();
         let service = PeerService::new(
             LocalTarget::new(node, Arc::clone(&registry)),
             Relay::new(router.clone()),
@@ -111,20 +110,12 @@ impl Process {
     }
 
     /// Registers one request this process waits for.
-    pub(super) fn expects(&self) -> Result<RequestId> {
-        Ok(self.registry.register_unguarded(
+    pub(super) fn expects(&self) -> Result<TestRegistration> {
+        TestRegistration::new(
+            &self.registry,
             from_ref(&SubsystemName::try_new(ALPHA)?),
-            CountingCodec::FORMAT_ID,
             BUDGET,
-        )?)
-    }
-
-    /// Whether this process stored the response `request` waited for.
-    pub(super) fn stored(&self, request: RequestId) -> Result<bool> {
-        Ok(self
-            .registry
-            .stored_payload(request, &SubsystemName::try_new(ALPHA)?)
-            .is_some())
+        )
     }
 
     /// Hands `frame` to the service and reports the status it answered.
@@ -170,50 +161,30 @@ impl Pair {
         targeted: Duration,
         route: TargetRoute,
     ) -> Result<Self> {
-        Self::start_with_target_config(
-            relaying,
-            targeted,
-            route,
-            &RequesterConfiguration::default(),
-            CAP_BYTES,
-        )
-        .await
+        Self::start_with_target_config(relaying, targeted, route, CAP_BYTES).await
     }
 
     /// Starts a pair whose target transport accepts at most `bytes` per frame.
     pub(super) async fn start_with_target_frame_cap(bytes: usize) -> Result<Self> {
-        Self::start_with_target_config(
-            BUDGET,
-            BUDGET,
-            TargetRoute::Nowhere,
-            &RequesterConfiguration::default(),
-            bytes,
-        )
-        .await
+        Self::start_with_target_config(BUDGET, BUDGET, TargetRoute::Nowhere, bytes).await
     }
 
     async fn start_with_target_config(
         relaying: Duration,
         targeted: Duration,
         route: TargetRoute,
-        requester: &RequesterConfiguration,
         target_frame_bytes: usize,
     ) -> Result<Self> {
         let relay_bound = bind(CAP_BYTES).await?;
         let target_bound = bind(target_frame_bytes).await?;
         let relay_address = endpoint(&relay_bound);
         let target_address = endpoint(&target_bound);
-        let relay = Live::serve(
-            relay_bound,
-            Some(target_address),
-            relaying,
-            &RequesterConfiguration::default(),
-        )?;
+        let relay = Live::serve(relay_bound, Some(target_address), relaying)?;
         let seen = match route {
             TargetRoute::Relay => Some(relay_address),
             TargetRoute::Nowhere => None,
         };
-        match Live::serve(target_bound, seen, targeted, requester) {
+        match Live::serve(target_bound, seen, targeted) {
             Ok(target) => Ok(Self { relay, target }),
             Err(error) => {
                 relay.stop().await?;
@@ -232,16 +203,11 @@ impl Pair {
 
 impl Live {
     /// Serves `bound`, sending every frame it does not own on to `seen`.
-    fn serve(
-        bound: BoundListener,
-        seen: Option<Endpoint>,
-        budget: Duration,
-        requester: &RequesterConfiguration,
-    ) -> Result<Self> {
+    fn serve(bound: BoundListener, seen: Option<Endpoint>, budget: Duration) -> Result<Self> {
         let node = NodeId::new();
         let address = endpoint(&bound);
         let cap = bound.frame_cap();
-        let registry = PendingRegistry::test(requester)?;
+        let registry = PendingRegistry::new();
         let router = FixedRouter::new(
             cap,
             FleetConfiguration::default(),

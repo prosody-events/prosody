@@ -1,5 +1,5 @@
 use super::{
-    HeaderRejection, ID_TEXT_LEN, MAX_AWAITED, RESPONSE_AWAITED_HEADER, RESPONSE_NODE_HEADER,
+    HeaderRejection, ID_TEXT_LEN, RESPONSE_AWAITED_HEADER, RESPONSE_NODE_HEADER,
     RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestTag, parse_request_tag,
 };
 use crate::response::RequestId;
@@ -96,9 +96,8 @@ enum Mutation {
     AwaitedNonUtf8,
     AwaitedTooLong,
     AwaitedValueAbsent,
-    /// Exactly as many awaited names as a request may carry.
-    AwaitedAtBound,
-    AwaitedOverBound,
+    /// More awaited names than the former artificial cap allowed.
+    ManyAwaited,
 }
 
 /// One record's reserved headers, plus which awaited name this responder
@@ -256,18 +255,13 @@ impl Case {
             Mutation::AwaitedValueAbsent => {
                 set_value(&mut headers, RESPONSE_AWAITED_HEADER, None);
             }
-            Mutation::AwaitedAtBound => {
+            Mutation::ManyAwaited => {
                 let chosen = self.awaited[self.responder % self.awaited.len()];
                 drop_header(&mut headers, RESPONSE_AWAITED_HEADER);
                 headers.extend(
-                    (1..MAX_AWAITED).map(|_| header(RESPONSE_AWAITED_HEADER, OUTSIDER.as_bytes())),
+                    (0_usize..64).map(|_| header(RESPONSE_AWAITED_HEADER, OUTSIDER.as_bytes())),
                 );
                 headers.push(header(RESPONSE_AWAITED_HEADER, chosen.as_bytes()));
-            }
-            Mutation::AwaitedOverBound => {
-                drop_header(&mut headers, RESPONSE_AWAITED_HEADER);
-                headers
-                    .extend((0..=MAX_AWAITED).map(|_| header(RESPONSE_AWAITED_HEADER, b"ledger")));
             }
         }
 
@@ -295,7 +289,7 @@ fn other_id_form(mutation: Mutation) -> String {
 /// from the headers the way the parser derives it.
 fn expected(mutation: Mutation) -> Result<Option<RequestTag>, HeaderRejection> {
     match mutation {
-        Mutation::WellFormed | Mutation::WellFormedCommaResponder | Mutation::AwaitedAtBound => {
+        Mutation::WellFormed | Mutation::WellFormedCommaResponder | Mutation::ManyAwaited => {
             Ok(Some(RequestTag::new(
                 RequestId::from_bytes(REQUEST_ID_BYTES),
                 NodeId::from_bytes(NODE_ID_BYTES),
@@ -325,7 +319,6 @@ fn expected(mutation: Mutation) -> Result<Option<RequestTag>, HeaderRejection> {
         | Mutation::AwaitedNonUtf8
         | Mutation::AwaitedTooLong
         | Mutation::AwaitedValueAbsent => Err(HeaderRejection::MalformedAwaited),
-        Mutation::AwaitedOverBound => Err(HeaderRejection::TooManyAwaited),
     }
 }
 

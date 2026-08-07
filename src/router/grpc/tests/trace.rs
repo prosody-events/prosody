@@ -1,32 +1,32 @@
 //! The return leg reads as one nested client call.
 //!
-//! The assertion spans the **real** delivery: a worker opens
+//! The assertion spans the real delivery. The sender opens
 //! `peer.response.send`, the client injects that span's context into the
 //! outbound metadata, and the listener extracts it in another task. Asserting
 //! the *immediate* parent is what makes it falsifiable — dropping the injection
 //! re-parents `peer.response.receive`, and "it is not a root span" would not
 //! notice.
 
-use super::{ALPHA, Harness, SUITE_DESTINATIONS, SUITE_SLOTS, header, reaching, register};
-use crate::codec::Codec;
+use super::{ALPHA, Harness, header, reaching, register};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::sender::TypedSender;
+use crate::router::Router;
 use crate::test_util::{GlobalSpans, TEST_RUNTIME, named};
 use color_eyre::Result;
-use color_eyre::eyre::{bail, ensure, eyre};
+use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::Value;
 use opentelemetry::trace::{SpanKind, TraceContextExt};
 use opentelemetry_sdk::trace::SpanData;
 use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-/// The span a worker opens for one outbound response.
+/// The span the sender opens for one outbound response.
 const SENT: &str = "peer.response.send";
 
 /// The span the listener opens for the response it receives.
 const RECEIVED: &str = "peer.response.receive";
 
-/// The response body this suite queues.
+/// The response body this suite sends.
 const PAYLOAD: &[u8] = b"traced";
 
 /// The attribute naming what became of the response.
@@ -44,37 +44,27 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
     let spans = GlobalSpans::install()?;
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
-        let router = reaching(
-            harness.cap,
-            &harness.address,
-            SUITE_DESTINATIONS,
-            SUITE_SLOTS,
-        )?;
-        let (sender, workers) =
-            TypedSender::<CountingCodec>::new_without_local(&router, harness.cap)?;
-        let request = register(&harness.registry, &[ALPHA], CountingCodec::FORMAT_ID)?;
+        let router = reaching(harness.cap, &harness.address)?;
+        let sender =
+            TypedSender::<CountingCodec, _>::new_route(router.clone(), router.fleet(), harness.cap);
+        let request = register(&harness.registry, &[ALPHA])?;
 
         // The caller's span is opened, read, and closed here: the send carries
         // its context, not the span itself.
         let caller = info_span!("peer.test.call");
         let trace = caller.context();
         let caller_span = trace.span().span_context().clone();
-        let counters = sender.counters();
-        if sender
+        let delivered = sender
             .send(
-                header(harness.node, request, ALPHA)?,
+                header(harness.node, request.id(), ALPHA)?,
                 trace,
                 PAYLOAD.to_vec(),
             )
-            .is_err()
-        {
-            bail!("the fleet refused the response");
-        }
+            .await;
         drop(caller);
         drop(sender);
-        workers.join().await;
         ensure!(
-            counters.sent() == 1,
+            delivered,
             "the response must have reached the listener before its trace is read"
         );
 
@@ -89,7 +79,7 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         ensure!(
             sent.parent_span_id == caller_span.span_id()
                 && sent.span_context.trace_id() == caller_span.trace_id(),
-            "{SENT} must be a child of the span the response was queued under"
+            "{SENT} must be a child of the span the response was sent under"
         );
         ensure!(
             received.parent_span_id == sent.span_context.span_id()

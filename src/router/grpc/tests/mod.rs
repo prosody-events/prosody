@@ -20,13 +20,12 @@ mod transport;
 use super::client::GrpcSender;
 use super::service::PeerService;
 use super::{BoundListener, TransportConfiguration};
-use crate::codec::Codec;
-use crate::requester::config::{MAX_IN_FLIGHT, RequesterConfiguration};
 use crate::requester::registry::PendingRegistry;
+use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
-use crate::response::frame::{FrameCap, FrameHeader, ResponseFrame};
-use crate::response::{FormatToken, RequestId, ResponseStatus};
+use crate::response::frame::{FrameCap, FrameHeader};
+use crate::response::{RequestId, ResponseStatus};
 use crate::router::directory::Endpoint;
 use crate::router::fleet::DestinationFleet;
 use crate::router::loopback::listener::{FixedRouter, Served, endpoint, transport};
@@ -50,36 +49,16 @@ const FRAME_CAP: usize = 8 * 1024;
 /// The ceiling a sender that must out-reach the listener encodes under.
 const WIDE_FRAME_CAP: usize = 2 * FRAME_CAP;
 
-/// Most bytes one accepted payload may carry. Below the frame ceiling, so a
-/// payload the registry refuses still fits a frame the transport accepts.
-const MAX_RESPONSE_BYTES: usize = 1024;
-
-/// A payload the registry refuses and the transport carries.
-const OVER_RESPONSE_BYTES: usize = 2 * MAX_RESPONSE_BYTES;
-
 /// A frame the listener refuses and a wide sender encodes.
 const OVER_FRAME_BYTES: usize = FRAME_CAP + 1024;
 
 /// The subsystem a request awaits.
 const ALPHA: &str = "alpha";
 
-/// A second subsystem, for the cases that need two positions.
-const BETA: &str = "beta";
-
-/// How long a request in these suites stays open. Long enough that no
-/// assertion races the deadline sweep.
+/// How long a request in these suites stays open.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Destinations a suite's fleet holds, which is what sizes the channel cache of
-/// the senders built from it. Every suite reaches one listener, so one channel
-/// is enough and the second is slack.
-const SUITE_DESTINATIONS: usize = 2;
-
-/// Responses one destination in a suite's fleet may hold at once.
-const SUITE_SLOTS: usize = 2;
-
-/// The budget a suite gives one delivery, and one forward. Far longer than any
-/// call here takes, so no assertion races a deadline.
+/// The budget a suite gives one delivery and one forward.
 const BUDGET: Duration = Duration::from_secs(30);
 
 /// The one listener every suite that needs a wire shares.
@@ -96,9 +75,6 @@ pub(super) struct Harness {
     pub(super) node: NodeId,
     /// The registry the listener hands frames to.
     pub(super) registry: Arc<PendingRegistry>,
-    /// An identically configured registry, driven in process. It is the oracle
-    /// the wire's status is compared against.
-    pub(super) oracle: Arc<PendingRegistry>,
     /// A sender whose ceiling matches the listener's.
     pub(super) sender: GrpcSender,
     /// A sender whose ceiling is above the listener's, so a frame it refuses
@@ -127,12 +103,11 @@ impl Harness {
     /// configuration. Call [`stop`](Self::stop) before the test returns.
     pub(super) async fn with(config: Result<TransportConfiguration>) -> Result<Self> {
         let config = config?;
-        let served_registry = registry()?;
+        let served_registry = registry();
         let node = NodeId::new();
         let bound = BoundListener::bind(&config).await?;
         let address = endpoint(&bound);
-        let (relay_router, _relay_deliveries) =
-            TestRouter::new(fleet_config(SUITE_DESTINATIONS, SUITE_SLOTS))?;
+        let (relay_router, _relay_deliveries) = TestRouter::new(fleet_config())?;
         let served = Served::start(
             bound,
             PeerService::new(
@@ -145,9 +120,8 @@ impl Harness {
         Ok(Self {
             node,
             registry: served_registry,
-            oracle: registry()?,
-            sender: GrpcSender::new(config.frame_cap, &fleet(SUITE_DESTINATIONS)?),
-            wide: GrpcSender::new(FrameCap::new(WIDE_FRAME_CAP)?, &fleet(SUITE_DESTINATIONS)?),
+            sender: GrpcSender::new(config.frame_cap, &fleet()?),
+            wide: GrpcSender::new(FrameCap::new(WIDE_FRAME_CAP)?, &fleet()?),
             address,
             cap: config.frame_cap,
             served,
@@ -194,17 +168,11 @@ impl Harness {
     }
 }
 
-/// A router that reaches `address` and nothing else, over a fleet of
-/// `destinations` cells with `slots` slots each.
-pub(super) fn reaching(
-    cap: FrameCap,
-    address: &Endpoint,
-    destinations: usize,
-    slots: usize,
-) -> Result<FixedRouter> {
+/// A router that reaches `address` and nothing else.
+pub(super) fn reaching(cap: FrameCap, address: &Endpoint) -> Result<FixedRouter> {
     FixedRouter::new(
         cap,
-        fleet_config(destinations, slots),
+        fleet_config(),
         Some(registration(address.clone())),
         None,
     )
@@ -220,41 +188,25 @@ impl Framed for RawFramed {
     }
 }
 
-/// A fleet of `destinations` destinations, which is what sizes a sender's
-/// channel cache.
-pub(super) fn fleet(destinations: usize) -> Result<DestinationFleet> {
-    Ok(DestinationFleet::new(fleet_config(
-        destinations,
-        SUITE_SLOTS,
-    ))?)
+/// Builds a destination fleet.
+pub(super) fn fleet() -> Result<DestinationFleet> {
+    Ok(DestinationFleet::new(fleet_config())?)
 }
 
-/// A registry with a response ceiling below the frame ceiling.
-///
-/// Admission is the registry's own ceiling rather than its default. These
-/// suites register without a waiter guard, so nothing removes an entry inside a
-/// run, and the property below registers one per iteration under a count the
-/// environment raises. At the ceiling no run over a real socket can exhaust it,
-/// so the property fails on its subject rather than on admission.
-pub(super) fn registry() -> Result<Arc<PendingRegistry>> {
-    Ok(PendingRegistry::test(&RequesterConfiguration {
-        max_in_flight: MAX_IN_FLIGHT,
-        max_response_bytes: MAX_RESPONSE_BYTES,
-        ..RequesterConfiguration::default()
-    })?)
+pub(super) fn registry() -> Arc<PendingRegistry> {
+    PendingRegistry::new()
 }
 
-/// Registers one request that awaits `subsystems` and reads `expects`.
+/// Registers one request that awaits `subsystems`.
 pub(super) fn register(
     registry: &Arc<PendingRegistry>,
     subsystems: &[&str],
-    expects: &'static str,
-) -> Result<RequestId> {
+) -> Result<TestRegistration> {
     let mut awaited = Vec::with_capacity(subsystems.len());
     for name in subsystems {
         awaited.push(SubsystemName::try_new(name)?);
     }
-    Ok(registry.register_unguarded(&awaited, expects, TIMEOUT)?)
+    TestRegistration::new(registry, &awaited, TIMEOUT)
 }
 
 /// A header for one response to `request`, addressed to `target`.
@@ -266,16 +218,6 @@ pub(super) fn header(target: NodeId, request: RequestId, subsystem: &str) -> Res
         status: ResponseStatus::Success,
         relay: None,
     })
-}
-
-/// The frame the registry sees when a delivery is driven in process rather than
-/// over the wire.
-pub(super) fn frame(header: FrameHeader, payload: &[u8]) -> ResponseFrame {
-    ResponseFrame {
-        header,
-        format: FormatToken::make(CountingCodec::FORMAT_ID),
-        payload: BytesMut::from(payload),
-    }
 }
 
 /// A payload of `bytes` deterministic bytes.

@@ -1,11 +1,10 @@
 //! Sends one Kafka request and collects one response per named subsystem.
 
 mod collect;
-pub(crate) mod config;
 pub(crate) mod registry;
 
 use self::collect::collect;
-use self::registry::{Admission, PendingRegistry};
+use self::registry::PendingRegistry;
 use crate::error::ClassifyError;
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::response::RequestId;
@@ -77,9 +76,6 @@ pub enum ResponseFailure {
     /// The responder used a different response format.
     #[error("the responder answered in another format")]
     FormatMismatch,
-    /// The response was larger than this process accepts.
-    #[error("the response was over the configured response ceiling")]
-    TooLarge,
     /// The response payload did not decode or disagreed with its status.
     #[error("the response did not decode")]
     Malformed,
@@ -100,53 +96,18 @@ pub enum RequestError<E: Error> {
         /// The repeated subsystem name.
         name: SubsystemName,
     },
-    /// The request named more subsystems than the configured limit.
-    #[error("the request names {count} subsystems; the limit is {max}")]
-    TooManySubsystems {
-        /// Number of requested subsystems.
-        count: usize,
-        /// Configured subsystem limit.
-        max: usize,
-    },
-    /// The timeout is shorter or longer than the configured range.
-    #[error("the request timeout {timeout:?} is outside {min:?}..={max:?}")]
-    TimeoutOutOfRange {
-        /// Requested timeout.
-        timeout: Duration,
-        /// Shortest accepted timeout.
-        min: Duration,
-        /// Longest accepted timeout.
-        max: Duration,
-    },
     /// A caller-supplied header belongs to the request protocol.
     #[error("header {name} is reserved for response requests")]
     ReservedHeader {
         /// The reserved header name.
         name: &'static str,
     },
-    /// Every in-flight request permit is in use.
-    #[error("request admission is exhausted")]
-    AdmissionExhausted,
     /// Registry shutdown has started.
     #[error("the requester is shutting down")]
     ShuttingDown,
     /// Kafka did not accept the request and no response arrived first.
     #[error(transparent)]
     Produce(#[from] ProducerError<E>),
-}
-
-/// Maps a registry refusal onto the error a caller sees.
-///
-/// An id already in use reads as exhausted capacity: a fresh `UUIDv7` puts a
-/// collision out of reach, and refusing is what keeps the live request under
-/// that id from being overwritten.
-impl<E: Error> From<Admission> for RequestError<E> {
-    fn from(admission: Admission) -> Self {
-        match admission {
-            Admission::Exhausted | Admission::IdInUse => Self::AdmissionExhausted,
-            Admission::ShuttingDown => Self::ShuttingDown,
-        }
-    }
 }
 
 /// Sends requests and returns responses in subsystem order.
@@ -235,7 +196,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             record_headers.push((name, value));
         }
 
-        let registration = self.registry.register(subsystems, timeout, R::FORMAT_ID)?;
+        let mut registration = self.registry.register(subsystems, timeout)?;
         Span::current().record("request.id", display(registration.id()));
 
         append_request_headers(
@@ -247,13 +208,11 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             subsystems,
         );
 
-        let deadline = registration.deadline();
         let started = Instant::now();
         let collected = collect::<R, V, E, _, _>(
-            &registration,
+            &mut registration,
             self.producer
                 .send(record_headers.iter().copied(), topic, key, payload),
-            deadline,
         )
         .await;
         // A request refused before this point sent nothing, so it has no

@@ -1,8 +1,6 @@
 //! The peer method: what one process does with a response frame another
 //! process sent it.
 
-use super::TRANSPORT;
-use super::counted::SERVICE_STATUS;
 use super::deadline::inbound_deadline;
 use super::generated::peer_server::Peer;
 use super::inject::MetadataExtractor;
@@ -18,7 +16,6 @@ use async_trait::async_trait;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use std::time::Duration;
 use tokio::time::Instant;
-use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span, debug_span};
@@ -62,16 +59,10 @@ impl<R: RelayHop> Peer for PeerService<R> {
     /// Hands one frame to the waiter it names, sends it on to the process it
     /// names, or refuses it — and answers with the status the whole path came
     /// to.
-    ///
-    /// The invocation is counted before anything can return, so "the service
-    /// never ran" is observable: a frame the transport refused leaves that
-    /// counter alone, which is what separates a transport rejection from a
-    /// registry outcome.
     async fn deliver_response(
         &self,
         request: Request<ResponseFrame>,
     ) -> Result<Response<()>, Status> {
-        TRANSPORT.record_served();
         // Hand-built rather than `#[instrument]`: the span relates to a context
         // this call carried, which the attribute cannot express. Every record
         // goes through this owned handle, because a level-disabled span never
@@ -108,16 +99,10 @@ impl<R: RelayHop> Peer for PeerService<R> {
             span.record("peer.subsystem", display(&frame.header.subsystem));
             let target = frame.header.target;
             let routing = routing(self.local.node, target, frame.header.relay);
-            // Counted here rather than inside the arms, so a routing outcome
-            // added later cannot reach the wire without being counted.
-            if routing != Routing::Accept {
-                TRANSPORT.record_misrouted();
-            }
             match routing {
                 Routing::Accept => answer(&span, self.local.accept(frame)),
                 Routing::AlreadyRelayed => answer(&span, ResponseDisposition::AlreadyRelayed),
                 Routing::Forward => {
-                    TRANSPORT.record_forwarded();
                     // The forwarded form carries this process's own id, so a
                     // relay id the caller supplied cannot survive the hop.
                     let Some(forwarded) = Forwarded::new(frame, self.local.node, self.cap) else {
@@ -137,16 +122,12 @@ impl<R: RelayHop> Peer for PeerService<R> {
                         .instrument(forward)
                         .await
                     {
-                        // The target decided this one and counted it there.
                         Ok(()) => {
                             span.record(
                                 "peer.disposition",
                                 ResponseDisposition::Accepted.message(),
                             );
                             Ok(Response::new(()))
-                        }
-                        Err(RelayFailure::NoCapacity) => {
-                            answer(&span, ResponseDisposition::NoRelayCapacity)
                         }
                         Err(RelayFailure::DeadlineExceeded) => {
                             answer(&span, ResponseDisposition::RelayDeadlineExceeded)
@@ -182,12 +163,8 @@ fn answer(span: &Span, disposition: ResponseDisposition) -> Result<Response<()>,
         ResponseDisposition::Accepted => Ok(Response::new(())),
         ResponseDisposition::UnknownRequest
         | ResponseDisposition::ClosedRequest
-        | ResponseDisposition::DuplicateSubsystem
-        | ResponseDisposition::UnexpectedSubsystem
-        | ResponseDisposition::FormatMismatch
         | ResponseDisposition::ResponseTooLarge
         | ResponseDisposition::AlreadyRelayed
-        | ResponseDisposition::NoRelayCapacity
         | ResponseDisposition::RelayDeadlineExceeded
         | ResponseDisposition::Unreachable => {
             Err(service_status(disposition.status(), disposition.message()))
@@ -197,9 +174,5 @@ fn answer(span: &Span, disposition: ResponseDisposition) -> Result<Response<()>,
 
 /// Marks one status as a service result, not a transport refusal.
 fn service_status(code: tonic::Code, message: &'static str) -> Status {
-    let mut status = Status::new(code, message);
-    status
-        .metadata_mut()
-        .insert(SERVICE_STATUS, MetadataValue::from_static("1"));
-    status
+    Status::new(code, message)
 }
