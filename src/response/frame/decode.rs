@@ -230,12 +230,12 @@ fn decode_payload<B: Buf>(src: &mut B) -> Result<BytesMut, FrameDecodeError> {
 /// Why a frame a peer sent could not be read.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum FrameDecodeError {
-    /// The encoded frame is larger than the configured ceiling.
+    /// The encoded frame is larger than the frame ceiling.
     #[error("frame is {bytes} bytes, over the {limit}-byte cap")]
     FrameTooLarge {
         /// The encoded frame's length.
         bytes: usize,
-        /// The configured ceiling.
+        /// The frame ceiling.
         limit: usize,
     },
 

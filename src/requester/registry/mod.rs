@@ -73,6 +73,9 @@ impl PendingRegistry {
         if self.closed.load(Acquire) {
             return Err(RequestError::ShuttingDown);
         }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(RequestError::DeadlineOutOfRange)?;
 
         let (id, keys, receivers) = loop {
             let id = RequestId::new();
@@ -104,7 +107,7 @@ impl PendingRegistry {
             id,
             keys,
             receivers,
-            deadline: Instant::now() + timeout,
+            deadline,
         })
     }
 

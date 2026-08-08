@@ -226,12 +226,12 @@ pub(crate) enum EncodeError<E: Error> {
     #[error(transparent)]
     Codec(E),
 
-    /// The forwarded frame would exceed the configured ceiling.
+    /// The forwarded frame would exceed the frame ceiling.
     #[error("framed response is {bytes} bytes, over the {limit}-byte cap")]
     TooLarge {
         /// The length the forwarded frame would have had.
         bytes: u64,
-        /// The configured ceiling.
+        /// The frame ceiling.
         limit: usize,
     },
 }

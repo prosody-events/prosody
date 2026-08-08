@@ -20,6 +20,7 @@ use color_eyre::eyre::bail;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use smallvec::SmallVec;
+use std::convert::Infallible;
 use std::iter::{empty, once};
 use std::pin::pin;
 use std::sync::Arc;
@@ -114,6 +115,12 @@ async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
             assert_eq!(name.as_str(), "billing");
         }
         other => bail!("a repeated subsystem must be refused, not {other:?}"),
+    }
+
+    match registry.register::<Infallible>(&one, Duration::MAX) {
+        Err(RequestError::DeadlineOutOfRange) => {}
+        Err(other) => bail!("an unsupported timeout returned {other:?}"),
+        Ok(_) => bail!("an unsupported timeout was accepted"),
     }
 
     for reserved in RESERVED_REQUEST_HEADERS {

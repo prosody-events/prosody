@@ -32,7 +32,7 @@ const ID_BYTES: usize = 16;
 const RELAY_FIELD_BYTES: usize =
     key_len(FIELD_RELAY_NODE) + encoded_len_varint(ID_BYTES as u64) + ID_BYTES;
 
-/// The one configured ceiling on an encoded frame.
+/// The internal ceiling on an encoded frame.
 ///
 /// It bounds the complete frame rather than the payload alone, and it is the
 /// size the outgoing transport buffer is created at, so a maximum-size frame
@@ -104,7 +104,7 @@ impl FrameCap {
         + 1
         + RELAY_FIELD_BYTES;
 
-    /// Accepts a configured ceiling within the supported range.
+    /// Accepts a test ceiling within the supported range.
     ///
     /// # Errors
     ///
@@ -129,14 +129,14 @@ impl FrameCap {
     }
 }
 
-/// A configured frame ceiling the transport cannot use.
+/// A test frame ceiling the transport cannot use.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[cfg(test)]
 pub(crate) enum FrameCapError {
     /// The ceiling is outside the supported range.
     #[error("frame cap {bytes} is outside {min}..={max} bytes")]
     OutOfRange {
-        /// The configured ceiling.
+        /// The requested ceiling.
         bytes: usize,
         /// The smallest usable ceiling.
         min: usize,

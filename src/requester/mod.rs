@@ -109,7 +109,7 @@ pub enum RequestError<E: Error> {
     /// Registry shutdown has started.
     #[error("the requester is shutting down")]
     ShuttingDown,
-    /// Kafka did not accept the request and no response arrived first.
+    /// Kafka did not accept the request.
     #[error(transparent)]
     Produce(#[from] ProducerError<E>),
 }

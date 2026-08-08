@@ -95,14 +95,13 @@ impl Decoder for ServerFrameCodec {
 
     /// Reads one frame, and counts what it refuses.
     ///
-    /// The listener's configured ceiling refuses an over-cap message before a
-    /// byte reaches this reader, and answers the peer `OUT_OF_RANGE` itself. So
-    /// the ceiling passed here is the type's own upper bound, the size arm of
-    /// [`refusal`] answers only a reader driven directly, and
-    /// transport made.
+    /// The transport rejects an over-cap message before a byte reaches this
+    /// reader. This reader uses the type's upper bound as a second defense.
+    /// The size arm of [`refusal`] applies only when a caller drives the codec
+    /// directly.
     ///
     /// This direction keeps tonic's own receive buffer, which grows to the
-    /// message once and is freed with the call. Sizing it to the configured
+    /// message once and is freed with the call. Sizing it to the frame
     /// ceiling instead would hold that ceiling open on every idle stream, and
     /// the codec is built through [`Default`] and could not read the ceiling
     /// anyway.
