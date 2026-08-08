@@ -38,6 +38,18 @@ pub struct ThroughputPosteriorCell {
 }
 
 impl CapacityCurve {
+    pub(crate) const fn service_time_seconds(self) -> f64 {
+        match self {
+            Self::NoKnee {
+                service_time_seconds,
+            }
+            | Self::Knee {
+                service_time_seconds,
+                ..
+            } => service_time_seconds,
+        }
+    }
+
     /// Returns completed-attempt throughput at one live concurrency.
     #[must_use]
     pub fn throughput(self, concurrency: f64) -> f64 {

@@ -273,6 +273,8 @@ pub struct EventContext<'a> {
 /// Per-event values calculated after the tick graph.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventInputs {
+    /// Virtual time when this event becomes available.
+    pub release_micros: u64,
     /// Kafka partition for this event.
     pub partition: u32,
     /// Serialization key for this event.
@@ -295,6 +297,19 @@ pub trait TickGenerator {
     /// Returns an error when a generated value violates a plant bound.
     fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError>;
 
+    /// Applies observations after the plant reaches this tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an observed value violates a plant bound.
+    fn observe(
+        &mut self,
+        _: TickContext<'_>,
+        inputs: TickInputs,
+    ) -> Result<TickInputs, PlantError> {
+        Ok(inputs)
+    }
+
     /// Calculates the frozen calendar input for this tick.
     ///
     /// # Errors
@@ -302,13 +317,13 @@ pub trait TickGenerator {
     /// Returns an error when the forecast violates a simulator bound.
     fn calendar_forecast(
         &self,
-        _context: TickContext<'_>,
+        _: TickContext<'_>,
     ) -> Result<Option<CalendarForecastInput>, PlantError> {
         Ok(None)
     }
 
     /// Calculates the reporter lifecycle action for this tick.
-    fn reporter(&self, _context: TickContext<'_>) -> ReporterDirective {
+    fn reporter(&self, _: TickContext<'_>) -> ReporterDirective {
         ReporterDirective::Send
     }
 
@@ -319,6 +334,7 @@ pub trait TickGenerator {
     /// Returns an error when the outcome exceeds a simulator bound.
     fn event(&self, context: EventContext<'_>) -> Result<EventInputs, PlantError> {
         Ok(EventInputs {
+            release_micros: context.tick.now_micros,
             partition: context.event_index % context.partition_count,
             key: context.event_index % context.key_count,
             handler_micros: context.inputs.handler_micros,
@@ -765,18 +781,9 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
     ///
     /// Returns an error when generated demand exceeds a fixed plant bound.
     pub fn tick(&mut self, now_micros: u64) -> Result<PlantSnapshot, PlantError> {
-        let before = self.plant.advance_until(now_micros);
-        self.plant
-            .write_partition_normal_backlog(now_micros, &mut self.partition_normal_backlog)?;
-        self.plant.write_partition_normal_oldest_release(
-            now_micros,
-            &mut self.partition_normal_oldest_release_micros,
-        )?;
-        self.plant
-            .write_partition_failure_backlog(&mut self.partition_failure_backlog)?;
-        self.plant
-            .write_partition_failure_release(&mut self.partition_failure_release_micros)?;
-        let inputs = self.graph.calculate(TickContext {
+        let previous_micros = self.history.view().now_micros(0).map_or(0, |time| time);
+        let before = self.plant.advance_until(previous_micros);
+        let schedule_context = TickContext {
             now_micros,
             tick_index: self.tick_index,
             plant: before,
@@ -790,19 +797,10 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
                 release_micros: &self.partition_failure_release_micros,
             },
             completed_settlements: self.plant.completed_settlements(),
-        })?;
+        };
+        let inputs = self.graph.calculate(schedule_context)?;
         self.plant.attempt_model.update(inputs);
-        if let ScaleDirective::Request {
-            replicas,
-            delay_micros,
-        } = inputs.scale
-        {
-            self.plant.replace_scale_target(ScaleChange {
-                at_micros: now_micros.saturating_add(delay_micros),
-                replicas,
-            })?;
-        }
-        let context = TickContext {
+        let event_context = TickContext {
             now_micros,
             tick_index: self.tick_index,
             plant: before,
@@ -825,13 +823,13 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             key_count: self.key_count,
         };
         event_sink.add(
-            context,
+            event_context,
             inputs,
             crate::EventSource::Message,
             inputs.message_count,
         )?;
         event_sink.add(
-            context,
+            event_context,
             inputs,
             crate::EventSource::Timer,
             inputs.timer_count,
@@ -839,8 +837,48 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
         let after = self.plant.advance_until(now_micros);
         self.plant
             .write_partition_normal_backlog(now_micros, &mut self.partition_normal_backlog)?;
-        self.history
-            .push(now_micros, after, inputs, &self.partition_normal_backlog);
+        self.plant.write_partition_normal_oldest_release(
+            now_micros,
+            &mut self.partition_normal_oldest_release_micros,
+        )?;
+        self.plant
+            .write_partition_failure_backlog(&mut self.partition_failure_backlog)?;
+        self.plant
+            .write_partition_failure_release(&mut self.partition_failure_release_micros)?;
+        let observed_inputs = self.graph.observe(
+            TickContext {
+                now_micros,
+                tick_index: self.tick_index,
+                plant: after,
+                history: self.history.view(),
+                normal_backlog: NormalBacklogView {
+                    counts: &self.partition_normal_backlog,
+                    oldest_release_micros: &self.partition_normal_oldest_release_micros,
+                },
+                failure_backlog: FailureBacklogView {
+                    counts: &self.partition_failure_backlog,
+                    release_micros: &self.partition_failure_release_micros,
+                },
+                completed_settlements: self.plant.completed_settlements(),
+            },
+            inputs,
+        )?;
+        if let ScaleDirective::Request {
+            replicas,
+            delay_micros,
+        } = observed_inputs.scale
+        {
+            self.plant.replace_scale_target(ScaleChange {
+                at_micros: now_micros.saturating_add(delay_micros),
+                replicas,
+            })?;
+        }
+        self.history.push(
+            now_micros,
+            after,
+            observed_inputs,
+            &self.partition_normal_backlog,
+        );
         self.tick_index = self.tick_index.saturating_add(1);
         Ok(after)
     }
@@ -899,7 +937,7 @@ impl<Graph: TickGenerator, Model: AttemptModel> EventSink<'_, Graph, Model> {
                 source,
             })?;
             self.plant.add_event(EventSpec {
-                release_micros: context.now_micros,
+                release_micros: event.release_micros,
                 partition: event.partition,
                 key: event.key,
                 handler_micros: event.handler_micros,

@@ -1,16 +1,18 @@
 //! Bounded predictive autoscaling algorithm.
 //!
-//! [`step`] is the only state transition. Construction allocates all retained
-//! state and scratch memory. A call to [`step`] performs bounded work and does
-//! not allocate.
+//! [`controller::step`] is the only state transition. Construction allocates
+//! all retained state and scratch memory. A transition performs bounded work
+//! and does not allocate.
 
 mod arrival;
 mod capacity;
 mod change_point;
+/// The bounded controller state, scratch columns, and transition function.
+pub mod controller;
 mod edf;
 mod lead_time;
-mod model;
 mod partition;
+mod planning;
 mod random;
 mod reliability;
 mod types;
@@ -20,11 +22,11 @@ pub use capacity::{
     CapacityCurve, CapacityGrid, CapacityGridError, CapacityPrior, PosteriorError, ResourceWindow,
     ResourceWindowError, ThroughputPosteriorCell,
 };
+pub use controller::{DecisionCurveError, DecisionRejection, ScaleScratch, ScaleState, step};
 pub use lead_time::{
     TransitionDirection, TransitionEvidence, TransitionEvidenceError, TransitionPrior,
     TransitionPriorError,
 };
-pub use model::{DecisionCurveError, ScaleScratch, ScaleState, step};
 pub use random::RandomStream;
 pub use reliability::ReliabilityPrior;
 pub use types::{

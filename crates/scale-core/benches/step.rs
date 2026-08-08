@@ -7,8 +7,10 @@ use prosody_scale_core::{
     ScaleState, ServiceObjective, TransitionPrior, step,
 };
 use std::hint::black_box;
+use std::time::Instant;
 use thiserror::Error;
 
+const REPORT_INTERVAL_MICROS: u64 = 1_000_000;
 const SMALL: BenchmarkCase = BenchmarkCase {
     name: "low_volume_synthetic",
     cohort_count_max: 8,
@@ -48,9 +50,83 @@ struct BenchmarkCase {
 fn benchmarks(criterion: &mut Criterion) {
     construction(criterion);
     steady_state(criterion);
+    staggered_cohort_step(criterion);
+    rayon_worker_step(criterion);
     capacity_grid(criterion);
     resource_grid_step(criterion);
     posterior_sample_count_step(criterion);
+}
+
+fn staggered_cohort_step(criterion: &mut Criterion) {
+    let Ok(configuration) = configuration(TYPICAL) else {
+        return;
+    };
+    let Ok(capacity_grid) = grid(TYPICAL) else {
+        return;
+    };
+    let state = ScaleState::new(configuration.clone(), capacity_grid);
+    let scratch = ScaleScratch::new(&configuration);
+    let observation = ObservationBuffer::new(&configuration);
+    let (Ok(mut state), Ok(mut scratch), Ok(mut observation)) = (state, scratch, observation)
+    else {
+        return;
+    };
+    if populate_staggered(&mut observation, TYPICAL).is_err() {
+        return;
+    }
+    let mut now = 1_u64;
+    criterion.bench_function("step/staggered/service_reference_synthetic", |bencher| {
+        bencher.iter(|| {
+            let decision = step(
+                &mut state,
+                &mut scratch,
+                observation.observation(),
+                ModelTime::from_micros(now),
+            );
+            now = now.wrapping_add(REPORT_INTERVAL_MICROS);
+            black_box(decision);
+        });
+    });
+}
+
+fn rayon_worker_step(criterion: &mut Criterion) {
+    let Ok(configuration) = configuration(TYPICAL) else {
+        return;
+    };
+    let Ok(capacity_grid) = grid(TYPICAL) else {
+        return;
+    };
+    let state = ScaleState::new(configuration.clone(), capacity_grid);
+    let scratch = ScaleScratch::new(&configuration);
+    let observation = ObservationBuffer::new(&configuration);
+    let pool = rayon::ThreadPoolBuilder::new().build();
+    let (Ok(mut state), Ok(mut scratch), Ok(mut observation), Ok(pool)) =
+        (state, scratch, observation, pool)
+    else {
+        return;
+    };
+    if populate(&mut observation, TYPICAL).is_err() {
+        return;
+    }
+    let mut now = 1_u64;
+    criterion.bench_function("step/rayon_worker/service_reference_synthetic", |bencher| {
+        bencher.iter_custom(|iterations| {
+            pool.install(|| {
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    let decision = step(
+                        &mut state,
+                        &mut scratch,
+                        observation.observation(),
+                        ModelTime::from_micros(now),
+                    );
+                    now = now.wrapping_add(REPORT_INTERVAL_MICROS);
+                    black_box(decision);
+                }
+                started.elapsed()
+            })
+        });
+    });
 }
 
 fn posterior_sample_count_step(criterion: &mut Criterion) {
@@ -85,7 +161,7 @@ fn posterior_sample_count_step(criterion: &mut Criterion) {
                         observation.observation(),
                         ModelTime::from_micros(now),
                     );
-                    now = now.wrapping_add(1);
+                    now = now.wrapping_add(REPORT_INTERVAL_MICROS);
                     black_box(decision);
                 });
             },
@@ -125,7 +201,7 @@ fn resource_grid_step(criterion: &mut Criterion) {
                         observation.observation(),
                         ModelTime::from_micros(now),
                     );
-                    now = now.wrapping_add(1);
+                    now = now.wrapping_add(REPORT_INTERVAL_MICROS);
                     black_box(decision);
                 });
             },
@@ -145,7 +221,7 @@ fn construction(criterion: &mut Criterion) {
             &case,
             |bencher, _case| {
                 bencher.iter(|| {
-                    let _construction = black_box(construct(&configuration, case));
+                    let _ = black_box(construct(&configuration, case));
                 });
             },
         );
@@ -184,7 +260,7 @@ fn steady_state(criterion: &mut Criterion) {
                         observation.observation(),
                         ModelTime::from_micros(now),
                     );
-                    now = now.wrapping_add(1);
+                    now = now.wrapping_add(REPORT_INTERVAL_MICROS);
                     black_box(decision);
                 });
             },
@@ -224,7 +300,7 @@ fn capacity_grid(criterion: &mut Criterion) {
                     observation.observation(),
                     ModelTime::from_micros(now),
                 );
-                now = now.wrapping_add(1);
+                now = now.wrapping_add(REPORT_INTERVAL_MICROS);
                 black_box(decision);
             });
         });
@@ -240,6 +316,7 @@ fn configuration(case: BenchmarkCase) -> Result<Configuration, ConfigurationErro
         replica_count_max: case.replica_count_max,
         slots_per_replica: case.slots_per_replica,
         posterior_sample_count: case.posterior_sample_count,
+        report_interval_micros: REPORT_INTERVAL_MICROS,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
         capacity_change_rate_per_second: 0.0_f64,
@@ -273,6 +350,26 @@ fn populate(
         observation.push_cohort(Cohort {
             release_micros: 0,
             deadline_micros: u64::from(HORIZON_SECONDS) * 1_000_000,
+            offered_events: events_per_cohort,
+            partition: cohort % 64,
+            demand_class: DemandClass::Normal,
+        })?;
+    }
+    Ok(())
+}
+
+fn populate_staggered(
+    observation: &mut ObservationBuffer,
+    case: BenchmarkCase,
+) -> Result<(), BenchmarkError> {
+    const HORIZON_SECONDS: u64 = 30;
+    let events_per_cohort = f64::from(case.offered_events_per_second) * HORIZON_SECONDS as f64
+        / f64::from(case.cohort_count_max);
+    for cohort in 0..case.cohort_count_max {
+        let release_micros = u64::from(cohort) * 100_000;
+        observation.push_cohort(Cohort {
+            release_micros,
+            deadline_micros: release_micros + HORIZON_SECONDS * 1_000_000,
             offered_events: events_per_cohort,
             partition: cohort % 64,
             demand_class: DemandClass::Normal,

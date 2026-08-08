@@ -50,26 +50,6 @@ impl ActuationCommitment {
             requested_at,
         })
     }
-
-    pub(crate) const fn target_replicas(self) -> u32 {
-        self.target_replicas
-    }
-
-    pub(crate) const fn direction(self) -> TransitionDirection {
-        if self.target_replicas > self.from_replicas {
-            TransitionDirection::Up
-        } else {
-            TransitionDirection::Down
-        }
-    }
-
-    pub(crate) const fn replica_delta(self) -> u32 {
-        self.target_replicas.abs_diff(self.from_replicas)
-    }
-
-    pub(crate) const fn requested_at(self) -> ModelTime {
-        self.requested_at
-    }
 }
 
 /// One discrete posterior view for diagnostics and calibration.
@@ -162,11 +142,20 @@ impl CalendarRateSegment {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct CalendarColumns {
+    positions: Vec<u32>,
+    start_micros: Vec<u64>,
+    end_micros: Vec<u64>,
+    shapes: Vec<f64>,
+    rate_seconds: Vec<f64>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CalendarForecast<'a> {
     pub(crate) artifact: CalendarArtifactId,
     pub(crate) prior_probability: f64,
-    pub(crate) segments: &'a [CalendarRateSegment],
+    pub(crate) segments: &'a CalendarColumns,
 }
 
 /// One latency objective supplied by a user.
@@ -223,6 +212,8 @@ pub struct Configuration {
     pub slots_per_replica: u32,
     /// Number of posterior samples per decision.
     pub posterior_sample_count: u32,
+    /// Time between complete telemetry reports.
+    pub report_interval_micros: u64,
     /// Maximum failure-service fraction while normal work waits.
     pub failure_service_weight: f64,
     /// Prior for live arrival-rate segments.
@@ -277,6 +268,11 @@ impl Configuration {
         if self.posterior_sample_count == 0 {
             return Err(ConfigurationError::ZeroBound {
                 name: "posterior_sample_count",
+            });
+        }
+        if self.report_interval_micros == 0 {
+            return Err(ConfigurationError::ZeroBound {
+                name: "report_interval_micros",
             });
         }
         if !self.failure_service_weight.is_finite()
@@ -444,30 +440,352 @@ impl Cohort {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct WorkCohort {
-    pub(crate) release_micros: u64,
-    pub(crate) deadline_micros: u64,
-    pub(crate) work_slot_seconds: f64,
-    pub(crate) partition: u32,
+#[derive(Clone, Debug)]
+pub(crate) struct WorkCohorts {
+    release_micros: Vec<u64>,
+    deadline_micros: Vec<u64>,
+    work_slot_seconds: Vec<f64>,
+    partitions: Vec<u32>,
+    release_max_micros: u64,
+    work_slot_seconds_sum: f64,
 }
 
-impl WorkCohort {
-    pub(crate) const fn new(cohort: Cohort, work_slot_seconds: f64) -> Self {
+#[derive(Debug)]
+pub(crate) struct CohortColumns {
+    release_micros: Vec<u64>,
+    deadline_micros: Vec<u64>,
+    offered_events: Vec<f64>,
+    partitions: Vec<u32>,
+    demand_classes: Vec<DemandClass>,
+    normal_events: f64,
+    failure_events: f64,
+}
+
+#[derive(Debug)]
+pub(crate) struct BacklogColumns {
+    event_counts: Vec<u32>,
+    oldest_arrival_micros: Vec<u64>,
+    observed_at_micros: Vec<u64>,
+    present: Vec<u8>,
+    normal_events: f64,
+    failure_events: f64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ActuationCommitments {
+    from_replicas: Vec<u32>,
+    target_replicas: Vec<u32>,
+    requested_at: Vec<ModelTime>,
+}
+
+impl WorkCohorts {
+    pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            release_micros: cohort.release_micros,
-            deadline_micros: cohort.deadline_micros,
-            work_slot_seconds,
-            partition: cohort.partition,
+            release_micros: Vec::with_capacity(capacity),
+            deadline_micros: Vec::with_capacity(capacity),
+            work_slot_seconds: Vec::with_capacity(capacity),
+            partitions: Vec::with_capacity(capacity),
+            release_max_micros: 0,
+            work_slot_seconds_sum: 0.0_f64,
         }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.release_micros.clear();
+        self.deadline_micros.clear();
+        self.work_slot_seconds.clear();
+        self.partitions.clear();
+        self.release_max_micros = 0;
+        self.work_slot_seconds_sum = 0.0_f64;
+    }
+
+    pub(crate) fn push_values(
+        &mut self,
+        release_micros: u64,
+        deadline_micros: u64,
+        work_slot_seconds: f64,
+        partition: u32,
+    ) {
+        assert!(
+            self.len() < self.release_micros.capacity(),
+            "work cohorts must fit the configured capacity"
+        );
+        self.release_micros.push(release_micros);
+        self.deadline_micros.push(deadline_micros);
+        self.work_slot_seconds.push(work_slot_seconds);
+        self.partitions.push(partition);
+        self.release_max_micros = self.release_max_micros.max(release_micros);
+        self.work_slot_seconds_sum += work_slot_seconds;
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.release_micros.len()
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.release_micros.is_empty()
+    }
+
+    pub(crate) fn release_micros(&self, index: usize) -> u64 {
+        self.release_micros[index]
+    }
+
+    pub(crate) fn deadline_micros(&self, index: usize) -> u64 {
+        self.deadline_micros[index]
+    }
+
+    pub(crate) fn work_slot_seconds(&self, index: usize) -> f64 {
+        self.work_slot_seconds[index]
+    }
+
+    pub(crate) fn partition(&self, index: usize) -> u32 {
+        self.partitions[index]
+    }
+
+    pub(crate) const fn release_max_micros(&self) -> u64 {
+        self.release_max_micros
+    }
+
+    pub(crate) const fn work_slot_seconds_sum(&self) -> f64 {
+        self.work_slot_seconds_sum
+    }
+}
+
+impl CalendarColumns {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            positions: Vec::with_capacity(capacity),
+            start_micros: Vec::with_capacity(capacity),
+            end_micros: Vec::with_capacity(capacity),
+            shapes: Vec::with_capacity(capacity),
+            rate_seconds: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.positions.clear();
+        self.start_micros.clear();
+        self.end_micros.clear();
+        self.shapes.clear();
+        self.rate_seconds.clear();
+    }
+
+    pub(crate) fn extend(&mut self, segments: &[CalendarRateSegment]) {
+        for segment in segments {
+            self.positions.push(segment.position);
+            self.start_micros.push(segment.start_micros);
+            self.end_micros.push(segment.end_micros);
+            self.shapes.push(segment.shape);
+            self.rate_seconds.push(segment.rate_seconds);
+        }
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.positions.len()
+    }
+
+    pub(crate) const fn capacity(&self) -> usize {
+        self.positions.capacity()
+    }
+
+    pub(crate) fn position(&self, index: usize) -> u32 {
+        self.positions[index]
+    }
+
+    pub(crate) fn start_micros(&self, index: usize) -> u64 {
+        self.start_micros[index]
+    }
+
+    pub(crate) fn end_micros(&self, index: usize) -> u64 {
+        self.end_micros[index]
+    }
+
+    pub(crate) fn shape(&self, index: usize) -> f64 {
+        self.shapes[index]
+    }
+
+    pub(crate) fn rate_seconds(&self, index: usize) -> f64 {
+        self.rate_seconds[index]
+    }
+}
+
+impl CohortColumns {
+    fn new(capacity: usize) -> Self {
+        Self {
+            release_micros: Vec::with_capacity(capacity),
+            deadline_micros: Vec::with_capacity(capacity),
+            offered_events: Vec::with_capacity(capacity),
+            partitions: Vec::with_capacity(capacity),
+            demand_classes: Vec::with_capacity(capacity),
+            normal_events: 0.0_f64,
+            failure_events: 0.0_f64,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.release_micros.clear();
+        self.deadline_micros.clear();
+        self.offered_events.clear();
+        self.partitions.clear();
+        self.demand_classes.clear();
+        self.normal_events = 0.0_f64;
+        self.failure_events = 0.0_f64;
+    }
+
+    fn push(&mut self, cohort: Cohort) {
+        self.release_micros.push(cohort.release_micros);
+        self.deadline_micros.push(cohort.deadline_micros);
+        self.offered_events.push(cohort.offered_events);
+        self.partitions.push(cohort.partition);
+        self.demand_classes.push(cohort.demand_class);
+        match cohort.demand_class {
+            DemandClass::Normal => self.normal_events += cohort.offered_events,
+            DemandClass::Failure => self.failure_events += cohort.offered_events,
+        }
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.release_micros.len()
+    }
+
+    const fn capacity(&self) -> usize {
+        self.release_micros.capacity()
+    }
+
+    pub(crate) fn release_micros(&self, index: usize) -> u64 {
+        self.release_micros[index]
+    }
+
+    pub(crate) fn deadline_micros(&self, index: usize) -> u64 {
+        self.deadline_micros[index]
+    }
+
+    pub(crate) fn offered_events(&self, index: usize) -> f64 {
+        self.offered_events[index]
+    }
+
+    pub(crate) fn partition(&self, index: usize) -> u32 {
+        self.partitions[index]
+    }
+
+    pub(crate) const fn demand_totals(&self) -> (f64, f64) {
+        (self.normal_events, self.failure_events)
+    }
+}
+
+impl BacklogColumns {
+    fn new(count: usize) -> Self {
+        Self {
+            event_counts: vec![0; count],
+            oldest_arrival_micros: vec![0; count],
+            observed_at_micros: vec![0; count],
+            present: vec![0; count],
+            normal_events: 0.0_f64,
+            failure_events: 0.0_f64,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.present.fill(0);
+        self.normal_events = 0.0_f64;
+        self.failure_events = 0.0_f64;
+    }
+
+    fn set(&mut self, index: usize, backlog: BacklogCohort) -> bool {
+        if self.present[index] != 0 {
+            return false;
+        }
+        self.event_counts[index] = backlog.event_count();
+        self.oldest_arrival_micros[index] = backlog.oldest_arrival_micros();
+        self.observed_at_micros[index] = backlog.observed_at_micros();
+        self.present[index] = 1;
+        match backlog.demand_class() {
+            DemandClass::Normal => self.normal_events += f64::from(backlog.event_count()),
+            DemandClass::Failure => self.failure_events += f64::from(backlog.event_count()),
+        }
+        true
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.present.len()
+    }
+
+    pub(crate) fn is_present(&self, index: usize) -> bool {
+        self.present[index] != 0
+    }
+
+    pub(crate) fn event_count(&self, index: usize) -> u32 {
+        self.event_counts[index]
+    }
+
+    pub(crate) fn oldest_arrival_micros(&self, index: usize) -> u64 {
+        self.oldest_arrival_micros[index]
+    }
+
+    pub(crate) fn observed_at_micros(&self, index: usize) -> u64 {
+        self.observed_at_micros[index]
+    }
+
+    pub(crate) const fn demand_totals(&self) -> (f64, f64) {
+        (self.normal_events, self.failure_events)
+    }
+}
+
+impl ActuationCommitments {
+    fn new(capacity: usize) -> Self {
+        Self {
+            from_replicas: Vec::with_capacity(capacity),
+            target_replicas: Vec::with_capacity(capacity),
+            requested_at: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.from_replicas.clear();
+        self.target_replicas.clear();
+        self.requested_at.clear();
+    }
+
+    fn push(&mut self, commitment: ActuationCommitment) {
+        self.from_replicas.push(commitment.from_replicas);
+        self.target_replicas.push(commitment.target_replicas);
+        self.requested_at.push(commitment.requested_at);
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.target_replicas.len()
+    }
+
+    const fn capacity(&self) -> usize {
+        self.target_replicas.capacity()
+    }
+
+    pub(crate) fn target_replicas(&self, index: usize) -> u32 {
+        self.target_replicas[index]
+    }
+
+    pub(crate) fn requested_at(&self, index: usize) -> ModelTime {
+        self.requested_at[index]
+    }
+
+    pub(crate) fn direction(&self, index: usize) -> TransitionDirection {
+        if self.target_replicas[index] > self.from_replicas[index] {
+            TransitionDirection::Up
+        } else {
+            TransitionDirection::Down
+        }
+    }
+
+    pub(crate) fn replica_delta(&self, index: usize) -> u32 {
+        self.target_replicas[index].abs_diff(self.from_replicas[index])
     }
 }
 
 /// Borrowed typed input for one controller tick.
 #[derive(Debug)]
 pub struct GroupObservation<'a> {
-    pub(crate) cohorts: &'a [Cohort],
-    pub(crate) backlog: &'a [Option<BacklogCohort>],
+    pub(crate) cohorts: &'a CohortColumns,
+    pub(crate) backlog: &'a BacklogColumns,
     pub(crate) arrivals: Option<ArrivalEvidence>,
     pub(crate) calendar: Option<CalendarForecast<'a>>,
     pub(crate) partition_arrivals: Option<PartitionArrivalEvidence<'a>>,
@@ -475,7 +793,7 @@ pub struct GroupObservation<'a> {
     pub(crate) attempt_outcomes: Option<AttemptOutcomeEvidence>,
     pub(crate) transition: Option<TransitionEvidence>,
     pub(crate) current_replicas: Option<u32>,
-    pub(crate) actuation_commitments: &'a [ActuationCommitment],
+    pub(crate) actuation_commitments: &'a ActuationCommitments,
 }
 
 /// Reusable owner for one [`GroupObservation`] view.
@@ -483,19 +801,19 @@ pub struct GroupObservation<'a> {
 pub struct ObservationBuffer {
     partition_count: u32,
     replica_count_max: u32,
-    cohorts: Vec<Cohort>,
-    backlog: Vec<Option<BacklogCohort>>,
+    cohorts: CohortColumns,
+    backlog: BacklogColumns,
     arrivals: Option<ArrivalEvidence>,
     calendar_artifact: Option<CalendarArtifactId>,
     calendar_prior_probability: f64,
-    calendar_segments: Vec<CalendarRateSegment>,
+    calendar_segments: CalendarColumns,
     partition_arrival_counts: Vec<u32>,
     partition_arrival_token: Option<UpdateToken>,
     resource_window: Option<ResourceWindow>,
     attempt_outcomes: Option<AttemptOutcomeEvidence>,
     transition: Option<TransitionEvidence>,
     current_replicas: Option<u32>,
-    actuation_commitments: Vec<ActuationCommitment>,
+    actuation_commitments: ActuationCommitments,
 }
 
 impl ObservationBuffer {
@@ -520,26 +838,26 @@ impl ObservationBuffer {
         Ok(Self {
             partition_count: configuration.partition_count,
             replica_count_max: configuration.replica_count_max,
-            cohorts: Vec::with_capacity(cohort_count_max),
-            backlog: vec![None; backlog_count],
+            cohorts: CohortColumns::new(cohort_count_max),
+            backlog: BacklogColumns::new(backlog_count),
             arrivals: None,
             calendar_artifact: None,
             calendar_prior_probability: 0.0_f64,
-            calendar_segments: Vec::with_capacity(calendar_segment_count),
+            calendar_segments: CalendarColumns::new(calendar_segment_count),
             partition_arrival_counts: vec![0; partition_count],
             partition_arrival_token: None,
             resource_window: None,
             attempt_outcomes: None,
             transition: None,
             current_replicas: None,
-            actuation_commitments: Vec::with_capacity(replica_count_max),
+            actuation_commitments: ActuationCommitments::new(replica_count_max),
         })
     }
 
     /// Clears values without releasing capacity.
     pub fn clear(&mut self) {
         self.cohorts.clear();
-        self.backlog.fill(None);
+        self.backlog.clear();
         self.arrivals = None;
         self.calendar_artifact = None;
         self.calendar_prior_probability = 0.0_f64;
@@ -581,10 +899,9 @@ impl ObservationBuffer {
         }
         let index = backlog.partition() as usize * DemandClass::COUNT_USIZE
             + backlog.demand_class().index();
-        if self.backlog[index].is_some() {
+        if !self.backlog.set(index, backlog) {
             return Err(ObservationError::BacklogPending);
         }
-        self.backlog[index] = Some(backlog);
         Ok(())
     }
 
@@ -634,7 +951,7 @@ impl ObservationBuffer {
         {
             return Err(ObservationError::CalendarContinuity);
         }
-        self.calendar_segments.extend_from_slice(segments);
+        self.calendar_segments.extend(segments);
         self.calendar_artifact = Some(artifact);
         self.calendar_prior_probability = prior_probability;
         Ok(())
@@ -775,6 +1092,8 @@ impl ObservationBuffer {
 /// Bounded values exported for diagnosis.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DecisionDiagnostics {
+    /// Posterior scenarios used for this decision.
+    pub scenario_count: u32,
     /// Posterior expected arrival rate in events per second.
     pub arrival_rate_per_second: f64,
     /// Posterior expected resource capacity in operations per second.

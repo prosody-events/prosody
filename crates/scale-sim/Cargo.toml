@@ -16,6 +16,8 @@ prosody-scale-core = { path = "../scale-core" }
 rayon.workspace = true
 statrs.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 typst-as-lib.workspace = true
 typst-pdf.workspace = true
 

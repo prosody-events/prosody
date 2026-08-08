@@ -1050,9 +1050,14 @@ fn write_summary(
     )?;
     writeln!(
         source,
-        "\nThe smallest reported controller cap was {} replicas. The largest observed miss \
-         fraction was {:.3}.",
-        summary.minimum_cap, summary.maximum_miss_fraction
+        "\nThe smallest reported controller cap was {} replicas. {} events missed the SLO. The \
+         total observed miss fraction was {:.3}.",
+        summary.minimum_cap, summary.total_misses, summary.total_miss_fraction
+    )?;
+    writeln!(
+        source,
+        "\nThe largest interval miss fraction was {:.3}.",
+        summary.maximum_miss_fraction
     )?;
     writeln!(
         source,
@@ -1090,16 +1095,22 @@ fn write_summary(
         "\nThe final no-knee posterior probability was {:.3}.",
         summary.final_no_knee_probability
     )?;
-    if summary.maximum_miss_fraction > 0.01_f64 {
+    if summary.total_miss_fraction > 0.01_f64 {
         writeln!(
             source,
-            "\nThe observed miss fraction exceeded the declared 1% allowance in at least one \
-             interval."
+            "\nThe total observed miss fraction exceeded the declared 1% allowance."
         )?;
     } else {
         writeln!(
             source,
-            "\nThe observed miss fraction stayed within the declared 1% allowance."
+            "\nThe total observed miss fraction stayed within the declared 1% allowance."
+        )?;
+    }
+    if summary.maximum_miss_fraction > 0.01_f64 {
+        writeln!(
+            source,
+            "\nAt least one interval exceeded the allowance. Inspect demand changes and actuation \
+             time before you classify that loss."
         )?;
     }
     writeln!(source, "\n== How to read this report\n")?;
@@ -1148,7 +1159,7 @@ fn write_strengths_and_limitations(
             source,
             "- The controller preserved a safe idle state without unnecessary work."
         )?;
-    } else if summary.final_backlog == 0 && summary.maximum_miss_fraction <= 0.01_f64 {
+    } else if summary.final_backlog == 0 && summary.total_miss_fraction <= 0.01_f64 {
         writeln!(
             source,
             "- The run cleared its observed backlog and stayed within the declared miss allowance."
@@ -1160,10 +1171,17 @@ fn write_strengths_and_limitations(
         )?;
     }
     writeln!(source, "\n=== Algorithm weaknesses or open questions\n")?;
+    if summary.total_miss_fraction > 0.01_f64 && !placement_bound {
+        writeln!(
+            source,
+            "- The total observed miss fraction exceeded the declared allowance."
+        )?;
+    }
     if summary.maximum_miss_fraction > 0.01_f64 && !placement_bound {
         writeln!(
             source,
-            "- The observed miss fraction exceeded the declared allowance."
+            "- At least one interval exceeded the allowance. The report does not yet classify \
+             avoidable and unavoidable misses."
         )?;
     }
     if summary.final_backlog > 0 && !placement_bound {
@@ -1620,6 +1638,8 @@ struct ReportSummary {
     maximum_target: u32,
     minimum_cap: u32,
     maximum_cap: u32,
+    total_miss_fraction: f64,
+    total_misses: u64,
     maximum_miss_fraction: f64,
     final_backlog: u64,
     resource_windows: usize,
@@ -1637,6 +1657,8 @@ impl ReportSummary {
             maximum_target: 0,
             minimum_cap: u32::MAX,
             maximum_cap: 0,
+            total_miss_fraction: 0.0_f64,
+            total_misses: 0,
             maximum_miss_fraction: 0.0_f64,
             final_backlog: 0,
             resource_windows: controller.capacity_evidence_count(CapacityEvidenceKind::Window),
@@ -1659,7 +1681,15 @@ impl ReportSummary {
                 summary.maximum_cap = summary.maximum_cap.max(point.cap);
             }
             summary.maximum_miss_fraction = summary.maximum_miss_fraction.max(point.miss_fraction);
+            summary.total_misses = summary.total_misses.saturating_add(point.misses);
             summary.final_backlog = point.backlog;
+        }
+        if summary.completions > 0 {
+            let misses = (0..trace.len())
+                .filter_map(|index| trace.point(index))
+                .map(|point| point.miss_fraction * point.useful_completions as f64)
+                .sum::<f64>();
+            summary.total_miss_fraction = misses / summary.completions as f64;
         }
         if summary.minimum_replicas == u32::MAX {
             summary.minimum_replicas = 0;

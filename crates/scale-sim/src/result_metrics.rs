@@ -96,6 +96,7 @@ impl SimulationResult {
                 point.miss_fraction =
                     count_as_f64(missed)? / count_as_f64(point.useful_completions)?;
             }
+            point.misses = missed;
             samples.apply(self, &mut point, start, end, window_seconds);
             trace.push(point)?;
         }

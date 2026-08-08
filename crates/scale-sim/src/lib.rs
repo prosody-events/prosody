@@ -922,7 +922,7 @@ impl<M: AttemptModel> Plant<M> {
     /// Runs all events to settlement with virtual time.
     #[must_use]
     pub fn run(mut self) -> SimulationResult {
-        let _snapshot = self.advance_until(u64::MAX);
+        let _ = self.advance_until(u64::MAX);
         SimulationResult {
             events: self.events,
             settlements: self.settlements,

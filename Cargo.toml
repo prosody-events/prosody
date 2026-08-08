@@ -21,6 +21,7 @@ resolver = "3"
 allocation-counter = "0.8.1"
 criterion = "0.8.2"
 fearless_simd = "0.6.0"
+paste = "1.0.15"
 plotters = { version = "0.3.7", default-features = false, features = [
     "bitmap_backend",
     "bitmap_encoder",
@@ -28,7 +29,6 @@ plotters = { version = "0.3.7", default-features = false, features = [
     "svg_backend",
     "ttf",
 ] }
-paste = "1.0.15"
 quickcheck = "1.1.0"
 quickcheck_macros = "1.2.0"
 rand = "0.10.2"
@@ -37,6 +37,11 @@ rand_xoshiro = "0.8.1"
 rayon = "1.12.0"
 statrs = { version = "0.19.0", default-features = false, features = ["std"] }
 thiserror = "2.0.19"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "parking_lot",
+] }
 typst-as-lib = { version = "0.16.0", features = ["typst-kit-fonts"] }
 typst-pdf = "0.15.0"
 wasm-bindgen = "0.2.126"
@@ -117,12 +122,9 @@ thiserror.workspace = true
 tokio = { version = "1.50", features = ["macros", "parking_lot", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["time"] }
-tracing = "0.1"
+tracing.workspace = true
 tracing-opentelemetry = "0.33"
-tracing-subscriber = { version = "0.3", features = [
-    "env-filter",
-    "parking_lot",
-] }
+tracing-subscriber.workspace = true
 uuid = { version = "1.23", features = ["v4", "v5", "v8"] }
 validator = { version = "0.21", features = ["derive"] }
 whoami = "2.1"
@@ -181,6 +183,12 @@ workspace = true
 codegen-units = 1
 lto = "fat"
 
+[profile.simulation]
+codegen-units = 16
+inherits = "release"
+lto = false
+opt-level = 1
+
 [workspace.lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
@@ -190,7 +198,6 @@ unused_qualifications = "warn"
 absolute_paths = "warn"
 blocks_in_conditions = "allow"
 cargo = { level = "warn", priority = -1 }
-multiple_crate_versions = "allow"
 cast_possible_truncation = "allow"
 cast_possible_wrap = "allow"
 cast_sign_loss = "allow"
@@ -208,6 +215,7 @@ implicit_clone = "warn"
 large_futures = "warn"
 missing_assert_message = "warn"
 module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
 multiple_inherent_impl = "warn"
 mutex_atomic = "warn"
 needless_raw_strings = "warn"

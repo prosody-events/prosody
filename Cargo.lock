@@ -3737,6 +3737,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_distr",
  "rand_xoshiro",
+ "rayon",
  "statrs",
  "thiserror",
 ]
@@ -3754,6 +3755,8 @@ dependencies = [
  "rayon",
  "statrs",
  "thiserror",
+ "tracing",
+ "tracing-subscriber",
  "typst-as-lib",
  "typst-pdf",
 ]

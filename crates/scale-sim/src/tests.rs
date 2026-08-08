@@ -13,14 +13,14 @@ use crate::series::{
 };
 use crate::{
     AttemptContext, AttemptFrame, AttemptGenerator, AttemptModel, AttemptParameters, ClosedLoop,
-    ClosedLoopError, ConcurrencyLatencyCurve, EventOutcome, EventOutcomeRule, EventSource,
-    EventSpec, FaultPattern, FinalOutcome, HistoricalAttemptModel, Kip848Rebalance, Plant,
-    PlantConfiguration, PlantError, PrincipalRegime, PrincipalRunError, QuantileTable,
-    RegimeExperiment, RegimeValidationError, ReporterDirective, RetryCount, RetryOutcome,
-    RunStopReason, ScaleChange, ScaleDirective, ScaleRequest, SimulationHarness, Snapshot,
-    SnapshotChannel, SnapshotCursor, SnapshotTable, StepSeries, TickContext, TickGenerator,
-    TickInputs, WorkloadSeries, run_batch_regime, run_batch_slo, run_capacity_evidence_regime,
-    run_parallel, run_principal_regime, validate_principal_regime,
+    ClosedLoopError, ConcurrencyLatencyCurve, EventContext, EventInputs, EventOutcome,
+    EventOutcomeRule, EventSource, EventSpec, FaultPattern, FinalOutcome, HistoricalAttemptModel,
+    Kip848Rebalance, Plant, PlantConfiguration, PlantError, PrincipalRegime, PrincipalRunError,
+    QuantileTable, RegimeExperiment, RegimeValidationError, ReporterDirective, RetryCount,
+    RetryOutcome, RunStopReason, ScaleChange, ScaleDirective, ScaleRequest, SimulationHarness,
+    Snapshot, SnapshotChannel, SnapshotCursor, SnapshotTable, StepSeries, TickContext,
+    TickGenerator, TickInputs, WorkloadSeries, run_batch_regime, run_batch_slo,
+    run_capacity_evidence_regime, run_parallel, run_principal_regime, validate_principal_regime,
 };
 use crate::{CapacityEvidenceKind, CapacityEvidenceSample};
 
@@ -327,6 +327,7 @@ fn uncertain_late_capacity_does_not_change_the_target() -> Result<(), TestError>
         replica_count_max: 8,
         slots_per_replica: 2,
         posterior_sample_count: 64,
+        report_interval_micros: 30_000,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
         capacity_change_rate_per_second: 0.0_f64,
@@ -376,6 +377,7 @@ fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
         replica_count_max: 8,
         slots_per_replica: 2,
         posterior_sample_count: 64,
+        report_interval_micros: 10_000,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
         capacity_change_rate_per_second: 0.0_f64,
@@ -399,7 +401,7 @@ fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
     let mut harness = SimulationHarness::new(plant_configuration, 1, 8, closed_loop)?;
 
     for tick in 0_u64..8 {
-        let _snapshot = harness.tick(tick * 10_000)?;
+        harness.tick(tick * 10_000)?;
     }
     let (_result, closed_loop) = harness.finish_with_graph();
     let kinds = (0..closed_loop.trace().len())
@@ -420,6 +422,7 @@ fn higher_retarget_preserves_each_completed_lead_time() -> Result<(), TestError>
         replica_count_max: 8,
         slots_per_replica: 2,
         posterior_sample_count: 64,
+        report_interval_micros: 10_000_000,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
         capacity_change_rate_per_second: 0.0_f64,
@@ -438,11 +441,11 @@ fn higher_retarget_preserves_each_completed_lead_time() -> Result<(), TestError>
     let plant_configuration = PlantConfiguration::new(4, 16, 16, 4, 2, 8)?;
     let mut harness = SimulationHarness::new(plant_configuration, 1, 4, closed_loop)?;
 
-    let _first = harness.tick(0)?;
-    let _retarget = harness.tick(10_000_000)?;
-    let _first_launch = harness.tick(100_000_000)?;
+    harness.tick(0)?;
+    harness.tick(10_000_000)?;
+    harness.tick(100_000_000)?;
     let first_ready = harness.tick(100_200_000)?;
-    let _second_launch = harness.tick(110_000_000)?;
+    harness.tick(110_000_000)?;
     let second_ready = harness.tick(110_200_000)?;
     let (_result, closed_loop) = harness.finish_with_graph();
     let completed = (0..closed_loop.trace().len())
@@ -462,6 +465,64 @@ fn higher_retarget_preserves_each_completed_lead_time() -> Result<(), TestError>
 }
 
 struct RetargetWorkload;
+
+struct ObservationBoundaryWorkload {
+    scheduled_released: u32,
+    observed_released: u32,
+}
+
+impl TickGenerator for ObservationBoundaryWorkload {
+    fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError> {
+        self.scheduled_released = context.plant.released;
+        Ok(TickInputs {
+            message_count: 1,
+            timer_count: 0,
+            handler_micros: 1,
+            dependency_operations: 0,
+            dependency_operation_micros: 0,
+            handler_added_micros: 0,
+            outcome: EventOutcomeRule::Success,
+            launch_delay_micros: 0,
+            scale: ScaleDirective::Hold,
+        })
+    }
+
+    fn observe(
+        &mut self,
+        context: TickContext<'_>,
+        inputs: TickInputs,
+    ) -> Result<TickInputs, PlantError> {
+        self.observed_released = context.plant.released;
+        Ok(inputs)
+    }
+
+    fn event(&self, context: EventContext<'_>) -> Result<EventInputs, PlantError> {
+        Ok(EventInputs {
+            release_micros: 500_000,
+            partition: context.event_index % context.partition_count,
+            key: context.event_index % context.key_count,
+            handler_micros: context.inputs.handler_micros,
+            dependency_operations: context.inputs.dependency_operations,
+            outcome: EventOutcome::Final(FinalOutcome::Success),
+        })
+    }
+}
+
+#[test]
+fn controller_observes_only_evidence_available_at_its_execution_time() -> Result<(), TestError> {
+    let graph = ObservationBoundaryWorkload {
+        scheduled_released: u32::MAX,
+        observed_released: u32::MAX,
+    };
+    let configuration = PlantConfiguration::new(1, 1, 1, 1, 1, 1)?;
+    let mut harness = SimulationHarness::new(configuration, 1, 2, graph)?;
+
+    harness.tick(1_000_000)?;
+
+    assert_eq!(harness.graph().scheduled_released, 0);
+    assert_eq!(harness.graph().observed_released, 1);
+    Ok(())
+}
 
 impl TickGenerator for RetargetWorkload {
     fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError> {
@@ -512,7 +573,7 @@ struct ReportedArrivalWorkload {
 }
 
 impl TickGenerator for ReportedArrivalWorkload {
-    fn calculate(&mut self, _context: TickContext<'_>) -> Result<TickInputs, PlantError> {
+    fn calculate(&mut self, _: TickContext<'_>) -> Result<TickInputs, PlantError> {
         Ok(TickInputs {
             message_count: 10,
             timer_count: 0,
@@ -534,7 +595,7 @@ impl TickGenerator for ReportedArrivalWorkload {
 }
 
 impl TickGenerator for ClosedLoopWorkload {
-    fn calculate(&mut self, _context: TickContext<'_>) -> Result<TickInputs, PlantError> {
+    fn calculate(&mut self, _: TickContext<'_>) -> Result<TickInputs, PlantError> {
         let message_count = if self.emitted { 0 } else { 100 };
         self.emitted = true;
         Ok(TickInputs {
@@ -613,7 +674,7 @@ impl SeriesFunction<TickContext<'_>, (Option<u32>,)> for DemandFunction {
 
     fn calculate(
         &self,
-        _context: SeriesContext<'_, TickContext<'_>>,
+        _: SeriesContext<'_, TickContext<'_>>,
         (previous,): (Option<u32>,),
     ) -> Self::Output {
         previous.map_or(self.initial, |value| value.saturating_add(1))
@@ -728,10 +789,7 @@ fn principal_regimes_exercise_distinct_failure_mechanisms() -> Result<(), TestEr
         vec![
             "message_count",
             "timer_count",
-            "message_emitted",
-            "timer_emitted",
             "historical_message_count",
-            "historical_emitted",
             "historical_replicas",
             "external_target",
             "scale_changed",
@@ -1070,36 +1128,103 @@ fn linear_closed_loop_uses_only_controller_scale_targets() -> Result<(), TestErr
 #[test]
 fn linear_closed_loop_satisfies_its_declared_outcome() -> Result<(), TestError> {
     let run = run_principal_regime(PrincipalRegime::LinearThroughput)?;
-    let misses = run
-        .settlements()
+    const STEP_MICROS: u64 = 180_000_000;
+    const STEP_COUNT: usize = 7;
+    let mut target_changes = Vec::new();
+    let mut decision_audit = Vec::new();
+    let mut misses_by_release_step = [0_usize; STEP_COUNT];
+    let mut settlements_by_release_step = [0_usize; STEP_COUNT];
+    let mut maximum_lateness_micros = 0_u64;
+    let third_replica_ready_micros = run
+        .applied_changes()
         .iter()
-        .filter(|settlement| {
-            settlement
-                .settle_micros
-                .saturating_sub(settlement.release_micros)
-                > PrincipalRegime::LinearThroughput.budget_micros()
-        })
-        .count();
-    let mut misses_by_step = [0_usize; 8];
-    let mut settlements_by_step = [0_usize; 8];
+        .find(|change| change.replicas >= 3)
+        .map_or(u64::MAX, |change| change.at_micros);
+    let mut misses_released_before_third_ready = 0_usize;
+    let mut misses_released_after_third_ready = 0_usize;
+    let mut first_missed_release_micros = u64::MAX;
+    let mut last_missed_release_micros = 0_u64;
+    let mut previous_target = None;
+    for index in 0..run.controller().len() {
+        let sample = run
+            .controller()
+            .sample(index)
+            .ok_or(TestError::MissingControllerSample)?;
+        if previous_target != Some(sample.target) {
+            target_changes.push((sample.at_micros, sample.target));
+            previous_target = Some(sample.target);
+        }
+        if matches!(
+            sample.at_micros,
+            900_000_000 | 1_000_000_000 | 1_079_000_000 | 1_080_000_000 | 1_081_000_000
+        ) {
+            decision_audit.push((
+                sample.at_micros,
+                sample.target,
+                sample.arrival_rate_per_second,
+                sample.arrival_predictive_low_count,
+                sample.arrival_predictive_median_count,
+                sample.arrival_predictive_high_count,
+                sample.lead_time_up_seconds,
+                run.controller()
+                    .decision_expected_losses(index)
+                    .and_then(|losses| losses.get(..6))
+                    .ok_or(TestError::MissingControllerSample)?
+                    .to_vec(),
+                run.controller()
+                    .decision_pass_probabilities(index)
+                    .and_then(|probabilities| probabilities.get(..6))
+                    .ok_or(TestError::MissingControllerSample)?
+                    .to_vec(),
+            ));
+        }
+    }
+    let mut misses = 0_usize;
     for settlement in run.settlements() {
-        let step =
-            usize::try_from(settlement.release_micros / 90_000_000).map_or(7, |index| index.min(7));
-        settlements_by_step[step] = settlements_by_step[step].saturating_add(1);
-        if settlement
+        let step = usize::try_from(settlement.release_micros / STEP_MICROS)
+            .map_err(|_| TestError::PlatformLimit)?
+            .min(STEP_COUNT - 1);
+        settlements_by_release_step[step] += 1;
+        let elapsed_micros = settlement
             .settle_micros
-            .saturating_sub(settlement.release_micros)
-            > PrincipalRegime::LinearThroughput.budget_micros()
-        {
-            misses_by_step[step] = misses_by_step[step].saturating_add(1);
+            .saturating_sub(settlement.release_micros);
+        if elapsed_micros > PrincipalRegime::LinearThroughput.budget_micros() {
+            misses += 1;
+            misses_by_release_step[step] += 1;
+            if settlement.release_micros < third_replica_ready_micros {
+                misses_released_before_third_ready += 1;
+            } else {
+                misses_released_after_third_ready += 1;
+            }
+            first_missed_release_micros =
+                first_missed_release_micros.min(settlement.release_micros);
+            last_missed_release_micros = last_missed_release_micros.max(settlement.release_micros);
+            maximum_lateness_micros = maximum_lateness_micros.max(
+                elapsed_micros.saturating_sub(PrincipalRegime::LinearThroughput.budget_micros()),
+            );
         }
     }
     assert!(
         misses.saturating_mul(100) <= run.settlements().len(),
-        "linear SLO misses={misses}, settlements={}, misses_by_step={misses_by_step:?}, \
-         settlements_by_step={settlements_by_step:?}, applied={:?}",
+        "linear SLO misses={misses}, settlements={}, \
+         misses_by_release_step={misses_by_release_step:?}, \
+         settlements_by_release_step={settlements_by_release_step:?}, \
+         third_replica_ready_micros={third_replica_ready_micros}, \
+         misses_released_before_third_ready={misses_released_before_third_ready}, \
+         misses_released_after_third_ready={misses_released_after_third_ready}, \
+         first_missed_release_micros={first_missed_release_micros}, \
+         last_missed_release_micros={last_missed_release_micros}, \
+         maximum_lateness_micros={maximum_lateness_micros}, decision_audit={decision_audit:?}, \
+         target_changes={target_changes:?}, applied={:?}",
         run.settlements().len(),
         run.applied_changes(),
+    );
+    assert!(
+        run.applied_changes()
+            .iter()
+            .any(|change| change.replicas >= 3),
+        "the linear regime did not cross three ready replicas: {:?}",
+        run.applied_changes()
     );
     validate_principal_regime(
         PrincipalRegime::LinearThroughput,
@@ -1404,7 +1529,7 @@ fn failure_attempts_use_the_configured_service_share() -> Result<(), TestError> 
         plant.add_event(work)?;
     }
 
-    let _snapshot = plant.advance_until(80_000);
+    let _ = plant.advance_until(80_000);
     let total = plant
         .normal_service_micros
         .saturating_add(plant.failure_service_micros);
@@ -1639,6 +1764,7 @@ fn run_reported_arrivals(
         replica_count_max: 8,
         slots_per_replica: 2,
         posterior_sample_count: 64,
+        report_interval_micros: 10_000,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
         capacity_change_rate_per_second: 0.0_f64,
@@ -1658,7 +1784,7 @@ fn run_reported_arrivals(
     let plant_configuration = PlantConfiguration::new(4, 40, 40, 3, 2, 8)?;
     let mut harness = SimulationHarness::new(plant_configuration, 2, 3, closed_loop)?;
     for tick in 0_u64..3 {
-        let _snapshot = harness.tick(tick * 10_000)?;
+        harness.tick(tick * 10_000)?;
     }
     let (_result, closed_loop) = harness.finish_with_graph();
     Ok(closed_loop.into_trace())
@@ -1778,6 +1904,8 @@ enum TestError {
     Principal(#[from] PrincipalRunError),
     #[error(transparent)]
     RegimeValidation(#[from] RegimeValidationError),
+    #[error("the test value exceeds the platform index range")]
+    PlatformLimit,
     #[error("the closed loop did not record a controller sample")]
     MissingControllerSample,
 }

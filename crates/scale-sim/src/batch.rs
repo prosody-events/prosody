@@ -105,6 +105,7 @@ pub fn run_batch_slo_with_inputs(
         replica_count_max: REPLICA_COUNT_MAX,
         slots_per_replica: DEFAULT_CONCURRENCY_PER_REPLICA,
         posterior_sample_count: 1_024,
+        report_interval_micros: budget_micros,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
         capacity_change_rate_per_second: 0.0_f64,
@@ -203,7 +204,7 @@ fn run_batch_plant(
         delay_micros,
     };
     let mut harness = SimulationHarness::new(configuration, initial_replicas, 1, graph)?;
-    let _snapshot = harness.tick(0)?;
+    harness.tick(0)?;
     Ok(harness.finish())
 }
 
@@ -226,7 +227,7 @@ struct BatchGraph {
 }
 
 impl TickGenerator for BatchGraph {
-    fn calculate(&mut self, _context: TickContext<'_>) -> Result<TickInputs, PlantError> {
+    fn calculate(&mut self, _: TickContext<'_>) -> Result<TickInputs, PlantError> {
         let scale = if self.target == INITIAL_REPLICAS {
             ScaleDirective::Hold
         } else {
@@ -251,6 +252,7 @@ impl TickGenerator for BatchGraph {
     fn event(&self, context: EventContext<'_>) -> Result<EventInputs, PlantError> {
         let event = batch_event(context.event_index);
         Ok(EventInputs {
+            release_micros: event.release_micros,
             partition: event.partition,
             key: event.key,
             handler_micros: event.handler_micros,

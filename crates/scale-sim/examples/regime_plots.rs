@@ -15,8 +15,15 @@ use prosody_scale_sim::{
 };
 use rayon::prelude::*;
 use thiserror::Error;
+use tracing_subscriber::util::SubscriberInitExt;
 
 fn main() -> Result<(), PlotGenerationError> {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .compact()
+        .finish()
+        .try_init()
+        .map_err(|error| io::Error::other(error.to_string()))?;
     let report_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reports");
     fs::create_dir_all(&report_directory)?;
     let requested = env::args().nth(1);
@@ -29,14 +36,23 @@ fn main() -> Result<(), PlotGenerationError> {
             .into_iter()
             .find(|regime| regime.name() == name)
             .ok_or(PlotGenerationError::UnknownRegime(name))?;
+        let include_capacity_evidence = match env::args().nth(2).as_deref() {
+            None => true,
+            Some("closed-loop") => false,
+            Some(experiment) => {
+                return Err(PlotGenerationError::UnknownExperiment(
+                    experiment.to_owned(),
+                ));
+            }
+        };
         clear_directory(&report_directory.join(regime.name()))?;
-        return generate_regime(&report_directory, regime);
+        return generate_regime(&report_directory, regime, include_capacity_evidence);
     }
     clear_plot_files(&report_directory)?;
     PrincipalRegime::ALL
         .par_iter()
         .copied()
-        .try_for_each(|regime| generate_regime(&report_directory, regime))?;
+        .try_for_each(|regime| generate_regime(&report_directory, regime, true))?;
     generate_batch(&report_directory)
 }
 
@@ -56,11 +72,13 @@ fn generate_batch(report_directory: &Path) -> Result<(), PlotGenerationError> {
 fn generate_regime(
     report_directory: &Path,
     regime: PrincipalRegime,
+    include_capacity_evidence: bool,
 ) -> Result<(), PlotGenerationError> {
     let regime_directory = report_directory.join(regime.name());
     fs::create_dir_all(&regime_directory)?;
     let result = run_principal_regime(regime)?;
-    validate_principal_regime(regime, RegimeExperiment::ClosedLoop, &result)?;
+    let closed_loop_validation =
+        validate_principal_regime(regime, RegimeExperiment::ClosedLoop, &result);
     let trace = result.metric_trace(result.metric_window_micros(), regime.budget_micros())?;
     write_experiment_figures(
         &regime_directory.join("closed-loop"),
@@ -68,18 +86,19 @@ fn generate_regime(
         &result,
         &trace,
     )?;
-    let capacity_evidence = if matches!(
-        regime,
-        PrincipalRegime::LinearThroughput
-            | PrincipalRegime::FlatPostKnee
-            | PrincipalRegime::DecliningPostKnee
-    ) {
+    let capacity_evidence = if include_capacity_evidence
+        && matches!(
+            regime,
+            PrincipalRegime::LinearThroughput
+                | PrincipalRegime::FlatPostKnee
+                | PrincipalRegime::DecliningPostKnee
+        ) {
         let capacity_evidence_result = run_capacity_evidence_regime(regime)?;
-        validate_principal_regime(
+        let validation = validate_principal_regime(
             regime,
             RegimeExperiment::CapacityEvidence,
             &capacity_evidence_result,
-        )?;
+        );
         let capacity_evidence_trace = capacity_evidence_result.metric_trace(
             capacity_evidence_result.metric_window_micros(),
             regime.budget_micros(),
@@ -90,7 +109,11 @@ fn generate_regime(
             &capacity_evidence_result,
             &capacity_evidence_trace,
         )?;
-        Some((capacity_evidence_result, capacity_evidence_trace))
+        Some((
+            capacity_evidence_result,
+            capacity_evidence_trace,
+            validation,
+        ))
     } else {
         None
     };
@@ -103,15 +126,17 @@ fn generate_regime(
                 controller: result.controller(),
                 stop: result.stop(),
             },
-            capacity_evidence: capacity_evidence.as_ref().map(
-                |(capacity_evidence_result, capacity_evidence_trace)| ExperimentReport {
-                    trace: capacity_evidence_trace,
-                    controller: capacity_evidence_result.controller(),
-                    stop: capacity_evidence_result.stop(),
-                },
-            ),
+            capacity_evidence: capacity_evidence.as_ref().map(|evidence| ExperimentReport {
+                trace: &evidence.1,
+                controller: evidence.0.controller(),
+                stop: evidence.0.stop(),
+            }),
         },
     )?;
+    closed_loop_validation?;
+    if let Some(evidence) = capacity_evidence {
+        evidence.2?;
+    }
     Ok(())
 }
 
@@ -180,4 +205,6 @@ enum PlotGenerationError {
     Validation(#[from] RegimeValidationError),
     #[error("unknown regime: {0}")]
     UnknownRegime(String),
+    #[error("unknown experiment: {0}")]
+    UnknownExperiment(String),
 }

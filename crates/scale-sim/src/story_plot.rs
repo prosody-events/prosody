@@ -254,7 +254,7 @@ fn meaningful_index(values: &[f64]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-fn panel_value_label(_series: &StorySeries, value: f64) -> String {
+fn panel_value_label(_: &StorySeries, value: f64) -> String {
     format!("{value:.3}")
 }
 

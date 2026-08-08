@@ -1,8 +1,9 @@
 use std::ops::Deref;
+use std::time::Duration;
 
 use prosody_scale_core::{
     CalendarArtifactId, CalendarRateSegment, CapacityGrid, CapacityPrior, Configuration,
-    RandomStream, ReliabilityPrior, ServiceObjective, TransitionPrior,
+    DecisionRejection, RandomStream, ReliabilityPrior, ServiceObjective, TransitionPrior,
 };
 
 use crate::harness::TickDrivenAttemptModel;
@@ -26,6 +27,7 @@ const SEASONAL_EVENT_COUNT: u32 = 3_000;
 const TRANSIENT_EVENT_COUNT: u32 = 36_000;
 const CAPACITY_EVENT_COUNT_MAX: u32 = 300_000;
 const CAPACITY_RESPONSE_EVENT_COUNT: u32 = 231_000;
+const LINEAR_RESPONSE_EVENT_COUNT: u32 = 462_000;
 const HISTORY_EVENT_COUNT_MAX: u32 = 64_000;
 const CALENDAR_HISTORY_EXPOSURE_SECONDS: u32 = 900;
 const CALENDAR_PRIOR_SHAPE: f64 = 4.0_f64;
@@ -662,7 +664,7 @@ fn run_principal_definition(
         graph,
         attempt_model,
     )?;
-    let stop = run_schedule(&mut harness, definition.schedule)?;
+    let stop = run_schedule(&mut harness, regime, definition.schedule)?;
     let (simulation, graph) = harness.finish_with_graph();
     let (controller, graph) = graph.into_parts();
     Ok(PrincipalRun {
@@ -726,7 +728,15 @@ fn principal_graph(
         partition_count: 64,
         replica_count_max,
         slots_per_replica,
-        posterior_sample_count: 1_024,
+        posterior_sample_count: if regime == PrincipalRegime::LinearThroughput {
+            16_384
+        } else {
+            1_024
+        },
+        report_interval_micros: definition
+            .schedule
+            .workload_interval_micros
+            .min(definition.schedule.followup_interval_micros),
         failure_service_weight: DEFAULT_FAILURE_WEIGHT,
         arrival_prior: prosody_scale_core::ArrivalPrior::new(
             4.0_f64,
@@ -855,12 +865,123 @@ fn capacity_grid(
 
 fn run_schedule(
     harness: &mut SimulationHarness<ClosedLoop<PrincipalGraph>, PrincipalAttemptModel>,
+    regime: PrincipalRegime,
     schedule: RunSchedule,
 ) -> Result<RunStop, PrincipalRunError> {
+    const PROGRESS_INTERVAL: u32 = 25;
+
     let mut at_micros = schedule.start_micros;
     let mut stable_count = 0_u8;
+    let tick_count_max = schedule.controller_sample_count_max()?;
+    let started = std::time::Instant::now();
+    let mut progress_started = started;
+    let mut tick_count = 0_u32;
+    let mut progress_tick_count = 0_u32;
+    let mut prior_target = None;
     loop {
         let snapshot = harness.tick(at_micros)?;
+        tick_count = tick_count.saturating_add(1);
+        let controller = harness.graph().trace();
+        let controller_index = controller.len().saturating_sub(1);
+        let controller_sample = controller.sample(controller_index);
+        let target_changed =
+            controller_sample.is_some_and(|sample| prior_target != Some(sample.target));
+        if tick_count == 1 || tick_count.is_multiple_of(PROGRESS_INTERVAL) || target_changed {
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(started).as_secs_f64();
+            let progress_ticks = tick_count.saturating_sub(progress_tick_count);
+            let recent_millis = now.duration_since(progress_started).as_secs_f64() * 1_000.0_f64
+                / f64::from(progress_ticks);
+            let average_millis = elapsed * 1_000.0_f64 / f64::from(tick_count);
+            let remaining_ticks = tick_count_max.saturating_sub(tick_count);
+            let eta_seconds = average_millis * f64::from(remaining_ticks) / 1_000.0_f64;
+            let phase = if at_micros < schedule.workload_end_micros {
+                "workload"
+            } else {
+                "followup"
+            };
+            let ready_index = snapshot.replicas.saturating_sub(1) as usize;
+            let next_index = ready_index.saturating_add(1);
+            let losses = controller.decision_expected_losses(controller_index);
+            let root_passes = controller.decision_root_pass_probabilities(controller_index);
+            let passes = controller.decision_pass_probabilities(controller_index);
+            let selected = controller_sample.map_or(0, |sample| sample.target);
+            let selected_index = selected.saturating_sub(1) as usize;
+            let rejection = |reason| {
+                controller
+                    .decision_rejection_probabilities(reason, controller_index)
+                    .and_then(|values| values.get(selected_index))
+                    .copied()
+                    .unwrap_or(f64::NAN)
+            };
+            let arrival_rate =
+                controller_sample.map_or(f64::NAN, |sample| sample.arrival_rate_per_second);
+            let selected_loss = controller_sample.map_or(f64::NAN, |sample| sample.expected_loss);
+            let selected_shortfall = controller_sample.map_or(f64::NAN, |sample| sample.shortfall);
+            let scenario_count = controller_sample.map_or(0, |sample| sample.scenario_count);
+            tracing::info!(
+                regime = regime.name(),
+                completed_ticks = tick_count,
+                maximum_ticks = tick_count_max,
+                virtual_seconds = Duration::from_micros(at_micros).as_secs_f64(),
+                maximum_virtual_seconds =
+                    Duration::from_micros(schedule.maximum_micros).as_secs_f64(),
+                wall_elapsed_seconds = elapsed,
+                recent_step_millis = recent_millis,
+                average_step_millis = average_millis,
+                eta_seconds,
+                phase,
+                actual_replicas = snapshot.replicas,
+                desired_replicas = harness.desired_replicas(),
+                selected_target = selected,
+                backlog = snapshot.backlog,
+                inferred_arrival_rate_per_second = arrival_rate,
+                selected_expected_loss = selected_loss,
+                selected_shortfall,
+                scenario_count,
+                selected_root_deadline_rejection_probability =
+                    rejection(DecisionRejection::RootDeadline),
+                selected_placement_rejection_probability =
+                    rejection(DecisionRejection::PartitionPlacement),
+                selected_recourse_deadline_rejection_probability =
+                    rejection(DecisionRejection::RecourseDeadline),
+                selected_terminal_backlog_rejection_probability =
+                    rejection(DecisionRejection::TerminalBacklog),
+                selected_future_arrival_rejection_probability =
+                    rejection(DecisionRejection::FutureArrival),
+                ready_target_pass_probability = passes
+                    .and_then(|values| values.get(ready_index))
+                    .copied()
+                    .unwrap_or(f64::NAN),
+                ready_target_root_pass_probability = root_passes
+                    .and_then(|values| values.get(ready_index))
+                    .copied()
+                    .unwrap_or(f64::NAN),
+                next_target_pass_probability = passes
+                    .and_then(|values| values.get(next_index))
+                    .copied()
+                    .unwrap_or(f64::NAN),
+                next_target_root_pass_probability = root_passes
+                    .and_then(|values| values.get(next_index))
+                    .copied()
+                    .unwrap_or(f64::NAN),
+                ready_target_expected_loss = losses
+                    .and_then(|values| values.get(ready_index))
+                    .copied()
+                    .unwrap_or(f64::NAN),
+                next_target_expected_loss = losses
+                    .and_then(|values| values.get(next_index))
+                    .copied()
+                    .unwrap_or(f64::NAN),
+                target_changed,
+                "regime progress"
+            );
+            progress_started = now;
+            progress_tick_count = tick_count;
+        }
+        if let Some(sample) = controller_sample {
+            prior_target = Some(sample.target);
+        }
         match schedule.stop {
             StopCondition::IdleStable { sample_count } => {
                 let stable = at_micros >= schedule.workload_end_micros
@@ -1051,7 +1172,7 @@ impl AttemptModel for PrincipalAttemptModel {
 }
 
 impl TickDrivenAttemptModel for PrincipalAttemptModel {
-    fn update(&mut self, _inputs: TickInputs) {}
+    fn update(&mut self, _: TickInputs) {}
 }
 
 series_graph! {
@@ -1080,7 +1201,7 @@ struct AttemptResourceCapacity(SharedResourcePolicy);
 impl SeriesFunction<AttemptFrame, ()> for AttemptResourceCapacity {
     type Output = u32;
 
-    fn calculate(&self, _context: SeriesContext<'_, AttemptFrame>, (): ()) -> Self::Output {
+    fn calculate(&self, _: SeriesContext<'_, AttemptFrame>, (): ()) -> Self::Output {
         self.0.capacity_per_second
     }
 }
@@ -1092,7 +1213,7 @@ impl SeriesFunction<AttemptFrame, (u32,)> for AttemptResourceBaseTime {
 
     fn calculate(
         &self,
-        _context: SeriesContext<'_, AttemptFrame>,
+        _: SeriesContext<'_, AttemptFrame>,
         (capacity_per_second,): (u32,),
     ) -> Self::Output {
         u64::from(self.0)
@@ -1118,7 +1239,7 @@ impl SeriesFunction<AttemptFrame, (u64, u32)> for AttemptResourceLatency {
 
     fn calculate(
         &self,
-        _context: SeriesContext<'_, AttemptFrame>,
+        _: SeriesContext<'_, AttemptFrame>,
         (base_micros, offered_concurrency): (u64, u32),
     ) -> Self::Output {
         overloaded_operation_micros(base_micros, self.0, offered_concurrency, self.1)
@@ -1165,7 +1286,7 @@ impl OutputFunction<AttemptFrame, (u64, u64)> for AttemptOutput {
 
     fn calculate(
         &self,
-        _context: SeriesContext<'_, AttemptFrame>,
+        _: SeriesContext<'_, AttemptFrame>,
         (dependency_operation_micros, handler_added_micros): (u64, u64),
     ) -> Self::Output {
         AttemptParameters {
@@ -1176,6 +1297,9 @@ impl OutputFunction<AttemptFrame, (u64, u64)> for AttemptOutput {
 }
 
 struct PrincipalGraph {
+    messages: ArrivalSchedule,
+    timers: ArrivalSchedule,
+    historical_messages: ArrivalSchedule,
     events: EventPolicy,
     reporter: ReporterPolicy,
     calendar: HistoricalSeries,
@@ -1185,28 +1309,64 @@ struct PrincipalGraph {
 impl PrincipalGraph {
     fn new(definition: PrincipalDefinition) -> Result<Self, PlantError> {
         let history_count_max = definition.schedule.controller_sample_count_max()?;
+        let inputs = definition.inputs;
         Ok(Self {
+            messages: ArrivalSchedule::new(
+                inputs.messages,
+                definition.schedule.start_micros,
+                definition.schedule.maximum_micros,
+                inputs.seed,
+                0x6d65_7373_6167_6573,
+                inputs.stochastic_arrivals,
+            )?,
+            timers: ArrivalSchedule::new(
+                inputs.timers,
+                definition.schedule.start_micros,
+                definition.schedule.maximum_micros,
+                inputs.seed,
+                0x7469_6d65_7273,
+                inputs.stochastic_arrivals,
+            )?,
+            historical_messages: ArrivalSchedule::new(
+                inputs.history.demand,
+                definition.schedule.start_micros,
+                definition.schedule.maximum_micros,
+                inputs.seed,
+                0x0068_6973_746f_7279,
+                inputs.stochastic_arrivals,
+            )?,
             events: definition.events,
             reporter: definition.reporter,
-            calendar: definition.inputs.history,
-            inputs: PrincipalInputGraph::new(definition.inputs, history_count_max)?,
+            calendar: inputs.history,
+            inputs: PrincipalInputGraph::new(inputs, history_count_max)?,
         })
     }
 }
 
 impl TickGenerator for PrincipalGraph {
     fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError> {
-        Ok(self.inputs.evaluate(context.now_micros, context))
+        let frame = PrincipalFrame {
+            tick: context,
+            message_count: self.messages.release_until(context.now_micros)?,
+            timer_count: self.timers.release_until(context.now_micros)?,
+            historical_message_count: self.historical_messages.release_until(context.now_micros)?,
+        };
+        Ok(self.inputs.evaluate(context.now_micros, frame))
     }
 
     fn event(&self, context: EventContext<'_>) -> Result<EventInputs, PlantError> {
         let event_index = context.event_index;
+        let arrivals = match context.source {
+            crate::EventSource::Message => &self.messages,
+            crate::EventSource::Timer => &self.timers,
+        };
         let final_outcome = if self.events.permanent_rejections.matches(event_index) {
             crate::FinalOutcome::PermanentFailure
         } else {
             crate::FinalOutcome::Success
         };
         Ok(EventInputs {
+            release_micros: arrivals.release_at(context.event_offset)?,
             partition: self.events.partitions.index(event_index, 64),
             key: self.events.keys.index(event_index, 1_024),
             handler_micros: context.inputs.handler_micros,
@@ -1220,7 +1380,7 @@ impl TickGenerator for PrincipalGraph {
 
     fn calendar_forecast(
         &self,
-        _context: TickContext<'_>,
+        _: TickContext<'_>,
     ) -> Result<Option<CalendarForecastInput>, PlantError> {
         self.calendar.forecast()
     }
@@ -1257,9 +1417,7 @@ impl PrincipalDefinition {
         match regime {
             PrincipalRegime::Idle => standard.messages(ArrivalSeries::None),
             PrincipalRegime::ApplicationLimited | PrincipalRegime::SnapshotFaults => standard,
-            PrincipalRegime::LinearThroughput => {
-                Self::capacity_closed_loop(100, 100).handler(100_000)
-            }
+            PrincipalRegime::LinearThroughput => Self::linear_closed_loop().handler(100_000),
             PrincipalRegime::FlatPostKnee => {
                 Self::capacity_closed_loop(100, 100).shared_resource(64, 320, 0)
             }
@@ -1482,6 +1640,22 @@ impl PrincipalDefinition {
             .schedule(RunSchedule::capacity_response())
     }
 
+    const fn linear_closed_loop() -> Self {
+        Self::capacity()
+            .messages(ArrivalSeries::StaircaseRate {
+                initial_per_second: 100,
+                increment_per_second: 100,
+                step_interval_micros: 180_000_000,
+                count_max: LINEAR_RESPONSE_EVENT_COUNT,
+            })
+            .launch_delay(LaunchDelaySeries::Uniform {
+                minimum_micros: 30_000_000,
+                maximum_micros: 90_000_000,
+            })
+            .schedule(RunSchedule::linear_response())
+            .event_count_max(LINEAR_RESPONSE_EVENT_COUNT)
+    }
+
     const fn messages(mut self, series: ArrivalSeries) -> Self {
         self.inputs.messages = series;
         self
@@ -1652,7 +1826,205 @@ enum ArrivalSeries {
     },
 }
 
+/// One bounded demand process with fixed virtual release times.
+///
+/// The controller cadence cannot change the ordered release column.
+struct ArrivalSchedule {
+    release_micros: Vec<u64>,
+    cursor: usize,
+    interval_start: usize,
+}
+
+impl ArrivalSchedule {
+    fn new(
+        series: ArrivalSeries,
+        start_micros: u64,
+        end_micros: u64,
+        seed: u64,
+        domain: u64,
+        stochastic: bool,
+    ) -> Result<Self, PlantError> {
+        let deterministic_count =
+            usize::try_from(series.at(end_micros, 0)).map_err(|_| PlantError::PlatformLimit)?;
+        let stochastic_rate = stochastic
+            && matches!(
+                series,
+                ArrivalSeries::Rate { .. } | ArrivalSeries::StaircaseRate { .. }
+            );
+        let count = if stochastic_rate {
+            usize::try_from(series.count_max()).map_err(|_| PlantError::PlatformLimit)?
+        } else {
+            deterministic_count
+        };
+        let mut release_micros = Vec::with_capacity(count);
+        if stochastic_rate {
+            series.push_stochastic_releases(end_micros, seed, domain, count, &mut release_micros);
+        } else {
+            series.push_deterministic_releases(
+                start_micros,
+                end_micros,
+                count,
+                &mut release_micros,
+            );
+        }
+        Ok(Self {
+            release_micros,
+            cursor: 0,
+            interval_start: 0,
+        })
+    }
+
+    fn release_until(&mut self, now_micros: u64) -> Result<u32, PlantError> {
+        self.interval_start = self.cursor;
+        self.cursor +=
+            self.release_micros[self.cursor..].partition_point(|release| *release <= now_micros);
+        u32::try_from(self.cursor - self.interval_start).map_err(|_| PlantError::PlatformLimit)
+    }
+
+    fn release_at(&self, event_offset: u32) -> Result<u64, PlantError> {
+        let offset = usize::try_from(event_offset).map_err(|_| PlantError::PlatformLimit)?;
+        self.release_micros
+            .get(self.interval_start.saturating_add(offset))
+            .copied()
+            .ok_or(PlantError::PlatformLimit)
+    }
+}
+
 impl ArrivalSeries {
+    fn push_deterministic_releases(
+        self,
+        start_micros: u64,
+        end_micros: u64,
+        count: usize,
+        output: &mut Vec<u64>,
+    ) {
+        for index in 0..count {
+            let ordinal = index as u64 + 1;
+            let release = match self {
+                Self::None => continue,
+                Self::Once(_) => start_micros,
+                Self::Rate { .. } | Self::StaircaseRate { .. } => {
+                    self.release_for_ordinal(start_micros, end_micros, ordinal)
+                }
+                Self::Periodic {
+                    count,
+                    interval_micros,
+                    ..
+                } => (ordinal - 1)
+                    .checked_div(u64::from(count))
+                    .map_or(0, |period| period.saturating_mul(interval_micros)),
+                Self::PeriodicDelayed {
+                    count,
+                    first_micros,
+                    interval_micros,
+                    ..
+                } => first_micros.saturating_add(
+                    (ordinal - 1)
+                        .checked_div(u64::from(count))
+                        .map_or(0, |period| period.saturating_mul(interval_micros)),
+                ),
+            };
+            output.push(release);
+        }
+    }
+
+    fn push_stochastic_releases(
+        self,
+        end_micros: u64,
+        seed: u64,
+        domain: u64,
+        count_max: usize,
+        output: &mut Vec<u64>,
+    ) {
+        let mut cell_start = 0_u64;
+        while cell_start < end_micros && output.len() < count_max {
+            let cell_end = cell_start.saturating_add(1_000_000).min(end_micros);
+            let start_hazard = self.cumulative_event_micros(cell_start);
+            let end_hazard = self.cumulative_event_micros(cell_end);
+            let hazard_delta = end_hazard.saturating_sub(start_hazard);
+            let hazard = count_as_f64(hazard_delta) / 1_000_000.0_f64;
+            let mut random = RandomStream::new(seed).domain(domain ^ cell_start);
+            let cell_count = usize::try_from(sample_poisson(hazard, &mut random))
+                .map_or(count_max - output.len(), |value| {
+                    value.min(count_max - output.len())
+                });
+            let first = output.len();
+            for _ in 0..cell_count {
+                let target = count_as_f64(start_hazard)
+                    + random.open_unit_f64() * count_as_f64(hazard_delta);
+                output.push(self.release_for_hazard(cell_start, cell_end, target));
+            }
+            output[first..].sort_unstable();
+            cell_start = cell_end;
+        }
+    }
+
+    fn release_for_hazard(self, start_micros: u64, end_micros: u64, target: f64) -> u64 {
+        let mut lower = start_micros.saturating_add(1).min(end_micros);
+        let mut upper = end_micros;
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2;
+            if count_as_f64(self.cumulative_event_micros(middle)) >= target {
+                upper = middle;
+            } else {
+                lower = middle.saturating_add(1);
+            }
+        }
+        lower
+    }
+
+    fn release_for_ordinal(self, start_micros: u64, end_micros: u64, ordinal: u64) -> u64 {
+        let target = ordinal.saturating_mul(1_000_000);
+        let mut lower = start_micros.saturating_add(1).min(end_micros);
+        let mut upper = end_micros;
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2;
+            if self.cumulative_event_micros(middle) >= target {
+                upper = middle;
+            } else {
+                lower = middle.saturating_add(1);
+            }
+        }
+        lower
+    }
+
+    const fn count_max(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Once(count)
+            | Self::Rate {
+                count_max: count, ..
+            }
+            | Self::Periodic {
+                count_max: count, ..
+            }
+            | Self::PeriodicDelayed {
+                count_max: count, ..
+            }
+            | Self::StaircaseRate {
+                count_max: count, ..
+            } => count,
+        }
+    }
+
+    fn cumulative_event_micros(self, now_micros: u64) -> u64 {
+        match self {
+            Self::Rate { per_second, .. } => u64::from(per_second).saturating_mul(now_micros),
+            Self::StaircaseRate {
+                initial_per_second,
+                increment_per_second,
+                step_interval_micros,
+                ..
+            } => staircase_event_micros(
+                now_micros,
+                initial_per_second,
+                increment_per_second,
+                step_interval_micros,
+            ),
+            Self::None | Self::Once(_) | Self::Periodic { .. } | Self::PeriodicDelayed { .. } => 0,
+        }
+    }
+
     fn at(self, now_micros: u64, emitted: u32) -> u32 {
         let cumulative = match self {
             Self::None => 0,
@@ -1703,66 +2075,6 @@ impl ArrivalSeries {
         };
         cumulative.saturating_sub(emitted)
     }
-
-    fn at_seeded(
-        self,
-        now_micros: u64,
-        previous_micros: u64,
-        emitted: u32,
-        seed: u64,
-        domain: u64,
-        stochastic: bool,
-    ) -> u32 {
-        if !stochastic {
-            return self.at(now_micros, emitted);
-        }
-        let Some((mean, count_max)) = self.interval_mean(previous_micros, now_micros) else {
-            return self.at(now_micros, emitted);
-        };
-        let remaining = count_max.saturating_sub(emitted);
-        let mut random = RandomStream::new(seed).domain(domain ^ now_micros);
-        sample_poisson(mean, &mut random).min(remaining)
-    }
-
-    fn interval_mean(self, start_micros: u64, end_micros: u64) -> Option<(f64, u32)> {
-        match self {
-            Self::Rate {
-                per_second,
-                count_max,
-            } => Some((
-                f64::from(per_second)
-                    * std::time::Duration::from_micros(end_micros.saturating_sub(start_micros))
-                        .as_secs_f64(),
-                count_max,
-            )),
-            Self::StaircaseRate {
-                initial_per_second,
-                increment_per_second,
-                step_interval_micros,
-                count_max,
-            } => {
-                let start = staircase_event_micros(
-                    start_micros,
-                    initial_per_second,
-                    increment_per_second,
-                    step_interval_micros,
-                );
-                let end = staircase_event_micros(
-                    end_micros,
-                    initial_per_second,
-                    increment_per_second,
-                    step_interval_micros,
-                );
-                Some((
-                    count_as_f64(end.saturating_sub(start)) / 1_000_000.0_f64,
-                    count_max,
-                ))
-            }
-            Self::None | Self::Once(_) | Self::Periodic { .. } | Self::PeriodicDelayed { .. } => {
-                None
-            }
-        }
-    }
 }
 
 fn sample_poisson(mean: f64, random: &mut RandomStream) -> u32 {
@@ -1809,17 +2121,15 @@ fn staircase_event_micros(
         )
 }
 
-fn count_as_f64(value: u64) -> f64 {
-    let high = (value >> 32_u32) as u32;
-    let low = value as u32;
-    f64::from(high) * 4_294_967_296.0_f64 + f64::from(low)
-}
-
 fn bounded_count(count: u64, count_max: u32) -> u32 {
     match u32::try_from(count.min(u64::from(count_max))) {
         Ok(count) => count,
         Err(_) => count_max,
     }
+}
+
+fn count_as_f64(value: u64) -> f64 {
+    Duration::from_micros(value).as_secs_f64() * 1_000_000.0_f64
 }
 
 impl ScaleSeries {
@@ -2037,6 +2347,19 @@ impl RunSchedule {
         }
     }
 
+    const fn linear_response() -> Self {
+        Self {
+            start_micros: 0,
+            workload_end_micros: 1_200_000_000,
+            workload_interval_micros: 1_000_000,
+            followup_interval_micros: 1_000_000,
+            maximum_micros: 1_290_000_000,
+            stop: StopCondition::FixedDuration {
+                reason: RunStopReason::DurationComplete,
+            },
+        }
+    }
+
     const fn one_shot() -> Self {
         Self {
             start_micros: 1_000_000,
@@ -2112,26 +2435,22 @@ enum StopCondition {
     FixedDuration { reason: RunStopReason },
 }
 
+#[derive(Clone, Copy)]
+struct PrincipalFrame<'a> {
+    tick: TickContext<'a>,
+    message_count: u32,
+    timer_count: u32,
+    historical_message_count: u32,
+}
+
 series_graph! {
-    struct PrincipalInputGraph(TickContext<'_>) with (policies: InputPolicies) {
+    struct PrincipalInputGraph(PrincipalFrame<'_>) with (policies: InputPolicies) {
         series message_count: u32 ["message arrivals", Count, Input] =
-            MessageDemand(policies.messages, policies.seed, policies.stochastic_arrivals) =>
-            () previous (message_emitted);
+            ScheduledMessages {} => ();
         series timer_count: u32 ["timer arrivals", Count, Input] =
-            TimerDemand(policies.timers, policies.seed, policies.stochastic_arrivals) =>
-            () previous (timer_emitted);
-        series message_emitted: u32 ["messages emitted", Count, State] =
-            EmittedEvents {} => (message_count) previous (message_emitted);
-        series timer_emitted: u32 ["timers emitted", Count, State] =
-            EmittedEvents {} => (timer_count) previous (timer_emitted);
+            ScheduledTimers {} => ();
         series historical_message_count: u32 ["historical demand", Count, Input] =
-            HistoricalDemand(
-                policies.history.demand,
-                policies.seed,
-                policies.stochastic_arrivals,
-            ) => () previous (historical_emitted);
-        series historical_emitted: u32 ["historical demand emitted", Count, State] =
-            EmittedEvents {} => (historical_message_count) previous (historical_emitted);
+            ScheduledHistoricalMessages {} => ();
         series historical_replicas: u32 ["historical replicas", Replicas, Input] =
             HistoricalReplicas(policies.history.replicas) => ();
         series external_target: u32 ["external target", Replicas, Action] =
@@ -2159,122 +2478,68 @@ series_graph! {
     }
 }
 
-fn previous_tick_micros(context: &TickContext<'_>) -> u64 {
-    context
-        .history
-        .now_micros(0)
-        .map_or(context.now_micros, |previous| previous)
-}
+struct ScheduledMessages;
 
-struct MessageDemand(ArrivalSeries, u64, bool);
-
-impl SeriesFunction<TickContext<'_>, (Option<u32>,)> for MessageDemand {
+impl SeriesFunction<PrincipalFrame<'_>, ()> for ScheduledMessages {
     type Output = u32;
 
-    fn calculate(
-        &self,
-        context: SeriesContext<'_, TickContext<'_>>,
-        (emitted_events,): (Option<u32>,),
-    ) -> Self::Output {
-        self.0.at_seeded(
-            context.frame.now_micros,
-            previous_tick_micros(&context.frame),
-            emitted_events.unwrap_or(0),
-            self.1,
-            0x6d65_7373_6167_6573,
-            self.2,
-        )
+    fn calculate(&self, context: SeriesContext<'_, PrincipalFrame<'_>>, (): ()) -> Self::Output {
+        context.frame.message_count
     }
 }
 
-struct TimerDemand(ArrivalSeries, u64, bool);
+struct ScheduledTimers;
 
-impl SeriesFunction<TickContext<'_>, (Option<u32>,)> for TimerDemand {
+impl SeriesFunction<PrincipalFrame<'_>, ()> for ScheduledTimers {
     type Output = u32;
 
-    fn calculate(
-        &self,
-        context: SeriesContext<'_, TickContext<'_>>,
-        (emitted_events,): (Option<u32>,),
-    ) -> Self::Output {
-        self.0.at_seeded(
-            context.frame.now_micros,
-            previous_tick_micros(&context.frame),
-            emitted_events.unwrap_or(0),
-            self.1,
-            0x7469_6d65_7273,
-            self.2,
-        )
+    fn calculate(&self, context: SeriesContext<'_, PrincipalFrame<'_>>, (): ()) -> Self::Output {
+        context.frame.timer_count
     }
 }
 
-struct HistoricalDemand(ArrivalSeries, u64, bool);
+struct ScheduledHistoricalMessages;
 
-impl SeriesFunction<TickContext<'_>, (Option<u32>,)> for HistoricalDemand {
+impl SeriesFunction<PrincipalFrame<'_>, ()> for ScheduledHistoricalMessages {
     type Output = u32;
 
-    fn calculate(
-        &self,
-        context: SeriesContext<'_, TickContext<'_>>,
-        (emitted_events,): (Option<u32>,),
-    ) -> Self::Output {
-        self.0.at_seeded(
-            context.frame.now_micros,
-            previous_tick_micros(&context.frame),
-            emitted_events.unwrap_or(0),
-            self.1,
-            0x0068_6973_746f_7279,
-            self.2,
-        )
+    fn calculate(&self, context: SeriesContext<'_, PrincipalFrame<'_>>, (): ()) -> Self::Output {
+        context.frame.historical_message_count
     }
 }
 
 struct HistoricalReplicas(u32);
 
-impl SeriesFunction<TickContext<'_>, ()> for HistoricalReplicas {
+impl SeriesFunction<PrincipalFrame<'_>, ()> for HistoricalReplicas {
     type Output = u32;
 
-    fn calculate(&self, _context: SeriesContext<'_, TickContext<'_>>, (): ()) -> Self::Output {
+    fn calculate(&self, _: SeriesContext<'_, PrincipalFrame<'_>>, (): ()) -> Self::Output {
         self.0
-    }
-}
-
-struct EmittedEvents;
-
-impl SeriesFunction<TickContext<'_>, (u32, Option<u32>)> for EmittedEvents {
-    type Output = u32;
-
-    fn calculate(
-        &self,
-        _context: SeriesContext<'_, TickContext<'_>>,
-        (count, emitted): (u32, Option<u32>),
-    ) -> Self::Output {
-        emitted.unwrap_or(0).saturating_add(count)
     }
 }
 
 struct ScaleInput(ScaleSeries);
 
-impl SeriesFunction<TickContext<'_>, (Option<u32>,)> for ScaleInput {
+impl SeriesFunction<PrincipalFrame<'_>, (Option<u32>,)> for ScaleInput {
     type Output = u32;
 
     fn calculate(
         &self,
-        context: SeriesContext<'_, TickContext<'_>>,
+        context: SeriesContext<'_, PrincipalFrame<'_>>,
         (previous,): (Option<u32>,),
     ) -> Self::Output {
-        self.0.at(context.frame.now_micros, previous)
+        self.0.at(context.frame.tick.now_micros, previous)
     }
 }
 
 struct ScaleChanged;
 
-impl SeriesFunction<TickContext<'_>, (u32, Option<u32>)> for ScaleChanged {
+impl SeriesFunction<PrincipalFrame<'_>, (u32, Option<u32>)> for ScaleChanged {
     type Output = bool;
 
     fn calculate(
         &self,
-        _context: SeriesContext<'_, TickContext<'_>>,
+        _: SeriesContext<'_, PrincipalFrame<'_>>,
         (target, previous): (u32, Option<u32>),
     ) -> Self::Output {
         target > 0 && Some(target) != previous
@@ -2283,32 +2548,32 @@ impl SeriesFunction<TickContext<'_>, (u32, Option<u32>)> for ScaleChanged {
 
 struct HandlerDuration(u64);
 
-impl SeriesFunction<TickContext<'_>, ()> for HandlerDuration {
+impl SeriesFunction<PrincipalFrame<'_>, ()> for HandlerDuration {
     type Output = u64;
 
-    fn calculate(&self, _context: SeriesContext<'_, TickContext<'_>>, (): ()) -> Self::Output {
+    fn calculate(&self, _: SeriesContext<'_, PrincipalFrame<'_>>, (): ()) -> Self::Output {
         self.0
     }
 }
 
 struct SharedResourceCapacity(u32);
 
-impl SeriesFunction<TickContext<'_>, ()> for SharedResourceCapacity {
+impl SeriesFunction<PrincipalFrame<'_>, ()> for SharedResourceCapacity {
     type Output = u32;
 
-    fn calculate(&self, _context: SeriesContext<'_, TickContext<'_>>, (): ()) -> Self::Output {
+    fn calculate(&self, _: SeriesContext<'_, PrincipalFrame<'_>>, (): ()) -> Self::Output {
         self.0
     }
 }
 
 struct SharedResourceServiceTime(u32);
 
-impl SeriesFunction<TickContext<'_>, (u32,)> for SharedResourceServiceTime {
+impl SeriesFunction<PrincipalFrame<'_>, (u32,)> for SharedResourceServiceTime {
     type Output = u64;
 
     fn calculate(
         &self,
-        _context: SeriesContext<'_, TickContext<'_>>,
+        _: SeriesContext<'_, PrincipalFrame<'_>>,
         (capacity_per_second,): (u32,),
     ) -> Self::Output {
         u64::from(self.0)
@@ -2319,22 +2584,22 @@ impl SeriesFunction<TickContext<'_>, (u32,)> for SharedResourceServiceTime {
 
 struct LaunchDelay(LaunchDelaySeries, u64);
 
-impl SeriesFunction<TickContext<'_>, ()> for LaunchDelay {
+impl SeriesFunction<PrincipalFrame<'_>, ()> for LaunchDelay {
     type Output = u64;
 
-    fn calculate(&self, context: SeriesContext<'_, TickContext<'_>>, (): ()) -> Self::Output {
-        self.0.at(context.frame.now_micros, self.1)
+    fn calculate(&self, context: SeriesContext<'_, PrincipalFrame<'_>>, (): ()) -> Self::Output {
+        self.0.at(context.frame.tick.now_micros, self.1)
     }
 }
 
 struct PrincipalInputs;
 
-impl OutputFunction<TickContext<'_>, (u32, u32, u32, bool, u64, u64, u64)> for PrincipalInputs {
+impl OutputFunction<PrincipalFrame<'_>, (u32, u32, u32, bool, u64, u64, u64)> for PrincipalInputs {
     type Output = TickInputs;
 
     fn calculate(
         &self,
-        _context: SeriesContext<'_, TickContext<'_>>,
+        _: SeriesContext<'_, PrincipalFrame<'_>>,
         values: (u32, u32, u32, bool, u64, u64, u64),
     ) -> Self::Output {
         TickInputs {

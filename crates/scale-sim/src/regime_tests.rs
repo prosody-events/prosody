@@ -1,7 +1,7 @@
 use super::{
-    ArrivalSeries, HISTORY_EVENT_COUNT_MAX, IndexSeries, PrincipalDefinition, PrincipalRegime,
-    RunSchedule, RunStopReason, SharedResourcePolicy, StopCondition, run_principal_definition,
-    run_principal_regime_seeded,
+    ArrivalSchedule, ArrivalSeries, HISTORY_EVENT_COUNT_MAX, IndexSeries, PrincipalDefinition,
+    PrincipalRegime, RunSchedule, RunStopReason, SharedResourcePolicy, StopCondition,
+    run_principal_definition, run_principal_regime_seeded,
 };
 use crate::model::{AttemptFrame, AttemptModel};
 use crate::{ConcurrencyLatencyCurve, PrincipalRunError, SeriesCell};
@@ -72,6 +72,71 @@ fn periodic_arrivals_do_not_depend_on_evaluation_cadence() {
 
     assert_eq!(fine, 2_000);
     assert_eq!(coarse, fine);
+}
+
+#[test]
+fn deterministic_rate_release_times_do_not_depend_on_controller_cadence()
+-> Result<(), PrincipalRunError> {
+    for series in [
+        ArrivalSeries::Rate {
+            per_second: 3,
+            count_max: 1_000,
+        },
+        ArrivalSeries::StaircaseRate {
+            initial_per_second: 3,
+            increment_per_second: 5,
+            step_interval_micros: 2_000_000,
+            count_max: 1_000,
+        },
+    ] {
+        let coarse = deterministic_release_times(series, 1_000_000, 4_000_000)?;
+        let fine = deterministic_release_times(series, 250_000, 4_000_000)?;
+        assert_eq!(coarse, fine);
+    }
+    Ok(())
+}
+
+fn deterministic_release_times(
+    series: ArrivalSeries,
+    interval_micros: u64,
+    end_micros: u64,
+) -> Result<Vec<u64>, PrincipalRunError> {
+    release_times(series, interval_micros, end_micros, false)
+}
+
+fn release_times(
+    series: ArrivalSeries,
+    interval_micros: u64,
+    end_micros: u64,
+    stochastic: bool,
+) -> Result<Vec<u64>, PrincipalRunError> {
+    let mut schedule = ArrivalSchedule::new(series, 0, end_micros, 7, 11, stochastic)?;
+    let mut releases = Vec::new();
+    let mut interval_end = interval_micros;
+    while interval_end <= end_micros {
+        let count = schedule.release_until(interval_end)?;
+        for event_offset in 0..count {
+            releases.push(schedule.release_at(event_offset)?);
+        }
+        interval_end = interval_end.saturating_add(interval_micros);
+    }
+    Ok(releases)
+}
+
+#[test]
+fn stochastic_rate_release_times_do_not_depend_on_controller_cadence()
+-> Result<(), PrincipalRunError> {
+    let series = ArrivalSeries::StaircaseRate {
+        initial_per_second: 3,
+        increment_per_second: 5,
+        step_interval_micros: 2_000_000,
+        count_max: 1_000,
+    };
+    let coarse = release_times(series, 1_000_000, 4_000_000, true)?;
+    let fine = release_times(series, 250_000, 4_000_000, true)?;
+
+    assert_eq!(coarse, fine);
+    Ok(())
 }
 
 #[test]
@@ -303,7 +368,9 @@ fn retry_outcomes_increase_loss_without_creating_physical_saturation()
     assert!(failed_clear_micros > healthy_clear_micros);
     assert!(
         saturation_delta <= 0.01_f64,
-        "retry outcomes changed the saturation probability by {saturation_delta:.3}"
+        "retry outcomes changed saturation from {} to {}",
+        healthy_final.map_or(f64::NAN, |sample| sample.saturation_probability),
+        failed_final.map_or(f64::NAN, |sample| sample.saturation_probability)
     );
     assert!(reliability_increases_loss);
     Ok(())

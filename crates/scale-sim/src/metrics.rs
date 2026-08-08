@@ -81,6 +81,8 @@ pub struct MetricPoint {
     pub hold: bool,
     /// Realized SLO miss fraction.
     pub miss_fraction: f64,
+    /// Useful completions that missed the SLO.
+    pub misses: u64,
     /// Cumulative replica-seconds.
     pub replica_seconds: f64,
     /// Probe work divided by useful work.
@@ -152,6 +154,7 @@ impl MetricPoint {
             cap: 0,
             hold: false,
             miss_fraction: 0.0_f64,
+            misses: 0,
             replica_seconds: 0.0_f64,
             snapshot_age_micros: 0,
             missing_reporters: 0,
@@ -212,6 +215,7 @@ pub struct MetricTrace {
     pub(crate) cap: Vec<u32>,
     pub(crate) hold: Vec<bool>,
     pub(crate) miss_fraction: Vec<f64>,
+    pub(crate) misses: Vec<u64>,
     pub(crate) replica_seconds: Vec<f64>,
     pub(crate) snapshot_age_micros: Vec<u64>,
     pub(crate) missing_reporters: Vec<u32>,
@@ -282,6 +286,7 @@ impl MetricTrace {
             cap: Vec::with_capacity(capacity),
             hold: Vec::with_capacity(capacity),
             miss_fraction: Vec::with_capacity(capacity),
+            misses: Vec::with_capacity(capacity),
             replica_seconds: Vec::with_capacity(capacity),
             snapshot_age_micros: Vec::with_capacity(capacity),
             missing_reporters: Vec::with_capacity(capacity),
@@ -359,6 +364,7 @@ impl MetricTrace {
         self.cap.push(point.cap);
         self.hold.push(point.hold);
         self.miss_fraction.push(point.miss_fraction);
+        self.misses.push(point.misses);
         self.replica_seconds.push(point.replica_seconds);
         self.snapshot_age_micros.push(point.snapshot_age_micros);
         self.missing_reporters.push(point.missing_reporters);
@@ -430,6 +436,7 @@ impl MetricTrace {
             cap: self.cap[index],
             hold: self.hold[index],
             miss_fraction: self.miss_fraction[index],
+            misses: self.misses[index],
             replica_seconds: self.replica_seconds[index],
             snapshot_age_micros: self.snapshot_age_micros[index],
             missing_reporters: self.missing_reporters[index],

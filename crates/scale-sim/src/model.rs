@@ -288,11 +288,7 @@ struct DependencyTotal;
 impl SeriesFunction<AttemptFrame, (u64, u64)> for DependencyTotal {
     type Output = u64;
 
-    fn calculate(
-        &self,
-        _context: SeriesContext<'_, AttemptFrame>,
-        values: (u64, u64),
-    ) -> Self::Output {
+    fn calculate(&self, _: SeriesContext<'_, AttemptFrame>, values: (u64, u64)) -> Self::Output {
         values.0.saturating_add(values.1)
     }
 }
@@ -312,11 +308,7 @@ struct AttemptOutput;
 impl OutputFunction<AttemptFrame, (u64, u64)> for AttemptOutput {
     type Output = AttemptParameters;
 
-    fn calculate(
-        &self,
-        _context: SeriesContext<'_, AttemptFrame>,
-        values: (u64, u64),
-    ) -> Self::Output {
+    fn calculate(&self, _: SeriesContext<'_, AttemptFrame>, values: (u64, u64)) -> Self::Output {
         AttemptParameters {
             dependency_operation_micros: values.0,
             handler_added_micros: values.1,

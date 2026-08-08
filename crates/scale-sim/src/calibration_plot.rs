@@ -1456,7 +1456,7 @@ impl CategoricalCalibrationPlot for PartitionCalibration {
         self.trials()
     }
 
-    fn include(&self, _trial: &Self::Trial) -> bool {
+    fn include(&self, _: &Self::Trial) -> bool {
         true
     }
 

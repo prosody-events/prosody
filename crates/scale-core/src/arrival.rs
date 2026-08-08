@@ -1,12 +1,13 @@
 use std::time::Duration;
 
 use rand::RngExt;
+use rand_distr::{Distribution, Poisson};
 use statrs::function::gamma::ln_gamma;
 use thiserror::Error;
 
 use crate::change_point::ChangePointKernel;
 use crate::random::sample_gamma;
-use crate::types::{CalendarForecast, CalendarRateSegment};
+use crate::types::{CalendarColumns, CalendarForecast};
 use crate::{ArrivalPosterior, CalendarArtifactId, RandomStream};
 
 const RUN_LENGTH_CAPACITY: usize = 1_024;
@@ -207,12 +208,13 @@ impl ArrivalFactor {
             return;
         };
         let artifact_changed = self.calendar_artifact != Some(forecast.artifact);
-        let segment_changed = artifact_changed || self.calendar_position != segment.position;
+        let segment_changed =
+            artifact_changed || self.calendar_position != forecast.segments.position(segment);
         if segment_changed {
             self.calendar_artifact = Some(forecast.artifact);
-            self.calendar_position = segment.position;
-            self.calendar_shape = segment.shape;
-            self.calendar_rate = segment.rate_seconds;
+            self.calendar_position = forecast.segments.position(segment);
+            self.calendar_shape = forecast.segments.shape(segment);
+            self.calendar_rate = forecast.segments.rate_seconds(segment);
         }
         if artifact_changed {
             self.calendar_log_odds = logit(forecast.prior_probability);
@@ -350,7 +352,7 @@ impl ArrivalFactor {
             && calendar_covers(forecast.segments, now_micros, duration_seconds)
             && random.random::<f64>() < self.calendar_probability()
         {
-            return self.sample_calendar_path(
+            let length = self.sample_calendar_path(
                 forecast,
                 now_micros,
                 duration_seconds,
@@ -358,6 +360,13 @@ impl ArrivalFactor {
                 end_seconds,
                 rates,
             );
+            sample_path_counts(
+                random.clone().domain(0x6172_7269_7661_6c73),
+                end_seconds,
+                rates,
+                length,
+            );
+            return length;
         }
         let mut rate = self.sample_current_rate(random);
         let missing_change_probability = self.missing_change_probability(now_micros);
@@ -374,11 +383,24 @@ impl ArrivalFactor {
             end_seconds[index] = cursor;
             rates[index] = rate;
             if cursor >= duration_seconds {
-                return index + 1;
+                let length = index + 1;
+                sample_path_counts(
+                    random.clone().domain(0x6172_7269_7661_6c73),
+                    end_seconds,
+                    rates,
+                    length,
+                );
+                return length;
             }
             rate = sample_gamma(self.prior.shape, random) / self.prior.rate_seconds;
         }
         end_seconds[bound - 1] = duration_seconds;
+        sample_path_counts(
+            random.clone().domain(0x6172_7269_7661_6c73),
+            end_seconds,
+            rates,
+            bound,
+        );
         bound
     }
 
@@ -401,23 +423,29 @@ impl ArrivalFactor {
     ) -> usize {
         let end_micros = now_micros.saturating_add((duration_seconds * 1_000_000.0_f64) as u64);
         let mut length = 0;
-        for segment in forecast.segments {
-            if segment.end_micros <= now_micros || segment.start_micros >= end_micros {
+        for segment in 0..forecast.segments.len() {
+            if forecast.segments.end_micros(segment) <= now_micros
+                || forecast.segments.start_micros(segment) >= end_micros
+            {
                 continue;
             }
             if length == end_seconds.len().min(rates.len()) {
                 break;
             }
             let uses_updated_segment = self.calendar_artifact == Some(forecast.artifact)
-                && self.calendar_position == segment.position;
+                && self.calendar_position == forecast.segments.position(segment);
             let (shape, rate) = if uses_updated_segment {
                 (self.calendar_shape, self.calendar_rate)
             } else {
-                (segment.shape, segment.rate_seconds)
+                (
+                    forecast.segments.shape(segment),
+                    forecast.segments.rate_seconds(segment),
+                )
             };
             end_seconds[length] = Duration::from_micros(
-                segment
-                    .end_micros
+                forecast
+                    .segments
+                    .end_micros(segment)
                     .min(end_micros)
                     .saturating_sub(now_micros),
             )
@@ -475,29 +503,37 @@ impl ArrivalFactor {
     }
 }
 
-fn calendar_segment_at(
-    segments: &[CalendarRateSegment],
-    now_micros: u64,
-) -> Option<CalendarRateSegment> {
-    segments
-        .iter()
-        .copied()
-        .find(|segment| segment.start_micros <= now_micros && now_micros < segment.end_micros)
+fn sample_path_counts(random: RandomStream, end_seconds: &[f64], rates: &mut [f64], length: usize) {
+    let mut start = 0.0_f64;
+    for segment in 0..length {
+        let duration = end_seconds[segment] - start;
+        let mean = rates[segment] * duration;
+        rates[segment] = if duration <= f64::EPSILON || mean <= f64::EPSILON {
+            0.0_f64
+        } else if let Ok(distribution) = Poisson::new(mean) {
+            let mut segment_random = random.clone().domain(segment as u64);
+            distribution.sample(&mut segment_random) / duration
+        } else {
+            0.0_f64
+        };
+        start = end_seconds[segment];
+    }
 }
 
-fn calendar_covers(
-    segments: &[CalendarRateSegment],
-    now_micros: u64,
-    duration_seconds: f64,
-) -> bool {
+fn calendar_segment_at(segments: &CalendarColumns, now_micros: u64) -> Option<usize> {
+    (0..segments.len()).find(|&segment| {
+        segments.start_micros(segment) <= now_micros && now_micros < segments.end_micros(segment)
+    })
+}
+
+fn calendar_covers(segments: &CalendarColumns, now_micros: u64, duration_seconds: f64) -> bool {
     let Some(first) = calendar_segment_at(segments, now_micros) else {
         return false;
     };
     let end_micros = now_micros.saturating_add((duration_seconds * 1_000_000.0_f64) as u64);
-    first.start_micros <= now_micros
-        && segments
-            .last()
-            .is_some_and(|segment| segment.end_micros >= end_micros)
+    segments.start_micros(first) <= now_micros
+        && segments.len() > 0
+        && segments.end_micros(segments.len() - 1) >= end_micros
 }
 
 fn logit(probability: f64) -> f64 {

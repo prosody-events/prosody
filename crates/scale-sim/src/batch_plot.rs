@@ -190,7 +190,7 @@ fn draw_panel<Backend: DrawingBackend>(
         })
         .fold(f64::EPSILON, f64::max);
     let x_end = summaries.len() * 2 + 1;
-    let no_axis_label = |_index: &usize| String::new();
+    let no_axis_label = |_: &usize| String::new();
     let mut chart = ChartBuilder::on(area)
         .margin_left(14_u32)
         .margin_right(16_u32)

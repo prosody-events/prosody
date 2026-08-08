@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use prosody_scale_core::{
     ActuationCommitment, ArrivalPosterior, AttemptOutcomeCounts, AttemptOutcomeEvidence,
-    BacklogCohort, CapacityGrid, Cohort, Configuration, ConfigurationError, DemandClass,
-    HoldReason, ModelTime, ObservationBuffer, PosteriorQuery, RandomStream, ResourceWindow,
-    ScaleDecision, ScaleScratch, ScaleState, ThroughputPosteriorCell, TransitionDirection,
-    TransitionEvidence, step,
+    BacklogCohort, CapacityGrid, Cohort, Configuration, ConfigurationError, DecisionRejection,
+    DemandClass, HoldReason, ModelTime, ObservationBuffer, PosteriorQuery, RandomStream,
+    ResourceWindow, ScaleDecision, ScaleScratch, ScaleState, ThroughputPosteriorCell,
+    TransitionDirection, TransitionEvidence, step,
 };
 use statrs::distribution::{DiscreteCDF, NegativeBinomial, Poisson};
 use thiserror::Error;
@@ -24,6 +24,8 @@ const HANDLER_RANK_BIN_COUNT: usize = 10;
 pub struct ControllerSample {
     /// Virtual decision time.
     pub at_micros: u64,
+    /// Posterior scenarios used for this decision.
+    pub scenario_count: u32,
     /// Current requested replica target.
     pub target: u32,
     /// Last valid saturation cap.
@@ -198,6 +200,7 @@ impl CapacityEvidenceSample {
 /// Fixed-capacity structure-of-arrays controller trace.
 pub struct ControllerTrace {
     at_micros: Vec<u64>,
+    scenario_count: Vec<u32>,
     target: Vec<u32>,
     cap: Vec<u32>,
     hold: Vec<bool>,
@@ -261,7 +264,13 @@ pub struct ControllerTrace {
     arrival_rate: Vec<f64>,
     decision_candidate_count: usize,
     decision_expected_losses: Vec<f64>,
+    decision_root_pass_probabilities: Vec<f64>,
     decision_pass_probabilities: Vec<f64>,
+    decision_root_deadline_rejections: Vec<f64>,
+    decision_placement_rejections: Vec<f64>,
+    decision_recourse_deadline_rejections: Vec<f64>,
+    decision_terminal_backlog_rejections: Vec<f64>,
+    decision_future_arrival_rejections: Vec<f64>,
 }
 
 struct DiscretePosteriorTrace {
@@ -342,6 +351,7 @@ impl ControllerTrace {
         )?;
         Ok(Self {
             at_micros: Vec::with_capacity(capacity),
+            scenario_count: Vec::with_capacity(capacity),
             target: Vec::with_capacity(capacity),
             cap: Vec::with_capacity(capacity),
             hold: Vec::with_capacity(capacity),
@@ -405,7 +415,13 @@ impl ControllerTrace {
             arrival_rate: Vec::with_capacity(capacity),
             decision_candidate_count,
             decision_expected_losses: Vec::with_capacity(decision_cell_count),
+            decision_root_pass_probabilities: Vec::with_capacity(decision_cell_count),
             decision_pass_probabilities: Vec::with_capacity(decision_cell_count),
+            decision_root_deadline_rejections: Vec::with_capacity(decision_cell_count),
+            decision_placement_rejections: Vec::with_capacity(decision_cell_count),
+            decision_recourse_deadline_rejections: Vec::with_capacity(decision_cell_count),
+            decision_terminal_backlog_rejections: Vec::with_capacity(decision_cell_count),
+            decision_future_arrival_rejections: Vec::with_capacity(decision_cell_count),
         })
     }
 
@@ -430,6 +446,7 @@ impl ControllerTrace {
     pub fn sample(&self, index: usize) -> Option<ControllerSample> {
         Some(ControllerSample {
             at_micros: *self.at_micros.get(index)?,
+            scenario_count: self.scenario_count[index],
             target: self.target[index],
             cap: self.cap[index],
             hold: self.hold[index],
@@ -546,6 +563,33 @@ impl ControllerTrace {
         let start = index.checked_mul(self.decision_candidate_count)?;
         let end = start.checked_add(self.decision_candidate_count)?;
         self.decision_pass_probabilities.get(start..end)
+    }
+
+    /// Returns the root-stage SLO pass probability for each replica candidate.
+    #[must_use]
+    pub fn decision_root_pass_probabilities(&self, index: usize) -> Option<&[f64]> {
+        let start = index.checked_mul(self.decision_candidate_count)?;
+        let end = start.checked_add(self.decision_candidate_count)?;
+        self.decision_root_pass_probabilities.get(start..end)
+    }
+
+    /// Returns one rejection-reason probability for each replica candidate.
+    #[must_use]
+    pub fn decision_rejection_probabilities(
+        &self,
+        reason: DecisionRejection,
+        index: usize,
+    ) -> Option<&[f64]> {
+        let start = index.checked_mul(self.decision_candidate_count)?;
+        let end = start.checked_add(self.decision_candidate_count)?;
+        let values = match reason {
+            DecisionRejection::RootDeadline => &self.decision_root_deadline_rejections,
+            DecisionRejection::PartitionPlacement => &self.decision_placement_rejections,
+            DecisionRejection::RecourseDeadline => &self.decision_recourse_deadline_rejections,
+            DecisionRejection::TerminalBacklog => &self.decision_terminal_backlog_rejections,
+            DecisionRejection::FutureArrival => &self.decision_future_arrival_rejections,
+        };
+        values.get(start..end)
     }
 
     /// Returns the arrival-rate prior before the first observation.
@@ -678,6 +722,7 @@ impl ControllerTrace {
             return Err(PlantError::MetricCapacity);
         }
         self.at_micros.push(sample.at_micros);
+        self.scenario_count.push(sample.scenario_count);
         self.target.push(sample.target);
         self.cap.push(sample.cap);
         self.hold.push(sample.hold);
@@ -767,6 +812,11 @@ impl ControllerTrace {
             return Err(PlantError::MetricCapacity);
         }
         self.decision_expected_losses.resize(decision_end, f64::NAN);
+        if decision_end > self.decision_root_pass_probabilities.capacity() {
+            return Err(PlantError::MetricCapacity);
+        }
+        self.decision_root_pass_probabilities
+            .resize(decision_end, f64::NAN);
         if decision_end > self.decision_pass_probabilities.capacity() {
             return Err(PlantError::MetricCapacity);
         }
@@ -779,6 +829,47 @@ impl ControllerTrace {
             Ok(()) | Err(prosody_scale_core::DecisionCurveError::Unavailable) => {}
             Err(error) => return Err(error.into()),
         }
+        match scratch.write_root_pass_curve(
+            &mut self.decision_root_pass_probabilities[decision_start..decision_end],
+        ) {
+            Ok(()) | Err(prosody_scale_core::DecisionCurveError::Unavailable) => {}
+            Err(error) => return Err(error.into()),
+        }
+        write_rejection_curve(
+            scratch,
+            DecisionRejection::RootDeadline,
+            &mut self.decision_root_deadline_rejections,
+            decision_start,
+            decision_end,
+        )?;
+        write_rejection_curve(
+            scratch,
+            DecisionRejection::PartitionPlacement,
+            &mut self.decision_placement_rejections,
+            decision_start,
+            decision_end,
+        )?;
+        write_rejection_curve(
+            scratch,
+            DecisionRejection::RecourseDeadline,
+            &mut self.decision_recourse_deadline_rejections,
+            decision_start,
+            decision_end,
+        )?;
+        write_rejection_curve(
+            scratch,
+            DecisionRejection::TerminalBacklog,
+            &mut self.decision_terminal_backlog_rejections,
+            decision_start,
+            decision_end,
+        )?;
+        write_rejection_curve(
+            scratch,
+            DecisionRejection::FutureArrival,
+            &mut self.decision_future_arrival_rejections,
+            decision_start,
+            decision_end,
+        )?;
         let posterior_start = self.capacity_posterior_probabilities.len();
         let posterior_end = posterior_start
             .checked_add(self.capacity_posterior_values.len())
@@ -888,7 +979,6 @@ pub struct ClosedLoop<Workload> {
     snapshot_pipeline: Option<SnapshotPipeline>,
     event_count: u32,
     budget_micros: u64,
-    slots_per_replica: u32,
     latest_capacity_window: Option<CapacityWindow>,
     capacity_evidence_sample: CapacityEvidenceSample,
     throughput_posterior_scratch: Vec<ThroughputPosteriorCell>,
@@ -1058,7 +1148,6 @@ impl<Workload> ClosedLoop<Workload> {
         let partition_posterior_count = trace.partition_share_posterior.values.len();
         let scratch = ScaleScratch::new(core_configuration)?;
         let observation = ObservationBuffer::new(core_configuration)?;
-        let slots_per_replica = core_configuration.slots_per_replica;
         Ok(Self {
             workload,
             configuration,
@@ -1076,7 +1165,6 @@ impl<Workload> ClosedLoop<Workload> {
             snapshot_pipeline: None,
             event_count: 0,
             budget_micros,
-            slots_per_replica,
             latest_capacity_window: None,
             capacity_evidence_sample: CapacityEvidenceSample::None,
             throughput_posterior_scratch: vec![
@@ -1428,9 +1516,7 @@ impl<Workload> ClosedLoop<Workload> {
         }
         let ready =
             context.history.partitions_ready(0).unwrap_or(false) && context.plant.partitions_ready;
-        let slot_count = previous_replicas.saturating_mul(self.slots_per_replica);
-        let offered_work = context.history.backlog(0).unwrap_or(0) >= slot_count;
-        if !ready || !offered_work {
+        if !ready {
             return Ok(());
         }
         let exposure_micros = context.now_micros.saturating_sub(previous_micros);
@@ -1600,6 +1686,7 @@ impl<Workload> ClosedLoop<Workload> {
                 }
                 ControllerSample {
                     at_micros: context.now_micros,
+                    scenario_count: apply.diagnostics.scenario_count,
                     target: apply.target,
                     cap: apply.cap,
                     hold: false,
@@ -1647,6 +1734,7 @@ impl<Workload> ClosedLoop<Workload> {
                 }
                 ControllerSample {
                     at_micros: context.now_micros,
+                    scenario_count: hold.diagnostics.scenario_count,
                     target: held_target,
                     cap: held_cap,
                     hold: true,
@@ -2037,6 +2125,23 @@ fn predictive_throughput_cdf(
     Ok(cumulative)
 }
 
+fn write_rejection_curve(
+    scratch: &ScaleScratch,
+    reason: DecisionRejection,
+    values: &mut Vec<f64>,
+    start: usize,
+    end: usize,
+) -> Result<(), PlantError> {
+    if end > values.capacity() {
+        return Err(PlantError::MetricCapacity);
+    }
+    values.resize(end, f64::NAN);
+    match scratch.write_rejection_curve(reason, &mut values[start..end]) {
+        Ok(()) | Err(prosody_scale_core::DecisionCurveError::Unavailable) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl PendingTransition {
     const fn reached(self, replicas: u32) -> bool {
         match self.direction() {
@@ -2060,9 +2165,16 @@ impl PendingTransition {
 
 impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
     fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError> {
+        self.workload.calculate(context)
+    }
+
+    fn observe(
+        &mut self,
+        context: TickContext<'_>,
+        inputs: TickInputs,
+    ) -> Result<TickInputs, PlantError> {
         let reporter = self.workload.reporter(context);
         let calendar = self.workload.calendar_forecast(context)?;
-        let inputs = self.workload.calculate(context)?;
         self.prepare_observation(context, inputs, reporter, calendar)?;
         self.apply_decision(context, inputs, reporter)
     }

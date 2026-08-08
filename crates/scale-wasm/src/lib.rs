@@ -28,6 +28,7 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
         replica_count_max: 32,
         slots_per_replica: 4,
         posterior_sample_count: 64,
+        report_interval_micros: 1_000_000,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
         capacity_change_rate_per_second: 0.0_f64,

@@ -1,8 +1,10 @@
 use std::time::Duration;
 
-use fearless_simd::{Level, Simd, dispatch, prelude::*};
+#[cfg(test)]
+use fearless_simd::{Level, dispatch};
+use fearless_simd::{Simd, prelude::*};
 
-use crate::types::WorkCohort;
+use crate::types::WorkCohorts;
 
 pub(crate) struct EdfScratch {
     release_order: Vec<u32>,
@@ -10,23 +12,32 @@ pub(crate) struct EdfScratch {
     heap: Vec<u32>,
     remaining: Vec<f64>,
     prepared_len: usize,
+    common_cohort: Option<CommonCohort>,
+    ordered_deadlines: bool,
 }
 
-pub(crate) struct CandidateSupply<'a> {
-    pub(crate) before: f64,
-    pub(crate) during: &'a [f64],
-    pub(crate) after: &'a [f64],
-    pub(crate) pause_seconds: &'a [f64],
-    pub(crate) ready_seconds: &'a [f64],
+impl EdfScratch {
+    pub(crate) fn has_common_interval(&self) -> bool {
+        self.common_cohort.is_some()
+    }
 }
 
-pub(crate) struct CandidateLoss<'a> {
-    pub(crate) service_balance: &'a mut [f64],
-    pub(crate) shortfall: &'a mut [f64],
-    pub(crate) delay_area: &'a mut [f64],
+#[derive(Clone, Copy)]
+struct CommonCohort {
+    release_micros: u64,
+    deadline_micros: u64,
+    work: f64,
+    last_positive_work: f64,
 }
 
-/// One candidate's ordered capacity and rebalance trajectory.
+struct CommonState {
+    late_work: f64,
+    on_time_work: f64,
+    shortfall: f64,
+    released: bool,
+    expired: bool,
+}
+
 pub(crate) struct SupplyTrajectory<'a> {
     pub(crate) initial: f64,
     pub(crate) pause_seconds: &'a [f64],
@@ -35,41 +46,113 @@ pub(crate) struct SupplyTrajectory<'a> {
     pub(crate) after: &'a [f64],
 }
 
-pub(crate) struct SupplyTrajectories<'a> {
-    pub(crate) initial: f64,
-    pub(crate) offsets: &'a [u32],
-    pub(crate) pause_seconds: &'a [f64],
-    pub(crate) ready_seconds: &'a [f64],
-    pub(crate) during: &'a [f64],
-    pub(crate) after: &'a [f64],
+#[derive(Clone, Copy)]
+pub(crate) struct SupplyStep {
+    pub(crate) before: f64,
+    pub(crate) during: f64,
+    pub(crate) after: f64,
+    pub(crate) pause_micros: u64,
+    pub(crate) ready_micros: u64,
 }
 
-impl SupplyTrajectories<'_> {
-    fn candidate(&self, index: usize) -> SupplyTrajectory<'_> {
-        let first = self.offsets[index] as usize;
-        let last = self.offsets[index + 1] as usize;
-        SupplyTrajectory {
-            initial: self.initial,
-            pause_seconds: &self.pause_seconds[first..last],
-            ready_seconds: &self.ready_seconds[first..last],
-            during: &self.during[first..last],
-            after: &self.after[first..last],
+#[derive(Clone, Copy)]
+pub(crate) struct EvaluationWindow {
+    pub(crate) start_micros: u64,
+    pub(crate) horizon_micros: u64,
+    pub(crate) initial_debt_work: f64,
+    pub(crate) deadline_budget_micros: u64,
+}
+
+struct DeadlineState {
+    queue: f64,
+    initial_debt: f64,
+    completed: f64,
+    released: f64,
+    due: f64,
+    shortfall: f64,
+}
+
+impl DeadlineState {
+    fn new(initial_debt: f64) -> Self {
+        Self {
+            queue: initial_debt,
+            initial_debt,
+            completed: 0.0_f64,
+            released: 0.0_f64,
+            due: 0.0_f64,
+            shortfall: 0.0_f64,
         }
     }
 
-    fn candidate_count(&self) -> usize {
-        self.offsets.len().saturating_sub(1)
+    fn release(&mut self, work: f64) {
+        self.queue += work;
+        self.released += work;
+    }
+
+    fn make_due(&mut self, work: f64) {
+        self.due += work;
+        self.update_shortfall();
+    }
+
+    fn advance(&mut self, duration: f64, capacity: f64, arrival_rate: f64, due_rate: f64) -> f64 {
+        let mut remaining = duration;
+        let mut area = 0.0_f64;
+        while remaining > f64::EPSILON {
+            let service_rate = if self.queue > f64::EPSILON {
+                capacity
+            } else {
+                capacity.min(arrival_rate)
+            };
+            let net_rate = arrival_rate - service_rate;
+            let mut span = remaining;
+            if net_rate < -f64::EPSILON {
+                span = span.min(self.queue / -net_rate);
+            }
+            if self.completed < self.initial_debt && service_rate > f64::EPSILON {
+                span = span.min((self.initial_debt - self.completed) / service_rate);
+            }
+            if span <= f64::EPSILON {
+                if self.queue <= f64::EPSILON * capacity.max(1.0_f64) {
+                    self.queue = 0.0_f64;
+                }
+                if self.initial_debt - self.completed
+                    <= f64::EPSILON * self.initial_debt.max(1.0_f64)
+                {
+                    self.completed = self.initial_debt.max(self.completed);
+                }
+                continue;
+            }
+            area += self.queue * span + 0.5_f64 * net_rate * span * span;
+            self.queue = (self.queue + net_rate * span).max(0.0_f64);
+            self.completed += service_rate * span;
+            self.released += arrival_rate * span;
+            self.due += due_rate * span;
+            self.update_shortfall();
+            remaining -= span;
+        }
+        area
+    }
+
+    fn update_shortfall(&mut self) {
+        let actionable_completed = (self.completed - self.initial_debt)
+            .max(0.0_f64)
+            .min(self.released);
+        let deficit = (self.due - actionable_completed).max(0.0_f64);
+        if deficit > f64::EPSILON * self.due.max(1.0_f64) {
+            self.shortfall = self.shortfall.max(deficit / self.due);
+        }
     }
 }
 
 impl SupplyTrajectory<'_> {
-    fn capacity_at(&self, at_seconds: f64) -> f64 {
+    fn capacity_at_micros(&self, at_micros: u64) -> f64 {
         let mut capacity = self.initial;
         for event in 0..self.pause_seconds.len() {
-            if at_seconds < self.pause_seconds[event] {
+            let pause_micros = seconds_to_micros(self.pause_seconds[event]);
+            if at_micros < pause_micros {
                 break;
             }
-            capacity = if at_seconds < self.ready_seconds[event] {
+            capacity = if at_micros < seconds_to_micros(self.ready_seconds[event]) {
                 self.during[event]
             } else {
                 self.after[event]
@@ -78,29 +161,14 @@ impl SupplyTrajectory<'_> {
         capacity
     }
 
-    fn next_boundary(&self, after_seconds: f64) -> Option<f64> {
+    fn next_boundary_micros(&self, after_micros: u64) -> Option<u64> {
         self.pause_seconds
             .iter()
             .chain(self.ready_seconds)
             .copied()
-            .filter(|boundary| *boundary > after_seconds)
-            .min_by(f64::total_cmp)
-    }
-
-    fn integrated_supply(&self, start_seconds: f64, end_seconds: f64) -> f64 {
-        let mut cursor = start_seconds;
-        let mut supply = 0.0_f64;
-        while cursor < end_seconds {
-            let next = self
-                .next_boundary(cursor)
-                .map_or(end_seconds, |boundary| boundary.min(end_seconds));
-            if next <= cursor {
-                break;
-            }
-            supply += self.capacity_at(cursor) * (next - cursor);
-            cursor = next;
-        }
-        supply
+            .map(seconds_to_micros)
+            .filter(|boundary| *boundary > after_micros)
+            .min()
     }
 }
 
@@ -132,37 +200,507 @@ impl ArrivalPath<'_> {
         count
     }
 
+    /// Returns the largest mean rate in one fixed window.
+    pub(crate) fn maximum_window_rate(&self, start: f64, end: f64, window: f64) -> f64 {
+        if end <= start || window <= f64::EPSILON {
+            return 0.0_f64;
+        }
+        let last_start = (end - window).max(start);
+        let mut maximum = self.integrated_count(start, (start + window).min(end)) / window;
+        for &relative_boundary in self.end_seconds {
+            let boundary = self.start_seconds + relative_boundary;
+            if boundary >= start && boundary <= last_start {
+                maximum = maximum.max(self.integrated_count(boundary, boundary + window) / window);
+            }
+            let aligned_start = boundary - window;
+            if aligned_start >= start && aligned_start <= last_start {
+                maximum = maximum
+                    .max(self.integrated_count(aligned_start, aligned_start + window) / window);
+            }
+        }
+        maximum.max(self.integrated_count(last_start, end) / window)
+    }
+
     fn rate_at(&self, at: f64) -> f64 {
         let relative = (at - self.start_seconds).max(0.0_f64);
         let index = self
             .end_seconds
-            .iter()
-            .position(|end| relative < *end)
-            .map_or(self.rates.len().saturating_sub(1), |index| index);
+            .partition_point(|end| relative >= *end)
+            .min(self.rates.len().saturating_sub(1));
         self.rates.get(index).copied().map_or(0.0_f64, |rate| rate)
     }
 
     fn next_boundary(&self, after: f64) -> Option<f64> {
         let relative = (after - self.start_seconds).max(0.0_f64);
         self.end_seconds
-            .iter()
+            .get(self.end_seconds.partition_point(|end| *end <= relative))
             .copied()
-            .find(|end| *end > relative)
             .map(|end| self.start_seconds + end)
     }
+
+    fn deadline_rate_at(&self, at: f64, budget_seconds: f64) -> f64 {
+        if at < self.start_seconds + budget_seconds {
+            0.0_f64
+        } else {
+            self.rate_at(at - budget_seconds)
+        }
+    }
+
+    fn next_deadline_boundary(&self, after: f64, budget_seconds: f64) -> Option<f64> {
+        let first = self.start_seconds + budget_seconds;
+        if first > after {
+            return Some(first);
+        }
+        let relative = after - self.start_seconds - budget_seconds;
+        self.end_seconds
+            .get(self.end_seconds.partition_point(|end| *end <= relative))
+            .copied()
+            .map(|end| self.start_seconds + end + budget_seconds)
+    }
+}
+
+pub(crate) struct StepCandidates<'a> {
+    pub(crate) before: f64,
+    pub(crate) during: &'a [f64],
+    pub(crate) after: &'a [f64],
+    pub(crate) pause_seconds: &'a [f64],
+    pub(crate) ready_seconds: &'a [f64],
+}
+
+#[derive(Clone, Copy)]
+struct ScalarStep {
+    pause: f64,
+    ready: f64,
+    before: f64,
+    during: f64,
+    after: f64,
+}
+
+#[cfg(test)]
+pub(crate) fn evaluate_empty_steps(
+    level: Level,
+    supply: &StepCandidates<'_>,
+    start_seconds: f64,
+    horizon_seconds: f64,
+    initial_work: f64,
+    arrivals: &ArrivalPath<'_>,
+    deadline_budget_micros: u64,
+    delay_area: &mut [f64],
+    terminal_work: &mut [f64],
+    shortfall: &mut [f64],
+) {
+    let count = supply.after.len();
+    assert_eq!(supply.during.len(), count);
+    assert_eq!(supply.pause_seconds.len(), count);
+    assert_eq!(supply.ready_seconds.len(), count);
+    assert_eq!(delay_area.len(), count);
+    assert_eq!(terminal_work.len(), count);
+    assert_eq!(shortfall.len(), count);
+    dispatch!(level, simd => evaluate_empty_steps_simd(
+        simd,
+        supply,
+        start_seconds,
+        horizon_seconds,
+        initial_work,
+        arrivals,
+        deadline_budget_micros,
+        delay_area,
+        terminal_work,
+        shortfall,
+    ));
+}
+
+pub(crate) fn evaluate_empty_steps_simd<S: Simd>(
+    simd: S,
+    supply: &StepCandidates<'_>,
+    start_seconds: f64,
+    horizon_seconds: f64,
+    initial_work: f64,
+    arrivals: &ArrivalPath<'_>,
+    deadline_budget_micros: u64,
+    delay_area: &mut [f64],
+    terminal_work: &mut [f64],
+    shortfall: &mut [f64],
+) {
+    let lane_count = S::f64s::N;
+    let vector_count = supply.after.len() / lane_count;
+    for vector in 0..vector_count {
+        let first = vector * lane_count;
+        let last = first + lane_count;
+        let pause = S::f64s::from_slice(simd, &supply.pause_seconds[first..last]);
+        let ready = S::f64s::from_slice(simd, &supply.ready_seconds[first..last]);
+        let during = S::f64s::from_slice(simd, &supply.during[first..last]);
+        let after = S::f64s::from_slice(simd, &supply.after[first..last]);
+        let before = S::f64s::splat(simd, supply.before);
+        let mut queue = S::f64s::splat(simd, initial_work);
+        let mut area = S::f64s::splat(simd, 0.0_f64);
+        let mut released = S::f64s::splat(simd, 0.0_f64);
+        let mut due = S::f64s::splat(simd, 0.0_f64);
+        let mut maximum_shortfall = S::f64s::splat(simd, 0.0_f64);
+        let budget_seconds = Duration::from_micros(deadline_budget_micros).as_secs_f64();
+        for_forecast_intervals(
+            arrivals,
+            start_seconds,
+            horizon_seconds,
+            budget_seconds,
+            |start, end, rate, due_rate| {
+                let start = S::f64s::splat(simd, start);
+                let end = S::f64s::splat(simd, end);
+                let zero = S::f64s::splat(simd, 0.0_f64);
+                let before_end = pause.simd_lt(end).select(pause, end);
+                let before_duration = (before_end - start)
+                    .simd_gt(zero)
+                    .select(before_end - start, zero);
+                accumulate_deadline_segment(
+                    simd,
+                    &mut queue,
+                    &mut area,
+                    &mut released,
+                    &mut due,
+                    &mut maximum_shortfall,
+                    before_duration,
+                    before,
+                    rate,
+                    due_rate,
+                );
+
+                let during_start = pause.simd_gt(start).select(pause, start);
+                let during_end = ready.simd_lt(end).select(ready, end);
+                let during_duration = (during_end - during_start)
+                    .simd_gt(zero)
+                    .select(during_end - during_start, zero);
+                accumulate_deadline_segment(
+                    simd,
+                    &mut queue,
+                    &mut area,
+                    &mut released,
+                    &mut due,
+                    &mut maximum_shortfall,
+                    during_duration,
+                    during,
+                    rate,
+                    due_rate,
+                );
+
+                let after_start = ready.simd_gt(start).select(ready, start);
+                let after_duration = (end - after_start)
+                    .simd_gt(zero)
+                    .select(end - after_start, zero);
+                accumulate_deadline_segment(
+                    simd,
+                    &mut queue,
+                    &mut area,
+                    &mut released,
+                    &mut due,
+                    &mut maximum_shortfall,
+                    after_duration,
+                    after,
+                    rate,
+                    due_rate,
+                );
+            },
+        );
+        area.store_slice(&mut delay_area[first..last]);
+        queue.store_slice(&mut terminal_work[first..last]);
+        maximum_shortfall.store_slice(&mut shortfall[first..last]);
+    }
+    for candidate in vector_count * lane_count..supply.after.len() {
+        let mut queue = initial_work;
+        let mut area = 0.0_f64;
+        for_arrival_intervals(
+            arrivals,
+            start_seconds,
+            horizon_seconds,
+            |start, end, rate| {
+                area += phased_queue_segment(
+                    &mut queue,
+                    start,
+                    end,
+                    ScalarStep {
+                        pause: supply.pause_seconds[candidate],
+                        ready: supply.ready_seconds[candidate],
+                        before: supply.before,
+                        during: supply.during[candidate],
+                        after: supply.after[candidate],
+                    },
+                    rate,
+                );
+            },
+        );
+        delay_area[candidate] = area;
+        terminal_work[candidate] = queue;
+        shortfall[candidate] = forecast_step_shortfall(
+            ScalarStep {
+                pause: supply.pause_seconds[candidate],
+                ready: supply.ready_seconds[candidate],
+                before: supply.before,
+                during: supply.during[candidate],
+                after: supply.after[candidate],
+            },
+            start_seconds,
+            horizon_seconds,
+            initial_work,
+            Duration::from_micros(deadline_budget_micros).as_secs_f64(),
+            arrivals,
+        );
+    }
+}
+
+fn accumulate_deadline_segment<S: Simd>(
+    simd: S,
+    queue: &mut S::f64s,
+    area: &mut S::f64s,
+    released: &mut S::f64s,
+    due: &mut S::f64s,
+    maximum_shortfall: &mut S::f64s,
+    duration: S::f64s,
+    capacity: S::f64s,
+    arrival_rate: f64,
+    due_rate: f64,
+) {
+    let zero = S::f64s::splat(simd, 0.0_f64);
+    let minimum = S::f64s::splat(simd, f64::MIN_POSITIVE);
+    let arrivals = S::f64s::splat(simd, arrival_rate);
+    let due_arrivals = S::f64s::splat(simd, due_rate);
+    let safe_capacity = capacity.simd_gt(minimum).select(capacity, minimum);
+    let debt_time = (*queue - *released) / safe_capacity;
+    let debt_valid =
+        capacity.simd_gt(minimum) & debt_time.simd_gt(zero) & debt_time.simd_lt(duration);
+    update_deadline_shortfall(
+        simd,
+        *queue,
+        *released,
+        *due,
+        capacity,
+        arrivals,
+        due_arrivals,
+        debt_time,
+        debt_valid,
+        maximum_shortfall,
+    );
+
+    let drain_rate = capacity - arrivals;
+    let safe_drain_rate = drain_rate.simd_gt(minimum).select(drain_rate, minimum);
+    let drain_time = *queue / safe_drain_rate;
+    let drain_valid =
+        drain_rate.simd_gt(minimum) & drain_time.simd_gt(zero) & drain_time.simd_lt(duration);
+    update_deadline_shortfall(
+        simd,
+        *queue,
+        *released,
+        *due,
+        capacity,
+        arrivals,
+        due_arrivals,
+        drain_time,
+        drain_valid,
+        maximum_shortfall,
+    );
+    update_deadline_shortfall(
+        simd,
+        *queue,
+        *released,
+        *due,
+        capacity,
+        arrivals,
+        due_arrivals,
+        duration,
+        duration.simd_gt(zero),
+        maximum_shortfall,
+    );
+    accumulate_queue_segment(simd, queue, area, duration, capacity, arrival_rate);
+    *released += arrivals * duration;
+    *due += due_arrivals * duration;
+}
+
+fn update_deadline_shortfall<S: Simd>(
+    simd: S,
+    queue: S::f64s,
+    released: S::f64s,
+    due: S::f64s,
+    capacity: S::f64s,
+    arrival_rate: S::f64s,
+    due_rate: S::f64s,
+    elapsed: S::f64s,
+    valid: <S::f64s as SimdBase<S>>::Mask,
+    maximum: &mut S::f64s,
+) {
+    let zero = S::f64s::splat(simd, 0.0_f64);
+    let minimum = S::f64s::splat(simd, f64::MIN_POSITIVE);
+    let terminal_queue = queue + (arrival_rate - capacity) * elapsed;
+    let terminal_queue = terminal_queue.simd_gt(zero).select(terminal_queue, zero);
+    let completed = released + arrival_rate * elapsed - terminal_queue;
+    let completed = completed.simd_gt(zero).select(completed, zero);
+    let terminal_due = due + due_rate * elapsed;
+    let deficit = terminal_due - completed;
+    let deficit = deficit.simd_gt(zero).select(deficit, zero);
+    let safe_due = terminal_due.simd_gt(minimum).select(terminal_due, minimum);
+    let fraction = deficit / safe_due;
+    let fraction = valid.select(fraction, zero);
+    *maximum = fraction.simd_gt(*maximum).select(fraction, *maximum);
+}
+
+fn forecast_step_shortfall(
+    step: ScalarStep,
+    start_seconds: f64,
+    horizon_seconds: f64,
+    initial_debt: f64,
+    budget_seconds: f64,
+    arrivals: &ArrivalPath<'_>,
+) -> f64 {
+    let mut deadline = DeadlineState::new(initial_debt);
+    let mut now = start_seconds;
+    while now < horizon_seconds {
+        let mut next = horizon_seconds;
+        if step.pause > now {
+            next = next.min(step.pause);
+        }
+        if step.ready > now {
+            next = next.min(step.ready);
+        }
+        if let Some(boundary) = arrivals.next_boundary(now) {
+            next = next.min(boundary);
+        }
+        if let Some(boundary) = arrivals.next_deadline_boundary(now, budget_seconds) {
+            next = next.min(boundary);
+        }
+        if next <= now {
+            break;
+        }
+        let capacity = if now < step.pause {
+            step.before
+        } else if now < step.ready {
+            step.during
+        } else {
+            step.after
+        };
+        let _ = deadline.advance(
+            next - now,
+            capacity,
+            arrivals.rate_at(now),
+            arrivals.deadline_rate_at(now, budget_seconds),
+        );
+        now = next;
+    }
+    deadline.shortfall
+}
+
+fn accumulate_queue_segment<S: Simd>(
+    simd: S,
+    queue: &mut S::f64s,
+    area: &mut S::f64s,
+    duration: S::f64s,
+    capacity: S::f64s,
+    arrival_rate: f64,
+) {
+    let zero = S::f64s::splat(simd, 0.0_f64);
+    let half = S::f64s::splat(simd, 0.5_f64);
+    let rate = S::f64s::splat(simd, arrival_rate);
+    let net = rate - capacity;
+    let growing = net.simd_ge(zero);
+    let growing_area = *queue * duration + half * net * duration * duration;
+    let growing_queue = *queue + net * duration;
+    let net_drain_rate = zero - net;
+    let minimum_rate = S::f64s::splat(simd, f64::MIN_POSITIVE);
+    let drain_rate = net_drain_rate
+        .simd_gt(minimum_rate)
+        .select(net_drain_rate, minimum_rate);
+    let complete_drain_duration = *queue / drain_rate;
+    let drain_duration = complete_drain_duration
+        .simd_lt(duration)
+        .select(complete_drain_duration, duration);
+    let draining_area = *queue * drain_duration + half * net * drain_duration * drain_duration;
+    let terminal_queue = *queue + net * duration;
+    let draining_queue = terminal_queue.simd_gt(zero).select(terminal_queue, zero);
+    *area += growing.select(growing_area, draining_area);
+    *queue = growing.select(growing_queue, draining_queue);
+}
+
+fn for_arrival_intervals(
+    arrivals: &ArrivalPath<'_>,
+    start: f64,
+    end: f64,
+    mut evaluate: impl FnMut(f64, f64, f64),
+) {
+    let mut cursor = start;
+    for (&relative_end, &rate) in arrivals.end_seconds.iter().zip(arrivals.rates) {
+        let interval_end = (arrivals.start_seconds + relative_end).min(end);
+        if interval_end > cursor {
+            evaluate(cursor, interval_end, rate);
+            cursor = interval_end;
+        }
+        if cursor >= end {
+            return;
+        }
+    }
+    if cursor < end {
+        evaluate(cursor, end, arrivals.rate_at(cursor));
+    }
+}
+
+fn for_forecast_intervals(
+    arrivals: &ArrivalPath<'_>,
+    start: f64,
+    end: f64,
+    budget_seconds: f64,
+    mut evaluate: impl FnMut(f64, f64, f64, f64),
+) {
+    let mut cursor = start;
+    while cursor < end {
+        let mut next = end;
+        if let Some(boundary) = arrivals.next_boundary(cursor) {
+            next = next.min(boundary);
+        }
+        if let Some(boundary) = arrivals.next_deadline_boundary(cursor, budget_seconds) {
+            next = next.min(boundary);
+        }
+        if next <= cursor {
+            break;
+        }
+        evaluate(
+            cursor,
+            next,
+            arrivals.rate_at(cursor),
+            arrivals.deadline_rate_at(cursor, budget_seconds),
+        );
+        cursor = next;
+    }
+}
+
+fn phased_queue_segment(
+    queue: &mut f64,
+    start: f64,
+    end: f64,
+    step: ScalarStep,
+    arrival_rate: f64,
+) -> f64 {
+    let before_end = step.pause.min(end);
+    let during_start = step.pause.max(start);
+    let during_end = step.ready.min(end);
+    let after_start = step.ready.max(start);
+    queue_area_segment(
+        queue,
+        (before_end - start).max(0.0_f64),
+        step.before,
+        arrival_rate,
+    ) + queue_area_segment(
+        queue,
+        (during_end - during_start).max(0.0_f64),
+        step.during,
+        arrival_rate,
+    ) + queue_area_segment(
+        queue,
+        (end - after_start).max(0.0_f64),
+        step.after,
+        arrival_rate,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct EdfOutcome {
     pub(crate) shortfall: f64,
     pub(crate) delay_area: f64,
-}
-
-#[derive(Clone, Copy)]
-struct ServiceInterval {
-    start: f64,
-    end: f64,
-    work: f64,
+    pub(crate) terminal_work: f64,
 }
 
 impl EdfScratch {
@@ -175,480 +713,93 @@ impl EdfScratch {
             heap: Vec::with_capacity(capacity),
             remaining: vec![0.0; capacity],
             prepared_len: 0,
+            common_cohort: None,
+            ordered_deadlines: true,
         })
     }
 }
 
-#[cfg(test)]
-pub(crate) fn shortfall(
-    cohorts: &[WorkCohort],
-    capacity_slots: f64,
-    scratch: &mut EdfScratch,
-) -> f64 {
-    prepare(cohorts, scratch);
-    shortfall_prepared(cohorts, capacity_slots, scratch)
-}
-
-pub(crate) fn shortfall_prepared_common_release_trajectories(
-    simd_level: Level,
-    cohorts: &[WorkCohort],
-    trajectories: &SupplyTrajectories<'_>,
-    initial_debt_work: f64,
-    future_arrivals: &ArrivalPath<'_>,
-    start_seconds: f64,
-    horizon_seconds: f64,
-    results: &mut CandidateLoss<'_>,
-    interval_supply: &mut [f64],
-    scratch: &EdfScratch,
-) {
-    let candidate_count = trajectories.candidate_count();
-    assert_eq!(candidate_count, results.service_balance.len());
-    assert_eq!(candidate_count, results.shortfall.len());
-    assert_eq!(candidate_count, results.delay_area.len());
-    assert_eq!(candidate_count, interval_supply.len());
-    results.service_balance.fill(-initial_debt_work);
-    results.shortfall.fill(0.0_f64);
-    let release = cohorts.first().map_or(start_seconds, |cohort| {
-        Duration::from_micros(cohort.release_micros)
-            .as_secs_f64()
-            .max(start_seconds)
-    });
-    let released_work = cohorts
-        .iter()
-        .map(|cohort| cohort.work_slot_seconds)
-        .sum::<f64>();
-    for candidate in 0..candidate_count {
-        let trajectory = trajectories.candidate(candidate);
-        let mut queue = initial_debt_work;
-        let mut area = trajectory_queue_area(
-            &mut queue,
-            start_seconds,
-            release.min(horizon_seconds),
-            &trajectory,
-            future_arrivals,
-        );
-        if release < horizon_seconds {
-            queue += released_work;
-            area += trajectory_queue_area(
-                &mut queue,
-                release,
-                horizon_seconds,
-                &trajectory,
-                future_arrivals,
-            );
-        }
-        results.delay_area[candidate] = area;
-    }
-    let mut previous_seconds = start_seconds;
-    if let Some(&first) = scratch.deadline_order.first() {
-        let release_micros = cohorts[first as usize].release_micros;
-        assert!(
-            cohorts
-                .iter()
-                .all(|cohort| cohort.release_micros == release_micros),
-            "all decision cohorts must have one release time"
-        );
-        let release_seconds = Duration::from_micros(release_micros).as_secs_f64();
-        update_trajectory_candidates(
-            simd_level,
-            ServiceInterval {
-                start: start_seconds,
-                end: release_seconds,
-                work: 0.0_f64,
-            },
-            trajectories,
-            results.service_balance,
-            results.shortfall,
-            interval_supply,
-        );
-        previous_seconds = release_seconds;
-    }
-    let mut cursor = 0_usize;
-    while cursor < scratch.deadline_order.len() {
-        let cohort = cohorts[scratch.deadline_order[cursor] as usize];
-        let deadline_micros = cohort.deadline_micros;
-        let mut work_slot_seconds = 0.0_f64;
-        while cursor < scratch.deadline_order.len() {
-            let next = cohorts[scratch.deadline_order[cursor] as usize];
-            if next.deadline_micros != deadline_micros {
-                break;
-            }
-            work_slot_seconds += next.work_slot_seconds;
-            cursor += 1;
-        }
-        let end_seconds = Duration::from_micros(deadline_micros).as_secs_f64();
-        update_trajectory_candidates(
-            simd_level,
-            ServiceInterval {
-                start: previous_seconds,
-                end: end_seconds,
-                work: work_slot_seconds,
-            },
-            trajectories,
-            results.service_balance,
-            results.shortfall,
-            interval_supply,
-        );
-        previous_seconds = end_seconds;
-    }
-}
-
-fn trajectory_queue_area(
-    queue: &mut f64,
-    start: f64,
-    end: f64,
-    trajectory: &SupplyTrajectory<'_>,
-    arrivals: &ArrivalPath<'_>,
-) -> f64 {
-    if trajectory.pause_seconds.is_empty() {
-        return arrival_queue_area(queue, start, end, trajectory.initial, arrivals);
-    }
-    if trajectory.pause_seconds.len() == 1 {
-        return phased_queue_area(
-            queue,
-            start,
-            end,
-            trajectory.pause_seconds[0],
-            trajectory.ready_seconds[0],
-            trajectory.initial,
-            trajectory.during[0],
-            trajectory.after[0],
-            arrivals,
-        );
-    }
-    let mut area = 0.0_f64;
-    let mut cursor = start;
-    while cursor < end {
-        let mut next = end;
-        if let Some(boundary) = trajectory.next_boundary(cursor) {
-            next = next.min(boundary);
-        }
-        if let Some(boundary) = arrivals.next_boundary(cursor) {
-            next = next.min(boundary);
-        }
-        if next <= cursor {
-            break;
-        }
-        area += queue_area_segment(
-            queue,
-            next - cursor,
-            trajectory.capacity_at(cursor),
-            arrivals.rate_at(cursor),
-        );
-        cursor = next;
-    }
-    area
-}
-
-fn arrival_queue_area(
-    queue: &mut f64,
-    start: f64,
-    end: f64,
-    capacity: f64,
-    arrivals: &ArrivalPath<'_>,
-) -> f64 {
-    let mut area = 0.0_f64;
-    let mut cursor = start;
-    while cursor < end {
-        let next = arrivals
-            .next_boundary(cursor)
-            .map_or(end, |boundary| boundary.min(end));
-        if next <= cursor {
-            break;
-        }
-        area += queue_area_segment(queue, next - cursor, capacity, arrivals.rate_at(cursor));
-        cursor = next;
-    }
-    area
-}
-
-fn update_trajectory_candidates(
-    simd_level: Level,
-    interval: ServiceInterval,
-    trajectories: &SupplyTrajectories<'_>,
-    service_balance: &mut [f64],
-    shortfall: &mut [f64],
-    interval_supply: &mut [f64],
-) {
-    for (candidate, supply) in interval_supply.iter_mut().enumerate() {
-        *supply = trajectories
-            .candidate(candidate)
-            .integrated_supply(interval.start, interval.end);
-    }
-    dispatch!(simd_level, simd => accumulate_trajectory_supply(
-        simd,
-        interval.work,
-        interval_supply,
-        service_balance,
-        shortfall,
-    ));
-}
-
-fn accumulate_trajectory_supply<S: Simd>(
-    simd: S,
-    work: f64,
-    interval_supply: &[f64],
-    service_balance: &mut [f64],
-    shortfall: &mut [f64],
-) {
-    let lane_count = S::f64s::N;
-    let vector_count = interval_supply.len() / lane_count;
-    let zero = S::f64s::splat(simd, 0.0_f64);
-    let work_vector = S::f64s::splat(simd, work);
-    for vector in 0..vector_count {
-        let first = vector * lane_count;
-        let last = first + lane_count;
-        let balance = S::f64s::from_slice(simd, &service_balance[first..last])
-            + S::f64s::from_slice(simd, &interval_supply[first..last]);
-        if work <= f64::EPSILON {
-            balance.store_slice(&mut service_balance[first..last]);
-            continue;
-        }
-        let remaining = work_vector - balance;
-        let one = S::f64s::splat(simd, 1.0_f64);
-        let fractional = remaining / work_vector;
-        let bounded = fractional.simd_lt(one).select(fractional, one);
-        let loss = bounded.simd_gt(zero).select(bounded, zero);
-        let prior = S::f64s::from_slice(simd, &shortfall[first..last]);
-        prior
-            .simd_gt(loss)
-            .select(prior, loss)
-            .store_slice(&mut shortfall[first..last]);
-        (balance - work_vector).store_slice(&mut service_balance[first..last]);
-    }
-    for candidate in vector_count * lane_count..interval_supply.len() {
-        service_balance[candidate] += interval_supply[candidate];
-        if work <= f64::EPSILON {
-            continue;
-        }
-        if work > service_balance[candidate] {
-            shortfall[candidate] =
-                shortfall[candidate].max(((work - service_balance[candidate]) / work).min(1.0_f64));
-        }
-        service_balance[candidate] -= work;
-    }
-}
-
-pub(crate) fn prepare(cohorts: &[WorkCohort], scratch: &mut EdfScratch) {
+pub(crate) fn prepare(cohorts: &WorkCohorts, scratch: &mut EdfScratch) {
     assert!(
         cohorts.len() <= scratch.release_order.capacity(),
         "cohorts must fit the release-order scratch"
     );
     scratch.release_order.clear();
-    for (index, _cohort) in cohorts.iter().enumerate() {
+    for index in 0..cohorts.len() {
         scratch.release_order.push(index as u32);
     }
     scratch.release_order.sort_unstable_by_key(|&index| {
-        let cohort = cohorts[index as usize];
-        (cohort.release_micros, cohort.deadline_micros)
+        let index = index as usize;
+        (
+            cohorts.release_micros(index),
+            cohorts.deadline_micros(index),
+        )
     });
     scratch.deadline_order.clear();
     scratch
         .deadline_order
         .extend_from_slice(&scratch.release_order);
     scratch.deadline_order.sort_unstable_by_key(|&index| {
-        let cohort = cohorts[index as usize];
-        (cohort.deadline_micros, cohort.release_micros)
+        let index = index as usize;
+        (
+            cohorts.deadline_micros(index),
+            cohorts.release_micros(index),
+        )
     });
     scratch.prepared_len = cohorts.len();
+    scratch.common_cohort = common_cohort(cohorts);
+    scratch.ordered_deadlines = scratch.release_order.windows(2).all(|pair| {
+        cohorts.deadline_micros(pair[0] as usize) <= cohorts.deadline_micros(pair[1] as usize)
+    });
+}
+
+fn common_cohort(cohorts: &WorkCohorts) -> Option<CommonCohort> {
+    if cohorts.is_empty() {
+        return None;
+    }
+    let release_micros = cohorts.release_micros(0);
+    let deadline_micros = cohorts.deadline_micros(0);
+    let mut work = 0.0_f64;
+    let mut last_positive_work = 0.0_f64;
+    for index in 0..cohorts.len() {
+        if cohorts.release_micros(index) != release_micros
+            || cohorts.deadline_micros(index) != deadline_micros
+        {
+            return None;
+        }
+        let cohort_work = cohorts.work_slot_seconds(index);
+        work += cohort_work;
+        if cohort_work > 0.0_f64 {
+            last_positive_work = cohort_work;
+        }
+    }
+    Some(CommonCohort {
+        release_micros,
+        deadline_micros,
+        work,
+        last_positive_work,
+    })
+}
+
+fn deadline_work(
+    cohorts: &WorkCohorts,
+    scratch: &EdfScratch,
+    cursor: &mut usize,
+    now_micros: u64,
+) -> f64 {
+    let mut work = 0.0_f64;
+    while *cursor < scratch.deadline_order.len() {
+        let cohort = scratch.deadline_order[*cursor] as usize;
+        if cohorts.deadline_micros(cohort) > now_micros {
+            break;
+        }
+        work += cohorts.work_slot_seconds(cohort);
+        *cursor += 1;
+    }
+    work
 }
 
 /// Computes all candidate shortfalls through one deadline traversal.
-pub(crate) fn shortfall_prepared_common_release_candidates(
-    simd_level: Level,
-    cohorts: &[WorkCohort],
-    supply: &CandidateSupply<'_>,
-    initial_debt_work: f64,
-    future_arrivals: &ArrivalPath<'_>,
-    start_seconds: f64,
-    horizon_seconds: f64,
-    results: &mut CandidateLoss<'_>,
-    scratch: &EdfScratch,
-) {
-    assert_eq!(
-        supply.after.len(),
-        supply.during.len(),
-        "candidate supply columns must have equal lengths"
-    );
-    assert_eq!(
-        supply.after.len(),
-        supply.pause_seconds.len(),
-        "candidate phase columns must have equal lengths"
-    );
-    assert_eq!(
-        supply.after.len(),
-        supply.ready_seconds.len(),
-        "candidate phase columns must have equal lengths"
-    );
-    assert_eq!(
-        supply.after.len(),
-        results.service_balance.len(),
-        "each candidate must have one service balance"
-    );
-    assert_eq!(
-        supply.after.len(),
-        results.shortfall.len(),
-        "each candidate must have one shortfall"
-    );
-    assert_eq!(
-        supply.after.len(),
-        results.delay_area.len(),
-        "each candidate must have one delay area"
-    );
-    results.service_balance.fill(-initial_debt_work);
-    results.shortfall.fill(0.0_f64);
-    fill_common_queue_area(
-        cohorts,
-        supply,
-        initial_debt_work,
-        future_arrivals,
-        start_seconds,
-        horizon_seconds,
-        results.delay_area,
-    );
-    let mut previous_seconds = start_seconds;
-    if let Some(&first) = scratch.deadline_order.first() {
-        let release_micros = cohorts[first as usize].release_micros;
-        assert!(
-            cohorts
-                .iter()
-                .all(|cohort| cohort.release_micros == release_micros),
-            "all decision cohorts must have one release time"
-        );
-        let release_seconds = Duration::from_micros(release_micros).as_secs_f64();
-        let interval = ServiceInterval {
-            start: start_seconds,
-            end: release_seconds,
-            work: 0.0_f64,
-        };
-        dispatch!(simd_level, simd => update_candidates(
-            simd,
-            interval,
-            supply,
-            results.service_balance,
-            results.shortfall,
-        ));
-        previous_seconds = release_seconds;
-    }
-    let mut cursor = 0_usize;
-    while cursor < scratch.deadline_order.len() {
-        let cohort = cohorts[scratch.deadline_order[cursor] as usize];
-        let deadline_micros = cohort.deadline_micros;
-        let mut work_slot_seconds = 0.0_f64;
-        while cursor < scratch.deadline_order.len() {
-            let next = cohorts[scratch.deadline_order[cursor] as usize];
-            if next.deadline_micros != deadline_micros {
-                break;
-            }
-            work_slot_seconds += next.work_slot_seconds;
-            cursor += 1;
-        }
-        let end_seconds = Duration::from_micros(deadline_micros).as_secs_f64();
-        let interval = ServiceInterval {
-            start: previous_seconds,
-            end: end_seconds,
-            work: work_slot_seconds,
-        };
-        dispatch!(simd_level, simd => update_candidates(
-            simd,
-            interval,
-            supply,
-            results.service_balance,
-            results.shortfall,
-        ));
-        previous_seconds = end_seconds;
-    }
-}
-
-fn fill_common_queue_area(
-    cohorts: &[WorkCohort],
-    supply: &CandidateSupply<'_>,
-    initial_work: f64,
-    arrivals: &ArrivalPath<'_>,
-    start: f64,
-    horizon: f64,
-    delay_area: &mut [f64],
-) {
-    let release = cohorts.first().map_or(start, |cohort| {
-        Duration::from_micros(cohort.release_micros)
-            .as_secs_f64()
-            .max(start)
-    });
-    let released_work = cohorts
-        .iter()
-        .map(|cohort| cohort.work_slot_seconds)
-        .sum::<f64>();
-    for candidate in 0..supply.after.len() {
-        let mut queue = initial_work;
-        let mut area = phased_queue_area(
-            &mut queue,
-            start,
-            release.min(horizon),
-            supply.pause_seconds[candidate],
-            supply.ready_seconds[candidate],
-            supply.before,
-            supply.during[candidate],
-            supply.after[candidate],
-            arrivals,
-        );
-        if release < horizon {
-            queue += released_work;
-            area += phased_queue_area(
-                &mut queue,
-                release,
-                horizon,
-                supply.pause_seconds[candidate],
-                supply.ready_seconds[candidate],
-                supply.before,
-                supply.during[candidate],
-                supply.after[candidate],
-                arrivals,
-            );
-        }
-        delay_area[candidate] = area;
-    }
-}
-
-fn phased_queue_area(
-    queue: &mut f64,
-    start: f64,
-    end: f64,
-    pause: f64,
-    ready: f64,
-    before_capacity: f64,
-    during_capacity: f64,
-    after_capacity: f64,
-    arrivals: &ArrivalPath<'_>,
-) -> f64 {
-    let mut area = 0.0_f64;
-    let mut cursor = start;
-    while cursor < end {
-        let mut next = end;
-        if pause > cursor {
-            next = next.min(pause);
-        }
-        if ready > cursor {
-            next = next.min(ready);
-        }
-        if let Some(boundary) = arrivals.next_boundary(cursor) {
-            next = next.min(boundary);
-        }
-        if next <= cursor {
-            break;
-        }
-        let capacity = if cursor < pause {
-            before_capacity
-        } else if cursor < ready {
-            during_capacity
-        } else {
-            after_capacity
-        };
-        area += queue_area_segment(queue, next - cursor, capacity, arrivals.rate_at(cursor));
-        cursor = next;
-    }
-    area
-}
-
 fn queue_area_segment(queue: &mut f64, duration: f64, capacity: f64, arrival_rate: f64) -> f64 {
     if duration <= f64::EPSILON {
         return 0.0_f64;
@@ -665,510 +816,597 @@ fn queue_area_segment(queue: &mut f64, duration: f64, capacity: f64, arrival_rat
     area
 }
 
-fn update_candidates<S: Simd>(
-    simd: S,
-    interval: ServiceInterval,
-    supply: &CandidateSupply<'_>,
-    service_balance: &mut [f64],
-    shortfall: &mut [f64],
-) {
-    let ServiceInterval {
-        start: start_seconds,
-        end: end_seconds,
-        work: work_slot_seconds,
-    } = interval;
-    let CandidateSupply {
-        before: capacity_before,
-        during: capacity_during,
-        after: capacity_after,
-        pause_seconds,
-        ready_seconds,
-    } = *supply;
-    let lane_count = S::f64s::N;
-    let vector_count = capacity_after.len() / lane_count;
-    let zero = S::f64s::splat(simd, 0.0_f64);
-    let start = S::f64s::splat(simd, start_seconds);
-    let end = S::f64s::splat(simd, end_seconds);
-    let before_capacity = S::f64s::splat(simd, capacity_before);
-    let work = S::f64s::splat(simd, work_slot_seconds);
-    let records_shortfall = work_slot_seconds > f64::EPSILON;
-    for vector in 0..vector_count {
-        let first = vector * lane_count;
-        let last = first + lane_count;
-        let pause = S::f64s::from_slice(simd, &pause_seconds[first..last]);
-        let ready = S::f64s::from_slice(simd, &ready_seconds[first..last]);
-        let during_capacity = S::f64s::from_slice(simd, &capacity_during[first..last]);
-        let after_capacity = S::f64s::from_slice(simd, &capacity_after[first..last]);
-        let before_end = pause.simd_lt(end).select(pause, end);
-        let before = before_end - start;
-        let before = before.simd_gt(zero).select(before, zero);
-        let during_start = pause.simd_gt(start).select(pause, start);
-        let during_end = ready.simd_lt(end).select(ready, end);
-        let during = during_end - during_start;
-        let during = during.simd_gt(zero).select(during, zero);
-        let after_start = ready.simd_gt(start).select(ready, start);
-        let after = end - after_start;
-        let after = after.simd_gt(zero).select(after, zero);
-        let supply = before_capacity * before + during_capacity * during + after_capacity * after;
-        let unchanged =
-            during_capacity.simd_eq(before_capacity) & after_capacity.simd_eq(before_capacity);
-        let unchanged_supply = before_capacity * (end - start);
-        let supply = unchanged.select(unchanged_supply, supply);
-        let balance = S::f64s::from_slice(simd, &service_balance[first..last]) + supply;
-        if !records_shortfall {
-            balance.store_slice(&mut service_balance[first..last]);
-            continue;
-        }
-        let remaining = work - balance;
-        let one = S::f64s::splat(simd, 1.0_f64);
-        let fractional = remaining / work;
-        let bounded = fractional.simd_lt(one).select(fractional, one);
-        let loss = bounded.simd_gt(zero).select(bounded, zero);
-        let prior_loss = S::f64s::from_slice(simd, &shortfall[first..last]);
-        prior_loss
-            .simd_gt(loss)
-            .select(prior_loss, loss)
-            .store_slice(&mut shortfall[first..last]);
-        (balance - work).store_slice(&mut service_balance[first..last]);
-    }
-    for candidate in vector_count * lane_count..capacity_after.len() {
-        let supply = phased_supply_seconds(
-            start_seconds,
-            end_seconds,
-            pause_seconds[candidate],
-            ready_seconds[candidate],
-            capacity_before,
-            capacity_during[candidate],
-            capacity_after[candidate],
-        );
-        service_balance[candidate] += supply;
-        if !records_shortfall {
-            continue;
-        }
-        if work_slot_seconds > service_balance[candidate] {
-            shortfall[candidate] = shortfall[candidate].max(
-                ((work_slot_seconds - service_balance[candidate]) / work_slot_seconds).min(1.0_f64),
-            );
-        }
-        service_balance[candidate] -= work_slot_seconds;
-    }
-}
-
-fn phased_supply_seconds(
-    start: f64,
-    end: f64,
-    pause: f64,
-    ready: f64,
-    before_capacity: f64,
-    during_capacity: f64,
-    after_capacity: f64,
-) -> f64 {
-    if before_capacity.to_bits() == during_capacity.to_bits()
-        && before_capacity.to_bits() == after_capacity.to_bits()
-    {
-        return before_capacity * (end - start);
-    }
-    before_capacity * (end.min(pause) - start).max(0.0_f64)
-        + during_capacity * (end.min(ready) - start.max(pause)).max(0.0_f64)
-        + after_capacity * (end - start.max(ready)).max(0.0_f64)
-}
-
 pub(crate) fn evaluate_prepared_step(
-    cohorts: &[WorkCohort],
-    capacity_before: f64,
-    capacity_during: f64,
-    capacity_after: f64,
-    pause_micros: u64,
-    ready_micros: u64,
-    start_micros: u64,
-    horizon_micros: u64,
-    initial_debt_work: f64,
+    cohorts: &WorkCohorts,
+    supply: SupplyStep,
+    window: EvaluationWindow,
     future_arrivals: &ArrivalPath<'_>,
     scratch: &mut EdfScratch,
 ) -> EdfOutcome {
     shortfall_reset(cohorts, scratch);
     let mut release_cursor = 0_usize;
-    let mut now_micros = start_micros;
-    let mut late_work = initial_debt_work;
+    let mut deadline_cursor = 0_usize;
+    let mut now_micros = window.start_micros;
+    let mut late_work = window.initial_debt_work;
+    let mut deadline = DeadlineState::new(window.initial_debt_work);
+    let mut delay_area = 0.0_f64;
     let mut shortfall = 0.0_f64;
-    while now_micros < horizon_micros {
-        shortfall_release(cohorts, scratch, &mut release_cursor, now_micros);
+    let budget_seconds = Duration::from_micros(window.deadline_budget_micros).as_secs_f64();
+    while now_micros < window.horizon_micros {
+        deadline.release(shortfall_release(
+            cohorts,
+            scratch,
+            &mut release_cursor,
+            now_micros,
+        ));
+        deadline.make_due(deadline_work(
+            cohorts,
+            scratch,
+            &mut deadline_cursor,
+            now_micros,
+        ));
         let expired = expire_to_debt(cohorts, scratch, now_micros, &mut shortfall);
         late_work += expired;
-        let mut next_micros = horizon_micros;
+        let mut next_micros = window.horizon_micros;
         next_micros = next_micros.min(shortfall_next_release(cohorts, scratch, release_cursor));
         if let Some(&cohort_index) = scratch.heap.first() {
-            next_micros = next_micros.min(cohorts[cohort_index as usize].deadline_micros);
+            next_micros = next_micros.min(cohorts.deadline_micros(cohort_index as usize));
         }
-        if pause_micros > now_micros {
-            next_micros = next_micros.min(pause_micros);
+        if supply.pause_micros > now_micros {
+            next_micros = next_micros.min(supply.pause_micros);
         }
-        if ready_micros > now_micros {
-            next_micros = next_micros.min(ready_micros);
+        if supply.ready_micros > now_micros {
+            next_micros = next_micros.min(supply.ready_micros);
+        }
+        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
+        if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
+            next_micros = next_micros.min(seconds_to_micros(boundary));
+        }
+        if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
+        {
+            next_micros = next_micros.min(seconds_to_micros(boundary));
         }
         if next_micros <= now_micros {
             break;
         }
         let duration_seconds = Duration::from_micros(next_micros - now_micros).as_secs_f64();
-        let capacity = if now_micros < pause_micros {
-            capacity_before
-        } else if now_micros < ready_micros {
-            capacity_during
+        let capacity = if now_micros < supply.pause_micros {
+            supply.before
+        } else if now_micros < supply.ready_micros {
+            supply.during
         } else {
-            capacity_after
+            supply.after
         };
+        delay_area += deadline.advance(
+            duration_seconds,
+            capacity,
+            future_arrivals.rate_at(now_seconds),
+            future_arrivals.deadline_rate_at(now_seconds, budget_seconds),
+        );
         let supply = capacity * duration_seconds;
         let late_supply = supply.min(late_work);
         late_work -= late_supply;
         shortfall_serve(cohorts, scratch, supply - late_supply);
         now_micros = next_micros;
     }
-    shortfall_release(cohorts, scratch, &mut release_cursor, now_micros);
-    let _new_debt = expire_to_debt(cohorts, scratch, now_micros, &mut shortfall);
-    let delay_area = queue_area_prepared_step(
+    deadline.release(shortfall_release(
         cohorts,
-        capacity_before,
-        capacity_during,
-        capacity_after,
-        pause_micros,
-        ready_micros,
-        start_micros,
-        horizon_micros,
-        initial_debt_work,
-        future_arrivals,
         scratch,
-    );
+        &mut release_cursor,
+        now_micros,
+    ));
+    deadline.make_due(deadline_work(
+        cohorts,
+        scratch,
+        &mut deadline_cursor,
+        now_micros,
+    ));
+    expire_to_debt(cohorts, scratch, now_micros, &mut shortfall);
     EdfOutcome {
-        shortfall,
+        shortfall: shortfall.max(deadline.shortfall),
         delay_area,
+        terminal_work: deadline.queue,
     }
 }
 
 pub(crate) fn evaluate_prepared_trajectory(
-    cohorts: &[WorkCohort],
+    cohorts: &WorkCohorts,
     trajectory: &SupplyTrajectory<'_>,
     start_micros: u64,
     horizon_micros: u64,
     initial_debt_work: f64,
+    deadline_budget_micros: u64,
     future_arrivals: &ArrivalPath<'_>,
     scratch: &mut EdfScratch,
 ) -> EdfOutcome {
-    shortfall_reset(cohorts, scratch);
-    let mut release_cursor = 0_usize;
-    let mut now_micros = start_micros;
-    let mut late_work = initial_debt_work;
-    let mut shortfall = 0.0_f64;
-    while now_micros < horizon_micros {
-        shortfall_release(cohorts, scratch, &mut release_cursor, now_micros);
-        late_work += expire_to_debt(cohorts, scratch, now_micros, &mut shortfall);
-        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
-        let mut next_micros = horizon_micros;
-        next_micros = next_micros.min(shortfall_next_release(cohorts, scratch, release_cursor));
-        if let Some(&cohort_index) = scratch.heap.first() {
-            next_micros = next_micros.min(cohorts[cohort_index as usize].deadline_micros);
-        }
-        if let Some(boundary) = trajectory.next_boundary(now_seconds) {
-            next_micros = next_micros.min((boundary * 1_000_000.0_f64) as u64);
-        }
-        if next_micros <= now_micros {
-            break;
-        }
-        let duration_seconds = Duration::from_micros(next_micros - now_micros).as_secs_f64();
-        let supply = trajectory.capacity_at(now_seconds) * duration_seconds;
-        let late_supply = supply.min(late_work);
-        late_work -= late_supply;
-        shortfall_serve(cohorts, scratch, supply - late_supply);
-        now_micros = next_micros;
+    if let Some(common) = scratch.common_cohort {
+        return evaluate_common_trajectory(
+            common,
+            trajectory,
+            start_micros,
+            horizon_micros,
+            initial_debt_work,
+            deadline_budget_micros,
+            future_arrivals,
+        );
     }
-    shortfall_release(cohorts, scratch, &mut release_cursor, now_micros);
-    let _new_debt = expire_to_debt(cohorts, scratch, now_micros, &mut shortfall);
-    let delay_area = queue_area_prepared_trajectory(
+    if scratch.ordered_deadlines {
+        return evaluate_ordered_trajectory(
+            cohorts,
+            trajectory,
+            start_micros,
+            horizon_micros,
+            initial_debt_work,
+            deadline_budget_micros,
+            future_arrivals,
+            scratch,
+        );
+    }
+    evaluate_general_trajectory(
         cohorts,
         trajectory,
         start_micros,
         horizon_micros,
         initial_debt_work,
+        deadline_budget_micros,
         future_arrivals,
         scratch,
-    );
-    EdfOutcome {
-        shortfall,
-        delay_area,
-    }
+    )
 }
 
-fn queue_area_prepared_trajectory(
-    cohorts: &[WorkCohort],
+fn evaluate_ordered_trajectory(
+    cohorts: &WorkCohorts,
     trajectory: &SupplyTrajectory<'_>,
     start_micros: u64,
     horizon_micros: u64,
-    initial_work: f64,
+    initial_debt_work: f64,
+    deadline_budget_micros: u64,
     future_arrivals: &ArrivalPath<'_>,
-    scratch: &EdfScratch,
-) -> f64 {
-    let mut queue = initial_work;
-    let mut area = 0.0_f64;
+    scratch: &mut EdfScratch,
+) -> EdfOutcome {
+    shortfall_reset(cohorts, scratch);
     let mut release_cursor = 0_usize;
-    while release_cursor < scratch.release_order.len() {
-        let cohort = cohorts[scratch.release_order[release_cursor] as usize];
-        if cohort.release_micros > start_micros {
-            break;
-        }
-        queue += cohort.work_slot_seconds;
-        release_cursor += 1;
-    }
+    let mut deadline_cursor = 0_usize;
+    let mut service_cursor = 0_usize;
     let mut now_micros = start_micros;
+    let mut late_work = initial_debt_work;
+    let mut deadline = DeadlineState::new(initial_debt_work);
+    let mut delay_area = 0.0_f64;
+    let mut shortfall = 0.0_f64;
+    let budget_seconds = Duration::from_micros(deadline_budget_micros).as_secs_f64();
     while now_micros < horizon_micros {
-        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
+        deadline.release(ordered_release(
+            cohorts,
+            scratch,
+            &mut release_cursor,
+            now_micros,
+        ));
+        deadline.make_due(deadline_work(
+            cohorts,
+            scratch,
+            &mut deadline_cursor,
+            now_micros,
+        ));
+        late_work += ordered_expire(
+            cohorts,
+            scratch,
+            release_cursor,
+            &mut service_cursor,
+            now_micros,
+            &mut shortfall,
+        );
         let mut next_micros = horizon_micros;
-        if release_cursor < scratch.release_order.len() {
-            next_micros = next_micros
-                .min(cohorts[scratch.release_order[release_cursor] as usize].release_micros);
+        next_micros = next_micros.min(shortfall_next_release(cohorts, scratch, release_cursor));
+        if service_cursor < release_cursor {
+            let cohort = scratch.release_order[service_cursor] as usize;
+            next_micros = next_micros.min(cohorts.deadline_micros(cohort));
         }
-        if let Some(boundary) = trajectory.next_boundary(now_seconds) {
-            next_micros = next_micros.min((boundary * 1_000_000.0_f64) as u64);
+        if let Some(boundary) = trajectory.next_boundary_micros(now_micros) {
+            next_micros = next_micros.min(boundary);
         }
+        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
         if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
-            next_micros = next_micros.min((boundary * 1_000_000.0_f64) as u64);
+            next_micros = next_micros.min(seconds_to_micros(boundary));
+        }
+        if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
+        {
+            next_micros = next_micros.min(seconds_to_micros(boundary));
         }
         if next_micros <= now_micros {
             break;
         }
-        let duration = Duration::from_micros(next_micros - now_micros).as_secs_f64();
-        area += queue_area_segment(
-            &mut queue,
-            duration,
-            trajectory.capacity_at(now_seconds),
+        let duration_seconds = Duration::from_micros(next_micros - now_micros).as_secs_f64();
+        let capacity = trajectory.capacity_at_micros(now_micros);
+        delay_area += deadline.advance(
+            duration_seconds,
+            capacity,
             future_arrivals.rate_at(now_seconds),
+            future_arrivals.deadline_rate_at(now_seconds, budget_seconds),
+        );
+        let supply = capacity * duration_seconds;
+        let debt_supply = supply.min(late_work);
+        late_work -= debt_supply;
+        ordered_serve(
+            scratch,
+            release_cursor,
+            &mut service_cursor,
+            supply - debt_supply,
         );
         now_micros = next_micros;
-        while release_cursor < scratch.release_order.len() {
-            let cohort = cohorts[scratch.release_order[release_cursor] as usize];
-            if cohort.release_micros > now_micros {
-                break;
-            }
-            queue += cohort.work_slot_seconds;
-            release_cursor += 1;
-        }
     }
-    area
+    deadline.release(ordered_release(
+        cohorts,
+        scratch,
+        &mut release_cursor,
+        now_micros,
+    ));
+    deadline.make_due(deadline_work(
+        cohorts,
+        scratch,
+        &mut deadline_cursor,
+        now_micros,
+    ));
+    ordered_expire(
+        cohorts,
+        scratch,
+        release_cursor,
+        &mut service_cursor,
+        now_micros,
+        &mut shortfall,
+    );
+    EdfOutcome {
+        shortfall: shortfall.max(deadline.shortfall),
+        delay_area,
+        terminal_work: deadline.queue,
+    }
 }
 
-fn queue_area_prepared_step(
-    cohorts: &[WorkCohort],
-    capacity_before: f64,
-    capacity_during: f64,
-    capacity_after: f64,
-    pause_micros: u64,
-    ready_micros: u64,
+fn ordered_release(
+    cohorts: &WorkCohorts,
+    scratch: &EdfScratch,
+    release_cursor: &mut usize,
+    now_micros: u64,
+) -> f64 {
+    let mut released = 0.0_f64;
+    while *release_cursor < cohorts.len() {
+        let cohort = scratch.release_order[*release_cursor] as usize;
+        if cohorts.release_micros(cohort) > now_micros {
+            break;
+        }
+        released += cohorts.work_slot_seconds(cohort);
+        *release_cursor += 1;
+    }
+    released
+}
+
+fn ordered_expire(
+    cohorts: &WorkCohorts,
+    scratch: &mut EdfScratch,
+    release_cursor: usize,
+    service_cursor: &mut usize,
+    now_micros: u64,
+    shortfall: &mut f64,
+) -> f64 {
+    let mut debt = 0.0_f64;
+    while *service_cursor < release_cursor {
+        let cohort = scratch.release_order[*service_cursor] as usize;
+        let remaining = scratch.remaining[cohort];
+        if remaining <= f64::EPSILON {
+            *service_cursor += 1;
+            continue;
+        }
+        if cohorts.deadline_micros(cohort) > now_micros {
+            break;
+        }
+        let work = cohorts.work_slot_seconds(cohort);
+        if work > 0.0_f64 {
+            *shortfall = shortfall.max(remaining / work);
+        }
+        debt += remaining;
+        scratch.remaining[cohort] = 0.0_f64;
+        *service_cursor += 1;
+    }
+    debt
+}
+
+fn ordered_serve(
+    scratch: &mut EdfScratch,
+    release_cursor: usize,
+    service_cursor: &mut usize,
+    mut supply: f64,
+) {
+    while supply > 0.0_f64 && *service_cursor < release_cursor {
+        let cohort = scratch.release_order[*service_cursor] as usize;
+        let served = supply.min(scratch.remaining[cohort]);
+        scratch.remaining[cohort] -= served;
+        supply -= served;
+        if scratch.remaining[cohort] <= f64::EPSILON {
+            *service_cursor += 1;
+        }
+    }
+}
+
+pub(crate) fn evaluate_general_trajectory(
+    cohorts: &WorkCohorts,
+    trajectory: &SupplyTrajectory<'_>,
     start_micros: u64,
     horizon_micros: u64,
-    initial_work: f64,
+    initial_debt_work: f64,
+    deadline_budget_micros: u64,
     future_arrivals: &ArrivalPath<'_>,
-    scratch: &EdfScratch,
-) -> f64 {
-    let mut queue = initial_work;
-    let mut area = 0.0_f64;
-    let mut cursor = 0_usize;
-    while cursor < scratch.release_order.len() {
-        let cohort = cohorts[scratch.release_order[cursor] as usize];
-        if cohort.release_micros > start_micros {
+    scratch: &mut EdfScratch,
+) -> EdfOutcome {
+    shortfall_reset(cohorts, scratch);
+    let mut release_cursor = 0_usize;
+    let mut deadline_cursor = 0_usize;
+    let mut now_micros = start_micros;
+    let mut late_work = initial_debt_work;
+    let mut deadline = DeadlineState::new(initial_debt_work);
+    let mut delay_area = 0.0_f64;
+    let mut shortfall = 0.0_f64;
+    let budget_seconds = Duration::from_micros(deadline_budget_micros).as_secs_f64();
+    while now_micros < horizon_micros {
+        deadline.release(shortfall_release(
+            cohorts,
+            scratch,
+            &mut release_cursor,
+            now_micros,
+        ));
+        deadline.make_due(deadline_work(
+            cohorts,
+            scratch,
+            &mut deadline_cursor,
+            now_micros,
+        ));
+        late_work += expire_to_debt(cohorts, scratch, now_micros, &mut shortfall);
+        let mut next_micros = horizon_micros;
+        next_micros = next_micros.min(shortfall_next_release(cohorts, scratch, release_cursor));
+        if let Some(&cohort_index) = scratch.heap.first() {
+            next_micros = next_micros.min(cohorts.deadline_micros(cohort_index as usize));
+        }
+        if let Some(boundary) = trajectory.next_boundary_micros(now_micros) {
+            next_micros = next_micros.min(boundary);
+        }
+        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
+        if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
+            next_micros = next_micros.min(seconds_to_micros(boundary));
+        }
+        if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
+        {
+            next_micros = next_micros.min(seconds_to_micros(boundary));
+        }
+        if next_micros <= now_micros {
             break;
         }
-        queue += cohort.work_slot_seconds;
-        cursor += 1;
+        let duration_seconds = Duration::from_micros(next_micros - now_micros).as_secs_f64();
+        let capacity = trajectory.capacity_at_micros(now_micros);
+        delay_area += deadline.advance(
+            duration_seconds,
+            capacity,
+            future_arrivals.rate_at(now_seconds),
+            future_arrivals.deadline_rate_at(now_seconds, budget_seconds),
+        );
+        let supply = capacity * duration_seconds;
+        let late_supply = supply.min(late_work);
+        late_work -= late_supply;
+        shortfall_serve(cohorts, scratch, supply - late_supply);
+        now_micros = next_micros;
     }
+    deadline.release(shortfall_release(
+        cohorts,
+        scratch,
+        &mut release_cursor,
+        now_micros,
+    ));
+    deadline.make_due(deadline_work(
+        cohorts,
+        scratch,
+        &mut deadline_cursor,
+        now_micros,
+    ));
+    expire_to_debt(cohorts, scratch, now_micros, &mut shortfall);
+    EdfOutcome {
+        shortfall: shortfall.max(deadline.shortfall),
+        delay_area,
+        terminal_work: deadline.queue,
+    }
+}
+
+fn evaluate_common_trajectory(
+    cohort: CommonCohort,
+    trajectory: &SupplyTrajectory<'_>,
+    start_micros: u64,
+    horizon_micros: u64,
+    initial_debt_work: f64,
+    deadline_budget_micros: u64,
+    future_arrivals: &ArrivalPath<'_>,
+) -> EdfOutcome {
     let mut now_micros = start_micros;
+    let mut state = CommonState {
+        late_work: initial_debt_work,
+        on_time_work: 0.0_f64,
+        shortfall: 0.0_f64,
+        released: false,
+        expired: false,
+    };
+    let mut deadline = DeadlineState::new(initial_debt_work);
+    let mut delay_area = 0.0_f64;
+    let budget_seconds = Duration::from_micros(deadline_budget_micros).as_secs_f64();
     while now_micros < horizon_micros {
+        let (released, due) = update_common_boundaries(cohort, now_micros, &mut state);
+        deadline.release(released);
+        deadline.make_due(due);
         let mut next_micros = horizon_micros;
-        if cursor < scratch.release_order.len() {
-            next_micros =
-                next_micros.min(cohorts[scratch.release_order[cursor] as usize].release_micros);
+        if !state.released {
+            next_micros = next_micros.min(cohort.release_micros);
         }
-        if pause_micros > now_micros {
-            next_micros = next_micros.min(pause_micros);
+        if state.released && !state.expired {
+            next_micros = next_micros.min(cohort.deadline_micros);
         }
-        if ready_micros > now_micros {
-            next_micros = next_micros.min(ready_micros);
+        if let Some(boundary) = trajectory.next_boundary_micros(now_micros) {
+            next_micros = next_micros.min(boundary);
         }
-        if let Some(boundary) =
-            future_arrivals.next_boundary(Duration::from_micros(now_micros).as_secs_f64())
+        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
+        if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
+            next_micros = next_micros.min(seconds_to_micros(boundary));
+        }
+        if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
         {
-            next_micros = next_micros.min((boundary * 1_000_000.0_f64) as u64);
+            next_micros = next_micros.min(seconds_to_micros(boundary));
         }
         if next_micros <= now_micros {
             break;
         }
         let duration = Duration::from_micros(next_micros - now_micros).as_secs_f64();
-        let capacity = if now_micros < pause_micros {
-            capacity_before
-        } else if now_micros < ready_micros {
-            capacity_during
-        } else {
-            capacity_after
-        };
-        area += queue_area_segment(
-            &mut queue,
+        let capacity = trajectory.capacity_at_micros(now_micros);
+        delay_area += deadline.advance(
             duration,
             capacity,
-            future_arrivals.rate_at(Duration::from_micros(now_micros).as_secs_f64()),
+            future_arrivals.rate_at(now_seconds),
+            future_arrivals.deadline_rate_at(now_seconds, budget_seconds),
         );
+        let mut supply = capacity * duration;
+        let debt_supply = supply.min(state.late_work);
+        state.late_work -= debt_supply;
+        supply -= debt_supply;
+        state.on_time_work = (state.on_time_work - supply).max(0.0_f64);
         now_micros = next_micros;
-        while cursor < scratch.release_order.len() {
-            let cohort = cohorts[scratch.release_order[cursor] as usize];
-            if cohort.release_micros > now_micros {
-                break;
-            }
-            queue += cohort.work_slot_seconds;
-            cursor += 1;
-        }
     }
-    area
+    let (released, due) = update_common_boundaries(cohort, now_micros, &mut state);
+    deadline.release(released);
+    deadline.make_due(due);
+    EdfOutcome {
+        shortfall: state.shortfall.max(deadline.shortfall),
+        delay_area,
+        terminal_work: deadline.queue,
+    }
 }
 
-pub(crate) fn has_common_release(cohorts: &[WorkCohort]) -> bool {
-    cohorts.first().is_none_or(|first| {
-        cohorts
-            .iter()
-            .all(|cohort| cohort.release_micros == first.release_micros)
-    })
+fn update_common_boundaries(
+    cohort: CommonCohort,
+    now_micros: u64,
+    state: &mut CommonState,
+) -> (f64, f64) {
+    let mut released = 0.0_f64;
+    let mut due = 0.0_f64;
+    if !state.released && cohort.release_micros <= now_micros {
+        released = cohort.work;
+        state.on_time_work = cohort.work;
+        state.released = true;
+    }
+    if state.released && !state.expired && cohort.deadline_micros <= now_micros {
+        due = cohort.work;
+        if state.on_time_work > 0.0_f64 {
+            state.shortfall = if state.on_time_work > cohort.last_positive_work {
+                1.0_f64
+            } else {
+                state.on_time_work / cohort.last_positive_work
+            };
+        }
+        state.late_work += state.on_time_work;
+        state.on_time_work = 0.0_f64;
+        state.expired = true;
+    }
+    (released, due)
 }
 
-pub(crate) fn shortfall_prepared(
-    cohorts: &[WorkCohort],
-    capacity_slots: f64,
-    scratch: &mut EdfScratch,
-) -> f64 {
+pub(crate) fn required_capacity_prepared(cohorts: &WorkCohorts, scratch: &mut EdfScratch) -> f64 {
     if cohorts.is_empty() {
-        return 0.0;
+        return 0.0_f64;
     }
     assert_eq!(
         cohorts.len(),
         scratch.prepared_len,
         "prepare the EDF order for these cohorts"
     );
-    shortfall_reset(cohorts, scratch);
+    if let Some(common) = scratch.common_cohort {
+        let seconds =
+            Duration::from_micros(common.deadline_micros - common.release_micros).as_secs_f64();
+        return common.work / seconds;
+    }
 
-    let mut release_cursor = 0_usize;
-    let mut now_micros = cohorts[scratch.release_order[0] as usize].release_micros;
-    let mut shortfall_max = 0.0_f64;
-    while release_cursor < cohorts.len() || !scratch.heap.is_empty() {
-        shortfall_release(cohorts, scratch, &mut release_cursor, now_micros);
-        if scratch.heap.is_empty() {
-            now_micros = cohorts[scratch.release_order[release_cursor] as usize].release_micros;
+    // Preemptive EDF is feasible when each release-to-deadline interval has enough
+    // capacity.
+    let mut required = 0.0_f64;
+    for release_position in 0..cohorts.len() {
+        let release = cohorts.release_micros(scratch.release_order[release_position] as usize);
+        if release_position > 0
+            && release
+                == cohorts.release_micros(scratch.release_order[release_position - 1] as usize)
+        {
             continue;
         }
-
-        let deadline_micros = cohorts[scratch.heap[0] as usize].deadline_micros;
-        let release_micros = shortfall_next_release(cohorts, scratch, release_cursor);
-        let next_micros = deadline_micros.min(release_micros);
-        let elapsed_micros = next_micros - now_micros;
-        let elapsed_seconds = Duration::from_micros(elapsed_micros).as_secs_f64();
-        shortfall_serve(cohorts, scratch, capacity_slots * elapsed_seconds);
-        now_micros = next_micros;
-
-        shortfall_max = shortfall_expire(cohorts, scratch, now_micros, shortfall_max);
-    }
-    shortfall_max
-}
-
-pub(crate) fn required_capacity_prepared(cohorts: &[WorkCohort], scratch: &mut EdfScratch) -> f64 {
-    if cohorts.is_empty() {
-        return 0.0_f64;
-    }
-    let mut high = cohorts
-        .iter()
-        .map(|cohort| {
-            let seconds =
-                Duration::from_micros(cohort.deadline_micros - cohort.release_micros).as_secs_f64();
-            cohort.work_slot_seconds / seconds
-        })
-        .sum::<f64>();
-    let mut low = 0.0_f64;
-    for _iteration in 0_u32..48 {
-        let middle = (low + high) * 0.5_f64;
-        if shortfall_prepared(cohorts, middle, scratch) <= f64::EPSILON {
-            high = middle;
-        } else {
-            low = middle;
+        let mut work = 0.0_f64;
+        for &cohort_index in &scratch.deadline_order {
+            let cohort = cohort_index as usize;
+            if cohorts.release_micros(cohort) < release {
+                continue;
+            }
+            work += cohorts.work_slot_seconds(cohort);
+            let interval =
+                Duration::from_micros(cohorts.deadline_micros(cohort) - release).as_secs_f64();
+            required = required.max(work / interval);
         }
     }
-    high
+    required
 }
 
-fn shortfall_reset(cohorts: &[WorkCohort], scratch: &mut EdfScratch) {
+fn shortfall_reset(cohorts: &WorkCohorts, scratch: &mut EdfScratch) {
     assert!(
         cohorts.len() <= scratch.remaining.len(),
         "cohorts must fit the remaining-work scratch"
     );
     scratch.heap.clear();
-    for (index, cohort) in cohorts.iter().enumerate() {
-        scratch.remaining[index] = cohort.work_slot_seconds;
+    for index in 0..cohorts.len() {
+        scratch.remaining[index] = cohorts.work_slot_seconds(index);
     }
 }
 
 fn shortfall_release(
-    cohorts: &[WorkCohort],
+    cohorts: &WorkCohorts,
     scratch: &mut EdfScratch,
     release_cursor: &mut usize,
     now_micros: u64,
-) {
+) -> f64 {
+    let mut released = 0.0_f64;
     while *release_cursor < cohorts.len() {
         let cohort_index = scratch.release_order[*release_cursor];
-        if cohorts[cohort_index as usize].release_micros > now_micros {
+        if cohorts.release_micros(cohort_index as usize) > now_micros {
             break;
         }
         heap_push(cohorts, &mut scratch.heap, cohort_index);
+        released += cohorts.work_slot_seconds(cohort_index as usize);
         *release_cursor += 1;
     }
+    released
 }
 
 fn shortfall_next_release(
-    cohorts: &[WorkCohort],
+    cohorts: &WorkCohorts,
     scratch: &EdfScratch,
     release_cursor: usize,
 ) -> u64 {
     if release_cursor < cohorts.len() {
-        cohorts[scratch.release_order[release_cursor] as usize].release_micros
+        cohorts.release_micros(scratch.release_order[release_cursor] as usize)
     } else {
         u64::MAX
     }
 }
 
-fn shortfall_serve(cohorts: &[WorkCohort], scratch: &mut EdfScratch, mut supply_slot_micros: f64) {
+fn shortfall_serve(cohorts: &WorkCohorts, scratch: &mut EdfScratch, mut supply_slot_micros: f64) {
     while supply_slot_micros > 0.0_f64 && !scratch.heap.is_empty() {
         let cohort_index = scratch.heap[0] as usize;
         let served = supply_slot_micros.min(scratch.remaining[cohort_index]);
         scratch.remaining[cohort_index] -= served;
         supply_slot_micros -= served;
         if scratch.remaining[cohort_index] <= f64::EPSILON {
-            let _removed = heap_pop(cohorts, &mut scratch.heap);
+            heap_pop(cohorts, &mut scratch.heap);
         }
     }
-}
-
-fn shortfall_expire(
-    cohorts: &[WorkCohort],
-    scratch: &mut EdfScratch,
-    now_micros: u64,
-    mut shortfall_max: f64,
-) -> f64 {
-    while !scratch.heap.is_empty() {
-        let cohort_index = scratch.heap[0] as usize;
-        if cohorts[cohort_index].deadline_micros > now_micros {
-            break;
-        }
-        let work = cohorts[cohort_index].work_slot_seconds;
-        if work > 0.0_f64 {
-            shortfall_max = shortfall_max.max(scratch.remaining[cohort_index] / work);
-        }
-        let _removed = heap_pop(cohorts, &mut scratch.heap);
-    }
-    shortfall_max
 }
 
 fn expire_to_debt(
-    cohorts: &[WorkCohort],
+    cohorts: &WorkCohorts,
     scratch: &mut EdfScratch,
     now_micros: u64,
     shortfall: &mut f64,
@@ -1176,21 +1414,21 @@ fn expire_to_debt(
     let mut debt = 0.0_f64;
     while !scratch.heap.is_empty() {
         let cohort_index = scratch.heap[0] as usize;
-        if cohorts[cohort_index].deadline_micros > now_micros {
+        if cohorts.deadline_micros(cohort_index) > now_micros {
             break;
         }
-        let work = cohorts[cohort_index].work_slot_seconds;
+        let work = cohorts.work_slot_seconds(cohort_index);
         let remaining = scratch.remaining[cohort_index];
         if work > 0.0_f64 {
             *shortfall = shortfall.max(remaining / work);
         }
         debt += remaining;
-        let _removed = heap_pop(cohorts, &mut scratch.heap);
+        heap_pop(cohorts, &mut scratch.heap);
     }
     debt
 }
 
-fn heap_push(cohorts: &[WorkCohort], heap: &mut Vec<u32>, cohort_index: u32) {
+fn heap_push(cohorts: &WorkCohorts, heap: &mut Vec<u32>, cohort_index: u32) {
     assert!(
         heap.len() < heap.capacity(),
         "the EDF heap must fit every configured cohort"
@@ -1207,7 +1445,7 @@ fn heap_push(cohorts: &[WorkCohort], heap: &mut Vec<u32>, cohort_index: u32) {
     }
 }
 
-fn heap_pop(cohorts: &[WorkCohort], heap: &mut Vec<u32>) -> u32 {
+fn heap_pop(cohorts: &WorkCohorts, heap: &mut Vec<u32>) -> u32 {
     let root = heap[0];
     let last_index = heap.len() - 1;
     let last = heap[last_index];
@@ -1219,7 +1457,7 @@ fn heap_pop(cohorts: &[WorkCohort], heap: &mut Vec<u32>) -> u32 {
     root
 }
 
-fn heap_sift_down(cohorts: &[WorkCohort], heap: &mut [u32]) {
+fn heap_sift_down(cohorts: &WorkCohorts, heap: &mut [u32]) {
     let mut parent = 0_usize;
     loop {
         let left = parent * 2 + 1;
@@ -1242,7 +1480,15 @@ fn heap_sift_down(cohorts: &[WorkCohort], heap: &mut [u32]) {
     }
 }
 
-fn deadline_key(cohorts: &[WorkCohort], cohort_index: u32) -> (u64, u64, u32) {
-    let cohort = cohorts[cohort_index as usize];
-    (cohort.deadline_micros, cohort.release_micros, cohort_index)
+fn deadline_key(cohorts: &WorkCohorts, cohort_index: u32) -> (u64, u64, u32) {
+    let cohort = cohort_index as usize;
+    (
+        cohorts.deadline_micros(cohort),
+        cohorts.release_micros(cohort),
+        cohort_index,
+    )
+}
+
+fn seconds_to_micros(seconds: f64) -> u64 {
+    (seconds * 1_000_000.0_f64) as u64
 }
