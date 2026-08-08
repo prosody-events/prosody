@@ -1,6 +1,6 @@
 //! One process's peer transport, registration, routing, and shutdown order.
 
-use crate::heartbeat::HeartbeatRegistry;
+use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::FrameCap;
 use crate::response::sender::Then;
@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::select;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep_until};
 use tracing::{error, warn};
 use validator::Validate;
 
@@ -232,40 +232,14 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
             return Err((self, error));
         }
         let ttl = self.directory.ttl();
-        let (stop_refresh, mut stopped) = watch::channel(false);
-        let refresh = tokio::spawn({
-            let directory = self.directory.clone();
-            let registration = self.registration.clone();
-            let heartbeat = self.heartbeats.register("directory refresh");
-            async move {
-                heartbeat.beat();
-                loop {
-                    select! {
-                        () = sleep(refresh_delay(ttl)) => {}
-                        () = heartbeat.next() => {
-                            heartbeat.beat();
-                            continue;
-                        }
-                        outcome = stopped.changed() => {
-                            if outcome.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    // Checked before every write, so a refresh cannot land
-                    // after the shutdown delete and resurrect this node.
-                    if *stopped.borrow() {
-                        break;
-                    }
-                    // A store failure must never end this task: a dead
-                    // refresher makes the node vanish one lease later.
-                    if let Err(error) = directory.register(&registration).await {
-                        warn!(%error, node = %registration.node, "node registration refresh failed");
-                    }
-                    heartbeat.beat();
-                }
-            }
-        });
+        let (stop_refresh, stopped) = watch::channel(false);
+        let refresh = tokio::spawn(refresh_registration(
+            self.directory.clone(),
+            self.registration.clone(),
+            self.heartbeats.register("directory refresh"),
+            ttl,
+            stopped,
+        ));
         Ok(PeerRuntime {
             router: self.router,
             directory: self.directory,
@@ -431,6 +405,44 @@ impl<D: NodeDirectory> PeerRuntime<D> {
             error!(%error, "the peer listener task did not exit cleanly");
         }
         deregistered
+    }
+}
+
+/// Refreshes one registration until shutdown starts.
+async fn refresh_registration<D: NodeDirectory>(
+    directory: D,
+    registration: NodeRegistration,
+    heartbeat: Heartbeat,
+    ttl: RegistrationTtl,
+    mut stopped: watch::Receiver<bool>,
+) {
+    heartbeat.beat();
+    let mut refresh_at = Instant::now() + refresh_delay(ttl);
+    loop {
+        select! {
+            () = sleep_until(refresh_at) => {}
+            () = heartbeat.next() => {
+                heartbeat.beat();
+                continue;
+            }
+            outcome = stopped.changed() => {
+                if outcome.is_err() {
+                    break;
+                }
+            }
+        }
+        // Checked before every write, so a refresh cannot land after the
+        // shutdown delete and resurrect this node.
+        if *stopped.borrow() {
+            break;
+        }
+        // A store failure must never end this task: a dead refresher makes the
+        // node vanish one lease later.
+        if let Err(error) = directory.register(&registration).await {
+            warn!(%error, node = %registration.node, "node registration refresh failed");
+        }
+        heartbeat.beat();
+        refresh_at = Instant::now() + refresh_delay(ttl);
     }
 }
 

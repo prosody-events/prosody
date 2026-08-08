@@ -471,25 +471,24 @@ where
     /// Returns a `HighLevelClientError` if the consumer is not currently
     /// subscribed.
     pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError<WireError<T>>> {
-        let consumer = {
-            let mut guard = self.consumer.lock().await;
-
-            let config = match &*guard {
-                ConsumerState::Configured { .. } => {
-                    return Err(HighLevelClientError::NotSubscribed);
-                }
-                ConsumerState::Running { config, .. } => config.clone(),
-            };
-            match replace(&mut *guard, ConsumerState::Configured { config }) {
-                ConsumerState::Running { consumer, .. } => consumer,
-                ConsumerState::Configured { .. } => {
-                    return Err(HighLevelClientError::NotSubscribed);
-                }
+        let mut guard = self.consumer.lock().await;
+        let config = match &*guard {
+            ConsumerState::Configured { .. } => {
+                return Err(HighLevelClientError::NotSubscribed);
+            }
+            ConsumerState::Running { config, .. } => config.clone(),
+        };
+        let consumer = match replace(&mut *guard, ConsumerState::Configured { config }) {
+            ConsumerState::Running { consumer, .. } => consumer,
+            ConsumerState::Configured { .. } => {
+                return Err(HighLevelClientError::NotSubscribed);
             }
         };
 
         info!("shutting down consumer");
-        consumer.shutdown().await?;
+        let stopped = consumer.shutdown().await;
+        drop(guard);
+        stopped?;
         Ok(())
     }
 

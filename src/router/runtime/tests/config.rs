@@ -2,11 +2,13 @@
 
 use super::super::{
     PeerInputs, PeerRuntimeError, PreparedPeerRuntime, RouterConfiguration, refresh_delay,
+    refresh_registration,
 };
 use super::listener;
 use crate::heartbeat::HeartbeatRegistry;
-use crate::router::directory::RegistrationTtl;
-use crate::router::directory::tests::support::test_directory;
+use crate::router::NodeId;
+use crate::router::directory::tests::support::{registration, test_directory};
+use crate::router::directory::{NodeDirectory, RegistrationTtl};
 use crate::router::fleet::config::FleetConfiguration;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -14,6 +16,9 @@ use color_eyre::Result;
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::yield_now;
+use tokio::time::advance;
 use validator::Validate;
 
 /// The lease the refused runtimes below publish under. Neither reaches a write,
@@ -71,6 +76,35 @@ fn prop_two_lost_refreshes_still_heal_inside_the_lease(seconds: u64) -> TestResu
          the lease is worth"
     );
     TestResult::passed()
+}
+
+/// Heartbeat checks do not postpone the next directory refresh.
+#[tokio::test(start_paused = true)]
+async fn heartbeat_checks_preserve_the_refresh_deadline() -> Result<()> {
+    let directory = test_directory(Duration::from_mins(1))?;
+    let registered = registration(NodeId::new());
+    let (stop, stopped) = watch::channel(false);
+    let refresh = tokio::spawn(refresh_registration(
+        directory.clone(),
+        registered.clone(),
+        HeartbeatRegistry::test().register("directory refresh"),
+        directory.ttl(),
+        stopped,
+    ));
+
+    yield_now().await;
+    advance(Duration::from_secs(10)).await;
+    yield_now().await;
+    advance(Duration::from_secs(10)).await;
+    yield_now().await;
+    assert!(
+        directory.read(registered.node).await?.is_some(),
+        "heartbeat checks postponed the registration refresh"
+    );
+
+    stop.send_replace(true);
+    refresh.await?;
+    Ok(())
 }
 
 /// The configuration refuses the degenerate values its fields can express: a

@@ -50,8 +50,10 @@ impl TryFrom<Duration> for RegistrationTtl {
                 actual: lease,
             });
         }
-        // The check above caps the value at 3600, so the cast cannot truncate.
-        Ok(Self(lease.as_secs() as u16))
+        // Cassandra accepts whole seconds. Round up so the stored lease never
+        // expires before the duration the caller requested.
+        let seconds = lease.as_secs() + u64::from(lease.subsec_nanos() != 0);
+        Ok(Self(seconds as u16))
     }
 }
 

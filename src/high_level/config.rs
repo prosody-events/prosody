@@ -8,6 +8,7 @@
 use crate::PeerConfiguration;
 use crate::Topic;
 use crate::cassandra::{CassandraConfiguration, config::CassandraConfigurationBuilderError};
+use crate::consumer::ConsumerError;
 use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
 use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilderError;
 use crate::consumer::middleware::defer::DeferConfigurationBuilder;
@@ -31,7 +32,6 @@ use crate::consumer::middleware::topic::{
 use crate::consumer::{
     CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
     ConsumerConfigurationBuilderError, KeyedStateConfiguration,
-    KeyedStateConfigurationBuilderError,
 };
 use crate::high_level::mode::Mode;
 use crate::state::descriptor::{Registered, StateDescriptor};
@@ -73,16 +73,15 @@ pub struct ConsumerBuilders {
 impl ConsumerBuilders {
     /// Creates every builder at its default.
     ///
-    /// Construction reads keyed-state environment overrides. An invalid
-    /// override returns an error instead of a default. Therefore, this type
-    /// has no `Default` implementation.
+    /// Construction reads keyed-state and peer environment overrides. An
+    /// invalid override returns an error instead of a default. Therefore, this
+    /// type has no `Default` implementation.
     ///
     /// # Errors
     ///
-    /// [`KeyedStateConfigurationBuilderError`] when a `PROSODY_STATE_*`
-    /// override is set to a value that cannot be parsed. An unset or blank
-    /// variable takes its default and never errors.
-    pub fn new() -> Result<Self, KeyedStateConfigurationBuilderError> {
+    /// Returns [`ConsumerError`] when a `PROSODY_STATE_*` or `PROSODY_PEER_*`
+    /// override cannot be parsed.
+    pub fn new() -> Result<Self, ConsumerError> {
         Ok(Self {
             consumer: ConsumerConfigurationBuilder::default(),
             retry: RetryConfigurationBuilder::default(),
@@ -93,7 +92,7 @@ impl ConsumerBuilders {
             dedup: DeduplicationConfigurationBuilder::default(),
             timeout: TimeoutConfigurationBuilder::default(),
             keyed_state: KeyedStateConfiguration::builder().build()?,
-            peer: PeerConfiguration::default(),
+            peer: PeerConfiguration::builder().build()?,
             emitter: TelemetryEmitterConfiguration::default(),
         })
     }

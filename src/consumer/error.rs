@@ -7,7 +7,7 @@ use crate::consumer::middleware::scheduler::SchedulerInitError;
 use crate::consumer::middleware::timeout::TimeoutInitError;
 use crate::consumer::storage::StoreCreationError;
 use crate::error::ErrorCategory;
-use crate::router::config::PeerConfigurationError;
+use crate::router::config::{PeerConfigurationBuilderError, PeerConfigurationError};
 use crate::router::runtime::PeerRuntimeError;
 use crate::state::config::KeyedStateConfigurationBuilderError;
 use crate::state::registry::RegisterStateError;
@@ -259,6 +259,14 @@ pub enum KeyedStateInitError {
 impl From<KeyedStateConfigurationBuilderError> for ConsumerError {
     fn from(error: KeyedStateConfigurationBuilderError) -> Self {
         Self::KeyedState(KeyedStateInitError::Configuration(error))
+    }
+}
+
+impl From<PeerConfigurationBuilderError> for ConsumerError {
+    fn from(error: PeerConfigurationBuilderError) -> Self {
+        Self::Peer(PeerInitError::Configuration {
+            message: format!("{error:#}"),
+        })
     }
 }
 

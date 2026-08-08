@@ -13,13 +13,17 @@ use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use quick_cache::UnitWeighter;
 use quick_cache::sync::{Cache, DefaultLifecycle};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::time::Instant;
-use tonic::Request;
 use tonic::client::Grpc;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::transport::{Channel, Endpoint as Dialled};
+use tonic::{Code, Request};
 use tracing::{Span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+/// First timeout that Tonic cannot write as an eight-digit gRPC value.
+pub(super) const GRPC_TIMEOUT_LIMIT: Duration = Duration::from_hours(100_000_000);
 
 /// The one method a response travels over.
 ///
@@ -126,10 +130,7 @@ impl ResponseSender for GrpcSender {
         // everything above it — the channel lookup and the readiness wait —
         // spends against the same deadline. Nothing has left this process yet,
         // so no time left is this process's own expiry rather than an answer.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(SendFailure::Expired);
-        }
+        let remaining = outbound_timeout(deadline)?;
         request.set_timeout(remaining);
         // The status is passed through as it arrived.
         match client
@@ -143,6 +144,18 @@ impl ResponseSender for GrpcSender {
             Ok(_) => Ok(()),
             Err(status) => Err(SendFailure::Status(status.code())),
         }
+    }
+}
+
+/// Returns the remaining deadline when Tonic can represent it.
+pub(super) fn outbound_timeout(deadline: Instant) -> Result<Duration, SendFailure> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(SendFailure::Expired)
+    } else if remaining >= GRPC_TIMEOUT_LIMIT {
+        Err(SendFailure::Status(Code::InvalidArgument))
+    } else {
+        Ok(remaining)
     }
 }
 

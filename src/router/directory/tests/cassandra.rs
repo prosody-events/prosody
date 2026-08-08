@@ -163,7 +163,7 @@ fn directory_statements_run_at_local_one() -> Result<()> {
 }
 
 /// A lease exists only inside the range the type publishes, and it carries
-/// exactly what the caller asked for. Outside that range there is no
+/// at least what the caller asked for. Outside that range there is no
 /// [`RegistrationTtl`] at all, so no configuration and no write can hold one.
 ///
 /// The values are fixed rather than generated: both bounds and the default are
@@ -172,16 +172,23 @@ fn directory_statements_run_at_local_one() -> Result<()> {
 #[test]
 fn a_lease_exists_only_inside_its_range() -> Result<()> {
     let second = Duration::from_secs(1);
-    for asked in [
-        RegistrationTtl::MIN,
-        RegistrationTtl::DEFAULT.duration(),
-        RegistrationTtl::MAX,
+    for (asked, stored) in [
+        (RegistrationTtl::MIN, RegistrationTtl::MIN),
+        (
+            RegistrationTtl::MIN + Duration::from_millis(500),
+            RegistrationTtl::MIN + second,
+        ),
+        (
+            RegistrationTtl::DEFAULT.duration(),
+            RegistrationTtl::DEFAULT.duration(),
+        ),
+        (RegistrationTtl::MAX, RegistrationTtl::MAX),
     ] {
         let ttl = RegistrationTtl::try_from(asked)?;
         assert_eq!(
             ttl.duration(),
-            asked,
-            "a lease must publish the requested duration"
+            stored,
+            "a lease must not expire before the requested duration"
         );
     }
     for refused in [

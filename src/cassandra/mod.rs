@@ -84,9 +84,8 @@ pub const TABLE_KEYED_STATE_IDENTITY: &str = "keyed_state_identity";
 /// information: a reader uses them to find the sources it reads from.
 pub const TABLE_KEYED_STATE_PUBLICATION: &str = "keyed_state_publication";
 
-/// Table holding one row per live prosody process: where peers can reach it,
-/// and the consumer group it belongs to, if any. Rows carry a TTL and each
-/// process rewrites its own row inside that TTL.
+/// Table holding one row per live prosody process and its peer endpoints.
+/// Rows carry a TTL. Each process refreshes its own row inside that TTL.
 pub const TABLE_NODE_DIRECTORY: &str = "node_directory";
 
 /// Cassandra's maximum TTL in seconds (~20 years).
