@@ -2,7 +2,7 @@ use super::suite::{
     DirectoryTrace, STABLE_LEASE, expected_answers, first_divergence, run_directory_trace,
     run_idempotent_deregister_case, run_label_bound_case,
 };
-use super::support::{cassandra_directory, finish, registration, store, token};
+use super::support::{cassandra_directory, finish, registration, store};
 use crate::cassandra::TABLE_NODE_DIRECTORY;
 use crate::router::NodeId;
 use crate::router::directory::{NodeDirectory, RegistrationTtl};
@@ -111,32 +111,35 @@ fn registration_cells_carry_a_ttl_and_expire() -> Result<()> {
     })
 }
 
-/// A row that lost its direct endpoint reads as absent, so a caller reports
-/// the node unreachable instead of dialing a partial address. Only a Cassandra
-/// row can be half written, so this case has no memory twin.
+/// An unusable Cassandra row reads as absent.
 #[test]
-fn half_written_row_reads_as_absent() -> Result<()> {
+fn unusable_row_reads_as_absent() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let directory = cassandra_directory(STABLE_LEASE).await?;
-        let node = NodeId::new();
-        store()
-            .await?
-            .session()
-            .query_unpaged(
-                // The seeded row carries a lease of its own, so a row no
-                // production path would write does not outlive the test.
-                format!(
-                    "INSERT INTO {TEST_KEYSPACE}.{TABLE_NODE_DIRECTORY} (node_id, hostname) \
-                     VALUES (?, ?) USING TTL 300"
-                ),
-                (Uuid::from(node), format!("orphan-{}", token())),
-            )
-            .await?;
-        assert!(
-            directory.read(node).await?.is_none(),
-            "a row with no direct endpoint must not resolve"
+        let store = store().await?;
+        let query = format!(
+            "INSERT INTO {TEST_KEYSPACE}.{TABLE_NODE_DIRECTORY} (node_id, direct_host, \
+             direct_port, hostname) VALUES (?, ?, ?, ?) USING TTL 300"
         );
+        for (host, port, reason) in [
+            (None, None, "has no direct endpoint"),
+            (Some("localhost"), Some(0_i32), "uses port zero"),
+            (Some(""), Some(1_i32), "has an empty host"),
+        ] {
+            let node = NodeId::new();
+            store
+                .session()
+                .query_unpaged(
+                    query.as_str(),
+                    (Uuid::from(node), host, port, "invalid-row"),
+                )
+                .await?;
+            assert!(
+                directory.read(node).await?.is_none(),
+                "a row that {reason} must not resolve"
+            );
+        }
         Ok(())
     })
 }

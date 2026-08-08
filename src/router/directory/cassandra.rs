@@ -4,7 +4,7 @@ use super::{Endpoint, NetworkId, NodeDirectory, NodeRegistration, RegistrationTt
 use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraStore, TABLE_NODE_DIRECTORY};
 use crate::cassandra_queries;
-use crate::router::{Host, MAX_LABEL_BYTES, NodeId};
+use crate::router::{Host, NodeId, label_fits};
 use fixedstr::Flexstr;
 use scylla::statement::Consistency;
 use std::sync::Arc;
@@ -145,9 +145,8 @@ impl NodeDirectory for CassandraNodeDirectory {
 
     /// Reads one node's registration.
     ///
-    /// A row that has lost its direct endpoint or its hostname, and a row
-    /// carrying a label over [`MAX_LABEL_BYTES`], read as absent. Both are rows
-    /// that half expired or that something other than this code wrote. The
+    /// A partial row or a row with an invalid label reads as absent. Such a row
+    /// has half expired or comes from another writer. The
     /// caller then reports the node unreachable instead of dialing a partial
     /// address.
     ///
@@ -178,7 +177,7 @@ impl NodeDirectory for CassandraNodeDirectory {
         let bounded = [&direct_host, &advertised_host, &network, &hostname]
             .into_iter()
             .flatten()
-            .all(|label| label.len() <= MAX_LABEL_BYTES);
+            .all(|label| label_fits(label));
         let (true, Some(direct), Some(hostname)) =
             (bounded, endpoint(direct_host, direct_port), hostname)
         else {
@@ -216,7 +215,7 @@ fn endpoint(host: Option<String>, port: Option<i32>) -> Option<Endpoint> {
     let (Some(host), Some(port)) = (host, port) else {
         return None;
     };
-    let Ok(port) = u16::try_from(port) else {
+    let Ok(port @ 1..) = u16::try_from(port) else {
         return None;
     };
     Some(Endpoint {

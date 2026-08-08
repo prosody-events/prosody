@@ -27,6 +27,7 @@ use crate::{Codec, Topic};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::future::Future;
+use std::mem::replace;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::info;
@@ -473,20 +474,16 @@ where
         let consumer = {
             let mut guard = self.consumer.lock().await;
 
-            // Restore `Configured`. Dropping the running consumer removes its
-            // heartbeat registrations from the retained shared registry.
-            match &*guard {
+            let config = match &*guard {
                 ConsumerState::Configured { .. } => {
                     return Err(HighLevelClientError::NotSubscribed);
                 }
-                ConsumerState::Running {
-                    consumer, config, ..
-                } => {
-                    let consumer = consumer.clone();
-                    *guard = ConsumerState::Configured {
-                        config: config.clone(),
-                    };
-                    consumer
+                ConsumerState::Running { config, .. } => config.clone(),
+            };
+            match replace(&mut *guard, ConsumerState::Configured { config }) {
+                ConsumerState::Running { consumer, .. } => consumer,
+                ConsumerState::Configured { .. } => {
+                    return Err(HighLevelClientError::NotSubscribed);
                 }
             }
         };

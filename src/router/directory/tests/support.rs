@@ -190,7 +190,7 @@ pub(crate) fn node_id(g: &mut Gen) -> NodeId {
 pub(crate) fn endpoint(g: &mut Gen) -> Endpoint {
     Endpoint {
         host: Host::make(&label(g)),
-        port: u16::arbitrary(g),
+        port: 1 + u16::arbitrary(g) % u16::MAX,
     }
 }
 
