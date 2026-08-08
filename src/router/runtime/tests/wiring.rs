@@ -231,9 +231,9 @@ async fn sent_on(elsewhere: &Elsewhere, here: &Endpoint) -> Result<()> {
     let receiver = request.receiver()?;
     let fleet = DestinationFleet::new(fleet_config())?;
     let sender = GrpcSender::new(frame_cap()?, &fleet);
-    let mut encoder = FrameEncoder::new(CountingCodec::default(), frame_cap()?);
+    let encoder = FrameEncoder::<CountingCodec>::new(frame_cap()?);
     let addressed = header(elsewhere.node, request.id(), ALPHA)?;
-    let staged = encoder.stage(&addressed, PAYLOAD.to_vec())?;
+    let staged = encoder.stage(&addressed, &PAYLOAD.to_vec())?;
     sender
         .deliver(here, &staged, Instant::now() + HANG_GUARD)
         .await

@@ -105,17 +105,14 @@ impl Harness {
 
     /// Sends `payload` for `index`.
     pub(super) async fn send_payload(&self, index: u8, payload: Vec<u8>) -> Result<()> {
-        let delivered = self
-            .sender
-            .send(
-                FrameHeader {
-                    target: node(index),
-                    ..self.header.clone()
-                },
-                Context::current(),
-                payload,
-            )
-            .await;
+        let prepared = self.sender.prepare(
+            FrameHeader {
+                target: node(index),
+                ..self.header.clone()
+            },
+            &payload,
+        );
+        let delivered = self.sender.send(prepared, Context::current()).await;
         self.outcomes.record(delivered);
         Ok(())
     }
@@ -128,10 +125,9 @@ impl Harness {
             target: node(index),
             ..self.header.clone()
         };
+        let prepared = sender.prepare(header, &PAYLOAD.to_vec());
         tokio::spawn(async move {
-            let delivered = sender
-                .send(header, Context::current(), PAYLOAD.to_vec())
-                .await;
+            let delivered = sender.send(prepared, Context::current()).await;
             outcomes.record(delivered);
             Ok(())
         })
@@ -140,14 +136,18 @@ impl Harness {
     /// Runs one already-expired job without production-only test hooks.
     pub(super) async fn run_expired(&self, index: u8) -> Result<()> {
         let target = node(index);
-        let delivered = deliver_response(
-            &self.router,
-            FrameEncoder::new(CountingCodec::default(), FrameCap::new(CAP_BYTES)?),
+        let encoder = FrameEncoder::<CountingCodec>::new(FrameCap::new(CAP_BYTES)?);
+        let prepared = super::route::stage(
+            &encoder,
             FrameHeader {
                 target,
                 ..self.header.clone()
             },
-            PAYLOAD.to_vec(),
+            &PAYLOAD.to_vec(),
+        );
+        let delivered = deliver_response(
+            &self.router,
+            prepared,
             Context::current(),
             &self.sender.fleet.destination(target),
             Instant::now(),

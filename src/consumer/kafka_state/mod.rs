@@ -71,6 +71,7 @@ impl<P> From<&ConsumerMessage<P>> for MessageRef {
 ///
 /// Codec id `"message-ref"` is frozen into the durable structural
 /// identity; never change it once cells exist.
+/// `MessagePack` borrows values and input bytes. Ownership adds no faster path.
 #[derive(Default)]
 pub struct MessageRefCodec;
 
@@ -84,8 +85,13 @@ impl Codec for MessageRefCodec {
         rmp_serde::from_slice(buf).map_err(MessageRefCodecError::Decode)
     }
 
-    fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
-        write_named(buf, &payload).map_err(MessageRefCodecError::Encode)
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        // MessagePack reads the value by reference, so no payload copy is needed.
+        write_named(buf, payload).map_err(MessageRefCodecError::Encode)
     }
 
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {

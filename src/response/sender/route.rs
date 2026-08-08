@@ -26,14 +26,12 @@ const FALLBACK_DIVISOR: u32 = 4;
 /// One response route in a statically composed route chain.
 pub trait ResponseRoute: Clone + Send + Sync + 'static {
     /// Tries this route. `Declined` lets the next route try the same frame.
-    fn deliver<C: Codec>(
+    fn deliver(
         &self,
-        encoder: &mut FrameEncoder<C>,
-        header: &FrameHeader,
-        payload: C::Payload,
+        frame: Staged,
         destination: &Destination,
         expires_at: Instant,
-    ) -> impl Future<Output = Result<RouteOutcome<C::Payload>, DropReason>> + Send;
+    ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send;
 }
 
 /// Two routes evaluated in order.
@@ -94,15 +92,14 @@ impl Share {
 /// It is a child of the trace the job carries, so the listener's
 /// `peer.response.receive` — parented on the context this span's own injection
 /// writes — lands under the call that asked for the response.
-pub(super) async fn deliver_response<C: Codec, R: ResponseRoute>(
+pub(super) async fn deliver_response<R: ResponseRoute>(
     router: &R,
-    mut encoder: FrameEncoder<C>,
-    header: FrameHeader,
-    payload: C::Payload,
+    prepared: PreparedResponse,
     trace: Context,
     destination: &Destination,
     expires_at: Instant,
 ) -> bool {
+    let header = prepared.header();
     let span = debug_span!(
         "peer.response.send",
         otel.kind = "client",
@@ -116,19 +113,14 @@ pub(super) async fn deliver_response<C: Codec, R: ResponseRoute>(
     // One deadline over the whole pipeline — the pacing wait, the address
     // read, the encode and every attempt — so a transport that never
     // answers still ends the delivery.
-    let outcome = select! {
-        biased;
-        () = sleep_until(expires_at) => Err(DropReason::Deadline),
-        outcome = deliver_route(
-            &mut encoder,
-            destination,
-            router,
-            header,
-            payload,
-            expires_at,
-        ).instrument(span.clone()) => {
-            outcome
-        }
+    let outcome = match prepared {
+        PreparedResponse::Ready(frame) => select! {
+            biased;
+            () = sleep_until(expires_at) => Err(DropReason::Deadline),
+            outcome = deliver_route(destination, router, frame, expires_at)
+                .instrument(span.clone()) => outcome,
+        },
+        PreparedResponse::Rejected(_, reason) => Err(reason),
     };
     // Recorded through the owned handle rather than the current span: a
     // level-disabled span never becomes current, and the deadline arm has
@@ -155,7 +147,6 @@ pub(super) async fn deliver_response<C: Codec, R: ResponseRoute>(
             reason.record();
         }
     }
-    encoder.release();
     delivered
 }
 
@@ -170,37 +161,29 @@ pub(super) async fn deliver_response<C: Codec, R: ResponseRoute>(
 /// The *time* budget is split the same way, and for the same reason. [`Share`]
 /// owns how much of it one endpoint may spend, and the endpoint this
 /// destination remembers is the one that gets the larger part.
-async fn deliver_route<C: Codec, R: ResponseRoute>(
-    encoder: &mut FrameEncoder<C>,
+async fn deliver_route<R: ResponseRoute>(
     destination: &Destination,
     router: &R,
-    header: FrameHeader,
-    payload: C::Payload,
+    frame: Staged,
     expires_at: Instant,
 ) -> Result<Delivery, DropReason> {
-    match router
-        .deliver(encoder, &header, payload, destination, expires_at)
-        .await?
-    {
+    match router.deliver(frame, destination, expires_at).await? {
         RouteOutcome::Delivered(delivery) => Ok(delivery),
         RouteOutcome::Declined(_) => Err(DropReason::UnresolvableNode),
     }
 }
 
 impl ResponseRoute for LocalTarget {
-    async fn deliver<C: Codec>(
+    async fn deliver(
         &self,
-        encoder: &mut FrameEncoder<C>,
-        header: &FrameHeader,
-        payload: C::Payload,
+        frame: Staged,
         _destination: &Destination,
         _expires_at: Instant,
-    ) -> Result<RouteOutcome<C::Payload>, DropReason> {
-        if !self.owns(header.target) {
-            return Ok(RouteOutcome::Declined(payload));
+    ) -> Result<RouteOutcome, DropReason> {
+        if !self.owns(frame.target()) {
+            return Ok(RouteOutcome::Declined(frame));
         }
-        let staged = stage(encoder, header, payload)?;
-        let disposition = self.accept(staged.local_frame());
+        let disposition = self.accept(frame.into_local_frame());
         disposition.record();
         if disposition == ResponseDisposition::Accepted {
             Ok(RouteOutcome::Delivered(Delivery::Local))
@@ -211,27 +194,24 @@ impl ResponseRoute for LocalTarget {
 }
 
 impl<R: Router> ResponseRoute for R {
-    async fn deliver<C: Codec>(
+    async fn deliver(
         &self,
-        encoder: &mut FrameEncoder<C>,
-        header: &FrameHeader,
-        payload: C::Payload,
+        frame: Staged,
         destination: &Destination,
         expires_at: Instant,
-    ) -> Result<RouteOutcome<C::Payload>, DropReason> {
-        let target = header.target;
+    ) -> Result<RouteOutcome, DropReason> {
+        let target = frame.target();
         // No address originates anywhere but a registration: a node the directory
         // does not hold is not dialed at all, and a node the rules refuse to reach
         // from here is not dialed either.
         let route = match self.route(target).await {
             Ok(Some(route)) => route,
-            Ok(None) => return Ok(RouteOutcome::Declined(payload)),
+            Ok(None) => return Ok(RouteOutcome::Declined(frame)),
             Err(error) => {
                 warn!(%error, node = %target, "peer route lookup failed");
                 return Err(DropReason::LookupFailed);
             }
         };
-        let staged = stage(encoder, header, payload)?;
         let mut remembered = None;
         let mut last_failure = None;
         // The candidate that failed the turn before this one. Inside the loop it
@@ -250,7 +230,7 @@ impl<R: Router> ResponseRoute for R {
             } else {
                 Share::Probe
             };
-            match deliver(self.sender(), address, &staged, expires_at, share).await {
+            match deliver(self.sender(), address, &frame, expires_at, share).await {
                 Ok(()) => {
                     destination.prefer(Some(preference));
                     return Ok(RouteOutcome::Delivered(Delivery::Remote {
@@ -290,24 +270,14 @@ impl<R: Router> ResponseRoute for R {
 }
 
 impl<A: ResponseRoute, B: ResponseRoute> ResponseRoute for Then<A, B> {
-    async fn deliver<C: Codec>(
+    async fn deliver(
         &self,
-        encoder: &mut FrameEncoder<C>,
-        header: &FrameHeader,
-        payload: C::Payload,
+        frame: Staged,
         destination: &Destination,
         expires_at: Instant,
-    ) -> Result<RouteOutcome<C::Payload>, DropReason> {
-        match self
-            .0
-            .deliver(encoder, header, payload, destination, expires_at)
-            .await?
-        {
-            RouteOutcome::Declined(payload) => {
-                self.1
-                    .deliver(encoder, header, payload, destination, expires_at)
-                    .await
-            }
+    ) -> Result<RouteOutcome, DropReason> {
+        match self.0.deliver(frame, destination, expires_at).await? {
+            RouteOutcome::Declined(frame) => self.1.deliver(frame, destination, expires_at).await,
             delivered @ RouteOutcome::Delivered(_) => Ok(delivered),
         }
     }
@@ -325,25 +295,40 @@ pub enum Delivery {
 }
 
 /// Whether one route accepted a frame or left it for the next route.
-pub enum RouteOutcome<P> {
-    Declined(P),
+pub enum RouteOutcome {
+    Declined(Staged),
     Delivered(Delivery),
 }
 
+/// One encoded response, or the bounded reason encoding refused it.
+pub(crate) enum PreparedResponse {
+    Ready(Staged),
+    Rejected(FrameHeader, DropReason),
+}
+
+impl PreparedResponse {
+    pub(crate) fn header(&self) -> &FrameHeader {
+        match self {
+            Self::Ready(frame) => frame.header(),
+            Self::Rejected(header, _) => header,
+        }
+    }
+}
+
 /// Encodes one payload and records the common frame stage.
-fn stage<'a, C: Codec>(
-    encoder: &'a mut FrameEncoder<C>,
-    header: &'a FrameHeader,
-    payload: C::Payload,
-) -> Result<Staged<'a>, DropReason> {
-    match encoder.stage(header, payload) {
+pub(super) fn stage<C: Codec>(
+    encoder: &FrameEncoder<C>,
+    header: FrameHeader,
+    payload: &C::Payload,
+) -> PreparedResponse {
+    match encoder.stage(&header, payload) {
         Ok(staged) => {
             Stage::Framed.record();
-            Ok(staged)
+            PreparedResponse::Ready(staged)
         }
         Err(error) => {
             warn!(%error, node = %header.target, "response could not be framed");
-            Err(DropReason::EncodeFailed)
+            PreparedResponse::Rejected(header, DropReason::EncodeFailed)
         }
     }
 }

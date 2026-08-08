@@ -36,7 +36,7 @@ fn a_response_reaches_the_wire_intact() -> Result<()> {
             "the frame must name its target node"
         );
         assert_eq!(
-            CountingCodec::default().deserialize(&mut frame.payload)?,
+            CountingCodec.deserialize(&mut frame.payload)?,
             PAYLOAD,
             "the frame must carry the sent response"
         );

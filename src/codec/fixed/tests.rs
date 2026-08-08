@@ -2,6 +2,7 @@
 //! bytes, and the wire-form length check.
 
 use super::*;
+use bytes::BytesMut;
 use quickcheck::{QuickCheck, TestResult};
 
 #[test]
@@ -64,7 +65,13 @@ fn prop_i64_pair_round_trip_and_length_reject() {
         if let Err(error) = codec.serialize((first, second), &mut buf) {
             return TestResult::error(format!("serialize failed: {error}"));
         }
-        let round_trips = codec.deserialize(&mut buf.clone()) == Ok((first, second));
+        let mut borrowed = Vec::new();
+        if let Err(error) = codec.serialize_ref(&(first, second), &mut borrowed) {
+            return TestResult::error(format!("borrowed serialize failed: {error}"));
+        }
+        let round_trips = borrowed == buf
+            && codec.deserialize(&mut buf.clone()) == Ok((first, second))
+            && codec.deserialize_owned(BytesMut::from(buf.as_slice())) == Ok((first, second));
         let short = matches!(
             codec.deserialize(&mut buf[..15].to_vec()),
             Err(PairCodecError::Length {

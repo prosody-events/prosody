@@ -69,7 +69,7 @@ where
         .collect())
 }
 
-fn decode<R, V, E>(mut frame: ResponseFrame) -> Outcome<V, E>
+fn decode<R, V, E>(frame: ResponseFrame) -> Outcome<V, E>
 where
     R: Codec<Payload = Result<V, E>>,
     E: ClassifyError,
@@ -77,7 +77,7 @@ where
     if frame.format.to_str() != R::FORMAT_ID {
         return Outcome::Failed(ResponseFailure::FormatMismatch);
     }
-    R::with_cached_local(|codec| match codec.deserialize(&mut frame.payload) {
+    R::with_cached_local(|codec| match codec.deserialize_owned(frame.payload) {
         Ok(Ok(value)) if frame.header.status == ResponseStatus::Success => Outcome::Ok(value),
         Ok(Err(error)) => match frame.header.status {
             ResponseStatus::Error(category) if category == error.classify_error() => {

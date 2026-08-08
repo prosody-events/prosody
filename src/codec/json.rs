@@ -12,6 +12,8 @@ use crate::{EventIdentity, EventType};
 /// On non-ARM targets `simd_json` parses **in place**, overwriting the input
 /// buffer with tape data; the bytes passed to `deserialize` are unspecified
 /// after the call returns.
+/// Both serializers borrow the JSON tree because the writer does not consume
+/// it. Both decoders mutate input for `simd_json` and reuse its cached buffers.
 #[derive(Default)]
 pub struct JsonCodec {
     #[cfg(not(target_arch = "arm"))]
@@ -35,8 +37,13 @@ impl Codec for JsonCodec {
         }
     }
 
-    fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
-        write_json(&payload, buf)
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        // The serializer reads JSON by reference, so no payload copy is needed.
+        write_json(payload, buf)
     }
 
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {

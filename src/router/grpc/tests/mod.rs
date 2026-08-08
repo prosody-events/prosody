@@ -144,8 +144,8 @@ impl Harness {
         header: &FrameHeader,
         payload: Vec<u8>,
     ) -> Result<Code> {
-        let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
-        let staged = encoder.stage(header, payload)?;
+        let encoder = FrameEncoder::<CountingCodec>::new(cap);
+        let staged = encoder.stage(header, &payload)?;
         status(
             sender
                 .deliver(&self.address, &staged, Instant::now() + BUDGET)

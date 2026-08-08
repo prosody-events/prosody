@@ -54,13 +54,9 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         let caller = info_span!("peer.test.call");
         let trace = caller.context();
         let caller_span = trace.span().span_context().clone();
-        let delivered = sender
-            .send(
-                header(harness.node, request.id(), ALPHA)?,
-                trace,
-                PAYLOAD.to_vec(),
-            )
-            .await;
+        let payload = PAYLOAD.to_vec();
+        let prepared = sender.prepare(header(harness.node, request.id(), ALPHA)?, &payload);
+        let delivered = sender.send(prepared, trace).await;
         drop(caller);
         drop(sender);
         ensure!(

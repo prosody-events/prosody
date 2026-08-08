@@ -315,8 +315,16 @@ impl Codec for CartCodec {
         serde_json::from_slice(buf).map_err(JsonCodecError::Serde)
     }
 
+    fn deserialize_owned(&mut self, buf: bytes::BytesMut) -> Result<Cart, JsonCodecError> {
+        serde_json::from_slice(&buf).map_err(JsonCodecError::Serde)
+    }
+
     fn serialize(&mut self, payload: Cart, buf: &mut Vec<u8>) -> Result<(), JsonCodecError> {
         serde_json::to_writer(buf, &payload).map_err(JsonCodecError::Serde)
+    }
+
+    fn serialize_ref(&mut self, payload: &Cart, buf: &mut Vec<u8>) -> Result<(), JsonCodecError> {
+        serde_json::to_writer(buf, payload).map_err(JsonCodecError::Serde)
     }
 
     fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {

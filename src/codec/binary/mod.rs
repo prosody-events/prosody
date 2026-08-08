@@ -1,6 +1,7 @@
 //! Binary codec that copies bytes verbatim and uses a caller-supplied
 //! function to extract event metadata (id and type).
 
+use bytes::BytesMut;
 use serde::Deserialize;
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_slice_with_buffers;
@@ -128,7 +129,9 @@ impl BinaryFormat for JsonFormat {
 /// on the (now scratch) input to pull out the event id and type. The codec
 /// owns one extractor instance for its lifetime, so any state the extractor
 /// keeps (parser buffers, lookup tables) is reused across calls. On
-/// `serialize`, the stored bytes are appended to the output buffer.
+/// Owned serialization moves the byte vector into an empty output buffer.
+/// Borrowed serialization copies bytes because the payload must retain them.
+/// Both decode forms preserve wire bytes before a mutable extractor runs.
 pub struct BinaryCodec<E: BinaryExtractor, F: BinaryFormat> {
     extractor: E,
     _format: PhantomData<fn() -> F>,
@@ -159,6 +162,17 @@ impl<E: BinaryExtractor, F: BinaryFormat> Codec for BinaryCodec<E, F> {
         })
     }
 
+    fn deserialize_owned(&mut self, mut buf: BytesMut) -> Result<Self::Payload, Self::Error> {
+        // Preserve the original wire bytes because an extractor can mutate its input.
+        let bytes = buf.to_vec();
+        let metadata = self.extractor.extract(&mut buf)?;
+        Ok(BinaryPayload {
+            bytes,
+            event_id: metadata.event_id.map(Into::into),
+            event_type: metadata.event_type.map(Into::into),
+        })
+    }
+
     fn serialize(
         &mut self,
         mut payload: Self::Payload,
@@ -169,6 +183,16 @@ impl<E: BinaryExtractor, F: BinaryFormat> Codec for BinaryCodec<E, F> {
         } else {
             buf.append(&mut payload.bytes);
         }
+        Ok(())
+    }
+
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        // A borrow requires one copy because the payload must retain its bytes.
+        buf.extend_from_slice(&payload.bytes);
         Ok(())
     }
 

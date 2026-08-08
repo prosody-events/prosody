@@ -7,6 +7,7 @@ use crate::producer::ProducerConfiguration;
 use crate::telemetry::Telemetry;
 use parking_lot::Mutex;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+use std::mem::{replace, take};
 use std::sync::Arc;
 
 // === Error Classification Tests ===
@@ -60,7 +61,7 @@ fn dlq_send_failed_classifies_by_producer_error() {
 // `Result<inner::Output, inner::Error>` to the inner handler.
 
 /// Records the inner-result a probe handler observes in each apply hook.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum InnerHookEvent {
     Commit(Result<u64, TestError>),
     Abort(Result<u64, TestError>),
@@ -117,7 +118,7 @@ impl FallibleHandler for Probe {
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        self.timer_result.lock().clone()
+        replace(&mut *self.timer_result.lock(), Ok(0))
     }
 
     async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
@@ -256,7 +257,7 @@ async fn apply_hook_routing_matrix() -> color_eyre::Result<()> {
             Hook::Abort => handler.after_abort(MockEventContext::new(), result).await,
         }
 
-        let events = log.lock().clone();
+        let events = take(&mut *log.lock());
         assert_eq!(
             events.len(),
             1,

@@ -40,10 +40,10 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
             let awaited = [SubsystemName::try_new(ALPHA)?];
             let request = TestRegistration::new(&shared.pending, &awaited, TIMEOUT)?;
             let transport = GrpcSender::new(frame_cap()?, &shared.fleet);
-            let mut encoder = FrameEncoder::new(CountingCodec::default(), frame_cap()?);
+            let encoder = FrameEncoder::<CountingCodec>::new(frame_cap()?);
 
             let addressed_here = header(shared.node, request.id(), ALPHA)?;
-            let mine = encoder.stage(&addressed_here, PAYLOAD.to_vec())?;
+            let mine = encoder.stage(&addressed_here, &PAYLOAD.to_vec())?;
             transport
                 .deliver(&shared.listener, &mine, Instant::now() + HANG_GUARD)
                 .await
@@ -51,7 +51,7 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
                     eyre!("the listener refused a frame for its own node: {failure}")
                 })?;
             let addressed_elsewhere = header(NodeId::new(), request.id(), ALPHA)?;
-            let foreign = encoder.stage(&addressed_elsewhere, PAYLOAD.to_vec())?;
+            let foreign = encoder.stage(&addressed_elsewhere, &PAYLOAD.to_vec())?;
             ensure!(
                 matches!(
                     transport
@@ -120,12 +120,9 @@ async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
     let subsystem = SubsystemName::try_new(ALPHA)?;
     let mut request = TestRegistration::new(&shared.pending, from_ref(&subsystem), TIMEOUT)?;
     let receiver = request.receiver()?;
-    own.send(
-        header(shared.node, request.id(), ALPHA)?,
-        Context::current(),
-        PAYLOAD.to_vec(),
-    )
-    .await;
+    let payload = PAYLOAD.to_vec();
+    let prepared = own.prepare(header(shared.node, request.id(), ALPHA)?, &payload);
+    own.send(prepared, Context::current()).await;
 
     let stored = receiver
         .await

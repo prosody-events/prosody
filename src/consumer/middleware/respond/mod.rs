@@ -101,8 +101,8 @@ pub(crate) struct Responded<T> {
 
 /// Wraps one handler and moves its final message result to a responder.
 ///
-/// Response-capable handlers clone each final result once. The response owns
-/// one copy, and the handler's apply hook owns the other copy.
+/// Response encoding borrows the final result before the apply hook consumes
+/// it.
 pub(crate) struct RespondHandler<H, C: Codec, R: ResponseRoute> {
     handler: H,
     responder: Arc<Responder<C, R>>,
@@ -157,8 +157,8 @@ impl<E: ClassifyError> ClassifyError for Responded<E> {
 impl<H, C, R> FallibleHandler for RespondHandler<H, C, R>
 where
     H: FallibleHandler,
-    H::Output: Clone + Sync + 'static,
-    H::Error: Clone + Sync + 'static,
+    H::Output: Sync + 'static,
+    H::Error: Sync + 'static,
     C: Codec<Payload = Result<H::Output, H::Error>>,
     R: ResponseRoute,
 {
@@ -229,10 +229,10 @@ where
         let Some(Answering { tag, trace }) = meta else {
             return self.handler.after_commit(context, result).await;
         };
-        let response = result.clone();
-        let header = tag.header(self.responder.subsystem().clone(), status(&response));
+        let header = tag.header(self.responder.subsystem().clone(), status(&result));
+        let response = self.responder.sender.prepare(header, &result);
         self.handler.after_commit(context, result).await;
-        self.responder.sender.send(header, trace, response).await;
+        self.responder.sender.send(response, trace).await;
     }
 
     /// Forwards a non-final invocation's result to the inner hook.
@@ -259,8 +259,8 @@ where
 impl<H, C, R> SettlementHandler for RespondHandler<H, C, R>
 where
     H: SettlementHandler,
-    H::Output: Clone + Sync + 'static,
-    H::Error: Clone + Sync + 'static,
+    H::Output: Sync + 'static,
+    H::Error: Sync + 'static,
     C: Codec<Payload = Result<H::Output, H::Error>>,
     R: ResponseRoute,
 {
@@ -299,8 +299,8 @@ pub(crate) fn responding_provider<M, H, C, R>(
 where
     M: HandlerMiddleware<H::Payload>,
     H: FallibleHandler + Clone + Send + Sync + 'static,
-    H::Output: Clone + Sync + 'static,
-    H::Error: Clone + Sync + 'static,
+    H::Output: Sync + 'static,
+    H::Error: Sync + 'static,
     C: Codec<Payload = Result<H::Output, H::Error>>,
     R: ResponseRoute,
 {

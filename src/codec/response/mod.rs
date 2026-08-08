@@ -2,6 +2,7 @@
 
 use super::Codec;
 use super::const_id::ConstId;
+use bytes::BytesMut;
 use std::error::Error as StdError;
 use thiserror::Error;
 
@@ -23,6 +24,10 @@ const ERR_TAG: u8 = 1;
 /// representation: a one-byte discriminant — `0x00` for `Ok`, `0x01` for `Err`
 /// — followed by that arm's codec bytes. An application that wants a different
 /// framing supplies its own codec over the whole `Result` instead.
+///
+/// Owned serialization transfers the selected arm to its codec. Borrowed
+/// serialization preserves the result for an apply hook. Owned decoding splits
+/// the frame without copying and transfers the selected arm buffer.
 ///
 /// The discriminant leads rather than trails. A trailing byte would leave the
 /// buffer empty for the arm's codec and so preserve [`BinaryCodec`]'s
@@ -73,6 +78,24 @@ impl<O: Codec, E: Codec> Codec for ResultCodec<O, E> {
         }
     }
 
+    fn deserialize_owned(&mut self, mut buf: BytesMut) -> Result<Self::Payload, Self::Error> {
+        let tag = buf.first().copied().ok_or(ResultCodecError::Empty)?;
+        let rest = buf.split_off(1);
+        match tag {
+            OK_TAG => self
+                .output
+                .deserialize_owned(rest)
+                .map(Ok)
+                .map_err(ResultCodecError::Output),
+            ERR_TAG => self
+                .error
+                .deserialize_owned(rest)
+                .map(Err)
+                .map_err(ResultCodecError::Error),
+            other => Err(ResultCodecError::UnknownDiscriminant(other)),
+        }
+    }
+
     fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
         match payload {
             Ok(value) => {
@@ -85,6 +108,28 @@ impl<O: Codec, E: Codec> Codec for ResultCodec<O, E> {
                 buf.push(ERR_TAG);
                 self.error
                     .serialize(error, buf)
+                    .map_err(ResultCodecError::Error)
+            }
+        }
+    }
+
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        // Borrowed arm encoding lets apply hooks retain the original result.
+        match payload {
+            Ok(value) => {
+                buf.push(OK_TAG);
+                self.output
+                    .serialize_ref(value, buf)
+                    .map_err(ResultCodecError::Output)
+            }
+            Err(error) => {
+                buf.push(ERR_TAG);
+                self.error
+                    .serialize_ref(error, buf)
                     .map_err(ResultCodecError::Error)
             }
         }

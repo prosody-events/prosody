@@ -1,5 +1,9 @@
-use super::{CountingCodec, RAW_ID, RELAY_FIELD_BYTES, expected_frame_len, header};
+use super::{
+    CountingCodec, RELAY_FIELD_BYTES, cache_uses_on_this_thread, header,
+    serialize_capacity_on_this_thread,
+};
 use crate::Codec;
+use crate::codec::SerializeBufGuard;
 use crate::error::ErrorCategory;
 use crate::response::frame::FrameCap;
 use crate::response::frame::decode::decode_frame;
@@ -45,7 +49,15 @@ impl Codec for WidestHeaderCodec {
         Ok(())
     }
 
+    fn deserialize_owned(&mut self, _buf: BytesMut) -> Result<(), Infallible> {
+        Ok(())
+    }
+
     fn serialize(&mut self, (): (), _buf: &mut Vec<u8>) -> Result<(), Infallible> {
+        Ok(())
+    }
+
+    fn serialize_ref(&mut self, (): &(), _buf: &mut Vec<u8>) -> Result<(), Infallible> {
         Ok(())
     }
 }
@@ -57,8 +69,8 @@ fn the_minimum_cap_carries_the_widest_legal_header() -> Result<()> {
     let cap = FrameCap::new(FrameCap::MIN_BYTES)?;
     let subsystem = "s".repeat(SubsystemName::MAX_BYTES);
     let header = header(&subsystem, ResponseStatus::Success, None)?;
-    let mut encoder = FrameEncoder::new(WidestHeaderCodec, cap);
-    let staged = encoder.stage(&header, ())?;
+    let encoder = FrameEncoder::<WidestHeaderCodec>::new(cap);
+    let staged = encoder.stage(&header, &())?;
     assert_eq!(staged.bytes() + RELAY_FIELD_BYTES, cap.bytes());
     Ok(())
 }
@@ -82,134 +94,22 @@ const FROZEN: [u8; 65] = [
 /// test holds this to the key that precedes it.
 const FROZEN_STATUS: usize = 60;
 
-/// The encoder never reserves: over a run of encodes up to the configured
-/// maximum, a destination buffer sized at the cap never grows, the payload is
-/// serialized exactly once per response, and the frame is exactly as long as
-/// the staging said it would be. The ceiling covers the frame's forwarded form,
-/// so the largest accepted payload leaves room for one relay id. After every
-/// accepted response the encoder is left holding a scratch the size of the one
-/// it started with — even after a response big enough to have grown it — or,
-/// for a codec that moves its own buffer into the empty scratch, exactly that
-/// buffer, at whatever capacity it came with.
-///
-/// Both codec shapes run and every payload is handed over with slack past the
-/// cap, because the copy shape alone — or a buffer whose capacity is only its
-/// length — leaves half of [`Codec::serialize`]'s contract untested.
-#[quickcheck]
-fn steady_state_encodes_never_reallocate(lengths: Vec<u16>, relay: bool) -> TestResult {
-    let lengths: Vec<usize> = lengths.into_iter().map(usize::from).collect();
-    for codec in [CountingCodec::default(), CountingCodec::moving()] {
-        let outcome = encodes_without_reserving(&codec, &lengths, relay);
-        if outcome.is_failure() || outcome.is_error() {
-            return outcome;
-        }
-    }
-    TestResult::passed()
-}
+/// Response encoding uses the codec cache and the shared serialize buffer.
+#[test]
+fn response_encoding_uses_standard_codec_resources() -> Result<()> {
+    const SEEDED: usize = 4096;
+    let mut shared = SerializeBufGuard::acquire();
+    shared.reserve(SEEDED);
+    drop(shared);
 
-fn encodes_without_reserving(codec: &CountingCodec, lengths: &[usize], relay: bool) -> TestResult {
-    let Ok(cap) = FrameCap::new(64 * 1024) else {
-        return TestResult::error("64 KiB is a supported cap");
-    };
-    let mut encoder = FrameEncoder::new(codec.clone(), cap);
-    let mut dst = BytesMut::with_capacity(cap.bytes());
-    let scratch_capacity = encoder.scratch_capacity();
-    let dst_capacity = dst.capacity();
-    let subsystem = "billing";
-    let Ok(header) = header(
-        subsystem,
-        ResponseStatus::Error(ErrorCategory::Transient),
-        relay.then(|| NodeId::from_bytes(RAW_ID)),
-    ) else {
-        return TestResult::error("the fixture subsystem is a legal name");
-    };
+    let before = cache_uses_on_this_thread();
+    let encoder = FrameEncoder::<CountingCodec>::new(FrameCap::new(1024)?);
+    let payload = b"hi".to_vec();
+    drop(encoder.stage(&header("billing", ResponseStatus::Success, None)?, &payload)?);
 
-    // The boundary lengths lead every run, so the largest frame the cap admits
-    // — and the first one it refuses — are exercised whatever quickcheck
-    // generated. The first is large enough to grow the scratch, so the run
-    // covers giving that memory back. The largest is found through the model
-    // rather than restated as a literal, so a change to the header cannot
-    // silently move it.
-    let Some(largest) = (0..=cap.bytes()).rev().find(|&length| {
-        expected_frame_len(subsystem, length, relay) + RELAY_FIELD_BYTES <= cap.bytes()
-    }) else {
-        return TestResult::error("the cap admits some payload");
-    };
-    let boundaries = [
-        cap.bytes() * 2,
-        cap.bytes(),
-        largest + 1,
-        largest,
-        largest - 1,
-    ];
-    for length in boundaries.into_iter().chain(lengths.iter().copied()) {
-        let payload: Vec<u8> = (0..length).map(|index| index as u8).collect();
-        // Slack past the cap, because a payload buffer's capacity is the
-        // application's business and only its length faces the cap: what a
-        // moving codec hands the encoder can be far larger than any frame.
-        let mut handed = Vec::with_capacity(length + cap.bytes());
-        handed.extend_from_slice(&payload);
-        let expected_scratch = codec.expected_scratch(handed.capacity(), scratch_capacity);
-        let serializes = codec.serializes();
-        dst.clear();
-
-        match encoder.stage(&header, handed) {
-            Err(EncodeError::TooLarge { bytes, limit }) => {
-                assert!(
-                    bytes > limit as u64,
-                    "a refusal must name a length over the cap, got {bytes} against {limit}"
-                );
-            }
-            Err(other) => return TestResult::error(format!("unexpected refusal: {other}")),
-            Ok(staged) => {
-                staged.write(&mut dst);
-                assert_eq!(
-                    dst.len(),
-                    staged.bytes(),
-                    "the staged length must be exactly what the frame writes"
-                );
-                assert_eq!(
-                    dst.len(),
-                    expected_frame_len(subsystem, length, relay),
-                    "the frame must cost exactly the fields it carries"
-                );
-                assert!(
-                    dst.len() <= cap.bytes(),
-                    "an accepted frame must fit the cap: {} over {}",
-                    dst.len(),
-                    cap.bytes()
-                );
-                let tail = if relay { RELAY_FIELD_BYTES } else { 0 };
-                assert_eq!(
-                    &dst[dst.len() - tail - length..dst.len() - tail],
-                    &payload[..],
-                    "the payload must be framed verbatim"
-                );
-                // A refused response grows the scratch and a moving codec
-                // replaces it outright, but `stage` shrinks it back toward the
-                // cap before the next response, so the encoder is left holding
-                // exactly the buffer its codec's shape implies and never one it
-                // had to reserve.
-                assert_eq!(
-                    encoder.scratch_capacity(),
-                    expected_scratch,
-                    "the encoder reserved a scratch instead of reusing one"
-                );
-            }
-        }
-
-        assert_eq!(
-            codec.serializes(),
-            serializes + 1,
-            "each response must be serialized exactly once"
-        );
-        assert_eq!(
-            dst.capacity(),
-            dst_capacity,
-            "a destination sized at the cap must never reallocate"
-        );
-    }
-    TestResult::passed()
+    assert_eq!(cache_uses_on_this_thread(), before + 1);
+    assert!(serialize_capacity_on_this_thread() >= SEEDED);
+    Ok(())
 }
 
 /// The cap covers the frame's forwarded form, and it is checked before anything
@@ -219,21 +119,21 @@ fn encodes_without_reserving(codec: &CountingCodec, lengths: &[usize], relay: bo
 #[test]
 fn an_over_cap_response_is_refused_before_it_is_framed() -> Result<()> {
     let cap = FrameCap::new(1024)?;
-    let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
+    let encoder = FrameEncoder::<CountingCodec>::new(cap);
     let header = header(
         "billing",
         ResponseStatus::Error(ErrorCategory::Permanent),
         None,
     )?;
 
-    let staged = encoder.stage(&header, vec![0_u8; 942])?;
+    let staged = encoder.stage(&header, &vec![0_u8; 942])?;
     assert_eq!(
         staged.bytes(),
         1024 - RELAY_FIELD_BYTES,
         "the largest accepted response must frame to the cap less one relay id"
     );
 
-    let Err(EncodeError::TooLarge { bytes, limit }) = encoder.stage(&header, vec![0_u8; 943])
+    let Err(EncodeError::TooLarge { bytes, limit }) = encoder.stage(&header, &vec![0_u8; 943])
     else {
         bail!("a response one byte past the boundary must be refused");
     };
@@ -242,41 +142,6 @@ fn an_over_cap_response_is_refused_before_it_is_framed() -> Result<()> {
         (1025, 1024),
         "the refusal must name the forwarded frame's length"
     );
-    Ok(())
-}
-
-/// A released encoder holds nothing of the response before it: the scratch is
-/// emptied and given back to the cap, whatever the codec left there.
-///
-/// What an encoder holds between responses is what the process holds, because a
-/// destination can go quiet for as long as it likes. The moving codec is the
-/// case that matters — it hands its own buffer over, at a capacity the cap
-/// never bounded.
-#[test]
-fn a_released_encoder_holds_nothing_of_the_response_before_it() -> Result<()> {
-    let cap = FrameCap::new(1024)?;
-    let header = header(
-        "billing",
-        ResponseStatus::Error(ErrorCategory::Permanent),
-        None,
-    )?;
-    for codec in [CountingCodec::default(), CountingCodec::moving()] {
-        let mut encoder = FrameEncoder::new(codec, cap);
-        let mut dst = BytesMut::with_capacity(cap.bytes());
-        // Far more capacity than the cap, so a scratch left as the codec handed
-        // it over is unmistakable.
-        let mut payload = Vec::with_capacity(cap.bytes() * 4);
-        payload.extend_from_slice(b"hi");
-
-        encoder.stage(&header, payload)?.write(&mut dst);
-        encoder.release();
-        assert!(
-            encoder.scratch_capacity() <= cap.bytes(),
-            "a released encoder holds {} bytes, over the {}-byte cap",
-            encoder.scratch_capacity(),
-            cap.bytes()
-        );
-    }
     Ok(())
 }
 
@@ -294,13 +159,13 @@ fn known_responses_frame_to_known_bytes() -> Result<()> {
         (ResponseStatus::Error(ErrorCategory::Permanent), 0x02),
         (ResponseStatus::Success, 0x04),
     ] {
-        let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
+        let encoder = FrameEncoder::<CountingCodec>::new(cap);
         let header = header("billing", status, None)?;
         let mut dst = BytesMut::with_capacity(cap.bytes());
         let mut expected = FROZEN;
         expected[FROZEN_STATUS] = byte;
 
-        encoder.stage(&header, b"hi".to_vec())?.write(&mut dst);
+        encoder.stage(&header, &b"hi".to_vec())?.write(&mut dst);
         assert_eq!(&dst[..], &expected[..], "the frame's bytes are frozen");
     }
     Ok(())
@@ -322,7 +187,7 @@ fn a_staged_frame_always_fits_its_forwarded_form(lengths: Vec<u16>) -> TestResul
 
 fn staged_frames_all_forward(lengths: Vec<u16>) -> Result<()> {
     let cap = FrameCap::new(1024)?;
-    let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
+    let encoder = FrameEncoder::<CountingCodec>::new(cap);
     let header = header(
         "billing",
         ResponseStatus::Error(ErrorCategory::Permanent),
@@ -334,7 +199,7 @@ fn staged_frames_all_forward(lengths: Vec<u16>) -> Result<()> {
         .into_iter()
         .chain(lengths.into_iter().map(usize::from))
     {
-        let Ok(staged) = encoder.stage(&header, vec![0_u8; length]) else {
+        let Ok(staged) = encoder.stage(&header, &vec![0_u8; length]) else {
             continue;
         };
         let mut bytes = BytesMut::with_capacity(staged.bytes());
@@ -357,10 +222,10 @@ fn a_forwarded_frame_never_keeps_the_relay_id_it_arrived_with() -> Result<()> {
     let cap = FrameCap::new(1024)?;
     let earlier = NodeId::from_bytes(EARLIER_RELAY_ID);
     let relay = NodeId::from_bytes(RELAY_ID);
-    let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
+    let encoder = FrameEncoder::<CountingCodec>::new(cap);
     let header = header("billing", ResponseStatus::Success, Some(earlier))?;
 
-    let staged = encoder.stage(&header, b"hi".to_vec())?;
+    let staged = encoder.stage(&header, &b"hi".to_vec())?;
     let mut bytes = BytesMut::with_capacity(staged.bytes());
     staged.write(&mut bytes);
     let arrived = decode_frame(&mut bytes, cap)?;

@@ -96,6 +96,13 @@ impl Codec for ResultProbeCodec {
         decode_result(buf)
     }
 
+    fn deserialize_owned(
+        &mut self,
+        buf: bytes::BytesMut,
+    ) -> Result<Self::Payload, ProbeCodecError> {
+        decode_result(&buf)
+    }
+
     fn serialize(
         &mut self,
         payload: Self::Payload,
@@ -103,6 +110,16 @@ impl Codec for ResultProbeCodec {
     ) -> Result<(), ProbeCodecError> {
         SERIALIZES.set(SERIALIZES.get() + 1);
         buf.push(discriminant(&payload));
+        Ok(())
+    }
+
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), ProbeCodecError> {
+        SERIALIZES.set(SERIALIZES.get() + 1);
+        buf.push(discriminant(payload));
         Ok(())
     }
 }
@@ -117,6 +134,13 @@ impl Codec for OversizedProbeCodec {
         decode_result(buf)
     }
 
+    fn deserialize_owned(
+        &mut self,
+        buf: bytes::BytesMut,
+    ) -> Result<Self::Payload, ProbeCodecError> {
+        decode_result(&buf)
+    }
+
     fn serialize(
         &mut self,
         payload: Self::Payload,
@@ -124,6 +148,21 @@ impl Codec for OversizedProbeCodec {
     ) -> Result<(), ProbeCodecError> {
         SERIALIZES.set(SERIALIZES.get() + 1);
         let byte = discriminant(&payload);
+        if payload.is_ok() {
+            buf.push(byte);
+        } else {
+            buf.resize(FrameCap::MIN_BYTES, byte);
+        }
+        Ok(())
+    }
+
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), ProbeCodecError> {
+        SERIALIZES.set(SERIALIZES.get() + 1);
+        let byte = discriminant(payload);
         if payload.is_ok() {
             buf.push(byte);
         } else {

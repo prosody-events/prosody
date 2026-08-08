@@ -1,11 +1,10 @@
 use super::{
     LocalTarget, NodeId, Preference, RelayHop, Router, RouterHandle, SendFailure, choose_route,
 };
-use crate::Codec;
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
 use crate::response::ResponseStatus;
-use crate::response::frame::encode::FrameEncoder;
+use crate::response::frame::encode::{FrameEncoder, Staged};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader};
 use crate::response::sender::{DropReason, ResponseRoute, RouteDelivery, RouteOutcome, Then};
@@ -37,14 +36,12 @@ use uuid::{Uuid, Version};
 struct CountedNetwork(Arc<AtomicUsize>);
 
 impl ResponseRoute for CountedNetwork {
-    async fn deliver<C: Codec>(
+    async fn deliver(
         &self,
-        _encoder: &mut FrameEncoder<C>,
-        _header: &FrameHeader,
-        _payload: C::Payload,
+        _frame: Staged,
         _destination: &Destination,
         _expires_at: Instant,
-    ) -> Result<RouteOutcome<C::Payload>, DropReason> {
+    ) -> Result<RouteOutcome, DropReason> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Ok(RouteOutcome::Delivered(RouteDelivery::Remote {
             preference: Preference::Direct,
@@ -395,21 +392,19 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
         );
         let fleet = DestinationFleet::new(FleetConfiguration::default())?;
         let destination = fleet.destination(node);
-        let mut encoder = FrameEncoder::new(CountingCodec::default(), FrameCap::new(4096)?);
+        let encoder = FrameEncoder::<CountingCodec>::new(FrameCap::new(4096)?);
+        let frame = encoder.stage(
+            &FrameHeader {
+                target: node,
+                request: request.id(),
+                subsystem,
+                status: ResponseStatus::Success,
+                relay: None,
+            },
+            &Vec::new(),
+        )?;
         let delivered = route
-            .deliver(
-                &mut encoder,
-                &FrameHeader {
-                    target: node,
-                    request: request.id(),
-                    subsystem,
-                    status: ResponseStatus::Success,
-                    relay: None,
-                },
-                Vec::new(),
-                &destination,
-                Instant::now() + Duration::from_secs(1),
-            )
+            .deliver(frame, &destination, Instant::now() + Duration::from_secs(1))
             .await;
 
         assert!(matches!(

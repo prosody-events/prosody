@@ -10,8 +10,7 @@ use crate::Codec;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::{ConsumerError, PeerInitError};
-use crate::response::frame::FrameHeader;
-use crate::response::frame::encode::FrameEncoder;
+use crate::response::frame::encode::Staged;
 use crate::response::sender::{DropReason, ResponseRoute, RouteOutcome, Then};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::fleet::Destination;
@@ -160,30 +159,24 @@ impl ConsumerRouter for LocalConsumer {}
 impl ConsumerRouter for GrpcConsumer {}
 
 impl ResponseRoute for LocalResponseRoute {
-    fn deliver<C: Codec>(
+    fn deliver(
         &self,
-        encoder: &mut FrameEncoder<C>,
-        header: &FrameHeader,
-        payload: C::Payload,
+        frame: Staged,
         destination: &Destination,
         expires_at: Instant,
-    ) -> impl Future<Output = Result<RouteOutcome<C::Payload>, DropReason>> + Send {
-        self.0
-            .deliver(encoder, header, payload, destination, expires_at)
+    ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send {
+        self.0.deliver(frame, destination, expires_at)
     }
 }
 
 impl ResponseRoute for GrpcResponseRoute {
-    fn deliver<C: Codec>(
+    fn deliver(
         &self,
-        encoder: &mut FrameEncoder<C>,
-        header: &FrameHeader,
-        payload: C::Payload,
+        frame: Staged,
         destination: &Destination,
         expires_at: Instant,
-    ) -> impl Future<Output = Result<RouteOutcome<C::Payload>, DropReason>> + Send {
-        self.0
-            .deliver(encoder, header, payload, destination, expires_at)
+    ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send {
+        self.0.deliver(frame, destination, expires_at)
     }
 }
 
@@ -206,8 +199,8 @@ where
     C: Codec<Payload = Result<H::Output, H::Error>>,
     M: HandlerMiddleware<H::Payload>,
     H: FallibleHandler + Clone + Send + Sync + 'static,
-    H::Output: Clone + Sync + 'static,
-    H::Error: Clone + Sync + 'static,
+    H::Output: Sync + 'static,
+    H::Error: Sync + 'static,
 {
     router
         .handle()

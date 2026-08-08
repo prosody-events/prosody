@@ -1,12 +1,11 @@
-//! Turning one response into frame bytes, against a scratch buffer sized to the
-//! cap that only the codec ever grows.
+//! Turning one borrowed response into owned, bounded frame data.
 
 use super::{
     FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
     FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, ID_BYTES,
     RELAY_FIELD_BYTES, ResponseFrame,
 };
-use crate::codec::Codec;
+use crate::codec::{Codec, SerializeBufGuard};
 use crate::response::FormatToken;
 use crate::response::ResponseStatus;
 use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION};
@@ -14,51 +13,25 @@ use crate::router::{Framed, NodeId};
 use bytes::{BufMut, BytesMut};
 use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len};
 use std::error::Error;
+use std::marker::PhantomData;
 use thiserror::Error;
 
-/// Encodes responses into frames against one scratch buffer.
+/// Encodes responses through the standard codec cache and serialize buffer.
 ///
-/// The encoder allocates that scratch at construction, big enough for a payload
-/// at the cap, and never grows it: every `reserve` on it is the codec's own,
-/// through the `&mut Vec<u8>` [`Codec::serialize`] is handed. A codec that
-/// appends into a scratch at the cap therefore cannot grow it with any response
-/// the cap admits.
-///
-/// What the scratch *is* after a response is the codec's doing, not the
-/// encoder's. One that takes `serialize`'s sanctioned move into an empty buffer
-/// hands its own buffer over in place of the scratch, at whatever capacity that
-/// buffer came with — the cap bounds a payload's length, never its allocation.
-/// So the scratch is returned to the cap by [`FrameEncoder::release`], which
-/// the caller runs once the staged frame is written and [`FrameEncoder::stage`]
-/// runs again before each response. An encoder therefore holds no response's
-/// bytes between responses, however long it waits for the next one. That shrink
-/// is the only place the encoder itself can allocate after construction, and it
-/// does so only when the response before left the scratch over the cap.
-///
-/// The framework's own response codec never takes that move, and
-/// [`ResultCodec`](crate::codec::ResultCodec) states why: its leading
-/// discriminant means the inner codec is never handed an empty buffer, so the
-/// scratch this encoder allocated once is the buffer every response is written
-/// into.
-///
-/// Staging and framing are two steps because a protobuf `bytes` field writes
-/// its varint length *before* its contents: the payload must be serialized
-/// somewhere before that length is known. [`FrameEncoder::stage`] serializes
-/// into the scratch and refuses anything whose complete frame would exceed the
-/// cap; only a [`Staged`] can be written, so "framed before the cap was
-/// checked" is unrepresentable.
+/// [`FrameEncoder::stage`] returns the shared buffer before any asynchronous
+/// hook or route starts. The staged frame owns its bounded payload bytes.
+/// Thus, a slow hook or peer cannot reserve thread-local codec resources.
 pub struct FrameEncoder<C> {
-    codec: C,
-    scratch: Vec<u8>,
     cap: FrameCap,
+    _codec: PhantomData<fn() -> C>,
 }
 
 /// A response whose complete frame length has been checked against the cap.
 /// Writing one cannot fail and cannot exceed that cap.
-pub(crate) struct Staged<'a> {
-    header: &'a FrameHeader,
+pub struct Staged {
+    header: FrameHeader,
     format: &'static str,
-    payload: &'a [u8],
+    payload: BytesMut,
     bytes: usize,
 }
 
@@ -69,17 +42,15 @@ pub(crate) struct Staged<'a> {
 pub(crate) struct Forwarded(ResponseFrame);
 
 impl<C: Codec> FrameEncoder<C> {
-    /// Builds an encoder over a scratch big enough for a payload at the cap.
-    pub(crate) fn new(codec: C, cap: FrameCap) -> Self {
+    /// Builds an encoder that uses the standard codec and buffer caches.
+    pub(crate) fn new(cap: FrameCap) -> Self {
         Self {
-            codec,
-            scratch: Vec::with_capacity(cap.bytes()),
             cap,
+            _codec: PhantomData,
         }
     }
 
-    /// Serializes one response into the scratch and checks the complete frame
-    /// forwarded length against the cap.
+    /// Serializes one borrowed response and checks its forwarded frame length.
     ///
     /// # Errors
     ///
@@ -89,11 +60,11 @@ impl<C: Codec> FrameEncoder<C> {
     /// accepts by construction.
     ///
     /// [`SubsystemName`]: crate::subsystem::SubsystemName
-    pub(crate) fn stage<'a>(
-        &'a mut self,
-        header: &'a FrameHeader,
-        payload: C::Payload,
-    ) -> Result<Staged<'a>, EncodeError<C::Error>> {
+    pub(crate) fn stage(
+        &self,
+        header: &FrameHeader,
+        payload: &C::Payload,
+    ) -> Result<Staged, EncodeError<C::Error>> {
         const {
             assert!(
                 !C::FORMAT_ID.is_empty(),
@@ -104,15 +75,11 @@ impl<C: Codec> FrameEncoder<C> {
                 "a codec used for responses must have a FORMAT_ID a frame can carry"
             );
         }
-        // Clearing here as well as in `release` is what keeps the move shape
-        // reachable whoever the caller is: the codec sees an empty buffer every
-        // time, so a moving codec never reuses the buffer it handed over.
-        self.release();
-        self.codec
-            .serialize(payload, &mut self.scratch)
+        let mut scratch = SerializeBufGuard::acquire();
+        C::with_cached_local(|codec| codec.serialize_ref(payload, &mut scratch))
             .map_err(EncodeError::Codec)?;
 
-        let bytes = frame_len(header, C::FORMAT_ID, self.scratch.len());
+        let bytes = frame_len(header, C::FORMAT_ID, scratch.len());
         let forwarded = bytes + RELAY_FIELD_BYTES as u64;
         if forwarded > self.cap.bytes() as u64 {
             return Err(EncodeError::TooLarge {
@@ -121,36 +88,17 @@ impl<C: Codec> FrameEncoder<C> {
             });
         }
         Ok(Staged {
-            header,
+            header: header.clone(),
             format: C::FORMAT_ID,
-            payload: &self.scratch,
+            payload: BytesMut::from(&scratch[..]),
             bytes: bytes as usize,
         })
-    }
-
-    /// Empties the scratch and returns it to the cap.
-    ///
-    /// Run this once the [`Staged`] frame is written. A response the cap
-    /// refused can have grown the scratch, and a codec that moved its own
-    /// buffer in can have handed over one larger still — or one holding the
-    /// response's bytes. `shrink_to` never grows, so a smaller moved-in
-    /// buffer is kept as it is.
-    pub(crate) fn release(&mut self) {
-        self.scratch.clear();
-        self.scratch.shrink_to(self.cap.bytes());
-    }
-
-    /// The scratch's live capacity, for the tests that pin what the encoder is
-    /// left holding after a response.
-    #[cfg(test)]
-    pub(crate) fn scratch_capacity(&self) -> usize {
-        self.scratch.capacity()
     }
 }
 
 /// A staged response is what the router delivers, so the transport never sees
 /// the response vocabulary above it.
-impl Framed for Staged<'_> {
+impl Framed for Staged {
     fn bytes(&self) -> usize {
         self.bytes
     }
@@ -162,20 +110,28 @@ impl Framed for Staged<'_> {
     /// [`BytesMut`](bytes::BytesMut), which reserves on demand, and sizing one
     /// at the frame cap keeps it from ever having to.
     fn write<B: BufMut>(&self, dst: &mut B) {
-        write_frame(self.header, self.format, self.payload, dst);
+        write_frame(&self.header, self.format, &self.payload, dst);
     }
 }
 
-impl Staged<'_> {
+impl Staged {
+    pub(in crate::response) const fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    pub(in crate::response) const fn target(&self) -> NodeId {
+        self.header.target
+    }
+
     /// Moves this process's response into the local request registry.
     ///
     /// Only the payload needs owned storage. The local path skips the protobuf
     /// header, transport buffer, socket, and receive-side decode.
-    pub(in crate::response) fn local_frame(&self) -> ResponseFrame {
+    pub(in crate::response) fn into_local_frame(self) -> ResponseFrame {
         ResponseFrame {
-            header: self.header.clone(),
+            header: self.header,
             format: FormatToken::make(self.format),
-            payload: BytesMut::from(self.payload),
+            payload: self.payload,
         }
     }
 }

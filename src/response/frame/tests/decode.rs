@@ -72,9 +72,9 @@ fn a_framed_response_round_trips(
     };
     payload.truncate(cap.bytes() / 2);
 
-    let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
+    let encoder = FrameEncoder::<CountingCodec>::new(cap);
     let mut wire = BytesMut::with_capacity(cap.bytes());
-    match encoder.stage(&header, payload.clone()) {
+    match encoder.stage(&header, &payload) {
         Ok(staged) => staged.write(&mut wire),
         Err(error) => return TestResult::error(format!("staging failed: {error}")),
     }

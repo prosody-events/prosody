@@ -583,7 +583,7 @@ impl<C: EventContext> TestLifecycleAccess for C {}
 
 /// Test error carrying its classification. Display matches the per-file
 /// originals (`test error (Transient)`) so no assertion text changes.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, PartialEq, Eq, Error)]
 #[error("test error ({0:?})")]
 pub struct TestError(pub ErrorCategory);
 

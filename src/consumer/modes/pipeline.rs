@@ -145,8 +145,8 @@ impl PipelineMiddlewareStack {
     ) -> Result<ProsodyConsumer<C>, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-        T::Output: Clone + Sync + 'static,
-        T::Error: Clone + Sync + 'static,
+        T::Output: Sync + 'static,
+        T::Error: Sync + 'static,
         R: Codec<Payload = Result<T::Output, T::Error>>,
         MP: MessageDeferStoreProvider,
         TP: TimerDeferStoreProvider,
@@ -281,8 +281,8 @@ where
     where
         C::Payload: EventIdentity,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-        T::Output: Clone + Sync + 'static,
-        T::Error: Clone + Sync + 'static,
+        T::Output: Sync + 'static,
+        T::Error: Sync + 'static,
         R: Codec<Payload = Result<T::Output, T::Error>>,
     {
         match (setup.consumer.mock, setup.trigger_store) {
@@ -391,8 +391,8 @@ where
         C::Payload: EventIdentity + Send + Sync + 'static,
         B: ConsumerReaderBackend<C>,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-        T::Output: Clone + Sync + 'static,
-        T::Error: Clone + Sync + 'static,
+        T::Output: Sync + 'static,
+        T::Error: Sync + 'static,
         R: Codec<Payload = Result<T::Output, T::Error>>,
     {
         let PipelineMiddlewareConfiguration {

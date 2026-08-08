@@ -12,9 +12,6 @@ use color_eyre::Result;
 use prost::encoding::{WireType, encode_key, encode_varint};
 use std::cell::Cell;
 use std::convert::Infallible;
-use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::Relaxed;
 
 mod decode;
 mod encode;
@@ -35,23 +32,15 @@ thread_local! {
     /// [`serialized_on_this_thread`] as a difference, never as an absolute:
     /// every other codec on the same thread counts here too.
     static SERIALIZED_HERE: Cell<usize> = const { Cell::new(0) };
+    static CACHE_USES: Cell<usize> = const { Cell::new(0) };
+    static SERIALIZE_CAPACITY: Cell<usize> = const { Cell::new(0) };
 }
 
 /// A codec whose payload is simply its bytes.
 ///
-/// The call counters are what make "the payload was serialized exactly once"
-/// and "a mismatched frame never reached the codec" observable; a clone shares
-/// them with the encoder that owns the codec.
-///
-/// `moves` picks between the two shapes [`Codec::serialize`] sanctions: append
-/// into the caller's buffer, or — when that buffer is empty — hand the
-/// payload's own buffer over instead, as [`BinaryCodec`](crate::BinaryCodec)
-/// does.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct CountingCodec {
-    serializes: Arc<AtomicUsize>,
-    moves: bool,
-}
+/// Thread-local counters observe calls through the cached codec instance.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CountingCodec;
 
 /// A frame assembled field by field, so a case can omit one field or make one
 /// malformed. Every field defaults to a well-formed value, and `None` leaves
@@ -79,36 +68,30 @@ impl Codec for CountingCodec {
         Ok(buf.to_vec())
     }
 
+    fn deserialize_owned(&mut self, buf: BytesMut) -> Result<Vec<u8>, Infallible> {
+        Ok(buf.into())
+    }
+
     fn serialize(&mut self, payload: Vec<u8>, buf: &mut Vec<u8>) -> Result<(), Infallible> {
-        self.serializes.fetch_add(1, Relaxed);
         SERIALIZED_HERE.set(SERIALIZED_HERE.get() + 1);
-        if self.moves && buf.is_empty() {
+        if buf.is_empty() {
             *buf = payload;
         } else {
             buf.extend_from_slice(&payload);
         }
         Ok(())
     }
-}
 
-impl CountingCodec {
-    /// The move-into-an-empty-buffer shape.
-    fn moving() -> Self {
-        Self {
-            moves: true,
-            ..Self::default()
-        }
+    fn serialize_ref(&mut self, payload: &Vec<u8>, buf: &mut Vec<u8>) -> Result<(), Infallible> {
+        SERIALIZED_HERE.set(SERIALIZED_HERE.get() + 1);
+        SERIALIZE_CAPACITY.set(buf.capacity());
+        buf.extend_from_slice(payload);
+        Ok(())
     }
 
-    /// The scratch capacity the encoder is left holding once this codec has
-    /// serialized: the payload's own buffer when it moved one in, otherwise the
-    /// buffer the encoder built.
-    fn expected_scratch(&self, handed: usize, built: usize) -> usize {
-        if self.moves { handed } else { built }
-    }
-
-    fn serializes(&self) -> usize {
-        self.serializes.load(Relaxed)
+    fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        CACHE_USES.set(CACHE_USES.get() + 1);
+        f(&mut Self)
     }
 }
 
@@ -131,6 +114,14 @@ impl Default for RawFrame<'_> {
 /// How many payloads [`CountingCodec`] has serialized on this thread.
 pub(crate) fn serialized_on_this_thread() -> usize {
     SERIALIZED_HERE.get()
+}
+
+pub(crate) fn cache_uses_on_this_thread() -> usize {
+    CACHE_USES.get()
+}
+
+pub(crate) fn serialize_capacity_on_this_thread() -> usize {
+    SERIALIZE_CAPACITY.get()
 }
 
 /// Writes one protobuf field, without borrowing the encoder's writers, so a
@@ -193,32 +184,6 @@ fn header(subsystem: &str, status: ResponseStatus, relay: Option<NodeId>) -> Res
         status,
         relay,
     })
-}
-
-/// An independent model of the framed length, spelled out as the wire costs a
-/// reader can check by hand rather than by reusing the encoder's arithmetic.
-/// It assumes the subsystem and format each fit a one-byte length varint, which
-/// every value used in these tests does.
-fn expected_frame_len(subsystem: &str, payload: usize, relay: bool) -> usize {
-    let format = CountingCodec::FORMAT_ID.len();
-    2                                                 // protocol_version: key + value
-        + 18 + 18                                     // target_node, request_id: key + len + 16
-        + 2 + subsystem.len()                         // subsystem: key + len + bytes
-        + 2 + format                                  // format: key + len + bytes
-        + 2                                           // status: key + value
-        + 1 + varint_len(payload) + payload           // payload: key + len + bytes
-        + if relay { RELAY_FIELD_BYTES } else { 0 }
-}
-
-/// Bytes a protobuf varint of `value` occupies.
-fn varint_len(value: usize) -> usize {
-    let mut len = 1;
-    let mut rest = value >> 7_u32;
-    while rest > 0 {
-        len += 1;
-        rest >>= 7_u32;
-    }
-    len
 }
 
 /// The ceiling is validated once, at construction, so no later code can hold an

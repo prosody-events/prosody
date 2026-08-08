@@ -326,8 +326,8 @@ where
     )
     where
         T: Clone,
-        T::Output: Clone + Sync + 'static,
-        T::Error: Clone + Sync + 'static,
+        T::Output: Sync + 'static,
+        T::Error: Sync + 'static,
         T::Payload: crate::EventType + Clone,
         B::Reader: ConsumerReaderBackend<Wire<T>>,
     {
@@ -408,8 +408,8 @@ where
     async fn subscribe_inner(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>>
     where
         T: Clone,
-        T::Output: Clone + Sync + 'static,
-        T::Error: Clone + Sync + 'static,
+        T::Output: Sync + 'static,
+        T::Error: Sync + 'static,
         T::Payload: crate::EventType + Clone,
         B::Reader: ConsumerReaderBackend<Wire<T>>,
     {
@@ -543,8 +543,8 @@ macro_rules! impl_subscribe {
         where
             T: ClientHandler + Clone,
             T::Payload: crate::EventIdentity + crate::EventType + Clone,
-            T::Output: Clone + Sync + 'static,
-            T::Error: Clone + Sync + 'static,
+            T::Output: Sync + 'static,
+            T::Error: Sync + 'static,
         {
             /// Subscribes the consumer with the provided handler.
             ///

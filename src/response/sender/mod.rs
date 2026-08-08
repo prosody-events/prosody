@@ -5,7 +5,7 @@ mod route;
 
 pub(crate) use self::metrics::DropReason;
 use self::metrics::Stage;
-use self::route::deliver_response;
+use self::route::{PreparedResponse, deliver_response, stage};
 use crate::codec::Codec;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::{FrameCap, FrameHeader};
@@ -51,30 +51,21 @@ impl<C: Codec, R: ResponseRoute> TypedSender<C, R> {
         }
     }
 
-    /// Sends one response in the trace that `trace` names.
+    /// Encodes one response through the standard codec cache and buffer.
+    pub(crate) fn prepare(&self, header: FrameHeader, payload: &C::Payload) -> PreparedResponse {
+        Stage::Attempted.record();
+        stage(&FrameEncoder::<C>::new(self.cap), header, payload)
+    }
+
+    /// Sends one prepared response in the trace that `trace` names.
     ///
     /// `trace` is the requester's trace, captured by `Answering` in the respond
     /// layer, which states why it is a context rather than an ambient span.
     ///
     /// Applies transport backpressure until delivery finishes.
-    pub(crate) async fn send(
-        &self,
-        header: FrameHeader,
-        trace: Context,
-        payload: C::Payload,
-    ) -> bool {
-        Stage::Attempted.record();
-        let destination = self.fleet.destination(header.target);
+    pub(crate) async fn send(&self, prepared: PreparedResponse, trace: Context) -> bool {
+        let destination = self.fleet.destination(prepared.header().target);
         let expires_at = Instant::now() + self.delivery_timeout;
-        deliver_response(
-            &self.route,
-            FrameEncoder::new(C::default(), self.cap),
-            header,
-            payload,
-            trace,
-            &destination,
-            expires_at,
-        )
-        .await
+        deliver_response(&self.route, prepared, trace, &destination, expires_at).await
     }
 }

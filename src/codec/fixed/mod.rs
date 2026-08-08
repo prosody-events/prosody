@@ -10,6 +10,7 @@
 
 use crate::codec::Codec;
 use crate::codec::const_id::ConstId;
+use bytes::BytesMut;
 use std::convert::Infallible;
 use std::error::Error;
 use thiserror::Error;
@@ -30,6 +31,7 @@ pub trait FixedCodec: Codec {
 }
 
 /// Codec for an empty success value.
+/// Every input form has the same zero-cost implementation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UnitCodec;
 
@@ -47,7 +49,7 @@ impl Codec for UnitCodec {
         }
     }
 
-    fn serialize(&mut self, (): (), _buf: &mut Vec<u8>) -> Result<(), UnitCodecError> {
+    fn serialize_ref(&mut self, (): &(), _buf: &mut Vec<u8>) -> Result<(), UnitCodecError> {
         Ok(())
     }
 }
@@ -57,6 +59,7 @@ impl FixedCodec for UnitCodec {
 }
 
 /// Codec for an error type that has no values.
+/// Every operation returns without reading or allocating storage.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InfallibleCodec;
 
@@ -70,12 +73,12 @@ impl Codec for InfallibleCodec {
         Err(InfallibleCodecError)
     }
 
-    fn serialize(
+    fn serialize_ref(
         &mut self,
-        value: Infallible,
+        value: &Infallible,
         _buf: &mut Vec<u8>,
     ) -> Result<(), InfallibleCodecError> {
-        match value {}
+        match *value {}
     }
 }
 
@@ -86,6 +89,8 @@ impl Codec for InfallibleCodec {
 /// encoding in [`order_codec`](crate::state::order_codec): a key codec must
 /// sort by memcmp, a payload codec need not, so the two never share bytes or a
 /// token.
+/// Owned and borrowed serialization both write one stack array.
+/// Both decode forms read eight bytes without allocation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct I64Codec;
 
@@ -100,7 +105,7 @@ impl Codec for I64Codec {
         Ok(i64::from_be_bytes(bytes))
     }
 
-    fn serialize(&mut self, payload: i64, buf: &mut Vec<u8>) -> Result<(), I64CodecError> {
+    fn serialize_ref(&mut self, payload: &i64, buf: &mut Vec<u8>) -> Result<(), I64CodecError> {
         buf.extend_from_slice(&payload.to_be_bytes());
         Ok(())
     }
@@ -116,6 +121,9 @@ impl FixedCodec for I64Codec {
 /// derived at compile time (see `ConstId`) so a composed codec asserts a
 /// durable identity distinct from either component's. Arity 2 only; a wider
 /// tuple is a macro away when a caller needs one.
+///
+/// Owned operations transfer each component. Borrowed operations preserve both.
+/// Owned decoding splits one buffer without copying its bytes.
 impl<A, B> Codec for (A, B)
 where
     A: FixedCodec,
@@ -149,6 +157,26 @@ where
         Ok((a, b))
     }
 
+    fn deserialize_owned(&mut self, mut buf: BytesMut) -> Result<Self::Payload, Self::Error> {
+        let expected = A::WIDTH + B::WIDTH;
+        if buf.len() != expected {
+            return Err(PairCodecError::Length {
+                expected,
+                actual: buf.len(),
+            });
+        }
+        let second = buf.split_off(A::WIDTH);
+        let a = self
+            .0
+            .deserialize_owned(buf)
+            .map_err(PairCodecError::First)?;
+        let b = self
+            .1
+            .deserialize_owned(second)
+            .map_err(PairCodecError::Second)?;
+        Ok((a, b))
+    }
+
     fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
         self.0
             .serialize(payload.0, buf)
@@ -157,6 +185,19 @@ where
             .serialize(payload.1, buf)
             .map_err(PairCodecError::Second)?;
         Ok(())
+    }
+
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        self.0
+            .serialize_ref(&payload.0, buf)
+            .map_err(PairCodecError::First)?;
+        self.1
+            .serialize_ref(&payload.1, buf)
+            .map_err(PairCodecError::Second)
     }
 }
 

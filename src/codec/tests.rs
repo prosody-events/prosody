@@ -1,5 +1,6 @@
 use super::{BinaryPayload, Codec, JsonBinaryCodec, JsonCodec, JsonPassthroughStateCodec};
 use crate::test_util::ArbJson;
+use bytes::BytesMut;
 use quickcheck::{QuickCheck, TestResult};
 use serde_json::Value;
 
@@ -41,6 +42,19 @@ fn json_bytes(value: &Value) -> Vec<u8> {
 fn passthrough_state_codec_byte_compatible_with_json() {
     fn prop(ArbJson(value): ArbJson) -> TestResult {
         let bytes = json_bytes(&value);
+        let mut borrowed_bytes = Vec::new();
+        let mut json = JsonCodec::default();
+        if json.serialize_ref(&value, &mut borrowed_bytes).is_err() || borrowed_bytes != bytes {
+            return TestResult::error("JSON serializers wrote different bytes");
+        }
+        let mut mutable_bytes = bytes.clone();
+        let borrowed_decode = json.deserialize(&mut mutable_bytes);
+        let owned_decode = json.deserialize_owned(BytesMut::from(bytes.as_slice()));
+        match (borrowed_decode, owned_decode) {
+            (Ok(borrowed), Ok(owned)) if borrowed == value && owned == value => {}
+            (Ok(_), Ok(_)) => return TestResult::error("JSON decoders produced different values"),
+            _ => return TestResult::error("JSON decoding failed"),
+        }
 
         // JsonCodec bytes -> passthrough deserialize -> verbatim bytes.
         let mut passthrough = JsonPassthroughStateCodec::default();

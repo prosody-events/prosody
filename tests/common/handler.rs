@@ -123,9 +123,24 @@ macro_rules! unit_error_codec {
                 UnitCodec.deserialize(buf).map(|()| $error)
             }
 
+            fn deserialize_owned(
+                &mut self,
+                buf: bytes::BytesMut,
+            ) -> Result<$error, UnitCodecError> {
+                UnitCodec.deserialize_owned(buf).map(|()| $error)
+            }
+
             fn serialize(
                 &mut self,
                 _payload: $error,
+                _buf: &mut Vec<u8>,
+            ) -> Result<(), UnitCodecError> {
+                Ok(())
+            }
+
+            fn serialize_ref(
+                &mut self,
+                _payload: &$error,
                 _buf: &mut Vec<u8>,
             ) -> Result<(), UnitCodecError> {
                 Ok(())

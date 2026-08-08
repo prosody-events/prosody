@@ -1,5 +1,6 @@
 use super::{ResultCodec, ResultCodecError};
 use crate::codec::{Codec, I64Codec, JsonCodec};
+use bytes::BytesMut;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use quickcheck::TestResult;
@@ -34,10 +35,22 @@ fn a_composed_result_round_trips(is_ok: bool, value: i64) -> TestResult {
     if let Err(error) = codec.serialize(payload.clone(), &mut buffer) {
         return TestResult::error(format!("serializing failed: {error}"));
     }
+    let mut borrowed = Vec::new();
+    if let Err(error) = codec.serialize_ref(&payload, &mut borrowed) {
+        return TestResult::error(format!("borrowed serialization failed: {error}"));
+    }
+    if borrowed != buffer {
+        return TestResult::error("owned and borrowed serialization differ");
+    }
+    let owned = codec.deserialize_owned(BytesMut::from(buffer.as_slice()));
     match codec.deserialize(&mut buffer) {
         Ok(decoded) => {
             assert_eq!(decoded, payload, "the result must survive the round trip");
-            TestResult::passed()
+            match owned {
+                Ok(owned) if owned == payload => TestResult::passed(),
+                Ok(_) => TestResult::error("both decode paths must agree"),
+                Err(error) => TestResult::error(format!("owned deserialization failed: {error}")),
+            }
         }
         Err(error) => TestResult::error(format!("deserializing failed: {error}")),
     }

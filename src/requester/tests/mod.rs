@@ -124,6 +124,10 @@ impl Codec for TestCodec {
         }
     }
 
+    fn deserialize_owned(&mut self, mut buf: BytesMut) -> Result<Self::Payload, TestCodecError> {
+        self.deserialize(&mut buf)
+    }
+
     fn serialize(
         &mut self,
         payload: Self::Payload,
@@ -131,6 +135,20 @@ impl Codec for TestCodec {
     ) -> Result<(), TestCodecError> {
         let (tag, value) = match payload {
             Ok(value) => (OK_TAG, value),
+            Err(error) => (category_tag(error.category), error.value),
+        };
+        buf.push(tag);
+        buf.extend_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), TestCodecError> {
+        let (tag, value) = match payload {
+            Ok(value) => (OK_TAG, *value),
             Err(error) => (category_tag(error.category), error.value),
         };
         buf.push(tag);
@@ -155,9 +173,22 @@ impl Codec for RequestCodec {
         Ok(RequestPayload)
     }
 
+    fn deserialize_owned(&mut self, _buf: BytesMut) -> Result<RequestPayload, TestCodecError> {
+        Ok(RequestPayload)
+    }
+
     fn serialize(
         &mut self,
         _payload: RequestPayload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), TestCodecError> {
+        buf.push(0);
+        Ok(())
+    }
+
+    fn serialize_ref(
+        &mut self,
+        _payload: &RequestPayload,
         buf: &mut Vec<u8>,
     ) -> Result<(), TestCodecError> {
         buf.push(0);

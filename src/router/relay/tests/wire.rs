@@ -292,19 +292,18 @@ async fn crossing(pair: &Pair) -> Result<()> {
     )?;
 
     let sender = TypedSender::<CountingCodec, _>::new_route(router.clone(), router.fleet(), cap);
-    sender
-        .send(
-            FrameHeader {
-                target: pair.target.node,
-                request: request.id(),
-                subsystem: SubsystemName::try_new(ALPHA)?,
-                status: ResponseStatus::Success,
-                relay: None,
-            },
-            Context::current(),
-            PAYLOAD.to_vec(),
-        )
-        .await;
+    let payload = PAYLOAD.to_vec();
+    let prepared = sender.prepare(
+        FrameHeader {
+            target: pair.target.node,
+            request: request.id(),
+            subsystem: SubsystemName::try_new(ALPHA)?,
+            status: ResponseStatus::Success,
+            relay: None,
+        },
+        &payload,
+    );
+    sender.send(prepared, Context::current()).await;
     drop(sender);
     receiver
         .await
@@ -327,7 +326,7 @@ async fn call_with_payload(
     let cap = FrameCap::new(CAP_BYTES)?;
     let fleet = DestinationFleet::new(FleetConfiguration::default())?;
     let sender = GrpcSender::new(cap, &fleet);
-    let mut encoder = FrameEncoder::new(CountingCodec::default(), cap);
+    let encoder = FrameEncoder::<CountingCodec>::new(cap);
     let header = FrameHeader {
         target,
         request,
@@ -335,7 +334,7 @@ async fn call_with_payload(
         status: ResponseStatus::Success,
         relay: None,
     };
-    let staged = encoder.stage(&header, payload.to_vec())?;
+    let staged = encoder.stage(&header, &payload.to_vec())?;
     let delivered = deliver(&sender, &live.address, &staged, granted)
         .instrument(info_span!("peer.test.call"))
         .await;
@@ -351,7 +350,7 @@ async fn call_with_payload(
 async fn deliver(
     sender: &GrpcSender,
     address: &Endpoint,
-    staged: &Staged<'_>,
+    staged: &Staged,
     granted: Duration,
 ) -> Result<(), SendFailure> {
     sender

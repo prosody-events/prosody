@@ -51,7 +51,23 @@ impl Codec for SomeResponseCodec {
         }
     }
 
+    fn deserialize_owned(
+        &mut self,
+        mut buf: bytes::BytesMut,
+    ) -> Result<Self::Payload, Self::Error> {
+        self.deserialize(&mut buf)
+    }
+
     fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
+        buf.push(u8::from(payload.is_err()));
+        Ok(())
+    }
+
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
         buf.push(u8::from(payload.is_err()));
         Ok(())
     }
