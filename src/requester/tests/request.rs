@@ -10,6 +10,7 @@ use crate::requester::{
     HEADER_INLINE, Outcome, RequestError, ResponseFailure, append_request_headers,
 };
 use crate::response::RequestId;
+use crate::response::headers::RequestDeadline;
 use crate::response::headers::{
     ID_TEXT_LEN, RESERVED_REQUEST_HEADERS, RequestTag, parse_request_tag,
 };
@@ -230,16 +231,17 @@ fn run_headers(trace: HeaderTrace) -> Result<()> {
     let id = RequestId::new();
     let mut request_buf = [0_u8; ID_TEXT_LEN];
     let mut node_buf = [0_u8; ID_TEXT_LEN];
+    let mut deadline_buf = itoa::Buffer::new();
+    let deadline = RequestDeadline::from_unix_micros(1_700_000_000_000_000);
     let mut headers = SmallVec::<[(&'static str, &str); HEADER_INLINE]>::new();
     for (name, value) in &user {
         headers.push((USER_NAMES[*name], USER_VALUES[*value]));
     }
     append_request_headers(
         &mut headers,
-        id,
-        &mut request_buf,
-        NODE,
-        &mut node_buf,
+        (id, &mut request_buf),
+        (NODE, &mut node_buf),
+        (deadline, &mut deadline_buf),
         &awaited,
     );
 
@@ -247,7 +249,7 @@ fn run_headers(trace: HeaderTrace) -> Result<()> {
         .iter()
         .map(|(name, value)| (*name, Some(value.as_bytes())))
         .collect();
-    let expected = RequestTag::new(id, NODE);
+    let expected = RequestTag::new(id, NODE, deadline);
     for name in &awaited {
         assert_eq!(
             parse_request_tag(wire.iter().copied(), name)?,

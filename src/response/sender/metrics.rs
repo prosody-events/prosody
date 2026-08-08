@@ -70,10 +70,6 @@ pub(super) enum Stage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(strum::VariantArray))]
 pub enum DropReason {
-    /// The sender gave up before the delivery finished. This can cancel a
-    /// delivery the transport already accepted, so it does not say the peer
-    /// never got the response.
-    Deadline,
     /// The codec could not frame the result inside the ceiling.
     EncodeFailed,
     /// No live registration names the node the response is addressed to.
@@ -111,7 +107,6 @@ impl DropReason {
     /// The metric label for this reason.
     pub(super) const fn label(self) -> &'static str {
         match self {
-            Self::Deadline => "deadline",
             Self::EncodeFailed => "encode_failed",
             Self::UnresolvableNode => "unresolvable_node",
             Self::LookupFailed => "lookup_failed",

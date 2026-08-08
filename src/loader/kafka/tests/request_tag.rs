@@ -10,8 +10,8 @@ use super::{
 };
 use crate::response::RequestId;
 use crate::response::headers::{
-    RESPONSE_AWAITED_HEADER, RESPONSE_NODE_HEADER, RESPONSE_REQUEST_ID_HEADER,
-    RESPONSE_VERSION_HEADER, RequestTag,
+    RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER, RESPONSE_NODE_HEADER,
+    RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline, RequestTag,
 };
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
@@ -44,7 +44,7 @@ async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
             OwnedHeaders::new()
                 .insert(Header {
                     key: RESPONSE_VERSION_HEADER,
-                    value: Some("1"),
+                    value: Some("2"),
                 })
                 .insert(Header {
                     key: RESPONSE_REQUEST_ID_HEADER,
@@ -53,6 +53,10 @@ async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
                 .insert(Header {
                     key: RESPONSE_NODE_HEADER,
                     value: Some(node_text.as_str()),
+                })
+                .insert(Header {
+                    key: RESPONSE_DEADLINE_HEADER,
+                    value: Some("1700000000000000"),
                 })
                 .insert(Header {
                     key: RESPONSE_AWAITED_HEADER,
@@ -72,11 +76,11 @@ async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
             OwnedHeaders::new()
                 .insert(Header {
                     key: RESPONSE_VERSION_HEADER,
-                    value: Some("1"),
+                    value: Some("2"),
                 })
                 .insert(Header {
                     key: RESPONSE_VERSION_HEADER,
-                    value: Some("1"),
+                    value: Some("2"),
                 }),
         )
         .await?;
@@ -90,7 +94,11 @@ async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
 
         assert_eq!(
             load(&loader, topic, tagged_offset).await?,
-            Some(RequestTag::new(id, node)),
+            Some(RequestTag::new(
+                id,
+                node,
+                RequestDeadline::from_unix_micros(1_700_000_000_000_000),
+            )),
             "the reloaded record lost the destination its headers named"
         );
         // The negative control: without it, a loader that reported the same tag

@@ -2239,6 +2239,7 @@ dependencies = [
  "internment",
  "intervallum",
  "itertools 0.15.0",
+ "itoa",
  "nohash-hasher",
  "opentelemetry",
  "opentelemetry-otlp",

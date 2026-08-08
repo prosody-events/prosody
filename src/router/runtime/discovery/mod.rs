@@ -1,9 +1,7 @@
 //! What one process can only learn by asking the machine it runs on.
 //!
-//! Both lookups block. The machine name is a system call, and the route probe
-//! binds a UDP socket and connects it. Both are private to this module, so no
-//! code outside it can call either one. [`discover`] is what the rest of the
-//! crate has instead, and it runs them on the blocking pool.
+//! The machine-name lookup can block. [`discover`] runs it on the blocking
+//! pool.
 //!
 //! Inside this module the rule is read rather than compiled: a function added
 //! here could call them on a runtime thread.
@@ -12,7 +10,6 @@ use super::config::{RouterConfiguration, validate_label};
 use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
 use crate::router::grpc::BoundListener;
 use crate::router::{Host, MAX_LABEL_BYTES, NodeId};
-use std::net::{SocketAddr, UdpSocket};
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle, spawn_blocking};
 use whoami::hostname;
@@ -20,20 +17,15 @@ use whoami::hostname;
 #[cfg(test)]
 mod tests;
 
-/// The two host values a process can only learn by asking the machine it runs
-/// on, and the network beneath it.
+/// The host value a process can only learn from its machine.
 ///
 /// [`discover`] produces one of these, and [`registration`] spends it.
 pub(super) struct DiscoveredHost {
     /// This machine's name. It is a label a registration may publish.
     pub(super) hostname: Host,
-    /// The local address that reaches the probe address, when the probe found
-    /// one.
-    pub(super) routed: Option<Host>,
 }
 
-/// Reads this machine's name and the address that reaches `probe`, on the
-/// blocking pool.
+/// Reads this machine's name on the blocking pool.
 ///
 /// The spawn sits inside the awaited expression, so no early return stands
 /// between the two. One there would detach a blocking task that tokio cannot
@@ -43,14 +35,14 @@ pub(super) struct DiscoveredHost {
 ///
 /// Returns [`DiscoveryError`] when the machine name cannot be read or
 /// published, or when the blocking task does not join.
-pub(super) async fn discover(probe: Option<SocketAddr>) -> Result<DiscoveredHost, DiscoveryError> {
-    join_discovery(spawn_blocking(move || discover_host(probe))).await
+pub(super) async fn discover() -> Result<DiscoveredHost, DiscoveryError> {
+    join_discovery(spawn_blocking(discover_host)).await
 }
 
 /// Builds the registration from the bound listener and discovered host.
 ///
-/// The direct endpoint uses the routed host or the machine name. The
-/// advertised endpoint uses only configured values. The registration omits
+/// The direct endpoint uses a specific bind address or the machine name.
+/// The advertised endpoint uses only configured values.
 pub(super) fn registration(
     node: NodeId,
     listener: &BoundListener,
@@ -58,11 +50,16 @@ pub(super) fn registration(
     config: &RouterConfiguration,
 ) -> NodeRegistration {
     let listener_port = listener.address().port();
-    let DiscoveredHost { hostname, routed } = discovered;
+    let DiscoveredHost { hostname } = discovered;
+    let bound_ip = listener.address().ip();
     NodeRegistration {
         node,
         direct: Endpoint {
-            host: routed.unwrap_or_else(|| hostname.clone()),
+            host: if bound_ip.is_unspecified() {
+                hostname.clone()
+            } else {
+                Host::make(&bound_ip.to_string())
+            },
             port: listener_port,
         },
         advertised: config.advertised_host.as_deref().map(|host| Endpoint {
@@ -91,20 +88,18 @@ async fn join_discovery(
     task.await?
 }
 
-/// Reads the machine name and the address that reaches `probe`.
+/// Reads the machine name.
 ///
 /// This is discovery's blocking half. [`discover`] is what runs it, and it runs
 /// it on the blocking pool.
 ///
 /// # Errors
 ///
-/// Returns [`DiscoveryError`] when the machine name cannot be read, or when
-/// it is not a label a registration may publish. The routed probe's own failure
-/// is not an error: it answers `None`, and `discover_registration` then
-/// publishes the machine name.
-fn discover_host(probe: Option<SocketAddr>) -> Result<DiscoveredHost, DiscoveryError> {
+/// Returns [`DiscoveryError`] when the machine name cannot be read or
+/// published.
+fn discover_host() -> Result<DiscoveredHost, DiscoveryError> {
     // The machine name is published in its own right, so the lookup is paid
-    // once and reused where the routed probe finds no address.
+    // once and reused for a wildcard listener.
     let machine = hostname()?;
     // One label rule for both sources. A name an operator may not configure is
     // not a name this machine may publish either.
@@ -114,37 +109,7 @@ fn discover_host(probe: Option<SocketAddr>) -> Result<DiscoveredHost, DiscoveryE
     })?;
     Ok(DiscoveredHost {
         hostname: Host::make(&machine),
-        routed: probe.and_then(routed_host),
     })
-}
-
-/// The local address the operating system would use to reach `target`.
-///
-/// Connecting a UDP socket sends nothing: it only asks the routing table which
-/// interface would carry that traffic. The answer is the address that reaches
-/// the target, and nothing more. A loopback target answers with a loopback
-/// address, and a target behind a management interface answers with the
-/// management address. A peer elsewhere reaches neither, which is what
-/// [`RouterConfiguration::advertised_host`](super::RouterConfiguration::advertised_host)
-/// is for. A bind, route, or address read failure yields `None`.
-fn routed_host(target: SocketAddr) -> Option<Host> {
-    // An IPv4-bound socket cannot discover an IPv6 route, so the probe binds
-    // the family of the address it aims at.
-    let unspecified = if target.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let Ok(probe) = UdpSocket::bind(unspecified) else {
-        return None;
-    };
-    let Ok(()) = probe.connect(target) else {
-        return None;
-    };
-    let Ok(local) = probe.local_addr() else {
-        return None;
-    };
-    Some(Host::make(&local.ip().to_string()))
 }
 
 /// What can stop a process from learning what only its machine knows.

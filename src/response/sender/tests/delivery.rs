@@ -1,10 +1,10 @@
 //! What happens to a response between its hook and the wire.
 
-use super::{CAP_BYTES, Harness, PAYLOAD, attempts, config, node, paused, port};
+use super::{CAP_BYTES, Harness, PAYLOAD, config, node, paused, port};
 use crate::Codec;
 use crate::response::frame::FrameCap;
 use crate::response::frame::decode::decode_frame;
-use crate::response::frame::tests::{CountingCodec, serialized_on_this_thread};
+use crate::response::frame::tests::CountingCodec;
 use color_eyre::Result;
 
 /// The destination these suites address.
@@ -42,30 +42,6 @@ fn a_response_reaches_the_wire_intact() -> Result<()> {
         );
 
         assert_eq!(drained.sent, 1);
-        Ok(())
-    })
-}
-
-/// A response whose deadline passed is dropped before it is encoded.
-#[test]
-fn an_expired_response_is_never_encoded() -> Result<()> {
-    let runtime = paused()?;
-    runtime.block_on(async {
-        let harness = Harness::new(config())?;
-        let serialized = serialized_on_this_thread();
-        harness.run_expired(TARGET).await?;
-
-        let drained = harness.drain().await?;
-        assert_eq!(
-            serialized_on_this_thread() - serialized,
-            0,
-            "the expired response must never be encoded"
-        );
-        assert_eq!(
-            attempts(&drained.deliveries, TARGET),
-            0,
-            "the expired response must never reach the transport"
-        );
         Ok(())
     })
 }

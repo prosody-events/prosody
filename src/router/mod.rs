@@ -344,7 +344,7 @@ impl SendFailure {
     ///   before anything left. Neither is the destination's word.
     ///
     /// `DEADLINE_EXCEEDED` is deliberately not here. It is the answer of a peer
-    /// that read the frame and ran out of the budget this response stated, so
+    /// that read the frame after this response's deadline, so
     /// it is that peer speaking about the whole path rather than about the
     /// address. The other endpoint has no more time to spend than this one had.
     pub(crate) const fn is_wrong_endpoint(self) -> bool {
@@ -464,9 +464,9 @@ pub(crate) enum SendFailure {
     #[error("destination published an address that cannot be dialed")]
     Undialable,
 
-    /// The budget ran out before the frame left this process, so nothing
+    /// The deadline elapsed before the frame left this process, so nothing
     /// reached the destination and the destination said nothing.
-    #[error("the send budget ran out before the frame left this process")]
+    #[error("the send deadline elapsed before the frame left this process")]
     Expired,
 }
 

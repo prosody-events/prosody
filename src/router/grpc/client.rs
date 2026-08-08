@@ -122,7 +122,7 @@ impl ResponseSender for GrpcSender {
             warn!(%error, host = %address.host, port = address.port, "a peer channel never became ready");
             return Err(SendFailure::Unreachable);
         }
-        // The outbound budget is written here rather than earlier, because
+        // The outbound timeout is written here rather than earlier, because
         // everything above it — the channel lookup and the readiness wait —
         // spends against the same deadline. Nothing has left this process yet,
         // so no time left is this process's own expiry rather than an answer.

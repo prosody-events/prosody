@@ -50,15 +50,11 @@ pub(crate) struct TestHealth {
 
 /// One delivery attempt, as the transport saw it.
 ///
-/// The frame bytes are copied out at the moment of the attempt. `at` is the
-/// virtual instant a paused-time test advances to, and `deadline` is the
-/// instant the caller gave this attempt to finish by.
+/// The frame bytes are copied out at the moment of the attempt.
 #[derive(Debug)]
 pub(crate) struct Delivery {
     pub(crate) port: u16,
     pub(crate) bytes: BytesMut,
-    pub(crate) at: Instant,
-    pub(crate) deadline: Instant,
 }
 
 /// What one sender or responder came to after all sends finished.
@@ -277,7 +273,7 @@ impl ResponseSender for LoopbackSender {
         &self,
         address: &Endpoint,
         frame: &F,
-        deadline: Instant,
+        _deadline: Instant,
     ) -> impl Future<Output = Result<(), SendFailure>> + Send {
         let port = address.port;
         let mut bytes = BytesMut::with_capacity(frame.bytes());
@@ -286,12 +282,7 @@ impl ResponseSender for LoopbackSender {
         // The attempt is recorded before it is answered, so a held attempt is
         // observable while it is still held. A closed stream means the test
         // already ended, and the record is simply lost.
-        drop(self.deliveries.send(Delivery {
-            port,
-            bytes,
-            at: Instant::now(),
-            deadline,
-        }));
+        drop(self.deliveries.send(Delivery { port, bytes }));
         async move {
             match answer {
                 Answer::Accepted => Ok(()),

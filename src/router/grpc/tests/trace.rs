@@ -9,6 +9,7 @@
 
 use super::{ALPHA, Harness, header, reaching, register};
 use crate::response::frame::tests::CountingCodec;
+use crate::response::headers::RequestDeadline;
 use crate::response::sender::TypedSender;
 use crate::router::Router;
 use crate::test_util::{GlobalSpans, TEST_RUNTIME, named};
@@ -56,7 +57,13 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         let caller_span = trace.span().span_context().clone();
         let payload = PAYLOAD.to_vec();
         let prepared = sender.prepare(header(harness.node, request.id(), ALPHA)?, &payload);
-        let delivered = sender.send(prepared, trace).await;
+        let delivered = sender
+            .send(
+                prepared,
+                trace,
+                RequestDeadline::from_unix_micros(4_102_444_800_000_000),
+            )
+            .await;
         drop(caller);
         drop(sender);
         ensure!(

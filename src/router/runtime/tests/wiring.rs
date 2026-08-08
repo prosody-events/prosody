@@ -8,7 +8,7 @@
 //! runtime can hold either argument.
 
 use super::super::{PeerInputs, PeerRuntime, RouterConfiguration};
-use super::{ALPHA, CONTACT, LEASE, TIMEOUT, frame_cap, header, listener, start_runtime};
+use super::{ALPHA, LEASE, TIMEOUT, frame_cap, header, listener, start_runtime};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
@@ -76,7 +76,6 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
             directory: directory.clone(),
             listener: listener().await?,
             heartbeats: HeartbeatRegistry::test(),
-            probe: Some(CONTACT),
             router: &config,
             fleet: FleetConfiguration::default(),
         })
@@ -124,7 +123,7 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
 /// arrives there.
 ///
 /// The runtime hands its listener's service a relay over its own router, the
-/// frame ceiling that listener enforces, and a forward budget. All three reach
+/// frame ceiling that listener enforces. Both values reach
 /// the service at one call. The second listener's registry holding the payload
 /// is the assertion, because the relay is the only path to it.
 #[test]
@@ -166,7 +165,6 @@ impl Elsewhere {
                 LocalTarget::new(node, Arc::clone(&registry)),
                 Relay::new(unused),
                 cap,
-                TIMEOUT,
             ),
             TestHealth::new(true, true),
             async move { stopped.await.unwrap_or(()) },
@@ -212,7 +210,6 @@ async fn start_over(
         directory: directory.clone(),
         listener: bound,
         heartbeats: HeartbeatRegistry::test(),
-        probe: Some(CONTACT),
         router: &config,
         fleet: FleetConfiguration::default(),
     })
@@ -254,7 +251,6 @@ async fn bind() -> Result<BoundListener> {
     Ok(BoundListener::bind(&TransportConfiguration {
         bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         frame_cap: frame_cap()?,
-        ..TransportConfiguration::default()
     })
     .await?)
 }

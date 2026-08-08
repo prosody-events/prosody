@@ -23,15 +23,6 @@ const UNKNOWN_TAG: u32 = 99;
 const RAW_ID: [u8; 16] = [0x11; 16];
 
 thread_local! {
-    /// Payloads serialized on this thread, by every [`CountingCodec`] on it.
-    ///
-    /// A response send builds its own codec through `Default`. A suite that
-    /// drives delivery holds no handle on the instance that encodes. Those
-    /// suites use one current-thread runtime. Thus, this total includes that
-    /// serialization. Read it through
-    /// [`serialized_on_this_thread`] as a difference, never as an absolute:
-    /// every other codec on the same thread counts here too.
-    static SERIALIZED_HERE: Cell<usize> = const { Cell::new(0) };
     static CACHE_USES: Cell<usize> = const { Cell::new(0) };
     static SERIALIZE_CAPACITY: Cell<usize> = const { Cell::new(0) };
 }
@@ -73,7 +64,6 @@ impl Codec for CountingCodec {
     }
 
     fn serialize(&mut self, payload: Vec<u8>, buf: &mut Vec<u8>) -> Result<(), Infallible> {
-        SERIALIZED_HERE.set(SERIALIZED_HERE.get() + 1);
         if buf.is_empty() {
             *buf = payload;
         } else {
@@ -83,7 +73,6 @@ impl Codec for CountingCodec {
     }
 
     fn serialize_ref(&mut self, payload: &Vec<u8>, buf: &mut Vec<u8>) -> Result<(), Infallible> {
-        SERIALIZED_HERE.set(SERIALIZED_HERE.get() + 1);
         SERIALIZE_CAPACITY.set(buf.capacity());
         buf.extend_from_slice(payload);
         Ok(())
@@ -109,11 +98,6 @@ impl Default for RawFrame<'_> {
             unknown: None,
         }
     }
-}
-
-/// How many payloads [`CountingCodec`] has serialized on this thread.
-pub(crate) fn serialized_on_this_thread() -> usize {
-    SERIALIZED_HERE.get()
 }
 
 pub(crate) fn cache_uses_on_this_thread() -> usize {

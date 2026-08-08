@@ -11,7 +11,7 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::requester::{Outcome, ProsodyRequester, ResponseFailure};
 use crate::response::frame::ResponseFrame;
-use crate::response::headers::RequestTag;
+use crate::response::headers::{RequestDeadline, RequestTag};
 use crate::response::{FormatToken, RequestId, ResponseStatus};
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
@@ -306,7 +306,12 @@ pub(super) fn formatted_frame(
     format: &str,
 ) -> ResponseFrame {
     ResponseFrame {
-        header: RequestTag::new(id, NODE).header(subsystem.clone(), status),
+        header: RequestTag::new(
+            id,
+            NODE,
+            RequestDeadline::from_unix_micros(1_700_000_000_000_000),
+        )
+        .header(subsystem.clone(), status),
         format: FormatToken::make(format),
         payload,
     }

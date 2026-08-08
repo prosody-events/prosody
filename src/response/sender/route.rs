@@ -6,22 +6,15 @@ use crate::otel::carry_parent;
 use crate::response::ResponseDisposition;
 use crate::response::frame::FrameHeader;
 use crate::response::frame::encode::{FrameEncoder, Staged};
-use crate::router::directory::Endpoint;
+use crate::response::headers::RequestDeadline;
 use crate::router::fleet::Destination;
-use crate::router::{Framed, Preference, ResponseSender, Router, SendFailure};
+use crate::router::{Preference, ResponseSender, Router};
 use opentelemetry::Context;
 use std::future::Future;
-use tokio::select;
-use tokio::time::{Instant, sleep_until, timeout_at};
 use tracing::field::Empty;
 use tracing::{Instrument, debug_span, warn};
 
 use crate::router::LocalTarget;
-
-/// One in this many of the deadline that is left is what an endpoint keeps for
-/// the fallback behind it — and all an endpoint that has never answered may
-/// spend. See [`Share`].
-const FALLBACK_DIVISOR: u32 = 4;
 
 /// One response route in a statically composed route chain.
 pub trait ResponseRoute: Clone + Send + Sync + 'static {
@@ -30,50 +23,13 @@ pub trait ResponseRoute: Clone + Send + Sync + 'static {
         &self,
         frame: Staged,
         destination: &Destination,
-        expires_at: Instant,
+        deadline: RequestDeadline,
     ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send;
 }
 
 /// Two routes evaluated in order.
 #[derive(Clone)]
 pub(crate) struct Then<A, B>(pub(crate) A, pub(crate) B);
-
-/// How much of what is left of a response's deadline one endpoint may spend.
-///
-/// While a route still has a candidate untried, no endpoint gets the whole
-/// budget. An address which drops packets instead of refusing them would
-/// otherwise spend the deadline unanswered and leave the endpoint that works
-/// untried — and that is exactly what a misapplied label reaches.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Share {
-    /// An endpoint with a fallback behind it that this destination has never
-    /// answered on. One [`FALLBACK_DIVISOR`]th of what is left.
-    Probe,
-    /// An endpoint with a fallback behind it that this destination answered on
-    /// before. Everything but the [`FALLBACK_DIVISOR`]th it keeps for that
-    /// fallback, because an endpoint that already answered is worth waiting
-    /// for.
-    Most,
-    /// The last endpoint of a route. Everything that is left.
-    Rest,
-}
-
-impl Share {
-    /// The instant this endpoint must give up at, measured from now.
-    ///
-    /// Read after the pacing wait rather than before it, so a share is a slice
-    /// of the time that is left to reach the network with.
-    fn until(self, expires_at: Instant) -> Instant {
-        let now = Instant::now();
-        let left = expires_at.saturating_duration_since(now);
-        let reserved = left / FALLBACK_DIVISOR;
-        match self {
-            Self::Probe => now + reserved,
-            Self::Most => now + left.saturating_sub(reserved),
-            Self::Rest => expires_at,
-        }
-    }
-}
 
 /// Frames and delivers one response.
 ///
@@ -82,12 +38,6 @@ impl Share {
 /// attribute on its own span. A delivered job also records `peer.preference`
 /// and counts one fallback transition when its walk made one. Every count of a
 /// response's outcome sits in this one match. Thus, no counters can disagree.
-/// The deadline is the biased arm of the select. Thus, an expired response is
-/// dropped before the route is
-/// polled at all — nothing is paced, encoded or sent for it.
-/// Work already inside one poll still finishes: this is a deadline the pipeline
-/// is measured against between polls, never an absolute wall-clock cut.
-///
 /// The `peer.response.send` span is opened here and covers the delivery alone.
 /// It is a child of the trace the job carries, so the listener's
 /// `peer.response.receive` — parented on the context this span's own injection
@@ -97,7 +47,7 @@ pub(super) async fn deliver_response<R: ResponseRoute>(
     prepared: PreparedResponse,
     trace: Context,
     destination: &Destination,
-    expires_at: Instant,
+    deadline: RequestDeadline,
 ) -> bool {
     let header = prepared.header();
     let span = debug_span!(
@@ -110,21 +60,16 @@ pub(super) async fn deliver_response<R: ResponseRoute>(
         peer.preference = Empty,
     );
     carry_parent(&span, trace);
-    // One deadline over the whole pipeline — the pacing wait, the address
-    // read, the encode and every attempt — so a transport that never
-    // answers still ends the delivery.
     let outcome = match prepared {
-        PreparedResponse::Ready(frame) => select! {
-            biased;
-            () = sleep_until(expires_at) => Err(DropReason::Deadline),
-            outcome = deliver_route(destination, router, frame, expires_at)
-                .instrument(span.clone()) => outcome,
-        },
+        PreparedResponse::Ready(frame) => {
+            deliver_route(destination, router, frame, deadline)
+                .instrument(span.clone())
+                .await
+        }
         PreparedResponse::Rejected(_, reason) => Err(reason),
     };
     // Recorded through the owned handle rather than the current span: a
-    // level-disabled span never becomes current, and the deadline arm has
-    // already left the instrumented future in any case.
+    // level-disabled span never becomes current.
     let delivered = outcome.is_ok();
     match outcome {
         Ok(delivery) => {
@@ -157,17 +102,13 @@ pub(super) async fn deliver_response<R: ResponseRoute>(
 /// response was dropped. The transition travels out rather than being counted
 /// here, so the caller counts the whole outcome of one response in one
 /// place.
-///
-/// The *time* budget is split the same way, and for the same reason. [`Share`]
-/// owns how much of it one endpoint may spend, and the endpoint this
-/// destination remembers is the one that gets the larger part.
 async fn deliver_route<R: ResponseRoute>(
     destination: &Destination,
     router: &R,
     frame: Staged,
-    expires_at: Instant,
+    deadline: RequestDeadline,
 ) -> Result<Delivery, DropReason> {
-    match router.deliver(frame, destination, expires_at).await? {
+    match router.deliver(frame, destination, deadline).await? {
         RouteOutcome::Delivered(delivery) => Ok(delivery),
         RouteOutcome::Declined(_) => Err(DropReason::UnresolvableNode),
     }
@@ -178,7 +119,7 @@ impl ResponseRoute for LocalTarget {
         &self,
         frame: Staged,
         _destination: &Destination,
-        _expires_at: Instant,
+        _deadline: RequestDeadline,
     ) -> Result<RouteOutcome, DropReason> {
         if !self.owns(frame.target()) {
             return Ok(RouteOutcome::Declined(frame));
@@ -198,7 +139,7 @@ impl<R: Router> ResponseRoute for R {
         &self,
         frame: Staged,
         destination: &Destination,
-        expires_at: Instant,
+        deadline: RequestDeadline,
     ) -> Result<RouteOutcome, DropReason> {
         let target = frame.target();
         // No address originates anywhere but a registration: a node the directory
@@ -221,16 +162,12 @@ impl<R: Router> ResponseRoute for R {
         let preferred = destination.preferred();
         let candidates = route.candidates(preferred);
         let has_fallback = candidates[1].is_some();
-        let proven = candidates[0].is_some_and(|(preference, _)| Some(preference) == preferred);
         for (preference, address) in candidates.into_iter().flatten() {
-            let share = if previous.is_some() || !has_fallback {
-                Share::Rest
-            } else if proven {
-                Share::Most
-            } else {
-                Share::Probe
-            };
-            match deliver(self.sender(), address, &frame, expires_at, share).await {
+            match self
+                .sender()
+                .deliver(address, &frame, deadline.expires_at())
+                .await
+            {
                 Ok(()) => {
                     destination.prefer(Some(preference));
                     return Ok(RouteOutcome::Delivered(Delivery::Remote {
@@ -274,10 +211,10 @@ impl<A: ResponseRoute, B: ResponseRoute> ResponseRoute for Then<A, B> {
         &self,
         frame: Staged,
         destination: &Destination,
-        expires_at: Instant,
+        deadline: RequestDeadline,
     ) -> Result<RouteOutcome, DropReason> {
-        match self.0.deliver(frame, destination, expires_at).await? {
-            RouteOutcome::Declined(frame) => self.1.deliver(frame, destination, expires_at).await,
+        match self.0.deliver(frame, destination, deadline).await? {
+            RouteOutcome::Declined(frame) => self.1.deliver(frame, destination, deadline).await,
             delivered @ RouteOutcome::Delivered(_) => Ok(delivered),
         }
     }
@@ -330,41 +267,5 @@ pub(super) fn stage<C: Codec>(
             warn!(%error, node = %header.target, "response could not be framed");
             PreparedResponse::Rejected(header, DropReason::EncodeFailed)
         }
-    }
-}
-
-/// Delivers one frame to one endpoint within its route share.
-async fn deliver<S: ResponseSender, F: Framed + Sync>(
-    sender: &S,
-    address: &Endpoint,
-    frame: &F,
-    expires_at: Instant,
-    share: Share,
-) -> Result<(), SendFailure> {
-    let until = share.until(expires_at);
-    attempt(sender, address, frame, expires_at, until).await
-}
-
-/// One attempt, bounded twice over: by `expires_at` on the wire and by `until`
-/// here.
-///
-/// The two deadlines are different on purpose. `expires_at` is what the peer is
-/// told to answer inside, so a `DEADLINE_EXCEEDED` still means what it says —
-/// the whole response ran out of time — rather than "this process moved on".
-/// `until` is what this process spends on this one endpoint, and it covers the
-/// channel lookup and the readiness wait as well, neither of which the
-/// `grpc-timeout` header reaches. Giving up on it therefore reads as
-/// [`SendFailure::Unreachable`]: nothing answered here, and the next candidate
-/// keeps what the response has left.
-async fn attempt<S: ResponseSender, F: Framed + Sync>(
-    sender: &S,
-    address: &Endpoint,
-    frame: &F,
-    expires_at: Instant,
-    until: Instant,
-) -> Result<(), SendFailure> {
-    match timeout_at(until, sender.deliver(address, frame, expires_at)).await {
-        Ok(outcome) => outcome,
-        Err(_) => Err(SendFailure::Unreachable),
     }
 }

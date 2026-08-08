@@ -11,6 +11,7 @@ use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::{ConsumerError, PeerInitError};
 use crate::response::frame::encode::Staged;
+use crate::response::headers::RequestDeadline;
 use crate::response::sender::{DropReason, ResponseRoute, RouteOutcome, Then};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::fleet::Destination;
@@ -19,7 +20,6 @@ use crate::router::{LocalTarget, RouterHandle};
 use crate::state_reader::CassandraReaderBackend;
 use crate::subsystem::SubsystemName;
 use std::future::Future;
-use tokio::time::Instant;
 
 mod sealed {
     use super::{ConsumerHandle, ResponseRoute};
@@ -163,9 +163,9 @@ impl ResponseRoute for LocalResponseRoute {
         &self,
         frame: Staged,
         destination: &Destination,
-        expires_at: Instant,
+        deadline: RequestDeadline,
     ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send {
-        self.0.deliver(frame, destination, expires_at)
+        self.0.deliver(frame, destination, deadline)
     }
 }
 
@@ -174,9 +174,9 @@ impl ResponseRoute for GrpcResponseRoute {
         &self,
         frame: Staged,
         destination: &Destination,
-        expires_at: Instant,
+        deadline: RequestDeadline,
     ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send {
-        self.0.deliver(frame, destination, expires_at)
+        self.0.deliver(frame, destination, deadline)
     }
 }
 

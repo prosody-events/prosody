@@ -63,10 +63,7 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// name at most, so this ceiling is small and fixed rather than configurable.
 const CONTROL_MESSAGE_BYTES: usize = 4 * 1024;
 
-/// What an operator sets for the peer listener.
-///
-/// Every field has a working default, so a process that serves peers needs no
-/// configuration. The frame ceiling bounds each request and response.
+/// Internal peer listener settings.
 #[derive(Builder, Clone, Copy, Debug, Validate)]
 #[builder(setter(into), default)]
 pub(crate) struct TransportConfiguration {
@@ -74,15 +71,8 @@ pub(crate) struct TransportConfiguration {
     /// one, and [`BoundListener`] is then the only place that port can be read.
     pub(crate) bind: SocketAddr,
 
-    /// The ceiling on one encoded frame, in both directions. The listener
-    /// refuses a larger message before it is decoded, and the client refuses
-    /// one before it is sent.
+    /// The internal ceiling on one encoded frame, in both directions.
     pub(crate) frame_cap: FrameCap,
-
-    /// Whether the listener publishes the peer schema through server
-    /// reflection. It is the one thing here that hands an unauthenticated
-    /// caller information rather than a rejection, so it is configurable.
-    pub(crate) reflection: bool,
 }
 
 /// A listener that is already bound, the address it bound, and the
@@ -104,7 +94,6 @@ impl Default for TransportConfiguration {
         Self {
             bind: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             frame_cap: FrameCap::DEFAULT,
-            reflection: true,
         }
     }
 }
@@ -139,8 +128,8 @@ impl BoundListener {
     }
 }
 
-/// Serves the peer method, health and — when configured — reflection on
-/// `bound`, until `shutdown` completes.
+/// Serves the peer method, health, and reflection on `bound` until `shutdown`
+/// completes.
 ///
 /// This is the one place the peer server is built. Transport security and peer
 /// authorization are designed separately, and they attach here.
@@ -163,15 +152,10 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let config = bound.config;
-    let reflection = config
-        .reflection
-        .then(|| {
-            ReflectionBuilder::configure()
-                .register_encoded_file_descriptor_set(DESCRIPTOR_SET)
-                .build_v1()
-        })
-        .transpose()?
-        .map(|service| service.max_decoding_message_size(CONTROL_MESSAGE_BYTES));
+    let reflection = ReflectionBuilder::configure()
+        .register_encoded_file_descriptor_set(DESCRIPTOR_SET)
+        .build_v1()?
+        .max_decoding_message_size(CONTROL_MESSAGE_BYTES);
     let incoming = incoming(bound.listener);
     let router = Server::builder()
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
@@ -181,7 +165,7 @@ where
             HealthServer::new(PeerHealth::new(health))
                 .max_decoding_message_size(CONTROL_MESSAGE_BYTES),
         )
-        .add_optional_service(reflection);
+        .add_service(reflection);
     Ok(tokio::spawn(async move {
         if let Err(error) = router
             .serve_with_incoming_shutdown(incoming, shutdown)

@@ -1,6 +1,6 @@
 //! Which process a frame is accepted by, forwarded by, or refused by.
 
-use super::{CAP_BYTES, Process, THIS, frame};
+use super::{BUDGET, CAP_BYTES, Process, THIS, frame};
 use crate::response::frame::FrameCap;
 use crate::response::frame::decode::decode_frame;
 use crate::router::loopback::{config, node, paused, port};
@@ -52,7 +52,7 @@ fn prop_a_frame_is_accepted_only_by_the_process_it_names(routed: Routed) -> Test
 
 /// Drives one case and holds it to the table.
 async fn play(routed: &Routed) -> Result<()> {
-    let mut process = Process::new(config(), super::BUDGET)?;
+    let mut process = Process::new(config())?;
     let mut request = process.expects()?;
     let target = node(routed.target);
     let relay = routed.relay.map(node);
@@ -64,7 +64,7 @@ async fn play(routed: &Routed) -> Result<()> {
     let refused = !mine && relay.is_some();
 
     let answered = process
-        .deliver(frame(target, request.id(), relay)?, None)
+        .deliver(frame(target, request.id(), relay)?, BUDGET)
         .await?;
 
     if request.received() != accepted {

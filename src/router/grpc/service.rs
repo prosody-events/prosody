@@ -14,7 +14,6 @@ use crate::router::relay::{Relay, RelayFailure, Routing, routing};
 use crate::router::{LocalTarget, RelayHop};
 use async_trait::async_trait;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
-use std::time::Duration;
 use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::field::{Empty, display};
@@ -30,25 +29,16 @@ pub(crate) struct PeerService<R> {
     local: LocalTarget,
     relay: Relay<R>,
     cap: FrameCap,
-    /// This process's own ceiling on one forward. [`inbound_deadline`] owns
-    /// what it does to the budget a caller stated.
-    budget: Duration,
     propagator: TextMapCompositePropagator,
 }
 
 impl<R> PeerService<R> {
     /// Serves `local` and sends every other frame through `relay`.
-    pub(crate) fn new(
-        local: LocalTarget,
-        relay: Relay<R>,
-        cap: FrameCap,
-        budget: Duration,
-    ) -> Self {
+    pub(crate) fn new(local: LocalTarget, relay: Relay<R>, cap: FrameCap) -> Self {
         Self {
             local,
             relay,
             cap,
-            budget,
             propagator: new_propagator(),
         }
     }
@@ -82,16 +72,16 @@ impl<R: RelayHop> Peer for PeerService<R> {
             self.propagator
                 .extract(&MetadataExtractor::new(request.metadata())),
         );
-        // The caller's budget becomes an instant on arrival, and everything
-        // this call does is spent against it. A duration passed on unchanged
-        // would hand a second hop a fresh full budget.
-        let deadline = inbound_deadline(request.metadata(), self.budget);
-        let granted = deadline
+        // Convert the caller's timeout to an instant on arrival. Forward the
+        // remaining duration so a second hop does not restart the timeout.
+        let deadline = inbound_deadline(request.metadata())
+            .ok_or_else(|| Status::invalid_argument("grpc-timeout is missing or invalid"))?;
+        let remaining_ms = deadline
             .saturating_duration_since(Instant::now())
             .as_millis();
         span.record(
             "peer.deadline_ms",
-            i64::try_from(granted).unwrap_or(i64::MAX),
+            i64::try_from(remaining_ms).unwrap_or(i64::MAX),
         );
         let frame = request.into_inner();
         async {

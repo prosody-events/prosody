@@ -18,7 +18,7 @@ use crate::consumer::{EventHandler, Partition, Topic};
 use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::RequestId;
 use crate::response::frame::FrameCap;
-use crate::response::headers::RequestTag;
+use crate::response::headers::{RequestDeadline, RequestTag};
 use crate::router::Router;
 use crate::router::loopback::{Delivery, TestRouter, collect_deliveries, config, node};
 use crate::subsystem::SubsystemName;
@@ -247,6 +247,34 @@ fn tagged(index: u8, request_byte: u8, key: &str) -> Result<ConsumerMessage<Valu
     tagged_under(index, request_byte, key, Span::current())
 }
 
+/// A message with an explicit Unix response deadline.
+fn tagged_at(
+    index: u8,
+    request_byte: u8,
+    key: &str,
+    deadline_micros: u64,
+) -> Result<ConsumerMessage<Value>> {
+    tagged_at_under(index, request_byte, key, deadline_micros, Span::current())
+}
+
+fn tagged_at_under(
+    index: u8,
+    request_byte: u8,
+    key: &str,
+    deadline_micros: u64,
+    span: Span,
+) -> Result<ConsumerMessage<Value>> {
+    create_message(
+        key,
+        Some(RequestTag::new(
+            RequestId::from_bytes([request_byte; 16]),
+            node(index),
+            RequestDeadline::from_unix_micros(deadline_micros),
+        )),
+        span,
+    )
+}
+
 /// [`tagged`] with the record's own span named, for a suite whose claim is
 /// which trace the answer lands in.
 fn tagged_under(
@@ -255,14 +283,7 @@ fn tagged_under(
     key: &str,
     span: Span,
 ) -> Result<ConsumerMessage<Value>> {
-    create_message(
-        key,
-        Some(RequestTag::new(
-            RequestId::from_bytes([request_byte; 16]),
-            node(index),
-        )),
-        span,
-    )
+    tagged_at_under(index, request_byte, key, 4_102_444_800_000_000, span)
 }
 
 /// A message that asks for nothing — ordinary traffic.

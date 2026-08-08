@@ -3,7 +3,7 @@
 use super::super::{
     PeerInputs, PeerRuntimeError, PreparedPeerRuntime, RouterConfiguration, refresh_delay,
 };
-use super::{CONTACT, listener};
+use super::listener;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::router::directory::RegistrationTtl;
 use crate::router::directory::tests::support::test_directory;
@@ -36,7 +36,6 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
             directory: test_directory(REFUSED_LEASE)?,
             listener: listener().await?,
             heartbeats: HeartbeatRegistry::test(),
-            probe: Some(CONTACT),
             router: &router,
             fleet: FleetConfiguration::default(),
         })
@@ -139,16 +138,12 @@ fn peer_cache_capacity_is_positive() {
     for capacity in [1, 100_000, usize::MAX] {
         let config = FleetConfiguration {
             peer_capacity: capacity,
-            ..FleetConfiguration::default()
         };
         assert!(
             config.validate().is_ok(),
             "capacity {capacity} must validate"
         );
     }
-    let config = FleetConfiguration {
-        peer_capacity: 0,
-        ..FleetConfiguration::default()
-    };
+    let config = FleetConfiguration { peer_capacity: 0 };
     assert!(config.validate().is_err(), "zero must be refused");
 }

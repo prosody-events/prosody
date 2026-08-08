@@ -131,7 +131,6 @@ pub(crate) fn transport(cap: usize) -> Result<TransportConfiguration> {
     Ok(TransportConfiguration {
         bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         frame_cap: FrameCap::new(cap)?,
-        ..TransportConfiguration::default()
     })
 }
 

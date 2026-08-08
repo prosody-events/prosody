@@ -9,8 +9,9 @@ use crate::error::ClassifyError;
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::response::RequestId;
 use crate::response::headers::{
-    ID_TEXT_LEN, REQUEST_REVISION, RESPONSE_AWAITED_HEADER, RESPONSE_NODE_HEADER,
-    RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, id_text, is_reserved,
+    ID_TEXT_LEN, REQUEST_REVISION, RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER,
+    RESPONSE_NODE_HEADER, RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline,
+    id_text, is_reserved,
 };
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
@@ -32,7 +33,7 @@ use tracing::{Span, instrument};
 mod tests;
 
 /// Reserved headers that occur exactly once in every request.
-const RESERVED_SINGLETONS: usize = 3;
+const RESERVED_SINGLETONS: usize = 4;
 
 /// Headers one request carries before the list uses the heap.
 const HEADER_INLINE: usize = 8;
@@ -102,6 +103,9 @@ pub enum RequestError<E: Error> {
         /// The reserved header name.
         name: &'static str,
     },
+    /// The timeout cannot be represented as a wire or runtime deadline.
+    #[error("the request timeout is too large")]
+    DeadlineOutOfRange,
     /// Registry shutdown has started.
     #[error("the requester is shutting down")]
     ShuttingDown,
@@ -181,6 +185,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         // the borrows the list holds on them.
         let mut request_buf = [0_u8; ID_TEXT_LEN];
         let mut node_buf = [0_u8; ID_TEXT_LEN];
+        let mut deadline_buf = itoa::Buffer::new();
         let user_headers = headers.into_iter();
         let capacity = user_headers
             .len()
@@ -195,15 +200,15 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             record_headers.push((name, value));
         }
 
+        let deadline = RequestDeadline::after(timeout).ok_or(RequestError::DeadlineOutOfRange)?;
         let mut registration = self.registry.register(subsystems, timeout)?;
         Span::current().record("request.id", display(registration.id()));
 
         append_request_headers(
             &mut record_headers,
-            registration.id(),
-            &mut request_buf,
-            self.node,
-            &mut node_buf,
+            (registration.id(), &mut request_buf),
+            (self.node, &mut node_buf),
+            (deadline, &mut deadline_buf),
             subsystems,
         );
 
@@ -261,25 +266,23 @@ const fn completeness(answered: usize, awaited: usize) -> &'static str {
 }
 
 /// Appends the reserved headers that tell a responder where to answer.
-///
-/// Each id arrives as its own type and is rendered here, so the two cannot be
-/// written to each other's header. One `response-awaited` header carries one
-/// name. A comma is legal in a subsystem name, so one joined header could not
-/// be read back.
 fn append_request_headers<'a>(
     headers: &mut SmallVec<[(&'static str, &'a str); HEADER_INLINE]>,
-    request: RequestId,
-    request_buf: &'a mut [u8; ID_TEXT_LEN],
-    node: NodeId,
-    node_buf: &'a mut [u8; ID_TEXT_LEN],
+    request: (RequestId, &'a mut [u8; ID_TEXT_LEN]),
+    node: (NodeId, &'a mut [u8; ID_TEXT_LEN]),
+    deadline: (RequestDeadline, &'a mut itoa::Buffer),
     subsystems: &'a [SubsystemName],
 ) {
+    let (request, request_buf) = request;
+    let (node, node_buf) = node;
+    let (deadline, deadline_buf) = deadline;
     headers.push((RESPONSE_VERSION_HEADER, REQUEST_REVISION));
     headers.push((
         RESPONSE_REQUEST_ID_HEADER,
         id_text(request.into(), request_buf),
     ));
     headers.push((RESPONSE_NODE_HEADER, id_text(node.into(), node_buf)));
+    headers.push((RESPONSE_DEADLINE_HEADER, deadline.text(deadline_buf)));
     headers.extend(
         subsystems
             .iter()

@@ -333,7 +333,6 @@ pub(crate) async fn prepare_network<D: NodeDirectory>(
         directory,
         listener,
         heartbeats: heartbeat_registry(),
-        probe: parts.probe,
         router: &parts.router,
         fleet: parts.fleet,
     })

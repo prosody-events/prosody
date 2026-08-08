@@ -2,11 +2,10 @@
 //! transport, and a harness that records every attempt it makes.
 
 use super::TypedSender;
-use super::route::deliver_response;
 use crate::error::ErrorCategory;
-use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader};
+use crate::response::headers::RequestDeadline;
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::Router;
 use crate::router::fleet::config::FleetConfiguration;
@@ -15,15 +14,13 @@ use crate::router::loopback::{
 };
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
-use color_eyre::eyre::{bail, eyre};
+use color_eyre::eyre::eyre;
 use opentelemetry::Context;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
 
-mod budget;
 mod delivery;
 mod fallback;
 mod isolation;
@@ -34,6 +31,9 @@ pub(super) const CAP_BYTES: usize = 4096;
 
 /// The response body every result in these suites carries.
 pub(super) const PAYLOAD: &[u8] = b"response";
+
+/// A future Kafka deadline for transport tests.
+const DEADLINE: RequestDeadline = RequestDeadline::from_unix_micros(4_102_444_800_000_000);
 
 /// One fleet, one transport, and one typed sender over them.
 pub(super) struct Harness {
@@ -112,7 +112,10 @@ impl Harness {
             },
             &payload,
         );
-        let delivered = self.sender.send(prepared, Context::current()).await;
+        let delivered = self
+            .sender
+            .send(prepared, Context::current(), DEADLINE)
+            .await;
         self.outcomes.record(delivered);
         Ok(())
     }
@@ -127,36 +130,10 @@ impl Harness {
         };
         let prepared = sender.prepare(header, &PAYLOAD.to_vec());
         tokio::spawn(async move {
-            let delivered = sender.send(prepared, Context::current()).await;
+            let delivered = sender.send(prepared, Context::current(), DEADLINE).await;
             outcomes.record(delivered);
             Ok(())
         })
-    }
-
-    /// Runs one already-expired job without production-only test hooks.
-    pub(super) async fn run_expired(&self, index: u8) -> Result<()> {
-        let target = node(index);
-        let encoder = FrameEncoder::<CountingCodec>::new(FrameCap::new(CAP_BYTES)?);
-        let prepared = super::route::stage(
-            &encoder,
-            FrameHeader {
-                target,
-                ..self.header.clone()
-            },
-            &PAYLOAD.to_vec(),
-        );
-        let delivered = deliver_response(
-            &self.router,
-            prepared,
-            Context::current(),
-            &self.sender.fleet.destination(target),
-            Instant::now(),
-        )
-        .await;
-        if delivered {
-            bail!("the expired job did not stop at the deadline");
-        }
-        Ok(())
     }
 
     /// The next attempt the transport recorded.

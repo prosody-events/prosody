@@ -16,7 +16,6 @@ use crate::router::relay::Relay;
 use crate::router::{LocalTarget, NodeId, RouterHandle};
 use rand::RngExt;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::select;
@@ -133,8 +132,6 @@ pub(crate) struct PeerInputs<'a, D> {
     pub(crate) listener: BoundListener,
     /// Heartbeats owned by this peer runtime.
     pub(crate) heartbeats: HeartbeatRegistry,
-    /// The address that the routed-address probe aims at.
-    pub(crate) probe: Option<SocketAddr>,
     pub(crate) router: &'a RouterConfiguration,
     pub(crate) fleet: FleetConfiguration,
 }
@@ -168,9 +165,9 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         let transport = Arc::new(GrpcSender::new(frame_cap, &fleet));
         let directory = inputs.directory;
         // The blocking pool owns this wait; a runtime thread must not. The
-        // machine-name lookup and the route probe are private to `discovery`,
-        // so this file reaches them only through `discover`.
-        let discovered = match discover(inputs.probe).await {
+        // Machine-name lookup is private to `discovery`, so this file reaches
+        // it only through `discover`.
+        let discovered = match discover().await {
             Ok(discovered) => discovered,
             Err(error) => {
                 pending.terminate();
@@ -193,7 +190,6 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
                 router.local().clone(),
                 Relay::new(router.clone()),
                 frame_cap,
-                inputs.fleet.response_timeout,
             ),
             RuntimeHealth::new(inputs.heartbeats.clone()),
             async move { drop(stopped.await) },

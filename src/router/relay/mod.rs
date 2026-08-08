@@ -8,7 +8,7 @@
 
 use crate::router::{Framed, NodeId, RelayHop, ResponseSender, SendFailure};
 use thiserror::Error;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::Instant;
 use tonic::Code;
 use tracing::warn;
 
@@ -30,7 +30,7 @@ pub(crate) enum Routing {
     AlreadyRelayed,
 }
 
-/// Sends a frame on to the process it names, inside the caller's budget.
+/// Sends a frame on to the process it names before the caller's deadline.
 ///
 /// A relay holds one [`RelayHop`] alone, and it stamps no frame itself. The
 /// caller passes the forwarded form, which carries the relay id by
@@ -62,33 +62,24 @@ impl<R: RelayHop> Relay<R> {
     ///
     /// # Errors
     ///
-    /// Returns [`RelayFailure`] when capacity, time, the lookup, or the
-    /// delivery itself stopped the hop.
+    /// Returns [`RelayFailure`] when the deadline, lookup, or delivery stops
+    /// the hop.
     pub(crate) async fn forward<F: Framed + Sync>(
         &self,
         target: NodeId,
         deadline: Instant,
         frame: &F,
     ) -> Result<(), RelayFailure> {
-        // A frame whose budget was already spent when it arrived reserves
-        // nothing. Answering first is what stops a caller from admitting one
-        // destination after another into the table with frames that could never
-        // have been delivered.
+        // Do not resolve or dial after the incoming gRPC deadline.
         if Instant::now() >= deadline {
             return Err(RelayFailure::DeadlineExceeded);
         }
-        // One deadline covers the directory read and the dial.
-        match timeout_at(deadline, self.hop(target, frame, deadline)).await {
-            Err(_) => Err(RelayFailure::DeadlineExceeded),
-            Ok(outcome) => outcome,
-        }
+        self.hop(target, frame, deadline).await
     }
 
     /// Resolves the target's direct endpoint and makes one attempt.
     ///
-    /// One attempt rather than several: the responder that sent this frame
-    /// keeps its own attempt budget, and a relay that retried would multiply
-    /// that budget by its own.
+    /// The outgoing gRPC request receives the incoming request's deadline.
     async fn hop<F: Framed + Sync>(
         &self,
         target: NodeId,
@@ -145,8 +136,8 @@ pub(crate) fn routing(this: NodeId, target: NodeId, relay: Option<NodeId>) -> Ro
 /// states.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum RelayFailure {
-    /// The caller's budget ran out before the hop finished.
-    #[error("the relay budget ran out")]
+    /// The caller's deadline elapsed before the hop finished.
+    #[error("the relay deadline elapsed")]
     DeadlineExceeded,
 
     /// The target published no direct endpoint, or nothing answered there.

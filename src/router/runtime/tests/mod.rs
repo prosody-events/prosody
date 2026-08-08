@@ -19,7 +19,7 @@ use crate::router::grpc::{BoundListener, TransportConfiguration};
 use crate::router::{Host, NodeId};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,10 +27,6 @@ mod config;
 mod ownership;
 mod shutdown;
 mod wiring;
-
-/// The address the routed-address probe aims at. It is an address literal, so
-/// the probe resolves no name and always aims at one address family.
-pub(super) const CONTACT: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9042));
 
 /// The lease these tests read under. It equals the default a runtime starts
 /// with, and its refresh delay is at least a fifth of it, so no refresh runs
@@ -79,7 +75,6 @@ impl Process {
         let bound = BoundListener::bind(&TransportConfiguration {
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             frame_cap: cap,
-            ..TransportConfiguration::default()
         })
         .await?;
         let listener = Endpoint {
@@ -91,15 +86,8 @@ impl Process {
             directory: directory.clone(),
             listener: bound,
             heartbeats: HeartbeatRegistry::test(),
-            // The probe address pins the address family it answers with,
-            // so the discovered host is the loopback address this listener
-            // bound and a process can reach itself.
-            probe: Some(CONTACT),
             router: &router,
-            fleet: FleetConfiguration {
-                response_timeout: Duration::from_mins(1),
-                ..FleetConfiguration::default()
-            },
+            fleet: FleetConfiguration::default(),
         })
         .await?;
         Ok(Self {
@@ -133,7 +121,6 @@ async fn plain_process() -> Result<PlainProcess> {
         directory: directory.clone(),
         listener: bound,
         heartbeats: HeartbeatRegistry::test(),
-        probe: Some(CONTACT),
         router: &router,
         fleet: FleetConfiguration::default(),
     })

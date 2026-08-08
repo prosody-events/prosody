@@ -1,6 +1,7 @@
 use super::{
-    HeaderRejection, ID_TEXT_LEN, RESPONSE_AWAITED_HEADER, RESPONSE_NODE_HEADER,
-    RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestTag, parse_request_tag,
+    HeaderRejection, ID_TEXT_LEN, RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER,
+    RESPONSE_NODE_HEADER, RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline,
+    RequestTag, parse_request_tag,
 };
 use crate::response::RequestId;
 use crate::router::NodeId;
@@ -22,6 +23,9 @@ const NODE_ID_TEXT: &str = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
 const NODE_ID_BYTES: [u8; 16] = [
     0xf8, 0x1d, 0x4f, 0xae, 0x7d, 0xec, 0x11, 0xd0, 0xa7, 0x65, 0x00, 0xa0, 0xc9, 0x1e, 0x6b, 0xf6,
 ];
+
+const DEADLINE_MICROS: u64 = 1_700_000_000_000_000;
+const DEADLINE_TEXT: &[u8] = b"1700000000000000";
 
 /// A subsystem name whose own text contains a comma — the reason the awaited
 /// header repeats instead of listing names in one value.
@@ -69,9 +73,11 @@ enum Mutation {
     DuplicateVersion,
     DuplicateRequestId,
     DuplicateNode,
+    DuplicateDeadline,
     MissingVersion,
     MissingRequestId,
     MissingNode,
+    MissingDeadline,
     MissingAwaited,
     /// Only the revision header survives.
     OnlyVersion,
@@ -92,6 +98,10 @@ enum Mutation {
     IdTruncated,
     IdNonUtf8,
     IdValueAbsent,
+    DeadlineLeadingZero,
+    DeadlineNonNumeric,
+    DeadlineOverflow,
+    DeadlineValueAbsent,
     AwaitedBlank,
     AwaitedNonUtf8,
     AwaitedTooLong,
@@ -169,24 +179,39 @@ impl Case {
         SubsystemName::try_new(name)
     }
 
-    /// The record's headers, well-formed and then deviated by the mutation.
-    fn headers(self) -> Vec<(String, Option<Vec<u8>>)> {
+    /// A valid request header set with one unrelated producer header.
+    fn base_headers(&self) -> Vec<(String, Option<Vec<u8>>)> {
         // A producer's own header rides every record, so it belongs in the base
-        // rather than in one case. Every mutation then mixes producer headers
-        // with reserved ones, which is the shape a real record has, and the
-        // parser's skip arm is exercised by the whole suite.
+        // rather than in one case.
         let mut headers = vec![
             header(crate::SOURCE_SYSTEM_HEADER, b"upstream"),
-            header(RESPONSE_VERSION_HEADER, b"1"),
+            header(RESPONSE_VERSION_HEADER, b"2"),
             header(RESPONSE_REQUEST_ID_HEADER, REQUEST_ID_TEXT.as_bytes()),
             header(RESPONSE_NODE_HEADER, NODE_ID_TEXT.as_bytes()),
+            header(RESPONSE_DEADLINE_HEADER, DEADLINE_TEXT),
         ];
         headers.extend(
             self.awaited
                 .iter()
                 .map(|name| header(RESPONSE_AWAITED_HEADER, name.as_bytes())),
         );
+        headers
+    }
 
+    /// The record's headers, well-formed and then deviated by the mutation.
+    fn headers(self) -> Vec<(String, Option<Vec<u8>>)> {
+        let rotation = self.rotation;
+        let headers = self.base_headers();
+        let mut headers = self.mutate(headers);
+        let len = headers.len();
+        if len > 0 {
+            headers.rotate_left(rotation % len);
+        }
+        headers
+    }
+
+    /// Applies this case's one deviation from a valid request.
+    fn mutate(self, mut headers: Vec<(String, Option<Vec<u8>>)>) -> Vec<(String, Option<Vec<u8>>)> {
         match self.mutation {
             Mutation::WellFormed | Mutation::NotAwaited => {}
             Mutation::WellFormedCommaResponder => {
@@ -195,7 +220,7 @@ impl Case {
             Mutation::NoReservedHeaders => {
                 headers.retain(|(key, _)| key == crate::SOURCE_SYSTEM_HEADER);
             }
-            Mutation::DuplicateVersion => headers.push(header(RESPONSE_VERSION_HEADER, b"1")),
+            Mutation::DuplicateVersion => headers.push(header(RESPONSE_VERSION_HEADER, b"2")),
             Mutation::DuplicateRequestId => headers.push(header(
                 RESPONSE_REQUEST_ID_HEADER,
                 REQUEST_ID_TEXT.as_bytes(),
@@ -203,13 +228,17 @@ impl Case {
             Mutation::DuplicateNode => {
                 headers.push(header(RESPONSE_NODE_HEADER, NODE_ID_TEXT.as_bytes()));
             }
+            Mutation::DuplicateDeadline => {
+                headers.push(header(RESPONSE_DEADLINE_HEADER, DEADLINE_TEXT));
+            }
             Mutation::MissingVersion => drop_header(&mut headers, RESPONSE_VERSION_HEADER),
             Mutation::MissingRequestId => drop_header(&mut headers, RESPONSE_REQUEST_ID_HEADER),
             Mutation::MissingNode => drop_header(&mut headers, RESPONSE_NODE_HEADER),
+            Mutation::MissingDeadline => drop_header(&mut headers, RESPONSE_DEADLINE_HEADER),
             Mutation::MissingAwaited => drop_header(&mut headers, RESPONSE_AWAITED_HEADER),
             Mutation::OnlyVersion => headers.retain(|(key, _)| key == RESPONSE_VERSION_HEADER),
             Mutation::UnsupportedRevision => {
-                set_value(&mut headers, RESPONSE_VERSION_HEADER, Some(b"2".to_vec()));
+                set_value(&mut headers, RESPONSE_VERSION_HEADER, Some(b"1".to_vec()));
             }
             Mutation::UnparseableRevision => {
                 set_value(&mut headers, RESPONSE_VERSION_HEADER, Some(b"one".to_vec()));
@@ -239,6 +268,24 @@ impl Case {
                 Some(vec![0xff; ID_TEXT_LEN]),
             ),
             Mutation::IdValueAbsent => set_value(&mut headers, RESPONSE_NODE_HEADER, None),
+            Mutation::DeadlineLeadingZero => set_value(
+                &mut headers,
+                RESPONSE_DEADLINE_HEADER,
+                Some(b"01700000000000000".to_vec()),
+            ),
+            Mutation::DeadlineNonNumeric => set_value(
+                &mut headers,
+                RESPONSE_DEADLINE_HEADER,
+                Some(b"tomorrow".to_vec()),
+            ),
+            Mutation::DeadlineOverflow => set_value(
+                &mut headers,
+                RESPONSE_DEADLINE_HEADER,
+                Some(b"18446744073709551616".to_vec()),
+            ),
+            Mutation::DeadlineValueAbsent => {
+                set_value(&mut headers, RESPONSE_DEADLINE_HEADER, None);
+            }
             Mutation::AwaitedBlank => {
                 set_value(&mut headers, RESPONSE_AWAITED_HEADER, Some(b"   ".to_vec()));
             }
@@ -264,11 +311,6 @@ impl Case {
                 headers.push(header(RESPONSE_AWAITED_HEADER, chosen.as_bytes()));
             }
         }
-
-        let len = headers.len();
-        if len > 0 {
-            headers.rotate_left(self.rotation % len);
-        }
         headers
     }
 }
@@ -293,15 +335,18 @@ fn expected(mutation: Mutation) -> Result<Option<RequestTag>, HeaderRejection> {
             Ok(Some(RequestTag::new(
                 RequestId::from_bytes(REQUEST_ID_BYTES),
                 NodeId::from_bytes(NODE_ID_BYTES),
+                RequestDeadline::from_unix_micros(DEADLINE_MICROS),
             )))
         }
         Mutation::NotAwaited | Mutation::NoReservedHeaders => Ok(None),
-        Mutation::DuplicateVersion | Mutation::DuplicateRequestId | Mutation::DuplicateNode => {
-            Err(HeaderRejection::DuplicateSingleton)
-        }
+        Mutation::DuplicateVersion
+        | Mutation::DuplicateRequestId
+        | Mutation::DuplicateNode
+        | Mutation::DuplicateDeadline => Err(HeaderRejection::DuplicateSingleton),
         Mutation::MissingVersion
         | Mutation::MissingRequestId
         | Mutation::MissingNode
+        | Mutation::MissingDeadline
         | Mutation::MissingAwaited
         | Mutation::OnlyVersion => Err(HeaderRejection::MissingSingleton),
         Mutation::UnsupportedRevision
@@ -315,6 +360,10 @@ fn expected(mutation: Mutation) -> Result<Option<RequestTag>, HeaderRejection> {
         | Mutation::IdTruncated
         | Mutation::IdNonUtf8
         | Mutation::IdValueAbsent => Err(HeaderRejection::MalformedId),
+        Mutation::DeadlineLeadingZero
+        | Mutation::DeadlineNonNumeric
+        | Mutation::DeadlineOverflow
+        | Mutation::DeadlineValueAbsent => Err(HeaderRejection::MalformedDeadline),
         Mutation::AwaitedBlank
         | Mutation::AwaitedNonUtf8
         | Mutation::AwaitedTooLong
@@ -363,6 +412,7 @@ fn canonical_headers_parse_to_their_ids() -> color_eyre::Result<()> {
     let expected = RequestTag::new(
         RequestId::from_bytes(REQUEST_ID_BYTES),
         NodeId::from_bytes(NODE_ID_BYTES),
+        RequestDeadline::from_unix_micros(DEADLINE_MICROS),
     );
 
     for id_text in [
@@ -370,12 +420,13 @@ fn canonical_headers_parse_to_their_ids() -> color_eyre::Result<()> {
         "01983B2A-7E40-7D11-9B52-C4F0A3D8E6B1",
     ] {
         let headers = [
-            ("response-version", Some(b"1".as_slice())),
+            ("response-version", Some(b"2".as_slice())),
             ("response-request-id", Some(id_text.as_bytes())),
             (
                 "response-node",
                 Some(b"f81d4fae-7dec-11d0-a765-00a0c91e6bf6".as_slice()),
             ),
+            ("response-deadline", Some(DEADLINE_TEXT)),
             ("response-awaited", Some(b"ledger".as_slice())),
             ("response-awaited", Some(b"billing".as_slice())),
         ];
@@ -403,9 +454,10 @@ fn a_name_that_only_overlaps_the_responder_is_another_subsystem() -> color_eyre:
 
     for awaited in ["bill", "illing", "billings", "autobilling", "BILLING"] {
         let headers = [
-            (RESPONSE_VERSION_HEADER, Some(b"1".as_slice())),
+            (RESPONSE_VERSION_HEADER, Some(b"2".as_slice())),
             (RESPONSE_REQUEST_ID_HEADER, Some(REQUEST_ID_TEXT.as_bytes())),
             (RESPONSE_NODE_HEADER, Some(NODE_ID_TEXT.as_bytes())),
+            (RESPONSE_DEADLINE_HEADER, Some(DEADLINE_TEXT)),
             (RESPONSE_AWAITED_HEADER, Some(awaited.as_bytes())),
         ];
 

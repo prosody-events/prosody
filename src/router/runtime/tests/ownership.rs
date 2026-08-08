@@ -9,6 +9,7 @@ use super::{ALPHA, Process, Shared, TIMEOUT, frame_cap, header};
 use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::tests::CountingCodec;
+use crate::response::headers::RequestDeadline;
 use crate::response::sender::{ResponseRoute, Then, TypedSender};
 use crate::router::directory::NodeDirectory;
 use crate::router::grpc::client::GrpcSender;
@@ -122,7 +123,12 @@ async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
     let receiver = request.receiver()?;
     let payload = PAYLOAD.to_vec();
     let prepared = own.prepare(header(shared.node, request.id(), ALPHA)?, &payload);
-    own.send(prepared, Context::current()).await;
+    own.send(
+        prepared,
+        Context::current(),
+        RequestDeadline::from_unix_micros(4_102_444_800_000_000),
+    )
+    .await;
 
     let stored = receiver
         .await

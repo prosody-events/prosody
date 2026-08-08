@@ -48,6 +48,7 @@ futures = "0.3"
 humantime = "2.3"
 internment = "0.8"
 intervallum = "1.4"
+itoa = "1"
 nohash-hasher = "0.2"
 opentelemetry = { version = "0.32", features = ["metrics"] }
 opentelemetry-otlp = { version = "0.32", features = [

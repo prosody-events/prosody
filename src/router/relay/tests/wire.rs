@@ -6,6 +6,7 @@ use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::encode::{FrameEncoder, Staged};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader};
+use crate::response::headers::RequestDeadline;
 use crate::response::sender::TypedSender;
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
@@ -51,11 +52,6 @@ const CALLER_BUDGET: Duration = Duration::from_secs(30);
 /// The ceiling the relaying process applies to one forward. Well under the
 /// budget its caller states, so what the relay hands on is a number no caller
 /// stated and no process would apply on its own.
-const RELAY_CEILING: Duration = Duration::from_secs(5);
-
-/// The ceiling a process applies if a caller stated none. Far above both.
-const PROCESS_BUDGET: Duration = Duration::from_mins(1);
-
 /// The two network labels the crossing case declares.
 const HERE: &str = "here";
 const THERE: &str = "there";
@@ -101,7 +97,7 @@ fn a_relayed_out_of_range_reaches_the_caller() -> Result<()> {
 #[test]
 fn a_frame_this_process_already_relayed_is_never_relayed_again() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let pair = Pair::start(PROCESS_BUDGET, PROCESS_BUDGET, TargetRoute::Relay).await?;
+        let pair = Pair::start(TargetRoute::Relay).await?;
         let outcome = async {
             let answered = call(&pair.relay, NodeId::new(), RequestId::new(), BUDGET).await?;
             ensure(
@@ -125,19 +121,16 @@ fn a_frame_this_process_already_relayed_is_never_relayed_again() -> Result<()> {
 /// The frame names a third node, so the second process refuses it — but it
 /// refuses it after reading the budget it was given, which is the number this
 /// case is about. Three budgets are deliberately distinct, so each way of
-/// getting the number wrong records a different one: the caller states 30 s,
-/// the relaying process holds that to its own 5 s ceiling, and a process given
-/// no budget at all would apply a 60 s ceiling. So a hop that copied the
-/// caller's stated duration through records 30 s, one that stated nothing
-/// leaves the target recording 60 s, and only a recomputed one records what is
-/// left of the relay's own 5 s. The two hops are compared with `<=` rather than
+/// getting the number wrong records a different one. The caller states 30 s.
+/// Each hop records the time that remains from that deadline. The two hops are
+/// compared with `<=` rather than
 /// `<` because the attribute is whole milliseconds and two instants
 /// microseconds apart round onto one number.
 #[test]
 fn a_forward_carries_what_is_left_of_the_caller_budget() -> Result<()> {
     let spans = GlobalSpans::install()?;
     TEST_RUNTIME.block_on(async {
-        let pair = Pair::start(RELAY_CEILING, PROCESS_BUDGET, TargetRoute::Nowhere).await?;
+        let pair = Pair::start(TargetRoute::Nowhere).await?;
         let outcome = async {
             let answered =
                 call(&pair.relay, NodeId::new(), RequestId::new(), CALLER_BUDGET).await?;
@@ -153,7 +146,6 @@ fn a_forward_carries_what_is_left_of_the_caller_budget() -> Result<()> {
             let relay_ms = deadline_ms(relay)?;
             let target_ms = deadline_ms(target)?;
             let stated = i64::try_from(CALLER_BUDGET.as_millis())?;
-            let ceiling = i64::try_from(PROCESS_BUDGET.as_millis())?;
             ensure(
                 target_ms > 0,
                 format!("the second hop was given {target_ms} ms, which is no budget at all"),
@@ -169,13 +161,7 @@ fn a_forward_carries_what_is_left_of_the_caller_budget() -> Result<()> {
                 relay_ms <= stated,
                 format!("the first hop was given {relay_ms} ms, more than the {stated} ms stated"),
             )?;
-            ensure(
-                target_ms < ceiling,
-                format!(
-                    "the second hop was given {target_ms} ms, which is this process's own \
-                     {ceiling} ms ceiling rather than what the caller left"
-                ),
-            )
+            Ok(())
         }
         .await;
         pair.stop().await?;
@@ -193,7 +179,7 @@ fn a_forward_carries_what_is_left_of_the_caller_budget() -> Result<()> {
 fn a_relayed_response_reads_as_one_trace() -> Result<()> {
     let spans = GlobalSpans::install()?;
     TEST_RUNTIME.block_on(async {
-        let pair = Pair::start(PROCESS_BUDGET, PROCESS_BUDGET, TargetRoute::Nowhere).await?;
+        let pair = Pair::start(TargetRoute::Nowhere).await?;
         let outcome = async {
             let request = awaited(&pair.target.registry)?;
             let answered = call(&pair.relay, pair.target.node, request.id(), BUDGET).await?;
@@ -244,7 +230,7 @@ fn a_relayed_response_reads_as_one_trace() -> Result<()> {
 fn a_response_crosses_two_networks_through_a_relay() -> Result<()> {
     let metrics = GlobalMetrics::install();
     TEST_RUNTIME.block_on(async {
-        let pair = Pair::start(PROCESS_BUDGET, PROCESS_BUDGET, TargetRoute::Nowhere).await?;
+        let pair = Pair::start(TargetRoute::Nowhere).await?;
         let outcome = crossing(&pair).await;
         pair.stop().await?;
         outcome?;
@@ -303,7 +289,13 @@ async fn crossing(pair: &Pair) -> Result<()> {
         },
         &payload,
     );
-    sender.send(prepared, Context::current()).await;
+    sender
+        .send(
+            prepared,
+            Context::current(),
+            RequestDeadline::from_unix_micros(4_102_444_800_000_000),
+        )
+        .await;
     drop(sender);
     receiver
         .await

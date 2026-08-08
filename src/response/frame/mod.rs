@@ -10,6 +10,7 @@ use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
 use prost::encoding::{encoded_len_varint, key_len};
+#[cfg(test)]
 use thiserror::Error;
 
 pub(crate) mod decode;
@@ -87,6 +88,7 @@ impl FrameCap {
     /// Above this one frame could exhaust a receiver's whole buffer budget.
     pub(crate) const MAX_BYTES: usize = 16 * 1024 * 1024;
     /// Below this a frame's largest legal header and relay field would not fit.
+    #[cfg(test)]
     pub(crate) const MIN_BYTES: usize = key_len(FIELD_PROTOCOL_VERSION)
         + 1
         + 2 * (key_len(FIELD_TARGET_NODE) + 1 + ID_BYTES)
@@ -108,6 +110,7 @@ impl FrameCap {
     ///
     /// Returns [`FrameCapError::OutOfRange`] for anything outside
     /// [`MIN_BYTES`](Self::MIN_BYTES)..=[`MAX_BYTES`](Self::MAX_BYTES).
+    #[cfg(test)]
     pub(crate) fn new(bytes: usize) -> Result<Self, FrameCapError> {
         if (Self::MIN_BYTES..=Self::MAX_BYTES).contains(&bytes) {
             Ok(Self(bytes))
@@ -128,6 +131,7 @@ impl FrameCap {
 
 /// A configured frame ceiling the transport cannot use.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[cfg(test)]
 pub(crate) enum FrameCapError {
     /// The ceiling is outside the supported range.
     #[error("frame cap {bytes} is outside {min}..={max} bytes")]

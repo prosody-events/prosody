@@ -6,20 +6,18 @@ use crate::response::frame::FrameCap;
 use crate::router::directory::tests::support::cassandra_directory;
 use crate::router::directory::{NodeDirectory, RegistrationTtl};
 use crate::router::fleet::config::FleetConfiguration;
+use crate::router::grpc::BoundListener;
 use crate::router::grpc::codec::ClientFrameCodec;
-use crate::router::grpc::{BoundListener, TransportConfiguration};
 use crate::router::runtime::{PeerInputs, RouterConfiguration, start_runtime};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::{bail, ensure, eyre};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use tonic::client::Grpc;
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::transport::Endpoint as Dialled;
 use tonic::{Code, Request};
 
-const CONTACT: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9042));
 const REFLECTION: &str = "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo";
 
 #[test]
@@ -34,7 +32,6 @@ fn a_registration_publishes_the_bound_port() -> Result<()> {
             directory: directory.clone(),
             listener: bound,
             heartbeats: HeartbeatRegistry::test(),
-            probe: Some(CONTACT),
             router: &router,
             fleet: FleetConfiguration::default(),
         })
@@ -57,19 +54,13 @@ fn a_registration_publishes_the_bound_port() -> Result<()> {
 }
 
 #[test]
-fn reflection_follows_its_configuration() -> Result<()> {
+fn reflection_is_always_served() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
-        for (reflection, expected) in [(true, Code::Ok), (false, Code::Unimplemented)] {
-            let harness = Harness::with(Ok(TransportConfiguration {
-                reflection,
-                ..transport(FRAME_CAP)?
-            }))
-            .await?;
-            let actual = reflect(harness.address.port).await;
-            harness.stop().await?;
-            ensure!(actual? == expected, "reflection returned another status");
-        }
+        let harness = Harness::with(transport(FRAME_CAP)).await?;
+        let actual = reflect(harness.address.port).await;
+        harness.stop().await?;
+        ensure!(actual? == Code::Ok, "reflection returned another status");
         Ok(())
     })
 }

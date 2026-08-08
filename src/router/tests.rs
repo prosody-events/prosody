@@ -7,6 +7,7 @@ use crate::response::ResponseStatus;
 use crate::response::frame::encode::{FrameEncoder, Staged};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameCap, FrameHeader};
+use crate::response::headers::RequestDeadline;
 use crate::response::sender::{DropReason, ResponseRoute, RouteDelivery, RouteOutcome, Then};
 use crate::router::Host;
 use crate::router::directory::cache::AddressResolver;
@@ -28,7 +29,6 @@ use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::time::Instant;
 use tonic::Code;
 use uuid::{Uuid, Version};
 
@@ -40,7 +40,7 @@ impl ResponseRoute for CountedNetwork {
         &self,
         _frame: Staged,
         _destination: &Destination,
-        _expires_at: Instant,
+        _deadline: RequestDeadline,
     ) -> Result<RouteOutcome, DropReason> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Ok(RouteOutcome::Delivered(RouteDelivery::Remote {
@@ -404,7 +404,11 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
             &Vec::new(),
         )?;
         let delivered = route
-            .deliver(frame, &destination, Instant::now() + Duration::from_secs(1))
+            .deliver(
+                frame,
+                &destination,
+                RequestDeadline::from_unix_micros(4_102_444_800_000_000),
+            )
             .await;
 
         assert!(matches!(

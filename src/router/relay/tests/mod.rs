@@ -88,9 +88,8 @@ pub(super) enum TargetRoute {
 }
 
 impl Process {
-    /// Builds one process over a fleet of `config`, with `budget` as its own
-    /// ceiling on a forward.
-    pub(super) fn new(config: FleetConfiguration, budget: Duration) -> Result<Self> {
+    /// Builds one process over a fleet of `config`.
+    pub(super) fn new(config: FleetConfiguration) -> Result<Self> {
         let node = node(THIS);
         let (router, deliveries) = TestRouter::new(config)?;
         let registry = PendingRegistry::new();
@@ -98,7 +97,6 @@ impl Process {
             LocalTarget::new(node, Arc::clone(&registry)),
             Relay::new(router.clone()),
             FrameCap::new(CAP_BYTES)?,
-            budget,
         );
         Ok(Self {
             node,
@@ -122,15 +120,9 @@ impl Process {
     ///
     /// `granted` is the budget the caller states, exactly as a caller over a
     /// socket states it.
-    pub(super) async fn deliver(
-        &self,
-        frame: ResponseFrame,
-        granted: Option<Duration>,
-    ) -> Result<Code> {
+    pub(super) async fn deliver(&self, frame: ResponseFrame, granted: Duration) -> Result<Code> {
         let mut request = Request::new(frame);
-        if let Some(granted) = granted {
-            request.set_timeout(granted);
-        }
+        request.set_timeout(granted);
         Ok(match self.service.deliver_response(request).await {
             Ok(_) => Code::Ok,
             Err(status) => status.code(),
@@ -150,28 +142,18 @@ impl Process {
 impl Pair {
     /// Binds and serves two listeners: a relay that resolves every node to the
     /// target, and a target whose own router points where `route` says.
-    ///
-    /// Each process is given its own ceiling on one forward, because what one
-    /// hop hands the next is only readable where the two differ.
-    ///
     /// Both are bound before either is served, because the two routers name
     /// each other.
-    pub(super) async fn start(
-        relaying: Duration,
-        targeted: Duration,
-        route: TargetRoute,
-    ) -> Result<Self> {
-        Self::start_with_target_config(relaying, targeted, route, CAP_BYTES).await
+    pub(super) async fn start(route: TargetRoute) -> Result<Self> {
+        Self::start_with_target_config(route, CAP_BYTES).await
     }
 
     /// Starts a pair whose target transport accepts at most `bytes` per frame.
     pub(super) async fn start_with_target_frame_cap(bytes: usize) -> Result<Self> {
-        Self::start_with_target_config(BUDGET, BUDGET, TargetRoute::Nowhere, bytes).await
+        Self::start_with_target_config(TargetRoute::Nowhere, bytes).await
     }
 
     async fn start_with_target_config(
-        relaying: Duration,
-        targeted: Duration,
         route: TargetRoute,
         target_frame_bytes: usize,
     ) -> Result<Self> {
@@ -179,12 +161,12 @@ impl Pair {
         let target_bound = bind(target_frame_bytes).await?;
         let relay_address = endpoint(&relay_bound);
         let target_address = endpoint(&target_bound);
-        let relay = Live::serve(relay_bound, Some(target_address), relaying)?;
+        let relay = Live::serve(relay_bound, Some(target_address))?;
         let seen = match route {
             TargetRoute::Relay => Some(relay_address),
             TargetRoute::Nowhere => None,
         };
-        match Live::serve(target_bound, seen, targeted) {
+        match Live::serve(target_bound, seen) {
             Ok(target) => Ok(Self { relay, target }),
             Err(error) => {
                 relay.stop().await?;
@@ -203,7 +185,7 @@ impl Pair {
 
 impl Live {
     /// Serves `bound`, sending every frame it does not own on to `seen`.
-    fn serve(bound: BoundListener, seen: Option<Endpoint>, budget: Duration) -> Result<Self> {
+    fn serve(bound: BoundListener, seen: Option<Endpoint>) -> Result<Self> {
         let node = NodeId::new();
         let address = endpoint(&bound);
         let cap = bound.frame_cap();
@@ -220,7 +202,6 @@ impl Live {
                 LocalTarget::new(node, Arc::clone(&registry)),
                 Relay::new(router),
                 cap,
-                budget,
             ),
         )?;
         Ok(Self {

@@ -229,10 +229,11 @@ where
         let Some(Answering { tag, trace }) = meta else {
             return self.handler.after_commit(context, result).await;
         };
+        let deadline = tag.deadline();
         let header = tag.header(self.responder.subsystem().clone(), status(&result));
         let response = self.responder.sender.prepare(header, &result);
         self.handler.after_commit(context, result).await;
-        self.responder.sender.send(response, trace).await;
+        self.responder.sender.send(response, trace, deadline).await;
     }
 
     /// Forwards a non-final invocation's result to the inner hook.

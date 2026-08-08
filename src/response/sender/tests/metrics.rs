@@ -68,7 +68,7 @@ fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
             == vec![
                 (label("stage", "attempted"), 2),
                 (label("stage", "delivered"), 1),
-                (label("stage", "framed"), 1),
+                (label("stage", "framed"), 2),
             ],
         "the stages a response passes must each be counted once per response: {:?}",
         metrics.points("prosody.response.stages")?

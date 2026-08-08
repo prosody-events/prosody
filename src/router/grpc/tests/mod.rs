@@ -58,7 +58,7 @@ const ALPHA: &str = "alpha";
 /// How long a request in these suites stays open.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The budget a suite gives one delivery and one forward.
+/// The deadline one transport call receives.
 const BUDGET: Duration = Duration::from_secs(30);
 
 /// The one listener every suite that needs a wire shares.
@@ -114,7 +114,6 @@ impl Harness {
                 LocalTarget::new(node, Arc::clone(&served_registry)),
                 Relay::new(relay_router),
                 config.frame_cap,
-                BUDGET,
             ),
         )?;
         Ok(Self {

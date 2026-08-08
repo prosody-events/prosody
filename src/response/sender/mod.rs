@@ -9,12 +9,11 @@ use self::route::{PreparedResponse, deliver_response, stage};
 use crate::codec::Codec;
 use crate::response::frame::encode::FrameEncoder;
 use crate::response::frame::{FrameCap, FrameHeader};
+use crate::response::headers::RequestDeadline;
 use crate::router::fleet::DestinationFleet;
 use opentelemetry::Context;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::Instant;
 
 #[cfg(test)]
 mod tests;
@@ -25,7 +24,6 @@ pub(crate) struct TypedSender<C: Codec, R: ResponseRoute> {
     fleet: Arc<DestinationFleet>,
     route: R,
     cap: FrameCap,
-    delivery_timeout: Duration,
     _codec: PhantomData<fn() -> C>,
 }
 
@@ -41,12 +39,10 @@ impl<C: Codec, R: ResponseRoute> TypedSender<C, R> {
 
     fn build(fleet: &Arc<DestinationFleet>, route: R, cap: FrameCap) -> Self {
         let fleet = Arc::clone(fleet);
-        let config = fleet.config();
         Self {
             fleet,
             route,
             cap,
-            delivery_timeout: config.response_timeout,
             _codec: PhantomData,
         }
     }
@@ -63,9 +59,13 @@ impl<C: Codec, R: ResponseRoute> TypedSender<C, R> {
     /// layer, which states why it is a context rather than an ambient span.
     ///
     /// Applies transport backpressure until delivery finishes.
-    pub(crate) async fn send(&self, prepared: PreparedResponse, trace: Context) -> bool {
+    pub(crate) async fn send(
+        &self,
+        prepared: PreparedResponse,
+        trace: Context,
+        deadline: RequestDeadline,
+    ) -> bool {
         let destination = self.fleet.destination(prepared.header().target);
-        let expires_at = Instant::now() + self.delivery_timeout;
-        deliver_response(&self.route, prepared, trace, &destination, expires_at).await
+        deliver_response(&self.route, prepared, trace, &destination, deadline).await
     }
 }

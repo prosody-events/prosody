@@ -1,13 +1,13 @@
 //! The reserved Kafka headers a record uses to ask for a peer response.
 //!
-//! Four plain UTF-8 headers carry the request metadata, so a stuck request is
+//! Five plain UTF-8 headers carry the request metadata, so a stuck request is
 //! readable in any broker UI without a decoder: `response-version`,
-//! `response-request-id`, `response-node`, and one `response-awaited` per
-//! subsystem the record awaits. The three singletons must occur **exactly**
-//! once — a producer may repeat a Kafka header key, so accepting the first or
-//! the last would be an unstated precedence — and `response-awaited` repeats
-//! rather than comma-separating because a comma is a legal character in a
-//! [`SubsystemName`].
+//! `response-request-id`, `response-node`, `response-deadline`, and one
+//! `response-awaited` per subsystem the record awaits. The four singletons
+//! must occur **exactly** once. A producer may repeat a Kafka header key, so
+//! accepting the first or the last would be an unstated precedence — and
+//! `response-awaited` repeats rather than comma-separating because a comma is a
+//! legal character in a [`SubsystemName`].
 //!
 //! A record whose reserved headers are unusable yields no tag and one counted
 //! rejection, on a consumer configured to answer for a subsystem. A consumer
@@ -30,14 +30,16 @@ use opentelemetry::global::meter;
 use opentelemetry::metrics::Counter;
 use std::str;
 use std::sync::LazyLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::time::Instant;
 use uuid::Uuid;
 use uuid::fmt::Hyphenated;
 
 #[cfg(test)]
 mod tests;
 
-// The four header names this protocol reserves. Two sites must agree on the
+// The five header names this protocol reserves. Two sites must agree on the
 // set: the `match key` arms of `parse_request_tag`, and
 // RESERVED_REQUEST_HEADERS below, which `is_reserved` reads. A name the parser
 // matches but the array omits is one a caller can inject, so add every new name
@@ -45,14 +47,16 @@ mod tests;
 pub(crate) const RESPONSE_VERSION_HEADER: &str = "response-version";
 pub(crate) const RESPONSE_REQUEST_ID_HEADER: &str = "response-request-id";
 pub(crate) const RESPONSE_NODE_HEADER: &str = "response-node";
+pub(crate) const RESPONSE_DEADLINE_HEADER: &str = "response-deadline";
 pub(crate) const RESPONSE_AWAITED_HEADER: &str = "response-awaited";
 
 /// Header names that [`ProsodyRequester`](crate::requester::ProsodyRequester)
 /// refuses in caller-supplied headers.
-pub(crate) const RESERVED_REQUEST_HEADERS: [&str; 4] = [
+pub(crate) const RESERVED_REQUEST_HEADERS: [&str; 5] = [
     RESPONSE_VERSION_HEADER,
     RESPONSE_REQUEST_ID_HEADER,
     RESPONSE_NODE_HEADER,
+    RESPONSE_DEADLINE_HEADER,
     RESPONSE_AWAITED_HEADER,
 ];
 
@@ -66,7 +70,7 @@ pub(crate) const RESERVED_REQUEST_HEADERS: [&str; 4] = [
 /// read under the old rules and answered confidently. One revision has one text
 /// form, as one id has one text form: `01` and `+1` are refused. The requester
 /// writes this value, so the writer and reader cannot differ.
-pub(crate) const REQUEST_REVISION: &str = "1";
+pub(crate) const REQUEST_REVISION: &str = "2";
 
 /// The only accepted length of an id header value: the hyphenated UUID that
 /// [`id_text`] writes. Fixing the length rejects the simple, braced and URN
@@ -92,12 +96,17 @@ static REJECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 pub(crate) struct RequestTag {
     id: RequestId,
     node: NodeId,
+    deadline: RequestDeadline,
 }
+
+/// One request's absolute Unix deadline, in microseconds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestDeadline(u64);
 
 impl RequestTag {
     /// Pairs a request with the node awaiting its response.
-    pub(crate) const fn new(id: RequestId, node: NodeId) -> Self {
-        Self { id, node }
+    pub(crate) const fn new(id: RequestId, node: NodeId, deadline: RequestDeadline) -> Self {
+        Self { id, node, deadline }
     }
 
     /// The frame header a response to this request must carry.
@@ -112,6 +121,41 @@ impl RequestTag {
             status,
             relay: None,
         }
+    }
+
+    /// Returns the deadline that a remote response must put on gRPC.
+    pub(crate) const fn deadline(self) -> RequestDeadline {
+        self.deadline
+    }
+}
+
+impl RequestDeadline {
+    /// Creates a deadline from canonical Unix microseconds.
+    pub(crate) const fn from_unix_micros(micros: u64) -> Self {
+        Self(micros)
+    }
+
+    /// Creates a wire deadline from a requester timeout.
+    pub(crate) fn after(timeout: Duration) -> Option<Self> {
+        let wall = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+        let micros = wall.as_micros().checked_add(timeout.as_micros())?;
+        Some(Self::from_unix_micros(u64::try_from(micros).ok()?))
+    }
+
+    /// Writes the canonical decimal header value without allocation.
+    pub(crate) fn text(self, buffer: &mut itoa::Buffer) -> &str {
+        buffer.format(self.0)
+    }
+
+    pub(crate) fn expires_at(self) -> Instant {
+        let now = Instant::now();
+        let wall_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_micros());
+        let remaining = u128::from(self.0).saturating_sub(wall_micros);
+        let remaining = u64::try_from(remaining).unwrap_or(u64::MAX);
+        now.checked_add(Duration::from_micros(remaining))
+            .unwrap_or(now)
     }
 }
 
@@ -147,6 +191,7 @@ where
     let mut version_seen = false;
     let mut id = None;
     let mut node = None;
+    let mut deadline = None;
     let mut awaited = 0_usize;
     let mut addressed = false;
 
@@ -179,23 +224,29 @@ where
                 }
                 node = Some(NodeId::from_bytes(parse_id(value)?));
             }
+            RESPONSE_DEADLINE_HEADER => {
+                if deadline.is_some() {
+                    return Err(HeaderRejection::DuplicateSingleton);
+                }
+                deadline = Some(parse_deadline(value)?);
+            }
             // Every other header belongs to the producer, not to this protocol.
             _ => {}
         }
     }
 
     // No reserved header at all, so this record asks for nothing.
-    if !version_seen && id.is_none() && node.is_none() && awaited == 0 {
+    if !version_seen && id.is_none() && node.is_none() && deadline.is_none() && awaited == 0 {
         return Ok(None);
     }
-    let (Some(id), Some(node)) = (id, node) else {
+    let (Some(id), Some(node), Some(deadline)) = (id, node, deadline) else {
         return Err(HeaderRejection::MissingSingleton);
     };
     if !version_seen || awaited == 0 {
         return Err(HeaderRejection::MissingSingleton);
     }
 
-    Ok(addressed.then_some(RequestTag::new(id, node)))
+    Ok(addressed.then_some(RequestTag::new(id, node, deadline)))
 }
 
 /// Renders one id in its 36-character header form without an allocation.
@@ -233,6 +284,23 @@ fn parse_id(value: Option<&[u8]>) -> Result<[u8; 16], HeaderRejection> {
         .map_err(|_| HeaderRejection::MalformedId)
 }
 
+/// Reads one canonical decimal Unix deadline in microseconds.
+fn parse_deadline(value: Option<&[u8]>) -> Result<RequestDeadline, HeaderRejection> {
+    let text = value.ok_or(HeaderRejection::MalformedDeadline)?;
+    if text.is_empty()
+        || text.len() > 20
+        || (text.len() > 1 && text[0] == b'0')
+        || !text.iter().all(u8::is_ascii_digit)
+    {
+        return Err(HeaderRejection::MalformedDeadline);
+    }
+    str::from_utf8(text)
+        .map_err(|_| HeaderRejection::MalformedDeadline)?
+        .parse()
+        .map(RequestDeadline::from_unix_micros)
+        .map_err(|_| HeaderRejection::MalformedDeadline)
+}
+
 /// Accepts the one revision this responder reads the other headers under, and
 /// discards it: keeping it would only let a later reader re-decide a question
 /// settled here.
@@ -258,6 +326,8 @@ pub(crate) enum HeaderRejection {
     UnsupportedVersion,
     #[error("a response id is not a 36-character UUID")]
     MalformedId,
+    #[error("a response deadline is not canonical Unix microseconds")]
+    MalformedDeadline,
     #[error("an awaited subsystem name is empty, not UTF-8, or too long")]
     MalformedAwaited,
 }
@@ -278,6 +348,7 @@ impl HeaderRejection {
             Self::MissingSingleton => "missing",
             Self::UnsupportedVersion => "unsupported_version",
             Self::MalformedId => "malformed_id",
+            Self::MalformedDeadline => "malformed_deadline",
             Self::MalformedAwaited => "malformed_awaited",
         }
     }
