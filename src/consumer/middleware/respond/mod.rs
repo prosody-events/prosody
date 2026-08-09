@@ -35,10 +35,8 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::response::ResponseStatus;
-use crate::response::frame::FrameCap;
 use crate::response::headers::RequestTag;
-use crate::response::sender::ResponseRoute;
-use crate::response::sender::TypedSender;
+use crate::response::sender::{ResponseRoute, TypedSender, prepare};
 use crate::router::fleet::DestinationFleet;
 use crate::subsystem::SubsystemName;
 use crate::timers::Trigger;
@@ -113,11 +111,10 @@ impl<C: Codec, R: ResponseRoute> Responder<C, R> {
     pub(crate) fn new_route(
         route: R,
         fleet: &Arc<DestinationFleet>,
-        cap: FrameCap,
         subsystem: SubsystemName,
     ) -> Self {
         Self {
-            sender: TypedSender::new_route(route, fleet, cap),
+            sender: TypedSender::new_route(route, fleet),
             subsystem,
         }
     }
@@ -231,7 +228,7 @@ where
         };
         let deadline = tag.deadline();
         let header = tag.header(self.responder.subsystem().clone(), status(&result));
-        let response = self.responder.sender.prepare(header, &result);
+        let response = prepare::<C>(header, &result);
         self.handler.after_commit(context, result).await;
         self.responder.sender.send(response, trace, deadline).await;
     }

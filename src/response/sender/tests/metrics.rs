@@ -11,13 +11,17 @@
 //! when they are first touched, and nextest gives each case its own process.
 
 use super::super::metrics::{DropReason, Stage, record_fallback};
-use super::{CAP_BYTES, Harness, attempts};
+use super::{DEADLINE, Harness, PAYLOAD, attempts};
+use crate::codec::Codec;
+use crate::response::sender::{TypedSender, prepare};
 use crate::router::loopback::{Script, UNPUBLISHED_NODE, config, node, paused};
-use crate::router::{Preference, SendFailure};
+use crate::router::{Preference, Router, SendFailure};
 use crate::test_util::{GlobalMetrics, assert_distinct_labels, label};
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
+use opentelemetry::Context;
 use std::collections::BTreeMap;
+use std::io::Error;
 use strum::VariantArray;
 
 /// A node every suite router publishes.
@@ -29,8 +33,51 @@ const FALLS_BACK: u8 = PUBLISHED;
 /// The node neither of whose endpoints answers.
 const SILENT: u8 = 1;
 
-/// A body no frame at the cap can carry: the whole cap, before any header.
-const OVER_CAP: usize = CAP_BYTES;
+#[derive(Default)]
+struct FailingCodec;
+
+impl Codec for FailingCodec {
+    type Error = Error;
+    type Payload = Vec<u8>;
+
+    const FORMAT_ID: &'static str = "test-failure";
+
+    fn deserialize(&mut self, buf: &mut [u8]) -> Result<Vec<u8>, Error> {
+        Ok(buf.to_vec())
+    }
+
+    fn serialize_ref(&mut self, _payload: &Vec<u8>, _buf: &mut Vec<u8>) -> Result<(), Error> {
+        Err(Error::other("injected encode failure"))
+    }
+}
+
+/// A codec failure stops before framing and names the encode failure.
+#[test]
+fn a_codec_failure_records_the_encode_drop() -> Result<()> {
+    let metrics = GlobalMetrics::install();
+    paused()?.block_on(async {
+        let harness = Harness::new(config())?;
+        let sender = TypedSender::<FailingCodec, _>::new_route(
+            harness.router.clone(),
+            harness.router.fleet(),
+        );
+        let prepared = prepare::<FailingCodec>(harness.header.clone(), &PAYLOAD.to_vec());
+        ensure!(
+            !sender.send(prepared, Context::current(), DEADLINE).await,
+            "an encode failure must drop the response"
+        );
+        Ok::<_, color_eyre::Report>(())
+    })?;
+    ensure!(
+        metrics.points("prosody.response.dropped")? == vec![(label("reason", "encode_failed"), 1)],
+        "the drop must name the codec failure"
+    );
+    ensure!(
+        metrics.points("prosody.response.stages")? == vec![(label("stage", "attempted"), 1)],
+        "the response must stop before framing"
+    );
+    Ok(())
+}
 
 /// One response to a node no registration names is dropped under a fixed
 /// reason, and the node's id appears nowhere in the metrics it moved.
@@ -85,44 +132,6 @@ fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
             }
         }
     }
-    Ok(())
-}
-
-/// A response the frame cap cannot carry is counted under its own reason.
-///
-/// The encoder refuses it before transport work. The other response completes.
-/// Thus, both are attempted and only one is framed.
-#[test]
-fn a_response_the_cap_refuses_is_counted() -> Result<()> {
-    let metrics = GlobalMetrics::install();
-    let drained = paused()?.block_on(async {
-        let harness = Harness::new(config())?;
-        harness.send_payload(PUBLISHED, vec![0; OVER_CAP]).await?;
-        harness.send(PUBLISHED).await?;
-        harness.drain().await
-    })?;
-    ensure!(
-        (drained.sent, drained.dropped) == (1, 1),
-        "one response must reach the listener and one must be refused, not {} and {}",
-        drained.sent,
-        drained.dropped
-    );
-
-    ensure!(
-        metrics.points("prosody.response.dropped")? == vec![(label("reason", "encode_failed"), 1)],
-        "the refusal must be counted under its own reason alone: {:?}",
-        metrics.points("prosody.response.dropped")?
-    );
-    ensure!(
-        metrics.points("prosody.response.stages")?
-            == vec![
-                (label("stage", "attempted"), 2),
-                (label("stage", "delivered"), 1),
-                (label("stage", "framed"), 1),
-            ],
-        "a response the cap refuses must stop before framing: {:?}",
-        metrics.points("prosody.response.stages")?
-    );
     Ok(())
 }
 

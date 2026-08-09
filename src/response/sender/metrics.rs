@@ -70,7 +70,7 @@ pub(super) enum Stage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(strum::VariantArray))]
 pub enum DropReason {
-    /// The codec could not frame the result inside the ceiling.
+    /// The codec could not encode the result.
     EncodeFailed,
     /// No live registration names the node the response is addressed to.
     UnresolvableNode,

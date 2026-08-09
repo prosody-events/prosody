@@ -5,7 +5,7 @@ use crate::codec::Codec;
 use crate::otel::carry_parent;
 use crate::response::ResponseDisposition;
 use crate::response::frame::FrameHeader;
-use crate::response::frame::encode::{FrameEncoder, Staged};
+use crate::response::frame::encode::{Staged, stage as encode};
 use crate::response::headers::RequestDeadline;
 use crate::router::fleet::Destination;
 use crate::router::{Preference, ResponseSender, Router};
@@ -253,12 +253,9 @@ impl PreparedResponse {
 }
 
 /// Encodes one payload and records the common frame stage.
-pub(super) fn stage<C: Codec>(
-    encoder: &FrameEncoder<C>,
-    header: FrameHeader,
-    payload: &C::Payload,
-) -> PreparedResponse {
-    match encoder.stage(&header, payload) {
+pub(super) fn stage<C: Codec>(header: FrameHeader, payload: &C::Payload) -> PreparedResponse {
+    Stage::Attempted.record();
+    match encode::<C>(&header, payload) {
         Ok(staged) => {
             Stage::Framed.record();
             PreparedResponse::Ready(staged)

@@ -96,7 +96,6 @@ impl PeerConfiguration {
         Ok(PeerParts {
             transport: TransportConfiguration {
                 bind: self.bind_address,
-                ..TransportConfiguration::default()
             },
             router: RouterConfiguration {
                 advertised_host: self.advertised_host.clone(),
@@ -115,10 +114,6 @@ fn validate_peer(config: &PeerConfiguration) -> Result<(), ValidationError> {
     let parts = config
         .unvalidated_parts()
         .map_err(|_| ValidationError::new("peer_parts"))?;
-    parts
-        .transport
-        .validate()
-        .map_err(|_| ValidationError::new("transport"))?;
     parts
         .router
         .validate()

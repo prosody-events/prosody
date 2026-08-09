@@ -17,10 +17,6 @@ fn each_disposition_reports_its_documented_status() {
         (ResponseDisposition::UnknownRequest, Code::NotFound),
         (ResponseDisposition::ClosedRequest, Code::NotFound),
         (
-            ResponseDisposition::ResponseTooLarge,
-            Code::ResourceExhausted,
-        ),
-        (
             ResponseDisposition::AlreadyRelayed,
             Code::FailedPrecondition,
         ),

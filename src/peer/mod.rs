@@ -26,7 +26,6 @@ pub use runtime::{ProducerHandle, RouterOwner};
 use crate::codec::Codec;
 use crate::consumer::middleware::respond::Responder;
 use crate::heartbeat::HeartbeatRegistry;
-use crate::response::frame::FrameCap;
 use crate::response::sender::ResponseRoute;
 use crate::router::fleet::DestinationFleet;
 use crate::subsystem::SubsystemName;
@@ -46,18 +45,17 @@ pub(crate) fn heartbeat_registry() -> HeartbeatRegistry {
 pub(crate) struct PeerResponder<R> {
     route: R,
     fleet: Arc<DestinationFleet>,
-    cap: FrameCap,
 }
 
 impl<R: ResponseRoute> PeerResponder<R> {
-    /// Captures one route, fleet, and frame ceiling.
-    pub(crate) const fn new(route: R, fleet: Arc<DestinationFleet>, cap: FrameCap) -> Self {
-        Self { route, fleet, cap }
+    /// Captures one route and fleet.
+    pub(crate) const fn new(route: R, fleet: Arc<DestinationFleet>) -> Self {
+        Self { route, fleet }
     }
 
     /// Binds one response codec and subsystem to this peer route.
     pub(crate) fn responder<C: Codec>(&self, subsystem: SubsystemName) -> Responder<C, R> {
-        Responder::new_route(self.route.clone(), &self.fleet, self.cap, subsystem)
+        Responder::new_route(self.route.clone(), &self.fleet, subsystem)
     }
 }
 
@@ -66,7 +64,6 @@ impl<R> PeerResponder<R> {
         PeerResponder {
             route: map(self.route),
             fleet: self.fleet,
-            cap: self.cap,
         }
     }
 }

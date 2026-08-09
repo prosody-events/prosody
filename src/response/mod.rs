@@ -128,8 +128,6 @@ pub(crate) enum ResponseDisposition {
     UnknownRequest,
     /// The request existed but has already finished.
     ClosedRequest,
-    /// The payload is larger than the waiting process retains for one response.
-    ResponseTooLarge,
     /// The frame is for another node and has already been relayed once.
     AlreadyRelayed,
     /// No time is left inside the caller's deadline to relay the frame.
@@ -145,16 +143,15 @@ impl ResponseDisposition {
     /// so a disposition added later cannot reach the wire without being given a
     /// status here.
     ///
-    /// A relay answers five of these on its own: [`AlreadyRelayed`],
-    /// [`ResponseTooLarge`], [`RelayDeadlineExceeded`] and
-    /// [`Unreachable`]. It passes the target's status through unchanged for
-    /// every other outcome. Nothing on the wire says which process spoke, so a
-    /// sender reads every status as the endpoint's own word. A per-process
-    /// origin would need a wire field, and this mapping names each outcome by
-    /// what gRPC statuses mean rather than by who sent it.
+    /// A relay answers three of these on its own: [`AlreadyRelayed`],
+    /// [`RelayDeadlineExceeded`] and [`Unreachable`]. It passes the target's
+    /// status through unchanged for every other outcome. Nothing on the
+    /// wire says which process spoke, so a sender reads every status as the
+    /// endpoint's own word. A per-process origin would need a wire field,
+    /// and this mapping names each outcome by what gRPC statuses mean
+    /// rather than by who sent it.
     ///
     /// [`AlreadyRelayed`]: Self::AlreadyRelayed
-    /// [`ResponseTooLarge`]: Self::ResponseTooLarge
     /// [`RelayDeadlineExceeded`]: Self::RelayDeadlineExceeded
     /// [`Unreachable`]: Self::Unreachable
     pub(crate) const fn status(self) -> Code {
@@ -162,7 +159,6 @@ impl ResponseDisposition {
             Self::Accepted => Code::Ok,
             Self::UnknownRequest | Self::ClosedRequest => Code::NotFound,
             Self::AlreadyRelayed => Code::FailedPrecondition,
-            Self::ResponseTooLarge => Code::ResourceExhausted,
             Self::RelayDeadlineExceeded => Code::DeadlineExceeded,
             Self::Unreachable => Code::Unavailable,
         }
@@ -178,7 +174,6 @@ impl ResponseDisposition {
             Self::Accepted => "the response was accepted",
             Self::UnknownRequest => "no request by that id is registered here",
             Self::ClosedRequest => "that request has already finished",
-            Self::ResponseTooLarge => "the payload is over this process's response ceiling",
             Self::AlreadyRelayed => "the frame has already been relayed once",
             Self::RelayDeadlineExceeded => "no time is left to relay the frame",
             Self::Unreachable => "the target node could not be reached from here",
@@ -204,7 +199,6 @@ impl ResponseDisposition {
             Self::Accepted => "accepted",
             Self::UnknownRequest => "unknown_request",
             Self::ClosedRequest => "closed_request",
-            Self::ResponseTooLarge => "response_too_large",
             Self::AlreadyRelayed => "already_relayed",
             Self::RelayDeadlineExceeded => "relay_deadline_exceeded",
             Self::Unreachable => "unreachable",

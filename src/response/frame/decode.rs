@@ -1,10 +1,8 @@
-//! Reading one frame a peer sent, bounding it before anything is allocated on
-//! behalf of a length that peer merely claimed.
+//! Reading one frame a peer sent.
 
 use super::{
     FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
-    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, ID_BYTES,
-    ResponseFrame,
+    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameHeader, ID_BYTES, ResponseFrame,
 };
 use crate::error::UnknownErrorCategory;
 use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION, RequestId, ResponseStatus};
@@ -36,31 +34,18 @@ const fn known_field(tag: u32) -> Option<(&'static str, u8)> {
     })
 }
 
-/// Decodes one frame, bounding the whole encoded message before any per-field
-/// work so nothing is allocated on behalf of a length a peer merely claimed.
+/// Decodes one frame.
 ///
 /// Each field may appear once. Protobuf lets a sender repeat a singular field
-/// and take the last, but every repeat here would be either a contradiction or
-/// an amplifier — a capped frame packed with tiny `payload` fields would buy
-/// millions of allocate-and-discard pairs for a few bytes each. Refusing the
-/// repeat is the same posture this decoder already takes toward an empty
-/// `subsystem` or a zero `status`.
+/// and take the last. A repeat here is either a contradiction or an allocation
+/// amplifier. Refusing repeats matches the checks for empty subsystem names
+/// and zero status values.
 ///
 /// # Errors
 ///
 /// Returns a [`FrameDecodeError`] naming the field that made the frame
 /// unreadable.
-pub(crate) fn decode_frame<B: Buf>(
-    src: &mut B,
-    cap: FrameCap,
-) -> Result<ResponseFrame, FrameDecodeError> {
-    if src.remaining() > cap.bytes() {
-        return Err(FrameDecodeError::FrameTooLarge {
-            bytes: src.remaining(),
-            limit: cap.bytes(),
-        });
-    }
-
+pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDecodeError> {
     let mut version = None;
     let mut target = None;
     let mut request = None;
@@ -230,15 +215,6 @@ fn decode_payload<B: Buf>(src: &mut B) -> Result<BytesMut, FrameDecodeError> {
 /// Why a frame a peer sent could not be read.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum FrameDecodeError {
-    /// The encoded frame is larger than the frame ceiling.
-    #[error("frame is {bytes} bytes, over the {limit}-byte cap")]
-    FrameTooLarge {
-        /// The encoded frame's length.
-        bytes: usize,
-        /// The frame ceiling.
-        limit: usize,
-    },
-
     /// A field states a length the frame does not carry.
     #[error("{field} claims {bytes} bytes with {remaining} left in the frame")]
     Truncated {
@@ -315,7 +291,6 @@ impl FrameDecodeError {
     /// echoes nothing back.
     pub(crate) const fn message(&self) -> &'static str {
         match self {
-            Self::FrameTooLarge { .. } => "the frame is over this listener's size cap",
             Self::Truncated { .. } => "a frame field claims more bytes than the frame carries",
             Self::MissingField(_) => "the frame omits a field it must carry",
             Self::RepeatedField(_) => "the frame repeats a field it may carry once",

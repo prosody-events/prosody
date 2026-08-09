@@ -6,9 +6,7 @@
 //! trip has to carry the tag: the answer follows the message, not the attempt.
 
 use super::super::RespondHandler;
-use super::{
-    Fixture, ResultProbeCodec, cap, offset_tracker, serialize_count, tagged, tagged_under,
-};
+use super::{Fixture, ResultProbeCodec, offset_tracker, serialize_count, tagged, tagged_under};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleEventHandler;
 use crate::consumer::middleware::defer::DeferConfiguration;
@@ -132,7 +130,7 @@ fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
             "only the reload answers, and it answers once",
         );
         let mut delivery = drained.remove(0);
-        let frame = decode_frame(&mut delivery.bytes, cap()?)?;
+        let frame = decode_frame(&mut delivery.bytes)?;
         assert_eq!(frame.header.target, node(TARGET));
         assert_eq!(frame.header.request, RequestId::from_bytes([REQUEST; 16]));
         assert_eq!(frame.header.status, ResponseStatus::Success);

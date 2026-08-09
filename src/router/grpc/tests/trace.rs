@@ -10,7 +10,7 @@
 use super::{ALPHA, Harness, header, reaching, register};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
-use crate::response::sender::TypedSender;
+use crate::response::sender::{TypedSender, prepare};
 use crate::router::Router;
 use crate::test_util::{GlobalSpans, TEST_RUNTIME, named};
 use color_eyre::Result;
@@ -45,9 +45,8 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
     let spans = GlobalSpans::install()?;
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
-        let router = reaching(harness.cap, &harness.address)?;
-        let sender =
-            TypedSender::<CountingCodec, _>::new_route(router.clone(), router.fleet(), harness.cap);
+        let router = reaching(&harness.address)?;
+        let sender = TypedSender::<CountingCodec, _>::new_route(router.clone(), router.fleet());
         let request = register(&harness.registry, &[ALPHA])?;
 
         // The caller's span is opened, read, and closed here: the send carries
@@ -56,7 +55,8 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         let trace = caller.context();
         let caller_span = trace.span().span_context().clone();
         let payload = PAYLOAD.to_vec();
-        let prepared = sender.prepare(header(harness.node, request.id(), ALPHA)?, &payload);
+        let prepared =
+            prepare::<CountingCodec>(header(harness.node, request.id(), ALPHA)?, &payload);
         let delivered = sender
             .send(
                 prepared,

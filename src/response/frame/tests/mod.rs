@@ -1,7 +1,6 @@
 use super::{
     FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
-    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameCapError, FrameHeader,
-    RELAY_FIELD_BYTES,
+    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameHeader, RELAY_FIELD_BYTES,
 };
 use crate::codec::Codec;
 use crate::response::{RequestId, ResponseStatus};
@@ -168,22 +167,4 @@ fn header(subsystem: &str, status: ResponseStatus, relay: Option<NodeId>) -> Res
         status,
         relay,
     })
-}
-
-/// The ceiling is validated once, at construction, so no later code can hold an
-/// unusable one.
-#[test]
-fn a_frame_cap_outside_the_supported_range_is_refused() {
-    for bytes in [0, FrameCap::MIN_BYTES - 1, FrameCap::MAX_BYTES + 1] {
-        assert!(
-            matches!(FrameCap::new(bytes), Err(FrameCapError::OutOfRange { .. })),
-            "a cap of {bytes} bytes must be refused"
-        );
-    }
-    for bytes in [FrameCap::MIN_BYTES, FrameCap::MAX_BYTES] {
-        assert!(
-            FrameCap::new(bytes).is_ok(),
-            "a cap of {bytes} bytes must be accepted"
-        );
-    }
 }

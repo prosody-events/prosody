@@ -8,11 +8,11 @@
 //! runtime can hold either argument.
 
 use super::super::{PeerInputs, PeerRuntime, RouterConfiguration};
-use super::{ALPHA, LEASE, TIMEOUT, frame_cap, header, listener, start_runtime};
+use super::{ALPHA, LEASE, TIMEOUT, header, listener, start_runtime};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
-use crate::response::frame::encode::FrameEncoder;
+use crate::response::frame::encode::stage;
 use crate::response::frame::tests::CountingCodec;
 use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::directory::tests::support::cassandra_directory;
@@ -122,10 +122,8 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
 /// A frame that names another node leaves the runtime's listener again and
 /// arrives there.
 ///
-/// The runtime hands its listener's service a relay over its own router, the
-/// frame ceiling that listener enforces. Both values reach
-/// the service at one call. The second listener's registry holding the payload
-/// is the assertion, because the relay is the only path to it.
+/// The runtime gives its listener a relay over its own router. The second
+/// listener's registry holds the payload only when that relay works.
 #[test]
 fn a_frame_for_another_node_leaves_the_runtime_listener_again() -> Result<()> {
     init_test_logging();
@@ -156,7 +154,6 @@ impl Elsewhere {
         let registry = PendingRegistry::new();
         let bound = bind().await?;
         let address = local(bound.address().port());
-        let cap = bound.frame_cap();
         let (unused, _deliveries) = TestRouter::new(fleet_config())?;
         let (stop, stopped) = channel();
         let served = serve(
@@ -164,7 +161,6 @@ impl Elsewhere {
             PeerService::new(
                 LocalTarget::new(node, Arc::clone(&registry)),
                 Relay::new(unused),
-                cap,
             ),
             TestHealth::new(true, true),
             async move { stopped.await.unwrap_or(()) },
@@ -227,10 +223,9 @@ async fn sent_on(elsewhere: &Elsewhere, here: &Endpoint) -> Result<()> {
     let mut request = TestRegistration::new(&elsewhere.registry, from_ref(&subsystem), TIMEOUT)?;
     let receiver = request.receiver()?;
     let fleet = DestinationFleet::new(fleet_config())?;
-    let sender = GrpcSender::new(frame_cap()?, &fleet);
-    let encoder = FrameEncoder::<CountingCodec>::new(frame_cap()?);
+    let sender = GrpcSender::new(&fleet);
     let addressed = header(elsewhere.node, request.id(), ALPHA)?;
-    let staged = encoder.stage(&addressed, &PAYLOAD.to_vec())?;
+    let staged = stage::<CountingCodec>(&addressed, &PAYLOAD.to_vec())?;
     sender
         .deliver(here, &staged, Instant::now() + HANG_GUARD)
         .await
@@ -250,7 +245,6 @@ async fn sent_on(elsewhere: &Elsewhere, here: &Endpoint) -> Result<()> {
 async fn bind() -> Result<BoundListener> {
     Ok(BoundListener::bind(&TransportConfiguration {
         bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        frame_cap: frame_cap()?,
     })
     .await?)
 }

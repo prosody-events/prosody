@@ -2,7 +2,7 @@
 //! boundary.
 
 use super::super::{RespondHandler, Responded};
-use super::{Fixture, ResultProbeCodec, cap, offset_tracker, tagged};
+use super::{Fixture, ResultProbeCodec, offset_tracker, tagged};
 use crate::consumer::middleware::tests::test_support::{
     BypassedHandler, MockEventContext, ScriptedHandler, TestError,
 };
@@ -39,7 +39,7 @@ fn metadata_rides_the_error_arm() -> Result<()> {
         let mut drained = fixture.drain().await?;
         assert_eq!(drained.len(), 1);
         let mut delivery = drained.remove(0);
-        let frame = decode_frame(&mut delivery.bytes, cap()?)?;
+        let frame = decode_frame(&mut delivery.bytes)?;
         assert_eq!(
             frame.header.target,
             node(2),

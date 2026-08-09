@@ -4,9 +4,9 @@ use super::{
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
 use crate::response::ResponseStatus;
-use crate::response::frame::encode::{FrameEncoder, Staged};
+use crate::response::frame::FrameHeader;
+use crate::response::frame::encode::{Staged, stage};
 use crate::response::frame::tests::CountingCodec;
-use crate::response::frame::{FrameCap, FrameHeader};
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{DropReason, ResponseRoute, RouteDelivery, RouteOutcome, Then};
 use crate::router::Host;
@@ -392,8 +392,7 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
         );
         let fleet = DestinationFleet::new(FleetConfiguration::default())?;
         let destination = fleet.destination(node);
-        let encoder = FrameEncoder::<CountingCodec>::new(FrameCap::new(4096)?);
-        let frame = encoder.stage(
+        let frame = stage::<CountingCodec>(
             &FrameHeader {
                 target: node,
                 request: request.id(),

@@ -1,15 +1,14 @@
 //! What the hook does when the transport cannot take a response.
 //!
-//! A barrier holds the transport, the encoder rejects a large frame, or the
-//! directory does not contain the destination.
+//! A barrier holds the transport, or the directory does not contain the
+//! destination.
 
-use super::{Fixture, OversizedProbeCodec, ResultProbeCodec, offset_tracker, tagged, tagged_at};
+use super::{Fixture, LargeProbeCodec, ResultProbeCodec, offset_tracker, tagged, tagged_at};
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, ScriptedHandler, ScriptedHook,
 };
 use crate::consumer::{DemandType, EventHandler};
 use crate::error::ErrorCategory;
-use crate::response::frame::FrameCap;
 use crate::router::loopback::{Script, UNPUBLISHED_NODE, paused};
 use color_eyre::Result;
 use std::sync::Arc;
@@ -75,17 +74,11 @@ fn the_hook_applies_network_backpressure() -> Result<()> {
     })
 }
 
-/// A response the frame ceiling refuses sends nothing at all, and nothing
-/// stands in for it.
-///
-/// The refusal itself is pinned at the encoder. This suite is the end-to-end
-/// reading: the sender rejects the response, and the transport records no
-/// attempt. The control response proves that the transport works.
+/// A large response reaches the transport without an application size limit.
 #[test]
-fn an_over_limit_response_sends_nothing() -> Result<()> {
+fn a_large_response_reaches_the_transport() -> Result<()> {
     paused()?.block_on(async {
-        let cap = FrameCap::new(FrameCap::MIN_BYTES)?;
-        let fixture = Fixture::<OversizedProbeCodec>::with_cap(cap)?;
+        let fixture = Fixture::<LargeProbeCodec>::new()?;
 
         let control = ScriptedHandler::success();
         let handler = fixture.stack(control, 0)?;
@@ -100,10 +93,10 @@ fn an_over_limit_response_sends_nothing() -> Result<()> {
         .await;
         drop(handler);
 
-        let oversized = ScriptedHandler::always_failing(ErrorCategory::Permanent);
-        let handler = fixture.stack(oversized, 0)?;
+        let large = ScriptedHandler::always_failing(ErrorCategory::Permanent);
+        let handler = fixture.stack(large, 0)?;
         let tracker = offset_tracker();
-        let message = tagged(1, 32, "oversized")?.into_uncommitted(tracker.take(1).await?);
+        let message = tagged(1, 32, "large")?.into_uncommitted(tracker.take(1).await?);
         EventHandler::on_message(
             &handler,
             MockEventContext::new(),
@@ -116,8 +109,8 @@ fn an_over_limit_response_sends_nothing() -> Result<()> {
         let drained = fixture.drain().await?;
         assert_eq!(
             drained.len(),
-            1,
-            "the control response is delivered and the over-cap one is not",
+            2,
+            "the application layer must not reject a large response",
         );
         Ok(())
     })

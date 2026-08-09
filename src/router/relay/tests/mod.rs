@@ -15,7 +15,7 @@ use crate::codec::Codec;
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::tests::CountingCodec;
-use crate::response::frame::{FrameCap, FrameHeader, ResponseFrame};
+use crate::response::frame::{FrameHeader, ResponseFrame};
 use crate::response::{FormatToken, RequestId, ResponseStatus};
 use crate::router::directory::Endpoint;
 use crate::router::fleet::config::FleetConfiguration;
@@ -37,9 +37,6 @@ use tonic::{Code, Request};
 /// The node the in-process suites run as. The test router publishes it, so a
 /// case that accepts is not one that simply resolved nothing.
 pub(super) const THIS: u8 = 0;
-
-/// The frame ceiling every suite here encodes and forwards under.
-pub(super) const CAP_BYTES: usize = 4096;
 
 /// The ceiling one process puts on one forward. Far longer than any suite here
 /// takes, except where a case states a shorter budget of its own.
@@ -96,7 +93,6 @@ impl Process {
         let service = PeerService::new(
             LocalTarget::new(node, Arc::clone(&registry)),
             Relay::new(router.clone()),
-            FrameCap::new(CAP_BYTES)?,
         );
         Ok(Self {
             node,
@@ -145,20 +141,8 @@ impl Pair {
     /// Both are bound before either is served, because the two routers name
     /// each other.
     pub(super) async fn start(route: TargetRoute) -> Result<Self> {
-        Self::start_with_target_config(route, CAP_BYTES).await
-    }
-
-    /// Starts a pair whose target transport accepts at most `bytes` per frame.
-    pub(super) async fn start_with_target_frame_cap(bytes: usize) -> Result<Self> {
-        Self::start_with_target_config(TargetRoute::Nowhere, bytes).await
-    }
-
-    async fn start_with_target_config(
-        route: TargetRoute,
-        target_frame_bytes: usize,
-    ) -> Result<Self> {
-        let relay_bound = bind(CAP_BYTES).await?;
-        let target_bound = bind(target_frame_bytes).await?;
+        let relay_bound = bind().await?;
+        let target_bound = bind().await?;
         let relay_address = endpoint(&relay_bound);
         let target_address = endpoint(&target_bound);
         let relay = Live::serve(relay_bound, Some(target_address))?;
@@ -188,20 +172,13 @@ impl Live {
     fn serve(bound: BoundListener, seen: Option<Endpoint>) -> Result<Self> {
         let node = NodeId::new();
         let address = endpoint(&bound);
-        let cap = bound.frame_cap();
         let registry = PendingRegistry::new();
-        let router = FixedRouter::new(
-            cap,
-            FleetConfiguration::default(),
-            seen.map(registration),
-            None,
-        )?;
+        let router = FixedRouter::new(FleetConfiguration::default(), seen.map(registration), None)?;
         let served = Served::start(
             bound,
             PeerService::new(
                 LocalTarget::new(node, Arc::clone(&registry)),
                 Relay::new(router),
-                cap,
             ),
         )?;
         Ok(Self {

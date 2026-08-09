@@ -142,9 +142,8 @@ pub(crate) trait Framed {
 /// The frame is borrowed, so a sender writes straight from the encoder scratch
 /// rather than building another frame per response. A
 /// transport whose own encoder needs an owned item still pays for one: it
-/// copies the scratch into a buffer of its own, and that buffer is what the
-/// borrow keeps bounded by the frame ceiling. An owned seam here would put that
-/// allocation on every response whatever the transport needs.
+/// copies the scratch into a buffer of its own. An owned seam here would put
+/// that allocation on every response, whatever the transport needs.
 pub(crate) trait ResponseSender: Send + Sync + 'static {
     /// Delivers one frame to one resolved address, and gives up at `deadline`.
     ///

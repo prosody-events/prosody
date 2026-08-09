@@ -2,7 +2,6 @@
 
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::requester::registry::PendingRegistry;
-use crate::response::frame::FrameCap;
 use crate::response::sender::Then;
 use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
@@ -97,7 +96,6 @@ pub(crate) struct PeerRuntime<D> {
 /// task, and a retry on the same port then fails to bind.
 pub(crate) struct PreparedPeerRuntime<D> {
     router: RouterHandle<GrpcSender, D>,
-    frame_cap: FrameCap,
     directory: D,
     registration: NodeRegistration,
     heartbeats: HeartbeatRegistry,
@@ -108,7 +106,6 @@ pub(crate) struct PreparedPeerRuntime<D> {
 /// Local peer machinery that has no listener, directory, or remote transport.
 pub(crate) struct PreparedLocalPeerRuntime {
     local: LocalTarget,
-    frame_cap: FrameCap,
     fleet: Arc<DestinationFleet>,
 }
 
@@ -157,12 +154,9 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
     /// registry, the fleet, or the listener refuses to start.
     pub(crate) async fn start(inputs: PeerInputs<'_, D>) -> Result<Self, PeerRuntimeError> {
         inputs.router.validate()?;
-        // One ceiling for both seams: the frames this process sends and the
-        // frames its listener admits.
-        let frame_cap = inputs.listener.frame_cap();
         let fleet = Arc::new(DestinationFleet::new(inputs.fleet)?);
         let pending = PendingRegistry::new();
-        let transport = Arc::new(GrpcSender::new(frame_cap, &fleet));
+        let transport = Arc::new(GrpcSender::new(&fleet));
         let directory = inputs.directory;
         // The blocking pool owns this wait; a runtime thread must not. The
         // Machine-name lookup is private to `discovery`, so this file reaches
@@ -186,11 +180,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         let (stop_listener, stopped) = oneshot::channel();
         let listener = match serve(
             inputs.listener,
-            PeerService::new(
-                router.local().clone(),
-                Relay::new(router.clone()),
-                frame_cap,
-            ),
+            PeerService::new(router.local().clone(), Relay::new(router.clone())),
             RuntimeHealth::new(inputs.heartbeats.clone()),
             async move { drop(stopped.await) },
         ) {
@@ -202,7 +192,6 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         };
         Ok(Self {
             router,
-            frame_cap,
             directory,
             registration,
             heartbeats: inputs.heartbeats,
@@ -261,11 +250,6 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         &self.router.fleet
     }
 
-    /// Returns the frame limit shared by this runtime.
-    pub(crate) const fn frame_cap(&self) -> FrameCap {
-        self.frame_cap
-    }
-
     /// Stops every local resource without publishing the node.
     pub(crate) async fn abandon(self) {
         self.router.local.registry.terminate();
@@ -275,14 +259,10 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
 
 impl PreparedLocalPeerRuntime {
     /// Builds local peer machinery without network resources.
-    pub(crate) fn start(
-        frame_cap: FrameCap,
-        fleet: FleetConfiguration,
-    ) -> Result<Self, PeerRuntimeError> {
+    pub(crate) fn start(fleet: FleetConfiguration) -> Result<Self, PeerRuntimeError> {
         let fleet = Arc::new(DestinationFleet::new(fleet)?);
         Ok(Self {
             local: LocalTarget::new(NodeId::new(), PendingRegistry::new()),
-            frame_cap,
             fleet,
         })
     }
@@ -300,11 +280,6 @@ impl PreparedLocalPeerRuntime {
     /// Returns the destination fleet shared by this runtime.
     pub(crate) const fn fleet(&self) -> &Arc<DestinationFleet> {
         &self.fleet
-    }
-
-    /// Returns the frame limit shared by this runtime.
-    pub(crate) const fn frame_cap(&self) -> FrameCap {
-        self.frame_cap
     }
 
     /// Starts the local runtime. No external activation is necessary.

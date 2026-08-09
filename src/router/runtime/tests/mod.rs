@@ -8,7 +8,7 @@
 use super::{PeerInputs, PeerRuntime, PreparedPeerRuntime, RouterConfiguration};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::registry::PendingRegistry;
-use crate::response::frame::{FrameCap, FrameHeader};
+use crate::response::frame::FrameHeader;
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::directory::tests::support::cassandra_directory;
@@ -32,9 +32,6 @@ mod wiring;
 /// with, and its refresh delay is at least a fifth of it, so no refresh runs
 /// while a test observes the first write.
 const LEASE: Duration = Duration::from_secs(30);
-
-/// The frame ceiling one process uses in both directions.
-const FRAME_BYTES: usize = 8 * 1024;
 
 /// How long a parked request stays open.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -71,10 +68,8 @@ impl Process {
     /// Starts one live process.
     async fn new() -> Result<Self> {
         let directory = cassandra_directory(LEASE).await?;
-        let cap = frame_cap()?;
         let bound = BoundListener::bind(&TransportConfiguration {
             bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-            frame_cap: cap,
         })
         .await?;
         let listener = Endpoint {
@@ -144,11 +139,6 @@ where
             Err(error.into())
         }
     }
-}
-
-/// The frame ceiling one process's listener and senders share.
-fn frame_cap() -> Result<FrameCap> {
-    Ok(FrameCap::new(FRAME_BYTES)?)
 }
 
 /// A header for one successful response to `request`, addressed to `target`.

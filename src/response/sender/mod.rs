@@ -4,11 +4,9 @@ mod metrics;
 mod route;
 
 pub(crate) use self::metrics::DropReason;
-use self::metrics::Stage;
 use self::route::{PreparedResponse, deliver_response, stage};
 use crate::codec::Codec;
-use crate::response::frame::encode::FrameEncoder;
-use crate::response::frame::{FrameCap, FrameHeader};
+use crate::response::frame::FrameHeader;
 use crate::response::headers::RequestDeadline;
 use crate::router::fleet::DestinationFleet;
 use opentelemetry::Context;
@@ -23,7 +21,6 @@ pub(crate) struct TypedSender<C: Codec, R: ResponseRoute> {
     /// The route preferences shared by every response from this process.
     fleet: Arc<DestinationFleet>,
     route: R,
-    cap: FrameCap,
     _codec: PhantomData<fn() -> C>,
 }
 
@@ -33,24 +30,17 @@ pub(crate) use route::{ResponseRoute, RouteOutcome, Then};
 
 impl<C: Codec, R: ResponseRoute> TypedSender<C, R> {
     /// Builds a sender from one statically composed response route.
-    pub(crate) fn new_route(route: R, fleet: &Arc<DestinationFleet>, cap: FrameCap) -> Self {
-        Self::build(fleet, route, cap)
+    pub(crate) fn new_route(route: R, fleet: &Arc<DestinationFleet>) -> Self {
+        Self::build(fleet, route)
     }
 
-    fn build(fleet: &Arc<DestinationFleet>, route: R, cap: FrameCap) -> Self {
+    fn build(fleet: &Arc<DestinationFleet>, route: R) -> Self {
         let fleet = Arc::clone(fleet);
         Self {
             fleet,
             route,
-            cap,
             _codec: PhantomData,
         }
-    }
-
-    /// Encodes one response through the standard codec cache and buffer.
-    pub(crate) fn prepare(&self, header: FrameHeader, payload: &C::Payload) -> PreparedResponse {
-        Stage::Attempted.record();
-        stage(&FrameEncoder::<C>::new(self.cap), header, payload)
     }
 
     /// Sends one prepared response in the trace that `trace` names.
@@ -68,4 +58,9 @@ impl<C: Codec, R: ResponseRoute> TypedSender<C, R> {
         let destination = self.fleet.destination(prepared.header().target);
         deliver_response(&self.route, prepared, trace, &destination, deadline).await
     }
+}
+
+/// Encodes one response through the standard codec cache and buffer.
+pub(crate) fn prepare<C: Codec>(header: FrameHeader, payload: &C::Payload) -> PreparedResponse {
+    stage::<C>(header, payload)
 }

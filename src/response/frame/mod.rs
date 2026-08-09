@@ -9,9 +9,8 @@ use super::{FormatToken, RequestId, ResponseStatus};
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
-use prost::encoding::{encoded_len_varint, key_len};
 #[cfg(test)]
-use thiserror::Error;
+use prost::encoding::{encoded_len_varint, key_len};
 
 pub(crate) mod decode;
 pub(crate) mod encode;
@@ -29,17 +28,9 @@ const FIELD_RELAY_NODE: u32 = 8;
 const ID_BYTES: usize = 16;
 
 /// The encoded size of one relay identifier field.
+#[cfg(test)]
 const RELAY_FIELD_BYTES: usize =
     key_len(FIELD_RELAY_NODE) + encoded_len_varint(ID_BYTES as u64) + ID_BYTES;
-
-/// The internal ceiling on an encoded frame.
-///
-/// It bounds the complete frame rather than the payload alone, and it is the
-/// size the outgoing transport buffer is created at, so a maximum-size frame
-/// never grows that buffer. Its range is checked once, here, so no later code
-/// has to wonder whether a ceiling is usable.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FrameCap(usize);
 
 /// The routing and classification fields a responder supplies for one frame.
 ///
@@ -74,75 +65,6 @@ pub(crate) struct ResponseFrame {
     /// The encoded response, opaque until a codec that speaks `format` reads
     /// it.
     pub(crate) payload: BytesMut,
-}
-
-impl FrameCap {
-    /// The ceiling a process publishes when an operator asks for none.
-    pub(crate) const DEFAULT: Self = Self(64 * 1024);
-    /// The widest ceiling this type admits.
-    ///
-    /// A reader that is already bounded by its transport passes this, so its
-    /// own check is the type's upper bound rather than a second ceiling to
-    /// configure.
-    pub(crate) const MAX: Self = Self(Self::MAX_BYTES);
-    /// Above this one frame could exhaust a receiver's whole buffer budget.
-    pub(crate) const MAX_BYTES: usize = 16 * 1024 * 1024;
-    /// Below this a frame's largest legal header and relay field would not fit.
-    #[cfg(test)]
-    pub(crate) const MIN_BYTES: usize = key_len(FIELD_PROTOCOL_VERSION)
-        + 1
-        + 2 * (key_len(FIELD_TARGET_NODE) + 1 + ID_BYTES)
-        + key_len(FIELD_SUBSYSTEM)
-        + 1
-        + SubsystemName::MAX_BYTES
-        + key_len(FIELD_FORMAT)
-        + 2
-        + super::FORMAT_MAX_BYTES
-        + key_len(FIELD_STATUS)
-        + 1
-        + key_len(FIELD_PAYLOAD)
-        + 1
-        + RELAY_FIELD_BYTES;
-
-    /// Accepts a test ceiling within the supported range.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FrameCapError::OutOfRange`] for anything outside
-    /// [`MIN_BYTES`](Self::MIN_BYTES)..=[`MAX_BYTES`](Self::MAX_BYTES).
-    #[cfg(test)]
-    pub(crate) fn new(bytes: usize) -> Result<Self, FrameCapError> {
-        if (Self::MIN_BYTES..=Self::MAX_BYTES).contains(&bytes) {
-            Ok(Self(bytes))
-        } else {
-            Err(FrameCapError::OutOfRange {
-                bytes,
-                min: Self::MIN_BYTES,
-                max: Self::MAX_BYTES,
-            })
-        }
-    }
-
-    /// The ceiling, in bytes.
-    pub(crate) const fn bytes(self) -> usize {
-        self.0
-    }
-}
-
-/// A test frame ceiling the transport cannot use.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[cfg(test)]
-pub(crate) enum FrameCapError {
-    /// The ceiling is outside the supported range.
-    #[error("frame cap {bytes} is outside {min}..={max} bytes")]
-    OutOfRange {
-        /// The requested ceiling.
-        bytes: usize,
-        /// The smallest usable ceiling.
-        min: usize,
-        /// The largest usable ceiling.
-        max: usize,
-    },
 }
 
 // Visible crate-wide to test modules: the sender's suites and the peer

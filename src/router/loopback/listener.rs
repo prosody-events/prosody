@@ -3,7 +3,6 @@
 //! neighbours through.
 
 use super::TestHealth;
-use crate::response::frame::FrameCap;
 use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
@@ -72,14 +71,13 @@ impl FixedRouter {
     /// A router over its own fleet and transport, resolving every node to
     /// `registration` from a process labelled `here`.
     pub(crate) fn new(
-        cap: FrameCap,
         config: FleetConfiguration,
         registration: Option<NodeRegistration>,
         here: Option<NetworkId>,
     ) -> Result<Self> {
         let fleet = Arc::new(DestinationFleet::new(config)?);
         Ok(Self {
-            transport: Arc::new(GrpcSender::new(cap, &fleet)),
+            transport: Arc::new(GrpcSender::new(&fleet)),
             fleet,
             registration,
             here,
@@ -126,17 +124,16 @@ impl RelayHop for FixedRouter {
 }
 
 /// A listener configuration on the loopback interface, on a port the operating
-/// system chooses, with `cap` as its frame ceiling.
-pub(crate) fn transport(cap: usize) -> Result<TransportConfiguration> {
-    Ok(TransportConfiguration {
+/// system chooses.
+pub(crate) fn transport() -> TransportConfiguration {
+    TransportConfiguration {
         bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        frame_cap: FrameCap::new(cap)?,
-    })
+    }
 }
 
 /// A listener bound on the loopback interface under [`transport`].
-pub(crate) async fn bind(cap: usize) -> Result<BoundListener> {
-    Ok(BoundListener::bind(&transport(cap)?).await?)
+pub(crate) async fn bind() -> Result<BoundListener> {
+    Ok(BoundListener::bind(&transport()).await?)
 }
 
 /// Where a bound listener is, as a peer on this machine dials it.

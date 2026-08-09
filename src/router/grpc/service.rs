@@ -7,7 +7,6 @@ use super::inject::MetadataExtractor;
 use crate::otel::carry_parent;
 use crate::propagator::new_propagator;
 use crate::response::ResponseDisposition;
-use crate::response::frame::FrameCap;
 use crate::response::frame::ResponseFrame;
 use crate::response::frame::encode::Forwarded;
 use crate::router::relay::{Relay, RelayFailure, Routing, routing};
@@ -28,17 +27,15 @@ use tracing::{Instrument, Span, debug_span};
 pub(crate) struct PeerService<R> {
     local: LocalTarget,
     relay: Relay<R>,
-    cap: FrameCap,
     propagator: TextMapCompositePropagator,
 }
 
 impl<R> PeerService<R> {
     /// Serves `local` and sends every other frame through `relay`.
-    pub(crate) fn new(local: LocalTarget, relay: Relay<R>, cap: FrameCap) -> Self {
+    pub(crate) fn new(local: LocalTarget, relay: Relay<R>) -> Self {
         Self {
             local,
             relay,
-            cap,
             propagator: new_propagator(),
         }
     }
@@ -95,9 +92,7 @@ impl<R: RelayHop> Peer for PeerService<R> {
                 Routing::Forward => {
                     // The forwarded form carries this process's own id, so a
                     // relay id the caller supplied cannot survive the hop.
-                    let Some(forwarded) = Forwarded::new(frame, self.local.node, self.cap) else {
-                        return answer(&span, ResponseDisposition::ResponseTooLarge);
-                    };
+                    let forwarded = Forwarded::new(frame, self.local.node);
                     let forward = debug_span!(
                         "peer.response.forward",
                         otel.kind = "client",
@@ -153,7 +148,6 @@ fn answer(span: &Span, disposition: ResponseDisposition) -> Result<Response<()>,
         ResponseDisposition::Accepted => Ok(Response::new(())),
         ResponseDisposition::UnknownRequest
         | ResponseDisposition::ClosedRequest
-        | ResponseDisposition::ResponseTooLarge
         | ResponseDisposition::AlreadyRelayed
         | ResponseDisposition::RelayDeadlineExceeded
         | ResponseDisposition::Unreachable => {

@@ -3,7 +3,6 @@
 use super::codec::{ClientFrameCodec, FrameBytes};
 use super::inject::MetadataInjector;
 use crate::propagator::new_propagator;
-use crate::response::frame::FrameCap;
 use crate::router::directory::Endpoint;
 use crate::router::fleet::DestinationFleet;
 use crate::router::{Framed, ResponseSender, SendFailure};
@@ -53,13 +52,12 @@ type Channels = Cache<Endpoint, Channel, UnitWeighter, RandomState>;
 /// evicted first.
 pub(crate) struct GrpcSender {
     channels: Arc<Channels>,
-    cap: FrameCap,
     propagator: TextMapCompositePropagator,
 }
 
 impl GrpcSender {
-    /// A sender for `fleet`, refusing to encode a frame over `cap`.
-    pub(crate) fn new(cap: FrameCap, fleet: &DestinationFleet) -> Self {
+    /// A sender for `fleet`.
+    pub(crate) fn new(fleet: &DestinationFleet) -> Self {
         let capacity = fleet.config().peer_capacity;
         Self {
             channels: Arc::new(Cache::with(
@@ -69,7 +67,6 @@ impl GrpcSender {
                 RandomState::default(),
                 DefaultLifecycle::default(),
             )),
-            cap,
             propagator: new_propagator(),
         }
     }
@@ -116,12 +113,7 @@ impl ResponseSender for GrpcSender {
             &Span::current().context(),
             &mut MetadataInjector::new(request.metadata_mut()),
         );
-        // The encoding ceiling is set explicitly because tonic defaults it to
-        // the whole address space. The decoding ceiling is zero because the
-        // answer is the status alone and carries no body.
-        let mut client = Grpc::new(channel)
-            .max_encoding_message_size(self.cap.bytes())
-            .max_decoding_message_size(0);
+        let mut client = Grpc::new(channel);
         if let Err(error) = client.ready().await {
             warn!(%error, host = %address.host, port = address.port, "a peer channel never became ready");
             return Err(SendFailure::Unreachable);

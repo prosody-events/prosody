@@ -17,7 +17,6 @@ use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{EventHandler, Partition, Topic};
 use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::RequestId;
-use crate::response::frame::FrameCap;
 use crate::response::headers::{RequestDeadline, RequestTag};
 use crate::router::Router;
 use crate::router::loopback::{Delivery, TestRouter, collect_deliveries, config, node};
@@ -44,9 +43,6 @@ mod ordering;
 /// The subsystem every fixture answers for.
 const SUBSYSTEM: &str = "billing";
 
-/// The frame ceiling the ordinary fixtures encode against.
-const CAP_BYTES: usize = 4096;
-
 /// The topic and partition every dispatch in these suites carries.
 const TOPIC: &str = "test-topic";
 const PARTITION: Partition = 0;
@@ -72,12 +68,9 @@ thread_local! {
 #[derive(Default)]
 struct ResultProbeCodec;
 
-/// The same codec, except that its error arm cannot fit the smallest frame cap.
-///
-/// The success arm stays one byte, so a suite can hold a control response and
-/// an over-cap response to the same fixture and differ in one dimension.
+/// The same codec, except that its error arm is large.
 #[derive(Default)]
-struct OversizedProbeCodec;
+struct LargeProbeCodec;
 
 /// One fleet, one loopback transport, and one responder over them.
 struct Fixture<C: Codec<Payload = Result<(), TestError>>> {
@@ -124,7 +117,7 @@ impl Codec for ResultProbeCodec {
     }
 }
 
-impl Codec for OversizedProbeCodec {
+impl Codec for LargeProbeCodec {
     type Error = ProbeCodecError;
     type Payload = Result<(), TestError>;
 
@@ -151,7 +144,7 @@ impl Codec for OversizedProbeCodec {
         if payload.is_ok() {
             buf.push(byte);
         } else {
-            buf.resize(FrameCap::MIN_BYTES, byte);
+            buf.resize(64 * 1024, byte);
         }
         Ok(())
     }
@@ -166,24 +159,18 @@ impl Codec for OversizedProbeCodec {
         if payload.is_ok() {
             buf.push(byte);
         } else {
-            buf.resize(FrameCap::MIN_BYTES, byte);
+            buf.resize(64 * 1024, byte);
         }
         Ok(())
     }
 }
 
 impl<C: Codec<Payload = Result<(), TestError>>> Fixture<C> {
-    /// Builds a fixture that encodes against `CAP_BYTES`.
     fn new() -> Result<Self> {
-        Self::with_cap(FrameCap::new(CAP_BYTES)?)
-    }
-
-    fn with_cap(cap: FrameCap) -> Result<Self> {
         let (router, deliveries) = TestRouter::new(config())?;
         let responder = Responder::new_route(
             router.clone(),
             router.fleet(),
-            cap,
             SubsystemName::try_new(SUBSYSTEM)?,
         );
         Ok(Self {
@@ -320,12 +307,6 @@ fn offset_tracker() -> OffsetTracker {
 /// How many payloads the probe codecs have serialized on this thread.
 fn serialize_count() -> usize {
     SERIALIZES.get()
-}
-
-/// The frame ceiling the ordinary fixtures encode against, so a decode in a
-/// suite cannot disagree with the response encode.
-fn cap() -> Result<FrameCap> {
-    Ok(FrameCap::new(CAP_BYTES)?)
 }
 
 /// The byte one result encodes to: zero for a success, else the category's own

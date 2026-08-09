@@ -1,13 +1,13 @@
 //! What crosses a real hop: the loop stop, the caller's budget, and the trace.
 
-use super::{ALPHA, BUDGET, CAP_BYTES, Live, PAYLOAD, Pair, TargetRoute};
+use super::{ALPHA, BUDGET, Live, PAYLOAD, Pair, TargetRoute};
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
-use crate::response::frame::encode::{FrameEncoder, Staged};
+use crate::response::frame::FrameHeader;
+use crate::response::frame::encode::{Staged, stage};
 use crate::response::frame::tests::CountingCodec;
-use crate::response::frame::{FrameCap, FrameHeader};
 use crate::response::headers::RequestDeadline;
-use crate::response::sender::TypedSender;
+use crate::response::sender::{TypedSender, prepare};
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
@@ -56,14 +56,13 @@ const CALLER_BUDGET: Duration = Duration::from_secs(30);
 const HERE: &str = "here";
 const THERE: &str = "there";
 
-/// One byte more than the smallest response ceiling can retain.
-const OVER_RESPONSE_CAP: [u8; FrameCap::MIN_BYTES + 1] = [0; FrameCap::MIN_BYTES + 1];
+static LARGE_RESPONSE: [u8; 64 * 1024] = [0; 64 * 1024];
 
-/// A target transport's size refusal reaches the original caller.
+/// A large response crosses the relay without a Prosody-specific size limit.
 #[test]
-fn a_relayed_out_of_range_reaches_the_caller() -> Result<()> {
+fn a_large_response_crosses_a_relay() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let pair = Pair::start_with_target_frame_cap(FrameCap::MIN_BYTES).await?;
+        let pair = Pair::start(TargetRoute::Nowhere).await?;
         let request = awaited(&pair.target.registry)?;
         let outcome = async {
             let answered = call_with_payload(
@@ -71,12 +70,12 @@ fn a_relayed_out_of_range_reaches_the_caller() -> Result<()> {
                 pair.target.node,
                 request.id(),
                 BUDGET,
-                &OVER_RESPONSE_CAP,
+                &LARGE_RESPONSE,
             )
             .await?;
             ensure(
-                answered == Code::OutOfRange,
-                format!("the target must pass its size refusal through, not {answered:?}"),
+                answered == Code::Ok,
+                format!("the target must accept the large response, not {answered:?}"),
             )?;
             Ok(())
         }
@@ -251,7 +250,6 @@ fn a_response_crosses_two_networks_through_a_relay() -> Result<()> {
 /// The responder uses the production fleet and transport. Thus, the response
 /// follows the same route as a production response.
 async fn crossing(pair: &Pair) -> Result<()> {
-    let cap = FrameCap::new(CAP_BYTES)?;
     let mut request = awaited(&pair.target.registry)?;
     let receiver = request.receiver()?;
     let elsewhere = NodeRegistration {
@@ -262,7 +260,6 @@ async fn crossing(pair: &Pair) -> Result<()> {
         hostname: Host::make("crossing"),
     };
     let router = FixedRouter::new(
-        cap,
         FleetConfiguration::default(),
         Some(elsewhere),
         Some(NetworkId::make(HERE)),
@@ -277,9 +274,9 @@ async fn crossing(pair: &Pair) -> Result<()> {
         format!("the rules chose {route:?}, which is not the target's entry point alone"),
     )?;
 
-    let sender = TypedSender::<CountingCodec, _>::new_route(router.clone(), router.fleet(), cap);
+    let sender = TypedSender::<CountingCodec, _>::new_route(router.clone(), router.fleet());
     let payload = PAYLOAD.to_vec();
-    let prepared = sender.prepare(
+    let prepared = prepare::<CountingCodec>(
         FrameHeader {
             target: pair.target.node,
             request: request.id(),
@@ -315,10 +312,8 @@ async fn call_with_payload(
     granted: Duration,
     payload: &[u8],
 ) -> Result<Code> {
-    let cap = FrameCap::new(CAP_BYTES)?;
     let fleet = DestinationFleet::new(FleetConfiguration::default())?;
-    let sender = GrpcSender::new(cap, &fleet);
-    let encoder = FrameEncoder::<CountingCodec>::new(cap);
+    let sender = GrpcSender::new(&fleet);
     let header = FrameHeader {
         target,
         request,
@@ -326,7 +321,7 @@ async fn call_with_payload(
         status: ResponseStatus::Success,
         relay: None,
     };
-    let staged = encoder.stage(&header, &payload.to_vec())?;
+    let staged = stage::<CountingCodec>(&header, &payload.to_vec())?;
     let delivered = deliver(&sender, &live.address, &staged, granted)
         .instrument(info_span!("peer.test.call"))
         .await;

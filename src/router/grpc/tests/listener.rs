@@ -1,8 +1,7 @@
 //! Peer listener registration and reflection.
 
-use super::{FRAME_CAP, Harness, transport};
+use super::{Harness, transport};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::response::frame::FrameCap;
 use crate::router::directory::tests::support::cassandra_directory;
 use crate::router::directory::{NodeDirectory, RegistrationTtl};
 use crate::router::fleet::config::FleetConfiguration;
@@ -24,7 +23,7 @@ const REFLECTION: &str = "/grpc.reflection.v1.ServerReflection/ServerReflectionI
 fn a_registration_publishes_the_bound_port() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
-        let bound = BoundListener::bind(&transport(FRAME_CAP)?).await?;
+        let bound = BoundListener::bind(&transport()).await?;
         let expected = bound.address().port();
         let router = RouterConfiguration::default();
         let directory = cassandra_directory(RegistrationTtl::DEFAULT.duration()).await?;
@@ -57,7 +56,7 @@ fn a_registration_publishes_the_bound_port() -> Result<()> {
 fn reflection_is_always_served() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
-        let harness = Harness::with(transport(FRAME_CAP)).await?;
+        let harness = Harness::with(transport()).await?;
         let actual = reflect(harness.address.port).await;
         harness.stop().await?;
         ensure!(actual? == Code::Ok, "reflection returned another status");
@@ -67,7 +66,7 @@ fn reflection_is_always_served() -> Result<()> {
 
 async fn reflect(port: u16) -> Result<Code> {
     let channel = Dialled::from_shared(format!("http://127.0.0.1:{port}"))?.connect_lazy();
-    let mut client = Grpc::new(channel).max_decoding_message_size(FrameCap::MAX_BYTES);
+    let mut client = Grpc::new(channel);
     let request = Request::new(tokio_stream::iter(Vec::new()));
     if let Err(error) = client.ready().await {
         bail!("the reflection channel never became ready: {error:#}");

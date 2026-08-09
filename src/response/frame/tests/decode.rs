@@ -2,10 +2,10 @@ use super::{CountingCodec, RAW_ID, RawFrame, UNKNOWN_TAG, raw_bytes_field, raw_v
 use crate::codec::Codec;
 use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::frame::decode::{FrameDecodeError, decode_frame};
-use crate::response::frame::encode::FrameEncoder;
+use crate::response::frame::encode::stage;
 use crate::response::frame::{
     FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
-    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader,
+    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameHeader,
 };
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::{Framed, NodeId};
@@ -39,7 +39,7 @@ const SHORT_ID: [u8; 15] = [0x22; 15];
 /// One byte past the longest subsystem name a frame may carry.
 const LONG_SUBSYSTEM: [u8; 65] = [b'x'; 65];
 
-/// A payload that pushes a frame past the smallest supported cap.
+/// A payload large enough to catch accidental tiny transport assumptions.
 const BIG_PAYLOAD: [u8; 512] = [0x5a; 512];
 
 /// Whatever a responder frames, the far end reads back unchanged.
@@ -52,9 +52,6 @@ fn a_framed_response_round_trips(
     relay: Option<u128>,
     mut payload: Vec<u8>,
 ) -> TestResult {
-    let Ok(cap) = FrameCap::new(4096) else {
-        return TestResult::error("4 KiB is a supported cap");
-    };
     let Ok(subsystem) = SubsystemName::try_new(SUBSYSTEMS[subsystem % SUBSYSTEMS.len()]) else {
         return TestResult::error("every name in the vocabulary is legal");
     };
@@ -70,15 +67,14 @@ fn a_framed_response_round_trips(
         },
         relay: relay.map(node),
     };
-    payload.truncate(cap.bytes() / 2);
+    payload.truncate(2048);
 
-    let encoder = FrameEncoder::<CountingCodec>::new(cap);
-    let mut wire = BytesMut::with_capacity(cap.bytes());
-    match encoder.stage(&header, &payload) {
+    let mut wire = BytesMut::new();
+    match stage::<CountingCodec>(&header, &payload) {
         Ok(staged) => staged.write(&mut wire),
         Err(error) => return TestResult::error(format!("staging failed: {error}")),
     }
-    let decoded = match decode_frame(&mut wire, cap) {
+    let decoded = match decode_frame(&mut wire) {
         Ok(decoded) => decoded,
         Err(error) => return TestResult::error(format!("decoding failed: {error}")),
     };
@@ -108,8 +104,7 @@ fn node(value: u128) -> NodeId {
 /// wrong reason.
 #[test]
 fn the_raw_fixture_is_a_well_formed_frame() -> Result<()> {
-    let cap = FrameCap::new(1024)?;
-    let decoded = decode_frame(&mut RawFrame::default().encode(), cap)?;
+    let decoded = decode_frame(&mut RawFrame::default().encode())?;
     assert_eq!(
         decoded.header.subsystem,
         SubsystemName::try_new("billing")?,
@@ -133,13 +128,12 @@ fn the_raw_fixture_is_a_well_formed_frame() -> Result<()> {
 /// relay node, so a peer that omits protobuf defaults must be understood.
 #[test]
 fn omitted_payload_and_relay_decode_as_absent() -> Result<()> {
-    let cap = FrameCap::new(1024)?;
     let raw = RawFrame {
         payload: None,
         relay: None,
         ..RawFrame::default()
     };
-    let decoded = decode_frame(&mut raw.encode(), cap)?;
+    let decoded = decode_frame(&mut raw.encode())?;
     assert!(
         decoded.payload.is_empty(),
         "an omitted payload decodes as empty"
@@ -155,19 +149,17 @@ fn omitted_payload_and_relay_decode_as_absent() -> Result<()> {
 /// can add one.
 #[test]
 fn an_unknown_field_is_skipped() -> Result<()> {
-    let cap = FrameCap::new(1024)?;
     let raw = RawFrame {
         unknown: Some(7),
         ..RawFrame::default()
     };
-    let decoded = decode_frame(&mut raw.encode(), cap)?;
+    let decoded = decode_frame(&mut raw.encode())?;
     assert_eq!(&decoded.payload[..], b"hi", "the known fields still decode");
     Ok(())
 }
 
 #[test]
 fn a_malformed_frame_is_refused_by_the_field_that_broke_it() -> Result<()> {
-    let cap = FrameCap::new(1024)?;
     let cases = [
         (
             RawFrame {
@@ -248,7 +240,7 @@ fn a_malformed_frame_is_refused_by_the_field_that_broke_it() -> Result<()> {
         ),
     ];
     for (raw, expected) in cases {
-        match decode_frame(&mut raw.encode(), cap) {
+        match decode_frame(&mut raw.encode()) {
             Err(actual) => assert_eq!(actual, expected, "the frame was refused for another reason"),
             Ok(_) => bail!("the frame must be refused as {expected}"),
         }
@@ -263,7 +255,6 @@ fn a_malformed_frame_is_refused_by_the_field_that_broke_it() -> Result<()> {
 /// of the field, not its absence.
 #[test]
 fn a_repeated_field_is_refused() -> Result<()> {
-    let cap = FrameCap::new(1024)?;
     let cases = [
         (FIELD_PROTOCOL_VERSION, "protocol_version"),
         (FIELD_TARGET_NODE, "target_node"),
@@ -287,7 +278,7 @@ fn a_repeated_field_is_refused() -> Result<()> {
         } else {
             raw_bytes_field(tag, b"", &mut wire);
         }
-        match decode_frame(&mut wire, cap) {
+        match decode_frame(&mut wire) {
             Err(actual) => assert_eq!(
                 actual,
                 FrameDecodeError::RepeatedField(field),
@@ -304,12 +295,11 @@ fn a_repeated_field_is_refused() -> Result<()> {
 /// length it claimed, and no cut smuggles bytes into a field the frame does not
 /// carry.
 #[test]
-fn a_frame_cut_short_is_refused_by_the_field_that_ran_out() -> Result<()> {
-    let cap = FrameCap::new(1024)?;
+fn a_frame_cut_short_is_refused_by_the_field_that_ran_out() {
     let wire = RawFrame::default().encode();
     let mut cut = Vec::new();
     for length in 0..wire.len() {
-        match decode_frame(&mut &wire[..length], cap) {
+        match decode_frame(&mut &wire[..length]) {
             Err(FrameDecodeError::Truncated { field, .. }) => cut.push(field),
             Err(_) => {}
             // The payload is the fixture's last field and the one field whose
@@ -333,29 +323,17 @@ fn a_frame_cut_short_is_refused_by_the_field_that_ran_out() -> Result<()> {
             "a cut inside {field} must be reported there"
         );
     }
-    Ok(())
 }
 
-/// The whole encoded frame is bounded before any per-field work, so nothing is
-/// allocated on behalf of a length a peer merely claimed.
+/// The frame codec leaves message-size policy to gRPC.
 #[test]
-fn an_over_cap_frame_is_refused_whole() -> Result<()> {
+fn a_large_payload_decodes() -> Result<()> {
     let raw = RawFrame {
         payload: Some(&BIG_PAYLOAD),
         ..RawFrame::default()
     };
     let mut wire = raw.encode();
-    let length = wire.len();
-
-    let cap = FrameCap::new(FrameCap::MIN_BYTES)?;
-    let Err(FrameDecodeError::FrameTooLarge { bytes, limit }) = decode_frame(&mut wire, cap) else {
-        bail!("a frame over the cap must be refused before it is read");
-    };
-    assert_eq!(
-        (bytes, limit),
-        (length, cap.bytes()),
-        "the refusal must name the whole frame"
-    );
+    assert_eq!(decode_frame(&mut wire)?.payload, &BIG_PAYLOAD[..]);
     Ok(())
 }
 

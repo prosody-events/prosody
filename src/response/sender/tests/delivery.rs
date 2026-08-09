@@ -1,8 +1,7 @@
 //! What happens to a response between its hook and the wire.
 
-use super::{CAP_BYTES, Harness, PAYLOAD, config, node, paused, port};
+use super::{Harness, PAYLOAD, config, node, paused, port};
 use crate::Codec;
-use crate::response::frame::FrameCap;
 use crate::response::frame::decode::decode_frame;
 use crate::response::frame::tests::CountingCodec;
 use color_eyre::Result;
@@ -29,7 +28,7 @@ fn a_response_reaches_the_wire_intact() -> Result<()> {
             "the response must reach its target node"
         );
 
-        let mut frame = decode_frame(&mut delivery.bytes, FrameCap::new(CAP_BYTES)?)?;
+        let mut frame = decode_frame(&mut delivery.bytes)?;
         assert_eq!(
             frame.header.target,
             node(TARGET),

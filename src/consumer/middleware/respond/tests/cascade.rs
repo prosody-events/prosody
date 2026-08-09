@@ -3,7 +3,7 @@
 //! Every suite here drives the real composed stack — log outside retry, retry
 //! outside respond — and reads the transport after an explicit drain.
 
-use super::{Fixture, ResultProbeCodec, cap, offset_tracker, tagged, untagged};
+use super::{Fixture, ResultProbeCodec, offset_tracker, tagged, untagged};
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, RecordingTimer, ScriptedHandler, ScriptedHook, create_test_trigger,
 };
@@ -99,7 +99,7 @@ fn a_retried_cascade_answers_once_with_the_settled_outcome() -> Result<()> {
             "only the attempt that settled answers: {settled:?}",
         );
         let mut delivery = drained.remove(0);
-        let frame = decode_frame(&mut delivery.bytes, cap()?)?;
+        let frame = decode_frame(&mut delivery.bytes)?;
         assert_eq!(
             frame.header.status, settled,
             "the answer states the settled outcome, not an earlier attempt",

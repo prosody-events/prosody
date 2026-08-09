@@ -238,11 +238,7 @@ impl<D: NodeDirectory> PreparedRuntime for PreparedPeerRuntime<D> {
     }
 
     fn responses(&self) -> PeerResponder<Self::Route> {
-        PeerResponder::new(
-            self.response_route(),
-            Arc::clone(self.fleet()),
-            self.frame_cap(),
-        )
+        PeerResponder::new(self.response_route(), Arc::clone(self.fleet()))
     }
 
     async fn launch(self) -> Result<Self::Running, (Self, ConsumerError)> {
@@ -271,11 +267,7 @@ impl PreparedRuntime for PreparedLocalPeerRuntime {
     }
 
     fn responses(&self) -> PeerResponder<Self::Route> {
-        PeerResponder::new(
-            self.response_route(),
-            Arc::clone(self.fleet()),
-            self.frame_cap(),
-        )
+        PeerResponder::new(self.response_route(), Arc::clone(self.fleet()))
     }
 
     async fn launch(self) -> Result<Self::Running, (Self, ConsumerError)> {
@@ -345,7 +337,7 @@ pub(crate) fn prepare_local(
     peer: &PeerConfiguration,
 ) -> Result<PreparedLocalPeerRuntime, ConsumerError> {
     let parts = peer.parts().map_err(PeerInitError::from)?;
-    PreparedLocalPeerRuntime::start(parts.transport.frame_cap, parts.fleet)
+    PreparedLocalPeerRuntime::start(parts.fleet)
         .map_err(PeerInitError::from)
         .map_err(Into::into)
 }

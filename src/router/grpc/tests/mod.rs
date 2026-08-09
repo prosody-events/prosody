@@ -22,9 +22,9 @@ use super::service::PeerService;
 use super::{BoundListener, TransportConfiguration};
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
-use crate::response::frame::encode::FrameEncoder;
+use crate::response::frame::FrameHeader;
+use crate::response::frame::encode::stage;
 use crate::response::frame::tests::CountingCodec;
-use crate::response::frame::{FrameCap, FrameHeader};
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::directory::Endpoint;
 use crate::router::fleet::DestinationFleet;
@@ -41,16 +41,6 @@ use std::time::Duration;
 use tokio::sync::OnceCell;
 use tokio::time::Instant;
 use tonic::Code;
-
-/// The listener's frame ceiling. Small enough that an over-cap frame costs one
-/// short allocation to build.
-const FRAME_CAP: usize = 8 * 1024;
-
-/// The ceiling a sender that must out-reach the listener encodes under.
-const WIDE_FRAME_CAP: usize = 2 * FRAME_CAP;
-
-/// A frame the listener refuses and a wide sender encodes.
-const OVER_FRAME_BYTES: usize = FRAME_CAP + 1024;
 
 /// The subsystem a request awaits.
 const ALPHA: &str = "alpha";
@@ -75,15 +65,9 @@ pub(super) struct Harness {
     pub(super) node: NodeId,
     /// The registry the listener hands frames to.
     pub(super) registry: Arc<PendingRegistry>,
-    /// A sender whose ceiling matches the listener's.
     pub(super) sender: GrpcSender,
-    /// A sender whose ceiling is above the listener's, so a frame it refuses
-    /// can only have been refused by the listener.
-    pub(super) wide: GrpcSender,
     /// Where the listener is.
     pub(super) address: Endpoint,
-    /// The ceiling the listener and its matching sender share.
-    pub(super) cap: FrameCap,
     served: Served,
 }
 
@@ -94,15 +78,12 @@ struct RawFramed(BytesMut);
 impl Harness {
     /// The listener every suite shares.
     pub(super) async fn shared() -> Result<&'static Self> {
-        SHARED
-            .get_or_try_init(|| Self::with(transport(FRAME_CAP)))
-            .await
+        SHARED.get_or_try_init(|| Self::with(transport())).await
     }
 
     /// A listener of this suite's own, for the cases that vary its
     /// configuration. Call [`stop`](Self::stop) before the test returns.
-    pub(super) async fn with(config: Result<TransportConfiguration>) -> Result<Self> {
-        let config = config?;
+    pub(super) async fn with(config: TransportConfiguration) -> Result<Self> {
         let served_registry = registry();
         let node = NodeId::new();
         let bound = BoundListener::bind(&config).await?;
@@ -113,16 +94,13 @@ impl Harness {
             PeerService::new(
                 LocalTarget::new(node, Arc::clone(&served_registry)),
                 Relay::new(relay_router),
-                config.frame_cap,
             ),
         )?;
         Ok(Self {
             node,
             registry: served_registry,
-            sender: GrpcSender::new(config.frame_cap, &fleet()?),
-            wide: GrpcSender::new(FrameCap::new(WIDE_FRAME_CAP)?, &fleet()?),
+            sender: GrpcSender::new(&fleet()?),
             address,
-            cap: config.frame_cap,
             served,
         })
     }
@@ -130,23 +108,9 @@ impl Harness {
     /// Frames one response and delivers it, reporting the status the listener
     /// answered.
     pub(super) async fn deliver(&self, header: &FrameHeader, payload: Vec<u8>) -> Result<Code> {
-        self.deliver_under(&self.sender, self.cap, header, payload)
-            .await
-    }
-
-    /// [`deliver`](Self::deliver) with the sender and the encode ceiling named,
-    /// so a suite can put a frame on the wire that one of the two would refuse.
-    pub(super) async fn deliver_under(
-        &self,
-        sender: &GrpcSender,
-        cap: FrameCap,
-        header: &FrameHeader,
-        payload: Vec<u8>,
-    ) -> Result<Code> {
-        let encoder = FrameEncoder::<CountingCodec>::new(cap);
-        let staged = encoder.stage(header, &payload)?;
+        let staged = stage::<CountingCodec>(header, &payload)?;
         status(
-            sender
+            self.sender
                 .deliver(&self.address, &staged, Instant::now() + BUDGET)
                 .await,
         )
@@ -168,13 +132,8 @@ impl Harness {
 }
 
 /// A router that reaches `address` and nothing else.
-pub(super) fn reaching(cap: FrameCap, address: &Endpoint) -> Result<FixedRouter> {
-    FixedRouter::new(
-        cap,
-        fleet_config(),
-        Some(registration(address.clone())),
-        None,
-    )
+pub(super) fn reaching(address: &Endpoint) -> Result<FixedRouter> {
+    FixedRouter::new(fleet_config(), Some(registration(address.clone())), None)
 }
 
 impl Framed for RawFramed {

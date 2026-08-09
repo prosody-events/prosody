@@ -1,10 +1,10 @@
 //! What the typed sender's own suites share: a router over an in-process
 //! transport, and a harness that records every attempt it makes.
 
-use super::TypedSender;
+use super::{TypedSender, prepare};
 use crate::error::ErrorCategory;
+use crate::response::frame::FrameHeader;
 use crate::response::frame::tests::CountingCodec;
-use crate::response::frame::{FrameCap, FrameHeader};
 use crate::response::headers::RequestDeadline;
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::Router;
@@ -25,9 +25,6 @@ mod delivery;
 mod fallback;
 mod isolation;
 mod metrics;
-
-/// The frame ceiling these suites encode against.
-pub(super) const CAP_BYTES: usize = 4096;
 
 /// The response body every result in these suites carries.
 pub(super) const PAYLOAD: &[u8] = b"response";
@@ -76,8 +73,7 @@ impl Harness {
     }
 
     fn over(router: TestRouter, deliveries: UnboundedReceiver<Delivery>) -> Result<Self> {
-        let sender =
-            TypedSender::new_route(router.clone(), router.fleet(), FrameCap::new(CAP_BYTES)?);
+        let sender = TypedSender::new_route(router.clone(), router.fleet());
         Ok(Self {
             sender: Arc::new(sender),
             router,
@@ -105,7 +101,7 @@ impl Harness {
 
     /// Sends `payload` for `index`.
     pub(super) async fn send_payload(&self, index: u8, payload: Vec<u8>) -> Result<()> {
-        let prepared = self.sender.prepare(
+        let prepared = prepare::<CountingCodec>(
             FrameHeader {
                 target: node(index),
                 ..self.header.clone()
@@ -128,7 +124,7 @@ impl Harness {
             target: node(index),
             ..self.header.clone()
         };
-        let prepared = sender.prepare(header, &PAYLOAD.to_vec());
+        let prepared = prepare::<CountingCodec>(header, &PAYLOAD.to_vec());
         tokio::spawn(async move {
             let delivered = sender.send(prepared, Context::current(), DEADLINE).await;
             outcomes.record(delivered);

@@ -11,8 +11,8 @@
 //! so the client encodes bytes and decodes nothing while the server decodes a
 //! frame and encodes nothing.
 
+use crate::response::frame::ResponseFrame;
 use crate::response::frame::decode::{FrameDecodeError, decode_frame};
-use crate::response::frame::{FrameCap, ResponseFrame};
 use bytes::{Buf, BufMut, Bytes};
 use tonic::Status;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
@@ -26,9 +26,8 @@ const GRPC_HEADER_BYTES: usize = 5;
 /// tonic's encoder must be `'static`, so it cannot borrow the sender's buffer.
 /// A response therefore pays a right-sized allocation and a copy into this
 /// value, and tonic then copies it again into the per-call buffer it owns. Both
-/// copies precede one network round trip, and both buffers are bounded by the
-/// frame ceiling. A pool cannot reclaim either, because tonic owns its buffer
-/// until the write completes.
+/// copies precede one network round trip. A pool cannot reclaim either buffer,
+/// because tonic owns its buffer until the write completes.
 /// [`ResponseSender`](crate::router::ResponseSender) owns that trade.
 pub(crate) struct FrameBytes(Bytes);
 
@@ -95,18 +94,10 @@ impl Decoder for ServerFrameCodec {
 
     /// Reads one frame, and counts what it refuses.
     ///
-    /// The transport rejects an over-cap message before a byte reaches this
-    /// reader. This reader uses the type's upper bound as a second defense.
-    /// The size arm of [`refusal`] applies only when a caller drives the codec
-    /// directly.
-    ///
     /// This direction keeps tonic's own receive buffer, which grows to the
-    /// message once and is freed with the call. Sizing it to the frame
-    /// ceiling instead would hold that ceiling open on every idle stream, and
-    /// the codec is built through [`Default`] and could not read the ceiling
-    /// anyway.
+    /// message once and frees it with the call.
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<ResponseFrame>, Status> {
-        match decode_frame(src, FrameCap::MAX) {
+        match decode_frame(src) {
             Ok(frame) => Ok(Some(frame)),
             Err(error) => {
                 // The only record of why: the status carries a literal, so the
@@ -179,9 +170,8 @@ impl Decoder for ClientFrameCodec {
 
 /// The status one unreadable frame is refused with.
 ///
-/// A frame over the ceiling is a size fault and a `RESOURCE`-shaped answer
-/// would invite a retry, so it is `OUT_OF_RANGE`. Everything else is a peer
-/// that sent bytes this build cannot read, which no retry fixes.
+/// Every error is a peer that sent bytes this build cannot read. A retry cannot
+/// fix the frame.
 ///
 /// The wording is [`FrameDecodeError::message`] rather than the `Display` form,
 /// because this port is unauthenticated: a formatted status would allocate per
@@ -189,7 +179,6 @@ impl Decoder for ClientFrameCodec {
 /// and versions that sender claimed.
 fn refusal(error: &FrameDecodeError) -> Status {
     match error {
-        FrameDecodeError::FrameTooLarge { .. } => Status::out_of_range(error.message()),
         FrameDecodeError::Truncated { .. }
         | FrameDecodeError::MissingField(_)
         | FrameDecodeError::RepeatedField(_)

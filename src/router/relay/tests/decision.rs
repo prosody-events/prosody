@@ -1,7 +1,6 @@
 //! Which process a frame is accepted by, forwarded by, or refused by.
 
-use super::{BUDGET, CAP_BYTES, Process, THIS, frame};
-use crate::response::frame::FrameCap;
+use super::{BUDGET, Process, THIS, frame};
 use crate::response::frame::decode::decode_frame;
 use crate::router::loopback::{config, node, paused, port};
 use color_eyre::Result;
@@ -91,7 +90,7 @@ async fn play(routed: &Routed) -> Result<()> {
                 routed.target
             );
         }
-        let sent_frame = decode_frame(&mut sent.bytes, FrameCap::new(CAP_BYTES)?)?;
+        let sent_frame = decode_frame(&mut sent.bytes)?;
         if sent_frame.header.relay != Some(process.node) {
             bail!(
                 "the sent frame names relay {:?}, not the process that sent it on",

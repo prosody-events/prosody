@@ -5,12 +5,12 @@
 //! directory holds, and the address the runtime's own router resolves — and
 //! require them to agree.
 
-use super::{ALPHA, Process, Shared, TIMEOUT, frame_cap, header};
+use super::{ALPHA, Process, Shared, TIMEOUT, header};
 use crate::requester::registry::tests::TestRegistration;
-use crate::response::frame::encode::FrameEncoder;
+use crate::response::frame::encode::stage;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
-use crate::response::sender::{ResponseRoute, Then, TypedSender};
+use crate::response::sender::{ResponseRoute, Then, TypedSender, prepare};
 use crate::router::directory::NodeDirectory;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::HANG_GUARD;
@@ -40,11 +40,9 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
         let outcome: Result<()> = async {
             let awaited = [SubsystemName::try_new(ALPHA)?];
             let request = TestRegistration::new(&shared.pending, &awaited, TIMEOUT)?;
-            let transport = GrpcSender::new(frame_cap()?, &shared.fleet);
-            let encoder = FrameEncoder::<CountingCodec>::new(frame_cap()?);
-
+            let transport = GrpcSender::new(&shared.fleet);
             let addressed_here = header(shared.node, request.id(), ALPHA)?;
-            let mine = encoder.stage(&addressed_here, &PAYLOAD.to_vec())?;
+            let mine = stage::<CountingCodec>(&addressed_here, &PAYLOAD.to_vec())?;
             transport
                 .deliver(&shared.listener, &mine, Instant::now() + HANG_GUARD)
                 .await
@@ -52,7 +50,7 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
                     eyre!("the listener refused a frame for its own node: {failure}")
                 })?;
             let addressed_elsewhere = header(NodeId::new(), request.id(), ALPHA)?;
-            let foreign = encoder.stage(&addressed_elsewhere, &PAYLOAD.to_vec())?;
+            let foreign = stage::<CountingCodec>(&addressed_elsewhere, &PAYLOAD.to_vec())?;
             ensure!(
                 matches!(
                     transport
@@ -91,7 +89,6 @@ fn a_same_node_response_uses_the_local_registry() -> Result<()> {
         let own = TypedSender::<CountingCodec, _>::new_route(
             Then(router.local().clone(), router.clone()),
             router.fleet(),
-            frame_cap()?,
         );
         let outcome = delivered_to_itself(&router, &own, &shared).await;
         runtime.shutdown(|| async {}).await?;
@@ -122,7 +119,7 @@ async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
     let mut request = TestRegistration::new(&shared.pending, from_ref(&subsystem), TIMEOUT)?;
     let receiver = request.receiver()?;
     let payload = PAYLOAD.to_vec();
-    let prepared = own.prepare(header(shared.node, request.id(), ALPHA)?, &payload);
+    let prepared = prepare::<CountingCodec>(header(shared.node, request.id(), ALPHA)?, &payload);
     own.send(
         prepared,
         Context::current(),

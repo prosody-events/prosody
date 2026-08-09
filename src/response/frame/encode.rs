@@ -2,8 +2,7 @@
 
 use super::{
     FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
-    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameCap, FrameHeader, ID_BYTES,
-    RELAY_FIELD_BYTES, ResponseFrame,
+    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameHeader, ID_BYTES, ResponseFrame,
 };
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::response::FormatToken;
@@ -13,21 +12,9 @@ use crate::router::{Framed, NodeId};
 use bytes::{BufMut, BytesMut};
 use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len};
 use std::error::Error;
-use std::marker::PhantomData;
 use thiserror::Error;
 
-/// Encodes responses through the standard codec cache and serialize buffer.
-///
-/// [`FrameEncoder::stage`] returns the shared buffer before any asynchronous
-/// hook or route starts. The staged frame owns its bounded payload bytes.
-/// Thus, a slow hook or peer cannot reserve thread-local codec resources.
-pub struct FrameEncoder<C> {
-    cap: FrameCap,
-    _codec: PhantomData<fn() -> C>,
-}
-
-/// A response whose complete frame length has been checked against the cap.
-/// Writing one cannot fail and cannot exceed that cap.
+/// An encoded response ready for routing.
 pub struct Staged {
     header: FrameHeader,
     format: &'static str,
@@ -41,59 +28,39 @@ pub struct Staged {
 /// this hop, so loop prevention does not depend on caller cleanup.
 pub(crate) struct Forwarded(ResponseFrame);
 
-impl<C: Codec> FrameEncoder<C> {
-    /// Builds an encoder that uses the standard codec and buffer caches.
-    pub(crate) fn new(cap: FrameCap) -> Self {
-        Self {
-            cap,
-            _codec: PhantomData,
-        }
+/// Serializes one response through the standard codec and buffer caches.
+///
+/// This function returns the shared buffer before routing starts. Thus, a slow
+/// peer cannot reserve thread-local codec resources.
+///
+/// # Errors
+///
+/// Returns [`EncodeError::Codec`] when the codec fails.
+pub(crate) fn stage<C: Codec>(
+    header: &FrameHeader,
+    payload: &C::Payload,
+) -> Result<Staged, EncodeError<C::Error>> {
+    const {
+        assert!(
+            !C::FORMAT_ID.is_empty(),
+            "a codec used for responses must name a format"
+        );
+        assert!(
+            C::FORMAT_ID.len() <= FORMAT_MAX_BYTES,
+            "a codec used for responses must have a FORMAT_ID a frame can carry"
+        );
     }
+    let mut scratch = SerializeBufGuard::acquire();
+    C::with_cached_local(|codec| codec.serialize_ref(payload, &mut scratch))
+        .map_err(EncodeError::Codec)?;
 
-    /// Serializes one borrowed response and checks its forwarded frame length.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EncodeError::Codec`] when the codec fails, and
-    /// [`EncodeError::TooLarge`] when the forwarded frame would exceed the cap.
-    /// The subsystem needs no check here: a [`SubsystemName`] is one a decoder
-    /// accepts by construction.
-    ///
-    /// [`SubsystemName`]: crate::subsystem::SubsystemName
-    pub(crate) fn stage(
-        &self,
-        header: &FrameHeader,
-        payload: &C::Payload,
-    ) -> Result<Staged, EncodeError<C::Error>> {
-        const {
-            assert!(
-                !C::FORMAT_ID.is_empty(),
-                "a codec used for responses must name a format"
-            );
-            assert!(
-                C::FORMAT_ID.len() <= FORMAT_MAX_BYTES,
-                "a codec used for responses must have a FORMAT_ID a frame can carry"
-            );
-        }
-        let mut scratch = SerializeBufGuard::acquire();
-        C::with_cached_local(|codec| codec.serialize_ref(payload, &mut scratch))
-            .map_err(EncodeError::Codec)?;
-
-        let bytes = frame_len(header, C::FORMAT_ID, scratch.len());
-        let forwarded = bytes + RELAY_FIELD_BYTES as u64;
-        if forwarded > self.cap.bytes() as u64 {
-            return Err(EncodeError::TooLarge {
-                bytes: forwarded,
-                limit: self.cap.bytes(),
-            });
-        }
-        Ok(Staged {
-            header: header.clone(),
-            format: C::FORMAT_ID,
-            payload: BytesMut::from(&scratch[..]),
-            bytes: bytes as usize,
-        })
-    }
+    let bytes = frame_len(header, C::FORMAT_ID, scratch.len());
+    Ok(Staged {
+        header: header.clone(),
+        format: C::FORMAT_ID,
+        payload: BytesMut::from(&scratch[..]),
+        bytes: bytes as usize,
+    })
 }
 
 /// A staged response is what the router delivers, so the transport never sees
@@ -106,9 +73,8 @@ impl Framed for Staged {
     /// Writes the frame in field order. Field order is this encoder's choice,
     /// not a protobuf requirement; the decoder accepts any order.
     ///
-    /// Every destination this crate writes into is a
-    /// [`BytesMut`](bytes::BytesMut), which reserves on demand, and sizing one
-    /// at the frame cap keeps it from ever having to.
+    /// Every destination this crate writes into is right-sized from
+    /// [`Framed::bytes`] before this method runs.
     fn write<B: BufMut>(&self, dst: &mut B) {
         write_frame(&self.header, self.format, &self.payload, dst);
     }
@@ -137,11 +103,10 @@ impl Staged {
 }
 
 impl Forwarded {
-    /// Builds a forwarded frame when its encoded form fits `cap`.
-    pub(crate) fn new(mut frame: ResponseFrame, relay: NodeId, cap: FrameCap) -> Option<Self> {
+    /// Builds a forwarded frame with this relay's identifier.
+    pub(crate) fn new(mut frame: ResponseFrame, relay: NodeId) -> Self {
         frame.header.relay = Some(relay);
-        (frame_len(&frame.header, frame.format.to_str(), frame.payload.len()) <= cap.bytes() as u64)
-            .then_some(Self(frame))
+        Self(frame)
     }
 }
 
@@ -206,8 +171,7 @@ fn status_varint(status: ResponseStatus) -> u64 {
 
 // These two are all it takes to emit a complete frame, so they stay private:
 // exporting them would put "framed without staging" back within reach of this
-// module, where `FrameEncoder` claims it is unrepresentable. A test that needs
-// a hand-built frame writes its own fields.
+// module. A test that needs a hand-built frame writes its own fields.
 fn write_varint_field<B: BufMut>(tag: u32, value: u64, dst: &mut B) {
     encode_key(tag, WireType::Varint, dst);
     encode_varint(value, dst);
@@ -225,13 +189,4 @@ pub(crate) enum EncodeError<E: Error> {
     /// The application's codec failed to serialize the response.
     #[error(transparent)]
     Codec(E),
-
-    /// The forwarded frame would exceed the frame ceiling.
-    #[error("framed response is {bytes} bytes, over the {limit}-byte cap")]
-    TooLarge {
-        /// The length the forwarded frame would have had.
-        bytes: u64,
-        /// The frame ceiling.
-        limit: usize,
-    },
 }
