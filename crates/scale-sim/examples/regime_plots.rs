@@ -49,11 +49,32 @@ fn main() -> Result<(), PlotGenerationError> {
         return generate_regime(&report_directory, regime, include_capacity_evidence);
     }
     clear_plot_files(&report_directory)?;
-    PrincipalRegime::ALL
+    let results = PrincipalRegime::ALL
         .par_iter()
         .copied()
-        .try_for_each(|regime| generate_regime(&report_directory, regime, true))?;
-    generate_batch(&report_directory)
+        .map(|regime| {
+            let result = generate_regime(&report_directory, regime, true);
+            if let Err(error) = &result {
+                tracing::error!(regime = regime.name(), %error, "regime report failed");
+            }
+            (regime, result)
+        })
+        .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    for (regime, result) in results {
+        if let Err(error) = result {
+            failures.push(format!("{}: {error}", regime.name()));
+        }
+    }
+    if let Err(error) = generate_batch(&report_directory) {
+        tracing::error!(regime = "batch-backlog", %error, "regime report failed");
+        failures.push(format!("batch-backlog: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(PlotGenerationError::ValidationSummary { failures })
+    }
 }
 
 fn generate_batch(report_directory: &Path) -> Result<(), PlotGenerationError> {
@@ -117,6 +138,7 @@ fn generate_regime(
     } else {
         None
     };
+    // Write all artifacts before validation so failed regimes keep their reports.
     write_regime_report_pdf(
         &regime_directory.join("report.pdf"),
         &RegimeReport {
@@ -203,6 +225,8 @@ enum PlotGenerationError {
     Report(#[from] ReportError),
     #[error(transparent)]
     Validation(#[from] RegimeValidationError),
+    #[error("report generation failed: {failures:?}")]
+    ValidationSummary { failures: Vec<String> },
     #[error("unknown regime: {0}")]
     UnknownRegime(String),
     #[error("unknown experiment: {0}")]
