@@ -29,8 +29,6 @@ fn a_mock_peer_uses_no_listener() -> Result<()> {
             second.node(),
             "each local peer must own a distinct identity"
         );
-        let (_, _, first) = first.into_parts();
-        let (_, _, second) = second.into_parts();
         first.shutdown().await?;
         second.shutdown().await?;
         Ok(())

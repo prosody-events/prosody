@@ -49,6 +49,7 @@ pub struct RespondingPeer {
 }
 
 /// Request identity and pending requests from one router.
+#[derive(Clone)]
 pub struct ProducerHandle {
     node: NodeId,
     pending: Arc<PendingRegistry>,
@@ -56,25 +57,15 @@ pub struct ProducerHandle {
 
 /// Response route from one router.
 #[doc(hidden)]
+#[derive(Clone)]
 pub struct ConsumerHandle<R> {
     route: R,
 }
 
-/// Exclusive lifecycle ownership of one router.
-pub struct RouterOwner {
-    pending: Arc<PendingRegistry>,
-    peer: PeerOwner,
-}
-
-/// One running router before its capabilities are separated.
+/// One running router with its request, response, and lifecycle capabilities.
 pub(crate) struct PeerRouter<R> {
     producer: ProducerHandle,
     consumer: ConsumerHandle<R>,
-    owner: PeerOwner,
-}
-
-/// The coordinator owned by one [`PeerRouter`].
-struct PeerOwner {
     /// Sending or dropping asks the coordinator to stop.
     stop: oneshot::Sender<()>,
     /// The explicit teardown result.
@@ -113,21 +104,24 @@ impl<R> PeerRouter<R> {
         self.producer.node
     }
 
-    pub(crate) fn into_parts(self) -> (ProducerHandle, ConsumerHandle<R>, RouterOwner) {
-        let Self {
-            producer,
-            consumer,
-            owner,
-        } = self;
-        let pending = Arc::clone(&producer.pending);
-        (
-            producer,
-            consumer,
-            RouterOwner {
-                pending,
-                peer: owner,
-            },
-        )
+    pub(crate) fn producer(&self) -> ProducerHandle {
+        self.producer.clone()
+    }
+
+    pub(crate) fn consumer(&self) -> ConsumerHandle<R>
+    where
+        R: Clone,
+    {
+        self.consumer.clone()
+    }
+
+    pub(crate) async fn shutdown(self) -> Result<(), ShutdownError> {
+        self.producer.pending.close_admission();
+        let _closed = self.stop.send(());
+        self.coordinator.await.map_err(|error| {
+            error!(%error, "peer coordinator did not stop cleanly");
+            ShutdownError::Teardown
+        })?
     }
 }
 
@@ -169,38 +163,6 @@ impl<R: ResponseRoute> ConsumerHandle<R> {
             responding_provider(middleware, handler, responder),
             RespondingPeer { subsystem },
         )
-    }
-}
-
-impl RouterOwner {
-    /// Stops this router and consumes its lifecycle owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when router teardown fails.
-    pub async fn shutdown(self) -> Result<(), ShutdownError> {
-        self.pending.close_admission();
-        self.peer.stop().await
-    }
-}
-
-impl PeerOwner {
-    /// Asks the coordinator to tear the peer runtime down, and reports what it
-    /// found.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ShutdownError::Directory`] when the directory did not confirm
-    /// the removal of this node. Returns [`ShutdownError::Teardown`] when the
-    /// coordinator ended without a report. Both leave the outcome unknown: a
-    /// delete that fails after the coordinator applied it removes the row all
-    /// the same, and the steps that follow the delete can fail after it.
-    async fn stop(self) -> Result<(), ShutdownError> {
-        let _closed = self.stop.send(());
-        self.coordinator.await.map_err(|error| {
-            error!(%error, "peer coordinator did not stop cleanly");
-            ShutdownError::Teardown
-        })?
     }
 }
 
@@ -382,7 +344,8 @@ where
     PeerRouter {
         producer: ProducerHandle { node, pending },
         consumer: ConsumerHandle { route },
-        owner: PeerOwner { stop, coordinator },
+        stop,
+        coordinator,
     }
 }
 

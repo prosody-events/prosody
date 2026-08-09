@@ -87,7 +87,7 @@ async fn the_prepared_peer_admits_the_name_its_responder_answers_with() -> Resul
     let peer_config = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
     let subsystem = SubsystemName::try_new(SUBSYSTEM)?;
     let router = prepare_router(&peer_config, &backend).await?;
-    let (_, router, router_owner) = router.into_parts();
+    let consumer_router = router.consumer();
     let common = common_config(Some(subsystem.clone()))?;
     let middleware = build_common_middleware::<_, Value>(
         &common,
@@ -96,7 +96,7 @@ async fn the_prepared_peer_admits_the_name_its_responder_answers_with() -> Resul
         MemoryDeduplicationStoreProvider::new(),
     )?
     .layer(LogMiddleware::new());
-    let (provider, peer) = router.responding_provider::<SomeResponseCodec, _, _>(
+    let (provider, peer) = consumer_router.responding_provider::<SomeResponseCodec, _, _>(
         subsystem.clone(),
         &middleware,
         ScriptedHandler::success(),
@@ -104,7 +104,7 @@ async fn the_prepared_peer_admits_the_name_its_responder_answers_with() -> Resul
     let admitted = peer.admission().0;
     drop(provider);
     drop(peer);
-    router_owner.shutdown().await?;
+    router.shutdown().await?;
     ensure!(
         admitted == subsystem,
         "the prepared peer admits {admitted:?}, not the name its responder answers with"
@@ -138,7 +138,7 @@ async fn an_explicit_response_subsystem_needs_no_keyed_state_subsystem() -> Resu
         deps,
     };
     let router = prepare_router(&peer, typed.deps.backend().as_ref()).await?;
-    let (_, router, router_owner) = router.into_parts();
+    let consumer_router = router.consumer();
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_responding_consumer_with_backend::<
         ScriptedHandler,
         SomeResponseCodec,
@@ -149,7 +149,7 @@ async fn an_explicit_response_subsystem_needs_no_keyed_state_subsystem() -> Resu
         pipeline_config()?,
         Telemetry::new(),
         ScriptedHandler::success(),
-        &router,
+        &consumer_router,
         SubsystemName::try_new(SUBSYSTEM)?,
     )
     .await?;
@@ -164,7 +164,7 @@ async fn an_explicit_response_subsystem_needs_no_keyed_state_subsystem() -> Resu
     }
     .await;
     consumer.shutdown().await?;
-    router_owner.shutdown().await?;
+    router.shutdown().await?;
     outcome
 }
 

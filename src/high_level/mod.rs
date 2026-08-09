@@ -14,7 +14,7 @@ use crate::high_level::config::ModeConfiguration;
 pub use crate::high_level::error::HighLevelClientError;
 pub use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
-use crate::peer::{Router, RouterOwner};
+use crate::peer::Router;
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::requester::{Outcome, ProsodyRequester, RequestError};
 use crate::state::descriptor::{Registered, StateDescriptor};
@@ -79,10 +79,9 @@ where
     #[educe(Debug(ignore))]
     requester: ProsodyRequester<Wire<T>, Reply<T>>,
     #[educe(Debug(ignore))]
-    consumer_peer: <B::Router as Router>::Consumer,
     subsystem: Option<SubsystemName>,
     #[educe(Debug(ignore))]
-    router_owner: RouterOwner,
+    router: B::Router,
     propagator: TextMapCompositePropagator,
     telemetry: Telemetry,
 }
@@ -419,6 +418,7 @@ where
         };
 
         let shared = self.reader.deps();
+        let consumer_peer = self.router.consumer();
 
         let (built, config) = if let Some(subsystem) = &self.subsystem {
             Self::build_responding_consumer(
@@ -427,7 +427,7 @@ where
                 self.producer.clone(),
                 self.telemetry.clone(),
                 handler.clone(),
-                &self.consumer_peer,
+                &consumer_peer,
                 subsystem,
             )
             .await
@@ -438,7 +438,7 @@ where
                 self.producer.clone(),
                 self.telemetry.clone(),
                 handler.clone(),
-                &self.consumer_peer,
+                &consumer_peer,
             )
             .await
         };
@@ -487,22 +487,6 @@ where
         drop(guard);
         stopped?;
         Ok(())
-    }
-
-    /// Stops the consumer, then stops the shared router.
-    ///
-    /// # Errors
-    ///
-    /// Returns the consumer error first. Otherwise, returns the router error.
-    pub async fn shutdown(self) -> Result<(), HighLevelClientError<WireError<T>>> {
-        let running = matches!(*self.consumer_state().await, ConsumerState::Running { .. });
-        let consumer = if running {
-            self.unsubscribe().await
-        } else {
-            Ok(())
-        };
-        let router = self.router_owner.shutdown().await.map_err(Into::into);
-        consumer.and(router)
     }
 
     /// Returns the number of partitions assigned to the consumer.

@@ -3,13 +3,13 @@
 use super::PeerConfiguration;
 use super::backend::prepare_cassandra;
 use super::runtime::{
-    ConsumerHandle, PeerRouter, ProducerHandle, RespondingLeaf, RespondingPeer, RouterOwner,
-    prepare_router, start_local_router, start_router,
+    ConsumerHandle, PeerRouter, ProducerHandle, RespondingLeaf, RespondingPeer, prepare_router,
+    start_local_router, start_router,
 };
 use crate::Codec;
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
-use crate::consumer::{ConsumerError, PeerInitError};
+use crate::consumer::{ConsumerError, PeerInitError, ShutdownError};
 use crate::response::frame::encode::Staged;
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{DropReason, ResponseRoute, RouteOutcome, Then};
@@ -37,17 +37,27 @@ mod sealed {
 /// route and its matching fleet.
 pub trait ConsumerRouter: sealed::Consumer + Send + Sync + Sized + 'static {}
 
-/// One peer route that separates into producer, consumer, and owner parts.
+/// One peer route with producer and consumer capabilities.
 ///
-/// One call creates all three parts. Their constructors are private, so
-/// production code cannot combine an identity, registry, route, or fleet from
-/// different routers.
+/// The router owns its runtime. Dropping it starts teardown. Its private
+/// constructors prevent code from combining capabilities from different
+/// routers.
 pub trait Router: sealed::Router + Send + Sync + Sized + 'static {
     /// The response capability selected by this router.
     type Consumer: ConsumerRouter;
 
-    /// Separates this router into its three exclusive roles.
-    fn split(self) -> (ProducerHandle, Self::Consumer, RouterOwner);
+    /// Returns this router's producer capability.
+    fn producer(&self) -> ProducerHandle;
+
+    /// Returns this router's consumer capability.
+    fn consumer(&self) -> Self::Consumer;
+
+    /// Stops this router and consumes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime cannot complete teardown.
+    fn shutdown(self) -> impl Future<Output = Result<(), ShutdownError>> + Send;
 }
 
 /// A local-only router for in-memory clients.
@@ -61,11 +71,13 @@ pub struct GrpcRouter {
 }
 
 /// The local-only response capability.
+#[derive(Clone)]
 pub struct LocalConsumer {
     inner: ConsumerHandle<LocalResponseRoute>,
 }
 
 /// The local-first gRPC response capability.
+#[derive(Clone)]
 pub struct GrpcConsumer {
     inner: ConsumerHandle<GrpcResponseRoute>,
 }
@@ -206,29 +218,35 @@ where
 impl Router for LocalRouter {
     type Consumer = LocalConsumer;
 
-    fn split(self) -> (ProducerHandle, Self::Consumer, RouterOwner) {
-        let (producer, consumer, owner) = self.inner.into_parts();
-        (
-            producer,
-            LocalConsumer {
-                inner: consumer.map_route(LocalResponseRoute),
-            },
-            owner,
-        )
+    fn producer(&self) -> ProducerHandle {
+        self.inner.producer()
+    }
+
+    fn consumer(&self) -> Self::Consumer {
+        LocalConsumer {
+            inner: self.inner.consumer().map_route(LocalResponseRoute),
+        }
+    }
+
+    async fn shutdown(self) -> Result<(), ShutdownError> {
+        self.inner.shutdown().await
     }
 }
 
 impl Router for GrpcRouter {
     type Consumer = GrpcConsumer;
 
-    fn split(self) -> (ProducerHandle, Self::Consumer, RouterOwner) {
-        let (producer, consumer, owner) = self.inner.into_parts();
-        (
-            producer,
-            GrpcConsumer {
-                inner: consumer.map_route(GrpcResponseRoute),
-            },
-            owner,
-        )
+    fn producer(&self) -> ProducerHandle {
+        self.inner.producer()
+    }
+
+    fn consumer(&self) -> Self::Consumer {
+        GrpcConsumer {
+            inner: self.inner.consumer().map_route(GrpcResponseRoute),
+        }
+    }
+
+    async fn shutdown(self) -> Result<(), ShutdownError> {
+        self.inner.shutdown().await
     }
 }

@@ -28,7 +28,7 @@ use prosody::consumer::{
     PipelineMiddlewareConfiguration, ProsodyConsumer, message_state,
 };
 use prosody::loader::KafkaLoader;
-use prosody::peer::{LocalRouter, Router, RouterOwner};
+use prosody::peer::{LocalRouter, Router};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::state::descriptor::StateDescriptor;
 use prosody::subsystem::SubsystemName;
@@ -64,7 +64,7 @@ struct CartEnv {
     topic: Topic,
     admin: &'static ProsodyAdminClient,
     consumer: ProsodyConsumer<JsonCodec>,
-    router: RouterOwner,
+    router: LocalRouter,
     producer: ProsodyProducer<JsonCodec>,
     observations: Receiver<Observation>,
     consumer_config: ConsumerConfiguration,
@@ -138,7 +138,7 @@ impl CartEnv {
         )?;
 
         let router = LocalRouter::new().await?;
-        let (_, consumer_router, router) = router.split();
+        let consumer_router = router.consumer();
         let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
             ConsumerSetup {
                 consumer: &consumer_config,

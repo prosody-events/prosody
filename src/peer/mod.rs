@@ -4,9 +4,9 @@
 //! responses. A consumer uses the same runtime to send responses. A combined
 //! client constructs one runtime and shares it with both.
 //!
-//! Standalone code starts a [`LocalRouter`] or [`GrpcRouter`], then calls
-//! [`Router::split`]. Retain the owner until shutdown. Give the other two
-//! capabilities to the producer and consumer.
+//! Standalone code retains a [`LocalRouter`] or [`GrpcRouter`] while it uses
+//! its capabilities. Dropping the router starts teardown. Call
+//! [`Router::shutdown`] to wait for teardown.
 
 mod backend;
 mod router;
@@ -21,7 +21,7 @@ pub use crate::router::config::{
     PeerConfiguration, PeerConfigurationBuilder, PeerConfigurationBuilderError,
 };
 pub use router::{ConsumerRouter, GrpcConsumer, GrpcRouter, LocalConsumer, LocalRouter, Router};
-pub use runtime::{ProducerHandle, RouterOwner};
+pub use runtime::ProducerHandle;
 
 use crate::heartbeat::HeartbeatRegistry;
 use std::time::Duration;
