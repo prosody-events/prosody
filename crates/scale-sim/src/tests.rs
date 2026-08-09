@@ -1008,14 +1008,14 @@ fn hot_partition_exposes_unavoidable_placement_loss() -> Result<(), TestError> {
         let Some(losses) = run.controller().decision_expected_losses(index) else {
             return false;
         };
-        let Some((&one_replica, &maximum_replicas)) = losses.first().zip(losses.last()) else {
+        let Some(&one_replica) = losses.first() else {
             return false;
         };
         !sample.hold
             && matches!(sample.capacity_evidence, CapacityEvidenceSample::Window(_))
             && sample.target == 1
             && one_replica > 0.0_f64
-            && (one_replica - maximum_replicas).abs() <= 1.0e-9_f64
+            && losses.iter().skip(1).all(|loss| *loss == f64::INFINITY)
     }));
     assert_eq!(trace.target.iter().copied().max().unwrap_or_default(), 1);
     Ok(())

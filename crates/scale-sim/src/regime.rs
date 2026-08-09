@@ -467,13 +467,13 @@ fn single_worker_constraint_binds(run: &PrincipalRun) -> bool {
         let Some(losses) = run.controller.decision_expected_losses(index) else {
             return false;
         };
-        let Some((&one_replica, &maximum_replicas)) = losses.first().zip(losses.last()) else {
+        let Some(&one_replica) = losses.first() else {
             return false;
         };
         !sample.hold
             && sample.target == 1
             && one_replica > 0.0_f64
-            && (one_replica - maximum_replicas).abs() <= 1.0e-9_f64
+            && losses.iter().skip(1).all(|loss| *loss == f64::INFINITY)
     })
 }
 
@@ -903,7 +903,6 @@ fn run_schedule(
             let ready_index = snapshot.replicas.saturating_sub(1) as usize;
             let next_index = ready_index.saturating_add(1);
             let losses = controller.decision_expected_losses(controller_index);
-            let root_passes = controller.decision_root_pass_probabilities(controller_index);
             let passes = controller.decision_pass_probabilities(controller_index);
             let selected = controller_sample.map_or(0, |sample| sample.target);
             let selected_index = selected.saturating_sub(1) as usize;
@@ -939,29 +938,14 @@ fn run_schedule(
                 selected_expected_loss = selected_loss,
                 selected_shortfall,
                 scenario_count,
-                selected_root_deadline_rejection_probability =
-                    rejection(DecisionRejection::RootDeadline),
+                selected_deadline_rejection_probability = rejection(DecisionRejection::Deadline),
                 selected_placement_rejection_probability =
                     rejection(DecisionRejection::PartitionPlacement),
-                selected_recourse_deadline_rejection_probability =
-                    rejection(DecisionRejection::RecourseDeadline),
-                selected_terminal_backlog_rejection_probability =
-                    rejection(DecisionRejection::TerminalBacklog),
-                selected_future_arrival_rejection_probability =
-                    rejection(DecisionRejection::FutureArrival),
                 ready_target_pass_probability = passes
                     .and_then(|values| values.get(ready_index))
                     .copied()
                     .unwrap_or(f64::NAN),
-                ready_target_root_pass_probability = root_passes
-                    .and_then(|values| values.get(ready_index))
-                    .copied()
-                    .unwrap_or(f64::NAN),
                 next_target_pass_probability = passes
-                    .and_then(|values| values.get(next_index))
-                    .copied()
-                    .unwrap_or(f64::NAN),
-                next_target_root_pass_probability = root_passes
                     .and_then(|values| values.get(next_index))
                     .copied()
                     .unwrap_or(f64::NAN),

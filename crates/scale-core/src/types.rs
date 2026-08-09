@@ -22,34 +22,82 @@ impl ModelTime {
     }
 }
 
-/// One desired replica target that has not reached warm membership.
+/// One replica transition that has not reached warm membership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActuationCommitment {
-    from_replicas: u32,
-    target_replicas: u32,
-    requested_at: ModelTime,
+    phase: ActuationPhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActuationPhase {
+    Launching {
+        from_replicas: u32,
+        target_replicas: u32,
+        requested_at: ModelTime,
+    },
+    Rebalancing {
+        from_replicas: u32,
+        target_replicas: u32,
+        requested_at: ModelTime,
+        started_at: ModelTime,
+    },
 }
 
 impl ActuationCommitment {
-    /// Constructs one incomplete replica transition.
+    /// Constructs one transition that has not changed replica membership.
     ///
     /// # Errors
     ///
     /// Returns an error for zero or equal replica counts.
-    pub fn new(
+    pub fn launching(
         from_replicas: u32,
         target_replicas: u32,
         requested_at: ModelTime,
     ) -> Result<Self, ObservationError> {
-        if from_replicas == 0 || target_replicas == 0 || from_replicas == target_replicas {
+        validate_actuation_replicas(from_replicas, target_replicas)?;
+        Ok(Self {
+            phase: ActuationPhase::Launching {
+                from_replicas,
+                target_replicas,
+                requested_at,
+            },
+        })
+    }
+
+    /// Constructs one transition whose replica membership has changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid counts or an invalid phase boundary.
+    pub fn rebalancing(
+        from_replicas: u32,
+        target_replicas: u32,
+        requested_at: ModelTime,
+        started_at: ModelTime,
+    ) -> Result<Self, ObservationError> {
+        validate_actuation_replicas(from_replicas, target_replicas)?;
+        if started_at < requested_at {
             return Err(ObservationError::ActuationCommitment);
         }
         Ok(Self {
-            from_replicas,
-            target_replicas,
-            requested_at,
+            phase: ActuationPhase::Rebalancing {
+                from_replicas,
+                target_replicas,
+                requested_at,
+                started_at,
+            },
         })
     }
+}
+
+fn validate_actuation_replicas(
+    from_replicas: u32,
+    target_replicas: u32,
+) -> Result<(), ObservationError> {
+    if from_replicas == 0 || target_replicas == 0 || from_replicas == target_replicas {
+        return Err(ObservationError::ActuationCommitment);
+    }
+    Ok(())
 }
 
 /// One discrete posterior view for diagnostics and calibration.
@@ -446,8 +494,7 @@ pub(crate) struct WorkCohorts {
     deadline_micros: Vec<u64>,
     work_slot_seconds: Vec<f64>,
     partitions: Vec<u32>,
-    release_max_micros: u64,
-    work_slot_seconds_sum: f64,
+    deadline_max_micros: u64,
 }
 
 #[derive(Debug)]
@@ -473,9 +520,24 @@ pub(crate) struct BacklogColumns {
 
 #[derive(Debug)]
 pub(crate) struct ActuationCommitments {
+    capacity: usize,
+    launching: LaunchingCommitments,
+    rebalancing: Option<RebalancingCommitment>,
+}
+
+#[derive(Debug)]
+struct LaunchingCommitments {
     from_replicas: Vec<u32>,
     target_replicas: Vec<u32>,
     requested_at: Vec<ModelTime>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RebalancingCommitment {
+    pub(crate) from_replicas: u32,
+    pub(crate) target_replicas: u32,
+    pub(crate) requested_at: ModelTime,
+    pub(crate) started_at: ModelTime,
 }
 
 impl WorkCohorts {
@@ -485,8 +547,7 @@ impl WorkCohorts {
             deadline_micros: Vec::with_capacity(capacity),
             work_slot_seconds: Vec::with_capacity(capacity),
             partitions: Vec::with_capacity(capacity),
-            release_max_micros: 0,
-            work_slot_seconds_sum: 0.0_f64,
+            deadline_max_micros: 0,
         }
     }
 
@@ -495,8 +556,7 @@ impl WorkCohorts {
         self.deadline_micros.clear();
         self.work_slot_seconds.clear();
         self.partitions.clear();
-        self.release_max_micros = 0;
-        self.work_slot_seconds_sum = 0.0_f64;
+        self.deadline_max_micros = 0;
     }
 
     pub(crate) fn push_values(
@@ -514,8 +574,7 @@ impl WorkCohorts {
         self.deadline_micros.push(deadline_micros);
         self.work_slot_seconds.push(work_slot_seconds);
         self.partitions.push(partition);
-        self.release_max_micros = self.release_max_micros.max(release_micros);
-        self.work_slot_seconds_sum += work_slot_seconds;
+        self.deadline_max_micros = self.deadline_max_micros.max(deadline_micros);
     }
 
     pub(crate) const fn len(&self) -> usize {
@@ -542,12 +601,8 @@ impl WorkCohorts {
         self.partitions[index]
     }
 
-    pub(crate) const fn release_max_micros(&self) -> u64 {
-        self.release_max_micros
-    }
-
-    pub(crate) const fn work_slot_seconds_sum(&self) -> f64 {
-        self.work_slot_seconds_sum
+    pub(crate) const fn deadline_max_micros(&self) -> u64 {
+        self.deadline_max_micros
     }
 }
 
@@ -734,50 +789,84 @@ impl BacklogColumns {
 impl ActuationCommitments {
     fn new(capacity: usize) -> Self {
         Self {
-            from_replicas: Vec::with_capacity(capacity),
-            target_replicas: Vec::with_capacity(capacity),
-            requested_at: Vec::with_capacity(capacity),
+            capacity,
+            launching: LaunchingCommitments {
+                from_replicas: Vec::with_capacity(capacity),
+                target_replicas: Vec::with_capacity(capacity),
+                requested_at: Vec::with_capacity(capacity),
+            },
+            rebalancing: None,
         }
     }
 
     fn clear(&mut self) {
-        self.from_replicas.clear();
-        self.target_replicas.clear();
-        self.requested_at.clear();
+        self.launching.from_replicas.clear();
+        self.launching.target_replicas.clear();
+        self.launching.requested_at.clear();
+        self.rebalancing = None;
     }
 
     fn push(&mut self, commitment: ActuationCommitment) {
-        self.from_replicas.push(commitment.from_replicas);
-        self.target_replicas.push(commitment.target_replicas);
-        self.requested_at.push(commitment.requested_at);
+        match commitment.phase {
+            ActuationPhase::Launching {
+                from_replicas,
+                target_replicas,
+                requested_at,
+            } => {
+                self.launching.from_replicas.push(from_replicas);
+                self.launching.target_replicas.push(target_replicas);
+                self.launching.requested_at.push(requested_at);
+            }
+            ActuationPhase::Rebalancing {
+                from_replicas,
+                target_replicas,
+                requested_at,
+                started_at,
+            } => {
+                self.rebalancing = Some(RebalancingCommitment {
+                    from_replicas,
+                    target_replicas,
+                    requested_at,
+                    started_at,
+                });
+            }
+        }
     }
 
-    pub(crate) const fn len(&self) -> usize {
-        self.target_replicas.len()
+    pub(crate) fn len(&self) -> usize {
+        self.launching.target_replicas.len() + self.rebalancing.is_some() as usize
     }
 
     const fn capacity(&self) -> usize {
-        self.target_replicas.capacity()
+        self.capacity
     }
 
-    pub(crate) fn target_replicas(&self, index: usize) -> u32 {
-        self.target_replicas[index]
+    pub(crate) const fn launching_len(&self) -> usize {
+        self.launching.target_replicas.len()
     }
 
-    pub(crate) fn requested_at(&self, index: usize) -> ModelTime {
-        self.requested_at[index]
+    pub(crate) fn launching_target_replicas(&self, index: usize) -> u32 {
+        self.launching.target_replicas[index]
     }
 
-    pub(crate) fn direction(&self, index: usize) -> TransitionDirection {
-        if self.target_replicas[index] > self.from_replicas[index] {
+    pub(crate) fn launching_requested_at(&self, index: usize) -> ModelTime {
+        self.launching.requested_at[index]
+    }
+
+    pub(crate) fn launching_direction(&self, index: usize) -> TransitionDirection {
+        if self.launching.target_replicas[index] > self.launching.from_replicas[index] {
             TransitionDirection::Up
         } else {
             TransitionDirection::Down
         }
     }
 
-    pub(crate) fn replica_delta(&self, index: usize) -> u32 {
-        self.target_replicas[index].abs_diff(self.from_replicas[index])
+    pub(crate) fn launching_replica_delta(&self, index: usize) -> u32 {
+        self.launching.target_replicas[index].abs_diff(self.launching.from_replicas[index])
+    }
+
+    pub(crate) const fn rebalancing(&self) -> Option<RebalancingCommitment> {
+        self.rebalancing
     }
 }
 
@@ -1050,8 +1139,26 @@ impl ObservationBuffer {
         &mut self,
         commitment: ActuationCommitment,
     ) -> Result<(), ObservationError> {
-        if commitment.from_replicas > self.replica_count_max
-            || commitment.target_replicas > self.replica_count_max
+        let (from_replicas, target_replicas, duplicate_rebalance) = match commitment.phase {
+            ActuationPhase::Launching {
+                from_replicas,
+                target_replicas,
+                requested_at: _,
+            } => (from_replicas, target_replicas, false),
+            ActuationPhase::Rebalancing {
+                from_replicas,
+                target_replicas,
+                requested_at: _,
+                started_at: _,
+            } => (
+                from_replicas,
+                target_replicas,
+                self.actuation_commitments.rebalancing().is_some(),
+            ),
+        };
+        if from_replicas > self.replica_count_max
+            || target_replicas > self.replica_count_max
+            || duplicate_rebalance
             || self.actuation_commitments.len() == self.actuation_commitments.capacity()
         {
             return Err(ObservationError::ActuationCommitment);

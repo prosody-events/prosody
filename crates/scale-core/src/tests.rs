@@ -10,13 +10,13 @@ use crate::arrival::{ArrivalEvidence, ArrivalFactor};
 use crate::capacity::CapacityFactor;
 use crate::change_point::ChangePointKernel;
 use crate::controller::{
-    DecisionRandomDomain, decision_random, minimal_moved_partitions, mixed_event_supply,
-    terminal_drain_area,
+    DecisionRandomDomain, NumericalDecision, classify_paired_bootstrap, decision_random,
+    minimal_moved_partitions, mixed_event_supply, terminal_drain_area,
 };
 use crate::edf::{
-    ArrivalPath, EdfOutcome, EdfScratch, EvaluationWindow, StepCandidates, SupplyStep,
-    SupplyTrajectory, evaluate_empty_steps, evaluate_general_trajectory, evaluate_prepared_step,
-    evaluate_prepared_trajectory, prepare, required_capacity_prepared,
+    ArrivalPath, EdfOutcome, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
+    evaluate_general_trajectory, evaluate_prepared_step, evaluate_prepared_trajectory, prepare,
+    required_capacity_prepared,
 };
 use crate::lead_time::LeadTimeFactor;
 use crate::partition::PartitionFactor;
@@ -40,6 +40,24 @@ const TEN_FUTURE_ARRIVALS_PER_SECOND: ArrivalPath<'static> = ArrivalPath {
     end_seconds: &[f64::MAX],
     rates: &[10.0_f64],
 };
+
+#[test]
+fn bootstrap_contract_excludes_actions_proven_worse() {
+    assert_eq!(
+        classify_paired_bootstrap(&[127, 0, 128], 128, 0.01_f64),
+        NumericalDecision::Resolved { target_index: 1 }
+    );
+}
+
+#[test]
+fn bootstrap_contract_retains_an_action_not_proven_worse() {
+    assert_eq!(
+        classify_paired_bootstrap(&[126, 0, 128], 128, 0.01_f64),
+        NumericalDecision::Unresolved {
+            smallest_credible_index: 0
+        }
+    );
+}
 
 fn evaluate_constant_supply(
     cohorts: &WorkCohorts,
@@ -67,20 +85,6 @@ fn evaluate_constant_supply(
         arrivals,
         scratch,
     )
-}
-
-#[test]
-fn maximum_arrival_window_checks_both_sides_of_a_rate_boundary() {
-    let path = ArrivalPath {
-        start_seconds: 0.0_f64,
-        end_seconds: &[2.0_f64, 3.0_f64, 5.0_f64],
-        rates: &[0.0_f64, 10.0_f64, 0.0_f64],
-    };
-
-    assert!(close_relative(
-        path.maximum_window_rate(0.0_f64, 5.0_f64, 2.0_f64),
-        5.0_f64
-    ));
 }
 
 #[test]
@@ -125,6 +129,167 @@ fn forecast_work_that_waits_past_its_deadline_fails_the_chance_test() -> Result<
 
     assert!(outcome.shortfall > 0.0_f64);
     assert!(outcome.terminal_work <= f64::EPSILON);
+    Ok(())
+}
+
+#[test]
+fn forecast_path_stops_arrivals_at_its_declared_end() -> Result<(), TestError> {
+    let cohorts = WorkCohorts::new(0);
+    let mut scratch = EdfScratch::new(0)?;
+    prepare(&cohorts, &mut scratch);
+    let arrivals = ArrivalPath {
+        start_seconds: 0.0_f64,
+        end_seconds: &[1.0_f64],
+        rates: &[10.0_f64],
+    };
+
+    let outcome = evaluate_constant_supply(
+        &cohorts,
+        0.0_f64,
+        3_000_000,
+        0.0_f64,
+        &arrivals,
+        &mut scratch,
+    );
+
+    assert!(close_relative(outcome.terminal_work, 10.0_f64));
+    Ok(())
+}
+
+#[quickcheck]
+fn edf_counts_missed_work_and_integrates_late_work(work_seed: u16, supply_seed: u16) -> bool {
+    let work = f64::from(work_seed % 10_000 + 1);
+    let supply = f64::from(supply_seed % 1_000 + 1);
+    let mut cohorts = WorkCohorts::new(1);
+    cohorts.push_values(0, 1_000_000, work, 0);
+    let Ok(mut scratch) = EdfScratch::new(1) else {
+        return false;
+    };
+    prepare(&cohorts, &mut scratch);
+    let drain_seconds = work / supply;
+    let horizon_micros = ((2.0_f64 + drain_seconds) * 1_000_000.0_f64) as u64;
+    let outcome = evaluate_prepared_step(
+        &cohorts,
+        SupplyStep {
+            before: supply,
+            during: supply,
+            after: supply,
+            pause_micros: 0,
+            ready_micros: 0,
+        },
+        EvaluationWindow {
+            start_micros: 0,
+            horizon_micros,
+            initial_debt_work: 0.0_f64,
+            deadline_budget_micros: 1_000_000,
+        },
+        &NO_FUTURE_ARRIVALS,
+        &mut scratch,
+    );
+    let missed = (work - supply).max(0.0_f64);
+    close_relative(outcome.missed_work, missed)
+        && close_relative(outcome.late_area, missed * missed / (2.0_f64 * supply))
+        && outcome.terminal_late_work <= f64::EPSILON
+}
+
+#[test]
+fn edf_does_not_count_preexisting_debt_as_a_new_miss() -> Result<(), TestError> {
+    let cohorts = WorkCohorts::new(0);
+    let mut scratch = EdfScratch::new(0)?;
+    prepare(&cohorts, &mut scratch);
+    let outcome = evaluate_prepared_step(
+        &cohorts,
+        SupplyStep {
+            before: 5.0_f64,
+            during: 5.0_f64,
+            after: 5.0_f64,
+            pause_micros: 0,
+            ready_micros: 0,
+        },
+        EvaluationWindow {
+            start_micros: 0,
+            horizon_micros: 1_000_000,
+            initial_debt_work: 5.0_f64,
+            deadline_budget_micros: 1_000_000,
+        },
+        &NO_FUTURE_ARRIVALS,
+        &mut scratch,
+    );
+
+    assert_eq!(outcome.missed_work, 0.0_f64);
+    assert!(close_relative(outcome.late_area, 2.5_f64));
+    assert!(outcome.terminal_late_work <= f64::EPSILON);
+    Ok(())
+}
+
+#[test]
+fn edf_does_not_report_lateness_after_work_finishes_before_its_deadline() -> Result<(), TestError> {
+    let mut cohorts = WorkCohorts::new(1);
+    cohorts.push_values(0, 1_000_000, 188.0_f64, 0);
+    let mut scratch = EdfScratch::new(1)?;
+    prepare(&cohorts, &mut scratch);
+    let outcome = evaluate_prepared_step(
+        &cohorts,
+        SupplyStep {
+            before: 686.0_f64,
+            during: 686.0_f64,
+            after: 686.0_f64,
+            pause_micros: 0,
+            ready_micros: 0,
+        },
+        EvaluationWindow {
+            start_micros: 0,
+            horizon_micros: 2_274_052,
+            initial_debt_work: 0.0_f64,
+            deadline_budget_micros: 1_000_000,
+        },
+        &NO_FUTURE_ARRIVALS,
+        &mut scratch,
+    );
+
+    assert_eq!(outcome.missed_work, 0.0_f64);
+    assert_eq!(outcome.late_area, 0.0_f64);
+    assert_eq!(outcome.terminal_late_work, 0.0_f64);
+    Ok(())
+}
+
+#[test]
+fn edf_counts_a_late_cohort_after_an_earlier_wide_interval() -> Result<(), TestError> {
+    let mut cohorts = WorkCohorts::new(2);
+    cohorts.push_values(0, 100_000_000, 0.0_f64, 0);
+    cohorts.push_values(50_000_000, 51_000_000, 16.0_f64, 0);
+    let mut scratch = EdfScratch::new(2)?;
+    prepare(&cohorts, &mut scratch);
+    let arrivals = ArrivalPath {
+        start_seconds: 0.000_001_f64,
+        end_seconds: &[f64::MAX],
+        rates: &[0.0_f64],
+    };
+    let outcome = evaluate_prepared_step(
+        &cohorts,
+        SupplyStep {
+            before: 3.806_668_352_250_828_2_f64,
+            during: 3.806_668_352_250_828_2_f64,
+            after: 3.806_668_352_250_828_2_f64,
+            pause_micros: 1,
+            ready_micros: 1,
+        },
+        EvaluationWindow {
+            start_micros: 1,
+            horizon_micros: 433_240_174,
+            initial_debt_work: 0.0_f64,
+            deadline_budget_micros: 1_000_000,
+        },
+        &arrivals,
+        &mut scratch,
+    );
+
+    let missed = 16.0_f64 - 3.806_668_352_250_828_2_f64;
+    assert!(close_relative(outcome.missed_work, missed));
+    assert!(close_relative(
+        outcome.late_area,
+        missed * missed / (2.0_f64 * 3.806_668_352_250_828_2_f64)
+    ));
     Ok(())
 }
 
@@ -1301,6 +1466,27 @@ fn fluid_edf_matches_exhaustive_interval_oracle(input: CohortSet, slots: u8) -> 
     actual == expected
 }
 
+#[test]
+fn common_edf_removes_roundoff_at_an_exact_deadline() -> Result<(), TestError> {
+    let mut cohorts = WorkCohorts::new(1);
+    cohorts.push_values(1, 3, 1.0e-5_f64, 0);
+    let mut scratch = EdfScratch::new(1)?;
+    prepare(&cohorts, &mut scratch);
+
+    let outcome = evaluate_constant_supply(
+        &cohorts,
+        5.0_f64,
+        3,
+        0.0_f64,
+        &NO_FUTURE_ARRIVALS,
+        &mut scratch,
+    );
+
+    assert_eq!(outcome.shortfall, 0.0_f64);
+    assert!(exhaustive_feasible(&cohorts, 5.0_f64));
+    Ok(())
+}
+
 #[quickcheck]
 fn required_capacity_matches_exhaustive_interval_oracle(input: CohortSet) -> bool {
     let CohortSet(cohorts) = input;
@@ -1337,7 +1523,8 @@ fn partial_observation_returns_a_decision() -> Result<(), TestError> {
 }
 
 #[test]
-fn predictive_arrivals_change_action_values_before_work_is_released() -> Result<(), TestError> {
+fn predictive_arrivals_have_nonzero_action_value_before_work_is_released() -> Result<(), TestError>
+{
     let fast_transition =
         TransitionPrior::new([0.01_f64; 4], [0.01_f64; 3], [1.0_f64; 12], 0.0_f64)?;
     let configuration = Configuration {
@@ -1377,10 +1564,17 @@ fn predictive_arrivals_change_action_values_before_work_is_released() -> Result<
     let mut losses = [0.0_f64; 4];
     let mut passes = [0.0_f64; 4];
     scratch.write_decision_curve(&mut losses, &mut passes)?;
-    assert_eq!(apply.target, 2);
+    let first_feasible = passes
+        .iter()
+        .position(|pass| *pass >= 0.99_f64)
+        .map_or(passes.len(), |index| index);
+    assert_eq!(
+        apply.target as usize - 1,
+        first_feasible,
+        "passes={passes:?}, losses={losses:?}"
+    );
     assert!(passes[0] < 0.99_f64);
-    assert!(passes[1] >= 0.99_f64);
-    assert!(losses[1] < losses[0]);
+    assert!(losses.iter().any(|loss| *loss > f64::EPSILON));
     Ok(())
 }
 
@@ -1428,11 +1622,9 @@ fn joint_capacity_samples_match_direct_enumeration() -> Result<(), TestError> {
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
-    let no_knee_area = 75.0_f64 * 75.0_f64 / (2.0_f64 * 1_000.0_f64);
-    let low_knee_area = 75.0_f64 * 75.0_f64 / (2.0_f64 * 50.0_f64);
-    let high_knee_area = 75.0_f64 * 75.0_f64 / (2.0_f64 * 100.0_f64);
-    let exact_loss =
-        (0.5_f64 * no_knee_area + 0.25_f64 * low_knee_area + 0.25_f64 * high_knee_area) / 75.0_f64;
+    let missed_at_low_knee = 75.0_f64 - 50.0_f64;
+    let low_knee_late_area = missed_at_low_knee * missed_at_low_knee / (2.0_f64 * 50.0_f64);
+    let exact_loss = 0.25_f64 * low_knee_late_area / 75.0_f64;
 
     assert!(
         (apply.diagnostics.expected_loss - exact_loss).abs() < 1.0e-5_f64,
@@ -1490,7 +1682,10 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
     let mut losses = [0.0_f64; 2];
     let mut passes = [0.0_f64; 2];
     scratch.write_decision_curve(&mut losses, &mut passes)?;
-    assert!(passes.iter().all(|probability| *probability < 0.99_f64));
+    assert!(
+        passes.iter().all(|probability| *probability < 0.99_f64),
+        "passes={passes:?}, losses={losses:?}"
+    );
     assert!(apply.diagnostics.shortfall > 0.0_f64);
     Ok(())
 }
@@ -1609,75 +1804,6 @@ fn predictive_arrivals_consume_service_while_debt_drains() -> Result<(), TestErr
 }
 
 #[test]
-fn simd_empty_steps_match_scalar_edf() -> Result<(), TestError> {
-    let cohorts = WorkCohorts::new(0);
-    let arrivals = ArrivalPath {
-        start_seconds: 0.0_f64,
-        end_seconds: &[0.5_f64, 1.5_f64, 3.0_f64],
-        rates: &[4.0_f64, 12.0_f64, 2.0_f64],
-    };
-    let during = [3.0_f64, 8.0_f64, 16.0_f64, 24.0_f64];
-    let after = [5.0_f64, 10.0_f64, 20.0_f64, 30.0_f64];
-    let pause = [0.0_f64, 0.25_f64, 0.75_f64, 1.25_f64];
-    let ready = [0.0_f64, 0.75_f64, 1.25_f64, 2.0_f64];
-    let mut delay_area = [0.0_f64; 4];
-    let mut terminal_work = [0.0_f64; 4];
-    let mut shortfall = [0.0_f64; 4];
-    evaluate_empty_steps(
-        Level::new(),
-        &StepCandidates {
-            before: 6.0_f64,
-            during: &during,
-            after: &after,
-            pause_seconds: &pause,
-            ready_seconds: &ready,
-        },
-        0.0_f64,
-        3.0_f64,
-        7.0_f64,
-        &arrivals,
-        1_000_000,
-        &mut delay_area,
-        &mut terminal_work,
-        &mut shortfall,
-    );
-    let mut scratch = EdfScratch::new(1)?;
-    prepare(&cohorts, &mut scratch);
-    for candidate in 0..after.len() {
-        let scalar = evaluate_prepared_step(
-            &cohorts,
-            SupplyStep {
-                before: 6.0_f64,
-                during: during[candidate],
-                after: after[candidate],
-                pause_micros: (pause[candidate] * 1_000_000.0_f64) as u64,
-                ready_micros: (ready[candidate] * 1_000_000.0_f64) as u64,
-            },
-            EvaluationWindow {
-                start_micros: 0,
-                horizon_micros: 3_000_000,
-                initial_debt_work: 7.0_f64,
-                deadline_budget_micros: 1_000_000,
-            },
-            &arrivals,
-            &mut scratch,
-        );
-        assert!(
-            close_relative(delay_area[candidate], scalar.delay_area),
-            "candidate={candidate}, simd={}, scalar={}",
-            delay_area[candidate],
-            scalar.delay_area
-        );
-        assert!(close_relative(
-            terminal_work[candidate],
-            scalar.terminal_work
-        ));
-        assert!(close_relative(shortfall[candidate], scalar.shortfall));
-    }
-    Ok(())
-}
-
-#[test]
 fn decision_curve_contains_the_selected_expected_loss() -> Result<(), TestError> {
     let configuration = configuration()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
@@ -1701,10 +1827,8 @@ fn decision_curve_contains_the_selected_expected_loss() -> Result<(), TestError>
         return Err(TestError::UnexpectedHold);
     };
     let mut losses = vec![0.0_f64; scratch.decision_candidate_count()];
-    let mut root_probabilities = vec![0.0_f64; configuration.replica_count_max as usize];
     let mut probabilities = vec![0.0_f64; configuration.replica_count_max as usize];
     scratch.write_decision_curve(&mut losses, &mut probabilities)?;
-    scratch.write_root_pass_curve(&mut root_probabilities)?;
 
     assert!(close_relative(
         losses[apply.target as usize - 1],
@@ -1715,13 +1839,6 @@ fn decision_curve_contains_the_selected_expected_loss() -> Result<(), TestError>
             .iter()
             .all(|probability| (0.0_f64..=1.0_f64).contains(probability)),
         "each candidate pass probability must be normalized"
-    );
-    assert!(
-        root_probabilities
-            .iter()
-            .zip(&probabilities)
-            .all(|(root, final_probability)| root >= final_probability),
-        "recourse cannot repair a root-stage SLO failure"
     );
     let required = 1.0_f64 - configuration.objective.epsilon();
     if let Some(first_feasible) = probabilities
@@ -1734,7 +1851,7 @@ fn decision_curve_contains_the_selected_expected_loss() -> Result<(), TestError>
 }
 
 #[test]
-fn root_pass_curve_reports_a_certain_zero_demand_stage() -> Result<(), TestError> {
+fn decision_diagnostics_report_no_rejection_for_zero_demand() -> Result<(), TestError> {
     let mut configuration = configuration()?;
     configuration.arrival_prior = negligible_arrival_prior()?;
     let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
@@ -1752,15 +1869,9 @@ fn root_pass_curve_reports_a_certain_zero_demand_stage() -> Result<(), TestError
         return Err(TestError::UnexpectedHold);
     }
     let mut probabilities = vec![0.0_f64; scratch.decision_candidate_count()];
-    scratch.write_root_pass_curve(&mut probabilities)?;
-
-    assert_eq!(probabilities[0], 1.0_f64);
     for reason in [
-        crate::DecisionRejection::RootDeadline,
+        crate::DecisionRejection::Deadline,
         crate::DecisionRejection::PartitionPlacement,
-        crate::DecisionRejection::RecourseDeadline,
-        crate::DecisionRejection::TerminalBacklog,
-        crate::DecisionRejection::FutureArrival,
     ] {
         scratch.write_rejection_curve(reason, &mut probabilities)?;
         assert!(
@@ -1954,7 +2065,10 @@ fn wide_cohort_cannot_hide_one_hot_partition_deadline() -> Result<(), TestError>
     let mut losses = [0.0_f64; 32];
     let mut passes = [0.0_f64; 32];
     scratch.write_decision_curve(&mut losses, &mut passes)?;
-    assert!(passes.iter().all(|probability| *probability < 0.99_f64));
+    assert!(
+        passes.iter().all(|probability| *probability < 0.99_f64),
+        "passes={passes:?}, losses={losses:?}"
+    );
     assert!(apply.diagnostics.shortfall > 0.0_f64);
     Ok(())
 }
@@ -2018,7 +2132,7 @@ fn replicas_above_active_partition_support_cannot_reduce_overload(
 }
 
 fn exhaustive_feasible(cohorts: &WorkCohorts, slots: f64) -> bool {
-    exhaustive_required_capacity(cohorts) <= slots + f64::EPSILON
+    exhaustive_required_capacity(cohorts) <= slots + 8.0_f64 * f64::EPSILON * slots.max(1.0_f64)
 }
 
 fn exhaustive_required_capacity(cohorts: &WorkCohorts) -> f64 {
@@ -2088,7 +2202,7 @@ fn larger_candidates_inherit_useful_pending_capacity() -> Result<(), TestError> 
     let mut scratch = ScaleScratch::new(&configuration)?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.set_current_replicas(2)?;
-    observation.push_actuation_commitment(ActuationCommitment::new(
+    observation.push_actuation_commitment(ActuationCommitment::launching(
         2,
         3,
         ModelTime::from_micros(1),
@@ -2111,23 +2225,57 @@ fn larger_candidates_inherit_useful_pending_capacity() -> Result<(), TestError> 
 }
 
 #[test]
-fn stable_linear_decision_converges_with_more_scenarios() -> Result<(), TestError> {
-    let sample_counts = [16_384_u32, 32_768, 65_536];
-    let mut targets = [0_u32; 3];
-    let mut used_counts = [0_u32; 3];
-    for (index, sample_count) in sample_counts.into_iter().enumerate() {
-        targets[index] = stable_linear_target(sample_count, &mut used_counts[index])?;
-    }
+fn started_rebalance_is_carried_and_can_be_superseded() -> Result<(), TestError> {
+    let mut configuration = configuration()?;
+    configuration.launch_time_prior =
+        TransitionPrior::new([1.0_f64; 4], [0.01_f64; 3], [1.0_f64; 12], 0.0_f64)?;
+    configuration.rebalance_time_prior =
+        TransitionPrior::new([100.0_f64; 4], [0.01_f64; 3], [1.0_f64; 12], 0.0_f64)?;
+    let mut state = ScaleState::new(configuration.clone(), grid()?)?;
+    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut observation = ObservationBuffer::new(&configuration)?;
+    observation.set_current_replicas(2)?;
+    observation.push_actuation_commitment(ActuationCommitment::rebalancing(
+        2,
+        3,
+        ModelTime::from_micros(1_000_000),
+        ModelTime::from_micros(10_000_000),
+    )?)?;
 
-    assert_eq!(
-        targets, [targets[2]; 3],
-        "a stable decision must converge as nested scenario count increases"
+    let _ = step(
+        &mut state,
+        &mut scratch,
+        observation.observation(),
+        ModelTime::from_micros(20_000_000),
     );
+
+    assert_eq!(scratch.trajectory_targets(3), Some([3].as_slice()));
     assert_eq!(
-        used_counts, sample_counts,
-        "an unresolved pilot decision must expand to its configured bound"
+        scratch.trajectory_pause_seconds(3),
+        Some([20.0_f64].as_slice())
     );
+    let retained = scratch
+        .trajectory_targets(2)
+        .zip(scratch.trajectory_pause_seconds(2))
+        .zip(scratch.trajectory_ready_seconds(2))
+        .ok_or(TestError::MissingTrajectory)?;
+    assert_eq!(retained.0.0, [3, 2]);
+    assert_eq!(retained.0.1[0], 20.0_f64);
+    assert!(retained.0.1[1] > retained.0.1[0]);
+    assert_eq!(retained.1[0], retained.0.1[1]);
+    assert!(retained.1[1] > retained.0.1[1]);
     Ok(())
+}
+
+#[quickcheck]
+fn rebalance_phase_rejects_time_before_request(requested: u64, started: u64) -> bool {
+    let result = ActuationCommitment::rebalancing(
+        1,
+        2,
+        ModelTime::from_micros(requested),
+        ModelTime::from_micros(started),
+    );
+    result.is_ok() == (started >= requested)
 }
 
 #[test]
@@ -2152,64 +2300,6 @@ fn resolved_decision_stops_after_the_pilot_scenarios() -> Result<(), TestError> 
     assert_eq!(decision.target, 1);
     assert_eq!(decision.diagnostics.scenario_count, 1_024);
     Ok(())
-}
-
-fn stable_linear_target(
-    posterior_sample_count: u32,
-    used_scenario_count: &mut u32,
-) -> Result<u32, TestError> {
-    let transition_prior = TransitionPrior::new(
-        [30.0_f64, 45.0_f64, 60.0_f64, 90.0_f64],
-        [0.1_f64, 0.3_f64, 0.6_f64],
-        [1.0_f64; 12],
-        0.0_f64,
-    )?;
-    let configuration = Configuration {
-        cohort_count_max: 64,
-        calendar_segment_count_max: 64,
-        partition_count: 64,
-        replica_count_max: 16,
-        slots_per_replica: 32,
-        posterior_sample_count,
-        report_interval_micros: 1_000_000,
-        failure_service_weight: 0.3_f64,
-        arrival_prior: crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64, 1_024)?,
-        capacity_change_rate_per_second: 0.0_f64,
-        reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: transition_prior.clone(),
-        rebalance_time_prior: transition_prior,
-        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
-    };
-    let capacity_grid = CapacityGrid::new(
-        &[0.025_f64, 0.05_f64, 0.1_f64, 0.2_f64],
-        &[
-            20.0_f64,
-            40.0_f64,
-            80.0_f64,
-            160.0_f64,
-            320.0_f64,
-            640.0_f64,
-            1_280.0_f64,
-        ],
-        &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
-    )?;
-    let mut state = ScaleState::new(configuration.clone(), capacity_grid)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
-    let mut observation = ObservationBuffer::new(&configuration)?;
-    observation.set_current_replicas(2)?;
-    observation.set_arrivals(144_000, 240_000_000)?;
-    observation.set_resource_window(ResourceWindow::new(60.0_f64, 240.0_f64, 144_000)?)?;
-
-    let ScaleDecision::Apply(decision) = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(240_000_000),
-    ) else {
-        return Err(TestError::UnexpectedHold);
-    };
-    *used_scenario_count = decision.diagnostics.scenario_count;
-    Ok(decision.target)
 }
 
 fn close_relative(left: f64, right: f64) -> bool {

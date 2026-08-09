@@ -264,13 +264,9 @@ pub struct ControllerTrace {
     arrival_rate: Vec<f64>,
     decision_candidate_count: usize,
     decision_expected_losses: Vec<f64>,
-    decision_root_pass_probabilities: Vec<f64>,
     decision_pass_probabilities: Vec<f64>,
-    decision_root_deadline_rejections: Vec<f64>,
+    decision_deadline_rejections: Vec<f64>,
     decision_placement_rejections: Vec<f64>,
-    decision_recourse_deadline_rejections: Vec<f64>,
-    decision_terminal_backlog_rejections: Vec<f64>,
-    decision_future_arrival_rejections: Vec<f64>,
 }
 
 struct DiscretePosteriorTrace {
@@ -415,13 +411,9 @@ impl ControllerTrace {
             arrival_rate: Vec::with_capacity(capacity),
             decision_candidate_count,
             decision_expected_losses: Vec::with_capacity(decision_cell_count),
-            decision_root_pass_probabilities: Vec::with_capacity(decision_cell_count),
             decision_pass_probabilities: Vec::with_capacity(decision_cell_count),
-            decision_root_deadline_rejections: Vec::with_capacity(decision_cell_count),
+            decision_deadline_rejections: Vec::with_capacity(decision_cell_count),
             decision_placement_rejections: Vec::with_capacity(decision_cell_count),
-            decision_recourse_deadline_rejections: Vec::with_capacity(decision_cell_count),
-            decision_terminal_backlog_rejections: Vec::with_capacity(decision_cell_count),
-            decision_future_arrival_rejections: Vec::with_capacity(decision_cell_count),
         })
     }
 
@@ -565,14 +557,6 @@ impl ControllerTrace {
         self.decision_pass_probabilities.get(start..end)
     }
 
-    /// Returns the root-stage SLO pass probability for each replica candidate.
-    #[must_use]
-    pub fn decision_root_pass_probabilities(&self, index: usize) -> Option<&[f64]> {
-        let start = index.checked_mul(self.decision_candidate_count)?;
-        let end = start.checked_add(self.decision_candidate_count)?;
-        self.decision_root_pass_probabilities.get(start..end)
-    }
-
     /// Returns one rejection-reason probability for each replica candidate.
     #[must_use]
     pub fn decision_rejection_probabilities(
@@ -583,11 +567,8 @@ impl ControllerTrace {
         let start = index.checked_mul(self.decision_candidate_count)?;
         let end = start.checked_add(self.decision_candidate_count)?;
         let values = match reason {
-            DecisionRejection::RootDeadline => &self.decision_root_deadline_rejections,
+            DecisionRejection::Deadline => &self.decision_deadline_rejections,
             DecisionRejection::PartitionPlacement => &self.decision_placement_rejections,
-            DecisionRejection::RecourseDeadline => &self.decision_recourse_deadline_rejections,
-            DecisionRejection::TerminalBacklog => &self.decision_terminal_backlog_rejections,
-            DecisionRejection::FutureArrival => &self.decision_future_arrival_rejections,
         };
         values.get(start..end)
     }
@@ -812,11 +793,6 @@ impl ControllerTrace {
             return Err(PlantError::MetricCapacity);
         }
         self.decision_expected_losses.resize(decision_end, f64::NAN);
-        if decision_end > self.decision_root_pass_probabilities.capacity() {
-            return Err(PlantError::MetricCapacity);
-        }
-        self.decision_root_pass_probabilities
-            .resize(decision_end, f64::NAN);
         if decision_end > self.decision_pass_probabilities.capacity() {
             return Err(PlantError::MetricCapacity);
         }
@@ -829,16 +805,10 @@ impl ControllerTrace {
             Ok(()) | Err(prosody_scale_core::DecisionCurveError::Unavailable) => {}
             Err(error) => return Err(error.into()),
         }
-        match scratch.write_root_pass_curve(
-            &mut self.decision_root_pass_probabilities[decision_start..decision_end],
-        ) {
-            Ok(()) | Err(prosody_scale_core::DecisionCurveError::Unavailable) => {}
-            Err(error) => return Err(error.into()),
-        }
         write_rejection_curve(
             scratch,
-            DecisionRejection::RootDeadline,
-            &mut self.decision_root_deadline_rejections,
+            DecisionRejection::Deadline,
+            &mut self.decision_deadline_rejections,
             decision_start,
             decision_end,
         )?;
@@ -846,27 +816,6 @@ impl ControllerTrace {
             scratch,
             DecisionRejection::PartitionPlacement,
             &mut self.decision_placement_rejections,
-            decision_start,
-            decision_end,
-        )?;
-        write_rejection_curve(
-            scratch,
-            DecisionRejection::RecourseDeadline,
-            &mut self.decision_recourse_deadline_rejections,
-            decision_start,
-            decision_end,
-        )?;
-        write_rejection_curve(
-            scratch,
-            DecisionRejection::TerminalBacklog,
-            &mut self.decision_terminal_backlog_rejections,
-            decision_start,
-            decision_end,
-        )?;
-        write_rejection_curve(
-            scratch,
-            DecisionRejection::FutureArrival,
-            &mut self.decision_future_arrival_rejections,
             decision_start,
             decision_end,
         )?;
@@ -1237,8 +1186,17 @@ impl<Workload> ClosedLoop<Workload> {
         Workload: TickGenerator,
     {
         self.observation.clear();
-        self.observation
-            .set_current_replicas(context.plant.replicas)?;
+        let active_transition = if context.plant.partitions_ready {
+            None
+        } else {
+            self.inflight_transitions
+                .iter()
+                .rposition(|pending| pending.target_replicas == context.plant.replicas)
+        };
+        let ready_replicas = active_transition.map_or(context.plant.replicas, |index| {
+            self.inflight_transitions[index].from_replicas
+        });
+        self.observation.set_current_replicas(ready_replicas)?;
         if let Some(calendar) = calendar {
             self.observation.set_calendar_forecast(
                 calendar.artifact(),
@@ -1246,13 +1204,32 @@ impl<Workload> ClosedLoop<Workload> {
                 calendar.segments(),
             )?;
         }
-        for pending in &self.inflight_transitions {
-            self.observation
-                .push_actuation_commitment(ActuationCommitment::new(
-                    pending.from_replicas,
-                    pending.target_replicas,
-                    ModelTime::from_micros(pending.requested_at_micros),
-                )?)?;
+        for (index, pending) in self.inflight_transitions.iter().enumerate() {
+            if pending.reached(context.plant.replicas) && Some(index) != active_transition {
+                continue;
+            }
+            let requested_at = ModelTime::from_micros(pending.requested_at_micros);
+            let commitment = active_transition
+                .filter(|active| *active == index)
+                .and_then(|_| context.plant.reconciliation_started_micros)
+                .map_or_else(
+                    || {
+                        ActuationCommitment::launching(
+                            pending.from_replicas,
+                            pending.target_replicas,
+                            requested_at,
+                        )
+                    },
+                    |started_at| {
+                        ActuationCommitment::rebalancing(
+                            pending.from_replicas,
+                            pending.target_replicas,
+                            requested_at,
+                            ModelTime::from_micros(started_at),
+                        )
+                    },
+                )?;
+            self.observation.push_actuation_commitment(commitment)?;
         }
         self.latest_capacity_window = None;
         self.capacity_evidence_sample = CapacityEvidenceSample::None;

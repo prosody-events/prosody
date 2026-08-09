@@ -1,9 +1,5 @@
 use std::time::Duration;
 
-#[cfg(test)]
-use fearless_simd::{Level, dispatch};
-use fearless_simd::{Simd, prelude::*};
-
 use crate::types::WorkCohorts;
 
 pub(crate) struct EdfScratch {
@@ -69,7 +65,14 @@ struct DeadlineState {
     completed: f64,
     released: f64,
     due: f64,
+    missed: f64,
     shortfall: f64,
+}
+
+#[derive(Clone, Copy)]
+struct DeadlineAdvance {
+    queue_area: f64,
+    late_area: f64,
 }
 
 impl DeadlineState {
@@ -80,6 +83,7 @@ impl DeadlineState {
             completed: 0.0_f64,
             released: 0.0_f64,
             due: 0.0_f64,
+            missed: 0.0_f64,
             shortfall: 0.0_f64,
         }
     }
@@ -90,13 +94,33 @@ impl DeadlineState {
     }
 
     fn make_due(&mut self, work: f64) {
+        let completion_headroom = (self.actionable_completed() - self.due).max(0.0_f64);
+        let missed = (work - completion_headroom).clamp(0.0_f64, work);
+        let error_bound = 8.0_f64
+            * f64::EPSILON
+            * self
+                .released
+                .max(self.completed)
+                .max(self.due)
+                .max(work)
+                .max(1.0_f64);
+        if missed > error_bound {
+            self.missed += missed;
+        }
         self.due += work;
         self.update_shortfall();
     }
 
-    fn advance(&mut self, duration: f64, capacity: f64, arrival_rate: f64, due_rate: f64) -> f64 {
+    fn advance(
+        &mut self,
+        duration: f64,
+        capacity: f64,
+        arrival_rate: f64,
+        due_rate: f64,
+    ) -> DeadlineAdvance {
         let mut remaining = duration;
-        let mut area = 0.0_f64;
+        let mut queue_area = 0.0_f64;
+        let mut late_area = 0.0_f64;
         while remaining > f64::EPSILON {
             let service_rate = if self.queue > f64::EPSILON {
                 capacity
@@ -111,6 +135,19 @@ impl DeadlineState {
             if self.completed < self.initial_debt && service_rate > f64::EPSILON {
                 span = span.min((self.initial_debt - self.completed) / service_rate);
             }
+            let actionable_rate = if self.completed >= self.initial_debt {
+                service_rate
+            } else {
+                0.0_f64
+            };
+            let completion_lead = self.actionable_completed() - self.due;
+            let lead_rate = actionable_rate - due_rate;
+            if completion_lead * lead_rate < 0.0_f64 {
+                let crossing = -completion_lead / lead_rate;
+                if crossing > f64::EPSILON {
+                    span = span.min(crossing);
+                }
+            }
             if span <= f64::EPSILON {
                 if self.queue <= f64::EPSILON * capacity.max(1.0_f64) {
                     self.queue = 0.0_f64;
@@ -122,22 +159,60 @@ impl DeadlineState {
                 }
                 continue;
             }
-            area += self.queue * span + 0.5_f64 * net_rate * span * span;
+            let late_before = self.late_work();
+            if due_rate > f64::EPSILON
+                && (completion_lead < -f64::EPSILON
+                    || (completion_lead.abs() <= f64::EPSILON && lead_rate < 0.0_f64))
+            {
+                self.missed += due_rate * span;
+            }
+            queue_area += self.queue * span + 0.5_f64 * net_rate * span * span;
             self.queue = (self.queue + net_rate * span).max(0.0_f64);
             self.completed += service_rate * span;
             self.released += arrival_rate * span;
             self.due += due_rate * span;
             self.update_shortfall();
+            late_area += 0.5_f64 * (late_before + self.late_work()) * span;
             remaining -= span;
         }
-        area
+        DeadlineAdvance {
+            queue_area,
+            late_area,
+        }
+    }
+
+    fn actionable_completed(&self) -> f64 {
+        (self.completed - self.initial_debt)
+            .max(0.0_f64)
+            .min(self.released)
+    }
+
+    fn late_work(&self) -> f64 {
+        let error_bound = 8.0_f64
+            * f64::EPSILON
+            * self
+                .initial_debt
+                .max(self.completed)
+                .max(self.released)
+                .max(self.due)
+                .max(1.0_f64);
+        let initial = self.initial_debt - self.completed;
+        let initial = if initial > error_bound {
+            initial
+        } else {
+            0.0_f64
+        };
+        let actionable = self.due - self.actionable_completed();
+        let actionable = if actionable > error_bound {
+            actionable
+        } else {
+            0.0_f64
+        };
+        initial + actionable
     }
 
     fn update_shortfall(&mut self) {
-        let actionable_completed = (self.completed - self.initial_debt)
-            .max(0.0_f64)
-            .min(self.released);
-        let deficit = (self.due - actionable_completed).max(0.0_f64);
+        let deficit = (self.due - self.actionable_completed()).max(0.0_f64);
         if deficit > f64::EPSILON * self.due.max(1.0_f64) {
             self.shortfall = self.shortfall.max(deficit / self.due);
         }
@@ -172,6 +247,7 @@ impl SupplyTrajectory<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct ArrivalPath<'a> {
     pub(crate) start_seconds: f64,
     pub(crate) end_seconds: &'a [f64],
@@ -200,29 +276,11 @@ impl ArrivalPath<'_> {
         count
     }
 
-    /// Returns the largest mean rate in one fixed window.
-    pub(crate) fn maximum_window_rate(&self, start: f64, end: f64, window: f64) -> f64 {
-        if end <= start || window <= f64::EPSILON {
-            return 0.0_f64;
-        }
-        let last_start = (end - window).max(start);
-        let mut maximum = self.integrated_count(start, (start + window).min(end)) / window;
-        for &relative_boundary in self.end_seconds {
-            let boundary = self.start_seconds + relative_boundary;
-            if boundary >= start && boundary <= last_start {
-                maximum = maximum.max(self.integrated_count(boundary, boundary + window) / window);
-            }
-            let aligned_start = boundary - window;
-            if aligned_start >= start && aligned_start <= last_start {
-                maximum = maximum
-                    .max(self.integrated_count(aligned_start, aligned_start + window) / window);
-            }
-        }
-        maximum.max(self.integrated_count(last_start, end) / window)
-    }
-
     fn rate_at(&self, at: f64) -> f64 {
         let relative = (at - self.start_seconds).max(0.0_f64);
+        if self.end_seconds.last().is_none_or(|end| relative >= *end) {
+            return 0.0_f64;
+        }
         let index = self
             .end_seconds
             .partition_point(|end| relative >= *end)
@@ -259,448 +317,14 @@ impl ArrivalPath<'_> {
     }
 }
 
-pub(crate) struct StepCandidates<'a> {
-    pub(crate) before: f64,
-    pub(crate) during: &'a [f64],
-    pub(crate) after: &'a [f64],
-    pub(crate) pause_seconds: &'a [f64],
-    pub(crate) ready_seconds: &'a [f64],
-}
-
-#[derive(Clone, Copy)]
-struct ScalarStep {
-    pause: f64,
-    ready: f64,
-    before: f64,
-    during: f64,
-    after: f64,
-}
-
-#[cfg(test)]
-pub(crate) fn evaluate_empty_steps(
-    level: Level,
-    supply: &StepCandidates<'_>,
-    start_seconds: f64,
-    horizon_seconds: f64,
-    initial_work: f64,
-    arrivals: &ArrivalPath<'_>,
-    deadline_budget_micros: u64,
-    delay_area: &mut [f64],
-    terminal_work: &mut [f64],
-    shortfall: &mut [f64],
-) {
-    let count = supply.after.len();
-    assert_eq!(supply.during.len(), count);
-    assert_eq!(supply.pause_seconds.len(), count);
-    assert_eq!(supply.ready_seconds.len(), count);
-    assert_eq!(delay_area.len(), count);
-    assert_eq!(terminal_work.len(), count);
-    assert_eq!(shortfall.len(), count);
-    dispatch!(level, simd => evaluate_empty_steps_simd(
-        simd,
-        supply,
-        start_seconds,
-        horizon_seconds,
-        initial_work,
-        arrivals,
-        deadline_budget_micros,
-        delay_area,
-        terminal_work,
-        shortfall,
-    ));
-}
-
-pub(crate) fn evaluate_empty_steps_simd<S: Simd>(
-    simd: S,
-    supply: &StepCandidates<'_>,
-    start_seconds: f64,
-    horizon_seconds: f64,
-    initial_work: f64,
-    arrivals: &ArrivalPath<'_>,
-    deadline_budget_micros: u64,
-    delay_area: &mut [f64],
-    terminal_work: &mut [f64],
-    shortfall: &mut [f64],
-) {
-    let lane_count = S::f64s::N;
-    let vector_count = supply.after.len() / lane_count;
-    for vector in 0..vector_count {
-        let first = vector * lane_count;
-        let last = first + lane_count;
-        let pause = S::f64s::from_slice(simd, &supply.pause_seconds[first..last]);
-        let ready = S::f64s::from_slice(simd, &supply.ready_seconds[first..last]);
-        let during = S::f64s::from_slice(simd, &supply.during[first..last]);
-        let after = S::f64s::from_slice(simd, &supply.after[first..last]);
-        let before = S::f64s::splat(simd, supply.before);
-        let mut queue = S::f64s::splat(simd, initial_work);
-        let mut area = S::f64s::splat(simd, 0.0_f64);
-        let mut released = S::f64s::splat(simd, 0.0_f64);
-        let mut due = S::f64s::splat(simd, 0.0_f64);
-        let mut maximum_shortfall = S::f64s::splat(simd, 0.0_f64);
-        let budget_seconds = Duration::from_micros(deadline_budget_micros).as_secs_f64();
-        for_forecast_intervals(
-            arrivals,
-            start_seconds,
-            horizon_seconds,
-            budget_seconds,
-            |start, end, rate, due_rate| {
-                let start = S::f64s::splat(simd, start);
-                let end = S::f64s::splat(simd, end);
-                let zero = S::f64s::splat(simd, 0.0_f64);
-                let before_end = pause.simd_lt(end).select(pause, end);
-                let before_duration = (before_end - start)
-                    .simd_gt(zero)
-                    .select(before_end - start, zero);
-                accumulate_deadline_segment(
-                    simd,
-                    &mut queue,
-                    &mut area,
-                    &mut released,
-                    &mut due,
-                    &mut maximum_shortfall,
-                    before_duration,
-                    before,
-                    rate,
-                    due_rate,
-                );
-
-                let during_start = pause.simd_gt(start).select(pause, start);
-                let during_end = ready.simd_lt(end).select(ready, end);
-                let during_duration = (during_end - during_start)
-                    .simd_gt(zero)
-                    .select(during_end - during_start, zero);
-                accumulate_deadline_segment(
-                    simd,
-                    &mut queue,
-                    &mut area,
-                    &mut released,
-                    &mut due,
-                    &mut maximum_shortfall,
-                    during_duration,
-                    during,
-                    rate,
-                    due_rate,
-                );
-
-                let after_start = ready.simd_gt(start).select(ready, start);
-                let after_duration = (end - after_start)
-                    .simd_gt(zero)
-                    .select(end - after_start, zero);
-                accumulate_deadline_segment(
-                    simd,
-                    &mut queue,
-                    &mut area,
-                    &mut released,
-                    &mut due,
-                    &mut maximum_shortfall,
-                    after_duration,
-                    after,
-                    rate,
-                    due_rate,
-                );
-            },
-        );
-        area.store_slice(&mut delay_area[first..last]);
-        queue.store_slice(&mut terminal_work[first..last]);
-        maximum_shortfall.store_slice(&mut shortfall[first..last]);
-    }
-    for candidate in vector_count * lane_count..supply.after.len() {
-        let mut queue = initial_work;
-        let mut area = 0.0_f64;
-        for_arrival_intervals(
-            arrivals,
-            start_seconds,
-            horizon_seconds,
-            |start, end, rate| {
-                area += phased_queue_segment(
-                    &mut queue,
-                    start,
-                    end,
-                    ScalarStep {
-                        pause: supply.pause_seconds[candidate],
-                        ready: supply.ready_seconds[candidate],
-                        before: supply.before,
-                        during: supply.during[candidate],
-                        after: supply.after[candidate],
-                    },
-                    rate,
-                );
-            },
-        );
-        delay_area[candidate] = area;
-        terminal_work[candidate] = queue;
-        shortfall[candidate] = forecast_step_shortfall(
-            ScalarStep {
-                pause: supply.pause_seconds[candidate],
-                ready: supply.ready_seconds[candidate],
-                before: supply.before,
-                during: supply.during[candidate],
-                after: supply.after[candidate],
-            },
-            start_seconds,
-            horizon_seconds,
-            initial_work,
-            Duration::from_micros(deadline_budget_micros).as_secs_f64(),
-            arrivals,
-        );
-    }
-}
-
-fn accumulate_deadline_segment<S: Simd>(
-    simd: S,
-    queue: &mut S::f64s,
-    area: &mut S::f64s,
-    released: &mut S::f64s,
-    due: &mut S::f64s,
-    maximum_shortfall: &mut S::f64s,
-    duration: S::f64s,
-    capacity: S::f64s,
-    arrival_rate: f64,
-    due_rate: f64,
-) {
-    let zero = S::f64s::splat(simd, 0.0_f64);
-    let minimum = S::f64s::splat(simd, f64::MIN_POSITIVE);
-    let arrivals = S::f64s::splat(simd, arrival_rate);
-    let due_arrivals = S::f64s::splat(simd, due_rate);
-    let safe_capacity = capacity.simd_gt(minimum).select(capacity, minimum);
-    let debt_time = (*queue - *released) / safe_capacity;
-    let debt_valid =
-        capacity.simd_gt(minimum) & debt_time.simd_gt(zero) & debt_time.simd_lt(duration);
-    update_deadline_shortfall(
-        simd,
-        *queue,
-        *released,
-        *due,
-        capacity,
-        arrivals,
-        due_arrivals,
-        debt_time,
-        debt_valid,
-        maximum_shortfall,
-    );
-
-    let drain_rate = capacity - arrivals;
-    let safe_drain_rate = drain_rate.simd_gt(minimum).select(drain_rate, minimum);
-    let drain_time = *queue / safe_drain_rate;
-    let drain_valid =
-        drain_rate.simd_gt(minimum) & drain_time.simd_gt(zero) & drain_time.simd_lt(duration);
-    update_deadline_shortfall(
-        simd,
-        *queue,
-        *released,
-        *due,
-        capacity,
-        arrivals,
-        due_arrivals,
-        drain_time,
-        drain_valid,
-        maximum_shortfall,
-    );
-    update_deadline_shortfall(
-        simd,
-        *queue,
-        *released,
-        *due,
-        capacity,
-        arrivals,
-        due_arrivals,
-        duration,
-        duration.simd_gt(zero),
-        maximum_shortfall,
-    );
-    accumulate_queue_segment(simd, queue, area, duration, capacity, arrival_rate);
-    *released += arrivals * duration;
-    *due += due_arrivals * duration;
-}
-
-fn update_deadline_shortfall<S: Simd>(
-    simd: S,
-    queue: S::f64s,
-    released: S::f64s,
-    due: S::f64s,
-    capacity: S::f64s,
-    arrival_rate: S::f64s,
-    due_rate: S::f64s,
-    elapsed: S::f64s,
-    valid: <S::f64s as SimdBase<S>>::Mask,
-    maximum: &mut S::f64s,
-) {
-    let zero = S::f64s::splat(simd, 0.0_f64);
-    let minimum = S::f64s::splat(simd, f64::MIN_POSITIVE);
-    let terminal_queue = queue + (arrival_rate - capacity) * elapsed;
-    let terminal_queue = terminal_queue.simd_gt(zero).select(terminal_queue, zero);
-    let completed = released + arrival_rate * elapsed - terminal_queue;
-    let completed = completed.simd_gt(zero).select(completed, zero);
-    let terminal_due = due + due_rate * elapsed;
-    let deficit = terminal_due - completed;
-    let deficit = deficit.simd_gt(zero).select(deficit, zero);
-    let safe_due = terminal_due.simd_gt(minimum).select(terminal_due, minimum);
-    let fraction = deficit / safe_due;
-    let fraction = valid.select(fraction, zero);
-    *maximum = fraction.simd_gt(*maximum).select(fraction, *maximum);
-}
-
-fn forecast_step_shortfall(
-    step: ScalarStep,
-    start_seconds: f64,
-    horizon_seconds: f64,
-    initial_debt: f64,
-    budget_seconds: f64,
-    arrivals: &ArrivalPath<'_>,
-) -> f64 {
-    let mut deadline = DeadlineState::new(initial_debt);
-    let mut now = start_seconds;
-    while now < horizon_seconds {
-        let mut next = horizon_seconds;
-        if step.pause > now {
-            next = next.min(step.pause);
-        }
-        if step.ready > now {
-            next = next.min(step.ready);
-        }
-        if let Some(boundary) = arrivals.next_boundary(now) {
-            next = next.min(boundary);
-        }
-        if let Some(boundary) = arrivals.next_deadline_boundary(now, budget_seconds) {
-            next = next.min(boundary);
-        }
-        if next <= now {
-            break;
-        }
-        let capacity = if now < step.pause {
-            step.before
-        } else if now < step.ready {
-            step.during
-        } else {
-            step.after
-        };
-        let _ = deadline.advance(
-            next - now,
-            capacity,
-            arrivals.rate_at(now),
-            arrivals.deadline_rate_at(now, budget_seconds),
-        );
-        now = next;
-    }
-    deadline.shortfall
-}
-
-fn accumulate_queue_segment<S: Simd>(
-    simd: S,
-    queue: &mut S::f64s,
-    area: &mut S::f64s,
-    duration: S::f64s,
-    capacity: S::f64s,
-    arrival_rate: f64,
-) {
-    let zero = S::f64s::splat(simd, 0.0_f64);
-    let half = S::f64s::splat(simd, 0.5_f64);
-    let rate = S::f64s::splat(simd, arrival_rate);
-    let net = rate - capacity;
-    let growing = net.simd_ge(zero);
-    let growing_area = *queue * duration + half * net * duration * duration;
-    let growing_queue = *queue + net * duration;
-    let net_drain_rate = zero - net;
-    let minimum_rate = S::f64s::splat(simd, f64::MIN_POSITIVE);
-    let drain_rate = net_drain_rate
-        .simd_gt(minimum_rate)
-        .select(net_drain_rate, minimum_rate);
-    let complete_drain_duration = *queue / drain_rate;
-    let drain_duration = complete_drain_duration
-        .simd_lt(duration)
-        .select(complete_drain_duration, duration);
-    let draining_area = *queue * drain_duration + half * net * drain_duration * drain_duration;
-    let terminal_queue = *queue + net * duration;
-    let draining_queue = terminal_queue.simd_gt(zero).select(terminal_queue, zero);
-    *area += growing.select(growing_area, draining_area);
-    *queue = growing.select(growing_queue, draining_queue);
-}
-
-fn for_arrival_intervals(
-    arrivals: &ArrivalPath<'_>,
-    start: f64,
-    end: f64,
-    mut evaluate: impl FnMut(f64, f64, f64),
-) {
-    let mut cursor = start;
-    for (&relative_end, &rate) in arrivals.end_seconds.iter().zip(arrivals.rates) {
-        let interval_end = (arrivals.start_seconds + relative_end).min(end);
-        if interval_end > cursor {
-            evaluate(cursor, interval_end, rate);
-            cursor = interval_end;
-        }
-        if cursor >= end {
-            return;
-        }
-    }
-    if cursor < end {
-        evaluate(cursor, end, arrivals.rate_at(cursor));
-    }
-}
-
-fn for_forecast_intervals(
-    arrivals: &ArrivalPath<'_>,
-    start: f64,
-    end: f64,
-    budget_seconds: f64,
-    mut evaluate: impl FnMut(f64, f64, f64, f64),
-) {
-    let mut cursor = start;
-    while cursor < end {
-        let mut next = end;
-        if let Some(boundary) = arrivals.next_boundary(cursor) {
-            next = next.min(boundary);
-        }
-        if let Some(boundary) = arrivals.next_deadline_boundary(cursor, budget_seconds) {
-            next = next.min(boundary);
-        }
-        if next <= cursor {
-            break;
-        }
-        evaluate(
-            cursor,
-            next,
-            arrivals.rate_at(cursor),
-            arrivals.deadline_rate_at(cursor, budget_seconds),
-        );
-        cursor = next;
-    }
-}
-
-fn phased_queue_segment(
-    queue: &mut f64,
-    start: f64,
-    end: f64,
-    step: ScalarStep,
-    arrival_rate: f64,
-) -> f64 {
-    let before_end = step.pause.min(end);
-    let during_start = step.pause.max(start);
-    let during_end = step.ready.min(end);
-    let after_start = step.ready.max(start);
-    queue_area_segment(
-        queue,
-        (before_end - start).max(0.0_f64),
-        step.before,
-        arrival_rate,
-    ) + queue_area_segment(
-        queue,
-        (during_end - during_start).max(0.0_f64),
-        step.during,
-        arrival_rate,
-    ) + queue_area_segment(
-        queue,
-        (end - after_start).max(0.0_f64),
-        step.after,
-        arrival_rate,
-    )
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct EdfOutcome {
     pub(crate) shortfall: f64,
     pub(crate) delay_area: f64,
+    pub(crate) missed_work: f64,
+    pub(crate) late_area: f64,
     pub(crate) terminal_work: f64,
+    pub(crate) terminal_late_work: f64,
 }
 
 impl EdfScratch {
@@ -799,23 +423,6 @@ fn deadline_work(
     work
 }
 
-/// Computes all candidate shortfalls through one deadline traversal.
-fn queue_area_segment(queue: &mut f64, duration: f64, capacity: f64, arrival_rate: f64) -> f64 {
-    if duration <= f64::EPSILON {
-        return 0.0_f64;
-    }
-    let net_rate = arrival_rate - capacity;
-    if net_rate >= 0.0_f64 {
-        let area = *queue * duration + 0.5_f64 * net_rate * duration * duration;
-        *queue += net_rate * duration;
-        return area;
-    }
-    let drain_duration = (*queue / -net_rate).min(duration);
-    let area = *queue * drain_duration + 0.5_f64 * net_rate * drain_duration * drain_duration;
-    *queue = (*queue + net_rate * duration).max(0.0_f64);
-    area
-}
-
 pub(crate) fn evaluate_prepared_step(
     cohorts: &WorkCohorts,
     supply: SupplyStep,
@@ -830,6 +437,7 @@ pub(crate) fn evaluate_prepared_step(
     let mut late_work = window.initial_debt_work;
     let mut deadline = DeadlineState::new(window.initial_debt_work);
     let mut delay_area = 0.0_f64;
+    let mut late_area = 0.0_f64;
     let mut shortfall = 0.0_f64;
     let budget_seconds = Duration::from_micros(window.deadline_budget_micros).as_secs_f64();
     while now_micros < window.horizon_micros {
@@ -860,11 +468,11 @@ pub(crate) fn evaluate_prepared_step(
         }
         let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
         if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
-            next_micros = next_micros.min(seconds_to_micros(boundary));
+            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
         }
         if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
         {
-            next_micros = next_micros.min(seconds_to_micros(boundary));
+            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
         }
         if next_micros <= now_micros {
             break;
@@ -877,12 +485,14 @@ pub(crate) fn evaluate_prepared_step(
         } else {
             supply.after
         };
-        delay_area += deadline.advance(
+        let advance = deadline.advance(
             duration_seconds,
             capacity,
             future_arrivals.rate_at(now_seconds),
             future_arrivals.deadline_rate_at(now_seconds, budget_seconds),
         );
+        delay_area += advance.queue_area;
+        late_area += advance.late_area;
         let supply = capacity * duration_seconds;
         let late_supply = supply.min(late_work);
         late_work -= late_supply;
@@ -905,7 +515,10 @@ pub(crate) fn evaluate_prepared_step(
     EdfOutcome {
         shortfall: shortfall.max(deadline.shortfall),
         delay_area,
+        missed_work: deadline.missed,
+        late_area,
         terminal_work: deadline.queue,
+        terminal_late_work: deadline.late_work(),
     }
 }
 
@@ -972,6 +585,7 @@ fn evaluate_ordered_trajectory(
     let mut late_work = initial_debt_work;
     let mut deadline = DeadlineState::new(initial_debt_work);
     let mut delay_area = 0.0_f64;
+    let mut late_area = 0.0_f64;
     let mut shortfall = 0.0_f64;
     let budget_seconds = Duration::from_micros(deadline_budget_micros).as_secs_f64();
     while now_micros < horizon_micros {
@@ -1006,23 +620,25 @@ fn evaluate_ordered_trajectory(
         }
         let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
         if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
-            next_micros = next_micros.min(seconds_to_micros(boundary));
+            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
         }
         if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
         {
-            next_micros = next_micros.min(seconds_to_micros(boundary));
+            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
         }
         if next_micros <= now_micros {
             break;
         }
         let duration_seconds = Duration::from_micros(next_micros - now_micros).as_secs_f64();
         let capacity = trajectory.capacity_at_micros(now_micros);
-        delay_area += deadline.advance(
+        let advance = deadline.advance(
             duration_seconds,
             capacity,
             future_arrivals.rate_at(now_seconds),
             future_arrivals.deadline_rate_at(now_seconds, budget_seconds),
         );
+        delay_area += advance.queue_area;
+        late_area += advance.late_area;
         let supply = capacity * duration_seconds;
         let debt_supply = supply.min(late_work);
         late_work -= debt_supply;
@@ -1057,7 +673,10 @@ fn evaluate_ordered_trajectory(
     EdfOutcome {
         shortfall: shortfall.max(deadline.shortfall),
         delay_area,
+        missed_work: deadline.missed,
+        late_area,
         terminal_work: deadline.queue,
+        terminal_late_work: deadline.late_work(),
     }
 }
 
@@ -1143,6 +762,7 @@ pub(crate) fn evaluate_general_trajectory(
     let mut late_work = initial_debt_work;
     let mut deadline = DeadlineState::new(initial_debt_work);
     let mut delay_area = 0.0_f64;
+    let mut late_area = 0.0_f64;
     let mut shortfall = 0.0_f64;
     let budget_seconds = Duration::from_micros(deadline_budget_micros).as_secs_f64();
     while now_micros < horizon_micros {
@@ -1169,23 +789,25 @@ pub(crate) fn evaluate_general_trajectory(
         }
         let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
         if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
-            next_micros = next_micros.min(seconds_to_micros(boundary));
+            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
         }
         if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
         {
-            next_micros = next_micros.min(seconds_to_micros(boundary));
+            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
         }
         if next_micros <= now_micros {
             break;
         }
         let duration_seconds = Duration::from_micros(next_micros - now_micros).as_secs_f64();
         let capacity = trajectory.capacity_at_micros(now_micros);
-        delay_area += deadline.advance(
+        let advance = deadline.advance(
             duration_seconds,
             capacity,
             future_arrivals.rate_at(now_seconds),
             future_arrivals.deadline_rate_at(now_seconds, budget_seconds),
         );
+        delay_area += advance.queue_area;
+        late_area += advance.late_area;
         let supply = capacity * duration_seconds;
         let late_supply = supply.min(late_work);
         late_work -= late_supply;
@@ -1208,7 +830,10 @@ pub(crate) fn evaluate_general_trajectory(
     EdfOutcome {
         shortfall: shortfall.max(deadline.shortfall),
         delay_area,
+        missed_work: deadline.missed,
+        late_area,
         terminal_work: deadline.queue,
+        terminal_late_work: deadline.late_work(),
     }
 }
 
@@ -1231,6 +856,7 @@ fn evaluate_common_trajectory(
     };
     let mut deadline = DeadlineState::new(initial_debt_work);
     let mut delay_area = 0.0_f64;
+    let mut late_area = 0.0_f64;
     let budget_seconds = Duration::from_micros(deadline_budget_micros).as_secs_f64();
     while now_micros < horizon_micros {
         let (released, due) = update_common_boundaries(cohort, now_micros, &mut state);
@@ -1248,23 +874,25 @@ fn evaluate_common_trajectory(
         }
         let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
         if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
-            next_micros = next_micros.min(seconds_to_micros(boundary));
+            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
         }
         if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
         {
-            next_micros = next_micros.min(seconds_to_micros(boundary));
+            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
         }
         if next_micros <= now_micros {
             break;
         }
         let duration = Duration::from_micros(next_micros - now_micros).as_secs_f64();
         let capacity = trajectory.capacity_at_micros(now_micros);
-        delay_area += deadline.advance(
+        let advance = deadline.advance(
             duration,
             capacity,
             future_arrivals.rate_at(now_seconds),
             future_arrivals.deadline_rate_at(now_seconds, budget_seconds),
         );
+        delay_area += advance.queue_area;
+        late_area += advance.late_area;
         let mut supply = capacity * duration;
         let debt_supply = supply.min(state.late_work);
         state.late_work -= debt_supply;
@@ -1278,7 +906,10 @@ fn evaluate_common_trajectory(
     EdfOutcome {
         shortfall: state.shortfall.max(deadline.shortfall),
         delay_area,
+        missed_work: deadline.missed,
+        late_area,
         terminal_work: deadline.queue,
+        terminal_late_work: deadline.late_work(),
     }
 }
 
@@ -1491,4 +1122,8 @@ fn deadline_key(cohorts: &WorkCohorts, cohort_index: u32) -> (u64, u64, u32) {
 
 fn seconds_to_micros(seconds: f64) -> u64 {
     (seconds * 1_000_000.0_f64) as u64
+}
+
+fn seconds_to_micros_ceil(seconds: f64) -> u64 {
+    (seconds * 1_000_000.0_f64).ceil() as u64
 }
