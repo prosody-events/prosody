@@ -15,7 +15,7 @@ use crate::router::directory::tests::support::cassandra_directory;
 use crate::router::directory::{Endpoint, NodeDirectory};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
-use crate::router::grpc::{BoundListener, TransportConfiguration};
+use crate::router::grpc::BoundListener;
 use crate::router::{Host, NodeId};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
@@ -68,10 +68,7 @@ impl Process {
     /// Starts one live process.
     async fn new() -> Result<Self> {
         let directory = cassandra_directory(LEASE).await?;
-        let bound = BoundListener::bind(&TransportConfiguration {
-            bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        })
-        .await?;
+        let bound = BoundListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let listener = Endpoint {
             host: Host::make("127.0.0.1"),
             port: bound.address().port(),
@@ -103,7 +100,7 @@ impl Process {
 /// Registration reads the bound listener rather than a port number, so a test
 /// binds a real one and the published port is always a port that exists.
 pub(super) async fn listener() -> Result<BoundListener> {
-    Ok(BoundListener::bind(&TransportConfiguration::default()).await?)
+    Ok(BoundListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?)
 }
 
 /// Starts one runtime with every peer field left at its default.

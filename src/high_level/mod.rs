@@ -14,9 +14,9 @@ use crate::high_level::config::ModeConfiguration;
 pub use crate::high_level::error::HighLevelClientError;
 pub use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
-use crate::peer::{ProducerHandle, Router, RouterOwner};
+use crate::peer::{Router, RouterOwner};
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
-use crate::requester::{Outcome, RequestError};
+use crate::requester::{Outcome, ProsodyRequester, RequestError};
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state_reader::ConsumerReaderBackend;
 use crate::state_reader::StateReaderDependencies;
@@ -77,7 +77,7 @@ where
     #[educe(Debug(ignore))]
     reader: StateReaderClient<Wire<T>, B::Reader>,
     #[educe(Debug(ignore))]
-    producer_peer: ProducerHandle,
+    requester: ProsodyRequester<Wire<T>, Reply<T>>,
     #[educe(Debug(ignore))]
     consumer_peer: <B::Router as Router>::Consumer,
     subsystem: Option<SubsystemName>,
@@ -161,10 +161,7 @@ where
         H: IntoIterator<Item = (&'static str, &'a str)>,
         H::IntoIter: ExactSizeIterator,
     {
-        let requester = self
-            .producer_peer
-            .requester::<Wire<T>, Reply<T>>(self.producer.clone());
-        requester
+        self.requester
             .request(headers, topic, key, payload, subsystems, timeout)
             .await
     }

@@ -37,7 +37,7 @@ use self::health::{PeerHealth, ProcessHealth};
 use self::service::PeerService;
 use crate::router::RelayHop;
 use std::io::Error as IoError;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -56,16 +56,7 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// How long a pinged peer has to answer before its connection is closed.
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Internal peer listener settings.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TransportConfiguration {
-    /// The address the listener binds. Port zero asks the operating system for
-    /// one, and [`BoundListener`] is then the only place that port can be read.
-    pub(crate) bind: SocketAddr,
-}
-
-/// A listener that is already bound, the address it bound, and the
-/// bind address.
+/// A listener that is already bound and the address it bound.
 ///
 /// The address is the one the operating system assigned, and it is the only
 /// address this type will give up: a caller cannot reach the configured one, so
@@ -75,22 +66,14 @@ pub(crate) struct BoundListener {
     address: SocketAddr,
 }
 
-impl Default for TransportConfiguration {
-    fn default() -> Self {
-        Self {
-            bind: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-        }
-    }
-}
-
 impl BoundListener {
-    /// Binds the address `config` names.
+    /// Binds `address`. Port zero asks the operating system for one.
     ///
     /// # Errors
     ///
     /// Returns [`TransportError::Bind`] when the address cannot be bound.
-    pub(crate) async fn bind(config: &TransportConfiguration) -> Result<Self, TransportError> {
-        let listener = TcpListener::bind(config.bind).await?;
+    pub(crate) async fn bind(address: SocketAddr) -> Result<Self, TransportError> {
+        let listener = TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
         Ok(Self { listener, address })
     }

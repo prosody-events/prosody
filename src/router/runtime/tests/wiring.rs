@@ -21,7 +21,7 @@ use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::service::PeerService;
-use crate::router::grpc::{BoundListener, TransportConfiguration, serve};
+use crate::router::grpc::{BoundListener, serve};
 use crate::router::loopback::{HANG_GUARD, TestHealth, TestRouter, config as fleet_config};
 use crate::router::relay::Relay;
 use crate::router::{Host, LocalTarget, NodeId, Preference, ResponseSender, Router};
@@ -243,10 +243,7 @@ async fn sent_on(elsewhere: &Elsewhere, here: &Endpoint) -> Result<()> {
 /// A listener on the loopback interface, on a port the operating system
 /// chooses.
 async fn bind() -> Result<BoundListener> {
-    Ok(BoundListener::bind(&TransportConfiguration {
-        bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-    })
-    .await?)
+    Ok(BoundListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?)
 }
 
 /// Where a listener on `port` is, as a peer on this machine dials it.

@@ -84,13 +84,14 @@ where
         .map_err(HighLevelClientError::StateReader)?;
     let router = backend.build_router(peer, &reader).await?;
     let (producer_peer, consumer_peer, router_owner) = router.split();
+    let requester = producer_peer.requester(producer.clone());
 
     Ok(HighLevelClient {
         producer,
         producer_config,
         consumer: Mutex::new(consumer_state),
         reader: StateReaderClient::new(reader),
-        producer_peer,
+        requester,
         consumer_peer,
         subsystem: consumer_builders.keyed_state.subsystem.clone(),
         router_owner,

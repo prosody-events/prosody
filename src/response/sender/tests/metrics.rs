@@ -15,7 +15,7 @@ use super::{DEADLINE, Harness, PAYLOAD, attempts};
 use crate::codec::Codec;
 use crate::response::sender::{TypedSender, prepare};
 use crate::router::loopback::{Script, UNPUBLISHED_NODE, config, node, paused};
-use crate::router::{Preference, Router, SendFailure};
+use crate::router::{Preference, SendFailure};
 use crate::test_util::{GlobalMetrics, assert_distinct_labels, label};
 use color_eyre::Result;
 use color_eyre::eyre::ensure;

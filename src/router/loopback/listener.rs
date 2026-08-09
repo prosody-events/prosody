@@ -8,7 +8,7 @@ use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::service::PeerService;
-use crate::router::grpc::{BoundListener, TransportConfiguration, serve};
+use crate::router::grpc::{BoundListener, serve};
 use crate::router::{Host, NodeId, RelayHop, Route, Router, choose_route};
 use color_eyre::Result;
 use std::convert::Infallible;
@@ -83,14 +83,13 @@ impl FixedRouter {
             here,
         })
     }
+
+    pub(crate) const fn fleet(&self) -> &Arc<DestinationFleet> {
+        &self.fleet
+    }
 }
 
 impl Router for FixedRouter {
-    #[cfg(test)]
-    fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
-    }
-
     fn route(
         &self,
         _node: NodeId,
@@ -123,17 +122,14 @@ impl RelayHop for FixedRouter {
     }
 }
 
-/// A listener configuration on the loopback interface, on a port the operating
-/// system chooses.
-pub(crate) fn transport() -> TransportConfiguration {
-    TransportConfiguration {
-        bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-    }
+/// The loopback address with an operating-system-selected port.
+pub(crate) fn bind_address() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
 }
 
-/// A listener bound on the loopback interface under [`transport`].
+/// A listener bound on [`bind_address`].
 pub(crate) async fn bind() -> Result<BoundListener> {
-    Ok(BoundListener::bind(&transport()).await?)
+    Ok(BoundListener::bind(bind_address()).await?)
 }
 
 /// Where a bound listener is, as a peer on this machine dials it.

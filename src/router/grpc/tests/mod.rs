@@ -17,9 +17,9 @@ mod metrics;
 mod trace;
 mod transport;
 
+use super::BoundListener;
 use super::client::GrpcSender;
 use super::service::PeerService;
-use super::{BoundListener, TransportConfiguration};
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::FrameHeader;
@@ -28,7 +28,7 @@ use crate::response::frame::tests::CountingCodec;
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::directory::Endpoint;
 use crate::router::fleet::DestinationFleet;
-use crate::router::loopback::listener::{FixedRouter, Served, endpoint, transport};
+use crate::router::loopback::listener::{FixedRouter, Served, bind_address, endpoint};
 use crate::router::loopback::{TestRouter, config as fleet_config, registration};
 use crate::router::relay::Relay;
 use crate::router::{Framed, LocalTarget, NodeId, ResponseSender, SendFailure};
@@ -36,6 +36,7 @@ use crate::subsystem::SubsystemName;
 use bytes::{BufMut, BytesMut};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::OnceCell;
@@ -78,15 +79,15 @@ struct RawFramed(BytesMut);
 impl Harness {
     /// The listener every suite shares.
     pub(super) async fn shared() -> Result<&'static Self> {
-        SHARED.get_or_try_init(|| Self::with(transport())).await
+        SHARED.get_or_try_init(|| Self::with(bind_address())).await
     }
 
     /// A listener of this suite's own, for the cases that vary its
     /// configuration. Call [`stop`](Self::stop) before the test returns.
-    pub(super) async fn with(config: TransportConfiguration) -> Result<Self> {
+    pub(super) async fn with(address: SocketAddr) -> Result<Self> {
         let served_registry = registry();
         let node = NodeId::new();
-        let bound = BoundListener::bind(&config).await?;
+        let bound = BoundListener::bind(address).await?;
         let address = endpoint(&bound);
         let (relay_router, _relay_deliveries) = TestRouter::new(fleet_config())?;
         let served = Served::start(

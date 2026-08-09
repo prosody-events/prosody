@@ -1,25 +1,22 @@
-//! What an operator sets to join the peer fleet, and how it becomes the four
-//! sections the runtime is built from.
+//! What an operator sets to join the peer fleet and how the runtime uses it.
 
 use crate::router::directory::{RegistrationTtl, RegistrationTtlError};
 use crate::router::fleet::config::FleetConfiguration;
-use crate::router::grpc::TransportConfiguration;
 use crate::router::runtime::RouterConfiguration;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback, from_option_env};
 use derive_builder::Builder;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use thiserror::Error;
 use validator::{Validate, ValidationError, ValidationErrors};
 
 /// How this process joins the peer fleet: what its listener binds, what it
 /// publishes about itself, how it answers, and what it may ask for.
-/// It restates the fields of four crate-private sections rather than nesting
-/// them, because a caller outside this crate cannot name a crate-private type.
-/// One crate-internal conversion turns it back into those sections.
+/// It keeps the public configuration flat. One crate-internal conversion
+/// groups the related values for their owners.
 ///
-/// Validation delegates to the four sections that consume these values. This
-/// keeps each rule in one place while exposing the standard [`Validate`] API.
+/// Validation delegates to the components that consume these values. This
+/// keeps each rule in one place and exposes the standard [`Validate`] API.
 #[derive(Builder, Clone, Debug, Validate)]
 #[builder(setter(into, strip_option), default)]
 #[validate(schema(function = "validate_peer"))]
@@ -49,10 +46,9 @@ pub struct PeerConfiguration {
     pub registration_ttl: Duration,
 }
 
-/// The four internal sections one peer configuration becomes, and the
-/// directory lease.
+/// The internal values one peer configuration becomes.
 pub(crate) struct PeerParts {
-    pub(crate) transport: TransportConfiguration,
+    pub(crate) bind: SocketAddr,
     pub(crate) router: RouterConfiguration,
     pub(crate) fleet: FleetConfiguration,
     pub(crate) lease: RegistrationTtl,
@@ -60,11 +56,10 @@ pub(crate) struct PeerParts {
 
 impl Default for PeerConfiguration {
     fn default() -> Self {
-        let transport = TransportConfiguration::default();
         let router = RouterConfiguration::default();
         let fleet = FleetConfiguration::default();
         Self {
-            bind_address: transport.bind,
+            bind_address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             advertised_host: router.advertised_host,
             advertised_port: router.advertised_port,
             network_name: router.network,
@@ -94,9 +89,7 @@ impl PeerConfiguration {
     fn unvalidated_parts(&self) -> Result<PeerParts, PeerConfigurationError> {
         let lease = RegistrationTtl::try_from(self.registration_ttl)?;
         Ok(PeerParts {
-            transport: TransportConfiguration {
-                bind: self.bind_address,
-            },
+            bind: self.bind_address,
             router: RouterConfiguration {
                 advertised_host: self.advertised_host.clone(),
                 advertised_port: self.advertised_port,

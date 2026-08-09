@@ -316,11 +316,12 @@ pub(crate) async fn prepare_network<D: NodeDirectory>(
     parts: PeerParts,
     directory: D,
 ) -> Result<PreparedPeerRuntime<D>, ConsumerError> {
-    let listener = BoundListener::bind(&parts.transport)
-        .await
-        .map_err(|error| PeerInitError::Listener {
-            message: format!("{error:#}"),
-        })?;
+    let listener =
+        BoundListener::bind(parts.bind)
+            .await
+            .map_err(|error| PeerInitError::Listener {
+                message: format!("{error:#}"),
+            })?;
     PreparedPeerRuntime::start(PeerInputs {
         directory,
         listener,

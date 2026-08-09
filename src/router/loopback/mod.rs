@@ -228,14 +228,13 @@ impl TestRouter {
     pub(crate) fn script_advertised(&self, index: u8, script: Script) {
         self.transport.script(advertised_port(index), script);
     }
+
+    pub(crate) const fn fleet(&self) -> &Arc<DestinationFleet> {
+        &self.fleet
+    }
 }
 
 impl Router for TestRouter {
-    #[cfg(test)]
-    fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
-    }
-
     fn route(
         &self,
         node: NodeId,

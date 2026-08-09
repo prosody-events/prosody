@@ -14,7 +14,7 @@ use crate::response::sender::{ResponseRoute, Then, TypedSender, prepare};
 use crate::router::directory::NodeDirectory;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::HANG_GUARD;
-use crate::router::{NodeId, RelayHop, ResponseSender, Router, RouterHandle, SendFailure};
+use crate::router::{NodeId, RelayHop, ResponseSender, RouterHandle, SendFailure};
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -88,7 +88,7 @@ fn a_same_node_response_uses_the_local_registry() -> Result<()> {
         let router = runtime.router.clone();
         let own = TypedSender::<CountingCodec, _>::new_route(
             Then(router.local().clone(), router.clone()),
-            router.fleet(),
+            &router.fleet,
         );
         let outcome = delivered_to_itself(&router, &own, &shared).await;
         runtime.shutdown(|| async {}).await?;

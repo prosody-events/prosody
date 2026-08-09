@@ -7,7 +7,6 @@ use crate::response::frame::FrameHeader;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
 use crate::response::{RequestId, ResponseStatus};
-use crate::router::Router;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{
     Delivery, Drained, Script, TestRouter, collect_deliveries, config, node, paused, port,

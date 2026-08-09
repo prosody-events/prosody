@@ -18,7 +18,6 @@ use crate::consumer::{EventHandler, Partition, Topic};
 use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::RequestId;
 use crate::response::headers::{RequestDeadline, RequestTag};
-use crate::router::Router;
 use crate::router::loopback::{Delivery, TestRouter, collect_deliveries, config, node};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
@@ -89,23 +88,6 @@ impl Codec for ResultProbeCodec {
         decode_result(buf)
     }
 
-    fn deserialize_owned(
-        &mut self,
-        buf: bytes::BytesMut,
-    ) -> Result<Self::Payload, ProbeCodecError> {
-        decode_result(&buf)
-    }
-
-    fn serialize(
-        &mut self,
-        payload: Self::Payload,
-        buf: &mut Vec<u8>,
-    ) -> Result<(), ProbeCodecError> {
-        SERIALIZES.set(SERIALIZES.get() + 1);
-        buf.push(discriminant(&payload));
-        Ok(())
-    }
-
     fn serialize_ref(
         &mut self,
         payload: &Self::Payload,
@@ -125,28 +107,6 @@ impl Codec for LargeProbeCodec {
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, ProbeCodecError> {
         decode_result(buf)
-    }
-
-    fn deserialize_owned(
-        &mut self,
-        buf: bytes::BytesMut,
-    ) -> Result<Self::Payload, ProbeCodecError> {
-        decode_result(&buf)
-    }
-
-    fn serialize(
-        &mut self,
-        payload: Self::Payload,
-        buf: &mut Vec<u8>,
-    ) -> Result<(), ProbeCodecError> {
-        SERIALIZES.set(SERIALIZES.get() + 1);
-        let byte = discriminant(&payload);
-        if payload.is_ok() {
-            buf.push(byte);
-        } else {
-            buf.resize(64 * 1024, byte);
-        }
-        Ok(())
     }
 
     fn serialize_ref(

@@ -197,10 +197,6 @@ pub(crate) trait RelayHop: Clone + Send + Sync + 'static {
 /// response path names one `R`. Address resolution belongs here, with the
 /// route call that can await it.
 pub(crate) trait Router: RelayHop {
-    /// The process-wide destination cache.
-    #[cfg(test)]
-    fn fleet(&self) -> &Arc<DestinationFleet>;
-
     /// The endpoints `node` may be dialed on from this process, in order. This
     /// is the responder's lookup, and [`choose_route`] decides what it answers.
     ///
@@ -312,11 +308,6 @@ impl<S: ResponseSender, D: NodeDirectory> RelayHop for RouterHandle<S, D> {
 }
 
 impl<S: ResponseSender, D: NodeDirectory> Router for RouterHandle<S, D> {
-    #[cfg(test)]
-    fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
-    }
-
     async fn route(&self, node: NodeId) -> Result<Option<Route>, D::Error> {
         let registration = self.addresses.resolve(node).await?;
         Ok(registration

@@ -1,12 +1,13 @@
 //! Peer listener registration and reflection.
 
-use super::{Harness, transport};
+use super::Harness;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::router::directory::tests::support::cassandra_directory;
 use crate::router::directory::{NodeDirectory, RegistrationTtl};
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::BoundListener;
 use crate::router::grpc::codec::ClientFrameCodec;
+use crate::router::loopback::listener::bind_address;
 use crate::router::runtime::{PeerInputs, RouterConfiguration, start_runtime};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -23,7 +24,7 @@ const REFLECTION: &str = "/grpc.reflection.v1.ServerReflection/ServerReflectionI
 fn a_registration_publishes_the_bound_port() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
-        let bound = BoundListener::bind(&transport()).await?;
+        let bound = BoundListener::bind(bind_address()).await?;
         let expected = bound.address().port();
         let router = RouterConfiguration::default();
         let directory = cassandra_directory(RegistrationTtl::DEFAULT.duration()).await?;
@@ -56,7 +57,7 @@ fn a_registration_publishes_the_bound_port() -> Result<()> {
 fn reflection_is_always_served() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
-        let harness = Harness::with(transport()).await?;
+        let harness = Harness::with(bind_address()).await?;
         let actual = reflect(harness.address.port).await;
         harness.stop().await?;
         ensure!(actual? == Code::Ok, "reflection returned another status");

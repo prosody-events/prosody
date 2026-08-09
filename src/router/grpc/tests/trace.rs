@@ -11,7 +11,6 @@ use super::{ALPHA, Harness, header, reaching, register};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{TypedSender, prepare};
-use crate::router::Router;
 use crate::test_util::{GlobalSpans, TEST_RUNTIME, named};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
