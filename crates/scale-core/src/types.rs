@@ -834,7 +834,7 @@ impl ActuationCommitments {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.launching.target_replicas.len() + self.rebalancing.is_some() as usize
+        self.launching.target_replicas.len() + usize::from(self.rebalancing.is_some())
     }
 
     const fn capacity(&self) -> usize {
@@ -1143,13 +1143,12 @@ impl ObservationBuffer {
             ActuationPhase::Launching {
                 from_replicas,
                 target_replicas,
-                requested_at: _,
+                ..
             } => (from_replicas, target_replicas, false),
             ActuationPhase::Rebalancing {
                 from_replicas,
                 target_replicas,
-                requested_at: _,
-                started_at: _,
+                ..
             } => (
                 from_replicas,
                 target_replicas,

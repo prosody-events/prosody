@@ -51,6 +51,9 @@ impl CapacityCurve {
     }
 
     /// Returns completed-attempt throughput at one live concurrency.
+    ///
+    /// This is the physical curve. Concurrency past the knee collapses
+    /// throughput. Use it to explain observed windows, never to plan supply.
     #[must_use]
     pub fn throughput(self, concurrency: f64) -> f64 {
         if concurrency <= 0.0_f64 {
@@ -72,6 +75,33 @@ impl CapacityCurve {
                 let excess = (concurrency - knee) / knee;
                 capacity_per_second / (1.0 + collapse * excess * excess)
             }
+        }
+    }
+
+    /// Returns the deliverable event rate for one slot allowance.
+    ///
+    /// A work-conserving consumer operates at the demand-driven concurrency,
+    /// not at its slot allowance. Idle slots therefore never push the plant
+    /// past its knee: the deliverable rate is the curve peak inside the
+    /// allowance, `min(slots / service_time, capacity)`. The knee ceiling on
+    /// the replica target itself comes from [`ScaleState`] through the
+    /// decision cap, not from this rate.
+    ///
+    /// [`ScaleState`]: crate::ScaleState
+    #[must_use]
+    pub fn sustainable_throughput(self, concurrency: f64) -> f64 {
+        if concurrency <= 0.0_f64 {
+            return 0.0;
+        }
+        match self {
+            Self::NoKnee {
+                service_time_seconds,
+            } => concurrency / service_time_seconds,
+            Self::Knee {
+                service_time_seconds,
+                capacity_per_second,
+                ..
+            } => (concurrency / service_time_seconds).min(capacity_per_second),
         }
     }
 }
@@ -1045,37 +1075,27 @@ fn curve_throughput<S: Simd>(
 ) {
     let lane_count = S::f64s::N;
     let vector_count = concurrency.len() / lane_count;
-    let (service_time_seconds, capacity_per_second, collapse, no_knee) = match curve {
+    let (service_time_seconds, ceiling) = match curve {
         CapacityCurve::NoKnee {
             service_time_seconds,
-        } => (service_time_seconds, 1.0_f64, 0.0_f64, true),
+        } => (service_time_seconds, f64::INFINITY),
         CapacityCurve::Knee {
             service_time_seconds,
             capacity_per_second,
-            collapse,
-        } => (service_time_seconds, capacity_per_second, collapse, false),
+            ..
+        } => (service_time_seconds, capacity_per_second),
     };
     let service_time = S::f64s::splat(simd, service_time_seconds);
-    let capacity = S::f64s::splat(simd, capacity_per_second);
-    let collapse = S::f64s::splat(simd, collapse);
-    let knee = capacity * service_time;
-    let one = S::f64s::splat(simd, 1.0_f64);
+    let capacity = S::f64s::splat(simd, ceiling);
     for vector in 0..vector_count {
         let start = vector * lane_count;
         let end = start + lane_count;
         let concurrency = S::f64s::from_slice(simd, &concurrency[start..end]);
-        let excess = (concurrency - knee) / knee;
-        let linear = concurrency / service_time;
-        let saturated = capacity / (one + collapse * excess * excess);
-        let throughput = if no_knee {
-            linear
-        } else {
-            concurrency.simd_le(knee).select(linear, saturated)
-        };
-        throughput.store_slice(&mut output[start..end]);
+        let sustainable = (concurrency / service_time).min(capacity);
+        sustainable.store_slice(&mut output[start..end]);
     }
     for candidate in vector_count * lane_count..concurrency.len() {
-        output[candidate] = curve.throughput(concurrency[candidate]);
+        output[candidate] = curve.sustainable_throughput(concurrency[candidate]);
     }
 }
 

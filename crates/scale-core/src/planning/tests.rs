@@ -1,4 +1,6 @@
-use super::{complete_horizon_micros, replica_seconds, select_action};
+use std::cmp::Ordering;
+
+use super::{ActionColumns, complete_horizon_micros, replica_seconds, select_action};
 
 #[test]
 fn complete_horizon_covers_the_latest_known_boundary_and_one_budget() {
@@ -20,70 +22,97 @@ fn complete_horizon_covers_the_latest_known_boundary_and_one_budget() {
 }
 #[test]
 fn action_selection_applies_the_chance_constraint_before_loss() {
-    let missed_work_sums = [2.0_f64, 1.0_f64, 0.0_f64];
-    let excess_delay_sums = [0.0_f64, 10.0_f64, 1.0_f64];
-    let replica_seconds_sums = [1.0_f64, 3.0_f64, 2.0_f64];
+    let columns = ActionColumns {
+        missed_work_sums: &[2.0_f64, 1.0_f64, 0.0_f64],
+        excess_delay_sums: &[0.0_f64, 10.0_f64, 1.0_f64],
+        replica_seconds_sums: &[1.0_f64, 3.0_f64, 2.0_f64],
+        demand_floor: 0,
+        event_count_sum: 100.0_f64,
+        epsilon: 0.01_f64,
+    };
 
-    let selected = select_action(
-        &missed_work_sums,
-        &excess_delay_sums,
-        &replica_seconds_sums,
-        100.0,
-        0.01,
-    );
-
-    assert_eq!(selected, 2);
+    assert_eq!(select_action(&columns), 2);
 }
 
 #[test]
-fn action_selection_minimizes_excess_delay_when_no_action_passes() {
-    let missed_work_sums = [20.0_f64, 10.0_f64, 2.0_f64];
-    let excess_delay_sums = [3.0_f64, 1.0_f64, 2.0_f64];
-    let replica_seconds_sums = [1.0_f64, 3.0_f64, 2.0_f64];
+fn action_selection_charges_only_avoidable_misses() {
+    let columns = ActionColumns {
+        missed_work_sums: &[20.0_f64, 10.5_f64, 10.0_f64],
+        excess_delay_sums: &[0.0_f64, 0.0_f64, 10.0_f64],
+        replica_seconds_sums: &[1.0_f64, 2.0_f64, 3.0_f64],
+        demand_floor: 0,
+        event_count_sum: 100.0_f64,
+        epsilon: 0.01_f64,
+    };
 
-    let selected = select_action(
-        &missed_work_sums,
-        &excess_delay_sums,
-        &replica_seconds_sums,
-        100.0,
-        0.01,
-    );
-
-    assert_eq!(selected, 1);
+    // Ten missed events are common to every action. The middle action sits
+    // inside the one-event allowance above the best action, so its lower
+    // replica-seconds win.
+    assert_eq!(select_action(&columns), 1);
 }
 
 #[test]
 fn action_selection_resolves_equal_loss_to_the_smallest_target() {
-    let missed_work_sums = [2.0_f64; 3];
-    let excess_delay_sums = [1.0_f64; 3];
-    let replica_seconds_sums = [1.0_f64; 3];
+    let columns = ActionColumns {
+        missed_work_sums: &[2.0_f64; 3],
+        excess_delay_sums: &[1.0_f64; 3],
+        replica_seconds_sums: &[1.0_f64; 3],
+        demand_floor: 0,
+        event_count_sum: 100.0_f64,
+        epsilon: 0.01_f64,
+    };
 
-    let selected = select_action(
-        &missed_work_sums,
-        &excess_delay_sums,
-        &replica_seconds_sums,
-        100.0_f64,
-        0.01_f64,
-    );
-
-    assert_eq!(selected, 0);
+    assert_eq!(select_action(&columns), 0);
 }
 
 #[test]
 fn action_selection_uses_replica_seconds_after_equal_loss() {
-    let missed_work_sums = [2.0_f64; 3];
-    let excess_delay_sums = [1.0_f64; 3];
-    let replica_seconds_sums = [3.0_f64, 1.0_f64, 2.0_f64];
+    let columns = ActionColumns {
+        missed_work_sums: &[2.0_f64; 3],
+        excess_delay_sums: &[1.0_f64; 3],
+        replica_seconds_sums: &[3.0_f64, 1.0_f64, 2.0_f64],
+        demand_floor: 0,
+        event_count_sum: 100.0_f64,
+        epsilon: 0.01_f64,
+    };
 
-    let selected = select_action(
-        &missed_work_sums,
-        &excess_delay_sums,
-        &replica_seconds_sums,
-        100.0_f64,
-        0.01_f64,
+    assert_eq!(select_action(&columns), 1);
+}
+
+#[test]
+fn the_demand_floor_excludes_actions_a_repair_overrides() {
+    let columns = ActionColumns {
+        missed_work_sums: &[0.0_f64; 3],
+        excess_delay_sums: &[0.0_f64; 3],
+        replica_seconds_sums: &[1.0_f64, 2.0_f64, 3.0_f64],
+        demand_floor: 1,
+        event_count_sum: 100.0_f64,
+        epsilon: 0.01_f64,
+    };
+
+    // Every action misses nothing, but the first action cannot serve the
+    // known arrival rate. The floor keeps replica-seconds from selecting
+    // an action the repair policy would immediately override.
+    assert_eq!(select_action(&columns), 1);
+}
+
+#[test]
+fn infeasible_actions_order_by_excess_delay() {
+    let columns = ActionColumns {
+        missed_work_sums: &[20.0_f64, 10.0_f64],
+        excess_delay_sums: &[3.0_f64, 1.0_f64],
+        replica_seconds_sums: &[1.0_f64, 3.0_f64],
+        demand_floor: 0,
+        event_count_sum: 100.0_f64,
+        epsilon: 0.01_f64,
+    };
+
+    // Both actions exceed a zero allowance, so expected excess delay
+    // orders them.
+    assert_eq!(
+        super::compare_actions(0, 1, &columns, 0.0_f64),
+        Ordering::Greater
     );
-
-    assert_eq!(selected, 1);
 }
 
 #[test]
@@ -93,5 +122,5 @@ fn replica_seconds_integrates_physical_membership_changes() {
 
     let area = replica_seconds(1.0_f64, 11.0_f64, 1, &targets, &membership_seconds);
 
-    assert_eq!(area, 26.0_f64);
+    assert!(area.total_cmp(&26.0_f64).is_eq(), "area={area}");
 }

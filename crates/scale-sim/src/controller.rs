@@ -1957,6 +1957,14 @@ impl<Workload> ClosedLoop<Workload> {
                 }
                 TransitionDirection::Up | TransitionDirection::Down => {}
             }
+            // A clamp can move the pending target back to its origin. That
+            // pending transition is no longer observable: censor it like
+            // any other superseded transition.
+            if pending.target_replicas == pending.from_replicas {
+                self.record_censored_transition(context, self.inflight_transitions[index])?;
+                self.inflight_transitions.remove(index);
+                continue;
+            }
             if pending.target_replicas == replicas {
                 if exact {
                     self.inflight_transitions.remove(index);

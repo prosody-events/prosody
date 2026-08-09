@@ -361,7 +361,7 @@ impl ArrivalFactor {
                 rates,
             );
             sample_path_counts(
-                random.clone().domain(0x6172_7269_7661_6c73),
+                &random.clone().domain(0x6172_7269_7661_6c73),
                 end_seconds,
                 rates,
                 length,
@@ -385,7 +385,7 @@ impl ArrivalFactor {
             if cursor >= duration_seconds {
                 let length = index + 1;
                 sample_path_counts(
-                    random.clone().domain(0x6172_7269_7661_6c73),
+                    &random.clone().domain(0x6172_7269_7661_6c73),
                     end_seconds,
                     rates,
                     length,
@@ -396,7 +396,7 @@ impl ArrivalFactor {
         }
         end_seconds[bound - 1] = duration_seconds;
         sample_path_counts(
-            random.clone().domain(0x6172_7269_7661_6c73),
+            &random.clone().domain(0x6172_7269_7661_6c73),
             end_seconds,
             rates,
             bound,
@@ -503,7 +503,12 @@ impl ArrivalFactor {
     }
 }
 
-fn sample_path_counts(random: RandomStream, end_seconds: &[f64], rates: &mut [f64], length: usize) {
+fn sample_path_counts(
+    random: &RandomStream,
+    end_seconds: &[f64],
+    rates: &mut [f64],
+    length: usize,
+) {
     let mut start = 0.0_f64;
     for segment in 0..length {
         let duration = end_seconds[segment] - start;

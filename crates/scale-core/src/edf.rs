@@ -13,6 +13,20 @@ pub(crate) struct EdfScratch {
 }
 
 impl EdfScratch {
+    pub(crate) fn new(cohort_count_max: u32) -> Result<Self, crate::ConfigurationError> {
+        let capacity = usize::try_from(cohort_count_max)
+            .map_err(|_| crate::ConfigurationError::PlatformLimit)?;
+        Ok(Self {
+            release_order: Vec::with_capacity(capacity),
+            deadline_order: Vec::with_capacity(capacity),
+            heap: Vec::with_capacity(capacity),
+            remaining: vec![0.0; capacity],
+            prepared_len: 0,
+            common_cohort: None,
+            ordered_deadlines: true,
+        })
+    }
+
     pub(crate) fn has_common_interval(&self) -> bool {
         self.common_cohort.is_some()
     }
@@ -121,20 +135,32 @@ impl DeadlineState {
         let mut remaining = duration;
         let mut queue_area = 0.0_f64;
         let mut late_area = 0.0_f64;
-        while remaining > f64::EPSILON {
-            let service_rate = if self.queue > f64::EPSILON {
-                capacity
-            } else {
-                capacity.min(arrival_rate)
-            };
+        // Rates stay constant across the call, so the state has few linear
+        // breakpoints: the initial debt completes once, the queue empties
+        // once, and the completion-due lead crosses zero at most once for
+        // each service regime. Each pass ends at the next breakpoint and
+        // resolves it exactly, so the pass budget below covers every case.
+        // The tail then integrates any numerical remainder without
+        // breakpoints, which keeps this loop free of stall states.
+        for _ in 0_u8..6 {
+            if remaining <= 0.0_f64 {
+                break;
+            }
+            let service_rate = self.service_rate(capacity, arrival_rate);
             let net_rate = arrival_rate - service_rate;
             let mut span = remaining;
-            if net_rate < -f64::EPSILON {
-                span = span.min(self.queue / -net_rate);
-            }
-            if self.completed < self.initial_debt && service_rate > f64::EPSILON {
-                span = span.min((self.initial_debt - self.completed) / service_rate);
-            }
+            let queue_crossing = if self.queue > 0.0_f64 && net_rate < 0.0_f64 {
+                self.queue / -net_rate
+            } else {
+                f64::INFINITY
+            };
+            span = span.min(queue_crossing);
+            let debt_crossing = if self.completed < self.initial_debt && service_rate > 0.0_f64 {
+                (self.initial_debt - self.completed) / service_rate
+            } else {
+                f64::INFINITY
+            };
+            span = span.min(debt_crossing);
             let actionable_rate = if self.completed >= self.initial_debt {
                 service_rate
             } else {
@@ -143,42 +169,95 @@ impl DeadlineState {
             let completion_lead = self.actionable_completed() - self.due;
             let lead_rate = actionable_rate - due_rate;
             if completion_lead * lead_rate < 0.0_f64 {
-                let crossing = -completion_lead / lead_rate;
-                if crossing > f64::EPSILON {
-                    span = span.min(crossing);
-                }
+                span = span.min(-completion_lead / lead_rate);
             }
-            if span <= f64::EPSILON {
-                if self.queue <= f64::EPSILON * capacity.max(1.0_f64) {
-                    self.queue = 0.0_f64;
-                }
-                if self.initial_debt - self.completed
-                    <= f64::EPSILON * self.initial_debt.max(1.0_f64)
-                {
-                    self.completed = self.initial_debt.max(self.completed);
-                }
-                continue;
+            let span = span.max(0.0_f64);
+            self.integrate(
+                span,
+                service_rate,
+                arrival_rate,
+                due_rate,
+                &mut queue_area,
+                &mut late_area,
+            );
+            if queue_crossing <= span {
+                self.queue = 0.0_f64;
             }
-            let late_before = self.late_work();
-            if due_rate > f64::EPSILON
-                && (completion_lead < -f64::EPSILON
-                    || (completion_lead.abs() <= f64::EPSILON && lead_rate < 0.0_f64))
-            {
-                self.missed += due_rate * span;
+            if debt_crossing <= span {
+                self.completed = self.completed.max(self.initial_debt);
             }
-            queue_area += self.queue * span + 0.5_f64 * net_rate * span * span;
-            self.queue = (self.queue + net_rate * span).max(0.0_f64);
-            self.completed += service_rate * span;
-            self.released += arrival_rate * span;
-            self.due += due_rate * span;
-            self.update_shortfall();
-            late_area += 0.5_f64 * (late_before + self.late_work()) * span;
             remaining -= span;
+        }
+        if remaining > 0.0_f64 {
+            let service_rate = self.service_rate(capacity, arrival_rate);
+            self.integrate(
+                remaining,
+                service_rate,
+                arrival_rate,
+                due_rate,
+                &mut queue_area,
+                &mut late_area,
+            );
         }
         DeadlineAdvance {
             queue_area,
             late_area,
         }
+    }
+
+    fn service_rate(&self, capacity: f64, arrival_rate: f64) -> f64 {
+        if self.queue > 0.0_f64 {
+            capacity
+        } else {
+            capacity.min(arrival_rate)
+        }
+    }
+
+    fn integrate(
+        &mut self,
+        span: f64,
+        service_rate: f64,
+        arrival_rate: f64,
+        due_rate: f64,
+        queue_area: &mut f64,
+        late_area: &mut f64,
+    ) {
+        let net_rate = arrival_rate - service_rate;
+        let actionable_rate = if self.completed >= self.initial_debt {
+            service_rate
+        } else {
+            0.0_f64
+        };
+        let completion_lead = self.actionable_completed() - self.due;
+        let lead_rate = actionable_rate - due_rate;
+        if due_rate > 0.0_f64 {
+            let bound = self.ledger_error_bound();
+            let lead = if completion_lead.abs() <= bound {
+                0.0_f64
+            } else {
+                completion_lead
+            };
+            self.missed += due_rate * behind_duration(lead, lead_rate, span);
+        }
+        let late_before = self.late_work();
+        *queue_area += self.queue * span + 0.5_f64 * net_rate * span * span;
+        self.queue = (self.queue + net_rate * span).max(0.0_f64);
+        self.completed += service_rate * span;
+        self.released += arrival_rate * span;
+        self.due += due_rate * span;
+        self.update_shortfall();
+        *late_area += 0.5_f64 * (late_before + self.late_work()) * span;
+    }
+
+    fn ledger_error_bound(&self) -> f64 {
+        8.0_f64
+            * f64::EPSILON
+            * self
+                .released
+                .max(self.completed)
+                .max(self.due)
+                .max(self.initial_debt)
+                .max(1.0_f64)
     }
 
     fn actionable_completed(&self) -> f64 {
@@ -325,22 +404,6 @@ pub(crate) struct EdfOutcome {
     pub(crate) late_area: f64,
     pub(crate) terminal_work: f64,
     pub(crate) terminal_late_work: f64,
-}
-
-impl EdfScratch {
-    pub(crate) fn new(cohort_count_max: u32) -> Result<Self, crate::ConfigurationError> {
-        let capacity = usize::try_from(cohort_count_max)
-            .map_err(|_| crate::ConfigurationError::PlatformLimit)?;
-        Ok(Self {
-            release_order: Vec::with_capacity(capacity),
-            deadline_order: Vec::with_capacity(capacity),
-            heap: Vec::with_capacity(capacity),
-            remaining: vec![0.0; capacity],
-            prepared_len: 0,
-            common_cohort: None,
-            ordered_deadlines: true,
-        })
-    }
 }
 
 pub(crate) fn prepare(cohorts: &WorkCohorts, scratch: &mut EdfScratch) {
@@ -522,61 +585,56 @@ pub(crate) fn evaluate_prepared_step(
     }
 }
 
+/// Clamps one event step to the next supply or arrival boundary.
+fn shared_boundary_micros(
+    trajectory: &SupplyTrajectory<'_>,
+    future_arrivals: &ArrivalPath<'_>,
+    now_micros: u64,
+    budget_seconds: f64,
+    mut next_micros: u64,
+) -> u64 {
+    if let Some(boundary) = trajectory.next_boundary_micros(now_micros) {
+        next_micros = next_micros.min(boundary);
+    }
+    let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
+    if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
+        next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
+    }
+    if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds) {
+        next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
+    }
+    next_micros
+}
+
 pub(crate) fn evaluate_prepared_trajectory(
     cohorts: &WorkCohorts,
     trajectory: &SupplyTrajectory<'_>,
-    start_micros: u64,
-    horizon_micros: u64,
-    initial_debt_work: f64,
-    deadline_budget_micros: u64,
+    window: EvaluationWindow,
     future_arrivals: &ArrivalPath<'_>,
     scratch: &mut EdfScratch,
 ) -> EdfOutcome {
     if let Some(common) = scratch.common_cohort {
-        return evaluate_common_trajectory(
-            common,
-            trajectory,
-            start_micros,
-            horizon_micros,
-            initial_debt_work,
-            deadline_budget_micros,
-            future_arrivals,
-        );
+        return evaluate_common_trajectory(common, trajectory, window, future_arrivals);
     }
     if scratch.ordered_deadlines {
-        return evaluate_ordered_trajectory(
-            cohorts,
-            trajectory,
-            start_micros,
-            horizon_micros,
-            initial_debt_work,
-            deadline_budget_micros,
-            future_arrivals,
-            scratch,
-        );
+        return evaluate_ordered_trajectory(cohorts, trajectory, window, future_arrivals, scratch);
     }
-    evaluate_general_trajectory(
-        cohorts,
-        trajectory,
-        start_micros,
-        horizon_micros,
-        initial_debt_work,
-        deadline_budget_micros,
-        future_arrivals,
-        scratch,
-    )
+    evaluate_general_trajectory(cohorts, trajectory, window, future_arrivals, scratch)
 }
 
 fn evaluate_ordered_trajectory(
     cohorts: &WorkCohorts,
     trajectory: &SupplyTrajectory<'_>,
-    start_micros: u64,
-    horizon_micros: u64,
-    initial_debt_work: f64,
-    deadline_budget_micros: u64,
+    window: EvaluationWindow,
     future_arrivals: &ArrivalPath<'_>,
     scratch: &mut EdfScratch,
 ) -> EdfOutcome {
+    let EvaluationWindow {
+        start_micros,
+        horizon_micros,
+        initial_debt_work,
+        deadline_budget_micros,
+    } = window;
     shortfall_reset(cohorts, scratch);
     let mut release_cursor = 0_usize;
     let mut deadline_cursor = 0_usize;
@@ -589,18 +647,14 @@ fn evaluate_ordered_trajectory(
     let mut shortfall = 0.0_f64;
     let budget_seconds = Duration::from_micros(deadline_budget_micros).as_secs_f64();
     while now_micros < horizon_micros {
-        deadline.release(ordered_release(
+        ordered_boundaries(
             cohorts,
             scratch,
             &mut release_cursor,
-            now_micros,
-        ));
-        deadline.make_due(deadline_work(
-            cohorts,
-            scratch,
             &mut deadline_cursor,
+            &mut deadline,
             now_micros,
-        ));
+        );
         late_work += ordered_expire(
             cohorts,
             scratch,
@@ -615,20 +669,17 @@ fn evaluate_ordered_trajectory(
             let cohort = scratch.release_order[service_cursor] as usize;
             next_micros = next_micros.min(cohorts.deadline_micros(cohort));
         }
-        if let Some(boundary) = trajectory.next_boundary_micros(now_micros) {
-            next_micros = next_micros.min(boundary);
-        }
-        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
-        if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
-            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
-        }
-        if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
-        {
-            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
-        }
+        let next_micros = shared_boundary_micros(
+            trajectory,
+            future_arrivals,
+            now_micros,
+            budget_seconds,
+            next_micros,
+        );
         if next_micros <= now_micros {
             break;
         }
+        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
         let duration_seconds = Duration::from_micros(next_micros - now_micros).as_secs_f64();
         let capacity = trajectory.capacity_at_micros(now_micros);
         let advance = deadline.advance(
@@ -650,18 +701,14 @@ fn evaluate_ordered_trajectory(
         );
         now_micros = next_micros;
     }
-    deadline.release(ordered_release(
+    ordered_boundaries(
         cohorts,
         scratch,
         &mut release_cursor,
-        now_micros,
-    ));
-    deadline.make_due(deadline_work(
-        cohorts,
-        scratch,
         &mut deadline_cursor,
+        &mut deadline,
         now_micros,
-    ));
+    );
     ordered_expire(
         cohorts,
         scratch,
@@ -678,6 +725,24 @@ fn evaluate_ordered_trajectory(
         terminal_work: deadline.queue,
         terminal_late_work: deadline.late_work(),
     }
+}
+
+/// Applies release and due boundaries up to one instant.
+fn ordered_boundaries(
+    cohorts: &WorkCohorts,
+    scratch: &EdfScratch,
+    release_cursor: &mut usize,
+    deadline_cursor: &mut usize,
+    deadline: &mut DeadlineState,
+    now_micros: u64,
+) {
+    deadline.release(ordered_release(
+        cohorts,
+        scratch,
+        release_cursor,
+        now_micros,
+    ));
+    deadline.make_due(deadline_work(cohorts, scratch, deadline_cursor, now_micros));
 }
 
 fn ordered_release(
@@ -748,13 +813,16 @@ fn ordered_serve(
 pub(crate) fn evaluate_general_trajectory(
     cohorts: &WorkCohorts,
     trajectory: &SupplyTrajectory<'_>,
-    start_micros: u64,
-    horizon_micros: u64,
-    initial_debt_work: f64,
-    deadline_budget_micros: u64,
+    window: EvaluationWindow,
     future_arrivals: &ArrivalPath<'_>,
     scratch: &mut EdfScratch,
 ) -> EdfOutcome {
+    let EvaluationWindow {
+        start_micros,
+        horizon_micros,
+        initial_debt_work,
+        deadline_budget_micros,
+    } = window;
     shortfall_reset(cohorts, scratch);
     let mut release_cursor = 0_usize;
     let mut deadline_cursor = 0_usize;
@@ -784,20 +852,17 @@ pub(crate) fn evaluate_general_trajectory(
         if let Some(&cohort_index) = scratch.heap.first() {
             next_micros = next_micros.min(cohorts.deadline_micros(cohort_index as usize));
         }
-        if let Some(boundary) = trajectory.next_boundary_micros(now_micros) {
-            next_micros = next_micros.min(boundary);
-        }
-        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
-        if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
-            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
-        }
-        if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
-        {
-            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
-        }
+        let next_micros = shared_boundary_micros(
+            trajectory,
+            future_arrivals,
+            now_micros,
+            budget_seconds,
+            next_micros,
+        );
         if next_micros <= now_micros {
             break;
         }
+        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
         let duration_seconds = Duration::from_micros(next_micros - now_micros).as_secs_f64();
         let capacity = trajectory.capacity_at_micros(now_micros);
         let advance = deadline.advance(
@@ -840,12 +905,15 @@ pub(crate) fn evaluate_general_trajectory(
 fn evaluate_common_trajectory(
     cohort: CommonCohort,
     trajectory: &SupplyTrajectory<'_>,
-    start_micros: u64,
-    horizon_micros: u64,
-    initial_debt_work: f64,
-    deadline_budget_micros: u64,
+    window: EvaluationWindow,
     future_arrivals: &ArrivalPath<'_>,
 ) -> EdfOutcome {
+    let EvaluationWindow {
+        start_micros,
+        horizon_micros,
+        initial_debt_work,
+        deadline_budget_micros,
+    } = window;
     let mut now_micros = start_micros;
     let mut state = CommonState {
         late_work: initial_debt_work,
@@ -869,20 +937,17 @@ fn evaluate_common_trajectory(
         if state.released && !state.expired {
             next_micros = next_micros.min(cohort.deadline_micros);
         }
-        if let Some(boundary) = trajectory.next_boundary_micros(now_micros) {
-            next_micros = next_micros.min(boundary);
-        }
-        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
-        if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
-            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
-        }
-        if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
-        {
-            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
-        }
+        let next_micros = shared_boundary_micros(
+            trajectory,
+            future_arrivals,
+            now_micros,
+            budget_seconds,
+            next_micros,
+        );
         if next_micros <= now_micros {
             break;
         }
+        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
         let duration = Duration::from_micros(next_micros - now_micros).as_secs_f64();
         let capacity = trajectory.capacity_at_micros(now_micros);
         let advance = deadline.advance(
@@ -1120,10 +1185,67 @@ fn deadline_key(cohorts: &WorkCohorts, cohort_index: u32) -> (u64, u64, u32) {
     )
 }
 
+/// Returns the time inside one span with completion behind due work.
+///
+/// The lead is completion minus due work and moves linearly at `lead_rate`.
+/// Work becomes missed while the lead is negative, or while it sits at zero
+/// and falls.
+fn behind_duration(lead: f64, lead_rate: f64, span: f64) -> f64 {
+    if lead < 0.0_f64 {
+        if lead_rate > 0.0_f64 {
+            (-lead / lead_rate).min(span)
+        } else {
+            span
+        }
+    } else if lead == 0.0_f64 && lead_rate < 0.0_f64 {
+        span
+    } else if lead > 0.0_f64 && lead_rate < 0.0_f64 {
+        (span + lead / lead_rate).max(0.0_f64)
+    } else {
+        0.0_f64
+    }
+}
+
 fn seconds_to_micros(seconds: f64) -> u64 {
     (seconds * 1_000_000.0_f64) as u64
 }
 
 fn seconds_to_micros_ceil(seconds: f64) -> u64 {
     (seconds * 1_000_000.0_f64).ceil() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeadlineState, behind_duration};
+
+    /// The debt remainder sits between the ledger error bound and the span
+    /// resolution of a large capacity. A span-epsilon loop stalls here; the
+    /// breakpoint passes resolve it exactly.
+    #[test]
+    fn advance_terminates_on_a_debt_sliver() {
+        let mut state = DeadlineState::new(0.5_f64);
+        state.completed = 0.5_f64 - 1.0e-12_f64;
+        let advanced = state.advance(1.0_f64, 1.0e6_f64, 0.0_f64, 0.0_f64);
+
+        assert!(state.completed >= state.initial_debt);
+        assert!(advanced.queue_area >= 0.0_f64);
+    }
+
+    #[test]
+    fn behind_duration_integrates_each_lead_regime() {
+        let cases = [
+            (-1.0_f64, 0.5_f64, 2.0_f64),
+            (-1.0_f64, -1.0_f64, 4.0_f64),
+            (0.0_f64, -1.0_f64, 4.0_f64),
+            (1.0_f64, -0.5_f64, 2.0_f64),
+            (1.0_f64, 1.0_f64, 0.0_f64),
+        ];
+        for (lead, lead_rate, expected) in cases {
+            let behind = behind_duration(lead, lead_rate, 4.0_f64);
+            assert!(
+                behind.total_cmp(&expected).is_eq(),
+                "lead={lead} lead_rate={lead_rate} behind={behind}"
+            );
+        }
+    }
 }

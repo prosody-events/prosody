@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::time::Duration;
 
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
@@ -11,13 +12,17 @@ use crate::edf::{
 };
 use crate::lead_time::{LeadTimeFactor, sample_index};
 use crate::partition::PartitionFactor;
-use crate::planning::{compare_actions, complete_horizon_micros, replica_seconds, select_action};
+use crate::planning::{
+    ActionColumns, compare_actions, complete_horizon_micros, replica_seconds, select_action,
+};
 use crate::reliability::{RELIABILITY_BIN_COUNT, ReliabilityFactor};
-use crate::types::{CalendarForecast, WorkCohorts};
+use crate::types::{
+    ActuationCommitments, BacklogColumns, CalendarForecast, CohortColumns, WorkCohorts,
+};
 use crate::{
     ApplyDecision, ArrivalPosterior, CapacityCurve, CapacityGrid, Configuration,
-    ConfigurationError, DecisionDiagnostics, GroupObservation, HoldDecision, HoldReason, ModelTime,
-    PosteriorError, PosteriorQuery, RandomStream, ScaleDecision,
+    ConfigurationError, DecisionDiagnostics, DemandClass, GroupObservation, HoldDecision,
+    HoldReason, ModelTime, PosteriorError, PosteriorQuery, RandomStream, ScaleDecision,
 };
 use thiserror::Error;
 
@@ -30,7 +35,7 @@ const STRATIFICATION_SHIFT: u64 = 0x9e37_79b9_7f4a_7c15;
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecisionRejection {
-    /// Work misses the posterior planning deadline.
+    /// The scenario's missed events exceed the objective epsilon.
     Deadline = 1,
     /// Partition placement cannot serve the located work.
     PartitionPlacement = 2,
@@ -57,16 +62,14 @@ pub(crate) enum DecisionRandomDomain {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NumericalDecision {
     Resolved { target_index: usize },
-    Unresolved { smallest_credible_index: usize },
+    Unresolved { credible_index: usize },
 }
 
 impl NumericalDecision {
     const fn target_index(self) -> usize {
         match self {
             Self::Resolved { target_index } => target_index,
-            Self::Unresolved {
-                smallest_credible_index,
-            } => smallest_credible_index,
+            Self::Unresolved { credible_index } => credible_index,
         }
     }
 
@@ -87,6 +90,7 @@ pub struct ScaleState {
     lead_time: LeadTimeFactor,
     rebalance_time: LeadTimeFactor,
     current_replicas: u32,
+    standing_target: u32,
 }
 
 impl ScaleState {
@@ -118,6 +122,7 @@ impl ScaleState {
             lead_time,
             rebalance_time,
             current_replicas: 1,
+            standing_target: 0,
         })
     }
 
@@ -327,6 +332,7 @@ pub struct ScaleScratch {
     posterior_missed_work_sums: Vec<f64>,
     posterior_loss_sums: Vec<f64>,
     posterior_replica_seconds_sums: Vec<f64>,
+    posterior_supply_sums: Vec<f64>,
     bootstrap_missed_work_sums: Vec<f64>,
     bootstrap_loss_sums: Vec<f64>,
     bootstrap_replica_seconds_sums: Vec<f64>,
@@ -380,14 +386,16 @@ struct ScratchBounds {
     arrival_path_cell_count: usize,
 }
 
-struct ForecastScenario<'a> {
+struct ForecastScenario {
     scenario: usize,
     normal_events: f64,
     failure_events: f64,
     current_supply: f64,
     event_supply_factor: f64,
     curve: CapacityCurve,
-    calendar: Option<CalendarForecast<'a>>,
+    path_length: usize,
+    planning_horizon_micros: u64,
+    disturbance_horizon_micros: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -420,7 +428,7 @@ impl ScratchBounds {
         let replica_count_max = usize::try_from(configuration.replica_count_max)
             .map_err(|_| ConfigurationError::PlatformLimit)?;
         let work_cohort_count_max = partition_count
-            .checked_mul(crate::DemandClass::COUNT_USIZE)
+            .checked_mul(DemandClass::COUNT_USIZE)
             .and_then(|count| cohort_count_max.checked_add(count))
             .ok_or(ConfigurationError::PlatformLimit)?;
         let partition_offset_count = partition_count
@@ -438,10 +446,13 @@ impl ScratchBounds {
             partition_count,
             partition_offset_count,
             replica_count_max,
+            // Each candidate holds its own transition events plus at most
+            // one strictly-increasing repair for every replica target.
             trajectory_event_count_max: replica_count_max
                 .checked_mul(
                     replica_count_max
-                        .checked_add(1)
+                        .checked_mul(2)
+                        .and_then(|events| events.checked_add(1))
                         .ok_or(ConfigurationError::PlatformLimit)?,
                 )
                 .ok_or(ConfigurationError::PlatformLimit)?,
@@ -526,6 +537,7 @@ impl ScaleScratch {
             posterior_missed_work_sums: vec![0.0_f64; replica_count_max],
             posterior_loss_sums: vec![0.0_f64; replica_count_max],
             posterior_replica_seconds_sums: vec![0.0_f64; replica_count_max],
+            posterior_supply_sums: vec![0.0_f64; replica_count_max],
             bootstrap_missed_work_sums: vec![0.0_f64; replica_count_max],
             bootstrap_loss_sums: vec![0.0_f64; replica_count_max],
             bootstrap_replica_seconds_sums: vec![0.0_f64; replica_count_max],
@@ -631,9 +643,9 @@ impl ScaleScratch {
         let action_count = decision_action_count(self);
         for scenario in 0..self.active_scenario_count {
             let first = scenario * candidate_count;
-            for target in 0..action_count {
+            for (target, probability) in probabilities.iter_mut().enumerate().take(action_count) {
                 let rejects = self.scenario_rejection[first + target] & reason.bit() != 0;
-                probabilities[target] += f64::from(u8::from(rejects));
+                *probability += f64::from(u8::from(rejects));
             }
         }
         let sample_count = f64::from(self.decision_curve_sample_count);
@@ -722,23 +734,27 @@ pub fn step(
         state.current_replicas = replicas;
     }
 
-    select_target(
+    let decision = select_target(
         state,
         scratch,
         cohorts,
         backlog,
         calendar,
         actuation_commitments,
-    )
+    );
+    if let ScaleDecision::Apply(apply) = &decision {
+        state.standing_target = apply.target;
+    }
+    decision
 }
 
 fn select_target(
     state: &mut ScaleState,
     scratch: &mut ScaleScratch,
-    cohorts: &crate::types::CohortColumns,
-    backlog: &crate::types::BacklogColumns,
+    cohorts: &CohortColumns,
+    backlog: &BacklogColumns,
     calendar: Option<CalendarForecast<'_>>,
-    actuation_commitments: &crate::types::ActuationCommitments,
+    actuation_commitments: &ActuationCommitments,
 ) -> ScaleDecision {
     let (normal_events, failure_events) = demand_class_totals(cohorts, backlog);
     prepare_work_cohorts(state, scratch, cohorts, backlog);
@@ -795,7 +811,7 @@ fn evaluate_scenarios(
     normal_events: f64,
     failure_events: f64,
     calendar: Option<CalendarForecast<'_>>,
-    actuation_commitments: &crate::types::ActuationCommitments,
+    actuation_commitments: &ActuationCommitments,
     scenario_count: u32,
 ) {
     scratch.active_scenario_count = scenario_count as usize;
@@ -835,7 +851,8 @@ fn evaluate_scenarios(
             &mut scratch.posterior_resource_supply,
             &mut scratch.scenario_supply[scenario_first..scenario_last],
         ));
-        let current_supply = curve.throughput(current_concurrency) * event_supply_factor;
+        let current_supply =
+            curve.sustainable_throughput(current_concurrency) * event_supply_factor;
         let mut lead_random = decision_random(sample, DecisionRandomDomain::LeadTime);
         let lead_seconds = state.lead_time.sample_bucket_seconds(&mut lead_random);
         let mut rebalance_random = decision_random(sample, DecisionRandomDomain::Rebalance);
@@ -849,16 +866,30 @@ fn evaluate_scenarios(
             &mut scratch.partition_share_draws,
             &mut scratch.moved_partition_share,
         );
+        let (planning_horizon_micros, disturbance_horizon_micros) =
+            scenario_horizons(state, scratch, &lead_seconds, &pause_seconds);
+        let path_first = scenario * state.configuration.arrival_prior.path_segment_count_max();
+        let path_length = sample_scenario_path(
+            state,
+            scratch,
+            calendar,
+            sample,
+            path_first,
+            disturbance_horizon_micros,
+        );
         prepare_supply_trajectories(
             state,
             scratch,
-            current_supply,
-            &lead_seconds,
-            &pause_seconds,
+            &ScenarioDraws {
+                current_supply,
+                lead_seconds: &lead_seconds,
+                rebalance_seconds: &pause_seconds,
+                commitment_random: decision_random(sample, DecisionRandomDomain::Commitment),
+                path_first,
+                path_length,
+            },
             actuation_commitments,
-            decision_random(sample, DecisionRandomDomain::Commitment),
         );
-        let mut arrival_random = decision_random(sample, DecisionRandomDomain::Arrival);
         evaluate_forecast_scenario(
             state,
             scratch,
@@ -869,13 +900,67 @@ fn evaluate_scenarios(
                 current_supply,
                 event_supply_factor,
                 curve,
-                calendar,
+                path_length,
+                planning_horizon_micros,
+                disturbance_horizon_micros,
             },
-            &mut arrival_random,
         );
     }
     dispatch!(state.simd_level, simd => aggregate_scenario_values(simd, scratch));
     scratch.decision_curve_sample_count = scenario_count;
+}
+
+/// Returns the planning and disturbance horizons for one scenario.
+///
+/// The horizon covers the candidate transition and one reactive repair,
+/// every known deadline, and one budget past the last boundary. It does
+/// not depend on the candidate, so every action is judged over the same
+/// future.
+fn scenario_horizons(
+    state: &ScaleState,
+    scratch: &ScaleScratch,
+    lead_seconds: &[f64; 8],
+    pause_seconds: &[f64; 8],
+) -> (u64, u64) {
+    let transition_span_seconds = bucket_maximum(lead_seconds) + bucket_maximum(pause_seconds);
+    let report_horizon_micros = state
+        .model_time
+        .as_micros()
+        .saturating_add(state.configuration.report_interval_micros);
+    let response_horizon_micros =
+        report_horizon_micros.saturating_add(seconds_to_micros(2.0_f64 * transition_span_seconds));
+    let planning_horizon_micros = complete_horizon_micros(
+        report_horizon_micros,
+        response_horizon_micros,
+        scratch.resource_cohorts.deadline_max_micros(),
+        state.configuration.objective.budget_micros(),
+    );
+    let disturbance_horizon_micros =
+        planning_horizon_micros.saturating_sub(state.configuration.objective.budget_micros());
+    (planning_horizon_micros, disturbance_horizon_micros)
+}
+
+fn sample_scenario_path(
+    state: &ScaleState,
+    scratch: &mut ScaleScratch,
+    calendar: Option<CalendarForecast<'_>>,
+    sample: u32,
+    path_first: usize,
+    disturbance_horizon_micros: u64,
+) -> usize {
+    let start_seconds = Duration::from_micros(state.model_time.as_micros()).as_secs_f64();
+    let disturbance_horizon_seconds =
+        Duration::from_micros(disturbance_horizon_micros).as_secs_f64();
+    let path_last = path_first + state.configuration.arrival_prior.path_segment_count_max();
+    let mut arrival_random = decision_random(sample, DecisionRandomDomain::Arrival);
+    state.arrivals.sample_rate_path(
+        disturbance_horizon_seconds - start_seconds,
+        &mut arrival_random,
+        &mut scratch.scenario_arrival_path_end_seconds[path_first..path_last],
+        &mut scratch.scenario_arrival_path_rates[path_first..path_last],
+        calendar,
+        state.model_time.as_micros(),
+    )
 }
 
 fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
@@ -884,6 +969,7 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
     scratch.posterior_missed_work_sums.fill(0.0_f64);
     scratch.posterior_loss_sums.fill(0.0_f64);
     scratch.posterior_replica_seconds_sums.fill(0.0_f64);
+    scratch.posterior_supply_sums.fill(0.0_f64);
     for scenario in 0..scratch.active_scenario_count {
         let first = scenario * candidate_stride;
         let vector_count = candidate_count / S::f64s::N;
@@ -905,9 +991,12 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
                         simd,
                         &scratch.scenario_replica_seconds[cell..cell + S::f64s::N],
                     );
+            let supply = S::f64s::from_slice(simd, &scratch.posterior_supply_sums[target..last])
+                + S::f64s::from_slice(simd, &scratch.scenario_supply[cell..cell + S::f64s::N]);
             missed.store_slice(&mut scratch.posterior_missed_work_sums[target..last]);
             loss.store_slice(&mut scratch.posterior_loss_sums[target..last]);
             replica_seconds.store_slice(&mut scratch.posterior_replica_seconds_sums[target..last]);
+            supply.store_slice(&mut scratch.posterior_supply_sums[target..last]);
         }
         for target in vector_count * S::f64s::N..candidate_count {
             let cell = first + target;
@@ -915,6 +1004,7 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
             scratch.posterior_loss_sums[target] += scratch.scenario_shortfall[cell];
             scratch.posterior_replica_seconds_sums[target] +=
                 scratch.scenario_replica_seconds[cell];
+            scratch.posterior_supply_sums[target] += scratch.scenario_supply[cell];
         }
     }
 }
@@ -940,13 +1030,15 @@ fn numerical_decision_simd<S: Simd>(
     let scenario_count = scratch.active_scenario_count;
     let epsilon = state.configuration.objective.epsilon();
     let event_count_sum: f64 = scratch.scenario_event_count[..scenario_count].iter().sum();
-    let nominal_target = select_action(
-        &scratch.posterior_missed_work_sums[..candidate_count],
-        &scratch.posterior_loss_sums[..candidate_count],
-        &scratch.posterior_replica_seconds_sums[..candidate_count],
+    let demand_floor = demand_floor(state, scratch, candidate_count);
+    let nominal_target = select_action(&ActionColumns {
+        missed_work_sums: &scratch.posterior_missed_work_sums[..candidate_count],
+        excess_delay_sums: &scratch.posterior_loss_sums[..candidate_count],
+        replica_seconds_sums: &scratch.posterior_replica_seconds_sums[..candidate_count],
+        demand_floor,
         event_count_sum,
         epsilon,
-    );
+    });
     scratch.bootstrap_worse_counts.fill(0);
     for bootstrap in 0..DECISION_BOOTSTRAP_COUNT {
         scratch.bootstrap_missed_work_sums.fill(0.0_f64);
@@ -995,33 +1087,59 @@ fn numerical_decision_simd<S: Simd>(
                     weight * scratch.scenario_replica_seconds[first + target];
             }
         }
+        let columns = ActionColumns {
+            missed_work_sums: &scratch.bootstrap_missed_work_sums[..candidate_count],
+            excess_delay_sums: &scratch.bootstrap_loss_sums[..candidate_count],
+            replica_seconds_sums: &scratch.bootstrap_replica_seconds_sums[..candidate_count],
+            demand_floor,
+            event_count_sum,
+            epsilon,
+        };
+        let allowance = columns.missed_allowance();
         for target in 0..candidate_count {
-            if compare_actions(
-                nominal_target,
-                target,
-                &scratch.bootstrap_missed_work_sums[..candidate_count],
-                &scratch.bootstrap_loss_sums[..candidate_count],
-                &scratch.bootstrap_replica_seconds_sums[..candidate_count],
-                event_count_sum,
-                epsilon,
-            )
-            .is_lt()
-            {
+            if compare_actions(nominal_target, target, &columns, allowance).is_lt() {
                 scratch.bootstrap_worse_counts[target] += 1;
             }
         }
     }
+    let incumbent = usize::try_from(state.standing_target)
+        .ok()
+        .and_then(|target| target.checked_sub(1))
+        .filter(|index| *index < candidate_count);
     classify_paired_bootstrap(
         &scratch.bootstrap_worse_counts[..candidate_count],
         DECISION_BOOTSTRAP_COUNT,
         epsilon,
+        incumbent,
     )
 }
 
+/// Returns the smallest action index covering the known arrival rate.
+///
+/// See [`ActionColumns::demand_floor`] for the rule this enforces. The
+/// posterior mean supply column is non-decreasing, so the first covering
+/// index is the floor. When no action covers the rate, the largest action
+/// is the floor.
+fn demand_floor(state: &ScaleState, scratch: &ScaleScratch, candidate_count: usize) -> usize {
+    let expected_rate = state.arrivals.expected_rate(state.model_time.as_micros());
+    let required = expected_rate * f64::from(scratch.decision_curve_sample_count);
+    scratch.posterior_supply_sums[..candidate_count]
+        .partition_point(|supply| *supply < required)
+        .min(candidate_count.saturating_sub(1))
+}
+
+/// Classifies the bootstrap credible set into one numerical decision.
+///
+/// The credible set holds every action the paired bootstrap cannot rank
+/// below the nominal optimum at the SLO confidence. Inside that set the
+/// integral cannot distinguish the actions, so a credible standing target
+/// wins: a decision changes the target only on confident evidence, never
+/// on sampling noise or on feedback from its own last actuation.
 pub(crate) fn classify_paired_bootstrap(
     worse_counts: &[u32],
     bootstrap_count: u32,
     epsilon: f64,
+    incumbent: Option<usize>,
 ) -> NumericalDecision {
     let credible = |target: usize| {
         f64::from(worse_counts[target]) / f64::from(bootstrap_count) < 1.0_f64 - epsilon
@@ -1030,8 +1148,9 @@ pub(crate) fn classify_paired_bootstrap(
         .find(|&target| credible(target))
         .map_or(0, |target| target);
     if (smallest_credible_index + 1..worse_counts.len()).any(credible) {
+        let standing = incumbent.filter(|&index| credible(index));
         NumericalDecision::Unresolved {
-            smallest_credible_index,
+            credible_index: standing.map_or(smallest_credible_index, |index| index),
         }
     } else {
         NumericalDecision::Resolved {
@@ -1043,52 +1162,19 @@ pub(crate) fn classify_paired_bootstrap(
 fn evaluate_forecast_scenario(
     state: &ScaleState,
     scratch: &mut ScaleScratch,
-    forecast: &ForecastScenario<'_>,
-    random: &mut RandomStream,
+    forecast: &ForecastScenario,
 ) {
     let candidate_count = scratch.posterior_resource_supply.len();
     let action_count = decision_action_count(scratch);
     let scenario_first = forecast.scenario * candidate_count;
-    let budget_seconds =
-        Duration::from_micros(state.configuration.objective.budget_micros()).as_secs_f64();
     let start_seconds = Duration::from_micros(state.model_time.as_micros()).as_secs_f64();
-    let report_horizon_micros = state
-        .model_time
-        .as_micros()
-        .saturating_add(state.configuration.report_interval_micros);
-    let mut horizon_max_micros = report_horizon_micros;
-    for candidate_index in 0..action_count {
-        let first = scratch.trajectory_offsets[candidate_index] as usize;
-        let last = scratch.trajectory_offsets[candidate_index + 1] as usize;
-        let ready_micros = scratch.trajectory.ready_seconds[first..last]
-            .last()
-            .map_or(state.model_time.as_micros(), |ready| {
-                seconds_to_micros(*ready)
-            });
-        horizon_max_micros = horizon_max_micros.max(ready_micros);
-    }
-    let planning_horizon_micros = complete_horizon_micros(
-        report_horizon_micros,
-        horizon_max_micros,
-        scratch.resource_cohorts.deadline_max_micros(),
-        state.configuration.objective.budget_micros(),
-    );
-    let disturbance_horizon_micros =
-        planning_horizon_micros.saturating_sub(state.configuration.objective.budget_micros());
+    let planning_horizon_micros = forecast.planning_horizon_micros;
     let planning_horizon_seconds = Duration::from_micros(planning_horizon_micros).as_secs_f64();
     let disturbance_horizon_seconds =
-        Duration::from_micros(disturbance_horizon_micros).as_secs_f64();
+        Duration::from_micros(forecast.disturbance_horizon_micros).as_secs_f64();
     let path_segment_count = state.configuration.arrival_prior.path_segment_count_max();
     let path_first = forecast.scenario * path_segment_count;
-    let path_last = path_first + path_segment_count;
-    let path_length = state.arrivals.sample_rate_path(
-        disturbance_horizon_seconds - start_seconds,
-        random,
-        &mut scratch.scenario_arrival_path_end_seconds[path_first..path_last],
-        &mut scratch.scenario_arrival_path_rates[path_first..path_last],
-        forecast.calendar,
-        state.model_time.as_micros(),
-    );
+    let path_length = forecast.path_length;
     let partition_outcome = partition_deadline_outcome(
         state,
         scratch,
@@ -1136,6 +1222,38 @@ fn evaluate_forecast_scenario(
         candidate_chunk,
         0,
     );
+    normalize_scenario_outcomes(state, scratch, forecast, action_count);
+    for candidate_index in 0..action_count {
+        let cell = scenario_first + candidate_index;
+        let first = scratch.trajectory_offsets[candidate_index] as usize;
+        let last = scratch.trajectory_offsets[candidate_index + 1] as usize;
+        scratch.scenario_replica_seconds[cell] = replica_seconds(
+            start_seconds,
+            planning_horizon_seconds,
+            state.current_replicas,
+            &scratch.trajectory.targets[first..last],
+            &scratch.trajectory.pause_seconds[first..last],
+        );
+    }
+}
+
+/// Converts one scenario's raw outcomes into normalized decision cells.
+///
+/// The shortfall cell becomes excess delay for each served event budget.
+/// The missed cell keeps event units and adds the deterministic placement
+/// floor, so a candidate that cannot own the located work carries its
+/// unservable events in every scenario.
+fn normalize_scenario_outcomes(
+    state: &ScaleState,
+    scratch: &mut ScaleScratch,
+    forecast: &ForecastScenario,
+    action_count: usize,
+) {
+    let candidate_count = scratch.posterior_resource_supply.len();
+    let scenario_first = forecast.scenario * candidate_count;
+    let budget_seconds =
+        Duration::from_micros(state.configuration.objective.budget_micros()).as_secs_f64();
+    let located_events = forecast.normal_events + forecast.failure_events;
     for candidate in 0..action_count {
         let cell = scenario_first + candidate;
         let late_area = scratch.scenario_shortfall[cell];
@@ -1149,7 +1267,8 @@ fn evaluate_forecast_scenario(
             0.0_f64
         };
         let missed_work = scratch.scenario_missed_work[cell]
-            .max(scratch.scenario_partition_missed_work[forecast.scenario]);
+            .max(scratch.scenario_partition_missed_work[forecast.scenario])
+            + scratch.deterministic_loss[candidate] * located_events;
         scratch.scenario_missed_work[cell] = missed_work;
         let mut rejection = 0_u8;
         let miss_fraction =
@@ -1161,19 +1280,6 @@ fn evaluate_forecast_scenario(
             rejection |= DecisionRejection::PartitionPlacement.bit();
         }
         scratch.scenario_rejection[cell] = rejection;
-    }
-    for candidate_index in 0..action_count {
-        let cell = scenario_first + candidate_index;
-        let first = scratch.trajectory_offsets[candidate_index] as usize;
-        let last = scratch.trajectory_offsets[candidate_index + 1] as usize;
-        let horizon_seconds = planning_horizon_seconds;
-        scratch.scenario_replica_seconds[cell] = replica_seconds(
-            start_seconds,
-            horizon_seconds,
-            state.current_replicas,
-            &scratch.trajectory.targets[first..last],
-            &scratch.trajectory.pause_seconds[first..last],
-        );
     }
 }
 
@@ -1201,10 +1307,12 @@ fn evaluate_candidate_workers(
                     during: &shared.trajectory_during_supply[first..last],
                     after: &shared.trajectory_after_supply[first..last],
                 },
-                shared.model_time_micros,
-                shared.horizon_micros,
-                shared.resource_debt_events,
-                shared.deadline_budget_micros,
+                EvaluationWindow {
+                    start_micros: shared.model_time_micros,
+                    horizon_micros: shared.horizon_micros,
+                    initial_debt_work: shared.resource_debt_events,
+                    deadline_budget_micros: shared.deadline_budget_micros,
+                },
                 &shared.arrival_path,
                 &mut workspaces[0].edf,
             );
@@ -1286,18 +1394,31 @@ pub(crate) fn terminal_drain_area(backlog: f64, supply_per_second: f64) -> f64 {
     }
 }
 
+/// One scenario's sampled transition and disturbance context.
+struct ScenarioDraws<'a> {
+    current_supply: f64,
+    lead_seconds: &'a [f64; 8],
+    rebalance_seconds: &'a [f64; 8],
+    commitment_random: RandomStream,
+    path_first: usize,
+    path_length: usize,
+}
+
 fn prepare_supply_trajectories(
     state: &ScaleState,
     scratch: &mut ScaleScratch,
-    current_supply: f64,
-    lead_seconds: &[f64; 8],
-    rebalance_seconds: &[f64; 8],
-    actuation_commitments: &crate::types::ActuationCommitments,
-    commitment_random: RandomStream,
+    draws: &ScenarioDraws<'_>,
+    actuation_commitments: &ActuationCommitments,
 ) {
+    let current_supply = draws.current_supply;
+    let rebalance_seconds = draws.rebalance_seconds;
     let candidate_count = scratch.posterior_resource_supply.len();
-    let now_seconds =
-        sample_commitment_pauses(state, scratch, actuation_commitments, commitment_random);
+    let now_seconds = sample_commitment_pauses(
+        state,
+        scratch,
+        actuation_commitments,
+        &draws.commitment_random,
+    );
     scratch.trajectory.targets.clear();
     scratch.trajectory.pause_seconds.clear();
     scratch.trajectory.ready_overrides.clear();
@@ -1307,68 +1428,14 @@ fn prepare_supply_trajectories(
     scratch.trajectory_offsets[0] = 0;
     for candidate_index in 0..scratch.posterior_resource_supply.len() {
         let candidate = candidate_index as u32 + 1;
-        let first = scratch.trajectory.targets.len();
-        let rebalancing = actuation_commitments.rebalancing();
-        let committed_replicas = rebalancing.map_or(state.current_replicas, |commitment| {
-            push_trajectory_event(
-                scratch,
-                commitment.target_replicas,
-                now_seconds,
-                scratch.rebalancing_ready_seconds,
-            );
-            commitment.target_replicas
-        });
-        let fixed_event_count = scratch.trajectory.targets.len() - first;
-        if candidate != committed_replicas {
-            let candidate_direction = if candidate > committed_replicas {
-                TransitionDirection::Up
-            } else {
-                TransitionDirection::Down
-            };
-            for commitment_index in 0..actuation_commitments.launching_len() {
-                if actuation_commitments.launching_direction(commitment_index)
-                    != candidate_direction
-                    || !scratch.commitment_pause_seconds[commitment_index].is_finite()
-                {
-                    continue;
-                }
-                let target = match candidate_direction {
-                    TransitionDirection::Up => actuation_commitments
-                        .launching_target_replicas(commitment_index)
-                        .min(candidate),
-                    TransitionDirection::Down => actuation_commitments
-                        .launching_target_replicas(commitment_index)
-                        .max(candidate),
-                };
-                if target == committed_replicas
-                    || scratch.trajectory.targets[first..].contains(&target)
-                {
-                    continue;
-                }
-                push_trajectory_event(
-                    scratch,
-                    target,
-                    scratch.commitment_pause_seconds[commitment_index],
-                    f64::NAN,
-                );
-            }
-        }
-        if candidate != committed_replicas
-            && !scratch.trajectory.targets[first..].contains(&candidate)
-        {
-            let direction = if candidate > committed_replicas {
-                TransitionDirection::Up
-            } else {
-                TransitionDirection::Down
-            };
-            let sample = sample_index(direction, candidate.abs_diff(committed_replicas));
-            push_trajectory_event(
-                scratch,
-                candidate,
-                now_seconds + lead_seconds[sample],
-                f64::NAN,
-            );
-        }
+        let (first, fixed_event_count, committed_replicas) = push_candidate_events(
+            state,
+            scratch,
+            draws,
+            actuation_commitments,
+            candidate,
+            now_seconds,
+        );
         sort_trajectory_events(scratch, first + fixed_event_count);
         let mut write = first;
         let mut replicas = state.current_replicas;
@@ -1428,15 +1495,174 @@ fn prepare_supply_trajectories(
         scratch.trajectory.ready_seconds.truncate(write);
         scratch.trajectory.during_supply.truncate(write);
         scratch.trajectory.after_supply.truncate(write);
-        scratch.trajectory_offsets[candidate_index + 1] = write as u32;
+        append_reactive_repairs(
+            state,
+            scratch,
+            draws,
+            replicas,
+            active_after_supply,
+            active_ready,
+            now_seconds,
+        );
+        scratch.trajectory_offsets[candidate_index + 1] = scratch.trajectory.targets.len() as u32;
     }
+}
+
+/// Pushes one candidate's committed and requested transition events.
+///
+/// Returns the candidate's first event index, its fixed-event count, and
+/// the replica count the started rebalance commits.
+fn push_candidate_events(
+    state: &ScaleState,
+    scratch: &mut ScaleScratch,
+    draws: &ScenarioDraws<'_>,
+    actuation_commitments: &ActuationCommitments,
+    candidate: u32,
+    now_seconds: f64,
+) -> (usize, usize, u32) {
+    let first = scratch.trajectory.targets.len();
+    let rebalancing = actuation_commitments.rebalancing();
+    let committed_replicas = rebalancing.map_or(state.current_replicas, |commitment| {
+        push_trajectory_event(
+            scratch,
+            commitment.target_replicas,
+            now_seconds,
+            scratch.rebalancing_ready_seconds,
+        );
+        commitment.target_replicas
+    });
+    let fixed_event_count = scratch.trajectory.targets.len() - first;
+    if candidate != committed_replicas {
+        let candidate_direction = if candidate > committed_replicas {
+            TransitionDirection::Up
+        } else {
+            TransitionDirection::Down
+        };
+        for commitment_index in 0..actuation_commitments.launching_len() {
+            if actuation_commitments.launching_direction(commitment_index) != candidate_direction
+                || !scratch.commitment_pause_seconds[commitment_index].is_finite()
+            {
+                continue;
+            }
+            let target = match candidate_direction {
+                TransitionDirection::Up => actuation_commitments
+                    .launching_target_replicas(commitment_index)
+                    .min(candidate),
+                TransitionDirection::Down => actuation_commitments
+                    .launching_target_replicas(commitment_index)
+                    .max(candidate),
+            };
+            if target == committed_replicas || scratch.trajectory.targets[first..].contains(&target)
+            {
+                continue;
+            }
+            push_trajectory_event(
+                scratch,
+                target,
+                scratch.commitment_pause_seconds[commitment_index],
+                f64::NAN,
+            );
+        }
+    }
+    if candidate != committed_replicas && !scratch.trajectory.targets[first..].contains(&candidate)
+    {
+        let direction = if candidate > committed_replicas {
+            TransitionDirection::Up
+        } else {
+            TransitionDirection::Down
+        };
+        let sample = sample_index(direction, candidate.abs_diff(committed_replicas));
+        push_trajectory_event(
+            scratch,
+            candidate,
+            now_seconds + draws.lead_seconds[sample],
+            f64::NAN,
+        );
+    }
+    (first, fixed_event_count, committed_replicas)
+}
+
+/// Appends the reactive corrections one deterministic successor makes.
+///
+/// The controller replans from real evidence at every report. When a
+/// scenario's arrival rate exceeds the standing supply, the successor
+/// requests the smallest sufficient target at the next report boundary
+/// and receives it after the sampled transition time. Standing capacity
+/// therefore keeps its full value, while deferral pays one detection and
+/// one transition of exposure plus the repair's replica-seconds. The
+/// policy reads only the scenario's realized past, so it exposes no
+/// future outcome to action selection.
+fn append_reactive_repairs(
+    state: &ScaleState,
+    scratch: &mut ScaleScratch,
+    draws: &ScenarioDraws<'_>,
+    mut replicas: u32,
+    mut supply: f64,
+    mut ready: f64,
+    now_seconds: f64,
+) {
+    let action_count = decision_action_count(scratch);
+    let candidate_count = scratch.posterior_resource_supply.len();
+    let report_seconds =
+        Duration::from_micros(state.configuration.report_interval_micros).as_secs_f64();
+    let mut segment_start = 0.0_f64;
+    for segment in 0..draws.path_length {
+        let cell = draws.path_first + segment;
+        let segment_end = scratch.scenario_arrival_path_end_seconds[cell];
+        let begin_seconds = now_seconds + segment_start;
+        let end_seconds = now_seconds + segment_end;
+        segment_start = segment_end;
+        let rate = scratch.scenario_arrival_path_rates[cell];
+        if rate <= supply {
+            continue;
+        }
+        // One transition runs at a time: the successor acts once the
+        // active transition completes and the report shows the shortage.
+        let observed = begin_seconds.max(ready);
+        if observed >= end_seconds {
+            continue;
+        }
+        let intervals = ((observed - now_seconds) / report_seconds)
+            .ceil()
+            .max(1.0_f64);
+        let requested = now_seconds + intervals * report_seconds;
+        let target = repair_target(&scratch.posterior_resource_supply[..action_count], rate);
+        if target <= replicas {
+            continue;
+        }
+        let sample = sample_index(TransitionDirection::Up, target - replicas);
+        let pause = requested.max(ready) + draws.lead_seconds[sample];
+        let repair_ready = pause + draws.rebalance_seconds[sample];
+        let moved = scratch.moved_partition_counts
+            [(replicas as usize - 1) * candidate_count + target as usize - 1];
+        let retained = 1.0_f64 - scratch.moved_partition_share[moved as usize];
+        let after = scratch.posterior_resource_supply[target as usize - 1];
+        scratch.trajectory.targets.push(target);
+        scratch.trajectory.pause_seconds.push(pause);
+        scratch.trajectory.ready_overrides.push(f64::NAN);
+        scratch.trajectory.ready_seconds.push(repair_ready);
+        scratch.trajectory.during_supply.push(supply * retained);
+        scratch.trajectory.after_supply.push(after);
+        replicas = target;
+        supply = after;
+        ready = repair_ready;
+    }
+}
+
+/// Returns the smallest replica target whose supply covers one rate.
+///
+/// The supply column is non-decreasing. When no target covers the rate,
+/// the largest target is the best repair.
+fn repair_target(supply: &[f64], rate: f64) -> u32 {
+    let index = supply.partition_point(|value| *value < rate);
+    index.min(supply.len() - 1) as u32 + 1
 }
 
 fn sample_commitment_pauses(
     state: &ScaleState,
     scratch: &mut ScaleScratch,
-    commitments: &crate::types::ActuationCommitments,
-    random: RandomStream,
+    commitments: &ActuationCommitments,
+    random: &RandomStream,
 ) -> f64 {
     let now_seconds = Duration::from_micros(state.model_time.as_micros()).as_secs_f64();
     for index in 0..commitments.launching_len() {
@@ -1546,8 +1772,15 @@ fn seconds_to_micros(seconds: f64) -> u64 {
     (seconds * 1_000_000.0_f64) as u64
 }
 
+fn bucket_maximum(values: &[f64; 8]) -> f64 {
+    values.iter().copied().fold(0.0_f64, f64::max)
+}
+
 pub(crate) fn minimal_moved_partitions(partitions: u32, current: u32, target: u32) -> u32 {
-    assert!(partitions > 0 && current > 0 && target > 0);
+    assert!(
+        partitions > 0 && current > 0 && target > 0,
+        "partition and replica counts are one-based"
+    );
     let current = current.min(partitions);
     let target = target.min(partitions);
     let common = current.min(target);
@@ -1556,11 +1789,9 @@ pub(crate) fn minimal_moved_partitions(partitions: u32, current: u32, target: u3
     let current_extra = partitions % current;
     let target_extra = partitions % target;
     let overlap = match current_base.cmp(&target_base) {
-        std::cmp::Ordering::Less => common * current_base + common.min(current_extra),
-        std::cmp::Ordering::Greater => common * target_base + common.min(target_extra),
-        std::cmp::Ordering::Equal => {
-            common * current_base + common.min(current_extra).min(target_extra)
-        }
+        Ordering::Less => common * current_base + common.min(current_extra),
+        Ordering::Greater => common * target_base + common.min(target_extra),
+        Ordering::Equal => common * current_base + common.min(current_extra).min(target_extra),
     };
     partitions.saturating_sub(overlap)
 }
@@ -1586,8 +1817,8 @@ fn moved_partition_count_matrix(
 fn prepare_work_cohorts(
     state: &ScaleState,
     scratch: &mut ScaleScratch,
-    cohorts: &crate::types::CohortColumns,
-    backlog: &crate::types::BacklogColumns,
+    cohorts: &CohortColumns,
+    backlog: &BacklogColumns,
 ) {
     let handler_seconds = state.capacity.expected_service_time(state.simd_level);
     scratch.handler_cohorts.clear();
@@ -1627,7 +1858,7 @@ fn prepare_work_cohorts(
             continue;
         }
         let offered_events = f64::from(backlog.event_count(backlog_index));
-        let partition = backlog_index as u32 / crate::DemandClass::COUNT;
+        let partition = backlog_index as u32 / DemandClass::COUNT;
         scratch.handler_cohorts.push_values(
             release_micros,
             deadline_micros,
@@ -1785,10 +2016,7 @@ fn decision_action_count(scratch: &ScaleScratch) -> usize {
         })
 }
 
-fn demand_class_totals(
-    cohorts: &crate::types::CohortColumns,
-    backlog: &crate::types::BacklogColumns,
-) -> (f64, f64) {
+fn demand_class_totals(cohorts: &CohortColumns, backlog: &BacklogColumns) -> (f64, f64) {
     let totals = cohorts.demand_totals();
     let backlog_totals = backlog.demand_totals();
     (totals.0 + backlog_totals.0, totals.1 + backlog_totals.1)

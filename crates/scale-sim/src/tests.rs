@@ -805,12 +805,13 @@ fn principal_regimes_exercise_distinct_failure_mechanisms() -> Result<(), TestEr
     );
     assert!(final_settle(&hot_key) > final_settle(&application));
     assert!(
-        timers
-            .settlements()
-            .iter()
-            .all(|settlement| settlement.release_micros == 1_000_000)
+        !timers.settlements().is_empty()
+            && timers
+                .settlements()
+                .iter()
+                .all(|settlement| settlement.release_micros == 120_000_000)
     );
-    assert_eq!(attempt_count(&transient), 2_400);
+    assert_eq!(attempt_count(&transient), 43_200);
     assert_eq!(
         rejected
             .settlements()
@@ -881,7 +882,17 @@ fn replica_ceiling_exposes_unmet_demand_at_the_limit() -> Result<(), TestError> 
         .collect::<Vec<_>>();
 
     assert!(targets.iter().all(|target| *target <= 8));
-    assert!(targets.contains(&8));
+    // The burst work is sunk before any transition can land, so the
+    // controller does not buy replicas that save nothing. The limit
+    // candidate's expected loss stays positive: the ceiling hides no
+    // unmet demand.
+    let exposed = (0..run.controller().len()).any(|index| {
+        run.controller()
+            .decision_expected_losses(index)
+            .and_then(|losses| losses.last().copied())
+            .is_some_and(|loss| loss > 0.0_f64)
+    });
+    assert!(exposed);
     Ok(())
 }
 
