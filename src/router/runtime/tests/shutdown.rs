@@ -24,7 +24,7 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
         ensure!(
             process
                 .runtime
-                .router
+                .network
                 .addresses
                 .resolve(node)
                 .await?

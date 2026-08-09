@@ -14,7 +14,7 @@ use crate::response::sender::{ResponseRoute, Then, deliver_response, stage as st
 use crate::router::directory::NodeDirectory;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::HANG_GUARD;
-use crate::router::{NodeId, RelayHop, ResponseSender, RouterHandle, SendFailure};
+use crate::router::{NetworkRoute, NodeId, RelayHop, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -85,9 +85,9 @@ fn a_same_node_response_uses_the_local_registry() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let Process { runtime, shared } = Process::new().await?;
-        let router = runtime.router.clone();
-        let own = Then(router.local().clone(), router.clone());
-        let outcome = delivered_to_itself(&router, &own, &shared).await;
+        let network = runtime.network.clone();
+        let own = Then(runtime.local.clone(), network.clone());
+        let outcome = delivered_to_itself(&network, &own, &shared).await;
         runtime.shutdown(|| async {}).await?;
         outcome
     })
@@ -95,16 +95,16 @@ fn a_same_node_response_uses_the_local_registry() -> Result<()> {
 
 /// Sends one response to this process's own node id and waits for the registry.
 async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
-    router: &RouterHandle<GrpcSender, D>,
+    network: &NetworkRoute<GrpcSender, D>,
     own: &R,
     shared: &Shared,
 ) -> Result<()> {
     ensure!(
-        Arc::ptr_eq(&router.fleet, &shared.fleet),
+        Arc::ptr_eq(&network.fleet, &shared.fleet),
         "the runtime's router must reserve from the process's own fleet"
     );
     ensure!(
-        router
+        network
             .direct(shared.node)
             .await
             .map_err(|error| eyre!("{error}"))?

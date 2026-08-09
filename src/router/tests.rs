@@ -1,5 +1,5 @@
 use super::{
-    LocalTarget, NetworkRouter, NodeId, Preference, RelayHop, RouterHandle, SendFailure,
+    LocalTarget, NetworkRoute, NetworkRouter, NodeId, Preference, RelayHop, SendFailure,
     choose_route,
 };
 use crate::requester::registry::PendingRegistry;
@@ -415,10 +415,9 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
     })
 }
 
-fn test_router(directory: TestDirectory) -> Result<RouterHandle<LoopbackSender, TestDirectory>> {
+fn test_router(directory: TestDirectory) -> Result<NetworkRoute<LoopbackSender, TestDirectory>> {
     let (transport, _recorded) = LoopbackSender::new();
-    Ok(RouterHandle::new(
-        LocalTarget::new(NodeId::new(), PendingRegistry::new()),
+    Ok(NetworkRoute::new(
         AddressResolver::new(CACHE_CAPACITY, directory),
         Arc::new(DestinationFleet::new(FleetConfiguration::default())?),
         Arc::new(transport),

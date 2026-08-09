@@ -13,7 +13,7 @@ use crate::response::headers::RequestDeadline;
 use crate::response::sender::{DropReason, ResponseRoute, RouteOutcome, Then};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::grpc::client::GrpcSender;
-use crate::router::{LocalTarget, RouterHandle};
+use crate::router::{LocalTarget, NetworkRoute};
 use crate::state_reader::CassandraReaderBackend;
 use std::future::Future;
 
@@ -51,7 +51,7 @@ pub struct LocalRouter {
 
 /// A local-first gRPC router for Cassandra clients.
 pub struct GrpcRouter {
-    inner: PeerRouter<Then<LocalTarget, RouterHandle<GrpcSender, CassandraNodeDirectory>>>,
+    inner: PeerRouter<Then<LocalTarget, NetworkRoute<GrpcSender, CassandraNodeDirectory>>>,
 }
 
 /// The opaque local response route selected by [`LocalRouter`].
@@ -65,7 +65,7 @@ pub struct LocalResponseRoute {
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct GrpcResponseRoute {
-    route: Then<LocalTarget, RouterHandle<GrpcSender, CassandraNodeDirectory>>,
+    route: Then<LocalTarget, NetworkRoute<GrpcSender, CassandraNodeDirectory>>,
 }
 
 impl LocalRouter {

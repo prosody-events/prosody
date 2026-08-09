@@ -12,7 +12,7 @@ use crate::router::grpc::health::RuntimeHealth;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
 use crate::router::relay::Relay;
-use crate::router::{LocalTarget, NodeId, RouterHandle};
+use crate::router::{LocalTarget, NetworkRoute, NodeId};
 use rand::RngExt;
 use std::future::Future;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ pub(in crate::router) use tests::start_runtime;
 ///
 /// The runtime holds this node's published registration, the resolver it reads
 /// peers through, the bound listener, the destination fleet, the pending
-/// request registry, and the router responses leave by. Consumers and
+/// request registry, and the local and network response routes. Consumers and
 /// requesters take handles from it and construct none of these themselves. It
 /// mints one [`NodeId`] and the listener answers for that same id, so one
 /// runtime has one identity. One process runs one runtime.
@@ -72,7 +72,8 @@ pub(in crate::router) use tests::start_runtime;
 /// a method on it, and writes the parameter nowhere. An owner infers `D` where
 /// it prepares the runtime, and moves the whole runtime into a task of its own.
 pub(crate) struct PeerRuntime<D> {
-    router: RouterHandle<GrpcSender, D>,
+    local: LocalTarget,
+    network: NetworkRoute<GrpcSender, D>,
     /// The write side of the directory. The resolver beside it only reads, so
     /// the two directions stay separate types rather than one that does both.
     directory: D,
@@ -95,7 +96,8 @@ pub(crate) struct PeerRuntime<D> {
 /// `activate` or [`abandon`](Self::abandon). A plain drop detaches the listener
 /// task, and a retry on the same port then fails to bind.
 pub(crate) struct PreparedPeerRuntime<D> {
-    router: RouterHandle<GrpcSender, D>,
+    local: LocalTarget,
+    network: NetworkRoute<GrpcSender, D>,
     directory: D,
     registration: NodeRegistration,
     heartbeats: HeartbeatRegistry,
@@ -169,8 +171,8 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         };
         let registration = registration(NodeId::new(), &inputs.listener, discovered, inputs.router);
         let addresses = AddressResolver::new(inputs.fleet.peer_capacity, directory.clone());
-        let router = RouterHandle::new(
-            LocalTarget::new(registration.node, Arc::clone(&pending)),
+        let local = LocalTarget::new(registration.node, Arc::clone(&pending));
+        let network = NetworkRoute::new(
             addresses.clone(),
             Arc::clone(&fleet),
             transport,
@@ -179,7 +181,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         let (stop_listener, stopped) = oneshot::channel();
         let listener = match serve(
             inputs.listener,
-            PeerService::new(router.local().clone(), Relay::new(router.clone())),
+            PeerService::new(local.clone(), Relay::new(network.clone())),
             RuntimeHealth::new(inputs.heartbeats.clone()),
             async move { drop(stopped.await) },
         ) {
@@ -190,7 +192,8 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
             }
         };
         Ok(Self {
-            router,
+            local,
+            network,
             directory,
             registration,
             heartbeats: inputs.heartbeats,
@@ -229,7 +232,8 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
             stopped,
         ));
         Ok(PeerRuntime {
-            router: self.router,
+            local: self.local,
+            network: self.network,
             directory: self.directory,
             registration: self.registration,
             stop_refresh,
@@ -240,13 +244,13 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
     }
 
     /// Returns the local-first response route for this runtime.
-    pub(crate) fn response_route(&self) -> Then<LocalTarget, RouterHandle<GrpcSender, D>> {
-        Then(self.router.local().clone(), self.router.clone())
+    pub(crate) fn response_route(&self) -> Then<LocalTarget, NetworkRoute<GrpcSender, D>> {
+        Then(self.local.clone(), self.network.clone())
     }
 
     /// Stops every local resource without publishing the node.
     pub(crate) async fn abandon(self) {
-        self.router.local.registry.terminate();
+        self.local.registry.terminate();
         abandon(self.stop_listener, self.listener).await;
     }
 }
@@ -308,7 +312,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
 
     /// The process-wide pending request registry.
     pub(crate) const fn pending(&self) -> &Arc<PendingRegistry> {
-        &self.router.local.registry
+        &self.local.registry
     }
 
     /// Shuts this process's peer machinery down.
@@ -347,11 +351,12 @@ impl<D: NodeDirectory> PeerRuntime<D> {
             refresh,
             stop_listener,
             listener,
-            router,
+            local,
+            network,
         } = self;
 
-        let pending = Arc::clone(&router.local.registry);
-        drop(router);
+        let pending = Arc::clone(&local.registry);
+        drop((local, network));
         // `send_replace` rather than `send`: a refresh task that already exited
         // leaves no receiver, and that is not a failure.
         stop_refresh.send_replace(true);

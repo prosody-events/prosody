@@ -83,7 +83,7 @@ impl Process {
         .await?;
         Ok(Self {
             shared: Shared {
-                fleet: Arc::clone(&runtime.router.fleet),
+                fleet: Arc::clone(&runtime.network.fleet),
                 pending: Arc::clone(runtime.pending()),
                 listener,
                 node: runtime.node(),

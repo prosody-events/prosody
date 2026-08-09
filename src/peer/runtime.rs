@@ -15,7 +15,7 @@ use crate::router::grpc::client::GrpcSender;
 use crate::router::runtime::{
     LocalPeerRuntime, PeerInputs, PeerRuntime, PreparedLocalPeerRuntime, PreparedPeerRuntime,
 };
-use crate::router::{LocalTarget, NodeId, RouterHandle};
+use crate::router::{LocalTarget, NetworkRoute, NodeId};
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -120,7 +120,7 @@ impl ProducerHandle {
 }
 
 impl<D: NodeDirectory> PreparedRuntime for PreparedPeerRuntime<D> {
-    type Route = Then<LocalTarget, RouterHandle<GrpcSender, D>>;
+    type Route = Then<LocalTarget, NetworkRoute<GrpcSender, D>>;
     type Running = PeerRuntime<D>;
 
     fn prepared_node(&self) -> NodeId {

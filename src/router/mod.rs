@@ -216,10 +216,9 @@ pub(crate) trait NetworkRouter: RelayHop {
     ) -> impl Future<Output = Result<Option<Route>, Self::Error>> + Send;
 }
 
-/// The production [`NetworkRouter`]: one required local target, cached peer
-/// addresses, one remote transport, and the process's destination fleet.
-pub(crate) struct RouterHandle<S, D> {
-    local: LocalTarget,
+/// The production [`NetworkRouter`]: cached peer addresses, one remote
+/// transport, and the process's destination fleet.
+pub(crate) struct NetworkRoute<S, D> {
     addresses: AddressResolver<D>,
     fleet: Arc<DestinationFleet>,
     transport: Arc<S>,
@@ -260,10 +259,9 @@ impl Display for NodeId {
 
 /// Cloning shares the cache, the fleet and the transport rather than copying
 /// them: one process has exactly one of each.
-impl<S, D: Clone> Clone for RouterHandle<S, D> {
+impl<S, D: Clone> Clone for NetworkRoute<S, D> {
     fn clone(&self) -> Self {
         Self {
-            local: self.local.clone(),
             addresses: self.addresses.clone(),
             fleet: Arc::clone(&self.fleet),
             transport: Arc::clone(&self.transport),
@@ -272,31 +270,24 @@ impl<S, D: Clone> Clone for RouterHandle<S, D> {
     }
 }
 
-impl<S, D> RouterHandle<S, D> {
+impl<S, D> NetworkRoute<S, D> {
     /// Binds one process's resolver, fleet and transport together.
     pub(in crate::router) fn new(
-        local: LocalTarget,
         addresses: AddressResolver<D>,
         fleet: Arc<DestinationFleet>,
         transport: Arc<S>,
         here: Option<NetworkId>,
     ) -> Self {
         Self {
-            local,
             addresses,
             fleet,
             transport,
             here,
         }
     }
-
-    /// This process's node id.
-    pub(crate) const fn local(&self) -> &LocalTarget {
-        &self.local
-    }
 }
 
-impl<S: ResponseSender, D: NodeDirectory> RelayHop for RouterHandle<S, D> {
+impl<S: ResponseSender, D: NodeDirectory> RelayHop for NetworkRoute<S, D> {
     type Error = D::Error;
     type Sender = S;
 
@@ -310,7 +301,7 @@ impl<S: ResponseSender, D: NodeDirectory> RelayHop for RouterHandle<S, D> {
     }
 }
 
-impl<S: ResponseSender, D: NodeDirectory> NetworkRouter for RouterHandle<S, D> {
+impl<S: ResponseSender, D: NodeDirectory> NetworkRouter for NetworkRoute<S, D> {
     fn destination(&self, node: NodeId) -> Arc<Destination> {
         self.fleet.destination(node)
     }
