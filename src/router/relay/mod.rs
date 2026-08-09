@@ -44,7 +44,8 @@ pub(crate) struct Relay<R> {
 impl<R: RelayHop> Relay<R> {
     /// Forwards through `router`.
     ///
-    /// [`RelayHop`] rather than the whole [`Router`](crate::router::Router):
+    /// [`RelayHop`] rather than the whole
+    /// [`NetworkRouter`](crate::router::NetworkRouter):
     /// the narrower trait offers no lookup that reads a declared label, so
     /// "a forwarder consulted the labels" is not writable here.
     pub(crate) const fn new(router: R) -> Self {

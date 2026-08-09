@@ -4,11 +4,11 @@
 //! A helper any two suites both need lives here rather than in either of them.
 
 use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
-use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
+use crate::router::fleet::{Destination, DestinationFleet};
 use crate::router::grpc::health::ProcessHealth;
 use crate::router::{
-    Framed, Host, NodeId, RelayHop, ResponseSender, Route, Router, SendFailure, choose_route,
+    Framed, Host, NetworkRouter, NodeId, RelayHop, ResponseSender, Route, SendFailure, choose_route,
 };
 use bytes::BytesMut;
 use parking_lot::Mutex;
@@ -228,13 +228,13 @@ impl TestRouter {
     pub(crate) fn script_advertised(&self, index: u8, script: Script) {
         self.transport.script(advertised_port(index), script);
     }
-
-    pub(crate) const fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
-    }
 }
 
-impl Router for TestRouter {
+impl NetworkRouter for TestRouter {
+    fn destination(&self, node: NodeId) -> Arc<Destination> {
+        self.fleet.destination(node)
+    }
+
     fn route(
         &self,
         node: NodeId,

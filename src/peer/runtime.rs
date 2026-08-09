@@ -4,10 +4,10 @@ use crate::Codec;
 use crate::PeerConfiguration;
 use crate::consumer::decode::{NoRequests, RequestAdmission, SubsystemRequests};
 use crate::consumer::middleware::providers::{FallibleCloneProvider, LeafHandler};
-use crate::consumer::middleware::respond::{RespondHandler, responding_provider};
+use crate::consumer::middleware::respond::{RespondHandler, Responder, responding_provider};
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::{ConsumerError, PeerInitError, ShutdownError};
-use crate::peer::{PeerBackend, PeerResponder, heartbeat_registry};
+use crate::peer::{PeerBackend, heartbeat_registry};
 use crate::producer::ProsodyProducer;
 use crate::requester::ProsodyRequester;
 use crate::requester::registry::PendingRegistry;
@@ -54,10 +54,10 @@ pub struct ProducerHandle {
     pending: Arc<PendingRegistry>,
 }
 
-/// Response route and fleet from one router.
+/// Response route from one router.
 #[doc(hidden)]
 pub struct ConsumerHandle<R> {
-    responses: PeerResponder<R>,
+    route: R,
 }
 
 /// Exclusive lifecycle ownership of one router.
@@ -75,12 +75,10 @@ pub(crate) struct PeerRouter<R> {
 
 /// The coordinator owned by one [`PeerRouter`].
 struct PeerOwner {
-    /// Sending a reply channel asks for the teardown report. Dropping this
-    /// sender asks the coordinator to stop and to log its report instead.
-    stop: oneshot::Sender<oneshot::Sender<Result<(), ShutdownError>>>,
-    /// Held so a caller that asked for the report can also observe a
-    /// coordinator that ended without one.
-    coordinator: JoinHandle<()>,
+    /// Sending or dropping asks the coordinator to stop.
+    stop: oneshot::Sender<()>,
+    /// The explicit teardown result.
+    coordinator: JoinHandle<Result<(), ShutdownError>>,
 }
 
 /// A prepared runtime selected by the backend type.
@@ -89,7 +87,7 @@ pub(crate) trait PreparedRuntime: Sized + Send {
     type Route: ResponseRoute;
 
     fn prepared_node(&self) -> NodeId;
-    fn responses(&self) -> PeerResponder<Self::Route>;
+    fn prepared_route(&self) -> Self::Route;
     fn launch(self) -> impl Future<Output = Result<Self::Running, (Self, ConsumerError)>> + Send;
     fn release(self) -> impl Future<Output = ()> + Send;
 }
@@ -136,7 +134,7 @@ impl<R> PeerRouter<R> {
 impl<R> ConsumerHandle<R> {
     pub(super) fn map_route<T>(self, map: impl FnOnce(R) -> T) -> ConsumerHandle<T> {
         ConsumerHandle {
-            responses: self.responses.map_route(map),
+            route: map(self.route),
         }
     }
 }
@@ -166,7 +164,7 @@ impl<R: ResponseRoute> ConsumerHandle<R> {
         H::Output: Sync + 'static,
         H::Error: Sync + 'static,
     {
-        let responder = Arc::new(self.responses.responder(subsystem.clone()));
+        let responder = Arc::new(Responder::new_route(self.route.clone(), subsystem.clone()));
         (
             responding_provider(middleware, handler, responder),
             RespondingPeer { subsystem },
@@ -198,18 +196,11 @@ impl PeerOwner {
     /// delete that fails after the coordinator applied it removes the row all
     /// the same, and the steps that follow the delete can fail after it.
     async fn stop(self) -> Result<(), ShutdownError> {
-        let (reply, report) = oneshot::channel();
-        // A closed receiver means the coordinator already ended, which the
-        // report read below reports as `Teardown`.
-        drop(self.stop.send(reply));
-        let report = report.await;
-        if let Err(error) = self.coordinator.await {
+        let _closed = self.stop.send(());
+        self.coordinator.await.map_err(|error| {
             error!(%error, "peer coordinator did not stop cleanly");
-        }
-        match report {
-            Ok(report) => report,
-            Err(_) => Err(ShutdownError::Teardown),
-        }
+            ShutdownError::Teardown
+        })?
     }
 }
 
@@ -237,8 +228,8 @@ impl<D: NodeDirectory> PreparedRuntime for PreparedPeerRuntime<D> {
         self.node()
     }
 
-    fn responses(&self) -> PeerResponder<Self::Route> {
-        PeerResponder::new(self.response_route(), Arc::clone(self.fleet()))
+    fn prepared_route(&self) -> Self::Route {
+        self.response_route()
     }
 
     async fn launch(self) -> Result<Self::Running, (Self, ConsumerError)> {
@@ -266,8 +257,8 @@ impl PreparedRuntime for PreparedLocalPeerRuntime {
         self.node()
     }
 
-    fn responses(&self) -> PeerResponder<Self::Route> {
-        PeerResponder::new(self.response_route(), Arc::clone(self.fleet()))
+    fn prepared_route(&self) -> Self::Route {
+        self.response_route()
     }
 
     async fn launch(self) -> Result<Self::Running, (Self, ConsumerError)> {
@@ -334,13 +325,8 @@ pub(crate) async fn prepare_network<D: NodeDirectory>(
     .map_err(Into::into)
 }
 
-pub(crate) fn prepare_local(
-    peer: &PeerConfiguration,
-) -> Result<PreparedLocalPeerRuntime, ConsumerError> {
-    let parts = peer.parts().map_err(PeerInitError::from)?;
-    PreparedLocalPeerRuntime::start(parts.fleet)
-        .map_err(PeerInitError::from)
-        .map_err(Into::into)
+pub(crate) fn prepare_local() -> PreparedLocalPeerRuntime {
+    PreparedLocalPeerRuntime::start()
 }
 
 /// Builds and starts the router selected by `B`.
@@ -367,17 +353,15 @@ where
     start_router(prepared).await
 }
 
-pub(crate) async fn start_local_router(
-    peer: &PeerConfiguration,
-) -> Result<PeerRouter<LocalTarget>, ConsumerError> {
-    start_router(prepare_local(peer)?).await
+pub(crate) async fn start_local_router() -> Result<PeerRouter<LocalTarget>, ConsumerError> {
+    start_router(prepare_local()).await
 }
 
 pub(super) async fn start_router<P: PreparedRuntime>(
     prepared: P,
 ) -> Result<PeerRouter<P::Route>, ConsumerError> {
     let node = prepared.prepared_node();
-    let responses = prepared.responses();
+    let route = prepared.prepared_route();
     let runtime = match prepared.launch().await {
         Ok(runtime) => runtime,
         Err((prepared, error)) => {
@@ -385,14 +369,21 @@ pub(super) async fn start_router<P: PreparedRuntime>(
             return Err(error);
         }
     };
+    Ok(finish_router(node, route, runtime))
+}
+
+fn finish_router<R, RT>(node: NodeId, route: R, runtime: RT) -> PeerRouter<R>
+where
+    RT: RunningRuntime,
+{
     let pending = Arc::clone(runtime.registry());
     let (stop, stopped) = oneshot::channel();
     let coordinator = tokio::spawn(run_coordinator(runtime, stopped));
-    Ok(PeerRouter {
+    PeerRouter {
         producer: ProducerHandle { node, pending },
-        consumer: ConsumerHandle { responses },
+        consumer: ConsumerHandle { route },
         owner: PeerOwner { stop, coordinator },
-    })
+    }
 }
 
 /// Owns the peer runtime until its owner asks for the teardown.
@@ -400,24 +391,16 @@ pub(super) async fn start_router<P: PreparedRuntime>(
 /// The runtime moves in here, which is what keeps the directory type out of
 /// [`ProsodyConsumer`](crate::consumer::ProsodyConsumer). A dropped stop sender
 /// is also a request to stop, so a consumer dropped without a shutdown still
-/// tears the peer down. Nothing waits for that teardown, so its report goes to
-/// the log.
+/// tears the peer down. Every teardown failure is logged before the task
+/// returns it, so canceling an explicit shutdown cannot discard the failure.
 async fn run_coordinator<R: RunningRuntime>(
     runtime: R,
-    stopped: oneshot::Receiver<oneshot::Sender<Result<(), ShutdownError>>>,
-) {
-    let reply = stopped.await;
+    stopped: oneshot::Receiver<()>,
+) -> Result<(), ShutdownError> {
+    drop(stopped.await);
     let report = runtime.stop(|| async {}).await;
-    match reply {
-        Ok(reply) => {
-            if let Err(report) = reply.send(report) {
-                error!(?report, "peer teardown report receiver closed");
-            }
-        }
-        Err(_) => {
-            if let Err(error) = report {
-                error!(%error, "peer teardown failed after its owner dropped");
-            }
-        }
+    if let Err(error) = &report {
+        error!(%error, "peer teardown failed");
     }
+    report
 }

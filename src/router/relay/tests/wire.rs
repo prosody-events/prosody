@@ -14,7 +14,7 @@ use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::listener::FixedRouter;
-use crate::router::{Host, NodeId, Preference, ResponseSender, Router, SendFailure};
+use crate::router::{Host, NetworkRouter, NodeId, Preference, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
 use crate::test_util::{GlobalMetrics, GlobalSpans, TEST_RUNTIME, label, named};
 use color_eyre::Result;
@@ -274,7 +274,7 @@ async fn crossing(pair: &Pair) -> Result<()> {
         format!("the rules chose {route:?}, which is not the target's entry point alone"),
     )?;
 
-    let sender = TypedSender::<CountingCodec, _>::new_route(router.clone(), router.fleet());
+    let sender = TypedSender::<CountingCodec, _>::new_route(router.clone());
     let payload = PAYLOAD.to_vec();
     let prepared = prepare::<CountingCodec>(
         FrameHeader {

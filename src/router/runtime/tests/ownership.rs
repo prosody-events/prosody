@@ -86,10 +86,10 @@ fn a_same_node_response_uses_the_local_registry() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let Process { runtime, shared } = Process::new().await?;
         let router = runtime.router.clone();
-        let own = TypedSender::<CountingCodec, _>::new_route(
-            Then(router.local().clone(), router.clone()),
-            &router.fleet,
-        );
+        let own = TypedSender::<CountingCodec, _>::new_route(Then(
+            router.local().clone(),
+            router.clone(),
+        ));
         let outcome = delivered_to_itself(&router, &own, &shared).await;
         runtime.shutdown(|| async {}).await?;
         outcome

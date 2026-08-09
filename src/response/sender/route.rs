@@ -7,8 +7,7 @@ use crate::response::ResponseDisposition;
 use crate::response::frame::FrameHeader;
 use crate::response::frame::encode::{Staged, stage as encode};
 use crate::response::headers::RequestDeadline;
-use crate::router::fleet::Destination;
-use crate::router::{Preference, ResponseSender, Router};
+use crate::router::{NetworkRouter, Preference, ResponseSender};
 use opentelemetry::Context;
 use std::future::Future;
 use tracing::field::Empty;
@@ -22,7 +21,6 @@ pub trait ResponseRoute: Clone + Send + Sync + 'static {
     fn deliver(
         &self,
         frame: Staged,
-        destination: &Destination,
         deadline: RequestDeadline,
     ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send;
 }
@@ -46,7 +44,6 @@ pub(super) async fn deliver_response<R: ResponseRoute>(
     router: &R,
     prepared: PreparedResponse,
     trace: Context,
-    destination: &Destination,
     deadline: RequestDeadline,
 ) -> bool {
     let header = prepared.header();
@@ -62,7 +59,7 @@ pub(super) async fn deliver_response<R: ResponseRoute>(
     carry_parent(&span, trace);
     let outcome = match prepared {
         PreparedResponse::Ready(frame) => {
-            deliver_route(destination, router, frame, deadline)
+            deliver_route(router, frame, deadline)
                 .instrument(span.clone())
                 .await
         }
@@ -103,12 +100,11 @@ pub(super) async fn deliver_response<R: ResponseRoute>(
 /// here, so the caller counts the whole outcome of one response in one
 /// place.
 async fn deliver_route<R: ResponseRoute>(
-    destination: &Destination,
     router: &R,
     frame: Staged,
     deadline: RequestDeadline,
 ) -> Result<Delivery, DropReason> {
-    match router.deliver(frame, destination, deadline).await? {
+    match router.deliver(frame, deadline).await? {
         RouteOutcome::Delivered(delivery) => Ok(delivery),
         RouteOutcome::Declined(_) => Err(DropReason::UnresolvableNode),
     }
@@ -118,7 +114,6 @@ impl ResponseRoute for LocalTarget {
     async fn deliver(
         &self,
         frame: Staged,
-        _destination: &Destination,
         _deadline: RequestDeadline,
     ) -> Result<RouteOutcome, DropReason> {
         if !self.owns(frame.target()) {
@@ -134,11 +129,10 @@ impl ResponseRoute for LocalTarget {
     }
 }
 
-impl<R: Router> ResponseRoute for R {
+impl<R: NetworkRouter> ResponseRoute for R {
     async fn deliver(
         &self,
         frame: Staged,
-        destination: &Destination,
         deadline: RequestDeadline,
     ) -> Result<RouteOutcome, DropReason> {
         let target = frame.target();
@@ -153,6 +147,7 @@ impl<R: Router> ResponseRoute for R {
                 return Err(DropReason::LookupFailed);
             }
         };
+        let destination = self.destination(target);
         let mut remembered = None;
         let mut last_failure = None;
         // The candidate that failed the turn before this one. Inside the loop it
@@ -210,11 +205,10 @@ impl<A: ResponseRoute, B: ResponseRoute> ResponseRoute for Then<A, B> {
     async fn deliver(
         &self,
         frame: Staged,
-        destination: &Destination,
         deadline: RequestDeadline,
     ) -> Result<RouteOutcome, DropReason> {
-        match self.0.deliver(frame, destination, deadline).await? {
-            RouteOutcome::Declined(frame) => self.1.deliver(frame, destination, deadline).await,
+        match self.0.deliver(frame, deadline).await? {
+            RouteOutcome::Declined(frame) => self.1.deliver(frame, deadline).await,
             delivered @ RouteOutcome::Delivered(_) => Ok(delivered),
         }
     }

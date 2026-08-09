@@ -18,7 +18,7 @@ use prosody::consumer::{
     CommonConfiguration, ConsumerConfiguration, ConsumerSetup, KeyedStateConfiguration,
     PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
-use prosody::peer::{LocalRouter, PeerConfiguration, Router};
+use prosody::peer::{LocalRouter, Router};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::telemetry::Telemetry;
 use prosody::tracing::init_test_logging;
@@ -90,7 +90,7 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         dedup: DeduplicationConfigurationBuilder::default().build()?,
         keyed_state: KeyedStateConfiguration::builder().build()?,
     };
-    let router = LocalRouter::new(&PeerConfiguration::default()).await?;
+    let router = LocalRouter::new().await?;
     let (_, consumer_router, router_owner) = router.split();
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(

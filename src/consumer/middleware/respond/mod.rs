@@ -37,7 +37,6 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::response::ResponseStatus;
 use crate::response::headers::RequestTag;
 use crate::response::sender::{ResponseRoute, TypedSender, prepare};
-use crate::router::fleet::DestinationFleet;
 use crate::subsystem::SubsystemName;
 use crate::timers::Trigger;
 use opentelemetry::Context;
@@ -108,13 +107,9 @@ pub(crate) struct RespondHandler<H, C: Codec, R: ResponseRoute> {
 
 impl<C: Codec, R: ResponseRoute> Responder<C, R> {
     /// Builds a responder from one statically composed response route.
-    pub(crate) fn new_route(
-        route: R,
-        fleet: &Arc<DestinationFleet>,
-        subsystem: SubsystemName,
-    ) -> Self {
+    pub(crate) fn new_route(route: R, subsystem: SubsystemName) -> Self {
         Self {
-            sender: TypedSender::new_route(route, fleet),
+            sender: TypedSender::new_route(route),
             subsystem,
         }
     }

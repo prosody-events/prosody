@@ -8,18 +8,14 @@ use self::route::{PreparedResponse, deliver_response, stage};
 use crate::codec::Codec;
 use crate::response::frame::FrameHeader;
 use crate::response::headers::RequestDeadline;
-use crate::router::fleet::DestinationFleet;
 use opentelemetry::Context;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 #[cfg(test)]
 mod tests;
 
 /// Encodes a typed response and sends it through one composed route.
 pub(crate) struct TypedSender<C: Codec, R: ResponseRoute> {
-    /// The route preferences shared by every response from this process.
-    fleet: Arc<DestinationFleet>,
     route: R,
     _codec: PhantomData<fn() -> C>,
 }
@@ -30,14 +26,8 @@ pub(crate) use route::{ResponseRoute, RouteOutcome, Then};
 
 impl<C: Codec, R: ResponseRoute> TypedSender<C, R> {
     /// Builds a sender from one statically composed response route.
-    pub(crate) fn new_route(route: R, fleet: &Arc<DestinationFleet>) -> Self {
-        Self::build(fleet, route)
-    }
-
-    fn build(fleet: &Arc<DestinationFleet>, route: R) -> Self {
-        let fleet = Arc::clone(fleet);
+    pub(crate) const fn new_route(route: R) -> Self {
         Self {
-            fleet,
             route,
             _codec: PhantomData,
         }
@@ -55,8 +45,7 @@ impl<C: Codec, R: ResponseRoute> TypedSender<C, R> {
         trace: Context,
         deadline: RequestDeadline,
     ) -> bool {
-        let destination = self.fleet.destination(prepared.header().target);
-        deliver_response(&self.route, prepared, trace, &destination, deadline).await
+        deliver_response(&self.route, prepared, trace, deadline).await
     }
 }
 

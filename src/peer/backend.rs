@@ -43,7 +43,7 @@ impl<C: Codec> PeerBackend for CassandraReaderBackend<C> {
 impl<C: Codec> PeerBackend for MemoryReaderBackend<C> {
     type Runtime = PreparedLocalPeerRuntime;
 
-    async fn prepare(&self, config: &PeerConfiguration) -> Result<Self::Runtime, ConsumerError> {
-        prepare_local(config)
+    async fn prepare(&self, _config: &PeerConfiguration) -> Result<Self::Runtime, ConsumerError> {
+        Ok(prepare_local())
     }
 }

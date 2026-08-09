@@ -45,7 +45,7 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
         let router = reaching(&harness.address)?;
-        let sender = TypedSender::<CountingCodec, _>::new_route(router.clone(), router.fleet());
+        let sender = TypedSender::<CountingCodec, _>::new_route(router.clone());
         let request = register(&harness.registry, &[ALPHA])?;
 
         // The caller's span is opened, read, and closed here: the send carries

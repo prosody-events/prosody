@@ -24,7 +24,7 @@ use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
 use crate::router::loopback::{HANG_GUARD, TestHealth, TestRouter, config as fleet_config};
 use crate::router::relay::Relay;
-use crate::router::{Host, LocalTarget, NodeId, Preference, ResponseSender, Router};
+use crate::router::{Host, LocalTarget, NetworkRouter, NodeId, Preference, ResponseSender};
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;

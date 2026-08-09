@@ -121,10 +121,10 @@ where
 
     async fn build_router(
         &self,
-        config: &PeerConfiguration,
+        _config: &PeerConfiguration,
         _reader: &StateReaderDependencies<C, Self::Reader>,
     ) -> Result<Self::Router, ConsumerError> {
-        LocalRouter::new(config).await
+        LocalRouter::new().await
     }
 }
 

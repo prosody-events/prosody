@@ -57,10 +57,7 @@ fn a_codec_failure_records_the_encode_drop() -> Result<()> {
     let metrics = GlobalMetrics::install();
     paused()?.block_on(async {
         let harness = Harness::new(config())?;
-        let sender = TypedSender::<FailingCodec, _>::new_route(
-            harness.router.clone(),
-            harness.router.fleet(),
-        );
+        let sender = TypedSender::<FailingCodec, _>::new_route(harness.router.clone());
         let prepared = prepare::<FailingCodec>(harness.header.clone(), &PAYLOAD.to_vec());
         ensure!(
             !sender.send(prepared, Context::current(), DEADLINE).await,

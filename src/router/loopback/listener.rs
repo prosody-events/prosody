@@ -4,12 +4,12 @@
 
 use super::TestHealth;
 use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
-use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
+use crate::router::fleet::{Destination, DestinationFleet};
 use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
-use crate::router::{Host, NodeId, RelayHop, Route, Router, choose_route};
+use crate::router::{Host, NetworkRouter, NodeId, RelayHop, Route, choose_route};
 use color_eyre::Result;
 use std::convert::Infallible;
 use std::future::Future;
@@ -34,7 +34,7 @@ pub(crate) struct Served {
 /// directory entry looks like, which is the case forwarding exists for. It is
 /// also the shape a suite needs to drive a real sender all the way to a
 /// listener. `here` is the label the process holding this router was configured
-/// with, so [`Router::route`] applies the declared rules exactly as the
+/// with, so [`NetworkRouter::route`] applies the declared rules exactly as the
 /// production router does.
 #[derive(Clone)]
 pub(crate) struct FixedRouter {
@@ -83,13 +83,13 @@ impl FixedRouter {
             here,
         })
     }
-
-    pub(crate) const fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
-    }
 }
 
-impl Router for FixedRouter {
+impl NetworkRouter for FixedRouter {
+    fn destination(&self, node: NodeId) -> Arc<Destination> {
+        self.fleet.destination(node)
+    }
+
     fn route(
         &self,
         _node: NodeId,

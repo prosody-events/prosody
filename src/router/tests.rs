@@ -1,5 +1,6 @@
 use super::{
-    LocalTarget, NodeId, Preference, RelayHop, Router, RouterHandle, SendFailure, choose_route,
+    LocalTarget, NetworkRouter, NodeId, Preference, RelayHop, RouterHandle, SendFailure,
+    choose_route,
 };
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
@@ -14,7 +15,6 @@ use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::tests::support::TestDirectory;
 use crate::router::directory::tests::support::{registration, test_directory};
 use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
-use crate::router::fleet::Destination;
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::LoopbackSender;
@@ -39,7 +39,6 @@ impl ResponseRoute for CountedNetwork {
     async fn deliver(
         &self,
         _frame: Staged,
-        _destination: &Destination,
         _deadline: RequestDeadline,
     ) -> Result<RouteOutcome, DropReason> {
         self.0.fetch_add(1, Ordering::Relaxed);
@@ -390,8 +389,6 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
             LocalTarget::new(node, registry),
             CountedNetwork(Arc::clone(&network_calls)),
         );
-        let fleet = DestinationFleet::new(FleetConfiguration::default())?;
-        let destination = fleet.destination(node);
         let frame = stage::<CountingCodec>(
             &FrameHeader {
                 target: node,
@@ -405,7 +402,6 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
         let delivered = route
             .deliver(
                 frame,
-                &destination,
                 RequestDeadline::from_unix_micros(4_102_444_800_000_000),
             )
             .await;

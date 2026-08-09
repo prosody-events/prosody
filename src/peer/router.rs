@@ -14,7 +14,6 @@ use crate::response::frame::encode::Staged;
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{DropReason, ResponseRoute, RouteOutcome, Then};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
-use crate::router::fleet::Destination;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::{LocalTarget, RouterHandle};
 use crate::state_reader::CassandraReaderBackend;
@@ -83,13 +82,12 @@ pub struct GrpcResponseRoute(Then<LocalTarget, RouterHandle<GrpcSender, Cassandr
 
 impl LocalRouter {
     /// Starts a local-only router.
-    ///
     /// # Errors
     ///
-    /// Returns an error when the peer configuration is invalid.
-    pub async fn new(config: &PeerConfiguration) -> Result<Self, ConsumerError> {
+    /// Returns an error if the local runtime cannot start.
+    pub async fn new() -> Result<Self, ConsumerError> {
         Ok(Self {
-            inner: start_local_router(config).await?,
+            inner: start_local_router().await?,
         })
     }
 }
@@ -162,10 +160,9 @@ impl ResponseRoute for LocalResponseRoute {
     fn deliver(
         &self,
         frame: Staged,
-        destination: &Destination,
         deadline: RequestDeadline,
     ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send {
-        self.0.deliver(frame, destination, deadline)
+        self.0.deliver(frame, deadline)
     }
 }
 
@@ -173,10 +170,9 @@ impl ResponseRoute for GrpcResponseRoute {
     fn deliver(
         &self,
         frame: Staged,
-        destination: &Destination,
         deadline: RequestDeadline,
     ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send {
-        self.0.deliver(frame, destination, deadline)
+        self.0.deliver(frame, deadline)
     }
 }
 

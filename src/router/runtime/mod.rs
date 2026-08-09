@@ -106,7 +106,6 @@ pub(crate) struct PreparedPeerRuntime<D> {
 /// Local peer machinery that has no listener, directory, or remote transport.
 pub(crate) struct PreparedLocalPeerRuntime {
     local: LocalTarget,
-    fleet: Arc<DestinationFleet>,
 }
 
 /// A running local-only peer runtime.
@@ -245,11 +244,6 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         Then(self.router.local().clone(), self.router.clone())
     }
 
-    /// Returns the destination fleet shared by this runtime.
-    pub(crate) fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.router.fleet
-    }
-
     /// Stops every local resource without publishing the node.
     pub(crate) async fn abandon(self) {
         self.router.local.registry.terminate();
@@ -259,12 +253,10 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
 
 impl PreparedLocalPeerRuntime {
     /// Builds local peer machinery without network resources.
-    pub(crate) fn start(fleet: FleetConfiguration) -> Result<Self, PeerRuntimeError> {
-        let fleet = Arc::new(DestinationFleet::new(fleet)?);
-        Ok(Self {
+    pub(crate) fn start() -> Self {
+        Self {
             local: LocalTarget::new(NodeId::new(), PendingRegistry::new()),
-            fleet,
-        })
+        }
     }
 
     /// This process's node id.
@@ -275,11 +267,6 @@ impl PreparedLocalPeerRuntime {
     /// Returns the local response route for this runtime.
     pub(crate) fn response_route(&self) -> LocalTarget {
         self.local.clone()
-    }
-
-    /// Returns the destination fleet shared by this runtime.
-    pub(crate) const fn fleet(&self) -> &Arc<DestinationFleet> {
-        &self.fleet
     }
 
     /// Starts the local runtime. No external activation is necessary.

@@ -128,11 +128,7 @@ impl Codec for LargeProbeCodec {
 impl<C: Codec<Payload = Result<(), TestError>>> Fixture<C> {
     fn new() -> Result<Self> {
         let (router, deliveries) = TestRouter::new(config())?;
-        let responder = Responder::new_route(
-            router.clone(),
-            router.fleet(),
-            SubsystemName::try_new(SUBSYSTEM)?,
-        );
+        let responder = Responder::new_route(router.clone(), SubsystemName::try_new(SUBSYSTEM)?);
         Ok(Self {
             router,
             responder: Arc::new(responder),

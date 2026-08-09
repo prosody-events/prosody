@@ -8,7 +8,7 @@ use crate::response::ResponseDisposition;
 use crate::response::frame::ResponseFrame;
 use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
-use crate::router::fleet::DestinationFleet;
+use crate::router::fleet::{Destination, DestinationFleet};
 use bytes::BufMut;
 use fixedstr::Flexstr;
 use std::error::Error;
@@ -164,9 +164,9 @@ pub(crate) trait ResponseSender: Send + Sync + 'static {
 ///
 /// A process that forwards stands beside its target already, so it reads no
 /// declared label. This trait offers none, and that is why a relay is bound by
-/// it rather than by [`Router`]: [`Router::route`] is the one function that
-/// applies the operator's rules, so a forward that consulted them does not
-/// compile.
+/// it rather than by [`NetworkRouter`]: [`NetworkRouter::route`] is the one
+/// function that applies the operator's rules, so a forward that consulted them
+/// does not compile.
 pub(crate) trait RelayHop: Clone + Send + Sync + 'static {
     /// The transport frames leave through.
     type Sender: ResponseSender;
@@ -196,7 +196,10 @@ pub(crate) trait RelayHop: Clone + Send + Sync + 'static {
 /// One trait rather than three type parameters, so every signature on the
 /// response path names one `R`. Address resolution belongs here, with the
 /// route call that can await it.
-pub(crate) trait Router: RelayHop {
+pub(crate) trait NetworkRouter: RelayHop {
+    /// Returns the bounded delivery state for `node`.
+    fn destination(&self, node: NodeId) -> Arc<Destination>;
+
     /// The endpoints `node` may be dialed on from this process, in order. This
     /// is the responder's lookup, and [`choose_route`] decides what it answers.
     ///
@@ -213,8 +216,8 @@ pub(crate) trait Router: RelayHop {
     ) -> impl Future<Output = Result<Option<Route>, Self::Error>> + Send;
 }
 
-/// The production [`Router`]: one required local target, cached peer addresses,
-/// one remote transport, and the process's destination fleet.
+/// The production [`NetworkRouter`]: one required local target, cached peer
+/// addresses, one remote transport, and the process's destination fleet.
 pub(crate) struct RouterHandle<S, D> {
     local: LocalTarget,
     addresses: AddressResolver<D>,
@@ -307,7 +310,11 @@ impl<S: ResponseSender, D: NodeDirectory> RelayHop for RouterHandle<S, D> {
     }
 }
 
-impl<S: ResponseSender, D: NodeDirectory> Router for RouterHandle<S, D> {
+impl<S: ResponseSender, D: NodeDirectory> NetworkRouter for RouterHandle<S, D> {
+    fn destination(&self, node: NodeId) -> Arc<Destination> {
+        self.fleet.destination(node)
+    }
+
     async fn route(&self, node: NodeId) -> Result<Option<Route>, D::Error> {
         let registration = self.addresses.resolve(node).await?;
         Ok(registration

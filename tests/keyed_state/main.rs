@@ -28,7 +28,7 @@ use prosody::consumer::{
     PipelineMiddlewareConfiguration, ProsodyConsumer, message_state,
 };
 use prosody::loader::KafkaLoader;
-use prosody::peer::{LocalRouter, PeerConfiguration, Router, RouterOwner};
+use prosody::peer::{LocalRouter, Router, RouterOwner};
 use prosody::producer::{ProducerConfiguration, ProsodyProducer};
 use prosody::state::descriptor::StateDescriptor;
 use prosody::subsystem::SubsystemName;
@@ -137,7 +137,7 @@ impl CartEnv {
             telemetry.sender(),
         )?;
 
-        let router = LocalRouter::new(&PeerConfiguration::default()).await?;
+        let router = LocalRouter::new().await?;
         let (_, consumer_router, router) = router.split();
         let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
             ConsumerSetup {

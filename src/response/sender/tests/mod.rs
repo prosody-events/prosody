@@ -72,7 +72,7 @@ impl Harness {
     }
 
     fn over(router: TestRouter, deliveries: UnboundedReceiver<Delivery>) -> Result<Self> {
-        let sender = TypedSender::new_route(router.clone(), router.fleet());
+        let sender = TypedSender::new_route(router.clone());
         Ok(Self {
             sender: Arc::new(sender),
             router,
