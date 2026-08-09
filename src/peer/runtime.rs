@@ -6,8 +6,9 @@ use crate::consumer::{ConsumerError, PeerInitError, ShutdownError};
 use crate::peer::{PeerBackend, heartbeat_registry};
 use crate::producer::ProsodyProducer;
 use crate::requester::ProsodyRequester;
-use crate::requester::registry::PendingRegistry;
 use crate::response::sender::{ResponseRoute, Then};
+#[cfg(test)]
+use crate::router::NodeId;
 use crate::router::config::PeerParts;
 use crate::router::directory::NodeDirectory;
 use crate::router::grpc::BoundListener;
@@ -15,7 +16,7 @@ use crate::router::grpc::client::GrpcSender;
 use crate::router::runtime::{
     LocalPeerRuntime, PeerInputs, PeerRuntime, PreparedLocalPeerRuntime, PreparedPeerRuntime,
 };
-use crate::router::{LocalTarget, NetworkRoute, NodeId};
+use crate::router::{LocalTarget, NetworkRoute};
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -33,16 +34,26 @@ mod local_route {
 }
 
 /// A response route that always tries the local node first.
-pub(crate) trait LocalRoute: local_route::Sealed + ResponseRoute {}
+pub(crate) trait LocalRoute: local_route::Sealed + ResponseRoute {
+    /// The local target that owns this route's request identity.
+    fn local(&self) -> &LocalTarget;
+}
 
-impl LocalRoute for LocalTarget {}
-impl<R: ResponseRoute> LocalRoute for Then<LocalTarget, R> {}
+impl LocalRoute for LocalTarget {
+    fn local(&self) -> &LocalTarget {
+        self
+    }
+}
+impl<R: ResponseRoute> LocalRoute for Then<LocalTarget, R> {
+    fn local(&self) -> &LocalTarget {
+        &self.0
+    }
+}
 
 /// Request identity and pending requests from one router.
 #[derive(Clone)]
 pub struct ProducerHandle {
-    node: NodeId,
-    pending: Arc<PendingRegistry>,
+    local: LocalTarget,
 }
 
 /// One running router with its request, response, and lifecycle capabilities.
@@ -60,7 +71,6 @@ pub(crate) trait PreparedRuntime: Sized + Send {
     type Running: RunningRuntime;
     type Route: LocalRoute;
 
-    fn prepared_node(&self) -> NodeId;
     fn prepared_route(&self) -> Self::Route;
     fn launch(self) -> impl Future<Output = Result<Self::Running, (Self, ConsumerError)>> + Send;
     fn release(self) -> impl Future<Output = ()> + Send;
@@ -68,7 +78,6 @@ pub(crate) trait PreparedRuntime: Sized + Send {
 
 /// A running runtime with the common shutdown contract.
 pub(crate) trait RunningRuntime: Sized + Send + 'static {
-    fn registry(&self) -> &Arc<PendingRegistry>;
     fn stop<F, Fut>(self, drain: F) -> impl Future<Output = Result<(), ShutdownError>> + Send
     where
         F: FnOnce() -> Fut + Send,
@@ -84,7 +93,7 @@ pub(crate) type RouteFor<B> = <RuntimeFor<B> as PreparedRuntime>::Route;
 impl<R: LocalRoute> PeerRouter<R> {
     #[cfg(test)]
     pub(crate) const fn node(&self) -> NodeId {
-        self.producer.node
+        self.producer.local.node()
     }
 
     pub(crate) fn producer_handle(&self) -> ProducerHandle {
@@ -99,7 +108,7 @@ impl<R: LocalRoute> PeerRouter<R> {
     }
 
     pub(crate) async fn shutdown_runtime(self) -> Result<(), ShutdownError> {
-        self.producer.pending.close_admission();
+        self.producer.local.pending().close_admission();
         let _closed = self.stop.send(());
         self.coordinator.await.map_err(|error| {
             error!(%error, "peer coordinator did not stop cleanly");
@@ -115,17 +124,17 @@ impl ProducerHandle {
         &self,
         producer: ProsodyProducer<C>,
     ) -> ProsodyRequester<C, RC> {
-        ProsodyRequester::new(producer, self.node, Arc::clone(&self.pending))
+        ProsodyRequester::new(
+            producer,
+            self.local.node(),
+            Arc::clone(self.local.pending()),
+        )
     }
 }
 
 impl<D: NodeDirectory> PreparedRuntime for PreparedPeerRuntime<D> {
     type Route = Then<LocalTarget, NetworkRoute<GrpcSender, D>>;
     type Running = PeerRuntime<D>;
-
-    fn prepared_node(&self) -> NodeId {
-        self.node()
-    }
 
     fn prepared_route(&self) -> Self::Route {
         self.response_route()
@@ -152,10 +161,6 @@ impl PreparedRuntime for PreparedLocalPeerRuntime {
     type Route = LocalTarget;
     type Running = LocalPeerRuntime;
 
-    fn prepared_node(&self) -> NodeId {
-        self.node()
-    }
-
     fn prepared_route(&self) -> Self::Route {
         self.response_route()
     }
@@ -170,10 +175,6 @@ impl PreparedRuntime for PreparedLocalPeerRuntime {
 }
 
 impl<D: NodeDirectory> RunningRuntime for PeerRuntime<D> {
-    fn registry(&self) -> &Arc<PendingRegistry> {
-        self.pending()
-    }
-
     async fn stop<F, Fut>(self, drain: F) -> Result<(), ShutdownError>
     where
         F: FnOnce() -> Fut + Send,
@@ -188,10 +189,6 @@ impl<D: NodeDirectory> RunningRuntime for PeerRuntime<D> {
 }
 
 impl RunningRuntime for LocalPeerRuntime {
-    fn registry(&self) -> &Arc<PendingRegistry> {
-        self.pending()
-    }
-
     async fn stop<F, Fut>(self, drain: F) -> Result<(), ShutdownError>
     where
         F: FnOnce() -> Fut + Send,
@@ -259,7 +256,6 @@ pub(crate) async fn start_local_router() -> Result<PeerRouter<LocalTarget>, Cons
 pub(super) async fn start_router<P: PreparedRuntime>(
     prepared: P,
 ) -> Result<PeerRouter<P::Route>, ConsumerError> {
-    let node = prepared.prepared_node();
     let route = prepared.prepared_route();
     let runtime = match prepared.launch().await {
         Ok(runtime) => runtime,
@@ -268,18 +264,20 @@ pub(super) async fn start_router<P: PreparedRuntime>(
             return Err(error);
         }
     };
-    Ok(finish_router(node, route, runtime))
+    Ok(finish_router(route, runtime))
 }
 
-fn finish_router<R: LocalRoute, RT>(node: NodeId, route: R, runtime: RT) -> PeerRouter<R>
+fn finish_router<R: LocalRoute, RT>(route: R, runtime: RT) -> PeerRouter<R>
 where
     RT: RunningRuntime,
 {
-    let pending = Arc::clone(runtime.registry());
+    let producer = ProducerHandle {
+        local: route.local().clone(),
+    };
     let (stop, stopped) = oneshot::channel();
     let coordinator = tokio::spawn(run_coordinator(runtime, stopped));
     PeerRouter {
-        producer: ProducerHandle { node, pending },
+        producer,
         route,
         stop,
         coordinator,

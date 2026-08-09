@@ -84,7 +84,7 @@ impl Process {
         Ok(Self {
             shared: Shared {
                 fleet: Arc::clone(&runtime.network.fleet),
-                pending: Arc::clone(runtime.pending()),
+                pending: Arc::clone(runtime.local.pending()),
                 listener,
                 node: runtime.node(),
                 directory,

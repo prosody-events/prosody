@@ -135,11 +135,6 @@ pub(crate) struct PeerInputs<'a, D> {
 }
 
 impl<D: NodeDirectory> PreparedPeerRuntime<D> {
-    /// This process's node id.
-    pub(crate) fn node(&self) -> NodeId {
-        self.registration.node
-    }
-
     /// Builds every shared piece and serves the listener.
     ///
     /// The listener is served here rather than at activation, so no peer can
@@ -263,11 +258,6 @@ impl PreparedLocalPeerRuntime {
         }
     }
 
-    /// This process's node id.
-    pub(crate) const fn node(&self) -> NodeId {
-        self.local.node
-    }
-
     /// Returns the local response route for this runtime.
     pub(crate) fn response_route(&self) -> LocalTarget {
         self.local.clone()
@@ -287,11 +277,6 @@ impl PreparedLocalPeerRuntime {
 }
 
 impl LocalPeerRuntime {
-    /// The process-wide request registry.
-    pub(crate) const fn pending(&self) -> &Arc<PendingRegistry> {
-        &self.pending
-    }
-
     /// Shuts the local peer machinery down in delivery order.
     pub(crate) async fn shutdown<F, Fut>(self, drain: F)
     where
@@ -308,11 +293,6 @@ impl<D: NodeDirectory> PeerRuntime<D> {
     #[cfg(test)]
     pub(crate) fn node(&self) -> NodeId {
         self.registration.node
-    }
-
-    /// The process-wide pending request registry.
-    pub(crate) const fn pending(&self) -> &Arc<PendingRegistry> {
-        &self.local.registry
     }
 
     /// Shuts this process's peer machinery down.

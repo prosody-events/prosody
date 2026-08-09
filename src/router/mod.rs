@@ -113,6 +113,16 @@ impl LocalTarget {
         self.node == node
     }
 
+    /// This process's node id.
+    pub(crate) const fn node(&self) -> NodeId {
+        self.node
+    }
+
+    /// The request registry bound to this node id.
+    pub(crate) const fn pending(&self) -> &Arc<PendingRegistry> {
+        &self.registry
+    }
+
     /// Deposits one same-node response into this process's registry.
     pub(crate) fn accept(&self, frame: ResponseFrame) -> ResponseDisposition {
         self.registry.accept(frame)

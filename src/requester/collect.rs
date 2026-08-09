@@ -11,7 +11,6 @@ use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::error::Error;
 use std::future::Future;
-use std::iter::repeat_with;
 use std::pin::pin;
 use tokio::select;
 use tokio::time::sleep_until;
@@ -32,8 +31,9 @@ where
 {
     let deadline = registration.deadline();
     let waiters = registration.take_waiters();
-    let mut outcomes: Vec<Option<Outcome<V, E>>> =
-        repeat_with(|| None).take(waiters.len()).collect();
+    let mut outcomes: Vec<Outcome<V, E>> = (0..waiters.len())
+        .map(|_| Outcome::Failed(ResponseFailure::Timeout))
+        .collect();
     let mut responses = FuturesUnordered::new();
     for (index, waiter) in waiters.into_iter().enumerate() {
         responses.push(waiter.map(move |frame| (index, frame)));
@@ -51,7 +51,7 @@ where
             }
             Some((index, frame)) = responses.next() => {
                 if let Ok(frame) = frame {
-                    outcomes[index] = Some(decode::<R, V, E>(frame));
+                    outcomes[index] = decode::<R, V, E>(frame);
                 } else if registration.is_closed() {
                     return Err(RequestError::ShuttingDown);
                 }
@@ -60,13 +60,7 @@ where
         }
     }
 
-    Ok(outcomes
-        .into_iter()
-        .map(|outcome| match outcome {
-            Some(outcome) => outcome,
-            None => Outcome::Failed(ResponseFailure::Timeout),
-        })
-        .collect())
+    Ok(outcomes)
 }
 
 fn decode<R, V, E>(frame: ResponseFrame) -> Outcome<V, E>
