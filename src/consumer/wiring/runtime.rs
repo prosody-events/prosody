@@ -2,6 +2,7 @@
 //! the poll loop, and hands back a running consumer.
 
 use crate::consumer::config::ConsumerConfiguration;
+use crate::consumer::decode::RequestAdmission;
 use crate::consumer::error::ConsumerError;
 use crate::consumer::handler::{EventHandler, HandlerProvider};
 use crate::consumer::kafka_context::{ContextHandles, PartitionProviders, new_context};
@@ -12,7 +13,6 @@ use crate::consumer::sweep::drain_managers;
 use crate::consumer::{Managers, ProsodyConsumer, RuntimeState, WatermarkVersion};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
-use crate::peer::ConsumerResources;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
 use crate::telemetry::Telemetry;
@@ -85,7 +85,7 @@ where
         EventSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
-    A: ConsumerResources,
+    A: RequestAdmission + 'static,
 {
     if let Err(error) = consumer_config.validate() {
         drop(handler_provider);
@@ -153,9 +153,6 @@ where
         }
     };
 
-    // The resource type admits only the request tags it can answer.
-    let admission = peer.admission();
-
     let poll_interval = consumer_config.poll_interval;
     let heartbeat = heartbeats.register("Kafka poll loop");
     let cloned_managers = managers.clone();
@@ -174,7 +171,7 @@ where
             heartbeat: &heartbeat,
             shutdown: &cloned_shutdown,
             message_spans,
-            admission,
+            admission: peer,
         });
     });
 

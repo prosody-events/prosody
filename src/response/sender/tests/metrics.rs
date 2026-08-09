@@ -11,9 +11,9 @@
 //! when they are first touched, and nextest gives each case its own process.
 
 use super::super::metrics::{DropReason, Stage, record_fallback};
-use super::{DEADLINE, Harness, PAYLOAD, attempts};
+use super::{Harness, PAYLOAD, attempts, deadline};
 use crate::codec::Codec;
-use crate::response::sender::{TypedSender, prepare};
+use crate::response::sender::{deliver_response, stage};
 use crate::router::loopback::{Script, UNPUBLISHED_NODE, config, node, paused};
 use crate::router::{Preference, SendFailure};
 use crate::test_util::{GlobalMetrics, assert_distinct_labels, label};
@@ -57,12 +57,8 @@ fn a_codec_failure_records_the_encode_drop() -> Result<()> {
     let metrics = GlobalMetrics::install();
     paused()?.block_on(async {
         let harness = Harness::new(config())?;
-        let sender = TypedSender::<FailingCodec, _>::new_route(harness.router.clone());
-        let prepared = prepare::<FailingCodec>(harness.header.clone(), &PAYLOAD.to_vec());
-        ensure!(
-            !sender.send(prepared, Context::current(), DEADLINE).await,
-            "an encode failure must drop the response"
-        );
+        let prepared = stage::<FailingCodec>(harness.header.clone(), &PAYLOAD.to_vec());
+        deliver_response(&harness.router, prepared, Context::current(), deadline()).await;
         Ok::<_, color_eyre::Report>(())
     })?;
     ensure!(

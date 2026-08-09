@@ -91,7 +91,6 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         keyed_state: KeyedStateConfiguration::builder().build()?,
     };
     let router = LocalRouter::new().await?;
-    let consumer_router = router.consumer();
 
     let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
         ConsumerSetup {
@@ -102,7 +101,6 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         pipeline_config,
         telemetry,
         handler,
-        &consumer_router,
     )
     .await?;
 

@@ -3,6 +3,7 @@
 use super::{PendingRegistry, Registration, Waiter};
 use crate::response::RequestId;
 use crate::response::frame::ResponseFrame;
+use crate::response::headers::RequestDeadline;
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
@@ -27,7 +28,9 @@ impl TestRegistration {
         subsystems: &[SubsystemName],
         timeout: Duration,
     ) -> Result<Self> {
-        let mut registration = registry.register::<Infallible>(subsystems, timeout)?;
+        let deadline = RequestDeadline::after(timeout)
+            .ok_or_else(|| eyre!("the test deadline was out of range"))?;
+        let mut registration = registry.register::<Infallible>(subsystems, deadline)?;
         let waiters = registration.take_waiters();
         Ok(Self {
             registration,

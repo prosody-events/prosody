@@ -19,7 +19,7 @@ use crate::telemetry::Telemetry;
 use crate::{EventIdentity, Topic};
 use bytes::BytesMut;
 use color_eyre::Result;
-use color_eyre::eyre::ensure;
+use color_eyre::eyre::{ensure, eyre};
 use quickcheck::{Arbitrary, Gen};
 use std::future::{Future, poll_fn};
 use std::iter::empty;
@@ -184,7 +184,9 @@ pub(super) fn register(
     awaited: &[SubsystemName],
     timeout: Duration,
 ) -> Result<Registration> {
-    Ok(registry.register::<TestCodecError>(awaited, timeout)?)
+    let deadline = RequestDeadline::after(timeout)
+        .ok_or_else(|| eyre!("the test deadline was out of range"))?;
+    Ok(registry.register::<TestCodecError>(awaited, deadline)?)
 }
 
 /// A requester over a mock cluster, so a case reaches the real `request` body.

@@ -99,9 +99,15 @@ pub(crate) struct RequestTag {
     deadline: RequestDeadline,
 }
 
-/// One request's absolute Unix deadline, in microseconds.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RequestDeadline(u64);
+/// One request deadline in wire time and local runtime time.
+///
+/// A requester creates both values together. The registry and Kafka header
+/// therefore use one deadline calculation.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestDeadline {
+    unix_micros: u64,
+    expires_at: Instant,
+}
 
 impl RequestTag {
     /// Pairs a request with the node awaiting its response.
@@ -131,33 +137,49 @@ impl RequestTag {
 
 impl RequestDeadline {
     /// Creates a deadline from canonical Unix microseconds.
-    pub(crate) const fn from_unix_micros(micros: u64) -> Self {
-        Self(micros)
-    }
-
-    /// Creates a wire deadline from a requester timeout.
-    pub(crate) fn after(timeout: Duration) -> Option<Self> {
-        let wall = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
-        let micros = wall.as_micros().checked_add(timeout.as_micros())?;
-        Some(Self::from_unix_micros(u64::try_from(micros).ok()?))
-    }
-
-    /// Writes the canonical decimal header value without allocation.
-    pub(crate) fn text(self, buffer: &mut itoa::Buffer) -> &str {
-        buffer.format(self.0)
-    }
-
-    pub(crate) fn expires_at(self) -> Instant {
+    pub(crate) fn from_unix_micros(unix_micros: u64) -> Self {
         let now = Instant::now();
         let wall_micros = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_micros());
-        let remaining = u128::from(self.0).saturating_sub(wall_micros);
+        let remaining = u128::from(unix_micros).saturating_sub(wall_micros);
         let remaining = u64::try_from(remaining).unwrap_or(u64::MAX);
-        now.checked_add(Duration::from_micros(remaining))
-            .unwrap_or(now)
+        Self {
+            unix_micros,
+            expires_at: now
+                .checked_add(Duration::from_micros(remaining))
+                .unwrap_or(now),
+        }
+    }
+
+    /// Creates a wire deadline from a requester timeout.
+    pub(crate) fn after(timeout: Duration) -> Option<Self> {
+        let now = Instant::now();
+        let wall = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+        let micros = wall.as_micros().checked_add(timeout.as_micros())?;
+        Some(Self {
+            unix_micros: u64::try_from(micros).ok()?,
+            expires_at: now.checked_add(timeout)?,
+        })
+    }
+
+    /// Writes the canonical decimal header value without allocation.
+    pub(crate) fn text(self, buffer: &mut itoa::Buffer) -> &str {
+        buffer.format(self.unix_micros)
+    }
+
+    pub(crate) const fn expires_at(self) -> Instant {
+        self.expires_at
     }
 }
+
+impl PartialEq for RequestDeadline {
+    fn eq(&self, other: &Self) -> bool {
+        self.unix_micros == other.unix_micros
+    }
+}
+
+impl Eq for RequestDeadline {}
 
 /// Reads one record's reserved headers, for the subsystem this consumer answers
 /// for.

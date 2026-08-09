@@ -7,7 +7,7 @@ use crate::response::frame::FrameHeader;
 use crate::response::frame::encode::{Staged, stage};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
-use crate::response::sender::{TypedSender, prepare};
+use crate::response::sender::{deliver_response, stage as stage_response};
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
@@ -274,9 +274,8 @@ async fn crossing(pair: &Pair) -> Result<()> {
         format!("the rules chose {route:?}, which is not the target's entry point alone"),
     )?;
 
-    let sender = TypedSender::<CountingCodec, _>::new_route(router.clone());
     let payload = PAYLOAD.to_vec();
-    let prepared = prepare::<CountingCodec>(
+    let prepared = stage_response::<CountingCodec>(
         FrameHeader {
             target: pair.target.node,
             request: request.id(),
@@ -286,14 +285,13 @@ async fn crossing(pair: &Pair) -> Result<()> {
         },
         &payload,
     );
-    sender
-        .send(
-            prepared,
-            Context::current(),
-            RequestDeadline::from_unix_micros(4_102_444_800_000_000),
-        )
-        .await;
-    drop(sender);
+    deliver_response(
+        &router,
+        prepared,
+        Context::current(),
+        RequestDeadline::from_unix_micros(4_102_444_800_000_000),
+    )
+    .await;
     receiver
         .await
         .map_err(|_| eyre!("the response never reached the process it named"))?;

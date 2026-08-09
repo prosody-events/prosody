@@ -13,14 +13,12 @@ mod router;
 pub(crate) mod runtime;
 
 pub(crate) use backend::PeerBackend;
-pub(crate) use router::responding_provider;
-pub(crate) use runtime::{ConsumerResources, NoPeer};
 
 pub use crate::requester::{Outcome, ProsodyRequester, RequestError, ResponseFailure};
 pub use crate::router::config::{
     PeerConfiguration, PeerConfigurationBuilder, PeerConfigurationBuilderError,
 };
-pub use router::{ConsumerRouter, GrpcConsumer, GrpcRouter, LocalConsumer, LocalRouter, Router};
+pub use router::{GrpcRouter, LocalRouter, Router};
 pub use runtime::ProducerHandle;
 
 use crate::heartbeat::HeartbeatRegistry;

@@ -39,8 +39,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// The subsystem every test request awaits.
 const ALPHA: &str = "alpha";
 
-/// One process under test: a live runtime, and one typed sender over the
-/// handles that runtime hands out.
+/// One process under test and the handles its runtime supplies.
 struct Process {
     runtime: PeerRuntime<CassandraNodeDirectory>,
     shared: Shared,

@@ -3,6 +3,7 @@
 
 use super::runtime::{StartupServices, initialize_consumer};
 use super::state::{KeyedStateInputs, memory_state_provider};
+use crate::consumer::decode::RequestAdmission;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::handler::{DemandType, EventHandler, HandlerProvider, Uncommitted};
 use crate::consumer::kafka_context::PartitionProviders;
@@ -23,8 +24,8 @@ use crate::consumer::{
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
 use crate::otel::SpanRelation;
+use crate::peer::PeerBackend;
 use crate::peer::runtime::prepare_network;
-use crate::peer::{ConsumerResources, PeerBackend};
 use crate::router::NodeId;
 use crate::router::directory::tests::support::TestDirectory;
 use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
@@ -364,7 +365,7 @@ fn recording_memory_deps(
     StateReaderDependencies::from_parts(backend, deps.cache().clone())
 }
 
-async fn start<A: ConsumerResources>(
+async fn start<A: RequestAdmission + 'static>(
     config: &ConsumerConfiguration,
     managers: Arc<Managers<Value>>,
     heartbeats: HeartbeatRegistry,

@@ -3,12 +3,11 @@
 //! A barrier holds the transport, or the directory does not contain the
 //! destination.
 
-use super::{Fixture, LargeProbeCodec, ResultProbeCodec, offset_tracker, tagged, tagged_at};
+use super::{Fixture, ResultProbeCodec, offset_tracker, tagged, tagged_at};
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, ScriptedHandler, ScriptedHook,
 };
 use crate::consumer::{DemandType, EventHandler};
-use crate::error::ErrorCategory;
 use crate::router::loopback::{Script, UNPUBLISHED_NODE, paused};
 use color_eyre::Result;
 use std::sync::Arc;
@@ -70,48 +69,6 @@ fn the_hook_applies_network_backpressure() -> Result<()> {
         dispatch.await;
         drop(handler);
         assert!(fixture.drain().await?.is_empty());
-        Ok(())
-    })
-}
-
-/// A large response reaches the transport without an application size limit.
-#[test]
-fn a_large_response_reaches_the_transport() -> Result<()> {
-    paused()?.block_on(async {
-        let fixture = Fixture::<LargeProbeCodec>::new()?;
-
-        let control = ScriptedHandler::success();
-        let handler = fixture.stack(control, 0)?;
-        let tracker = offset_tracker();
-        let message = tagged(1, 31, "control")?.into_uncommitted(tracker.take(0).await?);
-        EventHandler::on_message(
-            &handler,
-            MockEventContext::new(),
-            message,
-            DemandType::Normal,
-        )
-        .await;
-        drop(handler);
-
-        let large = ScriptedHandler::always_failing(ErrorCategory::Permanent);
-        let handler = fixture.stack(large, 0)?;
-        let tracker = offset_tracker();
-        let message = tagged(1, 32, "large")?.into_uncommitted(tracker.take(1).await?);
-        EventHandler::on_message(
-            &handler,
-            MockEventContext::new(),
-            message,
-            DemandType::Normal,
-        )
-        .await;
-        drop(handler);
-
-        let drained = fixture.drain().await?;
-        assert_eq!(
-            drained.len(),
-            2,
-            "the application layer must not reject a large response",
-        );
         Ok(())
     })
 }

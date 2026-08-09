@@ -10,7 +10,7 @@ use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::encode::stage;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
-use crate::response::sender::{ResponseRoute, Then, TypedSender, prepare};
+use crate::response::sender::{ResponseRoute, Then, deliver_response, stage as stage_response};
 use crate::router::directory::NodeDirectory;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::HANG_GUARD;
@@ -86,10 +86,7 @@ fn a_same_node_response_uses_the_local_registry() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let Process { runtime, shared } = Process::new().await?;
         let router = runtime.router.clone();
-        let own = TypedSender::<CountingCodec, _>::new_route(Then(
-            router.local().clone(),
-            router.clone(),
-        ));
+        let own = Then(router.local().clone(), router.clone());
         let outcome = delivered_to_itself(&router, &own, &shared).await;
         runtime.shutdown(|| async {}).await?;
         outcome
@@ -99,7 +96,7 @@ fn a_same_node_response_uses_the_local_registry() -> Result<()> {
 /// Sends one response to this process's own node id and waits for the registry.
 async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
     router: &RouterHandle<GrpcSender, D>,
-    own: &TypedSender<CountingCodec, R>,
+    own: &R,
     shared: &Shared,
 ) -> Result<()> {
     ensure!(
@@ -119,8 +116,10 @@ async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
     let mut request = TestRegistration::new(&shared.pending, from_ref(&subsystem), TIMEOUT)?;
     let receiver = request.receiver()?;
     let payload = PAYLOAD.to_vec();
-    let prepared = prepare::<CountingCodec>(header(shared.node, request.id(), ALPHA)?, &payload);
-    own.send(
+    let prepared =
+        stage_response::<CountingCodec>(header(shared.node, request.id(), ALPHA)?, &payload);
+    deliver_response(
+        own,
         prepared,
         Context::current(),
         RequestDeadline::from_unix_micros(4_102_444_800_000_000),

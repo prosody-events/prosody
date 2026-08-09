@@ -4,6 +4,7 @@
 use super::super::KafkaObserver;
 use crate::JsonCodec;
 use crate::consumer::config::ConsumerConfiguration;
+use crate::consumer::decode::NoRequests;
 use crate::consumer::error::ConsumerError;
 use crate::consumer::kafka_context::PartitionProviders;
 use crate::consumer::middleware::CloneProvider;
@@ -15,7 +16,6 @@ use crate::consumer::wiring::state::{KeyedStateInputs, memory_state_provider};
 use crate::consumer::{Managers, ProsodyConsumer};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MemoryLoader;
-use crate::peer::NoPeer;
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::telemetry::Telemetry;
@@ -63,7 +63,7 @@ pub(super) async fn initialize_with(
             observer,
             managers,
         },
-        NoPeer,
+        NoRequests,
     ))
     .await)
 }

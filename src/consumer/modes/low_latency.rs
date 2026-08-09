@@ -6,6 +6,7 @@
 //! outermost retry re-dispatches that routing forever, since there is nothing
 //! left to fall back to.
 
+use super::{NoResponses, Responding, ResponsePolicy};
 use crate::consumer::config::{
     ConsumerSetup, LowLatencyMiddlewareConfiguration, TypedConsumerSetup,
 };
@@ -20,7 +21,7 @@ use crate::consumer::wiring::{
 };
 use crate::consumer::{Managers, ProsodyConsumer};
 use crate::high_level::config::TriggerStoreConfiguration;
-use crate::peer::{ConsumerRouter, NoPeer, responding_provider};
+use crate::peer::Router;
 use crate::producer::ProsodyProducer;
 use crate::state_reader::ConsumerReaderBackend;
 use crate::subsystem::SubsystemName;
@@ -45,13 +46,12 @@ where
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub async fn low_latency_consumer<T, RT: ConsumerRouter>(
+    pub async fn low_latency_consumer<T>(
         setup: ConsumerSetup<'_>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
-        router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
@@ -70,7 +70,6 @@ where
                     producer,
                     telemetry,
                     handler,
-                    router,
                 )
                 .await
             }
@@ -86,7 +85,6 @@ where
                     producer,
                     telemetry,
                     handler,
-                    router,
                 )
                 .await
             }
@@ -98,7 +96,7 @@ where
     /// # Errors
     ///
     /// Returns [`ConsumerError`] when another startup step fails.
-    pub async fn low_latency_responding_consumer<T, R, RT: ConsumerRouter>(
+    pub async fn low_latency_responding_consumer<T, R, RT: Router>(
         setup: ConsumerSetup<'_>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
@@ -152,18 +150,42 @@ where
         }
     }
 
-    pub(crate) async fn low_latency_consumer_with_backend<T, B, RT: ConsumerRouter>(
+    pub(crate) async fn low_latency_consumer_with_backend<T, B>(
         setup: TypedConsumerSetup<'_, C, B>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
-        _router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
         B: ConsumerReaderBackend<C>,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+    {
+        Self::low_latency_consumer_with_policy(
+            setup,
+            low_latency_config,
+            producer,
+            telemetry,
+            handler,
+            NoResponses,
+        )
+        .await
+    }
+
+    async fn low_latency_consumer_with_policy<T, B, RP>(
+        setup: TypedConsumerSetup<'_, C, B>,
+        low_latency_config: LowLatencyMiddlewareConfiguration,
+        producer: ProsodyProducer<C>,
+        telemetry: Telemetry,
+        handler: T,
+        response: RP,
+    ) -> Result<Self, ConsumerError>
+    where
+        C::Payload: EventIdentity + Send + Sync + 'static,
+        B: ConsumerReaderBackend<C>,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        RP: ResponsePolicy<T>,
     {
         let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
         let retry = RetryMiddleware::new(low_latency_config.retry)?;
@@ -182,7 +204,8 @@ where
         .layer(topic)
         .layer(retry);
         let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let provider = middleware.into_provider(handler);
+        let (leaf, resources) = response.terminate(handler);
+        let provider = middleware.with_provider(leaf);
         let providers = PartitionProviders {
             triggers: components.trigger,
             state: components.state,
@@ -199,12 +222,12 @@ where
             provider,
             providers,
             services,
-            NoPeer,
+            resources,
         ))
         .await
     }
 
-    pub(crate) async fn low_latency_responding_consumer_with_backend<T, R, B, RT: ConsumerRouter>(
+    pub(crate) async fn low_latency_responding_consumer_with_backend<T, R, B, RT: Router>(
         setup: TypedConsumerSetup<'_, C, B>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
@@ -221,45 +244,14 @@ where
         T::Error: Sync + 'static,
         R: Codec<Payload = Result<T::Output, T::Error>>,
     {
-        let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
-        let retry = RetryMiddleware::new(low_latency_config.retry)?;
-        let topic = FailureTopicMiddleware::new(
-            low_latency_config.failure_topic,
-            setup.consumer.group_id.clone(),
+        Self::low_latency_consumer_with_policy(
+            setup,
+            low_latency_config,
             producer,
-        )?;
-        let middleware = build_common_middleware::<_, C::Payload>(
-            setup.common,
-            setup.consumer,
-            telemetry.clone(),
-            components.dedup,
-        )?
-        .layer(retry.clone())
-        .layer(topic)
-        .layer(retry);
-        let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let providers = PartitionProviders {
-            triggers: components.trigger,
-            state: components.state,
-        };
-        let services = StartupServices {
-            version: keyed_state.version.clone(),
-            telemetry: &telemetry,
-            heartbeats,
-            observer,
-            managers: Arc::clone(&managers),
-        };
-        // Preparation is the last fallible step of this mode, and no `?` runs
-        // between it and the termination below.
-        let (provider, resources) =
-            responding_provider::<_, R, _, _>(router, subsystem, &middleware, handler);
-        Box::pin(initialize_consumer::<_, _, _, C, _>(
-            setup.consumer,
-            provider,
-            providers,
-            services,
-            resources,
-        ))
+            telemetry,
+            handler,
+            Responding::<R, _>::new(router, subsystem),
+        )
         .await
     }
 }

@@ -2,6 +2,7 @@
 
 use crate::requester::RequestError;
 use crate::response::frame::ResponseFrame;
+use crate::response::headers::RequestDeadline;
 use crate::response::{RequestId, ResponseDisposition};
 use crate::subsystem::SubsystemName;
 use ahash::RandomState;
@@ -14,7 +15,6 @@ use std::mem;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
@@ -67,16 +67,12 @@ impl PendingRegistry {
     pub(in crate::requester) fn register<E: Error>(
         self: &Arc<Self>,
         subsystems: &[SubsystemName],
-        timeout: Duration,
+        deadline: RequestDeadline,
     ) -> Result<Registration, RequestError<E>> {
         Self::validate_request(subsystems)?;
         if self.closed.load(Acquire) {
             return Err(RequestError::ShuttingDown);
         }
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or(RequestError::DeadlineOutOfRange)?;
-
         let (id, keys, receivers) = loop {
             let id = RequestId::new();
             let mut keys = SmallVec::with_capacity(subsystems.len());
@@ -107,7 +103,7 @@ impl PendingRegistry {
             id,
             keys,
             receivers,
-            deadline,
+            deadline: deadline.expires_at(),
         })
     }
 

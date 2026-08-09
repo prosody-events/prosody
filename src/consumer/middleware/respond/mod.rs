@@ -23,23 +23,22 @@
 //! permanently rejected stage still commits and still fires this hook, so the
 //! answer leaves with the label the handler's own result gives. The label
 //! reports the handler result, never the durability of the writes behind it.
-//!
-//! [`responding_provider`] is the only way to build this layer outside this
-//! module.
-
-use super::providers::{FallibleCloneProvider, LeafHandler};
-use super::{FallibleHandler, HandlerMiddleware, Settlement, SettlementHandler};
+use super::{FallibleHandler, Settlement, SettlementHandler};
 use crate::codec::Codec;
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::response::ResponseStatus;
+use crate::response::frame::FrameHeader;
+use crate::response::headers::RequestDeadline;
 use crate::response::headers::RequestTag;
-use crate::response::sender::{ResponseRoute, TypedSender, prepare};
+use crate::response::sender::{ResponseRoute, deliver_response, stage};
 use crate::subsystem::SubsystemName;
 use crate::timers::Trigger;
 use opentelemetry::Context;
+use std::future::Future;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -49,14 +48,15 @@ mod tests;
 
 /// Sends one typed response for a subsystem.
 ///
-/// Construction requires the process router. Thus, a responder cannot detach
-/// from the directory and fleet that route its work.
+/// Construction takes a route from the process router. The route always tries
+/// local delivery before network delivery.
 ///
 /// `subsystem` is the name this consumer answers peer requests for. The decode
 /// path and this responder use the same subsystem value.
 pub(crate) struct Responder<C: Codec, R: ResponseRoute> {
-    sender: TypedSender<C, R>,
+    route: R,
     subsystem: SubsystemName,
+    codec: PhantomData<fn() -> C>,
 }
 
 /// The request one message asked this consumer to answer, and the trace that
@@ -75,7 +75,7 @@ pub(crate) struct Responder<C: Codec, R: ResponseRoute> {
 /// as a root of a trace of its own.
 ///
 /// One per in-flight event, and both exits are here:
-/// [`after_commit`](FallibleHandler::after_commit) moves it into the sender,
+/// [`after_commit`](FallibleHandler::after_commit) moves it into the responder,
 /// and [`after_abort`](FallibleHandler::after_abort) drops it.
 #[derive(Debug)]
 pub(crate) struct Answering {
@@ -109,14 +109,32 @@ impl<C: Codec, R: ResponseRoute> Responder<C, R> {
     /// Builds a responder from one statically composed response route.
     pub(crate) fn new_route(route: R, subsystem: SubsystemName) -> Self {
         Self {
-            sender: TypedSender::new_route(route),
+            route,
             subsystem,
+            codec: PhantomData,
         }
     }
 
     /// The name this responder answers for, and the one the decode path admits.
     pub(crate) fn subsystem(&self) -> &SubsystemName {
         &self.subsystem
+    }
+
+    /// Encodes a result, applies its commit hook, and then delivers it.
+    async fn respond<F, Fut>(
+        &self,
+        header: FrameHeader,
+        payload: C::Payload,
+        trace: Context,
+        deadline: RequestDeadline,
+        after_commit: F,
+    ) where
+        F: FnOnce(C::Payload) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let response = stage::<C>(header, &payload);
+        after_commit(payload).await;
+        deliver_response(&self.route, response, trace, deadline).await;
     }
 }
 
@@ -133,7 +151,7 @@ where
 }
 
 impl<H, C: Codec, R: ResponseRoute> RespondHandler<H, C, R> {
-    fn new(handler: H, responder: Arc<Responder<C, R>>) -> Self {
+    pub(crate) fn new(handler: H, responder: Arc<Responder<C, R>>) -> Self {
         Self { handler, responder }
     }
 }
@@ -223,9 +241,11 @@ where
         };
         let deadline = tag.deadline();
         let header = tag.header(self.responder.subsystem().clone(), status(&result));
-        let response = prepare::<C>(header, &result);
-        self.handler.after_commit(context, result).await;
-        self.responder.sender.send(response, trace, deadline).await;
+        self.responder
+            .respond(header, result, trace, deadline, |result| {
+                self.handler.after_commit(context, result)
+            })
+            .await;
     }
 
     /// Forwards a non-final invocation's result to the inner hook.
@@ -268,39 +288,6 @@ where
                 .map_err(|error| &error.inner),
         )
     }
-}
-
-/// Terminates a middleware stack with a responding application handler.
-///
-/// This is the mirror of [`HandlerMiddleware::into_provider`], and the only way
-/// to build the layer from outside this module. It mints the chain's leaf
-/// adapter itself, so the layer always sits directly outside the application
-/// handler.
-///
-/// The layer wraps that adapter rather than the raw handler, because only the
-/// adapter classifies a result for the settlement boundary. The other nesting
-/// would leave the layer with nothing to delegate to.
-///
-/// The common middleware block deliberately excludes this layer: a consumer
-/// answers peer requests or it does not, while every member of that block is
-/// mandatory.
-pub(crate) fn responding_provider<M, H, C, R>(
-    middleware: &M,
-    handler: H,
-    responder: Arc<Responder<C, R>>,
-) -> M::Provider<FallibleCloneProvider<RespondHandler<LeafHandler<H>, C, R>>>
-where
-    M: HandlerMiddleware<H::Payload>,
-    H: FallibleHandler + Clone + Send + Sync + 'static,
-    H::Output: Sync + 'static,
-    H::Error: Sync + 'static,
-    C: Codec<Payload = Result<H::Output, H::Error>>,
-    R: ResponseRoute,
-{
-    middleware.with_provider(FallibleCloneProvider::new(RespondHandler::new(
-        LeafHandler::new(handler),
-        responder,
-    )))
 }
 
 /// The label one result puts on its frame.

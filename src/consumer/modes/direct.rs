@@ -5,6 +5,7 @@
 use crate::cassandra::CassandraStore;
 use crate::consumer::ProsodyConsumer;
 use crate::consumer::config::ConsumerConfiguration;
+use crate::consumer::decode::NoRequests;
 use crate::consumer::error::{ConsumerError, KeyedStateInitError};
 use crate::consumer::handler::{EventHandler, HandlerProvider};
 use crate::consumer::kafka_context::PartitionProviders;
@@ -18,7 +19,6 @@ use crate::consumer::wiring::state::{KeyedStateInputs, memory_state_provider};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MemoryLoader;
-use crate::peer::NoPeer;
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
 use crate::telemetry::Telemetry;
@@ -159,7 +159,7 @@ where
             state,
         },
         services,
-        NoPeer,
+        NoRequests,
     ))
     .await
 }

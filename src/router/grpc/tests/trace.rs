@@ -10,7 +10,7 @@
 use super::{ALPHA, Harness, header, reaching, register};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
-use crate::response::sender::{TypedSender, prepare};
+use crate::response::sender::{deliver_response, stage};
 use crate::test_util::{GlobalSpans, TEST_RUNTIME, named};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
@@ -45,7 +45,6 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
         let router = reaching(&harness.address)?;
-        let sender = TypedSender::<CountingCodec, _>::new_route(router.clone());
         let request = register(&harness.registry, &[ALPHA])?;
 
         // The caller's span is opened, read, and closed here: the send carries
@@ -54,21 +53,15 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         let trace = caller.context();
         let caller_span = trace.span().span_context().clone();
         let payload = PAYLOAD.to_vec();
-        let prepared =
-            prepare::<CountingCodec>(header(harness.node, request.id(), ALPHA)?, &payload);
-        let delivered = sender
-            .send(
-                prepared,
-                trace,
-                RequestDeadline::from_unix_micros(4_102_444_800_000_000),
-            )
-            .await;
+        let prepared = stage::<CountingCodec>(header(harness.node, request.id(), ALPHA)?, &payload);
+        deliver_response(
+            &router,
+            prepared,
+            trace,
+            RequestDeadline::from_unix_micros(4_102_444_800_000_000),
+        )
+        .await;
         drop(caller);
-        drop(sender);
-        ensure!(
-            delivered,
-            "the response must have reached the listener before its trace is read"
-        );
 
         let ended = spans.ended();
         let sent = named(&ended, SENT)?;

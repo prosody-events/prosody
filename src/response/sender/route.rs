@@ -40,12 +40,12 @@ pub(crate) struct Then<A, B>(pub(crate) A, pub(crate) B);
 /// It is a child of the trace the job carries, so the listener's
 /// `peer.response.receive` — parented on the context this span's own injection
 /// writes — lands under the call that asked for the response.
-pub(super) async fn deliver_response<R: ResponseRoute>(
+pub(crate) async fn deliver_response<R: ResponseRoute>(
     router: &R,
     prepared: PreparedResponse,
     trace: Context,
     deadline: RequestDeadline,
-) -> bool {
+) {
     let header = prepared.header();
     let span = debug_span!(
         "peer.response.send",
@@ -67,7 +67,6 @@ pub(super) async fn deliver_response<R: ResponseRoute>(
     };
     // Recorded through the owned handle rather than the current span: a
     // level-disabled span never becomes current.
-    let delivered = outcome.is_ok();
     match outcome {
         Ok(delivery) => {
             span.record("peer.disposition", "delivered");
@@ -89,7 +88,6 @@ pub(super) async fn deliver_response<R: ResponseRoute>(
             reason.record();
         }
     }
-    delivered
 }
 
 /// Resolves one response's route, frames it and delivers it.
@@ -247,7 +245,7 @@ impl PreparedResponse {
 }
 
 /// Encodes one payload and records the common frame stage.
-pub(super) fn stage<C: Codec>(header: FrameHeader, payload: &C::Payload) -> PreparedResponse {
+pub(crate) fn stage<C: Codec>(header: FrameHeader, payload: &C::Payload) -> PreparedResponse {
     Stage::Attempted.record();
     match encode::<C>(&header, payload) {
         Ok(staged) => {

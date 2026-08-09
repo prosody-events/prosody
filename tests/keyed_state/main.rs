@@ -138,7 +138,6 @@ impl CartEnv {
         )?;
 
         let router = LocalRouter::new().await?;
-        let consumer_router = router.consumer();
         let consumer = ProsodyConsumer::<JsonCodec>::pipeline_consumer(
             ConsumerSetup {
                 consumer: &consumer_config,
@@ -155,7 +154,6 @@ impl CartEnv {
                 observations_tx,
                 cart,
             },
-            &consumer_router,
         )
         .await?;
 

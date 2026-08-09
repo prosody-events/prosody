@@ -1,6 +1,7 @@
 //! The pipeline mode: retry, defer, and monopolization middleware layered
 //! outside the common block.
 
+use super::{NoResponses, Responding, ResponsePolicy};
 use crate::consumer::config::{
     CommonConfiguration, ConsumerConfiguration, ConsumerSetup, PipelineMiddlewareConfiguration,
     TypedConsumerSetup,
@@ -25,7 +26,7 @@ use crate::consumer::{Managers, ProsodyConsumer};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MessageLoader;
-use crate::peer::{ConsumerRouter, NoPeer, responding_provider};
+use crate::peer::Router;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
 use crate::state_reader::ConsumerReaderBackend;
@@ -48,21 +49,15 @@ struct PipelineMiddlewareStack {
     observer: KafkaObserver,
 }
 
-/// Groups the response route to keep consumer construction within seven
-/// arguments.
-struct ResponseTarget<'a, R> {
-    router: &'a R,
-    subsystem: SubsystemName,
-}
-
 impl PipelineMiddlewareStack {
-    async fn into_consumer<T, MP, TP, DP, PP, SP, L, C>(
+    async fn into_consumer<T, MP, TP, DP, PP, SP, L, C, RP>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
         dedup_provider: DP,
         partition_providers: PartitionProviders<PP, SP>,
         handler: T,
+        response: RP,
     ) -> Result<ProsodyConsumer<C>, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
@@ -76,6 +71,7 @@ impl PipelineMiddlewareStack {
         L: MessageLoader<Payload = C::Payload> + 'static,
         C: Codec,
         C::Payload: Send + Sync + 'static + EventIdentity + EventType + Clone,
+        RP: ResponsePolicy<T>,
     {
         let timer_defer_middleware = TimerDeferMiddleware::new(
             self.defer_config,
@@ -110,7 +106,8 @@ impl PipelineMiddlewareStack {
             .layer(message_defer_middleware)
             .layer(self.retry_middleware);
         let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let provider = middleware.into_provider(handler);
+        let (leaf, resources) = response.terminate(handler);
+        let provider = middleware.with_provider(leaf);
         let services = StartupServices {
             version,
             telemetry: &self.telemetry,
@@ -120,80 +117,6 @@ impl PipelineMiddlewareStack {
         };
         // Preparation is the last fallible step of this mode: no `?` after it
         // could drop a served listener.
-        Box::pin(initialize_consumer::<_, _, _, C, _>(
-            &self.consumer_config,
-            provider,
-            partition_providers,
-            services,
-            NoPeer,
-        ))
-        .await
-    }
-
-    /// Builds a responding consumer without a shared tail helper.
-    ///
-    /// The telemetry borrow overlaps moves from this value. Keep this tail in
-    /// one function so the borrow remains clear.
-    async fn into_responding_consumer<T, R, MP, TP, DP, PP, SP, L, C, RT: ConsumerRouter>(
-        self,
-        message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
-        timer_provider: TP,
-        dedup_provider: DP,
-        partition_providers: PartitionProviders<PP, SP>,
-        handler: T,
-        response: ResponseTarget<'_, RT>,
-    ) -> Result<ProsodyConsumer<C>, ConsumerError>
-    where
-        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-        T::Output: Sync + 'static,
-        T::Error: Sync + 'static,
-        R: Codec<Payload = Result<T::Output, T::Error>>,
-        MP: MessageDeferStoreProvider,
-        TP: TimerDeferStoreProvider,
-        DP: DeduplicationStoreProvider,
-        PP: TriggerStoreProvider,
-        SP: PartitionStateProvider<PP::Store>,
-        <SP::Manager as PartitionStateManager>::Session:
-            EventSession<Loader: MessageLoader<Payload = C::Payload>>,
-        L: MessageLoader<Payload = C::Payload> + 'static,
-        C: Codec,
-        C::Payload: Send + Sync + 'static + EventIdentity + EventType + Clone,
-    {
-        let timer_defer_middleware = TimerDeferMiddleware::new(
-            self.defer_config,
-            timer_provider,
-            self.failure_tracker,
-            &self.consumer_config,
-            &self.telemetry,
-        );
-        let version: Arc<str> = Arc::from(self.common_config.dedup.version.as_str());
-        let common_middleware = build_common_middleware::<_, C::Payload>(
-            &self.common_config,
-            &self.consumer_config,
-            self.telemetry.clone(),
-            dedup_provider,
-        )?;
-        let middleware = common_middleware
-            .layer(self.monopolization_middleware)
-            .layer(timer_defer_middleware)
-            .layer(message_defer_middleware)
-            .layer(self.retry_middleware);
-        let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let services = StartupServices {
-            version,
-            telemetry: &self.telemetry,
-            heartbeats: self.heartbeats,
-            observer: self.observer,
-            managers: Arc::clone(&managers),
-        };
-        // Preparation is the last fallible step of this mode, and no `?` runs
-        // between it and the termination below.
-        let (provider, resources) = responding_provider::<_, R, _, _>(
-            response.router,
-            response.subsystem,
-            &middleware,
-            handler,
-        );
         Box::pin(initialize_consumer::<_, _, _, C, _>(
             &self.consumer_config,
             provider,
@@ -220,12 +143,11 @@ where
     /// # Errors
     ///
     /// Returns a `ConsumerError` if the consumer creation fails.
-    pub async fn pipeline_consumer<T, RT: ConsumerRouter>(
+    pub async fn pipeline_consumer<T>(
         setup: ConsumerSetup<'_>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
         handler: T,
-        router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity,
@@ -243,7 +165,6 @@ where
                     pipeline_config,
                     telemetry,
                     handler,
-                    router,
                 )
                 .await
             }
@@ -258,7 +179,6 @@ where
                     pipeline_config,
                     telemetry,
                     handler,
-                    router,
                 )
                 .await
             }
@@ -270,7 +190,7 @@ where
     /// # Errors
     ///
     /// Returns [`ConsumerError`] when another startup step fails.
-    pub async fn pipeline_responding_consumer<T, R, RT: ConsumerRouter>(
+    pub async fn pipeline_responding_consumer<T, R, RT: Router>(
         setup: ConsumerSetup<'_>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
@@ -321,17 +241,33 @@ where
         }
     }
 
-    pub(crate) async fn pipeline_consumer_with_backend<T, B, RT: ConsumerRouter>(
+    pub(crate) async fn pipeline_consumer_with_backend<T, B>(
         setup: TypedConsumerSetup<'_, C, B>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
         handler: T,
-        _router: &RT,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
         B: ConsumerReaderBackend<C>,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+    {
+        Self::pipeline_consumer_with_policy(setup, pipeline_config, telemetry, handler, NoResponses)
+            .await
+    }
+
+    async fn pipeline_consumer_with_policy<T, B, RP>(
+        setup: TypedConsumerSetup<'_, C, B>,
+        pipeline_config: PipelineMiddlewareConfiguration,
+        telemetry: Telemetry,
+        handler: T,
+        response: RP,
+    ) -> Result<Self, ConsumerError>
+    where
+        C::Payload: EventIdentity + Send + Sync + 'static,
+        B: ConsumerReaderBackend<C>,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        RP: ResponsePolicy<T>,
     {
         let PipelineMiddlewareConfiguration {
             retry,
@@ -366,7 +302,7 @@ where
             &stack.telemetry,
         )?;
         stack
-            .into_consumer::<_, _, _, _, _, _, _, C>(
+            .into_consumer::<_, _, _, _, _, _, _, C, _>(
                 message_defer,
                 components.timers,
                 components.dedup,
@@ -375,11 +311,12 @@ where
                     state: components.state,
                 },
                 handler,
+                response,
             )
             .await
     }
 
-    pub(crate) async fn pipeline_responding_consumer_with_backend<T, R, B, RT: ConsumerRouter>(
+    pub(crate) async fn pipeline_responding_consumer_with_backend<T, R, B, RT: Router>(
         setup: TypedConsumerSetup<'_, C, B>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
@@ -395,50 +332,13 @@ where
         T::Error: Sync + 'static,
         R: Codec<Payload = Result<T::Output, T::Error>>,
     {
-        let PipelineMiddlewareConfiguration {
-            retry,
-            monopolization,
-            defer,
-        } = pipeline_config;
-        let (components, _keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
-        let failure_tracker = FailureTracker::new(
-            defer.failure_window,
-            defer.failure_threshold,
-            &telemetry,
-            &heartbeats,
-        );
-        let stack = PipelineMiddlewareStack {
-            consumer_config: setup.consumer.clone(),
-            defer_config: defer.clone(),
-            common_config: setup.common.clone(),
-            failure_tracker: failure_tracker.clone(),
-            monopolization_middleware: MonopolizationMiddleware::new(&monopolization, &telemetry)?,
-            retry_middleware: RetryMiddleware::new(retry)?,
-            heartbeats,
+        Self::pipeline_consumer_with_policy(
+            setup,
+            pipeline_config,
             telemetry,
-            observer,
-        };
-        let message_defer = MessageDeferMiddleware::new(
-            defer,
-            setup.consumer,
-            components.messages,
-            failure_tracker,
-            components.loader,
-            &setup.common.dedup.version,
-            &stack.telemetry,
-        )?;
-        stack
-            .into_responding_consumer::<_, R, _, _, _, _, _, _, C, RT>(
-                message_defer,
-                components.timers,
-                components.dedup,
-                PartitionProviders {
-                    triggers: components.trigger,
-                    state: components.state,
-                },
-                handler,
-                ResponseTarget { router, subsystem },
-            )
-            .await
+            handler,
+            Responding::<R, _>::new(router, subsystem),
+        )
+        .await
     }
 }

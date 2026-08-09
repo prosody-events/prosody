@@ -1,11 +1,13 @@
-//! What the typed sender's own suites share: a router over an in-process
-//! transport, and a harness that records every attempt it makes.
+//! What response delivery suites share: an in-process route and a harness that
+//! records every attempt.
 
-use super::{TypedSender, prepare};
+use super::{ResponseRoute, RouteOutcome, deliver_response, stage};
 use crate::error::ErrorCategory;
 use crate::response::frame::FrameHeader;
+use crate::response::frame::encode::Staged;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
+use crate::response::sender::DropReason;
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{
@@ -15,6 +17,7 @@ use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use opentelemetry::Context;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -29,12 +32,14 @@ mod metrics;
 pub(super) const PAYLOAD: &[u8] = b"response";
 
 /// A future Kafka deadline for transport tests.
-const DEADLINE: RequestDeadline = RequestDeadline::from_unix_micros(4_102_444_800_000_000);
+fn deadline() -> RequestDeadline {
+    RequestDeadline::from_unix_micros(4_102_444_800_000_000)
+}
 
-/// One fleet, one transport, and one typed sender over them.
+/// One fleet and one observed route over an in-process transport.
 pub(super) struct Harness {
     router: TestRouter,
-    sender: Arc<TypedSender<CountingCodec, TestRouter>>,
+    route: Arc<ObservedRoute>,
     deliveries: UnboundedReceiver<Delivery>,
     header: FrameHeader,
     outcomes: Arc<Outcomes>,
@@ -46,12 +51,34 @@ struct Outcomes {
     dropped: AtomicU64,
 }
 
+#[derive(Clone)]
+struct ObservedRoute {
+    route: TestRouter,
+    outcomes: Arc<Outcomes>,
+}
+
 impl Outcomes {
     fn record(&self, delivered: bool) {
         if delivered {
             self.sent.fetch_add(1, Relaxed);
         } else {
             self.dropped.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+impl ResponseRoute for ObservedRoute {
+    fn deliver(
+        &self,
+        frame: Staged,
+        deadline: RequestDeadline,
+    ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send {
+        let route = self.route.clone();
+        let outcomes = Arc::clone(&self.outcomes);
+        async move {
+            let outcome = route.deliver(frame, deadline).await;
+            outcomes.record(matches!(&outcome, Ok(RouteOutcome::Delivered(_))));
+            outcome
         }
     }
 }
@@ -72,13 +99,17 @@ impl Harness {
     }
 
     fn over(router: TestRouter, deliveries: UnboundedReceiver<Delivery>) -> Result<Self> {
-        let sender = TypedSender::new_route(router.clone());
+        let outcomes = Arc::new(Outcomes::default());
+        let route = ObservedRoute {
+            route: router.clone(),
+            outcomes: Arc::clone(&outcomes),
+        };
         Ok(Self {
-            sender: Arc::new(sender),
+            route: Arc::new(route),
             router,
             deliveries,
             header: header()?,
-            outcomes: Arc::default(),
+            outcomes,
         })
     }
 
@@ -100,33 +131,27 @@ impl Harness {
 
     /// Sends `payload` for `index`.
     pub(super) async fn send_payload(&self, index: u8, payload: Vec<u8>) -> Result<()> {
-        let prepared = prepare::<CountingCodec>(
+        let prepared = stage::<CountingCodec>(
             FrameHeader {
                 target: node(index),
                 ..self.header.clone()
             },
             &payload,
         );
-        let delivered = self
-            .sender
-            .send(prepared, Context::current(), DEADLINE)
-            .await;
-        self.outcomes.record(delivered);
+        deliver_response(&*self.route, prepared, Context::current(), deadline()).await;
         Ok(())
     }
 
     /// Starts one send that a test synchronizes through transport events.
     pub(super) fn start_send(&self, index: u8) -> JoinHandle<Result<()>> {
-        let sender = Arc::clone(&self.sender);
-        let outcomes = Arc::clone(&self.outcomes);
+        let route = Arc::clone(&self.route);
         let header = FrameHeader {
             target: node(index),
             ..self.header.clone()
         };
-        let prepared = prepare::<CountingCodec>(header, &PAYLOAD.to_vec());
+        let prepared = stage::<CountingCodec>(header, &PAYLOAD.to_vec());
         tokio::spawn(async move {
-            let delivered = sender.send(prepared, Context::current(), DEADLINE).await;
-            outcomes.record(delivered);
+            deliver_response(&*route, prepared, Context::current(), deadline()).await;
             Ok(())
         })
     }
@@ -140,12 +165,12 @@ impl Harness {
     pub(super) async fn drain(self) -> Result<Drained> {
         let Self {
             router,
-            sender,
+            route,
             mut deliveries,
             outcomes,
             ..
         } = self;
-        drop(sender);
+        drop(route);
         drop(router);
 
         let drained = Drained {

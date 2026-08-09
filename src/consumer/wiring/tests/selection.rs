@@ -5,6 +5,7 @@ use crate::JsonCodec;
 use crate::consumer::wiring::memory_deps;
 use crate::consumer::{CommonConfiguration, ConsumerConfiguration, ConsumerSetup};
 use crate::high_level::config::TriggerStoreConfiguration;
+use crate::peer::Router;
 use crate::peer::runtime::prepare_router;
 use crate::state_reader::{MemoryReaderBackend, StateReaderDependencies};
 use crate::subsystem::SubsystemName;

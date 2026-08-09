@@ -1,11 +1,7 @@
-//! Router construction and typed consumer response resources.
+//! Router construction and request admission.
 
 use crate::Codec;
 use crate::PeerConfiguration;
-use crate::consumer::decode::{NoRequests, RequestAdmission, SubsystemRequests};
-use crate::consumer::middleware::providers::{FallibleCloneProvider, LeafHandler};
-use crate::consumer::middleware::respond::{RespondHandler, Responder, responding_provider};
-use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use crate::consumer::{ConsumerError, PeerInitError, ShutdownError};
 use crate::peer::{PeerBackend, heartbeat_registry};
 use crate::producer::ProsodyProducer;
@@ -20,33 +16,27 @@ use crate::router::runtime::{
     LocalPeerRuntime, PeerInputs, PeerRuntime, PreparedLocalPeerRuntime, PreparedPeerRuntime,
 };
 use crate::router::{LocalTarget, NodeId, RouterHandle};
-use crate::subsystem::SubsystemName;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::error;
 
-pub(super) type RespondingLeaf<H, C, R> =
-    FallibleCloneProvider<RespondHandler<LeafHandler<H>, C, R>>;
+mod local_route {
+    use crate::response::sender::{ResponseRoute, Then};
+    use crate::router::LocalTarget;
 
-/// Response resources selected by the consumer type.
-pub(crate) trait ConsumerResources: Sized + Send + 'static {
-    /// Request policy selected by this resource type.
-    type Admission: RequestAdmission;
+    pub trait Sealed {}
 
-    /// Builds the request policy before the resources move to shutdown.
-    fn admission(&self) -> Self::Admission;
+    impl Sealed for LocalTarget {}
+    impl<R: ResponseRoute> Sealed for Then<LocalTarget, R> {}
 }
 
-/// A consumer that sends no peer responses.
-pub(crate) struct NoPeer;
+/// A response route that always tries the local node first.
+pub(crate) trait LocalRoute: local_route::Sealed + ResponseRoute {}
 
-/// Response resources owned by one responding consumer.
-#[doc(hidden)]
-pub struct RespondingPeer {
-    subsystem: SubsystemName,
-}
+impl LocalRoute for LocalTarget {}
+impl<R: ResponseRoute> LocalRoute for Then<LocalTarget, R> {}
 
 /// Request identity and pending requests from one router.
 #[derive(Clone)]
@@ -55,17 +45,10 @@ pub struct ProducerHandle {
     pending: Arc<PendingRegistry>,
 }
 
-/// Response route from one router.
-#[doc(hidden)]
-#[derive(Clone)]
-pub struct ConsumerHandle<R> {
-    route: R,
-}
-
 /// One running router with its request, response, and lifecycle capabilities.
-pub(crate) struct PeerRouter<R> {
+pub(crate) struct PeerRouter<R: LocalRoute> {
     producer: ProducerHandle,
-    consumer: ConsumerHandle<R>,
+    route: R,
     /// Sending or dropping asks the coordinator to stop.
     stop: oneshot::Sender<()>,
     /// The explicit teardown result.
@@ -75,7 +58,7 @@ pub(crate) struct PeerRouter<R> {
 /// A prepared runtime selected by the backend type.
 pub(crate) trait PreparedRuntime: Sized + Send {
     type Running: RunningRuntime;
-    type Route: ResponseRoute;
+    type Route: LocalRoute;
 
     fn prepared_node(&self) -> NodeId;
     fn prepared_route(&self) -> Self::Route;
@@ -98,38 +81,30 @@ pub(crate) type RuntimeFor<B> = <B as PeerBackend>::Runtime;
 /// Response route selected by `B`.
 pub(crate) type RouteFor<B> = <RuntimeFor<B> as PreparedRuntime>::Route;
 
-impl<R> PeerRouter<R> {
+impl<R: LocalRoute> PeerRouter<R> {
     #[cfg(test)]
     pub(crate) const fn node(&self) -> NodeId {
         self.producer.node
     }
 
-    pub(crate) fn producer(&self) -> ProducerHandle {
+    pub(crate) fn producer_handle(&self) -> ProducerHandle {
         self.producer.clone()
     }
 
-    pub(crate) fn consumer(&self) -> ConsumerHandle<R>
+    pub(crate) fn route(&self) -> R
     where
         R: Clone,
     {
-        self.consumer.clone()
+        self.route.clone()
     }
 
-    pub(crate) async fn shutdown(self) -> Result<(), ShutdownError> {
+    pub(crate) async fn shutdown_runtime(self) -> Result<(), ShutdownError> {
         self.producer.pending.close_admission();
         let _closed = self.stop.send(());
         self.coordinator.await.map_err(|error| {
             error!(%error, "peer coordinator did not stop cleanly");
             ShutdownError::Teardown
         })?
-    }
-}
-
-impl<R> ConsumerHandle<R> {
-    pub(super) fn map_route<T>(self, map: impl FnOnce(R) -> T) -> ConsumerHandle<T> {
-        ConsumerHandle {
-            route: map(self.route),
-        }
     }
 }
 
@@ -141,44 +116,6 @@ impl ProducerHandle {
         producer: ProsodyProducer<C>,
     ) -> ProsodyRequester<C, RC> {
         ProsodyRequester::new(producer, self.node, Arc::clone(&self.pending))
-    }
-}
-
-impl<R: ResponseRoute> ConsumerHandle<R> {
-    pub(crate) fn responding_provider<C, M, H>(
-        &self,
-        subsystem: SubsystemName,
-        middleware: &M,
-        handler: H,
-    ) -> (M::Provider<RespondingLeaf<H, C, R>>, RespondingPeer)
-    where
-        C: Codec<Payload = Result<H::Output, H::Error>>,
-        M: HandlerMiddleware<H::Payload>,
-        H: FallibleHandler + Clone + Send + Sync + 'static,
-        H::Output: Sync + 'static,
-        H::Error: Sync + 'static,
-    {
-        let responder = Arc::new(Responder::new_route(self.route.clone(), subsystem.clone()));
-        (
-            responding_provider(middleware, handler, responder),
-            RespondingPeer { subsystem },
-        )
-    }
-}
-
-impl ConsumerResources for NoPeer {
-    type Admission = NoRequests;
-
-    fn admission(&self) -> Self::Admission {
-        NoRequests
-    }
-}
-
-impl ConsumerResources for RespondingPeer {
-    type Admission = SubsystemRequests;
-
-    fn admission(&self) -> Self::Admission {
-        SubsystemRequests(self.subsystem.clone())
     }
 }
 
@@ -334,7 +271,7 @@ pub(super) async fn start_router<P: PreparedRuntime>(
     Ok(finish_router(node, route, runtime))
 }
 
-fn finish_router<R, RT>(node: NodeId, route: R, runtime: RT) -> PeerRouter<R>
+fn finish_router<R: LocalRoute, RT>(node: NodeId, route: R, runtime: RT) -> PeerRouter<R>
 where
     RT: RunningRuntime,
 {
@@ -343,7 +280,7 @@ where
     let coordinator = tokio::spawn(run_coordinator(runtime, stopped));
     PeerRouter {
         producer: ProducerHandle { node, pending },
-        consumer: ConsumerHandle { route },
+        route,
         stop,
         coordinator,
     }

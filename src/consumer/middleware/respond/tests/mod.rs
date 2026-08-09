@@ -6,10 +6,11 @@
 //! reads a decoded frame rather than bytes. Every transport assertion runs
 //! after the direct router call returns.
 
-use super::{Responder, responding_provider};
+use super::{RespondHandler, Responder};
 use crate::codec::Codec;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::log::LogMiddleware;
+use crate::consumer::middleware::providers::{FallibleCloneProvider, LeafHandler};
 use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
 use crate::consumer::middleware::tests::test_support::TestError;
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
@@ -67,10 +68,6 @@ thread_local! {
 #[derive(Default)]
 struct ResultProbeCodec;
 
-/// The same codec, except that its error arm is large.
-#[derive(Default)]
-struct LargeProbeCodec;
-
 /// One fleet, one loopback transport, and one responder over them.
 struct Fixture<C: Codec<Payload = Result<(), TestError>>> {
     router: TestRouter,
@@ -95,32 +92,6 @@ impl Codec for ResultProbeCodec {
     ) -> Result<(), ProbeCodecError> {
         SERIALIZES.set(SERIALIZES.get() + 1);
         buf.push(discriminant(payload));
-        Ok(())
-    }
-}
-
-impl Codec for LargeProbeCodec {
-    type Error = ProbeCodecError;
-    type Payload = Result<(), TestError>;
-
-    const FORMAT_ID: &'static str = "test-oversized";
-
-    fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, ProbeCodecError> {
-        decode_result(buf)
-    }
-
-    fn serialize_ref(
-        &mut self,
-        payload: &Self::Payload,
-        buf: &mut Vec<u8>,
-    ) -> Result<(), ProbeCodecError> {
-        SERIALIZES.set(SERIALIZES.get() + 1);
-        let byte = discriminant(payload);
-        if payload.is_ok() {
-            buf.push(byte);
-        } else {
-            buf.resize(64 * 1024, byte);
-        }
         Ok(())
     }
 }
@@ -160,11 +131,12 @@ impl<C: Codec<Payload = Result<(), TestError>>> Fixture<C> {
                 .max_retries(max_retries)
                 .build()?,
         )?;
-        let provider = responding_provider(
-            &retry.layer(LogMiddleware::new()),
-            leaf,
-            Arc::clone(&self.responder),
-        );
+        let provider = retry
+            .layer(LogMiddleware::new())
+            .with_provider(FallibleCloneProvider::new(RespondHandler::new(
+                LeafHandler::new(leaf),
+                Arc::clone(&self.responder),
+            )));
         Ok(provider.handler_for_partition(TOPIC.into(), PARTITION))
     }
 

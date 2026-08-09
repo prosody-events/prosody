@@ -5,9 +5,10 @@ use super::{
     retain_manager, start,
 };
 use crate::consumer::Managers;
+use crate::consumer::decode::NoRequests;
 use crate::consumer::error::{ConsumerError, PeerInitError};
 use crate::heartbeat::HeartbeatRegistry;
-use crate::peer::NoPeer;
+use crate::peer::Router;
 use crate::peer::runtime::prepare_router;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
@@ -24,7 +25,7 @@ async fn a_consumer_without_responses_starts_and_stops() -> Result<()> {
     let config = consumer_config("peer-lifecycle-none")?;
     let managers: Arc<Managers<Value>> = Arc::default();
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
-    let consumer = start(&config, managers, heartbeats, Arc::clone(&log), NoPeer).await?;
+    let consumer = start(&config, managers, heartbeats, Arc::clone(&log), NoRequests).await?;
 
     consumer.shutdown().await?;
 
@@ -57,7 +58,7 @@ async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
         Arc::clone(&managers),
         heartbeats,
         Arc::clone(&log),
-        NoPeer,
+        NoRequests,
     )
     .await?;
     assert!(
@@ -111,7 +112,7 @@ async fn a_second_shutdown_sweeps_nothing() -> Result<()> {
         Arc::clone(&managers),
         heartbeats,
         Arc::clone(&log),
-        NoPeer,
+        NoRequests,
     )
     .await?;
     let loser = consumer.clone();

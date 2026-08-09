@@ -14,7 +14,6 @@ use crate::high_level::config::ModeConfiguration;
 pub use crate::high_level::error::HighLevelClientError;
 pub use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
-use crate::peer::Router;
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::requester::{Outcome, ProsodyRequester, RequestError};
 use crate::state::descriptor::{Registered, StateDescriptor};
@@ -233,7 +232,6 @@ where
         producer: ProsodyProducer<Wire<T>>,
         telemetry: Telemetry,
         handler: T,
-        router: &<B::Router as Router>::Consumer,
     ) -> (
         Result<ProsodyConsumer<Wire<T>>, HighLevelClientError<WireError<T>>>,
         ModeConfiguration,
@@ -251,11 +249,7 @@ where
                 defer,
                 common,
             } => Box::pin(
-                ProsodyConsumer::<Wire<T>>::pipeline_consumer_with_backend::<
-                    T,
-                    B::Reader,
-                    <B::Router as Router>::Consumer,
-                >(
+                ProsodyConsumer::<Wire<T>>::pipeline_consumer_with_backend::<T, B::Reader>(
                     deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
                     PipelineMiddlewareConfiguration {
                         retry: retry.clone(),
@@ -264,7 +258,6 @@ where
                     },
                     telemetry,
                     handler,
-                    router,
                 ),
             )
             .await
@@ -277,7 +270,6 @@ where
             } => Box::pin(ProsodyConsumer::low_latency_consumer_with_backend::<
                 T,
                 B::Reader,
-                <B::Router as Router>::Consumer,
             >(
                 deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
                 LowLatencyMiddlewareConfiguration {
@@ -287,7 +279,6 @@ where
                 producer,
                 telemetry,
                 handler,
-                router,
             ))
             .await
             .map_err(Into::into),
@@ -295,12 +286,10 @@ where
                 Box::pin(ProsodyConsumer::<Wire<T>>::best_effort_consumer::<
                     T,
                     B::Reader,
-                    <B::Router as Router>::Consumer,
                 >(
                     deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
                     telemetry,
                     handler,
-                    router,
                 ))
                 .await
                 .map_err(Into::into)
@@ -315,7 +304,7 @@ where
         producer: ProsodyProducer<Wire<T>>,
         telemetry: Telemetry,
         handler: T,
-        router: &<B::Router as Router>::Consumer,
+        router: &B::Router,
         subsystem: &SubsystemName,
     ) -> (
         Result<ProsodyConsumer<Wire<T>>, HighLevelClientError<WireError<T>>>,
@@ -340,7 +329,7 @@ where
                     T,
                     Reply<T>,
                     B::Reader,
-                    <B::Router as Router>::Consumer,
+                    B::Router,
                 >(
                     deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
                     PipelineMiddlewareConfiguration {
@@ -366,7 +355,7 @@ where
                     T,
                     Reply<T>,
                     B::Reader,
-                    <B::Router as Router>::Consumer,
+                    B::Router,
                 >(
                     deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
                     LowLatencyMiddlewareConfiguration {
@@ -387,7 +376,7 @@ where
                     T,
                     Reply<T>,
                     B::Reader,
-                    <B::Router as Router>::Consumer,
+                    B::Router,
                 >(
                     deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
                     telemetry,
@@ -418,8 +407,6 @@ where
         };
 
         let shared = self.reader.deps();
-        let consumer_peer = self.router.consumer();
-
         let (built, config) = if let Some(subsystem) = &self.subsystem {
             Self::build_responding_consumer(
                 config,
@@ -427,7 +414,7 @@ where
                 self.producer.clone(),
                 self.telemetry.clone(),
                 handler.clone(),
-                &consumer_peer,
+                &self.router,
                 subsystem,
             )
             .await
@@ -438,7 +425,6 @@ where
                 self.producer.clone(),
                 self.telemetry.clone(),
                 handler.clone(),
-                &consumer_peer,
             )
             .await
         };

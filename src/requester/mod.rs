@@ -201,7 +201,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         }
 
         let deadline = RequestDeadline::after(timeout).ok_or(RequestError::DeadlineOutOfRange)?;
-        let mut registration = self.registry.register(subsystems, timeout)?;
+        let mut registration = self.registry.register(subsystems, deadline)?;
         Span::current().record("request.id", display(registration.id()));
 
         append_request_headers(
