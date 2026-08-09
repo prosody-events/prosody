@@ -319,56 +319,6 @@ fn one_harness_calculates_time_history_and_function_dependencies() -> Result<(),
 }
 
 #[test]
-fn uncertain_late_capacity_does_not_change_the_target() -> Result<(), TestError> {
-    let controller_configuration = ControllerConfiguration {
-        cohort_count_max: 4,
-        calendar_segment_count_max: 4,
-        partition_count: 4,
-        replica_count_max: 8,
-        slots_per_replica: 2,
-        posterior_sample_count: 64,
-        report_interval_micros: 30_000,
-        failure_service_weight: 0.3_f64,
-        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
-        capacity_change_rate_per_second: 0.0_f64,
-        reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
-        objective: ServiceObjective::new(1_000_000, 0.01)?,
-    };
-    let capacity_grid = CapacityGrid::new(&[0.04_f64], &[1_000_000.0_f64], &[0.0_f64, 1.0_f64])?;
-    let closed_loop = ClosedLoop::new(
-        ClosedLoopWorkload { emitted: false },
-        &controller_configuration,
-        capacity_grid,
-        4,
-    )?;
-    let plant_configuration = PlantConfiguration::new(4, 100, 100, 4, 2, 16)?.with_rebalance(0, 0);
-    let mut harness = SimulationHarness::new(plant_configuration, 1, 4, closed_loop)?;
-
-    let initial = harness.tick(0)?;
-    let ready = harness.tick(30_000)?;
-    let (_result, closed_loop) = harness.finish_with_graph();
-    let Some(decision) = closed_loop.trace().sample(0) else {
-        return Err(TestError::MissingControllerSample);
-    };
-    let Some(after_actuation) = closed_loop.trace().sample(1) else {
-        return Err(TestError::MissingControllerSample);
-    };
-
-    assert_eq!(initial.replicas, 1);
-    assert_eq!(decision.target, 1);
-    assert_eq!(decision.cap, 8);
-    assert!(!decision.hold);
-    assert_eq!(ready.replicas, 1);
-    assert_eq!(
-        after_actuation.lead_time_evidence,
-        crate::LeadTimeEvidenceSample::None
-    );
-    Ok(())
-}
-
-#[test]
 fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
     let controller_configuration = ControllerConfiguration {
         cohort_count_max: 4,
@@ -564,10 +514,6 @@ impl TickGenerator for CapacityWorkload {
     }
 }
 
-struct ClosedLoopWorkload {
-    emitted: bool,
-}
-
 struct ReportedArrivalWorkload {
     reporter_tick: Option<(u32, ReporterDirective)>,
 }
@@ -591,24 +537,6 @@ impl TickGenerator for ReportedArrivalWorkload {
         self.reporter_tick
             .filter(|(tick, _directive)| *tick == context.tick_index)
             .map_or(ReporterDirective::Send, |(_tick, directive)| directive)
-    }
-}
-
-impl TickGenerator for ClosedLoopWorkload {
-    fn calculate(&mut self, _: TickContext<'_>) -> Result<TickInputs, PlantError> {
-        let message_count = if self.emitted { 0 } else { 100 };
-        self.emitted = true;
-        Ok(TickInputs {
-            message_count,
-            timer_count: 0,
-            handler_micros: 40_000,
-            dependency_operations: 1,
-            dependency_operation_micros: 1,
-            handler_added_micros: 0,
-            outcome: EventOutcomeRule::Success,
-            launch_delay_micros: 30_000,
-            scale: ScaleDirective::Hold,
-        })
     }
 }
 

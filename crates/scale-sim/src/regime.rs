@@ -12,10 +12,10 @@ use crate::series::{
 };
 use crate::{
     AttemptFrame, AttemptModel, AttemptParameters, CalendarForecastInput, ClosedLoop,
-    ClosedLoopError, ConcurrencyLatencyCurve, ControllerTrace, DEFAULT_CONCURRENCY_PER_REPLICA,
-    DEFAULT_FAILURE_WEIGHT, EventContext, EventInputs, FaultPattern, MetricTrace,
-    PlantConfiguration, PlantError, ReporterDirective, ScaleDirective, SeriesCell,
-    SimulationHarness, SimulationResult, TickContext, TickGenerator, TickInputs,
+    ClosedLoopError, ConcurrencyLatencyCurve, ControllerSample, ControllerTrace,
+    DEFAULT_CONCURRENCY_PER_REPLICA, DEFAULT_FAILURE_WEIGHT, EventContext, EventInputs,
+    FaultPattern, MetricTrace, PlantConfiguration, PlantError, ReporterDirective, ScaleDirective,
+    SeriesCell, SimulationHarness, SimulationResult, TickContext, TickGenerator, TickInputs,
 };
 
 const CAPACITY_COLLAPSE_GRID: &[f64] = &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64];
@@ -25,14 +25,19 @@ const HOT_KEY_EVENT_COUNT: u32 = 6_000;
 const HOT_PARTITION_EVENT_COUNT: u32 = 60_000;
 const SEASONAL_EVENT_COUNT: u32 = 3_000;
 const TRANSIENT_EVENT_COUNT: u32 = 36_000;
+const REBALANCE_EVENT_COUNT: u32 = 32_500;
+const REPLICA_CEILING_EVENT_COUNT: u32 = 230_400;
 const CAPACITY_EVENT_COUNT_MAX: u32 = 300_000;
 const CAPACITY_RESPONSE_EVENT_COUNT: u32 = 231_000;
 const LINEAR_RESPONSE_EVENT_COUNT: u32 = 462_000;
-const HISTORY_EVENT_COUNT_MAX: u32 = 64_000;
+const HISTORY_EVENT_COUNT_MAX: u32 = 240_000;
 const CALENDAR_HISTORY_EXPOSURE_SECONDS: u32 = 900;
+const SHORT_BURST_RELEASE_MICROS: u64 = 120_000_000;
 const CALENDAR_PRIOR_SHAPE: f64 = 4.0_f64;
 const CALENDAR_PRIOR_RATE_SECONDS: f64 = 0.01_f64;
 const CALENDAR_MODEL_PRIOR_PROBABILITY: f64 = 0.5_f64;
+const HISTORICAL_MAXIMUM_LEAD_SECONDS: f64 = 90.0_f64;
+const HISTORICAL_STEP_DURATION_SECONDS: f64 = 90.0_f64;
 
 /// A principal deterministic plant regime for plot review.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,13 +303,7 @@ fn validate_closed_loop_stimulus(
         PrincipalRegime::LinearThroughput
         | PrincipalRegime::FlatPostKnee
         | PrincipalRegime::DecliningPostKnee => input_sum(run.inputs(), "message_count") > 100_000,
-        PrincipalRegime::ShortBurst => {
-            run.events().len() == EVENT_COUNT as usize
-                && run
-                    .events()
-                    .iter()
-                    .all(|event| event.release_micros == 1_000_000)
-        }
+        PrincipalRegime::ShortBurst => validate_short_burst_stimulus(run),
         PrincipalRegime::SeasonalWaves => {
             let first = run.events().first().map(|event| event.release_micros);
             run.events()
@@ -348,6 +347,7 @@ fn validate_closed_loop_stimulus(
         }),
         PrincipalRegime::RebalanceStorm => {
             input_distinct_positive_count(run.inputs(), "external_target") >= 2
+                && input_sum(run.inputs(), "message_count") == u64::from(REBALANCE_EVENT_COUNT)
         }
         PrincipalRegime::HandlerContention => run
             .settlements()
@@ -363,10 +363,9 @@ fn validate_closed_loop_stimulus(
         PrincipalRegime::AggregatorReplacement => (0..run.controller().len())
             .filter_map(|index| run.controller().sample(index))
             .any(|sample| sample.reporter == ReporterDirective::ReplaceAggregator),
-        PrincipalRegime::ReplicaCeiling => (0..run.controller().len())
-            .filter_map(|index| run.controller().sample(index))
-            .filter(|sample| !sample.hold)
-            .all(|sample| sample.target <= 8),
+        PrincipalRegime::ReplicaCeiling => {
+            run.events().len() == REPLICA_CEILING_EVENT_COUNT as usize
+        }
         PrincipalRegime::HistoricalMatch => {
             let current = input_sum(run.inputs(), "message_count");
             let historical = input_sum(run.inputs(), "historical_message_count");
@@ -394,56 +393,249 @@ fn validate_closed_loop_stimulus(
     )
 }
 
+fn validate_short_burst_stimulus(run: &PrincipalRun) -> bool {
+    run.events().len() == EVENT_COUNT as usize
+        && run
+            .events()
+            .iter()
+            .all(|event| event.release_micros == SHORT_BURST_RELEASE_MICROS)
+}
+
 fn validate_closed_loop_claim(
     regime: PrincipalRegime,
     run: &PrincipalRun,
 ) -> Result<(), RegimeValidationError> {
-    let invariant = match regime {
-        PrincipalRegime::LinearThroughput => (
-            run.settlements().len() == run.events().len()
-                && slo_miss_count(run, regime.budget_micros()).saturating_mul(100)
-                    <= run.settlements().len(),
-            "the controller did not complete the linear workload within its SLO allowance",
-        ),
-        PrincipalRegime::ShortBurst => (
-            (0..run.controller.len()).all(|index| {
-                run.controller
-                    .sample(index)
-                    .is_some_and(|sample| sample.target == 1)
-            }),
-            "the controller requested capacity that cannot arrive before the burst deadlines",
-        ),
-        PrincipalRegime::HotPartition => (
-            single_worker_constraint_binds(run),
+    match regime {
+        PrincipalRegime::Idle => validate_idle_claim(run),
+        PrincipalRegime::ApplicationLimited => validate_application_limited_claim(run),
+        PrincipalRegime::LinearThroughput => validate_linear_claim(run),
+        PrincipalRegime::ShortBurst => validate_short_burst_claim(run),
+        PrincipalRegime::SeasonalWaves => validate_seasonal_claim(run),
+        PrincipalRegime::HotPartition => validate_single_worker_claim(
+            regime,
+            run,
             "the decision did not expose the binding partition-placement loss",
         ),
-        PrincipalRegime::SeasonalWaves => (
-            (0..run.controller.len()).any(|index| {
-                run.controller
-                    .sample(index)
-                    .is_some_and(|sample| sample.at_micros < 120_000_000 && sample.target > 1)
-            }),
-            "the controller did not request forecast capacity before the first seasonal wave",
-        ),
-        PrincipalRegime::TimerWave => (
-            (0..run.controller.len()).any(|index| {
-                run.controller
-                    .sample(index)
-                    .is_some_and(|sample| sample.at_micros < 120_000_000 && sample.target > 1)
-            }),
-            "the controller did not request capacity before the known timer wave",
-        ),
-        PrincipalRegime::HotSerializedKey => (
-            single_worker_constraint_binds(run),
+        PrincipalRegime::TimerWave => validate_timer_wave_claim(run),
+        PrincipalRegime::HotSerializedKey => validate_single_worker_claim(
+            regime,
+            run,
             "the decision did not expose the binding serialized-key loss",
         ),
-        _ => return Ok(()),
-    };
-    require_regime(
-        invariant.0,
-        regime,
-        RegimeExperiment::ClosedLoop,
-        invariant.1,
+        PrincipalRegime::TransientFailures => validate_transient_failure_claim(run),
+        PrincipalRegime::RebalanceStorm => validate_rebalance_storm_claim(run),
+        PrincipalRegime::LooseBudgetBacklog => validate_loose_budget_claim(run),
+        PrincipalRegime::ReplicaCeiling => validate_replica_ceiling_claim(run),
+        PrincipalRegime::HistoricalMatch => validate_historical_match_claim(run),
+        PrincipalRegime::HistoricalExceeded => validate_historical_exceeded_claim(run),
+        PrincipalRegime::HistoricalUnder => validate_historical_under_claim(run),
+        PrincipalRegime::HistoricalMissing => validate_historical_missing_claim(run),
+        _ => Ok(()),
+    }
+}
+
+fn validate_idle_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    require_closed_loop(
+        replica_seconds(run) <= 3.0_f64 * run_duration_seconds(run),
+        PrincipalRegime::Idle,
+        "idle capacity exceeded three average replicas",
+    )?;
+    require_closed_loop(
+        final_target(run) == Some(1),
+        PrincipalRegime::Idle,
+        "the idle controller did not finish at one replica",
+    )
+}
+
+fn validate_application_limited_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    require_closed_loop(
+        minimum_cap(run) >= 8,
+        PrincipalRegime::ApplicationLimited,
+        "uninformative evidence created a false saturation cap",
+    )?;
+    require_closed_loop(
+        final_no_knee_probability(run) >= 0.25_f64,
+        PrincipalRegime::ApplicationLimited,
+        "uninformative evidence removed the no-knee hypothesis",
+    )
+}
+
+fn validate_linear_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    require_closed_loop(
+        run.settlements().len() == run.events().len()
+            && slo_miss_count(run, PrincipalRegime::LinearThroughput.budget_micros())
+                .saturating_mul(100)
+                <= run.settlements().len(),
+        PrincipalRegime::LinearThroughput,
+        "the controller did not complete the linear workload within its SLO allowance",
+    )
+}
+
+fn validate_short_burst_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    const EXEMPTION_END_MICROS: u64 = SHORT_BURST_RELEASE_MICROS + 5_000_000;
+    let bounded_excursion = controller_samples(run).all(|sample| {
+        (SHORT_BURST_RELEASE_MICROS..EXEMPTION_END_MICROS).contains(&sample.at_micros)
+            || sample.target == 1
+    });
+    require_closed_loop(
+        bounded_excursion && final_target(run) == Some(1),
+        PrincipalRegime::ShortBurst,
+        "the controller held capacity after the short burst became sunk work",
+    )
+}
+
+fn validate_seasonal_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    let minimum_between_waves = controller_samples(run)
+        .filter(|sample| (120_000_000..240_000_000).contains(&sample.at_micros))
+        .map(|sample| sample.target)
+        .min();
+    require_closed_loop(
+        minimum_between_waves.is_some_and(|target| target <= 2),
+        PrincipalRegime::SeasonalWaves,
+        "the controller did not return to idle capacity between seasonal waves",
+    )?;
+    require_closed_loop(
+        release_window_miss_fraction(
+            run,
+            240_000_000,
+            u64::MAX,
+            PrincipalRegime::SeasonalWaves.budget_micros(),
+        ) <= 0.01_f64,
+        PrincipalRegime::SeasonalWaves,
+        "the controller missed the SLO for the forecast seasonal waves",
+    )
+}
+
+fn validate_single_worker_claim(
+    regime: PrincipalRegime,
+    run: &PrincipalRun,
+    invariant: &'static str,
+) -> Result<(), RegimeValidationError> {
+    require_closed_loop(single_worker_constraint_binds(run), regime, invariant)
+}
+
+fn validate_timer_wave_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    let minimum_before_wave = controller_samples(run)
+        .filter(|sample| sample.at_micros < 120_000_000)
+        .map(|sample| sample.target)
+        .min();
+    require_closed_loop(
+        minimum_before_wave.is_some_and(|target| target <= 2),
+        PrincipalRegime::TimerWave,
+        "the controller did not establish an idle baseline before the timer wave",
+    )?;
+    require_closed_loop(
+        slo_miss_fraction(run, PrincipalRegime::TimerWave.budget_micros()) <= 0.01_f64,
+        PrincipalRegime::TimerWave,
+        "the controller missed the SLO for the known timer wave",
+    )
+}
+
+fn validate_transient_failure_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    require_closed_loop(
+        maximum_target(run) <= 12,
+        PrincipalRegime::TransientFailures,
+        "retry demand caused excessive replica growth",
+    )
+}
+
+fn validate_rebalance_storm_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    const CALM_START_MICROS: u64 = 5_000_000;
+    require_closed_loop(
+        target_change_count(run, CALM_START_MICROS) <= 2,
+        PrincipalRegime::RebalanceStorm,
+        "the controller churned during the calm rebalance tail",
+    )?;
+    require_closed_loop(
+        minimum_cap(run) >= 2,
+        PrincipalRegime::RebalanceStorm,
+        "rebalance evidence created a false saturation cap",
+    )
+}
+
+fn validate_loose_budget_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    let clear_seconds = f64::from(EVENT_COUNT) / 32.0_f64;
+    require_closed_loop(
+        run.settlements().len() == run.events().len()
+            && slo_miss_count(run, PrincipalRegime::LooseBudgetBacklog.budget_micros()) == 0,
+        PrincipalRegime::LooseBudgetBacklog,
+        "the controller did not clear the backlog within the loose SLO",
+    )?;
+    require_closed_loop(
+        replica_seconds(run) <= run_duration_seconds(run) + 3.0_f64 * clear_seconds,
+        PrincipalRegime::LooseBudgetBacklog,
+        "the controller used excessive capacity to clear the loose-SLO backlog",
+    )?;
+    require_closed_loop(
+        minimum_cap(run) >= maximum_target(run),
+        PrincipalRegime::LooseBudgetBacklog,
+        "the saturation cap fell below a selected target",
+    )
+}
+
+fn validate_replica_ceiling_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    let targets_valid = controller_samples(run)
+        .filter(|sample| !sample.hold)
+        .all(|sample| sample.target <= 8);
+    require_closed_loop(
+        targets_valid,
+        PrincipalRegime::ReplicaCeiling,
+        "the controller exceeded the configured replica ceiling",
+    )?;
+    require_closed_loop(
+        controller_samples(run).any(|sample| !sample.hold && sample.target == 8),
+        PrincipalRegime::ReplicaCeiling,
+        "the controller did not bind at the configured replica ceiling",
+    )?;
+    let oracle_miss_fraction = (3_840.0_f64 - 8.0_f64 * 320.0_f64) / 3_840.0_f64;
+    require_closed_loop(
+        slo_miss_fraction(run, PrincipalRegime::ReplicaCeiling.budget_micros())
+            <= oracle_miss_fraction + 0.05_f64,
+        PrincipalRegime::ReplicaCeiling,
+        "the replica ceiling result exceeded the eight-replica oracle",
+    )
+}
+
+fn validate_historical_match_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    require_closed_loop(
+        slo_miss_fraction(run, PrincipalRegime::HistoricalMatch.budget_micros()) <= 0.01_f64,
+        PrincipalRegime::HistoricalMatch,
+        "matching history did not keep the workload inside its SLO",
+    )
+}
+
+fn validate_historical_exceeded_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    let excess_fraction = (2_000.0_f64 - 1_000.0_f64) / 2_000.0_f64;
+    let reactive_bound = excess_fraction
+        * (HISTORICAL_MAXIMUM_LEAD_SECONDS / HISTORICAL_STEP_DURATION_SECONDS)
+        + 0.01_f64;
+    require_closed_loop(
+        slo_miss_fraction(run, PrincipalRegime::HistoricalExceeded.budget_micros())
+            <= reactive_bound,
+        PrincipalRegime::HistoricalExceeded,
+        "live demand exceeded the reactive historical SLO bound",
+    )
+}
+
+fn validate_historical_under_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    require_closed_loop(
+        slo_miss_fraction(run, PrincipalRegime::HistoricalUnder.budget_micros()) <= 0.01_f64,
+        PrincipalRegime::HistoricalUnder,
+        "lower live demand did not stay inside its SLO",
+    )?;
+    let history_cost = 8.0_f64 * run_duration_seconds(run);
+    require_closed_loop(
+        replica_seconds(run) < 0.8_f64 * history_cost,
+        PrincipalRegime::HistoricalUnder,
+        "lower live demand did not reduce historical replica cost",
+    )
+}
+
+fn validate_historical_missing_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    require_closed_loop(
+        replica_seconds(run) <= 3.0_f64 * run_duration_seconds(run),
+        PrincipalRegime::HistoricalMissing,
+        "missing history caused excessive replica cost",
     )
 }
 
@@ -457,6 +649,142 @@ fn slo_miss_count(run: &PrincipalRun, budget_micros: u64) -> usize {
                 > budget_micros
         })
         .count()
+}
+
+fn slo_miss_fraction(run: &PrincipalRun, budget_micros: u64) -> f64 {
+    if run.events().is_empty() {
+        return 0.0_f64;
+    }
+    let unsettled = run.events().len().saturating_sub(run.settlements().len());
+    count_as_f64(
+        u64::try_from(slo_miss_count(run, budget_micros).saturating_add(unsettled))
+            .map_or(u64::MAX, |count| count),
+    ) / count_as_f64(u64::try_from(run.events().len()).map_or(u64::MAX, |count| count))
+}
+
+fn release_window_miss_fraction(
+    run: &PrincipalRun,
+    start_micros: u64,
+    end_micros: u64,
+    budget_micros: u64,
+) -> f64 {
+    let event_count = run
+        .events()
+        .iter()
+        .filter(|event| (start_micros..end_micros).contains(&event.release_micros))
+        .count();
+    let mut settled_count = 0_usize;
+    let mut miss_count = 0_usize;
+    for settlement in run
+        .settlements()
+        .iter()
+        .filter(|settlement| (start_micros..end_micros).contains(&settlement.release_micros))
+    {
+        settled_count = settled_count.saturating_add(1);
+        miss_count = miss_count.saturating_add(usize::from(
+            settlement
+                .settle_micros
+                .saturating_sub(settlement.release_micros)
+                > budget_micros,
+        ));
+    }
+    if event_count == 0 {
+        1.0_f64
+    } else {
+        let unsettled_count = event_count.saturating_sub(settled_count);
+        count_as_f64(
+            u64::try_from(miss_count.saturating_add(unsettled_count))
+                .map_or(u64::MAX, |count| count),
+        ) / count_as_f64(u64::try_from(event_count).map_or(u64::MAX, |count| count))
+    }
+}
+
+fn replica_seconds(run: &PrincipalRun) -> f64 {
+    let end_micros = run.stop.at_micros;
+    let mut replicas = run.simulation.initial_replicas;
+    let mut cursor = 0_u64;
+    let mut area = 0.0_f64;
+    for change in &run.simulation.changes {
+        if change.at_micros >= end_micros || change.at_micros < cursor {
+            continue;
+        }
+        area +=
+            f64::from(replicas) * Duration::from_micros(change.at_micros - cursor).as_secs_f64();
+        cursor = change.at_micros;
+        replicas = change.replicas;
+    }
+    area + f64::from(replicas) * Duration::from_micros(end_micros - cursor).as_secs_f64()
+}
+
+fn run_duration_seconds(run: &PrincipalRun) -> f64 {
+    Duration::from_micros(run.stop.at_micros).as_secs_f64()
+}
+
+fn controller_samples(run: &PrincipalRun) -> impl Iterator<Item = ControllerSample> + '_ {
+    (0..run.controller.len()).filter_map(|index| run.controller.sample(index))
+}
+
+fn final_target(run: &PrincipalRun) -> Option<u32> {
+    controller_samples(run).last().map(|sample| sample.target)
+}
+
+fn minimum_cap(run: &PrincipalRun) -> u32 {
+    controller_samples(run)
+        .map(|sample| sample.cap)
+        .min()
+        .map_or(0, |cap| cap)
+}
+
+fn maximum_target(run: &PrincipalRun) -> u32 {
+    controller_samples(run)
+        .map(|sample| sample.target)
+        .max()
+        .map_or(0, |target| target)
+}
+
+fn final_no_knee_probability(run: &PrincipalRun) -> f64 {
+    controller_samples(run)
+        .last()
+        .map_or(f64::NAN, |sample| sample.no_knee_probability)
+}
+
+fn target_change_count(run: &PrincipalRun, start_micros: u64) -> usize {
+    let mut prior = None;
+    let mut changes = 0_usize;
+    for sample in controller_samples(run).filter(|sample| sample.at_micros >= start_micros) {
+        if prior.is_some_and(|target| target != sample.target) {
+            changes = changes.saturating_add(1);
+        }
+        prior = Some(sample.target);
+    }
+    changes
+}
+
+fn require_closed_loop(
+    condition: bool,
+    regime: PrincipalRegime,
+    invariant: &'static str,
+) -> Result<(), RegimeValidationError> {
+    require_regime(condition, regime, RegimeExperiment::ClosedLoop, invariant)
+}
+
+fn capacity_coverage(run: &PrincipalRun) -> (u64, u64) {
+    let mut windows = 0_u64;
+    let mut covered = 0_u64;
+    for sample in controller_samples(run) {
+        if !matches!(
+            sample.capacity_evidence,
+            crate::CapacityEvidenceSample::Window(_)
+        ) || !sample.capacity_predictive_rank.is_finite()
+        {
+            continue;
+        }
+        windows = windows.saturating_add(1);
+        covered = covered.saturating_add(u64::from(
+            (0.1_f64..=0.9_f64).contains(&sample.capacity_predictive_rank),
+        ));
+    }
+    (windows, covered)
 }
 
 fn single_worker_constraint_binds(run: &PrincipalRun) -> bool {
@@ -544,6 +872,16 @@ fn validate_run_envelope(
             regime,
             experiment,
             "a controller sample has an invalid target or cap",
+        )?;
+    }
+    let (capacity_window_count, capacity_covered_count) = capacity_coverage(run);
+    if capacity_window_count >= 10 {
+        let coverage = count_as_f64(capacity_covered_count) / count_as_f64(capacity_window_count);
+        require_regime(
+            (coverage - 0.8_f64).abs() <= 0.15_f64,
+            regime,
+            experiment,
+            "capacity predictive coverage differs from its stated probability",
         )?;
     }
     let has_external_target = (0..run.inputs.len()).any(|row| {
@@ -1409,9 +1747,14 @@ impl PrincipalDefinition {
                 Self::capacity_closed_loop(100, 100).shared_resource(64, 320, 2)
             }
             PrincipalRegime::ShortBurst => standard
-                .messages(ArrivalSeries::Once(EVENT_COUNT))
+                .messages(ArrivalSeries::PeriodicDelayed {
+                    count: EVENT_COUNT,
+                    first_micros: SHORT_BURST_RELEASE_MICROS,
+                    interval_micros: SHORT_BURST_RELEASE_MICROS,
+                    count_max: EVENT_COUNT,
+                })
                 .handler(100_000)
-                .schedule(RunSchedule::one_shot())
+                .schedule(RunSchedule::short_burst())
                 .initial_replicas(1),
             PrincipalRegime::SeasonalWaves => {
                 let demand = ArrivalSeries::PeriodicDelayed {
@@ -1479,8 +1822,15 @@ impl PrincipalDefinition {
                 standard.permanent_rejections(OccurrenceSeries::Every(10))
             }
             PrincipalRegime::RebalanceStorm => standard
+                .messages(ArrivalSeries::Rate {
+                    per_second: 500,
+                    count_max: REBALANCE_EVENT_COUNT,
+                })
+                .handler(100_000)
                 .scale(ScaleSeries::RebalanceStorm)
-                .launch_delay(LaunchDelaySeries::Immediate),
+                .launch_delay(LaunchDelaySeries::Immediate)
+                .schedule(RunSchedule::rebalance_storm())
+                .event_count_max(REBALANCE_EVENT_COUNT),
             PrincipalRegime::HandlerContention => standard
                 .messages(ArrivalSeries::Periodic {
                     count: 400,
@@ -1488,10 +1838,18 @@ impl PrincipalDefinition {
                     count_max: EVENT_COUNT,
                 })
                 .schedule(RunSchedule::handler_contention()),
-            PrincipalRegime::LooseBudgetBacklog | PrincipalRegime::ReplicaCeiling => standard
+            PrincipalRegime::LooseBudgetBacklog => standard
                 .messages(ArrivalSeries::Once(EVENT_COUNT))
                 .handler(1_000_000)
                 .schedule(RunSchedule::one_shot()),
+            PrincipalRegime::ReplicaCeiling => standard
+                .messages(ArrivalSeries::Rate {
+                    per_second: 3_840,
+                    count_max: REPLICA_CEILING_EVENT_COUNT,
+                })
+                .handler(100_000)
+                .schedule(RunSchedule::replica_ceiling())
+                .event_count_max(REPLICA_CEILING_EVENT_COUNT),
             PrincipalRegime::MissingReporter => {
                 standard.reporter(ReporterPolicy::MissingAfter { at_micros: 500_000 })
             }
@@ -2349,6 +2707,43 @@ impl RunSchedule {
             start_micros: 1_000_000,
             workload_end_micros: 1_000_000,
             ..Self::standard()
+        }
+    }
+
+    const fn short_burst() -> Self {
+        Self {
+            start_micros: 0,
+            workload_end_micros: SHORT_BURST_RELEASE_MICROS,
+            workload_interval_micros: 1_000_000,
+            followup_interval_micros: 1_000_000,
+            maximum_micros: 300_000_000,
+            stop: StopCondition::IdleStable { sample_count: 3 },
+        }
+    }
+
+    const fn replica_ceiling() -> Self {
+        Self {
+            start_micros: 0,
+            workload_end_micros: 60_000_000,
+            workload_interval_micros: 1_000_000,
+            followup_interval_micros: 1_000_000,
+            maximum_micros: 150_000_000,
+            stop: StopCondition::FixedDuration {
+                reason: RunStopReason::DurationComplete,
+            },
+        }
+    }
+
+    const fn rebalance_storm() -> Self {
+        Self {
+            start_micros: 0,
+            workload_end_micros: 65_000_000,
+            workload_interval_micros: 100_000,
+            followup_interval_micros: 1_000_000,
+            maximum_micros: 65_000_000,
+            stop: StopCondition::FixedDuration {
+                reason: RunStopReason::DurationComplete,
+            },
         }
     }
 
