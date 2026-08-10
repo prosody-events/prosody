@@ -17,7 +17,8 @@ use crate::planning::{
 };
 use crate::reliability::{RELIABILITY_BIN_COUNT, ReliabilityFactor};
 use crate::types::{
-    ActuationCommitments, BacklogColumns, CalendarForecast, CohortColumns, WorkCohorts,
+    ActuationCommitments, BacklogColumns, CalendarForecast, CohortColumns,
+    SCHEDULED_RELEASE_COUNT_MAX, ScheduledRelease, WorkCohorts,
 };
 use crate::{
     ApplyDecision, ArrivalPosterior, CapacityCurve, CapacityGrid, Configuration,
@@ -30,6 +31,12 @@ const DECISION_SCENARIO_SEED: u64 = 0x7363_616c_652d_636f;
 const DECISION_BOOTSTRAP_COUNT: u32 = 128;
 const DECISION_SAMPLE_COUNT_MIN: u32 = 1_024;
 const STRATIFICATION_SHIFT: u64 = 0x9e37_79b9_7f4a_7c15;
+/// Schedule visibility covers the worst launch delay, rebalance, report,
+/// objective budget, and slack. A posterior lead-time quantile can replace it.
+const SCHEDULE_VISIBILITY_MICROS: u64 = 150_000_000;
+/// Scheduled work has no known partition. Resource feasibility prices it.
+/// Partition placement excludes this sentinel before it indexes columns.
+const SCHEDULED_PARTITION: u32 = u32::MAX;
 
 /// One calculated reason that a posterior scenario rejects an action.
 #[repr(u8)]
@@ -432,6 +439,7 @@ impl ScratchBounds {
         let work_cohort_count_max = partition_count
             .checked_mul(DemandClass::COUNT_USIZE)
             .and_then(|count| cohort_count_max.checked_add(count))
+            .and_then(|count| count.checked_add(SCHEDULED_RELEASE_COUNT_MAX))
             .ok_or(ConfigurationError::PlatformLimit)?;
         let partition_offset_count = partition_count
             .checked_add(1)
@@ -702,6 +710,7 @@ pub fn step(
         backlog,
         arrivals,
         calendar,
+        scheduled_releases,
         partition_arrivals,
         resource_window,
         attempt_outcomes,
@@ -744,6 +753,7 @@ pub fn step(
         scratch,
         cohorts,
         backlog,
+        scheduled_releases,
         calendar,
         actuation_commitments,
     );
@@ -758,14 +768,16 @@ fn select_target(
     scratch: &mut ScaleScratch,
     cohorts: &CohortColumns,
     backlog: &BacklogColumns,
+    scheduled_releases: &[ScheduledRelease],
     calendar: Option<CalendarForecast<'_>>,
     actuation_commitments: &ActuationCommitments,
 ) -> ScaleDecision {
     let (normal_events, failure_events) = demand_class_totals(cohorts, backlog);
-    prepare_work_cohorts(state, scratch, cohorts, backlog);
+    prepare_work_cohorts(state, scratch, cohorts, backlog, scheduled_releases);
     prepare_partition_work(state, scratch);
     if scratch.active_partition_count == 0
-        && state.arrivals.expected_rate(state.model_time.as_micros()) > f64::EPSILON
+        && (state.arrivals.expected_rate(state.model_time.as_micros()) > f64::EPSILON
+            || has_visible_scheduled_release(state, scheduled_releases))
     {
         scratch.active_partition_count = state.configuration.partition_count;
     }
@@ -1317,9 +1329,15 @@ fn evaluate_forecast_scenario(
             [path_first..path_first + path_length],
         rates: &scratch.scenario_arrival_path_rates[path_first..path_first + path_length],
     };
-    scratch.scenario_event_count[forecast.scenario] = forecast.normal_events
-        + forecast.failure_events
-        + arrival_path.integrated_count(start_seconds, disturbance_horizon_seconds);
+    scratch.scenario_event_count[forecast.scenario] = scenario_event_count(
+        forecast.normal_events,
+        forecast.failure_events,
+        &arrival_path,
+        start_seconds,
+        disturbance_horizon_seconds,
+        &scratch.resource_cohorts,
+        forecast.disturbance_horizon_micros,
+    );
     let worker_count = if scratch.candidate_workspaces[0].edf.has_common_interval() {
         1
     } else {
@@ -1364,6 +1382,31 @@ fn evaluate_forecast_scenario(
     }
 }
 
+fn scheduled_event_count(cohorts: &WorkCohorts, horizon_micros: u64) -> f64 {
+    (0..cohorts.len())
+        .filter(|&cohort| {
+            cohorts.partition(cohort) == SCHEDULED_PARTITION
+                && cohorts.release_micros(cohort) <= horizon_micros
+        })
+        .map(|cohort| cohorts.work_slot_seconds(cohort))
+        .sum()
+}
+
+fn scenario_event_count(
+    normal_events: f64,
+    failure_events: f64,
+    arrival_path: &ArrivalPath<'_>,
+    start_seconds: f64,
+    disturbance_horizon_seconds: f64,
+    cohorts: &WorkCohorts,
+    disturbance_horizon_micros: u64,
+) -> f64 {
+    normal_events
+        + failure_events
+        + arrival_path.integrated_count(start_seconds, disturbance_horizon_seconds)
+        + scheduled_event_count(cohorts, disturbance_horizon_micros)
+}
+
 /// Converts one scenario's raw outcomes into normalized decision cells.
 ///
 /// The shortfall cell becomes excess delay for each served event budget.
@@ -1380,6 +1423,8 @@ fn normalize_scenario_outcomes(
     let scenario_first = forecast.scenario * candidate_count;
     let budget_seconds =
         Duration::from_micros(state.configuration.objective.budget_micros()).as_secs_f64();
+    // Retry demand remains message-evidence-only. This is conservative for
+    // future scheduled work, whose outcomes do not exist yet.
     let located_events = forecast.normal_events + forecast.failure_events;
     for candidate in 0..action_count {
         let cell = scenario_first + candidate;
@@ -1946,6 +1991,7 @@ fn prepare_work_cohorts(
     scratch: &mut ScaleScratch,
     cohorts: &CohortColumns,
     backlog: &BacklogColumns,
+    scheduled_releases: &[ScheduledRelease],
 ) {
     let handler_seconds = state.capacity.expected_service_time(state.simd_level);
     scratch.handler_cohorts.clear();
@@ -1999,6 +2045,46 @@ fn prepare_work_cohorts(
             partition,
         );
     }
+    let visibility_end = schedule_visibility_end(state);
+    for release in scheduled_releases.iter().filter(|release| {
+        release.release_micros > state.model_time.as_micros()
+            && release.release_micros <= visibility_end
+    }) {
+        let deadline_micros = release
+            .release_micros
+            .saturating_add(state.configuration.objective.budget_micros());
+        let offered_events = f64::from(release.count);
+        scratch.handler_cohorts.push_values(
+            release.release_micros,
+            deadline_micros,
+            offered_events * handler_seconds,
+            SCHEDULED_PARTITION,
+        );
+        scratch.resource_cohorts.push_values(
+            release.release_micros,
+            deadline_micros,
+            offered_events,
+            SCHEDULED_PARTITION,
+        );
+    }
+}
+
+const fn schedule_visibility_end(state: &ScaleState) -> u64 {
+    state
+        .model_time
+        .as_micros()
+        .saturating_add(SCHEDULE_VISIBILITY_MICROS)
+}
+
+fn has_visible_scheduled_release(
+    state: &ScaleState,
+    scheduled_releases: &[ScheduledRelease],
+) -> bool {
+    let model_time = state.model_time.as_micros();
+    let visibility_end = schedule_visibility_end(state);
+    scheduled_releases.iter().any(|release| {
+        release.release_micros > model_time && release.release_micros <= visibility_end
+    })
 }
 
 fn prepare_partition_work(state: &ScaleState, scratch: &mut ScaleScratch) {
@@ -2009,6 +2095,9 @@ fn prepare_partition_work(state: &ScaleState, scratch: &mut ScaleScratch) {
     let mut release_min = u64::MAX;
     let mut deadline_max = 0_u64;
     for cohort in 0..cohorts.len() {
+        if cohorts.partition(cohort) == SCHEDULED_PARTITION {
+            continue;
+        }
         let partition = cohorts.partition(cohort) as usize;
         scratch.partition_work_slot_seconds[partition] += cohorts.work_slot_seconds(cohort);
         scratch.partition_offsets[partition + 1] += 1;
@@ -2025,6 +2114,9 @@ fn prepare_partition_work(state: &ScaleState, scratch: &mut ScaleScratch) {
         scratch.partition_write_offsets[partition] = scratch.partition_offsets[partition];
     }
     for cohort_index in 0..cohorts.len() {
+        if cohorts.partition(cohort_index) == SCHEDULED_PARTITION {
+            continue;
+        }
         let partition = cohorts.partition(cohort_index) as usize;
         let write_offset = scratch.partition_write_offsets[partition] as usize;
         scratch.partition_cohort_indexes[write_offset] = cohort_index as u32;
@@ -2088,6 +2180,9 @@ fn partition_deadline_outcome(
         scratch.placement_cohorts.clear();
         for &cohort_index in &scratch.partition_cohort_indexes[first..last] {
             let cohort = cohort_index as usize;
+            if scratch.resource_cohorts.partition(cohort) == SCHEDULED_PARTITION {
+                continue;
+            }
             scratch.placement_cohorts.push_values(
                 scratch.resource_cohorts.release_micros(cohort),
                 scratch.resource_cohorts.deadline_micros(cohort),
@@ -2296,3 +2391,7 @@ pub enum DecisionCurveError {
     #[error("the last controller step did not calculate a decision curve")]
     Unavailable,
 }
+
+#[cfg(test)]
+#[path = "controller_tests.rs"]
+mod tests;

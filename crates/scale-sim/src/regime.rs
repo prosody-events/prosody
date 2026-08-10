@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use prosody_scale_core::{
     CalendarArtifactId, CalendarRateSegment, CapacityGrid, CapacityPrior, Configuration,
-    DecisionRejection, RandomStream, ReliabilityPrior, ServiceObjective, TransitionPrior,
+    DecisionRejection, RandomStream, ReliabilityPrior, SCHEDULED_RELEASE_COUNT_MAX,
+    ScheduledRelease, ServiceObjective, TransitionPrior,
 };
 
 use crate::harness::TickDrivenAttemptModel;
@@ -15,7 +16,8 @@ use crate::{
     ClosedLoopError, ConcurrencyLatencyCurve, ControllerSample, ControllerTrace,
     DEFAULT_CONCURRENCY_PER_REPLICA, DEFAULT_FAILURE_WEIGHT, EventContext, EventInputs,
     FaultPattern, MetricTrace, PlantConfiguration, PlantError, ReporterDirective, ScaleDirective,
-    SeriesCell, SimulationHarness, SimulationResult, TickContext, TickGenerator, TickInputs,
+    ScheduledReleasesInput, SeriesCell, SimulationHarness, SimulationResult, TickContext,
+    TickGenerator, TickInputs,
 };
 
 const CAPACITY_COLLAPSE_GRID: &[f64] = &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64];
@@ -38,8 +40,13 @@ const SHORT_BURST_RELEASE_MICROS: u64 = 120_000_000;
 const CALENDAR_PRIOR_SHAPE: f64 = 4.0_f64;
 const CALENDAR_PRIOR_RATE_SECONDS: f64 = 0.01_f64;
 const CALENDAR_MODEL_PRIOR_PROBABILITY: f64 = 0.5_f64;
+const HISTORY_START_MICROS: u64 = 300_000_000;
+const HISTORY_END_MICROS: u64 = 420_000_000;
+const HISTORY_RUN_END_MICROS: u64 = 480_000_000;
+const TIMER_WAVE_RELEASE_MICROS: u64 = 420_000_000;
+const TIMER_WAVE_RUN_END_MICROS: u64 = 480_000_000;
 const HISTORICAL_MAXIMUM_LEAD_SECONDS: f64 = 90.0_f64;
-const HISTORICAL_STEP_DURATION_SECONDS: f64 = 90.0_f64;
+const HISTORICAL_STEP_DURATION_SECONDS: f64 = 120.0_f64;
 const REGIME_PRIOR_TRUST_SECONDS: f64 = 5.0_f64;
 const REGIME_OCCUPANCY_HALF_LIFE_SECONDS: f64 = 86_400.0_f64;
 const PRIOR_RELEASE_MARGIN_MICROS: u64 =
@@ -52,6 +59,21 @@ const PRIOR_RELEASE_MARGIN_MICROS: u64 =
 /// report interval; 90 s gives 1.75x headroom. Claims that charge capacity
 /// cost or bound capacity-driven targets start their clock here.
 const CAPACITY_WARMUP_MICROS: u64 = 90_000_000;
+
+const HISTORICAL_SCHEDULE: &[ScheduleSegment] = &[
+    ScheduleSegment::new(0, HISTORY_START_MICROS, 0),
+    ScheduleSegment::new(HISTORY_START_MICROS, HISTORY_END_MICROS, 1_000),
+    ScheduleSegment::new(HISTORY_END_MICROS, HISTORY_RUN_END_MICROS, 0),
+];
+const SEASONAL_SCHEDULE: &[ScheduleSegment] = &[
+    ScheduleSegment::new(0, 120_000_000, 0),
+    ScheduleSegment::new(120_000_000, 121_000_000, 1_000),
+    ScheduleSegment::new(121_000_000, 240_000_000, 0),
+    ScheduleSegment::new(240_000_000, 241_000_000, 1_000),
+    ScheduleSegment::new(241_000_000, 360_000_000, 0),
+    ScheduleSegment::new(360_000_000, 361_000_000, 1_000),
+    ScheduleSegment::new(361_000_000, 420_000_000, 0),
+];
 
 /// A principal deterministic plant regime for plot review.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -350,7 +372,8 @@ fn validate_closed_loop_stimulus(
             run.events().len() == EVENT_COUNT as usize
                 && settled_all
                 && run.events().iter().all(|event| {
-                    event.source == crate::EventSource::Timer && event.release_micros == 120_000_000
+                    event.source == crate::EventSource::Timer
+                        && event.release_micros == TIMER_WAVE_RELEASE_MICROS
                 })
         }
         PrincipalRegime::HotSerializedKey => {
@@ -602,7 +625,7 @@ fn validate_single_worker_claim(
 
 fn validate_timer_wave_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
     let minimum_before_wave = controller_samples(run)
-        .filter(|sample| sample.at_micros < 120_000_000)
+        .filter(|sample| (IDLE_DURATION_MICROS..270_000_000).contains(&sample.at_micros))
         .map(|sample| sample.target)
         .min();
     require_closed_loop(
@@ -799,9 +822,11 @@ fn validate_historical_under_claim(run: &PrincipalRun) -> Result<(), RegimeValid
         PrincipalRegime::HistoricalUnder,
         "lower live demand did not stay inside its SLO",
     )?;
-    let history_cost = 8.0_f64 * run_duration_seconds(run);
+    let history_cost =
+        8.0_f64 * Duration::from_micros(HISTORY_END_MICROS - HISTORY_START_MICROS).as_secs_f64();
     require_closed_loop(
-        replica_seconds(run) < 0.8_f64 * history_cost,
+        replica_seconds_between(run, HISTORY_START_MICROS, HISTORY_END_MICROS)
+            < 0.8_f64 * history_cost,
         PrincipalRegime::HistoricalUnder,
         "lower live demand did not reduce historical replica cost",
     )
@@ -815,7 +840,9 @@ fn validate_historical_missing_claim(run: &PrincipalRun) -> Result<(), RegimeVal
     // replicas (1,000/s at 320/s each); one more is the insurance level.
     // A wide-prior standing army fails at the first seasoned sample.
     let seasoned_peak = controller_samples(run)
-        .filter(|sample| sample.at_micros >= CAPACITY_WARMUP_MICROS)
+        .filter(|sample| {
+            sample.at_micros >= HISTORY_START_MICROS.saturating_add(CAPACITY_WARMUP_MICROS)
+        })
         .map(|sample| sample.target)
         .max();
     require_closed_loop(
@@ -885,10 +912,6 @@ fn release_window_miss_fraction(
     }
 }
 
-fn replica_seconds(run: &PrincipalRun) -> f64 {
-    replica_seconds_between(run, 0, run.stop.at_micros)
-}
-
 fn replica_seconds_between(run: &PrincipalRun, start_micros: u64, end_micros: u64) -> f64 {
     let mut replicas = run.simulation.initial_replicas;
     let mut cursor = 0_u64;
@@ -908,10 +931,6 @@ fn replica_seconds_between(run: &PrincipalRun, start_micros: u64, end_micros: u6
     let interval_start = cursor.max(start_micros);
     area + f64::from(replicas)
         * Duration::from_micros(end_micros.saturating_sub(interval_start)).as_secs_f64()
-}
-
-fn run_duration_seconds(run: &PrincipalRun) -> f64 {
-    Duration::from_micros(run.stop.at_micros).as_secs_f64()
 }
 
 fn controller_samples(run: &PrincipalRun) -> impl Iterator<Item = ControllerSample> + '_ {
@@ -1826,33 +1845,31 @@ struct PrincipalGraph {
 
 impl PrincipalGraph {
     fn new(definition: PrincipalDefinition) -> Result<Self, PlantError> {
+        if definition.schedule.start_micros > definition.schedule.workload_start_micros
+            || definition.schedule.workload_start_micros > definition.schedule.workload_end_micros
+        {
+            return Err(PlantError::WorkloadWindow);
+        }
         let history_count_max = definition.schedule.controller_sample_count_max()?;
         let inputs = definition.inputs;
         Ok(Self {
             messages: ArrivalSchedule::new(
                 inputs.messages,
-                definition.schedule.start_micros,
-                definition.schedule.maximum_micros,
+                definition.schedule.workload_start_micros,
+                definition.schedule.workload_end_micros,
                 inputs.seed,
                 0x6d65_7373_6167_6573,
                 inputs.stochastic_arrivals,
             )?,
             timers: ArrivalSchedule::new(
                 inputs.timers,
-                definition.schedule.start_micros,
-                definition.schedule.maximum_micros,
+                definition.schedule.workload_start_micros,
+                definition.schedule.workload_end_micros,
                 inputs.seed,
                 0x7469_6d65_7273,
                 inputs.stochastic_arrivals,
             )?,
-            historical_messages: ArrivalSchedule::new(
-                inputs.history.demand,
-                definition.schedule.start_micros,
-                definition.schedule.maximum_micros,
-                inputs.seed,
-                0x0068_6973_746f_7279,
-                inputs.stochastic_arrivals,
-            )?,
+            historical_messages: ArrivalSchedule::from_segments(inputs.history.segments)?,
             events: definition.events,
             reporter: definition.reporter,
             calendar: inputs.history,
@@ -1901,6 +1918,10 @@ impl TickGenerator for PrincipalGraph {
         _: TickContext<'_>,
     ) -> Result<Option<CalendarForecastInput>, PlantError> {
         self.calendar.forecast()
+    }
+
+    fn scheduled_releases(&self, _: TickContext<'_>) -> Result<ScheduledReleasesInput, PlantError> {
+        self.timers.pending_releases()
     }
 
     fn reporter(&self, context: TickContext<'_>) -> ReporterDirective {
@@ -1964,10 +1985,8 @@ impl PrincipalDefinition {
                 standard
                     .messages(demand)
                     .handler(100_000)
-                    .history(HistoricalSeries {
-                        demand,
-                        replicas: 4,
-                    })
+                    .history(HistoricalSeries::seasonal())
+                    .launch_delay(LaunchDelaySeries::Immediate)
                     .schedule(RunSchedule::seasonal())
                     .event_count_max(SEASONAL_EVENT_COUNT)
                     .initial_replicas(1)
@@ -1985,8 +2004,8 @@ impl PrincipalDefinition {
                 .messages(ArrivalSeries::None)
                 .timers(ArrivalSeries::PeriodicDelayed {
                     count: EVENT_COUNT,
-                    first_micros: 120_000_000,
-                    interval_micros: 120_000_000,
+                    first_micros: TIMER_WAVE_RELEASE_MICROS,
+                    interval_micros: TIMER_WAVE_RELEASE_MICROS,
                     count_max: EVENT_COUNT,
                 })
                 .handler(100_000)
@@ -2056,16 +2075,16 @@ impl PrincipalDefinition {
                     at_micros: 1_000_000,
                 })
             }
-            PrincipalRegime::HistoricalMatch => standard
-                .messages(ArrivalSeries::Rate {
-                    per_second: 1_000,
-                    count_max: HISTORY_EVENT_COUNT_MAX,
-                })
-                .history(HistoricalSeries::standard())
-                .handler(100_000)
-                .schedule(RunSchedule::history())
-                .event_count_max(HISTORY_EVENT_COUNT_MAX)
-                .initial_replicas(1),
+            PrincipalRegime::HistoricalMatch => {
+                let history = HistoricalSeries::standard();
+                standard
+                    .messages(history.live_demand(HISTORY_EVENT_COUNT_MAX))
+                    .history(history)
+                    .handler(100_000)
+                    .schedule(RunSchedule::history())
+                    .event_count_max(HISTORY_EVENT_COUNT_MAX)
+                    .initial_replicas(1)
+            }
             PrincipalRegime::HistoricalExceeded => standard
                 .messages(ArrivalSeries::Rate {
                     per_second: 2_000,
@@ -2299,43 +2318,101 @@ struct InputPolicies {
 
 #[derive(Clone, Copy)]
 struct HistoricalSeries {
-    demand: ArrivalSeries,
+    segments: &'static [ScheduleSegment],
     replicas: u32,
 }
 
 impl HistoricalSeries {
     const fn standard() -> Self {
         Self {
-            demand: ArrivalSeries::Rate {
-                per_second: 1_000,
-                count_max: HISTORY_EVENT_COUNT_MAX,
-            },
+            segments: HISTORICAL_SCHEDULE,
             replicas: 8,
+        }
+    }
+
+    const fn seasonal() -> Self {
+        Self {
+            segments: SEASONAL_SCHEDULE,
+            replicas: 4,
         }
     }
 
     const fn missing() -> Self {
         Self {
-            demand: ArrivalSeries::None,
+            segments: &[],
             replicas: 0,
         }
     }
 
+    const fn live_demand(self, count_max: u32) -> ArrivalSeries {
+        ArrivalSeries::Rate {
+            per_second: self.segments[1].rate_per_second,
+            count_max,
+        }
+    }
+
     fn forecast(self) -> Result<Option<CalendarForecastInput>, PlantError> {
-        let ArrivalSeries::Rate { per_second, .. } = self.demand else {
+        let Some(first) = self.segments.first() else {
             return Ok(None);
         };
-        let historical_count =
-            u64::from(per_second).saturating_mul(u64::from(CALENDAR_HISTORY_EXPOSURE_SECONDS));
-        let shape = CALENDAR_PRIOR_SHAPE + historical_count as f64;
-        let rate_seconds =
-            CALENDAR_PRIOR_RATE_SECONDS + f64::from(CALENDAR_HISTORY_EXPOSURE_SECONDS);
-        let segment = CalendarRateSegment::new(0, 0, u64::MAX, shape, rate_seconds)?;
+        if self.segments.len() > 8 {
+            return Err(PlantError::CalendarCapacity);
+        }
+        let span_micros = self
+            .segments
+            .last()
+            .map_or(0, |segment| segment.end_micros)
+            .saturating_sub(first.start_micros);
+        let span_seconds = Duration::from_micros(span_micros).as_secs_f64();
+        if span_seconds <= 0.0_f64 {
+            return Err(PlantError::ZeroBound {
+                name: "historical_schedule_span",
+            });
+        }
+        let exposure_scale = f64::from(CALENDAR_HISTORY_EXPOSURE_SECONDS) / span_seconds;
+        let mut segments = [CalendarRateSegment::new(
+            0,
+            first.start_micros,
+            first.end_micros,
+            CALENDAR_PRIOR_SHAPE,
+            CALENDAR_PRIOR_RATE_SECONDS,
+        )?; 8];
+        for (position, source) in self.segments.iter().enumerate() {
+            let exposure_seconds =
+                Duration::from_micros(source.end_micros.saturating_sub(source.start_micros))
+                    .as_secs_f64()
+                    * exposure_scale;
+            let historical_count = f64::from(source.rate_per_second) * exposure_seconds;
+            segments[position] = CalendarRateSegment::new(
+                position as u32,
+                source.start_micros,
+                source.end_micros,
+                CALENDAR_PRIOR_SHAPE + historical_count,
+                CALENDAR_PRIOR_RATE_SECONDS + exposure_seconds,
+            )?;
+        }
         Ok(Some(CalendarForecastInput::new(
             CalendarArtifactId(1),
             CALENDAR_MODEL_PRIOR_PROBABILITY,
-            std::slice::from_ref(&segment),
+            &segments[..self.segments.len()],
         )?))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScheduleSegment {
+    start_micros: u64,
+    end_micros: u64,
+    rate_per_second: u32,
+}
+
+impl ScheduleSegment {
+    const fn new(start_micros: u64, end_micros: u64, rate_per_second: u32) -> Self {
+        Self {
+            start_micros,
+            end_micros,
+            rate_per_second,
+        }
     }
 }
 
@@ -2376,6 +2453,32 @@ struct ArrivalSchedule {
 }
 
 impl ArrivalSchedule {
+    fn from_segments(segments: &[ScheduleSegment]) -> Result<Self, PlantError> {
+        let count = segments.iter().try_fold(0_usize, |sum, segment| {
+            let duration_micros = segment.end_micros.saturating_sub(segment.start_micros);
+            let count =
+                u64::from(segment.rate_per_second).saturating_mul(duration_micros) / 1_000_000;
+            let count = usize::try_from(count).map_err(|_| PlantError::PlatformLimit)?;
+            sum.checked_add(count).ok_or(PlantError::PlatformLimit)
+        })?;
+        let mut release_micros = Vec::with_capacity(count);
+        for segment in segments {
+            let segment_count = u64::from(segment.rate_per_second)
+                .saturating_mul(segment.end_micros.saturating_sub(segment.start_micros))
+                / 1_000_000;
+            for ordinal in 1..=segment_count {
+                let offset =
+                    ordinal.saturating_mul(1_000_000) / u64::from(segment.rate_per_second.max(1));
+                release_micros.push(segment.start_micros.saturating_add(offset));
+            }
+        }
+        Ok(Self {
+            release_micros,
+            cursor: 0,
+            interval_start: 0,
+        })
+    }
+
     fn new(
         series: ArrivalSeries,
         start_micros: u64,
@@ -2384,8 +2487,8 @@ impl ArrivalSchedule {
         domain: u64,
         stochastic: bool,
     ) -> Result<Self, PlantError> {
-        let deterministic_count =
-            usize::try_from(series.at(end_micros, 0)).map_err(|_| PlantError::PlatformLimit)?;
+        let deterministic_count = usize::try_from(series.count_between(start_micros, end_micros))
+            .map_err(|_| PlantError::PlatformLimit)?;
         let stochastic_rate = stochastic
             && matches!(
                 series,
@@ -2398,7 +2501,14 @@ impl ArrivalSchedule {
         };
         let mut release_micros = Vec::with_capacity(count);
         if stochastic_rate {
-            series.push_stochastic_releases(end_micros, seed, domain, count, &mut release_micros);
+            series.push_stochastic_releases(
+                start_micros,
+                end_micros,
+                seed,
+                domain,
+                count,
+                &mut release_micros,
+            );
         } else {
             series.push_deterministic_releases(
                 start_micros,
@@ -2427,6 +2537,26 @@ impl ArrivalSchedule {
             .get(self.interval_start.saturating_add(offset))
             .copied()
             .ok_or(PlantError::PlatformLimit)
+    }
+
+    fn pending_releases(&self) -> Result<ScheduledReleasesInput, PlantError> {
+        let mut releases = [ScheduledRelease {
+            release_micros: 0,
+            count: 1,
+        }; SCHEDULED_RELEASE_COUNT_MAX];
+        let mut input = &self.release_micros[self.cursor..];
+        let mut count = 0_usize;
+        while !input.is_empty() && count < releases.len() {
+            let release_micros = input[0];
+            let group_count = input.partition_point(|release| *release == release_micros);
+            releases[count] = ScheduledRelease {
+                release_micros,
+                count: u32::try_from(group_count).map_err(|_| PlantError::PlatformLimit)?,
+            };
+            count += 1;
+            input = &input[group_count..];
+        }
+        ScheduledReleasesInput::new(&releases[..count])
     }
 }
 
@@ -2470,13 +2600,14 @@ impl ArrivalSeries {
 
     fn push_stochastic_releases(
         self,
+        start_micros: u64,
         end_micros: u64,
         seed: u64,
         domain: u64,
         count_max: usize,
         output: &mut Vec<u64>,
     ) {
-        let mut cell_start = 0_u64;
+        let mut cell_start = start_micros;
         while cell_start < end_micros && output.len() < count_max {
             let cell_end = cell_start.saturating_add(1_000_000).min(end_micros);
             let start_hazard = self.cumulative_event_micros(cell_start);
@@ -2514,7 +2645,9 @@ impl ArrivalSeries {
     }
 
     fn release_for_ordinal(self, start_micros: u64, end_micros: u64, ordinal: u64) -> u64 {
-        let target = ordinal.saturating_mul(1_000_000);
+        let target = self
+            .cumulative_event_micros(start_micros)
+            .saturating_add(ordinal.saturating_mul(1_000_000));
         let mut lower = start_micros.saturating_add(1).min(end_micros);
         let mut upper = end_micros;
         while lower < upper {
@@ -2562,6 +2695,18 @@ impl ArrivalSeries {
                 step_interval_micros,
             ),
             Self::None | Self::Once(_) | Self::Periodic { .. } | Self::PeriodicDelayed { .. } => 0,
+        }
+    }
+
+    fn count_between(self, start_micros: u64, end_micros: u64) -> u32 {
+        match self {
+            Self::Rate { count_max, .. } | Self::StaircaseRate { count_max, .. } => {
+                let event_micros = self
+                    .cumulative_event_micros(end_micros)
+                    .saturating_sub(self.cumulative_event_micros(start_micros));
+                bounded_count(event_micros / 1_000_000, count_max)
+            }
+            _ => self.at(end_micros, 0),
         }
     }
 
@@ -2814,8 +2959,13 @@ enum ReporterPolicy {
 }
 
 #[derive(Clone, Copy)]
+/// One simulation clock and its live-demand window.
+///
+/// The workload window must start no earlier than the simulation. It must
+/// start no later than its end.
 struct RunSchedule {
     start_micros: u64,
+    workload_start_micros: u64,
     workload_end_micros: u64,
     workload_interval_micros: u64,
     followup_interval_micros: u64,
@@ -2840,6 +2990,7 @@ impl RunSchedule {
     const fn standard() -> Self {
         Self {
             start_micros: 0,
+            workload_start_micros: 0,
             workload_end_micros: 2_000_000,
             workload_interval_micros: 100_000,
             followup_interval_micros: 1_000_000,
@@ -2861,6 +3012,7 @@ impl RunSchedule {
     const fn capacity_evidence() -> Self {
         Self {
             start_micros: 0,
+            workload_start_micros: 0,
             workload_end_micros: 50_000_000,
             workload_interval_micros: 1_000_000,
             followup_interval_micros: 1_000_000,
@@ -2874,6 +3026,7 @@ impl RunSchedule {
     const fn extended_capacity_evidence() -> Self {
         Self {
             start_micros: 0,
+            workload_start_micros: 0,
             workload_end_micros: 180_000_000,
             workload_interval_micros: 1_000_000,
             followup_interval_micros: 1_000_000,
@@ -2887,6 +3040,7 @@ impl RunSchedule {
     const fn capacity_response() -> Self {
         Self {
             start_micros: 0,
+            workload_start_micros: 0,
             workload_end_micros: 600_000_000,
             workload_interval_micros: 1_000_000,
             followup_interval_micros: 1_000_000,
@@ -2900,6 +3054,7 @@ impl RunSchedule {
     const fn linear_response() -> Self {
         Self {
             start_micros: 0,
+            workload_start_micros: 0,
             workload_end_micros: 1_200_000_000,
             workload_interval_micros: 1_000_000,
             followup_interval_micros: 1_000_000,
@@ -2913,6 +3068,7 @@ impl RunSchedule {
     const fn one_shot() -> Self {
         Self {
             start_micros: 1_000_000,
+            workload_start_micros: 1_000_000,
             workload_end_micros: 1_000_000,
             ..Self::standard()
         }
@@ -2921,6 +3077,7 @@ impl RunSchedule {
     const fn short_burst() -> Self {
         Self {
             start_micros: 0,
+            workload_start_micros: 0,
             workload_end_micros: SHORT_BURST_RELEASE_MICROS,
             workload_interval_micros: 1_000_000,
             followup_interval_micros: 1_000_000,
@@ -2932,6 +3089,7 @@ impl RunSchedule {
     const fn replica_ceiling() -> Self {
         Self {
             start_micros: 0,
+            workload_start_micros: 0,
             workload_end_micros: 60_000_000,
             workload_interval_micros: 1_000_000,
             followup_interval_micros: 1_000_000,
@@ -2945,6 +3103,7 @@ impl RunSchedule {
     const fn rebalance_storm() -> Self {
         Self {
             start_micros: 0,
+            workload_start_micros: 0,
             workload_end_micros: 65_000_000,
             workload_interval_micros: 100_000,
             followup_interval_micros: 1_000_000,
@@ -2978,10 +3137,10 @@ impl RunSchedule {
 
     const fn timer_wave() -> Self {
         Self {
-            workload_end_micros: 180_000_000,
+            workload_end_micros: TIMER_WAVE_RUN_END_MICROS,
             workload_interval_micros: 1_000_000,
             followup_interval_micros: 1_000_000,
-            maximum_micros: 180_000_000,
+            maximum_micros: TIMER_WAVE_RUN_END_MICROS,
             stop: StopCondition::FixedDuration {
                 reason: RunStopReason::DurationComplete,
             },
@@ -3005,10 +3164,11 @@ impl RunSchedule {
     const fn history() -> Self {
         Self {
             start_micros: 0,
-            workload_end_micros: 30_000_000,
-            workload_interval_micros: 100_000,
+            workload_start_micros: HISTORY_START_MICROS,
+            workload_end_micros: HISTORY_END_MICROS,
+            workload_interval_micros: 1_000_000,
             followup_interval_micros: 1_000_000,
-            maximum_micros: 120_000_000,
+            maximum_micros: HISTORY_RUN_END_MICROS,
             stop: StopCondition::FixedDuration {
                 reason: RunStopReason::DurationComplete,
             },

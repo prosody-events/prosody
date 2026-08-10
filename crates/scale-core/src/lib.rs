@@ -34,7 +34,7 @@ pub use types::{
     AttemptOutcomeEvidence, BacklogCohort, CalendarArtifactId, CalendarRateSegment, Cohort,
     Configuration, ConfigurationError, DecisionDiagnostics, DemandClass, GroupObservation,
     HoldDecision, HoldReason, ModelTime, ObservationBuffer, ObservationError, PosteriorQuery,
-    ScaleDecision, ServiceObjective,
+    SCHEDULED_RELEASE_COUNT_MAX, ScaleDecision, ScheduledRelease, ServiceObjective,
 };
 
 #[cfg(test)]

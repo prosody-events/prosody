@@ -58,7 +58,8 @@ pub use controller::{
 pub use harness::{
     CalendarForecastInput, EventContext, EventInputs, EventOutcomeRule, FailureBacklog,
     FailureBacklogView, NormalBacklog, NormalBacklogView, ReporterDirective, ScaleDirective,
-    SimulationHarness, TickContext, TickGenerator, TickHistory, TickHistoryView, TickInputs,
+    ScheduledReleasesInput, SimulationHarness, TickContext, TickGenerator, TickHistory,
+    TickHistoryView, TickInputs,
 };
 pub use input::{ConcurrencyLatencyCurve, InputError, QuantileTable, StepSeries, WorkloadSeries};
 pub use metrics::{MetricPoint, MetricTrace};
@@ -1903,6 +1904,12 @@ pub enum PlantError {
     /// The calendar forecast exceeds its simulator bound.
     #[error("the calendar forecast buffer is full")]
     CalendarCapacity,
+    /// The scheduled release input exceeds its simulator bound.
+    #[error("the scheduled release buffer is full")]
+    ScheduledReleaseCapacity,
+    /// The live-demand window is outside the simulation window.
+    #[error("the workload start must be between the simulation start and workload end")]
+    WorkloadWindow,
     /// A new event precedes the plant's current virtual time.
     #[error("an event release cannot precede current plant time")]
     EventTimeRegressed,

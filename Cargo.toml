@@ -35,6 +35,7 @@ rand = "0.10.2"
 rand_distr = "0.6.0"
 rand_xoshiro = "0.8.1"
 rayon = "1.12.0"
+smallvec = { version = "1.15", features = ["const_generics", "union"] }
 statrs = { version = "0.19.0", default-features = false, features = ["std"] }
 thiserror = "2.0.19"
 tracing = "0.1"
@@ -116,7 +117,7 @@ scylla = { version = "1.5", features = ["chrono-04"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
-smallvec = { version = "1.15", features = ["const_generics", "union"] }
+smallvec.workspace = true
 strum = { version = "0.28", features = ["derive"] }
 thiserror.workspace = true
 tokio = { version = "1.50", features = ["macros", "parking_lot", "sync"] }

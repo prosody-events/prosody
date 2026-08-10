@@ -1,10 +1,57 @@
 use super::{
-    ArrivalSchedule, ArrivalSeries, HISTORY_EVENT_COUNT_MAX, IndexSeries, PrincipalDefinition,
-    PrincipalRegime, RunSchedule, RunStopReason, SharedResourcePolicy, StopCondition,
-    run_principal_definition, run_principal_regime_seeded,
+    ArrivalSchedule, ArrivalSeries, CALENDAR_PRIOR_RATE_SECONDS, CALENDAR_PRIOR_SHAPE,
+    HISTORICAL_SCHEDULE, HISTORY_EVENT_COUNT_MAX, HistoricalSeries, IndexSeries,
+    PrincipalDefinition, PrincipalRegime, RunSchedule, RunStopReason, SEASONAL_SCHEDULE,
+    SharedResourcePolicy, StopCondition, run_principal_definition, run_principal_regime_seeded,
 };
 use crate::model::{AttemptFrame, AttemptModel};
-use crate::{ConcurrencyLatencyCurve, PrincipalRunError, SeriesCell};
+use crate::{ConcurrencyLatencyCurve, PlantError, PrincipalRunError, SeriesCell};
+use quickcheck_macros::quickcheck;
+
+#[quickcheck]
+fn calendar_forecast_round_trips_the_historical_schedule(seasonal: bool) -> bool {
+    let history = if seasonal {
+        HistoricalSeries::seasonal()
+    } else {
+        HistoricalSeries::standard()
+    };
+    let schedule = if seasonal {
+        SEASONAL_SCHEDULE
+    } else {
+        HISTORICAL_SCHEDULE
+    };
+    let Ok(Some(forecast)) = history.forecast() else {
+        return false;
+    };
+    let segments = forecast.segments();
+    if segments.len() != schedule.len()
+        || segments.first().map(|segment| segment.start_micros())
+            != schedule.first().map(|segment| segment.start_micros)
+        || segments.last().map(|segment| segment.end_micros())
+            != schedule.last().map(|segment| segment.end_micros)
+    {
+        return false;
+    }
+    segments
+        .iter()
+        .zip(schedule)
+        .enumerate()
+        .all(|(position, (actual, expected))| {
+            let posterior_mean = actual.shape() / actual.rate_seconds();
+            let tolerance = (CALENDAR_PRIOR_SHAPE
+                - f64::from(expected.rate_per_second) * CALENDAR_PRIOR_RATE_SECONDS)
+                .abs()
+                / actual.rate_seconds()
+                + f64::EPSILON;
+            actual.position() == position as u32
+                && actual.start_micros() == expected.start_micros
+                && actual.end_micros() == expected.end_micros
+                && (posterior_mean - f64::from(expected.rate_per_second)).abs() <= tolerance
+        })
+        && segments
+            .windows(2)
+            .all(|pair| pair[0].end_micros() == pair[1].start_micros())
+}
 
 #[test]
 fn shared_resource_collapse_controls_latency_curve() {
@@ -96,6 +143,65 @@ fn deterministic_rate_release_times_do_not_depend_on_controller_cadence()
     Ok(())
 }
 
+#[test]
+fn rate_schedule_uses_the_declared_workload_window() -> Result<(), PrincipalRunError> {
+    let mut schedule = ArrivalSchedule::new(
+        ArrivalSeries::Rate {
+            per_second: 1_000,
+            count_max: HISTORY_EVENT_COUNT_MAX,
+        },
+        300_000_000,
+        420_000_000,
+        7,
+        11,
+        false,
+    )?;
+    assert_eq!(schedule.release_until(300_000_000)?, 0);
+    assert_eq!(schedule.release_until(420_000_000)?, 120_000);
+    assert_eq!(schedule.release_at(0)?, 300_001_000);
+    assert_eq!(schedule.release_at(119_999)?, 420_000_000);
+    Ok(())
+}
+
+#[test]
+fn pending_timer_releases_are_grouped_and_removed_after_release() -> Result<(), PrincipalRunError> {
+    let mut schedule = ArrivalSchedule::new(
+        ArrivalSeries::PeriodicDelayed {
+            count: 3,
+            first_micros: 100,
+            interval_micros: 100,
+            count_max: 6,
+        },
+        0,
+        200,
+        7,
+        11,
+        false,
+    )?;
+    assert_eq!(
+        schedule.pending_releases()?.releases(),
+        [
+            prosody_scale_core::ScheduledRelease {
+                release_micros: 100,
+                count: 3,
+            },
+            prosody_scale_core::ScheduledRelease {
+                release_micros: 200,
+                count: 3,
+            },
+        ]
+    );
+    assert_eq!(schedule.release_until(100)?, 3);
+    assert_eq!(
+        schedule.pending_releases()?.releases(),
+        [prosody_scale_core::ScheduledRelease {
+            release_micros: 200,
+            count: 3,
+        }]
+    );
+    Ok(())
+}
+
 fn deterministic_release_times(
     series: ArrivalSeries,
     interval_micros: u64,
@@ -156,7 +262,7 @@ fn staircase_rate_does_not_depend_on_evaluation_cadence() {
 }
 
 #[test]
-fn controller_trace_bound_comes_from_virtual_ticks() -> Result<(), crate::PlantError> {
+fn controller_trace_bound_comes_from_virtual_ticks() -> Result<(), PlantError> {
     assert_eq!(
         RunSchedule::extended_capacity_evidence().controller_sample_count_max()?,
         182
@@ -166,6 +272,28 @@ fn controller_trace_bound_comes_from_virtual_ticks() -> Result<(), crate::PlantE
         3_002
     );
     Ok(())
+}
+
+#[test]
+fn principal_graph_rejects_a_workload_start_outside_the_run() {
+    let definition = PrincipalDefinition::for_regime(PrincipalRegime::ApplicationLimited);
+    let mut before_run = definition;
+    before_run.schedule.start_micros = 1;
+    before_run.schedule.workload_start_micros = 0;
+    let mut after_workload = definition;
+    after_workload.schedule.workload_start_micros = after_workload
+        .schedule
+        .workload_end_micros
+        .saturating_add(1);
+
+    assert!(matches!(
+        super::PrincipalGraph::new(before_run),
+        Err(PlantError::WorkloadWindow)
+    ));
+    assert!(matches!(
+        super::PrincipalGraph::new(after_workload),
+        Err(PlantError::WorkloadWindow)
+    ));
 }
 
 #[test]
@@ -194,43 +322,55 @@ fn declining_capacity_experiment_has_a_fixed_duration() {
 }
 
 #[test]
-fn historical_definitions_sustain_their_relationships() {
+fn historical_definitions_sustain_their_relationships() -> Result<(), PrincipalRunError> {
     let matches = PrincipalDefinition::for_regime(PrincipalRegime::HistoricalMatch);
     let exceeded = PrincipalDefinition::for_regime(PrincipalRegime::HistoricalExceeded);
     let under = PrincipalDefinition::for_regime(PrincipalRegime::HistoricalUnder);
     let missing = PrincipalDefinition::for_regime(PrincipalRegime::HistoricalMissing);
-    let times = (0_u64..=300).map(|step| step * 100_000);
 
-    assert_eq!(emitted_at(matches.inputs.messages, times.clone()), 30_000);
-    assert_eq!(emitted_at(exceeded.inputs.messages, times.clone()), 60_000);
-    assert_eq!(emitted_at(under.inputs.messages, times.clone()), 15_000);
-    assert_eq!(
-        emitted_at(matches.inputs.history.demand, times.clone()),
-        30_000
-    );
-    assert_eq!(
-        emitted_at(exceeded.inputs.history.demand, times.clone()),
-        30_000
-    );
-    assert_eq!(
-        emitted_at(under.inputs.history.demand, times.clone()),
-        30_000
-    );
-    assert_eq!(emitted_at(missing.inputs.history.demand, times), 0);
+    assert_eq!(definition_message_count(matches)?, 120_000);
+    assert_eq!(definition_message_count(exceeded)?, 240_000);
+    assert_eq!(definition_message_count(under)?, 60_000);
+    assert_eq!(historical_message_count(matches.inputs.history)?, 120_000);
+    assert_eq!(historical_message_count(exceeded.inputs.history)?, 120_000);
+    assert_eq!(historical_message_count(under.inputs.history)?, 120_000);
+    assert_eq!(historical_message_count(missing.inputs.history)?, 0);
     for definition in [matches, exceeded, under, missing] {
-        assert_eq!(definition.schedule.workload_end_micros, 30_000_000);
+        assert_eq!(definition.schedule.start_micros, 0);
+        assert_eq!(definition.schedule.workload_start_micros, 300_000_000);
+        assert_eq!(definition.schedule.workload_end_micros, 420_000_000);
+        assert_eq!(definition.schedule.maximum_micros, 480_000_000);
         assert!(matches!(
             definition.schedule.stop,
             StopCondition::FixedDuration { .. }
         ));
         assert_eq!(definition.event_count_max, HISTORY_EVENT_COUNT_MAX);
     }
+    Ok(())
+}
+
+fn definition_message_count(definition: PrincipalDefinition) -> Result<u32, PrincipalRunError> {
+    let mut schedule = ArrivalSchedule::new(
+        definition.inputs.messages,
+        definition.schedule.workload_start_micros,
+        definition.schedule.workload_end_micros,
+        0,
+        0,
+        false,
+    )?;
+    Ok(schedule.release_until(definition.schedule.workload_end_micros)?)
+}
+
+fn historical_message_count(history: HistoricalSeries) -> Result<u32, PrincipalRunError> {
+    let mut schedule = ArrivalSchedule::from_segments(history.segments)?;
+    Ok(schedule.release_until(u64::MAX)?)
 }
 
 #[test]
 fn historical_match_changes_the_prearrival_decision() -> Result<(), PrincipalRunError> {
     let one_tick = RunSchedule {
         start_micros: 0,
+        workload_start_micros: 0,
         workload_end_micros: 0,
         workload_interval_micros: 1,
         followup_interval_micros: 1,
@@ -265,6 +405,7 @@ fn historical_match_changes_the_prearrival_decision() -> Result<(), PrincipalRun
 fn key_count_changes_one_partition_throughput() -> Result<(), PrincipalRunError> {
     let schedule = RunSchedule {
         start_micros: 0,
+        workload_start_micros: 0,
         workload_end_micros: 5_000_000,
         workload_interval_micros: 1_000_000,
         followup_interval_micros: 1_000_000,
@@ -304,6 +445,7 @@ fn retry_outcomes_increase_loss_without_creating_physical_saturation()
 -> Result<(), PrincipalRunError> {
     let schedule = RunSchedule {
         start_micros: 0,
+        workload_start_micros: 0,
         workload_end_micros: 10_000_000,
         workload_interval_micros: 1_000_000,
         followup_interval_micros: 1_000_000,

@@ -12,15 +12,16 @@ use crate::series::{
     SeriesMetadata, SeriesRole, SeriesUnit, series_graph, series_graph_is_acyclic,
 };
 use crate::{
-    AttemptContext, AttemptFrame, AttemptGenerator, AttemptModel, AttemptParameters, ClosedLoop,
-    ClosedLoopError, ConcurrencyLatencyCurve, EventContext, EventInputs, EventOutcome,
-    EventOutcomeRule, EventSource, EventSpec, FaultPattern, FinalOutcome, HistoricalAttemptModel,
-    Kip848Rebalance, Plant, PlantConfiguration, PlantError, PrincipalRegime, PrincipalRunError,
-    QuantileTable, RegimeExperiment, RegimeValidationError, ReporterDirective, RetryCount,
-    RetryOutcome, RunStopReason, ScaleChange, ScaleDirective, ScaleRequest, SimulationHarness,
-    Snapshot, SnapshotChannel, SnapshotCursor, SnapshotTable, StepSeries, TickContext,
-    TickGenerator, TickInputs, WorkloadSeries, run_batch_regime, run_batch_slo,
-    run_capacity_evidence_regime, run_parallel, run_principal_regime, validate_principal_regime,
+    ArrivalEvidenceSample, AttemptContext, AttemptFrame, AttemptGenerator, AttemptModel,
+    AttemptParameters, ClosedLoop, ClosedLoopError, ConcurrencyLatencyCurve, EventContext,
+    EventInputs, EventOutcome, EventOutcomeRule, EventSource, EventSpec, FaultPattern,
+    FinalOutcome, HistoricalAttemptModel, Kip848Rebalance, Plant, PlantConfiguration, PlantError,
+    PrincipalRegime, PrincipalRunError, QuantileTable, RegimeExperiment, RegimeValidationError,
+    ReporterDirective, RetryCount, RetryOutcome, RunStopReason, ScaleChange, ScaleDirective,
+    ScaleRequest, SimulationHarness, Snapshot, SnapshotChannel, SnapshotCursor, SnapshotTable,
+    StepSeries, TickContext, TickGenerator, TickInputs, WorkloadSeries, run_batch_regime,
+    run_batch_slo, run_capacity_evidence_regime, run_parallel, run_principal_regime,
+    validate_principal_regime,
 };
 use crate::{CapacityEvidenceKind, CapacityEvidenceSample};
 
@@ -579,6 +580,27 @@ impl TickGenerator for RampCapacityWorkload {
 
 struct ReportedArrivalWorkload {
     reporter_tick: Option<(u32, ReporterDirective)>,
+}
+
+struct SourceArrivalWorkload {
+    messages: u32,
+    timers: u32,
+}
+
+impl TickGenerator for SourceArrivalWorkload {
+    fn calculate(&mut self, _: TickContext<'_>) -> Result<TickInputs, PlantError> {
+        Ok(TickInputs {
+            message_count: self.messages,
+            timer_count: self.timers,
+            handler_micros: 1,
+            dependency_operations: 0,
+            dependency_operation_micros: 0,
+            handler_added_micros: 0,
+            outcome: EventOutcomeRule::Success,
+            launch_delay_micros: 0,
+            scale: ScaleDirective::Hold,
+        })
+    }
 }
 
 impl TickGenerator for ReportedArrivalWorkload {
@@ -1740,6 +1762,57 @@ fn reordered_and_duplicate_snapshots_cannot_regress_state() -> Result<(), TestEr
     let reporter = table.reporter(0);
     assert!(matches!(reporter, Some(state) if state.sequence == 2 && state.arrival_count == 20));
     Ok(())
+}
+
+#[test]
+fn timer_releases_do_not_enter_message_arrival_evidence() -> Result<(), TestError> {
+    let messages_only = source_arrival_count(10, 0)?;
+    let messages_and_timers = source_arrival_count(10, 10)?;
+    let timers_only = source_arrival_count(0, 10)?;
+
+    assert_eq!(messages_only, 10);
+    assert_eq!(messages_and_timers, messages_only);
+    assert_eq!(timers_only, 0);
+    Ok(())
+}
+
+fn source_arrival_count(messages: u32, timers: u32) -> Result<u32, TestError> {
+    let controller_configuration = ControllerConfiguration {
+        cohort_count_max: 4,
+        calendar_segment_count_max: 4,
+        partition_count: 4,
+        replica_count_max: 8,
+        slots_per_replica: 2,
+        posterior_sample_count: 64,
+        report_interval_micros: 10_000,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        capacity_change_rate_per_second: 0.0_f64,
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
+    };
+    let capacity_grid = CapacityGrid::new(&[0.001_f64], &[1_000.0_f64], &[0.0_f64])?;
+    let closed_loop = ClosedLoop::new(
+        SourceArrivalWorkload { messages, timers },
+        &controller_configuration,
+        capacity_grid,
+        2,
+    )?;
+    let plant_configuration = PlantConfiguration::new(4, 40, 80, 8, 2, 8)?;
+    let mut harness = SimulationHarness::new(plant_configuration, 2, 2, closed_loop)?;
+    harness.tick(0)?;
+    harness.tick(10_000)?;
+    let sample = harness
+        .graph()
+        .trace()
+        .sample(1)
+        .ok_or(TestError::MissingControllerSample)?;
+    Ok(match sample.arrival_evidence {
+        ArrivalEvidenceSample::Accepted(window) => window.count,
+        ArrivalEvidenceSample::None => 0,
+    })
 }
 
 fn run_reported_arrivals(

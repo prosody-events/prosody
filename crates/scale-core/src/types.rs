@@ -1,6 +1,10 @@
 use std::num::NonZeroU32;
 
+use smallvec::SmallVec;
 use thiserror::Error;
+
+/// Maximum scheduled releases in one observation.
+pub const SCHEDULED_RELEASE_COUNT_MAX: usize = 64;
 
 use crate::{ArrivalEvidence, ResourceWindow, TransitionDirection, TransitionEvidence};
 
@@ -158,6 +162,15 @@ pub struct CalendarRateSegment {
     pub(crate) rate_seconds: f64,
 }
 
+/// One known future release from the timer store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduledRelease {
+    /// Virtual time when the work becomes available.
+    pub release_micros: u64,
+    /// Number of events released at that time.
+    pub count: u32,
+}
+
 impl CalendarRateSegment {
     /// Constructs one frozen calendar posterior interval.
     ///
@@ -187,6 +200,36 @@ impl CalendarRateSegment {
             shape,
             rate_seconds,
         })
+    }
+
+    /// Returns this segment's calendar position.
+    #[must_use]
+    pub const fn position(self) -> u32 {
+        self.position
+    }
+
+    /// Returns this segment's inclusive start time.
+    #[must_use]
+    pub const fn start_micros(self) -> u64 {
+        self.start_micros
+    }
+
+    /// Returns this segment's exclusive end time.
+    #[must_use]
+    pub const fn end_micros(self) -> u64 {
+        self.end_micros
+    }
+
+    /// Returns this segment's Gamma shape parameter.
+    #[must_use]
+    pub const fn shape(self) -> f64 {
+        self.shape
+    }
+
+    /// Returns this segment's Gamma rate in seconds.
+    #[must_use]
+    pub const fn rate_seconds(self) -> f64 {
+        self.rate_seconds
     }
 }
 
@@ -904,6 +947,7 @@ pub struct GroupObservation<'a> {
     pub(crate) backlog: &'a BacklogColumns,
     pub(crate) arrivals: Option<ArrivalEvidence>,
     pub(crate) calendar: Option<CalendarForecast<'a>>,
+    pub(crate) scheduled_releases: &'a [ScheduledRelease],
     pub(crate) partition_arrivals: Option<PartitionArrivalEvidence<'a>>,
     pub(crate) resource_window: Option<ResourceWindow>,
     pub(crate) attempt_outcomes: Option<AttemptOutcomeEvidence>,
@@ -923,6 +967,7 @@ pub struct ObservationBuffer {
     calendar_artifact: Option<CalendarArtifactId>,
     calendar_prior_probability: f64,
     calendar_segments: CalendarColumns,
+    scheduled_releases: SmallVec<[ScheduledRelease; SCHEDULED_RELEASE_COUNT_MAX]>,
     partition_arrival_counts: Vec<u32>,
     partition_arrival_token: Option<UpdateToken>,
     resource_window: Option<ResourceWindow>,
@@ -960,6 +1005,7 @@ impl ObservationBuffer {
             calendar_artifact: None,
             calendar_prior_probability: 0.0_f64,
             calendar_segments: CalendarColumns::new(calendar_segment_count),
+            scheduled_releases: SmallVec::new(),
             partition_arrival_counts: vec![0; partition_count],
             partition_arrival_token: None,
             resource_window: None,
@@ -978,6 +1024,7 @@ impl ObservationBuffer {
         self.calendar_artifact = None;
         self.calendar_prior_probability = 0.0_f64;
         self.calendar_segments.clear();
+        self.scheduled_releases.clear();
         self.partition_arrival_counts.fill(0);
         self.partition_arrival_token = None;
         self.resource_window = None;
@@ -1070,6 +1117,32 @@ impl ObservationBuffer {
         self.calendar_segments.extend(segments);
         self.calendar_artifact = Some(artifact);
         self.calendar_prior_probability = prior_probability;
+        Ok(())
+    }
+
+    /// Replaces the complete known future release schedule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for excess entries, zero counts, or decreasing times.
+    pub fn set_scheduled_releases(
+        &mut self,
+        releases: &[ScheduledRelease],
+    ) -> Result<(), ObservationError> {
+        if releases.len() > SCHEDULED_RELEASE_COUNT_MAX {
+            return Err(ObservationError::ScheduledReleaseCapacity);
+        }
+        if releases.iter().any(|release| release.count == 0) {
+            return Err(ObservationError::ZeroScheduledReleaseCount);
+        }
+        if releases
+            .windows(2)
+            .any(|pair| pair[0].release_micros > pair[1].release_micros)
+        {
+            return Err(ObservationError::ScheduledReleaseOrder);
+        }
+        self.scheduled_releases.clear();
+        self.scheduled_releases.extend_from_slice(releases);
         Ok(())
     }
 
@@ -1212,6 +1285,7 @@ impl ObservationBuffer {
                 prior_probability: self.calendar_prior_probability,
                 segments: &self.calendar_segments,
             }),
+            scheduled_releases: &self.scheduled_releases,
             partition_arrivals,
             resource_window: self.resource_window.take(),
             attempt_outcomes: self.attempt_outcomes.take(),
@@ -1353,6 +1427,15 @@ pub enum ObservationError {
     /// The buffer contains an unconsumed calendar forecast.
     #[error("consume the pending calendar forecast before replacement")]
     CalendarForecastPending,
+    /// A scheduled release list exceeds its fixed bound.
+    #[error("the scheduled release list exceeds its fixed bound")]
+    ScheduledReleaseCapacity,
+    /// A scheduled release has no events.
+    #[error("a scheduled release count must be positive")]
+    ZeroScheduledReleaseCount,
+    /// Scheduled release times decrease.
+    #[error("scheduled releases must have nondecreasing times")]
+    ScheduledReleaseOrder,
     /// A calendar forecast has no segment or exceeds its fixed bound.
     #[error("the calendar forecast is empty or exceeds its fixed bound")]
     CalendarCapacity,

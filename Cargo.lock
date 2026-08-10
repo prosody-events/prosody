@@ -3738,6 +3738,7 @@ dependencies = [
  "rand_distr",
  "rand_xoshiro",
  "rayon",
+ "smallvec",
  "statrs",
  "thiserror",
 ]

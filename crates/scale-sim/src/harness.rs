@@ -5,7 +5,9 @@ use crate::{
 };
 use std::num::NonZeroU32;
 
-use prosody_scale_core::{CalendarArtifactId, CalendarRateSegment};
+use prosody_scale_core::{
+    CalendarArtifactId, CalendarRateSegment, SCHEDULED_RELEASE_COUNT_MAX, ScheduledRelease,
+};
 
 const CALENDAR_FORECAST_SEGMENT_COUNT_MAX: usize = 8;
 
@@ -112,6 +114,48 @@ pub struct CalendarForecastInput {
     prior_probability: f64,
     segments: [CalendarRateSegment; CALENDAR_FORECAST_SEGMENT_COUNT_MAX],
     segment_count: u8,
+}
+
+/// Bounded known future releases for one controller tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduledReleasesInput {
+    releases: [ScheduledRelease; SCHEDULED_RELEASE_COUNT_MAX],
+    count: u8,
+}
+
+impl ScheduledReleasesInput {
+    /// Returns an empty schedule.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            releases: [ScheduledRelease {
+                release_micros: 0,
+                count: 1,
+            }; SCHEDULED_RELEASE_COUNT_MAX],
+            count: 0,
+        }
+    }
+
+    /// Copies one bounded release schedule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schedule exceeds the simulator bound.
+    pub fn new(releases: &[ScheduledRelease]) -> Result<Self, PlantError> {
+        if releases.len() > SCHEDULED_RELEASE_COUNT_MAX {
+            return Err(PlantError::ScheduledReleaseCapacity);
+        }
+        let mut input = Self::empty();
+        input.releases[..releases.len()].copy_from_slice(releases);
+        input.count = u8::try_from(releases.len()).map_err(|_| PlantError::PlatformLimit)?;
+        Ok(input)
+    }
+
+    /// Returns the known releases.
+    #[must_use]
+    pub fn releases(&self) -> &[ScheduledRelease] {
+        &self.releases[..usize::from(self.count)]
+    }
 }
 
 impl CalendarForecastInput {
@@ -320,6 +364,15 @@ pub trait TickGenerator {
         _: TickContext<'_>,
     ) -> Result<Option<CalendarForecastInput>, PlantError> {
         Ok(None)
+    }
+
+    /// Returns known pending releases for this tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schedule exceeds a simulator bound.
+    fn scheduled_releases(&self, _: TickContext<'_>) -> Result<ScheduledReleasesInput, PlantError> {
+        Ok(ScheduledReleasesInput::empty())
     }
 
     /// Calculates the reporter lifecycle action for this tick.

@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::{
     CalendarForecastInput, EventContext, EventInputs, FaultPattern, MetricTrace, PlantError,
-    ReporterDirective, ScaleDirective, Snapshot, SnapshotChannel, SnapshotCursor, SnapshotTable,
-    TickContext, TickGenerator, TickInputs,
+    ReporterDirective, ScaleDirective, ScheduledReleasesInput, Snapshot, SnapshotChannel,
+    SnapshotCursor, SnapshotTable, TickContext, TickGenerator, TickInputs,
 };
 
 const HANDLER_COVERAGE_LEVELS: [f64; 4] = [0.5_f64, 0.8_f64, 0.9_f64, 0.95_f64];
@@ -1181,6 +1181,7 @@ impl<Workload> ClosedLoop<Workload> {
         inputs: TickInputs,
         reporter: ReporterDirective,
         calendar: Option<CalendarForecastInput>,
+        scheduled_releases: &ScheduledReleasesInput,
     ) -> Result<(), PlantError>
     where
         Workload: TickGenerator,
@@ -1204,6 +1205,8 @@ impl<Workload> ClosedLoop<Workload> {
                 calendar.segments(),
             )?;
         }
+        self.observation
+            .set_scheduled_releases(scheduled_releases.releases())?;
         for (index, pending) in self.inflight_transitions.iter().enumerate() {
             if pending.reached(context.plant.replicas) && Some(index) != active_transition {
                 continue;
@@ -2170,7 +2173,8 @@ impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
     ) -> Result<TickInputs, PlantError> {
         let reporter = self.workload.reporter(context);
         let calendar = self.workload.calendar_forecast(context)?;
-        self.prepare_observation(context, inputs, reporter, calendar)?;
+        let scheduled_releases = self.workload.scheduled_releases(context)?;
+        self.prepare_observation(context, inputs, reporter, calendar, &scheduled_releases)?;
         self.apply_decision(context, inputs, reporter)
     }
 
@@ -2183,6 +2187,13 @@ impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
         context: TickContext<'_>,
     ) -> Result<Option<CalendarForecastInput>, PlantError> {
         self.workload.calendar_forecast(context)
+    }
+
+    fn scheduled_releases(
+        &self,
+        context: TickContext<'_>,
+    ) -> Result<ScheduledReleasesInput, PlantError> {
+        self.workload.scheduled_releases(context)
     }
 }
 
