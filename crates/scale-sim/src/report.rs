@@ -1263,10 +1263,7 @@ const fn known_limitation(regime: PrincipalRegime) -> Option<&'static str> {
             "The core does not export the decision change caused by missing evidence. Snapshot \
              age alone cannot prove uncertainty growth.",
         ),
-        PrincipalRegime::HistoricalMatch
-        | PrincipalRegime::HistoricalExceeded
-        | PrincipalRegime::HistoricalUnder
-        | PrincipalRegime::HistoricalMissing => Some(
+        PrincipalRegime::HistoricalMissing => Some(
             "The core does not use the supplied historical series. This run cannot validate \
              history-aware inference.",
         ),

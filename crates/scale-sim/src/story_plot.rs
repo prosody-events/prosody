@@ -403,7 +403,7 @@ fn latency_panel(trace: &MetricTrace, budget_seconds: f64) -> StoryPanel {
 
 fn risk_panel(trace: &MetricTrace, allowed_miss_fraction: f64) -> StoryPanel {
     StoryPanel::new(
-        "fraction",
+        "expected loss (events)",
         vec![
             metric_f64(trace, "realized misses", &trace.miss_fraction),
             metric_f64(trace, "expected loss", &trace.expected_loss),
@@ -591,7 +591,7 @@ fn decision_loss_panel(trace: &MetricTrace, controller: &ControllerTrace) -> Sto
             metric_u32(trace, "saturation cap", &trace.cap).step(),
         ],
     )
-    .with_heatmap(decision_loss_heatmap(controller))
+    .with_bounded_heatmap(decision_loss_heatmap(controller))
 }
 
 fn decision_pass_panel(trace: &MetricTrace, controller: &ControllerTrace) -> StoryPanel {
@@ -602,7 +602,7 @@ fn decision_pass_panel(trace: &MetricTrace, controller: &ControllerTrace) -> Sto
             metric_u32(trace, "selected target", &trace.target).points(),
         ],
     )
-    .with_heatmap(decision_pass_heatmap(controller))
+    .with_bounded_heatmap(decision_pass_heatmap(controller))
 }
 
 fn decision_pass_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
@@ -830,6 +830,9 @@ fn micros(value: u64) -> f64 {
 }
 
 fn panel_bounds(panel: &StoryPanel) -> (f64, f64) {
+    if let Some(bounds) = panel.vertical_bounds {
+        return bounds;
+    }
     let mut values = panel
         .series
         .iter()
@@ -908,6 +911,7 @@ struct StoryPanel {
     horizon_micros: Option<u64>,
     annotations: Vec<StoryAnnotation>,
     heatmap: Option<PosteriorHeatmap>,
+    vertical_bounds: Option<(f64, f64)>,
 }
 
 impl StoryPanel {
@@ -919,6 +923,7 @@ impl StoryPanel {
             horizon_micros: None,
             annotations: Vec::new(),
             heatmap: None,
+            vertical_bounds: None,
         }
     }
 
@@ -928,6 +933,15 @@ impl StoryPanel {
     }
 
     fn with_heatmap(mut self, heatmap: PosteriorHeatmap) -> Self {
+        self.heatmap = Some(heatmap);
+        self
+    }
+
+    fn with_bounded_heatmap(mut self, heatmap: PosteriorHeatmap) -> Self {
+        self.vertical_bounds = heatmap
+            .values
+            .last()
+            .map(|maximum| (0.5_f64, maximum + 0.5_f64));
         self.heatmap = Some(heatmap);
         self
     }
