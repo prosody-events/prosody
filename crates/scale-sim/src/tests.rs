@@ -24,8 +24,6 @@ use crate::{
 };
 use crate::{CapacityEvidenceKind, CapacityEvidenceSample};
 
-const PRINCIPAL_EVENT_COUNT: usize = 2_000;
-
 #[test]
 fn generated_outcome_rules_reject_zero_sentinels() {
     assert!(EventOutcomeRule::permanent_every(0).is_none());
@@ -704,13 +702,24 @@ fn dependency_inputs_raise_measured_handler_latency() -> Result<(), TestError> {
 
 #[test]
 fn principal_regimes_exercise_distinct_failure_mechanisms() -> Result<(), TestError> {
-    let application = run_principal_regime(PrincipalRegime::ApplicationLimited)?;
-    let hot_key = run_principal_regime(PrincipalRegime::HotSerializedKey)?;
-    let timers = run_principal_regime(PrincipalRegime::TimerWave)?;
-    let transient = run_principal_regime(PrincipalRegime::TransientFailures)?;
-    let rejected = run_principal_regime(PrincipalRegime::PermanentRejections)?;
-    let rebalance = run_principal_regime(PrincipalRegime::RebalanceStorm)?;
-    let contention = run_principal_regime(PrincipalRegime::HandlerContention)?;
+    let (application, (hot_key, (rebalance, contention))) = rayon::join(
+        || run_principal_regime(PrincipalRegime::ApplicationLimited),
+        || {
+            rayon::join(
+                || run_principal_regime(PrincipalRegime::HotSerializedKey),
+                || {
+                    rayon::join(
+                        || run_principal_regime(PrincipalRegime::RebalanceStorm),
+                        || run_principal_regime(PrincipalRegime::HandlerContention),
+                    )
+                },
+            )
+        },
+    );
+    let application = application?;
+    let hot_key = hot_key?;
+    let rebalance = rebalance?;
+    let contention = contention?;
 
     assert_eq!(
         application.inputs().names().collect::<Vec<_>>(),
@@ -732,71 +741,18 @@ fn principal_regimes_exercise_distinct_failure_mechanisms() -> Result<(), TestEr
         Some(SeriesCell::Unsigned32(100))
     );
     assert!(final_settle(&hot_key) > final_settle(&application));
-    assert!(
-        !timers.settlements().is_empty()
-            && timers
-                .settlements()
-                .iter()
-                .all(|settlement| settlement.release_micros == 120_000_000)
-    );
-    assert_eq!(attempt_count(&transient), 43_200);
-    assert_eq!(
-        rejected
-            .settlements()
-            .iter()
-            .filter(|settlement| {
-                matches!(settlement.final_outcome, FinalOutcome::PermanentFailure)
-            })
-            .count(),
-        200
-    );
     assert!(final_settle(&rebalance) > final_settle(&application));
     assert!(maximum_handler_time(&contention) > maximum_handler_time(&application));
     Ok(())
 }
 
 #[test]
-fn extended_principal_regimes_enforce_their_physical_invariants() -> Result<(), TestError> {
-    let idle = run_principal_regime(PrincipalRegime::Idle)?;
-    let burst = run_principal_regime(PrincipalRegime::ShortBurst)?;
-    let seasonal = run_principal_regime(PrincipalRegime::SeasonalWaves)?;
-    let hot_partition = run_principal_regime(PrincipalRegime::HotPartition)?;
-    let loose = run_principal_regime(PrincipalRegime::LooseBudgetBacklog)?;
-    let faults = run_principal_regime(PrincipalRegime::SnapshotFaults)?;
-    let faults_replay = run_principal_regime(PrincipalRegime::SnapshotFaults)?;
-    let missing = run_principal_regime(PrincipalRegime::MissingReporter)?;
-    let replacement = run_principal_regime(PrincipalRegime::AggregatorReplacement)?;
-
-    assert!(idle.settlements().is_empty());
-    assert!(burst.settlements().iter().all(|settlement| {
-        settlement
-            .settle_micros
-            .saturating_sub(settlement.release_micros)
-            < 30_000_000
-    }));
-    let mut release_times = seasonal
-        .events()
-        .iter()
-        .map(|event| event.release_micros)
-        .collect::<Vec<_>>();
-    release_times.dedup();
-    assert_eq!(release_times, [120_000_000, 240_000_000, 360_000_000]);
-    assert!(
-        hot_partition
-            .events()
-            .iter()
-            .all(|event| event.partition == 0)
+fn snapshot_fault_replay_is_deterministic() -> Result<(), TestError> {
+    let (first, second) = rayon::join(
+        || run_principal_regime(PrincipalRegime::SnapshotFaults),
+        || run_principal_regime(PrincipalRegime::SnapshotFaults),
     );
-    assert!(loose.settlements().iter().all(|settlement| {
-        settlement
-            .settle_micros
-            .saturating_sub(settlement.release_micros)
-            <= 60_000_000
-    }));
-    assert_eq!(faults.settlements().len(), PRINCIPAL_EVENT_COUNT);
-    assert_eq!(faults.settlements(), faults_replay.settlements());
-    assert_eq!(missing.settlements().len(), PRINCIPAL_EVENT_COUNT);
-    assert_eq!(replacement.settlements().len(), PRINCIPAL_EVENT_COUNT);
+    assert_eq!(first?.settlements(), second?.settlements());
     Ok(())
 }
 
@@ -826,11 +782,13 @@ fn replica_ceiling_exposes_unmet_demand_at_the_limit() -> Result<(), TestError> 
 
 #[test]
 fn capacity_regimes_record_passive_resource_windows() -> Result<(), TestError> {
-    for regime in [
+    [
         PrincipalRegime::LinearThroughput,
         PrincipalRegime::FlatPostKnee,
         PrincipalRegime::DecliningPostKnee,
-    ] {
+    ]
+    .par_iter()
+    .try_for_each(|&regime| {
         let run = run_capacity_evidence_regime(regime)?;
         for row in 0..run.inputs().len() {
             assert_eq!(
@@ -888,17 +846,54 @@ fn capacity_regimes_record_passive_resource_windows() -> Result<(), TestError> {
                 .zip(final_posterior)
                 .any(|(before, after)| (before - after).abs() > 1.0e-12_f64)
         );
-    }
-    Ok(())
-}
-
-#[test]
-fn every_closed_loop_regime_satisfies_its_declared_stimulus() -> Result<(), TestError> {
-    PrincipalRegime::ALL.par_iter().try_for_each(|&regime| {
-        let run = run_principal_regime(regime)?;
-        validate_principal_regime(regime, RegimeExperiment::ClosedLoop, &run)?;
         Ok(())
     })
+}
+
+// One test per principal regime: nextest schedules the runs concurrently,
+// a red regime never hides another, and one regime re-runs in isolation
+// with `-E 'test(<name>_regime_satisfies)'`.
+macro_rules! closed_loop_regime_tests {
+    ($($name:ident => $regime:ident),+ $(,)?) => {
+        $(
+            #[test]
+            fn $name() -> Result<(), TestError> {
+                let run = run_principal_regime(PrincipalRegime::$regime)?;
+                validate_principal_regime(
+                    PrincipalRegime::$regime,
+                    RegimeExperiment::ClosedLoop,
+                    &run,
+                )?;
+                Ok(())
+            }
+        )+
+    };
+}
+
+closed_loop_regime_tests! {
+    idle_regime_satisfies_its_claims => Idle,
+    application_limited_regime_satisfies_its_claims => ApplicationLimited,
+    linear_throughput_regime_satisfies_its_claims => LinearThroughput,
+    flat_post_knee_regime_satisfies_its_claims => FlatPostKnee,
+    declining_post_knee_regime_satisfies_its_claims => DecliningPostKnee,
+    short_burst_regime_satisfies_its_claims => ShortBurst,
+    seasonal_waves_regime_satisfies_its_claims => SeasonalWaves,
+    hot_partition_regime_satisfies_its_claims => HotPartition,
+    timer_wave_regime_satisfies_its_claims => TimerWave,
+    hot_serialized_key_regime_satisfies_its_claims => HotSerializedKey,
+    transient_failures_regime_satisfies_its_claims => TransientFailures,
+    permanent_rejections_regime_satisfies_its_claims => PermanentRejections,
+    rebalance_storm_regime_satisfies_its_claims => RebalanceStorm,
+    handler_contention_regime_satisfies_its_claims => HandlerContention,
+    loose_budget_backlog_regime_satisfies_its_claims => LooseBudgetBacklog,
+    snapshot_faults_regime_satisfies_its_claims => SnapshotFaults,
+    missing_reporter_regime_satisfies_its_claims => MissingReporter,
+    aggregator_replacement_regime_satisfies_its_claims => AggregatorReplacement,
+    replica_ceiling_regime_satisfies_its_claims => ReplicaCeiling,
+    historical_match_regime_satisfies_its_claims => HistoricalMatch,
+    historical_exceeded_regime_satisfies_its_claims => HistoricalExceeded,
+    historical_under_regime_satisfies_its_claims => HistoricalUnder,
+    historical_missing_regime_satisfies_its_claims => HistoricalMissing,
 }
 
 #[test]
@@ -960,9 +955,9 @@ fn hot_partition_exposes_unavoidable_placement_loss() -> Result<(), TestError> {
     Ok(())
 }
 
-#[test]
-fn lead_time_diagnostics_use_prequential_predictive_distributions() -> Result<(), TestError> {
-    let run = run_principal_regime(PrincipalRegime::LinearThroughput)?;
+fn assert_lead_time_diagnostics_use_prequential_predictive_distributions(
+    run: &crate::PrincipalRun,
+) -> Result<(), TestError> {
     let mut completed = 0_u32;
     let mut maximum_target = 0_u32;
     let mut minimum_loss = f64::INFINITY;
@@ -1050,10 +1045,7 @@ fn lead_time_diagnostics_use_prequential_predictive_distributions() -> Result<()
     Ok(())
 }
 
-#[test]
-fn linear_closed_loop_uses_only_controller_scale_targets() -> Result<(), TestError> {
-    let run = run_principal_regime(PrincipalRegime::LinearThroughput)?;
-
+fn assert_linear_closed_loop_uses_only_controller_scale_targets(run: &crate::PrincipalRun) {
     assert_eq!(run.stop().reason, RunStopReason::DurationComplete);
     for row in 0..run.inputs().len() {
         assert_eq!(
@@ -1061,14 +1053,15 @@ fn linear_closed_loop_uses_only_controller_scale_targets() -> Result<(), TestErr
             Some(SeriesCell::Unsigned32(0))
         );
     }
-    Ok(())
 }
 
 #[test]
 fn linear_closed_loop_satisfies_its_declared_outcome() -> Result<(), TestError> {
-    let run = run_principal_regime(PrincipalRegime::LinearThroughput)?;
     const STEP_MICROS: u64 = 180_000_000;
     const STEP_COUNT: usize = 7;
+    let run = run_principal_regime(PrincipalRegime::LinearThroughput)?;
+    assert_lead_time_diagnostics_use_prequential_predictive_distributions(&run)?;
+    assert_linear_closed_loop_uses_only_controller_scale_targets(&run);
     let mut target_changes = Vec::new();
     let mut decision_audit = Vec::new();
     let mut misses_by_release_step = [0_usize; STEP_COUNT];
@@ -1251,14 +1244,6 @@ fn final_settle(result: &crate::SimulationResult) -> u64 {
         .settlements()
         .last()
         .map_or(0, |settlement| settlement.settle_micros)
-}
-
-fn attempt_count(result: &crate::SimulationResult) -> u32 {
-    result
-        .settlements()
-        .iter()
-        .map(|settlement| settlement.attempts)
-        .sum()
 }
 
 fn maximum_handler_time(result: &crate::SimulationResult) -> u64 {

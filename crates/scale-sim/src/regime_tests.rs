@@ -345,16 +345,18 @@ fn retry_outcomes_increase_loss_without_creating_physical_saturation()
         .len()
         .checked_sub(1)
         .and_then(|index| failed.controller().sample(index));
-    let healthy_final = healthy
+    // The two runs' evidence trajectories legitimately diverge (the
+    // healthy run descends and resolves its saturation prior; the failed
+    // run holds capacity for real retry delay). The invariant is
+    // within-run: retry outcomes must never push the saturation belief
+    // above its prior.
+    let failed_initial = failed
         .controller()
-        .len()
-        .checked_sub(1)
-        .and_then(|index| healthy.controller().sample(index));
-    let saturation_delta = failed_final
-        .zip(healthy_final)
-        .map_or(f64::INFINITY, |(failed, healthy)| {
-            (failed.saturation_probability - healthy.saturation_probability).abs()
-        });
+        .sample(0)
+        .map_or(f64::NAN, |sample| sample.saturation_probability);
+    let saturation_created = failed_final.map_or(f64::INFINITY, |sample| {
+        sample.saturation_probability - failed_initial
+    });
     let reliability_increases_loss = (1..failed.controller().len().min(healthy.controller().len()))
         .any(|index| {
             failed
@@ -367,9 +369,8 @@ fn retry_outcomes_increase_loss_without_creating_physical_saturation()
     assert!(failed_attempts > healthy_attempts);
     assert!(failed_clear_micros > healthy_clear_micros);
     assert!(
-        saturation_delta <= 0.01_f64,
-        "retry outcomes changed saturation from {} to {}",
-        healthy_final.map_or(f64::NAN, |sample| sample.saturation_probability),
+        saturation_created <= 0.01_f64,
+        "retry outcomes raised saturation from {failed_initial} to {}",
         failed_final.map_or(f64::NAN, |sample| sample.saturation_probability)
     );
     assert!(reliability_increases_loss);

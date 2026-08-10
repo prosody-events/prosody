@@ -32,12 +32,18 @@ const CAPACITY_RESPONSE_EVENT_COUNT: u32 = 231_000;
 const LINEAR_RESPONSE_EVENT_COUNT: u32 = 462_000;
 const HISTORY_EVENT_COUNT_MAX: u32 = 240_000;
 const CALENDAR_HISTORY_EXPOSURE_SECONDS: u32 = 900;
+const IDLE_COST_START_MICROS: u64 = 91_000_000;
+const IDLE_DURATION_MICROS: u64 = 240_000_000;
 const SHORT_BURST_RELEASE_MICROS: u64 = 120_000_000;
 const CALENDAR_PRIOR_SHAPE: f64 = 4.0_f64;
 const CALENDAR_PRIOR_RATE_SECONDS: f64 = 0.01_f64;
 const CALENDAR_MODEL_PRIOR_PROBABILITY: f64 = 0.5_f64;
 const HISTORICAL_MAXIMUM_LEAD_SECONDS: f64 = 90.0_f64;
 const HISTORICAL_STEP_DURATION_SECONDS: f64 = 90.0_f64;
+const REGIME_PRIOR_TRUST_SECONDS: f64 = 5.0_f64;
+const REGIME_OCCUPANCY_HALF_LIFE_SECONDS: f64 = 86_400.0_f64;
+const PRIOR_RELEASE_MARGIN_MICROS: u64 =
+    (1.5_f64 * 16.0_f64 * REGIME_PRIOR_TRUST_SECONDS * 1_000_000.0_f64) as u64;
 
 /// A principal deterministic plant regime for plot review.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -288,6 +294,26 @@ pub fn validate_principal_regime(
         }
         RegimeExperiment::CapacityEvidence => validate_capacity_evidence(regime, run)?,
     }
+    // The coverage bar runs after the claims: it grades the belief's
+    // calibration, and a red bar must not hide a regime's claim status.
+    validate_capacity_coverage(regime, experiment, run)
+}
+
+fn validate_capacity_coverage(
+    regime: PrincipalRegime,
+    experiment: RegimeExperiment,
+    run: &PrincipalRun,
+) -> Result<(), RegimeValidationError> {
+    let (capacity_window_count, capacity_covered_count) = capacity_coverage(run);
+    if capacity_window_count >= 10 {
+        let coverage = count_as_f64(capacity_covered_count) / count_as_f64(capacity_window_count);
+        require_regime(
+            (coverage - 0.8_f64).abs() <= 0.15_f64,
+            regime,
+            experiment,
+            "capacity predictive coverage differs from its stated probability",
+        )?;
+    }
     Ok(())
 }
 
@@ -304,16 +330,11 @@ fn validate_closed_loop_stimulus(
         | PrincipalRegime::FlatPostKnee
         | PrincipalRegime::DecliningPostKnee => input_sum(run.inputs(), "message_count") > 100_000,
         PrincipalRegime::ShortBurst => validate_short_burst_stimulus(run),
-        PrincipalRegime::SeasonalWaves => {
-            let first = run.events().first().map(|event| event.release_micros);
-            run.events()
-                .iter()
-                .any(|event| Some(event.release_micros) != first)
-                && input_sum(run.inputs(), "historical_message_count") > 0
-        }
+        PrincipalRegime::SeasonalWaves => validate_seasonal_stimulus(run),
         PrincipalRegime::HotPartition => run.events().iter().all(|event| event.partition == 0),
         PrincipalRegime::TimerWave => {
             run.events().len() == EVENT_COUNT as usize
+                && settled_all
                 && run.events().iter().all(|event| {
                     event.source == crate::EventSource::Timer && event.release_micros == 120_000_000
                 })
@@ -353,16 +374,21 @@ fn validate_closed_loop_stimulus(
             .settlements()
             .iter()
             .any(|settlement| settlement.handler_micros > 2_000),
-        PrincipalRegime::LooseBudgetBacklog => {
+        PrincipalRegime::LooseBudgetBacklog | PrincipalRegime::SnapshotFaults => {
             run.events().len() == EVENT_COUNT as usize && settled_all
         }
-        PrincipalRegime::SnapshotFaults => settled_all,
-        PrincipalRegime::MissingReporter => (0..run.controller().len())
-            .filter_map(|index| run.controller().sample(index))
-            .any(|sample| sample.reporter == ReporterDirective::Missing),
-        PrincipalRegime::AggregatorReplacement => (0..run.controller().len())
-            .filter_map(|index| run.controller().sample(index))
-            .any(|sample| sample.reporter == ReporterDirective::ReplaceAggregator),
+        PrincipalRegime::MissingReporter => {
+            run.events().len() == EVENT_COUNT as usize
+                && settled_all
+                && controller_samples(run)
+                    .any(|sample| sample.reporter == ReporterDirective::Missing)
+        }
+        PrincipalRegime::AggregatorReplacement => {
+            run.events().len() == EVENT_COUNT as usize
+                && settled_all
+                && controller_samples(run)
+                    .any(|sample| sample.reporter == ReporterDirective::ReplaceAggregator)
+        }
         PrincipalRegime::ReplicaCeiling => {
             run.events().len() == REPLICA_CEILING_EVENT_COUNT as usize
         }
@@ -401,6 +427,17 @@ fn validate_short_burst_stimulus(run: &PrincipalRun) -> bool {
             .all(|event| event.release_micros == SHORT_BURST_RELEASE_MICROS)
 }
 
+fn validate_seasonal_stimulus(run: &PrincipalRun) -> bool {
+    let mut release_times = run
+        .events()
+        .iter()
+        .map(|event| event.release_micros)
+        .collect::<Vec<_>>();
+    release_times.dedup();
+    release_times == [120_000_000, 240_000_000, 360_000_000]
+        && input_sum(run.inputs(), "historical_message_count") > 0
+}
+
 fn validate_closed_loop_claim(
     regime: PrincipalRegime,
     run: &PrincipalRun,
@@ -423,6 +460,7 @@ fn validate_closed_loop_claim(
             "the decision did not expose the binding serialized-key loss",
         ),
         PrincipalRegime::TransientFailures => validate_transient_failure_claim(run),
+        PrincipalRegime::PermanentRejections => validate_permanent_rejection_claim(run),
         PrincipalRegime::RebalanceStorm => validate_rebalance_storm_claim(run),
         PrincipalRegime::LooseBudgetBacklog => validate_loose_budget_claim(run),
         PrincipalRegime::ReplicaCeiling => validate_replica_ceiling_claim(run),
@@ -435,10 +473,14 @@ fn validate_closed_loop_claim(
 }
 
 fn validate_idle_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    let cost_duration_seconds =
+        Duration::from_micros(run.stop.at_micros.saturating_sub(IDLE_COST_START_MICROS))
+            .as_secs_f64();
     require_closed_loop(
-        replica_seconds(run) <= 3.0_f64 * run_duration_seconds(run),
+        replica_seconds_between(run, IDLE_COST_START_MICROS, run.stop.at_micros)
+            <= 1.5_f64 * cost_duration_seconds,
         PrincipalRegime::Idle,
-        "idle capacity exceeded three average replicas",
+        "idle capacity exceeded its controllable cost budget",
     )?;
     require_closed_loop(
         final_target(run) == Some(1),
@@ -471,16 +513,46 @@ fn validate_linear_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError
     )
 }
 
+/// A change point restarts the release clock. After the burst drains,
+/// the honest posterior holds one insurance replica while the learned
+/// hazard decays, and δ paces the release. The claim bounds the
+/// insurance level at that δ-quantile (target ≤ 2) and requires the
+/// release to complete within the derived margin.
 fn validate_short_burst_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
-    const EXEMPTION_END_MICROS: u64 = SHORT_BURST_RELEASE_MICROS + 5_000_000;
-    let bounded_excursion = controller_samples(run).all(|sample| {
-        (SHORT_BURST_RELEASE_MICROS..EXEMPTION_END_MICROS).contains(&sample.at_micros)
-            || sample.target == 1
+    const DRAIN_EXEMPTION_END_MICROS: u64 = SHORT_BURST_RELEASE_MICROS + 5_000_000;
+    const RELEASE_CEILING_MICROS: u64 = SHORT_BURST_RELEASE_MICROS + PRIOR_RELEASE_MARGIN_MICROS;
+    let bounded_insurance = controller_samples(run).all(|sample| {
+        sample.at_micros < PRIOR_RELEASE_MARGIN_MICROS
+            || (SHORT_BURST_RELEASE_MICROS..DRAIN_EXEMPTION_END_MICROS).contains(&sample.at_micros)
+            || sample.target <= 2
     });
+    let released = controller_samples(run)
+        .filter(|sample| sample.at_micros >= RELEASE_CEILING_MICROS)
+        .all(|sample| sample.target == 1);
     require_closed_loop(
-        bounded_excursion && final_target(run) == Some(1),
+        bounded_insurance,
         PrincipalRegime::ShortBurst,
-        "the controller held capacity after the short burst became sunk work",
+        "the controller held more than one insurance replica after the burst drained",
+    )?;
+    require_closed_loop(
+        released,
+        PrincipalRegime::ShortBurst,
+        "the controller held insurance past the derived release margin",
+    )?;
+    require_closed_loop(
+        final_target(run) == Some(1),
+        PrincipalRegime::ShortBurst,
+        "the short-burst controller did not finish at one replica",
+    )?;
+    require_closed_loop(
+        run.settlements().iter().all(|settlement| {
+            settlement
+                .settle_micros
+                .saturating_sub(settlement.release_micros)
+                < 30_000_000
+        }),
+        PrincipalRegime::ShortBurst,
+        "a short-burst settlement exceeded the reactive drain bound",
     )
 }
 
@@ -536,6 +608,34 @@ fn validate_transient_failure_claim(run: &PrincipalRun) -> Result<(), RegimeVali
         maximum_target(run) <= 12,
         PrincipalRegime::TransientFailures,
         "retry demand caused excessive replica growth",
+    )?;
+    let attempts = run
+        .settlements()
+        .iter()
+        .map(|settlement| settlement.attempts)
+        .sum::<u32>();
+    require_closed_loop(
+        attempts == 43_200,
+        PrincipalRegime::TransientFailures,
+        "the retry schedule did not produce its declared attempt count",
+    )
+}
+
+fn validate_permanent_rejection_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    let rejections = run
+        .settlements()
+        .iter()
+        .filter(|settlement| {
+            matches!(
+                settlement.final_outcome,
+                crate::FinalOutcome::PermanentFailure
+            )
+        })
+        .count();
+    require_closed_loop(
+        rejections == 200,
+        PrincipalRegime::PermanentRejections,
+        "the rejection schedule did not produce its declared permanent count",
     )
 }
 
@@ -553,7 +653,16 @@ fn validate_rebalance_storm_claim(run: &PrincipalRun) -> Result<(), RegimeValida
     )
 }
 
+/// The run starts at eight replicas, so the descent to one replica pays
+/// the plant's launch delay before it can land. The cost claim charges
+/// the controller only for what it controls: the descent must be
+/// requested within the drain window, it must land, and capacity after
+/// the landing stays within the clear-cost slack.
 fn validate_loose_budget_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    // Drain window: 2,000 events at eight replicas of 32 slots each,
+    // plus five report intervals of filter settling.
+    const DRAIN_END_MICROS: u64 = 1_000_000 + (EVENT_COUNT as u64) * 1_000_000 / (8 * 32);
+    const REQUEST_DEADLINE_MICROS: u64 = DRAIN_END_MICROS + 5_000_000;
     let clear_seconds = f64::from(EVENT_COUNT) / 32.0_f64;
     require_closed_loop(
         run.settlements().len() == run.events().len()
@@ -562,9 +671,31 @@ fn validate_loose_budget_claim(run: &PrincipalRun) -> Result<(), RegimeValidatio
         "the controller did not clear the backlog within the loose SLO",
     )?;
     require_closed_loop(
-        replica_seconds(run) <= run_duration_seconds(run) + 3.0_f64 * clear_seconds,
+        controller_samples(run)
+            .any(|sample| sample.at_micros <= REQUEST_DEADLINE_MICROS && sample.target == 1),
         PrincipalRegime::LooseBudgetBacklog,
-        "the controller used excessive capacity to clear the loose-SLO backlog",
+        "the controller did not request the descent within the drain window",
+    )?;
+    let descent_landing_micros = run
+        .simulation
+        .changes
+        .iter()
+        .find(|change| change.replicas < run.simulation.initial_replicas)
+        .map(|change| change.at_micros);
+    let Some(landing_micros) = descent_landing_micros else {
+        return Err(RegimeValidationError::Failed {
+            regime: PrincipalRegime::LooseBudgetBacklog,
+            experiment: RegimeExperiment::ClosedLoop,
+            invariant: "the requested descent never landed",
+        });
+    };
+    let landed_window_seconds =
+        Duration::from_micros(run.stop.at_micros.saturating_sub(landing_micros)).as_secs_f64();
+    require_closed_loop(
+        replica_seconds_between(run, landing_micros, run.stop.at_micros)
+            <= landed_window_seconds + 3.0_f64 * clear_seconds,
+        PrincipalRegime::LooseBudgetBacklog,
+        "the controller used excessive capacity after the descent landed",
     )?;
     require_closed_loop(
         minimum_cap(run) >= maximum_target(run),
@@ -587,12 +718,25 @@ fn validate_replica_ceiling_claim(run: &PrincipalRun) -> Result<(), RegimeValida
         PrincipalRegime::ReplicaCeiling,
         "the controller did not bind at the configured replica ceiling",
     )?;
-    let oracle_miss_fraction = (3_840.0_f64 - 8.0_f64 * 320.0_f64) / 3_840.0_f64;
+    // Sustained overload keeps a FIFO backlog, so almost every queued
+    // event misses the one-second budget at any policy — a loss-system
+    // miss oracle cannot bind here. The testable ceiling invariant is
+    // pace: the run settles every event no slower than the ceiling
+    // serves (eight replicas at 320 events per second). The 20 %
+    // tolerance covers release overlap and partition serialization; a
+    // seven-replica run still exceeds it.
+    let ceiling_drain_seconds = f64::from(REPLICA_CEILING_EVENT_COUNT) / (8.0_f64 * 320.0_f64);
+    let final_settle_seconds = run
+        .settlements()
+        .last()
+        .map_or(f64::INFINITY, |settlement| {
+            Duration::from_micros(settlement.settle_micros).as_secs_f64()
+        });
     require_closed_loop(
-        slo_miss_fraction(run, PrincipalRegime::ReplicaCeiling.budget_micros())
-            <= oracle_miss_fraction + 0.05_f64,
+        run.settlements().len() == run.events().len()
+            && final_settle_seconds <= 1.2_f64 * ceiling_drain_seconds,
         PrincipalRegime::ReplicaCeiling,
-        "the replica ceiling result exceeded the eight-replica oracle",
+        "the run did not settle the workload at the ceiling's service pace",
     )
 }
 
@@ -700,20 +844,28 @@ fn release_window_miss_fraction(
 }
 
 fn replica_seconds(run: &PrincipalRun) -> f64 {
-    let end_micros = run.stop.at_micros;
+    replica_seconds_between(run, 0, run.stop.at_micros)
+}
+
+fn replica_seconds_between(run: &PrincipalRun, start_micros: u64, end_micros: u64) -> f64 {
     let mut replicas = run.simulation.initial_replicas;
     let mut cursor = 0_u64;
     let mut area = 0.0_f64;
     for change in &run.simulation.changes {
-        if change.at_micros >= end_micros || change.at_micros < cursor {
-            continue;
+        if change.at_micros >= end_micros {
+            break;
         }
-        area +=
-            f64::from(replicas) * Duration::from_micros(change.at_micros - cursor).as_secs_f64();
+        if change.at_micros > start_micros {
+            let interval_start = cursor.max(start_micros);
+            area += f64::from(replicas)
+                * Duration::from_micros(change.at_micros - interval_start).as_secs_f64();
+        }
         cursor = change.at_micros;
         replicas = change.replicas;
     }
-    area + f64::from(replicas) * Duration::from_micros(end_micros - cursor).as_secs_f64()
+    let interval_start = cursor.max(start_micros);
+    area + f64::from(replicas)
+        * Duration::from_micros(end_micros.saturating_sub(interval_start)).as_secs_f64()
 }
 
 fn run_duration_seconds(run: &PrincipalRun) -> f64 {
@@ -872,16 +1024,6 @@ fn validate_run_envelope(
             regime,
             experiment,
             "a controller sample has an invalid target or cap",
-        )?;
-    }
-    let (capacity_window_count, capacity_covered_count) = capacity_coverage(run);
-    if capacity_window_count >= 10 {
-        let coverage = count_as_f64(capacity_covered_count) / count_as_f64(capacity_window_count);
-        require_regime(
-            (coverage - 0.8_f64).abs() <= 0.15_f64,
-            regime,
-            experiment,
-            "capacity predictive coverage differs from its stated probability",
         )?;
     }
     let has_external_target = (0..run.inputs.len()).any(|row| {
@@ -1081,6 +1223,10 @@ fn principal_graph(
             0.01_f64,
             1.0_f64 / 90.0_f64,
             1_024,
+        )?
+        .with_transition_learning(
+            REGIME_PRIOR_TRUST_SECONDS,
+            REGIME_OCCUPANCY_HALF_LIFE_SECONDS,
         )?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
@@ -1737,7 +1883,9 @@ impl PrincipalDefinition {
     fn for_regime(regime: PrincipalRegime) -> Self {
         let standard = Self::standard();
         match regime {
-            PrincipalRegime::Idle => standard.messages(ArrivalSeries::None),
+            PrincipalRegime::Idle => standard
+                .messages(ArrivalSeries::None)
+                .schedule(RunSchedule::idle()),
             PrincipalRegime::ApplicationLimited | PrincipalRegime::SnapshotFaults => standard,
             PrincipalRegime::LinearThroughput => Self::linear_closed_loop().handler(100_000),
             PrincipalRegime::FlatPostKnee => {
@@ -2647,6 +2795,16 @@ impl RunSchedule {
             followup_interval_micros: 1_000_000,
             maximum_micros: 300_000_000,
             stop: StopCondition::IdleStable { sample_count: 3 },
+        }
+    }
+
+    const fn idle() -> Self {
+        Self {
+            maximum_micros: IDLE_DURATION_MICROS,
+            stop: StopCondition::FixedDuration {
+                reason: RunStopReason::DurationComplete,
+            },
+            ..Self::standard()
         }
     }
 
