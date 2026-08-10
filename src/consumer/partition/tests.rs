@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::Key;
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, UncommittedMessage};
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, Record, UncommittedMessage};
 use crate::consumer::{DemandType, EventContext, EventHandler, Uncommitted};
 use crate::loader::MemoryLoader;
 use crate::state::SharedStateBackend;
@@ -324,7 +324,7 @@ async fn test_partition_manager_event_type_filtering() {
         ConsumerMessageValue {
             offset: Offset::from(0u8),
             key: "key".into(),
-            payload: Some(json!({ "type": "disallowed" })),
+            record: Record::Message(json!({ "type": "disallowed" })),
             ..Default::default()
         },
         Span::current(),
@@ -340,7 +340,7 @@ async fn test_partition_manager_event_type_filtering() {
         ConsumerMessageValue {
             offset: Offset::from(1u8),
             key: "key".into(),
-            payload: Some(json!({ "type": "allowed" })),
+            record: Record::Message(json!({ "type": "allowed" })),
             ..Default::default()
         },
         Span::current(),

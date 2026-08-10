@@ -29,7 +29,7 @@ use super::settle::{ArmOutcome, arm_backstop};
 use super::*;
 use crate::consumer::EventHandler;
 use crate::consumer::Uncommitted;
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, Record};
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, create_test_message, create_test_message_from,
 };
@@ -2199,10 +2199,10 @@ mod settlement_classification {
     }
 
     #[tokio::test]
-    async fn leaf_dispatches_absent_payload_to_excise() -> color_eyre::Result<()> {
+    async fn leaf_dispatches_excise_record_to_excise() -> color_eyre::Result<()> {
         let handler = ScriptedHandler::success();
         let message = create_test_message_from(ConsumerMessageValue {
-            payload: None,
+            record: Record::Excise,
             ..Default::default()
         })?;
         FallibleHandler::on_message(

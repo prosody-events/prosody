@@ -2,6 +2,7 @@ use super::*;
 use crate::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use crate::codec::JsonCodec;
 use crate::consumer::Keyed;
+use crate::consumer::message::Record;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::telemetry::Telemetry;
@@ -457,7 +458,7 @@ async fn null_payload_loads_as_excise() -> color_eyre::Result<()> {
         let message = timeout(Duration::from_mins(1), loader.load_message(topic, 0, 0)).await??;
 
         assert_eq!(message.key().as_ref(), "test-key");
-        assert_eq!(message.payload(), None);
+        assert!(matches!(message.record(), Record::Excise));
         Ok(())
     })
     .await

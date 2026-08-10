@@ -88,7 +88,7 @@ impl EventHandler for TimerTestHandler {
     {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
-        let Some(payload) = msg.payload().cloned() else {
+        let Some(payload) = msg.record().message().cloned() else {
             uncommitted.commit().await;
             return;
         };
@@ -218,7 +218,8 @@ impl FallibleHandler for InlineReplacementHandler {
     {
         let key = msg.key().to_string();
         let step = msg
-            .payload()
+            .record()
+            .message()
             .and_then(|payload| payload.get("step"))
             .and_then(Value::as_i64)
             .ok_or(TestError)?;

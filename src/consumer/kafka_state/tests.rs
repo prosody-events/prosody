@@ -169,7 +169,7 @@ async fn kafka_descriptor_set_then_get_loads_full_message() -> Result<()> {
     assert_eq!(message.topic(), topic);
     assert_eq!(message.partition(), partition);
     assert_eq!(message.offset(), offset);
-    assert_eq!(message.payload(), Some(&payload));
+    assert_eq!(message.record().message(), Some(&payload));
     Ok(())
 }
 
@@ -262,7 +262,7 @@ mod message_cell_in_every_kind {
         match (resolved, expected) {
             (None, None) => true,
             (Some(message), Some(id)) => {
-                message.offset() == id && message.payload() == Some(&json!(id))
+                message.offset() == id && message.record().message() == Some(&json!(id))
             }
             _ => false,
         }

@@ -14,7 +14,7 @@
 //! of partition-level message processing.
 
 use crate::consumer::event_context::PartitionEventContext;
-use crate::consumer::message::{ConsumerMessage, UncommittedEvent, UncommittedMessage};
+use crate::consumer::message::{ConsumerMessage, Record, UncommittedEvent, UncommittedMessage};
 use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
 use crate::consumer::partition::keyed::KeyManager;
 use crate::consumer::partition::offsets::OffsetTracker;
@@ -953,7 +953,11 @@ async fn filter_event_type<P: Send + Sync + 'static + EventType>(
     message: UncommittedMessage<P>,
 ) -> Option<UncommittedMessage<P>> {
     // Extract event type from message payload if present
-    let Some(event_type) = message.payload().and_then(EventType::event_type) else {
+    let event_type = match message.record() {
+        Record::Message(payload) => payload.event_type(),
+        Record::Excise => return Some(message),
+    };
+    let Some(event_type) = event_type else {
         return Some(message);
     };
 

@@ -53,7 +53,7 @@ impl EventHandler for SlowTimerHandler {
     {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
-        let payload = msg.payload();
+        let payload = msg.record().message();
 
         // Schedule a timer based on the message
         if let Some(delay_ms) = payload

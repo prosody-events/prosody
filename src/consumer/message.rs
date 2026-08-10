@@ -104,10 +104,10 @@ impl<P> UncommittedMessage<P> {
         self.inner.timestamp()
     }
 
-    /// Returns the payload, or `None` for an excise record.
+    /// Returns the record value.
     #[must_use]
-    pub fn payload(&self) -> Option<&P> {
-        self.inner.payload()
+    pub fn record(&self) -> &Record<P> {
+        self.inner.record()
     }
 
     /// Returns the tracing span associated with this message.
@@ -174,7 +174,10 @@ impl<P> Keyed for UncommittedMessage<P> {
 
 impl<P: EventIdentity> EventIdentity for UncommittedMessage<P> {
     fn event_id(&self) -> Option<&str> {
-        self.payload().and_then(EventIdentity::event_id)
+        match self.record() {
+            Record::Message(payload) => payload.event_id(),
+            Record::Excise => None,
+        }
     }
 }
 
@@ -244,9 +247,28 @@ pub struct ConsumerMessageValue<P> {
     /// Broker timestamp when the message was produced.
     pub timestamp: DateTime<Utc>,
 
-    /// Deserialized payload. `None` identifies an excise record.
+    /// Record content.
     #[educe(Debug(ignore))]
-    pub payload: Option<P>,
+    pub record: Record<P>,
+}
+
+/// Content of one keyed Kafka record.
+pub enum Record<P> {
+    /// A record with a deserialized payload.
+    Message(P),
+    /// A record that deletes its key from compacted views.
+    Excise,
+}
+
+impl<P> Record<P> {
+    /// Returns the message payload, if this is a message record.
+    #[must_use]
+    pub fn message(&self) -> Option<&P> {
+        match self {
+            Self::Message(payload) => Some(payload),
+            Self::Excise => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -259,7 +281,7 @@ impl Default for ConsumerMessageValue<serde_json::Value> {
             offset: 0,
             key: "test-key".into(),
             timestamp: Utc::now(),
-            payload: Some(serde_json::json!({})),
+            record: Record::Message(serde_json::json!({})),
         }
     }
 }
@@ -334,10 +356,10 @@ impl<P> ConsumerMessage<P> {
         &self.value.timestamp
     }
 
-    /// Returns the payload, or `None` for an excise record.
+    /// Returns the record value.
     #[must_use]
-    pub fn payload(&self) -> Option<&P> {
-        self.value.payload.as_ref()
+    pub fn record(&self) -> &Record<P> {
+        &self.value.record
     }
 
     /// Returns the tracing span associated with this message.
@@ -394,7 +416,7 @@ impl<P> ConsumerMessage<P> {
                 offset,
                 key,
                 timestamp: Utc::now(),
-                payload: Some(payload),
+                record: Record::Message(payload),
             },
             Span::current(),
             permit,

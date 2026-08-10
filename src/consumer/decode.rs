@@ -25,7 +25,7 @@ use tracing::error;
 
 use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
-use crate::consumer::message::ConsumerMessageValue;
+use crate::consumer::message::{ConsumerMessageValue, Record};
 use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
 /// A decoded Kafka message without live span references.
@@ -123,15 +123,15 @@ pub fn decode_message<C: Codec>(
     // `Cargo.toml` (which uses caret semver and accepts any 0.39.x via
     // `cargo update`). Re-audit on any rdkafka bump, including patch updates.
     #[allow(unsafe_code)]
-    let payload = match unsafe { message.payload_mut() } {
+    let record = match unsafe { message.payload_mut() } {
         Some(payload_bytes) => match codec.deserialize(payload_bytes) {
-            Ok(payload) => Some(payload),
+            Ok(payload) => Record::Message(payload),
             Err(error) => {
                 error!("invalid payload: {error:#}; discarding message");
                 return None;
             }
         },
-        None => None,
+        None => Record::Excise,
     };
 
     let value = Arc::new(ConsumerMessageValue {
@@ -141,7 +141,7 @@ pub fn decode_message<C: Codec>(
         offset,
         key,
         timestamp,
-        payload,
+        record,
     });
 
     Some(DecodedMessage {

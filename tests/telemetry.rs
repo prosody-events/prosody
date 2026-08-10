@@ -291,7 +291,8 @@ impl FallibleHandler for ClearAndScheduleHandler {
     {
         let key = msg.key().to_string();
         let step = msg
-            .payload()
+            .record()
+            .message()
             .and_then(|payload| payload.get("step"))
             .and_then(Value::as_i64)
             .ok_or(TestError)?;

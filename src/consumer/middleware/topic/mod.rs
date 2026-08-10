@@ -81,7 +81,7 @@ use crate::Codec;
 use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::{ConsumerMessage, Record};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
     Settlement, SettlementHandler,
@@ -314,9 +314,13 @@ where
         // Send the failed message to the failure topic. On failure, surface
         // BOTH the inner handler error and the producer error so the inner's
         // apply hook can fire on outer-retry re-dispatch.
-        let sent = match message.payload().cloned() {
-            Some(payload) => self.producer.send(headers, self.topic, key, payload).await,
-            None => self.producer.excise(headers, self.topic, key).await,
+        let sent = match message.record() {
+            Record::Message(payload) => {
+                self.producer
+                    .send(headers, self.topic, key, payload.clone())
+                    .await
+            }
+            Record::Excise => self.producer.excise(headers, self.topic, key).await,
         };
         match sent {
             // The inner attempt failed but the dispatch resolves `Ok`: the

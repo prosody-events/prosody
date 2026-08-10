@@ -63,7 +63,7 @@ impl EventHandler for ChannelHandler {
             sleep(self.delay).await;
         }
 
-        if let Some(payload) = msg.payload()
+        if let Some(payload) = msg.record().message()
             && let Err(error) = self
                 .messages_tx
                 .send((msg.key().to_string(), payload.clone()))
@@ -136,7 +136,7 @@ impl FallibleHandler for FallibleTestHandler {
         C: EventContext<Payload = Self::Payload>,
     {
         // Send errors are irrelevant here: the receiver may already be gone.
-        if let Some(payload) = message.payload() {
+        if let Some(payload) = message.record().message() {
             let _ = self
                 .messages_tx
                 .send((message.key().to_string(), payload.clone()))

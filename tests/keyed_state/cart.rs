@@ -101,7 +101,8 @@ impl CartHandler {
         };
         items.push(
             message
-                .payload()
+                .record()
+                .message()
                 .and_then(|payload| payload.get("item"))
                 .cloned()
                 .unwrap_or(Value::Null),
@@ -157,7 +158,8 @@ impl CartHandler {
             .await?
             .and_then(|message| {
                 message
-                    .payload()
+                    .record()
+                    .message()
                     .cloned()
                     .map(|payload| (message.offset(), payload))
             });

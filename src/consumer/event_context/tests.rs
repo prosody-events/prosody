@@ -792,7 +792,7 @@ async fn erased_kafka_record_then_get_matches_typed() -> Result<()> {
     assert_eq!(erased.topic(), topic);
     assert_eq!(erased.partition(), partition);
     assert_eq!(erased.offset(), offset);
-    assert_eq!(erased.payload(), Some(&payload));
+    assert_eq!(erased.record().message(), Some(&payload));
 
     let typed = ctx
         .state(Registered::new(message_state("last_seen")))
@@ -802,7 +802,7 @@ async fn erased_kafka_record_then_get_matches_typed() -> Result<()> {
         .map_err(|e| eyre!("typed kafka get: {e}"))?
         .ok_or_else(|| eyre!("typed get resolved nothing"))?;
     assert_eq!(typed.offset(), erased.offset());
-    assert_eq!(typed.payload(), erased.payload());
+    assert_eq!(typed.record().message(), erased.record().message());
     Ok(())
 }
 
@@ -844,7 +844,7 @@ async fn erased_kafka_map_set_then_get_matches_typed() -> Result<()> {
         .map_err(|e| eyre!("erased map get: {e}"))?
         .ok_or_else(|| eyre!("erased map get resolved nothing"))?;
     assert_eq!(erased.offset(), offset);
-    assert_eq!(erased.payload(), Some(&payload));
+    assert_eq!(erased.record().message(), Some(&payload));
 
     let typed = ctx
         .state(Registered::new(message_map_state::<
@@ -857,7 +857,7 @@ async fn erased_kafka_map_set_then_get_matches_typed() -> Result<()> {
         .map_err(|e| eyre!("typed map get: {e}"))?
         .ok_or_else(|| eyre!("typed map get resolved nothing"))?;
     assert_eq!(typed.offset(), erased.offset());
-    assert_eq!(typed.payload(), erased.payload());
+    assert_eq!(typed.record().message(), erased.record().message());
     Ok(())
 }
 
@@ -898,7 +898,7 @@ async fn erased_kafka_deque_push_then_get_matches_typed() -> Result<()> {
         .map_err(|e| eyre!("erased deque get: {e}"))?
         .ok_or_else(|| eyre!("erased deque get resolved nothing"))?;
     assert_eq!(erased.offset(), offset);
-    assert_eq!(erased.payload(), Some(&payload));
+    assert_eq!(erased.record().message(), Some(&payload));
 
     let typed = ctx
         .state(Registered::new(message_deque_state::<MemoryLoader<Value>>(
@@ -910,7 +910,7 @@ async fn erased_kafka_deque_push_then_get_matches_typed() -> Result<()> {
         .map_err(|e| eyre!("typed deque get: {e}"))?
         .ok_or_else(|| eyre!("typed deque get resolved nothing"))?;
     assert_eq!(typed.offset(), erased.offset());
-    assert_eq!(typed.payload(), erased.payload());
+    assert_eq!(typed.record().message(), erased.record().message());
     Ok(())
 }
 

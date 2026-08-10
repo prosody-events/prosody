@@ -123,9 +123,9 @@ pub(crate) async fn read_cart_via_standalone_reader(
         receipt.offset()
     );
     ensure!(
-        receipt.payload() == Some(&json!({ "id": "evt-2", "item": "banana" })),
+        receipt.record().message() == Some(&json!({ "id": "evt-2", "item": "banana" })),
         "receipt must re-fetch the second message's body, got {:?}",
-        receipt.payload()
+        receipt.record().message()
     );
     Ok(())
 }

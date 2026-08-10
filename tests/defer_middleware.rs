@@ -130,7 +130,7 @@ impl FallibleHandler for DeferTestHandler {
         C: EventContext<Payload = Self::Payload>,
     {
         let key = message.key().to_string();
-        let payload = message.payload();
+        let payload = message.record().message();
 
         if let Some(value) = payload
             .and_then(|payload| payload.get("value"))
@@ -226,7 +226,7 @@ impl FallibleHandler for PermanentErrorHandler {
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        let payload = message.payload();
+        let payload = message.record().message();
         if self.permanent_value.is_some()
             && payload
                 .and_then(|payload| payload.get("value"))

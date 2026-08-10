@@ -6,7 +6,7 @@ use crate::consumer::DemandType;
 use crate::consumer::EventHandler;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, Record};
 use crate::consumer::middleware::deduplication::{
     DedupIdentity, DeduplicationConfiguration, DeduplicationError, DeduplicationHandler,
     DeduplicationMiddleware, DeduplicationStore, MemoryDeduplicationStore,
@@ -158,7 +158,7 @@ fn create_test_message(
     };
     create_test_message_from(ConsumerMessageValue {
         key: key.into(),
-        payload: Some(payload),
+        record: Record::Message(payload),
         ..Default::default()
     })
 }
@@ -698,7 +698,8 @@ fn dedup_id_writer_matches_canonical_reader_derivation() -> color_eyre::Result<(
             TOPIC,
             PARTITION,
             msg.key().as_bytes(),
-            msg.payload()
+            msg.record()
+                .message()
                 .and_then(|payload| payload.get("id"))
                 .and_then(|v| v.as_str())
                 .map(str::as_bytes),
