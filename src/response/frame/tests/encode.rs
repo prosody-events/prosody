@@ -76,19 +76,18 @@ fn the_widest_legal_header_encodes() -> Result<()> {
 /// A round-trip cannot catch a wire break, because the encoder and the decoder
 /// move together. Field *order* is this encoder's choice rather than a protobuf
 /// requirement, but the bytes a peer of another release reads are not.
-const FROZEN: [u8; 65] = [
-    0x08, 0x01, // protocol_version = 1
-    0x12, 0x10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, // target_node
-    0x1a, 0x10, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, // request_id
-    0x22, 0x07, b'b', b'i', b'l', b'l', b'i', b'n', b'g', // subsystem
-    0x2a, 0x0a, b't', b'e', b's', b't', b'-', b'b', b'y', b't', b'e', b's', // format
-    0x30, 0x02, // status = Permanent
-    0x3a, 0x02, b'h', b'i', // payload
+const FROZEN: [u8; 63] = [
+    0x0a, 0x10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, // target_node
+    0x12, 0x10, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, // request_id
+    0x1a, 0x07, b'b', b'i', b'l', b'l', b'i', b'n', b'g', // subsystem
+    0x22, 0x0a, b't', b'e', b's', b't', b'-', b'b', b'y', b't', b'e', b's', // format
+    0x28, 0x02, // status = Permanent
+    0x32, 0x02, b'h', b'i', // payload
 ];
 
 /// Where the status value sits in [`FROZEN`]. The assertion in the frozen-bytes
 /// test holds this to the key that precedes it.
-const FROZEN_STATUS: usize = 60;
+const FROZEN_STATUS: usize = 58;
 
 /// Response encoding uses the codec cache and the shared serialize buffer.
 #[test]
@@ -127,7 +126,7 @@ fn a_large_response_is_framed() -> Result<()> {
 fn known_responses_frame_to_known_bytes() -> Result<()> {
     assert_eq!(
         FROZEN[FROZEN_STATUS - 1],
-        0x30,
+        0x28,
         "the status byte must follow its own field key",
     );
     // The error row is the frame a peer of another release already reads. The

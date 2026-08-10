@@ -4,7 +4,7 @@
 //! depend on consumer readiness or liveness. Producer-only clients therefore
 //! remain reachable for responses.
 
-use super::generated::peer_server::SERVICE_NAME;
+use super::generated::peer_service_server::SERVICE_NAME;
 use crate::heartbeat::HeartbeatRegistry;
 use async_trait::async_trait;
 use futures::stream::Empty;

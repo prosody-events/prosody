@@ -2,7 +2,7 @@
 //! process sent it.
 
 use super::deadline::inbound_deadline;
-use super::generated::peer_server::Peer;
+use super::generated::peer_service_server::PeerService as PeerServiceApi;
 use super::inject::MetadataExtractor;
 use crate::otel::carry_parent;
 use crate::propagator::new_propagator;
@@ -18,7 +18,7 @@ use tonic::{Request, Response, Status};
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span, debug_span, error};
 
-/// Serves [`DeliverResponse`](Peer::deliver_response) for one node.
+/// Serves [`DeliverResponse`](PeerServiceApi::deliver_response) for one node.
 ///
 /// A frame is accepted only by the process it names, sent on once when it names
 /// another, and refused when it already passed through a relay. The id every
@@ -42,7 +42,7 @@ impl<R> PeerService<R> {
 }
 
 #[async_trait]
-impl<R: RelayHop> Peer for PeerService<R> {
+impl<R: RelayHop> PeerServiceApi for PeerService<R> {
     /// Hands one frame to the waiter it names, sends it on to the process it
     /// names, or refuses it — and answers with the status the whole path came
     /// to.

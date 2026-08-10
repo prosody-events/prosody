@@ -1,9 +1,8 @@
 //! The response frame: the wire form of one response, and the conversions each
 //! end of a peer link performs on it.
 //!
-//! The field numbers here are the contract with `proto/peer.proto`, which is
-//! the version of the message peers of different releases must agree on. A test
-//! decodes the generated descriptor set so the two cannot drift apart.
+//! The field numbers here must match the peer Protobuf schema. A test decodes
+//! the generated descriptor set so the two cannot drift apart.
 
 use super::{FormatToken, RequestId, ResponseStatus};
 use crate::router::NodeId;
@@ -15,14 +14,13 @@ use prost::encoding::{encoded_len_varint, key_len};
 pub(crate) mod decode;
 pub(crate) mod encode;
 
-const FIELD_PROTOCOL_VERSION: u32 = 1;
-const FIELD_TARGET_NODE: u32 = 2;
-const FIELD_REQUEST_ID: u32 = 3;
-const FIELD_SUBSYSTEM: u32 = 4;
-const FIELD_FORMAT: u32 = 5;
-const FIELD_STATUS: u32 = 6;
-const FIELD_PAYLOAD: u32 = 7;
-const FIELD_RELAY_NODE: u32 = 8;
+const FIELD_TARGET_NODE: u32 = 1;
+const FIELD_REQUEST_ID: u32 = 2;
+const FIELD_SUBSYSTEM: u32 = 3;
+const FIELD_FORMAT: u32 = 4;
+const FIELD_STATUS: u32 = 5;
+const FIELD_PAYLOAD: u32 = 6;
+const FIELD_RELAY_NODE: u32 = 7;
 
 /// Width of every identifier on the wire.
 const ID_BYTES: usize = 16;

@@ -2,7 +2,7 @@
 
 use crate::router::SendFailure;
 use crate::router::grpc::client::{DELIVER_RESPONSE, GRPC_TIMEOUT_LIMIT, outbound_timeout};
-use crate::router::grpc::generated::peer_server::SERVICE_NAME;
+use crate::router::grpc::generated::peer_service_server::SERVICE_NAME;
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
 use std::time::Duration;

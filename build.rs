@@ -1,4 +1,4 @@
-//! Compiles the peer wire contract in `proto/peer.proto`.
+//! Compiles the peer wire contract in `proto/prosody/peer/v1/peer.proto`.
 //!
 //! `protoc` must be on `PATH` — see the build prerequisites in `README.md`.
 //! The generated descriptor set is written beside the generated code. gRPC
@@ -33,9 +33,10 @@ fn main() -> Result<()> {
         .build_client(false)
         .codec_path("crate::router::grpc::codec::ServerFrameCodec")
         .extern_path(
-            ".prosody.peer.v1.ResponseFrame",
+            ".prosody.peer.v1.DeliverResponseRequest",
             "crate::response::frame::ResponseFrame",
         )
+        .extern_path(".prosody.peer.v1.DeliverResponseResponse", "()")
         .server_mod_attribute(".", GENERATED_LINTS)
-        .compile_protos(&["proto/peer.proto"], &["proto"])
+        .compile_protos(&["proto/prosody/peer/v1/peer.proto"], &["proto"])
 }

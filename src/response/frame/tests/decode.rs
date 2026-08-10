@@ -1,11 +1,11 @@
-use super::{CountingCodec, RAW_ID, RawFrame, UNKNOWN_TAG, raw_bytes_field, raw_varint_field};
+use super::{CountingCodec, RAW_ID, RawFrame, raw_bytes_field, raw_varint_field};
 use crate::codec::Codec;
 use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::frame::decode::{FrameDecodeError, decode_frame};
 use crate::response::frame::encode::stage;
 use crate::response::frame::{
-    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
-    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameHeader,
+    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_RELAY_NODE, FIELD_REQUEST_ID, FIELD_STATUS, FIELD_SUBSYSTEM,
+    FIELD_TARGET_NODE, FrameHeader,
 };
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::{Framed, NodeId};
@@ -152,29 +152,9 @@ fn omitted_payload_and_relay_decode_as_absent() -> Result<()> {
     Ok(())
 }
 
-/// A field this release does not know is skipped, so a later protocol version
-/// can add one.
-#[test]
-fn an_unknown_field_is_skipped() -> Result<()> {
-    let raw = RawFrame {
-        unknown: Some(7),
-        ..RawFrame::default()
-    };
-    let decoded = decode_frame(&mut raw.encode())?;
-    assert_eq!(&decoded.payload[..], b"hi", "the known fields still decode");
-    Ok(())
-}
-
 #[test]
 fn a_malformed_frame_is_refused_by_the_field_that_broke_it() -> Result<()> {
     let cases = [
-        (
-            RawFrame {
-                version: Some(2),
-                ..RawFrame::default()
-            },
-            FrameDecodeError::UnsupportedVersion(2),
-        ),
         (
             RawFrame {
                 target: Some(&SHORT_ID),
@@ -263,7 +243,6 @@ fn a_malformed_frame_is_refused_by_the_field_that_broke_it() -> Result<()> {
 #[test]
 fn a_repeated_field_is_refused() -> Result<()> {
     let cases = [
-        (FIELD_PROTOCOL_VERSION, "protocol_version"),
         (FIELD_TARGET_NODE, "target_node"),
         (FIELD_REQUEST_ID, "request_id"),
         (FIELD_SUBSYSTEM, "subsystem"),
@@ -280,7 +259,7 @@ fn a_repeated_field_is_refused() -> Result<()> {
         .encode();
         // Empty for every field, so the repeat is refused for being a second
         // occurrence rather than for anything the occurrence carries.
-        if tag == FIELD_PROTOCOL_VERSION || tag == FIELD_STATUS {
+        if tag == FIELD_STATUS {
             raw_varint_field(tag, 1, &mut wire);
         } else {
             raw_bytes_field(tag, b"", &mut wire);
@@ -344,45 +323,44 @@ fn a_large_payload_decodes() -> Result<()> {
     Ok(())
 }
 
-/// The hand-written codec and `proto/peer.proto` are one contract. The
+/// The hand-written codec and the peer Protobuf schema are one contract. The
 /// descriptor set is regenerated from the `.proto`, so a field number changed
 /// on only one side shows up here.
 #[test]
 fn the_frame_fields_match_the_proto() -> Result<()> {
     let set = FileDescriptorSet::decode(DESCRIPTOR)?;
-    let Some(file) = set.file.iter().find(|file| file.name() == "peer.proto") else {
-        bail!("the descriptor set must contain peer.proto");
+    let Some(file) = set
+        .file
+        .iter()
+        .find(|file| file.name() == "prosody/peer/v1/peer.proto")
+    else {
+        bail!("the descriptor set must contain the peer schema");
     };
     let Some(message) = file
         .message_type
         .iter()
-        .find(|message| message.name() == "ResponseFrame")
+        .find(|message| message.name() == "DeliverResponseRequest")
     else {
-        bail!("peer.proto must define ResponseFrame");
+        bail!("the peer schema must define DeliverResponseRequest");
     };
 
     let expected = [
-        ("protocol_version", FIELD_PROTOCOL_VERSION, Type::Uint32),
         ("target_node", FIELD_TARGET_NODE, Type::Bytes),
         ("request_id", FIELD_REQUEST_ID, Type::Bytes),
         ("subsystem", FIELD_SUBSYSTEM, Type::String),
         ("format", FIELD_FORMAT, Type::String),
-        ("status", FIELD_STATUS, Type::Int32),
+        ("status", FIELD_STATUS, Type::Enum),
         ("payload", FIELD_PAYLOAD, Type::Bytes),
         ("relay_node", FIELD_RELAY_NODE, Type::Bytes),
     ];
     assert_eq!(
         message.field.len(),
         expected.len(),
-        "every field of ResponseFrame must be accounted for here"
-    );
-    assert!(
-        !expected.iter().any(|(_, tag, _)| *tag == UNKNOWN_TAG),
-        "the skipped-field test's tag must stay unused by the protocol"
+        "every request field must be accounted for here"
     );
     for (name, tag, kind) in expected {
         let Some(field) = message.field.iter().find(|field| field.name() == name) else {
-            bail!("ResponseFrame must define {name}");
+            bail!("DeliverResponseRequest must define {name}");
         };
         assert_eq!(
             field.number(),
@@ -392,12 +370,32 @@ fn the_frame_fields_match_the_proto() -> Result<()> {
         assert_eq!(field.r#type(), kind, "{name} must keep its wire type");
     }
 
-    let Some(service) = file.service.first() else {
-        bail!("peer.proto must define a service");
+    let Some(status) = file
+        .enum_type
+        .iter()
+        .find(|item| item.name() == "ResponseStatus")
+    else {
+        bail!("the peer schema must define ResponseStatus");
     };
-    assert_eq!(service.name(), "Peer", "the service is named for the peers");
+    let expected = [
+        ("RESPONSE_STATUS_UNSPECIFIED", 0_i32),
+        ("RESPONSE_STATUS_TRANSIENT_ERROR", 1_i32),
+        ("RESPONSE_STATUS_PERMANENT_ERROR", 2_i32),
+        ("RESPONSE_STATUS_TERMINAL_ERROR", 3_i32),
+        ("RESPONSE_STATUS_SUCCESS", 4_i32),
+    ];
+    assert_eq!(status.value.len(), expected.len());
+    for (value, (name, number)) in status.value.iter().zip(expected) {
+        assert_eq!(value.name(), name);
+        assert_eq!(value.number(), number);
+    }
+
+    let Some(service) = file.service.first() else {
+        bail!("the peer schema must define a service");
+    };
+    assert_eq!(service.name(), "PeerService");
     let Some(method) = service.method.first() else {
-        bail!("Peer must define a method");
+        bail!("PeerService must define a method");
     };
     assert_eq!(
         method.name(),
@@ -406,12 +404,12 @@ fn the_frame_fields_match_the_proto() -> Result<()> {
     );
     assert_eq!(
         method.input_type(),
-        ".prosody.peer.v1.ResponseFrame",
-        "the method takes a response frame"
+        ".prosody.peer.v1.DeliverResponseRequest",
+        "the method takes a delivery request"
     );
     assert_eq!(
         method.output_type(),
-        ".google.protobuf.Empty",
+        ".prosody.peer.v1.DeliverResponseResponse",
         "the method has no response body"
     );
     Ok(())

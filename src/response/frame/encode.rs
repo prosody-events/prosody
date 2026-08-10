@@ -1,13 +1,13 @@
 //! Turning one borrowed response into owned, bounded frame data.
 
 use super::{
-    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
-    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameHeader, ID_BYTES, ResponseFrame,
+    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_RELAY_NODE, FIELD_REQUEST_ID, FIELD_STATUS, FIELD_SUBSYSTEM,
+    FIELD_TARGET_NODE, FrameHeader, ID_BYTES, ResponseFrame,
 };
 use crate::codec::{Codec, SerializeBufGuard};
+use crate::response::FORMAT_MAX_BYTES;
 use crate::response::FormatToken;
 use crate::response::ResponseStatus;
-use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION};
 use crate::router::{Framed, NodeId};
 use bytes::{BufMut, Bytes};
 use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len};
@@ -124,11 +124,6 @@ impl Framed for Forwarded {
 
 /// Writes one complete frame in the stable field order.
 fn write_frame<B: BufMut>(header: &FrameHeader, format: &str, payload: &[u8], dst: &mut B) {
-    write_varint_field(
-        FIELD_PROTOCOL_VERSION,
-        u64::from(RESPONSE_PROTOCOL_VERSION),
-        dst,
-    );
     write_bytes_field(FIELD_TARGET_NODE, &header.target.into_bytes(), dst);
     write_bytes_field(FIELD_REQUEST_ID, &header.request.into_bytes(), dst);
     write_bytes_field(FIELD_SUBSYSTEM, header.subsystem.as_str().as_bytes(), dst);
@@ -143,8 +138,7 @@ fn write_frame<B: BufMut>(header: &FrameHeader, format: &str, payload: &[u8], ds
 /// The exact length [`Framed::write`] produces, summed in `u64` so no addition
 /// can overflow whatever a codec emitted.
 fn frame_len(header: &FrameHeader, format: &str, payload: usize) -> u64 {
-    varint_field_len(FIELD_PROTOCOL_VERSION, u64::from(RESPONSE_PROTOCOL_VERSION))
-        + bytes_field_len(FIELD_TARGET_NODE, ID_BYTES)
+    bytes_field_len(FIELD_TARGET_NODE, ID_BYTES)
         + bytes_field_len(FIELD_REQUEST_ID, ID_BYTES)
         + bytes_field_len(FIELD_SUBSYSTEM, header.subsystem.as_str().len())
         + bytes_field_len(FIELD_FORMAT, format.len())

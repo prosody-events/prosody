@@ -30,7 +30,7 @@ pub(super) const GRPC_TIMEOUT_LIMIT: Duration = Duration::from_hours(100_000_000
 /// against the generated service name, so a renamed proto cannot leave it
 /// misrouting quietly.
 pub(super) static DELIVER_RESPONSE: LazyLock<PathAndQuery> =
-    LazyLock::new(|| PathAndQuery::from_static("/prosody.peer.v1.Peer/DeliverResponse"));
+    LazyLock::new(|| PathAndQuery::from_static("/prosody.peer.v1.PeerService/DeliverResponse"));
 
 /// One channel per live destination, keyed by the address a node published.
 type Channels = Cache<Uri, Channel, UnitWeighter, RandomState>;

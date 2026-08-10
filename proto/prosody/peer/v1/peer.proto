@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package prosody.peer.v1;
+
+// Operations prosody nodes perform on each other. Later peer features add
+// methods here rather than services of their own.
+service PeerService {
+  // Delivers one response frame to the node it is addressed to. The outcome is
+  // the gRPC status; there is no response body, so an empty message from a
+  // buggy or hostile peer can never read as a report of delivery.
+  rpc DeliverResponse(DeliverResponseRequest) returns (DeliverResponseResponse);
+}
+
+// The handler result carried in a response frame. Zero is not a result, so an
+// omitted status cannot read as success or as an error category.
+enum ResponseStatus {
+  RESPONSE_STATUS_UNSPECIFIED = 0;
+  RESPONSE_STATUS_TRANSIENT_ERROR = 1;
+  RESPONSE_STATUS_PERMANENT_ERROR = 2;
+  RESPONSE_STATUS_TERMINAL_ERROR = 3;
+  RESPONSE_STATUS_SUCCESS = 4;
+}
+
+// One response, addressed to the node that is waiting for it.
+message DeliverResponseRequest {
+  // Which node this frame is for. A node that is not the target forwards the
+  // frame or rejects it, and never accepts it.
+  bytes target_node = 1; // 16 bytes
+  bytes request_id = 2; // 16 bytes
+  string subsystem = 3;
+  string format = 4; // the responder's Codec::FORMAT_ID
+  ResponseStatus status = 5;
+  bytes payload = 6;
+  // Empty until a relay forwards the frame, then the relay's own node id. A
+  // frame that already names a relay is never forwarded again. A relay always
+  // sets this itself and never preserves a value it received.
+  bytes relay_node = 7; // 16 bytes, or empty
+}
+
+// The gRPC status reports the delivery result. A response has no fields.
+message DeliverResponseResponse {}

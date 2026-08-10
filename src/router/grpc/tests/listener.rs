@@ -1,6 +1,6 @@
 //! Peer listener registration and reflection.
 
-use super::{Harness, RawFramed};
+use super::{EmptyFrame, Harness};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::router::directory::tests::support::cassandra_directory;
 use crate::router::directory::{NodeDirectory, RegistrationTtl};
@@ -68,7 +68,7 @@ fn reflection_is_always_served() -> Result<()> {
 async fn reflect(endpoint: Dialled) -> Result<Code> {
     let channel = endpoint.connect_lazy();
     let mut client = Grpc::new(channel);
-    let request = Request::new(tokio_stream::iter(Vec::<RawFramed>::new()));
+    let request = Request::new(tokio_stream::iter(Vec::<EmptyFrame>::new()));
     if let Err(error) = client.ready().await {
         bail!("the reflection channel never became ready: {error:#}");
     }

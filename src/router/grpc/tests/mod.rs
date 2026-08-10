@@ -15,7 +15,6 @@ mod inject;
 mod listener;
 mod metrics;
 mod trace;
-mod transport;
 
 use super::BoundListener;
 use super::client::GrpcSender;
@@ -33,7 +32,7 @@ use crate::router::loopback::{TestRouter, config as fleet_config, registration};
 use crate::router::relay::Relay;
 use crate::router::{Framed, LocalTarget, NodeId, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use std::net::SocketAddr;
@@ -72,10 +71,9 @@ pub(super) struct Harness {
     served: Served,
 }
 
-/// Bytes already framed, so a suite can put a frame on the wire that no encoder
-/// would produce.
+/// Gives an empty stream the frame type its codec requires.
 #[derive(Clone)]
-struct RawFramed(BytesMut);
+struct EmptyFrame;
 
 impl Harness {
     /// The listener every suite shares.
@@ -128,20 +126,6 @@ impl Harness {
         )
     }
 
-    /// Delivers bytes exactly as given.
-    pub(super) async fn deliver_raw(&self, sender: &GrpcSender, bytes: BytesMut) -> Result<Code> {
-        status(
-            sender
-                .deliver(
-                    &self.address,
-                    &RawFramed(bytes),
-                    Instant::now() + BUDGET,
-                    &opentelemetry::Context::new(),
-                )
-                .await,
-        )
-    }
-
     /// Stops the listener and waits for it to finish.
     pub(super) async fn stop(self) -> Result<()> {
         Ok(self.served.stop().await?)
@@ -153,14 +137,12 @@ pub(super) fn reaching(address: &Endpoint) -> Result<FixedRouter> {
     FixedRouter::new(fleet_config(), Some(registration(address.clone())), None)
 }
 
-impl Framed for RawFramed {
+impl Framed for EmptyFrame {
     fn bytes(&self) -> usize {
-        self.0.len()
+        0
     }
 
-    fn write<B: BufMut>(&self, dst: &mut B) {
-        dst.put_slice(&self.0);
-    }
+    fn write<B: BufMut>(&self, _dst: &mut B) {}
 }
 
 /// Builds a destination fleet.

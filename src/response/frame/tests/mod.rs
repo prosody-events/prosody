@@ -1,6 +1,6 @@
 use super::{
-    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
-    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameHeader, RELAY_FIELD_BYTES,
+    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_RELAY_NODE, FIELD_REQUEST_ID, FIELD_STATUS, FIELD_SUBSYSTEM,
+    FIELD_TARGET_NODE, FrameHeader, RELAY_FIELD_BYTES,
 };
 use crate::codec::Codec;
 use crate::response::{RequestId, ResponseStatus};
@@ -14,9 +14,6 @@ use std::convert::Infallible;
 
 mod decode;
 mod encode;
-
-/// A tag no field of this protocol uses, so a decoder must skip it.
-const UNKNOWN_TAG: u32 = 99;
 
 /// A well-formed 16-byte identifier.
 const RAW_ID: [u8; 16] = [0x11; 16];
@@ -36,7 +33,6 @@ pub(crate) struct CountingCodec;
 /// malformed. Every field defaults to a well-formed value, and `None` leaves
 /// the field out of the encoding entirely.
 pub(crate) struct RawFrame<'a> {
-    pub(crate) version: Option<u64>,
     pub(crate) target: Option<&'a [u8]>,
     pub(crate) request: Option<&'a [u8]>,
     pub(crate) subsystem: Option<&'a [u8]>,
@@ -44,8 +40,6 @@ pub(crate) struct RawFrame<'a> {
     pub(crate) status: Option<u64>,
     pub(crate) payload: Option<&'a [u8]>,
     pub(crate) relay: Option<&'a [u8]>,
-    /// Stands in for a field a later protocol version might add.
-    pub(crate) unknown: Option<u64>,
 }
 
 impl Codec for CountingCodec {
@@ -86,7 +80,6 @@ impl Codec for CountingCodec {
 impl Default for RawFrame<'_> {
     fn default() -> Self {
         Self {
-            version: Some(1),
             target: Some(&RAW_ID),
             request: Some(&RAW_ID),
             subsystem: Some(b"billing"),
@@ -94,7 +87,6 @@ impl Default for RawFrame<'_> {
             status: Some(2),
             payload: Some(b"hi"),
             relay: None,
-            unknown: None,
         }
     }
 }
@@ -124,9 +116,6 @@ fn raw_bytes_field(tag: u32, value: &[u8], dst: &mut BytesMut) {
 impl RawFrame<'_> {
     pub(crate) fn encode(&self) -> BytesMut {
         let mut dst = BytesMut::new();
-        if let Some(version) = self.version {
-            raw_varint_field(FIELD_PROTOCOL_VERSION, version, &mut dst);
-        }
         if let Some(target) = self.target {
             raw_bytes_field(FIELD_TARGET_NODE, target, &mut dst);
         }
@@ -147,9 +136,6 @@ impl RawFrame<'_> {
         }
         if let Some(relay) = self.relay {
             raw_bytes_field(FIELD_RELAY_NODE, relay, &mut dst);
-        }
-        if let Some(unknown) = self.unknown {
-            raw_varint_field(UNKNOWN_TAG, unknown, &mut dst);
         }
         dst
     }

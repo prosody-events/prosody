@@ -1,7 +1,7 @@
 //! What the gRPC health service answers, and whose verdict it is.
 
 use super::Harness;
-use crate::router::grpc::generated::peer_server::SERVICE_NAME;
+use crate::router::grpc::generated::peer_service_server::SERVICE_NAME;
 use crate::router::grpc::health::PeerHealth;
 use crate::router::loopback::TestHealth;
 use crate::test_util::TEST_RUNTIME;

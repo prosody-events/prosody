@@ -3,8 +3,8 @@
 //! The frame is encoded and decoded by the response layer's own writer and
 //! reader, not by a generated protobuf message. That is the point of a codec
 //! here: the reader enforces rules a `.proto` cannot state — one occurrence per
-//! field, no field whose proto3 default is illegal, a version this build
-//! speaks, bounded strings, and a payload slice from Tonic's receive storage.
+//! field, no field whose proto3 default is illegal, bounded strings, and a
+//! payload slice from Tonic's receive storage.
 //!
 //! The two directions are deliberately asymmetric. The client writes an owned
 //! frame into Tonic's final buffer. The server decodes that frame and returns
@@ -178,13 +178,12 @@ impl<F> Decoder for ClientFrameCodec<F> {
 /// The wording is [`FrameDecodeError::message`] rather than the `Display` form,
 /// because this port is unauthenticated: a formatted status would allocate per
 /// refused frame at a rate the sender chooses, and would echo back the lengths
-/// and versions that sender claimed.
+/// that sender claimed.
 fn refusal(error: &FrameDecodeError) -> Status {
     match error {
         FrameDecodeError::Truncated { .. }
         | FrameDecodeError::MissingField(_)
         | FrameDecodeError::RepeatedField(_)
-        | FrameDecodeError::UnsupportedVersion(_)
         | FrameDecodeError::MalformedId { .. }
         | FrameDecodeError::StringTooLong { .. }
         | FrameDecodeError::InvalidUtf8(_)

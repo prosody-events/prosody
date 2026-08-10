@@ -23,7 +23,13 @@ pub(crate) mod health;
 mod inject;
 pub(crate) mod service;
 
-/// The peer service, written from `proto/peer.proto` at build time.
+/// The peer service, written from the peer Protobuf schema at build time.
+#[expect(
+    clippy::absolute_paths,
+    clippy::doc_markdown,
+    clippy::trivially_copy_pass_by_ref,
+    reason = "written by prost-build, not by hand"
+)]
 pub(crate) mod generated {
     include!(concat!(env!("OUT_DIR"), "/prosody.peer.v1.rs"));
 }
@@ -32,7 +38,7 @@ pub(crate) mod generated {
 mod tests;
 
 use self::conn::incoming;
-use self::generated::peer_server::PeerServer;
+use self::generated::peer_service_server::PeerServiceServer;
 use self::health::{PeerHealth, ProcessHealth};
 use self::service::PeerService;
 use crate::router::RelayHop;
@@ -115,7 +121,7 @@ where
     let router = Server::builder()
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
-        .add_service(PeerServer::new(service))
+        .add_service(PeerServiceServer::new(service))
         .add_service(HealthServer::new(PeerHealth::new(health)))
         .add_service(reflection);
     Ok(tokio::spawn(async move {

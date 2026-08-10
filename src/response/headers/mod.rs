@@ -63,13 +63,11 @@ pub(crate) const RESERVED_REQUEST_HEADERS: [&str; 5] = [
 /// The one request-metadata revision this responder understands, in the exact
 /// text a producer must write.
 ///
-/// Distinct from
-/// [`RESPONSE_PROTOCOL_VERSION`](super::RESPONSE_PROTOCOL_VERSION),
-/// which versions the response frame between two peers. This one freezes what
-/// the headers *mean*, so a later revision that redefines a header cannot be
-/// read under the old rules and answered confidently. One revision has one text
-/// form, as one id has one text form: `01` and `+1` are refused. The requester
-/// writes this value, so the writer and reader cannot differ.
+/// This revision freezes what the Kafka headers mean. Kafka headers have no
+/// schema evolution rules that can protect a responder from incompatible
+/// semantics. One revision has one text form, as one id has one text form:
+/// `01` and `+1` are refused. The requester writes this value, so the writer
+/// and reader cannot differ.
 pub(crate) const REQUEST_REVISION: &str = "2";
 
 /// The only accepted length of an id header value: the hyphenated UUID that

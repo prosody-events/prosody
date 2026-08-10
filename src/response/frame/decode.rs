@@ -1,11 +1,11 @@
 //! Reading one frame a peer sent.
 
 use super::{
-    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_PROTOCOL_VERSION, FIELD_RELAY_NODE, FIELD_REQUEST_ID,
-    FIELD_STATUS, FIELD_SUBSYSTEM, FIELD_TARGET_NODE, FrameHeader, ID_BYTES, ResponseFrame,
+    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_RELAY_NODE, FIELD_REQUEST_ID, FIELD_STATUS, FIELD_SUBSYSTEM,
+    FIELD_TARGET_NODE, FrameHeader, ID_BYTES, ResponseFrame,
 };
 use crate::error::UnknownErrorCategory;
-use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION, RequestId, ResponseStatus};
+use crate::response::{FORMAT_MAX_BYTES, RequestId, ResponseStatus};
 use crate::router::NodeId;
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use bytes::{Buf, Bytes};
@@ -22,14 +22,13 @@ use thiserror::Error;
 /// skipped.
 const fn known_field(tag: u32) -> Option<(&'static str, u8)> {
     Some(match tag {
-        FIELD_PROTOCOL_VERSION => ("protocol_version", 0b0000_0001),
-        FIELD_TARGET_NODE => ("target_node", 0b0000_0010),
-        FIELD_REQUEST_ID => ("request_id", 0b0000_0100),
-        FIELD_SUBSYSTEM => ("subsystem", 0b0000_1000),
-        FIELD_FORMAT => ("format", 0b0001_0000),
-        FIELD_STATUS => ("status", 0b0010_0000),
-        FIELD_PAYLOAD => ("payload", 0b0100_0000),
-        FIELD_RELAY_NODE => ("relay_node", 0b1000_0000),
+        FIELD_TARGET_NODE => ("target_node", 0b0000_0001),
+        FIELD_REQUEST_ID => ("request_id", 0b0000_0010),
+        FIELD_SUBSYSTEM => ("subsystem", 0b0000_0100),
+        FIELD_FORMAT => ("format", 0b0000_1000),
+        FIELD_STATUS => ("status", 0b0001_0000),
+        FIELD_PAYLOAD => ("payload", 0b0010_0000),
+        FIELD_RELAY_NODE => ("relay_node", 0b0100_0000),
         _ => return None,
     })
 }
@@ -46,7 +45,6 @@ const fn known_field(tag: u32) -> Option<(&'static str, u8)> {
 /// Returns a [`FrameDecodeError`] naming the field that made the frame
 /// unreadable.
 pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDecodeError> {
-    let mut version = None;
     let mut target = None;
     let mut request = None;
     let mut subsystem = None;
@@ -54,10 +52,10 @@ pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDe
     let mut status = None;
     // A codec may legally serialize to zero bytes, and a frame no relay has
     // touched carries no relay node, so a peer that omits these proto3 defaults
-    // is sending a well-formed frame. The six fields above exclude their default
-    // by construction — the version is at least 1, the ids are 16 bytes, a
-    // response is never for an unnamed subsystem or in an unnamed format, and
-    // the status reserves 0 — so their absence is malformed. That is stricter
+    // is sending a well-formed frame. The five fields above exclude their default
+    // by construction — the ids are 16 bytes, a response is never for an unnamed
+    // subsystem or in an unnamed format, and the status reserves 0. Their absence
+    // is malformed. That is stricter
     // than the `.proto` can state, which is the point: a schema cannot say "not
     // the default", so the decoder does.
     let mut payload = Bytes::new();
@@ -73,10 +71,6 @@ pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDe
             seen |= bit;
         }
         match tag {
-            FIELD_PROTOCOL_VERSION => {
-                check_wire_type(WireType::Varint, wire_type)?;
-                version = Some(decode_varint(src)?);
-            }
             FIELD_TARGET_NODE => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
                 target = decode_id(src, "target_node")?.map(NodeId::from_bytes);
@@ -114,13 +108,6 @@ pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDe
         }
     }
 
-    // Compared as the raw varint rather than narrowed to the field's `uint32`:
-    // narrowing would fold a value too wide to be any version onto one this
-    // build believes it speaks, and refusing it costs nothing a real peer needs.
-    let version = version.ok_or(FrameDecodeError::MissingField("protocol_version"))?;
-    if version != u64::from(RESPONSE_PROTOCOL_VERSION) {
-        return Err(FrameDecodeError::UnsupportedVersion(version));
-    }
     Ok(ResponseFrame {
         header: FrameHeader {
             target: target.ok_or(FrameDecodeError::MissingField("target_node"))?,
@@ -231,10 +218,6 @@ pub(crate) enum FrameDecodeError {
     #[error("frame repeats {0}")]
     RepeatedField(&'static str),
 
-    /// The frame states a protocol version this build does not speak.
-    #[error("unsupported response protocol version {0}")]
-    UnsupportedVersion(u64),
-
     /// An identifier field is present but is not 16 bytes.
     #[error("{field} is {bytes} bytes, not 16")]
     MalformedId {
@@ -283,7 +266,7 @@ impl FrameDecodeError {
     /// What the sending peer is told about a frame this reader refused.
     ///
     /// Separate from `Display`, which is the local diagnostic and names the
-    /// lengths and versions the peer itself claimed. Every message here is a
+    /// lengths the peer itself claimed. Every message here is a
     /// literal, so a refusal on an unauthenticated port allocates nothing and
     /// echoes nothing back.
     pub(crate) const fn message(&self) -> &'static str {
@@ -291,9 +274,6 @@ impl FrameDecodeError {
             Self::Truncated { .. } => "a frame field claims more bytes than the frame carries",
             Self::MissingField(_) => "the frame omits a field it must carry",
             Self::RepeatedField(_) => "the frame repeats a field it may carry once",
-            Self::UnsupportedVersion(_) => {
-                "the frame states a protocol version this node does not speak"
-            }
             Self::MalformedId { .. } => "a frame identifier is not 16 bytes",
             Self::StringTooLong { .. } => "a frame text field is over its limit",
             Self::InvalidUtf8(_) => "a frame text field is not UTF-8",

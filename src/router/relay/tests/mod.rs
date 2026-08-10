@@ -20,7 +20,7 @@ use crate::response::{FormatToken, RequestId, ResponseStatus};
 use crate::router::directory::Endpoint;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::BoundListener;
-use crate::router::grpc::generated::peer_server::Peer;
+use crate::router::grpc::generated::peer_service_server::PeerService as PeerServiceApi;
 use crate::router::grpc::service::PeerService;
 use crate::router::loopback::listener::{FixedRouter, Served, bind, endpoint};
 use crate::router::loopback::{Delivery, TestRouter, node, registration};
