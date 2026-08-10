@@ -10,13 +10,14 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::registry::PendingRegistry;
 use crate::response::frame::FrameHeader;
 use crate::response::{RequestId, ResponseStatus};
+use crate::router::NodeId;
 use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::directory::tests::support::cassandra_directory;
 use crate::router::directory::{Endpoint, NodeDirectory};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::BoundListener;
-use crate::router::{Host, NodeId};
+use crate::router::loopback::listener::endpoint as listener_endpoint;
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -60,7 +61,6 @@ struct Shared {
 struct PlainProcess {
     runtime: PeerRuntime<CassandraNodeDirectory>,
     directory: CassandraNodeDirectory,
-    bound_port: u16,
 }
 
 impl Process {
@@ -68,10 +68,7 @@ impl Process {
     async fn new() -> Result<Self> {
         let directory = cassandra_directory(LEASE).await?;
         let bound = BoundListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
-        let listener = Endpoint {
-            host: Host::make("127.0.0.1"),
-            port: bound.address().port(),
-        };
+        let listener = listener_endpoint(&bound)?;
         let router = RouterConfiguration::default();
         let runtime = start_runtime(PeerInputs {
             directory: directory.clone(),
@@ -94,10 +91,9 @@ impl Process {
     }
 }
 
-/// A peer listener on a port the operating system chooses.
+/// A peer listener on an address the operating system completes.
 ///
-/// Registration reads the bound listener rather than a port number, so a test
-/// binds a real one and the published port is always a port that exists.
+/// Registration reads the bound listener, so a test binds a real one.
 pub(super) async fn listener() -> Result<BoundListener> {
     Ok(BoundListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?)
 }
@@ -106,7 +102,6 @@ pub(super) async fn listener() -> Result<BoundListener> {
 async fn plain_process() -> Result<PlainProcess> {
     let directory = cassandra_directory(LEASE).await?;
     let bound = listener().await?;
-    let bound_port = bound.address().port();
     let router = RouterConfiguration::default();
     let runtime = start_runtime(PeerInputs {
         directory: directory.clone(),
@@ -116,11 +111,7 @@ async fn plain_process() -> Result<PlainProcess> {
         fleet: FleetConfiguration::default(),
     })
     .await?;
-    Ok(PlainProcess {
-        runtime,
-        directory,
-        bound_port,
-    })
+    Ok(PlainProcess { runtime, directory })
 }
 
 pub(in crate::router) async fn start_runtime<D>(inputs: PeerInputs<'_, D>) -> Result<PeerRuntime<D>>

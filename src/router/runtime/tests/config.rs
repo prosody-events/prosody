@@ -107,19 +107,18 @@ async fn heartbeat_checks_preserve_the_refresh_deadline() -> Result<()> {
     Ok(())
 }
 
-/// The configuration refuses the degenerate values its fields can express: a
-/// blank or oversized label, port zero, and a published port with no host.
+/// The configuration refuses each degenerate network label it can express.
 ///
 /// The label rule counts bytes, not characters, because bytes are what keeps a
 /// label inline. A label of 32 multi-byte characters is therefore refused,
 /// while one of 63 ASCII bytes — the last that stays inline — is accepted.
 #[test]
-fn configuration_refuses_degenerate_values() -> Result<()> {
+fn configuration_refuses_degenerate_values() {
     let default = RouterConfiguration::default();
     assert!(default.validate().is_ok(), "the default must validate");
 
     let longest = RouterConfiguration {
-        advertised_host: Some("n".repeat(63)),
+        network: Some("n".repeat(63)),
         ..RouterConfiguration::default()
     };
     assert!(
@@ -127,16 +126,9 @@ fn configuration_refuses_degenerate_values() -> Result<()> {
         "a label of exactly the inline capacity must validate"
     );
 
-    let built = RouterConfiguration::builder()
-        .advertised_host("gateway.example")
-        .advertised_port(443_u16)
-        .network("east")
-        .build()?;
-    assert!(built.validate().is_ok(), "the entry point must validate");
-
     let cases = [
         RouterConfiguration {
-            advertised_host: Some(String::new()),
+            network: Some(String::new()),
             ..RouterConfiguration::default()
         },
         RouterConfiguration {
@@ -147,15 +139,6 @@ fn configuration_refuses_degenerate_values() -> Result<()> {
             network: Some("é".repeat(32)),
             ..RouterConfiguration::default()
         },
-        RouterConfiguration {
-            advertised_host: Some("gateway.example".to_owned()),
-            advertised_port: Some(0),
-            ..RouterConfiguration::default()
-        },
-        RouterConfiguration {
-            advertised_port: Some(443),
-            ..RouterConfiguration::default()
-        },
     ];
     for config in cases {
         assert!(
@@ -163,7 +146,6 @@ fn configuration_refuses_degenerate_values() -> Result<()> {
             "a degenerate configuration must not validate: {config:?}"
         );
     }
-    Ok(())
 }
 
 /// Peer caches accept every positive capacity and reject zero.

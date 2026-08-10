@@ -12,6 +12,7 @@ use crate::router::grpc::BoundListener;
 use crate::router::{Host, MAX_LABEL_BYTES, NodeId};
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle, spawn_blocking};
+use tonic::transport::Error as TransportError;
 use whoami::hostname;
 
 #[cfg(test)]
@@ -48,27 +49,21 @@ pub(super) fn registration(
     listener: &BoundListener,
     discovered: DiscoveredHost,
     config: &RouterConfiguration,
-) -> NodeRegistration {
-    let listener_port = listener.address().port();
+) -> Result<NodeRegistration, DiscoveryError> {
     let DiscoveredHost { hostname } = discovered;
-    let bound_ip = listener.address().ip();
-    NodeRegistration {
+    let bound = listener.address();
+    let authority = if bound.ip().is_unspecified() {
+        format!("{}:{}", hostname.as_str(), bound.port())
+    } else {
+        bound.to_string()
+    };
+    Ok(NodeRegistration {
         node,
-        direct: Endpoint {
-            host: if bound_ip.is_unspecified() {
-                hostname.clone()
-            } else {
-                Host::make(&bound_ip.to_string())
-            },
-            port: listener_port,
-        },
-        advertised: config.advertised_host.as_deref().map(|host| Endpoint {
-            host: Host::make(host),
-            port: config.advertised_port.unwrap_or(listener_port),
-        }),
+        direct: Endpoint::from_shared(format!("http://{authority}"))?,
+        advertised: config.advertised.clone(),
         network: config.network.as_deref().map(NetworkId::make),
         hostname,
-    }
+    })
 }
 
 /// Reports what the blocking task returned.
@@ -115,6 +110,10 @@ fn discover_host() -> Result<DiscoveredHost, DiscoveryError> {
 /// What can stop a process from learning what only its machine knows.
 #[derive(Debug, Error)]
 pub(crate) enum DiscoveryError {
+    /// The discovered listener address does not form a Tonic endpoint.
+    #[error(transparent)]
+    Endpoint(#[from] TransportError),
+
     /// The machine's own name could not be read. Every registration publishes
     /// it, so the lookup is not optional.
     #[error("the machine name could not be read: {0:#}")]

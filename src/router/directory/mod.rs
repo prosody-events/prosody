@@ -24,17 +24,7 @@ pub(crate) mod tests;
 /// it. Its range is then the constructor's alone, rather than a convention the
 /// write sites keep.
 pub(crate) use self::lease::{RegistrationTtl, RegistrationTtlError};
-
-/// Where a process can be reached: a host and the port peers dial there.
-///
-/// A tagged pair rather than a `host:port` string, because an entry point may
-/// later need a TLS server name or a scheme. Those are ordinary columns, so
-/// the set can grow without a key change.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct Endpoint {
-    pub(crate) host: Host,
-    pub(crate) port: u16,
-}
+pub(crate) use tonic::transport::Endpoint;
 
 /// The operator's name for a set of processes that can reach each other on
 /// their direct endpoints.
@@ -44,12 +34,11 @@ pub(crate) struct Endpoint {
 pub(crate) type NetworkId = Flexstr<LABEL_CAPACITY>;
 
 /// One live process, as the directory publishes it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct NodeRegistration {
     pub(crate) node: NodeId,
-    /// Where this process is reachable on its own network: the address it
-    /// discovered for itself, on the port its listener bound. Always present,
-    /// so "a node with no reachable address" is unrepresentable.
+    /// Where this process is reachable on its own network. The runtime derives
+    /// it from the bound listener. It is always present.
     pub(crate) direct: Endpoint,
     /// An entry point that reaches this process from another network. Present
     /// only where an operator arranged one; absent means intra-network only.

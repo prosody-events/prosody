@@ -89,7 +89,7 @@ impl Harness {
         let served_registry = registry();
         let node = NodeId::new();
         let bound = BoundListener::bind(address).await?;
-        let address = endpoint(&bound);
+        let address = endpoint(&bound)?;
         let (relay_router, _relay_deliveries) = TestRouter::new(fleet_config())?;
         let served = Served::start(
             bound,

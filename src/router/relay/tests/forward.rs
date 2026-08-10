@@ -3,7 +3,7 @@
 use super::{BUDGET, Process, frame};
 use crate::response::ResponseDisposition;
 use crate::router::SendFailure;
-use crate::router::loopback::{Script, config, node, paused, port};
+use crate::router::loopback::{Script, config, direct_uri, node, paused};
 use color_eyre::Result;
 use std::time::Duration;
 
@@ -32,7 +32,7 @@ fn a_failed_forward_is_never_answered_as_a_delivery() -> Result<()> {
                 failure: SendFailure::Unreachable,
                 times: usize::MAX,
             },
-        );
+        )?;
 
         let answered = process
             .deliver(frame(node(ELSEWHERE), request.id(), None)?, BUDGET)
@@ -44,8 +44,8 @@ fn a_failed_forward_is_never_answered_as_a_delivery() -> Result<()> {
         );
         let recorded = process.recorded();
         assert_eq!(
-            recorded.map(|delivery| delivery.port),
-            Some(port(ELSEWHERE)),
+            recorded.map(|delivery| delivery.uri),
+            Some(direct_uri(ELSEWHERE)?),
             "the process must have attempted the forward before it answered"
         );
         assert!(

@@ -18,12 +18,10 @@
 --          than tombstone noise.
 
 CREATE TABLE {{KEYSPACE}}.{{TABLE_NODE_DIRECTORY}} (
-    node_id          uuid PRIMARY KEY,
-    direct_host      text,
-    direct_port      int,
-    advertised_host  text,
-    advertised_port  int,
-    network          text,
-    hostname         text
+    node_id            uuid PRIMARY KEY,
+    direct_connect     text,
+    advertised_connect text,
+    network            text,
+    hostname           text
 ) WITH compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }
   AND compression = { 'class': 'ZstdCompressor' };

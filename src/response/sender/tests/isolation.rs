@@ -1,7 +1,7 @@
 //! What one destination's trouble costs the others: nothing.
 
-use super::{Harness, attempts, config, paused, port};
-use crate::router::loopback::Script;
+use super::{Harness, attempts, config, paused};
+use crate::router::loopback::{Script, direct_uri};
 use color_eyre::Result;
 use std::array;
 use std::sync::Arc;
@@ -24,17 +24,19 @@ fn a_held_destination_never_delays_a_healthy_one() -> Result<()> {
     runtime.block_on(async {
         let mut harness = Harness::new(config())?;
         let barrier = Arc::new(Semaphore::new(0));
-        harness.script(NODE_A, Script::Hold(Arc::clone(&barrier)));
+        harness.script(NODE_A, Script::Hold(Arc::clone(&barrier)))?;
 
         let held = array::from_fn::<_, HELD_REQUESTS, _>(|_| harness.start_send(NODE_A));
-        let mut held_attempts = usize::from(harness.next_delivery().await?.port == port(NODE_A));
+        let node_a = direct_uri(NODE_A)?;
+        let node_b = direct_uri(NODE_B)?;
+        let mut held_attempts = usize::from(harness.next_delivery().await?.uri == node_a);
 
         let healthy = harness.start_send(NODE_B);
         let mut healthy_attempted = false;
         for _ in 0..HELD_REQUESTS {
             let delivery = harness.next_delivery().await?;
-            held_attempts += usize::from(delivery.port == port(NODE_A));
-            healthy_attempted |= delivery.port == port(NODE_B);
+            held_attempts += usize::from(delivery.uri == node_a);
+            healthy_attempted |= delivery.uri == node_b;
         }
         assert!(
             healthy_attempted,
@@ -48,7 +50,7 @@ fn a_held_destination_never_delays_a_healthy_one() -> Result<()> {
         healthy.await??;
         let drained = harness.drain().await?;
         assert_eq!(
-            held_attempts + attempts(&drained.deliveries, NODE_A),
+            held_attempts + attempts(&drained.deliveries, NODE_A)?,
             HELD_REQUESTS,
             "each held response must make one attempt"
         );

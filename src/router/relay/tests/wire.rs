@@ -270,7 +270,9 @@ async fn crossing(pair: &Pair) -> Result<()> {
         .ok_or_else(|| eyre!("a node in another network must be reachable through its entry"))?;
     let [first, second] = route.candidates(None);
     ensure(
-        first == Some((Preference::Advertised, &pair.relay.address)) && second.is_none(),
+        first.is_some_and(|(preference, endpoint)| {
+            preference == Preference::Advertised && endpoint.uri() == pair.relay.address.uri()
+        }) && second.is_none(),
         format!("the rules chose {route:?}, which is not the target's entry point alone"),
     )?;
 

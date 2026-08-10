@@ -3,7 +3,7 @@
 use super::{Harness, attempts_on, paused};
 use crate::router::SendFailure;
 use crate::router::fleet::config::FleetConfiguration;
-use crate::router::loopback::{Script, advertised_port, port};
+use crate::router::loopback::{Script, advertised_uri, direct_uri};
 use color_eyre::Result;
 use tonic::Code;
 
@@ -141,7 +141,7 @@ fn a_route_is_walked_until_something_answers_and_that_endpoint_is_remembered() -
         let runtime = paused()?;
         runtime.block_on(async {
             let mut harness = Harness::dual_homed(settings())?;
-            apply(&harness, case.first);
+            apply(&harness, case.first)?;
             harness.send(TARGET).await?;
             // Taken from the stream rather than left for the drain, because
             // reading them is what says the first response is over.
@@ -149,19 +149,19 @@ fn a_route_is_walked_until_something_answers_and_that_endpoint_is_remembered() -
             for _ in 0..case.attempts {
                 recorded.push(harness.next_delivery().await?);
             }
-            apply(&harness, case.second);
+            apply(&harness, case.second)?;
             harness.send(TARGET).await?;
 
             let drained = harness.drain().await?;
             recorded.extend(drained.deliveries);
             let name = case.name;
             assert_eq!(
-                attempts_on(&recorded, port(TARGET)),
+                attempts_on(&recorded, &direct_uri(TARGET)?),
                 case.direct,
                 "{name}: wrong number of attempts on the direct endpoint"
             );
             assert_eq!(
-                attempts_on(&recorded, advertised_port(TARGET)),
+                attempts_on(&recorded, &advertised_uri(TARGET)?),
                 case.advertised,
                 "{name}: wrong number of attempts on the entry point"
             );
@@ -173,9 +173,10 @@ fn a_route_is_walked_until_something_answers_and_that_endpoint_is_remembered() -
 }
 
 /// Scripts what each of the target's two endpoints answers next.
-fn apply(harness: &Harness, (direct, advertised): (Answer, Answer)) {
-    harness.script(TARGET, direct.script());
-    harness.script_advertised(TARGET, advertised.script());
+fn apply(harness: &Harness, (direct, advertised): (Answer, Answer)) -> Result<()> {
+    harness.script(TARGET, direct.script())?;
+    harness.script_advertised(TARGET, advertised.script())?;
+    Ok(())
 }
 
 /// The fleet every case here runs against.

@@ -37,15 +37,11 @@ use std::sync::Arc;
 use tokio::sync::oneshot::{Sender, channel};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use tonic::transport::Error as TransportError;
 
 /// The label the process under test publishes, and the one its neighbour
 /// publishes too.
 const NETWORK: &str = "one-network";
-
-/// Where the neighbour says it is. Nothing dials either port: the order the
-/// route puts them in is the whole subject.
-const NEIGHBOUR_DIRECT: u16 = 9401;
-const NEIGHBOUR_ENTRY: u16 = 9402;
 
 /// The payload the forwarded frame carries.
 const PAYLOAD: &[u8] = b"sent on by the listener the runtime served";
@@ -82,14 +78,8 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
         .await?;
         let neighbour = NodeRegistration {
             node: NodeId::new(),
-            direct: Endpoint {
-                host: Host::make("10.0.0.11"),
-                port: NEIGHBOUR_DIRECT,
-            },
-            advertised: Some(Endpoint {
-                host: Host::make("gateway.example"),
-                port: NEIGHBOUR_ENTRY,
-            }),
+            direct: Endpoint::from_static("http://10.0.0.11:12001"),
+            advertised: Some(Endpoint::from_static("http://gateway.example:12002")),
             network: Some(NetworkId::make(NETWORK)),
             hostname: Host::make("neighbour"),
         };
@@ -153,7 +143,7 @@ impl Elsewhere {
         let node = NodeId::new();
         let registry = PendingRegistry::new();
         let bound = bind().await?;
-        let address = local(bound.address().port());
+        let address = local(bound.address())?;
         let (unused, _deliveries) = TestRouter::new(fleet_config())?;
         let (stop, stopped) = channel();
         let served = serve(
@@ -200,7 +190,7 @@ async fn start_over(
         })
         .await?;
     let bound = bind().await?;
-    let here = local(bound.address().port());
+    let here = local(bound.address())?;
     let config = RouterConfiguration::default();
     let runtime = start_runtime(PeerInputs {
         directory: directory.clone(),
@@ -247,9 +237,6 @@ async fn bind() -> Result<BoundListener> {
 }
 
 /// Where a listener on `port` is, as a peer on this machine dials it.
-fn local(port: u16) -> Endpoint {
-    Endpoint {
-        host: Host::make("127.0.0.1"),
-        port,
-    }
+fn local(address: SocketAddr) -> Result<Endpoint, TransportError> {
+    Endpoint::from_shared(format!("http://{address}"))
 }

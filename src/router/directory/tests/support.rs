@@ -154,14 +154,8 @@ pub(crate) fn token() -> String {
 pub(crate) fn registration(node: NodeId) -> NodeRegistration {
     NodeRegistration {
         node,
-        direct: Endpoint {
-            host: Host::make("10.1.2.3"),
-            port: 7777,
-        },
-        advertised: Some(Endpoint {
-            host: Host::make("gateway.example"),
-            port: 443,
-        }),
+        direct: Endpoint::from_static("http://10.1.2.3:7777"),
+        advertised: Some(Endpoint::from_static("http://gateway.example:443")),
         network: Some(NetworkId::make("east")),
         hostname: Host::make("worker-7"),
     }
@@ -188,9 +182,10 @@ pub(crate) fn node_id(g: &mut Gen) -> NodeId {
 
 /// A generated endpoint. Ports span the whole range, both ends included.
 pub(crate) fn endpoint(g: &mut Gen) -> Endpoint {
-    Endpoint {
-        host: Host::make(&label(g)),
-        port: 1 + u16::arbitrary(g) % u16::MAX,
+    let connect = format!("http://{}:{}", label(g), 1 + u16::arbitrary(g) % u16::MAX);
+    match Endpoint::from_shared(connect) {
+        Ok(endpoint) => endpoint,
+        Err(_) => Endpoint::from_static("http://fallback.example:1"),
     }
 }
 

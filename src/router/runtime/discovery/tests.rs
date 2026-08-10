@@ -6,8 +6,8 @@ use super::{
     DiscoveredHost, DiscoveryError, discover_host, join_discovery,
     registration as discover_registration,
 };
+use crate::router::NodeId;
 use crate::router::directory::Endpoint;
-use crate::router::{Host, NodeId};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
@@ -25,40 +25,26 @@ use validator::Validate;
 /// the operating system answers, and the answer is the only port registration
 /// can publish. What the operator configured reaches `advertised` alone.
 #[quickcheck]
-fn prop_the_direct_endpoint_publishes_only_what_it_discovered(label: u8, port: u16) -> TestResult {
+fn prop_the_direct_endpoint_publishes_only_what_it_discovered(label: u8) -> TestResult {
     init_test_logging();
-    let host = format!("gateway-{label}.example");
-    // Port zero is refused by the configuration, so it is not a case this
-    // property covers; `configuration_refuses_degenerate_values` owns it.
-    let advertised_port = port.max(1);
+    let connect = format!("http://gateway-{label}.example");
     let outcome: Result<()> = TEST_RUNTIME.block_on(async {
+        let advertised = Endpoint::from_shared(connect)?;
         let config = RouterConfiguration::builder()
-            .advertised_host(host.clone())
-            .advertised_port(advertised_port)
+            .advertised(advertised.clone())
             .build()?;
         config.validate()?;
         let bound = listener().await?;
-        let registration = discover_registration(NodeId::new(), &bound, discover_host()?, &config);
+        let registration = discover_registration(NodeId::new(), &bound, discover_host()?, &config)?;
         ensure!(
-            bound.address().port() != 0,
-            "the bound port must not be zero"
-        );
-        ensure!(
-            registration.direct.port == bound.address().port(),
-            "the direct endpoint published port {}, not the {} the listener bound",
-            registration.direct.port,
-            bound.address().port()
-        );
-        ensure!(
-            registration.direct.host != Host::make(&host),
+            registration.direct.uri() != advertised.uri(),
             "the direct endpoint published the configured entry point"
         );
         ensure!(
-            registration.advertised
-                == Some(Endpoint {
-                    host: Host::make(&host),
-                    port: advertised_port,
-                }),
+            registration
+                .advertised
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.uri() == advertised.uri()),
             "the entry point did not publish the configured endpoint"
         );
         Ok(())

@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tonic::Code;
+use tonic::codegen::http::Uri;
 use uuid::{Uuid, Version};
 
 #[derive(Clone)]
@@ -90,7 +91,6 @@ fn every_failure_answers_the_two_questions_the_send_path_asks() {
     // failure, wrong endpoint
     let table = [
         (SendFailure::Unreachable, true),
-        (SendFailure::Undialable, true),
         (SendFailure::Expired, true),
         (answer(Code::Unavailable), true),
         (answer(Code::Unimplemented), true),
@@ -145,24 +145,29 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
             "a published node must reach at least one endpoint"
         );
         for address in walked {
+            let uri = address.uri();
             assert!(
-                *address == published.direct || Some(address) == published.advertised.as_ref(),
+                uri == published.direct.uri()
+                    || published
+                        .advertised
+                        .as_ref()
+                        .is_some_and(|endpoint| uri == endpoint.uri()),
                 "a router handed out {address:?}, which the node never published"
             );
         }
-        assert_eq!(
-            router.direct(published.node).await?.as_ref(),
-            Some(&published.direct),
+        assert!(
+            router
+                .direct(published.node)
+                .await?
+                .is_some_and(|endpoint| endpoint.uri() == published.direct.uri()),
             "the lookup a forward uses must hand out the endpoint the node published"
         );
-        assert_eq!(
-            router.route(NodeId::new()).await?,
-            None,
+        assert!(
+            router.route(NodeId::new()).await?.is_none(),
             "a node the directory does not hold must reach no address"
         );
-        assert_eq!(
-            router.direct(NodeId::new()).await?,
-            None,
+        assert!(
+            router.direct(NodeId::new()).await?.is_none(),
             "a node the directory does not hold must reach no endpoint to forward to"
         );
         Ok(())
@@ -184,9 +189,11 @@ fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<(
 
         let router = test_router(directory.clone())?;
 
-        assert_eq!(
-            router.direct(published.node).await?,
-            Some(published.direct.clone()),
+        assert!(
+            router
+                .direct(published.node)
+                .await?
+                .is_some_and(|endpoint| endpoint.uri() == published.direct.uri()),
             "a published node must resolve"
         );
         directory.deregister(&published).await?;
@@ -194,9 +201,11 @@ fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<(
             directory.read(published.node).await?.is_none(),
             "the entry must be gone before the cached answer is asserted"
         );
-        assert_eq!(
-            router.direct(published.node).await?,
-            Some(published.direct.clone()),
+        assert!(
+            router
+                .direct(published.node)
+                .await?
+                .is_some_and(|endpoint| endpoint.uri() == published.direct.uri()),
             "a router must answer from its cache once the entry is gone"
         );
 
@@ -300,8 +309,8 @@ impl Labels {
 #[quickcheck]
 fn prop_a_route_follows_the_declared_labels(declared: Declared) -> TestResult {
     let advertised = matches!(declared.published, Published::WithAdvertised);
-    let direct = endpoint(7000);
-    let entry = endpoint(7001);
+    let direct = Endpoint::from_static("http://10.0.0.9:7000");
+    let entry = Endpoint::from_static("http://10.0.0.9:7001");
     let published = NodeRegistration {
         node: NodeId::new(),
         direct: direct.clone(),
@@ -311,16 +320,18 @@ fn prop_a_route_follows_the_declared_labels(declared: Declared) -> TestResult {
     };
 
     // The table, as an operator reads it off the two labels.
-    let expected: Vec<(Preference, Endpoint)> = match (declared.labels, advertised) {
+    let expected: Vec<(Preference, Uri)> = match (declared.labels, advertised) {
         (Labels::Agree, true) => vec![
-            (Preference::Direct, direct.clone()),
-            (Preference::Advertised, entry.clone()),
+            (Preference::Direct, direct.uri().clone()),
+            (Preference::Advertised, entry.uri().clone()),
         ],
-        (Labels::Agree, false) => vec![(Preference::Direct, direct.clone())],
-        (labels, true) if labels.both() => vec![(Preference::Advertised, entry.clone())],
+        (Labels::Agree, false) => vec![(Preference::Direct, direct.uri().clone())],
+        (labels, true) if labels.both() => {
+            vec![(Preference::Advertised, entry.uri().clone())]
+        }
         (labels, false) if labels.both() => Vec::new(),
-        (_, true) => vec![(Preference::Advertised, entry.clone())],
-        (_, false) => vec![(Preference::Direct, direct.clone())],
+        (_, true) => vec![(Preference::Advertised, entry.uri().clone())],
+        (_, false) => vec![(Preference::Direct, direct.uri().clone())],
     };
 
     let Some(route) = choose_route(declared.labels.here().as_ref(), &published) else {
@@ -337,11 +348,11 @@ fn prop_a_route_follows_the_declared_labels(declared: Declared) -> TestResult {
             "{declared:?} must reach nothing, but reached {route:?}"
         ));
     }
-    let walked: Vec<(Preference, Endpoint)> = route
+    let walked: Vec<(Preference, Uri)> = route
         .candidates(None)
         .into_iter()
         .flatten()
-        .map(|(preference, endpoint)| (preference, endpoint.clone()))
+        .map(|(preference, endpoint)| (preference, endpoint.uri().clone()))
         .collect();
     assert_eq!(
         walked, expected,
@@ -423,12 +434,4 @@ fn test_router(directory: TestDirectory) -> Result<NetworkRoute<LoopbackSender, 
         Arc::new(transport),
         None,
     ))
-}
-
-/// One endpoint on `port`. Its host is not the subject here.
-fn endpoint(port: u16) -> Endpoint {
-    Endpoint {
-        host: Host::make("10.0.0.9"),
-        port,
-    }
 }

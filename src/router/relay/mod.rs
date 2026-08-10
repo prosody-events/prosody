@@ -108,9 +108,7 @@ impl<R: RelayHop> Relay<R> {
             Ok(()) => Ok(()),
             Err(SendFailure::Status(code)) => Err(RelayFailure::Target(code)),
             Err(SendFailure::Expired) => Err(RelayFailure::DeadlineExceeded),
-            Err(SendFailure::Unreachable | SendFailure::Undialable) => {
-                Err(RelayFailure::Unreachable)
-            }
+            Err(SendFailure::Unreachable) => Err(RelayFailure::Unreachable),
         }
     }
 }

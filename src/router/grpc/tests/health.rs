@@ -8,7 +8,6 @@ use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
-use tonic::transport::Endpoint as Dialled;
 use tonic::{Code, Request};
 use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_check_response::ServingStatus;
@@ -63,8 +62,7 @@ fn the_health_service_answers_on_the_peer_port() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
-        let channel = Dialled::from_shared(format!("http://127.0.0.1:{}", harness.address.port))?
-            .connect_lazy();
+        let channel = harness.address.connect_lazy();
         let mut client = HealthClient::new(channel);
         for name in ["", SERVICE_NAME] {
             let answered = client.check(request(name)).await?.into_inner().status;

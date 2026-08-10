@@ -1,7 +1,7 @@
 use super::support::{cassandra_directory, finish, registration, test_directory_holding, token};
+use crate::router::NodeId;
 use crate::router::directory::cache::AddressCache;
 use crate::router::directory::{Endpoint, NodeDirectory, NodeRegistration, RegistrationTtl};
-use crate::router::{Host, NodeId};
 use crate::test_util::{TEST_RUNTIME, integration_test_count};
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::OnceCell;
 use tokio::task::yield_now;
+use tonic::codegen::http::Uri;
 
 /// How many registrations the cache under test admits.
 const CAPACITY: usize = 8;
@@ -46,7 +47,7 @@ const POOL_LEASE: Duration = Duration::from_hours(1);
 
 /// The Cassandra pool, registered once for the whole test process under a lease
 /// long enough to outlive the run.
-static POOL_NODES: OnceCell<Vec<(NodeId, u16)>> = OnceCell::const_new();
+static POOL_NODES: OnceCell<Vec<(NodeId, Uri)>> = OnceCell::const_new();
 
 /// The three bounds that make the address cache safe to key by a node id an
 /// outsider chooses, proved together over one generated request stream.
@@ -104,7 +105,7 @@ fn prop_address_cache_bounded_single_flight_over_cassandra() {
 /// Runs every address-cache case against one directory and one pool.
 async fn run_address_cache_cases<D: NodeDirectory>(
     directory: &D,
-    pool: &[(NodeId, u16)],
+    pool: &[(NodeId, Uri)],
     ttl: RegistrationTtl,
     generated: Vec<usize>,
 ) -> Result<()> {
@@ -116,10 +117,10 @@ async fn run_address_cache_cases<D: NodeDirectory>(
 
 /// Drives the generated stream and checks the two bounds that hold at every
 /// position: occupancy, and one read per request at most. Each served value is
-/// checked against the port its node registered, so a mixed-up entry is caught.
+/// checked against the URI its node registered, so a mixed-up entry is caught.
 async fn occupancy_holds<D: NodeDirectory>(
     directory: &D,
-    pool: &[(NodeId, u16)],
+    pool: &[(NodeId, Uri)],
     ttl: RegistrationTtl,
     generated: Vec<usize>,
 ) -> Result<()> {
@@ -131,9 +132,9 @@ async fn occupancy_holds<D: NodeDirectory>(
         .copied()
         .chain(generated.into_iter().map(|index| index % POOL));
     for (position, index) in requests.enumerate() {
-        let (node, port) = pool[index];
+        let (node, uri) = &pool[index];
         let before = reads.load(Ordering::Relaxed);
-        let resolved = resolve(&cache, directory, &reads, node)
+        let resolved = resolve(&cache, directory, &reads, *node)
             .await?
             .ok_or_else(|| eyre!("request {position}: a registered node must resolve"))?;
         let issued = reads.load(Ordering::Relaxed) - before;
@@ -147,7 +148,8 @@ async fn occupancy_holds<D: NodeDirectory>(
             "request {position}: a miss must read through once, not {issued} times"
         );
         assert_eq!(
-            resolved.direct.port, port,
+            resolved.direct.uri(),
+            uri,
             "request {position}: the cache served another node's registration"
         );
     }
@@ -158,18 +160,19 @@ async fn occupancy_holds<D: NodeDirectory>(
 /// placeholder and every other caller parks on it.
 async fn one_read_per_cold_burst<D: NodeDirectory>(
     directory: &D,
-    pool: &[(NodeId, u16)],
+    pool: &[(NodeId, Uri)],
     ttl: RegistrationTtl,
 ) -> Result<()> {
     let (clock, _mock) = Clock::mock();
     let cache = AddressCache::with_clock(CAPACITY, ttl, clock);
     let reads = AtomicUsize::new(0);
-    let (node, port) = pool[1];
-    let burst = join_all((0..CONCURRENT).map(|_| resolve(&cache, directory, &reads, node))).await;
+    let (node, uri) = &pool[1];
+    let burst = join_all((0..CONCURRENT).map(|_| resolve(&cache, directory, &reads, *node))).await;
     for served in burst {
         let served = served?.ok_or_else(|| eyre!("a registered node must resolve"))?;
         assert_eq!(
-            served.direct.port, port,
+            served.direct.uri(),
+            uri,
             "every caller in the burst must be served the node it asked for"
         );
     }
@@ -186,13 +189,13 @@ async fn one_read_per_cold_burst<D: NodeDirectory>(
 /// by an eviction and the hit is deterministic.
 async fn a_fresh_entry_is_served_until_the_lease_ends<D: NodeDirectory>(
     directory: &D,
-    pool: &[(NodeId, u16)],
+    pool: &[(NodeId, Uri)],
     ttl: RegistrationTtl,
 ) -> Result<()> {
     let (clock, mock) = Clock::mock();
     let cache = AddressCache::with_clock(CAPACITY, ttl, clock);
     let reads = AtomicUsize::new(0);
-    let (node, _) = pool[0];
+    let node = pool[0].0;
 
     drop(resolve(&cache, directory, &reads, node).await?);
     let after_fill = reads.load(Ordering::Relaxed);
@@ -261,22 +264,17 @@ async fn resolve<D: NodeDirectory>(
         .await?)
 }
 
-/// Registers [`POOL`] nodes, each with a distinct direct port so a mixed-up
-/// cache entry serves an observably wrong value.
-async fn register_pool<D: NodeDirectory>(directory: &D) -> Result<Vec<(NodeId, u16)>> {
+/// Registers [`POOL`] nodes with distinct URIs.
+async fn register_pool<D: NodeDirectory>(directory: &D) -> Result<Vec<(NodeId, Uri)>> {
     let mut nodes = Vec::with_capacity(POOL);
-    for index in 0..POOL {
+    for _ in 0..POOL {
         let node = NodeId::new();
-        // The port is the value the assertions join on, so it must differ per
-        // node.
-        let port = 20_000 + index as u16;
+        let endpoint = Endpoint::from_shared(format!("http://pool-{}.test", token()))?;
+        let uri = endpoint.uri().clone();
         let mut written = registration(node);
-        written.direct = Endpoint {
-            host: Host::make(&format!("pool-{}", token())),
-            port,
-        };
+        written.direct = endpoint;
         directory.register(&written).await?;
-        nodes.push((node, port));
+        nodes.push((node, uri));
     }
     Ok(nodes)
 }

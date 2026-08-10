@@ -18,16 +18,15 @@ cassandra_queries! {
     pub(crate) struct DirectoryQueries {
         /// Writes every column of one node's row under one lease.
         register: (
-            "INSERT INTO $keyspace.{} (node_id, direct_host, direct_port, advertised_host, \
-             advertised_port, network, hostname) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) USING TTL ?",
+            "INSERT INTO $keyspace.{} (node_id, direct_connect, advertised_connect, network, \
+             hostname) VALUES (?, ?, ?, ?, ?) USING TTL ?",
             TABLE_NODE_DIRECTORY
         ),
 
         /// Point-reads one node's row.
         read: (
-            "SELECT direct_host, direct_port, advertised_host, advertised_port, network, \
-             hostname FROM $keyspace.{} WHERE node_id = ?",
+            "SELECT direct_connect, advertised_connect, network, hostname \
+             FROM $keyspace.{} WHERE node_id = ?",
             TABLE_NODE_DIRECTORY
         ),
 
@@ -42,9 +41,7 @@ cassandra_queries! {
 /// The directory row as the driver hands it over: every column nullable.
 type DirectoryColumns = (
     Option<String>,
-    Option<i32>,
     Option<String>,
-    Option<i32>,
     Option<String>,
     Option<String>,
 );
@@ -118,10 +115,11 @@ impl NodeDirectory for CassandraNodeDirectory {
     /// Returns the driver's error when the write fails.
     #[instrument(level = "debug", skip_all, fields(node = %registration.node), err)]
     async fn register(&self, registration: &NodeRegistration) -> Result<(), CassandraStoreError> {
-        let (advertised_host, advertised_port) = match &registration.advertised {
-            Some(endpoint) => (Some(endpoint.host.as_str()), Some(i32::from(endpoint.port))),
-            None => (None, None),
-        };
+        let direct_connect = registration.direct.uri().to_string();
+        let advertised_connect = registration
+            .advertised
+            .as_ref()
+            .map(|endpoint| endpoint.uri().to_string());
         // An absent column binds CQL NULL, never `MaybeUnset::Unset`. An unset
         // column would keep its previous cell, and that cell would then expire
         // on its own older lease while the rest of the row lives — the row that
@@ -131,10 +129,8 @@ impl NodeDirectory for CassandraNodeDirectory {
                 &self.queries.register,
                 (
                     Uuid::from(registration.node),
-                    registration.direct.host.as_str(),
-                    i32::from(registration.direct.port),
-                    advertised_host,
-                    advertised_port,
+                    direct_connect,
+                    advertised_connect,
                     registration.network.as_ref().map(Flexstr::as_str),
                     registration.hostname.as_str(),
                     self.ttl.seconds(),
@@ -165,21 +161,16 @@ impl NodeDirectory for CassandraNodeDirectory {
             .maybe_first_row::<DirectoryColumns>()?;
         // Every column decodes as `Option`: a row can carry NULLs, and a
         // deserialization error would be Terminal where "absent" is the answer.
-        let Some((direct_host, direct_port, advertised_host, advertised_port, network, hostname)) =
-            row
-        else {
+        let Some((direct_connect, advertised_connect, network, hostname)) = row else {
             return Ok(None);
         };
         // A label longer than a registration may publish makes the whole row
-        // unresolvable rather than a shorter label: truncating would dial a
-        // different host, and keeping it would put an unbounded string in the
-        // address cache, which counts entries and not bytes.
-        let bounded = [&direct_host, &advertised_host, &network, &hostname]
+        // unresolvable. Truncation would change its identity.
+        let bounded = [&network, &hostname]
             .into_iter()
             .flatten()
             .all(|label| label_fits(label));
-        let (true, Some(direct), Some(hostname)) =
-            (bounded, endpoint(direct_host, direct_port), hostname)
+        let (true, Some(direct), Some(hostname)) = (bounded, endpoint(direct_connect), hostname)
         else {
             warn!(%node, "directory row is not resolvable");
             return Ok(None);
@@ -187,7 +178,7 @@ impl NodeDirectory for CassandraNodeDirectory {
         Ok(Some(NodeRegistration {
             node,
             direct,
-            advertised: endpoint(advertised_host, advertised_port),
+            advertised: endpoint(advertised_connect),
             network: network.map(|network| NetworkId::make(&network)),
             hostname: Host::make(&hostname),
         }))
@@ -209,17 +200,6 @@ impl NodeDirectory for CassandraNodeDirectory {
     }
 }
 
-/// An endpoint from its two columns, or nothing when either is missing or the
-/// port is outside the range a port can hold.
-fn endpoint(host: Option<String>, port: Option<i32>) -> Option<Endpoint> {
-    let (Some(host), Some(port)) = (host, port) else {
-        return None;
-    };
-    let Ok(port @ 1..) = u16::try_from(port) else {
-        return None;
-    };
-    Some(Endpoint {
-        host: Host::make(&host),
-        port,
-    })
+fn endpoint(connect: Option<String>) -> Option<Endpoint> {
+    connect.and_then(|connect| Endpoint::from_shared(connect).into_iter().next())
 }

@@ -18,19 +18,14 @@ use std::future::Future;
 use std::io::Error as IoError;
 use std::sync::Arc;
 use std::time::Duration;
+use thiserror::Error;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
+use tonic::codegen::http::{Uri, uri::InvalidUri};
 
 pub(crate) mod listener;
-
-/// Port of the first test node. Each node binds one of its own, which is also
-/// the transport's script key.
-const PORT_BASE: u16 = 9000;
-
-/// Port of the first advertised test endpoint.
-const ADVERTISED_PORT_BASE: u16 = 9300;
 
 /// How many nodes the test router publishes.
 pub(crate) const PUBLISHED_NODES: u8 = 8;
@@ -53,7 +48,7 @@ pub(crate) struct TestHealth {
 /// The frame bytes are copied out at the moment of the attempt.
 #[derive(Debug)]
 pub(crate) struct Delivery {
-    pub(crate) port: u16,
+    pub(crate) uri: Uri,
     pub(crate) bytes: BytesMut,
 }
 
@@ -80,17 +75,14 @@ pub(crate) enum Script {
     Hold(Arc<Semaphore>),
 }
 
-/// A transport that records every attempt and answers from a per-port script.
-///
-/// Ports key the scripts because a test node's endpoint is the only thing the
-/// transport is given, and each test node binds a distinct port.
+/// A transport that records every attempt and answers from an endpoint script.
 pub(crate) struct LoopbackSender {
     deliveries: UnboundedSender<Delivery>,
     /// A `Mutex<HashMap>` rather than `scc`: a script's read, decrement and
-    /// answer must be one step, and this map holds a few ports in one test.
+    /// answer must be one step, and this map holds a few URIs in one test.
     /// The rule against a mutex-wrapped map targets contended keyed production
     /// state, which this is not.
-    scripts: Mutex<HashMap<u16, Script>>,
+    scripts: Mutex<HashMap<Uri, Script>>,
 }
 
 /// A router over an in-process transport, addressing a fixed set of nodes.
@@ -142,15 +134,14 @@ impl LoopbackSender {
         )
     }
 
-    /// Sets what the destination on `port` answers. An unscripted port accepts
-    /// every attempt.
-    pub(crate) fn script(&self, port: u16, script: Script) {
-        drop(self.scripts.lock().insert(port, script));
+    /// Sets what one endpoint answers. An unscripted endpoint accepts.
+    pub(crate) fn script(&self, uri: Uri, script: Script) {
+        drop(self.scripts.lock().insert(uri, script));
     }
 
-    fn answer(&self, port: u16) -> Answer {
+    fn answer(&self, uri: &Uri) -> Answer {
         let mut scripts = self.scripts.lock();
-        match scripts.get_mut(&port) {
+        match scripts.get_mut(uri) {
             None => Answer::Accepted,
             Some(Script::Hold(barrier)) => Answer::Held(Arc::clone(barrier)),
             Some(Script::Fail { failure, times }) => {
@@ -169,14 +160,14 @@ impl TestRouter {
     /// Builds the fleet, transport, published addresses, and delivery stream.
     pub(crate) fn new(
         config: FleetConfiguration,
-    ) -> Result<(Self, UnboundedReceiver<Delivery>), FleetConfigurationError> {
+    ) -> Result<(Self, UnboundedReceiver<Delivery>), TestRouterError> {
         Self::build(config, None)
     }
 
     /// Builds a router whose nodes publish direct and advertised endpoints.
     pub(crate) fn dual_homed(
         config: FleetConfiguration,
-    ) -> Result<(Self, UnboundedReceiver<Delivery>), FleetConfigurationError> {
+    ) -> Result<(Self, UnboundedReceiver<Delivery>), TestRouterError> {
         Self::build(config, Some(NetworkId::make("test")))
     }
 
@@ -184,28 +175,25 @@ impl TestRouter {
     fn build(
         config: FleetConfiguration,
         here: Option<NetworkId>,
-    ) -> Result<(Self, UnboundedReceiver<Delivery>), FleetConfigurationError> {
+    ) -> Result<(Self, UnboundedReceiver<Delivery>), TestRouterError> {
         let (transport, deliveries) = LoopbackSender::new();
         let registrations = (0..PUBLISHED_NODES)
             .map(|index| {
-                (
+                Ok((
                     node(index),
                     NodeRegistration {
                         node: node(index),
-                        direct: Endpoint {
-                            host: Host::make("10.0.0.1"),
-                            port: port(index),
-                        },
-                        advertised: here.as_ref().map(|_| Endpoint {
-                            host: Host::make("10.0.0.1"),
-                            port: advertised_port(index),
-                        }),
+                        direct: Endpoint::from(direct_uri(index)?),
+                        advertised: here
+                            .as_ref()
+                            .map(|_| advertised_uri(index).map(Endpoint::from))
+                            .transpose()?,
                         network: here.clone(),
                         hostname: Host::make("test"),
                     },
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<_, InvalidUri>>()?;
         Ok((
             Self {
                 fleet: Arc::new(DestinationFleet::new(config)?),
@@ -218,15 +206,21 @@ impl TestRouter {
     }
 
     /// Sets what the destination for `index` answers on its direct endpoint.
-    pub(crate) fn script(&self, index: u8, script: Script) {
-        self.transport.script(port(index), script);
+    pub(crate) fn script(&self, index: u8, script: Script) -> Result<(), TestRouterError> {
+        self.transport.script(direct_uri(index)?, script);
+        Ok(())
     }
 
     /// Sets what the destination for `index` answers on its advertised
     /// endpoint. Scripting both is what makes a route whose every candidate
     /// fails reachable.
-    pub(crate) fn script_advertised(&self, index: u8, script: Script) {
-        self.transport.script(advertised_port(index), script);
+    pub(crate) fn script_advertised(
+        &self,
+        index: u8,
+        script: Script,
+    ) -> Result<(), TestRouterError> {
+        self.transport.script(advertised_uri(index)?, script);
+        Ok(())
     }
 }
 
@@ -274,14 +268,14 @@ impl ResponseSender for LoopbackSender {
         frame: &F,
         _deadline: Instant,
     ) -> impl Future<Output = Result<(), SendFailure>> + Send {
-        let port = address.port;
+        let uri = address.uri().clone();
         let mut bytes = BytesMut::with_capacity(frame.bytes());
         frame.write(&mut bytes);
-        let answer = self.answer(port);
+        let answer = self.answer(&uri);
         // The attempt is recorded before it is answered, so a held attempt is
         // observable while it is still held. A closed stream means the test
         // already ended, and the record is simply lost.
-        drop(self.deliveries.send(Delivery { port, bytes }));
+        drop(self.deliveries.send(Delivery { uri, bytes }));
         async move {
             match answer {
                 Answer::Accepted => Ok(()),
@@ -314,17 +308,14 @@ pub(crate) fn node(index: u8) -> NodeId {
     NodeId::from_bytes([index; 16])
 }
 
-/// The port that belongs to `index`.
-pub(crate) fn port(index: u8) -> u16 {
-    PORT_BASE + u16::from(index)
+/// The direct URI that belongs to `index`.
+pub(crate) fn direct_uri(index: u8) -> Result<Uri, InvalidUri> {
+    format!("http://direct-{index}.test").parse()
 }
 
-/// Returns the advertised port for `index`.
-///
-/// This range cannot overlap direct ports. Scripts use ports as keys, so tests
-/// identify which endpoint received an attempt.
-pub(crate) fn advertised_port(index: u8) -> u16 {
-    ADVERTISED_PORT_BASE + u16::from(index)
+/// The advertised URI that belongs to `index`.
+pub(crate) fn advertised_uri(index: u8) -> Result<Uri, InvalidUri> {
+    format!("http://advertised-{index}.test").parse()
 }
 
 /// Builds a current-thread runtime with paused time and the whole driver set.
@@ -356,4 +347,15 @@ pub(crate) async fn collect_deliveries(
 /// Builds the response delivery configuration.
 pub(crate) fn config() -> FleetConfiguration {
     FleetConfiguration::default()
+}
+
+/// What can stop shared router test scaffolding from starting.
+#[derive(Debug, Error)]
+pub(crate) enum TestRouterError {
+    /// The fleet configuration is invalid.
+    #[error(transparent)]
+    Fleet(#[from] FleetConfigurationError),
+    /// A test endpoint is not a valid Tonic endpoint.
+    #[error(transparent)]
+    Endpoint(#[from] InvalidUri),
 }

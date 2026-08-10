@@ -2,7 +2,7 @@
 
 use super::{BUDGET, Process, THIS, frame};
 use crate::response::frame::decode::decode_frame;
-use crate::router::loopback::{config, node, paused, port};
+use crate::router::loopback::{config, direct_uri, node, paused};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use quickcheck::{Arbitrary, Gen, TestResult};
@@ -83,10 +83,11 @@ async fn play(routed: &Routed) -> Result<()> {
         );
     }
     if let Some(mut sent) = recorded {
-        if sent.port != port(routed.target) {
+        let expected = direct_uri(routed.target)?;
+        if sent.uri != expected {
             bail!(
-                "the frame went to port {}, not to the port node {} published",
-                sent.port,
+                "the frame went to {}, not to the URI node {} published",
+                sent.uri,
                 routed.target
             );
         }

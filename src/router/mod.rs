@@ -86,7 +86,7 @@ pub enum Preference {
 ///
 /// Never more than two, and the second exists only where a failed first attempt
 /// has somewhere else to go. [`choose_route`] is the only way to build one.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Route {
     first: (Preference, Endpoint),
     second: Option<(Preference, Endpoint)>,
@@ -345,7 +345,6 @@ impl SendFailure {
     pub(crate) const fn is_wrong_endpoint(self) -> bool {
         match self {
             Self::Unreachable
-            | Self::Undialable
             | Self::Expired
             | Self::Status(Code::Unavailable | Code::Unimplemented | Code::Cancelled) => true,
             Self::Status(_) => false,
@@ -453,11 +452,6 @@ pub(crate) enum SendFailure {
     /// this process, or it may be in flight.
     #[error("nothing answered before the send gave up")]
     Unreachable,
-
-    /// The address the destination published is not one this transport can
-    /// dial, so nothing left this process.
-    #[error("destination published an address that cannot be dialed")]
-    Undialable,
 
     /// The deadline elapsed before the frame left this process, so nothing
     /// reached the destination and the destination said nothing.

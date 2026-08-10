@@ -9,7 +9,7 @@ use crate::router::fleet::{Destination, DestinationFleet};
 use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
-use crate::router::{Host, NetworkRouter, NodeId, RelayHop, Route, choose_route};
+use crate::router::{NetworkRouter, NodeId, RelayHop, Route, choose_route};
 use color_eyre::Result;
 use std::convert::Infallible;
 use std::future::Future;
@@ -17,6 +17,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::oneshot::{Sender, channel};
 use tokio::task::{JoinError, JoinHandle};
+use tonic::transport::Error as TransportError;
 
 /// A served peer listener and the handles that stop it.
 ///
@@ -133,9 +134,6 @@ pub(crate) async fn bind() -> Result<BoundListener> {
 }
 
 /// Where a bound listener is, as a peer on this machine dials it.
-pub(crate) fn endpoint(bound: &BoundListener) -> Endpoint {
-    Endpoint {
-        host: Host::make("127.0.0.1"),
-        port: bound.address().port(),
-    }
+pub(crate) fn endpoint(bound: &BoundListener) -> Result<Endpoint, TransportError> {
+    Endpoint::from_shared(format!("http://{}", bound.address()))
 }

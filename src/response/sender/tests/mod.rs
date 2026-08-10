@@ -11,7 +11,7 @@ use crate::response::sender::DropReason;
 use crate::response::{RequestId, ResponseStatus};
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{
-    Delivery, Drained, Script, TestRouter, collect_deliveries, config, node, paused, port,
+    Delivery, Drained, Script, TestRouter, collect_deliveries, config, direct_uri, node, paused,
 };
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
+use tonic::codegen::http::Uri;
 
 mod delivery;
 mod fallback;
@@ -114,14 +115,14 @@ impl Harness {
     }
 
     /// Sets what the destination for `index` answers on its direct endpoint.
-    pub(super) fn script(&self, index: u8, script: Script) {
-        self.router.script(index, script);
+    pub(super) fn script(&self, index: u8, script: Script) -> Result<()> {
+        Ok(self.router.script(index, script)?)
     }
 
     /// Sets what the destination for `index` answers on its advertised
     /// endpoint.
-    pub(super) fn script_advertised(&self, index: u8, script: Script) {
-        self.router.script_advertised(index, script);
+    pub(super) fn script_advertised(&self, index: u8, script: Script) -> Result<()> {
+        Ok(self.router.script_advertised(index, script)?)
     }
 
     /// Sends one response for `index`.
@@ -194,16 +195,15 @@ pub(super) async fn next_delivery(
 
 /// How many of `deliveries` went to the direct endpoint of the node for
 /// `index`.
-pub(super) fn attempts(deliveries: &[Delivery], index: u8) -> usize {
-    attempts_on(deliveries, port(index))
+pub(super) fn attempts(deliveries: &[Delivery], index: u8) -> Result<usize> {
+    Ok(attempts_on(deliveries, &direct_uri(index)?))
 }
 
-/// How many of `deliveries` reached one exact endpoint port. A node's two
-/// endpoints have distinct ports, so this is what tells them apart.
-pub(super) fn attempts_on(deliveries: &[Delivery], port: u16) -> usize {
+/// How many of `deliveries` reached one exact endpoint.
+pub(super) fn attempts_on(deliveries: &[Delivery], uri: &Uri) -> usize {
     deliveries
         .iter()
-        .filter(|delivery| delivery.port == port)
+        .filter(|delivery| delivery.uri == *uri)
         .count()
 }
 

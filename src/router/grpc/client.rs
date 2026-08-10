@@ -14,8 +14,8 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::time::Instant;
 use tonic::client::Grpc;
-use tonic::codegen::http::uri::PathAndQuery;
-use tonic::transport::{Channel, Endpoint as Dialled};
+use tonic::codegen::http::{Uri, uri::PathAndQuery};
+use tonic::transport::Channel;
 use tonic::{Code, Request};
 use tracing::{Span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -33,7 +33,7 @@ pub(super) static DELIVER_RESPONSE: LazyLock<PathAndQuery> =
     LazyLock::new(|| PathAndQuery::from_static("/prosody.peer.v1.Peer/DeliverResponse"));
 
 /// One channel per live destination, keyed by the address a node published.
-type Channels = Cache<Endpoint, Channel, UnitWeighter, RandomState>;
+type Channels = Cache<Uri, Channel, UnitWeighter, RandomState>;
 
 /// The production [`ResponseSender`]: it dials the address a node published and
 /// delivers one frame per call.
@@ -73,19 +73,14 @@ impl GrpcSender {
     /// The channel for `address`, dialling one on a miss.
     ///
     /// The connect is lazy, so a dead peer surfaces as the call's own status.
-    /// The address is parsed here, though, so an address no URI can hold fails
-    /// here — and fails the same way every time, which is why it is not
-    /// [`SendFailure::Unreachable`]. Only a miss builds the URI, so a hit
-    /// allocates nothing.
+    /// Tonic parsed the address before it entered the directory. A cache hit
+    /// allocates nothing. A miss clones Tonic's endpoint configuration.
     async fn channel(&self, address: &Endpoint) -> Result<Channel, SendFailure> {
-        match self.channels.get_value_or_guard_async(address).await {
+        let uri = address.uri().clone();
+        match self.channels.get_value_or_guard_async(&uri).await {
             Ok(channel) => Ok(channel),
             Err(guard) => {
-                let Ok(dialled) = Dialled::from_shared(peer_uri(address)) else {
-                    warn!(host = %address.host, port = address.port, "a published address is not dialable");
-                    return Err(SendFailure::Undialable);
-                };
-                let channel = dialled.connect_lazy();
+                let channel = address.connect_lazy();
                 drop(guard.insert(channel.clone()));
                 Ok(channel)
             }
@@ -111,7 +106,7 @@ impl ResponseSender for GrpcSender {
         );
         let mut client = Grpc::new(channel);
         if let Err(error) = client.ready().await {
-            warn!(%error, host = %address.host, port = address.port, "a peer channel never became ready");
+            warn!(%error, uri = %address.uri(), "a peer channel never became ready");
             return Err(SendFailure::Unreachable);
         }
         // The outbound timeout is written here rather than earlier, because
@@ -144,19 +139,5 @@ pub(super) fn outbound_timeout(deadline: Instant) -> Result<Duration, SendFailur
         Err(SendFailure::Status(Code::InvalidArgument))
     } else {
         Ok(remaining)
-    }
-}
-
-/// The URI one endpoint is dialled with.
-///
-/// An IPv6 literal must be bracketed. Without the brackets the authority
-/// carries more than one colon, no URI parser accepts it, and every response to
-/// that node is reported unreachable.
-pub(super) fn peer_uri(address: &Endpoint) -> String {
-    let host = address.host.as_str();
-    if host.contains(':') {
-        format!("http://[{host}]:{}", address.port)
-    } else {
-        format!("http://{host}:{}", address.port)
     }
 }

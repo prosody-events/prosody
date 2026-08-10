@@ -57,9 +57,6 @@ where
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_builder,
-        peer: PeerConfiguration::builder()
-            .advertised_host("127.0.0.1")
-            .build()?,
         ..ConsumerBuilders::new()?
     };
     Ok(TEST_RUNTIME.block_on(MemoryHighLevelClient::<T>::new(
@@ -88,9 +85,6 @@ where
         consumer,
         keyed_state: KeyedStateConfiguration::builder()
             .subsystem(Some(subsystem("echo")?))
-            .build()?,
-        peer: PeerConfiguration::builder()
-            .advertised_host("127.0.0.1")
             .build()?,
         ..ConsumerBuilders::new()?
     };

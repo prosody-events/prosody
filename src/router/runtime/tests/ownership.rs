@@ -108,8 +108,7 @@ async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
             .direct(shared.node)
             .await
             .map_err(|error| eyre!("{error}"))?
-            .as_ref()
-            == Some(&shared.listener),
+            .is_some_and(|endpoint| endpoint.uri() == shared.listener.uri()),
         "the runtime's router must resolve this process's own listener"
     );
     let subsystem = SubsystemName::try_new(ALPHA)?;

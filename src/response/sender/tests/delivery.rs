@@ -1,9 +1,10 @@
 //! What happens to a response between its hook and the wire.
 
-use super::{Harness, PAYLOAD, config, node, paused, port};
+use super::{Harness, PAYLOAD, config, node, paused};
 use crate::Codec;
 use crate::response::frame::decode::decode_frame;
 use crate::response::frame::tests::CountingCodec;
+use crate::router::loopback::direct_uri;
 use color_eyre::Result;
 
 /// The destination these suites address.
@@ -23,8 +24,8 @@ fn a_response_reaches_the_wire_intact() -> Result<()> {
             .pop()
             .ok_or_else(|| color_eyre::eyre::eyre!("the response made no delivery attempt"))?;
         assert_eq!(
-            delivery.port,
-            port(TARGET),
+            delivery.uri,
+            direct_uri(TARGET)?,
             "the response must reach its target node"
         );
 

@@ -94,7 +94,7 @@ fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
         drained.dropped
     );
     ensure!(
-        attempts(&drained.deliveries, UNPUBLISHED_NODE) == 0,
+        attempts(&drained.deliveries, UNPUBLISHED_NODE)? == 0,
         "an unpublished node must reach no address"
     );
     ensure!(
@@ -145,9 +145,9 @@ fn a_fallback_counts_the_transition_and_only_when_the_next_candidate_answers() -
     let metrics = GlobalMetrics::install();
     let drained = paused()?.block_on(async {
         let harness = Harness::dual_homed(config())?;
-        harness.script(FALLS_BACK, never_answers());
-        harness.script(SILENT, never_answers());
-        harness.script_advertised(SILENT, never_answers());
+        harness.script(FALLS_BACK, never_answers())?;
+        harness.script(SILENT, never_answers())?;
+        harness.script_advertised(SILENT, never_answers())?;
         harness.send(FALLS_BACK).await?;
         harness.send(FALLS_BACK).await?;
         harness.send(SILENT).await?;

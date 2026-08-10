@@ -1,36 +1,12 @@
 //! gRPC client address and method construction.
 
-use crate::router::Host;
 use crate::router::SendFailure;
-use crate::router::directory::Endpoint;
-use crate::router::grpc::client::{
-    DELIVER_RESPONSE, GRPC_TIMEOUT_LIMIT, outbound_timeout, peer_uri,
-};
+use crate::router::grpc::client::{DELIVER_RESPONSE, GRPC_TIMEOUT_LIMIT, outbound_timeout};
 use crate::router::grpc::generated::peer_server::SERVICE_NAME;
 use color_eyre::Result;
-use color_eyre::eyre::{ensure, eyre};
+use color_eyre::eyre::ensure;
 use std::time::Duration;
 use tokio::time::Instant;
-use tonic::transport::Endpoint as Dialled;
-
-/// Every host a node can publish makes a URI the dialer parses.
-///
-/// An IPv6 literal is the case that needs the brackets: unbracketed, its own
-/// colons split the authority, nothing parses it, and every response to that
-/// node is reported unreachable. A routed probe on an IPv6 host publishes
-/// exactly such a literal.
-#[test]
-fn every_published_host_makes_a_dialable_uri() -> Result<()> {
-    for host in ["127.0.0.1", "fd00::5", "::1", "peer.example"] {
-        let uri = peer_uri(&Endpoint {
-            host: Host::make(host),
-            port: 8080,
-        });
-        Dialled::from_shared(uri.clone())
-            .map_err(|error| eyre!("{host} produced {uri}, which does not parse: {error}"))?;
-    }
-    Ok(())
-}
 
 /// The path the client calls names the generated service, so a renamed proto
 /// cannot leave the client misrouting quietly.

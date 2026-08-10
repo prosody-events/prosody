@@ -46,7 +46,7 @@ use serde_json::Value;
 use std::array::from_fn;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -71,8 +71,14 @@ type EventLog = Arc<Mutex<Vec<Event>>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Event {
-    Registered { port: u16, port_held: bool },
-    RegisterFailed { port: u16, port_held: bool },
+    Registered {
+        address: SocketAddr,
+        address_held: bool,
+    },
+    RegisterFailed {
+        address: SocketAddr,
+        address_held: bool,
+    },
     Deregistered,
     ProviderDropped,
     ManagerSwept,
@@ -130,12 +136,25 @@ impl NodeDirectory for RecordingDirectory {
             Ok(()) => {}
             Err(error) => match error {},
         }
-        let port = registration.direct.port;
-        let port_held = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err();
+        let address = registration
+            .direct
+            .uri()
+            .authority()
+            .ok_or(RecordingError)?
+            .as_str()
+            .parse()
+            .map_err(|_| RecordingError)?;
+        let address_held = TcpListener::bind(address).is_err();
         let event = if self.fail_register {
-            Event::RegisterFailed { port, port_held }
+            Event::RegisterFailed {
+                address,
+                address_held,
+            }
         } else {
-            Event::Registered { port, port_held }
+            Event::Registered {
+                address,
+                address_held,
+            }
         };
         self.log.lock().push(event);
         if self.fail_register {

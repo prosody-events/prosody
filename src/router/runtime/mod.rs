@@ -164,7 +164,8 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
                 return Err(PeerRuntimeError::Discovery(error));
             }
         };
-        let registration = registration(NodeId::new(), &inputs.listener, discovered, inputs.router);
+        let registration =
+            registration(NodeId::new(), &inputs.listener, discovered, inputs.router)?;
         let addresses = AddressResolver::new(inputs.fleet.peer_capacity, directory.clone());
         let local = LocalTarget::new(registration.node, Arc::clone(&pending));
         let network = NetworkRoute::new(

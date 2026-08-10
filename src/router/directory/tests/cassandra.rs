@@ -74,7 +74,7 @@ fn registration_cells_carry_a_ttl_and_expire() -> Result<()> {
         let leases = session
             .query_unpaged(
                 format!(
-                    "SELECT TTL(direct_host), TTL(hostname), TTL(network) FROM \
+                    "SELECT TTL(direct_connect), TTL(hostname), TTL(network) FROM \
                      {TEST_KEYSPACE}.{TABLE_NODE_DIRECTORY} WHERE node_id = ?"
                 ),
                 (Uuid::from(node),),
@@ -119,21 +119,17 @@ fn unusable_row_reads_as_absent() -> Result<()> {
         let directory = cassandra_directory(STABLE_LEASE).await?;
         let store = store().await?;
         let query = format!(
-            "INSERT INTO {TEST_KEYSPACE}.{TABLE_NODE_DIRECTORY} (node_id, direct_host, \
-             direct_port, hostname) VALUES (?, ?, ?, ?) USING TTL 300"
+            "INSERT INTO {TEST_KEYSPACE}.{TABLE_NODE_DIRECTORY} (node_id, direct_connect, \
+             hostname) VALUES (?, ?, ?) USING TTL 300"
         );
-        for (host, port, reason) in [
-            (None, None, "has no direct endpoint"),
-            (Some("localhost"), Some(0_i32), "uses port zero"),
-            (Some(""), Some(1_i32), "has an empty host"),
+        for (connect, reason) in [
+            (None, "has no direct endpoint"),
+            (Some("http://[invalid"), "has an invalid connect string"),
         ] {
             let node = NodeId::new();
             store
                 .session()
-                .query_unpaged(
-                    query.as_str(),
-                    (Uuid::from(node), host, port, "invalid-row"),
-                )
+                .query_unpaged(query.as_str(), (Uuid::from(node), connect, "invalid-row"))
                 .await?;
             assert!(
                 directory.read(node).await?.is_none(),

@@ -42,7 +42,9 @@ fn the_hook_applies_network_backpressure() -> Result<()> {
     paused()?.block_on(async {
         let mut fixture = Fixture::<ResultProbeCodec>::new()?;
         let barrier = Arc::new(Semaphore::new(0));
-        fixture.router.script(1, Script::Hold(Arc::clone(&barrier)));
+        fixture
+            .router
+            .script(1, Script::Hold(Arc::clone(&barrier)))?;
 
         let leaf = ScriptedHandler::success();
         let handler = fixture.stack(leaf.clone(), 0)?;

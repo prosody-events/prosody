@@ -47,12 +47,7 @@ const SHAPES: usize = 2;
 /// two backends' clocks cannot disagree.
 pub(crate) const STABLE_LEASE: Duration = Duration::from_mins(10);
 
-const LABELS: [Label; 4] = [
-    Label::DirectHost,
-    Label::AdvertisedHost,
-    Label::Network,
-    Label::Hostname,
-];
+const LABELS: [Label; 2] = [Label::Network, Label::Hostname];
 
 /// One operation against a generated registration pool. The first index names
 /// a pooled node; `Register`'s second names which of that node's shapes it
@@ -75,8 +70,6 @@ pub(crate) struct DirectoryTrace {
 /// One label that the directory bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Label {
-    DirectHost,
-    AdvertisedHost,
     Network,
     Hostname,
 }
@@ -194,7 +187,7 @@ pub(crate) fn first_divergence(
 ) -> Option<String> {
     let length = left.len().max(right.len());
     for index in 0..length {
-        if left.get(index) == right.get(index) {
+        if same_answer(left.get(index), right.get(index)) {
             continue;
         }
         let position = if index < trace.ops.len() {
@@ -227,16 +220,10 @@ pub(crate) async fn run_label_bound_case<D: NodeDirectory>(directory: &D) -> Res
         .await?
         .ok_or_else(|| eyre!("a registration at the bound must resolve"))?;
     ensure!(
-        read == bounded,
+        same_registration(&read, &bounded),
         "a registration at the bound did not survive the round trip"
     );
-    let inline = read.direct.host.is_fixed()
-        && read.hostname.is_fixed()
-        && read.network.as_ref().is_some_and(Flexstr::is_fixed)
-        && read
-            .advertised
-            .as_ref()
-            .is_some_and(|entry| entry.host.is_fixed());
+    let inline = read.hostname.is_fixed() && read.network.as_ref().is_some_and(Flexstr::is_fixed);
     ensure!(
         inline,
         "a resolved registration must hold no label on the heap"
@@ -287,15 +274,29 @@ fn labelled(node: NodeId, over: Option<Label>) -> NodeRegistration {
     let text = |label: Label| "n".repeat(MAX_LABEL_BYTES + usize::from(over == Some(label)));
     NodeRegistration {
         node,
-        direct: Endpoint {
-            host: Host::make(&text(Label::DirectHost)),
-            port: 7777,
-        },
-        advertised: Some(Endpoint {
-            host: Host::make(&text(Label::AdvertisedHost)),
-            port: 443,
-        }),
+        direct: Endpoint::from_static("http://direct.test"),
+        advertised: Some(Endpoint::from_static("http://advertised.test")),
         network: Some(NetworkId::make(&text(Label::Network))),
         hostname: Host::make(&text(Label::Hostname)),
     }
+}
+
+fn same_answer(
+    left: Option<&Option<NodeRegistration>>,
+    right: Option<&Option<NodeRegistration>>,
+) -> bool {
+    match (left, right) {
+        (Some(Some(left)), Some(Some(right))) => same_registration(left, right),
+        (Some(None), Some(None)) | (None, None) => true,
+        _ => false,
+    }
+}
+
+pub(crate) fn same_registration(left: &NodeRegistration, right: &NodeRegistration) -> bool {
+    left.node == right.node
+        && left.direct.uri() == right.direct.uri()
+        && left.advertised.as_ref().map(Endpoint::uri)
+            == right.advertised.as_ref().map(Endpoint::uri)
+        && left.network == right.network
+        && left.hostname == right.hostname
 }

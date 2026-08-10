@@ -143,8 +143,8 @@ impl Pair {
     pub(super) async fn start(route: TargetRoute) -> Result<Self> {
         let relay_bound = bind().await?;
         let target_bound = bind().await?;
-        let relay_address = endpoint(&relay_bound);
-        let target_address = endpoint(&target_bound);
+        let relay_address = endpoint(&relay_bound)?;
+        let target_address = endpoint(&target_bound)?;
         let relay = Live::serve(relay_bound, Some(target_address))?;
         let seen = match route {
             TargetRoute::Relay => Some(relay_address),
@@ -171,7 +171,7 @@ impl Live {
     /// Serves `bound`, sending every frame it does not own on to `seen`.
     fn serve(bound: BoundListener, seen: Option<Endpoint>) -> Result<Self> {
         let node = NodeId::new();
-        let address = endpoint(&bound);
+        let address = endpoint(&bound)?;
         let registry = PendingRegistry::new();
         let router = FixedRouter::new(FleetConfiguration::default(), seen.map(registration), None)?;
         let served = Served::start(

@@ -8,6 +8,7 @@ use derive_builder::Builder;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use thiserror::Error;
+use tonic::transport::Endpoint;
 use validator::{Validate, ValidationError, ValidationErrors};
 
 /// How this process joins the peer fleet: what its listener binds, what it
@@ -25,12 +26,9 @@ pub struct PeerConfiguration {
     #[builder(default = "from_env_with_fallback(\"PROSODY_PEER_BIND_ADDRESS\", \
                          PeerConfiguration::default().bind_address)?")]
     pub bind_address: SocketAddr,
-    /// The host that peers on another network use.
-    #[builder(default = "from_option_env(\"PROSODY_PEER_ADVERTISED_HOST\")?")]
-    pub advertised_host: Option<String>,
-    /// The advertised port, or the listener port when absent.
-    #[builder(default = "from_option_env(\"PROSODY_PEER_ADVERTISED_PORT\")?")]
-    pub advertised_port: Option<u16>,
+    /// The Tonic connect string that peers on another network use.
+    #[builder(default = "from_option_env(\"PROSODY_PEER_ADVERTISED_CONNECT\")?")]
+    pub advertised_connect: Option<Endpoint>,
     /// The network label for direct routes.
     #[builder(default = "from_option_env(\"PROSODY_PEER_NETWORK_NAME\")?")]
     pub network_name: Option<String>,
@@ -56,13 +54,11 @@ pub(crate) struct PeerParts {
 
 impl Default for PeerConfiguration {
     fn default() -> Self {
-        let router = RouterConfiguration::default();
         let fleet = FleetConfiguration::default();
         Self {
             bind_address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            advertised_host: router.advertised_host,
-            advertised_port: router.advertised_port,
-            network_name: router.network,
+            advertised_connect: None,
+            network_name: None,
             peer_cache_capacity: fleet.peer_capacity,
             registration_ttl: RegistrationTtl::DEFAULT.duration(),
         }
@@ -91,8 +87,7 @@ impl PeerConfiguration {
         Ok(PeerParts {
             bind: self.bind_address,
             router: RouterConfiguration {
-                advertised_host: self.advertised_host.clone(),
-                advertised_port: self.advertised_port,
+                advertised: self.advertised_connect.clone(),
                 network: self.network_name.clone(),
             },
             fleet: FleetConfiguration {

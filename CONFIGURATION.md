@@ -48,9 +48,8 @@ An explicit builder value replaces its environment value.
 
 | Environment variable | Default | Why it is needed | What it controls | Validation |
 |---|---:|---|---|---|
-| `PROSODY_PEER_BIND_ADDRESS` | `0.0.0.0:0` | The peer server needs a local listener. | The IP address and port that the peer server binds. Port zero selects a free port. | Must be a socket address. |
-| `PROSODY_PEER_ADVERTISED_HOST` | unset | Peers on another network need an entry point. | The host that remote networks use instead of the direct host. | 1 through 63 bytes when set. |
-| `PROSODY_PEER_ADVERTISED_PORT` | listener port | An entry point can forward to a different port. | The port published with the advertised host. | 1 through 65535. Requires an advertised host. |
+| `PROSODY_PEER_BIND_ADDRESS` | `0.0.0.0:0` | The peer server needs a local listener. | The socket address that the peer server binds. | Must be a socket address. |
+| `PROSODY_PEER_ADVERTISED_CONNECT` | unset | Peers on another network need an entry point. | The Tonic endpoint that remote peers use. | Must be a Tonic endpoint URI. |
 | `PROSODY_PEER_NETWORK_NAME` | unset | A shared label lets peers prefer direct routes. | The network group used to choose direct or advertised routes. | 1 through 63 bytes when set. |
 | `PROSODY_PEER_CACHE_CAPACITY` | 256 | Node-keyed caches need a fixed memory bound. | The entry count for address, channel, and route-preference caches. | Must be greater than zero. |
 | `PROSODY_PEER_REGISTRATION_TTL` | 30s | A lease removes dead nodes without a cleanup task. | The Cassandra TTL and refresh pace for this node registration. | 5s through 1h. |

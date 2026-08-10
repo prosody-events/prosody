@@ -155,16 +155,19 @@ async fn failed_activation_rolls_back_and_releases_the_listener() -> Result<()> 
     );
 
     let events = log.lock();
-    let (port, held) = events
+    let (address, held) = events
         .iter()
         .find_map(|event| match event {
-            Event::RegisterFailed { port, port_held } => Some((*port, *port_held)),
+            Event::RegisterFailed {
+                address,
+                address_held,
+            } => Some((*address, *address_held)),
             _ => None,
         })
         .ok_or_else(|| eyre!("the directory did not record the failed registration"))?;
     assert!(
         held,
-        "the peer listener did not hold its port during registration"
+        "the peer listener did not hold its address during registration"
     );
     assert!(
         matches!(
@@ -175,7 +178,7 @@ async fn failed_activation_rolls_back_and_releases_the_listener() -> Result<()> 
     );
     drop(events);
     assert_eq!(directory.inner.len(), 0);
-    let rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+    let rebound = TcpListener::bind(address)?;
     drop(rebound);
     Ok(())
 }
