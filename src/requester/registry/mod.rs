@@ -69,7 +69,9 @@ impl PendingRegistry {
         subsystems: &[SubsystemName],
         deadline: RequestDeadline,
     ) -> Result<Registration, RequestError<E>> {
-        Self::validate_request(subsystems)?;
+        if subsystems.is_empty() {
+            return Err(RequestError::NoSubsystems);
+        }
         if self.closed.load(Acquire) {
             return Err(RequestError::ShuttingDown);
         }
@@ -82,6 +84,10 @@ impl PendingRegistry {
                 let (sender, receiver) = oneshot::channel();
                 let key = (id, name.clone());
                 if self.waiters.insert_sync(key.clone(), sender).is_err() {
+                    if keys.iter().any(|(_, present)| present == name) {
+                        self.remove(&keys);
+                        return Err(RequestError::DuplicateSubsystem { name: name.clone() });
+                    }
                     collision = true;
                     break;
                 }
@@ -132,22 +138,6 @@ impl PendingRegistry {
 
     pub(in crate::requester) fn is_closed(&self) -> bool {
         self.closed.load(Acquire)
-    }
-
-    fn validate_request<E: Error>(subsystems: &[SubsystemName]) -> Result<(), RequestError<E>> {
-        if subsystems.is_empty() {
-            return Err(RequestError::NoSubsystems);
-        }
-        for i in 0..subsystems.len() {
-            for j in (i + 1)..subsystems.len() {
-                if subsystems[i] == subsystems[j] {
-                    return Err(RequestError::DuplicateSubsystem {
-                        name: subsystems[i].clone(),
-                    });
-                }
-            }
-        }
-        Ok(())
     }
 
     fn remove(&self, keys: &[WaiterKey]) {

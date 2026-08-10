@@ -24,16 +24,9 @@ const CAPACITY: usize = 8;
 /// stream can push the cache past its bound.
 const POOL: usize = 12;
 
-/// What the test directory holds: the whole pool, so no answer
-/// here can be given by an eviction inside the directory rather than by the
-/// cache.
-///
-/// `match`, not `NonZeroUsize::new(..).unwrap_or(..)`: `Option::unwrap_or` is
-/// not const, and the tests forbid `unwrap`.
-const POOL_CAPACITY: NonZeroUsize = match NonZeroUsize::new(POOL) {
-    Some(capacity) => capacity,
-    None => NonZeroUsize::MIN,
-};
+/// What the test directory holds: the whole pool, so its eviction cannot
+/// produce a cache answer.
+const POOL_CAPACITY: NonZeroUsize = NonZeroUsize::MIN.saturating_add(POOL - 1);
 
 /// The head of every request stream. Nine distinct ids exceed [`CAPACITY`], so
 /// the occupancy bound is exercised on every iteration.

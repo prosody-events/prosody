@@ -23,13 +23,7 @@ const MAX_POOL: usize = 4;
 
 /// What the suite's memory directory holds. Above [`MAX_POOL`], so the whole
 /// pool stays resident and both backends answer from a full map.
-///
-/// `match`, not `NonZeroUsize::new(..).unwrap_or(..)`: `Option::unwrap_or` is
-/// not const, and the tests forbid `unwrap`.
-pub(crate) const SUITE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(8) {
-    Some(capacity) => capacity,
-    None => NonZeroUsize::MIN,
-};
+pub(crate) const SUITE_CAPACITY: NonZeroUsize = NonZeroUsize::MIN.saturating_add(7);
 
 const _: () = assert!(SUITE_CAPACITY.get() > MAX_POOL);
 

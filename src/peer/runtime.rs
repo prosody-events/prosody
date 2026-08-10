@@ -114,7 +114,7 @@ impl<R: LocalRoute> PeerRouter<R> {
 
     pub(crate) async fn shutdown_runtime(self) -> Result<(), ShutdownError> {
         self.producer.local.pending().close_admission();
-        let _closed = self.stop.send(());
+        let _ = self.stop.send(());
         self.coordinator.await.map_err(|error| {
             error!(%error, "peer coordinator did not stop cleanly");
             ShutdownError::Teardown

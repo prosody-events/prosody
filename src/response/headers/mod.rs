@@ -152,10 +152,15 @@ impl RequestDeadline {
     /// Creates a wire deadline from a requester timeout.
     pub(crate) fn after(timeout: Duration) -> Option<Self> {
         let now = Instant::now();
-        let wall = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+        let Ok(wall) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return None;
+        };
         let micros = wall.as_micros().checked_add(timeout.as_micros())?;
+        let Ok(unix_micros) = u64::try_from(micros) else {
+            return None;
+        };
         Some(Self {
-            unix_micros: u64::try_from(micros).ok()?,
+            unix_micros,
             expires_at: now.checked_add(timeout)?,
         })
     }

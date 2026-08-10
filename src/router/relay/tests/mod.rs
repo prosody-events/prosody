@@ -131,7 +131,10 @@ impl Process {
     /// has already returned, so an empty channel means no attempt was made
     /// rather than that one is still coming.
     pub(super) fn recorded(&mut self) -> Option<Delivery> {
-        self.deliveries.try_recv().ok()
+        let Ok(delivery) = self.deliveries.try_recv() else {
+            return None;
+        };
+        Some(delivery)
     }
 }
 

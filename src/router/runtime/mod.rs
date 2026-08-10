@@ -38,14 +38,14 @@ mod tests;
 #[cfg(test)]
 pub(in crate::router) use tests::start_runtime;
 
-/// Everything one process shares for peer traffic, under one owner.
+/// Everything one router shares for peer traffic, under one owner.
 ///
 /// The runtime holds this node's published registration, the resolver it reads
 /// peers through, the bound listener, the destination fleet, the pending
 /// request registry, and the local and network response routes. Consumers and
 /// requesters take handles from it and construct none of these themselves. It
 /// mints one [`NodeId`] and the listener answers for that same id, so one
-/// runtime has one identity. One process runs one runtime.
+/// runtime has one identity.
 ///
 /// The router names no response vocabulary except at the wire seam it owns.
 /// This type is inside that seam: the listener's service is the pending

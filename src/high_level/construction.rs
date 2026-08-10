@@ -80,7 +80,7 @@ where
     }
 
     let peer = &consumer_builders.peer;
-    let router = backend.build_router(peer).await?;
+    let router = Box::pin(backend.build_router(peer)).await?;
     let requester = router.producer().requester(producer.clone());
 
     Ok(HighLevelClient {

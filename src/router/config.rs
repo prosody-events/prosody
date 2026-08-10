@@ -26,7 +26,7 @@ pub struct PeerConfiguration {
     #[builder(default = "from_env_with_fallback(\"PROSODY_PEER_BIND_ADDRESS\", \
                          PeerConfiguration::default().bind_address)?")]
     pub bind_address: SocketAddr,
-    /// The Tonic connect string that peers on another network use.
+    /// The gRPC connect URI that peers on another network use.
     #[builder(default = "from_option_env(\"PROSODY_PEER_ADVERTISED_CONNECT\")?")]
     pub advertised_connect: Option<Endpoint>,
     /// The network label for direct routes.
@@ -56,7 +56,7 @@ impl Default for PeerConfiguration {
     fn default() -> Self {
         let fleet = FleetConfiguration::default();
         Self {
-            bind_address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            bind_address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9099)),
             advertised_connect: None,
             network_name: None,
             peer_cache_capacity: fleet.peer_capacity,

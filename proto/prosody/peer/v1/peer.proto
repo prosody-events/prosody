@@ -45,7 +45,7 @@ message DeliverResponseRequest {
   // Empty until a relay forwards the frame, then the relay's own node id. A
   // frame that already names a relay is never forwarded again. A relay always
   // sets this itself and never preserves a value it received.
-  bytes relay_node = 7; // 16 bytes, or empty
+  bytes relay_node = 6; // 16 bytes, or empty
 }
 
 // The gRPC status reports the delivery result. A response has no fields.

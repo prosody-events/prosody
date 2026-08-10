@@ -15,10 +15,10 @@ const MAX_DIGITS: usize = 8;
 /// This crate parses the header itself because tonic parses it privately and
 /// never puts the parsed value anywhere a service can read it.
 pub(super) fn inbound_deadline(metadata: &MetadataMap) -> Option<Instant> {
-    let stated = metadata
-        .get(TIMEOUT_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_timeout)?;
+    let Ok(value) = metadata.get(TIMEOUT_HEADER)?.to_str() else {
+        return None;
+    };
+    let stated = parse_timeout(value)?;
     Instant::now().checked_add(stated)
 }
 
