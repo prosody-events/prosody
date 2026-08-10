@@ -76,8 +76,7 @@ impl GrpcSender {
     /// Tonic parsed the address before it entered the directory. A cache hit
     /// allocates nothing. A miss clones Tonic's endpoint configuration.
     async fn channel(&self, address: &Endpoint) -> Result<Channel, SendFailure> {
-        let uri = address.uri().clone();
-        match self.channels.get_value_or_guard_async(&uri).await {
+        match self.channels.get_value_or_guard_async(address.uri()).await {
             Ok(channel) => Ok(channel),
             Err(guard) => {
                 let channel = address.connect_lazy();

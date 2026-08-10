@@ -41,7 +41,7 @@ pub(crate) struct Served {
 pub(crate) struct FixedRouter {
     fleet: Arc<DestinationFleet>,
     transport: Arc<GrpcSender>,
-    registration: Option<NodeRegistration>,
+    registration: Option<Arc<NodeRegistration>>,
     here: Option<NetworkId>,
 }
 
@@ -80,7 +80,7 @@ impl FixedRouter {
         Ok(Self {
             transport: Arc::new(GrpcSender::new(&fleet)),
             fleet,
-            registration,
+            registration: registration.map(Arc::new),
             here,
         })
     }
@@ -98,7 +98,7 @@ impl NetworkRouter for FixedRouter {
         let route = self
             .registration
             .as_ref()
-            .and_then(|registration| choose_route(self.here.as_ref(), registration));
+            .and_then(|registration| choose_route(self.here.as_ref(), Arc::clone(registration)));
         async move { Ok(route) }
     }
 }

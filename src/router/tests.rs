@@ -334,7 +334,7 @@ fn prop_a_route_follows_the_declared_labels(declared: Declared) -> TestResult {
         (_, false) => vec![(Preference::Direct, direct.uri().clone())],
     };
 
-    let Some(route) = choose_route(declared.labels.here().as_ref(), &published) else {
+    let Some(route) = choose_route(declared.labels.here().as_ref(), Arc::new(published)) else {
         return if expected.is_empty() {
             TestResult::passed()
         } else {

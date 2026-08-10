@@ -85,11 +85,13 @@ pub enum Preference {
 /// The endpoints one node may be dialed on, in the order the rules put them.
 ///
 /// Never more than two, and the second exists only where a failed first attempt
-/// has somewhere else to go. [`choose_route`] is the only way to build one.
+/// has somewhere else to go. Every stored preference names an endpoint in the
+/// shared registration. [`choose_route`] is the only way to build one.
 #[derive(Clone, Debug)]
 pub(crate) struct Route {
-    first: (Preference, Endpoint),
-    second: Option<(Preference, Endpoint)>,
+    registration: Arc<NodeRegistration>,
+    first: Preference,
+    second: Option<Preference>,
 }
 
 /// This process's node id and the request registry that serves it.
@@ -315,9 +317,7 @@ impl<S: ResponseSender, D: NodeDirectory> NetworkRouter for NetworkRoute<S, D> {
 
     async fn route(&self, node: NodeId) -> Result<Option<Route>, D::Error> {
         let registration = self.addresses.resolve(node).await?;
-        Ok(registration
-            .as_deref()
-            .and_then(|registration| choose_route(self.here.as_ref(), registration)))
+        Ok(registration.and_then(|registration| choose_route(self.here.as_ref(), registration)))
     }
 }
 
@@ -371,15 +371,25 @@ impl Route {
         &self,
         remembered: Option<Preference>,
     ) -> [Option<(Preference, &Endpoint)>; 2] {
-        let first = Some((self.first.0, &self.first.1));
+        let first = self.candidate(self.first);
         let second = self
             .second
-            .as_ref()
-            .map(|(preference, endpoint)| (*preference, endpoint));
+            .and_then(|preference| self.candidate(preference));
         if second.is_some_and(|(preference, _)| Some(preference) == remembered) {
             [second, first]
         } else {
             [first, second]
+        }
+    }
+
+    fn candidate(&self, preference: Preference) -> Option<(Preference, &Endpoint)> {
+        match preference {
+            Preference::Direct => Some((preference, &self.registration.direct)),
+            Preference::Advertised => self
+                .registration
+                .advertised
+                .as_ref()
+                .map(|endpoint| (preference, endpoint)),
         }
     }
 }
@@ -406,29 +416,29 @@ impl Route {
 /// `None` means "do not dial".
 pub(crate) fn choose_route(
     here: Option<&NetworkId>,
-    registration: &NodeRegistration,
+    registration: Arc<NodeRegistration>,
 ) -> Option<Route> {
+    let advertised = registration.advertised.is_some();
     match (here, registration.network.as_ref()) {
         (Some(here), Some(there)) if here == there => Some(Route {
-            first: (Preference::Direct, registration.direct.clone()),
-            second: registration
-                .advertised
-                .clone()
-                .map(|endpoint| (Preference::Advertised, endpoint)),
+            registration,
+            first: Preference::Direct,
+            second: advertised.then_some(Preference::Advertised),
         }),
-        (Some(_), Some(_)) => registration.advertised.clone().map(|endpoint| Route {
-            first: (Preference::Advertised, endpoint),
+        (Some(_), Some(_)) if advertised => Some(Route {
+            registration,
+            first: Preference::Advertised,
             second: None,
         }),
-        (None, _) | (_, None) => Some(match registration.advertised.clone() {
-            Some(endpoint) => Route {
-                first: (Preference::Advertised, endpoint),
-                second: None,
+        (Some(_), Some(_)) => None,
+        (None, _) | (_, None) => Some(Route {
+            registration,
+            first: if advertised {
+                Preference::Advertised
+            } else {
+                Preference::Direct
             },
-            None => Route {
-                first: (Preference::Direct, registration.direct.clone()),
-                second: None,
-            },
+            second: None,
         }),
     }
 }

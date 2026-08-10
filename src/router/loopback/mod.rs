@@ -93,7 +93,7 @@ pub(crate) struct LoopbackSender {
 pub(crate) struct TestRouter {
     fleet: Arc<DestinationFleet>,
     transport: Arc<LoopbackSender>,
-    registrations: Arc<HashMap<NodeId, NodeRegistration>>,
+    registrations: Arc<HashMap<NodeId, Arc<NodeRegistration>>>,
     here: Option<NetworkId>,
 }
 
@@ -181,7 +181,7 @@ impl TestRouter {
             .map(|index| {
                 Ok((
                     node(index),
-                    NodeRegistration {
+                    Arc::new(NodeRegistration {
                         node: node(index),
                         direct: Endpoint::from(direct_uri(index)?),
                         advertised: here
@@ -190,7 +190,7 @@ impl TestRouter {
                             .transpose()?,
                         network: here.clone(),
                         hostname: Host::make("test"),
-                    },
+                    }),
                 ))
             })
             .collect::<Result<_, InvalidUri>>()?;
@@ -236,7 +236,7 @@ impl NetworkRouter for TestRouter {
         let route = self
             .registrations
             .get(&node)
-            .and_then(|registration| choose_route(self.here.as_ref(), registration));
+            .and_then(|registration| choose_route(self.here.as_ref(), Arc::clone(registration)));
         async move { Ok(route) }
     }
 }
