@@ -200,6 +200,18 @@ where
     /// - `HandlerInvoked` when the handler is called
     /// - `HandlerSucceeded` when the handler completes successfully
     /// - `HandlerFailed` when the handler returns an error
+    fn on_excise<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        FallibleHandler::on_message(self, context, message, demand_type)
+    }
+
     async fn on_timer<C>(
         &self,
         context: C,

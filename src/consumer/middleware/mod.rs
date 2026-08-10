@@ -262,7 +262,7 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<LeafHandler<H>>>
     where
         Self: Sized,
-        H: ExciseHandler<Payload = P> + Clone + Send + Sync + 'static,
+        H: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
     {
         self.with_provider(FallibleCloneProvider::new(LeafHandler::new(handler)))
     }
@@ -467,7 +467,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// payloads to satisfy `EventIdentity`.
     type Payload: Send + Sync + 'static;
 
-    /// Error type returned by [`Self::on_message`] / [`Self::on_timer`].
+    /// Error type returned by the event methods.
     ///
     /// Must implement [`ClassifyError`] so the framework can decide
     /// whether to retry, give up, or shut down for each variant — see
@@ -475,7 +475,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// Use [`std::convert::Infallible`] for handlers that cannot fail.
     type Error: ClassifyError + StdError + Send;
 
-    /// Success value produced by [`Self::on_message`] / [`Self::on_timer`]
+    /// Success value produced by an event method
     /// and handed to the matching apply hook for that invocation. This is
     /// the staging handle in a 2-phase-commit workflow — a transaction
     /// token, a deferred-write handle, or whatever the handler needs to
@@ -506,6 +506,16 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// retry, which implementations can use for backpressure or
     /// observability.
     fn on_message<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    where
+        C: EventContext<Payload = Self::Payload>;
+
+    /// Handles an excise record that has a key and no payload.
+    fn on_excise<C>(
         &self,
         context: C,
         message: ConsumerMessage<Self::Payload>,
@@ -659,22 +669,6 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// `inner.shutdown().await`; otherwise the inner handler's resources
     /// leak.
     fn shutdown(self) -> impl Future<Output = ()> + Send;
-}
-
-/// Handles excise records.
-///
-/// An excise record has a key and no payload. Implement this trait to delete
-/// the key from external databases and other compacted views.
-pub trait ExciseHandler: FallibleHandler {
-    /// Handles a record whose [`ConsumerMessage::payload`] is `None`.
-    fn on_excise<C>(
-        &self,
-        context: C,
-        message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
-    where
-        C: EventContext<Payload = Self::Payload>;
 }
 
 /// A composition of two middleware components.

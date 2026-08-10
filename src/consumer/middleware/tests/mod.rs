@@ -106,6 +106,18 @@ impl FallibleHandler for ProbeHandler {
     type Output = u64;
     type Payload = serde_json::Value;
 
+    async fn on_excise<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        FallibleHandler::on_message(self, context, message, demand_type).await
+    }
+
     async fn on_message<C>(
         &self,
         _context: C,
@@ -342,6 +354,18 @@ where
         C: EventContext<Payload = Self::Payload>,
     {
         self.inner.on_message(context, message, demand_type).await
+    }
+
+    async fn on_excise<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.inner.on_excise(context, message, demand_type).await
     }
 
     async fn on_timer<C>(
@@ -660,6 +684,18 @@ mod staged_rollback {
         type Error = TestError;
         type Output = u64;
         type Payload = serde_json::Value;
+
+        async fn on_excise<C>(
+            &self,
+            context: C,
+            message: ConsumerMessage<Self::Payload>,
+            demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            FallibleHandler::on_message(self, context, message, demand_type).await
+        }
 
         async fn on_message<C>(
             &self,
@@ -987,6 +1023,18 @@ mod hook_visibility {
         type Error = TestError;
         type Output = u64;
         type Payload = serde_json::Value;
+
+        async fn on_excise<C>(
+            &self,
+            context: C,
+            message: ConsumerMessage<Self::Payload>,
+            demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            FallibleHandler::on_message(self, context, message, demand_type).await
+        }
 
         async fn on_message<C>(
             &self,
@@ -2294,6 +2342,18 @@ mod settled_view {
         type Error = TestError;
         type Output = u64;
         type Payload = Value;
+
+        async fn on_excise<C>(
+            &self,
+            context: C,
+            message: ConsumerMessage<Self::Payload>,
+            demand_type: DemandType,
+        ) -> Result<Self::Output, Self::Error>
+        where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            FallibleHandler::on_message(self, context, message, demand_type).await
+        }
 
         async fn on_message<C>(
             &self,

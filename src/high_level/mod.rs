@@ -6,7 +6,7 @@
 //! hands to consumers and readers alike lives in `deps`; topic reconciliation
 //! in `topics`; the consumer's state machine in [`state`].
 
-use crate::consumer::middleware::ExciseHandler;
+use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::{
     LowLatencyMiddlewareConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
@@ -243,7 +243,7 @@ where
     /// - Consumer initialization fails.
     async fn subscribe_inner(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>
     where
-        T: ExciseHandler<Payload = C::Payload> + Clone,
+        T: FallibleHandler<Payload = C::Payload> + Clone,
         C::Payload: crate::EventType + Clone,
         B::Reader: ConsumerReaderBackend<C>,
     {
@@ -404,7 +404,7 @@ macro_rules! impl_subscribe {
         where
             C: Codec,
             C::Payload: crate::EventIdentity + crate::EventType + Clone,
-            T: ExciseHandler<Payload = C::Payload> + Clone,
+            T: FallibleHandler<Payload = C::Payload> + Clone,
         {
             /// Subscribes the consumer with the provided handler.
             ///

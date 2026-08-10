@@ -789,6 +789,18 @@ where
     /// path. The reload identity override's stale-read argument (every
     /// marker-consulting settle arm implies the final attempt performed the
     /// set) leans on this fact.
+    fn on_excise<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        FallibleHandler::on_message(self, context, message, demand_type)
+    }
+
     async fn on_timer<C>(
         &self,
         context: C,

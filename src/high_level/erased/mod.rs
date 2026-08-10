@@ -2,7 +2,7 @@
 
 use crate::cassandra::config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError};
 use crate::consumer::MockConfigurationError;
-use crate::consumer::middleware::ExciseHandler;
+use crate::consumer::middleware::FallibleHandler;
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::state::ConsumerState;
 use crate::high_level::{
@@ -127,7 +127,7 @@ pub fn new_erased<T, C>(
     cassandra: &CassandraConfigurationBuilder,
 ) -> Result<SharedHighLevelClient<T, C>, ErasedClientBuildError<C::Error>>
 where
-    T: ExciseHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+    T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     C: Codec + Send + Sync,
     C::Payload: EventIdentity + EventType + Clone,
 {
@@ -154,7 +154,7 @@ where
 #[async_trait]
 impl<T, C, B> ErasedHighLevelClient<T, C> for ErasedClient<T, C, B>
 where
-    T: ExciseHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+    T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     C: Codec + Send + Sync,
     C::Payload: EventIdentity + EventType + Clone,
     B: ClientBackend<C>,

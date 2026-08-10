@@ -57,9 +57,7 @@ impl FallibleHandler for MyHandler {
     }
 
     async fn shutdown(self) {}
-}
 
-impl ExciseHandler for MyHandler {
     async fn on_excise<C>(
         &self,
         _context: C,

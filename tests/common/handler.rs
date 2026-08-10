@@ -6,7 +6,7 @@
 
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
-use prosody::consumer::middleware::{ExciseHandler, FallibleHandler};
+use prosody::consumer::middleware::FallibleHandler;
 use prosody::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::timers::{Trigger, UncommittedTimer};
@@ -158,9 +158,7 @@ impl FallibleHandler for FallibleTestHandler {
     }
 
     async fn shutdown(self) {}
-}
 
-impl ExciseHandler for FallibleTestHandler {
     async fn on_excise<C>(
         &self,
         _context: C,

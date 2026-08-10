@@ -96,6 +96,18 @@ impl FallibleHandler for Probe {
     type Output = u64;
     type Payload = serde_json::Value;
 
+    async fn on_excise<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        FallibleHandler::on_message(self, context, message, demand_type).await
+    }
+
     async fn on_message<C>(
         &self,
         _context: C,

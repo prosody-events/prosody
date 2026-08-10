@@ -158,9 +158,7 @@ impl FallibleHandler for SpanProbe {
     }
 
     async fn shutdown(self) {}
-}
 
-impl ExciseHandler for SpanProbe {
     async fn on_excise<C>(
         &self,
         _context: C,

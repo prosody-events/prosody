@@ -130,7 +130,7 @@ pub use crate::consumer::kafka_state::{
     MessageResolver, MessageStateError, message_deque_state, message_map_state, message_state,
 };
 pub use crate::consumer::message::ConsumerMessage;
-pub use crate::consumer::middleware::{ExciseHandler, FallibleHandler, RepinProof};
+pub use crate::consumer::middleware::{FallibleHandler, RepinProof};
 pub(crate) use crate::consumer::observer::KafkaObserver;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::probes::ProbeServer;

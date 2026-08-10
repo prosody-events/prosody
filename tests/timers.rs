@@ -19,7 +19,7 @@ use prosody::tracing::init_test_logging;
 use prosody::{
     consumer::ConsumerConfigurationBuilder,
     consumer::message::{ConsumerMessage, UncommittedMessage},
-    consumer::middleware::{CloneProvider, ExciseHandler, FallibleHandler},
+    consumer::middleware::{CloneProvider, FallibleHandler},
     consumer::{DemandType, EventHandler, Keyed, Uncommitted},
     timers::TimerType,
     timers::Trigger,
@@ -258,9 +258,7 @@ impl FallibleHandler for InlineReplacementHandler {
     }
 
     async fn shutdown(self) {}
-}
 
-impl ExciseHandler for InlineReplacementHandler {
     async fn on_excise<C>(
         &self,
         _context: C,

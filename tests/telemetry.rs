@@ -10,8 +10,8 @@ use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration}
 use prosody::cassandra::config::CassandraConfigurationBuilder;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
+use prosody::consumer::middleware::FallibleHandler;
 use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
-use prosody::consumer::middleware::{ExciseHandler, FallibleHandler};
 use prosody::consumer::{ConsumerConfigurationBuilder, DemandType, Keyed};
 use prosody::high_level::mode::Mode;
 use prosody::high_level::{CassandraHighLevelClient, ConsumerBuilders};
@@ -52,6 +52,22 @@ const TIMER_TEST_TIMEOUT: Duration = Duration::from_mins(3);
 /// Deadline for defer tests: warm-up + timer + retry backoff + telemetry drain.
 const DEFER_TEST_TIMEOUT: Duration = Duration::from_mins(5);
 
+macro_rules! ignore_excise {
+    () => {
+        async fn on_excise<C>(
+            &self,
+            _: C,
+            _: ConsumerMessage<Value>,
+            _: DemandType,
+        ) -> Result<(), Self::Error>
+        where
+            C: EventContext<Payload = Value>,
+        {
+            Ok(())
+        }
+    };
+}
+
 // ── Test Handlers ────────────────────────────────────────────────────────────
 //
 // The plain forward-to-channel handler lives in `common`
@@ -68,6 +84,8 @@ impl FallibleHandler for FailingHandler {
     type Error = TestError;
     type Output = ();
     type Payload = Value;
+
+    ignore_excise!();
 
     async fn on_message<C>(
         &self,
@@ -108,6 +126,8 @@ impl FallibleHandler for TimerSchedulingHandler {
     type Error = TestError;
     type Output = ();
     type Payload = Value;
+
+    ignore_excise!();
 
     async fn on_message<C>(
         &self,
@@ -157,6 +177,8 @@ impl FallibleHandler for TimerFailingHandler {
     type Output = ();
     type Payload = Value;
 
+    ignore_excise!();
+
     async fn on_message<C>(
         &self,
         ctx: C,
@@ -203,6 +225,8 @@ impl FallibleHandler for TimerCancellingHandler {
     type Error = TestError;
     type Output = ();
     type Payload = Value;
+
+    ignore_excise!();
 
     async fn on_message<C>(
         &self,
@@ -253,6 +277,8 @@ impl FallibleHandler for ClearAndScheduleHandler {
     type Error = TestError;
     type Output = ();
     type Payload = Value;
+
+    ignore_excise!();
 
     async fn on_message<C>(
         &self,
@@ -320,6 +346,8 @@ impl FallibleHandler for TransientMessageHandler {
     type Output = ();
     type Payload = Value;
 
+    ignore_excise!();
+
     async fn on_message<C>(
         &self,
         _ctx: C,
@@ -373,6 +401,8 @@ impl FallibleHandler for TransientTimerHandler {
     type Output = ();
     type Payload = Value;
 
+    ignore_excise!();
+
     async fn on_message<C>(
         &self,
         ctx: C,
@@ -417,34 +447,6 @@ impl FallibleHandler for TransientTimerHandler {
 
     async fn shutdown(self) {}
 }
-
-macro_rules! ignore_excise {
-    ($($handler:ty),+ $(,)?) => {$(
-        impl ExciseHandler for $handler {
-            async fn on_excise<C>(
-                &self,
-                _: C,
-                _: ConsumerMessage<Value>,
-                _: DemandType,
-            ) -> Result<(), Self::Error>
-            where
-                C: EventContext<Payload = Value>,
-            {
-                Ok(())
-            }
-        }
-    )+};
-}
-
-ignore_excise!(
-    FailingHandler,
-    TimerSchedulingHandler,
-    TimerFailingHandler,
-    TimerCancellingHandler,
-    ClearAndScheduleHandler,
-    TransientMessageHandler,
-    TransientTimerHandler,
-);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

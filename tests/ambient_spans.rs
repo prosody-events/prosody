@@ -79,9 +79,7 @@ impl FallibleHandler for AmbientProbe {
     }
 
     async fn shutdown(self) {}
-}
 
-impl ExciseHandler for AmbientProbe {
     async fn on_excise<C>(
         &self,
         _context: C,

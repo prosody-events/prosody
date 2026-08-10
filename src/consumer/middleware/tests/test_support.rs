@@ -20,7 +20,7 @@ use crate::Key;
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::{
-    DemandType, ExciseHandler, FallibleHandler, RepinProof, Settlement, SettlementHandler,
+    DemandType, FallibleHandler, RepinProof, Settlement, SettlementHandler,
 };
 use crate::consumer::partition::ShutdownPhase;
 use crate::consumer::{Keyed, Uncommitted};
@@ -642,9 +642,7 @@ impl FallibleHandler for ScriptedHandler {
     }
 
     async fn shutdown(self) {}
-}
 
-impl ExciseHandler for ScriptedHandler {
     async fn on_excise<C>(
         &self,
         _context: C,
@@ -675,6 +673,18 @@ impl FallibleHandler for BypassedHandler {
     type Error = TestError;
     type Output = ();
     type Payload = Value;
+
+    async fn on_excise<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        FallibleHandler::on_message(self, context, message, demand_type).await
+    }
 
     async fn on_message<C>(
         &self,
@@ -1102,6 +1112,18 @@ impl FallibleHandler for StagingTransientHandler {
     type Error = StagingError;
     type Output = ();
     type Payload = Value;
+
+    async fn on_excise<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        FallibleHandler::on_message(self, context, message, demand_type).await
+    }
 
     async fn on_message<C>(
         &self,

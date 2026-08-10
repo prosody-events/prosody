@@ -42,7 +42,7 @@ use prosody::consumer::middleware::defer::{
     DeferConfiguration, FailureTracker, MessageDeferMiddleware,
 };
 use prosody::consumer::middleware::log::LogMiddleware;
-use prosody::consumer::middleware::{ExciseHandler, FallibleHandler, HandlerMiddleware};
+use prosody::consumer::middleware::{FallibleHandler, HandlerMiddleware};
 use prosody::consumer::{DemandType, Keyed};
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::heartbeat::HeartbeatRegistry;
@@ -189,9 +189,7 @@ impl FallibleHandler for DeferTestHandler {
     }
 
     async fn shutdown(self) {}
-}
 
-impl ExciseHandler for DeferTestHandler {
     async fn on_excise<C>(
         &self,
         _context: C,
@@ -255,9 +253,7 @@ impl FallibleHandler for PermanentErrorHandler {
     async fn shutdown(self) {
         self.inner.shutdown().await;
     }
-}
 
-impl ExciseHandler for PermanentErrorHandler {
     async fn on_excise<C>(
         &self,
         context: C,
