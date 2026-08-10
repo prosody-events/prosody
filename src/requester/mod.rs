@@ -21,6 +21,7 @@ use opentelemetry::global::meter;
 use opentelemetry::metrics::Histogram;
 use smallvec::SmallVec;
 use std::error::Error;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::marker::PhantomData;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -160,7 +161,10 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             key = %key,
             response.node = %self.node,
             request.id = Empty,
+            request.outcome = Empty,
+            request.latency_ms = Empty,
             responses.received = Empty,
+            responses.missing = Empty,
             subsystems = subsystems.len() as i64,
         ),
         err
@@ -221,22 +225,39 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         .await;
         // A request refused before this point sent nothing, so it has no
         // latency to report. Only a call that really waited records one.
-        let waited = started.elapsed().as_secs_f64();
-        match &collected {
-            Ok(outcomes) => {
-                let answered = outcomes.iter().filter(|outcome| outcome.answered()).count();
-                Span::current().record("responses.received", answered as i64);
-                LATENCY.record(
-                    waited,
-                    &[KeyValue::new(
-                        "outcome",
-                        completeness(answered, outcomes.len()),
-                    )],
-                );
-            }
-            Err(_) => LATENCY.record(waited, &[KeyValue::new("outcome", "failed")]),
+        let elapsed = started.elapsed();
+        let waited = elapsed.as_secs_f64();
+        Span::current().record(
+            "request.latency_ms",
+            elapsed.as_millis().min(i64::MAX as u128) as i64,
+        );
+        if let Ok(outcomes) = &collected {
+            let answered = outcomes.iter().filter(|outcome| outcome.answered()).count();
+            let completeness = completeness(answered, outcomes.len());
+            Span::current().record("responses.received", answered as i64);
+            Span::current().record("responses.missing", display(Missing(subsystems, outcomes)));
+            Span::current().record("request.outcome", completeness);
+            LATENCY.record(waited, &[KeyValue::new("outcome", completeness)]);
+        } else {
+            Span::current().record("request.outcome", "failed");
+            LATENCY.record(waited, &[KeyValue::new("outcome", "failed")]);
         }
         collected
+    }
+}
+
+struct Missing<'a, V, E>(&'a [SubsystemName], &'a [Outcome<V, E>]);
+
+impl<V, E> Display for Missing<'_, V, E> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        let mut separator = "";
+        for (subsystem, outcome) in self.0.iter().zip(self.1) {
+            if !outcome.answered() {
+                write!(formatter, "{separator}{subsystem}")?;
+                separator = ",";
+            }
+        }
+        Ok(())
     }
 }
 

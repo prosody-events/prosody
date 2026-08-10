@@ -7,6 +7,7 @@ use crate::router::directory::Endpoint;
 use crate::router::fleet::DestinationFleet;
 use crate::router::{Framed, ResponseSender, SendFailure};
 use ahash::RandomState;
+use opentelemetry::Context;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use quick_cache::UnitWeighter;
 use quick_cache::sync::{Cache, DefaultLifecycle};
@@ -17,8 +18,7 @@ use tonic::client::Grpc;
 use tonic::codegen::http::{Uri, uri::PathAndQuery};
 use tonic::transport::Channel;
 use tonic::{Code, Request};
-use tracing::{Span, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing::warn;
 
 /// First timeout that Tonic cannot write as an eight-digit gRPC value.
 pub(super) const GRPC_TIMEOUT_LIMIT: Duration = Duration::from_hours(100_000_000);
@@ -95,14 +95,13 @@ impl ResponseSender for GrpcSender {
         address: &Endpoint,
         frame: &F,
         deadline: Instant,
+        context: &Context,
     ) -> Result<(), SendFailure> {
         let channel = self.channel(address).await?;
         let bytes = frame.bytes();
         let mut request = Request::new(frame.clone());
-        self.propagator.inject_context(
-            &Span::current().context(),
-            &mut MetadataInjector::new(request.metadata_mut()),
-        );
+        self.propagator
+            .inject_context(context, &mut MetadataInjector::new(request.metadata_mut()));
         let mut client = Grpc::new(channel);
         if let Err(error) = client.ready().await {
             warn!(%error, uri = %address.uri(), "a peer channel never became ready");

@@ -110,10 +110,20 @@ impl Harness {
     /// Frames one response and delivers it, reporting the status the listener
     /// answered.
     pub(super) async fn deliver(&self, header: &FrameHeader, payload: Vec<u8>) -> Result<Code> {
+        self.deliver_with_context(header, payload, &opentelemetry::Context::new())
+            .await
+    }
+
+    pub(super) async fn deliver_with_context(
+        &self,
+        header: &FrameHeader,
+        payload: Vec<u8>,
+        context: &opentelemetry::Context,
+    ) -> Result<Code> {
         let staged = stage::<CountingCodec>(header, &payload)?;
         status(
             self.sender
-                .deliver(&self.address, &staged, Instant::now() + BUDGET)
+                .deliver(&self.address, &staged, Instant::now() + BUDGET, context)
                 .await,
         )
     }
@@ -122,7 +132,12 @@ impl Harness {
     pub(super) async fn deliver_raw(&self, sender: &GrpcSender, bytes: BytesMut) -> Result<Code> {
         status(
             sender
-                .deliver(&self.address, &RawFramed(bytes), Instant::now() + BUDGET)
+                .deliver(
+                    &self.address,
+                    &RawFramed(bytes),
+                    Instant::now() + BUDGET,
+                    &opentelemetry::Context::new(),
+                )
                 .await,
         )
     }

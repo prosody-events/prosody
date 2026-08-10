@@ -27,7 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tonic::Code;
-use tracing::{Instrument, info_span};
+use tracing::info_span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// The span the delivery is made from, so every later span has one root to be
 /// measured against.
@@ -322,9 +323,10 @@ async fn call_with_payload(
         relay: None,
     };
     let staged = stage::<CountingCodec>(&header, &payload.to_vec())?;
-    let delivered = deliver(&sender, &live.address, &staged, granted)
-        .instrument(info_span!("peer.test.call"))
-        .await;
+    let caller = info_span!("peer.test.call");
+    let context = caller.context();
+    let delivered = deliver(&sender, &live.address, &staged, granted, &context).await;
+    drop(caller);
     match delivered {
         Ok(()) => Ok(Code::Ok),
         Err(SendFailure::Status(code)) => Ok(code),
@@ -339,9 +341,10 @@ async fn deliver(
     address: &Endpoint,
     staged: &Staged,
     granted: Duration,
+    context: &Context,
 ) -> Result<(), SendFailure> {
     sender
-        .deliver(address, staged, Instant::now() + granted)
+        .deliver(address, staged, Instant::now() + granted, context)
         .await
 }
 

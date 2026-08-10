@@ -11,12 +11,10 @@ use super::{ALPHA, Harness, header, reaching, register};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{deliver_response, stage};
-use crate::test_util::{GlobalSpans, TEST_RUNTIME, named};
+use crate::test_util::{GlobalSpans, TEST_RUNTIME, named, span_attribute};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
-use opentelemetry::Value;
-use opentelemetry::trace::{SpanKind, TraceContextExt};
-use opentelemetry_sdk::trace::SpanData;
+use opentelemetry::trace::{SpanKind, Status, TraceContextExt};
 use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -38,7 +36,8 @@ const PREFERENCE: &str = "peer.preference";
 /// One response delivered through the whole send path lands in the caller's
 /// trace, with `peer.response.receive` directly under `peer.response.send`, the
 /// send span is a client call rather than a consumer continuation, and that
-/// span says what became of the response and which endpoint answered.
+/// span says what became of the response and which endpoint answered. A
+/// refused delivery marks both transport spans as OpenTelemetry errors.
 #[test]
 fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
     let spans = GlobalSpans::install()?;
@@ -81,25 +80,55 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
                 && received.span_context.trace_id() == caller_span.trace_id(),
             "{RECEIVED} must be a child of {SENT}, in the caller's trace"
         );
-        let disposition = attribute(sent, DISPOSITION)?;
+        let disposition = span_attribute(sent, DISPOSITION)?;
         ensure!(
             disposition.as_str() == "delivered",
             "{SENT} must say what became of the response, not {disposition}"
         );
-        let preference = attribute(sent, PREFERENCE)?;
+        let preference = span_attribute(sent, PREFERENCE)?;
         ensure!(
             preference.as_str() == "direct",
             "{SENT} must name the endpoint that answered, not {preference}"
         );
+        for (key, expected) in [
+            ("peer.request", request.id().to_string()),
+            ("peer.subsystem", ALPHA.to_owned()),
+            ("peer.target", harness.node.to_string()),
+            (DISPOSITION, "accepted".to_owned()),
+        ] {
+            let value = span_attribute(received, key)?;
+            ensure!(
+                value.as_str() == expected,
+                "{RECEIVED} {key} reads {value}, not {expected}"
+            );
+        }
+
+        let mut refused = register(&harness.registry, &[ALPHA])?;
+        drop(refused.receiver()?);
+        let caller = info_span!("peer.test.refused");
+        let payload = PAYLOAD.to_vec();
+        let prepared = stage::<CountingCodec>(header(harness.node, refused.id(), ALPHA)?, &payload);
+        deliver_response(
+            &router,
+            prepared,
+            caller.context(),
+            RequestDeadline::from_unix_micros(4_102_444_800_000_000),
+        )
+        .await;
+        drop(caller);
+
+        let ended = spans.ended();
+        for (name, expected) in [(SENT, "send_failed"), (RECEIVED, "closed_request")] {
+            let span = ended
+                .iter()
+                .find(|span| span.name == name && matches!(span.status, Status::Error { .. }))
+                .ok_or_else(|| eyre!("no failed {name} span was exported"))?;
+            ensure!(
+                matches!(&span.status, Status::Error { description } if description == expected),
+                "{name} must report {expected} as an error, not {:?}",
+                span.status
+            );
+        }
         Ok(())
     })
-}
-
-/// One span attribute, by key.
-fn attribute<'a>(span: &'a SpanData, key: &str) -> Result<&'a Value> {
-    span.attributes
-        .iter()
-        .find(|attribute| attribute.key.as_str() == key)
-        .map(|attribute| &attribute.value)
-        .ok_or_else(|| eyre!("the {} span carries no {key}", span.name))
 }

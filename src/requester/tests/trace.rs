@@ -4,14 +4,13 @@
 //! it covers the whole wait: there is deliberately no second span for the
 //! answer arriving, because the answer is this call returning.
 
-use super::{KEY, NODE, TOPIC, unanswered_call};
+use super::{KEY, NODE, SUBSYSTEM, TOPIC, unanswered_call};
 use crate::router::loopback::paused;
-use crate::test_util::{captured_spans, named};
+use crate::test_util::{captured_spans, named, span_attribute};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::Value;
 use opentelemetry::trace::SpanKind;
-use opentelemetry_sdk::trace::SpanData;
 use uuid::Uuid;
 
 /// The span `request` opens. `#[instrument]` with no explicit name takes the
@@ -41,23 +40,30 @@ fn one_call_opens_a_client_span_naming_its_request_and_its_answers() -> Result<(
         ("topic", TOPIC),
         ("key", KEY),
         ("response.node", &NODE.to_string()),
+        ("request.outcome", "none"),
+        ("responses.missing", SUBSYSTEM),
     ] {
-        let value = attribute(span, key)?;
+        let value = span_attribute(span, key)?;
         ensure!(
             value.as_str() == expected,
             "{key} reads {value}, not {expected}"
         );
     }
-    let id = attribute(span, "request.id")?;
+    let id = span_attribute(span, "request.id")?;
     Uuid::try_parse(&id.as_str())
         .map_err(|error| eyre!("request.id reads {id}, which is no UUID: {error}"))?;
     for (key, expected) in [("subsystems", 1_i64), ("responses.received", 0_i64)] {
-        let value = attribute(span, key)?;
+        let value = span_attribute(span, key)?;
         ensure!(
             matches!(value, Value::I64(count) if *count == expected),
             "{key} reads {value:?}, not the integer {expected}"
         );
     }
+    let latency = span_attribute(span, "request.latency_ms")?;
+    ensure!(
+        matches!(latency, Value::I64(milliseconds) if *milliseconds >= 0),
+        "request.latency_ms reads {latency:?}, not a nonnegative integer"
+    );
     Ok(())
 }
 
@@ -65,13 +71,4 @@ fn one_call_opens_a_client_span_naming_its_request_and_its_answers() -> Result<(
 /// [`captured_spans`] scopes a synchronous closure.
 fn run_unanswered_call() -> Result<()> {
     paused()?.block_on(unanswered_call())
-}
-
-/// One span attribute, by key.
-fn attribute<'a>(span: &'a SpanData, key: &str) -> Result<&'a Value> {
-    span.attributes
-        .iter()
-        .find(|attribute| attribute.key.as_str() == key)
-        .map(|attribute| &attribute.value)
-        .ok_or_else(|| eyre!("the {} span carries no {key}", span.name))
 }

@@ -267,6 +267,7 @@ impl ResponseSender for LoopbackSender {
         address: &Endpoint,
         frame: &F,
         _deadline: Instant,
+        _context: &opentelemetry::Context,
     ) -> impl Future<Output = Result<(), SendFailure>> + Send {
         let uri = address.uri().clone();
         let mut bytes = BytesMut::with_capacity(frame.bytes());

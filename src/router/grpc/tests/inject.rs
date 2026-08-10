@@ -11,7 +11,8 @@ use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use opentelemetry_sdk::trace::SpanData;
 use tonic::Code;
-use tracing::{Instrument, info_span};
+use tracing::info_span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// The span the listener opens for one delivered response.
 const RECEIVED: &str = "peer.response.receive";
@@ -31,10 +32,16 @@ fn the_metadata_hop_carries_the_trace_context() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let harness = Harness::shared().await?;
         let traced = register(&harness.registry, &[ALPHA])?;
+        let caller = info_span!("peer.test.call");
+        let context = caller.context();
         let answered = harness
-            .deliver(&header(harness.node, traced.id(), ALPHA)?, payload(SHORT))
-            .instrument(info_span!("peer.test.call"))
+            .deliver_with_context(
+                &header(harness.node, traced.id(), ALPHA)?,
+                payload(SHORT),
+                &context,
+            )
             .await?;
+        drop(caller);
         ensure!(answered == Code::Ok, "the traced delivery must be accepted");
 
         let untraced = register(&harness.registry, &[ALPHA])?;

@@ -4,7 +4,9 @@ use super::{Harness, attempts_on, paused};
 use crate::router::SendFailure;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{Script, advertised_uri, direct_uri};
+use crate::test_util::{captured_spans, named, span_attribute};
 use color_eyre::Result;
+use color_eyre::eyre::{ensure, eyre};
 use tonic::Code;
 
 /// The node the responses in this suite are addressed to.
@@ -182,4 +184,39 @@ fn apply(harness: &Harness, (direct, advertised): (Answer, Answer)) -> Result<()
 /// The fleet every case here runs against.
 fn settings() -> FleetConfiguration {
     FleetConfiguration::default()
+}
+
+/// A fallback span names both endpoint preferences.
+#[test]
+fn a_fallback_names_both_endpoints() -> Result<()> {
+    let mut outcome = Err(eyre!("the fallback did not run"));
+    let spans = captured_spans(|| outcome = run_fallback());
+    outcome?;
+
+    let sent = named(&spans, "peer.response.send")?;
+    for (key, expected) in [
+        ("peer.fallback_from", "direct"),
+        ("peer.preference", "advertised"),
+    ] {
+        let value = span_attribute(sent, key)?;
+        ensure!(
+            value.as_str() == expected,
+            "{key} reads {value}, not {expected}"
+        );
+    }
+    Ok(())
+}
+
+fn run_fallback() -> Result<()> {
+    paused()?.block_on(async {
+        let harness = Harness::dual_homed(settings())?;
+        apply(&harness, (Answer::Silent, Answer::Takes))?;
+        harness.send(TARGET).await?;
+        let drained = harness.drain().await?;
+        ensure!(
+            drained.sent == 1,
+            "the fallback did not deliver the response"
+        );
+        Ok(())
+    })
 }

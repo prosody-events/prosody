@@ -11,17 +11,19 @@ use crate::router::{NetworkRouter, Preference, ResponseSender};
 use opentelemetry::Context;
 use std::future::Future;
 use tracing::field::Empty;
-use tracing::{Instrument, debug_span, warn};
+use tracing::{Instrument, debug_span, error, warn};
 
 use crate::router::LocalTarget;
 
 /// One response route in a statically composed route chain.
 pub trait ResponseRoute: Clone + Send + Sync + 'static {
     /// Tries this route. `Declined` lets the next route try the same frame.
+    /// `context` is the request context after any enabled transport span.
     fn deliver(
         &self,
         frame: Staged,
         deadline: RequestDeadline,
+        context: &Context,
     ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send;
 }
 
@@ -55,11 +57,12 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
         peer.subsystem = %header.subsystem,
         peer.disposition = Empty,
         peer.preference = Empty,
+        peer.fallback_from = Empty,
     );
-    carry_parent(&span, trace);
+    let context = carry_parent(&span, trace);
     let outcome = match prepared {
         PreparedResponse::Ready(frame) => {
-            deliver_route(router, frame, deadline)
+            deliver_route(router, frame, deadline, &context)
                 .instrument(span.clone())
                 .await
         }
@@ -77,6 +80,7 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
                 Delivery::Remote { preference, from } => {
                     span.record("peer.preference", preference.label());
                     if let Some(from) = from {
+                        span.record("peer.fallback_from", from.label());
                         record_fallback(from, preference);
                     }
                 }
@@ -85,6 +89,7 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
         }
         Err(reason) => {
             span.record("peer.disposition", reason.label());
+            span.in_scope(|| error!(error = %reason.label()));
             reason.record();
         }
     }
@@ -101,8 +106,9 @@ async fn deliver_route<R: ResponseRoute>(
     router: &R,
     frame: Staged,
     deadline: RequestDeadline,
+    context: &Context,
 ) -> Result<Delivery, DropReason> {
-    match router.deliver(frame, deadline).await? {
+    match router.deliver(frame, deadline, context).await? {
         RouteOutcome::Delivered(delivery) => Ok(delivery),
         RouteOutcome::Declined(_) => Err(DropReason::UnresolvableNode),
     }
@@ -113,6 +119,7 @@ impl ResponseRoute for LocalTarget {
         &self,
         frame: Staged,
         _deadline: RequestDeadline,
+        _context: &Context,
     ) -> Result<RouteOutcome, DropReason> {
         if !self.owns(frame.target()) {
             return Ok(RouteOutcome::Declined(frame));
@@ -132,6 +139,7 @@ impl<R: NetworkRouter> ResponseRoute for R {
         &self,
         frame: Staged,
         deadline: RequestDeadline,
+        context: &Context,
     ) -> Result<RouteOutcome, DropReason> {
         let target = frame.target();
         // No address originates anywhere but a registration: a node the directory
@@ -158,7 +166,7 @@ impl<R: NetworkRouter> ResponseRoute for R {
         for (preference, address) in candidates.into_iter().flatten() {
             match self
                 .sender()
-                .deliver(address, &frame, deadline.expires_at())
+                .deliver(address, &frame, deadline.expires_at(), context)
                 .await
             {
                 Ok(()) => {
@@ -204,9 +212,10 @@ impl<A: ResponseRoute, B: ResponseRoute> ResponseRoute for Then<A, B> {
         &self,
         frame: Staged,
         deadline: RequestDeadline,
+        context: &Context,
     ) -> Result<RouteOutcome, DropReason> {
-        match self.0.deliver(frame, deadline).await? {
-            RouteOutcome::Declined(frame) => self.1.deliver(frame, deadline).await,
+        match self.0.deliver(frame, deadline, context).await? {
+            RouteOutcome::Declined(frame) => self.1.deliver(frame, deadline, context).await,
             delivered @ RouteOutcome::Delivered(_) => Ok(delivered),
         }
     }

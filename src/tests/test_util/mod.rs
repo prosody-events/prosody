@@ -307,6 +307,18 @@ pub(crate) fn named<'a>(spans: &'a [SpanData], name: &str) -> Result<&'a SpanDat
     Ok(span)
 }
 
+/// One attribute from one exported span.
+pub(crate) fn span_attribute<'a>(
+    span: &'a SpanData,
+    key: &str,
+) -> Result<&'a opentelemetry::Value> {
+    span.attributes
+        .iter()
+        .find(|attribute| attribute.key.as_str() == key)
+        .map(|attribute| &attribute.value)
+        .ok_or_else(|| eyre!("the {} span carries no {key}", span.name))
+}
+
 /// Asserts, by id equality rather than any `is_some()`/validity proxy, that the
 /// exported span named `name` connects to `target` per `relation`.
 ///

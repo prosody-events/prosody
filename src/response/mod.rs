@@ -189,12 +189,12 @@ impl ResponseDisposition {
         DISPOSITIONS.add(1, &[KeyValue::new("disposition", self.label())]);
     }
 
-    /// The metric label for this disposition.
+    /// The stable telemetry label for this disposition.
     ///
     /// A fixed string per variant. The frame that produced the disposition
     /// arrived from the network, so nothing it carries — no node id, no claimed
     /// subsystem — is ever a label.
-    const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
             Self::UnknownRequest => "unknown_request",

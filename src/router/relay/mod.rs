@@ -7,6 +7,7 @@
 //! what makes it the fallback that always works.
 
 use crate::router::{Framed, NodeId, RelayHop, ResponseSender, SendFailure};
+use opentelemetry::Context;
 use thiserror::Error;
 use tokio::time::Instant;
 use tonic::Code;
@@ -70,12 +71,13 @@ impl<R: RelayHop> Relay<R> {
         target: NodeId,
         deadline: Instant,
         frame: &F,
+        context: &Context,
     ) -> Result<(), RelayFailure> {
         // Do not resolve or dial after the incoming gRPC deadline.
         if Instant::now() >= deadline {
             return Err(RelayFailure::DeadlineExceeded);
         }
-        self.hop(target, frame, deadline).await
+        self.hop(target, frame, deadline, context).await
     }
 
     /// Resolves the target's direct endpoint and makes one attempt.
@@ -86,6 +88,7 @@ impl<R: RelayHop> Relay<R> {
         target: NodeId,
         frame: &F,
         deadline: Instant,
+        context: &Context,
     ) -> Result<(), RelayFailure> {
         let address = self
             .router
@@ -102,7 +105,7 @@ impl<R: RelayHop> Relay<R> {
         match self
             .router
             .sender()
-            .deliver(&address, frame, deadline)
+            .deliver(&address, frame, deadline, context)
             .await
         {
             Ok(()) => Ok(()),

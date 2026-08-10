@@ -73,11 +73,12 @@ impl ResponseRoute for ObservedRoute {
         &self,
         frame: Staged,
         deadline: RequestDeadline,
+        context: &Context,
     ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send {
         let route = self.route.clone();
         let outcomes = Arc::clone(&self.outcomes);
         async move {
-            let outcome = route.deliver(frame, deadline).await;
+            let outcome = route.deliver(frame, deadline, context).await;
             outcomes.record(matches!(&outcome, Ok(RouteOutcome::Delivered(_))));
             outcome
         }

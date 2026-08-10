@@ -16,7 +16,7 @@ use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::field::{Empty, display};
-use tracing::{Instrument, Span, debug_span};
+use tracing::{Instrument, Span, debug_span, error};
 
 /// Serves [`DeliverResponse`](Peer::deliver_response) for one node.
 ///
@@ -59,12 +59,14 @@ impl<R: RelayHop> Peer for PeerService<R> {
             otel.kind = "server",
             peer.request = Empty,
             peer.subsystem = Empty,
+            peer.target = Empty,
+            peer.relay = Empty,
             peer.disposition = Empty,
             peer.deadline_ms = Empty,
         );
         // A caller that sent no propagation headers, or broken ones, still gets
         // its response delivered: the span is simply unparented.
-        carry_parent(
+        let context = carry_parent(
             &span,
             self.propagator
                 .extract(&MetadataExtractor::new(request.metadata())),
@@ -85,6 +87,10 @@ impl<R: RelayHop> Peer for PeerService<R> {
             span.record("peer.request", display(frame.header.request));
             span.record("peer.subsystem", display(&frame.header.subsystem));
             let target = frame.header.target;
+            span.record("peer.target", display(target));
+            if let Some(relay) = frame.header.relay {
+                span.record("peer.relay", display(relay));
+            }
             let routing = routing(self.local.node, target, frame.header.relay);
             match routing {
                 Routing::Accept => answer(&span, self.local.accept(frame)),
@@ -98,20 +104,18 @@ impl<R: RelayHop> Peer for PeerService<R> {
                         otel.kind = "client",
                         peer.target = %target,
                     );
+                    let forward_context = carry_parent(&forward, context.clone());
                     // Awaited rather than spawned, so this answer covers the
                     // whole path: a responder is never told it succeeded while
                     // the requester still waits.
                     match self
                         .relay
-                        .forward(target, deadline, &forwarded)
+                        .forward(target, deadline, &forwarded, &forward_context)
                         .instrument(forward)
                         .await
                     {
                         Ok(()) => {
-                            span.record(
-                                "peer.disposition",
-                                ResponseDisposition::Accepted.message(),
-                            );
+                            span.record("peer.disposition", ResponseDisposition::Accepted.label());
                             Ok(Response::new(()))
                         }
                         Err(RelayFailure::DeadlineExceeded) => {
@@ -125,6 +129,7 @@ impl<R: RelayHop> Peer for PeerService<R> {
                         // the responder's own retry decision.
                         Err(RelayFailure::Target(code)) => {
                             span.record("peer.disposition", code.description());
+                            span.in_scope(|| error!(error = %code.description()));
                             Err(service_status(code, code.description()))
                         }
                     }
@@ -142,7 +147,7 @@ impl<R: RelayHop> Peer for PeerService<R> {
 /// not compile until somebody decides here whether it means the response was
 /// stored. That decision is what `OK` reports.
 fn answer(span: &Span, disposition: ResponseDisposition) -> Result<Response<()>, Status> {
-    span.record("peer.disposition", disposition.message());
+    span.record("peer.disposition", disposition.label());
     disposition.record();
     match disposition {
         ResponseDisposition::Accepted => Ok(Response::new(())),
@@ -151,6 +156,7 @@ fn answer(span: &Span, disposition: ResponseDisposition) -> Result<Response<()>,
         | ResponseDisposition::AlreadyRelayed
         | ResponseDisposition::RelayDeadlineExceeded
         | ResponseDisposition::Unreachable => {
+            span.in_scope(|| error!(error = %disposition.label()));
             Err(service_status(disposition.status(), disposition.message()))
         }
     }

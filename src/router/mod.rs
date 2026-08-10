@@ -11,6 +11,7 @@ use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistrat
 use crate::router::fleet::{Destination, DestinationFleet};
 use bytes::BufMut;
 use fixedstr::Flexstr;
+use opentelemetry::Context;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::future::Future;
@@ -165,6 +166,7 @@ pub(crate) trait ResponseSender: Send + Sync + 'static {
         address: &Endpoint,
         frame: &F,
         deadline: Instant,
+        context: &Context,
     ) -> impl Future<Output = Result<(), SendFailure>> + Send;
 }
 

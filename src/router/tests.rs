@@ -41,6 +41,7 @@ impl ResponseRoute for CountedNetwork {
         &self,
         _frame: Staged,
         _deadline: RequestDeadline,
+        _context: &opentelemetry::Context,
     ) -> Result<RouteOutcome, DropReason> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Ok(RouteOutcome::Delivered(RouteDelivery::Remote {
@@ -414,6 +415,7 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
             .deliver(
                 frame,
                 RequestDeadline::from_unix_micros(4_102_444_800_000_000),
+                &opentelemetry::Context::new(),
             )
             .await;
 

@@ -123,13 +123,21 @@ macro_rules! related_span {
 /// tracing call site declares its own fields, so `otel.kind` is written where
 /// the span is written whatever this function takes.
 ///
-/// A context that cannot be attached is logged rather than propagated. A broken
-/// trace never fails the work it describes; the span simply appears at the root
-/// of its own trace, which is what makes missing propagation visible.
-pub(crate) fn carry_parent(span: &Span, context: Context) {
-    if let Err(error) = span.set_parent(context) {
-        debug!(%error, "a carried trace context could not be attached");
+/// Returns the context that downstream work must propagate. An enabled span
+/// returns its child context. A disabled span returns the carried context, so a
+/// level filter cannot break propagation.
+///
+/// A context that cannot be attached is logged. The work continues with the
+/// carried context.
+pub(crate) fn carry_parent(span: &Span, context: Context) -> Context {
+    if span.is_disabled() {
+        return context;
     }
+    if let Err(error) = span.set_parent(context.clone()) {
+        debug!(%error, "a carried trace context could not be attached");
+        return context;
+    }
+    span.context()
 }
 
 /// Error returned when parsing a [`SpanRelation`] from a string fails.

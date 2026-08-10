@@ -11,6 +11,7 @@ use crate::response::sender::{DropReason, ResponseRoute, RouteOutcome, Then};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::{LocalTarget, NetworkRoute};
+use opentelemetry::Context;
 use std::future::Future;
 
 mod sealed {
@@ -111,8 +112,9 @@ impl ResponseRoute for LocalResponseRoute {
         &self,
         frame: Staged,
         deadline: RequestDeadline,
+        context: &Context,
     ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send {
-        self.route.deliver(frame, deadline)
+        self.route.deliver(frame, deadline, context)
     }
 }
 
@@ -121,8 +123,9 @@ impl ResponseRoute for GrpcResponseRoute {
         &self,
         frame: Staged,
         deadline: RequestDeadline,
+        context: &Context,
     ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send {
-        self.route.deliver(frame, deadline)
+        self.route.deliver(frame, deadline, context)
     }
 }
 

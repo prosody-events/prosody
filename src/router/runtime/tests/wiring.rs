@@ -217,7 +217,12 @@ async fn sent_on(elsewhere: &Elsewhere, here: &Endpoint) -> Result<()> {
     let addressed = header(elsewhere.node, request.id(), ALPHA)?;
     let staged = stage::<CountingCodec>(&addressed, &PAYLOAD.to_vec())?;
     sender
-        .deliver(here, &staged, Instant::now() + HANG_GUARD)
+        .deliver(
+            here,
+            &staged,
+            Instant::now() + HANG_GUARD,
+            &opentelemetry::Context::new(),
+        )
         .await
         .map_err(|failure| eyre!("the listener did not send the frame on: {failure}"))?;
     let stored = receiver

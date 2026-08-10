@@ -44,7 +44,12 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
             let addressed_here = header(shared.node, request.id(), ALPHA)?;
             let mine = stage::<CountingCodec>(&addressed_here, &PAYLOAD.to_vec())?;
             transport
-                .deliver(&shared.listener, &mine, Instant::now() + HANG_GUARD)
+                .deliver(
+                    &shared.listener,
+                    &mine,
+                    Instant::now() + HANG_GUARD,
+                    &Context::new(),
+                )
                 .await
                 .map_err(|failure| {
                     eyre!("the listener refused a frame for its own node: {failure}")
@@ -54,7 +59,12 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
             ensure!(
                 matches!(
                     transport
-                        .deliver(&shared.listener, &foreign, Instant::now() + HANG_GUARD)
+                        .deliver(
+                            &shared.listener,
+                            &foreign,
+                            Instant::now() + HANG_GUARD,
+                            &Context::new(),
+                        )
                         .await,
                     Err(SendFailure::Status(_))
                 ),
