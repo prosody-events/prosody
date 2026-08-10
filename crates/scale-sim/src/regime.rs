@@ -1269,11 +1269,7 @@ fn principal_graph(
         partition_count: 64,
         replica_count_max,
         slots_per_replica,
-        posterior_sample_count: if regime == PrincipalRegime::LinearThroughput {
-            16_384
-        } else {
-            1_024
-        },
+        posterior_sample_count: 1_024,
         report_interval_micros: definition
             .schedule
             .workload_interval_micros

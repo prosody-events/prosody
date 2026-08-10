@@ -987,10 +987,13 @@ macro_rules! closed_loop_regime_tests {
     };
 }
 
+// LinearThroughput is absent:
+// `linear_closed_loop_satisfies_its_declared_outcome` runs the same simulation
+// and ends with the same claim validation, so a macro entry would run the
+// ~20-minute simulation twice.
 closed_loop_regime_tests! {
     idle_regime_satisfies_its_claims => Idle,
     application_limited_regime_satisfies_its_claims => ApplicationLimited,
-    linear_throughput_regime_satisfies_its_claims => LinearThroughput,
     flat_post_knee_regime_satisfies_its_claims => FlatPostKnee,
     declining_post_knee_regime_satisfies_its_claims => DecliningPostKnee,
     short_burst_regime_satisfies_its_claims => ShortBurst,
