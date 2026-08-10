@@ -168,6 +168,7 @@ pub mod kafka_state;
 pub mod message;
 pub mod middleware;
 mod modes;
+pub(crate) use modes::{NoResponses, Responding, ResponsePolicy};
 // Crate-wide, not `pub(in crate::consumer)`: keyed-state publication reads the
 // observed partition count from outside this module.
 pub(crate) mod observer;

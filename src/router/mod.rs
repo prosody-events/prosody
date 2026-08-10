@@ -39,10 +39,8 @@ const LABEL_CAPACITY: usize = 64;
 /// It is the largest label that stays inline in [`Host`] and
 /// [`NetworkId`](directory::NetworkId), and both ends of the directory hold to
 /// it: a process refuses to publish a longer one, and an entry carrying a
-/// longer one reads as unresolvable. That is what makes the address cache
-/// bounded in bytes as well as in entries — the cache charges one unit per
-/// entry however many bytes it holds, so an unbounded label would make a
-/// bounded entry count buy nothing.
+/// longer one reads as unresolvable. This bound keeps labels inline. The
+/// address cache bounds its entry count, not its total byte size.
 pub(crate) const MAX_LABEL_BYTES: usize = LABEL_CAPACITY - 1;
 
 /// Reports whether a nonempty label fits the directory label bound.
@@ -50,9 +48,8 @@ pub(crate) fn label_fits(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_LABEL_BYTES
 }
 
-/// The host a node publishes for its peers to dial. Every host that reaches the
-/// directory is bounded by [`MAX_LABEL_BYTES`], so a resolved address stays off
-/// the response path's allocator.
+/// The host label a node publishes for its peers to dial. Every stored host
+/// fits inline within [`MAX_LABEL_BYTES`].
 pub(crate) type Host = Flexstr<LABEL_CAPACITY>;
 
 /// Identifies one live prosody process.

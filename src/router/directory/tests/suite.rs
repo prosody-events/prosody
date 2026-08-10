@@ -208,10 +208,9 @@ pub(crate) fn first_divergence(
 /// `MAX_LABEL_BYTES` resolves and holds no label on the heap. One byte more on
 /// any one label makes the whole entry unresolvable.
 ///
-/// The heap assertion is what makes the address cache bounded in bytes as well
-/// as in entries: the cache charges one unit per entry however many bytes that
-/// entry holds. The entry goes rather than the label, because a shorter label
-/// would resolve a different host.
+/// The heap assertion proves that accepted labels stay inline. The entry goes
+/// rather than the label, because a shorter label would resolve a different
+/// host.
 pub(crate) async fn run_label_bound_case<D: NodeDirectory>(directory: &D) -> Result<()> {
     let bounded = labelled(NodeId::new(), None);
     directory.register(&bounded).await?;

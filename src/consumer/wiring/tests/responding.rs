@@ -12,7 +12,7 @@ use crate::consumer::middleware::retry::RetryConfiguration;
 use crate::consumer::middleware::tests::test_support::{ScriptedHandler, TestError};
 use crate::consumer::wiring::memory_deps;
 use crate::consumer::{
-    ConsumerSetup, PipelineMiddlewareConfiguration, ProsodyConsumer, TypedConsumerSetup,
+    ConsumerSetup, PipelineMiddlewareConfiguration, ProsodyConsumer, Responding, TypedConsumerSetup,
 };
 use crate::error::ErrorCategory;
 use crate::high_level::config::TriggerStoreConfiguration;
@@ -90,20 +90,15 @@ async fn an_explicit_response_subsystem_needs_no_keyed_state_subsystem() -> Resu
         deps,
     };
     let router = prepare_router(&peer, typed.deps.backend().as_ref()).await?;
-    let consumer = ProsodyConsumer::<JsonCodec>::pipeline_responding_consumer_with_backend::<
-        ScriptedHandler,
-        SomeResponseCodec,
-        _,
-        _,
-    >(
-        typed,
-        pipeline_config()?,
-        Telemetry::new(),
-        ScriptedHandler::success(),
-        &router,
-        SubsystemName::try_new(SUBSYSTEM)?,
-    )
-    .await?;
+    let consumer =
+        ProsodyConsumer::<JsonCodec>::pipeline_consumer_with_policy::<ScriptedHandler, _, _>(
+            typed,
+            pipeline_config()?,
+            Telemetry::new(),
+            ScriptedHandler::success(),
+            Responding::<SomeResponseCodec, _>::new(&router, SubsystemName::try_new(SUBSYSTEM)?),
+        )
+        .await?;
     let outcome: Result<()> = async {
         ensure!(
             log.lock()

@@ -57,38 +57,15 @@ where
         C::Payload: EventIdentity + Send + Sync + 'static,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
-        match (setup.consumer.mock, setup.trigger_store) {
-            (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
-                let deps = memory_deps(&setup);
-                Self::low_latency_consumer_with_backend(
-                    TypedConsumerSetup {
-                        consumer: setup.consumer,
-                        common: setup.common,
-                        deps,
-                    },
-                    low_latency_config,
-                    producer,
-                    telemetry,
-                    handler,
-                )
-                .await
-            }
-            (false, TriggerStoreConfiguration::Cassandra(config)) => {
-                let deps = cassandra_deps(&setup, config, None).await?;
-                Self::low_latency_consumer_with_backend(
-                    TypedConsumerSetup {
-                        consumer: setup.consumer,
-                        common: setup.common,
-                        deps,
-                    },
-                    low_latency_config,
-                    producer,
-                    telemetry,
-                    handler,
-                )
-                .await
-            }
-        }
+        Self::low_latency_consumer_with_response(
+            setup,
+            low_latency_config,
+            producer,
+            telemetry,
+            handler,
+            NoResponses,
+        )
+        .await
     }
 
     /// Creates a low-latency consumer that answers peer requests.
@@ -112,10 +89,34 @@ where
         T::Error: Sync + 'static,
         R: Codec<Payload = Result<T::Output, T::Error>>,
     {
+        Self::low_latency_consumer_with_response(
+            setup,
+            low_latency_config,
+            producer,
+            telemetry,
+            handler,
+            Responding::<R, _>::new(router, subsystem),
+        )
+        .await
+    }
+
+    async fn low_latency_consumer_with_response<T, RP>(
+        setup: ConsumerSetup<'_>,
+        low_latency_config: LowLatencyMiddlewareConfiguration,
+        producer: ProsodyProducer<C>,
+        telemetry: Telemetry,
+        handler: T,
+        response: RP,
+    ) -> Result<Self, ConsumerError>
+    where
+        C::Payload: EventIdentity + Send + Sync + 'static,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        RP: ResponsePolicy<T>,
+    {
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
                 let deps = memory_deps(&setup);
-                Self::low_latency_responding_consumer_with_backend::<T, R, _, RT>(
+                Self::low_latency_consumer_with_policy(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
                         common: setup.common,
@@ -125,14 +126,13 @@ where
                     producer,
                     telemetry,
                     handler,
-                    router,
-                    subsystem,
+                    response,
                 )
                 .await
             }
             (false, TriggerStoreConfiguration::Cassandra(config)) => {
-                let deps = cassandra_deps(&setup, config, Some(&subsystem)).await?;
-                Self::low_latency_responding_consumer_with_backend::<T, R, _, RT>(
+                let deps = cassandra_deps(&setup, config, response.subsystem()).await?;
+                Self::low_latency_consumer_with_policy(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
                         common: setup.common,
@@ -142,38 +142,14 @@ where
                     producer,
                     telemetry,
                     handler,
-                    router,
-                    subsystem,
+                    response,
                 )
                 .await
             }
         }
     }
 
-    pub(crate) async fn low_latency_consumer_with_backend<T, B>(
-        setup: TypedConsumerSetup<'_, C, B>,
-        low_latency_config: LowLatencyMiddlewareConfiguration,
-        producer: ProsodyProducer<C>,
-        telemetry: Telemetry,
-        handler: T,
-    ) -> Result<Self, ConsumerError>
-    where
-        C::Payload: EventIdentity + Send + Sync + 'static,
-        B: ConsumerReaderBackend<C>,
-        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-    {
-        Self::low_latency_consumer_with_policy(
-            setup,
-            low_latency_config,
-            producer,
-            telemetry,
-            handler,
-            NoResponses,
-        )
-        .await
-    }
-
-    async fn low_latency_consumer_with_policy<T, B, RP>(
+    pub(crate) async fn low_latency_consumer_with_policy<T, B, RP>(
         setup: TypedConsumerSetup<'_, C, B>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
@@ -224,34 +200,6 @@ where
             services,
             resources,
         ))
-        .await
-    }
-
-    pub(crate) async fn low_latency_responding_consumer_with_backend<T, R, B, RT: Router>(
-        setup: TypedConsumerSetup<'_, C, B>,
-        low_latency_config: LowLatencyMiddlewareConfiguration,
-        producer: ProsodyProducer<C>,
-        telemetry: Telemetry,
-        handler: T,
-        router: &RT,
-        subsystem: SubsystemName,
-    ) -> Result<Self, ConsumerError>
-    where
-        C::Payload: EventIdentity + Send + Sync + 'static,
-        B: ConsumerReaderBackend<C>,
-        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-        T::Output: Sync + 'static,
-        T::Error: Sync + 'static,
-        R: Codec<Payload = Result<T::Output, T::Error>>,
-    {
-        Self::low_latency_consumer_with_policy(
-            setup,
-            low_latency_config,
-            producer,
-            telemetry,
-            handler,
-            Responding::<R, _>::new(router, subsystem),
-        )
         .await
     }
 }

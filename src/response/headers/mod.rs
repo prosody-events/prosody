@@ -210,7 +210,7 @@ pub(crate) fn parse_request_tag<'h, H>(
 where
     H: IntoIterator<Item = (&'h str, Option<&'h [u8]>)>,
 {
-    let mut version_seen = false;
+    let mut version = None;
     let mut id = None;
     let mut node = None;
     let mut deadline = None;
@@ -228,29 +228,16 @@ where
                 addressed |= name == responder.as_str();
             }
             RESPONSE_VERSION_HEADER => {
-                if version_seen {
-                    return Err(HeaderRejection::DuplicateSingleton);
-                }
-                version_seen = true;
-                check_revision(value)?;
+                set_once(&mut version, || check_revision(value))?;
             }
             RESPONSE_REQUEST_ID_HEADER => {
-                if id.is_some() {
-                    return Err(HeaderRejection::DuplicateSingleton);
-                }
-                id = Some(RequestId::from_bytes(parse_id(value)?));
+                set_once(&mut id, || parse_id(value).map(RequestId::from_bytes))?;
             }
             RESPONSE_NODE_HEADER => {
-                if node.is_some() {
-                    return Err(HeaderRejection::DuplicateSingleton);
-                }
-                node = Some(NodeId::from_bytes(parse_id(value)?));
+                set_once(&mut node, || parse_id(value).map(NodeId::from_bytes))?;
             }
             RESPONSE_DEADLINE_HEADER => {
-                if deadline.is_some() {
-                    return Err(HeaderRejection::DuplicateSingleton);
-                }
-                deadline = Some(parse_deadline(value)?);
+                set_once(&mut deadline, || parse_deadline(value))?;
             }
             // Every other header belongs to the producer, not to this protocol.
             _ => {}
@@ -258,17 +245,28 @@ where
     }
 
     // No reserved header at all, so this record asks for nothing.
-    if !version_seen && id.is_none() && node.is_none() && deadline.is_none() && awaited == 0 {
+    if version.is_none() && id.is_none() && node.is_none() && deadline.is_none() && awaited == 0 {
         return Ok(None);
     }
     let (Some(id), Some(node), Some(deadline)) = (id, node, deadline) else {
         return Err(HeaderRejection::MissingSingleton);
     };
-    if !version_seen || awaited == 0 {
+    if version.is_none() || awaited == 0 {
         return Err(HeaderRejection::MissingSingleton);
     }
 
     Ok(addressed.then_some(RequestTag::new(id, node, deadline)))
+}
+
+fn set_once<T>(
+    slot: &mut Option<T>,
+    value: impl FnOnce() -> Result<T, HeaderRejection>,
+) -> Result<(), HeaderRejection> {
+    if slot.is_some() {
+        return Err(HeaderRejection::DuplicateSingleton);
+    }
+    *slot = Some(value()?);
+    Ok(())
 }
 
 /// Renders one id in its 36-character header form without an allocation.

@@ -7,7 +7,8 @@
 //! in `topics`; the consumer's state machine in [`state`].
 
 use crate::consumer::{
-    LowLatencyMiddlewareConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
+    LowLatencyMiddlewareConfiguration, NoResponses, PipelineMiddlewareConfiguration,
+    ProsodyConsumer, Responding, ResponsePolicy,
 };
 pub use crate::high_level::config::ConsumerBuilders;
 use crate::high_level::config::ModeConfiguration;
@@ -252,12 +253,13 @@ where
             .map_err(HighLevelClientError::StateReader)
     }
 
-    async fn build_consumer(
+    async fn build_consumer<RP>(
         config: ModeConfiguration,
         shared: StateReaderDependencies<Wire<T>, B::Reader>,
         producer: ProsodyProducer<Wire<T>>,
         telemetry: Telemetry,
         handler: T,
+        response: RP,
     ) -> (
         Result<ProsodyConsumer<Wire<T>>, HighLevelClientError<WireError<T>>>,
         ModeConfiguration,
@@ -266,6 +268,7 @@ where
         T: Clone,
         T::Payload: crate::EventType + Clone,
         B::Reader: ConsumerReaderBackend<Wire<T>>,
+        RP: ResponsePolicy<T>,
     {
         let built = match &config {
             ModeConfiguration::Pipeline {
@@ -274,18 +277,21 @@ where
                 monopolization,
                 defer,
                 common,
-            } => Box::pin(
-                ProsodyConsumer::<Wire<T>>::pipeline_consumer_with_backend::<T, B::Reader>(
-                    deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
-                    PipelineMiddlewareConfiguration {
-                        retry: retry.clone(),
-                        monopolization: monopolization.clone(),
-                        defer: defer.clone(),
-                    },
-                    telemetry,
-                    handler,
-                ),
-            )
+            } => Box::pin(ProsodyConsumer::<Wire<T>>::pipeline_consumer_with_policy::<
+                T,
+                B::Reader,
+                RP,
+            >(
+                deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
+                PipelineMiddlewareConfiguration {
+                    retry: retry.clone(),
+                    monopolization: monopolization.clone(),
+                    defer: defer.clone(),
+                },
+                telemetry,
+                handler,
+                response,
+            ))
             .await
             .map_err(Into::into),
             ModeConfiguration::LowLatency {
@@ -293,9 +299,10 @@ where
                 retry,
                 failure_topic,
                 common,
-            } => Box::pin(ProsodyConsumer::low_latency_consumer_with_backend::<
+            } => Box::pin(ProsodyConsumer::low_latency_consumer_with_policy::<
                 T,
                 B::Reader,
+                RP,
             >(
                 deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
                 LowLatencyMiddlewareConfiguration {
@@ -305,110 +312,16 @@ where
                 producer,
                 telemetry,
                 handler,
+                response,
             ))
             .await
             .map_err(Into::into),
-            ModeConfiguration::BestEffort { consumer, common } => {
-                Box::pin(ProsodyConsumer::<Wire<T>>::best_effort_consumer::<
-                    T,
-                    B::Reader,
-                >(
-                    deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
-                    telemetry,
-                    handler,
-                ))
-                .await
-                .map_err(Into::into)
-            }
-        };
-        (built, config)
-    }
-
-    async fn build_responding_consumer(
-        config: ModeConfiguration,
-        shared: StateReaderDependencies<Wire<T>, B::Reader>,
-        producer: ProsodyProducer<Wire<T>>,
-        telemetry: Telemetry,
-        handler: T,
-        router: &B::Router,
-        subsystem: &SubsystemName,
-    ) -> (
-        Result<ProsodyConsumer<Wire<T>>, HighLevelClientError<WireError<T>>>,
-        ModeConfiguration,
-    )
-    where
-        T: Clone,
-        T::Output: Sync + 'static,
-        T::Error: Sync + 'static,
-        T::Payload: crate::EventType + Clone,
-        B::Reader: ConsumerReaderBackend<Wire<T>>,
-    {
-        let built = match &config {
-            ModeConfiguration::Pipeline {
-                consumer,
-                retry,
-                monopolization,
-                defer,
-                common,
-            } => Box::pin(
-                ProsodyConsumer::<Wire<T>>::pipeline_responding_consumer_with_backend::<
-                    T,
-                    Reply<T>,
-                    B::Reader,
-                    B::Router,
-                >(
-                    deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
-                    PipelineMiddlewareConfiguration {
-                        retry: retry.clone(),
-                        monopolization: monopolization.clone(),
-                        defer: defer.clone(),
-                    },
-                    telemetry,
-                    handler,
-                    router,
-                    subsystem.clone(),
-                ),
-            )
-            .await
-            .map_err(Into::into),
-            ModeConfiguration::LowLatency {
-                consumer,
-                retry,
-                failure_topic,
-                common,
-            } => Box::pin(
-                ProsodyConsumer::low_latency_responding_consumer_with_backend::<
-                    T,
-                    Reply<T>,
-                    B::Reader,
-                    B::Router,
-                >(
-                    deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
-                    LowLatencyMiddlewareConfiguration {
-                        retry: retry.clone(),
-                        failure_topic: failure_topic.clone(),
-                    },
-                    producer,
-                    telemetry,
-                    handler,
-                    router,
-                    subsystem.clone(),
-                ),
-            )
-            .await
-            .map_err(Into::into),
             ModeConfiguration::BestEffort { consumer, common } => Box::pin(
-                ProsodyConsumer::<Wire<T>>::best_effort_responding_consumer::<
-                    T,
-                    Reply<T>,
-                    B::Reader,
-                    B::Router,
-                >(
+                ProsodyConsumer::<Wire<T>>::best_effort_consumer_with_policy::<T, B::Reader, RP>(
                     deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
                     telemetry,
                     handler,
-                    router,
-                    subsystem.clone(),
+                    response,
                 ),
             )
             .await
@@ -448,14 +361,13 @@ where
         };
 
         let (built, config) = if let Some(subsystem) = &self.subsystem {
-            Self::build_responding_consumer(
+            Self::build_consumer(
                 config,
                 shared,
                 self.producer.clone(),
                 self.telemetry.clone(),
                 handler.clone(),
-                &self.router,
-                subsystem,
+                Responding::<Reply<T>, _>::new(&self.router, subsystem.clone()),
             )
             .await
         } else {
@@ -465,6 +377,7 @@ where
                 self.producer.clone(),
                 self.telemetry.clone(),
                 handler.clone(),
+                NoResponses,
             )
             .await
         };

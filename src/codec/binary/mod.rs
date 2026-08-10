@@ -1,7 +1,6 @@
 //! Binary codec that copies bytes verbatim and uses a caller-supplied
 //! function to extract event metadata (id and type).
 
-use bytes::BytesMut;
 use serde::Deserialize;
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_slice_with_buffers;
@@ -155,17 +154,6 @@ impl<E: BinaryExtractor, F: BinaryFormat> Codec for BinaryCodec<E, F> {
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error> {
         let bytes = buf.to_vec();
         let metadata = self.extractor.extract(buf)?;
-        Ok(BinaryPayload {
-            bytes,
-            event_id: metadata.event_id.map(Into::into),
-            event_type: metadata.event_type.map(Into::into),
-        })
-    }
-
-    fn deserialize_owned(&mut self, mut buf: BytesMut) -> Result<Self::Payload, Self::Error> {
-        // Preserve the original wire bytes because an extractor can mutate its input.
-        let bytes = buf.to_vec();
-        let metadata = self.extractor.extract(&mut buf)?;
         Ok(BinaryPayload {
             bytes,
             event_id: metadata.event_id.map(Into::into),

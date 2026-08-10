@@ -32,17 +32,17 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// Terminates one middleware stack without peer responses.
-struct NoResponses;
+pub(crate) struct NoResponses;
 
 /// Terminates one middleware stack with peer responses.
-struct Responding<'a, C, R> {
+pub(crate) struct Responding<'a, C, R> {
     router: &'a R,
     subsystem: SubsystemName,
     codec: PhantomData<fn() -> C>,
 }
 
 /// Selects one consumer's leaf and peer resources at compile time.
-trait ResponsePolicy<H>
+pub(crate) trait ResponsePolicy<H>
 where
     H: FallibleHandler + Clone + Send + Sync + 'static,
 {
@@ -51,6 +51,7 @@ where
     >;
     type Admission: RequestAdmission + 'static;
 
+    fn subsystem(&self) -> Option<&SubsystemName>;
     fn terminate(self, handler: H) -> (Self::Leaf, Self::Admission);
 }
 
@@ -61,6 +62,10 @@ where
     type Admission = NoRequests;
     type Leaf = FallibleCloneProvider<LeafHandler<H>>;
 
+    fn subsystem(&self) -> Option<&SubsystemName> {
+        None
+    }
+
     fn terminate(self, handler: H) -> (Self::Leaf, Self::Admission) {
         (
             FallibleCloneProvider::new(LeafHandler::new(handler)),
@@ -70,7 +75,7 @@ where
 }
 
 impl<C, R> Responding<'_, C, R> {
-    const fn new(router: &R, subsystem: SubsystemName) -> Responding<'_, C, R> {
+    pub(crate) const fn new(router: &R, subsystem: SubsystemName) -> Responding<'_, C, R> {
         Responding {
             router,
             subsystem,
@@ -89,6 +94,10 @@ where
 {
     type Admission = SubsystemRequests;
     type Leaf = FallibleCloneProvider<RespondHandler<LeafHandler<H>, C, R::Response>>;
+
+    fn subsystem(&self) -> Option<&SubsystemName> {
+        Some(&self.subsystem)
+    }
 
     fn terminate(self, handler: H) -> (Self::Leaf, Self::Admission) {
         let responder = Arc::new(Responder::new_route(
