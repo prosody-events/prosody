@@ -9,7 +9,7 @@ use super::registry::{PendingRegistry, Registration};
 use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
-use crate::requester::{Outcome, ProsodyRequester, ResponseFailure};
+use crate::requester::{ProsodyRequester, ResponseError};
 use crate::response::frame::ResponseFrame;
 use crate::response::headers::{RequestDeadline, RequestTag};
 use crate::response::{FormatToken, RequestId, ResponseStatus};
@@ -216,7 +216,7 @@ pub(super) async fn unanswered_call() -> Result<()> {
     let registry = registry();
     let requester = requester(registry)?;
     let awaited = names(&[SUBSYSTEM])?;
-    let outcomes = requester
+    let results = requester
         .request::<_, u32, TestError>(
             empty(),
             Topic::from(TOPIC),
@@ -227,8 +227,8 @@ pub(super) async fn unanswered_call() -> Result<()> {
         )
         .await?;
     ensure!(
-        outcomes == vec![Outcome::Failed(ResponseFailure::Timeout)],
-        "nothing answered this call, so its one outcome must be a timeout"
+        results == vec![Err(ResponseError::Timeout)],
+        "nothing answered this call, so its one result must be a timeout"
     );
     Ok(())
 }

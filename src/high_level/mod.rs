@@ -16,7 +16,7 @@ pub use crate::high_level::error::HighLevelClientError;
 pub use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
-use crate::requester::{Outcome, ProsodyRequester, RequestError};
+use crate::requester::{ProsodyRequester, RequestError, ResponseError};
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state_reader::ConsumerReaderBackend;
 use crate::state_reader::StateReaderDependencies;
@@ -163,12 +163,12 @@ where
         Ok(())
     }
 
-    /// Sends one request and returns one outcome per subsystem.
+    /// Sends one request and returns one result per subsystem.
     ///
     /// # Errors
     ///
-    /// Returns [`RequestError`] for an unavailable runtime, invalid arguments,
-    /// failed admission, a produce failure without a response, or shutdown.
+    /// Returns [`RequestError`] for invalid arguments, a produce failure, or
+    /// shutdown.
     pub async fn request<'a, H>(
         &self,
         headers: H,
@@ -177,7 +177,7 @@ where
         payload: T::Payload,
         subsystems: &[SubsystemName],
         timeout: Duration,
-    ) -> Result<Vec<Outcome<T::Output, T::Error>>, RequestError<WireError<T>>>
+    ) -> Result<Vec<Result<T::Output, ResponseError<T::Error>>>, RequestError<WireError<T>>>
     where
         H: IntoIterator<Item = (&'a str, &'a str)> + Send,
         H::IntoIter: ExactSizeIterator + Send,
@@ -196,7 +196,7 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Outcome<T::Output, T::Error>>, RequestError<WireError<T>>> {
+    ) -> Result<Vec<Result<T::Output, ResponseError<T::Error>>>, RequestError<WireError<T>>> {
         self.request(
             headers
                 .iter()

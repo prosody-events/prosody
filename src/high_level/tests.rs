@@ -171,7 +171,7 @@ fn a_mock_client_round_trips_one_peer_request() -> Result<()> {
                     Duration::from_secs(1),
                 )
                 .await?;
-            assert_eq!(outcomes, vec![Outcome::Ok(payload)]);
+            assert_eq!(outcomes, vec![Ok(payload)]);
             Ok(())
         }
         .await;

@@ -1,7 +1,7 @@
 //! Concurrent Kafka delivery and subsystem response collection.
 
 use super::registry::Registration;
-use super::{Outcome, RequestError, ResponseFailure};
+use super::{RequestError, ResponseError};
 use crate::Codec;
 use crate::error::ClassifyError;
 use crate::producer::ProducerError;
@@ -18,11 +18,11 @@ use tokio::time::sleep_until;
 /// Races Kafka delivery, subsystem responses, and the request deadline.
 ///
 /// Before the deadline, completion requires both the Kafka report and every
-/// subsystem outcome. Thus, responses cannot cancel producer side effects.
+/// subsystem result. Thus, responses cannot cancel producer side effects.
 pub(crate) async fn collect<R, V, E, F, PE>(
     registration: &mut Registration,
     produce: F,
-) -> Result<Vec<Outcome<V, E>>, RequestError<PE>>
+) -> Result<Vec<Result<V, ResponseError<E>>>, RequestError<PE>>
 where
     R: Codec<Payload = Result<V, E>>,
     E: ClassifyError,
@@ -31,9 +31,9 @@ where
 {
     let deadline = registration.deadline();
     let waiters = registration.take_waiters();
-    let mut outcomes: Vec<Outcome<V, E>> = (0..waiters.len())
-        .map(|_| Outcome::Failed(ResponseFailure::Timeout))
-        .collect();
+    let mut results = (0..waiters.len())
+        .map(|_| Err(ResponseError::Timeout))
+        .collect::<Vec<_>>();
     let mut responses = FuturesUnordered::new();
     for (index, waiter) in waiters.into_iter().enumerate() {
         responses.push(waiter.map(move |frame| (index, frame)));
@@ -51,7 +51,7 @@ where
             }
             Some((index, frame)) = responses.next() => {
                 if let Ok(frame) = frame {
-                    outcomes[index] = decode::<R, V, E>(frame);
+                    results[index] = decode::<R, V, E>(frame);
                 } else if registration.is_closed() {
                     return Err(RequestError::ShuttingDown);
                 }
@@ -60,27 +60,25 @@ where
         }
     }
 
-    Ok(outcomes)
+    Ok(results)
 }
 
-fn decode<R, V, E>(frame: ResponseFrame) -> Outcome<V, E>
+fn decode<R, V, E>(frame: ResponseFrame) -> Result<V, ResponseError<E>>
 where
     R: Codec<Payload = Result<V, E>>,
     E: ClassifyError,
 {
     if frame.format.to_str() != R::FORMAT_ID {
-        return Outcome::Failed(ResponseFailure::FormatMismatch);
+        return Err(ResponseError::FormatMismatch);
     }
     R::with_cached_local(|codec| match codec.deserialize_bytes(frame.payload) {
-        Ok(Ok(value)) if frame.header.status == ResponseStatus::Success => Outcome::Ok(value),
+        Ok(Ok(value)) if frame.header.status == ResponseStatus::Success => Ok(value),
         Ok(Err(error)) => match frame.header.status {
             ResponseStatus::Error(category) if category == error.classify_error() => {
-                Outcome::Handler(error)
+                Err(ResponseError::Handler(error))
             }
-            ResponseStatus::Success | ResponseStatus::Error(_) => {
-                Outcome::Failed(ResponseFailure::Malformed)
-            }
+            ResponseStatus::Success | ResponseStatus::Error(_) => Err(ResponseError::Malformed),
         },
-        Err(_) | Ok(Ok(_)) => Outcome::Failed(ResponseFailure::Malformed),
+        Err(_) | Ok(Ok(_)) => Err(ResponseError::Malformed),
     })
 }

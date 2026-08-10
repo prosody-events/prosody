@@ -5,7 +5,7 @@ pub(crate) mod registry;
 
 use self::collect::collect;
 use self::registry::PendingRegistry;
-use crate::error::ClassifyError;
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::producer::{ProducerError, ProsodyProducer};
 use crate::response::RequestId;
 use crate::response::headers::{
@@ -48,27 +48,15 @@ static LATENCY: LazyLock<Histogram<f64>> = LazyLock::new(|| {
         .build()
 });
 
-/// One answer for one requested subsystem.
+/// Why one requested subsystem produced no successful response.
 ///
-/// This flat union can cross the JavaScript, Python, Ruby, and C boundaries as
-/// a value. Its order matches the requested subsystem slice.
-#[derive(Debug, PartialEq)]
-pub enum Outcome<V, E> {
-    /// The handler succeeded and the payload decoded.
-    Ok(V),
-    /// The handler failed and its error decoded.
-    ///
-    /// The wire status agrees with what this error classifies as, because a
-    /// frame whose two accounts disagree is [`ResponseFailure::Malformed`].
-    /// So the category is read off the error and is never stored beside it.
+/// Handler errors keep their category. A timeout is transient. An invalid or
+/// incompatible response is permanent for that request.
+#[derive(Debug, Error, PartialEq)]
+pub enum ResponseError<E> {
+    /// The handler returned an error.
+    #[error("handler failed: {0}")]
     Handler(E),
-    /// The subsystem produced no usable answer.
-    Failed(ResponseFailure),
-}
-
-/// Why one requested subsystem produced no usable answer.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum ResponseFailure {
     /// No response arrived before the deadline.
     #[error("no response arrived before the deadline")]
     Timeout,
@@ -80,7 +68,17 @@ pub enum ResponseFailure {
     Malformed,
 }
 
-/// Why one complete request failed before it could return subsystem outcomes.
+impl<E: ClassifyError> ClassifyError for ResponseError<E> {
+    fn classify_error(&self) -> ErrorCategory {
+        match self {
+            Self::Handler(error) => error.classify_error(),
+            Self::Timeout => ErrorCategory::Transient,
+            Self::FormatMismatch | Self::Malformed => ErrorCategory::Permanent,
+        }
+    }
+}
+
+/// Why one complete request failed before it could return subsystem results.
 ///
 /// This enum has no [`ClassifyError`] impl on purpose. Nothing retries a
 /// request for the caller, so a classification would have no consumer.
@@ -147,8 +145,8 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
     ///
     /// # Errors
     ///
-    /// Returns [`RequestError`] for invalid arguments, failed admission, a
-    /// produce failure without a response, or shutdown.
+    /// Returns [`RequestError`] for invalid arguments, a produce failure, or
+    /// shutdown.
     pub async fn request<'a, H, V, E>(
         &self,
         headers: H,
@@ -157,7 +155,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         payload: C::Payload,
         subsystems: &[SubsystemName],
         timeout: Duration,
-    ) -> Result<Vec<Outcome<V, E>>, RequestError<C::Error>>
+    ) -> Result<Vec<Result<V, ResponseError<E>>>, RequestError<C::Error>>
     where
         H: IntoIterator<Item = (&'a str, &'a str)> + Send,
         H::IntoIter: ExactSizeIterator + Send,
@@ -196,7 +194,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         payload: C::Payload,
         subsystems: &[SubsystemName],
         timeout: Duration,
-    ) -> Result<Vec<Outcome<V, E>>, RequestError<C::Error>>
+    ) -> Result<Vec<Result<V, ResponseError<E>>>, RequestError<C::Error>>
     where
         C::Payload: EventIdentity,
         R: Codec<Payload = Result<V, E>>,
@@ -235,11 +233,11 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             "request.latency_ms",
             elapsed.as_millis().min(i64::MAX as u128) as i64,
         );
-        if let Ok(outcomes) = &collected {
-            let answered = outcomes.iter().filter(|outcome| outcome.answered()).count();
-            let completeness = completeness(answered, outcomes.len());
+        if let Ok(results) = &collected {
+            let answered = results.iter().filter(|result| answered(result)).count();
+            let completeness = completeness(answered, results.len());
             Span::current().record("responses.received", answered as i64);
-            Span::current().record("responses.missing", display(Missing(subsystems, outcomes)));
+            Span::current().record("responses.missing", display(Missing(subsystems, results)));
             Span::current().record("request.outcome", completeness);
             LATENCY.record(waited, &[KeyValue::new("outcome", completeness)]);
         } else {
@@ -276,13 +274,13 @@ where
     Ok(owned)
 }
 
-struct Missing<'a, V, E>(&'a [SubsystemName], &'a [Outcome<V, E>]);
+struct Missing<'a, V, E>(&'a [SubsystemName], &'a [Result<V, ResponseError<E>>]);
 
 impl<V, E> Display for Missing<'_, V, E> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         let mut separator = "";
-        for (subsystem, outcome) in self.0.iter().zip(self.1) {
-            if !outcome.answered() {
+        for (subsystem, result) in self.0.iter().zip(self.1) {
+            if !answered(result) {
                 write!(formatter, "{separator}{subsystem}")?;
                 separator = ",";
             }
@@ -291,14 +289,9 @@ impl<V, E> Display for Missing<'_, V, E> {
     }
 }
 
-impl<V, E> Outcome<V, E> {
-    /// Whether the subsystem this outcome stands for answered at all.
-    ///
-    /// Every other failure is an answer that could not be used, which is a
-    /// different fact from silence.
-    const fn answered(&self) -> bool {
-        !matches!(self, Self::Failed(ResponseFailure::Timeout))
-    }
+/// Whether one subsystem answered at all.
+fn answered<V, E>(response: &Result<V, ResponseError<E>>) -> bool {
+    !matches!(response, Err(ResponseError::Timeout))
 }
 
 /// How complete one request's answers were, as the fixed label its latency is

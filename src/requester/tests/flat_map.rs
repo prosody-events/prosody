@@ -7,7 +7,7 @@ use super::{
 use crate::producer::ProducerError;
 use crate::requester::collect::collect;
 use crate::requester::registry::tests::pending_len;
-use crate::requester::{Outcome, RequestError, ResponseFailure};
+use crate::requester::{RequestError, ResponseError};
 use crate::response::ResponseDisposition;
 use crate::router::loopback::paused;
 use color_eyre::Result;
@@ -72,10 +72,10 @@ async fn each_waiter_is_removed_once() -> Result<()> {
         ResponseDisposition::Accepted
     );
 
-    let outcomes =
+    let results =
         collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, pending())
             .await?;
-    assert_eq!(outcomes, vec![Outcome::Ok(1), Outcome::Ok(2)]);
+    assert_eq!(results, vec![Ok(1), Ok(2)]);
     drop(registration);
     assert_eq!(pending_len(&registry), 0);
     Ok(())
@@ -108,7 +108,7 @@ async fn responses_do_not_cancel_producer_completion() -> Result<()> {
         "responses completed the request before producer completion"
     );
     assert!(complete.send(()).is_ok());
-    assert_eq!(collected.await?, vec![Outcome::Ok(1)]);
+    assert_eq!(collected.await?, vec![Ok(1)]);
     Ok(())
 }
 
@@ -121,17 +121,14 @@ async fn every_request_exit_removes_remaining_waiters() -> Result<()> {
     assert_eq!(pending_len(&registry), 0, "cancellation left waiters");
 
     let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
-    let outcomes =
+    let results =
         collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, async {
             Ok::<(), ProducerError<TestCodecError>>(())
         })
         .await?;
     assert_eq!(
-        outcomes,
-        vec![
-            Outcome::Failed(ResponseFailure::Timeout),
-            Outcome::Failed(ResponseFailure::Timeout),
-        ]
+        results,
+        vec![Err(ResponseError::Timeout), Err(ResponseError::Timeout)]
     );
     drop(registration);
     assert_eq!(pending_len(&registry), 0, "timeout left waiters");
@@ -186,16 +183,16 @@ fn run_arrivals(trace: ArrivalTrace) -> Result<()> {
             );
         }
 
-        let outcomes =
+        let results =
             collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, pending())
                 .await?;
         assert_eq!(
-            outcomes,
+            results,
             expected
                 .into_iter()
                 .map(|value| match value {
-                    Some(value) => Outcome::Ok(value),
-                    None => Outcome::Failed(ResponseFailure::Timeout),
+                    Some(value) => Ok(value),
+                    None => Err(ResponseError::Timeout),
                 })
                 .collect::<Vec<_>>()
         );

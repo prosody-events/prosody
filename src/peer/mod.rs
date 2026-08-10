@@ -15,7 +15,7 @@ pub(crate) mod runtime;
 #[cfg(test)]
 pub(crate) use backend::PeerBackend;
 
-pub use crate::requester::{Outcome, ProsodyRequester, RequestError, ResponseFailure};
+pub use crate::requester::{ProsodyRequester, RequestError, ResponseError};
 pub use crate::router::config::{
     PeerConfiguration, PeerConfigurationBuilder, PeerConfigurationBuilderError,
 };

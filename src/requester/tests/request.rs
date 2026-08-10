@@ -5,8 +5,9 @@ use super::{
     NODE, POOL, RequestPayload, TestError, distinct_indices, names, poll_once, registry, requester,
 };
 use crate::Topic;
+use crate::error::{ClassifyError, ErrorCategory};
 use crate::requester::registry::tests::pending_len;
-use crate::requester::{Outcome, RequestError, ResponseFailure, append_request_headers};
+use crate::requester::{RequestError, ResponseError, append_request_headers};
 use crate::response::RequestId;
 use crate::response::headers::RequestDeadline;
 use crate::response::headers::{
@@ -34,6 +35,28 @@ const USER_NAMES: [&str; 3] = ["tenant", "correlation", "priority"];
 
 /// Header values a caller may supply.
 const USER_VALUES: [&str; 3] = ["alpha", "beta", "gamma"];
+
+#[test]
+fn response_errors_keep_their_retry_posture() {
+    let errors = [
+        ResponseError::Handler(TestError {
+            value: 1,
+            category: ErrorCategory::Terminal,
+        }),
+        ResponseError::Timeout,
+        ResponseError::FormatMismatch,
+        ResponseError::Malformed,
+    ];
+    assert_eq!(
+        errors.map(|error| error.classify_error()),
+        [
+            ErrorCategory::Terminal,
+            ErrorCategory::Transient,
+            ErrorCategory::Permanent,
+            ErrorCategory::Permanent,
+        ]
+    );
+}
 
 /// The subsystem sets and caller headers one request carries.
 ///
@@ -149,7 +172,7 @@ async fn invalid_arguments_are_refused_before_registration() -> Result<()> {
 }
 
 /// One valid call holds a registry record before its record reaches Kafka,
-/// answers one outcome per named subsystem, and then leaves the registry empty.
+/// answers one result per named subsystem, and then leaves the registry empty.
 #[tokio::test(start_paused = true)]
 async fn a_valid_call_registers_first_and_gives_its_record_back() -> Result<()> {
     let registry = registry();
@@ -175,11 +198,8 @@ async fn a_valid_call_registers_first_and_gives_its_record_back() -> Result<()> 
 
     assert_eq!(
         call.await?,
-        vec![
-            Outcome::Failed(ResponseFailure::Timeout),
-            Outcome::Failed(ResponseFailure::Timeout),
-        ],
-        "one unanswered outcome must come back per named subsystem"
+        vec![Err(ResponseError::Timeout), Err(ResponseError::Timeout)],
+        "one unanswered result must come back per named subsystem"
     );
     assert_eq!(
         pending_len(&registry),

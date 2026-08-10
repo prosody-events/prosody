@@ -158,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Peer requests
 
 Peer requests let a producer ask named subsystems to process one Kafka event.
-The request returns one ordered outcome for each subsystem.
+The request returns one ordered result for each subsystem.
 A client can send requests without a subscription.
 A subscribed client responds when its configured subsystem receives a request.
 Local requests stay in the process.
@@ -166,7 +166,7 @@ Remote responses use peer gRPC routes.
 
 ```rust,ignore
 let subsystems = [SubsystemName::try_new("inventory")?];
-let outcomes = client
+let results = client
     .request(
         [("x-tenant", "north")],
         "orders".into(),
@@ -177,11 +177,10 @@ let outcomes = client
     )
     .await?;
 
-for outcome in outcomes {
-    match outcome {
-        Outcome::Ok(response) => println!("{response}"),
-        Outcome::Handler(error) => eprintln!("handler failed: {error}"),
-        Outcome::Failed(failure) => eprintln!("response failed: {failure}"),
+for result in results {
+    match result {
+        Ok(response) => println!("{response}"),
+        Err(error) => eprintln!("response failed: {error}"),
     }
 }
 ```

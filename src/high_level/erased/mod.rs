@@ -9,7 +9,7 @@ use crate::high_level::{
     HighLevelClientError, MemoryHighLevelClient, Mode, Wire, WireError,
 };
 use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder};
-use crate::requester::{Outcome, RequestError};
+use crate::requester::{RequestError, ResponseError};
 use crate::state_reader::ConsumerReaderBackend;
 use crate::subsystem::SubsystemName;
 use crate::{EventIdentity, EventType, Topic};
@@ -71,7 +71,7 @@ where
         key: String,
         payload: T::Payload,
     ) -> Result<(), HighLevelClientError<WireError<T>>>;
-    /// Sends one request and returns one outcome per subsystem.
+    /// Sends one request and returns one result per subsystem.
     async fn request(
         &self,
         headers: Vec<(String, String)>,
@@ -80,7 +80,7 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Outcome<T::Output, T::Error>>, RequestError<WireError<T>>>;
+    ) -> Result<Vec<Result<T::Output, ResponseError<T::Error>>>, RequestError<WireError<T>>>;
     /// Starts consuming.
     async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>>;
     /// Stops consuming.
@@ -188,7 +188,7 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Outcome<T::Output, T::Error>>, RequestError<WireError<T>>> {
+    ) -> Result<Vec<Result<T::Output, ResponseError<T::Error>>>, RequestError<WireError<T>>> {
         self.0
             .request_owned(headers, topic, key, payload, subsystems, timeout)
             .await
