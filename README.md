@@ -71,7 +71,6 @@ prosody = "0.1"
 ```rust,no_run
 use prosody::prelude::*;
 use serde_json::json;
-use std::convert::Infallible;
 
 #[derive(Clone)]
 struct MyHandler;
@@ -111,7 +110,7 @@ impl FallibleHandler for MyHandler {
 }
 
 impl ClientHandler for MyHandler {
-    type Codecs = Codecs<JsonCodec, UnitCodec, InfallibleCodec>;
+    type Codecs = Codecs<JsonCodec, UnitCodec>;
 }
 
 #[tokio::main]
