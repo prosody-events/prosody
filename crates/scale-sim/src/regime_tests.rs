@@ -367,11 +367,12 @@ fn historical_message_count(history: HistoricalSeries) -> Result<u32, PrincipalR
 }
 
 #[test]
-fn historical_match_changes_the_prearrival_decision() -> Result<(), PrincipalRunError> {
+fn matching_history_changes_prearrival_decision_and_requests_step_capacity()
+-> Result<(), PrincipalRunError> {
     let one_tick = RunSchedule {
         start_micros: 0,
-        workload_start_micros: 0,
-        workload_end_micros: 0,
+        workload_start_micros: super::HISTORY_START_MICROS,
+        workload_end_micros: super::HISTORY_END_MICROS,
         workload_interval_micros: 1,
         followup_interval_micros: 1,
         maximum_micros: 0,
@@ -381,22 +382,32 @@ fn historical_match_changes_the_prearrival_decision() -> Result<(), PrincipalRun
     };
     let mut matched = PrincipalDefinition::for_regime(PrincipalRegime::HistoricalMatch);
     let mut missing = PrincipalDefinition::for_regime(PrincipalRegime::HistoricalMissing);
+    let initial_replicas = matched.initial_replicas;
+    let handler_micros = matched.inputs.handler_micros;
+    let step_rate = matched.inputs.history.segments[1].rate_per_second;
     matched.schedule = one_tick;
     missing.schedule = one_tick;
     let matched = run_principal_definition(PrincipalRegime::HistoricalMatch, matched, None)?;
     let missing = run_principal_definition(PrincipalRegime::HistoricalMissing, missing, None)?;
-    let matched_target = matched
-        .controller()
-        .sample(0)
-        .map_or(0, |sample| sample.target);
+    let matched_sample = matched.controller().sample(0);
+    let matched_target = matched_sample.map_or(0, |sample| sample.target);
     let missing_target = missing
         .controller()
         .sample(0)
         .map_or(0, |sample| sample.target);
+    let target_handler_micros_per_second =
+        u64::from(matched_target) * u64::from(super::DEFAULT_CONCURRENCY_PER_REPLICA) * 1_000_000;
+    let step_handler_micros_per_second = u64::from(step_rate) * handler_micros;
 
-    assert!(
-        matched_target > missing_target,
+    assert_ne!(
+        matched_target, missing_target,
         "matched target={matched_target}, missing target={missing_target}"
+    );
+    assert!(
+        matched_sample.is_some_and(|sample| sample.at_micros < super::HISTORY_START_MICROS)
+            && matched_target > initial_replicas
+            && target_handler_micros_per_second >= step_handler_micros_per_second,
+        "target {matched_target} did not prepare for the {step_rate}/s historical step"
     );
     Ok(())
 }
