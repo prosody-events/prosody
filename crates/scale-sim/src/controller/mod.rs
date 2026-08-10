@@ -695,13 +695,20 @@ impl ControllerTrace {
 
     fn push(
         &mut self,
-        sample: ControllerSample,
+        sample: &ControllerSample,
         state: &ScaleState,
         scratch: &ScaleScratch,
     ) -> Result<(), PlantError> {
         if self.at_micros.len() == self.at_micros.capacity() {
             return Err(PlantError::MetricCapacity);
         }
+        self.push_sample_columns(sample);
+        self.push_decision_curves(scratch)?;
+        self.push_posteriors(state)?;
+        Ok(())
+    }
+
+    fn push_sample_columns(&mut self, sample: &ControllerSample) {
         self.at_micros.push(sample.at_micros);
         self.scenario_count.push(sample.scenario_count);
         self.target.push(sample.target);
@@ -785,6 +792,9 @@ impl ControllerTrace {
             .push(sample.capacity_predictive_high_per_second);
         self.capacity_predictive_rank
             .push(sample.capacity_predictive_rank);
+    }
+
+    fn push_decision_curves(&mut self, scratch: &ScaleScratch) -> Result<(), PlantError> {
         let decision_start = self.decision_expected_losses.len();
         let decision_end = decision_start
             .checked_add(self.decision_candidate_count)
@@ -819,6 +829,10 @@ impl ControllerTrace {
             decision_start,
             decision_end,
         )?;
+        Ok(())
+    }
+
+    fn push_posteriors(&mut self, state: &ScaleState) -> Result<(), PlantError> {
         let posterior_start = self.capacity_posterior_probabilities.len();
         let posterior_end = posterior_start
             .checked_add(self.capacity_posterior_values.len())
@@ -1178,7 +1192,7 @@ impl<Workload> ClosedLoop<Workload> {
         context: TickContext<'_>,
         inputs: TickInputs,
         reporter: ReporterDirective,
-        calendar: Option<CalendarForecastInput>,
+        calendar: Option<&CalendarForecastInput>,
         scheduled_releases: &ScheduledReleasesInput,
     ) -> Result<(), PlantError>
     where
@@ -1212,7 +1226,7 @@ impl<Workload> ClosedLoop<Workload> {
             let requested_at = ModelTime::from_micros(pending.requested_at_micros);
             let commitment = active_transition
                 .filter(|active| *active == index)
-                .and_then(|_| context.plant.reconciliation_started_micros)
+                .and(context.plant.reconciliation_started_micros)
                 .map_or_else(
                     || {
                         ActuationCommitment::launching(
@@ -1754,7 +1768,7 @@ impl<Workload> ClosedLoop<Workload> {
             }
         };
         self.track_scale_request(context, inputs.scale)?;
-        self.trace.push(sample, &self.state, &self.scratch)?;
+        self.trace.push(&sample, &self.state, &self.scratch)?;
         Ok(inputs)
     }
 
@@ -2160,7 +2174,13 @@ impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
         let reporter = self.workload.reporter(context);
         let calendar = self.workload.calendar_forecast(context)?;
         let scheduled_releases = self.workload.scheduled_releases(context)?;
-        self.prepare_observation(context, inputs, reporter, calendar, &scheduled_releases)?;
+        self.prepare_observation(
+            context,
+            inputs,
+            reporter,
+            calendar.as_ref(),
+            &scheduled_releases,
+        )?;
         self.apply_decision(context, inputs, reporter)
     }
 

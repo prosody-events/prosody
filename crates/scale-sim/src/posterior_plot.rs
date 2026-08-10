@@ -1,6 +1,7 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
+use std::iter;
 use std::path::Path;
 
 use plotters::coord::Shift;
@@ -26,7 +27,7 @@ struct PosteriorPanel {
     unit: &'static str,
     heatmap: PosteriorHeatmap,
     prior: Vec<f64>,
-    y_label: fn(&f64) -> String,
+    y_label: fn(f64) -> String,
 }
 
 struct SnapshotSelection<'a> {
@@ -57,7 +58,7 @@ pub fn write_model_belief_figures(
             root.fill(&WHITE).map_err(|error| drawing_error(&error))?;
             draw_panel(&root, panel).map_err(|error| drawing_error(&error))?;
             root.present().map_err(|error| drawing_error(&error))?;
-        }
+        };
         fs::write(
             directory.join(format!("{}.svg", panel.file)),
             svg.replace("<rect ", "<rect shape-rendering=\"crispEdges\" "),
@@ -88,7 +89,7 @@ pub fn write_model_belief_snapshot_figures(
             root.fill(&WHITE).map_err(|error| drawing_error(&error))?;
             draw_snapshot_row(&root, panel).map_err(|error| drawing_error(&error))?;
             root.present().map_err(|error| drawing_error(&error))?;
-        }
+        };
         fs::write(directory.join(format!("{}.svg", panel.file)), svg)?;
     }
     Ok(())
@@ -148,7 +149,7 @@ pub(crate) fn draw_posterior_heatmap<Backend: DrawingBackend>(
                 },
                 |next| value.midpoint(*next),
             ) + vertical_overlap;
-            chart.draw_series(std::iter::once(Rectangle::new(
+            chart.draw_series(iter::once(Rectangle::new(
                 [(x_start, lower), (x_end, upper)],
                 posterior_color(probability / color_maximum).filled(),
             )))?;
@@ -213,7 +214,7 @@ fn draw_snapshot<Backend: DrawingBackend>(
         .y_labels(3)
         .x_desc(panel.unit)
         .y_desc("mass")
-        .x_label_formatter(&panel.y_label)
+        .x_label_formatter(&|value| (panel.y_label)(*value))
         .axis_style(RGBColor(180, 180, 180))
         .label_style(
             (PLOT_FONT_FAMILY, 18_i32)
@@ -241,7 +242,7 @@ fn draw_snapshot<Backend: DrawingBackend>(
         (high, RGBColor(135, 135, 135), 1_u32),
         (median, RGBColor(240, 125, 35), 2_u32),
     ] {
-        chart.draw_series(std::iter::once(PathElement::new(
+        chart.draw_series(iter::once(PathElement::new(
             vec![(value, 0.0_f64), (value, y_max * 0.96_f64)],
             color.stroke_width(width),
         )))?;
@@ -271,7 +272,7 @@ fn draw_panel<Backend: DrawingBackend>(
         .x_desc("virtual time")
         .y_desc(panel.unit)
         .x_label_formatter(&|micros| format_time(*micros))
-        .y_label_formatter(&panel.y_label)
+        .y_label_formatter(&|value| (panel.y_label)(*value))
         .axis_style(RGBColor(180, 180, 180))
         .label_style(
             (PLOT_FONT_FAMILY, 20_i32)
@@ -396,7 +397,11 @@ fn arrival_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
         };
         let start = probabilities.len();
         probabilities.extend(gamma_mass(posterior, &rates, &mut log_mass));
-        debug_assert_eq!(probabilities.len() - start, ARRIVAL_CELL_COUNT);
+        debug_assert_eq!(
+            probabilities.len() - start,
+            ARRIVAL_CELL_COUNT,
+            "each arrival posterior must contain one complete grid"
+        );
         at_micros.push(sample.at_micros);
     }
     PosteriorHeatmap {
@@ -546,9 +551,9 @@ fn interpolate_channel(low: u8, high: u8, fraction: f64) -> u8 {
 
 fn format_time(micros: u64) -> String {
     if micros >= 120_000_000 {
-        return format!("{:.1} min", micros as f64 / 60_000_000.0_f64);
+        return format!("{:.1} min", crate::u64_to_f64(micros) / 60_000_000.0_f64);
     }
-    format!("{:.1} s", micros as f64 / 1_000_000.0_f64)
+    format!("{:.1} s", crate::u64_to_f64(micros) / 1_000_000.0_f64)
 }
 
 fn value_bounds(values: &[f64]) -> (f64, f64) {
@@ -567,7 +572,7 @@ fn value_bounds(values: &[f64]) -> (f64, f64) {
     (lower, upper)
 }
 
-fn format_value(value: &f64) -> String {
+fn format_value(value: f64) -> String {
     if value.abs() < 0.01_f64 {
         return format!("{value:.4}");
     }
@@ -577,8 +582,8 @@ fn format_value(value: &f64) -> String {
     format!("{value:.1}")
 }
 
-fn format_log_rate(value: &f64) -> String {
-    let rate = 2.0_f64.powf(*value);
+fn format_log_rate(value: f64) -> String {
+    let rate = 2.0_f64.powf(value);
     if rate < 0.1_f64 {
         return format!("{rate:.3}");
     }

@@ -1,5 +1,5 @@
 use std::ops::Deref;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use prosody_scale_core::{
     CalendarArtifactId, CalendarRateSegment, CapacityGrid, CapacityPrior, Configuration,
@@ -1422,7 +1422,7 @@ fn run_schedule(
     let mut at_micros = schedule.start_micros;
     let mut stable_count = 0_u8;
     let tick_count_max = schedule.controller_sample_count_max()?;
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let mut progress_started = started;
     let mut tick_count = 0_u32;
     let mut progress_tick_count = 0_u32;
@@ -1436,7 +1436,7 @@ fn run_schedule(
         let target_changed =
             controller_sample.is_some_and(|sample| prior_target != Some(sample.target));
         if tick_count == 1 || tick_count.is_multiple_of(PROGRESS_INTERVAL) || target_changed {
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             let elapsed = now.duration_since(started).as_secs_f64();
             let progress_ticks = tick_count.saturating_sub(progress_tick_count);
             let recent_millis = now.duration_since(progress_started).as_secs_f64() * 1_000.0_f64

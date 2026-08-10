@@ -5,6 +5,7 @@
 
 use prosody_scale_core::{DemandClass, RandomStream};
 use rayon::prelude::*;
+use statrs::distribution::{BinomialError, NegativeBinomialError, PoissonError};
 use std::collections::VecDeque;
 use std::num::NonZeroU8;
 use thiserror::Error;
@@ -134,20 +135,20 @@ impl Kip848Rebalance {
         let domain = u64::from(change) << 32_u32 | u64::from(partition);
         let mut random = RandomStream::new(self.seed).domain(domain);
         ReconciliationTiming {
-            notification_micros: self.notification_micros.sample(&mut random),
-            revocation_micros: self.revocation_micros.sample(&mut random),
-            assignment_micros: self.assignment_micros.sample(&mut random),
-            warmup_micros: self.warmup_micros.sample(&mut random),
+            notification: self.notification_micros.sample(&mut random),
+            revocation: self.revocation_micros.sample(&mut random),
+            assignment: self.assignment_micros.sample(&mut random),
+            warmup: self.warmup_micros.sample(&mut random),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReconciliationTiming {
-    notification_micros: u64,
-    revocation_micros: u64,
-    assignment_micros: u64,
-    warmup_micros: u64,
+    notification: u64,
+    revocation: u64,
+    assignment: u64,
+    warmup: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1134,9 +1135,8 @@ impl<M: AttemptModel> Plant<M> {
         }
         match (normal, failure) {
             (Some(normal), Some(_)) if self.prefer_normal() => Some((normal, DemandClass::Normal)),
-            (Some(_), Some(failure)) => Some((failure, DemandClass::Failure)),
+            (Some(_) | None, Some(failure)) => Some((failure, DemandClass::Failure)),
             (Some(normal), None) => Some((normal, DemandClass::Normal)),
-            (None, Some(failure)) => Some((failure, DemandClass::Failure)),
             (None, None) => None,
         }
     }
@@ -1150,8 +1150,8 @@ impl<M: AttemptModel> Plant<M> {
         if normal_weight == 0.0_f64 {
             return false;
         }
-        self.normal_service_micros as f64 / normal_weight
-            <= self.failure_service_micros as f64 / failure_weight
+        u64_to_f64(self.normal_service_micros) / normal_weight
+            <= u64_to_f64(self.failure_service_micros) / failure_weight
     }
 
     fn start_attempt(&mut self, event: u32, class: DemandClass, now_micros: u64) {
@@ -1250,70 +1250,83 @@ impl<M: AttemptModel> Plant<M> {
             }
         }
         if let Some((outcome, count, final_outcome)) = retry {
-            match (class, outcome) {
-                (DemandClass::Normal, RetryOutcome::Transient) => {
-                    self.normal_transient_failures =
-                        self.normal_transient_failures.saturating_add(1);
-                }
-                (DemandClass::Normal, RetryOutcome::Terminal) => {
-                    self.normal_terminal_failures = self.normal_terminal_failures.saturating_add(1);
-                }
-                (DemandClass::Failure, RetryOutcome::Transient) => {
-                    self.failure_transient_failures =
-                        self.failure_transient_failures.saturating_add(1);
-                }
-                (DemandClass::Failure, RetryOutcome::Terminal) => {
-                    self.failure_terminal_failures =
-                        self.failure_terminal_failures.saturating_add(1);
-                }
-            }
-            let defer = self.retry_mode_by_event[event_index] == RetryMode::Deferred
-                || self.should_defer(now_micros);
-            self.record_attempt_outcome(now_micros, AttemptResult::Failure);
-            self.events[event_index].outcome =
-                count
-                    .after_one()
-                    .map_or(EventOutcome::Final(final_outcome), |count| {
-                        EventOutcome::Retry {
-                            outcome,
-                            count,
-                            final_outcome,
-                        }
-                    });
-            self.attempts_by_event[event_index] += 1;
-            let delay = if defer {
-                let retry_count = if self.retry_mode_by_event[event_index] == RetryMode::Deferred {
-                    self.deferred_retry_count[event_index].saturating_add(1)
-                } else {
-                    0
-                };
-                self.retry_mode_by_event[event_index] = RetryMode::Deferred;
-                self.deferred_retry_count[event_index] = retry_count;
-                self.key_active[spec.key as usize] = false;
-                self.deferred_retry_delay(event, retry_count)
-            } else {
-                self.inline_retry_delay(
-                    event,
-                    self.attempts_by_event[event_index].saturating_sub(1),
-                )
-            };
-            let wait = if defer {
-                RetryWait::Deferred
-            } else {
-                RetryWait::Inline
-            };
-            self.attempt_state[event_index] = AttemptState::Backoff(wait);
-            self.retry_ready_micros[event_index] = now_micros.saturating_add(delay);
-            heap_push(
-                &mut self.heap,
-                Scheduled {
-                    at_micros: self.retry_ready_micros[event_index],
-                    ordinal: event,
-                    kind: ScheduledKind::RetryReady(event),
-                },
-            );
+            self.finish_retry(event, class, now_micros, outcome, count, final_outcome);
             return;
         }
+        self.settle_final(event, class, now_micros, spec);
+    }
+
+    fn finish_retry(
+        &mut self,
+        event: u32,
+        class: DemandClass,
+        now_micros: u64,
+        outcome: RetryOutcome,
+        count: RetryCount,
+        final_outcome: FinalOutcome,
+    ) {
+        let event_index = event as usize;
+        let spec = self.events[event_index];
+        match (class, outcome) {
+            (DemandClass::Normal, RetryOutcome::Transient) => {
+                self.normal_transient_failures = self.normal_transient_failures.saturating_add(1);
+            }
+            (DemandClass::Normal, RetryOutcome::Terminal) => {
+                self.normal_terminal_failures = self.normal_terminal_failures.saturating_add(1);
+            }
+            (DemandClass::Failure, RetryOutcome::Transient) => {
+                self.failure_transient_failures = self.failure_transient_failures.saturating_add(1);
+            }
+            (DemandClass::Failure, RetryOutcome::Terminal) => {
+                self.failure_terminal_failures = self.failure_terminal_failures.saturating_add(1);
+            }
+        }
+        let defer = self.retry_mode_by_event[event_index] == RetryMode::Deferred
+            || self.should_defer(now_micros);
+        self.record_attempt_outcome(now_micros, AttemptResult::Failure);
+        self.events[event_index].outcome =
+            count
+                .after_one()
+                .map_or(EventOutcome::Final(final_outcome), |count| {
+                    EventOutcome::Retry {
+                        outcome,
+                        count,
+                        final_outcome,
+                    }
+                });
+        self.attempts_by_event[event_index] += 1;
+        let delay = if defer {
+            let retry_count = if self.retry_mode_by_event[event_index] == RetryMode::Deferred {
+                self.deferred_retry_count[event_index].saturating_add(1)
+            } else {
+                0
+            };
+            self.retry_mode_by_event[event_index] = RetryMode::Deferred;
+            self.deferred_retry_count[event_index] = retry_count;
+            self.key_active[spec.key as usize] = false;
+            self.deferred_retry_delay(event, retry_count)
+        } else {
+            self.inline_retry_delay(event, self.attempts_by_event[event_index].saturating_sub(1))
+        };
+        let wait = if defer {
+            RetryWait::Deferred
+        } else {
+            RetryWait::Inline
+        };
+        self.attempt_state[event_index] = AttemptState::Backoff(wait);
+        self.retry_ready_micros[event_index] = now_micros.saturating_add(delay);
+        heap_push(
+            &mut self.heap,
+            Scheduled {
+                at_micros: self.retry_ready_micros[event_index],
+                ordinal: event,
+                kind: ScheduledKind::RetryReady(event),
+            },
+        );
+    }
+
+    fn settle_final(&mut self, event: u32, class: DemandClass, now_micros: u64, spec: EventSpec) {
+        let event_index = event as usize;
         let final_outcome = spec.outcome.final_outcome();
         self.record_attempt_outcome(
             now_micros,
@@ -1480,11 +1493,11 @@ impl<M: AttemptModel> Plant<M> {
                 .configuration
                 .rebalance
                 .sample(change, partition as u32);
-            let pause_micros = now_micros.saturating_add(timing.notification_micros);
+            let pause_micros = now_micros.saturating_add(timing.notification);
             let ready_micros = pause_micros
-                .saturating_add(timing.revocation_micros)
-                .saturating_add(timing.assignment_micros)
-                .saturating_add(timing.warmup_micros);
+                .saturating_add(timing.revocation)
+                .saturating_add(timing.assignment)
+                .saturating_add(timing.warmup);
             let reconciliation = PartitionReconciliation::Scheduled {
                 target_owner: self.partition_target_owner[partition],
                 ready_micros,
@@ -1850,6 +1863,15 @@ fn to_usize(value: u32) -> Result<usize, PlantError> {
     usize::try_from(value).map_err(|_| PlantError::PlatformLimit)
 }
 
+/// Converts an integer with the same rounding as the primitive `u64` to `f64`
+/// conversion.
+fn u64_to_f64(value: u64) -> f64 {
+    let bytes = value.to_le_bytes();
+    let low = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let high = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    f64::from(high) * 4_294_967_296.0_f64 + f64::from(low)
+}
+
 /// Invalid plant input or capacity.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum PlantError {
@@ -1876,13 +1898,13 @@ pub enum PlantError {
     DecisionCurve(#[from] prosody_scale_core::DecisionCurveError),
     /// A predictive distribution parameter is invalid.
     #[error(transparent)]
-    PredictiveDistribution(#[from] statrs::distribution::PoissonError),
+    PredictiveDistribution(#[from] PoissonError),
     /// A paired predictive distribution parameter is invalid.
     #[error(transparent)]
-    PairedPredictiveDistribution(#[from] statrs::distribution::BinomialError),
+    PairedPredictiveDistribution(#[from] BinomialError),
     /// An arrival predictive distribution parameter is invalid.
     #[error(transparent)]
-    ArrivalPredictiveDistribution(#[from] statrs::distribution::NegativeBinomialError),
+    ArrivalPredictiveDistribution(#[from] NegativeBinomialError),
     /// Generated actuation evidence is invalid.
     #[error(transparent)]
     TransitionEvidence(#[from] prosody_scale_core::TransitionEvidenceError),

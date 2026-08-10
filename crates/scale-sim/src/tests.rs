@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use prosody_scale_core::{
     CapacityGrid, Configuration as ControllerConfiguration, RandomStream, ReliabilityPrior,
     ServiceObjective, TransitionPrior,
@@ -24,6 +26,9 @@ use crate::{
     validate_principal_regime,
 };
 use crate::{CapacityEvidenceKind, CapacityEvidenceSample};
+
+const STEP_MICROS: u64 = 180_000_000;
+const STEP_COUNT: usize = 7;
 
 #[test]
 fn generated_outcome_rules_reject_zero_sentinels() {
@@ -1177,8 +1182,6 @@ fn assert_linear_closed_loop_uses_only_controller_scale_targets(run: &crate::Pri
 
 #[test]
 fn linear_closed_loop_satisfies_its_declared_outcome() -> Result<(), TestError> {
-    const STEP_MICROS: u64 = 180_000_000;
-    const STEP_COUNT: usize = 7;
     let run = run_principal_regime(PrincipalRegime::LinearThroughput)?;
     assert_lead_time_diagnostics_use_prequential_predictive_distributions(&run)?;
     assert_linear_closed_loop_uses_only_controller_scale_targets(&run);
@@ -1271,6 +1274,16 @@ fn linear_closed_loop_satisfies_its_declared_outcome() -> Result<(), TestError> 
         run.settlements().len(),
         run.applied_changes(),
     );
+    assert_linear_scale_response(&run);
+    validate_principal_regime(
+        PrincipalRegime::LinearThroughput,
+        RegimeExperiment::ClosedLoop,
+        &run,
+    )?;
+    Ok(())
+}
+
+fn assert_linear_scale_response(run: &crate::PrincipalRun) {
     assert!(
         run.applied_changes()
             .iter()
@@ -1278,12 +1291,6 @@ fn linear_closed_loop_satisfies_its_declared_outcome() -> Result<(), TestError> 
         "the linear regime did not cross three ready replicas: {:?}",
         run.applied_changes()
     );
-    validate_principal_regime(
-        PrincipalRegime::LinearThroughput,
-        RegimeExperiment::ClosedLoop,
-        &run,
-    )?;
-    Ok(())
 }
 
 #[test]
@@ -1311,7 +1318,10 @@ fn capacity_median_matches_each_posterior_slice() -> Result<(), TestError> {
                 break;
             }
         }
-        assert_eq!(sample.capacity_median_per_second, expected);
+        assert_eq!(
+            sample.capacity_median_per_second.partial_cmp(&expected),
+            Some(Ordering::Equal)
+        );
     }
     Ok(())
 }
@@ -1950,9 +1960,9 @@ impl Arbitrary for EventTrace {
                 FinalOutcome::Success
             };
             let retry_count = u8::arbitrary(generator) % 3;
-            let outcome = match EventOutcome::from_transient_failures(retry_count, final_outcome) {
-                Ok(outcome) => outcome,
-                Err(_) => return Self(events),
+            let Ok(outcome) = EventOutcome::from_transient_failures(retry_count, final_outcome)
+            else {
+                return Self(events);
             };
             events.push(EventSpec {
                 release_micros: u64::arbitrary(generator) % 1_000_000,

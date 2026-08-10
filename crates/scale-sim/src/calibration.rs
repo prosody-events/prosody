@@ -439,7 +439,6 @@ fn summarize_lead_time_trial(
             return Err(CalibrationError::MissingControllerSample);
         };
         match sample.lead_time_evidence {
-            crate::LeadTimeEvidenceSample::None => continue,
             crate::LeadTimeEvidenceSample::Censored {
                 direction: observed,
                 ..

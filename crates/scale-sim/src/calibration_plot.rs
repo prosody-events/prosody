@@ -334,7 +334,7 @@ fn write_categorical_error_uncertainty<Calibration: CategoricalCalibrationPlot>(
     file: &str,
 ) -> Result<(), PlotError> {
     let maximum = calibration
-        .trials()
+        .plot_trials()
         .iter()
         .filter(|trial| calibration.include(trial))
         .map(|trial| Calibration::error(trial).max(Calibration::uncertainty(trial)))
@@ -369,7 +369,7 @@ fn write_categorical_error_uncertainty<Calibration: CategoricalCalibrationPlot>(
             chart
                 .draw_series(
                     calibration
-                        .trials()
+                        .plot_trials()
                         .iter()
                         .filter(|trial| {
                             calibration.include(trial) && Calibration::regime(trial) == regime
@@ -426,7 +426,7 @@ fn write_categorical_contraction<Calibration: CategoricalCalibrationPlot>(
             chart
                 .draw_series(
                     calibration
-                        .trials()
+                        .plot_trials()
                         .iter()
                         .filter(|trial| {
                             calibration.include(trial) && Calibration::regime(trial) == regime
@@ -1394,7 +1394,7 @@ trait CategoricalCalibrationPlot {
     type Trial;
     const RANK_AXIS_LABEL: &'static str;
 
-    fn trials(&self) -> &[Self::Trial];
+    fn plot_trials(&self) -> &[Self::Trial];
     fn include(&self, trial: &Self::Trial) -> bool;
     fn regime(trial: &Self::Trial) -> PrincipalRegime;
     fn observation_count(trial: &Self::Trial) -> u32;
@@ -1410,7 +1410,7 @@ impl CategoricalCalibrationPlot for LeadTimeDirectionView<'_> {
 
     const RANK_AXIS_LABEL: &'static str = "predictive probability decile";
 
-    fn trials(&self) -> &[Self::Trial] {
+    fn plot_trials(&self) -> &[Self::Trial] {
         self.calibration.trials()
     }
 
@@ -1452,7 +1452,7 @@ impl CategoricalCalibrationPlot for PartitionCalibration {
 
     const RANK_AXIS_LABEL: &'static str = "randomized predictive rank decile";
 
-    fn trials(&self) -> &[Self::Trial] {
+    fn plot_trials(&self) -> &[Self::Trial] {
         self.trials()
     }
 
@@ -1494,7 +1494,7 @@ fn categorical_regimes<Calibration: CategoricalCalibrationPlot>(
 ) -> Vec<PrincipalRegime> {
     let mut regimes = Vec::new();
     for trial in calibration
-        .trials()
+        .plot_trials()
         .iter()
         .filter(|trial| calibration.include(trial))
     {
@@ -1512,7 +1512,7 @@ fn categorical_counts<Calibration: CategoricalCalibrationPlot>(
     level_index: usize,
 ) -> (u64, u64) {
     calibration
-        .trials()
+        .plot_trials()
         .iter()
         .filter(|trial| calibration.include(trial) && Calibration::regime(trial) == regime)
         .fold((0_u64, 0_u64), |(covered, total), trial| {
@@ -1529,7 +1529,7 @@ fn categorical_rank_counts<Calibration: CategoricalCalibrationPlot>(
 ) -> [u32; 10] {
     let mut counts = [0_u32; 10];
     for trial in calibration
-        .trials()
+        .plot_trials()
         .iter()
         .filter(|trial| calibration.include(trial) && Calibration::regime(trial) == regime)
     {

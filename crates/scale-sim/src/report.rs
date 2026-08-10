@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::fmt::{self, Write};
 use std::fs;
 use std::io;
@@ -446,38 +447,7 @@ pub fn write_capacity_calibration_report_pdf(
              these results to validate collapse inference.\n",
         );
     }
-    write_plot_page(
-        &mut source,
-        "Coverage by stated level",
-        "capacity-coverage.svg",
-        "The gray diagonal marks exact calibration. Each colored line represents one operating \
-         regime.",
-        true,
-    )?;
-    write_plot_page(
-        &mut source,
-        "Randomized predictive ranks",
-        "capacity-ranks.svg",
-        "A calibrated discrete forecast produces uniform randomized ranks. The gray line marks \
-         the expected count per decile.",
-        true,
-    )?;
-    write_plot_page(
-        &mut source,
-        "Forecast error and uncertainty",
-        "capacity-error-uncertainty.svg",
-        "Each point represents one seeded trial. The gray diagonal separates forecast error from \
-         the stated 80% interval width.",
-        true,
-    )?;
-    write_plot_page(
-        &mut source,
-        "Posterior contraction",
-        "capacity-contraction.svg",
-        "Each point compares the final 10% to 90% capacity width with its prior width. One means \
-         that the marginal width collapsed to one grid value.",
-        true,
-    )?;
+    write_capacity_calibration_plots(&mut source)?;
     source.push_str(
         "#pagebreak()\n== Prior and grid sensitivity\n\nThe prior experiment keeps the grid \
          fixed. It changes the log-normal standard deviation by factors two, four, and \
@@ -502,6 +472,42 @@ pub fn write_capacity_calibration_report_pdf(
         true,
     )?;
     write_pdf(path, &source)
+}
+
+fn write_capacity_calibration_plots(source: &mut String) -> Result<(), fmt::Error> {
+    write_plot_page(
+        source,
+        "Coverage by stated level",
+        "capacity-coverage.svg",
+        "The gray diagonal marks exact calibration. Each colored line represents one operating \
+         regime.",
+        true,
+    )?;
+    write_plot_page(
+        source,
+        "Randomized predictive ranks",
+        "capacity-ranks.svg",
+        "A calibrated discrete forecast produces uniform randomized ranks. The gray line marks \
+         the expected count per decile.",
+        true,
+    )?;
+    write_plot_page(
+        source,
+        "Forecast error and uncertainty",
+        "capacity-error-uncertainty.svg",
+        "Each point represents one seeded trial. The gray diagonal separates forecast error from \
+         the stated 80% interval width.",
+        true,
+    )?;
+    write_plot_page(
+        source,
+        "Posterior contraction",
+        "capacity-contraction.svg",
+        "Each point compares the final 10% to 90% capacity width with its prior width. One means \
+         that the marginal width collapsed to one grid value.",
+        true,
+    )?;
+    Ok(())
 }
 
 /// Writes the repeated demand calibration report.
@@ -789,42 +795,7 @@ pub fn write_lead_time_calibration_report_pdf(
         ")\n\nThe experiment contains few completed transitions. Treat coverage estimates as \
          sparse evidence. The broad predictive intervals cover every completed transition.\n",
     );
-    for (direction, name) in [
-        (TransitionDirection::Up, "up"),
-        (TransitionDirection::Down, "down"),
-    ] {
-        let title = transition_direction_name(direction);
-        write_plot_page(
-            &mut source,
-            &format!("Scale-{title} coverage"),
-            &format!("lead-time-{name}-coverage.svg"),
-            "The gray diagonal marks exact calibration. Each panel isolates one operating regime.",
-            true,
-        )?;
-        write_plot_page(
-            &mut source,
-            &format!("Scale-{title} predictive ranks"),
-            &format!("lead-time-{name}-ranks.svg"),
-            "Uniform ranks indicate a calibrated continuous forecast. Sparse bars reflect few \
-             completed transitions.",
-            true,
-        )?;
-        write_plot_page(
-            &mut source,
-            &format!("Scale-{title} error and uncertainty"),
-            &format!("lead-time-{name}-error-uncertainty.svg"),
-            "Each point compares median error with the 80% predictive interval width.",
-            true,
-        )?;
-        write_plot_page(
-            &mut source,
-            &format!("Scale-{title} posterior contraction"),
-            &format!("lead-time-{name}-contraction.svg"),
-            "Each point measures the one-replica parameter posterior. Evidence for other replica \
-             deltas updates separate factors.",
-            true,
-        )?;
-    }
+    write_lead_time_plot_pages(&mut source)?;
     writeln!(
         source,
         "#pagebreak()\n== Diagnostic conclusion\n\nAll completed transitions fall inside the \
@@ -834,6 +805,46 @@ pub fn write_lead_time_calibration_report_pdf(
          for complete censoring diagnostics."
     )?;
     write_pdf(path, &source)
+}
+
+fn write_lead_time_plot_pages(source: &mut String) -> Result<(), fmt::Error> {
+    for (direction, name) in [
+        (TransitionDirection::Up, "up"),
+        (TransitionDirection::Down, "down"),
+    ] {
+        let title = transition_direction_name(direction);
+        write_plot_page(
+            source,
+            &format!("Scale-{title} coverage"),
+            &format!("lead-time-{name}-coverage.svg"),
+            "The gray diagonal marks exact calibration. Each panel isolates one operating regime.",
+            true,
+        )?;
+        write_plot_page(
+            source,
+            &format!("Scale-{title} predictive ranks"),
+            &format!("lead-time-{name}-ranks.svg"),
+            "Uniform ranks indicate a calibrated continuous forecast. Sparse bars reflect few \
+             completed transitions.",
+            true,
+        )?;
+        write_plot_page(
+            source,
+            &format!("Scale-{title} error and uncertainty"),
+            &format!("lead-time-{name}-error-uncertainty.svg"),
+            "Each point compares median error with the 80% predictive interval width.",
+            true,
+        )?;
+        write_plot_page(
+            source,
+            &format!("Scale-{title} posterior contraction"),
+            &format!("lead-time-{name}-contraction.svg"),
+            "Each point measures the one-replica parameter posterior. Evidence for other replica \
+             deltas updates separate factors.",
+            true,
+        )?;
+    }
+    Ok(())
 }
 
 fn write_sensitivity_table(
@@ -959,9 +970,18 @@ fn capacity_calibration_results_match(
                     || left.observation_count != right.observation_count
                     || left.covered_counts != right.covered_counts
                     || left.rank_counts != right.rank_counts
-                    || left.mean_absolute_error_per_second != right.mean_absolute_error_per_second
-                    || left.mean_uncertainty_per_second != right.mean_uncertainty_per_second
-                    || left.capacity_contraction != right.capacity_contraction
+                    || left
+                        .mean_absolute_error_per_second
+                        .partial_cmp(&right.mean_absolute_error_per_second)
+                        != Some(Ordering::Equal)
+                    || left
+                        .mean_uncertainty_per_second
+                        .partial_cmp(&right.mean_uncertainty_per_second)
+                        != Some(Ordering::Equal)
+                    || left
+                        .capacity_contraction
+                        .partial_cmp(&right.capacity_contraction)
+                        != Some(Ordering::Equal)
                 {
                     return false;
                 }
@@ -1034,7 +1054,7 @@ fn write_summary(
     writeln!(
         source,
         "\nThe latency objective was {:.1} seconds.",
-        report.regime.budget_micros() as f64 / 1_000_000.0_f64
+        crate::u64_to_f64(report.regime.budget_micros()) / 1_000_000.0_f64
     )?;
     writeln!(source, "\n== Observed response\n")?;
     writeln!(
@@ -1113,6 +1133,11 @@ fn write_summary(
              time before you classify that loss."
         )?;
     }
+    write_reading_guide(source)?;
+    Ok(())
+}
+
+fn write_reading_guide(source: &mut String) -> Result<(), fmt::Error> {
     writeln!(source, "\n== How to read this report\n")?;
     writeln!(
         source,
@@ -1684,9 +1709,9 @@ impl ReportSummary {
         if summary.completions > 0 {
             let misses = (0..trace.len())
                 .filter_map(|index| trace.point(index))
-                .map(|point| point.miss_fraction * point.useful_completions as f64)
+                .map(|point| point.miss_fraction * crate::u64_to_f64(point.useful_completions))
                 .sum::<f64>();
-            summary.total_miss_fraction = misses / summary.completions as f64;
+            summary.total_miss_fraction = misses / crate::u64_to_f64(summary.completions);
         }
         if summary.minimum_replicas == u32::MAX {
             summary.minimum_replicas = 0;
@@ -2016,7 +2041,7 @@ const fn expectation(regime: PrincipalRegime) -> &'static str {
 }
 
 fn format_duration(micros: u64) -> String {
-    let seconds = micros as f64 / 1_000_000.0_f64;
+    let seconds = crate::u64_to_f64(micros) / 1_000_000.0_f64;
     if seconds >= 120.0_f64 {
         return format!("{:.1} minutes", seconds / 60.0_f64);
     }

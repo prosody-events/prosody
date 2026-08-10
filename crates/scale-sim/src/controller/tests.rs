@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use prosody_scale_core::ThroughputPosteriorCell;
 use statrs::distribution::NegativeBinomial;
 
@@ -31,8 +33,8 @@ fn arrival_prediction_uses_negative_binomial_count_quantiles() -> Result<(), Pla
     let quantiles = negative_binomial_quantiles(&distribution);
 
     assert_eq!(
-        quantiles,
-        [5.0_f64, 9.0_f64, 16.0_f64],
+        quantiles.partial_cmp(&[5.0_f64, 9.0_f64, 16.0_f64]),
+        Some(Ordering::Equal),
         "arrival prediction must retain discrete count quantiles"
     );
     Ok(())

@@ -88,7 +88,7 @@ pub fn write_regime_story_figures(
             root.fill(&WHITE).map_err(|error| drawing_error(&error))?;
             draw_panel(&root, panel).map_err(|error| drawing_error(&error))?;
             root.present().map_err(|error| drawing_error(&error))?;
-        }
+        };
         fs::write(
             directory.join(file),
             svg.replace("<rect ", "<rect shape-rendering=\"crispEdges\" "),
@@ -189,6 +189,16 @@ fn draw_panel<Backend: DrawingBackend>(
             )?;
         }
     }
+    draw_annotations(&mut chart, panel, minimum, maximum)?;
+    Ok(())
+}
+
+fn draw_annotations<Backend: DrawingBackend>(
+    chart: &mut ChartContext<'_, Backend, Cartesian2d<RangedCoordu64, RangedCoordf64>>,
+    panel: &StoryPanel,
+    minimum: f64,
+    maximum: f64,
+) -> Result<(), DrawingAreaErrorKind<Backend::ErrorType>> {
     for annotation in &panel.annotations {
         chart.draw_series(once(PathElement::new(
             vec![
@@ -613,7 +623,10 @@ fn decision_pass_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
             probabilities: Vec::new(),
         };
     };
-    let values = (1..=first.len()).map(|replicas| replicas as f64).collect();
+    let values = (1_u32..)
+        .zip(first)
+        .map(|(replicas, _)| f64::from(replicas))
+        .collect();
     let mut at_micros = Vec::with_capacity(controller.len());
     let mut probabilities = Vec::with_capacity(controller.len().saturating_mul(first.len()));
     for index in 0..controller.len() {
@@ -641,7 +654,10 @@ fn decision_loss_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
             probabilities: Vec::new(),
         };
     };
-    let values = (1..=first.len()).map(|replicas| replicas as f64).collect();
+    let values = (1_u32..)
+        .zip(first)
+        .map(|(replicas, _)| f64::from(replicas))
+        .collect();
     let mut at_micros = Vec::with_capacity(controller.len());
     let mut expected_losses = Vec::with_capacity(controller.len().saturating_mul(first.len()));
     for index in 0..controller.len() {
