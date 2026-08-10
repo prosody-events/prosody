@@ -2,7 +2,7 @@
 
 use crate::cassandra::config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError};
 use crate::consumer::MockConfigurationError;
-use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::ExciseHandler;
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::state::ConsumerState;
 use crate::high_level::{
@@ -69,6 +69,9 @@ where
         key: String,
         payload: C::Payload,
     ) -> Result<(), HighLevelClientError<C::Error>>;
+    /// Sends one excise record.
+    async fn excise(&self, topic: Topic, key: String)
+    -> Result<(), HighLevelClientError<C::Error>>;
     /// Starts consuming.
     async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>;
     /// Stops consuming.
@@ -124,7 +127,7 @@ pub fn new_erased<T, C>(
     cassandra: &CassandraConfigurationBuilder,
 ) -> Result<SharedHighLevelClient<T, C>, ErasedClientBuildError<C::Error>>
 where
-    T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+    T: ExciseHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     C: Codec + Send + Sync,
     C::Payload: EventIdentity + EventType + Clone,
 {
@@ -151,7 +154,7 @@ where
 #[async_trait]
 impl<T, C, B> ErasedHighLevelClient<T, C> for ErasedClient<T, C, B>
 where
-    T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+    T: ExciseHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     C: Codec + Send + Sync,
     C::Payload: EventIdentity + EventType + Clone,
     B: ClientBackend<C>,
@@ -164,6 +167,14 @@ where
         payload: C::Payload,
     ) -> Result<(), HighLevelClientError<C::Error>> {
         self.0.send(topic, &key, payload).await
+    }
+
+    async fn excise(
+        &self,
+        topic: Topic,
+        key: String,
+    ) -> Result<(), HighLevelClientError<C::Error>> {
+        self.0.excise(topic, &key).await
     }
 
     async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>> {

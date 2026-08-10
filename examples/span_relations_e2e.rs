@@ -160,6 +160,20 @@ impl FallibleHandler for SpanProbe {
     async fn shutdown(self) {}
 }
 
+impl ExciseHandler for SpanProbe {
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage<Self::Payload>,
+        _demand_type: DemandType,
+    ) -> Result<(), Infallible>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
+}
+
 /// Per-key trace/span ids and thread spreads for the sched and disp phases.
 type ProbeEvents = (
     BTreeMap<String, String>,

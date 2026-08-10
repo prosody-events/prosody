@@ -16,7 +16,7 @@ async fn test_store_and_load() -> Result<()> {
     assert_eq!(message.offset(), 100_i64);
     assert_eq!(message.partition(), 0_i32);
     assert_eq!(message.key(), &key);
-    assert_eq!(message.payload(), &payload);
+    assert_eq!(message.payload(), Some(&payload));
     Ok(())
 }
 
@@ -72,6 +72,6 @@ async fn test_clone_shares_storage() -> Result<()> {
 
     let loader2 = loader1.clone();
     let message = loader2.load_message(topic, 0_i32, 100_i64).await?;
-    assert_eq!(message.payload(), &payload);
+    assert_eq!(message.payload(), Some(&payload));
     Ok(())
 }

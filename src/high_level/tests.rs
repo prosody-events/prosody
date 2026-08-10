@@ -4,7 +4,7 @@ use crate::Key;
 use crate::cassandra::config::CassandraConfigurationBuilder;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::{ExciseHandler, FallibleHandler};
 use crate::consumer::{ConsumerConfiguration, DemandType};
 use crate::high_level::erased::{
     ErasedConsumerState, ErasedReadCache, ErasedReaderBuildError, new_erased,
@@ -119,6 +119,20 @@ impl FallibleHandler for NoOpHandler {
     }
 
     async fn shutdown(self) {}
+}
+
+impl ExciseHandler for NoOpHandler {
+    async fn on_excise<C>(
+        &self,
+        _ctx: C,
+        _message: ConsumerMessage<Value>,
+        _demand: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
 }
 
 /// Erased backend selection reads only mock mode. Invalid consumer-only fields

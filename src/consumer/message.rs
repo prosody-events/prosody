@@ -104,9 +104,9 @@ impl<P> UncommittedMessage<P> {
         self.inner.timestamp()
     }
 
-    /// Returns a reference to the deserialized payload.
+    /// Returns the payload, or `None` for an excise record.
     #[must_use]
-    pub fn payload(&self) -> &P {
+    pub fn payload(&self) -> Option<&P> {
         self.inner.payload()
     }
 
@@ -174,7 +174,7 @@ impl<P> Keyed for UncommittedMessage<P> {
 
 impl<P: EventIdentity> EventIdentity for UncommittedMessage<P> {
     fn event_id(&self) -> Option<&str> {
-        self.payload().event_id()
+        self.payload().and_then(EventIdentity::event_id)
     }
 }
 
@@ -244,9 +244,9 @@ pub struct ConsumerMessageValue<P> {
     /// Broker timestamp when the message was produced.
     pub timestamp: DateTime<Utc>,
 
-    /// Deserialized message payload.
+    /// Deserialized payload. `None` identifies an excise record.
     #[educe(Debug(ignore))]
-    pub payload: P,
+    pub payload: Option<P>,
 }
 
 #[cfg(test)]
@@ -259,7 +259,7 @@ impl Default for ConsumerMessageValue<serde_json::Value> {
             offset: 0,
             key: "test-key".into(),
             timestamp: Utc::now(),
-            payload: serde_json::json!({}),
+            payload: Some(serde_json::json!({})),
         }
     }
 }
@@ -334,10 +334,10 @@ impl<P> ConsumerMessage<P> {
         &self.value.timestamp
     }
 
-    /// Returns the deserialized payload.
+    /// Returns the payload, or `None` for an excise record.
     #[must_use]
-    pub fn payload(&self) -> &P {
-        &self.value.payload
+    pub fn payload(&self) -> Option<&P> {
+        self.value.payload.as_ref()
     }
 
     /// Returns the tracing span associated with this message.
@@ -394,7 +394,7 @@ impl<P> ConsumerMessage<P> {
                 offset,
                 key,
                 timestamp: Utc::now(),
-                payload,
+                payload: Some(payload),
             },
             Span::current(),
             permit,

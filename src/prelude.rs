@@ -18,6 +18,8 @@ pub use crate::consumer::Keyed;
 pub use crate::consumer::event_context::EventContext;
 /// Message type received in `on_message`.
 pub use crate::consumer::message::ConsumerMessage;
+/// The required handler trait for excise records.
+pub use crate::consumer::middleware::ExciseHandler;
 /// The primary handler trait to implement.
 pub use crate::consumer::middleware::FallibleHandler;
 /// Timer classification passed to `context.schedule()`.

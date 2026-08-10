@@ -324,7 +324,7 @@ async fn test_partition_manager_event_type_filtering() {
         ConsumerMessageValue {
             offset: Offset::from(0u8),
             key: "key".into(),
-            payload: json!({ "type": "disallowed" }),
+            payload: Some(json!({ "type": "disallowed" })),
             ..Default::default()
         },
         Span::current(),
@@ -340,7 +340,7 @@ async fn test_partition_manager_event_type_filtering() {
         ConsumerMessageValue {
             offset: Offset::from(1u8),
             key: "key".into(),
-            payload: json!({ "type": "allowed" }),
+            payload: Some(json!({ "type": "allowed" })),
             ..Default::default()
         },
         Span::current(),

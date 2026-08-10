@@ -248,7 +248,10 @@ where
         identity.topic,
         identity.partition,
         message.key().as_bytes(),
-        message.payload().event_id().map(str::as_bytes),
+        message
+            .payload()
+            .and_then(EventIdentity::event_id)
+            .map(str::as_bytes),
         message.offset(),
     )
 }

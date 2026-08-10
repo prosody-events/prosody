@@ -99,6 +99,21 @@ impl FallibleHandler for MyHandler {
     async fn shutdown(self) {}
 }
 
+impl ExciseHandler for MyHandler {
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: ConsumerMessage<Self::Payload>,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        println!("Excise key: {}", message.key());
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_servers = vec!["localhost:9094".to_owned()];
@@ -132,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.subscribe(MyHandler).await?;
 
     client.send("my-topic".into(), "message-key", json!({"value": "Hello, Kafka!"})).await?;
+    client.excise("my-topic".into(), "obsolete-key").await?;
 
     // Run your application logic here
 

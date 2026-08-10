@@ -19,7 +19,7 @@ use prosody::tracing::init_test_logging;
 use prosody::{
     consumer::ConsumerConfigurationBuilder,
     consumer::message::{ConsumerMessage, UncommittedMessage},
-    consumer::middleware::{CloneProvider, FallibleHandler},
+    consumer::middleware::{CloneProvider, ExciseHandler, FallibleHandler},
     consumer::{DemandType, EventHandler, Keyed, Uncommitted},
     timers::TimerType,
     timers::Trigger,
@@ -88,7 +88,10 @@ impl EventHandler for TimerTestHandler {
     {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
-        let payload = msg.payload().clone();
+        let Some(payload) = msg.payload().cloned() else {
+            uncommitted.commit().await;
+            return;
+        };
 
         // Send message event for verification
         if let Err(e) = self
@@ -216,7 +219,7 @@ impl FallibleHandler for InlineReplacementHandler {
         let key = msg.key().to_string();
         let step = msg
             .payload()
-            .get("step")
+            .and_then(|payload| payload.get("step"))
             .and_then(Value::as_i64)
             .ok_or(TestError)?;
 
@@ -255,6 +258,20 @@ impl FallibleHandler for InlineReplacementHandler {
     }
 
     async fn shutdown(self) {}
+}
+
+impl ExciseHandler for InlineReplacementHandler {
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage<Self::Payload>,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
 }
 
 /// Test environment wrapping [`ConsumerEnv`] with the timer handler's event

@@ -314,11 +314,11 @@ where
         // Send the failed message to the failure topic. On failure, surface
         // BOTH the inner handler error and the producer error so the inner's
         // apply hook can fire on outer-retry re-dispatch.
-        match self
-            .producer
-            .send(headers, self.topic, key, message.payload().clone())
-            .await
-        {
+        let sent = match message.payload().cloned() {
+            Some(payload) => self.producer.send(headers, self.topic, key, payload).await,
+            None => self.producer.excise(headers, self.topic, key).await,
+        };
+        match sent {
             // The inner attempt failed but the dispatch resolves `Ok`: the
             // `Routed` variant classifies `Bypassed` at the settle boundary,
             // so the failed attempt's dirty ops never stage and no marker

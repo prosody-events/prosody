@@ -13,7 +13,7 @@ use crate::consumer::config::{
 use crate::consumer::error::ConsumerError;
 use crate::consumer::middleware::retry::RetryMiddleware;
 use crate::consumer::middleware::topic::FailureTopicMiddleware;
-use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
+use crate::consumer::middleware::{ExciseHandler, HandlerMiddleware};
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::{
     build_common_middleware, build_typed_state, cassandra_deps, memory_deps,
@@ -50,7 +50,7 @@ where
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
-        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        T: ExciseHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
@@ -96,7 +96,7 @@ where
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
         B: ConsumerReaderBackend<C>,
-        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        T: ExciseHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
         let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
         let retry = RetryMiddleware::new(low_latency_config.retry)?;

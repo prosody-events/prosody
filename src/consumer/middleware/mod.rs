@@ -262,7 +262,7 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
     fn into_provider<H>(self, handler: H) -> Self::Provider<FallibleCloneProvider<LeafHandler<H>>>
     where
         Self: Sized,
-        H: FallibleHandler<Payload = P> + Clone + Send + Sync + 'static,
+        H: ExciseHandler<Payload = P> + Clone + Send + Sync + 'static,
     {
         self.with_provider(FallibleCloneProvider::new(LeafHandler::new(handler)))
     }
@@ -659,6 +659,22 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// `inner.shutdown().await`; otherwise the inner handler's resources
     /// leak.
     fn shutdown(self) -> impl Future<Output = ()> + Send;
+}
+
+/// Handles excise records.
+///
+/// An excise record has a key and no payload. Implement this trait to delete
+/// the key from external databases and other compacted views.
+pub trait ExciseHandler: FallibleHandler {
+    /// Handles a record whose [`ConsumerMessage::payload`] is `None`.
+    fn on_excise<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    where
+        C: EventContext<Payload = Self::Payload>;
 }
 
 /// A composition of two middleware components.

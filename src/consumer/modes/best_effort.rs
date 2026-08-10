@@ -6,7 +6,7 @@ use crate::consumer::ProsodyConsumer;
 use crate::consumer::config::TypedConsumerSetup;
 use crate::consumer::error::ConsumerError;
 use crate::consumer::middleware::log::LogMiddleware;
-use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
+use crate::consumer::middleware::{ExciseHandler, HandlerMiddleware};
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::{build_common_middleware, build_typed_state};
 use crate::state_reader::ConsumerReaderBackend;
@@ -32,7 +32,7 @@ where
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
         B: ConsumerReaderBackend<C>,
-        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        T: ExciseHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
         let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
 

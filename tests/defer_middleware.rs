@@ -42,7 +42,7 @@ use prosody::consumer::middleware::defer::{
     DeferConfiguration, FailureTracker, MessageDeferMiddleware,
 };
 use prosody::consumer::middleware::log::LogMiddleware;
-use prosody::consumer::middleware::{FallibleHandler, HandlerMiddleware};
+use prosody::consumer::middleware::{ExciseHandler, FallibleHandler, HandlerMiddleware};
 use prosody::consumer::{DemandType, Keyed};
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::heartbeat::HeartbeatRegistry;
@@ -132,7 +132,10 @@ impl FallibleHandler for DeferTestHandler {
         let key = message.key().to_string();
         let payload = message.payload();
 
-        if let Some(value) = payload.get("value").and_then(Value::as_i64) {
+        if let Some(value) = payload
+            .and_then(|payload| payload.get("value"))
+            .and_then(Value::as_i64)
+        {
             let should_fail = match self.fail_budget.lock().get_mut(&value) {
                 Some(remaining) if *remaining > 0 => {
                     *remaining -= 1;
@@ -188,6 +191,20 @@ impl FallibleHandler for DeferTestHandler {
     async fn shutdown(self) {}
 }
 
+impl ExciseHandler for DeferTestHandler {
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage<Value>,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
+}
+
 /// Handler that wraps [`DeferTestHandler`] to return permanent errors for a
 /// specific value. With `permanent_value: None` no error is injected and it
 /// behaves exactly like the inner handler.
@@ -213,7 +230,10 @@ impl FallibleHandler for PermanentErrorHandler {
     {
         let payload = message.payload();
         if self.permanent_value.is_some()
-            && payload.get("value").and_then(Value::as_i64) == self.permanent_value
+            && payload
+                .and_then(|payload| payload.get("value"))
+                .and_then(Value::as_i64)
+                == self.permanent_value
         {
             return Err(TestError::Permanent);
         }
@@ -234,6 +254,20 @@ impl FallibleHandler for PermanentErrorHandler {
 
     async fn shutdown(self) {
         self.inner.shutdown().await;
+    }
+}
+
+impl ExciseHandler for PermanentErrorHandler {
+    async fn on_excise<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Value>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.inner.on_excise(context, message, demand_type).await
     }
 }
 

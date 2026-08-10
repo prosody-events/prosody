@@ -1,7 +1,10 @@
 use super::*;
 use crate::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
 use crate::codec::JsonCodec;
+use crate::consumer::Keyed;
 use crate::heartbeat::HeartbeatRegistry;
+use crate::producer::{ProducerConfiguration, ProsodyProducer};
+use crate::telemetry::Telemetry;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use crate::{Offset, Partition, Topic};
@@ -432,6 +435,29 @@ async fn test_decode_error() -> color_eyre::Result<()> {
         assert_eq!(p, 0_i32);
         assert_eq!(offset, bad_offset);
 
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn null_payload_loads_as_excise() -> color_eyre::Result<()> {
+    with_topic("excise", async |topic_name| {
+        let topic = Topic::from(topic_name);
+        let producer = ProsodyProducer::<JsonCodec>::new(
+            &ProducerConfiguration::builder()
+                .bootstrap_servers(loader_config().bootstrap_servers)
+                .source_system("loader-test")
+                .build()?,
+            Telemetry::new().sender(),
+        )?;
+        producer.excise([], topic, "test-key").await?;
+        let loader = KafkaLoader::<JsonCodec>::new(loader_config(), &HeartbeatRegistry::test())?;
+
+        let message = timeout(Duration::from_mins(1), loader.load_message(topic, 0, 0)).await??;
+
+        assert_eq!(message.key().as_ref(), "test-key");
+        assert_eq!(message.payload(), None);
         Ok(())
     })
     .await

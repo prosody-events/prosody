@@ -15,7 +15,7 @@ use crate::consumer::middleware::defer::{
 };
 use crate::consumer::middleware::monopolization::MonopolizationMiddleware;
 use crate::consumer::middleware::retry::RetryMiddleware;
-use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
+use crate::consumer::middleware::{ExciseHandler, HandlerMiddleware};
 use crate::consumer::observer::KafkaObserver;
 use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::{
@@ -56,7 +56,7 @@ impl PipelineMiddlewareStack {
         handler: T,
     ) -> Result<ProsodyConsumer<C>, ConsumerError>
     where
-        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        T: ExciseHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         MP: MessageDeferStoreProvider,
         TP: TimerDeferStoreProvider,
         DP: DeduplicationStoreProvider,
@@ -141,7 +141,7 @@ where
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity,
-        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        T: ExciseHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
@@ -184,7 +184,7 @@ where
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
         B: ConsumerReaderBackend<C>,
-        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        T: ExciseHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
         let PipelineMiddlewareConfiguration {
             retry,

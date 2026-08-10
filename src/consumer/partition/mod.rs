@@ -953,7 +953,7 @@ async fn filter_event_type<P: Send + Sync + 'static + EventType>(
     message: UncommittedMessage<P>,
 ) -> Option<UncommittedMessage<P>> {
     // Extract event type from message payload if present
-    let Some(event_type) = message.payload().event_type() else {
+    let Some(event_type) = message.payload().and_then(EventType::event_type) else {
         return Some(message);
     };
 

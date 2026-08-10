@@ -123,22 +123,15 @@ pub fn decode_message<C: Codec>(
     // `Cargo.toml` (which uses caret semver and accepts any 0.39.x via
     // `cargo update`). Re-audit on any rdkafka bump, including patch updates.
     #[allow(unsafe_code)]
-    let Some(payload_bytes) = (unsafe { message.payload_mut() }) else {
-        error!(
-            topic = %topic,
-            partition = partition,
-            offset = offset,
-            "missing payload; discarding message"
-        );
-        return None;
-    };
-
-    let payload = match codec.deserialize(payload_bytes) {
-        Ok(p) => p,
-        Err(error) => {
-            error!("invalid payload: {error:#}; discarding message");
-            return None;
-        }
+    let payload = match unsafe { message.payload_mut() } {
+        Some(payload_bytes) => match codec.deserialize(payload_bytes) {
+            Ok(payload) => Some(payload),
+            Err(error) => {
+                error!("invalid payload: {error:#}; discarding message");
+                return None;
+            }
+        },
+        None => None,
     };
 
     let value = Arc::new(ConsumerMessageValue {

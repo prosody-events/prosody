@@ -59,6 +59,21 @@ impl FallibleHandler for MyHandler {
     async fn shutdown(self) {}
 }
 
+impl ExciseHandler for MyHandler {
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: ConsumerMessage<Self::Payload>,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        let _ = self.sender.send(message.key().to_string()).await;
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn quickstart() -> Result<()> {
     init_test_logging();

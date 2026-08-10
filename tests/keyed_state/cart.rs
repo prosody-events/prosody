@@ -14,7 +14,7 @@ use prosody::Offset;
 use prosody::codec::JsonCodecError;
 use prosody::consumer::event_context::{ErasedStateError, EventContext, StateAccessError};
 use prosody::consumer::message::ConsumerMessage;
-use prosody::consumer::middleware::FallibleHandler;
+use prosody::consumer::middleware::{ExciseHandler, FallibleHandler};
 use prosody::consumer::{DemandType, MessageDescriptor, message_state};
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::loader::KafkaLoader;
@@ -102,7 +102,7 @@ impl CartHandler {
         items.push(
             message
                 .payload()
-                .get("item")
+                .and_then(|payload| payload.get("item"))
                 .cloned()
                 .unwrap_or(Value::Null),
         );
@@ -155,12 +155,32 @@ impl CartHandler {
             .message_value_state(LAST_SEEN)?
             .get()
             .await?
-            .map(|message| (message.offset(), message.payload().clone()));
+            .and_then(|message| {
+                message
+                    .payload()
+                    .cloned()
+                    .map(|payload| (message.offset(), payload))
+            });
 
         self.observations_tx
             .send(Observation::Timer { cart, last_seen })
             .await
             .map_err(|_| CartHandlerError::ChannelClosed)?;
+        Ok(())
+    }
+}
+
+impl ExciseHandler for CartHandler {
+    async fn on_excise<C>(
+        &self,
+        ctx: C,
+        _message: ConsumerMessage<Self::Payload>,
+        _demand: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        ctx.state(self.cart)?.clear().await?;
         Ok(())
     }
 }

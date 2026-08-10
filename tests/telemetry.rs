@@ -10,8 +10,8 @@ use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration}
 use prosody::cassandra::config::CassandraConfigurationBuilder;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::ConsumerMessage;
-use prosody::consumer::middleware::FallibleHandler;
 use prosody::consumer::middleware::defer::DeferConfigurationBuilder;
+use prosody::consumer::middleware::{ExciseHandler, FallibleHandler};
 use prosody::consumer::{ConsumerConfigurationBuilder, DemandType, Keyed};
 use prosody::high_level::mode::Mode;
 use prosody::high_level::{CassandraHighLevelClient, ConsumerBuilders};
@@ -266,7 +266,7 @@ impl FallibleHandler for ClearAndScheduleHandler {
         let key = msg.key().to_string();
         let step = msg
             .payload()
-            .get("step")
+            .and_then(|payload| payload.get("step"))
             .and_then(Value::as_i64)
             .ok_or(TestError)?;
 
@@ -417,6 +417,34 @@ impl FallibleHandler for TransientTimerHandler {
 
     async fn shutdown(self) {}
 }
+
+macro_rules! ignore_excise {
+    ($($handler:ty),+ $(,)?) => {$(
+        impl ExciseHandler for $handler {
+            async fn on_excise<C>(
+                &self,
+                _: C,
+                _: ConsumerMessage<Value>,
+                _: DemandType,
+            ) -> Result<(), Self::Error>
+            where
+                C: EventContext<Payload = Value>,
+            {
+                Ok(())
+            }
+        }
+    )+};
+}
+
+ignore_excise!(
+    FailingHandler,
+    TimerSchedulingHandler,
+    TimerFailingHandler,
+    TimerCancellingHandler,
+    ClearAndScheduleHandler,
+    TransientMessageHandler,
+    TransientTimerHandler,
+);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

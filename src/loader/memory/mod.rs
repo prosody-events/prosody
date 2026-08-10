@@ -110,7 +110,7 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
             offset,
             key,
             timestamp: Utc::now(),
-            payload,
+            payload: Some(payload),
         });
         let context = Span::current().context();
         self.messages

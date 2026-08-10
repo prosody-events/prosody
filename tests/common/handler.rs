@@ -6,7 +6,7 @@
 
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
-use prosody::consumer::middleware::FallibleHandler;
+use prosody::consumer::middleware::{ExciseHandler, FallibleHandler};
 use prosody::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
 use prosody::error::{ClassifyError, ErrorCategory};
 use prosody::timers::{Trigger, UncommittedTimer};
@@ -63,10 +63,11 @@ impl EventHandler for ChannelHandler {
             sleep(self.delay).await;
         }
 
-        if let Err(error) = self
-            .messages_tx
-            .send((msg.key().to_string(), msg.payload().clone()))
-            .await
+        if let Some(payload) = msg.payload()
+            && let Err(error) = self
+                .messages_tx
+                .send((msg.key().to_string(), payload.clone()))
+                .await
         {
             error!("failed to send message: {error:#}");
         }
@@ -135,10 +136,12 @@ impl FallibleHandler for FallibleTestHandler {
         C: EventContext<Payload = Self::Payload>,
     {
         // Send errors are irrelevant here: the receiver may already be gone.
-        let _ = self
-            .messages_tx
-            .send((message.key().to_string(), message.payload().clone()))
-            .await;
+        if let Some(payload) = message.payload() {
+            let _ = self
+                .messages_tx
+                .send((message.key().to_string(), payload.clone()))
+                .await;
+        }
         Ok(())
     }
 
@@ -155,4 +158,18 @@ impl FallibleHandler for FallibleTestHandler {
     }
 
     async fn shutdown(self) {}
+}
+
+impl ExciseHandler for FallibleTestHandler {
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage<Value>,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
 }

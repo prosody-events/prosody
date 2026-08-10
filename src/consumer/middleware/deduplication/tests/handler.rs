@@ -146,7 +146,7 @@ fn create_test_message(
     };
     create_test_message_from(ConsumerMessageValue {
         key: key.into(),
-        payload,
+        payload: Some(payload),
         ..Default::default()
     })
 }
@@ -663,7 +663,7 @@ fn dedup_id_writer_matches_canonical_reader_derivation() -> color_eyre::Result<(
             PARTITION,
             msg.key().as_bytes(),
             msg.payload()
-                .get("id")
+                .and_then(|payload| payload.get("id"))
                 .and_then(|v| v.as_str())
                 .map(str::as_bytes),
             msg.offset(),

@@ -20,7 +20,7 @@ use crate::Key;
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::{
-    DemandType, FallibleHandler, RepinProof, Settlement, SettlementHandler,
+    DemandType, ExciseHandler, FallibleHandler, RepinProof, Settlement, SettlementHandler,
 };
 use crate::consumer::partition::ShutdownPhase;
 use crate::consumer::{Keyed, Uncommitted};
@@ -502,6 +502,7 @@ pub struct ScriptedHandler {
     /// failure, never a "long enough" sequence.
     sticky: Option<ErrorCategory>,
     calls: Arc<AtomicUsize>,
+    excisions: Arc<AtomicUsize>,
     demand_types: Arc<Mutex<Vec<DemandType>>>,
     hooks: Arc<Mutex<Vec<ScriptedHook>>>,
     /// When set, `request_shutdown()` fires on every invocation.
@@ -516,6 +517,7 @@ impl ScriptedHandler {
             failures: Arc::default(),
             sticky: None,
             calls: Arc::default(),
+            excisions: Arc::default(),
             demand_types: Arc::default(),
             hooks: Arc::default(),
             shutdown_on_call: None,
@@ -551,6 +553,12 @@ impl ScriptedHandler {
     #[must_use]
     pub fn call_count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// How many excise records the handler received.
+    #[must_use]
+    pub fn excision_count(&self) -> usize {
+        self.excisions.load(Ordering::SeqCst)
     }
 
     /// The demand types the handler was invoked with, in order.
@@ -634,6 +642,21 @@ impl FallibleHandler for ScriptedHandler {
     }
 
     async fn shutdown(self) {}
+}
+
+impl ExciseHandler for ScriptedHandler {
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage<Self::Payload>,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.excisions.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 impl SettlementHandler for ScriptedHandler {

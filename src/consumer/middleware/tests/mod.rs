@@ -29,8 +29,10 @@ use super::settle::{ArmOutcome, arm_backstop};
 use super::*;
 use crate::consumer::EventHandler;
 use crate::consumer::Uncommitted;
-use crate::consumer::message::ConsumerMessage;
-use crate::consumer::middleware::tests::test_support::{MockEventContext, create_test_message};
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
+use crate::consumer::middleware::tests::test_support::{
+    MockEventContext, create_test_message, create_test_message_from,
+};
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::error::ErrorCategory;
 use crate::timers::TimerType;
@@ -2146,6 +2148,25 @@ mod settlement_classification {
         let err: Result<(), SupportError> = Err(SupportError(ErrorCategory::Permanent));
         assert_eq!(Subject::settlement(ok.as_ref()), Settlement::Final);
         assert_eq!(Subject::settlement(err.as_ref()), Settlement::Final);
+    }
+
+    #[tokio::test]
+    async fn leaf_dispatches_absent_payload_to_excise() -> color_eyre::Result<()> {
+        let handler = ScriptedHandler::success();
+        let message = create_test_message_from(ConsumerMessageValue {
+            payload: None,
+            ..Default::default()
+        })?;
+        FallibleHandler::on_message(
+            &LeafHandler::new(handler.clone()),
+            MockEventContext::new(),
+            message,
+            DemandType::Normal,
+        )
+        .await?;
+        assert_eq!(handler.excision_count(), 1);
+        assert_eq!(handler.call_count(), 0);
+        Ok(())
     }
 }
 

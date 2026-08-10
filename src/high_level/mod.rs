@@ -6,7 +6,7 @@
 //! hands to consumers and readers alike lives in `deps`; topic reconciliation
 //! in `topics`; the consumer's state machine in [`state`].
 
-use crate::consumer::middleware::FallibleHandler;
+use crate::consumer::middleware::ExciseHandler;
 use crate::consumer::{
     LowLatencyMiddlewareConfiguration, PipelineMiddlewareConfiguration, ProsodyConsumer,
 };
@@ -151,6 +151,20 @@ where
         Ok(())
     }
 
+    /// Sends an excise record to the specified topic.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `HighLevelClientError` if the send operation fails.
+    pub async fn excise(
+        &self,
+        topic: Topic,
+        key: &str,
+    ) -> Result<(), HighLevelClientError<C::Error>> {
+        self.producer.excise([], topic, key).await?;
+        Ok(())
+    }
+
     /// Registers a keyed-state collection, returning the [`Registered`]
     /// capability handle a handler binds via `ctx.state(...)`.
     ///
@@ -229,7 +243,7 @@ where
     /// - Consumer initialization fails.
     async fn subscribe_inner(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>
     where
-        T: FallibleHandler<Payload = C::Payload> + Clone,
+        T: ExciseHandler<Payload = C::Payload> + Clone,
         C::Payload: crate::EventType + Clone,
         B::Reader: ConsumerReaderBackend<C>,
     {
@@ -390,7 +404,7 @@ macro_rules! impl_subscribe {
         where
             C: Codec,
             C::Payload: crate::EventIdentity + crate::EventType + Clone,
-            T: FallibleHandler<Payload = C::Payload> + Clone,
+            T: ExciseHandler<Payload = C::Payload> + Clone,
         {
             /// Subscribes the consumer with the provided handler.
             ///
