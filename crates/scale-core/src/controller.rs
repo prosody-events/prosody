@@ -21,9 +21,9 @@ use crate::types::{
     SCHEDULED_RELEASE_COUNT_MAX, ScheduledRelease, WorkCohorts,
 };
 use crate::{
-    ApplyDecision, ArrivalPosterior, CapacityCurve, CapacityGrid, Configuration,
-    ConfigurationError, DecisionDiagnostics, DemandClass, GroupObservation, HoldDecision,
-    HoldReason, ModelTime, PosteriorError, PosteriorQuery, RandomStream, ScaleDecision,
+    ApplyDecision, ArrivalPosterior, CapacityGrid, Configuration, ConfigurationError,
+    DecisionDiagnostics, DemandClass, GroupObservation, HoldDecision, HoldReason, ModelTime,
+    PosteriorError, PosteriorQuery, RandomStream, ScaleDecision,
 };
 use thiserror::Error;
 
@@ -329,9 +329,6 @@ pub struct ScaleScratch {
     partition_write_offsets: Vec<u32>,
     partition_cohort_indexes: Vec<u32>,
     partition_work_slot_seconds: Vec<f64>,
-    partition_order: Vec<u32>,
-    partition_share_draws: Vec<f64>,
-    moved_partition_share: Vec<f64>,
     moved_partition_counts: Vec<u32>,
     active_partition_count: u32,
     placement_interval_seconds: f64,
@@ -346,7 +343,6 @@ pub struct ScaleScratch {
     bootstrap_replica_seconds_sums: Vec<f64>,
     bootstrap_worse_counts: Vec<u32>,
     candidate_concurrency: Vec<f64>,
-    posterior_resource_supply: Vec<f64>,
     scenario_shortfall: Vec<f64>,
     scenario_terminal_late_work: Vec<f64>,
     scenario_replica_seconds: Vec<f64>,
@@ -359,19 +355,34 @@ pub struct ScaleScratch {
     scenario_event_count: Vec<f64>,
     scenario_partition_missed_work: Vec<f64>,
     scenario_partition_late_area: Vec<f64>,
-    candidate_workspaces: Vec<CandidateWorkspace>,
+    scenario_workspaces: Vec<ScenarioWorkspace>,
+    trajectory_worker: usize,
     deterministic_loss: Vec<f64>,
-    trajectory_offsets: Vec<u32>,
-    trajectory: TrajectoryColumns,
-    commitment_pause_seconds: Vec<f64>,
-    rebalancing_ready_seconds: f64,
     resource_debt_events: f64,
     active_scenario_count: usize,
     decision_curve_sample_count: u32,
 }
 
-struct CandidateWorkspace {
+/// One worker's private buffers for evaluating whole scenarios.
+///
+/// Scenario evaluation parallelizes over scenarios, not candidates:
+/// each worker owns one workspace and a disjoint range of scenario
+/// cells, so workers share no mutable state. Scenario randomness is
+/// index-derived ([`decision_random`]) and the aggregation pass reads
+/// the cells in a fixed order, so the parallel evaluation is
+/// bit-identical to a serial one.
+struct ScenarioWorkspace {
     edf: EdfScratch,
+    placement_edf: EdfScratch,
+    placement_cohorts: WorkCohorts,
+    posterior_resource_supply: Vec<f64>,
+    partition_order: Vec<u32>,
+    partition_share_draws: Vec<f64>,
+    moved_partition_share: Vec<f64>,
+    commitment_pause_seconds: Vec<f64>,
+    rebalancing_ready_seconds: f64,
+    trajectory_offsets: Vec<u32>,
+    trajectory: TrajectoryColumns,
 }
 
 struct TrajectoryColumns {
@@ -395,18 +406,6 @@ struct ScratchBounds {
     arrival_path_cell_count: usize,
 }
 
-struct ForecastScenario {
-    scenario: usize,
-    normal_events: f64,
-    failure_events: f64,
-    current_supply: f64,
-    event_supply_factor: f64,
-    curve: CapacityCurve,
-    path_length: usize,
-    planning_horizon_micros: u64,
-    disturbance_horizon_micros: u64,
-}
-
 #[derive(Clone, Copy)]
 struct PartitionDeadlineOutcome {
     missed_work: f64,
@@ -426,6 +425,137 @@ struct CandidateEvaluation<'a> {
     trajectory_after_supply: &'a [f64],
     horizon_micros: u64,
     arrival_path: ArrivalPath<'a>,
+}
+
+/// The decision-invariant inputs every scenario reads.
+struct ScenarioShared<'a> {
+    resource_cohorts: &'a WorkCohorts,
+    moved_partition_counts: &'a [u32],
+    partition_offsets: &'a [u32],
+    partition_cohort_indexes: &'a [u32],
+    partition_count: usize,
+    deterministic_loss: &'a [f64],
+    candidate_concurrency: &'a [f64],
+    action_count: usize,
+    current_index: usize,
+    resource_debt_events: f64,
+    normal_events: f64,
+    failure_events: f64,
+    calendar: Option<CalendarForecast<'a>>,
+    actuation_commitments: &'a ActuationCommitments,
+}
+
+/// One worker's disjoint chunk of the scenario-indexed output cells.
+struct ScenarioColumns<'a> {
+    first_scenario: usize,
+    scenario_count: usize,
+    candidate_stride: usize,
+    path_stride: usize,
+    supply: &'a mut [f64],
+    shortfall: &'a mut [f64],
+    terminal_late_work: &'a mut [f64],
+    missed_work: &'a mut [f64],
+    replica_seconds: &'a mut [f64],
+    rejection: &'a mut [u8],
+    event_count: &'a mut [f64],
+    partition_missed_work: &'a mut [f64],
+    partition_late_area: &'a mut [f64],
+    arrival_path_end_seconds: &'a mut [f64],
+    arrival_path_rates: &'a mut [f64],
+}
+
+/// One scenario's output cells.
+struct ScenarioCells<'a> {
+    supply: &'a mut [f64],
+    shortfall: &'a mut [f64],
+    terminal_late_work: &'a mut [f64],
+    missed_work: &'a mut [f64],
+    replica_seconds: &'a mut [f64],
+    rejection: &'a mut [u8],
+    event_count: &'a mut f64,
+    partition_missed_work: &'a mut f64,
+    partition_late_area: &'a mut f64,
+    arrival_path_end_seconds: &'a mut [f64],
+    arrival_path_rates: &'a mut [f64],
+}
+
+impl ScenarioColumns<'_> {
+    /// Splits this chunk into disjoint halves at one scenario index.
+    fn split_at(self, scenario: usize) -> (Self, Self) {
+        let cell = scenario * self.candidate_stride;
+        let path_cell = scenario * self.path_stride;
+        let (left_supply, right_supply) = self.supply.split_at_mut(cell);
+        let (left_shortfall, right_shortfall) = self.shortfall.split_at_mut(cell);
+        let (left_terminal, right_terminal) = self.terminal_late_work.split_at_mut(cell);
+        let (left_missed, right_missed) = self.missed_work.split_at_mut(cell);
+        let (left_replica, right_replica) = self.replica_seconds.split_at_mut(cell);
+        let (left_rejection, right_rejection) = self.rejection.split_at_mut(cell);
+        let (left_events, right_events) = self.event_count.split_at_mut(scenario);
+        let (left_partition_missed, right_partition_missed) =
+            self.partition_missed_work.split_at_mut(scenario);
+        let (left_partition_late, right_partition_late) =
+            self.partition_late_area.split_at_mut(scenario);
+        let (left_path_ends, right_path_ends) =
+            self.arrival_path_end_seconds.split_at_mut(path_cell);
+        let (left_path_rates, right_path_rates) = self.arrival_path_rates.split_at_mut(path_cell);
+        (
+            ScenarioColumns {
+                first_scenario: self.first_scenario,
+                scenario_count: scenario,
+                candidate_stride: self.candidate_stride,
+                path_stride: self.path_stride,
+                supply: left_supply,
+                shortfall: left_shortfall,
+                terminal_late_work: left_terminal,
+                missed_work: left_missed,
+                replica_seconds: left_replica,
+                rejection: left_rejection,
+                event_count: left_events,
+                partition_missed_work: left_partition_missed,
+                partition_late_area: left_partition_late,
+                arrival_path_end_seconds: left_path_ends,
+                arrival_path_rates: left_path_rates,
+            },
+            ScenarioColumns {
+                first_scenario: self.first_scenario + scenario,
+                scenario_count: self.scenario_count - scenario,
+                candidate_stride: self.candidate_stride,
+                path_stride: self.path_stride,
+                supply: right_supply,
+                shortfall: right_shortfall,
+                terminal_late_work: right_terminal,
+                missed_work: right_missed,
+                replica_seconds: right_replica,
+                rejection: right_rejection,
+                event_count: right_events,
+                partition_missed_work: right_partition_missed,
+                partition_late_area: right_partition_late,
+                arrival_path_end_seconds: right_path_ends,
+                arrival_path_rates: right_path_rates,
+            },
+        )
+    }
+
+    /// Borrows one local scenario's cells.
+    fn cells(&mut self, local: usize) -> ScenarioCells<'_> {
+        let first = local * self.candidate_stride;
+        let last = first + self.candidate_stride;
+        let path_first = local * self.path_stride;
+        let path_last = path_first + self.path_stride;
+        ScenarioCells {
+            supply: &mut self.supply[first..last],
+            shortfall: &mut self.shortfall[first..last],
+            terminal_late_work: &mut self.terminal_late_work[first..last],
+            missed_work: &mut self.missed_work[first..last],
+            replica_seconds: &mut self.replica_seconds[first..last],
+            rejection: &mut self.rejection[first..last],
+            event_count: &mut self.event_count[local],
+            partition_missed_work: &mut self.partition_missed_work[local],
+            partition_late_area: &mut self.partition_late_area[local],
+            arrival_path_end_seconds: &mut self.arrival_path_end_seconds[path_first..path_last],
+            arrival_path_rates: &mut self.arrival_path_rates[path_first..path_last],
+        }
+    }
 }
 
 impl ScratchBounds {
@@ -488,10 +618,20 @@ impl TrajectoryColumns {
     }
 }
 
-impl CandidateWorkspace {
-    fn new(cohort_count_max: u32) -> Result<Self, ConfigurationError> {
+impl ScenarioWorkspace {
+    fn new(bounds: &ScratchBounds) -> Result<Self, ConfigurationError> {
         Ok(Self {
-            edf: EdfScratch::new(cohort_count_max)?,
+            edf: EdfScratch::new(bounds.work_cohort_count_max_u32)?,
+            placement_edf: EdfScratch::new(bounds.work_cohort_count_max_u32)?,
+            placement_cohorts: WorkCohorts::new(bounds.work_cohort_count_max),
+            posterior_resource_supply: vec![0.0_f64; bounds.replica_count_max],
+            partition_order: vec![0; bounds.partition_count],
+            partition_share_draws: vec![0.0_f64; bounds.partition_count],
+            moved_partition_share: vec![0.0_f64; bounds.partition_offset_count],
+            commitment_pause_seconds: vec![0.0_f64; bounds.replica_count_max],
+            rebalancing_ready_seconds: f64::INFINITY,
+            trajectory_offsets: vec![0; bounds.replica_count_max + 1],
+            trajectory: TrajectoryColumns::new(bounds.trajectory_event_count_max),
         })
     }
 }
@@ -505,17 +645,18 @@ impl ScaleScratch {
     /// platform.
     pub fn new(configuration: &Configuration) -> Result<Self, ConfigurationError> {
         configuration.validate()?;
-        let ScratchBounds {
+        let bounds = ScratchBounds::new(configuration)?;
+        let &ScratchBounds {
             work_cohort_count_max,
             work_cohort_count_max_u32,
             partition_count,
             partition_offset_count,
             replica_count_max,
-            trajectory_event_count_max,
             posterior_sample_count,
             scenario_cell_count,
             arrival_path_cell_count,
-        } = ScratchBounds::new(configuration)?;
+            ..
+        } = &bounds;
         let candidate_concurrency = (1..=configuration.replica_count_max)
             .map(|replicas| f64::from(replicas) * f64::from(configuration.slots_per_replica))
             .collect::<Vec<_>>();
@@ -523,10 +664,12 @@ impl ScaleScratch {
             configuration.partition_count,
             configuration.replica_count_max,
         )?;
-        let worker_count = rayon::current_num_threads().min(replica_count_max).max(1);
-        let mut candidate_workspaces = Vec::with_capacity(worker_count);
+        let worker_count = rayon::current_num_threads()
+            .min(posterior_sample_count)
+            .max(1);
+        let mut scenario_workspaces = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
-            candidate_workspaces.push(CandidateWorkspace::new(work_cohort_count_max_u32)?);
+            scenario_workspaces.push(ScenarioWorkspace::new(&bounds)?);
         }
         Ok(Self {
             placement_edf: EdfScratch::new(work_cohort_count_max_u32)?,
@@ -537,9 +680,6 @@ impl ScaleScratch {
             partition_write_offsets: vec![0; partition_count],
             partition_cohort_indexes: vec![0; work_cohort_count_max],
             partition_work_slot_seconds: vec![0.0_f64; partition_count],
-            partition_order: vec![0; partition_count],
-            partition_share_draws: vec![0.0_f64; partition_count],
-            moved_partition_share: vec![0.0_f64; partition_offset_count],
             moved_partition_counts,
             active_partition_count: 0,
             placement_interval_seconds: 0.0_f64,
@@ -554,7 +694,6 @@ impl ScaleScratch {
             bootstrap_replica_seconds_sums: vec![0.0_f64; replica_count_max],
             bootstrap_worse_counts: vec![0; replica_count_max],
             candidate_concurrency,
-            posterior_resource_supply: vec![0.0_f64; replica_count_max],
             scenario_shortfall: vec![0.0_f64; scenario_cell_count],
             scenario_terminal_late_work: vec![0.0_f64; scenario_cell_count],
             scenario_replica_seconds: vec![0.0_f64; scenario_cell_count],
@@ -567,12 +706,9 @@ impl ScaleScratch {
             scenario_event_count: vec![0.0_f64; posterior_sample_count],
             scenario_partition_missed_work: vec![0.0_f64; posterior_sample_count],
             scenario_partition_late_area: vec![0.0_f64; posterior_sample_count],
-            candidate_workspaces,
+            scenario_workspaces,
+            trajectory_worker: 0,
             deterministic_loss: vec![0.0_f64; replica_count_max],
-            trajectory_offsets: vec![0; replica_count_max + 1],
-            trajectory: TrajectoryColumns::new(trajectory_event_count_max),
-            commitment_pause_seconds: vec![0.0_f64; replica_count_max],
-            rebalancing_ready_seconds: f64::INFINITY,
             resource_debt_events: 0.0_f64,
             active_scenario_count: posterior_sample_count,
             decision_curve_sample_count: 0,
@@ -668,28 +804,38 @@ impl ScaleScratch {
         Ok(())
     }
 
+    /// Returns the workspace that evaluated the final scenario, whose
+    /// trajectory buffers therefore hold the last-prepared trajectories.
+    #[cfg(test)]
+    fn trajectory_workspace(&self) -> Option<&ScenarioWorkspace> {
+        self.scenario_workspaces.get(self.trajectory_worker)
+    }
+
     #[cfg(test)]
     pub(crate) fn trajectory_targets(&self, candidate: u32) -> Option<&[u32]> {
+        let workspace = self.trajectory_workspace()?;
         let index = usize::try_from(candidate.checked_sub(1)?).ok()?;
-        let first = *self.trajectory_offsets.get(index)? as usize;
-        let last = *self.trajectory_offsets.get(index + 1)? as usize;
-        self.trajectory.targets.get(first..last)
+        let first = *workspace.trajectory_offsets.get(index)? as usize;
+        let last = *workspace.trajectory_offsets.get(index + 1)? as usize;
+        workspace.trajectory.targets.get(first..last)
     }
 
     #[cfg(test)]
     pub(crate) fn trajectory_pause_seconds(&self, candidate: u32) -> Option<&[f64]> {
+        let workspace = self.trajectory_workspace()?;
         let index = usize::try_from(candidate.checked_sub(1)?).ok()?;
-        let first = *self.trajectory_offsets.get(index)? as usize;
-        let last = *self.trajectory_offsets.get(index + 1)? as usize;
-        self.trajectory.pause_seconds.get(first..last)
+        let first = *workspace.trajectory_offsets.get(index)? as usize;
+        let last = *workspace.trajectory_offsets.get(index + 1)? as usize;
+        workspace.trajectory.pause_seconds.get(first..last)
     }
 
     #[cfg(test)]
     pub(crate) fn trajectory_ready_seconds(&self, candidate: u32) -> Option<&[f64]> {
+        let workspace = self.trajectory_workspace()?;
         let index = usize::try_from(candidate.checked_sub(1)?).ok()?;
-        let first = *self.trajectory_offsets.get(index)? as usize;
-        let last = *self.trajectory_offsets.get(index + 1)? as usize;
-        self.trajectory.ready_seconds.get(first..last)
+        let first = *workspace.trajectory_offsets.get(index)? as usize;
+        let last = *workspace.trajectory_offsets.get(index + 1)? as usize;
+        workspace.trajectory.ready_seconds.get(first..last)
     }
 }
 
@@ -822,6 +968,14 @@ fn select_target(
     )
 }
 
+/// Evaluates every posterior scenario, scenarios fanned across workers.
+///
+/// Each worker owns one [`ScenarioWorkspace`] and a disjoint, contiguous
+/// range of scenario cells, so workers share no mutable state. Scenario
+/// randomness is index-derived ([`decision_random`]) and
+/// [`finalize_scenario_columns`] reads the cells in a fixed order
+/// afterwards, so the parallel evaluation is bit-identical to a serial
+/// loop.
 fn evaluate_scenarios(
     state: &ScaleState,
     scratch: &mut ScaleScratch,
@@ -832,104 +986,263 @@ fn evaluate_scenarios(
     scenario_count: u32,
 ) {
     scratch.active_scenario_count = scenario_count as usize;
-    for workspace in &mut scratch.candidate_workspaces {
+    let scenario_total = scenario_count as usize;
+    let candidate_stride = scratch.posterior_loss_sums.len();
+    let path_stride = state.configuration.arrival_prior.path_segment_count_max();
+    let action_count = decision_action_count(scratch);
+    let worker_count = scratch.scenario_workspaces.len().min(scenario_total).max(1);
+    let scenario_chunk = scenario_total.div_ceil(worker_count);
+    let active_workers = scenario_total.div_ceil(scenario_chunk);
+    scratch.trajectory_worker = active_workers - 1;
+    for workspace in &mut scratch.scenario_workspaces[..active_workers] {
         prepare(&scratch.resource_cohorts, &mut workspace.edf);
     }
-    let current_index = state.current_replicas as usize - 1;
-    let current_concurrency = scratch.candidate_concurrency[current_index];
-    for sample in 0..scenario_count {
-        let scenario = sample as usize;
-        let candidate_count = scratch.posterior_resource_supply.len();
-        let scenario_first = scenario * candidate_count;
-        let scenario_last = scenario_first + candidate_count;
-        let probability = stratified_probability(sample);
-        let curve = state.capacity.curve_at_probability(probability);
-        CapacityFactor::fill_throughput(
-            state.simd_level,
-            curve,
-            &scratch.candidate_concurrency,
-            &mut scratch.posterior_resource_supply,
-        );
-        let mut reliability_random = decision_random(sample, DecisionRandomDomain::Reliability);
-        let (normal_retry, failure_retry) = state
-            .reliability
-            .sample_retry_probabilities(&mut reliability_random);
-        let event_supply_factor = mixed_event_supply(
-            1.0_f64,
-            normal_retry,
-            failure_retry,
-            state.configuration.failure_service_weight,
-            normal_events,
-            failure_events,
-        );
-        dispatch!(state.simd_level, simd => scale_and_store_supply(
-            simd,
+    let columns = ScenarioColumns {
+        first_scenario: 0,
+        scenario_count: scenario_total,
+        candidate_stride,
+        path_stride,
+        supply: &mut scratch.scenario_supply[..scenario_total * candidate_stride],
+        shortfall: &mut scratch.scenario_shortfall[..scenario_total * candidate_stride],
+        terminal_late_work: &mut scratch.scenario_terminal_late_work
+            [..scenario_total * candidate_stride],
+        missed_work: &mut scratch.scenario_missed_work[..scenario_total * candidate_stride],
+        replica_seconds: &mut scratch.scenario_replica_seconds[..scenario_total * candidate_stride],
+        rejection: &mut scratch.scenario_rejection[..scenario_total * candidate_stride],
+        event_count: &mut scratch.scenario_event_count[..scenario_total],
+        partition_missed_work: &mut scratch.scenario_partition_missed_work[..scenario_total],
+        partition_late_area: &mut scratch.scenario_partition_late_area[..scenario_total],
+        arrival_path_end_seconds: &mut scratch.scenario_arrival_path_end_seconds
+            [..scenario_total * path_stride],
+        arrival_path_rates: &mut scratch.scenario_arrival_path_rates
+            [..scenario_total * path_stride],
+    };
+    let shared = ScenarioShared {
+        resource_cohorts: &scratch.resource_cohorts,
+        moved_partition_counts: &scratch.moved_partition_counts,
+        partition_offsets: &scratch.partition_offsets,
+        partition_cohort_indexes: &scratch.partition_cohort_indexes,
+        partition_count: scratch.partition_write_offsets.len(),
+        deterministic_loss: &scratch.deterministic_loss,
+        candidate_concurrency: &scratch.candidate_concurrency,
+        action_count,
+        current_index: state.current_replicas as usize - 1,
+        resource_debt_events: scratch.resource_debt_events,
+        normal_events,
+        failure_events,
+        calendar,
+        actuation_commitments,
+    };
+    evaluate_scenario_workers(
+        state,
+        &shared,
+        &mut scratch.scenario_workspaces[..active_workers],
+        columns,
+        scenario_chunk,
+    );
+    finalize_scenario_columns(state, scratch, scenario_count);
+}
+
+/// Splits the workspaces and their scenario chunks across rayon workers.
+fn evaluate_scenario_workers(
+    state: &ScaleState,
+    shared: &ScenarioShared<'_>,
+    workspaces: &mut [ScenarioWorkspace],
+    mut columns: ScenarioColumns<'_>,
+    scenario_chunk: usize,
+) {
+    if let [workspace] = workspaces {
+        for local in 0..columns.scenario_count {
+            let sample = (columns.first_scenario + local) as u32;
+            evaluate_one_scenario(state, shared, workspace, columns.cells(local), sample);
+        }
+        return;
+    }
+    let middle = workspaces.len() / 2;
+    let scenario_middle = (middle * scenario_chunk).min(columns.scenario_count);
+    let (left_workspaces, right_workspaces) = workspaces.split_at_mut(middle);
+    let (left_columns, right_columns) = columns.split_at(scenario_middle);
+    rayon::join(
+        || evaluate_scenario_workers(state, shared, left_workspaces, left_columns, scenario_chunk),
+        || {
+            evaluate_scenario_workers(
+                state,
+                shared,
+                right_workspaces,
+                right_columns,
+                scenario_chunk,
+            );
+        },
+    );
+}
+
+/// Samples one scenario's draws and writes its decision cells.
+fn evaluate_one_scenario(
+    state: &ScaleState,
+    shared: &ScenarioShared<'_>,
+    workspace: &mut ScenarioWorkspace,
+    cells: ScenarioCells<'_>,
+    sample: u32,
+) {
+    let probability = stratified_probability(sample);
+    let curve = state.capacity.curve_at_probability(probability);
+    CapacityFactor::fill_throughput(
+        state.simd_level,
+        curve,
+        shared.candidate_concurrency,
+        &mut workspace.posterior_resource_supply,
+    );
+    let mut reliability_random = decision_random(sample, DecisionRandomDomain::Reliability);
+    let (normal_retry, failure_retry) = state
+        .reliability
+        .sample_retry_probabilities(&mut reliability_random);
+    let event_supply_factor = mixed_event_supply(
+        1.0_f64,
+        normal_retry,
+        failure_retry,
+        state.configuration.failure_service_weight,
+        shared.normal_events,
+        shared.failure_events,
+    );
+    dispatch!(state.simd_level, simd => scale_and_store_supply(
+        simd,
+        event_supply_factor,
+        &mut workspace.posterior_resource_supply,
+        &mut *cells.supply,
+    ));
+    let current_concurrency = shared.candidate_concurrency[shared.current_index];
+    let current_supply = curve.sustainable_throughput(current_concurrency) * event_supply_factor;
+    let mut lead_random = decision_random(sample, DecisionRandomDomain::LeadTime);
+    let lead_seconds = state.lead_time.sample_bucket_seconds(&mut lead_random);
+    let mut rebalance_random = decision_random(sample, DecisionRandomDomain::Rebalance);
+    let pause_seconds = state
+        .rebalance_time
+        .sample_bucket_seconds(&mut rebalance_random);
+    let mut placement_random = decision_random(sample, DecisionRandomDomain::Placement);
+    state.partition_placement.sample_moved_prefix(
+        &mut placement_random,
+        &mut workspace.partition_order,
+        &mut workspace.partition_share_draws,
+        &mut workspace.moved_partition_share,
+    );
+    let (planning_horizon_micros, disturbance_horizon_micros) = scenario_horizons(
+        state,
+        shared.resource_cohorts,
+        &lead_seconds,
+        &pause_seconds,
+    );
+    let path_length = sample_scenario_path(
+        state,
+        shared.calendar,
+        sample,
+        disturbance_horizon_micros,
+        cells.arrival_path_end_seconds,
+        cells.arrival_path_rates,
+    );
+    prepare_supply_trajectories(
+        state,
+        shared,
+        workspace,
+        &ScenarioDraws {
+            current_supply,
+            lead_seconds: &lead_seconds,
+            rebalance_seconds: &pause_seconds,
+            commitment_random: decision_random(sample, DecisionRandomDomain::Commitment),
+            arrival_path_end_seconds: &cells.arrival_path_end_seconds[..path_length],
+            arrival_path_rates: &cells.arrival_path_rates[..path_length],
+        },
+    );
+    evaluate_scenario_outcome(
+        state,
+        shared,
+        workspace,
+        cells,
+        &ScenarioForecast {
+            current_supply,
             event_supply_factor,
-            &mut scratch.posterior_resource_supply,
-            &mut scratch.scenario_supply[scenario_first..scenario_last],
-        ));
-        let current_supply =
-            curve.sustainable_throughput(current_concurrency) * event_supply_factor;
-        let mut lead_random = decision_random(sample, DecisionRandomDomain::LeadTime);
-        let lead_seconds = state.lead_time.sample_bucket_seconds(&mut lead_random);
-        let mut rebalance_random = decision_random(sample, DecisionRandomDomain::Rebalance);
-        let pause_seconds = state
-            .rebalance_time
-            .sample_bucket_seconds(&mut rebalance_random);
-        let mut placement_random = decision_random(sample, DecisionRandomDomain::Placement);
-        state.partition_placement.sample_moved_prefix(
-            &mut placement_random,
-            &mut scratch.partition_order,
-            &mut scratch.partition_share_draws,
-            &mut scratch.moved_partition_share,
-        );
-        let (planning_horizon_micros, disturbance_horizon_micros) =
-            scenario_horizons(state, scratch, &lead_seconds, &pause_seconds);
-        let path_first = scenario * state.configuration.arrival_prior.path_segment_count_max();
-        let path_length = sample_scenario_path(
-            state,
-            scratch,
-            calendar,
-            sample,
-            path_first,
+            service_time_seconds: curve.service_time_seconds(),
+            path_length,
+            planning_horizon_micros,
             disturbance_horizon_micros,
-        );
-        prepare_supply_trajectories(
-            state,
-            scratch,
-            &ScenarioDraws {
-                current_supply,
-                lead_seconds: &lead_seconds,
-                rebalance_seconds: &pause_seconds,
-                commitment_random: decision_random(sample, DecisionRandomDomain::Commitment),
-                path_first,
-                path_length,
-            },
-            actuation_commitments,
-        );
-        evaluate_forecast_scenario(
-            state,
-            scratch,
-            &ForecastScenario {
-                scenario,
-                normal_events,
-                failure_events,
-                current_supply,
-                event_supply_factor,
-                curve,
-                path_length,
-                planning_horizon_micros,
-                disturbance_horizon_micros,
-            },
+        },
+    );
+}
+
+/// Evaluates one scenario's prepared trajectories into decision cells.
+fn evaluate_scenario_outcome(
+    state: &ScaleState,
+    shared: &ScenarioShared<'_>,
+    workspace: &mut ScenarioWorkspace,
+    mut cells: ScenarioCells<'_>,
+    forecast: &ScenarioForecast,
+) {
+    let start_seconds = Duration::from_micros(state.model_time.as_micros()).as_secs_f64();
+    let planning_horizon_seconds =
+        Duration::from_micros(forecast.planning_horizon_micros).as_secs_f64();
+    let disturbance_horizon_seconds =
+        Duration::from_micros(forecast.disturbance_horizon_micros).as_secs_f64();
+    let partition_outcome = partition_deadline_outcome(
+        state,
+        shared,
+        workspace,
+        forecast.service_time_seconds,
+        forecast.event_supply_factor,
+        planning_horizon_seconds,
+    );
+    *cells.partition_missed_work = partition_outcome.missed_work;
+    *cells.partition_late_area = partition_outcome.late_area;
+    let arrival_path = ArrivalPath {
+        start_seconds,
+        end_seconds: &cells.arrival_path_end_seconds[..forecast.path_length],
+        rates: &cells.arrival_path_rates[..forecast.path_length],
+    };
+    *cells.event_count = scenario_event_count(
+        shared.normal_events,
+        shared.failure_events,
+        &arrival_path,
+        start_seconds,
+        disturbance_horizon_seconds,
+        shared.resource_cohorts,
+        forecast.disturbance_horizon_micros,
+    );
+    evaluate_candidates(
+        &CandidateEvaluation {
+            model_time_micros: state.model_time.as_micros(),
+            deadline_budget_micros: state.configuration.objective.budget_micros(),
+            current_supply: forecast.current_supply,
+            resource_debt_events: shared.resource_debt_events,
+            resource_cohorts: shared.resource_cohorts,
+            trajectory_offsets: &workspace.trajectory_offsets,
+            trajectory_pause_seconds: &workspace.trajectory.pause_seconds,
+            trajectory_ready_seconds: &workspace.trajectory.ready_seconds,
+            trajectory_during_supply: &workspace.trajectory.during_supply,
+            trajectory_after_supply: &workspace.trajectory.after_supply,
+            horizon_micros: forecast.planning_horizon_micros,
+            arrival_path,
+        },
+        &mut workspace.edf,
+        &mut cells.shortfall[..shared.action_count],
+        &mut cells.terminal_late_work[..shared.action_count],
+        &mut cells.missed_work[..shared.action_count],
+    );
+    normalize_scenario_outcomes(state, shared, &mut cells);
+    for candidate_index in 0..shared.action_count {
+        let first = workspace.trajectory_offsets[candidate_index] as usize;
+        let last = workspace.trajectory_offsets[candidate_index + 1] as usize;
+        cells.replica_seconds[candidate_index] = replica_seconds(
+            start_seconds,
+            planning_horizon_seconds,
+            state.current_replicas,
+            &workspace.trajectory.targets[first..last],
+            &workspace.trajectory.pause_seconds[first..last],
         );
     }
-    finalize_scenario_columns(state, scratch, scenario_count);
 }
 
 /// Marks per-scenario violations and folds the cells into decision columns.
 fn finalize_scenario_columns(state: &ScaleState, scratch: &mut ScaleScratch, scenario_count: u32) {
     let candidate_count = decision_action_count(scratch);
-    let candidate_stride = scratch.posterior_resource_supply.len();
+    let candidate_stride = scratch.posterior_loss_sums.len();
     dispatch!(state.simd_level, simd => prepare_scenario_violations(
         simd,
         &scratch.scenario_missed_work,
@@ -991,7 +1304,7 @@ pub(crate) fn prepare_scenario_violations<S: Simd>(
 /// future.
 fn scenario_horizons(
     state: &ScaleState,
-    scratch: &ScaleScratch,
+    cohorts: &WorkCohorts,
     lead_seconds: &[f64; 8],
     pause_seconds: &[f64; 8],
 ) -> (u64, u64) {
@@ -1005,7 +1318,7 @@ fn scenario_horizons(
     let planning_horizon_micros = complete_horizon_micros(
         report_horizon_micros,
         response_horizon_micros,
-        scratch.resource_cohorts.deadline_max_micros(),
+        cohorts.deadline_max_micros(),
         state.configuration.objective.budget_micros(),
     );
     let disturbance_horizon_micros =
@@ -1015,22 +1328,21 @@ fn scenario_horizons(
 
 fn sample_scenario_path(
     state: &ScaleState,
-    scratch: &mut ScaleScratch,
     calendar: Option<CalendarForecast<'_>>,
     sample: u32,
-    path_first: usize,
     disturbance_horizon_micros: u64,
+    end_seconds: &mut [f64],
+    rates: &mut [f64],
 ) -> usize {
     let start_seconds = Duration::from_micros(state.model_time.as_micros()).as_secs_f64();
     let disturbance_horizon_seconds =
         Duration::from_micros(disturbance_horizon_micros).as_secs_f64();
-    let path_last = path_first + state.configuration.arrival_prior.path_segment_count_max();
     let mut arrival_random = decision_random(sample, DecisionRandomDomain::Arrival);
     state.arrivals.sample_rate_path(
         disturbance_horizon_seconds - start_seconds,
         &mut arrival_random,
-        &mut scratch.scenario_arrival_path_end_seconds[path_first..path_last],
-        &mut scratch.scenario_arrival_path_rates[path_first..path_last],
+        end_seconds,
+        rates,
         calendar,
         state.model_time.as_micros(),
     )
@@ -1038,7 +1350,7 @@ fn sample_scenario_path(
 
 fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
     let candidate_count = decision_action_count(scratch);
-    let candidate_stride = scratch.posterior_resource_supply.len();
+    let candidate_stride = scratch.posterior_loss_sums.len();
     scratch.posterior_missed_work_sums.fill(0.0_f64);
     scratch.posterior_violation_weight_sums.fill(0.0_f64);
     scratch.posterior_loss_sums.fill(0.0_f64);
@@ -1298,90 +1610,6 @@ pub(crate) fn classify_paired_bootstrap(
     }
 }
 
-fn evaluate_forecast_scenario(
-    state: &ScaleState,
-    scratch: &mut ScaleScratch,
-    forecast: &ForecastScenario,
-) {
-    let candidate_count = scratch.posterior_resource_supply.len();
-    let action_count = decision_action_count(scratch);
-    let scenario_first = forecast.scenario * candidate_count;
-    let start_seconds = Duration::from_micros(state.model_time.as_micros()).as_secs_f64();
-    let planning_horizon_micros = forecast.planning_horizon_micros;
-    let planning_horizon_seconds = Duration::from_micros(planning_horizon_micros).as_secs_f64();
-    let disturbance_horizon_seconds =
-        Duration::from_micros(forecast.disturbance_horizon_micros).as_secs_f64();
-    let path_segment_count = state.configuration.arrival_prior.path_segment_count_max();
-    let path_first = forecast.scenario * path_segment_count;
-    let path_length = forecast.path_length;
-    let partition_outcome = partition_deadline_outcome(
-        state,
-        scratch,
-        forecast.curve.service_time_seconds(),
-        forecast.event_supply_factor,
-        planning_horizon_seconds,
-    );
-    scratch.scenario_partition_missed_work[forecast.scenario] = partition_outcome.missed_work;
-    scratch.scenario_partition_late_area[forecast.scenario] = partition_outcome.late_area;
-    let arrival_path = ArrivalPath {
-        start_seconds,
-        end_seconds: &scratch.scenario_arrival_path_end_seconds
-            [path_first..path_first + path_length],
-        rates: &scratch.scenario_arrival_path_rates[path_first..path_first + path_length],
-    };
-    scratch.scenario_event_count[forecast.scenario] = scenario_event_count(
-        forecast.normal_events,
-        forecast.failure_events,
-        &arrival_path,
-        start_seconds,
-        disturbance_horizon_seconds,
-        &scratch.resource_cohorts,
-        forecast.disturbance_horizon_micros,
-    );
-    let worker_count = if scratch.candidate_workspaces[0].edf.has_common_interval() {
-        1
-    } else {
-        scratch.candidate_workspaces.len().min(action_count)
-    };
-    let candidate_chunk = action_count.div_ceil(worker_count);
-    let active_workers = action_count.div_ceil(candidate_chunk);
-    evaluate_candidate_workers(
-        &CandidateEvaluation {
-            model_time_micros: state.model_time.as_micros(),
-            deadline_budget_micros: state.configuration.objective.budget_micros(),
-            current_supply: forecast.current_supply,
-            resource_debt_events: scratch.resource_debt_events,
-            resource_cohorts: &scratch.resource_cohorts,
-            trajectory_offsets: &scratch.trajectory_offsets,
-            trajectory_pause_seconds: &scratch.trajectory.pause_seconds,
-            trajectory_ready_seconds: &scratch.trajectory.ready_seconds,
-            trajectory_during_supply: &scratch.trajectory.during_supply,
-            trajectory_after_supply: &scratch.trajectory.after_supply,
-            horizon_micros: planning_horizon_micros,
-            arrival_path,
-        },
-        &mut scratch.candidate_workspaces[..active_workers],
-        &mut scratch.scenario_shortfall[scenario_first..scenario_first + action_count],
-        &mut scratch.scenario_terminal_late_work[scenario_first..scenario_first + action_count],
-        &mut scratch.scenario_missed_work[scenario_first..scenario_first + action_count],
-        candidate_chunk,
-        0,
-    );
-    normalize_scenario_outcomes(state, scratch, forecast, action_count);
-    for candidate_index in 0..action_count {
-        let cell = scenario_first + candidate_index;
-        let first = scratch.trajectory_offsets[candidate_index] as usize;
-        let last = scratch.trajectory_offsets[candidate_index + 1] as usize;
-        scratch.scenario_replica_seconds[cell] = replica_seconds(
-            start_seconds,
-            planning_horizon_seconds,
-            state.current_replicas,
-            &scratch.trajectory.targets[first..last],
-            &scratch.trajectory.pause_seconds[first..last],
-        );
-    }
-}
-
 fn scheduled_event_count(cohorts: &WorkCohorts, horizon_micros: u64) -> f64 {
     (0..cohorts.len())
         .filter(|&cohort| {
@@ -1415,116 +1643,72 @@ fn scenario_event_count(
 /// unservable events in every scenario.
 fn normalize_scenario_outcomes(
     state: &ScaleState,
-    scratch: &mut ScaleScratch,
-    forecast: &ForecastScenario,
-    action_count: usize,
+    shared: &ScenarioShared<'_>,
+    cells: &mut ScenarioCells<'_>,
 ) {
-    let candidate_count = scratch.posterior_resource_supply.len();
-    let scenario_first = forecast.scenario * candidate_count;
     let budget_seconds =
         Duration::from_micros(state.configuration.objective.budget_micros()).as_secs_f64();
     // Retry demand remains message-evidence-only. This is conservative for
     // future scheduled work, whose outcomes do not exist yet.
-    let located_events = forecast.normal_events + forecast.failure_events;
-    for candidate in 0..action_count {
-        let cell = scenario_first + candidate;
-        let late_area = scratch.scenario_shortfall[cell];
-        let terminal_late_work = scratch.scenario_terminal_late_work[cell];
-        let denominator = scratch.scenario_event_count[forecast.scenario] * budget_seconds;
-        scratch.scenario_shortfall[cell] = if denominator > f64::EPSILON {
-            (late_area + terminal_drain_area(terminal_late_work, scratch.scenario_supply[cell]))
-                .max(scratch.scenario_partition_late_area[forecast.scenario])
+    let located_events = shared.normal_events + shared.failure_events;
+    for candidate in 0..shared.action_count {
+        let late_area = cells.shortfall[candidate];
+        let terminal_late_work = cells.terminal_late_work[candidate];
+        let denominator = *cells.event_count * budget_seconds;
+        cells.shortfall[candidate] = if denominator > f64::EPSILON {
+            (late_area + terminal_drain_area(terminal_late_work, cells.supply[candidate]))
+                .max(*cells.partition_late_area)
                 / denominator
         } else {
             0.0_f64
         };
-        let missed_work = scratch.scenario_missed_work[cell]
-            .max(scratch.scenario_partition_missed_work[forecast.scenario])
-            + scratch.deterministic_loss[candidate] * located_events;
-        scratch.scenario_missed_work[cell] = missed_work;
+        let missed_work = cells.missed_work[candidate].max(*cells.partition_missed_work)
+            + shared.deterministic_loss[candidate] * located_events;
+        cells.missed_work[candidate] = missed_work;
         let mut rejection = 0_u8;
-        let miss_fraction =
-            missed_work / scratch.scenario_event_count[forecast.scenario].max(f64::MIN_POSITIVE);
+        let miss_fraction = missed_work / cells.event_count.max(f64::MIN_POSITIVE);
         if miss_fraction > state.configuration.objective.epsilon() {
             rejection |= DecisionRejection::Deadline.bit();
         }
-        if scratch.deterministic_loss[candidate] > f64::EPSILON {
+        if shared.deterministic_loss[candidate] > f64::EPSILON {
             rejection |= DecisionRejection::PartitionPlacement.bit();
         }
-        scratch.scenario_rejection[cell] = rejection;
+        cells.rejection[candidate] = rejection;
     }
 }
 
-fn evaluate_candidate_workers(
+fn evaluate_candidates(
     shared: &CandidateEvaluation<'_>,
-    workspaces: &mut [CandidateWorkspace],
+    edf: &mut EdfScratch,
     shortfall: &mut [f64],
     terminal_late_work: &mut [f64],
     missed_work: &mut [f64],
-    candidate_chunk: usize,
-    first_worker: usize,
 ) {
-    if workspaces.len() == 1 {
-        let first_candidate = first_worker * candidate_chunk;
-        for local_candidate in 0..shortfall.len() {
-            let candidate = first_candidate + local_candidate;
-            let first = shared.trajectory_offsets[candidate] as usize;
-            let last = shared.trajectory_offsets[candidate + 1] as usize;
-            let outcome = evaluate_prepared_trajectory(
-                shared.resource_cohorts,
-                &SupplyTrajectory {
-                    initial: shared.current_supply,
-                    pause_seconds: &shared.trajectory_pause_seconds[first..last],
-                    ready_seconds: &shared.trajectory_ready_seconds[first..last],
-                    during: &shared.trajectory_during_supply[first..last],
-                    after: &shared.trajectory_after_supply[first..last],
-                },
-                EvaluationWindow {
-                    start_micros: shared.model_time_micros,
-                    horizon_micros: shared.horizon_micros,
-                    initial_debt_work: shared.resource_debt_events,
-                    deadline_budget_micros: shared.deadline_budget_micros,
-                },
-                &shared.arrival_path,
-                &mut workspaces[0].edf,
-            );
-            shortfall[local_candidate] = outcome.late_area;
-            terminal_late_work[local_candidate] = outcome.terminal_late_work;
-            missed_work[local_candidate] = outcome.missed_work;
-        }
-        return;
+    for candidate in 0..shortfall.len() {
+        let first = shared.trajectory_offsets[candidate] as usize;
+        let last = shared.trajectory_offsets[candidate + 1] as usize;
+        let outcome = evaluate_prepared_trajectory(
+            shared.resource_cohorts,
+            &SupplyTrajectory {
+                initial: shared.current_supply,
+                pause_seconds: &shared.trajectory_pause_seconds[first..last],
+                ready_seconds: &shared.trajectory_ready_seconds[first..last],
+                during: &shared.trajectory_during_supply[first..last],
+                after: &shared.trajectory_after_supply[first..last],
+            },
+            EvaluationWindow {
+                start_micros: shared.model_time_micros,
+                horizon_micros: shared.horizon_micros,
+                initial_debt_work: shared.resource_debt_events,
+                deadline_budget_micros: shared.deadline_budget_micros,
+            },
+            &shared.arrival_path,
+            edf,
+        );
+        shortfall[candidate] = outcome.late_area;
+        terminal_late_work[candidate] = outcome.terminal_late_work;
+        missed_work[candidate] = outcome.missed_work;
     }
-
-    let middle = workspaces.len() / 2;
-    let candidate_middle = (middle * candidate_chunk).min(shortfall.len());
-    let (left_workspaces, right_workspaces) = workspaces.split_at_mut(middle);
-    let (left_shortfall, right_shortfall) = shortfall.split_at_mut(candidate_middle);
-    let (left_terminal, right_terminal) = terminal_late_work.split_at_mut(candidate_middle);
-    let (left_missed, right_missed) = missed_work.split_at_mut(candidate_middle);
-    rayon::join(
-        || {
-            evaluate_candidate_workers(
-                shared,
-                left_workspaces,
-                left_shortfall,
-                left_terminal,
-                left_missed,
-                candidate_chunk,
-                first_worker,
-            );
-        },
-        || {
-            evaluate_candidate_workers(
-                shared,
-                right_workspaces,
-                right_shortfall,
-                right_terminal,
-                right_missed,
-                candidate_chunk,
-                first_worker + middle,
-            );
-        },
-    );
 }
 
 fn finish_decision(
@@ -1566,67 +1750,77 @@ pub(crate) fn terminal_drain_area(backlog: f64, supply_per_second: f64) -> f64 {
     }
 }
 
+/// One scenario's realized draws that the outcome evaluation reads.
+struct ScenarioForecast {
+    current_supply: f64,
+    event_supply_factor: f64,
+    service_time_seconds: f64,
+    path_length: usize,
+    planning_horizon_micros: u64,
+    disturbance_horizon_micros: u64,
+}
+
 /// One scenario's sampled transition and disturbance context.
 struct ScenarioDraws<'a> {
     current_supply: f64,
     lead_seconds: &'a [f64; 8],
     rebalance_seconds: &'a [f64; 8],
     commitment_random: RandomStream,
-    path_first: usize,
-    path_length: usize,
+    arrival_path_end_seconds: &'a [f64],
+    arrival_path_rates: &'a [f64],
 }
 
 fn prepare_supply_trajectories(
     state: &ScaleState,
-    scratch: &mut ScaleScratch,
+    shared: &ScenarioShared<'_>,
+    workspace: &mut ScenarioWorkspace,
     draws: &ScenarioDraws<'_>,
-    actuation_commitments: &ActuationCommitments,
 ) {
     let current_supply = draws.current_supply;
     let rebalance_seconds = draws.rebalance_seconds;
-    let candidate_count = scratch.posterior_resource_supply.len();
+    let candidate_count = workspace.posterior_resource_supply.len();
     let now_seconds = sample_commitment_pauses(
         state,
-        scratch,
-        actuation_commitments,
+        workspace,
+        shared.actuation_commitments,
         &draws.commitment_random,
     );
-    scratch.trajectory.targets.clear();
-    scratch.trajectory.pause_seconds.clear();
-    scratch.trajectory.ready_overrides.clear();
-    scratch.trajectory.ready_seconds.clear();
-    scratch.trajectory.during_supply.clear();
-    scratch.trajectory.after_supply.clear();
-    scratch.trajectory_offsets[0] = 0;
-    for candidate_index in 0..scratch.posterior_resource_supply.len() {
+    workspace.trajectory.targets.clear();
+    workspace.trajectory.pause_seconds.clear();
+    workspace.trajectory.ready_overrides.clear();
+    workspace.trajectory.ready_seconds.clear();
+    workspace.trajectory.during_supply.clear();
+    workspace.trajectory.after_supply.clear();
+    workspace.trajectory_offsets[0] = 0;
+    for candidate_index in 0..candidate_count {
         let candidate = candidate_index as u32 + 1;
         let (first, fixed_event_count, committed_replicas) = push_candidate_events(
             state,
-            scratch,
+            workspace,
             draws,
-            actuation_commitments,
+            shared.actuation_commitments,
             candidate,
             now_seconds,
         );
-        sort_trajectory_events(scratch, first + fixed_event_count);
+        sort_trajectory_events(&mut workspace.trajectory, first + fixed_event_count);
         let mut write = first;
         let mut replicas = state.current_replicas;
         let mut active_ready = now_seconds;
         let mut active_during_supply = current_supply;
         let mut active_after_supply = current_supply;
         let mut active_event = None;
-        for read in first..scratch.trajectory.targets.len() {
-            let target = scratch.trajectory.targets[read];
+        for read in first..workspace.trajectory.targets.len() {
+            let target = workspace.trajectory.targets[read];
             if read >= first + fixed_event_count
                 && ((candidate > committed_replicas && target <= replicas)
                     || (candidate < committed_replicas && target >= replicas))
             {
                 continue;
             }
-            let pause = scratch.trajectory.pause_seconds[read].max(now_seconds);
+            let pause = workspace.trajectory.pause_seconds[read].max(now_seconds);
             let before_supply = if pause < active_ready {
                 if let Some(event) = active_event {
-                    scratch.trajectory.ready_seconds[event] = pause;
+                    workspace.trajectory.ready_seconds[event] = pause;
                 }
                 active_during_supply
             } else {
@@ -1638,45 +1832,46 @@ fn prepare_supply_trajectories(
                 TransitionDirection::Down
             };
             let sample = sample_index(direction, target.abs_diff(replicas));
-            let ready_override = scratch.trajectory.ready_overrides[read];
+            let ready_override = workspace.trajectory.ready_overrides[read];
             let ready = if ready_override.is_finite() {
                 ready_override.max(pause)
             } else {
                 pause + rebalance_seconds[sample]
             };
-            let moved = scratch.moved_partition_counts
+            let moved = shared.moved_partition_counts
                 [(replicas as usize - 1) * candidate_count + target as usize - 1];
-            let retained = 1.0_f64 - scratch.moved_partition_share[moved as usize];
-            scratch.trajectory.targets[write] = target;
-            scratch.trajectory.pause_seconds[write] = pause;
-            scratch.trajectory.ready_overrides[write] = ready_override;
-            scratch.trajectory.ready_seconds[write] = ready;
-            scratch.trajectory.during_supply[write] = before_supply * retained;
-            scratch.trajectory.after_supply[write] =
-                scratch.posterior_resource_supply[target as usize - 1];
+            let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
+            workspace.trajectory.targets[write] = target;
+            workspace.trajectory.pause_seconds[write] = pause;
+            workspace.trajectory.ready_overrides[write] = ready_override;
+            workspace.trajectory.ready_seconds[write] = ready;
+            workspace.trajectory.during_supply[write] = before_supply * retained;
+            workspace.trajectory.after_supply[write] =
+                workspace.posterior_resource_supply[target as usize - 1];
             active_ready = ready;
-            active_during_supply = scratch.trajectory.during_supply[write];
-            active_after_supply = scratch.trajectory.after_supply[write];
+            active_during_supply = workspace.trajectory.during_supply[write];
+            active_after_supply = workspace.trajectory.after_supply[write];
             active_event = Some(write);
             write += 1;
             replicas = target;
         }
-        scratch.trajectory.targets.truncate(write);
-        scratch.trajectory.pause_seconds.truncate(write);
-        scratch.trajectory.ready_overrides.truncate(write);
-        scratch.trajectory.ready_seconds.truncate(write);
-        scratch.trajectory.during_supply.truncate(write);
-        scratch.trajectory.after_supply.truncate(write);
+        workspace.trajectory.targets.truncate(write);
+        workspace.trajectory.pause_seconds.truncate(write);
+        workspace.trajectory.ready_overrides.truncate(write);
+        workspace.trajectory.ready_seconds.truncate(write);
+        workspace.trajectory.during_supply.truncate(write);
+        workspace.trajectory.after_supply.truncate(write);
         append_reactive_repairs(
             state,
-            scratch,
+            shared,
+            workspace,
             draws,
             replicas,
             active_after_supply,
             active_ready,
-            now_seconds,
         );
-        scratch.trajectory_offsets[candidate_index + 1] = scratch.trajectory.targets.len() as u32;
+        workspace.trajectory_offsets[candidate_index + 1] =
+            workspace.trajectory.targets.len() as u32;
     }
 }
 
@@ -1686,24 +1881,24 @@ fn prepare_supply_trajectories(
 /// the replica count the started rebalance commits.
 fn push_candidate_events(
     state: &ScaleState,
-    scratch: &mut ScaleScratch,
+    workspace: &mut ScenarioWorkspace,
     draws: &ScenarioDraws<'_>,
     actuation_commitments: &ActuationCommitments,
     candidate: u32,
     now_seconds: f64,
 ) -> (usize, usize, u32) {
-    let first = scratch.trajectory.targets.len();
+    let first = workspace.trajectory.targets.len();
     let rebalancing = actuation_commitments.rebalancing();
     let committed_replicas = rebalancing.map_or(state.current_replicas, |commitment| {
         push_trajectory_event(
-            scratch,
+            &mut workspace.trajectory,
             commitment.target_replicas,
             now_seconds,
-            scratch.rebalancing_ready_seconds,
+            workspace.rebalancing_ready_seconds,
         );
         commitment.target_replicas
     });
-    let fixed_event_count = scratch.trajectory.targets.len() - first;
+    let fixed_event_count = workspace.trajectory.targets.len() - first;
     if candidate != committed_replicas {
         let candidate_direction = if candidate > committed_replicas {
             TransitionDirection::Up
@@ -1712,7 +1907,7 @@ fn push_candidate_events(
         };
         for commitment_index in 0..actuation_commitments.launching_len() {
             if actuation_commitments.launching_direction(commitment_index) != candidate_direction
-                || !scratch.commitment_pause_seconds[commitment_index].is_finite()
+                || !workspace.commitment_pause_seconds[commitment_index].is_finite()
             {
                 continue;
             }
@@ -1724,19 +1919,21 @@ fn push_candidate_events(
                     .launching_target_replicas(commitment_index)
                     .max(candidate),
             };
-            if target == committed_replicas || scratch.trajectory.targets[first..].contains(&target)
+            if target == committed_replicas
+                || workspace.trajectory.targets[first..].contains(&target)
             {
                 continue;
             }
             push_trajectory_event(
-                scratch,
+                &mut workspace.trajectory,
                 target,
-                scratch.commitment_pause_seconds[commitment_index],
+                workspace.commitment_pause_seconds[commitment_index],
                 f64::NAN,
             );
         }
     }
-    if candidate != committed_replicas && !scratch.trajectory.targets[first..].contains(&candidate)
+    if candidate != committed_replicas
+        && !workspace.trajectory.targets[first..].contains(&candidate)
     {
         let direction = if candidate > committed_replicas {
             TransitionDirection::Up
@@ -1745,7 +1942,7 @@ fn push_candidate_events(
         };
         let sample = sample_index(direction, candidate.abs_diff(committed_replicas));
         push_trajectory_event(
-            scratch,
+            &mut workspace.trajectory,
             candidate,
             now_seconds + draws.lead_seconds[sample],
             f64::NAN,
@@ -1766,25 +1963,25 @@ fn push_candidate_events(
 /// future outcome to action selection.
 fn append_reactive_repairs(
     state: &ScaleState,
-    scratch: &mut ScaleScratch,
+    shared: &ScenarioShared<'_>,
+    workspace: &mut ScenarioWorkspace,
     draws: &ScenarioDraws<'_>,
     mut replicas: u32,
     mut supply: f64,
     mut ready: f64,
-    now_seconds: f64,
 ) {
-    let action_count = decision_action_count(scratch);
-    let candidate_count = scratch.posterior_resource_supply.len();
+    let now_seconds = Duration::from_micros(state.model_time.as_micros()).as_secs_f64();
+    let action_count = shared.action_count;
+    let candidate_count = workspace.posterior_resource_supply.len();
     let report_seconds =
         Duration::from_micros(state.configuration.report_interval_micros).as_secs_f64();
     let mut segment_start = 0.0_f64;
-    for segment in 0..draws.path_length {
-        let cell = draws.path_first + segment;
-        let segment_end = scratch.scenario_arrival_path_end_seconds[cell];
+    for segment in 0..draws.arrival_path_end_seconds.len() {
+        let segment_end = draws.arrival_path_end_seconds[segment];
         let begin_seconds = now_seconds + segment_start;
         let end_seconds = now_seconds + segment_end;
         segment_start = segment_end;
-        let rate = scratch.scenario_arrival_path_rates[cell];
+        let rate = draws.arrival_path_rates[segment];
         if rate <= supply {
             continue;
         }
@@ -1798,23 +1995,23 @@ fn append_reactive_repairs(
             .ceil()
             .max(1.0_f64);
         let requested = now_seconds + intervals * report_seconds;
-        let target = repair_target(&scratch.posterior_resource_supply[..action_count], rate);
+        let target = repair_target(&workspace.posterior_resource_supply[..action_count], rate);
         if target <= replicas {
             continue;
         }
         let sample = sample_index(TransitionDirection::Up, target - replicas);
         let pause = requested.max(ready) + draws.lead_seconds[sample];
         let repair_ready = pause + draws.rebalance_seconds[sample];
-        let moved = scratch.moved_partition_counts
+        let moved = shared.moved_partition_counts
             [(replicas as usize - 1) * candidate_count + target as usize - 1];
-        let retained = 1.0_f64 - scratch.moved_partition_share[moved as usize];
-        let after = scratch.posterior_resource_supply[target as usize - 1];
-        scratch.trajectory.targets.push(target);
-        scratch.trajectory.pause_seconds.push(pause);
-        scratch.trajectory.ready_overrides.push(f64::NAN);
-        scratch.trajectory.ready_seconds.push(repair_ready);
-        scratch.trajectory.during_supply.push(supply * retained);
-        scratch.trajectory.after_supply.push(after);
+        let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
+        let after = workspace.posterior_resource_supply[target as usize - 1];
+        workspace.trajectory.targets.push(target);
+        workspace.trajectory.pause_seconds.push(pause);
+        workspace.trajectory.ready_overrides.push(f64::NAN);
+        workspace.trajectory.ready_seconds.push(repair_ready);
+        workspace.trajectory.during_supply.push(supply * retained);
+        workspace.trajectory.after_supply.push(after);
         replicas = target;
         supply = after;
         ready = repair_ready;
@@ -1832,14 +2029,14 @@ fn repair_target(supply: &[f64], rate: f64) -> u32 {
 
 fn sample_commitment_pauses(
     state: &ScaleState,
-    scratch: &mut ScaleScratch,
+    workspace: &mut ScenarioWorkspace,
     commitments: &ActuationCommitments,
     random: &RandomStream,
 ) -> f64 {
     let now_seconds = Duration::from_micros(state.model_time.as_micros()).as_secs_f64();
     for index in 0..commitments.launching_len() {
         if commitments.launching_requested_at(index) > state.model_time {
-            scratch.commitment_pause_seconds[index] = f64::INFINITY;
+            workspace.commitment_pause_seconds[index] = f64::INFINITY;
             continue;
         }
         let elapsed_seconds = Duration::from_micros(
@@ -1859,9 +2056,9 @@ fn sample_commitment_pauses(
             elapsed_seconds,
             &mut commitment_random,
         );
-        scratch.commitment_pause_seconds[index] = now_seconds + remaining_seconds;
+        workspace.commitment_pause_seconds[index] = now_seconds + remaining_seconds;
     }
-    scratch.rebalancing_ready_seconds =
+    workspace.rebalancing_ready_seconds =
         commitments
             .rebalancing()
             .map_or(f64::INFINITY, |commitment| {
@@ -1913,28 +2110,27 @@ fn stratified_probability(scenario: u32) -> f64 {
 }
 
 fn push_trajectory_event(
-    scratch: &mut ScaleScratch,
+    trajectory: &mut TrajectoryColumns,
     target: u32,
     pause_seconds: f64,
     ready_override: f64,
 ) {
-    scratch.trajectory.targets.push(target);
-    scratch.trajectory.pause_seconds.push(pause_seconds);
-    scratch.trajectory.ready_overrides.push(ready_override);
-    scratch.trajectory.ready_seconds.push(0.0_f64);
-    scratch.trajectory.during_supply.push(0.0_f64);
-    scratch.trajectory.after_supply.push(0.0_f64);
+    trajectory.targets.push(target);
+    trajectory.pause_seconds.push(pause_seconds);
+    trajectory.ready_overrides.push(ready_override);
+    trajectory.ready_seconds.push(0.0_f64);
+    trajectory.during_supply.push(0.0_f64);
+    trajectory.after_supply.push(0.0_f64);
 }
 
-fn sort_trajectory_events(scratch: &mut ScaleScratch, first: usize) {
-    for mut event in first + 1..scratch.trajectory.targets.len() {
-        while event > first
-            && scratch.trajectory.pause_seconds[event] < scratch.trajectory.pause_seconds[event - 1]
+fn sort_trajectory_events(trajectory: &mut TrajectoryColumns, first: usize) {
+    for mut event in first + 1..trajectory.targets.len() {
+        while event > first && trajectory.pause_seconds[event] < trajectory.pause_seconds[event - 1]
         {
-            scratch.trajectory.targets.swap(event, event - 1);
-            scratch.trajectory.pause_seconds.swap(event, event - 1);
-            scratch.trajectory.ready_overrides.swap(event, event - 1);
-            scratch.trajectory.ready_seconds.swap(event, event - 1);
+            trajectory.targets.swap(event, event - 1);
+            trajectory.pause_seconds.swap(event, event - 1);
+            trajectory.ready_overrides.swap(event, event - 1);
+            trajectory.ready_seconds.swap(event, event - 1);
             event -= 1;
         }
     }
@@ -2158,7 +2354,8 @@ fn prepare_partition_work(state: &ScaleState, scratch: &mut ScaleScratch) {
 
 fn partition_deadline_outcome(
     state: &ScaleState,
-    scratch: &mut ScaleScratch,
+    shared: &ScenarioShared<'_>,
+    workspace: &mut ScenarioWorkspace,
     service_time_seconds: f64,
     event_supply_factor: f64,
     horizon_seconds: f64,
@@ -2171,28 +2368,28 @@ fn partition_deadline_outcome(
     let capacity = f64::from(state.configuration.slots_per_replica) * event_supply_factor;
     let mut missed_work = 0.0_f64;
     let mut late_area = 0.0_f64;
-    for partition in 0..scratch.partition_write_offsets.len() {
-        let first = scratch.partition_offsets[partition] as usize;
-        let last = scratch.partition_offsets[partition + 1] as usize;
+    for partition in 0..shared.partition_count {
+        let first = shared.partition_offsets[partition] as usize;
+        let last = shared.partition_offsets[partition + 1] as usize;
         if first == last {
             continue;
         }
-        scratch.placement_cohorts.clear();
-        for &cohort_index in &scratch.partition_cohort_indexes[first..last] {
+        workspace.placement_cohorts.clear();
+        for &cohort_index in &shared.partition_cohort_indexes[first..last] {
             let cohort = cohort_index as usize;
-            if scratch.resource_cohorts.partition(cohort) == SCHEDULED_PARTITION {
+            if shared.resource_cohorts.partition(cohort) == SCHEDULED_PARTITION {
                 continue;
             }
-            scratch.placement_cohorts.push_values(
-                scratch.resource_cohorts.release_micros(cohort),
-                scratch.resource_cohorts.deadline_micros(cohort),
-                scratch.resource_cohorts.work_slot_seconds(cohort) * service_time_seconds,
-                scratch.resource_cohorts.partition(cohort),
+            workspace.placement_cohorts.push_values(
+                shared.resource_cohorts.release_micros(cohort),
+                shared.resource_cohorts.deadline_micros(cohort),
+                shared.resource_cohorts.work_slot_seconds(cohort) * service_time_seconds,
+                shared.resource_cohorts.partition(cohort),
             );
         }
-        prepare(&scratch.placement_cohorts, &mut scratch.placement_edf);
+        prepare(&workspace.placement_cohorts, &mut workspace.placement_edf);
         let outcome = evaluate_prepared_step(
-            &scratch.placement_cohorts,
+            &workspace.placement_cohorts,
             SupplyStep {
                 before: capacity,
                 during: capacity,
@@ -2207,7 +2404,7 @@ fn partition_deadline_outcome(
                 deadline_budget_micros: state.configuration.objective.budget_micros(),
             },
             &no_arrivals,
-            &mut scratch.placement_edf,
+            &mut workspace.placement_edf,
         );
         missed_work += outcome.missed_work / service_time_seconds;
         late_area += outcome.late_area / service_time_seconds;

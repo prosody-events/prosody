@@ -26,10 +26,6 @@ impl EdfScratch {
             ordered_deadlines: true,
         })
     }
-
-    pub(crate) fn has_common_interval(&self) -> bool {
-        self.common_cohort.is_some()
-    }
 }
 
 #[derive(Clone, Copy)]
