@@ -175,18 +175,9 @@ pub struct LoaderConfiguration {
     /// Span relation for loaded message spans.
     pub message_spans: SpanRelation,
 
-    /// The subsystem this consumer answers peer requests for, or `None` when
-    /// it answers none.
-    ///
-    /// A reloaded record is decoded here rather than on the poll path, so a
-    /// deferred request keeps its destination only while this matches what the
-    /// poll loop was given.
-    ///
-    /// It stays a separate argument rather than being read from a keyed-state
-    /// configuration: a loader serves consumers that publish no state at all.
-    /// Every caller inside this crate passes the one configured subsystem name,
-    /// and a caller that passes another loses a deferred request's destination
-    /// and nothing besides.
+    /// The subsystem this consumer answers for, or `None` when it answers none.
+    /// Responding consumer construction gives live and reloaded messages the
+    /// same value.
     pub responder: Option<SubsystemName>,
 }
 

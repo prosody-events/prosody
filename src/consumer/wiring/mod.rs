@@ -29,6 +29,7 @@ use crate::loader::MemoryLoader;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state_reader::ConsumerReaderBackend;
 use crate::state_reader::{CassandraReaderBackend, MemoryReaderBackend, StateReaderDependencies};
+use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity};
 use std::sync::Arc;
@@ -125,6 +126,7 @@ where
 pub(in crate::consumer) async fn cassandra_deps<C>(
     setup: &ConsumerSetup<'_>,
     config: &CassandraConfiguration,
+    responder: Option<&SubsystemName>,
 ) -> Result<StateReaderDependencies<C, CassandraReaderBackend<C>>, ConsumerError>
 where
     C: Codec,
@@ -132,10 +134,7 @@ where
 {
     Ok(StateReaderDependencies::cassandra_with_loader(
         config,
-        LoaderConfiguration::for_consumer(
-            setup.consumer,
-            setup.common.keyed_state.subsystem.as_ref(),
-        ),
+        LoaderConfiguration::for_consumer(setup.consumer, responder),
         setup.common.keyed_state.reader_cache_size(),
         setup.consumer.stall_threshold,
     )

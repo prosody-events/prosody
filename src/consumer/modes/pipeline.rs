@@ -169,7 +169,7 @@ where
                 .await
             }
             (false, TriggerStoreConfiguration::Cassandra(config)) => {
-                let deps = cassandra_deps(&setup, config).await?;
+                let deps = cassandra_deps(&setup, config, None).await?;
                 Self::pipeline_consumer_with_backend(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
@@ -223,7 +223,7 @@ where
                 .await
             }
             (false, TriggerStoreConfiguration::Cassandra(config)) => {
-                let deps = cassandra_deps(&setup, config).await?;
+                let deps = cassandra_deps(&setup, config, Some(&subsystem)).await?;
                 Self::pipeline_responding_consumer_with_backend::<T, R, _, RT>(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
