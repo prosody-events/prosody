@@ -8,7 +8,7 @@ use crate::error::UnknownErrorCategory;
 use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION, RequestId, ResponseStatus};
 use crate::router::NodeId;
 use crate::subsystem::{SubsystemName, SubsystemNameError};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, Bytes};
 use fixedstr::Flexstr;
 use prost::DecodeError;
 use prost::encoding::{
@@ -60,7 +60,7 @@ pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDe
     // the status reserves 0 — so their absence is malformed. That is stricter
     // than the `.proto` can state, which is the point: a schema cannot say "not
     // the default", so the decoder does.
-    let mut payload = BytesMut::new();
+    let mut payload = Bytes::new();
     let mut relay = None;
     let mut seen = 0u8;
 
@@ -195,9 +195,9 @@ fn decode_text<B: Buf, const N: usize>(
     Ok(Some(Flexstr::make(from_utf8(&buf[..len])?)))
 }
 
-/// Copies the payload into one allocation sized to the length the frame states,
-/// refusing a length the frame does not actually carry.
-fn decode_payload<B: Buf>(src: &mut B) -> Result<BytesMut, FrameDecodeError> {
+/// Splits the payload from the transport buffer without copying when its
+/// [`Buf`] implementation supports shared bytes.
+fn decode_payload<B: Buf>(src: &mut B) -> Result<Bytes, FrameDecodeError> {
     let len = decode_varint(src)?;
     if len > src.remaining() as u64 {
         return Err(FrameDecodeError::Truncated {
@@ -206,10 +206,7 @@ fn decode_payload<B: Buf>(src: &mut B) -> Result<BytesMut, FrameDecodeError> {
             remaining: src.remaining(),
         });
     }
-    let len = len as usize;
-    let mut payload = BytesMut::with_capacity(len);
-    payload.put(src.take(len));
-    Ok(payload)
+    Ok(src.copy_to_bytes(len as usize))
 }
 
 /// Why a frame a peer sent could not be read.

@@ -9,16 +9,17 @@ use crate::response::FormatToken;
 use crate::response::ResponseStatus;
 use crate::response::{FORMAT_MAX_BYTES, RESPONSE_PROTOCOL_VERSION};
 use crate::router::{Framed, NodeId};
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes};
 use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len};
 use std::error::Error;
 use thiserror::Error;
 
 /// An encoded response ready for routing.
+#[derive(Clone)]
 pub struct Staged {
     header: FrameHeader,
     format: &'static str,
-    payload: BytesMut,
+    payload: Bytes,
     bytes: usize,
 }
 
@@ -26,6 +27,7 @@ pub struct Staged {
 ///
 /// Construction always replaces `relay_node`. A received value cannot survive
 /// this hop, so loop prevention does not depend on caller cleanup.
+#[derive(Clone)]
 pub(crate) struct Forwarded(ResponseFrame);
 
 /// Serializes one response through the standard codec and buffer caches.
@@ -58,7 +60,7 @@ pub(crate) fn stage<C: Codec>(
     Ok(Staged {
         header: header.clone(),
         format: C::FORMAT_ID,
-        payload: BytesMut::from(&scratch[..]),
+        payload: Bytes::copy_from_slice(&scratch),
         bytes: bytes as usize,
     })
 }

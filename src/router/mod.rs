@@ -133,7 +133,7 @@ impl LocalTarget {
 ///
 /// The router delivers frames without reading them, which is what keeps
 /// response vocabulary out of this module.
-pub(crate) trait Framed {
+pub(crate) trait Framed: Clone + Send + 'static {
     /// The exact number of bytes [`Framed::write`] produces.
     fn bytes(&self) -> usize;
 
@@ -149,11 +149,8 @@ pub(crate) trait Framed {
 /// `Ok` means the destination accepted the frame. Everything else is a
 /// [`SendFailure`], and only an ambiguous one may be tried again.
 ///
-/// The frame is borrowed, so a sender writes straight from the encoder scratch
-/// rather than building another frame per response. A
-/// transport whose own encoder needs an owned item still pays for one: it
-/// copies the scratch into a buffer of its own. An owned seam here would put
-/// that allocation on every response, whatever the transport needs.
+/// The frame is borrowed so retries can share it. A transport can clone its
+/// immutable handles when its encoder requires an owned item.
 pub(crate) trait ResponseSender: Send + Sync + 'static {
     /// Delivers one frame to one resolved address, and gives up at `deadline`.
     ///

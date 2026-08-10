@@ -2,7 +2,7 @@
 
 use super::Codec;
 use super::const_id::ConstId;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::error::Error as StdError;
 use thiserror::Error;
 
@@ -90,6 +90,24 @@ impl<O: Codec, E: Codec> Codec for ResultCodec<O, E> {
             ERR_TAG => self
                 .error
                 .deserialize_owned(rest)
+                .map(Err)
+                .map_err(ResultCodecError::Error),
+            other => Err(ResultCodecError::UnknownDiscriminant(other)),
+        }
+    }
+
+    fn deserialize_bytes(&mut self, mut buf: Bytes) -> Result<Self::Payload, Self::Error> {
+        let tag = buf.first().copied().ok_or(ResultCodecError::Empty)?;
+        let rest = buf.split_off(1);
+        match tag {
+            OK_TAG => self
+                .output
+                .deserialize_bytes(rest)
+                .map(Ok)
+                .map_err(ResultCodecError::Output),
+            ERR_TAG => self
+                .error
+                .deserialize_bytes(rest)
                 .map(Err)
                 .map_err(ResultCodecError::Error),
             other => Err(ResultCodecError::UnknownDiscriminant(other)),

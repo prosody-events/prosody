@@ -1,6 +1,6 @@
 //! Wire-format abstraction for encoding and decoding message payloads.
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::error::Error;
 
 mod binary;
@@ -81,6 +81,24 @@ pub trait Codec: Default + Send + Sync + 'static {
     /// Returns an error if the bytes cannot be decoded into `Self::Payload`.
     fn deserialize_owned(&mut self, mut buf: BytesMut) -> Result<Self::Payload, Self::Error> {
         self.deserialize(&mut buf)
+    }
+
+    /// Deserializes a payload from immutable owned bytes.
+    ///
+    /// Implement this method when the codec can retain or read immutable
+    /// storage. The default transfers unique storage to
+    /// [`Self::deserialize_owned`] and copies shared storage only when the
+    /// codec requires mutable bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes cannot be decoded into `Self::Payload`.
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<Self::Payload, Self::Error> {
+        let buf = match buf.try_into_mut() {
+            Ok(buf) => buf,
+            Err(buf) => BytesMut::from(buf.as_ref()),
+        };
+        self.deserialize_owned(buf)
     }
 
     /// Appends the serialized payload to `buf`, consuming the payload.

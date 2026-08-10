@@ -233,6 +233,10 @@ impl Codec for MapKeysetKey {
         Self::decode(buf)
     }
 
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<(), KeyCodecError> {
+        Self::decode(&buf)
+    }
+
     fn serialize_ref(&mut self, (): &(), buf: &mut Vec<u8>) -> Result<(), KeyCodecError> {
         buf.extend_from_slice(Self::encode(&()).as_bytes());
         Ok(())
@@ -314,6 +318,10 @@ impl Codec for MapKeysetCodec {
     fn deserialize_owned(&mut self, buf: BytesMut) -> Result<Keyset, KeysetFrameError> {
         // Freezing transfers the allocation into each coordinate slice.
         decode_keyset(&buf.freeze())
+    }
+
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<Keyset, KeysetFrameError> {
+        decode_keyset(&buf)
     }
 
     fn serialize_ref(

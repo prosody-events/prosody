@@ -74,6 +74,7 @@ pub(super) struct Harness {
 
 /// Bytes already framed, so a suite can put a frame on the wire that no encoder
 /// would produce.
+#[derive(Clone)]
 struct RawFramed(BytesMut);
 
 impl Harness {

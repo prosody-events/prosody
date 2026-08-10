@@ -74,6 +74,7 @@ fn a_framed_response_round_trips(
         Ok(staged) => staged.write(&mut wire),
         Err(error) => return TestResult::error(format!("staging failed: {error}")),
     }
+    let allocation = wire.as_ptr_range();
     let decoded = match decode_frame(&mut wire) {
         Ok(decoded) => decoded,
         Err(error) => return TestResult::error(format!("decoding failed: {error}")),
@@ -93,6 +94,12 @@ fn a_framed_response_round_trips(
         &payload[..],
         "the payload must survive the round trip"
     );
+    if !decoded.payload.is_empty() {
+        assert!(
+            allocation.contains(&decoded.payload.as_ptr()),
+            "the payload must share the transport allocation"
+        );
+    }
     TestResult::passed()
 }
 

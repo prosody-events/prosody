@@ -26,7 +26,7 @@ use crate::router::loopback::listener::{FixedRouter, Served, bind, endpoint};
 use crate::router::loopback::{Delivery, TestRouter, node, registration};
 use crate::router::{LocalTarget, NodeId};
 use crate::subsystem::SubsystemName;
-use bytes::BytesMut;
+use bytes::Bytes;
 use color_eyre::Result;
 use std::slice::from_ref;
 use std::sync::Arc;
@@ -210,6 +210,6 @@ pub(super) fn frame(
             relay,
         },
         format: FormatToken::make(CountingCodec::FORMAT_ID),
-        payload: BytesMut::from(PAYLOAD),
+        payload: Bytes::from_static(PAYLOAD),
     })
 }

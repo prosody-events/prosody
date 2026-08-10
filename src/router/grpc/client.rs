@@ -1,13 +1,12 @@
 //! The peer client: one framed response, over a real socket, to one address.
 
-use super::codec::{ClientFrameCodec, FrameBytes};
+use super::codec::ClientFrameCodec;
 use super::inject::MetadataInjector;
 use crate::propagator::new_propagator;
 use crate::router::directory::Endpoint;
 use crate::router::fleet::DestinationFleet;
 use crate::router::{Framed, ResponseSender, SendFailure};
 use ahash::RandomState;
-use bytes::BytesMut;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use quick_cache::UnitWeighter;
 use quick_cache::sync::{Cache, DefaultLifecycle};
@@ -95,9 +94,8 @@ impl GrpcSender {
 }
 
 impl ResponseSender for GrpcSender {
-    /// Copies the staged frame into one right-sized buffer and delivers it.
-    ///
-    /// [`FrameBytes`] owns that copy and the trade it accepts.
+    /// Clones the frame's immutable handles and writes it into Tonic's final
+    /// per-call buffer.
     async fn deliver<F: Framed + Sync>(
         &self,
         address: &Endpoint,
@@ -106,9 +104,7 @@ impl ResponseSender for GrpcSender {
     ) -> Result<(), SendFailure> {
         let channel = self.channel(address).await?;
         let bytes = frame.bytes();
-        let mut buffer = BytesMut::with_capacity(bytes);
-        frame.write(&mut buffer);
-        let mut request = Request::new(FrameBytes::new(buffer.freeze()));
+        let mut request = Request::new(frame.clone());
         self.propagator.inject_context(
             &Span::current().context(),
             &mut MetadataInjector::new(request.metadata_mut()),

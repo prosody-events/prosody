@@ -10,7 +10,7 @@
 use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::Coordinate;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::str::{Utf8Error, from_utf8};
 use thiserror::Error;
 
@@ -102,6 +102,10 @@ impl Codec for UnitKey {
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, KeyCodecError> {
         Self::decode(buf)
+    }
+
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<Self::Payload, KeyCodecError> {
+        Self::decode(&buf)
     }
 
     fn serialize_ref(
@@ -219,6 +223,10 @@ impl Codec for I64KeyCodec {
         Self::decode(buf)
     }
 
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<Self::Payload, KeyCodecError> {
+        Self::decode(&buf)
+    }
+
     fn serialize_ref(
         &mut self,
         payload: &Self::Payload,
@@ -256,6 +264,10 @@ impl Codec for U64KeyCodec {
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, KeyCodecError> {
         Self::decode(buf)
+    }
+
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<Self::Payload, KeyCodecError> {
+        Self::decode(&buf)
     }
 
     fn serialize_ref(

@@ -8,7 +8,7 @@
 use super::{FormatToken, RequestId, ResponseStatus};
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
-use bytes::BytesMut;
+use bytes::Bytes;
 #[cfg(test)]
 use prost::encoding::{encoded_len_varint, key_len};
 
@@ -54,8 +54,8 @@ pub struct FrameHeader {
 
 /// One decoded response frame.
 ///
-/// The payload is a single right-sized allocation made at the earliest point
-/// its length is known, so nothing here pins the transport's receive block.
+/// The payload shares Tonic's receive allocation. The server codec starts that
+/// allocation at the gRPC header size and reserves the declared frame length.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResponseFrame {
     /// Where the frame goes and how its result was classified.
@@ -63,8 +63,9 @@ pub(crate) struct ResponseFrame {
     /// The token the payload bytes were encoded with.
     pub(crate) format: FormatToken,
     /// The encoded response, opaque until a codec that speaks `format` reads
-    /// it.
-    pub(crate) payload: BytesMut,
+    /// it. Immutable ownership lets local delivery share it and lets Tonic
+    /// split it from its receive buffer without copying.
+    pub(crate) payload: Bytes,
 }
 
 // Visible crate-wide to test modules: the sender's suites and the peer

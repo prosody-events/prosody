@@ -28,14 +28,14 @@ fn a_response_reaches_the_wire_intact() -> Result<()> {
             "the response must reach its target node"
         );
 
-        let mut frame = decode_frame(&mut delivery.bytes)?;
+        let frame = decode_frame(&mut delivery.bytes)?;
         assert_eq!(
             frame.header.target,
             node(TARGET),
             "the frame must name its target node"
         );
         assert_eq!(
-            CountingCodec.deserialize(&mut frame.payload)?,
+            CountingCodec.deserialize_bytes(frame.payload)?,
             PAYLOAD,
             "the frame must carry the sent response"
         );

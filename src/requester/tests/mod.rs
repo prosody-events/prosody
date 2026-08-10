@@ -17,7 +17,7 @@ use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::{EventIdentity, Topic};
-use bytes::BytesMut;
+use bytes::Bytes;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use quickcheck::{Arbitrary, Gen};
@@ -252,10 +252,10 @@ pub(super) fn distinct_indices(g: &mut Gen, length: usize, count: usize) -> Vec<
 }
 
 /// Encodes one response body through the codec that reads it back.
-pub(super) fn body(payload: Result<u32, TestError>) -> Result<BytesMut> {
+pub(super) fn body(payload: Result<u32, TestError>) -> Result<Bytes> {
     let mut buf = Vec::with_capacity(RESPONSE_BYTES);
     TestCodec::with_cached_local(|codec| codec.serialize(payload, &mut buf))?;
-    Ok(BytesMut::from(buf.as_slice()))
+    Ok(Bytes::from(buf))
 }
 
 /// Builds one response frame for `subsystem`, in the format the waiter reads.
@@ -263,7 +263,7 @@ pub(super) fn frame(
     id: RequestId,
     subsystem: &SubsystemName,
     status: ResponseStatus,
-    payload: BytesMut,
+    payload: Bytes,
 ) -> ResponseFrame {
     formatted_frame(id, subsystem, status, payload, TestCodec::FORMAT_ID)
 }
@@ -273,7 +273,7 @@ pub(super) fn formatted_frame(
     id: RequestId,
     subsystem: &SubsystemName,
     status: ResponseStatus,
-    payload: BytesMut,
+    payload: Bytes,
     format: &str,
 ) -> ResponseFrame {
     ResponseFrame {

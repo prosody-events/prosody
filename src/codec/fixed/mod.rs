@@ -10,7 +10,7 @@
 
 use crate::codec::Codec;
 use crate::codec::const_id::ConstId;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::convert::Infallible;
 use std::error::Error;
 use thiserror::Error;
@@ -49,6 +49,14 @@ impl Codec for UnitCodec {
         }
     }
 
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<(), UnitCodecError> {
+        if buf.is_empty() {
+            Ok(())
+        } else {
+            Err(UnitCodecError { actual: buf.len() })
+        }
+    }
+
     fn serialize_ref(&mut self, (): &(), _buf: &mut Vec<u8>) -> Result<(), UnitCodecError> {
         Ok(())
     }
@@ -70,6 +78,10 @@ impl Codec for InfallibleCodec {
     const FORMAT_ID: &'static str = "infallible";
 
     fn deserialize(&mut self, _buf: &mut [u8]) -> Result<Infallible, InfallibleCodecError> {
+        Err(InfallibleCodecError)
+    }
+
+    fn deserialize_bytes(&mut self, _buf: Bytes) -> Result<Infallible, InfallibleCodecError> {
         Err(InfallibleCodecError)
     }
 
@@ -102,6 +114,12 @@ impl Codec for I64Codec {
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<i64, I64CodecError> {
         let bytes = <[u8; 8]>::try_from(&*buf).map_err(|_| I64CodecError { actual: buf.len() })?;
+        Ok(i64::from_be_bytes(bytes))
+    }
+
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<i64, I64CodecError> {
+        let bytes =
+            <[u8; 8]>::try_from(buf.as_ref()).map_err(|_| I64CodecError { actual: buf.len() })?;
         Ok(i64::from_be_bytes(bytes))
     }
 
@@ -173,6 +191,26 @@ where
         let b = self
             .1
             .deserialize_owned(second)
+            .map_err(PairCodecError::Second)?;
+        Ok((a, b))
+    }
+
+    fn deserialize_bytes(&mut self, mut buf: Bytes) -> Result<Self::Payload, Self::Error> {
+        let expected = A::WIDTH + B::WIDTH;
+        if buf.len() != expected {
+            return Err(PairCodecError::Length {
+                expected,
+                actual: buf.len(),
+            });
+        }
+        let second = buf.split_off(A::WIDTH);
+        let a = self
+            .0
+            .deserialize_bytes(buf)
+            .map_err(PairCodecError::First)?;
+        let b = self
+            .1
+            .deserialize_bytes(second)
             .map_err(PairCodecError::Second)?;
         Ok((a, b))
     }

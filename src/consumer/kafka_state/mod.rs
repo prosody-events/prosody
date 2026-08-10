@@ -32,6 +32,7 @@ use crate::state::descriptor::{
 };
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::{Offset, Partition, Topic};
+use bytes::Bytes;
 use rmp_serde::decode::Error as MsgPackDecodeError;
 use rmp_serde::encode::{Error as MsgPackEncodeError, write_named};
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,10 @@ impl Codec for MessageRefCodec {
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error> {
         rmp_serde::from_slice(buf).map_err(MessageRefCodecError::Decode)
+    }
+
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<Self::Payload, Self::Error> {
+        rmp_serde::from_slice(&buf).map_err(MessageRefCodecError::Decode)
     }
 
     fn serialize_ref(

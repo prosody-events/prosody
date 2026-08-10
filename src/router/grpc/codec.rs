@@ -4,32 +4,23 @@
 //! reader, not by a generated protobuf message. That is the point of a codec
 //! here: the reader enforces rules a `.proto` cannot state — one occurrence per
 //! field, no field whose proto3 default is illegal, a version this build
-//! speaks, bounded strings, and one right-sized payload allocation.
+//! speaks, bounded strings, and a payload slice from Tonic's receive storage.
 //!
-//! The two directions are deliberately asymmetric. A responder hands the
-//! transport bytes it already framed, and the peer method has no response body,
-//! so the client encodes bytes and decodes nothing while the server decodes a
-//! frame and encodes nothing.
+//! The two directions are deliberately asymmetric. The client writes an owned
+//! frame into Tonic's final buffer. The server decodes that frame and returns
+//! no response body.
 
 use crate::response::frame::ResponseFrame;
 use crate::response::frame::decode::{FrameDecodeError, decode_frame};
-use bytes::{Buf, BufMut, Bytes};
+use crate::router::Framed;
+use bytes::Buf;
+use std::marker::PhantomData;
 use tonic::Status;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tracing::warn;
 
 /// The compression flag and the length prefix gRPC writes before each message.
 const GRPC_HEADER_BYTES: usize = 5;
-
-/// One framed response, owned.
-///
-/// tonic's encoder must be `'static`, so it cannot borrow the sender's buffer.
-/// A response therefore pays a right-sized allocation and a copy into this
-/// value, and tonic then copies it again into the per-call buffer it owns. Both
-/// copies precede one network round trip. A pool cannot reclaim either buffer,
-/// because tonic owns its buffer until the write completes.
-/// [`ResponseSender`](crate::router::ResponseSender) owns that trade.
-pub(crate) struct FrameBytes(Bytes);
 
 /// The listener's codec: it reads a frame and writes nothing.
 ///
@@ -38,22 +29,24 @@ pub(crate) struct FrameBytes(Bytes);
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ServerFrameCodec;
 
-/// The client's codec: it writes one already-framed response and reads nothing.
+/// The client's codec: it writes one owned frame and reads nothing.
 ///
 /// It carries the frame's length so tonic sizes its per-call buffer to that
 /// exact frame. Without it tonic allocates 8 KiB per call and grows in 8 KiB
 /// steps.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ClientFrameCodec {
+#[derive(Debug)]
+pub(crate) struct ClientFrameCodec<F> {
     frame_len: usize,
+    frame: PhantomData<fn() -> F>,
 }
 
-impl FrameBytes {
-    /// Takes ownership of one complete frame.
-    pub(crate) const fn new(bytes: Bytes) -> Self {
-        Self(bytes)
+impl<F> Clone for ClientFrameCodec<F> {
+    fn clone(&self) -> Self {
+        *self
     }
 }
+
+impl<F> Copy for ClientFrameCodec<F> {}
 
 impl Codec for ServerFrameCodec {
     type Decode = ResponseFrame;
@@ -107,19 +100,28 @@ impl Decoder for ServerFrameCodec {
             }
         }
     }
-}
 
-impl ClientFrameCodec {
-    /// A codec for one call carrying a frame of `frame_len` bytes.
-    pub(crate) const fn new(frame_len: usize) -> Self {
-        Self { frame_len }
+    /// Start with only the gRPC header. Tonic reserves the declared message
+    /// length after it reads that header, so an 8 KiB initial buffer is waste.
+    fn buffer_settings(&self) -> BufferSettings {
+        BufferSettings::new(GRPC_HEADER_BYTES, GRPC_HEADER_BYTES)
     }
 }
 
-impl Codec for ClientFrameCodec {
+impl<F> ClientFrameCodec<F> {
+    /// A codec for one call carrying a frame of `frame_len` bytes.
+    pub(crate) const fn new(frame_len: usize) -> Self {
+        Self {
+            frame_len,
+            frame: PhantomData,
+        }
+    }
+}
+
+impl<F: Framed + Sync> Codec for ClientFrameCodec<F> {
     type Decode = ();
     type Decoder = Self;
-    type Encode = FrameBytes;
+    type Encode = F;
     type Encoder = Self;
 
     fn encoder(&mut self) -> Self {
@@ -131,12 +133,12 @@ impl Codec for ClientFrameCodec {
     }
 }
 
-impl Encoder for ClientFrameCodec {
+impl<F: Framed> Encoder for ClientFrameCodec<F> {
     type Error = Status;
-    type Item = FrameBytes;
+    type Item = F;
 
-    fn encode(&mut self, item: FrameBytes, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
-        dst.put_slice(&item.0);
+    fn encode(&mut self, item: F, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
+        item.write(dst);
         Ok(())
     }
 
@@ -149,7 +151,7 @@ impl Encoder for ClientFrameCodec {
     }
 }
 
-impl Decoder for ClientFrameCodec {
+impl<F> Decoder for ClientFrameCodec<F> {
     type Error = Status;
     type Item = ();
 
