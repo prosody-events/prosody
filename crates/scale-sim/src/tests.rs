@@ -213,9 +213,12 @@ fn kip848_pauses_only_partitions_that_move() -> Result<(), TestError> {
     assert!(!pending.partitions_ready);
     assert_eq!(pending.reconciling_partitions, 2);
     assert_eq!(pending.paused_partitions, 0);
+    assert_eq!(pending.rebalance_pause_micros, 0);
     assert_eq!(paused.paused_partitions, 2);
+    assert_eq!(paused.rebalance_pause_micros, 0);
     assert_eq!(paused.reconciliation_started_micros, Some(10));
     assert_eq!(ready.reconciliation_completed_micros, Some(100));
+    assert_eq!(ready.rebalance_pause_micros, 90);
     assert_eq!(result.settlements()[0].settle_micros, 12);
     assert_eq!(result.settlements()[1].settle_micros, 101);
     Ok(())
@@ -358,6 +361,50 @@ fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
         .collect::<Vec<_>>();
 
     assert!(kinds.contains(&CapacityEvidenceKind::Window));
+    Ok(())
+}
+
+#[test]
+fn closed_loop_excludes_zero_completion_capacity_windows() -> Result<(), TestError> {
+    let controller_configuration = ControllerConfiguration {
+        cohort_count_max: 4,
+        calendar_segment_count_max: 4,
+        partition_count: 4,
+        replica_count_max: 8,
+        slots_per_replica: 2,
+        posterior_sample_count: 64,
+        report_interval_micros: 10_000,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        capacity_change_rate_per_second: 0.0_f64,
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
+    };
+    let capacity_grid = CapacityGrid::new(
+        &[0.005_f64, 0.01_f64],
+        &[200.0_f64, 400.0_f64],
+        &[0.0_f64, 1.0_f64],
+    )?;
+    let closed_loop = ClosedLoop::new(
+        RampCapacityWorkload,
+        &controller_configuration,
+        capacity_grid,
+        2,
+    )?;
+    let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?;
+    let mut harness = SimulationHarness::new(plant_configuration, 1, 3, closed_loop)?;
+
+    harness.tick(0)?;
+    harness.tick(10_000)?;
+    let sample = harness
+        .graph()
+        .trace()
+        .sample(1)
+        .ok_or(TestError::MissingControllerSample)?;
+
+    assert_eq!(sample.capacity_evidence, CapacityEvidenceSample::None);
     Ok(())
 }
 
@@ -508,6 +555,24 @@ impl TickGenerator for CapacityWorkload {
                 replicas: u32::from(context.tick_index >= 3) + 1,
                 delay_micros: 0,
             },
+        })
+    }
+}
+
+struct RampCapacityWorkload;
+
+impl TickGenerator for RampCapacityWorkload {
+    fn calculate(&mut self, _: TickContext<'_>) -> Result<TickInputs, PlantError> {
+        Ok(TickInputs {
+            message_count: 20,
+            timer_count: 0,
+            handler_micros: 1_000_000,
+            dependency_operations: 0,
+            dependency_operation_micros: 0,
+            handler_added_micros: 0,
+            outcome: EventOutcomeRule::Success,
+            launch_delay_micros: 0,
+            scale: ScaleDirective::ExternalHold,
         })
     }
 }

@@ -462,6 +462,8 @@ pub struct PlantSnapshot {
     pub useful_completions: u32,
     /// Cumulative completed handler attempts for all outcomes.
     pub completed_attempts: u32,
+    /// Cumulative time with at least one partition paused for reconciliation.
+    pub rebalance_pause_micros: u64,
     /// Cumulative completed normal attempts.
     pub normal_attempts: u32,
     /// Cumulative successes from normal attempts.
@@ -608,6 +610,7 @@ pub struct Plant<M = SeriesAttemptModel> {
     attempt_outcomes: VecDeque<AttemptOutcome>,
     useful_completions: u32,
     completed_attempts: u32,
+    rebalance_pause_micros: u64,
     normal_attempts: u32,
     normal_successes: u32,
     normal_transient_failures: u32,
@@ -716,6 +719,7 @@ impl<M: AttemptModel> Plant<M> {
             ),
             useful_completions: 0,
             completed_attempts: 0,
+            rebalance_pause_micros: 0,
             normal_attempts: 0,
             normal_successes: 0,
             normal_transient_failures: 0,
@@ -1563,6 +1567,13 @@ impl<M: AttemptModel> Plant<M> {
         self.handler_occupancy_micros = self
             .handler_occupancy_micros
             .saturating_add(elapsed.saturating_mul(u64::from(self.active_handlers)));
+        if self
+            .partition_reconciliation
+            .iter()
+            .any(|state| matches!(state, PartitionReconciliation::Paused { .. }))
+        {
+            self.rebalance_pause_micros = self.rebalance_pause_micros.saturating_add(elapsed);
+        }
         self.now_micros = self.now_micros.max(now_micros);
     }
 
@@ -1595,6 +1606,7 @@ impl<M: AttemptModel> Plant<M> {
             handler_occupancy_micros: self.handler_occupancy_micros,
             useful_completions: self.useful_completions,
             completed_attempts: self.completed_attempts,
+            rebalance_pause_micros: self.rebalance_pause_micros,
             normal_attempts: self.normal_attempts,
             normal_successes: self.normal_successes,
             normal_transient_failures: self.normal_transient_failures,

@@ -1496,6 +1496,10 @@ impl<Workload> ClosedLoop<Workload> {
         if !ready {
             return Ok(());
         }
+        let previous_pause_micros = context.history.rebalance_pause_micros(0).unwrap_or(0);
+        if previous_pause_micros != context.plant.rebalance_pause_micros {
+            return Ok(());
+        }
         let exposure_micros = context.now_micros.saturating_sub(previous_micros);
         if exposure_micros == 0 {
             return Ok(());
@@ -1509,14 +1513,20 @@ impl<Workload> ClosedLoop<Workload> {
             return Ok(());
         }
         let previous_attempts = context.history.completed_attempts(0).unwrap_or(0);
+        let completed_attempts = context
+            .plant
+            .completed_attempts
+            .saturating_sub(previous_attempts);
+        // A zero-completion window cannot distinguish ramp-up from collapse.
+        // The capacity model does not represent this censored observation.
+        if completed_attempts == 0 {
+            return Ok(());
+        }
         let exposure_seconds = Duration::from_micros(exposure_micros).as_secs_f64();
         let current = CapacityWindow {
             concurrency: Duration::from_micros(occupancy).as_secs_f64() / exposure_seconds,
             exposure_seconds,
-            completed_attempts: context
-                .plant
-                .completed_attempts
-                .saturating_sub(previous_attempts),
+            completed_attempts,
         };
         self.latest_capacity_window = Some(current);
         self.observation.set_resource_window(current.evidence()?)?;
