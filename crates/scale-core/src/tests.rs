@@ -9,7 +9,7 @@ use statrs::distribution::{ContinuousCDF, Gamma};
 use thiserror::Error;
 
 use crate::arrival::{ArrivalEvidence, ArrivalFactor, ChangeHazard, RateOccupancy, rate_bin};
-use crate::capacity::CapacityFactor;
+use crate::capacity::{CapacityFactor, contaminated_poisson_log_likelihood};
 use crate::change_point::ChangePointKernel;
 use crate::controller::{
     DecisionRandomDomain, NumericalDecision, classify_paired_bootstrap, decision_random,
@@ -1580,6 +1580,7 @@ fn narrower_log_capacity_prior_concentrates_more_mass_at_its_median() -> Result<
             service_time_median_seconds: 0.1_f64,
             capacity_median_per_second: 320.0_f64,
             log_standard_deviation: 2.0_f64.ln(),
+            window_contamination_probability: 0.05_f64,
         },
     )?;
     let wide = CapacityGrid::new_with_prior(
@@ -1590,6 +1591,7 @@ fn narrower_log_capacity_prior_concentrates_more_mass_at_its_median() -> Result<
             service_time_median_seconds: 0.1_f64,
             capacity_median_per_second: 320.0_f64,
             log_standard_deviation: 8.0_f64.ln(),
+            window_contamination_probability: 0.05_f64,
         },
     )?;
     let narrow = capacity_prior(narrow)?;
@@ -1611,7 +1613,9 @@ fn default_capacity_prior_is_explicit_log_uniform() -> Result<(), TestError> {
         &service_times,
         &capacities,
         &[0.0_f64, 0.5_f64, 1.0_f64],
-        CapacityPrior::LogUniform,
+        CapacityPrior::LogUniform {
+            window_contamination_probability: 0.05_f64,
+        },
     )?;
 
     assert_eq!(
@@ -1642,9 +1646,89 @@ fn capacity_grid_accepts_exactly_representable_log_normal_parameters(
             service_time_median_seconds: service_median,
             capacity_median_per_second: capacity_median,
             log_standard_deviation,
+            window_contamination_probability: 0.05_f64,
         },
     );
     result.is_ok() == valid
+}
+
+#[quickcheck]
+fn capacity_window_log_odds_are_bounded(
+    completed: u16,
+    first_mean_bits: u32,
+    second_mean_bits: u32,
+) -> bool {
+    const CONTAMINATION: f64 = 0.05_f64;
+
+    let first_mean = f64::from(first_mean_bits % 1_000_001);
+    let second_mean = f64::from(second_mean_bits % 1_000_001);
+    let first =
+        contaminated_poisson_log_likelihood(u32::from(completed), first_mean, CONTAMINATION);
+    let second =
+        contaminated_poisson_log_likelihood(u32::from(completed), second_mean, CONTAMINATION);
+    (first - second).abs() <= (1.0_f64 / CONTAMINATION).ln() + 1.0e-9_f64
+}
+
+#[test]
+fn consistent_capacity_windows_concentrate_the_posterior() -> Result<(), TestError> {
+    let simd_level = Level::new();
+    let grid = CapacityGrid::new_with_prior(
+        &[0.1_f64],
+        &[50.0_f64, 100.0_f64],
+        &[0.0_f64],
+        CapacityPrior::LogUniform {
+            window_contamination_probability: 0.05_f64,
+        },
+    )?;
+    let mut factor = CapacityFactor::new(grid, 0.0_f64);
+    let window = ResourceWindow::new(20.0_f64, 1.0_f64, 100)?;
+    for _ in 0_u32..128_u32 {
+        factor.update(simd_level, &window);
+    }
+    let mut values = [0.0_f64; 2];
+    let mut probabilities = [0.0_f64; 2];
+    factor.write_capacity_posterior(&mut values, &mut probabilities)?;
+
+    assert!((values[0] - 50.0_f64).abs() < f64::EPSILON);
+    assert!((values[1] - 100.0_f64).abs() < f64::EPSILON);
+    assert!(probabilities[1] > 0.99_f64);
+    Ok(())
+}
+
+#[test]
+fn one_application_trickle_window_cannot_erase_no_knee_mass() -> Result<(), TestError> {
+    let simd_level = Level::new();
+    let grid = CapacityGrid::new_with_prior(
+        &[0.001_f64, 0.01_f64, 0.1_f64],
+        &[2_000.0_f64, 4_000.0_f64],
+        &[0.0_f64, 1.0_f64],
+        CapacityPrior::LogUniform {
+            window_contamination_probability: 0.05_f64,
+        },
+    )?;
+    let mut factor = CapacityFactor::new(grid, 0.0_f64);
+    factor.update(simd_level, &ResourceWindow::new(0.003_f64, 1.0_f64, 3)?);
+
+    assert!(factor.no_knee_probability() >= 0.02_f64);
+    Ok(())
+}
+
+#[test]
+fn one_burst_onset_window_cannot_erase_no_knee_mass() -> Result<(), TestError> {
+    let simd_level = Level::new();
+    let grid = CapacityGrid::new_with_prior(
+        &[0.1_f64, 1.0_f64],
+        &[40.0_f64, 320.0_f64, 4_000.0_f64],
+        &[0.0_f64, 1.0_f64],
+        CapacityPrior::LogUniform {
+            window_contamination_probability: 0.05_f64,
+        },
+    )?;
+    let mut factor = CapacityFactor::new(grid, 0.0_f64);
+    factor.update(simd_level, &ResourceWindow::new(256.0_f64, 1.0_f64, 0)?);
+
+    assert!(factor.no_knee_probability() >= 0.02_f64);
+    Ok(())
 }
 
 fn capacity_prior(grid: CapacityGrid) -> Result<Vec<f64>, TestError> {

@@ -6,6 +6,7 @@ use thiserror::Error;
 use crate::change_point::ChangePointKernel;
 
 const CAPACITY_CELL_COUNT_MAX: u32 = 4_096;
+const DEFAULT_WINDOW_CONTAMINATION_PROBABILITY: f64 = 0.05_f64;
 const NO_KNEE_PRIOR_PROBABILITY: f64 = 0.5_f64;
 const NO_COLLAPSE_PRIOR_PROBABILITY: f64 = 0.5_f64;
 
@@ -110,7 +111,10 @@ impl CapacityCurve {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CapacityPrior {
     /// Equal prior mass for equal intervals on each logarithmic axis.
-    LogUniform,
+    LogUniform {
+        /// Prior probability that one window is outside the model class.
+        window_contamination_probability: f64,
+    },
     /// Independent normal priors on logarithmic service time and capacity.
     LogNormal {
         /// Median handler service time.
@@ -119,27 +123,47 @@ pub enum CapacityPrior {
         capacity_median_per_second: f64,
         /// Standard deviation on both natural-log axes.
         log_standard_deviation: f64,
+        /// Prior probability that one window is outside the model class.
+        window_contamination_probability: f64,
     },
 }
 
 impl CapacityPrior {
     fn validate(self) -> Result<(), CapacityGridError> {
         match self {
-            Self::LogUniform => Ok(()),
+            Self::LogUniform {
+                window_contamination_probability,
+            } if valid_contamination_probability(window_contamination_probability) => Ok(()),
             Self::LogNormal {
                 service_time_median_seconds,
                 capacity_median_per_second,
                 log_standard_deviation,
+                window_contamination_probability,
             } if service_time_median_seconds.is_finite()
                 && service_time_median_seconds > 0.0_f64
                 && capacity_median_per_second.is_finite()
                 && capacity_median_per_second > 0.0_f64
                 && log_standard_deviation.is_finite()
-                && log_standard_deviation >= f64::EPSILON =>
+                && log_standard_deviation >= f64::EPSILON
+                && valid_contamination_probability(window_contamination_probability) =>
             {
                 Ok(())
             }
-            Self::LogNormal { .. } => Err(CapacityGridError::InvalidPrior),
+            Self::LogUniform { .. } | Self::LogNormal { .. } => {
+                Err(CapacityGridError::InvalidPrior)
+            }
+        }
+    }
+
+    const fn window_contamination_probability(self) -> f64 {
+        match self {
+            Self::LogUniform {
+                window_contamination_probability,
+            }
+            | Self::LogNormal {
+                window_contamination_probability,
+                ..
+            } => window_contamination_probability,
         }
     }
 }
@@ -175,7 +199,9 @@ impl CapacityGrid {
             service_times_seconds,
             capacities_per_second,
             collapse_values,
-            CapacityPrior::LogUniform,
+            CapacityPrior::LogUniform {
+                window_contamination_probability: DEFAULT_WINDOW_CONTAMINATION_PROBABILITY,
+            },
         )
     }
 
@@ -706,6 +732,7 @@ impl CapacityFactor {
     }
 
     fn update_window(&mut self, simd_level: Level, window: &ResourceWindow) {
+        let contamination_probability = self.grid.prior.window_contamination_probability();
         for (index, likelihood) in self.likelihoods.iter_mut().enumerate() {
             let mean = window.exposure_seconds
                 * throughput(
@@ -715,7 +742,11 @@ impl CapacityFactor {
                     self.grid.no_knee[index] > 0.0_f64,
                     window.concurrency,
                 );
-            *likelihood = poisson_log_kernel(window.completed_attempts, mean);
+            *likelihood = contaminated_poisson_log_likelihood(
+                window.completed_attempts,
+                mean,
+                contamination_probability,
+            );
         }
         self.apply_likelihood(simd_level);
     }
@@ -741,11 +772,12 @@ impl CapacityFactor {
 
 fn capacity_prior(grid: &CapacityGrid) -> Vec<f64> {
     let mut weights = match grid.prior {
-        CapacityPrior::LogUniform => log_uniform_capacity_prior(grid),
+        CapacityPrior::LogUniform { .. } => log_uniform_capacity_prior(grid),
         CapacityPrior::LogNormal {
             service_time_median_seconds,
             capacity_median_per_second,
             log_standard_deviation,
+            ..
         } => log_normal_capacity_prior(
             grid,
             service_time_median_seconds,
@@ -1128,6 +1160,31 @@ fn poisson_log_kernel(count: u32, mean: f64) -> f64 {
     } else {
         f64::NEG_INFINITY
     }
+}
+
+/// Returns a robust Poisson log likelihood for one capacity cell.
+///
+/// The contaminant uses the Poisson profile likelihood. It is maximal at the
+/// observed count. One window therefore changes the log odds between any two
+/// cells by at most `ln(1 / contamination_probability)`.
+pub(crate) fn contaminated_poisson_log_likelihood(
+    count: u32,
+    mean: f64,
+    contamination_probability: f64,
+) -> f64 {
+    let modeled = (-contamination_probability).ln_1p() + poisson_log_kernel(count, mean);
+    let contaminant = contamination_probability.ln() + poisson_log_kernel(count, f64::from(count));
+    logaddexp(modeled, contaminant)
+}
+
+fn logaddexp(left: f64, right: f64) -> f64 {
+    let maximum = left.max(right);
+    let minimum = left.min(right);
+    maximum + (minimum - maximum).exp().ln_1p()
+}
+
+fn valid_contamination_probability(probability: f64) -> bool {
+    probability.is_finite() && probability > 0.0_f64 && probability < 0.5_f64
 }
 
 fn validate_axis(values: &[f64], permits_zero: bool) -> Result<(), CapacityGridError> {
