@@ -223,6 +223,25 @@ struct ProcessingState {
     _permit: OwnedSemaphorePermit,
 }
 
+/// Content of one keyed Kafka record.
+pub enum Record<P> {
+    /// A record with a deserialized payload.
+    Message(P),
+    /// A record that deletes its key from compacted views.
+    Excise,
+}
+
+impl<P> Record<P> {
+    /// Returns the message payload, if this is a message record.
+    #[must_use]
+    pub fn message(&self) -> Option<&P> {
+        match self {
+            Self::Message(payload) => Some(payload),
+            Self::Excise => None,
+        }
+    }
+}
+
 /// The full data and metadata for a consumer message.
 ///
 /// Owned by `ConsumerMessage` and shared via `Arc`.
@@ -250,25 +269,6 @@ pub struct ConsumerMessageValue<P> {
     /// Record content.
     #[educe(Debug(ignore))]
     pub record: Record<P>,
-}
-
-/// Content of one keyed Kafka record.
-pub enum Record<P> {
-    /// A record with a deserialized payload.
-    Message(P),
-    /// A record that deletes its key from compacted views.
-    Excise,
-}
-
-impl<P> Record<P> {
-    /// Returns the message payload, if this is a message record.
-    #[must_use]
-    pub fn message(&self) -> Option<&P> {
-        match self {
-            Self::Message(payload) => Some(payload),
-            Self::Excise => None,
-        }
-    }
 }
 
 #[cfg(test)]
