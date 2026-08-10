@@ -322,38 +322,13 @@ fn one_harness_calculates_time_history_and_function_dependencies() -> Result<(),
 
 #[test]
 fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
-    let controller_configuration = ControllerConfiguration {
-        cohort_count_max: 4,
-        calendar_segment_count_max: 4,
-        partition_count: 4,
-        replica_count_max: 8,
-        slots_per_replica: 2,
-        posterior_sample_count: 64,
-        report_interval_micros: 10_000,
-        failure_service_weight: 0.3_f64,
-        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
-        capacity_change_rate_per_second: 0.0_f64,
-        reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
-        objective: ServiceObjective::new(1_000_000, 0.01)?,
-    };
-    let capacity_grid = CapacityGrid::new(
-        &[0.005_f64, 0.01_f64],
-        &[200.0_f64, 400.0_f64],
-        &[0.0_f64, 1.0_f64],
-    )?;
-    let closed_loop = ClosedLoop::new(
-        CapacityWorkload,
-        &controller_configuration,
-        capacity_grid,
-        8,
-    )?;
+    let closed_loop = capacity_test_closed_loop(CapacityWorkload, 8)?;
     let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?.with_rebalance(0, 0);
     let mut harness = SimulationHarness::new(plant_configuration, 1, 8, closed_loop)?;
 
+    let mut replicas = Vec::with_capacity(8);
     for tick in 0_u64..8 {
-        harness.tick(tick * 10_000)?;
+        replicas.push(harness.tick(tick * 10_000)?.replicas);
     }
     let (_result, closed_loop) = harness.finish_with_graph();
     let kinds = (0..closed_loop.trace().len())
@@ -362,11 +337,80 @@ fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
         .collect::<Vec<_>>();
 
     assert!(kinds.contains(&CapacityEvidenceKind::Window));
+    let changed_tick = replicas
+        .windows(2)
+        .position(|pair| pair[0] != pair[1])
+        .map(|index| index + 1)
+        .ok_or(TestError::MissingScaleChange)?;
+    let changed_sample = closed_loop
+        .trace()
+        .sample(changed_tick)
+        .ok_or(TestError::MissingControllerSample)?;
+    assert!(matches!(
+        changed_sample.capacity_evidence,
+        CapacityEvidenceSample::Window(_)
+    ));
     Ok(())
 }
 
 #[test]
-fn closed_loop_excludes_zero_completion_capacity_windows() -> Result<(), TestError> {
+fn closed_loop_accepts_ready_window_with_rebalance_pause() -> Result<(), TestError> {
+    let closed_loop = capacity_test_closed_loop(CapacityWorkload, 8)?;
+    let plant_configuration =
+        PlantConfiguration::new(4, 100, 200, 8, 2, 16)?.with_rebalance(2_000, 0);
+    let mut harness = SimulationHarness::new(plant_configuration, 1, 8, closed_loop)?;
+    let mut snapshots = Vec::with_capacity(8);
+    for tick in 0_u64..8 {
+        snapshots.push(harness.tick(tick * 10_000)?);
+    }
+    let (_result, closed_loop) = harness.finish_with_graph();
+    let eligible_tick = snapshots
+        .windows(2)
+        .position(|pair| {
+            pair[0].partitions_ready
+                && pair[1].partitions_ready
+                && pair[0].rebalance_pause_micros < pair[1].rebalance_pause_micros
+        })
+        .map(|index| index + 1)
+        .ok_or(TestError::MissingPauseWindow)?;
+    let sample = closed_loop
+        .trace()
+        .sample(eligible_tick)
+        .ok_or(TestError::MissingControllerSample)?;
+
+    assert!(matches!(
+        sample.capacity_evidence,
+        CapacityEvidenceSample::Window(_)
+    ));
+    Ok(())
+}
+
+#[test]
+fn closed_loop_accepts_busy_zero_completion_capacity_windows() -> Result<(), TestError> {
+    let closed_loop = capacity_test_closed_loop(RampCapacityWorkload, 2)?;
+    let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?;
+    let mut harness = SimulationHarness::new(plant_configuration, 1, 3, closed_loop)?;
+
+    harness.tick(0)?;
+    harness.tick(10_000)?;
+    let sample = harness
+        .graph()
+        .trace()
+        .sample(1)
+        .ok_or(TestError::MissingControllerSample)?;
+
+    let CapacityEvidenceSample::Window(window) = sample.capacity_evidence else {
+        return Err(TestError::MissingCapacityWindow);
+    };
+    assert_eq!(window.completed_attempts, 0);
+    assert!(window.concurrency > 0.0_f64);
+    Ok(())
+}
+
+fn capacity_test_closed_loop<Workload>(
+    workload: Workload,
+    sample_count_max: u32,
+) -> Result<ClosedLoop<Workload>, TestError> {
     let controller_configuration = ControllerConfiguration {
         cohort_count_max: 4,
         calendar_segment_count_max: 4,
@@ -388,25 +432,12 @@ fn closed_loop_excludes_zero_completion_capacity_windows() -> Result<(), TestErr
         &[200.0_f64, 400.0_f64],
         &[0.0_f64, 1.0_f64],
     )?;
-    let closed_loop = ClosedLoop::new(
-        RampCapacityWorkload,
+    Ok(ClosedLoop::new(
+        workload,
         &controller_configuration,
         capacity_grid,
-        2,
-    )?;
-    let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?;
-    let mut harness = SimulationHarness::new(plant_configuration, 1, 3, closed_loop)?;
-
-    harness.tick(0)?;
-    harness.tick(10_000)?;
-    let sample = harness
-        .graph()
-        .trace()
-        .sample(1)
-        .ok_or(TestError::MissingControllerSample)?;
-
-    assert_eq!(sample.capacity_evidence, CapacityEvidenceSample::None);
-    Ok(())
+        sample_count_max,
+    )?)
 }
 
 #[test]
@@ -901,7 +932,6 @@ fn capacity_regimes_record_passive_resource_windows() -> Result<(), TestError> {
             if let CapacityEvidenceSample::Window(window) = sample.capacity_evidence {
                 recorded_windows += 1;
                 assert!(window.exposure_seconds > 0.0_f64);
-                assert!(window.completed_attempts > 0);
                 assert!(window.concurrency > 0.0_f64);
                 assert!(window.throughput_per_second().is_finite());
             }
@@ -1970,4 +2000,10 @@ enum TestError {
     PlatformLimit,
     #[error("the closed loop did not record a controller sample")]
     MissingControllerSample,
+    #[error("the closed loop did not record a capacity window")]
+    MissingCapacityWindow,
+    #[error("the plant did not change its replica count")]
+    MissingScaleChange,
+    #[error("the plant did not produce a ready interval with pause time")]
+    MissingPauseWindow,
 }

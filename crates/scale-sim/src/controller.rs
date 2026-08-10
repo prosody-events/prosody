@@ -931,7 +931,6 @@ pub struct ClosedLoop<Workload> {
     latest_capacity_window: Option<CapacityWindow>,
     capacity_evidence_sample: CapacityEvidenceSample,
     throughput_posterior_scratch: Vec<ThroughputPosteriorCell>,
-    last_observed_replicas: Option<u32>,
     inflight_transitions: Vec<PendingTransition>,
     pending_transition_observation: Option<PendingTransitionObservation>,
     lead_time_evidence_sample: LeadTimeEvidenceSample,
@@ -1120,7 +1119,6 @@ impl<Workload> ClosedLoop<Workload> {
                 ThroughputPosteriorCell::default();
                 throughput_posterior_count
             ],
-            last_observed_replicas: None,
             inflight_transitions: Vec::with_capacity(
                 usize::try_from(trace_count_max).map_err(|_| ConfigurationError::PlatformLimit)?,
             ),
@@ -1341,7 +1339,6 @@ impl<Workload> ClosedLoop<Workload> {
         )?;
         self.latest_capacity_window = None;
         self.capacity_evidence_sample = CapacityEvidenceSample::None;
-        self.last_observed_replicas = None;
         self.inflight_transitions.clear();
         self.pending_transition_observation = None;
         self.lead_time_evidence_sample = LeadTimeEvidenceSample::None;
@@ -1482,25 +1479,19 @@ impl<Workload> ClosedLoop<Workload> {
         Ok(())
     }
 
+    /// Adds a measured resource window between two ready plant states.
+    ///
+    /// Concurrency comes from occupancy, not replica count. Thus, a replica
+    /// change or rebalance pause does not invalidate a window. Occupancy and
+    /// completions fall together during a pause. A busy zero-completion window
+    /// is valid Poisson evidence. The contamination floor bounds its influence.
     fn prepare_capacity_evidence(&mut self, context: TickContext<'_>) -> Result<(), PlantError> {
         let Some(previous_micros) = context.history.now_micros(0) else {
             return Ok(());
         };
-        let previous_replicas = self
-            .last_observed_replicas
-            .replace(context.plant.replicas)
-            .unwrap_or(context.plant.replicas);
-        let replicas_changed = previous_replicas != context.plant.replicas;
-        if replicas_changed {
-            return Ok(());
-        }
         let ready =
             context.history.partitions_ready(0).unwrap_or(false) && context.plant.partitions_ready;
         if !ready {
-            return Ok(());
-        }
-        let previous_pause_micros = context.history.rebalance_pause_micros(0).unwrap_or(0);
-        if previous_pause_micros != context.plant.rebalance_pause_micros {
             return Ok(());
         }
         let exposure_micros = context.now_micros.saturating_sub(previous_micros);
@@ -1520,11 +1511,6 @@ impl<Workload> ClosedLoop<Workload> {
             .plant
             .completed_attempts
             .saturating_sub(previous_attempts);
-        // A zero-completion window cannot distinguish ramp-up from collapse.
-        // The capacity model does not represent this censored observation.
-        if completed_attempts == 0 {
-            return Ok(());
-        }
         let exposure_seconds = Duration::from_micros(exposure_micros).as_secs_f64();
         let current = CapacityWindow {
             concurrency: Duration::from_micros(occupancy).as_secs_f64() / exposure_seconds,
