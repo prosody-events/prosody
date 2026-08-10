@@ -23,43 +23,40 @@ fn complete_horizon_covers_the_latest_known_boundary_and_one_budget() {
 #[test]
 fn action_selection_applies_the_chance_constraint_before_loss() {
     let columns = ActionColumns {
-        missed_work_sums: &[2.0_f64, 1.0_f64, 0.0_f64],
+        violation_weight_sums: &[10.0_f64, 6.0_f64, 0.0_f64],
         excess_delay_sums: &[0.0_f64, 10.0_f64, 1.0_f64],
         replica_seconds_sums: &[1.0_f64, 3.0_f64, 2.0_f64],
         demand_floor: 0,
-        event_count_sum: 100.0_f64,
-        epsilon: 0.01_f64,
+        scenario_weight_sum: 100.0_f64,
+        slo_violation_probability: 0.05_f64,
     };
 
     assert_eq!(select_action(&columns), 2);
 }
 
 #[test]
-fn action_selection_charges_only_avoidable_misses() {
+fn action_selection_uses_the_best_attainable_violation_rate() {
     let columns = ActionColumns {
-        missed_work_sums: &[20.0_f64, 10.5_f64, 10.0_f64],
+        violation_weight_sums: &[20.0_f64, 10.5_f64, 10.0_f64],
         excess_delay_sums: &[0.0_f64, 0.0_f64, 10.0_f64],
         replica_seconds_sums: &[1.0_f64, 2.0_f64, 3.0_f64],
         demand_floor: 0,
-        event_count_sum: 100.0_f64,
-        epsilon: 0.01_f64,
+        scenario_weight_sum: 100.0_f64,
+        slo_violation_probability: 0.01_f64,
     };
 
-    // Ten missed events are common to every action. The middle action sits
-    // inside the one-event allowance above the best action, so its lower
-    // replica-seconds win.
-    assert_eq!(select_action(&columns), 1);
+    assert_eq!(select_action(&columns), 2);
 }
 
 #[test]
 fn action_selection_resolves_equal_loss_to_the_smallest_target() {
     let columns = ActionColumns {
-        missed_work_sums: &[2.0_f64; 3],
+        violation_weight_sums: &[2.0_f64; 3],
         excess_delay_sums: &[1.0_f64; 3],
         replica_seconds_sums: &[1.0_f64; 3],
         demand_floor: 0,
-        event_count_sum: 100.0_f64,
-        epsilon: 0.01_f64,
+        scenario_weight_sum: 100.0_f64,
+        slo_violation_probability: 0.01_f64,
     };
 
     assert_eq!(select_action(&columns), 0);
@@ -68,12 +65,12 @@ fn action_selection_resolves_equal_loss_to_the_smallest_target() {
 #[test]
 fn action_selection_uses_replica_seconds_after_equal_loss() {
     let columns = ActionColumns {
-        missed_work_sums: &[2.0_f64; 3],
+        violation_weight_sums: &[2.0_f64; 3],
         excess_delay_sums: &[1.0_f64; 3],
         replica_seconds_sums: &[3.0_f64, 1.0_f64, 2.0_f64],
         demand_floor: 0,
-        event_count_sum: 100.0_f64,
-        epsilon: 0.01_f64,
+        scenario_weight_sum: 100.0_f64,
+        slo_violation_probability: 0.01_f64,
     };
 
     assert_eq!(select_action(&columns), 1);
@@ -82,12 +79,12 @@ fn action_selection_uses_replica_seconds_after_equal_loss() {
 #[test]
 fn the_demand_floor_excludes_actions_a_repair_overrides() {
     let columns = ActionColumns {
-        missed_work_sums: &[0.0_f64; 3],
+        violation_weight_sums: &[0.0_f64; 3],
         excess_delay_sums: &[0.0_f64; 3],
         replica_seconds_sums: &[1.0_f64, 2.0_f64, 3.0_f64],
         demand_floor: 1,
-        event_count_sum: 100.0_f64,
-        epsilon: 0.01_f64,
+        scenario_weight_sum: 100.0_f64,
+        slo_violation_probability: 0.01_f64,
     };
 
     // Every action misses nothing, but the first action cannot serve the
@@ -99,12 +96,12 @@ fn the_demand_floor_excludes_actions_a_repair_overrides() {
 #[test]
 fn infeasible_actions_order_by_excess_delay() {
     let columns = ActionColumns {
-        missed_work_sums: &[20.0_f64, 10.0_f64],
+        violation_weight_sums: &[20.0_f64, 10.0_f64],
         excess_delay_sums: &[3.0_f64, 1.0_f64],
         replica_seconds_sums: &[1.0_f64, 3.0_f64],
         demand_floor: 0,
-        event_count_sum: 100.0_f64,
-        epsilon: 0.01_f64,
+        scenario_weight_sum: 100.0_f64,
+        slo_violation_probability: 0.01_f64,
     };
 
     // Both actions exceed a zero allowance, so expected excess delay

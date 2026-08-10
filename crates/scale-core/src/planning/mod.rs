@@ -20,7 +20,7 @@ pub(crate) fn complete_horizon_micros(
 
 /// Columnar posterior values with one cell for each ordered replica target.
 pub(crate) struct ActionColumns<'a> {
-    pub(crate) missed_work_sums: &'a [f64],
+    pub(crate) violation_weight_sums: &'a [f64],
     pub(crate) excess_delay_sums: &'a [f64],
     pub(crate) replica_seconds_sums: &'a [f64],
     /// Smallest action index whose supply covers the known arrival rate.
@@ -31,40 +31,39 @@ pub(crate) struct ActionColumns<'a> {
     /// not a fixed point of the policy: it defers work the controller must
     /// do now. Actions below this index are never feasible.
     pub(crate) demand_floor: usize,
-    pub(crate) event_count_sum: f64,
-    pub(crate) epsilon: f64,
+    pub(crate) scenario_weight_sum: f64,
+    pub(crate) slo_violation_probability: f64,
 }
 
 impl ActionColumns<'_> {
-    /// Returns the missed-work allowance that bounds the feasible set.
+    /// Returns the violation-weight allowance that bounds the feasible set.
     ///
-    /// An action is feasible when its posterior missed events exceed the
-    /// best action's by no more than epsilon of the posterior events. The
-    /// best action is always feasible, so common-cause loss that no action
-    /// prevents never empties the feasible set.
-    pub(crate) fn missed_allowance(&self) -> f64 {
+    /// An action is feasible when its posterior violation probability is at
+    /// most the configured budget. The best attainable violation weight is
+    /// the fallback, so the feasible set cannot be empty.
+    pub(crate) fn violation_allowance(&self) -> f64 {
         let minimum = self
-            .missed_work_sums
+            .violation_weight_sums
             .iter()
             .copied()
             .fold(f64::INFINITY, f64::min);
-        minimum + self.epsilon * self.event_count_sum.max(f64::MIN_POSITIVE)
+        minimum.max(self.slo_violation_probability * self.scenario_weight_sum)
     }
 
-    fn feasible(&self, index: usize, allowance: f64) -> bool {
-        index >= self.demand_floor && self.missed_work_sums[index] <= allowance
+    pub(crate) fn feasible(&self, index: usize, allowance: f64) -> bool {
+        index >= self.demand_floor && self.violation_weight_sums[index] <= allowance
     }
 }
 
 /// Selects one action from columnar posterior values.
 ///
 /// Replica-seconds order feasible actions; see
-/// [`ActionColumns::missed_allowance`] and [`ActionColumns::demand_floor`]
+/// [`ActionColumns::violation_allowance`] and [`ActionColumns::demand_floor`]
 /// for the feasibility rules. Expected excess delay and then
 /// replica-seconds order infeasible actions. Target order resolves ties.
 pub(crate) fn select_action(columns: &ActionColumns<'_>) -> usize {
-    let allowance = columns.missed_allowance();
-    (0..columns.missed_work_sums.len())
+    let allowance = columns.violation_allowance();
+    (0..columns.violation_weight_sums.len())
         .min_by(|left, right| compare_actions(*left, *right, columns, allowance))
         .map_or(0, |index| index)
 }

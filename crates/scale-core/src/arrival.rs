@@ -1,3 +1,4 @@
+use std::f64::consts::LN_2;
 use std::time::Duration;
 
 use rand::RngExt;
@@ -11,6 +12,12 @@ use crate::types::{CalendarColumns, CalendarForecast};
 use crate::{ArrivalPosterior, CalendarArtifactId, RandomStream};
 
 const RUN_LENGTH_CAPACITY: usize = 1_024;
+const RATE_BIN_COUNT: usize = 64;
+const RATE_LOG_MIN: f64 = -6.907_755_278_982_137_f64;
+const RATE_LOG_WIDTH: f64 = 0.323_801_028_702_287_66_f64;
+const RATE_LOG_WIDTH_RECIPROCAL: f64 = 3.088_316_315_756_457_7_f64;
+const DEFAULT_PRIOR_TRUST_SECONDS: f64 = 86_400.0_f64;
+const DEFAULT_OCCUPANCY_HALF_LIFE_SECONDS: f64 = 604_800.0_f64;
 
 /// Prior for the current arrival-rate segment.
 #[derive(Clone, Copy, Debug)]
@@ -19,6 +26,8 @@ pub struct ArrivalPrior {
     rate_seconds: f64,
     change_kernel: ChangePointKernel,
     run_length_max: usize,
+    prior_trust_seconds: f64,
+    occupancy_half_life_seconds: f64,
 }
 
 impl ArrivalPrior {
@@ -52,7 +61,34 @@ impl ArrivalPrior {
             rate_seconds,
             change_kernel: ChangePointKernel::new(change_rate_per_second),
             run_length_max,
+            prior_trust_seconds: DEFAULT_PRIOR_TRUST_SECONDS,
+            occupancy_half_life_seconds: DEFAULT_OCCUPANCY_HALF_LIFE_SECONDS,
         })
+    }
+
+    /// Sets how quickly observed rate levels replace the configured jump prior.
+    ///
+    /// `prior_trust_seconds` is the exposure that gives history and the prior
+    /// equal weight. `occupancy_half_life_seconds` controls how quickly old
+    /// rate levels lose weight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a duration is not finite and positive.
+    pub fn with_transition_learning(
+        mut self,
+        prior_trust_seconds: f64,
+        occupancy_half_life_seconds: f64,
+    ) -> Result<Self, ArrivalPriorError> {
+        if !prior_trust_seconds.is_finite() || prior_trust_seconds <= 0.0_f64 {
+            return Err(ArrivalPriorError::InvalidPriorTrust);
+        }
+        if !occupancy_half_life_seconds.is_finite() || occupancy_half_life_seconds <= 0.0_f64 {
+            return Err(ArrivalPriorError::InvalidOccupancyHalfLife);
+        }
+        self.prior_trust_seconds = prior_trust_seconds;
+        self.occupancy_half_life_seconds = occupancy_half_life_seconds;
+        Ok(self)
     }
 
     /// Returns a broad prior for tests that do not study arrival inference.
@@ -63,6 +99,8 @@ impl ArrivalPrior {
             rate_seconds: 1.0_f64,
             change_kernel: ChangePointKernel::new(1.0_f64 / 300.0_f64),
             run_length_max: RUN_LENGTH_CAPACITY,
+            prior_trust_seconds: DEFAULT_PRIOR_TRUST_SECONDS,
+            occupancy_half_life_seconds: DEFAULT_OCCUPANCY_HALF_LIFE_SECONDS,
         }
     }
 
@@ -89,6 +127,119 @@ impl ArrivalEvidence {
     }
 }
 
+/// Exposure-weighted occupancy of observed arrival rates.
+///
+/// This model assumes that an arrival process revisits rate levels that it
+/// occupied before. Weights are non-negative, and `total` is their sum. A
+/// zero total makes the jump sampler use only the configured prior.
+pub(crate) struct RateOccupancy {
+    weights: [f64; RATE_BIN_COUNT],
+    cumulative: [f64; RATE_BIN_COUNT],
+    total: f64,
+}
+
+impl RateOccupancy {
+    pub(crate) const fn new() -> Self {
+        Self {
+            weights: [0.0_f64; RATE_BIN_COUNT],
+            cumulative: [0.0_f64; RATE_BIN_COUNT],
+            total: 0.0_f64,
+        }
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        rate_per_second: f64,
+        exposure_seconds: f64,
+        elapsed_seconds: f64,
+        half_life_seconds: f64,
+    ) {
+        let decay = (-LN_2 * elapsed_seconds / half_life_seconds).exp();
+        for weight in &mut self.weights {
+            *weight *= decay;
+        }
+        let index = rate_bin(rate_per_second);
+        self.weights[index] += exposure_seconds;
+        let mut cumulative = 0.0_f64;
+        for (weight, value) in self.weights.iter().zip(&mut self.cumulative) {
+            cumulative += weight;
+            *value = cumulative;
+        }
+        self.total = cumulative;
+    }
+
+    pub(crate) fn sample(&self, prior: ArrivalPrior, random: &mut RandomStream) -> f64 {
+        let prior_probability =
+            prior.prior_trust_seconds / (prior.prior_trust_seconds + self.total);
+        if self.total <= f64::EPSILON || random.random::<f64>() < prior_probability {
+            return sample_gamma(prior.shape, random) / prior.rate_seconds;
+        }
+        let draw = random.random::<f64>() * self.total;
+        let selected = self
+            .cumulative
+            .partition_point(|&cumulative| cumulative < draw)
+            .min(RATE_BIN_COUNT - 1);
+        let selected = u32::try_from(selected).map_or(u32::MAX, |index| index);
+        let log_rate =
+            RATE_LOG_MIN + (f64::from(selected) + random.open_unit_f64()) * RATE_LOG_WIDTH;
+        log_rate.exp()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total(&self) -> f64 {
+        self.total
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn weights(&self) -> &[f64; RATE_BIN_COUNT] {
+        &self.weights
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn cumulative(&self) -> &[f64; RATE_BIN_COUNT] {
+        &self.cumulative
+    }
+}
+
+/// Posterior evidence for the arrival change frequency.
+pub(crate) struct ChangeHazard {
+    change_mass: f64,
+    exposure_seconds: f64,
+}
+
+impl ChangeHazard {
+    pub(crate) const fn new() -> Self {
+        Self {
+            change_mass: 0.0_f64,
+            exposure_seconds: 0.0_f64,
+        }
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        change_probability: f64,
+        exposure_seconds: f64,
+        elapsed_seconds: f64,
+        half_life_seconds: f64,
+    ) {
+        let decay = (-LN_2 * elapsed_seconds / half_life_seconds).exp();
+        self.change_mass = self.change_mass * decay + change_probability;
+        self.exposure_seconds = self.exposure_seconds * decay + exposure_seconds;
+    }
+
+    fn sample(&self, prior: ArrivalPrior, random: &mut RandomStream) -> f64 {
+        let prior_shape = prior.change_kernel.rate_per_second() * prior.prior_trust_seconds;
+        sample_gamma(prior_shape + self.change_mass, random)
+            / (prior.prior_trust_seconds + self.exposure_seconds)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mean(&self, prior: ArrivalPrior) -> f64 {
+        (prior.change_kernel.rate_per_second() * prior.prior_trust_seconds + self.change_mass)
+            / (prior.prior_trust_seconds + self.exposure_seconds)
+    }
+}
+
 pub(crate) struct ArrivalFactor {
     prior: ArrivalPrior,
     probability: [f64; RUN_LENGTH_CAPACITY],
@@ -105,6 +256,8 @@ pub(crate) struct ArrivalFactor {
     calendar_rate: f64,
     calendar_log_odds: f64,
     last_evidence_micros: u64,
+    rate_occupancy: RateOccupancy,
+    change_hazard: ChangeHazard,
 }
 
 impl ArrivalFactor {
@@ -125,6 +278,8 @@ impl ArrivalFactor {
             calendar_rate: 0.0_f64,
             calendar_log_odds: f64::NEG_INFINITY,
             last_evidence_micros: 0,
+            rate_occupancy: RateOccupancy::new(),
+            change_hazard: ChangeHazard::new(),
         };
         factor.probability[0] = 1.0_f64;
         factor.cumulative_probability[0] = 1.0_f64;
@@ -153,6 +308,9 @@ impl ArrivalFactor {
         let exposure_micros = exposure_micros.min(now_micros);
         let evidence_start_micros = now_micros - exposure_micros;
         let missing_micros = evidence_start_micros.saturating_sub(self.last_evidence_micros);
+        let elapsed_seconds =
+            Duration::from_micros(now_micros.saturating_sub(self.last_evidence_micros))
+                .as_secs_f64();
         self.propagate_missing(Duration::from_micros(missing_micros));
         self.prepare_calendar(calendar, now_micros);
         if let Some(forecast) = calendar
@@ -166,6 +324,18 @@ impl ArrivalFactor {
         }
         self.update_local(count, exposure_duration);
         self.last_evidence_micros = now_micros;
+        self.rate_occupancy.record(
+            self.expected_rate(now_micros),
+            exposure,
+            elapsed_seconds,
+            self.prior.occupancy_half_life_seconds,
+        );
+        self.change_hazard.record(
+            self.probability[0],
+            exposure,
+            elapsed_seconds,
+            self.prior.occupancy_half_life_seconds,
+        );
         drop(token);
     }
 
@@ -368,17 +538,18 @@ impl ArrivalFactor {
             );
             return length;
         }
+        let hazard_rate = self.change_hazard.sample(self.prior, random);
         let mut rate = self.sample_current_rate(random);
         let missing_change_probability = self.missing_change_probability(now_micros);
         if missing_change_probability > 0.0_f64
             && random.random::<f64>() < missing_change_probability
         {
-            rate = sample_gamma(self.prior.shape, random) / self.prior.rate_seconds;
+            rate = self.rate_occupancy.sample(self.prior, random);
         }
         let mut cursor = 0.0_f64;
         for index in 0..bound {
             let uniform = random.random::<f64>();
-            let until_change = -(-uniform).ln_1p() / self.prior.change_kernel.rate_per_second();
+            let until_change = -(-uniform).ln_1p() / hazard_rate;
             cursor = (cursor + until_change).min(duration_seconds);
             end_seconds[index] = cursor;
             rates[index] = rate;
@@ -392,7 +563,7 @@ impl ArrivalFactor {
                 );
                 return length;
             }
-            rate = sample_gamma(self.prior.shape, random) / self.prior.rate_seconds;
+            rate = self.rate_occupancy.sample(self.prior, random);
         }
         end_seconds[bound - 1] = duration_seconds;
         sample_path_counts(
@@ -503,6 +674,12 @@ impl ArrivalFactor {
     }
 }
 
+pub(crate) fn rate_bin(rate_per_second: f64) -> usize {
+    let position =
+        (rate_per_second.max(1.0e-3_f64).ln() - RATE_LOG_MIN) * RATE_LOG_WIDTH_RECIPROCAL;
+    (position as usize).min(RATE_BIN_COUNT - 1)
+}
+
 fn sample_path_counts(
     random: &RandomStream,
     end_seconds: &[f64],
@@ -578,6 +755,12 @@ pub enum ArrivalPriorError {
     /// The change rate is not finite and positive.
     #[error("arrival change rate must be finite and positive")]
     InvalidChangeRate,
+    /// The jump-prior trust exposure is not finite and positive.
+    #[error("arrival prior trust must be finite and positive")]
+    InvalidPriorTrust,
+    /// The rate-occupancy half-life is not finite and positive.
+    #[error("arrival occupancy half-life must be finite and positive")]
+    InvalidOccupancyHalfLife,
     /// The run-length bound is outside the supported range.
     #[error("arrival run-length bound must be between 2 and {maximum}")]
     InvalidRunLength {

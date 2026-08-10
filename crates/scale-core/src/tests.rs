@@ -2,17 +2,18 @@ use std::hint::black_box;
 use std::slice;
 use std::time::Duration;
 
-use fearless_simd::Level;
+use fearless_simd::{Level, dispatch};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
+use statrs::distribution::{ContinuousCDF, Gamma};
 use thiserror::Error;
 
-use crate::arrival::{ArrivalEvidence, ArrivalFactor};
+use crate::arrival::{ArrivalEvidence, ArrivalFactor, ChangeHazard, RateOccupancy, rate_bin};
 use crate::capacity::CapacityFactor;
 use crate::change_point::ChangePointKernel;
 use crate::controller::{
     DecisionRandomDomain, NumericalDecision, classify_paired_bootstrap, decision_random,
-    minimal_moved_partitions, mixed_event_supply, terminal_drain_area,
+    minimal_moved_partitions, mixed_event_supply, prepare_scenario_violations, terminal_drain_area,
 };
 use crate::edf::{
     ArrivalPath, EdfOutcome, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
@@ -21,13 +22,14 @@ use crate::edf::{
 };
 use crate::lead_time::LeadTimeFactor;
 use crate::partition::PartitionFactor;
+use crate::planning::{ActionColumns, select_action};
 use crate::types::{CalendarColumns, CalendarForecast, WorkCohorts};
 use crate::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
     CalendarArtifactId, CalendarRateSegment, CapacityCurve, CapacityGrid, CapacityPrior, Cohort,
-    Configuration, DemandClass, HoldReason, ModelTime, ObservationBuffer, PosteriorQuery,
-    RandomStream, ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleScratch, ScaleState,
-    ServiceObjective, ThroughputPosteriorCell, TransitionDirection, TransitionEvidence,
+    Configuration, ConfigurationError, DemandClass, HoldReason, ModelTime, ObservationBuffer,
+    PosteriorQuery, RandomStream, ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleScratch,
+    ScaleState, ServiceObjective, ThroughputPosteriorCell, TransitionDirection, TransitionEvidence,
     TransitionPrior, step,
 };
 
@@ -44,33 +46,168 @@ const TEN_FUTURE_ARRIVALS_PER_SECOND: ArrivalPath<'static> = ArrivalPath {
 
 #[test]
 fn bootstrap_contract_excludes_actions_proven_worse() {
+    let replica_seconds = [3.0_f64, 2.0_f64, 4.0_f64];
+    let columns = bootstrap_columns(&replica_seconds);
     assert_eq!(
-        classify_paired_bootstrap(&[127, 0, 128], 128, 0.01_f64, None),
+        classify_paired_bootstrap(&[127, 0, 128], 128, &columns, 1, None, 0.0_f64, 0.01_f64,),
         NumericalDecision::Resolved { target_index: 1 }
     );
 }
 
 #[test]
 fn bootstrap_contract_retains_an_action_not_proven_worse() {
+    let replica_seconds = [1.0_f64, 2.0_f64, 3.0_f64];
+    let columns = bootstrap_columns(&replica_seconds);
     assert_eq!(
-        classify_paired_bootstrap(&[126, 0, 128], 128, 0.01_f64, None),
+        classify_paired_bootstrap(&[0, 126, 128], 128, &columns, 0, None, 0.0_f64, 0.01_f64,),
         NumericalDecision::Unresolved { credible_index: 0 }
     );
 }
 
+#[quickcheck]
+fn bootstrap_contract_prices_credible_incumbency(cost_code: u16, excess_code: u16) -> bool {
+    let transition_cost = f64::from(cost_code) + 1.0_f64;
+    let within_cost = transition_cost * f64::from(excess_code) / f64::from(u16::MAX);
+    let outside_cost = transition_cost + f64::from(excess_code) + 1.0_f64;
+    let within_replica_seconds = [1.0_f64, 1.0_f64 + within_cost, 3.0_f64];
+    let outside_replica_seconds = [1.0_f64, 1.0_f64 + outside_cost, 3.0_f64];
+    let within_columns = bootstrap_columns(&within_replica_seconds);
+    let outside_columns = bootstrap_columns(&outside_replica_seconds);
+    let worse_counts = [0, 0, 128];
+    let within = classify_paired_bootstrap(
+        &worse_counts,
+        128,
+        &within_columns,
+        0,
+        Some(1),
+        transition_cost,
+        0.01_f64,
+    );
+    let outside = || {
+        classify_paired_bootstrap(
+            &worse_counts,
+            128,
+            &outside_columns,
+            0,
+            Some(1),
+            transition_cost,
+            0.01_f64,
+        )
+    };
+    let first_outside = outside();
+    let second_outside = outside();
+    within == (NumericalDecision::Unresolved { credible_index: 1 })
+        && first_outside == (NumericalDecision::Unresolved { credible_index: 0 })
+        && second_outside == first_outside
+}
+
+fn bootstrap_columns(replica_seconds_sums: &[f64]) -> ActionColumns<'_> {
+    const ZEROES: [f64; 3] = [0.0_f64; 3];
+    ActionColumns {
+        violation_weight_sums: &ZEROES,
+        excess_delay_sums: &ZEROES,
+        replica_seconds_sums,
+        demand_floor: 0,
+        scenario_weight_sum: 1.0_f64,
+        slo_violation_probability: 0.05_f64,
+    }
+}
+
+#[quickcheck]
+fn chance_constraint_matches_the_posterior_violation_fraction(violation_code: u8) -> bool {
+    const SCENARIO_COUNT: usize = 100;
+    const CANDIDATE_COUNT: usize = 3;
+    const DELTA: f64 = 0.05_f64;
+    let violation_count = usize::from(violation_code) % (SCENARIO_COUNT + 1);
+    let mut missed_work = vec![0.0_f64; SCENARIO_COUNT * CANDIDATE_COUNT];
+    for scenario in 0..violation_count {
+        missed_work[scenario * CANDIDATE_COUNT] = 2.0_f64;
+    }
+    let event_count = vec![100.0_f64; SCENARIO_COUNT];
+    let mut violations = vec![0.0_f64; missed_work.len()];
+    dispatch!(Level::new(), simd => prepare_scenario_violations(
+        simd,
+        &missed_work,
+        &event_count,
+        CANDIDATE_COUNT,
+        CANDIDATE_COUNT,
+        &mut violations,
+        0.01_f64,
+    ));
+    let violation_weight_sums = [
+        violations.iter().step_by(CANDIDATE_COUNT).sum(),
+        violations.iter().skip(1).step_by(CANDIDATE_COUNT).sum(),
+        violations.iter().skip(2).step_by(CANDIDATE_COUNT).sum(),
+    ];
+    let columns = ActionColumns {
+        violation_weight_sums: &violation_weight_sums,
+        excess_delay_sums: &[0.0_f64; CANDIDATE_COUNT],
+        replica_seconds_sums: &[1.0_f64, 2.0_f64, 3.0_f64],
+        demand_floor: 0,
+        scenario_weight_sum: 100.0_f64,
+        slo_violation_probability: DELTA,
+    };
+    let allowance = columns.violation_allowance();
+    let expected_feasible = violation_count <= 5;
+    columns.feasible(0, allowance) == expected_feasible
+        && (0..CANDIDATE_COUNT).any(|target| columns.feasible(target, allowance))
+        && violations
+            .chunks_exact(CANDIDATE_COUNT)
+            .all(|row| row.contains(&0.0_f64))
+        && select_action(&columns) == usize::from(!expected_feasible)
+}
+
 #[test]
-fn bootstrap_contract_keeps_a_credible_standing_target() {
-    // Actions 0 and 2 are statistically indistinguishable, so the
-    // standing target wins over the smallest credible action. A standing
-    // target proven worse loses to the smallest credible action.
-    assert_eq!(
-        classify_paired_bootstrap(&[126, 128, 126], 128, 0.01_f64, Some(2)),
-        NumericalDecision::Unresolved { credible_index: 2 }
+fn idle_shaped_scenarios_release_insurance_below_the_probability_budget() {
+    let low_phantom_mass = ActionColumns {
+        violation_weight_sums: &[4.0_f64, 0.0_f64],
+        excess_delay_sums: &[0.0_f64; 2],
+        replica_seconds_sums: &[1.0_f64, 2.0_f64],
+        demand_floor: 0,
+        scenario_weight_sum: 100.0_f64,
+        slo_violation_probability: 0.05_f64,
+    };
+    let high_phantom_mass = ActionColumns {
+        violation_weight_sums: &[20.0_f64, 0.0_f64],
+        excess_delay_sums: &[0.0_f64; 2],
+        replica_seconds_sums: &[1.0_f64, 2.0_f64],
+        demand_floor: 0,
+        scenario_weight_sum: 100.0_f64,
+        slo_violation_probability: 0.05_f64,
+    };
+
+    assert_eq!(select_action(&low_phantom_mass), 0);
+    assert_eq!(select_action(&high_phantom_mass), 1);
+}
+
+#[test]
+fn service_objective_rejects_invalid_slo_violation_probabilities() -> Result<(), ConfigurationError>
+{
+    let objective = ServiceObjective::new(1_000_000, 0.01_f64)?;
+    for probability in [
+        f64::NEG_INFINITY,
+        -f64::MIN_POSITIVE,
+        0.0_f64,
+        0.5_f64,
+        1.0_f64,
+        f64::INFINITY,
+        f64::NAN,
+    ] {
+        assert!(
+            objective
+                .with_slo_violation_probability(probability)
+                .is_err(),
+            "probability={probability}"
+        );
+    }
+    assert!(
+        objective
+            .with_slo_violation_probability(0.05_f64)?
+            .slo_violation_probability()
+            .total_cmp(&0.05_f64)
+            .is_eq()
     );
-    assert_eq!(
-        classify_paired_bootstrap(&[126, 126, 128], 128, 0.01_f64, Some(2)),
-        NumericalDecision::Unresolved { credible_index: 0 }
-    );
+    Ok(())
 }
 
 fn evaluate_constant_supply(
@@ -800,6 +937,114 @@ fn arrival_posterior_predictive_mass_normalizes() {
     assert!((mass - 1.0_f64).abs() < 1.0e-12_f64);
 }
 
+#[quickcheck]
+fn empty_rate_occupancy_samples_the_configured_prior(seed: u64) -> bool {
+    let Ok(prior) = crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64, 1_024)
+        .and_then(|prior| prior.with_transition_learning(1.0_f64, 1.0e9_f64))
+    else {
+        return false;
+    };
+    let Ok(distribution) = Gamma::new(4.0_f64, 0.01_f64) else {
+        return false;
+    };
+    let occupancy = RateOccupancy::new();
+    let mut random = RandomStream::new(seed);
+    let mut samples = vec![0.0_f64; 4_096];
+    for sample in &mut samples {
+        *sample = occupancy.sample(prior, &mut random);
+    }
+    samples.sort_by(f64::total_cmp);
+    [0.1_f64, 0.5_f64, 0.9_f64]
+        .into_iter()
+        .zip([409_usize, 2_048, 3_686])
+        .all(|(probability, index)| {
+            let expected = distribution.inverse_cdf(probability);
+            (samples[index] - expected).abs() / expected < 0.1_f64
+        })
+}
+
+#[quickcheck]
+fn observed_rate_occupancy_controls_jump_samples(rate_code: u16, seed: u64) -> bool {
+    let Ok(prior) = crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64, 1_024)
+        .and_then(|prior| prior.with_transition_learning(1.0_f64, 1.0e9_f64))
+    else {
+        return false;
+    };
+    let exponent = -2.0_f64 + 6.0_f64 * f64::from(rate_code) / f64::from(u16::MAX);
+    let rate = 10.0_f64.powf(exponent);
+    let expected_bin = rate_bin(rate);
+    let mut occupancy = RateOccupancy::new();
+    occupancy.record(rate, 1_000.0_f64, 1_000.0_f64, 1.0e9_f64);
+    let mut random = RandomStream::new(seed);
+    let matching = (0_u32..4_096)
+        .filter(|_| {
+            let sampled_bin = rate_bin(occupancy.sample(prior, &mut random));
+            sampled_bin.abs_diff(expected_bin) <= 1
+        })
+        .count();
+    matching >= 3_972
+}
+
+#[quickcheck]
+fn rate_occupancy_preserves_column_invariants(records: Vec<(u16, u16, u16)>) -> bool {
+    let mut occupancy = RateOccupancy::new();
+    for (rate_code, exposure_code, elapsed_code) in records.into_iter().take(128) {
+        let exponent = -3.0_f64 + 9.0_f64 * f64::from(rate_code) / f64::from(u16::MAX);
+        occupancy.record(
+            10.0_f64.powf(exponent),
+            f64::from(exposure_code) + 1.0_f64,
+            f64::from(elapsed_code),
+            86_400.0_f64,
+        );
+    }
+    let sum = occupancy.weights().iter().sum::<f64>();
+    let tolerance = occupancy.total().max(1.0_f64) * 1.0e-12_f64;
+    let weights_valid = occupancy
+        .weights()
+        .iter()
+        .all(|weight| weight.is_finite() && *weight >= 0.0_f64);
+    let cumulative_valid = occupancy
+        .cumulative()
+        .windows(2)
+        .all(|pair| pair[0] <= pair[1]);
+    weights_valid
+        && cumulative_valid
+        && (sum - occupancy.total()).abs() <= tolerance
+        && (occupancy.cumulative()[63] - occupancy.total()).abs() <= tolerance
+}
+
+#[quickcheck]
+fn learned_hazard_mean_moves_from_the_prior_to_observed_frequency(frequency_code: u8) -> bool {
+    let Ok(prior) = crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 0.01_f64, 1_024)
+        .and_then(|prior| prior.with_transition_learning(10.0_f64, 1.0e12_f64))
+    else {
+        return false;
+    };
+    let frequency = f64::from(frequency_code) / f64::from(u8::MAX);
+    let mut hazard = ChangeHazard::new();
+    for _ in 0_u32..1_000 {
+        hazard.record(frequency, 1.0_f64, 1.0_f64, 1.0e12_f64);
+    }
+    let mean = hazard.mean(prior);
+    let lower = frequency.min(0.01_f64);
+    let upper = frequency.max(0.01_f64);
+    (lower..=upper).contains(&mean) && (mean - frequency).abs() < 0.01_f64
+}
+
+#[test]
+fn transition_learning_requires_positive_finite_durations() -> Result<(), TestError> {
+    let prior = crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 0.01_f64, 1_024)?;
+    assert!(matches!(
+        prior.with_transition_learning(0.0_f64, 1.0_f64),
+        Err(crate::ArrivalPriorError::InvalidPriorTrust)
+    ));
+    assert!(matches!(
+        prior.with_transition_learning(1.0_f64, f64::INFINITY),
+        Err(crate::ArrivalPriorError::InvalidOccupancyHalfLife)
+    ));
+    Ok(())
+}
+
 #[test]
 fn arrival_change_point_replaces_stale_rate_evidence() -> Result<(), TestError> {
     let prior = crate::ArrivalPrior::new(100.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64, 1_024)?;
@@ -1277,7 +1522,7 @@ fn every_discrete_posterior_has_an_ordered_normalized_view() -> Result<(), TestE
     ];
     for query in queries {
         let count = usize::try_from(state.posterior_value_count(query)?)
-            .map_err(|_| crate::ConfigurationError::PlatformLimit)?;
+            .map_err(|_| ConfigurationError::PlatformLimit)?;
         let mut values = vec![0.0_f64; count];
         let mut probabilities = vec![0.0_f64; count];
         state.write_posterior(query, &mut values, &mut probabilities)?;
@@ -1405,7 +1650,7 @@ fn capacity_grid_accepts_exactly_representable_log_normal_parameters(
 fn capacity_prior(grid: CapacityGrid) -> Result<Vec<f64>, TestError> {
     let state = ScaleState::new(configuration()?, grid)?;
     let count = usize::try_from(state.posterior_value_count(PosteriorQuery::Capacity)?)
-        .map_err(|_| crate::ConfigurationError::PlatformLimit)?;
+        .map_err(|_| ConfigurationError::PlatformLimit)?;
     let mut values = vec![0.0_f64; count];
     let mut probabilities = vec![0.0_f64; count];
     state.write_posterior(PosteriorQuery::Capacity, &mut values, &mut probabilities)?;
@@ -1697,8 +1942,11 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
     let mut losses = [0.0_f64; 2];
     let mut passes = [0.0_f64; 2];
     scratch.write_decision_curve(&mut losses, &mut passes)?;
+    // The pass probability is relative to the row-minimum candidate, so
+    // the expected loss carries the absolute invariant: every candidate
+    // keeps a positive loss because no capacity lands before the deadline.
     assert!(
-        passes.iter().all(|probability| *probability < 0.99_f64),
+        losses.iter().all(|loss| *loss > 0.0_f64),
         "passes={passes:?}, losses={losses:?}"
     );
     assert!(apply.diagnostics.shortfall > 0.0_f64);
@@ -2080,8 +2328,11 @@ fn wide_cohort_cannot_hide_one_hot_partition_deadline() -> Result<(), TestError>
     let mut losses = [0.0_f64; 32];
     let mut passes = [0.0_f64; 32];
     scratch.write_decision_curve(&mut losses, &mut passes)?;
+    // The pass probability is relative to the row-minimum candidate, so
+    // the expected loss carries the absolute invariant: the serialized
+    // partition keeps a positive loss at every replica count.
     assert!(
-        passes.iter().all(|probability| *probability < 0.99_f64),
+        losses.iter().all(|loss| *loss > 0.0_f64),
         "passes={passes:?}, losses={losses:?}"
     );
     assert!(apply.diagnostics.shortfall > 0.0_f64);
@@ -2358,12 +2609,10 @@ fn plateau_grid() -> Result<CapacityGrid, TestError> {
     )?)
 }
 
-/// A steady plateau at high utilization must buy jump insurance: the
-/// posterior arrival hazard makes standing headroom the only policy whose
-/// avoidable misses stay inside the SLO slack. The target must also stay
-/// bounded: untested capacity is not a reason to scale without limit.
+/// A steady plateau must select the best attainable chance constraint when
+/// no fixed target meets the configured probability budget.
 #[test]
-fn steady_plateau_selects_insured_capacity() -> Result<(), TestError> {
+fn steady_plateau_selects_best_attainable_insurance() -> Result<(), TestError> {
     let configuration = plateau_configuration()?;
     let mut state = ScaleState::new(configuration.clone(), plateau_grid()?)?;
     let mut scratch = ScaleScratch::new(&configuration)?;
@@ -2399,16 +2648,25 @@ fn steady_plateau_selects_insured_capacity() -> Result<(), TestError> {
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
-    assert!(
-        (3..=8).contains(&apply.target),
-        "target={} cap={}",
-        apply.target,
-        apply.cap
-    );
     let candidate_count = scratch.decision_candidate_count();
     let mut losses = vec![0.0_f64; candidate_count];
     let mut passes = vec![0.0_f64; candidate_count];
     scratch.write_decision_curve(&mut losses, &mut passes)?;
+    let selected =
+        usize::try_from(apply.target - 1).map_err(|_| ConfigurationError::PlatformLimit)?;
+    let best_pass_probability = passes.iter().copied().fold(0.0_f64, f64::max);
+    assert!(
+        passes[selected].total_cmp(&best_pass_probability).is_eq(),
+        "target={} selected_pass={} best_pass={best_pass_probability}",
+        apply.target,
+        passes[selected]
+    );
+    assert!(
+        apply.target <= configuration.partition_count,
+        "target={} partitions={}",
+        apply.target,
+        configuration.partition_count
+    );
     // The anti-scaling wall stays gone: one step above the demand floor
     // costs less expected delay than holding at it.
     assert!(losses[2] <= losses[1], "losses={:?}", &losses[..8]);
@@ -2445,7 +2703,7 @@ fn close_relative(left: f64, right: f64) -> bool {
 
 fn posterior_mean(state: &ScaleState, query: PosteriorQuery) -> Result<f64, TestError> {
     let count = usize::try_from(state.posterior_value_count(query)?)
-        .map_err(|_| crate::ConfigurationError::PlatformLimit)?;
+        .map_err(|_| ConfigurationError::PlatformLimit)?;
     let mut values = vec![0.0_f64; count];
     let mut probabilities = vec![0.0_f64; count];
     state.write_posterior(query, &mut values, &mut probabilities)?;
@@ -2530,7 +2788,7 @@ enum TestError {
     #[error(transparent)]
     Posterior(#[from] crate::PosteriorError),
     #[error(transparent)]
-    Configuration(#[from] crate::ConfigurationError),
+    Configuration(#[from] ConfigurationError),
     #[error(transparent)]
     DecisionCurve(#[from] crate::DecisionCurveError),
     #[error(transparent)]

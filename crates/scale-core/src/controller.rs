@@ -330,10 +330,11 @@ pub struct ScaleScratch {
     placement_interval_seconds: f64,
     partition_shortfall: f64,
     posterior_missed_work_sums: Vec<f64>,
+    posterior_violation_weight_sums: Vec<f64>,
     posterior_loss_sums: Vec<f64>,
     posterior_replica_seconds_sums: Vec<f64>,
     posterior_supply_sums: Vec<f64>,
-    bootstrap_missed_work_sums: Vec<f64>,
+    bootstrap_violation_weight_sums: Vec<f64>,
     bootstrap_loss_sums: Vec<f64>,
     bootstrap_replica_seconds_sums: Vec<f64>,
     bootstrap_worse_counts: Vec<u32>,
@@ -344,6 +345,7 @@ pub struct ScaleScratch {
     scenario_replica_seconds: Vec<f64>,
     scenario_rejection: Vec<u8>,
     scenario_missed_work: Vec<f64>,
+    scenario_violation: Vec<f64>,
     scenario_supply: Vec<f64>,
     scenario_arrival_path_end_seconds: Vec<f64>,
     scenario_arrival_path_rates: Vec<f64>,
@@ -535,10 +537,11 @@ impl ScaleScratch {
             placement_interval_seconds: 0.0_f64,
             partition_shortfall: 0.0_f64,
             posterior_missed_work_sums: vec![0.0_f64; replica_count_max],
+            posterior_violation_weight_sums: vec![0.0_f64; replica_count_max],
             posterior_loss_sums: vec![0.0_f64; replica_count_max],
             posterior_replica_seconds_sums: vec![0.0_f64; replica_count_max],
             posterior_supply_sums: vec![0.0_f64; replica_count_max],
-            bootstrap_missed_work_sums: vec![0.0_f64; replica_count_max],
+            bootstrap_violation_weight_sums: vec![0.0_f64; replica_count_max],
             bootstrap_loss_sums: vec![0.0_f64; replica_count_max],
             bootstrap_replica_seconds_sums: vec![0.0_f64; replica_count_max],
             bootstrap_worse_counts: vec![0; replica_count_max],
@@ -549,6 +552,7 @@ impl ScaleScratch {
             scenario_replica_seconds: vec![0.0_f64; scenario_cell_count],
             scenario_rejection: vec![0; scenario_cell_count],
             scenario_missed_work: vec![0.0_f64; scenario_cell_count],
+            scenario_violation: vec![0.0_f64; scenario_cell_count],
             scenario_supply: vec![0.0_f64; scenario_cell_count],
             scenario_arrival_path_end_seconds: vec![0.0_f64; arrival_path_cell_count],
             scenario_arrival_path_rates: vec![0.0_f64; arrival_path_cell_count],
@@ -573,10 +577,15 @@ impl ScaleScratch {
         self.posterior_loss_sums.len()
     }
 
-    /// Writes the expected loss and SLO pass probability for each candidate.
+    /// Writes the expected loss and posterior SLO pass probability.
     ///
     /// Candidate index zero represents one replica. The last index represents
-    /// the configured replica limit.
+    /// the configured replica limit. The pass probability is relative: it is
+    /// the fraction of posterior scenarios where the candidate stays within
+    /// the scenario's ε-slack allowance over the row-minimum candidate. The
+    /// row-minimum candidate never violates by construction, so a probability
+    /// of one does not state that the work meets its deadlines — read the
+    /// expected loss for the absolute outcome.
     ///
     /// # Errors
     ///
@@ -597,16 +606,12 @@ impl ScaleScratch {
             return Err(DecisionCurveError::Unavailable);
         }
         let sample_count = f64::from(self.decision_curve_sample_count);
-        let event_count_sum: f64 = self.scenario_event_count[..self.active_scenario_count]
-            .iter()
-            .sum();
         let action_count = decision_action_count(self);
         for index in 0..self.posterior_loss_sums.len() {
             if index < action_count {
                 expected_losses[index] = self.posterior_loss_sums[index] / sample_count;
-                pass_probabilities[index] = 1.0_f64
-                    - self.posterior_missed_work_sums[index]
-                        / event_count_sum.max(f64::MIN_POSITIVE);
+                pass_probabilities[index] =
+                    1.0_f64 - self.posterior_violation_weight_sums[index] / sample_count;
             } else {
                 expected_losses[index] = f64::INFINITY;
                 pass_probabilities[index] = 0.0_f64;
@@ -906,8 +911,64 @@ fn evaluate_scenarios(
             },
         );
     }
+    finalize_scenario_columns(state, scratch, scenario_count);
+}
+
+/// Marks per-scenario violations and folds the cells into decision columns.
+fn finalize_scenario_columns(state: &ScaleState, scratch: &mut ScaleScratch, scenario_count: u32) {
+    let candidate_count = decision_action_count(scratch);
+    let candidate_stride = scratch.posterior_resource_supply.len();
+    dispatch!(state.simd_level, simd => prepare_scenario_violations(
+        simd,
+        &scratch.scenario_missed_work,
+        &scratch.scenario_event_count[..scratch.active_scenario_count],
+        candidate_count,
+        candidate_stride,
+        &mut scratch.scenario_violation,
+        state.configuration.objective.epsilon(),
+    ));
     dispatch!(state.simd_level, simd => aggregate_scenario_values(simd, scratch));
     scratch.decision_curve_sample_count = scenario_count;
+}
+
+/// Marks each candidate that exceeds the scenario's relative SLO allowance.
+pub(crate) fn prepare_scenario_violations<S: Simd>(
+    simd: S,
+    scenario_missed_work: &[f64],
+    scenario_event_count: &[f64],
+    candidate_count: usize,
+    candidate_stride: usize,
+    scenario_violation: &mut [f64],
+    epsilon: f64,
+) {
+    let zero = S::f64s::splat(simd, 0.0_f64);
+    let one = S::f64s::splat(simd, 1.0_f64);
+    for (scenario, &event_count) in scenario_event_count.iter().enumerate() {
+        let first = scenario * candidate_stride;
+        let last = first + candidate_count;
+        let minimum = scenario_missed_work[first..last]
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let allowance = minimum + epsilon * event_count;
+        let allowance = S::f64s::splat(simd, allowance);
+        let vector_count = candidate_count / S::f64s::N;
+        for vector in 0..vector_count {
+            let target = vector * S::f64s::N;
+            let cell = first + target;
+            let cell_last = cell + S::f64s::N;
+            S::f64s::from_slice(simd, &scenario_missed_work[cell..cell_last])
+                .simd_gt(allowance)
+                .select(one, zero)
+                .store_slice(&mut scenario_violation[cell..cell_last]);
+        }
+        for target in vector_count * S::f64s::N..candidate_count {
+            let cell = first + target;
+            scenario_violation[cell] = f64::from(u8::from(
+                scenario_missed_work[cell] > minimum + epsilon * event_count,
+            ));
+        }
+    }
 }
 
 /// Returns the planning and disturbance horizons for one scenario.
@@ -967,6 +1028,7 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
     let candidate_count = decision_action_count(scratch);
     let candidate_stride = scratch.posterior_resource_supply.len();
     scratch.posterior_missed_work_sums.fill(0.0_f64);
+    scratch.posterior_violation_weight_sums.fill(0.0_f64);
     scratch.posterior_loss_sums.fill(0.0_f64);
     scratch.posterior_replica_seconds_sums.fill(0.0_f64);
     scratch.posterior_supply_sums.fill(0.0_f64);
@@ -983,6 +1045,12 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
                         simd,
                         &scratch.scenario_missed_work[cell..cell + S::f64s::N],
                     );
+            let violations =
+                S::f64s::from_slice(simd, &scratch.posterior_violation_weight_sums[target..last])
+                    + S::f64s::from_slice(
+                        simd,
+                        &scratch.scenario_violation[cell..cell + S::f64s::N],
+                    );
             let loss = S::f64s::from_slice(simd, &scratch.posterior_loss_sums[target..last])
                 + S::f64s::from_slice(simd, &scratch.scenario_shortfall[cell..cell + S::f64s::N]);
             let replica_seconds =
@@ -994,6 +1062,7 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
             let supply = S::f64s::from_slice(simd, &scratch.posterior_supply_sums[target..last])
                 + S::f64s::from_slice(simd, &scratch.scenario_supply[cell..cell + S::f64s::N]);
             missed.store_slice(&mut scratch.posterior_missed_work_sums[target..last]);
+            violations.store_slice(&mut scratch.posterior_violation_weight_sums[target..last]);
             loss.store_slice(&mut scratch.posterior_loss_sums[target..last]);
             replica_seconds.store_slice(&mut scratch.posterior_replica_seconds_sums[target..last]);
             supply.store_slice(&mut scratch.posterior_supply_sums[target..last]);
@@ -1001,6 +1070,7 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
         for target in vector_count * S::f64s::N..candidate_count {
             let cell = first + target;
             scratch.posterior_missed_work_sums[target] += scratch.scenario_missed_work[cell];
+            scratch.posterior_violation_weight_sums[target] += scratch.scenario_violation[cell];
             scratch.posterior_loss_sums[target] += scratch.scenario_shortfall[cell];
             scratch.posterior_replica_seconds_sums[target] +=
                 scratch.scenario_replica_seconds[cell];
@@ -1009,13 +1079,13 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
     }
 }
 
-/// Returns the smallest action in the bootstrap credible set.
+/// Returns the minimum-cost action in the bootstrap credible set.
 ///
 /// The credible set excludes an action only when at least the configured SLO
 /// confidence of paired bootstrap posteriors ranks it below the nominal
 /// optimum. A singleton set makes the numerical integral resolved. Multiple
-/// actions preserve the smallest action because the integral cannot
-/// distinguish them at that confidence.
+/// actions use the transition cost to decide if the standing target remains
+/// preferable to the nominal minimum.
 fn numerical_decision(state: &ScaleState, scratch: &mut ScaleScratch) -> NumericalDecision {
     dispatch!(state.simd_level, simd => numerical_decision_simd(simd, state, scratch))
 }
@@ -1028,74 +1098,32 @@ fn numerical_decision_simd<S: Simd>(
     let candidate_count = decision_action_count(scratch);
     let candidate_stride = scratch.posterior_loss_sums.len();
     let scenario_count = scratch.active_scenario_count;
-    let epsilon = state.configuration.objective.epsilon();
-    let event_count_sum: f64 = scratch.scenario_event_count[..scenario_count].iter().sum();
+    let scenario_count_as_f64 =
+        f64::from(u32::try_from(scenario_count).map_or(u32::MAX, |count| count));
+    let bootstrap_tail_probability = state.configuration.objective.epsilon();
+    let slo_violation_probability = state.configuration.objective.slo_violation_probability();
     let demand_floor = demand_floor(state, scratch, candidate_count);
     let nominal_target = select_action(&ActionColumns {
-        missed_work_sums: &scratch.posterior_missed_work_sums[..candidate_count],
+        violation_weight_sums: &scratch.posterior_violation_weight_sums[..candidate_count],
         excess_delay_sums: &scratch.posterior_loss_sums[..candidate_count],
         replica_seconds_sums: &scratch.posterior_replica_seconds_sums[..candidate_count],
         demand_floor,
-        event_count_sum,
-        epsilon,
+        scenario_weight_sum: scenario_count_as_f64,
+        slo_violation_probability,
     });
     scratch.bootstrap_worse_counts.fill(0);
     for bootstrap in 0..DECISION_BOOTSTRAP_COUNT {
-        scratch.bootstrap_missed_work_sums.fill(0.0_f64);
-        scratch.bootstrap_loss_sums.fill(0.0_f64);
-        scratch.bootstrap_replica_seconds_sums.fill(0.0_f64);
-        let mut event_count_sum = 0.0_f64;
-        for scenario in 0..scenario_count {
-            let mut random = decision_random(scenario as u32, DecisionRandomDomain::Bootstrap)
-                .domain(u64::from(bootstrap));
-            let weight = -random.open_unit_f64().ln();
-            event_count_sum += weight * scratch.scenario_event_count[scenario];
-            let first = scenario * candidate_stride;
-            let vector_count = candidate_count / S::f64s::N;
-            for vector in 0..vector_count {
-                let target = vector * S::f64s::N;
-                let last = target + S::f64s::N;
-                let missed =
-                    S::f64s::from_slice(simd, &scratch.bootstrap_missed_work_sums[target..last])
-                        + S::f64s::from_slice(
-                            simd,
-                            &scratch.scenario_missed_work[first + target..first + last],
-                        ) * S::f64s::splat(simd, weight);
-                let loss = S::f64s::from_slice(simd, &scratch.bootstrap_loss_sums[target..last])
-                    + S::f64s::from_slice(
-                        simd,
-                        &scratch.scenario_shortfall[first + target..first + last],
-                    ) * S::f64s::splat(simd, weight);
-                let replica_seconds = S::f64s::from_slice(
-                    simd,
-                    &scratch.bootstrap_replica_seconds_sums[target..last],
-                ) + S::f64s::from_slice(
-                    simd,
-                    &scratch.scenario_replica_seconds[first + target..first + last],
-                ) * S::f64s::splat(simd, weight);
-                missed.store_slice(&mut scratch.bootstrap_missed_work_sums[target..last]);
-                loss.store_slice(&mut scratch.bootstrap_loss_sums[target..last]);
-                replica_seconds
-                    .store_slice(&mut scratch.bootstrap_replica_seconds_sums[target..last]);
-            }
-            for target in vector_count * S::f64s::N..candidate_count {
-                scratch.bootstrap_missed_work_sums[target] +=
-                    weight * scratch.scenario_missed_work[first + target];
-                scratch.bootstrap_loss_sums[target] +=
-                    weight * scratch.scenario_shortfall[first + target];
-                scratch.bootstrap_replica_seconds_sums[target] +=
-                    weight * scratch.scenario_replica_seconds[first + target];
-            }
-        }
+        let scenario_weight_sum =
+            accumulate_bootstrap_draw(simd, scratch, bootstrap, candidate_count, candidate_stride);
         let columns = ActionColumns {
-            missed_work_sums: &scratch.bootstrap_missed_work_sums[..candidate_count],
+            violation_weight_sums: &scratch.bootstrap_violation_weight_sums[..candidate_count],
             excess_delay_sums: &scratch.bootstrap_loss_sums[..candidate_count],
             replica_seconds_sums: &scratch.bootstrap_replica_seconds_sums[..candidate_count],
             demand_floor,
-            event_count_sum,
-            epsilon,
+            scenario_weight_sum,
+            slo_violation_probability,
         };
-        let allowance = columns.missed_allowance();
+        let allowance = columns.violation_allowance();
         for target in 0..candidate_count {
             if compare_actions(nominal_target, target, &columns, allowance).is_lt() {
                 scratch.bootstrap_worse_counts[target] += 1;
@@ -1106,12 +1134,98 @@ fn numerical_decision_simd<S: Simd>(
         .ok()
         .and_then(|target| target.checked_sub(1))
         .filter(|index| *index < candidate_count);
+    let columns = ActionColumns {
+        violation_weight_sums: &scratch.posterior_violation_weight_sums[..candidate_count],
+        excess_delay_sums: &scratch.posterior_loss_sums[..candidate_count],
+        replica_seconds_sums: &scratch.posterior_replica_seconds_sums[..candidate_count],
+        demand_floor,
+        scenario_weight_sum: scenario_count_as_f64,
+        slo_violation_probability,
+    };
+    let transition_cost_sum = incumbent.map_or(0.0_f64, |incumbent| {
+        transition_cost(state, incumbent, nominal_target) * scenario_count_as_f64
+    });
     classify_paired_bootstrap(
         &scratch.bootstrap_worse_counts[..candidate_count],
         DECISION_BOOTSTRAP_COUNT,
-        epsilon,
+        &columns,
+        nominal_target,
         incumbent,
+        transition_cost_sum,
+        bootstrap_tail_probability,
     )
+}
+
+/// Accumulates one exponentially weighted bootstrap resample.
+///
+/// Fills the bootstrap column sums from the per-scenario cells and
+/// returns the draw's total scenario weight.
+fn accumulate_bootstrap_draw<S: Simd>(
+    simd: S,
+    scratch: &mut ScaleScratch,
+    bootstrap: u32,
+    candidate_count: usize,
+    candidate_stride: usize,
+) -> f64 {
+    scratch.bootstrap_violation_weight_sums.fill(0.0_f64);
+    scratch.bootstrap_loss_sums.fill(0.0_f64);
+    scratch.bootstrap_replica_seconds_sums.fill(0.0_f64);
+    let mut scenario_weight_sum = 0.0_f64;
+    for scenario in 0..scratch.active_scenario_count {
+        let mut random = decision_random(scenario as u32, DecisionRandomDomain::Bootstrap)
+            .domain(u64::from(bootstrap));
+        let weight = -random.open_unit_f64().ln();
+        scenario_weight_sum += weight;
+        let first = scenario * candidate_stride;
+        let vector_count = candidate_count / S::f64s::N;
+        for vector in 0..vector_count {
+            let target = vector * S::f64s::N;
+            let last = target + S::f64s::N;
+            let violations =
+                S::f64s::from_slice(simd, &scratch.bootstrap_violation_weight_sums[target..last])
+                    + S::f64s::from_slice(
+                        simd,
+                        &scratch.scenario_violation[first + target..first + last],
+                    ) * S::f64s::splat(simd, weight);
+            let loss = S::f64s::from_slice(simd, &scratch.bootstrap_loss_sums[target..last])
+                + S::f64s::from_slice(
+                    simd,
+                    &scratch.scenario_shortfall[first + target..first + last],
+                ) * S::f64s::splat(simd, weight);
+            let replica_seconds =
+                S::f64s::from_slice(simd, &scratch.bootstrap_replica_seconds_sums[target..last])
+                    + S::f64s::from_slice(
+                        simd,
+                        &scratch.scenario_replica_seconds[first + target..first + last],
+                    ) * S::f64s::splat(simd, weight);
+            violations.store_slice(&mut scratch.bootstrap_violation_weight_sums[target..last]);
+            loss.store_slice(&mut scratch.bootstrap_loss_sums[target..last]);
+            replica_seconds.store_slice(&mut scratch.bootstrap_replica_seconds_sums[target..last]);
+        }
+        for target in vector_count * S::f64s::N..candidate_count {
+            scratch.bootstrap_violation_weight_sums[target] +=
+                weight * scratch.scenario_violation[first + target];
+            scratch.bootstrap_loss_sums[target] +=
+                weight * scratch.scenario_shortfall[first + target];
+            scratch.bootstrap_replica_seconds_sums[target] +=
+                weight * scratch.scenario_replica_seconds[first + target];
+        }
+    }
+    scenario_weight_sum
+}
+
+/// Returns the capacity-time that one target change destroys.
+fn transition_cost(state: &ScaleState, from: usize, to: usize) -> f64 {
+    if from == to {
+        return 0.0_f64;
+    }
+    let direction = if to > from {
+        TransitionDirection::Up
+    } else {
+        TransitionDirection::Down
+    };
+    let delta = u32::try_from(from.abs_diff(to)).map_or(u32::MAX, |value| value);
+    state.rebalance_time.expected_seconds(direction, delta) * f64::from(state.current_replicas)
 }
 
 /// Returns the smallest action index covering the known arrival rate.
@@ -1131,30 +1245,43 @@ fn demand_floor(state: &ScaleState, scratch: &ScaleScratch, candidate_count: usi
 /// Classifies the bootstrap credible set into one numerical decision.
 ///
 /// The credible set holds every action the paired bootstrap cannot rank
-/// below the nominal optimum at the SLO confidence. Inside that set the
-/// integral cannot distinguish the actions, so a credible standing target
-/// wins: a decision changes the target only on confident evidence, never
-/// on sampling noise or on feedback from its own last actuation.
+/// below the nominal optimum at the SLO confidence. Inside that set, the
+/// standing target remains only when its excess capacity cost does not exceed
+/// one transition cost. This rule prevents numerical noise from causing a
+/// costly move without preserving a dominated target.
 pub(crate) fn classify_paired_bootstrap(
     worse_counts: &[u32],
     bootstrap_count: u32,
-    epsilon: f64,
+    columns: &ActionColumns<'_>,
+    nominal_target: usize,
     incumbent: Option<usize>,
+    transition_cost_sum: f64,
+    bootstrap_tail_probability: f64,
 ) -> NumericalDecision {
+    let allowance = columns.violation_allowance();
     let credible = |target: usize| {
-        f64::from(worse_counts[target]) / f64::from(bootstrap_count) < 1.0_f64 - epsilon
+        columns.feasible(target, allowance)
+            && f64::from(worse_counts[target]) / f64::from(bootstrap_count)
+                < 1.0_f64 - bootstrap_tail_probability
     };
-    let smallest_credible_index = (0..worse_counts.len())
-        .find(|&target| credible(target))
-        .map_or(0, |target| target);
-    if (smallest_credible_index + 1..worse_counts.len()).any(credible) {
-        let standing = incumbent.filter(|&index| credible(index));
+    let unresolved = (0..worse_counts.len())
+        .filter(|&target| credible(target))
+        .take(2)
+        .count()
+        > 1;
+    if unresolved {
+        let standing = incumbent.filter(|&index| {
+            credible(index)
+                && columns.replica_seconds_sums[index]
+                    - columns.replica_seconds_sums[nominal_target]
+                    <= transition_cost_sum
+        });
         NumericalDecision::Unresolved {
-            credible_index: standing.map_or(smallest_credible_index, |index| index),
+            credible_index: standing.map_or(nominal_target, |index| index),
         }
     } else {
         NumericalDecision::Resolved {
-            target_index: smallest_credible_index,
+            target_index: nominal_target,
         }
     }
 }

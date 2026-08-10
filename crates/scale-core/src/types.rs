@@ -211,9 +211,12 @@ pub(crate) struct CalendarForecast<'a> {
 pub struct ServiceObjective {
     budget_micros: u64,
     epsilon: f64,
+    slo_violation_probability: f64,
 }
 
 impl ServiceObjective {
+    const DEFAULT_SLO_VIOLATION_PROBABILITY: f64 = 0.05_f64;
+
     /// Constructs a validated objective.
     ///
     /// # Errors
@@ -229,7 +232,25 @@ impl ServiceObjective {
         Ok(Self {
             budget_micros,
             epsilon,
+            slo_violation_probability: Self::DEFAULT_SLO_VIOLATION_PROBABILITY,
         })
+    }
+
+    /// Sets the posterior-future probability budget for an SLO violation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the probability is outside the open interval
+    /// from zero to one half.
+    pub fn with_slo_violation_probability(
+        mut self,
+        probability: f64,
+    ) -> Result<Self, ConfigurationError> {
+        if !probability.is_finite() || probability <= 0.0_f64 || probability >= 0.5_f64 {
+            return Err(ConfigurationError::InvalidSloViolationProbability { probability });
+        }
+        self.slo_violation_probability = probability;
+        Ok(self)
     }
 
     /// Returns the latency budget in microseconds.
@@ -242,6 +263,12 @@ impl ServiceObjective {
     #[must_use]
     pub const fn epsilon(self) -> f64 {
         self.epsilon
+    }
+
+    /// Returns the posterior-future probability budget for an SLO violation.
+    #[must_use]
+    pub const fn slo_violation_probability(self) -> f64 {
+        self.slo_violation_probability
     }
 }
 
@@ -1279,6 +1306,14 @@ pub enum ConfigurationError {
     InvalidEpsilon {
         /// Invalid miss fraction.
         epsilon: f64,
+    },
+    /// The posterior-future SLO violation probability is invalid.
+    #[error(
+        "SLO violation probability {probability} must be greater than zero and less than one half"
+    )]
+    InvalidSloViolationProbability {
+        /// Invalid probability.
+        probability: f64,
     },
     /// The failure-service weight is not in the closed unit interval.
     #[error("failure service weight {weight} must be between zero and one")]
