@@ -153,6 +153,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Excise records
+
+Call `excise(topic, key)` to send a Kafka record with a key and no payload. Use this record to delete the key from compacted views.
+
+Each handler must implement `on_excise`. It receives the same arguments as `on_message`. The message contains `Record::Excise` instead of a payload.
+
 ## Keyed State
 
 Keyed state gives every Kafka key its own durable working memory. Prosody automatically uses the current message or
