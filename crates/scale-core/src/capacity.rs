@@ -687,12 +687,37 @@ impl CapacityFactor {
             / self.knee_probability()
     }
 
+    pub(crate) fn declining_probability(&self) -> f64 {
+        let knee_probability = self.knee_probability();
+        if knee_probability <= f64::EPSILON {
+            return 0.0_f64;
+        }
+        self.weights
+            .iter()
+            .take(self.grid.knee_cell_count as usize)
+            .zip(&self.grid.collapse_values)
+            .filter(|(_, collapse)| **collapse > 0.0_f64)
+            .map(|(weight, _)| weight)
+            .sum::<f64>()
+            / knee_probability
+    }
+
+    /// Returns the replica cap from the posterior knee.
+    ///
+    /// When declining mass exceeds the error allowance, the cap does not
+    /// admit slots above the knee quantile. The one-replica minimum can exceed
+    /// a knee smaller than one replica.
     pub(crate) fn cap(&self, slots_per_replica: u32, replica_count_max: u32, epsilon: f64) -> u32 {
         if self.no_knee_probability() > epsilon {
             return replica_count_max;
         }
         let knee = self.knee_quantile(1.0_f64 - epsilon);
-        let cap = (knee / f64::from(slots_per_replica)).ceil();
+        let replicas = knee / f64::from(slots_per_replica);
+        let cap = if self.declining_probability() > epsilon {
+            replicas.floor()
+        } else {
+            replicas.ceil()
+        };
         cap.clamp(1.0, f64::from(replica_count_max)) as u32
     }
 
@@ -1253,3 +1278,7 @@ pub enum ResourceWindowError {
         value: f64,
     },
 }
+
+#[cfg(test)]
+#[path = "capacity_tests.rs"]
+mod tests;
