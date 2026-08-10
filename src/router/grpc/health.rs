@@ -1,12 +1,8 @@
-//! `grpc.health.v1` beside the peer method.
+//! Router health on the peer listener.
 //!
-//! This service computes no predicate of its own: it calls [`is_ready`] and
-//! [`is_live`], the pair `/readyz` and `/livez` already call. So a verdict here
-//! and a verdict over HTTP cannot come from different state, and traffic never
-//! reaches a process its own probe calls unready.
-//!
-//! Every `Check` recomputes. A cached verdict someone must refresh is exactly
-//! the second opinion this service exists to avoid.
+//! The peer service reports `SERVING` when its listener answers. It does not
+//! depend on consumer readiness or liveness. Producer-only clients therefore
+//! remain reachable for responses.
 
 use super::generated::peer_server::SERVICE_NAME;
 use crate::heartbeat::HeartbeatRegistry;
@@ -18,11 +14,9 @@ use tonic_health::pb::health_check_response::ServingStatus as WireStatus;
 use tonic_health::pb::health_server::Health;
 use tonic_health::pb::{HealthCheckRequest, HealthCheckResponse};
 
-/// Where a process's readiness and liveness come from.
+/// Where the router runtime's readiness and liveness come from.
 ///
-/// A source selector, never a flag: a process that runs no consumer has no
-/// partition managers and must still answer health, so the source is a type
-/// rather than an option on one.
+/// This source contains router state only. It never reads consumer state.
 pub(crate) trait ProcessHealth: Send + Sync + 'static {
     /// Whether this process is ready to take work.
     fn ready(&self) -> bool;
@@ -31,12 +25,12 @@ pub(crate) trait ProcessHealth: Send + Sync + 'static {
     fn live(&self) -> bool;
 }
 
-/// Health of a peer runtime that is serving this check.
+/// Health of the peer runtime that serves this check.
 pub(crate) struct RuntimeHealth {
     heartbeats: HeartbeatRegistry,
 }
 
-/// Serves `grpc.health.v1.Health` from one [`ProcessHealth`] source.
+/// Serves `grpc.health.v1.Health` from one router health source.
 pub(crate) struct PeerHealth<H> {
     health: H,
 }
@@ -67,18 +61,14 @@ impl<H> PeerHealth<H> {
 
 #[async_trait]
 impl<H: ProcessHealth> Health for PeerHealth<H> {
-    /// A `Watch` needs a signal that a verdict changed, and this process has
-    /// none: both predicates are computed on demand. Inventing one would be the
-    /// cached second opinion this service avoids, and orchestrators probe with
-    /// `Check`.
+    /// A `Watch` needs a change signal. The router computes health on demand
+    /// and publishes no such signal.
     type WatchStream = Empty<Result<HealthCheckResponse, Status>>;
 
-    /// Answers for the whole process under the empty name, and for the peer
-    /// service under its own.
+    /// Answers for the router runtime under the empty name. Answers for the
+    /// peer service under its own name.
     ///
-    /// The empty name answers for the process, which means ready **and** live.
-    /// A probe that wants liveness alone must ask `/livez`, because one serving
-    /// status cannot carry two verdicts.
+    /// The empty name requires the router runtime to be ready and live.
     ///
     /// The peer service serves whenever this call is answered at all, because
     /// answering it *is* the evidence that the listener is up. Any other name
