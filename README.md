@@ -44,6 +44,7 @@ chain. Handler timeouts cancel handlers that exceed their deadline, preventing a
 - **Backpressure**: Pauses partitions when handlers fall behind.
 - **Mocking**: In-memory Kafka broker for tests (`PROSODY_MOCK=true`).
 - **High-Level Client**: Combines producer and consumer with timer support.
+- **Peer Requests**: Collects one typed response from each requested subsystem.
 - **Failure Handling**: Pipeline (retry forever), Low-Latency (dead letter), Best-Effort (log and skip).
 
 ## Usage
@@ -151,6 +152,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     client.unsubscribe().await?;
     Ok(())
+}
+```
+
+## Peer requests
+
+Peer requests let a producer ask named subsystems to process one Kafka event.
+The request returns one ordered outcome for each subsystem.
+A client can send requests without a subscription.
+A subscribed client responds when its configured subsystem receives a request.
+Local requests stay in the process.
+Remote responses use peer gRPC routes.
+
+```rust,ignore
+let subsystems = [SubsystemName::try_new("inventory")?];
+let outcomes = client
+    .request(
+        [("x-tenant", "north")],
+        "orders".into(),
+        "order-123",
+        json!({"sku": "A-42"}),
+        &subsystems,
+        Duration::from_secs(2),
+    )
+    .await?;
+
+for outcome in outcomes {
+    match outcome {
+        Outcome::Ok(response) => println!("{response}"),
+        Outcome::Handler(error) => eprintln!("handler failed: {error}"),
+        Outcome::Failed(failure) => eprintln!("response failed: {failure}"),
+    }
 }
 ```
 

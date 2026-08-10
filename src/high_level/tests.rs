@@ -284,6 +284,15 @@ fn erased_client_retains_consumer_failure_until_subscribe() -> Result<()> {
         subscribed,
         Err(HighLevelClientError::ConsumerConfiguration(_))
     ));
+    let requested = TEST_RUNTIME.block_on(client.request(
+        Vec::new(),
+        Topic::from("test-topic"),
+        "key".to_owned(),
+        Value::Null,
+        Vec::new(),
+        Duration::from_secs(1),
+    ));
+    assert!(matches!(requested, Err(RequestError::NoSubsystems)));
     Ok(())
 }
 

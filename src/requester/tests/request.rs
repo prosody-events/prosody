@@ -6,9 +6,7 @@ use super::{
 };
 use crate::Topic;
 use crate::requester::registry::tests::pending_len;
-use crate::requester::{
-    HEADER_INLINE, Outcome, RequestError, ResponseFailure, append_request_headers,
-};
+use crate::requester::{Outcome, RequestError, ResponseFailure, append_request_headers};
 use crate::response::RequestId;
 use crate::response::headers::RequestDeadline;
 use crate::response::headers::{
@@ -19,7 +17,7 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
-use smallvec::SmallVec;
+use rdkafka::message::{Header, Headers, OwnedHeaders};
 use std::iter::{empty, once};
 use std::pin::pin;
 use std::sync::Arc;
@@ -242,12 +240,15 @@ fn run_headers(trace: HeaderTrace) -> Result<()> {
     let mut node_buf = [0_u8; ID_TEXT_LEN];
     let mut deadline_buf = itoa::Buffer::new();
     let deadline = RequestDeadline::from_unix_micros(1_700_000_000_000_000);
-    let mut headers = SmallVec::<[(&'static str, &str); HEADER_INLINE]>::new();
+    let mut headers = OwnedHeaders::new_with_capacity(user.len() + awaited.len() + 4);
     for (name, value) in &user {
-        headers.push((USER_NAMES[*name], USER_VALUES[*value]));
+        headers = headers.insert(Header {
+            key: USER_NAMES[*name],
+            value: Some(USER_VALUES[*value].as_bytes()),
+        });
     }
-    append_request_headers(
-        &mut headers,
+    let headers = append_request_headers(
+        headers,
         (id, &mut request_buf),
         (NODE, &mut node_buf),
         (deadline, &mut deadline_buf),
@@ -256,7 +257,7 @@ fn run_headers(trace: HeaderTrace) -> Result<()> {
 
     let wire: Vec<(&str, Option<&[u8]>)> = headers
         .iter()
-        .map(|(name, value)| (*name, Some(value.as_bytes())))
+        .map(|header| (header.key, header.value))
         .collect();
     let expected = RequestTag::new(id, NODE, deadline);
     for name in &awaited {

@@ -9,12 +9,15 @@ use crate::high_level::{
     HighLevelClientError, MemoryHighLevelClient, Mode, Wire, WireError,
 };
 use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder};
+use crate::requester::{Outcome, RequestError};
 use crate::state_reader::ConsumerReaderBackend;
+use crate::subsystem::SubsystemName;
 use crate::{EventIdentity, EventType, Topic};
 use async_trait::async_trait;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::error::Error as StdError;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 mod readers;
@@ -68,6 +71,16 @@ where
         key: String,
         payload: T::Payload,
     ) -> Result<(), HighLevelClientError<WireError<T>>>;
+    /// Sends one request and returns one outcome per subsystem.
+    async fn request(
+        &self,
+        headers: Vec<(String, String)>,
+        topic: Topic,
+        key: String,
+        payload: T::Payload,
+        subsystems: Vec<SubsystemName>,
+        timeout: Duration,
+    ) -> Result<Vec<Outcome<T::Output, T::Error>>, RequestError<WireError<T>>>;
     /// Starts consuming.
     async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>>;
     /// Stops consuming.
@@ -165,6 +178,20 @@ where
         payload: T::Payload,
     ) -> Result<(), HighLevelClientError<WireError<T>>> {
         self.0.send(topic, &key, payload).await
+    }
+
+    async fn request(
+        &self,
+        headers: Vec<(String, String)>,
+        topic: Topic,
+        key: String,
+        payload: T::Payload,
+        subsystems: Vec<SubsystemName>,
+        timeout: Duration,
+    ) -> Result<Vec<Outcome<T::Output, T::Error>>, RequestError<WireError<T>>> {
+        self.0
+            .request_owned(headers, topic, key, payload, subsystems, timeout)
+            .await
     }
 
     async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>> {

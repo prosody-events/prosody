@@ -26,7 +26,6 @@ use crate::telemetry::Telemetry;
 use crate::{Codec, Topic};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
-use std::future::Future;
 use std::mem::take;
 use std::time::Duration;
 use tokio::sync::{Mutex, OnceCell};
@@ -171,21 +170,44 @@ where
     /// Returns [`RequestError`] for an unavailable runtime, invalid arguments,
     /// failed admission, a produce failure without a response, or shutdown.
     pub async fn request<'a, H>(
-        &'a self,
+        &self,
         headers: H,
         topic: Topic,
-        key: &'a str,
+        key: &str,
         payload: T::Payload,
-        subsystems: &'a [SubsystemName],
+        subsystems: &[SubsystemName],
         timeout: Duration,
     ) -> Result<Vec<Outcome<T::Output, T::Error>>, RequestError<WireError<T>>>
     where
-        H: IntoIterator<Item = (&'static str, &'a str)>,
-        H::IntoIter: ExactSizeIterator,
+        H: IntoIterator<Item = (&'a str, &'a str)> + Send,
+        H::IntoIter: ExactSizeIterator + Send,
     {
         self.requester
             .request(headers, topic, key, payload, subsystems, timeout)
             .await
+    }
+
+    /// Sends one request from owned FFI values.
+    pub(crate) async fn request_owned(
+        &self,
+        headers: Vec<(String, String)>,
+        topic: Topic,
+        key: String,
+        payload: T::Payload,
+        subsystems: Vec<SubsystemName>,
+        timeout: Duration,
+    ) -> Result<Vec<Outcome<T::Output, T::Error>>, RequestError<WireError<T>>> {
+        self.request(
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+            topic,
+            &key,
+            payload,
+            &subsystems,
+            timeout,
+        )
+        .await
     }
 
     /// Registers a keyed-state collection, returning the [`Registered`]

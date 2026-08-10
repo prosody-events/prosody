@@ -19,7 +19,7 @@ use crate::{Codec, EventIdentity, Topic};
 use opentelemetry::KeyValue;
 use opentelemetry::global::meter;
 use opentelemetry::metrics::Histogram;
-use smallvec::SmallVec;
+use rdkafka::message::{Header, OwnedHeaders};
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::marker::PhantomData;
@@ -35,9 +35,6 @@ mod tests;
 
 /// Reserved headers that occur exactly once in every request.
 const RESERVED_SINGLETONS: usize = 4;
-
-/// Headers one request carries before the list uses the heap.
-const HEADER_INLINE: usize = 8;
 
 /// How long one request waited, by how complete its answers were.
 ///
@@ -102,7 +99,7 @@ pub enum RequestError<E: Error> {
     #[error("header {name} is reserved for response requests")]
     ReservedHeader {
         /// The reserved header name.
-        name: &'static str,
+        name: String,
     },
     /// The timeout cannot be represented as a wire or runtime deadline.
     #[error("the request timeout is too large")]
@@ -152,7 +149,29 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
     ///
     /// Returns [`RequestError`] for invalid arguments, failed admission, a
     /// produce failure without a response, or shutdown.
+    pub async fn request<'a, H, V, E>(
+        &self,
+        headers: H,
+        topic: Topic,
+        key: &str,
+        payload: C::Payload,
+        subsystems: &[SubsystemName],
+        timeout: Duration,
+    ) -> Result<Vec<Outcome<V, E>>, RequestError<C::Error>>
+    where
+        H: IntoIterator<Item = (&'a str, &'a str)> + Send,
+        H::IntoIter: ExactSizeIterator + Send,
+        C::Payload: EventIdentity,
+        R: Codec<Payload = Result<V, E>>,
+        E: ClassifyError,
+    {
+        let record_headers = request_headers(headers, subsystems.len())?;
+        self.request_prepared(record_headers, topic, key, payload, subsystems, timeout)
+            .await
+    }
+
     #[instrument(
+        name = "request",
         skip_all,
         fields(
             otel.kind = "client",
@@ -169,18 +188,16 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         ),
         err
     )]
-    pub async fn request<'a, H, V, E>(
+    async fn request_prepared<V, E>(
         &self,
-        headers: H,
+        mut record_headers: OwnedHeaders,
         topic: Topic,
-        key: &'a str,
+        key: &str,
         payload: C::Payload,
-        subsystems: &'a [SubsystemName],
+        subsystems: &[SubsystemName],
         timeout: Duration,
     ) -> Result<Vec<Outcome<V, E>>, RequestError<C::Error>>
     where
-        H: IntoIterator<Item = (&'static str, &'a str)>,
-        H::IntoIter: ExactSizeIterator,
         C::Payload: EventIdentity,
         R: Codec<Payload = Result<V, E>>,
         E: ClassifyError,
@@ -190,26 +207,13 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         let mut request_buf = [0_u8; ID_TEXT_LEN];
         let mut node_buf = [0_u8; ID_TEXT_LEN];
         let mut deadline_buf = itoa::Buffer::new();
-        let user_headers = headers.into_iter();
-        let capacity = user_headers
-            .len()
-            .saturating_add(subsystems.len())
-            .saturating_add(RESERVED_SINGLETONS);
-        let mut record_headers =
-            SmallVec::<[(&'static str, &str); HEADER_INLINE]>::with_capacity(capacity);
-        for (name, value) in user_headers {
-            if is_reserved(name) {
-                return Err(RequestError::ReservedHeader { name });
-            }
-            record_headers.push((name, value));
-        }
 
         let deadline = RequestDeadline::after(timeout).ok_or(RequestError::DeadlineOutOfRange)?;
         let mut registration = self.registry.register(subsystems, deadline)?;
         Span::current().record("request.id", display(registration.id()));
 
-        append_request_headers(
-            &mut record_headers,
+        record_headers = append_request_headers(
+            record_headers,
             (registration.id(), &mut request_buf),
             (self.node, &mut node_buf),
             (deadline, &mut deadline_buf),
@@ -220,7 +224,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         let collected = collect::<R, V, E, _, _>(
             &mut registration,
             self.producer
-                .send(record_headers.iter().copied(), topic, key, payload),
+                .send_owned(record_headers, topic, key, payload),
         )
         .await;
         // A request refused before this point sent nothing, so it has no
@@ -244,6 +248,32 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         }
         collected
     }
+}
+
+fn request_headers<'name, 'value, H, E>(
+    headers: H,
+    subsystem_count: usize,
+) -> Result<OwnedHeaders, RequestError<E>>
+where
+    H: IntoIterator<Item = (&'name str, &'value str)>,
+    H::IntoIter: ExactSizeIterator,
+    E: Error,
+{
+    let headers = headers.into_iter();
+    let capacity = headers
+        .len()
+        .saturating_add(subsystem_count)
+        .saturating_add(RESERVED_SINGLETONS + 1);
+    let mut owned = OwnedHeaders::new_with_capacity(capacity);
+    for (name, value) in headers {
+        if is_reserved(name) {
+            return Err(RequestError::ReservedHeader {
+                name: name.to_owned(),
+            });
+        }
+        owned = insert_header(owned, name, value);
+    }
+    Ok(owned)
 }
 
 struct Missing<'a, V, E>(&'a [SubsystemName], &'a [Outcome<V, E>]);
@@ -288,25 +318,40 @@ const fn completeness(answered: usize, awaited: usize) -> &'static str {
 
 /// Appends the reserved headers that tell a responder where to answer.
 fn append_request_headers<'a>(
-    headers: &mut SmallVec<[(&'static str, &'a str); HEADER_INLINE]>,
+    mut headers: OwnedHeaders,
     request: (RequestId, &'a mut [u8; ID_TEXT_LEN]),
     node: (NodeId, &'a mut [u8; ID_TEXT_LEN]),
     deadline: (RequestDeadline, &'a mut itoa::Buffer),
     subsystems: &'a [SubsystemName],
-) {
+) -> OwnedHeaders {
     let (request, request_buf) = request;
     let (node, node_buf) = node;
     let (deadline, deadline_buf) = deadline;
-    headers.push((RESPONSE_VERSION_HEADER, REQUEST_REVISION));
-    headers.push((
+    headers = insert_header(headers, RESPONSE_VERSION_HEADER, REQUEST_REVISION);
+    headers = insert_header(
+        headers,
         RESPONSE_REQUEST_ID_HEADER,
         id_text(request.into(), request_buf),
-    ));
-    headers.push((RESPONSE_NODE_HEADER, id_text(node.into(), node_buf)));
-    headers.push((RESPONSE_DEADLINE_HEADER, deadline.text(deadline_buf)));
-    headers.extend(
-        subsystems
-            .iter()
-            .map(|subsystem| (RESPONSE_AWAITED_HEADER, subsystem.as_str())),
     );
+    headers = insert_header(
+        headers,
+        RESPONSE_NODE_HEADER,
+        id_text(node.into(), node_buf),
+    );
+    headers = insert_header(
+        headers,
+        RESPONSE_DEADLINE_HEADER,
+        deadline.text(deadline_buf),
+    );
+    for subsystem in subsystems {
+        headers = insert_header(headers, RESPONSE_AWAITED_HEADER, subsystem.as_str());
+    }
+    headers
+}
+
+fn insert_header(headers: OwnedHeaders, key: &str, value: &str) -> OwnedHeaders {
+    headers.insert(Header {
+        key,
+        value: Some(value.as_bytes()),
+    })
 }
