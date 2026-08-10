@@ -9,12 +9,11 @@ use crate::codec::Codec;
 use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::consumer::middleware::monopolization::MonopolizationConfiguration;
 use crate::consumer::middleware::retry::RetryConfiguration;
-use crate::consumer::middleware::tests::test_support::{ScriptedHandler, TestError};
+use crate::consumer::middleware::tests::test_support::ScriptedHandler;
 use crate::consumer::wiring::memory_deps;
 use crate::consumer::{
     ConsumerSetup, PipelineMiddlewareConfiguration, ProsodyConsumer, Responding, TypedConsumerSetup,
 };
-use crate::error::ErrorCategory;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::peer::Router;
 use crate::peer::runtime::prepare_router;
@@ -34,16 +33,16 @@ struct SomeResponseCodec;
 
 impl Codec for SomeResponseCodec {
     type Error = ResponseCodecError;
-    type Payload = Result<(), TestError>;
+    type Payload = ();
 
     const FORMAT_ID: &'static str = "wiring-result";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error> {
-        match buf.first() {
-            Some(0) => Ok(Ok(())),
-            Some(_) => Ok(Err(TestError(ErrorCategory::Permanent))),
-            None => Err(ResponseCodecError),
-        }
+        buf.first()
+            .copied()
+            .filter(|byte| *byte == 0)
+            .map(|_| ())
+            .ok_or(ResponseCodecError)
     }
 
     fn deserialize_owned(
@@ -53,17 +52,17 @@ impl Codec for SomeResponseCodec {
         self.deserialize(&mut buf)
     }
 
-    fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
-        buf.push(u8::from(payload.is_err()));
+    fn serialize(&mut self, (): Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
+        buf.push(0);
         Ok(())
     }
 
     fn serialize_ref(
         &mut self,
-        payload: &Self::Payload,
+        _payload: &Self::Payload,
         buf: &mut Vec<u8>,
     ) -> Result<(), Self::Error> {
-        buf.push(u8::from(payload.is_err()));
+        buf.push(0);
         Ok(())
     }
 }

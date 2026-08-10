@@ -186,10 +186,10 @@ fn refusal(error: &FrameDecodeError) -> Status {
         | FrameDecodeError::RepeatedField(_)
         | FrameDecodeError::MalformedId { .. }
         | FrameDecodeError::StringTooLong { .. }
-        | FrameDecodeError::InvalidUtf8(_)
-        | FrameDecodeError::Subsystem(_)
-        | FrameDecodeError::StatusTooWide(_)
-        | FrameDecodeError::Status(_)
-        | FrameDecodeError::Wire(_) => Status::invalid_argument(error.message()),
+        | FrameDecodeError::CategoryTooWide(_)
+        | FrameDecodeError::UnknownCategory(_)
+        | FrameDecodeError::InvalidText(_)
+        | FrameDecodeError::InvalidSubsystem(_)
+        | FrameDecodeError::Protobuf(_) => Status::invalid_argument(error.message()),
     }
 }

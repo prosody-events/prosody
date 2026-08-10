@@ -7,8 +7,9 @@
 
 use super::{ALPHA, Process, Shared, TIMEOUT, header};
 use crate::requester::registry::tests::TestRegistration;
-use crate::response::frame::encode::stage;
+use crate::response::frame::encode::stage_success;
 use crate::response::frame::tests::CountingCodec;
+use crate::response::frame::{FrameResult, ResponseSuccess};
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{ResponseRoute, Then, deliver_response, stage as stage_response};
 use crate::router::directory::NodeDirectory;
@@ -21,6 +22,7 @@ use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::Context;
+use std::convert::Infallible;
 use std::slice::from_ref;
 use std::sync::Arc;
 use tokio::time::Instant;
@@ -42,7 +44,7 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
             let request = TestRegistration::new(&shared.pending, &awaited, TIMEOUT)?;
             let transport = GrpcSender::new(&shared.fleet);
             let addressed_here = header(shared.node, request.id(), ALPHA)?;
-            let mine = stage::<CountingCodec>(&addressed_here, &PAYLOAD.to_vec())?;
+            let mine = stage_success::<CountingCodec>(&addressed_here, &PAYLOAD.to_vec())?;
             transport
                 .deliver(
                     &shared.listener,
@@ -55,7 +57,7 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
                     eyre!("the listener refused a frame for its own node: {failure}")
                 })?;
             let addressed_elsewhere = header(NodeId::new(), request.id(), ALPHA)?;
-            let foreign = stage::<CountingCodec>(&addressed_elsewhere, &PAYLOAD.to_vec())?;
+            let foreign = stage_success::<CountingCodec>(&addressed_elsewhere, &PAYLOAD.to_vec())?;
             ensure!(
                 matches!(
                     transport
@@ -125,8 +127,10 @@ async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
     let mut request = TestRegistration::new(&shared.pending, from_ref(&subsystem), TIMEOUT)?;
     let receiver = request.receiver()?;
     let payload = PAYLOAD.to_vec();
-    let prepared =
-        stage_response::<CountingCodec>(header(shared.node, request.id(), ALPHA)?, &payload);
+    let prepared = stage_response::<CountingCodec, Infallible>(
+        header(shared.node, request.id(), ALPHA)?,
+        Ok(&payload),
+    );
     deliver_response(
         own,
         prepared,
@@ -138,9 +142,12 @@ async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
     let stored = receiver
         .await
         .map_err(|_| eyre!("the same-node response stored no payload"))?;
+    let FrameResult::Success(ResponseSuccess { payload, .. }) = stored.result else {
+        return Err(eyre!("the same-node response stored a handler error"));
+    };
     ensure!(
-        stored.payload.as_ref() == PAYLOAD,
-        "the registry stored a payload the sender never wrote"
+        payload.as_ref() == PAYLOAD,
+        "the registry stored other payload bytes"
     );
     Ok(())
 }

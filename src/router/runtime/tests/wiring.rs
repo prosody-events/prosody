@@ -12,8 +12,9 @@ use super::{ALPHA, LEASE, TIMEOUT, header, listener, start_runtime};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
-use crate::response::frame::encode::stage;
+use crate::response::frame::encode::stage_success;
 use crate::response::frame::tests::CountingCodec;
+use crate::response::frame::{FrameResult, ResponseSuccess};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::directory::tests::support::cassandra_directory;
 use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
@@ -215,7 +216,7 @@ async fn sent_on(elsewhere: &Elsewhere, here: &Endpoint) -> Result<()> {
     let fleet = DestinationFleet::new(fleet_config())?;
     let sender = GrpcSender::new(&fleet);
     let addressed = header(elsewhere.node, request.id(), ALPHA)?;
-    let staged = stage::<CountingCodec>(&addressed, &PAYLOAD.to_vec())?;
+    let staged = stage_success::<CountingCodec>(&addressed, &PAYLOAD.to_vec())?;
     sender
         .deliver(
             here,
@@ -228,9 +229,12 @@ async fn sent_on(elsewhere: &Elsewhere, here: &Endpoint) -> Result<()> {
     let stored = receiver
         .await
         .map_err(|_| eyre!("the frame never reached the node it named"))?;
+    let FrameResult::Success(ResponseSuccess { payload, .. }) = stored.result else {
+        return Err(eyre!("the target stored a handler error"));
+    };
     ensure!(
-        stored.payload.as_ref() == PAYLOAD,
-        "the node the frame named stored a payload nothing sent"
+        payload.as_ref() == PAYLOAD,
+        "the target stored other payload bytes"
     );
     Ok(())
 }

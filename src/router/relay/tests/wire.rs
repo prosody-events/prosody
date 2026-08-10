@@ -3,12 +3,12 @@
 use super::{ALPHA, BUDGET, Live, PAYLOAD, Pair, TargetRoute};
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
+use crate::response::RequestId;
 use crate::response::frame::FrameHeader;
-use crate::response::frame::encode::{Staged, stage};
+use crate::response::frame::encode::{Staged, stage_success};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{deliver_response, stage as stage_response};
-use crate::response::{RequestId, ResponseStatus};
 use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
@@ -22,6 +22,7 @@ use color_eyre::eyre::{bail, eyre};
 use opentelemetry::Context;
 use opentelemetry::Value;
 use opentelemetry_sdk::trace::SpanData;
+use std::convert::Infallible;
 use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -278,15 +279,14 @@ async fn crossing(pair: &Pair) -> Result<()> {
     )?;
 
     let payload = PAYLOAD.to_vec();
-    let prepared = stage_response::<CountingCodec>(
+    let prepared = stage_response::<CountingCodec, Infallible>(
         FrameHeader {
             target: pair.target.node,
             request: request.id(),
             subsystem: SubsystemName::try_new(ALPHA)?,
-            status: ResponseStatus::Success,
             relay: None,
         },
-        &payload,
+        Ok(&payload),
     );
     deliver_response(
         &router,
@@ -319,10 +319,9 @@ async fn call_with_payload(
         target,
         request,
         subsystem: SubsystemName::try_new(ALPHA)?,
-        status: ResponseStatus::Success,
         relay: None,
     };
-    let staged = stage::<CountingCodec>(&header, &payload.to_vec())?;
+    let staged = stage_success::<CountingCodec>(&header, &payload.to_vec())?;
     let caller = info_span!("peer.test.call");
     let context = caller.context();
     let delivered = deliver(&sender, &live.address, &staged, granted, &context).await;

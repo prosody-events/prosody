@@ -80,7 +80,7 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError<T::Error>>>, RequestError<WireError<T>>>;
+    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<WireError<T>>>;
     /// Starts consuming.
     async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>>;
     /// Stops consuming.
@@ -188,7 +188,7 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError<T::Error>>>, RequestError<WireError<T>>> {
+    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<WireError<T>>> {
         self.0
             .request_owned(headers, topic, key, payload, subsystems, timeout)
             .await

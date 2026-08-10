@@ -2,6 +2,7 @@
 
 use super::{ALPHA, Harness, header, payload, register};
 use crate::response::RequestId;
+use crate::response::frame::{FrameResult, ResponseSuccess};
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
@@ -29,10 +30,15 @@ fn the_wire_reports_exact_waiter_consumption() -> Result<()> {
         );
 
         let frame = receiver.await?;
-        ensure!(
-            frame.payload.as_ref() == sent,
-            "the waiter received other bytes"
-        );
+        let FrameResult::Success(ResponseSuccess {
+            payload: answer, ..
+        }) = frame.result
+        else {
+            return Err(color_eyre::eyre::eyre!(
+                "the waiter received a handler error"
+            ));
+        };
+        ensure!(answer.as_ref() == sent, "the waiter received other bytes");
 
         let repeated = harness
             .deliver(&header(harness.node, id, ALPHA)?, payload(SHORT))

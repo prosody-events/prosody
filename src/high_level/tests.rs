@@ -4,7 +4,7 @@ use crate::JsonCodec;
 use crate::Key;
 use crate::PeerConfiguration;
 use crate::cassandra::config::CassandraConfigurationBuilder;
-use crate::codec::{InfallibleCodec, UnitCodec};
+use crate::codec::UnitCodec;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
@@ -133,7 +133,7 @@ impl FallibleHandler for EchoHandler {
 }
 
 impl ClientHandler for EchoHandler {
-    type Codecs = JsonCodecs<InfallibleCodec>;
+    type Codecs = JsonCodecs;
 }
 
 /// A mock client answers through its explicit response subsystem.
@@ -250,7 +250,7 @@ impl FallibleHandler for NoOpHandler {
 }
 
 impl ClientHandler for NoOpHandler {
-    type Codecs = Codecs<JsonCodec, UnitCodec, InfallibleCodec>;
+    type Codecs = Codecs<JsonCodec, UnitCodec>;
 }
 
 /// Erased backend selection reads only mock mode. Invalid consumer-only fields

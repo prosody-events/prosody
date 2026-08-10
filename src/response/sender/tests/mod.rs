@@ -2,13 +2,12 @@
 //! records every attempt.
 
 use super::{ResponseRoute, RouteOutcome, deliver_response, stage};
-use crate::error::ErrorCategory;
+use crate::response::RequestId;
 use crate::response::frame::FrameHeader;
 use crate::response::frame::encode::Staged;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::DropReason;
-use crate::response::{RequestId, ResponseStatus};
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{
     Delivery, Drained, Script, TestRouter, collect_deliveries, config, direct_uri, node, paused,
@@ -17,6 +16,7 @@ use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use opentelemetry::Context;
+use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -133,12 +133,12 @@ impl Harness {
 
     /// Sends `payload` for `index`.
     pub(super) async fn send_payload(&self, index: u8, payload: Vec<u8>) -> Result<()> {
-        let prepared = stage::<CountingCodec>(
+        let prepared = stage::<CountingCodec, Infallible>(
             FrameHeader {
                 target: node(index),
                 ..self.header.clone()
             },
-            &payload,
+            Ok(&payload),
         );
         deliver_response(&*self.route, prepared, Context::current(), deadline()).await;
         Ok(())
@@ -151,7 +151,8 @@ impl Harness {
             target: node(index),
             ..self.header.clone()
         };
-        let prepared = stage::<CountingCodec>(header, &PAYLOAD.to_vec());
+        let payload = PAYLOAD.to_vec();
+        let prepared = stage::<CountingCodec, Infallible>(header, Ok(&payload));
         tokio::spawn(async move {
             deliver_response(&*route, prepared, Context::current(), deadline()).await;
             Ok(())
@@ -214,7 +215,6 @@ fn header() -> Result<FrameHeader> {
         target: node(0),
         request: RequestId::from_bytes([7; 16]),
         subsystem: SubsystemName::try_new("billing")?,
-        status: ResponseStatus::Error(ErrorCategory::Permanent),
         relay: None,
     })
 }

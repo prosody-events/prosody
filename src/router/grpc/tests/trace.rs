@@ -15,6 +15,7 @@ use crate::test_util::{GlobalSpans, TEST_RUNTIME, named, span_attribute};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::trace::{SpanKind, Status, TraceContextExt};
+use std::convert::Infallible;
 use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -52,7 +53,10 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         let trace = caller.context();
         let caller_span = trace.span().span_context().clone();
         let payload = PAYLOAD.to_vec();
-        let prepared = stage::<CountingCodec>(header(harness.node, request.id(), ALPHA)?, &payload);
+        let prepared = stage::<CountingCodec, Infallible>(
+            header(harness.node, request.id(), ALPHA)?,
+            Ok(&payload),
+        );
         deliver_response(
             &router,
             prepared,
@@ -107,7 +111,10 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         drop(refused.receiver()?);
         let caller = info_span!("peer.test.refused");
         let payload = PAYLOAD.to_vec();
-        let prepared = stage::<CountingCodec>(header(harness.node, refused.id(), ALPHA)?, &payload);
+        let prepared = stage::<CountingCodec, Infallible>(
+            header(harness.node, refused.id(), ALPHA)?,
+            Ok(&payload),
+        );
         deliver_response(
             &router,
             prepared,

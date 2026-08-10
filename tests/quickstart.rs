@@ -61,7 +61,7 @@ impl FallibleHandler for MyHandler {
 }
 
 impl ClientHandler for MyHandler {
-    type Codecs = Codecs<JsonCodec, UnitCodec, InfallibleCodec>;
+    type Codecs = Codecs<JsonCodec, UnitCodec>;
 }
 
 #[tokio::test]

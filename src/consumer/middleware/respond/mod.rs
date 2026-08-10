@@ -10,8 +10,8 @@
 //! **A dispatch that never reaches the final apply hook is never answered.**
 //! The layer never reads an error category to make that decision, so a
 //! transient failure that exhausts its retries answers its requester while the
-//! attempts before it stay silent. The category rides the frame as a label
-//! only.
+//! attempts before it stay silent. A failed result carries its category and
+//! display text in Prosody's protocol.
 //!
 //! Two live paths commit a tagged record and answer nothing. The dedup layer
 //! fires no inner hook for a duplicate, so a redelivery of an answered record
@@ -21,15 +21,14 @@
 //!
 //! One live path answers a record whose keyed-state writes did not last. A
 //! permanently rejected stage still commits and still fires this hook, so the
-//! answer leaves with the label the handler's own result gives. The label
-//! reports the handler result, never the durability of the writes behind it.
+//! answer carries the handler's own result. It never reports the durability of
+//! the writes behind it.
 use super::{FallibleHandler, Settlement, SettlementHandler};
 use crate::codec::Codec;
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::response::ResponseStatus;
 use crate::response::frame::FrameHeader;
 use crate::response::headers::RequestDeadline;
 use crate::response::headers::RequestTag;
@@ -37,6 +36,7 @@ use crate::response::sender::{ResponseRoute, deliver_response, stage};
 use crate::subsystem::SubsystemName;
 use crate::timers::Trigger;
 use opentelemetry::Context;
+use std::fmt::Display;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -121,19 +121,20 @@ impl<C: Codec, R: ResponseRoute> Responder<C, R> {
     }
 
     /// Encodes a result, applies its commit hook, and then delivers it.
-    async fn respond<F, Fut>(
+    async fn respond<E, F, Fut>(
         &self,
         header: FrameHeader,
-        payload: C::Payload,
+        result: Result<C::Payload, E>,
         trace: Context,
         deadline: RequestDeadline,
         after_commit: F,
     ) where
-        F: FnOnce(C::Payload) -> Fut,
+        E: ClassifyError + Display,
+        F: FnOnce(Result<C::Payload, E>) -> Fut,
         Fut: Future<Output = ()>,
     {
-        let response = stage::<C>(header, &payload);
-        after_commit(payload).await;
+        let response = stage::<C, E>(header, result.as_ref());
+        after_commit(result).await;
         deliver_response(&self.route, response, trace, deadline).await;
     }
 }
@@ -169,7 +170,7 @@ where
     H: FallibleHandler,
     H::Output: Sync + 'static,
     H::Error: Sync + 'static,
-    C: Codec<Payload = Result<H::Output, H::Error>>,
+    C: Codec<Payload = H::Output>,
     R: ResponseRoute,
 {
     type Error = Responded<H::Error>;
@@ -240,7 +241,7 @@ where
             return self.handler.after_commit(context, result).await;
         };
         let deadline = tag.deadline();
-        let header = tag.header(self.responder.subsystem().clone(), status(&result));
+        let header = tag.header(self.responder.subsystem().clone());
         self.responder
             .respond(header, result, trace, deadline, |result| {
                 self.handler.after_commit(context, result)
@@ -274,7 +275,7 @@ where
     H: SettlementHandler,
     H::Output: Sync + 'static,
     H::Error: Sync + 'static,
-    C: Codec<Payload = Result<H::Output, H::Error>>,
+    C: Codec<Payload = H::Output>,
     R: ResponseRoute,
 {
     /// Delegates the inner classification.
@@ -287,16 +288,5 @@ where
                 .map(|value| &value.inner)
                 .map_err(|error| &error.inner),
         )
-    }
-}
-
-/// The label one result puts on its frame.
-///
-/// The category labels a frame and never gates a send. A category test here
-/// would turn retry exhaustion into a silent timeout for the requester.
-fn status<O, E: ClassifyError>(result: &Result<O, E>) -> ResponseStatus {
-    match result {
-        Ok(_) => ResponseStatus::Success,
-        Err(error) => ResponseStatus::Error(error.classify_error()),
     }
 }

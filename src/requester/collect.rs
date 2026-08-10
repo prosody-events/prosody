@@ -3,10 +3,8 @@
 use super::registry::Registration;
 use super::{RequestError, ResponseError};
 use crate::Codec;
-use crate::error::ClassifyError;
 use crate::producer::ProducerError;
-use crate::response::ResponseStatus;
-use crate::response::frame::ResponseFrame;
+use crate::response::frame::{FrameResult, HandlerError, ResponseFrame, ResponseSuccess};
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::error::Error;
@@ -19,13 +17,12 @@ use tokio::time::sleep_until;
 ///
 /// Before the deadline, completion requires both the Kafka report and every
 /// subsystem result. Thus, responses cannot cancel producer side effects.
-pub(crate) async fn collect<R, V, E, F, PE>(
+pub(crate) async fn collect<R, V, F, PE>(
     registration: &mut Registration,
     produce: F,
-) -> Result<Vec<Result<V, ResponseError<E>>>, RequestError<PE>>
+) -> Result<Vec<Result<V, ResponseError>>, RequestError<PE>>
 where
-    R: Codec<Payload = Result<V, E>>,
-    E: ClassifyError,
+    R: Codec<Payload = V>,
     F: Future<Output = Result<(), ProducerError<PE>>>,
     PE: Error,
 {
@@ -51,7 +48,7 @@ where
             }
             Some((index, frame)) = responses.next() => {
                 if let Ok(frame) = frame {
-                    results[index] = decode::<R, V, E>(frame);
+                    results[index] = decode::<R, V>(frame);
                 } else if registration.is_closed() {
                     return Err(RequestError::ShuttingDown);
                 }
@@ -63,22 +60,25 @@ where
     Ok(results)
 }
 
-fn decode<R, V, E>(frame: ResponseFrame) -> Result<V, ResponseError<E>>
+fn decode<R, V>(frame: ResponseFrame) -> Result<V, ResponseError>
 where
-    R: Codec<Payload = Result<V, E>>,
-    E: ClassifyError,
+    R: Codec<Payload = V>,
 {
-    if frame.format.to_str() != R::FORMAT_ID {
-        return Err(ResponseError::FormatMismatch);
-    }
-    R::with_cached_local(|codec| match codec.deserialize_bytes(frame.payload) {
-        Ok(Ok(value)) if frame.header.status == ResponseStatus::Success => Ok(value),
-        Ok(Err(error)) => match frame.header.status {
-            ResponseStatus::Error(category) if category == error.classify_error() => {
-                Err(ResponseError::Handler(error))
+    match frame.result {
+        FrameResult::Success(ResponseSuccess { format, payload }) => {
+            if format.as_bytes() != R::FORMAT_ID.as_bytes() {
+                return Err(ResponseError::FormatMismatch);
             }
-            ResponseStatus::Success | ResponseStatus::Error(_) => Err(ResponseError::Malformed),
-        },
-        Err(_) | Ok(Ok(_)) => Err(ResponseError::Malformed),
-    })
+            R::with_cached_local(|codec| codec.deserialize_bytes(payload))
+                .map_err(|_| ResponseError::Malformed)
+        }
+        FrameResult::HandlerError(HandlerError { category, message }) => {
+            let message = match message.try_into_mut() {
+                Ok(message) => String::from_utf8(message.into()),
+                Err(message) => String::from_utf8(message.to_vec()),
+            }
+            .map_err(|_| ResponseError::Malformed)?;
+            Err(ResponseError::Handler { category, message })
+        }
+    }
 }

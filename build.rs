@@ -36,6 +36,18 @@ fn main() -> Result<()> {
             ".prosody.peer.v1.DeliverResponseRequest",
             "crate::response::frame::ResponseFrame",
         )
+        .extern_path(
+            ".prosody.peer.v1.ResponseSuccess",
+            "crate::response::frame::ResponseSuccess",
+        )
+        .extern_path(
+            ".prosody.peer.v1.HandlerError",
+            "crate::response::frame::HandlerError",
+        )
+        .extern_path(
+            ".prosody.peer.v1.ErrorCategory",
+            "crate::error::ErrorCategory",
+        )
         .extern_path(".prosody.peer.v1.DeliverResponseResponse", "()")
         .server_mod_attribute(".", GENERATED_LINTS)
         .compile_protos(&["proto/prosody/peer/v1/peer.proto"], &["proto"])

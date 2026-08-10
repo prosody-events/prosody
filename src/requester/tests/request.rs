@@ -1,9 +1,7 @@
 //! What one call refuses before it produces anything, and what it puts on the
 //! record when it does produce.
 
-use super::{
-    NODE, POOL, RequestPayload, TestError, distinct_indices, names, poll_once, registry, requester,
-};
+use super::{NODE, POOL, RequestPayload, distinct_indices, names, poll_once, registry, requester};
 use crate::Topic;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::requester::registry::tests::pending_len;
@@ -39,10 +37,10 @@ const USER_VALUES: [&str; 3] = ["alpha", "beta", "gamma"];
 #[test]
 fn response_errors_keep_their_retry_posture() {
     let errors = [
-        ResponseError::Handler(TestError {
-            value: 1,
+        ResponseError::Handler {
             category: ErrorCategory::Terminal,
-        }),
+            message: "failed".to_owned(),
+        },
         ResponseError::Timeout,
         ResponseError::FormatMismatch,
         ResponseError::Malformed,
@@ -178,7 +176,7 @@ async fn a_valid_call_registers_first_and_gives_its_record_back() -> Result<()> 
     let registry = registry();
     let requester = requester(Arc::clone(&registry))?;
     let awaited = names(&["billing", "ledger"])?;
-    let mut call = pin!(requester.request::<_, u32, TestError>(
+    let mut call = pin!(requester.request::<_, u32>(
         empty(),
         Topic::from("requests"),
         "key",
@@ -218,7 +216,7 @@ async fn a_cancelled_call_leaves_the_registry_empty() -> Result<()> {
     let awaited = names(&["billing", "ledger"])?;
     // Boxed rather than pinned on the stack, so dropping the handle drops the
     // call itself. That drop is what this case is about.
-    let mut call = Box::pin(requester.request::<_, u32, TestError>(
+    let mut call = Box::pin(requester.request::<_, u32>(
         empty(),
         Topic::from("requests"),
         "key",

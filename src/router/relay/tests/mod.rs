@@ -15,8 +15,8 @@ use crate::codec::Codec;
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::tests::CountingCodec;
-use crate::response::frame::{FrameHeader, ResponseFrame};
-use crate::response::{FormatToken, RequestId, ResponseStatus};
+use crate::response::frame::{FrameHeader, FrameResult, ResponseFrame, ResponseSuccess};
+use crate::response::{FormatToken, RequestId};
 use crate::router::directory::Endpoint;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::BoundListener;
@@ -206,10 +206,11 @@ pub(super) fn frame(
             target,
             request,
             subsystem: SubsystemName::try_new(ALPHA)?,
-            status: ResponseStatus::Success,
             relay,
         },
-        format: FormatToken::make(CountingCodec::FORMAT_ID),
-        payload: Bytes::from_static(PAYLOAD),
+        result: FrameResult::Success(ResponseSuccess {
+            format: FormatToken::make(CountingCodec::FORMAT_ID),
+            payload: Bytes::from_static(PAYLOAD),
+        }),
     })
 }

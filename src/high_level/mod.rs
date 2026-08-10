@@ -177,7 +177,7 @@ where
         payload: T::Payload,
         subsystems: &[SubsystemName],
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError<T::Error>>>, RequestError<WireError<T>>>
+    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<WireError<T>>>
     where
         H: IntoIterator<Item = (&'a str, &'a str)> + Send,
         H::IntoIter: ExactSizeIterator + Send,
@@ -196,7 +196,7 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError<T::Error>>>, RequestError<WireError<T>>> {
+    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<WireError<T>>> {
         self.request(
             headers
                 .iter()

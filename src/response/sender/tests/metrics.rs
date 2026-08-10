@@ -21,6 +21,7 @@ use color_eyre::Result;
 use color_eyre::eyre::ensure;
 use opentelemetry::Context;
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::io::Error;
 use strum::VariantArray;
 
@@ -57,7 +58,8 @@ fn a_codec_failure_records_the_encode_drop() -> Result<()> {
     let metrics = GlobalMetrics::install();
     paused()?.block_on(async {
         let harness = Harness::new(config())?;
-        let prepared = stage::<FailingCodec>(harness.header.clone(), &PAYLOAD.to_vec());
+        let payload = PAYLOAD.to_vec();
+        let prepared = stage::<FailingCodec, Infallible>(harness.header.clone(), Ok(&payload));
         deliver_response(&harness.router, prepared, Context::current(), deadline()).await;
         Ok::<_, color_eyre::Report>(())
     })?;

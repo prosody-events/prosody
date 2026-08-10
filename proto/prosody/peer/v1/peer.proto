@@ -5,20 +5,29 @@ package prosody.peer.v1;
 // Operations prosody nodes perform on each other. Later peer features add
 // methods here rather than services of their own.
 service PeerService {
-  // Delivers one response frame to the node it is addressed to. The outcome is
-  // the gRPC status; there is no response body, so an empty message from a
-  // buggy or hostile peer can never read as a report of delivery.
+  // Delivers one response frame to its target node. The gRPC status reports
+  // delivery. An empty response body cannot report a false success.
   rpc DeliverResponse(DeliverResponseRequest) returns (DeliverResponseResponse);
 }
 
-// The handler result carried in a response frame. Zero is not a result, so an
-// omitted status cannot read as success or as an error category.
-enum ResponseStatus {
-  RESPONSE_STATUS_UNSPECIFIED = 0;
-  RESPONSE_STATUS_TRANSIENT_ERROR = 1;
-  RESPONSE_STATUS_PERMANENT_ERROR = 2;
-  RESPONSE_STATUS_TERMINAL_ERROR = 3;
-  RESPONSE_STATUS_SUCCESS = 4;
+// Prosody's retry classification for one handler failure.
+enum ErrorCategory {
+  ERROR_CATEGORY_UNSPECIFIED = 0;
+  ERROR_CATEGORY_TRANSIENT = 1;
+  ERROR_CATEGORY_PERMANENT = 2;
+  ERROR_CATEGORY_TERMINAL = 3;
+}
+
+// A successful handler result encoded with the user's response codec.
+message ResponseSuccess {
+  string format = 1; // the response Codec::FORMAT_ID
+  bytes payload = 2;
+}
+
+// A handler failure encoded by Prosody.
+message HandlerError {
+  ErrorCategory category = 1;
+  string message = 2;
 }
 
 // One response, addressed to the node that is waiting for it.
@@ -28,9 +37,11 @@ message DeliverResponseRequest {
   bytes target_node = 1; // 16 bytes
   bytes request_id = 2; // 16 bytes
   string subsystem = 3;
-  string format = 4; // the responder's Codec::FORMAT_ID
-  ResponseStatus status = 5;
-  bytes payload = 6;
+  // Exactly one arm reports the handler result.
+  oneof result {
+    ResponseSuccess success = 4;
+    HandlerError handler_error = 5;
+  }
   // Empty until a relay forwards the frame, then the relay's own node id. A
   // frame that already names a relay is never forwarded again. A relay always
   // sets this itself and never preserves a value it received.

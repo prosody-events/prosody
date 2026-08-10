@@ -1,5 +1,4 @@
-use super::{RequestId, ResponseDisposition, ResponseStatus, SUCCESS};
-use crate::error::ErrorCategory;
+use super::{RequestId, ResponseDisposition};
 use crate::test_util::assert_distinct_labels;
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
@@ -63,36 +62,6 @@ fn each_disposition_has_a_distinct_label_and_message() -> Result<()> {
             "{message:?} answers more than one disposition"
         );
         seen.push(message);
-    }
-    Ok(())
-}
-
-/// A response status round trips through its wire discriminant, and no error
-/// category claims the success discriminant.
-///
-/// The two conversions read one `SUCCESS` const, so this proves the whole
-/// mapping. A fourth [`ErrorCategory`] given `4` would read a handler failure
-/// back as a success, and the second half of this test refuses it.
-#[test]
-fn every_response_status_round_trips_and_none_collides_with_success() -> Result<()> {
-    let statuses = [ResponseStatus::Success].into_iter().chain(
-        ErrorCategory::VARIANTS
-            .iter()
-            .copied()
-            .map(ResponseStatus::Error),
-    );
-    for status in statuses {
-        let wire = i32::from(status);
-        ensure!(
-            ResponseStatus::try_from(wire)? == status,
-            "{status:?} did not survive its wire form {wire}"
-        );
-    }
-    for category in ErrorCategory::VARIANTS {
-        ensure!(
-            i32::from(*category) != SUCCESS,
-            "{category:?} claims the success discriminant"
-        );
     }
     Ok(())
 }

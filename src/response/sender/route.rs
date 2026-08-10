@@ -2,13 +2,15 @@
 
 use super::metrics::{DropReason, Stage, record_fallback};
 use crate::codec::Codec;
+use crate::error::ClassifyError;
 use crate::otel::carry_parent;
 use crate::response::ResponseDisposition;
 use crate::response::frame::FrameHeader;
-use crate::response::frame::encode::{Staged, stage as encode};
+use crate::response::frame::encode::{Staged, stage_error, stage_success};
 use crate::response::headers::RequestDeadline;
 use crate::router::{NetworkRouter, Preference, ResponseSender};
 use opentelemetry::Context;
+use std::fmt::Display;
 use std::future::Future;
 use tracing::field::Empty;
 use tracing::{Instrument, debug_span, error, warn};
@@ -254,9 +256,24 @@ impl PreparedResponse {
 }
 
 /// Encodes one payload and records the common frame stage.
-pub(crate) fn stage<C: Codec>(header: FrameHeader, payload: &C::Payload) -> PreparedResponse {
+pub(crate) fn stage<C, E>(header: FrameHeader, result: Result<&C::Payload, &E>) -> PreparedResponse
+where
+    C: Codec,
+    E: ClassifyError + Display,
+{
     Stage::Attempted.record();
-    match encode::<C>(&header, payload) {
+    let encoded = match result {
+        Ok(payload) => stage_success::<C>(&header, payload),
+        Err(error) => {
+            Stage::Framed.record();
+            return PreparedResponse::Ready(stage_error(
+                &header,
+                error.classify_error(),
+                error.to_string(),
+            ));
+        }
+    };
+    match encoded {
         Ok(staged) => {
             Stage::Framed.record();
             PreparedResponse::Ready(staged)

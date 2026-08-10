@@ -1,12 +1,12 @@
 //! Synchrony recovery's own half: what a response is, how it is framed, and
 //! how one delivery attempt is answered.
 
-use crate::error::{ErrorCategory, UnknownErrorCategory};
-use fixedstr::Flexstr;
+use bytes::Bytes;
 use opentelemetry::KeyValue;
 use opentelemetry::global::meter;
 use opentelemetry::metrics::Counter;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::str::{Utf8Error, from_utf8};
 use std::sync::LazyLock;
 use tonic::Code;
 use uuid::Uuid;
@@ -15,19 +15,24 @@ pub(crate) mod frame;
 pub(crate) mod headers;
 pub(crate) mod sender;
 
-/// Longest [`Codec::FORMAT_ID`](crate::Codec::FORMAT_ID) a frame may carry.
-pub(crate) const FORMAT_MAX_BYTES: usize = 128;
+/// The response codec format token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FormatToken(Bytes);
 
-/// The wire discriminant of a successful result.
-///
-/// Named once, so both directions of [`ResponseStatus`]'s conversion read the
-/// same value. [`ErrorCategory`] reserves it, and a test pins that no category
-/// claims it.
-const SUCCESS: i32 = 4;
+impl FormatToken {
+    pub(crate) const fn make(value: &'static str) -> Self {
+        Self(Bytes::from_static(value.as_bytes()))
+    }
 
-/// The format token a frame's payload was encoded with, bounded by
-/// [`FORMAT_MAX_BYTES`].
-pub(crate) type FormatToken = Flexstr<{ FORMAT_MAX_BYTES + 1 }>;
+    pub(crate) fn try_from_bytes(value: Bytes) -> Result<Self, Utf8Error> {
+        from_utf8(&value)?;
+        Ok(Self(value))
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 /// Delivery attempts this node answered, by fixed disposition label.
 static DISPOSITIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -37,40 +42,6 @@ static DISPOSITIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_unit("{response}")
         .build()
 });
-
-/// How a responder classified the result one frame carries.
-///
-/// The wire keeps the error categories and adds one discriminant for a
-/// success. Thus, a frame never states a category for a successful result.
-/// Zero stays reserved, so an omitted field is malformed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResponseStatus {
-    /// The handler succeeded.
-    Success,
-    /// The handler failed, with this classification.
-    Error(ErrorCategory),
-}
-
-impl From<ResponseStatus> for i32 {
-    fn from(status: ResponseStatus) -> Self {
-        match status {
-            ResponseStatus::Success => SUCCESS,
-            ResponseStatus::Error(category) => Self::from(category),
-        }
-    }
-}
-
-impl TryFrom<i32> for ResponseStatus {
-    type Error = UnknownErrorCategory;
-
-    fn try_from(value: i32) -> Result<Self, UnknownErrorCategory> {
-        if value == SUCCESS {
-            Ok(Self::Success)
-        } else {
-            ErrorCategory::try_from(value).map(Self::Error)
-        }
-    }
-}
 
 /// Identifies one request across the fleet.
 ///

@@ -4,9 +4,8 @@ use super::{
 };
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
-use crate::response::ResponseStatus;
 use crate::response::frame::FrameHeader;
-use crate::response::frame::encode::{Staged, stage};
+use crate::response::frame::encode::{Staged, stage_success};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{DropReason, ResponseRoute, RouteDelivery, RouteOutcome, Then};
@@ -401,12 +400,11 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
             LocalTarget::new(node, registry),
             CountedNetwork(Arc::clone(&network_calls)),
         );
-        let frame = stage::<CountingCodec>(
+        let frame = stage_success::<CountingCodec>(
             &FrameHeader {
                 target: node,
                 request: request.id(),
                 subsystem,
-                status: ResponseStatus::Success,
                 relay: None,
             },
             &Vec::new(),

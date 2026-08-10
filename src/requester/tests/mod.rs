@@ -1,18 +1,17 @@
-//! What the requester suites share: a request codec and its payload, one
-//! response codec, a registry factory, a requester over a mock cluster, and the
-//! frames and produce futures the delivery race is driven with.
+//! What the requester suites share: codecs, a registry, a mock requester,
+//! response frames, and produce futures.
 //!
 //! Every suite runs on a paused-time runtime, so a virtual second costs
 //! nothing and every schedule is the same on every machine.
 
 use super::registry::{PendingRegistry, Registration};
 use crate::codec::Codec;
-use crate::error::{ClassifyError, ErrorCategory};
+use crate::error::ErrorCategory;
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::requester::{ProsodyRequester, ResponseError};
-use crate::response::frame::ResponseFrame;
+use crate::response::frame::{FrameResult, HandlerError, ResponseFrame, ResponseSuccess};
 use crate::response::headers::{RequestDeadline, RequestTag};
-use crate::response::{FormatToken, RequestId, ResponseStatus};
+use crate::response::{FormatToken, RequestId};
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
@@ -34,20 +33,8 @@ mod metrics;
 mod request;
 mod trace;
 
-/// Bytes one test response occupies: one arm tag and one little-endian `u32`.
-const RESPONSE_BYTES: usize = 5;
-
-/// Arm tag of a successful response.
-const OK_TAG: u8 = 0;
-
-/// Arm tag of a transient handler failure.
-const TRANSIENT_TAG: u8 = 1;
-
-/// Arm tag of a permanent handler failure.
-const PERMANENT_TAG: u8 = 2;
-
-/// Arm tag of a terminal handler failure.
-const TERMINAL_TAG: u8 = 3;
+/// Bytes one successful test response occupies.
+const RESPONSE_BYTES: usize = 4;
 
 /// The node every suite answers to.
 const NODE: NodeId = NodeId::from_bytes([7_u8; 16]);
@@ -73,22 +60,9 @@ pub(super) struct RequestCodec;
 
 /// The response codec every requester suite speaks.
 ///
-/// One tag byte names the arm and the four bytes after it carry the value. The
-/// tag also names the category a failed arm classifies as, so a suite can build
-/// a frame whose wire status agrees with its payload and one whose status does
-/// not.
+/// Four bytes carry the successful value.
 #[derive(Debug, Default)]
 pub(super) struct TestCodec;
-
-/// The handler error a test response carries.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("test handler error {value}")]
-pub(super) struct TestError {
-    /// The value the failing arm carries.
-    pub(super) value: u32,
-    /// What the error classifies as.
-    pub(super) category: ErrorCategory,
-}
 
 /// Why the test codec could not read a response.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -100,28 +74,15 @@ pub(super) enum TestCodecError {
 
 impl Codec for TestCodec {
     type Error = TestCodecError;
-    type Payload = Result<u32, TestError>;
+    type Payload = u32;
 
     const FORMAT_ID: &'static str = "requester-test";
 
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, TestCodecError> {
-        let Some((tag, rest)) = buf.split_first() else {
+        let Ok(value) = <[u8; 4]>::try_from(buf) else {
             return Err(TestCodecError::Malformed);
         };
-        let Ok(value) = <[u8; 4]>::try_from(rest) else {
-            return Err(TestCodecError::Malformed);
-        };
-        let value = u32::from_le_bytes(value);
-        match *tag {
-            OK_TAG => Ok(Ok(value)),
-            TRANSIENT_TAG | PERMANENT_TAG | TERMINAL_TAG => {
-                let Some(category) = tagged_category(*tag) else {
-                    return Err(TestCodecError::Malformed);
-                };
-                Ok(Err(TestError { value, category }))
-            }
-            _ => Err(TestCodecError::Malformed),
-        }
+        Ok(u32::from_le_bytes(value))
     }
 
     fn serialize_ref(
@@ -129,12 +90,7 @@ impl Codec for TestCodec {
         payload: &Self::Payload,
         buf: &mut Vec<u8>,
     ) -> Result<(), TestCodecError> {
-        let (tag, value) = match payload {
-            Ok(value) => (OK_TAG, *value),
-            Err(error) => (category_tag(error.category), error.value),
-        };
-        buf.push(tag);
-        buf.extend_from_slice(&value.to_le_bytes());
+        buf.extend_from_slice(&payload.to_le_bytes());
         Ok(())
     }
 }
@@ -162,12 +118,6 @@ impl Codec for RequestCodec {
     ) -> Result<(), TestCodecError> {
         buf.push(0);
         Ok(())
-    }
-}
-
-impl ClassifyError for TestError {
-    fn classify_error(&self) -> ErrorCategory {
-        self.category
     }
 }
 
@@ -217,7 +167,7 @@ pub(super) async fn unanswered_call() -> Result<()> {
     let requester = requester(registry)?;
     let awaited = names(&[SUBSYSTEM])?;
     let results = requester
-        .request::<_, u32, TestError>(
+        .request::<_, u32>(
             empty(),
             Topic::from(TOPIC),
             KEY,
@@ -252,39 +202,25 @@ pub(super) fn distinct_indices(g: &mut Gen, length: usize, count: usize) -> Vec<
 }
 
 /// Encodes one response body through the codec that reads it back.
-pub(super) fn body(payload: Result<u32, TestError>) -> Result<Bytes> {
+pub(super) fn body(payload: u32) -> Result<Bytes> {
     let mut buf = Vec::with_capacity(RESPONSE_BYTES);
     TestCodec::with_cached_local(|codec| codec.serialize(payload, &mut buf))?;
     Ok(Bytes::from(buf))
 }
 
 /// Builds one response frame for `subsystem`, in the format the waiter reads.
-pub(super) fn frame(
-    id: RequestId,
-    subsystem: &SubsystemName,
-    status: ResponseStatus,
-    payload: Bytes,
-) -> ResponseFrame {
-    formatted_frame(id, subsystem, status, payload, TestCodec::FORMAT_ID)
-}
-
-/// Builds one response frame in an arbitrary format token.
-pub(super) fn formatted_frame(
-    id: RequestId,
-    subsystem: &SubsystemName,
-    status: ResponseStatus,
-    payload: Bytes,
-    format: &str,
-) -> ResponseFrame {
+pub(super) fn frame(id: RequestId, subsystem: &SubsystemName, payload: Bytes) -> ResponseFrame {
     ResponseFrame {
         header: RequestTag::new(
             id,
             NODE,
             RequestDeadline::from_unix_micros(1_700_000_000_000_000),
         )
-        .header(subsystem.clone(), status),
-        format: FormatToken::make(format),
-        payload,
+        .header(subsystem.clone()),
+        result: FrameResult::Success(ResponseSuccess {
+            format: FormatToken::make(TestCodec::FORMAT_ID),
+            payload,
+        }),
     }
 }
 
@@ -294,12 +230,28 @@ pub(super) fn success(
     subsystem: &SubsystemName,
     value: u32,
 ) -> Result<ResponseFrame> {
-    Ok(frame(
-        id,
-        subsystem,
-        ResponseStatus::Success,
-        body(Ok(value))?,
-    ))
+    Ok(frame(id, subsystem, body(value)?))
+}
+
+/// Builds one handler failure frame.
+pub(super) fn failure(
+    id: RequestId,
+    subsystem: &SubsystemName,
+    category: ErrorCategory,
+    message: &'static str,
+) -> ResponseFrame {
+    ResponseFrame {
+        header: RequestTag::new(
+            id,
+            NODE,
+            RequestDeadline::from_unix_micros(1_700_000_000_000_000),
+        )
+        .header(subsystem.clone()),
+        result: FrameResult::HandlerError(HandlerError {
+            category,
+            message: Bytes::from_static(message.as_bytes()),
+        }),
+    }
 }
 
 /// Polls `future` exactly once and reports what that one poll returned.
@@ -307,23 +259,4 @@ pub(super) fn success(
 /// A zero timeout would not do: it does not promise exactly one inner poll.
 pub(super) async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
     poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await
-}
-
-/// The category one arm tag names.
-const fn tagged_category(tag: u8) -> Option<ErrorCategory> {
-    match tag {
-        TRANSIENT_TAG => Some(ErrorCategory::Transient),
-        PERMANENT_TAG => Some(ErrorCategory::Permanent),
-        TERMINAL_TAG => Some(ErrorCategory::Terminal),
-        _ => None,
-    }
-}
-
-/// The arm tag one category is written as.
-const fn category_tag(category: ErrorCategory) -> u8 {
-    match category {
-        ErrorCategory::Transient => TRANSIENT_TAG,
-        ErrorCategory::Permanent => PERMANENT_TAG,
-        ErrorCategory::Terminal => TERMINAL_TAG,
-    }
 }

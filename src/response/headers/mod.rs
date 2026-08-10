@@ -21,8 +21,8 @@
 //! headers through the same names this module reserves, so the writer and this
 //! parser cannot drift apart.
 
+use crate::response::RequestId;
 use crate::response::frame::FrameHeader;
-use crate::response::{RequestId, ResponseStatus};
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use opentelemetry::KeyValue;
@@ -117,12 +117,11 @@ impl RequestTag {
     ///
     /// The sender resolves the node through the directory. A Kafka header can
     /// never supply an address. A responder never sets the relay.
-    pub(crate) fn header(self, subsystem: SubsystemName, status: ResponseStatus) -> FrameHeader {
+    pub(crate) fn header(self, subsystem: SubsystemName) -> FrameHeader {
         FrameHeader {
             target: self.node,
             request: self.id,
             subsystem,
-            status,
             relay: None,
         }
     }

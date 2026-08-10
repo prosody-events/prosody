@@ -181,7 +181,7 @@ where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
         T::Output: Sync + 'static,
         T::Error: Sync + 'static,
-        R: Codec<Payload = Result<T::Output, T::Error>>,
+        R: Codec<Payload = T::Output>,
     {
         Self::pipeline_consumer_with_response(
             setup,

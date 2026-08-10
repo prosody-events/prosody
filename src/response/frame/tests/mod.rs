@@ -1,46 +1,23 @@
-use super::{
-    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_RELAY_NODE, FIELD_REQUEST_ID, FIELD_STATUS, FIELD_SUBSYSTEM,
-    FIELD_TARGET_NODE, FrameHeader, RELAY_FIELD_BYTES,
-};
+use super::{FrameHeader, FrameResult, ResponseSuccess};
 use crate::codec::Codec;
-use crate::response::{RequestId, ResponseStatus};
+use crate::response::RequestId;
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
 use color_eyre::Result;
-use prost::encoding::{WireType, encode_key, encode_varint};
 use std::cell::Cell;
 use std::convert::Infallible;
 
 mod decode;
 mod encode;
 
-/// A well-formed 16-byte identifier.
-const RAW_ID: [u8; 16] = [0x11; 16];
-
 thread_local! {
     static CACHE_USES: Cell<usize> = const { Cell::new(0) };
     static SERIALIZE_CAPACITY: Cell<usize> = const { Cell::new(0) };
 }
 
-/// A codec whose payload is simply its bytes.
-///
-/// Thread-local counters observe calls through the cached codec instance.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CountingCodec;
-
-/// A frame assembled field by field, so a case can omit one field or make one
-/// malformed. Every field defaults to a well-formed value, and `None` leaves
-/// the field out of the encoding entirely.
-pub(crate) struct RawFrame<'a> {
-    pub(crate) target: Option<&'a [u8]>,
-    pub(crate) request: Option<&'a [u8]>,
-    pub(crate) subsystem: Option<&'a [u8]>,
-    pub(crate) format: Option<&'a [u8]>,
-    pub(crate) status: Option<u64>,
-    pub(crate) payload: Option<&'a [u8]>,
-    pub(crate) relay: Option<&'a [u8]>,
-}
 
 impl Codec for CountingCodec {
     type Error = Infallible;
@@ -56,15 +33,6 @@ impl Codec for CountingCodec {
         Ok(buf.into())
     }
 
-    fn serialize(&mut self, payload: Vec<u8>, buf: &mut Vec<u8>) -> Result<(), Infallible> {
-        if buf.is_empty() {
-            *buf = payload;
-        } else {
-            buf.extend_from_slice(&payload);
-        }
-        Ok(())
-    }
-
     fn serialize_ref(&mut self, payload: &Vec<u8>, buf: &mut Vec<u8>) -> Result<(), Infallible> {
         SERIALIZE_CAPACITY.set(buf.capacity());
         buf.extend_from_slice(payload);
@@ -77,80 +45,30 @@ impl Codec for CountingCodec {
     }
 }
 
-impl Default for RawFrame<'_> {
-    fn default() -> Self {
-        Self {
-            target: Some(&RAW_ID),
-            request: Some(&RAW_ID),
-            subsystem: Some(b"billing"),
-            format: Some(CountingCodec::FORMAT_ID.as_bytes()),
-            status: Some(2),
-            payload: Some(b"hi"),
-            relay: None,
-        }
-    }
-}
-
-pub(crate) fn cache_uses_on_this_thread() -> usize {
-    CACHE_USES.get()
-}
-
-pub(crate) fn serialize_capacity_on_this_thread() -> usize {
-    SERIALIZE_CAPACITY.get()
-}
-
-/// Writes one protobuf field, without borrowing the encoder's writers, so a
-/// fixture frame is a second opinion on the wire form rather than a mirror of
-/// the code under test.
-fn raw_varint_field(tag: u32, value: u64, dst: &mut BytesMut) {
-    encode_key(tag, WireType::Varint, dst);
-    encode_varint(value, dst);
-}
-
-fn raw_bytes_field(tag: u32, value: &[u8], dst: &mut BytesMut) {
-    encode_key(tag, WireType::LengthDelimited, dst);
-    encode_varint(value.len() as u64, dst);
-    dst.extend_from_slice(value);
-}
-
-impl RawFrame<'_> {
-    pub(crate) fn encode(&self) -> BytesMut {
-        let mut dst = BytesMut::new();
-        if let Some(target) = self.target {
-            raw_bytes_field(FIELD_TARGET_NODE, target, &mut dst);
-        }
-        if let Some(request) = self.request {
-            raw_bytes_field(FIELD_REQUEST_ID, request, &mut dst);
-        }
-        if let Some(subsystem) = self.subsystem {
-            raw_bytes_field(FIELD_SUBSYSTEM, subsystem, &mut dst);
-        }
-        if let Some(format) = self.format {
-            raw_bytes_field(FIELD_FORMAT, format, &mut dst);
-        }
-        if let Some(status) = self.status {
-            raw_varint_field(FIELD_STATUS, status, &mut dst);
-        }
-        if let Some(payload) = self.payload {
-            raw_bytes_field(FIELD_PAYLOAD, payload, &mut dst);
-        }
-        if let Some(relay) = self.relay {
-            raw_bytes_field(FIELD_RELAY_NODE, relay, &mut dst);
-        }
-        dst
-    }
-}
-
-/// A header whose fixed fields are deterministic, so a frozen-bytes assertion
-/// and a boundary calculation can both name exact numbers.
-fn header(subsystem: &str, status: ResponseStatus, relay: Option<NodeId>) -> Result<FrameHeader> {
+pub(crate) fn header(subsystem: &str, relay: Option<NodeId>) -> Result<FrameHeader> {
     Ok(FrameHeader {
         target: NodeId::from_bytes([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
         request: RequestId::from_bytes([
             16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
         ]),
         subsystem: SubsystemName::try_new(subsystem)?,
-        status,
         relay,
     })
+}
+
+pub(crate) fn success(frame: &FrameResult) -> Option<(&[u8], &[u8])> {
+    match frame {
+        FrameResult::Success(ResponseSuccess { format, payload }) => {
+            Some((format.as_bytes(), payload.as_ref()))
+        }
+        FrameResult::HandlerError(_) => None,
+    }
+}
+
+pub(crate) fn cache_uses() -> usize {
+    CACHE_USES.get()
+}
+
+pub(crate) fn serialize_capacity() -> usize {
+    SERIALIZE_CAPACITY.get()
 }

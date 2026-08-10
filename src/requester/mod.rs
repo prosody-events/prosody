@@ -53,25 +53,30 @@ static LATENCY: LazyLock<Histogram<f64>> = LazyLock::new(|| {
 /// Handler errors keep their category. A timeout is transient. An invalid or
 /// incompatible response is permanent for that request.
 #[derive(Debug, Error, PartialEq)]
-pub enum ResponseError<E> {
+pub enum ResponseError {
     /// The handler returned an error.
-    #[error("handler failed: {0}")]
-    Handler(E),
+    #[error("handler failed: {message}")]
+    Handler {
+        /// The handler's retry classification.
+        category: ErrorCategory,
+        /// The handler's display text.
+        message: String,
+    },
     /// No response arrived before the deadline.
     #[error("no response arrived before the deadline")]
     Timeout,
     /// The responder used a different response format.
     #[error("the responder answered in another format")]
     FormatMismatch,
-    /// The response payload did not decode or disagreed with its status.
+    /// The response payload did not decode.
     #[error("the response did not decode")]
     Malformed,
 }
 
-impl<E: ClassifyError> ClassifyError for ResponseError<E> {
+impl ClassifyError for ResponseError {
     fn classify_error(&self) -> ErrorCategory {
         match self {
-            Self::Handler(error) => error.classify_error(),
+            Self::Handler { category, .. } => *category,
             Self::Timeout => ErrorCategory::Transient,
             Self::FormatMismatch | Self::Malformed => ErrorCategory::Permanent,
         }
@@ -147,7 +152,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
     ///
     /// Returns [`RequestError`] for invalid arguments, a produce failure, or
     /// shutdown.
-    pub async fn request<'a, H, V, E>(
+    pub async fn request<'a, H, V>(
         &self,
         headers: H,
         topic: Topic,
@@ -155,13 +160,12 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         payload: C::Payload,
         subsystems: &[SubsystemName],
         timeout: Duration,
-    ) -> Result<Vec<Result<V, ResponseError<E>>>, RequestError<C::Error>>
+    ) -> Result<Vec<Result<V, ResponseError>>, RequestError<C::Error>>
     where
         H: IntoIterator<Item = (&'a str, &'a str)> + Send,
         H::IntoIter: ExactSizeIterator + Send,
         C::Payload: EventIdentity,
-        R: Codec<Payload = Result<V, E>>,
-        E: ClassifyError,
+        R: Codec<Payload = V>,
     {
         let record_headers = request_headers(headers, subsystems.len())?;
         self.request_prepared(record_headers, topic, key, payload, subsystems, timeout)
@@ -186,7 +190,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         ),
         err
     )]
-    async fn request_prepared<V, E>(
+    async fn request_prepared<V>(
         &self,
         mut record_headers: OwnedHeaders,
         topic: Topic,
@@ -194,11 +198,10 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         payload: C::Payload,
         subsystems: &[SubsystemName],
         timeout: Duration,
-    ) -> Result<Vec<Result<V, ResponseError<E>>>, RequestError<C::Error>>
+    ) -> Result<Vec<Result<V, ResponseError>>, RequestError<C::Error>>
     where
         C::Payload: EventIdentity,
-        R: Codec<Payload = Result<V, E>>,
-        E: ClassifyError,
+        R: Codec<Payload = V>,
     {
         // The two id texts are declared before the header list, so they outlive
         // the borrows the list holds on them.
@@ -219,7 +222,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         );
 
         let started = Instant::now();
-        let collected = collect::<R, V, E, _, _>(
+        let collected = collect::<R, V, _, _>(
             &mut registration,
             self.producer
                 .send_owned(record_headers, topic, key, payload),
@@ -274,9 +277,9 @@ where
     Ok(owned)
 }
 
-struct Missing<'a, V, E>(&'a [SubsystemName], &'a [Result<V, ResponseError<E>>]);
+struct Missing<'a, V>(&'a [SubsystemName], &'a [Result<V, ResponseError>]);
 
-impl<V, E> Display for Missing<'_, V, E> {
+impl<V> Display for Missing<'_, V> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         let mut separator = "";
         for (subsystem, result) in self.0.iter().zip(self.1) {
@@ -290,7 +293,7 @@ impl<V, E> Display for Missing<'_, V, E> {
 }
 
 /// Whether one subsystem answered at all.
-fn answered<V, E>(response: &Result<V, ResponseError<E>>) -> bool {
+fn answered<V>(response: &Result<V, ResponseError>) -> bool {
     !matches!(response, Err(ResponseError::Timeout))
 }
 

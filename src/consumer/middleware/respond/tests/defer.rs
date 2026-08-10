@@ -23,8 +23,9 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
 use crate::related_span;
+use crate::response::RequestId;
+use crate::response::frame::FrameResult;
 use crate::response::frame::decode::decode_frame;
-use crate::response::{RequestId, ResponseStatus};
 use crate::router::loopback::{TestRouter, node, paused};
 use crate::telemetry::Telemetry;
 use crate::test_util::{captured_spans, named, sampled_remote_context};
@@ -133,7 +134,7 @@ fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
         let frame = decode_frame(&mut delivery.bytes)?;
         assert_eq!(frame.header.target, node(TARGET));
         assert_eq!(frame.header.request, RequestId::from_bytes([REQUEST; 16]));
-        assert_eq!(frame.header.status, ResponseStatus::Success);
+        assert!(matches!(frame.result, FrameResult::Success(_)));
         assert!(
             frame.header.relay.is_none(),
             "a responder never sets the relay"

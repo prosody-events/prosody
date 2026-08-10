@@ -4,6 +4,7 @@ use super::{Harness, PAYLOAD, config, node, paused};
 use crate::Codec;
 use crate::response::frame::decode::decode_frame;
 use crate::response::frame::tests::CountingCodec;
+use crate::response::frame::{FrameResult, ResponseSuccess};
 use crate::router::loopback::direct_uri;
 use color_eyre::Result;
 
@@ -35,11 +36,10 @@ fn a_response_reaches_the_wire_intact() -> Result<()> {
             node(TARGET),
             "the frame must name its target node"
         );
-        assert_eq!(
-            CountingCodec.deserialize_bytes(frame.payload)?,
-            PAYLOAD,
-            "the frame must carry the sent response"
-        );
+        let FrameResult::Success(ResponseSuccess { payload, .. }) = frame.result else {
+            return Err(color_eyre::eyre::eyre!("the response must succeed"));
+        };
+        assert_eq!(CountingCodec.deserialize_bytes(payload)?, PAYLOAD);
 
         assert_eq!(drained.sent, 1);
         Ok(())

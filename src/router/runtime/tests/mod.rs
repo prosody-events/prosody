@@ -8,8 +8,8 @@
 use super::{PeerInputs, PeerRuntime, PreparedPeerRuntime, RouterConfiguration};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::registry::PendingRegistry;
+use crate::response::RequestId;
 use crate::response::frame::FrameHeader;
-use crate::response::{RequestId, ResponseStatus};
 use crate::router::NodeId;
 use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::directory::tests::support::cassandra_directory;
@@ -134,7 +134,6 @@ fn header(target: NodeId, request: RequestId, subsystem: &str) -> Result<FrameHe
         target,
         request,
         subsystem: SubsystemName::try_new(subsystem)?,
-        status: ResponseStatus::Success,
         relay: None,
     })
 }

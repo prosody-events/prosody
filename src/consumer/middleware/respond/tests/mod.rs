@@ -1,4 +1,4 @@
-//! What the respond layer's suites share: a codec over a handler result, a
+//! What the respond layer's suites share: a codec over handler output, a
 //! fixture that owns the fleet and the loopback transport, and the composed
 //! stack every cascade test drives.
 //!
@@ -16,7 +16,6 @@ use crate::consumer::middleware::tests::test_support::TestError;
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, HandlerMiddleware};
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{EventHandler, Partition, Topic};
-use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::RequestId;
 use crate::response::headers::{RequestDeadline, RequestTag};
 use crate::router::loopback::{Delivery, TestRouter, collect_deliveries, config, node};
@@ -26,10 +25,10 @@ use color_eyre::eyre::bail;
 use crossbeam_utils::CachePadded;
 use serde_json::Value;
 use std::cell::Cell;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
-use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::Span;
@@ -61,7 +60,7 @@ thread_local! {
     static SERIALIZES: Cell<usize> = const { Cell::new(0) };
 }
 
-/// A codec over one handler result, encoded as a single byte.
+/// A codec over one successful handler result.
 ///
 /// It cannot reuse the response layer's `CountingCodec`: that codec's payload
 /// is `Vec<u8>` and its visibility stops inside the response module.
@@ -69,34 +68,34 @@ thread_local! {
 struct ResultProbeCodec;
 
 /// One fleet, one loopback transport, and one responder over them.
-struct Fixture<C: Codec<Payload = Result<(), TestError>>> {
+struct Fixture<C: Codec<Payload = ()>> {
     router: TestRouter,
     responder: Arc<Responder<C, TestRouter>>,
     deliveries: UnboundedReceiver<Delivery>,
 }
 
 impl Codec for ResultProbeCodec {
-    type Error = ProbeCodecError;
-    type Payload = Result<(), TestError>;
+    type Error = Infallible;
+    type Payload = ();
 
     const FORMAT_ID: &'static str = "test-result";
 
-    fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, ProbeCodecError> {
-        decode_result(buf)
+    fn deserialize(&mut self, _buf: &mut [u8]) -> Result<Self::Payload, Infallible> {
+        Ok(())
     }
 
     fn serialize_ref(
         &mut self,
-        payload: &Self::Payload,
+        _payload: &Self::Payload,
         buf: &mut Vec<u8>,
-    ) -> Result<(), ProbeCodecError> {
+    ) -> Result<(), Infallible> {
         SERIALIZES.set(SERIALIZES.get() + 1);
-        buf.push(discriminant(payload));
+        buf.push(0);
         Ok(())
     }
 }
 
-impl<C: Codec<Payload = Result<(), TestError>>> Fixture<C> {
+impl<C: Codec<Payload = ()>> Fixture<C> {
     fn new() -> Result<Self> {
         let (router, deliveries) = TestRouter::new(config())?;
         let responder = Responder::new_route(router.clone(), SubsystemName::try_new(SUBSYSTEM)?);
@@ -235,35 +234,4 @@ fn offset_tracker() -> OffsetTracker {
 /// How many payloads the probe codecs have serialized on this thread.
 fn serialize_count() -> usize {
     SERIALIZES.get()
-}
-
-/// The byte one result encodes to: zero for a success, else the category's own
-/// wire discriminant.
-fn discriminant(payload: &Result<(), TestError>) -> u8 {
-    match payload {
-        Ok(()) => 0,
-        Err(TestError(category)) => i32::from(*category) as u8,
-    }
-}
-
-fn decode_result(buf: &[u8]) -> Result<Result<(), TestError>, ProbeCodecError> {
-    let Some(byte) = buf.first().copied() else {
-        return Err(ProbeCodecError::Empty);
-    };
-    if byte == 0 {
-        return Ok(Ok(()));
-    }
-    Ok(Err(TestError(ErrorCategory::try_from(i32::from(byte))?)))
-}
-
-/// Why a probe codec could not read a payload.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-enum ProbeCodecError {
-    /// The payload carries no result byte.
-    #[error("the result payload is empty")]
-    Empty,
-
-    /// The result byte names no error category.
-    #[error(transparent)]
-    Category(#[from] UnknownErrorCategory),
 }

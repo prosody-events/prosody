@@ -21,10 +21,10 @@ use super::client::GrpcSender;
 use super::service::PeerService;
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
+use crate::response::RequestId;
 use crate::response::frame::FrameHeader;
-use crate::response::frame::encode::stage;
+use crate::response::frame::encode::stage_success;
 use crate::response::frame::tests::CountingCodec;
-use crate::response::{RequestId, ResponseStatus};
 use crate::router::directory::Endpoint;
 use crate::router::fleet::DestinationFleet;
 use crate::router::loopback::listener::{FixedRouter, Served, bind_address, endpoint};
@@ -118,7 +118,7 @@ impl Harness {
         payload: Vec<u8>,
         context: &opentelemetry::Context,
     ) -> Result<Code> {
-        let staged = stage::<CountingCodec>(header, &payload)?;
+        let staged = stage_success::<CountingCodec>(header, &payload)?;
         status(
             self.sender
                 .deliver(&self.address, &staged, Instant::now() + BUDGET, context)
@@ -172,7 +172,6 @@ pub(super) fn header(target: NodeId, request: RequestId, subsystem: &str) -> Res
         target,
         request,
         subsystem: SubsystemName::try_new(subsystem)?,
-        status: ResponseStatus::Success,
         relay: None,
     })
 }

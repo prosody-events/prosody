@@ -24,12 +24,6 @@ mod inject;
 pub(crate) mod service;
 
 /// The peer service, written from the peer Protobuf schema at build time.
-#[expect(
-    clippy::absolute_paths,
-    clippy::doc_markdown,
-    clippy::trivially_copy_pass_by_ref,
-    reason = "written by prost-build, not by hand"
-)]
 pub(crate) mod generated {
     include!(concat!(env!("OUT_DIR"), "/prosody.peer.v1.rs"));
 }

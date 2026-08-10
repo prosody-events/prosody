@@ -1,9 +1,10 @@
 //! Flat waiter map lifecycle invariants.
 
 use super::{
-    MAX_TIMEOUT, POOL, TestCodec, TestCodecError, TestError, distinct_indices, names, poll_once,
+    MAX_TIMEOUT, POOL, TestCodec, TestCodecError, distinct_indices, failure, names, poll_once,
     register, registry, success,
 };
+use crate::error::ErrorCategory;
 use crate::producer::ProducerError;
 use crate::requester::collect::collect;
 use crate::requester::registry::tests::pending_len;
@@ -73,11 +74,38 @@ async fn each_waiter_is_removed_once() -> Result<()> {
     );
 
     let results =
-        collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, pending())
-            .await?;
+        collect::<TestCodec, u32, _, TestCodecError>(&mut registration, pending()).await?;
     assert_eq!(results, vec![Ok(1), Ok(2)]);
     drop(registration);
     assert_eq!(pending_len(&registry), 0);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn handler_failures_keep_their_category_and_message() -> Result<()> {
+    let registry = registry();
+    let names = names(&["billing"])?;
+    let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
+    assert_eq!(
+        registry.accept(failure(
+            registration.id(),
+            &names[0],
+            ErrorCategory::Permanent,
+            "invalid account",
+        )),
+        ResponseDisposition::Accepted
+    );
+    let results = collect::<TestCodec, u32, _, TestCodecError>(&mut registration, async {
+        Ok::<(), ProducerError<TestCodecError>>(())
+    })
+    .await?;
+    assert_eq!(
+        results,
+        vec![Err(ResponseError::Handler {
+            category: ErrorCategory::Permanent,
+            message: "invalid account".to_owned(),
+        })]
+    );
     Ok(())
 }
 
@@ -99,7 +127,7 @@ async fn responses_do_not_cancel_producer_completion() -> Result<()> {
         ResponseDisposition::Accepted
     );
 
-    let mut collected = pin!(collect::<TestCodec, u32, TestError, _, TestCodecError>(
+    let mut collected = pin!(collect::<TestCodec, u32, _, TestCodecError>(
         &mut registration,
         produce,
     ));
@@ -121,11 +149,10 @@ async fn every_request_exit_removes_remaining_waiters() -> Result<()> {
     assert_eq!(pending_len(&registry), 0, "cancellation left waiters");
 
     let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
-    let results =
-        collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, async {
-            Ok::<(), ProducerError<TestCodecError>>(())
-        })
-        .await?;
+    let results = collect::<TestCodec, u32, _, TestCodecError>(&mut registration, async {
+        Ok::<(), ProducerError<TestCodecError>>(())
+    })
+    .await?;
     assert_eq!(
         results,
         vec![Err(ResponseError::Timeout), Err(ResponseError::Timeout)]
@@ -134,11 +161,10 @@ async fn every_request_exit_removes_remaining_waiters() -> Result<()> {
     assert_eq!(pending_len(&registry), 0, "timeout left waiters");
 
     let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
-    let outcome =
-        collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, async {
-            Err(ProducerError::Kafka(KafkaError::Canceled))
-        })
-        .await;
+    let outcome = collect::<TestCodec, u32, _, TestCodecError>(&mut registration, async {
+        Err(ProducerError::Kafka(KafkaError::Canceled))
+    })
+    .await;
     if !matches!(outcome, Err(RequestError::Produce(_))) {
         bail!("a send failure did not fail the request");
     }
@@ -147,8 +173,7 @@ async fn every_request_exit_removes_remaining_waiters() -> Result<()> {
 
     let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
     registry.terminate();
-    let outcome =
-        collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, pending()).await;
+    let outcome = collect::<TestCodec, u32, _, TestCodecError>(&mut registration, pending()).await;
     if !matches!(outcome, Err(RequestError::ShuttingDown)) {
         bail!("shutdown did not fail the request");
     }
@@ -184,8 +209,7 @@ fn run_arrivals(trace: ArrivalTrace) -> Result<()> {
         }
 
         let results =
-            collect::<TestCodec, u32, TestError, _, TestCodecError>(&mut registration, pending())
-                .await?;
+            collect::<TestCodec, u32, _, TestCodecError>(&mut registration, pending()).await?;
         assert_eq!(
             results,
             expected

@@ -83,7 +83,7 @@ impl FallibleHandler for AmbientProbe {
 }
 
 impl ClientHandler for AmbientProbe {
-    type Codecs = Codecs<JsonCodec, UnitCodec, InfallibleCodec>;
+    type Codecs = Codecs<JsonCodec, UnitCodec>;
 }
 
 #[tokio::test]

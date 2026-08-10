@@ -4,12 +4,11 @@
 //! The field numbers here must match the peer Protobuf schema. A test decodes
 //! the generated descriptor set so the two cannot drift apart.
 
-use super::{FormatToken, RequestId, ResponseStatus};
+use super::{FormatToken, RequestId};
+use crate::error::ErrorCategory;
 use crate::router::NodeId;
 use crate::subsystem::SubsystemName;
 use bytes::Bytes;
-#[cfg(test)]
-use prost::encoding::{encoded_len_varint, key_len};
 
 pub(crate) mod decode;
 pub(crate) mod encode;
@@ -17,24 +16,18 @@ pub(crate) mod encode;
 const FIELD_TARGET_NODE: u32 = 1;
 const FIELD_REQUEST_ID: u32 = 2;
 const FIELD_SUBSYSTEM: u32 = 3;
-const FIELD_FORMAT: u32 = 4;
-const FIELD_STATUS: u32 = 5;
-const FIELD_PAYLOAD: u32 = 6;
+const FIELD_SUCCESS: u32 = 4;
+const FIELD_HANDLER_ERROR: u32 = 5;
 const FIELD_RELAY_NODE: u32 = 7;
+const FIELD_SUCCESS_FORMAT: u32 = 1;
+const FIELD_SUCCESS_PAYLOAD: u32 = 2;
+const FIELD_ERROR_CATEGORY: u32 = 1;
+const FIELD_ERROR_MESSAGE: u32 = 2;
 
 /// Width of every identifier on the wire.
 const ID_BYTES: usize = 16;
 
-/// The encoded size of one relay identifier field.
-#[cfg(test)]
-const RELAY_FIELD_BYTES: usize =
-    key_len(FIELD_RELAY_NODE) + encoded_len_varint(ID_BYTES as u64) + ID_BYTES;
-
-/// The routing and classification fields a responder supplies for one frame.
-///
-/// The format token is deliberately absent: it is the encoding codec's
-/// [`Codec::FORMAT_ID`], so a frame cannot claim a format it was not encoded
-/// with. The protocol version is likewise the encoder's.
+/// The routing fields a responder supplies for one frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameHeader {
     /// The node waiting for this response.
@@ -43,11 +36,32 @@ pub struct FrameHeader {
     pub(crate) request: RequestId,
     /// The subsystem the response is for.
     pub(crate) subsystem: SubsystemName,
-    /// How the responder classified the result.
-    pub(crate) status: ResponseStatus,
     /// Set only by a relay, which always writes its own id and never preserves
     /// one it received. A responder always leaves this `None`.
     pub(crate) relay: Option<NodeId>,
+}
+
+/// A successful result encoded by the user's response codec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResponseSuccess {
+    pub(crate) format: FormatToken,
+    pub(crate) payload: Bytes,
+}
+
+/// A handler failure encoded by Prosody.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HandlerError {
+    pub(crate) category: ErrorCategory,
+    pub(crate) message: Bytes,
+}
+
+/// The application result carried by one response frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FrameResult {
+    /// User-owned bytes encoded with the response codec.
+    Success(ResponseSuccess),
+    /// A handler failure encoded by Prosody.
+    HandlerError(HandlerError),
 }
 
 /// One decoded response frame.
@@ -56,14 +70,10 @@ pub struct FrameHeader {
 /// allocation at the gRPC header size and reserves the declared frame length.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResponseFrame {
-    /// Where the frame goes and how its result was classified.
+    /// Where the frame goes.
     pub(crate) header: FrameHeader,
-    /// The token the payload bytes were encoded with.
-    pub(crate) format: FormatToken,
-    /// The encoded response, opaque until a codec that speaks `format` reads
-    /// it. Immutable ownership lets local delivery share it and lets Tonic
-    /// split it from its receive buffer without copying.
-    pub(crate) payload: Bytes,
+    /// The successful value or handler failure.
+    pub(crate) result: FrameResult,
 }
 
 // Visible crate-wide to test modules: the sender's suites and the peer

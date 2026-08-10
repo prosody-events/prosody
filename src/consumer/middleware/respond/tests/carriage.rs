@@ -9,8 +9,9 @@ use crate::consumer::middleware::tests::test_support::{
 use crate::consumer::middleware::{Settlement, SettlementHandler};
 use crate::consumer::{DemandType, EventHandler};
 use crate::error::ErrorCategory;
+use crate::response::RequestId;
 use crate::response::frame::decode::decode_frame;
-use crate::response::{RequestId, ResponseStatus};
+use crate::response::frame::{FrameResult, HandlerError};
 use crate::router::loopback::{TestRouter, node, paused};
 use color_eyre::Result;
 
@@ -47,16 +48,13 @@ fn metadata_rides_the_error_arm() -> Result<()> {
         );
         assert_eq!(frame.header.request, RequestId::from_bytes([9; 16]));
         assert_eq!(frame.header.subsystem.as_str(), super::SUBSYSTEM);
-        assert_eq!(
-            frame.header.status,
-            ResponseStatus::Error(ErrorCategory::Permanent),
-            "the category labels the frame",
-        );
-        assert_eq!(
-            frame.payload.first().copied(),
-            Some(i32::from(ErrorCategory::Permanent) as u8),
-            "the error arm itself crossed the wire",
-        );
+        let FrameResult::HandlerError(HandlerError { category, message }) = frame.result else {
+            return Err(color_eyre::eyre::eyre!(
+                "the failed handler returned success"
+            ));
+        };
+        assert_eq!(category, ErrorCategory::Permanent);
+        assert_eq!(message, b"test error (Permanent)".as_slice());
         Ok(())
     })
 }

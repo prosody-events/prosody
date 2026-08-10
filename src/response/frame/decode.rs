@@ -1,11 +1,13 @@
-//! Reading one frame a peer sent.
+//! Reading one response frame.
 
 use super::{
-    FIELD_FORMAT, FIELD_PAYLOAD, FIELD_RELAY_NODE, FIELD_REQUEST_ID, FIELD_STATUS, FIELD_SUBSYSTEM,
-    FIELD_TARGET_NODE, FrameHeader, ID_BYTES, ResponseFrame,
+    FIELD_ERROR_CATEGORY, FIELD_ERROR_MESSAGE, FIELD_HANDLER_ERROR, FIELD_RELAY_NODE,
+    FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_SUCCESS, FIELD_SUCCESS_FORMAT, FIELD_SUCCESS_PAYLOAD,
+    FIELD_TARGET_NODE, FrameHeader, FrameResult, HandlerError, ID_BYTES, ResponseFrame,
+    ResponseSuccess,
 };
-use crate::error::UnknownErrorCategory;
-use crate::response::{FORMAT_MAX_BYTES, RequestId, ResponseStatus};
+use crate::error::{ErrorCategory, UnknownErrorCategory};
+use crate::response::{FormatToken, RequestId};
 use crate::router::NodeId;
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use bytes::{Buf, Bytes};
@@ -17,48 +19,24 @@ use prost::encoding::{
 use std::str::{Utf8Error, from_utf8};
 use thiserror::Error;
 
-/// Every field this frame defines, paired with the bit that records having read
-/// it. A tag absent from here belongs to a later protocol version and is
-/// skipped.
 const fn known_field(tag: u32) -> Option<(&'static str, u8)> {
     Some(match tag {
         FIELD_TARGET_NODE => ("target_node", 0b0000_0001),
         FIELD_REQUEST_ID => ("request_id", 0b0000_0010),
         FIELD_SUBSYSTEM => ("subsystem", 0b0000_0100),
-        FIELD_FORMAT => ("format", 0b0000_1000),
-        FIELD_STATUS => ("status", 0b0001_0000),
-        FIELD_PAYLOAD => ("payload", 0b0010_0000),
-        FIELD_RELAY_NODE => ("relay_node", 0b0100_0000),
+        FIELD_SUCCESS => ("success", 0b0000_1000),
+        FIELD_HANDLER_ERROR => ("handler_error", 0b0000_1000),
+        FIELD_RELAY_NODE => ("relay_node", 0b0001_0000),
         _ => return None,
     })
 }
 
-/// Decodes one frame.
-///
-/// Each field may appear once. Protobuf lets a sender repeat a singular field
-/// and take the last. A repeat here is either a contradiction or an allocation
-/// amplifier. Refusing repeats matches the checks for empty subsystem names
-/// and zero status values.
-///
-/// # Errors
-///
-/// Returns a [`FrameDecodeError`] naming the field that made the frame
-/// unreadable.
+/// Decodes one frame and rejects repeated singular fields.
 pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDecodeError> {
     let mut target = None;
     let mut request = None;
     let mut subsystem = None;
-    let mut format = None;
-    let mut status = None;
-    // A codec may legally serialize to zero bytes, and a frame no relay has
-    // touched carries no relay node, so a peer that omits these proto3 defaults
-    // is sending a well-formed frame. The five fields above exclude their default
-    // by construction — the ids are 16 bytes, a response is never for an unnamed
-    // subsystem or in an unnamed format, and the status reserves 0. Their absence
-    // is malformed. That is stricter
-    // than the `.proto` can state, which is the point: a schema cannot say "not
-    // the default", so the decoder does.
-    let mut payload = Bytes::new();
+    let mut result = None;
     let mut relay = None;
     let mut seen = 0u8;
 
@@ -85,20 +63,13 @@ pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDe
                     .map(SubsystemName::try_new)
                     .transpose()?;
             }
-            FIELD_FORMAT => {
+            FIELD_SUCCESS => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
-                format = decode_text::<B, { FORMAT_MAX_BYTES + 1 }>(src, "format")?;
+                result = Some(decode_success(&mut decode_bytes(src, "success")?)?);
             }
-            FIELD_STATUS => {
-                check_wire_type(WireType::Varint, wire_type)?;
-                let raw = decode_varint(src)?;
-                let narrowed =
-                    i32::try_from(raw).map_err(|_| FrameDecodeError::StatusTooWide(raw))?;
-                status = Some(ResponseStatus::try_from(narrowed)?);
-            }
-            FIELD_PAYLOAD => {
+            FIELD_HANDLER_ERROR => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
-                payload = decode_payload(src)?;
+                result = Some(decode_error(&mut decode_bytes(src, "handler_error")?)?);
             }
             FIELD_RELAY_NODE => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
@@ -113,17 +84,86 @@ pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDe
             target: target.ok_or(FrameDecodeError::MissingField("target_node"))?,
             request: request.ok_or(FrameDecodeError::MissingField("request_id"))?,
             subsystem: subsystem.ok_or(FrameDecodeError::MissingField("subsystem"))?,
-            status: status.ok_or(FrameDecodeError::MissingField("status"))?,
             relay,
         },
-        format: format.ok_or(FrameDecodeError::MissingField("format"))?,
-        payload,
+        result: result.ok_or(FrameDecodeError::MissingField("result"))?,
     })
 }
 
-/// Reads an identifier field. A zero-length field is protobuf's way of spelling
-/// "absent", which only `relay_node` legitimately is; for the others the caller
-/// turns `None` into a missing-field error.
+fn decode_success(src: &mut Bytes) -> Result<FrameResult, FrameDecodeError> {
+    let mut format = None;
+    let mut payload = None;
+    let mut seen = 0u8;
+    while src.has_remaining() {
+        let (tag, wire_type) = decode_key(src)?;
+        match tag {
+            FIELD_SUCCESS_FORMAT => {
+                repeated(&mut seen, 1, "success.format")?;
+                check_wire_type(WireType::LengthDelimited, wire_type)?;
+                let bytes = decode_bytes(src, "success.format")?;
+                if bytes.is_empty() {
+                    return Err(FrameDecodeError::MissingField("success.format"));
+                }
+                format = Some(FormatToken::try_from_bytes(bytes)?);
+            }
+            FIELD_SUCCESS_PAYLOAD => {
+                repeated(&mut seen, 2, "success.payload")?;
+                check_wire_type(WireType::LengthDelimited, wire_type)?;
+                payload = Some(decode_bytes(src, "success.payload")?);
+            }
+            _ => skip_field(wire_type, tag, src, DecodeContext::default())?,
+        }
+    }
+    Ok(FrameResult::Success(ResponseSuccess {
+        format: format.ok_or(FrameDecodeError::MissingField("success.format"))?,
+        payload: match payload {
+            Some(payload) => payload,
+            None => Bytes::new(),
+        },
+    }))
+}
+
+fn decode_error(src: &mut Bytes) -> Result<FrameResult, FrameDecodeError> {
+    let mut category = None;
+    let mut message = None;
+    let mut seen = 0u8;
+    while src.has_remaining() {
+        let (tag, wire_type) = decode_key(src)?;
+        match tag {
+            FIELD_ERROR_CATEGORY => {
+                repeated(&mut seen, 1, "handler_error.category")?;
+                check_wire_type(WireType::Varint, wire_type)?;
+                let raw = decode_varint(src)?;
+                let raw = i32::try_from(raw).map_err(|_| FrameDecodeError::CategoryTooWide(raw))?;
+                category = Some(ErrorCategory::try_from(raw)?);
+            }
+            FIELD_ERROR_MESSAGE => {
+                repeated(&mut seen, 2, "handler_error.message")?;
+                check_wire_type(WireType::LengthDelimited, wire_type)?;
+                let bytes = decode_bytes(src, "handler_error.message")?;
+                from_utf8(&bytes)?;
+                message = Some(bytes);
+            }
+            _ => skip_field(wire_type, tag, src, DecodeContext::default())?,
+        }
+    }
+    Ok(FrameResult::HandlerError(HandlerError {
+        category: category.ok_or(FrameDecodeError::MissingField("handler_error.category"))?,
+        message: match message {
+            Some(message) => message,
+            None => Bytes::new(),
+        },
+    }))
+}
+
+fn repeated(seen: &mut u8, bit: u8, field: &'static str) -> Result<(), FrameDecodeError> {
+    if *seen & bit != 0 {
+        return Err(FrameDecodeError::RepeatedField(field));
+    }
+    *seen |= bit;
+    Ok(())
+}
+
 fn decode_id<B: Buf>(
     src: &mut B,
     field: &'static str,
@@ -135,25 +175,12 @@ fn decode_id<B: Buf>(
     if len != ID_BYTES as u64 {
         return Err(FrameDecodeError::MalformedId { field, bytes: len });
     }
-    if src.remaining() < ID_BYTES {
-        return Err(FrameDecodeError::Truncated {
-            field,
-            bytes: len,
-            remaining: src.remaining(),
-        });
-    }
+    require(src, field, len)?;
     let mut id = [0u8; ID_BYTES];
     src.copy_to_slice(&mut id);
     Ok(Some(id))
 }
 
-/// Reads a bounded UTF-8 field into an inline string. The claimed length is
-/// checked against the bound before a byte is copied, so the stack buffer is
-/// always large enough and no peer-claimed length ever sizes an allocation.
-///
-/// An empty string is protobuf's spelling of the default, which neither of this
-/// frame's text fields may be, so it reads as absent and the caller turns
-/// `None` into a missing-field error.
 fn decode_text<B: Buf, const N: usize>(
     src: &mut B,
     field: &'static str,
@@ -169,106 +196,65 @@ fn decode_text<B: Buf, const N: usize>(
             limit: N - 1,
         });
     }
-    if len > src.remaining() as u64 {
-        return Err(FrameDecodeError::Truncated {
-            field,
-            bytes: len,
-            remaining: src.remaining(),
-        });
-    }
+    require(src, field, len)?;
     let mut buf = [0u8; N];
     let len = len as usize;
     src.copy_to_slice(&mut buf[..len]);
     Ok(Some(Flexstr::make(from_utf8(&buf[..len])?)))
 }
 
-/// Splits the payload from the transport buffer without copying when its
-/// [`Buf`] implementation supports shared bytes.
-fn decode_payload<B: Buf>(src: &mut B) -> Result<Bytes, FrameDecodeError> {
+fn decode_bytes<B: Buf>(src: &mut B, field: &'static str) -> Result<Bytes, FrameDecodeError> {
     let len = decode_varint(src)?;
-    if len > src.remaining() as u64 {
-        return Err(FrameDecodeError::Truncated {
-            field: "payload",
-            bytes: len,
-            remaining: src.remaining(),
-        });
-    }
+    require(src, field, len)?;
     Ok(src.copy_to_bytes(len as usize))
 }
 
-/// Why a frame a peer sent could not be read.
+fn require<B: Buf>(src: &B, field: &'static str, bytes: u64) -> Result<(), FrameDecodeError> {
+    if bytes > src.remaining() as u64 {
+        return Err(FrameDecodeError::Truncated {
+            field,
+            bytes,
+            remaining: src.remaining(),
+        });
+    }
+    Ok(())
+}
+
+/// Why a peer frame could not be read.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum FrameDecodeError {
-    /// A field states a length the frame does not carry.
     #[error("{field} claims {bytes} bytes with {remaining} left in the frame")]
     Truncated {
-        /// The field that made the claim.
         field: &'static str,
-        /// The claimed length.
         bytes: u64,
-        /// What the frame actually had left.
         remaining: usize,
     },
-
-    /// A field whose absence cannot be a legal default is absent.
     #[error("frame is missing {0}")]
     MissingField(&'static str),
-
-    /// A field appears more than once.
     #[error("frame repeats {0}")]
     RepeatedField(&'static str),
-
-    /// An identifier field is present but is not 16 bytes.
     #[error("{field} is {bytes} bytes, not 16")]
-    MalformedId {
-        /// The identifier field.
-        field: &'static str,
-        /// The length it claimed.
-        bytes: u64,
-    },
-
-    /// A string field is longer than the frame permits.
+    MalformedId { field: &'static str, bytes: u64 },
     #[error("{field} is {bytes} bytes, over the {limit}-byte limit")]
     StringTooLong {
-        /// The string field.
         field: &'static str,
-        /// The claimed length.
         bytes: u64,
-        /// The longest value the field may carry.
         limit: usize,
     },
-
-    /// A string field is not valid UTF-8.
+    #[error("handler_error.category value {0} does not fit int32")]
+    CategoryTooWide(u64),
     #[error(transparent)]
-    InvalidUtf8(#[from] Utf8Error),
-
-    /// The subsystem field carries no name a responder could hold. The length
-    /// bound above cannot catch this one: a name of whitespace alone is not
-    /// empty on the wire and is blank after the trim.
+    UnknownCategory(#[from] UnknownErrorCategory),
     #[error(transparent)]
-    Subsystem(#[from] SubsystemNameError),
-
-    /// The status field carries a varint too wide for its `int32`. Narrowing it
-    /// would fold a value no status can be onto one that is.
-    #[error("status varint {0} does not fit int32")]
-    StatusTooWide(u64),
-
-    /// The status field names neither a success nor an error category.
+    InvalidText(#[from] Utf8Error),
     #[error(transparent)]
-    Status(#[from] UnknownErrorCategory),
-
-    /// The bytes are not well-formed protobuf.
+    InvalidSubsystem(#[from] SubsystemNameError),
     #[error(transparent)]
-    Wire(#[from] DecodeError),
+    Protobuf(#[from] DecodeError),
 }
 
 impl FrameDecodeError {
-    /// What the sending peer is told about a frame this reader refused.
-    ///
-    /// Separate from `Display`, which is the local diagnostic and names the
-    /// lengths the peer itself claimed. Every message here is a
-    /// literal, so a refusal on an unauthenticated port allocates nothing and
-    /// echoes nothing back.
+    /// Returns a fixed message safe for an unauthenticated peer.
     pub(crate) const fn message(&self) -> &'static str {
         match self {
             Self::Truncated { .. } => "a frame field claims more bytes than the frame carries",
@@ -276,10 +262,12 @@ impl FrameDecodeError {
             Self::RepeatedField(_) => "the frame repeats a field it may carry once",
             Self::MalformedId { .. } => "a frame identifier is not 16 bytes",
             Self::StringTooLong { .. } => "a frame text field is over its limit",
-            Self::InvalidUtf8(_) => "a frame text field is not UTF-8",
-            Self::Subsystem(_) => "the frame names no subsystem a responder could hold",
-            Self::StatusTooWide(_) | Self::Status(_) => "the frame states no known outcome",
-            Self::Wire(_) => "the frame is not well-formed protobuf",
+            Self::CategoryTooWide(_) | Self::UnknownCategory(_) => {
+                "the frame states no known error category"
+            }
+            Self::InvalidText(_) => "a frame text field is not UTF-8",
+            Self::InvalidSubsystem(_) => "the frame names no valid subsystem",
+            Self::Protobuf(_) => "the frame is not well-formed protobuf",
         }
     }
 }

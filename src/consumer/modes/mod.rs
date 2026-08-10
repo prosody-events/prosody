@@ -86,7 +86,7 @@ impl<C, R> Responding<'_, C, R> {
 
 impl<C, R, H> ResponsePolicy<H> for Responding<'_, C, R>
 where
-    C: Codec<Payload = Result<H::Output, H::Error>>,
+    C: Codec<Payload = H::Output>,
     R: Router,
     H: FallibleHandler + Clone + Send + Sync + 'static,
     H::Output: Sync + 'static,

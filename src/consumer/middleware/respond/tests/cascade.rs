@@ -9,8 +9,7 @@ use crate::consumer::middleware::tests::test_support::{
 };
 use crate::consumer::{DemandType, EventHandler};
 use crate::error::ErrorCategory;
-use crate::response::ResponseStatus;
-use crate::response::frame::decode::decode_frame;
+use crate::response::frame::{FrameResult, HandlerError, decode::decode_frame};
 use crate::router::loopback::{Delivery, paused};
 use color_eyre::Report;
 use color_eyre::Result;
@@ -79,10 +78,10 @@ fn at_most_one_response_per_final_invocation() {
 #[test]
 fn a_retried_cascade_answers_once_with_the_settled_outcome() -> Result<()> {
     let directions = [
-        (vec![ErrorCategory::Transient], ResponseStatus::Success),
+        (vec![ErrorCategory::Transient], None),
         (
             vec![ErrorCategory::Transient, ErrorCategory::Transient],
-            ResponseStatus::Error(ErrorCategory::Transient),
+            Some(ErrorCategory::Transient),
         ),
     ];
     for (script, settled) in directions {
@@ -100,10 +99,11 @@ fn a_retried_cascade_answers_once_with_the_settled_outcome() -> Result<()> {
         );
         let mut delivery = drained.remove(0);
         let frame = decode_frame(&mut delivery.bytes)?;
-        assert_eq!(
-            frame.header.status, settled,
-            "the answer states the settled outcome, not an earlier attempt",
-        );
+        let actual = match frame.result {
+            FrameResult::Success(_) => None,
+            FrameResult::HandlerError(HandlerError { category, .. }) => Some(category),
+        };
+        assert_eq!(actual, settled, "the answer must state the settled outcome");
     }
     Ok(())
 }

@@ -5,7 +5,7 @@
 //! stay local to the test file that needs them.
 
 use prosody::JsonCodec;
-use prosody::codec::{Codec, UnitCodec, UnitCodecError};
+use prosody::codec::UnitCodec;
 use prosody::consumer::event_context::EventContext;
 use prosody::consumer::message::{ConsumerMessage, UncommittedMessage};
 use prosody::consumer::middleware::FallibleHandler;
@@ -111,47 +111,6 @@ impl ClassifyError for TransientError {
     }
 }
 
-macro_rules! unit_error_codec {
-    ($error:ident, $format:literal) => {
-        impl Codec for $error {
-            type Error = UnitCodecError;
-            type Payload = $error;
-
-            const FORMAT_ID: &'static str = $format;
-
-            fn deserialize(&mut self, buf: &mut [u8]) -> Result<$error, UnitCodecError> {
-                UnitCodec.deserialize(buf).map(|()| $error)
-            }
-
-            fn deserialize_owned(
-                &mut self,
-                buf: bytes::BytesMut,
-            ) -> Result<$error, UnitCodecError> {
-                UnitCodec.deserialize_owned(buf).map(|()| $error)
-            }
-
-            fn serialize(
-                &mut self,
-                _payload: $error,
-                _buf: &mut Vec<u8>,
-            ) -> Result<(), UnitCodecError> {
-                Ok(())
-            }
-
-            fn serialize_ref(
-                &mut self,
-                _payload: &$error,
-                _buf: &mut Vec<u8>,
-            ) -> Result<(), UnitCodecError> {
-                Ok(())
-            }
-        }
-    };
-}
-
-unit_error_codec!(TestError, "test-permanent-error");
-unit_error_codec!(TransientError, "test-transient-error");
-
 /// A [`FallibleHandler`] that forwards every message to a channel.
 ///
 /// A leaf handler: it relies on the default no-op `after_commit` /
@@ -202,5 +161,5 @@ impl FallibleHandler for FallibleTestHandler {
 }
 
 impl ClientHandler for FallibleTestHandler {
-    type Codecs = Codecs<JsonCodec, UnitCodec, TestError>;
+    type Codecs = Codecs<JsonCodec, UnitCodec>;
 }
