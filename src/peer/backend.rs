@@ -1,12 +1,18 @@
 //! Compile-time backend selection for one peer runtime.
 
 use crate::cassandra::CassandraStore;
+#[cfg(test)]
 use crate::codec::Codec;
 use crate::consumer::{ConsumerError, PeerInitError};
 use crate::peer::PeerConfiguration;
-use crate::peer::runtime::{PreparedRuntime, prepare_local, prepare_network};
+use crate::peer::runtime::prepare_network;
+#[cfg(test)]
+use crate::peer::runtime::{PreparedRuntime, prepare_local};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
-use crate::router::runtime::{PreparedLocalPeerRuntime, PreparedPeerRuntime};
+#[cfg(test)]
+use crate::router::runtime::PreparedLocalPeerRuntime;
+use crate::router::runtime::PreparedPeerRuntime;
+#[cfg(test)]
 use crate::state_reader::{CassandraReaderBackend, MemoryReaderBackend};
 
 pub(crate) async fn prepare_cassandra(
@@ -23,6 +29,7 @@ pub(crate) async fn prepare_cassandra(
 }
 
 /// A backend that selects its peer runtime at compile time.
+#[cfg(test)]
 pub(crate) trait PeerBackend: Send + Sync + Sized + 'static {
     type Runtime: PreparedRuntime;
 
@@ -32,6 +39,7 @@ pub(crate) trait PeerBackend: Send + Sync + Sized + 'static {
     ) -> impl Future<Output = Result<Self::Runtime, ConsumerError>> + Send;
 }
 
+#[cfg(test)]
 impl<C: Codec> PeerBackend for CassandraReaderBackend<C> {
     type Runtime = PreparedPeerRuntime<CassandraNodeDirectory>;
 
@@ -40,6 +48,7 @@ impl<C: Codec> PeerBackend for CassandraReaderBackend<C> {
     }
 }
 
+#[cfg(test)]
 impl<C: Codec> PeerBackend for MemoryReaderBackend<C> {
     type Runtime = PreparedLocalPeerRuntime;
 

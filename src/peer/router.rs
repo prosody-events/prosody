@@ -2,10 +2,7 @@
 
 use super::PeerConfiguration;
 use super::backend::prepare_cassandra;
-use super::runtime::{
-    LocalRoute, PeerRouter, ProducerHandle, prepare_router, start_local_router, start_router,
-};
-use crate::Codec;
+use super::runtime::{LocalRoute, PeerRouter, ProducerHandle, start_local_router, start_router};
 use crate::cassandra::{CassandraConfiguration, CassandraStore};
 use crate::consumer::{ConsumerError, PeerInitError, ShutdownError};
 use crate::response::frame::encode::Staged;
@@ -14,7 +11,6 @@ use crate::response::sender::{DropReason, ResponseRoute, RouteOutcome, Then};
 use crate::router::directory::cassandra::CassandraNodeDirectory;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::{LocalTarget, NetworkRoute};
-use crate::state_reader::CassandraReaderBackend;
 use std::future::Future;
 
 mod sealed {
@@ -102,15 +98,6 @@ impl GrpcRouter {
                 })?;
         Ok(Self {
             inner: start_router(prepare_cassandra(config, store).await?).await?,
-        })
-    }
-
-    pub(crate) async fn start<C: Codec>(
-        config: &PeerConfiguration,
-        backend: &CassandraReaderBackend<C>,
-    ) -> Result<Self, ConsumerError> {
-        Ok(Self {
-            inner: prepare_router(config, backend).await?,
         })
     }
 }

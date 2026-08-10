@@ -9,7 +9,9 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::{ConsumerConfiguration, DemandType, KeyedStateConfiguration};
-use crate::high_level::erased::{ErasedReadCache, ErasedReaderBuildError, new_erased};
+use crate::high_level::erased::{
+    ErasedConsumerState, ErasedReadCache, ErasedReaderBuildError, new_erased,
+};
 use crate::high_level::mode::Mode;
 use crate::producer::ProducerConfiguration;
 use crate::state::descriptor::value_state;
@@ -251,9 +253,11 @@ impl ClientHandler for NoOpHandler {
     type Codecs = Codecs<JsonCodec, UnitCodec, InfallibleCodec>;
 }
 
-/// Erased construction rejects an invalid consumer configuration.
+/// Erased backend selection reads only mock mode. Invalid consumer-only fields
+/// remain deferred, so the producer half constructs and subscription reports
+/// the retained configuration error.
 #[test]
-fn erased_client_rejects_consumer_failure_at_construction() -> Result<()> {
+fn erased_client_retains_consumer_failure_until_subscribe() -> Result<()> {
     let mut producer = ProducerConfiguration::builder();
     producer
         .bootstrap_servers(vec!["unused-in-mock-mode:9092".to_owned()])
@@ -266,17 +270,19 @@ fn erased_client_rejects_consumer_failure_at_construction() -> Result<()> {
         ..ConsumerBuilders::new()?
     };
 
-    let built = TEST_RUNTIME.block_on(new_erased::<NoOpHandler>(
+    let client = TEST_RUNTIME.block_on(new_erased::<NoOpHandler>(
         Mode::Pipeline,
         &mut producer,
         &consumers,
         &CassandraConfigurationBuilder::default(),
-    ));
+    ))?;
+    assert_eq!(client.source_system(), "producer-only");
+    let state = TEST_RUNTIME.block_on(client.consumer_state());
+    assert!(matches!(state, ErasedConsumerState::ConfigurationFailed(_)));
+    let subscribed = TEST_RUNTIME.block_on(client.subscribe(NoOpHandler));
     assert!(matches!(
-        built,
-        Err(erased::ErasedClientBuildError::Client(
-            HighLevelClientError::ConsumerConfiguration(_)
-        ))
+        subscribed,
+        Err(HighLevelClientError::ConsumerConfiguration(_))
     ));
     Ok(())
 }
@@ -416,16 +422,22 @@ fn subsystem(name: &str) -> Result<SubsystemName> {
 fn state_and_subscriptions_share_one_bundle() -> Result<()> {
     let client = create_test_client::<NoOpHandler>("share-one-bundle", None)?;
     TEST_RUNTIME.block_on(async {
-        let before = client.state(subsystem("carts")?, value_state::<JsonCodec>("cart"))?;
+        let before = client
+            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
+            .await?;
         let expected = before.deps_instance_id();
 
         client.subscribe(NoOpHandler).await?;
-        let running = client.state(subsystem("carts")?, value_state::<JsonCodec>("cart"))?;
+        let running = client
+            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
+            .await?;
         client.unsubscribe().await?;
 
         client.subscribe(NoOpHandler).await?;
         client.unsubscribe().await?;
-        let after = client.state(subsystem("carts")?, value_state::<JsonCodec>("cart"))?;
+        let after = client
+            .state(subsystem("carts")?, value_state::<JsonCodec>("cart"))
+            .await?;
 
         assert_eq!(running.deps_instance_id(), expected);
         assert_eq!(after.deps_instance_id(), expected);
@@ -464,7 +476,9 @@ fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
         // always runs, even if the scenario fails.
         let outcome: Result<()> = async {
             // The bundle the running consumer and the client's readers share.
-            let deps = client.retained_deps();
+            let Some(deps) = client.retained_deps() else {
+                return Err(color_eyre::eyre::eyre!("reader dependencies are absent"));
+            };
             let backend = deps.backend();
             let cells = backend.cells();
             let publications = backend.publications();
@@ -509,7 +523,9 @@ fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
 
             // A reader composed from the client reads the committed value from
             // the shared cells.
-            let reader = client.state(sub.clone(), value_state::<JsonCodec>("cart"))?;
+            let reader = client
+                .state(sub.clone(), value_state::<JsonCodec>("cart"))
+                .await?;
             let observed = reader.get("user-1").await?;
             ensure!(
                 observed == Some(json!(["apple"])),

@@ -27,6 +27,10 @@ pub use readers::{
 /// Consumer lifecycle state materialized across an FFI boundary.
 #[derive(Clone, Debug)]
 pub enum ErasedConsumerState<T> {
+    /// No valid consumer configuration exists.
+    Unconfigured,
+    /// Consumer configuration failed.
+    ConfigurationFailed(String),
     /// The consumer is ready to subscribe.
     Configured(ErasedConsumerConfiguration),
     /// The consumer is running.
@@ -173,6 +177,10 @@ where
 
     async fn consumer_state(&self) -> ErasedConsumerState<T> {
         match &*self.0.consumer_state().await {
+            ConsumerState::Unconfigured => ErasedConsumerState::Unconfigured,
+            ConsumerState::ConfigurationFailed(error) => {
+                ErasedConsumerState::ConfigurationFailed(error.to_string())
+            }
             ConsumerState::Configured { config, .. } => {
                 ErasedConsumerState::Configured(erased_config(config))
             }
@@ -191,7 +199,7 @@ where
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedValueReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
-        readers::value(&self.0, subsystem, &name, cache)
+        readers::value(&self.0, subsystem, &name, cache).await
     }
 
     async fn map_state(
@@ -200,7 +208,7 @@ where
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedMapReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
-        readers::map(&self.0, subsystem, &name, cache)
+        readers::map(&self.0, subsystem, &name, cache).await
     }
 
     async fn deque_state(
@@ -209,7 +217,7 @@ where
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedDequeReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
-        readers::deque(&self.0, subsystem, &name, cache)
+        readers::deque(&self.0, subsystem, &name, cache).await
     }
 
     async fn assigned_partition_count(&self) -> u32 {

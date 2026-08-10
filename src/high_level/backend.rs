@@ -41,7 +41,6 @@ where
     fn build_router(
         &self,
         config: &PeerConfiguration,
-        reader: &StateReaderDependencies<C, Self::Reader>,
     ) -> impl Future<Output = Result<Self::Router, ConsumerError>> + Send;
 }
 
@@ -122,7 +121,6 @@ where
     async fn build_router(
         &self,
         _config: &PeerConfiguration,
-        _reader: &StateReaderDependencies<C, Self::Reader>,
     ) -> Result<Self::Router, ConsumerError> {
         LocalRouter::new().await
     }
@@ -178,8 +176,7 @@ where
     async fn build_router(
         &self,
         config: &PeerConfiguration,
-        reader: &StateReaderDependencies<C, Self::Reader>,
     ) -> Result<Self::Router, ConsumerError> {
-        GrpcRouter::start(config, reader.backend().as_ref()).await
+        GrpcRouter::new(config, &self.config).await
     }
 }

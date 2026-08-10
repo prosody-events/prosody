@@ -1,9 +1,12 @@
 //! Router construction and request admission.
 
 use crate::Codec;
+#[cfg(test)]
 use crate::PeerConfiguration;
 use crate::consumer::{ConsumerError, PeerInitError, ShutdownError};
-use crate::peer::{PeerBackend, heartbeat_registry};
+#[cfg(test)]
+use crate::peer::PeerBackend;
+use crate::peer::heartbeat_registry;
 use crate::producer::ProsodyProducer;
 use crate::requester::ProsodyRequester;
 use crate::response::sender::{ResponseRoute, Then};
@@ -85,9 +88,11 @@ pub(crate) trait RunningRuntime: Sized + Send + 'static {
 }
 
 /// Prepared runtime selected by `B`.
+#[cfg(test)]
 pub(crate) type RuntimeFor<B> = <B as PeerBackend>::Runtime;
 
 /// Response route selected by `B`.
+#[cfg(test)]
 pub(crate) type RouteFor<B> = <RuntimeFor<B> as PreparedRuntime>::Route;
 
 impl<R: LocalRoute> PeerRouter<R> {
@@ -238,6 +243,7 @@ pub(crate) fn prepare_local() -> PreparedLocalPeerRuntime {
 ///
 /// Returns [`ConsumerError::Peer`] when the configuration, the listener, the
 /// directory, or the runtime refuses to start.
+#[cfg(test)]
 pub(crate) async fn prepare_router<B>(
     peer: &PeerConfiguration,
     backend: &B,

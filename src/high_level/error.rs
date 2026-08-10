@@ -46,6 +46,10 @@ pub enum HighLevelClientError<E> {
     #[error("consumer is already subscribed")]
     AlreadySubscribed,
 
+    /// Error when attempting to use an unconfigured consumer.
+    #[error("unconfigured consumer; client does not have a valid consumer configuration")]
+    UnconfiguredConsumer,
+
     /// Error when attempting to unsubscribe a not subscribed consumer.
     #[error("consumer is not subscribed")]
     NotSubscribed,

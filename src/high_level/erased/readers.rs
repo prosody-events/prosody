@@ -153,7 +153,7 @@ pub enum ErasedReaderBuildError<E> {
     Client(#[from] HighLevelClientError<E>),
 }
 
-pub(super) fn value<T, B>(
+pub(super) async fn value<T, B>(
     client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
@@ -166,11 +166,11 @@ where
     B::Reader: ConsumerReaderBackend<Wire<T>>,
 {
     let descriptor = value_state::<Wire<T>>(name).read_cache(cache);
-    let reader = client.state(subsystem_name(subsystem)?, descriptor)?;
+    let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
     Ok(Arc::new(ValueReader(reader)))
 }
 
-pub(super) fn map<T, B>(
+pub(super) async fn map<T, B>(
     client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
@@ -183,11 +183,11 @@ where
     B::Reader: ConsumerReaderBackend<Wire<T>>,
 {
     let descriptor = map_state::<Utf8KeyCodec, Wire<T>>(name).read_cache(cache);
-    let reader = client.state(subsystem_name(subsystem)?, descriptor)?;
+    let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
     Ok(Arc::new(MapReader(reader)))
 }
 
-pub(super) fn deque<T, B>(
+pub(super) async fn deque<T, B>(
     client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
@@ -200,7 +200,7 @@ where
     B::Reader: ConsumerReaderBackend<Wire<T>>,
 {
     let descriptor = deque_state::<Wire<T>>(name).read_cache(cache);
-    let reader = client.state(subsystem_name(subsystem)?, descriptor)?;
+    let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
     Ok(Arc::new(DequeReader(reader)))
 }
 

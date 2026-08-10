@@ -5,6 +5,7 @@ use crate::consumer::TypedConsumerSetup;
 use crate::consumer::{CommonConfiguration, ConsumerConfiguration};
 use crate::high_level::ClientBackend;
 use crate::high_level::config::ModeConfiguration;
+use crate::high_level::error::HighLevelClientError;
 use crate::loader::LoaderConfiguration;
 use crate::state_reader::StateReaderDependencies;
 use std::num::NonZeroU64;
@@ -21,6 +22,21 @@ pub struct ReaderConfiguration {
     pub(super) stall_threshold: Duration,
     pub(super) cache_size: NonZeroU64,
     pub(super) cache_ttl: Option<Duration>,
+}
+
+pub(super) async fn build<C, B>(
+    config: &ReaderConfiguration,
+    backend: &B,
+) -> Result<StateReaderDependencies<C, B::Reader>, HighLevelClientError<C::Error>>
+where
+    C: Codec,
+    C::Payload: Clone,
+    B: ClientBackend<C>,
+{
+    backend
+        .build_reader(config)
+        .await
+        .map_err(HighLevelClientError::StateReader)
 }
 
 impl ReaderConfiguration {

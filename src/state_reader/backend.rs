@@ -17,7 +17,6 @@ use crate::consumer::{
 };
 use crate::error::ClassifyError;
 use crate::loader::{KafkaLoader, MemoryLoader, MessageLoader};
-use crate::peer::PeerBackend;
 use crate::state::cassandra::{
     CassandraCellResources, CassandraCellStoreError, CassandraDescriptorIdentityStore,
     CassandraPublicationStore,
@@ -179,7 +178,7 @@ where
 
 /// Reader family that can also supply a consumer's matching stores.
 pub(crate) trait ConsumerReaderBackend<C>:
-    ReaderBackend<C> + ConsumerStorageBackend<C> + PeerBackend
+    ReaderBackend<C> + ConsumerStorageBackend<C>
 where
     C: Codec,
 {
@@ -188,7 +187,7 @@ where
 impl<C, B> ConsumerReaderBackend<C> for B
 where
     C: Codec,
-    B: ReaderBackend<C> + ConsumerStorageBackend<C> + PeerBackend,
+    B: ReaderBackend<C> + ConsumerStorageBackend<C>,
 {
 }
 
@@ -214,6 +213,7 @@ impl<C, S, P, I, L> ReaderComponents<C, S, P, I, L> {
     }
 
     /// Returns the cell component for another shared client component.
+    #[cfg(test)]
     pub(crate) const fn cells_ref(&self) -> &S {
         &self.cells
     }

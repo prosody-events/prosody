@@ -26,9 +26,9 @@ use crate::{Codec, Topic};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::future::Future;
-use std::mem::replace;
+use std::mem::take;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tracing::info;
 
 mod backend;
@@ -74,7 +74,10 @@ where
     producer_config: ProducerConfiguration,
     consumer: Mutex<ConsumerState<T, Wire<T>>>,
     #[educe(Debug(ignore))]
-    reader: StateReaderClient<Wire<T>, B::Reader>,
+    reader: OnceCell<StateReaderClient<Wire<T>, B::Reader>>,
+    #[educe(Debug(ignore))]
+    reader_config: Option<ReaderConfiguration>,
+    backend: B,
     #[educe(Debug(ignore))]
     requester: ProsodyRequester<Wire<T>, Reply<T>>,
     #[educe(Debug(ignore))]
@@ -91,6 +94,26 @@ where
     T::Payload: crate::EventIdentity,
     B: ClientBackend<Wire<T>>,
 {
+    async fn reader(
+        &self,
+    ) -> Result<StateReaderClient<Wire<T>, B::Reader>, HighLevelClientError<WireError<T>>>
+    where
+        T::Payload: Clone,
+    {
+        let config = self
+            .reader_config
+            .as_ref()
+            .ok_or(HighLevelClientError::UnconfiguredConsumer)?;
+        self.reader
+            .get_or_try_init(|| async {
+                deps::build(config, &self.backend)
+                    .await
+                    .map(StateReaderClient::new)
+            })
+            .await
+            .cloned()
+    }
+
     /// Returns a reference to the internal `ProsodyProducer`.
     pub fn producer(&self) -> &ProsodyProducer<Wire<T>> {
         &self.producer
@@ -187,6 +210,9 @@ where
     {
         let mut guard = self.consumer.lock().await;
         match &mut *guard {
+            ConsumerState::Unconfigured | ConsumerState::ConfigurationFailed(_) => {
+                Err(HighLevelClientError::UnconfiguredConsumer)
+            }
             ConsumerState::Configured { config } => config.register(descriptor).map_err(Into::into),
             ConsumerState::Running { .. } => Err(HighLevelClientError::AlreadySubscribed),
         }
@@ -196,8 +222,8 @@ where
     /// hook lets the composition suite seed committed state into the exact
     /// stores that the running consumer and the client's readers share.
     #[cfg(test)]
-    pub(crate) fn retained_deps(&self) -> StateReaderDependencies<Wire<T>, B::Reader> {
-        self.reader.deps()
+    pub(crate) fn retained_deps(&self) -> Option<StateReaderDependencies<Wire<T>, B::Reader>> {
+        self.reader.get().map(StateReaderClient::deps)
     }
 
     /// Composes a standalone [`StateReader`] over this client's one shared
@@ -211,7 +237,7 @@ where
     ///
     /// Returns [`HighLevelClientError::StateReader`] when the descriptor is
     /// rejected.
-    pub fn state<D>(
+    pub async fn state<D>(
         &self,
         subsystem: SubsystemName,
         descriptor: D,
@@ -220,8 +246,8 @@ where
         D: StateDescriptor,
         T::Payload: Clone,
     {
-        self.reader
-            .clone()
+        self.reader()
+            .await?
             .state(subsystem, descriptor)
             .map_err(HighLevelClientError::StateReader)
     }
@@ -401,12 +427,26 @@ where
     {
         let mut guard = self.consumer.lock().await;
 
-        let config = match &*guard {
-            ConsumerState::Configured { config } => config.clone(),
-            ConsumerState::Running { .. } => return Err(HighLevelClientError::AlreadySubscribed),
+        let config = match take(&mut *guard) {
+            ConsumerState::Unconfigured => return Err(HighLevelClientError::UnconfiguredConsumer),
+            ConsumerState::ConfigurationFailed(error) => {
+                return Err(HighLevelClientError::ConsumerConfiguration(error));
+            }
+            ConsumerState::Configured { config } => config,
+            running @ ConsumerState::Running { .. } => {
+                *guard = running;
+                return Err(HighLevelClientError::AlreadySubscribed);
+            }
         };
 
-        let shared = self.reader.deps();
+        let shared = match self.reader().await {
+            Ok(reader) => reader.deps(),
+            Err(error) => {
+                *guard = ConsumerState::Configured { config };
+                return Err(error);
+            }
+        };
+
         let (built, config) = if let Some(subsystem) = &self.subsystem {
             Self::build_responding_consumer(
                 config,
@@ -434,6 +474,7 @@ where
             Err(error) => {
                 // Restore the configured state so a transient build failure
                 // stays retryable.
+                *guard = ConsumerState::Configured { config };
                 return Err(error);
             }
         };
@@ -454,24 +495,26 @@ where
     /// Returns a `HighLevelClientError` if the consumer is not currently
     /// subscribed.
     pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError<WireError<T>>> {
-        let mut guard = self.consumer.lock().await;
-        let config = match &*guard {
-            ConsumerState::Configured { .. } => {
-                return Err(HighLevelClientError::NotSubscribed);
-            }
-            ConsumerState::Running { config, .. } => config.clone(),
-        };
-        let consumer = match replace(&mut *guard, ConsumerState::Configured { config }) {
-            ConsumerState::Running { consumer, .. } => consumer,
-            ConsumerState::Configured { .. } => {
-                return Err(HighLevelClientError::NotSubscribed);
+        let consumer = {
+            let mut guard = self.consumer.lock().await;
+            match take(&mut *guard) {
+                state @ (ConsumerState::Unconfigured
+                | ConsumerState::ConfigurationFailed(_)
+                | ConsumerState::Configured { .. }) => {
+                    *guard = state;
+                    return Err(HighLevelClientError::NotSubscribed);
+                }
+                ConsumerState::Running {
+                    consumer, config, ..
+                } => {
+                    *guard = ConsumerState::Configured { config };
+                    consumer
+                }
             }
         };
 
         info!("shutting down consumer");
-        let stopped = consumer.shutdown().await;
-        drop(guard);
-        stopped?;
+        consumer.shutdown().await?;
         Ok(())
     }
 

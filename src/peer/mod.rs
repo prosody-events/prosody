@@ -12,6 +12,7 @@ mod backend;
 mod router;
 pub(crate) mod runtime;
 
+#[cfg(test)]
 pub(crate) use backend::PeerBackend;
 
 pub use crate::requester::{Outcome, ProsodyRequester, RequestError, ResponseFailure};

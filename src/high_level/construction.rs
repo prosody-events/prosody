@@ -11,9 +11,8 @@ use crate::high_level::topics::missing_topics;
 use crate::peer::Router;
 use crate::producer::{ProducerConfigurationBuilder, ProsodyProducer};
 use crate::propagator::new_propagator;
-use crate::state_reader::StateReaderClient;
 use crate::telemetry::{Telemetry, spawn_telemetry_emitter};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 async fn new_with_backend<T, B>(
     backend: B,
@@ -59,14 +58,17 @@ where
         producer_config.mock,
     )?;
 
-    let mode_config = super::config::ModeConfiguration::build(&ModeConfigurationBuildParams {
+    let consumer_state = ConsumerState::build(&ModeConfigurationBuildParams {
         mode,
         consumer_builders: &consumer_builders,
-    })
-    .map_err(HighLevelClientError::ConsumerConfiguration)?;
-    let reader_config = super::deps::ReaderConfiguration::from_mode(&mode_config);
-    let consumer_state = ConsumerState::Configured {
-        config: mode_config,
+    });
+    let reader_config = match &consumer_state {
+        ConsumerState::Configured { config } => {
+            Some(super::deps::ReaderConfiguration::from_mode(config))
+        }
+        ConsumerState::Unconfigured
+        | ConsumerState::ConfigurationFailed(_)
+        | ConsumerState::Running { .. } => None,
     };
     if !producer_config.mock
         && let ConsumerState::Configured { config, .. } = &consumer_state
@@ -78,18 +80,16 @@ where
     }
 
     let peer = &consumer_builders.peer;
-    let reader = backend
-        .build_reader(&reader_config)
-        .await
-        .map_err(HighLevelClientError::StateReader)?;
-    let router = backend.build_router(peer, &reader).await?;
+    let router = backend.build_router(peer).await?;
     let requester = router.producer().requester(producer.clone());
 
     Ok(HighLevelClient {
         producer,
         producer_config,
         consumer: Mutex::new(consumer_state),
-        reader: StateReaderClient::new(reader),
+        reader: OnceCell::new(),
+        reader_config,
+        backend,
         requester,
         subsystem: consumer_builders.keyed_state.subsystem.clone(),
         router,
