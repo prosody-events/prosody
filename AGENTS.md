@@ -80,11 +80,10 @@ aspirations — perform each one; do not merely agree with it:
   names its removal path; self-draining maps (removed on settle/fire) are
   fine but still need the drain named.
 
-**Allocation and layout (tiger style / data-oriented — https://tigerstyle.dev/):**
+**Allocation (tiger style / data-oriented — https://tigerstyle.dev/):**
 
-Tiger style and data-oriented design agree on two things: minimize allocation,
-and lay data out for the way the machine reads it. Never *pessimize* a path
-whose size you know.
+Tiger style and data-oriented design agree: minimize allocation, and never
+*pessimize* a path whose size you know.
 
 - **No hot-path allocation that isn't upfront and bounded.** A steady-state
   path (per message, per timer fire, per event, per cell) must not allocate a
@@ -113,13 +112,6 @@ whose size you know.
   ever seen") on the hot path. If a reusable scratch buffer is truly
   unavoidable, allocate it once at construction with a fixed bound and reuse it
   — never amortize-grow it per call.
-- **Lay data out for the access pattern.** A hot path that scans one or two
-  fields across many entries must find those fields contiguously. Reach the
-  full record only for the entry the scan selects. An array of `Option<Arc<T>>`
-  turns a two-word decision into one heap dereference per entry, and thrashes
-  the CPU cache. Memory bandwidth is the bottleneck today, so the scan decides
-  the layout, not the record. Don't thrash the cache. False sharing counts:
-  keep atomics that different threads write off one line.
 - **Simplicity is not sacrificed for this.** The design principles above still
   win: prefer the reading that's clearest. Zero-alloc and simple are usually
   *not* in conflict — the fn-item fix above removed an allocation *and* a line.
