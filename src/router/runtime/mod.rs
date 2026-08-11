@@ -3,10 +3,9 @@
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::requester::registry::PendingRegistry;
 use crate::response::sender::Then;
+use crate::router::cache_config::{PeerCacheConfiguration, PeerCacheConfigurationError};
 use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::{PeerDirectory, PeerRegistration, RegistrationTtl};
-use crate::router::fleet::DestinationFleet;
-use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
@@ -130,7 +129,7 @@ pub(crate) struct PeerInputs<'a, D> {
     /// Heartbeats owned by this peer runtime.
     pub(crate) heartbeats: HeartbeatRegistry,
     pub(crate) router: &'a RouterConfiguration,
-    pub(crate) fleet: FleetConfiguration,
+    pub(crate) cache: PeerCacheConfiguration,
 }
 
 impl<D: PeerDirectory> PreparedPeerRuntime<D> {
@@ -146,12 +145,15 @@ impl<D: PeerDirectory> PreparedPeerRuntime<D> {
     /// # Errors
     ///
     /// Returns [`PeerRuntimeError`] when the configuration, discovery, the
-    /// registry, the fleet, or the listener refuses to start.
+    /// registry, the peer caches, or the listener refuses to start.
     pub(crate) async fn start(inputs: PeerInputs<'_, D>) -> Result<Self, PeerRuntimeError> {
         inputs.router.validate()?;
-        let fleet = Arc::new(DestinationFleet::new(inputs.fleet)?);
+        inputs
+            .cache
+            .validate()
+            .map_err(PeerCacheConfigurationError::from)?;
         let pending = PendingRegistry::new();
-        let transport = Arc::new(GrpcSender::new(&fleet));
+        let transport = Arc::new(GrpcSender::new(inputs.cache));
         let directory = inputs.directory;
         // The blocking pool owns this wait; a runtime thread must not. The
         // Machine-name lookup is private to `discovery`, so this file reaches
@@ -165,14 +167,9 @@ impl<D: PeerDirectory> PreparedPeerRuntime<D> {
         };
         let registration =
             registration(PeerId::new(), &inputs.listener, discovered, inputs.router)?;
-        let addresses = AddressResolver::new(inputs.fleet.peer_capacity, directory.clone());
+        let addresses = AddressResolver::new(inputs.cache.peer_capacity, directory.clone());
         let local = LocalTarget::new(registration.peer, Arc::clone(&pending));
-        let network = NetworkRoute::new(
-            addresses.clone(),
-            Arc::clone(&fleet),
-            transport,
-            registration.network.clone(),
-        );
+        let network = NetworkRoute::new(addresses.clone(), transport, registration.network.clone());
         let (stop_listener, stopped) = oneshot::channel();
         let listener = match serve(
             inputs.listener,

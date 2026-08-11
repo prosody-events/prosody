@@ -3,8 +3,8 @@
 use super::codec::ClientFrameCodec;
 use super::inject::MetadataInjector;
 use crate::propagator::new_propagator;
+use crate::router::cache_config::PeerCacheConfiguration;
 use crate::router::directory::Endpoint;
-use crate::router::fleet::DestinationFleet;
 use crate::router::{Framed, ResponseSender, SendFailure};
 use ahash::RandomState;
 use opentelemetry::Context;
@@ -40,24 +40,21 @@ type Channels = Cache<Uri, Channel, UnitWeighter, RandomState>;
 ///
 /// # What bounds the memory
 ///
-/// The cache holds as many channels as the fleet it was built from holds
-/// destinations. `quick_cache` evicts to stay inside that count, and eviction
+/// The cache holds at most the configured number of channels. `quick_cache`
+/// evicts to stay inside that count, and eviction
 /// is the removal path: nothing else holds a channel, so an evicted one closes
 /// its connections when its last clone drops. The key is the published address
-/// rather than the peer, so a peer reached on both of its endpoints — while a
-/// response probes one and falls back to the other — occupies two entries, as
-/// does a peer that restarts on another port. Neither grows the cache: the
-/// count is the bound, and the entry that stops being dialled goes cold and is
-/// evicted first.
+/// because a peer can publish a new address. The old entry goes cold and is
+/// evicted.
 pub(crate) struct GrpcSender {
     channels: Arc<Channels>,
     propagator: TextMapCompositePropagator,
 }
 
 impl GrpcSender {
-    /// A sender for `fleet`.
-    pub(crate) fn new(fleet: &DestinationFleet) -> Self {
-        let capacity = fleet.config().peer_capacity;
+    /// A sender with the configured cache bound.
+    pub(crate) fn new(config: PeerCacheConfiguration) -> Self {
+        let capacity = config.peer_capacity;
         Self {
             channels: Arc::new(Cache::with(
                 capacity,

@@ -1,11 +1,13 @@
 //! What an operator sets to join the peer fleet and how the runtime uses it.
 
+use crate::router::cache_config::PeerCacheConfiguration;
 use crate::router::directory::{RegistrationTtl, RegistrationTtlError};
-use crate::router::fleet::config::FleetConfiguration;
 use crate::router::runtime::RouterConfiguration;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback, from_option_env};
-use derive_builder::Builder;
-use std::net::{Ipv4Addr, SocketAddr};
+use derive_builder::{Builder, UninitializedFieldError};
+use std::env::{VarError, var};
+use std::net::AddrParseError;
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
 use thiserror::Error;
 use tonic::transport::Endpoint;
@@ -19,12 +21,14 @@ use validator::{Validate, ValidationError, ValidationErrors};
 /// Validation delegates to the components that consume these values. This
 /// keeps each rule in one place and exposes the standard [`Validate`] API.
 #[derive(Builder, Clone, Debug, Validate)]
-#[builder(setter(into, strip_option), default)]
+#[builder(
+    setter(into, strip_option),
+    build_fn(error = "PeerConfigurationBuilderError")
+)]
 #[validate(schema(function = "validate_peer"))]
 pub struct PeerConfiguration {
     /// The address for the peer listener.
-    #[builder(default = "from_env_with_fallback(\"PROSODY_PEER_BIND_ADDRESS\", \
-                         PeerConfiguration::default().bind_address)?")]
+    #[builder(default = "default_bind_address()?")]
     pub bind_address: SocketAddr,
     /// The gRPC connect URI that peers on another network use.
     #[builder(default = "from_option_env(\"PROSODY_PEER_ADVERTISED_CONNECT\")?")]
@@ -34,12 +38,12 @@ pub struct PeerConfiguration {
     pub network_name: Option<String>,
     /// The maximum number of peers held in each peer-keyed cache.
     #[builder(default = "from_env_with_fallback(\"PROSODY_PEER_CACHE_CAPACITY\", \
-                         PeerConfiguration::default().peer_cache_capacity)?")]
+                         PeerCacheConfiguration::default().peer_capacity)?")]
     pub peer_cache_capacity: usize,
     /// The duration of each directory registration lease.
     #[builder(
         default = "from_duration_env_with_fallback(\"PROSODY_PEER_REGISTRATION_TTL\", \
-                   PeerConfiguration::default().registration_ttl)?"
+                   RegistrationTtl::DEFAULT.duration())?"
     )]
     pub registration_ttl: Duration,
 }
@@ -48,21 +52,43 @@ pub struct PeerConfiguration {
 pub(crate) struct PeerParts {
     pub(crate) bind: SocketAddr,
     pub(crate) router: RouterConfiguration,
-    pub(crate) fleet: FleetConfiguration,
+    pub(crate) cache: PeerCacheConfiguration,
     pub(crate) lease: RegistrationTtl,
 }
 
-impl Default for PeerConfiguration {
-    fn default() -> Self {
-        let fleet = FleetConfiguration::default();
-        Self {
-            bind_address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9099)),
-            advertised_connect: None,
-            network_name: None,
-            peer_cache_capacity: fleet.peer_capacity,
-            registration_ttl: RegistrationTtl::DEFAULT.duration(),
-        }
+fn default_bind_address() -> Result<SocketAddr, PeerConfigurationBuilderError> {
+    match var("PROSODY_PEER_BIND_ADDRESS") {
+        Ok(value) => Ok(value.parse()?),
+        Err(VarError::NotPresent) => default_socket_address(),
+        Err(error) => Err(PeerConfigurationBuilderError::Environment(error)),
     }
+}
+
+fn default_socket_address() -> Result<SocketAddr, PeerConfigurationBuilderError> {
+    let interface = netdev::get_interfaces()
+        .into_iter()
+        .find(|interface| interface.default)
+        .ok_or(PeerConfigurationBuilderError::NoDefaultInterface)?;
+    if let Some(network) = interface.ipv4.iter().find(|network| {
+        let address = network.addr();
+        !address.is_link_local() && !address.is_loopback() && !address.is_unspecified()
+    }) {
+        return Ok(SocketAddr::new(IpAddr::V4(network.addr()), 9099));
+    }
+    if let Some(network) = interface.ipv6.iter().find(|network| {
+        let address = network.addr();
+        !address.is_unicast_link_local() && !address.is_loopback() && !address.is_unspecified()
+    }) {
+        return Ok(SocketAddr::new(IpAddr::V6(network.addr()), 9099));
+    }
+    if let Some(network) = interface.ipv4.first() {
+        return Ok(SocketAddr::new(IpAddr::V4(network.addr()), 9099));
+    }
+    interface
+        .ipv6
+        .first()
+        .map(|network| SocketAddrV6::new(network.addr(), 9099, 0, interface.index).into())
+        .ok_or(PeerConfigurationBuilderError::NoInterfaceAddress)
 }
 
 impl PeerConfiguration {
@@ -90,7 +116,7 @@ impl PeerConfiguration {
                 advertised: self.advertised_connect.clone(),
                 network: self.network_name.clone(),
             },
-            fleet: FleetConfiguration {
+            cache: PeerCacheConfiguration {
                 peer_capacity: self.peer_cache_capacity,
             },
             lease,
@@ -99,6 +125,9 @@ impl PeerConfiguration {
 }
 
 fn validate_peer(config: &PeerConfiguration) -> Result<(), ValidationError> {
+    if config.bind_address.ip().is_unspecified() {
+        return Err(ValidationError::new("unspecified_bind_address"));
+    }
     let parts = config
         .unvalidated_parts()
         .map_err(|_| ValidationError::new("peer_parts"))?;
@@ -107,7 +136,7 @@ fn validate_peer(config: &PeerConfiguration) -> Result<(), ValidationError> {
         .validate()
         .map_err(|_| ValidationError::new("router"))?;
     parts
-        .fleet
+        .cache
         .validate()
         .map_err(|_| ValidationError::new("fleet"))?;
     Ok(())
@@ -122,4 +151,36 @@ pub(crate) enum PeerConfigurationError {
     /// The registration lease is outside its supported range.
     #[error("invalid registration lease: {0:#}")]
     Lease(#[from] RegistrationTtlError),
+}
+
+/// Why the peer configuration builder cannot build a configuration.
+#[derive(Debug, Error)]
+pub enum PeerConfigurationBuilderError {
+    /// A required field has no value.
+    #[error(transparent)]
+    Uninitialized(#[from] UninitializedFieldError),
+    /// The configured bind address is not a socket address.
+    #[error("PROSODY_PEER_BIND_ADDRESS is not a socket address: {0}")]
+    InvalidBindAddress(#[from] AddrParseError),
+    /// The operating system did not identify a default interface.
+    #[error("the operating system did not identify a default network interface")]
+    NoDefaultInterface,
+    /// The default interface has no address.
+    #[error("the default network interface has no address")]
+    NoInterfaceAddress,
+    /// The bind address environment variable is not valid Unicode.
+    #[error("PROSODY_PEER_BIND_ADDRESS cannot be read: {0}")]
+    Environment(VarError),
+    /// An existing environment parser rejected a configured value.
+    #[error("{0}")]
+    ConfiguredValue(String),
+    /// A configured value fails validation.
+    #[error(transparent)]
+    Validation(#[from] ValidationErrors),
+}
+
+impl From<String> for PeerConfigurationBuilderError {
+    fn from(error: String) -> Self {
+        Self::ConfiguredValue(error)
+    }
 }

@@ -5,7 +5,7 @@
 //! `prosody_test` keyspace uses one local Cassandra node. Therefore, a
 //! `LOCAL_ONE` read follows a `LOCAL_ONE` write in this suite.
 
-use super::support::{ArbRegistration, endpoint, label, peer_id};
+use super::support::{ArbRegistration, direct_address, fixed_direct_address, label, peer_id};
 use crate::router::directory::{Endpoint, NetworkId, PeerDirectory, PeerRegistration};
 use crate::router::{Host, MAX_LABEL_BYTES, PeerId};
 use color_eyre::Result;
@@ -257,7 +257,7 @@ pub(crate) async fn run_idempotent_deregister_case<D: PeerDirectory>(directory: 
 fn shape(g: &mut Gen, peer: PeerId) -> PeerRegistration {
     let ArbRegistration(mut registration) = ArbRegistration::arbitrary(g);
     registration.peer = peer;
-    registration.direct = endpoint(g);
+    registration.direct = direct_address(g);
     registration.hostname = Host::make(&label(g));
     registration
 }
@@ -267,7 +267,7 @@ fn labelled(peer: PeerId, over: Option<Label>) -> PeerRegistration {
     let text = |label: Label| "n".repeat(MAX_LABEL_BYTES + usize::from(over == Some(label)));
     PeerRegistration {
         peer,
-        direct: Endpoint::from_static("http://direct.test"),
+        direct: fixed_direct_address(),
         advertised: Some(Endpoint::from_static("http://advertised.test")),
         network: Some(NetworkId::make(&text(Label::Network))),
         hostname: Host::make(&text(Label::Hostname)),
@@ -287,7 +287,7 @@ fn same_answer(
 
 pub(crate) fn same_registration(left: &PeerRegistration, right: &PeerRegistration) -> bool {
     left.peer == right.peer
-        && left.direct.uri() == right.direct.uri()
+        && left.direct.socket() == right.direct.socket()
         && left.advertised.as_ref().map(Endpoint::uri)
             == right.advertised.as_ref().map(Endpoint::uri)
         && left.network == right.network

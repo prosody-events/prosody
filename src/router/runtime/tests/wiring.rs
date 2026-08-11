@@ -8,22 +8,25 @@
 //! runtime can hold either argument.
 
 use super::super::{PeerInputs, PeerRuntime, RouterConfiguration};
-use super::{ALPHA, LEASE, TIMEOUT, header, listener, start_runtime};
+use super::{ALPHA, LEASE, Process, TIMEOUT, header, listener, start_runtime};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::registry::PendingRegistry;
 use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::encode::stage_success;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameResult, ResponseSuccess};
+use crate::response::headers::RequestDeadline;
+use crate::response::sender::{deliver_response, stage as stage_response};
+use crate::router::cache_config::PeerCacheConfiguration;
 use crate::router::directory::cassandra::CassandraPeerDirectory;
 use crate::router::directory::tests::support::cassandra_directory;
-use crate::router::directory::{Endpoint, NetworkId, PeerDirectory, PeerRegistration};
-use crate::router::fleet::DestinationFleet;
-use crate::router::fleet::config::FleetConfiguration;
+use crate::router::directory::{
+    DirectAddress, Endpoint, NetworkId, PeerDirectory, PeerRegistration,
+};
 use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
-use crate::router::loopback::{HANG_GUARD, TestRouter, config as fleet_config};
+use crate::router::loopback::{HANG_GUARD, TestRouter, config as fleet_config, direct_address};
 use crate::router::relay::Relay;
 use crate::router::{Host, LocalTarget, NetworkRouter, PeerId, Preference, ResponseSender};
 use crate::subsystem::SubsystemName;
@@ -32,6 +35,7 @@ use crate::tracing::init_test_logging;
 use color_eyre::Report;
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
+use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::slice::from_ref;
 use std::sync::Arc;
@@ -47,6 +51,72 @@ const NETWORK: &str = "one-network";
 /// The payload the forwarded frame carries.
 const PAYLOAD: &[u8] = b"sent on by the listener the runtime served";
 
+/// Two peer runtimes resolve and contact each other through Cassandra.
+#[test]
+fn two_peer_clients_communicate_through_their_socket_addresses() -> Result<()> {
+    init_test_logging();
+    let hostname = whoami::hostname()?;
+    TEST_RUNTIME.block_on(async move {
+        let sender = Process::new().await?;
+        let receiver = Process::new().await?;
+        let outcome: Result<()> = async {
+            let published = sender
+                .shared
+                .directory
+                .read(receiver.shared.peer)
+                .await?
+                .ok_or_else(|| eyre!("the second peer did not publish its address"))?;
+            ensure!(
+                published.hostname.as_str() == hostname,
+                "the peer directory did not store the local hostname"
+            );
+            let listener: SocketAddr = receiver
+                .shared
+                .listener
+                .uri()
+                .authority()
+                .ok_or_else(|| eyre!("the second peer listener has no authority"))?
+                .as_str()
+                .parse()?;
+            ensure!(
+                published.direct.socket() == listener,
+                "the peer directory did not store the bound socket address"
+            );
+            let subsystem = SubsystemName::try_new(ALPHA)?;
+            let mut request =
+                TestRegistration::new(&receiver.shared.pending, from_ref(&subsystem), TIMEOUT)?;
+            let response = request.receiver()?;
+            let payload = PAYLOAD.to_vec();
+            let prepared = stage_response::<CountingCodec, Infallible>(
+                header(receiver.shared.peer, request.id(), ALPHA)?,
+                Ok(&payload),
+            );
+            deliver_response(
+                &sender.runtime.network,
+                prepared,
+                opentelemetry::Context::new(),
+                RequestDeadline::from_unix_micros(4_102_444_800_000_000),
+            )
+            .await;
+            let stored = response
+                .await
+                .map_err(|_| eyre!("the second peer did not receive the response"))?;
+            let FrameResult::Success(ResponseSuccess { payload, .. }) = stored.result else {
+                return Err(eyre!("the second peer received a handler error"));
+            };
+            ensure!(
+                payload.as_ref() == PAYLOAD,
+                "the second peer received other bytes"
+            );
+            Ok(())
+        }
+        .await;
+        sender.runtime.shutdown(|| async {}).await?;
+        receiver.runtime.shutdown(|| async {}).await?;
+        outcome
+    })
+}
+
 /// One more listener, answering for one more peer.
 struct Elsewhere {
     peer: PeerId,
@@ -58,11 +128,9 @@ struct Elsewhere {
 
 /// The label a process was configured with is the label its router routes by.
 ///
-/// A peer that published the same label is a neighbour, so its direct endpoint
-/// leads and its entry point is only the fallback. A router built without the
-/// label puts every neighbour behind its entry point instead, and nothing below
-/// the runtime can tell the two apart: the label reaches the router at one
-/// argument that no other suite passes.
+/// A peer that published the same label is a neighbour, so the router selects
+/// its direct endpoint. The label reaches the router at one argument that no
+/// other suite passes.
 #[test]
 fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> Result<()> {
     init_test_logging();
@@ -74,12 +142,12 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
             listener: listener().await?,
             heartbeats: HeartbeatRegistry::test(),
             router: &config,
-            fleet: FleetConfiguration::default(),
+            cache: PeerCacheConfiguration::default(),
         })
         .await?;
         let neighbour = PeerRegistration {
             peer: PeerId::new(),
-            direct: Endpoint::from_static("http://10.0.0.11:12001"),
+            direct: DirectAddress::new(SocketAddr::from(([10, 0, 0, 11], 12_001)))?,
             advertised: Some(Endpoint::from_static("http://gateway.example:12002")),
             network: Some(NetworkId::make(NETWORK)),
             hostname: Host::make("neighbour"),
@@ -92,15 +160,10 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
                 .route(neighbour.peer)
                 .await?
                 .ok_or_else(|| eyre!("a published neighbour must resolve"))?;
-            let walked: Vec<Preference> = route
-                .candidates(None)
-                .into_iter()
-                .flatten()
-                .map(|(preference, _)| preference)
-                .collect();
+            let (preference, _) = route.endpoint();
             ensure!(
-                walked == [Preference::Direct, Preference::Advertised],
-                "a neighbour's route is {walked:?}, not its direct endpoint before its entry point"
+                preference == Preference::Direct,
+                "a neighbour's route is {preference:?}, not its direct endpoint"
             );
             Ok(())
         }
@@ -145,7 +208,7 @@ impl Elsewhere {
         let registry = PendingRegistry::new();
         let bound = bind().await?;
         let address = local(bound.address())?;
-        let (unused, _deliveries) = TestRouter::new(fleet_config())?;
+        let (unused, _deliveries) = TestRouter::new()?;
         let (stop, stopped) = channel();
         let served = serve(
             bound,
@@ -183,7 +246,7 @@ async fn start_over(
     directory
         .register(&PeerRegistration {
             peer: elsewhere.peer,
-            direct: elsewhere.address.clone(),
+            direct: direct_address(&elsewhere.address)?,
             advertised: None,
             network: None,
             hostname: Host::make("elsewhere"),
@@ -197,7 +260,7 @@ async fn start_over(
         listener: bound,
         heartbeats: HeartbeatRegistry::test(),
         router: &config,
-        fleet: FleetConfiguration::default(),
+        cache: PeerCacheConfiguration::default(),
     })
     .await?;
     Ok((runtime, here))
@@ -212,8 +275,7 @@ async fn sent_on(elsewhere: &Elsewhere, here: &Endpoint) -> Result<()> {
     let subsystem = SubsystemName::try_new(ALPHA)?;
     let mut request = TestRegistration::new(&elsewhere.registry, from_ref(&subsystem), TIMEOUT)?;
     let receiver = request.receiver()?;
-    let fleet = DestinationFleet::new(fleet_config())?;
-    let sender = GrpcSender::new(&fleet);
+    let sender = GrpcSender::new(fleet_config());
     let addressed = header(elsewhere.peer, request.id(), ALPHA)?;
     let staged = stage_success::<CountingCodec>(&addressed, &PAYLOAD.to_vec())?;
     sender

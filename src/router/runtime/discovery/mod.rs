@@ -7,7 +7,7 @@
 //! here could call them on a runtime thread.
 
 use super::config::{RouterConfiguration, validate_label};
-use crate::router::directory::{Endpoint, NetworkId, PeerRegistration};
+use crate::router::directory::{DirectAddress, NetworkId, PeerRegistration};
 use crate::router::grpc::BoundListener;
 use crate::router::{Host, MAX_LABEL_BYTES, PeerId};
 use thiserror::Error;
@@ -41,9 +41,6 @@ pub(super) async fn discover() -> Result<DiscoveredHost, DiscoveryError> {
 }
 
 /// Builds the registration from the bound listener and discovered host.
-///
-/// The direct endpoint uses a specific bind address or the machine name.
-/// The advertised endpoint uses only configured values.
 pub(super) fn registration(
     peer: PeerId,
     listener: &BoundListener,
@@ -51,15 +48,9 @@ pub(super) fn registration(
     config: &RouterConfiguration,
 ) -> Result<PeerRegistration, DiscoveryError> {
     let DiscoveredHost { hostname } = discovered;
-    let bound = listener.address();
-    let authority = if bound.ip().is_unspecified() {
-        format!("{}:{}", hostname.as_str(), bound.port())
-    } else {
-        bound.to_string()
-    };
     Ok(PeerRegistration {
         peer,
-        direct: Endpoint::from_shared(format!("http://{authority}"))?,
+        direct: DirectAddress::new(listener.address())?,
         advertised: config.advertised.clone(),
         network: config.network.as_deref().map(NetworkId::make),
         hostname,
@@ -93,8 +84,6 @@ async fn join_discovery(
 /// Returns [`DiscoveryError`] when the machine name cannot be read or
 /// published.
 fn discover_host() -> Result<DiscoveredHost, DiscoveryError> {
-    // The machine name is published in its own right, so the lookup is paid
-    // once and reused for a wildcard listener.
     let machine = hostname()?;
     // One label rule for both sources. A name an operator may not configure is
     // not a name this machine may publish either.
@@ -115,7 +104,7 @@ pub(crate) enum DiscoveryError {
     Endpoint(#[from] TransportError),
 
     /// The machine's own name could not be read. Every registration publishes
-    /// it, so the lookup is not optional.
+    /// it, so startup cannot continue.
     #[error("the machine name could not be read: {0:#}")]
     Name(#[from] whoami::Error),
 

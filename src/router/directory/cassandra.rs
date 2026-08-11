@@ -1,12 +1,13 @@
 //! The Cassandra peer directory.
 
-use super::{Endpoint, NetworkId, PeerDirectory, PeerRegistration, RegistrationTtl};
+use super::{DirectAddress, Endpoint, NetworkId, PeerDirectory, PeerRegistration, RegistrationTtl};
 use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraStore, TABLE_PEER_DIRECTORY};
 use crate::cassandra_queries;
 use crate::router::{Host, PeerId, label_fits};
 use fixedstr::Flexstr;
 use scylla::statement::Consistency;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{instrument, warn};
 use uuid::Uuid;
@@ -18,14 +19,14 @@ cassandra_queries! {
     pub(crate) struct DirectoryQueries {
         /// Writes every column of one peer's row under one lease.
         register: (
-            "INSERT INTO $keyspace.{} (peer_id, direct_connect, advertised_connect, network, \
+            "INSERT INTO $keyspace.{} (peer_id, direct_socket_address, advertised_connect, network, \
              hostname) VALUES (?, ?, ?, ?, ?) USING TTL ?",
             TABLE_PEER_DIRECTORY
         ),
 
         /// Point-reads one peer's row.
         read: (
-            "SELECT direct_connect, advertised_connect, network, hostname \
+            "SELECT direct_socket_address, advertised_connect, network, hostname \
              FROM $keyspace.{} WHERE peer_id = ?",
             TABLE_PEER_DIRECTORY
         ),
@@ -115,7 +116,7 @@ impl PeerDirectory for CassandraPeerDirectory {
     /// Returns the driver's error when the write fails.
     #[instrument(level = "debug", skip_all, fields(peer = %registration.peer), err)]
     async fn register(&self, registration: &PeerRegistration) -> Result<(), CassandraStoreError> {
-        let direct_connect = registration.direct.uri().to_string();
+        let direct_socket_address = registration.direct.socket().to_string();
         let advertised_connect = registration
             .advertised
             .as_ref()
@@ -129,7 +130,7 @@ impl PeerDirectory for CassandraPeerDirectory {
                 &self.queries.register,
                 (
                     Uuid::from(registration.peer),
-                    direct_connect,
+                    direct_socket_address,
                     advertised_connect,
                     registration.network.as_ref().map(Flexstr::as_str),
                     registration.hostname.as_str(),
@@ -161,7 +162,7 @@ impl PeerDirectory for CassandraPeerDirectory {
             .maybe_first_row::<DirectoryColumns>()?;
         // Every column decodes as `Option`: a row can carry NULLs, and a
         // deserialization error would be Terminal where "absent" is the answer.
-        let Some((direct_connect, advertised_connect, network, hostname)) = row else {
+        let Some((direct_socket_address, advertised_connect, network, hostname)) = row else {
             return Ok(None);
         };
         // A label longer than a registration may publish makes the whole row
@@ -180,8 +181,19 @@ impl PeerDirectory for CassandraPeerDirectory {
             },
             None => None,
         };
-        let (true, Some(direct), Some(hostname)) = (bounded, endpoint(direct_connect), hostname)
+        let Some(Ok(socket)) = direct_socket_address.map(|address| address.parse::<SocketAddr>())
         else {
+            warn!(%peer, "directory row has an invalid direct socket address");
+            return Ok(None);
+        };
+        let direct = match DirectAddress::new(socket) {
+            Ok(direct) => direct,
+            Err(error) => {
+                warn!(%error, %peer, "directory row has an invalid direct socket address");
+                return Ok(None);
+            }
+        };
+        let (true, Some(hostname)) = (bounded, hostname) else {
             warn!(%peer, "directory row is not resolvable");
             return Ok(None);
         };
@@ -208,8 +220,4 @@ impl PeerDirectory for CassandraPeerDirectory {
             .execute_unpaged_discard(&self.queries.remove, (Uuid::from(registration.peer),))
             .await
     }
-}
-
-fn endpoint(connect: Option<String>) -> Option<Endpoint> {
-    connect.and_then(|connect| Endpoint::from_shared(connect).into_iter().next())
 }

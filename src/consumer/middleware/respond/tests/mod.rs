@@ -18,7 +18,7 @@ use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{EventHandler, Partition, Topic};
 use crate::response::RequestId;
 use crate::response::headers::{RequestDeadline, RequestTag};
-use crate::router::loopback::{Delivery, TestRouter, collect_deliveries, config, peer};
+use crate::router::loopback::{Delivery, TestRouter, collect_deliveries, peer};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
@@ -97,7 +97,7 @@ impl Codec for ResultProbeCodec {
 
 impl<C: Codec<Payload = ()>> Fixture<C> {
     fn new() -> Result<Self> {
-        let (router, deliveries) = TestRouter::new(config())?;
+        let (router, deliveries) = TestRouter::new()?;
         let responder = Responder::new_route(router.clone(), SubsystemName::try_new(SUBSYSTEM)?);
         Ok(Self {
             router,

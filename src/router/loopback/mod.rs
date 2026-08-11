@@ -3,9 +3,8 @@
 //!
 //! A helper any two suites both need lives here rather than in either of them.
 
-use crate::router::directory::{Endpoint, NetworkId, PeerRegistration};
-use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
-use crate::router::fleet::{Destination, DestinationFleet};
+use crate::router::cache_config::PeerCacheConfiguration;
+use crate::router::directory::{DirectAddress, Endpoint, PeerRegistration};
 use crate::router::{
     Framed, Host, NetworkRouter, PeerId, RelayHop, ResponseSender, Route, SendFailure, choose_route,
 };
@@ -15,6 +14,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io::Error as IoError;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -23,6 +23,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
 use tonic::codegen::http::{Uri, uri::InvalidUri};
+use tonic::transport::Error as TransportError;
 
 pub(crate) mod listener;
 
@@ -84,10 +85,8 @@ pub(crate) struct LoopbackSender {
 /// exists once rather than once per test tree.
 #[derive(Clone)]
 pub(crate) struct TestRouter {
-    fleet: Arc<DestinationFleet>,
     transport: Arc<LoopbackSender>,
     registrations: Arc<HashMap<PeerId, Arc<PeerRegistration>>>,
-    here: Option<NetworkId>,
 }
 
 /// What one attempt gets, once the script has been consulted.
@@ -133,25 +132,8 @@ impl LoopbackSender {
 }
 
 impl TestRouter {
-    /// Builds the fleet, transport, published addresses, and delivery stream.
-    pub(crate) fn new(
-        config: FleetConfiguration,
-    ) -> Result<(Self, UnboundedReceiver<Delivery>), TestRouterError> {
-        Self::build(config, None)
-    }
-
-    /// Builds a router whose peers publish direct and advertised endpoints.
-    pub(crate) fn dual_homed(
-        config: FleetConfiguration,
-    ) -> Result<(Self, UnboundedReceiver<Delivery>), TestRouterError> {
-        Self::build(config, Some(NetworkId::make("test")))
-    }
-
-    /// Builds the requested test endpoint shape.
-    fn build(
-        config: FleetConfiguration,
-        here: Option<NetworkId>,
-    ) -> Result<(Self, UnboundedReceiver<Delivery>), TestRouterError> {
+    /// Builds the transport, published addresses, and delivery stream.
+    pub(crate) fn new() -> Result<(Self, UnboundedReceiver<Delivery>), TestRouterError> {
         let (transport, deliveries) = LoopbackSender::new();
         let registrations = (0..PUBLISHED_PEERS)
             .map(|index| {
@@ -159,23 +141,18 @@ impl TestRouter {
                     peer(index),
                     Arc::new(PeerRegistration {
                         peer: peer(index),
-                        direct: Endpoint::from(direct_uri(index)?),
-                        advertised: here
-                            .as_ref()
-                            .map(|_| advertised_uri(index).map(Endpoint::from))
-                            .transpose()?,
-                        network: here.clone(),
+                        direct: DirectAddress::new(direct_socket(index))?,
+                        advertised: None,
+                        network: None,
                         hostname: Host::make("test"),
                     }),
                 ))
             })
-            .collect::<Result<_, InvalidUri>>()?;
+            .collect::<Result<_, TestRouterError>>()?;
         Ok((
             Self {
-                fleet: Arc::new(DestinationFleet::new(config)?),
                 transport: Arc::new(transport),
                 registrations: Arc::new(registrations),
-                here,
             },
             deliveries,
         ))
@@ -186,25 +163,9 @@ impl TestRouter {
         self.transport.script(direct_uri(index)?, script);
         Ok(())
     }
-
-    /// Sets what the destination for `index` answers on its advertised
-    /// endpoint. Scripting both is what makes a route whose every candidate
-    /// fails reachable.
-    pub(crate) fn script_advertised(
-        &self,
-        index: u8,
-        script: Script,
-    ) -> Result<(), TestRouterError> {
-        self.transport.script(advertised_uri(index)?, script);
-        Ok(())
-    }
 }
 
 impl NetworkRouter for TestRouter {
-    fn destination(&self, peer: PeerId) -> Arc<Destination> {
-        self.fleet.destination(peer)
-    }
-
     fn route(
         &self,
         peer: PeerId,
@@ -212,7 +173,7 @@ impl NetworkRouter for TestRouter {
         let route = self
             .registrations
             .get(&peer)
-            .and_then(|registration| choose_route(self.here.as_ref(), Arc::clone(registration)));
+            .and_then(|registration| choose_route(None, registration));
         async move { Ok(route) }
     }
 }
@@ -228,7 +189,7 @@ impl RelayHop for TestRouter {
         let direct = self
             .registrations
             .get(&peer)
-            .map(|registration| registration.direct.clone());
+            .map(|registration| registration.direct.endpoint().clone());
         async move { Ok(direct) }
     }
 
@@ -270,14 +231,26 @@ impl ResponseSender for LoopbackSender {
 }
 
 /// A registration publishing `direct` and nothing else.
-pub(crate) fn registration(direct: Endpoint) -> PeerRegistration {
-    PeerRegistration {
+pub(crate) fn registration(direct: &Endpoint) -> color_eyre::Result<PeerRegistration> {
+    Ok(PeerRegistration {
         peer: PeerId::new(),
-        direct,
+        direct: direct_address(direct)?,
         advertised: None,
         network: None,
         hostname: Host::make("test-peer"),
-    }
+    })
+}
+
+/// Converts a numeric test endpoint into a direct address.
+pub(crate) fn direct_address(direct: &Endpoint) -> color_eyre::Result<DirectAddress> {
+    Ok(DirectAddress::new(
+        direct
+            .uri()
+            .authority()
+            .ok_or_else(|| color_eyre::eyre::eyre!("endpoint has no authority"))?
+            .as_str()
+            .parse()?,
+    )?)
 }
 
 /// A peer id from one repeated byte.
@@ -287,12 +260,11 @@ pub(crate) fn peer(index: u8) -> PeerId {
 
 /// The direct URI that belongs to `index`.
 pub(crate) fn direct_uri(index: u8) -> Result<Uri, InvalidUri> {
-    format!("http://direct-{index}.test").parse()
+    format!("http://{}", direct_socket(index)).parse()
 }
 
-/// The advertised URI that belongs to `index`.
-pub(crate) fn advertised_uri(index: u8) -> Result<Uri, InvalidUri> {
-    format!("http://advertised-{index}.test").parse()
+fn direct_socket(index: u8) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 10_000 + u16::from(index)))
 }
 
 /// Builds a current-thread runtime with paused time and the whole driver set.
@@ -322,17 +294,17 @@ pub(crate) async fn collect_deliveries(
 }
 
 /// Builds the response delivery configuration.
-pub(crate) fn config() -> FleetConfiguration {
-    FleetConfiguration::default()
+pub(crate) fn config() -> PeerCacheConfiguration {
+    PeerCacheConfiguration::default()
 }
 
 /// What can stop shared router test scaffolding from starting.
 #[derive(Debug, Error)]
 pub(crate) enum TestRouterError {
-    /// The fleet configuration is invalid.
-    #[error(transparent)]
-    Fleet(#[from] FleetConfigurationError),
     /// A test endpoint is not a valid Tonic endpoint.
     #[error(transparent)]
     Endpoint(#[from] InvalidUri),
+    /// A direct socket address cannot form a transport endpoint.
+    #[error(transparent)]
+    Transport(#[from] TransportError),
 }

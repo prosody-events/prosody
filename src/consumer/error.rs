@@ -126,9 +126,9 @@ pub enum PeerInitError {
         /// The rendered source chain.
         message: String,
     },
-    /// The destination fleet could not start.
-    #[error("peer destination fleet failed: {message}")]
-    Fleet {
+    /// The peer cache bound is invalid.
+    #[error("peer cache configuration is invalid: {message}")]
+    Cache {
         /// The rendered source chain.
         message: String,
     },
@@ -157,7 +157,7 @@ impl From<PeerRuntimeError> for PeerInitError {
             PeerRuntimeError::Discovery(error) => Self::Discovery {
                 message: format!("{error:#}"),
             },
-            PeerRuntimeError::Fleet(error) => Self::Fleet {
+            PeerRuntimeError::Cache(error) => Self::Cache {
                 message: format!("{error:#}"),
             },
             PeerRuntimeError::Listener(error) => Self::Listener {

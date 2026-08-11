@@ -1,6 +1,6 @@
 //! Statically composed response routes.
 
-use super::metrics::{DropReason, Stage, record_fallback};
+use super::metrics::{DropReason, Stage};
 use crate::codec::Codec;
 use crate::error::ClassifyError;
 use crate::otel::carry_parent;
@@ -37,9 +37,9 @@ pub(crate) struct Then<A, B>(pub(crate) A, pub(crate) B);
 ///
 /// Every response ends as exactly one outcome. It moves one stage or one
 /// drop reason, one of this sender's two counters, and the `peer.disposition`
-/// attribute on its own span. A delivered job also records `peer.preference`
-/// and counts one fallback transition when its walk made one. Every count of a
-/// response's outcome sits in this one match. Thus, no counters can disagree.
+/// attribute on its own span. A delivered job also records `peer.preference`.
+/// Every count of a response's outcome sits in this one match. Thus, no
+/// counters can disagree.
 /// The `peer.response.send` span is opened here and covers the delivery alone.
 /// It is a child of the trace the job carries, so the listener's
 /// `peer.response.receive` — parented on the context this span's own injection
@@ -59,7 +59,6 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
         peer.subsystem = %header.subsystem,
         peer.disposition = Empty,
         peer.preference = Empty,
-        peer.fallback_from = Empty,
     );
     let context = carry_parent(&span, trace);
     let outcome = match prepared {
@@ -79,12 +78,8 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
                 Delivery::Local => {
                     span.record("peer.preference", "local");
                 }
-                Delivery::Remote { preference, from } => {
+                Delivery::Remote(preference) => {
                     span.record("peer.preference", preference.label());
-                    if let Some(from) = from {
-                        span.record("peer.fallback_from", from.label());
-                        record_fallback(from, preference);
-                    }
                 }
             }
             Stage::Delivered.record();
@@ -99,11 +94,8 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
 
 /// Resolves one response's route, frames it and delivers it.
 ///
-/// `Ok` carries the candidate that accepted the frame, and the candidate tried
-/// before it when the walk fell back; every other outcome names why the
-/// response was dropped. The transition travels out rather than being counted
-/// here, so the caller counts the whole outcome of one response in one
-/// place.
+/// `Ok` carries the route that accepted the frame. Every other outcome names
+/// why the response was dropped.
 async fn deliver_route<R: ResponseRoute>(
     router: &R,
     frame: Staged,
@@ -155,57 +147,16 @@ impl<R: NetworkRouter> ResponseRoute for R {
                 return Err(DropReason::LookupFailed);
             }
         };
-        let destination = self.destination(target);
-        let mut remembered = None;
-        let mut last_failure = None;
-        // The candidate that failed the turn before this one. Inside the loop it
-        // proves this is no longer the first candidate, and it is the `from` of a
-        // fallback.
-        let mut previous = None;
-        let preferred = destination.preferred();
-        let candidates = route.candidates(preferred);
-        let has_fallback = candidates[1].is_some();
-        for (preference, address) in candidates.into_iter().flatten() {
-            match self
-                .sender()
-                .deliver(address, &frame, deadline.expires_at(), context)
-                .await
-            {
-                Ok(()) => {
-                    destination.prefer(Some(preference));
-                    return Ok(RouteOutcome::Delivered(Delivery::Remote {
-                        preference,
-                        from: previous,
-                    }));
-                }
-                Err(failure) => {
-                    last_failure = Some((preference, failure));
-                    if !failure.is_wrong_endpoint() {
-                        // A failure that is not a wrong endpoint is a status the
-                        // path answered, so this endpoint is the one that reaches
-                        // the peer — refusal and all. Every other failure proves
-                        // nothing about which endpoint serves the peer, so it
-                        // leaves nothing remembered.
-                        remembered = Some(preference);
-                        break;
-                    }
-                    previous = Some(preference);
-                }
-            }
+        let (preference, address) = route.endpoint();
+        if let Err(failure) = self
+            .sender()
+            .deliver(address, &frame, deadline.expires_at(), context)
+            .await
+        {
+            warn!(%failure, peer = %target, preference = preference.label(), "response delivery failed");
+            return Err(DropReason::SendFailed);
         }
-        destination.prefer(remembered);
-        if let Some((preference, failure)) = last_failure {
-            // What the walk did, not what the route offered. The last turn sets
-            // `previous` as well, so a route of one candidate needs both terms.
-            warn!(
-                %failure,
-                peer = %target,
-                preference = preference.label(),
-                fell_back = has_fallback && previous.is_some(),
-                "response delivery failed"
-            );
-        }
-        Err(DropReason::SendFailed)
+        Ok(RouteOutcome::Delivered(Delivery::Remote(preference)))
     }
 }
 
@@ -227,11 +178,8 @@ impl<A: ResponseRoute, B: ResponseRoute> ResponseRoute for Then<A, B> {
 pub enum Delivery {
     /// The local registry accepted it without transport work.
     Local,
-    /// A remote endpoint accepted it, after an optional fallback.
-    Remote {
-        preference: Preference,
-        from: Option<Preference>,
-    },
+    /// A remote endpoint accepted it.
+    Remote(Preference),
 }
 
 /// Whether one route accepted a frame or left it for the next route.

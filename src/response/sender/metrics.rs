@@ -10,7 +10,6 @@
 //! Each instrument binds to whatever meter provider is global when it is first
 //! touched. Thus, install the process provider before the first response.
 
-use crate::router::Preference;
 use opentelemetry::KeyValue;
 use opentelemetry::global::meter;
 use opentelemetry::metrics::Counter;
@@ -30,18 +29,6 @@ static DROPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter("prosody")
         .u64_counter("prosody.response.dropped")
         .with_description("Responses the sender gave up on")
-        .with_unit("{response}")
-        .build()
-});
-
-/// Responses a route's next candidate answered after the one before it failed.
-/// Concurrent senders can count the same shared preference change once each.
-static FALLBACKS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    meter("prosody")
-        .u64_counter("prosody.response.fallback")
-        .with_description(
-            "Responses a route's next candidate answered after the one before it failed",
-        )
         .with_unit("{response}")
         .build()
 });
@@ -76,9 +63,7 @@ pub enum DropReason {
     UnresolvablePeer,
     /// The directory lookup itself failed.
     LookupFailed,
-    /// No endpoint of the route answered `Ok`, which does not prove that none
-    /// of them read the frame. A failure that is not a wrong endpoint also ends
-    /// the walk, so the candidate behind it can stay undialed.
+    /// The selected endpoint did not accept the response.
     SendFailed,
 }
 
@@ -113,32 +98,4 @@ impl DropReason {
             Self::SendFailed => "send_failed",
         }
     }
-}
-
-/// Counts one response the route's next candidate answered after the one before
-/// it failed.
-///
-/// A route offers a second candidate only where the dialer's network label and
-/// the peer's are equal. Each count therefore says the first candidate gave no
-/// proof that it serves the peer. That is not proof it never read the frame:
-/// the share it was given can simply have run out. A network label put on the
-/// wrong process is one cause. A dead direct endpoint, a peer that moved and a
-/// peer that answered `UNAVAILABLE` are others, so read this series as a
-/// question, not as a verdict.
-///
-/// It counts transitions, not responses, and a steady fault does not count once
-/// per response. The destination remembers the candidate that answered, so the
-/// responses behind the first one start there and count nothing. A further
-/// count needs that remembered candidate to fail too, or the destination to be
-/// evicted and the walk to start over. `from` and `to` are recorded together,
-/// so one series names the whole transition. A reader does not need to know
-/// which endpoints a route offers.
-pub(super) fn record_fallback(from: Preference, to: Preference) {
-    FALLBACKS.add(
-        1,
-        &[
-            KeyValue::new("from", from.label()),
-            KeyValue::new("to", to.label()),
-        ],
-    );
 }

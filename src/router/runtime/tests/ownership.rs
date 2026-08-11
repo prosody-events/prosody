@@ -12,6 +12,7 @@ use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameResult, ResponseSuccess};
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{ResponseRoute, Then, deliver_response, stage as stage_response};
+use crate::router::cache_config::PeerCacheConfiguration;
 use crate::router::directory::PeerDirectory;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::HANG_GUARD;
@@ -24,7 +25,6 @@ use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::Context;
 use std::convert::Infallible;
 use std::slice::from_ref;
-use std::sync::Arc;
 use tokio::time::Instant;
 
 /// The payload one delivered response carries.
@@ -42,7 +42,7 @@ fn the_listener_answers_only_for_the_peer_the_runtime_minted() -> Result<()> {
         let outcome: Result<()> = async {
             let awaited = [SubsystemName::try_new(ALPHA)?];
             let request = TestRegistration::new(&shared.pending, &awaited, TIMEOUT)?;
-            let transport = GrpcSender::new(&shared.fleet);
+            let transport = GrpcSender::new(PeerCacheConfiguration::default());
             let addressed_here = header(shared.peer, request.id(), ALPHA)?;
             let mine = stage_success::<CountingCodec>(&addressed_here, &PAYLOAD.to_vec())?;
             transport
@@ -111,10 +111,6 @@ async fn delivered_to_itself<D: PeerDirectory, R: ResponseRoute>(
     own: &R,
     shared: &Shared,
 ) -> Result<()> {
-    ensure!(
-        Arc::ptr_eq(&network.fleet, &shared.fleet),
-        "the runtime's router must reserve from the process's own fleet"
-    );
     ensure!(
         network
             .direct(shared.peer)

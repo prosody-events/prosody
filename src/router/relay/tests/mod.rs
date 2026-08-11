@@ -17,8 +17,8 @@ use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameHeader, FrameResult, ResponseFrame, ResponseSuccess};
 use crate::response::{FormatToken, RequestId};
+use crate::router::cache_config::PeerCacheConfiguration;
 use crate::router::directory::Endpoint;
-use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::BoundListener;
 use crate::router::grpc::generated::peer_service_server::PeerService as PeerServiceApi;
 use crate::router::grpc::service::PeerService;
@@ -85,10 +85,10 @@ pub(super) enum TargetRoute {
 }
 
 impl Process {
-    /// Builds one process over a fleet of `config`.
-    pub(super) fn new(config: FleetConfiguration) -> Result<Self> {
+    /// Builds one process.
+    pub(super) fn new() -> Result<Self> {
         let peer = peer(THIS);
-        let (router, deliveries) = TestRouter::new(config)?;
+        let (router, deliveries) = TestRouter::new()?;
         let registry = PendingRegistry::new();
         let service = PeerService::new(
             LocalTarget::new(peer, Arc::clone(&registry)),
@@ -148,9 +148,9 @@ impl Pair {
         let target_bound = bind().await?;
         let relay_address = endpoint(&relay_bound)?;
         let target_address = endpoint(&target_bound)?;
-        let relay = Live::serve(relay_bound, Some(target_address))?;
+        let relay = Live::serve(relay_bound, Some(&target_address))?;
         let seen = match route {
-            TargetRoute::Relay => Some(relay_address),
+            TargetRoute::Relay => Some(&relay_address),
             TargetRoute::Nowhere => None,
         };
         match Live::serve(target_bound, seen) {
@@ -172,11 +172,12 @@ impl Pair {
 
 impl Live {
     /// Serves `bound`, sending every frame it does not own on to `seen`.
-    fn serve(bound: BoundListener, seen: Option<Endpoint>) -> Result<Self> {
+    fn serve(bound: BoundListener, seen: Option<&Endpoint>) -> Result<Self> {
         let peer = PeerId::new();
         let address = endpoint(&bound)?;
         let registry = PendingRegistry::new();
-        let router = FixedRouter::new(FleetConfiguration::default(), seen.map(registration), None)?;
+        let registration = seen.map(registration).transpose()?;
+        let router = FixedRouter::new(PeerCacheConfiguration::default(), registration, None);
         let served = Served::start(
             bound,
             PeerService::new(

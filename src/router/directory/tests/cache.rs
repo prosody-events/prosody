@@ -1,7 +1,7 @@
-use super::support::{cassandra_directory, finish, registration, test_directory_holding, token};
+use super::support::{cassandra_directory, finish, registration, test_directory_holding};
 use crate::router::PeerId;
 use crate::router::directory::cache::AddressCache;
-use crate::router::directory::{Endpoint, PeerDirectory, PeerRegistration, RegistrationTtl};
+use crate::router::directory::{DirectAddress, PeerDirectory, PeerRegistration, RegistrationTtl};
 use crate::test_util::{TEST_RUNTIME, integration_test_count};
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
@@ -9,6 +9,7 @@ use color_eyre::eyre::eyre;
 use futures::future::join_all;
 use quanta::Clock;
 use quickcheck::{QuickCheck, TestResult};
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -141,7 +142,7 @@ async fn occupancy_holds<D: PeerDirectory>(
             "request {position}: a miss must read through once, not {issued} times"
         );
         assert_eq!(
-            resolved.direct.uri(),
+            resolved.direct.endpoint().uri(),
             uri,
             "request {position}: the cache served another peer's registration"
         );
@@ -164,7 +165,7 @@ async fn one_read_per_cold_burst<D: PeerDirectory>(
     for served in burst {
         let served = served?.ok_or_else(|| eyre!("a registered peer must resolve"))?;
         assert_eq!(
-            served.direct.uri(),
+            served.direct.endpoint().uri(),
             uri,
             "every caller in the burst must be served the peer it asked for"
         );
@@ -257,15 +258,18 @@ async fn resolve<D: PeerDirectory>(
         .await?)
 }
 
-/// Registers [`POOL`] peers with distinct URIs.
+/// Registers [`POOL`] peers with distinct socket addresses.
 async fn register_pool<D: PeerDirectory>(directory: &D) -> Result<Vec<(PeerId, Uri)>> {
     let mut peers = Vec::with_capacity(POOL);
-    for _ in 0..POOL {
+    for index in 0..POOL {
         let peer = PeerId::new();
-        let endpoint = Endpoint::from_shared(format!("http://pool-{}.test", token()))?;
-        let uri = endpoint.uri().clone();
+        let direct = DirectAddress::new(SocketAddr::from((
+            [127, 0, 0, 1],
+            10_000 + u16::try_from(index)?,
+        )))?;
+        let uri = direct.endpoint().uri().clone();
         let mut written = registration(peer);
-        written.direct = endpoint;
+        written.direct = direct;
         directory.register(&written).await?;
         peers.push((peer, uri));
     }

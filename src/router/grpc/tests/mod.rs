@@ -26,7 +26,6 @@ use crate::response::frame::FrameHeader;
 use crate::response::frame::encode::stage_success;
 use crate::response::frame::tests::CountingCodec;
 use crate::router::directory::Endpoint;
-use crate::router::fleet::DestinationFleet;
 use crate::router::loopback::listener::{FixedRouter, Served, bind_address, endpoint};
 use crate::router::loopback::{TestRouter, config as fleet_config, registration};
 use crate::router::relay::Relay;
@@ -88,7 +87,7 @@ impl Harness {
         let peer = PeerId::new();
         let bound = BoundListener::bind(address).await?;
         let address = endpoint(&bound)?;
-        let (relay_router, _relay_deliveries) = TestRouter::new(fleet_config())?;
+        let (relay_router, _relay_deliveries) = TestRouter::new()?;
         let served = Served::start(
             bound,
             PeerService::new(
@@ -99,7 +98,7 @@ impl Harness {
         Ok(Self {
             peer,
             registry: served_registry,
-            sender: GrpcSender::new(&fleet()?),
+            sender: GrpcSender::new(fleet_config()),
             address,
             served,
         })
@@ -134,7 +133,11 @@ impl Harness {
 
 /// A router that reaches `address` and nothing else.
 pub(super) fn reaching(address: &Endpoint) -> Result<FixedRouter> {
-    FixedRouter::new(fleet_config(), Some(registration(address.clone())), None)
+    Ok(FixedRouter::new(
+        fleet_config(),
+        Some(registration(address)?),
+        None,
+    ))
 }
 
 impl Framed for EmptyFrame {
@@ -143,11 +146,6 @@ impl Framed for EmptyFrame {
     }
 
     fn write<B: BufMut>(&self, _dst: &mut B) {}
-}
-
-/// Builds a destination fleet.
-pub(super) fn fleet() -> Result<DestinationFleet> {
-    Ok(DestinationFleet::new(fleet_config())?)
 }
 
 pub(super) fn registry() -> Arc<PendingRegistry> {

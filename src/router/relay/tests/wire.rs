@@ -9,10 +9,10 @@ use crate::response::frame::encode::{Staged, stage_success};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{deliver_response, stage as stage_response};
+use crate::router::cache_config::PeerCacheConfiguration;
 use crate::router::directory::{Endpoint, NetworkId, PeerRegistration};
-use crate::router::fleet::DestinationFleet;
-use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::client::GrpcSender;
+use crate::router::loopback::direct_address;
 use crate::router::loopback::listener::FixedRouter;
 use crate::router::{Host, NetworkRouter, PeerId, Preference, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
@@ -256,25 +256,23 @@ async fn crossing(pair: &Pair) -> Result<()> {
     let receiver = request.receiver()?;
     let elsewhere = PeerRegistration {
         peer: pair.target.peer,
-        direct: pair.target.address.clone(),
+        direct: direct_address(&pair.target.address)?,
         advertised: Some(pair.relay.address.clone()),
         network: Some(NetworkId::make(THERE)),
         hostname: Host::make("crossing"),
     };
     let router = FixedRouter::new(
-        FleetConfiguration::default(),
+        PeerCacheConfiguration::default(),
         Some(elsewhere),
         Some(NetworkId::make(HERE)),
-    )?;
+    );
     let route = router
         .route(pair.target.peer)
         .await?
         .ok_or_else(|| eyre!("a peer in another network must be reachable through its entry"))?;
-    let [first, second] = route.candidates(None);
+    let (preference, endpoint) = route.endpoint();
     ensure(
-        first.is_some_and(|(preference, endpoint)| {
-            preference == Preference::Advertised && endpoint.uri() == pair.relay.address.uri()
-        }) && second.is_none(),
+        preference == Preference::Advertised && endpoint.uri() == pair.relay.address.uri(),
         format!("the rules chose {route:?}, which is not the target's entry point alone"),
     )?;
 
@@ -313,8 +311,7 @@ async fn call_with_payload(
     granted: Duration,
     payload: &[u8],
 ) -> Result<Code> {
-    let fleet = DestinationFleet::new(FleetConfiguration::default())?;
-    let sender = GrpcSender::new(&fleet);
+    let sender = GrpcSender::new(PeerCacheConfiguration::default());
     let header = FrameHeader {
         target,
         request,

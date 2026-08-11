@@ -3,7 +3,7 @@
 use super::{BUDGET, Process, frame};
 use crate::response::ResponseDisposition;
 use crate::router::SendFailure;
-use crate::router::loopback::{Script, config, direct_uri, paused, peer};
+use crate::router::loopback::{Script, direct_uri, paused, peer};
 use color_eyre::Result;
 use std::time::Duration;
 
@@ -24,7 +24,7 @@ const SPENT: Duration = Duration::ZERO;
 fn a_failed_forward_is_never_answered_as_a_delivery() -> Result<()> {
     let runtime = paused()?;
     runtime.block_on(async {
-        let mut process = Process::new(config())?;
+        let mut process = Process::new()?;
         let mut request = process.expects()?;
         process.router.script(
             ELSEWHERE,
@@ -71,7 +71,7 @@ fn a_failed_forward_is_never_answered_as_a_delivery() -> Result<()> {
 fn a_frame_that_arrives_with_no_budget_reserves_nothing() -> Result<()> {
     let runtime = paused()?;
     runtime.block_on(async {
-        let mut process = Process::new(config())?;
+        let mut process = Process::new()?;
         let request = process.expects()?;
 
         let answered = process

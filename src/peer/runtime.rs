@@ -219,7 +219,7 @@ pub(crate) async fn prepare_network<D: PeerDirectory>(
         listener,
         heartbeats: heartbeat_registry(),
         router: &parts.router,
-        fleet: parts.fleet,
+        cache: parts.cache,
     })
     .await
     .map_err(PeerInitError::from)

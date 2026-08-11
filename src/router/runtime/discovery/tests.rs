@@ -37,7 +37,7 @@ fn prop_the_direct_endpoint_publishes_only_what_it_discovered(label: u8) -> Test
         let bound = listener().await?;
         let registration = discover_registration(PeerId::new(), &bound, discover_host()?, &config)?;
         ensure!(
-            registration.direct.uri() != advertised.uri(),
+            registration.direct.endpoint().uri() != advertised.uri(),
             "the direct endpoint published the configured entry point"
         );
         ensure!(

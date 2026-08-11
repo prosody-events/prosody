@@ -2,9 +2,8 @@
 //! how it is served and stopped, and the router a served process reaches its
 //! neighbours through.
 
+use crate::router::cache_config::PeerCacheConfiguration;
 use crate::router::directory::{Endpoint, NetworkId, PeerRegistration};
-use crate::router::fleet::config::FleetConfiguration;
-use crate::router::fleet::{Destination, DestinationFleet};
 use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
@@ -38,7 +37,6 @@ pub(crate) struct Served {
 /// production router does.
 #[derive(Clone)]
 pub(crate) struct FixedRouter {
-    fleet: Arc<DestinationFleet>,
     transport: Arc<GrpcSender>,
     registration: Option<Arc<PeerRegistration>>,
     here: Option<NetworkId>,
@@ -71,25 +69,19 @@ impl FixedRouter {
     /// A router over its own fleet and transport, resolving every peer to
     /// `registration` from a process labelled `here`.
     pub(crate) fn new(
-        config: FleetConfiguration,
+        config: PeerCacheConfiguration,
         registration: Option<PeerRegistration>,
         here: Option<NetworkId>,
-    ) -> Result<Self> {
-        let fleet = Arc::new(DestinationFleet::new(config)?);
-        Ok(Self {
-            transport: Arc::new(GrpcSender::new(&fleet)),
-            fleet,
+    ) -> Self {
+        Self {
+            transport: Arc::new(GrpcSender::new(config)),
             registration: registration.map(Arc::new),
             here,
-        })
+        }
     }
 }
 
 impl NetworkRouter for FixedRouter {
-    fn destination(&self, peer: PeerId) -> Arc<Destination> {
-        self.fleet.destination(peer)
-    }
-
     fn route(
         &self,
         _peer: PeerId,
@@ -97,7 +89,7 @@ impl NetworkRouter for FixedRouter {
         let route = self
             .registration
             .as_ref()
-            .and_then(|registration| choose_route(self.here.as_ref(), Arc::clone(registration)));
+            .and_then(|registration| choose_route(self.here.as_ref(), registration));
         async move { Ok(route) }
     }
 }
@@ -113,7 +105,7 @@ impl RelayHop for FixedRouter {
         let direct = self
             .registration
             .as_ref()
-            .map(|registration| registration.direct.clone());
+            .map(|registration| registration.direct.endpoint().clone());
         async move { Ok(direct) }
     }
 

@@ -138,6 +138,7 @@ impl PeerDirectory for RecordingDirectory {
         }
         let address = registration
             .direct
+            .endpoint()
             .uri()
             .authority()
             .ok_or(RecordingError)?

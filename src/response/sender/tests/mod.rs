@@ -8,9 +8,8 @@ use crate::response::frame::encode::Staged;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::DropReason;
-use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{
-    Delivery, Drained, Script, TestRouter, collect_deliveries, config, direct_uri, paused, peer,
+    Delivery, Drained, Script, TestRouter, collect_deliveries, direct_uri, paused, peer,
 };
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
@@ -25,7 +24,6 @@ use tokio::task::JoinHandle;
 use tonic::codegen::http::Uri;
 
 mod delivery;
-mod fallback;
 mod isolation;
 mod metrics;
 
@@ -86,17 +84,9 @@ impl ResponseRoute for ObservedRoute {
 }
 
 impl Harness {
-    /// A harness over a fleet built from `config`, where every peer publishes a
-    /// direct endpoint alone.
-    pub(super) fn new(config: FleetConfiguration) -> Result<Self> {
-        let (router, deliveries) = TestRouter::new(config)?;
-        Self::over(router, deliveries)
-    }
-
-    /// A harness whose peers publish both endpoints under a label the dialer
-    /// shares, so every route offers a fallback.
-    pub(super) fn dual_homed(config: FleetConfiguration) -> Result<Self> {
-        let (router, deliveries) = TestRouter::dual_homed(config)?;
+    /// A harness where every peer publishes a direct endpoint.
+    pub(super) fn new() -> Result<Self> {
+        let (router, deliveries) = TestRouter::new()?;
         Self::over(router, deliveries)
     }
 
@@ -118,12 +108,6 @@ impl Harness {
     /// Sets what the destination for `index` answers on its direct endpoint.
     pub(super) fn script(&self, index: u8, script: Script) -> Result<()> {
         Ok(self.router.script(index, script)?)
-    }
-
-    /// Sets what the destination for `index` answers on its advertised
-    /// endpoint.
-    pub(super) fn script_advertised(&self, index: u8, script: Script) -> Result<()> {
-        Ok(self.router.script_advertised(index, script)?)
     }
 
     /// Sends one response for `index`.

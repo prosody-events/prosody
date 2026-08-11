@@ -61,7 +61,7 @@ fn checksums_match_baseline() -> Result<()> {
         ),
         (
             "20260801_create_peer_directory.cql",
-            "7f758e30db95691ed0a91404d80eff115e4b35cbf9443760271f80133bd3e26f",
+            "d901330b8cca92e0d386a7c809d3c87cc594313d0fca939a225ffcefbb9d95c4",
         ),
     ]
     .into();

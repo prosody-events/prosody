@@ -18,10 +18,10 @@
 --          than tombstone noise.
 
 CREATE TABLE {{KEYSPACE}}.{{TABLE_PEER_DIRECTORY}} (
-    peer_id            uuid PRIMARY KEY,
-    direct_connect     text,
-    advertised_connect text,
-    network            text,
-    hostname           text
+    peer_id               uuid PRIMARY KEY,
+    direct_socket_address text,
+    advertised_connect    text,
+    network               text,
+    hostname              text
 ) WITH compaction  = { 'class': 'UnifiedCompactionStrategy', 'scaling_parameters': 'L10' }
   AND compression = { 'class': 'ZstdCompressor' };

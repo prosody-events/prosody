@@ -12,6 +12,8 @@ use crate::router::{Host, LABEL_CAPACITY, PeerId};
 use fixedstr::Flexstr;
 use std::error::Error;
 use std::future::Future;
+use std::net::SocketAddr;
+use tonic::transport::Error as TransportError;
 
 pub(crate) mod cache;
 pub(crate) mod cassandra;
@@ -33,13 +35,46 @@ pub(crate) use tonic::transport::Endpoint;
 /// or do not. Absent means "unknown", which never counts as a match.
 pub(crate) type NetworkId = Flexstr<LABEL_CAPACITY>;
 
+/// A peer's direct socket address.
+///
+/// Construction also builds the endpoint once. Response routing then adds no
+/// allocation for address conversion.
+#[derive(Clone, Debug)]
+pub(crate) struct DirectAddress {
+    socket: SocketAddr,
+    endpoint: Endpoint,
+}
+
+impl DirectAddress {
+    /// Builds a direct address and its reusable endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket address cannot form an endpoint.
+    pub(crate) fn new(socket: SocketAddr) -> Result<Self, TransportError> {
+        Ok(Self {
+            socket,
+            endpoint: Endpoint::from_shared(format!("http://{socket}"))?,
+        })
+    }
+
+    /// Returns the address stored in the peer directory.
+    pub(crate) const fn socket(&self) -> SocketAddr {
+        self.socket
+    }
+
+    /// Returns the endpoint that response routing uses.
+    pub(crate) const fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+}
+
 /// One live process, as the directory publishes it.
 #[derive(Clone, Debug)]
 pub(crate) struct PeerRegistration {
     pub(crate) peer: PeerId,
-    /// Where this process is reachable on its own network. The runtime derives
-    /// it from the bound listener. It is always present.
-    pub(crate) direct: Endpoint,
+    /// The socket address that this process bound and published.
+    pub(crate) direct: DirectAddress,
     /// An entry point that reaches this process from another network. Present
     /// only where an operator arranged one; absent means intra-network only.
     pub(crate) advertised: Option<Endpoint>,

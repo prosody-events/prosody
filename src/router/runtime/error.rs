@@ -1,7 +1,7 @@
 //! Peer runtime startup errors.
 
 use super::discovery::DiscoveryError;
-use crate::router::fleet::config::FleetConfigurationError;
+use crate::router::cache_config::PeerCacheConfigurationError;
 use crate::router::grpc::TransportError;
 use thiserror::Error;
 use validator::ValidationErrors;
@@ -22,9 +22,9 @@ pub(crate) enum PeerRuntimeError {
     #[error("this process could not read what only its machine knows: {0:#}")]
     Discovery(#[from] DiscoveryError),
 
-    /// The destination limits were invalid.
-    #[error("the destination fleet could not be built: {0:#}")]
-    Fleet(#[from] FleetConfigurationError),
+    /// The peer cache bound was invalid.
+    #[error("the peer cache configuration is invalid: {0:#}")]
+    Cache(#[from] PeerCacheConfigurationError),
 
     /// The bound peer listener could not start its service.
     #[error("the peer listener could not be served: {0:#}")]

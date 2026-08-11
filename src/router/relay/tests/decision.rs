@@ -2,7 +2,7 @@
 
 use super::{BUDGET, Process, THIS, frame};
 use crate::response::frame::decode::decode_frame;
-use crate::router::loopback::{config, direct_uri, paused, peer};
+use crate::router::loopback::{direct_uri, paused, peer};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use quickcheck::{Arbitrary, Gen, TestResult};
@@ -51,7 +51,7 @@ fn prop_a_frame_is_accepted_only_by_the_process_it_names(routed: Routed) -> Test
 
 /// Drives one case and holds it to the table.
 async fn play(routed: &Routed) -> Result<()> {
-    let mut process = Process::new(config())?;
+    let mut process = Process::new()?;
     let mut request = process.expects()?;
     let target = peer(routed.target);
     let relay = routed.relay.map(peer);

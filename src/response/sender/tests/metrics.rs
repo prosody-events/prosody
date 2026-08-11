@@ -10,29 +10,21 @@
 //! reads a metric: the instruments bind to whatever meter provider is global
 //! when they are first touched, and nextest gives each case its own process.
 
-use super::super::metrics::{DropReason, Stage, record_fallback};
+use super::super::metrics::{DropReason, Stage};
 use super::{Harness, PAYLOAD, attempts, deadline};
 use crate::codec::Codec;
 use crate::response::sender::{deliver_response, stage};
-use crate::router::loopback::{Script, UNPUBLISHED_PEER, config, paused, peer};
-use crate::router::{Preference, SendFailure};
+use crate::router::loopback::{UNPUBLISHED_PEER, paused, peer};
 use crate::test_util::{GlobalMetrics, assert_distinct_labels, label};
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
 use opentelemetry::Context;
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::io::Error;
 use strum::VariantArray;
 
 /// A peer every suite router publishes.
 const PUBLISHED: u8 = 0;
-
-/// The peer whose direct endpoint does not answer, so its responses fall back.
-const FALLS_BACK: u8 = PUBLISHED;
-
-/// The peer neither of whose endpoints answers.
-const SILENT: u8 = 1;
 
 #[derive(Default)]
 struct FailingCodec;
@@ -57,7 +49,7 @@ impl Codec for FailingCodec {
 fn a_codec_failure_records_the_encode_drop() -> Result<()> {
     let metrics = GlobalMetrics::install();
     paused()?.block_on(async {
-        let harness = Harness::new(config())?;
+        let harness = Harness::new()?;
         let payload = PAYLOAD.to_vec();
         let prepared = stage::<FailingCodec, Infallible>(harness.header.clone(), Ok(&payload));
         deliver_response(&harness.router, prepared, Context::current(), deadline()).await;
@@ -84,7 +76,7 @@ fn a_codec_failure_records_the_encode_drop() -> Result<()> {
 fn a_drop_names_its_reason_and_never_the_peer() -> Result<()> {
     let metrics = GlobalMetrics::install();
     let drained = paused()?.block_on(async {
-        let harness = Harness::new(config())?;
+        let harness = Harness::new()?;
         harness.send(PUBLISHED).await?;
         harness.send(UNPUBLISHED_PEER).await?;
         harness.drain().await
@@ -130,81 +122,7 @@ fn a_drop_names_its_reason_and_never_the_peer() -> Result<()> {
     Ok(())
 }
 
-/// A fallback counts the transition it made, and only when the next candidate
-/// answered.
-///
-/// Three responses drive the whole claim on one meter. The first falls back,
-/// and it is the one transition. The second reaches the same peer, which now
-/// remembers the endpoint that answered. It starts there and counts nothing, so
-/// a counter that moved once per delivery would read two. The third reaches a
-/// peer where nothing answers. Its walk leaves both candidates behind and still
-/// counts nothing, so a counter that moved once per candidate would read two as
-/// well.
-///
-/// The second response starts after the first response stores its preference.
-#[test]
-fn a_fallback_counts_the_transition_and_only_when_the_next_candidate_answers() -> Result<()> {
-    let metrics = GlobalMetrics::install();
-    let drained = paused()?.block_on(async {
-        let harness = Harness::dual_homed(config())?;
-        harness.script(FALLS_BACK, never_answers())?;
-        harness.script(SILENT, never_answers())?;
-        harness.script_advertised(SILENT, never_answers())?;
-        harness.send(FALLS_BACK).await?;
-        harness.send(FALLS_BACK).await?;
-        harness.send(SILENT).await?;
-        harness.drain().await
-    })?;
-    ensure!(
-        (drained.sent, drained.dropped) == (2, 1),
-        "two responses must be accepted and one must be dropped, not {} and {}",
-        drained.sent,
-        drained.dropped
-    );
-
-    ensure!(
-        metrics.points("prosody.response.fallback")?
-            == vec![(
-                BTreeMap::from([
-                    ("from".to_owned(), "direct".to_owned()),
-                    ("to".to_owned(), "advertised".to_owned()),
-                ]),
-                1,
-            )],
-        "only the answered direct-to-advertised transition must be counted: {:?}",
-        metrics.points("prosody.response.fallback")?
-    );
-    Ok(())
-}
-
-/// A transition is counted under the pair it is given, in that order.
-///
-/// The case above reaches the direct-to-advertised transition alone. A
-/// [`Script`] fails a fixed count of first attempts, so an endpoint that
-/// answers and then stops cannot be scripted, and the walk back to direct needs
-/// exactly that. A counter that named one fixed pair would therefore pass that
-/// case. This one records the other direction directly, so the labels are
-/// proved to be read rather than fixed.
-#[test]
-fn a_fallback_names_the_pair_it_is_given() -> Result<()> {
-    let metrics = GlobalMetrics::install();
-    record_fallback(Preference::Advertised, Preference::Direct);
-    ensure!(
-        metrics.points("prosody.response.fallback")?
-            == vec![(
-                BTreeMap::from([
-                    ("from".to_owned(), "advertised".to_owned()),
-                    ("to".to_owned(), "direct".to_owned()),
-                ]),
-                1,
-            )],
-        "the count must name the pair it was given: {:?}",
-        metrics.points("prosody.response.fallback")?
-    );
-    Ok(())
-}
-
-/// Every stage, every drop reason and every fallback endpoint counts under its
+/// Every stage and every drop reason count under its
 /// own label, so one outcome can never be read as another in a dashboard.
 ///
 /// Each enum is checked in its own namespace. They are different instruments
@@ -213,19 +131,5 @@ fn a_fallback_names_the_pair_it_is_given() -> Result<()> {
 #[test]
 fn every_outcome_has_a_distinct_lowercase_label() -> Result<()> {
     assert_distinct_labels(Stage::VARIANTS.iter().map(|stage| stage.label()))?;
-    assert_distinct_labels(
-        Preference::VARIANTS
-            .iter()
-            .map(|preference| preference.label()),
-    )?;
     assert_distinct_labels(DropReason::VARIANTS.iter().map(|reason| reason.label()))
-}
-
-/// An endpoint that says nothing at all, which is what a wrong network label
-/// reaches.
-const fn never_answers() -> Script {
-    Script::Fail {
-        failure: SendFailure::Unreachable,
-        times: usize::MAX,
-    }
 }

@@ -49,6 +49,7 @@ humantime = "2.3"
 internment = "0.8"
 intervallum = "1.4"
 itoa = "1"
+netdev = { version = "0.46", default-features = false, features = ["gateway"] }
 nohash-hasher = "0.2"
 opentelemetry = { version = "0.32", features = ["metrics"] }
 opentelemetry-otlp = { version = "0.32", features = [

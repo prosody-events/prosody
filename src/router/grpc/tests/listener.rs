@@ -2,9 +2,9 @@
 
 use super::{EmptyFrame, Harness};
 use crate::heartbeat::HeartbeatRegistry;
+use crate::router::cache_config::PeerCacheConfiguration;
 use crate::router::directory::tests::support::cassandra_directory;
 use crate::router::directory::{PeerDirectory, RegistrationTtl};
-use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::BoundListener;
 use crate::router::grpc::codec::ClientFrameCodec;
 use crate::router::loopback::listener::bind_address;
@@ -33,7 +33,7 @@ fn a_registration_publishes_the_bound_address() -> Result<()> {
             listener: bound,
             heartbeats: HeartbeatRegistry::test(),
             router: &router,
-            fleet: FleetConfiguration::default(),
+            cache: PeerCacheConfiguration::default(),
         })
         .await?;
         let outcome = async {
@@ -42,7 +42,7 @@ fn a_registration_publishes_the_bound_address() -> Result<()> {
                 .await?
                 .ok_or_else(|| eyre!("a started runtime must resolve"))?;
             ensure!(
-                published.direct.uri() == expected.uri(),
+                published.direct.endpoint().uri() == expected.uri(),
                 "the runtime published another address"
             );
             Ok(())

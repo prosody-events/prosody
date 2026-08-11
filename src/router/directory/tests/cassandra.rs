@@ -74,7 +74,7 @@ fn registration_cells_carry_a_ttl_and_expire() -> Result<()> {
         let leases = session
             .query_unpaged(
                 format!(
-                    "SELECT TTL(direct_connect), TTL(hostname), TTL(network) FROM \
+                    "SELECT TTL(direct_socket_address), TTL(hostname), TTL(network) FROM \
                      {TEST_KEYSPACE}.{TABLE_PEER_DIRECTORY} WHERE peer_id = ?"
                 ),
                 (Uuid::from(peer),),
@@ -119,7 +119,7 @@ fn unusable_row_reads_as_absent() -> Result<()> {
         let directory = cassandra_directory(STABLE_LEASE).await?;
         let store = store().await?;
         let query = format!(
-            "INSERT INTO {TEST_KEYSPACE}.{TABLE_PEER_DIRECTORY} (peer_id, direct_connect, \
+            "INSERT INTO {TEST_KEYSPACE}.{TABLE_PEER_DIRECTORY} (peer_id, direct_socket_address, \
              advertised_connect, hostname) VALUES (?, ?, ?, ?) USING TTL 300"
         );
         for (direct, advertised, reason) in [

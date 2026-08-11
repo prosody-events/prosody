@@ -3,8 +3,7 @@
 //! A process that forwards a frame stands beside its target already: it was
 //! reached through the entry point that fronts that target. So it dials the
 //! direct endpoint and reads no declared label at all. Forwarding is therefore
-//! correct even where the labels are unset, wrong, or disagreed upon, which is
-//! what makes it the fallback that always works.
+//! correct even where the labels are unset, wrong, or disagreed upon.
 
 use crate::router::{Framed, PeerId, RelayHop, ResponseSender, SendFailure};
 use opentelemetry::Context;

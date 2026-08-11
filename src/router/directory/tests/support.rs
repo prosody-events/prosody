@@ -8,7 +8,7 @@ use super::suite::SUITE_CAPACITY;
 use crate::cassandra::CassandraStore;
 use crate::router::directory::cassandra::CassandraPeerDirectory;
 use crate::router::directory::{
-    Endpoint, NetworkId, PeerDirectory, PeerRegistration, RegistrationTtl,
+    DirectAddress, Endpoint, NetworkId, PeerDirectory, PeerRegistration, RegistrationTtl,
 };
 use crate::router::{Host, MAX_LABEL_BYTES, PeerId};
 use crate::test_util::test_cassandra_config;
@@ -16,11 +16,11 @@ use color_eyre::Result;
 use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::OnceCell;
-use uuid::Uuid;
 
 /// Characters a generated host, hostname or label is built from.
 const LABEL_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789.:-";
@@ -105,7 +105,7 @@ impl Arbitrary for ArbRegistration {
     fn arbitrary(g: &mut Gen) -> Self {
         Self(PeerRegistration {
             peer: peer_id(g),
-            direct: endpoint(g),
+            direct: direct_address(g),
             advertised: bool::arbitrary(g).then(|| endpoint(g)),
             network: bool::arbitrary(g).then(|| NetworkId::make(&label(g))),
             hostname: Host::make(&label(g)),
@@ -145,16 +145,11 @@ pub(crate) fn test_directory_holding(
     ))
 }
 
-/// A token unique to one evaluation.
-pub(crate) fn token() -> String {
-    Uuid::new_v4().simple().to_string()
-}
-
 /// A fixed registration for `peer`, with every optional field present.
 pub(crate) fn registration(peer: PeerId) -> PeerRegistration {
     PeerRegistration {
         peer,
-        direct: Endpoint::from_static("http://10.1.2.3:7777"),
+        direct: fixed_direct_address(),
         advertised: Some(Endpoint::from_static("http://gateway.example:443")),
         network: Some(NetworkId::make("east")),
         hostname: Host::make("worker-7"),
@@ -186,6 +181,21 @@ pub(crate) fn endpoint(g: &mut Gen) -> Endpoint {
     match Endpoint::from_shared(connect) {
         Ok(endpoint) => endpoint,
         Err(_) => Endpoint::from_static("http://fallback.example:1"),
+    }
+}
+
+/// A generated IPv4 socket address and its transport endpoint.
+pub(crate) fn direct_address(g: &mut Gen) -> DirectAddress {
+    match DirectAddress::new(SocketAddr::arbitrary(g)) {
+        Ok(address) => address,
+        Err(_) => fixed_direct_address(),
+    }
+}
+
+pub(crate) fn fixed_direct_address() -> DirectAddress {
+    DirectAddress {
+        socket: SocketAddr::from(([10, 1, 2, 3], 7777)),
+        endpoint: Endpoint::from_static("http://10.1.2.3:7777"),
     }
 }
 

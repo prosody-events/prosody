@@ -8,7 +8,6 @@ use crate::response::ResponseDisposition;
 use crate::response::frame::ResponseFrame;
 use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::{Endpoint, NetworkId, PeerDirectory, PeerRegistration};
-use crate::router::fleet::{Destination, DestinationFleet};
 use bytes::BufMut;
 use fixedstr::Flexstr;
 use opentelemetry::Context;
@@ -21,9 +20,9 @@ use tokio::time::Instant;
 use tonic::Code;
 use uuid::Uuid;
 
+pub(crate) mod cache_config;
 pub(crate) mod config;
 pub(crate) mod directory;
-pub(crate) mod fleet;
 pub(crate) mod grpc;
 #[cfg(test)]
 pub(crate) mod loopback;
@@ -65,12 +64,7 @@ pub(crate) type Host = Flexstr<LABEL_CAPACITY>;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PeerId(Uuid);
 
-/// Which of a peer's two endpoints answered last.
-///
-/// A destination remembers one of these and never an [`Endpoint`]. A remembered
-/// address would outlive the registration that published it, and would be
-/// dialed after the peer moved. The route is resolved for every response; the
-/// preference only orders the candidates.
+/// Which peer endpoint a route selected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(strum::VariantArray))]
 pub enum Preference {
@@ -80,16 +74,11 @@ pub enum Preference {
     Advertised,
 }
 
-/// The endpoints one peer may be dialed on, in the order the rules put them.
-///
-/// Never more than two, and the second exists only where a failed first attempt
-/// has somewhere else to go. Every stored preference names an endpoint in the
-/// shared registration. [`choose_route`] is the only way to build one.
+/// The one endpoint selected for a peer.
 #[derive(Clone, Debug)]
 pub(crate) struct Route {
-    registration: Arc<PeerRegistration>,
-    first: Preference,
-    second: Option<Preference>,
+    preference: Preference,
+    endpoint: Endpoint,
 }
 
 /// This process's peer id and the request registry that serves it.
@@ -205,10 +194,7 @@ pub(crate) trait RelayHop: Clone + Send + Sync + 'static {
 /// response path names one `R`. Address resolution belongs here, with the
 /// route call that can await it.
 pub(crate) trait NetworkRouter: RelayHop {
-    /// Returns the bounded delivery state for `peer`.
-    fn destination(&self, peer: PeerId) -> Arc<Destination>;
-
-    /// The endpoints `peer` may be dialed on from this process, in order. This
+    /// The endpoint `peer` may be dialed on from this process. This
     /// is the responder's lookup, and [`choose_route`] decides what it answers.
     ///
     /// `None` means "do not dial", which covers both a peer the directory does
@@ -225,10 +211,9 @@ pub(crate) trait NetworkRouter: RelayHop {
 }
 
 /// The production [`NetworkRouter`]: cached peer addresses, one remote
-/// transport, and the process's destination fleet.
+/// transport.
 pub(crate) struct NetworkRoute<S, D> {
     addresses: AddressResolver<D>,
-    fleet: Arc<DestinationFleet>,
     transport: Arc<S>,
     here: Option<NetworkId>,
 }
@@ -265,13 +250,11 @@ impl Display for PeerId {
     }
 }
 
-/// Cloning shares the cache, the fleet and the transport rather than copying
-/// them: one process has exactly one of each.
+/// Cloning shares the cache and transport rather than copying them.
 impl<S, D: Clone> Clone for NetworkRoute<S, D> {
     fn clone(&self) -> Self {
         Self {
             addresses: self.addresses.clone(),
-            fleet: Arc::clone(&self.fleet),
             transport: Arc::clone(&self.transport),
             here: self.here.clone(),
         }
@@ -279,16 +262,14 @@ impl<S, D: Clone> Clone for NetworkRoute<S, D> {
 }
 
 impl<S, D> NetworkRoute<S, D> {
-    /// Binds one process's resolver, fleet and transport together.
+    /// Binds one process's resolver and transport together.
     pub(in crate::router) fn new(
         addresses: AddressResolver<D>,
-        fleet: Arc<DestinationFleet>,
         transport: Arc<S>,
         here: Option<NetworkId>,
     ) -> Self {
         Self {
             addresses,
-            fleet,
             transport,
             here,
         }
@@ -301,7 +282,7 @@ impl<S: ResponseSender, D: PeerDirectory> RelayHop for NetworkRoute<S, D> {
 
     async fn direct(&self, peer: PeerId) -> Result<Option<Endpoint>, D::Error> {
         let registration = self.addresses.resolve(peer).await?;
-        Ok(registration.map(|registration| registration.direct.clone()))
+        Ok(registration.map(|registration| registration.direct.endpoint().clone()))
     }
 
     fn sender(&self) -> &S {
@@ -310,44 +291,11 @@ impl<S: ResponseSender, D: PeerDirectory> RelayHop for NetworkRoute<S, D> {
 }
 
 impl<S: ResponseSender, D: PeerDirectory> NetworkRouter for NetworkRoute<S, D> {
-    fn destination(&self, peer: PeerId) -> Arc<Destination> {
-        self.fleet.destination(peer)
-    }
-
     async fn route(&self, peer: PeerId) -> Result<Option<Route>, D::Error> {
         let registration = self.addresses.resolve(peer).await?;
-        Ok(registration.and_then(|registration| choose_route(self.here.as_ref(), registration)))
-    }
-}
-
-impl SendFailure {
-    /// Whether this attempt got no proof that this address serves the peer, so
-    /// the other endpoint is worth trying inside the same response.
-    ///
-    /// Every failure that answers `false` is a status some process gave the
-    /// frame after reading it, which is what lets the send path remember the
-    /// endpoint that gave it. The rest are these:
-    ///
-    /// - **Nothing was dialed, or nothing answered.** The address could not be
-    ///   dialed, or the endpoint said nothing at all. `UNAVAILABLE` and
-    ///   `UNIMPLEMENTED` are the same fact from something that answered but
-    ///   does not serve this method — which is what a misapplied label reaches,
-    ///   an address that belongs to something unrelated on this network.
-    /// - **This process gave up first.** `CANCELLED` is what the transport's
-    ///   own timer reads as, and [`SendFailure::Expired`] is the same fact
-    ///   before anything left. Neither is the destination's word.
-    ///
-    /// `DEADLINE_EXCEEDED` is deliberately not here. It is the answer of a peer
-    /// that read the frame after this response's deadline, so
-    /// it is that peer speaking about the whole path rather than about the
-    /// address. The other endpoint has no more time to spend than this one had.
-    pub(crate) const fn is_wrong_endpoint(self) -> bool {
-        match self {
-            Self::Unreachable
-            | Self::Expired
-            | Self::Status(Code::Unavailable | Code::Unimplemented | Code::Cancelled) => true,
-            Self::Status(_) => false,
-        }
+        Ok(registration
+            .as_deref()
+            .and_then(|registration| choose_route(self.here.as_ref(), registration)))
     }
 }
 
@@ -362,34 +310,9 @@ impl Preference {
 }
 
 impl Route {
-    /// The candidates to try, the remembered one first when this route offers
-    /// it.
-    ///
-    /// A fixed-size array, so walking a route allocates nothing.
-    pub(crate) fn candidates(
-        &self,
-        remembered: Option<Preference>,
-    ) -> [Option<(Preference, &Endpoint)>; 2] {
-        let first = self.candidate(self.first);
-        let second = self
-            .second
-            .and_then(|preference| self.candidate(preference));
-        if second.is_some_and(|(preference, _)| Some(preference) == remembered) {
-            [second, first]
-        } else {
-            [first, second]
-        }
-    }
-
-    fn candidate(&self, preference: Preference) -> Option<(Preference, &Endpoint)> {
-        match preference {
-            Preference::Direct => Some((preference, &self.registration.direct)),
-            Preference::Advertised => self
-                .registration
-                .advertised
-                .as_ref()
-                .map(|endpoint| (preference, endpoint)),
-        }
+    /// Returns the selected endpoint and its route type.
+    pub(crate) fn endpoint(&self) -> (Preference, &Endpoint) {
+        (self.preference, &self.endpoint)
     }
 }
 
@@ -399,61 +322,41 @@ impl Route {
 /// endpoints. An operator declares it; nothing infers it. Three rules follow
 /// from that, and this is the one function in the crate that reads a label:
 ///
-/// - **Both present and equal.** Dial `direct`, and fall back to `advertised`
-///   when the peer published one. Neighbours skip the entry point, which
-///   matters less for latency than for load.
+/// - **Both present and equal.** Dial `direct`. Neighbours skip the entry
+///   point, which matters less for latency than for load.
 /// - **Both present and unequal.** Dial `advertised` alone, and `None` when the
 ///   peer published none. The peer is known to be elsewhere, so its direct
 ///   address is a foreign one that most likely belongs to something unrelated
 ///   here. Refusing to dial is only expressible because the labels were
 ///   declared.
-/// - **Either absent.** That means "cannot tell", never "different". Dial
-///   `advertised` if the peer published one, else `direct`. With nothing
-///   configured anywhere, every peer resolves to `direct`, which is the
-///   single-network case working with no configuration at all.
+/// - **Either absent.** Dial `direct`. With nothing configured anywhere, every
+///   peer uses its direct address. This is the single-network default.
 ///
 /// `None` means "do not dial".
 pub(crate) fn choose_route(
     here: Option<&NetworkId>,
-    registration: Arc<PeerRegistration>,
+    registration: &PeerRegistration,
 ) -> Option<Route> {
-    let advertised = registration.advertised.is_some();
     match (here, registration.network.as_ref()) {
-        (Some(here), Some(there)) if here == there => Some(Route {
-            registration,
-            first: Preference::Direct,
-            second: advertised.then_some(Preference::Advertised),
-        }),
-        (Some(_), Some(_)) if advertised => Some(Route {
-            registration,
-            first: Preference::Advertised,
-            second: None,
-        }),
-        (Some(_), Some(_)) => None,
-        (None, _) | (_, None) => Some(Route {
-            registration,
-            first: if advertised {
-                Preference::Advertised
-            } else {
-                Preference::Direct
-            },
-            second: None,
+        (Some(here), Some(there)) if here != there => {
+            registration.advertised.as_ref().map(|endpoint| Route {
+                preference: Preference::Advertised,
+                endpoint: endpoint.clone(),
+            })
+        }
+        _ => Some(Route {
+            preference: Preference::Direct,
+            endpoint: registration.direct.endpoint().clone(),
         }),
     }
 }
 
 /// Why one delivery attempt did not succeed.
 ///
-/// [`Status`](Self::Status) carries the gRPC status the attempt came to, rather
-/// than a code of this crate's own, for the reason [`crate::router::grpc`]
-/// states.
+/// [`Status`](Self::Status) carries the gRPC status that the attempt reached.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SendFailure {
-    /// The attempt came to a gRPC status other than `OK`. It may be what
-    /// something at the address answered, or what this transport produced on
-    /// its own, and which process at that address answered is not knowable
-    /// here. [`Self::is_wrong_endpoint`] says which of these codes make the
-    /// other endpoint worth trying.
+    /// The attempt came to a gRPC status other than `OK`.
     #[error("the attempt came to {0:?}")]
     Status(Code),
 

@@ -7,9 +7,9 @@ use super::super::{
 use super::listener;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::router::PeerId;
+use crate::router::cache_config::PeerCacheConfiguration;
 use crate::router::directory::tests::support::{registration, test_directory};
 use crate::router::directory::{PeerDirectory, RegistrationTtl};
-use crate::router::fleet::config::FleetConfiguration;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
@@ -42,7 +42,7 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
             listener: listener().await?,
             heartbeats: HeartbeatRegistry::test(),
             router: &router,
-            fleet: FleetConfiguration::default(),
+            cache: PeerCacheConfiguration::default(),
         })
         .await;
         assert!(
@@ -152,7 +152,7 @@ fn configuration_refuses_degenerate_values() {
 #[test]
 fn peer_cache_capacity_is_positive() {
     for capacity in [1, 100_000, usize::MAX] {
-        let config = FleetConfiguration {
+        let config = PeerCacheConfiguration {
             peer_capacity: capacity,
         };
         assert!(
@@ -160,6 +160,6 @@ fn peer_cache_capacity_is_positive() {
             "capacity {capacity} must validate"
         );
     }
-    let config = FleetConfiguration { peer_capacity: 0 };
+    let config = PeerCacheConfiguration { peer_capacity: 0 };
     assert!(config.validate().is_err(), "zero must be refused");
 }

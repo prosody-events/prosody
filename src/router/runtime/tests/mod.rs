@@ -11,11 +11,10 @@ use crate::requester::registry::PendingRegistry;
 use crate::response::RequestId;
 use crate::response::frame::FrameHeader;
 use crate::router::PeerId;
+use crate::router::cache_config::PeerCacheConfiguration;
 use crate::router::directory::cassandra::CassandraPeerDirectory;
 use crate::router::directory::tests::support::cassandra_directory;
 use crate::router::directory::{Endpoint, PeerDirectory};
-use crate::router::fleet::DestinationFleet;
-use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::BoundListener;
 use crate::router::loopback::listener::endpoint as listener_endpoint;
 use crate::subsystem::SubsystemName;
@@ -48,7 +47,6 @@ struct Process {
 
 /// The handles a test keeps after shutdown has consumed the runtime.
 struct Shared {
-    fleet: Arc<DestinationFleet>,
     pending: Arc<PendingRegistry>,
     /// Where this process's own listener is.
     listener: Endpoint,
@@ -75,12 +73,11 @@ impl Process {
             listener: bound,
             heartbeats: HeartbeatRegistry::test(),
             router: &router,
-            fleet: FleetConfiguration::default(),
+            cache: PeerCacheConfiguration::default(),
         })
         .await?;
         Ok(Self {
             shared: Shared {
-                fleet: Arc::clone(&runtime.network.fleet),
                 pending: Arc::clone(runtime.local.pending()),
                 listener,
                 peer: runtime.peer(),
@@ -108,7 +105,7 @@ async fn plain_process() -> Result<PlainProcess> {
         listener: bound,
         heartbeats: HeartbeatRegistry::test(),
         router: &router,
-        fleet: FleetConfiguration::default(),
+        cache: PeerCacheConfiguration::default(),
     })
     .await?;
     Ok(PlainProcess { runtime, directory })

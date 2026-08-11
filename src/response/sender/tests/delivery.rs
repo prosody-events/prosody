@@ -1,6 +1,6 @@
 //! What happens to a response between its hook and the wire.
 
-use super::{Harness, PAYLOAD, config, paused, peer};
+use super::{Harness, PAYLOAD, paused, peer};
 use crate::Codec;
 use crate::response::frame::decode::decode_frame;
 use crate::response::frame::tests::CountingCodec;
@@ -16,7 +16,7 @@ const TARGET: u8 = 1;
 fn a_response_reaches_the_wire_intact() -> Result<()> {
     let runtime = paused()?;
     runtime.block_on(async {
-        let harness = Harness::new(config())?;
+        let harness = Harness::new()?;
         harness.send(TARGET).await?;
         let mut drained = harness.drain().await?;
 

@@ -1,6 +1,6 @@
 //! What one destination's trouble costs the others: nothing.
 
-use super::{Harness, attempts, config, paused};
+use super::{Harness, attempts, paused};
 use crate::router::loopback::{Script, direct_uri};
 use color_eyre::Result;
 use std::array;
@@ -22,7 +22,7 @@ const HELD_REQUESTS: usize = 2;
 fn a_held_destination_never_delays_a_healthy_one() -> Result<()> {
     let runtime = paused()?;
     runtime.block_on(async {
-        let mut harness = Harness::new(config())?;
+        let mut harness = Harness::new()?;
         let barrier = Arc::new(Semaphore::new(0));
         harness.script(PEER_A, Script::Hold(Arc::clone(&barrier)))?;
 
