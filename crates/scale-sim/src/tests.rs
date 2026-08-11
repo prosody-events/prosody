@@ -391,6 +391,29 @@ fn closed_loop_accepts_ready_window_with_rebalance_pause() -> Result<(), TestErr
 }
 
 #[test]
+fn reconciliation_churn_does_not_starve_capacity_evidence() -> Result<(), TestError> {
+    let closed_loop = capacity_test_closed_loop(ReconciliationChurnWorkload, 12)?;
+    let plant_configuration =
+        PlantConfiguration::new(4, 100, 240, 12, 2, 16)?.with_rebalance(20_000, 0);
+    let mut harness = SimulationHarness::new(plant_configuration, 1, 12, closed_loop)?;
+    let mut unready_ticks = 0_u8;
+    for tick in 0_u64..12 {
+        unready_ticks =
+            unready_ticks.saturating_add(u8::from(!harness.tick(tick * 10_000)?.partitions_ready));
+    }
+    let (_result, closed_loop) = harness.finish_with_graph();
+
+    assert!(unready_ticks >= 5);
+    assert!(
+        closed_loop
+            .trace()
+            .capacity_evidence_count(CapacityEvidenceKind::Window)
+            >= 5
+    );
+    Ok(())
+}
+
+#[test]
 fn unused_paused_partition_does_not_change_capacity_posterior() -> Result<(), TestError> {
     let (baseline, baseline_pause) = run_idle_partition_capacity_trace(1)?;
     let (with_idle_partition, idle_partition_pause) = run_idle_partition_capacity_trace(2)?;
@@ -687,6 +710,27 @@ impl TickGenerator for IdlePartitionCapacityWorkload {
 }
 
 struct RampCapacityWorkload;
+
+struct ReconciliationChurnWorkload;
+
+impl TickGenerator for ReconciliationChurnWorkload {
+    fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError> {
+        Ok(TickInputs {
+            message_count: 20,
+            timer_count: 0,
+            handler_micros: 1_000_000,
+            dependency_operations: 0,
+            dependency_operation_micros: 0,
+            handler_added_micros: 0,
+            outcome: EventOutcomeRule::Success,
+            launch_delay_micros: 0,
+            scale: ScaleDirective::Request {
+                replicas: context.tick_index % 2 + 1,
+                delay_micros: 0,
+            },
+        })
+    }
+}
 
 impl TickGenerator for RampCapacityWorkload {
     fn calculate(&mut self, _: TickContext<'_>) -> Result<TickInputs, PlantError> {
@@ -1048,15 +1092,16 @@ fn capacity_regimes_record_passive_resource_windows() -> Result<(), TestError> {
             .controller()
             .capacity_posterior(0)
             .ok_or(TestError::MissingControllerSample)?;
-        let final_posterior = run
-            .controller()
-            .capacity_posterior(run.controller().len() - 1)
-            .ok_or(TestError::MissingControllerSample)?;
+        // A refuted knee family can relax to prior-shaped redraw cohorts. The
+        // final marginal can then equal the prior. Movement during the run is
+        // the non-vacuity claim.
         assert!(
-            prior
-                .iter()
-                .zip(final_posterior)
-                .any(|(before, after)| (before - after).abs() > 1.0e-12_f64)
+            (1..run.controller().len())
+                .filter_map(|index| run.controller().capacity_posterior(index))
+                .any(|posterior| prior
+                    .iter()
+                    .zip(posterior)
+                    .any(|(before, after)| (before - after).abs() > 1.0e-12_f64))
         );
         Ok(())
     })

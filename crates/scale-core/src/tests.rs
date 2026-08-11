@@ -9,7 +9,7 @@ use statrs::distribution::{ContinuousCDF, Gamma};
 use thiserror::Error;
 
 use crate::arrival::{ArrivalEvidence, ArrivalFactor, ChangeHazard, RateOccupancy, rate_bin};
-use crate::capacity::{CapacityFactor, contaminated_poisson_log_likelihood};
+use crate::capacity::CapacityFactor;
 use crate::change_point::ChangePointKernel;
 use crate::controller::{
     DecisionRandomDomain, NumericalDecision, classify_paired_bootstrap, decision_random,
@@ -1580,7 +1580,7 @@ fn narrower_log_capacity_prior_concentrates_more_mass_at_its_median() -> Result<
             service_time_median_seconds: 0.1_f64,
             capacity_median_per_second: 320.0_f64,
             log_standard_deviation: 2.0_f64.ln(),
-            window_contamination_probability: 0.05_f64,
+            window_influence_bound_probability: 0.05_f64,
         },
     )?;
     let wide = CapacityGrid::new_with_prior(
@@ -1591,7 +1591,7 @@ fn narrower_log_capacity_prior_concentrates_more_mass_at_its_median() -> Result<
             service_time_median_seconds: 0.1_f64,
             capacity_median_per_second: 320.0_f64,
             log_standard_deviation: 8.0_f64.ln(),
-            window_contamination_probability: 0.05_f64,
+            window_influence_bound_probability: 0.05_f64,
         },
     )?;
     let narrow = capacity_prior(narrow)?;
@@ -1614,7 +1614,7 @@ fn default_capacity_prior_is_explicit_log_uniform() -> Result<(), TestError> {
         &capacities,
         &[0.0_f64, 0.5_f64, 1.0_f64],
         CapacityPrior::LogUniform {
-            window_contamination_probability: 0.05_f64,
+            window_influence_bound_probability: 0.05_f64,
         },
     )?;
 
@@ -1646,27 +1646,10 @@ fn capacity_grid_accepts_exactly_representable_log_normal_parameters(
             service_time_median_seconds: service_median,
             capacity_median_per_second: capacity_median,
             log_standard_deviation,
-            window_contamination_probability: 0.05_f64,
+            window_influence_bound_probability: 0.05_f64,
         },
     );
     result.is_ok() == valid
-}
-
-#[quickcheck]
-fn capacity_window_log_odds_are_bounded(
-    completed: u16,
-    first_mean_bits: u32,
-    second_mean_bits: u32,
-) -> bool {
-    const CONTAMINATION: f64 = 0.05_f64;
-
-    let first_mean = f64::from(first_mean_bits % 1_000_001);
-    let second_mean = f64::from(second_mean_bits % 1_000_001);
-    let first =
-        contaminated_poisson_log_likelihood(u32::from(completed), first_mean, CONTAMINATION);
-    let second =
-        contaminated_poisson_log_likelihood(u32::from(completed), second_mean, CONTAMINATION);
-    (first - second).abs() <= (1.0_f64 / CONTAMINATION).ln() + 1.0e-9_f64
 }
 
 #[test]
@@ -1677,7 +1660,7 @@ fn consistent_capacity_windows_concentrate_the_posterior() -> Result<(), TestErr
         &[50.0_f64, 100.0_f64],
         &[0.0_f64],
         CapacityPrior::LogUniform {
-            window_contamination_probability: 0.05_f64,
+            window_influence_bound_probability: 0.05_f64,
         },
     )?;
     let mut factor = CapacityFactor::new(grid, 0.0_f64);
@@ -1703,7 +1686,7 @@ fn one_application_trickle_window_cannot_erase_no_knee_mass() -> Result<(), Test
         &[2_000.0_f64, 4_000.0_f64],
         &[0.0_f64, 1.0_f64],
         CapacityPrior::LogUniform {
-            window_contamination_probability: 0.05_f64,
+            window_influence_bound_probability: 0.05_f64,
         },
     )?;
     let mut factor = CapacityFactor::new(grid, 0.0_f64);
@@ -1721,7 +1704,7 @@ fn one_burst_onset_window_cannot_erase_no_knee_mass() -> Result<(), TestError> {
         &[40.0_f64, 320.0_f64, 4_000.0_f64],
         &[0.0_f64, 1.0_f64],
         CapacityPrior::LogUniform {
-            window_contamination_probability: 0.05_f64,
+            window_influence_bound_probability: 0.05_f64,
         },
     )?;
     let mut factor = CapacityFactor::new(grid, 0.0_f64);
@@ -2695,9 +2678,18 @@ fn plateau_grid() -> Result<CapacityGrid, TestError> {
 
 /// A steady plateau must select the best attainable chance constraint when
 /// no fixed target meets the configured probability budget.
+///
+/// The strict violation budget keeps the scenario in the fallback branch:
+/// the pass curve tops out near 0.95, far below the required 0.99.
 #[test]
 fn steady_plateau_selects_best_attainable_insurance() -> Result<(), TestError> {
-    let configuration = plateau_configuration()?;
+    let configuration = {
+        let mut configuration = plateau_configuration()?;
+        configuration.objective = configuration
+            .objective
+            .with_slo_violation_probability(0.01_f64)?;
+        configuration
+    };
     let mut state = ScaleState::new(configuration.clone(), plateau_grid()?)?;
     let mut scratch = ScaleScratch::new(&configuration)?;
     let mut observation = ObservationBuffer::new(&configuration)?;

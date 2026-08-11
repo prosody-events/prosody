@@ -483,6 +483,9 @@ fn validate_closed_loop_claim(
         PrincipalRegime::Idle => validate_idle_claim(run),
         PrincipalRegime::ApplicationLimited => validate_application_limited_claim(run),
         PrincipalRegime::LinearThroughput => validate_linear_claim(run),
+        PrincipalRegime::FlatPostKnee | PrincipalRegime::DecliningPostKnee => {
+            validate_capacity_closed_loop_claim(regime, run)
+        }
         PrincipalRegime::ShortBurst => validate_short_burst_claim(run),
         PrincipalRegime::SeasonalWaves => validate_seasonal_claim(run),
         PrincipalRegime::HotPartition => validate_single_worker_claim(
@@ -547,6 +550,36 @@ fn validate_linear_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError
                 <= run.settlements().len(),
         PrincipalRegime::LinearThroughput,
         "the controller did not complete the linear workload within its SLO allowance",
+    )
+}
+
+fn validate_capacity_closed_loop_claim(
+    regime: PrincipalRegime,
+    run: &PrincipalRun,
+) -> Result<(), RegimeValidationError> {
+    const CAP_DEADLINE_MICROS: u64 = 150_000_000;
+    let cap_engagement = controller_samples(run).position(|sample| sample.cap <= 4);
+    let cap_engaged_by_deadline = cap_engagement.is_some_and(|index| {
+        run.controller
+            .sample(index)
+            .is_some_and(|sample| sample.at_micros <= CAP_DEADLINE_MICROS)
+    });
+    require_closed_loop(
+        cap_engaged_by_deadline,
+        regime,
+        "the capacity cap did not engage by its deadline",
+    )?;
+    if regime == PrincipalRegime::FlatPostKnee {
+        return require_closed_loop(
+            final_target(run).is_some_and(|target| (2..=3).contains(&target)),
+            regime,
+            "the capacity controller did not finish at its settled target",
+        );
+    }
+    require_closed_loop(
+        final_target(run).is_some_and(|target| target <= 3),
+        regime,
+        "the declining capacity controller finished above its target bound",
     )
 }
 
@@ -693,10 +726,11 @@ fn validate_rebalance_storm_claim(run: &PrincipalRun) -> Result<(), RegimeValida
     )?;
     // The cap claim measures the calm tail, where the cap can bind a
     // decision. During the storm the first ambiguous onset windows let the
-    // knee ridge briefly outweigh the no-knee cells — an honest posterior
-    // transient at one operating point — while external actions drive
-    // every transition. A pause-taught standing false knee still fails:
-    // it persists into the calm tail.
+    // knee ridge briefly outweigh the no-knee cells. This is an honest
+    // posterior transient at one operating point. External actions drive
+    // every transition. A pause-taught standing false knee still fails
+    // because it persists into the calm tail. The rank clamp bounds the
+    // transient by ln(1 / p) per window, and recovery follows at that rate.
     let calm_minimum_cap = controller_samples(run)
         .filter(|sample| sample.at_micros >= CALM_START_MICROS)
         .map(|sample| sample.cap)
@@ -705,6 +739,15 @@ fn validate_rebalance_storm_claim(run: &PrincipalRun) -> Result<(), RegimeValida
         calm_minimum_cap.is_some_and(|cap| cap >= 2),
         PrincipalRegime::RebalanceStorm,
         "rebalance evidence created a false saturation cap",
+    )?;
+    // The run stays at one operating point after onset. The data cannot
+    // separate no-knee cells from knees above this point. Thus, the honest
+    // posterior recovers to an even split. This bound rejects a standing
+    // false knee without requiring certainty that the data cannot provide.
+    require_closed_loop(
+        final_no_knee_probability(run) >= 0.45_f64,
+        PrincipalRegime::RebalanceStorm,
+        "rebalance evidence left a standing false knee",
     )
 }
 
@@ -1111,10 +1154,10 @@ fn validate_capacity_evidence(
         .controller
         .capacity_evidence_count(crate::CapacityEvidenceKind::Window);
     require_regime(
-        window_count > 0,
+        window_count >= 30,
         regime,
         experiment,
-        "the controller produced no passive resource window",
+        "the controller produced fewer than 30 passive resource windows",
     )?;
     let mut concurrency_min = f64::INFINITY;
     let mut concurrency_max = 0.0_f64;
@@ -1154,7 +1197,139 @@ fn validate_capacity_evidence(
             "passive windows did not cross the physical concurrency knee",
         )?;
     }
+    match regime {
+        PrincipalRegime::LinearThroughput => require_regime(
+            final_no_knee_probability(run) >= 0.95_f64,
+            regime,
+            experiment,
+            "the linear capacity belief lost its no-knee mass",
+        )?,
+        PrincipalRegime::FlatPostKnee => {
+            require_regime(
+                final_no_knee_probability(run) <= 0.01_f64,
+                regime,
+                experiment,
+                "the flat capacity belief retained excess no-knee mass",
+            )?;
+            require_regime(
+                controller_samples(run)
+                    .last()
+                    .is_some_and(|sample| sample.cap == 2),
+                regime,
+                experiment,
+                "the flat capacity run did not finish with a cap of two",
+            )?;
+        }
+        PrincipalRegime::DecliningPostKnee => {
+            require_regime(
+                capacity_evidence_has_no_gap(run, 5),
+                regime,
+                experiment,
+                "the declining capacity evidence has a gap longer than five ticks",
+            )?;
+            validate_declining_capacity_evidence(run)?;
+        }
+        _ => {}
+    }
     Ok(())
+}
+
+fn capacity_evidence_has_no_gap(run: &PrincipalRun, maximum_gap: usize) -> bool {
+    let mut first_window = None;
+    let mut previous_window = None;
+    for (index, sample) in controller_samples(run).enumerate() {
+        if !matches!(
+            sample.capacity_evidence,
+            crate::CapacityEvidenceSample::Window(_)
+        ) {
+            continue;
+        }
+        first_window.get_or_insert(index);
+        if previous_window.is_some_and(|previous| index.saturating_sub(previous) > maximum_gap) {
+            return false;
+        }
+        previous_window = Some(index);
+    }
+    first_window.is_some()
+        && previous_window.is_some_and(|previous| {
+            run.controller
+                .len()
+                .saturating_sub(1)
+                .saturating_sub(previous)
+                <= maximum_gap
+        })
+}
+
+fn validate_declining_capacity_evidence(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    const KNEE_CONCURRENCY: f64 = 64.0_f64;
+    const BELIEF_DEADLINE_MICROS: u64 = 10_000_000;
+    const CAP_DEADLINE_MICROS: u64 = 60_000_000;
+    let regime = PrincipalRegime::DecliningPostKnee;
+    let experiment = RegimeExperiment::CapacityEvidence;
+    let first_collapse = controller_samples(run)
+        .enumerate()
+        .find_map(|(index, sample)| {
+            matches!(
+                sample.capacity_evidence,
+                crate::CapacityEvidenceSample::Window(window)
+                    if window.concurrency > KNEE_CONCURRENCY
+            )
+            .then_some((index, sample.at_micros))
+        });
+    // Below the knee, covering cells hold their prior odds. The posterior must
+    // retain no-knee mass until the plant supplies separating evidence.
+    require_regime(
+        first_collapse.is_some_and(|(index, _)| {
+            controller_samples(run)
+                .take(index)
+                .all(|sample| sample.no_knee_probability >= 0.25_f64)
+        }),
+        regime,
+        experiment,
+        "the declining no-knee probability lost mass before the knee crossing",
+    )?;
+    let first_below = first_collapse.and_then(|(index, collapse_micros)| {
+        controller_samples(run)
+            .enumerate()
+            .skip(index)
+            .find(|(_, sample)| sample.no_knee_probability < 0.40_f64)
+            .map(|(fall_index, sample)| (fall_index, collapse_micros, sample.at_micros))
+    });
+    // Above the knee, the declining curve separates from the no-knee family.
+    // The posterior must respond within the fixed evidence deadline.
+    require_regime(
+        first_below.is_some_and(|(_, collapse_micros, fall_micros)| {
+            fall_micros <= collapse_micros.saturating_add(BELIEF_DEADLINE_MICROS)
+        }),
+        regime,
+        experiment,
+        "the declining no-knee probability did not fall after the knee crossing",
+    )?;
+    // Separating evidence must keep the no-knee probability below its bound.
+    require_regime(
+        first_below.is_some_and(|(index, ..)| {
+            controller_samples(run)
+                .skip(index)
+                .all(|sample| sample.no_knee_probability < 0.40_f64)
+        }),
+        regime,
+        experiment,
+        "the declining no-knee probability recovered after its post-knee fall",
+    )?;
+    let cap_engagement = controller_samples(run).position(|sample| sample.cap < 128);
+    require_regime(
+        first_collapse
+            .map(|(_, collapse_micros)| collapse_micros)
+            .zip(cap_engagement)
+            .is_some_and(|(collapse_micros, cap_index)| {
+                run.controller.sample(cap_index).is_some_and(|sample| {
+                    sample.at_micros <= collapse_micros.saturating_add(CAP_DEADLINE_MICROS)
+                })
+            }),
+        regime,
+        experiment,
+        "the declining capacity cap did not engage within 60 seconds",
+    )
 }
 
 fn require_regime(
@@ -1285,7 +1460,10 @@ fn principal_graph(
             REGIME_PRIOR_TRUST_SECONDS,
             REGIME_OCCUPANCY_HALF_LIFE_SECONDS,
         )?,
-        capacity_change_rate_per_second: 0.0_f64,
+        // A collapsing plant changes as work crosses its knee. The kernel
+        // revives cells that current data cover. This rate matches the
+        // workload change cadence.
+        capacity_change_rate_per_second: 1.0_f64 / 300.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: transition_prior([30.0_f64, 45.0_f64, 60.0_f64, 90.0_f64])?,
         rebalance_time_prior: transition_prior([0.05_f64, 0.1_f64, 0.2_f64, 0.4_f64])?,
@@ -1373,12 +1551,12 @@ fn capacity_grid(
             service_time_median_seconds: 0.1_f64,
             capacity_median_per_second: 1_280.0_f64,
             log_standard_deviation: 2.0_f64.ln(),
-            window_contamination_probability: 0.05_f64,
+            window_influence_bound_probability: 0.05_f64,
         }
     } else if capacity_regime {
         sensitivity.map_or(
             CapacityPrior::LogUniform {
-                window_contamination_probability: 0.05_f64,
+                window_influence_bound_probability: 0.05_f64,
             },
             |variant| {
                 let factor: f64 = match variant {
@@ -1392,7 +1570,7 @@ fn capacity_grid(
                     service_time_median_seconds: 0.1_f64,
                     capacity_median_per_second: 320.0_f64,
                     log_standard_deviation: factor.ln(),
-                    window_contamination_probability: 0.05_f64,
+                    window_influence_bound_probability: 0.05_f64,
                 }
             },
         )
@@ -1401,7 +1579,7 @@ fn capacity_grid(
             service_time_median_seconds: 0.002_f64,
             capacity_median_per_second: 64_000.0_f64,
             log_standard_deviation: 100.0_f64.ln(),
-            window_contamination_probability: 0.05_f64,
+            window_influence_bound_probability: 0.05_f64,
         }
     };
     CapacityGrid::new_with_prior(

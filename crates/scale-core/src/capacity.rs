@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::change_point::ChangePointKernel;
 
 const CAPACITY_CELL_COUNT_MAX: u32 = 4_096;
-const DEFAULT_WINDOW_CONTAMINATION_PROBABILITY: f64 = 0.05_f64;
+const DEFAULT_WINDOW_INFLUENCE_BOUND_PROBABILITY: f64 = 0.05_f64;
 const NO_KNEE_PRIOR_PROBABILITY: f64 = 0.5_f64;
 const NO_COLLAPSE_PRIOR_PROBABILITY: f64 = 0.5_f64;
 
@@ -34,6 +34,10 @@ pub enum CapacityCurve {
 pub struct ThroughputPosteriorCell {
     /// Predicted completed attempts per second.
     pub throughput_per_second: f64,
+    /// Lowest throughput in this cell's parameter region.
+    pub throughput_low_per_second: f64,
+    /// Highest throughput in this cell's parameter region.
+    pub throughput_high_per_second: f64,
     /// Joint posterior probability for this curve.
     pub probability: f64,
 }
@@ -112,8 +116,8 @@ impl CapacityCurve {
 pub enum CapacityPrior {
     /// Equal prior mass for equal intervals on each logarithmic axis.
     LogUniform {
-        /// Prior probability that one window is outside the model class.
-        window_contamination_probability: f64,
+        /// Reciprocal bound on one window's pairwise likelihood ratio.
+        window_influence_bound_probability: f64,
     },
     /// Independent normal priors on logarithmic service time and capacity.
     LogNormal {
@@ -123,8 +127,8 @@ pub enum CapacityPrior {
         capacity_median_per_second: f64,
         /// Standard deviation on both natural-log axes.
         log_standard_deviation: f64,
-        /// Prior probability that one window is outside the model class.
-        window_contamination_probability: f64,
+        /// Reciprocal bound on one window's pairwise likelihood ratio.
+        window_influence_bound_probability: f64,
     },
 }
 
@@ -132,20 +136,20 @@ impl CapacityPrior {
     fn validate(self) -> Result<(), CapacityGridError> {
         match self {
             Self::LogUniform {
-                window_contamination_probability,
-            } if valid_contamination_probability(window_contamination_probability) => Ok(()),
+                window_influence_bound_probability,
+            } if valid_influence_bound_probability(window_influence_bound_probability) => Ok(()),
             Self::LogNormal {
                 service_time_median_seconds,
                 capacity_median_per_second,
                 log_standard_deviation,
-                window_contamination_probability,
+                window_influence_bound_probability,
             } if service_time_median_seconds.is_finite()
                 && service_time_median_seconds > 0.0_f64
                 && capacity_median_per_second.is_finite()
                 && capacity_median_per_second > 0.0_f64
                 && log_standard_deviation.is_finite()
                 && log_standard_deviation >= f64::EPSILON
-                && valid_contamination_probability(window_contamination_probability) =>
+                && valid_influence_bound_probability(window_influence_bound_probability) =>
             {
                 Ok(())
             }
@@ -155,15 +159,15 @@ impl CapacityPrior {
         }
     }
 
-    const fn window_contamination_probability(self) -> f64 {
+    const fn window_influence_bound_probability(self) -> f64 {
         match self {
             Self::LogUniform {
-                window_contamination_probability,
+                window_influence_bound_probability,
             }
             | Self::LogNormal {
-                window_contamination_probability,
+                window_influence_bound_probability,
                 ..
-            } => window_contamination_probability,
+            } => window_influence_bound_probability,
         }
     }
 }
@@ -172,8 +176,14 @@ impl CapacityPrior {
 #[derive(Clone, Debug)]
 pub struct CapacityGrid {
     service_times_seconds: Vec<f64>,
+    service_time_lows: Vec<f64>,
+    service_time_highs: Vec<f64>,
     capacities_per_second: Vec<f64>,
+    capacity_lows: Vec<f64>,
+    capacity_highs: Vec<f64>,
     collapse_values: Vec<f64>,
+    collapse_lows: Vec<f64>,
+    collapse_highs: Vec<f64>,
     no_knee: Vec<f64>,
     knee_values: Vec<f64>,
     knee_indexes: Vec<u32>,
@@ -200,7 +210,7 @@ impl CapacityGrid {
             capacities_per_second,
             collapse_values,
             CapacityPrior::LogUniform {
-                window_contamination_probability: DEFAULT_WINDOW_CONTAMINATION_PROBABILITY,
+                window_influence_bound_probability: DEFAULT_WINDOW_INFLUENCE_BOUND_PROBABILITY,
             },
         )
     }
@@ -234,23 +244,44 @@ impl CapacityGrid {
             return Err(CapacityGridError::TooLarge);
         }
 
+        let service_bounds = log_axis_bounds(service_times_seconds);
+        let capacity_bounds = log_axis_bounds(capacities_per_second);
+        let collapse_bounds = collapse_axis_bounds(collapse_values);
         let mut service_time_cells = Vec::with_capacity(cell_count);
+        let mut service_time_lows = Vec::with_capacity(cell_count);
+        let mut service_time_highs = Vec::with_capacity(cell_count);
         let mut capacity_cells = Vec::with_capacity(cell_count);
+        let mut capacity_lows = Vec::with_capacity(cell_count);
+        let mut capacity_highs = Vec::with_capacity(cell_count);
         let mut collapse_cells = Vec::with_capacity(cell_count);
-        for &service_time_seconds in service_times_seconds {
-            for &capacity_per_second in capacities_per_second {
-                for &collapse in collapse_values {
+        let mut collapse_lows = Vec::with_capacity(cell_count);
+        let mut collapse_highs = Vec::with_capacity(cell_count);
+        for (service_index, &service_time_seconds) in service_times_seconds.iter().enumerate() {
+            for (capacity_index, &capacity_per_second) in capacities_per_second.iter().enumerate() {
+                for (collapse_index, &collapse) in collapse_values.iter().enumerate() {
                     service_time_cells.push(service_time_seconds);
+                    service_time_lows.push(service_bounds[service_index].0);
+                    service_time_highs.push(service_bounds[service_index].1);
                     capacity_cells.push(capacity_per_second);
+                    capacity_lows.push(capacity_bounds[capacity_index].0);
+                    capacity_highs.push(capacity_bounds[capacity_index].1);
                     collapse_cells.push(collapse);
+                    collapse_lows.push(collapse_bounds[collapse_index].0);
+                    collapse_highs.push(collapse_bounds[collapse_index].1);
                 }
             }
         }
         let mut no_knee = vec![0.0_f64; knee_cell_count];
-        for &service_time_seconds in service_times_seconds {
+        for (service_index, &service_time_seconds) in service_times_seconds.iter().enumerate() {
             service_time_cells.push(service_time_seconds);
+            service_time_lows.push(service_bounds[service_index].0);
+            service_time_highs.push(service_bounds[service_index].1);
             capacity_cells.push(0.0_f64);
+            capacity_lows.push(0.0_f64);
+            capacity_highs.push(0.0_f64);
             collapse_cells.push(0.0_f64);
+            collapse_lows.push(0.0_f64);
+            collapse_highs.push(0.0_f64);
             no_knee.push(1.0_f64);
         }
         let mut knee_values = service_time_cells
@@ -275,8 +306,14 @@ impl CapacityGrid {
         }
         Ok(Self {
             service_times_seconds: service_time_cells,
+            service_time_lows,
+            service_time_highs,
             capacities_per_second: capacity_cells,
+            capacity_lows,
+            capacity_highs,
             collapse_values: collapse_cells,
+            collapse_lows,
+            collapse_highs,
             no_knee,
             knee_values,
             knee_indexes,
@@ -304,6 +341,39 @@ impl CapacityGrid {
 
     pub(crate) const fn capacity_value_count(&self) -> u32 {
         self.capacity_count
+    }
+
+    fn throughput_interval(&self, index: usize, concurrency: f64) -> (f64, f64) {
+        let service_low = self.service_time_lows[index];
+        let service_high = self.service_time_highs[index];
+        if self.no_knee[index] > 0.0_f64 {
+            return (concurrency / service_high, concurrency / service_low);
+        }
+        let capacity_low = self.capacity_lows[index];
+        let capacity_high = self.capacity_highs[index];
+        let collapse_low = self.collapse_lows[index];
+        let collapse_high = self.collapse_highs[index];
+        let low = throughput(service_low, capacity_low, collapse_high, false, concurrency).min(
+            throughput(
+                service_high,
+                capacity_low,
+                collapse_high,
+                false,
+                concurrency,
+            ),
+        );
+        let high = if concurrency <= capacity_high * service_high {
+            (concurrency / service_low).min(capacity_high)
+        } else {
+            throughput(
+                service_high,
+                capacity_high,
+                collapse_low,
+                false,
+                concurrency,
+            )
+        };
+        (low, high)
     }
 }
 
@@ -377,6 +447,7 @@ impl CapacityFactor {
             });
         }
         for (index, cell) in cells.iter_mut().enumerate() {
+            let (low, high) = self.grid.throughput_interval(index, concurrency);
             cell.throughput_per_second = throughput(
                 self.grid.service_times_seconds[index],
                 self.grid.capacities_per_second[index],
@@ -384,6 +455,8 @@ impl CapacityFactor {
                 self.grid.no_knee[index] > 0.0_f64,
                 concurrency,
             );
+            cell.throughput_low_per_second = low;
+            cell.throughput_high_per_second = high;
             cell.probability = self.weights[index];
         }
         Ok(())
@@ -757,33 +830,31 @@ impl CapacityFactor {
     }
 
     fn update_window(&mut self, simd_level: Level, window: &ResourceWindow) {
-        let contamination_probability = self.grid.prior.window_contamination_probability();
+        let influence_bound_probability = self.grid.prior.window_influence_bound_probability();
         for (index, likelihood) in self.likelihoods.iter_mut().enumerate() {
-            let mean = window.exposure_seconds
-                * throughput(
-                    self.grid.service_times_seconds[index],
-                    self.grid.capacities_per_second[index],
-                    self.grid.collapse_values[index],
-                    self.grid.no_knee[index] > 0.0_f64,
-                    window.concurrency,
-                );
-            *likelihood = contaminated_poisson_log_likelihood(
-                window.completed_attempts,
-                mean,
-                contamination_probability,
+            let (low, high) = self.grid.throughput_interval(index, window.concurrency);
+            let mean = f64::from(window.completed_attempts).clamp(
+                window.exposure_seconds * low,
+                window.exposure_seconds * high,
             );
+            *likelihood = poisson_log_kernel(window.completed_attempts, mean);
         }
-        self.apply_likelihood(simd_level);
+        self.apply_likelihood(simd_level, influence_bound_probability);
     }
 
-    fn apply_likelihood(&mut self, simd_level: Level) {
+    fn apply_likelihood(&mut self, simd_level: Level, influence_bound_probability: f64) {
         let maximum = self
             .likelihoods
             .iter()
             .copied()
             .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            maximum.is_finite(),
+            "a capacity window must have a finite maximum likelihood"
+        );
+        let minimum = maximum + influence_bound_probability.ln();
         for likelihood in &mut self.likelihoods {
-            *likelihood = (*likelihood - maximum).exp();
+            *likelihood = (likelihood.max(minimum) - maximum).exp();
         }
         dispatch!(simd_level, simd => multiply_weights(simd, &mut self.weights, &self.likelihoods));
         let total = self.weights.iter().sum::<f64>();
@@ -936,6 +1007,52 @@ where
         center.midpoint(value(index + 1).ln())
     };
     (upper - lower) / (maximum - minimum)
+}
+
+fn log_axis_bounds(values: &[f64]) -> Vec<(f64, f64)> {
+    (0..values.len())
+        .map(|index| {
+            let low = if index == 0 {
+                values[0]
+            } else {
+                (values[index - 1] * values[index]).sqrt()
+            };
+            let high = if index + 1 == values.len() {
+                values[values.len() - 1]
+            } else {
+                (values[index] * values[index + 1]).sqrt()
+            };
+            (low, high)
+        })
+        .collect()
+}
+
+fn collapse_axis_bounds(values: &[f64]) -> Vec<(f64, f64)> {
+    if values[0] != 0.0_f64 {
+        return linear_axis_bounds(values);
+    }
+    let mut bounds = Vec::with_capacity(values.len());
+    bounds.push((0.0_f64, 0.0_f64));
+    bounds.extend(linear_axis_bounds(&values[1..]));
+    bounds
+}
+
+fn linear_axis_bounds(values: &[f64]) -> Vec<(f64, f64)> {
+    (0..values.len())
+        .map(|index| {
+            let low = if index == 0 {
+                values[0]
+            } else {
+                values[index - 1].midpoint(values[index])
+            };
+            let high = if index + 1 == values.len() {
+                values[values.len() - 1]
+            } else {
+                values[index].midpoint(values[index + 1])
+            };
+            (low, high)
+        })
+        .collect()
 }
 
 fn bounded_log_width<Value>(index: usize, count: usize, value: Value) -> f64
@@ -1187,28 +1304,7 @@ fn poisson_log_kernel(count: u32, mean: f64) -> f64 {
     }
 }
 
-/// Returns a robust Poisson log likelihood for one capacity cell.
-///
-/// The contaminant uses the Poisson profile likelihood. It is maximal at the
-/// observed count. One window therefore changes the log odds between any two
-/// cells by at most `ln(1 / contamination_probability)`.
-pub(crate) fn contaminated_poisson_log_likelihood(
-    count: u32,
-    mean: f64,
-    contamination_probability: f64,
-) -> f64 {
-    let modeled = (-contamination_probability).ln_1p() + poisson_log_kernel(count, mean);
-    let contaminant = contamination_probability.ln() + poisson_log_kernel(count, f64::from(count));
-    logaddexp(modeled, contaminant)
-}
-
-fn logaddexp(left: f64, right: f64) -> f64 {
-    let maximum = left.max(right);
-    let minimum = left.min(right);
-    maximum + (minimum - maximum).exp().ln_1p()
-}
-
-fn valid_contamination_probability(probability: f64) -> bool {
+fn valid_influence_bound_probability(probability: f64) -> bool {
     probability.is_finite() && probability > 0.0_f64 && probability < 0.5_f64
 }
 

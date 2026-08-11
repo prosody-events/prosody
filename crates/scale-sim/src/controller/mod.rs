@@ -18,6 +18,18 @@ use crate::{
 
 const HANDLER_COVERAGE_LEVELS: [f64; 4] = [0.5_f64, 0.8_f64, 0.9_f64, 0.95_f64];
 const HANDLER_RANK_BIN_COUNT: usize = 10;
+const GAUSS_LEGENDRE_NODES: [f64; 4] = [
+    0.183_434_642_495_649_8_f64,
+    0.525_532_409_916_329_f64,
+    0.796_666_477_413_626_7_f64,
+    0.960_289_856_497_536_3_f64,
+];
+const GAUSS_LEGENDRE_WEIGHTS: [f64; 4] = [
+    0.362_683_783_378_362_f64,
+    0.313_706_645_877_887_3_f64,
+    0.222_381_034_453_374_5_f64,
+    0.101_228_536_290_376_3_f64,
+];
 
 /// One controller result retained by the simulator.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1493,21 +1505,17 @@ impl<Workload> ClosedLoop<Workload> {
         Ok(())
     }
 
-    /// Adds a measured resource window between two ready plant states.
+    /// Adds a measured resource window between two plant states.
     ///
     /// Concurrency comes from occupancy, not replica count. Thus, a replica
-    /// change or rebalance pause does not invalidate a window. Occupancy and
-    /// completions fall together during a pause. A busy zero-completion window
-    /// is valid Poisson evidence. The contamination floor bounds its influence.
+    /// change, reconciliation, or pause does not invalidate a window. Occupancy
+    /// and completions fall together during reconciliation and pauses. A busy
+    /// zero-completion window is valid Poisson evidence. The rank floor bounds
+    /// its influence.
     fn prepare_capacity_evidence(&mut self, context: TickContext<'_>) -> Result<(), PlantError> {
         let Some(previous_micros) = context.history.now_micros(0) else {
             return Ok(());
         };
-        let ready =
-            context.history.partitions_ready(0).unwrap_or(false) && context.plant.partitions_ready;
-        if !ready {
-            return Ok(());
-        }
         let exposure_micros = context.now_micros.saturating_sub(previous_micros);
         if exposure_micros == 0 {
             return Ok(());
@@ -2093,7 +2101,7 @@ fn posterior_predictive_throughput_quantiles(
         let mut high = upper;
         while low < high {
             let middle = low + (high - low) / 2;
-            if predictive_throughput_cdf(cells, exposure_seconds, middle)? >= threshold {
+            if point_predictive_throughput_cdf(cells, exposure_seconds, middle)? >= threshold {
                 high = middle;
             } else {
                 low = middle + 1;
@@ -2112,15 +2120,66 @@ fn predictive_throughput_cdf(
 ) -> Result<f64, PlantError> {
     let mut cumulative = 0.0_f64;
     for cell in cells {
-        let mean = cell.throughput_per_second * exposure_seconds;
-        let probability = if mean <= f64::EPSILON {
-            1.0_f64
+        let low = cell.throughput_low_per_second;
+        let high = cell.throughput_high_per_second;
+        let probability = if high > low && low > 0.0_f64 {
+            log_uniform_predictive_throughput_cdf(low, high, exposure_seconds, completed_attempts)?
         } else {
-            Poisson::new(mean)?.cdf(completed_attempts)
+            poisson_cdf(
+                cell.throughput_per_second * exposure_seconds,
+                completed_attempts,
+            )?
         };
         cumulative += cell.probability * probability;
     }
     Ok(cumulative)
+}
+
+/// Approximates each cell's predictive spread as uniform in log throughput.
+///
+/// This spread is not the exact push-forward of the parameter prior. The
+/// calibration gates measure whether the approximation is adequate.
+fn log_uniform_predictive_throughput_cdf(
+    low: f64,
+    high: f64,
+    exposure_seconds: f64,
+    completed_attempts: u64,
+) -> Result<f64, PlantError> {
+    let log_low = low.ln();
+    let midpoint = log_low.midpoint(high.ln());
+    let half_width = (high.ln() - log_low) / 2.0_f64;
+    let mut integral = 0.0_f64;
+    for (&node, &weight) in GAUSS_LEGENDRE_NODES.iter().zip(&GAUSS_LEGENDRE_WEIGHTS) {
+        let lower_mean = (midpoint - half_width * node).exp() * exposure_seconds;
+        let upper_mean = (midpoint + half_width * node).exp() * exposure_seconds;
+        integral += weight
+            * (poisson_cdf(lower_mean, completed_attempts)?
+                + poisson_cdf(upper_mean, completed_attempts)?);
+    }
+    Ok(integral / 2.0_f64)
+}
+
+fn point_predictive_throughput_cdf(
+    cells: &[ThroughputPosteriorCell],
+    exposure_seconds: f64,
+    completed_attempts: u64,
+) -> Result<f64, PlantError> {
+    let mut cumulative = 0.0_f64;
+    for cell in cells {
+        cumulative += cell.probability
+            * poisson_cdf(
+                cell.throughput_per_second * exposure_seconds,
+                completed_attempts,
+            )?;
+    }
+    Ok(cumulative)
+}
+
+fn poisson_cdf(mean: f64, completed_attempts: u64) -> Result<f64, PlantError> {
+    if mean <= f64::EPSILON {
+        return Ok(1.0_f64);
+    }
+    Ok(Poisson::new(mean)?.cdf(completed_attempts))
 }
 
 fn write_rejection_curve(
