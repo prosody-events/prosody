@@ -361,6 +361,34 @@ pub struct ScaleScratch {
     resource_debt_events: f64,
     active_scenario_count: usize,
     decision_curve_sample_count: u32,
+    decision_demand_floor: usize,
+    decision_violation_allowance: f64,
+}
+
+/// Retained scalar columns for one replica action.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecisionActionColumns {
+    /// Zero-based replica action index.
+    pub action_index: u32,
+    /// Posterior SLO violation weight sum.
+    pub violation_weight_sum: f64,
+    /// Posterior excess delay sum.
+    pub excess_delay_sum: f64,
+    /// Posterior replica-seconds sum.
+    pub replica_seconds_sum: f64,
+}
+
+/// Bounded scalar summary for one controller decision.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecisionColumnSummary {
+    /// Columns for the selected action.
+    pub selected: DecisionActionColumns,
+    /// Columns for the next action under the same ordering.
+    pub runner_up: Option<DecisionActionColumns>,
+    /// Violation weight allowed by the selected feasible set.
+    pub violation_allowance: f64,
+    /// Smallest action index that covers known demand.
+    pub demand_floor: u32,
 }
 
 /// One worker's private buffers for evaluating whole scenarios.
@@ -712,6 +740,8 @@ impl ScaleScratch {
             resource_debt_events: 0.0_f64,
             active_scenario_count: posterior_sample_count,
             decision_curve_sample_count: 0,
+            decision_demand_floor: 0,
+            decision_violation_allowance: 0.0_f64,
         })
     }
 
@@ -719,6 +749,44 @@ impl ScaleScratch {
     #[must_use]
     pub fn decision_candidate_count(&self) -> usize {
         self.posterior_loss_sums.len()
+    }
+
+    /// Returns bounded scalar columns for the selected and runner-up actions.
+    #[must_use]
+    pub fn decision_column_summary(&self, selected: usize) -> Option<DecisionColumnSummary> {
+        let action_count = decision_action_count(self);
+        if self.decision_curve_sample_count == 0 || selected >= action_count {
+            return None;
+        }
+        let columns = ActionColumns {
+            violation_weight_sums: &self.posterior_violation_weight_sums[..action_count],
+            excess_delay_sums: &self.posterior_loss_sums[..action_count],
+            replica_seconds_sums: &self.posterior_replica_seconds_sums[..action_count],
+            demand_floor: self.decision_demand_floor,
+            scenario_weight_sum: f64::from(self.decision_curve_sample_count),
+            slo_violation_probability: 0.0_f64,
+        };
+        let runner_up = (0..action_count)
+            .filter(|index| *index != selected)
+            .min_by(|left, right| {
+                compare_actions(*left, *right, &columns, self.decision_violation_allowance)
+            })
+            .map(|index| self.action_columns(index));
+        Some(DecisionColumnSummary {
+            selected: self.action_columns(selected),
+            runner_up,
+            violation_allowance: self.decision_violation_allowance,
+            demand_floor: u32::try_from(self.decision_demand_floor).map_or(u32::MAX, |value| value),
+        })
+    }
+
+    fn action_columns(&self, index: usize) -> DecisionActionColumns {
+        DecisionActionColumns {
+            action_index: u32::try_from(index).map_or(u32::MAX, |value| value),
+            violation_weight_sum: self.posterior_violation_weight_sums[index],
+            excess_delay_sum: self.posterior_loss_sums[index],
+            replica_seconds_sum: self.posterior_replica_seconds_sums[index],
+        }
     }
 
     /// Writes the expected loss and posterior SLO pass probability.
@@ -1427,6 +1495,7 @@ fn numerical_decision_simd<S: Simd>(
     let bootstrap_tail_probability = state.configuration.objective.epsilon();
     let slo_violation_probability = state.configuration.objective.slo_violation_probability();
     let demand_floor = demand_floor(state, scratch, candidate_count);
+    scratch.decision_demand_floor = demand_floor;
     let nominal_target = select_action(&ActionColumns {
         violation_weight_sums: &scratch.posterior_violation_weight_sums[..candidate_count],
         excess_delay_sums: &scratch.posterior_loss_sums[..candidate_count],
@@ -1466,6 +1535,7 @@ fn numerical_decision_simd<S: Simd>(
         scenario_weight_sum: scenario_count_as_f64,
         slo_violation_probability,
     };
+    scratch.decision_violation_allowance = columns.violation_allowance();
     let transition_cost_sum = incumbent.map_or(0.0_f64, |incumbent| {
         transition_cost(state, incumbent, nominal_target) * scenario_count_as_f64
     });

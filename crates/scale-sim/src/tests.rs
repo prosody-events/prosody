@@ -328,7 +328,9 @@ fn one_harness_calculates_time_history_and_function_dependencies() -> Result<(),
 #[test]
 fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
     let closed_loop = capacity_test_closed_loop(CapacityWorkload, 8)?;
-    let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?.with_rebalance(0, 0);
+    let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?
+        .with_rebalance(0, 0)
+        .with_metric_poll_interval_micros(10_000);
     let mut harness = SimulationHarness::new(plant_configuration, 1, 8, closed_loop)?;
 
     let mut replicas = Vec::with_capacity(8);
@@ -361,8 +363,9 @@ fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
 #[test]
 fn closed_loop_accepts_ready_window_with_rebalance_pause() -> Result<(), TestError> {
     let closed_loop = capacity_test_closed_loop(CapacityWorkload, 8)?;
-    let plant_configuration =
-        PlantConfiguration::new(4, 100, 200, 8, 2, 16)?.with_rebalance(2_000, 0);
+    let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?
+        .with_rebalance(2_000, 0)
+        .with_metric_poll_interval_micros(10_000);
     let mut harness = SimulationHarness::new(plant_configuration, 1, 8, closed_loop)?;
     let mut snapshots = Vec::with_capacity(8);
     for tick in 0_u64..8 {
@@ -393,8 +396,9 @@ fn closed_loop_accepts_ready_window_with_rebalance_pause() -> Result<(), TestErr
 #[test]
 fn reconciliation_churn_does_not_starve_capacity_evidence() -> Result<(), TestError> {
     let closed_loop = capacity_test_closed_loop(ReconciliationChurnWorkload, 12)?;
-    let plant_configuration =
-        PlantConfiguration::new(4, 100, 240, 12, 2, 16)?.with_rebalance(20_000, 0);
+    let plant_configuration = PlantConfiguration::new(4, 100, 240, 12, 2, 16)?
+        .with_rebalance(20_000, 0)
+        .with_metric_poll_interval_micros(10_000);
     let mut harness = SimulationHarness::new(plant_configuration, 1, 12, closed_loop)?;
     let mut unready_ticks = 0_u8;
     for tick in 0_u64..12 {
@@ -454,8 +458,9 @@ fn run_idle_partition_capacity_trace(partition_count: u32) -> Result<(Vec<u64>, 
         capacity_grid,
         12,
     )?;
-    let plant_configuration =
-        PlantConfiguration::new(partition_count, 100, 240, 12, 2, 16)?.with_rebalance(2_000, 0);
+    let plant_configuration = PlantConfiguration::new(partition_count, 100, 240, 12, 2, 16)?
+        .with_rebalance(2_000, 0)
+        .with_metric_poll_interval_micros(10_000);
     let mut harness = SimulationHarness::new(plant_configuration, 1, 12, closed_loop)?;
     let mut rebalance_pause_micros = 0;
     for tick in 0_u64..12 {
@@ -522,6 +527,61 @@ fn capacity_test_closed_loop<Workload>(
         capacity_grid,
         sample_count_max,
     )?)
+}
+
+#[test]
+fn retargeted_up_cohorts_record_disjoint_replica_deltas() -> Result<(), TestError> {
+    let closed_loop = capacity_test_closed_loop(CohortSegmentWorkload, 10)?;
+    let plant_configuration = PlantConfiguration::new(4, 16, 16, 10, 2, 8)?;
+    let mut harness = SimulationHarness::new(plant_configuration, 1, 10, closed_loop)?;
+
+    for at_micros in [
+        0_u64,
+        10_000_000,
+        20_000_000,
+        100_000_000,
+        100_200_000,
+        120_000_000,
+        120_200_000,
+        121_000_000,
+    ] {
+        harness.tick(at_micros)?;
+    }
+    let actual_addition = harness.tick(122_000_000)?.replicas.saturating_sub(1);
+    let (_result, closed_loop) = harness.finish_with_graph();
+    let recorded_delta = (0..closed_loop.trace().len())
+        .filter_map(|index| closed_loop.trace().sample(index))
+        .filter_map(|sample| match sample.lead_time_evidence {
+            crate::LeadTimeEvidenceSample::Completed {
+                direction: prosody_scale_core::TransitionDirection::Up,
+                replica_delta,
+                ..
+            } => Some(replica_delta),
+            crate::LeadTimeEvidenceSample::None
+            | crate::LeadTimeEvidenceSample::Completed { .. }
+            | crate::LeadTimeEvidenceSample::Censored { .. } => None,
+        })
+        .sum::<u32>();
+
+    assert_eq!(actual_addition, 4);
+    assert_eq!(recorded_delta, actual_addition);
+    Ok(())
+}
+
+#[test]
+fn metric_flaps_between_polls_are_invisible_to_the_plant() -> Result<(), TestError> {
+    let configuration = PlantConfiguration::new(4, 4, 1, 4, 4, 2)?
+        .with_rebalance(0, 0)
+        .with_metric_poll_interval_micros(10);
+    let mut harness = SimulationHarness::new(configuration, 1, 5, MetricFlapWorkload)?;
+
+    for at_micros in [0_u64, 1, 2, 10, 11] {
+        harness.tick(at_micros)?;
+    }
+    let (result, _) = harness.finish_with_graph();
+    assert_eq!(result.changes.len(), 1);
+    assert_eq!(result.changes[0].replicas, 2);
+    Ok(())
 }
 
 #[test]
@@ -648,13 +708,54 @@ impl TickGenerator for RetargetWorkload {
             launch_delay_micros: 100_000_000,
             scale: ScaleDirective::Request {
                 replicas: if context.tick_index == 0 { 2 } else { 3 },
-                delay_micros: 100_000_000,
             },
         })
     }
 }
 
 struct CapacityWorkload;
+
+struct CohortSegmentWorkload;
+
+struct MetricFlapWorkload;
+
+impl TickGenerator for MetricFlapWorkload {
+    fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError> {
+        let scale = match context.tick_index {
+            1 => ScaleDirective::Request { replicas: 5 },
+            2 => ScaleDirective::Request { replicas: 2 },
+            _ => ScaleDirective::Hold,
+        };
+        Ok(TickInputs {
+            message_count: 0,
+            timer_count: 0,
+            handler_micros: 1_000,
+            dependency_operations: 0,
+            dependency_operation_micros: 0,
+            handler_added_micros: 0,
+            outcome: EventOutcomeRule::Success,
+            launch_delay_micros: 0,
+            scale,
+        })
+    }
+}
+
+impl TickGenerator for CohortSegmentWorkload {
+    fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError> {
+        let replicas = if context.tick_index == 1 { 3 } else { 5 };
+        Ok(TickInputs {
+            message_count: 0,
+            timer_count: 0,
+            handler_micros: 1_000,
+            dependency_operations: 0,
+            dependency_operation_micros: 0,
+            handler_added_micros: 0,
+            outcome: EventOutcomeRule::Success,
+            launch_delay_micros: 100_000_000,
+            scale: ScaleDirective::Request { replicas },
+        })
+    }
+}
 
 impl TickGenerator for CapacityWorkload {
     fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError> {
@@ -669,7 +770,6 @@ impl TickGenerator for CapacityWorkload {
             launch_delay_micros: 0,
             scale: ScaleDirective::Request {
                 replicas: u32::from(context.tick_index >= 3) + 1,
-                delay_micros: 0,
             },
         })
     }
@@ -692,7 +792,6 @@ impl TickGenerator for IdlePartitionCapacityWorkload {
             launch_delay_micros: 0,
             scale: ScaleDirective::Request {
                 replicas: u32::from(self.move_idle_partition && context.tick_index % 4 >= 2) + 1,
-                delay_micros: 0,
             },
         })
     }
@@ -726,7 +825,6 @@ impl TickGenerator for ReconciliationChurnWorkload {
             launch_delay_micros: 0,
             scale: ScaleDirective::Request {
                 replicas: context.tick_index % 2 + 1,
-                delay_micros: 0,
             },
         })
     }
@@ -837,10 +935,7 @@ impl OutputFunction<TickContext<'_>, (u32, u64, u64)> for RegimeOutput {
             outcome: EventOutcomeRule::Success,
             launch_delay_micros: 30_000,
             scale: if context.frame.tick_index == 0 {
-                ScaleDirective::Request {
-                    replicas: 4,
-                    delay_micros: 30_000,
-                }
+                ScaleDirective::Request { replicas: 4 }
             } else {
                 ScaleDirective::Hold
             },
@@ -1676,6 +1771,100 @@ fn repeated_pending_scale_target_keeps_original_readiness() -> Result<(), TestEr
 
     assert_eq!(plant.advance_until(100_000).replicas, 2);
     Ok(())
+}
+
+#[test]
+fn adversarial_up_delays_never_reduce_ready_replicas() -> Result<(), TestError> {
+    let configuration = PlantConfiguration::new(4, 4, 1, 8, 4, 2)?.with_rebalance(0, 0);
+    let mut plant = Plant::new(configuration, 1)?;
+    for change in [
+        ScaleChange {
+            at_micros: 90,
+            replicas: 2,
+        },
+        ScaleChange {
+            at_micros: 30,
+            replicas: 3,
+        },
+        ScaleChange {
+            at_micros: 60,
+            replicas: 4,
+        },
+        ScaleChange {
+            at_micros: 20,
+            replicas: 5,
+        },
+    ] {
+        plant.replace_scale_target(change)?;
+    }
+
+    let mut previous = 1;
+    for at_micros in [20_u64, 30, 60, 90, 100] {
+        let ready = plant.advance_until(at_micros).replicas;
+        assert!(ready >= previous);
+        previous = ready;
+    }
+    assert_eq!(previous, 5);
+    Ok(())
+}
+
+#[quickcheck]
+fn latest_count_actuation_converges_and_preserves_bounds(input: Vec<(u8, u8)>) -> bool {
+    let Ok(configuration) = PlantConfiguration::new(4, 4, 1, 64, 4, 2) else {
+        return false;
+    };
+    let Ok(mut plant) = Plant::new(configuration.with_rebalance(0, 0), 1) else {
+        return false;
+    };
+    let mut now_micros = 0_u64;
+    let mut prior_ready = 1_u32;
+    for (target, delay) in input.into_iter().take(32) {
+        let replicas = u32::from(target % 16) + 1;
+        let ready_micros = now_micros.saturating_add(u64::from(delay) + 1);
+        if plant
+            .replace_scale_target(ScaleChange {
+                at_micros: ready_micros,
+                replicas,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        let snapshot = plant.advance_until(now_micros);
+        if snapshot.replicas < prior_ready
+            && !plant.applied_changes.last().is_some_and(|change| {
+                change.at_micros == now_micros && change.replicas == snapshot.replicas
+            })
+        {
+            return false;
+        }
+        let mode_holds = match &plant.pending_actuation {
+            crate::PendingActuation::Converged(cohorts) => {
+                cohorts.iter().all(|cohort| cohort.count == 0)
+                    && snapshot.replicas == plant.desired_replicas
+            }
+            crate::PendingActuation::Up(_) => {
+                snapshot.replicas <= plant.desired_replicas
+                    && snapshot.replicas.saturating_add(plant.in_flight_replicas())
+                        <= plant.desired_replicas
+            }
+            crate::PendingActuation::Down {
+                down,
+                inactive_up_storage,
+            } => {
+                inactive_up_storage.iter().all(|cohort| cohort.count == 0)
+                    && down.target == plant.desired_replicas
+                    && plant.desired_replicas < snapshot.replicas
+            }
+        };
+        if !mode_holds {
+            return false;
+        }
+        prior_ready = snapshot.replicas;
+        now_micros = now_micros.saturating_add(1);
+    }
+    let final_snapshot = plant.advance_until(now_micros.saturating_add(256));
+    final_snapshot.replicas == plant.desired_replicas && plant.in_flight_replicas() == 0
 }
 
 #[test]

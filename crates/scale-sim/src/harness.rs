@@ -272,12 +272,10 @@ pub enum ScaleDirective {
     Hold,
     /// Keep an externally owned desired replica count.
     ExternalHold,
-    /// Request a replica count after one actuator delay.
+    /// Publish one desired replica count.
     Request {
         /// Desired replica count.
         replicas: u32,
-        /// Delay until the new replicas become ready.
-        delay_micros: u64,
     },
 }
 
@@ -352,6 +350,15 @@ pub trait TickGenerator {
         inputs: TickInputs,
     ) -> Result<TickInputs, PlantError> {
         Ok(inputs)
+    }
+
+    /// Records one desired-replica metric value consumed by the actuator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the observation exceeds a fixed bound.
+    fn metric_polled(&mut self, _: TickContext<'_>, _: u32, _: u32) -> Result<(), PlantError> {
+        Ok(())
     }
 
     /// Calculates the frozen calendar input for this tick.
@@ -535,7 +542,7 @@ impl TickHistory {
             ScaleDirective::Hold | ScaleDirective::ExternalHold => {
                 self.latest_desired_replicas(plant.replicas)
             }
-            ScaleDirective::Request { replicas, .. } => replicas,
+            ScaleDirective::Request { replicas } => replicas,
         };
         let partition_start = index * self.partition_count;
         let partition_end = partition_start + self.partition_count;
@@ -772,6 +779,9 @@ pub struct SimulationHarness<Graph, Model = DefaultTickAttemptModel> {
     key_count: u32,
     event_count: u32,
     tick_index: u32,
+    published_replicas: u32,
+    next_metric_poll_micros: u64,
+    metric_poll_interval_micros: u64,
     partition_normal_backlog: Vec<u32>,
     partition_normal_oldest_release_micros: Vec<u64>,
     partition_failure_backlog: Vec<u32>,
@@ -820,6 +830,12 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
     ) -> Result<Self, PlantError> {
         let partition_count = configuration.partition_count;
         let key_count = configuration.key_count;
+        let metric_poll_interval_micros = configuration.metric_poll_interval_micros();
+        if metric_poll_interval_micros == 0 {
+            return Err(PlantError::ZeroBound {
+                name: "metric_poll_interval_micros",
+            });
+        }
         let plant = Plant::with_attempt_model(configuration, initial_replicas, attempt_model)?;
         let partition_capacity =
             usize::try_from(partition_count).map_err(|_| PlantError::PlatformLimit)?;
@@ -831,11 +847,49 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             key_count,
             event_count: 0,
             tick_index: 0,
+            published_replicas: initial_replicas,
+            next_metric_poll_micros: 0,
+            metric_poll_interval_micros,
             partition_normal_backlog: vec![0; partition_capacity],
             partition_normal_oldest_release_micros: vec![0; partition_capacity],
             partition_failure_backlog: vec![0; partition_capacity],
             partition_failure_release_micros: vec![0; partition_capacity],
         })
+    }
+
+    fn poll_metric(
+        &mut self,
+        now_micros: u64,
+        inputs: TickInputs,
+        plant: PlantSnapshot,
+    ) -> Result<(), PlantError> {
+        if now_micros < self.next_metric_poll_micros {
+            return Ok(());
+        }
+        self.next_metric_poll_micros = now_micros.saturating_add(self.metric_poll_interval_micros);
+        self.plant.replace_scale_target(ScaleChange {
+            at_micros: now_micros.saturating_add(inputs.launch_delay_micros),
+            replicas: self.published_replicas,
+        })?;
+        self.graph.metric_polled(
+            TickContext {
+                now_micros,
+                tick_index: self.tick_index,
+                plant,
+                history: self.history.view(),
+                normal_backlog: NormalBacklogView {
+                    counts: &self.partition_normal_backlog,
+                    oldest_release_micros: &self.partition_normal_oldest_release_micros,
+                },
+                failure_backlog: FailureBacklogView {
+                    counts: &self.partition_failure_backlog,
+                    release_micros: &self.partition_failure_release_micros,
+                },
+                completed_settlements: self.plant.completed_settlements(),
+            },
+            self.published_replicas,
+            self.plant.in_flight_replicas(),
+        )
     }
 
     /// Calculates one input row and advances the plant at that time.
@@ -926,16 +980,10 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             },
             inputs,
         )?;
-        if let ScaleDirective::Request {
-            replicas,
-            delay_micros,
-        } = observed_inputs.scale
-        {
-            self.plant.replace_scale_target(ScaleChange {
-                at_micros: now_micros.saturating_add(delay_micros),
-                replicas,
-            })?;
+        if let ScaleDirective::Request { replicas } = observed_inputs.scale {
+            self.published_replicas = replicas;
         }
+        self.poll_metric(now_micros, inputs, after)?;
         self.history.push(
             now_micros,
             after,

@@ -233,7 +233,6 @@ impl TickGenerator for BatchGraph {
         } else {
             ScaleDirective::Request {
                 replicas: self.target,
-                delay_micros: self.delay_micros,
             }
         };
         Ok(TickInputs {

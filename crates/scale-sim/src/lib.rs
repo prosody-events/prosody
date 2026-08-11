@@ -7,6 +7,7 @@ use prosody_scale_core::{DemandClass, RandomStream};
 use rayon::prelude::*;
 use statrs::distribution::{BinomialError, NegativeBinomialError, PoissonError};
 use std::collections::VecDeque;
+use std::mem;
 use std::num::NonZeroU8;
 use thiserror::Error;
 
@@ -185,6 +186,7 @@ pub struct PlantConfiguration {
     key_count: u32,
     event_count_max: u32,
     change_count_max: u32,
+    metric_poll_interval_micros: u64,
     slots_per_replica: u32,
     dependency_slots: u32,
     dependency_operation_micros: StepSeries<u64>,
@@ -219,6 +221,7 @@ impl PlantConfiguration {
             key_count,
             event_count_max,
             change_count_max,
+            metric_poll_interval_micros: 1_000_000,
             slots_per_replica,
             dependency_slots,
             dependency_operation_micros: StepSeries::constant(1_000),
@@ -233,6 +236,17 @@ impl PlantConfiguration {
             ),
             handler_latency_curve: ConcurrencyLatencyCurve::zero(),
         })
+    }
+
+    /// Sets the interval between desired-replica metric polls.
+    #[must_use]
+    pub const fn with_metric_poll_interval_micros(mut self, micros: u64) -> Self {
+        self.metric_poll_interval_micros = micros;
+        self
+    }
+
+    const fn metric_poll_interval_micros(&self) -> u64 {
+        self.metric_poll_interval_micros
     }
 
     /// Sets the duration of one dependency operation.
@@ -425,6 +439,56 @@ pub struct ScaleChange {
     pub replicas: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScaleUpCohort {
+    count: u32,
+    ready_micros: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScaleDown {
+    target: u32,
+    apply_micros: u64,
+    generation: u32,
+}
+
+/// One mutually exclusive aggregate actuation mode.
+enum PendingActuation {
+    Converged(Vec<ScaleUpCohort>),
+    Up(Vec<ScaleUpCohort>),
+    Down {
+        down: ScaleDown,
+        inactive_up_storage: Vec<ScaleUpCohort>,
+    },
+}
+
+fn cohort_replica_count(cohorts: &[ScaleUpCohort]) -> u32 {
+    cohorts
+        .iter()
+        .fold(0_u32, |total, cohort| total.saturating_add(cohort.count))
+}
+
+fn cancel_excess_scale_up(cohorts: &mut [ScaleUpCohort], mut excess: u32) {
+    while excess > 0 {
+        let Some(index) = cohorts
+            .iter()
+            .enumerate()
+            .filter(|(_, cohort)| cohort.count > 0)
+            .max_by_key(|(_, cohort)| cohort.ready_micros)
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let canceled = excess.min(cohorts[index].count);
+        cohorts[index].count -= canceled;
+        excess -= canceled;
+    }
+    assert_eq!(
+        excess, 0,
+        "the active cohorts must cover the canceled excess"
+    );
+}
+
 /// One desired replica change before actuator delay.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScaleRequest {
@@ -572,8 +636,9 @@ pub struct Plant<M = SeriesAttemptModel> {
     attempt_model: M,
     replicas: u32,
     events: Vec<EventSpec>,
-    changes: Vec<ScaleChange>,
-    change_active: Vec<bool>,
+    pending_actuation: PendingActuation,
+    scale_down_generation: u32,
+    scale_schedule_count: usize,
     applied_changes: Vec<ScaleChange>,
     desired_replicas: u32,
     heap: Vec<Scheduled>,
@@ -679,8 +744,9 @@ impl<M: AttemptModel> Plant<M> {
             attempt_model,
             replicas: initial_replicas,
             events: Vec::with_capacity(event_count_max),
-            changes: Vec::with_capacity(change_count_max),
-            change_active: Vec::with_capacity(change_count_max),
+            pending_actuation: PendingActuation::Converged(Vec::with_capacity(change_count_max)),
+            scale_down_generation: 0,
+            scale_schedule_count: 0,
             applied_changes: Vec::with_capacity(change_count_max),
             desired_replicas: initial_replicas,
             heap: Vec::with_capacity(heap_capacity),
@@ -772,37 +838,20 @@ impl<M: AttemptModel> Plant<M> {
         Ok(())
     }
 
-    /// Adds one replica change without growing retained memory.
+    /// Adds one already-timed aggregate replica target.
     ///
     /// # Errors
     ///
-    /// Returns an error for zero replicas or a full change buffer.
+    /// Returns an error for zero replicas or a full actuation buffer.
     pub fn add_scale_change(&mut self, change: ScaleChange) -> Result<(), PlantError> {
-        validate_positive(change.replicas, "replicas")?;
-        if self.changes.len() == self.changes.capacity() {
-            return Err(PlantError::ChangeCapacity);
-        }
-        self.changes.push(change);
-        self.change_active.push(true);
-        if self.started {
-            let change_index = self.changes.len() - 1;
-            let ordinal = self.events.len().saturating_add(change_index);
-            let ordinal = u32::try_from(ordinal).map_err(|_| PlantError::PlatformLimit)?;
-            heap_push(
-                &mut self.heap,
-                Scheduled {
-                    at_micros: change.at_micros,
-                    ordinal,
-                    kind: ScheduledKind::Scale(change_index as u32),
-                },
-            );
-        }
-        Ok(())
+        self.replace_scale_target(change)
     }
 
-    /// Reconciles pending replica capacity with one new desired target.
+    /// Publishes one polled aggregate target with its sampled apply time.
     ///
-    /// A new target preserves each pending replica subset that it still needs.
+    /// Ready replicas only decrease when a pending down applies. Ready replicas
+    /// plus active up cohorts never exceed the latest polled target. With no
+    /// pending actuation, ready replicas equal that target.
     ///
     /// # Errors
     ///
@@ -813,40 +862,205 @@ impl<M: AttemptModel> Plant<M> {
             return Ok(());
         }
         self.desired_replicas = change.replicas;
+        if change.replicas < self.replicas {
+            self.schedule_scale_down(change)?;
+        } else {
+            self.scale_down_generation = self.scale_down_generation.wrapping_add(1);
+            let mut cohorts = self.take_cohort_storage();
+            let in_flight = cohort_replica_count(&cohorts);
+            let planned = self.replicas.saturating_add(in_flight);
+            if change.replicas < planned {
+                cancel_excess_scale_up(&mut cohorts, planned - change.replicas);
+            } else if change.replicas > planned {
+                self.schedule_scale_up(&mut cohorts, change.replicas - planned, change.at_micros)?;
+            }
+            self.pending_actuation = if cohort_replica_count(&cohorts) == 0 {
+                PendingActuation::Converged(cohorts)
+            } else {
+                PendingActuation::Up(cohorts)
+            };
+        }
+        self.assert_scale_invariants();
+        Ok(())
+    }
 
-        if change.replicas <= self.replicas {
-            for active in &mut self.change_active {
-                *active = false;
-            }
-            if change.replicas == self.replicas {
-                return Ok(());
-            }
-            return self.add_scale_change(change);
+    pub(crate) fn in_flight_replicas(&self) -> u32 {
+        match &self.pending_actuation {
+            PendingActuation::Up(cohorts) => cohort_replica_count(cohorts),
+            PendingActuation::Converged(_) | PendingActuation::Down { .. } => 0,
         }
+    }
 
-        let mut preserved_target = self.replicas;
-        let mut preserved_exact = false;
-        for (index, active) in self.change_active.iter_mut().enumerate() {
-            if !*active {
-                continue;
+    fn take_cohort_storage(&mut self) -> Vec<ScaleUpCohort> {
+        let mode = mem::replace(
+            &mut self.pending_actuation,
+            PendingActuation::Converged(Vec::new()),
+        );
+        let was_up = matches!(&mode, PendingActuation::Up(_));
+        let mut cohorts = match mode {
+            PendingActuation::Converged(cohorts) | PendingActuation::Up(cohorts) => cohorts,
+            PendingActuation::Down {
+                inactive_up_storage,
+                ..
+            } => inactive_up_storage,
+        };
+        if !was_up {
+            for cohort in &mut cohorts {
+                cohort.count = 0;
             }
-            let pending = &mut self.changes[index];
-            if pending.replicas > change.replicas {
-                pending.replicas = change.replicas;
-            }
-            if pending.replicas == change.replicas {
-                if preserved_exact {
-                    *active = false;
-                    continue;
-                }
-                preserved_exact = true;
-            }
-            preserved_target = preserved_target.max(pending.replicas);
         }
-        if preserved_target == change.replicas {
-            return Ok(());
+        cohorts
+    }
+
+    fn reserve_scale_schedule(&mut self) -> Result<u32, PlantError> {
+        let schedule_capacity = usize::try_from(self.configuration.change_count_max)
+            .map_err(|_| PlantError::PlatformLimit)?;
+        if self.scale_schedule_count == schedule_capacity {
+            return Err(PlantError::ChangeCapacity);
         }
-        self.add_scale_change(change)
+        let ordinal =
+            u32::try_from(self.scale_schedule_count).map_err(|_| PlantError::PlatformLimit)?;
+        self.scale_schedule_count += 1;
+        Ok(ordinal)
+    }
+
+    fn schedule_scale_up(
+        &mut self,
+        cohorts: &mut Vec<ScaleUpCohort>,
+        count: u32,
+        ready_micros: u64,
+    ) -> Result<(), PlantError> {
+        let ordinal = self.reserve_scale_schedule()?;
+        let index = u32::try_from(cohorts.len()).map_err(|_| PlantError::PlatformLimit)?;
+        cohorts.push(ScaleUpCohort {
+            count,
+            ready_micros,
+        });
+        heap_push(
+            &mut self.heap,
+            Scheduled {
+                at_micros: ready_micros,
+                ordinal,
+                kind: ScheduledKind::ScaleUp(index),
+            },
+        );
+        Ok(())
+    }
+
+    fn schedule_scale_down(&mut self, change: ScaleChange) -> Result<(), PlantError> {
+        let ordinal = self.reserve_scale_schedule()?;
+        self.scale_down_generation = self.scale_down_generation.wrapping_add(1);
+        let generation = self.scale_down_generation;
+        let mut cohorts = self.take_cohort_storage();
+        for cohort in &mut cohorts {
+            cohort.count = 0;
+        }
+        let down = ScaleDown {
+            target: change.replicas,
+            apply_micros: change.at_micros,
+            generation,
+        };
+        self.pending_actuation = PendingActuation::Down {
+            down,
+            inactive_up_storage: cohorts,
+        };
+        heap_push(
+            &mut self.heap,
+            Scheduled {
+                at_micros: change.at_micros,
+                ordinal,
+                kind: ScheduledKind::ScaleDown(generation),
+            },
+        );
+        Ok(())
+    }
+
+    fn apply_scale_up(&mut self, cohort: u32, now_micros: u64) {
+        let cohort = cohort as usize;
+        let PendingActuation::Up(cohorts) = &mut self.pending_actuation else {
+            return;
+        };
+        let count = cohorts[cohort].count;
+        if count == 0 {
+            return;
+        }
+        cohorts[cohort].count = 0;
+        let converged = cohort_replica_count(cohorts) == 0;
+        let previous = self.replicas;
+        let replicas = previous.saturating_add(count);
+        assert!(
+            replicas >= previous,
+            "an up cohort must not decrease ready replicas"
+        );
+        self.apply_scale(replicas, cohort as u32, now_micros);
+        if converged {
+            let cohorts = self.take_cohort_storage();
+            self.pending_actuation = PendingActuation::Converged(cohorts);
+        }
+        self.assert_scale_invariants();
+    }
+
+    fn apply_scale_down(&mut self, generation: u32, now_micros: u64) {
+        let PendingActuation::Down { down, .. } = &self.pending_actuation else {
+            return;
+        };
+        let pending = *down;
+        if pending.generation != generation || pending.apply_micros != now_micros {
+            return;
+        }
+        let cohorts = self.take_cohort_storage();
+        self.pending_actuation = PendingActuation::Converged(cohorts);
+        assert!(
+            pending.target < self.replicas,
+            "a down must lower ready replicas"
+        );
+        self.apply_scale(pending.target, generation, now_micros);
+        self.assert_scale_invariants();
+    }
+
+    fn assert_scale_invariants(&self) {
+        match &self.pending_actuation {
+            PendingActuation::Converged(cohorts) => {
+                assert_eq!(
+                    cohort_replica_count(cohorts),
+                    0,
+                    "converged actuation must not contain an active cohort"
+                );
+                assert_eq!(
+                    self.replicas, self.desired_replicas,
+                    "converged actuation must reach the published count"
+                );
+            }
+            PendingActuation::Up(cohorts) => {
+                assert!(
+                    self.desired_replicas >= self.replicas,
+                    "up actuation must not publish below the ready count"
+                );
+                assert!(
+                    self.replicas.saturating_add(cohort_replica_count(cohorts))
+                        <= self.desired_replicas,
+                    "ready and in-flight replicas must not exceed the published count"
+                );
+            }
+            PendingActuation::Down {
+                down,
+                inactive_up_storage,
+            } => {
+                assert_eq!(
+                    cohort_replica_count(inactive_up_storage),
+                    0,
+                    "down actuation must not contain an active up cohort"
+                );
+                assert_eq!(
+                    self.desired_replicas, down.target,
+                    "down actuation must apply the published count"
+                );
+                assert!(
+                    down.target < self.replicas,
+                    "down actuation must terminate ready replicas"
+                );
+            }
+        }
     }
 
     /// Samples actuator delay and schedules one desired replica change.
@@ -863,7 +1077,7 @@ impl<M: AttemptModel> Plant<M> {
         let ready_micros = request
             .at_micros
             .saturating_add(delays_micros.sample(random));
-        self.add_scale_change(ScaleChange {
+        self.replace_scale_target(ScaleChange {
             at_micros: ready_micros,
             replicas: request.replicas,
         })?;
@@ -908,10 +1122,12 @@ impl<M: AttemptModel> Plant<M> {
                     self.active_dependency_operations =
                         self.active_dependency_operations.saturating_sub(1);
                 }
-                ScheduledKind::Scale(change) if self.change_active[change as usize] => {
-                    self.apply_scale(change, scheduled.at_micros);
+                ScheduledKind::ScaleUp(cohort) => {
+                    self.apply_scale_up(cohort, scheduled.at_micros);
                 }
-                ScheduledKind::Scale(_) => {}
+                ScheduledKind::ScaleDown(generation) => {
+                    self.apply_scale_down(generation, scheduled.at_micros);
+                }
                 ScheduledKind::ReconcileStart { partition, epoch } => {
                     self.start_reconciliation(partition, epoch);
                 }
@@ -1069,15 +1285,6 @@ impl<M: AttemptModel> Plant<M> {
                 at_micros: self.events[event].release_micros,
                 ordinal: event as u32,
                 kind: ScheduledKind::Arrival(event as u32),
-            };
-            heap_push(&mut self.heap, scheduled);
-        }
-        let ordinal_base = self.events.len() as u32;
-        for change in 0..self.changes.len() {
-            let scheduled = Scheduled {
-                at_micros: self.changes[change].at_micros,
-                ordinal: ordinal_base + change as u32,
-                kind: ScheduledKind::Scale(change as u32),
             };
             heap_push(&mut self.heap, scheduled);
         }
@@ -1467,10 +1674,12 @@ impl<M: AttemptModel> Plant<M> {
         }
     }
 
-    fn apply_scale(&mut self, change: u32, now_micros: u64) {
-        let applied = self.changes[change as usize];
-        self.replicas = applied.replicas;
-        self.change_active[change as usize] = false;
+    fn apply_scale(&mut self, replicas: u32, ordinal: u32, now_micros: u64) {
+        let applied = ScaleChange {
+            at_micros: now_micros,
+            replicas,
+        };
+        self.replicas = replicas;
         self.applied_changes.push(applied);
         sticky_assignment(
             &self.partition_owner,
@@ -1492,7 +1701,7 @@ impl<M: AttemptModel> Plant<M> {
             let timing = self
                 .configuration
                 .rebalance
-                .sample(change, partition as u32);
+                .sample(ordinal, partition as u32);
             let pause_micros = now_micros.saturating_add(timing.notification);
             let ready_micros = pause_micros
                 .saturating_add(timing.revocation)
@@ -1702,7 +1911,8 @@ enum ScheduledKind {
     AttemptDone(u32),
     RetryReady(u32),
     DependencyDone,
-    Scale(u32),
+    ScaleUp(u32),
+    ScaleDown(u32),
     ReconcileStart { partition: u32, epoch: u32 },
     ReconcileReady { partition: u32, epoch: u32 },
 }
@@ -1785,7 +1995,9 @@ fn heap_sift_down(heap: &mut [Scheduled]) {
 fn schedule_key(value: Scheduled) -> (u64, u8, u32) {
     let phase = match value.kind {
         ScheduledKind::DependencyDone => 0,
-        ScheduledKind::Scale(_) | ScheduledKind::ReconcileStart { .. } => 1,
+        ScheduledKind::ScaleUp(_)
+        | ScheduledKind::ScaleDown(_)
+        | ScheduledKind::ReconcileStart { .. } => 1,
         ScheduledKind::AttemptDone(_)
         | ScheduledKind::RetryReady(_)
         | ScheduledKind::ReconcileReady { .. } => 2,

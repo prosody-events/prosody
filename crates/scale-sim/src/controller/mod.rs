@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use prosody_scale_core::{
@@ -50,6 +51,24 @@ pub struct ControllerSample {
     pub shortfall: f64,
     /// Posterior expected fractional loss.
     pub expected_loss: f64,
+    /// Selected action violation weight sum.
+    pub selected_violation_weight_sum: f64,
+    /// Selected action excess delay sum.
+    pub selected_excess_delay_sum: f64,
+    /// Selected action replica-seconds sum.
+    pub selected_replica_seconds_sum: f64,
+    /// Zero-based runner-up action index.
+    pub runner_up_action_index: u32,
+    /// Runner-up action violation weight sum.
+    pub runner_up_violation_weight_sum: f64,
+    /// Runner-up action excess delay sum.
+    pub runner_up_excess_delay_sum: f64,
+    /// Runner-up action replica-seconds sum.
+    pub runner_up_replica_seconds_sum: f64,
+    /// Violation weight allowance for the decision.
+    pub violation_allowance: f64,
+    /// Zero-based demand-floor action index.
+    pub demand_floor: u32,
     /// Posterior expected arrival rate.
     pub arrival_rate_per_second: f64,
     /// Arrival evidence accepted at this controller tick.
@@ -219,6 +238,15 @@ pub struct ControllerTrace {
     hold_reason: Vec<Option<HoldReason>>,
     shortfall: Vec<f64>,
     expected_loss: Vec<f64>,
+    selected_violation_weight_sum: Vec<f64>,
+    selected_excess_delay_sum: Vec<f64>,
+    selected_replica_seconds_sum: Vec<f64>,
+    runner_up_action_index: Vec<u32>,
+    runner_up_violation_weight_sum: Vec<f64>,
+    runner_up_excess_delay_sum: Vec<f64>,
+    runner_up_replica_seconds_sum: Vec<f64>,
+    violation_allowance: Vec<f64>,
+    demand_floor: Vec<u32>,
     arrival_rate_per_second: Vec<f64>,
     arrival_evidence: Vec<bool>,
     arrival_evidence_count: Vec<u32>,
@@ -366,6 +394,15 @@ impl ControllerTrace {
             hold_reason: Vec::with_capacity(capacity),
             shortfall: Vec::with_capacity(capacity),
             expected_loss: Vec::with_capacity(capacity),
+            selected_violation_weight_sum: Vec::with_capacity(capacity),
+            selected_excess_delay_sum: Vec::with_capacity(capacity),
+            selected_replica_seconds_sum: Vec::with_capacity(capacity),
+            runner_up_action_index: Vec::with_capacity(capacity),
+            runner_up_violation_weight_sum: Vec::with_capacity(capacity),
+            runner_up_excess_delay_sum: Vec::with_capacity(capacity),
+            runner_up_replica_seconds_sum: Vec::with_capacity(capacity),
+            violation_allowance: Vec::with_capacity(capacity),
+            demand_floor: Vec::with_capacity(capacity),
             arrival_rate_per_second: Vec::with_capacity(capacity),
             arrival_evidence: Vec::with_capacity(capacity),
             arrival_evidence_count: Vec::with_capacity(capacity),
@@ -457,6 +494,15 @@ impl ControllerTrace {
             hold_reason: self.hold_reason[index],
             shortfall: self.shortfall[index],
             expected_loss: self.expected_loss[index],
+            selected_violation_weight_sum: self.selected_violation_weight_sum[index],
+            selected_excess_delay_sum: self.selected_excess_delay_sum[index],
+            selected_replica_seconds_sum: self.selected_replica_seconds_sum[index],
+            runner_up_action_index: self.runner_up_action_index[index],
+            runner_up_violation_weight_sum: self.runner_up_violation_weight_sum[index],
+            runner_up_excess_delay_sum: self.runner_up_excess_delay_sum[index],
+            runner_up_replica_seconds_sum: self.runner_up_replica_seconds_sum[index],
+            violation_allowance: self.violation_allowance[index],
+            demand_floor: self.demand_floor[index],
             arrival_rate_per_second: self.arrival_rate_per_second[index],
             arrival_evidence: self.arrival_evidence_sample(index),
             arrival_predictive_low_count: self.arrival_predictive_low_count[index],
@@ -715,6 +761,7 @@ impl ControllerTrace {
             return Err(PlantError::MetricCapacity);
         }
         self.push_sample_columns(sample);
+        self.push_decision_columns(sample.target, scratch);
         self.push_decision_curves(scratch)?;
         self.push_posteriors(state)?;
         Ok(())
@@ -804,6 +851,33 @@ impl ControllerTrace {
             .push(sample.capacity_predictive_high_per_second);
         self.capacity_predictive_rank
             .push(sample.capacity_predictive_rank);
+    }
+
+    fn push_decision_columns(&mut self, target: u32, scratch: &ScaleScratch) {
+        let summary = usize::try_from(target)
+            .ok()
+            .and_then(|target| target.checked_sub(1))
+            .and_then(|selected| scratch.decision_column_summary(selected));
+        let selected = summary.map(|summary| summary.selected);
+        let runner_up = summary.and_then(|summary| summary.runner_up);
+        self.selected_violation_weight_sum
+            .push(selected.map_or(f64::NAN, |action| action.violation_weight_sum));
+        self.selected_excess_delay_sum
+            .push(selected.map_or(f64::NAN, |action| action.excess_delay_sum));
+        self.selected_replica_seconds_sum
+            .push(selected.map_or(f64::NAN, |action| action.replica_seconds_sum));
+        self.runner_up_action_index
+            .push(runner_up.map_or(u32::MAX, |action| action.action_index));
+        self.runner_up_violation_weight_sum
+            .push(runner_up.map_or(f64::NAN, |action| action.violation_weight_sum));
+        self.runner_up_excess_delay_sum
+            .push(runner_up.map_or(f64::NAN, |action| action.excess_delay_sum));
+        self.runner_up_replica_seconds_sum
+            .push(runner_up.map_or(f64::NAN, |action| action.replica_seconds_sum));
+        self.violation_allowance
+            .push(summary.map_or(f64::NAN, |summary| summary.violation_allowance));
+        self.demand_floor
+            .push(summary.map_or(u32::MAX, |summary| summary.demand_floor));
     }
 
     fn push_decision_curves(&mut self, scratch: &ScaleScratch) -> Result<(), PlantError> {
@@ -958,7 +1032,8 @@ pub struct ClosedLoop<Workload> {
     capacity_evidence_sample: CapacityEvidenceSample,
     throughput_posterior_scratch: Vec<ThroughputPosteriorCell>,
     inflight_transitions: Vec<PendingTransition>,
-    pending_transition_observation: Option<PendingTransitionObservation>,
+    ready_transitions: Vec<PendingTransition>,
+    pending_transition_observations: VecDeque<PendingTransitionObservation>,
     lead_time_evidence_sample: LeadTimeEvidenceSample,
     trace: ControllerTrace,
     diagnostic_seed: u64,
@@ -993,6 +1068,11 @@ struct CapacityWindow {
     completed_attempts: u32,
 }
 
+/// One aggregate-readiness observation segment.
+///
+/// The controller observes only published and ready replica counts. A segment
+/// measures when its target first became ready after its anchor was demanded.
+/// It never attributes readiness to a specific cohort.
 #[derive(Clone, Copy)]
 struct PendingTransition {
     from_replicas: u32,
@@ -1120,6 +1200,8 @@ impl<Workload> ClosedLoop<Workload> {
         let throughput_posterior_count = usize::try_from(state.throughput_posterior_value_count())
             .map_err(|_| ConfigurationError::PlatformLimit)?;
         let partition_posterior_count = trace.partition_share_posterior.values.len();
+        let transition_capacity =
+            usize::try_from(trace_count_max).map_err(|_| ConfigurationError::PlatformLimit)?;
         let scratch = ScaleScratch::new(core_configuration)?;
         let observation = ObservationBuffer::new(core_configuration)?;
         Ok(Self {
@@ -1145,10 +1227,9 @@ impl<Workload> ClosedLoop<Workload> {
                 ThroughputPosteriorCell::default();
                 throughput_posterior_count
             ],
-            inflight_transitions: Vec::with_capacity(
-                usize::try_from(trace_count_max).map_err(|_| ConfigurationError::PlatformLimit)?,
-            ),
-            pending_transition_observation: None,
+            inflight_transitions: Vec::with_capacity(transition_capacity),
+            ready_transitions: Vec::with_capacity(transition_capacity),
+            pending_transition_observations: VecDeque::with_capacity(transition_capacity),
             lead_time_evidence_sample: LeadTimeEvidenceSample::None,
             trace,
             diagnostic_seed: 0,
@@ -1366,67 +1447,80 @@ impl<Workload> ClosedLoop<Workload> {
         self.latest_capacity_window = None;
         self.capacity_evidence_sample = CapacityEvidenceSample::None;
         self.inflight_transitions.clear();
-        self.pending_transition_observation = None;
+        self.ready_transitions.clear();
+        self.pending_transition_observations.clear();
         self.lead_time_evidence_sample = LeadTimeEvidenceSample::None;
         Ok(())
     }
 
     fn prepare_transition_evidence(&mut self, context: TickContext<'_>) -> Result<(), PlantError> {
-        if let Some(pending) = self.pending_transition_observation.take() {
+        let mut index = 0_usize;
+        while index < self.inflight_transitions.len() {
+            if !self.inflight_transitions[index].reached(context.plant.replicas) {
+                index += 1;
+                continue;
+            }
+            if self.ready_transitions.len() == self.ready_transitions.capacity() {
+                return Err(PlantError::ChangeCapacity);
+            }
+            self.ready_transitions
+                .push(self.inflight_transitions.remove(index));
+        }
+        if let Some(pending) = self.inflight_transitions.iter_mut().find(|pending| {
+            pending.direction() == TransitionDirection::Up
+                && pending.from_replicas < context.plant.replicas
+                && pending.target_replicas > context.plant.replicas
+        }) {
+            pending.from_replicas = context.plant.replicas;
+        }
+        if context.plant.partitions_ready {
+            let completed_micros = context
+                .plant
+                .reconciliation_completed_micros
+                .unwrap_or(context.now_micros);
+            while !self.ready_transitions.is_empty() {
+                let transition = self.ready_transitions.remove(0);
+                let elapsed_micros =
+                    completed_micros.saturating_sub(transition.requested_at_micros);
+                if elapsed_micros == 0 {
+                    continue;
+                }
+                let evidence = context
+                    .plant
+                    .reconciliation_started_micros
+                    .filter(|started| *started > transition.requested_at_micros)
+                    .filter(|started| completed_micros > *started)
+                    .map_or_else(
+                        || {
+                            TransitionEvidence::completed(
+                                transition.direction(),
+                                transition.replica_delta(),
+                                elapsed_micros,
+                            )
+                        },
+                        |started| {
+                            TransitionEvidence::completed_rebalance(
+                                transition.direction(),
+                                transition.replica_delta(),
+                                started.saturating_sub(transition.requested_at_micros),
+                                completed_micros.saturating_sub(started),
+                            )
+                        },
+                    )?;
+                self.push_transition_observation(PendingTransitionObservation {
+                    evidence,
+                    sample: LeadTimeEvidenceSample::Completed {
+                        direction: transition.direction(),
+                        replica_delta: transition.replica_delta(),
+                        elapsed_seconds: Duration::from_micros(elapsed_micros).as_secs_f64(),
+                    },
+                })?;
+            }
+        }
+        if let Some(pending) = self.pending_transition_observations.pop_front() {
             self.observation.set_transition(pending.evidence)?;
             self.lead_time_evidence_sample = pending.sample;
-            return Ok(());
         }
-        let Some((index, transition)) = self
-            .inflight_transitions
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_index, transition)| transition.reached(context.plant.replicas))
-        else {
-            return Ok(());
-        };
-        if !context.plant.partitions_ready {
-            return Ok(());
-        }
-        let completed_micros = context
-            .plant
-            .reconciliation_completed_micros
-            .unwrap_or(context.now_micros);
-        let elapsed_micros = completed_micros.saturating_sub(transition.requested_at_micros);
-        if elapsed_micros == 0 {
-            self.inflight_transitions.remove(index);
-            return Ok(());
-        }
-        let evidence = context
-            .plant
-            .reconciliation_started_micros
-            .filter(|started| *started > transition.requested_at_micros)
-            .filter(|started| completed_micros > *started)
-            .map_or_else(
-                || {
-                    TransitionEvidence::completed(
-                        transition.direction(),
-                        transition.replica_delta(),
-                        elapsed_micros,
-                    )
-                },
-                |started| {
-                    TransitionEvidence::completed_rebalance(
-                        transition.direction(),
-                        transition.replica_delta(),
-                        started.saturating_sub(transition.requested_at_micros),
-                        completed_micros.saturating_sub(started),
-                    )
-                },
-            )?;
-        self.observation.set_transition(evidence)?;
-        self.lead_time_evidence_sample = LeadTimeEvidenceSample::Completed {
-            direction: transition.direction(),
-            replica_delta: transition.replica_delta(),
-            elapsed_seconds: Duration::from_micros(elapsed_micros).as_secs_f64(),
-        };
-        self.inflight_transitions.remove(index);
         Ok(())
     }
 
@@ -1678,7 +1772,6 @@ impl<Workload> ClosedLoop<Workload> {
                     } else {
                         ScaleDirective::Request {
                             replicas: apply.target,
-                            delay_micros: inputs.launch_delay_micros,
                         }
                     };
                 }
@@ -1691,6 +1784,15 @@ impl<Workload> ClosedLoop<Workload> {
                     hold_reason: None,
                     shortfall: apply.diagnostics.shortfall,
                     expected_loss: apply.diagnostics.expected_loss,
+                    selected_violation_weight_sum: f64::NAN,
+                    selected_excess_delay_sum: f64::NAN,
+                    selected_replica_seconds_sum: f64::NAN,
+                    runner_up_action_index: u32::MAX,
+                    runner_up_violation_weight_sum: f64::NAN,
+                    runner_up_excess_delay_sum: f64::NAN,
+                    runner_up_replica_seconds_sum: f64::NAN,
+                    violation_allowance: f64::NAN,
+                    demand_floor: u32::MAX,
                     arrival_rate_per_second: apply.diagnostics.arrival_rate_per_second,
                     arrival_evidence: self.arrival_evidence_sample,
                     arrival_predictive_low_count: arrival_predictive.quantiles[0],
@@ -1739,6 +1841,15 @@ impl<Workload> ClosedLoop<Workload> {
                     hold_reason: Some(hold.reason),
                     shortfall: hold.diagnostics.shortfall,
                     expected_loss: hold.diagnostics.expected_loss,
+                    selected_violation_weight_sum: f64::NAN,
+                    selected_excess_delay_sum: f64::NAN,
+                    selected_replica_seconds_sum: f64::NAN,
+                    runner_up_action_index: u32::MAX,
+                    runner_up_violation_weight_sum: f64::NAN,
+                    runner_up_excess_delay_sum: f64::NAN,
+                    runner_up_replica_seconds_sum: f64::NAN,
+                    violation_allowance: f64::NAN,
+                    demand_floor: u32::MAX,
                     arrival_rate_per_second: hold.diagnostics.arrival_rate_per_second,
                     arrival_evidence: self.arrival_evidence_sample,
                     arrival_predictive_low_count: arrival_predictive.quantiles[0],
@@ -1775,7 +1886,6 @@ impl<Workload> ClosedLoop<Workload> {
                 }
             }
         };
-        self.track_scale_request(context, inputs.scale)?;
         self.trace.push(&sample, &self.state, &self.scratch)?;
         Ok(inputs)
     }
@@ -1941,69 +2051,100 @@ impl<Workload> ClosedLoop<Workload> {
     fn track_scale_request(
         &mut self,
         context: TickContext<'_>,
-        directive: ScaleDirective,
+        replicas: u32,
+        plant_in_flight: u32,
     ) -> Result<(), PlantError> {
-        let ScaleDirective::Request { replicas, .. } = directive else {
-            return Ok(());
-        };
-        let requested = PendingTransition {
-            from_replicas: context.plant.replicas,
-            target_replicas: replicas,
-            requested_at_micros: context.now_micros,
-        };
-        if replicas == context.plant.replicas
-            && !context.plant.partitions_ready
-            && self
-                .inflight_transitions
-                .iter()
-                .any(|pending| pending.target_replicas == replicas)
-        {
-            return Ok(());
-        }
-        let mut index = 0_usize;
-        let mut exact = false;
-        while index < self.inflight_transitions.len() {
-            let mut pending = self.inflight_transitions[index];
-            if replicas == context.plant.replicas || pending.direction() != requested.direction() {
+        let ready = context.plant.replicas;
+        if replicas <= ready {
+            while let Some(pending) = self.inflight_transitions.pop() {
                 self.record_censored_transition(context, pending)?;
-                self.inflight_transitions.remove(index);
-                continue;
             }
-            match requested.direction() {
-                TransitionDirection::Up if pending.target_replicas > replicas => {
-                    pending.target_replicas = replicas;
-                }
-                TransitionDirection::Down if pending.target_replicas < replicas => {
-                    pending.target_replicas = replicas;
-                }
-                TransitionDirection::Up | TransitionDirection::Down => {}
+            if replicas < ready {
+                self.push_pending_transition(PendingTransition {
+                    from_replicas: ready,
+                    target_replicas: replicas,
+                    requested_at_micros: context.now_micros,
+                })?;
             }
-            // A clamp can move the pending target back to its origin. That
-            // pending transition is no longer observable: censor it like
-            // any other superseded transition.
-            if pending.target_replicas == pending.from_replicas {
-                self.record_censored_transition(context, self.inflight_transitions[index])?;
-                self.inflight_transitions.remove(index);
-                continue;
-            }
-            if pending.target_replicas == replicas {
-                if exact {
-                    self.inflight_transitions.remove(index);
-                    continue;
-                }
-                exact = true;
-            }
-            self.inflight_transitions[index] = pending;
-            index += 1;
-        }
-        if replicas == context.plant.replicas || exact {
+            self.assert_pending_up_segments(ready, replicas, plant_in_flight);
             return Ok(());
         }
+
+        let mut index = 0_usize;
+        while index < self.inflight_transitions.len() {
+            if self.inflight_transitions[index].direction() == TransitionDirection::Down {
+                let pending = self.inflight_transitions.remove(index);
+                self.record_censored_transition(context, pending)?;
+            } else {
+                index += 1;
+            }
+        }
+        while self.inflight_transitions.last().is_some_and(|pending| {
+            pending.direction() == TransitionDirection::Up && pending.from_replicas >= replicas
+        }) {
+            let Some(pending) = self.inflight_transitions.pop() else {
+                break;
+            };
+            self.record_censored_transition(context, pending)?;
+        }
+        if let Some(pending) = self.inflight_transitions.last_mut()
+            && pending.direction() == TransitionDirection::Up
+            && pending.target_replicas > replicas
+        {
+            pending.target_replicas = replicas;
+        }
+
+        let frontier = self
+            .inflight_transitions
+            .iter()
+            .filter(|pending| pending.direction() == TransitionDirection::Up)
+            .map(|pending| pending.target_replicas)
+            .max()
+            .map_or(ready, |target| target.max(ready));
+        if replicas > frontier {
+            self.push_pending_transition(PendingTransition {
+                from_replicas: frontier,
+                target_replicas: replicas,
+                requested_at_micros: context.now_micros,
+            })?;
+        }
+        self.assert_pending_up_segments(ready, replicas, plant_in_flight);
+        Ok(())
+    }
+
+    fn push_pending_transition(&mut self, transition: PendingTransition) -> Result<(), PlantError> {
         if self.inflight_transitions.len() == self.inflight_transitions.capacity() {
             return Err(PlantError::ChangeCapacity);
         }
-        self.inflight_transitions.push(requested);
+        self.inflight_transitions.push(transition);
         Ok(())
+    }
+
+    fn assert_pending_up_segments(&self, ready: u32, published: u32, plant_in_flight: u32) {
+        let mut frontier = ready;
+        let mut delta = 0_u32;
+        for pending in self
+            .inflight_transitions
+            .iter()
+            .filter(|pending| pending.direction() == TransitionDirection::Up)
+        {
+            assert_eq!(
+                pending.from_replicas, frontier,
+                "pending up segments must be disjoint and contiguous"
+            );
+            frontier = pending.target_replicas;
+            delta = delta.saturating_add(pending.replica_delta());
+        }
+        if published >= ready {
+            assert_eq!(
+                frontier, published,
+                "pending up segments must reach the published target"
+            );
+        }
+        assert_eq!(
+            delta, plant_in_flight,
+            "pending up segment deltas must equal the plant in-flight count"
+        );
     }
 
     fn record_censored_transition(
@@ -2011,9 +2152,6 @@ impl<Workload> ClosedLoop<Workload> {
         context: TickContext<'_>,
         transition: PendingTransition,
     ) -> Result<(), PlantError> {
-        if self.pending_transition_observation.is_some() {
-            return Ok(());
-        }
         let exposure_micros = context
             .now_micros
             .saturating_sub(transition.requested_at_micros);
@@ -2025,14 +2163,26 @@ impl<Workload> ClosedLoop<Workload> {
             transition.replica_delta(),
             exposure_micros,
         )?;
-        self.pending_transition_observation = Some(PendingTransitionObservation {
+        self.push_transition_observation(PendingTransitionObservation {
             evidence,
             sample: LeadTimeEvidenceSample::Censored {
                 direction: transition.direction(),
                 replica_delta: transition.replica_delta(),
                 exposure_seconds: Duration::from_micros(exposure_micros).as_secs_f64(),
             },
-        });
+        })
+    }
+
+    fn push_transition_observation(
+        &mut self,
+        observation: PendingTransitionObservation,
+    ) -> Result<(), PlantError> {
+        if self.pending_transition_observations.len()
+            == self.pending_transition_observations.capacity()
+        {
+            return Err(PlantError::ChangeCapacity);
+        }
+        self.pending_transition_observations.push_back(observation);
         Ok(())
     }
 }
@@ -2241,6 +2391,15 @@ impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
             &scheduled_releases,
         )?;
         self.apply_decision(context, inputs, reporter)
+    }
+
+    fn metric_polled(
+        &mut self,
+        context: TickContext<'_>,
+        replicas: u32,
+        plant_in_flight: u32,
+    ) -> Result<(), PlantError> {
+        self.track_scale_request(context, replicas, plant_in_flight)
     }
 
     fn event(&self, context: EventContext<'_>) -> Result<EventInputs, PlantError> {

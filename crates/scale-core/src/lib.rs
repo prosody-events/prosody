@@ -22,7 +22,10 @@ pub use capacity::{
     CapacityCurve, CapacityGrid, CapacityGridError, CapacityPrior, PosteriorError, ResourceWindow,
     ResourceWindowError, ThroughputPosteriorCell,
 };
-pub use controller::{DecisionCurveError, DecisionRejection, ScaleScratch, ScaleState, step};
+pub use controller::{
+    DecisionActionColumns, DecisionColumnSummary, DecisionCurveError, DecisionRejection,
+    ScaleScratch, ScaleState, step,
+};
 pub use lead_time::{
     TransitionDirection, TransitionEvidence, TransitionEvidenceError, TransitionPrior,
     TransitionPriorError,

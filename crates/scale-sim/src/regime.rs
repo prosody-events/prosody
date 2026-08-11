@@ -1406,14 +1406,15 @@ fn principal_plant_configuration(
     slots_per_replica: u32,
     shared_resource_parallelism: u32,
 ) -> Result<PlantConfiguration, PlantError> {
-    PlantConfiguration::new(
+    Ok(PlantConfiguration::new(
         64,
         1_024,
         event_count_max,
         event_count_max,
         slots_per_replica,
         shared_resource_parallelism,
-    )
+    )?
+    .with_metric_poll_interval_micros(1_000_000))
 }
 
 fn principal_handler_curve(regime: PrincipalRegime) -> Result<ConcurrencyLatencyCurve, PlantError> {
@@ -3535,10 +3536,7 @@ impl OutputFunction<PrincipalFrame<'_>, (u32, u32, u32, bool, u64, u64, u64)> fo
             scale: if values.2 == 0 {
                 ScaleDirective::Hold
             } else if values.3 {
-                ScaleDirective::Request {
-                    replicas: values.2,
-                    delay_micros: 0,
-                }
+                ScaleDirective::Request { replicas: values.2 }
             } else {
                 ScaleDirective::ExternalHold
             },
