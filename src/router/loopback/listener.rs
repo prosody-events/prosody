@@ -2,7 +2,6 @@
 //! how it is served and stopped, and the router a served process reaches its
 //! neighbours through.
 
-use super::TestHealth;
 use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::fleet::{Destination, DestinationFleet};
@@ -52,7 +51,7 @@ impl Served {
         service: PeerService<R>,
     ) -> Result<Self> {
         let (stop, stopped) = channel();
-        let task = serve(bound, service, TestHealth::new(true, true), async move {
+        let task = serve(bound, service, async move {
             stopped.await.unwrap_or(());
         })?;
         Ok(Self { stop, task })

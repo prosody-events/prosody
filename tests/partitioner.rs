@@ -141,8 +141,7 @@ async fn consumed_partition_matches_partition_for_key() -> Result<()> {
     }
     .await;
 
-    let shutdown = consumer.shutdown().await;
+    consumer.shutdown().await;
     admin.delete_topic(&topic).await?;
-    shutdown?;
     outcome
 }

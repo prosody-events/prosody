@@ -3,8 +3,8 @@
 use super::PeerConfiguration;
 use super::backend::prepare_cassandra;
 use super::runtime::{LocalRoute, PeerRouter, ProducerHandle, start_local_router, start_router};
-use crate::cassandra::{CassandraConfiguration, CassandraStore};
-use crate::consumer::{ConsumerError, PeerInitError, ShutdownError};
+use crate::cassandra::CassandraStore;
+use crate::consumer::{ConsumerError, ShutdownError};
 use crate::response::frame::encode::Staged;
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{DropReason, ResponseRoute, RouteOutcome, Then};
@@ -78,10 +78,7 @@ impl LocalRouter {
 }
 
 impl GrpcRouter {
-    /// Starts a local-first gRPC router with its own Cassandra session.
-    ///
-    /// Use this constructor for a standalone producer or consumer. A combined
-    /// high-level client shares its existing Cassandra session instead.
+    /// Starts a local-first gRPC router with a shared Cassandra store.
     ///
     /// # Errors
     ///
@@ -89,14 +86,8 @@ impl GrpcRouter {
     /// cannot start.
     pub async fn new(
         config: &PeerConfiguration,
-        cassandra: &CassandraConfiguration,
+        store: CassandraStore,
     ) -> Result<Self, ConsumerError> {
-        let store =
-            CassandraStore::new(cassandra)
-                .await
-                .map_err(|error| PeerInitError::Directory {
-                    message: format!("{error:#}"),
-                })?;
         Ok(Self {
             inner: start_router(prepare_cassandra(config, store).await?).await?,
         })

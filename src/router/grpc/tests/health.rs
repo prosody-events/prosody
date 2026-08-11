@@ -3,7 +3,6 @@
 use super::Harness;
 use crate::router::grpc::generated::peer_service_server::SERVICE_NAME;
 use crate::router::grpc::health::PeerHealth;
-use crate::router::loopback::TestHealth;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
@@ -17,16 +16,16 @@ use tonic_health::pb::health_server::Health;
 /// A name this listener serves nothing under.
 const UNSERVED: &str = "prosody.peer.v1.NotAService";
 
-/// The process answers `SERVING` under the empty name exactly when it is both
-/// ready and live; the peer service answers `SERVING` whenever it answers at
-/// all; every other name is `NOT_FOUND`.
+/// An active router serves the empty name and its peer service only.
 #[test]
-fn the_grpc_health_answer_follows_the_predicates() -> Result<()> {
+fn the_grpc_health_answer_names_the_active_router() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
-        // Neither answer depends on the predicates, so both are asserted once
-        // rather than inside the loop that varies them.
-        let health = PeerHealth::new(TestHealth::new(false, false));
+        let health = PeerHealth::new();
+        ensure!(
+            check(&health, "").await? == Some(i32::from(ServingStatus::Serving)),
+            "an active router must serve the empty name"
+        );
         ensure!(
             check(&health, SERVICE_NAME).await? == Some(i32::from(ServingStatus::Serving)),
             "a listener that answers at all serves the peer method"
@@ -35,18 +34,6 @@ fn the_grpc_health_answer_follows_the_predicates() -> Result<()> {
             check(&health, UNSERVED).await?.is_none(),
             "a name this listener does not serve must be NOT_FOUND"
         );
-        for (ready, live) in [(true, true), (true, false), (false, true), (false, false)] {
-            let health = PeerHealth::new(TestHealth::new(ready, live));
-            let expected = if ready && live {
-                ServingStatus::Serving
-            } else {
-                ServingStatus::NotServing
-            };
-            ensure!(
-                check(&health, "").await? == Some(i32::from(expected)),
-                "ready = {ready} and live = {live} must answer {expected:?} for the process"
-            );
-        }
         Ok(())
     })
 }

@@ -27,7 +27,7 @@ async fn a_consumer_without_responses_starts_and_stops() -> Result<()> {
     let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
     let consumer = start(&config, managers, heartbeats, Arc::clone(&log), NoRequests).await?;
 
-    consumer.shutdown().await?;
+    consumer.shutdown().await;
 
     // The poll task drops the provider, and nothing else records anything. An
     // equality rather than a predicate: a predicate over an empty log would
@@ -69,7 +69,7 @@ async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
     );
     retain_manager(&config, &managers, Arc::clone(&log))?;
 
-    consumer.shutdown().await?;
+    consumer.shutdown().await;
     router.shutdown().await?;
 
     let events = log.lock();
@@ -117,10 +117,10 @@ async fn a_second_shutdown_sweeps_nothing() -> Result<()> {
     .await?;
     let loser = consumer.clone();
 
-    consumer.shutdown().await?;
+    consumer.shutdown().await;
     // Retained after the winner finished, so only the loser could sweep it.
     retain_manager(&config, &managers, Arc::clone(&log))?;
-    loser.shutdown().await?;
+    loser.shutdown().await;
 
     assert_eq!(
         managers.read().len(),

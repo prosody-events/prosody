@@ -449,7 +449,7 @@ where
         };
 
         info!("shutting down consumer");
-        consumer.shutdown().await?;
+        consumer.shutdown().await;
         Ok(())
     }
 

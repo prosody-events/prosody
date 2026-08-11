@@ -120,16 +120,28 @@ fn unusable_row_reads_as_absent() -> Result<()> {
         let store = store().await?;
         let query = format!(
             "INSERT INTO {TEST_KEYSPACE}.{TABLE_NODE_DIRECTORY} (node_id, direct_connect, \
-             hostname) VALUES (?, ?, ?) USING TTL 300"
+             advertised_connect, hostname) VALUES (?, ?, ?, ?) USING TTL 300"
         );
-        for (connect, reason) in [
-            (None, "has no direct endpoint"),
-            (Some("http://[invalid"), "has an invalid connect string"),
+        for (direct, advertised, reason) in [
+            (None, None, "has no direct endpoint"),
+            (
+                Some("http://[invalid"),
+                None,
+                "has an invalid direct endpoint",
+            ),
+            (
+                Some("http://direct.example"),
+                Some("http://[invalid"),
+                "has an invalid advertised endpoint",
+            ),
         ] {
             let node = NodeId::new();
             store
                 .session()
-                .query_unpaged(query.as_str(), (Uuid::from(node), connect, "invalid-row"))
+                .query_unpaged(
+                    query.as_str(),
+                    (Uuid::from(node), direct, advertised, "invalid-row"),
+                )
                 .await?;
             assert!(
                 directory.read(node).await?.is_none(),

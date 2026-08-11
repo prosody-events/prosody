@@ -291,8 +291,7 @@ async fn test_producer_deduplication() -> Result<()> {
     .map_err(|_| eyre::eyre!("test timed out after {overall_timeout:?}"))
     .and_then(|r| r);
 
-    let shutdown = consumer_client.shutdown().await;
+    consumer_client.shutdown().await;
     admin.delete_topic(&topic).await?;
-    shutdown?;
     result
 }

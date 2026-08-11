@@ -8,7 +8,6 @@ use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl}
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::client::GrpcSender;
-use crate::router::grpc::health::RuntimeHealth;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
 use crate::router::relay::Relay;
@@ -178,7 +177,6 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         let listener = match serve(
             inputs.listener,
             PeerService::new(local.clone(), Relay::new(network.clone())),
-            RuntimeHealth::new(inputs.heartbeats.clone()),
             async move { drop(stopped.await) },
         ) {
             Ok(listener) => listener,

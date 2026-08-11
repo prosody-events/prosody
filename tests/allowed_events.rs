@@ -102,8 +102,7 @@ async fn test_allowed_events_filtering() -> Result<()> {
     .await;
 
     // Shut down the consumer and delete the test topic on every path.
-    let shutdown = consumer.shutdown().await;
+    consumer.shutdown().await;
     admin_client.delete_topic(&topic).await?;
-    shutdown?;
     outcome
 }

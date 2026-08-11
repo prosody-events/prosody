@@ -5,12 +5,14 @@ use super::{
     HighLevelClient, HighLevelClientError, MemoryClientBackend, MemoryHighLevelClient, Mode, Wire,
     WireError,
 };
+use crate::cassandra::CassandraStore;
 use crate::cassandra::config::CassandraConfiguration;
 use crate::high_level::config::ModeConfigurationBuildParams;
 use crate::high_level::topics::missing_topics;
 use crate::peer::Router;
 use crate::producer::{ProducerConfigurationBuilder, ProsodyProducer};
 use crate::propagator::new_propagator;
+use crate::state_reader::StateReaderError;
 use crate::telemetry::{Telemetry, spawn_telemetry_emitter};
 use tokio::sync::{Mutex, OnceCell};
 
@@ -136,8 +138,11 @@ where
         producer: &mut ProducerConfigurationBuilder,
         consumers: &ConsumerBuilders,
     ) -> Result<Self, HighLevelClientError<WireError<T>>> {
+        let store = CassandraStore::new(&cassandra)
+            .await
+            .map_err(|error| StateReaderError::store(&error))?;
         new_with_backend(
-            CassandraClientBackend::new(cassandra),
+            CassandraClientBackend::new(store),
             false,
             mode,
             producer,

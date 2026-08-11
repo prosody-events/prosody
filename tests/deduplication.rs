@@ -131,10 +131,9 @@ async fn test_pipeline_deduplication_of_same_event_id() -> Result<()> {
         Ok(())
     }
     .await;
-    let shutdown = consumer.shutdown().await;
+    consumer.shutdown().await;
     let router_shutdown = router.shutdown().await;
     admin_client.delete_topic(&topic).await?;
-    shutdown?;
     router_shutdown?;
     outcome
 }

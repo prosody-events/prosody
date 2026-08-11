@@ -108,7 +108,7 @@ async fn an_explicit_response_subsystem_needs_no_keyed_state_subsystem() -> Resu
         Ok(())
     }
     .await;
-    consumer.shutdown().await?;
+    consumer.shutdown().await;
     router.shutdown().await?;
     outcome
 }

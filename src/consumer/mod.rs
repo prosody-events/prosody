@@ -320,22 +320,17 @@ impl<C: Codec> ProsodyConsumer<C> {
     ///
     /// It stops the poll loop, sweeps each partition, and retires observations.
     ///
-    /// A second call, or a call on a clone whose sibling already ran, finds no
-    /// runtime state and answers `Ok(())` without touching anything shared.
-    /// That success is not an observation: the other caller made it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ShutdownError::PollLoop`] when the poll loop task fails.
-    pub async fn shutdown(mut self) -> Result<(), ShutdownError> {
+    /// A second call finds no runtime state and does no work.
+    /// A call on a clone behaves the same after another clone stops the
+    /// consumer.
+    pub async fn shutdown(mut self) {
         let Some((teardown, poll_failure)) = self.stop_polling().await else {
-            return Ok(());
+            return;
         };
         let swept = sweep::drain_managers(&self.managers).await;
         teardown.release(swept).await;
-        match poll_failure {
-            Some(failure) => Err(failure),
-            None => Ok(()),
+        if let Some(error) = poll_failure {
+            error!(%error, "consumer shutdown failed");
         }
     }
 

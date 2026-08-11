@@ -23,7 +23,7 @@ use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
-use crate::router::loopback::{HANG_GUARD, TestHealth, TestRouter, config as fleet_config};
+use crate::router::loopback::{HANG_GUARD, TestRouter, config as fleet_config};
 use crate::router::relay::Relay;
 use crate::router::{Host, LocalTarget, NetworkRouter, NodeId, Preference, ResponseSender};
 use crate::subsystem::SubsystemName;
@@ -153,7 +153,6 @@ impl Elsewhere {
                 LocalTarget::new(node, Arc::clone(&registry)),
                 Relay::new(unused),
             ),
-            TestHealth::new(true, true),
             async move { stopped.await.unwrap_or(()) },
         )?;
         Ok(Self {

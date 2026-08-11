@@ -245,8 +245,7 @@ async fn test_global_concurrency_limit_multi_partition() -> Result<()> {
     .await;
 
     // Clean up resources on every path
-    let shutdown = consumer.shutdown().await;
+    consumer.shutdown().await;
     admin_client.delete_topic(&topic).await?;
-    shutdown?;
     outcome
 }

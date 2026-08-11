@@ -1,6 +1,6 @@
 //! Compile-time storage choices for the high-level client.
 
-use crate::cassandra::config::CassandraConfiguration;
+use crate::cassandra::CassandraStore;
 use crate::codec::Codec;
 use crate::consumer::ConsumerError;
 use crate::high_level::deps::ReaderConfiguration;
@@ -128,16 +128,16 @@ where
 
 /// Cassandra high-level client backend.
 pub struct CassandraClientBackend<C> {
-    config: CassandraConfiguration,
+    store: CassandraStore,
     codec: PhantomData<fn() -> C>,
 }
 
 impl<C> CassandraClientBackend<C> {
     /// Selects Cassandra storage.
     #[must_use]
-    pub fn new(config: CassandraConfiguration) -> Self {
+    pub fn new(store: CassandraStore) -> Self {
         Self {
-            config,
+            store,
             codec: PhantomData,
         }
     }
@@ -145,7 +145,7 @@ impl<C> CassandraClientBackend<C> {
 
 impl<C> Clone for CassandraClientBackend<C> {
     fn clone(&self) -> Self {
-        Self::new(self.config.clone())
+        Self::new(self.store.clone())
     }
 }
 
@@ -163,8 +163,8 @@ where
         &self,
         config: &ReaderConfiguration,
     ) -> Result<StateReaderDependencies<C, Self::Reader>, StateReaderError> {
-        Ok(StateReaderDependencies::cassandra_with_loader(
-            &self.config,
+        Ok(StateReaderDependencies::cassandra_with_store(
+            self.store.clone(),
             config.loader.clone(),
             config.cache_size,
             config.stall_threshold,
@@ -177,6 +177,6 @@ where
         &self,
         config: &PeerConfiguration,
     ) -> Result<Self::Router, ConsumerError> {
-        GrpcRouter::new(config, &self.config).await
+        GrpcRouter::new(config, self.store.clone()).await
     }
 }

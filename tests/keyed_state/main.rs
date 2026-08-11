@@ -201,14 +201,14 @@ impl CartEnv {
         }
         .await;
 
-        let shutdown: Result<()> = self.consumer.shutdown().await.map_err(Into::into);
+        self.consumer.shutdown().await;
         let router_shutdown: Result<()> = self.router.shutdown().await.map_err(Into::into);
         let cleanup: Result<()> = self
             .admin
             .delete_topic(&self.topic)
             .await
             .map_err(Into::into);
-        outcome.and(shutdown).and(router_shutdown).and(cleanup)
+        outcome.and(router_shutdown).and(cleanup)
     }
 }
 

@@ -33,7 +33,7 @@ mod tests;
 
 use self::conn::incoming;
 use self::generated::peer_service_server::PeerServiceServer;
-use self::health::{PeerHealth, ProcessHealth};
+use self::health::PeerHealth;
 use self::service::PeerService;
 use crate::router::RelayHop;
 use std::io::Error as IoError;
@@ -97,15 +97,13 @@ impl BoundListener {
 ///
 /// Returns [`TransportError::Reflection`] when the embedded schema cannot be
 /// published.
-pub(in crate::router) fn serve<R, H, F>(
+pub(in crate::router) fn serve<R, F>(
     bound: BoundListener,
     service: PeerService<R>,
-    health: H,
     shutdown: F,
 ) -> Result<JoinHandle<()>, TransportError>
 where
     R: RelayHop,
-    H: ProcessHealth,
     F: Future<Output = ()> + Send + 'static,
 {
     let reflection = ReflectionBuilder::configure()
@@ -116,7 +114,7 @@ where
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .add_service(PeerServiceServer::new(service))
-        .add_service(HealthServer::new(PeerHealth::new(health)))
+        .add_service(HealthServer::new(PeerHealth::new()))
         .add_service(reflection);
     Ok(tokio::spawn(async move {
         if let Err(error) = router

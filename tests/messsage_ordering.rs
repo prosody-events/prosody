@@ -351,7 +351,7 @@ fn spawn_consumers(
             )
             .await?;
             shutdown_rx.wait_for(|is_shutdown| *is_shutdown).await?; // Wait for shutdown signal
-            consumer.shutdown().await?; // Shut down consumer gracefully
+            consumer.shutdown().await; // Shut down consumer gracefully
             Ok(())
         });
     }

@@ -170,6 +170,16 @@ impl NodeDirectory for CassandraNodeDirectory {
             .into_iter()
             .flatten()
             .all(|label| label_fits(label));
+        let advertised = match advertised_connect {
+            Some(connect) => match Endpoint::from_shared(connect) {
+                Ok(endpoint) => Some(endpoint),
+                Err(error) => {
+                    warn!(%error, %node, "directory row has an invalid advertised endpoint");
+                    return Ok(None);
+                }
+            },
+            None => None,
+        };
         let (true, Some(direct), Some(hostname)) = (bounded, endpoint(direct_connect), hostname)
         else {
             warn!(%node, "directory row is not resolvable");
@@ -178,7 +188,7 @@ impl NodeDirectory for CassandraNodeDirectory {
         Ok(Some(NodeRegistration {
             node,
             direct,
-            advertised: endpoint(advertised_connect),
+            advertised,
             network: network.map(|network| NetworkId::make(&network)),
             hostname: Host::make(&hostname),
         }))
