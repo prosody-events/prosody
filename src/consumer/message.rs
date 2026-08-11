@@ -274,6 +274,12 @@ impl Default for ConsumerMessageValue<serde_json::Value> {
 }
 
 impl<P> ConsumerMessage<P> {
+    /// Reports whether this consumer must respond to the message.
+    #[must_use]
+    pub fn response_requested(&self) -> bool {
+        self.value.request.is_some()
+    }
+
     /// Where a response to this message must go, when the record asked for one.
     pub(crate) fn request(&self) -> Option<RequestTag> {
         self.value.request
