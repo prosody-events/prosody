@@ -7,9 +7,9 @@
 //! here could call them on a runtime thread.
 
 use super::config::{RouterConfiguration, validate_label};
-use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
+use crate::router::directory::{Endpoint, NetworkId, PeerRegistration};
 use crate::router::grpc::BoundListener;
-use crate::router::{Host, MAX_LABEL_BYTES, NodeId};
+use crate::router::{Host, MAX_LABEL_BYTES, PeerId};
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle, spawn_blocking};
 use tonic::transport::Error as TransportError;
@@ -45,11 +45,11 @@ pub(super) async fn discover() -> Result<DiscoveredHost, DiscoveryError> {
 /// The direct endpoint uses a specific bind address or the machine name.
 /// The advertised endpoint uses only configured values.
 pub(super) fn registration(
-    node: NodeId,
+    peer: PeerId,
     listener: &BoundListener,
     discovered: DiscoveredHost,
     config: &RouterConfiguration,
-) -> Result<NodeRegistration, DiscoveryError> {
+) -> Result<PeerRegistration, DiscoveryError> {
     let DiscoveredHost { hostname } = discovered;
     let bound = listener.address();
     let authority = if bound.ip().is_unspecified() {
@@ -57,8 +57,8 @@ pub(super) fn registration(
     } else {
         bound.to_string()
     };
-    Ok(NodeRegistration {
-        node,
+    Ok(PeerRegistration {
+        peer,
         direct: Endpoint::from_shared(format!("http://{authority}"))?,
         advertised: config.advertised.clone(),
         network: config.network.as_deref().map(NetworkId::make),

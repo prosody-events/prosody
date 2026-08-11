@@ -1,5 +1,5 @@
 use super::{
-    LocalTarget, NetworkRoute, NetworkRouter, NodeId, Preference, RelayHop, SendFailure,
+    LocalTarget, NetworkRoute, NetworkRouter, PeerId, Preference, RelayHop, SendFailure,
     choose_route,
 };
 use crate::requester::registry::PendingRegistry;
@@ -13,7 +13,7 @@ use crate::router::Host;
 use crate::router::directory::cache::AddressResolver;
 use crate::router::directory::tests::support::TestDirectory;
 use crate::router::directory::tests::support::{registration, test_directory};
-use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
+use crate::router::directory::{Endpoint, NetworkId, PeerDirectory, PeerRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::LoopbackSender;
@@ -59,9 +59,9 @@ const CACHE_CAPACITY: usize = 8;
 /// Ids are minted fresh, never derived from anything a restart could repeat:
 /// two mints of the same process already differ, and each is a random UUID.
 #[test]
-fn every_minted_node_id_is_a_fresh_random_uuid() {
-    let first = NodeId::new();
-    let second = NodeId::new();
+fn every_minted_peer_id_is_a_fresh_random_uuid() {
+    let first = PeerId::new();
+    let second = PeerId::new();
     assert_ne!(first, second, "two mints must not collide");
     for id in [first, second] {
         assert_eq!(
@@ -80,8 +80,8 @@ fn every_minted_node_id_is_a_fresh_random_uuid() {
 /// off the other:
 ///
 /// - **Ambiguous.** Another attempt on this endpoint could still get an answer.
-/// - **Wrong endpoint.** Nothing proved this endpoint serves the node, so the
-///   node's other endpoint is worth trying instead.
+/// - **Wrong endpoint.** Nothing proved this endpoint serves the peer, so the
+///   peer's other endpoint is worth trying instead.
 ///
 /// The second column carries a third claim the send path depends on: a failure
 /// that is not a wrong endpoint is always a status, so the walk may record the
@@ -105,17 +105,17 @@ fn every_failure_answers_the_two_questions_the_send_path_asks() {
         assert_eq!(
             failure.is_wrong_endpoint(),
             wrong_endpoint,
-            "{failure} must{} send the response to the node's other endpoint",
+            "{failure} must{} send the response to the peer's other endpoint",
             if wrong_endpoint { "" } else { " not" }
         );
         assert!(
             wrong_endpoint || matches!(failure, SendFailure::Status(_)),
-            "{failure} is not a wrong endpoint, so it must be a status the node itself answered"
+            "{failure} is not a wrong endpoint, so it must be a status the peer itself answered"
         );
     }
 }
 
-/// A router hands out only what a node published, and nothing at all for a node
+/// A router hands out only what a peer published, and nothing at all for a peer
 /// the directory does not hold.
 ///
 /// This is where the addressing rule is enforced rather than described: a
@@ -125,15 +125,15 @@ fn every_failure_answers_the_two_questions_the_send_path_asks() {
 fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let directory = test_directory(LEASE)?;
-        let published = registration(NodeId::new());
+        let published = registration(PeerId::new());
         directory.register(&published).await?;
 
         let router = test_router(directory)?;
 
         let route = router
-            .route(published.node)
+            .route(published.peer)
             .await?
-            .ok_or_else(|| eyre!("a published node must resolve"))?;
+            .ok_or_else(|| eyre!("a published peer must resolve"))?;
         let walked: Vec<&_> = route
             .candidates(None)
             .into_iter()
@@ -142,7 +142,7 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
             .collect();
         assert!(
             !walked.is_empty(),
-            "a published node must reach at least one endpoint"
+            "a published peer must reach at least one endpoint"
         );
         for address in walked {
             let uri = address.uri();
@@ -152,23 +152,23 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
                         .advertised
                         .as_ref()
                         .is_some_and(|endpoint| uri == endpoint.uri()),
-                "a router handed out {address:?}, which the node never published"
+                "a router handed out {address:?}, which the peer never published"
             );
         }
         assert!(
             router
-                .direct(published.node)
+                .direct(published.peer)
                 .await?
                 .is_some_and(|endpoint| endpoint.uri() == published.direct.uri()),
-            "the lookup a forward uses must hand out the endpoint the node published"
+            "the lookup a forward uses must hand out the endpoint the peer published"
         );
         assert!(
-            router.route(NodeId::new()).await?.is_none(),
-            "a node the directory does not hold must reach no address"
+            router.route(PeerId::new()).await?.is_none(),
+            "a peer the directory does not hold must reach no address"
         );
         assert!(
-            router.direct(NodeId::new()).await?.is_none(),
-            "a node the directory does not hold must reach no endpoint to forward to"
+            router.direct(PeerId::new()).await?.is_none(),
+            "a peer the directory does not hold must reach no endpoint to forward to"
         );
         Ok(())
     })
@@ -184,26 +184,26 @@ fn a_router_addresses_only_what_the_directory_published() -> Result<()> {
 fn a_router_reads_through_its_cache_and_shares_it_with_every_clone() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let directory = test_directory(LEASE)?;
-        let published = registration(NodeId::new());
+        let published = registration(PeerId::new());
         directory.register(&published).await?;
 
         let router = test_router(directory.clone())?;
 
         assert!(
             router
-                .direct(published.node)
+                .direct(published.peer)
                 .await?
                 .is_some_and(|endpoint| endpoint.uri() == published.direct.uri()),
-            "a published node must resolve"
+            "a published peer must resolve"
         );
         directory.deregister(&published).await?;
         assert!(
-            directory.read(published.node).await?.is_none(),
+            directory.read(published.peer).await?.is_none(),
             "the entry must be gone before the cached answer is asserted"
         );
         assert!(
             router
-                .direct(published.node)
+                .direct(published.peer)
                 .await?
                 .is_some_and(|endpoint| endpoint.uri() == published.direct.uri()),
             "a router must answer from its cache once the entry is gone"
@@ -304,15 +304,15 @@ impl Labels {
 ///
 /// The expected route is written out here as data. Every row is a decision an
 /// operator can read off the labels alone: neighbours use the direct address, a
-/// node known to be elsewhere is reached only through its entry point or not at
+/// peer known to be elsewhere is reached only through its entry point or not at
 /// all, and an unknown label prefers the entry point where one exists.
 #[quickcheck]
 fn prop_a_route_follows_the_declared_labels(declared: Declared) -> TestResult {
     let advertised = matches!(declared.published, Published::WithAdvertised);
     let direct = Endpoint::from_static("http://10.0.0.9:7000");
     let entry = Endpoint::from_static("http://10.0.0.9:7001");
-    let published = NodeRegistration {
-        node: NodeId::new(),
+    let published = PeerRegistration {
+        peer: PeerId::new(),
         direct: direct.clone(),
         advertised: advertised.then(|| entry.clone()),
         network: declared.labels.there(),
@@ -387,7 +387,7 @@ fn answer(code: Code) -> SendFailure {
 #[test]
 fn a_local_target_never_reaches_the_network_route() -> Result<()> {
     TEST_RUNTIME.block_on(async {
-        let node = NodeId::new();
+        let peer = PeerId::new();
         let subsystem = SubsystemName::try_new("local")?;
         let registry = PendingRegistry::new();
         let request = TestRegistration::new(
@@ -397,12 +397,12 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
         )?;
         let network_calls = Arc::new(AtomicUsize::new(0));
         let route = Then(
-            LocalTarget::new(node, registry),
+            LocalTarget::new(peer, registry),
             CountedNetwork(Arc::clone(&network_calls)),
         );
         let frame = stage_success::<CountingCodec>(
             &FrameHeader {
-                target: node,
+                target: peer,
                 request: request.id(),
                 subsystem,
                 relay: None,

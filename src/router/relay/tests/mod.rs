@@ -23,8 +23,8 @@ use crate::router::grpc::BoundListener;
 use crate::router::grpc::generated::peer_service_server::PeerService as PeerServiceApi;
 use crate::router::grpc::service::PeerService;
 use crate::router::loopback::listener::{FixedRouter, Served, bind, endpoint};
-use crate::router::loopback::{Delivery, TestRouter, node, registration};
-use crate::router::{LocalTarget, NodeId};
+use crate::router::loopback::{Delivery, TestRouter, peer, registration};
+use crate::router::{LocalTarget, PeerId};
 use crate::subsystem::SubsystemName;
 use bytes::Bytes;
 use color_eyre::Result;
@@ -34,7 +34,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tonic::{Code, Request};
 
-/// The node the in-process suites run as. The test router publishes it, so a
+/// The peer the in-process suites run as. The test router publishes it, so a
 /// case that accepts is not one that simply resolved nothing.
 pub(super) const THIS: u8 = 0;
 
@@ -54,7 +54,7 @@ pub(super) const PAYLOAD: &[u8] = b"relayed";
 /// the registry holds, what the transport recorded, and what the call answered
 /// — never from the decision function itself.
 pub(super) struct Process {
-    pub(super) node: NodeId,
+    pub(super) peer: PeerId,
     pub(super) registry: Arc<PendingRegistry>,
     pub(super) router: TestRouter,
     pub(super) deliveries: UnboundedReceiver<Delivery>,
@@ -69,7 +69,7 @@ pub(super) struct Pair {
 
 /// One live listener, and what a caller needs to reach it.
 pub(super) struct Live {
-    pub(super) node: NodeId,
+    pub(super) peer: PeerId,
     pub(super) registry: Arc<PendingRegistry>,
     pub(super) address: Endpoint,
     served: Served,
@@ -87,15 +87,15 @@ pub(super) enum TargetRoute {
 impl Process {
     /// Builds one process over a fleet of `config`.
     pub(super) fn new(config: FleetConfiguration) -> Result<Self> {
-        let node = node(THIS);
+        let peer = peer(THIS);
         let (router, deliveries) = TestRouter::new(config)?;
         let registry = PendingRegistry::new();
         let service = PeerService::new(
-            LocalTarget::new(node, Arc::clone(&registry)),
+            LocalTarget::new(peer, Arc::clone(&registry)),
             Relay::new(router.clone()),
         );
         Ok(Self {
-            node,
+            peer,
             registry,
             router,
             deliveries,
@@ -139,7 +139,7 @@ impl Process {
 }
 
 impl Pair {
-    /// Binds and serves two listeners: a relay that resolves every node to the
+    /// Binds and serves two listeners: a relay that resolves every peer to the
     /// target, and a target whose own router points where `route` says.
     /// Both are bound before either is served, because the two routers name
     /// each other.
@@ -173,19 +173,19 @@ impl Pair {
 impl Live {
     /// Serves `bound`, sending every frame it does not own on to `seen`.
     fn serve(bound: BoundListener, seen: Option<Endpoint>) -> Result<Self> {
-        let node = NodeId::new();
+        let peer = PeerId::new();
         let address = endpoint(&bound)?;
         let registry = PendingRegistry::new();
         let router = FixedRouter::new(FleetConfiguration::default(), seen.map(registration), None)?;
         let served = Served::start(
             bound,
             PeerService::new(
-                LocalTarget::new(node, Arc::clone(&registry)),
+                LocalTarget::new(peer, Arc::clone(&registry)),
                 Relay::new(router),
             ),
         )?;
         Ok(Self {
-            node,
+            peer,
             registry,
             address,
             served,
@@ -200,9 +200,9 @@ impl Live {
 
 /// One frame for `target`, answering `request`, naming `relay`.
 pub(super) fn frame(
-    target: NodeId,
+    target: PeerId,
     request: RequestId,
-    relay: Option<NodeId>,
+    relay: Option<PeerId>,
 ) -> Result<ResponseFrame> {
     Ok(ResponseFrame {
         header: FrameHeader {

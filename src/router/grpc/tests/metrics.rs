@@ -1,7 +1,7 @@
 //! What the receive leg tells an operator, and what it never tells them.
 //!
 //! This is the leg the attacker-controlled values arrive on: a frame's claimed
-//! subsystem and its node id come off a Kafka header a topic writer controls.
+//! subsystem and its peer id come off a Kafka header a topic writer controls.
 //! So the attribute set of every point is compared **exactly**, rather than
 //! searched for the label it should carry.
 //!
@@ -35,7 +35,7 @@ fn every_answer_counts_once_under_a_fixed_label() -> Result<()> {
         let harness = Harness::shared().await?;
         let request = register(&harness.registry, &[ALPHA])?;
         let accepted = harness
-            .deliver(&header(harness.node, request.id(), ALPHA)?, payload(SHORT))
+            .deliver(&header(harness.peer, request.id(), ALPHA)?, payload(SHORT))
             .await?;
         ensure!(accepted == Code::Ok, "a well-formed response is accepted");
 
@@ -43,7 +43,7 @@ fn every_answer_counts_once_under_a_fixed_label() -> Result<()> {
         // a refusal the service decided.
         let refused = harness
             .deliver(
-                &header(harness.node, RequestId::new(), ALPHA)?,
+                &header(harness.peer, RequestId::new(), ALPHA)?,
                 payload(SHORT),
             )
             .await?;

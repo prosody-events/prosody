@@ -10,7 +10,7 @@ use crate::response::headers::RequestDeadline;
 use crate::response::sender::DropReason;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::loopback::{
-    Delivery, Drained, Script, TestRouter, collect_deliveries, config, direct_uri, node, paused,
+    Delivery, Drained, Script, TestRouter, collect_deliveries, config, direct_uri, paused, peer,
 };
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
@@ -86,14 +86,14 @@ impl ResponseRoute for ObservedRoute {
 }
 
 impl Harness {
-    /// A harness over a fleet built from `config`, where every node publishes a
+    /// A harness over a fleet built from `config`, where every peer publishes a
     /// direct endpoint alone.
     pub(super) fn new(config: FleetConfiguration) -> Result<Self> {
         let (router, deliveries) = TestRouter::new(config)?;
         Self::over(router, deliveries)
     }
 
-    /// A harness whose nodes publish both endpoints under a label the dialer
+    /// A harness whose peers publish both endpoints under a label the dialer
     /// shares, so every route offers a fallback.
     pub(super) fn dual_homed(config: FleetConfiguration) -> Result<Self> {
         let (router, deliveries) = TestRouter::dual_homed(config)?;
@@ -135,7 +135,7 @@ impl Harness {
     pub(super) async fn send_payload(&self, index: u8, payload: Vec<u8>) -> Result<()> {
         let prepared = stage::<CountingCodec, Infallible>(
             FrameHeader {
-                target: node(index),
+                target: peer(index),
                 ..self.header.clone()
             },
             Ok(&payload),
@@ -148,7 +148,7 @@ impl Harness {
     pub(super) fn start_send(&self, index: u8) -> JoinHandle<Result<()>> {
         let route = Arc::clone(&self.route);
         let header = FrameHeader {
-            target: node(index),
+            target: peer(index),
             ..self.header.clone()
         };
         let payload = PAYLOAD.to_vec();
@@ -195,7 +195,7 @@ pub(super) async fn next_delivery(
         .ok_or_else(|| eyre!("the transport stopped recording before a delivery arrived"))
 }
 
-/// How many of `deliveries` went to the direct endpoint of the node for
+/// How many of `deliveries` went to the direct endpoint of the peer for
 /// `index`.
 pub(super) fn attempts(deliveries: &[Delivery], index: u8) -> Result<usize> {
     Ok(attempts_on(deliveries, &direct_uri(index)?))
@@ -212,7 +212,7 @@ pub(super) fn attempts_on(deliveries: &[Delivery], uri: &Uri) -> usize {
 /// The header every response in these suites carries, except its target.
 fn header() -> Result<FrameHeader> {
     Ok(FrameHeader {
-        target: node(0),
+        target: peer(0),
         request: RequestId::from_bytes([7; 16]),
         subsystem: SubsystemName::try_new("billing")?,
         relay: None,

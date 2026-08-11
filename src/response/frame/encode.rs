@@ -1,15 +1,15 @@
 //! Turning one borrowed response into owned frame data.
 
 use super::{
-    FIELD_ERROR_CATEGORY, FIELD_ERROR_MESSAGE, FIELD_HANDLER_ERROR, FIELD_RELAY_NODE,
+    FIELD_ERROR_CATEGORY, FIELD_ERROR_MESSAGE, FIELD_HANDLER_ERROR, FIELD_RELAY_PEER,
     FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_SUCCESS, FIELD_SUCCESS_FORMAT, FIELD_SUCCESS_PAYLOAD,
-    FIELD_TARGET_NODE, FrameHeader, FrameResult, HandlerError, ID_BYTES, ResponseFrame,
+    FIELD_TARGET_PEER, FrameHeader, FrameResult, HandlerError, ID_BYTES, ResponseFrame,
     ResponseSuccess,
 };
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::error::ErrorCategory;
 use crate::response::FormatToken;
-use crate::router::{Framed, NodeId};
+use crate::router::{Framed, PeerId};
 use bytes::{BufMut, Bytes};
 use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len};
 use std::error::Error;
@@ -88,7 +88,7 @@ impl Staged {
         &self.header
     }
 
-    pub(in crate::response) const fn target(&self) -> NodeId {
+    pub(in crate::response) const fn target(&self) -> PeerId {
         self.header.target
     }
 
@@ -101,7 +101,7 @@ impl Staged {
 }
 
 impl Forwarded {
-    pub(crate) fn new(mut frame: ResponseFrame, relay: NodeId) -> Self {
+    pub(crate) fn new(mut frame: ResponseFrame, relay: PeerId) -> Self {
         frame.header.relay = Some(relay);
         Self(frame)
     }
@@ -118,7 +118,7 @@ impl Framed for Forwarded {
 }
 
 fn write_frame<B: BufMut>(header: &FrameHeader, result: &FrameResult, dst: &mut B) {
-    write_bytes_field(FIELD_TARGET_NODE, &header.target.into_bytes(), dst);
+    write_bytes_field(FIELD_TARGET_PEER, &header.target.into_bytes(), dst);
     write_bytes_field(FIELD_REQUEST_ID, &header.request.into_bytes(), dst);
     write_bytes_field(FIELD_SUBSYSTEM, header.subsystem.as_str().as_bytes(), dst);
     match result {
@@ -136,12 +136,12 @@ fn write_frame<B: BufMut>(header: &FrameHeader, result: &FrameResult, dst: &mut 
         }
     }
     if let Some(relay) = header.relay {
-        write_bytes_field(FIELD_RELAY_NODE, &relay.into_bytes(), dst);
+        write_bytes_field(FIELD_RELAY_PEER, &relay.into_bytes(), dst);
     }
 }
 
 fn frame_len(header: &FrameHeader, result: &FrameResult) -> u64 {
-    bytes_field_len(FIELD_TARGET_NODE, ID_BYTES)
+    bytes_field_len(FIELD_TARGET_PEER, ID_BYTES)
         + bytes_field_len(FIELD_REQUEST_ID, ID_BYTES)
         + bytes_field_len(FIELD_SUBSYSTEM, header.subsystem.as_str().len())
         + match result {
@@ -154,7 +154,7 @@ fn frame_len(header: &FrameHeader, result: &FrameResult) -> u64 {
             }
         }
         + if header.relay.is_some() {
-            bytes_field_len(FIELD_RELAY_NODE, ID_BYTES)
+            bytes_field_len(FIELD_RELAY_PEER, ID_BYTES)
         } else {
             0
         }

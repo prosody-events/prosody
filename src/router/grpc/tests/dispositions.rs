@@ -22,7 +22,7 @@ fn the_wire_reports_exact_waiter_consumption() -> Result<()> {
         let sent = payload(SHORT);
 
         let accepted = harness
-            .deliver(&header(harness.node, id, ALPHA)?, sent.clone())
+            .deliver(&header(harness.peer, id, ALPHA)?, sent.clone())
             .await?;
         ensure!(
             accepted == Code::Ok,
@@ -41,7 +41,7 @@ fn the_wire_reports_exact_waiter_consumption() -> Result<()> {
         ensure!(answer.as_ref() == sent, "the waiter received other bytes");
 
         let repeated = harness
-            .deliver(&header(harness.node, id, ALPHA)?, payload(SHORT))
+            .deliver(&header(harness.peer, id, ALPHA)?, payload(SHORT))
             .await?;
         ensure!(
             repeated == Code::NotFound,
@@ -50,7 +50,7 @@ fn the_wire_reports_exact_waiter_consumption() -> Result<()> {
 
         let unknown = harness
             .deliver(
-                &header(harness.node, RequestId::new(), ALPHA)?,
+                &header(harness.peer, RequestId::new(), ALPHA)?,
                 payload(SHORT),
             )
             .await?;
@@ -68,7 +68,7 @@ fn a_closed_receiver_reports_not_found() -> Result<()> {
         let id = request.id();
         drop(request.receiver()?);
         let status = harness
-            .deliver(&header(harness.node, id, ALPHA)?, payload(SHORT))
+            .deliver(&header(harness.peer, id, ALPHA)?, payload(SHORT))
             .await?;
         ensure!(
             status == Code::NotFound,

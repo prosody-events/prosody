@@ -1,6 +1,6 @@
 //! What the runtime owns, and what its handles reach.
 //!
-//! One process has one node identity. The tests here read that identity from
+//! One process has one peer identity. The tests here read that identity from
 //! all three places it appears — the listener the runtime serves, the entry the
 //! directory holds, and the address the runtime's own router resolves — and
 //! require them to agree.
@@ -12,10 +12,10 @@ use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameResult, ResponseSuccess};
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{ResponseRoute, Then, deliver_response, stage as stage_response};
-use crate::router::directory::NodeDirectory;
+use crate::router::directory::PeerDirectory;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::HANG_GUARD;
-use crate::router::{NetworkRoute, NodeId, RelayHop, ResponseSender, SendFailure};
+use crate::router::{NetworkRoute, PeerId, RelayHop, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -33,9 +33,9 @@ const PAYLOAD: &[u8] = b"through the runtime's own router";
 /// The listener answers for the id the runtime minted, and for no other.
 ///
 /// The id it answers for is the one the directory row carries, so a peer that
-/// resolves this node reaches the process that owns that id.
+/// resolves this peer reaches the process that owns that id.
 #[test]
-fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
+fn the_listener_answers_only_for_the_peer_the_runtime_minted() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let Process { runtime, shared } = Process::new().await?;
@@ -43,7 +43,7 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
             let awaited = [SubsystemName::try_new(ALPHA)?];
             let request = TestRegistration::new(&shared.pending, &awaited, TIMEOUT)?;
             let transport = GrpcSender::new(&shared.fleet);
-            let addressed_here = header(shared.node, request.id(), ALPHA)?;
+            let addressed_here = header(shared.peer, request.id(), ALPHA)?;
             let mine = stage_success::<CountingCodec>(&addressed_here, &PAYLOAD.to_vec())?;
             transport
                 .deliver(
@@ -54,9 +54,9 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
                 )
                 .await
                 .map_err(|failure| {
-                    eyre!("the listener refused a frame for its own node: {failure}")
+                    eyre!("the listener refused a frame for its own peer: {failure}")
                 })?;
-            let addressed_elsewhere = header(NodeId::new(), request.id(), ALPHA)?;
+            let addressed_elsewhere = header(PeerId::new(), request.id(), ALPHA)?;
             let foreign = stage_success::<CountingCodec>(&addressed_elsewhere, &PAYLOAD.to_vec())?;
             ensure!(
                 matches!(
@@ -70,15 +70,15 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
                         .await,
                     Err(SendFailure::Status(_))
                 ),
-                "a frame addressed to another node must never be accepted here"
+                "a frame addressed to another peer must never be accepted here"
             );
             let registered = shared
                 .directory
-                .read(shared.node)
+                .read(shared.peer)
                 .await?
                 .ok_or_else(|| eyre!("a started runtime must already resolve"))?;
             ensure!(
-                registered.node == shared.node,
+                registered.peer == shared.peer,
                 "the directory row must carry the id the listener answers for"
             );
             Ok(())
@@ -93,7 +93,7 @@ fn the_listener_answers_only_for_the_node_the_runtime_minted() -> Result<()> {
 ///
 /// The local route skips address resolution and transport work.
 #[test]
-fn a_same_node_response_uses_the_local_registry() -> Result<()> {
+fn a_same_peer_response_uses_the_local_registry() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let Process { runtime, shared } = Process::new().await?;
@@ -105,8 +105,8 @@ fn a_same_node_response_uses_the_local_registry() -> Result<()> {
     })
 }
 
-/// Sends one response to this process's own node id and waits for the registry.
-async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
+/// Sends one response to this process's own peer id and waits for the registry.
+async fn delivered_to_itself<D: PeerDirectory, R: ResponseRoute>(
     network: &NetworkRoute<GrpcSender, D>,
     own: &R,
     shared: &Shared,
@@ -117,7 +117,7 @@ async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
     );
     ensure!(
         network
-            .direct(shared.node)
+            .direct(shared.peer)
             .await
             .map_err(|error| eyre!("{error}"))?
             .is_some_and(|endpoint| endpoint.uri() == shared.listener.uri()),
@@ -128,7 +128,7 @@ async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
     let receiver = request.receiver()?;
     let payload = PAYLOAD.to_vec();
     let prepared = stage_response::<CountingCodec, Infallible>(
-        header(shared.node, request.id(), ALPHA)?,
+        header(shared.peer, request.id(), ALPHA)?,
         Ok(&payload),
     );
     deliver_response(
@@ -141,9 +141,9 @@ async fn delivered_to_itself<D: NodeDirectory, R: ResponseRoute>(
 
     let stored = receiver
         .await
-        .map_err(|_| eyre!("the same-node response stored no payload"))?;
+        .map_err(|_| eyre!("the same-peer response stored no payload"))?;
     let FrameResult::Success(ResponseSuccess { payload, .. }) = stored.result else {
-        return Err(eyre!("the same-node response stored a handler error"));
+        return Err(eyre!("the same-peer response stored a handler error"));
     };
     ensure!(
         payload.as_ref() == PAYLOAD,

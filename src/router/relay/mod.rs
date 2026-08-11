@@ -6,7 +6,7 @@
 //! correct even where the labels are unset, wrong, or disagreed upon, which is
 //! what makes it the fallback that always works.
 
-use crate::router::{Framed, NodeId, RelayHop, ResponseSender, SendFailure};
+use crate::router::{Framed, PeerId, RelayHop, ResponseSender, SendFailure};
 use opentelemetry::Context;
 use thiserror::Error;
 use tokio::time::Instant;
@@ -16,9 +16,9 @@ use tracing::warn;
 #[cfg(test)]
 mod tests;
 
-/// What a process does with a frame that named some node.
+/// What a process does with a frame that named some peer.
 ///
-/// [`Forward`](Self::Forward) carries no node id. Carrying one was examined and
+/// [`Forward`](Self::Forward) carries no peer id. Carrying one was examined and
 /// rejected: the caller holds the target already, so the field would only add a
 /// binding at every arm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,7 +68,7 @@ impl<R: RelayHop> Relay<R> {
     /// the hop.
     pub(crate) async fn forward<F: Framed + Sync>(
         &self,
-        target: NodeId,
+        target: PeerId,
         deadline: Instant,
         frame: &F,
         context: &Context,
@@ -85,7 +85,7 @@ impl<R: RelayHop> Relay<R> {
     /// The outgoing gRPC request receives the incoming request's deadline.
     async fn hop<F: Framed + Sync>(
         &self,
-        target: NodeId,
+        target: PeerId,
         frame: &F,
         deadline: Instant,
         context: &Context,
@@ -95,10 +95,10 @@ impl<R: RelayHop> Relay<R> {
             .direct(target)
             .await
             .map_err(|error| {
-                // A directory that is down and a node that published nothing
+                // A directory that is down and a peer that published nothing
                 // both reach the caller as one status, so the difference
                 // between them is only readable here.
-                warn!(%error, node = %target, "peer route lookup failed");
+                warn!(%error, peer = %target, "peer route lookup failed");
                 RelayFailure::Unreachable
             })?
             .ok_or(RelayFailure::Unreachable)?;
@@ -121,7 +121,7 @@ impl<R: RelayHop> Relay<R> {
 /// A frame is accepted only by the process it names. A frame that already names
 /// a relay is never sent on again, which is what stops two processes with stale
 /// directory entries from passing one frame back and forth until a deadline.
-pub(crate) fn routing(this: NodeId, target: NodeId, relay: Option<NodeId>) -> Routing {
+pub(crate) fn routing(this: PeerId, target: PeerId, relay: Option<PeerId>) -> Routing {
     if target == this {
         Routing::Accept
     } else if relay.is_some() {

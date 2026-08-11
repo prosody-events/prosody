@@ -1,7 +1,7 @@
 use super::support::{cassandra_directory, finish, registration, test_directory_holding, token};
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::router::directory::cache::AddressCache;
-use crate::router::directory::{Endpoint, NodeDirectory, NodeRegistration, RegistrationTtl};
+use crate::router::directory::{Endpoint, PeerDirectory, PeerRegistration, RegistrationTtl};
 use crate::test_util::{TEST_RUNTIME, integration_test_count};
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
@@ -20,7 +20,7 @@ use tonic::codegen::http::Uri;
 /// How many registrations the cache under test admits.
 const CAPACITY: usize = 8;
 
-/// How many nodes the shared pool holds. More than [`CAPACITY`], so a request
+/// How many peers the shared pool holds. More than [`CAPACITY`], so a request
 /// stream can push the cache past its bound.
 const POOL: usize = 12;
 
@@ -32,7 +32,7 @@ const POOL_CAPACITY: NonZeroUsize = NonZeroUsize::MIN.saturating_add(POOL - 1);
 /// the occupancy bound is exercised on every iteration.
 const PREFIX: [usize; 10] = [0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
 
-/// How many callers ask for one cold node at once.
+/// How many callers ask for one cold peer at once.
 const CONCURRENT: usize = 16;
 
 /// The lease the cached entries age on.
@@ -40,16 +40,16 @@ const POOL_LEASE: Duration = Duration::from_hours(1);
 
 /// The Cassandra pool, registered once for the whole test process under a lease
 /// long enough to outlive the run.
-static POOL_NODES: OnceCell<Vec<(NodeId, Uri)>> = OnceCell::const_new();
+static POOL_PEERS: OnceCell<Vec<(PeerId, Uri)>> = OnceCell::const_new();
 
-/// The three bounds that make the address cache safe to key by a node id an
+/// The three bounds that make the address cache safe to key by a peer id an
 /// outsider chooses, proved together over one generated request stream.
 ///
-/// **Occupancy.** However long the stream and however many distinct nodes it
+/// **Occupancy.** However long the stream and however many distinct peers it
 /// names, the cache never holds more than its capacity, and no request issues
 /// more than one directory read.
 ///
-/// **Single flight.** Many callers asking for one cold node at once issue
+/// **Single flight.** Many callers asking for one cold peer at once issue
 /// exactly one read; every caller after the first parks on the placeholder.
 /// This is the bound that matters on the response path, and it is the one the
 /// cache guarantees — a cached entry itself is best-effort, because
@@ -58,10 +58,10 @@ static POOL_NODES: OnceCell<Vec<(NodeId, Uri)>> = OnceCell::const_new();
 /// **Age.** A fresh entry is served with no read. Past the lease the same
 /// entry is read again rather than served.
 ///
-/// **Absence.** A node the directory does not hold is cached as absent, so a
+/// **Absence.** A peer the directory does not hold is cached as absent, so a
 /// burst for an unknown id issues one read and not one per request.
 ///
-/// The cache reads through a [`NodeDirectory`] and nothing more, so this is the
+/// The cache reads through a [`PeerDirectory`] and nothing more, so this is the
 /// default loop and it needs no cluster.
 #[test]
 fn prop_address_cache_bounded_single_flight() {
@@ -83,7 +83,7 @@ fn prop_address_cache_bounded_single_flight_over_cassandra() {
     fn property(generated: Vec<usize>) -> TestResult {
         finish(TEST_RUNTIME.block_on(async {
             let directory = cassandra_directory(POOL_LEASE).await?;
-            let pool = POOL_NODES
+            let pool = POOL_PEERS
                 .get_or_try_init(|| register_pool(&directory))
                 .await?;
             run_address_cache_cases(&directory, pool, directory.ttl(), generated).await
@@ -96,9 +96,9 @@ fn prop_address_cache_bounded_single_flight_over_cassandra() {
 }
 
 /// Runs every address-cache case against one directory and one pool.
-async fn run_address_cache_cases<D: NodeDirectory>(
+async fn run_address_cache_cases<D: PeerDirectory>(
     directory: &D,
-    pool: &[(NodeId, Uri)],
+    pool: &[(PeerId, Uri)],
     ttl: RegistrationTtl,
     generated: Vec<usize>,
 ) -> Result<()> {
@@ -110,10 +110,10 @@ async fn run_address_cache_cases<D: NodeDirectory>(
 
 /// Drives the generated stream and checks the two bounds that hold at every
 /// position: occupancy, and one read per request at most. Each served value is
-/// checked against the URI its node registered, so a mixed-up entry is caught.
-async fn occupancy_holds<D: NodeDirectory>(
+/// checked against the URI its peer registered, so a mixed-up entry is caught.
+async fn occupancy_holds<D: PeerDirectory>(
     directory: &D,
-    pool: &[(NodeId, Uri)],
+    pool: &[(PeerId, Uri)],
     ttl: RegistrationTtl,
     generated: Vec<usize>,
 ) -> Result<()> {
@@ -125,11 +125,11 @@ async fn occupancy_holds<D: NodeDirectory>(
         .copied()
         .chain(generated.into_iter().map(|index| index % POOL));
     for (position, index) in requests.enumerate() {
-        let (node, uri) = &pool[index];
+        let (peer, uri) = &pool[index];
         let before = reads.load(Ordering::Relaxed);
-        let resolved = resolve(&cache, directory, &reads, *node)
+        let resolved = resolve(&cache, directory, &reads, *peer)
             .await?
-            .ok_or_else(|| eyre!("request {position}: a registered node must resolve"))?;
+            .ok_or_else(|| eyre!("request {position}: a registered peer must resolve"))?;
         let issued = reads.load(Ordering::Relaxed) - before;
         assert!(
             cache.len() <= CAPACITY,
@@ -143,36 +143,36 @@ async fn occupancy_holds<D: NodeDirectory>(
         assert_eq!(
             resolved.direct.uri(),
             uri,
-            "request {position}: the cache served another node's registration"
+            "request {position}: the cache served another peer's registration"
         );
     }
     Ok(())
 }
 
-/// A burst of callers for one cold node issues one read: the winner takes the
+/// A burst of callers for one cold peer issues one read: the winner takes the
 /// placeholder and every other caller parks on it.
-async fn one_read_per_cold_burst<D: NodeDirectory>(
+async fn one_read_per_cold_burst<D: PeerDirectory>(
     directory: &D,
-    pool: &[(NodeId, Uri)],
+    pool: &[(PeerId, Uri)],
     ttl: RegistrationTtl,
 ) -> Result<()> {
     let (clock, _mock) = Clock::mock();
     let cache = AddressCache::with_clock(CAPACITY, ttl, clock);
     let reads = AtomicUsize::new(0);
-    let (node, uri) = &pool[1];
-    let burst = join_all((0..CONCURRENT).map(|_| resolve(&cache, directory, &reads, *node))).await;
+    let (peer, uri) = &pool[1];
+    let burst = join_all((0..CONCURRENT).map(|_| resolve(&cache, directory, &reads, *peer))).await;
     for served in burst {
-        let served = served?.ok_or_else(|| eyre!("a registered node must resolve"))?;
+        let served = served?.ok_or_else(|| eyre!("a registered peer must resolve"))?;
         assert_eq!(
             served.direct.uri(),
             uri,
-            "every caller in the burst must be served the node it asked for"
+            "every caller in the burst must be served the peer it asked for"
         );
     }
     assert_eq!(
         reads.load(Ordering::Relaxed),
         1,
-        "{CONCURRENT} callers for one cold node must issue one read"
+        "{CONCURRENT} callers for one cold peer must issue one read"
     );
     Ok(())
 }
@@ -180,19 +180,19 @@ async fn one_read_per_cold_burst<D: NodeDirectory>(
 /// A fresh entry is served without a read; past the lease the same entry is
 /// read again. The cache holds one entry here, so admission cannot be undone
 /// by an eviction and the hit is deterministic.
-async fn a_fresh_entry_is_served_until_the_lease_ends<D: NodeDirectory>(
+async fn a_fresh_entry_is_served_until_the_lease_ends<D: PeerDirectory>(
     directory: &D,
-    pool: &[(NodeId, Uri)],
+    pool: &[(PeerId, Uri)],
     ttl: RegistrationTtl,
 ) -> Result<()> {
     let (clock, mock) = Clock::mock();
     let cache = AddressCache::with_clock(CAPACITY, ttl, clock);
     let reads = AtomicUsize::new(0);
-    let node = pool[0].0;
+    let peer = pool[0].0;
 
-    drop(resolve(&cache, directory, &reads, node).await?);
+    drop(resolve(&cache, directory, &reads, peer).await?);
     let after_fill = reads.load(Ordering::Relaxed);
-    drop(resolve(&cache, directory, &reads, node).await?);
+    drop(resolve(&cache, directory, &reads, peer).await?);
     assert_eq!(
         reads.load(Ordering::Relaxed),
         after_fill,
@@ -200,7 +200,7 @@ async fn a_fresh_entry_is_served_until_the_lease_ends<D: NodeDirectory>(
     );
 
     mock.increment(POOL_LEASE + Duration::from_secs(1));
-    drop(resolve(&cache, directory, &reads, node).await?);
+    drop(resolve(&cache, directory, &reads, peer).await?);
     assert!(
         reads.load(Ordering::Relaxed) > after_fill,
         "an entry older than the lease must be read again, not served"
@@ -212,28 +212,28 @@ async fn a_fresh_entry_is_served_until_the_lease_ends<D: NodeDirectory>(
     Ok(())
 }
 
-/// A node the directory does not hold is cached as absent, so repeated
+/// A peer the directory does not hold is cached as absent, so repeated
 /// requests for an unknown id issue one read and not one per request.
-async fn absence_is_cached<D: NodeDirectory>(directory: &D, ttl: RegistrationTtl) -> Result<()> {
+async fn absence_is_cached<D: PeerDirectory>(directory: &D, ttl: RegistrationTtl) -> Result<()> {
     let (clock, _mock) = Clock::mock();
     let cache = AddressCache::with_clock(CAPACITY, ttl, clock);
     let reads = AtomicUsize::new(0);
-    let unknown = NodeId::new();
+    let unknown = PeerId::new();
     for attempt in 1_u8..=3 {
         assert!(
             resolve(&cache, directory, &reads, unknown).await?.is_none(),
-            "attempt {attempt}: a node the directory does not hold must resolve as absent"
+            "attempt {attempt}: a peer the directory does not hold must resolve as absent"
         );
     }
     assert_eq!(
         reads.load(Ordering::Relaxed),
         1,
-        "repeated requests for an absent node must issue one read"
+        "repeated requests for an absent peer must issue one read"
     );
     Ok(())
 }
 
-/// Resolves `node`, counting the directory reads the cache actually issues.
+/// Resolves `peer`, counting the directory reads the cache actually issues.
 ///
 /// The fill suspends once before it reads. That is what makes
 /// [`one_read_per_cold_burst`] a detector: the test directory answers without
@@ -242,32 +242,32 @@ async fn absence_is_cached<D: NodeDirectory>(directory: &D, ttl: RegistrationTtl
 /// fresh entry however the cache filled it. With the yield the first caller
 /// parks holding the placeholder, so a cache that lost single flight issues one
 /// read per caller and the count reds.
-async fn resolve<D: NodeDirectory>(
+async fn resolve<D: PeerDirectory>(
     cache: &AddressCache,
     directory: &D,
     reads: &AtomicUsize,
-    node: NodeId,
-) -> Result<Option<Arc<NodeRegistration>>> {
+    peer: PeerId,
+) -> Result<Option<Arc<PeerRegistration>>> {
     Ok(cache
-        .resolve(node, || async move {
+        .resolve(peer, || async move {
             reads.fetch_add(1, Ordering::Relaxed);
             yield_now().await;
-            directory.read(node).await
+            directory.read(peer).await
         })
         .await?)
 }
 
-/// Registers [`POOL`] nodes with distinct URIs.
-async fn register_pool<D: NodeDirectory>(directory: &D) -> Result<Vec<(NodeId, Uri)>> {
-    let mut nodes = Vec::with_capacity(POOL);
+/// Registers [`POOL`] peers with distinct URIs.
+async fn register_pool<D: PeerDirectory>(directory: &D) -> Result<Vec<(PeerId, Uri)>> {
+    let mut peers = Vec::with_capacity(POOL);
     for _ in 0..POOL {
-        let node = NodeId::new();
+        let peer = PeerId::new();
         let endpoint = Endpoint::from_shared(format!("http://pool-{}.test", token()))?;
         let uri = endpoint.uri().clone();
-        let mut written = registration(node);
+        let mut written = registration(peer);
         written.direct = endpoint;
         directory.register(&written).await?;
-        nodes.push((node, uri));
+        peers.push((peer, uri));
     }
-    Ok(nodes)
+    Ok(peers)
 }

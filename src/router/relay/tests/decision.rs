@@ -2,14 +2,14 @@
 
 use super::{BUDGET, Process, THIS, frame};
 use crate::response::frame::decode::decode_frame;
-use crate::router::loopback::{config, direct_uri, node, paused};
+use crate::router::loopback::{config, direct_uri, paused, peer};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use tonic::Code;
 
-/// How many node ids a case draws from. Small, so `target == this` and a frame
+/// How many peer ids a case draws from. Small, so `target == this` and a frame
 /// that already names a relay both occur often.
 const POOL: u8 = 4;
 
@@ -53,10 +53,10 @@ fn prop_a_frame_is_accepted_only_by_the_process_it_names(routed: Routed) -> Test
 async fn play(routed: &Routed) -> Result<()> {
     let mut process = Process::new(config())?;
     let mut request = process.expects()?;
-    let target = node(routed.target);
-    let relay = routed.relay.map(node);
+    let target = peer(routed.target);
+    let relay = routed.relay.map(peer);
 
-    // The table. `this` is the node the process answers for.
+    // The table. `this` is the peer the process answers for.
     let mine = routed.target == THIS;
     let accepted = mine;
     let forwarded = !mine && relay.is_none();
@@ -86,13 +86,13 @@ async fn play(routed: &Routed) -> Result<()> {
         let expected = direct_uri(routed.target)?;
         if sent.uri != expected {
             bail!(
-                "the frame went to {}, not to the URI node {} published",
+                "the frame went to {}, not to the URI peer {} published",
                 sent.uri,
                 routed.target
             );
         }
         let sent_frame = decode_frame(&mut sent.bytes)?;
-        if sent_frame.header.relay != Some(process.node) {
+        if sent_frame.header.relay != Some(process.peer) {
             bail!(
                 "the sent frame names relay {:?}, not the process that sent it on",
                 sent_frame.header.relay

@@ -1,7 +1,7 @@
 //! Peer registration lifecycle.
 
 use super::plain_process;
-use crate::router::directory::NodeDirectory;
+use crate::router::directory::PeerDirectory;
 use crate::router::directory::tests::suite::same_registration;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -14,10 +14,10 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let process = plain_process().await?;
-        let node = process.runtime.node();
+        let peer = process.runtime.peer();
         let registered = process
             .directory
-            .read(node)
+            .read(peer)
             .await?
             .ok_or_else(|| eyre!("a started runtime must resolve"))?;
         ensure!(registered.advertised.is_none() && registered.network.is_none());
@@ -26,14 +26,14 @@ fn runtime_registers_on_start_and_deregisters_on_shutdown() -> Result<()> {
                 .runtime
                 .network
                 .addresses
-                .resolve(node)
+                .resolve(peer)
                 .await?
                 .as_deref()
                 .is_some_and(|resolved| same_registration(resolved, &registered))
         );
 
         process.runtime.shutdown(|| async {}).await?;
-        ensure!(process.directory.read(node).await?.is_none());
+        ensure!(process.directory.read(peer).await?.is_none());
         Ok(())
     })
 }

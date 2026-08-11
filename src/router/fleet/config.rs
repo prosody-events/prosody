@@ -8,7 +8,7 @@ const DEFAULT_PEER_CAPACITY: usize = 256;
 /// Response delivery policy.
 #[derive(Clone, Copy, Debug, Validate)]
 pub(crate) struct FleetConfiguration {
-    /// Maximum peer records held in each node-keyed cache.
+    /// Maximum peer records held in each peer-keyed cache.
     #[validate(range(min = 1_usize))]
     pub(crate) peer_capacity: usize,
 }

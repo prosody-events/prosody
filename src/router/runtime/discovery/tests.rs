@@ -6,7 +6,7 @@ use super::{
     DiscoveredHost, DiscoveryError, discover_host, join_discovery,
     registration as discover_registration,
 };
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::router::directory::Endpoint;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -35,7 +35,7 @@ fn prop_the_direct_endpoint_publishes_only_what_it_discovered(label: u8) -> Test
             .build()?;
         config.validate()?;
         let bound = listener().await?;
-        let registration = discover_registration(NodeId::new(), &bound, discover_host()?, &config)?;
+        let registration = discover_registration(PeerId::new(), &bound, discover_host()?, &config)?;
         ensure!(
             registration.direct.uri() != advertised.uri(),
             "the direct endpoint published the configured entry point"

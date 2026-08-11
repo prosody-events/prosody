@@ -32,7 +32,7 @@ pub struct PeerConfiguration {
     /// The network label for direct routes.
     #[builder(default = "from_option_env(\"PROSODY_PEER_NETWORK_NAME\")?")]
     pub network_name: Option<String>,
-    /// The maximum number of peers held in each node-keyed cache.
+    /// The maximum number of peers held in each peer-keyed cache.
     #[builder(default = "from_env_with_fallback(\"PROSODY_PEER_CACHE_CAPACITY\", \
                          PeerConfiguration::default().peer_cache_capacity)?")]
     pub peer_cache_capacity: usize,

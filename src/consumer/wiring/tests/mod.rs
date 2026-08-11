@@ -26,9 +26,9 @@ use crate::loader::MemoryLoader;
 use crate::otel::SpanRelation;
 use crate::peer::PeerBackend;
 use crate::peer::runtime::prepare_network;
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::router::directory::tests::support::TestDirectory;
-use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
+use crate::router::directory::{PeerDirectory, PeerRegistration, RegistrationTtl};
 use crate::router::runtime::PreparedPeerRuntime;
 use crate::state::config::KeyedStateConfiguration;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore};
@@ -124,14 +124,14 @@ impl RecordingDirectory {
     }
 }
 
-impl NodeDirectory for RecordingDirectory {
+impl PeerDirectory for RecordingDirectory {
     type Error = RecordingError;
 
     fn ttl(&self) -> RegistrationTtl {
         self.inner.ttl()
     }
 
-    async fn register(&self, registration: &NodeRegistration) -> Result<(), Self::Error> {
+    async fn register(&self, registration: &PeerRegistration) -> Result<(), Self::Error> {
         match self.inner.register(registration).await {
             Ok(()) => {}
             Err(error) => match error {},
@@ -164,14 +164,14 @@ impl NodeDirectory for RecordingDirectory {
         }
     }
 
-    async fn read(&self, node: NodeId) -> Result<Option<NodeRegistration>, Self::Error> {
-        match self.inner.read(node).await {
+    async fn read(&self, peer: PeerId) -> Result<Option<PeerRegistration>, Self::Error> {
+        match self.inner.read(peer).await {
             Ok(registration) => Ok(registration),
             Err(error) => match error {},
         }
     }
 
-    async fn deregister(&self, registration: &NodeRegistration) -> Result<(), Self::Error> {
+    async fn deregister(&self, registration: &PeerRegistration) -> Result<(), Self::Error> {
         match self.inner.deregister(registration).await {
             Ok(()) => {}
             Err(error) => match error {},

@@ -3,9 +3,9 @@ use super::suite::{
     run_idempotent_deregister_case, run_label_bound_case,
 };
 use super::support::{cassandra_directory, finish, registration, store};
-use crate::cassandra::TABLE_NODE_DIRECTORY;
-use crate::router::NodeId;
-use crate::router::directory::{NodeDirectory, RegistrationTtl};
+use crate::cassandra::TABLE_PEER_DIRECTORY;
+use crate::router::PeerId;
+use crate::router::directory::{PeerDirectory, RegistrationTtl};
 use crate::test_util::{TEST_KEYSPACE, TEST_RUNTIME, integration_test_count};
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
@@ -55,9 +55,9 @@ fn cassandra_directory_deregisters_idempotently() -> Result<()> {
     })
 }
 
-/// A registration lives on a lease and nothing else. Every cell a node writes
-/// carries a TTL inside the lease, and past the lease with no refresh the node
-/// row is gone — so resolution finds nothing and the node reads as unreachable
+/// A registration lives on a lease and nothing else. Every cell a peer writes
+/// carries a TTL inside the lease, and past the lease with no refresh the peer
+/// row is gone — so resolution finds nothing and the peer reads as unreachable
 /// rather than as a stale address to dial.
 #[test]
 fn registration_cells_carry_a_ttl_and_expire() -> Result<()> {
@@ -65,8 +65,8 @@ fn registration_cells_carry_a_ttl_and_expire() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let directory = cassandra_directory(RegistrationTtl::MIN).await?;
         let session = store().await?.session();
-        let node = NodeId::new();
-        let written = registration(node);
+        let peer = PeerId::new();
+        let written = registration(peer);
         directory.register(&written).await?;
 
         // Only non-NULL regular columns are asked. `TTL()` of a NULL column is
@@ -75,9 +75,9 @@ fn registration_cells_carry_a_ttl_and_expire() -> Result<()> {
             .query_unpaged(
                 format!(
                     "SELECT TTL(direct_connect), TTL(hostname), TTL(network) FROM \
-                     {TEST_KEYSPACE}.{TABLE_NODE_DIRECTORY} WHERE node_id = ?"
+                     {TEST_KEYSPACE}.{TABLE_PEER_DIRECTORY} WHERE peer_id = ?"
                 ),
-                (Uuid::from(node),),
+                (Uuid::from(peer),),
             )
             .await?
             .into_rows_result()?
@@ -98,13 +98,13 @@ fn registration_cells_carry_a_ttl_and_expire() -> Result<()> {
         let mut ticker = interval(Duration::from_millis(200));
         loop {
             ticker.tick().await;
-            let resolved = directory.read(node).await?;
+            let resolved = directory.read(peer).await?;
             if resolved.is_none() {
                 break;
             }
             ensure!(
                 Instant::now() < deadline,
-                "the registration outlived its lease: node {resolved:?}"
+                "the registration outlived its lease: peer {resolved:?}"
             );
         }
         Ok(())
@@ -119,7 +119,7 @@ fn unusable_row_reads_as_absent() -> Result<()> {
         let directory = cassandra_directory(STABLE_LEASE).await?;
         let store = store().await?;
         let query = format!(
-            "INSERT INTO {TEST_KEYSPACE}.{TABLE_NODE_DIRECTORY} (node_id, direct_connect, \
+            "INSERT INTO {TEST_KEYSPACE}.{TABLE_PEER_DIRECTORY} (peer_id, direct_connect, \
              advertised_connect, hostname) VALUES (?, ?, ?, ?) USING TTL 300"
         );
         for (direct, advertised, reason) in [
@@ -135,16 +135,16 @@ fn unusable_row_reads_as_absent() -> Result<()> {
                 "has an invalid advertised endpoint",
             ),
         ] {
-            let node = NodeId::new();
+            let peer = PeerId::new();
             store
                 .session()
                 .query_unpaged(
                     query.as_str(),
-                    (Uuid::from(node), direct, advertised, "invalid-row"),
+                    (Uuid::from(peer), direct, advertised, "invalid-row"),
                 )
                 .await?;
             assert!(
-                directory.read(node).await?.is_none(),
+                directory.read(peer).await?.is_none(),
                 "a row that {reason} must not resolve"
             );
         }

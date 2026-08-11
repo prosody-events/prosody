@@ -1,7 +1,7 @@
 use super::{FrameHeader, FrameResult, ResponseSuccess};
 use crate::codec::Codec;
 use crate::response::RequestId;
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::subsystem::SubsystemName;
 use bytes::BytesMut;
 use color_eyre::Result;
@@ -45,9 +45,9 @@ impl Codec for CountingCodec {
     }
 }
 
-pub(crate) fn header(subsystem: &str, relay: Option<NodeId>) -> Result<FrameHeader> {
+pub(crate) fn header(subsystem: &str, relay: Option<PeerId>) -> Result<FrameHeader> {
     Ok(FrameHeader {
-        target: NodeId::from_bytes([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+        target: PeerId::from_bytes([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
         request: RequestId::from_bytes([
             16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
         ]),

@@ -1,10 +1,10 @@
-//! The Cassandra node directory.
+//! The Cassandra peer directory.
 
-use super::{Endpoint, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl};
+use super::{Endpoint, NetworkId, PeerDirectory, PeerRegistration, RegistrationTtl};
 use crate::cassandra::errors::CassandraStoreError;
-use crate::cassandra::{CassandraStore, TABLE_NODE_DIRECTORY};
+use crate::cassandra::{CassandraStore, TABLE_PEER_DIRECTORY};
 use crate::cassandra_queries;
-use crate::router::{Host, NodeId, label_fits};
+use crate::router::{Host, PeerId, label_fits};
 use fixedstr::Flexstr;
 use scylla::statement::Consistency;
 use std::sync::Arc;
@@ -12,28 +12,28 @@ use tracing::{instrument, warn};
 use uuid::Uuid;
 
 cassandra_queries! {
-    /// Prepared statements of the node directory. Each one is an unconditional
+    /// Prepared statements of the peer directory. Each one is an unconditional
     /// write or a single-partition point read: no lightweight transaction, no
     /// filtering, and no client-supplied write timestamp.
     pub(crate) struct DirectoryQueries {
-        /// Writes every column of one node's row under one lease.
+        /// Writes every column of one peer's row under one lease.
         register: (
-            "INSERT INTO $keyspace.{} (node_id, direct_connect, advertised_connect, network, \
+            "INSERT INTO $keyspace.{} (peer_id, direct_connect, advertised_connect, network, \
              hostname) VALUES (?, ?, ?, ?, ?) USING TTL ?",
-            TABLE_NODE_DIRECTORY
+            TABLE_PEER_DIRECTORY
         ),
 
-        /// Point-reads one node's row.
+        /// Point-reads one peer's row.
         read: (
             "SELECT direct_connect, advertised_connect, network, hostname \
-             FROM $keyspace.{} WHERE node_id = ?",
-            TABLE_NODE_DIRECTORY
+             FROM $keyspace.{} WHERE peer_id = ?",
+            TABLE_PEER_DIRECTORY
         ),
 
-        /// Removes one node's row on a clean shutdown.
+        /// Removes one peer's row on a clean shutdown.
         remove: (
-            "DELETE FROM $keyspace.{} WHERE node_id = ?",
-            TABLE_NODE_DIRECTORY
+            "DELETE FROM $keyspace.{} WHERE peer_id = ?",
+            TABLE_PEER_DIRECTORY
         ),
     }
 }
@@ -46,7 +46,7 @@ type DirectoryColumns = (
     Option<String>,
 );
 
-/// The read-write handle on the Cassandra node directory.
+/// The read-write handle on the Cassandra peer directory.
 ///
 /// Every statement runs at `LOCAL_ONE`. A registration is idempotent and
 /// rewritten every interval, so a write that reaches one replica and is then
@@ -54,13 +54,13 @@ type DirectoryColumns = (
 /// every cache miss on the response path wait for a second replica and would
 /// buy nothing on top of a row that is rewritten every interval.
 #[derive(Clone, Debug)]
-pub(crate) struct CassandraNodeDirectory {
+pub(crate) struct CassandraPeerDirectory {
     store: CassandraStore,
     queries: Arc<DirectoryQueries>,
     ttl: RegistrationTtl,
 }
 
-impl CassandraNodeDirectory {
+impl CassandraPeerDirectory {
     /// Prepares the directory's statements against `store` and fixes the lease
     /// every write publishes.
     ///
@@ -97,7 +97,7 @@ impl CassandraNodeDirectory {
     }
 }
 
-impl NodeDirectory for CassandraNodeDirectory {
+impl PeerDirectory for CassandraPeerDirectory {
     type Error = CassandraStoreError;
 
     fn ttl(&self) -> RegistrationTtl {
@@ -113,8 +113,8 @@ impl NodeDirectory for CassandraNodeDirectory {
     /// # Errors
     ///
     /// Returns the driver's error when the write fails.
-    #[instrument(level = "debug", skip_all, fields(node = %registration.node), err)]
-    async fn register(&self, registration: &NodeRegistration) -> Result<(), CassandraStoreError> {
+    #[instrument(level = "debug", skip_all, fields(peer = %registration.peer), err)]
+    async fn register(&self, registration: &PeerRegistration) -> Result<(), CassandraStoreError> {
         let direct_connect = registration.direct.uri().to_string();
         let advertised_connect = registration
             .advertised
@@ -128,7 +128,7 @@ impl NodeDirectory for CassandraNodeDirectory {
             .execute_unpaged_discard(
                 &self.queries.register,
                 (
-                    Uuid::from(registration.node),
+                    Uuid::from(registration.peer),
                     direct_connect,
                     advertised_connect,
                     registration.network.as_ref().map(Flexstr::as_str),
@@ -139,23 +139,23 @@ impl NodeDirectory for CassandraNodeDirectory {
             .await
     }
 
-    /// Reads one node's registration.
+    /// Reads one peer's registration.
     ///
     /// A partial row or a row with an invalid label reads as absent. Such a row
     /// has half expired or comes from another writer. The
-    /// caller then reports the node unreachable instead of dialing a partial
+    /// caller then reports the peer unreachable instead of dialing a partial
     /// address.
     ///
     /// # Errors
     ///
     /// Returns the driver's error when the read fails. An unusable row is a
     /// data outcome, not an error.
-    #[instrument(level = "debug", skip_all, fields(%node), err)]
-    async fn read(&self, node: NodeId) -> Result<Option<NodeRegistration>, CassandraStoreError> {
+    #[instrument(level = "debug", skip_all, fields(%peer), err)]
+    async fn read(&self, peer: PeerId) -> Result<Option<PeerRegistration>, CassandraStoreError> {
         let row = self
             .store
             .session()
-            .execute_unpaged(&self.queries.read, (Uuid::from(node),))
+            .execute_unpaged(&self.queries.read, (Uuid::from(peer),))
             .await?
             .into_rows_result()?
             .maybe_first_row::<DirectoryColumns>()?;
@@ -174,7 +174,7 @@ impl NodeDirectory for CassandraNodeDirectory {
             Some(connect) => match Endpoint::from_shared(connect) {
                 Ok(endpoint) => Some(endpoint),
                 Err(error) => {
-                    warn!(%error, %node, "directory row has an invalid advertised endpoint");
+                    warn!(%error, %peer, "directory row has an invalid advertised endpoint");
                     return Ok(None);
                 }
             },
@@ -182,11 +182,11 @@ impl NodeDirectory for CassandraNodeDirectory {
         };
         let (true, Some(direct), Some(hostname)) = (bounded, endpoint(direct_connect), hostname)
         else {
-            warn!(%node, "directory row is not resolvable");
+            warn!(%peer, "directory row is not resolvable");
             return Ok(None);
         };
-        Ok(Some(NodeRegistration {
-            node,
+        Ok(Some(PeerRegistration {
+            peer,
             direct,
             advertised,
             network: network.map(|network| NetworkId::make(&network)),
@@ -202,10 +202,10 @@ impl NodeDirectory for CassandraNodeDirectory {
     /// # Errors
     ///
     /// Returns the driver's error when the delete fails.
-    #[instrument(level = "debug", skip_all, fields(node = %registration.node), err)]
-    async fn deregister(&self, registration: &NodeRegistration) -> Result<(), CassandraStoreError> {
+    #[instrument(level = "debug", skip_all, fields(peer = %registration.peer), err)]
+    async fn deregister(&self, registration: &PeerRegistration) -> Result<(), CassandraStoreError> {
         self.store
-            .execute_unpaged_discard(&self.queries.remove, (Uuid::from(registration.node),))
+            .execute_unpaged_discard(&self.queries.remove, (Uuid::from(registration.peer),))
             .await
     }
 }

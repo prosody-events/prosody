@@ -1,7 +1,7 @@
 //! What one call refuses before it produces anything, and what it puts on the
 //! record when it does produce.
 
-use super::{NODE, POOL, RequestPayload, distinct_indices, names, poll_once, registry, requester};
+use super::{PEER, POOL, RequestPayload, distinct_indices, names, poll_once, registry, requester};
 use crate::Topic;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::requester::registry::tests::pending_len;
@@ -255,7 +255,7 @@ fn run_headers(trace: HeaderTrace) -> Result<()> {
 
     let id = RequestId::new();
     let mut request_buf = [0_u8; ID_TEXT_LEN];
-    let mut node_buf = [0_u8; ID_TEXT_LEN];
+    let mut peer_buf = [0_u8; ID_TEXT_LEN];
     let mut deadline_buf = itoa::Buffer::new();
     let deadline = RequestDeadline::from_unix_micros(1_700_000_000_000_000);
     let mut headers = OwnedHeaders::new_with_capacity(user.len() + awaited.len() + 4);
@@ -268,7 +268,7 @@ fn run_headers(trace: HeaderTrace) -> Result<()> {
     let headers = append_request_headers(
         headers,
         (id, &mut request_buf),
-        (NODE, &mut node_buf),
+        (PEER, &mut peer_buf),
         (deadline, &mut deadline_buf),
         &awaited,
     );
@@ -277,7 +277,7 @@ fn run_headers(trace: HeaderTrace) -> Result<()> {
         .iter()
         .map(|header| (header.key, header.value))
         .collect();
-    let expected = RequestTag::new(id, NODE, deadline);
+    let expected = RequestTag::new(id, PEER, deadline);
     for name in &awaited {
         assert_eq!(
             parse_request_tag(wire.iter().copied(), name)?,

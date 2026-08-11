@@ -52,8 +52,8 @@ Use a different bind address for each client that shares a host.
 | `PROSODY_PEER_BIND_ADDRESS` | `0.0.0.0:9099` | The peer server needs a local listener. | The socket address that the peer server binds. | Must be a socket address. |
 | `PROSODY_PEER_ADVERTISED_CONNECT` | unset | Peers on another network need an entry point. | The gRPC connect URI that remote peers use. | Must be a valid gRPC URI. |
 | `PROSODY_PEER_NETWORK_NAME` | unset | A shared label lets peers prefer direct routes. | The network group used to choose direct or advertised routes. | 1 through 63 bytes when set. |
-| `PROSODY_PEER_CACHE_CAPACITY` | 256 | Node-keyed caches need a fixed memory bound. | The entry count for address, channel, and route-preference caches. | Must be greater than zero. |
-| `PROSODY_PEER_REGISTRATION_TTL` | 30s | A lease removes dead nodes without a cleanup task. | The Cassandra TTL and refresh pace for this node registration. | 5s through 1h. |
+| `PROSODY_PEER_CACHE_CAPACITY` | 256 | Peer-keyed caches need a fixed memory bound. | The entry count for address, channel, and route-preference caches. | Must be greater than zero. |
+| `PROSODY_PEER_REGISTRATION_TTL` | 30s | A lease removes dead peers without a cleanup task. | The Cassandra TTL and refresh pace for this peer registration. | 5s through 1h. |
 
 Set `PROSODY_SUBSYSTEM` to make the client answer requests for that subsystem.
 Without it, the client consumes messages but does not answer requests. A

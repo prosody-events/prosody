@@ -18,7 +18,7 @@ use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{EventHandler, Partition, Topic};
 use crate::response::RequestId;
 use crate::response::headers::{RequestDeadline, RequestTag};
-use crate::router::loopback::{Delivery, TestRouter, collect_deliveries, config, node};
+use crate::router::loopback::{Delivery, TestRouter, collect_deliveries, config, peer};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
@@ -156,7 +156,7 @@ impl<C: Codec<Payload = ()>> Fixture<C> {
     }
 }
 
-/// A message asking node `index` for a response to request `request_byte`.
+/// A message asking peer `index` for a response to request `request_byte`.
 fn tagged(index: u8, request_byte: u8, key: &str) -> Result<ConsumerMessage<Value>> {
     tagged_under(index, request_byte, key, Span::current())
 }
@@ -182,7 +182,7 @@ fn tagged_at_under(
         key,
         Some(RequestTag::new(
             RequestId::from_bytes([request_byte; 16]),
-            node(index),
+            peer(index),
             RequestDeadline::from_unix_micros(deadline_micros),
         )),
         span,

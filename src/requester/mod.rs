@@ -10,10 +10,10 @@ use crate::producer::{ProducerError, ProsodyProducer};
 use crate::response::RequestId;
 use crate::response::headers::{
     ID_TEXT_LEN, REQUEST_REVISION, RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER,
-    RESPONSE_NODE_HEADER, RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline,
+    RESPONSE_PEER_HEADER, RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline,
     id_text, is_reserved,
 };
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::subsystem::SubsystemName;
 use crate::{Codec, EventIdentity, Topic};
 use opentelemetry::KeyValue;
@@ -118,21 +118,21 @@ pub enum RequestError<E: Error> {
 /// Sends requests and returns responses in subsystem order.
 pub struct ProsodyRequester<C: Codec, R: Codec> {
     producer: ProsodyProducer<C>,
-    node: NodeId,
+    peer: PeerId,
     registry: Arc<PendingRegistry>,
     _response: PhantomData<fn() -> R>,
 }
 
 impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
-    /// Creates a requester for one node and one response codec.
+    /// Creates a requester for one peer and one response codec.
     pub(crate) fn new(
         producer: ProsodyProducer<C>,
-        node: NodeId,
+        peer: PeerId,
         registry: Arc<PendingRegistry>,
     ) -> Self {
         Self {
             producer,
-            node,
+            peer,
             registry,
             _response: PhantomData,
         }
@@ -180,7 +180,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             messaging.system = "kafka",
             topic = topic.as_ref(),
             key = %key,
-            response.node = %self.node,
+            response.peer = %self.peer,
             request.id = Empty,
             request.outcome = Empty,
             request.latency_ms = Empty,
@@ -206,7 +206,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         // The two id texts are declared before the header list, so they outlive
         // the borrows the list holds on them.
         let mut request_buf = [0_u8; ID_TEXT_LEN];
-        let mut node_buf = [0_u8; ID_TEXT_LEN];
+        let mut peer_buf = [0_u8; ID_TEXT_LEN];
         let mut deadline_buf = itoa::Buffer::new();
 
         let deadline = RequestDeadline::after(timeout).ok_or(RequestError::DeadlineOutOfRange)?;
@@ -216,7 +216,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         record_headers = append_request_headers(
             record_headers,
             (registration.id(), &mut request_buf),
-            (self.node, &mut node_buf),
+            (self.peer, &mut peer_buf),
             (deadline, &mut deadline_buf),
             subsystems,
         );
@@ -300,7 +300,7 @@ fn answered<V>(response: &Result<V, ResponseError>) -> bool {
 /// How complete one request's answers were, as the fixed label its latency is
 /// recorded under.
 ///
-/// A label rather than a subsystem name or a node id: those arrive from the
+/// A label rather than a subsystem name or a peer id: those arrive from the
 /// network, and a metric keyed by one is a cardinality attack.
 const fn completeness(answered: usize, awaited: usize) -> &'static str {
     if answered == 0 {
@@ -316,12 +316,12 @@ const fn completeness(answered: usize, awaited: usize) -> &'static str {
 fn append_request_headers<'a>(
     mut headers: OwnedHeaders,
     request: (RequestId, &'a mut [u8; ID_TEXT_LEN]),
-    node: (NodeId, &'a mut [u8; ID_TEXT_LEN]),
+    peer: (PeerId, &'a mut [u8; ID_TEXT_LEN]),
     deadline: (RequestDeadline, &'a mut itoa::Buffer),
     subsystems: &'a [SubsystemName],
 ) -> OwnedHeaders {
     let (request, request_buf) = request;
-    let (node, node_buf) = node;
+    let (peer, peer_buf) = peer;
     let (deadline, deadline_buf) = deadline;
     headers = insert_header(headers, RESPONSE_VERSION_HEADER, REQUEST_REVISION);
     headers = insert_header(
@@ -331,8 +331,8 @@ fn append_request_headers<'a>(
     );
     headers = insert_header(
         headers,
-        RESPONSE_NODE_HEADER,
-        id_text(node.into(), node_buf),
+        RESPONSE_PEER_HEADER,
+        id_text(peer.into(), peer_buf),
     );
     headers = insert_header(
         headers,

@@ -1,16 +1,16 @@
 //! Test data and backend constructors shared by the directory and runtime.
 //!
-//! Isolation follows the Cassandra row rule: a directory row is keyed by node
+//! Isolation follows the Cassandra row rule: a directory row is keyed by peer
 //! id alone and every test mints fresh ids, so rows are disjoint in the shared
 //! `prosody_test` keyspace and no test creates a keyspace of its own.
 
 use super::suite::SUITE_CAPACITY;
 use crate::cassandra::CassandraStore;
-use crate::router::directory::cassandra::CassandraNodeDirectory;
+use crate::router::directory::cassandra::CassandraPeerDirectory;
 use crate::router::directory::{
-    Endpoint, NetworkId, NodeDirectory, NodeRegistration, RegistrationTtl,
+    Endpoint, NetworkId, PeerDirectory, PeerRegistration, RegistrationTtl,
 };
-use crate::router::{Host, MAX_LABEL_BYTES, NodeId};
+use crate::router::{Host, MAX_LABEL_BYTES, PeerId};
 use crate::test_util::test_cassandra_config;
 use color_eyre::Result;
 use parking_lot::Mutex;
@@ -38,7 +38,7 @@ static STORE: OnceCell<CassandraStore> = OnceCell::const_new();
 /// A bounded in-process directory for tests that do not need Cassandra.
 #[derive(Clone)]
 pub(crate) struct TestDirectory {
-    registrations: Arc<Mutex<Vec<NodeRegistration>>>,
+    registrations: Arc<Mutex<Vec<PeerRegistration>>>,
     capacity: usize,
     ttl: RegistrationTtl,
 }
@@ -57,18 +57,18 @@ impl TestDirectory {
     }
 }
 
-impl NodeDirectory for TestDirectory {
+impl PeerDirectory for TestDirectory {
     type Error = Infallible;
 
     fn ttl(&self) -> RegistrationTtl {
         self.ttl
     }
 
-    async fn register(&self, registration: &NodeRegistration) -> Result<(), Self::Error> {
+    async fn register(&self, registration: &PeerRegistration) -> Result<(), Self::Error> {
         let mut registrations = self.registrations.lock();
         if let Some(stored) = registrations
             .iter_mut()
-            .find(|stored| stored.node == registration.node)
+            .find(|stored| stored.peer == registration.peer)
         {
             stored.clone_from(registration);
         } else {
@@ -80,31 +80,31 @@ impl NodeDirectory for TestDirectory {
         Ok(())
     }
 
-    async fn read(&self, node: NodeId) -> Result<Option<NodeRegistration>, Self::Error> {
+    async fn read(&self, peer: PeerId) -> Result<Option<PeerRegistration>, Self::Error> {
         Ok(self
             .registrations
             .lock()
             .iter()
-            .find(|registration| registration.node == node)
+            .find(|registration| registration.peer == peer)
             .cloned())
     }
 
-    async fn deregister(&self, registration: &NodeRegistration) -> Result<(), Self::Error> {
+    async fn deregister(&self, registration: &PeerRegistration) -> Result<(), Self::Error> {
         self.registrations
             .lock()
-            .retain(|stored| stored.node != registration.node);
+            .retain(|stored| stored.peer != registration.peer);
         Ok(())
     }
 }
 
 /// A registration whose every field is generated.
 #[derive(Clone, Debug)]
-pub(crate) struct ArbRegistration(pub(crate) NodeRegistration);
+pub(crate) struct ArbRegistration(pub(crate) PeerRegistration);
 
 impl Arbitrary for ArbRegistration {
     fn arbitrary(g: &mut Gen) -> Self {
-        Self(NodeRegistration {
-            node: node_id(g),
+        Self(PeerRegistration {
+            peer: peer_id(g),
             direct: endpoint(g),
             advertised: bool::arbitrary(g).then(|| endpoint(g)),
             network: bool::arbitrary(g).then(|| NetworkId::make(&label(g))),
@@ -122,9 +122,9 @@ pub(crate) async fn store() -> Result<&'static CassandraStore> {
 }
 
 /// A directory over the shared store, publishing `lease`.
-pub(crate) async fn cassandra_directory(lease: Duration) -> Result<CassandraNodeDirectory> {
+pub(crate) async fn cassandra_directory(lease: Duration) -> Result<CassandraPeerDirectory> {
     let ttl = RegistrationTtl::try_from(lease)?;
-    Ok(CassandraNodeDirectory::new(store().await?.clone(), ttl).await?)
+    Ok(CassandraPeerDirectory::new(store().await?.clone(), ttl).await?)
 }
 
 /// An in-process directory holding [`SUITE_CAPACITY`] registrations under
@@ -150,10 +150,10 @@ pub(crate) fn token() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
-/// A fixed registration for `node`, with every optional field present.
-pub(crate) fn registration(node: NodeId) -> NodeRegistration {
-    NodeRegistration {
-        node,
+/// A fixed registration for `peer`, with every optional field present.
+pub(crate) fn registration(peer: PeerId) -> PeerRegistration {
+    PeerRegistration {
+        peer,
         direct: Endpoint::from_static("http://10.1.2.3:7777"),
         advertised: Some(Endpoint::from_static("http://gateway.example:443")),
         network: Some(NetworkId::make("east")),
@@ -170,14 +170,14 @@ pub(crate) fn finish(result: Result<()>) -> TestResult {
     }
 }
 
-/// A node id from sixteen generated bytes, so the generator covers ids no UUID
+/// A peer id from sixteen generated bytes, so the generator covers ids no UUID
 /// version would mint.
-pub(crate) fn node_id(g: &mut Gen) -> NodeId {
+pub(crate) fn peer_id(g: &mut Gen) -> PeerId {
     let mut bytes = [0_u8; 16];
     for byte in &mut bytes {
         *byte = u8::arbitrary(g);
     }
-    NodeId::from_bytes(bytes)
+    PeerId::from_bytes(bytes)
 }
 
 /// A generated endpoint. Ports span the whole range, both ends included.

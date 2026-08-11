@@ -6,19 +6,19 @@
 
 use super::{FormatToken, RequestId};
 use crate::error::ErrorCategory;
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::subsystem::SubsystemName;
 use bytes::Bytes;
 
 pub(crate) mod decode;
 pub(crate) mod encode;
 
-const FIELD_TARGET_NODE: u32 = 1;
+const FIELD_TARGET_PEER: u32 = 1;
 const FIELD_REQUEST_ID: u32 = 2;
 const FIELD_SUBSYSTEM: u32 = 3;
 const FIELD_SUCCESS: u32 = 4;
 const FIELD_HANDLER_ERROR: u32 = 5;
-const FIELD_RELAY_NODE: u32 = 6;
+const FIELD_RELAY_PEER: u32 = 6;
 const FIELD_SUCCESS_FORMAT: u32 = 1;
 const FIELD_SUCCESS_PAYLOAD: u32 = 2;
 const FIELD_ERROR_CATEGORY: u32 = 1;
@@ -30,15 +30,15 @@ const ID_BYTES: usize = 16;
 /// The routing fields a responder supplies for one frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameHeader {
-    /// The node waiting for this response.
-    pub(crate) target: NodeId,
+    /// The peer waiting for this response.
+    pub(crate) target: PeerId,
     /// The request this response answers.
     pub(crate) request: RequestId,
     /// The subsystem the response is for.
     pub(crate) subsystem: SubsystemName,
     /// Set only by a relay, which always writes its own id and never preserves
     /// one it received. A responder always leaves this `None`.
-    pub(crate) relay: Option<NodeId>,
+    pub(crate) relay: Option<PeerId>,
 }
 
 /// A successful result encoded by the user's response codec.

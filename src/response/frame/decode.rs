@@ -1,14 +1,14 @@
 //! Reading one response frame.
 
 use super::{
-    FIELD_ERROR_CATEGORY, FIELD_ERROR_MESSAGE, FIELD_HANDLER_ERROR, FIELD_RELAY_NODE,
+    FIELD_ERROR_CATEGORY, FIELD_ERROR_MESSAGE, FIELD_HANDLER_ERROR, FIELD_RELAY_PEER,
     FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_SUCCESS, FIELD_SUCCESS_FORMAT, FIELD_SUCCESS_PAYLOAD,
-    FIELD_TARGET_NODE, FrameHeader, FrameResult, HandlerError, ID_BYTES, ResponseFrame,
+    FIELD_TARGET_PEER, FrameHeader, FrameResult, HandlerError, ID_BYTES, ResponseFrame,
     ResponseSuccess,
 };
 use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::response::{FormatToken, RequestId};
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use bytes::{Buf, Bytes};
 use fixedstr::Flexstr;
@@ -21,12 +21,12 @@ use thiserror::Error;
 
 const fn known_field(tag: u32) -> Option<(&'static str, u8)> {
     Some(match tag {
-        FIELD_TARGET_NODE => ("target_node", 0b0000_0001),
+        FIELD_TARGET_PEER => ("target_peer", 0b0000_0001),
         FIELD_REQUEST_ID => ("request_id", 0b0000_0010),
         FIELD_SUBSYSTEM => ("subsystem", 0b0000_0100),
         FIELD_SUCCESS => ("success", 0b0000_1000),
         FIELD_HANDLER_ERROR => ("handler_error", 0b0000_1000),
-        FIELD_RELAY_NODE => ("relay_node", 0b0001_0000),
+        FIELD_RELAY_PEER => ("relay_peer", 0b0001_0000),
         _ => return None,
     })
 }
@@ -49,9 +49,9 @@ pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDe
             seen |= bit;
         }
         match tag {
-            FIELD_TARGET_NODE => {
+            FIELD_TARGET_PEER => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
-                target = decode_id(src, "target_node")?.map(NodeId::from_bytes);
+                target = decode_id(src, "target_peer")?.map(PeerId::from_bytes);
             }
             FIELD_REQUEST_ID => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
@@ -71,9 +71,9 @@ pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDe
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
                 result = Some(decode_error(&mut decode_bytes(src, "handler_error")?)?);
             }
-            FIELD_RELAY_NODE => {
+            FIELD_RELAY_PEER => {
                 check_wire_type(WireType::LengthDelimited, wire_type)?;
-                relay = decode_id(src, "relay_node")?.map(NodeId::from_bytes);
+                relay = decode_id(src, "relay_peer")?.map(PeerId::from_bytes);
             }
             _ => skip_field(wire_type, tag, src, DecodeContext::default())?,
         }
@@ -81,7 +81,7 @@ pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDe
 
     Ok(ResponseFrame {
         header: FrameHeader {
-            target: target.ok_or(FrameDecodeError::MissingField("target_node"))?,
+            target: target.ok_or(FrameDecodeError::MissingField("target_peer"))?,
             request: request.ok_or(FrameDecodeError::MissingField("request_id"))?,
             subsystem: subsystem.ok_or(FrameDecodeError::MissingField("subsystem"))?,
             relay,

@@ -1,4 +1,4 @@
-//! Tests for the node directory and the shared address cache.
+//! Tests for the peer directory and the shared address cache.
 
 pub(crate) mod suite;
 pub(crate) mod support;

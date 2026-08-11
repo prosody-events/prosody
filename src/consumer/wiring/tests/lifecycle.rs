@@ -37,7 +37,7 @@ async fn a_consumer_without_responses_starts_and_stops() -> Result<()> {
 }
 
 /// The router outlives the handlers. Consumer shutdown joins the poll loop and
-/// sweeps the partition manager before router shutdown deregisters the node.
+/// sweeps the partition manager before router shutdown deregisters the peer.
 ///
 /// The sweep is what bounds the peer teardown, so its position between the two
 /// is asserted rather than its occurrence.
@@ -79,7 +79,7 @@ async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
     let swept = position(&Event::ManagerSwept)
         .ok_or_else(|| eyre!("shutdown did not sweep the retained partition manager"))?;
     let deregistered = position(&Event::Deregistered)
-        .ok_or_else(|| eyre!("peer teardown did not deregister the node"))?;
+        .ok_or_else(|| eyre!("peer teardown did not deregister the peer"))?;
     ensure!(provider < swept, "the sweep preceded the poll loop");
     ensure!(swept < deregistered, "peer teardown preceded the sweep");
     ensure!(

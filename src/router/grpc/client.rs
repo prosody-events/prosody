@@ -32,10 +32,10 @@ pub(super) const GRPC_TIMEOUT_LIMIT: Duration = Duration::from_hours(100_000_000
 pub(super) static DELIVER_RESPONSE: LazyLock<PathAndQuery> =
     LazyLock::new(|| PathAndQuery::from_static("/prosody.peer.v1.PeerService/DeliverResponse"));
 
-/// One channel per live destination, keyed by the address a node published.
+/// One channel per live destination, keyed by the address a peer published.
 type Channels = Cache<Uri, Channel, UnitWeighter, RandomState>;
 
-/// The production [`ResponseSender`]: it dials the address a node published and
+/// The production [`ResponseSender`]: it dials the address a peer published and
 /// delivers one frame per call.
 ///
 /// # What bounds the memory
@@ -44,9 +44,9 @@ type Channels = Cache<Uri, Channel, UnitWeighter, RandomState>;
 /// destinations. `quick_cache` evicts to stay inside that count, and eviction
 /// is the removal path: nothing else holds a channel, so an evicted one closes
 /// its connections when its last clone drops. The key is the published address
-/// rather than the node, so a node reached on both of its endpoints — while a
+/// rather than the peer, so a peer reached on both of its endpoints — while a
 /// response probes one and falls back to the other — occupies two entries, as
-/// does a node that restarts on another port. Neither grows the cache: the
+/// does a peer that restarts on another port. Neither grows the cache: the
 /// count is the bound, and the entry that stops being dialled goes cold and is
 /// evicted first.
 pub(crate) struct GrpcSender {

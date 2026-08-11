@@ -2,13 +2,13 @@
 //! how it is served and stopped, and the router a served process reaches its
 //! neighbours through.
 
-use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
+use crate::router::directory::{Endpoint, NetworkId, PeerRegistration};
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::fleet::{Destination, DestinationFleet};
 use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
-use crate::router::{NetworkRouter, NodeId, RelayHop, Route, choose_route};
+use crate::router::{NetworkRouter, PeerId, RelayHop, Route, choose_route};
 use color_eyre::Result;
 use std::convert::Infallible;
 use std::future::Future;
@@ -28,9 +28,9 @@ pub(crate) struct Served {
     task: JoinHandle<()>,
 }
 
-/// A router that resolves every node to one registration, or to none at all.
+/// A router that resolves every peer to one registration, or to none at all.
 ///
-/// One registration for every node is not a contrivance: it is what a stale
+/// One registration for every peer is not a contrivance: it is what a stale
 /// directory entry looks like, which is the case forwarding exists for. It is
 /// also the shape a suite needs to drive a real sender all the way to a
 /// listener. `here` is the label the process holding this router was configured
@@ -40,7 +40,7 @@ pub(crate) struct Served {
 pub(crate) struct FixedRouter {
     fleet: Arc<DestinationFleet>,
     transport: Arc<GrpcSender>,
-    registration: Option<Arc<NodeRegistration>>,
+    registration: Option<Arc<PeerRegistration>>,
     here: Option<NetworkId>,
 }
 
@@ -68,11 +68,11 @@ impl Served {
 }
 
 impl FixedRouter {
-    /// A router over its own fleet and transport, resolving every node to
+    /// A router over its own fleet and transport, resolving every peer to
     /// `registration` from a process labelled `here`.
     pub(crate) fn new(
         config: FleetConfiguration,
-        registration: Option<NodeRegistration>,
+        registration: Option<PeerRegistration>,
         here: Option<NetworkId>,
     ) -> Result<Self> {
         let fleet = Arc::new(DestinationFleet::new(config)?);
@@ -86,13 +86,13 @@ impl FixedRouter {
 }
 
 impl NetworkRouter for FixedRouter {
-    fn destination(&self, node: NodeId) -> Arc<Destination> {
-        self.fleet.destination(node)
+    fn destination(&self, peer: PeerId) -> Arc<Destination> {
+        self.fleet.destination(peer)
     }
 
     fn route(
         &self,
-        _node: NodeId,
+        _peer: PeerId,
     ) -> impl Future<Output = Result<Option<Route>, Infallible>> + Send {
         let route = self
             .registration
@@ -108,7 +108,7 @@ impl RelayHop for FixedRouter {
 
     fn direct(
         &self,
-        _node: NodeId,
+        _peer: PeerId,
     ) -> impl Future<Output = Result<Option<Endpoint>, Infallible>> + Send {
         let direct = self
             .registration

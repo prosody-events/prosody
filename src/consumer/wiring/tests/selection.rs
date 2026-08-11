@@ -26,8 +26,8 @@ fn a_mock_peer_uses_no_listener() -> Result<()> {
         let first = prepare_router(&peer, deps.backend().as_ref()).await?;
         let second = prepare_router(&peer, deps.backend().as_ref()).await?;
         assert_ne!(
-            first.node(),
-            second.node(),
+            first.peer(),
+            second.peer(),
             "each local peer must own a distinct identity"
         );
         first.shutdown().await?;

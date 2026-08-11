@@ -1,6 +1,6 @@
 //! What the send path tells an operator, and what it never tells them.
 //!
-//! The claim these cases pin is a security one: an unresolvable node id arrives
+//! The claim these cases pin is a security one: an unresolvable peer id arrives
 //! in a Kafka header a topic writer controls, so putting it in a label would
 //! let that writer choose the metrics pipeline's cardinality. The attribute set
 //! is therefore compared **exactly**, not searched for the label it should
@@ -14,7 +14,7 @@ use super::super::metrics::{DropReason, Stage, record_fallback};
 use super::{Harness, PAYLOAD, attempts, deadline};
 use crate::codec::Codec;
 use crate::response::sender::{deliver_response, stage};
-use crate::router::loopback::{Script, UNPUBLISHED_NODE, config, node, paused};
+use crate::router::loopback::{Script, UNPUBLISHED_PEER, config, paused, peer};
 use crate::router::{Preference, SendFailure};
 use crate::test_util::{GlobalMetrics, assert_distinct_labels, label};
 use color_eyre::Result;
@@ -25,13 +25,13 @@ use std::convert::Infallible;
 use std::io::Error;
 use strum::VariantArray;
 
-/// A node every suite router publishes.
+/// A peer every suite router publishes.
 const PUBLISHED: u8 = 0;
 
-/// The node whose direct endpoint does not answer, so its responses fall back.
+/// The peer whose direct endpoint does not answer, so its responses fall back.
 const FALLS_BACK: u8 = PUBLISHED;
 
-/// The node neither of whose endpoints answers.
+/// The peer neither of whose endpoints answers.
 const SILENT: u8 = 1;
 
 #[derive(Default)]
@@ -74,19 +74,19 @@ fn a_codec_failure_records_the_encode_drop() -> Result<()> {
     Ok(())
 }
 
-/// One response to a node no registration names is dropped under a fixed
-/// reason, and the node's id appears nowhere in the metrics it moved.
+/// One response to a peer no registration names is dropped under a fixed
+/// reason, and the peer's id appears nowhere in the metrics it moved.
 ///
 /// The published response beside it is what makes the stage counters a
 /// progression rather than one number: it reaches `delivered`, and the
 /// unresolvable one stops after `attempted`.
 #[test]
-fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
+fn a_drop_names_its_reason_and_never_the_peer() -> Result<()> {
     let metrics = GlobalMetrics::install();
     let drained = paused()?.block_on(async {
         let harness = Harness::new(config())?;
         harness.send(PUBLISHED).await?;
-        harness.send(UNPUBLISHED_NODE).await?;
+        harness.send(UNPUBLISHED_PEER).await?;
         harness.drain().await
     })?;
     ensure!(
@@ -96,12 +96,12 @@ fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
         drained.dropped
     );
     ensure!(
-        attempts(&drained.deliveries, UNPUBLISHED_NODE)? == 0,
-        "an unpublished node must reach no address"
+        attempts(&drained.deliveries, UNPUBLISHED_PEER)? == 0,
+        "an unpublished peer must reach no address"
     );
     ensure!(
         metrics.points("prosody.response.dropped")?
-            == vec![(label("reason", "unresolvable_node"), 1)],
+            == vec![(label("reason", "unresolvable_peer"), 1)],
         "the drop must be counted under its reason alone: {:?}",
         metrics.points("prosody.response.dropped")?
     );
@@ -116,13 +116,13 @@ fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
         metrics.points("prosody.response.stages")?
     );
 
-    let unresolvable = node(UNPUBLISHED_NODE).to_string();
+    let unresolvable = peer(UNPUBLISHED_PEER).to_string();
     for name in ["prosody.response.dropped", "prosody.response.stages"] {
         for (attributes, _) in metrics.points(name)? {
             for (key, value) in attributes {
                 ensure!(
                     !key.contains(&unresolvable) && !value.contains(&unresolvable),
-                    "{name} carries the node id in {key}={value}"
+                    "{name} carries the peer id in {key}={value}"
                 );
             }
         }
@@ -134,10 +134,10 @@ fn a_drop_names_its_reason_and_never_the_node() -> Result<()> {
 /// answered.
 ///
 /// Three responses drive the whole claim on one meter. The first falls back,
-/// and it is the one transition. The second reaches the same node, which now
+/// and it is the one transition. The second reaches the same peer, which now
 /// remembers the endpoint that answered. It starts there and counts nothing, so
 /// a counter that moved once per delivery would read two. The third reaches a
-/// node where nothing answers. Its walk leaves both candidates behind and still
+/// peer where nothing answers. Its walk leaves both candidates behind and still
 /// counts nothing, so a counter that moved once per candidate would read two as
 /// well.
 ///

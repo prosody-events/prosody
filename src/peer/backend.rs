@@ -8,7 +8,7 @@ use crate::peer::PeerConfiguration;
 use crate::peer::runtime::prepare_network;
 #[cfg(test)]
 use crate::peer::runtime::{PreparedRuntime, prepare_local};
-use crate::router::directory::cassandra::CassandraNodeDirectory;
+use crate::router::directory::cassandra::CassandraPeerDirectory;
 #[cfg(test)]
 use crate::router::runtime::PreparedLocalPeerRuntime;
 use crate::router::runtime::PreparedPeerRuntime;
@@ -18,9 +18,9 @@ use crate::state_reader::{CassandraReaderBackend, MemoryReaderBackend};
 pub(crate) async fn prepare_cassandra(
     config: &PeerConfiguration,
     store: CassandraStore,
-) -> Result<PreparedPeerRuntime<CassandraNodeDirectory>, ConsumerError> {
+) -> Result<PreparedPeerRuntime<CassandraPeerDirectory>, ConsumerError> {
     let parts = config.parts().map_err(PeerInitError::from)?;
-    let directory = CassandraNodeDirectory::new(store, parts.lease)
+    let directory = CassandraPeerDirectory::new(store, parts.lease)
         .await
         .map_err(|error| PeerInitError::Directory {
             message: format!("{error:#}"),
@@ -41,7 +41,7 @@ pub(crate) trait PeerBackend: Send + Sync + Sized + 'static {
 
 #[cfg(test)]
 impl<C: Codec> PeerBackend for CassandraReaderBackend<C> {
-    type Runtime = PreparedPeerRuntime<CassandraNodeDirectory>;
+    type Runtime = PreparedPeerRuntime<CassandraPeerDirectory>;
 
     async fn prepare(&self, config: &PeerConfiguration) -> Result<Self::Runtime, ConsumerError> {
         prepare_cassandra(config, self.cells_ref().session.clone()).await

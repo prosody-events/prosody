@@ -9,12 +9,12 @@ use crate::response::frame::encode::{Staged, stage_success};
 use crate::response::frame::tests::CountingCodec;
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{deliver_response, stage as stage_response};
-use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
+use crate::router::directory::{Endpoint, NetworkId, PeerRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::loopback::listener::FixedRouter;
-use crate::router::{Host, NetworkRouter, NodeId, Preference, ResponseSender, SendFailure};
+use crate::router::{Host, NetworkRouter, PeerId, Preference, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
 use crate::test_util::{GlobalMetrics, GlobalSpans, TEST_RUNTIME, label, named};
 use color_eyre::Result;
@@ -69,7 +69,7 @@ fn a_large_response_crosses_a_relay() -> Result<()> {
         let outcome = async {
             let answered = call_with_payload(
                 &pair.relay,
-                pair.target.node,
+                pair.target.peer,
                 request.id(),
                 BUDGET,
                 &LARGE_RESPONSE,
@@ -90,7 +90,7 @@ fn a_large_response_crosses_a_relay() -> Result<()> {
 /// Two processes whose directory entries name each other pass a frame neither
 /// owns exactly once.
 ///
-/// The frame names a third node, so neither process can accept it. The first
+/// The frame names a third peer, so neither process can accept it. The first
 /// sends it on and writes its own id into it; the second sees an id already
 /// there and refuses. Without that refusal the two would pass the frame back
 /// and forth until a budget ended it, so the answered status is the assertion:
@@ -100,7 +100,7 @@ fn a_frame_this_process_already_relayed_is_never_relayed_again() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let pair = Pair::start(TargetRoute::Relay).await?;
         let outcome = async {
-            let answered = call(&pair.relay, NodeId::new(), RequestId::new(), BUDGET).await?;
+            let answered = call(&pair.relay, PeerId::new(), RequestId::new(), BUDGET).await?;
             ensure(
                 answered == Code::FailedPrecondition,
                 format!(
@@ -119,7 +119,7 @@ fn a_frame_this_process_already_relayed_is_never_relayed_again() -> Result<()> {
 /// The budget a process states on the hop it makes is what is left of the
 /// budget it is spending itself, never a budget it was handed.
 ///
-/// The frame names a third node, so the second process refuses it — but it
+/// The frame names a third peer, so the second process refuses it — but it
 /// refuses it after reading the budget it was given, which is the number this
 /// case is about. Three budgets are deliberately distinct, so each way of
 /// getting the number wrong records a different one. The caller states 30 s.
@@ -134,7 +134,7 @@ fn a_forward_carries_what_is_left_of_the_caller_budget() -> Result<()> {
         let pair = Pair::start(TargetRoute::Nowhere).await?;
         let outcome = async {
             let answered =
-                call(&pair.relay, NodeId::new(), RequestId::new(), CALLER_BUDGET).await?;
+                call(&pair.relay, PeerId::new(), RequestId::new(), CALLER_BUDGET).await?;
             ensure(
                 answered == Code::FailedPrecondition,
                 format!(
@@ -183,7 +183,7 @@ fn a_relayed_response_reads_as_one_trace() -> Result<()> {
         let pair = Pair::start(TargetRoute::Nowhere).await?;
         let outcome = async {
             let request = awaited(&pair.target.registry)?;
-            let answered = call(&pair.relay, pair.target.node, request.id(), BUDGET).await?;
+            let answered = call(&pair.relay, pair.target.peer, request.id(), BUDGET).await?;
             ensure(
                 answered == Code::Ok,
                 format!("the target must accept the relayed response, not answer {answered:?}"),
@@ -254,8 +254,8 @@ fn a_response_crosses_two_networks_through_a_relay() -> Result<()> {
 async fn crossing(pair: &Pair) -> Result<()> {
     let mut request = awaited(&pair.target.registry)?;
     let receiver = request.receiver()?;
-    let elsewhere = NodeRegistration {
-        node: pair.target.node,
+    let elsewhere = PeerRegistration {
+        peer: pair.target.peer,
         direct: pair.target.address.clone(),
         advertised: Some(pair.relay.address.clone()),
         network: Some(NetworkId::make(THERE)),
@@ -267,9 +267,9 @@ async fn crossing(pair: &Pair) -> Result<()> {
         Some(NetworkId::make(HERE)),
     )?;
     let route = router
-        .route(pair.target.node)
+        .route(pair.target.peer)
         .await?
-        .ok_or_else(|| eyre!("a node in another network must be reachable through its entry"))?;
+        .ok_or_else(|| eyre!("a peer in another network must be reachable through its entry"))?;
     let [first, second] = route.candidates(None);
     ensure(
         first.is_some_and(|(preference, endpoint)| {
@@ -281,7 +281,7 @@ async fn crossing(pair: &Pair) -> Result<()> {
     let payload = PAYLOAD.to_vec();
     let prepared = stage_response::<CountingCodec, Infallible>(
         FrameHeader {
-            target: pair.target.node,
+            target: pair.target.peer,
             request: request.id(),
             subsystem: SubsystemName::try_new(ALPHA)?,
             relay: None,
@@ -302,13 +302,13 @@ async fn crossing(pair: &Pair) -> Result<()> {
 }
 
 /// Delivers one frame for `target` into `live`, under a budget of `granted`.
-async fn call(live: &Live, target: NodeId, request: RequestId, granted: Duration) -> Result<Code> {
+async fn call(live: &Live, target: PeerId, request: RequestId, granted: Duration) -> Result<Code> {
     call_with_payload(live, target, request, granted, PAYLOAD).await
 }
 
 async fn call_with_payload(
     live: &Live,
-    target: NodeId,
+    target: PeerId,
     request: RequestId,
     granted: Duration,
     payload: &[u8],

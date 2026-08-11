@@ -1,7 +1,7 @@
-//! The read-through address cache in front of the node directory.
+//! The read-through address cache in front of the peer directory.
 
-use crate::router::NodeId;
-use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
+use crate::router::PeerId;
+use crate::router::directory::{PeerDirectory, PeerRegistration, RegistrationTtl};
 use quanta::{Clock, Instant};
 use quick_cache::UnitWeighter;
 use quick_cache::sync::{Cache, DefaultLifecycle};
@@ -11,18 +11,18 @@ use std::time::Duration;
 
 /// One entry: when the read that produced it was issued, and what it found.
 ///
-/// A known-absent node is cached too, so a burst of traffic for an id that the
+/// A known-absent peer is cached too, so a burst of traffic for an id that the
 /// directory does not hold issues one read rather than one per message. The
 /// registration sits behind an [`Arc`], so serving a hit costs a reference
 /// count and never an allocation.
-type Entry = (Instant, Option<Arc<NodeRegistration>>);
+type Entry = (Instant, Option<Arc<PeerRegistration>>);
 
 /// The concrete `quick_cache` instance. Items are weighed by count: capacity
 /// bounds how many registrations are held, and each one holds only what the
 /// directory entry held — a host, a machine name, and two optional labels.
-type Inner = Cache<NodeId, Entry, UnitWeighter, ahash::RandomState>;
+type Inner = Cache<PeerId, Entry, UnitWeighter, ahash::RandomState>;
 
-/// Node id to registration, read through to the directory.
+/// Peer id to registration, read through to the directory.
 ///
 /// Two bounds make it safe to key by something an outsider chooses.
 ///
@@ -44,7 +44,7 @@ type Inner = Cache<NodeId, Entry, UnitWeighter, ahash::RandomState>;
 ///
 /// Its single-flight behaviour is what matters on the response path: every
 /// caller after the first parks on the placeholder until the fill finishes, so
-/// a burst for one cold node issues one directory read. **Retention and single
+/// a burst for one cold peer issues one directory read. **Retention and single
 /// flight are both best-effort.** `quick_cache` may evict an entry it has just
 /// admitted into a full cache, so a repeat request can miss. A fill that fails
 /// inserts nothing and the next waiter reads again, so a burst against a
@@ -56,7 +56,7 @@ pub(crate) struct AddressCache {
     ttl: Duration,
 }
 
-/// A node id resolved to what that node published, read through the bounded
+/// A peer id resolved to what that peer published, read through the bounded
 /// cache.
 ///
 /// One type, so every caller that needs an address holds one thing rather than
@@ -118,15 +118,15 @@ impl AddressCache {
     /// Propagates the error `fill` returns.
     pub(crate) async fn resolve<F, Fut, E>(
         &self,
-        node: NodeId,
+        peer: PeerId,
         fill: F,
-    ) -> Result<Option<Arc<NodeRegistration>>, E>
+    ) -> Result<Option<Arc<PeerRegistration>>, E>
     where
         F: Fn() -> Fut,
-        Fut: Future<Output = Result<Option<NodeRegistration>, E>>,
+        Fut: Future<Output = Result<Option<PeerRegistration>, E>>,
     {
         loop {
-            match self.inner.get_value_or_guard_async(&node).await {
+            match self.inner.get_value_or_guard_async(&peer).await {
                 Ok((issued, registration)) => {
                     if self.clock.now().duration_since(issued) < self.ttl {
                         return Ok(registration);
@@ -134,7 +134,7 @@ impl AddressCache {
                     // Equal clock readings are interchangeable observations.
                     // Removing either can only cause a refill.
                     self.inner
-                        .remove_if(&node, |(observed, _)| *observed == issued);
+                        .remove_if(&peer, |(observed, _)| *observed == issued);
                 }
                 Err(guard) => {
                     // Single-flight: this caller owns the fill. The issue time
@@ -152,7 +152,7 @@ impl AddressCache {
     }
 }
 
-impl<D: NodeDirectory> AddressResolver<D> {
+impl<D: PeerDirectory> AddressResolver<D> {
     /// Reads `directory` through a cache of up to `capacity` registrations.
     ///
     /// The cache is built here, from the lease `directory` publishes, rather
@@ -168,7 +168,7 @@ impl<D: NodeDirectory> AddressResolver<D> {
         }
     }
 
-    /// What `node` published, or `None` when the directory holds no entry for
+    /// What `peer` published, or `None` when the directory holds no entry for
     /// it.
     ///
     /// # Errors
@@ -176,8 +176,8 @@ impl<D: NodeDirectory> AddressResolver<D> {
     /// Returns the directory's error when a cache miss cannot be filled.
     pub(crate) async fn resolve(
         &self,
-        node: NodeId,
-    ) -> Result<Option<Arc<NodeRegistration>>, D::Error> {
-        self.cache.resolve(node, || self.directory.read(node)).await
+        peer: PeerId,
+    ) -> Result<Option<Arc<PeerRegistration>>, D::Error> {
+        self.cache.resolve(peer, || self.directory.read(peer)).await
     }
 }

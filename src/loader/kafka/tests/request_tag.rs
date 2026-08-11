@@ -10,10 +10,10 @@ use super::{
 };
 use crate::response::RequestId;
 use crate::response::headers::{
-    RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER, RESPONSE_NODE_HEADER,
+    RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER, RESPONSE_PEER_HEADER,
     RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline, RequestTag,
 };
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::subsystem::SubsystemName;
 use crate::tracing::init_test_logging;
 use rdkafka::message::{Header, OwnedHeaders};
@@ -33,8 +33,8 @@ async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
 
     with_topic("request_tag", async |topic_name| {
         let id = RequestId::new();
-        let node = NodeId::from_bytes([7; 16]);
-        let (id_text, node_text) = (id.to_string(), node.to_string());
+        let peer = PeerId::from_bytes([7; 16]);
+        let (id_text, peer_text) = (id.to_string(), peer.to_string());
         let producer = producer()?;
 
         let tagged_offset = produce(
@@ -51,8 +51,8 @@ async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
                     value: Some(id_text.as_str()),
                 })
                 .insert(Header {
-                    key: RESPONSE_NODE_HEADER,
-                    value: Some(node_text.as_str()),
+                    key: RESPONSE_PEER_HEADER,
+                    value: Some(peer_text.as_str()),
                 })
                 .insert(Header {
                     key: RESPONSE_DEADLINE_HEADER,
@@ -96,7 +96,7 @@ async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
             load(&loader, topic, tagged_offset).await?,
             Some(RequestTag::new(
                 id,
-                node,
+                peer,
                 RequestDeadline::from_unix_micros(1_700_000_000_000_000),
             )),
             "the reloaded record lost the destination its headers named"

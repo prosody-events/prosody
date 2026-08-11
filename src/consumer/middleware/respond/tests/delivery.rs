@@ -8,7 +8,7 @@ use crate::consumer::middleware::tests::test_support::{
     MockEventContext, ScriptedHandler, ScriptedHook,
 };
 use crate::consumer::{DemandType, EventHandler};
-use crate::router::loopback::{Script, UNPUBLISHED_NODE, paused};
+use crate::router::loopback::{Script, UNPUBLISHED_PEER, paused};
 use color_eyre::Result;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -75,24 +75,24 @@ fn the_hook_applies_network_backpressure() -> Result<()> {
     })
 }
 
-/// A node the directory does not hold is never dialed.
+/// A peer the directory does not hold is never dialed.
 ///
 /// A request tag holds two identifiers and no host and no port, and the header
-/// it builds carries only the target node. The route resolves that
-/// node through the router, so no edit can make an address originate from a
+/// it builds carries only the target peer. The route resolves that
+/// peer through the router, so no edit can make an address originate from a
 /// Kafka header without inventing a field. What stays testable is the
-/// unresolvable node itself.
+/// unresolvable peer itself.
 ///
 /// The handler's own hook fires even when the response route rejects the value.
 #[test]
-fn an_unpublished_node_is_never_dialed() -> Result<()> {
+fn an_unpublished_peer_is_never_dialed() -> Result<()> {
     paused()?.block_on(async {
         let fixture = Fixture::<ResultProbeCodec>::new()?;
         let leaf = ScriptedHandler::success();
         let handler = fixture.stack(leaf.clone(), 0)?;
         let tracker = offset_tracker();
         let message =
-            tagged(UNPUBLISHED_NODE, 41, "unpublished")?.into_uncommitted(tracker.take(0).await?);
+            tagged(UNPUBLISHED_PEER, 41, "unpublished")?.into_uncommitted(tracker.take(0).await?);
 
         EventHandler::on_message(
             &handler,
@@ -105,7 +105,7 @@ fn an_unpublished_node_is_never_dialed() -> Result<()> {
 
         let hooks = leaf.hook_events();
         let drained = fixture.drain().await?;
-        assert!(drained.is_empty(), "an unresolvable node is never dialed");
+        assert!(drained.is_empty(), "an unresolvable peer is never dialed");
         assert!(
             hooks
                 .iter()

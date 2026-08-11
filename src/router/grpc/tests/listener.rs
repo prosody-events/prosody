@@ -3,7 +3,7 @@
 use super::{EmptyFrame, Harness};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::router::directory::tests::support::cassandra_directory;
-use crate::router::directory::{NodeDirectory, RegistrationTtl};
+use crate::router::directory::{PeerDirectory, RegistrationTtl};
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::BoundListener;
 use crate::router::grpc::codec::ClientFrameCodec;
@@ -38,7 +38,7 @@ fn a_registration_publishes_the_bound_address() -> Result<()> {
         .await?;
         let outcome = async {
             let published = directory
-                .read(runtime.node())
+                .read(runtime.peer())
                 .await?
                 .ok_or_else(|| eyre!("a started runtime must resolve"))?;
             ensure!(

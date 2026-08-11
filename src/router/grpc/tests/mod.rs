@@ -30,7 +30,7 @@ use crate::router::fleet::DestinationFleet;
 use crate::router::loopback::listener::{FixedRouter, Served, bind_address, endpoint};
 use crate::router::loopback::{TestRouter, config as fleet_config, registration};
 use crate::router::relay::Relay;
-use crate::router::{Framed, LocalTarget, NodeId, ResponseSender, SendFailure};
+use crate::router::{Framed, LocalTarget, PeerId, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
 use bytes::BufMut;
 use color_eyre::Result;
@@ -56,13 +56,13 @@ static SHARED: OnceCell<Harness> = OnceCell::const_new();
 
 /// A live listener, the registry it serves, and the senders that reach it.
 ///
-/// The listener sends a frame for another node on, exactly as a live process
+/// The listener sends a frame for another peer on, exactly as a live process
 /// does. Its relay resolves nothing for any id these suites use, because every
-/// "another node" here is a freshly minted id and the test router publishes a
+/// "another peer" here is a freshly minted id and the test router publishes a
 /// fixed set. So such a frame reaches no target and answers `UNAVAILABLE`.
 pub(super) struct Harness {
-    /// The node the listener answers for.
-    pub(super) node: NodeId,
+    /// The peer the listener answers for.
+    pub(super) peer: PeerId,
     /// The registry the listener hands frames to.
     pub(super) registry: Arc<PendingRegistry>,
     pub(super) sender: GrpcSender,
@@ -85,19 +85,19 @@ impl Harness {
     /// configuration. Call [`stop`](Self::stop) before the test returns.
     pub(super) async fn with(address: SocketAddr) -> Result<Self> {
         let served_registry = registry();
-        let node = NodeId::new();
+        let peer = PeerId::new();
         let bound = BoundListener::bind(address).await?;
         let address = endpoint(&bound)?;
         let (relay_router, _relay_deliveries) = TestRouter::new(fleet_config())?;
         let served = Served::start(
             bound,
             PeerService::new(
-                LocalTarget::new(node, Arc::clone(&served_registry)),
+                LocalTarget::new(peer, Arc::clone(&served_registry)),
                 Relay::new(relay_router),
             ),
         )?;
         Ok(Self {
-            node,
+            peer,
             registry: served_registry,
             sender: GrpcSender::new(&fleet()?),
             address,
@@ -167,7 +167,7 @@ pub(super) fn register(
 }
 
 /// A header for one response to `request`, addressed to `target`.
-pub(super) fn header(target: NodeId, request: RequestId, subsystem: &str) -> Result<FrameHeader> {
+pub(super) fn header(target: PeerId, request: RequestId, subsystem: &str) -> Result<FrameHeader> {
     Ok(FrameHeader {
         target,
         request,

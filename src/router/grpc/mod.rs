@@ -1,5 +1,5 @@
-//! Both ends of the peer wire: the listener a node serves and the client it
-//! dials another node with.
+//! Both ends of the peer wire: the listener a peer serves and the client it
+//! dials another peer with.
 //!
 //! This directory is the only place in the crate that names tonic's transport,
 //! service, codec, metadata, health and reflection surface. One type is shared

@@ -94,7 +94,7 @@ impl Decoder for ServerFrameCodec {
             Ok(frame) => Ok(Some(frame)),
             Err(error) => {
                 // The only record of why: the status carries a literal, so the
-                // detail the `Display` form names stays on this node.
+                // detail the `Display` form names stays on this peer.
                 warn!(%error, "peer frame could not be read");
                 Err(refusal(&error))
             }

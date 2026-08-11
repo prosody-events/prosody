@@ -26,7 +26,7 @@ use crate::related_span;
 use crate::response::RequestId;
 use crate::response::frame::FrameResult;
 use crate::response::frame::decode::decode_frame;
-use crate::router::loopback::{TestRouter, node, paused};
+use crate::router::loopback::{TestRouter, paused, peer};
 use crate::telemetry::Telemetry;
 use crate::test_util::{captured_spans, named, sampled_remote_context};
 use crate::timers::TimerType;
@@ -44,7 +44,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 /// The key both the deferred message and its retry timer carry.
 const KEY: &str = "deferred";
 
-/// The node the deferred record asks for its answer.
+/// The peer the deferred record asks for its answer.
 const TARGET: u8 = 3;
 
 /// The request the deferred record names.
@@ -132,7 +132,7 @@ fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
         );
         let mut delivery = drained.remove(0);
         let frame = decode_frame(&mut delivery.bytes)?;
-        assert_eq!(frame.header.target, node(TARGET));
+        assert_eq!(frame.header.target, peer(TARGET));
         assert_eq!(frame.header.request, RequestId::from_bytes([REQUEST; 16]));
         assert!(matches!(frame.result, FrameResult::Success(_)));
         assert!(

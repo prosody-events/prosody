@@ -2,7 +2,7 @@
 //!
 //! Five plain UTF-8 headers carry the request metadata, so a stuck request is
 //! readable in any broker UI without a decoder: `response-version`,
-//! `response-request-id`, `response-node`, `response-deadline`, and one
+//! `response-request-id`, `response-peer`, `response-deadline`, and one
 //! `response-awaited` per subsystem the record awaits. The four singletons
 //! must occur **exactly** once. A producer may repeat a Kafka header key, so
 //! accepting the first or the last would be an unstated precedence — and
@@ -23,7 +23,7 @@
 
 use crate::response::RequestId;
 use crate::response::frame::FrameHeader;
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::subsystem::SubsystemName;
 use opentelemetry::KeyValue;
 use opentelemetry::global::meter;
@@ -46,7 +46,7 @@ mod tests;
 // to both.
 pub(crate) const RESPONSE_VERSION_HEADER: &str = "response-version";
 pub(crate) const RESPONSE_REQUEST_ID_HEADER: &str = "response-request-id";
-pub(crate) const RESPONSE_NODE_HEADER: &str = "response-node";
+pub(crate) const RESPONSE_PEER_HEADER: &str = "response-peer";
 pub(crate) const RESPONSE_DEADLINE_HEADER: &str = "response-deadline";
 pub(crate) const RESPONSE_AWAITED_HEADER: &str = "response-awaited";
 
@@ -55,7 +55,7 @@ pub(crate) const RESPONSE_AWAITED_HEADER: &str = "response-awaited";
 pub(crate) const RESERVED_REQUEST_HEADERS: [&str; 5] = [
     RESPONSE_VERSION_HEADER,
     RESPONSE_REQUEST_ID_HEADER,
-    RESPONSE_NODE_HEADER,
+    RESPONSE_PEER_HEADER,
     RESPONSE_DEADLINE_HEADER,
     RESPONSE_AWAITED_HEADER,
 ];
@@ -87,13 +87,13 @@ static REJECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// Where one request's response must go.
 ///
 /// Two fixed-size ids and no strings: everything else the headers carry is
-/// consumed while the Kafka record is still borrowed. [`node`](Self::node) is a
+/// consumed while the Kafka record is still borrowed. [`peer`](Self::peer) is a
 /// directory lookup key rather than an address, so a topic writer can name a
-/// live prosody node and nothing else.
+/// live prosody peer and nothing else.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RequestTag {
     id: RequestId,
-    node: NodeId,
+    peer: PeerId,
     deadline: RequestDeadline,
 }
 
@@ -108,18 +108,18 @@ pub struct RequestDeadline {
 }
 
 impl RequestTag {
-    /// Pairs a request with the node awaiting its response.
-    pub(crate) const fn new(id: RequestId, node: NodeId, deadline: RequestDeadline) -> Self {
-        Self { id, node, deadline }
+    /// Pairs a request with the peer awaiting its response.
+    pub(crate) const fn new(id: RequestId, peer: PeerId, deadline: RequestDeadline) -> Self {
+        Self { id, peer, deadline }
     }
 
     /// The frame header a response to this request must carry.
     ///
-    /// The sender resolves the node through the directory. A Kafka header can
+    /// The sender resolves the peer through the directory. A Kafka header can
     /// never supply an address. A responder never sets the relay.
     pub(crate) fn header(self, subsystem: SubsystemName) -> FrameHeader {
         FrameHeader {
-            target: self.node,
+            target: self.peer,
             request: self.id,
             subsystem,
             relay: None,
@@ -214,7 +214,7 @@ where
 {
     let mut version = None;
     let mut id = None;
-    let mut node = None;
+    let mut peer = None;
     let mut deadline = None;
     let mut awaited = 0_usize;
     let mut addressed = false;
@@ -235,8 +235,8 @@ where
             RESPONSE_REQUEST_ID_HEADER => {
                 set_once(&mut id, || parse_id(value).map(RequestId::from_bytes))?;
             }
-            RESPONSE_NODE_HEADER => {
-                set_once(&mut node, || parse_id(value).map(NodeId::from_bytes))?;
+            RESPONSE_PEER_HEADER => {
+                set_once(&mut peer, || parse_id(value).map(PeerId::from_bytes))?;
             }
             RESPONSE_DEADLINE_HEADER => {
                 set_once(&mut deadline, || parse_deadline(value))?;
@@ -247,17 +247,17 @@ where
     }
 
     // No reserved header at all, so this record asks for nothing.
-    if version.is_none() && id.is_none() && node.is_none() && deadline.is_none() && awaited == 0 {
+    if version.is_none() && id.is_none() && peer.is_none() && deadline.is_none() && awaited == 0 {
         return Ok(None);
     }
-    let (Some(id), Some(node), Some(deadline)) = (id, node, deadline) else {
+    let (Some(id), Some(peer), Some(deadline)) = (id, peer, deadline) else {
         return Err(HeaderRejection::MissingSingleton);
     };
     if version.is_none() || awaited == 0 {
         return Err(HeaderRejection::MissingSingleton);
     }
 
-    Ok(addressed.then_some(RequestTag::new(id, node, deadline)))
+    Ok(addressed.then_some(RequestTag::new(id, peer, deadline)))
 }
 
 fn set_once<T>(

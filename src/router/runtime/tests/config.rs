@@ -6,9 +6,9 @@ use super::super::{
 };
 use super::listener;
 use crate::heartbeat::HeartbeatRegistry;
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::router::directory::tests::support::{registration, test_directory};
-use crate::router::directory::{NodeDirectory, RegistrationTtl};
+use crate::router::directory::{PeerDirectory, RegistrationTtl};
 use crate::router::fleet::config::FleetConfiguration;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -82,7 +82,7 @@ fn prop_two_lost_refreshes_still_heal_inside_the_lease(seconds: u64) -> TestResu
 #[tokio::test(start_paused = true)]
 async fn heartbeat_checks_preserve_the_refresh_deadline() -> Result<()> {
     let directory = test_directory(Duration::from_mins(1))?;
-    let registered = registration(NodeId::new());
+    let registered = registration(PeerId::new());
     let (stop, stopped) = watch::channel(false);
     let refresh = tokio::spawn(refresh_registration(
         directory.clone(),
@@ -98,7 +98,7 @@ async fn heartbeat_checks_preserve_the_refresh_deadline() -> Result<()> {
     advance(Duration::from_secs(10)).await;
     yield_now().await;
     assert!(
-        directory.read(registered.node).await?.is_some(),
+        directory.read(registered.peer).await?.is_some(),
         "heartbeat checks postponed the registration refresh"
     );
 

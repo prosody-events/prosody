@@ -15,9 +15,9 @@ use crate::requester::registry::tests::TestRegistration;
 use crate::response::frame::encode::stage_success;
 use crate::response::frame::tests::CountingCodec;
 use crate::response::frame::{FrameResult, ResponseSuccess};
-use crate::router::directory::cassandra::CassandraNodeDirectory;
+use crate::router::directory::cassandra::CassandraPeerDirectory;
 use crate::router::directory::tests::support::cassandra_directory;
-use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
+use crate::router::directory::{Endpoint, NetworkId, PeerDirectory, PeerRegistration};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::client::GrpcSender;
@@ -25,7 +25,7 @@ use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
 use crate::router::loopback::{HANG_GUARD, TestRouter, config as fleet_config};
 use crate::router::relay::Relay;
-use crate::router::{Host, LocalTarget, NetworkRouter, NodeId, Preference, ResponseSender};
+use crate::router::{Host, LocalTarget, NetworkRouter, PeerId, Preference, ResponseSender};
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -47,9 +47,9 @@ const NETWORK: &str = "one-network";
 /// The payload the forwarded frame carries.
 const PAYLOAD: &[u8] = b"sent on by the listener the runtime served";
 
-/// One more listener, answering for one more node.
+/// One more listener, answering for one more peer.
 struct Elsewhere {
-    node: NodeId,
+    peer: PeerId,
     registry: Arc<PendingRegistry>,
     address: Endpoint,
     stop: Option<Sender<()>>,
@@ -77,8 +77,8 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
             fleet: FleetConfiguration::default(),
         })
         .await?;
-        let neighbour = NodeRegistration {
-            node: NodeId::new(),
+        let neighbour = PeerRegistration {
+            peer: PeerId::new(),
             direct: Endpoint::from_static("http://10.0.0.11:12001"),
             advertised: Some(Endpoint::from_static("http://gateway.example:12002")),
             network: Some(NetworkId::make(NETWORK)),
@@ -89,7 +89,7 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
             let route = runtime
                 .network
                 .clone()
-                .route(neighbour.node)
+                .route(neighbour.peer)
                 .await?
                 .ok_or_else(|| eyre!("a published neighbour must resolve"))?;
             let walked: Vec<Preference> = route
@@ -110,13 +110,13 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
     })
 }
 
-/// A frame that names another node leaves the runtime's listener again and
+/// A frame that names another peer leaves the runtime's listener again and
 /// arrives there.
 ///
 /// The runtime gives its listener a relay over its own router. The second
 /// listener's registry holds the payload only when that relay works.
 #[test]
-fn a_frame_for_another_node_leaves_the_runtime_listener_again() -> Result<()> {
+fn a_frame_for_another_peer_leaves_the_runtime_listener_again() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME.block_on(async {
         let directory = cassandra_directory(LEASE).await?;
@@ -137,11 +137,11 @@ fn a_frame_for_another_node_leaves_the_runtime_listener_again() -> Result<()> {
 }
 
 impl Elsewhere {
-    /// Binds and serves one more listener, answering for a node of its own.
+    /// Binds and serves one more listener, answering for a peer of its own.
     ///
     /// Its own relay never runs: every frame this suite sends it names it.
     async fn start() -> Result<Self> {
-        let node = NodeId::new();
+        let peer = PeerId::new();
         let registry = PendingRegistry::new();
         let bound = bind().await?;
         let address = local(bound.address())?;
@@ -150,13 +150,13 @@ impl Elsewhere {
         let served = serve(
             bound,
             PeerService::new(
-                LocalTarget::new(node, Arc::clone(&registry)),
+                LocalTarget::new(peer, Arc::clone(&registry)),
                 Relay::new(unused),
             ),
             async move { stopped.await.unwrap_or(()) },
         )?;
         Ok(Self {
-            node,
+            peer,
             registry,
             address,
             stop: Some(stop),
@@ -177,12 +177,12 @@ impl Elsewhere {
 /// Publishes `elsewhere` and starts the process under test, reporting where its
 /// own listener is.
 async fn start_over(
-    directory: &CassandraNodeDirectory,
+    directory: &CassandraPeerDirectory,
     elsewhere: &Elsewhere,
-) -> Result<(PeerRuntime<CassandraNodeDirectory>, Endpoint), Report> {
+) -> Result<(PeerRuntime<CassandraPeerDirectory>, Endpoint), Report> {
     directory
-        .register(&NodeRegistration {
-            node: elsewhere.node,
+        .register(&PeerRegistration {
+            peer: elsewhere.peer,
             direct: elsewhere.address.clone(),
             advertised: None,
             network: None,
@@ -214,7 +214,7 @@ async fn sent_on(elsewhere: &Elsewhere, here: &Endpoint) -> Result<()> {
     let receiver = request.receiver()?;
     let fleet = DestinationFleet::new(fleet_config())?;
     let sender = GrpcSender::new(&fleet);
-    let addressed = header(elsewhere.node, request.id(), ALPHA)?;
+    let addressed = header(elsewhere.peer, request.id(), ALPHA)?;
     let staged = stage_success::<CountingCodec>(&addressed, &PAYLOAD.to_vec())?;
     sender
         .deliver(
@@ -227,7 +227,7 @@ async fn sent_on(elsewhere: &Elsewhere, here: &Endpoint) -> Result<()> {
         .map_err(|failure| eyre!("the listener did not send the frame on: {failure}"))?;
     let stored = receiver
         .await
-        .map_err(|_| eyre!("the frame never reached the node it named"))?;
+        .map_err(|_| eyre!("the frame never reached the peer it named"))?;
     let FrameResult::Success(ResponseSuccess { payload, .. }) = stored.result else {
         return Err(eyre!("the target stored a handler error"));
     };

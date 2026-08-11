@@ -36,7 +36,7 @@ fn the_metadata_hop_carries_the_trace_context() -> Result<()> {
         let context = caller.context();
         let answered = harness
             .deliver_with_context(
-                &header(harness.node, traced.id(), ALPHA)?,
+                &header(harness.peer, traced.id(), ALPHA)?,
                 payload(SHORT),
                 &context,
             )
@@ -46,7 +46,7 @@ fn the_metadata_hop_carries_the_trace_context() -> Result<()> {
 
         let untraced = register(&harness.registry, &[ALPHA])?;
         let answered = harness
-            .deliver(&header(harness.node, untraced.id(), ALPHA)?, payload(SHORT))
+            .deliver(&header(harness.peer, untraced.id(), ALPHA)?, payload(SHORT))
             .await?;
         ensure!(
             answered == Code::Ok,

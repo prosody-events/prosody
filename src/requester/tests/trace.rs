@@ -4,7 +4,7 @@
 //! it covers the whole wait: there is deliberately no second span for the
 //! answer arriving, because the answer is this call returning.
 
-use super::{KEY, NODE, SUBSYSTEM, TOPIC, unanswered_call};
+use super::{KEY, PEER, SUBSYSTEM, TOPIC, unanswered_call};
 use crate::router::loopback::paused;
 use crate::test_util::{captured_spans, named, span_attribute};
 use color_eyre::Result;
@@ -39,7 +39,7 @@ fn one_call_opens_a_client_span_naming_its_request_and_its_answers() -> Result<(
         ("messaging.system", "kafka"),
         ("topic", TOPIC),
         ("key", KEY),
-        ("response.node", &NODE.to_string()),
+        ("response.peer", &PEER.to_string()),
         ("request.outcome", "none"),
         ("responses.missing", SUBSYSTEM),
     ] {

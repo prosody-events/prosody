@@ -8,7 +8,7 @@ use crate::consumer::{ConsumerError, ShutdownError};
 use crate::response::frame::encode::Staged;
 use crate::response::headers::RequestDeadline;
 use crate::response::sender::{DropReason, ResponseRoute, RouteOutcome, Then};
-use crate::router::directory::cassandra::CassandraNodeDirectory;
+use crate::router::directory::cassandra::CassandraPeerDirectory;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::{LocalTarget, NetworkRoute};
 use opentelemetry::Context;
@@ -48,7 +48,7 @@ pub struct LocalRouter {
 
 /// A local-first gRPC router for Cassandra clients.
 pub struct GrpcRouter {
-    inner: PeerRouter<Then<LocalTarget, NetworkRoute<GrpcSender, CassandraNodeDirectory>>>,
+    inner: PeerRouter<Then<LocalTarget, NetworkRoute<GrpcSender, CassandraPeerDirectory>>>,
 }
 
 /// The opaque local response route selected by [`LocalRouter`].
@@ -62,7 +62,7 @@ pub struct LocalResponseRoute {
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct GrpcResponseRoute {
-    route: Then<LocalTarget, NetworkRoute<GrpcSender, CassandraNodeDirectory>>,
+    route: Then<LocalTarget, NetworkRoute<GrpcSender, CassandraPeerDirectory>>,
 }
 
 impl LocalRouter {

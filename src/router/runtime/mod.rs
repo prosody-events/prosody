@@ -4,14 +4,14 @@ use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::requester::registry::PendingRegistry;
 use crate::response::sender::Then;
 use crate::router::directory::cache::AddressResolver;
-use crate::router::directory::{NodeDirectory, NodeRegistration, RegistrationTtl};
+use crate::router::directory::{PeerDirectory, PeerRegistration, RegistrationTtl};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::grpc::service::PeerService;
 use crate::router::grpc::{BoundListener, serve};
 use crate::router::relay::Relay;
-use crate::router::{LocalTarget, NetworkRoute, NodeId};
+use crate::router::{LocalTarget, NetworkRoute, PeerId};
 use rand::RngExt;
 use std::future::Future;
 use std::sync::Arc;
@@ -39,11 +39,11 @@ pub(in crate::router) use tests::start_runtime;
 
 /// Everything one router shares for peer traffic, under one owner.
 ///
-/// The runtime holds this node's published registration, the resolver it reads
+/// The runtime holds this peer's published registration, the resolver it reads
 /// peers through, the bound listener, the destination fleet, the pending
 /// request registry, and the local and network response routes. Consumers and
 /// requesters take handles from it and construct none of these themselves. It
-/// mints one [`NodeId`] and the listener answers for that same id, so one
+/// mints one [`PeerId`] and the listener answers for that same id, so one
 /// runtime has one identity.
 ///
 /// The router names no response vocabulary except at the wire seam it owns.
@@ -60,7 +60,7 @@ pub(in crate::router) use tests::start_runtime;
 ///
 /// A runtime that is dropped instead still ends: the refresher stops when the
 /// watch channel closes, the listener stops when the one-shot sender drops, the
-/// registry drops when its last [`Arc`] drops, and this node's entry expires on
+/// registry drops when its last [`Arc`] drops, and this peer's entry expires on
 /// its lease. What a plain drop cannot do is wake a parked waiter or wait for a
 /// reservation. This is why shutdown exists.
 ///
@@ -76,7 +76,7 @@ pub(crate) struct PeerRuntime<D> {
     /// The write side of the directory. The resolver beside it only reads, so
     /// the two directions stay separate types rather than one that does both.
     directory: D,
-    registration: NodeRegistration,
+    registration: PeerRegistration,
     stop_refresh: watch::Sender<bool>,
     refresh: JoinHandle<()>,
     /// Dropping it resolves the listener's shutdown future.
@@ -87,7 +87,7 @@ pub(crate) struct PeerRuntime<D> {
 /// One process's peer machinery, served but not yet published.
 ///
 /// [`start`](Self::start) builds and serves every local part and writes
-/// nothing. The directory learns this node only at
+/// nothing. The directory learns this peer only at
 /// [`activate`](Self::activate). So the first write is the last step that can
 /// fail, and an owner that fails after preparation publishes nothing to undo.
 ///
@@ -98,7 +98,7 @@ pub(crate) struct PreparedPeerRuntime<D> {
     local: LocalTarget,
     network: NetworkRoute<GrpcSender, D>,
     directory: D,
-    registration: NodeRegistration,
+    registration: PeerRegistration,
     heartbeats: HeartbeatRegistry,
     stop_listener: oneshot::Sender<()>,
     listener: JoinHandle<()>,
@@ -133,7 +133,7 @@ pub(crate) struct PeerInputs<'a, D> {
     pub(crate) fleet: FleetConfiguration,
 }
 
-impl<D: NodeDirectory> PreparedPeerRuntime<D> {
+impl<D: PeerDirectory> PreparedPeerRuntime<D> {
     /// Builds every shared piece and serves the listener.
     ///
     /// The listener is served here rather than at activation, so no peer can
@@ -164,9 +164,9 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
             }
         };
         let registration =
-            registration(NodeId::new(), &inputs.listener, discovered, inputs.router)?;
+            registration(PeerId::new(), &inputs.listener, discovered, inputs.router)?;
         let addresses = AddressResolver::new(inputs.fleet.peer_capacity, directory.clone());
-        let local = LocalTarget::new(registration.node, Arc::clone(&pending));
+        let local = LocalTarget::new(registration.peer, Arc::clone(&pending));
         let network = NetworkRoute::new(
             addresses.clone(),
             Arc::clone(&fleet),
@@ -196,9 +196,9 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         })
     }
 
-    /// Publishes this node and starts its registration refresh task.
+    /// Publishes this peer and starts its registration refresh task.
     ///
-    /// A failed write issues one delete before it gives up. Node ids are minted
+    /// A failed write issues one delete before it gives up. Peer ids are minted
     /// fresh and never reused. So this process is the only writer of its own
     /// row, and the delete can remove no other. The delete is best effort, not
     /// a guarantee: a delete that also fails leaves a row that expires on its
@@ -212,7 +212,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
     pub(crate) async fn activate(self) -> Result<PeerRuntime<D>, (Self, D::Error)> {
         if let Err(error) = self.directory.register(&self.registration).await {
             if let Err(delete_error) = self.directory.deregister(&self.registration).await {
-                warn!(%delete_error, node = %self.registration.node, "failed peer registration rollback");
+                warn!(%delete_error, peer = %self.registration.peer, "failed peer registration rollback");
             }
             return Err((self, error));
         }
@@ -242,7 +242,7 @@ impl<D: NodeDirectory> PreparedPeerRuntime<D> {
         Then(self.local.clone(), self.network.clone())
     }
 
-    /// Stops every local resource without publishing the node.
+    /// Stops every local resource without publishing the peer.
     pub(crate) async fn abandon(self) {
         self.local.registry.terminate();
         abandon(self.stop_listener, self.listener).await;
@@ -253,7 +253,7 @@ impl PreparedLocalPeerRuntime {
     /// Builds local peer machinery without network resources.
     pub(crate) fn start() -> Self {
         Self {
-            local: LocalTarget::new(NodeId::new(), PendingRegistry::new()),
+            local: LocalTarget::new(PeerId::new(), PendingRegistry::new()),
         }
     }
 
@@ -287,11 +287,11 @@ impl LocalPeerRuntime {
     }
 }
 
-impl<D: NodeDirectory> PeerRuntime<D> {
-    /// This process's node id.
+impl<D: PeerDirectory> PeerRuntime<D> {
+    /// This process's peer id.
     #[cfg(test)]
-    pub(crate) fn node(&self) -> NodeId {
-        self.registration.node
+    pub(crate) fn peer(&self) -> PeerId {
+        self.registration.peer
     }
 
     /// Shuts this process's peer machinery down.
@@ -303,7 +303,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
     /// reason the code cannot show:
     ///
     /// - **Join the refresher before the delete.** A refresh that landed after
-    ///   the delete would republish this node under a fresh lease and outlive
+    ///   the delete would republish this peer under a fresh lease and outlive
     ///   the process. The delete's outcome is returned, but every later step
     ///   runs whatever it was — a failed delete heals on the lease, and an
     ///   abandoned teardown does not.
@@ -340,7 +340,7 @@ impl<D: NodeDirectory> PeerRuntime<D> {
         // leaves no receiver, and that is not a failure.
         stop_refresh.send_replace(true);
         if let Err(error) = refresh.await {
-            error!(%error, "node registration refresh task did not exit cleanly");
+            error!(%error, "peer registration refresh task did not exit cleanly");
         }
         let deregistered = directory.deregister(&registration).await;
 
@@ -355,9 +355,9 @@ impl<D: NodeDirectory> PeerRuntime<D> {
 }
 
 /// Refreshes one registration until shutdown starts.
-async fn refresh_registration<D: NodeDirectory>(
+async fn refresh_registration<D: PeerDirectory>(
     directory: D,
-    registration: NodeRegistration,
+    registration: PeerRegistration,
     heartbeat: Heartbeat,
     ttl: RegistrationTtl,
     mut stopped: watch::Receiver<bool>,
@@ -378,14 +378,14 @@ async fn refresh_registration<D: NodeDirectory>(
             }
         }
         // Checked before every write, so a refresh cannot land after the
-        // shutdown delete and resurrect this node.
+        // shutdown delete and resurrect this peer.
         if *stopped.borrow() {
             break;
         }
         // A store failure must never end this task: a dead refresher makes the
-        // node vanish one lease later.
+        // peer vanish one lease later.
         if let Err(error) = directory.register(&registration).await {
-            warn!(%error, node = %registration.node, "node registration refresh failed");
+            warn!(%error, peer = %registration.peer, "peer registration refresh failed");
         }
         heartbeat.beat();
         refresh_at = Instant::now() + refresh_delay(ttl);

@@ -1,13 +1,13 @@
 //! Reaching any prosody process by id.
 //!
-//! Every peer feature routes through here. Remote paths know only a [`NodeId`]
+//! Every peer feature routes through here. Remote paths know only a [`PeerId`]
 //! and frame bytes. The local target owns this process's request registry.
 
 use crate::requester::registry::PendingRegistry;
 use crate::response::ResponseDisposition;
 use crate::response::frame::ResponseFrame;
 use crate::router::directory::cache::AddressResolver;
-use crate::router::directory::{Endpoint, NetworkId, NodeDirectory, NodeRegistration};
+use crate::router::directory::{Endpoint, NetworkId, PeerDirectory, PeerRegistration};
 use crate::router::fleet::{Destination, DestinationFleet};
 use bytes::BufMut;
 use fixedstr::Flexstr;
@@ -48,7 +48,7 @@ pub(crate) fn label_fits(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_LABEL_BYTES
 }
 
-/// The host label a node publishes for its peers to dial. Every stored host
+/// The host label a peer publishes for its peers to dial. Every stored host
 /// fits inline within [`MAX_LABEL_BYTES`].
 pub(crate) type Host = Flexstr<LABEL_CAPACITY>;
 
@@ -63,67 +63,67 @@ pub(crate) type Host = Flexstr<LABEL_CAPACITY>;
 /// On the wire it is 16 opaque bytes, so a peer that mints ids some other way
 /// is still addressable.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct NodeId(Uuid);
+pub(crate) struct PeerId(Uuid);
 
-/// Which of a node's two endpoints answered last.
+/// Which of a peer's two endpoints answered last.
 ///
 /// A destination remembers one of these and never an [`Endpoint`]. A remembered
 /// address would outlive the registration that published it, and would be
-/// dialed after the node moved. The route is resolved for every response; the
+/// dialed after the peer moved. The route is resolved for every response; the
 /// preference only orders the candidates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(strum::VariantArray))]
 pub enum Preference {
-    /// The address the node discovered for itself on its own network.
+    /// The address the peer discovered for itself on its own network.
     Direct,
-    /// The entry point that reaches the node from another network.
+    /// The entry point that reaches the peer from another network.
     Advertised,
 }
 
-/// The endpoints one node may be dialed on, in the order the rules put them.
+/// The endpoints one peer may be dialed on, in the order the rules put them.
 ///
 /// Never more than two, and the second exists only where a failed first attempt
 /// has somewhere else to go. Every stored preference names an endpoint in the
 /// shared registration. [`choose_route`] is the only way to build one.
 #[derive(Clone, Debug)]
 pub(crate) struct Route {
-    registration: Arc<NodeRegistration>,
+    registration: Arc<PeerRegistration>,
     first: Preference,
     second: Option<Preference>,
 }
 
-/// This process's node id and the request registry that serves it.
+/// This process's peer id and the request registry that serves it.
 ///
 /// Both values exist together. Thus, a production router always has a local
-/// delivery path, and no caller can pair its node with another registry.
+/// delivery path, and no caller can pair its peer with another registry.
 #[derive(Clone)]
 pub(crate) struct LocalTarget {
-    node: NodeId,
+    peer: PeerId,
     registry: Arc<PendingRegistry>,
 }
 
 impl LocalTarget {
     /// Binds one process identity to its request registry.
-    pub(in crate::router) fn new(node: NodeId, registry: Arc<PendingRegistry>) -> Self {
-        Self { node, registry }
+    pub(in crate::router) fn new(peer: PeerId, registry: Arc<PendingRegistry>) -> Self {
+        Self { peer, registry }
     }
 
-    /// Whether this target owns `node`.
-    pub(crate) fn owns(&self, node: NodeId) -> bool {
-        self.node == node
+    /// Whether this target owns `peer`.
+    pub(crate) fn owns(&self, peer: PeerId) -> bool {
+        self.peer == peer
     }
 
-    /// This process's node id.
-    pub(crate) const fn node(&self) -> NodeId {
-        self.node
+    /// This process's peer id.
+    pub(crate) const fn peer(&self) -> PeerId {
+        self.peer
     }
 
-    /// The request registry bound to this node id.
+    /// The request registry bound to this peer id.
     pub(crate) const fn pending(&self) -> &Arc<PendingRegistry> {
         &self.registry
     }
 
-    /// Deposits one same-node response into this process's registry.
+    /// Deposits one same-peer response into this process's registry.
     pub(crate) fn accept(&self, frame: ResponseFrame) -> ResponseDisposition {
         self.registry.accept(frame)
     }
@@ -167,7 +167,7 @@ pub(crate) trait ResponseSender: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), SendFailure>> + Send;
 }
 
-/// What one forward reads: the endpoint a node published for its neighbours,
+/// What one forward reads: the endpoint a peer published for its neighbours,
 /// the transport that dials it, and the shared destination fleet.
 ///
 /// A process that forwards stands beside its target already, so it reads no
@@ -179,7 +179,7 @@ pub(crate) trait RelayHop: Clone + Send + Sync + 'static {
     /// The transport frames leave through.
     type Sender: ResponseSender;
 
-    /// What can stop a node id from becoming an address.
+    /// What can stop a peer id from becoming an address.
     type Error: Error + Send + Sync + 'static;
 
     /// The direct endpoint alone. This is the lookup a process uses when it
@@ -190,14 +190,14 @@ pub(crate) trait RelayHop: Clone + Send + Sync + 'static {
     /// Returns [`RelayHop::Error`] when the lookup itself failed.
     fn direct(
         &self,
-        node: NodeId,
+        peer: PeerId,
     ) -> impl Future<Output = Result<Option<Endpoint>, Self::Error>> + Send;
 
     /// The transport.
     fn sender(&self) -> &Self::Sender;
 }
 
-/// Everything the response path needs to reach a peer: every endpoint a node
+/// Everything the response path needs to reach a peer: every endpoint a peer
 /// may be dialed on, the transport that dials them, and the shared destination
 /// fleet.
 ///
@@ -205,22 +205,22 @@ pub(crate) trait RelayHop: Clone + Send + Sync + 'static {
 /// response path names one `R`. Address resolution belongs here, with the
 /// route call that can await it.
 pub(crate) trait NetworkRouter: RelayHop {
-    /// Returns the bounded delivery state for `node`.
-    fn destination(&self, node: NodeId) -> Arc<Destination>;
+    /// Returns the bounded delivery state for `peer`.
+    fn destination(&self, peer: PeerId) -> Arc<Destination>;
 
-    /// The endpoints `node` may be dialed on from this process, in order. This
+    /// The endpoints `peer` may be dialed on from this process, in order. This
     /// is the responder's lookup, and [`choose_route`] decides what it answers.
     ///
-    /// `None` means "do not dial", which covers both a node the directory does
+    /// `None` means "do not dial", which covers both a peer the directory does
     /// not hold and one the rules refuse to reach from here.
     ///
     /// # Errors
     ///
     /// Returns [`RelayHop::Error`] when the lookup itself failed, which is
-    /// distinct from a node that is simply not published.
+    /// distinct from a peer that is simply not published.
     fn route(
         &self,
-        node: NodeId,
+        peer: PeerId,
     ) -> impl Future<Output = Result<Option<Route>, Self::Error>> + Send;
 }
 
@@ -233,7 +233,7 @@ pub(crate) struct NetworkRoute<S, D> {
     here: Option<NetworkId>,
 }
 
-impl NodeId {
+impl PeerId {
     /// Mints an id for one incarnation of one process.
     pub(in crate::router) fn new() -> Self {
         Self(Uuid::new_v4())
@@ -250,16 +250,16 @@ impl NodeId {
     }
 }
 
-/// The directory stores a node id in a Cassandra `uuid` column, so the driver's
+/// The directory stores a peer id in a Cassandra `uuid` column, so the driver's
 /// own `Uuid` serde carries it. This conversion is the one place the newtype is
 /// unwrapped for that purpose.
-impl From<NodeId> for Uuid {
-    fn from(node: NodeId) -> Self {
-        node.0
+impl From<PeerId> for Uuid {
+    fn from(peer: PeerId) -> Self {
+        peer.0
     }
 }
 
-impl Display for NodeId {
+impl Display for PeerId {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         Display::fmt(&self.0, f)
     }
@@ -295,12 +295,12 @@ impl<S, D> NetworkRoute<S, D> {
     }
 }
 
-impl<S: ResponseSender, D: NodeDirectory> RelayHop for NetworkRoute<S, D> {
+impl<S: ResponseSender, D: PeerDirectory> RelayHop for NetworkRoute<S, D> {
     type Error = D::Error;
     type Sender = S;
 
-    async fn direct(&self, node: NodeId) -> Result<Option<Endpoint>, D::Error> {
-        let registration = self.addresses.resolve(node).await?;
+    async fn direct(&self, peer: PeerId) -> Result<Option<Endpoint>, D::Error> {
+        let registration = self.addresses.resolve(peer).await?;
         Ok(registration.map(|registration| registration.direct.clone()))
     }
 
@@ -309,19 +309,19 @@ impl<S: ResponseSender, D: NodeDirectory> RelayHop for NetworkRoute<S, D> {
     }
 }
 
-impl<S: ResponseSender, D: NodeDirectory> NetworkRouter for NetworkRoute<S, D> {
-    fn destination(&self, node: NodeId) -> Arc<Destination> {
-        self.fleet.destination(node)
+impl<S: ResponseSender, D: PeerDirectory> NetworkRouter for NetworkRoute<S, D> {
+    fn destination(&self, peer: PeerId) -> Arc<Destination> {
+        self.fleet.destination(peer)
     }
 
-    async fn route(&self, node: NodeId) -> Result<Option<Route>, D::Error> {
-        let registration = self.addresses.resolve(node).await?;
+    async fn route(&self, peer: PeerId) -> Result<Option<Route>, D::Error> {
+        let registration = self.addresses.resolve(peer).await?;
         Ok(registration.and_then(|registration| choose_route(self.here.as_ref(), registration)))
     }
 }
 
 impl SendFailure {
-    /// Whether this attempt got no proof that this address serves the node, so
+    /// Whether this attempt got no proof that this address serves the peer, so
     /// the other endpoint is worth trying inside the same response.
     ///
     /// Every failure that answers `false` is a status some process gave the
@@ -400,22 +400,22 @@ impl Route {
 /// from that, and this is the one function in the crate that reads a label:
 ///
 /// - **Both present and equal.** Dial `direct`, and fall back to `advertised`
-///   when the node published one. Neighbours skip the entry point, which
+///   when the peer published one. Neighbours skip the entry point, which
 ///   matters less for latency than for load.
 /// - **Both present and unequal.** Dial `advertised` alone, and `None` when the
-///   node published none. The node is known to be elsewhere, so its direct
+///   peer published none. The peer is known to be elsewhere, so its direct
 ///   address is a foreign one that most likely belongs to something unrelated
 ///   here. Refusing to dial is only expressible because the labels were
 ///   declared.
 /// - **Either absent.** That means "cannot tell", never "different". Dial
-///   `advertised` if the node published one, else `direct`. With nothing
-///   configured anywhere, every node resolves to `direct`, which is the
+///   `advertised` if the peer published one, else `direct`. With nothing
+///   configured anywhere, every peer resolves to `direct`, which is the
 ///   single-network case working with no configuration at all.
 ///
 /// `None` means "do not dial".
 pub(crate) fn choose_route(
     here: Option<&NetworkId>,
-    registration: Arc<NodeRegistration>,
+    registration: Arc<PeerRegistration>,
 ) -> Option<Route> {
     let advertised = registration.advertised.is_some();
     match (here, registration.network.as_ref()) {

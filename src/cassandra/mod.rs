@@ -86,7 +86,7 @@ pub const TABLE_KEYED_STATE_PUBLICATION: &str = "keyed_state_publication";
 
 /// Table holding one row per live prosody process and its peer endpoints.
 /// Rows carry a TTL. Each process refreshes its own row inside that TTL.
-pub const TABLE_NODE_DIRECTORY: &str = "node_directory";
+pub const TABLE_PEER_DIRECTORY: &str = "peer_directory";
 
 /// Cassandra's maximum TTL in seconds (~20 years).
 pub const MAX_CASSANDRA_TTL_SECS: i64 = 630_720_000;

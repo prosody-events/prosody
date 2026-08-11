@@ -3,11 +3,11 @@
 //!
 //! A helper any two suites both need lives here rather than in either of them.
 
-use crate::router::directory::{Endpoint, NetworkId, NodeRegistration};
+use crate::router::directory::{Endpoint, NetworkId, PeerRegistration};
 use crate::router::fleet::config::{FleetConfiguration, FleetConfigurationError};
 use crate::router::fleet::{Destination, DestinationFleet};
 use crate::router::{
-    Framed, Host, NetworkRouter, NodeId, RelayHop, ResponseSender, Route, SendFailure, choose_route,
+    Framed, Host, NetworkRouter, PeerId, RelayHop, ResponseSender, Route, SendFailure, choose_route,
 };
 use bytes::BytesMut;
 use parking_lot::Mutex;
@@ -26,11 +26,11 @@ use tonic::codegen::http::{Uri, uri::InvalidUri};
 
 pub(crate) mod listener;
 
-/// How many nodes the test router publishes.
-pub(crate) const PUBLISHED_NODES: u8 = 8;
+/// How many peers the test router publishes.
+pub(crate) const PUBLISHED_PEERS: u8 = 8;
 
-/// A node the test router does not publish.
-pub(crate) const UNPUBLISHED_NODE: u8 = 200;
+/// A peer the test router does not publish.
+pub(crate) const UNPUBLISHED_PEER: u8 = 200;
 
 /// A deadline on every wait, so a hang fails the test instead of hanging the
 /// binary. It is never the assertion.
@@ -78,7 +78,7 @@ pub(crate) struct LoopbackSender {
     scripts: Mutex<HashMap<Uri, Script>>,
 }
 
-/// A router over an in-process transport, addressing a fixed set of nodes.
+/// A router over an in-process transport, addressing a fixed set of peers.
 ///
 /// Every suite that drives delivery builds one of these, so a router double
 /// exists once rather than once per test tree.
@@ -86,7 +86,7 @@ pub(crate) struct LoopbackSender {
 pub(crate) struct TestRouter {
     fleet: Arc<DestinationFleet>,
     transport: Arc<LoopbackSender>,
-    registrations: Arc<HashMap<NodeId, Arc<NodeRegistration>>>,
+    registrations: Arc<HashMap<PeerId, Arc<PeerRegistration>>>,
     here: Option<NetworkId>,
 }
 
@@ -140,7 +140,7 @@ impl TestRouter {
         Self::build(config, None)
     }
 
-    /// Builds a router whose nodes publish direct and advertised endpoints.
+    /// Builds a router whose peers publish direct and advertised endpoints.
     pub(crate) fn dual_homed(
         config: FleetConfiguration,
     ) -> Result<(Self, UnboundedReceiver<Delivery>), TestRouterError> {
@@ -153,12 +153,12 @@ impl TestRouter {
         here: Option<NetworkId>,
     ) -> Result<(Self, UnboundedReceiver<Delivery>), TestRouterError> {
         let (transport, deliveries) = LoopbackSender::new();
-        let registrations = (0..PUBLISHED_NODES)
+        let registrations = (0..PUBLISHED_PEERS)
             .map(|index| {
                 Ok((
-                    node(index),
-                    Arc::new(NodeRegistration {
-                        node: node(index),
+                    peer(index),
+                    Arc::new(PeerRegistration {
+                        peer: peer(index),
                         direct: Endpoint::from(direct_uri(index)?),
                         advertised: here
                             .as_ref()
@@ -201,17 +201,17 @@ impl TestRouter {
 }
 
 impl NetworkRouter for TestRouter {
-    fn destination(&self, node: NodeId) -> Arc<Destination> {
-        self.fleet.destination(node)
+    fn destination(&self, peer: PeerId) -> Arc<Destination> {
+        self.fleet.destination(peer)
     }
 
     fn route(
         &self,
-        node: NodeId,
+        peer: PeerId,
     ) -> impl Future<Output = Result<Option<Route>, Infallible>> + Send {
         let route = self
             .registrations
-            .get(&node)
+            .get(&peer)
             .and_then(|registration| choose_route(self.here.as_ref(), Arc::clone(registration)));
         async move { Ok(route) }
     }
@@ -223,11 +223,11 @@ impl RelayHop for TestRouter {
 
     fn direct(
         &self,
-        node: NodeId,
+        peer: PeerId,
     ) -> impl Future<Output = Result<Option<Endpoint>, Infallible>> + Send {
         let direct = self
             .registrations
-            .get(&node)
+            .get(&peer)
             .map(|registration| registration.direct.clone());
         async move { Ok(direct) }
     }
@@ -270,19 +270,19 @@ impl ResponseSender for LoopbackSender {
 }
 
 /// A registration publishing `direct` and nothing else.
-pub(crate) fn registration(direct: Endpoint) -> NodeRegistration {
-    NodeRegistration {
-        node: NodeId::new(),
+pub(crate) fn registration(direct: Endpoint) -> PeerRegistration {
+    PeerRegistration {
+        peer: PeerId::new(),
         direct,
         advertised: None,
         network: None,
-        hostname: Host::make("test-node"),
+        hostname: Host::make("test-peer"),
     }
 }
 
-/// A node id from one repeated byte.
-pub(crate) fn node(index: u8) -> NodeId {
-    NodeId::from_bytes([index; 16])
+/// A peer id from one repeated byte.
+pub(crate) fn peer(index: u8) -> PeerId {
+    PeerId::from_bytes([index; 16])
 }
 
 /// The direct URI that belongs to `index`.

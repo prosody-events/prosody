@@ -2,10 +2,10 @@ syntax = "proto3";
 
 package prosody.peer.v1;
 
-// Operations prosody nodes perform on each other. Later peer features add
+// Operations prosody peers perform on each other. Later peer features add
 // methods here rather than services of their own.
 service PeerService {
-  // Delivers one response frame to its target node. The gRPC status reports
+  // Delivers one response frame to its target peer. The gRPC status reports
   // delivery. An empty response body cannot report a false success.
   rpc DeliverResponse(DeliverResponseRequest) returns (DeliverResponseResponse);
 }
@@ -30,11 +30,11 @@ message HandlerError {
   string message = 2;
 }
 
-// One response, addressed to the node that is waiting for it.
+// One response, addressed to the peer that is waiting for it.
 message DeliverResponseRequest {
-  // Which node this frame is for. A node that is not the target forwards the
+  // Which peer this frame is for. A peer that is not the target forwards the
   // frame or rejects it, and never accepts it.
-  bytes target_node = 1; // 16 bytes
+  bytes target_peer = 1; // 16 bytes
   bytes request_id = 2; // 16 bytes
   string subsystem = 3;
   // Exactly one arm reports the handler result.
@@ -42,10 +42,10 @@ message DeliverResponseRequest {
     ResponseSuccess success = 4;
     HandlerError handler_error = 5;
   }
-  // Empty until a relay forwards the frame, then the relay's own node id. A
+  // Empty until a relay forwards the frame, then the relay's own peer id. A
   // frame that already names a relay is never forwarded again. A relay always
   // sets this itself and never preserves a value it received.
-  bytes relay_node = 6; // 16 bytes, or empty
+  bytes relay_peer = 6; // 16 bytes, or empty
 }
 
 // The gRPC status reports the delivery result. A response has no fields.

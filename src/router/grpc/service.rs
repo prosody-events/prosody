@@ -18,7 +18,7 @@ use tonic::{Request, Response, Status};
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span, debug_span, error};
 
-/// Serves [`DeliverResponse`](PeerServiceApi::deliver_response) for one node.
+/// Serves [`DeliverResponse`](PeerServiceApi::deliver_response) for one peer.
 ///
 /// A frame is accepted only by the process it names, sent on once when it names
 /// another, and refused when it already passed through a relay. The id every
@@ -91,14 +91,14 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
             if let Some(relay) = frame.header.relay {
                 span.record("peer.relay", display(relay));
             }
-            let routing = routing(self.local.node, target, frame.header.relay);
+            let routing = routing(self.local.peer, target, frame.header.relay);
             match routing {
                 Routing::Accept => answer(&span, self.local.accept(frame)),
                 Routing::AlreadyRelayed => answer(&span, ResponseDisposition::AlreadyRelayed),
                 Routing::Forward => {
                     // The forwarded form carries this process's own id, so a
                     // relay id the caller supplied cannot survive the hop.
-                    let forwarded = Forwarded::new(frame, self.local.node);
+                    let forwarded = Forwarded::new(frame, self.local.peer);
                     let forward = debug_span!(
                         "peer.response.forward",
                         otel.kind = "client",

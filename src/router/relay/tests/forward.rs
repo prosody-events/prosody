@@ -3,11 +3,11 @@
 use super::{BUDGET, Process, frame};
 use crate::response::ResponseDisposition;
 use crate::router::SendFailure;
-use crate::router::loopback::{Script, config, direct_uri, node, paused};
+use crate::router::loopback::{Script, config, direct_uri, paused, peer};
 use color_eyre::Result;
 use std::time::Duration;
 
-/// The node every case here sends a frame on to. It is not the process under
+/// The peer every case here sends a frame on to. It is not the process under
 /// test, so every frame is forwarded rather than accepted.
 const ELSEWHERE: u8 = 3;
 
@@ -35,7 +35,7 @@ fn a_failed_forward_is_never_answered_as_a_delivery() -> Result<()> {
         )?;
 
         let answered = process
-            .deliver(frame(node(ELSEWHERE), request.id(), None)?, BUDGET)
+            .deliver(frame(peer(ELSEWHERE), request.id(), None)?, BUDGET)
             .await?;
         assert_eq!(
             answered,
@@ -75,7 +75,7 @@ fn a_frame_that_arrives_with_no_budget_reserves_nothing() -> Result<()> {
         let request = process.expects()?;
 
         let answered = process
-            .deliver(frame(node(ELSEWHERE), request.id(), None)?, SPENT)
+            .deliver(frame(peer(ELSEWHERE), request.id(), None)?, SPENT)
             .await?;
         assert_eq!(
             answered,

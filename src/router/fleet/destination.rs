@@ -8,7 +8,7 @@ const UNKNOWN: u8 = 0;
 const DIRECT: u8 = 1;
 const ADVERTISED: u8 = 2;
 
-/// The endpoint that most recently answered for one node.
+/// The endpoint that most recently answered for one peer.
 pub struct Destination {
     preferred: AtomicU8,
 }

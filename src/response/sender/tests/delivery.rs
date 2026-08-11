@@ -1,6 +1,6 @@
 //! What happens to a response between its hook and the wire.
 
-use super::{Harness, PAYLOAD, config, node, paused};
+use super::{Harness, PAYLOAD, config, paused, peer};
 use crate::Codec;
 use crate::response::frame::decode::decode_frame;
 use crate::response::frame::tests::CountingCodec;
@@ -27,14 +27,14 @@ fn a_response_reaches_the_wire_intact() -> Result<()> {
         assert_eq!(
             delivery.uri,
             direct_uri(TARGET)?,
-            "the response must reach its target node"
+            "the response must reach its target peer"
         );
 
         let frame = decode_frame(&mut delivery.bytes)?;
         assert_eq!(
             frame.header.target,
-            node(TARGET),
-            "the frame must name its target node"
+            peer(TARGET),
+            "the frame must name its target peer"
         );
         let FrameResult::Success(ResponseSuccess { payload, .. }) = frame.result else {
             return Err(color_eyre::eyre::eyre!("the response must succeed"));

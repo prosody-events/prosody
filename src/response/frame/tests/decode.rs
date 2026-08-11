@@ -5,13 +5,13 @@ use crate::response::frame::decode::{FrameDecodeError, decode_frame};
 use crate::response::frame::encode::{stage_error, stage_success};
 use crate::response::frame::{
     FIELD_ERROR_CATEGORY, FIELD_HANDLER_ERROR, FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_SUCCESS,
-    FIELD_SUCCESS_FORMAT, FIELD_TARGET_NODE,
+    FIELD_SUCCESS_FORMAT, FIELD_TARGET_PEER,
 };
 use crate::response::{
     RequestId,
     frame::{FrameResult, HandlerError, ResponseSuccess},
 };
-use crate::router::{Framed, NodeId};
+use crate::router::{Framed, PeerId};
 use bytes::BytesMut;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
@@ -36,11 +36,11 @@ fn both_response_arms_round_trip(
     payload.truncate(2048);
     let Ok(mut header) = header(
         "billing",
-        relay.map(|id| NodeId::from_bytes(id.to_le_bytes())),
+        relay.map(|id| PeerId::from_bytes(id.to_le_bytes())),
     ) else {
         return TestResult::error("the fixed subsystem must be valid");
     };
-    header.target = NodeId::from_bytes(target.to_le_bytes());
+    header.target = PeerId::from_bytes(target.to_le_bytes());
     header.request = RequestId::from_bytes(request.to_le_bytes());
     let expected_category = match category % 3 {
         0 => ErrorCategory::Transient,
@@ -142,7 +142,7 @@ fn malformed_result_fields_are_refused() -> Result<()> {
 
 fn raw_header() -> BytesMut {
     let mut wire = BytesMut::new();
-    raw_bytes(FIELD_TARGET_NODE, &[0x11; 16], &mut wire);
+    raw_bytes(FIELD_TARGET_PEER, &[0x11; 16], &mut wire);
     raw_bytes(FIELD_REQUEST_ID, &[0x22; 16], &mut wire);
     raw_bytes(FIELD_SUBSYSTEM, b"billing", &mut wire);
     wire

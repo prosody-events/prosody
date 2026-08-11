@@ -1,6 +1,6 @@
 //! Answering a record that asked for a response.
 //!
-//! A Kafka record can name a request, a node and the subsystems it awaits. When
+//! A Kafka record can name a request, a peer and the subsystems it awaits. When
 //! this consumer answers for one of them, the parsed tag rides the message.
 //! This layer reads that tag and the record's own trace into an [`Answering`],
 //! carries it on both result arms, and — from

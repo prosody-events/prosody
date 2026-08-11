@@ -54,7 +54,7 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         let caller_span = trace.span().span_context().clone();
         let payload = PAYLOAD.to_vec();
         let prepared = stage::<CountingCodec, Infallible>(
-            header(harness.node, request.id(), ALPHA)?,
+            header(harness.peer, request.id(), ALPHA)?,
             Ok(&payload),
         );
         deliver_response(
@@ -97,7 +97,7 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         for (key, expected) in [
             ("peer.request", request.id().to_string()),
             ("peer.subsystem", ALPHA.to_owned()),
-            ("peer.target", harness.node.to_string()),
+            ("peer.target", harness.peer.to_string()),
             (DISPOSITION, "accepted".to_owned()),
         ] {
             let value = span_attribute(received, key)?;
@@ -112,7 +112,7 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         let caller = info_span!("peer.test.refused");
         let payload = PAYLOAD.to_vec();
         let prepared = stage::<CountingCodec, Infallible>(
-            header(harness.node, refused.id(), ALPHA)?,
+            header(harness.peer, refused.id(), ALPHA)?,
             Ok(&payload),
         );
         deliver_response(

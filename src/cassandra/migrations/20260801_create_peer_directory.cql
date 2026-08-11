@@ -1,8 +1,8 @@
--- Migration: create_node_directory
+-- Migration: create_peer_directory
 -- Timestamp: 20260801
--- Purpose: Provision the node directory that every prosody process registers
---          itself in. {{TABLE_NODE_DIRECTORY}} holds one row per live process,
---          keyed by a node id that the process mints at startup and never
+-- Purpose: Provision the peer directory that every prosody process registers
+--          itself in. {{TABLE_PEER_DIRECTORY}} holds one row per live process,
+--          keyed by a peer id that the process mints at startup and never
 --          reuses. Each write is therefore an unconditional last-write-wins
 --          upsert: there is no lease to acquire and nothing to fence. A row
 --          carries a TTL and the process rewrites it well inside that TTL, so a
@@ -17,8 +17,8 @@
 --          stays at the default because it governs resurrection risk rather
 --          than tombstone noise.
 
-CREATE TABLE {{KEYSPACE}}.{{TABLE_NODE_DIRECTORY}} (
-    node_id            uuid PRIMARY KEY,
+CREATE TABLE {{KEYSPACE}}.{{TABLE_PEER_DIRECTORY}} (
+    peer_id            uuid PRIMARY KEY,
     direct_connect     text,
     advertised_connect text,
     network            text,

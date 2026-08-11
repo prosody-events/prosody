@@ -12,7 +12,7 @@ use crate::requester::{ProsodyRequester, ResponseError};
 use crate::response::frame::{FrameResult, HandlerError, ResponseFrame, ResponseSuccess};
 use crate::response::headers::{RequestDeadline, RequestTag};
 use crate::response::{FormatToken, RequestId};
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::{EventIdentity, Topic};
@@ -36,8 +36,8 @@ mod trace;
 /// Bytes one successful test response occupies.
 const RESPONSE_BYTES: usize = 4;
 
-/// The node every suite answers to.
-const NODE: NodeId = NodeId::from_bytes([7_u8; 16]);
+/// The peer every suite answers to.
+const PEER: PeerId = PeerId::from_bytes([7_u8; 16]);
 
 /// Longest timeout the suites may ask for.
 const MAX_TIMEOUT: Duration = Duration::from_mins(1);
@@ -149,7 +149,7 @@ pub(super) fn requester(
         .mock(true)
         .build()?;
     let producer = ProsodyProducer::new(&config, Telemetry::new().sender())?;
-    Ok(ProsodyRequester::new(producer, NODE, registry))
+    Ok(ProsodyRequester::new(producer, PEER, registry))
 }
 
 /// Drives one real call that nothing answers, to its deadline.
@@ -213,7 +213,7 @@ pub(super) fn frame(id: RequestId, subsystem: &SubsystemName, payload: Bytes) ->
     ResponseFrame {
         header: RequestTag::new(
             id,
-            NODE,
+            PEER,
             RequestDeadline::from_unix_micros(1_700_000_000_000_000),
         )
         .header(subsystem.clone()),
@@ -243,7 +243,7 @@ pub(super) fn failure(
     ResponseFrame {
         header: RequestTag::new(
             id,
-            NODE,
+            PEER,
             RequestDeadline::from_unix_micros(1_700_000_000_000_000),
         )
         .header(subsystem.clone()),

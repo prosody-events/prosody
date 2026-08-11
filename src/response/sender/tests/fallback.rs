@@ -9,7 +9,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use tonic::Code;
 
-/// The node the responses in this suite are addressed to.
+/// The peer the responses in this suite are addressed to.
 const TARGET: u8 = 1;
 
 /// Every candidate walk two responses to one destination can make.

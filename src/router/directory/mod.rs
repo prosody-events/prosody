@@ -1,14 +1,14 @@
-//! The node directory: where every live prosody process publishes how peers
+//! The peer directory: where every live prosody process publishes how peers
 //! can reach it, and how any process resolves another by id.
 //!
 //! A registration is soft state. A process writes its own entry under a lease,
 //! rewrites the entry inside that lease, and deletes the entry on a clean
-//! shutdown. A process that dies expires with the lease. Node ids are minted
+//! shutdown. A process that dies expires with the lease. Peer ids are minted
 //! fresh at startup and never reused, so an entry has exactly one writer for
 //! its whole life. That is why a backend needs no lightweight transaction and
 //! nothing to fence: every write is an unconditional upsert or delete.
 
-use crate::router::{Host, LABEL_CAPACITY, NodeId};
+use crate::router::{Host, LABEL_CAPACITY, PeerId};
 use fixedstr::Flexstr;
 use std::error::Error;
 use std::future::Future;
@@ -29,14 +29,14 @@ pub(crate) use tonic::transport::Endpoint;
 /// The operator's name for a set of processes that can reach each other on
 /// their direct endpoints.
 ///
-/// Not a CIDR and not a Kubernetes object: a label that two nodes either share
+/// Not a CIDR and not a Kubernetes object: a label that two peers either share
 /// or do not. Absent means "unknown", which never counts as a match.
 pub(crate) type NetworkId = Flexstr<LABEL_CAPACITY>;
 
 /// One live process, as the directory publishes it.
 #[derive(Clone, Debug)]
-pub(crate) struct NodeRegistration {
-    pub(crate) node: NodeId,
+pub(crate) struct PeerRegistration {
+    pub(crate) peer: PeerId,
     /// Where this process is reachable on its own network. The runtime derives
     /// it from the bound listener. It is always present.
     pub(crate) direct: Endpoint,
@@ -48,11 +48,11 @@ pub(crate) struct NodeRegistration {
     pub(crate) hostname: Host,
 }
 
-/// What a process publishes about itself, and how it resolves another node.
+/// What a process publishes about itself, and how it resolves another peer.
 ///
-/// [`CassandraNodeDirectory`](cassandra::CassandraNodeDirectory) is the
+/// [`CassandraPeerDirectory`](cassandra::CassandraPeerDirectory) is the
 /// production implementation. Tests use small in-process implementations.
-pub(crate) trait NodeDirectory: Clone + Send + Sync + 'static {
+pub(crate) trait PeerDirectory: Clone + Send + Sync + 'static {
     /// What can stop a directory operation.
     ///
     /// No error-classification bound: no caller reads a directory error's
@@ -70,19 +70,19 @@ pub(crate) trait NodeDirectory: Clone + Send + Sync + 'static {
     /// Publishes `registration` under a fresh lease.
     fn register(
         &self,
-        registration: &NodeRegistration,
+        registration: &PeerRegistration,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Reads one node's registration. A registration that is not resolvable
+    /// Reads one peer's registration. A registration that is not resolvable
     /// reads as absent rather than as an error.
     fn read(
         &self,
-        node: NodeId,
-    ) -> impl Future<Output = Result<Option<NodeRegistration>, Self::Error>> + Send;
+        peer: PeerId,
+    ) -> impl Future<Output = Result<Option<PeerRegistration>, Self::Error>> + Send;
 
     /// Removes `registration`'s entry. Idempotent.
     fn deregister(
         &self,
-        registration: &NodeRegistration,
+        registration: &PeerRegistration,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }

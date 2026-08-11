@@ -1,6 +1,6 @@
 //! What one response's journey came to, as counters an operator can watch.
 //!
-//! **No identity is ever an attribute.** A node id and a claimed subsystem name
+//! **No identity is ever an attribute.** A peer id and a claimed subsystem name
 //! arrive in a Kafka header a topic writer controls, so a series keyed by one
 //! is a cardinality attack on the metrics pipeline. Every attribute here is one
 //! fixed `&'static str` a `const fn` chose.
@@ -72,8 +72,8 @@ pub(super) enum Stage {
 pub enum DropReason {
     /// The codec could not encode the result.
     EncodeFailed,
-    /// No live registration names the node the response is addressed to.
-    UnresolvableNode,
+    /// No live registration names the peer the response is addressed to.
+    UnresolvablePeer,
     /// The directory lookup itself failed.
     LookupFailed,
     /// No endpoint of the route answered `Ok`, which does not prove that none
@@ -108,7 +108,7 @@ impl DropReason {
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::EncodeFailed => "encode_failed",
-            Self::UnresolvableNode => "unresolvable_node",
+            Self::UnresolvablePeer => "unresolvable_peer",
             Self::LookupFailed => "lookup_failed",
             Self::SendFailed => "send_failed",
         }
@@ -119,11 +119,11 @@ impl DropReason {
 /// it failed.
 ///
 /// A route offers a second candidate only where the dialer's network label and
-/// the node's are equal. Each count therefore says the first candidate gave no
-/// proof that it serves the node. That is not proof it never read the frame:
+/// the peer's are equal. Each count therefore says the first candidate gave no
+/// proof that it serves the peer. That is not proof it never read the frame:
 /// the share it was given can simply have run out. A network label put on the
-/// wrong process is one cause. A dead direct endpoint, a node that moved and a
-/// node that answered `UNAVAILABLE` are others, so read this series as a
+/// wrong process is one cause. A dead direct endpoint, a peer that moved and a
+/// peer that answered `UNAVAILABLE` are others, so read this series as a
 /// question, not as a verdict.
 ///
 /// It counts transitions, not responses, and a steady fault does not count once

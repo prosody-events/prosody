@@ -1,7 +1,7 @@
 //! The process runtime's suites, driven against live Cassandra and a real
 //! listener.
 //!
-//! Isolation follows the Cassandra row rule: every process mints a fresh node
+//! Isolation follows the Cassandra row rule: every process mints a fresh peer
 //! id and a fresh group id, so rows are disjoint in the shared `prosody_test`
 //! keyspace and no test creates a keyspace of its own.
 
@@ -10,10 +10,10 @@ use crate::heartbeat::HeartbeatRegistry;
 use crate::requester::registry::PendingRegistry;
 use crate::response::RequestId;
 use crate::response::frame::FrameHeader;
-use crate::router::NodeId;
-use crate::router::directory::cassandra::CassandraNodeDirectory;
+use crate::router::PeerId;
+use crate::router::directory::cassandra::CassandraPeerDirectory;
 use crate::router::directory::tests::support::cassandra_directory;
-use crate::router::directory::{Endpoint, NodeDirectory};
+use crate::router::directory::{Endpoint, PeerDirectory};
 use crate::router::fleet::DestinationFleet;
 use crate::router::fleet::config::FleetConfiguration;
 use crate::router::grpc::BoundListener;
@@ -42,7 +42,7 @@ const ALPHA: &str = "alpha";
 
 /// One process under test and the handles its runtime supplies.
 struct Process {
-    runtime: PeerRuntime<CassandraNodeDirectory>,
+    runtime: PeerRuntime<CassandraPeerDirectory>,
     shared: Shared,
 }
 
@@ -53,14 +53,14 @@ struct Shared {
     /// Where this process's own listener is.
     listener: Endpoint,
     /// The id the runtime minted.
-    node: NodeId,
-    directory: CassandraNodeDirectory,
+    peer: PeerId,
+    directory: CassandraPeerDirectory,
 }
 
 /// One runtime with the default peer configuration, and no sender.
 struct PlainProcess {
-    runtime: PeerRuntime<CassandraNodeDirectory>,
-    directory: CassandraNodeDirectory,
+    runtime: PeerRuntime<CassandraPeerDirectory>,
+    directory: CassandraPeerDirectory,
 }
 
 impl Process {
@@ -83,7 +83,7 @@ impl Process {
                 fleet: Arc::clone(&runtime.network.fleet),
                 pending: Arc::clone(runtime.local.pending()),
                 listener,
-                node: runtime.node(),
+                peer: runtime.peer(),
                 directory,
             },
             runtime,
@@ -116,7 +116,7 @@ async fn plain_process() -> Result<PlainProcess> {
 
 pub(in crate::router) async fn start_runtime<D>(inputs: PeerInputs<'_, D>) -> Result<PeerRuntime<D>>
 where
-    D: NodeDirectory,
+    D: PeerDirectory,
 {
     let prepared = PreparedPeerRuntime::start(inputs).await?;
     match prepared.activate().await {
@@ -129,7 +129,7 @@ where
 }
 
 /// A header for one successful response to `request`, addressed to `target`.
-fn header(target: NodeId, request: RequestId, subsystem: &str) -> Result<FrameHeader> {
+fn header(target: PeerId, request: RequestId, subsystem: &str) -> Result<FrameHeader> {
     Ok(FrameHeader {
         target,
         request,

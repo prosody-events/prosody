@@ -11,9 +11,9 @@ use crate::producer::ProsodyProducer;
 use crate::requester::ProsodyRequester;
 use crate::response::sender::{ResponseRoute, Then};
 #[cfg(test)]
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::router::config::PeerParts;
-use crate::router::directory::NodeDirectory;
+use crate::router::directory::PeerDirectory;
 use crate::router::grpc::BoundListener;
 use crate::router::grpc::client::GrpcSender;
 use crate::router::runtime::{
@@ -36,7 +36,7 @@ mod local_route {
     impl<R: ResponseRoute> Sealed for Then<LocalTarget, R> {}
 }
 
-/// A response route that always tries the local node first.
+/// A response route that always tries the local peer first.
 pub(crate) trait LocalRoute: local_route::Sealed + ResponseRoute {
     /// The local target that owns this route's request identity.
     fn local(&self) -> &LocalTarget;
@@ -97,8 +97,8 @@ pub(crate) type RouteFor<B> = <RuntimeFor<B> as PreparedRuntime>::Route;
 
 impl<R: LocalRoute> PeerRouter<R> {
     #[cfg(test)]
-    pub(crate) const fn node(&self) -> NodeId {
-        self.producer.local.node()
+    pub(crate) const fn peer(&self) -> PeerId {
+        self.producer.local.peer()
     }
 
     pub(crate) fn producer_handle(&self) -> ProducerHandle {
@@ -131,13 +131,13 @@ impl ProducerHandle {
     ) -> ProsodyRequester<C, RC> {
         ProsodyRequester::new(
             producer,
-            self.local.node(),
+            self.local.peer(),
             Arc::clone(self.local.pending()),
         )
     }
 }
 
-impl<D: NodeDirectory> PreparedRuntime for PreparedPeerRuntime<D> {
+impl<D: PeerDirectory> PreparedRuntime for PreparedPeerRuntime<D> {
     type Route = Then<LocalTarget, NetworkRoute<GrpcSender, D>>;
     type Running = PeerRuntime<D>;
 
@@ -179,7 +179,7 @@ impl PreparedRuntime for PreparedLocalPeerRuntime {
     }
 }
 
-impl<D: NodeDirectory> RunningRuntime for PeerRuntime<D> {
+impl<D: PeerDirectory> RunningRuntime for PeerRuntime<D> {
     async fn stop<F, Fut>(self, drain: F) -> Result<(), ShutdownError>
     where
         F: FnOnce() -> Fut + Send,
@@ -204,7 +204,7 @@ impl RunningRuntime for LocalPeerRuntime {
     }
 }
 
-pub(crate) async fn prepare_network<D: NodeDirectory>(
+pub(crate) async fn prepare_network<D: PeerDirectory>(
     parts: PeerParts,
     directory: D,
 ) -> Result<PreparedPeerRuntime<D>, ConsumerError> {

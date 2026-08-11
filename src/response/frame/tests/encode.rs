@@ -4,13 +4,13 @@ use crate::error::ErrorCategory;
 use crate::response::frame::decode::decode_frame;
 use crate::response::frame::encode::{Forwarded, stage_error, stage_success};
 use crate::response::frame::{FrameResult, HandlerError};
-use crate::router::{Framed, NodeId};
+use crate::router::{Framed, PeerId};
 use bytes::BytesMut;
 use color_eyre::Result;
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 
-const RELAY: NodeId = NodeId::from_bytes([0x77; 16]);
+const RELAY: PeerId = PeerId::from_bytes([0x77; 16]);
 
 #[test]
 fn success_encoding_uses_standard_codec_resources() -> Result<()> {
@@ -37,7 +37,7 @@ fn grpc_owns_response_size_policy() -> Result<()> {
 
 #[test]
 fn a_forwarded_frame_replaces_the_previous_relay() -> Result<()> {
-    let earlier = NodeId::from_bytes([0x33; 16]);
+    let earlier = PeerId::from_bytes([0x33; 16]);
     let staged =
         stage_success::<CountingCodec>(&header("billing", Some(earlier))?, &b"hi".to_vec())?;
     let mut wire = BytesMut::with_capacity(staged.bytes());

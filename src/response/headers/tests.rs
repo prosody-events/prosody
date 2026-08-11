@@ -1,10 +1,10 @@
 use super::{
     HeaderRejection, ID_TEXT_LEN, RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER,
-    RESPONSE_NODE_HEADER, RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline,
+    RESPONSE_PEER_HEADER, RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline,
     RequestTag, parse_request_tag,
 };
 use crate::response::RequestId;
-use crate::router::NodeId;
+use crate::router::PeerId;
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use crate::test_util::assert_distinct_labels;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
@@ -17,10 +17,10 @@ const REQUEST_ID_BYTES: [u8; 16] = [
     0x01, 0x98, 0x3b, 0x2a, 0x7e, 0x40, 0x7d, 0x11, 0x9b, 0x52, 0xc4, 0xf0, 0xa3, 0xd8, 0xe6, 0xb1,
 ];
 
-/// The one node id every case carries, and the bytes its text form must parse
+/// The one peer id every case carries, and the bytes its text form must parse
 /// to.
-const NODE_ID_TEXT: &str = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
-const NODE_ID_BYTES: [u8; 16] = [
+const PEER_ID_TEXT: &str = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
+const PEER_ID_BYTES: [u8; 16] = [
     0xf8, 0x1d, 0x4f, 0xae, 0x7d, 0xec, 0x11, 0xd0, 0xa7, 0x65, 0x00, 0xa0, 0xc9, 0x1e, 0x6b, 0xf6,
 ];
 
@@ -72,11 +72,11 @@ enum Mutation {
     NoReservedHeaders,
     DuplicateVersion,
     DuplicateRequestId,
-    DuplicateNode,
+    DuplicatePeer,
     DuplicateDeadline,
     MissingVersion,
     MissingRequestId,
-    MissingNode,
+    MissingPeer,
     MissingDeadline,
     MissingAwaited,
     /// Only the revision header survives.
@@ -187,7 +187,7 @@ impl Case {
             header(crate::SOURCE_SYSTEM_HEADER, b"upstream"),
             header(RESPONSE_VERSION_HEADER, b"2"),
             header(RESPONSE_REQUEST_ID_HEADER, REQUEST_ID_TEXT.as_bytes()),
-            header(RESPONSE_NODE_HEADER, NODE_ID_TEXT.as_bytes()),
+            header(RESPONSE_PEER_HEADER, PEER_ID_TEXT.as_bytes()),
             header(RESPONSE_DEADLINE_HEADER, DEADLINE_TEXT),
         ];
         headers.extend(
@@ -225,15 +225,15 @@ impl Case {
                 RESPONSE_REQUEST_ID_HEADER,
                 REQUEST_ID_TEXT.as_bytes(),
             )),
-            Mutation::DuplicateNode => {
-                headers.push(header(RESPONSE_NODE_HEADER, NODE_ID_TEXT.as_bytes()));
+            Mutation::DuplicatePeer => {
+                headers.push(header(RESPONSE_PEER_HEADER, PEER_ID_TEXT.as_bytes()));
             }
             Mutation::DuplicateDeadline => {
                 headers.push(header(RESPONSE_DEADLINE_HEADER, DEADLINE_TEXT));
             }
             Mutation::MissingVersion => drop_header(&mut headers, RESPONSE_VERSION_HEADER),
             Mutation::MissingRequestId => drop_header(&mut headers, RESPONSE_REQUEST_ID_HEADER),
-            Mutation::MissingNode => drop_header(&mut headers, RESPONSE_NODE_HEADER),
+            Mutation::MissingPeer => drop_header(&mut headers, RESPONSE_PEER_HEADER),
             Mutation::MissingDeadline => drop_header(&mut headers, RESPONSE_DEADLINE_HEADER),
             Mutation::MissingAwaited => drop_header(&mut headers, RESPONSE_AWAITED_HEADER),
             Mutation::OnlyVersion => headers.retain(|(key, _)| key == RESPONSE_VERSION_HEADER),
@@ -259,15 +259,15 @@ impl Case {
             ),
             Mutation::IdTruncated => set_value(
                 &mut headers,
-                RESPONSE_NODE_HEADER,
-                Some(NODE_ID_TEXT.as_bytes()[..ID_TEXT_LEN - 1].to_vec()),
+                RESPONSE_PEER_HEADER,
+                Some(PEER_ID_TEXT.as_bytes()[..ID_TEXT_LEN - 1].to_vec()),
             ),
             Mutation::IdNonUtf8 => set_value(
                 &mut headers,
                 RESPONSE_REQUEST_ID_HEADER,
                 Some(vec![0xff; ID_TEXT_LEN]),
             ),
-            Mutation::IdValueAbsent => set_value(&mut headers, RESPONSE_NODE_HEADER, None),
+            Mutation::IdValueAbsent => set_value(&mut headers, RESPONSE_PEER_HEADER, None),
             Mutation::DeadlineLeadingZero => set_value(
                 &mut headers,
                 RESPONSE_DEADLINE_HEADER,
@@ -334,18 +334,18 @@ fn expected(mutation: Mutation) -> Result<Option<RequestTag>, HeaderRejection> {
         Mutation::WellFormed | Mutation::WellFormedCommaResponder | Mutation::ManyAwaited => {
             Ok(Some(RequestTag::new(
                 RequestId::from_bytes(REQUEST_ID_BYTES),
-                NodeId::from_bytes(NODE_ID_BYTES),
+                PeerId::from_bytes(PEER_ID_BYTES),
                 RequestDeadline::from_unix_micros(DEADLINE_MICROS),
             )))
         }
         Mutation::NotAwaited | Mutation::NoReservedHeaders => Ok(None),
         Mutation::DuplicateVersion
         | Mutation::DuplicateRequestId
-        | Mutation::DuplicateNode
+        | Mutation::DuplicatePeer
         | Mutation::DuplicateDeadline => Err(HeaderRejection::DuplicateSingleton),
         Mutation::MissingVersion
         | Mutation::MissingRequestId
-        | Mutation::MissingNode
+        | Mutation::MissingPeer
         | Mutation::MissingDeadline
         | Mutation::MissingAwaited
         | Mutation::OnlyVersion => Err(HeaderRejection::MissingSingleton),
@@ -411,7 +411,7 @@ fn canonical_headers_parse_to_their_ids() -> color_eyre::Result<()> {
     let responder = SubsystemName::try_new("billing")?;
     let expected = RequestTag::new(
         RequestId::from_bytes(REQUEST_ID_BYTES),
-        NodeId::from_bytes(NODE_ID_BYTES),
+        PeerId::from_bytes(PEER_ID_BYTES),
         RequestDeadline::from_unix_micros(DEADLINE_MICROS),
     );
 
@@ -423,7 +423,7 @@ fn canonical_headers_parse_to_their_ids() -> color_eyre::Result<()> {
             ("response-version", Some(b"2".as_slice())),
             ("response-request-id", Some(id_text.as_bytes())),
             (
-                "response-node",
+                "response-peer",
                 Some(b"f81d4fae-7dec-11d0-a765-00a0c91e6bf6".as_slice()),
             ),
             ("response-deadline", Some(DEADLINE_TEXT)),
@@ -456,7 +456,7 @@ fn a_name_that_only_overlaps_the_responder_is_another_subsystem() -> color_eyre:
         let headers = [
             (RESPONSE_VERSION_HEADER, Some(b"2".as_slice())),
             (RESPONSE_REQUEST_ID_HEADER, Some(REQUEST_ID_TEXT.as_bytes())),
-            (RESPONSE_NODE_HEADER, Some(NODE_ID_TEXT.as_bytes())),
+            (RESPONSE_PEER_HEADER, Some(PEER_ID_TEXT.as_bytes())),
             (RESPONSE_DEADLINE_HEADER, Some(DEADLINE_TEXT)),
             (RESPONSE_AWAITED_HEADER, Some(awaited.as_bytes())),
         ];

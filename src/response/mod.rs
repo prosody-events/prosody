@@ -34,11 +34,11 @@ impl FormatToken {
     }
 }
 
-/// Delivery attempts this node answered, by fixed disposition label.
+/// Delivery attempts this peer answered, by fixed disposition label.
 static DISPOSITIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     meter("prosody")
         .u64_counter("prosody.response.dispositions")
-        .with_description("Response delivery attempts this node answered")
+        .with_description("Response delivery attempts this peer answered")
         .with_unit("{response}")
         .build()
 });
@@ -81,7 +81,7 @@ impl From<RequestId> for Uuid {
     }
 }
 
-/// How a node answered one delivery attempt.
+/// How a peer answered one delivery attempt.
 ///
 /// Each disposition names exactly one gRPC status and only
 /// [`Accepted`](Self::Accepted) names `OK`. There is deliberately no status
@@ -96,11 +96,11 @@ pub(crate) enum ResponseDisposition {
     UnknownRequest,
     /// The request existed but has already finished.
     ClosedRequest,
-    /// The frame is for another node and has already been relayed once.
+    /// The frame is for another peer and has already been relayed once.
     AlreadyRelayed,
     /// No time is left inside the caller's deadline to relay the frame.
     RelayDeadlineExceeded,
-    /// The target node could not be resolved or could not be reached.
+    /// The target peer could not be resolved or could not be reached.
     Unreachable,
 }
 
@@ -132,7 +132,7 @@ impl ResponseDisposition {
         }
     }
 
-    /// What the sending node is told this disposition was.
+    /// What the sending peer is told this disposition was.
     ///
     /// The wording lives beside the status mapping, so the two travel together
     /// and a `Debug` rendering of a crate-internal name never reaches the wire.
@@ -144,14 +144,14 @@ impl ResponseDisposition {
             Self::ClosedRequest => "that request has already finished",
             Self::AlreadyRelayed => "the frame has already been relayed once",
             Self::RelayDeadlineExceeded => "no time is left to relay the frame",
-            Self::Unreachable => "the target node could not be reached from here",
+            Self::Unreachable => "the target peer could not be reached from here",
         }
     }
 
     /// Counts one delivery attempt this process **decided**, under this
     /// disposition's label.
     ///
-    /// A frame this process only sent on is counted at the node that decided
+    /// A frame this process only sent on is counted at the peer that decided
     /// it, so a relay never adds a second point for one delivery.
     pub(crate) fn record(self) {
         DISPOSITIONS.add(1, &[KeyValue::new("disposition", self.label())]);
@@ -160,7 +160,7 @@ impl ResponseDisposition {
     /// The stable telemetry label for this disposition.
     ///
     /// A fixed string per variant. The frame that produced the disposition
-    /// arrived from the network, so nothing it carries — no node id, no claimed
+    /// arrived from the network, so nothing it carries — no peer id, no claimed
     /// subsystem — is ever a label.
     pub(crate) const fn label(self) -> &'static str {
         match self {

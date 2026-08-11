@@ -112,7 +112,7 @@ async fn deliver_route<R: ResponseRoute>(
 ) -> Result<Delivery, DropReason> {
     match router.deliver(frame, deadline, context).await? {
         RouteOutcome::Delivered(delivery) => Ok(delivery),
-        RouteOutcome::Declined(_) => Err(DropReason::UnresolvableNode),
+        RouteOutcome::Declined(_) => Err(DropReason::UnresolvablePeer),
     }
 }
 
@@ -144,14 +144,14 @@ impl<R: NetworkRouter> ResponseRoute for R {
         context: &Context,
     ) -> Result<RouteOutcome, DropReason> {
         let target = frame.target();
-        // No address originates anywhere but a registration: a node the directory
-        // does not hold is not dialed at all, and a node the rules refuse to reach
+        // No address originates anywhere but a registration: a peer the directory
+        // does not hold is not dialed at all, and a peer the rules refuse to reach
         // from here is not dialed either.
         let route = match self.route(target).await {
             Ok(Some(route)) => route,
             Ok(None) => return Ok(RouteOutcome::Declined(frame)),
             Err(error) => {
-                warn!(%error, node = %target, "peer route lookup failed");
+                warn!(%error, peer = %target, "peer route lookup failed");
                 return Err(DropReason::LookupFailed);
             }
         };
@@ -183,8 +183,8 @@ impl<R: NetworkRouter> ResponseRoute for R {
                     if !failure.is_wrong_endpoint() {
                         // A failure that is not a wrong endpoint is a status the
                         // path answered, so this endpoint is the one that reaches
-                        // the node — refusal and all. Every other failure proves
-                        // nothing about which endpoint serves the node, so it
+                        // the peer — refusal and all. Every other failure proves
+                        // nothing about which endpoint serves the peer, so it
                         // leaves nothing remembered.
                         remembered = Some(preference);
                         break;
@@ -199,7 +199,7 @@ impl<R: NetworkRouter> ResponseRoute for R {
             // `previous` as well, so a route of one candidate needs both terms.
             warn!(
                 %failure,
-                node = %target,
+                peer = %target,
                 preference = preference.label(),
                 fell_back = has_fallback && previous.is_some(),
                 "response delivery failed"
@@ -279,7 +279,7 @@ where
             PreparedResponse::Ready(staged)
         }
         Err(error) => {
-            warn!(%error, node = %header.target, "response could not be framed");
+            warn!(%error, peer = %header.target, "response could not be framed");
             PreparedResponse::Rejected(header, DropReason::EncodeFailed)
         }
     }

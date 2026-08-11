@@ -120,7 +120,7 @@ pub enum PeerInitError {
         /// The rendered source chain.
         message: String,
     },
-    /// The node directory could not start or register this process.
+    /// The peer directory could not start or register this process.
     #[error("peer directory failed: {message}")]
     Directory {
         /// The rendered source chain.
@@ -178,9 +178,9 @@ pub enum ShutdownError {
         /// The rendered join failure.
         message: String,
     },
-    /// The peer directory did not confirm the removal of this node. The row
+    /// The peer directory did not confirm the removal of this peer. The row
     /// may or may not survive, and one that survives expires on its lease.
-    #[error("the peer directory did not confirm the removal of this node: {message}")]
+    #[error("the peer directory did not confirm the removal of this peer: {message}")]
     Directory {
         /// The rendered source chain.
         message: String,

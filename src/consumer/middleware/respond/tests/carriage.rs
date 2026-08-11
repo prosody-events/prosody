@@ -12,7 +12,7 @@ use crate::error::ErrorCategory;
 use crate::response::RequestId;
 use crate::response::frame::decode::decode_frame;
 use crate::response::frame::{FrameResult, HandlerError};
-use crate::router::loopback::{TestRouter, node, paused};
+use crate::router::loopback::{TestRouter, paused, peer};
 use color_eyre::Result;
 
 /// The tag reaches the wire from the error arm as well as the success arm.
@@ -43,7 +43,7 @@ fn metadata_rides_the_error_arm() -> Result<()> {
         let frame = decode_frame(&mut delivery.bytes)?;
         assert_eq!(
             frame.header.target,
-            node(2),
+            peer(2),
             "the tag names the destination"
         );
         assert_eq!(frame.header.request, RequestId::from_bytes([9; 16]));

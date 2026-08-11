@@ -60,7 +60,7 @@ fn checksums_match_baseline() -> Result<()> {
             "319c1163ded1575088ba761e6138f30b5f6adeaf57dc5514e8c7cfd30808f25c",
         ),
         (
-            "20260801_create_node_directory.cql",
+            "20260801_create_peer_directory.cql",
             "feff017837acbcde99a20f33d9bf8de1bd537940b4b736a76bd983388d6b7ce4",
         ),
     ]
