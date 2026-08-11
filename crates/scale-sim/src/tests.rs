@@ -391,6 +391,62 @@ fn closed_loop_accepts_ready_window_with_rebalance_pause() -> Result<(), TestErr
 }
 
 #[test]
+fn unused_paused_partition_does_not_change_capacity_posterior() -> Result<(), TestError> {
+    let (baseline, baseline_pause) = run_idle_partition_capacity_trace(1)?;
+    let (with_idle_partition, idle_partition_pause) = run_idle_partition_capacity_trace(2)?;
+
+    assert_eq!(baseline_pause, 0);
+    assert!(idle_partition_pause > 0);
+    assert_eq!(baseline, with_idle_partition);
+    Ok(())
+}
+
+fn run_idle_partition_capacity_trace(partition_count: u32) -> Result<(Vec<u64>, u64), TestError> {
+    let controller_configuration = ControllerConfiguration {
+        cohort_count_max: 4,
+        calendar_segment_count_max: 4,
+        partition_count,
+        replica_count_max: 2,
+        slots_per_replica: 2,
+        posterior_sample_count: 64,
+        report_interval_micros: 10_000,
+        failure_service_weight: 0.3_f64,
+        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        capacity_change_rate_per_second: 0.0_f64,
+        reliability_prior: ReliabilityPrior::population_fallback(),
+        launch_time_prior: TransitionPrior::broad_fallback(),
+        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
+    };
+    let capacity_grid = CapacityGrid::new(
+        &[0.005_f64, 0.01_f64],
+        &[200.0_f64, 400.0_f64],
+        &[0.0_f64, 1.0_f64],
+    )?;
+    let closed_loop = ClosedLoop::new(
+        IdlePartitionCapacityWorkload {
+            move_idle_partition: partition_count > 1,
+        },
+        &controller_configuration,
+        capacity_grid,
+        12,
+    )?;
+    let plant_configuration =
+        PlantConfiguration::new(partition_count, 100, 240, 12, 2, 16)?.with_rebalance(2_000, 0);
+    let mut harness = SimulationHarness::new(plant_configuration, 1, 12, closed_loop)?;
+    let mut rebalance_pause_micros = 0;
+    for tick in 0_u64..12 {
+        rebalance_pause_micros = harness.tick(tick * 10_000)?.rebalance_pause_micros;
+    }
+    let (_result, closed_loop) = harness.finish_with_graph();
+    let posterior = (0..closed_loop.trace().len())
+        .filter_map(|index| closed_loop.trace().sample(index))
+        .map(|sample| sample.no_knee_probability.to_bits())
+        .collect();
+    Ok((posterior, rebalance_pause_micros))
+}
+
+#[test]
 fn closed_loop_accepts_busy_zero_completion_capacity_windows() -> Result<(), TestError> {
     let closed_loop = capacity_test_closed_loop(RampCapacityWorkload, 2)?;
     let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?;
@@ -592,6 +648,40 @@ impl TickGenerator for CapacityWorkload {
                 replicas: u32::from(context.tick_index >= 3) + 1,
                 delay_micros: 0,
             },
+        })
+    }
+}
+
+struct IdlePartitionCapacityWorkload {
+    move_idle_partition: bool,
+}
+
+impl TickGenerator for IdlePartitionCapacityWorkload {
+    fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError> {
+        Ok(TickInputs {
+            message_count: 20,
+            timer_count: 0,
+            handler_micros: 10_000,
+            dependency_operations: 1,
+            dependency_operation_micros: 1,
+            handler_added_micros: 0,
+            outcome: EventOutcomeRule::Success,
+            launch_delay_micros: 0,
+            scale: ScaleDirective::Request {
+                replicas: u32::from(self.move_idle_partition && context.tick_index % 4 >= 2) + 1,
+                delay_micros: 0,
+            },
+        })
+    }
+
+    fn event(&self, context: EventContext<'_>) -> Result<EventInputs, PlantError> {
+        Ok(EventInputs {
+            release_micros: context.tick.now_micros,
+            partition: 0,
+            key: context.event_index % context.key_count,
+            handler_micros: context.inputs.handler_micros,
+            dependency_operations: context.inputs.dependency_operations,
+            outcome: EventOutcome::Final(FinalOutcome::Success),
         })
     }
 }

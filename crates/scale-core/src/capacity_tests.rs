@@ -7,6 +7,22 @@ use super::{CapacityFactor, CapacityGrid, CapacityGridError, ResourceWindow, Res
 const ERROR_ALLOWANCE: f64 = 0.01_f64;
 
 #[test]
+fn alternating_pause_and_stable_windows_find_the_true_capacity_cell() -> Result<(), TestError> {
+    let simd_level = Level::new();
+    let grid = CapacityGrid::new(&[0.1_f64], &[100.0_f64], &[0.0_f64])?;
+    let mut factor = CapacityFactor::new(grid, 0.0_f64);
+    let paused = ResourceWindow::new(5.0_f64, 1.0_f64, 50)?;
+    let stable = ResourceWindow::new(20.0_f64, 1.0_f64, 100)?;
+
+    for window in [paused, stable].iter().cycle().take(40) {
+        factor.update(simd_level, window);
+    }
+
+    assert!(factor.weights[0] > factor.weights[1]);
+    Ok(())
+}
+
+#[test]
 fn declining_mass_keeps_the_cap_below_the_knee() -> Result<(), TestError> {
     let mut factor = cap_fixture()?;
     let window = ResourceWindow::new(100.0_f64, 1.0_f64, 236)?;
