@@ -478,6 +478,7 @@ async fn build_inline_replacement_client(
             topic: telemetry_topic.to_owned(),
             enabled: true,
         },
+        peer: common::test_peer_config()?,
         ..ConsumerBuilders::new()?
     };
 

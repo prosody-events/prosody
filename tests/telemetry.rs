@@ -825,6 +825,7 @@ async fn build_client_with<T: ClientHandler<Payload = Value>>(
             topic: telemetry_topic.to_owned(),
             enabled: emitter_enabled,
         },
+        peer: common::test_peer_config()?,
         ..ConsumerBuilders::new()?
     };
 

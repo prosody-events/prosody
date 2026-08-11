@@ -22,6 +22,8 @@ use tokio::sync::mpsc::{Sender, channel};
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
+mod common;
+
 #[derive(Clone)]
 struct MyHandler {
     sender: Sender<String>,
@@ -99,6 +101,7 @@ async fn quickstart() -> Result<()> {
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_config,
+        peer: common::test_peer_config()?,
         ..ConsumerBuilders::new()?
     };
 

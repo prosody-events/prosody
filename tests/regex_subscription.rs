@@ -106,6 +106,7 @@ async fn create_high_level_client(
             enabled: false,
             ..Default::default()
         },
+        peer: common::test_peer_config()?,
         ..ConsumerBuilders::new()?
     };
     let mut cassandra_builder = CassandraConfigurationBuilder::default();

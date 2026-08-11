@@ -29,6 +29,8 @@ use tracing::Span;
 use tracing::subscriber::set_global_default;
 use uuid::Uuid;
 
+mod common;
+
 /// Reports whether the handler's ambient span is exactly the event's span.
 #[derive(Clone)]
 struct AmbientProbe {
@@ -121,6 +123,7 @@ async fn handlers_run_inside_their_event_spans() -> Result<()> {
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_config,
+        peer: common::test_peer_config()?,
         ..ConsumerBuilders::new()?
     };
 
