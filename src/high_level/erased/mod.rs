@@ -19,6 +19,7 @@ use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 mod readers;
 
@@ -30,6 +31,8 @@ pub use readers::{
 /// Consumer lifecycle state materialized across an FFI boundary.
 #[derive(Clone, Debug)]
 pub enum ErasedConsumerState<T> {
+    /// The client is shut down.
+    ShutDown,
     /// No valid consumer configuration exists.
     Unconfigured,
     /// Consumer configuration failed.
@@ -56,22 +59,17 @@ pub struct ErasedConsumerConfiguration {
     pub group_id: String,
 }
 
-/// Lifecycle operations used by foreign-language client wrappers.
-///
-/// Rust callers use [`HighLevelClient`] directly and pay no type-erasure cost.
 #[async_trait]
-pub trait ErasedHighLevelClient<T>: Send + Sync
+trait ErasedHighLevelClient<T>: Send + Sync
 where
     T: ClientHandler,
 {
-    /// Sends one event.
     async fn send(
         &self,
         topic: Topic,
         key: String,
         payload: T::Payload,
     ) -> Result<(), HighLevelClientError<WireError<T>>>;
-    /// Sends one request and returns one result per subsystem.
     async fn request(
         &self,
         headers: Vec<(String, String)>,
@@ -81,47 +79,244 @@ where
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
     ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<WireError<T>>>;
-    /// Starts consuming.
     async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>>;
-    /// Stops consuming.
     async fn unsubscribe(&self) -> Result<(), HighLevelClientError<WireError<T>>>;
-    /// Returns the current lifecycle state.
+    async fn shutdown(self: Box<Self>) -> Result<(), HighLevelClientError<WireError<T>>>;
     async fn consumer_state(&self) -> ErasedConsumerState<T>;
-    /// Builds a read-only view of one published value collection.
     async fn value_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedValueReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>;
-    /// Builds a read-only view of one published string-keyed map collection.
     async fn map_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedMapReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>;
-    /// Builds a read-only view of one published deque collection.
     async fn deque_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedDequeReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>;
-    /// Returns the assigned partition count.
     async fn assigned_partition_count(&self) -> u32;
-    /// Reports whether any consumer heartbeat is stalled.
     async fn is_stalled(&self) -> bool;
-    /// Producer configuration.
     fn producer_config(&self) -> &ProducerConfiguration;
-    /// Trace-context propagator.
-    fn propagator(&self) -> &TextMapCompositePropagator;
-    /// Configured source system.
-    fn source_system(&self) -> &str;
+    fn propagator(&self) -> &Arc<TextMapCompositePropagator>;
 }
 
-/// Shared erased client representation stored by native FFI wrappers.
-pub type SharedHighLevelClient<T> = Arc<dyn ErasedHighLevelClient<T>>;
+/// Shared FFI client with one concrete lifecycle owner.
+///
+/// Operations hold shared access until they finish. Shutdown takes exclusive
+/// access and consumes the concrete client.
+///
+/// Each foreign binding polls each operation in an independent task. Do not
+/// retain an operation future and await shutdown from the same task.
+pub struct SharedHighLevelClient<T>
+where
+    T: ClientHandler,
+{
+    client: Arc<RwLock<Option<Box<dyn ErasedHighLevelClient<T>>>>>,
+    producer_config: Arc<ProducerConfiguration>,
+    propagator: Arc<TextMapCompositePropagator>,
+}
+
+impl<T> Clone for SharedHighLevelClient<T>
+where
+    T: ClientHandler,
+{
+    fn clone(&self) -> Self {
+        Self {
+            client: Arc::clone(&self.client),
+            producer_config: Arc::clone(&self.producer_config),
+            propagator: Arc::clone(&self.propagator),
+        }
+    }
+}
+
+impl<T> SharedHighLevelClient<T>
+where
+    T: ClientHandler,
+{
+    fn new(client: Box<dyn ErasedHighLevelClient<T>>) -> Self {
+        let producer_config = Arc::new(client.producer_config().clone());
+        let propagator = Arc::clone(client.propagator());
+        Self {
+            client: Arc::new(RwLock::new(Some(client))),
+            producer_config,
+            propagator,
+        }
+    }
+
+    /// Sends one event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or Kafka rejects the event.
+    pub async fn send(
+        &self,
+        topic: Topic,
+        key: String,
+        payload: T::Payload,
+    ) -> Result<(), HighLevelClientError<WireError<T>>> {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::ShutDown)?;
+        client.send(topic, key, payload).await
+    }
+
+    /// Sends one request and returns one result per subsystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request is invalid or cannot start.
+    pub async fn request(
+        &self,
+        headers: Vec<(String, String)>,
+        topic: Topic,
+        key: String,
+        payload: T::Payload,
+        subsystems: Vec<SubsystemName>,
+        timeout: Duration,
+    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<WireError<T>>> {
+        let guard = self.client.read().await;
+        let Some(client) = guard.as_deref() else {
+            return Err(RequestError::ShuttingDown);
+        };
+        client
+            .request(headers, topic, key, payload, subsystems, timeout)
+            .await
+    }
+
+    /// Starts consuming.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or cannot subscribe.
+    pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>> {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::ShutDown)?;
+        client.subscribe(handler).await
+    }
+
+    /// Stops consuming.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or is not subscribed.
+    pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError<WireError<T>>> {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::ShutDown)?;
+        client.unsubscribe().await
+    }
+
+    /// Shuts down the client and all its services.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or a service cannot stop.
+    pub async fn shutdown(self) -> Result<(), HighLevelClientError<WireError<T>>> {
+        let client = {
+            let mut guard = self.client.write().await;
+            guard.take().ok_or(HighLevelClientError::ShutDown)?
+        };
+        client.shutdown().await
+    }
+
+    /// Returns the current lifecycle state.
+    pub async fn consumer_state(&self) -> ErasedConsumerState<T> {
+        let guard = self.client.read().await;
+        let Some(client) = guard.as_deref() else {
+            return ErasedConsumerState::ShutDown;
+        };
+        client.consumer_state().await
+    }
+
+    /// Builds a read-only view of one published value collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or the reader is invalid.
+    pub async fn value_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedValueReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::ShutDown)?;
+        client.value_state(subsystem, name, cache).await
+    }
+
+    /// Builds a read-only view of one published string-keyed map collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or the reader is invalid.
+    pub async fn map_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedMapReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::ShutDown)?;
+        client.map_state(subsystem, name, cache).await
+    }
+
+    /// Builds a read-only view of one published deque collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or the reader is invalid.
+    pub async fn deque_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedDequeReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::ShutDown)?;
+        client.deque_state(subsystem, name, cache).await
+    }
+
+    /// Returns the assigned partition count.
+    pub async fn assigned_partition_count(&self) -> u32 {
+        let guard = self.client.read().await;
+        let Some(client) = guard.as_deref() else {
+            return 0;
+        };
+        client.assigned_partition_count().await
+    }
+
+    /// Reports whether any consumer heartbeat is stalled.
+    pub async fn is_stalled(&self) -> bool {
+        let guard = self.client.read().await;
+        let Some(client) = guard.as_deref() else {
+            return false;
+        };
+        client.is_stalled().await
+    }
+
+    /// Returns the producer configuration.
+    #[must_use]
+    pub fn producer_config(&self) -> &ProducerConfiguration {
+        &self.producer_config
+    }
+
+    /// Returns the trace-context propagator.
+    #[must_use]
+    pub fn propagator(&self) -> &TextMapCompositePropagator {
+        &self.propagator
+    }
+
+    /// Returns the configured source system.
+    #[must_use]
+    pub fn source_system(&self) -> &str {
+        &self.producer_config.source_system
+    }
+}
 
 /// Constructs and erases the backend selected by an FFI configuration.
 ///
@@ -144,14 +339,14 @@ where
     let mock = consumers.consumer.configured_mock()?;
 
     if mock {
-        Ok(Arc::new(ErasedClient(
+        Ok(SharedHighLevelClient::new(Box::new(ErasedClient(
             MemoryHighLevelClient::new(mode, producer, consumers).await?,
-        )))
+        ))))
     } else {
         let cassandra = cassandra.build()?;
-        Ok(Arc::new(ErasedClient(
+        Ok(SharedHighLevelClient::new(Box::new(ErasedClient(
             CassandraHighLevelClient::new(cassandra, mode, producer, consumers).await?,
-        )))
+        ))))
     }
 }
 
@@ -200,6 +395,10 @@ where
 
     async fn unsubscribe(&self) -> Result<(), HighLevelClientError<WireError<T>>> {
         self.0.unsubscribe().await
+    }
+
+    async fn shutdown(self: Box<Self>) -> Result<(), HighLevelClientError<WireError<T>>> {
+        self.0.shutdown().await
     }
 
     async fn consumer_state(&self) -> ErasedConsumerState<T> {
@@ -259,12 +458,8 @@ where
         self.0.producer_config()
     }
 
-    fn propagator(&self) -> &TextMapCompositePropagator {
-        self.0.propagator()
-    }
-
-    fn source_system(&self) -> &str {
-        self.0.source_system()
+    fn propagator(&self) -> &Arc<TextMapCompositePropagator> {
+        &self.0.propagator
     }
 }
 

@@ -15,6 +15,7 @@ use crate::high_level::config::ModeConfiguration;
 pub use crate::high_level::error::HighLevelClientError;
 pub use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
+use crate::peer::Router;
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::requester::{ProsodyRequester, RequestError, ResponseError};
 use crate::state::descriptor::{Registered, StateDescriptor};
@@ -27,6 +28,7 @@ use crate::{Codec, Topic};
 use educe::Educe;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::mem::take;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, OnceCell};
 use tracing::info;
@@ -84,7 +86,7 @@ where
     subsystem: Option<SubsystemName>,
     #[educe(Debug(ignore))]
     router: B::Router,
-    propagator: TextMapCompositePropagator,
+    propagator: Arc<TextMapCompositePropagator>,
     telemetry: Telemetry,
 }
 
@@ -131,7 +133,7 @@ where
 
     /// Returns a reference to the OpenTelemetry propagator.
     pub fn propagator(&self) -> &TextMapCompositePropagator {
-        &self.propagator
+        self.propagator.as_ref()
     }
 
     /// Returns the configured source system identifier.
@@ -450,6 +452,23 @@ where
 
         info!("shutting down consumer");
         consumer.shutdown().await;
+        Ok(())
+    }
+
+    /// Shuts down the consumer and all client services.
+    ///
+    /// The method consumes the client. No operation can start after shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `HighLevelClientError` if a client service cannot stop.
+    pub async fn shutdown(self) -> Result<(), HighLevelClientError<WireError<T>>> {
+        if let ConsumerState::Running { consumer, .. } = self.consumer.into_inner() {
+            info!("shutting down consumer");
+            consumer.shutdown().await;
+        }
+
+        self.router.shutdown().await?;
         Ok(())
     }
 

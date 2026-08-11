@@ -2,8 +2,8 @@
 //! [`HighLevelClient`](super::HighLevelClient).
 
 use crate::Topic;
-use crate::consumer::ConsumerError;
 use crate::consumer::middleware::scheduler::SchedulerInitError;
+use crate::consumer::{ConsumerError, ShutdownError};
 use crate::high_level::config::ModeConfigurationError;
 use crate::producer::{ProducerConfigurationBuilderError, ProducerError};
 use crate::state::registry::RegisterStateError;
@@ -25,6 +25,14 @@ pub enum HighLevelClientError<E> {
     /// Error when initializing the consumer fails.
     #[error("failed to initialize consumer: {0:#}")]
     Consumer(#[from] ConsumerError),
+
+    /// Error when client shutdown fails.
+    #[error("failed to shut down client: {0:#}")]
+    Shutdown(#[from] ShutdownError),
+
+    /// Error when an operation starts after client shutdown.
+    #[error("client is shut down")]
+    ShutDown,
 
     /// Error when the scheduler configuration is invalid.
     #[error("invalid scheduler configuration: {0:#}")]

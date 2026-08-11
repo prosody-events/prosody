@@ -293,6 +293,13 @@ fn erased_client_retains_consumer_failure_until_subscribe() -> Result<()> {
         Duration::from_secs(1),
     ));
     assert!(matches!(requested, Err(RequestError::NoSubsystems)));
+    let retained = client.clone();
+    TEST_RUNTIME.block_on(client.shutdown())?;
+    let after_shutdown = TEST_RUNTIME.block_on(retained.subscribe(NoOpHandler));
+    assert!(matches!(
+        after_shutdown,
+        Err(HighLevelClientError::ShutDown)
+    ));
     Ok(())
 }
 
@@ -353,6 +360,7 @@ fn erased_reader_kinds_share_subsystem_validation() -> Result<()> {
             Err(ErasedReaderBuildError::InvalidSubsystem(_))
         ));
     });
+    TEST_RUNTIME.block_on(client.shutdown())?;
     Ok(())
 }
 

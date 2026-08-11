@@ -14,6 +14,7 @@ use crate::producer::{ProducerConfigurationBuilder, ProsodyProducer};
 use crate::propagator::new_propagator;
 use crate::state_reader::StateReaderError;
 use crate::telemetry::{Telemetry, spawn_telemetry_emitter};
+use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
 
 async fn new_with_backend<T, B>(
@@ -95,7 +96,7 @@ where
         requester,
         subsystem: consumer_builders.keyed_state.subsystem.clone(),
         router,
-        propagator: new_propagator(),
+        propagator: Arc::new(new_propagator()),
         telemetry,
     })
 }
