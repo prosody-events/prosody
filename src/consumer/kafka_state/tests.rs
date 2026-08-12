@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::Key;
+use crate::codec::Codec;
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -44,7 +45,6 @@ fn last_seen() -> MessageDescriptor<MemoryLoader<Value>> {
 /// (mismatch ⇒ Permanent), so pin both literals — a rename fails loudly here.
 #[test]
 fn kafka_message_identity_tokens_are_frozen() {
-    use crate::codec::Codec;
     use crate::state::descriptor::CellResolver;
 
     assert_eq!(MessageRefCodec::FORMAT_ID, "message-ref");

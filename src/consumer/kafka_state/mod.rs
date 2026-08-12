@@ -23,7 +23,6 @@
 //! bind. Handlers pin it by annotating the descriptor or aliasing
 //! `MessageCell<MyLoader>` once.
 
-use crate::codec::Codec;
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::message::ConsumerMessage;
 use crate::loader::MessageLoader;
@@ -32,12 +31,12 @@ use crate::state::descriptor::{
 };
 use crate::state::order_codec::OrderedKeyCodec;
 use crate::{Offset, Partition, Topic};
-use bytes::Bytes;
-use rmp_serde::decode::Error as MsgPackDecodeError;
-use rmp_serde::encode::{Error as MsgPackEncodeError, write_named};
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
-use thiserror::Error;
+
+mod codec;
+
+pub use self::codec::{MessageRefCodec, MessageRefCodecError};
 
 /// Durable pointer to a Kafka message body.
 ///
@@ -48,7 +47,7 @@ use thiserror::Error;
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageRef {
     /// Kafka topic.
-    #[serde(with = "topic_serde")]
+    #[serde(with = "codec::topic_serde")]
     pub topic: Topic,
 
     /// Kafka partition.
@@ -65,44 +64,6 @@ impl<P> From<&ConsumerMessage<P>> for MessageRef {
             partition: message.partition(),
             offset: message.offset(),
         }
-    }
-}
-
-/// `MsgPack` [`Codec`] for [`MessageRef`] cells.
-///
-/// Codec id `"message-ref"` is frozen into the durable structural
-/// identity; never change it once cells exist.
-/// `MessagePack` borrows values and input bytes. Ownership adds no faster path.
-#[derive(Default)]
-pub struct MessageRefCodec;
-
-impl Codec for MessageRefCodec {
-    type Error = MessageRefCodecError;
-    type Payload = MessageRef;
-
-    const FORMAT_ID: &'static str = "message-ref";
-
-    fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error> {
-        rmp_serde::from_slice(buf).map_err(MessageRefCodecError::Decode)
-    }
-
-    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<Self::Payload, Self::Error> {
-        rmp_serde::from_slice(&buf).map_err(MessageRefCodecError::Decode)
-    }
-
-    fn serialize_ref(
-        &mut self,
-        payload: &Self::Payload,
-        buf: &mut Vec<u8>,
-    ) -> Result<(), Self::Error> {
-        // MessagePack reads the value by reference, so no payload copy is needed.
-        write_named(buf, payload).map_err(MessageRefCodecError::Encode)
-    }
-
-    fn with_cached_local<R>(f: impl FnOnce(&mut Self) -> R) -> R {
-        // The codec is a zero-sized type with no reusable buffers, so there
-        // is nothing to cache: hand `f` a fresh instance.
-        f(&mut Self)
     }
 }
 
@@ -197,41 +158,6 @@ where
 #[must_use]
 pub fn message_deque_state<L: MessageLoader>(name: &str) -> DequeDescriptor<MessageCell<L>> {
     DequeDescriptor::new(name)
-}
-
-mod topic_serde {
-    use crate::Topic;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(topic: &Topic, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(topic.as_ref())
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Topic, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = <String as Deserialize<'de>>::deserialize(deserializer)?;
-        Ok(Topic::from(value.as_str()))
-    }
-}
-
-/// Error from the [`MessageRefCodec`] cell encode/decode.
-///
-/// Both variants classify Permanent through [`CellStateError`]'s codec arm: a
-/// cell that does not round-trip will not start to on retry.
-#[derive(Debug, Error)]
-pub enum MessageRefCodecError {
-    /// The cell bytes did not decode as a [`MessageRef`].
-    #[error("kafka message reference cell is corrupt")]
-    Decode(#[source] MsgPackDecodeError),
-
-    /// The reference failed to encode.
-    #[error("kafka message reference failed to encode")]
-    Encode(#[source] MsgPackEncodeError),
 }
 
 #[cfg(test)]
