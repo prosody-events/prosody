@@ -9,17 +9,19 @@
 //! [`Router::shutdown`] to wait for teardown.
 
 mod backend;
-mod router;
+pub(crate) mod requester;
+pub(crate) mod response;
+pub(crate) mod router;
 pub(crate) mod runtime;
 
 #[cfg(test)]
 pub(crate) use backend::PeerBackend;
 
-pub use crate::requester::{ProsodyRequester, RequestError, ResponseError};
-pub use crate::router::config::{
+pub use requester::{ProsodyRequester, RequestError, ResponseError};
+pub use router::api::{GrpcRouter, LocalRouter, Router};
+pub use router::config::{
     PeerConfiguration, PeerConfigurationBuilder, PeerConfigurationBuilderError,
 };
-pub use router::{GrpcRouter, LocalRouter, Router};
 pub use runtime::ProducerHandle;
 
 use crate::heartbeat::HeartbeatRegistry;

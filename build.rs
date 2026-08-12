@@ -31,18 +31,18 @@ fn main() -> Result<()> {
         // the frame is an extern type and the codec is ours. The client is
         // hand-written too: it encodes bytes the responder already framed.
         .build_client(false)
-        .codec_path("crate::router::grpc::codec::ServerFrameCodec")
+        .codec_path("crate::peer::router::grpc::codec::ServerFrameCodec")
         .extern_path(
             ".prosody.peer.v1.DeliverResultRequest",
-            "crate::response::frame::ResponseFrame",
+            "crate::peer::response::frame::ResponseFrame",
         )
         .extern_path(
             ".prosody.peer.v1.ResponseSuccess",
-            "crate::response::frame::ResponseSuccess",
+            "crate::peer::response::frame::ResponseSuccess",
         )
         .extern_path(
             ".prosody.peer.v1.HandlerError",
-            "crate::response::frame::HandlerError",
+            "crate::peer::response::frame::HandlerError",
         )
         .extern_path(
             ".prosody.peer.v1.ErrorCategory",

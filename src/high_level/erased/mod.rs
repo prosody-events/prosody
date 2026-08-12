@@ -8,8 +8,8 @@ use crate::high_level::{
     CassandraHighLevelClient, ClientBackend, ClientHandler, ConsumerBuilders, HighLevelClient,
     HighLevelClientError, MemoryHighLevelClient, Mode, Wire, WireError,
 };
+use crate::peer::requester::{RequestError, ResponseError};
 use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder};
-use crate::requester::{RequestError, ResponseError};
 use crate::state_reader::ConsumerReaderBackend;
 use crate::subsystem::SubsystemName;
 use crate::{EventIdentity, EventType, Topic};

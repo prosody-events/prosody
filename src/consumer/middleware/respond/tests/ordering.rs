@@ -9,7 +9,7 @@ use crate::consumer::middleware::settle::settle;
 use crate::consumer::middleware::tests::test_support::{
     GatedGuard, ScriptedHandler, buffered, committed_value, is_provisional,
 };
-use crate::router::loopback::paused;
+use crate::peer::router::loopback::paused;
 use color_eyre::eyre::bail;
 use color_eyre::{Report, Result};
 use std::sync::Arc;

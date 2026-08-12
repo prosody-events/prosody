@@ -9,8 +9,8 @@ use crate::consumer::middleware::tests::test_support::{
 };
 use crate::consumer::{DemandType, EventHandler};
 use crate::error::ErrorCategory;
-use crate::response::frame::{FrameResult, HandlerError, decode::decode_frame};
-use crate::router::loopback::{Delivery, paused};
+use crate::peer::response::frame::{FrameResult, HandlerError, decode::decode_frame};
+use crate::peer::router::loopback::{Delivery, paused};
 use color_eyre::Report;
 use color_eyre::Result;
 use quickcheck::{Arbitrary, Gen, QuickCheck};

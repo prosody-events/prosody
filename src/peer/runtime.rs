@@ -7,19 +7,19 @@ use crate::consumer::{ConsumerError, PeerInitError, ShutdownError};
 #[cfg(test)]
 use crate::peer::PeerBackend;
 use crate::peer::heartbeat_registry;
-use crate::producer::ProsodyProducer;
-use crate::requester::ProsodyRequester;
-use crate::response::sender::{ResponseRoute, Then};
+use crate::peer::requester::ProsodyRequester;
+use crate::peer::response::sender::{ResponseRoute, Then};
 #[cfg(test)]
-use crate::router::PeerId;
-use crate::router::config::PeerParts;
-use crate::router::directory::PeerDirectory;
-use crate::router::grpc::BoundListener;
-use crate::router::grpc::client::GrpcSender;
-use crate::router::runtime::{
+use crate::peer::router::PeerId;
+use crate::peer::router::config::PeerParts;
+use crate::peer::router::directory::PeerDirectory;
+use crate::peer::router::grpc::BoundListener;
+use crate::peer::router::grpc::client::GrpcSender;
+use crate::peer::router::runtime::{
     LocalPeerRuntime, PeerInputs, PeerRuntime, PreparedLocalPeerRuntime, PreparedPeerRuntime,
 };
-use crate::router::{LocalTarget, NetworkRoute};
+use crate::peer::router::{LocalTarget, NetworkRoute};
+use crate::producer::ProsodyProducer;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -27,8 +27,8 @@ use tokio::task::JoinHandle;
 use tracing::error;
 
 mod local_route {
-    use crate::response::sender::{ResponseRoute, Then};
-    use crate::router::LocalTarget;
+    use crate::peer::response::sender::{ResponseRoute, Then};
+    use crate::peer::router::LocalTarget;
 
     pub trait Sealed {}
 

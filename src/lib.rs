@@ -56,9 +56,11 @@ pub mod peer;
 pub mod prelude;
 pub mod producer;
 pub mod propagator;
-pub mod requester;
-mod response;
-mod router;
+pub mod requester {
+    //! Peer request types.
+
+    pub use crate::peer::{ProsodyRequester, RequestError, ResponseError};
+}
 mod segment;
 mod size;
 pub mod state;

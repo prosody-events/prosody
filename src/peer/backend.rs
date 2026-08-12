@@ -5,13 +5,13 @@ use crate::cassandra::CassandraStore;
 use crate::codec::Codec;
 use crate::consumer::{ConsumerError, PeerInitError};
 use crate::peer::PeerConfiguration;
+use crate::peer::router::directory::cassandra::CassandraPeerDirectory;
+#[cfg(test)]
+use crate::peer::router::runtime::PreparedLocalPeerRuntime;
+use crate::peer::router::runtime::PreparedPeerRuntime;
 use crate::peer::runtime::prepare_network;
 #[cfg(test)]
 use crate::peer::runtime::{PreparedRuntime, prepare_local};
-use crate::router::directory::cassandra::CassandraPeerDirectory;
-#[cfg(test)]
-use crate::router::runtime::PreparedLocalPeerRuntime;
-use crate::router::runtime::PreparedPeerRuntime;
 #[cfg(test)]
 use crate::state_reader::{CassandraReaderBackend, MemoryReaderBackend};
 

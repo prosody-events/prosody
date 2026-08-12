@@ -20,7 +20,7 @@ use tracing::{Span, debug};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::{Keyed, Uncommitted};
-use crate::response::headers::ResultRequest;
+use crate::peer::response::headers::ResultRequest;
 use crate::timers::PendingTimer;
 use crate::timers::store::TriggerStore;
 use crate::{EventIdentity, Key, Offset, Partition, ProcessScope, SourceSystem, Topic};

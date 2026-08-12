@@ -26,7 +26,7 @@ use tracing::error;
 use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::ConsumerMessageValue;
-use crate::response::headers::{ResultRequest, parse_result_request};
+use crate::peer::response::headers::{ResultRequest, parse_result_request};
 use crate::subsystem::SubsystemName;
 use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
@@ -191,7 +191,8 @@ fn extract_source_system(message: &BorrowedMessage) -> Option<SourceSystem> {
 /// no requests.
 ///
 /// An unusable header set is counted and dropped, never failed.
-/// [`HeaderRejection`](crate::response::headers::HeaderRejection) states why.
+/// [`HeaderRejection`](crate::peer::response::headers::HeaderRejection) states
+/// why.
 impl ResultRequestReader for IgnoreRequests {
     fn request(&self, _message: &BorrowedMessage) -> Option<ResultRequest> {
         None

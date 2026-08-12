@@ -8,12 +8,12 @@ use super::{
     HeartbeatRegistry, JsonCodec, KafkaLoader, LoaderConfiguration, Offset, Topic, loader_config,
     producer, with_topic,
 };
-use crate::response::RequestId;
-use crate::response::headers::{
+use crate::peer::response::RequestId;
+use crate::peer::response::headers::{
     RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER, RESPONSE_PEER_HEADER,
     RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline, ResultRequest,
 };
-use crate::router::PeerId;
+use crate::peer::router::PeerId;
 use crate::subsystem::SubsystemName;
 use crate::tracing::init_test_logging;
 use rdkafka::message::{Header, OwnedHeaders};

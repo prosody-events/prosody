@@ -8,7 +8,7 @@ use crate::consumer::middleware::tests::test_support::{
     MockEventContext, ScriptedHandler, ScriptedHook,
 };
 use crate::consumer::{DemandType, EventHandler};
-use crate::router::loopback::{Script, UNPUBLISHED_PEER, paused};
+use crate::peer::router::loopback::{Script, UNPUBLISHED_PEER, paused};
 use color_eyre::Result;
 use std::sync::Arc;
 use tokio::sync::Semaphore;

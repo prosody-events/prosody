@@ -9,10 +9,10 @@ use crate::consumer::middleware::tests::test_support::{
 use crate::consumer::middleware::{Settlement, SettlementHandler};
 use crate::consumer::{DemandType, EventHandler};
 use crate::error::ErrorCategory;
-use crate::response::RequestId;
-use crate::response::frame::decode::decode_frame;
-use crate::response::frame::{FrameResult, HandlerError};
-use crate::router::loopback::{TestRouter, paused, peer};
+use crate::peer::response::RequestId;
+use crate::peer::response::frame::decode::decode_frame;
+use crate::peer::response::frame::{FrameResult, HandlerError};
+use crate::peer::router::loopback::{TestRouter, paused, peer};
 use color_eyre::Result;
 
 /// The request reaches the wire from the error arm and the success arm.
