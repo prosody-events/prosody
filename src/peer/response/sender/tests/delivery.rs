@@ -2,8 +2,8 @@
 
 use super::{Harness, PAYLOAD, paused, peer};
 use crate::Codec;
-use crate::peer::response::frame::decode::decode_frame;
 use crate::peer::response::frame::tests::CountingCodec;
+use crate::peer::response::frame::tests::decode_frame;
 use crate::peer::response::frame::{FrameResult, ResponseSuccess};
 use crate::peer::router::loopback::direct_uri;
 use color_eyre::Result;

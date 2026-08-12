@@ -2,8 +2,7 @@
 //!
 //! `protoc` must be on `PATH` — see the build prerequisites in `README.md`.
 //! The generated descriptor set is written beside the generated code. gRPC
-//! reflection embeds that set to publish the schema. The tests read it to check
-//! the hand-written frame codec against the `.proto` it must agree with.
+//! reflection embeds that set to publish the same schema.
 
 use std::env::var;
 use std::io::{Error, Result};
@@ -27,27 +26,10 @@ fn main() -> Result<()> {
     let out_dir = PathBuf::from(var("OUT_DIR").map_err(Error::other)?);
     tonic_prost_build::configure()
         .file_descriptor_set_path(out_dir.join("peer_descriptor.bin"))
-        // The hand-written frame decoder enforces rules prost cannot state, so
-        // the frame is an extern type and the codec is ours. The client is
-        // hand-written too: it encodes bytes the responder already framed.
+        // Keep every wire byte as a slice of Tonic's receive allocation.
+        .bytes(".prosody.peer.v1")
         .build_client(false)
         .codec_path("crate::peer::router::grpc::codec::ServerFrameCodec")
-        .extern_path(
-            ".prosody.peer.v1.DeliverResultRequest",
-            "crate::peer::response::frame::ResponseFrame",
-        )
-        .extern_path(
-            ".prosody.peer.v1.ResponseSuccess",
-            "crate::peer::response::frame::ResponseSuccess",
-        )
-        .extern_path(
-            ".prosody.peer.v1.HandlerError",
-            "crate::peer::response::frame::HandlerError",
-        )
-        .extern_path(
-            ".prosody.peer.v1.ErrorCategory",
-            "crate::error::ErrorCategory",
-        )
         .extern_path(".prosody.peer.v1.DeliverResultResponse", "()")
         .server_mod_attribute(".", GENERATED_LINTS)
         .compile_protos(&["proto/prosody/peer/v1/peer.proto"], &["proto"])

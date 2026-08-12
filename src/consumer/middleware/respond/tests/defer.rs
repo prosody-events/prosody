@@ -26,7 +26,7 @@ use crate::loader::MessageLoader;
 use crate::otel::SpanRelation;
 use crate::peer::response::RequestId;
 use crate::peer::response::frame::FrameResult;
-use crate::peer::response::frame::decode::decode_frame;
+use crate::peer::response::frame::tests::decode_frame;
 use crate::peer::router::loopback::{TestRouter, paused, peer};
 use crate::related_span;
 use crate::telemetry::Telemetry;

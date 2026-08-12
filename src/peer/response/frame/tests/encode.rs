@@ -1,7 +1,7 @@
+use super::decode_frame;
 use super::{CountingCodec, cache_uses, header, serialize_capacity, success};
 use crate::codec::SerializeBufGuard;
 use crate::error::ErrorCategory;
-use crate::peer::response::frame::decode::decode_frame;
 use crate::peer::response::frame::encode::{Forwarded, stage_error, stage_success};
 use crate::peer::response::frame::{FrameResult, HandlerError};
 use crate::peer::router::{Framed, PeerId};

@@ -20,14 +20,14 @@ enum ErrorCategory {
 
 // A successful handler result encoded with the user's response codec.
 message ResponseSuccess {
-  string format = 1; // the response Codec::FORMAT_ID
+  bytes format = 1; // UTF-8 response `Codec::FORMAT_ID`
   bytes payload = 2;
 }
 
 // A handler failure encoded by Prosody.
 message HandlerError {
   ErrorCategory category = 1;
-  string message = 2;
+  bytes message = 2; // UTF-8 display text
 }
 
 // One handler result, addressed to the peer that is waiting for it.
@@ -36,7 +36,7 @@ message DeliverResultRequest {
   // frame or rejects it, and never accepts it.
   bytes target_peer = 1; // 16 bytes
   bytes request_id = 2; // 16 bytes
-  string subsystem = 3;
+  bytes subsystem = 3; // UTF-8 subsystem name
   // Exactly one arm reports the handler result.
   oneof result {
     ResponseSuccess success = 4;

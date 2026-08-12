@@ -1,11 +1,12 @@
+use super::decode_frame;
 use super::{CountingCodec, header};
 use crate::codec::Codec;
 use crate::error::ErrorCategory;
-use crate::peer::response::frame::decode::{FrameDecodeError, decode_frame};
+use crate::peer::response::frame::decode::FrameDecodeError;
 use crate::peer::response::frame::encode::{stage_error, stage_success};
 use crate::peer::response::frame::{
     FIELD_ERROR_CATEGORY, FIELD_HANDLER_ERROR, FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_SUCCESS,
-    FIELD_SUCCESS_FORMAT, FIELD_TARGET_PEER,
+    FIELD_SUCCESS_FORMAT, FIELD_SUCCESS_PAYLOAD, FIELD_TARGET_PEER,
 };
 use crate::peer::response::{
     RequestId,
@@ -94,7 +95,7 @@ fn a_frame_requires_exactly_one_result_arm() {
 }
 
 #[test]
-fn malformed_result_fields_are_refused() -> Result<()> {
+fn protobuf_merge_semantics_are_preserved() -> Result<()> {
     let header = header("billing", None)?;
     let staged = stage_success::<CountingCodec>(&header, &b"hi".to_vec())?;
     let mut valid = BytesMut::with_capacity(staged.bytes());
@@ -108,18 +109,38 @@ fn malformed_result_fields_are_refused() -> Result<()> {
         &mut handler,
     );
     raw_bytes(FIELD_HANDLER_ERROR, &handler, &mut repeated);
+    raw_bytes(FIELD_TARGET_PEER, &[0x33; 16], &mut repeated);
+    let decoded = decode_frame(&mut repeated)?;
+    assert_eq!(decoded.header.target, PeerId::from_bytes([0x33; 16]));
     assert!(matches!(
-        decode_frame(&mut repeated),
-        Err(FrameDecodeError::RepeatedField(_))
+        decoded.result,
+        FrameResult::HandlerError(HandlerError {
+            category: ErrorCategory::Permanent,
+            ..
+        })
     ));
 
-    let mut truncated = valid;
-    truncated.truncate(truncated.len() - 1);
+    let mut merged = raw_header();
+    let mut format = BytesMut::new();
+    raw_bytes(
+        FIELD_SUCCESS_FORMAT,
+        CountingCodec::FORMAT_ID.as_bytes(),
+        &mut format,
+    );
+    raw_bytes(FIELD_SUCCESS, &format, &mut merged);
+    let mut payload = BytesMut::new();
+    raw_bytes(FIELD_SUCCESS_PAYLOAD, b"merged", &mut payload);
+    raw_bytes(FIELD_SUCCESS, &payload, &mut merged);
     assert!(matches!(
-        decode_frame(&mut truncated),
-        Err(FrameDecodeError::Truncated { .. } | FrameDecodeError::Protobuf(_))
+        decode_frame(&mut merged)?.result,
+        FrameResult::Success(ResponseSuccess { payload, .. }) if payload == b"merged"[..]
     ));
 
+    Ok(())
+}
+
+#[test]
+fn invalid_domain_fields_are_refused() {
     let mut invalid_text = raw_header();
     let mut success = BytesMut::new();
     raw_bytes(FIELD_SUCCESS_FORMAT, &[0xff], &mut success);
@@ -137,7 +158,6 @@ fn malformed_result_fields_are_refused() -> Result<()> {
         decode_frame(&mut unknown_category),
         Err(FrameDecodeError::UnknownCategory(_))
     ));
-    Ok(())
 }
 
 fn raw_header() -> BytesMut {
@@ -160,7 +180,7 @@ fn raw_bytes(tag: u32, value: &[u8], wire: &mut BytesMut) {
 }
 
 #[test]
-fn the_schema_models_results_as_oneof() -> Result<()> {
+fn the_schema_matches_the_frame_contract() -> Result<()> {
     let set = FileDescriptorSet::decode(DESCRIPTOR)?;
     let Some(file) = set
         .file
@@ -176,6 +196,19 @@ fn the_schema_models_results_as_oneof() -> Result<()> {
     else {
         bail!("the peer schema must define DeliverResultRequest");
     };
+    let routing_fields = [
+        ("target_peer", 1_i32),
+        ("request_id", 2_i32),
+        ("subsystem", 3_i32),
+        ("relay_peer", 6_i32),
+    ];
+    for (name, number) in routing_fields {
+        let Some(field) = message.field.iter().find(|field| field.name() == name) else {
+            bail!("DeliverResultRequest must define {name}");
+        };
+        assert_eq!(field.number(), number);
+        assert_eq!(field.r#type(), Type::Bytes);
+    }
     let Some(oneof) = message.oneof_decl.first() else {
         bail!("DeliverResultRequest must define its result oneof");
     };
@@ -193,8 +226,20 @@ fn the_schema_models_results_as_oneof() -> Result<()> {
         assert_eq!(field.oneof_index(), 0_i32);
     }
     let expected_messages = [
-        ("ResponseSuccess", [("format", 1_i32), ("payload", 2_i32)]),
-        ("HandlerError", [("category", 1_i32), ("message", 2_i32)]),
+        (
+            "ResponseSuccess",
+            [
+                ("format", 1_i32, Type::Bytes),
+                ("payload", 2_i32, Type::Bytes),
+            ],
+        ),
+        (
+            "HandlerError",
+            [
+                ("category", 1_i32, Type::Enum),
+                ("message", 2_i32, Type::Bytes),
+            ],
+        ),
     ];
     for (name, fields) in expected_messages {
         let Some(message) = file
@@ -204,7 +249,7 @@ fn the_schema_models_results_as_oneof() -> Result<()> {
         else {
             bail!("the peer schema must define {name}");
         };
-        for (field_name, number) in fields {
+        for (field_name, number, kind) in fields {
             let Some(field) = message
                 .field
                 .iter()
@@ -213,6 +258,7 @@ fn the_schema_models_results_as_oneof() -> Result<()> {
                 bail!("{name} must define {field_name}");
             };
             assert_eq!(field.number(), number);
+            assert_eq!(field.r#type(), kind);
         }
     }
     Ok(())

@@ -9,7 +9,8 @@ use crate::consumer::middleware::tests::test_support::{
 };
 use crate::consumer::{DemandType, EventHandler};
 use crate::error::ErrorCategory;
-use crate::peer::response::frame::{FrameResult, HandlerError, decode::decode_frame};
+use crate::peer::response::frame::tests::decode_frame;
+use crate::peer::response::frame::{FrameResult, HandlerError};
 use crate::peer::router::loopback::{Delivery, paused};
 use color_eyre::Report;
 use color_eyre::Result;

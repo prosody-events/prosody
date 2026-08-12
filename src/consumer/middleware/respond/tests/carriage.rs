@@ -10,7 +10,7 @@ use crate::consumer::middleware::{Settlement, SettlementHandler};
 use crate::consumer::{DemandType, EventHandler};
 use crate::error::ErrorCategory;
 use crate::peer::response::RequestId;
-use crate::peer::response::frame::decode::decode_frame;
+use crate::peer::response::frame::tests::decode_frame;
 use crate::peer::response::frame::{FrameResult, HandlerError};
 use crate::peer::router::loopback::{TestRouter, paused, peer};
 use color_eyre::Result;

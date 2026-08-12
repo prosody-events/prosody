@@ -1,15 +1,49 @@
-use super::{FrameHeader, FrameResult, ResponseSuccess};
+use super::decode::FrameDecodeError;
+use super::{FrameHeader, FrameResult, ResponseFrame, ResponseSuccess};
 use crate::codec::Codec;
 use crate::peer::response::RequestId;
 use crate::peer::router::PeerId;
+use crate::peer::router::grpc::generated::{
+    DeliverResultRequest, HandlerError as WireHandlerError, ResponseSuccess as WireSuccess,
+    deliver_result_request::Result as WireResult,
+};
 use crate::subsystem::SubsystemName;
-use bytes::BytesMut;
+use bytes::{Buf, Bytes, BytesMut};
 use color_eyre::Result;
+use prost::Message;
 use std::cell::Cell;
 use std::convert::Infallible;
 
 mod decode;
 mod encode;
+
+pub(crate) fn decode_frame<B: Buf>(src: &mut B) -> Result<ResponseFrame, FrameDecodeError> {
+    DeliverResultRequest::decode(src)?.try_into()
+}
+
+impl From<ResponseFrame> for DeliverResultRequest {
+    fn from(frame: ResponseFrame) -> Self {
+        let result = Some(match frame.result {
+            FrameResult::Success(success) => WireResult::Success(WireSuccess {
+                format: Bytes::copy_from_slice(success.format.as_bytes()),
+                payload: success.payload,
+            }),
+            FrameResult::HandlerError(error) => WireResult::HandlerError(WireHandlerError {
+                category: i32::from(error.category),
+                message: error.message,
+            }),
+        });
+        Self {
+            target_peer: Bytes::copy_from_slice(&frame.header.target.into_bytes()),
+            request_id: Bytes::copy_from_slice(&frame.header.request.into_bytes()),
+            subsystem: Bytes::copy_from_slice(frame.header.subsystem.as_str().as_bytes()),
+            result,
+            relay_peer: frame.header.relay.map_or_else(Bytes::new, |peer| {
+                Bytes::copy_from_slice(&peer.into_bytes())
+            }),
+        }
+    }
+}
 
 thread_local! {
     static CACHE_USES: Cell<usize> = const { Cell::new(0) };

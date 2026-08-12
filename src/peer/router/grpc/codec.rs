@@ -1,19 +1,17 @@
 //! What the peer method puts on the wire, and what it reads back off it.
 //!
-//! The frame is encoded and decoded by the response layer's own writer and
-//! reader, not by a generated protobuf message. That is the point of a codec
-//! here: the reader enforces rules a `.proto` cannot state — one occurrence per
-//! field, no field whose proto3 default is illegal, bounded strings, and a
-//! payload slice from Tonic's receive storage.
+//! The response layer writes the frame. Prost decodes the generated request
+//! type. Prosody then validates the domain rules that the schema cannot state.
 //!
 //! The two directions are deliberately asymmetric. The client writes an owned
 //! frame into Tonic's final buffer. The server decodes that frame and returns
 //! no response body.
 
-use crate::peer::response::frame::ResponseFrame;
-use crate::peer::response::frame::decode::{FrameDecodeError, decode_frame};
+use super::generated::DeliverResultRequest;
+use crate::peer::response::frame::decode::FrameDecodeError;
 use crate::peer::router::Framed;
 use bytes::Buf;
+use prost::Message;
 use std::marker::PhantomData;
 use tonic::Status;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
@@ -49,7 +47,7 @@ impl<F> Clone for ClientFrameCodec<F> {
 impl<F> Copy for ClientFrameCodec<F> {}
 
 impl Codec for ServerFrameCodec {
-    type Decode = ResponseFrame;
+    type Decode = DeliverResultRequest;
     type Decoder = Self;
     type Encode = ();
     type Encoder = Self;
@@ -83,19 +81,20 @@ impl Encoder for ServerFrameCodec {
 
 impl Decoder for ServerFrameCodec {
     type Error = Status;
-    type Item = ResponseFrame;
+    type Item = DeliverResultRequest;
 
     /// Reads one frame, and counts what it refuses.
     ///
     /// This direction keeps tonic's own receive buffer, which grows to the
     /// message once and frees it with the call.
-    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<ResponseFrame>, Status> {
-        match decode_frame(src) {
+    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<DeliverResultRequest>, Status> {
+        match DeliverResultRequest::decode(src) {
             Ok(frame) => Ok(Some(frame)),
             Err(error) => {
+                let error = FrameDecodeError::from(error);
                 // The only record of why: the status carries a literal, so the
                 // detail the `Display` form names stays on this peer.
-                warn!(%error, "peer frame could not be read");
+                warn!(%error, "peer frame is not valid protobuf");
                 Err(refusal(&error))
             }
         }
@@ -179,17 +178,6 @@ impl<F> Decoder for ClientFrameCodec<F> {
 /// because this port is unauthenticated: a formatted status would allocate per
 /// refused frame at a rate the sender chooses, and would echo back the lengths
 /// that sender claimed.
-fn refusal(error: &FrameDecodeError) -> Status {
-    match error {
-        FrameDecodeError::Truncated { .. }
-        | FrameDecodeError::MissingField(_)
-        | FrameDecodeError::RepeatedField(_)
-        | FrameDecodeError::MalformedId { .. }
-        | FrameDecodeError::StringTooLong { .. }
-        | FrameDecodeError::CategoryTooWide(_)
-        | FrameDecodeError::UnknownCategory(_)
-        | FrameDecodeError::InvalidText(_)
-        | FrameDecodeError::InvalidSubsystem(_)
-        | FrameDecodeError::Protobuf(_) => Status::invalid_argument(error.message()),
-    }
+pub(super) fn refusal(error: &FrameDecodeError) -> Status {
+    Status::invalid_argument(error.message())
 }

@@ -117,7 +117,7 @@ impl Process {
     /// `granted` is the budget the caller states, exactly as a caller over a
     /// socket states it.
     pub(super) async fn deliver(&self, frame: ResponseFrame, granted: Duration) -> Result<Code> {
-        let mut request = Request::new(frame);
+        let mut request = Request::new(frame.into());
         request.set_timeout(granted);
         Ok(match self.service.deliver_result(request).await {
             Ok(_) => Code::Ok,

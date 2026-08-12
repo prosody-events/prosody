@@ -1,7 +1,9 @@
 //! The peer method: what one process does with a response frame another
 //! process sent it.
 
+use super::codec::refusal;
 use super::deadline::inbound_deadline;
+use super::generated::DeliverResultRequest;
 use super::generated::peer_service_server::PeerService as PeerServiceApi;
 use super::inject::MetadataExtractor;
 use super::telemetry::{METHOD, record_status};
@@ -49,7 +51,7 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
     /// to.
     async fn deliver_result(
         &self,
-        request: Request<ResponseFrame>,
+        request: Request<DeliverResultRequest>,
     ) -> Result<Response<()>, Status> {
         // Hand-built rather than `#[instrument]`: the span relates to a context
         // this call carried, which the attribute cannot express. Every record
@@ -90,7 +92,11 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
             "peer.deadline_ms",
             i64::try_from(remaining_ms).unwrap_or(i64::MAX),
         );
-        let frame = request.into_inner();
+        let frame: ResponseFrame = request.into_inner().try_into().map_err(|error| {
+            record_status(&span, Code::InvalidArgument);
+            span.in_scope(|| error!(%error, "peer frame is invalid"));
+            refusal(&error)
+        })?;
         async {
             span.record("peer.request", display(frame.header.request));
             span.record("peer.subsystem", display(&frame.header.subsystem));

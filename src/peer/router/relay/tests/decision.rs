@@ -1,7 +1,7 @@
 //! Which process a frame is accepted by, forwarded by, or refused by.
 
 use super::{BUDGET, Process, THIS, frame};
-use crate::peer::response::frame::decode::decode_frame;
+use crate::peer::response::frame::tests::decode_frame;
 use crate::peer::router::loopback::{direct_uri, paused, peer};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
