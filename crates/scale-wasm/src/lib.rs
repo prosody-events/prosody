@@ -2,8 +2,7 @@
 
 use prosody_scale_core::{
     CapacityGrid, Cohort, Configuration, DemandClass, ModelTime, ObservationBuffer,
-    ReliabilityPrior, ScaleDecision, ScaleScratch, ScaleState, ServiceObjective, TransitionPrior,
-    step,
+    ReliabilityPrior, ScaleDecision, ScaleState, ServiceObjective, TransitionPrior, step,
 };
 
 #[cfg(all(target_arch = "wasm32", feature = "threads"))]
@@ -18,7 +17,7 @@ const ERROR_CODE: u64 = u64::MAX;
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 #[must_use]
 pub fn fixture_decision(offered_events: u32) -> u64 {
-    let Ok(objective) = ServiceObjective::new(1_000_000, 0.01_f64) else {
+    let Ok(objective) = ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64) else {
         return ERROR_CODE;
     };
     let configuration = Configuration {
@@ -47,7 +46,7 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
     let Ok(mut state) = ScaleState::new(configuration.clone(), grid) else {
         return ERROR_CODE;
     };
-    let Ok(mut scratch) = ScaleScratch::new(&configuration) else {
+    let Ok(mut scratch) = state.new_scratch() else {
         return ERROR_CODE;
     };
     let Ok(mut observation) = ObservationBuffer::new(&configuration) else {

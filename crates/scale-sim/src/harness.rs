@@ -417,6 +417,7 @@ pub struct TickHistory {
     handler_occupancy_micros: Vec<u64>,
     useful_completions: Vec<u32>,
     completed_attempts: Vec<u32>,
+    started_attempts: Vec<u32>,
     rebalance_pause_micros: Vec<u64>,
     normal_attempts: Vec<u32>,
     normal_successes: Vec<u32>,
@@ -479,6 +480,7 @@ impl TickHistory {
             handler_occupancy_micros: vec![0; capacity],
             useful_completions: vec![0; capacity],
             completed_attempts: vec![0; capacity],
+            started_attempts: vec![0; capacity],
             rebalance_pause_micros: vec![0; capacity],
             normal_attempts: vec![0; capacity],
             normal_successes: vec![0; capacity],
@@ -524,6 +526,7 @@ impl TickHistory {
         self.handler_occupancy_micros[index] = plant.handler_occupancy_micros;
         self.useful_completions[index] = plant.useful_completions;
         self.completed_attempts[index] = plant.completed_attempts;
+        self.started_attempts[index] = plant.started_attempts;
         self.rebalance_pause_micros[index] = plant.rebalance_pause_micros;
         self.normal_attempts[index] = plant.normal_attempts;
         self.normal_successes[index] = plant.normal_successes;
@@ -645,6 +648,13 @@ impl<'a> TickHistoryView<'a> {
     pub fn completed_attempts(self, steps_back: usize) -> Option<u32> {
         self.index(steps_back)
             .map(|index| self.history.completed_attempts[index])
+    }
+
+    /// Returns cumulative started attempts for one newest-first offset.
+    #[must_use]
+    pub fn started_attempts(self, steps_back: usize) -> Option<u32> {
+        self.index(steps_back)
+            .map(|index| self.history.started_attempts[index])
     }
 
     /// Returns cumulative rebalance pause time for one newest-first offset.

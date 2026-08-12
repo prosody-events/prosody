@@ -4,7 +4,7 @@ use std::time::Duration;
 use prosody_scale_core::{
     CapacityGrid, CapacityGridError, Cohort, Configuration, ConfigurationError, DemandClass,
     ModelTime, ObservationBuffer, ObservationError, RandomStream, ReliabilityPrior, ScaleDecision,
-    ScaleScratch, ScaleState, ServiceObjective, TransitionPrior, step,
+    ScaleState, ServiceObjective, TransitionPrior, step,
 };
 use thiserror::Error;
 
@@ -97,14 +97,14 @@ pub fn run_batch_slo_with_inputs(
     epsilon: f64,
     inputs: &BatchInputs,
 ) -> Result<BatchSloSummary, BatchSloError> {
-    let objective = ServiceObjective::new(budget_micros, epsilon)?;
+    let objective = ServiceObjective::new(budget_micros, epsilon, 3.0_f64)?;
     let configuration = Configuration {
         cohort_count_max: PARTITION_COUNT,
         calendar_segment_count_max: PARTITION_COUNT,
         partition_count: PARTITION_COUNT,
         replica_count_max: REPLICA_COUNT_MAX,
         slots_per_replica: DEFAULT_CONCURRENCY_PER_REPLICA,
-        posterior_sample_count: 1_024,
+        posterior_sample_count: 4_096,
         report_interval_micros: budget_micros,
         failure_service_weight: 0.3_f64,
         arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
@@ -120,7 +120,7 @@ pub fn run_batch_slo_with_inputs(
         &[0.0_f64],
     )?;
     let mut state = ScaleState::new(configuration.clone(), grid)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     let mut partition_events = [0_u32; PARTITION_COUNT as usize];
     for event_index in 0..EVENT_COUNT {

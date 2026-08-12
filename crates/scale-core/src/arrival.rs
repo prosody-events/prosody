@@ -107,6 +107,10 @@ impl ArrivalPrior {
     pub(crate) const fn path_segment_count_max(self) -> usize {
         self.run_length_max
     }
+
+    pub(crate) const fn shape(self) -> f64 {
+        self.shape
+    }
 }
 
 /// One consumable count and exposure update.

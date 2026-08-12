@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use quickcheck_macros::quickcheck;
 
 use super::{ActionColumns, complete_horizon_micros, replica_seconds, select_action};
 
@@ -21,95 +21,73 @@ fn complete_horizon_covers_the_latest_known_boundary_and_one_budget() {
     );
 }
 #[test]
-fn action_selection_applies_the_chance_constraint_before_loss() {
+fn action_selection_uses_the_lowest_total_cost() {
     let columns = ActionColumns {
-        violation_weight_sums: &[10.0_f64, 6.0_f64, 0.0_f64],
-        excess_delay_sums: &[0.0_f64, 10.0_f64, 1.0_f64],
-        replica_seconds_sums: &[1.0_f64, 3.0_f64, 2.0_f64],
+        late_area_sums: &[12.0_f64, 1.0_f64, 4.0_f64],
+        replica_seconds_sums: &[1.0_f64, 5.0_f64, 2.0_f64],
+        rate: 3.0_f64,
         demand_floor: 0,
-        scenario_weight_sum: 100.0_f64,
-        slo_violation_probability: 0.05_f64,
     };
 
     assert_eq!(select_action(&columns), 2);
 }
 
 #[test]
-fn action_selection_uses_the_best_attainable_violation_rate() {
+fn action_selection_uses_the_smallest_index_for_an_exact_cost_tie() {
     let columns = ActionColumns {
-        violation_weight_sums: &[20.0_f64, 10.5_f64, 10.0_f64],
-        excess_delay_sums: &[0.0_f64, 0.0_f64, 10.0_f64],
-        replica_seconds_sums: &[1.0_f64, 2.0_f64, 3.0_f64],
+        late_area_sums: &[3.0_f64, 0.0_f64, 6.0_f64],
+        replica_seconds_sums: &[1.0_f64, 2.0_f64, 0.0_f64],
+        rate: 3.0_f64,
         demand_floor: 0,
-        scenario_weight_sum: 100.0_f64,
-        slo_violation_probability: 0.01_f64,
-    };
-
-    assert_eq!(select_action(&columns), 2);
-}
-
-#[test]
-fn action_selection_resolves_equal_loss_to_the_smallest_target() {
-    let columns = ActionColumns {
-        violation_weight_sums: &[2.0_f64; 3],
-        excess_delay_sums: &[1.0_f64; 3],
-        replica_seconds_sums: &[1.0_f64; 3],
-        demand_floor: 0,
-        scenario_weight_sum: 100.0_f64,
-        slo_violation_probability: 0.01_f64,
     };
 
     assert_eq!(select_action(&columns), 0);
 }
 
 #[test]
-fn action_selection_uses_replica_seconds_after_equal_loss() {
-    let columns = ActionColumns {
-        violation_weight_sums: &[2.0_f64; 3],
-        excess_delay_sums: &[1.0_f64; 3],
-        replica_seconds_sums: &[3.0_f64, 1.0_f64, 2.0_f64],
-        demand_floor: 0,
-        scenario_weight_sum: 100.0_f64,
-        slo_violation_probability: 0.01_f64,
-    };
-
-    assert_eq!(select_action(&columns), 1);
-}
-
-#[test]
 fn the_demand_floor_excludes_actions_a_repair_overrides() {
     let columns = ActionColumns {
-        violation_weight_sums: &[0.0_f64; 3],
-        excess_delay_sums: &[0.0_f64; 3],
-        replica_seconds_sums: &[1.0_f64, 2.0_f64, 3.0_f64],
+        late_area_sums: &[0.0_f64, 10.0_f64, 20.0_f64],
+        replica_seconds_sums: &[0.0_f64; 3],
+        rate: 3.0_f64,
         demand_floor: 1,
-        scenario_weight_sum: 100.0_f64,
-        slo_violation_probability: 0.01_f64,
     };
 
-    // Every action misses nothing, but the first action cannot serve the
-    // known arrival rate. The floor keeps replica-seconds from selecting
-    // an action the repair policy would immediately override.
     assert_eq!(select_action(&columns), 1);
 }
 
-#[test]
-fn infeasible_actions_order_by_excess_delay() {
+#[quickcheck]
+fn action_selection_is_the_cost_argmin_above_the_floor(
+    late_codes: Vec<u16>,
+    replica_codes: Vec<u16>,
+    floor_code: u8,
+    rate_code: u8,
+) -> bool {
+    let count = late_codes.len().min(replica_codes.len()).max(1);
+    let mut late_area_sums = vec![0.0_f64; count];
+    let mut replica_seconds_sums = vec![0.0_f64; count];
+    for index in 0..late_codes.len().min(replica_codes.len()) {
+        late_area_sums[index] = f64::from(late_codes[index]);
+        replica_seconds_sums[index] = f64::from(replica_codes[index]);
+    }
+    let demand_floor = usize::from(floor_code) % count;
+    let rate = f64::from(rate_code) + 1.0_f64;
     let columns = ActionColumns {
-        violation_weight_sums: &[20.0_f64, 10.0_f64],
-        excess_delay_sums: &[3.0_f64, 1.0_f64],
-        replica_seconds_sums: &[1.0_f64, 3.0_f64],
-        demand_floor: 0,
-        scenario_weight_sum: 100.0_f64,
-        slo_violation_probability: 0.01_f64,
+        late_area_sums: &late_area_sums,
+        replica_seconds_sums: &replica_seconds_sums,
+        rate,
+        demand_floor,
     };
+    let expected = (demand_floor..count)
+        .min_by(|left, right| {
+            columns
+                .cost(*left)
+                .total_cmp(&columns.cost(*right))
+                .then_with(|| left.cmp(right))
+        })
+        .unwrap_or(demand_floor);
 
-    // Both actions exceed a zero allowance, so expected excess delay
-    // orders them.
-    assert_eq!(
-        super::compare_actions(0, 1, &columns, 0.0_f64),
-        Ordering::Greater
-    );
+    select_action(&columns) == expected
 }
 
 #[test]

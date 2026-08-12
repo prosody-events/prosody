@@ -2,7 +2,7 @@ use std::hint::black_box;
 use std::slice;
 use std::time::Duration;
 
-use fearless_simd::{Level, dispatch};
+use fearless_simd::Level;
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use statrs::distribution::{ContinuousCDF, Gamma};
@@ -13,7 +13,7 @@ use crate::capacity::CapacityFactor;
 use crate::change_point::ChangePointKernel;
 use crate::controller::{
     DecisionRandomDomain, NumericalDecision, classify_paired_bootstrap, decision_random,
-    minimal_moved_partitions, mixed_event_supply, prepare_scenario_violations, terminal_drain_area,
+    minimal_moved_partitions, mixed_event_supply,
 };
 use crate::edf::{
     ArrivalPath, EdfOutcome, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
@@ -22,14 +22,14 @@ use crate::edf::{
 };
 use crate::lead_time::LeadTimeFactor;
 use crate::partition::PartitionFactor;
-use crate::planning::{ActionColumns, select_action};
+use crate::planning::ActionColumns;
 use crate::types::{CalendarColumns, CalendarForecast, WorkCohorts};
 use crate::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
     CalendarArtifactId, CalendarRateSegment, CapacityCurve, CapacityGrid, CapacityPrior, Cohort,
     Configuration, ConfigurationError, DemandClass, HoldReason, ModelTime, ObservationBuffer,
-    PosteriorQuery, RandomStream, ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleScratch,
-    ScaleState, ServiceObjective, ThroughputPosteriorCell, TransitionDirection, TransitionEvidence,
+    PosteriorQuery, RandomStream, ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleState,
+    ServiceObjective, ThroughputPosteriorCell, TransitionDirection, TransitionEvidence,
     TransitionPrior, step,
 };
 
@@ -66,9 +66,9 @@ fn bootstrap_contract_retains_an_action_not_proven_worse() {
 
 #[quickcheck]
 fn bootstrap_contract_prices_credible_incumbency(cost_code: u16, excess_code: u16) -> bool {
-    let transition_cost = f64::from(cost_code) + 1.0_f64;
-    let within_cost = transition_cost * f64::from(excess_code) / f64::from(u16::MAX);
-    let outside_cost = transition_cost + f64::from(excess_code) + 1.0_f64;
+    let transition_cost_sum = f64::from(cost_code) + 1.0_f64;
+    let within_cost = transition_cost_sum * f64::from(excess_code) / f64::from(u16::MAX);
+    let outside_cost = transition_cost_sum + f64::from(excess_code) + 1.0_f64;
     let within_replica_seconds = [1.0_f64, 1.0_f64 + within_cost, 3.0_f64];
     let outside_replica_seconds = [1.0_f64, 1.0_f64 + outside_cost, 3.0_f64];
     let within_columns = bootstrap_columns(&within_replica_seconds);
@@ -80,134 +80,58 @@ fn bootstrap_contract_prices_credible_incumbency(cost_code: u16, excess_code: u1
         &within_columns,
         0,
         Some(1),
-        transition_cost,
+        transition_cost_sum,
         0.01_f64,
     );
-    let outside = || {
-        classify_paired_bootstrap(
-            &worse_counts,
-            128,
-            &outside_columns,
-            0,
-            Some(1),
-            transition_cost,
-            0.01_f64,
-        )
-    };
-    let first_outside = outside();
-    let second_outside = outside();
+    let outside = classify_paired_bootstrap(
+        &worse_counts,
+        128,
+        &outside_columns,
+        0,
+        Some(1),
+        transition_cost_sum,
+        0.01_f64,
+    );
     within == (NumericalDecision::Unresolved { credible_index: 1 })
-        && first_outside == (NumericalDecision::Unresolved { credible_index: 0 })
-        && second_outside == first_outside
+        && outside == (NumericalDecision::Unresolved { credible_index: 0 })
+}
+
+#[test]
+fn transition_price_uses_mean_column_units() {
+    let columns = bootstrap_columns(&[1.0_f64, 4.0_f64, 8.0_f64]);
+    let decision =
+        classify_paired_bootstrap(&[0, 0, 128], 128, &columns, 0, Some(1), 10.0_f64, 0.01_f64);
+
+    assert_eq!(
+        decision,
+        NumericalDecision::Unresolved { credible_index: 1 }
+    );
 }
 
 fn bootstrap_columns(replica_seconds_sums: &[f64]) -> ActionColumns<'_> {
     const ZEROES: [f64; 3] = [0.0_f64; 3];
     ActionColumns {
-        violation_weight_sums: &ZEROES,
-        excess_delay_sums: &ZEROES,
+        late_area_sums: &ZEROES,
         replica_seconds_sums,
+        rate: 3.0_f64,
         demand_floor: 0,
-        scenario_weight_sum: 1.0_f64,
-        slo_violation_probability: 0.05_f64,
     }
 }
 
-#[quickcheck]
-fn chance_constraint_matches_the_posterior_violation_fraction(violation_code: u8) -> bool {
-    const SCENARIO_COUNT: usize = 100;
-    const CANDIDATE_COUNT: usize = 3;
-    const DELTA: f64 = 0.05_f64;
-    let violation_count = usize::from(violation_code) % (SCENARIO_COUNT + 1);
-    let mut missed_work = vec![0.0_f64; SCENARIO_COUNT * CANDIDATE_COUNT];
-    for scenario in 0..violation_count {
-        missed_work[scenario * CANDIDATE_COUNT] = 2.0_f64;
-    }
-    let event_count = vec![100.0_f64; SCENARIO_COUNT];
-    let mut violations = vec![0.0_f64; missed_work.len()];
-    dispatch!(Level::new(), simd => prepare_scenario_violations(
-        simd,
-        &missed_work,
-        &event_count,
-        CANDIDATE_COUNT,
-        CANDIDATE_COUNT,
-        &mut violations,
-        0.01_f64,
-    ));
-    let violation_weight_sums = [
-        violations.iter().step_by(CANDIDATE_COUNT).sum(),
-        violations.iter().skip(1).step_by(CANDIDATE_COUNT).sum(),
-        violations.iter().skip(2).step_by(CANDIDATE_COUNT).sum(),
-    ];
-    let columns = ActionColumns {
-        violation_weight_sums: &violation_weight_sums,
-        excess_delay_sums: &[0.0_f64; CANDIDATE_COUNT],
-        replica_seconds_sums: &[1.0_f64, 2.0_f64, 3.0_f64],
-        demand_floor: 0,
-        scenario_weight_sum: 100.0_f64,
-        slo_violation_probability: DELTA,
-    };
-    let allowance = columns.violation_allowance();
-    let expected_feasible = violation_count <= 5;
-    columns.feasible(0, allowance) == expected_feasible
-        && (0..CANDIDATE_COUNT).any(|target| columns.feasible(target, allowance))
-        && violations
-            .chunks_exact(CANDIDATE_COUNT)
-            .all(|row| row.contains(&0.0_f64))
-        && select_action(&columns) == usize::from(!expected_feasible)
-}
-
 #[test]
-fn idle_shaped_scenarios_release_insurance_below_the_probability_budget() {
-    let low_phantom_mass = ActionColumns {
-        violation_weight_sums: &[4.0_f64, 0.0_f64],
-        excess_delay_sums: &[0.0_f64; 2],
-        replica_seconds_sums: &[1.0_f64, 2.0_f64],
-        demand_floor: 0,
-        scenario_weight_sum: 100.0_f64,
-        slo_violation_probability: 0.05_f64,
-    };
-    let high_phantom_mass = ActionColumns {
-        violation_weight_sums: &[20.0_f64, 0.0_f64],
-        excess_delay_sums: &[0.0_f64; 2],
-        replica_seconds_sums: &[1.0_f64, 2.0_f64],
-        demand_floor: 0,
-        scenario_weight_sum: 100.0_f64,
-        slo_violation_probability: 0.05_f64,
-    };
-
-    assert_eq!(select_action(&low_phantom_mass), 0);
-    assert_eq!(select_action(&high_phantom_mass), 1);
-}
-
-#[test]
-fn service_objective_rejects_invalid_slo_violation_probabilities() -> Result<(), ConfigurationError>
-{
-    let objective = ServiceObjective::new(1_000_000, 0.01_f64)?;
-    for probability in [
+fn service_objective_rejects_invalid_replica_second_delay_rates() {
+    for rate in [
         f64::NEG_INFINITY,
         -f64::MIN_POSITIVE,
         0.0_f64,
-        0.5_f64,
-        1.0_f64,
         f64::INFINITY,
         f64::NAN,
     ] {
         assert!(
-            objective
-                .with_slo_violation_probability(probability)
-                .is_err(),
-            "probability={probability}"
+            ServiceObjective::new(1_000_000, 0.01_f64, rate).is_err(),
+            "rate={rate}"
         );
     }
-    assert!(
-        objective
-            .with_slo_violation_probability(0.05_f64)?
-            .slo_violation_probability()
-            .total_cmp(&0.05_f64)
-            .is_eq()
-    );
-    Ok(())
 }
 
 fn evaluate_constant_supply(
@@ -236,16 +160,6 @@ fn evaluate_constant_supply(
         arrivals,
         scratch,
     )
-}
-
-#[test]
-fn terminal_drain_area_prices_all_forecast_work() {
-    assert!(close_relative(
-        terminal_drain_area(100.0_f64, 10.0_f64),
-        500.0_f64,
-    ));
-    assert!(terminal_drain_area(200.0_f64, 10.0_f64) > terminal_drain_area(100.0_f64, 10.0_f64));
-    assert!(terminal_drain_area(100.0_f64, 20.0_f64) < terminal_drain_area(100.0_f64, 10.0_f64));
 }
 
 #[test]
@@ -308,7 +222,7 @@ fn forecast_path_stops_arrivals_at_its_declared_end() -> Result<(), TestError> {
 }
 
 #[quickcheck]
-fn edf_counts_missed_work_and_integrates_late_work(work_seed: u16, supply_seed: u16) -> bool {
+fn edf_counts_missed_work_and_bounds_late_area(work_seed: u16, supply_seed: u16) -> bool {
     let work = f64::from(work_seed % 10_000 + 1);
     let supply = f64::from(supply_seed % 1_000 + 1);
     let mut cohorts = WorkCohorts::new(1);
@@ -338,13 +252,15 @@ fn edf_counts_missed_work_and_integrates_late_work(work_seed: u16, supply_seed: 
         &mut scratch,
     );
     let missed = (work - supply).max(0.0_f64);
+    let late_seconds = (missed / supply).min(1.0_f64);
+    let expected_late_area = missed * late_seconds - 0.5_f64 * supply * late_seconds * late_seconds;
     close_relative(outcome.missed_work, missed)
-        && close_relative(outcome.late_area, missed * missed / (2.0_f64 * supply))
+        && close_relative(outcome.late_area, expected_late_area)
         && outcome.terminal_late_work <= f64::EPSILON
 }
 
 #[test]
-fn edf_does_not_count_preexisting_debt_as_a_new_miss() -> Result<(), TestError> {
+fn edf_treats_preexisting_debt_as_occupancy_only() -> Result<(), TestError> {
     let cohorts = WorkCohorts::new(0);
     let mut scratch = EdfScratch::new(0)?;
     prepare(&cohorts, &mut scratch);
@@ -368,7 +284,7 @@ fn edf_does_not_count_preexisting_debt_as_a_new_miss() -> Result<(), TestError> 
     );
 
     assert!(outcome.missed_work.total_cmp(&0.0_f64).is_eq());
-    assert!(close_relative(outcome.late_area, 2.5_f64));
+    assert!(outcome.late_area.total_cmp(&0.0_f64).is_eq());
     assert!(outcome.terminal_late_work <= f64::EPSILON);
     Ok(())
 }
@@ -436,11 +352,9 @@ fn edf_counts_a_late_cohort_after_an_earlier_wide_interval() -> Result<(), TestE
     );
 
     let missed = 16.0_f64 - 3.806_668_352_250_828_2_f64;
+    let expected_late_area = missed - 0.5_f64 * 3.806_668_352_250_828_2_f64;
     assert!(close_relative(outcome.missed_work, missed));
-    assert!(close_relative(
-        outcome.late_area,
-        missed * missed / (2.0_f64 * 3.806_668_352_250_828_2_f64)
-    ));
+    assert!(close_relative(outcome.late_area, expected_late_area));
     Ok(())
 }
 
@@ -825,7 +739,7 @@ fn lead_time_updates_only_the_matching_direction_and_delta() -> Result<(), TestE
 fn rebalance_evidence_updates_each_observed_phase() -> Result<(), TestError> {
     let configuration = configuration()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     let lead_query = PosteriorQuery::LeadTime {
         direction: TransitionDirection::Up,
@@ -1431,8 +1345,8 @@ fn controller_transition_is_cadence_invariant() -> Result<(), TestError> {
     let capacity_grid = grid()?;
     let mut coarse_state = ScaleState::new(configuration.clone(), capacity_grid.clone())?;
     let mut fine_state = ScaleState::new(configuration.clone(), capacity_grid)?;
-    let mut coarse_scratch = ScaleScratch::new(&configuration)?;
-    let mut fine_scratch = ScaleScratch::new(&configuration)?;
+    let mut coarse_scratch = coarse_state.new_scratch()?;
+    let mut fine_scratch = fine_state.new_scratch()?;
     let mut coarse_observation = ObservationBuffer::new(&configuration)?;
     let mut fine_observation = ObservationBuffer::new(&configuration)?;
 
@@ -1458,44 +1372,6 @@ fn controller_transition_is_cadence_invariant() -> Result<(), TestError> {
     );
 
     assert_eq!(coarse, fine);
-    Ok(())
-}
-
-#[test]
-fn controller_target_is_invariant_to_arrival_observation_cadence() -> Result<(), TestError> {
-    let configuration = configuration()?;
-    for count in [4_u32, 20, 100, 400, 1_000] {
-        let capacity_grid = grid()?;
-        let mut coarse_state = ScaleState::new(configuration.clone(), capacity_grid.clone())?;
-        let mut fine_state = ScaleState::new(configuration.clone(), capacity_grid)?;
-        let mut coarse_scratch = ScaleScratch::new(&configuration)?;
-        let mut fine_scratch = ScaleScratch::new(&configuration)?;
-        let mut coarse_observation = ObservationBuffer::new(&configuration)?;
-        let mut fine_observation = ObservationBuffer::new(&configuration)?;
-        coarse_observation.set_arrivals(count, 1_000_000)?;
-
-        let mut fine = None;
-        for now_micros in [250_000_u64, 500_000, 750_000, 1_000_000] {
-            fine_observation.set_arrivals(count / 4, 250_000)?;
-            fine = Some(step(
-                &mut fine_state,
-                &mut fine_scratch,
-                fine_observation.observation(),
-                ModelTime::from_micros(now_micros),
-            ));
-        }
-        let coarse = step(
-            &mut coarse_state,
-            &mut coarse_scratch,
-            coarse_observation.observation(),
-            ModelTime::from_micros(1_000_000),
-        );
-        let (ScaleDecision::Apply(coarse), Some(ScaleDecision::Apply(fine))) = (coarse, fine)
-        else {
-            return Err(TestError::UnexpectedHold);
-        };
-        assert_eq!((coarse.target, coarse.cap), (fine.target, fine.cap));
-    }
     Ok(())
 }
 
@@ -1539,7 +1415,7 @@ fn every_discrete_posterior_has_an_ordered_normalized_view() -> Result<(), TestE
 fn attempt_outcomes_update_only_their_retry_factors() -> Result<(), TestError> {
     let configuration = configuration()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.set_attempt_outcomes(AttemptOutcomeEvidence::new(
         AttemptOutcomeCounts::new(80, 10, 10, 0),
@@ -1841,7 +1717,7 @@ fn required_capacity_matches_exhaustive_interval_oracle(input: CohortSet) -> boo
 fn partial_observation_returns_a_decision() -> Result<(), TestError> {
     let configuration = configuration()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
 
     let decision = step(
@@ -1876,11 +1752,11 @@ fn predictive_arrivals_hold_the_demand_floor_before_work_is_released() -> Result
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: fast_transition.clone(),
         rebalance_time_prior: fast_transition,
-        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
+        objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     };
     let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
     let mut state = ScaleState::new(configuration.clone(), grid)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.set_arrivals(200, 10_000_000)?;
     observation.set_attempt_outcomes(AttemptOutcomeEvidence::new(
@@ -1906,7 +1782,7 @@ fn predictive_arrivals_hold_the_demand_floor_before_work_is_released() -> Result
 }
 
 #[test]
-fn joint_capacity_samples_match_direct_enumeration() -> Result<(), TestError> {
+fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
     let configuration = Configuration {
         cohort_count_max: 1,
         calendar_segment_count_max: 1,
@@ -1921,11 +1797,11 @@ fn joint_capacity_samples_match_direct_enumeration() -> Result<(), TestError> {
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
-        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
+        objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     };
     let grid = CapacityGrid::new(&[0.001_f64], &[50.0_f64, 100.0_f64], &[0.0_f64])?;
     let mut state = ScaleState::new(configuration.clone(), grid)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.push_cohort(Cohort {
         release_micros: 0,
@@ -1973,7 +1849,7 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
         partition_count: 2,
         replica_count_max: 2,
         slots_per_replica: 1,
-        posterior_sample_count: 64,
+        posterior_sample_count: 128,
         report_interval_micros: 1_000_000,
         failure_service_weight: 0.3_f64,
         arrival_prior: negligible_arrival_prior()?,
@@ -1981,11 +1857,11 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
-        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
+        objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     };
     let grid = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64])?;
     let mut state = ScaleState::new(configuration.clone(), grid)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     for partition in 0_u32..2 {
         observation.push_cohort(Cohort {
@@ -2007,14 +1883,10 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
         return Err(TestError::UnexpectedHold);
     };
     let mut losses = [0.0_f64; 2];
-    let mut passes = [0.0_f64; 2];
-    scratch.write_decision_curve(&mut losses, &mut passes)?;
-    // The pass probability is relative to the row-minimum candidate, so
-    // the expected loss carries the absolute invariant: every candidate
-    // keeps a positive loss because no capacity lands before the deadline.
+    scratch.write_decision_expected_losses(&mut losses)?;
     assert!(
         losses.iter().all(|loss| *loss > 0.0_f64),
-        "passes={passes:?}, losses={losses:?}"
+        "losses={losses:?}"
     );
     assert!(apply.diagnostics.shortfall > 0.0_f64);
     Ok(())
@@ -2137,7 +2009,7 @@ fn predictive_arrivals_consume_service_while_debt_drains() -> Result<(), TestErr
 fn decision_curve_contains_the_selected_expected_loss() -> Result<(), TestError> {
     let configuration = configuration()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.push_cohort(Cohort {
         release_micros: 0,
@@ -2157,26 +2029,12 @@ fn decision_curve_contains_the_selected_expected_loss() -> Result<(), TestError>
         return Err(TestError::UnexpectedHold);
     };
     let mut losses = vec![0.0_f64; scratch.decision_candidate_count()];
-    let mut probabilities = vec![0.0_f64; configuration.replica_count_max as usize];
-    scratch.write_decision_curve(&mut losses, &mut probabilities)?;
+    scratch.write_decision_expected_losses(&mut losses)?;
 
     assert!(close_relative(
         losses[apply.target as usize - 1],
         apply.diagnostics.expected_loss,
     ));
-    assert!(
-        probabilities
-            .iter()
-            .all(|probability| (0.0_f64..=1.0_f64).contains(probability)),
-        "each candidate pass probability must be normalized"
-    );
-    let required = 1.0_f64 - configuration.objective.epsilon();
-    if let Some(first_feasible) = probabilities
-        .iter()
-        .position(|probability| *probability >= required)
-    {
-        assert_eq!(apply.target as usize - 1, first_feasible);
-    }
     Ok(())
 }
 
@@ -2186,7 +2044,7 @@ fn decision_diagnostics_report_no_rejection_for_zero_demand() -> Result<(), Test
     configuration.arrival_prior = negligible_arrival_prior()?;
     let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
     let mut state = ScaleState::new(configuration.clone(), grid)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
 
     let decision = step(
@@ -2245,7 +2103,7 @@ fn throughput_posterior_preserves_joint_curve_mass() -> Result<(), TestError> {
 fn steady_state_step_allocates_no_memory() -> Result<(), TestError> {
     let configuration = configuration()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     for partition in 0..configuration.partition_count {
         observation.push_cohort(Cohort {
@@ -2308,7 +2166,7 @@ fn rayon_width_does_not_change_the_decision() -> Result<(), TestError> {
 fn regressed_model_time_returns_hold() -> Result<(), TestError> {
     let configuration = configuration()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut first = ObservationBuffer::new(&configuration)?;
     let mut second = ObservationBuffer::new(&configuration)?;
     let _ = step(
@@ -2337,7 +2195,7 @@ fn one_hot_partition_cannot_claim_capacity_from_other_replicas() -> Result<(), T
     let mut configuration = configuration()?;
     configuration.arrival_prior = negligible_arrival_prior()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.push_cohort(Cohort {
         release_micros: 0,
@@ -2366,7 +2224,7 @@ fn wide_cohort_cannot_hide_one_hot_partition_deadline() -> Result<(), TestError>
     let mut configuration = configuration()?;
     configuration.arrival_prior = negligible_arrival_prior()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.push_cohort(Cohort {
         release_micros: 0,
@@ -2393,14 +2251,10 @@ fn wide_cohort_cannot_hide_one_hot_partition_deadline() -> Result<(), TestError>
         return Err(TestError::UnexpectedHold);
     };
     let mut losses = [0.0_f64; 32];
-    let mut passes = [0.0_f64; 32];
-    scratch.write_decision_curve(&mut losses, &mut passes)?;
-    // The pass probability is relative to the row-minimum candidate, so
-    // the expected loss carries the absolute invariant: the serialized
-    // partition keeps a positive loss at every replica count.
+    scratch.write_decision_expected_losses(&mut losses)?;
     assert!(
         losses.iter().all(|loss| *loss > 0.0_f64),
-        "passes={passes:?}, losses={losses:?}"
+        "losses={losses:?}"
     );
     assert!(apply.diagnostics.shortfall > 0.0_f64);
     Ok(())
@@ -2420,7 +2274,7 @@ fn replicas_above_active_partition_support_cannot_reduce_overload(
         configuration.arrival_prior = negligible_arrival_prior()?;
         let active_partitions = u32::from(partition_seed) % configuration.partition_count + 1;
         let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-        let mut scratch = ScaleScratch::new(&configuration)?;
+        let mut scratch = state.new_scratch()?;
         let mut observation = ObservationBuffer::new(&configuration)?;
         for partition in 0..active_partitions {
             observation.push_cohort(Cohort {
@@ -2444,16 +2298,14 @@ fn replicas_above_active_partition_support_cannot_reduce_overload(
             return Ok(false);
         };
         let mut losses = [0.0_f64; 32];
-        let mut passes = [0.0_f64; 32];
-        scratch.write_decision_curve(&mut losses, &mut passes)?;
+        scratch.write_decision_expected_losses(&mut losses)?;
         let unsupported = active_partitions as usize..losses.len();
         assert!(
             apply.target <= active_partitions
                 && apply.diagnostics.shortfall > 0.0_f64
                 && unsupported
                     .clone()
-                    .all(|target| losses[target].is_infinite())
-                && unsupported.clone().all(|target| passes[target] == 0.0_f64),
+                    .all(|target| losses[target].is_infinite()),
             "duration={duration_micros}, excess={excess}, active_partitions={active_partitions}, \
              target={}, shortfall={}",
             apply.target,
@@ -2532,7 +2384,7 @@ fn incomplete_actuation_uses_the_conditional_remaining_time() {
 fn larger_candidates_inherit_useful_pending_capacity() -> Result<(), TestError> {
     let configuration = configuration()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.set_current_replicas(2)?;
     observation.push_actuation_commitment(ActuationCommitment::launching(
@@ -2565,7 +2417,7 @@ fn started_rebalance_is_carried_and_can_be_superseded() -> Result<(), TestError>
     configuration.rebalance_time_prior =
         TransitionPrior::new([100.0_f64; 4], [0.01_f64; 3], [1.0_f64; 12], 0.0_f64)?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.set_current_replicas(2)?;
     observation.push_actuation_commitment(ActuationCommitment::rebalancing(
@@ -2618,7 +2470,7 @@ fn resolved_decision_stops_after_the_pilot_scenarios() -> Result<(), TestError> 
     configuration.arrival_prior = negligible_arrival_prior()?;
     let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
     let mut state = ScaleState::new(configuration.clone(), grid)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
 
     let ScaleDecision::Apply(decision) = step(
@@ -2661,7 +2513,7 @@ fn plateau_configuration() -> Result<Configuration, TestError> {
             [1.0_f64; 12],
             0.0_f64,
         )?,
-        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
+        objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     })
 }
 
@@ -2676,32 +2528,25 @@ fn plateau_grid() -> Result<CapacityGrid, TestError> {
     )?)
 }
 
-/// A steady plateau must select the best attainable chance constraint when
-/// no fixed target meets the configured probability budget.
-///
-/// The strict violation budget keeps the scenario in the fallback branch:
-/// the pass curve tops out near 0.95, far below the required 0.99.
+/// A steady plateau selects the minimum expected cost.
 #[test]
-fn steady_plateau_selects_best_attainable_insurance() -> Result<(), TestError> {
-    let configuration = {
-        let mut configuration = plateau_configuration()?;
-        configuration.objective = configuration
-            .objective
-            .with_slo_violation_probability(0.01_f64)?;
-        configuration
-    };
+fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
+    let configuration = plateau_configuration()?;
     let mut state = ScaleState::new(configuration.clone(), plateau_grid()?)?;
-    let mut scratch = ScaleScratch::new(&configuration)?;
+    let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.set_arrivals(72_000, 240_000_000)?;
     observation.set_resource_window(ResourceWindow::new(30.0_f64, 240.0_f64, 72_000)?)?;
     observation.set_current_replicas(2)?;
-    let _ = step(
+    let first = step(
         &mut state,
         &mut scratch,
         observation.observation(),
         ModelTime::from_micros(240_000_000),
     );
+    let ScaleDecision::Apply(first) = first else {
+        return Err(TestError::UnexpectedHold);
+    };
 
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.set_current_replicas(2)?;
@@ -2724,19 +2569,16 @@ fn steady_plateau_selects_best_attainable_insurance() -> Result<(), TestError> {
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
-    let candidate_count = scratch.decision_candidate_count();
-    let mut losses = vec![0.0_f64; candidate_count];
-    let mut passes = vec![0.0_f64; candidate_count];
-    scratch.write_decision_curve(&mut losses, &mut passes)?;
     let selected =
         usize::try_from(apply.target - 1).map_err(|_| ConfigurationError::PlatformLimit)?;
-    let best_pass_probability = passes.iter().copied().fold(0.0_f64, f64::max);
-    assert!(
-        passes[selected].total_cmp(&best_pass_probability).is_eq(),
-        "target={} selected_pass={} best_pass={best_pass_probability}",
-        apply.target,
-        passes[selected]
-    );
+    let mut losses = vec![0.0_f64; scratch.decision_candidate_count()];
+    scratch.write_decision_expected_losses(&mut losses)?;
+    let summary = scratch
+        .decision_column_summary(selected)
+        .ok_or(TestError::MissingDecisionCurve)?;
+    let runner_up = summary.runner_up.ok_or(TestError::MissingDecisionCurve)?;
+    assert_eq!((first.target, apply.target), (3, 4));
+    assert!(summary.selected.cost <= runner_up.cost);
     assert!(
         apply.target <= configuration.partition_count,
         "target={} partitions={}",
@@ -2797,7 +2639,7 @@ fn configuration() -> Result<Configuration, TestError> {
         partition_count: 16,
         replica_count_max: 32,
         slots_per_replica: 4,
-        posterior_sample_count: 64,
+        posterior_sample_count: 128,
         report_interval_micros: 1_000_000,
         failure_service_weight: 0.3_f64,
         arrival_prior: crate::ArrivalPrior::broad_fallback(),
@@ -2805,7 +2647,7 @@ fn configuration() -> Result<Configuration, TestError> {
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
-        objective: ServiceObjective::new(1_000_000, 0.01)?,
+        objective: ServiceObjective::new(1_000_000, 0.01, 3.0_f64)?,
     })
 }
 
@@ -2816,7 +2658,7 @@ fn decision_with_threads(thread_count: usize) -> Result<ScaleDecision, TestError
     pool.install(|| {
         let configuration = configuration()?;
         let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-        let mut scratch = ScaleScratch::new(&configuration)?;
+        let mut scratch = state.new_scratch()?;
         let mut observation = ObservationBuffer::new(&configuration)?;
         for cohort in 0..configuration.cohort_count_max {
             observation.push_cohort(Cohort {
@@ -2881,4 +2723,6 @@ enum TestError {
     PlatformLimit,
     #[error("the candidate trajectory is missing")]
     MissingTrajectory,
+    #[error("the decision columns are missing")]
+    MissingDecisionCurve,
 }

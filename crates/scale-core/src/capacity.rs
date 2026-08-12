@@ -3,12 +3,14 @@ use std::time::Duration;
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use thiserror::Error;
 
+use crate::arrival::ArrivalPrior;
 use crate::change_point::ChangePointKernel;
 
 const CAPACITY_CELL_COUNT_MAX: u32 = 4_096;
 const DEFAULT_WINDOW_INFLUENCE_BOUND_PROBABILITY: f64 = 0.05_f64;
 const NO_KNEE_PRIOR_PROBABILITY: f64 = 0.5_f64;
 const NO_COLLAPSE_PRIOR_PROBABILITY: f64 = 0.5_f64;
+const HAZARD_GRID_COUNT: usize = 9;
 
 /// One point on the passive throughput curve.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -383,6 +385,7 @@ pub struct ResourceWindow {
     concurrency: f64,
     exposure_seconds: f64,
     completed_attempts: u32,
+    started_attempts: Option<u32>,
 }
 
 impl ResourceWindow {
@@ -403,8 +406,32 @@ impl ResourceWindow {
             concurrency,
             exposure_seconds,
             completed_attempts,
+            started_attempts: None,
         })
     }
+
+    /// Constructs one resource window with an observed start count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when concurrency or exposure is not positive and
+    /// finite.
+    pub fn new_with_starts(
+        concurrency: f64,
+        exposure_seconds: f64,
+        completed_attempts: u32,
+        started_attempts: u32,
+    ) -> Result<Self, ResourceWindowError> {
+        let mut window = Self::new(concurrency, exposure_seconds, completed_attempts)?;
+        window.started_attempts = Some(started_attempts);
+        Ok(window)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StartWindow {
+    exposure_seconds: f64,
+    started_attempts: u32,
 }
 
 pub(crate) struct CapacityFactor {
@@ -412,19 +439,63 @@ pub(crate) struct CapacityFactor {
     prior_weights: Vec<f64>,
     weights: Vec<f64>,
     likelihoods: Vec<f64>,
-    change_kernel: ChangePointKernel,
+    hazard_rates_per_second: Vec<f64>,
+    hazard_weights: Vec<f64>,
+    hazard_curve_weights: Vec<f64>,
+    start_history: Vec<StartWindow>,
+    start_history_head: usize,
+    start_history_len: usize,
 }
 
 impl CapacityFactor {
+    #[cfg(test)]
     pub(crate) fn new(grid: CapacityGrid, change_rate_per_second: f64) -> Self {
+        Self::new_with_prior(grid, change_rate_per_second, ArrivalPrior::broad_fallback())
+    }
+
+    pub(crate) fn new_with_prior(
+        grid: CapacityGrid,
+        change_rate_per_second: f64,
+        arrival_prior: ArrivalPrior,
+    ) -> Self {
         let cell_count = grid.service_times_seconds.len();
+        let minimum_service_time = grid
+            .service_times_seconds
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let maximum_service_time = grid
+            .service_times_seconds
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max);
+        let start_history_capacity = ((maximum_service_time / minimum_service_time).ceil()
+            as usize)
+            .min(CAPACITY_CELL_COUNT_MAX as usize);
         let prior_weights = capacity_prior(&grid);
+        let (hazard_rates_per_second, hazard_weights) =
+            hazard_prior(change_rate_per_second, arrival_prior.shape());
+        let mut hazard_curve_weights = Vec::with_capacity(cell_count * hazard_weights.len());
+        for _ in &hazard_weights {
+            hazard_curve_weights.extend_from_slice(&prior_weights);
+        }
         Self {
             grid,
             weights: prior_weights.clone(),
             prior_weights,
             likelihoods: vec![0.0; cell_count],
-            change_kernel: ChangePointKernel::new(change_rate_per_second),
+            hazard_rates_per_second,
+            hazard_weights,
+            hazard_curve_weights,
+            start_history: vec![
+                StartWindow {
+                    exposure_seconds: 0.0_f64,
+                    started_attempts: 0,
+                };
+                start_history_capacity
+            ],
+            start_history_head: 0,
+            start_history_len: 0,
         }
     }
 
@@ -434,6 +505,21 @@ impl CapacityFactor {
 
     pub(crate) fn curve_posterior_value_count(&self) -> u32 {
         self.grid.cell_count()
+    }
+
+    pub(crate) fn curve_and_probability(&self, index: usize) -> (CapacityCurve, f64) {
+        let curve = if self.grid.no_knee[index] > 0.0_f64 {
+            CapacityCurve::NoKnee {
+                service_time_seconds: self.grid.service_times_seconds[index],
+            }
+        } else {
+            CapacityCurve::Knee {
+                service_time_seconds: self.grid.service_times_seconds[index],
+                capacity_per_second: self.grid.capacities_per_second[index],
+                collapse: self.grid.collapse_values[index],
+            }
+        };
+        (curve, self.weights[index])
     }
 
     pub(crate) fn write_throughput_posterior(
@@ -475,11 +561,18 @@ impl CapacityFactor {
     }
 
     pub(crate) fn transition(&mut self, elapsed: Duration) {
-        let transition = self.change_kernel.probabilities(elapsed);
-        for index in 0..self.weights.len() {
-            self.weights[index] = transition.retained * self.weights[index]
-                + transition.redrawn * self.prior_weights[index];
+        let cell_count = self.weights.len();
+        for (hazard, curve_weights) in self
+            .hazard_rates_per_second
+            .iter()
+            .zip(self.hazard_curve_weights.chunks_exact_mut(cell_count))
+        {
+            let transition = ChangePointKernel::new(*hazard).probabilities(elapsed);
+            for (weight, prior) in curve_weights.iter_mut().zip(&self.prior_weights) {
+                *weight = transition.retained * *weight + transition.redrawn * prior;
+            }
         }
+        self.mix_hazard_filters();
     }
 
     pub(crate) fn update(&mut self, simd_level: Level, window: &ResourceWindow) {
@@ -662,33 +755,6 @@ impl CapacityFactor {
         ))
     }
 
-    pub(crate) fn curve_at_probability(&self, threshold: f64) -> CapacityCurve {
-        debug_assert!(
-            (0.0_f64..1.0_f64).contains(&threshold),
-            "a stratified posterior probability stays inside the unit interval"
-        );
-        let mut cumulative = 0.0_f64;
-        let mut selected = self.weights.len() - 1;
-        for (cell, weight) in self.weights.iter().enumerate() {
-            cumulative += weight;
-            if cumulative >= threshold {
-                selected = cell;
-                break;
-            }
-        }
-        if self.grid.no_knee[selected] > 0.0_f64 {
-            CapacityCurve::NoKnee {
-                service_time_seconds: self.grid.service_times_seconds[selected],
-            }
-        } else {
-            CapacityCurve::Knee {
-                service_time_seconds: self.grid.service_times_seconds[selected],
-                capacity_per_second: self.grid.capacities_per_second[selected],
-                collapse: self.grid.collapse_values[selected],
-            }
-        }
-    }
-
     pub(crate) fn fill_throughput(
         simd_level: Level,
         curve: CapacityCurve,
@@ -829,20 +895,109 @@ impl CapacityFactor {
         self.grid.knee_values[self.grid.knee_values.len() - 1]
     }
 
-    fn update_window(&mut self, simd_level: Level, window: &ResourceWindow) {
+    fn update_window(&mut self, _simd_level: Level, window: &ResourceWindow) {
+        let had_start_history = self.start_history_len > 0;
+        if window.started_attempts.is_some() {
+            self.record_start_window(window);
+        }
         let influence_bound_probability = self.grid.prior.window_influence_bound_probability();
         for (index, likelihood) in self.likelihoods.iter_mut().enumerate() {
-            let (low, high) = self.grid.throughput_interval(index, window.concurrency);
-            let mean = f64::from(window.completed_attempts).clamp(
-                window.exposure_seconds * low,
-                window.exposure_seconds * high,
-            );
-            *likelihood = poisson_log_kernel(window.completed_attempts, mean);
+            let service_time = self.grid.service_times_seconds[index];
+            let effective_service_time = window.concurrency
+                / throughput(
+                    service_time,
+                    self.grid.capacities_per_second[index],
+                    self.grid.collapse_values[index],
+                    self.grid.no_knee[index] > 0.0_f64,
+                    window.concurrency,
+                );
+            let lagged = if window.started_attempts.is_none()
+                || (!had_start_history && window.completed_attempts > 0)
+            {
+                None
+            } else if !had_start_history {
+                Some(0.0_f64)
+            } else {
+                lagged_starts(
+                    &self.start_history,
+                    self.start_history_head,
+                    self.start_history_len,
+                    window.exposure_seconds,
+                    effective_service_time,
+                )
+            };
+            let completion_mean = lagged
+                .filter(|starts| *starts > 0.0_f64 || window.completed_attempts == 0)
+                .unwrap_or_else(|| {
+                    let (low, high) = self.grid.throughput_interval(index, window.concurrency);
+                    f64::from(window.completed_attempts).clamp(
+                        window.exposure_seconds * low,
+                        window.exposure_seconds * high,
+                    )
+                });
+            *likelihood = poisson_log_kernel(f64::from(window.completed_attempts), completion_mean);
+            if lagged.is_some() && had_start_history {
+                let occupancy_mean = in_flight_mean(
+                    &self.start_history,
+                    self.start_history_head,
+                    self.start_history_len,
+                    window.exposure_seconds,
+                    effective_service_time,
+                );
+                *likelihood += poisson_log_kernel(window.concurrency, occupancy_mean);
+            }
         }
-        self.apply_likelihood(simd_level, influence_bound_probability);
+        self.bound_likelihoods(influence_bound_probability);
+        self.update_hazard_filters();
     }
 
-    fn apply_likelihood(&mut self, simd_level: Level, influence_bound_probability: f64) {
+    fn record_start_window(&mut self, window: &ResourceWindow) {
+        self.start_history[self.start_history_head] = StartWindow {
+            exposure_seconds: window.exposure_seconds,
+            started_attempts: window.started_attempts.unwrap_or_default(),
+        };
+        self.start_history_head = (self.start_history_head + 1) % self.start_history.len();
+        self.start_history_len = (self.start_history_len + 1).min(self.start_history.len());
+    }
+
+    fn update_hazard_filters(&mut self) {
+        let cell_count = self.weights.len();
+        for (hazard_weight, curve_weights) in self
+            .hazard_weights
+            .iter_mut()
+            .zip(self.hazard_curve_weights.chunks_exact_mut(cell_count))
+        {
+            let predictive = curve_weights
+                .iter()
+                .zip(&self.likelihoods)
+                .map(|(weight, likelihood)| weight * likelihood)
+                .sum::<f64>();
+            *hazard_weight *= predictive;
+            if predictive > 0.0_f64 {
+                for (weight, likelihood) in curve_weights.iter_mut().zip(&self.likelihoods) {
+                    *weight *= likelihood / predictive;
+                }
+            }
+        }
+        normalize(&mut self.hazard_weights);
+        self.mix_hazard_filters();
+    }
+
+    fn mix_hazard_filters(&mut self) {
+        self.weights.fill(0.0_f64);
+        let cell_count = self.weights.len();
+        for (hazard_weight, curve_weights) in self
+            .hazard_weights
+            .iter()
+            .zip(self.hazard_curve_weights.chunks_exact(cell_count))
+        {
+            for (weight, curve_weight) in self.weights.iter_mut().zip(curve_weights) {
+                *weight += hazard_weight * curve_weight;
+            }
+        }
+    }
+
+    fn bound_likelihoods(&mut self, influence_bound_probability: f64) {
         let maximum = self
             .likelihoods
             .iter()
@@ -856,6 +1011,16 @@ impl CapacityFactor {
         for likelihood in &mut self.likelihoods {
             *likelihood = (likelihood.max(minimum) - maximum).exp();
         }
+    }
+
+    #[cfg(test)]
+    fn apply_likelihood(&mut self, simd_level: Level, influence_bound_probability: f64) {
+        self.bound_likelihoods(influence_bound_probability);
+        self.multiply_likelihood(simd_level);
+    }
+
+    #[cfg(test)]
+    fn multiply_likelihood(&mut self, simd_level: Level) {
         dispatch!(simd_level, simd => multiply_weights(simd, &mut self.weights, &self.likelihoods));
         let total = self.weights.iter().sum::<f64>();
         if total > 0.0_f64 {
@@ -893,6 +1058,58 @@ fn capacity_prior(grid: &CapacityGrid) -> Vec<f64> {
     }
     weights.extend(no_knee_weights);
     weights
+}
+
+fn hazard_prior(mean_per_second: f64, shape: f64) -> (Vec<f64>, Vec<f64>) {
+    if mean_per_second <= f64::EPSILON {
+        return (vec![0.0_f64], vec![1.0_f64]);
+    }
+    let center = (HAZARD_GRID_COUNT / 2) as i32;
+    let mut rates = Vec::with_capacity(HAZARD_GRID_COUNT);
+    let mut weights = Vec::with_capacity(HAZARD_GRID_COUNT);
+    for index in 0..HAZARD_GRID_COUNT {
+        let rate = mean_per_second * 2.0_f64.powi(index as i32 - center);
+        rates.push(rate);
+        weights.push((shape * rate.ln() - shape * rate / mean_per_second).exp());
+    }
+    normalize(&mut weights);
+    (rates, weights)
+}
+
+fn normalize(weights: &mut [f64]) {
+    let total = weights.iter().sum::<f64>();
+    if total > 0.0_f64 {
+        for weight in weights {
+            *weight /= total;
+        }
+    }
+}
+
+fn lagged_starts(
+    history: &[StartWindow],
+    head: usize,
+    length: usize,
+    exposure_seconds: f64,
+    service_time_seconds: f64,
+) -> Option<f64> {
+    let target_start = service_time_seconds;
+    let target_end = service_time_seconds + exposure_seconds;
+    let mut age = 0.0_f64;
+    let mut expected = 0.0_f64;
+    for offset in 0..length {
+        let index = (head + history.len() - 1 - offset) % history.len();
+        let window = history[index];
+        let window_end = age + window.exposure_seconds;
+        let overlap = window_end.min(target_end) - age.max(target_start);
+        if overlap > 0.0_f64 {
+            expected += f64::from(window.started_attempts) * overlap / window.exposure_seconds;
+        }
+        age = window_end;
+        if age >= target_end {
+            return Some(expected);
+        }
+    }
+    None
 }
 
 fn log_uniform_capacity_prior(grid: &CapacityGrid) -> Vec<f64> {
@@ -1123,6 +1340,7 @@ pub enum PosteriorError {
     ReliabilityDistribution,
 }
 
+#[cfg(test)]
 fn multiply_weights<S: Simd>(simd: S, weights: &mut [f64], likelihoods: &[f64]) {
     let lane_count = S::f64s::N;
     let vector_count = weights.len() / lane_count;
@@ -1294,14 +1512,50 @@ fn throughput(
     curve.throughput(concurrency)
 }
 
-fn poisson_log_kernel(count: u32, mean: f64) -> f64 {
+fn poisson_log_kernel(count: f64, mean: f64) -> f64 {
     if mean > 0.0_f64 {
-        f64::from(count) * mean.ln() - mean
-    } else if count == 0 {
+        count * mean.ln() - mean
+    } else if count == 0.0_f64 {
         0.0
     } else {
         f64::NEG_INFINITY
     }
+}
+
+fn in_flight_mean(
+    history: &[StartWindow],
+    head: usize,
+    length: usize,
+    exposure_seconds: f64,
+    service_time_seconds: f64,
+) -> f64 {
+    let mut age = 0.0_f64;
+    let mut in_flight_seconds = 0.0_f64;
+    for offset in 0..length {
+        let index = (head + history.len() - 1 - offset) % history.len();
+        let window = history[index];
+        let window_end = age + window.exposure_seconds;
+        let integral = in_flight_integral(window_end, exposure_seconds, service_time_seconds)
+            - in_flight_integral(age, exposure_seconds, service_time_seconds);
+        in_flight_seconds +=
+            f64::from(window.started_attempts) * integral / window.exposure_seconds;
+        age = window_end;
+        if age >= service_time_seconds + exposure_seconds {
+            break;
+        }
+    }
+    in_flight_seconds / exposure_seconds
+}
+
+fn in_flight_integral(age: f64, exposure_seconds: f64, service_time_seconds: f64) -> f64 {
+    let rising_end = exposure_seconds.min(service_time_seconds);
+    let plateau_end = exposure_seconds.max(service_time_seconds);
+    let falling_end = exposure_seconds + service_time_seconds;
+    let rising = age.min(rising_end);
+    let plateau = (age.min(plateau_end) - rising_end).max(0.0_f64);
+    let falling = (age.min(falling_end) - plateau_end).max(0.0_f64);
+    rising * rising * 0.5_f64 + plateau * rising_end + falling * rising_end
+        - falling * falling * 0.5_f64
 }
 
 fn valid_influence_bound_probability(probability: f64) -> bool {

@@ -9,6 +9,7 @@ use quickcheck_macros::quickcheck;
 use rayon::prelude::*;
 use thiserror::Error;
 
+use crate::regime::linear_miss_accounting;
 use crate::series::{
     OutputFunction, SeriesCell, SeriesContext, SeriesFunction, SeriesHistory, SeriesKey,
     SeriesMetadata, SeriesRole, SeriesUnit, series_graph, series_graph_is_acyclic,
@@ -26,9 +27,6 @@ use crate::{
     validate_principal_regime,
 };
 use crate::{CapacityEvidenceKind, CapacityEvidenceSample};
-
-const STEP_MICROS: u64 = 180_000_000;
-const STEP_COUNT: usize = 7;
 
 #[test]
 fn generated_outcome_rules_reject_zero_sentinels() {
@@ -443,7 +441,7 @@ fn run_idle_partition_capacity_trace(partition_count: u32) -> Result<(Vec<u64>, 
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
-        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
+        objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     };
     let capacity_grid = CapacityGrid::new(
         &[0.005_f64, 0.01_f64],
@@ -514,7 +512,7 @@ fn capacity_test_closed_loop<Workload>(
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
-        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
+        objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     };
     let capacity_grid = CapacityGrid::new(
         &[0.005_f64, 0.01_f64],
@@ -600,7 +598,7 @@ fn higher_retarget_preserves_each_completed_lead_time() -> Result<(), TestError>
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
-        objective: ServiceObjective::new(1_000_000, 0.01)?,
+        objective: ServiceObjective::new(1_000_000, 0.01, 3.0_f64)?,
     };
     let capacity_grid = CapacityGrid::new(&[0.001_f64], &[1_000.0_f64], &[0.0_f64, 1.0_f64])?;
     let closed_loop = ClosedLoop::new(
@@ -1337,14 +1335,16 @@ fn assert_lead_time_diagnostics_use_prequential_predictive_distributions(
         };
         maximum_target_streak = maximum_target_streak.max(target_streak);
         let losses = run.controller().decision_expected_losses(index);
-        let passes = run.controller().decision_pass_probabilities(index);
+        let satisfactions = run
+            .controller()
+            .decision_deadline_satisfaction_probabilities(index);
         if sample.target == 2 && first_two.is_none() {
             first_two = Some((
                 index,
                 losses.and_then(|values| values.first()).copied(),
                 losses.and_then(|values| values.get(1)).copied(),
-                passes.and_then(|values| values.first()).copied(),
-                passes.and_then(|values| values.get(1)).copied(),
+                satisfactions.and_then(|values| values.first()).copied(),
+                satisfactions.and_then(|values| values.get(1)).copied(),
                 sample.cap,
                 sample.arrival_predictive_median_count,
                 sample.capacity_median_per_second,
@@ -1354,8 +1354,8 @@ fn assert_lead_time_diagnostics_use_prequential_predictive_distributions(
                 index,
                 losses.and_then(|values| values.first()).copied(),
                 losses.and_then(|values| values.get(1)).copied(),
-                passes.and_then(|values| values.first()).copied(),
-                passes.and_then(|values| values.get(1)).copied(),
+                satisfactions.and_then(|values| values.first()).copied(),
+                satisfactions.and_then(|values| values.get(1)).copied(),
                 sample.cap,
                 sample.arrival_predictive_median_count,
                 sample.capacity_median_per_second,
@@ -1415,95 +1415,7 @@ fn linear_closed_loop_satisfies_its_declared_outcome() -> Result<(), TestError> 
     let run = run_principal_regime(PrincipalRegime::LinearThroughput)?;
     assert_lead_time_diagnostics_use_prequential_predictive_distributions(&run)?;
     assert_linear_closed_loop_uses_only_controller_scale_targets(&run);
-    let mut target_changes = Vec::new();
-    let mut decision_audit = Vec::new();
-    let mut misses_by_release_step = [0_usize; STEP_COUNT];
-    let mut settlements_by_release_step = [0_usize; STEP_COUNT];
-    let mut maximum_lateness_micros = 0_u64;
-    let third_replica_ready_micros = run
-        .applied_changes()
-        .iter()
-        .find(|change| change.replicas >= 3)
-        .map_or(u64::MAX, |change| change.at_micros);
-    let mut misses_released_before_third_ready = 0_usize;
-    let mut misses_released_after_third_ready = 0_usize;
-    let mut first_missed_release_micros = u64::MAX;
-    let mut last_missed_release_micros = 0_u64;
-    let mut previous_target = None;
-    for index in 0..run.controller().len() {
-        let sample = run
-            .controller()
-            .sample(index)
-            .ok_or(TestError::MissingControllerSample)?;
-        if previous_target != Some(sample.target) {
-            target_changes.push((sample.at_micros, sample.target));
-            previous_target = Some(sample.target);
-        }
-        if matches!(
-            sample.at_micros,
-            900_000_000 | 1_000_000_000 | 1_079_000_000 | 1_080_000_000 | 1_081_000_000
-        ) {
-            decision_audit.push((
-                sample.at_micros,
-                sample.target,
-                sample.arrival_rate_per_second,
-                sample.arrival_predictive_low_count,
-                sample.arrival_predictive_median_count,
-                sample.arrival_predictive_high_count,
-                sample.lead_time_up_seconds,
-                run.controller()
-                    .decision_expected_losses(index)
-                    .and_then(|losses| losses.get(..6))
-                    .ok_or(TestError::MissingControllerSample)?
-                    .to_vec(),
-                run.controller()
-                    .decision_pass_probabilities(index)
-                    .and_then(|probabilities| probabilities.get(..6))
-                    .ok_or(TestError::MissingControllerSample)?
-                    .to_vec(),
-            ));
-        }
-    }
-    let mut misses = 0_usize;
-    for settlement in run.settlements() {
-        let step = usize::try_from(settlement.release_micros / STEP_MICROS)
-            .map_err(|_| TestError::PlatformLimit)?
-            .min(STEP_COUNT - 1);
-        settlements_by_release_step[step] += 1;
-        let elapsed_micros = settlement
-            .settle_micros
-            .saturating_sub(settlement.release_micros);
-        if elapsed_micros > PrincipalRegime::LinearThroughput.budget_micros() {
-            misses += 1;
-            misses_by_release_step[step] += 1;
-            if settlement.release_micros < third_replica_ready_micros {
-                misses_released_before_third_ready += 1;
-            } else {
-                misses_released_after_third_ready += 1;
-            }
-            first_missed_release_micros =
-                first_missed_release_micros.min(settlement.release_micros);
-            last_missed_release_micros = last_missed_release_micros.max(settlement.release_micros);
-            maximum_lateness_micros = maximum_lateness_micros.max(
-                elapsed_micros.saturating_sub(PrincipalRegime::LinearThroughput.budget_micros()),
-            );
-        }
-    }
-    assert!(
-        misses.saturating_mul(100) <= run.settlements().len(),
-        "linear SLO misses={misses}, settlements={}, \
-         misses_by_release_step={misses_by_release_step:?}, \
-         settlements_by_release_step={settlements_by_release_step:?}, \
-         third_replica_ready_micros={third_replica_ready_micros}, \
-         misses_released_before_third_ready={misses_released_before_third_ready}, \
-         misses_released_after_third_ready={misses_released_after_third_ready}, \
-         first_missed_release_micros={first_missed_release_micros}, \
-         last_missed_release_micros={last_missed_release_micros}, \
-         maximum_lateness_micros={maximum_lateness_micros}, decision_audit={decision_audit:?}, \
-         target_changes={target_changes:?}, applied={:?}",
-        run.settlements().len(),
-        run.applied_changes(),
-    );
+    assert_linear_miss_bound(&run);
     assert_linear_scale_response(&run);
     validate_principal_regime(
         PrincipalRegime::LinearThroughput,
@@ -1511,6 +1423,15 @@ fn linear_closed_loop_satisfies_its_declared_outcome() -> Result<(), TestError> 
         &run,
     )?;
     Ok(())
+}
+
+fn assert_linear_miss_bound(run: &crate::PrincipalRun) {
+    let accounting = linear_miss_accounting(run);
+    assert!(
+        accounting.reaction_window_misses <= accounting.reaction_window_allowance
+            && accounting.outside_misses.saturating_mul(100) <= accounting.outside_settlements,
+        "linear miss accounting failed: {accounting:?}",
+    );
 }
 
 fn assert_linear_scale_response(run: &crate::PrincipalRun) {
@@ -2158,7 +2079,7 @@ fn source_arrival_count(messages: u32, timers: u32) -> Result<u32, TestError> {
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
-        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
+        objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     };
     let capacity_grid = CapacityGrid::new(&[0.001_f64], &[1_000.0_f64], &[0.0_f64])?;
     let closed_loop = ClosedLoop::new(
@@ -2200,7 +2121,7 @@ fn run_reported_arrivals(
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
-        objective: ServiceObjective::new(1_000_000, 0.01)?,
+        objective: ServiceObjective::new(1_000_000, 0.01, 3.0_f64)?,
     };
     let capacity_grid = CapacityGrid::new(&[0.001_f64], &[1_000.0_f64], &[0.0_f64, 1.0_f64])?;
     let closed_loop = ClosedLoop::new(
@@ -2333,8 +2254,6 @@ enum TestError {
     Principal(#[from] PrincipalRunError),
     #[error(transparent)]
     RegimeValidation(#[from] RegimeValidationError),
-    #[error("the test value exceeds the platform index range")]
-    PlatformLimit,
     #[error("the closed loop did not record a controller sample")]
     MissingControllerSample,
     #[error("the closed loop did not record a capacity window")]

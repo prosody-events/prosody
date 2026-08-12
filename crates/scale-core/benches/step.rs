@@ -64,11 +64,12 @@ fn staggered_cohort_step(criterion: &mut Criterion) {
     let Ok(capacity_grid) = grid(TYPICAL) else {
         return;
     };
-    let state = ScaleState::new(configuration.clone(), capacity_grid);
-    let scratch = ScaleScratch::new(&configuration);
+    let Ok(mut state) = ScaleState::new(configuration.clone(), capacity_grid) else {
+        return;
+    };
+    let scratch = state.new_scratch();
     let observation = ObservationBuffer::new(&configuration);
-    let (Ok(mut state), Ok(mut scratch), Ok(mut observation)) = (state, scratch, observation)
-    else {
+    let (Ok(mut scratch), Ok(mut observation)) = (scratch, observation) else {
         return;
     };
     if populate_staggered(&mut observation, TYPICAL).is_err() {
@@ -96,13 +97,13 @@ fn rayon_worker_step(criterion: &mut Criterion) {
     let Ok(capacity_grid) = grid(TYPICAL) else {
         return;
     };
-    let state = ScaleState::new(configuration.clone(), capacity_grid);
-    let scratch = ScaleScratch::new(&configuration);
+    let Ok(mut state) = ScaleState::new(configuration.clone(), capacity_grid) else {
+        return;
+    };
+    let scratch = state.new_scratch();
     let observation = ObservationBuffer::new(&configuration);
     let pool = rayon::ThreadPoolBuilder::new().build();
-    let (Ok(mut state), Ok(mut scratch), Ok(mut observation), Ok(pool)) =
-        (state, scratch, observation, pool)
-    else {
+    let (Ok(mut scratch), Ok(mut observation), Ok(pool)) = (scratch, observation, pool) else {
         return;
     };
     if populate(&mut observation, TYPICAL).is_err() {
@@ -139,11 +140,12 @@ fn posterior_sample_count_step(criterion: &mut Criterion) {
         let Ok(grid) = grid(TYPICAL) else {
             return;
         };
-        let state = ScaleState::new(configuration.clone(), grid);
-        let scratch = ScaleScratch::new(&configuration);
+        let Ok(mut state) = ScaleState::new(configuration.clone(), grid) else {
+            return;
+        };
+        let scratch = state.new_scratch();
         let observation = ObservationBuffer::new(&configuration);
-        let (Ok(mut state), Ok(mut scratch), Ok(mut observation)) = (state, scratch, observation)
-        else {
+        let (Ok(mut scratch), Ok(mut observation)) = (scratch, observation) else {
             return;
         };
         if populate(&mut observation, TYPICAL).is_err() {
@@ -179,11 +181,12 @@ fn resource_grid_step(criterion: &mut Criterion) {
         let Ok(grid) = realistic_capacity_grid(TYPICAL, cell_count) else {
             return;
         };
-        let state = ScaleState::new(configuration.clone(), grid);
-        let scratch = ScaleScratch::new(&configuration);
+        let Ok(mut state) = ScaleState::new(configuration.clone(), grid) else {
+            return;
+        };
+        let scratch = state.new_scratch();
         let observation = ObservationBuffer::new(&configuration);
-        let (Ok(mut state), Ok(mut scratch), Ok(mut observation)) = (state, scratch, observation)
-        else {
+        let (Ok(mut scratch), Ok(mut observation)) = (scratch, observation) else {
             return;
         };
         if populate(&mut observation, TYPICAL).is_err() {
@@ -238,11 +241,12 @@ fn steady_state(criterion: &mut Criterion) {
         let Ok(capacity_grid) = grid(case) else {
             return;
         };
-        let state = ScaleState::new(configuration.clone(), capacity_grid);
-        let scratch = ScaleScratch::new(&configuration);
+        let Ok(mut state) = ScaleState::new(configuration.clone(), capacity_grid) else {
+            return;
+        };
+        let scratch = state.new_scratch();
         let observation = ObservationBuffer::new(&configuration);
-        let (Ok(mut state), Ok(mut scratch), Ok(mut observation)) = (state, scratch, observation)
-        else {
+        let (Ok(mut scratch), Ok(mut observation)) = (scratch, observation) else {
             return;
         };
         if populate(&mut observation, case).is_err() {
@@ -278,11 +282,12 @@ fn capacity_grid(criterion: &mut Criterion) {
         let Ok(grid) = capacity_grid_with_cells(cell_count) else {
             return;
         };
-        let state = ScaleState::new(configuration.clone(), grid);
-        let scratch = ScaleScratch::new(&configuration);
+        let Ok(mut state) = ScaleState::new(configuration.clone(), grid) else {
+            return;
+        };
+        let scratch = state.new_scratch();
         let observation = ObservationBuffer::new(&configuration);
-        let (Ok(mut state), Ok(mut scratch), Ok(mut observation)) = (state, scratch, observation)
-        else {
+        let (Ok(mut scratch), Ok(mut observation)) = (scratch, observation) else {
             return;
         };
         let mut now = 1_u64;
@@ -323,7 +328,7 @@ fn configuration(case: BenchmarkCase) -> Result<Configuration, ConfigurationErro
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
         rebalance_time_prior: TransitionPrior::broad_fallback(),
-        objective: ServiceObjective::new(1_000_000, 0.01_f64)?,
+        objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     })
 }
 
@@ -332,7 +337,7 @@ fn construct(
     case: BenchmarkCase,
 ) -> Result<(ScaleState, ScaleScratch, ObservationBuffer), BenchmarkError> {
     let state = ScaleState::new(configuration.clone(), grid(case)?)?;
-    let scratch = ScaleScratch::new(configuration)?;
+    let scratch = state.new_scratch()?;
     let observation = ObservationBuffer::new(configuration)?;
     Ok((state, scratch, observation))
 }

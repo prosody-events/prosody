@@ -528,6 +528,8 @@ pub struct PlantSnapshot {
     pub useful_completions: u32,
     /// Cumulative completed handler attempts for all outcomes.
     pub completed_attempts: u32,
+    /// Cumulative handler attempts started for all outcomes.
+    pub started_attempts: u32,
     /// Cumulative time with at least one partition paused for reconciliation.
     pub rebalance_pause_micros: u64,
     /// Cumulative completed normal attempts.
@@ -677,6 +679,7 @@ pub struct Plant<M = SeriesAttemptModel> {
     attempt_outcomes: VecDeque<AttemptOutcome>,
     useful_completions: u32,
     completed_attempts: u32,
+    started_attempts: u32,
     rebalance_pause_micros: u64,
     normal_attempts: u32,
     normal_successes: u32,
@@ -787,6 +790,7 @@ impl<M: AttemptModel> Plant<M> {
             ),
             useful_completions: 0,
             completed_attempts: 0,
+            started_attempts: 0,
             rebalance_pause_micros: 0,
             normal_attempts: 0,
             normal_successes: 0,
@@ -1369,6 +1373,7 @@ impl<M: AttemptModel> Plant<M> {
         let owner = self.partition_owner[partition] as usize;
         self.key_active[key] = true;
         self.active_handlers += 1;
+        self.started_attempts = self.started_attempts.saturating_add(1);
         self.active_handlers_by_owner[owner] += 1;
         self.partition_active_handlers[partition] += 1;
         self.owner_at_dispatch[event_index] = owner as u32;
@@ -1626,7 +1631,10 @@ impl<M: AttemptModel> Plant<M> {
         let rate = if self.attempt_outcomes.is_empty() {
             0.0_f64
         } else {
-            failures as f64 / self.attempt_outcomes.len() as f64
+            let failures = u32::try_from(failures).map_or(u32::MAX, |value| value);
+            let attempts =
+                u32::try_from(self.attempt_outcomes.len()).map_or(u32::MAX, |value| value);
+            f64::from(failures) / f64::from(attempts)
         };
         rate < self.configuration.retry_policy.defer_threshold
     }
@@ -1829,6 +1837,7 @@ impl<M: AttemptModel> Plant<M> {
             handler_occupancy_micros: self.handler_occupancy_micros,
             useful_completions: self.useful_completions,
             completed_attempts: self.completed_attempts,
+            started_attempts: self.started_attempts,
             rebalance_pause_micros: self.rebalance_pause_micros,
             normal_attempts: self.normal_attempts,
             normal_successes: self.normal_successes,

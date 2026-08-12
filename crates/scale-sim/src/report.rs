@@ -97,11 +97,10 @@ const STORY_FIGURES: [FlowFigure; 19] = [
         "Final and retry-producing outcome counts show evidence for the reliability posterior.",
     ),
     FlowFigure::new(
-        "SLO pass probability by replica candidate",
+        "Deadline satisfaction by replica candidate",
         "16-decision-pass.svg",
-        "Light cells have high posterior pass probability. A candidate is feasible when its mass \
-         +         reaches the declared SLO probability. The lines show the selected target and \
-         actual +         replicas.",
+        "Light cells have high posterior deadline-satisfaction probability. The lines show the \
+         selected target and actual replicas.",
     ),
     FlowFigure::new(
         "Decision loss by replica candidate",

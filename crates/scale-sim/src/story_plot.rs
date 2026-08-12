@@ -325,7 +325,7 @@ fn story_panels(story: &RegimeStory<'_>) -> Result<[StoryPanel; PANEL_COUNT as u
         reporter_coverage_panel(trace),
         snapshot_age_panel(trace),
         reliability_evidence_panel(trace),
-        decision_pass_panel(trace, story.controller),
+        decision_deadline_satisfaction_panel(trace, story.controller),
         decision_loss_panel(trace, story.controller),
         capacity_predictive_panel(story.controller),
         capacity_predictive_coverage_panel(story.controller),
@@ -604,19 +604,22 @@ fn decision_loss_panel(trace: &MetricTrace, controller: &ControllerTrace) -> Sto
     .with_bounded_heatmap(decision_loss_heatmap(controller))
 }
 
-fn decision_pass_panel(trace: &MetricTrace, controller: &ControllerTrace) -> StoryPanel {
+fn decision_deadline_satisfaction_panel(
+    trace: &MetricTrace,
+    controller: &ControllerTrace,
+) -> StoryPanel {
     StoryPanel::new(
-        "replicas; light color means higher SLO pass probability",
+        "replicas; light color means higher deadline-satisfaction probability",
         vec![
             metric_u32(trace, "actual", &trace.replicas).step(),
             metric_u32(trace, "selected target", &trace.target).points(),
         ],
     )
-    .with_bounded_heatmap(decision_pass_heatmap(controller))
+    .with_bounded_heatmap(decision_deadline_satisfaction_heatmap(controller))
 }
 
-fn decision_pass_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
-    let Some(first) = controller.decision_pass_probabilities(0) else {
+fn decision_deadline_satisfaction_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
+    let Some(first) = controller.decision_deadline_satisfaction_probabilities(0) else {
         return PosteriorHeatmap {
             at_micros: Vec::new(),
             values: Vec::new(),
@@ -633,11 +636,12 @@ fn decision_pass_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
         let Some(sample) = controller.sample(index) else {
             continue;
         };
-        let Some(passes) = controller.decision_pass_probabilities(index) else {
+        let Some(satisfactions) = controller.decision_deadline_satisfaction_probabilities(index)
+        else {
             continue;
         };
         at_micros.push(sample.at_micros);
-        probabilities.extend_from_slice(passes);
+        probabilities.extend_from_slice(satisfactions);
     }
     PosteriorHeatmap {
         at_micros,

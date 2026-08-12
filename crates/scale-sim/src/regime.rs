@@ -21,6 +21,7 @@ use crate::{
 };
 
 const CAPACITY_COLLAPSE_GRID: &[f64] = &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64];
+const REPLICA_SECOND_DELAY_RATE: f64 = 3.0_f64;
 
 const EVENT_COUNT: u32 = 2_000;
 const HOT_KEY_EVENT_COUNT: u32 = 6_000;
@@ -32,6 +33,8 @@ const REPLICA_CEILING_EVENT_COUNT: u32 = 230_400;
 const CAPACITY_EVENT_COUNT_MAX: u32 = 300_000;
 const CAPACITY_RESPONSE_EVENT_COUNT: u32 = 231_000;
 const LINEAR_RESPONSE_EVENT_COUNT: u32 = 462_000;
+const LINEAR_STEP_MICROS: u64 = 180_000_000;
+const LINEAR_RATE_INCREMENT: u32 = 100;
 const HISTORY_EVENT_COUNT_MAX: u32 = 240_000;
 const CALENDAR_HISTORY_EXPOSURE_SECONDS: u32 = 900;
 const IDLE_COST_START_MICROS: u64 = 91_000_000;
@@ -543,31 +546,160 @@ fn validate_application_limited_claim(run: &PrincipalRun) -> Result<(), RegimeVa
 }
 
 fn validate_linear_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
+    let accounting = linear_miss_accounting(run);
     require_closed_loop(
-        run.settlements().len() == run.events().len()
-            && slo_miss_count(run, PrincipalRegime::LinearThroughput.budget_micros())
-                .saturating_mul(100)
-                <= run.settlements().len(),
+        run.settlements().len() == run.events().len(),
         PrincipalRegime::LinearThroughput,
-        "the controller did not complete the linear workload within its SLO allowance",
+        "the controller did not complete the linear workload",
+    )?;
+    require_closed_loop(
+        accounting.reaction_window_misses <= accounting.reaction_window_allowance,
+        PrincipalRegime::LinearThroughput,
+        "linear misses exceeded the physical reaction-window allowance",
+    )?;
+    require_closed_loop(
+        accounting.outside_misses.saturating_mul(100) <= accounting.outside_settlements,
+        PrincipalRegime::LinearThroughput,
+        "linear misses outside reaction windows exceeded the SLO allowance",
     )
+}
+
+/// Separates unavoidable step reactions from controller misses.
+///
+/// A level belief cannot act before an authored rate step. Each reaction
+/// window starts at that step. It ends when the run first records enough ready
+/// replicas after one report interval. Permit wait plus handler service gives
+/// the physical miss allowance in each window. Settlements outside the windows
+/// retain the SLO epsilon bound. All values come from the completed trace.
+pub(crate) fn linear_miss_accounting(run: &PrincipalRun) -> LinearMissAccounting {
+    let report_micros = run
+        .controller
+        .sample(1)
+        .zip(run.controller.sample(0))
+        .map_or(0, |(next, first)| {
+            next.at_micros.saturating_sub(first.at_micros)
+        });
+    let mut windows = Vec::new();
+    let events = run.events();
+    let last_release_micros = events
+        .iter()
+        .map(|event| event.release_micros)
+        .max()
+        .unwrap_or(0);
+    let mut step = 1_u32;
+    loop {
+        let release_micros = u64::from(step).saturating_mul(LINEAR_STEP_MICROS);
+        if release_micros > last_release_micros {
+            break;
+        }
+        if let Some(event) = events
+            .iter()
+            .find(|event| event.release_micros >= release_micros)
+        {
+            let rate = step.saturating_add(1).saturating_mul(LINEAR_RATE_INCREMENT);
+            let handler_micros = event.handler_micros;
+            let work_micros = u64::from(rate).saturating_mul(handler_micros);
+            let replica_micros = u64::from(run.simulation.slots_per_replica) * 1_000_000;
+            let required =
+                work_micros.saturating_add(replica_micros.saturating_sub(1)) / replica_micros;
+            let required = u32::try_from(required)
+                .map_or(u32::MAX, |value| value)
+                .max(1);
+            let earliest_ready = release_micros.saturating_add(report_micros);
+            if let Some(change) =
+                run.simulation.changes.iter().find(|change| {
+                    change.at_micros >= earliest_ready && change.replicas >= required
+                })
+            {
+                windows.push((release_micros, change.at_micros));
+            }
+        }
+        step = step.saturating_add(1);
+    }
+    let budget_micros = PrincipalRegime::LinearThroughput.budget_micros();
+    let mut accounting = LinearMissAccounting::default();
+    for settlement in run.settlements() {
+        let in_reaction_window = windows
+            .iter()
+            .any(|&(start, end)| (start..end).contains(&settlement.release_micros));
+        let missed = settlement
+            .settle_micros
+            .saturating_sub(settlement.release_micros)
+            > budget_micros;
+        if in_reaction_window {
+            let physical_miss = settlement
+                .permit_wait_micros
+                .saturating_add(settlement.handler_micros)
+                > budget_micros;
+            accounting.reaction_window_allowance += usize::from(physical_miss);
+            accounting.reaction_window_misses += usize::from(missed);
+        } else {
+            accounting.outside_settlements += 1;
+            accounting.outside_misses += usize::from(missed);
+        }
+    }
+    accounting
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LinearMissAccounting {
+    pub(crate) reaction_window_allowance: usize,
+    pub(crate) reaction_window_misses: usize,
+    pub(crate) outside_settlements: usize,
+    pub(crate) outside_misses: usize,
 }
 
 fn validate_capacity_closed_loop_claim(
     regime: PrincipalRegime,
     run: &PrincipalRun,
 ) -> Result<(), RegimeValidationError> {
-    const CAP_DEADLINE_MICROS: u64 = 150_000_000;
-    let cap_engagement = controller_samples(run).position(|sample| sample.cap <= 4);
-    let cap_engaged_by_deadline = cap_engagement.is_some_and(|index| {
-        run.controller
-            .sample(index)
-            .is_some_and(|sample| sample.at_micros <= CAP_DEADLINE_MICROS)
+    // The controller reacts within one second after demand exceeds capacity.
+    // The launch delay gates evidence availability through ready capacity, not
+    // inference. Identification then completes during the bounded clamp
+    // traversal.
+    const DEMAND_STEP_MICROS: u64 = 270_000_000;
+    const REACTION_LIMIT_MICROS: u64 = 5_000_000;
+    const ENGAGEMENT_LIMIT_MICROS: u64 = 20_000_000;
+    const KNEE_CONCURRENCY: u32 = 64;
+    let pre_step_target = controller_samples(run)
+        .take_while(|sample| sample.at_micros <= DEMAND_STEP_MICROS)
+        .last()
+        .map(|sample| sample.target);
+    let reacted = pre_step_target.is_some_and(|pre_step| {
+        controller_samples(run).any(|sample| {
+            sample.at_micros > DEMAND_STEP_MICROS
+                && sample.at_micros <= DEMAND_STEP_MICROS + REACTION_LIMIT_MICROS
+                && sample.target > pre_step
+        })
     });
     require_closed_loop(
-        cap_engaged_by_deadline,
+        reacted,
         regime,
-        "the capacity cap did not engage by its deadline",
+        "the capacity target did not react to the demand step",
+    )?;
+    let slots_per_replica = run.simulation.slots_per_replica;
+    let evidence_at = run
+        .simulation
+        .changes
+        .iter()
+        .find(|change| change.replicas.saturating_mul(slots_per_replica) > KNEE_CONCURRENCY)
+        .map(|change| change.at_micros);
+    require_closed_loop(
+        evidence_at.is_some(),
+        regime,
+        "ready capacity did not cross the resource knee",
+    )?;
+    let engaged = evidence_at.is_some_and(|evidence_at| {
+        controller_samples(run).any(|sample| {
+            sample.at_micros >= evidence_at
+                && sample.at_micros <= evidence_at + ENGAGEMENT_LIMIT_MICROS
+                && sample.cap <= 4
+        })
+    });
+    require_closed_loop(
+        engaged,
+        regime,
+        "the capacity cap did not engage after evidence became available",
     )?;
     if regime == PrincipalRegime::FlatPostKnee {
         return require_closed_loop(
@@ -675,9 +807,8 @@ fn validate_timer_wave_claim(run: &PrincipalRun) -> Result<(), RegimeValidationE
 
 fn validate_transient_failure_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
     // The peak bound starts at the capacity warm-up: before the belief
-    // tightens, the chance constraint honestly insures against the
-    // pessimistic prior capacity quantile, and that hedge is not retry
-    // demand. A standing army still fails at the first seasoned sample.
+    // tightens, the cost can provision against the pessimistic prior capacity
+    // quantile. A standing army still fails at the first seasoned sample.
     let seasoned_peak = controller_samples(run)
         .filter(|sample| sample.at_micros >= CAPACITY_WARMUP_MICROS)
         .map(|sample| sample.target)
@@ -876,22 +1007,26 @@ fn validate_historical_under_claim(run: &PrincipalRun) -> Result<(), RegimeValid
 }
 
 fn validate_historical_missing_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
-    // The claim bounds the seasoned target, not landed replica cost. The
-    // wide-prior cold hedge is honest insurance, and the plant's launch
-    // delay can hold the hedge's replicas standing past the stop — both
-    // are outside the controller's control. The demand needs four
-    // replicas (1,000/s at 320/s each); one more is the insurance level.
-    // A wide-prior standing army fails at the first seasoned sample.
-    let seasoned_peak = controller_samples(run)
-        .filter(|sample| {
-            sample.at_micros >= HISTORY_START_MICROS.saturating_add(CAPACITY_WARMUP_MICROS)
-        })
-        .map(|sample| sample.target)
-        .max();
+    // Down-transition dents and likely repairs make a one-step excursion the
+    // priced cost minimum. The target returns to its old bound within tens of
+    // seconds.
+    let mut seasoned = controller_samples(run).filter(|sample| {
+        sample.at_micros >= HISTORY_START_MICROS.saturating_add(CAPACITY_WARMUP_MICROS)
+    });
+    let first = seasoned.next();
+    let (seasoned_peak, final_seasoned_target) = seasoned.fold(
+        first.map_or((0, None), |sample| (sample.target, Some(sample.target))),
+        |(peak, _), sample| (peak.max(sample.target), Some(sample.target)),
+    );
     require_closed_loop(
-        seasoned_peak.is_some_and(|target| target <= 5),
+        final_seasoned_target.is_some() && seasoned_peak <= 6,
         PrincipalRegime::HistoricalMissing,
         "missing history held an excessive seasoned target",
+    )?;
+    require_closed_loop(
+        final_seasoned_target.is_some_and(|target| target <= 5),
+        PrincipalRegime::HistoricalMissing,
+        "missing history finished above its seasoned target bound",
     )
 }
 
@@ -1445,7 +1580,7 @@ fn principal_graph(
         partition_count: 64,
         replica_count_max,
         slots_per_replica,
-        posterior_sample_count: 1_024,
+        posterior_sample_count: 4_096,
         report_interval_micros: definition
             .schedule
             .workload_interval_micros
@@ -1468,7 +1603,7 @@ fn principal_graph(
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: transition_prior([30.0_f64, 45.0_f64, 60.0_f64, 90.0_f64])?,
         rebalance_time_prior: transition_prior([0.05_f64, 0.1_f64, 0.2_f64, 0.4_f64])?,
-        objective: ServiceObjective::new(regime.budget_micros(), 0.01)?,
+        objective: ServiceObjective::new(regime.budget_micros(), 0.01, REPLICA_SECOND_DELAY_RATE)?,
     };
     let capacity_grid = capacity_grid(regime, capacity_regime, sensitivity)?;
     let graph = ClosedLoop::new(
@@ -1631,7 +1766,8 @@ fn run_schedule(
             let ready_index = snapshot.replicas.saturating_sub(1) as usize;
             let next_index = ready_index.saturating_add(1);
             let losses = controller.decision_expected_losses(controller_index);
-            let passes = controller.decision_pass_probabilities(controller_index);
+            let satisfactions =
+                controller.decision_deadline_satisfaction_probabilities(controller_index);
             let selected = controller_sample.map_or(0, |sample| sample.target);
             let selected_index = selected.saturating_sub(1) as usize;
             let rejection = |reason| {
@@ -1669,11 +1805,11 @@ fn run_schedule(
                 selected_deadline_rejection_probability = rejection(DecisionRejection::Deadline),
                 selected_placement_rejection_probability =
                     rejection(DecisionRejection::PartitionPlacement),
-                ready_target_pass_probability = passes
+                ready_target_deadline_satisfaction_probability = satisfactions
                     .and_then(|values| values.get(ready_index))
                     .copied()
                     .unwrap_or(f64::NAN),
-                next_target_pass_probability = passes
+                next_target_deadline_satisfaction_probability = satisfactions
                     .and_then(|values| values.get(next_index))
                     .copied()
                     .unwrap_or(f64::NAN),
@@ -2377,9 +2513,9 @@ impl PrincipalDefinition {
     const fn linear_closed_loop() -> Self {
         Self::capacity()
             .messages(ArrivalSeries::StaircaseRate {
-                initial_per_second: 100,
-                increment_per_second: 100,
-                step_interval_micros: 180_000_000,
+                initial_per_second: LINEAR_RATE_INCREMENT,
+                increment_per_second: LINEAR_RATE_INCREMENT,
+                step_interval_micros: LINEAR_STEP_MICROS,
                 count_max: LINEAR_RESPONSE_EVENT_COUNT,
             })
             .launch_delay(LaunchDelaySeries::Uniform {

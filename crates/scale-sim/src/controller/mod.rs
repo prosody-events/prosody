@@ -51,22 +51,20 @@ pub struct ControllerSample {
     pub shortfall: f64,
     /// Posterior expected fractional loss.
     pub expected_loss: f64,
-    /// Selected action violation weight sum.
-    pub selected_violation_weight_sum: f64,
-    /// Selected action excess delay sum.
-    pub selected_excess_delay_sum: f64,
+    /// Selected action late-area sum.
+    pub selected_late_area_mean: f64,
     /// Selected action replica-seconds sum.
-    pub selected_replica_seconds_sum: f64,
+    pub selected_replica_seconds_mean: f64,
+    /// Selected action expected-cost sum.
+    pub selected_cost: f64,
     /// Zero-based runner-up action index.
     pub runner_up_action_index: u32,
-    /// Runner-up action violation weight sum.
-    pub runner_up_violation_weight_sum: f64,
-    /// Runner-up action excess delay sum.
-    pub runner_up_excess_delay_sum: f64,
+    /// Runner-up action late-area sum.
+    pub runner_up_late_area_mean: f64,
     /// Runner-up action replica-seconds sum.
-    pub runner_up_replica_seconds_sum: f64,
-    /// Violation weight allowance for the decision.
-    pub violation_allowance: f64,
+    pub runner_up_replica_seconds_mean: f64,
+    /// Runner-up action expected-cost sum.
+    pub runner_up_cost: f64,
     /// Zero-based demand-floor action index.
     pub demand_floor: u32,
     /// Posterior expected arrival rate.
@@ -238,14 +236,13 @@ pub struct ControllerTrace {
     hold_reason: Vec<Option<HoldReason>>,
     shortfall: Vec<f64>,
     expected_loss: Vec<f64>,
-    selected_violation_weight_sum: Vec<f64>,
-    selected_excess_delay_sum: Vec<f64>,
-    selected_replica_seconds_sum: Vec<f64>,
+    selected_late_area_mean: Vec<f64>,
+    selected_replica_seconds_mean: Vec<f64>,
+    selected_cost: Vec<f64>,
     runner_up_action_index: Vec<u32>,
-    runner_up_violation_weight_sum: Vec<f64>,
-    runner_up_excess_delay_sum: Vec<f64>,
-    runner_up_replica_seconds_sum: Vec<f64>,
-    violation_allowance: Vec<f64>,
+    runner_up_late_area_mean: Vec<f64>,
+    runner_up_replica_seconds_mean: Vec<f64>,
+    runner_up_cost: Vec<f64>,
     demand_floor: Vec<u32>,
     arrival_rate_per_second: Vec<f64>,
     arrival_evidence: Vec<bool>,
@@ -304,7 +301,7 @@ pub struct ControllerTrace {
     arrival_rate: Vec<f64>,
     decision_candidate_count: usize,
     decision_expected_losses: Vec<f64>,
-    decision_pass_probabilities: Vec<f64>,
+    decision_deadline_satisfaction_probabilities: Vec<f64>,
     decision_deadline_rejections: Vec<f64>,
     decision_placement_rejections: Vec<f64>,
 }
@@ -314,6 +311,61 @@ struct DiscretePosteriorTrace {
     values: Vec<f64>,
     prior: Vec<f64>,
     probabilities: Vec<f64>,
+}
+
+struct PosteriorTraces {
+    service_time: DiscretePosteriorTrace,
+    collapse: DiscretePosteriorTrace,
+    knee: DiscretePosteriorTrace,
+    saturation_state: DiscretePosteriorTrace,
+    normal_retry: DiscretePosteriorTrace,
+    failure_retry: DiscretePosteriorTrace,
+    partition_share: DiscretePosteriorTrace,
+    lead_time_up: DiscretePosteriorTrace,
+    lead_time_down: DiscretePosteriorTrace,
+    rebalance_time_up: DiscretePosteriorTrace,
+    rebalance_time_down: DiscretePosteriorTrace,
+}
+
+impl PosteriorTraces {
+    fn new(state: &ScaleState, capacity: usize) -> Result<Self, PlantError> {
+        let trace = |query| DiscretePosteriorTrace::new(state, query, capacity);
+        Ok(Self {
+            service_time: trace(PosteriorQuery::ServiceTime)?,
+            collapse: trace(PosteriorQuery::Collapse)?,
+            knee: trace(PosteriorQuery::Knee)?,
+            saturation_state: trace(PosteriorQuery::SaturationState)?,
+            normal_retry: trace(PosteriorQuery::NormalRetryProbability)?,
+            failure_retry: trace(PosteriorQuery::FailureRetryProbability)?,
+            partition_share: trace(PosteriorQuery::PartitionShare)?,
+            lead_time_up: trace(PosteriorQuery::LeadTime {
+                direction: TransitionDirection::Up,
+                replica_delta: 1,
+            })?,
+            lead_time_down: trace(PosteriorQuery::LeadTime {
+                direction: TransitionDirection::Down,
+                replica_delta: 1,
+            })?,
+            rebalance_time_up: trace(PosteriorQuery::RebalanceTime {
+                direction: TransitionDirection::Up,
+                replica_delta: 1,
+            })?,
+            rebalance_time_down: trace(PosteriorQuery::RebalanceTime {
+                direction: TransitionDirection::Down,
+                replica_delta: 1,
+            })?,
+        })
+    }
+}
+
+fn initial_capacity_posterior(
+    state: &ScaleState,
+    value_count: usize,
+) -> Result<(Vec<f64>, Vec<f64>), PlantError> {
+    let mut values = vec![0.0_f64; value_count];
+    let mut probabilities = vec![0.0_f64; value_count];
+    state.write_capacity_posterior(&mut values, &mut probabilities)?;
+    Ok((values, probabilities))
 }
 
 impl ControllerTrace {
@@ -334,57 +386,9 @@ impl ControllerTrace {
         let decision_cell_count = capacity
             .checked_mul(decision_candidate_count)
             .ok_or(PlantError::PlatformLimit)?;
-        let mut capacity_posterior_values = vec![0.0_f64; posterior_value_count];
-        let mut capacity_prior_probabilities = vec![0.0_f64; posterior_value_count];
-        state.write_capacity_posterior(
-            &mut capacity_posterior_values,
-            &mut capacity_prior_probabilities,
-        )?;
-        let service_time_posterior =
-            DiscretePosteriorTrace::new(state, PosteriorQuery::ServiceTime, capacity)?;
-        let collapse_posterior =
-            DiscretePosteriorTrace::new(state, PosteriorQuery::Collapse, capacity)?;
-        let knee_posterior = DiscretePosteriorTrace::new(state, PosteriorQuery::Knee, capacity)?;
-        let saturation_state_posterior =
-            DiscretePosteriorTrace::new(state, PosteriorQuery::SaturationState, capacity)?;
-        let normal_retry_posterior =
-            DiscretePosteriorTrace::new(state, PosteriorQuery::NormalRetryProbability, capacity)?;
-        let failure_retry_posterior =
-            DiscretePosteriorTrace::new(state, PosteriorQuery::FailureRetryProbability, capacity)?;
-        let partition_share_posterior =
-            DiscretePosteriorTrace::new(state, PosteriorQuery::PartitionShare, capacity)?;
-        let lead_time_up_posterior = DiscretePosteriorTrace::new(
-            state,
-            PosteriorQuery::LeadTime {
-                direction: TransitionDirection::Up,
-                replica_delta: 1,
-            },
-            capacity,
-        )?;
-        let lead_time_down_posterior = DiscretePosteriorTrace::new(
-            state,
-            PosteriorQuery::LeadTime {
-                direction: TransitionDirection::Down,
-                replica_delta: 1,
-            },
-            capacity,
-        )?;
-        let rebalance_time_up_posterior = DiscretePosteriorTrace::new(
-            state,
-            PosteriorQuery::RebalanceTime {
-                direction: TransitionDirection::Up,
-                replica_delta: 1,
-            },
-            capacity,
-        )?;
-        let rebalance_time_down_posterior = DiscretePosteriorTrace::new(
-            state,
-            PosteriorQuery::RebalanceTime {
-                direction: TransitionDirection::Down,
-                replica_delta: 1,
-            },
-            capacity,
-        )?;
+        let (capacity_posterior_values, capacity_prior_probabilities) =
+            initial_capacity_posterior(state, posterior_value_count)?;
+        let posteriors = PosteriorTraces::new(state, capacity)?;
         Ok(Self {
             at_micros: Vec::with_capacity(capacity),
             scenario_count: Vec::with_capacity(capacity),
@@ -394,14 +398,13 @@ impl ControllerTrace {
             hold_reason: Vec::with_capacity(capacity),
             shortfall: Vec::with_capacity(capacity),
             expected_loss: Vec::with_capacity(capacity),
-            selected_violation_weight_sum: Vec::with_capacity(capacity),
-            selected_excess_delay_sum: Vec::with_capacity(capacity),
-            selected_replica_seconds_sum: Vec::with_capacity(capacity),
+            selected_late_area_mean: Vec::with_capacity(capacity),
+            selected_replica_seconds_mean: Vec::with_capacity(capacity),
+            selected_cost: Vec::with_capacity(capacity),
             runner_up_action_index: Vec::with_capacity(capacity),
-            runner_up_violation_weight_sum: Vec::with_capacity(capacity),
-            runner_up_excess_delay_sum: Vec::with_capacity(capacity),
-            runner_up_replica_seconds_sum: Vec::with_capacity(capacity),
-            violation_allowance: Vec::with_capacity(capacity),
+            runner_up_late_area_mean: Vec::with_capacity(capacity),
+            runner_up_replica_seconds_mean: Vec::with_capacity(capacity),
+            runner_up_cost: Vec::with_capacity(capacity),
             demand_floor: Vec::with_capacity(capacity),
             arrival_rate_per_second: Vec::with_capacity(capacity),
             arrival_evidence: Vec::with_capacity(capacity),
@@ -444,23 +447,23 @@ impl ControllerTrace {
             capacity_posterior_values,
             capacity_prior_probabilities,
             capacity_posterior_probabilities: Vec::with_capacity(posterior_cell_count),
-            service_time_posterior,
-            collapse_posterior,
-            knee_posterior,
-            saturation_state_posterior,
-            normal_retry_posterior,
-            failure_retry_posterior,
-            partition_share_posterior,
-            lead_time_up_posterior,
-            lead_time_down_posterior,
-            rebalance_time_up_posterior,
-            rebalance_time_down_posterior,
+            service_time_posterior: posteriors.service_time,
+            collapse_posterior: posteriors.collapse,
+            knee_posterior: posteriors.knee,
+            saturation_state_posterior: posteriors.saturation_state,
+            normal_retry_posterior: posteriors.normal_retry,
+            failure_retry_posterior: posteriors.failure_retry,
+            partition_share_posterior: posteriors.partition_share,
+            lead_time_up_posterior: posteriors.lead_time_up,
+            lead_time_down_posterior: posteriors.lead_time_down,
+            rebalance_time_up_posterior: posteriors.rebalance_time_up,
+            rebalance_time_down_posterior: posteriors.rebalance_time_down,
             arrival_prior: state.arrival_posterior(),
             arrival_shape: Vec::with_capacity(capacity),
             arrival_rate: Vec::with_capacity(capacity),
             decision_candidate_count,
             decision_expected_losses: Vec::with_capacity(decision_cell_count),
-            decision_pass_probabilities: Vec::with_capacity(decision_cell_count),
+            decision_deadline_satisfaction_probabilities: Vec::with_capacity(decision_cell_count),
             decision_deadline_rejections: Vec::with_capacity(decision_cell_count),
             decision_placement_rejections: Vec::with_capacity(decision_cell_count),
         })
@@ -494,14 +497,13 @@ impl ControllerTrace {
             hold_reason: self.hold_reason[index],
             shortfall: self.shortfall[index],
             expected_loss: self.expected_loss[index],
-            selected_violation_weight_sum: self.selected_violation_weight_sum[index],
-            selected_excess_delay_sum: self.selected_excess_delay_sum[index],
-            selected_replica_seconds_sum: self.selected_replica_seconds_sum[index],
+            selected_late_area_mean: self.selected_late_area_mean[index],
+            selected_replica_seconds_mean: self.selected_replica_seconds_mean[index],
+            selected_cost: self.selected_cost[index],
             runner_up_action_index: self.runner_up_action_index[index],
-            runner_up_violation_weight_sum: self.runner_up_violation_weight_sum[index],
-            runner_up_excess_delay_sum: self.runner_up_excess_delay_sum[index],
-            runner_up_replica_seconds_sum: self.runner_up_replica_seconds_sum[index],
-            violation_allowance: self.violation_allowance[index],
+            runner_up_late_area_mean: self.runner_up_late_area_mean[index],
+            runner_up_replica_seconds_mean: self.runner_up_replica_seconds_mean[index],
+            runner_up_cost: self.runner_up_cost[index],
             demand_floor: self.demand_floor[index],
             arrival_rate_per_second: self.arrival_rate_per_second[index],
             arrival_evidence: self.arrival_evidence_sample(index),
@@ -607,12 +609,14 @@ impl ControllerTrace {
         self.decision_expected_losses.get(start..end)
     }
 
-    /// Returns the SLO pass probability for each replica candidate.
+    /// Returns the absolute deadline-satisfaction probability for each
+    /// candidate.
     #[must_use]
-    pub fn decision_pass_probabilities(&self, index: usize) -> Option<&[f64]> {
+    pub fn decision_deadline_satisfaction_probabilities(&self, index: usize) -> Option<&[f64]> {
         let start = index.checked_mul(self.decision_candidate_count)?;
         let end = start.checked_add(self.decision_candidate_count)?;
-        self.decision_pass_probabilities.get(start..end)
+        self.decision_deadline_satisfaction_probabilities
+            .get(start..end)
     }
 
     /// Returns one rejection-reason probability for each replica candidate.
@@ -860,22 +864,20 @@ impl ControllerTrace {
             .and_then(|selected| scratch.decision_column_summary(selected));
         let selected = summary.map(|summary| summary.selected);
         let runner_up = summary.and_then(|summary| summary.runner_up);
-        self.selected_violation_weight_sum
-            .push(selected.map_or(f64::NAN, |action| action.violation_weight_sum));
-        self.selected_excess_delay_sum
-            .push(selected.map_or(f64::NAN, |action| action.excess_delay_sum));
-        self.selected_replica_seconds_sum
-            .push(selected.map_or(f64::NAN, |action| action.replica_seconds_sum));
+        self.selected_late_area_mean
+            .push(selected.map_or(f64::NAN, |action| action.late_area_mean));
+        self.selected_replica_seconds_mean
+            .push(selected.map_or(f64::NAN, |action| action.replica_seconds_mean));
+        self.selected_cost
+            .push(selected.map_or(f64::NAN, |action| action.cost));
         self.runner_up_action_index
             .push(runner_up.map_or(u32::MAX, |action| action.action_index));
-        self.runner_up_violation_weight_sum
-            .push(runner_up.map_or(f64::NAN, |action| action.violation_weight_sum));
-        self.runner_up_excess_delay_sum
-            .push(runner_up.map_or(f64::NAN, |action| action.excess_delay_sum));
-        self.runner_up_replica_seconds_sum
-            .push(runner_up.map_or(f64::NAN, |action| action.replica_seconds_sum));
-        self.violation_allowance
-            .push(summary.map_or(f64::NAN, |summary| summary.violation_allowance));
+        self.runner_up_late_area_mean
+            .push(runner_up.map_or(f64::NAN, |action| action.late_area_mean));
+        self.runner_up_replica_seconds_mean
+            .push(runner_up.map_or(f64::NAN, |action| action.replica_seconds_mean));
+        self.runner_up_cost
+            .push(runner_up.map_or(f64::NAN, |action| action.cost));
         self.demand_floor
             .push(summary.map_or(u32::MAX, |summary| summary.demand_floor));
     }
@@ -889,14 +891,13 @@ impl ControllerTrace {
             return Err(PlantError::MetricCapacity);
         }
         self.decision_expected_losses.resize(decision_end, f64::NAN);
-        if decision_end > self.decision_pass_probabilities.capacity() {
+        if decision_end > self.decision_deadline_satisfaction_probabilities.capacity() {
             return Err(PlantError::MetricCapacity);
         }
-        self.decision_pass_probabilities
+        self.decision_deadline_satisfaction_probabilities
             .resize(decision_end, f64::NAN);
-        match scratch.write_decision_curve(
+        match scratch.write_decision_expected_losses(
             &mut self.decision_expected_losses[decision_start..decision_end],
-            &mut self.decision_pass_probabilities[decision_start..decision_end],
         ) {
             Ok(()) | Err(prosody_scale_core::DecisionCurveError::Unavailable) => {}
             Err(error) => return Err(error.into()),
@@ -908,6 +909,13 @@ impl ControllerTrace {
             decision_start,
             decision_end,
         )?;
+        for (satisfaction, rejection) in self.decision_deadline_satisfaction_probabilities
+            [decision_start..decision_end]
+            .iter_mut()
+            .zip(&self.decision_deadline_rejections[decision_start..decision_end])
+        {
+            *satisfaction = 1.0_f64 - *rejection;
+        }
         write_rejection_curve(
             scratch,
             DecisionRejection::PartitionPlacement,
@@ -1066,6 +1074,7 @@ struct CapacityWindow {
     concurrency: f64,
     exposure_seconds: f64,
     completed_attempts: u32,
+    started_attempts: u32,
 }
 
 /// One aggregate-readiness observation segment.
@@ -1144,10 +1153,11 @@ struct SnapshotPipeline {
 
 impl CapacityWindow {
     fn evidence(self) -> Result<ResourceWindow, PlantError> {
-        Ok(ResourceWindow::new(
+        Ok(ResourceWindow::new_with_starts(
             self.concurrency,
             self.exposure_seconds,
             self.completed_attempts,
+            self.started_attempts,
         )?)
     }
 
@@ -1202,7 +1212,7 @@ impl<Workload> ClosedLoop<Workload> {
         let partition_posterior_count = trace.partition_share_posterior.values.len();
         let transition_capacity =
             usize::try_from(trace_count_max).map_err(|_| ConfigurationError::PlatformLimit)?;
-        let scratch = ScaleScratch::new(core_configuration)?;
+        let scratch = state.new_scratch()?;
         let observation = ObservationBuffer::new(core_configuration)?;
         Ok(Self {
             workload,
@@ -1627,11 +1637,17 @@ impl<Workload> ClosedLoop<Workload> {
             .plant
             .completed_attempts
             .saturating_sub(previous_attempts);
+        let previous_starts = context.history.started_attempts(0).unwrap_or(0);
+        let started_attempts = context
+            .plant
+            .started_attempts
+            .saturating_sub(previous_starts);
         let exposure_seconds = Duration::from_micros(exposure_micros).as_secs_f64();
         let current = CapacityWindow {
             concurrency: Duration::from_micros(occupancy).as_secs_f64() / exposure_seconds,
             exposure_seconds,
             completed_attempts,
+            started_attempts,
         };
         self.latest_capacity_window = Some(current);
         self.observation.set_resource_window(current.evidence()?)?;
@@ -1741,30 +1757,13 @@ impl<Workload> ClosedLoop<Workload> {
             .history
             .desired_replicas(0)
             .unwrap_or(context.plant.replicas);
-        let held_target = (0..self.trace.len())
-            .rev()
-            .find_map(|index| self.trace.sample(index).filter(|sample| !sample.hold))
-            .map_or(context.plant.replicas, |sample| sample.target);
-        let last_cap = (0..self.trace.len()).rev().find_map(|index| {
-            self.trace
-                .sample(index)
-                .map(|sample| sample.cap)
-                .filter(|cap| *cap > 0)
-        });
-        let held_cap = last_cap.map_or(self.configuration.core().replica_count_max, |cap| cap);
+        let (held_target, held_cap) = self.held_target_and_cap(context.plant.replicas);
         let external_scale = matches!(
             inputs.scale,
             ScaleDirective::ExternalHold | ScaleDirective::Request { .. }
         );
-        let (resource_concurrency, attempt_throughput_per_second) = self
-            .latest_capacity_window
-            .map_or((f64::NAN, f64::NAN), |window| {
-                (
-                    window.concurrency,
-                    f64::from(window.completed_attempts) / window.exposure_seconds,
-                )
-            });
-        let sample = match decision {
+        let (resource_concurrency, attempt_throughput_per_second) = self.latest_capacity_rates();
+        let (diagnostics, target, cap, hold, hold_reason) = match decision {
             ScaleDecision::Apply(apply) => {
                 if !external_scale {
                     inputs.scale = if apply.target == desired {
@@ -1775,119 +1774,97 @@ impl<Workload> ClosedLoop<Workload> {
                         }
                     };
                 }
-                ControllerSample {
-                    at_micros: context.now_micros,
-                    scenario_count: apply.diagnostics.scenario_count,
-                    target: apply.target,
-                    cap: apply.cap,
-                    hold: false,
-                    hold_reason: None,
-                    shortfall: apply.diagnostics.shortfall,
-                    expected_loss: apply.diagnostics.expected_loss,
-                    selected_violation_weight_sum: f64::NAN,
-                    selected_excess_delay_sum: f64::NAN,
-                    selected_replica_seconds_sum: f64::NAN,
-                    runner_up_action_index: u32::MAX,
-                    runner_up_violation_weight_sum: f64::NAN,
-                    runner_up_excess_delay_sum: f64::NAN,
-                    runner_up_replica_seconds_sum: f64::NAN,
-                    violation_allowance: f64::NAN,
-                    demand_floor: u32::MAX,
-                    arrival_rate_per_second: apply.diagnostics.arrival_rate_per_second,
-                    arrival_evidence: self.arrival_evidence_sample,
-                    arrival_predictive_low_count: arrival_predictive.quantiles[0],
-                    arrival_predictive_median_count: arrival_predictive.quantiles[1],
-                    arrival_predictive_high_count: arrival_predictive.quantiles[2],
-                    arrival_predictive_rank: arrival_predictive.rank,
-                    partition_evidence_count: partition_predictive.evidence_count,
-                    partition_predictive_covered_counts: partition_predictive.covered_counts,
-                    partition_predictive_rank_counts: partition_predictive.rank_counts,
-                    partition_log_loss_sum: partition_predictive.log_loss_sum,
-                    partition_entropy_sum: partition_predictive.entropy_sum,
-                    lead_time_evidence: self.lead_time_evidence_sample,
-                    lead_time_predictive_low_seconds: lead_time_predictive.quantiles[0],
-                    lead_time_predictive_median_seconds: lead_time_predictive.quantiles[1],
-                    lead_time_predictive_high_seconds: lead_time_predictive.quantiles[2],
-                    lead_time_predictive_rank: lead_time_predictive.rank,
-                    capacity_per_second: apply.diagnostics.capacity_per_second,
-                    capacity_low_per_second: apply.diagnostics.capacity_low_per_second,
-                    capacity_median_per_second: apply.diagnostics.capacity_median_per_second,
-                    capacity_high_per_second: apply.diagnostics.capacity_high_per_second,
-                    saturation_probability: apply.diagnostics.saturation_probability,
-                    no_knee_probability: apply.diagnostics.no_knee_probability,
-                    lead_time_up_seconds: apply.diagnostics.lead_time_up_seconds,
-                    lead_time_down_seconds: apply.diagnostics.lead_time_down_seconds,
-                    lead_time_seconds: apply.diagnostics.lead_time_seconds,
-                    resource_concurrency,
-                    attempt_throughput_per_second,
-                    capacity_evidence: self.capacity_evidence_sample,
-                    capacity_predictive_low_per_second: capacity_predictive.quantiles[0],
-                    capacity_predictive_median_per_second: capacity_predictive.quantiles[1],
-                    capacity_predictive_high_per_second: capacity_predictive.quantiles[2],
-                    capacity_predictive_rank: capacity_predictive.rank,
-                    reporter,
-                }
+                (apply.diagnostics, apply.target, apply.cap, false, None)
             }
-            ScaleDecision::Hold(hold) => {
+            ScaleDecision::Hold(held) => {
                 if !external_scale {
                     inputs.scale = ScaleDirective::Hold;
                 }
-                ControllerSample {
-                    at_micros: context.now_micros,
-                    scenario_count: hold.diagnostics.scenario_count,
-                    target: held_target,
-                    cap: held_cap,
-                    hold: true,
-                    hold_reason: Some(hold.reason),
-                    shortfall: hold.diagnostics.shortfall,
-                    expected_loss: hold.diagnostics.expected_loss,
-                    selected_violation_weight_sum: f64::NAN,
-                    selected_excess_delay_sum: f64::NAN,
-                    selected_replica_seconds_sum: f64::NAN,
-                    runner_up_action_index: u32::MAX,
-                    runner_up_violation_weight_sum: f64::NAN,
-                    runner_up_excess_delay_sum: f64::NAN,
-                    runner_up_replica_seconds_sum: f64::NAN,
-                    violation_allowance: f64::NAN,
-                    demand_floor: u32::MAX,
-                    arrival_rate_per_second: hold.diagnostics.arrival_rate_per_second,
-                    arrival_evidence: self.arrival_evidence_sample,
-                    arrival_predictive_low_count: arrival_predictive.quantiles[0],
-                    arrival_predictive_median_count: arrival_predictive.quantiles[1],
-                    arrival_predictive_high_count: arrival_predictive.quantiles[2],
-                    arrival_predictive_rank: arrival_predictive.rank,
-                    partition_evidence_count: partition_predictive.evidence_count,
-                    partition_predictive_covered_counts: partition_predictive.covered_counts,
-                    partition_predictive_rank_counts: partition_predictive.rank_counts,
-                    partition_log_loss_sum: partition_predictive.log_loss_sum,
-                    partition_entropy_sum: partition_predictive.entropy_sum,
-                    lead_time_evidence: self.lead_time_evidence_sample,
-                    lead_time_predictive_low_seconds: lead_time_predictive.quantiles[0],
-                    lead_time_predictive_median_seconds: lead_time_predictive.quantiles[1],
-                    lead_time_predictive_high_seconds: lead_time_predictive.quantiles[2],
-                    lead_time_predictive_rank: lead_time_predictive.rank,
-                    capacity_per_second: hold.diagnostics.capacity_per_second,
-                    capacity_low_per_second: hold.diagnostics.capacity_low_per_second,
-                    capacity_median_per_second: hold.diagnostics.capacity_median_per_second,
-                    capacity_high_per_second: hold.diagnostics.capacity_high_per_second,
-                    saturation_probability: hold.diagnostics.saturation_probability,
-                    no_knee_probability: hold.diagnostics.no_knee_probability,
-                    lead_time_up_seconds: hold.diagnostics.lead_time_up_seconds,
-                    lead_time_down_seconds: hold.diagnostics.lead_time_down_seconds,
-                    lead_time_seconds: hold.diagnostics.lead_time_seconds,
-                    resource_concurrency,
-                    attempt_throughput_per_second,
-                    capacity_evidence: self.capacity_evidence_sample,
-                    capacity_predictive_low_per_second: capacity_predictive.quantiles[0],
-                    capacity_predictive_median_per_second: capacity_predictive.quantiles[1],
-                    capacity_predictive_high_per_second: capacity_predictive.quantiles[2],
-                    capacity_predictive_rank: capacity_predictive.rank,
-                    reporter,
-                }
+                (
+                    held.diagnostics,
+                    held_target,
+                    held_cap,
+                    true,
+                    Some(held.reason),
+                )
             }
+        };
+        let sample = ControllerSample {
+            at_micros: context.now_micros,
+            scenario_count: diagnostics.scenario_count,
+            target,
+            cap,
+            hold,
+            hold_reason,
+            shortfall: diagnostics.shortfall,
+            expected_loss: diagnostics.expected_loss,
+            selected_late_area_mean: f64::NAN,
+            selected_replica_seconds_mean: f64::NAN,
+            selected_cost: f64::NAN,
+            runner_up_action_index: u32::MAX,
+            runner_up_late_area_mean: f64::NAN,
+            runner_up_replica_seconds_mean: f64::NAN,
+            runner_up_cost: f64::NAN,
+            demand_floor: u32::MAX,
+            arrival_rate_per_second: diagnostics.arrival_rate_per_second,
+            arrival_evidence: self.arrival_evidence_sample,
+            arrival_predictive_low_count: arrival_predictive.quantiles[0],
+            arrival_predictive_median_count: arrival_predictive.quantiles[1],
+            arrival_predictive_high_count: arrival_predictive.quantiles[2],
+            arrival_predictive_rank: arrival_predictive.rank,
+            partition_evidence_count: partition_predictive.evidence_count,
+            partition_predictive_covered_counts: partition_predictive.covered_counts,
+            partition_predictive_rank_counts: partition_predictive.rank_counts,
+            partition_log_loss_sum: partition_predictive.log_loss_sum,
+            partition_entropy_sum: partition_predictive.entropy_sum,
+            lead_time_evidence: self.lead_time_evidence_sample,
+            lead_time_predictive_low_seconds: lead_time_predictive.quantiles[0],
+            lead_time_predictive_median_seconds: lead_time_predictive.quantiles[1],
+            lead_time_predictive_high_seconds: lead_time_predictive.quantiles[2],
+            lead_time_predictive_rank: lead_time_predictive.rank,
+            capacity_per_second: diagnostics.capacity_per_second,
+            capacity_low_per_second: diagnostics.capacity_low_per_second,
+            capacity_median_per_second: diagnostics.capacity_median_per_second,
+            capacity_high_per_second: diagnostics.capacity_high_per_second,
+            saturation_probability: diagnostics.saturation_probability,
+            no_knee_probability: diagnostics.no_knee_probability,
+            lead_time_up_seconds: diagnostics.lead_time_up_seconds,
+            lead_time_down_seconds: diagnostics.lead_time_down_seconds,
+            lead_time_seconds: diagnostics.lead_time_seconds,
+            resource_concurrency,
+            attempt_throughput_per_second,
+            capacity_evidence: self.capacity_evidence_sample,
+            capacity_predictive_low_per_second: capacity_predictive.quantiles[0],
+            capacity_predictive_median_per_second: capacity_predictive.quantiles[1],
+            capacity_predictive_high_per_second: capacity_predictive.quantiles[2],
+            capacity_predictive_rank: capacity_predictive.rank,
+            reporter,
         };
         self.trace.push(&sample, &self.state, &self.scratch)?;
         Ok(inputs)
+    }
+
+    fn held_target_and_cap(&self, current_replicas: u32) -> (u32, u32) {
+        let held_target = (0..self.trace.len())
+            .rev()
+            .find_map(|index| self.trace.sample(index).filter(|sample| !sample.hold))
+            .map_or(current_replicas, |sample| sample.target);
+        let held_cap = (0..self.trace.len())
+            .rev()
+            .find_map(|index| self.trace.sample(index).map(|sample| sample.cap))
+            .filter(|cap| *cap > 0)
+            .map_or(self.configuration.core().replica_count_max, |cap| cap);
+        (held_target, held_cap)
+    }
+
+    fn latest_capacity_rates(&self) -> (f64, f64) {
+        self.latest_capacity_window
+            .map_or((f64::NAN, f64::NAN), |window| {
+                (
+                    window.concurrency,
+                    f64::from(window.completed_attempts) / window.exposure_seconds,
+                )
+            })
     }
 
     fn arrival_prediction(&self, now_micros: u64) -> Result<ArrivalPrediction, PlantError> {

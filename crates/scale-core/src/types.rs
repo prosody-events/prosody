@@ -254,46 +254,37 @@ pub(crate) struct CalendarForecast<'a> {
 pub struct ServiceObjective {
     budget_micros: u64,
     epsilon: f64,
-    slo_violation_probability: f64,
+    replica_second_delay_rate: f64,
 }
 
 impl ServiceObjective {
-    const DEFAULT_SLO_VIOLATION_PROBABILITY: f64 = 0.05_f64;
-
     /// Constructs a validated objective.
     ///
     /// # Errors
     ///
-    /// Returns an error for a zero budget or an invalid miss fraction.
-    pub fn new(budget_micros: u64, epsilon: f64) -> Result<Self, ConfigurationError> {
+    /// Returns an error for a zero budget, an invalid miss fraction, or an
+    /// invalid rate.
+    pub fn new(
+        budget_micros: u64,
+        epsilon: f64,
+        replica_second_delay_rate: f64,
+    ) -> Result<Self, ConfigurationError> {
         if budget_micros == 0 {
             return Err(ConfigurationError::ZeroBudget);
         }
         if !(0.0_f64..1.0_f64).contains(&epsilon) {
             return Err(ConfigurationError::InvalidEpsilon { epsilon });
         }
+        if !replica_second_delay_rate.is_finite() || replica_second_delay_rate <= 0.0_f64 {
+            return Err(ConfigurationError::InvalidReplicaSecondDelayRate {
+                rate: replica_second_delay_rate,
+            });
+        }
         Ok(Self {
             budget_micros,
             epsilon,
-            slo_violation_probability: Self::DEFAULT_SLO_VIOLATION_PROBABILITY,
+            replica_second_delay_rate,
         })
-    }
-
-    /// Sets the posterior-future probability budget for an SLO violation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the probability is outside the open interval
-    /// from zero to one half.
-    pub fn with_slo_violation_probability(
-        mut self,
-        probability: f64,
-    ) -> Result<Self, ConfigurationError> {
-        if !probability.is_finite() || probability <= 0.0_f64 || probability >= 0.5_f64 {
-            return Err(ConfigurationError::InvalidSloViolationProbability { probability });
-        }
-        self.slo_violation_probability = probability;
-        Ok(self)
     }
 
     /// Returns the latency budget in microseconds.
@@ -308,10 +299,10 @@ impl ServiceObjective {
         self.epsilon
     }
 
-    /// Returns the posterior-future probability budget for an SLO violation.
+    /// Returns event-delay-seconds priced per replica-second.
     #[must_use]
-    pub const fn slo_violation_probability(self) -> f64 {
-        self.slo_violation_probability
+    pub const fn replica_second_delay_rate(self) -> f64 {
+        self.replica_second_delay_rate
     }
 }
 
@@ -1381,13 +1372,11 @@ pub enum ConfigurationError {
         /// Invalid miss fraction.
         epsilon: f64,
     },
-    /// The posterior-future SLO violation probability is invalid.
-    #[error(
-        "SLO violation probability {probability} must be greater than zero and less than one half"
-    )]
-    InvalidSloViolationProbability {
-        /// Invalid probability.
-        probability: f64,
+    /// The replica-second delay rate is not positive and finite.
+    #[error("replica-second delay rate {rate} must be positive and finite")]
+    InvalidReplicaSecondDelayRate {
+        /// Invalid rate.
+        rate: f64,
     },
     /// The failure-service weight is not in the closed unit interval.
     #[error("failure service weight {weight} must be between zero and one")]
@@ -1406,6 +1395,14 @@ pub enum ConfigurationError {
     ZeroBound {
         /// Name of the zero bound.
         name: &'static str,
+    },
+    /// The posterior budget cannot provide two draws for each capacity cell.
+    #[error("posterior sample count {sample_count} must be at least {minimum}")]
+    InsufficientPosteriorSamples {
+        /// Configured posterior sample count.
+        sample_count: u32,
+        /// Minimum sample count for this capacity grid.
+        minimum: u32,
     },
     /// A validated count does not fit this platform.
     #[error("a validated count exceeds this platform's address space")]
