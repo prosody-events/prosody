@@ -5,9 +5,9 @@ package prosody.peer.v1;
 // Operations prosody peers perform on each other. Later peer features add
 // methods here rather than services of their own.
 service PeerService {
-  // Delivers one response frame to its target peer. The gRPC status reports
+  // Delivers one handler result to its target peer. The gRPC status reports
   // delivery. An empty response body cannot report a false success.
-  rpc DeliverResponse(DeliverResponseRequest) returns (DeliverResponseResponse);
+  rpc DeliverResult(DeliverResultRequest) returns (DeliverResultResponse);
 }
 
 // Prosody's retry classification for one handler failure.
@@ -30,8 +30,8 @@ message HandlerError {
   string message = 2;
 }
 
-// One response, addressed to the peer that is waiting for it.
-message DeliverResponseRequest {
+// One handler result, addressed to the peer that is waiting for it.
+message DeliverResultRequest {
   // Which peer this frame is for. A peer that is not the target forwards the
   // frame or rejects it, and never accepts it.
   bytes target_peer = 1; // 16 bytes
@@ -49,4 +49,4 @@ message DeliverResponseRequest {
 }
 
 // The gRPC status reports the delivery result. A response has no fields.
-message DeliverResponseResponse {}
+message DeliverResultResponse {}

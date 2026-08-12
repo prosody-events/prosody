@@ -33,7 +33,7 @@ fn main() -> Result<()> {
         .build_client(false)
         .codec_path("crate::router::grpc::codec::ServerFrameCodec")
         .extern_path(
-            ".prosody.peer.v1.DeliverResponseRequest",
+            ".prosody.peer.v1.DeliverResultRequest",
             "crate::response::frame::ResponseFrame",
         )
         .extern_path(
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
             ".prosody.peer.v1.ErrorCategory",
             "crate::error::ErrorCategory",
         )
-        .extern_path(".prosody.peer.v1.DeliverResponseResponse", "()")
+        .extern_path(".prosody.peer.v1.DeliverResultResponse", "()")
         .server_mod_attribute(".", GENERATED_LINTS)
         .compile_protos(&["proto/prosody/peer/v1/peer.proto"], &["proto"])
 }

@@ -1,7 +1,7 @@
 //! gRPC client address and method construction.
 
 use crate::router::SendFailure;
-use crate::router::grpc::client::{DELIVER_RESPONSE, GRPC_TIMEOUT_LIMIT, outbound_timeout};
+use crate::router::grpc::client::{DELIVER_RESULT, GRPC_TIMEOUT_LIMIT, outbound_timeout};
 use crate::router::grpc::generated::peer_service_server::SERVICE_NAME;
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
@@ -13,9 +13,9 @@ use tokio::time::Instant;
 #[test]
 fn the_method_path_names_the_generated_service() -> Result<()> {
     ensure!(
-        DELIVER_RESPONSE.as_str() == format!("/{SERVICE_NAME}/DeliverResponse"),
+        DELIVER_RESULT.as_str() == format!("/{SERVICE_NAME}/DeliverResult"),
         "the client calls {}, which is not the generated service's method",
-        DELIVER_RESPONSE.as_str()
+        DELIVER_RESULT.as_str()
     );
     Ok(())
 }

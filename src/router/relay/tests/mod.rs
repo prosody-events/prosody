@@ -119,7 +119,7 @@ impl Process {
     pub(super) async fn deliver(&self, frame: ResponseFrame, granted: Duration) -> Result<Code> {
         let mut request = Request::new(frame);
         request.set_timeout(granted);
-        Ok(match self.service.deliver_response(request).await {
+        Ok(match self.service.deliver_result(request).await {
             Ok(_) => Code::Ok,
             Err(status) => status.code(),
         })

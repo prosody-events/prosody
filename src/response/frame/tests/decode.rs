@@ -172,12 +172,12 @@ fn the_schema_models_results_as_oneof() -> Result<()> {
     let Some(message) = file
         .message_type
         .iter()
-        .find(|message| message.name() == "DeliverResponseRequest")
+        .find(|message| message.name() == "DeliverResultRequest")
     else {
-        bail!("the peer schema must define DeliverResponseRequest");
+        bail!("the peer schema must define DeliverResultRequest");
     };
     let Some(oneof) = message.oneof_decl.first() else {
-        bail!("DeliverResponseRequest must define its result oneof");
+        bail!("DeliverResultRequest must define its result oneof");
     };
     assert_eq!(oneof.name(), "result");
     let arms = [

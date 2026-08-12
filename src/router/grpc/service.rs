@@ -18,7 +18,7 @@ use tonic::{Request, Response, Status};
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span, debug_span, error};
 
-/// Serves [`DeliverResponse`](PeerServiceApi::deliver_response) for one peer.
+/// Serves [`DeliverResult`](PeerServiceApi::deliver_result) for one peer.
 ///
 /// A frame is accepted only by the process it names, sent on once when it names
 /// another, and refused when it already passed through a relay. The id every
@@ -46,7 +46,7 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
     /// Hands one frame to the waiter it names, sends it on to the process it
     /// names, or refuses it — and answers with the status the whole path came
     /// to.
-    async fn deliver_response(
+    async fn deliver_result(
         &self,
         request: Request<ResponseFrame>,
     ) -> Result<Response<()>, Status> {
