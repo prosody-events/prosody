@@ -1,4 +1,4 @@
-//! Response waiters keyed by request and subsystem.
+//! Pending responses keyed by request and subsystem.
 
 use crate::peer::requester::RequestError;
 use crate::peer::response::frame::ResponseFrame;
@@ -23,9 +23,6 @@ const INLINE_AWAITED: usize = 2;
 #[cfg(test)]
 pub(crate) mod tests;
 
-type WaiterKey = (RequestId, SubsystemName);
-type Waiters = HashMap<WaiterKey, oneshot::Sender<ResponseFrame>, RandomState>;
-
 static PENDING: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
     meter("prosody")
         .i64_up_down_counter("prosody.peer.requests.pending")
@@ -34,31 +31,34 @@ static PENDING: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Response waiters for one process.
+type ResponseKey = (RequestId, SubsystemName);
+type FrameSender = oneshot::Sender<ResponseFrame>;
+type FrameReceiver = oneshot::Receiver<ResponseFrame>;
+type PendingSenders = HashMap<ResponseKey, FrameSender, RandomState>;
+
+/// Pending response channels for one process.
 ///
-/// Each sender has two states. It is present and waiting, or it is absent and
-/// consumed. Removal is the only transition.
+/// Each key has at most one sender. Response delivery, registration drop, and
+/// shutdown remove senders. No operation restores a removed sender.
 pub(crate) struct PendingRegistry {
-    waiters: Waiters,
+    senders: PendingSenders,
     closed: AtomicBool,
 }
 
-type Waiter = oneshot::Receiver<ResponseFrame>;
-
-/// Removes all response senders that remain when one request ends.
+/// Owns one request's receivers and removes its remaining senders on drop.
 pub(crate) struct Registration {
     registry: Arc<PendingRegistry>,
     id: RequestId,
-    keys: SmallVec<[WaiterKey; INLINE_AWAITED]>,
-    receivers: SmallVec<[Waiter; INLINE_AWAITED]>,
+    keys: SmallVec<[ResponseKey; INLINE_AWAITED]>,
+    receivers: SmallVec<[FrameReceiver; INLINE_AWAITED]>,
     deadline: Instant,
 }
 
 impl PendingRegistry {
-    /// Builds an empty waiter registry.
+    /// Builds an empty pending response registry.
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            waiters: HashMap::with_hasher(RandomState::default()),
+            senders: HashMap::with_hasher(RandomState::default()),
             closed: AtomicBool::new(false),
         })
     }
@@ -83,7 +83,7 @@ impl PendingRegistry {
             for name in subsystems {
                 let (sender, receiver) = oneshot::channel();
                 let key = (id, name.clone());
-                if self.waiters.insert_sync(key.clone(), sender).is_err() {
+                if self.senders.insert_sync(key.clone(), sender).is_err() {
                     if keys.iter().any(|(_, present)| present == name) {
                         self.remove(&keys);
                         return Err(RequestError::DuplicateSubsystem { name: name.clone() });
@@ -113,10 +113,10 @@ impl PendingRegistry {
         })
     }
 
-    /// Delivers one frame to its exact waiter.
+    /// Delivers one frame to its exact pending request.
     pub(crate) fn accept(&self, frame: ResponseFrame) -> ResponseDisposition {
         let key = (frame.header.request, frame.header.subsystem.clone());
-        let Some((_, sender)) = self.waiters.remove_sync(&key) else {
+        let Some((_, sender)) = self.senders.remove_sync(&key) else {
             return ResponseDisposition::UnknownRequest;
         };
         if sender.send(frame).is_ok() {
@@ -133,16 +133,16 @@ impl PendingRegistry {
     /// Closes admission and wakes all request tasks.
     pub(crate) fn terminate(&self) {
         self.close_admission();
-        self.waiters.retain_sync(|_, _| false);
+        self.senders.retain_sync(|_, _| false);
     }
 
     pub(in crate::peer::requester) fn is_closed(&self) -> bool {
         self.closed.load(Acquire)
     }
 
-    fn remove(&self, keys: &[WaiterKey]) {
+    fn remove(&self, keys: &[ResponseKey]) {
         for key in keys {
-            drop(self.waiters.remove_sync(key));
+            drop(self.senders.remove_sync(key));
         }
     }
 }
@@ -156,9 +156,9 @@ impl Registration {
         self.deadline
     }
 
-    pub(in crate::peer::requester) fn take_waiters(
+    pub(in crate::peer::requester) fn take_receivers(
         &mut self,
-    ) -> SmallVec<[Waiter; INLINE_AWAITED]> {
+    ) -> SmallVec<[FrameReceiver; INLINE_AWAITED]> {
         mem::take(&mut self.receivers)
     }
 

@@ -1,4 +1,4 @@
-//! Flat waiter map lifecycle invariants.
+//! Flat pending response map lifecycle invariants.
 
 use super::{
     MAX_TIMEOUT, POOL, TestCodec, TestCodecError, distinct_indices, failure, names, poll_once,
@@ -44,9 +44,10 @@ impl Arbitrary for ArrivalTrace {
     }
 }
 
-/// Each subsystem owns one waiter, whatever order responses arrive in.
+/// Each subsystem owns one pending response, whatever order responses arrive
+/// in.
 #[quickcheck]
-fn arrivals_consume_only_their_exact_waiter(trace: ArrivalTrace) -> TestResult {
+fn arrivals_consume_only_their_exact_pending_response(trace: ArrivalTrace) -> TestResult {
     match run_arrivals(trace) {
         Ok(()) => TestResult::passed(),
         Err(error) => TestResult::error(format!("{error:#}")),
@@ -54,7 +55,7 @@ fn arrivals_consume_only_their_exact_waiter(trace: ArrivalTrace) -> TestResult {
 }
 
 #[tokio::test(start_paused = true)]
-async fn each_waiter_is_removed_once() -> Result<()> {
+async fn each_pending_response_is_removed_once() -> Result<()> {
     let registry = registry();
     let names = names(&["billing", "ledger"])?;
     let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
@@ -141,12 +142,12 @@ async fn responses_do_not_cancel_producer_completion() -> Result<()> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn every_request_exit_removes_remaining_waiters() -> Result<()> {
+async fn every_request_exit_removes_remaining_responses() -> Result<()> {
     let names = names(&["billing", "ledger"])?;
 
     let registry = registry();
     drop(register(&registry, &names, MAX_TIMEOUT)?);
-    assert_eq!(pending_len(&registry), 0, "cancellation left waiters");
+    assert_eq!(pending_len(&registry), 0);
 
     let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
     let results = collect::<TestCodec, u32, _, TestCodecError>(&mut registration, async {
@@ -158,7 +159,7 @@ async fn every_request_exit_removes_remaining_waiters() -> Result<()> {
         vec![Err(ResponseError::Timeout), Err(ResponseError::Timeout)]
     );
     drop(registration);
-    assert_eq!(pending_len(&registry), 0, "timeout left waiters");
+    assert_eq!(pending_len(&registry), 0);
 
     let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
     let outcome = collect::<TestCodec, u32, _, TestCodecError>(&mut registration, async {
@@ -169,7 +170,7 @@ async fn every_request_exit_removes_remaining_waiters() -> Result<()> {
         bail!("a send failure did not fail the request");
     }
     drop(registration);
-    assert_eq!(pending_len(&registry), 0, "send failure left waiters");
+    assert_eq!(pending_len(&registry), 0);
 
     let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
     registry.terminate();
@@ -178,7 +179,7 @@ async fn every_request_exit_removes_remaining_waiters() -> Result<()> {
         bail!("shutdown did not fail the request");
     }
     drop(registration);
-    assert_eq!(pending_len(&registry), 0, "shutdown left waiters");
+    assert_eq!(pending_len(&registry), 0);
     Ok(())
 }
 

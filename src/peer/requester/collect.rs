@@ -27,13 +27,13 @@ where
     PE: Error,
 {
     let deadline = registration.deadline();
-    let waiters = registration.take_waiters();
-    let mut results = (0..waiters.len())
+    let receivers = registration.take_receivers();
+    let mut results = (0..receivers.len())
         .map(|_| Err(ResponseError::Timeout))
         .collect::<Vec<_>>();
     let mut responses = FuturesUnordered::new();
-    for (index, waiter) in waiters.into_iter().enumerate() {
-        responses.push(waiter.map(move |frame| (index, frame)));
+    for (index, receiver) in receivers.into_iter().enumerate() {
+        responses.push(receiver.map(move |frame| (index, frame)));
     }
 
     let mut produce = pin!(produce);

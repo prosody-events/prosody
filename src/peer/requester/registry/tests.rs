@@ -1,8 +1,7 @@
 //! Test-only registration ownership for router integration tests.
 
-use super::{PendingRegistry, Registration, Waiter};
+use super::{FrameReceiver, INLINE_AWAITED, PendingRegistry, Registration};
 use crate::peer::response::RequestId;
-use crate::peer::response::frame::ResponseFrame;
 use crate::peer::response::headers::RequestDeadline;
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
@@ -11,15 +10,14 @@ use smallvec::SmallVec;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
 
 pub(crate) struct TestRegistration {
     registration: Registration,
-    waiters: SmallVec<[Waiter; 2]>,
+    receivers: SmallVec<[FrameReceiver; INLINE_AWAITED]>,
 }
 
 pub(crate) fn pending_len(registry: &PendingRegistry) -> usize {
-    registry.waiters.len()
+    registry.senders.len()
 }
 
 impl TestRegistration {
@@ -31,10 +29,10 @@ impl TestRegistration {
         let deadline = RequestDeadline::after(timeout)
             .ok_or_else(|| eyre!("the test deadline was out of range"))?;
         let mut registration = registry.register::<Infallible>(subsystems, deadline)?;
-        let waiters = registration.take_waiters();
+        let receivers = registration.take_receivers();
         Ok(Self {
             registration,
-            waiters,
+            receivers,
         })
     }
 
@@ -42,15 +40,15 @@ impl TestRegistration {
         self.registration.id()
     }
 
-    pub(crate) fn receiver(&mut self) -> Result<oneshot::Receiver<ResponseFrame>> {
-        self.waiters
+    pub(crate) fn receiver(&mut self) -> Result<FrameReceiver> {
+        self.receivers
             .pop()
-            .ok_or_else(|| eyre!("the registration had no waiter"))
+            .ok_or_else(|| eyre!("the registration had no response receiver"))
     }
 
     pub(crate) fn received(&mut self) -> bool {
-        self.waiters
+        self.receivers
             .first_mut()
-            .is_some_and(|waiter| waiter.try_recv().is_ok())
+            .is_some_and(|receiver| receiver.try_recv().is_ok())
     }
 }
