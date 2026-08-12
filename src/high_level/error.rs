@@ -26,13 +26,13 @@ pub enum HighLevelClientError<E> {
     #[error("failed to initialize consumer: {0:#}")]
     Consumer(#[from] ConsumerError),
 
-    /// Error when client shutdown fails.
+    /// Client teardown failed.
     #[error("failed to shut down client: {0:#}")]
-    Shutdown(#[from] ShutdownError),
+    ShutdownFailed(#[from] ShutdownError),
 
-    /// Error when an operation starts after client shutdown.
+    /// The client no longer accepts operations.
     #[error("client is shut down")]
-    ShutDown,
+    Closed,
 
     /// Error when the scheduler configuration is invalid.
     #[error("invalid scheduler configuration: {0:#}")]

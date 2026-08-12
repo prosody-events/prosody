@@ -296,10 +296,7 @@ fn erased_client_retains_consumer_failure_until_subscribe() -> Result<()> {
     let retained = client.clone();
     TEST_RUNTIME.block_on(client.shutdown())?;
     let after_shutdown = TEST_RUNTIME.block_on(retained.subscribe(NoOpHandler));
-    assert!(matches!(
-        after_shutdown,
-        Err(HighLevelClientError::ShutDown)
-    ));
+    assert!(matches!(after_shutdown, Err(HighLevelClientError::Closed)));
     Ok(())
 }
 

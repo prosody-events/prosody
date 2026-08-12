@@ -32,7 +32,7 @@ pub use readers::{
 #[derive(Clone, Debug)]
 pub enum ErasedConsumerState<T> {
     /// The client is shut down.
-    ShutDown,
+    Shutdown,
     /// No valid consumer configuration exists.
     Unconfigured,
     /// Consumer configuration failed.
@@ -162,7 +162,7 @@ where
         payload: T::Payload,
     ) -> Result<(), HighLevelClientError<WireError<T>>> {
         let guard = self.client.read().await;
-        let client = guard.as_deref().ok_or(HighLevelClientError::ShutDown)?;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.send(topic, key, payload).await
     }
 
@@ -196,7 +196,7 @@ where
     /// Returns an error if the client is shut down or cannot subscribe.
     pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>> {
         let guard = self.client.read().await;
-        let client = guard.as_deref().ok_or(HighLevelClientError::ShutDown)?;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.subscribe(handler).await
     }
 
@@ -207,7 +207,7 @@ where
     /// Returns an error if the client is shut down or is not subscribed.
     pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError<WireError<T>>> {
         let guard = self.client.read().await;
-        let client = guard.as_deref().ok_or(HighLevelClientError::ShutDown)?;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.unsubscribe().await
     }
 
@@ -219,7 +219,7 @@ where
     pub async fn shutdown(self) -> Result<(), HighLevelClientError<WireError<T>>> {
         let client = {
             let mut guard = self.client.write().await;
-            guard.take().ok_or(HighLevelClientError::ShutDown)?
+            guard.take().ok_or(HighLevelClientError::Closed)?
         };
         client.shutdown().await
     }
@@ -228,7 +228,7 @@ where
     pub async fn consumer_state(&self) -> ErasedConsumerState<T> {
         let guard = self.client.read().await;
         let Some(client) = guard.as_deref() else {
-            return ErasedConsumerState::ShutDown;
+            return ErasedConsumerState::Shutdown;
         };
         client.consumer_state().await
     }
@@ -245,7 +245,7 @@ where
         cache: ErasedReadCache,
     ) -> Result<SharedValueReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
         let guard = self.client.read().await;
-        let client = guard.as_deref().ok_or(HighLevelClientError::ShutDown)?;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.value_state(subsystem, name, cache).await
     }
 
@@ -261,7 +261,7 @@ where
         cache: ErasedReadCache,
     ) -> Result<SharedMapReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
         let guard = self.client.read().await;
-        let client = guard.as_deref().ok_or(HighLevelClientError::ShutDown)?;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.map_state(subsystem, name, cache).await
     }
 
@@ -277,7 +277,7 @@ where
         cache: ErasedReadCache,
     ) -> Result<SharedDequeReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
         let guard = self.client.read().await;
-        let client = guard.as_deref().ok_or(HighLevelClientError::ShutDown)?;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.deque_state(subsystem, name, cache).await
     }
 
