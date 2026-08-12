@@ -106,8 +106,8 @@ impl PipelineMiddlewareStack {
             .layer(message_defer_middleware)
             .layer(self.retry_middleware);
         let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let (leaf, requests) = response.terminate(handler);
-        let provider = middleware.with_provider(leaf);
+        let (inner_provider, requests) = response.into_parts(handler);
+        let provider = middleware.with_provider(inner_provider);
         let services = StartupServices {
             version,
             telemetry: &self.telemetry,

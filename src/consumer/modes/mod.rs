@@ -31,42 +31,42 @@ use crate::subsystem::SubsystemName;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-/// Terminates one middleware stack without peer responses.
+/// Disables peer responses for one consumer.
 pub(crate) struct NoResponses;
 
-/// Terminates one middleware stack with peer responses.
+/// Enables peer responses for one subsystem.
 pub(crate) struct Responding<'a, C, R> {
     router: &'a R,
     subsystem: SubsystemName,
     codec: PhantomData<fn() -> C>,
 }
 
-/// Selects one consumer's leaf and result-request reader at compile time.
+/// Builds one consumer's response-specific provider and result-request reader.
 pub(crate) trait ResponsePolicy<H>
 where
     H: FallibleHandler + Clone,
 {
-    type Leaf: FallibleHandlerProvider<
+    type Provider: FallibleHandlerProvider<
         Handler: FallibleHandler<Payload = H::Payload> + SettlementHandler,
     >;
     type Requests: ResultRequestReader + 'static;
 
     fn request_subsystem(&self) -> Option<&SubsystemName>;
-    fn terminate(self, handler: H) -> (Self::Leaf, Self::Requests);
+    fn into_parts(self, handler: H) -> (Self::Provider, Self::Requests);
 }
 
 impl<H> ResponsePolicy<H> for NoResponses
 where
     H: FallibleHandler + Clone,
 {
-    type Leaf = FallibleCloneProvider<LeafHandler<H>>;
+    type Provider = FallibleCloneProvider<LeafHandler<H>>;
     type Requests = IgnoreRequests;
 
     fn request_subsystem(&self) -> Option<&SubsystemName> {
         None
     }
 
-    fn terminate(self, handler: H) -> (Self::Leaf, Self::Requests) {
+    fn into_parts(self, handler: H) -> (Self::Provider, Self::Requests) {
         (
             FallibleCloneProvider::new(LeafHandler::new(handler)),
             IgnoreRequests,
@@ -92,14 +92,14 @@ where
     H::Output: Sync + 'static,
     H::Error: Sync + 'static,
 {
-    type Leaf = FallibleCloneProvider<RespondHandler<LeafHandler<H>, C, R::Response>>;
+    type Provider = FallibleCloneProvider<RespondHandler<LeafHandler<H>, C, R::Response>>;
     type Requests = SubsystemName;
 
     fn request_subsystem(&self) -> Option<&SubsystemName> {
         Some(&self.subsystem)
     }
 
-    fn terminate(self, handler: H) -> (Self::Leaf, Self::Requests) {
+    fn into_parts(self, handler: H) -> (Self::Provider, Self::Requests) {
         let responder = Arc::new(Responder::new(
             self.router.response(),
             self.subsystem.clone(),

@@ -41,8 +41,8 @@ where
         )?
         .layer(LogMiddleware::new());
         let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let (leaf, requests) = response.terminate(handler);
-        let provider = middleware.with_provider(leaf);
+        let (inner_provider, requests) = response.into_parts(handler);
+        let provider = middleware.with_provider(inner_provider);
         let providers = PartitionProviders {
             triggers: components.trigger,
             state: components.state,
