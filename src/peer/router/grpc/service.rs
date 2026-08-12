@@ -4,7 +4,7 @@
 use super::deadline::inbound_deadline;
 use super::generated::peer_service_server::PeerService as PeerServiceApi;
 use super::inject::MetadataExtractor;
-use crate::otel::carry_parent;
+use crate::otel::context_with_parent;
 use crate::peer::response::ResponseDisposition;
 use crate::peer::response::frame::ResponseFrame;
 use crate::peer::response::frame::encode::Forwarded;
@@ -66,7 +66,7 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
         );
         // A caller that sent no propagation headers, or broken ones, still gets
         // its response delivered: the span is simply unparented.
-        let context = carry_parent(
+        let context = context_with_parent(
             &span,
             self.propagator
                 .extract(&MetadataExtractor::new(request.metadata())),
@@ -104,7 +104,7 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
                         otel.kind = "client",
                         peer.target = %target,
                     );
-                    let forward_context = carry_parent(&forward, context.clone());
+                    let forward_context = context_with_parent(&forward, context.clone());
                     // Awaited rather than spawned, so this answer covers the
                     // whole path: a responder is never told it succeeded while
                     // the requester still waits.

@@ -129,7 +129,7 @@ macro_rules! related_span {
 ///
 /// A context that cannot be attached is logged. The work continues with the
 /// carried context.
-pub(crate) fn carry_parent(span: &Span, context: Context) -> Context {
+pub(crate) fn context_with_parent(span: &Span, context: Context) -> Context {
     if span.is_disabled() {
         return context;
     }

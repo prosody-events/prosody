@@ -1,7 +1,7 @@
 use color_eyre::Result;
 use opentelemetry::trace::TraceContextExt as _;
 
-use crate::otel::{SpanRelation, carry_parent};
+use crate::otel::{SpanRelation, context_with_parent};
 use crate::test_util::{
     assert_span_relation, captured_spans, captured_spans_filtered, sampled_remote_context,
 };
@@ -32,7 +32,7 @@ fn a_disabled_span_preserves_its_carried_context() {
     let carried = sampled_remote_context();
     let expected = carried.span().span_context().clone();
     captured_spans_filtered(LevelFilter::INFO, || {
-        let actual = carry_parent(&debug_span!("filtered"), carried);
+        let actual = context_with_parent(&debug_span!("filtered"), carried);
         assert_eq!(actual.span().span_context(), &expected);
     });
 }

@@ -3,7 +3,7 @@
 use super::metrics::{DropReason, Stage};
 use crate::codec::Codec;
 use crate::error::ClassifyError;
-use crate::otel::carry_parent;
+use crate::otel::context_with_parent;
 use crate::peer::response::ResponseDisposition;
 use crate::peer::response::frame::FrameHeader;
 use crate::peer::response::frame::encode::{Staged, stage_error, stage_success};
@@ -60,7 +60,7 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
         peer.disposition = Empty,
         peer.preference = Empty,
     );
-    let context = carry_parent(&span, trace);
+    let context = context_with_parent(&span, trace);
     let outcome = match prepared {
         PreparedResponse::Ready(frame) => {
             deliver_route(router, frame, deadline, &context)
