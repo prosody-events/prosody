@@ -28,15 +28,11 @@ use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
-use crate::response::frame::FrameHeader;
-use crate::response::headers::RequestDeadline;
 use crate::response::headers::ResultRequest;
 use crate::response::sender::{ResponseRoute, deliver_response, stage};
 use crate::subsystem::SubsystemName;
 use crate::timers::Trigger;
 use opentelemetry::Context;
-use std::fmt::Display;
-use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use thiserror::Error;
@@ -105,35 +101,12 @@ pub(crate) struct RespondHandler<H, C: Codec, R: ResponseRoute> {
 
 impl<C: Codec, R: ResponseRoute> Responder<C, R> {
     /// Builds a responder from one statically composed response route.
-    pub(crate) fn new_route(route: R, subsystem: SubsystemName) -> Self {
+    pub(crate) fn new(route: R, subsystem: SubsystemName) -> Self {
         Self {
             route,
             subsystem,
             codec: PhantomData,
         }
-    }
-
-    /// The name this responder answers for, and the one the decode path admits.
-    pub(crate) fn subsystem(&self) -> &SubsystemName {
-        &self.subsystem
-    }
-
-    /// Encodes a result, applies its commit hook, and then delivers it.
-    async fn respond<E, F, Fut>(
-        &self,
-        header: FrameHeader,
-        result: Result<C::Payload, E>,
-        trace: Context,
-        deadline: RequestDeadline,
-        after_commit: F,
-    ) where
-        E: ClassifyError + Display,
-        F: FnOnce(Result<C::Payload, E>) -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        let response = stage::<C, E>(header, result.as_ref());
-        after_commit(result).await;
-        deliver_response(&self.route, response, trace, deadline).await;
     }
 }
 
@@ -239,12 +212,10 @@ where
             return self.handler.after_commit(context, result).await;
         };
         let deadline = request.deadline();
-        let header = request.delivery_header(self.responder.subsystem().clone());
-        self.responder
-            .respond(header, result, trace, deadline, |result| {
-                self.handler.after_commit(context, result)
-            })
-            .await;
+        let header = request.delivery_header(self.responder.subsystem.clone());
+        let response = stage::<C, _>(header, result.as_ref());
+        self.handler.after_commit(context, result).await;
+        deliver_response(&self.responder.route, response, trace, deadline).await;
     }
 
     /// Forwards a non-final invocation's result to the inner hook.

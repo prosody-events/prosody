@@ -100,7 +100,7 @@ where
     }
 
     fn terminate(self, handler: H) -> (Self::Leaf, Self::Admission) {
-        let responder = Arc::new(Responder::new_route(
+        let responder = Arc::new(Responder::new(
             self.router.response(),
             self.subsystem.clone(),
         ));
