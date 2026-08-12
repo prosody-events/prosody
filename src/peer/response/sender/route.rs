@@ -10,10 +10,11 @@ use crate::peer::response::frame::encode::{Staged, stage_error, stage_success};
 use crate::peer::response::headers::RequestDeadline;
 use crate::peer::router::{NetworkRouter, Preference, ResponseSender};
 use opentelemetry::Context;
+use opentelemetry_semantic_conventions::attribute::ERROR_TYPE;
 use std::fmt::Display;
 use std::future::Future;
 use tracing::field::Empty;
-use tracing::{Instrument, debug_span, error, warn};
+use tracing::{Instrument, Span, debug_span, error, warn};
 
 use crate::peer::router::LocalTarget;
 
@@ -54,6 +55,12 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
     let span = debug_span!(
         "peer.response.send",
         otel.kind = "client",
+        rpc.system.name = Empty,
+        rpc.method = Empty,
+        rpc.response.status_code = Empty,
+        server.address = Empty,
+        server.port = Empty,
+        error.type = Empty,
         peer.target = %header.target,
         peer.request = %header.request,
         peer.subsystem = %header.subsystem,
@@ -86,6 +93,9 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
         }
         Err(reason) => {
             span.record("peer.disposition", reason.label());
+            if reason != DropReason::SendFailed {
+                span.record(ERROR_TYPE, reason.label());
+            }
             span.in_scope(|| error!(error = %reason.label()));
             reason.record();
         }
@@ -123,6 +133,7 @@ impl ResponseRoute for LocalTarget {
         if disposition == ResponseDisposition::Accepted {
             Ok(RouteOutcome::Delivered(Delivery::Local))
         } else {
+            Span::current().record(ERROR_TYPE, disposition.label());
             Err(DropReason::SendFailed)
         }
     }

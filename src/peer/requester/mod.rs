@@ -19,6 +19,9 @@ use crate::{Codec, EventIdentity, Topic};
 use opentelemetry::KeyValue;
 use opentelemetry::global::meter;
 use opentelemetry::metrics::Histogram;
+use opentelemetry_semantic_conventions::attribute::{
+    ERROR_TYPE, MESSAGING_MESSAGE_CONVERSATION_ID,
+};
 use rdkafka::message::{Header, OwnedHeaders};
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -178,6 +181,11 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         fields(
             otel.kind = "client",
             messaging.system = "kafka",
+            messaging.operation.name = "request",
+            messaging.operation.type = "request",
+            messaging.destination.name = topic.as_ref(),
+            messaging.kafka.message.key = %key,
+            messaging.message.conversation_id = Empty,
             topic = topic.as_ref(),
             key = %key,
             response.peer = %self.peer,
@@ -189,6 +197,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             responses.failed = Empty,
             responses.missing = Empty,
             responses.errors = Empty,
+            error.type = Empty,
             subsystems = subsystems.len() as i64,
         ),
         err
@@ -212,9 +221,21 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         let mut peer_buf = [0_u8; ID_TEXT_LEN];
         let mut deadline_buf = itoa::Buffer::new();
 
-        let deadline = RequestDeadline::after(timeout).ok_or(RequestError::DeadlineOutOfRange)?;
-        let registration = self.registry.register(subsystems, deadline)?;
+        let deadline = RequestDeadline::after(timeout).ok_or_else(|| {
+            record_request_error(&RequestError::<C::Error>::DeadlineOutOfRange);
+            RequestError::DeadlineOutOfRange
+        })?;
+        let registration = self
+            .registry
+            .register(subsystems, deadline)
+            .inspect_err(|error| {
+                record_request_error(error);
+            })?;
         Span::current().record("request.id", display(registration.id()));
+        Span::current().record(
+            MESSAGING_MESSAGE_CONVERSATION_ID,
+            display(registration.id()),
+        );
 
         record_headers = append_request_headers(
             record_headers,
@@ -251,11 +272,26 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             Span::current().record("request.outcome", completeness);
             LATENCY.record(waited, &[KeyValue::new("outcome", completeness)]);
         } else {
+            if let Err(error) = &collected {
+                record_request_error(error);
+            }
             Span::current().record("request.outcome", "failed");
             LATENCY.record(waited, &[KeyValue::new("outcome", "failed")]);
         }
         collected
     }
+}
+
+fn record_request_error<E: Error>(error: &RequestError<E>) {
+    let error_type = match error {
+        RequestError::NoSubsystems => "no_subsystems",
+        RequestError::DuplicateSubsystem { .. } => "duplicate_subsystem",
+        RequestError::ReservedHeader { .. } => "reserved_header",
+        RequestError::DeadlineOutOfRange => "deadline_out_of_range",
+        RequestError::ShuttingDown => "shutting_down",
+        RequestError::Produce(_) => "produce_error",
+    };
+    Span::current().record(ERROR_TYPE, error_type);
 }
 
 fn request_headers<'name, 'value, H, E>(

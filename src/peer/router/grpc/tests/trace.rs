@@ -11,10 +11,12 @@ use super::{ALPHA, Harness, header, reaching, register};
 use crate::peer::response::frame::tests::CountingCodec;
 use crate::peer::response::headers::RequestDeadline;
 use crate::peer::response::sender::{deliver_response, stage};
+use crate::peer::router::directory::Endpoint;
 use crate::test_util::{GlobalSpans, TEST_RUNTIME, named, span_attribute};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::trace::{SpanKind, Status, TraceContextExt};
+use opentelemetry_sdk::trace::SpanData;
 use std::convert::Infallible;
 use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -94,6 +96,9 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
             preference.as_str() == "direct",
             "{SENT} must name the endpoint that answered, not {preference}"
         );
+        ensure_rpc_attributes(sent)?;
+        ensure_rpc_attributes(received)?;
+        ensure_server_attributes(sent, &harness.address)?;
         for (key, expected) in [
             ("peer.request", request.id().to_string()),
             ("peer.subsystem", ALPHA.to_owned()),
@@ -135,7 +140,46 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
                 "{name} must report {expected} as an error, not {:?}",
                 span.status
             );
+            ensure!(
+                span_attribute(span, "error.type")?.as_str() == "NOT_FOUND",
+                "{name} must keep the exact gRPC error type"
+            );
         }
         Ok(())
     })
+}
+
+fn ensure_rpc_attributes(span: &SpanData) -> Result<()> {
+    for (key, expected) in [
+        ("rpc.system.name", "grpc"),
+        ("rpc.method", "prosody.peer.v1.PeerService/DeliverResult"),
+        ("rpc.response.status_code", "OK"),
+    ] {
+        let value = span_attribute(span, key)?;
+        ensure!(
+            value.as_str() == expected,
+            "{} {key} reads {value}, not {expected}",
+            span.name
+        );
+    }
+    Ok(())
+}
+
+fn ensure_server_attributes(span: &SpanData, endpoint: &Endpoint) -> Result<()> {
+    let uri = endpoint.uri();
+    ensure!(
+        span_attribute(span, "server.address")?.as_str()
+            == uri
+                .host()
+                .ok_or_else(|| eyre!("the endpoint has no host"))?,
+        "{SENT} must name the selected server address"
+    );
+    ensure!(
+        matches!(
+            span_attribute(span, "server.port")?,
+            opentelemetry::Value::I64(port) if Some(*port) == uri.port_u16().map(i64::from)
+        ),
+        "{SENT} must name the selected server port"
+    );
+    Ok(())
 }

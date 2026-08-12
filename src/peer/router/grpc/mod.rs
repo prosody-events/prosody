@@ -22,6 +22,7 @@ mod deadline;
 pub(crate) mod health;
 mod inject;
 pub(crate) mod service;
+mod telemetry;
 
 /// The peer service, written from the peer Protobuf schema at build time.
 pub(crate) mod generated {

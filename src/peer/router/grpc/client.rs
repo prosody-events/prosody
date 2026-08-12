@@ -2,6 +2,7 @@
 
 use super::codec::ClientFrameCodec;
 use super::inject::MetadataInjector;
+use super::telemetry::{METHOD, record_status};
 use crate::peer::router::cache_config::PeerCacheConfiguration;
 use crate::peer::router::directory::Endpoint;
 use crate::peer::router::{Framed, ResponseSender, SendFailure};
@@ -9,6 +10,9 @@ use crate::propagator::new_propagator;
 use ahash::RandomState;
 use opentelemetry::Context;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
+use opentelemetry_semantic_conventions::attribute::{
+    RPC_METHOD, RPC_SYSTEM_NAME, SERVER_ADDRESS, SERVER_PORT,
+};
 use quick_cache::UnitWeighter;
 use quick_cache::sync::{Cache, DefaultLifecycle};
 use std::sync::{Arc, LazyLock};
@@ -18,7 +22,7 @@ use tonic::client::Grpc;
 use tonic::codegen::http::{Uri, uri::PathAndQuery};
 use tonic::transport::Channel;
 use tonic::{Code, Request};
-use tracing::warn;
+use tracing::{Span, warn};
 
 /// First timeout that Tonic cannot write as an eight-digit gRPC value.
 pub(super) const GRPC_TIMEOUT_LIMIT: Duration = Duration::from_hours(100_000_000);
@@ -94,6 +98,15 @@ impl ResponseSender for GrpcSender {
         deadline: Instant,
         context: &Context,
     ) -> Result<(), SendFailure> {
+        let span = Span::current();
+        span.record(RPC_SYSTEM_NAME, "grpc");
+        span.record(RPC_METHOD, METHOD);
+        if let Some(host) = address.uri().host() {
+            span.record(SERVER_ADDRESS, host);
+        }
+        if let Some(port) = address.uri().port_u16() {
+            span.record(SERVER_PORT, i64::from(port));
+        }
         let channel = self.channel(address).await?;
         let bytes = frame.bytes();
         let mut request = Request::new(frame.clone());
@@ -101,6 +114,7 @@ impl ResponseSender for GrpcSender {
             .inject_context(context, &mut MetadataInjector::new(request.metadata_mut()));
         let mut client = Grpc::new(channel);
         if let Err(error) = client.ready().await {
+            record_status(&span, Code::Unavailable);
             warn!(%error, uri = %address.uri(), "a peer channel never became ready");
             return Err(SendFailure::Unreachable);
         }
@@ -108,7 +122,14 @@ impl ResponseSender for GrpcSender {
         // everything above it — the channel lookup and the readiness wait —
         // spends against the same deadline. Nothing has left this process yet,
         // so no time left is this process's own expiry rather than an answer.
-        let remaining = outbound_timeout(deadline)?;
+        let remaining = outbound_timeout(deadline).inspect_err(|error| {
+            let code = match error {
+                SendFailure::Expired => Code::DeadlineExceeded,
+                SendFailure::Status(code) => *code,
+                SendFailure::Unreachable => Code::Unavailable,
+            };
+            record_status(&span, code);
+        })?;
         request.set_timeout(remaining);
         // The status is passed through as it arrived.
         match client
@@ -119,8 +140,14 @@ impl ResponseSender for GrpcSender {
             )
             .await
         {
-            Ok(_) => Ok(()),
-            Err(status) => Err(SendFailure::Status(status.code())),
+            Ok(_) => {
+                record_status(&span, Code::Ok);
+                Ok(())
+            }
+            Err(status) => {
+                record_status(&span, status.code());
+                Err(SendFailure::Status(status.code()))
+            }
         }
     }
 }

@@ -39,6 +39,10 @@ fn one_call_opens_a_client_span_naming_its_request_and_its_answers() -> Result<(
     );
     for (key, expected) in [
         ("messaging.system", "kafka"),
+        ("messaging.operation.name", "request"),
+        ("messaging.operation.type", "request"),
+        ("messaging.destination.name", TOPIC),
+        ("messaging.kafka.message.key", KEY),
         ("topic", TOPIC),
         ("key", KEY),
         ("response.peer", &PEER.to_string()),
@@ -54,6 +58,10 @@ fn one_call_opens_a_client_span_naming_its_request_and_its_answers() -> Result<(
     let id = span_attribute(span, "request.id")?;
     Uuid::try_parse(&id.as_str())
         .map_err(|error| eyre!("request.id reads {id}, which is no UUID: {error}"))?;
+    ensure!(
+        span_attribute(span, "messaging.message.conversation_id")? == id,
+        "the conversation id must match request.id"
+    );
     for (key, expected) in [
         ("subsystems", 1_i64),
         ("responses.received", 0_i64),

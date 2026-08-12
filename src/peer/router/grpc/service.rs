@@ -4,6 +4,7 @@
 use super::deadline::inbound_deadline;
 use super::generated::peer_service_server::PeerService as PeerServiceApi;
 use super::inject::MetadataExtractor;
+use super::telemetry::{METHOD, record_status};
 use crate::otel::context_with_parent;
 use crate::peer::response::ResponseDisposition;
 use crate::peer::response::frame::ResponseFrame;
@@ -14,7 +15,7 @@ use crate::propagator::new_propagator;
 use async_trait::async_trait;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use tokio::time::Instant;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span, debug_span, error};
 
@@ -57,6 +58,10 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
         let span = debug_span!(
             "peer.response.receive",
             otel.kind = "server",
+            rpc.system.name = "grpc",
+            rpc.method = METHOD,
+            rpc.response.status_code = Empty,
+            error.type = Empty,
             peer.request = Empty,
             peer.subsystem = Empty,
             peer.target = Empty,
@@ -73,8 +78,11 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
         );
         // Convert the caller's timeout to an instant on arrival. Forward the
         // remaining duration so a second hop does not restart the timeout.
-        let deadline = inbound_deadline(request.metadata())
-            .ok_or_else(|| Status::invalid_argument("grpc-timeout is missing or invalid"))?;
+        let deadline = inbound_deadline(request.metadata()).ok_or_else(|| {
+            record_status(&span, Code::InvalidArgument);
+            span.in_scope(|| error!(error = "grpc-timeout is missing or invalid"));
+            Status::invalid_argument("grpc-timeout is missing or invalid")
+        })?;
         let remaining_ms = deadline
             .saturating_duration_since(Instant::now())
             .as_millis();
@@ -102,32 +110,45 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
                     let forward = debug_span!(
                         "peer.response.forward",
                         otel.kind = "client",
+                        rpc.system.name = "grpc",
+                        rpc.method = METHOD,
+                        rpc.response.status_code = Empty,
+                        error.type = Empty,
                         peer.target = %target,
                     );
                     let forward_context = context_with_parent(&forward, context.clone());
                     // Awaited rather than spawned, so this answer covers the
                     // whole path: a responder is never told it succeeded while
                     // the requester still waits.
-                    match self
+                    let outcome = self
                         .relay
                         .forward(target, deadline, &forwarded, &forward_context)
-                        .instrument(forward)
-                        .await
-                    {
+                        .instrument(forward.clone())
+                        .await;
+                    match outcome {
                         Ok(()) => {
+                            record_status(&forward, Code::Ok);
+                            record_status(&span, Code::Ok);
                             span.record("peer.disposition", ResponseDisposition::Accepted.label());
                             Ok(Response::new(()))
                         }
                         Err(RelayFailure::DeadlineExceeded) => {
+                            record_status(&forward, Code::DeadlineExceeded);
+                            forward.in_scope(|| error!(error = "the relay deadline elapsed"));
                             answer(&span, ResponseDisposition::RelayDeadlineExceeded)
                         }
                         Err(RelayFailure::Unreachable) => {
+                            record_status(&forward, Code::Unavailable);
+                            forward.in_scope(|| error!(error = "the relay target was unavailable"));
                             answer(&span, ResponseDisposition::Unreachable)
                         }
                         // The hop came to a status. It is passed through
                         // unchanged: rewriting a code here can silently change
                         // the responder's own retry decision.
                         Err(RelayFailure::Target(code)) => {
+                            record_status(&forward, code);
+                            forward.in_scope(|| error!(error = %code.description()));
+                            record_status(&span, code);
                             span.record("peer.disposition", code.description());
                             span.in_scope(|| error!(error = %code.description()));
                             Err(service_status(code, code.description()))
@@ -149,6 +170,7 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
 fn answer(span: &Span, disposition: ResponseDisposition) -> Result<Response<()>, Status> {
     span.record("peer.disposition", disposition.label());
     disposition.record();
+    record_status(span, disposition.status());
     match disposition {
         ResponseDisposition::Accepted => Ok(Response::new(())),
         ResponseDisposition::UnknownRequest
@@ -163,6 +185,6 @@ fn answer(span: &Span, disposition: ResponseDisposition) -> Result<Response<()>,
 }
 
 /// Marks one status as a service result, not a transport refusal.
-fn service_status(code: tonic::Code, message: &'static str) -> Status {
+fn service_status(code: Code, message: &'static str) -> Status {
     Status::new(code, message)
 }
