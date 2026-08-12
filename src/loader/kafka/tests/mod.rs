@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
 
-mod request_tag;
+mod result_request;
 
 fn test_topic(name: &str) -> String {
     format!("loader_test_{name}_{}", uuid::Uuid::new_v4())

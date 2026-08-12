@@ -10,7 +10,7 @@ use crate::error::ErrorCategory;
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::requester::{ProsodyRequester, ResponseError};
 use crate::response::frame::{FrameResult, HandlerError, ResponseFrame, ResponseSuccess};
-use crate::response::headers::{RequestDeadline, RequestTag};
+use crate::response::headers::{RequestDeadline, ResultRequest};
 use crate::response::{FormatToken, RequestId};
 use crate::router::PeerId;
 use crate::subsystem::SubsystemName;
@@ -211,12 +211,12 @@ pub(super) fn body(payload: u32) -> Result<Bytes> {
 /// Builds one response frame for `subsystem`, in the format the waiter reads.
 pub(super) fn frame(id: RequestId, subsystem: &SubsystemName, payload: Bytes) -> ResponseFrame {
     ResponseFrame {
-        header: RequestTag::new(
+        header: ResultRequest::new(
             id,
             PEER,
             RequestDeadline::from_unix_micros(1_700_000_000_000_000),
         )
-        .header(subsystem.clone()),
+        .delivery_header(subsystem.clone()),
         result: FrameResult::Success(ResponseSuccess {
             format: FormatToken::make(TestCodec::FORMAT_ID),
             payload,
@@ -241,12 +241,12 @@ pub(super) fn failure(
     message: &'static str,
 ) -> ResponseFrame {
     ResponseFrame {
-        header: RequestTag::new(
+        header: ResultRequest::new(
             id,
             PEER,
             RequestDeadline::from_unix_micros(1_700_000_000_000_000),
         )
-        .header(subsystem.clone()),
+        .delivery_header(subsystem.clone()),
         result: FrameResult::HandlerError(HandlerError {
             category,
             message: Bytes::from_static(message.as_bytes()),

@@ -3,7 +3,7 @@
 //! Every suite here drives the real composed stack — log outside retry, retry
 //! outside respond — and reads the transport after an explicit drain.
 
-use super::{Fixture, ResultProbeCodec, offset_tracker, tagged, untagged};
+use super::{Fixture, ResultProbeCodec, offset_tracker, plain, requesting};
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, RecordingTimer, ScriptedHandler, ScriptedHook, create_test_trigger,
 };
@@ -111,13 +111,13 @@ fn a_retried_cascade_answers_once_with_the_settled_outcome() -> Result<()> {
 /// Ordinary traffic reaches the transport never, and the handler's own hook
 /// always.
 #[test]
-fn an_untagged_message_forwards_its_result() -> Result<()> {
+fn a_plain_message_forwards_its_result() -> Result<()> {
     paused()?.block_on(async {
         let fixture = Fixture::<ResultProbeCodec>::new()?;
         let leaf = ScriptedHandler::success();
         let handler = fixture.stack(leaf.clone(), 0)?;
         let tracker = offset_tracker();
-        let message = untagged("plain")?.into_uncommitted(tracker.take(0).await?);
+        let message = plain("plain")?.into_uncommitted(tracker.take(0).await?);
 
         EventHandler::on_message(
             &handler,
@@ -142,9 +142,8 @@ fn an_untagged_message_forwards_its_result() -> Result<()> {
 /// A timer dispatch never responds, and settles exactly as it does without the
 /// layer.
 ///
-/// A trigger carries no headers, so the layer has no tag to wrap a timer result
-/// with. A deferred message reload is a different path: it arrives as a message
-/// dispatch inside the defer layer's timer handling, and it does respond.
+/// A trigger has no headers, so the layer cannot wrap a timer result. A
+/// deferred reload arrives as a message inside timer handling and does respond.
 #[test]
 fn a_timer_dispatch_never_responds() -> Result<()> {
     for failure in [None, Some(ErrorCategory::Permanent)] {
@@ -220,7 +219,7 @@ fn run(session: RetrySession) -> Result<(Vec<Delivery>, usize)> {
         let leaf = ScriptedHandler::failing_then_success(session.script);
         let handler = fixture.stack(leaf.clone(), session.max_retries)?;
         let tracker = offset_tracker();
-        let message = tagged(1, 7, "session")?.into_uncommitted(tracker.take(0).await?);
+        let message = requesting(1, 7, "session")?.into_uncommitted(tracker.take(0).await?);
 
         EventHandler::on_message(
             &handler,

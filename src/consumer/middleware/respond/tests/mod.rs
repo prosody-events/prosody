@@ -17,7 +17,7 @@ use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, Hand
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{EventHandler, Partition, Topic};
 use crate::response::RequestId;
-use crate::response::headers::{RequestDeadline, RequestTag};
+use crate::response::headers::{RequestDeadline, ResultRequest};
 use crate::router::loopback::{Delivery, TestRouter, collect_deliveries, peer};
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
@@ -157,21 +157,21 @@ impl<C: Codec<Payload = ()>> Fixture<C> {
 }
 
 /// A message asking peer `index` for a response to request `request_byte`.
-fn tagged(index: u8, request_byte: u8, key: &str) -> Result<ConsumerMessage<Value>> {
-    tagged_under(index, request_byte, key, Span::current())
+fn requesting(index: u8, request_byte: u8, key: &str) -> Result<ConsumerMessage<Value>> {
+    requesting_under(index, request_byte, key, Span::current())
 }
 
 /// A message with an explicit Unix response deadline.
-fn tagged_at(
+fn requesting_at(
     index: u8,
     request_byte: u8,
     key: &str,
     deadline_micros: u64,
 ) -> Result<ConsumerMessage<Value>> {
-    tagged_at_under(index, request_byte, key, deadline_micros, Span::current())
+    requesting_at_under(index, request_byte, key, deadline_micros, Span::current())
 }
 
-fn tagged_at_under(
+fn requesting_at_under(
     index: u8,
     request_byte: u8,
     key: &str,
@@ -180,7 +180,7 @@ fn tagged_at_under(
 ) -> Result<ConsumerMessage<Value>> {
     create_message(
         key,
-        Some(RequestTag::new(
+        Some(ResultRequest::new(
             RequestId::from_bytes([request_byte; 16]),
             peer(index),
             RequestDeadline::from_unix_micros(deadline_micros),
@@ -189,25 +189,25 @@ fn tagged_at_under(
     )
 }
 
-/// [`tagged`] with the record's own span named, for a suite whose claim is
+/// [`requesting`] with the record's own span named, for a suite whose claim is
 /// which trace the answer lands in.
-fn tagged_under(
+fn requesting_under(
     index: u8,
     request_byte: u8,
     key: &str,
     span: Span,
 ) -> Result<ConsumerMessage<Value>> {
-    tagged_at_under(index, request_byte, key, 4_102_444_800_000_000, span)
+    requesting_at_under(index, request_byte, key, 4_102_444_800_000_000, span)
 }
 
 /// A message that asks for nothing — ordinary traffic.
-fn untagged(key: &str) -> Result<ConsumerMessage<Value>> {
+fn plain(key: &str) -> Result<ConsumerMessage<Value>> {
     create_message(key, None, Span::current())
 }
 
 fn create_message(
     key: &str,
-    request: Option<RequestTag>,
+    request: Option<ResultRequest>,
     span: Span,
 ) -> Result<ConsumerMessage<Value>> {
     let semaphore = Arc::new(Semaphore::new(1));

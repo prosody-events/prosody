@@ -1,12 +1,14 @@
-//! The request tag survives a deferred retry.
+//! The result request survives a deferred retry.
 //!
 //! A deferred attempt reaches `after_abort`, so it answers nothing. The reload
 //! arrives as a message dispatch inside the defer layer's timer handling, and
-//! it answers with the reloaded record's own tag. That is why the defer round
-//! trip has to carry the tag: the answer follows the message, not the attempt.
+//! it answers with the reloaded record's own request. The defer round trip must
+//! carry the request because the answer follows the message, not the attempt.
 
 use super::super::RespondHandler;
-use super::{Fixture, ResultProbeCodec, offset_tracker, serialize_count, tagged, tagged_under};
+use super::{
+    Fixture, ResultProbeCodec, offset_tracker, requesting, requesting_under, serialize_count,
+};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleEventHandler;
 use crate::consumer::middleware::defer::DeferConfiguration;
@@ -60,17 +62,17 @@ const RELOADED: &str = "load";
 /// A loader whose reloaded record still asks for a response.
 ///
 /// The shared in-memory loader cannot serve here: every record it rebuilds
-/// carries no request tag, so it could not tell a lost tag from a suppressed
-/// answer.
+/// carries no result request, so it could not tell a lost request from a
+/// suppressed answer.
 #[derive(Clone)]
-struct TaggedLoader;
+struct RequestLoader;
 
 /// The composition this suite drives: defer outside respond, respond directly
 /// around the leaf.
 type DeferStack = MessageDeferHandler<
     RespondHandler<LeafHandler<ScriptedHandler>, ResultProbeCodec, TestRouter>,
     MemoryMessageDeferStore,
-    TaggedLoader,
+    RequestLoader,
     TraceBasedDecider,
 >;
 
@@ -79,9 +81,9 @@ type DeferStack = MessageDeferHandler<
 impl FallibleEventHandler for DeferStack {}
 
 /// The deferred attempt answers nothing, and the reload answers once with the
-/// reloaded record's own tag.
+/// reloaded record's own request.
 #[test]
-fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
+fn a_deferred_reload_answers_with_the_reloaded_request() -> Result<()> {
     paused()?.block_on(async {
         let fixture = Fixture::<ResultProbeCodec>::new()?;
         let leaf = ScriptedHandler::failing_then_success(vec![ErrorCategory::Transient]);
@@ -89,7 +91,7 @@ fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
         let handler = defer_handler(&fixture, leaf.clone(), store.clone())?;
 
         let tracker = offset_tracker();
-        let message = tagged(TARGET, REQUEST, KEY)?.into_uncommitted(tracker.take(0).await?);
+        let message = requesting(TARGET, REQUEST, KEY)?.into_uncommitted(tracker.take(0).await?);
         EventHandler::on_message(
             &handler,
             MockEventContext::new().with_timer_tracking(),
@@ -150,7 +152,7 @@ fn a_deferred_reload_answers_with_the_reloaded_tag() -> Result<()> {
 /// fires as a timer, and a timer dispatch starts a trace of its own under the
 /// shipped defaults. So a context taken when the answer is sent would put
 /// every deferred response outside the requester's trace. The context travels
-/// with the tag instead, read from the record both came from.
+/// with the request instead. Both values come from the same record.
 ///
 /// The parent edge is read span to span, never against a constant the fixture
 /// also seeds the loader from: a comparison of one constant with itself would
@@ -177,8 +179,8 @@ fn a_deferred_reload_answers_inside_the_records_own_trace() -> Result<()> {
     Ok(())
 }
 
-/// Defers one tagged message, then reloads it from a timer that runs in a trace
-/// of its own. Returns that timer's trace id.
+/// Defers one requesting message, then reloads it from a timer that runs in a
+/// trace of its own. Returns that timer's trace id.
 fn reload_under_a_fresh_timer_trace() -> Result<TraceId> {
     paused()?.block_on(async {
         let fixture = Fixture::<ResultProbeCodec>::new()?;
@@ -186,7 +188,7 @@ fn reload_under_a_fresh_timer_trace() -> Result<TraceId> {
         let handler = defer_handler(&fixture, leaf, MemoryMessageDeferStore::new())?;
 
         let tracker = offset_tracker();
-        let message = tagged(TARGET, REQUEST, KEY)?.into_uncommitted(tracker.take(0).await?);
+        let message = requesting(TARGET, REQUEST, KEY)?.into_uncommitted(tracker.take(0).await?);
         EventHandler::on_message(
             &handler,
             MockEventContext::new().with_timer_tracking(),
@@ -236,7 +238,7 @@ fn defer_handler(
     let telemetry = Telemetry::new();
     Ok(MessageDeferHandler {
         handler: RespondHandler::new(LeafHandler::new(leaf), Arc::clone(&fixture.responder)),
-        loader: TaggedLoader,
+        loader: RequestLoader,
         store,
         decider: TraceBasedDecider::new(),
         config: DeferConfiguration::builder()
@@ -253,8 +255,8 @@ fn defer_handler(
     })
 }
 
-impl MessageLoader for TaggedLoader {
-    type Error = TaggedLoaderError;
+impl MessageLoader for RequestLoader {
+    type Error = RequestLoaderError;
     type Payload = Value;
 
     async fn load_message(
@@ -262,12 +264,12 @@ impl MessageLoader for TaggedLoader {
         _topic: Topic,
         _partition: Partition,
         _offset: Offset,
-    ) -> Result<ConsumerMessage<Value>, TaggedLoaderError> {
+    ) -> Result<ConsumerMessage<Value>, RequestLoaderError> {
         // The Kafka loader parents a reloaded record's span on the record's own
         // propagated context, so a reload rejoins the trace the request began
         // in. This double does the same, from one fixed remote context.
         let load = related_span!(SpanRelation::Child, sampled_remote_context(), "load");
-        tagged_under(TARGET, REQUEST, KEY, load).map_err(|_| TaggedLoaderError::Unavailable)
+        requesting_under(TARGET, REQUEST, KEY, load).map_err(|_| RequestLoaderError::Unavailable)
     }
 
     async fn try_load_message(
@@ -275,21 +277,21 @@ impl MessageLoader for TaggedLoader {
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> Result<ConsumerMessage<Value>, TaggedLoaderError> {
+    ) -> Result<ConsumerMessage<Value>, RequestLoaderError> {
         self.load_message(topic, partition, offset).await
     }
 }
 
-impl ClassifyError for TaggedLoaderError {
+impl ClassifyError for RequestLoaderError {
     fn classify_error(&self) -> ErrorCategory {
         ErrorCategory::Transient
     }
 }
 
-/// Why the tagged loader could not rebuild a record.
+/// Why the requesting loader could not rebuild a record.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-enum TaggedLoaderError {
+enum RequestLoaderError {
     /// The harness could not build the record.
-    #[error("the tagged loader could not rebuild the record")]
+    #[error("the requesting loader could not rebuild the record")]
     Unavailable,
 }

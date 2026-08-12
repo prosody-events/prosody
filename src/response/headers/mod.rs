@@ -9,11 +9,11 @@
 //! `response-awaited` repeats rather than comma-separating because a comma is a
 //! legal character in a [`SubsystemName`].
 //!
-//! A record whose reserved headers are unusable yields no tag and one counted
-//! rejection, on a consumer configured to answer for a subsystem. A consumer
-//! that answers for none never reads the headers, so it counts nothing. It is
-//! never a failed event: asking for a response badly is not a reason to stop
-//! processing the message. The count is per decode, not per
+//! A record whose reserved headers are unusable yields no request and one
+//! counted rejection, on a consumer configured to answer for a subsystem. A
+//! consumer that answers for none never reads the headers, so it counts
+//! nothing. It is never a failed event: asking for a response badly is not a
+//! reason to stop processing the message. The count is per decode, not per
 //! record — a poll, a deferred reload and a state read each decode the same
 //! record — so read the counter as a rate, never as a population.
 //!
@@ -40,7 +40,7 @@ use uuid::fmt::Hyphenated;
 mod tests;
 
 // The five header names this protocol reserves. Two sites must agree on the
-// set: the `match key` arms of `parse_request_tag`, and
+// set: the `match key` arms of `parse_result_request`, and
 // RESERVED_REQUEST_HEADERS below, which `is_reserved` reads. A name the parser
 // matches but the array omits is one a caller can inject, so add every new name
 // to both.
@@ -84,14 +84,14 @@ static REJECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Where one request's response must go.
+/// A Kafka message's request for one handler result.
 ///
 /// Two fixed-size ids and no strings: everything else the headers carry is
 /// consumed while the Kafka record is still borrowed. [`peer`](Self::peer) is a
 /// directory lookup key rather than an address, so a topic writer can name a
 /// live prosody peer and nothing else.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RequestTag {
+pub(crate) struct ResultRequest {
     id: RequestId,
     peer: PeerId,
     deadline: RequestDeadline,
@@ -107,17 +107,17 @@ pub struct RequestDeadline {
     expires_at: Instant,
 }
 
-impl RequestTag {
-    /// Pairs a request with the peer awaiting its response.
+impl ResultRequest {
+    /// Pairs a request with the peer that awaits its result.
     pub(crate) const fn new(id: RequestId, peer: PeerId, deadline: RequestDeadline) -> Self {
         Self { id, peer, deadline }
     }
 
-    /// The frame header a response to this request must carry.
+    /// Converts this request into the header for its handler result.
     ///
     /// The sender resolves the peer through the directory. A Kafka header can
     /// never supply an address. A responder never sets the relay.
-    pub(crate) fn header(self, subsystem: SubsystemName) -> FrameHeader {
+    pub(crate) fn delivery_header(self, subsystem: SubsystemName) -> FrameHeader {
         FrameHeader {
             target: self.peer,
             request: self.id,
@@ -188,10 +188,10 @@ impl Eq for RequestDeadline {}
 ///
 /// * `Ok(None)` — the record reserves no header, or awaits only other
 ///   subsystems. Ordinary traffic; nothing is counted.
-/// * `Ok(Some(tag))` — every header is present, singular and in bounds, the
+/// * `Ok(Some(request))` — every header is present, singular and in bounds, the
 ///   revision is supported, and `responder` is among the awaited subsystems.
 /// * `Err(rejection)` — a reserved header is present but unusable. The caller
-///   counts it and drops the tag; the event still processes normally.
+///   counts it and drops the request; the event still processes normally.
 ///
 /// Validation precedes the awaited match, so a malformed request is counted by
 /// every responder that reads it rather than only by the one it meant to reach.
@@ -205,10 +205,10 @@ impl Eq for RequestDeadline {}
 /// The parse allocates nothing — a handful of stack scalars and two 16-byte ids
 /// out — and is linear in the record's header count, which the broker's own
 /// record-size limit bounds.
-pub(crate) fn parse_request_tag<'h, H>(
+pub(crate) fn parse_result_request<'h, H>(
     headers: H,
     responder: &SubsystemName,
-) -> Result<Option<RequestTag>, HeaderRejection>
+) -> Result<Option<ResultRequest>, HeaderRejection>
 where
     H: IntoIterator<Item = (&'h str, Option<&'h [u8]>)>,
 {
@@ -257,7 +257,7 @@ where
         return Err(HeaderRejection::MissingSingleton);
     }
 
-    Ok(addressed.then_some(RequestTag::new(id, peer, deadline)))
+    Ok(addressed.then_some(ResultRequest::new(id, peer, deadline)))
 }
 
 fn set_once<T>(
@@ -333,7 +333,7 @@ fn check_revision(value: Option<&[u8]>) -> Result<(), HeaderRejection> {
     Err(HeaderRejection::UnsupportedVersion)
 }
 
-/// Why a record's reserved headers yield no tag.
+/// Why a record's reserved headers yield no result request.
 ///
 /// Never propagated as an event failure — the caller counts it and processes
 /// the message — so it carries no error classification.

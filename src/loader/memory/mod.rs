@@ -112,7 +112,7 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
             timestamp: Utc::now(),
             payload,
             // This loader serves messages it was handed, not Kafka records, so
-            // there are no headers to read a request tag from.
+            // there are no headers to read a result request from.
             request: None,
         });
         let context = Span::current().context();

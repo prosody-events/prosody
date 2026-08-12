@@ -2,7 +2,7 @@
 //! record asked its response to go to survives a retry only when the loader
 //! decodes under the same subsystem the poll loop was given. The message-defer
 //! store persists offsets alone — never the record — so that reload is the
-//! whole of "the request tag round-trips message defer".
+//! whole of "the result request round-trips message defer".
 
 use super::{
     HeartbeatRegistry, JsonCodec, KafkaLoader, LoaderConfiguration, Offset, Topic, loader_config,
@@ -11,7 +11,7 @@ use super::{
 use crate::response::RequestId;
 use crate::response::headers::{
     RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER, RESPONSE_PEER_HEADER,
-    RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline, RequestTag,
+    RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline, ResultRequest,
 };
 use crate::router::PeerId;
 use crate::subsystem::SubsystemName;
@@ -22,25 +22,25 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 /// The subsystem the loader under test answers for. It is deliberately the
-/// **second** awaited name on the tagged record, so a parse that stops at the
-/// first awaited header loses the tag.
+/// **second** awaited name on the requested record, so a parse that stops at
+/// the first awaited header loses the request.
 const RESPONDER: &str = "billing";
 
 #[tokio::test]
-async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
+async fn a_reloaded_record_carries_its_result_request() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
     init_test_logging();
 
-    with_topic("request_tag", async |topic_name| {
+    with_topic("result_request", async |topic_name| {
         let id = RequestId::new();
         let peer = PeerId::from_bytes([7; 16]);
         let (id_text, peer_text) = (id.to_string(), peer.to_string());
         let producer = producer()?;
 
-        let tagged_offset = produce(
+        let requested_offset = produce(
             &producer,
             topic_name,
-            "tagged",
+            "requested",
             OwnedHeaders::new()
                 .insert(Header {
                     key: RESPONSE_VERSION_HEADER,
@@ -93,15 +93,15 @@ async fn a_reloaded_record_carries_its_request_tag() -> color_eyre::Result<()> {
         let topic = Topic::from(topic_name);
 
         assert_eq!(
-            load(&loader, topic, tagged_offset).await?,
-            Some(RequestTag::new(
+            load(&loader, topic, requested_offset).await?,
+            Some(ResultRequest::new(
                 id,
                 peer,
                 RequestDeadline::from_unix_micros(1_700_000_000_000_000),
             )),
             "the reloaded record lost the destination its headers named"
         );
-        // The negative control: without it, a loader that reported the same tag
+        // The negative control: without it, a loader that reported the same request
         // for every record would satisfy the assertion above.
         assert_eq!(
             load(&loader, topic, plain_offset).await?,
@@ -133,7 +133,7 @@ async fn produce(
             FutureRecord::to(topic)
                 .partition(0)
                 .key(key)
-                .payload(r#"{"test_id":1,"data":"request-tag"}"#)
+                .payload(r#"{"test_id":1,"data":"result-request"}"#)
                 .headers(headers),
             Duration::from_secs(5),
         )
@@ -148,7 +148,7 @@ async fn load(
     loader: &KafkaLoader<JsonCodec>,
     topic: Topic,
     offset: Offset,
-) -> color_eyre::Result<Option<RequestTag>> {
+) -> color_eyre::Result<Option<ResultRequest>> {
     let decoded = timeout(
         Duration::from_mins(1),
         loader.load_from_kafka(topic, 0, offset),

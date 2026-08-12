@@ -1,9 +1,9 @@
-//! Answering a record that asked for a response.
+//! Delivering a handler result that a Kafka record requested.
 //!
 //! A Kafka record can name a request, a peer and the subsystems it awaits. When
-//! this consumer answers for one of them, the parsed tag rides the message.
-//! This layer reads that tag and the record's own trace into an [`Answering`],
-//! carries it on both result arms, and — from
+//! this consumer answers for one of them, the parsed request rides the message.
+//! This layer reads that request and the record's own trace into an
+//! [`ResultDelivery`], carries it on both result arms, and — from
 //! [`after_commit`](FallibleHandler::after_commit) and nowhere else — moves
 //! the typed result to the response route.
 //!
@@ -13,11 +13,10 @@
 //! attempts before it stay silent. A failed result carries its category and
 //! display text in Prosody's protocol.
 //!
-//! Two live paths commit a tagged record and answer nothing. The dedup layer
-//! fires no inner hook for a duplicate, so a redelivery of an answered record
-//! stays silent and its requester waits out its own deadline. A crash between
-//! the durable commit and this hook loses the answer. The marker suppresses
-//! the redelivery. A requester therefore always needs its own deadline.
+//! Two live paths commit a requesting record and answer nothing. Dedup fires no
+//! inner hook for a duplicate, so its requester waits out its deadline. A crash
+//! between the durable commit and this hook loses the answer. The marker
+//! suppresses redelivery. A requester therefore always needs a deadline.
 //!
 //! One live path answers a record whose keyed-state writes did not last. A
 //! permanently rejected stage still commits and still fires this hook, so the
@@ -31,7 +30,7 @@ use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::response::frame::FrameHeader;
 use crate::response::headers::RequestDeadline;
-use crate::response::headers::RequestTag;
+use crate::response::headers::ResultRequest;
 use crate::response::sender::{ResponseRoute, deliver_response, stage};
 use crate::subsystem::SubsystemName;
 use crate::timers::Trigger;
@@ -59,8 +58,7 @@ pub(crate) struct Responder<C: Codec, R: ResponseRoute> {
     codec: PhantomData<fn() -> C>,
 }
 
-/// The request one message asked this consumer to answer, and the trace that
-/// request belongs to.
+/// The metadata needed to deliver one requested handler result.
 ///
 /// Both are read from the message rather than from the invocation that answers
 /// it. A deferred reload answers the request its own record names, in that
@@ -74,16 +72,16 @@ pub(crate) struct Responder<C: Codec, R: ResponseRoute> {
 /// `message.span()` is never `Span::none()` and the response leg can never open
 /// as a root of a trace of its own.
 ///
-/// One per in-flight event, and both exits are here:
+/// One exists per requested in-flight event. Both exits are here:
 /// [`after_commit`](FallibleHandler::after_commit) moves it into the responder,
 /// and [`after_abort`](FallibleHandler::after_abort) drops it.
 #[derive(Debug)]
-pub(crate) struct Answering {
-    tag: RequestTag,
+struct ResultDelivery {
+    request: ResultRequest,
     trace: Context,
 }
 
-/// One result arm and its [`Answering`] carrier.
+/// One result arm and its [`ResultDelivery`] carrier.
 ///
 /// The enclosing [`Result`] distinguishes success from failure. This carrier
 /// keeps the same metadata shape on both arms. Its error implementation keeps
@@ -93,7 +91,7 @@ pub(crate) struct Answering {
 pub(crate) struct Responded<T> {
     #[source]
     inner: T,
-    meta: Option<Answering>,
+    meta: Option<ResultDelivery>,
 }
 
 /// Wraps one handler and moves its final message result to a responder.
@@ -189,8 +187,8 @@ where
         // The message's own span, not the ambient one: a middleware span
         // between the dispatch and this layer must not become the response's
         // parent.
-        let meta = message.request().map(|tag| Answering {
-            tag,
+        let meta = message.request().map(|request| ResultDelivery {
+            request,
             trace: message.span().context(),
         });
         // Matched rather than mapped: a `map` / `map_err` pair would move the
@@ -237,11 +235,11 @@ where
             Ok(Responded { inner, meta }) => (Ok(inner), meta),
             Err(Responded { inner, meta }) => (Err(inner), meta),
         };
-        let Some(Answering { tag, trace }) = meta else {
+        let Some(ResultDelivery { request, trace }) = meta else {
             return self.handler.after_commit(context, result).await;
         };
-        let deadline = tag.deadline();
-        let header = tag.header(self.responder.subsystem().clone());
+        let deadline = request.deadline();
+        let header = request.delivery_header(self.responder.subsystem().clone());
         self.responder
             .respond(header, result, trace, deadline, |result| {
                 self.handler.after_commit(context, result)
@@ -252,8 +250,8 @@ where
     /// Forwards a non-final invocation's result to the inner hook.
     ///
     /// Another invocation is coming for this event, so nothing is answered
-    /// here. This arm drops the tag with the carrier and never binds it, so it
-    /// holds nothing a frame header could be built from.
+    /// here. This arm drops the request without binding it. Thus, it holds
+    /// nothing that can build a frame header.
     async fn after_abort<C2>(&self, context: C2, result: Result<Self::Output, Self::Error>)
     where
         C2: EventContext<Payload = Self::Payload>,

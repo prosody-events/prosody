@@ -1,6 +1,6 @@
-//! The durable commit order for requested responses.
+//! The durable commit order for requesting responses.
 
-use super::{Fixture, ResultProbeCodec, serialize_count, tagged};
+use super::{Fixture, ResultProbeCodec, requesting, serialize_count};
 use crate::consumer::DemandType;
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::providers::LeafHandler;
@@ -15,7 +15,7 @@ use color_eyre::{Report, Result};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::SeqCst;
 
-/// The durable commit precedes the requested response.
+/// The durable commit precedes the requesting response.
 #[test]
 fn the_response_leaves_only_after_the_durable_commit() -> Result<()> {
     paused()?.block_on(async {
@@ -25,7 +25,7 @@ fn the_response_leaves_only_after_the_durable_commit() -> Result<()> {
             LeafHandler::new(ScriptedHandler::success()),
             Arc::clone(&fixture.responder),
         );
-        let message = tagged(1, 9, "ordering")?;
+        let message = requesting(1, 9, "ordering")?;
         let result =
             FallibleHandler::on_message(&handler, context.clone(), message, DemandType::Normal)
                 .await;

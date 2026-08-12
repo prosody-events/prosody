@@ -26,7 +26,7 @@ use tracing::error;
 use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::ConsumerMessageValue;
-use crate::response::headers::{RequestTag, parse_request_tag};
+use crate::response::headers::{ResultRequest, parse_result_request};
 use crate::subsystem::SubsystemName;
 use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
@@ -61,8 +61,8 @@ pub struct DecodedMessage<P> {
 
 /// Selects whether this consumer accepts peer request headers.
 pub(crate) trait RequestAdmission: Send {
-    /// Reads a request tag admitted by this consumer.
-    fn request(&self, message: &BorrowedMessage) -> Option<RequestTag>;
+    /// Reads a result request admitted by this consumer.
+    fn request(&self, message: &BorrowedMessage) -> Option<ResultRequest>;
 }
 
 /// Rejects all peer request headers.
@@ -198,20 +198,20 @@ fn extract_source_system(message: &BorrowedMessage) -> Option<SourceSystem> {
 /// An unusable header set is counted and dropped, never failed.
 /// [`HeaderRejection`](crate::response::headers::HeaderRejection) states why.
 impl RequestAdmission for NoRequests {
-    fn request(&self, _message: &BorrowedMessage) -> Option<RequestTag> {
+    fn request(&self, _message: &BorrowedMessage) -> Option<ResultRequest> {
         None
     }
 }
 
 impl RequestAdmission for SubsystemRequests {
-    fn request(&self, message: &BorrowedMessage) -> Option<RequestTag> {
+    fn request(&self, message: &BorrowedMessage) -> Option<ResultRequest> {
         let headers = message.headers()?;
 
-        match parse_request_tag(
+        match parse_result_request(
             headers.iter().map(|header| (header.key, header.value)),
             &self.0,
         ) {
-            Ok(tag) => tag,
+            Ok(request) => request,
             Err(rejection) => {
                 rejection.record();
                 None
@@ -221,7 +221,7 @@ impl RequestAdmission for SubsystemRequests {
 }
 
 impl RequestAdmission for Option<&SubsystemName> {
-    fn request(&self, message: &BorrowedMessage) -> Option<RequestTag> {
+    fn request(&self, message: &BorrowedMessage) -> Option<ResultRequest> {
         let subsystem = self.as_ref()?;
         SubsystemRequests((*subsystem).clone()).request(message)
     }

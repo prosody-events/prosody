@@ -3,7 +3,7 @@
 //! A barrier holds the transport, or the directory does not contain the
 //! destination.
 
-use super::{Fixture, ResultProbeCodec, offset_tracker, tagged, tagged_at};
+use super::{Fixture, ResultProbeCodec, offset_tracker, requesting, requesting_at};
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, ScriptedHandler, ScriptedHook,
 };
@@ -20,7 +20,7 @@ fn the_request_deadline_only_reaches_the_transport() -> Result<()> {
         let fixture = Fixture::<ResultProbeCodec>::new()?;
         let handler = fixture.stack(ScriptedHandler::success(), 0)?;
         let tracker = offset_tracker();
-        let message = tagged_at(1, 10, "expired", 0)?.into_uncommitted(tracker.take(0).await?);
+        let message = requesting_at(1, 10, "expired", 0)?.into_uncommitted(tracker.take(0).await?);
 
         EventHandler::on_message(
             &handler,
@@ -49,7 +49,7 @@ fn the_hook_applies_network_backpressure() -> Result<()> {
         let leaf = ScriptedHandler::success();
         let handler = fixture.stack(leaf.clone(), 0)?;
         let tracker = offset_tracker();
-        let message = tagged(1, 11, "held")?.into_uncommitted(tracker.take(0).await?);
+        let message = requesting(1, 11, "held")?.into_uncommitted(tracker.take(0).await?);
         let mut dispatch = Box::pin(EventHandler::on_message(
             &handler,
             MockEventContext::new(),
@@ -77,8 +77,8 @@ fn the_hook_applies_network_backpressure() -> Result<()> {
 
 /// A peer the directory does not hold is never dialed.
 ///
-/// A request tag holds two identifiers and no host and no port, and the header
-/// it builds carries only the target peer. The route resolves that
+/// A result request holds two identifiers and no host and no port, and the
+/// header it builds carries only the target peer. The route resolves that
 /// peer through the router, so no edit can make an address originate from a
 /// Kafka header without inventing a field. What stays testable is the
 /// unresolvable peer itself.
@@ -91,8 +91,8 @@ fn an_unpublished_peer_is_never_dialed() -> Result<()> {
         let leaf = ScriptedHandler::success();
         let handler = fixture.stack(leaf.clone(), 0)?;
         let tracker = offset_tracker();
-        let message =
-            tagged(UNPUBLISHED_PEER, 41, "unpublished")?.into_uncommitted(tracker.take(0).await?);
+        let message = requesting(UNPUBLISHED_PEER, 41, "unpublished")?
+            .into_uncommitted(tracker.take(0).await?);
 
         EventHandler::on_message(
             &handler,

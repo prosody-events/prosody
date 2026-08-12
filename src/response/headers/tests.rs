@@ -1,7 +1,7 @@
 use super::{
     HeaderRejection, ID_TEXT_LEN, RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER,
     RESPONSE_PEER_HEADER, RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline,
-    RequestTag, parse_request_tag,
+    ResultRequest, parse_result_request,
 };
 use crate::response::RequestId;
 use crate::router::PeerId;
@@ -329,10 +329,10 @@ fn other_id_form(mutation: Mutation) -> String {
 
 /// What the parser must answer, read off the mutation alone — never re-derived
 /// from the headers the way the parser derives it.
-fn expected(mutation: Mutation) -> Result<Option<RequestTag>, HeaderRejection> {
+fn expected(mutation: Mutation) -> Result<Option<ResultRequest>, HeaderRejection> {
     match mutation {
         Mutation::WellFormed | Mutation::WellFormedCommaResponder | Mutation::ManyAwaited => {
-            Ok(Some(RequestTag::new(
+            Ok(Some(ResultRequest::new(
                 RequestId::from_bytes(REQUEST_ID_BYTES),
                 PeerId::from_bytes(PEER_ID_BYTES),
                 RequestDeadline::from_unix_micros(DEADLINE_MICROS),
@@ -386,8 +386,8 @@ fn every_mutation_reports_its_documented_outcome() -> color_eyre::Result<()> {
 /// it in or on where in the awaited list the responder's own name sits.
 ///
 /// Each case carries exactly one defect, which is the whole of the guarantee
-/// [`parse_request_tag`] states: a record with two defects is answered the same
-/// way whatever the order, and only the reason it reports is the first one met.
+/// [`parse_result_request`] states: header order does not change the outcome.
+/// Only the first reported reason can change when two defects exist.
 #[test]
 fn header_order_and_awaited_position_do_not_change_the_outcome() {
     fn property(case: Case) -> TestResult {
@@ -409,7 +409,7 @@ fn header_order_and_awaited_position_do_not_change_the_outcome() {
 #[test]
 fn canonical_headers_parse_to_their_ids() -> color_eyre::Result<()> {
     let responder = SubsystemName::try_new("billing")?;
-    let expected = RequestTag::new(
+    let expected = ResultRequest::new(
         RequestId::from_bytes(REQUEST_ID_BYTES),
         PeerId::from_bytes(PEER_ID_BYTES),
         RequestDeadline::from_unix_micros(DEADLINE_MICROS),
@@ -432,7 +432,7 @@ fn canonical_headers_parse_to_their_ids() -> color_eyre::Result<()> {
         ];
 
         assert_eq!(
-            parse_request_tag(headers, &responder),
+            parse_result_request(headers, &responder),
             Ok(Some(expected)),
             "{id_text} must parse to the frozen bytes"
         );
@@ -462,7 +462,7 @@ fn a_name_that_only_overlaps_the_responder_is_another_subsystem() -> color_eyre:
         ];
 
         assert_eq!(
-            parse_request_tag(headers, &responder),
+            parse_result_request(headers, &responder),
             Ok(None),
             "{awaited} is not this responder's name"
         );
@@ -482,10 +482,10 @@ fn each_rejection_has_a_distinct_label() -> color_eyre::Result<()> {
 }
 
 /// Runs the parser over one case's headers.
-fn parse(case: Case) -> color_eyre::Result<Result<Option<RequestTag>, HeaderRejection>> {
+fn parse(case: Case) -> color_eyre::Result<Result<Option<ResultRequest>, HeaderRejection>> {
     let responder = case.responder()?;
     let headers = case.headers();
-    Ok(parse_request_tag(
+    Ok(parse_result_request(
         headers
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_deref())),

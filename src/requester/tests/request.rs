@@ -9,7 +9,7 @@ use crate::requester::{RequestError, ResponseError, append_request_headers};
 use crate::response::RequestId;
 use crate::response::headers::RequestDeadline;
 use crate::response::headers::{
-    ID_TEXT_LEN, RESERVED_REQUEST_HEADERS, RequestTag, parse_request_tag,
+    ID_TEXT_LEN, RESERVED_REQUEST_HEADERS, ResultRequest, parse_result_request,
 };
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
@@ -97,7 +97,7 @@ impl Arbitrary for HeaderTrace {
     }
 }
 
-/// Every awaited subsystem reads its own tag back out of the emitted headers,
+/// Every awaited subsystem reads its own request from the emitted headers,
 /// and a subsystem the request never named reads nothing.
 #[quickcheck]
 fn the_emitted_headers_parse_back(trace: HeaderTrace) -> TestResult {
@@ -277,19 +277,19 @@ fn run_headers(trace: HeaderTrace) -> Result<()> {
         .iter()
         .map(|header| (header.key, header.value))
         .collect();
-    let expected = RequestTag::new(id, PEER, deadline);
+    let expected = ResultRequest::new(id, PEER, deadline);
     for name in &awaited {
         assert_eq!(
-            parse_request_tag(wire.iter().copied(), name)?,
+            parse_result_request(wire.iter().copied(), name)?,
             Some(expected),
-            "the awaited subsystem {name} did not read its own tag back"
+            "the awaited subsystem {name} did not read its own request"
         );
     }
     let stranger = SubsystemName::try_new(STRANGER)?;
     assert_eq!(
-        parse_request_tag(wire.iter().copied(), &stranger)?,
+        parse_result_request(wire.iter().copied(), &stranger)?,
         None,
-        "a subsystem the request never named read a tag"
+        "a subsystem the request never named read a result request"
     );
     Ok(())
 }

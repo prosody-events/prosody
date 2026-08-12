@@ -2,7 +2,7 @@
 //! boundary.
 
 use super::super::{RespondHandler, Responded};
-use super::{Fixture, ResultProbeCodec, offset_tracker, tagged};
+use super::{Fixture, ResultProbeCodec, offset_tracker, requesting};
 use crate::consumer::middleware::tests::test_support::{
     BypassedHandler, MockEventContext, ScriptedHandler, TestError,
 };
@@ -15,7 +15,7 @@ use crate::response::frame::{FrameResult, HandlerError};
 use crate::router::loopback::{TestRouter, paused, peer};
 use color_eyre::Result;
 
-/// The tag reaches the wire from the error arm as well as the success arm.
+/// The request reaches the wire from the error arm and the success arm.
 ///
 /// A permanent rejection is the case where a failure answer helps a requester
 /// most: nothing else will come, and only the responder knows why.
@@ -26,7 +26,7 @@ fn metadata_rides_the_error_arm() -> Result<()> {
         let leaf = ScriptedHandler::always_failing(ErrorCategory::Permanent);
         let handler = fixture.stack(leaf, 0)?;
         let tracker = offset_tracker();
-        let message = tagged(2, 9, "rejected")?.into_uncommitted(tracker.take(0).await?);
+        let message = requesting(2, 9, "rejected")?.into_uncommitted(tracker.take(0).await?);
 
         EventHandler::on_message(
             &handler,
@@ -44,7 +44,7 @@ fn metadata_rides_the_error_arm() -> Result<()> {
         assert_eq!(
             frame.header.target,
             peer(2),
-            "the tag names the destination"
+            "the request names the destination"
         );
         assert_eq!(frame.header.request, RequestId::from_bytes([9; 16]));
         assert_eq!(frame.header.subsystem.as_str(), super::SUBSYSTEM);

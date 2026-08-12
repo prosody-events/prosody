@@ -20,7 +20,7 @@ use tracing::{Span, debug};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::{Keyed, Uncommitted};
-use crate::response::headers::RequestTag;
+use crate::response::headers::ResultRequest;
 use crate::timers::PendingTimer;
 use crate::timers::store::TriggerStore;
 use crate::{EventIdentity, Key, Offset, Partition, ProcessScope, SourceSystem, Topic};
@@ -254,7 +254,7 @@ pub struct ConsumerMessageValue<P> {
     ///
     /// Crate-internal deliberately: it is framework routing, not something
     /// every cross-language binding has to express.
-    pub(crate) request: Option<RequestTag>,
+    pub(crate) request: Option<ResultRequest>,
 }
 
 #[cfg(test)]
@@ -281,7 +281,7 @@ impl<P> ConsumerMessage<P> {
     }
 
     /// Where a response to this message must go, when the record asked for one.
-    pub(crate) fn request(&self) -> Option<RequestTag> {
+    pub(crate) fn request(&self) -> Option<ResultRequest> {
         self.value.request
     }
 
