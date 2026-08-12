@@ -175,7 +175,9 @@ impl<D: PeerDirectory> PreparedPeerRuntime<D> {
             inputs.listener,
             PeerService::new(local.clone(), Relay::new(network.clone())),
             async move { drop(stopped.await) },
-        ) {
+        )
+        .await
+        {
             Ok(listener) => listener,
             Err(error) => {
                 pending.terminate();

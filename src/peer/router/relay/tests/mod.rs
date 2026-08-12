@@ -148,12 +148,12 @@ impl Pair {
         let target_bound = bind().await?;
         let relay_address = endpoint(&relay_bound)?;
         let target_address = endpoint(&target_bound)?;
-        let relay = Live::serve(relay_bound, Some(&target_address))?;
+        let relay = Live::serve(relay_bound, Some(&target_address)).await?;
         let seen = match route {
             TargetRoute::Relay => Some(&relay_address),
             TargetRoute::Nowhere => None,
         };
-        match Live::serve(target_bound, seen) {
+        match Live::serve(target_bound, seen).await {
             Ok(target) => Ok(Self { relay, target }),
             Err(error) => {
                 relay.stop().await?;
@@ -172,7 +172,7 @@ impl Pair {
 
 impl Live {
     /// Serves `bound`, sending every frame it does not own on to `seen`.
-    fn serve(bound: BoundListener, seen: Option<&Endpoint>) -> Result<Self> {
+    async fn serve(bound: BoundListener, seen: Option<&Endpoint>) -> Result<Self> {
         let peer = PeerId::new();
         let address = endpoint(&bound)?;
         let registry = PendingRegistry::new();
@@ -184,7 +184,8 @@ impl Live {
                 LocalTarget::new(peer, Arc::clone(&registry)),
                 Relay::new(router),
             ),
-        )?;
+        )
+        .await?;
         Ok(Self {
             peer,
             registry,

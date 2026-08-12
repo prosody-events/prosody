@@ -1,10 +1,10 @@
 //! Turning one borrowed response into owned frame data.
 
 use super::{
-    FIELD_ERROR_CATEGORY, FIELD_ERROR_MESSAGE, FIELD_HANDLER_ERROR, FIELD_RELAY_PEER,
-    FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_SUCCESS, FIELD_SUCCESS_FORMAT, FIELD_SUCCESS_PAYLOAD,
-    FIELD_TARGET_PEER, FrameHeader, FrameResult, HandlerError, ID_BYTES, ResponseFrame,
-    ResponseSuccess,
+    DELIVER_RESULT_HANDLER_ERROR_TAG, DELIVER_RESULT_RELAY_PEER_TAG, DELIVER_RESULT_REQUEST_ID_TAG,
+    DELIVER_RESULT_SUBSYSTEM_TAG, DELIVER_RESULT_SUCCESS_TAG, DELIVER_RESULT_TARGET_PEER_TAG,
+    FrameHeader, FrameResult, HANDLER_ERROR_CATEGORY_TAG, HANDLER_ERROR_MESSAGE_TAG, HandlerError,
+    RESPONSE_SUCCESS_FORMAT_TAG, RESPONSE_SUCCESS_PAYLOAD_TAG, ResponseFrame, ResponseSuccess,
 };
 use crate::codec::{Codec, SerializeBufGuard};
 use crate::error::ErrorCategory;
@@ -13,7 +13,9 @@ use crate::peer::router::{Framed, PeerId};
 use bytes::{BufMut, Bytes};
 use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len};
 use std::error::Error;
+use std::mem::size_of;
 use thiserror::Error;
+use uuid::Bytes as UuidBytes;
 
 /// An encoded response ready for routing.
 #[derive(Clone)]
@@ -118,55 +120,72 @@ impl Framed for Forwarded {
 }
 
 fn write_frame<B: BufMut>(header: &FrameHeader, result: &FrameResult, dst: &mut B) {
-    write_bytes_field(FIELD_TARGET_PEER, &header.target.into_bytes(), dst);
-    write_bytes_field(FIELD_REQUEST_ID, &header.request.into_bytes(), dst);
-    write_bytes_field(FIELD_SUBSYSTEM, header.subsystem.as_str().as_bytes(), dst);
+    write_bytes_field(
+        DELIVER_RESULT_TARGET_PEER_TAG,
+        &header.target.into_bytes(),
+        dst,
+    );
+    write_bytes_field(
+        DELIVER_RESULT_REQUEST_ID_TAG,
+        &header.request.into_bytes(),
+        dst,
+    );
+    write_bytes_field(
+        DELIVER_RESULT_SUBSYSTEM_TAG,
+        header.subsystem.as_str().as_bytes(),
+        dst,
+    );
     match result {
         FrameResult::Success(ResponseSuccess { format, payload }) => {
             let len = success_len(format.as_bytes().len(), payload.len());
-            write_message_key(FIELD_SUCCESS, len, dst);
-            write_bytes_field(FIELD_SUCCESS_FORMAT, format.as_bytes(), dst);
-            write_bytes_field(FIELD_SUCCESS_PAYLOAD, payload, dst);
+            write_message_key(DELIVER_RESULT_SUCCESS_TAG, len, dst);
+            write_bytes_field(RESPONSE_SUCCESS_FORMAT_TAG, format.as_bytes(), dst);
+            write_bytes_field(RESPONSE_SUCCESS_PAYLOAD_TAG, payload, dst);
         }
         FrameResult::HandlerError(HandlerError { category, message }) => {
             let len = error_len(*category, message.len());
-            write_message_key(FIELD_HANDLER_ERROR, len, dst);
-            write_varint_field(FIELD_ERROR_CATEGORY, i32::from(*category) as u64, dst);
-            write_bytes_field(FIELD_ERROR_MESSAGE, message, dst);
+            write_message_key(DELIVER_RESULT_HANDLER_ERROR_TAG, len, dst);
+            write_varint_field(HANDLER_ERROR_CATEGORY_TAG, i32::from(*category) as u64, dst);
+            write_bytes_field(HANDLER_ERROR_MESSAGE_TAG, message, dst);
         }
     }
     if let Some(relay) = header.relay {
-        write_bytes_field(FIELD_RELAY_PEER, &relay.into_bytes(), dst);
+        write_bytes_field(DELIVER_RESULT_RELAY_PEER_TAG, &relay.into_bytes(), dst);
     }
 }
 
 fn frame_len(header: &FrameHeader, result: &FrameResult) -> u64 {
-    bytes_field_len(FIELD_TARGET_PEER, ID_BYTES)
-        + bytes_field_len(FIELD_REQUEST_ID, ID_BYTES)
-        + bytes_field_len(FIELD_SUBSYSTEM, header.subsystem.as_str().len())
+    bytes_field_len(DELIVER_RESULT_TARGET_PEER_TAG, size_of::<UuidBytes>())
+        + bytes_field_len(DELIVER_RESULT_REQUEST_ID_TAG, size_of::<UuidBytes>())
+        + bytes_field_len(
+            DELIVER_RESULT_SUBSYSTEM_TAG,
+            header.subsystem.as_str().len(),
+        )
         + match result {
             FrameResult::Success(ResponseSuccess { format, payload }) => message_field_len(
-                FIELD_SUCCESS,
+                DELIVER_RESULT_SUCCESS_TAG,
                 success_len(format.as_bytes().len(), payload.len()),
             ),
-            FrameResult::HandlerError(HandlerError { category, message }) => {
-                message_field_len(FIELD_HANDLER_ERROR, error_len(*category, message.len()))
-            }
+            FrameResult::HandlerError(HandlerError { category, message }) => message_field_len(
+                DELIVER_RESULT_HANDLER_ERROR_TAG,
+                error_len(*category, message.len()),
+            ),
         }
         + if header.relay.is_some() {
-            bytes_field_len(FIELD_RELAY_PEER, ID_BYTES)
+            bytes_field_len(DELIVER_RESULT_RELAY_PEER_TAG, size_of::<UuidBytes>())
         } else {
             0
         }
 }
 
 fn success_len(format: usize, payload: usize) -> u64 {
-    bytes_field_len(FIELD_SUCCESS_FORMAT, format) + bytes_field_len(FIELD_SUCCESS_PAYLOAD, payload)
+    bytes_field_len(RESPONSE_SUCCESS_FORMAT_TAG, format)
+        + bytes_field_len(RESPONSE_SUCCESS_PAYLOAD_TAG, payload)
 }
 
 fn error_len(category: ErrorCategory, message: usize) -> u64 {
-    varint_field_len(FIELD_ERROR_CATEGORY, i32::from(category) as u64)
-        + bytes_field_len(FIELD_ERROR_MESSAGE, message)
+    varint_field_len(HANDLER_ERROR_CATEGORY_TAG, i32::from(category) as u64)
+        + bytes_field_len(HANDLER_ERROR_MESSAGE_TAG, message)
 }
 
 const fn message_field_len(tag: u32, len: u64) -> u64 {

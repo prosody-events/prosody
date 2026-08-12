@@ -18,7 +18,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::time::Instant;
 use tonic::Code;
-use uuid::Uuid;
+use uuid::{Bytes as UuidBytes, Uuid};
 
 pub(crate) mod api;
 pub(crate) mod cache_config;
@@ -226,12 +226,12 @@ impl PeerId {
     }
 
     /// Reads an id from its 16-byte wire form.
-    pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
+    pub(crate) const fn from_bytes(bytes: UuidBytes) -> Self {
         Self(Uuid::from_bytes(bytes))
     }
 
     /// The 16-byte wire form.
-    pub(crate) const fn into_bytes(self) -> [u8; 16] {
+    pub(crate) const fn into_bytes(self) -> UuidBytes {
         self.0.into_bytes()
     }
 }

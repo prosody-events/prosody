@@ -8,9 +8,8 @@ use self::registry::PendingRegistry;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::peer::response::RequestId;
 use crate::peer::response::headers::{
-    ID_TEXT_LEN, REQUEST_REVISION, RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER,
-    RESPONSE_PEER_HEADER, RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline,
-    id_text, is_reserved,
+    ID_TEXT_LEN, RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER, RESPONSE_PEER_HEADER,
+    RESPONSE_REQUEST_ID_HEADER, RequestDeadline, id_text, is_reserved,
 };
 use crate::peer::router::PeerId;
 use crate::producer::{ProducerError, ProsodyProducer};
@@ -37,7 +36,7 @@ use tracing::{Span, instrument};
 mod tests;
 
 /// Reserved headers that occur exactly once in every request.
-const RESERVED_SINGLETONS: usize = 4;
+const RESERVED_SINGLETONS: usize = 3;
 
 /// How long one request waited, by how complete its answers were.
 ///
@@ -415,7 +414,6 @@ fn append_request_headers<'a>(
     let (request, request_buf) = request;
     let (peer, peer_buf) = peer;
     let (deadline, deadline_buf) = deadline;
-    headers = insert_header(headers, RESPONSE_VERSION_HEADER, REQUEST_REVISION);
     headers = insert_header(
         headers,
         RESPONSE_REQUEST_ID_HEADER,

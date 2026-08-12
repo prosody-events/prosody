@@ -13,19 +13,16 @@ use bytes::Bytes;
 pub(crate) mod decode;
 pub(crate) mod encode;
 
-const FIELD_TARGET_PEER: u32 = 1;
-const FIELD_REQUEST_ID: u32 = 2;
-const FIELD_SUBSYSTEM: u32 = 3;
-const FIELD_SUCCESS: u32 = 4;
-const FIELD_HANDLER_ERROR: u32 = 5;
-const FIELD_RELAY_PEER: u32 = 6;
-const FIELD_SUCCESS_FORMAT: u32 = 1;
-const FIELD_SUCCESS_PAYLOAD: u32 = 2;
-const FIELD_ERROR_CATEGORY: u32 = 1;
-const FIELD_ERROR_MESSAGE: u32 = 2;
-
-/// Width of every identifier on the wire.
-const ID_BYTES: usize = 16;
+const DELIVER_RESULT_TARGET_PEER_TAG: u32 = 1;
+const DELIVER_RESULT_REQUEST_ID_TAG: u32 = 2;
+const DELIVER_RESULT_SUBSYSTEM_TAG: u32 = 3;
+const DELIVER_RESULT_SUCCESS_TAG: u32 = 4;
+const DELIVER_RESULT_HANDLER_ERROR_TAG: u32 = 5;
+const DELIVER_RESULT_RELAY_PEER_TAG: u32 = 6;
+const RESPONSE_SUCCESS_FORMAT_TAG: u32 = 1;
+const RESPONSE_SUCCESS_PAYLOAD_TAG: u32 = 2;
+const HANDLER_ERROR_CATEGORY_TAG: u32 = 1;
+const HANDLER_ERROR_MESSAGE_TAG: u32 = 2;
 
 /// The routing fields a responder supplies for one frame.
 #[derive(Clone, Debug, Eq, PartialEq)]

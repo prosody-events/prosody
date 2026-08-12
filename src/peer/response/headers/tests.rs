@@ -1,7 +1,7 @@
 use super::{
     HeaderRejection, ID_TEXT_LEN, RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER,
-    RESPONSE_PEER_HEADER, RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline,
-    ResultRequest, parse_result_request,
+    RESPONSE_PEER_HEADER, RESPONSE_REQUEST_ID_HEADER, RequestDeadline, ResultRequest,
+    parse_result_request,
 };
 use crate::peer::response::RequestId;
 use crate::peer::router::PeerId;
@@ -70,25 +70,13 @@ enum Mutation {
     NotAwaited,
     /// The record reserves no header at all.
     NoReservedHeaders,
-    DuplicateVersion,
     DuplicateRequestId,
     DuplicatePeer,
     DuplicateDeadline,
-    MissingVersion,
     MissingRequestId,
     MissingPeer,
     MissingDeadline,
     MissingAwaited,
-    /// Only the revision header survives.
-    OnlyVersion,
-    /// A revision this responder does not read the other headers under.
-    UnsupportedRevision,
-    UnparseableRevision,
-    /// The supported revision written as `01`.
-    RevisionLeadingZero,
-    /// The supported revision written as `+1`.
-    RevisionSigned,
-    RevisionValueAbsent,
     /// The 32-character unhyphenated UUID form.
     IdSimpleForm,
     /// The braced UUID form, `{...}`.
@@ -185,7 +173,6 @@ impl Case {
         // rather than in one case.
         let mut headers = vec![
             header(crate::SOURCE_SYSTEM_HEADER, b"upstream"),
-            header(RESPONSE_VERSION_HEADER, b"2"),
             header(RESPONSE_REQUEST_ID_HEADER, REQUEST_ID_TEXT.as_bytes()),
             header(RESPONSE_PEER_HEADER, PEER_ID_TEXT.as_bytes()),
             header(RESPONSE_DEADLINE_HEADER, DEADLINE_TEXT),
@@ -220,7 +207,6 @@ impl Case {
             Mutation::NoReservedHeaders => {
                 headers.retain(|(key, _)| key == crate::SOURCE_SYSTEM_HEADER);
             }
-            Mutation::DuplicateVersion => headers.push(header(RESPONSE_VERSION_HEADER, b"2")),
             Mutation::DuplicateRequestId => headers.push(header(
                 RESPONSE_REQUEST_ID_HEADER,
                 REQUEST_ID_TEXT.as_bytes(),
@@ -231,27 +217,10 @@ impl Case {
             Mutation::DuplicateDeadline => {
                 headers.push(header(RESPONSE_DEADLINE_HEADER, DEADLINE_TEXT));
             }
-            Mutation::MissingVersion => drop_header(&mut headers, RESPONSE_VERSION_HEADER),
             Mutation::MissingRequestId => drop_header(&mut headers, RESPONSE_REQUEST_ID_HEADER),
             Mutation::MissingPeer => drop_header(&mut headers, RESPONSE_PEER_HEADER),
             Mutation::MissingDeadline => drop_header(&mut headers, RESPONSE_DEADLINE_HEADER),
             Mutation::MissingAwaited => drop_header(&mut headers, RESPONSE_AWAITED_HEADER),
-            Mutation::OnlyVersion => headers.retain(|(key, _)| key == RESPONSE_VERSION_HEADER),
-            Mutation::UnsupportedRevision => {
-                set_value(&mut headers, RESPONSE_VERSION_HEADER, Some(b"1".to_vec()));
-            }
-            Mutation::UnparseableRevision => {
-                set_value(&mut headers, RESPONSE_VERSION_HEADER, Some(b"one".to_vec()));
-            }
-            Mutation::RevisionLeadingZero => {
-                set_value(&mut headers, RESPONSE_VERSION_HEADER, Some(b"01".to_vec()));
-            }
-            Mutation::RevisionSigned => {
-                set_value(&mut headers, RESPONSE_VERSION_HEADER, Some(b"+1".to_vec()));
-            }
-            Mutation::RevisionValueAbsent => {
-                set_value(&mut headers, RESPONSE_VERSION_HEADER, None);
-            }
             Mutation::IdSimpleForm | Mutation::IdBracedForm | Mutation::IdUrnForm => set_value(
                 &mut headers,
                 RESPONSE_REQUEST_ID_HEADER,
@@ -339,21 +308,13 @@ fn expected(mutation: Mutation) -> Result<Option<ResultRequest>, HeaderRejection
             )))
         }
         Mutation::NotAwaited | Mutation::NoReservedHeaders => Ok(None),
-        Mutation::DuplicateVersion
-        | Mutation::DuplicateRequestId
-        | Mutation::DuplicatePeer
-        | Mutation::DuplicateDeadline => Err(HeaderRejection::DuplicateSingleton),
-        Mutation::MissingVersion
-        | Mutation::MissingRequestId
+        Mutation::DuplicateRequestId | Mutation::DuplicatePeer | Mutation::DuplicateDeadline => {
+            Err(HeaderRejection::DuplicateSingleton)
+        }
+        Mutation::MissingRequestId
         | Mutation::MissingPeer
         | Mutation::MissingDeadline
-        | Mutation::MissingAwaited
-        | Mutation::OnlyVersion => Err(HeaderRejection::MissingSingleton),
-        Mutation::UnsupportedRevision
-        | Mutation::UnparseableRevision
-        | Mutation::RevisionLeadingZero
-        | Mutation::RevisionSigned
-        | Mutation::RevisionValueAbsent => Err(HeaderRejection::UnsupportedVersion),
+        | Mutation::MissingAwaited => Err(HeaderRejection::MissingSingleton),
         Mutation::IdSimpleForm
         | Mutation::IdBracedForm
         | Mutation::IdUrnForm
@@ -420,7 +381,6 @@ fn canonical_headers_parse_to_their_ids() -> color_eyre::Result<()> {
         "01983B2A-7E40-7D11-9B52-C4F0A3D8E6B1",
     ] {
         let headers = [
-            ("response-version", Some(b"2".as_slice())),
             ("response-request-id", Some(id_text.as_bytes())),
             (
                 "response-peer",
@@ -454,7 +414,6 @@ fn a_name_that_only_overlaps_the_responder_is_another_subsystem() -> color_eyre:
 
     for awaited in ["bill", "illing", "billings", "autobilling", "BILLING"] {
         let headers = [
-            (RESPONSE_VERSION_HEADER, Some(b"2".as_slice())),
             (RESPONSE_REQUEST_ID_HEADER, Some(REQUEST_ID_TEXT.as_bytes())),
             (RESPONSE_PEER_HEADER, Some(PEER_ID_TEXT.as_bytes())),
             (RESPONSE_DEADLINE_HEADER, Some(DEADLINE_TEXT)),

@@ -11,7 +11,7 @@ use super::{
 use crate::peer::response::RequestId;
 use crate::peer::response::headers::{
     RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER, RESPONSE_PEER_HEADER,
-    RESPONSE_REQUEST_ID_HEADER, RESPONSE_VERSION_HEADER, RequestDeadline, ResultRequest,
+    RESPONSE_REQUEST_ID_HEADER, RequestDeadline, ResultRequest,
 };
 use crate::peer::router::PeerId;
 use crate::subsystem::SubsystemName;
@@ -43,10 +43,6 @@ async fn a_reloaded_record_carries_its_result_request() -> color_eyre::Result<()
             "requested",
             OwnedHeaders::new()
                 .insert(Header {
-                    key: RESPONSE_VERSION_HEADER,
-                    value: Some("2"),
-                })
-                .insert(Header {
                     key: RESPONSE_REQUEST_ID_HEADER,
                     value: Some(id_text.as_str()),
                 })
@@ -75,12 +71,12 @@ async fn a_reloaded_record_carries_its_result_request() -> color_eyre::Result<()
             "malformed",
             OwnedHeaders::new()
                 .insert(Header {
-                    key: RESPONSE_VERSION_HEADER,
-                    value: Some("2"),
+                    key: RESPONSE_REQUEST_ID_HEADER,
+                    value: Some(id_text.as_str()),
                 })
                 .insert(Header {
-                    key: RESPONSE_VERSION_HEADER,
-                    value: Some("2"),
+                    key: RESPONSE_REQUEST_ID_HEADER,
+                    value: Some(id_text.as_str()),
                 }),
         )
         .await?;

@@ -19,7 +19,6 @@ pub(crate) mod client;
 pub(crate) mod codec;
 mod conn;
 mod deadline;
-pub(crate) mod health;
 mod inject;
 pub(crate) mod service;
 mod telemetry;
@@ -41,7 +40,6 @@ mod tests;
 
 use self::conn::incoming;
 use self::generated::peer_service_server::PeerServiceServer;
-use self::health::PeerHealth;
 use self::service::PeerService;
 use crate::peer::router::RelayHop;
 use std::io::Error as IoError;
@@ -51,7 +49,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
-use tonic_health::pb::health_server::HealthServer;
+use tonic_health::server::health_reporter;
 use tonic_reflection::server::{Builder as ReflectionBuilder, Error as ReflectionError};
 use tracing::error;
 
@@ -105,7 +103,7 @@ impl BoundListener {
 ///
 /// Returns [`TransportError::Reflection`] when the embedded schema cannot be
 /// published.
-pub(in crate::peer::router) fn serve<R, F>(
+pub(in crate::peer::router) async fn serve<R, F>(
     bound: BoundListener,
     service: PeerService<R>,
     shutdown: F,
@@ -118,11 +116,15 @@ where
         .register_encoded_file_descriptor_set(DESCRIPTOR_SET)
         .build_v1()?;
     let incoming = incoming(bound.listener);
+    let (health_reporter, health) = health_reporter();
+    health_reporter
+        .set_serving::<PeerServiceServer<PeerService<R>>>()
+        .await;
     let router = Server::builder()
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .add_service(PeerServiceServer::new(service))
-        .add_service(HealthServer::new(PeerHealth::new()))
+        .add_service(health)
         .add_service(reflection);
     Ok(tokio::spawn(async move {
         if let Err(error) = router

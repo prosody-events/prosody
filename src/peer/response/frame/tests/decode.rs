@@ -5,8 +5,9 @@ use crate::error::ErrorCategory;
 use crate::peer::response::frame::decode::FrameDecodeError;
 use crate::peer::response::frame::encode::{stage_error, stage_success};
 use crate::peer::response::frame::{
-    FIELD_ERROR_CATEGORY, FIELD_HANDLER_ERROR, FIELD_REQUEST_ID, FIELD_SUBSYSTEM, FIELD_SUCCESS,
-    FIELD_SUCCESS_FORMAT, FIELD_SUCCESS_PAYLOAD, FIELD_TARGET_PEER,
+    DELIVER_RESULT_HANDLER_ERROR_TAG, DELIVER_RESULT_REQUEST_ID_TAG, DELIVER_RESULT_SUBSYSTEM_TAG,
+    DELIVER_RESULT_SUCCESS_TAG, DELIVER_RESULT_TARGET_PEER_TAG, HANDLER_ERROR_CATEGORY_TAG,
+    RESPONSE_SUCCESS_FORMAT_TAG, RESPONSE_SUCCESS_PAYLOAD_TAG,
 };
 use crate::peer::response::{
     RequestId,
@@ -104,12 +105,12 @@ fn protobuf_merge_semantics_are_preserved() -> Result<()> {
     let mut repeated = valid.clone();
     let mut handler = BytesMut::new();
     raw_varint(
-        FIELD_ERROR_CATEGORY,
+        HANDLER_ERROR_CATEGORY_TAG,
         i32::from(ErrorCategory::Permanent) as u64,
         &mut handler,
     );
-    raw_bytes(FIELD_HANDLER_ERROR, &handler, &mut repeated);
-    raw_bytes(FIELD_TARGET_PEER, &[0x33; 16], &mut repeated);
+    raw_bytes(DELIVER_RESULT_HANDLER_ERROR_TAG, &handler, &mut repeated);
+    raw_bytes(DELIVER_RESULT_TARGET_PEER_TAG, &[0x33; 16], &mut repeated);
     let decoded = decode_frame(&mut repeated)?;
     assert_eq!(decoded.header.target, PeerId::from_bytes([0x33; 16]));
     assert!(matches!(
@@ -123,14 +124,14 @@ fn protobuf_merge_semantics_are_preserved() -> Result<()> {
     let mut merged = raw_header();
     let mut format = BytesMut::new();
     raw_bytes(
-        FIELD_SUCCESS_FORMAT,
+        RESPONSE_SUCCESS_FORMAT_TAG,
         CountingCodec::FORMAT_ID.as_bytes(),
         &mut format,
     );
-    raw_bytes(FIELD_SUCCESS, &format, &mut merged);
+    raw_bytes(DELIVER_RESULT_SUCCESS_TAG, &format, &mut merged);
     let mut payload = BytesMut::new();
-    raw_bytes(FIELD_SUCCESS_PAYLOAD, b"merged", &mut payload);
-    raw_bytes(FIELD_SUCCESS, &payload, &mut merged);
+    raw_bytes(RESPONSE_SUCCESS_PAYLOAD_TAG, b"merged", &mut payload);
+    raw_bytes(DELIVER_RESULT_SUCCESS_TAG, &payload, &mut merged);
     assert!(matches!(
         decode_frame(&mut merged)?.result,
         FrameResult::Success(ResponseSuccess { payload, .. }) if payload == b"merged"[..]
@@ -143,8 +144,8 @@ fn protobuf_merge_semantics_are_preserved() -> Result<()> {
 fn invalid_domain_fields_are_refused() {
     let mut invalid_text = raw_header();
     let mut success = BytesMut::new();
-    raw_bytes(FIELD_SUCCESS_FORMAT, &[0xff], &mut success);
-    raw_bytes(FIELD_SUCCESS, &success, &mut invalid_text);
+    raw_bytes(RESPONSE_SUCCESS_FORMAT_TAG, &[0xff], &mut success);
+    raw_bytes(DELIVER_RESULT_SUCCESS_TAG, &success, &mut invalid_text);
     assert!(matches!(
         decode_frame(&mut invalid_text),
         Err(FrameDecodeError::InvalidText(_))
@@ -152,8 +153,12 @@ fn invalid_domain_fields_are_refused() {
 
     let mut unknown_category = raw_header();
     let mut handler = BytesMut::new();
-    raw_varint(FIELD_ERROR_CATEGORY, 0, &mut handler);
-    raw_bytes(FIELD_HANDLER_ERROR, &handler, &mut unknown_category);
+    raw_varint(HANDLER_ERROR_CATEGORY_TAG, 0, &mut handler);
+    raw_bytes(
+        DELIVER_RESULT_HANDLER_ERROR_TAG,
+        &handler,
+        &mut unknown_category,
+    );
     assert!(matches!(
         decode_frame(&mut unknown_category),
         Err(FrameDecodeError::UnknownCategory(_))
@@ -162,9 +167,9 @@ fn invalid_domain_fields_are_refused() {
 
 fn raw_header() -> BytesMut {
     let mut wire = BytesMut::new();
-    raw_bytes(FIELD_TARGET_PEER, &[0x11; 16], &mut wire);
-    raw_bytes(FIELD_REQUEST_ID, &[0x22; 16], &mut wire);
-    raw_bytes(FIELD_SUBSYSTEM, b"billing", &mut wire);
+    raw_bytes(DELIVER_RESULT_TARGET_PEER_TAG, &[0x11; 16], &mut wire);
+    raw_bytes(DELIVER_RESULT_REQUEST_ID_TAG, &[0x22; 16], &mut wire);
+    raw_bytes(DELIVER_RESULT_SUBSYSTEM_TAG, b"billing", &mut wire);
     wire
 }
 

@@ -219,7 +219,8 @@ impl Elsewhere {
                 Relay::new(unused),
             ),
             async move { stopped.await.unwrap_or(()) },
-        )?;
+        )
+        .await?;
         Ok(Self {
             peer,
             registry,

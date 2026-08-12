@@ -2,41 +2,17 @@
 
 use super::Harness;
 use crate::peer::router::grpc::generated::peer_service_server::SERVICE_NAME;
-use crate::peer::router::grpc::health::PeerHealth;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
-use tonic::{Code, Request};
+use tonic::Code;
 use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
-use tonic_health::pb::health_server::Health;
 
 /// A name this listener serves nothing under.
 const UNSERVED: &str = "prosody.peer.v1.NotAService";
-
-/// An active router serves the empty name and its peer service only.
-#[test]
-fn the_grpc_health_answer_names_the_active_router() -> Result<()> {
-    init_test_logging();
-    TEST_RUNTIME.block_on(async {
-        let health = PeerHealth::new();
-        ensure!(
-            check(&health, "").await? == Some(i32::from(ServingStatus::Serving)),
-            "an active router must serve the empty name"
-        );
-        ensure!(
-            check(&health, SERVICE_NAME).await? == Some(i32::from(ServingStatus::Serving)),
-            "a listener that answers at all serves the peer method"
-        );
-        ensure!(
-            check(&health, UNSERVED).await?.is_none(),
-            "a name this listener does not serve must be NOT_FOUND"
-        );
-        Ok(())
-    })
-}
 
 /// `grpc.health.v1` is routed on the peer port itself, not merely built.
 ///
@@ -71,15 +47,5 @@ fn the_health_service_answers_on_the_peer_port() -> Result<()> {
 fn request(service: &str) -> HealthCheckRequest {
     HealthCheckRequest {
         service: service.to_owned(),
-    }
-}
-
-/// The serving status one `Check` answered, or `None` when the name is not
-/// served here.
-async fn check<H: Health>(health: &H, service: &str) -> Result<Option<i32>> {
-    match health.check(Request::new(request(service))).await {
-        Ok(response) => Ok(Some(response.into_inner().status)),
-        Err(status) if status.code() == Code::NotFound => Ok(None),
-        Err(status) => Err(status.into()),
     }
 }

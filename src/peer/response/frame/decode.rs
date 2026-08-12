@@ -1,8 +1,7 @@
 //! Converts one generated Protobuf frame into Prosody's domain types.
 
 use super::{
-    FrameHeader, FrameResult, HandlerError, ID_BYTES, ResponseFrame,
-    ResponseSuccess as DomainSuccess,
+    FrameHeader, FrameResult, HandlerError, ResponseFrame, ResponseSuccess as DomainSuccess,
 };
 use crate::error::{ErrorCategory, UnknownErrorCategory};
 use crate::peer::response::{FormatToken, RequestId};
@@ -14,8 +13,10 @@ use crate::peer::router::grpc::generated::{
 use crate::subsystem::{SubsystemName, SubsystemNameError};
 use bytes::Bytes;
 use prost::DecodeError;
+use std::mem::size_of;
 use std::str::{Utf8Error, from_utf8};
 use thiserror::Error;
+use uuid::Bytes as UuidBytes;
 
 impl TryFrom<DeliverResultRequest> for ResponseFrame {
     type Error = FrameDecodeError;
@@ -73,24 +74,21 @@ fn decode_subsystem(value: &Bytes) -> Result<SubsystemName, FrameDecodeError> {
     Ok(SubsystemName::try_new(from_utf8(value)?)?)
 }
 
-fn required_id(value: &Bytes, field: &'static str) -> Result<[u8; ID_BYTES], FrameDecodeError> {
+fn required_id(value: &Bytes, field: &'static str) -> Result<UuidBytes, FrameDecodeError> {
     optional_id(value, field)?.ok_or(FrameDecodeError::MissingField(field))
 }
 
-fn optional_id(
-    value: &Bytes,
-    field: &'static str,
-) -> Result<Option<[u8; ID_BYTES]>, FrameDecodeError> {
+fn optional_id(value: &Bytes, field: &'static str) -> Result<Option<UuidBytes>, FrameDecodeError> {
     if value.is_empty() {
         return Ok(None);
     }
-    if value.len() != ID_BYTES {
+    if value.len() != size_of::<UuidBytes>() {
         return Err(FrameDecodeError::MalformedId {
             field,
             bytes: value.len(),
         });
     }
-    let mut id = [0; ID_BYTES];
+    let mut id = UuidBytes::default();
     id.copy_from_slice(value);
     Ok(Some(id))
 }

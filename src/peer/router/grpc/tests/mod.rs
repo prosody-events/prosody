@@ -94,7 +94,8 @@ impl Harness {
                 LocalTarget::new(peer, Arc::clone(&served_registry)),
                 Relay::new(relay_router),
             ),
-        )?;
+        )
+        .await?;
         Ok(Self {
             peer,
             registry: served_registry,

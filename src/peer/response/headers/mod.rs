@@ -1,9 +1,9 @@
 //! The reserved Kafka headers a record uses to ask for a peer response.
 //!
-//! Five plain UTF-8 headers carry the request metadata, so a stuck request is
-//! readable in any broker UI without a decoder: `response-version`,
-//! `response-request-id`, `response-peer`, `response-deadline`, and one
-//! `response-awaited` per subsystem the record awaits. The four singletons
+//! Four plain UTF-8 headers carry the request metadata, so a stuck request is
+//! readable in any broker UI without a decoder: `response-request-id`,
+//! `response-peer`, `response-deadline`, and one `response-awaited` per
+//! subsystem the record awaits. The three singletons
 //! must occur **exactly** once. A producer may repeat a Kafka header key, so
 //! accepting the first or the last would be an unstated precedence — and
 //! `response-awaited` repeats rather than comma-separating because a comma is a
@@ -39,12 +39,11 @@ use uuid::fmt::Hyphenated;
 #[cfg(test)]
 mod tests;
 
-// The five header names this protocol reserves. Two sites must agree on the
+// The four header names this protocol reserves. Two sites must agree on the
 // set: the `match key` arms of `parse_result_request`, and
 // RESERVED_REQUEST_HEADERS below, which `is_reserved` reads. A name the parser
 // matches but the array omits is one a caller can inject, so add every new name
 // to both.
-pub(crate) const RESPONSE_VERSION_HEADER: &str = "response-version";
 pub(crate) const RESPONSE_REQUEST_ID_HEADER: &str = "response-request-id";
 pub(crate) const RESPONSE_PEER_HEADER: &str = "response-peer";
 pub(crate) const RESPONSE_DEADLINE_HEADER: &str = "response-deadline";
@@ -53,23 +52,12 @@ pub(crate) const RESPONSE_AWAITED_HEADER: &str = "response-awaited";
 /// Header names that
 /// [`ProsodyRequester`](crate::peer::requester::ProsodyRequester) refuses in
 /// caller-supplied headers.
-pub(crate) const RESERVED_REQUEST_HEADERS: [&str; 5] = [
-    RESPONSE_VERSION_HEADER,
+pub(crate) const RESERVED_REQUEST_HEADERS: [&str; 4] = [
     RESPONSE_REQUEST_ID_HEADER,
     RESPONSE_PEER_HEADER,
     RESPONSE_DEADLINE_HEADER,
     RESPONSE_AWAITED_HEADER,
 ];
-
-/// The one request-metadata revision this responder understands, in the exact
-/// text a producer must write.
-///
-/// This revision freezes what the Kafka headers mean. Kafka headers have no
-/// schema evolution rules that can protect a responder from incompatible
-/// semantics. One revision has one text form, as one id has one text form:
-/// `01` and `+1` are refused. The requester writes this value, so the writer
-/// and reader cannot differ.
-pub(crate) const REQUEST_REVISION: &str = "2";
 
 /// The only accepted length of an id header value: the hyphenated UUID that
 /// [`id_text`] writes. Fixing the length rejects the simple, braced and URN
@@ -189,8 +177,8 @@ impl Eq for RequestDeadline {}
 ///
 /// * `Ok(None)` — the record reserves no header, or awaits only other
 ///   subsystems. Ordinary traffic; nothing is counted.
-/// * `Ok(Some(request))` — every header is present, singular and in bounds, the
-///   revision is supported, and `responder` is among the awaited subsystems.
+/// * `Ok(Some(request))` — every header is present, singular, and in bounds.
+///   The `responder` is among the awaited subsystems.
 /// * `Err(rejection)` — a reserved header is present but unusable. The caller
 ///   counts it and drops the request; the event still processes normally.
 ///
@@ -213,7 +201,6 @@ pub(crate) fn parse_result_request<'h, H>(
 where
     H: IntoIterator<Item = (&'h str, Option<&'h [u8]>)>,
 {
-    let mut version = None;
     let mut id = None;
     let mut peer = None;
     let mut deadline = None;
@@ -230,9 +217,6 @@ where
                 let name = awaited_name(value)?;
                 addressed |= name == responder.as_str();
             }
-            RESPONSE_VERSION_HEADER => {
-                set_once(&mut version, || check_revision(value))?;
-            }
             RESPONSE_REQUEST_ID_HEADER => {
                 set_once(&mut id, || parse_id(value).map(RequestId::from_bytes))?;
             }
@@ -248,13 +232,13 @@ where
     }
 
     // No reserved header at all, so this record asks for nothing.
-    if version.is_none() && id.is_none() && peer.is_none() && deadline.is_none() && awaited == 0 {
+    if id.is_none() && peer.is_none() && deadline.is_none() && awaited == 0 {
         return Ok(None);
     }
     let (Some(id), Some(peer), Some(deadline)) = (id, peer, deadline) else {
         return Err(HeaderRejection::MissingSingleton);
     };
-    if version.is_none() || awaited == 0 {
+    if awaited == 0 {
         return Err(HeaderRejection::MissingSingleton);
     }
 
@@ -324,16 +308,6 @@ fn parse_deadline(value: Option<&[u8]>) -> Result<RequestDeadline, HeaderRejecti
         .map_err(|_| HeaderRejection::MalformedDeadline)
 }
 
-/// Accepts the one revision this responder reads the other headers under, and
-/// discards it: keeping it would only let a later reader re-decide a question
-/// settled here.
-fn check_revision(value: Option<&[u8]>) -> Result<(), HeaderRejection> {
-    if value == Some(REQUEST_REVISION.as_bytes()) {
-        return Ok(());
-    }
-    Err(HeaderRejection::UnsupportedVersion)
-}
-
 /// Why a record's reserved headers yield no result request.
 ///
 /// Never propagated as an event failure — the caller counts it and processes
@@ -345,8 +319,6 @@ pub(crate) enum HeaderRejection {
     DuplicateSingleton,
     #[error("a required response header is missing")]
     MissingSingleton,
-    #[error("the request metadata revision is not supported")]
-    UnsupportedVersion,
     #[error("a response id is not a 36-character UUID")]
     MalformedId,
     #[error("a response deadline is not canonical Unix microseconds")]
@@ -369,7 +341,6 @@ impl HeaderRejection {
         match self {
             Self::DuplicateSingleton => "duplicate",
             Self::MissingSingleton => "missing",
-            Self::UnsupportedVersion => "unsupported_version",
             Self::MalformedId => "malformed_id",
             Self::MalformedDeadline => "malformed_deadline",
             Self::MalformedAwaited => "malformed_awaited",

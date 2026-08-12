@@ -44,14 +44,15 @@ pub(crate) struct FixedRouter {
 
 impl Served {
     /// Serves `service` on `bound`, reporting ready and live.
-    pub(crate) fn start<R: RelayHop>(
+    pub(crate) async fn start<R: RelayHop>(
         bound: BoundListener,
         service: PeerService<R>,
     ) -> Result<Self> {
         let (stop, stopped) = channel();
         let task = serve(bound, service, async move {
             stopped.await.unwrap_or(());
-        })?;
+        })
+        .await?;
         Ok(Self { stop, task })
     }
 

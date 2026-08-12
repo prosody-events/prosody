@@ -9,7 +9,7 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::str::{Utf8Error, from_utf8};
 use std::sync::LazyLock;
 use tonic::Code;
-use uuid::Uuid;
+use uuid::{Bytes as UuidBytes, Uuid};
 
 pub(crate) mod frame;
 pub(crate) mod headers;
@@ -58,12 +58,12 @@ impl RequestId {
     }
 
     /// Reads an id from its 16-byte wire form.
-    pub(crate) const fn from_bytes(bytes: [u8; 16]) -> Self {
+    pub(crate) const fn from_bytes(bytes: UuidBytes) -> Self {
         Self(Uuid::from_bytes(bytes))
     }
 
     /// The 16-byte wire form.
-    pub(crate) const fn into_bytes(self) -> [u8; 16] {
+    pub(crate) const fn into_bytes(self) -> UuidBytes {
         self.0.into_bytes()
     }
 }
