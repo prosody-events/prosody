@@ -210,7 +210,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         let mut deadline_buf = itoa::Buffer::new();
 
         let deadline = RequestDeadline::after(timeout).ok_or(RequestError::DeadlineOutOfRange)?;
-        let mut registration = self.registry.register(subsystems, deadline)?;
+        let registration = self.registry.register(subsystems, deadline)?;
         Span::current().record("request.id", display(registration.id()));
 
         record_headers = append_request_headers(
@@ -222,8 +222,8 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         );
 
         let started = Instant::now();
-        let collected = collect::<R, V, _, _>(
-            &mut registration,
+        let collected = collect::<R, _, _>(
+            registration,
             self.producer
                 .send_owned(record_headers, topic, key, payload),
         )

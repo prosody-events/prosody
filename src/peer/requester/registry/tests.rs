@@ -1,19 +1,18 @@
 //! Test-only registration ownership for router integration tests.
 
-use super::{FrameReceiver, INLINE_AWAITED, PendingRegistry, Registration};
+use super::{FrameReceiver, FrameReceivers, PendingRegistry, PendingRequest};
 use crate::peer::response::RequestId;
 use crate::peer::response::headers::RequestDeadline;
 use crate::subsystem::SubsystemName;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
-use smallvec::SmallVec;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) struct TestRegistration {
-    registration: Registration,
-    receivers: SmallVec<[FrameReceiver; INLINE_AWAITED]>,
+    pending: PendingRequest,
+    receivers: FrameReceivers,
 }
 
 pub(crate) fn pending_len(registry: &PendingRegistry) -> usize {
@@ -28,16 +27,13 @@ impl TestRegistration {
     ) -> Result<Self> {
         let deadline = RequestDeadline::after(timeout)
             .ok_or_else(|| eyre!("the test deadline was out of range"))?;
-        let mut registration = registry.register::<Infallible>(subsystems, deadline)?;
-        let receivers = registration.take_receivers();
-        Ok(Self {
-            registration,
-            receivers,
-        })
+        let registration = registry.register::<Infallible>(subsystems, deadline)?;
+        let (pending, receivers) = registration.into_parts();
+        Ok(Self { pending, receivers })
     }
 
     pub(crate) const fn id(&self) -> RequestId {
-        self.registration.id()
+        self.pending.id
     }
 
     pub(crate) fn receiver(&mut self) -> Result<FrameReceiver> {

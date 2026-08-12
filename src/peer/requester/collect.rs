@@ -17,20 +17,22 @@ use tokio::time::sleep_until;
 ///
 /// Before the deadline, completion requires both the Kafka report and every
 /// subsystem result. Thus, responses cannot cancel producer side effects.
-pub(crate) async fn collect<R, V, F, PE>(
-    registration: &mut Registration,
+pub(crate) async fn collect<R, F, PE>(
+    registration: Registration,
     produce: F,
-) -> Result<Vec<Result<V, ResponseError>>, RequestError<PE>>
+) -> Result<Vec<Result<R::Payload, ResponseError>>, RequestError<PE>>
 where
-    R: Codec<Payload = V>,
+    R: Codec,
     F: Future<Output = Result<(), ProducerError<PE>>>,
     PE: Error,
 {
-    let deadline = registration.deadline();
-    let receivers = registration.take_receivers();
+    let (pending, receivers) = registration.into_parts();
+    let deadline = pending.deadline();
     let mut results = (0..receivers.len())
         .map(|_| Err(ResponseError::Timeout))
         .collect::<Vec<_>>();
+    // This set allocates per receiver but polls only receivers that wake. A
+    // contiguous scan can make an unfavorable response order quadratic.
     let mut responses = FuturesUnordered::new();
     for (index, receiver) in receivers.into_iter().enumerate() {
         responses.push(receiver.map(move |frame| (index, frame)));
@@ -38,19 +40,18 @@ where
 
     let mut produce = pin!(produce);
     let mut deadline = pin!(sleep_until(deadline));
-    let mut sent = false;
-    while !responses.is_empty() || !sent {
+    let mut reported = false;
+    while !responses.is_empty() || !reported {
         select! {
             biased;
-            report = &mut produce, if !sent => {
+            report = &mut produce, if !reported => {
                 report.map_err(RequestError::Produce)?;
-                sent = true;
+                reported = true;
             }
             Some((index, frame)) = responses.next() => {
-                if let Ok(frame) = frame {
-                    results[index] = decode::<R, V>(frame);
-                } else if registration.is_closed() {
-                    return Err(RequestError::ShuttingDown);
+                match frame {
+                    Ok(frame) => results[index] = decode::<R>(frame),
+                    Err(_) => return Err(RequestError::ShuttingDown),
                 }
             }
             () = &mut deadline => break,
@@ -60,10 +61,7 @@ where
     Ok(results)
 }
 
-fn decode<R, V>(frame: ResponseFrame) -> Result<V, ResponseError>
-where
-    R: Codec<Payload = V>,
-{
+fn decode<R: Codec>(frame: ResponseFrame) -> Result<R::Payload, ResponseError> {
     match frame.result {
         FrameResult::Success(ResponseSuccess { format, payload }) => {
             if format.as_bytes() != R::FORMAT_ID.as_bytes() {

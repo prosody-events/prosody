@@ -58,7 +58,7 @@ fn arrivals_consume_only_their_exact_pending_response(trace: ArrivalTrace) -> Te
 async fn each_pending_response_is_removed_once() -> Result<()> {
     let registry = registry();
     let names = names(&["billing", "ledger"])?;
-    let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
+    let registration = register(&registry, &names, MAX_TIMEOUT)?;
     let id = registration.id();
 
     assert_eq!(
@@ -74,10 +74,8 @@ async fn each_pending_response_is_removed_once() -> Result<()> {
         ResponseDisposition::Accepted
     );
 
-    let results =
-        collect::<TestCodec, u32, _, TestCodecError>(&mut registration, pending()).await?;
+    let results = collect::<TestCodec, _, TestCodecError>(registration, pending()).await?;
     assert_eq!(results, vec![Ok(1), Ok(2)]);
-    drop(registration);
     assert_eq!(pending_len(&registry), 0);
     Ok(())
 }
@@ -86,7 +84,7 @@ async fn each_pending_response_is_removed_once() -> Result<()> {
 async fn handler_failures_keep_their_category_and_message() -> Result<()> {
     let registry = registry();
     let names = names(&["billing"])?;
-    let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
+    let registration = register(&registry, &names, MAX_TIMEOUT)?;
     assert_eq!(
         registry.accept(failure(
             registration.id(),
@@ -96,7 +94,7 @@ async fn handler_failures_keep_their_category_and_message() -> Result<()> {
         )),
         ResponseDisposition::Accepted
     );
-    let results = collect::<TestCodec, u32, _, TestCodecError>(&mut registration, async {
+    let results = collect::<TestCodec, _, TestCodecError>(registration, async {
         Ok::<(), ProducerError<TestCodecError>>(())
     })
     .await?;
@@ -114,7 +112,7 @@ async fn handler_failures_keep_their_category_and_message() -> Result<()> {
 async fn responses_do_not_cancel_producer_completion() -> Result<()> {
     let registry = registry();
     let names = names(&["billing"])?;
-    let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
+    let registration = register(&registry, &names, MAX_TIMEOUT)?;
     let id = registration.id();
     let (complete, completed) = oneshot::channel();
     let produce = async {
@@ -128,8 +126,8 @@ async fn responses_do_not_cancel_producer_completion() -> Result<()> {
         ResponseDisposition::Accepted
     );
 
-    let mut collected = pin!(collect::<TestCodec, u32, _, TestCodecError>(
-        &mut registration,
+    let mut collected = pin!(collect::<TestCodec, _, TestCodecError>(
+        registration,
         produce,
     ));
     assert!(
@@ -149,8 +147,8 @@ async fn every_request_exit_removes_remaining_responses() -> Result<()> {
     drop(register(&registry, &names, MAX_TIMEOUT)?);
     assert_eq!(pending_len(&registry), 0);
 
-    let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
-    let results = collect::<TestCodec, u32, _, TestCodecError>(&mut registration, async {
+    let registration = register(&registry, &names, MAX_TIMEOUT)?;
+    let results = collect::<TestCodec, _, TestCodecError>(registration, async {
         Ok::<(), ProducerError<TestCodecError>>(())
     })
     .await?;
@@ -158,27 +156,24 @@ async fn every_request_exit_removes_remaining_responses() -> Result<()> {
         results,
         vec![Err(ResponseError::Timeout), Err(ResponseError::Timeout)]
     );
-    drop(registration);
     assert_eq!(pending_len(&registry), 0);
 
-    let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
-    let outcome = collect::<TestCodec, u32, _, TestCodecError>(&mut registration, async {
+    let registration = register(&registry, &names, MAX_TIMEOUT)?;
+    let outcome = collect::<TestCodec, _, TestCodecError>(registration, async {
         Err(ProducerError::Kafka(KafkaError::Canceled))
     })
     .await;
     if !matches!(outcome, Err(RequestError::Produce(_))) {
         bail!("a send failure did not fail the request");
     }
-    drop(registration);
     assert_eq!(pending_len(&registry), 0);
 
-    let mut registration = register(&registry, &names, MAX_TIMEOUT)?;
+    let registration = register(&registry, &names, MAX_TIMEOUT)?;
     registry.terminate();
-    let outcome = collect::<TestCodec, u32, _, TestCodecError>(&mut registration, pending()).await;
+    let outcome = collect::<TestCodec, _, TestCodecError>(registration, pending()).await;
     if !matches!(outcome, Err(RequestError::ShuttingDown)) {
         bail!("shutdown did not fail the request");
     }
-    drop(registration);
     assert_eq!(pending_len(&registry), 0);
     Ok(())
 }
@@ -190,7 +185,7 @@ fn run_arrivals(trace: ArrivalTrace) -> Result<()> {
         let awaited = names(&pool)?;
         let outsider = names(&["not-awaited"])?;
         let registry = registry();
-        let mut registration = register(&registry, &awaited, MAX_TIMEOUT)?;
+        let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
         let mut expected = vec![None; awaited.len()];
 
         for (raw, value) in trace.arrivals {
@@ -209,8 +204,7 @@ fn run_arrivals(trace: ArrivalTrace) -> Result<()> {
             );
         }
 
-        let results =
-            collect::<TestCodec, u32, _, TestCodecError>(&mut registration, pending()).await?;
+        let results = collect::<TestCodec, _, TestCodecError>(registration, pending()).await?;
         assert_eq!(
             results,
             expected
@@ -221,7 +215,6 @@ fn run_arrivals(trace: ArrivalTrace) -> Result<()> {
                 })
                 .collect::<Vec<_>>()
         );
-        drop(registration);
         assert_eq!(pending_len(&registry), 0);
         Ok(())
     })

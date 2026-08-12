@@ -11,7 +11,6 @@ use opentelemetry::metrics::UpDownCounter;
 use scc::HashMap;
 use smallvec::SmallVec;
 use std::error::Error;
-use std::mem;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::{Arc, LazyLock};
@@ -34,6 +33,7 @@ static PENDING: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
 type ResponseKey = (RequestId, SubsystemName);
 type FrameSender = oneshot::Sender<ResponseFrame>;
 type FrameReceiver = oneshot::Receiver<ResponseFrame>;
+type FrameReceivers = SmallVec<[FrameReceiver; INLINE_AWAITED]>;
 type PendingSenders = HashMap<ResponseKey, FrameSender, RandomState>;
 
 /// Pending response channels for one process.
@@ -47,10 +47,15 @@ pub(crate) struct PendingRegistry {
 
 /// Owns one request's receivers and removes its remaining senders on drop.
 pub(crate) struct Registration {
+    pending: PendingRequest,
+    receivers: FrameReceivers,
+}
+
+/// Removes one request's remaining response senders on drop.
+pub(super) struct PendingRequest {
     registry: Arc<PendingRegistry>,
     id: RequestId,
     keys: SmallVec<[ResponseKey; INLINE_AWAITED]>,
-    receivers: SmallVec<[FrameReceiver; INLINE_AWAITED]>,
     deadline: Instant,
 }
 
@@ -105,11 +110,13 @@ impl PendingRegistry {
         }
         PENDING.add(1, &[]);
         Ok(Registration {
-            registry: Arc::clone(self),
-            id,
-            keys,
+            pending: PendingRequest {
+                registry: Arc::clone(self),
+                id,
+                keys,
+                deadline: deadline.expires_at(),
+            },
             receivers,
-            deadline: deadline.expires_at(),
         })
     }
 
@@ -136,10 +143,6 @@ impl PendingRegistry {
         self.senders.retain_sync(|_, _| false);
     }
 
-    pub(in crate::peer::requester) fn is_closed(&self) -> bool {
-        self.closed.load(Acquire)
-    }
-
     fn remove(&self, keys: &[ResponseKey]) {
         for key in keys {
             drop(self.senders.remove_sync(key));
@@ -149,25 +152,21 @@ impl PendingRegistry {
 
 impl Registration {
     pub(in crate::peer::requester) const fn id(&self) -> RequestId {
-        self.id
+        self.pending.id
     }
 
-    pub(in crate::peer::requester) fn deadline(&self) -> Instant {
-        self.deadline
-    }
-
-    pub(in crate::peer::requester) fn take_receivers(
-        &mut self,
-    ) -> SmallVec<[FrameReceiver; INLINE_AWAITED]> {
-        mem::take(&mut self.receivers)
-    }
-
-    pub(in crate::peer::requester) fn is_closed(&self) -> bool {
-        self.registry.is_closed()
+    pub(super) fn into_parts(self) -> (PendingRequest, FrameReceivers) {
+        (self.pending, self.receivers)
     }
 }
 
-impl Drop for Registration {
+impl PendingRequest {
+    pub(super) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+}
+
+impl Drop for PendingRequest {
     fn drop(&mut self) {
         self.registry.remove(&self.keys);
         PENDING.add(-1, &[]);
