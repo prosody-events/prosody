@@ -71,6 +71,7 @@ prosody = "0.1"
 ```rust,no_run
 use prosody::prelude::*;
 use serde_json::json;
+use std::convert::Infallible;
 
 #[derive(Clone)]
 struct MyHandler;
