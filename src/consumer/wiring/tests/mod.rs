@@ -3,7 +3,7 @@
 
 use super::runtime::{StartupServices, initialize_consumer};
 use super::state::{KeyedStateInputs, memory_state_provider};
-use crate::consumer::decode::RequestAdmission;
+use crate::consumer::decode::ResultRequestReader;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::handler::{DemandType, EventHandler, HandlerProvider, Uncommitted};
 use crate::consumer::kafka_context::PartitionProviders;
@@ -385,12 +385,12 @@ fn recording_memory_deps(
     StateReaderDependencies::from_parts(backend, deps.cache().clone())
 }
 
-async fn start<A: RequestAdmission + 'static>(
+async fn start<R: ResultRequestReader + 'static>(
     config: &ConsumerConfiguration,
     managers: Arc<Managers<Value>>,
     heartbeats: HeartbeatRegistry,
     log: EventLog,
-    peer: A,
+    requests: R,
 ) -> Result<ProsodyConsumer<JsonCodec>, ConsumerError> {
     let telemetry = Telemetry::new();
     let keyed_state = KeyedStateInputs::new(
@@ -420,7 +420,7 @@ async fn start<A: RequestAdmission + 'static>(
             observer: KafkaObserver::new(&config.group_id),
             managers,
         },
-        peer,
+        requests,
     ))
     .await
 }

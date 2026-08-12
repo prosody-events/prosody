@@ -4,7 +4,7 @@
 use super::super::KafkaObserver;
 use crate::JsonCodec;
 use crate::consumer::config::ConsumerConfiguration;
-use crate::consumer::decode::NoRequests;
+use crate::consumer::decode::IgnoreRequests;
 use crate::consumer::error::ConsumerError;
 use crate::consumer::kafka_context::PartitionProviders;
 use crate::consumer::middleware::CloneProvider;
@@ -63,7 +63,7 @@ pub(super) async fn initialize_with(
             observer,
             managers,
         },
-        NoRequests,
+        IgnoreRequests,
     ))
     .await)
 }

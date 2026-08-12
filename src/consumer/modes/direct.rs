@@ -5,7 +5,7 @@
 use crate::cassandra::CassandraStore;
 use crate::consumer::ProsodyConsumer;
 use crate::consumer::config::ConsumerConfiguration;
-use crate::consumer::decode::NoRequests;
+use crate::consumer::decode::IgnoreRequests;
 use crate::consumer::error::{ConsumerError, KeyedStateInitError};
 use crate::consumer::handler::{EventHandler, HandlerProvider};
 use crate::consumer::kafka_context::PartitionProviders;
@@ -159,7 +159,7 @@ where
             state,
         },
         services,
-        NoRequests,
+        IgnoreRequests,
     ))
     .await
 }

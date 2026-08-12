@@ -59,17 +59,13 @@ pub struct DecodedMessage<P> {
     pub parent_context: Context,
 }
 
-/// Selects whether this consumer accepts peer request headers.
-pub(crate) trait RequestAdmission: Send {
-    /// Reads a result request admitted by this consumer.
+/// Reads result-request headers that this consumer can answer.
+pub(crate) trait ResultRequestReader: Send {
     fn request(&self, message: &BorrowedMessage) -> Option<ResultRequest>;
 }
 
-/// Rejects all peer request headers.
-pub(crate) struct NoRequests;
-
-/// Accepts peer requests for one subsystem.
-pub(crate) struct SubsystemRequests(pub(crate) SubsystemName);
+/// Ignores all result-request headers.
+pub(crate) struct IgnoreRequests;
 
 /// Decodes and validates a Kafka message into a `DecodedMessage`.
 ///
@@ -77,17 +73,16 @@ pub(crate) struct SubsystemRequests(pub(crate) SubsystemName);
 /// Callers create their own spans from the context, ensuring span lifecycles
 /// are independent of cache eviction.
 ///
-/// `responder` is the subsystem this consumer answers peer requests for, or
-/// `None` when it answers none.
+/// `requests` selects which result-request headers this consumer reads.
 ///
 /// `message` is taken as `&mut` so the codec can parse the payload in place
 /// via `payload_mut`, avoiding a copy; its payload bytes are left in an
 /// unspecified state after this call.
-pub fn decode_message<C: Codec, A: RequestAdmission>(
+pub fn decode_message<C: Codec, R: ResultRequestReader>(
     message: &mut BorrowedMessage,
     propagator: &TextMapCompositePropagator,
     codec: &mut C,
-    admission: &A,
+    requests: &R,
 ) -> Option<DecodedMessage<C::Payload>> {
     let topic: Topic = Intern::from(message.topic());
     let partition = message.partition();
@@ -96,7 +91,7 @@ pub fn decode_message<C: Codec, A: RequestAdmission>(
     let parent_context = propagator.extract(&MessageExtractor::new(message));
 
     let source_system = extract_source_system(message);
-    let request = admission.request(message);
+    let request = requests.request(message);
     let timestamp = resolve_timestamp(message);
 
     let Some(key_data) = message.key() else {
@@ -197,19 +192,18 @@ fn extract_source_system(message: &BorrowedMessage) -> Option<SourceSystem> {
 ///
 /// An unusable header set is counted and dropped, never failed.
 /// [`HeaderRejection`](crate::response::headers::HeaderRejection) states why.
-impl RequestAdmission for NoRequests {
+impl ResultRequestReader for IgnoreRequests {
     fn request(&self, _message: &BorrowedMessage) -> Option<ResultRequest> {
         None
     }
 }
 
-impl RequestAdmission for SubsystemRequests {
+impl ResultRequestReader for SubsystemName {
     fn request(&self, message: &BorrowedMessage) -> Option<ResultRequest> {
         let headers = message.headers()?;
-
         match parse_result_request(
             headers.iter().map(|header| (header.key, header.value)),
-            &self.0,
+            self,
         ) {
             Ok(request) => request,
             Err(rejection) => {
@@ -220,10 +214,9 @@ impl RequestAdmission for SubsystemRequests {
     }
 }
 
-impl RequestAdmission for Option<&SubsystemName> {
+impl ResultRequestReader for Option<&SubsystemName> {
     fn request(&self, message: &BorrowedMessage) -> Option<ResultRequest> {
-        let subsystem = self.as_ref()?;
-        SubsystemRequests((*subsystem).clone()).request(message)
+        self.as_ref()?.request(message)
     }
 }
 

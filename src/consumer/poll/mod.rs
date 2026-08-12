@@ -26,7 +26,7 @@ use tracing::{Span, debug, error, warn};
 use crate::Codec;
 use crate::EventType;
 use crate::Topic;
-use crate::consumer::decode::{DecodedMessage, RequestAdmission, decode_message};
+use crate::consumer::decode::{DecodedMessage, ResultRequestReader, decode_message};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{Managers, WatermarkVersion};
@@ -52,12 +52,12 @@ mod tests;
 ///   poller only calls `Consumer`-trait methods on it, so it stays agnostic to
 ///   the provider generics baked into the context.
 /// * `C` - A type implementing [`Codec`] for deserializing message payloads.
-pub struct PollConfig<'a, Ctx, C, A>
+pub struct PollConfig<'a, Ctx, C, R>
 where
     Ctx: ConsumerContext,
     C: Codec,
     C::Payload: Clone + EventType,
-    A: RequestAdmission,
+    R: ResultRequestReader,
 {
     /// Time between consecutive poll operations
     pub poll_interval: Duration,
@@ -86,8 +86,8 @@ where
     /// Span relation for message execution spans
     pub message_spans: SpanRelation,
 
-    /// Peer request policy selected by the consumer resource type.
-    pub admission: A,
+    /// Result-request reader selected by the response policy.
+    pub requests: R,
 }
 
 /// Runs the main Kafka message polling and processing loop.
@@ -103,12 +103,12 @@ where
 ///
 /// The loop continues until the shutdown flag is set, or until the message
 /// buffer's semaphore reports closed.
-pub fn poll<Ctx, C, A>(config: PollConfig<Ctx, C, A>)
+pub fn poll<Ctx, C, R>(config: PollConfig<Ctx, C, R>)
 where
     Ctx: ConsumerContext,
     C: Codec,
     C::Payload: Clone + EventType,
-    A: RequestAdmission,
+    R: ResultRequestReader,
 {
     // Destructure configuration for cleaner access
     let PollConfig {
@@ -121,7 +121,7 @@ where
         heartbeat,
         shutdown,
         message_spans,
-        admission,
+        requests,
     } = config;
 
     // Initialize distributed tracing propagator for context extraction
@@ -191,7 +191,7 @@ where
         );
 
         // Decode message through extraction, validation, and filtering
-        let maybe_decoded = decode_message(&mut message, &propagator, &mut codec, &admission);
+        let maybe_decoded = decode_message(&mut message, &propagator, &mut codec, &requests);
 
         // Create consumer message with processing state and dispatch
         if let Some(decoded) = maybe_decoded {

@@ -131,7 +131,7 @@ where
                 .await
             }
             (false, TriggerStoreConfiguration::Cassandra(config)) => {
-                let deps = cassandra_deps(&setup, config, response.subsystem()).await?;
+                let deps = cassandra_deps(&setup, config, response.request_subsystem()).await?;
                 Self::low_latency_consumer_with_policy(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
@@ -180,7 +180,7 @@ where
         .layer(topic)
         .layer(retry);
         let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let (leaf, resources) = response.terminate(handler);
+        let (leaf, requests) = response.terminate(handler);
         let provider = middleware.with_provider(leaf);
         let providers = PartitionProviders {
             triggers: components.trigger,
@@ -198,7 +198,7 @@ where
             provider,
             providers,
             services,
-            resources,
+            requests,
         ))
         .await
     }

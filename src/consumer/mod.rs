@@ -334,7 +334,7 @@ impl<C: Codec> ProsodyConsumer<C> {
         }
     }
 
-    /// Closes peer request admission, stops the poll loop, and waits for it.
+    /// Stops result-request reading and the poll loop, then waits for the loop.
     ///
     /// Answers `None` to every caller but the one that takes the runtime state,
     /// so a losing caller runs no step of the teardown at all. The winner also

@@ -22,7 +22,7 @@ mod low_latency;
 mod pipeline;
 
 use crate::Codec;
-use crate::consumer::decode::{NoRequests, RequestAdmission, SubsystemRequests};
+use crate::consumer::decode::{IgnoreRequests, ResultRequestReader};
 use crate::consumer::middleware::providers::{FallibleCloneProvider, LeafHandler};
 use crate::consumer::middleware::respond::{RespondHandler, Responder};
 use crate::consumer::middleware::{FallibleHandler, FallibleHandlerProvider, SettlementHandler};
@@ -41,7 +41,7 @@ pub(crate) struct Responding<'a, C, R> {
     codec: PhantomData<fn() -> C>,
 }
 
-/// Selects one consumer's leaf and peer resources at compile time.
+/// Selects one consumer's leaf and result-request reader at compile time.
 pub(crate) trait ResponsePolicy<H>
 where
     H: FallibleHandler + Clone,
@@ -49,27 +49,27 @@ where
     type Leaf: FallibleHandlerProvider<
         Handler: FallibleHandler<Payload = H::Payload> + SettlementHandler,
     >;
-    type Admission: RequestAdmission + 'static;
+    type Requests: ResultRequestReader + 'static;
 
-    fn subsystem(&self) -> Option<&SubsystemName>;
-    fn terminate(self, handler: H) -> (Self::Leaf, Self::Admission);
+    fn request_subsystem(&self) -> Option<&SubsystemName>;
+    fn terminate(self, handler: H) -> (Self::Leaf, Self::Requests);
 }
 
 impl<H> ResponsePolicy<H> for NoResponses
 where
     H: FallibleHandler + Clone,
 {
-    type Admission = NoRequests;
     type Leaf = FallibleCloneProvider<LeafHandler<H>>;
+    type Requests = IgnoreRequests;
 
-    fn subsystem(&self) -> Option<&SubsystemName> {
+    fn request_subsystem(&self) -> Option<&SubsystemName> {
         None
     }
 
-    fn terminate(self, handler: H) -> (Self::Leaf, Self::Admission) {
+    fn terminate(self, handler: H) -> (Self::Leaf, Self::Requests) {
         (
             FallibleCloneProvider::new(LeafHandler::new(handler)),
-            NoRequests,
+            IgnoreRequests,
         )
     }
 }
@@ -92,21 +92,21 @@ where
     H::Output: Sync + 'static,
     H::Error: Sync + 'static,
 {
-    type Admission = SubsystemRequests;
     type Leaf = FallibleCloneProvider<RespondHandler<LeafHandler<H>, C, R::Response>>;
+    type Requests = SubsystemName;
 
-    fn subsystem(&self) -> Option<&SubsystemName> {
+    fn request_subsystem(&self) -> Option<&SubsystemName> {
         Some(&self.subsystem)
     }
 
-    fn terminate(self, handler: H) -> (Self::Leaf, Self::Admission) {
+    fn terminate(self, handler: H) -> (Self::Leaf, Self::Requests) {
         let responder = Arc::new(Responder::new(
             self.router.response(),
             self.subsystem.clone(),
         ));
         (
             FallibleCloneProvider::new(RespondHandler::new(LeafHandler::new(handler), responder)),
-            SubsystemRequests(self.subsystem),
+            self.subsystem,
         )
     }
 }

@@ -41,7 +41,7 @@ where
         )?
         .layer(LogMiddleware::new());
         let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let (leaf, resources) = response.terminate(handler);
+        let (leaf, requests) = response.terminate(handler);
         let provider = middleware.with_provider(leaf);
         let providers = PartitionProviders {
             triggers: components.trigger,
@@ -59,7 +59,7 @@ where
             provider,
             providers,
             services,
-            resources,
+            requests,
         ))
         .await
     }

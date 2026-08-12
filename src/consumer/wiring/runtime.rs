@@ -2,7 +2,7 @@
 //! the poll loop, and hands back a running consumer.
 
 use crate::consumer::config::ConsumerConfiguration;
-use crate::consumer::decode::RequestAdmission;
+use crate::consumer::decode::ResultRequestReader;
 use crate::consumer::error::ConsumerError;
 use crate::consumer::handler::{EventHandler, HandlerProvider};
 use crate::consumer::kafka_context::{ContextHandles, PartitionProviders, new_context};
@@ -58,7 +58,7 @@ pub(in crate::consumer) struct StartupServices<'a, P> {
 /// client configured to report statistics, and its first observation is seeded
 /// by [`KafkaObserver::install_startup_metadata`], which owns that contract.
 ///
-/// `peer` selects request admission by type.
+/// `requests` selects result-request reading by type.
 ///
 /// Every caller wraps this future in `Box::pin`, because
 /// `clippy::large_futures` warns otherwise. The allocation is one per consumer
@@ -69,12 +69,12 @@ pub(in crate::consumer) struct StartupServices<'a, P> {
 /// retrieved for the client ID, the Kafka consumer can't be created with the
 /// provided configuration, topic subscription fails, the startup metadata
 /// fetch fails.
-pub(in crate::consumer) async fn initialize_consumer<T, P, SP, C, A>(
+pub(in crate::consumer) async fn initialize_consumer<T, P, SP, C, R>(
     consumer_config: &ConsumerConfiguration,
     handler_provider: T,
     providers: PartitionProviders<P, SP>,
     services: StartupServices<'_, C::Payload>,
-    peer: A,
+    requests: R,
 ) -> Result<ProsodyConsumer<C>, ConsumerError>
 where
     T: HandlerProvider,
@@ -85,7 +85,7 @@ where
         EventSession<Loader: MessageLoader<Payload = C::Payload>>,
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
-    A: RequestAdmission + 'static,
+    R: ResultRequestReader + 'static,
 {
     if let Err(error) = consumer_config.validate() {
         drop(handler_provider);
@@ -171,7 +171,7 @@ where
             heartbeat: &heartbeat,
             shutdown: &cloned_shutdown,
             message_spans,
-            admission: peer,
+            requests,
         });
     });
 

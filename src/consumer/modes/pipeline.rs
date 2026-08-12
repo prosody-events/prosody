@@ -106,7 +106,7 @@ impl PipelineMiddlewareStack {
             .layer(message_defer_middleware)
             .layer(self.retry_middleware);
         let managers: Arc<Managers<C::Payload>> = Arc::default();
-        let (leaf, resources) = response.terminate(handler);
+        let (leaf, requests) = response.terminate(handler);
         let provider = middleware.with_provider(leaf);
         let services = StartupServices {
             version,
@@ -122,7 +122,7 @@ impl PipelineMiddlewareStack {
             provider,
             partition_providers,
             services,
-            resources,
+            requests,
         ))
         .await
     }
@@ -222,7 +222,7 @@ where
                 .await
             }
             (false, TriggerStoreConfiguration::Cassandra(config)) => {
-                let deps = cassandra_deps(&setup, config, response.subsystem()).await?;
+                let deps = cassandra_deps(&setup, config, response.request_subsystem()).await?;
                 Self::pipeline_consumer_with_policy(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
