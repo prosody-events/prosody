@@ -185,7 +185,10 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             request.outcome = Empty,
             request.latency_ms = Empty,
             responses.received = Empty,
+            responses.succeeded = Empty,
+            responses.failed = Empty,
             responses.missing = Empty,
+            responses.errors = Empty,
             subsystems = subsystems.len() as i64,
         ),
         err
@@ -237,10 +240,14 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             elapsed.as_millis().min(i64::MAX as u128) as i64,
         );
         if let Ok(results) = &collected {
-            let answered = results.iter().filter(|result| answered(result)).count();
-            let completeness = completeness(answered, results.len());
-            Span::current().record("responses.received", answered as i64);
+            let (succeeded, failed) = response_counts(results);
+            let received = succeeded + failed;
+            let completeness = completeness(received, results.len());
+            Span::current().record("responses.received", received as i64);
+            Span::current().record("responses.succeeded", succeeded as i64);
+            Span::current().record("responses.failed", failed as i64);
             Span::current().record("responses.missing", display(Missing(subsystems, results)));
+            Span::current().record("responses.errors", display(Failures(subsystems, results)));
             Span::current().record("request.outcome", completeness);
             LATENCY.record(waited, &[KeyValue::new("outcome", completeness)]);
         } else {
@@ -279,6 +286,8 @@ where
 
 struct Missing<'a, V>(&'a [SubsystemName], &'a [Result<V, ResponseError>]);
 
+struct Failures<'a, V>(&'a [SubsystemName], &'a [Result<V, ResponseError>]);
+
 impl<V> Display for Missing<'_, V> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         let mut separator = "";
@@ -290,6 +299,53 @@ impl<V> Display for Missing<'_, V> {
         }
         Ok(())
     }
+}
+
+impl<V> Display for Failures<'_, V> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        let mut separator = "";
+        for (subsystem, result) in self.0.iter().zip(self.1) {
+            let Err(error) = result else {
+                continue;
+            };
+            let Some(reason) = response_failure(error) else {
+                continue;
+            };
+            write!(formatter, "{separator}{subsystem}={reason}")?;
+            separator = ",";
+        }
+        Ok(())
+    }
+}
+
+fn response_failure(error: &ResponseError) -> Option<&'static str> {
+    match error {
+        ResponseError::Handler {
+            category: ErrorCategory::Transient,
+            ..
+        } => Some("handler.transient"),
+        ResponseError::Handler {
+            category: ErrorCategory::Permanent,
+            ..
+        } => Some("handler.permanent"),
+        ResponseError::Handler {
+            category: ErrorCategory::Terminal,
+            ..
+        } => Some("handler.terminal"),
+        ResponseError::FormatMismatch => Some("format_mismatch"),
+        ResponseError::Malformed => Some("malformed"),
+        ResponseError::Timeout => None,
+    }
+}
+
+fn response_counts<V>(responses: &[Result<V, ResponseError>]) -> (usize, usize) {
+    responses
+        .iter()
+        .fold((0, 0), |(succeeded, failed), response| match response {
+            Ok(_) => (succeeded + 1, failed),
+            Err(ResponseError::Timeout) => (succeeded, failed),
+            Err(_) => (succeeded, failed + 1),
+        })
 }
 
 /// Whether one subsystem answered at all.
