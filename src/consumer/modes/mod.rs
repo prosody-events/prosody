@@ -44,7 +44,7 @@ pub(crate) struct Responding<'a, C, R> {
 /// Selects one consumer's leaf and peer resources at compile time.
 pub(crate) trait ResponsePolicy<H>
 where
-    H: FallibleHandler + Clone + Send + Sync + 'static,
+    H: FallibleHandler + Clone,
 {
     type Leaf: FallibleHandlerProvider<
         Handler: FallibleHandler<Payload = H::Payload> + SettlementHandler,
@@ -57,7 +57,7 @@ where
 
 impl<H> ResponsePolicy<H> for NoResponses
 where
-    H: FallibleHandler + Clone + Send + Sync + 'static,
+    H: FallibleHandler + Clone,
 {
     type Admission = NoRequests;
     type Leaf = FallibleCloneProvider<LeafHandler<H>>;
@@ -74,9 +74,9 @@ where
     }
 }
 
-impl<C, R> Responding<'_, C, R> {
-    pub(crate) const fn new(router: &R, subsystem: SubsystemName) -> Responding<'_, C, R> {
-        Responding {
+impl<'a, C, R> Responding<'a, C, R> {
+    pub(crate) const fn new(router: &'a R, subsystem: SubsystemName) -> Self {
+        Self {
             router,
             subsystem,
             codec: PhantomData,
@@ -88,7 +88,7 @@ impl<C, R, H> ResponsePolicy<H> for Responding<'_, C, R>
 where
     C: Codec<Payload = H::Output>,
     R: Router,
-    H: FallibleHandler + Clone + Send + Sync + 'static,
+    H: FallibleHandler + Clone,
     H::Output: Sync + 'static,
     H::Error: Sync + 'static,
 {
