@@ -5,7 +5,7 @@ use fearless_simd::{Level, Simd, dispatch, prelude::*};
 
 use crate::TransitionDirection;
 use crate::arrival::ArrivalFactor;
-use crate::capacity::{CapacityFactor, ThroughputPosteriorCell};
+use crate::capacity::{CapacityFactor, CompletionPosteriorCell, ThroughputPosteriorCell};
 use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
     evaluate_prepared_step, evaluate_prepared_trajectory, prepare, required_capacity_prepared,
@@ -23,7 +23,7 @@ use crate::types::{
 use crate::{
     ApplyDecision, ArrivalPosterior, CapacityGrid, Configuration, ConfigurationError,
     DecisionDiagnostics, DemandClass, GroupObservation, HoldDecision, HoldReason, ModelTime,
-    PosteriorError, PosteriorQuery, RandomStream, ScaleDecision,
+    PosteriorError, PosteriorQuery, RandomStream, ResourceWindow, ScaleDecision,
 };
 use thiserror::Error;
 
@@ -302,6 +302,21 @@ impl ScaleState {
         cells: &mut [ThroughputPosteriorCell],
     ) -> Result<(), PosteriorError> {
         self.capacity.write_throughput_posterior(concurrency, cells)
+    }
+
+    /// Writes the completion predictive with the likelihood's shared mean.
+    ///
+    /// The predictive uses the current posterior before the window update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the buffer has the wrong fixed length.
+    pub fn write_completion_posterior(
+        &mut self,
+        window: &ResourceWindow,
+        cells: &mut [CompletionPosteriorCell],
+    ) -> Result<(), PosteriorError> {
+        self.capacity.write_completion_posterior(window, cells)
     }
 
     /// Writes the marginal capacity posterior into caller-owned buffers.

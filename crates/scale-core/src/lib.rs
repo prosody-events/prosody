@@ -19,8 +19,8 @@ mod types;
 
 pub use arrival::{ArrivalEvidence, ArrivalPrior, ArrivalPriorError};
 pub use capacity::{
-    CapacityCurve, CapacityGrid, CapacityGridError, CapacityPrior, PosteriorError, ResourceWindow,
-    ResourceWindowError, ThroughputPosteriorCell,
+    CapacityCurve, CapacityGrid, CapacityGridError, CapacityPrior, CompletionPosteriorCell,
+    PosteriorError, ResourceWindow, ResourceWindowError, ThroughputPosteriorCell,
 };
 pub use controller::{
     DecisionActionColumns, DecisionColumnSummary, DecisionCurveError, DecisionRejection,

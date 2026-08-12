@@ -3,13 +3,16 @@ use std::time::Duration;
 
 use prosody_scale_core::{
     ActuationCommitment, ArrivalPosterior, AttemptOutcomeCounts, AttemptOutcomeEvidence,
-    BacklogCohort, CapacityGrid, Cohort, Configuration, ConfigurationError, DecisionRejection,
-    DemandClass, HoldReason, ModelTime, ObservationBuffer, PosteriorQuery, RandomStream,
-    ResourceWindow, ScaleDecision, ScaleScratch, ScaleState, ThroughputPosteriorCell,
+    BacklogCohort, CapacityGrid, Cohort, CompletionPosteriorCell, Configuration,
+    ConfigurationError, DecisionRejection, DemandClass, HoldReason, ModelTime, ObservationBuffer,
+    PosteriorQuery, RandomStream, ResourceWindow, ScaleDecision, ScaleScratch, ScaleState,
     TransitionDirection, TransitionEvidence, step,
 };
 use statrs::distribution::{DiscreteCDF, NegativeBinomial, Poisson};
 use thiserror::Error;
+
+#[cfg(test)]
+use prosody_scale_core::ThroughputPosteriorCell;
 
 use crate::{
     CalendarForecastInput, EventContext, EventInputs, FaultPattern, MetricTrace, PlantError,
@@ -19,12 +22,14 @@ use crate::{
 
 const HANDLER_COVERAGE_LEVELS: [f64; 4] = [0.5_f64, 0.8_f64, 0.9_f64, 0.95_f64];
 const HANDLER_RANK_BIN_COUNT: usize = 10;
+#[cfg(test)]
 const GAUSS_LEGENDRE_NODES: [f64; 4] = [
     0.183_434_642_495_649_8_f64,
     0.525_532_409_916_329_f64,
     0.796_666_477_413_626_7_f64,
     0.960_289_856_497_536_3_f64,
 ];
+#[cfg(test)]
 const GAUSS_LEGENDRE_WEIGHTS: [f64; 4] = [
     0.362_683_783_378_362_f64,
     0.313_706_645_877_887_3_f64,
@@ -129,7 +134,9 @@ pub struct ControllerSample {
     pub capacity_predictive_median_per_second: f64,
     /// Upper prequential throughput quantile at the accepted concurrency.
     pub capacity_predictive_high_per_second: f64,
-    /// Randomized prequential rank for the accepted throughput observation.
+    /// Randomized rank for the model's own completion predictive.
+    ///
+    /// Shared code gives this predictive and the likelihood the same mean.
     pub capacity_predictive_rank: f64,
     /// Reporter action applied at this controller tick.
     pub reporter: ReporterDirective,
@@ -1038,7 +1045,7 @@ pub struct ClosedLoop<Workload> {
     budget_micros: u64,
     latest_capacity_window: Option<CapacityWindow>,
     capacity_evidence_sample: CapacityEvidenceSample,
-    throughput_posterior_scratch: Vec<ThroughputPosteriorCell>,
+    completion_posterior_scratch: Vec<CompletionPosteriorCell>,
     inflight_transitions: Vec<PendingTransition>,
     ready_transitions: Vec<PendingTransition>,
     pending_transition_observations: VecDeque<PendingTransitionObservation>,
@@ -1233,8 +1240,8 @@ impl<Workload> ClosedLoop<Workload> {
             budget_micros,
             latest_capacity_window: None,
             capacity_evidence_sample: CapacityEvidenceSample::None,
-            throughput_posterior_scratch: vec![
-                ThroughputPosteriorCell::default();
+            completion_posterior_scratch: vec![
+                CompletionPosteriorCell::default();
                 throughput_posterior_count
             ],
             inflight_transitions: Vec::with_capacity(transition_capacity),
@@ -1994,28 +2001,25 @@ impl<Workload> ClosedLoop<Workload> {
         match self.capacity_evidence_sample {
             CapacityEvidenceSample::None => Ok(CapacityPrediction::missing()),
             CapacityEvidenceSample::Window(window) => {
-                self.state.write_throughput_posterior(
-                    window.concurrency,
-                    &mut self.throughput_posterior_scratch,
+                let evidence = self
+                    .latest_capacity_window
+                    .ok_or(PlantError::MetricCapacity)?
+                    .evidence()?;
+                self.state.write_completion_posterior(
+                    &evidence,
+                    &mut self.completion_posterior_scratch,
                 )?;
-                let quantiles = posterior_predictive_throughput_quantiles(
-                    &self.throughput_posterior_scratch,
+                let quantiles = posterior_predictive_completion_quantiles(
+                    &self.completion_posterior_scratch,
                     window.exposure_seconds,
                 )?;
                 let observed = u64::from(window.completed_attempts);
-                let upper = predictive_throughput_cdf(
-                    &self.throughput_posterior_scratch,
-                    window.exposure_seconds,
-                    observed,
-                )?;
+                let upper =
+                    predictive_completion_cdf(&self.completion_posterior_scratch, observed)?;
                 let lower = if observed == 0 {
                     0.0_f64
                 } else {
-                    predictive_throughput_cdf(
-                        &self.throughput_posterior_scratch,
-                        window.exposure_seconds,
-                        observed - 1,
-                    )?
+                    predictive_completion_cdf(&self.completion_posterior_scratch, observed - 1)?
                 };
                 Ok(CapacityPrediction {
                     quantiles,
@@ -2210,6 +2214,45 @@ fn count_f64(value: u64) -> f64 {
     f64::from(high) * 4_294_967_296.0_f64 + f64::from(low)
 }
 
+fn posterior_predictive_completion_quantiles(
+    cells: &[CompletionPosteriorCell],
+    exposure_seconds: f64,
+) -> Result<[f64; 3], PlantError> {
+    let maximum_mean = cells.iter().map(|cell| cell.mean).fold(0.0_f64, f64::max);
+    let upper = (maximum_mean + 12.0_f64 * maximum_mean.sqrt() + 64.0_f64)
+        .ceil()
+        .clamp(1.0_f64, f64::from(u32::MAX)) as u64;
+    let mut quantiles = [0.0_f64; 3];
+    let thresholds = [0.1_f64, 0.5_f64, 0.9_f64];
+    for (index, threshold) in thresholds.into_iter().enumerate() {
+        let mut low = 0_u64;
+        let mut high = upper;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if predictive_completion_cdf(cells, middle)? >= threshold {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        let count = u32::try_from(low).map_err(|_| PlantError::PlatformLimit)?;
+        quantiles[index] = f64::from(count) / exposure_seconds;
+    }
+    Ok(quantiles)
+}
+
+fn predictive_completion_cdf(
+    cells: &[CompletionPosteriorCell],
+    completed_attempts: u64,
+) -> Result<f64, PlantError> {
+    let mut cumulative = 0.0_f64;
+    for cell in cells {
+        cumulative += cell.probability * poisson_cdf(cell.mean, completed_attempts)?;
+    }
+    Ok(cumulative)
+}
+
+#[cfg(test)]
 fn posterior_predictive_throughput_quantiles(
     cells: &[ThroughputPosteriorCell],
     exposure_seconds: f64,
@@ -2222,8 +2265,7 @@ fn posterior_predictive_throughput_quantiles(
         .ceil()
         .clamp(1.0_f64, f64::from(u32::MAX)) as u64;
     let mut quantiles = [0.0_f64; 3];
-    let thresholds = [0.1_f64, 0.5_f64, 0.9_f64];
-    for (index, threshold) in thresholds.into_iter().enumerate() {
+    for (index, threshold) in [0.1_f64, 0.5_f64, 0.9_f64].into_iter().enumerate() {
         let mut low = 0_u64;
         let mut high = upper;
         while low < high {
@@ -2234,12 +2276,13 @@ fn posterior_predictive_throughput_quantiles(
                 low = middle + 1;
             }
         }
-        let count = u32::try_from(low).map_err(|_| PlantError::PlatformLimit)?;
-        quantiles[index] = f64::from(count) / exposure_seconds;
+        quantiles[index] = f64::from(u32::try_from(low).map_err(|_| PlantError::PlatformLimit)?)
+            / exposure_seconds;
     }
     Ok(quantiles)
 }
 
+#[cfg(test)]
 fn predictive_throughput_cdf(
     cells: &[ThroughputPosteriorCell],
     exposure_seconds: f64,
@@ -2262,10 +2305,7 @@ fn predictive_throughput_cdf(
     Ok(cumulative)
 }
 
-/// Approximates each cell's predictive spread as uniform in log throughput.
-///
-/// This spread is not the exact push-forward of the parameter prior. The
-/// calibration gates measure whether the approximation is adequate.
+#[cfg(test)]
 fn log_uniform_predictive_throughput_cdf(
     low: f64,
     high: f64,
@@ -2286,6 +2326,7 @@ fn log_uniform_predictive_throughput_cdf(
     Ok(integral / 2.0_f64)
 }
 
+#[cfg(test)]
 fn point_predictive_throughput_cdf(
     cells: &[ThroughputPosteriorCell],
     exposure_seconds: f64,

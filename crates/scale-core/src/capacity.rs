@@ -44,6 +44,15 @@ pub struct ThroughputPosteriorCell {
     pub probability: f64,
 }
 
+/// One weighted completion prediction from the joint capacity posterior.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CompletionPosteriorCell {
+    /// Predicted completed attempts in the window.
+    pub mean: f64,
+    /// Joint posterior probability for this curve.
+    pub probability: f64,
+}
+
 impl CapacityCurve {
     pub(crate) const fn service_time_seconds(self) -> f64 {
         match self {
@@ -445,6 +454,7 @@ pub(crate) struct CapacityFactor {
     start_history: Vec<StartWindow>,
     start_history_head: usize,
     start_history_len: usize,
+    predictive_start_history: Vec<StartWindow>,
 }
 
 impl CapacityFactor {
@@ -496,6 +506,13 @@ impl CapacityFactor {
             ],
             start_history_head: 0,
             start_history_len: 0,
+            predictive_start_history: vec![
+                StartWindow {
+                    exposure_seconds: 0.0_f64,
+                    started_attempts: 0,
+                };
+                start_history_capacity
+            ],
         }
     }
 
@@ -543,6 +560,45 @@ impl CapacityFactor {
             );
             cell.throughput_low_per_second = low;
             cell.throughput_high_per_second = high;
+            cell.probability = self.weights[index];
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_completion_posterior(
+        &mut self,
+        window: &ResourceWindow,
+        cells: &mut [CompletionPosteriorCell],
+    ) -> Result<(), PosteriorError> {
+        if cells.len() != self.weights.len() {
+            return Err(PosteriorError::BufferLength {
+                expected: self.grid.cell_count(),
+            });
+        }
+        let had_start_history = self.start_history_len > 0;
+        self.predictive_start_history
+            .copy_from_slice(&self.start_history);
+        let mut head = self.start_history_head;
+        let mut length = self.start_history_len;
+        if window.started_attempts.is_some() {
+            record_start_window(
+                &mut self.predictive_start_history,
+                &mut head,
+                &mut length,
+                window,
+            );
+        }
+        for (index, cell) in cells.iter_mut().enumerate() {
+            cell.mean = completion_mean(
+                &self.grid,
+                index,
+                &self.predictive_start_history,
+                head,
+                length,
+                had_start_history,
+                window,
+            )
+            .0;
             cell.probability = self.weights[index];
         }
         Ok(())
@@ -911,32 +967,17 @@ impl CapacityFactor {
                     self.grid.no_knee[index] > 0.0_f64,
                     window.concurrency,
                 );
-            let lagged = if window.started_attempts.is_none()
-                || (!had_start_history && window.completed_attempts > 0)
-            {
-                None
-            } else if !had_start_history {
-                Some(0.0_f64)
-            } else {
-                lagged_starts(
-                    &self.start_history,
-                    self.start_history_head,
-                    self.start_history_len,
-                    window.exposure_seconds,
-                    effective_service_time,
-                )
-            };
-            let completion_mean = lagged
-                .filter(|starts| *starts > 0.0_f64 || window.completed_attempts == 0)
-                .unwrap_or_else(|| {
-                    let (low, high) = self.grid.throughput_interval(index, window.concurrency);
-                    f64::from(window.completed_attempts).clamp(
-                        window.exposure_seconds * low,
-                        window.exposure_seconds * high,
-                    )
-                });
-            *likelihood = poisson_log_kernel(f64::from(window.completed_attempts), completion_mean);
-            if lagged.is_some() && had_start_history {
+            let (mean, occupancy_eligible) = completion_mean(
+                &self.grid,
+                index,
+                &self.start_history,
+                self.start_history_head,
+                self.start_history_len,
+                had_start_history,
+                window,
+            );
+            *likelihood = poisson_log_kernel(f64::from(window.completed_attempts), mean);
+            if occupancy_eligible && had_start_history {
                 let occupancy_mean = in_flight_mean(
                     &self.start_history,
                     self.start_history_head,
@@ -952,12 +993,12 @@ impl CapacityFactor {
     }
 
     fn record_start_window(&mut self, window: &ResourceWindow) {
-        self.start_history[self.start_history_head] = StartWindow {
-            exposure_seconds: window.exposure_seconds,
-            started_attempts: window.started_attempts.unwrap_or_default(),
-        };
-        self.start_history_head = (self.start_history_head + 1) % self.start_history.len();
-        self.start_history_len = (self.start_history_len + 1).min(self.start_history.len());
+        record_start_window(
+            &mut self.start_history,
+            &mut self.start_history_head,
+            &mut self.start_history_len,
+            window,
+        );
     }
 
     fn update_hazard_filters(&mut self) {
@@ -1085,6 +1126,20 @@ fn normalize(weights: &mut [f64]) {
     }
 }
 
+fn record_start_window(
+    history: &mut [StartWindow],
+    head: &mut usize,
+    length: &mut usize,
+    window: &ResourceWindow,
+) {
+    history[*head] = StartWindow {
+        exposure_seconds: window.exposure_seconds,
+        started_attempts: window.started_attempts.unwrap_or_default(),
+    };
+    *head = (*head + 1) % history.len();
+    *length = (*length + 1).min(history.len());
+}
+
 fn lagged_starts(
     history: &[StartWindow],
     head: usize,
@@ -1110,6 +1165,52 @@ fn lagged_starts(
         }
     }
     None
+}
+
+fn completion_mean(
+    grid: &CapacityGrid,
+    index: usize,
+    history: &[StartWindow],
+    head: usize,
+    length: usize,
+    had_start_history: bool,
+    window: &ResourceWindow,
+) -> (f64, bool) {
+    let service_time = grid.service_times_seconds[index];
+    let effective_service_time = window.concurrency
+        / throughput(
+            service_time,
+            grid.capacities_per_second[index],
+            grid.collapse_values[index],
+            grid.no_knee[index] > 0.0_f64,
+            window.concurrency,
+        );
+    let lagged = if window.started_attempts.is_none()
+        || (!had_start_history && window.completed_attempts > 0)
+    {
+        None
+    } else if !had_start_history {
+        Some(0.0_f64)
+    } else {
+        lagged_starts(
+            history,
+            head,
+            length,
+            window.exposure_seconds,
+            effective_service_time,
+        )
+    };
+    let occupancy_eligible = lagged.is_some();
+    let mean = lagged
+        .filter(|starts| *starts > 0.0_f64 || window.completed_attempts == 0)
+        .unwrap_or_else(|| {
+            let (low, high) = grid.throughput_interval(index, window.concurrency);
+            f64::from(window.completed_attempts).clamp(
+                window.exposure_seconds * low,
+                window.exposure_seconds * high,
+            )
+        });
+    (mean, occupancy_eligible)
 }
 
 fn log_uniform_capacity_prior(grid: &CapacityGrid) -> Vec<f64> {
