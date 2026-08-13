@@ -134,13 +134,14 @@ impl DeadlineState {
         let mut remaining = duration;
         let mut queue_area = 0.0_f64;
         let mut late_area = 0.0_f64;
-        // Initial debt completes at most once. The queue empties at most once
-        // because rates stay constant. Only those events change service
-        // regimes. The completion lead crosses at most once in each regime.
-        let one_way_events =
-            usize::from(self.overdue > 0.0_f64) + usize::from(self.queue > 0.0_f64);
-        let service_regimes = one_way_events + 1;
-        let iteration_bound = one_way_events + service_regimes + 1;
+        // Queue, on-time work, overdue work, and completion credit each reach
+        // zero at most once in this constant-rate segment. A zero queue can
+        // grow only when arrivals exceed capacity. It cannot then drain in the
+        // same segment. On-time or overdue work can become positive after a
+        // regime change. Its new rate then prevents a second zero crossing.
+        // Completion credit cannot grow after it reaches zero. Each nonfinal
+        // pass consumes one of these four crossings, so five passes suffice.
+        let iteration_bound = 5_usize;
         let mut iterations = 0_usize;
         while remaining > 0.0_f64 {
             iterations += 1;
