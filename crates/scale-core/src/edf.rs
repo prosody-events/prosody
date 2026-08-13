@@ -782,7 +782,7 @@ fn ordered_serve(
     }
 }
 
-pub(crate) fn evaluate_general_trajectory(
+fn evaluate_general_trajectory(
     cohorts: &WorkCohorts,
     trajectory: &SupplyTrajectory<'_>,
     window: EvaluationWindow,
@@ -1173,7 +1173,136 @@ fn seconds_to_micros_ceil(seconds: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeadlineState, terminal_closure};
+    use quickcheck_macros::quickcheck;
+
+    use super::{
+        ArrivalPath, DeadlineState, EdfScratch, EvaluationWindow, SupplyTrajectory,
+        evaluate_general_trajectory, evaluate_prepared_trajectory, prepare, terminal_closure,
+    };
+    use crate::types::WorkCohorts;
+
+    const NO_FUTURE_ARRIVALS: ArrivalPath<'static> = ArrivalPath {
+        start_seconds: 0.0_f64,
+        end_seconds: &[f64::MAX],
+        rates: &[0.0_f64],
+    };
+
+    #[quickcheck]
+    fn common_cohort_trajectory_matches_general_edf(
+        count_seed: u8,
+        work_seed: u16,
+        debt_seed: u8,
+        supply_seed: u8,
+    ) -> bool {
+        let count = usize::from(count_seed % 8 + 1);
+        let work = f64::from(work_seed % 1_000) / 10.0_f64;
+        let debt = f64::from(debt_seed);
+        let supply = f64::from(supply_seed) + 1.0_f64;
+        let mut cohorts = WorkCohorts::new(count);
+        for partition in 0..count {
+            cohorts.push_values(250_000, 1_500_000, work, partition as u32);
+        }
+        let trajectory = SupplyTrajectory {
+            initial: supply,
+            pause_seconds: &[0.5_f64],
+            ready_seconds: &[1.0_f64],
+            during: &[supply * 0.5_f64],
+            after: &[supply * 1.5_f64],
+        };
+        let Ok(mut scratch) = EdfScratch::new(count as u32) else {
+            return false;
+        };
+        prepare(&cohorts, &mut scratch);
+        let window = EvaluationWindow {
+            start_micros: 0,
+            horizon_micros: 2_000_000,
+            initial_debt_work: debt,
+            deadline_budget_micros: 1_500_000,
+        };
+        let fast = evaluate_prepared_trajectory(
+            &cohorts,
+            &trajectory,
+            window,
+            &NO_FUTURE_ARRIVALS,
+            &mut scratch,
+        );
+        let general = evaluate_general_trajectory(
+            &cohorts,
+            &trajectory,
+            window,
+            &NO_FUTURE_ARRIVALS,
+            &mut scratch,
+        );
+
+        let matches = close_relative(fast.shortfall, general.shortfall)
+            && close_relative(fast.delay_area, general.delay_area)
+            && close_relative(fast.drain_seconds, general.drain_seconds);
+        assert!(matches, "fast={fast:?}, general={general:?}");
+        true
+    }
+
+    #[quickcheck]
+    fn ordered_deadline_trajectory_matches_general_edf(
+        count_seed: u8,
+        gap_seed: u8,
+        work_seed: u16,
+        supply_seed: u8,
+    ) -> bool {
+        let count = usize::from(count_seed % 16 + 1);
+        let gap_micros = u64::from(gap_seed) * 10_000 + 1;
+        let work = f64::from(work_seed % 1_000) / 10.0_f64;
+        let supply = f64::from(supply_seed) + 1.0_f64;
+        let mut cohorts = WorkCohorts::new(count);
+        for cohort in 0..count {
+            let release_micros = cohort as u64 * gap_micros;
+            cohorts.push_values(
+                release_micros,
+                release_micros + 1_500_000,
+                work + f64::from(cohort as u32),
+                cohort as u32,
+            );
+        }
+        let trajectory = SupplyTrajectory {
+            initial: supply,
+            pause_seconds: &[0.5_f64],
+            ready_seconds: &[1.0_f64],
+            during: &[supply * 0.5_f64],
+            after: &[supply * 1.5_f64],
+        };
+        let Ok(mut scratch) = EdfScratch::new(count as u32) else {
+            return false;
+        };
+        prepare(&cohorts, &mut scratch);
+        let window = EvaluationWindow {
+            start_micros: 0,
+            horizon_micros: 3_000_000,
+            initial_debt_work: 7.0_f64,
+            deadline_budget_micros: 1_500_000,
+        };
+        let fast = evaluate_prepared_trajectory(
+            &cohorts,
+            &trajectory,
+            window,
+            &NO_FUTURE_ARRIVALS,
+            &mut scratch,
+        );
+        let general = evaluate_general_trajectory(
+            &cohorts,
+            &trajectory,
+            window,
+            &NO_FUTURE_ARRIVALS,
+            &mut scratch,
+        );
+
+        close_relative(fast.shortfall, general.shortfall)
+            && close_relative(fast.delay_area, general.delay_area)
+            && close_relative(fast.drain_seconds, general.drain_seconds)
+    }
+
+    fn close_relative(left: f64, right: f64) -> bool {
+        let scale = left.abs().max(right.abs()).max(1.0_f64);
+        (left - right).abs() <= 1.0e-12_f64 * scale
+    }
 
     #[test]
     fn terminal_triangle_matches_closed_form_cases() {

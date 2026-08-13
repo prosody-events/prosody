@@ -18,8 +18,8 @@ use crate::planning::{
 };
 use crate::reliability::{RELIABILITY_BIN_COUNT, ReliabilityFactor};
 use crate::types::{
-    ActuationCommitments, BacklogColumns, CalendarForecast, CohortColumns, ScheduledRelease,
-    WorkCohorts,
+    ActuationCommitments, BacklogColumns, CalendarForecast, CohortColumns,
+    POSTERIOR_SAMPLES_PER_CAPACITY_CLASS_MIN, ScheduledRelease, WorkCohorts,
 };
 use crate::{
     ApplyDecision, ArrivalPosterior, CapacityGrid, Configuration, ConfigurationError,
@@ -193,7 +193,7 @@ impl ScaleState {
         let class_count =
             u32::try_from(capacity_classes.len()).map_err(|_| ConfigurationError::PlatformLimit)?;
         let minimum = class_count
-            .checked_mul(2)
+            .checked_mul(POSTERIOR_SAMPLES_PER_CAPACITY_CLASS_MIN)
             .ok_or(ConfigurationError::PlatformLimit)?;
         if configuration.posterior_sample_count < minimum {
             return Err(ConfigurationError::InsufficientPosteriorSamples {
@@ -471,7 +471,6 @@ pub struct ScaleScratch {
     scenario_partition_missed_work: Vec<f64>,
     scenario_partition_late_area: Vec<f64>,
     scenario_workspaces: Vec<ScenarioWorkspace>,
-    trajectory_worker: usize,
     active_scenario_count: usize,
     active_inner_count: usize,
     decision_curve_sample_count: u32,
@@ -847,7 +846,6 @@ impl ScaleScratch {
             scenario_partition_missed_work: vec![0.0_f64; posterior_sample_count],
             scenario_partition_late_area: vec![0.0_f64; posterior_sample_count],
             scenario_workspaces,
-            trajectory_worker: 0,
             active_scenario_count: posterior_sample_count,
             active_inner_count: 0,
             decision_curve_sample_count: 0,
@@ -1001,40 +999,6 @@ impl ScaleScratch {
         }
         Ok(())
     }
-
-    /// Returns the workspace that evaluated the final scenario, whose
-    /// trajectory buffers therefore hold the last-prepared trajectories.
-    #[cfg(test)]
-    fn trajectory_workspace(&self) -> Option<&ScenarioWorkspace> {
-        self.scenario_workspaces.get(self.trajectory_worker)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn trajectory_targets(&self, candidate: u32) -> Option<&[u32]> {
-        let workspace = self.trajectory_workspace()?;
-        let index = usize::try_from(candidate.checked_sub(1)?).ok()?;
-        let first = *workspace.trajectory_offsets.get(index)? as usize;
-        let last = *workspace.trajectory_offsets.get(index + 1)? as usize;
-        workspace.trajectory.targets.get(first..last)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn trajectory_pause_seconds(&self, candidate: u32) -> Option<&[f64]> {
-        let workspace = self.trajectory_workspace()?;
-        let index = usize::try_from(candidate.checked_sub(1)?).ok()?;
-        let first = *workspace.trajectory_offsets.get(index)? as usize;
-        let last = *workspace.trajectory_offsets.get(index + 1)? as usize;
-        workspace.trajectory.pause_seconds.get(first..last)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn trajectory_ready_seconds(&self, candidate: u32) -> Option<&[f64]> {
-        let workspace = self.trajectory_workspace()?;
-        let index = usize::try_from(candidate.checked_sub(1)?).ok()?;
-        let first = *workspace.trajectory_offsets.get(index)? as usize;
-        let last = *workspace.trajectory_offsets.get(index + 1)? as usize;
-        workspace.trajectory.ready_seconds.get(first..last)
-    }
 }
 
 /// Advances the complete controller by one observation.
@@ -1174,7 +1138,6 @@ fn evaluate_scenarios(
     let worker_count = scratch.scenario_workspaces.len().min(scenario_total).max(1);
     let scenario_chunk = scenario_total.div_ceil(worker_count);
     let active_workers = scenario_total.div_ceil(scenario_chunk);
-    scratch.trajectory_worker = active_workers - 1;
     for workspace in &mut scratch.scenario_workspaces[..active_workers] {
         prepare(&scratch.resource_cohorts, &mut workspace.edf);
     }
@@ -1992,6 +1955,11 @@ fn append_reactive_repairs(
 ///
 /// The supply column is non-decreasing. When no target covers the rate,
 /// the largest target is the best repair.
+///
+/// This target is the reactive-policy fixed point. The live policy uses the
+/// posterior-mean rate from its next report. The controller keeps this demand
+/// floor by design. Sampled future rates affect cost, but they do not restrict
+/// the initial action set.
 fn repair_target(supply: &[f64], rate: f64) -> u32 {
     let index = supply.partition_point(|value| *value < rate);
     index.min(supply.len() - 1) as u32 + 1

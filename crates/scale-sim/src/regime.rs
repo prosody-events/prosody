@@ -15,9 +15,9 @@ use crate::{
     AttemptFrame, AttemptModel, AttemptParameters, CalendarForecastInput, ClosedLoop,
     ClosedLoopError, ConcurrencyLatencyCurve, ControllerSample, ControllerTrace,
     DEFAULT_CONCURRENCY_PER_REPLICA, DEFAULT_FAILURE_WEIGHT, EventContext, EventInputs,
-    FaultPattern, MetricTrace, PlantConfiguration, PlantError, ReporterDirective, ScaleDirective,
-    ScheduledReleasesInput, SeriesCell, SimulationHarness, SimulationResult, TickContext,
-    TickGenerator, TickInputs,
+    FaultPattern, MetricTrace, PlantConfiguration, PlantError, PlantSnapshot, ReporterDirective,
+    ScaleDirective, ScheduledReleasesInput, SeriesCell, SimulationHarness, SimulationResult,
+    TickContext, TickGenerator, TickInputs,
 };
 
 const CAPACITY_COLLAPSE_GRID: &[f64] = &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64];
@@ -1706,37 +1706,52 @@ fn capacity_grid(
     )
 }
 
-fn run_schedule(
-    harness: &mut SimulationHarness<ClosedLoop<PrincipalGraph>, PrincipalAttemptModel>,
-    regime: PrincipalRegime,
-    schedule: RunSchedule,
-) -> Result<RunStop, PrincipalRunError> {
-    const PROGRESS_INTERVAL: u32 = 25;
+struct RunProgress {
+    started: Instant,
+    progress_started: Instant,
+    tick_count: u32,
+    progress_tick_count: u32,
+    prior_target: Option<u32>,
+}
 
-    let mut at_micros = schedule.start_micros;
-    let mut stable_count = 0_u8;
-    let tick_count_max = schedule.controller_sample_count_max()?;
-    let started = Instant::now();
-    let mut progress_started = started;
-    let mut tick_count = 0_u32;
-    let mut progress_tick_count = 0_u32;
-    let mut prior_target = None;
-    loop {
-        let snapshot = harness.tick(at_micros)?;
-        tick_count = tick_count.saturating_add(1);
+impl RunProgress {
+    fn new() -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            progress_started: started,
+            tick_count: 0,
+            progress_tick_count: 0,
+            prior_target: None,
+        }
+    }
+
+    fn record(
+        &mut self,
+        harness: &SimulationHarness<ClosedLoop<PrincipalGraph>, PrincipalAttemptModel>,
+        snapshot: &PlantSnapshot,
+        regime: PrincipalRegime,
+        schedule: RunSchedule,
+        at_micros: u64,
+        tick_count_max: u32,
+    ) {
+        const INTERVAL: u32 = 25;
+
+        self.tick_count = self.tick_count.saturating_add(1);
         let controller = harness.graph().trace();
         let controller_index = controller.len().saturating_sub(1);
         let controller_sample = controller.sample(controller_index);
         let target_changed =
-            controller_sample.is_some_and(|sample| prior_target != Some(sample.target));
-        if tick_count == 1 || tick_count.is_multiple_of(PROGRESS_INTERVAL) || target_changed {
+            controller_sample.is_some_and(|sample| self.prior_target != Some(sample.target));
+        if self.tick_count == 1 || self.tick_count.is_multiple_of(INTERVAL) || target_changed {
             let now = Instant::now();
-            let elapsed = now.duration_since(started).as_secs_f64();
-            let progress_ticks = tick_count.saturating_sub(progress_tick_count);
-            let recent_millis = now.duration_since(progress_started).as_secs_f64() * 1_000.0_f64
+            let elapsed = now.duration_since(self.started).as_secs_f64();
+            let progress_ticks = self.tick_count.saturating_sub(self.progress_tick_count);
+            let recent_millis = now.duration_since(self.progress_started).as_secs_f64()
+                * 1_000.0_f64
                 / f64::from(progress_ticks);
-            let average_millis = elapsed * 1_000.0_f64 / f64::from(tick_count);
-            let remaining_ticks = tick_count_max.saturating_sub(tick_count);
+            let average_millis = elapsed * 1_000.0_f64 / f64::from(self.tick_count);
+            let remaining_ticks = tick_count_max.saturating_sub(self.tick_count);
             let eta_seconds = average_millis * f64::from(remaining_ticks) / 1_000.0_f64;
             let phase = if at_micros < schedule.workload_end_micros {
                 "workload"
@@ -1764,7 +1779,7 @@ fn run_schedule(
             let scenario_count = controller_sample.map_or(0, |sample| sample.scenario_count);
             tracing::info!(
                 regime = regime.name(),
-                completed_ticks = tick_count,
+                completed_ticks = self.tick_count,
                 maximum_ticks = tick_count_max,
                 virtual_seconds = Duration::from_micros(at_micros).as_secs_f64(),
                 maximum_virtual_seconds =
@@ -1804,12 +1819,34 @@ fn run_schedule(
                 target_changed,
                 "regime progress"
             );
-            progress_started = now;
-            progress_tick_count = tick_count;
+            self.progress_started = now;
+            self.progress_tick_count = self.tick_count;
         }
         if let Some(sample) = controller_sample {
-            prior_target = Some(sample.target);
+            self.prior_target = Some(sample.target);
         }
+    }
+}
+
+fn run_schedule(
+    harness: &mut SimulationHarness<ClosedLoop<PrincipalGraph>, PrincipalAttemptModel>,
+    regime: PrincipalRegime,
+    schedule: RunSchedule,
+) -> Result<RunStop, PrincipalRunError> {
+    let mut at_micros = schedule.start_micros;
+    let mut stable_count = 0_u8;
+    let tick_count_max = schedule.controller_sample_count_max()?;
+    let mut progress = RunProgress::new();
+    loop {
+        let snapshot = harness.tick(at_micros)?;
+        progress.record(
+            harness,
+            &snapshot,
+            regime,
+            schedule,
+            at_micros,
+            tick_count_max,
+        );
         match schedule.stop {
             StopCondition::IdleStable { sample_count } => {
                 let stable = at_micros >= schedule.workload_end_micros
@@ -2260,32 +2297,8 @@ impl PrincipalDefinition {
             PrincipalRegime::DecliningPostKnee => {
                 Self::capacity_closed_loop(100, 100).shared_resource(64, 320, 2)
             }
-            PrincipalRegime::ShortBurst => standard
-                .messages(ArrivalSeries::PeriodicDelayed {
-                    count: EVENT_COUNT,
-                    first_micros: SHORT_BURST_RELEASE_MICROS,
-                    interval_micros: SHORT_BURST_RELEASE_MICROS,
-                    count_max: EVENT_COUNT,
-                })
-                .handler(100_000)
-                .schedule(RunSchedule::short_burst())
-                .initial_replicas(1),
-            PrincipalRegime::SeasonalWaves => {
-                let demand = ArrivalSeries::PeriodicDelayed {
-                    count: 1_000,
-                    first_micros: 120_000_000,
-                    interval_micros: 120_000_000,
-                    count_max: SEASONAL_EVENT_COUNT,
-                };
-                standard
-                    .messages(demand)
-                    .handler(100_000)
-                    .history(HistoricalSeries::seasonal())
-                    .launch_delay(LaunchDelaySeries::Immediate)
-                    .schedule(RunSchedule::seasonal())
-                    .event_count_max(SEASONAL_EVENT_COUNT)
-                    .initial_replicas(1)
-            }
+            PrincipalRegime::ShortBurst => short_burst_definition(standard),
+            PrincipalRegime::SeasonalWaves => seasonal_definition(standard),
             PrincipalRegime::HotPartition => standard
                 .messages(ArrivalSeries::Rate {
                     per_second: 500,
@@ -2317,19 +2330,7 @@ impl PrincipalDefinition {
                 .schedule(RunSchedule::hot_partition())
                 .event_count_max(HOT_KEY_EVENT_COUNT)
                 .initial_replicas(1),
-            PrincipalRegime::TransientFailures => standard
-                .messages(ArrivalSeries::Rate {
-                    per_second: 300,
-                    count_max: TRANSIENT_EVENT_COUNT,
-                })
-                .handler(100_000)
-                .transient_failures(FailureSeries::Every {
-                    interval: 10,
-                    transient_count: 2,
-                })
-                .schedule(RunSchedule::hot_partition())
-                .event_count_max(TRANSIENT_EVENT_COUNT)
-                .initial_replicas(1),
+            PrincipalRegime::TransientFailures => transient_failures_definition(standard),
             PrincipalRegime::PermanentRejections => {
                 standard.permanent_rejections(OccurrenceSeries::Every(10))
             }
@@ -2370,46 +2371,16 @@ impl PrincipalDefinition {
                     at_micros: 1_000_000,
                 })
             }
-            PrincipalRegime::HistoricalMatch => {
-                let history = HistoricalSeries::standard();
-                standard
-                    .messages(history.live_demand(HISTORY_EVENT_COUNT_MAX))
-                    .history(history)
-                    .handler(100_000)
-                    .schedule(RunSchedule::history())
-                    .event_count_max(HISTORY_EVENT_COUNT_MAX)
-                    .initial_replicas(1)
+            PrincipalRegime::HistoricalMatch => historical_match_definition(standard),
+            PrincipalRegime::HistoricalExceeded => {
+                historical_rate_definition(standard, 2_000, HistoricalSeries::standard())
             }
-            PrincipalRegime::HistoricalExceeded => standard
-                .messages(ArrivalSeries::Rate {
-                    per_second: 2_000,
-                    count_max: HISTORY_EVENT_COUNT_MAX,
-                })
-                .history(HistoricalSeries::standard())
-                .handler(100_000)
-                .schedule(RunSchedule::history())
-                .event_count_max(HISTORY_EVENT_COUNT_MAX)
-                .initial_replicas(1),
-            PrincipalRegime::HistoricalUnder => standard
-                .messages(ArrivalSeries::Rate {
-                    per_second: 500,
-                    count_max: HISTORY_EVENT_COUNT_MAX,
-                })
-                .history(HistoricalSeries::standard())
-                .handler(100_000)
-                .schedule(RunSchedule::history())
-                .event_count_max(HISTORY_EVENT_COUNT_MAX)
-                .initial_replicas(1),
-            PrincipalRegime::HistoricalMissing => standard
-                .messages(ArrivalSeries::Rate {
-                    per_second: 1_000,
-                    count_max: HISTORY_EVENT_COUNT_MAX,
-                })
-                .history(HistoricalSeries::missing())
-                .handler(100_000)
-                .schedule(RunSchedule::history())
-                .event_count_max(HISTORY_EVENT_COUNT_MAX)
-                .initial_replicas(1),
+            PrincipalRegime::HistoricalUnder => {
+                historical_rate_definition(standard, 500, HistoricalSeries::standard())
+            }
+            PrincipalRegime::HistoricalMissing => {
+                historical_rate_definition(standard, 1_000, HistoricalSeries::missing())
+            }
         }
     }
 
@@ -2596,6 +2567,86 @@ impl PrincipalDefinition {
         self.inputs.stochastic_arrivals = true;
         self
     }
+}
+
+fn short_burst_definition(standard: PrincipalDefinition) -> PrincipalDefinition {
+    standard
+        .messages(ArrivalSeries::PeriodicDelayed {
+            count: EVENT_COUNT,
+            first_micros: SHORT_BURST_RELEASE_MICROS,
+            interval_micros: SHORT_BURST_RELEASE_MICROS,
+            count_max: EVENT_COUNT,
+        })
+        .handler(100_000)
+        .schedule(RunSchedule::short_burst())
+        .initial_replicas(1)
+}
+
+fn seasonal_definition(standard: PrincipalDefinition) -> PrincipalDefinition {
+    standard
+        .messages(ArrivalSeries::PeriodicDelayed {
+            count: 1_000,
+            first_micros: 120_000_000,
+            interval_micros: 120_000_000,
+            count_max: SEASONAL_EVENT_COUNT,
+        })
+        .handler(100_000)
+        .history(HistoricalSeries::seasonal())
+        .launch_delay(LaunchDelaySeries::Immediate)
+        .schedule(RunSchedule::seasonal())
+        .event_count_max(SEASONAL_EVENT_COUNT)
+        .initial_replicas(1)
+}
+
+fn transient_failures_definition(standard: PrincipalDefinition) -> PrincipalDefinition {
+    standard
+        .messages(ArrivalSeries::Rate {
+            per_second: 300,
+            count_max: TRANSIENT_EVENT_COUNT,
+        })
+        .handler(100_000)
+        .transient_failures(FailureSeries::Every {
+            interval: 10,
+            transient_count: 2,
+        })
+        .schedule(RunSchedule::hot_partition())
+        .event_count_max(TRANSIENT_EVENT_COUNT)
+        .initial_replicas(1)
+}
+
+fn historical_match_definition(standard: PrincipalDefinition) -> PrincipalDefinition {
+    let history = HistoricalSeries::standard();
+    let messages = history.live_demand(HISTORY_EVENT_COUNT_MAX);
+    historical_definition(standard, messages, history)
+}
+
+fn historical_rate_definition(
+    standard: PrincipalDefinition,
+    per_second: u32,
+    history: HistoricalSeries,
+) -> PrincipalDefinition {
+    historical_definition(
+        standard,
+        ArrivalSeries::Rate {
+            per_second,
+            count_max: HISTORY_EVENT_COUNT_MAX,
+        },
+        history,
+    )
+}
+
+fn historical_definition(
+    standard: PrincipalDefinition,
+    messages: ArrivalSeries,
+    history: HistoricalSeries,
+) -> PrincipalDefinition {
+    standard
+        .messages(messages)
+        .history(history)
+        .handler(100_000)
+        .schedule(RunSchedule::history())
+        .event_count_max(HISTORY_EVENT_COUNT_MAX)
+        .initial_replicas(1)
 }
 
 #[derive(Clone, Copy)]

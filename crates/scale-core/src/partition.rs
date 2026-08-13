@@ -133,19 +133,6 @@ impl PartitionFactor {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn expected_share(&self, partition: u32) -> f64 {
-        let partition = partition as usize;
-        assert!(
-            partition < self.count_sums.len(),
-            "the partition must be inside the configured range"
-        );
-        let prior = JEFFREYS_CONCENTRATION;
-        let prior_total = prior * f64::from(self.partition_count);
-        let total = self.count_sums.iter().copied().sum::<f64>();
-        (prior + self.count_sums[partition]) / (prior_total + total)
-    }
-
     pub(crate) fn maximum_expected_share(&self) -> f64 {
         let prior = JEFFREYS_CONCENTRATION;
         let prior_total = prior * f64::from(self.partition_count);

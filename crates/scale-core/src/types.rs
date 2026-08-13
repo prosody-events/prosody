@@ -7,6 +7,8 @@ use crate::{
     ResourceWindow, TransitionDirection,
 };
 
+pub(crate) const POSTERIOR_SAMPLES_PER_CAPACITY_CLASS_MIN: u32 = 2;
+
 /// Monotonic model time in microseconds.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ModelTime(u64);
@@ -538,7 +540,7 @@ pub struct Configuration {
     pub replica_count_max: u32,
     /// Warm handler slots on each replica.
     pub slots_per_replica: u32,
-    /// Number of posterior samples per decision.
+    /// Posterior sample budget for at least two draws per capacity class.
     pub posterior_sample_count: u32,
     /// Time between complete telemetry reports.
     pub report_interval_micros: u64,
@@ -607,9 +609,10 @@ impl Configuration {
                 name: "slots_per_replica",
             });
         }
-        if self.posterior_sample_count == 0 {
-            return Err(ConfigurationError::ZeroBound {
-                name: "posterior_sample_count",
+        if self.posterior_sample_count < POSTERIOR_SAMPLES_PER_CAPACITY_CLASS_MIN {
+            return Err(ConfigurationError::InsufficientPosteriorSamples {
+                sample_count: self.posterior_sample_count,
+                minimum: POSTERIOR_SAMPLES_PER_CAPACITY_CLASS_MIN,
             });
         }
         if self.report_interval_micros == 0 {

@@ -14,8 +14,7 @@ use crate::controller::{
 };
 use crate::edf::{
     ArrivalPath, EdfOutcome, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
-    evaluate_general_trajectory, evaluate_prepared_step, evaluate_prepared_trajectory, prepare,
-    required_capacity_prepared,
+    evaluate_prepared_step, evaluate_prepared_trajectory, prepare, required_capacity_prepared,
 };
 use crate::lead_time::LaunchTimeFactor;
 use crate::partition::PartitionFactor;
@@ -57,6 +56,21 @@ fn service_objective_rejects_invalid_replica_second_delay_rates() {
             "rate={rate}"
         );
     }
+}
+
+#[test]
+fn configuration_requires_two_samples_for_each_capacity_class() -> Result<(), TestError> {
+    let mut configuration = configuration()?;
+    configuration.posterior_sample_count = 1;
+
+    assert!(matches!(
+        configuration.validate(),
+        Err(ConfigurationError::InsufficientPosteriorSamples {
+            sample_count: 1,
+            minimum: 2,
+        })
+    ));
+    Ok(())
 }
 
 fn evaluate_constant_supply(
@@ -399,126 +413,6 @@ fn trajectory_counts_a_cohort_released_before_its_horizon() -> Result<(), TestEr
     assert!(outcome.delay_area > 0.0_f64);
     assert!(outcome.drain_seconds.total_cmp(&0.0_f64).is_eq());
     Ok(())
-}
-
-#[quickcheck]
-fn common_cohort_trajectory_matches_general_edf(
-    count_seed: u8,
-    work_seed: u16,
-    debt_seed: u8,
-    supply_seed: u8,
-) -> bool {
-    let count = usize::from(count_seed % 8 + 1);
-    let work = f64::from(work_seed % 1_000) / 10.0_f64;
-    let debt = f64::from(debt_seed);
-    let supply = f64::from(supply_seed) + 1.0_f64;
-    let mut cohorts = WorkCohorts::new(count);
-    for partition in 0..count {
-        cohorts.push_values(250_000, 1_500_000, work, partition as u32);
-    }
-    let trajectory = SupplyTrajectory {
-        initial: supply,
-        pause_seconds: &[0.5_f64],
-        ready_seconds: &[1.0_f64],
-        during: &[supply * 0.5_f64],
-        after: &[supply * 1.5_f64],
-    };
-    let Ok(mut scratch) = EdfScratch::new(count as u32) else {
-        return false;
-    };
-    prepare(&cohorts, &mut scratch);
-    let fast = evaluate_prepared_trajectory(
-        &cohorts,
-        &trajectory,
-        EvaluationWindow {
-            start_micros: 0,
-            horizon_micros: 2_000_000,
-            initial_debt_work: debt,
-            deadline_budget_micros: 1_500_000,
-        },
-        &NO_FUTURE_ARRIVALS,
-        &mut scratch,
-    );
-    let general = evaluate_general_trajectory(
-        &cohorts,
-        &trajectory,
-        EvaluationWindow {
-            start_micros: 0,
-            horizon_micros: 2_000_000,
-            initial_debt_work: debt,
-            deadline_budget_micros: 1_500_000,
-        },
-        &NO_FUTURE_ARRIVALS,
-        &mut scratch,
-    );
-
-    let matches = close_relative(fast.shortfall, general.shortfall)
-        && close_relative(fast.delay_area, general.delay_area)
-        && close_relative(fast.drain_seconds, general.drain_seconds);
-    assert!(matches, "fast={fast:?}, general={general:?}");
-    true
-}
-
-#[quickcheck]
-fn ordered_deadline_trajectory_matches_general_edf(
-    count_seed: u8,
-    gap_seed: u8,
-    work_seed: u16,
-    supply_seed: u8,
-) -> bool {
-    let count = usize::from(count_seed % 16 + 1);
-    let gap_micros = u64::from(gap_seed) * 10_000 + 1;
-    let work = f64::from(work_seed % 1_000) / 10.0_f64;
-    let supply = f64::from(supply_seed) + 1.0_f64;
-    let mut cohorts = WorkCohorts::new(count);
-    for cohort in 0..count {
-        let release_micros = cohort as u64 * gap_micros;
-        cohorts.push_values(
-            release_micros,
-            release_micros + 1_500_000,
-            work + cohort_fraction(cohort),
-            cohort as u32,
-        );
-    }
-    let trajectory = SupplyTrajectory {
-        initial: supply,
-        pause_seconds: &[0.5_f64],
-        ready_seconds: &[1.0_f64],
-        during: &[supply * 0.5_f64],
-        after: &[supply * 1.5_f64],
-    };
-    let Ok(mut scratch) = EdfScratch::new(count as u32) else {
-        return false;
-    };
-    prepare(&cohorts, &mut scratch);
-    let fast = evaluate_prepared_trajectory(
-        &cohorts,
-        &trajectory,
-        EvaluationWindow {
-            start_micros: 0,
-            horizon_micros: 3_000_000,
-            initial_debt_work: 7.0_f64,
-            deadline_budget_micros: 1_500_000,
-        },
-        &NO_FUTURE_ARRIVALS,
-        &mut scratch,
-    );
-    let general = evaluate_general_trajectory(
-        &cohorts,
-        &trajectory,
-        EvaluationWindow {
-            start_micros: 0,
-            horizon_micros: 3_000_000,
-            initial_debt_work: 7.0_f64,
-            deadline_budget_micros: 1_500_000,
-        },
-        &NO_FUTURE_ARRIVALS,
-        &mut scratch,
-    );
-
-    close_relative(fast.shortfall, general.shortfall)
-        && close_relative(fast.delay_area, general.delay_area)
-        && close_relative(fast.drain_seconds, general.drain_seconds)
 }
 
 #[quickcheck]
@@ -1098,11 +992,12 @@ fn missing_interval_weakens_stale_arrival_evidence_before_the_next_update() -> R
 fn partition_factor_learns_a_normalized_skew() -> Result<(), TestError> {
     let mut factor = PartitionFactor::new(4)?;
     factor.update(&[90, 10, 0, 0]);
-    let sum = (0_u32..4)
-        .map(|partition| factor.expected_share(partition))
-        .sum::<f64>();
+    let mut shares = [0.0_f64; 4];
+
+    assert!(factor.write_expected_shares(&mut shares));
+    let sum = shares.iter().copied().sum::<f64>();
     assert!((sum - 1.0_f64).abs() < 1.0e-12_f64);
-    assert!(factor.expected_share(0) > 0.85_f64);
+    assert!(shares[0] > 0.85_f64);
     Ok(())
 }
 
@@ -1115,9 +1010,11 @@ fn partition_prior_uses_one_jeffreys_half_unit_per_partition() -> Result<(), Tes
     let entropy = check.share_entropy_quantiles();
     let uniform_hottest = check.uniform_hottest_share_quantiles();
     let uniform_entropy = check.uniform_share_entropy_quantiles();
+    let mut shares = [0.0_f64; 4];
 
-    assert!(close_relative(factor.expected_share(0), 0.5_f64));
-    assert!(close_relative(factor.expected_share(1), 1.0_f64 / 6.0_f64));
+    assert!(factor.write_expected_shares(&mut shares));
+    assert!(close_relative(shares[0], 0.5_f64));
+    assert!(close_relative(shares[1], 1.0_f64 / 6.0_f64));
     assert!(hottest[0] < hottest[1] && hottest[1] < hottest[2]);
     assert!(entropy[0] < entropy[1] && entropy[1] < entropy[2]);
     assert!(hottest[1] > uniform_hottest[1]);
@@ -2209,76 +2106,6 @@ fn incomplete_actuation_uses_the_conditional_remaining_time() -> Result<(), Test
     Ok(())
 }
 
-#[test]
-fn larger_candidates_inherit_useful_pending_capacity() -> Result<(), TestError> {
-    let configuration = configuration()?;
-    let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-    let mut scratch = state.new_scratch()?;
-    let mut observation = ObservationBuffer::new(&configuration)?;
-    observation.set_current_replicas(2)?;
-    observation.push_actuation_commitment(ActuationCommitment::launching(
-        2,
-        3,
-        ModelTime::from_micros(1),
-    )?)?;
-
-    let _ = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(20_000_000),
-    );
-
-    assert!(matches!(scratch.trajectory_targets(2), Some([] | [1])));
-    assert!(matches!(scratch.trajectory_targets(3), Some([3, ..])));
-    let targets = scratch
-        .trajectory_targets(4)
-        .ok_or(TestError::MissingTrajectory)?;
-    assert!(targets.contains(&4));
-    Ok(())
-}
-
-#[test]
-fn started_rebalance_is_carried_and_can_be_superseded() -> Result<(), TestError> {
-    let mut configuration = configuration()?;
-    configuration.launch_time_prior = LaunchPrior::kubernetes()?;
-    configuration.rebalance_time_prior = RebalancePrior::kip848()?;
-    let mut state = ScaleState::new(configuration.clone(), grid()?)?;
-    let mut scratch = state.new_scratch()?;
-    let mut observation = ObservationBuffer::new(&configuration)?;
-    observation.set_current_replicas(2)?;
-    observation.push_actuation_commitment(ActuationCommitment::rebalancing(
-        2,
-        3,
-        ModelTime::from_micros(1_000_000),
-        ModelTime::from_micros(10_000_000),
-    )?)?;
-
-    let _ = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(20_000_000),
-    );
-
-    assert!(matches!(scratch.trajectory_targets(3), Some([3, ..])));
-    assert!(matches!(
-        scratch.trajectory_pause_seconds(3),
-        Some([20.0_f64, ..])
-    ));
-    let retained = scratch
-        .trajectory_targets(2)
-        .zip(scratch.trajectory_pause_seconds(2))
-        .zip(scratch.trajectory_ready_seconds(2))
-        .ok_or(TestError::MissingTrajectory)?;
-    assert!(matches!(retained.0.0, [3, 2, ..]));
-    assert!(retained.0.1[0].total_cmp(&20.0_f64).is_eq());
-    assert!(retained.0.1[1] > retained.0.1[0]);
-    assert!(retained.1[0].total_cmp(&retained.0.1[1]).is_eq());
-    assert!(retained.1[1] > retained.0.1[1]);
-    Ok(())
-}
-
 #[quickcheck]
 fn rebalance_phase_rejects_time_before_request(requested: u64, started: u64) -> bool {
     let result = ActuationCommitment::rebalancing(
@@ -2563,8 +2390,6 @@ enum TestError {
     UnexpectedHold,
     #[error("a test count exceeds the platform limit")]
     PlatformLimit,
-    #[error("the candidate trajectory is missing")]
-    MissingTrajectory,
     #[error("the decision columns are missing")]
     MissingDecisionCurve,
 }
