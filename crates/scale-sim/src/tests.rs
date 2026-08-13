@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 
 use prosody_scale_core::{
-    CapacityGrid, Configuration as ControllerConfiguration, RandomStream, ReliabilityPrior,
-    ServiceObjective, TransitionPrior,
+    ArrivalPrior, ArrivalPriorError, CapacityGrid, Configuration as ControllerConfiguration,
+    RandomStream, ReliabilityPrior, ServiceObjective, TransitionPrior,
 };
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
@@ -27,6 +27,12 @@ use crate::{
     validate_principal_regime,
 };
 use crate::{CapacityEvidenceKind, CapacityEvidenceSample};
+
+/// Returns the authored test prior: one arrival per second and one expected
+/// change per day. These tests exercise the controller, not this prior.
+fn test_arrival_prior() -> Result<ArrivalPrior, ArrivalPriorError> {
+    ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)
+}
 
 #[test]
 fn generated_outcome_rules_reject_zero_sentinels() {
@@ -436,7 +442,7 @@ fn run_idle_partition_capacity_trace(partition_count: u32) -> Result<(Vec<u64>, 
         posterior_sample_count: 64,
         report_interval_micros: 10_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
@@ -507,7 +513,7 @@ fn capacity_test_closed_loop<Workload>(
         posterior_sample_count: 64,
         report_interval_micros: 10_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
@@ -593,7 +599,7 @@ fn higher_retarget_preserves_each_completed_lead_time() -> Result<(), TestError>
         posterior_sample_count: 64,
         report_interval_micros: 10_000_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
@@ -2074,7 +2080,7 @@ fn source_arrival_count(messages: u32, timers: u32) -> Result<u32, TestError> {
         posterior_sample_count: 64,
         report_interval_micros: 10_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
@@ -2116,7 +2122,7 @@ fn run_reported_arrivals(
         posterior_sample_count: 64,
         report_interval_micros: 10_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
@@ -2238,6 +2244,8 @@ impl Arbitrary for EventTrace {
 
 #[derive(Debug, Error)]
 enum TestError {
+    #[error(transparent)]
+    ArrivalPrior(#[from] ArrivalPriorError),
     #[error(transparent)]
     Batch(#[from] crate::BatchSloError),
     #[error(transparent)]

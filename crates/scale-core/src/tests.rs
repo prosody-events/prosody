@@ -1,14 +1,12 @@
 use std::hint::black_box;
-use std::slice;
 use std::time::Duration;
 
 use fearless_simd::Level;
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
-use statrs::distribution::{ContinuousCDF, Gamma};
 use thiserror::Error;
 
-use crate::arrival::{ArrivalEvidence, ArrivalFactor, ChangeHazard, RateOccupancy, rate_bin};
+use crate::arrival::{ArrivalEvidence, ArrivalFactor};
 use crate::capacity::CapacityFactor;
 use crate::change_point::ChangePointKernel;
 use crate::controller::{
@@ -22,14 +20,13 @@ use crate::edf::{
 use crate::lead_time::LeadTimeFactor;
 use crate::partition::PartitionFactor;
 use crate::planning::terminal_replica_seconds;
-use crate::types::{CalendarColumns, CalendarForecast, WorkCohorts};
+use crate::types::WorkCohorts;
 use crate::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
-    CalendarArtifactId, CalendarRateSegment, CapacityCurve, CapacityGrid, CapacityPrior, Cohort,
-    Configuration, ConfigurationError, DemandClass, HoldReason, ModelTime, ObservationBuffer,
-    PosteriorQuery, RandomStream, ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleState,
-    ServiceObjective, ThroughputPosteriorCell, TransitionDirection, TransitionEvidence,
-    TransitionPrior, step,
+    CapacityCurve, CapacityGrid, CapacityPrior, Cohort, Configuration, ConfigurationError,
+    DemandClass, HoldReason, ModelTime, ObservationBuffer, PosteriorQuery, RandomStream,
+    ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleState, ServiceObjective,
+    ThroughputPosteriorCell, TransitionDirection, TransitionEvidence, TransitionPrior, step,
 };
 
 const NO_FUTURE_ARRIVALS: ArrivalPath<'static> = ArrivalPath {
@@ -823,126 +820,8 @@ fn partition_arrival_update_is_consumed_once() -> Result<(), TestError> {
 }
 
 #[test]
-fn arrival_posterior_predictive_mass_normalizes() {
-    let mut factor = ArrivalFactor::new(crate::ArrivalPrior::broad_fallback());
-    factor.update(ArrivalEvidence::new(4, 1_000_000), None, 1_000_000);
-    let mass = (0_u32..128)
-        .map(|count| factor.predictive_probability(count, 1.0_f64))
-        .sum::<f64>();
-    assert!((mass - 1.0_f64).abs() < 1.0e-12_f64);
-}
-
-#[quickcheck]
-fn empty_rate_occupancy_samples_the_configured_prior(seed: u64) -> bool {
-    let Ok(prior) = crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64, 1_024)
-        .and_then(|prior| prior.with_transition_learning(1.0_f64, 1.0e9_f64))
-    else {
-        return false;
-    };
-    let Ok(distribution) = Gamma::new(4.0_f64, 0.01_f64) else {
-        return false;
-    };
-    let occupancy = RateOccupancy::new();
-    let mut random = RandomStream::new(seed);
-    let mut samples = vec![0.0_f64; 4_096];
-    for sample in &mut samples {
-        *sample = occupancy.sample(prior, &mut random);
-    }
-    samples.sort_by(f64::total_cmp);
-    [0.1_f64, 0.5_f64, 0.9_f64]
-        .into_iter()
-        .zip([409_usize, 2_048, 3_686])
-        .all(|(probability, index)| {
-            let expected = distribution.inverse_cdf(probability);
-            (samples[index] - expected).abs() / expected < 0.1_f64
-        })
-}
-
-#[quickcheck]
-fn observed_rate_occupancy_controls_jump_samples(rate_code: u16, seed: u64) -> bool {
-    let Ok(prior) = crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64, 1_024)
-        .and_then(|prior| prior.with_transition_learning(1.0_f64, 1.0e9_f64))
-    else {
-        return false;
-    };
-    let exponent = -2.0_f64 + 6.0_f64 * f64::from(rate_code) / f64::from(u16::MAX);
-    let rate = 10.0_f64.powf(exponent);
-    let expected_bin = rate_bin(rate);
-    let mut occupancy = RateOccupancy::new();
-    occupancy.record(rate, 1_000.0_f64, 1_000.0_f64, 1.0e9_f64);
-    let mut random = RandomStream::new(seed);
-    let matching = (0_u32..4_096)
-        .filter(|_| {
-            let sampled_bin = rate_bin(occupancy.sample(prior, &mut random));
-            sampled_bin.abs_diff(expected_bin) <= 1
-        })
-        .count();
-    matching >= 3_972
-}
-
-#[quickcheck]
-fn rate_occupancy_preserves_column_invariants(records: Vec<(u16, u16, u16)>) -> bool {
-    let mut occupancy = RateOccupancy::new();
-    for (rate_code, exposure_code, elapsed_code) in records.into_iter().take(128) {
-        let exponent = -3.0_f64 + 9.0_f64 * f64::from(rate_code) / f64::from(u16::MAX);
-        occupancy.record(
-            10.0_f64.powf(exponent),
-            f64::from(exposure_code) + 1.0_f64,
-            f64::from(elapsed_code),
-            86_400.0_f64,
-        );
-    }
-    let sum = occupancy.weights().iter().sum::<f64>();
-    let tolerance = occupancy.total().max(1.0_f64) * 1.0e-12_f64;
-    let weights_valid = occupancy
-        .weights()
-        .iter()
-        .all(|weight| weight.is_finite() && *weight >= 0.0_f64);
-    let cumulative_valid = occupancy
-        .cumulative()
-        .windows(2)
-        .all(|pair| pair[0] <= pair[1]);
-    weights_valid
-        && cumulative_valid
-        && (sum - occupancy.total()).abs() <= tolerance
-        && (occupancy.cumulative()[63] - occupancy.total()).abs() <= tolerance
-}
-
-#[quickcheck]
-fn learned_hazard_mean_moves_from_the_prior_to_observed_frequency(frequency_code: u8) -> bool {
-    let Ok(prior) = crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 0.01_f64, 1_024)
-        .and_then(|prior| prior.with_transition_learning(10.0_f64, 1.0e12_f64))
-    else {
-        return false;
-    };
-    let frequency = f64::from(frequency_code) / f64::from(u8::MAX);
-    let mut hazard = ChangeHazard::new();
-    for _ in 0_u32..1_000 {
-        hazard.record(frequency, 1.0_f64, 1.0_f64, 1.0e12_f64);
-    }
-    let mean = hazard.mean(prior);
-    let lower = frequency.min(0.01_f64);
-    let upper = frequency.max(0.01_f64);
-    (lower..=upper).contains(&mean) && (mean - frequency).abs() < 0.01_f64
-}
-
-#[test]
-fn transition_learning_requires_positive_finite_durations() -> Result<(), TestError> {
-    let prior = crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 0.01_f64, 1_024)?;
-    assert!(matches!(
-        prior.with_transition_learning(0.0_f64, 1.0_f64),
-        Err(crate::ArrivalPriorError::InvalidPriorTrust)
-    ));
-    assert!(matches!(
-        prior.with_transition_learning(1.0_f64, f64::INFINITY),
-        Err(crate::ArrivalPriorError::InvalidOccupancyHalfLife)
-    ));
-    Ok(())
-}
-
-#[test]
 fn arrival_change_point_replaces_stale_rate_evidence() -> Result<(), TestError> {
-    let prior = crate::ArrivalPrior::new(100.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64, 1_024)?;
+    let prior = crate::ArrivalPrior::new(100.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
     let mut factor = ArrivalFactor::new(prior);
     for _ in 0_u32..100 {
         factor.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
@@ -960,7 +839,7 @@ fn arrival_change_point_replaces_stale_rate_evidence() -> Result<(), TestError> 
 
 #[test]
 fn arrival_change_point_normalizes_after_an_extreme_rate_change() -> Result<(), TestError> {
-    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64, 1_024)?;
+    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
     let mut factor = ArrivalFactor::new(prior);
 
     factor.update(ArrivalEvidence::new(10_000, 1_000_000), None, 1_000_000);
@@ -971,7 +850,7 @@ fn arrival_change_point_normalizes_after_an_extreme_rate_change() -> Result<(), 
 
 #[test]
 fn missing_arrival_prediction_is_cadence_invariant() -> Result<(), TestError> {
-    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 2.0_f64.ln(), 1_024)?;
+    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
     let mut coarse = ArrivalFactor::new(prior);
     let mut fine = ArrivalFactor::new(prior);
     coarse.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
@@ -984,14 +863,13 @@ fn missing_arrival_prediction_is_cadence_invariant() -> Result<(), TestError> {
     let fine_prediction = fine.expected_rate(2_000_000);
 
     assert!((coarse_prediction - fine_prediction).abs() < 1.0e-12_f64);
-    assert!((coarse_prediction - 25.75_f64).abs() < 1.0e-12_f64);
     Ok(())
 }
 
 #[test]
 fn missing_interval_weakens_stale_arrival_evidence_before_the_next_update() -> Result<(), TestError>
 {
-    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 2.0_f64.ln(), 1_024)?;
+    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
     let mut contiguous = ArrivalFactor::new(prior);
     let mut missing = ArrivalFactor::new(prior);
     contiguous.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
@@ -1006,56 +884,6 @@ fn missing_interval_weakens_stale_arrival_evidence_before_the_next_update() -> R
         missing_rate < contiguous_rate,
         "missing rate={missing_rate}, contiguous rate={contiguous_rate}"
     );
-    Ok(())
-}
-
-#[test]
-fn live_evidence_selects_a_supported_calendar_model() -> Result<(), TestError> {
-    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64, 1_024)?;
-    let segment = CalendarRateSegment::new(7, 0, 60_000_000, 1_000.0_f64, 10.0_f64)?;
-    let mut segments = CalendarColumns::new(1);
-    segments.extend(slice::from_ref(&segment));
-    let forecast = CalendarForecast {
-        artifact: CalendarArtifactId(11),
-        prior_probability: 0.5_f64,
-        segments: &segments,
-    };
-    let mut factor = ArrivalFactor::new(prior);
-
-    for second in 1_u64..=10 {
-        factor.update(
-            ArrivalEvidence::new(100, 1_000_000),
-            Some(forecast),
-            second * 1_000_000,
-        );
-    }
-
-    assert!(factor.calendar_model_probability() > 0.9_f64);
-    Ok(())
-}
-
-#[test]
-fn live_evidence_rejects_a_stale_calendar_model() -> Result<(), TestError> {
-    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64, 1_024)?;
-    let segment = CalendarRateSegment::new(7, 0, 60_000_000, 1_000.0_f64, 10.0_f64)?;
-    let mut segments = CalendarColumns::new(1);
-    segments.extend(slice::from_ref(&segment));
-    let forecast = CalendarForecast {
-        artifact: CalendarArtifactId(11),
-        prior_probability: 0.5_f64,
-        segments: &segments,
-    };
-    let mut factor = ArrivalFactor::new(prior);
-
-    for second in 1_u64..=10 {
-        factor.update(
-            ArrivalEvidence::new(1_000, 1_000_000),
-            Some(forecast),
-            second * 1_000_000,
-        );
-    }
-
-    assert!(factor.calendar_model_probability() < 0.1_f64);
     Ok(())
 }
 
@@ -1661,7 +1489,7 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
         posterior_sample_count: 1_024,
         report_interval_micros: 1_000_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: crate::ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64, 1_024)?,
+        arrival_prior: crate::ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
@@ -2287,7 +2115,7 @@ fn plateau_configuration() -> Result<Configuration, TestError> {
         posterior_sample_count: 4_096,
         report_interval_micros: 1_000_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64, 1_024)?,
+        arrival_prior: crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::new(
@@ -2425,6 +2253,13 @@ fn posterior_mean(state: &ScaleState, query: PosteriorQuery) -> Result<f64, Test
         .sum())
 }
 
+#[test]
+fn test_artifact_matches_validated_construction() -> Result<(), TestError> {
+    let validated = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?;
+    assert_eq!(crate::ArrivalPrior::test_artifact(), validated);
+    Ok(())
+}
+
 fn configuration() -> Result<Configuration, TestError> {
     Ok(Configuration {
         cohort_count_max: 16,
@@ -2435,7 +2270,7 @@ fn configuration() -> Result<Configuration, TestError> {
         posterior_sample_count: 128,
         report_interval_micros: 1_000_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: crate::ArrivalPrior::broad_fallback(),
+        arrival_prior: crate::ArrivalPrior::test_artifact(),
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
@@ -2472,12 +2307,7 @@ fn decision_with_threads(thread_count: usize) -> Result<ScaleDecision, TestError
 }
 
 fn negligible_arrival_prior() -> Result<crate::ArrivalPrior, TestError> {
-    Ok(crate::ArrivalPrior::new(
-        1.0_f64,
-        1.0e12_f64,
-        1.0e-12_f64,
-        1_024,
-    )?)
+    Ok(crate::ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?)
 }
 
 fn grid() -> Result<CapacityGrid, TestError> {

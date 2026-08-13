@@ -2,9 +2,10 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use prosody_scale_core::{
-    CapacityGrid, CapacityGridError, Cohort, Configuration, ConfigurationError, DemandClass,
-    ModelTime, ObservationBuffer, ObservationError, ReliabilityPrior, ResourceWindow, ScaleScratch,
-    ScaleState, ServiceObjective, TransitionPrior, step,
+    ArrivalPrior, ArrivalPriorError, CapacityGrid, CapacityGridError, Cohort, Configuration,
+    ConfigurationError, DemandClass, ModelTime, ObservationBuffer, ObservationError,
+    ReliabilityPrior, ResourceWindow, ScaleScratch, ScaleState, ServiceObjective, TransitionPrior,
+    step,
 };
 use std::hint::black_box;
 use std::time::Instant;
@@ -313,7 +314,7 @@ fn capacity_grid(criterion: &mut Criterion) {
     group.finish();
 }
 
-fn configuration(case: BenchmarkCase) -> Result<Configuration, ConfigurationError> {
+fn configuration(case: BenchmarkCase) -> Result<Configuration, BenchmarkError> {
     Ok(Configuration {
         cohort_count_max: case.cohort_count_max,
         calendar_segment_count_max: case.cohort_count_max,
@@ -323,7 +324,9 @@ fn configuration(case: BenchmarkCase) -> Result<Configuration, ConfigurationErro
         posterior_sample_count: case.posterior_sample_count,
         report_interval_micros: REPORT_INTERVAL_MICROS,
         failure_service_weight: 0.3_f64,
-        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        // Use one arrival each second and one expected change each day because this benchmark
+        // measures step cost, not the prior.
+        arrival_prior: ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
@@ -421,6 +424,8 @@ fn grid(case: BenchmarkCase) -> Result<CapacityGrid, CapacityGridError> {
 
 #[derive(Debug, Error)]
 enum BenchmarkError {
+    #[error(transparent)]
+    ArrivalPrior(#[from] ArrivalPriorError),
     #[error(transparent)]
     CapacityGrid(#[from] CapacityGridError),
     #[error(transparent)]

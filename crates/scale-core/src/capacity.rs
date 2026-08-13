@@ -460,7 +460,7 @@ pub(crate) struct CapacityFactor {
 impl CapacityFactor {
     #[cfg(test)]
     pub(crate) fn new(grid: CapacityGrid, change_rate_per_second: f64) -> Self {
-        Self::new_with_prior(grid, change_rate_per_second, ArrivalPrior::broad_fallback())
+        Self::new_with_prior(grid, change_rate_per_second, ArrivalPrior::test_artifact())
     }
 
     pub(crate) fn new_with_prior(

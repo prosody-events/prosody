@@ -3,8 +3,31 @@ use core::convert::Infallible;
 use rand::{Rng, SeedableRng, TryRng};
 use rand_distr::{Distribution, StandardNormal};
 use rand_xoshiro::Xoshiro256PlusPlus;
+use statrs::function::gamma::ln_gamma;
 
 const UNIT_SCALE: f64 = 1.0_f64 / 9_007_199_254_740_992.0_f64;
+const PTRS_THRESHOLD: f64 = 10.0_f64;
+
+/// A finite positive mean accepted by the internal Poisson sampler.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PoissonMean(f64);
+
+impl PoissonMean {
+    pub(crate) fn new(mean: f64) -> Option<Self> {
+        (mean.is_finite() && mean > 0.0_f64).then_some(Self(mean))
+    }
+
+    /// Multiplies values from a model that validated their complete domain.
+    pub(crate) fn from_product(rate: f64, duration: f64) -> Self {
+        debug_assert!(rate.is_finite() && rate > 0.0_f64, "validated rate");
+        debug_assert!(
+            duration.is_finite() && duration > 0.0_f64,
+            "validated duration"
+        );
+        debug_assert!((rate * duration).is_finite(), "validated Poisson product");
+        Self(rate * duration)
+    }
+}
 
 /// Deterministic random stream indexed by a key and counter.
 ///
@@ -110,7 +133,64 @@ impl TryRng for RandomStream {
     }
 
     fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), Self::Error> {
-        self.generator.try_fill_bytes(destination)
+        // Byte fills consume the public stream counter like every other draw.
+        for chunk in destination.chunks_mut(size_of::<u64>()) {
+            let bytes = self.next_u64().to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+        Ok(())
+    }
+}
+
+/// Samples a Poisson variate from a mean that construction already validated.
+pub(crate) fn sample_poisson(mean: PoissonMean, random: &mut RandomStream) -> u64 {
+    if mean.0 < PTRS_THRESHOLD {
+        return sample_poisson_inversion(mean.0, random);
+    }
+    sample_poisson_ptrs(mean.0, random)
+}
+
+pub(crate) fn count_as_f64(value: u64) -> f64 {
+    let high = u32::try_from(value >> 32_u32).map_or(u32::MAX, |part| part);
+    let low = u32::try_from(value & u64::from(u32::MAX)).map_or(u32::MAX, |part| part);
+    f64::from(high) * 4_294_967_296.0_f64 + f64::from(low)
+}
+
+fn sample_poisson_inversion(mean: f64, random: &mut RandomStream) -> u64 {
+    let limit = (-mean).exp();
+    let mut product = 1.0_f64;
+    let mut count = 0_u64;
+    loop {
+        product *= random.open_unit_f64();
+        if product <= limit {
+            return count;
+        }
+        count += 1;
+    }
+}
+
+fn sample_poisson_ptrs(mean: f64, random: &mut RandomStream) -> u64 {
+    let root = mean.sqrt();
+    let b = 0.931_f64 + 2.53_f64 * root;
+    let a = -0.059_f64 + 0.02483_f64 * b;
+    let inverse_alpha = 1.1239_f64 + 1.1328_f64 / (b - 3.4_f64);
+    let v_r = 0.9277_f64 - 3.6224_f64 / (b - 2.0_f64);
+    loop {
+        let u = random.open_unit_f64() - 0.5_f64;
+        let v = random.open_unit_f64();
+        let us = 0.5_f64 - u.abs();
+        let candidate = ((2.0_f64 * a / us + b) * u + mean + 0.43_f64).floor();
+        if us >= 0.07_f64 && v <= v_r && candidate >= 0.0_f64 {
+            return candidate as u64;
+        }
+        if candidate < 0.0_f64 || (us < 0.013_f64 && v > us) {
+            continue;
+        }
+        let lhs = (v * inverse_alpha / (a / (us * us) + b)).ln();
+        let rhs = -mean + candidate * mean.ln() - ln_gamma(candidate + 1.0_f64);
+        if lhs <= rhs {
+            return candidate as u64;
+        }
     }
 }
 
@@ -120,3 +200,7 @@ const fn mix(mut value: u64) -> u64 {
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
+
+#[cfg(test)]
+#[path = "random_tests.rs"]
+mod tests;

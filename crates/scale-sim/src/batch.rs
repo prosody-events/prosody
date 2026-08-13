@@ -2,9 +2,9 @@ use std::num::TryFromIntError;
 use std::time::Duration;
 
 use prosody_scale_core::{
-    CapacityGrid, CapacityGridError, Cohort, Configuration, ConfigurationError, DemandClass,
-    ModelTime, ObservationBuffer, ObservationError, RandomStream, ReliabilityPrior, ScaleDecision,
-    ScaleState, ServiceObjective, TransitionPrior, step,
+    ArrivalPrior, ArrivalPriorError, CapacityGrid, CapacityGridError, Cohort, Configuration,
+    ConfigurationError, DemandClass, ModelTime, ObservationBuffer, ObservationError, RandomStream,
+    ReliabilityPrior, ScaleDecision, ScaleState, ServiceObjective, TransitionPrior, step,
 };
 use thiserror::Error;
 
@@ -107,7 +107,10 @@ pub fn run_batch_slo_with_inputs(
         posterior_sample_count: 4_096,
         report_interval_micros: budget_micros,
         failure_service_weight: 0.3_f64,
-        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        // One arrival per second with one expected change per day is the
+        // batch baseline; the batch drains a fixed backlog, so this prior
+        // only shapes early rate uncertainty.
+        arrival_prior: ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
@@ -273,6 +276,9 @@ pub enum BatchSloError {
     /// The resource grid is invalid.
     #[error(transparent)]
     CapacityGrid(#[from] CapacityGridError),
+    /// The arrival prior is invalid.
+    #[error(transparent)]
+    ArrivalPrior(#[from] ArrivalPriorError),
     /// The controller configuration is invalid.
     #[error(transparent)]
     Configuration(#[from] ConfigurationError),

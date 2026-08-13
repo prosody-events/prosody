@@ -1,7 +1,7 @@
 //! Thin WebAssembly adapter for deterministic laboratory decisions.
 
 use prosody_scale_core::{
-    CapacityGrid, Cohort, Configuration, DemandClass, ModelTime, ObservationBuffer,
+    ArrivalPrior, CapacityGrid, Cohort, Configuration, DemandClass, ModelTime, ObservationBuffer,
     ReliabilityPrior, ScaleDecision, ScaleState, ServiceObjective, TransitionPrior, step,
 };
 
@@ -20,6 +20,11 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
     let Ok(objective) = ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64) else {
         return ERROR_CODE;
     };
+    // Use one arrival each second and one expected change each day because this
+    // fixture measures step cost, not the prior.
+    let Ok(arrival_prior) = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64) else {
+        return ERROR_CODE;
+    };
     let configuration = Configuration {
         cohort_count_max: 8,
         calendar_segment_count_max: 8,
@@ -29,7 +34,7 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
         posterior_sample_count: 64,
         report_interval_micros: 1_000_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: prosody_scale_core::ArrivalPrior::broad_fallback(),
+        arrival_prior,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),

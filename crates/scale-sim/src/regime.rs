@@ -51,7 +51,6 @@ const TIMER_WAVE_RUN_END_MICROS: u64 = 480_000_000;
 const HISTORICAL_MAXIMUM_LEAD_SECONDS: f64 = 90.0_f64;
 const HISTORICAL_STEP_DURATION_SECONDS: f64 = 120.0_f64;
 const REGIME_PRIOR_TRUST_SECONDS: f64 = 5.0_f64;
-const REGIME_OCCUPANCY_HALF_LIFE_SECONDS: f64 = 86_400.0_f64;
 const PRIOR_RELEASE_MARGIN_MICROS: u64 =
     (1.5_f64 * 16.0_f64 * REGIME_PRIOR_TRUST_SECONDS * 1_000_000.0_f64) as u64;
 /// Claim clock for capacity beliefs, as [`PRIOR_RELEASE_MARGIN_MICROS`] is
@@ -1592,11 +1591,6 @@ fn principal_graph(
             4.0_f64,
             0.01_f64,
             1.0_f64 / 90.0_f64,
-            1_024,
-        )?
-        .with_transition_learning(
-            REGIME_PRIOR_TRUST_SECONDS,
-            REGIME_OCCUPANCY_HALF_LIFE_SECONDS,
         )?,
         // A collapsing plant changes as work crosses its knee. The kernel
         // revives cells that current data cover. This rate matches the
