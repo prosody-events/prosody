@@ -1,9 +1,7 @@
 use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
-use super::{
-    SCHEDULE_VISIBILITY_MICROS, SCHEDULED_PARTITION, prepare_work_cohorts, scenario_event_count,
-};
+use super::{SCHEDULED_PARTITION, prepare_work_cohorts, scenario_event_count};
 use crate::edf::ArrivalPath;
 use crate::types::WorkCohorts;
 use crate::{
@@ -14,7 +12,7 @@ use crate::{
 };
 
 #[test]
-fn overdue_backlog_keeps_only_its_original_loss_window() -> Result<(), TestError> {
+fn overdue_backlog_keeps_each_original_deadline() -> Result<(), TestError> {
     let (mut state, mut scratch, mut observation) = test_model()?;
     state.model_time = ModelTime::from_micros(10_000_000);
     observation.set_backlog(BacklogCohort::new(
@@ -41,14 +39,17 @@ fn overdue_backlog_keeps_only_its_original_loss_window() -> Result<(), TestError
         input.scheduled_releases,
     );
 
-    assert_eq!(scratch.handler_cohorts.len(), 0);
-    assert_eq!(scratch.resource_cohorts.len(), 1);
+    assert_eq!(scratch.resource_cohorts.len(), 2);
     assert_eq!(scratch.resource_cohorts.deadline_micros(0), 9_500_000);
+    assert_eq!(scratch.resource_cohorts.deadline_micros(1), 9_000_000);
     assert!(approximately_equal(
         scratch.resource_cohorts.work_slot_seconds(0),
         5.0_f64,
     ));
-    assert!(approximately_equal(scratch.resource_debt_events, 7.0_f64));
+    assert!(approximately_equal(
+        scratch.resource_cohorts.work_slot_seconds(1),
+        7.0_f64,
+    ));
     Ok(())
 }
 
@@ -109,15 +110,11 @@ fn scheduled_releases_are_exact_and_idempotent(raw: Vec<(u8, u16)>) -> bool {
         count: 3,
     });
     releases.push(ScheduledRelease {
-        release_micros: now_micros
-            .saturating_add(SCHEDULE_VISIBILITY_MICROS)
-            .saturating_sub(1),
+        release_micros: now_micros.saturating_add(149_999_999),
         count: 5,
     });
     releases.push(ScheduledRelease {
-        release_micros: now_micros
-            .saturating_add(SCHEDULE_VISIBILITY_MICROS)
-            .saturating_add(1),
+        release_micros: now_micros.saturating_add(150_000_001),
         count: 7,
     });
     releases.sort_unstable_by_key(|release| release.release_micros);
@@ -138,36 +135,22 @@ fn scheduled_releases_are_exact_and_idempotent(raw: Vec<(u8, u16)>) -> bool {
 
     let expected = releases
         .iter()
-        .filter(|release| {
-            release.release_micros > now_micros
-                && release.release_micros <= now_micros.saturating_add(SCHEDULE_VISIBILITY_MICROS)
-        })
+        .filter(|release| release.release_micros > now_micros)
         .collect::<Vec<_>>();
-    if scratch.resource_cohorts.len() != expected.len()
-        || scratch.handler_cohorts.len() != expected.len()
-    {
+    if scratch.resource_cohorts.len() != expected.len() {
         return false;
     }
-    let handler_seconds = state.capacity.expected_service_time(state.simd_level);
     expected.iter().enumerate().all(|(index, release)| {
         scratch.resource_cohorts.release_micros(index) == release.release_micros
-            && scratch.handler_cohorts.release_micros(index) == release.release_micros
             && scratch.resource_cohorts.deadline_micros(index)
                 == release
                     .release_micros
                     .saturating_add(state.configuration.objective.budget_micros())
-            && scratch.handler_cohorts.deadline_micros(index)
-                == scratch.resource_cohorts.deadline_micros(index)
             && approximately_equal(
                 scratch.resource_cohorts.work_slot_seconds(index),
                 f64::from(release.count),
             )
-            && approximately_equal(
-                scratch.handler_cohorts.work_slot_seconds(index),
-                f64::from(release.count) * handler_seconds,
-            )
             && scratch.resource_cohorts.partition(index) == SCHEDULED_PARTITION
-            && scratch.handler_cohorts.partition(index) == SCHEDULED_PARTITION
     })
 }
 
@@ -202,7 +185,7 @@ fn curve_class_columns_equal_cell_columns_with_rolled_masses() -> Result<(), Tes
     let configuration = test_configuration()?;
     let grid = CapacityGrid::new(&[0.1_f64], &[100.0_f64], &[0.0_f64, 1.0_f64])?;
     let state = ScaleState::new(configuration, grid)?;
-    let draw_count = 3;
+    let draw_count = 3_u32;
     let mut cell_column = 0.0_f64;
     let mut class_column = 0.0_f64;
     for class in 0..state.capacity_classes.len() {
@@ -213,7 +196,7 @@ fn curve_class_columns_equal_cell_columns_with_rolled_masses() -> Result<(), Tes
             .sum::<f64>();
         let representative = state.capacity_classes.representative(class);
         let (curve, _) = state.capacity.curve_and_probability(representative);
-        let path_mean = (0..draw_count)
+        let path_mean = (0_u32..draw_count)
             .map(|draw| curve.sustainable_throughput(64.0_f64) + f64::from(draw))
             .sum::<f64>()
             / f64::from(draw_count);

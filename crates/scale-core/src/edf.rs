@@ -75,11 +75,10 @@ pub(crate) struct EvaluationWindow {
 /// scenario horizon. A deadline never truncates this integral.
 struct DeadlineState {
     queue: f64,
-    initial_debt: f64,
-    completed: f64,
-    released: f64,
-    due: f64,
-    loss_due: f64,
+    on_time: f64,
+    overdue: f64,
+    completion_credit: f64,
+    due_work: f64,
     missed: f64,
     shortfall: f64,
 }
@@ -90,22 +89,14 @@ struct DeadlineAdvance {
     late_area: f64,
 }
 
-#[derive(Clone, Copy)]
-struct SpanRates {
-    service: f64,
-    arrival: f64,
-    due: f64,
-}
-
 impl DeadlineState {
     fn new(initial_debt: f64) -> Self {
         Self {
             queue: initial_debt,
-            initial_debt,
-            completed: 0.0_f64,
-            released: 0.0_f64,
-            due: 0.0_f64,
-            loss_due: 0.0_f64,
+            on_time: 0.0_f64,
+            overdue: initial_debt,
+            completion_credit: 0.0_f64,
+            due_work: 0.0_f64,
             missed: 0.0_f64,
             shortfall: 0.0_f64,
         }
@@ -113,26 +104,24 @@ impl DeadlineState {
 
     fn release(&mut self, work: f64) {
         self.queue += work;
-        self.released += work;
+        self.on_time += work;
     }
 
     fn make_due(&mut self, work: f64) {
-        let completion_headroom = (self.actionable_completed() - self.due).max(0.0_f64);
-        let missed = (work - completion_headroom).clamp(0.0_f64, work);
-        let error_bound = 8.0_f64
-            * f64::EPSILON
-            * self
-                .released
-                .max(self.completed)
-                .max(self.due)
-                .max(work)
-                .max(1.0_f64);
-        if missed > error_bound {
-            self.missed += missed;
+        self.due_work += work;
+        if self.completion_credit >= work {
+            self.completion_credit -= work;
+            return;
         }
-        self.due += work;
-        self.loss_due += work;
-        self.update_shortfall();
+        let remaining_due = work - self.completion_credit;
+        self.completion_credit = 0.0_f64;
+        let missed = remaining_due.min(self.on_time);
+        self.on_time -= missed;
+        self.overdue += missed;
+        self.missed += missed;
+        if work > 0.0_f64 {
+            self.shortfall = self.shortfall.max(missed / work);
+        }
     }
 
     fn advance(
@@ -145,65 +134,80 @@ impl DeadlineState {
         let mut remaining = duration;
         let mut queue_area = 0.0_f64;
         let mut late_area = 0.0_f64;
-        // Rates stay constant across the call, so the state has few linear
-        // breakpoints: the initial debt completes once, the queue empties
-        // once, and the completion-due lead crosses zero at most once for
-        // each service regime. Each pass ends at the next breakpoint and
-        // resolves it exactly, so the pass budget below covers every case.
-        // The tail then integrates any numerical remainder without
-        // breakpoints, which keeps this loop free of stall states.
-        for _ in 0_u8..8 {
-            if remaining <= 0.0_f64 {
-                break;
-            }
+        // Initial debt completes at most once. The queue empties at most once
+        // because rates stay constant. Only those events change service
+        // regimes. The completion lead crosses at most once in each regime.
+        let one_way_events =
+            usize::from(self.overdue > 0.0_f64) + usize::from(self.queue > 0.0_f64);
+        let service_regimes = one_way_events + 1;
+        let iteration_bound = one_way_events + service_regimes + 1;
+        let mut iterations = 0_usize;
+        while remaining > 0.0_f64 {
+            iterations += 1;
+            debug_assert!(
+                iterations <= iteration_bound,
+                "the constant-rate breakpoint proof bounds each advance"
+            );
             let service_rate = self.service_rate(capacity, arrival_rate);
-            let net_rate = arrival_rate - service_rate;
-            let mut span = remaining;
-            let queue_crossing = if self.queue > 0.0_f64 && net_rate < 0.0_f64 {
-                self.queue / -net_rate
-            } else {
-                f64::INFINITY
-            };
-            span = span.min(queue_crossing);
-            let debt_crossing = if self.completed < self.initial_debt && service_rate > 0.0_f64 {
-                (self.initial_debt - self.completed) / service_rate
-            } else {
-                f64::INFINITY
-            };
-            span = span.min(debt_crossing);
-            let actionable_rate = if self.completed >= self.initial_debt {
-                service_rate
+            let due_from_credit = if self.completion_credit > 0.0_f64 {
+                due_rate
             } else {
                 0.0_f64
             };
-            let completion_lead = self.actionable_completed() - self.due;
-            let lead_rate = actionable_rate - due_rate;
-            if completion_lead * lead_rate < 0.0_f64 {
-                span = span.min(-completion_lead / lead_rate);
-            }
-            let span = span.max(0.0_f64);
-            let rates = SpanRates {
-                service: service_rate,
-                arrival: arrival_rate,
-                due: due_rate,
+            let due_to_queue = due_rate - due_from_credit;
+            let had_overdue = self.overdue > 0.0_f64;
+            let (overdue_service, on_time_service) = if had_overdue {
+                (service_rate, 0.0_f64)
+            } else {
+                (
+                    service_rate.min(due_to_queue),
+                    (service_rate - due_to_queue).max(0.0_f64),
+                )
             };
-            self.integrate(span, rates, &mut queue_area, &mut late_area);
-            if queue_crossing <= span {
+            let queue_rate = arrival_rate - service_rate;
+            let overdue_rate = due_to_queue - overdue_service;
+            let on_time_rate = arrival_rate - due_to_queue - on_time_service;
+            let credit_rate = on_time_service - due_from_credit;
+            let queue_crossing = positive_crossing(self.queue, queue_rate);
+            let overdue_crossing = positive_crossing(self.overdue, overdue_rate);
+            let on_time_crossing = positive_crossing(self.on_time, on_time_rate);
+            let credit_crossing = positive_crossing(self.completion_credit, credit_rate);
+            let crossing = queue_crossing
+                .min(overdue_crossing)
+                .min(on_time_crossing)
+                .min(credit_crossing);
+            let span = crossing.min(remaining);
+            let queue_after = self.queue + queue_rate * span;
+            let overdue_after = self.overdue + overdue_rate * span;
+            queue_area += 0.5_f64 * (self.queue + queue_after) * span;
+            late_area += 0.5_f64 * (self.overdue + overdue_after) * span;
+            self.queue = queue_after;
+            self.overdue = overdue_after;
+            self.on_time += on_time_rate * span;
+            self.completion_credit += credit_rate * span;
+            self.due_work += due_rate * span;
+            let missed_rate = if had_overdue {
+                due_rate
+            } else {
+                overdue_rate.max(0.0_f64)
+            };
+            self.missed += missed_rate * span;
+            if self.due_work > 0.0_f64 {
+                self.shortfall = self.shortfall.max(self.overdue / self.due_work);
+            }
+            if queue_crossing.total_cmp(&span).is_eq() {
                 self.queue = 0.0_f64;
             }
-            if debt_crossing <= span {
-                self.completed = self.completed.max(self.initial_debt);
+            if overdue_crossing.total_cmp(&span).is_eq() {
+                self.overdue = 0.0_f64;
+            }
+            if on_time_crossing.total_cmp(&span).is_eq() {
+                self.on_time = 0.0_f64;
+            }
+            if credit_crossing.total_cmp(&span).is_eq() {
+                self.completion_credit = 0.0_f64;
             }
             remaining -= span;
-        }
-        if remaining > 0.0_f64 {
-            let service_rate = self.service_rate(capacity, arrival_rate);
-            let rates = SpanRates {
-                service: service_rate,
-                arrival: arrival_rate,
-                due: due_rate,
-            };
-            self.integrate(remaining, rates, &mut queue_area, &mut late_area);
         }
         DeadlineAdvance {
             queue_area,
@@ -218,77 +222,13 @@ impl DeadlineState {
             capacity.min(arrival_rate)
         }
     }
+}
 
-    fn integrate(
-        &mut self,
-        span: f64,
-        rates: SpanRates,
-        queue_area: &mut f64,
-        late_area: &mut f64,
-    ) {
-        let net_rate = rates.arrival - rates.service;
-        let actionable_rate = if self.completed >= self.initial_debt {
-            rates.service
-        } else {
-            0.0_f64
-        };
-        let completion_lead = self.actionable_completed() - self.due;
-        let lead_rate = actionable_rate - rates.due;
-        if rates.due > 0.0_f64 {
-            let bound = self.ledger_error_bound();
-            let lead = if completion_lead.abs() <= bound {
-                0.0_f64
-            } else {
-                completion_lead
-            };
-            self.missed += rates.due * behind_duration(lead, lead_rate, span);
-        }
-        let late_before = self.late_work();
-        *queue_area += self.queue * span + 0.5_f64 * net_rate * span * span;
-        self.queue = (self.queue + net_rate * span).max(0.0_f64);
-        self.completed += rates.service * span;
-        self.released += rates.arrival * span;
-        self.due += rates.due * span;
-        self.loss_due += rates.due * span;
-        self.update_shortfall();
-        *late_area += 0.5_f64 * (late_before + self.late_work()) * span;
-    }
-
-    fn ledger_error_bound(&self) -> f64 {
-        8.0_f64
-            * f64::EPSILON
-            * self
-                .released
-                .max(self.completed)
-                .max(self.due)
-                .max(self.initial_debt)
-                .max(1.0_f64)
-    }
-
-    fn actionable_completed(&self) -> f64 {
-        (self.completed - self.initial_debt)
-            .max(0.0_f64)
-            .min(self.released)
-    }
-
-    fn late_work(&self) -> f64 {
-        let error_bound = 8.0_f64
-            * f64::EPSILON
-            * self
-                .initial_debt
-                .max(self.completed)
-                .max(self.released)
-                .max(self.due)
-                .max(1.0_f64);
-        let late = self.loss_due - self.completed;
-        if late > error_bound { late } else { 0.0_f64 }
-    }
-
-    fn update_shortfall(&mut self) {
-        let deficit = (self.due - self.actionable_completed()).max(0.0_f64);
-        if deficit > f64::EPSILON * self.due.max(1.0_f64) {
-            self.shortfall = self.shortfall.max(deficit / self.due);
-        }
+fn positive_crossing(value: f64, rate: f64) -> f64 {
+    if value > 0.0_f64 && rate < 0.0_f64 {
+        value / -rate
+    } else {
+        f64::INFINITY
     }
 }
 
@@ -297,15 +237,28 @@ fn edf_outcome(
     shortfall: f64,
     delay_area: f64,
     late_area: f64,
+    terminal_capacity: f64,
 ) -> EdfOutcome {
+    let (terminal_late_area, drain_seconds) = terminal_closure(deadline.queue, terminal_capacity);
     EdfOutcome {
         shortfall: shortfall.max(deadline.shortfall),
         delay_area,
         missed_work: deadline.missed,
         late_area,
-        terminal_work: deadline.queue,
-        terminal_late_work: deadline.late_work(),
+        terminal_late_area,
+        drain_seconds,
     }
+}
+
+/// Returns the exact constant-rate continuation after an admissible closure.
+fn terminal_closure(queue: f64, capacity: f64) -> (f64, f64) {
+    if queue == 0.0_f64 {
+        return (0.0_f64, 0.0_f64);
+    }
+    if capacity == 0.0_f64 {
+        return (f64::INFINITY, f64::INFINITY);
+    }
+    (queue * queue / (2.0_f64 * capacity), queue / capacity)
 }
 
 impl SupplyTrajectory<'_> {
@@ -404,7 +357,6 @@ impl ArrivalPath<'_> {
             .copied()
             .map(|end| self.start_seconds + end + budget_seconds)
     }
-
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -413,8 +365,8 @@ pub(crate) struct EdfOutcome {
     pub(crate) delay_area: f64,
     pub(crate) missed_work: f64,
     pub(crate) late_area: f64,
-    pub(crate) terminal_work: f64,
-    pub(crate) terminal_late_work: f64,
+    pub(crate) terminal_late_area: f64,
+    pub(crate) drain_seconds: f64,
 }
 
 pub(crate) fn prepare(cohorts: &WorkCohorts, scratch: &mut EdfScratch) {
@@ -586,7 +538,20 @@ pub(crate) fn evaluate_prepared_step(
         now_micros,
     ));
     expire_to_debt(cohorts, scratch, now_micros, &mut shortfall);
-    edf_outcome(&deadline, shortfall, delay_area, late_area)
+    let terminal_capacity = if window.horizon_micros < supply.pause_micros {
+        supply.before
+    } else if window.horizon_micros < supply.ready_micros {
+        supply.during
+    } else {
+        supply.after
+    };
+    edf_outcome(
+        &deadline,
+        shortfall,
+        delay_area,
+        late_area,
+        terminal_capacity,
+    )
 }
 
 /// Clamps one event step to the next supply or arrival boundary.
@@ -721,7 +686,13 @@ fn evaluate_ordered_trajectory(
         now_micros,
         &mut shortfall,
     );
-    edf_outcome(&deadline, shortfall, delay_area, late_area)
+    edf_outcome(
+        &deadline,
+        shortfall,
+        delay_area,
+        late_area,
+        trajectory.capacity_at_micros(horizon_micros),
+    )
 }
 
 /// Applies release and due boundaries up to one instant.
@@ -772,7 +743,7 @@ fn ordered_expire(
     while *service_cursor < release_cursor {
         let cohort = scratch.release_order[*service_cursor] as usize;
         let remaining = scratch.remaining[cohort];
-        if remaining <= f64::EPSILON {
+        if remaining == 0.0_f64 {
             *service_cursor += 1;
             continue;
         }
@@ -798,11 +769,14 @@ fn ordered_serve(
 ) {
     while supply > 0.0_f64 && *service_cursor < release_cursor {
         let cohort = scratch.release_order[*service_cursor] as usize;
-        let served = supply.min(scratch.remaining[cohort]);
-        scratch.remaining[cohort] -= served;
-        supply -= served;
-        if scratch.remaining[cohort] <= f64::EPSILON {
+        let remaining = scratch.remaining[cohort];
+        if supply >= remaining {
+            supply -= remaining;
+            scratch.remaining[cohort] = 0.0_f64;
             *service_cursor += 1;
+        } else {
+            scratch.remaining[cohort] = remaining - supply;
+            supply = 0.0_f64;
         }
     }
 }
@@ -889,14 +863,13 @@ pub(crate) fn evaluate_general_trajectory(
         now_micros,
     ));
     expire_to_debt(cohorts, scratch, now_micros, &mut shortfall);
-    EdfOutcome {
-        shortfall: shortfall.max(deadline.shortfall),
+    edf_outcome(
+        &deadline,
+        shortfall,
         delay_area,
-        missed_work: deadline.missed,
         late_area,
-        terminal_work: deadline.queue,
-        terminal_late_work: deadline.late_work(),
-    }
+        trajectory.capacity_at_micros(horizon_micros),
+    )
 }
 
 fn evaluate_common_trajectory(
@@ -959,20 +932,23 @@ fn evaluate_common_trajectory(
         let debt_supply = supply.min(state.late_work);
         state.late_work -= debt_supply;
         supply -= debt_supply;
-        state.on_time_work = (state.on_time_work - supply).max(0.0_f64);
+        if supply >= state.on_time_work {
+            state.on_time_work = 0.0_f64;
+        } else {
+            state.on_time_work -= supply;
+        }
         now_micros = next_micros;
     }
     let (released, due) = update_common_boundaries(cohort, now_micros, &mut state);
     deadline.release(released);
     deadline.make_due(due);
-    EdfOutcome {
-        shortfall: state.shortfall.max(deadline.shortfall),
+    edf_outcome(
+        &deadline,
+        state.shortfall,
         delay_area,
-        missed_work: deadline.missed,
         late_area,
-        terminal_work: deadline.queue,
-        terminal_late_work: deadline.late_work(),
-    }
+        trajectory.capacity_at_micros(horizon_micros),
+    )
 }
 
 fn update_common_boundaries(
@@ -1003,6 +979,7 @@ fn update_common_boundaries(
     (released, due)
 }
 
+#[cfg(test)]
 pub(crate) fn required_capacity_prepared(cohorts: &WorkCohorts, scratch: &mut EdfScratch) -> f64 {
     if cohorts.is_empty() {
         return 0.0_f64;
@@ -1089,11 +1066,14 @@ fn shortfall_next_release(
 fn shortfall_serve(cohorts: &WorkCohorts, scratch: &mut EdfScratch, mut supply_slot_micros: f64) {
     while supply_slot_micros > 0.0_f64 && !scratch.heap.is_empty() {
         let cohort_index = scratch.heap[0] as usize;
-        let served = supply_slot_micros.min(scratch.remaining[cohort_index]);
-        scratch.remaining[cohort_index] -= served;
-        supply_slot_micros -= served;
-        if scratch.remaining[cohort_index] <= f64::EPSILON {
+        let remaining = scratch.remaining[cohort_index];
+        if supply_slot_micros >= remaining {
+            supply_slot_micros -= remaining;
+            scratch.remaining[cohort_index] = 0.0_f64;
             heap_pop(cohorts, &mut scratch.heap);
+        } else {
+            scratch.remaining[cohort_index] = remaining - supply_slot_micros;
+            supply_slot_micros = 0.0_f64;
         }
     }
 }
@@ -1182,27 +1162,6 @@ fn deadline_key(cohorts: &WorkCohorts, cohort_index: u32) -> (u64, u64, u32) {
     )
 }
 
-/// Returns the time inside one span with completion behind due work.
-///
-/// The lead is completion minus due work and moves linearly at `lead_rate`.
-/// Work becomes missed while the lead is negative, or while it sits at zero
-/// and falls.
-fn behind_duration(lead: f64, lead_rate: f64, span: f64) -> f64 {
-    if lead < 0.0_f64 {
-        if lead_rate > 0.0_f64 {
-            (-lead / lead_rate).min(span)
-        } else {
-            span
-        }
-    } else if lead == 0.0_f64 && lead_rate < 0.0_f64 {
-        span
-    } else if lead > 0.0_f64 && lead_rate < 0.0_f64 {
-        (span + lead / lead_rate).max(0.0_f64)
-    } else {
-        0.0_f64
-    }
-}
-
 fn seconds_to_micros(seconds: f64) -> u64 {
     (seconds * 1_000_000.0_f64) as u64
 }
@@ -1213,7 +1172,19 @@ fn seconds_to_micros_ceil(seconds: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeadlineState, behind_duration};
+    use super::{DeadlineState, terminal_closure};
+
+    #[test]
+    fn terminal_triangle_matches_closed_form_cases() {
+        // q=12 and c=3 give T=q/c=4 and V=q*T/2=24.
+        assert_eq!(terminal_closure(12.0_f64, 3.0_f64), (24.0_f64, 4.0_f64));
+        // An empty queue has zero continuation for every terminal capacity.
+        assert_eq!(terminal_closure(0.0_f64, 0.0_f64), (0.0_f64, 0.0_f64));
+        // Positive work cannot drain at zero capacity, so both terms diverge.
+        let (late_area, drain_seconds) = terminal_closure(1.0_f64, 0.0_f64);
+        assert!(late_area.is_infinite());
+        assert!(drain_seconds.is_infinite());
+    }
 
     /// The debt remainder sits between the ledger error bound and the span
     /// resolution of a large capacity. A span-epsilon loop stalls here; the
@@ -1221,10 +1192,11 @@ mod tests {
     #[test]
     fn advance_terminates_on_a_debt_sliver() {
         let mut state = DeadlineState::new(0.5_f64);
-        state.completed = 0.5_f64 - 1.0e-12_f64;
+        state.overdue = 1.0e-12_f64;
+        state.queue = state.overdue;
         let advanced = state.advance(1.0_f64, 1.0e6_f64, 0.0_f64, 0.0_f64);
 
-        assert!(state.completed >= state.initial_debt);
+        assert!(state.overdue.total_cmp(&0.0_f64).is_eq());
         assert!(advanced.queue_area >= 0.0_f64);
     }
 
@@ -1239,23 +1211,5 @@ mod tests {
 
         assert!(within_budget.late_area.total_cmp(&20.0_f64).is_eq());
         assert!(after_budget.late_area.total_cmp(&50.0_f64).is_eq());
-    }
-
-    #[test]
-    fn behind_duration_integrates_each_lead_regime() {
-        let cases = [
-            (-1.0_f64, 0.5_f64, 2.0_f64),
-            (-1.0_f64, -1.0_f64, 4.0_f64),
-            (0.0_f64, -1.0_f64, 4.0_f64),
-            (1.0_f64, -0.5_f64, 2.0_f64),
-            (1.0_f64, 1.0_f64, 0.0_f64),
-        ];
-        for (lead, lead_rate, expected) in cases {
-            let behind = behind_duration(lead, lead_rate, 4.0_f64);
-            assert!(
-                behind.total_cmp(&expected).is_eq(),
-                "lead={lead} lead_rate={lead_rate} behind={behind}"
-            );
-        }
     }
 }

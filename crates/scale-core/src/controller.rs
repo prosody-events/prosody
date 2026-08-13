@@ -8,12 +8,13 @@ use crate::arrival::ArrivalFactor;
 use crate::capacity::{CapacityFactor, CompletionPosteriorCell, ThroughputPosteriorCell};
 use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
-    evaluate_prepared_step, evaluate_prepared_trajectory, prepare, required_capacity_prepared,
+    evaluate_prepared_step, evaluate_prepared_trajectory, prepare,
 };
 use crate::lead_time::{LeadTimeFactor, sample_index};
 use crate::partition::PartitionFactor;
 use crate::planning::{
     ActionColumns, compare_actions, complete_horizon_micros, replica_seconds, select_action,
+    terminal_replica_seconds,
 };
 use crate::reliability::{RELIABILITY_BIN_COUNT, ReliabilityFactor};
 use crate::types::{
@@ -28,11 +29,8 @@ use crate::{
 use thiserror::Error;
 
 const DECISION_SCENARIO_SEED: u64 = 0x7363_616c_652d_636f;
-const DECISION_BOOTSTRAP_COUNT: u32 = 128;
-const DECISION_SAMPLE_COUNT_MIN: u32 = 1_024;
 /// Schedule visibility covers the worst launch delay, rebalance, report,
 /// objective budget, and slack. A posterior lead-time quantile can replace it.
-const SCHEDULE_VISIBILITY_MICROS: u64 = 150_000_000;
 /// Scheduled work has no known partition. Resource feasibility prices it.
 /// Partition placement excludes this sentinel before it indexes columns.
 const SCHEDULED_PARTITION: u32 = u32::MAX;
@@ -62,26 +60,6 @@ pub(crate) enum DecisionRandomDomain {
     Placement = 0x706c_6163_656d_656e,
     Commitment = 0x636f_6d6d_6974_6d65,
     Arrival = 0x6172_7269_7661_6c73,
-    Bootstrap = 0x626f_6f74_7374_7261,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum NumericalDecision {
-    Resolved { target_index: usize },
-    Unresolved { credible_index: usize },
-}
-
-impl NumericalDecision {
-    const fn target_index(self) -> usize {
-        match self {
-            Self::Resolved { target_index } => target_index,
-            Self::Unresolved { credible_index } => credible_index,
-        }
-    }
-
-    const fn is_resolved(self) -> bool {
-        matches!(self, Self::Resolved { .. })
-    }
 }
 
 /// Fixed curve classes and their capacity-cell members.
@@ -149,7 +127,6 @@ impl CapacityClasses {
     fn members(&self, class: usize) -> &[usize] {
         &self.members[self.member_offsets[class]..self.member_offsets[class + 1]]
     }
-
 }
 
 fn candidate_concurrency_ladder(configuration: &Configuration) -> Vec<f64> {
@@ -453,34 +430,21 @@ impl ScaleState {
 
 /// Reusable memory for one controller transition.
 pub struct ScaleScratch {
-    placement_edf: EdfScratch,
-    handler_cohorts: WorkCohorts,
     resource_cohorts: WorkCohorts,
-    placement_cohorts: WorkCohorts,
     partition_offsets: Vec<u32>,
     partition_write_offsets: Vec<u32>,
     partition_cohort_indexes: Vec<u32>,
-    partition_work_slot_seconds: Vec<f64>,
     moved_partition_counts: Vec<u32>,
-    active_partition_count: u32,
-    placement_interval_seconds: f64,
-    partition_shortfall: f64,
     posterior_missed_work_sums: Vec<f64>,
     posterior_loss_sums: Vec<f64>,
     posterior_late_area_sums: Vec<f64>,
     posterior_replica_seconds_sums: Vec<f64>,
     posterior_supply_sums: Vec<f64>,
-    bootstrap_late_area_sums: Vec<f64>,
-    bootstrap_replica_seconds_sums: Vec<f64>,
-    bootstrap_worse_counts: Vec<u32>,
     class_masses: Vec<f64>,
-    bootstrap_class_late_area_numerators: Vec<f64>,
-    bootstrap_class_replica_seconds_numerators: Vec<f64>,
-    bootstrap_class_denominators: Vec<f64>,
     candidate_concurrency: Vec<f64>,
     scenario_shortfall: Vec<f64>,
     scenario_late_area: Vec<f64>,
-    scenario_terminal_late_work: Vec<f64>,
+    scenario_drain_seconds: Vec<f64>,
     scenario_replica_seconds: Vec<f64>,
     scenario_rejection: Vec<u8>,
     scenario_missed_work: Vec<f64>,
@@ -492,12 +456,9 @@ pub struct ScaleScratch {
     scenario_partition_late_area: Vec<f64>,
     scenario_workspaces: Vec<ScenarioWorkspace>,
     trajectory_worker: usize,
-    deterministic_loss: Vec<f64>,
-    resource_debt_events: f64,
     active_scenario_count: usize,
     active_inner_count: usize,
     decision_curve_sample_count: u32,
-    decision_demand_floor: usize,
     decision_rate: f64,
 }
 
@@ -521,6 +482,8 @@ pub struct DecisionColumnSummary {
     pub selected: DecisionActionColumns,
     /// Columns for the next action under the same ordering.
     pub runner_up: Option<DecisionActionColumns>,
+    /// Paired standard error of the runner-up cost minus selected cost.
+    pub paired_standard_error: Option<f64>,
     /// Smallest action index that covers known demand.
     pub demand_floor: u32,
 }
@@ -578,7 +541,6 @@ struct CandidateEvaluation<'a> {
     model_time_micros: u64,
     deadline_budget_micros: u64,
     current_supply: f64,
-    resource_debt_events: f64,
     resource_cohorts: &'a WorkCohorts,
     trajectory_offsets: &'a [u32],
     trajectory_pause_seconds: &'a [f64],
@@ -596,11 +558,9 @@ struct ScenarioShared<'a> {
     partition_offsets: &'a [u32],
     partition_cohort_indexes: &'a [u32],
     partition_count: usize,
-    deterministic_loss: &'a [f64],
     candidate_concurrency: &'a [f64],
     action_count: usize,
     current_index: usize,
-    resource_debt_events: f64,
     normal_events: f64,
     failure_events: f64,
     calendar: Option<CalendarForecast<'a>>,
@@ -617,7 +577,7 @@ struct ScenarioColumns<'a> {
     supply: &'a mut [f64],
     shortfall: &'a mut [f64],
     late_area: &'a mut [f64],
-    terminal_late_work: &'a mut [f64],
+    drain_seconds: &'a mut [f64],
     missed_work: &'a mut [f64],
     replica_seconds: &'a mut [f64],
     rejection: &'a mut [u8],
@@ -633,7 +593,7 @@ struct ScenarioCells<'a> {
     supply: &'a mut [f64],
     shortfall: &'a mut [f64],
     late_area: &'a mut [f64],
-    terminal_late_work: &'a mut [f64],
+    drain_seconds: &'a mut [f64],
     missed_work: &'a mut [f64],
     replica_seconds: &'a mut [f64],
     rejection: &'a mut [u8],
@@ -652,7 +612,7 @@ impl ScenarioColumns<'_> {
         let (left_supply, right_supply) = self.supply.split_at_mut(cell);
         let (left_shortfall, right_shortfall) = self.shortfall.split_at_mut(cell);
         let (left_late_area, right_late_area) = self.late_area.split_at_mut(cell);
-        let (left_terminal, right_terminal) = self.terminal_late_work.split_at_mut(cell);
+        let (left_drain, right_drain) = self.drain_seconds.split_at_mut(cell);
         let (left_missed, right_missed) = self.missed_work.split_at_mut(cell);
         let (left_replica, right_replica) = self.replica_seconds.split_at_mut(cell);
         let (left_rejection, right_rejection) = self.rejection.split_at_mut(cell);
@@ -673,7 +633,7 @@ impl ScenarioColumns<'_> {
                 supply: left_supply,
                 shortfall: left_shortfall,
                 late_area: left_late_area,
-                terminal_late_work: left_terminal,
+                drain_seconds: left_drain,
                 missed_work: left_missed,
                 replica_seconds: left_replica,
                 rejection: left_rejection,
@@ -691,7 +651,7 @@ impl ScenarioColumns<'_> {
                 supply: right_supply,
                 shortfall: right_shortfall,
                 late_area: right_late_area,
-                terminal_late_work: right_terminal,
+                drain_seconds: right_drain,
                 missed_work: right_missed,
                 replica_seconds: right_replica,
                 rejection: right_rejection,
@@ -714,7 +674,7 @@ impl ScenarioColumns<'_> {
             supply: &mut self.supply[first..last],
             shortfall: &mut self.shortfall[first..last],
             late_area: &mut self.late_area[first..last],
-            terminal_late_work: &mut self.terminal_late_work[first..last],
+            drain_seconds: &mut self.drain_seconds[first..last],
             missed_work: &mut self.missed_work[first..last],
             replica_seconds: &mut self.replica_seconds[first..last],
             rejection: &mut self.rejection[first..last],
@@ -820,7 +780,6 @@ impl ScaleScratch {
         let bounds = ScratchBounds::new(configuration)?;
         let &ScratchBounds {
             work_cohort_count_max,
-            work_cohort_count_max_u32,
             partition_count,
             partition_offset_count,
             replica_count_max,
@@ -844,48 +803,21 @@ impl ScaleScratch {
             scenario_workspaces.push(ScenarioWorkspace::new(&bounds)?);
         }
         Ok(Self {
-            placement_edf: EdfScratch::new(work_cohort_count_max_u32)?,
-            handler_cohorts: WorkCohorts::new(work_cohort_count_max),
             resource_cohorts: WorkCohorts::new(work_cohort_count_max),
-            placement_cohorts: WorkCohorts::new(work_cohort_count_max),
             partition_offsets: vec![0; partition_offset_count],
             partition_write_offsets: vec![0; partition_count],
             partition_cohort_indexes: vec![0; work_cohort_count_max],
-            partition_work_slot_seconds: vec![0.0_f64; partition_count],
             moved_partition_counts,
-            active_partition_count: 0,
-            placement_interval_seconds: 0.0_f64,
-            partition_shortfall: 0.0_f64,
             posterior_missed_work_sums: vec![0.0_f64; replica_count_max],
             posterior_loss_sums: vec![0.0_f64; replica_count_max],
             posterior_late_area_sums: vec![0.0_f64; replica_count_max],
             posterior_replica_seconds_sums: vec![0.0_f64; replica_count_max],
             posterior_supply_sums: vec![0.0_f64; replica_count_max],
-            bootstrap_late_area_sums: vec![0.0_f64; replica_count_max],
-            bootstrap_replica_seconds_sums: vec![0.0_f64; replica_count_max],
-            bootstrap_worse_counts: vec![0; replica_count_max],
             class_masses: vec![0.0_f64; capacity_class_count],
-            bootstrap_class_late_area_numerators: vec![
-                0.0_f64;
-                capacity_class_count
-                    .checked_mul(replica_count_max)
-                    .ok_or(
-                        ConfigurationError::PlatformLimit
-                    )?
-            ],
-            bootstrap_class_replica_seconds_numerators: vec![
-                0.0_f64;
-                capacity_class_count
-                    .checked_mul(replica_count_max)
-                    .ok_or(
-                        ConfigurationError::PlatformLimit
-                    )?
-            ],
-            bootstrap_class_denominators: vec![0.0_f64; capacity_class_count],
             candidate_concurrency,
             scenario_shortfall: vec![0.0_f64; scenario_cell_count],
             scenario_late_area: vec![0.0_f64; scenario_cell_count],
-            scenario_terminal_late_work: vec![0.0_f64; scenario_cell_count],
+            scenario_drain_seconds: vec![0.0_f64; scenario_cell_count],
             scenario_replica_seconds: vec![0.0_f64; scenario_cell_count],
             scenario_rejection: vec![0; scenario_cell_count],
             scenario_missed_work: vec![0.0_f64; scenario_cell_count],
@@ -897,12 +829,9 @@ impl ScaleScratch {
             scenario_partition_late_area: vec![0.0_f64; posterior_sample_count],
             scenario_workspaces,
             trajectory_worker: 0,
-            deterministic_loss: vec![0.0_f64; replica_count_max],
-            resource_debt_events: 0.0_f64,
             active_scenario_count: posterior_sample_count,
             active_inner_count: 0,
             decision_curve_sample_count: 0,
-            decision_demand_floor: 0,
             decision_rate: 0.0_f64,
         })
     }
@@ -924,17 +853,53 @@ impl ScaleScratch {
             late_area_sums: &self.posterior_late_area_sums[..action_count],
             replica_seconds_sums: &self.posterior_replica_seconds_sums[..action_count],
             rate: self.decision_rate,
-            demand_floor: self.decision_demand_floor,
         };
-        let runner_up = (self.decision_demand_floor..action_count)
+        let runner_up_index = (0..action_count)
             .filter(|index| *index != selected)
-            .min_by(|left, right| compare_actions(*left, *right, &columns))
-            .map(|index| self.action_columns(index, columns.rate));
+            .min_by(|left, right| compare_actions(*left, *right, &columns));
         Some(DecisionColumnSummary {
             selected: self.action_columns(selected, columns.rate),
-            runner_up,
-            demand_floor: u32::try_from(self.decision_demand_floor).map_or(u32::MAX, |value| value),
+            runner_up: runner_up_index.map(|index| self.action_columns(index, columns.rate)),
+            paired_standard_error: runner_up_index
+                .map(|runner_up| self.paired_standard_error(selected, runner_up, columns.rate)),
+            demand_floor: 0,
         })
+    }
+
+    fn paired_standard_error(&self, selected: usize, runner_up: usize, rate: f64) -> f64 {
+        if self.active_inner_count < 2 {
+            return f64::NAN;
+        }
+        let stride = self.posterior_loss_sums.len();
+        let count = u32::try_from(self.active_inner_count).map_or(f64::INFINITY, f64::from);
+        let mut variance = 0.0_f64;
+        for class in 0..self.class_masses.len() {
+            let first = class * self.active_inner_count;
+            let mean = (first..first + self.active_inner_count)
+                .map(|scenario| {
+                    let cell = scenario * stride;
+                    self.scenario_late_area[cell + runner_up]
+                        - self.scenario_late_area[cell + selected]
+                        + rate
+                            * (self.scenario_replica_seconds[cell + runner_up]
+                                - self.scenario_replica_seconds[cell + selected])
+                })
+                .sum::<f64>()
+                / count;
+            let sum = (first..first + self.active_inner_count)
+                .map(|scenario| {
+                    let cell = scenario * stride;
+                    let difference = self.scenario_late_area[cell + runner_up]
+                        - self.scenario_late_area[cell + selected]
+                        + rate
+                            * (self.scenario_replica_seconds[cell + runner_up]
+                                - self.scenario_replica_seconds[cell + selected]);
+                    (difference - mean).powi(2)
+                })
+                .sum::<f64>();
+            variance += self.class_masses[class].powi(2) * sum / (count * (count - 1.0_f64));
+        }
+        variance.sqrt()
     }
 
     fn action_columns(&self, index: usize, rate: f64) -> DecisionActionColumns {
@@ -1135,31 +1100,12 @@ fn select_target(
     let (normal_events, failure_events) = demand_class_totals(cohorts, backlog);
     prepare_work_cohorts(state, scratch, cohorts, backlog, scheduled_releases);
     prepare_partition_work(state, scratch);
-    if scratch.active_partition_count == 0
-        && (state.arrivals.expected_rate(state.model_time.as_micros()) > f64::EPSILON
-            || has_visible_scheduled_release(state, scheduled_releases))
-    {
-        scratch.active_partition_count = state.configuration.partition_count;
-    }
     prepare_candidate_concurrency(state, scratch);
     scratch.posterior_missed_work_sums.fill(0.0_f64);
     scratch.posterior_loss_sums.fill(0.0_f64);
-    for candidate_index in 0..scratch.deterministic_loss.len() {
-        let candidate = candidate_index as u32 + 1;
-        scratch.deterministic_loss[candidate_index] =
-            placement_shortfall(state, scratch, candidate);
-    }
-    let scenario_count_max = state.configuration.posterior_sample_count;
+    let scenario_count = state.configuration.posterior_sample_count;
     let class_count = state.capacity_classes.len() as u32;
-    let pilot_budget = scenario_count_max.min(DECISION_SAMPLE_COUNT_MIN);
-    let pilot_inner_count = pilot_budget / class_count;
-    let full_inner_count = scenario_count_max / class_count;
-    let inner_count =
-        if class_count > DECISION_SAMPLE_COUNT_MIN / 2 || full_inner_count <= pilot_inner_count {
-            full_inner_count
-        } else {
-            pilot_inner_count
-        };
+    let inner_count = scenario_count / class_count;
     evaluate_scenarios(
         state,
         scratch,
@@ -1169,21 +1115,8 @@ fn select_target(
         actuation_commitments,
         inner_count,
     );
-    let pilot_decision = numerical_decision(state, scratch);
-    if inner_count < full_inner_count && !pilot_decision.is_resolved() {
-        evaluate_scenarios(
-            state,
-            scratch,
-            normal_events,
-            failure_events,
-            calendar,
-            actuation_commitments,
-            full_inner_count,
-        );
-        let target_index = numerical_decision(state, scratch).target_index();
-        return finish_decision(state, scratch, target_index);
-    }
-    finish_decision(state, scratch, pilot_decision.target_index())
+    let target_index = numerical_decision(state, scratch);
+    finish_decision(state, scratch, target_index)
 }
 
 /// Evaluates every posterior scenario, scenarios fanned across workers.
@@ -1233,8 +1166,7 @@ fn evaluate_scenarios(
         supply: &mut scratch.scenario_supply[..scenario_total * candidate_stride],
         shortfall: &mut scratch.scenario_shortfall[..scenario_total * candidate_stride],
         late_area: &mut scratch.scenario_late_area[..scenario_total * candidate_stride],
-        terminal_late_work: &mut scratch.scenario_terminal_late_work
-            [..scenario_total * candidate_stride],
+        drain_seconds: &mut scratch.scenario_drain_seconds[..scenario_total * candidate_stride],
         missed_work: &mut scratch.scenario_missed_work[..scenario_total * candidate_stride],
         replica_seconds: &mut scratch.scenario_replica_seconds[..scenario_total * candidate_stride],
         rejection: &mut scratch.scenario_rejection[..scenario_total * candidate_stride],
@@ -1252,11 +1184,9 @@ fn evaluate_scenarios(
         partition_offsets: &scratch.partition_offsets,
         partition_cohort_indexes: &scratch.partition_cohort_indexes,
         partition_count: scratch.partition_write_offsets.len(),
-        deterministic_loss: &scratch.deterministic_loss,
         candidate_concurrency: &scratch.candidate_concurrency,
         action_count,
         current_index: state.current_replicas as usize - 1,
-        resource_debt_events: scratch.resource_debt_events,
         normal_events,
         failure_events,
         calendar,
@@ -1442,7 +1372,6 @@ fn evaluate_scenario_outcome(
             model_time_micros: state.model_time.as_micros(),
             deadline_budget_micros: state.configuration.objective.budget_micros(),
             current_supply: forecast.current_supply,
-            resource_debt_events: shared.resource_debt_events,
             resource_cohorts: shared.resource_cohorts,
             trajectory_offsets: &workspace.trajectory_offsets,
             trajectory_pause_seconds: &workspace.trajectory.pause_seconds,
@@ -1454,7 +1383,7 @@ fn evaluate_scenario_outcome(
         },
         &mut workspace.edf,
         &mut cells.shortfall[..shared.action_count],
-        &mut cells.terminal_late_work[..shared.action_count],
+        &mut cells.drain_seconds[..shared.action_count],
         &mut cells.missed_work[..shared.action_count],
     );
     normalize_scenario_outcomes(state, shared, &mut cells);
@@ -1466,7 +1395,15 @@ fn evaluate_scenario_outcome(
             planning_horizon_seconds,
             state.current_replicas,
             &workspace.trajectory.targets[first..last],
-            &workspace.trajectory.pause_seconds[first..last],
+            &workspace.trajectory.ready_seconds[first..last],
+        ) + terminal_replica_seconds(
+            forecast.planning_horizon_micros,
+            cells.drain_seconds[candidate_index],
+            state.configuration.report_interval_micros,
+            workspace.trajectory.targets[first..last]
+                .last()
+                .copied()
+                .unwrap_or(state.current_replicas),
         );
     }
 }
@@ -1592,194 +1529,19 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
     }
 }
 
-/// Returns the minimum-cost action in the bootstrap credible set.
+/// Selects the paired-sample minimum expected cost.
 ///
-/// The credible set excludes an action only when at least the configured SLO
-/// confidence of paired bootstrap posteriors ranks it below the nominal
-/// optimum. A singleton set makes the numerical integral resolved. Multiple
-/// actions use the transition cost to decide if the standing target remains
-/// preferable to the nominal minimum.
-fn numerical_decision(state: &ScaleState, scratch: &mut ScaleScratch) -> NumericalDecision {
-    dispatch!(state.simd_level, simd => numerical_decision_simd(
-        simd,
-        state,
-        scratch,
-    ))
-}
-
-fn numerical_decision_simd<S: Simd>(
-    simd: S,
-    state: &ScaleState,
-    scratch: &mut ScaleScratch,
-) -> NumericalDecision {
+/// All actions use the same configured posterior scenarios. A smaller target
+/// wins only when represented means are exactly equal.
+fn numerical_decision(state: &ScaleState, scratch: &mut ScaleScratch) -> usize {
     let candidate_count = decision_action_count(scratch);
-    let candidate_stride = scratch.posterior_loss_sums.len();
-    let bootstrap_tail_probability = state.configuration.objective.epsilon();
     let rate = state.configuration.objective.replica_second_delay_rate();
-    let demand_floor = demand_floor(state, scratch, candidate_count);
-    scratch.decision_demand_floor = demand_floor;
     scratch.decision_rate = rate;
-    let nominal_target = select_action(&ActionColumns {
+    select_action(&ActionColumns {
         late_area_sums: &scratch.posterior_late_area_sums[..candidate_count],
         replica_seconds_sums: &scratch.posterior_replica_seconds_sums[..candidate_count],
         rate,
-        demand_floor,
-    });
-    let incumbent = usize::try_from(state.standing_target)
-        .ok()
-        .and_then(|target| target.checked_sub(1))
-        .filter(|index| *index < candidate_count);
-    let transition_cost_sum = incumbent.map_or(0.0_f64, |incumbent| {
-        transition_cost(state, incumbent, nominal_target)
-    });
-    scratch.bootstrap_worse_counts.fill(0);
-    for bootstrap in 0..DECISION_BOOTSTRAP_COUNT {
-        accumulate_bootstrap_draw(simd, scratch, bootstrap, candidate_count, candidate_stride);
-        let columns = ActionColumns {
-            late_area_sums: &scratch.bootstrap_late_area_sums[..candidate_count],
-            replica_seconds_sums: &scratch.bootstrap_replica_seconds_sums[..candidate_count],
-            rate,
-            demand_floor,
-        };
-        for target in 0..candidate_count {
-            if compare_actions(nominal_target, target, &columns).is_lt() {
-                scratch.bootstrap_worse_counts[target] += 1;
-            }
-        }
-    }
-    let columns = ActionColumns {
-        late_area_sums: &scratch.posterior_late_area_sums[..candidate_count],
-        replica_seconds_sums: &scratch.posterior_replica_seconds_sums[..candidate_count],
-        rate,
-        demand_floor,
-    };
-    classify_paired_bootstrap(
-        &scratch.bootstrap_worse_counts[..candidate_count],
-        DECISION_BOOTSTRAP_COUNT,
-        &columns,
-        nominal_target,
-        incumbent,
-        transition_cost_sum,
-        bootstrap_tail_probability,
-    )
-}
-
-/// Accumulates one exponentially weighted bootstrap resample.
-///
-/// Fills the bootstrap column sums from the per-scenario cells.
-fn accumulate_bootstrap_draw<S: Simd>(
-    _simd: S,
-    scratch: &mut ScaleScratch,
-    bootstrap: u32,
-    candidate_count: usize,
-    candidate_stride: usize,
-) {
-    scratch.bootstrap_late_area_sums.fill(0.0_f64);
-    scratch.bootstrap_replica_seconds_sums.fill(0.0_f64);
-    scratch.bootstrap_class_late_area_numerators.fill(0.0_f64);
-    scratch
-        .bootstrap_class_replica_seconds_numerators
-        .fill(0.0_f64);
-    scratch.bootstrap_class_denominators.fill(0.0_f64);
-    for scenario in 0..scratch.active_scenario_count {
-        let capacity_class = scenario / scratch.active_inner_count;
-        let mut random = decision_random(scenario as u32, DecisionRandomDomain::Bootstrap)
-            .domain(u64::from(bootstrap));
-        let weight = -random.open_unit_f64().ln();
-        let first = scenario * candidate_stride;
-        let class_first = capacity_class * candidate_stride;
-        scratch.bootstrap_class_denominators[capacity_class] += weight;
-        for target in 0..candidate_count {
-            scratch.bootstrap_class_late_area_numerators[class_first + target] +=
-                weight * scratch.scenario_late_area[first + target];
-            scratch.bootstrap_class_replica_seconds_numerators[class_first + target] +=
-                weight * scratch.scenario_replica_seconds[first + target];
-        }
-    }
-    for capacity_class in 0..scratch.class_masses.len() {
-        let mass = scratch.class_masses[capacity_class];
-        let denominator = scratch.bootstrap_class_denominators[capacity_class];
-        let first = capacity_class * candidate_stride;
-        for target in 0..candidate_count {
-            scratch.bootstrap_late_area_sums[target] +=
-                mass * scratch.bootstrap_class_late_area_numerators[first + target] / denominator;
-            scratch.bootstrap_replica_seconds_sums[target] += mass
-                * scratch.bootstrap_class_replica_seconds_numerators[first + target]
-                / denominator;
-        }
-    }
-}
-
-/// Returns the capacity-time that one target change destroys.
-fn transition_cost(state: &ScaleState, from: usize, to: usize) -> f64 {
-    if from == to {
-        return 0.0_f64;
-    }
-    let direction = if to > from {
-        TransitionDirection::Up
-    } else {
-        TransitionDirection::Down
-    };
-    let delta = u32::try_from(from.abs_diff(to)).map_or(u32::MAX, |value| value);
-    state.rebalance_time.expected_seconds(direction, delta) * f64::from(state.current_replicas)
-}
-
-/// Returns the smallest action index with posterior mean supply that covers the live rate.
-///
-/// The floor promises live-rate feasibility under the posterior mean supply.
-/// The priced action curve owns all scheduled work and never forces its target.
-/// The supply column is non-decreasing. When no action covers the live rate,
-/// the largest action is the floor.
-fn demand_floor(
-    state: &ScaleState,
-    scratch: &ScaleScratch,
-    candidate_count: usize,
-) -> usize {
-    let expected_rate = state.arrivals.expected_rate(state.model_time.as_micros());
-    scratch.posterior_supply_sums[..candidate_count]
-        .partition_point(|supply| *supply < expected_rate)
-        .min(candidate_count.saturating_sub(1))
-}
-
-/// Classifies the bootstrap credible set into one numerical decision.
-///
-/// The credible set holds every action the paired bootstrap cannot rank
-/// below the nominal optimum at the SLO confidence. A credible incumbent holds
-/// when its point cost gap does not exceed the priced transition cost.
-/// The transition cost uses the same replica-second price as the action cost.
-pub(crate) fn classify_paired_bootstrap(
-    worse_counts: &[u32],
-    bootstrap_count: u32,
-    columns: &ActionColumns<'_>,
-    nominal_target: usize,
-    incumbent: Option<usize>,
-    transition_cost_sum: f64,
-    bootstrap_tail_probability: f64,
-) -> NumericalDecision {
-    let credible = |target: usize| {
-        target >= columns.demand_floor
-            && f64::from(worse_counts[target]) / f64::from(bootstrap_count)
-                < 1.0_f64 - bootstrap_tail_probability
-    };
-    let unresolved = (0..worse_counts.len())
-        .filter(|&target| credible(target))
-        .take(2)
-        .count()
-        > 1;
-    if unresolved {
-        let standing = incumbent.filter(|&index| {
-            credible(index)
-                && columns.cost(index) - columns.cost(nominal_target)
-                    <= columns.rate * transition_cost_sum
-        });
-        NumericalDecision::Unresolved {
-            credible_index: standing.map_or(nominal_target, |index| index),
-        }
-    } else {
-        NumericalDecision::Resolved {
-            target_index: nominal_target,
-        }
-    }
+    })
 }
 
 fn scheduled_event_count(cohorts: &WorkCohorts, horizon_micros: u64) -> f64 {
@@ -1822,7 +1584,6 @@ fn normalize_scenario_outcomes(
         Duration::from_micros(state.configuration.objective.budget_micros()).as_secs_f64();
     // Retry demand remains message-evidence-only. This is conservative for
     // future scheduled work, whose outcomes do not exist yet.
-    let located_events = shared.normal_events + shared.failure_events;
     for candidate in 0..shared.action_count {
         let late_area = cells.shortfall[candidate];
         let denominator = *cells.event_count * budget_seconds;
@@ -1832,15 +1593,14 @@ fn normalize_scenario_outcomes(
         } else {
             0.0_f64
         };
-        let missed_work = cells.missed_work[candidate].max(*cells.partition_missed_work)
-            + shared.deterministic_loss[candidate] * located_events;
+        let missed_work = cells.missed_work[candidate].max(*cells.partition_missed_work);
         cells.missed_work[candidate] = missed_work;
         let mut rejection = 0_u8;
         let miss_fraction = missed_work / cells.event_count.max(f64::MIN_POSITIVE);
         if miss_fraction > state.configuration.objective.epsilon() {
             rejection |= DecisionRejection::Deadline.bit();
         }
-        if shared.deterministic_loss[candidate] > f64::EPSILON {
+        if *cells.partition_missed_work > f64::EPSILON {
             rejection |= DecisionRejection::PartitionPlacement.bit();
         }
         cells.rejection[candidate] = rejection;
@@ -1851,7 +1611,7 @@ fn evaluate_candidates(
     shared: &CandidateEvaluation<'_>,
     edf: &mut EdfScratch,
     shortfall: &mut [f64],
-    terminal_late_work: &mut [f64],
+    drain_seconds: &mut [f64],
     missed_work: &mut [f64],
 ) {
     for candidate in 0..shortfall.len() {
@@ -1869,14 +1629,14 @@ fn evaluate_candidates(
             EvaluationWindow {
                 start_micros: shared.model_time_micros,
                 horizon_micros: shared.horizon_micros,
-                initial_debt_work: shared.resource_debt_events,
+                initial_debt_work: 0.0_f64,
                 deadline_budget_micros: shared.deadline_budget_micros,
             },
             &shared.arrival_path,
             edf,
         );
-        shortfall[candidate] = outcome.late_area;
-        terminal_late_work[candidate] = outcome.terminal_late_work;
+        shortfall[candidate] = outcome.late_area + outcome.terminal_late_area;
+        drain_seconds[candidate] = outcome.drain_seconds;
         missed_work[candidate] = outcome.missed_work;
     }
 }
@@ -1887,20 +1647,17 @@ fn finish_decision(
     target_index: usize,
 ) -> ScaleDecision {
     let target = target_index as u32 + 1;
-    let cap = state.capacity.cap(
-        state.configuration.slots_per_replica,
-        state.configuration.replica_count_max,
-        state.configuration.objective.epsilon(),
-    );
-    let target = target.min(cap);
-    let selected = target as usize - 1;
+    let selected = target_index;
     let expected_loss = scratch.posterior_loss_sums[selected];
     let saturation_probability = state
         .capacity
         .saturation_probability(state.simd_level, scratch.candidate_concurrency[selected]);
     ScaleDecision::Apply(ApplyDecision {
         target,
-        cap,
+        cap: state
+            .configuration
+            .replica_count_max
+            .min(state.configuration.partition_count),
         diagnostics: diagnostics(
             state,
             expected_loss,
@@ -1994,13 +1751,14 @@ fn prepare_supply_trajectories(
             };
             let sample = sample_index(direction, target.abs_diff(replicas));
             let ready_override = workspace.trajectory.ready_overrides[read];
-            let ready = if ready_override.is_finite() {
+            let sampled_ready = if ready_override.is_finite() {
                 ready_override.max(pause)
             } else {
                 pause + rebalance_seconds[sample]
             };
             let moved = shared.moved_partition_counts
                 [(replicas as usize - 1) * candidate_count + target as usize - 1];
+            let ready = membership_ready(direction, moved, pause, sampled_ready);
             let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
             workspace.trajectory.targets[write] = target;
             workspace.trajectory.pause_seconds[write] = pause;
@@ -2033,6 +1791,19 @@ fn prepare_supply_trajectories(
         );
         workspace.trajectory_offsets[candidate_index + 1] =
             workspace.trajectory.targets.len() as u32;
+    }
+}
+
+const fn membership_ready(
+    direction: TransitionDirection,
+    moved: u32,
+    pause: f64,
+    sampled_ready: f64,
+) -> f64 {
+    if matches!(direction, TransitionDirection::Down) && moved == 0 {
+        pause
+    } else {
+        sampled_ready
     }
 }
 
@@ -2114,14 +1885,11 @@ fn push_candidate_events(
 
 /// Appends the reactive corrections one deterministic successor makes.
 ///
-/// The controller replans from real evidence at every report. When a
-/// scenario's arrival rate exceeds the standing supply, the successor
-/// requests the smallest sufficient target at the next report boundary
-/// and receives it after the sampled transition time. Standing capacity
-/// therefore keeps its full value, while deferral pays one detection and
-/// one transition of exposure plus the repair's replica-seconds. The
-/// policy reads only the scenario's realized past, so it exposes no
-/// future outcome to action selection.
+/// The successor requests the smallest target that covers the realized rate.
+///
+/// This rule is an optimistic approximation. It observes the sampled plant
+/// truth, but the real controller observes a posterior. The approximation can
+/// underprice low and high initial targets. Paired reports measure this bias.
 fn append_reactive_repairs(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
@@ -2143,9 +1911,6 @@ fn append_reactive_repairs(
         let end_seconds = now_seconds + segment_end;
         segment_start = segment_end;
         let rate = draws.arrival_path_rates[segment];
-        if rate <= supply {
-            continue;
-        }
         // One transition runs at a time: the successor acts once the
         // active transition completes and the report shows the shortage.
         let observed = begin_seconds.max(ready);
@@ -2157,14 +1922,23 @@ fn append_reactive_repairs(
             .max(1.0_f64);
         let requested = now_seconds + intervals * report_seconds;
         let target = repair_target(&workspace.posterior_resource_supply[..action_count], rate);
-        if target <= replicas {
+        if target == replicas {
             continue;
         }
-        let sample = sample_index(TransitionDirection::Up, target - replicas);
+        let direction = if target > replicas {
+            TransitionDirection::Up
+        } else {
+            TransitionDirection::Down
+        };
+        let sample = sample_index(direction, target.abs_diff(replicas));
         let pause = requested.max(ready) + draws.lead_seconds[sample];
-        let repair_ready = pause + draws.rebalance_seconds[sample];
         let moved = shared.moved_partition_counts
             [(replicas as usize - 1) * candidate_count + target as usize - 1];
+        let repair_ready = if direction == TransitionDirection::Down && moved == 0 {
+            pause
+        } else {
+            pause + draws.rebalance_seconds[sample]
+        };
         let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
         let after = workspace.posterior_resource_supply[target as usize - 1];
         workspace.trajectory.targets.push(target);
@@ -2342,21 +2116,12 @@ fn prepare_work_cohorts(
     backlog: &BacklogColumns,
     scheduled_releases: &[ScheduledRelease],
 ) {
-    let handler_seconds = state.capacity.expected_service_time(state.simd_level);
-    scratch.handler_cohorts.clear();
     scratch.resource_cohorts.clear();
-    scratch.resource_debt_events = 0.0_f64;
     for cohort in 0..cohorts.len() {
         let release_micros = cohorts.release_micros(cohort);
         let deadline_micros = cohorts.deadline_micros(cohort);
         let offered_events = cohorts.offered_events(cohort);
         let partition = cohorts.partition(cohort);
-        scratch.handler_cohorts.push_values(
-            release_micros,
-            deadline_micros,
-            offered_events * handler_seconds,
-            partition,
-        );
         scratch.resource_cohorts.push_values(
             release_micros,
             deadline_micros,
@@ -2376,21 +2141,7 @@ fn prepare_work_cohorts(
             .oldest_arrival_micros(backlog_index)
             .saturating_add(state.configuration.objective.budget_micros());
         let offered_events = f64::from(backlog.event_count(backlog_index));
-        if deadline_micros.saturating_add(state.configuration.objective.budget_micros())
-            <= release_micros
-        {
-            scratch.resource_debt_events += offered_events;
-            continue;
-        }
         let partition = backlog_index as u32 / DemandClass::COUNT;
-        if deadline_micros > release_micros {
-            scratch.handler_cohorts.push_values(
-                release_micros,
-                deadline_micros,
-                offered_events * handler_seconds,
-                partition,
-            );
-        }
         scratch.resource_cohorts.push_values(
             release_micros,
             deadline_micros,
@@ -2398,21 +2149,14 @@ fn prepare_work_cohorts(
             partition,
         );
     }
-    let visibility_end = schedule_visibility_end(state);
-    for release in scheduled_releases.iter().filter(|release| {
-        release.release_micros > state.model_time.as_micros()
-            && release.release_micros <= visibility_end
-    }) {
+    for release in scheduled_releases
+        .iter()
+        .filter(|release| release.release_micros > state.model_time.as_micros())
+    {
         let deadline_micros = release
             .release_micros
             .saturating_add(state.configuration.objective.budget_micros());
         let offered_events = f64::from(release.count);
-        scratch.handler_cohorts.push_values(
-            release.release_micros,
-            deadline_micros,
-            offered_events * handler_seconds,
-            SCHEDULED_PARTITION,
-        );
         scratch.resource_cohorts.push_values(
             release.release_micros,
             deadline_micros,
@@ -2422,46 +2166,16 @@ fn prepare_work_cohorts(
     }
 }
 
-const fn schedule_visibility_end(state: &ScaleState) -> u64 {
-    state
-        .model_time
-        .as_micros()
-        .saturating_add(SCHEDULE_VISIBILITY_MICROS)
-}
-
-fn has_visible_scheduled_release(
-    state: &ScaleState,
-    scheduled_releases: &[ScheduledRelease],
-) -> bool {
-    let model_time = state.model_time.as_micros();
-    let visibility_end = schedule_visibility_end(state);
-    scheduled_releases.iter().any(|release| {
-        release.release_micros > model_time && release.release_micros <= visibility_end
-    })
-}
-
-fn prepare_partition_work(state: &ScaleState, scratch: &mut ScaleScratch) {
-    let cohorts = &scratch.handler_cohorts;
-    scratch.partition_work_slot_seconds.fill(0.0_f64);
-    scratch.active_partition_count = 0;
+fn prepare_partition_work(_state: &ScaleState, scratch: &mut ScaleScratch) {
+    let cohorts = &scratch.resource_cohorts;
     scratch.partition_offsets.fill(0);
-    let mut release_min = u64::MAX;
-    let mut deadline_max = 0_u64;
     for cohort in 0..cohorts.len() {
         if cohorts.partition(cohort) == SCHEDULED_PARTITION {
             continue;
         }
         let partition = cohorts.partition(cohort) as usize;
-        scratch.partition_work_slot_seconds[partition] += cohorts.work_slot_seconds(cohort);
         scratch.partition_offsets[partition + 1] += 1;
-        release_min = release_min.min(cohorts.release_micros(cohort));
-        deadline_max = deadline_max.max(cohorts.deadline_micros(cohort));
     }
-    scratch.active_partition_count = scratch
-        .partition_work_slot_seconds
-        .iter()
-        .filter(|&&work| work > f64::EPSILON)
-        .fold(0_u32, |count, _work| count.saturating_add(1));
     for partition in 0..scratch.partition_write_offsets.len() {
         scratch.partition_offsets[partition + 1] += scratch.partition_offsets[partition];
         scratch.partition_write_offsets[partition] = scratch.partition_offsets[partition];
@@ -2475,38 +2189,6 @@ fn prepare_partition_work(state: &ScaleState, scratch: &mut ScaleScratch) {
         scratch.partition_cohort_indexes[write_offset] = cohort_index as u32;
         scratch.partition_write_offsets[partition] += 1;
     }
-    scratch.partition_shortfall = 0.0_f64;
-    for partition in 0..scratch.partition_write_offsets.len() {
-        let start = scratch.partition_offsets[partition] as usize;
-        let end = scratch.partition_offsets[partition + 1] as usize;
-        if start == end {
-            continue;
-        }
-        scratch.placement_cohorts.clear();
-        for &cohort_index in &scratch.partition_cohort_indexes[start..end] {
-            let cohort = cohort_index as usize;
-            scratch.placement_cohorts.push_values(
-                cohorts.release_micros(cohort),
-                cohorts.deadline_micros(cohort),
-                cohorts.work_slot_seconds(cohort),
-                cohorts.partition(cohort),
-            );
-        }
-        prepare(&scratch.placement_cohorts, &mut scratch.placement_edf);
-        let required =
-            required_capacity_prepared(&scratch.placement_cohorts, &mut scratch.placement_edf);
-        let shortfall =
-            fractional_shortfall(required, f64::from(state.configuration.slots_per_replica));
-        scratch.partition_shortfall = scratch.partition_shortfall.max(shortfall);
-    }
-    scratch
-        .partition_work_slot_seconds
-        .sort_unstable_by(|left, right| right.total_cmp(left));
-    scratch.placement_interval_seconds = if cohorts.is_empty() {
-        0.0_f64
-    } else {
-        Duration::from_micros(deadline_max.saturating_sub(release_min)).as_secs_f64()
-    };
 }
 
 fn partition_deadline_outcome(
@@ -2575,21 +2257,21 @@ fn partition_deadline_outcome(
 fn prepare_candidate_concurrency(state: &ScaleState, scratch: &mut ScaleScratch) {
     for (candidate_index, concurrency) in scratch.candidate_concurrency.iter_mut().enumerate() {
         let candidate = candidate_index as u32 + 1;
-        let active_replicas = candidate.min(scratch.active_partition_count);
+        let active_replicas = candidate.min(state.configuration.partition_count);
         *concurrency =
             f64::from(active_replicas.saturating_mul(state.configuration.slots_per_replica));
     }
 }
 
-/// Returns the replica actions that can own demanded partitions.
+/// Returns the complete physical action domain.
 ///
-/// Located work defines partition support. Aggregate future demand without a
-/// location activates all configured partitions before this function runs.
+/// Kafka assigns one partition to at most one consumer. A larger target adds
+/// no service. Prior construction must reject material endpoint mass.
 fn decision_action_count(scratch: &ScaleScratch) -> usize {
-    usize::try_from(scratch.active_partition_count.max(1))
-        .map_or(scratch.posterior_loss_sums.len(), |count| {
-            count.min(scratch.posterior_loss_sums.len())
-        })
+    scratch
+        .partition_write_offsets
+        .len()
+        .min(scratch.posterior_loss_sums.len())
 }
 
 fn demand_class_totals(cohorts: &CohortColumns, backlog: &BacklogColumns) -> (f64, f64) {
@@ -2645,31 +2327,6 @@ pub(crate) fn mixed_event_supply(
         return aggregate;
     }
     aggregate.min(attempt_supply * failure_service_weight * events / failure_demand)
-}
-
-fn fractional_shortfall(demand: f64, supply: f64) -> f64 {
-    if demand <= f64::EPSILON || supply >= demand {
-        0.0_f64
-    } else {
-        (demand - supply) / demand
-    }
-}
-
-fn placement_shortfall(state: &ScaleState, scratch: &ScaleScratch, candidate: u32) -> f64 {
-    if scratch.placement_interval_seconds <= 0.0_f64 {
-        return scratch.partition_shortfall;
-    }
-    let partitions_on_one_replica = state.configuration.partition_count.div_ceil(candidate);
-    let work = scratch.partition_work_slot_seconds[..partitions_on_one_replica as usize]
-        .iter()
-        .sum::<f64>();
-    let capacity =
-        f64::from(state.configuration.slots_per_replica) * scratch.placement_interval_seconds;
-    if work <= capacity || work <= f64::EPSILON {
-        scratch.partition_shortfall
-    } else {
-        scratch.partition_shortfall.max((work - capacity) / work)
-    }
 }
 
 fn hold(state: &ScaleState, reason: HoldReason, shortfall: f64) -> ScaleDecision {

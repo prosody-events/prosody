@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::time::Duration;
 
 /// Returns one common horizon for all actions in a posterior scenario.
 ///
@@ -23,16 +24,6 @@ pub(crate) struct ActionColumns<'a> {
     pub(crate) late_area_sums: &'a [f64],
     pub(crate) replica_seconds_sums: &'a [f64],
     pub(crate) rate: f64,
-    /// Smallest action index whose supply covers known demand.
-    ///
-    /// The scenario evaluation grants every action the reactive repairs a
-    /// successor controller makes. That successor is this controller, so an
-    /// action the repair policy would override is not a fixed point of the
-    /// policy. This applies to the current rate. It also applies to each known
-    /// release after its required transition must start. Posterior arrivals and
-    /// hypothetical calendar work cannot raise this index. Actions below this
-    /// index are never feasible.
-    pub(crate) demand_floor: usize,
 }
 
 impl ActionColumns<'_> {
@@ -43,10 +34,9 @@ impl ActionColumns<'_> {
 
 /// Selects one action from columnar posterior values.
 ///
-/// Expected cost orders actions at or above [`ActionColumns::demand_floor`].
-/// Target order resolves exact ties.
+/// Expected cost orders all actions. Target order resolves exact ties.
 pub(crate) fn select_action(columns: &ActionColumns<'_>) -> usize {
-    (columns.demand_floor..columns.late_area_sums.len())
+    (0..columns.late_area_sums.len())
         .min_by(|left, right| compare_actions(*left, *right, columns))
         .map_or(0, |index| index)
 }
@@ -91,6 +81,23 @@ pub(crate) fn replica_seconds(
         replicas = target;
     }
     area + f64::from(replicas) * (end_seconds - cursor).max(0.0_f64)
+}
+
+/// Prices terminal membership until the successor can first descend.
+pub(crate) fn terminal_replica_seconds(
+    horizon_micros: u64,
+    drain_seconds: f64,
+    report_interval_micros: u64,
+    replicas: u32,
+) -> f64 {
+    if drain_seconds == 0.0_f64 || drain_seconds.is_infinite() {
+        return drain_seconds;
+    }
+    let horizon_seconds = Duration::from_micros(horizon_micros).as_secs_f64();
+    let report_seconds = Duration::from_micros(report_interval_micros).as_secs_f64();
+    let drain_at = horizon_seconds + drain_seconds;
+    let boundary = (drain_at / report_seconds).ceil() * report_seconds;
+    f64::from(replicas) * (boundary - horizon_seconds)
 }
 
 #[cfg(test)]

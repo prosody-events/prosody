@@ -367,14 +367,14 @@ fn populate_staggered(
     observation: &mut ObservationBuffer,
     case: BenchmarkCase,
 ) -> Result<(), BenchmarkError> {
-    const HORIZON_SECONDS: u64 = 30;
-    let events_per_cohort = f64::from(case.offered_events_per_second) * HORIZON_SECONDS as f64
+    const HORIZON_SECONDS: u32 = 30;
+    let events_per_cohort = f64::from(case.offered_events_per_second) * f64::from(HORIZON_SECONDS)
         / f64::from(case.cohort_count_max);
     for cohort in 0..case.cohort_count_max {
         let release_micros = u64::from(cohort) * 100_000;
         observation.push_cohort(Cohort {
             release_micros,
-            deadline_micros: release_micros + HORIZON_SECONDS * 1_000_000,
+            deadline_micros: release_micros + u64::from(HORIZON_SECONDS) * 1_000_000,
             offered_events: events_per_cohort,
             partition: cohort % 64,
             demand_class: DemandClass::Normal,
