@@ -214,8 +214,11 @@ where
                 // Every name is validated even after a match is found: stopping
                 // early would make a later name's validity depend on where the
                 // producer put the match.
-                let name = awaited_name(value)?;
-                addressed |= name == responder.as_str();
+                let bytes = value.ok_or(HeaderRejection::MalformedAwaited)?;
+                let name = str::from_utf8(bytes).map_err(|_| HeaderRejection::MalformedAwaited)?;
+                addressed |= responder
+                    .matches(name)
+                    .map_err(|_| HeaderRejection::MalformedAwaited)?;
             }
             RESPONSE_REQUEST_ID_HEADER => {
                 set_once(&mut id, || parse_id(value).map(RequestId::from_bytes))?;
@@ -264,18 +267,6 @@ pub(crate) fn id_text(id: Uuid, buf: &mut [u8; ID_TEXT_LEN]) -> &str {
 /// Reports whether `name` belongs to the request protocol.
 pub(crate) fn is_reserved(name: &str) -> bool {
     RESERVED_REQUEST_HEADERS.contains(&name)
-}
-
-/// Reads one awaited subsystem name.
-///
-/// [`SubsystemName::checked`] applies the rule, so a padded name addresses the
-/// same subsystem. Nothing is copied: the name is compared where it lies in
-/// the record.
-fn awaited_name(value: Option<&[u8]>) -> Result<&str, HeaderRejection> {
-    let bytes = value.ok_or(HeaderRejection::MalformedAwaited)?;
-    let name = str::from_utf8(bytes).map_err(|_| HeaderRejection::MalformedAwaited)?;
-
-    SubsystemName::checked(name).map_err(|_| HeaderRejection::MalformedAwaited)
 }
 
 /// Reads one id header into its 16 bytes.

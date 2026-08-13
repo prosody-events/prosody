@@ -36,25 +36,18 @@ impl SubsystemName {
     where
         N: AsRef<str>,
     {
-        Ok(Self(Flexstr::make(Self::checked(name.as_ref())?)))
+        let name = normalize(name.as_ref())?;
+        Ok(Self(Flexstr::make(name)))
     }
 
-    /// Trims `name` and holds it to the rule [`try_new`](Self::try_new)
-    /// applies, without building a name.
-    ///
-    /// This is the one place the rule is written. A caller that only compares a
-    /// borrowed name — a reserved Kafka header, a decoded wire field — checks
-    /// it here and copies nothing.
+    /// Compares this name with a borrowed input after normalization.
     ///
     /// # Errors
     ///
-    /// Returns [`SubsystemNameError`] when the trimmed name is empty.
-    pub(crate) fn checked(name: &str) -> Result<&str, SubsystemNameError> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(SubsystemNameError);
-        }
-        Ok(name)
+    /// Returns [`SubsystemNameError`] when `name` is empty after trimming.
+    pub(crate) fn matches(&self, name: &str) -> Result<bool, SubsystemNameError> {
+        let name = normalize(name)?;
+        Ok(self.as_str() == name)
     }
 
     /// Returns the subsystem name as a string slice.
@@ -94,6 +87,14 @@ impl Borrow<str> for SubsystemName {
     fn borrow(&self) -> &str {
         self.as_str()
     }
+}
+
+fn normalize(name: &str) -> Result<&str, SubsystemNameError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(SubsystemNameError);
+    }
+    Ok(name)
 }
 
 /// A subsystem name is empty or contains only whitespace.
