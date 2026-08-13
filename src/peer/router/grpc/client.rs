@@ -7,14 +7,12 @@ use crate::peer::router::cache_config::PeerCacheConfiguration;
 use crate::peer::router::directory::Endpoint;
 use crate::peer::router::{Framed, ResponseSender, SendFailure};
 use crate::propagator::new_propagator;
-use ahash::RandomState;
 use opentelemetry::Context;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use opentelemetry_semantic_conventions::attribute::{
     RPC_METHOD, RPC_SYSTEM_NAME, SERVER_ADDRESS, SERVER_PORT,
 };
-use quick_cache::UnitWeighter;
-use quick_cache::sync::{Cache, DefaultLifecycle};
+use quick_cache::sync::Cache;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -37,7 +35,7 @@ pub(super) static DELIVER_RESULT: LazyLock<PathAndQuery> =
     LazyLock::new(|| PathAndQuery::from_static("/prosody.peer.v1.PeerService/DeliverResult"));
 
 /// One channel per live destination, keyed by the address a peer published.
-type Channels = Cache<Uri, Channel, UnitWeighter, RandomState>;
+type ChannelCache = Cache<Uri, Channel>;
 
 /// The production [`ResponseSender`]: it dials the address a peer published and
 /// delivers one frame per call.
@@ -51,7 +49,7 @@ type Channels = Cache<Uri, Channel, UnitWeighter, RandomState>;
 /// because a peer can publish a new address. The old entry goes cold and is
 /// evicted.
 pub(crate) struct GrpcSender {
-    channels: Arc<Channels>,
+    channels: Arc<ChannelCache>,
     propagator: TextMapCompositePropagator,
 }
 
@@ -60,13 +58,7 @@ impl GrpcSender {
     pub(crate) fn new(config: PeerCacheConfiguration) -> Self {
         let capacity = config.peer_capacity;
         Self {
-            channels: Arc::new(Cache::with(
-                capacity,
-                capacity as u64,
-                UnitWeighter,
-                RandomState::default(),
-                DefaultLifecycle::default(),
-            )),
+            channels: Arc::new(Cache::new(capacity)),
             propagator: new_propagator(),
         }
     }

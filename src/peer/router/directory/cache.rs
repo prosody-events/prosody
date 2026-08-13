@@ -3,8 +3,7 @@
 use crate::peer::router::PeerId;
 use crate::peer::router::directory::{PeerDirectory, PeerRegistration, RegistrationTtl};
 use quanta::{Clock, Instant};
-use quick_cache::UnitWeighter;
-use quick_cache::sync::{Cache, DefaultLifecycle};
+use quick_cache::sync::Cache;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,12 +14,12 @@ use std::time::Duration;
 /// directory does not hold issues one read rather than one per message. The
 /// registration sits behind an [`Arc`], so serving a hit costs a reference
 /// count and never an allocation.
-type Entry = (Instant, Option<Arc<PeerRegistration>>);
+type CachedRegistration = (Instant, Option<Arc<PeerRegistration>>);
 
 /// The concrete `quick_cache` instance. Items are weighed by count: capacity
 /// bounds how many registrations are held, and each one holds only what the
 /// directory entry held — a host, a machine name, and two optional labels.
-type Inner = Cache<PeerId, Entry, UnitWeighter, ahash::RandomState>;
+type RegistrationCache = Cache<PeerId, CachedRegistration>;
 
 /// Peer id to registration, read through to the directory.
 ///
@@ -51,7 +50,7 @@ type Inner = Cache<PeerId, Entry, UnitWeighter, ahash::RandomState>;
 /// failing directory issues one read per waiter, one at a time.
 #[derive(Clone)]
 pub(crate) struct AddressCache {
-    inner: Arc<Inner>,
+    registrations: Arc<RegistrationCache>,
     clock: Clock,
     ttl: Duration,
 }
@@ -86,15 +85,8 @@ impl AddressCache {
     }
 
     fn build(capacity: usize, ttl: RegistrationTtl, clock: Clock) -> Self {
-        let inner = Cache::with(
-            capacity,
-            capacity as u64,
-            UnitWeighter,
-            ahash::RandomState::default(),
-            DefaultLifecycle::default(),
-        );
         Self {
-            inner: Arc::new(inner),
+            registrations: Arc::new(Cache::new(capacity)),
             clock,
             ttl: ttl.duration(),
         }
@@ -103,7 +95,7 @@ impl AddressCache {
     /// How many registrations the cache currently holds.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.inner.len()
+        self.registrations.len()
     }
 
     /// Serves a fresh entry, or fills single-flight through `fill`.
@@ -126,14 +118,14 @@ impl AddressCache {
         Fut: Future<Output = Result<Option<PeerRegistration>, E>>,
     {
         loop {
-            match self.inner.get_value_or_guard_async(&peer).await {
+            match self.registrations.get_value_or_guard_async(&peer).await {
                 Ok((issued, registration)) => {
                     if self.clock.now().duration_since(issued) < self.ttl {
                         return Ok(registration);
                     }
                     // Equal clock readings are interchangeable observations.
                     // Removing either can only cause a refill.
-                    self.inner
+                    self.registrations
                         .remove_if(&peer, |(observed, _)| *observed == issued);
                 }
                 Err(guard) => {
