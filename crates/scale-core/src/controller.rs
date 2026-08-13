@@ -1597,6 +1597,7 @@ fn normalize_scenario_outcomes(
         cells.missed_work[candidate] = missed_work;
         let mut rejection = 0_u8;
         let miss_fraction = missed_work / cells.event_count.max(f64::MIN_POSITIVE);
+        // This SLO constraint is epsilon's only consumer.
         if miss_fraction > state.configuration.objective.epsilon() {
             rejection |= DecisionRejection::Deadline.bit();
         }

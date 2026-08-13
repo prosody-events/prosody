@@ -293,7 +293,11 @@ impl ServiceObjective {
         self.budget_micros
     }
 
-    /// Returns the tolerated miss fraction.
+    /// Returns the SLO miss-fraction constraint.
+    ///
+    /// The controller rejects a candidate when its predicted miss fraction
+    /// exceeds epsilon. It then minimizes expected cost among valid candidates.
+    /// Pricing has no epsilon by design.
     #[must_use]
     pub const fn epsilon(self) -> f64 {
         self.epsilon

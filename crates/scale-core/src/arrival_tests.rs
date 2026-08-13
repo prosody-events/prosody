@@ -5,7 +5,8 @@ use super::{
     ArrivalEvidence, ArrivalFactor, ArrivalPrior, CELL_COUNT, HAZARD_COUNT, RATE_COUNT,
     RESET_COUNT, T_MAX_SECONDS, cell, poisson_mass,
 };
-use crate::RandomStream;
+use crate::types::{CalendarColumns, CalendarForecast};
+use crate::{CalendarArtifactId, CalendarRateSegment, RandomStream};
 
 #[quickcheck]
 fn boundary_filter_matches_exhaustive_one_step(count_code: u8, duration_code: u16) -> bool {
@@ -55,6 +56,45 @@ fn update_path_does_not_allocate() -> Result<(), super::ArrivalPriorError> {
     let allocation = measure(|| factor.update(ArrivalEvidence::new(7, 1_000_000), None, 1_000_000));
     assert_eq!(allocation.count_total, 0);
     assert_eq!(allocation.bytes_total, 0);
+    Ok(())
+}
+
+#[test]
+fn crossing_interval_updates_its_start_calendar_segment() -> Result<(), super::ArrivalPriorError> {
+    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
+    let mut segments = CalendarColumns::new(2);
+    segments.extend(&[
+        CalendarRateSegment {
+            position: 10,
+            start_micros: 0,
+            end_micros: 2_000_000,
+            shape: 2.0_f64,
+            rate_seconds: 2.0_f64,
+        },
+        CalendarRateSegment {
+            position: 11,
+            start_micros: 2_000_000,
+            end_micros: 4_000_000,
+            shape: 100.0_f64,
+            rate_seconds: 20.0_f64,
+        },
+    ]);
+    let calendar = CalendarForecast {
+        artifact: CalendarArtifactId(1),
+        prior_probability: 0.5_f64,
+        segments: &segments,
+    };
+    let mut factor = ArrivalFactor::new(model);
+
+    factor.update(
+        ArrivalEvidence::new(6, 2_000_000),
+        Some(calendar),
+        3_000_000,
+    );
+
+    assert_eq!(factor.calendar_position, 10);
+    assert!((factor.calendar_shape - 8.0_f64).abs() <= f64::EPSILON);
+    assert!((factor.calendar_rate - 4.0_f64).abs() <= f64::EPSILON);
     Ok(())
 }
 

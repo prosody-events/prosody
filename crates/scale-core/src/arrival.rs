@@ -205,6 +205,9 @@ pub(crate) struct ArrivalFactor {
     reset_probability: [[f64; RATE_COUNT]; RESET_COUNT],
     probability: Box<[f64]>,
     scratch: Box<[f64]>,
+    // Calendar segment changes take effect at the next evidence boundary.
+    // Each interval belongs to the segment active at its start.
+    // This assignment is exact for the declared discrete model.
     calendar_artifact: Option<CalendarArtifactId>,
     calendar_position: u32,
     calendar_shape: f64,
@@ -276,6 +279,11 @@ impl ArrivalFactor {
         }
     }
 
+    /// Updates the model with one certified evidence interval.
+    ///
+    /// `now_micros` is the evidence interval end.
+    /// The producer certifies that the count covers exactly `[now - exposure,
+    /// now]`. The producer controls delivery delay.
     pub(crate) fn update(
         &mut self,
         evidence: ArrivalEvidence,
@@ -292,15 +300,15 @@ impl ArrivalFactor {
             drop(token);
             return;
         }
-        let evidence_start = now_micros.saturating_sub(exposure_micros.min(now_micros));
+        let evidence_start = now_micros.saturating_sub(exposure_micros);
         self.transition(
             Duration::from_micros(evidence_start.saturating_sub(self.last_evidence_micros))
                 .as_secs_f64(),
             None,
         );
-        self.prepare_calendar(calendar, now_micros);
+        self.prepare_calendar(calendar, evidence_start);
         if let Some(forecast) = calendar
-            && calendar_segment_at(forecast.segments, now_micros).is_some()
+            && calendar_segment_at(forecast.segments, evidence_start).is_some()
         {
             self.calendar_log_odds +=
                 log_predictive_mass(self.calendar_shape, self.calendar_rate, count, exposure)
@@ -362,12 +370,12 @@ impl ArrivalFactor {
     pub(crate) fn prepare_calendar(
         &mut self,
         calendar: Option<CalendarForecast<'_>>,
-        now_micros: u64,
+        evidence_start_micros: u64,
     ) {
         let Some(forecast) = calendar else {
             return;
         };
-        let Some(segment) = calendar_segment_at(forecast.segments, now_micros) else {
+        let Some(segment) = calendar_segment_at(forecast.segments, evidence_start_micros) else {
             return;
         };
         let artifact_changed = self.calendar_artifact != Some(forecast.artifact);
