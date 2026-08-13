@@ -1,5 +1,6 @@
 use super::{BinaryPayload, Codec, JsonBinaryCodec, JsonBinaryMessageCodec, JsonCodec};
 use crate::test_util::ArbJson;
+use crate::{EventIdentity, EventType};
 use bytes::BytesMut;
 use quickcheck::{QuickCheck, TestResult};
 use serde_json::Value;
@@ -63,6 +64,33 @@ fn binary_json_codec_is_byte_compatible_with_json() {
             Ok(payload) if payload.bytes == bytes => {}
             Ok(_) => return TestResult::error(format!("binary codec altered bytes for {value}")),
             Err(_) => return TestResult::error("binary codec deserialize failed"),
+        }
+
+        // The message codec accepts the same JSON domain. It extracts string
+        // metadata from objects and leaves all other JSON values untagged.
+        let mut message = JsonBinaryMessageCodec::default();
+        let mut scratch = bytes.clone();
+        match message.deserialize(&mut scratch) {
+            Ok(payload)
+                if payload.bytes == bytes
+                    && payload.event_id() == value.get("id").and_then(Value::as_str)
+                    && payload.event_type() == value.get("type").and_then(Value::as_str) => {}
+            Ok(_) => return TestResult::error(format!("message codec altered {value}")),
+            Err(_) => return TestResult::error(format!("message codec rejected {value}")),
+        }
+
+        // Every JSON shape is also valid in a metadata field. Only strings
+        // become metadata.
+        let tagged = serde_json::json!({ "id": value, "type": value });
+        let tagged_bytes = json_bytes(&tagged);
+        let mut scratch = tagged_bytes.clone();
+        match message.deserialize(&mut scratch) {
+            Ok(payload)
+                if payload.bytes == tagged_bytes
+                    && payload.event_id() == value.as_str()
+                    && payload.event_type() == value.as_str() => {}
+            Ok(_) => return TestResult::error(format!("message codec altered tagged {value}")),
+            Err(_) => return TestResult::error(format!("message codec rejected tagged {value}")),
         }
 
         // Binary serialize -> JsonCodec deserialize -> original value.

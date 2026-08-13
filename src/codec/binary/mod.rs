@@ -1,12 +1,14 @@
 //! Binary codec that copies bytes verbatim and uses a caller-supplied
 //! function to extract event metadata (id and type).
 
-use serde::Deserialize;
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_slice_with_buffers;
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::error::Error as StdError;
+use std::fmt::{Formatter, Result as FmtResult};
 use std::marker::PhantomData;
 
 use crate::codec::Codec;
@@ -204,9 +206,10 @@ impl<E: BinaryExtractor, F: BinaryFormat> Codec for BinaryCodec<E, F> {
 /// fields of a JSON document.
 ///
 /// Uses the same backend as [`crate::codec::JsonCodec`] — `simd_json` on
-/// non-ARM targets, `serde_json` on ARM — but deserializes into a two-field
-/// view that borrows the values directly from `buf`. No full parse tree is
-/// materialized.
+/// non-ARM targets, `serde_json` on ARM. It streams the document into a
+/// two-field view that borrows from `buf`. It does not build a parse tree.
+/// All JSON values are valid messages. Values without string metadata fields
+/// return no metadata.
 ///
 /// On non-ARM targets the extractor owns a `simd_json::Buffers` instance; the
 /// parent [`BinaryCodec`] holds one [`JsonExtractor`] for its lifetime, so the
@@ -257,16 +260,88 @@ pub type JsonBinaryCodec = BinaryCodec<NoopExtractor, JsonFormat>;
 
 #[derive(Deserialize)]
 struct JsonMetaView<'a> {
-    #[serde(borrow)]
+    #[serde(borrow, default, deserialize_with = "borrowed_string")]
     id: Option<&'a str>,
-    #[serde(borrow, rename = "type")]
+    #[serde(borrow, default, rename = "type", deserialize_with = "borrowed_string")]
     event_type: Option<&'a str>,
+}
+
+fn borrowed_string<'de, D>(deserializer: D) -> Result<Option<&'de str>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_any(BorrowedStringVisitor)
+}
+
+struct BorrowedStringVisitor;
+
+impl<'de> Visitor<'de> for BorrowedStringVisitor {
+    type Value = Option<&'de str>;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(Some(value))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(None)
+    }
 }
 
 impl BinaryExtractor for JsonExtractor {
     type Error = JsonExtractError;
 
     fn extract<'a>(&mut self, buf: &'a mut [u8]) -> Result<BinaryMetadata<'a>, Self::Error> {
+        if buf.iter().copied().find(|byte| !byte.is_ascii_whitespace()) != Some(b'{') {
+            #[cfg(target_arch = "arm")]
+            serde_json::from_slice::<IgnoredAny>(buf)?;
+            #[cfg(not(target_arch = "arm"))]
+            from_slice_with_buffers::<IgnoredAny>(buf, &mut self.buffers)?;
+            return Ok(BinaryMetadata::default());
+        }
         #[cfg(target_arch = "arm")]
         {
             let view = serde_json::from_slice::<JsonMetaView<'a>>(buf)?;
