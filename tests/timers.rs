@@ -260,7 +260,7 @@ impl FallibleHandler for InlineReplacementHandler {
 }
 
 impl ClientHandler for InlineReplacementHandler {
-    type Codecs = Codecs<JsonCodec, JsonCodec, UnitCodec>;
+    type Codecs = Codecs<JsonCodec, UnitCodec>;
 }
 
 /// Test environment wrapping [`ConsumerEnv`] with the timer handler's event

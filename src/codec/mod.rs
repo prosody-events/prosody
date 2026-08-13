@@ -151,8 +151,8 @@ pub trait Codec: Default + Send + Sync + 'static {
 /// The erased `DynEventContext` value ops carry no codec type parameter, so
 /// they recover one from the payload through this map. The reachable
 /// payloads are the FFI codecs' — `serde_json::Value` ([`JsonCodec`], for
-/// the js/py/rb bindings) and [`BinaryPayload`] ([`JsonBinaryCodec`],
-/// for the C# binding, which hands Rust raw JSON bytes it never parses).
+/// Python and Ruby) and [`BinaryPayload`] ([`JsonBinaryCodec`], for
+/// JavaScript and C#). Binary clients give Rust raw JSON bytes.
 ///
 /// # Invariant: the recovered codec must match the registration
 ///

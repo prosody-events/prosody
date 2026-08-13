@@ -161,7 +161,7 @@ impl FallibleHandler for SpanProbe {
 }
 
 impl ClientHandler for SpanProbe {
-    type Codecs = Codecs<JsonCodec, JsonCodec, UnitCodec>;
+    type Codecs = Codecs<JsonCodec, UnitCodec>;
 }
 
 /// Per-key trace/span ids and thread spreads for the sched and disp phases.

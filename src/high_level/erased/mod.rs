@@ -1,6 +1,7 @@
 //! Optional type erasure for foreign-language client wrappers.
 
 use crate::cassandra::config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError};
+use crate::codec::ErasedStateCodec;
 use crate::consumer::MockConfigurationError;
 use crate::high_level::codecs::StateCodec;
 use crate::high_level::config::ModeConfiguration;
@@ -23,6 +24,8 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 
 mod readers;
+
+pub(super) use readers::{deque, map, value};
 
 pub use readers::{
     ErasedDequeReader, ErasedDirection, ErasedMapReader, ErasedReadCache, ErasedReaderBuildError,
@@ -90,19 +93,25 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>;
+    ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec;
     async fn map_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>;
+    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec;
     async fn deque_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>;
+    ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec;
     async fn assigned_partition_count(&self) -> u32;
     async fn is_stalled(&self) -> bool;
     fn producer_config(&self) -> &ProducerConfiguration;
@@ -249,6 +258,8 @@ where
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
     {
         let guard = self.client.read().await;
         let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
@@ -265,7 +276,10 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>> {
+    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
         let guard = self.client.read().await;
         let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.map_state(subsystem, name, cache).await
@@ -282,6 +296,8 @@ where
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
     {
         let guard = self.client.read().await;
         let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
@@ -435,8 +451,10 @@ where
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
     {
-        readers::value(&self.0, subsystem, &name, cache).await
+        value(&self.0, subsystem, &name, cache).await
     }
 
     async fn map_state(
@@ -444,8 +462,11 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>> {
-        readers::map(&self.0, subsystem, &name, cache).await
+    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
+        map(&self.0, subsystem, &name, cache).await
     }
 
     async fn deque_state(
@@ -454,8 +475,10 @@ where
         name: String,
         cache: ErasedReadCache,
     ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
     {
-        readers::deque(&self.0, subsystem, &name, cache).await
+        deque(&self.0, subsystem, &name, cache).await
     }
 
     async fn assigned_partition_count(&self) -> u32 {

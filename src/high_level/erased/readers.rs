@@ -2,7 +2,7 @@
 
 use crate::EventIdentity;
 use crate::Key;
-use crate::codec::Codec;
+use crate::codec::{Codec, ErasedStateCodec};
 use crate::consumer::event_context::{BoxStateCursor, ErasedStateError, StateCursor};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::high_level::codecs::StateCodec;
@@ -155,7 +155,7 @@ pub enum ErasedReaderBuildError<E> {
     Client(#[from] HighLevelClientError<E>),
 }
 
-pub(super) async fn value<T, B>(
+pub(in crate::high_level) async fn value<T, B>(
     client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
@@ -163,7 +163,7 @@ pub(super) async fn value<T, B>(
 ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
 where
     T: ClientHandler,
-    T::Payload: Clone + EventIdentity + Send + Sync + 'static,
+    T::Payload: Clone + ErasedStateCodec + EventIdentity + Send + Sync + 'static,
     B: ClientBackend<MessageCodec<T>>,
     B::Reader: ConsumerReaderBackend<MessageCodec<T>>,
 {
@@ -172,7 +172,7 @@ where
     Ok(Arc::new(ValueReader(reader)))
 }
 
-pub(super) async fn map<T, B>(
+pub(in crate::high_level) async fn map<T, B>(
     client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
@@ -180,7 +180,7 @@ pub(super) async fn map<T, B>(
 ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
 where
     T: ClientHandler,
-    T::Payload: Clone + EventIdentity + Send + Sync + 'static,
+    T::Payload: Clone + ErasedStateCodec + EventIdentity + Send + Sync + 'static,
     B: ClientBackend<MessageCodec<T>>,
     B::Reader: ConsumerReaderBackend<MessageCodec<T>>,
 {
@@ -189,7 +189,7 @@ where
     Ok(Arc::new(MapReader(reader)))
 }
 
-pub(super) async fn deque<T, B>(
+pub(in crate::high_level) async fn deque<T, B>(
     client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
@@ -197,7 +197,7 @@ pub(super) async fn deque<T, B>(
 ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
 where
     T: ClientHandler,
-    T::Payload: Clone + EventIdentity + Send + Sync + 'static,
+    T::Payload: Clone + ErasedStateCodec + EventIdentity + Send + Sync + 'static,
     B: ClientBackend<MessageCodec<T>>,
     B::Reader: ConsumerReaderBackend<MessageCodec<T>>,
 {
