@@ -13,36 +13,25 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::str::FromStr;
 use thiserror::Error;
 
-/// Inline capacity of a name.
+/// Inline capacity for common subsystem names.
 ///
-/// `Flexstr` spends byte 0 of its buffer on the length, so this holds
-/// [`SubsystemName::MAX_BYTES`] bytes of text and never spills to the heap.
-const CAPACITY: usize = 65;
+/// `Flexstr` uses one byte for the length. Names of 24 bytes or fewer stay
+/// inline. Longer names remain valid and use heap storage.
+const CAPACITY: usize = 25;
 
 /// Human-readable subsystem name.
 ///
-/// Every value is trimmed, is not blank, and is no longer than
-/// [`MAX_BYTES`](Self::MAX_BYTES). The bound belongs to the name rather than to
-/// any one reader of it, because a name that exceeds it is unusable everywhere
-/// it travels: a peer response frame carries the answering subsystem, and a
-/// name also becomes a metric label and a Cassandra value. A consumer
-/// configured with a longer name could never be addressed, so a name is refused
-/// where it is made. Code that holds one never tests it again.
-///
-/// The name is stored inline, so it allocates nothing and a clone copies.
+/// Every value is trimmed and is not blank. Common names stay inline. Longer
+/// names remain valid and use heap storage.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SubsystemName(Flexstr<CAPACITY>);
 
 impl SubsystemName {
-    /// Longest name this crate accepts, in bytes, measured after the trim.
-    pub const MAX_BYTES: usize = CAPACITY - 1;
-
     /// Creates a subsystem name, trimmed of surrounding whitespace.
     ///
     /// # Errors
     ///
-    /// Returns [`SubsystemNameError`] when the trimmed name is empty or is
-    /// longer than [`MAX_BYTES`](Self::MAX_BYTES).
+    /// Returns [`SubsystemNameError`] when the trimmed name is empty.
     pub fn try_new<N>(name: N) -> Result<Self, SubsystemNameError>
     where
         N: AsRef<str>,
@@ -59,17 +48,12 @@ impl SubsystemName {
     ///
     /// # Errors
     ///
-    /// Returns [`SubsystemNameError`] when the trimmed name is empty or is
-    /// longer than [`MAX_BYTES`](Self::MAX_BYTES).
+    /// Returns [`SubsystemNameError`] when the trimmed name is empty.
     pub(crate) fn checked(name: &str) -> Result<&str, SubsystemNameError> {
         let name = name.trim();
         if name.is_empty() {
-            return Err(SubsystemNameError::Blank);
+            return Err(SubsystemNameError);
         }
-        if name.len() > Self::MAX_BYTES {
-            return Err(SubsystemNameError::TooLong { bytes: name.len() });
-        }
-
         Ok(name)
     }
 
@@ -112,22 +96,10 @@ impl Borrow<str> for SubsystemName {
     }
 }
 
-/// Why a subsystem name was refused.
+/// A subsystem name is empty or contains only whitespace.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-pub enum SubsystemNameError {
-    /// The name is empty, or is whitespace alone.
-    #[error("subsystem name must not be empty")]
-    Blank,
-    /// The name is longer than [`SubsystemName::MAX_BYTES`].
-    #[error(
-        "subsystem name is {bytes} bytes; the limit is {}",
-        SubsystemName::MAX_BYTES
-    )]
-    TooLong {
-        /// Length of the trimmed name.
-        bytes: usize,
-    },
-}
+#[error("subsystem name must not be empty")]
+pub struct SubsystemNameError;
 
 impl ClassifyError for SubsystemNameError {
     fn classify_error(&self) -> ErrorCategory {

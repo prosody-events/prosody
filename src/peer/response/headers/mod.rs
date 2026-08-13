@@ -269,9 +269,8 @@ pub(crate) fn is_reserved(name: &str) -> bool {
 /// Reads one awaited subsystem name.
 ///
 /// [`SubsystemName::checked`] applies the rule, so a padded name addresses the
-/// same subsystem and a name no responder could ever hold is refused rather
-/// than compared. Nothing is copied: the name is compared where it lies in the
-/// record.
+/// same subsystem. Nothing is copied: the name is compared where it lies in
+/// the record.
 fn awaited_name(value: Option<&[u8]>) -> Result<&str, HeaderRejection> {
     let bytes = value.ok_or(HeaderRejection::MalformedAwaited)?;
     let name = str::from_utf8(bytes).map_err(|_| HeaderRejection::MalformedAwaited)?;
@@ -323,7 +322,7 @@ pub(crate) enum HeaderRejection {
     MalformedId,
     #[error("a response deadline is not canonical Unix microseconds")]
     MalformedDeadline,
-    #[error("an awaited subsystem name is empty, not UTF-8, or too long")]
+    #[error("an awaited subsystem name is empty or not UTF-8")]
     MalformedAwaited,
 }
 

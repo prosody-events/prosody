@@ -1,9 +1,9 @@
 use super::suite::{
     DirectoryTrace, STABLE_LEASE, expected_answers, first_divergence, run_directory_trace,
-    run_idempotent_deregister_case, run_label_bound_case,
+    run_idempotent_deregister_case, run_long_label_case,
 };
 use super::support::{cassandra_directory, finish, registration, store};
-use crate::cassandra::TABLE_PEER_DIRECTORY;
+use crate::cassandra::{MAX_CASSANDRA_TTL_SECS, TABLE_PEER_DIRECTORY};
 use crate::peer::router::PeerId;
 use crate::peer::router::directory::{PeerDirectory, RegistrationTtl};
 use crate::test_util::{TEST_KEYSPACE, TEST_RUNTIME, integration_test_count};
@@ -38,12 +38,12 @@ fn prop_cassandra_directory_matches_the_model() {
         .quickcheck(property as fn(DirectoryTrace) -> TestResult);
 }
 
-/// Every label obeys the byte bound in the Cassandra directory.
+/// Cassandra preserves long labels.
 #[test]
-fn cassandra_directory_enforces_the_label_bound() -> Result<()> {
+fn cassandra_directory_preserves_long_labels() -> Result<()> {
     init_test_logging();
     TEST_RUNTIME
-        .block_on(async { run_label_bound_case(&cassandra_directory(STABLE_LEASE).await?).await })
+        .block_on(async { run_long_label_case(&cassandra_directory(STABLE_LEASE).await?).await })
 }
 
 /// Repeated deletion stays harmless in the Cassandra directory.
@@ -174,9 +174,7 @@ fn directory_statements_run_at_local_one() -> Result<()> {
 /// at least what the caller asked for. Outside that range there is no
 /// [`RegistrationTtl`] at all, so no configuration and no write can hold one.
 ///
-/// The values are fixed rather than generated: both bounds and the default are
-/// three points out of 3600, and a generator reaches them too rarely to fail on
-/// a bound that goes missing.
+/// The values are fixed because a generator rarely reaches exact boundaries.
 #[test]
 fn a_lease_exists_only_inside_its_range() -> Result<()> {
     let second = Duration::from_secs(1);
@@ -190,7 +188,10 @@ fn a_lease_exists_only_inside_its_range() -> Result<()> {
             RegistrationTtl::DEFAULT.duration(),
             RegistrationTtl::DEFAULT.duration(),
         ),
-        (RegistrationTtl::MAX, RegistrationTtl::MAX),
+        (
+            Duration::from_secs(MAX_CASSANDRA_TTL_SECS as u64),
+            Duration::from_secs(MAX_CASSANDRA_TTL_SECS as u64),
+        ),
     ] {
         let ttl = RegistrationTtl::try_from(asked)?;
         assert_eq!(
@@ -202,7 +203,7 @@ fn a_lease_exists_only_inside_its_range() -> Result<()> {
     for refused in [
         Duration::ZERO,
         RegistrationTtl::MIN.saturating_sub(second),
-        RegistrationTtl::MAX + second,
+        Duration::from_secs(MAX_CASSANDRA_TTL_SECS as u64) + second,
     ] {
         assert!(
             RegistrationTtl::try_from(refused).is_err(),

@@ -34,26 +34,14 @@ const COMMA_NAME: &str = "billing,ledger";
 /// A name no case ever awaits.
 const OUTSIDER: &str = "treasury";
 
-/// The longest name a header may carry, and one byte past it.
+/// A long valid subsystem name.
 const LONG_NAME: &str = concat!(
     "aaaaaaaa", "aaaaaaaa", "aaaaaaaa", "aaaaaaaa", "aaaaaaaa", "aaaaaaaa", "aaaaaaaa", "aaaaaaaa"
-);
-const OVERLONG_NAME: &str = concat!(
-    "aaaaaaaa", "aaaaaaaa", "aaaaaaaa", "aaaaaaaa", "aaaaaaaa", "aaaaaaaa", "aaaaaaaa", "aaaaaaaa",
-    "a"
-);
-const _: () = assert!(
-    LONG_NAME.len() == SubsystemName::MAX_BYTES,
-    "LONG_NAME must sit exactly on the bound"
-);
-const _: () = assert!(
-    OVERLONG_NAME.len() == SubsystemName::MAX_BYTES + 1,
-    "OVERLONG_NAME must sit one byte past the bound"
 );
 
 /// The names a generated case draws its awaited list from: two plain names, a
 /// name containing a comma, a padded name (which both the header parser and
-/// [`SubsystemName`] trim), and a name exactly on the length bound.
+/// [`SubsystemName`] trim), and a long name.
 const VOCABULARY: [&str; 5] = ["billing", "ledger", COMMA_NAME, "  padded  ", LONG_NAME];
 
 /// One deviation from a well-formed request, and the outcome it must produce.
@@ -92,7 +80,6 @@ enum Mutation {
     DeadlineValueAbsent,
     AwaitedBlank,
     AwaitedNonUtf8,
-    AwaitedTooLong,
     AwaitedValueAbsent,
     /// More awaited names than the former artificial cap allowed.
     ManyAwaited,
@@ -263,11 +250,6 @@ impl Case {
                 RESPONSE_AWAITED_HEADER,
                 Some(vec![0xff, 0xfe]),
             ),
-            Mutation::AwaitedTooLong => set_value(
-                &mut headers,
-                RESPONSE_AWAITED_HEADER,
-                Some(OVERLONG_NAME.as_bytes().to_vec()),
-            ),
             Mutation::AwaitedValueAbsent => {
                 set_value(&mut headers, RESPONSE_AWAITED_HEADER, None);
             }
@@ -325,10 +307,9 @@ fn expected(mutation: Mutation) -> Result<Option<ResultRequest>, HeaderRejection
         | Mutation::DeadlineNonNumeric
         | Mutation::DeadlineOverflow
         | Mutation::DeadlineValueAbsent => Err(HeaderRejection::MalformedDeadline),
-        Mutation::AwaitedBlank
-        | Mutation::AwaitedNonUtf8
-        | Mutation::AwaitedTooLong
-        | Mutation::AwaitedValueAbsent => Err(HeaderRejection::MalformedAwaited),
+        Mutation::AwaitedBlank | Mutation::AwaitedNonUtf8 | Mutation::AwaitedValueAbsent => {
+            Err(HeaderRejection::MalformedAwaited)
+        }
     }
 }
 

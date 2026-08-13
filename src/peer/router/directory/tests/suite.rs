@@ -7,10 +7,9 @@
 
 use super::support::{ArbRegistration, direct_address, fixed_direct_address, label, peer_id};
 use crate::peer::router::directory::{Endpoint, NetworkId, PeerDirectory, PeerRegistration};
-use crate::peer::router::{Host, MAX_LABEL_BYTES, PeerId};
+use crate::peer::router::{Host, PeerId};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
-use fixedstr::Flexstr;
 use quickcheck::{Arbitrary, Gen};
 use std::array::from_fn;
 use std::collections::HashMap;
@@ -41,8 +40,6 @@ const SHAPES: usize = 2;
 /// two backends' clocks cannot disagree.
 pub(crate) const STABLE_LEASE: Duration = Duration::from_mins(10);
 
-const LABELS: [Label; 2] = [Label::Network, Label::Hostname];
-
 /// One operation against a generated registration pool. The first index names
 /// a pooled peer; `Register`'s second names which of that peer's shapes it
 /// publishes.
@@ -62,12 +59,6 @@ pub(crate) struct DirectoryTrace {
 }
 
 /// One label that the directory bounds.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Label {
-    Network,
-    Hostname,
-}
-
 impl DirectoryTrace {
     /// The peer id every shape at `index` shares.
     fn peer(&self, index: usize) -> PeerId {
@@ -198,44 +189,24 @@ pub(crate) fn first_divergence(
     None
 }
 
-/// A label is bounded at both ends: a registration whose labels are all exactly
-/// `MAX_LABEL_BYTES` resolves and holds no label on the heap. One byte more on
-/// any one label makes the whole entry unresolvable.
-///
-/// The heap assertion proves that accepted labels stay inline. The entry goes
-/// rather than the label, because a shorter label would resolve a different
-/// host.
-pub(crate) async fn run_label_bound_case<D: PeerDirectory>(directory: &D) -> Result<()> {
-    let bounded = labelled(PeerId::new(), None);
-    directory.register(&bounded).await?;
+/// Long labels survive a directory round trip unchanged.
+pub(crate) async fn run_long_label_case<D: PeerDirectory>(directory: &D) -> Result<()> {
+    let written = labelled(PeerId::new());
+    directory.register(&written).await?;
     let read = directory
-        .read(bounded.peer)
+        .read(written.peer)
         .await?
-        .ok_or_else(|| eyre!("a registration at the bound must resolve"))?;
+        .ok_or_else(|| eyre!("a registration with long labels must resolve"))?;
     ensure!(
-        same_registration(&read, &bounded),
-        "a registration at the bound did not survive the round trip"
+        same_registration(&read, &written),
+        "long labels did not survive the round trip"
     );
-    let inline = read.hostname.is_fixed() && read.network.as_ref().is_some_and(Flexstr::is_fixed);
-    ensure!(
-        inline,
-        "a resolved registration must hold no label on the heap"
-    );
-
-    for over in LABELS {
-        let oversized = labelled(PeerId::new(), Some(over));
-        directory.register(&oversized).await?;
-        ensure!(
-            directory.read(oversized.peer).await?.is_none(),
-            "a registration whose {over:?} is one byte over the bound must not resolve"
-        );
-    }
     Ok(())
 }
 
 /// A shutdown delete removes the entry, and repeating it changes nothing.
 pub(crate) async fn run_idempotent_deregister_case<D: PeerDirectory>(directory: &D) -> Result<()> {
-    let written = labelled(PeerId::new(), None);
+    let written = labelled(PeerId::new());
     directory.register(&written).await?;
     ensure!(
         directory.read(written.peer).await?.is_some(),
@@ -262,15 +233,15 @@ fn shape(g: &mut Gen, peer: PeerId) -> PeerRegistration {
     registration
 }
 
-/// A registration with bounded labels, except for the selected oversized one.
-fn labelled(peer: PeerId, over: Option<Label>) -> PeerRegistration {
-    let text = |label: Label| "n".repeat(MAX_LABEL_BYTES + usize::from(over == Some(label)));
+/// A registration with labels longer than the inline storage.
+fn labelled(peer: PeerId) -> PeerRegistration {
+    let text = "n".repeat(256);
     PeerRegistration {
         peer,
         direct: fixed_direct_address(),
         advertised: Some(Endpoint::from_static("http://advertised.test")),
-        network: Some(NetworkId::make(&text(Label::Network))),
-        hostname: Host::make(&text(Label::Hostname)),
+        network: Some(NetworkId::make(&text)),
+        hostname: Host::make(&text),
     }
 }
 

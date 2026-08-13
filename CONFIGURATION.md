@@ -51,9 +51,9 @@ Use a different bind address for each client that shares a host.
 |---|---:|---|---|---|
 | `PROSODY_PEER_BIND_ADDRESS` | Default route address with port `9099` | The peer server needs a reachable listener. | The socket address that the peer server binds and publishes. | Must be an IPv4 or IPv6 socket address. |
 | `PROSODY_PEER_ADVERTISED_CONNECT` | unset | Peers on another network need an entry point. | The gRPC connect URI that remote peers use. | Must be a valid gRPC URI. |
-| `PROSODY_PEER_NETWORK_NAME` | unset | A shared label identifies peers that can use direct addresses. | The network group used to choose a direct address or advertised endpoint. | 1 through 63 bytes when set. |
+| `PROSODY_PEER_NETWORK_NAME` | unset | A shared label identifies peers that can use direct addresses. | The network group used to choose a direct address or advertised endpoint. | Must not be empty when set. |
 | `PROSODY_PEER_CACHE_CAPACITY` | 256 | Peer caches need a fixed memory bound. | The entry count for address and channel caches. | Must be greater than zero. |
-| `PROSODY_PEER_REGISTRATION_TTL` | 30s | A lease removes dead peers without a cleanup task. | The Cassandra TTL and refresh pace for this peer registration. | 5s through 1h. |
+| `PROSODY_PEER_REGISTRATION_TTL` | 30s | A lease removes dead peers without a cleanup task. | The Cassandra TTL and refresh pace for this peer registration. | At least 5s and no greater than Cassandra's maximum TTL. |
 
 Set `PROSODY_SUBSYSTEM` to make the client answer requests for that subsystem.
 Without it, the client consumes messages but does not answer requests. A
@@ -102,8 +102,8 @@ reloads and keyed-state message resolution.
 | `PROSODY_STATE_READ_CACHE_TTL` | Default read-cache TTL for composed readers: how long a `StateReader` may serve a collection's reads from its cache before re-reading the store. A humantime duration (`5s`, `750ms`); `none` disables the inherited default. A descriptor can replace it with `.read_cache(duration)` or bypass it with `.read_cache(ReadCachePolicy::Disabled)`. Reader-only — never affects the owning consumer's writes or a collection's durable TTL. | 5s |
 
 `PROSODY_SUBSYSTEM` names the service's published keyed state. Set it whenever
-any collection uses `.published(true)`. Prosody trims the name, and refuses it
-at startup when it is blank or longer than 64 bytes.
+any collection uses `.published(true)`. Prosody trims the name and refuses a
+blank value.
 
 To make a published collection private, change it to `.published(false)` but
 keep the collection registered and retain the same subsystem name for one

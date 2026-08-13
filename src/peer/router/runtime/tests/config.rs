@@ -5,6 +5,7 @@ use super::super::{
     refresh_registration,
 };
 use super::listener;
+use crate::cassandra::MAX_CASSANDRA_TTL_SECS;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::peer::router::PeerId;
 use crate::peer::router::cache_config::PeerCacheConfiguration;
@@ -59,7 +60,7 @@ fn start_refuses_an_invalid_configuration() -> Result<()> {
 /// refreshes per lease.
 #[quickcheck]
 fn prop_two_lost_refreshes_still_heal_inside_the_lease(seconds: u64) -> TestResult {
-    let span = RegistrationTtl::MAX.as_secs() - RegistrationTtl::MIN.as_secs();
+    let span = MAX_CASSANDRA_TTL_SECS as u64 - RegistrationTtl::MIN.as_secs();
     let lease = Duration::from_secs(RegistrationTtl::MIN.as_secs() + seconds % (span + 1));
     let Ok(ttl) = RegistrationTtl::try_from(lease) else {
         return TestResult::error(format!("{lease:?} must be an acceptable lease"));
@@ -107,45 +108,29 @@ async fn heartbeat_checks_preserve_the_refresh_deadline() -> Result<()> {
     Ok(())
 }
 
-/// The configuration refuses each degenerate network label it can express.
-///
-/// The label rule counts bytes, not characters, because bytes are what keeps a
-/// label inline. A label of 32 multi-byte characters is therefore refused,
-/// while one of 63 ASCII bytes — the last that stays inline — is accepted.
+/// A network label must not be empty. Its length has no protocol limit.
 #[test]
 fn configuration_refuses_degenerate_values() {
     let default = RouterConfiguration::default();
     assert!(default.validate().is_ok(), "the default must validate");
 
-    let longest = RouterConfiguration {
-        network: Some("n".repeat(63)),
+    let long = RouterConfiguration {
+        network: Some("é".repeat(128)),
         ..RouterConfiguration::default()
     };
     assert!(
-        longest.validate().is_ok(),
-        "a label of exactly the inline capacity must validate"
+        long.validate().is_ok(),
+        "a long nonempty label must validate"
     );
 
-    let cases = [
-        RouterConfiguration {
-            network: Some(String::new()),
-            ..RouterConfiguration::default()
-        },
-        RouterConfiguration {
-            network: Some("n".repeat(64)),
-            ..RouterConfiguration::default()
-        },
-        RouterConfiguration {
-            network: Some("é".repeat(32)),
-            ..RouterConfiguration::default()
-        },
-    ];
-    for config in cases {
-        assert!(
-            config.validate().is_err(),
-            "a degenerate configuration must not validate: {config:?}"
-        );
-    }
+    let empty = RouterConfiguration {
+        network: Some(String::new()),
+        ..RouterConfiguration::default()
+    };
+    assert!(
+        empty.validate().is_err(),
+        "an empty label must not validate"
+    );
 }
 
 /// Peer caches accept every positive capacity and reject zero.

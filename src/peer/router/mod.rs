@@ -30,26 +30,10 @@ pub(crate) mod loopback;
 pub(crate) mod relay;
 pub(crate) mod runtime;
 
-/// Inline capacity of a label. One byte holds the length, so a label of
-/// [`MAX_LABEL_BYTES`] never reaches the heap.
-const LABEL_CAPACITY: usize = 64;
+/// Inline capacity for common host and network labels.
+const LABEL_CAPACITY: usize = 25;
 
-/// Longest label this crate publishes or resolves.
-///
-/// It is the largest label that stays inline in [`Host`] and
-/// [`NetworkId`](directory::NetworkId), and both ends of the directory hold to
-/// it: a process refuses to publish a longer one, and an entry carrying a
-/// longer one reads as unresolvable. This bound keeps labels inline. The
-/// address cache bounds its entry count, not its total byte size.
-pub(crate) const MAX_LABEL_BYTES: usize = LABEL_CAPACITY - 1;
-
-/// Reports whether a nonempty label fits the directory label bound.
-pub(crate) fn label_fits(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_LABEL_BYTES
-}
-
-/// The host label a peer publishes for its peers to dial. Every stored host
-/// fits inline within [`MAX_LABEL_BYTES`].
+/// The host label a peer publishes for diagnostics.
 pub(crate) type Host = Flexstr<LABEL_CAPACITY>;
 
 /// Identifies one live prosody process.

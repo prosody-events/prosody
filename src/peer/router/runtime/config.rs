@@ -2,7 +2,6 @@
 //! degenerate value at startup.
 
 use crate::peer::router::directory::Endpoint;
-use crate::peer::router::label_fits;
 use derive_builder::Builder;
 use validator::{Validate, ValidationError};
 
@@ -32,27 +31,10 @@ impl RouterConfiguration {
     }
 }
 
-/// Refuses a blank label and one longer than a host or network name may be.
-/// An absent label never reaches this function.
-///
-/// The rule itself is [`label_fits`], which the directory's checked group
-/// constructor also reads. This function is its `validator` adapter, so a
-/// configured host, a discovered machine name and a published group label are
-/// all accepted on the same terms.
-///
-/// A `length` rule cannot replace this one: `validator` counts characters,
-/// while [`MAX_LABEL_BYTES`] is the byte capacity that keeps a label inline in
-/// [`Host`](crate::peer::router::Host).
-///
-/// Length and blankness are the only rules here, and a dialability rule does
-/// not belong beside them: an advertised host may be an IPv6 literal, so a rule
-/// that refused a colon would refuse a legal address.
+/// Refuses a blank network label. An absent label never reaches this function.
 pub(super) fn validate_label(label: &str) -> Result<(), ValidationError> {
     if label.is_empty() {
         return Err(ValidationError::new("label_empty"));
-    }
-    if !label_fits(label) {
-        return Err(ValidationError::new("label_too_long"));
     }
     Ok(())
 }

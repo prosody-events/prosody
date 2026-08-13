@@ -4,7 +4,7 @@ use super::{DirectAddress, Endpoint, NetworkId, PeerDirectory, PeerRegistration,
 use crate::cassandra::errors::CassandraStoreError;
 use crate::cassandra::{CassandraStore, TABLE_PEER_DIRECTORY};
 use crate::cassandra_queries;
-use crate::peer::router::{Host, PeerId, label_fits};
+use crate::peer::router::{Host, PeerId};
 use fixedstr::Flexstr;
 use scylla::statement::Consistency;
 use std::net::SocketAddr;
@@ -165,12 +165,11 @@ impl PeerDirectory for CassandraPeerDirectory {
         let Some((direct_socket_address, advertised_connect, network, hostname)) = row else {
             return Ok(None);
         };
-        // A label longer than a registration may publish makes the whole row
-        // unresolvable. Truncation would change its identity.
-        let bounded = [&network, &hostname]
+        // An empty label cannot identify a network or host.
+        let named = [&network, &hostname]
             .into_iter()
             .flatten()
-            .all(|label| label_fits(label));
+            .all(|label| !label.is_empty());
         let advertised = match advertised_connect {
             Some(connect) => match Endpoint::from_shared(connect) {
                 Ok(endpoint) => Some(endpoint),
@@ -193,7 +192,7 @@ impl PeerDirectory for CassandraPeerDirectory {
                 return Ok(None);
             }
         };
-        let (true, Some(hostname)) = (bounded, hostname) else {
+        let (true, Some(hostname)) = (named, hostname) else {
             warn!(%peer, "directory row is not resolvable");
             return Ok(None);
         };

@@ -9,7 +9,7 @@
 use super::config::{RouterConfiguration, validate_label};
 use crate::peer::router::directory::{DirectAddress, NetworkId, PeerRegistration};
 use crate::peer::router::grpc::BoundListener;
-use crate::peer::router::{Host, MAX_LABEL_BYTES, PeerId};
+use crate::peer::router::{Host, PeerId};
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle, spawn_blocking};
 use tonic::transport::Error as TransportError;
@@ -87,10 +87,7 @@ fn discover_host() -> Result<DiscoveredHost, DiscoveryError> {
     let machine = hostname()?;
     // One label rule for both sources. A name an operator may not configure is
     // not a name this machine may publish either.
-    validate_label(&machine).map_err(|_| DiscoveryError::Unpublishable {
-        bytes: machine.len(),
-        limit: MAX_LABEL_BYTES,
-    })?;
+    validate_label(&machine).map_err(|_| DiscoveryError::EmptyName)?;
     Ok(DiscoveredHost {
         hostname: Host::make(&machine),
     })
@@ -113,13 +110,7 @@ pub(crate) enum DiscoveryError {
     #[error("the host discovery task returned no result: {0:#}")]
     Task(#[from] JoinError),
 
-    /// The machine name is not a label that a registration can publish.
-    /// Startup stops because an oversized label would not resolve.
-    #[error("the machine name is {bytes} bytes, outside the 1 to {limit} byte label range")]
-    Unpublishable {
-        /// The machine name's length.
-        bytes: usize,
-        /// The longest label a registration may publish.
-        limit: usize,
-    },
+    /// The machine name is empty.
+    #[error("the machine name is empty")]
+    EmptyName,
 }

@@ -10,7 +10,7 @@ use crate::peer::router::directory::cassandra::CassandraPeerDirectory;
 use crate::peer::router::directory::{
     DirectAddress, Endpoint, NetworkId, PeerDirectory, PeerRegistration, RegistrationTtl,
 };
-use crate::peer::router::{Host, MAX_LABEL_BYTES, PeerId};
+use crate::peer::router::{Host, PeerId};
 use crate::test_util::test_cassandra_config;
 use color_eyre::Result;
 use parking_lot::Mutex;
@@ -25,11 +25,8 @@ use tokio::sync::OnceCell;
 /// Characters a generated host, hostname or label is built from.
 const LABEL_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789.:-";
 
-/// Longest generated label. Every label the directory resolves is inside
-/// [`MAX_LABEL_BYTES`], so a generated registration stays resolvable.
-/// [`run_label_bound_case`](super::suite::run_label_bound_case) owns the other
-/// side.
-const MAX_LABEL: usize = MAX_LABEL_BYTES;
+/// Longest generated label. Dedicated tests cover longer values.
+const MAX_LABEL: usize = 64;
 
 /// One store per test process. `CassandraStore::new` runs the migrator, so a
 /// store per property iteration would spend the run on schema checks.
