@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, time::Duration};
 
 use thiserror::Error;
 
@@ -517,6 +517,8 @@ pub struct Configuration {
     pub posterior_sample_count: u32,
     /// Time between complete telemetry reports.
     pub report_interval_micros: u64,
+    /// Maximum starts or completions in one resource report.
+    pub resource_window_attempt_count_max: u32,
     /// Maximum failure-service fraction while normal work waits.
     pub failure_service_weight: f64,
     /// Prior for live arrival-rate segments.
@@ -590,6 +592,11 @@ impl Configuration {
                 name: "report_interval_micros",
             });
         }
+        if self.resource_window_attempt_count_max == 0 {
+            return Err(ConfigurationError::ZeroBound {
+                name: "resource_window_attempt_count_max",
+            });
+        }
         if !self.failure_service_weight.is_finite()
             || !(0.0_f64..=1.0_f64).contains(&self.failure_service_weight)
         {
@@ -598,11 +605,22 @@ impl Configuration {
             });
         }
         if !self.capacity_change_rate_per_second.is_finite()
-            || self.capacity_change_rate_per_second < 0.0_f64
+            || self.capacity_change_rate_per_second <= 0.0_f64
         {
             return Err(ConfigurationError::InvalidCapacityChangeRate);
         }
         Ok(())
+    }
+
+    pub(crate) fn capacity_concurrency_max(&self) -> Result<f64, ConfigurationError> {
+        self.replica_count_max
+            .checked_mul(self.slots_per_replica)
+            .map(f64::from)
+            .ok_or(ConfigurationError::PlatformLimit)
+    }
+
+    pub(crate) fn resource_exposure_min_seconds(&self) -> f64 {
+        Duration::from_micros(self.report_interval_micros).as_secs_f64()
     }
 }
 
@@ -1164,6 +1182,9 @@ pub struct GroupObservation<'a> {
 pub struct ObservationBuffer {
     partition_count: u32,
     replica_count_max: u32,
+    resource_concurrency_max: f64,
+    resource_exposure_min_seconds: f64,
+    resource_attempt_count_max: u32,
     cohorts: CohortColumns,
     backlog: BacklogColumns,
     arrivals: Option<ArrivalEvidence>,
@@ -1211,6 +1232,9 @@ impl ObservationBuffer {
         Ok(Self {
             partition_count: configuration.partition_count,
             replica_count_max: configuration.replica_count_max,
+            resource_concurrency_max: configuration.capacity_concurrency_max()?,
+            resource_exposure_min_seconds: configuration.resource_exposure_min_seconds(),
+            resource_attempt_count_max: configuration.resource_window_attempt_count_max,
             cohorts: CohortColumns::new(cohort_count_max),
             backlog: BacklogColumns::new(backlog_count),
             arrivals: None,
@@ -1413,6 +1437,19 @@ impl ObservationBuffer {
     pub fn set_resource_window(&mut self, window: ResourceWindow) -> Result<(), ObservationError> {
         if self.resource_window.is_some() {
             return Err(ObservationError::ResourceWindowPending);
+        }
+        if window.concurrency() > self.resource_concurrency_max {
+            return Err(ObservationError::ResourceConcurrency);
+        }
+        if window.exposure_seconds() < self.resource_exposure_min_seconds {
+            return Err(ObservationError::ResourceExposure);
+        }
+        if window.completed_attempts() > self.resource_attempt_count_max
+            || window
+                .started_attempts()
+                .is_some_and(|count| count > self.resource_attempt_count_max)
+        {
+            return Err(ObservationError::ResourceAttemptCount);
         }
         self.resource_window = Some(window);
         Ok(())
@@ -1666,6 +1703,9 @@ pub enum ScaleDecision {
 /// Invalid construction input.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum ConfigurationError {
+    /// The capacity model exceeds its artifact or plant contract.
+    #[error(transparent)]
+    CapacityModel(#[from] crate::CapacityModelError),
     /// A lead-time artifact exceeds its declared budget.
     #[error(transparent)]
     LeadTimePrior(#[from] crate::LeadTimePriorError),
@@ -1693,8 +1733,8 @@ pub enum ConfigurationError {
     /// A reliability-prior shape is not positive and finite.
     #[error("reliability prior shapes must be positive and finite")]
     InvalidReliabilityPrior,
-    /// The physical capacity change rate is negative or non-finite.
-    #[error("capacity change rate must be finite and nonnegative")]
+    /// The physical capacity change rate is not positive and finite.
+    #[error("capacity change rate must be positive and finite")]
     InvalidCapacityChangeRate,
     /// A fixed capacity bound is zero.
     #[error("{name} must be positive")]
@@ -1721,6 +1761,15 @@ pub enum ConfigurationError {
 /// Invalid observation input.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum ObservationError {
+    /// Resource concurrency exceeds the configured plant maximum.
+    #[error("resource concurrency exceeds the configured maximum")]
+    ResourceConcurrency,
+    /// Resource exposure is below the configured report minimum.
+    #[error("resource exposure is below the configured minimum")]
+    ResourceExposure,
+    /// A resource attempt count exceeds the configured report maximum.
+    #[error("resource attempt count exceeds the configured maximum")]
+    ResourceAttemptCount,
     /// An incomplete actuation has invalid replica counts or exceeds its bound.
     #[error("an actuation commitment is invalid or exceeds its fixed bound")]
     ActuationCommitment,

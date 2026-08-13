@@ -54,8 +54,45 @@ fn benchmarks(criterion: &mut Criterion) {
     staggered_cohort_step(criterion);
     rayon_worker_step(criterion);
     capacity_grid(criterion);
+    capacity_convolution(criterion);
     resource_grid_step(criterion);
     posterior_sample_count_step(criterion);
+}
+
+fn capacity_convolution(criterion: &mut Criterion) {
+    let Ok(configuration) = configuration(SMALL) else {
+        return;
+    };
+    let Ok(grid) = CapacityGrid::new(&[0.5_f64], &[10.0_f64], &[0.0_f64]) else {
+        return;
+    };
+    let Ok(mut state) = ScaleState::new(configuration.clone(), grid) else {
+        return;
+    };
+    let (Ok(mut scratch), Ok(mut observation)) =
+        (state.new_scratch(), ObservationBuffer::new(&configuration))
+    else {
+        return;
+    };
+    let mut now = 1_u64;
+    criterion.bench_function("capacity_convolution/64_starts", |bencher| {
+        bencher.iter(|| {
+            let Ok(window) = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 64, 64) else {
+                return;
+            };
+            if observation.set_resource_window(window).is_err() {
+                return;
+            }
+            let decision = step(
+                &mut state,
+                &mut scratch,
+                observation.observation(),
+                ModelTime::from_micros(now),
+            );
+            now = now.wrapping_add(REPORT_INTERVAL_MICROS);
+            black_box(decision);
+        });
+    });
 }
 
 fn staggered_cohort_step(criterion: &mut Criterion) {
@@ -325,11 +362,12 @@ fn configuration(case: BenchmarkCase) -> Result<Configuration, BenchmarkError> {
         slots_per_replica: case.slots_per_replica,
         posterior_sample_count: case.posterior_sample_count,
         report_interval_micros: REPORT_INTERVAL_MICROS,
+        resource_window_attempt_count_max: 100_000,
         failure_service_weight: 0.3_f64,
         // Use one arrival each second and one expected change each day because this benchmark
         // measures step cost, not the prior.
         arrival_prior: ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?,
-        capacity_change_rate_per_second: 0.0_f64,
+        capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,

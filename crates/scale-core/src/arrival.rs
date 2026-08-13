@@ -169,6 +169,10 @@ impl ArrivalPrior {
         self.authored_shape
     }
 
+    pub(crate) const fn rate_seconds(self) -> f64 {
+        self.rate_seconds
+    }
+
     fn storage_bytes() -> Result<usize, ArrivalPriorError> {
         CELL_COUNT
             .checked_mul(2)

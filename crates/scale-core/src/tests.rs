@@ -559,38 +559,6 @@ fn change_point_kernel_satisfies_the_semigroup_law(
 #[derive(Clone, Debug)]
 struct CohortSet(WorkCohorts);
 
-#[derive(Clone, Copy, Debug)]
-struct CapacityQuery {
-    cell_count: u16,
-    concurrency_tenths: u16,
-}
-
-impl Arbitrary for CapacityQuery {
-    fn arbitrary(generator: &mut Gen) -> Self {
-        Self {
-            cell_count: u16::arbitrary(generator) % 256 + 2,
-            concurrency_tenths: u16::arbitrary(generator) % 2_001,
-        }
-    }
-
-    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        let mut shrunk = Vec::with_capacity(2);
-        if self.cell_count > 2 {
-            shrunk.push(Self {
-                cell_count: (self.cell_count / 2).max(2),
-                ..*self
-            });
-        }
-        if self.concurrency_tenths > 0 {
-            shrunk.push(Self {
-                concurrency_tenths: self.concurrency_tenths / 2,
-                ..*self
-            });
-        }
-        Box::new(shrunk.into_iter())
-    }
-}
-
 impl Arbitrary for CohortSet {
     fn arbitrary(generator: &mut Gen) -> Self {
         let count = usize::arbitrary(generator) % 16;
@@ -996,18 +964,19 @@ fn rebalance_evidence_updates_each_observed_phase() -> Result<(), TestError> {
 
 #[test]
 fn linear_evidence_retains_a_no_knee_explanation() -> Result<(), TestError> {
-    let simd_level = Level::new();
     let grid = CapacityGrid::new(&[0.1_f64], &[10.0_f64, 20.0_f64], &[0.0_f64, 1.0_f64])?;
-    let mut factor = CapacityFactor::new(grid, 0.0_f64);
+    let mut factor = capacity_factor(grid, 8.0_f64)?;
     for concurrency in [1.0_f64, 2.0_f64, 4.0_f64, 8.0_f64] {
         let completions = (concurrency * 10.0_f64) as u32;
-        factor.update(
-            simd_level,
-            &ResourceWindow::new(concurrency, 1.0_f64, completions)?,
-        );
+        factor.update(&ResourceWindow::new_with_starts(
+            concurrency,
+            1.0_f64,
+            completions,
+            completions,
+        )?);
     }
 
-    assert!(factor.expected_throughput(simd_level, 8.0_f64) > 70.0_f64);
+    assert!(factor.no_knee_probability() > 0.5_f64);
     Ok(())
 }
 
@@ -1026,6 +995,18 @@ fn resource_window_is_consumed_once() -> Result<(), TestError> {
     assert!(consumed.resource_window.is_some());
     let next = observation.observation();
     assert!(next.resource_window.is_none());
+    assert!(matches!(
+        observation.set_resource_window(ResourceWindow::new(8.0_f64, 0.5_f64, 80)?),
+        Err(ObservationError::ResourceExposure)
+    ));
+    assert!(matches!(
+        observation.set_resource_window(ResourceWindow::new(129.0_f64, 1.0_f64, 80)?),
+        Err(ObservationError::ResourceConcurrency)
+    ));
+    assert!(matches!(
+        observation.set_resource_window(ResourceWindow::new(8.0_f64, 1.0_f64, 100_001)?),
+        Err(ObservationError::ResourceAttemptCount)
+    ));
     Ok(())
 }
 
@@ -1210,50 +1191,6 @@ fn moved_partition_formula_matches_assignment_overlap(
     minimal_moved_partitions(partitions, current, target) == partitions - overlap
 }
 
-#[quickcheck]
-fn simd_capacity_reductions_match_scalar(query: CapacityQuery) -> bool {
-    let simd_level = Level::new();
-    let capacities = (0..query.cell_count)
-        .map(|cell| 10.0_f64 + f64::from(cell))
-        .collect::<Vec<_>>();
-    let Ok(grid) = CapacityGrid::new(&[0.01_f64], &capacities, &[0.5_f64]) else {
-        return false;
-    };
-    let mut factor = CapacityFactor::new(grid, 0.0_f64);
-    let Ok(window) = ResourceWindow::new(7.0_f64, 1.0_f64, 83) else {
-        return false;
-    };
-    factor.update(simd_level, &window);
-    let concurrency = f64::from(query.concurrency_tenths) / 10.0_f64;
-    let capacity_matches = close_relative(
-        factor.expected_capacity(simd_level),
-        factor.expected_capacity_scalar(),
-    );
-    let throughput_matches = close_relative(
-        factor.expected_throughput(simd_level, concurrency),
-        factor.expected_throughput_scalar(concurrency),
-    );
-    let saturation_matches = close_relative(
-        factor.saturation_probability(simd_level, concurrency),
-        factor.saturation_probability_scalar(concurrency),
-    );
-    assert!(
-        capacity_matches,
-        "the SIMD capacity reduction {} must match scalar {}",
-        factor.expected_capacity(simd_level),
-        factor.expected_capacity_scalar()
-    );
-    assert!(
-        throughput_matches,
-        "the SIMD throughput reduction must match scalar"
-    );
-    assert!(
-        saturation_matches,
-        "the SIMD saturation reduction must match scalar"
-    );
-    true
-}
-
 #[test]
 fn capacity_quantiles_preserve_posterior_order() -> Result<(), TestError> {
     assert!(matches!(
@@ -1265,7 +1202,7 @@ fn capacity_quantiles_preserve_posterior_order() -> Result<(), TestError> {
         &[100.0_f64, 200.0_f64, 400.0_f64],
         &[0.0_f64, 1.0_f64],
     )?;
-    let factor = CapacityFactor::new(grid, 0.0_f64);
+    let factor = capacity_factor(grid, 1.0_f64)?;
 
     let low = factor.capacity_quantile(0.1_f64);
     let median = factor.capacity_quantile(0.5_f64);
@@ -1286,7 +1223,7 @@ fn capacity_prior_is_proper_and_stationary() -> Result<(), TestError> {
         &[1.0_f64, 10.0_f64, 100.0_f64],
         &[0.0_f64, 1.0_f64],
     )?;
-    let mut factor = CapacityFactor::new(grid, 0.0_f64);
+    let mut factor = capacity_factor(grid, 1.0_f64)?;
     let mut values = [0.0_f64; 3];
     let mut prior = [0.0_f64; 3];
     factor.write_capacity_posterior(&mut values, &mut prior)?;
@@ -1300,8 +1237,6 @@ fn capacity_prior_is_proper_and_stationary() -> Result<(), TestError> {
     assert!(close_relative(prior[0], 0.25_f64));
     assert!(close_relative(prior[1], 0.5_f64));
     assert!(close_relative(prior[2], 0.25_f64));
-    assert!(close_relative(factor.no_collapse_probability(), 0.5_f64));
-
     for _ in 0_u32..100 {
         factor.transition(Duration::from_secs(1));
     }
@@ -1318,7 +1253,6 @@ fn capacity_prior_is_proper_and_stationary() -> Result<(), TestError> {
 
 #[test]
 fn capacity_transition_is_cadence_invariant() -> Result<(), TestError> {
-    let simd_level = Level::new();
     let grid = CapacityGrid::new(
         &[0.01_f64, 0.1_f64],
         &[100.0_f64, 1_000.0_f64],
@@ -1326,11 +1260,11 @@ fn capacity_transition_is_cadence_invariant() -> Result<(), TestError> {
     )?;
     let cell_count = grid.cell_count() as usize;
     let change_rate = 2.0_f64.ln();
-    let mut coarse = CapacityFactor::new(grid.clone(), change_rate);
-    let mut fine = CapacityFactor::new(grid, change_rate);
-    let evidence = ResourceWindow::new(32.0_f64, 10.0_f64, 3_200)?;
-    coarse.update(simd_level, &evidence);
-    fine.update(simd_level, &evidence);
+    let mut coarse = capacity_factor_with_rate(grid.clone(), change_rate, 32.0_f64)?;
+    let mut fine = capacity_factor_with_rate(grid, change_rate, 32.0_f64)?;
+    let evidence = ResourceWindow::new_with_starts(32.0_f64, 10.0_f64, 3_200, 3_200)?;
+    coarse.update(&evidence);
+    fine.update(&evidence);
 
     coarse.transition(Duration::from_secs(1));
     for _ in 0_u32..1_000 {
@@ -1526,7 +1460,6 @@ fn narrower_log_capacity_prior_concentrates_more_mass_at_its_median() -> Result<
             service_time_median_seconds: 0.1_f64,
             capacity_median_per_second: 320.0_f64,
             log_standard_deviation: 2.0_f64.ln(),
-            window_influence_bound_probability: 0.05_f64,
         },
     )?;
     let wide = CapacityGrid::new_with_prior(
@@ -1537,7 +1470,6 @@ fn narrower_log_capacity_prior_concentrates_more_mass_at_its_median() -> Result<
             service_time_median_seconds: 0.1_f64,
             capacity_median_per_second: 320.0_f64,
             log_standard_deviation: 8.0_f64.ln(),
-            window_influence_bound_probability: 0.05_f64,
         },
     )?;
     let narrow = capacity_prior(narrow)?;
@@ -1559,9 +1491,7 @@ fn default_capacity_prior_is_explicit_log_uniform() -> Result<(), TestError> {
         &service_times,
         &capacities,
         &[0.0_f64, 0.5_f64, 1.0_f64],
-        CapacityPrior::LogUniform {
-            window_influence_bound_probability: 0.05_f64,
-        },
+        CapacityPrior::LogUniform,
     )?;
 
     assert_eq!(
@@ -1592,72 +1522,9 @@ fn capacity_grid_accepts_exactly_representable_log_normal_parameters(
             service_time_median_seconds: service_median,
             capacity_median_per_second: capacity_median,
             log_standard_deviation,
-            window_influence_bound_probability: 0.05_f64,
         },
     );
     result.is_ok() == valid
-}
-
-#[test]
-fn consistent_capacity_windows_concentrate_the_posterior() -> Result<(), TestError> {
-    let simd_level = Level::new();
-    let grid = CapacityGrid::new_with_prior(
-        &[0.1_f64],
-        &[50.0_f64, 100.0_f64],
-        &[0.0_f64],
-        CapacityPrior::LogUniform {
-            window_influence_bound_probability: 0.05_f64,
-        },
-    )?;
-    let mut factor = CapacityFactor::new(grid, 0.0_f64);
-    let window = ResourceWindow::new(20.0_f64, 1.0_f64, 100)?;
-    for _ in 0_u32..128_u32 {
-        factor.update(simd_level, &window);
-    }
-    let mut values = [0.0_f64; 2];
-    let mut probabilities = [0.0_f64; 2];
-    factor.write_capacity_posterior(&mut values, &mut probabilities)?;
-
-    assert!((values[0] - 50.0_f64).abs() < f64::EPSILON);
-    assert!((values[1] - 100.0_f64).abs() < f64::EPSILON);
-    assert!(probabilities[1] > 0.99_f64);
-    Ok(())
-}
-
-#[test]
-fn one_application_trickle_window_cannot_erase_no_knee_mass() -> Result<(), TestError> {
-    let simd_level = Level::new();
-    let grid = CapacityGrid::new_with_prior(
-        &[0.001_f64, 0.01_f64, 0.1_f64],
-        &[2_000.0_f64, 4_000.0_f64],
-        &[0.0_f64, 1.0_f64],
-        CapacityPrior::LogUniform {
-            window_influence_bound_probability: 0.05_f64,
-        },
-    )?;
-    let mut factor = CapacityFactor::new(grid, 0.0_f64);
-    factor.update(simd_level, &ResourceWindow::new(0.003_f64, 1.0_f64, 3)?);
-
-    assert!(factor.no_knee_probability() >= 0.02_f64);
-    Ok(())
-}
-
-#[test]
-fn one_burst_onset_window_cannot_erase_no_knee_mass() -> Result<(), TestError> {
-    let simd_level = Level::new();
-    let grid = CapacityGrid::new_with_prior(
-        &[0.1_f64, 1.0_f64],
-        &[40.0_f64, 320.0_f64, 4_000.0_f64],
-        &[0.0_f64, 1.0_f64],
-        CapacityPrior::LogUniform {
-            window_influence_bound_probability: 0.05_f64,
-        },
-    )?;
-    let mut factor = CapacityFactor::new(grid, 0.0_f64);
-    factor.update(simd_level, &ResourceWindow::new(256.0_f64, 1.0_f64, 0)?);
-
-    assert!(factor.no_knee_probability() >= 0.02_f64);
-    Ok(())
 }
 
 fn capacity_prior(grid: CapacityGrid) -> Result<Vec<f64>, TestError> {
@@ -1673,7 +1540,7 @@ fn capacity_prior(grid: CapacityGrid) -> Result<Vec<f64>, TestError> {
 #[test]
 fn one_knee_cell_still_competes_with_no_knee() -> Result<(), TestError> {
     let grid = CapacityGrid::new(&[0.1_f64], &[100.0_f64], &[0.0_f64])?;
-    let factor = CapacityFactor::new(grid, 0.0_f64);
+    let factor = capacity_factor(grid, 1.0_f64)?;
     assert!(close_relative(factor.no_knee_probability(), 0.5_f64));
     Ok(())
 }
@@ -1780,9 +1647,10 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
         slots_per_replica: 1,
         posterior_sample_count: 1_024,
         report_interval_micros: 1_000_000,
+        resource_window_attempt_count_max: 100_000,
         failure_service_weight: 0.3_f64,
         arrival_prior: crate::ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
-        capacity_change_rate_per_second: 0.0_f64,
+        capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,
@@ -1842,9 +1710,10 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
         slots_per_replica: 1,
         posterior_sample_count: 128,
         report_interval_micros: 1_000_000,
+        resource_window_attempt_count_max: 100_000,
         failure_service_weight: 0.3_f64,
         arrival_prior: negligible_arrival_prior()?,
-        capacity_change_rate_per_second: 0.0_f64,
+        capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,
@@ -2433,9 +2302,10 @@ fn plateau_configuration() -> Result<Configuration, TestError> {
         slots_per_replica: 32,
         posterior_sample_count: 4_096,
         report_interval_micros: 1_000_000,
+        resource_window_attempt_count_max: 100_000,
         failure_service_weight: 0.3_f64,
         arrival_prior: crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
-        capacity_change_rate_per_second: 0.0_f64,
+        capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,
@@ -2450,7 +2320,7 @@ fn plateau_grid() -> Result<CapacityGrid, TestError> {
     Ok(CapacityGrid::new(
         &[0.025_f64, 0.05_f64, 0.1_f64, 0.2_f64],
         &capacities,
-        &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
+        &[0.0_f64],
     )?)
 }
 
@@ -2580,9 +2450,10 @@ fn configuration() -> Result<Configuration, TestError> {
         slots_per_replica: 4,
         posterior_sample_count: 128,
         report_interval_micros: 1_000_000,
+        resource_window_attempt_count_max: 100_000,
         failure_service_weight: 0.3_f64,
         arrival_prior: crate::ArrivalPrior::test_artifact(),
-        capacity_change_rate_per_second: 0.0_f64,
+        capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,
@@ -2629,6 +2500,25 @@ fn grid() -> Result<CapacityGrid, TestError> {
     )?)
 }
 
+fn capacity_factor(grid: CapacityGrid, concurrency_max: f64) -> Result<CapacityFactor, TestError> {
+    capacity_factor_with_rate(grid, 1.0_f64 / 86_400.0_f64, concurrency_max)
+}
+
+fn capacity_factor_with_rate(
+    grid: CapacityGrid,
+    change_rate_per_second: f64,
+    concurrency_max: f64,
+) -> Result<CapacityFactor, TestError> {
+    Ok(CapacityFactor::new_with_prior(
+        grid,
+        change_rate_per_second,
+        crate::ArrivalPrior::test_artifact(),
+        concurrency_max,
+        1.0_f64,
+        100_000,
+    )?)
+}
+
 #[derive(Debug, Error)]
 enum TestError {
     #[error(transparent)]
@@ -2637,6 +2527,8 @@ enum TestError {
     ResourceWindow(#[from] crate::ResourceWindowError),
     #[error(transparent)]
     CapacityGrid(#[from] crate::CapacityGridError),
+    #[error(transparent)]
+    CapacityModel(#[from] crate::CapacityModelError),
     #[error(transparent)]
     Posterior(#[from] crate::PosteriorError),
     #[error(transparent)]

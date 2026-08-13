@@ -109,12 +109,13 @@ pub fn run_batch_slo_with_inputs(
         slots_per_replica: DEFAULT_CONCURRENCY_PER_REPLICA,
         posterior_sample_count: 4_096,
         report_interval_micros: budget_micros,
+        resource_window_attempt_count_max: 100_000,
         failure_service_weight: 0.3_f64,
         // One arrival per second with one expected change per day is the
         // batch baseline; the batch drains a fixed backlog, so this prior
         // only shapes early rate uncertainty.
         arrival_prior: ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?,
-        capacity_change_rate_per_second: 0.0_f64,
+        capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,

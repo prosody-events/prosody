@@ -185,7 +185,10 @@ impl ScaleState {
             capacity_grid,
             configuration.capacity_change_rate_per_second,
             configuration.arrival_prior,
-        );
+            configuration.capacity_concurrency_max()?,
+            configuration.resource_exposure_min_seconds(),
+            configuration.resource_window_attempt_count_max,
+        )?;
         let capacity_classes = CapacityClasses::new(&configuration, &capacity)?;
         let class_count =
             u32::try_from(capacity_classes.len()).map_err(|_| ConfigurationError::PlatformLimit)?;
@@ -1067,7 +1070,7 @@ pub fn step(
     state.lead_time.transition(elapsed);
     state.rebalance_time.transition(elapsed);
     if let Some(window) = resource_window {
-        state.capacity.update(state.simd_level, &window);
+        state.capacity.update(&window);
     }
     if let Some(evidence) = attempt_outcomes {
         state.reliability.update(evidence);

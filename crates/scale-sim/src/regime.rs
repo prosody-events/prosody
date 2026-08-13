@@ -1588,6 +1588,7 @@ fn principal_graph(
             .schedule
             .workload_interval_micros
             .min(definition.schedule.followup_interval_micros),
+        resource_window_attempt_count_max: 100_000,
         failure_service_weight: DEFAULT_FAILURE_WEIGHT,
         arrival_prior: prosody_scale_core::ArrivalPrior::new(
             4.0_f64,
@@ -1674,35 +1675,27 @@ fn capacity_grid(
             service_time_median_seconds: 0.1_f64,
             capacity_median_per_second: 1_280.0_f64,
             log_standard_deviation: 2.0_f64.ln(),
-            window_influence_bound_probability: 0.05_f64,
         }
     } else if capacity_regime {
-        sensitivity.map_or(
-            CapacityPrior::LogUniform {
-                window_influence_bound_probability: 0.05_f64,
-            },
-            |variant| {
-                let factor: f64 = match variant {
-                    CapacitySensitivity::NarrowPrior => 2.0_f64,
-                    CapacitySensitivity::WidePrior => 8.0_f64,
-                    CapacitySensitivity::ReferencePrior
-                    | CapacitySensitivity::LowerGridCeiling
-                    | CapacitySensitivity::HigherGridCeiling => 4.0_f64,
-                };
-                CapacityPrior::LogNormal {
-                    service_time_median_seconds: 0.1_f64,
-                    capacity_median_per_second: 320.0_f64,
-                    log_standard_deviation: factor.ln(),
-                    window_influence_bound_probability: 0.05_f64,
-                }
-            },
-        )
+        sensitivity.map_or(CapacityPrior::LogUniform, |variant| {
+            let factor: f64 = match variant {
+                CapacitySensitivity::NarrowPrior => 2.0_f64,
+                CapacitySensitivity::WidePrior => 8.0_f64,
+                CapacitySensitivity::ReferencePrior
+                | CapacitySensitivity::LowerGridCeiling
+                | CapacitySensitivity::HigherGridCeiling => 4.0_f64,
+            };
+            CapacityPrior::LogNormal {
+                service_time_median_seconds: 0.1_f64,
+                capacity_median_per_second: 320.0_f64,
+                log_standard_deviation: factor.ln(),
+            }
+        })
     } else {
         CapacityPrior::LogNormal {
             service_time_median_seconds: 0.002_f64,
             capacity_median_per_second: 64_000.0_f64,
             log_standard_deviation: 100.0_f64.ln(),
-            window_influence_bound_probability: 0.05_f64,
         }
     };
     CapacityGrid::new_with_prior(
