@@ -1049,7 +1049,6 @@ pub fn step(
     state.capacity.transition(elapsed);
     state.lead_time.transition(elapsed);
     state.rebalance_time.transition(elapsed);
-    state.arrivals.prepare_calendar(calendar, now.as_micros());
     if let Some(window) = resource_window {
         state.capacity.update(state.simd_level, &window);
     }
@@ -1058,6 +1057,8 @@ pub fn step(
     }
     if let Some(evidence) = arrivals {
         state.arrivals.update(evidence, calendar, now.as_micros());
+    } else {
+        state.arrivals.prepare_calendar(calendar, now.as_micros());
     }
     if let Some(evidence) = partition_arrivals {
         state.partition_placement.update(evidence.consume());

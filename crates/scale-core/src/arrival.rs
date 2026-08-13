@@ -284,6 +284,8 @@ impl ArrivalFactor {
     /// `now_micros` is the evidence interval end.
     /// The producer certifies that the count covers exactly `[now - exposure,
     /// now]`. The producer controls delivery delay.
+    /// After the evidence applies, the update advances the calendar boundary to
+    /// `now_micros`.
     pub(crate) fn update(
         &mut self,
         evidence: ArrivalEvidence,
@@ -317,6 +319,7 @@ impl ArrivalFactor {
             self.calendar_rate += exposure;
         }
         self.transition(exposure, Some(count));
+        self.prepare_calendar(calendar, now_micros);
         self.last_evidence_micros = now_micros;
         drop(token);
     }

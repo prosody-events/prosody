@@ -84,17 +84,50 @@ fn crossing_interval_updates_its_start_calendar_segment() -> Result<(), super::A
         prior_probability: 0.5_f64,
         segments: &segments,
     };
+    let mut reference_segments = CalendarColumns::new(1);
+    reference_segments.extend(&[CalendarRateSegment {
+        position: 10,
+        start_micros: 0,
+        end_micros: 4_000_000,
+        shape: 2.0_f64,
+        rate_seconds: 2.0_f64,
+    }]);
+    let reference_calendar = CalendarForecast {
+        artifact: CalendarArtifactId(1),
+        prior_probability: 0.5_f64,
+        segments: &reference_segments,
+    };
     let mut factor = ArrivalFactor::new(model);
+    let mut reference = ArrivalFactor::new(model);
+
+    factor.update(
+        ArrivalEvidence::new(4, 1_000_000),
+        Some(calendar),
+        1_000_000,
+    );
+    reference.update(
+        ArrivalEvidence::new(4, 1_000_000),
+        Some(reference_calendar),
+        1_000_000,
+    );
 
     factor.update(
         ArrivalEvidence::new(6, 2_000_000),
         Some(calendar),
         3_000_000,
     );
+    reference.update(
+        ArrivalEvidence::new(6, 2_000_000),
+        Some(reference_calendar),
+        3_000_000,
+    );
 
-    assert_eq!(factor.calendar_position, 10);
-    assert!((factor.calendar_shape - 8.0_f64).abs() <= f64::EPSILON);
-    assert!((factor.calendar_rate - 4.0_f64).abs() <= f64::EPSILON);
+    assert!((reference.calendar_shape - 12.0_f64).abs() <= f64::EPSILON);
+    assert!((reference.calendar_rate - 5.0_f64).abs() <= f64::EPSILON);
+    assert!((factor.calendar_log_odds - reference.calendar_log_odds).abs() <= f64::EPSILON);
+    assert_eq!(factor.calendar_position, 11);
+    assert!((factor.calendar_shape - 100.0_f64).abs() <= f64::EPSILON);
+    assert!((factor.calendar_rate - 20.0_f64).abs() <= f64::EPSILON);
     Ok(())
 }
 
