@@ -45,7 +45,7 @@ pub mod state;
 mod topics;
 
 pub use backend::{CassandraClientBackend, ClientBackend, MemoryClientBackend};
-pub use codecs::{ClientHandler, CodecSet, Codecs, JsonCodecs};
+pub use codecs::{ClientHandler, CodecSet, Codecs, JsonBinaryCodecs, JsonCodecs};
 #[doc(hidden)]
 pub use deps::ReaderConfiguration;
 

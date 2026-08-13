@@ -108,11 +108,10 @@ pub trait BinaryFormat: 'static {
     const FORMAT_ID: &'static str;
 }
 
-/// The JSON document format, declared by [`JsonBinaryCodec`]. Format-equal
-/// with [`JsonCodec`](crate::codec::JsonCodec): both speak `"json"`, so
-/// collections written through either validate against the same frozen
-/// identity — this is what lets differently-implemented consumers share a
-/// collection.
+/// The JSON document format used by the binary JSON codecs.
+///
+/// It is format-equal with [`JsonCodec`](crate::codec::JsonCodec). This lets
+/// clients with different JSON implementations share data.
 pub struct JsonFormat;
 
 impl BinaryFormat for JsonFormat {
@@ -227,14 +226,12 @@ pub struct JsonExtractor {
 /// extraction and the declared [`JsonFormat`]: the application commits to
 /// writing JSON documents, and the codec is format-equal with
 /// [`JsonCodec`](crate::codec::JsonCodec).
-pub type JsonBinaryCodec = BinaryCodec<JsonExtractor, JsonFormat>;
+pub type JsonBinaryMessageCodec = BinaryCodec<JsonExtractor, JsonFormat>;
 
 /// A [`BinaryExtractor`] that pulls no metadata and never parses.
 ///
-/// The keyed-state value path never needs an event id or type, and it must
-/// not parse: a state cell can hold any JSON document — a scalar, an array,
-/// or an object — none of which an object-shaped metadata parse would accept.
-/// Extraction is infallible and always yields empty metadata.
+/// Non-message values do not need an event id or type. They can contain any
+/// JSON shape, so this extractor leaves them unchanged.
 #[derive(Default)]
 pub struct NoopExtractor;
 
@@ -252,15 +249,11 @@ impl BinaryExtractor for NoopExtractor {
     }
 }
 
-/// Verbatim JSON state codec for the C# binding's `BinaryPayload`: raw bytes
-/// in and out, never parsed by Rust. Composed from [`NoopExtractor`] and
-/// [`JsonFormat`], which owns the `"json"` cross-client identity-compatibility
-/// invariant.
+/// Verbatim JSON codec for a caller that owns JSON validation.
 ///
-/// Because it never parses, the codec cannot enforce that the bytes are valid
-/// JSON: a binding writing through it must write JSON documents, or it breaks
-/// the mutually-decodable-bytes promise [`JsonFormat`] makes on its behalf.
-pub type JsonPassthroughStateCodec = BinaryCodec<NoopExtractor, JsonFormat>;
+/// It does not parse the bytes or extract message metadata. The caller must
+/// supply JSON documents to keep the [`JsonFormat`] contract.
+pub type JsonBinaryCodec = BinaryCodec<NoopExtractor, JsonFormat>;
 
 #[derive(Deserialize)]
 struct JsonMetaView<'a> {

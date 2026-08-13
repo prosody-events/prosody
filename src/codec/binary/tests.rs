@@ -212,7 +212,7 @@ fn json_id_non_object_propagates_error() {
 fn json_id_via_binary_codec() -> color_eyre::Result<()> {
     let mut wire = br#"{"id":"evt-1","payload":{"x":1}}"#.to_vec();
     let original = wire.clone();
-    let mut codec = JsonBinaryCodec::default();
+    let mut codec = JsonBinaryMessageCodec::default();
     let payload = codec.deserialize(&mut wire)?;
     assert_eq!(payload.bytes, original);
     assert_eq!(payload.event_id(), Some("evt-1"));
@@ -246,7 +246,7 @@ fn json_type_missing_returns_none() -> Result<(), JsonExtractError> {
 fn json_type_via_binary_codec() -> color_eyre::Result<()> {
     let mut wire = br#"{"id":"evt-1","type":"user.created","data":{}}"#.to_vec();
     let original = wire.clone();
-    let mut codec = JsonBinaryCodec::default();
+    let mut codec = JsonBinaryMessageCodec::default();
     let payload = codec.deserialize(&mut wire)?;
     assert_eq!(payload.bytes, original);
     assert_eq!(payload.event_id(), Some("evt-1"));

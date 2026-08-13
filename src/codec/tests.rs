@@ -1,4 +1,4 @@
-use super::{BinaryPayload, Codec, JsonBinaryCodec, JsonCodec, JsonPassthroughStateCodec};
+use super::{BinaryPayload, Codec, JsonBinaryCodec, JsonBinaryMessageCodec, JsonCodec};
 use crate::test_util::ArbJson;
 use bytes::BytesMut;
 use quickcheck::{QuickCheck, TestResult};
@@ -13,7 +13,7 @@ use serde_json::Value;
 fn format_ids_are_stable() {
     assert_eq!(JsonCodec::FORMAT_ID, "json");
     assert_eq!(JsonBinaryCodec::FORMAT_ID, "json");
-    assert_eq!(JsonPassthroughStateCodec::FORMAT_ID, "json");
+    assert_eq!(JsonBinaryMessageCodec::FORMAT_ID, "json");
 }
 
 /// Serializes `value` through a fresh [`JsonCodec`].
@@ -29,7 +29,7 @@ fn json_bytes(value: &Value) -> Vec<u8> {
 }
 
 /// The `"json"` format-id promises mutually decodable bytes: whatever
-/// [`JsonCodec`] writes, the erased state seam's [`JsonPassthroughStateCodec`]
+/// [`JsonCodec`] writes, [`JsonBinaryCodec`]
 /// reads back byte-for-byte (it never parses), and re-decoding those bytes
 /// through `JsonCodec` reproduces the original value — for every JSON shape,
 /// including `null`, scalars, arrays, and objects. This pins the cross-client
@@ -39,7 +39,7 @@ fn json_bytes(value: &Value) -> Vec<u8> {
 /// codec drop or mutate a byte and the recovered bytes / re-decoded value
 /// diverge.
 #[test]
-fn passthrough_state_codec_byte_compatible_with_json() {
+fn binary_json_codec_is_byte_compatible_with_json() {
     fn prop(ArbJson(value): ArbJson) -> TestResult {
         let bytes = json_bytes(&value);
         let mut borrowed_bytes = Vec::new();
@@ -57,7 +57,7 @@ fn passthrough_state_codec_byte_compatible_with_json() {
         }
 
         // JsonCodec bytes -> passthrough deserialize -> verbatim bytes.
-        let mut passthrough = JsonPassthroughStateCodec::default();
+        let mut passthrough = JsonBinaryCodec::default();
         let mut scratch = bytes.clone();
         match passthrough.deserialize(&mut scratch) {
             Ok(payload) if payload.bytes == bytes => {}
@@ -67,7 +67,7 @@ fn passthrough_state_codec_byte_compatible_with_json() {
 
         // passthrough serialize -> JsonCodec deserialize -> original value.
         let mut out = Vec::new();
-        let mut passthrough = JsonPassthroughStateCodec::default();
+        let mut passthrough = JsonBinaryCodec::default();
         if passthrough
             .serialize(
                 BinaryPayload::new(bytes, None::<String>, None::<String>),
