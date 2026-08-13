@@ -161,16 +161,6 @@ fn requesting(index: u8, request_byte: u8, key: &str) -> Result<ConsumerMessage<
     requesting_under(index, request_byte, key, Span::current())
 }
 
-/// A message with an explicit Unix response deadline.
-fn requesting_at(
-    index: u8,
-    request_byte: u8,
-    key: &str,
-    deadline_micros: u64,
-) -> Result<ConsumerMessage<Value>> {
-    requesting_at_under(index, request_byte, key, deadline_micros, Span::current())
-}
-
 fn requesting_at_under(
     index: u8,
     request_byte: u8,

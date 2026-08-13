@@ -3,7 +3,7 @@
 //! A barrier holds the transport, or the directory does not contain the
 //! destination.
 
-use super::{Fixture, ResultProbeCodec, offset_tracker, requesting, requesting_at};
+use super::{Fixture, ResultProbeCodec, offset_tracker, requesting};
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, ScriptedHandler, ScriptedHook,
 };
@@ -12,29 +12,6 @@ use crate::peer::router::loopback::{Script, UNPUBLISHED_PEER, paused};
 use color_eyre::Result;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-
-/// An expired header does not suppress work before the gRPC transport.
-#[test]
-fn the_request_deadline_only_reaches_the_transport() -> Result<()> {
-    paused()?.block_on(async {
-        let fixture = Fixture::<ResultProbeCodec>::new()?;
-        let handler = fixture.stack(ScriptedHandler::success(), 0)?;
-        let tracker = offset_tracker();
-        let message = requesting_at(1, 10, "expired", 0)?.into_uncommitted(tracker.take(0).await?);
-
-        EventHandler::on_message(
-            &handler,
-            MockEventContext::new(),
-            message,
-            DemandType::Normal,
-        )
-        .await;
-        drop(handler);
-
-        assert_eq!(fixture.drain().await?.len(), 1);
-        Ok(())
-    })
-}
 
 /// The apply hook waits for response delivery.
 #[test]

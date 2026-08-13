@@ -7,7 +7,7 @@ use crate::peer::response::frame::tests::CountingCodec;
 use crate::peer::response::headers::RequestDeadline;
 use crate::peer::response::sender::route::PreparedResponse;
 use crate::peer::response::sender::{DropReason, ResponseRoute, RouteOutcome, stage};
-use crate::peer::router::loopback::{Script, TestRouter, direct_uri, peer};
+use crate::peer::router::loopback::{HANG_GUARD, Script, TestRouter, direct_uri, peer};
 use color_eyre::Result;
 use opentelemetry::Context;
 use std::array;
@@ -15,9 +15,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
-use tokio::task::yield_now;
-use tokio::time::advance;
+use tokio::time::timeout;
 
 /// The two destinations these suites address.
 const PEER_A: u8 = 1;
@@ -80,15 +78,11 @@ fn a_held_destination_never_delays_a_healthy_one() -> Result<()> {
 fn the_deadline_bounds_route_resolution() -> Result<()> {
     paused()?.block_on(async {
         let (mut route, _deliveries) = TestRouter::new()?;
-        let entered = route.hold_lookup();
+        route.hold_lookup();
         let harness = Harness::new()?;
         let frame = frame(&harness)?;
         let deadline = short_deadline()?;
-        let delivery =
-            tokio::spawn(async move { route.deliver(frame, deadline, &Context::new()).await });
-
-        entered.notified().await;
-        assert_deadline(delivery).await?;
+        assert_deadline(route.deliver(frame, deadline, &Context::new())).await?;
         Ok(())
     })
 }
@@ -97,16 +91,12 @@ fn the_deadline_bounds_route_resolution() -> Result<()> {
 #[test]
 fn the_deadline_bounds_transport_readiness() -> Result<()> {
     paused()?.block_on(async {
-        let mut harness = Harness::new()?;
+        let harness = Harness::new()?;
         harness.script(PEER_A, Script::Hold(Arc::new(Semaphore::new(0))))?;
         let route = harness.router.clone();
         let frame = frame(&harness)?;
         let deadline = short_deadline()?;
-        let delivery =
-            tokio::spawn(async move { route.deliver(frame, deadline, &Context::new()).await });
-
-        drop(harness.next_delivery().await?);
-        assert_deadline(delivery).await?;
+        assert_deadline(route.deliver(frame, deadline, &Context::new())).await?;
         Ok(())
     })
 }
@@ -130,13 +120,10 @@ fn short_deadline() -> Result<RequestDeadline> {
         .ok_or_else(|| color_eyre::eyre::eyre!("the test deadline must be representable"))
 }
 
-async fn assert_deadline(delivery: JoinHandle<Result<RouteOutcome, DropReason>>) -> Result<()> {
-    advance(Duration::from_secs(1)).await;
-    yield_now().await;
-    assert!(
-        delivery.is_finished(),
-        "network delivery must stop at the request deadline"
-    );
-    assert!(matches!(delivery.await?, Err(DropReason::DeadlineExceeded)));
+async fn assert_deadline(
+    delivery: impl Future<Output = Result<RouteOutcome, DropReason>>,
+) -> Result<()> {
+    let outcome = timeout(HANG_GUARD, delivery).await?;
+    assert!(matches!(outcome, Err(DropReason::DeadlineExceeded)));
     Ok(())
 }

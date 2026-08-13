@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
 use tonic::codegen::http::{Uri, uri::InvalidUri};
 use tonic::transport::Error as TransportError;
@@ -87,7 +87,7 @@ pub(crate) struct LoopbackSender {
 pub(crate) struct TestRouter {
     transport: Arc<LoopbackSender>,
     registrations: Arc<HashMap<PeerId, Arc<PeerRegistration>>>,
-    held_lookup: Option<Arc<Notify>>,
+    hold_lookup: bool,
 }
 
 /// What one attempt gets, once the script has been consulted.
@@ -154,7 +154,7 @@ impl TestRouter {
             Self {
                 transport: Arc::new(transport),
                 registrations: Arc::new(registrations),
-                held_lookup: None,
+                hold_lookup: false,
             },
             deliveries,
         ))
@@ -166,11 +166,9 @@ impl TestRouter {
         Ok(())
     }
 
-    /// Holds every route lookup and reports when one starts.
-    pub(crate) fn hold_lookup(&mut self) -> Arc<Notify> {
-        let entered = Arc::new(Notify::new());
-        self.held_lookup = Some(Arc::clone(&entered));
-        entered
+    /// Holds every route lookup.
+    pub(crate) fn hold_lookup(&mut self) {
+        self.hold_lookup = true;
     }
 }
 
@@ -183,15 +181,8 @@ impl NetworkRouter for TestRouter {
             .registrations
             .get(&peer)
             .and_then(|registration| choose_route(None, registration));
-        let held = self.held_lookup.clone();
-        async move {
-            if let Some(entered) = held {
-                entered.notify_one();
-                pending().await
-            } else {
-                Ok(route)
-            }
-        }
+        let held = self.hold_lookup;
+        async move { if held { pending().await } else { Ok(route) } }
     }
 }
 
