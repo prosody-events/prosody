@@ -7,6 +7,7 @@ use crate::peer::response::frame::tests::CountingCodec;
 use crate::peer::response::headers::RequestDeadline;
 use crate::peer::response::sender::route::PreparedResponse;
 use crate::peer::response::sender::{DropReason, ResponseRoute, RouteOutcome, stage};
+use crate::peer::router::SendFailure;
 use crate::peer::router::loopback::{HANG_GUARD, Script, TestRouter, direct_uri, peer};
 use color_eyre::Result;
 use opentelemetry::Context;
@@ -80,23 +81,34 @@ fn the_deadline_bounds_route_resolution() -> Result<()> {
         let (mut route, _deliveries) = TestRouter::new()?;
         route.hold_lookup();
         let harness = Harness::new()?;
-        let frame = frame(&harness)?;
+        let held = frame(&harness)?;
         let deadline = short_deadline()?;
-        assert_deadline(route.deliver(frame, deadline, &Context::new())).await?;
+        assert_deadline(route.deliver(held, deadline, &Context::new())).await?;
         Ok(())
     })
 }
 
-/// The request deadline cancels a transport that does not become ready.
+/// The request deadline cancels a held transport and classifies expiration.
 #[test]
 fn the_deadline_bounds_transport_readiness() -> Result<()> {
     paused()?.block_on(async {
         let harness = Harness::new()?;
         harness.script(PEER_A, Script::Hold(Arc::new(Semaphore::new(0))))?;
         let route = harness.router.clone();
-        let frame = frame(&harness)?;
+        let held = frame(&harness)?;
         let deadline = short_deadline()?;
-        assert_deadline(route.deliver(frame, deadline, &Context::new())).await?;
+        assert_deadline(route.deliver(held, deadline, &Context::new())).await?;
+        harness.script(
+            PEER_A,
+            Script::Fail {
+                failure: SendFailure::Expired,
+                times: 1,
+            },
+        )?;
+        let outcome = route
+            .deliver(frame(&harness)?, short_deadline()?, &Context::new())
+            .await;
+        assert!(matches!(outcome, Err(DropReason::DeadlineExceeded)));
         Ok(())
     })
 }

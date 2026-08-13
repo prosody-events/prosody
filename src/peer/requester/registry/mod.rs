@@ -34,6 +34,7 @@ type ResponseKey = (RequestId, SubsystemName);
 type FrameSender = oneshot::Sender<ResponseFrame>;
 type FrameReceiver = oneshot::Receiver<ResponseFrame>;
 type FrameReceivers = SmallVec<[FrameReceiver; INLINE_AWAITED]>;
+pub(super) type IndexedFrameReceivers = SmallVec<[(usize, FrameReceiver); INLINE_AWAITED]>;
 type PendingSenders = HashMap<ResponseKey, FrameSender, RandomState>;
 
 /// Pending response channels for one process.

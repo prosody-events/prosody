@@ -174,9 +174,7 @@ pub(crate) use modes::{NoResponses, Responding, ResponsePolicy};
 pub(crate) mod observer;
 pub(crate) mod partition;
 mod poll;
-// Crate-wide: the peer listener's health service answers from the same
-// readiness and liveness predicates this module's HTTP probes serve.
-pub(crate) mod probes;
+mod probes;
 pub mod storage;
 mod sweep;
 mod wiring;
@@ -324,23 +322,24 @@ impl<C: Codec> ProsodyConsumer<C> {
     /// A call on a clone behaves the same after another clone stops the
     /// consumer.
     pub async fn shutdown(mut self) {
-        let Some((teardown, poll_failure)) = self.stop_polling().await else {
-            return;
-        };
-        let swept = sweep::drain_managers(&self.managers).await;
-        teardown.release(swept).await;
-        if let Some(error) = poll_failure {
+        if let Some(error) = self.finish_shutdown().await {
             error!(%error, "consumer shutdown failed");
         }
+    }
+
+    /// Stops polling, drains every manager, and releases observations.
+    async fn finish_shutdown(&mut self) -> Option<ShutdownError> {
+        let (teardown, poll_failure) = self.stop_polling().await?;
+        let swept = sweep::drain_managers(&self.managers).await;
+        teardown.release(swept).await;
+        poll_failure
     }
 
     /// Stops result-request reading and the poll loop, then waits for the loop.
     ///
     /// Answers `None` to every caller but the one that takes the runtime state,
-    /// so a losing caller runs no step of the teardown at all. The winner also
-    /// gets the poll loop's join failure, because
-    /// [`shutdown`](Self::shutdown) reports it and [`Drop`](Self::drop) can
-    /// only log it.
+    /// so a losing caller runs no teardown step. The winner gets the poll
+    /// loop's join failure for its caller to log.
     async fn stop_polling(&mut self) -> Option<(Teardown, Option<ShutdownError>)> {
         let RuntimeState {
             poll_handle,
@@ -381,27 +380,9 @@ impl Teardown {
             probe_server.shutdown().await;
         }
     }
-
-    /// Retires the observation gauges and stops the probe server.
-    ///
-    /// [`Drop`](ProsodyConsumer::drop) calls this instead of
-    /// [`release`](Self::release), because it runs no sweep and holds no proof.
-    async fn stop_observation(self) {
-        // The `BaseConsumer` is dropped inside the poll task, so its close-time
-        // polling — which can deliver one last statistics sample — finished
-        // before the join handle resolved. Nothing can record over this.
-        self.observer.retire_gauges();
-
-        if let Some(probe_server) = self.probe_server {
-            probe_server.shutdown().await;
-        }
-    }
 }
 
-/// Stops the poll loop when a consumer drops without a shutdown.
-///
-/// `Drop` also runs no partition sweep, which
-/// [`shutdown`](ProsodyConsumer::shutdown) performs.
+/// Stops the consumer when it drops without an explicit shutdown.
 ///
 /// This path does await the probe server task. A current-thread runtime cannot
 /// drive that task while this blocks its only thread, so call `shutdown` from
@@ -412,11 +393,8 @@ impl Teardown {
 impl<C: Codec> Drop for ProsodyConsumer<C> {
     fn drop(&mut self) {
         block_on(async {
-            if let Some((teardown, poll_failure)) = self.stop_polling().await {
-                if let Some(error) = poll_failure {
-                    error!("consumer shutdown failed: {error:#}");
-                }
-                teardown.stop_observation().await;
+            if let Some(error) = self.finish_shutdown().await {
+                error!("consumer shutdown failed: {error:#}");
             }
         });
     }

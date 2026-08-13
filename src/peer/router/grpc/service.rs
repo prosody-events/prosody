@@ -155,7 +155,7 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
                             record_status(&forward, code);
                             forward.in_scope(|| error!(error = %code.description()));
                             record_status(&span, code);
-                            span.record("peer.disposition", code.description());
+                            span.record("peer.disposition", "target_error");
                             span.in_scope(|| error!(error = %code.description()));
                             Err(service_status(code, code.description()))
                         }

@@ -43,13 +43,13 @@ async fn a_consumer_without_responses_starts_and_stops() -> Result<()> {
     Ok(())
 }
 
-/// The router outlives the handlers. Consumer shutdown joins the poll loop and
+/// The router outlives the handlers. Consumer drop joins the poll loop and
 /// sweeps the partition manager before router shutdown deregisters the peer.
 ///
 /// The sweep is what bounds the peer teardown, so its position between the two
 /// is asserted rather than its occurrence.
 #[tokio::test(flavor = "multi_thread")]
-async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
+async fn peer_teardown_follows_drop_and_the_sweep() -> Result<()> {
     let log: EventLog = Arc::new(Mutex::new(Vec::new()));
     let directory = RecordingDirectory::new(Arc::clone(&log), false);
     let backend = RecordingBackend {
@@ -76,7 +76,7 @@ async fn peer_teardown_follows_the_poll_loop_and_the_sweep() -> Result<()> {
     );
     retain_manager(&config, &managers, Arc::clone(&log))?;
 
-    consumer.shutdown().await;
+    drop(consumer);
     router.shutdown().await?;
 
     let events = log.lock();

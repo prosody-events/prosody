@@ -88,7 +88,6 @@ where
     R: ResultRequestReader + 'static,
 {
     if let Err(error) = consumer_config.validate() {
-        drop(handler_provider);
         return Err(error.into());
     }
     let StartupServices {
@@ -116,7 +115,6 @@ where
     {
         Ok(probe_server) => probe_server,
         Err(error) => {
-            drop(handler_provider);
             return Err(error.into());
         }
     };
@@ -222,17 +220,19 @@ where
     C: Codec,
     C::Payload: EventType + Clone + EventIdentity,
 {
-    let context = new_context(
-        consumer_config,
-        handler_provider,
-        providers,
-        watermark_version,
-        handles,
-        version,
-    )?;
-    let consumer: BaseConsumer<_> = client_config(consumer_config)?.create_with_context(context)?;
-    let topics = consumer_config.subscribed_topics.clone();
+    let consumer_config = consumer_config.clone();
     spawn_blocking(move || {
+        let context = new_context(
+            &consumer_config,
+            handler_provider,
+            providers,
+            watermark_version,
+            handles,
+            version,
+        )?;
+        let consumer: BaseConsumer<_> =
+            client_config(&consumer_config)?.create_with_context(context)?;
+        let topics = &consumer_config.subscribed_topics;
         let topics: Vec<&str> = topics.iter().map(String::as_str).collect();
         consumer.subscribe(&topics)?;
         observer.install_startup_metadata(&consumer)?;

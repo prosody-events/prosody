@@ -8,7 +8,7 @@ use crate::peer::response::ResponseDisposition;
 use crate::peer::response::frame::FrameHeader;
 use crate::peer::response::frame::encode::{Staged, stage_error, stage_success};
 use crate::peer::response::headers::RequestDeadline;
-use crate::peer::router::{EndpointKind, NetworkRouter, ResponseSender};
+use crate::peer::router::{EndpointKind, NetworkRouter, ResponseSender, SendFailure};
 use opentelemetry::Context;
 use opentelemetry_semantic_conventions::attribute::ERROR_TYPE;
 use std::fmt::Display;
@@ -168,7 +168,10 @@ impl<R: NetworkRouter> ResponseRoute for R {
                 .await
             {
                 warn!(%failure, peer = %target, endpoint_kind = kind.label(), "response delivery failed");
-                return Err(DropReason::SendFailed);
+                return Err(match failure {
+                    SendFailure::Expired => DropReason::DeadlineExceeded,
+                    SendFailure::Status(_) | SendFailure::Unreachable => DropReason::SendFailed,
+                });
             }
             Ok(RouteOutcome::Delivered(Delivery::Remote(kind)))
         };

@@ -170,9 +170,9 @@ impl ProbeServer {
 async fn readiness_probe<P: Send + Sync + 'static>(
     State(ProbeState { managers, .. }): State<ProbeState<P>>,
 ) -> (StatusCode, Cow<'static, str>) {
-    if is_ready(&managers) {
+    let assigned_count = get_assigned_partition_count(&managers);
+    if assigned_count > 0 {
         // Partitions assigned - service is ready
-        let assigned_count = get_assigned_partition_count(&managers);
         (
             StatusCode::OK,
             Cow::Owned(format!("{assigned_count} partitions assigned")),
@@ -210,16 +210,6 @@ async fn liveness_probe<P: Send + Sync + 'static>(
              details.",
         )
     }
-}
-
-/// Whether this consumer is ready: Kafka has assigned it at least one
-/// partition.
-///
-/// This predicate and [`is_live`] are the process's only readiness and liveness
-/// verdicts. Every health surface calls them, so no two surfaces can answer the
-/// same question differently.
-pub(crate) fn is_ready<P: Send + Sync + 'static>(managers: &Managers<P>) -> bool {
-    get_assigned_partition_count(managers) != 0
 }
 
 /// Whether this consumer is live: no consumer-level actor and no partition has

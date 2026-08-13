@@ -1,16 +1,16 @@
 //! Concurrent Kafka delivery and subsystem response collection.
 
-use super::registry::Registration;
+use super::registry::{IndexedFrameReceivers, Registration};
 use super::{RequestError, ResponseError};
 use crate::Codec;
 use crate::peer::response::frame::{FrameResult, HandlerError, ResponseFrame, ResponseSuccess};
 use crate::producer::ProducerError;
-use futures::FutureExt;
-use futures::stream::{FuturesUnordered, StreamExt};
 use std::error::Error;
-use std::future::Future;
-use std::pin::pin;
+use std::future::{Future, poll_fn};
+use std::pin::{Pin, pin};
+use std::task::Poll;
 use tokio::select;
+use tokio::sync::oneshot::error::RecvError;
 use tokio::time::sleep_until;
 
 /// Races Kafka delivery, subsystem responses, and the request deadline.
@@ -31,12 +31,10 @@ where
     let mut results = (0..receivers.len())
         .map(|_| Err(ResponseError::Timeout))
         .collect::<Vec<_>>();
-    // This set allocates per receiver but polls only receivers that wake. A
-    // contiguous scan can make an unfavorable response order quadratic.
-    let mut responses = FuturesUnordered::new();
-    for (index, receiver) in receivers.into_iter().enumerate() {
-        responses.push(receiver.map(move |frame| (index, frame)));
-    }
+    let mut responses = receivers
+        .into_iter()
+        .enumerate()
+        .collect::<IndexedFrameReceivers>();
 
     let mut produce = pin!(produce);
     let mut deadline = pin!(sleep_until(deadline));
@@ -48,7 +46,7 @@ where
                 report.map_err(RequestError::Produce)?;
                 reported = true;
             }
-            Some((index, frame)) = responses.next() => {
+            (index, frame) = next_response(&mut responses), if !responses.is_empty() => {
                 match frame {
                     Ok(frame) => results[index] = decode::<R>(frame),
                     Err(_) => return Err(RequestError::ShuttingDown),
@@ -59,6 +57,23 @@ where
     }
 
     Ok(results)
+}
+
+/// Returns the next response without allocating one task node per receiver.
+/// The collection loop calls this only while at least one receiver remains.
+async fn next_response(
+    responses: &mut IndexedFrameReceivers,
+) -> (usize, Result<ResponseFrame, RecvError>) {
+    poll_fn(|context| {
+        for slot in 0..responses.len() {
+            if let Poll::Ready(frame) = Pin::new(&mut responses[slot].1).poll(context) {
+                let (index, _) = responses.swap_remove(slot);
+                return Poll::Ready((index, frame));
+            }
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 fn decode<R: Codec>(frame: ResponseFrame) -> Result<R::Payload, ResponseError> {
