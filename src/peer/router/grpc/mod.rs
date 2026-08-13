@@ -17,7 +17,6 @@
 
 pub(crate) mod client;
 pub(crate) mod codec;
-mod conn;
 mod deadline;
 mod inject;
 pub(crate) mod service;
@@ -38,7 +37,6 @@ pub(crate) mod generated {
 #[cfg(test)]
 mod tests;
 
-use self::conn::incoming;
 use self::generated::peer_service_server::PeerServiceServer;
 use self::service::PeerService;
 use crate::peer::router::RelayHop;
@@ -49,6 +47,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
+use tonic::transport::server::TcpIncoming;
 use tonic_health::server::health_reporter;
 use tonic_reflection::server::{Builder as ReflectionBuilder, Error as ReflectionError};
 use tracing::error;
@@ -115,7 +114,7 @@ where
     let reflection = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(DESCRIPTOR_SET)
         .build_v1()?;
-    let incoming = incoming(bound.listener);
+    let incoming = TcpIncoming::from(bound.listener).with_nodelay(Some(true));
     let (health_reporter, health) = health_reporter();
     health_reporter
         .set_serving::<PeerServiceServer<PeerService<R>>>()

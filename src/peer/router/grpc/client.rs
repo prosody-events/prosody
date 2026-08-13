@@ -1,6 +1,7 @@
 //! The peer client: one framed response, over a real socket, to one address.
 
 use super::codec::ClientFrameCodec;
+use super::generated::peer_service_server::SERVICE_NAME;
 use super::inject::MetadataInjector;
 use super::telemetry::{METHOD, record_status};
 use crate::peer::router::cache_config::PeerCacheConfiguration;
@@ -16,6 +17,7 @@ use quick_cache::sync::Cache;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::time::Instant;
+use tonic::GrpcMethod;
 use tonic::client::Grpc;
 use tonic::codegen::http::{Uri, uri::PathAndQuery};
 use tonic::transport::Channel;
@@ -24,6 +26,9 @@ use tracing::{Span, warn};
 
 /// First timeout that Tonic cannot write as an eight-digit gRPC value.
 pub(super) const GRPC_TIMEOUT_LIMIT: Duration = Duration::from_hours(100_000_000);
+
+/// Method name Tonic attaches to a generated client request.
+const DELIVER_RESULT_METHOD: &str = "DeliverResult";
 
 /// The one method a response travels over.
 ///
@@ -102,6 +107,9 @@ impl ResponseSender for GrpcSender {
         let channel = self.channel(address).await?;
         let bytes = frame.bytes();
         let mut request = Request::new(frame.clone());
+        request
+            .extensions_mut()
+            .insert(GrpcMethod::new(SERVICE_NAME, DELIVER_RESULT_METHOD));
         self.propagator
             .inject_context(context, &mut MetadataInjector::new(request.metadata_mut()));
         let mut client = Grpc::new(channel);

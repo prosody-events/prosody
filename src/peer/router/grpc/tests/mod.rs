@@ -29,9 +29,8 @@ use crate::peer::router::directory::Endpoint;
 use crate::peer::router::loopback::listener::{FixedRouter, Served, bind_address, endpoint};
 use crate::peer::router::loopback::{TestRouter, config as fleet_config, registration};
 use crate::peer::router::relay::Relay;
-use crate::peer::router::{Framed, LocalTarget, PeerId, ResponseSender, SendFailure};
+use crate::peer::router::{LocalTarget, PeerId, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
-use bytes::BufMut;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use std::net::SocketAddr;
@@ -69,10 +68,6 @@ pub(super) struct Harness {
     pub(super) address: Endpoint,
     served: Served,
 }
-
-/// Gives an empty stream the frame type its codec requires.
-#[derive(Clone)]
-struct EmptyFrame;
 
 impl Harness {
     /// The listener every suite shares.
@@ -139,14 +134,6 @@ pub(super) fn reaching(address: &Endpoint) -> Result<FixedRouter> {
         Some(registration(address)?),
         None,
     ))
-}
-
-impl Framed for EmptyFrame {
-    fn bytes(&self) -> usize {
-        0
-    }
-
-    fn write<B: BufMut>(&self, _dst: &mut B) {}
 }
 
 pub(super) fn registry() -> Arc<PendingRegistry> {
