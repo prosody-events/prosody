@@ -8,7 +8,7 @@ use crate::peer::response::ResponseDisposition;
 use crate::peer::response::frame::FrameHeader;
 use crate::peer::response::frame::encode::{Staged, stage_error, stage_success};
 use crate::peer::response::headers::RequestDeadline;
-use crate::peer::router::{NetworkRouter, Preference, ResponseSender};
+use crate::peer::router::{EndpointKind, NetworkRouter, ResponseSender};
 use opentelemetry::Context;
 use opentelemetry_semantic_conventions::attribute::ERROR_TYPE;
 use std::fmt::Display;
@@ -38,9 +38,9 @@ pub(crate) struct Then<A, B>(pub(crate) A, pub(crate) B);
 ///
 /// Every response ends as exactly one outcome. It moves one stage or one
 /// drop reason, one of this sender's two counters, and the `peer.disposition`
-/// attribute on its own span. A delivered job also records `peer.preference`.
-/// Every count of a response's outcome sits in this one match. Thus, no
-/// counters can disagree.
+/// attribute on its own span. A delivered job also records
+/// `peer.endpoint.kind`. Every count of a response's outcome sits in this one
+/// match. Thus, no counters can disagree.
 /// The `peer.response.send` span is opened here and covers the delivery alone.
 /// It is a child of the trace the job carries, so the listener's
 /// `peer.response.receive` — parented on the context this span's own injection
@@ -65,7 +65,7 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
         peer.request = %header.request,
         peer.subsystem = %header.subsystem,
         peer.disposition = Empty,
-        peer.preference = Empty,
+        peer.endpoint.kind = Empty,
     );
     let context = context_with_parent(&span, trace);
     let outcome = match prepared {
@@ -81,14 +81,11 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
     match outcome {
         Ok(delivery) => {
             span.record("peer.disposition", "delivered");
-            match delivery {
-                Delivery::Local => {
-                    span.record("peer.preference", "local");
-                }
-                Delivery::Remote(preference) => {
-                    span.record("peer.preference", preference.label());
-                }
-            }
+            let endpoint_kind = match delivery {
+                Delivery::Local => "local",
+                Delivery::Remote(kind) => kind.label(),
+            };
+            span.record("peer.endpoint.kind", endpoint_kind);
             Stage::Delivered.record();
         }
         Err(reason) => {
@@ -158,16 +155,16 @@ impl<R: NetworkRouter> ResponseRoute for R {
                 return Err(DropReason::LookupFailed);
             }
         };
-        let (preference, address) = route.endpoint();
+        let (kind, address) = route.endpoint();
         if let Err(failure) = self
             .sender()
             .deliver(address, &frame, deadline.expires_at(), context)
             .await
         {
-            warn!(%failure, peer = %target, preference = preference.label(), "response delivery failed");
+            warn!(%failure, peer = %target, endpoint_kind = kind.label(), "response delivery failed");
             return Err(DropReason::SendFailed);
         }
-        Ok(RouteOutcome::Delivered(Delivery::Remote(preference)))
+        Ok(RouteOutcome::Delivered(Delivery::Remote(kind)))
     }
 }
 
@@ -190,7 +187,7 @@ pub enum Delivery {
     /// The local registry accepted it without transport work.
     Local,
     /// A remote endpoint accepted it.
-    Remote(Preference),
+    Remote(EndpointKind),
 }
 
 /// Whether one route accepted a frame or left it for the next route.

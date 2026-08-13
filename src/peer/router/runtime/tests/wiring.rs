@@ -30,7 +30,7 @@ use crate::peer::router::loopback::{
     HANG_GUARD, TestRouter, config as fleet_config, direct_address,
 };
 use crate::peer::router::relay::Relay;
-use crate::peer::router::{Host, LocalTarget, NetworkRouter, PeerId, Preference, ResponseSender};
+use crate::peer::router::{EndpointKind, Host, LocalTarget, NetworkRouter, PeerId, ResponseSender};
 use crate::subsystem::SubsystemName;
 use crate::test_util::TEST_RUNTIME;
 use crate::tracing::init_test_logging;
@@ -162,10 +162,10 @@ fn the_router_routes_by_the_network_label_the_process_was_configured_with() -> R
                 .route(neighbour.peer)
                 .await?
                 .ok_or_else(|| eyre!("a published neighbour must resolve"))?;
-            let (preference, _) = route.endpoint();
+            let (kind, _) = route.endpoint();
             ensure!(
-                preference == Preference::Direct,
-                "a neighbour's route is {preference:?}, not its direct endpoint"
+                kind == EndpointKind::Direct,
+                "a neighbour's route is {kind:?}, not its direct endpoint"
             );
             Ok(())
         }

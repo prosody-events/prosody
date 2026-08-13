@@ -1,4 +1,6 @@
-use super::{LocalTarget, NetworkRoute, NetworkRouter, PeerId, Preference, RelayHop, choose_route};
+use super::{
+    EndpointKind, LocalTarget, NetworkRoute, NetworkRouter, PeerId, RelayHop, choose_route,
+};
 use crate::peer::requester::registry::PendingRegistry;
 use crate::peer::requester::registry::tests::TestRegistration;
 use crate::peer::response::frame::FrameHeader;
@@ -40,7 +42,7 @@ impl ResponseRoute for CountedNetwork {
     ) -> Result<RouteOutcome, DropReason> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Ok(RouteOutcome::Delivered(RouteDelivery::Remote(
-            Preference::Direct,
+            EndpointKind::Direct,
         )))
     }
 }
@@ -247,9 +249,9 @@ fn prop_a_route_follows_the_declared_labels(declared: Declared) -> TestResult {
 
     // The table, as an operator reads it off the two labels.
     let expected = match (declared.labels, advertised) {
-        (Labels::Differ, true) => Some((Preference::Advertised, entry.uri())),
+        (Labels::Differ, true) => Some((EndpointKind::Advertised, entry.uri())),
         (Labels::Differ, false) => None,
-        _ => Some((Preference::Direct, direct.uri())),
+        _ => Some((EndpointKind::Direct, direct.uri())),
     };
 
     let Some(route) = choose_route(declared.labels.here().as_ref(), &published) else {
@@ -266,8 +268,8 @@ fn prop_a_route_follows_the_declared_labels(declared: Declared) -> TestResult {
             "{declared:?} must reach nothing, but reached {route:?}"
         ));
     };
-    let (preference, endpoint) = route.endpoint();
-    assert_eq!((preference, endpoint.uri()), expected);
+    let (kind, endpoint) = route.endpoint();
+    assert_eq!((kind, endpoint.uri()), expected);
     TestResult::passed()
 }
 

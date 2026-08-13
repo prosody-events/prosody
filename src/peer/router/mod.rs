@@ -68,7 +68,7 @@ pub(crate) struct PeerId(Uuid);
 /// Which peer endpoint a route selected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(strum::VariantArray))]
-pub enum Preference {
+pub enum EndpointKind {
     /// The address the peer discovered for itself on its own network.
     Direct,
     /// The entry point that reaches the peer from another network.
@@ -78,7 +78,7 @@ pub enum Preference {
 /// The one endpoint selected for a peer.
 #[derive(Clone, Debug)]
 pub(crate) struct Route {
-    preference: Preference,
+    kind: EndpointKind,
     endpoint: Endpoint,
 }
 
@@ -300,8 +300,8 @@ impl<S: ResponseSender, D: PeerDirectory> NetworkRouter for NetworkRoute<S, D> {
     }
 }
 
-impl Preference {
-    /// The fixed metric attribute this preference is counted and traced under.
+impl EndpointKind {
+    /// The fixed metric and trace label for this endpoint kind.
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Direct => "direct",
@@ -312,8 +312,8 @@ impl Preference {
 
 impl Route {
     /// Returns the selected endpoint and its route type.
-    pub(crate) fn endpoint(&self) -> (Preference, &Endpoint) {
-        (self.preference, &self.endpoint)
+    pub(crate) fn endpoint(&self) -> (EndpointKind, &Endpoint) {
+        (self.kind, &self.endpoint)
     }
 }
 
@@ -341,12 +341,12 @@ pub(crate) fn choose_route(
     match (here, registration.network.as_ref()) {
         (Some(here), Some(there)) if here != there => {
             registration.advertised.as_ref().map(|endpoint| Route {
-                preference: Preference::Advertised,
+                kind: EndpointKind::Advertised,
                 endpoint: endpoint.clone(),
             })
         }
         _ => Some(Route {
-            preference: Preference::Direct,
+            kind: EndpointKind::Direct,
             endpoint: registration.direct.endpoint().clone(),
         }),
     }

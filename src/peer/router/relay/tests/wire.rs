@@ -14,7 +14,7 @@ use crate::peer::router::directory::{Endpoint, NetworkId, PeerRegistration};
 use crate::peer::router::grpc::client::GrpcSender;
 use crate::peer::router::loopback::direct_address;
 use crate::peer::router::loopback::listener::FixedRouter;
-use crate::peer::router::{Host, NetworkRouter, PeerId, Preference, ResponseSender, SendFailure};
+use crate::peer::router::{EndpointKind, Host, NetworkRouter, PeerId, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
 use crate::test_util::{GlobalMetrics, GlobalSpans, TEST_RUNTIME, label, named};
 use color_eyre::Result;
@@ -270,9 +270,9 @@ async fn crossing(pair: &Pair) -> Result<()> {
         .route(pair.target.peer)
         .await?
         .ok_or_else(|| eyre!("a peer in another network must be reachable through its entry"))?;
-    let (preference, endpoint) = route.endpoint();
+    let (kind, endpoint) = route.endpoint();
     ensure(
-        preference == Preference::Advertised && endpoint.uri() == pair.relay.address.uri(),
+        kind == EndpointKind::Advertised && endpoint.uri() == pair.relay.address.uri(),
         format!("the rules chose {route:?}, which is not the target's entry point alone"),
     )?;
 

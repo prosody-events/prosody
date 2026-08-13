@@ -34,7 +34,7 @@ const PAYLOAD: &[u8] = b"traced";
 const DISPOSITION: &str = "peer.disposition";
 
 /// The attribute naming the endpoint that answered.
-const PREFERENCE: &str = "peer.preference";
+const ENDPOINT_KIND: &str = "peer.endpoint.kind";
 
 /// One response delivered through the whole send path lands in the caller's
 /// trace, with `peer.response.receive` directly under `peer.response.send`, the
@@ -91,10 +91,10 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
             disposition.as_str() == "delivered",
             "{SENT} must say what became of the response, not {disposition}"
         );
-        let preference = span_attribute(sent, PREFERENCE)?;
+        let endpoint_kind = span_attribute(sent, ENDPOINT_KIND)?;
         ensure!(
-            preference.as_str() == "direct",
-            "{SENT} must name the endpoint that answered, not {preference}"
+            endpoint_kind.as_str() == "direct",
+            "{SENT} must name the endpoint that answered, not {endpoint_kind}"
         );
         ensure_rpc_attributes(sent)?;
         ensure_rpc_attributes(received)?;
