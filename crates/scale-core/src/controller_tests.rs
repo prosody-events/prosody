@@ -202,7 +202,7 @@ fn curve_class_columns_equal_cell_columns_with_rolled_masses() -> Result<(), Tes
     let configuration = test_configuration()?;
     let grid = CapacityGrid::new(&[0.1_f64], &[100.0_f64], &[0.0_f64, 1.0_f64])?;
     let state = ScaleState::new(configuration, grid)?;
-    let draw_count = 3;
+    let draw_count = 3_u32;
     let mut cell_column = 0.0_f64;
     let mut class_column = 0.0_f64;
     for class in 0..state.capacity_classes.len() {
@@ -213,7 +213,7 @@ fn curve_class_columns_equal_cell_columns_with_rolled_masses() -> Result<(), Tes
             .sum::<f64>();
         let representative = state.capacity_classes.representative(class);
         let (curve, _) = state.capacity.curve_and_probability(representative);
-        let path_mean = (0..draw_count)
+        let path_mean = (0_u32..draw_count)
             .map(|draw| curve.sustainable_throughput(64.0_f64) + f64::from(draw))
             .sum::<f64>()
             / f64::from(draw_count);
@@ -251,7 +251,7 @@ fn test_configuration() -> Result<Configuration, TestError> {
         posterior_sample_count: 64,
         report_interval_micros: 1_000_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64, 64)?,
+        arrival_prior: ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
         launch_time_prior: TransitionPrior::broad_fallback(),
