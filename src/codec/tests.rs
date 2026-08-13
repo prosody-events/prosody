@@ -7,7 +7,7 @@ use serde_json::Value;
 /// The format tokens are persisted in keyed-state identity rows; changing
 /// one orphans every cell written under it. Frozen by construction. The JSON
 /// codecs are deliberately format-equal — that equality is what lets
-/// differently-implemented consumers (and the erased state seam's passthrough
+/// differently-implemented consumers (and the erased state seam's binary
 /// codec) share a collection.
 #[test]
 fn format_ids_are_stable() {
@@ -35,7 +35,7 @@ fn json_bytes(value: &Value) -> Vec<u8> {
 /// including `null`, scalars, arrays, and objects. This pins the cross-client
 /// byte-compatibility law the shared format-id asserts.
 ///
-/// Falsify: make [`NoopExtractor`](super::NoopExtractor) / the passthrough
+/// Falsify: make [`NoopExtractor`](super::NoopExtractor) / the binary
 /// codec drop or mutate a byte and the recovered bytes / re-decoded value
 /// diverge.
 #[test]
@@ -56,26 +56,26 @@ fn binary_json_codec_is_byte_compatible_with_json() {
             _ => return TestResult::error("JSON decoding failed"),
         }
 
-        // JsonCodec bytes -> passthrough deserialize -> verbatim bytes.
-        let mut passthrough = JsonBinaryCodec::default();
+        // JsonCodec bytes -> binary deserialize -> verbatim bytes.
+        let mut binary = JsonBinaryCodec::default();
         let mut scratch = bytes.clone();
-        match passthrough.deserialize(&mut scratch) {
+        match binary.deserialize(&mut scratch) {
             Ok(payload) if payload.bytes == bytes => {}
-            Ok(_) => return TestResult::error(format!("passthrough altered bytes for {value}")),
-            Err(_) => return TestResult::error("passthrough deserialize failed"),
+            Ok(_) => return TestResult::error(format!("binary codec altered bytes for {value}")),
+            Err(_) => return TestResult::error("binary codec deserialize failed"),
         }
 
-        // passthrough serialize -> JsonCodec deserialize -> original value.
+        // Binary serialize -> JsonCodec deserialize -> original value.
         let mut out = Vec::new();
-        let mut passthrough = JsonBinaryCodec::default();
-        if passthrough
+        let mut binary = JsonBinaryCodec::default();
+        if binary
             .serialize(
                 BinaryPayload::new(bytes, None::<String>, None::<String>),
                 &mut out,
             )
             .is_err()
         {
-            return TestResult::error("passthrough serialize failed");
+            return TestResult::error("binary codec serialize failed");
         }
         let mut json = JsonCodec::default();
         match json.deserialize(&mut out) {

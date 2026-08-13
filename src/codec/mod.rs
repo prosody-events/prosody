@@ -187,7 +187,7 @@ impl ErasedStateCodec for BinaryPayload {
     type Codec = JsonBinaryCodec;
 
     fn is_absent_sentinel(&self) -> bool {
-        // No parse (the passthrough codec never parses): the seam only needs to
+        // No parse (the binary codec never parses): the seam only needs to
         // recognize the literal `null` document, ASCII-whitespace-trimmed.
         self.bytes.trim_ascii() == b"null"
     }

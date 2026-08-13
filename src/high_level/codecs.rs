@@ -33,7 +33,9 @@ where
 /// JSON message and response codecs.
 pub type JsonCodecs = Codecs<JsonCodec, JsonCodec>;
 
-/// JSON message and response codecs for callers that supply encoded bytes.
+/// JSON codecs for callers that supply encoded bytes.
+///
+/// Messages extract event metadata. Responses pass through unchanged.
 pub type JsonBinaryCodecs = Codecs<JsonBinaryMessageCodec, JsonBinaryCodec>;
 
 /// The message codec selected by `H`.
