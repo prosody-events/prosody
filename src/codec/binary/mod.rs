@@ -1,6 +1,7 @@
 //! Binary codec that copies bytes verbatim and uses a caller-supplied
 //! function to extract event metadata (id and type).
 
+use serde::de::value::MapAccessDeserializer;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 #[cfg(not(target_arch = "arm"))]
@@ -258,12 +259,84 @@ impl BinaryExtractor for NoopExtractor {
 /// supply JSON documents to keep the [`JsonFormat`] contract.
 pub type JsonBinaryCodec = BinaryCodec<NoopExtractor, JsonFormat>;
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct JsonMetaView<'a> {
     #[serde(borrow, default, deserialize_with = "borrowed_string")]
     id: Option<&'a str>,
     #[serde(borrow, default, rename = "type", deserialize_with = "borrowed_string")]
     event_type: Option<&'a str>,
+}
+
+struct JsonDocument<'a>(JsonMetaView<'a>);
+
+fn empty_json_document<'a>() -> JsonDocument<'a> {
+    JsonDocument(JsonMetaView::default())
+}
+
+impl<'de> Deserialize<'de> for JsonDocument<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(JsonDocumentVisitor)
+    }
+}
+
+struct JsonDocumentVisitor;
+
+impl<'de> Visitor<'de> for JsonDocumentVisitor {
+    type Value = JsonDocument<'de>;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        JsonMetaView::deserialize(MapAccessDeserializer::new(map)).map(JsonDocument)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(empty_json_document())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E> {
+        Ok(JsonDocument(JsonMetaView::default()))
+    }
 }
 
 fn borrowed_string<'de, D>(deserializer: D) -> Result<Option<&'de str>, D::Error>
@@ -335,16 +408,9 @@ impl BinaryExtractor for JsonExtractor {
     type Error = JsonExtractError;
 
     fn extract<'a>(&mut self, buf: &'a mut [u8]) -> Result<BinaryMetadata<'a>, Self::Error> {
-        if buf.iter().copied().find(|byte| !byte.is_ascii_whitespace()) != Some(b'{') {
-            #[cfg(target_arch = "arm")]
-            serde_json::from_slice::<IgnoredAny>(buf)?;
-            #[cfg(not(target_arch = "arm"))]
-            from_slice_with_buffers::<IgnoredAny>(buf, &mut self.buffers)?;
-            return Ok(BinaryMetadata::default());
-        }
         #[cfg(target_arch = "arm")]
         {
-            let view = serde_json::from_slice::<JsonMetaView<'a>>(buf)?;
+            let JsonDocument(view) = serde_json::from_slice::<JsonDocument<'a>>(buf)?;
             Ok(BinaryMetadata {
                 event_id: view.id,
                 event_type: view.event_type,
@@ -352,7 +418,8 @@ impl BinaryExtractor for JsonExtractor {
         }
         #[cfg(not(target_arch = "arm"))]
         {
-            let view = from_slice_with_buffers::<JsonMetaView<'a>>(buf, &mut self.buffers)?;
+            let JsonDocument(view) =
+                from_slice_with_buffers::<JsonDocument<'a>>(buf, &mut self.buffers)?;
             Ok(BinaryMetadata {
                 event_id: view.id,
                 event_type: view.event_type,
