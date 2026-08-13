@@ -1,6 +1,6 @@
 use super::support::{cassandra_directory, finish, registration, test_directory_holding};
 use crate::peer::router::PeerId;
-use crate::peer::router::directory::cache::AddressCache;
+use crate::peer::router::directory::cache::AddressResolver;
 use crate::peer::router::directory::{
     DirectAddress, PeerDirectory, PeerRegistration, RegistrationTtl,
 };
@@ -9,7 +9,6 @@ use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use futures::future::join_all;
-use quanta::Clock;
 use quickcheck::{QuickCheck, TestResult};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -38,15 +37,43 @@ const PREFIX: [usize; 10] = [0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
 /// How many callers ask for one cold peer at once.
 const CONCURRENT: usize = 16;
 
-/// The lease the cached entries age on.
 const POOL_LEASE: Duration = Duration::from_hours(1);
 
 /// The Cassandra pool, registered once for the whole test process under a lease
 /// long enough to outlive the run.
 static POOL_PEERS: OnceCell<Vec<(PeerId, Uri)>> = OnceCell::const_new();
 
-/// The three bounds that make the address cache safe to key by a peer id an
-/// outsider chooses, proved together over one generated request stream.
+/// A directory that counts reads and yields each one for concurrency tests.
+#[derive(Clone)]
+struct CountingDirectory<D> {
+    inner: D,
+    reads: Arc<AtomicUsize>,
+}
+
+impl<D: PeerDirectory> PeerDirectory for CountingDirectory<D> {
+    type Error = D::Error;
+
+    fn ttl(&self) -> RegistrationTtl {
+        self.inner.ttl()
+    }
+
+    async fn register(&self, registration: &PeerRegistration) -> Result<(), Self::Error> {
+        self.inner.register(registration).await
+    }
+
+    async fn read(&self, peer: PeerId) -> Result<Option<PeerRegistration>, Self::Error> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        yield_now().await;
+        self.inner.read(peer).await
+    }
+
+    async fn deregister(&self, registration: &PeerRegistration) -> Result<(), Self::Error> {
+        self.inner.deregister(registration).await
+    }
+}
+
+/// The bounds that make the address cache safe to key by a peer id an outsider
+/// chooses, proved together over one generated request stream.
 ///
 /// **Occupancy.** However long the stream and however many distinct peers it
 /// names, the cache never holds more than its capacity, and no request issues
@@ -58,11 +85,8 @@ static POOL_PEERS: OnceCell<Vec<(PeerId, Uri)>> = OnceCell::const_new();
 /// cache guarantees — a cached entry itself is best-effort, because
 /// `quick_cache` may evict an entry it admitted into a full cache at once.
 ///
-/// **Age.** A fresh entry is served with no read. Past the lease the same
-/// entry is read again rather than served.
-///
-/// **Absence.** A peer the directory does not hold is cached as absent, so a
-/// burst for an unknown id issues one read and not one per request.
+/// **Absence.** A peer the directory does not hold is not cached. A later
+/// registration for that id can therefore become visible.
 ///
 /// The cache reads through a [`PeerDirectory`] and nothing more, so this is the
 /// default loop and it needs no cluster.
@@ -72,15 +96,15 @@ fn prop_address_cache_bounded_single_flight() {
         finish(TEST_RUNTIME.block_on(async {
             let directory = test_directory_holding(POOL_CAPACITY, POOL_LEASE)?;
             let pool = register_pool(&directory).await?;
-            run_address_cache_cases(&directory, &pool, directory.ttl(), generated).await
+            run_address_cache_cases(&directory, &pool, generated).await
         }))
     }
     init_test_logging();
     QuickCheck::new().quickcheck(property as fn(Vec<usize>) -> TestResult);
 }
 
-/// The same four bounds over the Cassandra directory, so a read that crosses
-/// the wire is held to them too.
+/// The same bounds over the Cassandra directory, so a read that crosses the
+/// wire is held to them too.
 #[test]
 fn prop_address_cache_bounded_single_flight_over_cassandra() {
     fn property(generated: Vec<usize>) -> TestResult {
@@ -89,7 +113,7 @@ fn prop_address_cache_bounded_single_flight_over_cassandra() {
             let pool = POOL_PEERS
                 .get_or_try_init(|| register_pool(&directory))
                 .await?;
-            run_address_cache_cases(&directory, pool, directory.ttl(), generated).await
+            run_address_cache_cases(&directory, pool, generated).await
         }))
     }
     init_test_logging();
@@ -102,13 +126,11 @@ fn prop_address_cache_bounded_single_flight_over_cassandra() {
 async fn run_address_cache_cases<D: PeerDirectory>(
     directory: &D,
     pool: &[(PeerId, Uri)],
-    ttl: RegistrationTtl,
     generated: Vec<usize>,
 ) -> Result<()> {
-    occupancy_holds(directory, pool, ttl, generated).await?;
-    one_read_per_cold_burst(directory, pool, ttl).await?;
-    a_fresh_entry_is_served_until_the_lease_ends(directory, pool, ttl).await?;
-    absence_is_cached(directory, ttl).await
+    occupancy_holds(directory, pool, generated).await?;
+    one_read_per_cold_burst(directory, pool).await?;
+    absence_is_not_cached(directory).await
 }
 
 /// Drives the generated stream and checks the two bounds that hold at every
@@ -117,12 +139,9 @@ async fn run_address_cache_cases<D: PeerDirectory>(
 async fn occupancy_holds<D: PeerDirectory>(
     directory: &D,
     pool: &[(PeerId, Uri)],
-    ttl: RegistrationTtl,
     generated: Vec<usize>,
 ) -> Result<()> {
-    let (clock, _mock) = Clock::mock();
-    let cache = AddressCache::with_clock(CAPACITY, ttl, clock);
-    let reads = AtomicUsize::new(0);
+    let (resolver, reads) = resolver(directory.clone());
     let requests = PREFIX
         .iter()
         .copied()
@@ -130,21 +149,22 @@ async fn occupancy_holds<D: PeerDirectory>(
     for (position, index) in requests.enumerate() {
         let (peer, uri) = &pool[index];
         let before = reads.load(Ordering::Relaxed);
-        let resolved = resolve(&cache, directory, &reads, *peer)
+        let registration = resolver
+            .resolve(*peer)
             .await?
             .ok_or_else(|| eyre!("request {position}: a registered peer must resolve"))?;
         let issued = reads.load(Ordering::Relaxed) - before;
         assert!(
-            cache.len() <= CAPACITY,
+            resolver.len() <= CAPACITY,
             "request {position}: the cache holds {} entries, over its capacity of {CAPACITY}",
-            cache.len()
+            resolver.len()
         );
         assert!(
             issued <= 1,
             "request {position}: a miss must read through once, not {issued} times"
         );
         assert_eq!(
-            resolved.direct.endpoint().uri(),
+            registration.direct.endpoint().uri(),
             uri,
             "request {position}: the cache served another peer's registration"
         );
@@ -157,13 +177,10 @@ async fn occupancy_holds<D: PeerDirectory>(
 async fn one_read_per_cold_burst<D: PeerDirectory>(
     directory: &D,
     pool: &[(PeerId, Uri)],
-    ttl: RegistrationTtl,
 ) -> Result<()> {
-    let (clock, _mock) = Clock::mock();
-    let cache = AddressCache::with_clock(CAPACITY, ttl, clock);
-    let reads = AtomicUsize::new(0);
+    let (resolver, reads) = resolver(directory.clone());
     let (peer, uri) = &pool[1];
-    let burst = join_all((0..CONCURRENT).map(|_| resolve(&cache, directory, &reads, *peer))).await;
+    let burst = join_all((0..CONCURRENT).map(|_| resolver.resolve(*peer))).await;
     for served in burst {
         let served = served?.ok_or_else(|| eyre!("a registered peer must resolve"))?;
         assert_eq!(
@@ -180,84 +197,37 @@ async fn one_read_per_cold_burst<D: PeerDirectory>(
     Ok(())
 }
 
-/// A fresh entry is served without a read; past the lease the same entry is
-/// read again. The cache holds one entry here, so admission cannot be undone
-/// by an eviction and the hit is deterministic.
-async fn a_fresh_entry_is_served_until_the_lease_ends<D: PeerDirectory>(
-    directory: &D,
-    pool: &[(PeerId, Uri)],
-    ttl: RegistrationTtl,
-) -> Result<()> {
-    let (clock, mock) = Clock::mock();
-    let cache = AddressCache::with_clock(CAPACITY, ttl, clock);
-    let reads = AtomicUsize::new(0);
-    let peer = pool[0].0;
-
-    drop(resolve(&cache, directory, &reads, peer).await?);
-    let after_fill = reads.load(Ordering::Relaxed);
-    drop(resolve(&cache, directory, &reads, peer).await?);
+/// A registration that appears after a miss becomes visible on the next read.
+async fn absence_is_not_cached<D: PeerDirectory>(directory: &D) -> Result<()> {
+    let (resolver, reads) = resolver(directory.clone());
+    let peer = PeerId::new();
+    assert!(
+        resolver.resolve(peer).await?.is_none(),
+        "a peer the directory does not hold must resolve as absent"
+    );
+    directory.register(&registration(peer)).await?;
+    assert!(
+        resolver.resolve(peer).await?.is_some(),
+        "a registration written after a miss must become visible"
+    );
     assert_eq!(
         reads.load(Ordering::Relaxed),
-        after_fill,
-        "a fresh entry must be served without a read"
-    );
-
-    mock.increment(POOL_LEASE + Duration::from_secs(1));
-    drop(resolve(&cache, directory, &reads, peer).await?);
-    assert!(
-        reads.load(Ordering::Relaxed) > after_fill,
-        "an entry older than the lease must be read again, not served"
-    );
-    assert!(
-        cache.len() <= CAPACITY,
-        "the refill pushed the cache over its capacity of {CAPACITY}"
+        2,
+        "a miss must not enter the cache"
     );
     Ok(())
 }
 
-/// A peer the directory does not hold is cached as absent, so repeated
-/// requests for an unknown id issue one read and not one per request.
-async fn absence_is_cached<D: PeerDirectory>(directory: &D, ttl: RegistrationTtl) -> Result<()> {
-    let (clock, _mock) = Clock::mock();
-    let cache = AddressCache::with_clock(CAPACITY, ttl, clock);
-    let reads = AtomicUsize::new(0);
-    let unknown = PeerId::new();
-    for attempt in 1_u8..=3 {
-        assert!(
-            resolve(&cache, directory, &reads, unknown).await?.is_none(),
-            "attempt {attempt}: a peer the directory does not hold must resolve as absent"
-        );
-    }
-    assert_eq!(
-        reads.load(Ordering::Relaxed),
-        1,
-        "repeated requests for an absent peer must issue one read"
-    );
-    Ok(())
-}
-
-/// Resolves `peer`, counting the directory reads the cache actually issues.
-///
-/// The fill suspends once before it reads. That is what makes
-/// [`one_read_per_cold_burst`] a detector: the test directory answers without
-/// ever suspending, so a fill that never yields would run to completion before
-/// the second caller of a burst is polled, and every later caller would find a
-/// fresh entry however the cache filled it. With the yield the first caller
-/// parks holding the placeholder, so a cache that lost single flight issues one
-/// read per caller and the count reds.
-async fn resolve<D: PeerDirectory>(
-    cache: &AddressCache,
-    directory: &D,
-    reads: &AtomicUsize,
-    peer: PeerId,
-) -> Result<Option<Arc<PeerRegistration>>> {
-    Ok(cache
-        .resolve(peer, || async move {
-            reads.fetch_add(1, Ordering::Relaxed);
-            yield_now().await;
-            directory.read(peer).await
-        })
-        .await?)
+/// Adds read observation to a directory and builds its resolver.
+fn resolver<D: PeerDirectory>(
+    directory: D,
+) -> (AddressResolver<CountingDirectory<D>>, Arc<AtomicUsize>) {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let directory = CountingDirectory {
+        inner: directory,
+        reads: Arc::clone(&reads),
+    };
+    (AddressResolver::new(CAPACITY, directory), reads)
 }
 
 /// Registers [`POOL`] peers with distinct socket addresses.

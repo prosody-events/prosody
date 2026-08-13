@@ -97,9 +97,8 @@ pub(crate) trait PeerDirectory: Clone + Send + Sync + 'static {
 
     /// The lease every write this directory issues publishes.
     ///
-    /// It is the single source of the lease.
-    /// [`AddressResolver::new`](cache::AddressResolver::new) builds its cache
-    /// from this value, and the process runtime paces its refresher inside it.
+    /// It is the single source of the lease. The process runtime paces its
+    /// refresher inside it.
     fn ttl(&self) -> RegistrationTtl;
 
     /// Publishes `registration` under a fresh lease.
