@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use prosody_scale_core::{
     ArrivalPrior, ArrivalPriorError, CapacityGrid, CapacityGridError, Cohort, Configuration,
-    ConfigurationError, DemandClass, ModelTime, ObservationBuffer, ObservationError, RandomStream,
-    ReliabilityPrior, ScaleDecision, ScaleState, ServiceObjective, TransitionPrior, step,
+    ConfigurationError, DemandClass, LaunchPrior, ModelTime, ObservationBuffer, ObservationError,
+    RandomStream, RebalancePrior, ReliabilityPrior, ScaleDecision, ScaleState, ServiceObjective,
+    step,
 };
 use thiserror::Error;
 
@@ -101,6 +102,8 @@ pub fn run_batch_slo_with_inputs(
     let configuration = Configuration {
         cohort_count_max: PARTITION_COUNT,
         calendar_segment_count_max: PARTITION_COUNT,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: PARTITION_COUNT,
         replica_count_max: REPLICA_COUNT_MAX,
         slots_per_replica: DEFAULT_CONCURRENCY_PER_REPLICA,
@@ -113,8 +116,8 @@ pub fn run_batch_slo_with_inputs(
         arrival_prior: ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective,
     };
     let grid = CapacityGrid::new(
@@ -267,6 +270,9 @@ impl TickGenerator for BatchGraph {
 /// Failure while evaluating one batch objective.
 #[derive(Debug, Error)]
 pub enum BatchSloError {
+    /// A lead-time prior artifact is invalid.
+    #[error(transparent)]
+    LeadTimePrior(#[from] prosody_scale_core::LeadTimePriorError),
     /// The controller refused to apply a target.
     #[error("the controller held the batch decision")]
     ControllerHold,

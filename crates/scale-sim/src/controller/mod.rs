@@ -1,12 +1,14 @@
 use std::collections::VecDeque;
+use std::slice;
 use std::time::Duration;
 
 use prosody_scale_core::{
     ActuationCommitment, ArrivalPosterior, AttemptOutcomeCounts, AttemptOutcomeEvidence,
     BacklogCohort, CapacityGrid, Cohort, CompletionPosteriorCell, Configuration,
     ConfigurationError, DecisionRejection, DemandClass, HoldReason, ModelTime, ObservationBuffer,
-    PosteriorQuery, RandomStream, ResourceWindow, ScaleDecision, ScaleScratch, ScaleState,
-    TransitionDirection, TransitionEvidence, step,
+    PosteriorQuery, RandomStream, ReadinessGroupId, ReadinessLump, ReadinessObservation,
+    RebalanceEvidence, ResourceWindow, ScaleDecision, ScaleScratch, ScaleState,
+    TransitionDirection, step,
 };
 use statrs::distribution::{DiscreteCDF, NegativeBinomial, Poisson};
 use thiserror::Error;
@@ -120,7 +122,7 @@ pub struct ControllerSample {
     pub lead_time_up_seconds: f64,
     /// Posterior expected lead time for a one-replica scale-down.
     pub lead_time_down_seconds: f64,
-    /// Posterior expected lead time for the selected or last transition bucket.
+    /// Posterior expected lead time for the selected or last replica change.
     pub lead_time_seconds: f64,
     /// Mean live handler concurrency for the latest eligible window.
     pub resource_concurrency: f64,
@@ -1097,8 +1099,17 @@ struct PendingTransition {
 }
 
 struct PendingTransitionObservation {
-    evidence: TransitionEvidence,
+    launch: Option<PendingLaunchObservation>,
+    rebalance: Option<RebalanceEvidence>,
     sample: LeadTimeEvidenceSample,
+}
+
+#[derive(Clone, Copy)]
+struct PendingLaunchObservation {
+    requested_at: ModelTime,
+    requested_delta: u32,
+    observed_at: ModelTime,
+    lump: ReadinessLump,
 }
 
 #[derive(Clone, Copy)]
@@ -1195,7 +1206,7 @@ impl ArrivalPrediction {
     }
 }
 
-impl<Workload> ClosedLoop<Workload> {
+impl<Workload: TickGenerator> ClosedLoop<Workload> {
     /// Allocates the controller adapter and all bounded scratch columns.
     ///
     /// # Errors
@@ -1207,6 +1218,14 @@ impl<Workload> ClosedLoop<Workload> {
         capacity_grid: CapacityGrid,
         trace_count_max: u32,
     ) -> Result<Self, ClosedLoopError> {
+        let producer_count_max = workload.scheduled_release_count_max();
+        if producer_count_max == 0 || producer_count_max > configuration.scheduled_release_count_max
+        {
+            return Err(ClosedLoopError::ScheduledReleaseCertification {
+                producer_count_max,
+                configured_count_max: configuration.scheduled_release_count_max,
+            });
+        }
         let configuration = ClosedLoopConfiguration::new(configuration.clone())?;
         let core_configuration = configuration.core();
         let partition_count = usize::try_from(core_configuration.partition_count)
@@ -1494,7 +1513,7 @@ impl<Workload> ClosedLoop<Workload> {
             let completed_micros = context
                 .plant
                 .reconciliation_completed_micros
-                .unwrap_or(context.now_micros);
+                .map_or(context.now_micros, |completed| completed);
             while !self.ready_transitions.is_empty() {
                 let transition = self.ready_transitions.remove(0);
                 let elapsed_micros =
@@ -1502,40 +1521,68 @@ impl<Workload> ClosedLoop<Workload> {
                 if elapsed_micros == 0 {
                     continue;
                 }
-                let evidence = context
+                let rebalance_started = context
                     .plant
                     .reconciliation_started_micros
                     .filter(|started| *started > transition.requested_at_micros)
-                    .filter(|started| completed_micros > *started)
-                    .map_or_else(
-                        || {
-                            TransitionEvidence::completed(
-                                transition.direction(),
-                                transition.replica_delta(),
-                                elapsed_micros,
-                            )
-                        },
-                        |started| {
-                            TransitionEvidence::completed_rebalance(
-                                transition.direction(),
-                                transition.replica_delta(),
-                                started.saturating_sub(transition.requested_at_micros),
-                                completed_micros.saturating_sub(started),
-                            )
-                        },
+                    .filter(|started| completed_micros > *started);
+                let launch_completed_micros =
+                    rebalance_started.map_or(completed_micros, |started| started);
+                let launch = if transition.direction() == TransitionDirection::Up {
+                    let observation = ReadinessObservation::ready(
+                        ModelTime::from_micros(transition.requested_at_micros),
+                        ModelTime::from_micros(launch_completed_micros),
                     )?;
+                    Some(PendingLaunchObservation {
+                        requested_at: ModelTime::from_micros(transition.requested_at_micros),
+                        requested_delta: transition.replica_delta(),
+                        observed_at: ModelTime::from_micros(launch_completed_micros),
+                        lump: ReadinessLump::new(
+                            ReadinessGroupId(
+                                transition.requested_at_micros
+                                    ^ u64::from(transition.target_replicas).rotate_left(32),
+                            ),
+                            transition.replica_delta(),
+                            observation,
+                        )?,
+                    })
+                } else {
+                    None
+                };
+                let rebalance = rebalance_started
+                    .map(|started| {
+                        RebalanceEvidence::completed(
+                            ModelTime::from_micros(started),
+                            ModelTime::from_micros(completed_micros),
+                        )
+                    })
+                    .transpose()?;
                 self.push_transition_observation(PendingTransitionObservation {
-                    evidence,
+                    launch,
+                    rebalance,
                     sample: LeadTimeEvidenceSample::Completed {
                         direction: transition.direction(),
                         replica_delta: transition.replica_delta(),
-                        elapsed_seconds: Duration::from_micros(elapsed_micros).as_secs_f64(),
+                        elapsed_seconds: Duration::from_micros(
+                            launch_completed_micros.saturating_sub(transition.requested_at_micros),
+                        )
+                        .as_secs_f64(),
                     },
                 })?;
             }
         }
         if let Some(pending) = self.pending_transition_observations.pop_front() {
-            self.observation.set_transition(pending.evidence)?;
+            if let Some(launch) = pending.launch {
+                self.observation.set_launch_evidence(
+                    launch.requested_at,
+                    launch.requested_delta,
+                    launch.observed_at,
+                    slice::from_ref(&launch.lump),
+                )?;
+            }
+            if let Some(rebalance) = pending.rebalance {
+                self.observation.set_rebalance_evidence(rebalance)?;
+            }
             self.lead_time_evidence_sample = pending.sample;
         }
         Ok(())
@@ -1752,7 +1799,7 @@ impl<Workload> ClosedLoop<Workload> {
     ) -> Result<TickInputs, PlantError> {
         let arrival_predictive = self.arrival_prediction(context.now_micros)?;
         let partition_predictive = self.partition_prediction(context.now_micros)?;
-        let lead_time_predictive = self.lead_time_prediction();
+        let lead_time_predictive = self.lead_time_prediction()?;
         let capacity_predictive = self.capacity_prediction(context.now_micros)?;
         let decision = step(
             &mut self.state,
@@ -1970,9 +2017,9 @@ impl<Workload> ClosedLoop<Workload> {
         })
     }
 
-    fn lead_time_prediction(&self) -> LeadTimePrediction {
+    fn lead_time_prediction(&self) -> Result<LeadTimePrediction, PlantError> {
         let (direction, replica_delta, elapsed_seconds) = match self.lead_time_evidence_sample {
-            LeadTimeEvidenceSample::None => return LeadTimePrediction::missing(),
+            LeadTimeEvidenceSample::None => return Ok(LeadTimePrediction::missing()),
             LeadTimeEvidenceSample::Completed {
                 direction,
                 replica_delta,
@@ -1984,16 +2031,20 @@ impl<Workload> ClosedLoop<Workload> {
                 ..
             } => (direction, replica_delta, None),
         };
-        LeadTimePrediction {
-            quantiles: [0.1_f64, 0.5_f64, 0.9_f64].map(|probability| {
+        Ok(LeadTimePrediction {
+            quantiles: [
                 self.state
-                    .lead_time_predictive_quantile(direction, replica_delta, probability)
-            }),
+                    .lead_time_predictive_quantile(direction, replica_delta, 0.1_f64)?,
+                self.state
+                    .lead_time_predictive_quantile(direction, replica_delta, 0.5_f64)?,
+                self.state
+                    .lead_time_predictive_quantile(direction, replica_delta, 0.9_f64)?,
+            ],
             rank: elapsed_seconds.map_or(f64::NAN, |elapsed| {
                 self.state
                     .lead_time_predictive_cdf(direction, replica_delta, elapsed)
             }),
-        }
+        })
     }
 
     fn capacity_prediction(&mut self, now_micros: u64) -> Result<CapacityPrediction, PlantError> {
@@ -2139,13 +2190,28 @@ impl<Workload> ClosedLoop<Workload> {
         if exposure_micros == 0 {
             return Ok(());
         }
-        let evidence = TransitionEvidence::censored(
-            transition.direction(),
-            transition.replica_delta(),
-            exposure_micros,
-        )?;
+        let launch = if transition.direction() == TransitionDirection::Up {
+            let requested_at = ModelTime::from_micros(transition.requested_at_micros);
+            let observed_at = ModelTime::from_micros(context.now_micros);
+            Some(PendingLaunchObservation {
+                requested_at,
+                requested_delta: transition.replica_delta(),
+                observed_at,
+                lump: ReadinessLump::new(
+                    ReadinessGroupId(
+                        transition.requested_at_micros
+                            ^ u64::from(transition.target_replicas).rotate_left(32),
+                    ),
+                    transition.replica_delta(),
+                    ReadinessObservation::pending(requested_at, observed_at)?,
+                )?,
+            })
+        } else {
+            None
+        };
         self.push_transition_observation(PendingTransitionObservation {
-            evidence,
+            launch,
+            rebalance: None,
             sample: LeadTimeEvidenceSample::Censored {
                 direction: transition.direction(),
                 replica_delta: transition.replica_delta(),
@@ -2437,11 +2503,26 @@ impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
     ) -> Result<ScheduledReleasesInput, PlantError> {
         self.workload.scheduled_releases(context)
     }
+
+    fn scheduled_release_count_max(&self) -> u32 {
+        self.workload.scheduled_release_count_max()
+    }
 }
 
 /// Failure while constructing one closed-loop simulator graph.
 #[derive(Debug, Error)]
 pub enum ClosedLoopError {
+    /// The producer does not certify the configured future-release bound.
+    #[error(
+        "producer release bound {producer_count_max} must be positive and not exceed configured \
+         bound {configured_count_max}"
+    )]
+    ScheduledReleaseCertification {
+        /// Producer-certified maximum.
+        producer_count_max: u32,
+        /// Controller storage maximum.
+        configured_count_max: u32,
+    },
     /// The controller configuration is invalid.
     #[error(transparent)]
     Configuration(#[from] ConfigurationError),

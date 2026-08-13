@@ -1,8 +1,9 @@
 //! Thin WebAssembly adapter for deterministic laboratory decisions.
 
 use prosody_scale_core::{
-    ArrivalPrior, CapacityGrid, Cohort, Configuration, DemandClass, ModelTime, ObservationBuffer,
-    ReliabilityPrior, ScaleDecision, ScaleState, ServiceObjective, TransitionPrior, step,
+    ArrivalPrior, CapacityGrid, Cohort, Configuration, DemandClass, LaunchPrior, ModelTime,
+    ObservationBuffer, RebalancePrior, ReliabilityPrior, ScaleDecision, ScaleState,
+    ServiceObjective, step,
 };
 
 #[cfg(all(target_arch = "wasm32", feature = "threads"))]
@@ -25,9 +26,17 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
     let Ok(arrival_prior) = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64) else {
         return ERROR_CODE;
     };
+    let Ok(launch_time_prior) = LaunchPrior::kubernetes() else {
+        return ERROR_CODE;
+    };
+    let Ok(rebalance_time_prior) = RebalancePrior::kip848() else {
+        return ERROR_CODE;
+    };
     let configuration = Configuration {
         cohort_count_max: 8,
         calendar_segment_count_max: 8,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: 8,
         replica_count_max: 32,
         slots_per_replica: 4,
@@ -37,8 +46,8 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
         arrival_prior,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        launch_time_prior,
+        rebalance_time_prior,
         objective,
     };
     let Ok(grid) = CapacityGrid::new(

@@ -10,7 +10,7 @@ use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
     evaluate_prepared_step, evaluate_prepared_trajectory, prepare,
 };
-use crate::lead_time::{LeadTimeFactor, sample_index};
+use crate::lead_time::{LaunchTimeFactor, RebalanceTimeFactor};
 use crate::partition::PartitionFactor;
 use crate::planning::{
     ActionColumns, compare_actions, complete_horizon_micros, replica_seconds, select_action,
@@ -18,13 +18,14 @@ use crate::planning::{
 };
 use crate::reliability::{RELIABILITY_BIN_COUNT, ReliabilityFactor};
 use crate::types::{
-    ActuationCommitments, BacklogColumns, CalendarForecast, CohortColumns,
-    SCHEDULED_RELEASE_COUNT_MAX, ScheduledRelease, WorkCohorts,
+    ActuationCommitments, BacklogColumns, CalendarForecast, CohortColumns, ScheduledRelease,
+    WorkCohorts,
 };
 use crate::{
     ApplyDecision, ArrivalPosterior, CapacityGrid, Configuration, ConfigurationError,
     DecisionDiagnostics, DemandClass, GroupObservation, HoldDecision, HoldReason, ModelTime,
-    PosteriorError, PosteriorQuery, RandomStream, ResourceWindow, ScaleDecision,
+    PosteriorError, PosteriorQuery, PredictiveQuantileError, RandomStream, ResourceWindow,
+    ScaleDecision,
 };
 use thiserror::Error;
 
@@ -163,8 +164,8 @@ pub struct ScaleState {
     capacity_classes: CapacityClasses,
     reliability: ReliabilityFactor,
     partition_placement: PartitionFactor,
-    lead_time: LeadTimeFactor,
-    rebalance_time: LeadTimeFactor,
+    lead_time: LaunchTimeFactor,
+    rebalance_time: RebalanceTimeFactor,
     current_replicas: u32,
     standing_target: u32,
 }
@@ -199,8 +200,8 @@ impl ScaleState {
         }
         let partition_placement = PartitionFactor::new(configuration.partition_count)?;
         let reliability = ReliabilityFactor::new(configuration.reliability_prior);
-        let lead_time = LeadTimeFactor::new(&configuration.launch_time_prior);
-        let rebalance_time = LeadTimeFactor::new(&configuration.rebalance_time_prior);
+        let lead_time = LaunchTimeFactor::new(&configuration.launch_time_prior);
+        let rebalance_time = RebalanceTimeFactor::new(&configuration.rebalance_time_prior);
         let arrivals = ArrivalFactor::new(configuration.arrival_prior);
         Ok(Self {
             simd_level: Level::new(),
@@ -306,15 +307,36 @@ impl ScaleState {
     }
 
     /// Returns one posterior predictive actuation-duration quantile.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when finite arithmetic cannot invert the CDF.
     pub fn lead_time_predictive_quantile(
         &self,
         direction: TransitionDirection,
         replica_delta: u32,
         probability: f64,
-    ) -> f64 {
+    ) -> Result<f64, PredictiveQuantileError> {
         self.lead_time
             .predictive_quantile(direction, replica_delta, probability)
+    }
+
+    /// Returns the posterior predictive CDF for one rebalance pause.
+    #[must_use]
+    pub fn rebalance_time_predictive_cdf(&self, elapsed_seconds: f64) -> f64 {
+        self.rebalance_time.predictive_cdf(elapsed_seconds)
+    }
+
+    /// Returns one posterior predictive rebalance-pause quantile.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when finite arithmetic cannot invert the CDF.
+    pub fn rebalance_time_predictive_quantile(
+        &self,
+        probability: f64,
+    ) -> Result<f64, PredictiveQuantileError> {
+        self.rebalance_time.predictive_quantile(probability)
     }
 
     /// Returns the fixed value count for one discrete posterior view.
@@ -339,9 +361,8 @@ impl ScaleState {
             | PosteriorQuery::RebalanceTime {
                 replica_delta: 0, ..
             } => Err(PosteriorError::ZeroReplicaDelta),
-            PosteriorQuery::LeadTime { .. } | PosteriorQuery::RebalanceTime { .. } => {
-                Ok(LeadTimeFactor::posterior_value_count())
-            }
+            PosteriorQuery::LeadTime { .. } => Ok(self.lead_time.posterior_value_count()),
+            PosteriorQuery::RebalanceTime { .. } => Ok(self.rebalance_time.posterior_value_count()),
         }
     }
 
@@ -409,16 +430,8 @@ impl ScaleState {
                     Err(PosteriorError::BufferLength { expected })
                 }
             }
-            PosteriorQuery::RebalanceTime {
-                direction,
-                replica_delta,
-            } => {
-                if self.rebalance_time.write_posterior(
-                    direction,
-                    replica_delta,
-                    values,
-                    probabilities,
-                ) {
+            PosteriorQuery::RebalanceTime { .. } => {
+                if self.rebalance_time.write_posterior(values, probabilities) {
                     Ok(())
                 } else {
                     Err(PosteriorError::BufferLength { expected })
@@ -695,10 +708,13 @@ impl ScratchBounds {
             .map_err(|_| ConfigurationError::PlatformLimit)?;
         let replica_count_max = usize::try_from(configuration.replica_count_max)
             .map_err(|_| ConfigurationError::PlatformLimit)?;
+        let scheduled_release_count_max =
+            usize::try_from(configuration.scheduled_release_count_max)
+                .map_err(|_| ConfigurationError::PlatformLimit)?;
         let work_cohort_count_max = partition_count
             .checked_mul(DemandClass::COUNT_USIZE)
             .and_then(|count| cohort_count_max.checked_add(count))
-            .and_then(|count| count.checked_add(SCHEDULED_RELEASE_COUNT_MAX))
+            .and_then(|count| count.checked_add(scheduled_release_count_max))
             .ok_or(ConfigurationError::PlatformLimit)?;
         let partition_offset_count = partition_count
             .checked_add(1)
@@ -1039,7 +1055,8 @@ pub fn step(
         partition_arrivals,
         resource_window,
         attempt_outcomes,
-        transition,
+        launch,
+        rebalance,
         current_replicas,
         actuation_commitments,
     } = observation;
@@ -1063,12 +1080,11 @@ pub fn step(
     if let Some(evidence) = partition_arrivals {
         state.partition_placement.update(evidence.consume());
     }
-    if let Some(evidence) = transition {
-        let (pre_pause, pause) = evidence.consume();
-        state.lead_time.update(state.simd_level, pre_pause);
-        if let Some(pause) = pause {
-            state.rebalance_time.update(state.simd_level, pause);
-        }
+    if let Some(evidence) = launch {
+        state.lead_time.update(state.simd_level, evidence);
+    }
+    if let Some(evidence) = rebalance {
+        state.rebalance_time.update(state.simd_level, evidence);
     }
     if let Some(replicas) = current_replicas {
         state.current_replicas = replicas;
@@ -1275,12 +1291,8 @@ fn evaluate_one_scenario(
     ));
     let current_concurrency = shared.candidate_concurrency[shared.current_index];
     let current_supply = curve.sustainable_throughput(current_concurrency) * event_supply_factor;
-    let mut lead_random = decision_random(sample, DecisionRandomDomain::LeadTime);
-    let lead_seconds = state.lead_time.sample_bucket_seconds(&mut lead_random);
-    let mut rebalance_random = decision_random(sample, DecisionRandomDomain::Rebalance);
-    let pause_seconds = state
-        .rebalance_time
-        .sample_bucket_seconds(&mut rebalance_random);
+    let lead_random = decision_random(sample, DecisionRandomDomain::LeadTime);
+    let rebalance_random = decision_random(sample, DecisionRandomDomain::Rebalance);
     let mut placement_random = decision_random(sample, DecisionRandomDomain::Placement);
     state.partition_placement.sample_moved_prefix(
         &mut placement_random,
@@ -1291,8 +1303,8 @@ fn evaluate_one_scenario(
     let (planning_horizon_micros, disturbance_horizon_micros) = scenario_horizons(
         state,
         shared.resource_cohorts,
-        &lead_seconds,
-        &pause_seconds,
+        &lead_random,
+        &rebalance_random,
     );
     let path_length = sample_scenario_path(
         state,
@@ -1308,8 +1320,8 @@ fn evaluate_one_scenario(
         workspace,
         &ScenarioDraws {
             current_supply,
-            lead_seconds: &lead_seconds,
-            rebalance_seconds: &pause_seconds,
+            lead_random,
+            rebalance_random,
             commitment_random: decision_random(sample, DecisionRandomDomain::Commitment),
             arrival_path_end_seconds: &cells.arrival_path_end_seconds[..path_length],
             arrival_path_rates: &cells.arrival_path_rates[..path_length],
@@ -1425,10 +1437,18 @@ fn finalize_scenario_columns(state: &ScaleState, scratch: &mut ScaleScratch) {
 fn scenario_horizons(
     state: &ScaleState,
     cohorts: &WorkCohorts,
-    lead_seconds: &[f64; 8],
-    pause_seconds: &[f64; 8],
+    lead_random: &RandomStream,
+    rebalance_random: &RandomStream,
 ) -> (u64, u64) {
-    let transition_span_seconds = bucket_maximum(lead_seconds) + bucket_maximum(pause_seconds);
+    let mut transition_span_seconds = 0.0_f64;
+    for direction in [TransitionDirection::Up, TransitionDirection::Down] {
+        for delta in 1..=state.configuration.replica_count_max {
+            transition_span_seconds = transition_span_seconds.max(
+                scenario_launch_seconds(state, lead_random, direction, delta)
+                    + scenario_rebalance_seconds(state, rebalance_random, direction, delta),
+            );
+        }
+    }
     let report_horizon_micros = state
         .model_time
         .as_micros()
@@ -1683,8 +1703,8 @@ struct ScenarioForecast {
 /// One scenario's sampled transition and disturbance context.
 struct ScenarioDraws<'a> {
     current_supply: f64,
-    lead_seconds: &'a [f64; 8],
-    rebalance_seconds: &'a [f64; 8],
+    lead_random: RandomStream,
+    rebalance_random: RandomStream,
     commitment_random: RandomStream,
     arrival_path_end_seconds: &'a [f64],
     arrival_path_rates: &'a [f64],
@@ -1697,7 +1717,6 @@ fn prepare_supply_trajectories(
     draws: &ScenarioDraws<'_>,
 ) {
     let current_supply = draws.current_supply;
-    let rebalance_seconds = draws.rebalance_seconds;
     let candidate_count = workspace.posterior_resource_supply.len();
     let now_seconds = sample_commitment_pauses(
         state,
@@ -1751,13 +1770,16 @@ fn prepare_supply_trajectories(
             } else {
                 TransitionDirection::Down
             };
-            let sample = sample_index(direction, target.abs_diff(replicas));
+            let replica_delta = target.abs_diff(replicas);
             let ready_override = workspace.trajectory.ready_overrides[read];
-            let sampled_ready = if ready_override.is_finite() {
-                ready_override.max(pause)
-            } else {
-                pause + rebalance_seconds[sample]
-            };
+            let sampled_ready = sampled_membership_ready(
+                state,
+                draws,
+                direction,
+                replica_delta,
+                pause,
+                ready_override,
+            );
             let moved = shared.moved_partition_counts
                 [(replicas as usize - 1) * candidate_count + target as usize - 1];
             let ready = membership_ready(direction, moved, pause, sampled_ready);
@@ -1874,11 +1896,12 @@ fn push_candidate_events(
         } else {
             TransitionDirection::Down
         };
-        let sample = sample_index(direction, candidate.abs_diff(committed_replicas));
+        let replica_delta = candidate.abs_diff(committed_replicas);
         push_trajectory_event(
             &mut workspace.trajectory,
             candidate,
-            now_seconds + draws.lead_seconds[sample],
+            now_seconds
+                + scenario_launch_seconds(state, &draws.lead_random, direction, replica_delta),
             f64::NAN,
         );
     }
@@ -1932,14 +1955,21 @@ fn append_reactive_repairs(
         } else {
             TransitionDirection::Down
         };
-        let sample = sample_index(direction, target.abs_diff(replicas));
-        let pause = requested.max(ready) + draws.lead_seconds[sample];
+        let replica_delta = target.abs_diff(replicas);
+        let pause = requested.max(ready)
+            + scenario_launch_seconds(state, &draws.lead_random, direction, replica_delta);
         let moved = shared.moved_partition_counts
             [(replicas as usize - 1) * candidate_count + target as usize - 1];
         let repair_ready = if direction == TransitionDirection::Down && moved == 0 {
             pause
         } else {
-            pause + draws.rebalance_seconds[sample]
+            pause
+                + scenario_rebalance_seconds(
+                    state,
+                    &draws.rebalance_random,
+                    direction,
+                    replica_delta,
+                )
         };
         let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
         let after = workspace.posterior_resource_supply[target as usize - 1];
@@ -2009,25 +2039,14 @@ fn sample_commitment_pauses(
                         .saturating_sub(commitment.started_at.as_micros()),
                 )
                 .as_secs_f64();
-                let direction = if commitment.target_replicas > commitment.from_replicas {
-                    TransitionDirection::Up
-                } else {
-                    TransitionDirection::Down
-                };
-                let delta = commitment
-                    .target_replicas
-                    .abs_diff(commitment.from_replicas);
                 let domain = commitment.requested_at.as_micros()
                     ^ commitment.started_at.as_micros().rotate_left(17)
                     ^ u64::from(commitment.target_replicas).rotate_left(34);
                 let mut rebalance_random = random.clone().domain(domain);
                 now_seconds
-                    + state.rebalance_time.sample_remaining_seconds(
-                        direction,
-                        delta,
-                        elapsed_seconds,
-                        &mut rebalance_random,
-                    )
+                    + state
+                        .rebalance_time
+                        .sample_remaining_seconds(elapsed_seconds, &mut rebalance_random)
             });
     now_seconds
 }
@@ -2036,6 +2055,40 @@ pub(crate) fn decision_random(scenario: u32, domain: DecisionRandomDomain) -> Ra
     RandomStream::new(DECISION_SCENARIO_SEED)
         .domain(u64::from(scenario))
         .domain(domain as u64)
+}
+
+fn scenario_launch_seconds(
+    state: &ScaleState,
+    random: &RandomStream,
+    direction: TransitionDirection,
+    replica_delta: u32,
+) -> f64 {
+    let direction_domain = match direction {
+        TransitionDirection::Up => 0_u64,
+        TransitionDirection::Down => 1_u64 << 32_u32,
+    };
+    let mut random = random
+        .clone()
+        .domain(direction_domain | u64::from(replica_delta));
+    state
+        .lead_time
+        .sample_seconds(direction, replica_delta, &mut random)
+}
+
+fn scenario_rebalance_seconds(
+    state: &ScaleState,
+    random: &RandomStream,
+    direction: TransitionDirection,
+    replica_delta: u32,
+) -> f64 {
+    let direction_domain = match direction {
+        TransitionDirection::Up => 0_u64,
+        TransitionDirection::Down => 1_u64 << 32_u32,
+    };
+    let mut random = random
+        .clone()
+        .domain(direction_domain | u64::from(replica_delta));
+    state.rebalance_time.sample_seconds(&mut random)
 }
 
 fn push_trajectory_event(
@@ -2050,6 +2103,21 @@ fn push_trajectory_event(
     trajectory.ready_seconds.push(0.0_f64);
     trajectory.during_supply.push(0.0_f64);
     trajectory.after_supply.push(0.0_f64);
+}
+
+fn sampled_membership_ready(
+    state: &ScaleState,
+    draws: &ScenarioDraws<'_>,
+    direction: TransitionDirection,
+    replica_delta: u32,
+    pause: f64,
+    ready_override: f64,
+) -> f64 {
+    if ready_override.is_finite() {
+        ready_override.max(pause)
+    } else {
+        pause + scenario_rebalance_seconds(state, &draws.rebalance_random, direction, replica_delta)
+    }
 }
 
 fn sort_trajectory_events(trajectory: &mut TrajectoryColumns, first: usize) {
@@ -2067,10 +2135,6 @@ fn sort_trajectory_events(trajectory: &mut TrajectoryColumns, first: usize) {
 
 fn seconds_to_micros(seconds: f64) -> u64 {
     (seconds * 1_000_000.0_f64) as u64
-}
-
-fn bucket_maximum(values: &[f64; 8]) -> f64 {
-    values.iter().copied().fold(0.0_f64, f64::max)
 }
 
 pub(crate) fn minimal_moved_partitions(partitions: u32, current: u32, target: u32) -> u32 {
@@ -2346,7 +2410,7 @@ fn diagnostics(
     scenario_count: u32,
 ) -> DecisionDiagnostics {
     let selected_lead_time = selected_target.map_or_else(
-        || state.lead_time.expected_last_seconds() + state.rebalance_time.expected_last_seconds(),
+        || state.lead_time.expected_last_seconds() + state.rebalance_time.expected_seconds(),
         |target| {
             if target == state.current_replicas {
                 return 0.0_f64;
@@ -2357,7 +2421,7 @@ fn diagnostics(
                 (TransitionDirection::Down, state.current_replicas - target)
             };
             state.lead_time.expected_seconds(direction, delta)
-                + state.rebalance_time.expected_seconds(direction, delta)
+                + state.rebalance_time.expected_seconds()
         },
     );
     DecisionDiagnostics {
@@ -2370,15 +2434,11 @@ fn diagnostics(
         saturation_probability,
         no_knee_probability: state.capacity.no_knee_probability(),
         lead_time_up_seconds: state.lead_time.expected_seconds(TransitionDirection::Up, 1)
-            + state
-                .rebalance_time
-                .expected_seconds(TransitionDirection::Up, 1),
+            + state.rebalance_time.expected_seconds(),
         lead_time_down_seconds: state
             .lead_time
             .expected_seconds(TransitionDirection::Down, 1)
-            + state
-                .rebalance_time
-                .expected_seconds(TransitionDirection::Down, 1),
+            + state.rebalance_time.expected_seconds(),
         lead_time_seconds: selected_lead_time,
         handler_seconds: state.capacity.expected_service_time(state.simd_level),
         maximum_partition_share: state.partition_placement.maximum_expected_share(),

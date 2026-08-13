@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use prosody_scale_core::{
     CalendarArtifactId, CalendarRateSegment, CapacityGrid, CapacityPrior, Configuration,
-    DecisionRejection, RandomStream, ReliabilityPrior, SCHEDULED_RELEASE_COUNT_MAX,
-    ScheduledRelease, ServiceObjective, TransitionPrior,
+    DecisionRejection, LaunchPrior, RandomStream, RebalancePrior, ReliabilityPrior,
+    ScheduledRelease, ServiceObjective,
 };
 
 use crate::harness::TickDrivenAttemptModel;
@@ -1578,6 +1578,8 @@ fn principal_graph(
     let controller_configuration = Configuration {
         cohort_count_max: 64,
         calendar_segment_count_max: 64,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: 64,
         replica_count_max,
         slots_per_replica,
@@ -1597,8 +1599,8 @@ fn principal_graph(
         // workload change cadence.
         capacity_change_rate_per_second: 1.0_f64 / 300.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: transition_prior([30.0_f64, 45.0_f64, 60.0_f64, 90.0_f64])?,
-        rebalance_time_prior: transition_prior([0.05_f64, 0.1_f64, 0.2_f64, 0.4_f64])?,
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(regime.budget_micros(), 0.01, REPLICA_SECOND_DELAY_RATE)?,
     };
     let capacity_grid = capacity_grid(regime, capacity_regime, sensitivity)?;
@@ -1624,17 +1626,6 @@ fn principal_graph(
         }
         _ => Ok(graph),
     }
-}
-
-fn transition_prior(
-    median_seconds: [f64; 4],
-) -> Result<TransitionPrior, prosody_scale_core::TransitionPriorError> {
-    TransitionPrior::new(
-        median_seconds,
-        [0.1_f64, 0.2_f64, 0.3_f64],
-        [1.0_f64; 12],
-        0.0_f64,
-    )
 }
 
 fn capacity_grid(
@@ -1939,7 +1930,7 @@ pub enum PrincipalRunError {
     CapacityGrid(#[from] prosody_scale_core::CapacityGridError),
     /// A transition population prior is invalid.
     #[error(transparent)]
-    TransitionPrior(#[from] prosody_scale_core::TransitionPriorError),
+    LeadTimePrior(#[from] prosody_scale_core::LeadTimePriorError),
     /// The arrival population prior is invalid.
     #[error(transparent)]
     ArrivalPrior(#[from] prosody_scale_core::ArrivalPriorError),
@@ -2186,6 +2177,10 @@ impl PrincipalGraph {
 }
 
 impl TickGenerator for PrincipalGraph {
+    fn scheduled_release_count_max(&self) -> u32 {
+        64
+    }
+
     fn calculate(&mut self, context: TickContext<'_>) -> Result<TickInputs, PlantError> {
         let frame = PrincipalFrame {
             tick: context,
@@ -2847,23 +2842,20 @@ impl ArrivalSchedule {
     }
 
     fn pending_releases(&self) -> Result<ScheduledReleasesInput, PlantError> {
-        let mut releases = [ScheduledRelease {
-            release_micros: 0,
-            count: 1,
-        }; SCHEDULED_RELEASE_COUNT_MAX];
+        let mut releases = Vec::with_capacity(64);
         let mut input = &self.release_micros[self.cursor..];
         let mut count = 0_usize;
-        while !input.is_empty() && count < releases.len() {
+        while !input.is_empty() && count < releases.capacity() {
             let release_micros = input[0];
             let group_count = input.partition_point(|release| *release == release_micros);
-            releases[count] = ScheduledRelease {
+            releases.push(ScheduledRelease {
                 release_micros,
                 count: u32::try_from(group_count).map_err(|_| PlantError::PlatformLimit)?,
-            };
+            });
             count += 1;
             input = &input[group_count..];
         }
-        ScheduledReleasesInput::new(&releases[..count])
+        ScheduledReleasesInput::new(releases, 64)
     }
 }
 

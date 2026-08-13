@@ -1,12 +1,11 @@
 use std::num::NonZeroU32;
 
-use smallvec::SmallVec;
 use thiserror::Error;
 
-/// Maximum scheduled releases in one observation.
-pub const SCHEDULED_RELEASE_COUNT_MAX: usize = 64;
-
-use crate::{ArrivalEvidence, ResourceWindow, TransitionDirection, TransitionEvidence};
+use crate::{
+    ArrivalEvidence, LaunchEvidence, LaunchEvidenceError, ReadinessLump, RebalanceEvidence,
+    ResourceWindow, TransitionDirection,
+};
 
 /// Monotonic model time in microseconds.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -151,6 +150,193 @@ pub struct ArrivalPosterior {
 /// Stable identity for one frozen calendar artifact.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CalendarArtifactId(pub u64);
+
+/// Stable identity and random stream for one prior artifact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PriorArtifactIdentity {
+    source: u64,
+    version: u32,
+    random_stream: u64,
+}
+
+impl PriorArtifactIdentity {
+    /// Constructs one versioned artifact identity.
+    #[must_use]
+    pub const fn new(source: u64, version: u32, random_stream: u64) -> Self {
+        Self {
+            source,
+            version,
+            random_stream,
+        }
+    }
+
+    /// Returns the artifact source identity.
+    #[must_use]
+    pub const fn source(self) -> u64 {
+        self.source
+    }
+
+    /// Returns the artifact version.
+    #[must_use]
+    pub const fn version(self) -> u32 {
+        self.version
+    }
+
+    /// Returns the stream used for prior-predictive checks.
+    #[must_use]
+    pub const fn random_stream(self) -> u64 {
+        self.random_stream
+    }
+}
+
+/// Fixed approximation limits for one prior artifact.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PriorArtifactBudget {
+    hypothesis_count_max: u32,
+    storage_bytes_max: u64,
+    update_operation_count_max: u64,
+    boundary_probability_max: f64,
+    path_time_error_seconds: f64,
+    decision_cost_error_max: f64,
+}
+
+impl PriorArtifactBudget {
+    /// Constructs one grid, boundary, and path budget.
+    #[must_use]
+    pub const fn new(
+        hypothesis_count_max: u32,
+        storage_bytes_max: u64,
+        update_operation_count_max: u64,
+        boundary_probability_max: f64,
+        path_time_error_seconds: f64,
+        decision_cost_error_max: f64,
+    ) -> Self {
+        Self {
+            hypothesis_count_max,
+            storage_bytes_max,
+            update_operation_count_max,
+            boundary_probability_max,
+            path_time_error_seconds,
+            decision_cost_error_max,
+        }
+    }
+
+    pub(crate) fn is_valid(self) -> bool {
+        self.hypothesis_count_max > 0
+            && self.storage_bytes_max > 0
+            && self.update_operation_count_max > 0
+            && self.boundary_probability_max.is_finite()
+            && (0.0_f64..1.0_f64).contains(&self.boundary_probability_max)
+            && self.path_time_error_seconds.is_finite()
+            && self.path_time_error_seconds > 0.0_f64
+            && self.decision_cost_error_max.is_finite()
+            && self.decision_cost_error_max >= 0.0_f64
+    }
+
+    /// Returns the maximum product-grid cell count.
+    #[must_use]
+    pub const fn hypothesis_count_max(self) -> u32 {
+        self.hypothesis_count_max
+    }
+
+    /// Returns the maximum posterior and work storage in bytes.
+    #[must_use]
+    pub const fn storage_bytes_max(self) -> u64 {
+        self.storage_bytes_max
+    }
+
+    /// Returns the maximum cell and observation operations per update.
+    #[must_use]
+    pub const fn update_operation_count_max(self) -> u64 {
+        self.update_operation_count_max
+    }
+
+    /// Returns the maximum predictive mass outside recorded support.
+    #[must_use]
+    pub const fn boundary_probability_max(self) -> f64 {
+        self.boundary_probability_max
+    }
+
+    /// Returns the maximum lead-time path error in seconds.
+    #[must_use]
+    pub const fn path_time_error_seconds(self) -> f64 {
+        self.path_time_error_seconds
+    }
+
+    /// Returns the maximum decision-cost approximation error.
+    #[must_use]
+    pub const fn decision_cost_error_max(self) -> f64 {
+        self.decision_cost_error_max
+    }
+}
+
+/// One prior-predictive support and omitted-tail record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PriorCoverageRecord {
+    lower_endpoint: f64,
+    upper_endpoint: f64,
+    lower_tail_probability: f64,
+    upper_tail_probability: f64,
+    decision_cost_error: f64,
+}
+
+impl PriorCoverageRecord {
+    /// Constructs one coverage record.
+    #[must_use]
+    pub const fn new(
+        lower_endpoint: f64,
+        upper_endpoint: f64,
+        lower_tail_probability: f64,
+        upper_tail_probability: f64,
+        decision_cost_error: f64,
+    ) -> Self {
+        Self {
+            lower_endpoint,
+            upper_endpoint,
+            lower_tail_probability,
+            upper_tail_probability,
+            decision_cost_error,
+        }
+    }
+
+    pub(crate) fn is_valid(self) -> bool {
+        self.lower_endpoint.is_finite()
+            && self.lower_endpoint > 0.0_f64
+            && self.upper_endpoint.is_finite()
+            && self.upper_endpoint > self.lower_endpoint
+            && self.lower_tail_probability.is_finite()
+            && self.lower_tail_probability >= 0.0_f64
+            && self.upper_tail_probability.is_finite()
+            && self.upper_tail_probability >= 0.0_f64
+            && self.tail_probability() < 1.0_f64
+            && self.decision_cost_error.is_finite()
+            && self.decision_cost_error >= 0.0_f64
+    }
+
+    /// Returns the lower support endpoint in artifact units.
+    #[must_use]
+    pub const fn lower_endpoint(self) -> f64 {
+        self.lower_endpoint
+    }
+
+    /// Returns the upper support endpoint in artifact units.
+    #[must_use]
+    pub const fn upper_endpoint(self) -> f64 {
+        self.upper_endpoint
+    }
+
+    /// Returns the recorded probability outside both endpoints.
+    #[must_use]
+    pub const fn tail_probability(self) -> f64 {
+        self.lower_tail_probability + self.upper_tail_probability
+    }
+
+    /// Returns the recorded decision-cost error from omitted mass.
+    #[must_use]
+    pub const fn decision_cost_error(self) -> f64 {
+        self.decision_cost_error
+    }
+}
 
 /// One Gamma rate posterior for a future calendar interval.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -317,6 +503,10 @@ pub struct Configuration {
     pub cohort_count_max: u32,
     /// Maximum calendar intervals supplied in one observation.
     pub calendar_segment_count_max: u32,
+    /// Certified maximum future releases in one complete observation.
+    pub scheduled_release_count_max: u32,
+    /// Maximum scheduling groups in one launch update.
+    pub readiness_lump_count_max: u32,
     /// Configured Kafka partition count.
     pub partition_count: u32,
     /// Maximum allowed replica count.
@@ -336,9 +526,9 @@ pub struct Configuration {
     /// Population prior for class-specific retry probabilities.
     pub reliability_prior: crate::ReliabilityPrior,
     /// Population prior for replica launch time.
-    pub launch_time_prior: crate::TransitionPrior,
+    pub launch_time_prior: crate::LaunchPrior,
     /// Population prior for KIP-848 pause time.
-    pub rebalance_time_prior: crate::TransitionPrior,
+    pub rebalance_time_prior: crate::RebalancePrior,
     /// User latency objective.
     pub objective: ServiceObjective,
 }
@@ -360,6 +550,18 @@ impl Configuration {
                 name: "calendar_segment_count_max",
             });
         }
+        if self.scheduled_release_count_max == 0 {
+            return Err(ConfigurationError::ZeroBound {
+                name: "scheduled_release_count_max",
+            });
+        }
+        if self.readiness_lump_count_max == 0 {
+            return Err(ConfigurationError::ZeroBound {
+                name: "readiness_lump_count_max",
+            });
+        }
+        self.launch_time_prior
+            .validate_update_budget(self.readiness_lump_count_max)?;
         if self.calendar_segment_count_max > self.arrival_prior.path_segment_count_max() as u32 {
             return Err(ConfigurationError::CalendarPathCapacity);
         }
@@ -599,7 +801,6 @@ struct LaunchingCommitments {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RebalancingCommitment {
-    pub(crate) from_replicas: u32,
     pub(crate) target_replicas: u32,
     pub(crate) requested_at: ModelTime,
     pub(crate) started_at: ModelTime,
@@ -883,13 +1084,12 @@ impl ActuationCommitments {
                 self.launching.requested_at.push(requested_at);
             }
             ActuationPhase::Rebalancing {
-                from_replicas,
                 target_replicas,
                 requested_at,
                 started_at,
+                ..
             } => {
                 self.rebalancing = Some(RebalancingCommitment {
-                    from_replicas,
                     target_replicas,
                     requested_at,
                     started_at,
@@ -935,6 +1135,13 @@ impl ActuationCommitments {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LaunchEvidenceHeader {
+    requested_at: ModelTime,
+    requested_delta: u32,
+    observed_at: ModelTime,
+}
+
 /// Borrowed typed input for one controller tick.
 #[derive(Debug)]
 pub struct GroupObservation<'a> {
@@ -946,7 +1153,8 @@ pub struct GroupObservation<'a> {
     pub(crate) partition_arrivals: Option<PartitionArrivalEvidence<'a>>,
     pub(crate) resource_window: Option<ResourceWindow>,
     pub(crate) attempt_outcomes: Option<AttemptOutcomeEvidence>,
-    pub(crate) transition: Option<TransitionEvidence>,
+    pub(crate) launch: Option<LaunchEvidence<'a>>,
+    pub(crate) rebalance: Option<RebalanceEvidence>,
     pub(crate) current_replicas: Option<u32>,
     pub(crate) actuation_commitments: &'a ActuationCommitments,
 }
@@ -962,12 +1170,16 @@ pub struct ObservationBuffer {
     calendar_artifact: Option<CalendarArtifactId>,
     calendar_prior_probability: f64,
     calendar_segments: CalendarColumns,
-    scheduled_releases: SmallVec<[ScheduledRelease; SCHEDULED_RELEASE_COUNT_MAX]>,
+    scheduled_release_count_max: usize,
+    readiness_lump_count_max: usize,
+    scheduled_releases: Vec<ScheduledRelease>,
     partition_arrival_counts: Vec<u32>,
     partition_arrival_token: Option<UpdateToken>,
     resource_window: Option<ResourceWindow>,
     attempt_outcomes: Option<AttemptOutcomeEvidence>,
-    transition: Option<TransitionEvidence>,
+    launch_header: Option<LaunchEvidenceHeader>,
+    readiness_lumps: Vec<ReadinessLump>,
+    rebalance: Option<RebalanceEvidence>,
     current_replicas: Option<u32>,
     actuation_commitments: ActuationCommitments,
 }
@@ -986,6 +1198,11 @@ impl ObservationBuffer {
             .map_err(|_| ConfigurationError::PlatformLimit)?;
         let calendar_segment_count = usize::try_from(configuration.calendar_segment_count_max)
             .map_err(|_| ConfigurationError::PlatformLimit)?;
+        let scheduled_release_count_max =
+            usize::try_from(configuration.scheduled_release_count_max)
+                .map_err(|_| ConfigurationError::PlatformLimit)?;
+        let readiness_lump_count_max = usize::try_from(configuration.readiness_lump_count_max)
+            .map_err(|_| ConfigurationError::PlatformLimit)?;
         let replica_count_max = usize::try_from(configuration.replica_count_max)
             .map_err(|_| ConfigurationError::PlatformLimit)?;
         let backlog_count = partition_count
@@ -1000,12 +1217,16 @@ impl ObservationBuffer {
             calendar_artifact: None,
             calendar_prior_probability: 0.0_f64,
             calendar_segments: CalendarColumns::new(calendar_segment_count),
-            scheduled_releases: SmallVec::new(),
+            scheduled_release_count_max,
+            readiness_lump_count_max,
+            scheduled_releases: Vec::with_capacity(scheduled_release_count_max),
             partition_arrival_counts: vec![0; partition_count],
             partition_arrival_token: None,
             resource_window: None,
             attempt_outcomes: None,
-            transition: None,
+            launch_header: None,
+            readiness_lumps: Vec::with_capacity(readiness_lump_count_max),
+            rebalance: None,
             current_replicas: None,
             actuation_commitments: ActuationCommitments::new(replica_count_max),
         })
@@ -1024,7 +1245,9 @@ impl ObservationBuffer {
         self.partition_arrival_token = None;
         self.resource_window = None;
         self.attempt_outcomes = None;
-        self.transition = None;
+        self.launch_header = None;
+        self.readiness_lumps.clear();
+        self.rebalance = None;
         self.current_replicas = None;
         self.actuation_commitments.clear();
     }
@@ -1119,12 +1342,13 @@ impl ObservationBuffer {
     ///
     /// # Errors
     ///
-    /// Returns an error for excess entries, zero counts, or decreasing times.
+    /// Returns an error for excess entries, invalid counts, or decreasing
+    /// times.
     pub fn set_scheduled_releases(
         &mut self,
         releases: &[ScheduledRelease],
     ) -> Result<(), ObservationError> {
-        if releases.len() > SCHEDULED_RELEASE_COUNT_MAX {
+        if releases.len() > self.scheduled_release_count_max {
             return Err(ObservationError::ScheduledReleaseCapacity);
         }
         if releases.iter().any(|release| release.count == 0) {
@@ -1137,7 +1361,18 @@ impl ObservationBuffer {
             return Err(ObservationError::ScheduledReleaseOrder);
         }
         self.scheduled_releases.clear();
-        self.scheduled_releases.extend_from_slice(releases);
+        for &release in releases {
+            if let Some(previous) = self.scheduled_releases.last_mut()
+                && previous.release_micros == release.release_micros
+            {
+                previous.count = previous
+                    .count
+                    .checked_add(release.count)
+                    .ok_or(ObservationError::CountOverflow)?;
+            } else {
+                self.scheduled_releases.push(release);
+            }
+        }
         Ok(())
     }
 
@@ -1199,16 +1434,72 @@ impl ObservationBuffer {
         Ok(())
     }
 
-    /// Sets one actuation lead-time update token.
+    /// Sets one consumable launch update without growing the buffer.
     ///
     /// # Errors
     ///
-    /// Returns an error when an unconsumed token is present.
-    pub fn set_transition(&mut self, evidence: TransitionEvidence) -> Result<(), ObservationError> {
-        if self.transition.is_some() {
-            return Err(ObservationError::TransitionEvidencePending);
+    /// Returns an error for invalid groups, intervals, or capacity.
+    pub fn set_launch_evidence(
+        &mut self,
+        requested_at: ModelTime,
+        requested_delta: u32,
+        observed_at: ModelTime,
+        lumps: &[ReadinessLump],
+    ) -> Result<(), ObservationError> {
+        if self.launch_header.is_some() {
+            return Err(ObservationError::LaunchEvidencePending);
         }
-        self.transition = Some(evidence);
+        if requested_delta == 0 {
+            return Err(LaunchEvidenceError::ZeroReplicaDelta.into());
+        }
+        if observed_at < requested_at {
+            return Err(LaunchEvidenceError::ObservationBeforeRequest.into());
+        }
+        if lumps.len() > self.readiness_lump_count_max {
+            return Err(ObservationError::ReadinessLumpCapacity);
+        }
+        let mut pod_count = 0_u32;
+        for (index, lump) in lumps.iter().copied().enumerate() {
+            let (lower, upper) = lump.observation().bounds();
+            if lower < requested_at || upper > observed_at {
+                return Err(LaunchEvidenceError::IntervalOutsideObservation.into());
+            }
+            if lumps[..index]
+                .iter()
+                .any(|prior| prior.group() == lump.group())
+            {
+                return Err(LaunchEvidenceError::DuplicateGroup.into());
+            }
+            pod_count = pod_count
+                .checked_add(lump.pod_count())
+                .ok_or(ObservationError::CountOverflow)?;
+        }
+        if pod_count > requested_delta {
+            return Err(LaunchEvidenceError::PodCountExceedsDelta.into());
+        }
+        self.readiness_lumps.clear();
+        self.readiness_lumps.extend_from_slice(lumps);
+        self.launch_header = Some(LaunchEvidenceHeader {
+            requested_at,
+            requested_delta,
+            observed_at,
+        });
+        Ok(())
+    }
+
+    /// Sets one consumable rebalance-pause update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an unconsumed update is present.
+    pub fn set_rebalance_evidence(
+        &mut self,
+        evidence: RebalanceEvidence,
+    ) -> Result<(), ObservationError> {
+        if self.rebalance.is_some() {
+            return Err(ObservationError::RebalanceEvidencePending);
+        }
+        self.rebalance = Some(evidence);
         Ok(())
     }
 
@@ -1284,7 +1575,15 @@ impl ObservationBuffer {
             partition_arrivals,
             resource_window: self.resource_window.take(),
             attempt_outcomes: self.attempt_outcomes.take(),
-            transition: self.transition.take(),
+            launch: self.launch_header.take().map(|header| {
+                LaunchEvidence::new(
+                    header.requested_at,
+                    header.requested_delta,
+                    header.observed_at,
+                    &self.readiness_lumps,
+                )
+            }),
+            rebalance: self.rebalance.take(),
             current_replicas: self.current_replicas.take(),
             actuation_commitments: &self.actuation_commitments,
         }
@@ -1314,7 +1613,7 @@ pub struct DecisionDiagnostics {
     pub lead_time_up_seconds: f64,
     /// Posterior expected scale-down lead time for one replica.
     pub lead_time_down_seconds: f64,
-    /// Posterior expected lead time for the selected or last transition bucket.
+    /// Posterior expected lead time for the selected or last replica change.
     pub lead_time_seconds: f64,
     /// Posterior expected uncongested handler duration in seconds.
     pub handler_seconds: f64,
@@ -1367,6 +1666,9 @@ pub enum ScaleDecision {
 /// Invalid construction input.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum ConfigurationError {
+    /// A lead-time artifact exceeds its declared budget.
+    #[error(transparent)]
+    LeadTimePrior(#[from] crate::LeadTimePriorError),
     /// The latency budget is zero.
     #[error("the latency budget must be positive")]
     ZeroBudget,
@@ -1464,9 +1766,18 @@ pub enum ObservationError {
     /// A partition and class backlog observation was not consumed.
     #[error("backlog evidence is already pending for this partition and class")]
     BacklogPending,
-    /// An actuation lead-time update was not consumed.
-    #[error("transition evidence is already pending")]
-    TransitionEvidencePending,
+    /// A launch update was not consumed.
+    #[error("launch evidence is already pending")]
+    LaunchEvidencePending,
+    /// A rebalance update was not consumed.
+    #[error("rebalance evidence is already pending")]
+    RebalanceEvidencePending,
+    /// A launch update exceeds its configured scheduling-group bound.
+    #[error("the launch evidence exceeds its scheduling-group bound")]
+    ReadinessLumpCapacity,
+    /// Launch evidence is invalid.
+    #[error(transparent)]
+    LaunchEvidence(#[from] LaunchEvidenceError),
     /// A warm replica count is outside the configured range.
     #[error("the current replica count is outside the configured range")]
     ReplicaCount,

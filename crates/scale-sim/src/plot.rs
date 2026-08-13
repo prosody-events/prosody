@@ -383,7 +383,7 @@ fn model_panels(trace: &MetricTrace) -> [Panel<'_>; 7] {
             [
                 series("scale up", Values::F64(&trace.lead_time_up_seconds)),
                 series("scale down", Values::F64(&trace.lead_time_down_seconds)),
-                series("active bucket", Values::F64(&trace.lead_time_seconds)),
+                series("active change", Values::F64(&trace.lead_time_seconds)),
                 missing_series(trace.at_micros.len()),
             ],
         ),

@@ -2126,9 +2126,12 @@ pub enum PlantError {
     /// An arrival predictive distribution parameter is invalid.
     #[error(transparent)]
     ArrivalPredictiveDistribution(#[from] NegativeBinomialError),
-    /// Generated actuation evidence is invalid.
+    /// Generated launch or rebalance evidence is invalid.
     #[error(transparent)]
-    TransitionEvidence(#[from] prosody_scale_core::TransitionEvidenceError),
+    LaunchEvidence(#[from] prosody_scale_core::LaunchEvidenceError),
+    /// A predictive lead-time quantile failed.
+    #[error(transparent)]
+    PredictiveQuantile(#[from] prosody_scale_core::PredictiveQuantileError),
     /// A fixed bound is zero.
     #[error("{name} must be positive")]
     ZeroBound {

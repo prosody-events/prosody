@@ -5,9 +5,7 @@ use crate::{
 };
 use std::num::NonZeroU32;
 
-use prosody_scale_core::{
-    CalendarArtifactId, CalendarRateSegment, SCHEDULED_RELEASE_COUNT_MAX, ScheduledRelease,
-};
+use prosody_scale_core::{CalendarArtifactId, CalendarRateSegment, ScheduledRelease};
 
 const CALENDAR_FORECAST_SEGMENT_COUNT_MAX: usize = 8;
 
@@ -117,10 +115,9 @@ pub struct CalendarForecastInput {
 }
 
 /// Bounded known future releases for one controller tick.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScheduledReleasesInput {
-    releases: [ScheduledRelease; SCHEDULED_RELEASE_COUNT_MAX],
-    count: u8,
+    releases: Vec<ScheduledRelease>,
 }
 
 impl ScheduledReleasesInput {
@@ -128,11 +125,7 @@ impl ScheduledReleasesInput {
     #[must_use]
     pub const fn empty() -> Self {
         Self {
-            releases: [ScheduledRelease {
-                release_micros: 0,
-                count: 1,
-            }; SCHEDULED_RELEASE_COUNT_MAX],
-            count: 0,
+            releases: Vec::new(),
         }
     }
 
@@ -140,21 +133,28 @@ impl ScheduledReleasesInput {
     ///
     /// # Errors
     ///
-    /// Returns an error when the schedule exceeds the simulator bound.
-    pub fn new(releases: &[ScheduledRelease]) -> Result<Self, PlantError> {
-        if releases.len() > SCHEDULED_RELEASE_COUNT_MAX {
+    /// Returns an error when the schedule exceeds the certified producer bound.
+    pub fn new(
+        releases: Vec<ScheduledRelease>,
+        certified_count_max: u32,
+    ) -> Result<Self, PlantError> {
+        let certified_count_max =
+            usize::try_from(certified_count_max).map_err(|_| PlantError::PlatformLimit)?;
+        if certified_count_max == 0 {
+            return Err(PlantError::ZeroBound {
+                name: "scheduled_release_count_max",
+            });
+        }
+        if releases.len() > certified_count_max {
             return Err(PlantError::ScheduledReleaseCapacity);
         }
-        let mut input = Self::empty();
-        input.releases[..releases.len()].copy_from_slice(releases);
-        input.count = u8::try_from(releases.len()).map_err(|_| PlantError::PlatformLimit)?;
-        Ok(input)
+        Ok(Self { releases })
     }
 
     /// Returns the known releases.
     #[must_use]
     pub fn releases(&self) -> &[ScheduledRelease] {
-        &self.releases[..usize::from(self.count)]
+        &self.releases
     }
 }
 
@@ -331,6 +331,11 @@ pub struct EventInputs {
 
 /// A regime-owned graph that calculates every tick input.
 pub trait TickGenerator {
+    /// Returns the certified maximum future releases in one observation.
+    fn scheduled_release_count_max(&self) -> u32 {
+        1
+    }
+
     /// Calculates one row from time, plant state, history, and graph
     /// dependencies.
     ///

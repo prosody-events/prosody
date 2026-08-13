@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use prosody_scale_core::{
     ArrivalPrior, ArrivalPriorError, CapacityGrid, Configuration as ControllerConfiguration,
-    RandomStream, ReliabilityPrior, ServiceObjective, TransitionPrior,
+    LaunchPrior, RandomStream, RebalancePrior, ReliabilityPrior, ServiceObjective,
 };
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
@@ -436,6 +436,8 @@ fn run_idle_partition_capacity_trace(partition_count: u32) -> Result<(Vec<u64>, 
     let controller_configuration = ControllerConfiguration {
         cohort_count_max: 4,
         calendar_segment_count_max: 4,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count,
         replica_count_max: 2,
         slots_per_replica: 2,
@@ -445,8 +447,8 @@ fn run_idle_partition_capacity_trace(partition_count: u32) -> Result<(Vec<u64>, 
         arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     };
     let capacity_grid = CapacityGrid::new(
@@ -500,13 +502,15 @@ fn closed_loop_accepts_busy_zero_completion_capacity_windows() -> Result<(), Tes
     Ok(())
 }
 
-fn capacity_test_closed_loop<Workload>(
+fn capacity_test_closed_loop<Workload: TickGenerator>(
     workload: Workload,
     sample_count_max: u32,
 ) -> Result<ClosedLoop<Workload>, TestError> {
     let controller_configuration = ControllerConfiguration {
         cohort_count_max: 4,
         calendar_segment_count_max: 4,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: 4,
         replica_count_max: 8,
         slots_per_replica: 2,
@@ -516,8 +520,8 @@ fn capacity_test_closed_loop<Workload>(
         arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     };
     let capacity_grid = CapacityGrid::new(
@@ -593,6 +597,8 @@ fn higher_retarget_preserves_each_completed_lead_time() -> Result<(), TestError>
     let controller_configuration = ControllerConfiguration {
         cohort_count_max: 4,
         calendar_segment_count_max: 4,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: 4,
         replica_count_max: 8,
         slots_per_replica: 2,
@@ -602,8 +608,8 @@ fn higher_retarget_preserves_each_completed_lead_time() -> Result<(), TestError>
         arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01, 3.0_f64)?,
     };
     let capacity_grid = CapacityGrid::new(&[0.001_f64], &[1_000.0_f64], &[0.0_f64, 1.0_f64])?;
@@ -2074,6 +2080,8 @@ fn source_arrival_count(messages: u32, timers: u32) -> Result<u32, TestError> {
     let controller_configuration = ControllerConfiguration {
         cohort_count_max: 4,
         calendar_segment_count_max: 4,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: 4,
         replica_count_max: 8,
         slots_per_replica: 2,
@@ -2083,8 +2091,8 @@ fn source_arrival_count(messages: u32, timers: u32) -> Result<u32, TestError> {
         arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     };
     let capacity_grid = CapacityGrid::new(&[0.001_f64], &[1_000.0_f64], &[0.0_f64])?;
@@ -2116,6 +2124,8 @@ fn run_reported_arrivals(
     let controller_configuration = ControllerConfiguration {
         cohort_count_max: 4,
         calendar_segment_count_max: 4,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: 4,
         replica_count_max: 8,
         slots_per_replica: 2,
@@ -2125,8 +2135,8 @@ fn run_reported_arrivals(
         arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01, 3.0_f64)?,
     };
     let capacity_grid = CapacityGrid::new(&[0.001_f64], &[1_000.0_f64], &[0.0_f64, 1.0_f64])?;
@@ -2244,6 +2254,8 @@ impl Arbitrary for EventTrace {
 
 #[derive(Debug, Error)]
 enum TestError {
+    #[error(transparent)]
+    LeadTimePrior(#[from] prosody_scale_core::LeadTimePriorError),
     #[error(transparent)]
     ArrivalPrior(#[from] ArrivalPriorError),
     #[error(transparent)]

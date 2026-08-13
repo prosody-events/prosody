@@ -17,16 +17,19 @@ use crate::edf::{
     evaluate_general_trajectory, evaluate_prepared_step, evaluate_prepared_trajectory, prepare,
     required_capacity_prepared,
 };
-use crate::lead_time::LeadTimeFactor;
+use crate::lead_time::LaunchTimeFactor;
 use crate::partition::PartitionFactor;
 use crate::planning::terminal_replica_seconds;
 use crate::types::WorkCohorts;
 use crate::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
     CapacityCurve, CapacityGrid, CapacityPrior, Cohort, Configuration, ConfigurationError,
-    DemandClass, HoldReason, ModelTime, ObservationBuffer, PosteriorQuery, RandomStream,
-    ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleState, ServiceObjective,
-    ThroughputPosteriorCell, TransitionDirection, TransitionEvidence, TransitionPrior, step,
+    DemandClass, DurationCell, HoldReason, LaunchPrior, LaunchPriorGrid, ModelTime,
+    ObservationBuffer, ObservationError, PosteriorQuery, PriorArtifactBudget,
+    PriorArtifactIdentity, PriorCoverageRecord, RandomStream, ReadinessGroupId, ReadinessLump,
+    ReadinessObservation, RebalanceEvidence, RebalancePrior, ReliabilityPrior, ResourceWindow,
+    ScaleDecision, ScaleState, ServiceObjective, ThroughputPosteriorCell, TransitionDirection,
+    step,
 };
 
 const NO_FUTURE_ARRIVALS: ArrivalPath<'static> = ArrivalPath {
@@ -679,50 +682,261 @@ fn backlog_evidence_has_one_positive_observation_per_partition_and_class() -> Re
 }
 
 #[test]
-fn lead_time_updates_only_the_matching_direction_and_delta() -> Result<(), TestError> {
-    let simd_level = Level::new();
-    let prior = TransitionPrior::broad_fallback();
-    let mut factor = LeadTimeFactor::new(&prior);
-    let up_one_prior = factor.expected_seconds(TransitionDirection::Up, 1);
-    let up_four_prior = factor.expected_seconds(TransitionDirection::Up, 4);
-    let down_prior = factor.expected_seconds(TransitionDirection::Down, 1);
+fn launch_evidence_accepts_incremental_groups_and_rejects_duplicate_groups() -> Result<(), TestError>
+{
+    let configuration = configuration()?;
+    let mut observation = ObservationBuffer::new(&configuration)?;
+    let requested_at = ModelTime::from_micros(1_000_000);
+    let observed_at = ModelTime::from_micros(3_000_000);
+    let ready = ReadinessLump::new(
+        ReadinessGroupId(1),
+        1,
+        ReadinessObservation::ready(requested_at, ModelTime::from_micros(2_000_000))?,
+    )?;
+    let pending = ReadinessLump::new(
+        ReadinessGroupId(2),
+        1,
+        ReadinessObservation::pending(ModelTime::from_micros(2_000_000), observed_at)?,
+    )?;
 
-    factor.update(
-        simd_level,
-        TransitionEvidence::completed(TransitionDirection::Up, 1, 15_000_000)?
-            .consume()
-            .0,
-    );
+    observation.set_launch_evidence(requested_at, 3, observed_at, &[ready, pending])?;
+    assert!(observation.observation().launch.is_some());
 
-    assert!(factor.expected_seconds(TransitionDirection::Up, 1) < up_one_prior);
-    assert!(close_relative(
-        factor.expected_seconds(TransitionDirection::Up, 4),
-        up_four_prior,
+    let duplicate = [
+        ready,
+        ReadinessLump::new(ReadinessGroupId(1), 1, pending.observation())?,
+    ];
+    assert!(matches!(
+        observation.set_launch_evidence(requested_at, 3, observed_at, &duplicate),
+        Err(ObservationError::LaunchEvidence(
+            crate::LaunchEvidenceError::DuplicateGroup
+        ))
     ));
-    assert!(close_relative(
-        factor.expected_seconds(TransitionDirection::Down, 1),
-        down_prior,
-    ));
+    Ok(())
+}
 
-    factor.update(
-        simd_level,
-        TransitionEvidence::censored(TransitionDirection::Down, 1, 120_000_000)?
-            .consume()
-            .0,
-    );
-    assert!(factor.expected_seconds(TransitionDirection::Down, 1) > down_prior);
-    factor.update(
-        simd_level,
-        TransitionEvidence::censored(TransitionDirection::Down, 1, u64::MAX)?
-            .consume()
-            .0,
-    );
+#[test]
+fn bimodal_launch_evidence_concentrates_without_a_compromise_cell() -> Result<(), TestError> {
+    const PAIR_COUNT: u32 = 16;
+    const OLD_MODEL_VALLEY_MASS: f64 = 0.842_456_256_292_198_1_f64;
+    let mut witness = mixture_witness()?;
+    let fast_interval = (4.95_f64, 5.05_f64);
+    let slow_interval = (59.95_f64, 60.05_f64);
+    let mut prior_half_mass = mode_mass(&witness.oracle, 1);
+    let mut wrong_odds_at_half = [0.0_f64; 2];
+    for pair in 1..=PAIR_COUNT {
+        witness.factor.update(
+            Level::new(),
+            crate::LaunchEvidence::new(
+                ModelTime::from_micros(0),
+                2,
+                ModelTime::from_micros(60_050_000),
+                &witness.lumps,
+            ),
+        );
+        update_launch_oracle(
+            &mut witness.oracle,
+            &witness.intercepts,
+            &witness.fast_medians,
+            &witness.slow_medians,
+            witness.sigma,
+            [fast_interval, slow_interval],
+        );
+        let roundoff = f64::EPSILON * 12.0_f64 * f64::from(pair) * 64.0_f64;
+        assert!(
+            witness
+                .factor
+                .posterior_weights()
+                .iter()
+                .zip(witness.oracle)
+                .all(|(actual, expected)| (actual - expected).abs() <= roundoff),
+            "the posterior must match the finite-grid oracle"
+        );
+        let half_mass = mode_mass(witness.factor.posterior_weights(), 1);
+        assert!(
+            half_mass >= prior_half_mass,
+            "each fast and slow pair must increase mass on equal mode weight"
+        );
+        prior_half_mass = half_mass;
+        if pair == PAIR_COUNT / 2 {
+            wrong_odds_at_half = [
+                mode_mass(witness.factor.posterior_weights(), 0) / half_mass,
+                mode_mass(witness.factor.posterior_weights(), 2) / half_mass,
+            ];
+        }
+    }
+    let half_mass = mode_mass(witness.factor.posterior_weights(), 1);
+    for (wrong, prior_odds) in [0_usize, 2].into_iter().zip(wrong_odds_at_half) {
+        assert!(
+            mode_mass(witness.factor.posterior_weights(), wrong) / half_mass < prior_odds,
+            "doubling the evidence must reduce each wrong mode odds"
+        );
+    }
+    let mut values = [0.0_f64; 4];
+    let mut component_mass = [0.0_f64; 4];
+    assert!(witness.factor.write_posterior(
+        TransitionDirection::Up,
+        2,
+        &mut values,
+        &mut component_mass,
+    ));
+    let generating_mass = component_mass[0] + component_mass[3];
+    let compromise_mass = component_mass[1] + component_mass[2];
     assert!(
-        factor
-            .expected_seconds(TransitionDirection::Down, 1)
-            .is_finite()
+        generating_mass > compromise_mass,
+        "the mixture must select the fast and slow cells, not compromise cells"
+    );
+    let valley_mass = witness
+        .factor
+        .predictive_cdf(TransitionDirection::Up, 2, 40.0_f64)
+        - witness
+            .factor
+            .predictive_cdf(TransitionDirection::Up, 2, 10.0_f64);
+    let oracle_valley_mass = launch_oracle_interval_mass(
+        &witness.oracle,
+        &witness.intercepts,
+        &witness.fast_medians,
+        &witness.slow_medians,
+        witness.sigma,
+        (10.0_f64, 40.0_f64),
+    );
+    let roundoff = f64::EPSILON * 12.0_f64 * f64::from(PAIR_COUNT) * 64.0_f64;
+    assert!((valley_mass - oracle_valley_mass).abs() <= roundoff);
+    assert!(
+        valley_mass < OLD_MODEL_VALLEY_MASS,
+        "the mixture must reject the old model's predictive valley mass"
     );
     Ok(())
+}
+
+struct MixtureWitness {
+    factor: LaunchTimeFactor,
+    oracle: [f64; 12],
+    intercepts: [f64; 3],
+    fast_medians: [f64; 2],
+    slow_medians: [f64; 2],
+    sigma: f64,
+    lumps: [ReadinessLump; 2],
+}
+
+fn mixture_witness() -> Result<MixtureWitness, TestError> {
+    let intercepts = [-9.0_f64.ln(), 0.0_f64, 9.0_f64.ln()];
+    let fast_medians = [5.0_f64, 20.0_f64];
+    let slow_medians = [20.0_f64, 60.0_f64];
+    let sigma = 0.03_f64;
+    let fast_cells = [
+        DurationCell::new(fast_medians[0], sigma)?,
+        DurationCell::new(fast_medians[1], sigma)?,
+    ];
+    let slow_cells = [
+        DurationCell::new(slow_medians[0], sigma)?,
+        DurationCell::new(slow_medians[1], sigma)?,
+    ];
+    let prior = LaunchPrior::new(
+        PriorArtifactIdentity::new(1, 1, 1),
+        PriorArtifactBudget::new(16, 512, 1_024, 1.0e-6_f64, 1.0e-6_f64, 1.0e-6_f64),
+        &[
+            PriorCoverageRecord::new(1.0_f64, 120.0_f64, 1.0e-12_f64, 1.0e-12_f64, 1.0e-12_f64),
+            PriorCoverageRecord::new(1.0_f64, 120.0_f64, 1.0e-12_f64, 1.0e-12_f64, 1.0e-12_f64),
+        ],
+        LaunchPriorGrid::new(&intercepts, &[0.0_f64], &fast_cells, &slow_cells),
+        &[1.0_f64; 12],
+        0.0_f64,
+    )?;
+    Ok(MixtureWitness {
+        factor: LaunchTimeFactor::new(&prior),
+        oracle: [1.0_f64 / 12.0_f64; 12],
+        intercepts,
+        fast_medians,
+        slow_medians,
+        sigma,
+        lumps: [
+            readiness_lump(1, 4_950_000, 5_050_000)?,
+            readiness_lump(2, 59_950_000, 60_050_000)?,
+        ],
+    })
+}
+
+fn readiness_lump(group: u64, after: u64, ready: u64) -> Result<ReadinessLump, TestError> {
+    Ok(ReadinessLump::new(
+        ReadinessGroupId(group),
+        1,
+        ReadinessObservation::ready(ModelTime::from_micros(after), ModelTime::from_micros(ready))?,
+    )?)
+}
+
+fn mode_mass(weights: &[f64], intercept: usize) -> f64 {
+    weights[intercept * 4..intercept * 4 + 4].iter().sum()
+}
+
+fn update_launch_oracle(
+    weights: &mut [f64; 12],
+    intercepts: &[f64; 3],
+    fast_medians: &[f64; 2],
+    slow_medians: &[f64; 2],
+    sigma: f64,
+    intervals: [(f64, f64); 2],
+) {
+    for (hypothesis, weight) in weights.iter_mut().enumerate() {
+        let intercept = hypothesis / 4;
+        let fast = (hypothesis / 2) % 2;
+        let slow = hypothesis % 2;
+        let slow_probability = 1.0_f64 / (1.0_f64 + (-intercepts[intercept]).exp());
+        for interval in intervals {
+            let fast_probability = test_log_normal_interval(fast_medians[fast], sigma, interval);
+            let slow_probability_mass =
+                test_log_normal_interval(slow_medians[slow], sigma, interval);
+            *weight *= (1.0_f64 - slow_probability) * fast_probability
+                + slow_probability * slow_probability_mass;
+        }
+    }
+    let total = weights.iter().sum::<f64>();
+    for weight in weights {
+        *weight /= total;
+    }
+}
+
+fn launch_oracle_interval_mass(
+    weights: &[f64; 12],
+    intercepts: &[f64; 3],
+    fast_medians: &[f64; 2],
+    slow_medians: &[f64; 2],
+    sigma: f64,
+    interval: (f64, f64),
+) -> f64 {
+    weights
+        .iter()
+        .enumerate()
+        .map(|(hypothesis, weight)| {
+            let intercept = hypothesis / 4;
+            let fast = (hypothesis / 2) % 2;
+            let slow = hypothesis % 2;
+            let slow_probability = 1.0_f64 / (1.0_f64 + (-intercepts[intercept]).exp());
+            weight
+                * ((1.0_f64 - slow_probability)
+                    * test_log_normal_interval(fast_medians[fast], sigma, interval)
+                    + slow_probability
+                        * test_log_normal_interval(slow_medians[slow], sigma, interval))
+        })
+        .sum()
+}
+
+fn test_log_normal_interval(median: f64, sigma: f64, interval: (f64, f64)) -> f64 {
+    test_normal_cdf((interval.1.ln() - median.ln()) / sigma)
+        - test_normal_cdf((interval.0.ln() - median.ln()) / sigma)
+}
+
+fn test_normal_cdf(value: f64) -> f64 {
+    let sign = if value < 0.0_f64 { -1.0_f64 } else { 1.0_f64 };
+    let value = value.abs() / 2.0_f64.sqrt();
+    let t = 1.0_f64 / (1.0_f64 + 0.327_591_1_f64 * value);
+    let polynomial = (((((1.061_405_429_f64 * t - 1.453_152_027_f64) * t) + 1.421_413_741_f64)
+        * t
+        - 0.284_496_736_f64)
+        * t
+        + 0.254_829_592_f64)
+        * t;
+    0.5_f64 * (1.0_f64 + sign * (1.0_f64 - polynomial * (-value * value).exp()))
 }
 
 #[test]
@@ -745,11 +959,23 @@ fn rebalance_evidence_updates_each_observed_phase() -> Result<(), TestError> {
     let mut pause_before = vec![0.0_f64; value_count];
     state.write_posterior(lead_query, &mut values, &mut lead_before)?;
     state.write_posterior(pause_query, &mut values, &mut pause_before)?;
-    observation.set_transition(TransitionEvidence::completed_rebalance(
-        TransitionDirection::Up,
+    let launch_lump = ReadinessLump::new(
+        ReadinessGroupId(1),
         1,
-        15_000_000,
-        120_000_000,
+        ReadinessObservation::ready(
+            ModelTime::from_micros(0),
+            ModelTime::from_micros(15_000_000),
+        )?,
+    )?;
+    observation.set_launch_evidence(
+        ModelTime::from_micros(0),
+        1,
+        ModelTime::from_micros(15_000_000),
+        &[launch_lump],
+    )?;
+    observation.set_rebalance_evidence(RebalanceEvidence::completed(
+        ModelTime::from_micros(119_000_000),
+        ModelTime::from_micros(120_000_000),
     )?)?;
 
     let _ = step(
@@ -793,7 +1019,7 @@ fn resource_window_is_consumed_once() -> Result<(), TestError> {
     let replacement = observation.set_resource_window(ResourceWindow::new(8.0, 1.0, 80)?);
     assert!(matches!(
         replacement,
-        Err(crate::ObservationError::ResourceWindowPending)
+        Err(ObservationError::ResourceWindowPending)
     ));
 
     let consumed = observation.observation();
@@ -896,6 +1122,26 @@ fn partition_factor_learns_a_normalized_skew() -> Result<(), TestError> {
         .sum::<f64>();
     assert!((sum - 1.0_f64).abs() < 1.0e-12_f64);
     assert!(factor.expected_share(0) > 0.85_f64);
+    Ok(())
+}
+
+#[test]
+fn partition_prior_uses_one_jeffreys_half_unit_per_partition() -> Result<(), TestError> {
+    let mut factor = PartitionFactor::new(4)?;
+    factor.update(&[1, 0, 0, 0]);
+    let check = crate::partition_prior_predictive_check(4)?;
+    let hottest = check.hottest_share_quantiles();
+    let entropy = check.share_entropy_quantiles();
+    let uniform_hottest = check.uniform_hottest_share_quantiles();
+    let uniform_entropy = check.uniform_share_entropy_quantiles();
+
+    assert!(close_relative(factor.expected_share(0), 0.5_f64));
+    assert!(close_relative(factor.expected_share(1), 1.0_f64 / 6.0_f64));
+    assert!(hottest[0] < hottest[1] && hottest[1] < hottest[2]);
+    assert!(entropy[0] < entropy[1] && entropy[1] < entropy[2]);
+    assert!(hottest[1] > uniform_hottest[1]);
+    assert!(entropy[1] < uniform_entropy[1]);
+    assert!(check.quantile_rank_error_max() < 0.1_f64);
     Ok(())
 }
 
@@ -1104,29 +1350,44 @@ fn capacity_transition_is_cadence_invariant() -> Result<(), TestError> {
 
 #[test]
 fn actuation_transition_is_cadence_invariant() -> Result<(), TestError> {
-    let prior = TransitionPrior::new(
-        [15.0_f64, 30.0_f64, 60.0_f64, 120.0_f64],
-        [0.1_f64, 0.3_f64, 0.6_f64],
-        [1.0_f64; 12],
-        2.0_f64.ln(),
-    )?;
-    let mut coarse = LeadTimeFactor::new(&prior);
-    let mut fine = LeadTimeFactor::new(&prior);
-    let (coarse_evidence, _) =
-        TransitionEvidence::completed(TransitionDirection::Up, 2, 30_000_000)?.consume();
-    let (fine_evidence, _) =
-        TransitionEvidence::completed(TransitionDirection::Up, 2, 30_000_000)?.consume();
-    coarse.update(Level::new(), coarse_evidence);
-    fine.update(Level::new(), fine_evidence);
+    let prior = LaunchPrior::kubernetes()?;
+    let mut coarse = LaunchTimeFactor::new(&prior);
+    let mut fine = LaunchTimeFactor::new(&prior);
+    let lumps = [ReadinessLump::new(
+        ReadinessGroupId(1),
+        2,
+        ReadinessObservation::ready(
+            ModelTime::from_micros(0),
+            ModelTime::from_micros(30_000_000),
+        )?,
+    )?];
+    coarse.update(
+        Level::new(),
+        crate::LaunchEvidence::new(
+            ModelTime::from_micros(0),
+            2,
+            ModelTime::from_micros(30_000_000),
+            &lumps,
+        ),
+    );
+    fine.update(
+        Level::new(),
+        crate::LaunchEvidence::new(
+            ModelTime::from_micros(0),
+            2,
+            ModelTime::from_micros(30_000_000),
+            &lumps,
+        ),
+    );
 
     coarse.transition(Duration::from_secs(1));
     for _ in 0_u32..1_000 {
         fine.transition(Duration::from_millis(1));
     }
 
-    let mut values = [0.0_f64; 4];
-    let mut coarse_probability = [0.0_f64; 4];
-    let mut fine_probability = [0.0_f64; 4];
+    let mut values = [0.0_f64; 6];
+    let mut coarse_probability = [0.0_f64; 6];
+    let mut fine_probability = [0.0_f64; 6];
     assert!(coarse.write_posterior(
         TransitionDirection::Up,
         2,
@@ -1429,18 +1690,47 @@ fn fluid_edf_matches_exhaustive_interval_oracle(input: CohortSet, slots: u8) -> 
         .map(|index| cohorts.deadline_micros(index))
         .max()
         .unwrap_or(0);
-    let actual = evaluate_constant_supply(
+    let outcome = evaluate_constant_supply(
         &cohorts,
         slots,
         horizon_micros,
         0.0_f64,
         &NO_FUTURE_ARRIVALS,
         &mut scratch,
-    )
-    .shortfall
-        <= f64::EPSILON;
+    );
+    let roundoff = 8.0_f64 * f64::EPSILON * slots.max(1.0_f64);
+    let actual = outcome.shortfall <= roundoff;
     let expected = exhaustive_feasible(&cohorts, slots);
     actual == expected
+}
+
+#[test]
+fn feasible_fluid_schedule_tolerates_roundoff_slivers() -> Result<(), TestError> {
+    let mut cohorts = WorkCohorts::new(3);
+    for (partition, (release, deadline, work)) in [
+        (0_u64, 11_u64, 3.2e-5_f64),
+        (6, 15, 1.5e-5_f64),
+        (15, 31, 3.2e-5_f64),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        cohorts.push_values(release, deadline, work, partition as u32);
+    }
+    let mut scratch = EdfScratch::new(3)?;
+    prepare(&cohorts, &mut scratch);
+    let slots = 4.0_f64;
+    let outcome = evaluate_constant_supply(
+        &cohorts,
+        slots,
+        31,
+        0.0_f64,
+        &NO_FUTURE_ARRIVALS,
+        &mut scratch,
+    );
+    assert!(outcome.shortfall <= 8.0_f64 * f64::EPSILON * slots);
+    assert!(exhaustive_feasible(&cohorts, slots));
+    Ok(())
 }
 
 #[quickcheck]
@@ -1483,6 +1773,8 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
     let configuration = Configuration {
         cohort_count_max: 1,
         calendar_segment_count_max: 1,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: 1,
         replica_count_max: 1,
         slots_per_replica: 1,
@@ -1492,8 +1784,8 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
         arrival_prior: crate::ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     };
     let grid = CapacityGrid::new(&[0.001_f64], &[50.0_f64, 100.0_f64], &[0.0_f64])?;
@@ -1543,6 +1835,8 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
     let configuration = Configuration {
         cohort_count_max: 2,
         calendar_segment_count_max: 2,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: 2,
         replica_count_max: 2,
         slots_per_replica: 1,
@@ -1552,8 +1846,8 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
         arrival_prior: negligible_arrival_prior()?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     };
     let grid = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64])?;
@@ -1990,11 +2284,21 @@ fn lead_time_predictive_quantile_inverts_the_predictive_cdf() -> Result<(), Test
     let state = ScaleState::new(configuration()?, grid()?)?;
     for direction in [TransitionDirection::Up, TransitionDirection::Down] {
         for probability in [0.1_f64, 0.5_f64, 0.9_f64] {
-            let quantile = state.lead_time_predictive_quantile(direction, 3, probability);
-            let cumulative = state.lead_time_predictive_cdf(direction, 3, quantile);
+            let quantile = state.lead_time_predictive_quantile(direction, 3, probability)?;
+            let time_error = state
+                .configuration()
+                .launch_time_prior
+                .budget()
+                .path_time_error_seconds();
+            let lower = state.lead_time_predictive_cdf(
+                direction,
+                3,
+                (quantile - time_error).max(f64::MIN_POSITIVE),
+            );
+            let upper = state.lead_time_predictive_cdf(direction, 3, quantile + time_error);
             assert!(
-                (cumulative - probability).abs() < 1.0e-9_f64,
-                "the predictive quantile must invert its CDF"
+                lower <= probability && upper >= probability,
+                "the predictive quantile must meet its declared time error"
             );
         }
     }
@@ -2002,12 +2306,26 @@ fn lead_time_predictive_quantile_inverts_the_predictive_cdf() -> Result<(), Test
 }
 
 #[test]
-fn incomplete_actuation_uses_the_conditional_remaining_time() {
-    let factor = LeadTimeFactor::new(&TransitionPrior::broad_fallback());
+fn incomplete_actuation_uses_the_conditional_remaining_time() -> Result<(), TestError> {
+    let cells = [DurationCell::new(30.0_f64, 0.3_f64)?];
+    let coverage = [
+        PriorCoverageRecord::new(1.0_f64, 300.0_f64, 1.0e-12_f64, 1.0e-12_f64, 1.0e-12_f64),
+        PriorCoverageRecord::new(1.0_f64, 300.0_f64, 1.0e-12_f64, 1.0e-12_f64, 1.0e-12_f64),
+    ];
+    let prior = LaunchPrior::new(
+        PriorArtifactIdentity::new(2, 1, 2),
+        PriorArtifactBudget::new(1, 64, 64, 1.0e-4_f64, 1.0e-6_f64, 1.0e-4_f64),
+        &coverage,
+        LaunchPriorGrid::new(&[0.0_f64], &[0.0_f64], &cells, &cells),
+        &[1.0_f64],
+        0.0_f64,
+    )?;
+    let factor = LaunchTimeFactor::new(&prior);
     let elapsed_seconds = 20.0_f64;
-    let direction = TransitionDirection::Up;
+    let direction = TransitionDirection::Down;
     let delta = 1;
     let mut coordinate = RandomStream::new(91);
+    let _component_selector = coordinate.open_unit_f64();
     let uniform = coordinate.open_unit_f64();
     let elapsed_cdf = factor.predictive_cdf(direction, delta, elapsed_seconds);
     let expected_cdf = elapsed_cdf + uniform * (1.0_f64 - elapsed_cdf);
@@ -2016,9 +2334,10 @@ fn incomplete_actuation_uses_the_conditional_remaining_time() {
     let actual_cdf = factor.predictive_cdf(direction, delta, elapsed_seconds + remaining);
 
     assert!(
-        (actual_cdf - expected_cdf).abs() < 1.0e-12_f64,
+        (actual_cdf - expected_cdf).abs() < 1.0e-4_f64,
         "the remaining-time draw must invert the conditional survival distribution"
     );
+    Ok(())
 }
 
 #[test]
@@ -2053,10 +2372,8 @@ fn larger_candidates_inherit_useful_pending_capacity() -> Result<(), TestError> 
 #[test]
 fn started_rebalance_is_carried_and_can_be_superseded() -> Result<(), TestError> {
     let mut configuration = configuration()?;
-    configuration.launch_time_prior =
-        TransitionPrior::new([1.0_f64; 4], [0.01_f64; 3], [1.0_f64; 12], 0.0_f64)?;
-    configuration.rebalance_time_prior =
-        TransitionPrior::new([100.0_f64; 4], [0.01_f64; 3], [1.0_f64; 12], 0.0_f64)?;
+    configuration.launch_time_prior = LaunchPrior::kubernetes()?;
+    configuration.rebalance_time_prior = RebalancePrior::kip848()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
     let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
@@ -2109,6 +2426,8 @@ fn plateau_configuration() -> Result<Configuration, TestError> {
     Ok(Configuration {
         cohort_count_max: 256,
         calendar_segment_count_max: 64,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: 64,
         replica_count_max: 128,
         slots_per_replica: 32,
@@ -2118,18 +2437,8 @@ fn plateau_configuration() -> Result<Configuration, TestError> {
         arrival_prior: crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::new(
-            [30.0_f64, 45.0_f64, 60.0_f64, 90.0_f64],
-            [0.1_f64, 0.2_f64, 0.3_f64],
-            [1.0_f64; 12],
-            0.0_f64,
-        )?,
-        rebalance_time_prior: TransitionPrior::new(
-            [0.05_f64, 0.1_f64, 0.2_f64, 0.4_f64],
-            [0.1_f64, 0.2_f64, 0.3_f64],
-            [1.0_f64; 12],
-            0.0_f64,
-        )?,
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     })
 }
@@ -2264,6 +2573,8 @@ fn configuration() -> Result<Configuration, TestError> {
     Ok(Configuration {
         cohort_count_max: 16,
         calendar_segment_count_max: 16,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: 16,
         replica_count_max: 32,
         slots_per_replica: 4,
@@ -2273,8 +2584,8 @@ fn configuration() -> Result<Configuration, TestError> {
         arrival_prior: crate::ArrivalPrior::test_artifact(),
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01, 3.0_f64)?,
     })
 }
@@ -2333,11 +2644,13 @@ enum TestError {
     #[error(transparent)]
     DecisionCurve(#[from] crate::DecisionCurveError),
     #[error(transparent)]
-    Observation(#[from] crate::ObservationError),
+    Observation(#[from] ObservationError),
     #[error(transparent)]
-    TransitionEvidence(#[from] crate::TransitionEvidenceError),
+    LaunchEvidence(#[from] crate::LaunchEvidenceError),
     #[error(transparent)]
-    TransitionPrior(#[from] crate::TransitionPriorError),
+    LeadTimePrior(#[from] crate::LeadTimePriorError),
+    #[error(transparent)]
+    PredictiveQuantile(#[from] crate::PredictiveQuantileError),
     #[error(transparent)]
     ThreadPool(#[from] rayon::ThreadPoolBuildError),
     #[error("the model held when the test required an applied decision")]

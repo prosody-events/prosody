@@ -6,9 +6,8 @@ use crate::edf::ArrivalPath;
 use crate::types::WorkCohorts;
 use crate::{
     ArrivalPrior, ArrivalPriorError, BacklogCohort, CapacityGrid, CapacityGridError, Configuration,
-    ConfigurationError, DemandClass, ModelTime, ObservationBuffer, ObservationError,
-    ReliabilityPrior, SCHEDULED_RELEASE_COUNT_MAX, ScaleScratch, ScaleState, ScheduledRelease,
-    ServiceObjective, TransitionPrior,
+    ConfigurationError, DemandClass, LaunchPrior, ModelTime, ObservationBuffer, ObservationError,
+    RebalancePrior, ReliabilityPrior, ScaleScratch, ScaleState, ScheduledRelease, ServiceObjective,
 };
 
 #[test]
@@ -55,7 +54,7 @@ fn overdue_backlog_keeps_each_original_deadline() -> Result<(), TestError> {
 
 #[test]
 fn scheduled_release_validation_rejects_invalid_inputs() -> Result<(), TestError> {
-    let (_state, _scratch, mut observation) = test_model()?;
+    let (state, _scratch, mut observation) = test_model()?;
     assert!(
         observation
             .set_scheduled_releases(&[ScheduledRelease {
@@ -83,7 +82,7 @@ fn scheduled_release_validation_rejects_invalid_inputs() -> Result<(), TestError
             release_micros: 1,
             count: 1,
         };
-        SCHEDULED_RELEASE_COUNT_MAX + 1
+        state.configuration.scheduled_release_count_max as usize + 1
     ];
     assert!(observation.set_scheduled_releases(&excess).is_err());
     Ok(())
@@ -99,7 +98,7 @@ fn scheduled_releases_are_exact_and_idempotent(raw: Vec<(u8, u16)>) -> bool {
 
     let mut releases = raw
         .into_iter()
-        .take(SCHEDULED_RELEASE_COUNT_MAX.saturating_sub(3))
+        .take(state.configuration.scheduled_release_count_max as usize - 3)
         .map(|(seconds, count)| ScheduledRelease {
             release_micros: now_micros.saturating_add(u64::from(seconds).saturating_mul(1_000_000)),
             count: u32::from(count).saturating_add(1),
@@ -125,6 +124,12 @@ fn scheduled_releases_are_exact_and_idempotent(raw: Vec<(u8, u16)>) -> bool {
         return false;
     }
     let input = observation.observation();
+    let expected = input
+        .scheduled_releases
+        .iter()
+        .filter(|release| release.release_micros > now_micros)
+        .copied()
+        .collect::<Vec<_>>();
     prepare_work_cohorts(
         &state,
         &mut scratch,
@@ -133,10 +138,6 @@ fn scheduled_releases_are_exact_and_idempotent(raw: Vec<(u8, u16)>) -> bool {
         input.scheduled_releases,
     );
 
-    let expected = releases
-        .iter()
-        .filter(|release| release.release_micros > now_micros)
-        .collect::<Vec<_>>();
     if scratch.resource_cohorts.len() != expected.len() {
         return false;
     }
@@ -228,6 +229,8 @@ fn test_configuration() -> Result<Configuration, TestError> {
     Ok(Configuration {
         cohort_count_max: 1,
         calendar_segment_count_max: 1,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: 4,
         replica_count_max: 4,
         slots_per_replica: 32,
@@ -237,14 +240,16 @@ fn test_configuration() -> Result<Configuration, TestError> {
         arrival_prior: ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     })
 }
 
 #[derive(Debug, Error)]
 enum TestError {
+    #[error(transparent)]
+    LeadTime(#[from] crate::LeadTimePriorError),
     #[error(transparent)]
     Arrival(#[from] ArrivalPriorError),
     #[error(transparent)]

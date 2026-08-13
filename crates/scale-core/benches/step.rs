@@ -3,9 +3,9 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use prosody_scale_core::{
     ArrivalPrior, ArrivalPriorError, CapacityGrid, CapacityGridError, Cohort, Configuration,
-    ConfigurationError, DemandClass, ModelTime, ObservationBuffer, ObservationError,
-    ReliabilityPrior, ResourceWindow, ScaleScratch, ScaleState, ServiceObjective, TransitionPrior,
-    step,
+    ConfigurationError, DemandClass, LaunchPrior, LeadTimePriorError, ModelTime, ObservationBuffer,
+    ObservationError, RebalancePrior, ReliabilityPrior, ResourceWindow, ScaleScratch, ScaleState,
+    ServiceObjective, step,
 };
 use std::hint::black_box;
 use std::time::Instant;
@@ -318,6 +318,8 @@ fn configuration(case: BenchmarkCase) -> Result<Configuration, BenchmarkError> {
     Ok(Configuration {
         cohort_count_max: case.cohort_count_max,
         calendar_segment_count_max: case.cohort_count_max,
+        scheduled_release_count_max: 64,
+        readiness_lump_count_max: 64,
         partition_count: 64,
         replica_count_max: case.replica_count_max,
         slots_per_replica: case.slots_per_replica,
@@ -329,8 +331,8 @@ fn configuration(case: BenchmarkCase) -> Result<Configuration, BenchmarkError> {
         arrival_prior: ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?,
         capacity_change_rate_per_second: 0.0_f64,
         reliability_prior: ReliabilityPrior::population_fallback(),
-        launch_time_prior: TransitionPrior::broad_fallback(),
-        rebalance_time_prior: TransitionPrior::broad_fallback(),
+        launch_time_prior: LaunchPrior::kubernetes()?,
+        rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
     })
 }
@@ -424,6 +426,8 @@ fn grid(case: BenchmarkCase) -> Result<CapacityGrid, CapacityGridError> {
 
 #[derive(Debug, Error)]
 enum BenchmarkError {
+    #[error(transparent)]
+    LeadTimePrior(#[from] LeadTimePriorError),
     #[error(transparent)]
     ArrivalPrior(#[from] ArrivalPriorError),
     #[error(transparent)]

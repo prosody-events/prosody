@@ -100,7 +100,7 @@ pub struct MetricPoint {
     pub lead_time_up_seconds: f64,
     /// Posterior expected one-replica scale-down lead time.
     pub lead_time_down_seconds: f64,
-    /// Posterior expected lead time for the selected or last transition bucket.
+    /// Posterior expected lead time for the selected or last replica change.
     pub lead_time_seconds: f64,
     /// Controller execution time.
     pub step_nanos: u64,

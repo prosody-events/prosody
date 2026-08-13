@@ -27,9 +27,11 @@ pub use controller::{
     ScaleScratch, ScaleState, step,
 };
 pub use lead_time::{
-    TransitionDirection, TransitionEvidence, TransitionEvidenceError, TransitionPrior,
-    TransitionPriorError,
+    DurationCell, LaunchEvidence, LaunchEvidenceError, LaunchPrior, LaunchPriorGrid,
+    LeadTimePriorError, PredictiveQuantileError, ReadinessGroupId, ReadinessLump,
+    ReadinessObservation, RebalanceEvidence, RebalancePrior, TransitionDirection,
 };
+pub use partition::{PartitionPriorPredictiveCheck, partition_prior_predictive_check};
 pub use random::RandomStream;
 pub use reliability::ReliabilityPrior;
 pub use types::{
@@ -37,7 +39,8 @@ pub use types::{
     AttemptOutcomeEvidence, BacklogCohort, CalendarArtifactId, CalendarRateSegment, Cohort,
     Configuration, ConfigurationError, DecisionDiagnostics, DemandClass, GroupObservation,
     HoldDecision, HoldReason, ModelTime, ObservationBuffer, ObservationError, PosteriorQuery,
-    SCHEDULED_RELEASE_COUNT_MAX, ScaleDecision, ScheduledRelease, ServiceObjective,
+    PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord, ScaleDecision,
+    ScheduledRelease, ServiceObjective,
 };
 
 #[cfg(test)]
