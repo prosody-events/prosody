@@ -1,12 +1,15 @@
 //! Binary codec that copies bytes verbatim and uses a caller-supplied
 //! function to extract event metadata (id and type).
 
-use serde::Deserialize;
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 #[cfg(not(target_arch = "arm"))]
 use simd_json::serde::from_slice_with_buffers;
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::error::Error as StdError;
+use std::fmt::{Formatter, Result as FmtResult};
 use std::marker::PhantomData;
 
 use crate::codec::Codec;
@@ -108,11 +111,10 @@ pub trait BinaryFormat: 'static {
     const FORMAT_ID: &'static str;
 }
 
-/// The JSON document format, declared by [`JsonBinaryCodec`]. Format-equal
-/// with [`JsonCodec`](crate::codec::JsonCodec): both speak `"json"`, so
-/// collections written through either validate against the same frozen
-/// identity — this is what lets differently-implemented consumers share a
-/// collection.
+/// The JSON document format used by the binary JSON codecs.
+///
+/// It is format-equal with [`JsonCodec`](crate::codec::JsonCodec). This lets
+/// clients with different JSON implementations share data.
 pub struct JsonFormat;
 
 impl BinaryFormat for JsonFormat {
@@ -205,9 +207,10 @@ impl<E: BinaryExtractor, F: BinaryFormat> Codec for BinaryCodec<E, F> {
 /// fields of a JSON document.
 ///
 /// Uses the same backend as [`crate::codec::JsonCodec`] — `simd_json` on
-/// non-ARM targets, `serde_json` on ARM — but deserializes into a two-field
-/// view that borrows the values directly from `buf`. No full parse tree is
-/// materialized.
+/// non-ARM targets, `serde_json` on ARM. It streams the document into a
+/// two-field view that borrows from `buf`. It does not build a parse tree.
+/// All JSON values are valid messages. Values without string metadata fields
+/// return no metadata.
 ///
 /// On non-ARM targets the extractor owns a `simd_json::Buffers` instance; the
 /// parent [`BinaryCodec`] holds one [`JsonExtractor`] for its lifetime, so the
@@ -227,14 +230,12 @@ pub struct JsonExtractor {
 /// extraction and the declared [`JsonFormat`]: the application commits to
 /// writing JSON documents, and the codec is format-equal with
 /// [`JsonCodec`](crate::codec::JsonCodec).
-pub type JsonBinaryCodec = BinaryCodec<JsonExtractor, JsonFormat>;
+pub type JsonBinaryMessageCodec = BinaryCodec<JsonExtractor, JsonFormat>;
 
 /// A [`BinaryExtractor`] that pulls no metadata and never parses.
 ///
-/// The keyed-state value path never needs an event id or type, and it must
-/// not parse: a state cell can hold any JSON document — a scalar, an array,
-/// or an object — none of which an object-shaped metadata parse would accept.
-/// Extraction is infallible and always yields empty metadata.
+/// Non-message values do not need an event id or type. They can contain any
+/// JSON shape, so this extractor leaves them unchanged.
 #[derive(Default)]
 pub struct NoopExtractor;
 
@@ -252,22 +253,155 @@ impl BinaryExtractor for NoopExtractor {
     }
 }
 
-/// Verbatim JSON state codec for the C# binding's `BinaryPayload`: raw bytes
-/// in and out, never parsed by Rust. Composed from [`NoopExtractor`] and
-/// [`JsonFormat`], which owns the `"json"` cross-client identity-compatibility
-/// invariant.
+/// Verbatim JSON codec for a caller that owns JSON validation.
 ///
-/// Because it never parses, the codec cannot enforce that the bytes are valid
-/// JSON: a binding writing through it must write JSON documents, or it breaks
-/// the mutually-decodable-bytes promise [`JsonFormat`] makes on its behalf.
-pub type JsonPassthroughStateCodec = BinaryCodec<NoopExtractor, JsonFormat>;
+/// It does not parse the bytes or extract message metadata. The caller must
+/// supply JSON documents to keep the [`JsonFormat`] contract.
+pub type JsonBinaryCodec = BinaryCodec<NoopExtractor, JsonFormat>;
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct JsonMetaView<'a> {
-    #[serde(borrow)]
+    #[serde(borrow, default, deserialize_with = "borrowed_string")]
     id: Option<&'a str>,
-    #[serde(borrow, rename = "type")]
+    #[serde(borrow, default, rename = "type", deserialize_with = "borrowed_string")]
     event_type: Option<&'a str>,
+}
+
+struct JsonDocument<'a>(JsonMetaView<'a>);
+
+fn empty_json_document<'a>() -> JsonDocument<'a> {
+    JsonDocument(JsonMetaView::default())
+}
+
+impl<'de> Deserialize<'de> for JsonDocument<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(JsonDocumentVisitor)
+    }
+}
+
+struct JsonDocumentVisitor;
+
+impl<'de> Visitor<'de> for JsonDocumentVisitor {
+    type Value = JsonDocument<'de>;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        JsonMetaView::deserialize(MapAccessDeserializer::new(map)).map(JsonDocument)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(empty_json_document())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(empty_json_document())
+    }
+
+    fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E> {
+        Ok(JsonDocument(JsonMetaView::default()))
+    }
+}
+
+fn borrowed_string<'de, D>(deserializer: D) -> Result<Option<&'de str>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_any(BorrowedStringVisitor)
+}
+
+struct BorrowedStringVisitor;
+
+impl<'de> Visitor<'de> for BorrowedStringVisitor {
+    type Value = Option<&'de str>;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> FmtResult {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(Some(value))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(None)
+    }
 }
 
 impl BinaryExtractor for JsonExtractor {
@@ -276,7 +410,7 @@ impl BinaryExtractor for JsonExtractor {
     fn extract<'a>(&mut self, buf: &'a mut [u8]) -> Result<BinaryMetadata<'a>, Self::Error> {
         #[cfg(target_arch = "arm")]
         {
-            let view = serde_json::from_slice::<JsonMetaView<'a>>(buf)?;
+            let JsonDocument(view) = serde_json::from_slice::<JsonDocument<'a>>(buf)?;
             Ok(BinaryMetadata {
                 event_id: view.id,
                 event_type: view.event_type,
@@ -284,7 +418,8 @@ impl BinaryExtractor for JsonExtractor {
         }
         #[cfg(not(target_arch = "arm"))]
         {
-            let view = from_slice_with_buffers::<JsonMetaView<'a>>(buf, &mut self.buffers)?;
+            let JsonDocument(view) =
+                from_slice_with_buffers::<JsonDocument<'a>>(buf, &mut self.buffers)?;
             Ok(BinaryMetadata {
                 event_id: view.id,
                 event_type: view.event_type,

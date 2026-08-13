@@ -194,16 +194,7 @@ fn json_id_null_value_yields_none() -> Result<(), JsonExtractError> {
 }
 
 #[test]
-fn json_id_non_string_value_propagates_error() {
-    // Non-null, non-string values for `id` are a parse error.
-    assert!(json_id(br#"{"id":123}"#).is_err());
-}
-
-#[test]
-fn json_id_non_object_propagates_error() {
-    // Inputs that aren't a JSON object cannot be parsed as the metadata
-    // view — the error propagates.
-    assert!(json_id(b"[1,2,3]").is_err());
+fn json_id_rejects_invalid_json() {
     assert!(json_id(b"").is_err());
     assert!(json_id(b"   ").is_err());
 }
@@ -212,7 +203,7 @@ fn json_id_non_object_propagates_error() {
 fn json_id_via_binary_codec() -> color_eyre::Result<()> {
     let mut wire = br#"{"id":"evt-1","payload":{"x":1}}"#.to_vec();
     let original = wire.clone();
-    let mut codec = JsonBinaryCodec::default();
+    let mut codec = JsonBinaryMessageCodec::default();
     let payload = codec.deserialize(&mut wire)?;
     assert_eq!(payload.bytes, original);
     assert_eq!(payload.event_id(), Some("evt-1"));
@@ -246,7 +237,7 @@ fn json_type_missing_returns_none() -> Result<(), JsonExtractError> {
 fn json_type_via_binary_codec() -> color_eyre::Result<()> {
     let mut wire = br#"{"id":"evt-1","type":"user.created","data":{}}"#.to_vec();
     let original = wire.clone();
-    let mut codec = JsonBinaryCodec::default();
+    let mut codec = JsonBinaryMessageCodec::default();
     let payload = codec.deserialize(&mut wire)?;
     assert_eq!(payload.bytes, original);
     assert_eq!(payload.event_id(), Some("evt-1"));

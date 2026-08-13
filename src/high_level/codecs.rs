@@ -1,6 +1,6 @@
 //! Wire codecs selected by one high-level handler.
 
-use crate::codec::{Codec, JsonCodec};
+use crate::codec::{Codec, JsonBinaryCodec, JsonBinaryMessageCodec, JsonCodec};
 use crate::consumer::middleware::FallibleHandler;
 use std::marker::PhantomData;
 
@@ -32,6 +32,11 @@ where
 
 /// JSON message and response codecs.
 pub type JsonCodecs = Codecs<JsonCodec, JsonCodec>;
+
+/// JSON codecs for callers that supply encoded bytes.
+///
+/// Messages extract event metadata. Responses pass through unchanged.
+pub type JsonBinaryCodecs = Codecs<JsonBinaryMessageCodec, JsonBinaryCodec>;
 
 /// The message codec selected by `H`.
 pub type MessageCodec<H> = <<H as ClientHandler>::Codecs as CodecSet<

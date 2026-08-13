@@ -11,7 +11,7 @@ mod serialize_buf;
 
 pub use binary::{
     BinaryCodec, BinaryCodecError, BinaryExtractor, BinaryFormat, BinaryMetadata, BinaryPayload,
-    JsonBinaryCodec, JsonExtractError, JsonExtractor, JsonFormat, JsonPassthroughStateCodec,
+    JsonBinaryCodec, JsonBinaryMessageCodec, JsonExtractError, JsonExtractor, JsonFormat,
     NoopExtractor,
 };
 pub use fixed::{
@@ -151,7 +151,7 @@ pub trait Codec: Default + Send + Sync + 'static {
 /// The erased `DynEventContext` value ops carry no codec type parameter, so
 /// they recover one from the payload through this map. The reachable
 /// payloads are the FFI codecs' — `serde_json::Value` ([`JsonCodec`], for
-/// the js/py/rb bindings) and [`BinaryPayload`] ([`JsonPassthroughStateCodec`],
+/// the js/py/rb bindings) and [`BinaryPayload`] ([`JsonBinaryCodec`],
 /// for the C# binding, which hands Rust raw JSON bytes it never parses).
 ///
 /// # Invariant: the recovered codec must match the registration
@@ -184,10 +184,10 @@ impl ErasedStateCodec for serde_json::Value {
 }
 
 impl ErasedStateCodec for BinaryPayload {
-    type Codec = JsonPassthroughStateCodec;
+    type Codec = JsonBinaryCodec;
 
     fn is_absent_sentinel(&self) -> bool {
-        // No parse (the passthrough codec never parses): the seam only needs to
+        // No parse (the binary codec never parses): the seam only needs to
         // recognize the literal `null` document, ASCII-whitespace-trimmed.
         self.bytes.trim_ascii() == b"null"
     }
