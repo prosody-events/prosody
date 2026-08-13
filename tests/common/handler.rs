@@ -161,5 +161,5 @@ impl FallibleHandler for FallibleTestHandler {
 }
 
 impl ClientHandler for FallibleTestHandler {
-    type Codecs = Codecs<JsonCodec, UnitCodec>;
+    type Codecs = Codecs<JsonCodec, JsonCodec, UnitCodec>;
 }

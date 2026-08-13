@@ -250,7 +250,7 @@ impl FallibleHandler for NoOpHandler {
 }
 
 impl ClientHandler for NoOpHandler {
-    type Codecs = Codecs<JsonCodec, UnitCodec>;
+    type Codecs = Codecs<JsonCodec, JsonCodec, UnitCodec>;
 }
 
 /// Erased backend selection reads only mock mode. Invalid consumer-only fields

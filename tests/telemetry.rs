@@ -424,7 +424,7 @@ macro_rules! impl_client_handlers {
     ($codec:ty => $($handler:ty),+ $(,)?) => {
         $(
             impl ClientHandler for $handler {
-                type Codecs = Codecs<JsonCodec, UnitCodec>;
+                type Codecs = Codecs<JsonCodec, JsonCodec, UnitCodec>;
             }
         )+
     };
