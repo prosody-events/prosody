@@ -50,15 +50,15 @@ pub use codecs::{ClientHandler, CodecSet, Codecs, JsonBinaryCodecs, JsonCodecs};
 pub use deps::ReaderConfiguration;
 
 /// High-level client using Cassandra storage.
-pub type CassandraHighLevelClient<T> = HighLevelClient<T, CassandraClientBackend<Wire<T>>>;
+pub type CassandraHighLevelClient<T> = HighLevelClient<T, CassandraClientBackend<MessageCodec<T>>>;
 
 /// High-level client using in-memory storage.
-pub type MemoryHighLevelClient<T> = HighLevelClient<T, MemoryClientBackend<Wire<T>>>;
+pub type MemoryHighLevelClient<T> = HighLevelClient<T, MemoryClientBackend<MessageCodec<T>>>;
 
-type Wire<T> = codecs::MessageCodec<T>;
-type Reply<T> = codecs::ResponseCodec<T>;
-type WireError<T> = <Wire<T> as Codec>::Error;
-type ClientStateReader<T, B, D> = StateReader<D, Wire<T>, <B as ClientBackend<Wire<T>>>::Reader>;
+use codecs::{MessageCodec, ResponseCodec};
+type MessageCodecError<T> = <MessageCodec<T> as Codec>::Error;
+type ClientStateReader<T, B, D> =
+    StateReader<D, MessageCodec<T>, <B as ClientBackend<MessageCodec<T>>>::Reader>;
 
 #[cfg(test)]
 mod tests;
@@ -70,18 +70,18 @@ pub struct HighLevelClient<T, B>
 where
     T: ClientHandler,
     T::Payload: crate::EventIdentity,
-    B: ClientBackend<Wire<T>>,
+    B: ClientBackend<MessageCodec<T>>,
 {
-    producer: ProsodyProducer<Wire<T>>,
+    producer: ProsodyProducer<MessageCodec<T>>,
     producer_config: ProducerConfiguration,
-    consumer: Mutex<ConsumerState<T, Wire<T>>>,
+    consumer: Mutex<ConsumerState<T, MessageCodec<T>>>,
     #[educe(Debug(ignore))]
-    reader: OnceCell<StateReaderClient<Wire<T>, B::Reader>>,
+    reader: OnceCell<StateReaderClient<MessageCodec<T>, B::Reader>>,
     #[educe(Debug(ignore))]
     reader_config: Option<ReaderConfiguration>,
     backend: B,
     #[educe(Debug(ignore))]
-    requester: ProsodyRequester<Wire<T>, Reply<T>>,
+    requester: ProsodyRequester<MessageCodec<T>, ResponseCodec<T>>,
     #[educe(Debug(ignore))]
     subsystem: Option<SubsystemName>,
     #[educe(Debug(ignore))]
@@ -94,11 +94,14 @@ impl<T, B> HighLevelClient<T, B>
 where
     T: ClientHandler,
     T::Payload: crate::EventIdentity,
-    B: ClientBackend<Wire<T>>,
+    B: ClientBackend<MessageCodec<T>>,
 {
     async fn reader(
         &self,
-    ) -> Result<StateReaderClient<Wire<T>, B::Reader>, HighLevelClientError<WireError<T>>>
+    ) -> Result<
+        StateReaderClient<MessageCodec<T>, B::Reader>,
+        HighLevelClientError<MessageCodecError<T>>,
+    >
     where
         T::Payload: Clone,
     {
@@ -117,7 +120,7 @@ where
     }
 
     /// Returns a reference to the internal `ProsodyProducer`.
-    pub fn producer(&self) -> &ProsodyProducer<Wire<T>> {
+    pub fn producer(&self) -> &ProsodyProducer<MessageCodec<T>> {
         &self.producer
     }
 
@@ -127,7 +130,7 @@ where
     }
 
     /// Returns a view of the current consumer state.
-    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T, Wire<T>> {
+    pub async fn consumer_state(&self) -> ConsumerStateView<'_, T, MessageCodec<T>> {
         ConsumerStateView(self.consumer.lock().await)
     }
 
@@ -160,7 +163,7 @@ where
         topic: Topic,
         key: &str,
         payload: T::Payload,
-    ) -> Result<(), HighLevelClientError<WireError<T>>> {
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         self.producer.send([], topic, key, payload).await?;
         Ok(())
     }
@@ -179,7 +182,7 @@ where
         payload: T::Payload,
         subsystems: &[SubsystemName],
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<WireError<T>>>
+    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<MessageCodecError<T>>>
     where
         H: IntoIterator<Item = (&'a str, &'a str)> + Send,
         H::IntoIter: ExactSizeIterator + Send,
@@ -198,7 +201,7 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<WireError<T>>> {
+    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<MessageCodecError<T>>> {
         self.request(
             headers
                 .iter()
@@ -229,7 +232,7 @@ where
     pub async fn register<D>(
         &self,
         descriptor: D,
-    ) -> Result<Registered<D>, HighLevelClientError<WireError<T>>>
+    ) -> Result<Registered<D>, HighLevelClientError<MessageCodecError<T>>>
     where
         D: StateDescriptor,
     {
@@ -247,7 +250,9 @@ where
     /// hook lets the composition suite seed committed state into the exact
     /// stores that the running consumer and the client's readers share.
     #[cfg(test)]
-    pub(crate) fn retained_deps(&self) -> Option<StateReaderDependencies<Wire<T>, B::Reader>> {
+    pub(crate) fn retained_deps(
+        &self,
+    ) -> Option<StateReaderDependencies<MessageCodec<T>, B::Reader>> {
         self.reader.get().map(StateReaderClient::deps)
     }
 
@@ -266,7 +271,7 @@ where
         &self,
         subsystem: SubsystemName,
         descriptor: D,
-    ) -> Result<ClientStateReader<T, B, D>, HighLevelClientError<WireError<T>>>
+    ) -> Result<ClientStateReader<T, B, D>, HighLevelClientError<MessageCodecError<T>>>
     where
         D: StateDescriptor,
         T::Payload: Clone,
@@ -279,88 +284,98 @@ where
 
     async fn build_consumer<RP>(
         config: ModeConfiguration,
-        shared: StateReaderDependencies<Wire<T>, B::Reader>,
-        producer: ProsodyProducer<Wire<T>>,
+        shared: StateReaderDependencies<MessageCodec<T>, B::Reader>,
+        producer: ProsodyProducer<MessageCodec<T>>,
         telemetry: Telemetry,
         handler: T,
         response: RP,
     ) -> (
-        Result<ProsodyConsumer<Wire<T>>, HighLevelClientError<WireError<T>>>,
+        Result<ProsodyConsumer<MessageCodec<T>>, HighLevelClientError<MessageCodecError<T>>>,
         ModeConfiguration,
     )
     where
         T: Clone,
         T::Payload: crate::EventType + Clone,
-        B::Reader: ConsumerReaderBackend<Wire<T>>,
+        B::Reader: ConsumerReaderBackend<MessageCodec<T>>,
         RP: ResponsePolicy<T>,
     {
-        let built = match &config {
-            ModeConfiguration::Pipeline {
-                consumer,
-                retry,
-                monopolization,
-                defer,
-                common,
-            } => Box::pin(ProsodyConsumer::<Wire<T>>::pipeline_consumer_with_policy::<
-                T,
-                B::Reader,
-                RP,
-            >(
-                deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
-                PipelineMiddlewareConfiguration {
-                    retry: retry.clone(),
-                    monopolization: monopolization.clone(),
-                    defer: defer.clone(),
-                },
-                telemetry,
-                handler,
-                response,
-            ))
-            .await
-            .map_err(Into::into),
-            ModeConfiguration::LowLatency {
-                consumer,
-                retry,
-                failure_topic,
-                common,
-            } => Box::pin(ProsodyConsumer::low_latency_consumer_with_policy::<
-                T,
-                B::Reader,
-                RP,
-            >(
-                deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
-                LowLatencyMiddlewareConfiguration {
-                    retry: retry.clone(),
-                    failure_topic: failure_topic.clone(),
-                },
-                producer,
-                telemetry,
-                handler,
-                response,
-            ))
-            .await
-            .map_err(Into::into),
-            ModeConfiguration::BestEffort { consumer, common } => Box::pin(
-                ProsodyConsumer::<Wire<T>>::best_effort_consumer_with_policy::<T, B::Reader, RP>(
-                    deps::consumer_setup::<Wire<T>, B>(consumer, common, &shared),
+        let built =
+            match &config {
+                ModeConfiguration::Pipeline {
+                    consumer,
+                    retry,
+                    monopolization,
+                    defer,
+                    common,
+                } => Box::pin(
+                    ProsodyConsumer::<MessageCodec<T>>::pipeline_consumer_with_policy::<
+                        T,
+                        B::Reader,
+                        RP,
+                    >(
+                        deps::consumer_setup::<MessageCodec<T>, B>(consumer, common, &shared),
+                        PipelineMiddlewareConfiguration {
+                            retry: retry.clone(),
+                            monopolization: monopolization.clone(),
+                            defer: defer.clone(),
+                        },
+                        telemetry,
+                        handler,
+                        response,
+                    ),
+                )
+                .await
+                .map_err(Into::into),
+                ModeConfiguration::LowLatency {
+                    consumer,
+                    retry,
+                    failure_topic,
+                    common,
+                } => Box::pin(ProsodyConsumer::low_latency_consumer_with_policy::<
+                    T,
+                    B::Reader,
+                    RP,
+                >(
+                    deps::consumer_setup::<MessageCodec<T>, B>(consumer, common, &shared),
+                    LowLatencyMiddlewareConfiguration {
+                        retry: retry.clone(),
+                        failure_topic: failure_topic.clone(),
+                    },
+                    producer,
                     telemetry,
                     handler,
                     response,
-                ),
-            )
-            .await
-            .map_err(Into::into),
-        };
+                ))
+                .await
+                .map_err(Into::into),
+                ModeConfiguration::BestEffort { consumer, common } => Box::pin(
+                    ProsodyConsumer::<MessageCodec<T>>::best_effort_consumer_with_policy::<
+                        T,
+                        B::Reader,
+                        RP,
+                    >(
+                        deps::consumer_setup::<MessageCodec<T>, B>(consumer, common, &shared),
+                        telemetry,
+                        handler,
+                        response,
+                    ),
+                )
+                .await
+                .map_err(Into::into),
+            };
         (built, config)
     }
 
-    async fn subscribe_inner(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>>
+    async fn subscribe_inner(
+        &self,
+        handler: T,
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>>
     where
         T: Clone,
         T::Output: Sync + 'static,
         T::Error: Sync + 'static,
         T::Payload: crate::EventType + Clone,
-        B::Reader: ConsumerReaderBackend<Wire<T>>,
+        B::Reader: ConsumerReaderBackend<MessageCodec<T>>,
     {
         let mut guard = self.consumer.lock().await;
 
@@ -391,7 +406,7 @@ where
                 self.producer.clone(),
                 self.telemetry.clone(),
                 handler.clone(),
-                Responding::<Reply<T>, _>::new(&self.router, subsystem.clone()),
+                Responding::<ResponseCodec<T>, _>::new(&self.router, subsystem.clone()),
             )
             .await
         } else {
@@ -431,7 +446,7 @@ where
     ///
     /// Returns a `HighLevelClientError` if the consumer is not currently
     /// subscribed.
-    pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError<WireError<T>>> {
+    pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         let consumer = {
             let mut guard = self.consumer.lock().await;
             match take(&mut *guard) {
@@ -462,7 +477,7 @@ where
     /// # Errors
     ///
     /// Returns a `HighLevelClientError` if a client service cannot stop.
-    pub async fn shutdown(self) -> Result<(), HighLevelClientError<WireError<T>>> {
+    pub async fn shutdown(self) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         if let ConsumerState::Running { consumer, .. } = self.consumer.into_inner() {
             info!("shutting down consumer");
             consumer.shutdown().await;
@@ -499,7 +514,7 @@ where
 // public bounds.
 macro_rules! impl_subscribe {
     ($backend:ident) => {
-        impl<T> HighLevelClient<T, $backend<Wire<T>>>
+        impl<T> HighLevelClient<T, $backend<MessageCodec<T>>>
         where
             T: ClientHandler + Clone,
             T::Payload: crate::EventIdentity + crate::EventType + Clone,
@@ -518,7 +533,7 @@ macro_rules! impl_subscribe {
             pub fn subscribe(
                 &self,
                 handler: T,
-            ) -> impl Future<Output = Result<(), HighLevelClientError<WireError<T>>>> + Send + '_
+            ) -> impl Future<Output = Result<(), HighLevelClientError<MessageCodecError<T>>>> + Send + '_
             {
                 self.subscribe_inner(handler)
             }

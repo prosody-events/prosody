@@ -2,11 +2,13 @@
 
 use crate::EventIdentity;
 use crate::Key;
-use crate::codec::Codec;
+use crate::codec::{Codec, ErasedStateCodec};
 use crate::consumer::event_context::{BoxStateCursor, ErasedStateError, StateCursor};
 use crate::error::{ClassifyError, ErrorCategory};
+use crate::high_level::codecs::StateCodec;
 use crate::high_level::{
-    ClientBackend, ClientHandler, HighLevelClient, HighLevelClientError, Wire, WireError,
+    ClientBackend, ClientHandler, HighLevelClient, HighLevelClientError, MessageCodec,
+    MessageCodecError,
 };
 use crate::state::ReadCachePolicy;
 use crate::state::cell_key::Direction;
@@ -153,53 +155,53 @@ pub enum ErasedReaderBuildError<E> {
     Client(#[from] HighLevelClientError<E>),
 }
 
-pub(super) async fn value<T, B>(
+pub(in crate::high_level) async fn value<T, B>(
     client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
     cache: ErasedReadCache,
-) -> Result<SharedValueReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>
+) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
 where
     T: ClientHandler,
-    T::Payload: Clone + EventIdentity + Send + Sync + 'static,
-    B: ClientBackend<Wire<T>>,
-    B::Reader: ConsumerReaderBackend<Wire<T>>,
+    T::Payload: Clone + ErasedStateCodec + EventIdentity + Send + Sync + 'static,
+    B: ClientBackend<MessageCodec<T>>,
+    B::Reader: ConsumerReaderBackend<MessageCodec<T>>,
 {
-    let descriptor = value_state::<Wire<T>>(name).read_cache(cache);
+    let descriptor = value_state::<StateCodec<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
     Ok(Arc::new(ValueReader(reader)))
 }
 
-pub(super) async fn map<T, B>(
+pub(in crate::high_level) async fn map<T, B>(
     client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
     cache: ErasedReadCache,
-) -> Result<SharedMapReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>
+) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
 where
     T: ClientHandler,
-    T::Payload: Clone + EventIdentity + Send + Sync + 'static,
-    B: ClientBackend<Wire<T>>,
-    B::Reader: ConsumerReaderBackend<Wire<T>>,
+    T::Payload: Clone + ErasedStateCodec + EventIdentity + Send + Sync + 'static,
+    B: ClientBackend<MessageCodec<T>>,
+    B::Reader: ConsumerReaderBackend<MessageCodec<T>>,
 {
-    let descriptor = map_state::<Utf8KeyCodec, Wire<T>>(name).read_cache(cache);
+    let descriptor = map_state::<Utf8KeyCodec, StateCodec<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
     Ok(Arc::new(MapReader(reader)))
 }
 
-pub(super) async fn deque<T, B>(
+pub(in crate::high_level) async fn deque<T, B>(
     client: &HighLevelClient<T, B>,
     subsystem: String,
     name: &str,
     cache: ErasedReadCache,
-) -> Result<SharedDequeReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>
+) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
 where
     T: ClientHandler,
-    T::Payload: Clone + EventIdentity + Send + Sync + 'static,
-    B: ClientBackend<Wire<T>>,
-    B::Reader: ConsumerReaderBackend<Wire<T>>,
+    T::Payload: Clone + ErasedStateCodec + EventIdentity + Send + Sync + 'static,
+    B: ClientBackend<MessageCodec<T>>,
+    B::Reader: ConsumerReaderBackend<MessageCodec<T>>,
 {
-    let descriptor = deque_state::<Wire<T>>(name).read_cache(cache);
+    let descriptor = deque_state::<StateCodec<T>>(name).read_cache(cache);
     let reader = client.state(subsystem_name(subsystem)?, descriptor).await?;
     Ok(Arc::new(DequeReader(reader)))
 }
@@ -208,28 +210,34 @@ fn subsystem_name<E>(name: String) -> Result<SubsystemName, ErasedReaderBuildErr
     Ok(SubsystemName::try_new(name)?)
 }
 
-struct ValueReader<C: Codec, B: ReaderBackend<C>>(StateReader<ValueDescriptor<C>, C, B>);
+struct ValueReader<C: Codec, W: Codec, B: ReaderBackend<W>>(StateReader<ValueDescriptor<C>, W, B>);
 
 #[async_trait]
-impl<C, B> ErasedValueReader<C> for ValueReader<C, B>
+impl<C, W, B> ErasedValueReader<C> for ValueReader<C, W, B>
 where
     C: Codec + Send + Sync,
     C::Payload: Clone + Send + Sync + 'static,
-    B: ReaderBackend<C>,
+    W: Codec,
+    W::Payload: Clone,
+    B: ReaderBackend<W>,
 {
     async fn get(&self, key: String) -> Result<Option<C::Payload>, ErasedStateError> {
         self.0.get(Key::from(key)).await.map_err(Into::into)
     }
 }
 
-struct MapReader<C: Codec, B: ReaderBackend<C>>(StateReader<MapDescriptor<Utf8KeyCodec, C>, C, B>);
+struct MapReader<C: Codec, W: Codec, B: ReaderBackend<W>>(
+    StateReader<MapDescriptor<Utf8KeyCodec, C>, W, B>,
+);
 
 #[async_trait]
-impl<C, B> ErasedMapReader<C> for MapReader<C, B>
+impl<C, W, B> ErasedMapReader<C> for MapReader<C, W, B>
 where
     C: Codec + Send + Sync,
     C::Payload: Clone + Send + Sync + 'static,
-    B: ReaderBackend<C>,
+    W: Codec,
+    W::Payload: Clone,
+    B: ReaderBackend<W>,
 {
     async fn get(
         &self,
@@ -288,14 +296,16 @@ where
     }
 }
 
-struct DequeReader<C: Codec, B: ReaderBackend<C>>(StateReader<DequeDescriptor<C>, C, B>);
+struct DequeReader<C: Codec, W: Codec, B: ReaderBackend<W>>(StateReader<DequeDescriptor<C>, W, B>);
 
 #[async_trait]
-impl<C, B> ErasedDequeReader<C> for DequeReader<C, B>
+impl<C, W, B> ErasedDequeReader<C> for DequeReader<C, W, B>
 where
     C: Codec + Send + Sync,
     C::Payload: Clone + Send + Sync + 'static,
-    B: ReaderBackend<C>,
+    W: Codec,
+    W::Payload: Clone,
+    B: ReaderBackend<W>,
 {
     async fn get(&self, key: String, index: usize) -> Result<Option<C::Payload>, ErasedStateError> {
         self.0.get(Key::from(key), index).await.map_err(Into::into)

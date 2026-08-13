@@ -4,7 +4,7 @@ use crate::JsonCodec;
 use crate::Key;
 use crate::PeerConfiguration;
 use crate::cassandra::config::CassandraConfigurationBuilder;
-use crate::codec::UnitCodec;
+use crate::codec::{BinaryPayload, JsonBinaryCodec, JsonBinaryMessageCodec, UnitCodec};
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::middleware::FallibleHandler;
@@ -253,6 +253,45 @@ impl ClientHandler for NoOpHandler {
     type Codecs = Codecs<JsonCodec, UnitCodec>;
 }
 
+#[derive(Clone)]
+struct BinaryHandler;
+
+impl FallibleHandler for BinaryHandler {
+    type Error = Infallible;
+    type Output = ();
+    type Payload = BinaryPayload;
+
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage<Self::Payload>,
+        _demand: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
+
+    async fn on_timer<C>(
+        &self,
+        _context: C,
+        _trigger: Trigger,
+        _demand: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
+
+    async fn shutdown(self) {}
+}
+
+impl ClientHandler for BinaryHandler {
+    type Codecs = Codecs<JsonBinaryMessageCodec, UnitCodec>;
+}
+
 /// Erased backend selection reads only mock mode. Invalid consumer-only fields
 /// remain deferred, so the producer half constructs and subscription reports
 /// the retained configuration error.
@@ -462,11 +501,9 @@ fn state_and_subscriptions_share_one_bundle() -> Result<()> {
 /// The consumer group under which the committed `cart` value is published.
 const GROUP: &str = "group-aaa";
 
-/// A reader built from the client observes committed state in the client's
-/// single retained `StateReaderDependencies` bundle. That bundle holds the same
-/// in-memory cell store the running consumer holds, so this proves
-/// `client.state()` composes readers over the consumer's shared stores instead
-/// of a separate set.
+/// An erased reader uses the payload's state codec and the client's retained
+/// reader dependencies. The binary state codec preserves bytes without adding
+/// message metadata.
 ///
 /// A faithful end-to-end version of this test would drive the write through a
 /// produced Kafka record. The in-process mock cluster cannot do that: it
@@ -476,15 +513,14 @@ const GROUP: &str = "group-aaa";
 /// promote) as the reader-suite seeding helpers. It then reads the value back
 /// through a reader the client composes.
 ///
-/// Falsify by breaking the bundle memoization so `state()` builds a fresh
-/// bundle every call: the reader would then read empty stores and the
-/// assertion would fail.
+/// Falsify by selecting the message codec in `erased::value`: the observed
+/// payload gets an event ID and the assertion fails.
 #[test]
-fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
-    let client = create_test_client::<NoOpHandler>("shared-bundle-ryow", None)?;
+fn erased_reader_uses_payload_state_codec() -> Result<()> {
+    let client = create_test_client::<BinaryHandler>("binary-state-reader", None)?;
     TEST_RUNTIME.block_on(async {
         // Start the consumer so the retained bundle is the one it holds.
-        client.subscribe(NoOpHandler).await?;
+        client.subscribe(BinaryHandler).await?;
 
         // Run the scenario in a block that returns Result, so shutdown below
         // always runs, even if the scenario fails.
@@ -501,7 +537,7 @@ fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
             // Seed a committed `cart` value plus its published routing row and
             // frozen identity into the shared stores — as the owning consumer
             // would on a committed write.
-            let descriptor = value_state::<JsonCodec>("cart");
+            let descriptor = value_state::<JsonBinaryCodec>("cart");
             let sub = subsystem("carts")?;
             let name = state_name("cart")?;
             let orders = topic("orders");
@@ -527,7 +563,11 @@ fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
                 1,
                 |handle| async move {
                     handle
-                        .set(json!(["apple"]))
+                        .set(BinaryPayload::new(
+                            br#"{"id":"state-cell","items":["apple"]}"#.to_vec(),
+                            None::<String>,
+                            None::<String>,
+                        ))
                         .await
                         .map_err(|e| eyre!("set: {e}"))?;
                     Ok(())
@@ -537,20 +577,25 @@ fn reader_sees_write_through_client_shared_bundle() -> Result<()> {
 
             // A reader composed from the client reads the committed value from
             // the shared cells.
-            let reader = client
-                .state(sub.clone(), value_state::<JsonCodec>("cart"))
-                .await?;
-            let observed = reader.get("user-1").await?;
+            let reader =
+                erased::value(&client, sub.to_string(), "cart", ErasedReadCache::Disabled).await?;
+            let observed = reader.get("user-1".to_owned()).await?;
+            let Some(observed) = observed else {
+                return Err(eyre!("erased reader observed no committed value"));
+            };
             ensure!(
-                observed == Some(json!(["apple"])),
-                "client reader must observe the committed write in the shared bundle, got \
-                 {observed:?}"
+                observed.event_id().is_none(),
+                "state decode added message metadata"
+            );
+            ensure!(
+                observed.bytes == br#"{"id":"state-cell","items":["apple"]}"#,
+                "state decode changed the stored bytes"
             );
             Ok(())
         }
         .await;
 
-        client.unsubscribe().await?;
+        client.shutdown().await?;
         outcome
     })
 }

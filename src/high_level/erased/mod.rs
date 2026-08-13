@@ -1,12 +1,14 @@
 //! Optional type erasure for foreign-language client wrappers.
 
 use crate::cassandra::config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError};
+use crate::codec::ErasedStateCodec;
 use crate::consumer::MockConfigurationError;
+use crate::high_level::codecs::StateCodec;
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::state::ConsumerState;
 use crate::high_level::{
     CassandraHighLevelClient, ClientBackend, ClientHandler, ConsumerBuilders, HighLevelClient,
-    HighLevelClientError, MemoryHighLevelClient, Mode, Wire, WireError,
+    HighLevelClientError, MemoryHighLevelClient, MessageCodec, MessageCodecError, Mode,
 };
 use crate::peer::requester::{RequestError, ResponseError};
 use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder};
@@ -22,6 +24,8 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 
 mod readers;
+
+pub(super) use readers::{deque, map, value};
 
 pub use readers::{
     ErasedDequeReader, ErasedDirection, ErasedMapReader, ErasedReadCache, ErasedReaderBuildError,
@@ -69,7 +73,7 @@ where
         topic: Topic,
         key: String,
         payload: T::Payload,
-    ) -> Result<(), HighLevelClientError<WireError<T>>>;
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
     async fn request(
         &self,
         headers: Vec<(String, String)>,
@@ -78,29 +82,36 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<WireError<T>>>;
-    async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>>;
-    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<WireError<T>>>;
-    async fn shutdown(self: Box<Self>) -> Result<(), HighLevelClientError<WireError<T>>>;
+    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<MessageCodecError<T>>>;
+    async fn subscribe(&self, handler: T)
+    -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
+    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
+    async fn shutdown(self: Box<Self>) -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
     async fn consumer_state(&self) -> ErasedConsumerState<T>;
     async fn value_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedValueReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>;
+    ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec;
     async fn map_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>;
+    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec;
     async fn deque_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedDequeReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>>;
+    ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec;
     async fn assigned_partition_count(&self) -> u32;
     async fn is_stalled(&self) -> bool;
     fn producer_config(&self) -> &ProducerConfiguration;
@@ -160,7 +171,7 @@ where
         topic: Topic,
         key: String,
         payload: T::Payload,
-    ) -> Result<(), HighLevelClientError<WireError<T>>> {
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         let guard = self.client.read().await;
         let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.send(topic, key, payload).await
@@ -179,7 +190,7 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<WireError<T>>> {
+    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<MessageCodecError<T>>> {
         let guard = self.client.read().await;
         let Some(client) = guard.as_deref() else {
             return Err(RequestError::ShuttingDown);
@@ -194,7 +205,10 @@ where
     /// # Errors
     ///
     /// Returns an error if the client is shut down or cannot subscribe.
-    pub async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>> {
+    pub async fn subscribe(
+        &self,
+        handler: T,
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         let guard = self.client.read().await;
         let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.subscribe(handler).await
@@ -205,7 +219,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the client is shut down or is not subscribed.
-    pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError<WireError<T>>> {
+    pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         let guard = self.client.read().await;
         let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.unsubscribe().await
@@ -216,7 +230,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the client is shut down or a service cannot stop.
-    pub async fn shutdown(self) -> Result<(), HighLevelClientError<WireError<T>>> {
+    pub async fn shutdown(self) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         let client = {
             let mut guard = self.client.write().await;
             guard.take().ok_or(HighLevelClientError::Closed)?
@@ -243,7 +257,10 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedValueReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
+    ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
         let guard = self.client.read().await;
         let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.value_state(subsystem, name, cache).await
@@ -259,7 +276,10 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
+    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
         let guard = self.client.read().await;
         let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.map_state(subsystem, name, cache).await
@@ -275,7 +295,10 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedDequeReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
+    ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
         let guard = self.client.read().await;
         let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
         client.deque_state(subsystem, name, cache).await
@@ -329,7 +352,7 @@ pub async fn new_erased<T>(
     producer: &mut ProducerConfigurationBuilder,
     consumers: &ConsumerBuilders,
     cassandra: &CassandraConfigurationBuilder,
-) -> Result<SharedHighLevelClient<T>, ErasedClientBuildError<WireError<T>>>
+) -> Result<SharedHighLevelClient<T>, ErasedClientBuildError<MessageCodecError<T>>>
 where
     T: ClientHandler + Clone + Send + Sync + 'static,
     T::Payload: EventIdentity + EventType + Clone,
@@ -354,7 +377,7 @@ struct ErasedClient<T, B>(HighLevelClient<T, B>)
 where
     T: ClientHandler,
     T::Payload: EventIdentity,
-    B: ClientBackend<Wire<T>>;
+    B: ClientBackend<MessageCodec<T>>;
 
 #[async_trait]
 impl<T, B> ErasedHighLevelClient<T> for ErasedClient<T, B>
@@ -363,15 +386,15 @@ where
     T::Payload: EventIdentity + EventType + Clone,
     T::Output: Sync + 'static,
     T::Error: Sync + 'static,
-    B: ClientBackend<Wire<T>>,
-    B::Reader: ConsumerReaderBackend<Wire<T>>,
+    B: ClientBackend<MessageCodec<T>>,
+    B::Reader: ConsumerReaderBackend<MessageCodec<T>>,
 {
     async fn send(
         &self,
         topic: Topic,
         key: String,
         payload: T::Payload,
-    ) -> Result<(), HighLevelClientError<WireError<T>>> {
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         self.0.send(topic, &key, payload).await
     }
 
@@ -383,21 +406,24 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<WireError<T>>> {
+    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<MessageCodecError<T>>> {
         self.0
             .request_owned(headers, topic, key, payload, subsystems, timeout)
             .await
     }
 
-    async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<WireError<T>>> {
+    async fn subscribe(
+        &self,
+        handler: T,
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         self.0.subscribe_inner(handler).await
     }
 
-    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<WireError<T>>> {
+    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         self.0.unsubscribe().await
     }
 
-    async fn shutdown(self: Box<Self>) -> Result<(), HighLevelClientError<WireError<T>>> {
+    async fn shutdown(self: Box<Self>) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         self.0.shutdown().await
     }
 
@@ -424,8 +450,11 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedValueReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
-        readers::value(&self.0, subsystem, &name, cache).await
+    ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
+        value(&self.0, subsystem, &name, cache).await
     }
 
     async fn map_state(
@@ -433,8 +462,11 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
-        readers::map(&self.0, subsystem, &name, cache).await
+    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
+        map(&self.0, subsystem, &name, cache).await
     }
 
     async fn deque_state(
@@ -442,8 +474,11 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedDequeReader<Wire<T>>, ErasedReaderBuildError<WireError<T>>> {
-        readers::deque(&self.0, subsystem, &name, cache).await
+    ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
+        deque(&self.0, subsystem, &name, cache).await
     }
 
     async fn assigned_partition_count(&self) -> u32 {

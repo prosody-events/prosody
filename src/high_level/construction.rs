@@ -2,8 +2,8 @@
 
 use super::{
     CassandraClientBackend, CassandraHighLevelClient, ConsumerBuilders, ConsumerState,
-    HighLevelClient, HighLevelClientError, MemoryClientBackend, MemoryHighLevelClient, Mode, Wire,
-    WireError,
+    HighLevelClient, HighLevelClientError, MemoryClientBackend, MemoryHighLevelClient,
+    MessageCodec, MessageCodecError, Mode,
 };
 use crate::cassandra::CassandraStore;
 use crate::cassandra::config::CassandraConfiguration;
@@ -23,11 +23,11 @@ async fn new_with_backend<T, B>(
     mode: Mode,
     producer_builder: &mut ProducerConfigurationBuilder,
     consumer_builders: &ConsumerBuilders,
-) -> Result<HighLevelClient<T, B>, HighLevelClientError<WireError<T>>>
+) -> Result<HighLevelClient<T, B>, HighLevelClientError<MessageCodecError<T>>>
 where
     T: super::ClientHandler,
     T::Payload: crate::EventIdentity,
-    B: super::ClientBackend<Wire<T>>,
+    B: super::ClientBackend<MessageCodec<T>>,
 {
     producer_builder.mock(mock);
     let mut consumer_builders = consumer_builders.clone();
@@ -42,7 +42,7 @@ where
 
     let producer_config = producer_builder.build()?;
     let telemetry = Telemetry::new();
-    let producer: ProsodyProducer<Wire<T>> = match mode {
+    let producer: ProsodyProducer<MessageCodec<T>> = match mode {
         Mode::Pipeline => {
             ProsodyProducer::pipeline_producer(producer_config.clone(), telemetry.sender())
         }
@@ -118,7 +118,7 @@ where
         mode: Mode,
         producer: &mut ProducerConfigurationBuilder,
         consumers: &ConsumerBuilders,
-    ) -> Result<Self, HighLevelClientError<WireError<T>>> {
+    ) -> Result<Self, HighLevelClientError<MessageCodecError<T>>> {
         new_with_backend(MemoryClientBackend::new(), true, mode, producer, consumers).await
     }
 }
@@ -138,7 +138,7 @@ where
         mode: Mode,
         producer: &mut ProducerConfigurationBuilder,
         consumers: &ConsumerBuilders,
-    ) -> Result<Self, HighLevelClientError<WireError<T>>> {
+    ) -> Result<Self, HighLevelClientError<MessageCodecError<T>>> {
         let store = CassandraStore::new(&cassandra)
             .await
             .map_err(|error| StateReaderError::store(&error))?;
