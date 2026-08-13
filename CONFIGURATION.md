@@ -49,15 +49,20 @@ Use a different bind address for each client that shares a host.
 
 | Environment variable | Default | Why it is needed | What it controls | Validation |
 |---|---:|---|---|---|
-| `PROSODY_PEER_BIND_ADDRESS` | Default route address with port `9099` | The peer server needs a reachable listener. | The socket address that the peer server binds and publishes. | Must be an IPv4 or IPv6 socket address. |
+| `PROSODY_PEER_BIND_ADDRESS` | Default-interface address on port `9099` | The peer server needs a reachable listener. | The socket address that the peer server binds and publishes. | Must be a specified IPv4 or IPv6 socket address. Automatic selection must find a default interface and address. |
 | `PROSODY_PEER_ADVERTISED_CONNECT` | unset | Peers on another network need an entry point. | The gRPC connect URI that remote peers use. | Must be a valid gRPC URI. |
 | `PROSODY_PEER_NETWORK_NAME` | unset | A shared label identifies peers that can use direct addresses. | The network group used to choose a direct address or advertised endpoint. | Must not be empty when set. |
 | `PROSODY_PEER_CACHE_CAPACITY` | 256 | Peer caches need a fixed memory bound. | The entry count for address and channel caches. | Must be greater than zero. |
-| `PROSODY_PEER_REGISTRATION_TTL` | 30s | A lease removes dead peers without a cleanup task. | The Cassandra TTL and refresh pace for this peer registration. | At least 5s and no greater than Cassandra's maximum TTL. |
+| `PROSODY_PEER_REGISTRATION_TTL` | 30s | A lease removes dead peers after failures. | The Cassandra TTL and refresh pace for this peer registration. | From 5s through Cassandra's maximum TTL. Subsecond values round up. |
 
 Set `PROSODY_SUBSYSTEM` to make the client answer requests for that subsystem.
 Without it, the client consumes messages but does not answer requests. A
-requestor can target one or more subsystems in either configuration.
+requester can target one or more subsystems in either configuration.
+
+With no network name, Prosody always uses each peer's direct address. Equal
+network names also use direct addresses. Different network names use only the
+advertised connect URI. The response times out if that peer did not publish an
+advertised URI.
 
 ## Retry
 

@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run your application logic here
 
-    client.unsubscribe().await?;
+    client.shutdown().await?;
     Ok(())
 }
 ```
@@ -158,11 +158,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Peer requests
 
 Peer requests let a producer ask named subsystems to process one Kafka event.
-The request returns one ordered result for each subsystem.
-A client can send requests without a subscription.
-A subscribed client responds when its configured subsystem receives a request.
-Local requests stay in the process.
-Remote responses use peer gRPC routes.
+The request returns the handler result for each subsystem in the requested
+order. Each result reports success, handler failure, malformed data, a codec
+mismatch, or a timeout.
+
+A client can send requests without a subscription. Set `PROSODY_SUBSYSTEM`, or
+set `KeyedStateConfiguration::subsystem`, to make a subscribed client answer
+requests. A handler response uses the response codec in `ClientHandler::Codecs`.
+
+Prosody delivers responses locally when the requester and responder share one
+client. It routes other responses between live peers. See
+[Peer Requests](CONFIGURATION.md#peer-requests) for network and cache settings.
 
 ```rust,ignore
 let subsystems = [SubsystemName::try_new("inventory")?];
