@@ -412,8 +412,6 @@ async fn abandon(stop: oneshot::Sender<()>, listener: JoinHandle<()>) {
 /// the last instant of it. The lower bound caps what the margin costs at five
 /// refreshes per lease.
 fn refresh_delay(ttl: RegistrationTtl) -> Duration {
-    let millis = ttl.duration().as_secs() * 1000;
-    let base = millis / 5;
-    let span = millis / 20;
-    Duration::from_millis(base + rand::rng().random_range(0..=span))
+    ttl.duration()
+        .mul_f64(rand::rng().random_range(0.20..=0.25))
 }
