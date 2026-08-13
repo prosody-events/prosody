@@ -482,7 +482,8 @@ fn run_idle_partition_capacity_trace(partition_count: u32) -> Result<(Vec<u64>, 
 }
 
 #[test]
-fn closed_loop_accepts_busy_zero_completion_capacity_windows() -> Result<(), TestError> {
+fn generated_trace_mean_matches_legacy_concurrency_for_busy_zero_completion()
+-> Result<(), TestError> {
     let closed_loop = capacity_test_closed_loop(RampCapacityWorkload, 2)?;
     let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?;
     let mut harness = SimulationHarness::new(plant_configuration, 1, 3, closed_loop)?;

@@ -26,6 +26,8 @@ pub struct TickContext<'a> {
     pub failure_backlog: FailureBacklogView<'a>,
     /// Settlements completed before this controller tick.
     pub completed_settlements: &'a [Settlement],
+    /// Exact handler-slot transitions through this tick.
+    pub attempt_transitions: &'a [crate::AttemptTransition],
 }
 
 /// Paired Normal backlog columns for all partitions.
@@ -420,6 +422,7 @@ pub struct TickHistory {
     backlog: Vec<u32>,
     active_handlers: Vec<u32>,
     handler_occupancy_micros: Vec<u64>,
+    attempt_transition_count: Vec<usize>,
     useful_completions: Vec<u32>,
     completed_attempts: Vec<u32>,
     started_attempts: Vec<u32>,
@@ -483,6 +486,7 @@ impl TickHistory {
             backlog: vec![0; capacity],
             active_handlers: vec![0; capacity],
             handler_occupancy_micros: vec![0; capacity],
+            attempt_transition_count: vec![0; capacity],
             useful_completions: vec![0; capacity],
             completed_attempts: vec![0; capacity],
             started_attempts: vec![0; capacity],
@@ -529,6 +533,7 @@ impl TickHistory {
         self.backlog[index] = plant.backlog;
         self.active_handlers[index] = plant.active_handlers;
         self.handler_occupancy_micros[index] = plant.handler_occupancy_micros;
+        self.attempt_transition_count[index] = plant.attempt_transition_count;
         self.useful_completions[index] = plant.useful_completions;
         self.completed_attempts[index] = plant.completed_attempts;
         self.started_attempts[index] = plant.started_attempts;
@@ -639,6 +644,13 @@ impl<'a> TickHistoryView<'a> {
     pub fn handler_occupancy_micros(self, steps_back: usize) -> Option<u64> {
         self.index(steps_back)
             .map(|index| self.history.handler_occupancy_micros[index])
+    }
+
+    /// Returns the recorded transition count for one newest-first offset.
+    #[must_use]
+    pub fn attempt_transition_count(self, steps_back: usize) -> Option<usize> {
+        self.index(steps_back)
+            .map(|index| self.history.attempt_transition_count[index])
     }
 
     /// Returns cumulative useful completions for one newest-first offset.
@@ -901,6 +913,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
                     release_micros: &self.partition_failure_release_micros,
                 },
                 completed_settlements: self.plant.completed_settlements(),
+                attempt_transitions: self.plant.attempt_transitions(),
             },
             self.published_replicas,
             self.plant.in_flight_replicas(),
@@ -929,6 +942,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
                 release_micros: &self.partition_failure_release_micros,
             },
             completed_settlements: self.plant.completed_settlements(),
+            attempt_transitions: &[],
         };
         let inputs = self.graph.calculate(schedule_context)?;
         self.plant.attempt_model.update(inputs);
@@ -946,6 +960,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
                 release_micros: &self.partition_failure_release_micros,
             },
             completed_settlements: &[],
+            attempt_transitions: &[],
         };
         let mut event_sink = EventSink {
             graph: &self.graph,
@@ -955,13 +970,13 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             key_count: self.key_count,
         };
         event_sink.add(
-            event_context,
+            &event_context,
             inputs,
             crate::EventSource::Message,
             inputs.message_count,
         )?;
         event_sink.add(
-            event_context,
+            &event_context,
             inputs,
             crate::EventSource::Timer,
             inputs.timer_count,
@@ -992,6 +1007,7 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
                     release_micros: &self.partition_failure_release_micros,
                 },
                 completed_settlements: self.plant.completed_settlements(),
+                attempt_transitions: self.plant.attempt_transitions(),
             },
             inputs,
         )?;
@@ -1046,7 +1062,7 @@ struct EventSink<'a, Graph, Model> {
 impl<Graph: TickGenerator, Model: AttemptModel> EventSink<'_, Graph, Model> {
     fn add(
         &mut self,
-        context: TickContext<'_>,
+        context: &TickContext<'_>,
         inputs: TickInputs,
         source: crate::EventSource,
         count: u32,
@@ -1054,7 +1070,7 @@ impl<Graph: TickGenerator, Model: AttemptModel> EventSink<'_, Graph, Model> {
         for event_offset in 0..count {
             let event_index = *self.event_count;
             let event = self.graph.event(EventContext {
-                tick: context,
+                tick: *context,
                 inputs,
                 event_offset,
                 event_index,

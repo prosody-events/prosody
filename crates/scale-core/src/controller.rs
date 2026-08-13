@@ -237,6 +237,12 @@ impl ScaleState {
         &self.configuration
     }
 
+    /// Returns true when time-rescaled residuals reject the Markov clock.
+    #[must_use]
+    pub const fn capacity_clock_rejected(&self) -> bool {
+        self.capacity.markov_clock_rejected()
+    }
+
     /// Returns the fixed number of marginal capacity values.
     #[must_use]
     pub const fn capacity_posterior_value_count(&self) -> u32 {
@@ -1020,7 +1026,7 @@ pub fn step(
         calendar,
         scheduled_releases,
         partition_arrivals,
-        resource_window,
+        resource,
         attempt_outcomes,
         launch,
         rebalance,
@@ -1033,8 +1039,10 @@ pub fn step(
     state.capacity.transition(elapsed);
     state.lead_time.transition(elapsed);
     state.rebalance_time.transition(elapsed);
-    if let Some(window) = resource_window {
-        state.capacity.update(&window);
+    if let Some(evidence) = resource {
+        state.capacity.update(evidence);
+    } else {
+        state.capacity.omit_observation();
     }
     if let Some(evidence) = attempt_outcomes {
         state.reliability.update(evidence);

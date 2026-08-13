@@ -19,12 +19,12 @@ use crate::edf::{
 use crate::lead_time::LaunchTimeFactor;
 use crate::partition::PartitionFactor;
 use crate::planning::terminal_replica_seconds;
-use crate::types::WorkCohorts;
+use crate::types::{WorkCohorts, occupancy_trace_for_test};
 use crate::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
     CapacityCurve, CapacityGrid, CapacityPrior, Cohort, Configuration, ConfigurationError,
     DemandClass, DurationCell, HoldReason, LaunchPrior, LaunchPriorGrid, ModelTime,
-    ObservationBuffer, ObservationError, PosteriorQuery, PriorArtifactBudget,
+    ObservationBuffer, ObservationError, OccupancyTransition, PosteriorQuery, PriorArtifactBudget,
     PriorArtifactIdentity, PriorCoverageRecord, RandomStream, ReadinessGroupId, ReadinessLump,
     ReadinessObservation, RebalanceEvidence, RebalancePrior, ReliabilityPrior, ResourceWindow,
     ScaleDecision, ScaleState, ServiceObjective, ThroughputPosteriorCell, TransitionDirection,
@@ -862,12 +862,9 @@ fn linear_evidence_retains_a_no_knee_explanation() -> Result<(), TestError> {
     let mut factor = capacity_factor(grid, 8.0_f64)?;
     for concurrency in [1.0_f64, 2.0_f64, 4.0_f64, 8.0_f64] {
         let completions = (concurrency * 10.0_f64) as u32;
-        factor.update(&ResourceWindow::new_with_starts(
-            concurrency,
-            1.0_f64,
-            completions,
-            completions,
-        )?);
+        let window =
+            ResourceWindow::new_with_starts(concurrency, 1.0_f64, completions, completions)?;
+        update_constant_capacity_trace(&mut factor, window, concurrency as u32, completions);
     }
 
     assert!(factor.no_knee_probability() > 0.5_f64);
@@ -878,28 +875,121 @@ fn linear_evidence_retains_a_no_knee_explanation() -> Result<(), TestError> {
 fn resource_window_is_consumed_once() -> Result<(), TestError> {
     let configuration = configuration()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
-    observation.set_resource_window(ResourceWindow::new(8.0, 1.0, 80)?)?;
-    let replacement = observation.set_resource_window(ResourceWindow::new(8.0, 1.0, 80)?);
+    let transitions = constant_occupancy_transitions(80, 1_000_000);
+    observation.set_resource_observation(
+        ResourceWindow::new_with_starts(8.0, 1.0, 80, 80)?,
+        8,
+        8,
+        &transitions,
+    )?;
+    let replacement = observation.set_resource_observation(
+        ResourceWindow::new_with_starts(8.0, 1.0, 80, 80)?,
+        8,
+        8,
+        &transitions,
+    );
     assert!(matches!(
         replacement,
         Err(ObservationError::ResourceWindowPending)
     ));
 
     let consumed = observation.observation();
-    assert!(consumed.resource_window.is_some());
+    assert!(consumed.resource.is_some());
     let next = observation.observation();
-    assert!(next.resource_window.is_none());
+    assert!(next.resource.is_none());
     assert!(matches!(
-        observation.set_resource_window(ResourceWindow::new(8.0_f64, 0.5_f64, 80)?),
+        observation.set_resource_observation(
+            ResourceWindow::new_with_starts(8.0_f64, 0.5_f64, 80, 80)?,
+            8,
+            8,
+            &transitions
+        ),
         Err(ObservationError::ResourceExposure)
     ));
     assert!(matches!(
-        observation.set_resource_window(ResourceWindow::new(129.0_f64, 1.0_f64, 80)?),
+        observation.set_resource_observation(
+            ResourceWindow::new_with_starts(129.0_f64, 1.0_f64, 80, 80)?,
+            129,
+            129,
+            &transitions
+        ),
         Err(ObservationError::ResourceConcurrency)
     ));
     assert!(matches!(
-        observation.set_resource_window(ResourceWindow::new(8.0_f64, 1.0_f64, 100_001)?),
+        observation.set_resource_observation(
+            ResourceWindow::new_with_starts(8.0_f64, 1.0_f64, 100_001, 100_001)?,
+            8,
+            8,
+            &transitions,
+        ),
         Err(ObservationError::ResourceAttemptCount)
+    ));
+    Ok(())
+}
+
+#[test]
+fn occupancy_trace_contract_rejects_each_invalid_value() -> Result<(), TestError> {
+    let mut configuration = configuration()?;
+    configuration.resource_window_attempt_count_max = 2;
+    let mut observation = ObservationBuffer::new(&configuration)?;
+    assert!(matches!(
+        ResourceWindow::new_with_starts(1.0_f64, 1.000_000_5_f64, 0, 0),
+        Err(crate::ResourceWindowError::ClockResolution)
+    ));
+    let empty = ResourceWindow::new_with_starts(0.0_f64, 1.0_f64, 0, 0)?;
+    assert!(matches!(
+        observation.set_resource_observation(empty, 129, 129, &[]),
+        Err(ObservationError::ResourceBusySlots)
+    ));
+    let outside = [OccupancyTransition::new(1_000_001, 0, 0)];
+    assert!(matches!(
+        observation.set_resource_observation(empty, 0, 0, &outside),
+        Err(ObservationError::ResourceTransitionTime)
+    ));
+    let unordered = [
+        OccupancyTransition::new(2, 0, 0),
+        OccupancyTransition::new(1, 0, 0),
+    ];
+    assert!(matches!(
+        observation.set_resource_observation(empty, 0, 0, &unordered),
+        Err(ObservationError::ResourceTransitionOrder)
+    ));
+    let completion_underflow = [OccupancyTransition::new(1, 1, 0)];
+    let one_completion = ResourceWindow::new_with_starts(0.0_f64, 1.0_f64, 1, 0)?;
+    assert!(matches!(
+        observation.set_resource_observation(one_completion, 0, 0, &completion_underflow),
+        Err(ObservationError::ResourceBusySlots)
+    ));
+    let start_overflow = [OccupancyTransition::new(1, 0, 1)];
+    let one_start = ResourceWindow::new_with_starts(128.0_f64, 1.0_f64, 0, 1)?;
+    assert!(matches!(
+        observation.set_resource_observation(one_start, 128, 128, &start_overflow),
+        Err(ObservationError::ResourceBusySlots)
+    ));
+    let balanced = [OccupancyTransition::new(500_000, 1, 1)];
+    assert!(matches!(
+        observation.set_resource_observation(empty, 1, 1, &balanced),
+        Err(ObservationError::ResourceTraceSummary)
+    ));
+    let wrong_starts = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 1, 0)?;
+    assert!(matches!(
+        observation.set_resource_observation(wrong_starts, 1, 1, &balanced),
+        Err(ObservationError::ResourceTraceSummary)
+    ));
+    let balanced_window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 1, 1)?;
+    assert!(matches!(
+        observation.set_resource_observation(balanced_window, 1, 0, &balanced),
+        Err(ObservationError::ResourceTraceSummary)
+    ));
+    let wrong_mean = ResourceWindow::new_with_starts(2.0_f64, 1.0_f64, 1, 1)?;
+    assert!(matches!(
+        observation.set_resource_observation(wrong_mean, 1, 1, &balanced),
+        Err(ObservationError::ResourceTraceSummary)
+    ));
+    let too_many = [OccupancyTransition::new(0, 0, 0); 6];
+    assert!(matches!(
+        observation.set_resource_observation(empty, 0, 0, &too_many),
+        Err(ObservationError::ResourceTransitionCapacity)
     ));
     Ok(())
 }
@@ -1160,8 +1250,8 @@ fn capacity_transition_is_cadence_invariant() -> Result<(), TestError> {
     let mut coarse = capacity_factor_with_rate(grid.clone(), change_rate, 32.0_f64)?;
     let mut fine = capacity_factor_with_rate(grid, change_rate, 32.0_f64)?;
     let evidence = ResourceWindow::new_with_starts(32.0_f64, 10.0_f64, 3_200, 3_200)?;
-    coarse.update(&evidence);
-    fine.update(&evidence);
+    update_constant_capacity_trace(&mut coarse, evidence, 32, 3_200);
+    update_constant_capacity_trace(&mut fine, evidence, 32, 3_200);
 
     coarse.transition(Duration::from_secs(1));
     for _ in 0_u32..1_000 {
@@ -2159,7 +2249,6 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
     let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.set_arrivals(72_000, 240_000_000)?;
-    observation.set_resource_window(ResourceWindow::new(30.0_f64, 240.0_f64, 72_000)?)?;
     observation.set_current_replicas(2)?;
     let ScaleDecision::Apply(_first) = step(
         &mut state,
@@ -2175,7 +2264,13 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
         let now_micros = 239_000_000 + window * 1_000_000;
         let mut observation = ObservationBuffer::new(&configuration)?;
         observation.set_arrivals(300, 1_000_000)?;
-        observation.set_resource_window(ResourceWindow::new(30.0_f64, 1.0_f64, 300)?)?;
+        let transitions = constant_occupancy_transitions(300, 1_000_000);
+        observation.set_resource_observation(
+            ResourceWindow::new_with_starts(30.0_f64, 1.0_f64, 300, 300)?,
+            30,
+            30,
+            &transitions,
+        )?;
         observation.set_current_replicas(2)?;
         for partition in 0..configuration.partition_count {
             observation.push_cohort(Cohort {
@@ -2343,6 +2438,45 @@ fn grid() -> Result<CapacityGrid, TestError> {
 
 fn capacity_factor(grid: CapacityGrid, concurrency_max: f64) -> Result<CapacityFactor, TestError> {
     capacity_factor_with_rate(grid, 1.0_f64 / 86_400.0_f64, concurrency_max)
+}
+
+fn constant_occupancy_transitions(
+    completed_attempts: u32,
+    exposure_micros: u64,
+) -> Vec<OccupancyTransition> {
+    (0..completed_attempts)
+        .map(|index| {
+            OccupancyTransition::new(
+                u64::from(index + 1) * exposure_micros / u64::from(completed_attempts + 1),
+                1,
+                1,
+            )
+        })
+        .collect()
+}
+
+fn update_constant_capacity_trace(
+    factor: &mut CapacityFactor,
+    window: ResourceWindow,
+    concurrency: u32,
+    completed_attempts: u32,
+) {
+    let transitions = constant_occupancy_transitions(completed_attempts, window.exposure_micros());
+    let offsets = transitions
+        .iter()
+        .map(|transition| transition.offset_micros())
+        .collect::<Vec<_>>();
+    let completed = vec![1_u32; transitions.len()];
+    let started = vec![1_u32; transitions.len()];
+    factor.update(occupancy_trace_for_test(
+        window,
+        concurrency,
+        concurrency,
+        u128::from(concurrency) * u128::from(window.exposure_micros()),
+        &offsets,
+        &completed,
+        &started,
+    ));
 }
 
 fn capacity_factor_with_rate(

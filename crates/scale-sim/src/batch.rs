@@ -109,7 +109,8 @@ pub fn run_batch_slo_with_inputs(
         slots_per_replica: DEFAULT_CONCURRENCY_PER_REPLICA,
         posterior_sample_count: 4_096,
         report_interval_micros: budget_micros,
-        resource_window_attempt_count_max: 100_000,
+        resource_window_attempt_count_max: EVENT_COUNT
+            .saturating_mul(u32::from(crate::MAX_RETRY_FAILURES) + 1),
         failure_service_weight: 0.3_f64,
         // One arrival per second with one expected change per day is the
         // batch baseline; the batch drains a fixed backlog, so this prior

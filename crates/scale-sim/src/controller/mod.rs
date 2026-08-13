@@ -6,9 +6,9 @@ use prosody_scale_core::{
     ActuationCommitment, ArrivalPosterior, AttemptOutcomeCounts, AttemptOutcomeEvidence,
     BacklogCohort, CapacityGrid, Cohort, CompletionPosteriorCell, Configuration,
     ConfigurationError, DecisionRejection, DemandClass, HoldReason, ModelTime, ObservationBuffer,
-    PosteriorQuery, RandomStream, ReadinessGroupId, ReadinessLump, ReadinessObservation,
-    RebalanceEvidence, ResourceWindow, ScaleDecision, ScaleScratch, ScaleState,
-    TransitionDirection, step,
+    OccupancyTransition, PosteriorQuery, RandomStream, ReadinessGroupId, ReadinessLump,
+    ReadinessObservation, RebalanceEvidence, ResourceWindow, ScaleDecision, ScaleScratch,
+    ScaleState, TransitionDirection, step,
 };
 use statrs::distribution::{DiscreteCDF, NegativeBinomial, Poisson};
 use thiserror::Error;
@@ -868,8 +868,7 @@ impl ControllerTrace {
 
     fn push_decision_columns(&mut self, target: u32, scratch: &ScaleScratch) {
         let summary = usize::try_from(target)
-            .ok()
-            .and_then(|target| target.checked_sub(1))
+            .map_or(None, |target| target.checked_sub(1))
             .and_then(|selected| scratch.decision_column_summary(selected));
         let selected = summary.map(|summary| summary.selected);
         let runner_up = summary.and_then(|summary| summary.runner_up);
@@ -1048,6 +1047,7 @@ pub struct ClosedLoop<Workload> {
     latest_capacity_window: Option<CapacityWindow>,
     capacity_evidence_sample: CapacityEvidenceSample,
     completion_posterior_scratch: Vec<CompletionPosteriorCell>,
+    capacity_transition_scratch: Vec<OccupancyTransition>,
     inflight_transitions: Vec<PendingTransition>,
     ready_transitions: Vec<PendingTransition>,
     pending_transition_observations: VecDeque<PendingTransitionObservation>,
@@ -1238,6 +1238,14 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         let partition_posterior_count = trace.partition_share_posterior.values.len();
         let transition_capacity =
             usize::try_from(trace_count_max).map_err(|_| ConfigurationError::PlatformLimit)?;
+        let capacity_transition_count = usize::try_from(
+            core_configuration
+                .resource_window_attempt_count_max
+                .checked_mul(2)
+                .and_then(|count| count.checked_add(1))
+                .ok_or(ConfigurationError::PlatformLimit)?,
+        )
+        .map_err(|_| ConfigurationError::PlatformLimit)?;
         let scratch = state.new_scratch()?;
         let observation = ObservationBuffer::new(core_configuration)?;
         Ok(Self {
@@ -1263,6 +1271,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                 CompletionPosteriorCell::default();
                 throughput_posterior_count
             ],
+            capacity_transition_scratch: Vec::with_capacity(capacity_transition_count),
             inflight_transitions: Vec::with_capacity(transition_capacity),
             ready_transitions: Vec::with_capacity(transition_capacity),
             pending_transition_observations: VecDeque::with_capacity(transition_capacity),
@@ -1318,7 +1327,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
 
     fn prepare_observation(
         &mut self,
-        context: TickContext<'_>,
+        context: &TickContext<'_>,
         inputs: TickInputs,
         reporter: ReporterDirective,
         calendar: Option<&CalendarForecastInput>,
@@ -1404,7 +1413,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
 
     fn prepare_arrival_evidence(
         &mut self,
-        context: TickContext<'_>,
+        context: &TickContext<'_>,
         reporter: ReporterDirective,
     ) -> Result<(), PlantError> {
         if reporter == ReporterDirective::ReplaceAggregator {
@@ -1489,7 +1498,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         Ok(())
     }
 
-    fn prepare_transition_evidence(&mut self, context: TickContext<'_>) -> Result<(), PlantError> {
+    fn prepare_transition_evidence(&mut self, context: &TickContext<'_>) -> Result<(), PlantError> {
         let mut index = 0_usize;
         while index < self.inflight_transitions.len() {
             if !self.inflight_transitions[index].reached(context.plant.replicas) {
@@ -1588,7 +1597,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         Ok(())
     }
 
-    fn prepare_attempt_outcomes(&mut self, context: TickContext<'_>) -> Result<(), PlantError> {
+    fn prepare_attempt_outcomes(&mut self, context: &TickContext<'_>) -> Result<(), PlantError> {
         let Some(previous_normal_successes) = context.history.normal_successes(0) else {
             return Ok(());
         };
@@ -1665,37 +1674,92 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
 
     /// Adds a measured resource window between two plant states.
     ///
-    /// Concurrency comes from occupancy, not replica count. Thus, a replica
-    /// change, reconciliation, or pause does not invalidate a window. Occupancy
-    /// and completions fall together during reconciliation and pauses. A busy
-    /// zero-completion window is valid Poisson evidence. The rank floor bounds
-    /// its influence.
-    fn prepare_capacity_evidence(&mut self, context: TickContext<'_>) -> Result<(), PlantError> {
+    /// Two consecutive plant snapshots bracket the window: the transition
+    /// log between their recorded counts is exactly the evidence between the
+    /// handler samples, however boundary-time ties order against a sample.
+    /// A tie clamps to offset zero or to the full exposure. Only a window
+    /// that spans exactly one report interval is a certified report; a tick
+    /// at any other spacing omits the observation.
+    fn prepare_capacity_evidence(&mut self, context: &TickContext<'_>) -> Result<(), PlantError> {
         let Some(previous_micros) = context.history.now_micros(0) else {
             return Ok(());
         };
         let exposure_micros = context.now_micros.saturating_sub(previous_micros);
-        if exposure_micros == 0 {
+        if exposure_micros != self.configuration.core().report_interval_micros {
             return Ok(());
+        }
+        let Some(initial_busy_slots) = context.history.active_handlers(0) else {
+            return Ok(());
+        };
+        let Some(previous_count) = context.history.attempt_transition_count(0) else {
+            return Ok(());
+        };
+        let window_transitions = context
+            .attempt_transitions
+            .get(previous_count..context.plant.attempt_transition_count)
+            .unwrap_or(&[]);
+        self.capacity_transition_scratch.clear();
+        for transition in window_transitions.iter().copied() {
+            let offset_micros = transition
+                .at_micros
+                .saturating_sub(previous_micros)
+                .min(exposure_micros);
+            if let Some(group) = self.capacity_transition_scratch.last_mut()
+                && group.offset_micros() == offset_micros
+            {
+                let completed = group
+                    .completed_attempts()
+                    .saturating_add(u32::from(matches!(
+                        transition.kind,
+                        crate::AttemptTransitionKind::Completion
+                    )));
+                let started = group.started_attempts().saturating_add(u32::from(matches!(
+                    transition.kind,
+                    crate::AttemptTransitionKind::Start
+                )));
+                *group = OccupancyTransition::new(offset_micros, completed, started);
+            } else {
+                if self.capacity_transition_scratch.len()
+                    == self.capacity_transition_scratch.capacity()
+                {
+                    return Err(PlantError::MetricCapacity);
+                }
+                self.capacity_transition_scratch
+                    .push(OccupancyTransition::new(
+                        offset_micros,
+                        u32::from(matches!(
+                            transition.kind,
+                            crate::AttemptTransitionKind::Completion
+                        )),
+                        u32::from(matches!(
+                            transition.kind,
+                            crate::AttemptTransitionKind::Start
+                        )),
+                    ));
+            }
+        }
+        let completed_attempts = self
+            .capacity_transition_scratch
+            .iter()
+            .map(|group| group.completed_attempts())
+            .fold(0_u32, u32::saturating_add);
+        let started_attempts = self
+            .capacity_transition_scratch
+            .iter()
+            .map(|group| group.started_attempts())
+            .fold(0_u32, u32::saturating_add);
+        let mut final_busy_slots = initial_busy_slots;
+        for group in &self.capacity_transition_scratch {
+            final_busy_slots = final_busy_slots
+                .checked_sub(group.completed_attempts())
+                .and_then(|state| state.checked_add(group.started_attempts()))
+                .ok_or(PlantError::MetricCapacity)?;
         }
         let previous_occupancy = context.history.handler_occupancy_micros(0).unwrap_or(0);
         let occupancy = context
             .plant
             .handler_occupancy_micros
             .saturating_sub(previous_occupancy);
-        if occupancy == 0 {
-            return Ok(());
-        }
-        let previous_attempts = context.history.completed_attempts(0).unwrap_or(0);
-        let completed_attempts = context
-            .plant
-            .completed_attempts
-            .saturating_sub(previous_attempts);
-        let previous_starts = context.history.started_attempts(0).unwrap_or(0);
-        let started_attempts = context
-            .plant
-            .started_attempts
-            .saturating_sub(previous_starts);
         let exposure_seconds = Duration::from_micros(exposure_micros).as_secs_f64();
         let current = CapacityWindow {
             concurrency: Duration::from_micros(occupancy).as_secs_f64() / exposure_seconds,
@@ -1704,14 +1768,19 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             started_attempts,
         };
         self.latest_capacity_window = Some(current);
-        self.observation.set_resource_window(current.evidence()?)?;
+        self.observation.set_resource_observation(
+            current.evidence()?,
+            initial_busy_slots,
+            final_busy_slots,
+            &self.capacity_transition_scratch,
+        )?;
         self.capacity_evidence_sample = CapacityEvidenceSample::Window(current.sample());
         Ok(())
     }
 
     fn count_generated(
         &mut self,
-        context: TickContext<'_>,
+        context: &TickContext<'_>,
         inputs: TickInputs,
         source: crate::EventSource,
         count: u32,
@@ -1722,7 +1791,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         for event_offset in 0..count {
             let event_index = self.event_count.saturating_add(event_offset);
             let event = self.workload.event(EventContext {
-                tick: context,
+                tick: *context,
                 inputs,
                 event_offset,
                 event_index,
@@ -1744,7 +1813,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         Ok(())
     }
 
-    fn push_backlog_cohorts(&mut self, context: TickContext<'_>) -> Result<(), PlantError> {
+    fn push_backlog_cohorts(&mut self, context: &TickContext<'_>) -> Result<(), PlantError> {
         for partition in 0..self.generated_counts.len() {
             let Some(normal) = context.normal_backlog.get(partition) else {
                 return Err(PlantError::PartitionIndex);
@@ -1793,7 +1862,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
 
     fn apply_decision(
         &mut self,
-        context: TickContext<'_>,
+        context: &TickContext<'_>,
         mut inputs: TickInputs,
         reporter: ReporterDirective,
     ) -> Result<TickInputs, PlantError> {
@@ -2082,7 +2151,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
 
     fn track_scale_request(
         &mut self,
-        context: TickContext<'_>,
+        context: &TickContext<'_>,
         replicas: u32,
         plant_in_flight: u32,
     ) -> Result<(), PlantError> {
@@ -2181,7 +2250,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
 
     fn record_censored_transition(
         &mut self,
-        context: TickContext<'_>,
+        context: &TickContext<'_>,
         transition: PendingTransition,
     ) -> Result<(), PlantError> {
         let exposure_micros = context
@@ -2468,13 +2537,13 @@ impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
         let calendar = self.workload.calendar_forecast(context)?;
         let scheduled_releases = self.workload.scheduled_releases(context)?;
         self.prepare_observation(
-            context,
+            &context,
             inputs,
             reporter,
             calendar.as_ref(),
             &scheduled_releases,
         )?;
-        self.apply_decision(context, inputs, reporter)
+        self.apply_decision(&context, inputs, reporter)
     }
 
     fn metric_polled(
@@ -2483,7 +2552,7 @@ impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
         replicas: u32,
         plant_in_flight: u32,
     ) -> Result<(), PlantError> {
-        self.track_scale_request(context, replicas, plant_in_flight)
+        self.track_scale_request(&context, replicas, plant_in_flight)
     }
 
     fn event(&self, context: EventContext<'_>) -> Result<EventInputs, PlantError> {

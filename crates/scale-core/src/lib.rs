@@ -39,9 +39,9 @@ pub use types::{
     ActuationCommitment, ApplyDecision, ArrivalPosterior, AttemptOutcomeCounts,
     AttemptOutcomeEvidence, BacklogCohort, CalendarArtifactId, CalendarRateSegment, Cohort,
     Configuration, ConfigurationError, DecisionDiagnostics, DemandClass, GroupObservation,
-    HoldDecision, HoldReason, ModelTime, ObservationBuffer, ObservationError, PosteriorQuery,
-    PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord, ScaleDecision,
-    ScheduledRelease, ServiceObjective,
+    HoldDecision, HoldReason, ModelTime, ObservationBuffer, ObservationError,
+    OccupancyTraceEvidence, OccupancyTransition, PosteriorQuery, PriorArtifactBudget,
+    PriorArtifactIdentity, PriorCoverageRecord, ScaleDecision, ScheduledRelease, ServiceObjective,
 };
 
 #[cfg(test)]

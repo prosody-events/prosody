@@ -530,6 +530,12 @@ pub struct PlantSnapshot {
     pub completed_attempts: u32,
     /// Cumulative handler attempts started for all outcomes.
     pub started_attempts: u32,
+    /// Count of handler-slot transitions recorded by this snapshot.
+    ///
+    /// Two consecutive snapshots bracket one report window: the transition
+    /// log between their counts is exactly the evidence between the samples,
+    /// however boundary-time ties order against the sample.
+    pub attempt_transition_count: usize,
     /// Cumulative time with at least one partition paused for reconciliation.
     pub rebalance_pause_micros: u64,
     /// Cumulative completed normal attempts.
@@ -626,6 +632,24 @@ struct AttemptOutcome {
     result: AttemptResult,
 }
 
+/// One exact handler-slot transition from the simulator event stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptTransition {
+    /// Simulator clock time for the transition.
+    pub at_micros: u64,
+    /// Direction of the busy-slot change.
+    pub kind: AttemptTransitionKind,
+}
+
+/// Direction of one exact handler-slot transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttemptTransitionKind {
+    /// One handler slot started work.
+    Start,
+    /// One handler slot completed work.
+    Completion,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttemptResult {
     Success,
@@ -677,6 +701,7 @@ pub struct Plant<M = SeriesAttemptModel> {
     normal_service_micros: u64,
     failure_service_micros: u64,
     attempt_outcomes: VecDeque<AttemptOutcome>,
+    attempt_transitions: Vec<AttemptTransition>,
     useful_completions: u32,
     completed_attempts: u32,
     started_attempts: u32,
@@ -787,6 +812,11 @@ impl<M: AttemptModel> Plant<M> {
             failure_service_micros: 0,
             attempt_outcomes: VecDeque::with_capacity(
                 event_count_max.saturating_mul(usize::from(MAX_RETRY_FAILURES) + 1),
+            ),
+            attempt_transitions: Vec::with_capacity(
+                event_count_max
+                    .saturating_mul(usize::from(MAX_RETRY_FAILURES) + 1)
+                    .saturating_mul(2),
             ),
             useful_completions: 0,
             completed_attempts: 0,
@@ -1283,6 +1313,12 @@ impl<M: AttemptModel> Plant<M> {
         &self.settlements
     }
 
+    /// Returns exact handler-slot transitions through the current time.
+    #[must_use]
+    pub fn attempt_transitions(&self) -> &[AttemptTransition] {
+        &self.attempt_transitions
+    }
+
     fn seed_heap(&mut self) {
         for event in 0..self.events.len() {
             let scheduled = Scheduled {
@@ -1374,6 +1410,10 @@ impl<M: AttemptModel> Plant<M> {
         self.key_active[key] = true;
         self.active_handlers += 1;
         self.started_attempts = self.started_attempts.saturating_add(1);
+        self.attempt_transitions.push(AttemptTransition {
+            at_micros: now_micros,
+            kind: AttemptTransitionKind::Start,
+        });
         self.active_handlers_by_owner[owner] += 1;
         self.partition_active_handlers[partition] += 1;
         self.owner_at_dispatch[event_index] = owner as u32;
@@ -1445,6 +1485,10 @@ impl<M: AttemptModel> Plant<M> {
         };
         self.finish_running_attempt(event, class, now_micros);
         self.completed_attempts = self.completed_attempts.saturating_add(1);
+        self.attempt_transitions.push(AttemptTransition {
+            at_micros: now_micros,
+            kind: AttemptTransitionKind::Completion,
+        });
         let retry = match spec.outcome {
             EventOutcome::Final(_) => None,
             EventOutcome::Retry {
@@ -1838,6 +1882,7 @@ impl<M: AttemptModel> Plant<M> {
             useful_completions: self.useful_completions,
             completed_attempts: self.completed_attempts,
             started_attempts: self.started_attempts,
+            attempt_transition_count: self.attempt_transitions.len(),
             rebalance_pause_micros: self.rebalance_pause_micros,
             normal_attempts: self.normal_attempts,
             normal_successes: self.normal_successes,

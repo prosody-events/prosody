@@ -1,14 +1,49 @@
+use std::{array, time::Duration};
+
 use allocation_counter::measure;
 use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
 use super::{
-    CapacityGrid, CapacityGridError, CapacityModelError, CompletionScratch, ResourceWindow,
-    ResourceWindowError, RetainedHistory, StartWindow, binomial_log_probability,
+    CapacityGrid, CapacityGridError, CapacityModelError, CompletionScratch, DeathBand,
+    ResourceWindow, ResourceWindowError, RetainedHistory, StartWindow, binomial_log_probability,
     capacity_model_artifact, completion_expectation, completion_log_likelihood,
-    contamination_prior, hazard_prior, log_normal_axis_masses, record_start_window,
+    completion_marginal_probability, contamination_prior, feasibility_probability, fold_trace,
+    hazard_prior, log_contamination_mixture, log_normal_axis_masses, log_weighted_sum,
+    path_log_score, pure_death_step, record_start_window,
 };
-use crate::ArrivalPrior;
+use crate::types::occupancy_trace_for_test;
+use crate::{ArrivalPrior, OccupancyTraceEvidence};
+
+fn update_constant_trace(
+    factor: &mut super::CapacityFactor,
+    concurrency: u32,
+    exposure_seconds: f64,
+    completed_attempts: u32,
+) -> Result<(), ResourceWindowError> {
+    let window = ResourceWindow::new_with_starts(
+        f64::from(concurrency),
+        exposure_seconds,
+        completed_attempts,
+        completed_attempts,
+    )?;
+    let exposure_micros = window.exposure_micros();
+    let offsets = (0..completed_attempts)
+        .map(|index| u64::from(index + 1) * exposure_micros / u64::from(completed_attempts + 1))
+        .collect::<Vec<_>>();
+    let completed = vec![1_u32; completed_attempts as usize];
+    let started = vec![1_u32; completed_attempts as usize];
+    factor.update(occupancy_trace_for_test(
+        window,
+        concurrency,
+        concurrency,
+        u128::from(concurrency) * u128::from(exposure_micros),
+        &offsets,
+        &completed,
+        &started,
+    ));
+    Ok(())
+}
 
 #[quickcheck]
 fn known_start_binomial_likelihood_is_normalized(trial_code: u8, probability_code: u8) -> bool {
@@ -172,8 +207,8 @@ fn coverage_ring_matches_unbounded_history() -> Result<(), TestError> {
 
 #[test]
 fn contamination_cells_preserve_the_authored_beta_mass() -> Result<(), TestError> {
-    let artifact = capacity_model_artifact(1.0_f64 / 300.0_f64, 4.0_f64)?;
-    let (probabilities, weights) = contamination_prior(artifact)?;
+    let artifact = capacity_model_artifact(1.0_f64 / 300.0_f64, 4.0_f64, 4)?;
+    let (probabilities, weights) = contamination_prior(&artifact)?;
     assert_eq!(probabilities.len(), weights.len());
     assert!(probabilities.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(
@@ -209,12 +244,8 @@ fn an_identifiable_persistent_run_beats_contamination_redraws() -> Result<(), Te
         .skip(quality_count - 1)
         .step_by(quality_count)
         .sum::<f64>();
-    let mut previous_starts = 4;
-    for index in 0_u32..180 {
-        let starts = if index % 2 == 0 { 20 } else { 4 };
-        let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, previous_starts, starts)?;
-        factor.update(&window);
-        previous_starts = starts;
+    for _ in 0_u32..180 {
+        update_constant_trace(&mut factor, 1, 1.0_f64, 1)?;
     }
     let persistent_mass = factor.weights[1] + factor.weights[3];
     let clean_filter_mass = factor
@@ -238,14 +269,14 @@ fn an_identifiable_persistent_run_beats_contamination_redraws() -> Result<(), Te
 
 #[test]
 fn hazard_cells_cover_the_declared_gamma_tails() -> Result<(), TestError> {
-    let artifact = capacity_model_artifact(1.0_f64 / 300.0_f64, 4.0_f64)?;
-    assert_eq!(artifact.identity.version(), 1);
+    let artifact = capacity_model_artifact(1.0_f64 / 300.0_f64, 4.0_f64, 4)?;
+    assert_eq!(artifact.identity.version(), 2);
     assert!(artifact.coverage[1].tail_probability() <= artifact.budget.boundary_probability_max());
-    let (rates, weights) = hazard_prior(artifact)?;
+    let (rates, weights) = hazard_prior(&artifact)?;
     assert!(rates.windows(2).all(|pair| pair[0] < pair[1]));
     assert!((weights.iter().sum::<f64>() - 1.0_f64).abs() <= 16.0_f64 * f64::EPSILON);
     assert!(matches!(
-        capacity_model_artifact(0.0_f64, 4.0_f64),
+        capacity_model_artifact(0.0_f64, 4.0_f64, 4),
         Err(CapacityModelError::InvalidHazardPrior)
     ));
     Ok(())
@@ -271,6 +302,16 @@ fn observation_contract_sizes_history_from_coverage() -> Result<(), TestError> {
         64,
     )?;
     assert_eq!(factor.start_history.len(), 3);
+    let collapse_grid = CapacityGrid::new(&[600.0_f64], &[0.01_f64], &[2.0_f64])?;
+    let clamped = super::CapacityFactor::new_with_prior(
+        collapse_grid,
+        1.0_f64 / 300.0_f64,
+        &ArrivalPrior::test_artifact()?,
+        4_096.0_f64,
+        1.0_f64,
+        8,
+    )?;
+    assert_eq!(clamped.start_history.len(), super::START_HISTORY_SLOT_MAX);
     Ok(())
 }
 
@@ -285,12 +326,700 @@ fn completion_convolution_update_does_not_allocate() -> Result<(), TestError> {
         1.0_f64,
         64,
     )?;
+    update_constant_trace(&mut factor, 1, 1.0_f64, 32)?;
     let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 32, 32)?;
-    factor.update(&window);
-    let allocation = measure(|| factor.update(&window));
+    let offsets = (1_u64..=32).map(|value| value * 30_000).collect::<Vec<_>>();
+    let completed = [1_u32; 32];
+    let started = [1_u32; 32];
+    let evidence =
+        occupancy_trace_for_test(window, 1, 1, 1_000_000, &offsets, &completed, &started);
+    let allocation = measure(|| factor.update(evidence));
     assert_eq!(allocation.count_total, 0);
     assert_eq!(allocation.bytes_total, 0);
+    assert_eq!(factor.start_history_len, 2);
     Ok(())
+}
+
+#[test]
+fn finite_grid_oracle_matches_joint_normalization_and_filters() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.5_f64, 1.0_f64], &[100.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid.clone(),
+        1.0_f64 / 300.0_f64,
+        &ArrivalPrior::test_artifact()?,
+        1.0_f64,
+        1.0_f64,
+        8,
+    )?;
+    let no_completion = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 0, 0)?;
+    let empty: [u64; 0] = [];
+    let empty_counts: [u32; 0] = [];
+    let no_completion_evidence = occupancy_trace_for_test(
+        no_completion,
+        1,
+        1,
+        1_000_000,
+        &empty,
+        &empty_counts,
+        &empty_counts,
+    );
+    let completion = ResourceWindow::new_with_starts(0.25_f64, 1.0_f64, 1, 0)?;
+    let offsets = [250_000_u64];
+    let completed = [1_u32];
+    let started = [0_u32];
+    let completion_evidence =
+        occupancy_trace_for_test(completion, 1, 0, 250_000, &offsets, &completed, &started);
+    let mut probabilities = [0.0_f64; 2];
+    let mut coefficients = [0.0_f64; 2];
+    let mut work = [0.0_f64; 2];
+    for index in 0..grid.cell_count() as usize {
+        let rate = super::state_rate(&grid, index, 1);
+        let zero = completion_marginal_probability(
+            &grid,
+            index,
+            no_completion_evidence,
+            &mut probabilities,
+            &mut coefficients,
+            &mut work,
+        )
+        .ok_or(CapacityModelError::InvalidObservationContract)?;
+        let one = completion_marginal_probability(
+            &grid,
+            index,
+            completion_evidence,
+            &mut probabilities,
+            &mut coefficients,
+            &mut work,
+        )
+        .ok_or(CapacityModelError::InvalidObservationContract)?;
+        let operation_bound = 256.0_f64 * f64::EPSILON;
+        assert!((zero - (-rate).exp()).abs() <= operation_bound);
+        assert!((zero + one - 1.0_f64).abs() <= operation_bound);
+        let conditional_integral = (1.0_f64 - (-rate).exp()) / one;
+        assert!((conditional_integral - 1.0_f64).abs() <= operation_bound);
+        let mut exposures = [0.0_f64; 2];
+        let mut completion_counts = [0_u32; 2];
+        fold_trace(completion_evidence, &mut exposures, &mut completion_counts);
+        let path = path_log_score(&grid, index, &exposures, &completion_counts);
+        let oracle_path = rate.ln() - rate * 0.25_f64;
+        assert!((path - oracle_path).abs() <= operation_bound);
+
+        let conditioned_window = ResourceWindow::new_with_starts(0.75_f64, 1.0_f64, 1, 1)?;
+        let conditioned_offsets = [250_000_u64, 500_000_u64];
+        let conditioned_completed = [1_u32, 0_u32];
+        let conditioned_started = [0_u32, 1_u32];
+        let conditioned = occupancy_trace_for_test(
+            conditioned_window,
+            1,
+            1,
+            750_000,
+            &conditioned_offsets,
+            &conditioned_completed,
+            &conditioned_started,
+        );
+        let normalizer = feasibility_probability(
+            &grid,
+            index,
+            conditioned,
+            &mut probabilities,
+            &mut coefficients,
+            &mut work,
+        )
+        .ok_or(CapacityModelError::InvalidObservationContract)?;
+        let expected_normalizer = 1.0_f64 - (-rate * 0.5_f64).exp();
+        assert!((normalizer - expected_normalizer).abs() <= operation_bound);
+        let conditioned_marginal = completion_marginal_probability(
+            &grid,
+            index,
+            conditioned,
+            &mut probabilities,
+            &mut coefficients,
+            &mut work,
+        )
+        .ok_or(CapacityModelError::InvalidObservationContract)?;
+        assert!((conditioned_marginal - (-rate * 0.5_f64).exp()).abs() <= operation_bound);
+        let conditional_path_integral = expected_normalizer / normalizer;
+        assert!((conditional_path_integral - 1.0_f64).abs() <= operation_bound);
+    }
+
+    assert_contamination_filter_parity(&mut factor, &grid, completion_evidence);
+    Ok(())
+}
+
+fn assert_contamination_filter_parity(
+    factor: &mut super::CapacityFactor,
+    grid: &CapacityGrid,
+    evidence: OccupancyTraceEvidence<'_>,
+) {
+    let initial_filter_weights = factor.filter_weights.clone();
+    let initial_curve_weights = factor.filter_curve_weights.clone();
+    let mut exposures = [0.0_f64; 2];
+    let mut completion_counts = [0_u32; 2];
+    fold_trace(evidence, &mut exposures, &mut completion_counts);
+    let likelihoods = (0..grid.cell_count() as usize)
+        .map(|index| path_log_score(grid, index, &exposures, &completion_counts))
+        .collect::<Vec<_>>();
+    let prior_predictive = log_weighted_sum(&factor.prior_weights, &likelihoods);
+    let cell_count = likelihoods.len();
+    let quality_count = factor.contamination_probabilities.len();
+    let mut direct_weights = vec![0.0_f64; cell_count];
+    let mut filter_evidence = vec![0.0_f64; initial_filter_weights.len()];
+    let mut conditional_weights = vec![0.0_f64; initial_curve_weights.len()];
+    for (filter, prior) in initial_curve_weights.chunks_exact(cell_count).enumerate() {
+        let contamination = factor.contamination_probabilities[filter % quality_count];
+        let mixtures = likelihoods
+            .iter()
+            .map(|likelihood| {
+                log_contamination_mixture(*likelihood, prior_predictive, contamination).exp()
+            })
+            .collect::<Vec<_>>();
+        let predictive = prior
+            .iter()
+            .zip(&mixtures)
+            .map(|(weight, likelihood)| weight * likelihood)
+            .sum::<f64>();
+        filter_evidence[filter] = initial_filter_weights[filter] * predictive;
+        for cell in 0..cell_count {
+            conditional_weights[filter * cell_count + cell] =
+                prior[cell] * mixtures[cell] / predictive;
+        }
+    }
+    let total_filter_evidence = filter_evidence.iter().sum::<f64>();
+    for (filter, evidence) in filter_evidence.iter().enumerate() {
+        for cell in 0..cell_count {
+            direct_weights[cell] +=
+                evidence / total_filter_evidence * conditional_weights[filter * cell_count + cell];
+        }
+    }
+    factor.update(evidence);
+    let operation_bound = 4_096.0_f64 * f64::EPSILON;
+    assert!(
+        factor
+            .weights
+            .iter()
+            .zip(direct_weights)
+            .all(|(actual, expected)| (actual - expected).abs() <= operation_bound)
+    );
+}
+
+#[quickcheck]
+fn finite_grid_oracle_covers_random_valid_transition_paths(
+    state_code: u8,
+    service_code: u8,
+    event_codes: [u8; 8],
+) -> bool {
+    const STATE_COUNT: usize = 4;
+    let initial = usize::from(state_code) % STATE_COUNT;
+    let service = 0.5_f64 + f64::from(service_code) / 255.0_f64 * 1.5_f64;
+    let Ok(grid) = CapacityGrid::new(&[service], &[100.0_f64], &[0.0_f64]) else {
+        return false;
+    };
+    let mut state = initial;
+    let mut busy_slot_micros = 0_u128;
+    let mut previous_offset = 0_u64;
+    let mut offsets = Vec::with_capacity(event_codes.len());
+    let mut completed = Vec::with_capacity(event_codes.len());
+    let mut started = Vec::with_capacity(event_codes.len());
+    for (index, code) in event_codes.into_iter().enumerate() {
+        let offset = (index as u64 + 1) * 100_000;
+        busy_slot_micros += u128::from(offset - previous_offset) * state as u128;
+        let completion_count = u32::from(code & 1 == 0 && state > 0);
+        state -= completion_count as usize;
+        let start_count = u32::from(code & 2 != 0 && state + 1 < STATE_COUNT);
+        state += start_count as usize;
+        offsets.push(offset);
+        completed.push(completion_count);
+        started.push(start_count);
+        previous_offset = offset;
+    }
+    busy_slot_micros += u128::from(1_000_000 - previous_offset) * state as u128;
+    let completion_count = completed.iter().copied().sum::<u32>();
+    let start_count = started.iter().copied().sum::<u32>();
+    let Ok(busy_slot_micros_u64) = u64::try_from(busy_slot_micros) else {
+        return false;
+    };
+    let Ok(window) = ResourceWindow::new_with_starts(
+        Duration::from_micros(busy_slot_micros_u64).as_secs_f64(),
+        1.0_f64,
+        completion_count,
+        start_count,
+    ) else {
+        return false;
+    };
+    let evidence = occupancy_trace_for_test(
+        window,
+        initial as u32,
+        state as u32,
+        busy_slot_micros,
+        &offsets,
+        &completed,
+        &started,
+    );
+    let rates = array::from_fn(|busy| super::state_rate(&grid, 0, busy));
+    let (oracle_normalizer, oracle_final, operation_count) =
+        oracle_forward(&rates, initial, &offsets, &started);
+    let mut probabilities = [0.0_f64; STATE_COUNT];
+    let mut coefficients = [0.0_f64; STATE_COUNT];
+    let mut work = [0.0_f64; STATE_COUNT];
+    let Some(normalizer) = feasibility_probability(
+        &grid,
+        0,
+        evidence,
+        &mut probabilities,
+        &mut coefficients,
+        &mut work,
+    ) else {
+        return false;
+    };
+    let Some(marginal) = completion_marginal_probability(
+        &grid,
+        0,
+        evidence,
+        &mut probabilities,
+        &mut coefficients,
+        &mut work,
+    ) else {
+        return false;
+    };
+    let tolerance =
+        Duration::from_micros(operation_count).as_secs_f64() * 64_000_000.0_f64 * f64::EPSILON
+            + 1.0e-10_f64;
+    let oracle_marginal = oracle_final[state] / oracle_normalizer;
+    let normalized_marginals = oracle_final.iter().sum::<f64>() / oracle_normalizer;
+    (normalizer - oracle_normalizer).abs() <= tolerance
+        && (marginal - oracle_marginal).abs() <= tolerance
+        && (normalized_marginals - 1.0_f64).abs() <= tolerance
+        && (oracle_final[state] / (oracle_normalizer * oracle_marginal) - 1.0_f64).abs()
+            <= tolerance
+}
+
+#[test]
+fn pure_death_band_keeps_states_when_remaining_starts_exceed_the_bound() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.5_f64], &[100.0_f64], &[0.0_f64])?;
+    let offsets = [
+        100_000_u64,
+        200_000,
+        300_000,
+        400_000,
+        500_000,
+        600_000,
+        700_000,
+        800_000,
+    ];
+    let completed = [0_u32, 0, 1, 0, 0, 0, 1, 1];
+    let started = [0_u32, 1, 0, 1, 1, 1, 0, 0];
+    let mut state = 0_u32;
+    let mut previous_offset = 0_u64;
+    let mut busy_slot_micros = 0_u128;
+    for ((&offset, &completion_count), &start_count) in offsets.iter().zip(&completed).zip(&started)
+    {
+        busy_slot_micros += u128::from(offset - previous_offset) * u128::from(state);
+        state = state - completion_count + start_count;
+        previous_offset = offset;
+    }
+    busy_slot_micros += u128::from(1_000_000 - previous_offset) * u128::from(state);
+    let busy_slot_micros_u64 =
+        u64::try_from(busy_slot_micros).map_err(|_| CapacityModelError::StorageBound)?;
+    let window = ResourceWindow::new_with_starts(
+        Duration::from_micros(busy_slot_micros_u64).as_secs_f64(),
+        1.0_f64,
+        completed.iter().sum(),
+        started.iter().sum(),
+    )?;
+    let evidence = occupancy_trace_for_test(
+        window,
+        0,
+        state,
+        busy_slot_micros,
+        &offsets,
+        &completed,
+        &started,
+    );
+    let rates = array::from_fn(|busy| super::state_rate(&grid, 0, busy));
+    let (oracle, _, operation_count) = oracle_forward(&rates, 0, &offsets, &started);
+    let mut probabilities = [0.0_f64; 4];
+    let mut coefficients = [0.0_f64; 4];
+    let mut work = [0.0_f64; 4];
+    let actual = feasibility_probability(
+        &grid,
+        0,
+        evidence,
+        &mut probabilities,
+        &mut coefficients,
+        &mut work,
+    )
+    .ok_or(CapacityModelError::InvalidObservationContract)?;
+    let tolerance =
+        Duration::from_micros(operation_count).as_secs_f64() * 64_000_000.0_f64 * f64::EPSILON
+            + 1.0e-10_f64;
+    assert!((actual - oracle).abs() <= tolerance);
+    Ok(())
+}
+
+#[test]
+fn equal_and_mixed_rate_death_bands_match_the_erlang_limit() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.1_f64], &[1.0_f64], &[0.0_f64])?;
+    let expected = (-1.0_f64).exp();
+    let mut probabilities = [0.0_f64; 4];
+    let mut coefficients = [0.0_f64; 4];
+    let mut work = [0.0_f64; 4];
+    probabilities[3] = 1.0_f64;
+    pure_death_step(
+        &grid,
+        0,
+        DeathBand {
+            low: 1,
+            high: 3,
+            exposure_seconds: 1.0_f64,
+        },
+        &mut probabilities,
+        &mut coefficients,
+        &mut work,
+    )
+    .ok_or(CapacityModelError::InvalidObservationContract)?;
+    let tolerance = 256.0_f64 * f64::EPSILON;
+    assert!((probabilities[3] - expected).abs() <= tolerance);
+    assert!((probabilities[2] - expected).abs() <= tolerance);
+    assert!((probabilities[1] - expected * 0.5_f64).abs() <= tolerance);
+
+    probabilities.fill(0.0_f64);
+    probabilities[3] = 1.0_f64;
+    pure_death_step(
+        &grid,
+        0,
+        DeathBand {
+            low: 0,
+            high: 3,
+            exposure_seconds: 1.0_f64,
+        },
+        &mut probabilities,
+        &mut coefficients,
+        &mut work,
+    )
+    .ok_or(CapacityModelError::InvalidObservationContract)?;
+    let fallback_tolerance = 1.0e-10_f64 + 4_096.0_f64 * f64::EPSILON;
+    assert!((probabilities[3] - expected).abs() <= fallback_tolerance);
+    assert!((probabilities[2] - expected).abs() <= fallback_tolerance);
+    assert!((probabilities[1] - expected * 0.5_f64).abs() <= fallback_tolerance);
+    assert!((probabilities.iter().sum::<f64>() - 1.0_f64).abs() <= fallback_tolerance);
+    Ok(())
+}
+
+fn oracle_forward(
+    rates: &[f64; 4],
+    initial: usize,
+    offsets: &[u64],
+    starts: &[u32],
+) -> (f64, [f64; 4], u64) {
+    let mut probabilities = [0.0_f64; 4];
+    probabilities[initial] = 1.0_f64;
+    let mut previous_offset = 0_u64;
+    let mut operation_count = 0_u64;
+    for (&offset, &start_count) in offsets.iter().zip(starts) {
+        if start_count == 0 {
+            continue;
+        }
+        operation_count += oracle_death_step(
+            rates,
+            Duration::from_micros(offset - previous_offset).as_secs_f64(),
+            &mut probabilities,
+        );
+        for state in (0..probabilities.len()).rev() {
+            let shifted = state + start_count as usize;
+            if shifted < probabilities.len() {
+                probabilities[shifted] = probabilities[state];
+            }
+            probabilities[state] = 0.0_f64;
+        }
+        previous_offset = offset;
+    }
+    operation_count += oracle_death_step(
+        rates,
+        Duration::from_micros(1_000_000 - previous_offset).as_secs_f64(),
+        &mut probabilities,
+    );
+    (probabilities.iter().sum(), probabilities, operation_count)
+}
+
+fn oracle_death_step(rates: &[f64; 4], exposure_seconds: f64, probabilities: &mut [f64; 4]) -> u64 {
+    let rate = rates.iter().copied().fold(0.0_f64, f64::max);
+    if rate == 0.0_f64 || exposure_seconds == 0.0_f64 {
+        return 1;
+    }
+    let mean = rate * exposure_seconds;
+    let mut current = *probabilities;
+    let mut result = [0.0_f64; 4];
+    let mut poisson = (-mean).exp();
+    let mut cumulative = poisson;
+    for state in 0..4 {
+        result[state] = poisson * current[state];
+    }
+    let mut term = 0_u32;
+    while 1.0_f64 - cumulative > 1.0e-12_f64 {
+        let mut next = [0.0_f64; 4];
+        for state in 0..4 {
+            let death = rates[state] / rate;
+            next[state] += current[state] * (1.0_f64 - death);
+            if state > 0 {
+                next[state - 1] += current[state] * death;
+            }
+        }
+        current = next;
+        term += 1;
+        poisson *= mean / f64::from(term);
+        cumulative += poisson;
+        for state in 0..4 {
+            result[state] += poisson * current[state];
+        }
+    }
+    *probabilities = result;
+    u64::from(term).saturating_mul(16)
+}
+
+const ABLATION_ARM_COUNT: usize = 5;
+
+struct AblationScratch {
+    completion_coefficients: [f64; 3],
+    completion_convolution: [f64; 3],
+    completion_binomial: [f64; 3],
+    forward: [f64; 2],
+    forward_coefficients: [f64; 2],
+    forward_work: [f64; 2],
+}
+
+impl AblationScratch {
+    const fn new() -> Self {
+        Self {
+            completion_coefficients: [0.0_f64; 3],
+            completion_convolution: [0.0_f64; 3],
+            completion_binomial: [0.0_f64; 3],
+            forward: [0.0_f64; 2],
+            forward_coefficients: [0.0_f64; 2],
+            forward_work: [0.0_f64; 2],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AblationWindow<'a> {
+    window: &'a ResourceWindow,
+    evidence: OccupancyTraceEvidence<'a>,
+    busy_seconds: f64,
+    observed_completion: u32,
+    offset_micros: u64,
+}
+
+fn ablation_likelihoods(
+    grid: &CapacityGrid,
+    scratch: &mut AblationScratch,
+    cell_indexes: [usize; 2],
+    observation: AblationWindow<'_>,
+) -> Result<[[f64; 2]; ABLATION_ARM_COUNT], TestError> {
+    let history = [StartWindow {
+        exposure_seconds: 1.0_f64,
+        started_attempts: Some(1),
+    }];
+    let mut likelihoods = [[0.0_f64; 2]; ABLATION_ARM_COUNT];
+    for candidate in 0..2 {
+        let index = cell_indexes[candidate];
+        let landed = completion_log_likelihood(
+            grid,
+            index,
+            RetainedHistory {
+                windows: &history,
+                head: 0,
+                length: 1,
+            },
+            observation.window,
+            1.0_f64,
+            1.0_f64,
+            CompletionScratch {
+                coefficients: &mut scratch.completion_coefficients,
+                convolution: &mut scratch.completion_convolution,
+                binomial: &mut scratch.completion_binomial,
+            },
+        );
+        let rate = super::state_rate(grid, index, 1);
+        let old_kernel = deleted_poisson_log_kernel(
+            observation.busy_seconds,
+            deleted_in_flight_mean(1.0_f64, 1.0_f64 / rate),
+        );
+        let marginal = completion_marginal_probability(
+            grid,
+            index,
+            observation.evidence,
+            &mut scratch.forward,
+            &mut scratch.forward_coefficients,
+            &mut scratch.forward_work,
+        )
+        .ok_or(CapacityModelError::InvalidObservationContract)?
+        .ln();
+        let mut exposures = [0.0_f64; 2];
+        let mut completion_counts = [0_u32; 2];
+        fold_trace(observation.evidence, &mut exposures, &mut completion_counts);
+        let joint = path_log_score(grid, index, &exposures, &completion_counts);
+        let oracle = if observation.observed_completion == 0 {
+            -rate
+        } else {
+            rate.ln() - rate * Duration::from_micros(observation.offset_micros).as_secs_f64()
+        };
+        likelihoods[0][candidate] = landed;
+        likelihoods[1][candidate] = landed + old_kernel;
+        likelihoods[2][candidate] = marginal;
+        likelihoods[3][candidate] = joint;
+        likelihoods[4][candidate] = oracle;
+    }
+    Ok(likelihoods)
+}
+
+#[test]
+fn five_arm_double_counting_and_alternating_ablation_match_the_oracle() -> Result<(), TestError> {
+    const WINDOW_COUNT: u32 = 180;
+    let grid = CapacityGrid::new(&[0.25_f64, 1.0_f64], &[100.0_f64], &[0.0_f64])?;
+    let cell_indexes = [1_usize, 0_usize];
+    let mut weights = [[0.5_f64; 2]; ABLATION_ARM_COUNT];
+    let mut score = [0.0_f64; ABLATION_ARM_COUNT];
+    let mut entropy = [0.0_f64; ABLATION_ARM_COUNT];
+    let mut covered = [0_u32; ABLATION_ARM_COUNT];
+    let mut rank = [0.0_f64; ABLATION_ARM_COUNT];
+    let mut scratch = AblationScratch::new();
+    let mut legitimate_completion_gain = 0.0_f64;
+    let mut duplicated_inflation = 0.0_f64;
+    for window_index in 0..WINDOW_COUNT {
+        let generating_cell = (window_index % 2) as usize;
+        let rate = super::state_rate(&grid, cell_indexes[generating_cell], 1);
+        let stratum = f64::from((window_index * 73) % WINDOW_COUNT) + 0.5_f64;
+        let uniform = stratum / f64::from(WINDOW_COUNT);
+        let completion_time = -(-uniform).ln_1p() / rate;
+        let observed_completion = u32::from(completion_time < 1.0_f64);
+        let busy_seconds = completion_time.min(1.0_f64);
+        let window =
+            ResourceWindow::new_with_starts(busy_seconds, 1.0_f64, observed_completion, 0)?;
+        let offset = [(busy_seconds * 1_000_000.0_f64).round() as u64];
+        let completed = [1_u32];
+        let started = [0_u32];
+        let empty_offsets: [u64; 0] = [];
+        let empty_counts: [u32; 0] = [];
+        let evidence = if observed_completion == 0 {
+            occupancy_trace_for_test(
+                window,
+                1,
+                1,
+                1_000_000,
+                &empty_offsets,
+                &empty_counts,
+                &empty_counts,
+            )
+        } else {
+            occupancy_trace_for_test(
+                window,
+                1,
+                0,
+                u128::from(offset[0]),
+                &offset,
+                &completed,
+                &started,
+            )
+        };
+        let arm_likelihoods = ablation_likelihoods(
+            &grid,
+            &mut scratch,
+            cell_indexes,
+            AblationWindow {
+                window: &window,
+                evidence,
+                busy_seconds,
+                observed_completion,
+                offset_micros: offset[0],
+            },
+        )?;
+        let completion_predictive =
+            |arm: usize| log_weighted_sum(&weights[arm], &arm_likelihoods[2]);
+        legitimate_completion_gain += completion_predictive(4) - completion_predictive(2);
+        duplicated_inflation += completion_predictive(1) - completion_predictive(4);
+        for arm in 0..ABLATION_ARM_COUNT {
+            let predictive = log_weighted_sum(&weights[arm], &arm_likelihoods[arm]);
+            score[arm] += predictive;
+            for candidate in 0..2 {
+                weights[arm][candidate] *= (arm_likelihoods[arm][candidate] - predictive).exp();
+            }
+            let total = weights[arm].iter().sum::<f64>();
+            for weight in &mut weights[arm] {
+                *weight /= total;
+            }
+            entropy[arm] += weights[arm]
+                .iter()
+                .filter(|weight| **weight > 0.0_f64)
+                .map(|weight| -weight * weight.ln())
+                .sum::<f64>();
+            let generating_weight = weights[arm][generating_cell];
+            rank[arm] += f64::from(u8::from(
+                weights[arm][1 - generating_cell] > generating_weight,
+            ));
+            covered[arm] = covered[arm].saturating_add(u32::from(
+                generating_weight >= 0.05_f64 || weights[arm][1 - generating_cell] < 0.95_f64,
+            ));
+        }
+    }
+    let operation_bound = f64::from(WINDOW_COUNT) * 512.0_f64 * f64::EPSILON;
+    assert!((score[3] - score[4]).abs() <= operation_bound);
+    assert!((entropy[3] - entropy[4]).abs() <= operation_bound);
+    assert!((rank[3] - rank[4]).abs() <= operation_bound);
+    assert_eq!(covered[3], covered[4]);
+    assert!(covered[1] < covered[4]);
+    assert!(entropy[1] < entropy[4]);
+    assert!((legitimate_completion_gain - -2.543_012_689_671_795_3_f64).abs() <= operation_bound);
+    assert!((duplicated_inflation - 1.352_425_081_789_762_7_f64).abs() <= operation_bound);
+    Ok(())
+}
+
+#[test]
+fn time_rescaled_residuals_reject_tied_deterministic_completions() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &ArrivalPrior::test_artifact()?,
+        20.0_f64,
+        1.0_f64,
+        32,
+    )?;
+    let window = ResourceWindow::new_with_starts(20.0_f64, 1.0_f64, 20, 20)?;
+    let offsets = [500_000_u64];
+    let completed = [20_u32];
+    let started = [20_u32];
+    let evidence =
+        occupancy_trace_for_test(window, 20, 20, 20_000_000, &offsets, &completed, &started);
+    for _ in 0_u8..10 {
+        factor.update(evidence);
+    }
+    assert!(factor.markov_clock_rejected());
+    Ok(())
+}
+
+fn deleted_poisson_log_kernel(count: f64, mean: f64) -> f64 {
+    if mean > 0.0_f64 {
+        count * mean.ln() - mean
+    } else if count == 0.0_f64 {
+        0.0_f64
+    } else {
+        f64::NEG_INFINITY
+    }
+}
+
+fn deleted_in_flight_mean(exposure_seconds: f64, service_time_seconds: f64) -> f64 {
+    let age = exposure_seconds;
+    let rising_end = exposure_seconds.min(service_time_seconds);
+    let plateau_end = exposure_seconds.max(service_time_seconds);
+    let falling_end = exposure_seconds + service_time_seconds;
+    let integral = |value: f64| {
+        let rising = value.min(rising_end);
+        let plateau = (value.min(plateau_end) - rising_end).max(0.0_f64);
+        let falling = (value.min(falling_end) - plateau_end).max(0.0_f64);
+        rising * rising * 0.5_f64 + plateau * rising_end + falling * rising_end
+            - falling * falling * 0.5_f64
+    };
+    (integral(age + exposure_seconds) - integral(age)) / exposure_seconds
 }
 
 #[derive(Debug, Error)]

@@ -4,8 +4,8 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use prosody_scale_core::{
     ArrivalPrior, ArrivalPriorError, CapacityGrid, CapacityGridError, Cohort, Configuration,
     ConfigurationError, DemandClass, LaunchPrior, LeadTimePriorError, ModelTime, ObservationBuffer,
-    ObservationError, RebalancePrior, ReliabilityPrior, ResourceWindow, ScaleScratch, ScaleState,
-    ServiceObjective, step,
+    ObservationError, OccupancyTransition, RebalancePrior, ReliabilityPrior, ResourceWindow,
+    ScaleScratch, ScaleState, ServiceObjective, step,
 };
 use std::hint::black_box;
 use std::time::Instant;
@@ -55,6 +55,7 @@ fn benchmarks(criterion: &mut Criterion) {
     rayon_worker_step(criterion);
     capacity_grid(criterion);
     capacity_convolution(criterion);
+    capacity_rate_magnitude(criterion);
     resource_grid_step(criterion);
     posterior_sample_count_step(criterion);
 }
@@ -75,12 +76,16 @@ fn capacity_convolution(criterion: &mut Criterion) {
         return;
     };
     let mut now = 1_u64;
+    let transitions = constant_transitions(64);
     criterion.bench_function("capacity_convolution/64_starts", |bencher| {
         bencher.iter(|| {
             let Ok(window) = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 64, 64) else {
                 return;
             };
-            if observation.set_resource_window(window).is_err() {
+            if observation
+                .set_resource_observation(window, 1, 1, &transitions)
+                .is_err()
+            {
                 return;
             }
             let decision = step(
@@ -93,6 +98,49 @@ fn capacity_convolution(criterion: &mut Criterion) {
             black_box(decision);
         });
     });
+}
+
+fn capacity_rate_magnitude(criterion: &mut Criterion) {
+    let Ok(configuration) = configuration(SMALL) else {
+        return;
+    };
+    let mut group = criterion.benchmark_group("capacity_rate_magnitude");
+    for (name, service_time) in [("low", 10.0_f64), ("high", 0.001_f64)] {
+        let Ok(grid) = CapacityGrid::new(&[service_time], &[100.0_f64], &[0.0_f64]) else {
+            return;
+        };
+        let Ok(mut state) = ScaleState::new(configuration.clone(), grid) else {
+            return;
+        };
+        let (Ok(mut scratch), Ok(mut observation)) =
+            (state.new_scratch(), ObservationBuffer::new(&configuration))
+        else {
+            return;
+        };
+        let transitions = [OccupancyTransition::new(500_000, 1, 1)];
+        let mut now = 1_u64;
+        group.bench_function(name, |bencher| {
+            bencher.iter(|| {
+                let Ok(window) = ResourceWindow::new_with_starts(32.0_f64, 1.0_f64, 1, 1) else {
+                    return;
+                };
+                if observation
+                    .set_resource_observation(window, 32, 32, &transitions)
+                    .is_err()
+                {
+                    return;
+                }
+                black_box(step(
+                    &mut state,
+                    &mut scratch,
+                    observation.observation(),
+                    ModelTime::from_micros(now),
+                ));
+                now = now.wrapping_add(REPORT_INTERVAL_MICROS);
+            });
+        });
+    }
+    group.finish();
 }
 
 fn staggered_cohort_step(criterion: &mut Criterion) {
@@ -329,12 +377,17 @@ fn capacity_grid(criterion: &mut Criterion) {
             return;
         };
         let mut now = 1_u64;
+        let transitions = constant_transitions(4_000);
         group.bench_function(BenchmarkId::new("stable_update", name), |bencher| {
             bencher.iter(|| {
-                let Ok(window) = ResourceWindow::new(4.0_f64, 1.0_f64, 4_000) else {
+                let Ok(window) = ResourceWindow::new_with_starts(4.0_f64, 1.0_f64, 4_000, 4_000)
+                else {
                     return;
                 };
-                if observation.set_resource_window(window).is_err() {
+                if observation
+                    .set_resource_observation(window, 4, 4, &transitions)
+                    .is_err()
+                {
                     return;
                 }
                 let decision = step(
@@ -349,6 +402,18 @@ fn capacity_grid(criterion: &mut Criterion) {
         });
     }
     group.finish();
+}
+
+fn constant_transitions(count: u32) -> Vec<OccupancyTransition> {
+    (0..count)
+        .map(|index| {
+            OccupancyTransition::new(
+                u64::from(index + 1) * REPORT_INTERVAL_MICROS / u64::from(count + 1),
+                1,
+                1,
+            )
+        })
+        .collect()
 }
 
 fn configuration(case: BenchmarkCase) -> Result<Configuration, BenchmarkError> {

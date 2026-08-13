@@ -1,52 +1,71 @@
 use std::{f64::consts::E, mem::size_of, time::Duration};
 
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
-use statrs::{
-    distribution::{Beta, ContinuousCDF, Gamma, LogNormal},
-    function::gamma::ln_gamma,
-};
+use statrs::distribution::{Beta, ContinuousCDF, Gamma, LogNormal};
+#[cfg(test)]
+use statrs::function::gamma::ln_gamma;
 use thiserror::Error;
 
 use crate::arrival::ArrivalPrior;
 use crate::change_point::ChangePointKernel;
 use crate::types::prior_artifact_contract_holds;
-use crate::{PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord};
+use crate::{
+    OccupancyTraceEvidence, PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord,
+};
 
 const CAPACITY_MODEL_STORAGE_BYTES_MAX: usize = 512 * 1_024 * 1_024;
 const CAPACITY_MODEL_ARTIFACT_SOURCE: u64 = 0x4341_5041_4349_5459;
-const CAPACITY_MODEL_ARTIFACT_VERSION: u32 = 1;
+const CAPACITY_MODEL_ARTIFACT_VERSION: u32 = 2;
+const PATH_SOLVER_PROBABILITY_ERROR_MAX: f64 = 1.0e-10_f64;
+const START_HISTORY_SLOT_MAX: usize = 4_096;
+const REPORT_CLOCK_ERROR_SECONDS: f64 = 1.0e-6_f64;
+const RESIDUAL_BIN_COUNT: usize = 16;
+const RESIDUAL_BIN_COUNT_F64: f64 = 16.0_f64;
 const OBSERVATION_PROBABILITY_ERROR_MAX: f64 = 1.0_f64 / 16.0_f64;
 const HAZARD_TRANSITION_PROBABILITY_ERROR_MAX: f64 = 1.0_f64 / 8.0_f64;
 const OBSERVATION_COVERAGE_INDEX: usize = 0;
 const HAZARD_COVERAGE_INDEX: usize = 1;
+const SOLVER_COVERAGE_INDEX: usize = 2;
 const CAPACITY_MODEL_BUDGET: PriorArtifactBudget = PriorArtifactBudget::new(
     (CAPACITY_MODEL_STORAGE_BYTES_MAX / size_of::<f64>()) as u32,
     CAPACITY_MODEL_STORAGE_BYTES_MAX as u64,
-    (CAPACITY_MODEL_STORAGE_BYTES_MAX / size_of::<f64>()) as u64,
+    1_u64 << 56,
     1.0e-6_f64,
-    0.0_f64,
+    REPORT_CLOCK_ERROR_SECONDS,
     HAZARD_TRANSITION_PROBABILITY_ERROR_MAX,
 );
 
 /// Versioned prior and approximation limits for the capacity model.
 ///
-/// Version 1 is an authored weak-information artifact. It assigns one
+/// Version 2 uses the certified event-path sampling model. It assigns one
 /// affected window and nine clean windows to observation quality. It assigns
 /// equal prior odds to the bounded knee family and the no-knee family. Within
 /// the knee family, it assigns equal odds to no collapse and positive collapse.
 /// The quadratic collapse law represents pairwise contention after the knee.
 /// A labelled plant corpus can replace these judgments under a new version.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CapacityModelArtifact {
     identity: PriorArtifactIdentity,
     budget: PriorArtifactBudget,
-    coverage: [PriorCoverageRecord; 2],
+    coverage: Vec<PriorCoverageRecord>,
     hazard_mean_per_second: f64,
     hazard_shape: f64,
     observation_quality_alpha: f64,
     observation_quality_beta: f64,
     no_knee_probability: f64,
     no_collapse_probability: f64,
+    markov_clock_assumption: MarkovClockAssumption,
+    start_delay_evidence: StartDelayEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MarkovClockAssumption {
+    MemorylessAggregateCompletions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartDelayEvidence {
+    DiscardedByAcceptedStartConditioning,
 }
 
 /// One point on the passive throughput curve.
@@ -398,10 +417,10 @@ impl CapacityGrid {
 }
 
 /// One passive resource observation window.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResourceWindow {
     concurrency: f64,
-    exposure_seconds: f64,
+    exposure_micros: u64,
     completed_attempts: u32,
     started_attempts: Option<u32>,
 }
@@ -411,18 +430,34 @@ impl ResourceWindow {
     ///
     /// # Errors
     ///
-    /// Returns an error when concurrency or exposure is not positive and
-    /// finite.
+    /// Returns an error when concurrency is negative or not finite.
+    ///
+    /// Returns an error when exposure is not positive and finite.
     pub fn new(
         concurrency: f64,
         exposure_seconds: f64,
         completed_attempts: u32,
     ) -> Result<Self, ResourceWindowError> {
-        validate_positive(concurrency, "concurrency")?;
+        if !concurrency.is_finite() || concurrency < 0.0_f64 {
+            return Err(ResourceWindowError::InvalidValue {
+                name: "concurrency",
+                value: concurrency,
+            });
+        }
         validate_positive(exposure_seconds, "exposure_seconds")?;
+        let exposure = Duration::try_from_secs_f64(exposure_seconds)
+            .map_err(|_| ResourceWindowError::ClockResolution)?;
+        if exposure.subsec_nanos() % 1_000 != 0 {
+            return Err(ResourceWindowError::ClockResolution);
+        }
+        let exposure_micros = u64::try_from(exposure.as_micros())
+            .map_err(|_| ResourceWindowError::ClockResolution)?;
+        if exposure_micros == 0 {
+            return Err(ResourceWindowError::ClockResolution);
+        }
         Ok(Self {
             concurrency,
-            exposure_seconds,
+            exposure_micros,
             completed_attempts,
             started_attempts: None,
         })
@@ -432,8 +467,9 @@ impl ResourceWindow {
     ///
     /// # Errors
     ///
-    /// Returns an error when concurrency or exposure is not positive and
-    /// finite.
+    /// Returns an error when concurrency is negative or not finite.
+    ///
+    /// Returns an error when exposure is not positive and finite.
     pub fn new_with_starts(
         concurrency: f64,
         exposure_seconds: f64,
@@ -449,8 +485,12 @@ impl ResourceWindow {
         self.concurrency
     }
 
-    pub(crate) const fn exposure_seconds(&self) -> f64 {
-        self.exposure_seconds
+    pub(crate) fn exposure_seconds(&self) -> f64 {
+        Duration::from_micros(self.exposure_micros).as_secs_f64()
+    }
+
+    pub(crate) const fn exposure_micros(&self) -> u64 {
+        self.exposure_micros
     }
 
     pub(crate) const fn completed_attempts(&self) -> u32 {
@@ -475,6 +515,24 @@ struct RetainedHistory<'a> {
     length: usize,
 }
 
+#[derive(Clone, Copy)]
+struct DeathBand {
+    low: usize,
+    high: usize,
+    exposure_seconds: f64,
+}
+
+#[derive(Clone, Copy)]
+struct CapacityAllocation {
+    cell_count: usize,
+    state_count: usize,
+    filter_count: usize,
+    filter_curve_count: usize,
+    transition_count: usize,
+    start_history_capacity: usize,
+}
+
+#[cfg(test)]
 struct CompletionScratch<'a> {
     coefficients: &'a mut [f64],
     convolution: &'a mut [f64],
@@ -487,7 +545,6 @@ pub(crate) struct CapacityFactor {
     arrival_rate_seconds: f64,
     concurrency_max: f64,
     exposure_min_seconds: f64,
-    history_coverage_seconds: f64,
     prior_weights: Vec<f64>,
     weights: Vec<f64>,
     likelihoods: Vec<f64>,
@@ -500,9 +557,15 @@ pub(crate) struct CapacityFactor {
     start_history_head: usize,
     start_history_len: usize,
     predictive_start_history: Vec<StartWindow>,
-    coefficient_scratch: Vec<f64>,
-    convolution_scratch: Vec<f64>,
-    binomial_scratch: Vec<f64>,
+    state_exposure_seconds: Vec<f64>,
+    state_completion_counts: Vec<u32>,
+    forward_probabilities: Vec<f64>,
+    forward_coefficients: Vec<f64>,
+    forward_work: Vec<f64>,
+    residual_counts: [u32; RESIDUAL_BIN_COUNT],
+    residual_sample_count: u32,
+    residual_integrated_hazard: f64,
+    markov_clock_rejected: bool,
 }
 
 impl CapacityFactor {
@@ -514,30 +577,37 @@ impl CapacityFactor {
         exposure_min_seconds: f64,
         attempt_count_max: u32,
     ) -> Result<Self, CapacityModelError> {
-        if !concurrency_max.is_finite()
-            || concurrency_max <= 0.0_f64
-            || !exposure_min_seconds.is_finite()
-            || exposure_min_seconds <= 0.0_f64
-            || attempt_count_max == 0
-        {
-            return Err(CapacityModelError::InvalidObservationContract);
-        }
+        validate_capacity_observation_contract(
+            concurrency_max,
+            exposure_min_seconds,
+            attempt_count_max,
+        )?;
         let cell_count = grid.service_times_seconds.len();
+        let state_count = concurrency_max as usize + 1;
         let history_coverage_seconds = (0..cell_count)
             .map(|index| effective_service_time(&grid, index, concurrency_max))
             .fold(0.0_f64, f64::max);
         if !history_coverage_seconds.is_finite() {
             return Err(CapacityModelError::InvalidObservationContract);
         }
-        let history_count = (history_coverage_seconds / exposure_min_seconds).ceil();
-        if history_count > f64::from(u32::MAX - 1) {
-            return Err(CapacityModelError::StorageBound);
-        }
-        let start_history_capacity = history_count as u32 as usize + 1;
-        let artifact = capacity_model_artifact(change_rate_per_second, arrival_prior.shape())?;
-        let prior_weights = capacity_prior(&grid, artifact);
-        let (hazard_rates_per_second, hazard_weights) = hazard_prior(artifact)?;
-        let (contamination_probabilities, contamination_weights) = contamination_prior(artifact)?;
+        // The ring keeps exact start windows for completion-only
+        // prediction. Exposure older than the ring passes to the
+        // Gamma-Poisson prehistory marginal, so this bound changes report
+        // sharpness, never correctness. The trace likelihood reads the
+        // certified trace, not this ring. A deep-collapse tail cell can
+        // demand centuries of coverage at maximum concurrency; the clamp
+        // keeps such hypotheses affordable instead of rejecting the
+        // configuration.
+        let history_count = (history_coverage_seconds / exposure_min_seconds).ceil() as usize;
+        let start_history_capacity = history_count.saturating_add(1).min(START_HISTORY_SLOT_MAX);
+        let artifact = capacity_model_artifact(
+            change_rate_per_second,
+            arrival_prior.shape(),
+            concurrency_max as u32,
+        )?;
+        let prior_weights = capacity_prior(&grid, &artifact);
+        let (hazard_rates_per_second, hazard_weights) = hazard_prior(&artifact)?;
+        let (contamination_probabilities, contamination_weights) = contamination_prior(&artifact)?;
         let filter_count = hazard_weights
             .len()
             .checked_mul(contamination_weights.len())
@@ -545,32 +615,24 @@ impl CapacityFactor {
         let filter_curve_count = filter_count
             .checked_mul(cell_count)
             .ok_or(CapacityModelError::StorageBound)?;
-        let coefficient_count = usize::try_from(attempt_count_max)
+        let transition_count = usize::try_from(attempt_count_max)
             .map_err(|_| CapacityModelError::StorageBound)?
-            .checked_add(1)
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(1))
             .ok_or(CapacityModelError::StorageBound)?;
-        let storage_bytes = capacity_storage_bytes(
-            filter_curve_count,
-            cell_count,
-            filter_count,
-            coefficient_count,
-            start_history_capacity,
-        )?
-        .checked_add(
-            capacity_grid_storage_bytes(cell_count, grid.knee_cell_count as usize)
-                .ok_or(CapacityModelError::StorageBound)?,
-        )
-        .ok_or(CapacityModelError::StorageBound)?;
-        if !prior_artifact_contract_holds(
-            artifact.identity,
-            artifact.budget,
-            &artifact.coverage,
-            filter_curve_count,
-            storage_bytes,
-            u64::try_from(filter_curve_count).map_err(|_| CapacityModelError::StorageBound)?,
-        ) {
-            return Err(CapacityModelError::StorageBound);
-        }
+        validate_capacity_allocation(
+            &grid,
+            &artifact,
+            CapacityAllocation {
+                cell_count,
+                state_count,
+                filter_count,
+                filter_curve_count,
+                transition_count,
+                start_history_capacity,
+            },
+            attempt_count_max,
+        )?;
         let mut filter_weights = Vec::with_capacity(filter_count);
         let mut filter_curve_weights = Vec::with_capacity(filter_curve_count);
         for hazard_weight in hazard_weights {
@@ -585,7 +647,6 @@ impl CapacityFactor {
             arrival_rate_seconds: arrival_prior.rate_seconds(),
             concurrency_max,
             exposure_min_seconds,
-            history_coverage_seconds,
             weights: prior_weights.clone(),
             prior_weights,
             likelihoods: vec![0.0_f64; cell_count],
@@ -610,9 +671,15 @@ impl CapacityFactor {
                 };
                 start_history_capacity
             ],
-            coefficient_scratch: vec![0.0_f64; coefficient_count],
-            convolution_scratch: vec![0.0_f64; coefficient_count],
-            binomial_scratch: vec![0.0_f64; coefficient_count],
+            state_exposure_seconds: vec![0.0_f64; state_count],
+            state_completion_counts: vec![0; state_count],
+            forward_probabilities: vec![0.0_f64; state_count],
+            forward_coefficients: vec![0.0_f64; state_count],
+            forward_work: vec![0.0_f64; state_count],
+            residual_counts: [0; RESIDUAL_BIN_COUNT],
+            residual_sample_count: 0,
+            residual_integrated_hazard: 0.0_f64,
+            markov_clock_rejected: false,
         })
     }
 
@@ -735,62 +802,120 @@ impl CapacityFactor {
         self.mix_filters();
     }
 
-    /// Applies one contract-valid completion observation.
+    /// Applies one certified occupancy-trace observation.
     ///
-    /// The update costs `O(G H C² + G F)`. `G` is the curve count, `H` is
-    /// retained history, `C` is the completion bound, and `F` is filter count.
-    pub(crate) fn update(&mut self, window: &ResourceWindow) {
+    /// The update costs `O(G J C² + G F)`. `G` is the curve count, `J` is
+    /// the start-group count, `C` is the completion bound, and `F` is filter
+    /// count. An accepted window also enters the start-history ring that
+    /// feeds [`Self::write_completion_posterior`].
+    pub(crate) fn update(&mut self, evidence: OccupancyTraceEvidence<'_>) {
+        let window = evidence.window();
         debug_assert!(
-            window.concurrency <= self.concurrency_max,
+            evidence.mean_concurrency() <= self.concurrency_max,
             "the observation buffer enforces maximum resource concurrency"
         );
         debug_assert!(
-            window.exposure_seconds >= self.exposure_min_seconds,
+            window.exposure_seconds() >= self.exposure_min_seconds,
             "the observation buffer enforces minimum resource exposure"
         );
-        self.predictive_start_history
-            .copy_from_slice(&self.start_history);
-        let mut head = self.start_history_head;
-        let mut length = self.start_history_len;
-        record_start_window(
-            &mut self.predictive_start_history,
-            &mut head,
-            &mut length,
-            window,
+        fold_trace(
+            evidence,
+            &mut self.state_exposure_seconds,
+            &mut self.state_completion_counts,
         );
+        self.update_residual_check(evidence);
         for index in 0..self.likelihoods.len() {
-            self.likelihoods[index] = completion_log_likelihood(
+            let raw = path_log_score(
                 &self.grid,
                 index,
-                RetainedHistory {
-                    windows: &self.predictive_start_history,
-                    head,
-                    length,
-                },
-                window,
-                self.arrival_shape,
-                self.arrival_rate_seconds,
-                CompletionScratch {
-                    coefficients: &mut self.coefficient_scratch,
-                    convolution: &mut self.convolution_scratch,
-                    binomial: &mut self.binomial_scratch,
-                },
+                &self.state_exposure_seconds,
+                &self.state_completion_counts,
             );
+            let normalizer = feasibility_probability(
+                &self.grid,
+                index,
+                evidence,
+                &mut self.forward_probabilities,
+                &mut self.forward_coefficients,
+                &mut self.forward_work,
+            );
+            self.likelihoods[index] = normalizer
+                .filter(|value| *value > 0.0_f64)
+                .map_or(f64::NEG_INFINITY, |value| raw - value.ln());
         }
         let prior_predictive = log_weighted_sum(&self.prior_weights, &self.likelihoods);
-        if !prior_predictive.is_finite() || !self.update_filters(prior_predictive) {
+        if prior_predictive.is_finite() && self.update_filters(prior_predictive) {
+            record_start_window(
+                &mut self.start_history,
+                &mut self.start_history_head,
+                &mut self.start_history_len,
+                window,
+            );
+        }
+    }
+
+    pub(crate) fn omit_observation(&mut self) {
+        self.residual_integrated_hazard = 0.0_f64;
+    }
+
+    pub(crate) const fn markov_clock_rejected(&self) -> bool {
+        self.markov_clock_rejected
+    }
+
+    fn update_residual_check(&mut self, evidence: OccupancyTraceEvidence<'_>) {
+        let mut state = evidence.initial_busy_slots() as usize;
+        let mut previous_offset = 0_u64;
+        for ((&offset, &completed), &started) in evidence
+            .offsets_micros()
+            .iter()
+            .zip(evidence.completion_groups())
+            .zip(evidence.start_groups())
+        {
+            let exposure = Duration::from_micros(offset - previous_offset).as_secs_f64();
+            self.residual_integrated_hazard += exposure * self.posterior_state_rate(state);
+            for _ in 0..completed {
+                let uniform = 1.0_f64 - (-self.residual_integrated_hazard).exp();
+                let bin = ((uniform * RESIDUAL_BIN_COUNT_F64) as usize).min(RESIDUAL_BIN_COUNT - 1);
+                self.residual_counts[bin] = self.residual_counts[bin].saturating_add(1);
+                self.residual_sample_count = self.residual_sample_count.saturating_add(1);
+                self.residual_integrated_hazard = 0.0_f64;
+                state -= 1;
+            }
+            state += started as usize;
+            previous_offset = offset;
+        }
+        let tail = Duration::from_micros(evidence.window().exposure_micros() - previous_offset)
+            .as_secs_f64();
+        self.residual_integrated_hazard += tail * self.posterior_state_rate(state);
+        if self.residual_sample_count == 0 {
             return;
         }
-        self.start_history
-            .copy_from_slice(&self.predictive_start_history);
-        self.start_history_head = head;
-        self.start_history_len = length;
-        debug_assert!(
-            retained_prior_exposure(&self.start_history, head, length)
-                >= self.history_coverage_seconds
-                || length < self.start_history.len(),
-            "a full start ring must retain the maximum service delay"
-        );
+        let alpha = CAPACITY_MODEL_BUDGET.boundary_probability_max();
+        let sample_count = f64::from(self.residual_sample_count);
+        let dkw_bound = (-(alpha * 0.5_f64).ln() / (2.0_f64 * sample_count)).sqrt();
+        let lattice_bound = 1.0_f64 / RESIDUAL_BIN_COUNT_F64;
+        let mut cumulative = 0_u32;
+        let mut distance = 0.0_f64;
+        let mut expected = lattice_bound;
+        for (index, count) in self.residual_counts.iter().enumerate() {
+            cumulative = cumulative.saturating_add(*count);
+            let empirical = f64::from(cumulative) / sample_count;
+            distance = distance.max((empirical - expected).abs());
+            expected = if index + 1 == RESIDUAL_BIN_COUNT {
+                1.0_f64
+            } else {
+                expected + lattice_bound
+            };
+        }
+        self.markov_clock_rejected = distance > dkw_bound + lattice_bound;
+    }
+
+    fn posterior_state_rate(&self, state: usize) -> f64 {
+        self.weights
+            .iter()
+            .enumerate()
+            .map(|(index, weight)| weight * state_rate(&self.grid, index, state))
+            .sum()
     }
 
     pub(crate) fn expected_capacity(&self, simd_level: Level) -> f64 {
@@ -1058,7 +1183,7 @@ impl CapacityFactor {
     }
 }
 
-fn capacity_prior(grid: &CapacityGrid, artifact: CapacityModelArtifact) -> Vec<f64> {
+fn capacity_prior(grid: &CapacityGrid, artifact: &CapacityModelArtifact) -> Vec<f64> {
     let mut weights = match grid.prior {
         CapacityPrior::LogUniform => log_uniform_capacity_prior(grid, artifact),
         CapacityPrior::LogNormal {
@@ -1087,11 +1212,77 @@ fn capacity_prior(grid: &CapacityGrid, artifact: CapacityModelArtifact) -> Vec<f
     weights
 }
 
+fn validate_capacity_observation_contract(
+    concurrency_max: f64,
+    exposure_min_seconds: f64,
+    attempt_count_max: u32,
+) -> Result<(), CapacityModelError> {
+    if concurrency_max.is_finite()
+        && concurrency_max > 0.0_f64
+        && exposure_min_seconds.is_finite()
+        && exposure_min_seconds > 0.0_f64
+        && attempt_count_max > 0
+    {
+        Ok(())
+    } else {
+        Err(CapacityModelError::InvalidObservationContract)
+    }
+}
+
+fn validate_capacity_allocation(
+    grid: &CapacityGrid,
+    artifact: &CapacityModelArtifact,
+    allocation: CapacityAllocation,
+    attempt_count_max: u32,
+) -> Result<(), CapacityModelError> {
+    let storage_bytes = capacity_storage_bytes(
+        allocation.filter_curve_count,
+        allocation.cell_count,
+        allocation.filter_count,
+        allocation.state_count,
+        allocation.transition_count,
+        allocation.start_history_capacity,
+    )?
+    .checked_add(
+        capacity_grid_storage_bytes(allocation.cell_count, grid.knee_cell_count as usize)
+            .ok_or(CapacityModelError::StorageBound)?,
+    )
+    .ok_or(CapacityModelError::StorageBound)?;
+    let storage_bytes = artifact
+        .coverage
+        .len()
+        .checked_mul(size_of::<PriorCoverageRecord>())
+        .and_then(|coverage_bytes| storage_bytes.checked_add(coverage_bytes))
+        .ok_or(CapacityModelError::StorageBound)?;
+    let band_count = allocation.state_count.min(allocation.transition_count);
+    let cells =
+        u64::try_from(allocation.cell_count).map_err(|_| CapacityModelError::StorageBound)?;
+    let bands = u64::try_from(band_count).map_err(|_| CapacityModelError::StorageBound)?;
+    let update_operation_count = u64::from(attempt_count_max)
+        .checked_mul(bands)
+        .and_then(|value| value.checked_mul(bands))
+        .and_then(|value| value.checked_mul(cells))
+        .ok_or(CapacityModelError::StorageBound)?;
+    if prior_artifact_contract_holds(
+        artifact.identity,
+        artifact.budget,
+        &artifact.coverage,
+        allocation.filter_curve_count,
+        storage_bytes,
+        update_operation_count,
+    ) {
+        Ok(())
+    } else {
+        Err(CapacityModelError::StorageBound)
+    }
+}
+
 fn capacity_storage_bytes(
     filter_curve_count: usize,
     cell_count: usize,
     filter_count: usize,
-    coefficient_count: usize,
+    state_count: usize,
+    transition_count: usize,
     start_history_capacity: usize,
 ) -> Result<usize, CapacityModelError> {
     filter_curve_count
@@ -1105,12 +1296,17 @@ fn capacity_storage_bytes(
                 .checked_mul(2)
                 .and_then(|filter_bytes| count.checked_add(filter_bytes))
         })
-        .and_then(|count| {
-            coefficient_count
-                .checked_mul(3)
-                .and_then(|scratch_bytes| count.checked_add(scratch_bytes))
-        })
         .and_then(|count| count.checked_mul(size_of::<f64>()))
+        .and_then(|bytes| {
+            state_count
+                .checked_mul(4 * size_of::<f64>() + size_of::<u32>())
+                .and_then(|state_bytes| bytes.checked_add(state_bytes))
+        })
+        .and_then(|bytes| {
+            transition_count
+                .checked_mul(size_of::<u64>() + 2 * size_of::<u32>())
+                .and_then(|transition_bytes| bytes.checked_add(transition_bytes))
+        })
         .and_then(|bytes| {
             start_history_capacity
                 .checked_mul(2)
@@ -1138,6 +1334,7 @@ fn capacity_grid_storage_bytes(cell_count: usize, knee_cell_count: usize) -> Opt
 fn capacity_model_artifact(
     mean_per_second: f64,
     shape: f64,
+    busy_slot_max: u32,
 ) -> Result<CapacityModelArtifact, CapacityModelError> {
     if !mean_per_second.is_finite()
         || mean_per_second <= 0.0_f64
@@ -1158,35 +1355,55 @@ fn capacity_model_artifact(
     let lower_tail = distribution.cdf(low);
     let upper_tail = 1.0_f64 - distribution.cdf(high);
     let random_stream = mean_per_second.to_bits() ^ shape.to_bits().rotate_left(32) | 1;
+    let mut coverage = Vec::with_capacity(busy_slot_max as usize + 4);
+    coverage.extend([
+        PriorCoverageRecord::new(
+            0.0_f64,
+            1.0_f64,
+            0.0_f64,
+            0.0_f64,
+            OBSERVATION_PROBABILITY_ERROR_MAX,
+        ),
+        PriorCoverageRecord::new(
+            low,
+            high,
+            lower_tail,
+            upper_tail,
+            HAZARD_TRANSITION_PROBABILITY_ERROR_MAX,
+        ),
+        PriorCoverageRecord::new(
+            0.0_f64,
+            1.0_f64,
+            0.0_f64,
+            PATH_SOLVER_PROBABILITY_ERROR_MAX,
+            PATH_SOLVER_PROBABILITY_ERROR_MAX,
+        ),
+    ]);
+    for state in 0..=busy_slot_max {
+        coverage.push(PriorCoverageRecord::new(
+            f64::from(state),
+            f64::from(state) + 1.0_f64,
+            0.0_f64,
+            0.0_f64,
+            0.0_f64,
+        ));
+    }
     let artifact = CapacityModelArtifact {
         identity: PriorArtifactIdentity::new(
             CAPACITY_MODEL_ARTIFACT_SOURCE,
             CAPACITY_MODEL_ARTIFACT_VERSION,
-            random_stream,
+            random_stream ^ 0x5736_4556_454e_5453,
         ),
         budget: CAPACITY_MODEL_BUDGET,
-        coverage: [
-            PriorCoverageRecord::new(
-                0.0_f64,
-                1.0_f64,
-                0.0_f64,
-                0.0_f64,
-                OBSERVATION_PROBABILITY_ERROR_MAX,
-            ),
-            PriorCoverageRecord::new(
-                low,
-                high,
-                lower_tail,
-                upper_tail,
-                HAZARD_TRANSITION_PROBABILITY_ERROR_MAX,
-            ),
-        ],
+        coverage,
         hazard_mean_per_second: mean_per_second,
         hazard_shape: shape,
         observation_quality_alpha: 1.0_f64,
         observation_quality_beta: 9.0_f64,
         no_knee_probability: 0.5_f64,
         no_collapse_probability: 0.5_f64,
+        markov_clock_assumption: MarkovClockAssumption::MemorylessAggregateCompletions,
+        start_delay_evidence: StartDelayEvidence::DiscardedByAcceptedStartConditioning,
     };
     if !prior_artifact_contract_holds(
         artifact.identity,
@@ -1198,11 +1415,19 @@ fn capacity_model_artifact(
     ) {
         return Err(CapacityModelError::InvalidHazardPrior);
     }
+    if artifact.coverage[SOLVER_COVERAGE_INDEX].tail_probability()
+        > PATH_SOLVER_PROBABILITY_ERROR_MAX
+        || artifact.budget.path_time_error_seconds() != REPORT_CLOCK_ERROR_SECONDS
+        || artifact.markov_clock_assumption != MarkovClockAssumption::MemorylessAggregateCompletions
+        || artifact.start_delay_evidence != StartDelayEvidence::DiscardedByAcceptedStartConditioning
+    {
+        return Err(CapacityModelError::InvalidObservationContract);
+    }
     Ok(artifact)
 }
 
 fn hazard_prior(
-    artifact: CapacityModelArtifact,
+    artifact: &CapacityModelArtifact,
 ) -> Result<(Vec<f64>, Vec<f64>), CapacityModelError> {
     let distribution = Gamma::new(
         artifact.hazard_shape,
@@ -1258,7 +1483,7 @@ fn hazard_prior(
 }
 
 fn contamination_prior(
-    artifact: CapacityModelArtifact,
+    artifact: &CapacityModelArtifact,
 ) -> Result<(Vec<f64>, Vec<f64>), CapacityModelError> {
     let distribution = Beta::new(
         artifact.observation_quality_alpha,
@@ -1311,20 +1536,11 @@ fn record_start_window(
     window: &ResourceWindow,
 ) {
     history[*head] = StartWindow {
-        exposure_seconds: window.exposure_seconds,
+        exposure_seconds: window.exposure_seconds(),
         started_attempts: window.started_attempts,
     };
     *head = (*head + 1) % history.len();
     *length = (*length + 1).min(history.len());
-}
-
-fn retained_prior_exposure(history: &[StartWindow], head: usize, length: usize) -> f64 {
-    (1..length)
-        .map(|offset| {
-            let index = (head + history.len() - 1 - offset) % history.len();
-            history[index].exposure_seconds
-        })
-        .sum()
 }
 
 fn effective_service_time(grid: &CapacityGrid, index: usize, concurrency: f64) -> f64 {
@@ -1338,6 +1554,360 @@ fn effective_service_time(grid: &CapacityGrid, index: usize, concurrency: f64) -
         )
 }
 
+fn state_rate(grid: &CapacityGrid, index: usize, state: usize) -> f64 {
+    let state = u32::try_from(state).map_or(f64::from(u32::MAX), f64::from);
+    throughput(
+        grid.service_times_seconds[index],
+        grid.capacities_per_second[index],
+        grid.collapse_values[index],
+        grid.no_knee[index] > 0.0_f64,
+        state,
+    )
+}
+
+fn fold_trace(
+    evidence: OccupancyTraceEvidence<'_>,
+    exposure_seconds: &mut [f64],
+    completion_counts: &mut [u32],
+) {
+    exposure_seconds.fill(0.0_f64);
+    completion_counts.fill(0);
+    let mut state = evidence.initial_busy_slots() as usize;
+    let mut previous_offset = 0_u64;
+    for ((&offset, &completed), &started) in evidence
+        .offsets_micros()
+        .iter()
+        .zip(evidence.completion_groups())
+        .zip(evidence.start_groups())
+    {
+        exposure_seconds[state] += Duration::from_micros(offset - previous_offset).as_secs_f64();
+        for _ in 0..completed {
+            completion_counts[state] = completion_counts[state].saturating_add(1);
+            state -= 1;
+        }
+        state += started as usize;
+        previous_offset = offset;
+    }
+    exposure_seconds[state] +=
+        Duration::from_micros(evidence.window().exposure_micros() - previous_offset).as_secs_f64();
+}
+
+fn path_log_score(
+    grid: &CapacityGrid,
+    index: usize,
+    exposure_seconds: &[f64],
+    completion_counts: &[u32],
+) -> f64 {
+    let mut score = 0.0_f64;
+    for state in 1..exposure_seconds.len() {
+        let rate = state_rate(grid, index, state);
+        score -= exposure_seconds[state] * rate;
+        if completion_counts[state] > 0 {
+            if rate <= 0.0_f64 {
+                return f64::NEG_INFINITY;
+            }
+            score += f64::from(completion_counts[state]) * rate.ln();
+        }
+    }
+    score
+}
+
+fn feasibility_probability(
+    grid: &CapacityGrid,
+    index: usize,
+    evidence: OccupancyTraceEvidence<'_>,
+    probabilities: &mut [f64],
+    coefficients: &mut [f64],
+    work: &mut [f64],
+) -> Option<f64> {
+    let c_max = probabilities.len() - 1;
+    let total_starts = evidence.window().started_attempts()? as usize;
+    let initial = evidence.initial_busy_slots() as usize;
+    if initial
+        .checked_add(total_starts)
+        .is_some_and(|value| value <= c_max)
+    {
+        return Some(1.0_f64);
+    }
+    probabilities.fill(0.0_f64);
+    probabilities[initial] = 1.0_f64;
+    let mut safe_mass = 0.0_f64;
+    let mut remaining_starts = total_starts;
+    let mut low = if remaining_starts > c_max {
+        0
+    } else {
+        c_max - remaining_starts + 1
+    };
+    let mut high = initial;
+    let mut previous_offset = 0_u64;
+    for (&offset, &starts) in evidence
+        .offsets_micros()
+        .iter()
+        .zip(evidence.start_groups())
+    {
+        if starts == 0 {
+            continue;
+        }
+        let band_mass = probabilities[low..=high].iter().sum::<f64>();
+        pure_death_step(
+            grid,
+            index,
+            DeathBand {
+                low,
+                high,
+                exposure_seconds: Duration::from_micros(offset - previous_offset).as_secs_f64(),
+            },
+            probabilities,
+            coefficients,
+            work,
+        )?;
+        safe_mass += band_mass - probabilities[low..=high].iter().sum::<f64>();
+        let starts = starts as usize;
+        for state in (low..=high).rev() {
+            let shifted = state.saturating_add(starts);
+            if shifted <= c_max {
+                probabilities[shifted] = probabilities[state];
+            }
+            probabilities[state] = 0.0_f64;
+        }
+        high = high.saturating_add(starts).min(c_max);
+        remaining_starts = remaining_starts.saturating_sub(starts);
+        if remaining_starts <= c_max {
+            let safe_high = c_max - remaining_starts;
+            for probability in &mut probabilities[..=safe_high.min(high)] {
+                safe_mass += *probability;
+                *probability = 0.0_f64;
+            }
+            low = safe_high + 1;
+        } else {
+            low = 0;
+        }
+        previous_offset = offset;
+        if low > high {
+            return Some(safe_mass.min(1.0_f64));
+        }
+    }
+    Some((safe_mass + probabilities[low..=high].iter().sum::<f64>()).clamp(0.0_f64, 1.0_f64))
+}
+
+#[cfg(test)]
+fn completion_marginal_probability(
+    grid: &CapacityGrid,
+    index: usize,
+    evidence: OccupancyTraceEvidence<'_>,
+    probabilities: &mut [f64],
+    coefficients: &mut [f64],
+    work: &mut [f64],
+) -> Option<f64> {
+    let normalizer =
+        feasibility_probability(grid, index, evidence, probabilities, coefficients, work)?;
+    if normalizer <= 0.0_f64 {
+        return None;
+    }
+    let final_state = evidence.final_busy_slots() as usize;
+    let mut remaining_starts = evidence.window().started_attempts()? as usize;
+    let mut low = final_state.saturating_sub(remaining_starts);
+    let mut high = evidence.initial_busy_slots() as usize;
+    probabilities.fill(0.0_f64);
+    probabilities[high] = 1.0_f64;
+    let mut previous_offset = 0_u64;
+    for (&offset, &starts) in evidence
+        .offsets_micros()
+        .iter()
+        .zip(evidence.start_groups())
+    {
+        if starts == 0 {
+            continue;
+        }
+        pure_death_step(
+            grid,
+            index,
+            DeathBand {
+                low,
+                high,
+                exposure_seconds: Duration::from_micros(offset - previous_offset).as_secs_f64(),
+            },
+            probabilities,
+            coefficients,
+            work,
+        )?;
+        let starts = starts as usize;
+        for state in (low..=high).rev() {
+            let shifted = state.saturating_add(starts);
+            if shifted < probabilities.len() {
+                probabilities[shifted] = probabilities[state];
+            }
+            probabilities[state] = 0.0_f64;
+        }
+        high = high.saturating_add(starts).min(probabilities.len() - 1);
+        remaining_starts = remaining_starts.saturating_sub(starts);
+        low = final_state.saturating_sub(remaining_starts);
+        probabilities[..low].fill(0.0_f64);
+        previous_offset = offset;
+    }
+    pure_death_step(
+        grid,
+        index,
+        DeathBand {
+            low: final_state,
+            high,
+            exposure_seconds: Duration::from_micros(
+                evidence.window().exposure_micros() - previous_offset,
+            )
+            .as_secs_f64(),
+        },
+        probabilities,
+        coefficients,
+        work,
+    )?;
+    Some((probabilities[final_state] / normalizer).clamp(0.0_f64, 1.0_f64))
+}
+
+/// Evolves one reachable pure-death band without rate-dependent work.
+///
+/// Distinct rates use the triangular closed form. Equal-rate bands use its
+/// Erlang limit. A mixed near-equal band uses uniformization. Its Poisson tail
+/// stops only after the artifact's omitted-probability bound holds.
+fn pure_death_step(
+    grid: &CapacityGrid,
+    index: usize,
+    band: DeathBand,
+    probabilities: &mut [f64],
+    coefficients: &mut [f64],
+    work: &mut [f64],
+) -> Option<()> {
+    let DeathBand {
+        low,
+        high,
+        exposure_seconds,
+    } = band;
+    if exposure_seconds == 0.0_f64 || low > high {
+        return Some(());
+    }
+    let first_rate = state_rate(grid, index, low);
+    let mut all_equal = true;
+    let mut all_distinct = true;
+    for left in low..=high {
+        let left_rate = state_rate(grid, index, left);
+        all_equal &= left_rate.to_bits() == first_rate.to_bits();
+        for right in left + 1..=high {
+            let right_rate = state_rate(grid, index, right);
+            let separation = (left_rate - right_rate).abs();
+            let scale = left_rate.abs().max(right_rate.abs()).max(1.0_f64);
+            all_distinct &= separation > 64.0_f64 * f64::EPSILON * scale;
+        }
+    }
+    if all_equal {
+        return equal_rate_death_step(first_rate, low, high, exposure_seconds, probabilities, work);
+    }
+    if !all_distinct {
+        return uniformized_death_step(grid, index, band, probabilities, coefficients, work);
+    }
+    coefficients[low..=high].fill(0.0_f64);
+    for state in (low..=high).rev() {
+        if state == high {
+            coefficients[state] = probabilities[state];
+        } else {
+            let feed_rate = state_rate(grid, index, state + 1);
+            let current_rate = state_rate(grid, index, state);
+            let mut sum = 0.0_f64;
+            for (offset, coefficient) in coefficients[state + 1..=high].iter_mut().enumerate() {
+                let source = state + 1 + offset;
+                *coefficient *= feed_rate / (current_rate - state_rate(grid, index, source));
+                sum += *coefficient;
+            }
+            coefficients[state] = probabilities[state] - sum;
+        }
+        probabilities[state] = (state..=high)
+            .map(|source| {
+                coefficients[source] * (-state_rate(grid, index, source) * exposure_seconds).exp()
+            })
+            .sum::<f64>()
+            .max(0.0_f64);
+    }
+    Some(())
+}
+
+fn equal_rate_death_step(
+    rate: f64,
+    low: usize,
+    high: usize,
+    exposure_seconds: f64,
+    probabilities: &mut [f64],
+    work: &mut [f64],
+) -> Option<()> {
+    work[low..=high].fill(0.0_f64);
+    let mean = rate * exposure_seconds;
+    let zero_deaths = (-mean).exp();
+    for source in low..=high {
+        let mut probability = zero_deaths;
+        for deaths in 0..=source - low {
+            work[source - deaths] += probabilities[source] * probability;
+            let Ok(divisor) = u32::try_from(deaths + 1) else {
+                return None;
+            };
+            probability *= mean / f64::from(divisor);
+        }
+    }
+    probabilities[low..=high].copy_from_slice(&work[low..=high]);
+    Some(())
+}
+
+fn uniformized_death_step(
+    grid: &CapacityGrid,
+    index: usize,
+    band: DeathBand,
+    probabilities: &mut [f64],
+    current: &mut [f64],
+    next: &mut [f64],
+) -> Option<()> {
+    let DeathBand {
+        low,
+        high,
+        exposure_seconds,
+    } = band;
+    let rate = (low..=high)
+        .map(|state| state_rate(grid, index, state))
+        .fold(0.0_f64, f64::max);
+    if rate == 0.0_f64 {
+        return Some(());
+    }
+    let mean_limit = -PATH_SOLVER_PROBABILITY_ERROR_MAX.ln();
+    let step_count = (rate * exposure_seconds / mean_limit).ceil().max(1.0_f64) as u64;
+    let step_count_f64 = Duration::from_secs(step_count).as_secs_f64();
+    let step_seconds = exposure_seconds / step_count_f64;
+    let tail_bound = PATH_SOLVER_PROBABILITY_ERROR_MAX / step_count_f64;
+    for _ in 0..step_count {
+        current[low..=high].copy_from_slice(&probabilities[low..=high]);
+        probabilities[low..=high].fill(0.0_f64);
+        let mean = rate * step_seconds;
+        let mut poisson = (-mean).exp();
+        let mut cumulative = poisson;
+        for state in low..=high {
+            probabilities[state] += poisson * current[state];
+        }
+        let mut term = 0_u32;
+        while 1.0_f64 - cumulative > tail_bound {
+            next[low..=high].fill(0.0_f64);
+            for state in low..=high {
+                let death = state_rate(grid, index, state) / rate;
+                next[state] += current[state] * (1.0_f64 - death);
+                if state > low {
+                    next[state - 1] += current[state] * death;
+                }
+            }
+            current[low..=high].copy_from_slice(&next[low..=high]);
+            term = term.checked_add(1)?;
+            poisson *= mean / f64::from(term);
+            cumulative += poisson;
+            for state in low..=high {
+                probabilities[state] += poisson * current[state];
+            }
+        }
+    }
+    Some(())
+}
+
 fn completion_expectation(
     grid: &CapacityGrid,
     index: usize,
@@ -1347,7 +1917,7 @@ fn completion_expectation(
     arrival_rate_seconds: f64,
 ) -> f64 {
     let delay = effective_service_time(grid, index, window.concurrency);
-    let target_end = delay + window.exposure_seconds;
+    let target_end = delay + window.exposure_seconds();
     let mut age = 0.0_f64;
     let mut known_mean = 0.0_f64;
     let mut known_overlap = 0.0_f64;
@@ -1366,10 +1936,11 @@ fn completion_expectation(
         }
         age = window_end;
     }
-    let missing = (window.exposure_seconds - known_overlap).max(0.0_f64);
+    let missing = (window.exposure_seconds() - known_overlap).max(0.0_f64);
     known_mean + posterior_shape / posterior_rate * missing
 }
 
+#[cfg(test)]
 fn completion_log_likelihood(
     grid: &CapacityGrid,
     index: usize,
@@ -1389,7 +1960,7 @@ fn completion_log_likelihood(
         return f64::NEG_INFINITY;
     }
     let delay = effective_service_time(grid, index, window.concurrency);
-    let target_end = delay + window.exposure_seconds;
+    let target_end = delay + window.exposure_seconds();
     let mut age = 0.0_f64;
     let mut known_overlap = 0.0_f64;
     let mut posterior_shape = arrival_shape;
@@ -1462,7 +2033,7 @@ fn completion_log_likelihood(
         }
         age = window_end;
     }
-    let missing = (window.exposure_seconds - known_overlap).max(0.0_f64);
+    let missing = (window.exposure_seconds() - known_overlap).max(0.0_f64);
     completion_probability_from_coefficients(
         coefficients,
         degree,
@@ -1474,6 +2045,7 @@ fn completion_log_likelihood(
     )
 }
 
+#[cfg(test)]
 fn completion_probability_from_coefficients(
     coefficients: &[f64],
     degree: usize,
@@ -1506,6 +2078,7 @@ fn completion_probability_from_coefficients(
     likelihood
 }
 
+#[cfg(test)]
 fn binomial_log_probability(trials: u32, count: usize, probability: f64) -> f64 {
     let trials = f64::from(trials);
     let count = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
@@ -1514,6 +2087,7 @@ fn binomial_log_probability(trials: u32, count: usize, probability: f64) -> f64 
         + (trials - count) * (-probability).ln_1p()
 }
 
+#[cfg(test)]
 fn negative_binomial_log_probability(shape: f64, success: f64, count: usize) -> f64 {
     let count = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
     ln_gamma(count + shape) - ln_gamma(shape) - ln_gamma(count + 1.0_f64)
@@ -1551,7 +2125,7 @@ fn log_add_exp(left: f64, right: f64) -> f64 {
     }
 }
 
-fn log_uniform_capacity_prior(grid: &CapacityGrid, artifact: CapacityModelArtifact) -> Vec<f64> {
+fn log_uniform_capacity_prior(grid: &CapacityGrid, artifact: &CapacityModelArtifact) -> Vec<f64> {
     let service_count = grid.service_time_count as usize;
     let capacity_count = grid.capacity_count as usize;
     let collapse_count = grid.collapse_count as usize;
@@ -1587,7 +2161,7 @@ fn log_normal_capacity_prior(
     service_median: f64,
     capacity_median: f64,
     log_standard_deviation: f64,
-    artifact: CapacityModelArtifact,
+    artifact: &CapacityModelArtifact,
 ) -> Vec<f64> {
     let service_count = grid.service_time_count as usize;
     let capacity_count = grid.capacity_count as usize;
@@ -1716,7 +2290,7 @@ fn linear_axis_bounds(values: &[f64]) -> Vec<(f64, f64)> {
         .collect()
 }
 
-fn collapse_mass(values: &[f64], index: usize, artifact: CapacityModelArtifact) -> f64 {
+fn collapse_mass(values: &[f64], index: usize, artifact: &CapacityModelArtifact) -> f64 {
     if values.len() == 1 {
         return 1.0_f64;
     }
@@ -1946,14 +2520,17 @@ pub enum CapacityModelError {
 /// Invalid passive resource window.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum ResourceWindowError {
-    /// A required value is not positive and finite.
-    #[error("{name} value {value} must be positive and finite")]
+    /// A required value is outside its finite range.
+    #[error("{name} value {value} is outside its finite range")]
     InvalidValue {
         /// Name of the invalid field.
         name: &'static str,
         /// Invalid field value.
         value: f64,
     },
+    /// Exposure does not resolve to the certified microsecond clock.
+    #[error("resource exposure must resolve to whole microseconds")]
+    ClockResolution,
 }
 
 #[cfg(test)]

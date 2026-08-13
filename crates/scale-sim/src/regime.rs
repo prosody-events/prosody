@@ -1588,7 +1588,12 @@ fn principal_graph(
             .schedule
             .workload_interval_micros
             .min(definition.schedule.followup_interval_micros),
-        resource_window_attempt_count_max: 100_000,
+        // The plant can retry every event, so one report window can carry
+        // every attempt the run can produce. The certified bound comes from
+        // that plant contract, never from an authored guess.
+        resource_window_attempt_count_max: definition
+            .event_count_max
+            .saturating_mul(u32::from(crate::MAX_RETRY_FAILURES) + 1),
         failure_service_weight: DEFAULT_FAILURE_WEIGHT,
         arrival_prior: prosody_scale_core::ArrivalPrior::new(
             4.0_f64,

@@ -1197,12 +1197,147 @@ pub struct GroupObservation<'a> {
     pub(crate) calendar: Option<CalendarForecast<'a>>,
     pub(crate) scheduled_releases: &'a [ScheduledRelease],
     pub(crate) partition_arrivals: Option<PartitionArrivalEvidence<'a>>,
-    pub(crate) resource_window: Option<ResourceWindow>,
+    pub(crate) resource: Option<OccupancyTraceEvidence<'a>>,
     pub(crate) attempt_outcomes: Option<AttemptOutcomeEvidence>,
     pub(crate) launch: Option<LaunchEvidence<'a>>,
     pub(crate) rebalance: Option<RebalanceEvidence>,
     pub(crate) current_replicas: Option<u32>,
     pub(crate) actuation_commitments: &'a ActuationCommitments,
+}
+
+/// One grouped busy-slot transition on the report clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OccupancyTransition {
+    offset_micros: u64,
+    completed_attempts: u32,
+    started_attempts: u32,
+}
+
+impl OccupancyTransition {
+    /// Constructs one ordered transition group.
+    #[must_use]
+    pub const fn new(offset_micros: u64, completed_attempts: u32, started_attempts: u32) -> Self {
+        Self {
+            offset_micros,
+            completed_attempts,
+            started_attempts,
+        }
+    }
+
+    /// Returns the offset from the report start.
+    #[must_use]
+    pub const fn offset_micros(self) -> u64 {
+        self.offset_micros
+    }
+
+    /// Returns completions at this clock tick.
+    #[must_use]
+    pub const fn completed_attempts(self) -> u32 {
+        self.completed_attempts
+    }
+
+    /// Returns starts at this clock tick.
+    #[must_use]
+    pub const fn started_attempts(self) -> u32 {
+        self.started_attempts
+    }
+}
+
+/// A certified busy-slot path for one resource report.
+///
+/// The observation buffer constructs this view only after it proves the
+/// report counts, state bounds, event order, final state, and occupancy sum.
+#[derive(Clone, Copy, Debug)]
+pub struct OccupancyTraceEvidence<'a> {
+    window: ResourceWindow,
+    initial_busy_slots: u32,
+    final_busy_slots: u32,
+    busy_slot_micros: u128,
+    mean_concurrency: f64,
+    offsets_micros: &'a [u64],
+    completed_attempts: &'a [u32],
+    started_attempts: &'a [u32],
+}
+
+impl OccupancyTraceEvidence<'_> {
+    /// Returns the checked report summary.
+    #[must_use]
+    pub const fn window(&self) -> &ResourceWindow {
+        &self.window
+    }
+
+    /// Returns the busy-slot count at the report start.
+    #[must_use]
+    pub const fn initial_busy_slots(&self) -> u32 {
+        self.initial_busy_slots
+    }
+
+    /// Returns the busy-slot count at the report end.
+    #[must_use]
+    pub const fn final_busy_slots(&self) -> u32 {
+        self.final_busy_slots
+    }
+
+    /// Returns the event-time busy-slot integral in microseconds.
+    #[must_use]
+    pub const fn busy_slot_micros(&self) -> u128 {
+        self.busy_slot_micros
+    }
+
+    /// Returns mean busy slots over the complete report.
+    #[must_use]
+    pub const fn mean_concurrency(&self) -> f64 {
+        self.mean_concurrency
+    }
+
+    /// Returns the number of grouped transitions.
+    #[must_use]
+    pub const fn transition_count(&self) -> usize {
+        self.offsets_micros.len()
+    }
+
+    pub(crate) const fn offsets_micros(&self) -> &[u64] {
+        self.offsets_micros
+    }
+
+    pub(crate) const fn completion_groups(&self) -> &[u32] {
+        self.completed_attempts
+    }
+
+    pub(crate) const fn start_groups(&self) -> &[u32] {
+        self.started_attempts
+    }
+}
+
+#[cfg(test)]
+pub(crate) const fn occupancy_trace_for_test<'a>(
+    window: ResourceWindow,
+    initial_busy_slots: u32,
+    final_busy_slots: u32,
+    busy_slot_micros: u128,
+    offsets_micros: &'a [u64],
+    completed_attempts: &'a [u32],
+    started_attempts: &'a [u32],
+) -> OccupancyTraceEvidence<'a> {
+    OccupancyTraceEvidence {
+        window,
+        initial_busy_slots,
+        final_busy_slots,
+        busy_slot_micros,
+        mean_concurrency: window.concurrency(),
+        offsets_micros,
+        completed_attempts,
+        started_attempts,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OccupancyTraceHeader {
+    window: ResourceWindow,
+    initial_busy_slots: u32,
+    final_busy_slots: u32,
+    busy_slot_micros: u128,
+    mean_concurrency: f64,
 }
 
 /// Reusable owner for one [`GroupObservation`] view.
@@ -1211,7 +1346,7 @@ pub struct ObservationBuffer {
     partition_count: u32,
     replica_count_max: u32,
     resource_concurrency_max: f64,
-    resource_exposure_min_seconds: f64,
+    resource_exposure_micros: u64,
     resource_attempt_count_max: u32,
     cohorts: CohortColumns,
     backlog: BacklogColumns,
@@ -1224,7 +1359,10 @@ pub struct ObservationBuffer {
     scheduled_releases: Vec<ScheduledRelease>,
     partition_arrival_counts: Vec<u32>,
     partition_arrival_token: Option<UpdateToken>,
-    resource_window: Option<ResourceWindow>,
+    resource_trace: Option<OccupancyTraceHeader>,
+    resource_transition_offsets_micros: Vec<u64>,
+    resource_transition_completed_attempts: Vec<u32>,
+    resource_transition_started_attempts: Vec<u32>,
     attempt_outcomes: Option<AttemptOutcomeEvidence>,
     launch_header: Option<LaunchEvidenceHeader>,
     readiness_lumps: Vec<ReadinessLump>,
@@ -1257,11 +1395,19 @@ impl ObservationBuffer {
         let backlog_count = partition_count
             .checked_mul(DemandClass::COUNT_USIZE)
             .ok_or(ConfigurationError::PlatformLimit)?;
+        let resource_transition_count_max = usize::try_from(
+            configuration
+                .resource_window_attempt_count_max
+                .checked_mul(2)
+                .and_then(|count| count.checked_add(1))
+                .ok_or(ConfigurationError::PlatformLimit)?,
+        )
+        .map_err(|_| ConfigurationError::PlatformLimit)?;
         Ok(Self {
             partition_count: configuration.partition_count,
             replica_count_max: configuration.replica_count_max,
             resource_concurrency_max: configuration.capacity_concurrency_max()?,
-            resource_exposure_min_seconds: configuration.resource_exposure_min_seconds(),
+            resource_exposure_micros: configuration.report_interval_micros,
             resource_attempt_count_max: configuration.resource_window_attempt_count_max,
             cohorts: CohortColumns::new(cohort_count_max),
             backlog: BacklogColumns::new(backlog_count),
@@ -1274,7 +1420,12 @@ impl ObservationBuffer {
             scheduled_releases: Vec::with_capacity(scheduled_release_count_max),
             partition_arrival_counts: vec![0; partition_count],
             partition_arrival_token: None,
-            resource_window: None,
+            resource_trace: None,
+            resource_transition_offsets_micros: Vec::with_capacity(resource_transition_count_max),
+            resource_transition_completed_attempts: Vec::with_capacity(
+                resource_transition_count_max,
+            ),
+            resource_transition_started_attempts: Vec::with_capacity(resource_transition_count_max),
             attempt_outcomes: None,
             launch_header: None,
             readiness_lumps: Vec::with_capacity(readiness_lump_count_max),
@@ -1295,7 +1446,10 @@ impl ObservationBuffer {
         self.scheduled_releases.clear();
         self.partition_arrival_counts.fill(0);
         self.partition_arrival_token = None;
-        self.resource_window = None;
+        self.resource_trace = None;
+        self.resource_transition_offsets_micros.clear();
+        self.resource_transition_completed_attempts.clear();
+        self.resource_transition_started_attempts.clear();
         self.attempt_outcomes = None;
         self.launch_header = None;
         self.readiness_lumps.clear();
@@ -1457,19 +1611,25 @@ impl ObservationBuffer {
         Ok(())
     }
 
-    /// Sets one passive resource window.
+    /// Sets one resource summary and its complete busy-slot trace.
     ///
     /// # Errors
     ///
-    /// Returns an error when an unconsumed token is present.
-    pub fn set_resource_window(&mut self, window: ResourceWindow) -> Result<(), ObservationError> {
-        if self.resource_window.is_some() {
+    /// Returns an error when the trace violates its certified contract.
+    pub fn set_resource_observation(
+        &mut self,
+        window: ResourceWindow,
+        initial_busy_slots: u32,
+        final_busy_slots: u32,
+        transitions: &[OccupancyTransition],
+    ) -> Result<(), ObservationError> {
+        if self.resource_trace.is_some() {
             return Err(ObservationError::ResourceWindowPending);
         }
         if window.concurrency() > self.resource_concurrency_max {
             return Err(ObservationError::ResourceConcurrency);
         }
-        if window.exposure_seconds() < self.resource_exposure_min_seconds {
+        if window.exposure_micros() != self.resource_exposure_micros {
             return Err(ObservationError::ResourceExposure);
         }
         if window.completed_attempts() > self.resource_attempt_count_max
@@ -1479,7 +1639,82 @@ impl ObservationBuffer {
         {
             return Err(ObservationError::ResourceAttemptCount);
         }
-        self.resource_window = Some(window);
+        if initial_busy_slots > self.resource_concurrency_max as u32
+            || final_busy_slots > self.resource_concurrency_max as u32
+        {
+            return Err(ObservationError::ResourceBusySlots);
+        }
+        if transitions.len() > self.resource_transition_offsets_micros.capacity() {
+            return Err(ObservationError::ResourceTransitionCapacity);
+        }
+        let mut state = initial_busy_slots;
+        let mut previous_offset = 0_u64;
+        let mut busy_slot_micros = 0_u128;
+        let mut completed_attempts = 0_u32;
+        let mut started_attempts = 0_u32;
+        for (index, transition) in transitions.iter().copied().enumerate() {
+            if transition.offset_micros > window.exposure_micros() {
+                return Err(ObservationError::ResourceTransitionTime);
+            }
+            if index > 0 && transition.offset_micros <= previous_offset {
+                return Err(ObservationError::ResourceTransitionOrder);
+            }
+            let elapsed = transition.offset_micros - previous_offset;
+            busy_slot_micros = busy_slot_micros
+                .checked_add(u128::from(elapsed) * u128::from(state))
+                .ok_or(ObservationError::CountOverflow)?;
+            state = state
+                .checked_sub(transition.completed_attempts)
+                .ok_or(ObservationError::ResourceBusySlots)?;
+            state = state
+                .checked_add(transition.started_attempts)
+                .filter(|value| *value <= self.resource_concurrency_max as u32)
+                .ok_or(ObservationError::ResourceBusySlots)?;
+            completed_attempts = completed_attempts
+                .checked_add(transition.completed_attempts)
+                .ok_or(ObservationError::CountOverflow)?;
+            started_attempts = started_attempts
+                .checked_add(transition.started_attempts)
+                .ok_or(ObservationError::CountOverflow)?;
+            previous_offset = transition.offset_micros;
+        }
+        busy_slot_micros = busy_slot_micros
+            .checked_add(u128::from(window.exposure_micros() - previous_offset) * u128::from(state))
+            .ok_or(ObservationError::CountOverflow)?;
+        if state != final_busy_slots
+            || completed_attempts != window.completed_attempts()
+            || Some(started_attempts) != window.started_attempts()
+        {
+            return Err(ObservationError::ResourceTraceSummary);
+        }
+        let derived_concurrency = busy_slot_mean(busy_slot_micros, window.exposure_micros())?;
+        let concurrency_error = 8.0_f64
+            * f64::EPSILON
+            * derived_concurrency
+                .abs()
+                .max(window.concurrency().abs())
+                .max(1.0_f64);
+        if (derived_concurrency - window.concurrency()).abs() > concurrency_error {
+            return Err(ObservationError::ResourceTraceSummary);
+        }
+        self.resource_transition_offsets_micros.clear();
+        self.resource_transition_completed_attempts.clear();
+        self.resource_transition_started_attempts.clear();
+        for transition in transitions {
+            self.resource_transition_offsets_micros
+                .push(transition.offset_micros);
+            self.resource_transition_completed_attempts
+                .push(transition.completed_attempts);
+            self.resource_transition_started_attempts
+                .push(transition.started_attempts);
+        }
+        self.resource_trace = Some(OccupancyTraceHeader {
+            window,
+            initial_busy_slots,
+            final_busy_slots,
+            busy_slot_micros,
+            mean_concurrency: derived_concurrency,
+        });
         Ok(())
     }
 
@@ -1638,7 +1873,19 @@ impl ObservationBuffer {
             }),
             scheduled_releases: &self.scheduled_releases,
             partition_arrivals,
-            resource_window: self.resource_window.take(),
+            resource: self
+                .resource_trace
+                .take()
+                .map(|header| OccupancyTraceEvidence {
+                    window: header.window,
+                    initial_busy_slots: header.initial_busy_slots,
+                    final_busy_slots: header.final_busy_slots,
+                    busy_slot_micros: header.busy_slot_micros,
+                    mean_concurrency: header.mean_concurrency,
+                    offsets_micros: &self.resource_transition_offsets_micros,
+                    completed_attempts: &self.resource_transition_completed_attempts,
+                    started_attempts: &self.resource_transition_started_attempts,
+                }),
             attempt_outcomes: self.attempt_outcomes.take(),
             launch: self.launch_header.take().map(|header| {
                 LaunchEvidence::new(
@@ -1653,6 +1900,17 @@ impl ObservationBuffer {
             actuation_commitments: &self.actuation_commitments,
         }
     }
+}
+
+fn busy_slot_mean(busy_slot_micros: u128, exposure_micros: u64) -> Result<f64, ObservationError> {
+    let exposure = u128::from(exposure_micros);
+    let whole =
+        u32::try_from(busy_slot_micros / exposure).map_err(|_| ObservationError::CountOverflow)?;
+    let remainder =
+        u64::try_from(busy_slot_micros % exposure).map_err(|_| ObservationError::CountOverflow)?;
+    Ok(f64::from(whole)
+        + Duration::from_micros(remainder).as_secs_f64()
+            / Duration::from_micros(exposure_micros).as_secs_f64())
 }
 
 /// Bounded values exported for diagnosis.
@@ -1792,12 +2050,27 @@ pub enum ObservationError {
     /// Resource concurrency exceeds the configured plant maximum.
     #[error("resource concurrency exceeds the configured maximum")]
     ResourceConcurrency,
-    /// Resource exposure is below the configured report minimum.
-    #[error("resource exposure is below the configured minimum")]
+    /// Resource exposure differs from the configured report interval.
+    #[error("resource exposure differs from the configured report interval")]
     ResourceExposure,
     /// A resource attempt count exceeds the configured report maximum.
     #[error("resource attempt count exceeds the configured maximum")]
     ResourceAttemptCount,
+    /// A busy-slot boundary or transition exceeds the plant range.
+    #[error("a resource busy-slot state is outside the configured range")]
+    ResourceBusySlots,
+    /// A resource trace exceeds its fixed transition bound.
+    #[error("the resource trace exceeds its fixed transition bound")]
+    ResourceTransitionCapacity,
+    /// A resource transition is outside the report interval.
+    #[error("a resource transition is outside the report interval")]
+    ResourceTransitionTime,
+    /// Resource transitions are not strictly ordered and grouped.
+    #[error("resource transitions must be strictly ordered and grouped")]
+    ResourceTransitionOrder,
+    /// A resource summary disagrees with its derived trace values.
+    #[error("the resource summary disagrees with its trace")]
+    ResourceTraceSummary,
     /// An incomplete actuation has invalid replica counts or exceeds its bound.
     #[error("an actuation commitment is invalid or exceeds its fixed bound")]
     ActuationCommitment,
