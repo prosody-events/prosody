@@ -63,6 +63,8 @@ pub enum DropReason {
     UnresolvablePeer,
     /// The directory lookup itself failed.
     LookupFailed,
+    /// The request deadline elapsed during network delivery.
+    DeadlineExceeded,
     /// The selected endpoint did not accept the response.
     SendFailed,
 }
@@ -95,6 +97,7 @@ impl DropReason {
             Self::EncodeFailed => "encode_failed",
             Self::UnresolvablePeer => "unresolvable_peer",
             Self::LookupFailed => "lookup_failed",
+            Self::DeadlineExceeded => "deadline_exceeded",
             Self::SendFailed => "send_failed",
         }
     }

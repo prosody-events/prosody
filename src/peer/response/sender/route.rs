@@ -13,6 +13,7 @@ use opentelemetry::Context;
 use opentelemetry_semantic_conventions::attribute::ERROR_TYPE;
 use std::fmt::Display;
 use std::future::Future;
+use tokio::time::{Instant, timeout_at};
 use tracing::field::Empty;
 use tracing::{Instrument, Span, debug_span, error, warn};
 
@@ -143,28 +144,37 @@ impl<R: NetworkRouter> ResponseRoute for R {
         deadline: RequestDeadline,
         context: &Context,
     ) -> Result<RouteOutcome, DropReason> {
-        let target = frame.target();
-        // No address originates anywhere but a registration: a peer the directory
-        // does not hold is not dialed at all, and a peer the rules refuse to reach
-        // from here is not dialed either.
-        let route = match self.route(target).await {
-            Ok(Some(route)) => route,
-            Ok(None) => return Ok(RouteOutcome::Declined(frame)),
-            Err(error) => {
-                warn!(%error, peer = %target, "peer route lookup failed");
-                return Err(DropReason::LookupFailed);
-            }
-        };
-        let (kind, address) = route.endpoint();
-        if let Err(failure) = self
-            .sender()
-            .deliver(address, &frame, deadline.expires_at(), context)
-            .await
-        {
-            warn!(%failure, peer = %target, endpoint_kind = kind.label(), "response delivery failed");
-            return Err(DropReason::SendFailed);
+        if Instant::now() >= deadline.expires_at() {
+            return Err(DropReason::DeadlineExceeded);
         }
-        Ok(RouteOutcome::Delivered(Delivery::Remote(kind)))
+        // Cancellation drops the active directory, cache, or transport
+        // future. No awaited future retains progress another task requires.
+        let delivery = async {
+            let target = frame.target();
+            // No address originates anywhere but a registration. A missing or
+            // unreachable peer is not dialed.
+            let route = match self.route(target).await {
+                Ok(Some(route)) => route,
+                Ok(None) => return Ok(RouteOutcome::Declined(frame)),
+                Err(error) => {
+                    warn!(%error, peer = %target, "peer route lookup failed");
+                    return Err(DropReason::LookupFailed);
+                }
+            };
+            let (kind, address) = route.endpoint();
+            if let Err(failure) = self
+                .sender()
+                .deliver(address, &frame, deadline.expires_at(), context)
+                .await
+            {
+                warn!(%failure, peer = %target, endpoint_kind = kind.label(), "response delivery failed");
+                return Err(DropReason::SendFailed);
+            }
+            Ok(RouteOutcome::Delivered(Delivery::Remote(kind)))
+        };
+        timeout_at(deadline.expires_at(), delivery)
+            .await
+            .unwrap_or(Err(DropReason::DeadlineExceeded))
     }
 }
 

@@ -1,11 +1,23 @@
 //! What one destination's trouble costs the others: nothing.
 
-use super::{Harness, attempts, paused};
-use crate::peer::router::loopback::{Script, direct_uri};
+use super::{Harness, PAYLOAD, attempts, paused};
+use crate::peer::response::frame::FrameHeader;
+use crate::peer::response::frame::encode::Staged;
+use crate::peer::response::frame::tests::CountingCodec;
+use crate::peer::response::headers::RequestDeadline;
+use crate::peer::response::sender::route::PreparedResponse;
+use crate::peer::response::sender::{DropReason, ResponseRoute, RouteOutcome, stage};
+use crate::peer::router::loopback::{Script, TestRouter, direct_uri, peer};
 use color_eyre::Result;
+use opentelemetry::Context;
 use std::array;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
+use tokio::task::yield_now;
+use tokio::time::advance;
 
 /// The two destinations these suites address.
 const PEER_A: u8 = 1;
@@ -61,4 +73,70 @@ fn a_held_destination_never_delays_a_healthy_one() -> Result<()> {
         );
         Ok(())
     })
+}
+
+/// The request deadline cancels a directory lookup that does not answer.
+#[test]
+fn the_deadline_bounds_route_resolution() -> Result<()> {
+    paused()?.block_on(async {
+        let (mut route, _deliveries) = TestRouter::new()?;
+        let entered = route.hold_lookup();
+        let harness = Harness::new()?;
+        let frame = frame(&harness)?;
+        let deadline = short_deadline()?;
+        let delivery =
+            tokio::spawn(async move { route.deliver(frame, deadline, &Context::new()).await });
+
+        entered.notified().await;
+        assert_deadline(delivery).await?;
+        Ok(())
+    })
+}
+
+/// The request deadline cancels a transport that does not become ready.
+#[test]
+fn the_deadline_bounds_transport_readiness() -> Result<()> {
+    paused()?.block_on(async {
+        let mut harness = Harness::new()?;
+        harness.script(PEER_A, Script::Hold(Arc::new(Semaphore::new(0))))?;
+        let route = harness.router.clone();
+        let frame = frame(&harness)?;
+        let deadline = short_deadline()?;
+        let delivery =
+            tokio::spawn(async move { route.deliver(frame, deadline, &Context::new()).await });
+
+        drop(harness.next_delivery().await?);
+        assert_deadline(delivery).await?;
+        Ok(())
+    })
+}
+
+fn frame(harness: &Harness) -> Result<Staged> {
+    let payload = PAYLOAD.to_vec();
+    let PreparedResponse::Ready(frame) = stage::<CountingCodec, Infallible>(
+        FrameHeader {
+            target: peer(PEER_A),
+            ..harness.header.clone()
+        },
+        Ok(&payload),
+    ) else {
+        return Err(color_eyre::eyre::eyre!("the test payload must encode"));
+    };
+    Ok(frame)
+}
+
+fn short_deadline() -> Result<RequestDeadline> {
+    RequestDeadline::after(Duration::from_secs(1))
+        .ok_or_else(|| color_eyre::eyre::eyre!("the test deadline must be representable"))
+}
+
+async fn assert_deadline(delivery: JoinHandle<Result<RouteOutcome, DropReason>>) -> Result<()> {
+    advance(Duration::from_secs(1)).await;
+    yield_now().await;
+    assert!(
+        delivery.is_finished(),
+        "network delivery must stop at the request deadline"
+    );
+    assert!(matches!(delivery.await?, Err(DropReason::DeadlineExceeded)));
+    Ok(())
 }

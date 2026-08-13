@@ -8,7 +8,7 @@
 use crate::peer::router::{Framed, PeerId, RelayHop, ResponseSender, SendFailure};
 use opentelemetry::Context;
 use thiserror::Error;
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout_at};
 use tonic::Code;
 use tracing::warn;
 
@@ -72,11 +72,12 @@ impl<R: RelayHop> Relay<R> {
         frame: &F,
         context: &Context,
     ) -> Result<(), RelayFailure> {
-        // Do not resolve or dial after the incoming gRPC deadline.
         if Instant::now() >= deadline {
             return Err(RelayFailure::DeadlineExceeded);
         }
-        self.hop(target, frame, deadline, context).await
+        timeout_at(deadline, self.hop(target, frame, deadline, context))
+            .await
+            .unwrap_or(Err(RelayFailure::DeadlineExceeded))
     }
 
     /// Resolves the target's direct endpoint and makes one attempt.
