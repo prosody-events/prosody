@@ -654,9 +654,8 @@ fn validate_capacity_closed_loop_claim(
     run: &PrincipalRun,
 ) -> Result<(), RegimeValidationError> {
     // The controller reacts within one second after demand exceeds capacity.
-    // The launch delay gates evidence availability through ready capacity, not
-    // inference. Identification then completes during the bounded clamp
-    // traversal.
+    // The first accepted window above the knee starts the evidence clock.
+    // Identification then completes during the bounded clamp traversal.
     const DEMAND_STEP_MICROS: u64 = 270_000_000;
     const REACTION_LIMIT_MICROS: u64 = 5_000_000;
     const ENGAGEMENT_LIMIT_MICROS: u64 = 20_000_000;
@@ -677,17 +676,20 @@ fn validate_capacity_closed_loop_claim(
         regime,
         "the capacity target did not react to the demand step",
     )?;
-    let slots_per_replica = run.simulation.slots_per_replica;
-    let evidence_at = run
-        .simulation
-        .changes
-        .iter()
-        .find(|change| change.replicas.saturating_mul(slots_per_replica) > KNEE_CONCURRENCY)
-        .map(|change| change.at_micros);
+    let evidence_at = controller_samples(run)
+        .find(|sample| {
+            matches!(
+                sample.capacity_evidence,
+                crate::CapacityEvidenceSample::Window(window)
+                    if window.concurrency > f64::from(KNEE_CONCURRENCY)
+                        && window.completed_attempts > 0
+            )
+        })
+        .map(|sample| sample.at_micros);
     require_closed_loop(
         evidence_at.is_some(),
         regime,
-        "ready capacity did not cross the resource knee",
+        "the plant produced no resource evidence above the knee",
     )?;
     let engaged = evidence_at.is_some_and(|evidence_at| {
         controller_samples(run).any(|sample| {

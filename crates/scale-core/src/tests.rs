@@ -252,7 +252,7 @@ fn edf_counts_missed_work_and_bounds_late_area(work_seed: u16, supply_seed: u16)
         &mut scratch,
     );
     let missed = (work - supply).max(0.0_f64);
-    let late_seconds = (missed / supply).min(1.0_f64);
+    let late_seconds = missed / supply;
     let expected_late_area = missed * late_seconds - 0.5_f64 * supply * late_seconds * late_seconds;
     close_relative(outcome.missed_work, missed)
         && close_relative(outcome.late_area, expected_late_area)
@@ -352,7 +352,9 @@ fn edf_counts_a_late_cohort_after_an_earlier_wide_interval() -> Result<(), TestE
     );
 
     let missed = 16.0_f64 - 3.806_668_352_250_828_2_f64;
-    let expected_late_area = missed - 0.5_f64 * 3.806_668_352_250_828_2_f64;
+    let late_seconds = missed / 3.806_668_352_250_828_2_f64;
+    let expected_late_area =
+        missed * late_seconds - 0.5_f64 * 3.806_668_352_250_828_2_f64 * late_seconds * late_seconds;
     assert!(close_relative(outcome.missed_work, missed));
     assert!(close_relative(outcome.late_area, expected_late_area));
     Ok(())
@@ -2538,37 +2540,45 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
     observation.set_arrivals(72_000, 240_000_000)?;
     observation.set_resource_window(ResourceWindow::new(30.0_f64, 240.0_f64, 72_000)?)?;
     observation.set_current_replicas(2)?;
-    let first = step(
+    let ScaleDecision::Apply(_first) = step(
         &mut state,
         &mut scratch,
         observation.observation(),
         ModelTime::from_micros(240_000_000),
-    );
-    let ScaleDecision::Apply(first) = first else {
+    ) else {
         return Err(TestError::UnexpectedHold);
     };
 
-    let mut observation = ObservationBuffer::new(&configuration)?;
-    observation.set_current_replicas(2)?;
-    for partition in 0..configuration.partition_count {
-        observation.push_cohort(Cohort {
-            release_micros: 241_000_000,
-            deadline_micros: 242_000_000,
-            offered_events: 300.0_f64 / f64::from(configuration.partition_count),
-            partition,
-            demand_class: DemandClass::Normal,
-        })?;
+    let mut apply = None;
+    for window in 2_u64..=15 {
+        let now_micros = 239_000_000 + window * 1_000_000;
+        let mut observation = ObservationBuffer::new(&configuration)?;
+        observation.set_arrivals(300, 1_000_000)?;
+        observation.set_resource_window(ResourceWindow::new(30.0_f64, 1.0_f64, 300)?)?;
+        observation.set_current_replicas(2)?;
+        for partition in 0..configuration.partition_count {
+            observation.push_cohort(Cohort {
+                release_micros: now_micros,
+                deadline_micros: now_micros + 1_000_000,
+                offered_events: 300.0_f64 / f64::from(configuration.partition_count),
+                partition,
+                demand_class: DemandClass::Normal,
+            })?;
+        }
+        let ScaleDecision::Apply(decision) = step(
+            &mut state,
+            &mut scratch,
+            observation.observation(),
+            ModelTime::from_micros(now_micros),
+        ) else {
+            return Err(TestError::UnexpectedHold);
+        };
+        if window >= 4 {
+            assert!(matches!(decision.target, 3 | 4), "window={window}");
+        }
+        apply = Some(decision);
     }
-    let decision = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(241_000_000),
-    );
-
-    let ScaleDecision::Apply(apply) = decision else {
-        return Err(TestError::UnexpectedHold);
-    };
+    let apply = apply.ok_or(TestError::MissingDecisionCurve)?;
     let selected =
         usize::try_from(apply.target - 1).map_err(|_| ConfigurationError::PlatformLimit)?;
     let mut losses = vec![0.0_f64; scratch.decision_candidate_count()];
@@ -2577,7 +2587,6 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
         .decision_column_summary(selected)
         .ok_or(TestError::MissingDecisionCurve)?;
     let runner_up = summary.runner_up.ok_or(TestError::MissingDecisionCurve)?;
-    assert_eq!((first.target, apply.target), (3, 4));
     assert!(summary.selected.cost <= runner_up.cost);
     assert!(
         apply.target <= configuration.partition_count,

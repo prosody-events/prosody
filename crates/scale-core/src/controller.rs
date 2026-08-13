@@ -150,29 +150,6 @@ impl CapacityClasses {
         &self.members[self.member_offsets[class]..self.member_offsets[class + 1]]
     }
 
-    fn median_service_time(&self, capacity: &CapacityFactor) -> f64 {
-        let mut cumulative = 0.0_f64;
-        for class in 0..self.len() {
-            let representative = self.representative(class);
-            let (curve, _) = capacity.curve_and_probability(representative);
-            cumulative += self
-                .members(class)
-                .iter()
-                .map(|&member| capacity.curve_and_probability(member).1)
-                .sum::<f64>();
-            if cumulative >= 0.5_f64 {
-                return curve.service_time_seconds();
-            }
-        }
-        self.representatives
-            .last()
-            .map_or(0.0_f64, |&representative| {
-                capacity
-                    .curve_and_probability(representative)
-                    .0
-                    .service_time_seconds()
-            })
-    }
 }
 
 fn candidate_concurrency_ladder(configuration: &Configuration) -> Vec<f64> {
@@ -521,7 +498,6 @@ pub struct ScaleScratch {
     active_inner_count: usize,
     decision_curve_sample_count: u32,
     decision_demand_floor: usize,
-    known_release_floors: Vec<(u64, usize)>,
     decision_rate: f64,
 }
 
@@ -927,7 +903,6 @@ impl ScaleScratch {
             active_inner_count: 0,
             decision_curve_sample_count: 0,
             decision_demand_floor: 0,
-            known_release_floors: Vec::with_capacity(SCHEDULED_RELEASE_COUNT_MAX),
             decision_rate: 0.0_f64,
         })
     }
@@ -1194,7 +1169,7 @@ fn select_target(
         actuation_commitments,
         inner_count,
     );
-    let pilot_decision = numerical_decision(state, scratch, scheduled_releases);
+    let pilot_decision = numerical_decision(state, scratch);
     if inner_count < full_inner_count && !pilot_decision.is_resolved() {
         evaluate_scenarios(
             state,
@@ -1205,7 +1180,7 @@ fn select_target(
             actuation_commitments,
             full_inner_count,
         );
-        let target_index = numerical_decision(state, scratch, scheduled_releases).target_index();
+        let target_index = numerical_decision(state, scratch).target_index();
         return finish_decision(state, scratch, target_index);
     }
     finish_decision(state, scratch, pilot_decision.target_index())
@@ -1624,16 +1599,11 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
 /// optimum. A singleton set makes the numerical integral resolved. Multiple
 /// actions use the transition cost to decide if the standing target remains
 /// preferable to the nominal minimum.
-fn numerical_decision(
-    state: &ScaleState,
-    scratch: &mut ScaleScratch,
-    scheduled_releases: &[ScheduledRelease],
-) -> NumericalDecision {
+fn numerical_decision(state: &ScaleState, scratch: &mut ScaleScratch) -> NumericalDecision {
     dispatch!(state.simd_level, simd => numerical_decision_simd(
         simd,
         state,
         scratch,
-        scheduled_releases,
     ))
 }
 
@@ -1641,13 +1611,12 @@ fn numerical_decision_simd<S: Simd>(
     simd: S,
     state: &ScaleState,
     scratch: &mut ScaleScratch,
-    scheduled_releases: &[ScheduledRelease],
 ) -> NumericalDecision {
     let candidate_count = decision_action_count(scratch);
     let candidate_stride = scratch.posterior_loss_sums.len();
     let bootstrap_tail_probability = state.configuration.objective.epsilon();
     let rate = state.configuration.objective.replica_second_delay_rate();
-    let demand_floor = demand_floor(state, scratch, scheduled_releases, candidate_count);
+    let demand_floor = demand_floor(state, scratch, candidate_count);
     scratch.decision_demand_floor = demand_floor;
     scratch.decision_rate = rate;
     let nominal_target = select_action(&ActionColumns {
@@ -1755,89 +1724,20 @@ fn transition_cost(state: &ScaleState, from: usize, to: usize) -> f64 {
     state.rebalance_time.expected_seconds(direction, delta) * f64::from(state.current_replicas)
 }
 
-/// Returns the smallest action index covering the known arrival rate.
+/// Returns the smallest action index with posterior mean supply that covers the live rate.
 ///
-/// See [`ActionColumns::demand_floor`] for the rule this enforces. The
-/// posterior mean supply column is non-decreasing, so the first covering
-/// index is the floor. When no action covers the rate, the largest action
-/// is the floor.
+/// The floor promises live-rate feasibility under the posterior mean supply.
+/// The priced action curve owns all scheduled work and never forces its target.
+/// The supply column is non-decreasing. When no action covers the live rate,
+/// the largest action is the floor.
 fn demand_floor(
     state: &ScaleState,
-    scratch: &mut ScaleScratch,
-    scheduled_releases: &[ScheduledRelease],
+    scratch: &ScaleScratch,
     candidate_count: usize,
 ) -> usize {
     let expected_rate = state.arrivals.expected_rate(state.model_time.as_micros());
-    let current_floor = covering_target(scratch, candidate_count, expected_rate);
-    let now_micros = state.model_time.as_micros();
-    scratch
-        .known_release_floors
-        .retain(|(end_micros, _floor)| *end_micros >= now_micros);
-    for release in scheduled_releases.iter().filter(|release| {
-        release.release_micros >= state.model_time.as_micros()
-            && release.release_micros <= schedule_visibility_end(state)
-    }) {
-        let Some(floor) = future_release_floor(state, scratch, candidate_count, release) else {
-            continue;
-        };
-        let end_micros = release
-            .release_micros
-            .saturating_add(state.configuration.objective.budget_micros());
-        if !scratch.known_release_floors.contains(&(end_micros, floor)) {
-            scratch.known_release_floors.push((end_micros, floor));
-        }
-    }
-    scratch
-        .known_release_floors
-        .iter()
-        .map(|(_end_micros, floor)| *floor)
-        .fold(current_floor, usize::max)
-}
-
-fn future_release_floor(
-    state: &ScaleState,
-    scratch: &ScaleScratch,
-    candidate_count: usize,
-    release: &ScheduledRelease,
-) -> Option<usize> {
-    let budget_seconds =
-        Duration::from_micros(state.configuration.objective.budget_micros()).as_secs_f64();
-    let required_rate = f64::from(release.count) / budget_seconds;
-    let target = covering_known_rate(state, scratch, candidate_count, required_rate)
-        .saturating_add(1)
-        .min(candidate_count.saturating_sub(1));
-    let replicas = u32::try_from(target.saturating_add(1)).map_or(u32::MAX, |value| value);
-    let delta = replicas.saturating_sub(1);
-    let lead_seconds = if delta == 0 {
-        0.0_f64
-    } else {
-        state
-            .lead_time
-            .expected_seconds(TransitionDirection::Up, delta)
-            + state
-                .rebalance_time
-                .expected_seconds(TransitionDirection::Up, delta)
-    };
-    let lead_micros = (lead_seconds.ceil() * 1_000_000.0_f64) as u64;
-    (state.model_time.as_micros() >= release.release_micros.saturating_sub(lead_micros))
-        .then_some(target)
-}
-
-fn covering_known_rate(
-    state: &ScaleState,
-    scratch: &ScaleScratch,
-    candidate_count: usize,
-    required_rate: f64,
-) -> usize {
-    let service_time = state.capacity_classes.median_service_time(&state.capacity);
-    scratch.candidate_concurrency[..candidate_count]
-        .partition_point(|concurrency| *concurrency / service_time < required_rate)
-        .min(candidate_count.saturating_sub(1))
-}
-
-fn covering_target(scratch: &ScaleScratch, candidate_count: usize, required_rate: f64) -> usize {
     scratch.posterior_supply_sums[..candidate_count]
-        .partition_point(|supply| *supply < required_rate)
+        .partition_point(|supply| *supply < expected_rate)
         .min(candidate_count.saturating_sub(1))
 }
 
