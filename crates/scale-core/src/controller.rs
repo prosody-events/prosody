@@ -184,7 +184,7 @@ impl ScaleState {
         let capacity = CapacityFactor::new_with_prior(
             capacity_grid,
             configuration.capacity_change_rate_per_second,
-            configuration.arrival_prior,
+            &configuration.arrival_prior,
             configuration.capacity_concurrency_max()?,
             configuration.resource_exposure_min_seconds(),
             configuration.resource_window_attempt_count_max,
@@ -205,7 +205,7 @@ impl ScaleState {
         let reliability = ReliabilityFactor::new(configuration.reliability_prior);
         let lead_time = LaunchTimeFactor::new(&configuration.launch_time_prior);
         let rebalance_time = RebalanceTimeFactor::new(&configuration.rebalance_time_prior);
-        let arrivals = ArrivalFactor::new(configuration.arrival_prior);
+        let arrivals = ArrivalFactor::new(&configuration.arrival_prior);
         Ok(Self {
             simd_level: Level::new(),
             configuration,

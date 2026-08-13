@@ -15,7 +15,7 @@ fn boundary_filter_matches_exhaustive_one_step(count_code: u8, duration_code: u1
     };
     let duration = 0.1_f64 + 30.0_f64 * f64::from(duration_code) / f64::from(u16::MAX);
     let count = u32::from(count_code % 32);
-    let before = ArrivalFactor::new(model);
+    let before = ArrivalFactor::new(&model);
     let mut expected = vec![0.0_f64; CELL_COUNT];
     for hazard in 0..HAZARD_COUNT {
         let retained = (-before.hazards[hazard] * duration).exp();
@@ -52,7 +52,7 @@ fn update_path_does_not_allocate() -> Result<(), super::ArrivalPriorError> {
         ArrivalPrior::storage_bytes()?,
         8 * (2 * CELL_COUNT + HAZARD_COUNT + RESET_COUNT * RATE_COUNT + RATE_COUNT)
     );
-    let mut factor = ArrivalFactor::new(model);
+    let mut factor = ArrivalFactor::new(&model);
     let allocation = measure(|| factor.update(ArrivalEvidence::new(7, 1_000_000), None, 1_000_000));
     assert_eq!(allocation.count_total, 0);
     assert_eq!(allocation.bytes_total, 0);
@@ -97,8 +97,8 @@ fn crossing_interval_updates_its_start_calendar_segment() -> Result<(), super::A
         prior_probability: 0.5_f64,
         segments: &reference_segments,
     };
-    let mut factor = ArrivalFactor::new(model);
-    let mut reference = ArrivalFactor::new(model);
+    let mut factor = ArrivalFactor::new(&model);
+    let mut reference = ArrivalFactor::new(&model);
 
     factor.update(
         ArrivalEvidence::new(4, 1_000_000),
@@ -141,7 +141,7 @@ fn accepted_paths_end_at_the_requested_horizon(seed: u64, duration_code: u16) ->
     let mut ends = vec![0.0_f64; model.path_segment_count_max()];
     let mut rates = vec![0.0_f64; model.path_segment_count_max()];
     let mut random = RandomStream::new(seed);
-    let length = ArrivalFactor::new(model).sample_rate_path(
+    let length = ArrivalFactor::new(&model).sample_rate_path(
         duration,
         &mut random,
         &mut ends,

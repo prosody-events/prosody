@@ -116,7 +116,7 @@ pub fn run_batch_slo_with_inputs(
         // only shapes early rate uncertainty.
         arrival_prior: ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
-        reliability_prior: ReliabilityPrior::population_fallback(),
+        reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,
         objective,

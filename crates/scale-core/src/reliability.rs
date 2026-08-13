@@ -1,15 +1,51 @@
+use std::mem::size_of;
+
 use crate::AttemptOutcomeEvidence;
 use crate::ConfigurationError;
 use crate::PosteriorError;
+use crate::PriorArtifactBudget;
+use crate::PriorArtifactIdentity;
+use crate::PriorCoverageRecord;
 use crate::RandomStream;
 use crate::random::sample_gamma;
+use crate::types::prior_artifact_contract_holds;
 use statrs::distribution::{Beta, ContinuousCDF};
 
 pub(crate) const RELIABILITY_BIN_COUNT: u32 = 64;
+const RELIABILITY_ARTIFACT_SOURCE: u64 = 0x5245_4c49_4142_4c45;
+const RELIABILITY_ARTIFACT_VERSION: u32 = 1;
+const RELIABILITY_MIDPOINT_ERROR: f64 = 0.5_f64 / RELIABILITY_BIN_COUNT as f64;
+const RELIABILITY_ARTIFACT_BUDGET: PriorArtifactBudget = PriorArtifactBudget::new(
+    2 * RELIABILITY_BIN_COUNT,
+    4 * size_of::<f64>() as u64,
+    2,
+    0.0_f64,
+    0.0_f64,
+    RELIABILITY_MIDPOINT_ERROR,
+);
+const RELIABILITY_COVERAGE: [PriorCoverageRecord; 2] = [
+    PriorCoverageRecord::new(
+        0.0_f64,
+        1.0_f64,
+        0.0_f64,
+        0.0_f64,
+        RELIABILITY_MIDPOINT_ERROR,
+    ),
+    PriorCoverageRecord::new(
+        0.0_f64,
+        1.0_f64,
+        0.0_f64,
+        0.0_f64,
+        RELIABILITY_MIDPOINT_ERROR,
+    ),
+];
 
 /// Proper population prior for Normal and Failure retry probabilities.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReliabilityPrior {
+    artifact: PriorArtifactIdentity,
+    budget: PriorArtifactBudget,
+    coverage: [PriorCoverageRecord; 2],
     normal_retrying: f64,
     normal_final: f64,
     failure_retrying: f64,
@@ -40,7 +76,30 @@ impl ReliabilityPrior {
         {
             return Err(ConfigurationError::InvalidReliabilityPrior);
         }
+        let random_stream = normal_retrying.to_bits()
+            ^ normal_final.to_bits().rotate_left(16)
+            ^ failure_retrying.to_bits().rotate_left(32)
+            ^ failure_final.to_bits().rotate_left(48)
+            | 1;
+        let artifact = PriorArtifactIdentity::new(
+            RELIABILITY_ARTIFACT_SOURCE,
+            RELIABILITY_ARTIFACT_VERSION,
+            random_stream,
+        );
+        if !prior_artifact_contract_holds(
+            artifact,
+            RELIABILITY_ARTIFACT_BUDGET,
+            &RELIABILITY_COVERAGE,
+            2 * RELIABILITY_BIN_COUNT as usize,
+            4 * size_of::<f64>(),
+            2,
+        ) {
+            return Err(ConfigurationError::InvalidReliabilityPrior);
+        }
         Ok(Self {
+            artifact,
+            budget: RELIABILITY_ARTIFACT_BUDGET,
+            coverage: RELIABILITY_COVERAGE,
             normal_retrying,
             normal_final,
             failure_retrying,
@@ -48,17 +107,36 @@ impl ReliabilityPrior {
         })
     }
 
-    /// Returns the declared fallback when no trained artifact exists.
+    /// Returns the authored weak-information population prior.
     ///
-    /// Each class starts with one retry and nine final pseudo-observations.
+    /// No representative retry corpus exists. This choice assigns a 10%
+    /// retry mean and ten observations of strength to each class. Retries are
+    /// expected to be uncommon. The weak strength lets early evidence replace
+    /// that judgment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the embedded artifact fails its contract.
+    pub fn authored() -> Result<Self, ConfigurationError> {
+        Self::new(1.0_f64, 9.0_f64, 1.0_f64, 9.0_f64)
+    }
+
+    /// Returns this prior's artifact identity.
     #[must_use]
-    pub const fn population_fallback() -> Self {
-        Self {
-            normal_retrying: 1.0_f64,
-            normal_final: 9.0_f64,
-            failure_retrying: 1.0_f64,
-            failure_final: 9.0_f64,
-        }
+    pub const fn artifact(self) -> PriorArtifactIdentity {
+        self.artifact
+    }
+
+    /// Returns this prior's approximation budget.
+    #[must_use]
+    pub const fn budget(self) -> PriorArtifactBudget {
+        self.budget
+    }
+
+    /// Returns the two retry-probability coverage records.
+    #[must_use]
+    pub const fn coverage(&self) -> &[PriorCoverageRecord] {
+        &self.coverage
     }
 }
 

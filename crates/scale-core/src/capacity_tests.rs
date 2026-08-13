@@ -3,9 +3,9 @@ use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
 use super::{
-    CAPACITY_MODEL_ARTIFACT, CapacityGrid, CapacityGridError, CapacityModelError,
-    CompletionScratch, ResourceWindow, ResourceWindowError, RetainedHistory, StartWindow,
-    binomial_log_probability, completion_expectation, completion_log_likelihood,
+    CapacityGrid, CapacityGridError, CapacityModelError, CompletionScratch, ResourceWindow,
+    ResourceWindowError, RetainedHistory, StartWindow, binomial_log_probability,
+    capacity_model_artifact, completion_expectation, completion_log_likelihood,
     contamination_prior, hazard_prior, log_normal_axis_masses, record_start_window,
 };
 use crate::ArrivalPrior;
@@ -172,7 +172,8 @@ fn coverage_ring_matches_unbounded_history() -> Result<(), TestError> {
 
 #[test]
 fn contamination_cells_preserve_the_authored_beta_mass() -> Result<(), TestError> {
-    let (probabilities, weights) = contamination_prior(CAPACITY_MODEL_ARTIFACT)?;
+    let artifact = capacity_model_artifact(1.0_f64 / 300.0_f64, 4.0_f64)?;
+    let (probabilities, weights) = contamination_prior(artifact)?;
     assert_eq!(probabilities.len(), weights.len());
     assert!(probabilities.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(
@@ -190,7 +191,7 @@ fn an_identifiable_persistent_run_beats_contamination_redraws() -> Result<(), Te
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        ArrivalPrior::test_artifact(),
+        &ArrivalPrior::test_artifact()?,
         1.0_f64,
         1.0_f64,
         32,
@@ -237,11 +238,14 @@ fn an_identifiable_persistent_run_beats_contamination_redraws() -> Result<(), Te
 
 #[test]
 fn hazard_cells_cover_the_declared_gamma_tails() -> Result<(), TestError> {
-    let (rates, weights) = hazard_prior(1.0_f64 / 300.0_f64, 4.0_f64, CAPACITY_MODEL_ARTIFACT)?;
+    let artifact = capacity_model_artifact(1.0_f64 / 300.0_f64, 4.0_f64)?;
+    assert_eq!(artifact.identity.version(), 1);
+    assert!(artifact.coverage[1].tail_probability() <= artifact.budget.boundary_probability_max());
+    let (rates, weights) = hazard_prior(artifact)?;
     assert!(rates.windows(2).all(|pair| pair[0] < pair[1]));
     assert!((weights.iter().sum::<f64>() - 1.0_f64).abs() <= 16.0_f64 * f64::EPSILON);
     assert!(matches!(
-        hazard_prior(0.0_f64, 4.0_f64, CAPACITY_MODEL_ARTIFACT),
+        capacity_model_artifact(0.0_f64, 4.0_f64),
         Err(CapacityModelError::InvalidHazardPrior)
     ));
     Ok(())
@@ -261,7 +265,7 @@ fn observation_contract_sizes_history_from_coverage() -> Result<(), TestError> {
     let factor = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        ArrivalPrior::test_artifact(),
+        &ArrivalPrior::test_artifact()?,
         1.0_f64,
         1.0_f64,
         64,
@@ -276,7 +280,7 @@ fn completion_convolution_update_does_not_allocate() -> Result<(), TestError> {
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
         1.0_f64 / 300.0_f64,
-        ArrivalPrior::test_artifact(),
+        &ArrivalPrior::test_artifact()?,
         1.0_f64,
         1.0_f64,
         64,
@@ -291,6 +295,8 @@ fn completion_convolution_update_does_not_allocate() -> Result<(), TestError> {
 
 #[derive(Debug, Error)]
 enum TestError {
+    #[error(transparent)]
+    Arrival(#[from] crate::ArrivalPriorError),
     #[error(transparent)]
     Grid(#[from] CapacityGridError),
     #[error(transparent)]

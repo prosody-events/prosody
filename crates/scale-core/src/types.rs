@@ -187,6 +187,10 @@ impl PriorArtifactIdentity {
     pub const fn random_stream(self) -> u64 {
         self.random_stream
     }
+
+    pub(crate) const fn is_valid(self) -> bool {
+        self.source != 0 && self.version != 0 && self.random_stream != 0
+    }
 }
 
 /// Fixed approximation limits for one prior artifact.
@@ -228,7 +232,7 @@ impl PriorArtifactBudget {
             && self.boundary_probability_max.is_finite()
             && (0.0_f64..1.0_f64).contains(&self.boundary_probability_max)
             && self.path_time_error_seconds.is_finite()
-            && self.path_time_error_seconds > 0.0_f64
+            && self.path_time_error_seconds >= 0.0_f64
             && self.decision_cost_error_max.is_finite()
             && self.decision_cost_error_max >= 0.0_f64
     }
@@ -301,7 +305,7 @@ impl PriorCoverageRecord {
 
     pub(crate) fn is_valid(self) -> bool {
         self.lower_endpoint.is_finite()
-            && self.lower_endpoint > 0.0_f64
+            && self.lower_endpoint >= 0.0_f64
             && self.upper_endpoint.is_finite()
             && self.upper_endpoint > self.lower_endpoint
             && self.lower_tail_probability.is_finite()
@@ -336,6 +340,27 @@ impl PriorCoverageRecord {
     pub const fn decision_cost_error(self) -> f64 {
         self.decision_cost_error
     }
+}
+
+pub(crate) fn prior_artifact_contract_holds(
+    identity: PriorArtifactIdentity,
+    budget: PriorArtifactBudget,
+    coverage: &[PriorCoverageRecord],
+    hypothesis_count: usize,
+    storage_bytes: usize,
+    update_operation_count: u64,
+) -> bool {
+    identity.is_valid()
+        && budget.is_valid()
+        && !coverage.is_empty()
+        && u32::try_from(hypothesis_count).is_ok_and(|count| count <= budget.hypothesis_count_max())
+        && u64::try_from(storage_bytes).is_ok_and(|bytes| bytes <= budget.storage_bytes_max())
+        && update_operation_count <= budget.update_operation_count_max()
+        && coverage.iter().all(|record| {
+            record.is_valid()
+                && record.tail_probability() <= budget.boundary_probability_max()
+                && record.decision_cost_error() <= budget.decision_cost_error_max()
+        })
 }
 
 /// One Gamma rate posterior for a future calendar interval.

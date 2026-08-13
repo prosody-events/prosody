@@ -9,18 +9,24 @@ use thiserror::Error;
 
 use crate::arrival::ArrivalPrior;
 use crate::change_point::ChangePointKernel;
+use crate::types::prior_artifact_contract_holds;
+use crate::{PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord};
 
-const CAPACITY_MODEL_ARTIFACT: CapacityModelArtifact = CapacityModelArtifact {
-    version: 1,
-    storage_bytes_max: 512 * 1_024 * 1_024,
-    observation_quality_alpha: 1.0_f64,
-    observation_quality_beta: 9.0_f64,
-    observation_probability_error_max: 1.0_f64 / 16.0_f64,
-    hazard_tail_probability_max: 1.0e-6_f64,
-    hazard_transition_probability_error_max: 1.0_f64 / 8.0_f64,
-    no_knee_probability: 0.5_f64,
-    no_collapse_probability: 0.5_f64,
-};
+const CAPACITY_MODEL_STORAGE_BYTES_MAX: usize = 512 * 1_024 * 1_024;
+const CAPACITY_MODEL_ARTIFACT_SOURCE: u64 = 0x4341_5041_4349_5459;
+const CAPACITY_MODEL_ARTIFACT_VERSION: u32 = 1;
+const OBSERVATION_PROBABILITY_ERROR_MAX: f64 = 1.0_f64 / 16.0_f64;
+const HAZARD_TRANSITION_PROBABILITY_ERROR_MAX: f64 = 1.0_f64 / 8.0_f64;
+const OBSERVATION_COVERAGE_INDEX: usize = 0;
+const HAZARD_COVERAGE_INDEX: usize = 1;
+const CAPACITY_MODEL_BUDGET: PriorArtifactBudget = PriorArtifactBudget::new(
+    (CAPACITY_MODEL_STORAGE_BYTES_MAX / size_of::<f64>()) as u32,
+    CAPACITY_MODEL_STORAGE_BYTES_MAX as u64,
+    (CAPACITY_MODEL_STORAGE_BYTES_MAX / size_of::<f64>()) as u64,
+    1.0e-6_f64,
+    0.0_f64,
+    HAZARD_TRANSITION_PROBABILITY_ERROR_MAX,
+);
 
 /// Versioned prior and approximation limits for the capacity model.
 ///
@@ -32,13 +38,13 @@ const CAPACITY_MODEL_ARTIFACT: CapacityModelArtifact = CapacityModelArtifact {
 /// A labelled plant corpus can replace these judgments under a new version.
 #[derive(Clone, Copy)]
 struct CapacityModelArtifact {
-    version: u32,
-    storage_bytes_max: usize,
+    identity: PriorArtifactIdentity,
+    budget: PriorArtifactBudget,
+    coverage: [PriorCoverageRecord; 2],
+    hazard_mean_per_second: f64,
+    hazard_shape: f64,
     observation_quality_alpha: f64,
     observation_quality_beta: f64,
-    observation_probability_error_max: f64,
-    hazard_tail_probability_max: f64,
-    hazard_transition_probability_error_max: f64,
     no_knee_probability: f64,
     no_collapse_probability: f64,
 }
@@ -257,7 +263,7 @@ impl CapacityGrid {
             .checked_add(service_times_seconds.len())
             .ok_or(CapacityGridError::TooLarge)?;
         if capacity_grid_storage_bytes(cell_count, knee_cell_count)
-            .is_none_or(|bytes| bytes > CAPACITY_MODEL_ARTIFACT.storage_bytes_max)
+            .is_none_or(|bytes| bytes > CAPACITY_MODEL_BUDGET.storage_bytes_max() as usize)
         {
             return Err(CapacityGridError::TooLarge);
         }
@@ -503,7 +509,7 @@ impl CapacityFactor {
     pub(crate) fn new_with_prior(
         grid: CapacityGrid,
         change_rate_per_second: f64,
-        arrival_prior: ArrivalPrior,
+        arrival_prior: &ArrivalPrior,
         concurrency_max: f64,
         exposure_min_seconds: f64,
         attempt_count_max: u32,
@@ -528,14 +534,10 @@ impl CapacityFactor {
             return Err(CapacityModelError::StorageBound);
         }
         let start_history_capacity = history_count as u32 as usize + 1;
-        let prior_weights = capacity_prior(&grid);
-        let (hazard_rates_per_second, hazard_weights) = hazard_prior(
-            change_rate_per_second,
-            arrival_prior.shape(),
-            CAPACITY_MODEL_ARTIFACT,
-        )?;
-        let (contamination_probabilities, contamination_weights) =
-            contamination_prior(CAPACITY_MODEL_ARTIFACT)?;
+        let artifact = capacity_model_artifact(change_rate_per_second, arrival_prior.shape())?;
+        let prior_weights = capacity_prior(&grid, artifact);
+        let (hazard_rates_per_second, hazard_weights) = hazard_prior(artifact)?;
+        let (contamination_probabilities, contamination_weights) = contamination_prior(artifact)?;
         let filter_count = hazard_weights
             .len()
             .checked_mul(contamination_weights.len())
@@ -559,7 +561,14 @@ impl CapacityFactor {
                 .ok_or(CapacityModelError::StorageBound)?,
         )
         .ok_or(CapacityModelError::StorageBound)?;
-        if storage_bytes > CAPACITY_MODEL_ARTIFACT.storage_bytes_max {
+        if !prior_artifact_contract_holds(
+            artifact.identity,
+            artifact.budget,
+            &artifact.coverage,
+            filter_curve_count,
+            storage_bytes,
+            u64::try_from(filter_curve_count).map_err(|_| CapacityModelError::StorageBound)?,
+        ) {
             return Err(CapacityModelError::StorageBound);
         }
         let mut filter_weights = Vec::with_capacity(filter_count);
@@ -1049,9 +1058,9 @@ impl CapacityFactor {
     }
 }
 
-fn capacity_prior(grid: &CapacityGrid) -> Vec<f64> {
+fn capacity_prior(grid: &CapacityGrid, artifact: CapacityModelArtifact) -> Vec<f64> {
     let mut weights = match grid.prior {
-        CapacityPrior::LogUniform => log_uniform_capacity_prior(grid),
+        CapacityPrior::LogUniform => log_uniform_capacity_prior(grid, artifact),
         CapacityPrior::LogNormal {
             service_time_median_seconds,
             capacity_median_per_second,
@@ -1061,6 +1070,7 @@ fn capacity_prior(grid: &CapacityGrid) -> Vec<f64> {
             service_time_median_seconds,
             capacity_median_per_second,
             log_standard_deviation,
+            artifact,
         ),
     };
     let service_stride = grid.capacity_count as usize * grid.collapse_count as usize;
@@ -1068,10 +1078,10 @@ fn capacity_prior(grid: &CapacityGrid) -> Vec<f64> {
     for service in 0..grid.service_time_count as usize {
         let start = service * service_stride;
         let service_mass = weights[start..start + service_stride].iter().sum::<f64>();
-        no_knee_weights.push(service_mass * CAPACITY_MODEL_ARTIFACT.no_knee_probability);
+        no_knee_weights.push(service_mass * artifact.no_knee_probability);
     }
     for weight in &mut weights {
-        *weight *= 1.0_f64 - CAPACITY_MODEL_ARTIFACT.no_knee_probability;
+        *weight *= 1.0_f64 - artifact.no_knee_probability;
     }
     weights.extend(no_knee_weights);
     weights
@@ -1125,13 +1135,11 @@ fn capacity_grid_storage_bytes(cell_count: usize, knee_cell_count: usize) -> Opt
 ///
 /// Log spacing only sets cell boundaries. Gamma integration includes the
 /// log-cell-width Jacobian, so this function does not change the exponent.
-fn hazard_prior(
+fn capacity_model_artifact(
     mean_per_second: f64,
     shape: f64,
-    artifact: CapacityModelArtifact,
-) -> Result<(Vec<f64>, Vec<f64>), CapacityModelError> {
-    if artifact.version != 1
-        || !mean_per_second.is_finite()
+) -> Result<CapacityModelArtifact, CapacityModelError> {
+    if !mean_per_second.is_finite()
         || mean_per_second <= 0.0_f64
         || !shape.is_finite()
         || shape <= 0.0_f64
@@ -1141,21 +1149,78 @@ fn hazard_prior(
     let distribution = Gamma::new(shape, mean_per_second / shape)
         .map_err(|_| CapacityModelError::InvalidHazardPrior)?;
     // Keep half of the tail budget for inverse-CDF and CDF roundoff.
-    let tail = artifact.hazard_tail_probability_max * 0.25_f64;
+    let tail = CAPACITY_MODEL_BUDGET.boundary_probability_max() * 0.25_f64;
     let low = distribution.inverse_cdf(tail);
     let high = distribution.inverse_cdf(1.0_f64 - tail);
     if !low.is_finite() || low <= 0.0_f64 || !high.is_finite() || high <= low {
         return Err(CapacityModelError::InvalidHazardPrior);
     }
+    let lower_tail = distribution.cdf(low);
+    let upper_tail = 1.0_f64 - distribution.cdf(high);
+    let random_stream = mean_per_second.to_bits() ^ shape.to_bits().rotate_left(32) | 1;
+    let artifact = CapacityModelArtifact {
+        identity: PriorArtifactIdentity::new(
+            CAPACITY_MODEL_ARTIFACT_SOURCE,
+            CAPACITY_MODEL_ARTIFACT_VERSION,
+            random_stream,
+        ),
+        budget: CAPACITY_MODEL_BUDGET,
+        coverage: [
+            PriorCoverageRecord::new(
+                0.0_f64,
+                1.0_f64,
+                0.0_f64,
+                0.0_f64,
+                OBSERVATION_PROBABILITY_ERROR_MAX,
+            ),
+            PriorCoverageRecord::new(
+                low,
+                high,
+                lower_tail,
+                upper_tail,
+                HAZARD_TRANSITION_PROBABILITY_ERROR_MAX,
+            ),
+        ],
+        hazard_mean_per_second: mean_per_second,
+        hazard_shape: shape,
+        observation_quality_alpha: 1.0_f64,
+        observation_quality_beta: 9.0_f64,
+        no_knee_probability: 0.5_f64,
+        no_collapse_probability: 0.5_f64,
+    };
+    if !prior_artifact_contract_holds(
+        artifact.identity,
+        artifact.budget,
+        &artifact.coverage,
+        1,
+        1,
+        1,
+    ) {
+        return Err(CapacityModelError::InvalidHazardPrior);
+    }
+    Ok(artifact)
+}
+
+fn hazard_prior(
+    artifact: CapacityModelArtifact,
+) -> Result<(Vec<f64>, Vec<f64>), CapacityModelError> {
+    let distribution = Gamma::new(
+        artifact.hazard_shape,
+        artifact.hazard_mean_per_second / artifact.hazard_shape,
+    )
+    .map_err(|_| CapacityModelError::InvalidHazardPrior)?;
+    let coverage = artifact.coverage[HAZARD_COVERAGE_INDEX];
+    let low = coverage.lower_endpoint();
+    let high = coverage.upper_endpoint();
     // The maximum derivative of exp(-x) with respect to log(x) is 1/e.
-    let log_width_max = E * artifact.hazard_transition_probability_error_max;
+    let log_width_max = E * coverage.decision_cost_error();
     let interval_count = ((high / low).ln() / log_width_max).ceil() as usize;
     let count = interval_count
         .checked_add(1)
         .ok_or(CapacityModelError::StorageBound)?;
     if count
         .checked_mul(2 * size_of::<f64>())
-        .is_none_or(|bytes| bytes > artifact.storage_bytes_max)
+        .is_none_or(|bytes| bytes > CAPACITY_MODEL_STORAGE_BYTES_MAX)
     {
         return Err(CapacityModelError::StorageBound);
     }
@@ -1171,7 +1236,7 @@ fn hazard_prior(
         .collect::<Vec<_>>();
     let lower_tail = distribution.cdf(rates[0]);
     let upper_tail = 1.0_f64 - distribution.cdf(rates[count - 1]);
-    if lower_tail + upper_tail > artifact.hazard_tail_probability_max {
+    if lower_tail + upper_tail > artifact.budget.boundary_probability_max() {
         return Err(CapacityModelError::HazardTailMass);
     }
     let mut weights = Vec::with_capacity(count);
@@ -1200,11 +1265,12 @@ fn contamination_prior(
         artifact.observation_quality_beta,
     )
     .map_err(|_| CapacityModelError::InvalidObservationQualityPrior)?;
-    let count = (0.5_f64 / artifact.observation_probability_error_max).ceil() as usize;
+    let count = (0.5_f64 / artifact.coverage[OBSERVATION_COVERAGE_INDEX].decision_cost_error())
+        .ceil() as usize;
     if count == 0
         || count
             .checked_mul(2 * size_of::<f64>())
-            .is_none_or(|bytes| bytes > artifact.storage_bytes_max)
+            .is_none_or(|bytes| bytes > CAPACITY_MODEL_STORAGE_BYTES_MAX)
     {
         return Err(CapacityModelError::InvalidObservationQualityPrior);
     }
@@ -1485,7 +1551,7 @@ fn log_add_exp(left: f64, right: f64) -> f64 {
     }
 }
 
-fn log_uniform_capacity_prior(grid: &CapacityGrid) -> Vec<f64> {
+fn log_uniform_capacity_prior(grid: &CapacityGrid, artifact: CapacityModelArtifact) -> Vec<f64> {
     let service_count = grid.service_time_count as usize;
     let capacity_count = grid.capacity_count as usize;
     let collapse_count = grid.collapse_count as usize;
@@ -1500,8 +1566,11 @@ fn log_uniform_capacity_prior(grid: &CapacityGrid) -> Vec<f64> {
                 grid.capacities_per_second[index * collapse_count]
             });
             for collapse_index in 0..collapse_count {
-                let collapse_mass =
-                    collapse_mass(&grid.collapse_values[..collapse_count], collapse_index);
+                let collapse_mass = collapse_mass(
+                    &grid.collapse_values[..collapse_count],
+                    collapse_index,
+                    artifact,
+                );
                 weights.push(service_mass * capacity_mass * collapse_mass);
             }
         }
@@ -1518,6 +1587,7 @@ fn log_normal_capacity_prior(
     service_median: f64,
     capacity_median: f64,
     log_standard_deviation: f64,
+    artifact: CapacityModelArtifact,
 ) -> Vec<f64> {
     let service_count = grid.service_time_count as usize;
     let capacity_count = grid.capacity_count as usize;
@@ -1540,7 +1610,11 @@ fn log_normal_capacity_prior(
                 weights.push(
                     service_mass
                         * capacity_mass
-                        * collapse_mass(&grid.collapse_values[..collapse_count], collapse_index),
+                        * collapse_mass(
+                            &grid.collapse_values[..collapse_count],
+                            collapse_index,
+                            artifact,
+                        ),
                 );
             }
         }
@@ -1642,7 +1716,7 @@ fn linear_axis_bounds(values: &[f64]) -> Vec<(f64, f64)> {
         .collect()
 }
 
-fn collapse_mass(values: &[f64], index: usize) -> f64 {
+fn collapse_mass(values: &[f64], index: usize, artifact: CapacityModelArtifact) -> f64 {
     if values.len() == 1 {
         return 1.0_f64;
     }
@@ -1650,10 +1724,9 @@ fn collapse_mass(values: &[f64], index: usize) -> f64 {
         return bounded_linear_mass(values, index);
     }
     if index == 0 {
-        return CAPACITY_MODEL_ARTIFACT.no_collapse_probability;
+        return artifact.no_collapse_probability;
     }
-    (1.0_f64 - CAPACITY_MODEL_ARTIFACT.no_collapse_probability)
-        * bounded_linear_mass(&values[1..], index - 1)
+    (1.0_f64 - artifact.no_collapse_probability) * bounded_linear_mass(&values[1..], index - 1)
 }
 
 fn bounded_linear_mass(values: &[f64], index: usize) -> f64 {

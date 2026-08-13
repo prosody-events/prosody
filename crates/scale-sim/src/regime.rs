@@ -1599,7 +1599,7 @@ fn principal_graph(
         // revives cells that current data cover. This rate matches the
         // workload change cadence.
         capacity_change_rate_per_second: 1.0_f64 / 300.0_f64,
-        reliability_prior: ReliabilityPrior::population_fallback(),
+        reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(regime.budget_micros(), 0.01, REPLICA_SECOND_DELAY_RATE)?,

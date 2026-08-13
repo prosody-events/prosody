@@ -240,7 +240,7 @@ fn test_configuration() -> Result<Configuration, TestError> {
         failure_service_weight: 0.3_f64,
         arrival_prior: ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
-        reliability_prior: ReliabilityPrior::population_fallback(),
+        reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,

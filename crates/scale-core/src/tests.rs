@@ -1029,7 +1029,7 @@ fn partition_arrival_update_is_consumed_once() -> Result<(), TestError> {
 #[test]
 fn arrival_change_point_replaces_stale_rate_evidence() -> Result<(), TestError> {
     let prior = crate::ArrivalPrior::new(100.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
-    let mut factor = ArrivalFactor::new(prior);
+    let mut factor = ArrivalFactor::new(&prior);
     for _ in 0_u32..100 {
         factor.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
     }
@@ -1047,7 +1047,7 @@ fn arrival_change_point_replaces_stale_rate_evidence() -> Result<(), TestError> 
 #[test]
 fn arrival_change_point_normalizes_after_an_extreme_rate_change() -> Result<(), TestError> {
     let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
-    let mut factor = ArrivalFactor::new(prior);
+    let mut factor = ArrivalFactor::new(&prior);
 
     factor.update(ArrivalEvidence::new(10_000, 1_000_000), None, 1_000_000);
 
@@ -1058,8 +1058,8 @@ fn arrival_change_point_normalizes_after_an_extreme_rate_change() -> Result<(), 
 #[test]
 fn missing_arrival_prediction_is_cadence_invariant() -> Result<(), TestError> {
     let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
-    let mut coarse = ArrivalFactor::new(prior);
-    let mut fine = ArrivalFactor::new(prior);
+    let mut coarse = ArrivalFactor::new(&prior);
+    let mut fine = ArrivalFactor::new(&prior);
     coarse.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
     fine.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
 
@@ -1077,8 +1077,8 @@ fn missing_arrival_prediction_is_cadence_invariant() -> Result<(), TestError> {
 fn missing_interval_weakens_stale_arrival_evidence_before_the_next_update() -> Result<(), TestError>
 {
     let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
-    let mut contiguous = ArrivalFactor::new(prior);
-    let mut missing = ArrivalFactor::new(prior);
+    let mut contiguous = ArrivalFactor::new(&prior);
+    let mut missing = ArrivalFactor::new(&prior);
     contiguous.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
     missing.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
 
@@ -1651,7 +1651,7 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
         failure_service_weight: 0.3_f64,
         arrival_prior: crate::ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
-        reliability_prior: ReliabilityPrior::population_fallback(),
+        reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
@@ -1714,7 +1714,7 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
         failure_service_weight: 0.3_f64,
         arrival_prior: negligible_arrival_prior()?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
-        reliability_prior: ReliabilityPrior::population_fallback(),
+        reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
@@ -2306,7 +2306,7 @@ fn plateau_configuration() -> Result<Configuration, TestError> {
         failure_service_weight: 0.3_f64,
         arrival_prior: crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
-        reliability_prior: ReliabilityPrior::population_fallback(),
+        reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01_f64, 3.0_f64)?,
@@ -2433,9 +2433,23 @@ fn posterior_mean(state: &ScaleState, query: PosteriorQuery) -> Result<f64, Test
 }
 
 #[test]
-fn test_artifact_matches_validated_construction() -> Result<(), TestError> {
+fn model_priors_carry_validated_artifacts() -> Result<(), TestError> {
     let validated = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?;
-    assert_eq!(crate::ArrivalPrior::test_artifact(), validated);
+    assert_eq!(crate::ArrivalPrior::test_artifact()?, validated);
+    assert_eq!(validated.artifact().version(), 1);
+    assert_eq!(validated.coverage().len(), 4);
+    assert!(
+        validated.coverage().iter().all(
+            |record| record.tail_probability() <= validated.budget().boundary_probability_max()
+        )
+    );
+    let reliability = ReliabilityPrior::authored()?;
+    assert_eq!(reliability.artifact().version(), 1);
+    assert_eq!(reliability.coverage().len(), 2);
+    assert!(reliability.coverage().iter().all(|record| {
+        record.tail_probability() <= reliability.budget().boundary_probability_max()
+            && record.decision_cost_error() <= reliability.budget().decision_cost_error_max()
+    }));
     Ok(())
 }
 
@@ -2452,9 +2466,9 @@ fn configuration() -> Result<Configuration, TestError> {
         report_interval_micros: 1_000_000,
         resource_window_attempt_count_max: 100_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: crate::ArrivalPrior::test_artifact(),
+        arrival_prior: crate::ArrivalPrior::test_artifact()?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
-        reliability_prior: ReliabilityPrior::population_fallback(),
+        reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
         rebalance_time_prior: RebalancePrior::kip848()?,
         objective: ServiceObjective::new(1_000_000, 0.01, 3.0_f64)?,
@@ -2512,7 +2526,7 @@ fn capacity_factor_with_rate(
     Ok(CapacityFactor::new_with_prior(
         grid,
         change_rate_per_second,
-        crate::ArrivalPrior::test_artifact(),
+        &crate::ArrivalPrior::test_artifact()?,
         concurrency_max,
         1.0_f64,
         100_000,

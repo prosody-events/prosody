@@ -8,14 +8,18 @@ use thiserror::Error;
 
 use crate::change_point::ChangePointKernel;
 use crate::random::{PoissonMean, count_as_f64, sample_gamma, sample_poisson};
-use crate::types::{CalendarColumns, CalendarForecast};
-use crate::{ArrivalPosterior, CalendarArtifactId, RandomStream};
+use crate::types::{CalendarColumns, CalendarForecast, prior_artifact_contract_holds};
+use crate::{
+    ArrivalPosterior, CalendarArtifactId, PriorArtifactBudget, PriorArtifactIdentity,
+    PriorCoverageRecord, RandomStream,
+};
 
 const HAZARD_COUNT: usize = 5;
 const RESET_COUNT: usize = 3;
 const RATE_COUNT: usize = 257;
 const CELL_COUNT: usize = HAZARD_COUNT * RESET_COUNT * RATE_COUNT;
 const MODEL_VERSION: u32 = 1;
+const ARRIVAL_ARTIFACT_SOURCE: u64 = 0x0041_5252_4956_414c;
 const T_MAX_SECONDS: f64 = 86_400.0_f64;
 const EPSILON_GRID: f64 = 0.02_f64;
 const EPSILON_BOUNDARY: f64 = 1.0e-6_f64;
@@ -24,15 +28,25 @@ const STORAGE_BUDGET_BYTES: usize = 96 * 1_024;
 const CALENDAR_SEGMENT_LIMIT: usize = 1_024;
 const PATH_SEGMENT_LIMIT: usize = 65_536;
 const ARRIVAL_COUNT_DOMAIN: u64 = 0x6172_7269_7661_6c73;
+const ARRIVAL_ARTIFACT_BUDGET: PriorArtifactBudget = PriorArtifactBudget::new(
+    CELL_COUNT as u32,
+    STORAGE_BUDGET_BYTES as u64,
+    (7 * CELL_COUNT) as u64,
+    EPSILON_BOUNDARY,
+    0.0_f64,
+    EPSILON_GRID,
+);
 
 /// A validated finite-state arrival model.
 ///
 /// The declared model is discrete at evidence boundaries. A rate stays fixed
 /// during an interval. It changes at the next boundary with probability
 /// `1 - exp(-hazard * duration)`. The filter is exact for this finite model.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ArrivalPrior {
-    version: u32,
+    artifact: PriorArtifactIdentity,
+    budget: PriorArtifactBudget,
+    coverage: Box<[PriorCoverageRecord]>,
     authored_shape: f64,
     rate_seconds: f64,
     hazard_center: f64,
@@ -43,8 +57,9 @@ impl ArrivalPrior {
     /// Constructs a validated finite arrival model.
     ///
     /// `shape` and `rate_seconds` define the reset-rate prior. The change rate
-    /// locates the hazard prior. These module-local priors keep the old API
-    /// usable until the versioned prior artifact owns configuration.
+    /// locates the hazard prior. Exact parameter bits identify this authored
+    /// artifact. Its coverage records certify every reset-rate tail and the
+    /// rejected change-path tail.
     ///
     /// # Errors
     ///
@@ -64,11 +79,6 @@ impl ArrivalPrior {
             return Err(ArrivalPriorError::InvalidChangeRate);
         }
         let storage_bytes = Self::storage_bytes()?;
-        if !(0.0_f64..1.0_f64).contains(&EPSILON_GRID)
-            || !(0.0_f64..1.0_f64).contains(&EPSILON_BOUNDARY)
-        {
-            return Err(ArrivalPriorError::InvalidAccuracyBudget);
-        }
         if storage_bytes > STORAGE_BUDGET_BYTES {
             return Err(ArrivalPriorError::StorageBudget {
                 required: storage_bytes,
@@ -104,33 +114,31 @@ impl ArrivalPrior {
         {
             return Err(ArrivalPriorError::InvalidRate);
         }
-        for reset_shape in [shape * 0.5_f64, shape, shape * 2.0_f64] {
-            let reset_rate = reset_shape / mean;
-            let distribution = Gamma::new(reset_shape, reset_rate.recip())
-                .map_err(|_| ArrivalPriorError::InvalidRate)?;
-            let lower = distribution.cdf(rates[0] / 2.0_f64.powf(0.125_f64));
-            let upper = 1.0_f64 - distribution.cdf(rates[RATE_COUNT - 1] * 2.0_f64.powf(0.125_f64));
-            if !lower.is_finite() || !upper.is_finite() {
-                return Err(ArrivalPriorError::InvalidRate);
-            }
-            if lower + upper > EPSILON_BOUNDARY && mean >= 1.0e-9_f64 {
-                return Err(ArrivalPriorError::BoundaryMass);
-            }
-        }
-        let maximum_mean = hazards[HAZARD_COUNT - 1] * T_MAX_SECONDS;
-        let path_change_bound = poisson_tail_bound(maximum_mean, EPSILON_PATH)?;
-        if path_change_bound >= PATH_SEGMENT_LIMIT {
-            return Err(ArrivalPriorError::InvalidPathBound {
-                required: path_change_bound + 1,
-                maximum: PATH_SEGMENT_LIMIT,
-            });
-        }
+        let (coverage, path_change_bound) = arrival_coverage(shape, mean, &rates, &hazards)?;
         let maximum_poisson_mean = rates[RATE_COUNT - 1] * T_MAX_SECONDS;
         if PoissonMean::new(maximum_poisson_mean).is_none() {
             return Err(ArrivalPriorError::InvalidPoissonMean);
         }
+        let random_stream = shape.to_bits()
+            ^ rate_seconds.to_bits().rotate_left(21)
+            ^ change_rate_per_second.to_bits().rotate_left(42)
+            | 1;
+        let artifact =
+            PriorArtifactIdentity::new(ARRIVAL_ARTIFACT_SOURCE, MODEL_VERSION, random_stream);
+        if !prior_artifact_contract_holds(
+            artifact,
+            ARRIVAL_ARTIFACT_BUDGET,
+            &coverage,
+            CELL_COUNT,
+            storage_bytes,
+            (7 * CELL_COUNT) as u64,
+        ) {
+            return Err(ArrivalPriorError::InvalidAccuracyBudget);
+        }
         Ok(Self {
-            version: MODEL_VERSION,
+            artifact,
+            budget: ARRIVAL_ARTIFACT_BUDGET,
+            coverage: coverage.into(),
             authored_shape: shape,
             rate_seconds,
             hazard_center,
@@ -142,21 +150,33 @@ impl ArrivalPrior {
     /// expected change per day. Use it only where the arrival prior is not
     /// the subject. A test pins it equal to validated construction.
     #[cfg(test)]
-    pub(crate) const fn test_artifact() -> Self {
-        Self {
-            version: MODEL_VERSION,
-            authored_shape: 1.0_f64,
-            rate_seconds: 1.0_f64,
-            hazard_center: 1.0_f64 / 86_400.0_f64,
-            path_change_bound: 15,
-        }
+    pub(crate) fn test_artifact() -> Result<Self, ArrivalPriorError> {
+        Self::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)
     }
 
-    pub(crate) const fn path_segment_count_max(self) -> usize {
+    /// Returns this prior's artifact identity.
+    #[must_use]
+    pub const fn artifact(&self) -> PriorArtifactIdentity {
+        self.artifact
+    }
+
+    /// Returns this prior's approximation budget.
+    #[must_use]
+    pub const fn budget(&self) -> PriorArtifactBudget {
+        self.budget
+    }
+
+    /// Returns the reset-rate and path-tail coverage records.
+    #[must_use]
+    pub const fn coverage(&self) -> &[PriorCoverageRecord] {
+        &self.coverage
+    }
+
+    pub(crate) const fn path_segment_count_max(&self) -> usize {
         // Calendar timing needs a separate bound. The shared caller buffer keeps its
         // legacy limit.
         let stochastic = self.path_change_bound + 1;
-        if self.version != MODEL_VERSION {
+        if self.artifact.version() != MODEL_VERSION {
             0
         } else if stochastic > CALENDAR_SEGMENT_LIMIT {
             stochastic
@@ -165,11 +185,11 @@ impl ArrivalPrior {
         }
     }
 
-    pub(crate) const fn shape(self) -> f64 {
+    pub(crate) const fn shape(&self) -> f64 {
         self.authored_shape
     }
 
-    pub(crate) const fn rate_seconds(self) -> f64 {
+    pub(crate) const fn rate_seconds(&self) -> f64 {
         self.rate_seconds
     }
 
@@ -221,7 +241,7 @@ pub(crate) struct ArrivalFactor {
 }
 
 impl ArrivalFactor {
-    pub(crate) fn new(model: ArrivalPrior) -> Self {
+    pub(crate) fn new(model: &ArrivalPrior) -> Self {
         let hazard_scale = [
             0.5_f64,
             2.0_f64.sqrt().recip(),
@@ -268,7 +288,7 @@ impl ArrivalFactor {
             }
         }
         Self {
-            model,
+            model: model.clone(),
             hazards,
             rates,
             reset_probability,
@@ -639,6 +659,61 @@ fn sample_discrete(probability: &[f64], random: &mut RandomStream) -> usize {
 
 fn poisson_mass(count: u32, mean: f64) -> f64 {
     log_poisson_mass(count, mean).exp()
+}
+
+fn arrival_coverage(
+    shape: f64,
+    mean: f64,
+    rates: &[f64; RATE_COUNT],
+    hazards: &[f64; HAZARD_COUNT],
+) -> Result<([PriorCoverageRecord; RESET_COUNT + 1], usize), ArrivalPriorError> {
+    let mut coverage =
+        [PriorCoverageRecord::new(0.0_f64, 1.0_f64, 0.0_f64, 0.0_f64, 0.0_f64); RESET_COUNT + 1];
+    for (record, reset_shape) in coverage
+        .iter_mut()
+        .zip([shape * 0.5_f64, shape, shape * 2.0_f64])
+    {
+        let distribution = Gamma::new(reset_shape, reset_shape.recip())
+            .map_err(|_| ArrivalPriorError::InvalidRate)?;
+        let lower_endpoint = rates[0] / 2.0_f64.powf(0.125_f64);
+        let upper_endpoint = rates[RATE_COUNT - 1] * 2.0_f64.powf(0.125_f64);
+        let lower_tail = distribution.cdf(lower_endpoint / mean);
+        let upper_tail = 1.0_f64 - distribution.cdf(upper_endpoint / mean);
+        if !lower_tail.is_finite() || !upper_tail.is_finite() {
+            return Err(ArrivalPriorError::InvalidRate);
+        }
+        if lower_tail + upper_tail > EPSILON_BOUNDARY {
+            return Err(ArrivalPriorError::BoundaryMass);
+        }
+        *record = PriorCoverageRecord::new(
+            lower_endpoint,
+            upper_endpoint,
+            lower_tail,
+            upper_tail,
+            EPSILON_GRID,
+        );
+    }
+    let maximum_mean = hazards[HAZARD_COUNT - 1] * T_MAX_SECONDS;
+    let path_change_bound = poisson_tail_bound(maximum_mean, EPSILON_PATH)?;
+    let path_change_bound_u32 =
+        u32::try_from(path_change_bound).map_err(|_| ArrivalPriorError::InvalidPathBound {
+            required: path_change_bound,
+            maximum: PATH_SEGMENT_LIMIT,
+        })?;
+    let path_distribution =
+        Poisson::new(maximum_mean).map_err(|_| ArrivalPriorError::InvalidPathBound {
+            required: 0,
+            maximum: PATH_SEGMENT_LIMIT,
+        })?;
+    let path_tail = 1.0_f64 - path_distribution.cdf(u64::from(path_change_bound_u32));
+    coverage[RESET_COUNT] = PriorCoverageRecord::new(
+        0.0_f64,
+        f64::from(path_change_bound_u32),
+        0.0_f64,
+        path_tail,
+        0.0_f64,
+    );
+    Ok((coverage, path_change_bound))
 }
 
 fn log_poisson_mass(count: u32, mean: f64) -> f64 {

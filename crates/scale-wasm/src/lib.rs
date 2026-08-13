@@ -32,6 +32,9 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
     let Ok(rebalance_time_prior) = RebalancePrior::kip848() else {
         return ERROR_CODE;
     };
+    let Ok(reliability_prior) = ReliabilityPrior::authored() else {
+        return ERROR_CODE;
+    };
     let configuration = Configuration {
         cohort_count_max: 8,
         calendar_segment_count_max: 8,
@@ -46,7 +49,7 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
         failure_service_weight: 0.3_f64,
         arrival_prior,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
-        reliability_prior: ReliabilityPrior::population_fallback(),
+        reliability_prior,
         launch_time_prior,
         rebalance_time_prior,
         objective,

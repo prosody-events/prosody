@@ -5,6 +5,7 @@ use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use thiserror::Error;
 
 use crate::change_point::ChangePointKernel;
+use crate::types::prior_artifact_contract_holds;
 use crate::{
     ModelTime, PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord, RandomStream,
 };
@@ -363,7 +364,7 @@ impl LaunchPrior {
             fast_cells.len(),
             slow_cells.len(),
         ])?;
-        validate_artifact(budget, coverage, hypothesis_count, probabilities)?;
+        validate_artifact(artifact, budget, coverage, hypothesis_count, probabilities)?;
         let mut probabilities = probabilities.to_vec();
         normalize(&mut probabilities)?;
         let [fast_coverage, slow_coverage, ..] = coverage else {
@@ -503,7 +504,7 @@ impl RebalancePrior {
         {
             return Err(LeadTimePriorError::InvalidAxis);
         }
-        validate_artifact(budget, coverage, cells.len(), probabilities)?;
+        validate_artifact(artifact, budget, coverage, cells.len(), probabilities)?;
         let mut probabilities = probabilities.to_vec();
         normalize(&mut probabilities)?;
         let Some(&duration_coverage) = coverage.first() else {
@@ -998,36 +999,29 @@ fn checked_product(lengths: &[usize]) -> Result<usize, LeadTimePriorError> {
 }
 
 fn validate_artifact(
+    artifact: PriorArtifactIdentity,
     budget: PriorArtifactBudget,
     coverage: &[PriorCoverageRecord],
     hypothesis_count: usize,
     probabilities: &[f64],
 ) -> Result<(), LeadTimePriorError> {
-    if !budget.is_valid() {
-        return Err(LeadTimePriorError::InvalidArtifactBudget);
-    }
     if probabilities.len() != hypothesis_count {
         return Err(LeadTimePriorError::ProbabilityCount);
     }
-    let hypothesis_count_u32 =
-        u32::try_from(hypothesis_count).map_err(|_| LeadTimePriorError::GridSize)?;
     let storage_bytes = hypothesis_count
         .checked_mul(size_of::<f64>() * 2)
         .ok_or(LeadTimePriorError::GridSize)?;
-    let storage_bytes = u64::try_from(storage_bytes).map_err(|_| LeadTimePriorError::GridSize)?;
-    if hypothesis_count_u32 > budget.hypothesis_count_max()
-        || storage_bytes > budget.storage_bytes_max()
-    {
+    let update_operation_count =
+        u64::try_from(hypothesis_count).map_err(|_| LeadTimePriorError::GridSize)?;
+    if !prior_artifact_contract_holds(
+        artifact,
+        budget,
+        coverage,
+        hypothesis_count,
+        storage_bytes,
+        update_operation_count,
+    ) {
         return Err(LeadTimePriorError::GridBudget);
-    }
-    if coverage.is_empty()
-        || coverage.iter().any(|record| {
-            !record.is_valid()
-                || record.tail_probability() > budget.boundary_probability_max()
-                || record.decision_cost_error() > budget.decision_cost_error_max()
-        })
-    {
-        return Err(LeadTimePriorError::CoverageBudget);
     }
     Ok(())
 }
