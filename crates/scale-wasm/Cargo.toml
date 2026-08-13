@@ -1,0 +1,27 @@
+[package]
+description = "WebAssembly adapter for the Prosody autoscaling laboratory"
+edition = "2024"
+categories = ["algorithms", "simulation", "wasm"]
+keywords = ["autoscaling", "simulation", "wasm"]
+license = "MIT"
+name = "prosody-scale-wasm"
+publish = false
+repository = "https://github.com/prosody-events/prosody"
+version = "0.1.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+threads = ["dep:wasm-bindgen-rayon"]
+
+[dependencies]
+prosody-scale-core = { path = "../scale-core" }
+prosody-scale-sim = { path = "../scale-sim" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+wasm-bindgen-rayon = { workspace = true, optional = true }
+
+[lints]
+workspace = true

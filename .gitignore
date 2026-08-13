@@ -1,4 +1,5 @@
 /target
+/crates/scale-sim/reports/
 .claude/*
 !.claude/settings.json
 !.claude/hooks/
