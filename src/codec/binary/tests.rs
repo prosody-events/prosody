@@ -3,6 +3,7 @@ use std::ptr;
 use std::str;
 
 use super::*;
+use bytes::BytesMut;
 
 /// Test format marker: an opaque token for the prefix-framed test payloads.
 struct PrefixFormat;
@@ -71,8 +72,24 @@ fn serialize_round_trips_bytes() -> color_eyre::Result<()> {
     );
     let mut buf = Vec::new();
     let mut codec = BinaryCodec::<PrefixExtractor, PrefixFormat>::default();
-    codec.serialize(payload, &mut buf)?;
+    codec.serialize_ref(&payload, &mut buf)?;
     assert_eq!(buf, b"hello world");
+    let mut owned = Vec::new();
+    codec.serialize(payload, &mut owned)?;
+    assert_eq!(owned, buf);
+    Ok(())
+}
+
+#[test]
+fn owned_and_borrowed_decode_preserve_the_same_bytes() -> color_eyre::Result<()> {
+    let original = frame(b"abc")?;
+    let mut borrowed = original.clone();
+    let mut codec = BinaryCodec::<PrefixExtractor, PrefixFormat>::default();
+    let borrowed_payload = codec.deserialize(&mut borrowed)?;
+    let owned_payload = codec.deserialize_owned(BytesMut::from(original.as_slice()))?;
+    assert_eq!(owned_payload.bytes, borrowed_payload.bytes);
+    assert_eq!(owned_payload.event_id(), borrowed_payload.event_id());
+    assert_eq!(owned_payload.event_type(), borrowed_payload.event_type());
     Ok(())
 }
 

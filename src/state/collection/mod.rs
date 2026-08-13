@@ -65,7 +65,7 @@ use crate::state::order_codec::OrderedKeyCodec;
 use crate::state::registry::CollectionDef;
 use crate::state::store::{CellBuffer, CoordinateBatch};
 use crate::state::{RESOLVE_FANOUT, StateName, StateType, StoreOutcome};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use educe::Educe;
 use futures::stream::{Stream, StreamExt, TryStreamExt, iter};
 use std::future::Future;
@@ -835,10 +835,10 @@ where
 /// test backend). The single decode path every typed cell read shares.
 pub(in crate::state) fn decode_cell<C: Codec>(cell: Bytes) -> Result<C::Payload, C::Error> {
     match cell.try_into_mut() {
-        Ok(mut buf) => C::with_cached_local(|codec| codec.deserialize(&mut buf)),
+        Ok(buf) => C::with_cached_local(|codec| codec.deserialize_owned(buf)),
         Err(cell) => {
-            let mut buf = cell.to_vec();
-            C::with_cached_local(|codec| codec.deserialize(&mut buf))
+            let buf = BytesMut::from(cell.as_ref());
+            C::with_cached_local(|codec| codec.deserialize_owned(buf))
         }
     }
 }

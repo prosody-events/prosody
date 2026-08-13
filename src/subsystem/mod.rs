@@ -7,17 +7,27 @@
 //! it.
 
 use crate::error::{ClassifyError, ErrorCategory};
+use fixedstr::Flexstr;
 use std::borrow::Borrow;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::str::FromStr;
-use std::sync::Arc;
 use thiserror::Error;
 
+/// Inline capacity for common subsystem names.
+///
+/// `Flexstr` uses one byte for the length. Names of 24 bytes or fewer stay
+/// inline. Longer names remain valid and use heap storage.
+const CAPACITY: usize = 25;
+
 /// Human-readable subsystem name.
+///
+/// Every value is trimmed and is not blank. Common names stay inline. Longer
+/// names remain valid and use heap storage.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SubsystemName(Arc<str>);
+pub struct SubsystemName(Flexstr<CAPACITY>);
 
 impl SubsystemName {
-    /// Creates a non-empty subsystem name.
+    /// Creates a subsystem name, trimmed of surrounding whitespace.
     ///
     /// # Errors
     ///
@@ -26,12 +36,18 @@ impl SubsystemName {
     where
         N: AsRef<str>,
     {
-        let name = name.as_ref().trim();
-        if name.is_empty() {
-            return Err(SubsystemNameError);
-        }
+        let name = normalize(name.as_ref())?;
+        Ok(Self(Flexstr::make(name)))
+    }
 
-        Ok(Self(Arc::from(name)))
+    /// Compares this name with a borrowed input after normalization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubsystemNameError`] when `name` is empty after trimming.
+    pub(crate) fn matches(&self, name: &str) -> Result<bool, SubsystemNameError> {
+        let name = normalize(name)?;
+        Ok(self.as_str() == name)
     }
 
     /// Returns the subsystem name as a string slice.
@@ -47,6 +63,12 @@ impl AsRef<str> for SubsystemName {
     }
 }
 
+impl Display for SubsystemName {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.write_str(self.as_str())
+    }
+}
+
 impl FromStr for SubsystemName {
     type Err = SubsystemNameError;
 
@@ -55,19 +77,11 @@ impl FromStr for SubsystemName {
     }
 }
 
-/// Shares the name's backing allocation, so an error or log field that needs an
-/// owned name never copies the bytes.
-impl From<&SubsystemName> for Arc<str> {
-    fn from(name: &SubsystemName) -> Self {
-        Arc::clone(&name.0)
-    }
-}
-
 /// Lets maps keyed by [`SubsystemName`] resolve `&str` lookups without
 /// allocating, as [`StateName`](crate::state::StateName) does.
 ///
 /// The `Borrow` contract requires `Hash` and `Eq` to agree between the owned
-/// and borrowed forms. The derived `Hash`/`Eq` delegate to the inner `str`, so
+/// and borrowed forms. The derived `Hash`/`Eq` delegate to the inner string, so
 /// they match `str`'s own implementations.
 impl Borrow<str> for SubsystemName {
     fn borrow(&self) -> &str {
@@ -75,7 +89,15 @@ impl Borrow<str> for SubsystemName {
     }
 }
 
-/// Error returned for an empty subsystem name.
+fn normalize(name: &str) -> Result<&str, SubsystemNameError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(SubsystemNameError);
+    }
+    Ok(name)
+}
+
+/// A subsystem name is empty or contains only whitespace.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error("subsystem name must not be empty")]
 pub struct SubsystemNameError;

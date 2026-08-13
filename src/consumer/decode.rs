@@ -1,12 +1,12 @@
 //! Decoding and validation of Kafka messages.
 //!
 //! This module provides functionality for converting rdkafka's
-//! `BorrowedMessage` into Prosody's `ConsumerMessage` type. The decoding
+//! `BorrowedMessage` into Prosody's [`DecodedMessage`] type. The decoding
 //! process includes:
 //!
 //! - Distributed tracing context extraction
-//! - Message header parsing (source system)
-//! - JSON payload validation and parsing
+//! - Message header parsing (source system, and the reserved response headers)
+//! - Payload parsing via the configured codec
 //! - Key extraction and UTF-8 validation
 //! - Timestamp resolution from Kafka metadata
 //!
@@ -26,6 +26,8 @@ use tracing::error;
 use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::ConsumerMessageValue;
+use crate::peer::response::headers::{ResultRequest, parse_result_request};
+use crate::subsystem::SubsystemName;
 use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
 /// A decoded Kafka message without live span references.
@@ -57,25 +59,30 @@ pub struct DecodedMessage<P> {
     pub parent_context: Context,
 }
 
+/// Reads result-request headers that this consumer can answer.
+pub(crate) trait ResultRequestReader: Send {
+    fn request(&self, message: &BorrowedMessage) -> Option<ResultRequest>;
+}
+
+/// Ignores all result-request headers.
+pub(crate) struct IgnoreRequests;
+
 /// Decodes and validates a Kafka message into a `DecodedMessage`.
-///
-/// This function performs comprehensive message processing:
-/// 1. Extracts distributed tracing context from message headers
-/// 2. Parses and validates the payload via the provided codec
-/// 3. Extracts and validates the message key
-/// 4. Resolves the message timestamp from Kafka metadata
 ///
 /// The decoded message contains immutable data and parent trace context.
 /// Callers create their own spans from the context, ensuring span lifecycles
 /// are independent of cache eviction.
 ///
+/// `requests` selects which result-request headers this consumer reads.
+///
 /// `message` is taken as `&mut` so the codec can parse the payload in place
 /// via `payload_mut`, avoiding a copy; its payload bytes are left in an
 /// unspecified state after this call.
-pub fn decode_message<C: Codec>(
+pub fn decode_message<C: Codec, R: ResultRequestReader>(
     message: &mut BorrowedMessage,
     propagator: &TextMapCompositePropagator,
     codec: &mut C,
+    requests: &R,
 ) -> Option<DecodedMessage<C::Payload>> {
     let topic: Topic = Intern::from(message.topic());
     let partition = message.partition();
@@ -84,6 +91,7 @@ pub fn decode_message<C: Codec>(
     let parent_context = propagator.extract(&MessageExtractor::new(message));
 
     let source_system = extract_source_system(message);
+    let request = requests.request(message);
     let timestamp = resolve_timestamp(message);
 
     let Some(key_data) = message.key() else {
@@ -149,6 +157,7 @@ pub fn decode_message<C: Codec>(
         key,
         timestamp,
         payload,
+        request,
     });
 
     Some(DecodedMessage {
@@ -175,6 +184,40 @@ fn extract_source_system(message: &BorrowedMessage) -> Option<SourceSystem> {
             error!("invalid source system encoding: {error:#}; ignoring");
             None
         }
+    }
+}
+
+/// Reads the reserved response headers, or nothing when this consumer answers
+/// no requests.
+///
+/// An unusable header set is counted and dropped, never failed.
+/// [`HeaderRejection`](crate::peer::response::headers::HeaderRejection) states
+/// why.
+impl ResultRequestReader for IgnoreRequests {
+    fn request(&self, _message: &BorrowedMessage) -> Option<ResultRequest> {
+        None
+    }
+}
+
+impl ResultRequestReader for SubsystemName {
+    fn request(&self, message: &BorrowedMessage) -> Option<ResultRequest> {
+        let headers = message.headers()?;
+        match parse_result_request(
+            headers.iter().map(|header| (header.key, header.value)),
+            self,
+        ) {
+            Ok(request) => request,
+            Err(rejection) => {
+                rejection.record();
+                None
+            }
+        }
+    }
+}
+
+impl ResultRequestReader for Option<&SubsystemName> {
+    fn request(&self, message: &BorrowedMessage) -> Option<ResultRequest> {
+        self.as_ref()?.request(message)
     }
 }
 

@@ -6,11 +6,12 @@
 //! outermost retry re-dispatches that routing forever, since there is nothing
 //! left to fall back to.
 
-use crate::consumer::ProsodyConsumer;
+use super::{NoResponses, Responding, ResponsePolicy};
 use crate::consumer::config::{
     ConsumerSetup, LowLatencyMiddlewareConfiguration, TypedConsumerSetup,
 };
 use crate::consumer::error::ConsumerError;
+use crate::consumer::kafka_context::PartitionProviders;
 use crate::consumer::middleware::retry::RetryMiddleware;
 use crate::consumer::middleware::topic::FailureTopicMiddleware;
 use crate::consumer::middleware::{FallibleHandler, HandlerMiddleware};
@@ -18,11 +19,15 @@ use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::{
     build_common_middleware, build_typed_state, cassandra_deps, memory_deps,
 };
+use crate::consumer::{Managers, ProsodyConsumer};
 use crate::high_level::config::TriggerStoreConfiguration;
+use crate::peer::Router;
 use crate::producer::ProsodyProducer;
 use crate::state_reader::ConsumerReaderBackend;
+use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity, EventType};
+use std::sync::Arc;
 
 impl<C: Codec> ProsodyConsumer<C>
 where
@@ -52,10 +57,66 @@ where
         C::Payload: EventIdentity + Send + Sync + 'static,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
+        Self::low_latency_consumer_with_response(
+            setup,
+            low_latency_config,
+            producer,
+            telemetry,
+            handler,
+            NoResponses,
+        )
+        .await
+    }
+
+    /// Creates a low-latency consumer that answers peer requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError`] when another startup step fails.
+    pub async fn low_latency_responding_consumer<T, R, RT: Router>(
+        setup: ConsumerSetup<'_>,
+        low_latency_config: LowLatencyMiddlewareConfiguration,
+        producer: ProsodyProducer<C>,
+        telemetry: Telemetry,
+        handler: T,
+        router: &RT,
+        subsystem: SubsystemName,
+    ) -> Result<Self, ConsumerError>
+    where
+        C::Payload: EventIdentity + Send + Sync + 'static,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        T::Output: Sync + 'static,
+        T::Error: Sync + 'static,
+        R: Codec<Payload = T::Output>,
+    {
+        Self::low_latency_consumer_with_response(
+            setup,
+            low_latency_config,
+            producer,
+            telemetry,
+            handler,
+            Responding::<R, _>::new(router, subsystem),
+        )
+        .await
+    }
+
+    async fn low_latency_consumer_with_response<T, RP>(
+        setup: ConsumerSetup<'_>,
+        low_latency_config: LowLatencyMiddlewareConfiguration,
+        producer: ProsodyProducer<C>,
+        telemetry: Telemetry,
+        handler: T,
+        response: RP,
+    ) -> Result<Self, ConsumerError>
+    where
+        C::Payload: EventIdentity + Send + Sync + 'static,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        RP: ResponsePolicy<T>,
+    {
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
                 let deps = memory_deps(&setup);
-                Self::low_latency_consumer_with_backend(
+                Self::low_latency_consumer_with_policy(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
                         common: setup.common,
@@ -65,12 +126,13 @@ where
                     producer,
                     telemetry,
                     handler,
+                    response,
                 )
                 .await
             }
             (false, TriggerStoreConfiguration::Cassandra(config)) => {
-                let deps = cassandra_deps(&setup, config).await?;
-                Self::low_latency_consumer_with_backend(
+                let deps = cassandra_deps(&setup, config, response.request_subsystem()).await?;
+                Self::low_latency_consumer_with_policy(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
                         common: setup.common,
@@ -80,23 +142,26 @@ where
                     producer,
                     telemetry,
                     handler,
+                    response,
                 )
                 .await
             }
         }
     }
 
-    pub(crate) async fn low_latency_consumer_with_backend<T, B>(
+    pub(crate) async fn low_latency_consumer_with_policy<T, B, RP>(
         setup: TypedConsumerSetup<'_, C, B>,
         low_latency_config: LowLatencyMiddlewareConfiguration,
         producer: ProsodyProducer<C>,
         telemetry: Telemetry,
         handler: T,
+        response: RP,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
         B: ConsumerReaderBackend<C>,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        RP: ResponsePolicy<T>,
     {
         let (components, keyed_state, heartbeats, observer) = build_typed_state(&setup).await?;
         let retry = RetryMiddleware::new(low_latency_config.retry)?;
@@ -105,13 +170,7 @@ where
             setup.consumer.group_id.clone(),
             producer,
         )?;
-        let services = StartupServices {
-            version: keyed_state.version.clone(),
-            telemetry: &telemetry,
-            heartbeats,
-            observer,
-        };
-        let provider = build_common_middleware::<_, C::Payload>(
+        let middleware = build_common_middleware::<_, C::Payload>(
             setup.common,
             setup.consumer,
             telemetry.clone(),
@@ -119,15 +178,28 @@ where
         )?
         .layer(retry.clone())
         .layer(topic)
-        .layer(retry)
-        .into_provider(handler);
-        initialize_consumer::<_, _, _, C>(
+        .layer(retry);
+        let managers: Arc<Managers<C::Payload>> = Arc::default();
+        let (inner_provider, requests) = response.into_parts(handler);
+        let provider = middleware.with_provider(inner_provider);
+        let providers = PartitionProviders {
+            triggers: components.trigger,
+            state: components.state,
+        };
+        let services = StartupServices {
+            version: keyed_state.version.clone(),
+            telemetry: &telemetry,
+            heartbeats,
+            observer,
+            managers: Arc::clone(&managers),
+        };
+        Box::pin(initialize_consumer::<_, _, _, C, _>(
             setup.consumer,
             provider,
-            components.trigger,
-            components.state,
+            providers,
             services,
-        )
+            requests,
+        ))
         .await
     }
 }

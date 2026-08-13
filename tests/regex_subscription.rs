@@ -14,12 +14,8 @@ use prosody::{
     Topic,
     admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration},
     cassandra::config::CassandraConfigurationBuilder,
-    codec::JsonCodecError,
-    consumer::{ConsumerConfigurationBuilder, ConsumerError},
-    high_level::{
-        CassandraHighLevelClient, ConsumerBuilders, HighLevelClientError,
-        config::ModeConfigurationError, mode::Mode,
-    },
+    consumer::ConsumerConfigurationBuilder,
+    high_level::{CassandraHighLevelClient, ConsumerBuilders, mode::Mode},
     producer::ProducerConfigurationBuilder,
     telemetry::emitter::TelemetryEmitterConfiguration,
 };
@@ -86,10 +82,10 @@ async fn create_test_topics(
 }
 
 /// Creates a configured `HighLevelClient` for regex subscription testing.
-fn create_high_level_client(
+async fn create_high_level_client(
     regex_pattern: String,
     consumer_group: String,
-) -> Result<CassandraHighLevelClient<FallibleTestHandler>, HighLevelClientError<JsonCodecError>> {
+) -> Result<CassandraHighLevelClient<FallibleTestHandler>> {
     let bootstrap = vec![BOOTSTRAP_SERVER.to_owned()];
 
     let mut producer_builder = ProducerConfigurationBuilder::default();
@@ -110,19 +106,19 @@ fn create_high_level_client(
             enabled: false,
             ..Default::default()
         },
-        ..ConsumerBuilders::new().map_err(ConsumerError::from)?
+        peer: common::test_peer_config()?,
+        ..ConsumerBuilders::new()?
     };
     let mut cassandra_builder = CassandraConfigurationBuilder::default();
     cassandra_builder.nodes(vec![CASSANDRA_HOST.to_owned()]);
 
-    CassandraHighLevelClient::new(
-        cassandra_builder.build().map_err(|error| {
-            HighLevelClientError::ConsumerConfiguration(ModeConfigurationError::Cassandra(error))
-        })?,
+    Ok(CassandraHighLevelClient::new(
+        cassandra_builder.build()?,
         Mode::BestEffort,
         &mut producer_builder,
         &consumer_builders,
     )
+    .await?)
 }
 
 /// Sends test messages to all topics and returns expected matching count.
@@ -237,7 +233,7 @@ async fn test_regex_topic_subscription() -> Result<()> {
     let (messages_tx, mut messages_rx) = channel(10);
 
     // Create and configure high-level client
-    let client = create_high_level_client(regex_pattern, consumer_group)?;
+    let client = create_high_level_client(regex_pattern, consumer_group).await?;
     client
         .subscribe(FallibleTestHandler { messages_tx })
         .await?;

@@ -1,55 +1,46 @@
 use super::*;
 use color_eyre::Result;
+use color_eyre::eyre::ensure;
 use reqwest::Client;
+use reqwest::StatusCode;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
+/// A hang guard on one probe request. It is never the assertion.
+const REQUEST_GUARD: Duration = Duration::from_secs(5);
+
+/// Both probes answer over HTTP with the verdict the shared predicates give: a
+/// consumer with no partitions assigned is unready and live.
+///
+/// The status is the assertion, not merely that a response arrived. That is
+/// what makes the one pair of functions both surfaces call checkable here.
 #[tokio::test]
 async fn test_probe_server_endpoints_respond() -> Result<()> {
-    // Create mock components
     let managers: Arc<Managers<serde_json::Value>> = Arc::default();
     let heartbeats = HeartbeatRegistry::test();
-
-    // Create ProbeServer instance on a random port (0)
     let server = ProbeServer::new(0, managers, heartbeats)?;
-
     let address = server.local_addr();
-
-    // Create an HTTP client for testing
     let client = Client::new();
 
-    // Give the server a moment to start up
-    sleep(Duration::from_millis(100)).await;
+    // `ProbeServer::new` binds the listener before it returns, so a connection
+    // to `local_addr` is accepted from here on. Nothing has to be waited for.
+    let readyz = check_endpoint(&client, address, "/readyz").await;
+    let livez = check_endpoint(&client, address, "/livez").await;
 
-    // Verify both endpoints respond
-    let readyz_result = check_endpoint(&client, address, "/readyz").await;
-    let livez_result = check_endpoint(&client, address, "/livez").await;
-
-    // Shutdown the server
+    // Asserted after shutdown, so the server stops however the probes answered.
     server.shutdown().await;
-
-    // Assert after shutdown to ensure we always shutdown even if assertions fail
-    assert!(readyz_result, "Readiness probe did not respond");
-    assert!(livez_result, "Liveness probe did not respond");
-
+    ensure!(
+        readyz? == StatusCode::SERVICE_UNAVAILABLE,
+        "a consumer with no partitions assigned is unready"
+    );
+    ensure!(livez? == StatusCode::OK, "the same consumer is live");
     Ok(())
 }
 
-/// Checks if an endpoint responds to HTTP requests within the timeout.
-async fn check_endpoint(client: &Client, address: SocketAddr, path: &str) -> bool {
+/// The status one endpoint answered.
+async fn check_endpoint(client: &Client, address: SocketAddr, path: &str) -> Result<StatusCode> {
     let url = format!("http://localhost:{}{}", address.port(), path);
-
-    // Attempt to connect with timeout
-    match timeout(Duration::from_secs(5), client.get(&url).send()).await {
-        Ok(Ok(_)) => true,
-        Ok(Err(e)) => {
-            error!("Error sending request to {path}: {e:?}");
-            false
-        }
-        Err(_) => {
-            error!("Timeout sending request to {path}");
-            false
-        }
-    }
+    let response = timeout(REQUEST_GUARD, client.get(&url).send()).await??;
+    Ok(response.status())
 }

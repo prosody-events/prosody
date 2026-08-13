@@ -17,7 +17,6 @@ use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
 use std::env::var;
 use std::hash::Hasher;
-use std::mem::take;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,7 +33,7 @@ use crate::util::{
     DEFAULT_IDEMPOTENCE_CACHE_SIZE, from_env, from_env_with_fallback,
     from_option_duration_env_with_fallback, from_vec_env,
 };
-use crate::{Codec, EventIdentity, Key, MOCK_CLUSTER_BOOTSTRAP, SOURCE_SYSTEM_HEADER, Topic};
+use crate::{Codec, EventIdentity, Key, SOURCE_SYSTEM_HEADER, Topic, mock_cluster_bootstrap};
 use std::marker::PhantomData;
 use tracing::field::debug;
 use tracing::info;
@@ -196,7 +195,7 @@ impl<C: Codec> ProsodyProducer<C> {
         let send_timeout = config.send_timeout.map_or(Timeout::Never, Timeout::After);
 
         let bootstrap = if config.mock {
-            MOCK_CLUSTER_BOOTSTRAP.clone()
+            mock_cluster_bootstrap()
         } else {
             config.bootstrap_servers.join(",")
         };
@@ -280,13 +279,8 @@ impl<C: Codec> ProsodyProducer<C> {
     /// - The payload cannot be serialized
     /// - The system time cannot be retrieved
     /// - The Kafka send operation fails
-    #[instrument(
-        skip(self, topic, headers, payload),
-        fields(otel.kind = "producer", messaging.system = "kafka", topic = topic.as_ref(), key = %key, payload_size, partition, offset, timestamp),
-        err
-    )]
     pub async fn send<'a, H>(
-        &'a self,
+        &self,
         headers: H,
         topic: Topic,
         key: &str,
@@ -294,6 +288,34 @@ impl<C: Codec> ProsodyProducer<C> {
     ) -> Result<(), ProducerError<C::Error>>
     where
         H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
+        C::Payload: EventIdentity,
+    {
+        let headers = headers.into_iter();
+        let mut owned = OwnedHeaders::new_with_capacity(headers.len() + 1);
+        for (key, value) in headers {
+            owned = owned.insert(Header {
+                key,
+                value: Some(value.as_bytes()),
+            });
+        }
+        self.send_owned(owned, topic, key, payload).await
+    }
+
+    /// Sends a message with headers that the caller already owns.
+    #[instrument(
+        name = "send",
+        skip(self, topic, headers, payload),
+        fields(otel.kind = "producer", messaging.system = "kafka", topic = topic.as_ref(), key = %key, payload_size, partition, offset, timestamp),
+        err
+    )]
+    pub(crate) async fn send_owned(
+        &self,
+        mut headers: OwnedHeaders,
+        topic: Topic,
+        key: &str,
+        payload: C::Payload,
+    ) -> Result<(), ProducerError<C::Error>>
+    where
         C::Payload: EventIdentity,
     {
         let maybe_event_id = payload.event_id();
@@ -337,31 +359,18 @@ impl<C: Codec> ProsodyProducer<C> {
             .payload(serialized.as_slice())
             .timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64);
 
+        // Add source system header
+        headers = headers.insert(Header {
+            key: SOURCE_SYSTEM_HEADER,
+            value: Some(self.source_system.as_bytes()),
+        });
+        record.headers = Some(headers);
+
         // Inject OpenTelemetry context
         self.propagator.inject_context(
             &Span::current().context(),
             &mut RecordInjector::new(&mut record),
         );
-
-        // Add custom headers
-        let headers = headers.into_iter();
-        let owned_headers = record
-            .headers
-            .get_or_insert_with(|| OwnedHeaders::new_with_capacity(headers.len() + 1));
-
-        // Add source system header
-        *owned_headers = take(owned_headers).insert(Header {
-            key: SOURCE_SYSTEM_HEADER,
-            value: Some(self.source_system.as_bytes()),
-        });
-
-        // Add all custom headers
-        for (key, value) in headers {
-            *owned_headers = take(owned_headers).insert(Header {
-                key,
-                value: Some(value.as_bytes()),
-            });
-        }
 
         // Send the message to Kafka
         let delivery = self

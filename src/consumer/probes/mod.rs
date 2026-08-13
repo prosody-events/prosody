@@ -171,18 +171,17 @@ async fn readiness_probe<P: Send + Sync + 'static>(
     State(ProbeState { managers, .. }): State<ProbeState<P>>,
 ) -> (StatusCode, Cow<'static, str>) {
     let assigned_count = get_assigned_partition_count(&managers);
-
-    if assigned_count == 0 {
-        // No partitions assigned yet - service is not ready
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Cow::Borrowed("no partitions assigned"),
-        )
-    } else {
+    if assigned_count > 0 {
         // Partitions assigned - service is ready
         (
             StatusCode::OK,
             Cow::Owned(format!("{assigned_count} partitions assigned")),
+        )
+    } else {
+        // No partitions assigned yet - service is not ready
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Cow::Borrowed("no partitions assigned"),
         )
     }
 }
@@ -200,17 +199,26 @@ async fn liveness_probe<P: Send + Sync + 'static>(
         heartbeats,
     }): State<ProbeState<P>>,
 ) -> (StatusCode, &'static str) {
-    if heartbeats.any_stalled() || get_is_stalled(&managers) {
+    if is_live(&managers, &heartbeats) {
+        // Consumer is actively processing messages
+        (StatusCode::OK, "No stalled components.")
+    } else {
         // Either a consumer-level actor or a partition has stalled
         (
             StatusCode::SERVICE_UNAVAILABLE,
             "Consumer-level actor or one or more partitions have stalled. See logs for more \
              details.",
         )
-    } else {
-        // Consumer is actively processing messages
-        (StatusCode::OK, "No stalled components.")
     }
+}
+
+/// Whether this consumer is live: no consumer-level actor and no partition has
+/// stalled.
+pub(crate) fn is_live<P: Send + Sync + 'static>(
+    managers: &Managers<P>,
+    heartbeats: &HeartbeatRegistry,
+) -> bool {
+    !heartbeats.any_stalled() && !get_is_stalled(managers)
 }
 
 #[cfg(test)]

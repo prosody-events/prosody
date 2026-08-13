@@ -1,0 +1,13 @@
+//! Typed response delivery.
+
+mod metrics;
+mod route;
+
+pub(crate) use self::metrics::DropReason;
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+pub(crate) use route::Delivery as RouteDelivery;
+pub(crate) use route::{ResponseRoute, RouteOutcome, Then};
+pub(crate) use route::{deliver_response, stage};

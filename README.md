@@ -44,9 +44,20 @@ chain. Handler timeouts cancel handlers that exceed their deadline, preventing a
 - **Backpressure**: Pauses partitions when handlers fall behind.
 - **Mocking**: In-memory Kafka broker for tests (`PROSODY_MOCK=true`).
 - **High-Level Client**: Combines producer and consumer with timer support.
+- **Peer Requests**: Collects one typed response from each requested subsystem.
 - **Failure Handling**: Pipeline (retry forever), Low-Latency (dead letter), Best-Effort (log and skip).
 
 ## Usage
+
+### Build prerequisites
+
+Building Prosody compiles its peer wire contract, so the Protocol Buffers
+compiler must be on `PATH`:
+
+```bash
+apt-get install -y protobuf-compiler   # Debian/Ubuntu
+brew install protobuf                  # macOS
+```
 
 Add Prosody to your `Cargo.toml`:
 
@@ -99,6 +110,10 @@ impl FallibleHandler for MyHandler {
     async fn shutdown(self) {}
 }
 
+impl ClientHandler for MyHandler {
+    type Codecs = Codecs<JsonCodec, UnitCodec>;
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_servers = vec!["localhost:9094".to_owned()];
@@ -119,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_config,
-        ..ConsumerBuilders::default()
+        ..ConsumerBuilders::new()?
     };
 
     let client: CassandraHighLevelClient<MyHandler> = CassandraHighLevelClient::new(
@@ -127,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-    )?;
+    ).await?;
 
     client.subscribe(MyHandler).await?;
 
@@ -135,8 +150,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run your application logic here
 
-    client.unsubscribe().await?;
+    client.shutdown().await?;
     Ok(())
+}
+```
+
+## Peer requests
+
+Peer requests let a producer ask named subsystems to process one Kafka event.
+The request returns the handler result for each subsystem in the requested
+order. Each result reports success, handler failure, malformed data, a codec
+mismatch, or a timeout.
+
+A client can send requests without a subscription. Set `PROSODY_SUBSYSTEM`, or
+set `KeyedStateConfiguration::subsystem`, to make a subscribed client answer
+requests. A handler response uses the response codec in `ClientHandler::Codecs`.
+
+Prosody delivers responses locally when the requester and responder share one
+client. It routes other responses between live peers. See
+[Peer Requests](CONFIGURATION.md#peer-requests) for network and cache settings.
+
+```rust,ignore
+let subsystems = [SubsystemName::try_new("inventory")?];
+let results = client
+    .request(
+        [("x-tenant", "north")],
+        "orders".into(),
+        "order-123",
+        json!({"sku": "A-42"}),
+        &subsystems,
+        Duration::from_secs(2),
+    )
+    .await?;
+
+for result in results {
+    match result {
+        Ok(response) => println!("{response}"),
+        Err(error) => eprintln!("response failed: {error}"),
+    }
 }
 ```
 

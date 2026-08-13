@@ -2,28 +2,32 @@
 
 use super::{
     CassandraClientBackend, CassandraHighLevelClient, ConsumerBuilders, ConsumerState,
-    HighLevelClient, HighLevelClientError, MemoryClientBackend, MemoryHighLevelClient, Mode,
+    HighLevelClient, HighLevelClientError, MemoryClientBackend, MemoryHighLevelClient, Mode, Wire,
+    WireError,
 };
-use crate::Codec;
+use crate::cassandra::CassandraStore;
 use crate::cassandra::config::CassandraConfiguration;
 use crate::high_level::config::ModeConfigurationBuildParams;
 use crate::high_level::topics::missing_topics;
+use crate::peer::Router;
 use crate::producer::{ProducerConfigurationBuilder, ProsodyProducer};
 use crate::propagator::new_propagator;
+use crate::state_reader::StateReaderError;
 use crate::telemetry::{Telemetry, spawn_telemetry_emitter};
+use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
 
-fn new_with_backend<T, C, B>(
+async fn new_with_backend<T, B>(
     backend: B,
     mock: bool,
     mode: Mode,
     producer_builder: &mut ProducerConfigurationBuilder,
     consumer_builders: &ConsumerBuilders,
-) -> Result<HighLevelClient<T, C, B>, HighLevelClientError<C::Error>>
+) -> Result<HighLevelClient<T, B>, HighLevelClientError<WireError<T>>>
 where
-    C: Codec,
-    C::Payload: crate::EventIdentity,
-    B: super::ClientBackend<C>,
+    T: super::ClientHandler,
+    T::Payload: crate::EventIdentity,
+    B: super::ClientBackend<Wire<T>>,
 {
     producer_builder.mock(mock);
     let mut consumer_builders = consumer_builders.clone();
@@ -38,7 +42,7 @@ where
 
     let producer_config = producer_builder.build()?;
     let telemetry = Telemetry::new();
-    let producer: ProsodyProducer<C> = match mode {
+    let producer: ProsodyProducer<Wire<T>> = match mode {
         Mode::Pipeline => {
             ProsodyProducer::pipeline_producer(producer_config.clone(), telemetry.sender())
         }
@@ -78,6 +82,10 @@ where
         }
     }
 
+    let peer = &consumer_builders.peer;
+    let router = Box::pin(backend.build_router(peer)).await?;
+    let requester = router.producer().requester(producer.clone());
+
     Ok(HighLevelClient {
         producer,
         producer_config,
@@ -85,15 +93,18 @@ where
         reader: OnceCell::new(),
         reader_config,
         backend,
-        propagator: new_propagator(),
+        requester,
+        subsystem: consumer_builders.keyed_state.subsystem.clone(),
+        router,
+        propagator: Arc::new(new_propagator()),
         telemetry,
     })
 }
 
-impl<T, C> MemoryHighLevelClient<T, C>
+impl<T> MemoryHighLevelClient<T>
 where
-    C: Codec,
-    C::Payload: crate::EventIdentity + Clone,
+    T: super::ClientHandler,
+    T::Payload: crate::EventIdentity + Clone,
 {
     /// Creates a fully in-memory client.
     ///
@@ -103,37 +114,41 @@ where
     /// # Errors
     ///
     /// Returns an error when configuration or producer initialization fails.
-    pub fn new(
+    pub async fn new(
         mode: Mode,
         producer: &mut ProducerConfigurationBuilder,
         consumers: &ConsumerBuilders,
-    ) -> Result<Self, HighLevelClientError<C::Error>> {
-        new_with_backend(MemoryClientBackend::new(), true, mode, producer, consumers)
+    ) -> Result<Self, HighLevelClientError<WireError<T>>> {
+        new_with_backend(MemoryClientBackend::new(), true, mode, producer, consumers).await
     }
 }
 
-impl<T, C> CassandraHighLevelClient<T, C>
+impl<T> CassandraHighLevelClient<T>
 where
-    C: Codec,
-    C::Payload: crate::EventIdentity + Clone,
+    T: super::ClientHandler,
+    T::Payload: crate::EventIdentity + Clone,
 {
     /// Creates a client backed by Cassandra and Kafka.
     ///
     /// # Errors
     ///
     /// Returns an error when configuration or producer initialization fails.
-    pub fn new(
+    pub async fn new(
         cassandra: CassandraConfiguration,
         mode: Mode,
         producer: &mut ProducerConfigurationBuilder,
         consumers: &ConsumerBuilders,
-    ) -> Result<Self, HighLevelClientError<C::Error>> {
+    ) -> Result<Self, HighLevelClientError<WireError<T>>> {
+        let store = CassandraStore::new(&cassandra)
+            .await
+            .map_err(|error| StateReaderError::store(&error))?;
         new_with_backend(
-            CassandraClientBackend::new(cassandra),
+            CassandraClientBackend::new(store),
             false,
             mode,
             producer,
             consumers,
         )
+        .await
     }
 }

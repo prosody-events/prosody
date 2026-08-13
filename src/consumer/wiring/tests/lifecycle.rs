@@ -1,0 +1,191 @@
+//! What a consumer does about the peer runtime at startup and at shutdown.
+
+use super::{
+    Event, EventLog, RecordingBackend, RecordingDirectory, consumer_config, peer_config,
+    retain_manager, start,
+};
+use crate::consumer::Managers;
+use crate::consumer::decode::IgnoreRequests;
+use crate::consumer::error::{ConsumerError, PeerInitError};
+use crate::heartbeat::HeartbeatRegistry;
+use crate::peer::Router;
+use crate::peer::runtime::prepare_router;
+use color_eyre::Result;
+use color_eyre::eyre::{ensure, eyre};
+use parking_lot::Mutex;
+use serde_json::Value;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::sync::Arc;
+
+/// A consumer without response resources starts and stops without directory
+/// access.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consumer_without_responses_starts_and_stops() -> Result<()> {
+    let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+    let config = consumer_config("peer-lifecycle-none")?;
+    let managers: Arc<Managers<Value>> = Arc::default();
+    let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
+    let consumer = start(
+        &config,
+        managers,
+        heartbeats,
+        Arc::clone(&log),
+        IgnoreRequests,
+    )
+    .await?;
+
+    consumer.shutdown().await;
+
+    // The poll task drops the provider, and nothing else records anything. An
+    // equality rather than a predicate: a predicate over an empty log would
+    // pass without the consumer ever running.
+    assert_eq!(*log.lock(), vec![Event::ProviderDropped]);
+    Ok(())
+}
+
+/// The router outlives the handlers. Consumer drop joins the poll loop and
+/// sweeps the partition manager before router shutdown deregisters the peer.
+///
+/// The sweep is what bounds the peer teardown, so its position between the two
+/// is asserted rather than its occurrence.
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_teardown_follows_drop_and_the_sweep() -> Result<()> {
+    let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+    let directory = RecordingDirectory::new(Arc::clone(&log), false);
+    let backend = RecordingBackend {
+        directory: directory.clone(),
+    };
+    let config = consumer_config("peer-lifecycle-order")?;
+    let managers: Arc<Managers<Value>> = Arc::default();
+    let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
+    let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let router = prepare_router(&peer, &backend).await?;
+    let consumer = start(
+        &config,
+        Arc::clone(&managers),
+        heartbeats,
+        Arc::clone(&log),
+        IgnoreRequests,
+    )
+    .await?;
+    assert!(
+        log.lock()
+            .iter()
+            .any(|event| matches!(event, Event::Registered { .. })),
+        "startup must register the peer"
+    );
+    retain_manager(&config, &managers, Arc::clone(&log))?;
+
+    drop(consumer);
+    router.shutdown().await?;
+
+    let events = log.lock();
+    let position = |wanted: &Event| events.iter().position(|event| event == wanted);
+    let provider = position(&Event::ProviderDropped)
+        .ok_or_else(|| eyre!("the poll loop kept its provider"))?;
+    let swept = position(&Event::ManagerSwept)
+        .ok_or_else(|| eyre!("shutdown did not sweep the retained partition manager"))?;
+    let deregistered = position(&Event::Deregistered)
+        .ok_or_else(|| eyre!("peer teardown did not deregister the peer"))?;
+    ensure!(provider < swept, "the sweep preceded the poll loop");
+    ensure!(swept < deregistered, "peer teardown preceded the sweep");
+    ensure!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::Deregistered))
+            .count()
+            == 1,
+        "peer teardown must deregister exactly once"
+    );
+    assert_eq!(events.last(), Some(&Event::Deregistered));
+    Ok(())
+}
+
+/// Only the caller that takes the runtime state runs the teardown. A clone
+/// whose sibling already shut the consumer down touches nothing shared.
+///
+/// The partition managers are the shared state that would be lost: a losing
+/// caller that swept them would tear down machinery a live poll loop is still
+/// feeding, and would break the one-manager-per-partition rule when a rebalance
+/// lands in that window.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_shutdown_sweeps_nothing() -> Result<()> {
+    let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+    let config = consumer_config("peer-lifecycle-second")?;
+    let managers: Arc<Managers<Value>> = Arc::default();
+    let heartbeats = HeartbeatRegistry::new(config.group_id.clone(), config.stall_threshold);
+    let consumer = start(
+        &config,
+        Arc::clone(&managers),
+        heartbeats,
+        Arc::clone(&log),
+        IgnoreRequests,
+    )
+    .await?;
+    let loser = consumer.clone();
+
+    consumer.shutdown().await;
+    // Retained after the winner finished, so only the loser could sweep it.
+    retain_manager(&config, &managers, Arc::clone(&log))?;
+    loser.shutdown().await;
+
+    assert_eq!(
+        managers.read().len(),
+        1,
+        "the losing shutdown drained the shared partition managers"
+    );
+    assert_eq!(*log.lock(), vec![Event::ProviderDropped]);
+    Ok(())
+}
+
+/// A first directory write that applied and then failed is rolled back, and
+/// the served listener is released.
+///
+/// The current-thread flavour is deliberate. The listener task cannot run
+/// between the abandon that joins it and the synchronous rebind below, so the
+/// rebind observes the release rather than a race.
+#[tokio::test]
+async fn failed_activation_rolls_back_and_releases_the_listener() -> Result<()> {
+    let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+    let directory = RecordingDirectory::new(Arc::clone(&log), true);
+    let backend = RecordingBackend {
+        directory: directory.clone(),
+    };
+    let peer = peer_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let error = prepare_router(&peer, &backend)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("peer startup succeeded despite the scripted failure"))?;
+    assert!(
+        matches!(&error, ConsumerError::Peer(PeerInitError::Directory { message }) if message == "scripted registration failure"),
+        "activation wrapped or changed the directory error: {error:#}"
+    );
+
+    let events = log.lock();
+    let (address, held) = events
+        .iter()
+        .find_map(|event| match event {
+            Event::RegisterFailed {
+                address,
+                address_held,
+            } => Some((*address, *address_held)),
+            _ => None,
+        })
+        .ok_or_else(|| eyre!("the directory did not record the failed registration"))?;
+    assert!(
+        held,
+        "the peer listener did not hold its address during registration"
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [Event::RegisterFailed { .. }, Event::Deregistered]
+        ),
+        "activation rollback events were {events:?}"
+    );
+    drop(events);
+    assert_eq!(directory.inner.len(), 0);
+    let rebound = TcpListener::bind(address)?;
+    drop(rebound);
+    Ok(())
+}

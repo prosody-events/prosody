@@ -10,6 +10,7 @@
 use crate::codec::Codec;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::Coordinate;
+use bytes::{Bytes, BytesMut};
 use std::str::{Utf8Error, from_utf8};
 use thiserror::Error;
 
@@ -92,6 +93,7 @@ impl OrderedKeyCodec for UnitKey {
 
 /// The payload half of `UnitKey` — delegates to `encode`/`decode`, so the
 /// byte-identity law on [`OrderedKeyCodec`] holds by construction.
+/// Every input form writes or checks zero bytes.
 impl Codec for UnitKey {
     type Error = KeyCodecError;
     type Payload = ();
@@ -102,12 +104,16 @@ impl Codec for UnitKey {
         Self::decode(buf)
     }
 
-    fn serialize(
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<Self::Payload, KeyCodecError> {
+        Self::decode(&buf)
+    }
+
+    fn serialize_ref(
         &mut self,
-        payload: Self::Payload,
+        payload: &Self::Payload,
         buf: &mut Vec<u8>,
     ) -> Result<(), KeyCodecError> {
-        buf.extend_from_slice(Self::encode(&payload).as_bytes());
+        buf.extend_from_slice(Self::encode(payload).as_bytes());
         Ok(())
     }
 }
@@ -147,6 +153,7 @@ impl OrderedKeyCodec for Utf8KeyCodec {
 
 /// The payload half of `Utf8KeyCodec` — delegates to `encode`/`decode`, so the
 /// byte-identity law on [`OrderedKeyCodec`] holds by construction.
+/// Owned operations move the string allocation. Borrowed operations copy bytes.
 impl Codec for Utf8KeyCodec {
     type Error = KeyCodecError;
     type Payload = String;
@@ -157,12 +164,32 @@ impl Codec for Utf8KeyCodec {
         Self::decode(buf)
     }
 
+    fn deserialize_owned(&mut self, buf: BytesMut) -> Result<Self::Payload, KeyCodecError> {
+        // Ownership moves the UTF-8 allocation directly into the key string.
+        String::from_utf8(buf.into())
+            .map_err(|error| KeyCodecError::InvalidUtf8(error.utf8_error()))
+    }
+
     fn serialize(
         &mut self,
         payload: Self::Payload,
         buf: &mut Vec<u8>,
     ) -> Result<(), KeyCodecError> {
-        buf.extend_from_slice(Self::encode(&payload).as_bytes());
+        // Ownership moves the string allocation into the output when it is empty.
+        if buf.is_empty() {
+            *buf = payload.into_bytes();
+        } else {
+            buf.extend_from_slice(payload.as_bytes());
+        }
+        Ok(())
+    }
+
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), KeyCodecError> {
+        buf.extend_from_slice(payload.as_bytes());
         Ok(())
     }
 }
@@ -185,6 +212,7 @@ impl OrderedKeyCodec for I64KeyCodec {
 
 /// The payload half of `I64KeyCodec` — delegates to `encode`/`decode`, so the
 /// byte-identity law on [`OrderedKeyCodec`] holds by construction.
+/// Each serialization writes one stack array. Decoding does not allocate.
 impl Codec for I64KeyCodec {
     type Error = KeyCodecError;
     type Payload = i64;
@@ -195,12 +223,16 @@ impl Codec for I64KeyCodec {
         Self::decode(buf)
     }
 
-    fn serialize(
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<Self::Payload, KeyCodecError> {
+        Self::decode(&buf)
+    }
+
+    fn serialize_ref(
         &mut self,
-        payload: Self::Payload,
+        payload: &Self::Payload,
         buf: &mut Vec<u8>,
     ) -> Result<(), KeyCodecError> {
-        buf.extend_from_slice(Self::encode(&payload).as_bytes());
+        buf.extend_from_slice(&order_preserving_i64(*payload));
         Ok(())
     }
 }
@@ -223,6 +255,7 @@ impl OrderedKeyCodec for U64KeyCodec {
 
 /// The payload half of `U64KeyCodec` — delegates to `encode`/`decode`, so the
 /// byte-identity law on [`OrderedKeyCodec`] holds by construction.
+/// Each serialization writes one stack array. Decoding does not allocate.
 impl Codec for U64KeyCodec {
     type Error = KeyCodecError;
     type Payload = u64;
@@ -233,12 +266,16 @@ impl Codec for U64KeyCodec {
         Self::decode(buf)
     }
 
-    fn serialize(
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<Self::Payload, KeyCodecError> {
+        Self::decode(&buf)
+    }
+
+    fn serialize_ref(
         &mut self,
-        payload: Self::Payload,
+        payload: &Self::Payload,
         buf: &mut Vec<u8>,
     ) -> Result<(), KeyCodecError> {
-        buf.extend_from_slice(Self::encode(&payload).as_bytes());
+        buf.extend_from_slice(&payload.to_be_bytes());
         Ok(())
     }
 }

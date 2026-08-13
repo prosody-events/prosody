@@ -1,9 +1,9 @@
-use super::SubsystemName;
+use super::{SubsystemName, SubsystemNameError};
 use crate::error::{ClassifyError, ErrorCategory};
 use quickcheck::{QuickCheck, TestResult};
 
-/// A name that is non-blank after trimming is accepted and stored in its
-/// trimmed form. A blank name (empty or all-whitespace) is rejected.
+/// A name is accepted exactly when its trimmed form is not blank. It is stored
+/// in that trimmed form.
 #[test]
 fn prop_subsystem_name_trims_and_rejects_blank() {
     fn prop(name: String) -> TestResult {
@@ -13,30 +13,42 @@ fn prop_subsystem_name_trims_and_rejects_blank() {
             return TestResult::error("constructor and environment parsing must agree");
         }
         match parsed {
-            Ok(_) if trimmed.is_empty() => TestResult::error("blank name must be rejected"),
             Ok(subsystem) if subsystem.as_str() == trimmed => TestResult::passed(),
             Ok(subsystem) => TestResult::error(format!(
                 "expected {trimmed:?}, got {:?}",
                 subsystem.as_str()
             )),
-            Err(_) if trimmed.is_empty() => TestResult::passed(),
-            Err(_) => TestResult::error("non-blank name must be accepted"),
+            Err(SubsystemNameError) if trimmed.is_empty() => TestResult::passed(),
+            Err(error) => TestResult::error(format!("{trimmed:?} gave {error:?}")),
         }
     }
     QuickCheck::new().quickcheck(prop as fn(String) -> TestResult);
 }
 
-/// Covers blank-name boundary cases that quickcheck's random generator rarely
-/// produces exactly.
+/// Blank names are invalid. Long names remain valid.
 #[test]
-fn blank_subsystem_names_rejected() {
-    for blank in ["", "   ", "\t\n"] {
+fn subsystem_name_validity() -> color_eyre::Result<()> {
+    for refused in ["", "   ", "\t\n"] {
         assert!(
             matches!(
-                SubsystemName::try_new(blank),
+                SubsystemName::try_new(refused),
                 Err(e) if e.classify_error() == ErrorCategory::Permanent
             ),
-            "blank name {blank:?} must be rejected as Permanent",
+            "name of {} bytes must be refused as Permanent",
+            refused.len(),
         );
     }
+
+    let long = "a".repeat(256);
+    assert_eq!(SubsystemName::try_new(&long)?.as_str(), long);
+    Ok(())
+}
+
+/// Existing subsystem names stay inline.
+#[test]
+fn common_names_are_stored_inline() -> color_eyre::Result<()> {
+    for name in ["crm", "sites", "listing-accounts"] {
+        assert!(SubsystemName::try_new(name)?.0.is_fixed());
+    }
+    Ok(())
 }

@@ -2,8 +2,8 @@
 //! [`HighLevelClient`](super::HighLevelClient).
 
 use crate::Topic;
-use crate::consumer::ConsumerError;
 use crate::consumer::middleware::scheduler::SchedulerInitError;
+use crate::consumer::{ConsumerError, ShutdownError};
 use crate::high_level::config::ModeConfigurationError;
 use crate::producer::{ProducerConfigurationBuilderError, ProducerError};
 use crate::state::registry::RegisterStateError;
@@ -26,13 +26,17 @@ pub enum HighLevelClientError<E> {
     #[error("failed to initialize consumer: {0:#}")]
     Consumer(#[from] ConsumerError),
 
+    /// Client teardown failed.
+    #[error("failed to shut down client: {0:#}")]
+    ShutdownFailed(#[from] ShutdownError),
+
+    /// The client no longer accepts operations.
+    #[error("client is shut down")]
+    Closed,
+
     /// Error when the scheduler configuration is invalid.
     #[error("invalid scheduler configuration: {0:#}")]
     SchedulerConfiguration(#[from] SchedulerInitError),
-
-    /// Error when attempting to use an unconfigured consumer.
-    #[error("unconfigured consumer; client does not have a valid consumer configuration")]
-    UnconfiguredConsumer,
 
     /// Error when the consumer configuration failed during build.
     #[error("consumer configuration failed: {0:#}")]
@@ -45,6 +49,10 @@ pub enum HighLevelClientError<E> {
     /// Error when attempting to subscribe an already subscribed consumer.
     #[error("consumer is already subscribed")]
     AlreadySubscribed,
+
+    /// Error when attempting to use an unconfigured consumer.
+    #[error("unconfigured consumer; client does not have a valid consumer configuration")]
+    UnconfiguredConsumer,
 
     /// Error when attempting to unsubscribe a not subscribed consumer.
     #[error("consumer is not subscribed")]

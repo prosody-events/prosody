@@ -65,40 +65,44 @@ async fn test_allowed_events_filtering() -> Result<()> {
         Telemetry::new(),
     )
     .await?;
-    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
-
     let key = "test-key";
 
-    // Create test payloads: one to be filtered, one to be allowed
-    let payload_filtered = json!({
-        "type": "disallowed",
-        "content": "this message should be filtered"
-    });
-    let payload_allowed = json!({
-        "type": "allowed",
-        "content": "this message should be delivered"
-    });
+    let outcome: Result<()> = async {
+        let producer =
+            ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
-    // Send both disallowed and allowed messages
-    producer.send([], topic, key, payload_filtered).await?;
-    producer
-        .send([], topic, key, payload_allowed.clone())
-        .await?;
+        // Create test payloads: one to be filtered, one to be allowed
+        let payload_filtered = json!({
+            "type": "disallowed",
+            "content": "this message should be filtered"
+        });
+        let payload_allowed = json!({
+            "type": "allowed",
+            "content": "this message should be delivered"
+        });
 
-    // Validate receipt of only the allowed message. The wait is a hang-guard
-    // for an event that will arrive, sized generously so cluster slowness never
-    // trips it; the assertions below on key/payload are what prove correctness.
-    let received = timeout(Duration::from_mins(1), messages_rx.recv()).await?;
-    let (received_key, received_payload) =
-        received.ok_or_else(|| eyre!("Timeout waiting for a delivered message"))?;
+        // Send both disallowed and allowed messages
+        producer.send([], topic, key, payload_filtered).await?;
+        producer
+            .send([], topic, key, payload_allowed.clone())
+            .await?;
 
-    // Shut down the consumer and assert the filtering behavior
+        // Validate receipt of only the allowed message. The wait is a
+        // hang-guard for an event that will arrive, sized generously so cluster
+        // slowness never trips it; the assertions below on key/payload are what
+        // prove correctness.
+        let received = timeout(Duration::from_mins(1), messages_rx.recv()).await?;
+        let (received_key, received_payload) =
+            received.ok_or_else(|| eyre!("Timeout waiting for a delivered message"))?;
+
+        ensure!(received_key == key);
+        ensure!(received_payload == payload_allowed);
+        Ok(())
+    }
+    .await;
+
+    // Shut down the consumer and delete the test topic on every path.
     consumer.shutdown().await;
-
-    ensure!(received_key == key);
-    ensure!(received_payload == payload_allowed);
-
-    // Clean up by deleting the test topic
     admin_client.delete_topic(&topic).await?;
-    Ok(())
+    outcome
 }

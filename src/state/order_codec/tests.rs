@@ -10,6 +10,7 @@ use super::{
     order_preserving_i64, order_preserving_i64_decode,
 };
 use crate::error::{ClassifyError, ErrorCategory};
+use bytes::BytesMut;
 use quickcheck::{QuickCheck, TestResult};
 
 /// Asserts both halves of the order-preserving invariant for one codec over a
@@ -176,7 +177,12 @@ fn prop_key_codec_payload_bytes_are_coordinate_bytes() {
         if codec.serialize(key.clone(), &mut buf).is_err() {
             return false;
         }
-        buf == KC::encode(&key).as_bytes() && codec.deserialize(&mut buf.clone()) == Ok(key)
+        let mut borrowed = Vec::new();
+        codec.serialize_ref(&key, &mut borrowed).is_ok()
+            && borrowed == buf
+            && buf == KC::encode(&key).as_bytes()
+            && codec.deserialize(&mut buf.clone()) == Ok(key.clone())
+            && codec.deserialize_owned(BytesMut::from(buf.as_slice())) == Ok(key)
     }
     fn prop(s: String, i: i64, u: u64) -> bool {
         agrees::<Utf8KeyCodec>(s)

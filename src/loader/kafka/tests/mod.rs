@@ -15,10 +15,12 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use slotmap::{DefaultKey, SlotMap};
 use std::env;
 use std::iter::once_with;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
+
+mod result_request;
 
 fn test_topic(name: &str) -> String {
     format!("loader_test_{name}_{}", uuid::Uuid::new_v4())
@@ -30,10 +32,11 @@ fn loader_config() -> LoaderConfiguration {
         group_id: "prosody-test".to_owned(),
         max_permits: 10,
         cache_size: 1, // Minimal size to stress test deadlock prevention and eviction
-        poll_interval: Duration::from_millis(50),
+        poll_interval: Duration::from_millis(1),
         seek_timeout: Duration::from_secs(5),
         discard_threshold: 10,
         message_spans: SpanRelation::default(),
+        responder: None,
     }
 }
 
@@ -126,27 +129,34 @@ async fn produce_messages_to_partition(
     count: usize,
 ) -> color_eyre::Result<Vec<i64>> {
     let producer = producer()?;
-    let mut offsets = Vec::new();
+    produce_messages(&producer, topic, partition, count).await
+}
 
-    for i in 0..count {
-        // Produce JSON payload as expected by decode_message
+async fn produce_messages(
+    producer: &FutureProducer,
+    topic: &str,
+    partition: Partition,
+    count: usize,
+) -> color_eyre::Result<Vec<i64>> {
+    join_all((0..count).map(|i| async move {
         let payload = format!(r#"{{"test_id":{i},"data":"message-{i}"}}"#);
-
-        let delivery = producer
+        let key = format!("key-{i}");
+        producer
             .send(
                 FutureRecord::to(topic)
                     .partition(partition)
-                    .key(&format!("key-{i}"))
+                    .key(&key)
                     .payload(&payload)
                     .headers(OwnedHeaders::new()),
                 Duration::from_secs(5),
             )
             .await
-            .map_err(|(e, _)| e)?;
-        offsets.push(delivery.offset);
-    }
-
-    Ok(offsets)
+            .map(|delivery| delivery.offset)
+            .map_err(|(error, _)| error.into())
+    }))
+    .await
+    .into_iter()
+    .collect()
 }
 
 /// Deletes records across multiple partitions in a single admin call, then
@@ -161,39 +171,42 @@ async fn delete_records_multi(
     admin
         .delete_records(deletions.iter().map(|&(p, o)| (*topic, p, o)))
         .await?;
-    for &(partition, offset) in deletions {
-        wait_for_lso_partition(topic, partition, offset).await?;
-    }
+    let consumer = watermark_consumer()?;
+    join_all(deletions.iter().map(|&(partition, offset)| {
+        wait_for_lso(Arc::clone(&consumer), topic.to_string(), partition, offset)
+    }))
+    .await
+    .into_iter()
+    .collect::<color_eyre::Result<Vec<()>>>()?;
     Ok(())
 }
 
-/// Polls `fetch_watermarks` until the low watermark (LSO) reaches `expected`.
-/// Replaces the fixed 5-second sleep, cutting deletion propagation overhead
-/// from ~5 s to the actual broker propagation time (~50–500 ms locally).
-///
-/// Each `fetch_watermarks` call has a built-in 500ms timeout that yields the
-/// async runtime while the blocking call is in-flight — no extra sleep needed.
-async fn wait_for_lso_partition(
-    topic: &Topic,
-    partition: Partition,
-    expected_lso: Offset,
-) -> color_eyre::Result<()> {
-    let consumer: Arc<BaseConsumer> = Arc::new(
+fn watermark_consumer() -> color_eyre::Result<Arc<BaseConsumer>> {
+    Ok(Arc::new(
         ClientConfig::new()
             .set("bootstrap.servers", "localhost:9094")
             .set("group.id", "prosody-test-setup")
             .create()?,
-    );
+    ))
+}
 
-    let topic_str = topic.to_string();
+/// Polls until the low watermark reaches `expected_lso`.
+///
+/// Each fetch has a 500 ms bound. Concurrent partition waits share one client.
+async fn wait_for_lso(
+    consumer: Arc<BaseConsumer>,
+    topic: String,
+    partition: Partition,
+    expected_lso: Offset,
+) -> color_eyre::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let lso = spawn_blocking({
-            let topic_str = topic_str.clone();
+            let topic = topic.clone();
             let consumer = Arc::clone(&consumer);
             move || {
                 consumer
-                    .fetch_watermarks(&topic_str, partition, Duration::from_millis(500))
+                    .fetch_watermarks(&topic, partition, Duration::from_millis(500))
                     .map(|(low, _high)| low)
             }
         })
@@ -296,14 +309,8 @@ async fn test_discard_threshold_boundary() -> color_eyre::Result<()> {
         let topic = Topic::from(topic_name);
 
         let config = LoaderConfiguration {
-            bootstrap_servers: vec!["localhost:9094".to_owned()],
-            group_id: "prosody-test".to_owned(),
-            max_permits: 10,
-            cache_size: 1, // Minimal size to stress test deadlock prevention and eviction
-            poll_interval: Duration::from_millis(50),
-            seek_timeout: Duration::from_secs(5),
             discard_threshold: 5, // Small threshold for testing
-            message_spans: SpanRelation::default(),
+            ..loader_config()
         };
         let loader = KafkaLoader::<JsonCodec>::new(config, &HeartbeatRegistry::test())?;
 
@@ -516,14 +523,9 @@ async fn test_cache_permit_exhaustion() -> color_eyre::Result<()> {
 
         // Small cache to force evictions
         let config = LoaderConfiguration {
-            bootstrap_servers: vec!["localhost:9094".to_owned()],
-            group_id: "prosody-test".to_owned(),
             max_permits: 20, // Allow many concurrent loads
             cache_size: 2,   // But only 2 cache permits
-            poll_interval: Duration::from_millis(50),
-            seek_timeout: Duration::from_secs(5),
-            discard_threshold: 10,
-            message_spans: SpanRelation::default(),
+            ..loader_config()
         };
         let loader = Arc::new(KafkaLoader::<JsonCodec>::new(
             config,
@@ -710,6 +712,14 @@ type Pending = AHashMap<(usize, usize, usize), usize>;
 
 /// Domain-typed key used in the runner once broker values are resolved.
 type ResolvedKey = (Topic, Partition, Offset);
+
+const INTERLEAVED_TOPIC_COUNT: usize = 4;
+const INTERLEAVED_PARTITION_COUNT: u16 = 16;
+
+/// Topics shared by all generated interleaving cases in this process.
+static INTERLEAVED_TOPICS: OnceLock<Vec<String>> = OnceLock::new();
+static INTERLEAVED_LOADER: OnceLock<Arc<KafkaLoader<JsonCodec>>> = OnceLock::new();
+static INTERLEAVED_PRODUCER: OnceLock<FutureProducer> = OnceLock::new();
 
 /// Replay `ops`, tracking unmatched Requests. Returns the pending map.
 fn tally_pending(ops: &[Op]) -> Pending {
@@ -920,125 +930,166 @@ impl Arbitrary for InterleavedScenario {
 }
 
 async fn run_interleaved_async(scenario: InterleavedScenario) -> color_eyre::Result<()> {
-    // Create all topics concurrently.
-    let topic_names: Vec<String> = scenario
-        .topics
+    let execution = execution_topics(&scenario);
+    let topic_names = INTERLEAVED_TOPICS
+        .get()
+        .ok_or_else(|| color_eyre::eyre::eyre!("the interleaving topics are not ready"))?;
+    let topics: Vec<Topic> = topic_names
         .iter()
-        .map(|_| test_topic("prop_interleaved"))
+        .take(scenario.topics.len())
+        .map(|name| Topic::from(name.as_str()))
         .collect();
-    join_all(
+    let producer = INTERLEAVED_PRODUCER
+        .get()
+        .ok_or_else(|| color_eyre::eyre::eyre!("the interleaving producer is not ready"))?;
+
+    // Produce to all partitions, delete records where lso > 0.
+    let offsets: Vec<Vec<Vec<i64>>> = join_all(
         topic_names
             .iter()
-            .zip(scenario.topics.iter())
-            .map(|(name, t)| create_topic_with_partitions(name, t.partitions.len() as u16)),
+            .zip(execution.iter())
+            .map(|(name, topic)| produce_all_partitions(producer, name, &topic.partitions)),
     )
     .await
     .into_iter()
-    .collect::<color_eyre::Result<Vec<()>>>()?;
+    .collect::<color_eyre::Result<_>>()?;
 
-    let result = async {
-        let topics: Vec<Topic> = topic_names
-            .iter()
-            .map(|n| Topic::from(n.as_str()))
-            .collect();
+    delete_scenario_records(&topics, &execution, &offsets).await?;
 
-        // Produce to all partitions, delete records where lso > 0.
-        let offsets: Vec<Vec<Vec<i64>>> = join_all(
-            topic_names
-                .iter()
-                .zip(scenario.topics.iter())
-                .map(|(name, t)| produce_all_partitions(name, &t.partitions)),
-        )
-        .await
-        .into_iter()
-        .collect::<color_eyre::Result<_>>()?;
+    let loader = INTERLEAVED_LOADER
+        .get()
+        .ok_or_else(|| color_eyre::eyre::eyre!("the interleaving loader is not ready"))?;
 
-        for (t, topic_spec) in scenario.topics.iter().enumerate() {
-            delete_partition_records(&topics[t], &topic_spec.partitions, &offsets[t]).await?;
-        }
+    // Spawn each load_message immediately so tokio drives it in the
+    // background even when we're blocked awaiting a different handle.
+    // SlotMap gives stable DefaultKey handles with no index bookkeeping.
+    let mut handles: SlotMap<
+        DefaultKey,
+        JoinHandle<Result<ConsumerMessage<serde_json::Value>, KafkaLoaderError>>,
+    > = SlotMap::new();
+    let mut pending: AHashMap<ResolvedKey, Vec<DefaultKey>> = AHashMap::new();
 
-        let loader = Arc::new(KafkaLoader::<JsonCodec>::new(
-            loader_config(),
-            &HeartbeatRegistry::test(),
-        )?);
-
-        // Spawn each load_message immediately so tokio drives it in the
-        // background even when we're blocked awaiting a different handle.
-        // SlotMap gives stable DefaultKey handles with no index bookkeeping.
-        let mut handles: SlotMap<
-            DefaultKey,
-            JoinHandle<Result<ConsumerMessage<serde_json::Value>, KafkaLoaderError>>,
-        > = SlotMap::new();
-        let mut pending: AHashMap<ResolvedKey, Vec<DefaultKey>> = AHashMap::new();
-
-        for op in &scenario.ops {
-            match *op {
-                Op::Request {
-                    topic: t_idx,
-                    partition: p_idx,
-                    offset: o_idx,
-                } => {
-                    let topic: Topic = topics[t_idx];
-                    let partition: Partition = p_idx as Partition;
-                    let offset: Offset = offsets[t_idx][p_idx][o_idx];
-                    let loader = Arc::clone(&loader);
-                    let key = handles.insert(tokio::spawn(async move {
-                        loader.load_message(topic, partition, offset).await
-                    }));
-                    pending
-                        .entry((topic, partition, offset))
-                        .or_default()
-                        .push(key);
+    for op in &scenario.ops {
+        match *op {
+            Op::Request {
+                topic: t_idx,
+                partition: p_idx,
+                offset: o_idx,
+            } => {
+                let topic: Topic = topics[t_idx];
+                let partition: Partition = p_idx as Partition;
+                let offset: Offset = offsets[t_idx][p_idx][o_idx];
+                let loader = Arc::clone(loader);
+                let key = handles.insert(tokio::spawn(async move {
+                    loader.load_message(topic, partition, offset).await
+                }));
+                pending
+                    .entry((topic, partition, offset))
+                    .or_default()
+                    .push(key);
+            }
+            Op::Await {
+                topic: t_idx,
+                partition: p_idx,
+                offset: o_idx,
+            } => {
+                let topic: Topic = topics[t_idx];
+                let partition: Partition = p_idx as Partition;
+                let offset: Offset = offsets[t_idx][p_idx][o_idx];
+                let keys = pending
+                    .get_mut(&(topic, partition, offset))
+                    .ok_or_else(|| color_eyre::eyre::eyre!("Await without matching Request"))?;
+                let key = keys
+                    .pop()
+                    .ok_or_else(|| color_eyre::eyre::eyre!("Await without matching Request"))?;
+                if keys.is_empty() {
+                    pending.remove(&(topic, partition, offset));
                 }
-                Op::Await {
-                    topic: t_idx,
-                    partition: p_idx,
-                    offset: o_idx,
-                } => {
-                    let topic: Topic = topics[t_idx];
-                    let partition: Partition = p_idx as Partition;
-                    let offset: Offset = offsets[t_idx][p_idx][o_idx];
-                    let keys = pending
-                        .get_mut(&(topic, partition, offset))
-                        .ok_or_else(|| color_eyre::eyre::eyre!("Await without matching Request"))?;
-                    let key = keys
-                        .pop()
-                        .ok_or_else(|| color_eyre::eyre::eyre!("Await without matching Request"))?;
-                    if keys.is_empty() {
-                        pending.remove(&(topic, partition, offset));
-                    }
-                    let result = timeout(
-                        Duration::from_mins(1),
-                        handles
-                            .remove(key)
-                            .ok_or_else(|| color_eyre::eyre::eyre!("handle already consumed"))?,
-                    )
-                    .await??;
-                    let lso = scenario.topics[t_idx].partitions[p_idx].lso;
-                    assert_load_result(result, t_idx, partition, o_idx, offset, lso)?;
-                }
+                let result = timeout(
+                    Duration::from_mins(1),
+                    handles
+                        .remove(key)
+                        .ok_or_else(|| color_eyre::eyre::eyre!("handle already consumed"))?,
+                )
+                .await??;
+                let lso = scenario.topics[t_idx].partitions[p_idx].lso;
+                assert_load_result(result, t_idx, partition, o_idx, offset, lso)?;
             }
         }
-
-        Ok(())
     }
-    .await;
 
-    let cleanup = cleanup_topics(&topic_names).await;
-    // Preserve the test error if both the test and cleanup failed.
-    result.and(cleanup)
+    Ok(())
+}
+
+/// Reduces each partition to the prefix needed by this scenario's requests.
+///
+/// The effective deletion boundary gives every requested offset the same
+/// deleted or present classification as the generated boundary.
+fn execution_topics(scenario: &InterleavedScenario) -> Vec<TopicSpec> {
+    scenario
+        .topics
+        .iter()
+        .enumerate()
+        .map(|(topic, spec)| TopicSpec {
+            partitions: spec
+                .partitions
+                .iter()
+                .enumerate()
+                .map(|(partition, original)| {
+                    let requested = scenario.ops.iter().filter_map(|op| match *op {
+                        Op::Request {
+                            topic: op_topic,
+                            partition: op_partition,
+                            offset,
+                        } if op_topic == topic && op_partition == partition => Some(offset),
+                        Op::Request { .. } | Op::Await { .. } => None,
+                    });
+                    let Some(last) = requested.max() else {
+                        return PartitionSpec {
+                            message_count: 0,
+                            lso: 0,
+                        };
+                    };
+                    if original.lso > last {
+                        PartitionSpec {
+                            message_count: last + 2,
+                            lso: last + 1,
+                        }
+                    } else {
+                        PartitionSpec {
+                            message_count: last + 1,
+                            lso: original.lso,
+                        }
+                    }
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 async fn cleanup_topics(topic_names: &[String]) -> color_eyre::Result<()> {
-    let mut first_err: Option<color_eyre::Report> = None;
-    for name in topic_names {
-        if let Err(e) = delete_topic(name).await
-            && first_err.is_none()
-        {
-            first_err = Some(e);
+    join_all(topic_names.iter().map(|name| delete_topic(name)))
+        .await
+        .into_iter()
+        .collect::<color_eyre::Result<Vec<()>>>()?;
+    Ok(())
+}
+
+async fn prepare_interleaved_topics() -> color_eyre::Result<Vec<String>> {
+    let mut topics = Vec::with_capacity(INTERLEAVED_TOPIC_COUNT);
+    for _ in 0..INTERLEAVED_TOPIC_COUNT {
+        let name = test_topic("prop_interleaved");
+        if let Err(error) = create_topic_with_partitions(&name, INTERLEAVED_PARTITION_COUNT).await {
+            return match cleanup_topics(&topics).await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(color_eyre::eyre::eyre!(
+                    "topic setup failed: {error:#}; cleanup failed: {cleanup:#}"
+                )),
+            };
         }
+        topics.push(name);
     }
-    first_err.map_or(Ok(()), Err)
+    Ok(topics)
 }
 
 fn run_interleaved_scenario(scenario: InterleavedScenario) -> TestResult {
@@ -1049,16 +1100,48 @@ fn run_interleaved_scenario(scenario: InterleavedScenario) -> TestResult {
 }
 
 #[test]
-fn prop_interleaved_requests() {
+fn prop_interleaved_requests() -> color_eyre::Result<()> {
     let _ = color_eyre::install();
     init_test_logging();
     let test_count = env::var("INTEGRATION_TESTS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(5);
-    QuickCheck::new()
+    let topic_names = TEST_RUNTIME.block_on(prepare_interleaved_topics())?;
+    if INTERLEAVED_TOPICS.set(topic_names.clone()).is_err() {
+        TEST_RUNTIME.block_on(cleanup_topics(&topic_names))?;
+        color_eyre::eyre::bail!("the interleaving topics were already ready");
+    }
+    let loader = {
+        let _runtime = TEST_RUNTIME.enter();
+        Arc::new(KafkaLoader::<JsonCodec>::new(
+            loader_config(),
+            &HeartbeatRegistry::test(),
+        )?)
+    };
+    if INTERLEAVED_LOADER.set(loader).is_err() {
+        TEST_RUNTIME.block_on(cleanup_topics(&topic_names))?;
+        color_eyre::eyre::bail!("the interleaving loader was already ready");
+    }
+    if INTERLEAVED_PRODUCER.set(producer()?).is_err() {
+        TEST_RUNTIME.block_on(cleanup_topics(&topic_names))?;
+        color_eyre::eyre::bail!("the interleaving producer was already ready");
+    }
+
+    let result = QuickCheck::new()
         .tests(test_count)
-        .quickcheck(run_interleaved_scenario as fn(InterleavedScenario) -> TestResult);
+        .quicktest(run_interleaved_scenario as fn(InterleavedScenario) -> TestResult);
+    let cleanup = TEST_RUNTIME.block_on(cleanup_topics(&topic_names));
+    match (result, cleanup) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(failure), Ok(())) => Err(color_eyre::eyre::eyre!(
+            "the interleaving property failed: {failure:?}"
+        )),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(failure), Err(cleanup)) => Err(color_eyre::eyre::eyre!(
+            "the interleaving property failed: {failure:?}; cleanup failed: {cleanup:#}"
+        )),
+    }
 }
 
 impl Arbitrary for PartitionSpec {
@@ -1082,32 +1165,53 @@ impl Arbitrary for TopicSpec {
 
 /// Produce messages to all partitions of a single topic concurrently.
 async fn produce_all_partitions(
+    producer: &FutureProducer,
     topic_name: &str,
     specs: &[PartitionSpec],
 ) -> color_eyre::Result<Vec<Vec<i64>>> {
     join_all(specs.iter().enumerate().map(|(p, spec)| {
-        produce_messages_to_partition(topic_name, p as Partition, spec.message_count)
+        produce_messages(producer, topic_name, p as Partition, spec.message_count)
     }))
     .await
     .into_iter()
     .collect()
 }
 
-/// Delete records for any partition in `specs` where `lso > 0`.
-async fn delete_partition_records(
-    topic: &Topic,
-    specs: &[PartitionSpec],
-    offsets: &[Vec<i64>],
+/// Delete all scenario prefixes in one broker request.
+async fn delete_scenario_records(
+    topics: &[Topic],
+    specs: &[TopicSpec],
+    offsets: &[Vec<Vec<i64>>],
 ) -> color_eyre::Result<()> {
-    let deletions: Vec<(Partition, Offset)> = specs
+    let deletions: Vec<(Topic, Partition, Offset)> = specs
         .iter()
         .enumerate()
-        .filter(|(_, spec)| spec.lso > 0)
-        .map(|(p, spec)| (p as Partition, offsets[p][spec.lso]))
+        .flat_map(|(topic, spec)| {
+            spec.partitions
+                .iter()
+                .enumerate()
+                .filter(|(_, partition)| partition.lso > 0)
+                .map(move |(partition, spec)| {
+                    (
+                        topics[topic],
+                        partition as Partition,
+                        offsets[topic][partition][spec.lso],
+                    )
+                })
+        })
         .collect();
-    if !deletions.is_empty() {
-        delete_records_multi(topic, &deletions).await?;
+    if deletions.is_empty() {
+        return Ok(());
     }
+
+    admin()?.delete_records(deletions.iter().copied()).await?;
+    let consumer = watermark_consumer()?;
+    join_all(deletions.into_iter().map(|(topic, partition, offset)| {
+        wait_for_lso(Arc::clone(&consumer), topic.to_string(), partition, offset)
+    }))
+    .await
+    .into_iter()
+    .collect::<color_eyre::Result<Vec<()>>>()?;
     Ok(())
 }
 

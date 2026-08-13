@@ -122,7 +122,9 @@ pub use crate::consumer::config::{
     ConsumerConfigurationBuilderError, ConsumerSetup, LowLatencyMiddlewareConfiguration,
     MockConfigurationError, PipelineMiddlewareConfiguration, RecoveryTtlMarginError,
 };
-pub use crate::consumer::error::{ConsumerError, KeyedStateInitError};
+pub use crate::consumer::error::{
+    ConsumerError, KeyedStateInitError, PeerInitError, ShutdownError,
+};
 pub use crate::consumer::event_context::{EventContext, TerminationSignals};
 pub use crate::consumer::handler::{DemandType, EventHandler, HandlerProvider, Keyed, Uncommitted};
 pub use crate::consumer::kafka_state::{
@@ -166,6 +168,7 @@ pub mod kafka_state;
 pub mod message;
 pub mod middleware;
 mod modes;
+pub(crate) use modes::{NoResponses, Responding, ResponsePolicy};
 // Crate-wide, not `pub(in crate::consumer)`: keyed-state publication reads the
 // observed partition count from outside this module.
 pub(crate) mod observer;
@@ -173,6 +176,7 @@ pub(crate) mod partition;
 mod poll;
 mod probes;
 pub mod storage;
+mod sweep;
 mod wiring;
 
 /// Atomic counter for tracking changes in partition watermarks.
@@ -186,7 +190,7 @@ type WatermarkVersion = CachePadded<AtomicUsize>;
 /// Maps (Topic, Partition) pairs to their corresponding `PartitionManager`
 /// instances. Protected by a `RwLock` to allow concurrent reads with exclusive
 /// writes.
-type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManager<P>>>;
+pub(crate) type Managers<P> = RwLock<HashMap<(Topic, Partition), PartitionManager<P>>>;
 
 /// Holds the runtime state of the consumer.
 ///
@@ -197,6 +201,17 @@ struct RuntimeState {
     probe_server: Option<ProbeServer>,
     /// The consumer's Kafka observation handle. Shutdown retires its gauge
     /// series so a stopped consumer stops contributing to `sum` aggregations.
+    observer: KafkaObserver,
+}
+
+/// What one teardown still holds after the Kafka poll loop stops.
+///
+/// Only the caller that takes [`RuntimeState`] out of the shared mutex builds
+/// one, and exactly one caller ever does. So holding this value is what proves
+/// a caller owns the teardown, and every other caller gets `None` and touches
+/// nothing shared.
+struct Teardown {
+    probe_server: Option<ProbeServer>,
     observer: KafkaObserver,
 }
 
@@ -213,7 +228,7 @@ struct RuntimeState {
 ///
 /// The `C` type parameter is the [`Codec`] used to deserialize incoming
 /// payloads; the consumer's payload type is `C::Payload`.
-#[derive(Clone, Educe)]
+#[derive(Educe)]
 #[educe(Debug)]
 pub struct ProsodyConsumer<C: Codec = JsonCodec> {
     /// Flag to signal consumer shutdown.
@@ -237,6 +252,25 @@ pub struct ProsodyConsumer<C: Codec = JsonCodec> {
     /// Heartbeat registry for consumer-level actors.
     #[educe(Debug(ignore))]
     heartbeats: HeartbeatRegistry,
+}
+
+/// Every clone reaches the same consumer, so a clone is a second owner and
+/// never a passive view. The first clone to
+/// [`shutdown`](ProsodyConsumer::shutdown) stops the consumer, and so does the
+/// first clone to drop.
+///
+/// Written out rather than derived, because a derive would demand `C: Clone`.
+/// No field holds a `C`, so the codec never has to be cloneable.
+impl<C: Codec> Clone for ProsodyConsumer<C> {
+    fn clone(&self) -> Self {
+        Self {
+            shutdown: Arc::clone(&self.shutdown),
+            managers: Arc::clone(&self.managers),
+            assignment: self.assignment.clone(),
+            runtime_state: Arc::clone(&self.runtime_state),
+            heartbeats: self.heartbeats.clone(),
+        }
+    }
 }
 
 impl<C: Codec> ProsodyConsumer<C> {
@@ -280,52 +314,89 @@ impl<C: Codec> ProsodyConsumer<C> {
         get_is_stalled(&self.managers) || self.heartbeats.any_stalled()
     }
 
-    /// Initiates a graceful shutdown of the Kafka consumer.
+    /// Stops this consumer after all handlers finish.
     ///
-    /// This method stops polling for new messages and waits for any in-flight
-    /// message processing to complete or timeout.
+    /// It stops the poll loop, sweeps each partition, and retires observations.
+    ///
+    /// A second call finds no runtime state and does no work.
+    /// A call on a clone behaves the same after another clone stops the
+    /// consumer.
     pub async fn shutdown(mut self) {
-        self.execute_shutdown().await;
+        if let Some(error) = self.finish_shutdown().await {
+            error!(%error, "consumer shutdown failed");
+        }
     }
 
-    /// Executes the consumer shutdown process.
-    ///
-    /// This method is used by both the public shutdown method and the drop
-    /// handler to ensure resources are properly cleaned up.
-    async fn execute_shutdown(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+    /// Stops polling, drains every manager, and releases observations.
+    async fn finish_shutdown(&mut self) -> Option<ShutdownError> {
+        let (teardown, poll_failure) = self.stop_polling().await?;
+        let swept = sweep::drain_managers(&self.managers).await;
+        teardown.release(swept).await;
+        poll_failure
+    }
 
-        let Some(RuntimeState {
+    /// Stops result-request reading and the poll loop, then waits for the loop.
+    ///
+    /// Answers `None` to every caller but the one that takes the runtime state,
+    /// so a losing caller runs no teardown step. The winner gets the poll
+    /// loop's join failure for its caller to log.
+    async fn stop_polling(&mut self) -> Option<(Teardown, Option<ShutdownError>)> {
+        let RuntimeState {
             poll_handle,
             probe_server,
             observer,
-        }) = self.runtime_state.lock().take()
-        else {
-            return;
+        } = self.runtime_state.lock().take()?;
+
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        let poll_failure = match poll_handle.await {
+            Ok(()) => None,
+            Err(error) => Some(ShutdownError::PollLoop {
+                message: format!("{error:#}"),
+            }),
         };
+        Some((
+            Teardown {
+                probe_server,
+                observer,
+            },
+            poll_failure,
+        ))
+    }
+}
 
-        if let Err(error) = poll_handle.await {
-            error!("consumer shutdown failed: {error:#}");
-        }
-
-        // The `BaseConsumer` is dropped inside the poll task, so its close-time
-        // polling — which can deliver one last statistics sample — finished
-        // before the join handle resolved. Nothing can record over this.
+impl Teardown {
+    /// Retires observation resources after all partition handlers stop.
+    ///
+    /// The [`Swept`](sweep::Swept) proof is the parameter, and only the sweep
+    /// mints one, so this step cannot run before the sweep.
+    async fn release(self, _swept: sweep::Swept) {
+        let Self {
+            probe_server,
+            observer,
+        } = self;
         observer.retire_gauges();
-
         if let Some(probe_server) = probe_server {
             probe_server.shutdown().await;
         }
     }
 }
 
-/// Ensures graceful shutdown when the consumer is dropped.
+/// Stops the consumer when it drops without an explicit shutdown.
 ///
-/// This implementation guarantees that resources are cleaned up even if
-/// the consumer is dropped without explicitly calling `shutdown()`.
+/// This path does await the probe server task. A current-thread runtime cannot
+/// drive that task while this blocks its only thread, so call `shutdown` from
+/// such a runtime.
+///
+/// `Drop` cannot return, so it logs the poll loop's join failure that
+/// [`shutdown`](ProsodyConsumer::shutdown) reports.
 impl<C: Codec> Drop for ProsodyConsumer<C> {
     fn drop(&mut self) {
-        block_on(self.execute_shutdown());
+        block_on(async {
+            if let Some(error) = self.finish_shutdown().await {
+                error!("consumer shutdown failed: {error:#}");
+            }
+        });
     }
 }
 

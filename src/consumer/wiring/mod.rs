@@ -29,6 +29,7 @@ use crate::loader::MemoryLoader;
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state_reader::ConsumerReaderBackend;
 use crate::state_reader::{CassandraReaderBackend, MemoryReaderBackend, StateReaderDependencies};
+use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::{Codec, EventIdentity};
 use std::sync::Arc;
@@ -36,6 +37,9 @@ use validator::Validate;
 
 pub(in crate::consumer) mod runtime;
 pub(in crate::consumer) mod state;
+
+#[cfg(test)]
+mod tests;
 
 /// The concrete common-block composition `build_common_middleware` returns
 /// (innermost `telemetry` to outermost `dedup`). Named — not an opaque `impl
@@ -99,6 +103,7 @@ where
     Ok((components, keyed_state, heartbeats, observer))
 }
 
+/// Builds the in-memory reader dependencies.
 pub(in crate::consumer) fn memory_deps<C>(
     setup: &ConsumerSetup<'_>,
 ) -> StateReaderDependencies<C, MemoryReaderBackend<C>>
@@ -121,6 +126,7 @@ where
 pub(in crate::consumer) async fn cassandra_deps<C>(
     setup: &ConsumerSetup<'_>,
     config: &CassandraConfiguration,
+    responder: Option<&SubsystemName>,
 ) -> Result<StateReaderDependencies<C, CassandraReaderBackend<C>>, ConsumerError>
 where
     C: Codec,
@@ -128,7 +134,7 @@ where
 {
     Ok(StateReaderDependencies::cassandra_with_loader(
         config,
-        LoaderConfiguration::for_consumer(setup.consumer),
+        LoaderConfiguration::for_consumer(setup.consumer, responder),
         setup.common.keyed_state.reader_cache_size(),
         setup.consumer.stall_threshold,
     )

@@ -298,7 +298,7 @@ mod settlement_pins {
     use crate::consumer::middleware::providers::FallibleCloneProvider;
     use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
     use crate::consumer::middleware::tests::test_support::{
-        RecordingOracle, RecordingSession, RecordingTimer, StagingError, committed_value,
+        RecordingOracle, RecordingSession, RecordingTimer, StagingError, committed_json_value,
         recording_session_with_loader,
     };
     use crate::consumer::middleware::{
@@ -593,7 +593,7 @@ mod settlement_pins {
             "the swallowed attempt must record NO marker — the reload must not be filtered",
         );
         assert_eq!(
-            committed_value(&cell_store, fx.registry_key.clone(), "cart").await?,
+            committed_json_value(&cell_store, fx.registry_key.clone(), "cart").await?,
             None,
             "the swallowed attempt must stage nothing",
         );
@@ -654,7 +654,7 @@ mod settlement_pins {
             "the boundary records the RELOADED message's id, read from the override",
         );
         assert_eq!(
-            committed_value(&cell_store, fx.registry_key.clone(), "cart").await?,
+            committed_json_value(&cell_store, fx.registry_key.clone(), "cart").await?,
             Some(json!({ "offset": 0_i64 })),
             "the reload's write staged under the timer session and promoted",
         );
@@ -718,7 +718,7 @@ mod settlement_pins {
             "a permanently-failed reload records the reloaded message's id",
         );
         assert_eq!(
-            committed_value(&cell_store, fx.registry_key.clone(), "cart").await?,
+            committed_json_value(&cell_store, fx.registry_key.clone(), "cart").await?,
             None,
             "permanent reload failure stages nothing",
         );

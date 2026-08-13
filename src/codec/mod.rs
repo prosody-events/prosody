@@ -1,8 +1,10 @@
 //! Wire-format abstraction for encoding and decoding message payloads.
 
+use bytes::{Bytes, BytesMut};
 use std::error::Error;
 
 mod binary;
+mod const_id;
 mod fixed;
 mod json;
 mod serialize_buf;
@@ -12,7 +14,10 @@ pub use binary::{
     JsonBinaryCodec, JsonExtractError, JsonExtractor, JsonFormat, JsonPassthroughStateCodec,
     NoopExtractor,
 };
-pub use fixed::{FixedCodec, I64Codec, I64CodecError, PairCodecError};
+pub use fixed::{
+    FixedCodec, I64Codec, I64CodecError, InfallibleCodec, InfallibleCodecError, PairCodecError,
+    UnitCodec, UnitCodecError,
+};
 pub use json::{JsonCodec, JsonCodecError, serialize_to_json};
 
 // Crate-internal: not part of the public codec API surface.
@@ -63,22 +68,70 @@ pub trait Codec: Default + Send + Sync + 'static {
     /// Returns an error if the bytes cannot be decoded into `Self::Payload`.
     fn deserialize(&mut self, buf: &mut [u8]) -> Result<Self::Payload, Self::Error>;
 
+    /// Deserializes a payload from an owned buffer.
+    ///
+    /// Implement this method to move storage into the payload or reuse its
+    /// allocation. Use [`Self::deserialize`] when the caller retains storage.
+    /// The default passes the owned storage to [`Self::deserialize`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes cannot be decoded into `Self::Payload`.
+    fn deserialize_owned(&mut self, mut buf: BytesMut) -> Result<Self::Payload, Self::Error> {
+        self.deserialize(&mut buf)
+    }
+
+    /// Deserializes a payload from immutable owned bytes.
+    ///
+    /// Implement this method when the codec can retain or read immutable
+    /// storage. The default transfers unique storage to
+    /// [`Self::deserialize_owned`] and copies shared storage only when the
+    /// codec requires mutable bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes cannot be decoded into `Self::Payload`.
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<Self::Payload, Self::Error> {
+        let buf = match buf.try_into_mut() {
+            Ok(buf) => buf,
+            Err(buf) => BytesMut::from(buf.as_ref()),
+        };
+        self.deserialize_owned(buf)
+    }
+
     /// Appends the serialized payload to `buf`, consuming the payload.
     /// Callers are responsible for clearing `buf` first if a fresh buffer is
     /// required; codecs that own a wire-format byte buffer (e.g.
     /// [`BinaryCodec`]) may move it into `buf` directly when `buf` is empty,
     /// avoiding a copy.
+    /// The default passes a borrow to [`Self::serialize_ref`].
     ///
     /// # Errors
     ///
     /// Returns an error if `payload` cannot be encoded.
-    fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error>;
+    fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
+        self.serialize_ref(&payload, buf)
+    }
+
+    /// Appends a borrowed payload to `buf`.
+    ///
+    /// Implement this method for callers that must retain the payload. Use
+    /// [`Self::serialize`] when the caller can transfer ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `payload` cannot be encoded.
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Self::Error>;
 
     /// Runs `f` with an instance of this codec.
     ///
     /// The default constructs a fresh codec via `Default` per call — all a
     /// user codec needs is `FORMAT_ID`, `Payload`, `Error`, and the two
-    /// serialize/deserialize methods. Override it to reuse internal buffers
+    /// required data methods. Override it to reuse internal buffers
     /// (such as `simd_json::Buffers`) across calls by backing it with a
     /// `thread_local!` of the concrete codec type so dispatch stays static;
     /// [`JsonCodec`] does exactly that.

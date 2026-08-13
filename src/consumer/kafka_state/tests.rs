@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::Key;
+use crate::codec::Codec;
 use crate::consumer::event_context::StateAccessError;
 use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
@@ -16,6 +17,7 @@ use crate::state::Direction;
 use crate::state::descriptor::tests::{TestSession, bind_registered};
 use crate::state::descriptor::{DequeHandle, DescriptorIdentity, MapHandle};
 use crate::state::order_codec::Utf8KeyCodec;
+use bytes::BytesMut;
 use color_eyre::eyre::{Result, bail, eyre};
 use futures::StreamExt;
 use futures::executor::block_on;
@@ -43,7 +45,6 @@ fn last_seen() -> MessageDescriptor<MemoryLoader<Value>> {
 /// (mismatch ⇒ Permanent), so pin both literals — a rename fails loudly here.
 #[test]
 fn kafka_message_identity_tokens_are_frozen() {
-    use crate::codec::Codec;
     use crate::state::descriptor::CellResolver;
 
     assert_eq!(MessageRefCodec::FORMAT_ID, "message-ref");
@@ -89,9 +90,15 @@ fn prop_kafka_message_ref_msgpack_roundtrip() {
         let Ok(()) = codec.serialize(message_ref.clone(), &mut buf) else {
             return false;
         };
-        codec
-            .deserialize(&mut buf)
-            .is_ok_and(|decoded| decoded == message_ref)
+        let mut borrowed = Vec::new();
+        codec.serialize_ref(&message_ref, &mut borrowed).is_ok()
+            && borrowed == buf
+            && codec
+                .deserialize(&mut buf.clone())
+                .is_ok_and(|decoded| decoded == message_ref)
+            && codec
+                .deserialize_owned(BytesMut::from(buf.as_slice()))
+                .is_ok_and(|decoded| decoded == message_ref)
     }
     QuickCheck::new().quickcheck(prop as fn(ArbMessageRef) -> bool);
 }

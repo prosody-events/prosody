@@ -1,12 +1,13 @@
 //! The pipeline mode: retry, defer, and monopolization middleware layered
 //! outside the common block.
 
-use crate::consumer::ProsodyConsumer;
+use super::{NoResponses, Responding, ResponsePolicy};
 use crate::consumer::config::{
     CommonConfiguration, ConsumerConfiguration, ConsumerSetup, PipelineMiddlewareConfiguration,
     TypedConsumerSetup,
 };
 use crate::consumer::error::ConsumerError;
+use crate::consumer::kafka_context::PartitionProviders;
 use crate::consumer::middleware::deduplication::DeduplicationStoreProvider;
 use crate::consumer::middleware::defer::message::store::MessageDeferStoreProvider;
 use crate::consumer::middleware::defer::timer::store::TimerDeferStoreProvider;
@@ -21,12 +22,15 @@ use crate::consumer::wiring::runtime::{StartupServices, initialize_consumer};
 use crate::consumer::wiring::{
     build_common_middleware, build_typed_state, cassandra_deps, memory_deps,
 };
+use crate::consumer::{Managers, ProsodyConsumer};
 use crate::heartbeat::HeartbeatRegistry;
 use crate::high_level::config::TriggerStoreConfiguration;
 use crate::loader::MessageLoader;
+use crate::peer::Router;
 use crate::state::manager::{PartitionStateManager, PartitionStateProvider};
 use crate::state::session::EventSession;
 use crate::state_reader::ConsumerReaderBackend;
+use crate::subsystem::SubsystemName;
 use crate::telemetry::Telemetry;
 use crate::timers::store::TriggerStoreProvider;
 use crate::{Codec, EventIdentity, EventType};
@@ -46,14 +50,14 @@ struct PipelineMiddlewareStack {
 }
 
 impl PipelineMiddlewareStack {
-    async fn into_consumer<T, MP, TP, DP, PP, SP, L, C>(
+    async fn into_consumer<T, MP, TP, DP, PP, SP, L, C, RP>(
         self,
         message_defer_middleware: MessageDeferMiddleware<MP, L, FailureTracker>,
         timer_provider: TP,
         dedup_provider: DP,
-        trigger_provider: PP,
-        state_provider: SP,
+        partition_providers: PartitionProviders<PP, SP>,
         handler: T,
+        response: RP,
     ) -> Result<ProsodyConsumer<C>, ConsumerError>
     where
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
@@ -67,6 +71,7 @@ impl PipelineMiddlewareStack {
         L: MessageLoader<Payload = C::Payload> + 'static,
         C: Codec,
         C::Payload: Send + Sync + 'static + EventIdentity + EventType + Clone,
+        RP: ResponsePolicy<T>,
     {
         let timer_defer_middleware = TimerDeferMiddleware::new(
             self.defer_config,
@@ -89,31 +94,36 @@ impl PipelineMiddlewareStack {
         // so every attempt is a fresh dispatch. The dedup filter sits INSIDE
         // message-defer so a deferred reload's duplicate check sees the reload
         // identity override.
-        let common_middleware = build_common_middleware::<DP, C::Payload>(
+        let common_middleware = build_common_middleware::<_, C::Payload>(
             &self.common_config,
             &self.consumer_config,
             self.telemetry.clone(),
             dedup_provider,
         )?;
-        let provider = common_middleware
+        let middleware = common_middleware
             .layer(self.monopolization_middleware)
             .layer(timer_defer_middleware)
             .layer(message_defer_middleware)
-            .layer(self.retry_middleware)
-            .into_provider(handler);
-
-        initialize_consumer::<_, _, _, C>(
+            .layer(self.retry_middleware);
+        let managers: Arc<Managers<C::Payload>> = Arc::default();
+        let (inner_provider, requests) = response.into_parts(handler);
+        let provider = middleware.with_provider(inner_provider);
+        let services = StartupServices {
+            version,
+            telemetry: &self.telemetry,
+            heartbeats: self.heartbeats,
+            observer: self.observer,
+            managers: Arc::clone(&managers),
+        };
+        // Preparation is the last fallible step of this mode: no `?` after it
+        // could drop a served listener.
+        Box::pin(initialize_consumer::<_, _, _, C, _>(
             &self.consumer_config,
             provider,
-            trigger_provider,
-            state_provider,
-            StartupServices {
-                version,
-                telemetry: &self.telemetry,
-                heartbeats: self.heartbeats,
-                observer: self.observer,
-            },
-        )
+            partition_providers,
+            services,
+            requests,
+        ))
         .await
     }
 }
@@ -143,10 +153,62 @@ where
         C::Payload: EventIdentity,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
     {
+        Self::pipeline_consumer_with_response(
+            setup,
+            pipeline_config,
+            telemetry,
+            handler,
+            NoResponses,
+        )
+        .await
+    }
+
+    /// Creates a pipeline consumer that answers peer requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsumerError`] when another startup step fails.
+    pub async fn pipeline_responding_consumer<T, R, RT: Router>(
+        setup: ConsumerSetup<'_>,
+        pipeline_config: PipelineMiddlewareConfiguration,
+        telemetry: Telemetry,
+        handler: T,
+        router: &RT,
+        subsystem: SubsystemName,
+    ) -> Result<Self, ConsumerError>
+    where
+        C::Payload: EventIdentity,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        T::Output: Sync + 'static,
+        T::Error: Sync + 'static,
+        R: Codec<Payload = T::Output>,
+    {
+        Self::pipeline_consumer_with_response(
+            setup,
+            pipeline_config,
+            telemetry,
+            handler,
+            Responding::<R, _>::new(router, subsystem),
+        )
+        .await
+    }
+
+    async fn pipeline_consumer_with_response<T, RP>(
+        setup: ConsumerSetup<'_>,
+        pipeline_config: PipelineMiddlewareConfiguration,
+        telemetry: Telemetry,
+        handler: T,
+        response: RP,
+    ) -> Result<Self, ConsumerError>
+    where
+        C::Payload: EventIdentity,
+        T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        RP: ResponsePolicy<T>,
+    {
         match (setup.consumer.mock, setup.trigger_store) {
             (true, _) | (false, TriggerStoreConfiguration::InMemory) => {
                 let deps = memory_deps(&setup);
-                Self::pipeline_consumer_with_backend(
+                Self::pipeline_consumer_with_policy(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
                         common: setup.common,
@@ -155,12 +217,13 @@ where
                     pipeline_config,
                     telemetry,
                     handler,
+                    response,
                 )
                 .await
             }
             (false, TriggerStoreConfiguration::Cassandra(config)) => {
-                let deps = cassandra_deps(&setup, config).await?;
-                Self::pipeline_consumer_with_backend(
+                let deps = cassandra_deps(&setup, config, response.request_subsystem()).await?;
+                Self::pipeline_consumer_with_policy(
                     TypedConsumerSetup {
                         consumer: setup.consumer,
                         common: setup.common,
@@ -169,22 +232,25 @@ where
                     pipeline_config,
                     telemetry,
                     handler,
+                    response,
                 )
                 .await
             }
         }
     }
 
-    pub(crate) async fn pipeline_consumer_with_backend<T, B>(
+    pub(crate) async fn pipeline_consumer_with_policy<T, B, RP>(
         setup: TypedConsumerSetup<'_, C, B>,
         pipeline_config: PipelineMiddlewareConfiguration,
         telemetry: Telemetry,
         handler: T,
+        response: RP,
     ) -> Result<Self, ConsumerError>
     where
         C::Payload: EventIdentity + Send + Sync + 'static,
         B: ConsumerReaderBackend<C>,
         T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
+        RP: ResponsePolicy<T>,
     {
         let PipelineMiddlewareConfiguration {
             retry,
@@ -219,13 +285,16 @@ where
             &stack.telemetry,
         )?;
         stack
-            .into_consumer::<_, _, _, _, _, _, _, C>(
+            .into_consumer::<_, _, _, _, _, _, _, C, _>(
                 message_defer,
                 components.timers,
                 components.dedup,
-                components.trigger,
-                components.state,
+                PartitionProviders {
+                    triggers: components.trigger,
+                    state: components.state,
+                },
                 handler,
+                response,
             )
             .await
     }

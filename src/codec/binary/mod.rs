@@ -128,7 +128,9 @@ impl BinaryFormat for JsonFormat {
 /// on the (now scratch) input to pull out the event id and type. The codec
 /// owns one extractor instance for its lifetime, so any state the extractor
 /// keeps (parser buffers, lookup tables) is reused across calls. On
-/// `serialize`, the stored bytes are appended to the output buffer.
+/// Owned serialization moves the byte vector into an empty output buffer.
+/// Borrowed serialization copies bytes because the payload must retain them.
+/// Both decode forms preserve wire bytes before a mutable extractor runs.
 pub struct BinaryCodec<E: BinaryExtractor, F: BinaryFormat> {
     extractor: E,
     _format: PhantomData<fn() -> F>,
@@ -169,6 +171,16 @@ impl<E: BinaryExtractor, F: BinaryFormat> Codec for BinaryCodec<E, F> {
         } else {
             buf.append(&mut payload.bytes);
         }
+        Ok(())
+    }
+
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        // A borrow requires one copy because the payload must retain its bytes.
+        buf.extend_from_slice(&payload.bytes);
         Ok(())
     }
 

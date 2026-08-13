@@ -37,8 +37,12 @@ pub use crate::error::ErrorCategory;
 
 // ── Wire up the high-level client ────────────────────────────────────────────
 
+/// Peer listener, routing, and request configuration.
+pub use crate::PeerConfiguration;
 /// Cassandra connection configuration (required for production timer storage).
 pub use crate::cassandra::config::CassandraConfigurationBuilder;
+/// Codecs for JSON, empty values, and uninhabited errors.
+pub use crate::codec::{InfallibleCodec, JsonCodec, UnitCodec};
 /// Consumer bootstrap and subscription configuration.
 pub use crate::consumer::ConsumerConfiguration;
 /// High-level client using Cassandra storage.
@@ -51,8 +55,12 @@ pub use crate::high_level::HighLevelClient;
 pub use crate::high_level::MemoryHighLevelClient;
 /// Operational mode: `Pipeline`, `LowLatency`, or `BestEffort`.
 pub use crate::high_level::mode::Mode;
+/// High-level handler codec contracts.
+pub use crate::high_level::{ClientHandler, Codecs, JsonCodecs};
 /// Producer bootstrap and delivery configuration.
 pub use crate::producer::ProducerConfiguration;
+/// Errors for a complete request and for each subsystem response.
+pub use crate::requester::{RequestError, ResponseError};
 /// Standalone client for published state reads.
 pub use crate::state_reader::StateReaderClient;
 /// Shared dependencies passed to a standalone state reader client.

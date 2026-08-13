@@ -211,6 +211,12 @@ impl<C, S, P, I, L> ReaderComponents<C, S, P, I, L> {
             codec: PhantomData,
         }
     }
+
+    /// Returns the cell component for another shared client component.
+    #[cfg(test)]
+    pub(crate) const fn cells_ref(&self) -> &S {
+        &self.cells
+    }
 }
 
 impl<C, S, P, I, L> ReaderBackend<C> for ReaderComponents<C, S, P, I, L>

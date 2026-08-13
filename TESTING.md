@@ -26,7 +26,8 @@ homes — per-file scaffolding clones are how this test tree once doubled:
 
 | Area | Home |
 | --- | --- |
-| Crate-wide (`integration_test_count`, `test_cassandra_config`; span capture: `captured_spans{,_filtered}`, `assert_span_relation`, `sampled_remote_context`) | `src/tests/test_util.rs` |
+| Crate-wide (`integration_test_count`, `test_cassandra_config`; span capture: `captured_spans{,_filtered}`, `GlobalSpans`, `assert_span_relation`, `named`, `sampled_remote_context`) | `src/tests/test_util/mod.rs` |
+| Metric capture (`GlobalMetrics`, `label`, `assert_distinct_labels`) | `src/tests/test_util/metrics.rs` |
 | Consumer middleware (mock contexts, handlers, fixtures) | `src/consumer/middleware/tests/test_support.rs` |
 | Kafka observation (statistics fixtures: `observing`, `observe`, `unobserved`) | `src/consumer/observer/tests/support.rs` |
 | Keyed state (oracles, cells, collections, `UnavailableState`) | `src/state/tests/support.rs` |

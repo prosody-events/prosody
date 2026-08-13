@@ -1,7 +1,10 @@
+mod metrics;
+
+pub(crate) use self::metrics::{GlobalMetrics, assert_distinct_labels, label};
 use crate::cassandra::CassandraConfiguration;
 use crate::otel::SpanRelation;
 use color_eyre::Result;
-use color_eyre::eyre::eyre;
+use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::Context;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::trace::{
@@ -18,7 +21,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 use tracing::field::{Field, Visit};
-use tracing::subscriber::{DefaultGuard, set_default, with_default};
+use tracing::subscriber::{DefaultGuard, set_default, set_global_default, with_default};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::LevelFilter;
@@ -32,6 +35,10 @@ use tracing_subscriber::registry::LookupSpan;
 /// tests). Isolation comes from fresh per-test identifiers (segment ids,
 /// group ids, topics) instead.
 pub const TEST_KEYSPACE: &str = "prosody_test";
+
+/// The trace id [`sampled_remote_context`] carries.
+const SAMPLED_REMOTE_TRACE: TraceId =
+    TraceId::from_bytes(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10_u128.to_be_bytes());
 
 /// Shared multi-threaded runtime for all unit tests in the crate.
 #[expect(
@@ -111,6 +118,27 @@ pub(crate) fn captured_spans(f: impl FnOnce()) -> Vec<SpanData> {
 /// span-level invariant: application-facing spans at INFO, framework-internal
 /// spans at DEBUG.
 pub(crate) fn captured_spans_filtered(max_level: LevelFilter, f: impl FnOnce()) -> Vec<SpanData> {
+    let (exporter, provider, subscriber) = span_pipeline(max_level);
+
+    with_default(subscriber, f);
+    drop(provider);
+
+    let spans = exporter.0.lock();
+    spans.clone()
+}
+
+/// One `OpenTelemetry` capture pipeline: the exporter to read spans from, the
+/// provider that must outlive the capture, and the subscriber to install.
+///
+/// Both capture surfaces build it here, so the pipeline cannot change for the
+/// thread-local one and not for the process-wide one.
+fn span_pipeline(
+    max_level: LevelFilter,
+) -> (
+    TestExporter,
+    SdkTracerProvider,
+    impl Subscriber + Send + Sync + 'static,
+) {
     let exporter = TestExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter.clone())
@@ -120,12 +148,42 @@ pub(crate) fn captured_spans_filtered(max_level: LevelFilter, f: impl FnOnce()) 
             .with_tracer(provider.tracer("test"))
             .with_filter(max_level),
     );
+    (exporter, provider, subscriber)
+}
 
-    with_default(subscriber, f);
-    drop(provider);
+/// Captures spans opened on **any** thread, for a test whose subject runs in a
+/// spawned task.
+///
+/// [`captured_spans`] installs its subscriber with `with_default`, which is
+/// thread-local, so it cannot see a span a server task opened. This installs
+/// the same pipeline as the process default instead — which one test process
+/// may do exactly once, so it belongs to tests that own their process.
+pub(crate) struct GlobalSpans {
+    exporter: TestExporter,
+    /// Held so the pipeline outlives the capture. The simple processor exports
+    /// on span end, so nothing has to be flushed before a read.
+    _provider: SdkTracerProvider,
+}
 
-    let spans = exporter.0.lock();
-    spans.clone()
+impl GlobalSpans {
+    /// Installs the pipeline as this process's default subscriber.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a default subscriber is already installed.
+    pub(crate) fn install() -> Result<Self> {
+        let (exporter, provider, subscriber) = span_pipeline(LevelFilter::TRACE);
+        set_global_default(subscriber)?;
+        Ok(Self {
+            exporter,
+            _provider: provider,
+        })
+    }
+
+    /// Every span that has ended so far, on every thread.
+    pub(crate) fn ended(&self) -> Vec<SpanData> {
+        self.exporter.0.lock().clone()
+    }
 }
 
 /// Accumulates every captured tracing event, rendered field-by-field, into a
@@ -219,13 +277,46 @@ pub(crate) fn capture_events(max_level: Level) -> (CapturedEvents, DefaultGuard)
 /// span derived from it exportable through [`captured_spans`].
 pub(crate) fn sampled_remote_context() -> Context {
     let span_context = SpanContext::new(
-        TraceId::from(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10),
+        SAMPLED_REMOTE_TRACE,
         SpanId::from(0x1122_3344_5566_7788),
         TraceFlags::SAMPLED,
         true,
         TraceState::NONE,
     );
     Context::current().with_remote_span_context(span_context)
+}
+
+/// The one exported span named `name`.
+///
+/// Exactly one must exist: a test that reads "the" span of a name is asserting
+/// on a second one it never saw as soon as two are exported.
+///
+/// # Errors
+///
+/// Returns an error when no span of that name was exported, or when more than
+/// one was.
+pub(crate) fn named<'a>(spans: &'a [SpanData], name: &str) -> Result<&'a SpanData> {
+    let mut found = spans.iter().filter(|span| span.name == name);
+    let span = found
+        .next()
+        .ok_or_else(|| eyre!("span {name} was not exported"))?;
+    ensure!(
+        found.next().is_none(),
+        "more than one {name} span was exported"
+    );
+    Ok(span)
+}
+
+/// One attribute from one exported span.
+pub(crate) fn span_attribute<'a>(
+    span: &'a SpanData,
+    key: &str,
+) -> Result<&'a opentelemetry::Value> {
+    span.attributes
+        .iter()
+        .find(|attribute| attribute.key.as_str() == key)
+        .map(|attribute| &attribute.value)
+        .ok_or_else(|| eyre!("the {} span carries no {key}", span.name))
 }
 
 /// Asserts, by id equality rather than any `is_some()`/validity proxy, that the

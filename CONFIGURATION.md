@@ -12,7 +12,7 @@ environment variables for unset fields, so you can mix both approaches.
 | `PROSODY_SUBSCRIBED_TOPICS` | Topics to read from                                | -            | ✓        |          |
 | `PROSODY_ALLOWED_EVENTS`    | Only process events matching these prefixes        | (all)        | ✓        |          |
 | `PROSODY_SOURCE_SYSTEM`     | Tag for outgoing messages (prevents reprocessing)  | `<group id>` |          | ✓        |
-| `PROSODY_SUBSYSTEM`         | Subsystem name used to advertise published JSON collections | -    | ✓        |          |
+| `PROSODY_SUBSYSTEM`         | This consumer's request and published-state subsystem | - | ✓ |          |
 | `PROSODY_MOCK`              | Use in-memory Kafka for testing                    | false        | ✓        | ✓        |
 | `PROSODY_LOG`               | Log level (e.g., `info`, `prosody=debug`)          | info         | ✓        | ✓        |
 
@@ -40,6 +40,29 @@ environment variables for unset fields, so you can mix both approaches.
 |-------------------------------------|------------------------------------------------------|---------|
 | `PROSODY_SEND_TIMEOUT`              | Give up sending after this long                      | 1s      |
 | `PROSODY_IDEMPOTENCE_CACHE_SIZE`    | Producer dedup cache capacity (0 to disable)         | 8192    |
+
+## Peer Requests
+
+Set these values with environment variables or `PeerConfiguration::builder()`.
+An explicit builder value replaces its environment value.
+Use a different bind address for each client that shares a host.
+
+| Environment variable | Default | Why it is needed | What it controls | Validation |
+|---|---:|---|---|---|
+| `PROSODY_PEER_BIND_ADDRESS` | Default-interface address on port `9099` | The peer server needs a reachable listener. | The socket address that the peer server binds and publishes. | Must be a specified IPv4 or IPv6 socket address. Automatic selection must find a default interface and address. |
+| `PROSODY_PEER_ADVERTISED_CONNECT` | unset | Peers on another network need an entry point. | The gRPC connect URI that remote peers use. | Must be a valid gRPC URI. |
+| `PROSODY_PEER_NETWORK_NAME` | unset | A shared label identifies peers that can use direct addresses. | The network group used to choose a direct address or advertised endpoint. | Must not be empty when set. |
+| `PROSODY_PEER_CACHE_CAPACITY` | 256 | Peer caches need a fixed memory bound. | The entry count for address and channel caches. | Must be greater than zero. |
+| `PROSODY_PEER_REGISTRATION_TTL` | 30s | A lease removes dead peers after failures. | The Cassandra TTL and refresh pace for this peer registration. | From 5s through Cassandra's maximum TTL. Subsecond values round up. |
+
+Set `PROSODY_SUBSYSTEM` to make the client answer requests for that subsystem.
+Without it, the client consumes messages but does not answer requests. A
+requester can target one or more subsystems in either configuration.
+
+With no network name, Prosody always uses each peer's direct address. Equal
+network names also use direct addresses. Different network names use only the
+advertised connect URI. The response times out if that peer did not publish an
+advertised URI.
 
 ## Retry
 
@@ -84,7 +107,8 @@ reloads and keyed-state message resolution.
 | `PROSODY_STATE_READ_CACHE_TTL` | Default read-cache TTL for composed readers: how long a `StateReader` may serve a collection's reads from its cache before re-reading the store. A humantime duration (`5s`, `750ms`); `none` disables the inherited default. A descriptor can replace it with `.read_cache(duration)` or bypass it with `.read_cache(ReadCachePolicy::Disabled)`. Reader-only — never affects the owning consumer's writes or a collection's durable TTL. | 5s |
 
 `PROSODY_SUBSYSTEM` names the service's published keyed state. Set it whenever
-any collection uses `.published(true)`.
+any collection uses `.published(true)`. Prosody trims the name and refuses a
+blank value.
 
 To make a published collection private, change it to `.published(false)` but
 keep the collection registered and retain the same subsystem name for one
