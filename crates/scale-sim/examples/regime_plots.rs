@@ -24,7 +24,9 @@ fn main() -> Result<(), PlotGenerationError> {
         .finish()
         .try_init()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    let report_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reports");
+    let report_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("reports")
+        .join("regimes");
     fs::create_dir_all(&report_directory)?;
     let requested = env::args().nth(1);
     if let Some(name) = requested {
@@ -144,11 +146,13 @@ fn generate_regime(
         &RegimeReport {
             regime,
             closed_loop: ExperimentReport {
+                metadata: result.report_metadata(),
                 trace: &trace,
                 controller: result.controller(),
                 stop: result.stop(),
             },
             capacity_evidence: capacity_evidence.as_ref().map(|evidence| ExperimentReport {
+                metadata: evidence.0.report_metadata(),
                 trace: &evidence.1,
                 controller: evidence.0.controller(),
                 stop: evidence.0.stop(),

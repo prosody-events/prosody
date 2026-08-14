@@ -4,6 +4,9 @@
 //! all retained state and scratch memory. A transition performs bounded work
 //! and does not allocate.
 
+/// Published model package version.
+pub const MODEL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod arrival;
 mod capacity;
 mod change_point;
@@ -22,8 +25,8 @@ pub use arrival::{
     ArrivalPriorError,
 };
 pub use capacity::{
-    CapacityCurve, CapacityGrid, CapacityGridError, CapacityModelError, CapacityPrior,
-    CompletionPosteriorCell, PosteriorError, ResourceWindow, ResourceWindowError,
+    CapacityClockCheck, CapacityCurve, CapacityGrid, CapacityGridError, CapacityModelError,
+    CapacityPrior, CompletionPosteriorCell, PosteriorError, ResourceWindow, ResourceWindowError,
     ThroughputPosteriorCell,
 };
 pub use controller::{
@@ -31,8 +34,8 @@ pub use controller::{
     ScaleScratch, ScaleState, step,
 };
 pub use lead_time::{
-    DurationCell, LaunchEvidence, LaunchEvidenceError, LaunchPrior, LaunchPriorGrid,
-    LeadTimePriorError, PredictiveQuantileError, ReadinessGroupId, ReadinessLump,
+    DurationCell, LaunchComponentSummary, LaunchEvidence, LaunchEvidenceError, LaunchPrior,
+    LaunchPriorGrid, LeadTimePriorError, PredictiveQuantileError, ReadinessGroupId, ReadinessLump,
     ReadinessObservation, RebalanceEvidence, RebalancePrior, TransitionDirection,
 };
 pub use partition::{PartitionPriorPredictiveCheck, partition_prior_predictive_check};
@@ -43,7 +46,7 @@ pub use types::{
     BacklogCohort, CalendarArtifactId, CalendarRateSegment, Cohort, Configuration,
     ConfigurationError, DecisionDiagnostics, DemandClass, GroupObservation, HoldDecision,
     HoldReason, ModelTime, ObservationBuffer, ObservationError, OccupancyTraceEvidence,
-    OccupancyTransition, PosteriorQuery, PriorArtifactBudget, PriorArtifactIdentity,
+    OccupancyTransition, PosteriorQuery, PriorArtifact, PriorArtifactBudget, PriorArtifactIdentity,
     PriorCoverageRecord, ScaleDecision, ScheduledRelease, ServiceObjective,
 };
 

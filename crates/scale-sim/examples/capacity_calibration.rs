@@ -50,7 +50,7 @@ fn main() -> Result<(), CalibrationGenerationError> {
     let sensitivity = run_capacity_sensitivity(&regimes, &sensitivity_seeds)?;
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("reports")
-        .join("calibration");
+        .join("capacity-calibration");
     if directory.exists() {
         fs::remove_dir_all(&directory)?;
     }

@@ -1,6 +1,38 @@
 use quickcheck_macros::quickcheck;
 
-use super::{RANK_BIN_COUNT, rank_bin};
+use super::{CapacityCalibration, RANK_BIN_COUNT, rank_bin};
+use crate::{W6AblationArm, w6_witness::W6_ABLATION_WITNESSES};
+
+#[test]
+fn capacity_calibration_retains_all_w6_ablation_witnesses() {
+    let calibration = CapacityCalibration {
+        trials: Vec::new(),
+        w6_ablation_witnesses: W6_ABLATION_WITNESSES,
+    };
+    let witnesses = calibration.w6_ablation_witnesses();
+
+    assert_eq!(
+        witnesses.map(|witness| witness.arm),
+        [
+            W6AblationArm::LandedCompletion,
+            W6AblationArm::DeletedProduct,
+            W6AblationArm::CompletionMarginal,
+            W6AblationArm::ProperJoint,
+            W6AblationArm::DirectOracle,
+        ]
+    );
+    assert!(witnesses.iter().all(|witness| {
+        (witness.completion_log_score + witness.conditional_path_log_score
+            - witness.joint_log_score)
+            .abs()
+            <= 64.0_f64 * f64::EPSILON
+            && witness.window_count == 180
+    }));
+    assert_eq!(
+        witnesses[3].joint_log_score.to_bits(),
+        witnesses[4].joint_log_score.to_bits()
+    );
+}
 
 #[quickcheck]
 fn predictive_rank_maps_to_one_decile(raw_rank: u64) -> bool {

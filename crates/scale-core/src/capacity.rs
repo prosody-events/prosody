@@ -10,7 +10,8 @@ use crate::arrival::ArrivalPrior;
 use crate::change_point::ChangePointKernel;
 use crate::types::prior_artifact_contract_holds;
 use crate::{
-    OccupancyTraceEvidence, PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord,
+    OccupancyTraceEvidence, PriorArtifact, PriorArtifactBudget, PriorArtifactIdentity,
+    PriorCoverageRecord,
 };
 
 const CAPACITY_MODEL_STORAGE_BYTES_MAX: usize = 512 * 1_024 * 1_024;
@@ -66,6 +67,19 @@ enum MarkovClockAssumption {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StartDelayEvidence {
     DiscardedByAcceptedStartConditioning,
+}
+
+/// Time-rescaled residual evidence for the aggregate completion clock.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CapacityClockCheck {
+    /// Completion residuals included in the check.
+    pub sample_count: u32,
+    /// Largest empirical CDF distance from the uniform clock.
+    pub maximum_distance: f64,
+    /// DKW and report-clock rejection threshold.
+    pub rejection_threshold: f64,
+    /// Whether the residual evidence rejects the declared clock.
+    pub rejected: bool,
 }
 
 /// One point on the passive throughput curve.
@@ -691,6 +705,47 @@ impl CapacityFactor {
         self.grid.cell_count()
     }
 
+    pub(crate) fn artifact(
+        &self,
+        change_rate_per_second: f64,
+    ) -> Result<PriorArtifact, CapacityModelError> {
+        let artifact = capacity_model_artifact(
+            change_rate_per_second,
+            self.arrival_shape,
+            self.concurrency_max as u32,
+        )?;
+        Ok(PriorArtifact::new(
+            artifact.identity,
+            artifact.budget,
+            artifact.coverage.into_boxed_slice(),
+        ))
+    }
+
+    pub(crate) fn contamination_posterior_value_count(&self) -> u32 {
+        self.contamination_probabilities.len() as u32
+    }
+
+    pub(crate) fn write_contamination_posterior(
+        &self,
+        values: &mut [f64],
+        probabilities: &mut [f64],
+    ) -> Result<(), PosteriorError> {
+        let quality_count = self.contamination_probabilities.len();
+        if values.len() != quality_count || probabilities.len() != quality_count {
+            return Err(PosteriorError::BufferLength {
+                expected: self.contamination_posterior_value_count(),
+            });
+        }
+        values.copy_from_slice(&self.contamination_probabilities);
+        probabilities.fill(0.0_f64);
+        for filter_weights in self.filter_weights.chunks_exact(quality_count) {
+            for (probability, weight) in probabilities.iter_mut().zip(filter_weights) {
+                *probability += *weight;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn curve_and_probability(&self, index: usize) -> (CapacityCurve, f64) {
         let curve = if self.grid.no_knee[index] > 0.0_f64 {
             CapacityCurve::NoKnee {
@@ -860,6 +915,41 @@ impl CapacityFactor {
 
     pub(crate) const fn markov_clock_rejected(&self) -> bool {
         self.markov_clock_rejected
+    }
+
+    pub(crate) fn clock_check(&self) -> CapacityClockCheck {
+        if self.residual_sample_count == 0 {
+            return CapacityClockCheck {
+                sample_count: 0,
+                maximum_distance: 0.0_f64,
+                rejection_threshold: f64::INFINITY,
+                rejected: false,
+            };
+        }
+        let sample_count = f64::from(self.residual_sample_count);
+        let dkw_bound = (-(CAPACITY_MODEL_BUDGET.boundary_probability_max() * 0.5_f64).ln()
+            / (2.0_f64 * sample_count))
+            .sqrt();
+        let lattice_bound = 1.0_f64 / RESIDUAL_BIN_COUNT_F64;
+        let mut cumulative = 0_u32;
+        let mut maximum_distance = 0.0_f64;
+        let mut expected = lattice_bound;
+        for (index, count) in self.residual_counts.iter().enumerate() {
+            cumulative = cumulative.saturating_add(*count);
+            let empirical = f64::from(cumulative) / sample_count;
+            maximum_distance = maximum_distance.max((empirical - expected).abs());
+            expected = if index + 1 == RESIDUAL_BIN_COUNT {
+                1.0_f64
+            } else {
+                expected + lattice_bound
+            };
+        }
+        CapacityClockCheck {
+            sample_count: self.residual_sample_count,
+            maximum_distance,
+            rejection_threshold: dkw_bound + lattice_bound,
+            rejected: self.markov_clock_rejected,
+        }
     }
 
     fn update_residual_check(&mut self, evidence: OccupancyTraceEvidence<'_>) {

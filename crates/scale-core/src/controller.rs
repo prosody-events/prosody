@@ -5,12 +5,14 @@ use fearless_simd::{Level, Simd, dispatch, prelude::*};
 
 use crate::TransitionDirection;
 use crate::arrival::{ArrivalFactor, ArrivalPrior};
-use crate::capacity::{CapacityFactor, CompletionPosteriorCell, ThroughputPosteriorCell};
+use crate::capacity::{
+    CapacityClockCheck, CapacityFactor, CompletionPosteriorCell, ThroughputPosteriorCell,
+};
 use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
     evaluate_prepared_step, evaluate_prepared_trajectory, prepare,
 };
-use crate::lead_time::{LaunchTimeFactor, RebalanceTimeFactor};
+use crate::lead_time::{LaunchComponentSummary, LaunchTimeFactor, RebalanceTimeFactor};
 use crate::partition::PartitionFactor;
 use crate::planning::{
     ActionColumns, compare_actions, complete_horizon_micros, replica_seconds, select_action,
@@ -24,8 +26,8 @@ use crate::types::{
 use crate::{
     ApplyDecision, ArrivalCountPredictive, ArrivalPredictiveError, CapacityGrid, Configuration,
     ConfigurationError, DecisionDiagnostics, DemandClass, GroupObservation, HoldDecision,
-    HoldReason, ModelTime, PosteriorError, PosteriorQuery, PredictiveQuantileError, RandomStream,
-    ResourceWindow, ScaleDecision,
+    HoldReason, ModelTime, PosteriorError, PosteriorQuery, PredictiveQuantileError, PriorArtifact,
+    RandomStream, ResourceWindow, ScaleDecision,
 };
 use thiserror::Error;
 
@@ -161,6 +163,7 @@ pub struct ScaleState {
     model_time: ModelTime,
     arrivals: ArrivalFactor,
     capacity: CapacityFactor,
+    capacity_artifact: PriorArtifact,
     capacity_classes: CapacityClasses,
     reliability: ReliabilityFactor,
     partition_placement: PartitionFactor,
@@ -189,6 +192,7 @@ impl ScaleState {
             configuration.resource_exposure_min_seconds(),
             configuration.resource_window_attempt_count_max,
         )?;
+        let capacity_artifact = capacity.artifact(configuration.capacity_change_rate_per_second)?;
         let capacity_classes = CapacityClasses::new(&configuration, &capacity)?;
         let class_count =
             u32::try_from(capacity_classes.len()).map_err(|_| ConfigurationError::PlatformLimit)?;
@@ -212,6 +216,7 @@ impl ScaleState {
             model_time: ModelTime::from_micros(0),
             arrivals,
             capacity,
+            capacity_artifact,
             capacity_classes,
             reliability,
             partition_placement,
@@ -241,6 +246,30 @@ impl ScaleState {
     #[must_use]
     pub const fn capacity_clock_rejected(&self) -> bool {
         self.capacity.markov_clock_rejected()
+    }
+
+    /// Returns the time-rescaled completion-clock check.
+    #[must_use]
+    pub fn capacity_clock_check(&self) -> CapacityClockCheck {
+        self.capacity.clock_check()
+    }
+
+    /// Returns the capacity model's complete prior artifact contract.
+    #[must_use]
+    pub const fn capacity_artifact(&self) -> &PriorArtifact {
+        &self.capacity_artifact
+    }
+
+    /// Returns the number of capacity classes used for stratified sampling.
+    #[must_use]
+    pub fn capacity_class_count(&self) -> u32 {
+        self.capacity_classes.len() as u32
+    }
+
+    /// Returns the minimum posterior draws required for each capacity class.
+    #[must_use]
+    pub const fn posterior_samples_per_capacity_class_min(&self) -> u32 {
+        POSTERIOR_SAMPLES_PER_CAPACITY_CLASS_MIN
     }
 
     /// Returns the fixed number of marginal capacity values.
@@ -368,6 +397,18 @@ impl ScaleState {
             .predictive_quantile(direction, replica_delta, probability)
     }
 
+    /// Returns the fast and slow launch components for one replica delta.
+    #[must_use]
+    pub fn launch_component_summary(&self, replica_delta: u32) -> LaunchComponentSummary {
+        self.lead_time.component_summary(replica_delta)
+    }
+
+    /// Returns launch components for the latest accepted replica delta.
+    #[must_use]
+    pub fn latest_launch_component_summary(&self) -> LaunchComponentSummary {
+        self.lead_time.last_component_summary()
+    }
+
     /// Returns the posterior predictive CDF for one rebalance pause.
     #[must_use]
     pub fn rebalance_time_predictive_cdf(&self, elapsed_seconds: f64) -> f64 {
@@ -398,6 +439,9 @@ impl ScaleState {
             PosteriorQuery::Collapse => Ok(self.capacity.collapse_posterior_value_count()),
             PosteriorQuery::Knee => Ok(self.capacity.knee_posterior_value_count()),
             PosteriorQuery::SaturationState => Ok(2),
+            PosteriorQuery::CapacityContaminationProbability => {
+                Ok(self.capacity.contamination_posterior_value_count())
+            }
             PosteriorQuery::NormalRetryProbability | PosteriorQuery::FailureRetryProbability => {
                 Ok(RELIABILITY_BIN_COUNT)
             }
@@ -445,6 +489,9 @@ impl ScaleState {
                 probabilities[1] = self.capacity.no_knee_probability();
                 Ok(())
             }
+            PosteriorQuery::CapacityContaminationProbability => self
+                .capacity
+                .write_contamination_posterior(values, probabilities),
             PosteriorQuery::NormalRetryProbability => self
                 .reliability
                 .write_normal_posterior(values, probabilities),

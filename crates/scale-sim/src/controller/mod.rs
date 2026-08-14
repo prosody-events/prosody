@@ -3,9 +3,10 @@ use std::slice;
 use std::time::Duration;
 
 use prosody_scale_core::{
-    ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort, CapacityGrid,
-    Cohort, CompletionPosteriorCell, Configuration, ConfigurationError, DecisionRejection,
-    DemandClass, HoldReason, ModelTime, ObservationBuffer, OccupancyTransition, PosteriorQuery,
+    ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
+    CapacityClockCheck, CapacityGrid, Cohort, CompletionPosteriorCell, Configuration,
+    ConfigurationError, DecisionDiagnostics, DecisionRejection, DemandClass, HoldReason,
+    LaunchComponentSummary, ModelTime, ObservationBuffer, OccupancyTransition, PosteriorQuery,
     RandomStream, ReadinessGroupId, ReadinessLump, ReadinessObservation, RebalanceEvidence,
     ResourceWindow, ScaleDecision, ScaleScratch, ScaleState, TransitionDirection, step,
 };
@@ -15,10 +16,12 @@ use thiserror::Error;
 #[cfg(test)]
 use prosody_scale_core::ThroughputPosteriorCell;
 
+use crate::w6_witness::W6_ABLATION_WITNESSES;
 use crate::{
     CalendarForecastInput, EventContext, EventInputs, FaultPattern, MetricTrace, PlantError,
-    ReporterDirective, ScaleDirective, ScheduledReleasesInput, Snapshot, SnapshotChannel,
-    SnapshotCursor, SnapshotTable, TickContext, TickGenerator, TickInputs,
+    PriorArtifactKind, PriorArtifactMetadata, ReporterDirective, ScaleDirective,
+    ScheduledReleasesInput, Snapshot, SnapshotChannel, SnapshotCursor, SnapshotTable, TickContext,
+    TickGenerator, TickInputs, W6AblationWitness,
 };
 
 const HANDLER_COVERAGE_LEVELS: [f64; 4] = [0.5_f64, 0.8_f64, 0.9_f64, 0.95_f64];
@@ -45,6 +48,12 @@ pub struct ControllerSample {
     pub at_micros: u64,
     /// Posterior scenarios used for this decision.
     pub scenario_count: u32,
+    /// Number of capacity classes used for stratified sampling.
+    pub capacity_class_count: u32,
+    /// Posterior samples allocated to each capacity class.
+    pub samples_per_capacity_class: u32,
+    /// Required posterior sample floor for each capacity class.
+    pub samples_per_capacity_class_min: u32,
     /// Current requested replica target.
     pub target: u32,
     /// Last valid saturation cap.
@@ -123,6 +132,12 @@ pub struct ControllerSample {
     pub lead_time_down_seconds: f64,
     /// Posterior expected lead time for the selected or last replica change.
     pub lead_time_seconds: f64,
+    /// Fast launch component for the selected or last replica delta.
+    pub lead_time_fast_seconds: f64,
+    /// Slow launch component for the selected or last replica delta.
+    pub lead_time_slow_seconds: f64,
+    /// Slow-mode probability for the selected or last replica delta.
+    pub lead_time_slow_probability: f64,
     /// Mean live handler concurrency for the latest eligible window.
     pub resource_concurrency: f64,
     /// Completed attempt rate for the latest eligible window.
@@ -139,6 +154,10 @@ pub struct ControllerSample {
     ///
     /// Shared code gives this predictive and the likelihood the same mean.
     pub capacity_predictive_rank: f64,
+    /// Time-rescaled residual check for the completion clock.
+    pub capacity_clock_check: CapacityClockCheck,
+    /// Attempt outcomes accepted at this controller tick.
+    pub reliability_evidence: ReliabilityEvidenceSample,
     /// Reporter action applied at this controller tick.
     pub reporter: ReporterDirective,
 }
@@ -146,10 +165,28 @@ pub struct ControllerSample {
 /// One arrival count and its accepted exposure.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ArrivalWindowSample {
+    /// Inclusive start of the assigned evidence interval.
+    pub start_micros: u64,
+    /// Exclusive end of the assigned evidence interval.
+    pub end_micros: u64,
     /// Accepted event count.
     pub count: u32,
     /// Accepted exposure duration.
     pub exposure_seconds: f64,
+}
+
+/// Reliability evidence accepted at one controller tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReliabilityEvidenceSample {
+    /// No attempt outcome interval was eligible.
+    None,
+    /// One class-separated outcome interval was accepted.
+    Accepted {
+        /// First-attempt outcomes.
+        normal: AttemptOutcomeCounts,
+        /// Retry-attempt outcomes.
+        failure: AttemptOutcomeCounts,
+    },
 }
 
 /// Arrival evidence accepted at one controller tick.
@@ -234,8 +271,29 @@ impl CapacityEvidenceSample {
     }
 }
 
+/// Certified capacity event-path data for one report interval.
+#[derive(Clone, Copy, Debug)]
+pub struct CapacityTraceSample<'a> {
+    /// Busy-slot count at the interval start.
+    pub initial_busy_slots: u32,
+    /// Busy-slot count at the interval end.
+    pub final_busy_slots: u32,
+    /// Event-time busy-slot integral in microseconds.
+    pub busy_slot_micros: u128,
+    /// `E_n`: exposure seconds for each busy-slot state.
+    pub state_exposure_seconds: &'a [f64],
+    /// `D_n`: completions observed from each busy-slot state.
+    pub state_completion_counts: &'a [u32],
+    /// Equal-clock transition groups in certified order.
+    pub transition_groups: &'a [OccupancyTransition],
+}
+
 /// Fixed-capacity structure-of-arrays controller trace.
 pub struct ControllerTrace {
+    artifacts: [PriorArtifactMetadata; 5],
+    w6_ablation_witnesses: [W6AblationWitness; 5],
+    capacity_class_count: u32,
+    samples_per_capacity_class_min: u32,
     at_micros: Vec<u64>,
     scenario_count: Vec<u32>,
     target: Vec<u32>,
@@ -255,6 +313,8 @@ pub struct ControllerTrace {
     arrival_rate_per_second: Vec<f64>,
     arrival_evidence: Vec<bool>,
     arrival_evidence_count: Vec<u32>,
+    arrival_evidence_start_micros: Vec<u64>,
+    arrival_evidence_end_micros: Vec<u64>,
     arrival_evidence_exposure_seconds: Vec<f64>,
     arrival_predictive_low_count: Vec<f64>,
     arrival_predictive_median_count: Vec<f64>,
@@ -279,6 +339,9 @@ pub struct ControllerTrace {
     lead_time_up_seconds: Vec<f64>,
     lead_time_down_seconds: Vec<f64>,
     lead_time_seconds: Vec<f64>,
+    lead_time_fast_seconds: Vec<f64>,
+    lead_time_slow_seconds: Vec<f64>,
+    lead_time_slow_probability: Vec<f64>,
     resource_concurrency: Vec<f64>,
     attempt_throughput_per_second: Vec<f64>,
     capacity_evidence: Vec<CapacityEvidenceKind>,
@@ -290,6 +353,9 @@ pub struct ControllerTrace {
     capacity_predictive_median_per_second: Vec<f64>,
     capacity_predictive_high_per_second: Vec<f64>,
     capacity_predictive_rank: Vec<f64>,
+    capacity_clock_check: Vec<CapacityClockCheck>,
+    reliability_evidence: Vec<ReliabilityEvidenceSample>,
+    capacity_trace: CapacityEventTrace,
     capacity_posterior_values: Vec<f64>,
     capacity_prior_probabilities: Vec<f64>,
     capacity_posterior_probabilities: Vec<f64>,
@@ -297,6 +363,7 @@ pub struct ControllerTrace {
     collapse_posterior: DiscretePosteriorTrace,
     knee_posterior: DiscretePosteriorTrace,
     saturation_state_posterior: DiscretePosteriorTrace,
+    contamination_posterior: DiscretePosteriorTrace,
     normal_retry_posterior: DiscretePosteriorTrace,
     failure_retry_posterior: DiscretePosteriorTrace,
     partition_share_posterior: DiscretePosteriorTrace,
@@ -314,6 +381,35 @@ pub struct ControllerTrace {
     decision_placement_rejections: Vec<f64>,
 }
 
+/// Each sample owns one fixed-width state row and one bounded transition range.
+struct CapacityEventTrace {
+    present: Vec<bool>,
+    initial_busy_slots: Vec<u32>,
+    final_busy_slots: Vec<u32>,
+    busy_slot_micros: Vec<u128>,
+    state_count: usize,
+    state_exposure_seconds: Vec<f64>,
+    state_completion_counts: Vec<u32>,
+    transition_offsets: Vec<usize>,
+    transition_groups: Vec<OccupancyTransition>,
+}
+
+impl CapacityEventTrace {
+    fn new(capacity: usize, layout: CapacityTraceLayout) -> Self {
+        Self {
+            present: Vec::with_capacity(capacity),
+            initial_busy_slots: Vec::with_capacity(capacity),
+            final_busy_slots: Vec::with_capacity(capacity),
+            busy_slot_micros: Vec::with_capacity(capacity),
+            state_count: layout.state_count,
+            state_exposure_seconds: Vec::with_capacity(layout.state_cell_count),
+            state_completion_counts: Vec::with_capacity(layout.state_cell_count),
+            transition_offsets: layout.transition_offsets,
+            transition_groups: Vec::with_capacity(layout.transition_cell_count),
+        }
+    }
+}
+
 struct DiscretePosteriorTrace {
     query: PosteriorQuery,
     values: Vec<f64>,
@@ -326,6 +422,7 @@ struct PosteriorTraces {
     collapse: DiscretePosteriorTrace,
     knee: DiscretePosteriorTrace,
     saturation_state: DiscretePosteriorTrace,
+    contamination: DiscretePosteriorTrace,
     normal_retry: DiscretePosteriorTrace,
     failure_retry: DiscretePosteriorTrace,
     partition_share: DiscretePosteriorTrace,
@@ -343,6 +440,7 @@ impl PosteriorTraces {
             collapse: trace(PosteriorQuery::Collapse)?,
             knee: trace(PosteriorQuery::Knee)?,
             saturation_state: trace(PosteriorQuery::SaturationState)?,
+            contamination: trace(PosteriorQuery::CapacityContaminationProbability)?,
             normal_retry: trace(PosteriorQuery::NormalRetryProbability)?,
             failure_retry: trace(PosteriorQuery::FailureRetryProbability)?,
             partition_share: trace(PosteriorQuery::PartitionShare)?,
@@ -393,7 +491,130 @@ fn initial_arrival_posterior(state: &ScaleState) -> Result<(Vec<f64>, Vec<f64>),
     Ok((values, probabilities))
 }
 
-impl ControllerTrace {
+struct TracePosteriorInputs {
+    posterior_cell_count: usize,
+    decision_candidate_count: usize,
+    decision_cell_count: usize,
+    capacity_values: Vec<f64>,
+    capacity_prior: Vec<f64>,
+    posteriors: PosteriorTraces,
+    arrival_values: Vec<f64>,
+    arrival_prior: Vec<f64>,
+    arrival_cell_count: usize,
+}
+
+impl TracePosteriorInputs {
+    fn new(state: &ScaleState, capacity: usize) -> Result<Self, PlantError> {
+        let (posterior_value_count, posterior_cell_count) =
+            cell_counts(capacity, state.capacity_posterior_value_count())?;
+        let (decision_candidate_count, decision_cell_count) =
+            cell_counts(capacity, state.configuration().replica_count_max)?;
+        let (capacity_values, capacity_prior) =
+            initial_capacity_posterior(state, posterior_value_count)?;
+        let posteriors = PosteriorTraces::new(state, capacity)?;
+        let (arrival_values, arrival_prior) = initial_arrival_posterior(state)?;
+        let arrival_cell_count = capacity
+            .checked_mul(arrival_values.len())
+            .ok_or(PlantError::PlatformLimit)?;
+        Ok(Self {
+            posterior_cell_count,
+            decision_candidate_count,
+            decision_cell_count,
+            capacity_values,
+            capacity_prior,
+            posteriors,
+            arrival_values,
+            arrival_prior,
+            arrival_cell_count,
+        })
+    }
+}
+
+fn report_artifacts(state: &ScaleState) -> [PriorArtifactMetadata; 5] {
+    let configuration = state.configuration();
+    [
+        PriorArtifactMetadata::from_artifact(
+            PriorArtifactKind::Capacity,
+            state.capacity_artifact(),
+        ),
+        PriorArtifactMetadata::new(
+            PriorArtifactKind::Arrival,
+            configuration.arrival_prior.artifact(),
+            configuration.arrival_prior.budget(),
+            configuration.arrival_prior.coverage(),
+        ),
+        PriorArtifactMetadata::new(
+            PriorArtifactKind::Reliability,
+            configuration.reliability_prior.artifact(),
+            configuration.reliability_prior.budget(),
+            configuration.reliability_prior.coverage(),
+        ),
+        PriorArtifactMetadata::new(
+            PriorArtifactKind::Launch,
+            configuration.launch_time_prior.artifact(),
+            configuration.launch_time_prior.budget(),
+            configuration.launch_time_prior.coverage(),
+        ),
+        PriorArtifactMetadata::new(
+            PriorArtifactKind::Rebalance,
+            configuration.rebalance_time_prior.artifact(),
+            configuration.rebalance_time_prior.budget(),
+            configuration.rebalance_time_prior.coverage(),
+        ),
+    ]
+}
+
+struct CapacityTraceLayout {
+    state_count: usize,
+    state_cell_count: usize,
+    transition_cell_count: usize,
+    transition_offsets: Vec<usize>,
+}
+
+fn capacity_trace_layout(
+    configuration: &Configuration,
+    capacity: usize,
+) -> Result<CapacityTraceLayout, PlantError> {
+    let state_count = usize::try_from(
+        configuration
+            .replica_count_max
+            .checked_mul(configuration.slots_per_replica)
+            .and_then(|count| count.checked_add(1))
+            .ok_or(PlantError::PlatformLimit)?,
+    )
+    .map_err(|_| PlantError::PlatformLimit)?;
+    let state_cell_count = capacity
+        .checked_mul(state_count)
+        .ok_or(PlantError::PlatformLimit)?;
+    let transition_count_max = usize::try_from(
+        configuration
+            .resource_window_attempt_count_max
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(1))
+            .ok_or(PlantError::PlatformLimit)?,
+    )
+    .map_err(|_| PlantError::PlatformLimit)?;
+    let transition_cell_count = capacity
+        .checked_mul(transition_count_max)
+        .ok_or(PlantError::PlatformLimit)?;
+    let mut transition_offsets = Vec::with_capacity(capacity + 1);
+    transition_offsets.push(0);
+    Ok(CapacityTraceLayout {
+        state_count,
+        state_cell_count,
+        transition_cell_count,
+        transition_offsets,
+    })
+}
+
+struct ControllerTraceInputs {
+    capacity: usize,
+    posterior: TracePosteriorInputs,
+    artifacts: [PriorArtifactMetadata; 5],
+    capacity_layout: CapacityTraceLayout,
+}
+
+impl ControllerTraceInputs {
     fn new(sample_count_max: u32, state: &ScaleState) -> Result<Self, PlantError> {
         let capacity = usize::try_from(sample_count_max).map_err(|_| PlantError::PlatformLimit)?;
         if capacity == 0 {
@@ -401,19 +622,28 @@ impl ControllerTrace {
                 name: "controller_trace_count_max",
             });
         }
-        let (posterior_value_count, posterior_cell_count) =
-            cell_counts(capacity, state.capacity_posterior_value_count())?;
-        let (decision_candidate_count, decision_cell_count) =
-            cell_counts(capacity, state.configuration().replica_count_max)?;
-        let (capacity_posterior_values, capacity_prior_probabilities) =
-            initial_capacity_posterior(state, posterior_value_count)?;
-        let posteriors = PosteriorTraces::new(state, capacity)?;
-        let (arrival_posterior_values, arrival_prior_probabilities) =
-            initial_arrival_posterior(state)?;
-        let arrival_cell_count = capacity
-            .checked_mul(arrival_posterior_values.len())
-            .ok_or(PlantError::PlatformLimit)?;
         Ok(Self {
+            capacity,
+            posterior: TracePosteriorInputs::new(state, capacity)?,
+            artifacts: report_artifacts(state),
+            capacity_layout: capacity_trace_layout(state.configuration(), capacity)?,
+        })
+    }
+}
+
+impl ControllerTrace {
+    fn new(sample_count_max: u32, state: &ScaleState) -> Result<Self, PlantError> {
+        let ControllerTraceInputs {
+            capacity,
+            posterior,
+            artifacts,
+            capacity_layout,
+        } = ControllerTraceInputs::new(sample_count_max, state)?;
+        Ok(Self {
+            artifacts,
+            w6_ablation_witnesses: W6_ABLATION_WITNESSES,
+            capacity_class_count: state.capacity_class_count(),
+            samples_per_capacity_class_min: state.posterior_samples_per_capacity_class_min(),
             at_micros: Vec::with_capacity(capacity),
             scenario_count: Vec::with_capacity(capacity),
             target: Vec::with_capacity(capacity),
@@ -433,6 +663,8 @@ impl ControllerTrace {
             arrival_rate_per_second: Vec::with_capacity(capacity),
             arrival_evidence: Vec::with_capacity(capacity),
             arrival_evidence_count: Vec::with_capacity(capacity),
+            arrival_evidence_start_micros: Vec::with_capacity(capacity),
+            arrival_evidence_end_micros: Vec::with_capacity(capacity),
             arrival_evidence_exposure_seconds: Vec::with_capacity(capacity),
             arrival_predictive_low_count: Vec::with_capacity(capacity),
             arrival_predictive_median_count: Vec::with_capacity(capacity),
@@ -457,6 +689,9 @@ impl ControllerTrace {
             lead_time_up_seconds: Vec::with_capacity(capacity),
             lead_time_down_seconds: Vec::with_capacity(capacity),
             lead_time_seconds: Vec::with_capacity(capacity),
+            lead_time_fast_seconds: Vec::with_capacity(capacity),
+            lead_time_slow_seconds: Vec::with_capacity(capacity),
+            lead_time_slow_probability: Vec::with_capacity(capacity),
             resource_concurrency: Vec::with_capacity(capacity),
             attempt_throughput_per_second: Vec::with_capacity(capacity),
             capacity_evidence: Vec::with_capacity(capacity),
@@ -468,28 +703,34 @@ impl ControllerTrace {
             capacity_predictive_median_per_second: Vec::with_capacity(capacity),
             capacity_predictive_high_per_second: Vec::with_capacity(capacity),
             capacity_predictive_rank: Vec::with_capacity(capacity),
-            capacity_posterior_values,
-            capacity_prior_probabilities,
-            capacity_posterior_probabilities: Vec::with_capacity(posterior_cell_count),
-            service_time_posterior: posteriors.service_time,
-            collapse_posterior: posteriors.collapse,
-            knee_posterior: posteriors.knee,
-            saturation_state_posterior: posteriors.saturation_state,
-            normal_retry_posterior: posteriors.normal_retry,
-            failure_retry_posterior: posteriors.failure_retry,
-            partition_share_posterior: posteriors.partition_share,
-            lead_time_up_posterior: posteriors.lead_time_up,
-            lead_time_down_posterior: posteriors.lead_time_down,
-            rebalance_time_up_posterior: posteriors.rebalance_time_up,
-            rebalance_time_down_posterior: posteriors.rebalance_time_down,
-            arrival_posterior_values,
-            arrival_prior_probabilities,
-            arrival_posterior_probabilities: Vec::with_capacity(arrival_cell_count),
-            decision_candidate_count,
-            decision_expected_losses: Vec::with_capacity(decision_cell_count),
-            decision_deadline_satisfaction_probabilities: Vec::with_capacity(decision_cell_count),
-            decision_deadline_rejections: Vec::with_capacity(decision_cell_count),
-            decision_placement_rejections: Vec::with_capacity(decision_cell_count),
+            capacity_clock_check: Vec::with_capacity(capacity),
+            reliability_evidence: Vec::with_capacity(capacity),
+            capacity_trace: CapacityEventTrace::new(capacity, capacity_layout),
+            capacity_posterior_values: posterior.capacity_values,
+            capacity_prior_probabilities: posterior.capacity_prior,
+            capacity_posterior_probabilities: Vec::with_capacity(posterior.posterior_cell_count),
+            service_time_posterior: posterior.posteriors.service_time,
+            collapse_posterior: posterior.posteriors.collapse,
+            knee_posterior: posterior.posteriors.knee,
+            saturation_state_posterior: posterior.posteriors.saturation_state,
+            contamination_posterior: posterior.posteriors.contamination,
+            normal_retry_posterior: posterior.posteriors.normal_retry,
+            failure_retry_posterior: posterior.posteriors.failure_retry,
+            partition_share_posterior: posterior.posteriors.partition_share,
+            lead_time_up_posterior: posterior.posteriors.lead_time_up,
+            lead_time_down_posterior: posterior.posteriors.lead_time_down,
+            rebalance_time_up_posterior: posterior.posteriors.rebalance_time_up,
+            rebalance_time_down_posterior: posterior.posteriors.rebalance_time_down,
+            arrival_posterior_values: posterior.arrival_values,
+            arrival_prior_probabilities: posterior.arrival_prior,
+            arrival_posterior_probabilities: Vec::with_capacity(posterior.arrival_cell_count),
+            decision_candidate_count: posterior.decision_candidate_count,
+            decision_expected_losses: Vec::with_capacity(posterior.decision_cell_count),
+            decision_deadline_satisfaction_probabilities: Vec::with_capacity(
+                posterior.decision_cell_count,
+            ),
+            decision_deadline_rejections: Vec::with_capacity(posterior.decision_cell_count),
+            decision_placement_rejections: Vec::with_capacity(posterior.decision_cell_count),
         })
     }
 
@@ -515,6 +756,9 @@ impl ControllerTrace {
         Some(ControllerSample {
             at_micros: *self.at_micros.get(index)?,
             scenario_count: self.scenario_count[index],
+            capacity_class_count: self.capacity_class_count,
+            samples_per_capacity_class: self.scenario_count[index] / self.capacity_class_count,
+            samples_per_capacity_class_min: self.samples_per_capacity_class_min,
             target: self.target[index],
             cap: self.cap[index],
             hold: self.hold[index],
@@ -554,6 +798,9 @@ impl ControllerTrace {
             lead_time_up_seconds: self.lead_time_up_seconds[index],
             lead_time_down_seconds: self.lead_time_down_seconds[index],
             lead_time_seconds: self.lead_time_seconds[index],
+            lead_time_fast_seconds: self.lead_time_fast_seconds[index],
+            lead_time_slow_seconds: self.lead_time_slow_seconds[index],
+            lead_time_slow_probability: self.lead_time_slow_probability[index],
             resource_concurrency: self.resource_concurrency[index],
             attempt_throughput_per_second: self.attempt_throughput_per_second[index],
             capacity_evidence: self.evidence_sample(index),
@@ -562,7 +809,58 @@ impl ControllerTrace {
                 [index],
             capacity_predictive_high_per_second: self.capacity_predictive_high_per_second[index],
             capacity_predictive_rank: self.capacity_predictive_rank[index],
+            capacity_clock_check: self.capacity_clock_check[index],
+            reliability_evidence: self.reliability_evidence[index],
             reporter: self.reporter[index],
+        })
+    }
+
+    /// Returns one model artifact by family.
+    #[must_use]
+    pub fn artifact(&self, kind: PriorArtifactKind) -> Option<&PriorArtifactMetadata> {
+        self.artifacts
+            .iter()
+            .find(|artifact| artifact.kind() == kind)
+    }
+
+    /// Returns the complete shared prior artifact catalog.
+    #[must_use]
+    pub const fn artifacts(&self) -> &[PriorArtifactMetadata; 5] {
+        &self.artifacts
+    }
+
+    /// Returns the fixed five-arm event-path calibration witness.
+    #[must_use]
+    pub const fn w6_ablation_witnesses(&self) -> &[W6AblationWitness; 5] {
+        &self.w6_ablation_witnesses
+    }
+
+    /// Returns one certified capacity trace and its sufficient statistics.
+    #[must_use]
+    pub fn capacity_trace(&self, index: usize) -> Option<CapacityTraceSample<'_>> {
+        if !*self.capacity_trace.present.get(index)? {
+            return None;
+        }
+        let state_start = index.checked_mul(self.capacity_trace.state_count)?;
+        let state_end = state_start.checked_add(self.capacity_trace.state_count)?;
+        let group_start = *self.capacity_trace.transition_offsets.get(index)?;
+        let group_end = *self.capacity_trace.transition_offsets.get(index + 1)?;
+        Some(CapacityTraceSample {
+            initial_busy_slots: self.capacity_trace.initial_busy_slots[index],
+            final_busy_slots: self.capacity_trace.final_busy_slots[index],
+            busy_slot_micros: self.capacity_trace.busy_slot_micros[index],
+            state_exposure_seconds: self
+                .capacity_trace
+                .state_exposure_seconds
+                .get(state_start..state_end)?,
+            state_completion_counts: self
+                .capacity_trace
+                .state_completion_counts
+                .get(state_start..state_end)?,
+            transition_groups: self
+                .capacity_trace
+                .transition_groups
+                .get(group_start..group_end)?,
         })
     }
 
@@ -683,6 +981,8 @@ impl ControllerTrace {
     fn arrival_evidence_sample(&self, index: usize) -> ArrivalEvidenceSample {
         if self.arrival_evidence[index] {
             ArrivalEvidenceSample::Accepted(ArrivalWindowSample {
+                start_micros: self.arrival_evidence_start_micros[index],
+                end_micros: self.arrival_evidence_end_micros[index],
                 count: self.arrival_evidence_count[index],
                 exposure_seconds: self.arrival_evidence_exposure_seconds[index],
             })
@@ -697,6 +997,7 @@ impl ControllerTrace {
             PosteriorQuery::Collapse => Some(&self.collapse_posterior),
             PosteriorQuery::Knee => Some(&self.knee_posterior),
             PosteriorQuery::SaturationState => Some(&self.saturation_state_posterior),
+            PosteriorQuery::CapacityContaminationProbability => Some(&self.contamination_posterior),
             PosteriorQuery::NormalRetryProbability => Some(&self.normal_retry_posterior),
             PosteriorQuery::FailureRetryProbability => Some(&self.failure_retry_posterior),
             PosteriorQuery::PartitionShare => Some(&self.partition_share_posterior),
@@ -790,11 +1091,13 @@ impl ControllerTrace {
         sample: &ControllerSample,
         state: &ScaleState,
         scratch: &ScaleScratch,
+        capacity_trace: Option<CapacityTraceInput<'_>>,
     ) -> Result<(), PlantError> {
         if self.at_micros.len() == self.at_micros.capacity() {
             return Err(PlantError::MetricCapacity);
         }
         self.push_sample_columns(sample);
+        self.push_capacity_trace(capacity_trace)?;
         self.push_decision_columns(sample.target, scratch);
         self.push_decision_curves(scratch)?;
         self.push_posteriors(state)?;
@@ -816,11 +1119,15 @@ impl ControllerTrace {
             ArrivalEvidenceSample::None => {
                 self.arrival_evidence.push(false);
                 self.arrival_evidence_count.push(0);
+                self.arrival_evidence_start_micros.push(0);
+                self.arrival_evidence_end_micros.push(0);
                 self.arrival_evidence_exposure_seconds.push(f64::NAN);
             }
             ArrivalEvidenceSample::Accepted(window) => {
                 self.arrival_evidence.push(true);
                 self.arrival_evidence_count.push(window.count);
+                self.arrival_evidence_start_micros.push(window.start_micros);
+                self.arrival_evidence_end_micros.push(window.end_micros);
                 self.arrival_evidence_exposure_seconds
                     .push(window.exposure_seconds);
             }
@@ -866,6 +1173,12 @@ impl ControllerTrace {
         self.lead_time_down_seconds
             .push(sample.lead_time_down_seconds);
         self.lead_time_seconds.push(sample.lead_time_seconds);
+        self.lead_time_fast_seconds
+            .push(sample.lead_time_fast_seconds);
+        self.lead_time_slow_seconds
+            .push(sample.lead_time_slow_seconds);
+        self.lead_time_slow_probability
+            .push(sample.lead_time_slow_probability);
         self.resource_concurrency.push(sample.resource_concurrency);
         self.attempt_throughput_per_second
             .push(sample.attempt_throughput_per_second);
@@ -885,6 +1198,65 @@ impl ControllerTrace {
             .push(sample.capacity_predictive_high_per_second);
         self.capacity_predictive_rank
             .push(sample.capacity_predictive_rank);
+        self.capacity_clock_check.push(sample.capacity_clock_check);
+        self.reliability_evidence.push(sample.reliability_evidence);
+    }
+
+    fn push_capacity_trace(
+        &mut self,
+        trace: Option<CapacityTraceInput<'_>>,
+    ) -> Result<(), PlantError> {
+        let group_end = self
+            .capacity_trace
+            .transition_groups
+            .len()
+            .checked_add(trace.map_or(0, |trace| trace.transition_groups.len()))
+            .ok_or(PlantError::PlatformLimit)?;
+        if group_end > self.capacity_trace.transition_groups.capacity() {
+            return Err(PlantError::MetricCapacity);
+        }
+        let state_start = self.capacity_trace.state_exposure_seconds.len();
+        let state_end = state_start
+            .checked_add(self.capacity_trace.state_count)
+            .ok_or(PlantError::PlatformLimit)?;
+        if state_end > self.capacity_trace.state_exposure_seconds.capacity()
+            || state_end > self.capacity_trace.state_completion_counts.capacity()
+        {
+            return Err(PlantError::MetricCapacity);
+        }
+        self.capacity_trace
+            .state_exposure_seconds
+            .resize(state_end, 0.0_f64);
+        self.capacity_trace
+            .state_completion_counts
+            .resize(state_end, 0);
+        let (initial_busy_slots, final_busy_slots, busy_slot_micros) = if let Some(trace) = trace {
+            fold_capacity_trace(
+                trace,
+                &mut self.capacity_trace.state_exposure_seconds[state_start..state_end],
+                &mut self.capacity_trace.state_completion_counts[state_start..state_end],
+            )?;
+            self.capacity_trace
+                .transition_groups
+                .extend_from_slice(trace.transition_groups);
+            (
+                trace.initial_busy_slots,
+                trace.final_busy_slots,
+                trace.busy_slot_micros,
+            )
+        } else {
+            (0, 0, 0)
+        };
+        self.capacity_trace.present.push(trace.is_some());
+        self.capacity_trace
+            .initial_busy_slots
+            .push(initial_busy_slots);
+        self.capacity_trace.final_busy_slots.push(final_busy_slots);
+        self.capacity_trace.busy_slot_micros.push(busy_slot_micros);
+        self.capacity_trace
+            .transition_offsets
+            .push(self.capacity_trace.transition_groups.len());
+        Ok(())
     }
 
     fn push_decision_columns(&mut self, target: u32, scratch: &ScaleScratch) {
@@ -973,6 +1345,7 @@ impl ControllerTrace {
         self.collapse_posterior.push(state)?;
         self.knee_posterior.push(state)?;
         self.saturation_state_posterior.push(state)?;
+        self.contamination_posterior.push(state)?;
         self.normal_retry_posterior.push(state)?;
         self.failure_retry_posterior.push(state)?;
         self.partition_share_posterior.push(state)?;
@@ -1083,6 +1456,7 @@ pub struct ClosedLoop<Workload> {
     ready_transitions: Vec<PendingTransition>,
     pending_transition_observations: VecDeque<PendingTransitionObservation>,
     lead_time_evidence_sample: LeadTimeEvidenceSample,
+    reliability_evidence_sample: ReliabilityEvidenceSample,
     trace: ControllerTrace,
     diagnostic_seed: u64,
 }
@@ -1115,6 +1489,18 @@ struct CapacityWindow {
     exposure_seconds: f64,
     completed_attempts: u32,
     started_attempts: u32,
+    initial_busy_slots: u32,
+    final_busy_slots: u32,
+    busy_slot_micros: u128,
+}
+
+#[derive(Clone, Copy)]
+struct CapacityTraceInput<'a> {
+    exposure_micros: u64,
+    initial_busy_slots: u32,
+    final_busy_slots: u32,
+    busy_slot_micros: u128,
+    transition_groups: &'a [OccupancyTransition],
 }
 
 /// One aggregate-readiness observation segment.
@@ -1170,6 +1556,23 @@ struct LeadTimePrediction {
     rank: f64,
 }
 
+#[derive(Clone, Copy)]
+struct ControllerSampleInput {
+    at_micros: u64,
+    diagnostics: DecisionDiagnostics,
+    target: u32,
+    cap: u32,
+    hold: bool,
+    hold_reason: Option<HoldReason>,
+    arrival: ArrivalPrediction,
+    partition: PartitionPrediction,
+    lead_time: LeadTimePrediction,
+    capacity: CapacityPrediction,
+    resource_concurrency: f64,
+    attempt_throughput_per_second: f64,
+    reporter: ReporterDirective,
+}
+
 impl LeadTimePrediction {
     const fn missing() -> Self {
         Self {
@@ -1217,6 +1620,45 @@ impl CapacityWindow {
             completed_attempts: self.completed_attempts,
         }
     }
+}
+
+fn fold_capacity_trace(
+    trace: CapacityTraceInput<'_>,
+    exposure_seconds: &mut [f64],
+    completion_counts: &mut [u32],
+) -> Result<(), PlantError> {
+    let mut state = trace.initial_busy_slots as usize;
+    let mut previous_offset = 0_u64;
+    for group in trace.transition_groups {
+        let elapsed = group
+            .offset_micros()
+            .checked_sub(previous_offset)
+            .ok_or(PlantError::MetricCapacity)?;
+        let exposure = exposure_seconds
+            .get_mut(state)
+            .ok_or(PlantError::MetricCapacity)?;
+        *exposure += Duration::from_micros(elapsed).as_secs_f64();
+        for _ in 0..group.completed_attempts() {
+            let count = completion_counts
+                .get_mut(state)
+                .ok_or(PlantError::MetricCapacity)?;
+            *count = count.saturating_add(1);
+            state = state.checked_sub(1).ok_or(PlantError::MetricCapacity)?;
+        }
+        state = state
+            .checked_add(group.started_attempts() as usize)
+            .ok_or(PlantError::MetricCapacity)?;
+        previous_offset = group.offset_micros();
+    }
+    let elapsed = trace
+        .exposure_micros
+        .checked_sub(previous_offset)
+        .ok_or(PlantError::MetricCapacity)?;
+    let exposure = exposure_seconds
+        .get_mut(state)
+        .ok_or(PlantError::MetricCapacity)?;
+    *exposure += Duration::from_micros(elapsed).as_secs_f64();
+    Ok(())
 }
 
 impl CapacityPrediction {
@@ -1307,6 +1749,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             ready_transitions: Vec::with_capacity(transition_capacity),
             pending_transition_observations: VecDeque::with_capacity(transition_capacity),
             lead_time_evidence_sample: LeadTimeEvidenceSample::None,
+            reliability_evidence_sample: ReliabilityEvidenceSample::None,
             trace,
             diagnostic_seed: 0,
         })
@@ -1424,6 +1867,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         self.arrival_evidence_sample = ArrivalEvidenceSample::None;
         self.partition_evidence_accepted = false;
         self.lead_time_evidence_sample = LeadTimeEvidenceSample::None;
+        self.reliability_evidence_sample = ReliabilityEvidenceSample::None;
         self.count_generated(
             context,
             inputs,
@@ -1466,6 +1910,8 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                 })?;
                 self.arrival_evidence_sample =
                     ArrivalEvidenceSample::Accepted(ArrivalWindowSample {
+                        start_micros: context.now_micros.saturating_sub(exposure_micros),
+                        end_micros: context.now_micros,
                         count,
                         exposure_seconds: Duration::from_micros(exposure_micros).as_secs_f64(),
                     });
@@ -1510,6 +1956,8 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             self.observation
                 .set_arrivals(count, interval.exposure_micros)?;
             self.arrival_evidence_sample = ArrivalEvidenceSample::Accepted(ArrivalWindowSample {
+                start_micros: interval.start_micros,
+                end_micros: interval.end_micros,
                 count,
                 exposure_seconds: Duration::from_micros(interval.exposure_micros).as_secs_f64(),
             });
@@ -1687,21 +2135,21 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             .plant
             .failure_permanent_failures
             .saturating_sub(previous_failure_permanent);
-        let evidence = AttemptOutcomeEvidence::new(
-            AttemptOutcomeCounts::new(
-                normal_success,
-                normal_permanent,
-                normal_transient,
-                normal_terminal,
-            ),
-            AttemptOutcomeCounts::new(
-                failure_success,
-                failure_permanent,
-                failure_transient,
-                failure_terminal,
-            ),
+        let normal = AttemptOutcomeCounts::new(
+            normal_success,
+            normal_permanent,
+            normal_transient,
+            normal_terminal,
         );
-        self.observation.set_attempt_outcomes(evidence)?;
+        let failure = AttemptOutcomeCounts::new(
+            failure_success,
+            failure_permanent,
+            failure_transient,
+            failure_terminal,
+        );
+        self.observation
+            .set_attempt_outcomes(AttemptOutcomeEvidence::new(normal, failure))?;
+        self.reliability_evidence_sample = ReliabilityEvidenceSample::Accepted { normal, failure };
         Ok(())
     }
 
@@ -1799,6 +2247,9 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             exposure_seconds,
             completed_attempts,
             started_attempts,
+            initial_busy_slots,
+            final_busy_slots,
+            busy_slot_micros: u128::from(occupancy),
         };
         self.latest_capacity_window = Some(current);
         self.observation.set_resource_observation(
@@ -1945,9 +2396,63 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                 )
             }
         };
-        let sample = ControllerSample {
+        let sample = self.report_sample(&ControllerSampleInput {
             at_micros: context.now_micros,
+            diagnostics,
+            target,
+            cap,
+            hold,
+            hold_reason,
+            arrival: arrival_predictive,
+            partition: partition_predictive,
+            lead_time: lead_time_predictive,
+            capacity: capacity_predictive,
+            resource_concurrency,
+            attempt_throughput_per_second,
+            reporter,
+        });
+        let capacity_trace = self
+            .latest_capacity_window
+            .map(|window| CapacityTraceInput {
+                exposure_micros: self.configuration.core().report_interval_micros,
+                initial_busy_slots: window.initial_busy_slots,
+                final_busy_slots: window.final_busy_slots,
+                busy_slot_micros: window.busy_slot_micros,
+                transition_groups: &self.capacity_transition_scratch,
+            });
+        self.trace
+            .push(&sample, &self.state, &self.scratch, capacity_trace)?;
+        Ok(inputs)
+    }
+
+    fn report_sample(&self, input: &ControllerSampleInput) -> ControllerSample {
+        let &ControllerSampleInput {
+            at_micros,
+            diagnostics,
+            target,
+            cap,
+            hold,
+            hold_reason,
+            arrival,
+            partition,
+            lead_time,
+            capacity,
+            resource_concurrency,
+            attempt_throughput_per_second,
+            reporter,
+        } = input;
+        let LaunchComponentSummary {
+            slow_probability,
+            fast_mean_seconds,
+            slow_mean_seconds,
+        } = self.state.latest_launch_component_summary();
+        let capacity_class_count = self.state.capacity_class_count();
+        ControllerSample {
+            at_micros,
             scenario_count: diagnostics.scenario_count,
+            capacity_class_count,
+            samples_per_capacity_class: diagnostics.scenario_count / capacity_class_count,
+            samples_per_capacity_class_min: self.state.posterior_samples_per_capacity_class_min(),
             target,
             cap,
             hold,
@@ -1964,20 +2469,20 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             demand_floor: u32::MAX,
             arrival_rate_per_second: diagnostics.arrival_rate_per_second,
             arrival_evidence: self.arrival_evidence_sample,
-            arrival_predictive_low_count: arrival_predictive.quantiles[0],
-            arrival_predictive_median_count: arrival_predictive.quantiles[1],
-            arrival_predictive_high_count: arrival_predictive.quantiles[2],
-            arrival_predictive_rank: arrival_predictive.rank,
-            partition_evidence_count: partition_predictive.evidence_count,
-            partition_predictive_covered_counts: partition_predictive.covered_counts,
-            partition_predictive_rank_counts: partition_predictive.rank_counts,
-            partition_log_loss_sum: partition_predictive.log_loss_sum,
-            partition_entropy_sum: partition_predictive.entropy_sum,
+            arrival_predictive_low_count: arrival.quantiles[0],
+            arrival_predictive_median_count: arrival.quantiles[1],
+            arrival_predictive_high_count: arrival.quantiles[2],
+            arrival_predictive_rank: arrival.rank,
+            partition_evidence_count: partition.evidence_count,
+            partition_predictive_covered_counts: partition.covered_counts,
+            partition_predictive_rank_counts: partition.rank_counts,
+            partition_log_loss_sum: partition.log_loss_sum,
+            partition_entropy_sum: partition.entropy_sum,
             lead_time_evidence: self.lead_time_evidence_sample,
-            lead_time_predictive_low_seconds: lead_time_predictive.quantiles[0],
-            lead_time_predictive_median_seconds: lead_time_predictive.quantiles[1],
-            lead_time_predictive_high_seconds: lead_time_predictive.quantiles[2],
-            lead_time_predictive_rank: lead_time_predictive.rank,
+            lead_time_predictive_low_seconds: lead_time.quantiles[0],
+            lead_time_predictive_median_seconds: lead_time.quantiles[1],
+            lead_time_predictive_high_seconds: lead_time.quantiles[2],
+            lead_time_predictive_rank: lead_time.rank,
             capacity_per_second: diagnostics.capacity_per_second,
             capacity_low_per_second: diagnostics.capacity_low_per_second,
             capacity_median_per_second: diagnostics.capacity_median_per_second,
@@ -1987,17 +2492,20 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             lead_time_up_seconds: diagnostics.lead_time_up_seconds,
             lead_time_down_seconds: diagnostics.lead_time_down_seconds,
             lead_time_seconds: diagnostics.lead_time_seconds,
+            lead_time_fast_seconds: fast_mean_seconds,
+            lead_time_slow_seconds: slow_mean_seconds,
+            lead_time_slow_probability: slow_probability,
             resource_concurrency,
             attempt_throughput_per_second,
             capacity_evidence: self.capacity_evidence_sample,
-            capacity_predictive_low_per_second: capacity_predictive.quantiles[0],
-            capacity_predictive_median_per_second: capacity_predictive.quantiles[1],
-            capacity_predictive_high_per_second: capacity_predictive.quantiles[2],
-            capacity_predictive_rank: capacity_predictive.rank,
+            capacity_predictive_low_per_second: capacity.quantiles[0],
+            capacity_predictive_median_per_second: capacity.quantiles[1],
+            capacity_predictive_high_per_second: capacity.quantiles[2],
+            capacity_predictive_rank: capacity.rank,
+            capacity_clock_check: self.state.capacity_clock_check(),
+            reliability_evidence: self.reliability_evidence_sample,
             reporter,
-        };
-        self.trace.push(&sample, &self.state, &self.scratch)?;
-        Ok(inputs)
+        }
     }
 
     fn held_target_and_cap(&self, current_replicas: u32) -> (u32, u32) {

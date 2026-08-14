@@ -233,6 +233,8 @@ pub struct RegimeReport<'a> {
 /// Evidence from one complete regime experiment.
 #[derive(Clone, Copy)]
 pub struct ExperimentReport<'a> {
+    /// Reproducible source and artifact identity.
+    pub metadata: crate::ReportMetadata,
     /// Plant and controller metrics.
     pub trace: &'a MetricTrace,
     /// Exact controller evidence and decisions.

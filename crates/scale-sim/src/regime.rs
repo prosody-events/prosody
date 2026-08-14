@@ -1490,6 +1490,7 @@ fn run_principal_definition(
     definition: PrincipalDefinition,
     sensitivity: Option<CapacitySensitivity>,
 ) -> Result<PrincipalRun, PrincipalRunError> {
+    let seed = definition.inputs.seed;
     let capacity_regime = is_capacity_regime(regime);
     let slots_per_replica = DEFAULT_CONCURRENCY_PER_REPLICA;
     let plant_configuration = principal_plant_configuration(
@@ -1524,6 +1525,7 @@ fn run_principal_definition(
         controller,
         inputs: graph.inputs.into_series_history(),
         stop,
+        seed,
         metric_window_micros: definition.schedule.workload_interval_micros,
     })
 }
@@ -1896,6 +1898,7 @@ pub struct PrincipalRun {
     controller: ControllerTrace,
     inputs: SeriesHistory,
     stop: RunStop,
+    seed: u64,
     metric_window_micros: u64,
 }
 
@@ -1946,6 +1949,16 @@ impl PrincipalRun {
     #[must_use]
     pub const fn stop(&self) -> RunStop {
         self.stop
+    }
+
+    /// Returns reproducible metadata for this experiment.
+    #[must_use]
+    pub fn report_metadata(&self) -> crate::ReportMetadata {
+        crate::ReportMetadata::new(
+            self.controller.artifacts()[0].identity(),
+            self.seed,
+            self.stop.at_micros,
+        )
     }
 }
 

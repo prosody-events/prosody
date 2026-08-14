@@ -41,6 +41,8 @@ impl BatchInputs {
 /// Result of one batch objective evaluated by the controller and plant.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BatchSloSummary {
+    /// Reproducible source and artifact identity.
+    pub metadata: crate::ReportMetadata,
     /// Configured latency budget.
     pub budget_micros: u64,
     /// Configured tolerated miss fraction.
@@ -129,6 +131,7 @@ pub fn run_batch_slo_with_inputs(
         &[0.0_f64],
     )?;
     let mut state = ScaleState::new(configuration.clone(), grid)?;
+    let artifact_identity = state.capacity_artifact().identity();
     let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
     let mut partition_events = [0_u32; PARTITION_COUNT as usize];
@@ -182,6 +185,7 @@ pub fn run_batch_slo_with_inputs(
     let replica_seconds =
         f64::from(INITIAL_REPLICAS) * initial_seconds + f64::from(apply.target) * scaled_seconds;
     Ok(BatchSloSummary {
+        metadata: crate::ReportMetadata::new(artifact_identity, inputs.seed, completion_micros),
         budget_micros,
         epsilon,
         target: apply.target,

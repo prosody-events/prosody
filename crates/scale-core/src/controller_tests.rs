@@ -7,8 +7,43 @@ use crate::types::WorkCohorts;
 use crate::{
     ArrivalPrior, ArrivalPriorError, BacklogCohort, CapacityGrid, CapacityGridError, Configuration,
     ConfigurationError, DemandClass, LaunchPrior, ModelTime, ObservationBuffer, ObservationError,
-    RebalancePrior, ReliabilityPrior, ScaleScratch, ScaleState, ScheduledRelease, ServiceObjective,
+    PosteriorError, PosteriorQuery, RebalancePrior, ReliabilityPrior, ScaleScratch, ScaleState,
+    ScheduledRelease, ServiceObjective,
 };
+
+#[test]
+fn report_views_match_the_fixed_model_contract() -> Result<(), TestError> {
+    let (state, _scratch, _observation) = test_model()?;
+    let artifact = state.capacity_artifact();
+    let clock = state.capacity_clock_check();
+    let launch = state.launch_component_summary(1);
+    let query = PosteriorQuery::CapacityContaminationProbability;
+    let value_count = usize::try_from(state.posterior_value_count(query)?)?;
+    let mut values = vec![0.0_f64; value_count];
+    let mut probabilities = vec![0.0_f64; value_count];
+
+    state.write_posterior(query, &mut values, &mut probabilities)?;
+
+    assert_eq!(artifact.identity().version(), 2);
+    assert!(!artifact.coverage().is_empty());
+    assert!(artifact.coverage().iter().all(|coverage| {
+        coverage.lower_tail_probability() >= 0.0_f64 && coverage.upper_tail_probability() >= 0.0_f64
+    }));
+    assert_eq!(clock.sample_count, 0);
+    assert_eq!(clock.maximum_distance.to_bits(), 0.0_f64.to_bits());
+    assert!(clock.rejection_threshold.is_infinite());
+    assert!(!clock.rejected);
+    assert!(launch.fast_mean_seconds > 0.0_f64);
+    assert!(launch.slow_mean_seconds > launch.fast_mean_seconds);
+    assert!((0.0_f64..=1.0_f64).contains(&launch.slow_probability));
+    assert_eq!(values.len(), probabilities.len());
+    assert!(approximately_equal(probabilities.iter().sum(), 1.0_f64));
+    assert!(
+        state.capacity_class_count() * state.posterior_samples_per_capacity_class_min()
+            <= state.configuration().posterior_sample_count
+    );
+    Ok(())
+}
 
 #[test]
 fn overdue_backlog_keeps_each_original_deadline() -> Result<(), TestError> {
@@ -315,6 +350,8 @@ fn test_configuration() -> Result<Configuration, TestError> {
 #[derive(Debug, Error)]
 enum TestError {
     #[error(transparent)]
+    Integer(#[from] TryFromIntError),
+    #[error(transparent)]
     LeadTime(#[from] crate::LeadTimePriorError),
     #[error(transparent)]
     Arrival(#[from] ArrivalPriorError),
@@ -324,4 +361,7 @@ enum TestError {
     Configuration(#[from] ConfigurationError),
     #[error(transparent)]
     Observation(#[from] ObservationError),
+    #[error(transparent)]
+    Posterior(#[from] PosteriorError),
 }
+use std::num::TryFromIntError;

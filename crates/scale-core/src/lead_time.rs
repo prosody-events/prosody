@@ -287,6 +287,17 @@ pub struct LaunchPriorGrid<'a> {
     slow_cells: &'a [DurationCell],
 }
 
+/// Posterior launch mixture for one replica delta.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LaunchComponentSummary {
+    /// Posterior probability of the slow launch mode.
+    pub slow_probability: f64,
+    /// Conditional posterior mean for the fast mode in seconds.
+    pub fast_mean_seconds: f64,
+    /// Conditional posterior mean for the slow mode in seconds.
+    pub slow_mean_seconds: f64,
+}
+
 impl<'a> LaunchPriorGrid<'a> {
     /// Groups the four product-grid axes for prior construction.
     #[must_use]
@@ -637,6 +648,38 @@ impl LaunchTimeFactor {
 
     pub(crate) fn expected_last_seconds(&self) -> f64 {
         self.expected_seconds(TransitionDirection::Up, self.last_replica_delta)
+    }
+
+    pub(crate) fn component_summary(&self, replica_delta: u32) -> LaunchComponentSummary {
+        let mut slow_probability = 0.0_f64;
+        let mut fast_mean_seconds = 0.0_f64;
+        let mut slow_mean_seconds = 0.0_f64;
+        for (hypothesis, weight) in self.weights.iter().copied().enumerate() {
+            let components = self.components(hypothesis, replica_delta);
+            let slow_mass = weight * components.slow_probability;
+            let fast_mass = weight - slow_mass;
+            slow_probability += slow_mass;
+            fast_mean_seconds += fast_mass * log_normal_mean(components.fast);
+            slow_mean_seconds += slow_mass * log_normal_mean(components.slow);
+        }
+        let fast_probability = 1.0_f64 - slow_probability;
+        LaunchComponentSummary {
+            slow_probability,
+            fast_mean_seconds: if fast_probability > 0.0_f64 {
+                fast_mean_seconds / fast_probability
+            } else {
+                0.0_f64
+            },
+            slow_mean_seconds: if slow_probability > 0.0_f64 {
+                slow_mean_seconds / slow_probability
+            } else {
+                0.0_f64
+            },
+        }
+    }
+
+    pub(crate) fn last_component_summary(&self) -> LaunchComponentSummary {
+        self.component_summary(self.last_replica_delta)
     }
 
     pub(crate) fn sample_seconds(

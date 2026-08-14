@@ -10,6 +10,7 @@ use crate::{
     PrincipalRun, PrincipalRunError, RegimeExperiment, RegimeValidationError,
     run_capacity_evidence_regime_seeded, run_principal_regime_seeded, validate_principal_regime,
 };
+use crate::{ReportMetadata, W6AblationWitness, w6_witness::W6_ABLATION_WITNESSES};
 
 const COVERAGE_LEVELS: [f64; 4] = [0.5_f64, 0.8_f64, 0.9_f64, 0.95_f64];
 const RANK_BIN_COUNT: usize = 10;
@@ -18,6 +19,7 @@ const MAX_CALIBRATION_THREADS: usize = 4;
 /// Repeated capacity calibration results.
 pub struct CapacityCalibration {
     trials: Vec<CapacityCalibrationTrial>,
+    w6_ablation_witnesses: [W6AblationWitness; 5],
 }
 
 /// Repeated capacity prior and grid sensitivity results.
@@ -43,6 +45,8 @@ pub struct LeadTimeCalibration {
 /// Lead-time calibration summary for one direction and seeded regime.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LeadTimeCalibrationTrial {
+    /// Reproducible source and artifact identity.
+    pub metadata: ReportMetadata,
     /// Tested operating regime.
     pub regime: PrincipalRegime,
     /// Stochastic simulator seed.
@@ -68,6 +72,8 @@ pub struct LeadTimeCalibrationTrial {
 /// Partition-shape calibration summary for one seeded regime.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PartitionCalibrationTrial {
+    /// Reproducible source and artifact identity.
+    pub metadata: ReportMetadata,
     /// Tested operating regime.
     pub regime: PrincipalRegime,
     /// Stochastic simulator seed.
@@ -89,6 +95,8 @@ pub struct PartitionCalibrationTrial {
 /// Arrival calibration summary for one seeded regime.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DemandCalibrationTrial {
+    /// Reproducible source and artifact identity.
+    pub metadata: ReportMetadata,
     /// Tested operating regime.
     pub regime: PrincipalRegime,
     /// Stochastic simulator seed.
@@ -123,6 +131,8 @@ pub struct CapacitySensitivityTrial {
 /// Calibration summary for one seeded experiment.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CapacityCalibrationTrial {
+    /// Reproducible source and artifact identity.
+    pub metadata: ReportMetadata,
     /// Tested operating regime.
     pub regime: PrincipalRegime,
     /// Stochastic simulator seed.
@@ -146,6 +156,12 @@ impl CapacityCalibration {
     #[must_use]
     pub fn trials(&self) -> &[CapacityCalibrationTrial] {
         &self.trials
+    }
+
+    /// Returns the fixed five-arm event-path calibration witness.
+    #[must_use]
+    pub const fn w6_ablation_witnesses(&self) -> &[W6AblationWitness; 5] {
+        &self.w6_ablation_witnesses
     }
 }
 
@@ -216,7 +232,10 @@ pub fn run_capacity_calibration(
             .map(|(regime, seed)| run_trial(regime, seed))
             .collect::<Result<Vec<_>, _>>()
     })?;
-    Ok(CapacityCalibration { trials })
+    Ok(CapacityCalibration {
+        trials,
+        w6_ablation_witnesses: W6_ABLATION_WITNESSES,
+    })
 }
 
 /// Runs capacity prior and grid sensitivity experiments in parallel.
@@ -486,6 +505,7 @@ fn summarize_lead_time_trial(
     let final_width = posterior_width(values, final_mass);
     let count = f64::from(observation_count.max(1));
     Ok(LeadTimeCalibrationTrial {
+        metadata: run.report_metadata(),
         regime,
         seed,
         direction,
@@ -549,6 +569,7 @@ fn summarize_partition_trial(
     let final_entropy = categorical_entropy(final_mass);
     let count = f64::from(observation_count);
     Ok(PartitionCalibrationTrial {
+        metadata: run.report_metadata(),
         regime,
         seed,
         observation_count,
@@ -625,6 +646,7 @@ fn summarize_demand_trial(
     let final_width = arrival_posterior_width(arrival_values, final_posterior);
     let count = f64::from(observation_count);
     Ok(DemandCalibrationTrial {
+        metadata: run.report_metadata(),
         regime,
         seed,
         observation_count,
@@ -697,6 +719,7 @@ fn summarize_trial(
     let final_width = posterior_width(run.controller().capacity_posterior_values(), final_mass);
     let count = f64::from(observation_count);
     Ok(CapacityCalibrationTrial {
+        metadata: run.report_metadata(),
         regime,
         seed,
         observation_count,

@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use prosody_scale_core::{
     ArrivalPrior, ArrivalPriorError, CapacityGrid, Configuration as ControllerConfiguration,
-    LaunchPrior, RandomStream, RebalancePrior, ReliabilityPrior, ServiceObjective,
+    LaunchPrior, PosteriorQuery, RandomStream, RebalancePrior, ReliabilityPrior, ServiceObjective,
 };
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
@@ -16,15 +16,16 @@ use crate::series::{
 };
 use crate::{
     ArrivalEvidenceSample, AttemptContext, AttemptFrame, AttemptGenerator, AttemptModel,
-    AttemptParameters, ClosedLoop, ClosedLoopError, ConcurrencyLatencyCurve, EventContext,
-    EventInputs, EventOutcome, EventOutcomeRule, EventSource, EventSpec, FaultPattern,
-    FinalOutcome, HistoricalAttemptModel, Kip848Rebalance, Plant, PlantConfiguration, PlantError,
-    PrincipalRegime, PrincipalRunError, QuantileTable, RegimeExperiment, RegimeValidationError,
+    AttemptParameters, ClosedLoop, ClosedLoopError, ConcurrencyLatencyCurve, ControllerSample,
+    ControllerTrace, EventContext, EventInputs, EventOutcome, EventOutcomeRule, EventSource,
+    EventSpec, FaultPattern, FinalOutcome, HistoricalAttemptModel, Kip848Rebalance, Plant,
+    PlantConfiguration, PlantError, PrincipalRegime, PrincipalRunError, PriorArtifactKind,
+    QuantileTable, RegimeExperiment, RegimeValidationError, ReliabilityEvidenceSample,
     ReporterDirective, RetryCount, RetryOutcome, RunStopReason, ScaleChange, ScaleDirective,
     ScaleRequest, SimulationHarness, Snapshot, SnapshotChannel, SnapshotCursor, SnapshotTable,
-    StepSeries, TickContext, TickGenerator, TickInputs, WorkloadSeries, run_batch_regime,
-    run_batch_slo, run_capacity_evidence_regime, run_parallel, run_principal_regime,
-    validate_principal_regime,
+    StepSeries, TickContext, TickGenerator, TickInputs, W6AblationArm, WorkloadSeries,
+    run_batch_regime, run_batch_slo, run_capacity_evidence_regime, run_parallel,
+    run_principal_regime, validate_principal_regime,
 };
 use crate::{CapacityEvidenceKind, CapacityEvidenceSample};
 
@@ -361,6 +362,147 @@ fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
         changed_sample.capacity_evidence,
         CapacityEvidenceSample::Window(_)
     ));
+    Ok(())
+}
+
+#[test]
+fn controller_trace_exposes_report_evidence_contract() -> Result<(), TestError> {
+    let closed_loop = capacity_test_closed_loop(CapacityWorkload, 8)?;
+    let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?
+        .with_rebalance(0, 0)
+        .with_metric_poll_interval_micros(10_000);
+    let mut harness = SimulationHarness::new(plant_configuration, 1, 8, closed_loop)?;
+    for tick in 0_u64..8 {
+        harness.tick(tick * 10_000)?;
+    }
+    let (_result, closed_loop) = harness.finish_with_graph();
+    let trace = closed_loop.trace();
+
+    assert_trace_catalog(trace);
+    let (arrival_windows, capacity_windows, reliability_observations) =
+        assert_trace_samples(trace)?;
+    assert!(arrival_windows > 0);
+    assert!(capacity_windows > 0);
+    assert!(reliability_observations > 0);
+    assert_reported_arrival_intervals()?;
+    Ok(())
+}
+
+fn assert_trace_catalog(trace: &ControllerTrace) {
+    assert_eq!(trace.artifacts().len(), 5);
+    for artifact in trace.artifacts() {
+        assert_eq!(artifact.schema_version(), 1);
+        assert!(!artifact.coverage().is_empty());
+        assert!(artifact.coverage().iter().all(|coverage| {
+            coverage.lower_tail_probability() >= 0.0_f64
+                && coverage.upper_tail_probability() >= 0.0_f64
+        }));
+    }
+    assert!(trace.artifact(PriorArtifactKind::Capacity).is_some());
+    assert_eq!(trace.w6_ablation_witnesses().len(), 5);
+    assert_eq!(
+        trace.w6_ablation_witnesses()[3].arm,
+        W6AblationArm::ProperJoint
+    );
+    assert_eq!(
+        trace.w6_ablation_witnesses()[3].joint_log_score.to_bits(),
+        trace.w6_ablation_witnesses()[4].joint_log_score.to_bits()
+    );
+    assert!(
+        trace
+            .posterior_values(PosteriorQuery::CapacityContaminationProbability)
+            .is_some()
+    );
+}
+
+fn assert_trace_samples(trace: &ControllerTrace) -> Result<(u32, u32, u32), TestError> {
+    let mut capacity_windows = 0_u32;
+    let mut arrival_windows = 0_u32;
+    let mut reliability_observations = 0_u32;
+    for index in 0..trace.len() {
+        let sample = trace
+            .sample(index)
+            .ok_or(TestError::MissingControllerSample)?;
+        assert_sample_fields(&sample);
+        if let ArrivalEvidenceSample::Accepted(window) = sample.arrival_evidence {
+            arrival_windows = arrival_windows.saturating_add(1);
+            assert_arrival_interval(sample.at_micros, window);
+        }
+        if let ReliabilityEvidenceSample::Accepted { normal, failure } = sample.reliability_evidence
+        {
+            reliability_observations = reliability_observations
+                .saturating_add(normal.success)
+                .saturating_add(normal.permanent)
+                .saturating_add(normal.transient)
+                .saturating_add(normal.terminal)
+                .saturating_add(failure.success)
+                .saturating_add(failure.permanent)
+                .saturating_add(failure.transient)
+                .saturating_add(failure.terminal);
+        }
+        if let CapacityEvidenceSample::Window(window) = sample.capacity_evidence {
+            let capacity_trace = trace
+                .capacity_trace(index)
+                .ok_or(TestError::MissingCapacityWindow)?;
+            capacity_windows = capacity_windows.saturating_add(1);
+            assert_eq!(
+                capacity_trace.state_completion_counts.iter().sum::<u32>(),
+                window.completed_attempts
+            );
+            let exposure = capacity_trace.state_exposure_seconds.iter().sum::<f64>();
+            assert!((exposure - window.exposure_seconds).abs() <= f64::EPSILON);
+            assert_eq!(
+                capacity_trace.busy_slot_micros,
+                (window.concurrency * exposure * 1_000_000.0_f64).round() as u128
+            );
+        }
+    }
+    Ok((arrival_windows, capacity_windows, reliability_observations))
+}
+
+fn assert_sample_fields(sample: &ControllerSample) {
+    assert!(sample.samples_per_capacity_class >= sample.samples_per_capacity_class_min);
+    assert_eq!(
+        sample.scenario_count,
+        sample
+            .capacity_class_count
+            .saturating_mul(sample.samples_per_capacity_class)
+    );
+    assert!(sample.selected_late_area_mean.is_finite());
+    assert!(sample.selected_replica_seconds_mean.is_finite());
+    assert!(sample.selected_cost.is_finite());
+    assert!(sample.demand_floor <= sample.cap);
+    assert!(sample.lead_time_fast_seconds.is_finite());
+    assert!(sample.lead_time_slow_seconds.is_finite());
+    assert!((0.0_f64..=1.0_f64).contains(&sample.lead_time_slow_probability));
+}
+
+fn assert_arrival_interval(at_micros: u64, window: crate::ArrivalWindowSample) {
+    assert_eq!(window.end_micros, at_micros);
+    assert_eq!(
+        window.end_micros.saturating_sub(window.start_micros),
+        (window.exposure_seconds * 1_000_000.0_f64).round() as u64
+    );
+}
+
+fn assert_reported_arrival_intervals() -> Result<(), TestError> {
+    let reported = run_reported_arrivals(
+        FaultPattern {
+            drop_every: 0,
+            duplicate_every: 0,
+            delay_micros: 0,
+            odd_sequence_delay_micros: 0,
+        },
+        None,
+    )?;
+    for index in 0..reported.len() {
+        let sample = reported
+            .sample(index)
+            .ok_or(TestError::MissingControllerSample)?;
+        if let ArrivalEvidenceSample::Accepted(window) = sample.arrival_evidence {
+            assert_arrival_interval(sample.at_micros, window);
+        }
+    }
     Ok(())
 }
 
@@ -2125,7 +2267,7 @@ fn source_arrival_count(messages: u32, timers: u32) -> Result<u32, TestError> {
 fn run_reported_arrivals(
     fault: FaultPattern,
     reporter_tick: Option<(u32, ReporterDirective)>,
-) -> Result<crate::ControllerTrace, TestError> {
+) -> Result<ControllerTrace, TestError> {
     let controller_configuration = ControllerConfiguration {
         cohort_count_max: 4,
         calendar_segment_count_max: 4,

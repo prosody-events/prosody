@@ -126,6 +126,10 @@ pub struct ReporterState {
 /// One complete cumulative-counter interval.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArrivalInterval {
+    /// Inclusive reporter time for interval assignment.
+    pub start_micros: u64,
+    /// Exclusive reporter time for interval assignment.
+    pub end_micros: u64,
     /// Arrivals added after the prior accepted snapshot.
     pub count: u64,
     /// Model-time exposure covered by the interval.
@@ -177,6 +181,8 @@ impl SnapshotCursor {
         let monotonic = self.arrival_counts[sender_index] <= current.arrival_count
             && self.observed_at_micros[sender_index] < current.observed_at_micros;
         let interval = (newer && monotonic).then(|| ArrivalInterval {
+            start_micros: self.observed_at_micros[sender_index],
+            end_micros: current.observed_at_micros,
             count: current.arrival_count - self.arrival_counts[sender_index],
             exposure_micros: current.observed_at_micros - self.observed_at_micros[sender_index],
         });

@@ -118,6 +118,8 @@ pub enum PosteriorQuery {
     Knee,
     /// Whether a finite knee exists in the supported range.
     SaturationState,
+    /// Capacity-window contamination probability.
+    CapacityContaminationProbability,
     /// Retry probability after a normal attempt.
     NormalRetryProbability,
     /// Retry probability after a failure attempt.
@@ -153,6 +155,9 @@ pub struct PriorArtifactIdentity {
 }
 
 impl PriorArtifactIdentity {
+    /// Schema version for the shared prior artifact contract.
+    pub const SCHEMA_VERSION: u32 = 1;
+
     /// Constructs one versioned artifact identity.
     #[must_use]
     pub const fn new(source: u64, version: u32, random_stream: u64) -> Self {
@@ -322,6 +327,18 @@ impl PriorCoverageRecord {
         self.upper_endpoint
     }
 
+    /// Returns the recorded probability below the lower endpoint.
+    #[must_use]
+    pub const fn lower_tail_probability(self) -> f64 {
+        self.lower_tail_probability
+    }
+
+    /// Returns the recorded probability above the upper endpoint.
+    #[must_use]
+    pub const fn upper_tail_probability(self) -> f64 {
+        self.upper_tail_probability
+    }
+
     /// Returns the recorded probability outside both endpoints.
     #[must_use]
     pub const fn tail_probability(self) -> f64 {
@@ -332,6 +349,46 @@ impl PriorCoverageRecord {
     #[must_use]
     pub const fn decision_cost_error(self) -> f64 {
         self.decision_cost_error
+    }
+}
+
+/// One complete shared prior artifact contract.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PriorArtifact {
+    identity: PriorArtifactIdentity,
+    budget: PriorArtifactBudget,
+    coverage: Box<[PriorCoverageRecord]>,
+}
+
+impl PriorArtifact {
+    pub(crate) fn new(
+        identity: PriorArtifactIdentity,
+        budget: PriorArtifactBudget,
+        coverage: Box<[PriorCoverageRecord]>,
+    ) -> Self {
+        Self {
+            identity,
+            budget,
+            coverage,
+        }
+    }
+
+    /// Returns the artifact identity and version.
+    #[must_use]
+    pub const fn identity(&self) -> PriorArtifactIdentity {
+        self.identity
+    }
+
+    /// Returns the approximation and resource budget.
+    #[must_use]
+    pub const fn budget(&self) -> PriorArtifactBudget {
+        self.budget
+    }
+
+    /// Returns all support and omitted-tail records.
+    #[must_use]
+    pub const fn coverage(&self) -> &[PriorCoverageRecord] {
+        &self.coverage
     }
 }
 

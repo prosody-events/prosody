@@ -22,9 +22,10 @@ mod capacity_plot;
 mod controller;
 mod harness;
 mod input;
+mod metadata;
 mod metrics;
 mod model;
-mod plot;
+mod plot_error;
 mod posterior_plot;
 mod regime;
 mod report;
@@ -32,6 +33,7 @@ mod result_metrics;
 mod series;
 mod snapshot;
 mod story_plot;
+mod w6_witness;
 
 pub use batch::{
     BatchInputs, BatchSloError, BatchSloSummary, run_batch_regime, run_batch_slo,
@@ -54,8 +56,8 @@ pub use calibration_plot::{
 pub use capacity_plot::write_capacity_belief_svg;
 pub use controller::{
     ArrivalEvidenceSample, ArrivalWindowSample, CapacityEvidenceKind, CapacityEvidenceSample,
-    CapacityWindowSample, ClosedLoop, ClosedLoopError, ControllerSample, ControllerTrace,
-    LeadTimeEvidenceSample,
+    CapacityTraceSample, CapacityWindowSample, ClosedLoop, ClosedLoopError, ControllerSample,
+    ControllerTrace, LeadTimeEvidenceSample, ReliabilityEvidenceSample,
 };
 pub use harness::{
     CalendarForecastInput, EventContext, EventInputs, EventOutcomeRule, FailureBacklog,
@@ -64,12 +66,13 @@ pub use harness::{
     TickHistoryView, TickInputs,
 };
 pub use input::{ConcurrencyLatencyCurve, InputError, QuantileTable, StepSeries, WorkloadSeries};
+pub use metadata::{GENERATOR_VERSION, PriorArtifactKind, PriorArtifactMetadata, ReportMetadata};
 pub use metrics::{MetricPoint, MetricTrace};
 pub use model::{
     AttemptContext, AttemptFrame, AttemptGenerator, AttemptHistory, AttemptHistoryView,
     AttemptModel, AttemptParameters, HistoricalAttemptModel, SeriesAttemptModel,
 };
-pub use plot::{PlotError, write_metric_svg};
+pub use plot_error::PlotError;
 pub use posterior_plot::{write_model_belief_figures, write_model_belief_snapshot_figures};
 pub use regime::{
     CapacitySensitivity, PrincipalRegime, PrincipalRun, PrincipalRunError, RegimeExperiment,
@@ -92,6 +95,7 @@ pub use snapshot::{
     SnapshotTable,
 };
 pub use story_plot::{RegimeStory, write_regime_story_figures};
+pub use w6_witness::{W6AblationArm, W6AblationWitness};
 
 const NO_EVENT: u32 = u32::MAX;
 const DEFAULT_FAILURE_WEIGHT: f64 = 0.3_f64;

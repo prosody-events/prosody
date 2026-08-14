@@ -1,4 +1,5 @@
 [package]
+build = "build.rs"
 description = "Independent plant and validation laboratory for Prosody autoscaling"
 edition = "2024"
 categories = ["algorithms", "simulation"]
