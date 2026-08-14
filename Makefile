@@ -2,7 +2,7 @@
 bootstrap:
 	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 	brew install buf protobuf
-	cargo install cargo-udeps cargo-tarpaulin taplo-cli bacon cargo-nextest
+	cargo install cargo-udeps cargo-llvm-cov taplo-cli bacon cargo-nextest
 
 # Start Kafka and related services using Docker Compose
 up:
@@ -56,7 +56,7 @@ test-watch: up
 
 # Generate code coverage report
 coverage: up
-	cargo tarpaulin
+	cargo llvm-cov nextest
 
 # Check for unused dependencies
 # note: requires installing nightly with `rustup install nightly`
