@@ -28,8 +28,11 @@ use validator::{Validate, ValidationError, ValidationErrors};
 #[validate(schema(function = "validate_peer"))]
 pub struct PeerConfiguration {
     /// The address for the peer listener.
-    #[builder(default = "default_bind_address()?")]
-    pub bind_address: SocketAddr,
+    ///
+    /// Prosody selects an address when it starts the network router if this
+    /// value is absent. Local-only routers do not select an address.
+    #[builder(default = "configured_bind_address()?")]
+    pub bind_address: Option<SocketAddr>,
     /// The gRPC connect URI that peers on another network use.
     #[builder(default = "from_option_env(\"PROSODY_PEER_ADVERTISED_CONNECT\")?")]
     pub advertised_connect: Option<Endpoint>,
@@ -56,19 +59,19 @@ pub(crate) struct PeerParts {
     pub(crate) lease: RegistrationTtl,
 }
 
-fn default_bind_address() -> Result<SocketAddr, PeerConfigurationBuilderError> {
+fn configured_bind_address() -> Result<Option<SocketAddr>, PeerConfigurationBuilderError> {
     match var("PROSODY_PEER_BIND_ADDRESS") {
-        Ok(value) => Ok(value.parse()?),
-        Err(VarError::NotPresent) => default_socket_address(),
+        Ok(value) => Ok(Some(value.parse()?)),
+        Err(VarError::NotPresent) => Ok(None),
         Err(error) => Err(PeerConfigurationBuilderError::Environment(error)),
     }
 }
 
-fn default_socket_address() -> Result<SocketAddr, PeerConfigurationBuilderError> {
+fn default_socket_address() -> Result<SocketAddr, PeerConfigurationError> {
     let interface = netdev::get_interfaces()
         .into_iter()
         .find(|interface| interface.default)
-        .ok_or(PeerConfigurationBuilderError::NoDefaultInterface)?;
+        .ok_or(PeerConfigurationError::NoDefaultInterface)?;
     if let Some(network) = interface.ipv4.iter().find(|network| {
         let address = network.addr();
         !address.is_link_local() && !address.is_loopback() && !address.is_unspecified()
@@ -88,7 +91,7 @@ fn default_socket_address() -> Result<SocketAddr, PeerConfigurationBuilderError>
         .ipv6
         .first()
         .map(|network| SocketAddrV6::new(network.addr(), 9099, 0, interface.index).into())
-        .ok_or(PeerConfigurationBuilderError::NoInterfaceAddress)
+        .ok_or(PeerConfigurationError::NoInterfaceAddress)
 }
 
 impl PeerConfiguration {
@@ -111,7 +114,7 @@ impl PeerConfiguration {
     fn unvalidated_parts(&self) -> Result<PeerParts, PeerConfigurationError> {
         let lease = RegistrationTtl::try_from(self.registration_ttl)?;
         Ok(PeerParts {
-            bind: self.bind_address,
+            bind: self.bind_address.map_or_else(default_socket_address, Ok)?,
             router: RouterConfiguration {
                 advertised: self.advertised_connect.clone(),
                 network: self.network_name.clone(),
@@ -125,20 +128,25 @@ impl PeerConfiguration {
 }
 
 fn validate_peer(config: &PeerConfiguration) -> Result<(), ValidationError> {
-    if config.bind_address.ip().is_unspecified() {
+    if config
+        .bind_address
+        .is_some_and(|bind| bind.ip().is_unspecified())
+    {
         return Err(ValidationError::new("unspecified_bind_address"));
     }
-    let parts = config
-        .unvalidated_parts()
-        .map_err(|_| ValidationError::new("peer_parts"))?;
-    parts
-        .router
-        .validate()
-        .map_err(|_| ValidationError::new("router"))?;
-    parts
-        .cache
-        .validate()
-        .map_err(|_| ValidationError::new("fleet"))?;
+    RouterConfiguration {
+        advertised: config.advertised_connect.clone(),
+        network: config.network_name.clone(),
+    }
+    .validate()
+    .map_err(|_| ValidationError::new("router"))?;
+    PeerCacheConfiguration {
+        peer_capacity: config.peer_cache_capacity,
+    }
+    .validate()
+    .map_err(|_| ValidationError::new("fleet"))?;
+    RegistrationTtl::try_from(config.registration_ttl)
+        .map_err(|_| ValidationError::new("registration_ttl"))?;
     Ok(())
 }
 
@@ -151,6 +159,12 @@ pub(crate) enum PeerConfigurationError {
     /// The registration lease is outside its supported range.
     #[error("invalid registration lease: {0:#}")]
     Lease(#[from] RegistrationTtlError),
+    /// The operating system did not identify a default interface.
+    #[error("the operating system did not identify a default network interface")]
+    NoDefaultInterface,
+    /// The default interface has no address.
+    #[error("the default network interface has no address")]
+    NoInterfaceAddress,
 }
 
 /// Why the peer configuration builder cannot build a configuration.
@@ -162,12 +176,6 @@ pub enum PeerConfigurationBuilderError {
     /// The configured bind address is not a socket address.
     #[error("PROSODY_PEER_BIND_ADDRESS is not a socket address: {0}")]
     InvalidBindAddress(#[from] AddrParseError),
-    /// The operating system did not identify a default interface.
-    #[error("the operating system did not identify a default network interface")]
-    NoDefaultInterface,
-    /// The default interface has no address.
-    #[error("the default network interface has no address")]
-    NoInterfaceAddress,
     /// The bind address environment variable is not valid Unicode.
     #[error("PROSODY_PEER_BIND_ADDRESS cannot be read: {0}")]
     Environment(VarError),

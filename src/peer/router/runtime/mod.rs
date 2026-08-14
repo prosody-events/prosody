@@ -90,9 +90,9 @@ pub(crate) struct PeerRuntime<D> {
 /// [`activate`](Self::activate). So the first write is the last step that can
 /// fail, and an owner that fails after preparation publishes nothing to undo.
 ///
-/// This value owns a listening socket. Spend it exactly once, through
-/// `activate` or [`abandon`](Self::abandon). A plain drop detaches the listener
-/// task, and a retry on the same port then fails to bind.
+/// This value owns a listening socket. Spend it through `activate` or
+/// [`abandon`](Self::abandon) to wait for listener shutdown. A plain drop
+/// signals shutdown but does not wait for the listener task.
 pub(crate) struct PreparedPeerRuntime<D> {
     local: LocalTarget,
     network: NetworkRoute<GrpcSender, D>,
@@ -393,8 +393,8 @@ async fn refresh_registration<D: PeerDirectory>(
 
 /// Stops the listener that preparation served.
 ///
-/// A dropped handle leaves its task live. A retry could then fail to bind the
-/// same port.
+/// A dropped stop sender also signals shutdown. This function additionally
+/// waits for the listener task to finish.
 async fn abandon(stop: oneshot::Sender<()>, listener: JoinHandle<()>) {
     drop(stop);
     if let Err(join_error) = listener.await {
