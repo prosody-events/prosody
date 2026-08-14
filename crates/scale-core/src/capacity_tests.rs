@@ -720,7 +720,8 @@ fn equal_rate_erlang_matches_uniformization_within_its_charge() -> Result<(), Te
     let mut erlang_work = [0.0_f64; 4];
     let mut uniform_current = [0.0_f64; 4];
     let mut uniform_next = [0.0_f64; 4];
-    let mut ledger = ErrorLedger::new(1).ok_or(CapacityModelError::StorageBound)?;
+    let mut ledger = ErrorLedger::with_budget(1, PATH_SOLVER_PROBABILITY_ERROR_MAX)
+        .ok_or(CapacityModelError::StorageBound)?;
     pure_death_step(
         &CapacityGrid::new(&[0.5_f64], &[2.0_f64], &[0.0_f64])?,
         0,

@@ -543,15 +543,11 @@ struct ErrorLedger {
 }
 
 impl ErrorLedger {
-    /// Splits the path error across all solver groups in one cell-window.
+    /// Splits the path error budget across all solver groups in one
+    /// cell-window.
     ///
-    /// Each group receives `PATH_SOLVER_PROBABILITY_ERROR_MAX / group_count`.
-    /// A group divides its grant across its uniformization steps and
-    /// contraction.
-    fn new(group_count: usize) -> Option<Self> {
-        Self::with_budget(group_count, PATH_SOLVER_PROBABILITY_ERROR_MAX)
-    }
-
+    /// Each group receives `budget / group_count`. A group divides its grant
+    /// across its uniformization steps and contraction.
     fn with_budget(group_count: usize, budget: f64) -> Option<Self> {
         let count = u32::try_from(group_count).ok()?;
         (count > 0).then_some(Self {
@@ -2029,7 +2025,7 @@ fn pure_death_step(
 ) -> Option<()> {
     let mut rates = vec![0.0_f64; probabilities.len()];
     fill_state_rates(grid, index, &mut rates);
-    let mut ledger = ErrorLedger::new(1)?;
+    let mut ledger = ErrorLedger::with_budget(1, PATH_SOLVER_PROBABILITY_ERROR_MAX)?;
     pure_death_step_with_rates(&rates, band, probabilities, coefficients, work, &mut ledger)?;
     Some(())
 }
