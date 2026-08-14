@@ -73,6 +73,7 @@ pub(crate) struct EvaluationWindow {
 ///
 /// Expected late area integrates lateness to predicted completion within the
 /// scenario horizon. A deadline never truncates this integral.
+/// At every breakpoint, `queue == on_time + overdue`.
 struct DeadlineState {
     queue: f64,
     on_time: f64,
@@ -165,9 +166,14 @@ impl DeadlineState {
                     (service_rate - due_to_queue).max(0.0_f64),
                 )
             };
+            let due_from_on_time = if self.on_time > 0.0_f64 {
+                due_to_queue
+            } else {
+                due_to_queue.min((arrival_rate - on_time_service).max(0.0_f64))
+            };
             let queue_rate = arrival_rate - service_rate;
-            let overdue_rate = due_to_queue - overdue_service;
-            let on_time_rate = arrival_rate - due_to_queue - on_time_service;
+            let overdue_rate = due_from_on_time - overdue_service;
+            let on_time_rate = arrival_rate - due_from_on_time - on_time_service;
             let credit_rate = on_time_service - due_from_credit;
             let queue_crossing = positive_crossing(self.queue, queue_rate);
             let overdue_crossing = positive_crossing(self.overdue, overdue_rate);
@@ -188,7 +194,7 @@ impl DeadlineState {
             self.completion_credit += credit_rate * span;
             self.due_work += due_rate * span;
             let missed_rate = if had_overdue {
-                due_rate
+                due_from_on_time
             } else {
                 overdue_rate.max(0.0_f64)
             };
@@ -1328,6 +1334,33 @@ mod tests {
 
         assert!(state.overdue.total_cmp(&0.0_f64).is_eq());
         assert!(advanced.queue_area >= 0.0_f64);
+    }
+
+    #[test]
+    fn excess_due_vanishes_while_debt_drains() {
+        let mut state = DeadlineState::new(5.0_f64);
+
+        let advanced = state.advance(10.0_f64, 1.0_f64, 0.0_f64, 3.0_f64);
+
+        assert!(state.on_time.total_cmp(&0.0_f64).is_eq());
+        assert!(state.queue.total_cmp(&0.0_f64).is_eq());
+        assert!(state.overdue.total_cmp(&0.0_f64).is_eq());
+        assert!(state.missed.total_cmp(&0.0_f64).is_eq());
+        assert!(advanced.late_area.total_cmp(&12.5_f64).is_eq());
+    }
+
+    #[test]
+    fn due_spike_cannot_create_phantom_overdue_work() {
+        let mut state = DeadlineState::new(0.0_f64);
+        state.release(5.0_f64);
+
+        let advanced = state.advance(4.0_f64, 0.0_f64, 1.0_f64, 3.0_f64);
+
+        assert!(state.on_time.total_cmp(&0.0_f64).is_eq());
+        assert!(state.queue.total_cmp(&9.0_f64).is_eq());
+        assert!(state.overdue.total_cmp(&9.0_f64).is_eq());
+        assert!(state.missed.total_cmp(&9.0_f64).is_eq());
+        assert!(advanced.late_area.total_cmp(&21.75_f64).is_eq());
     }
 
     #[test]
