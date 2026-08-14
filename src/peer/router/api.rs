@@ -4,9 +4,12 @@ use super::config::PeerConfiguration;
 use crate::cassandra::CassandraStore;
 use crate::consumer::{ConsumerError, ShutdownError};
 use crate::peer::backend::prepare_cassandra;
+use crate::peer::metrics::PeerMetrics;
 use crate::peer::response::frame::encode::Staged;
 use crate::peer::response::headers::RequestDeadline;
-use crate::peer::response::sender::{DropReason, ResponseRoute, RouteOutcome, Then};
+use crate::peer::response::sender::{
+    DropReason, PeerMetricSource, ResponseRoute, RouteOutcome, Then,
+};
 use crate::peer::router::directory::cassandra::CassandraPeerDirectory;
 use crate::peer::router::grpc::client::GrpcSender;
 use crate::peer::router::{LocalTarget, NetworkRoute};
@@ -27,7 +30,7 @@ mod sealed {
 /// routers.
 pub trait Router: sealed::Router + Send + Sync + Sized + 'static {
     /// The response route selected by this router.
-    type Response: ResponseRoute;
+    type Response: ResponseRoute + PeerMetricSource;
 
     /// Returns this router's producer capability.
     fn producer(&self) -> ProducerHandle;
@@ -111,6 +114,12 @@ impl ResponseRoute for LocalResponseRoute {
     }
 }
 
+impl PeerMetricSource for LocalResponseRoute {
+    fn peer_metrics(&self) -> &PeerMetrics {
+        self.route.peer_metrics()
+    }
+}
+
 impl ResponseRoute for GrpcResponseRoute {
     fn deliver(
         &self,
@@ -119,6 +128,12 @@ impl ResponseRoute for GrpcResponseRoute {
         context: &Context,
     ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send {
         self.route.deliver(frame, deadline, context)
+    }
+}
+
+impl PeerMetricSource for GrpcResponseRoute {
+    fn peer_metrics(&self) -> &PeerMetrics {
+        self.route.peer_metrics()
     }
 }
 

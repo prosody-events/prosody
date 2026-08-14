@@ -5,11 +5,9 @@
 //! So the attribute set of every point is compared **exactly**, rather than
 //! searched for the label it should carry.
 //!
-//! [`GlobalMetrics`] is installed as the first statement: the instrument binds
-//! to whatever meter provider is global when it is first touched, and nextest
-//! gives this case its own process.
+//! This case supplies local instruments to its listener.
 
-use super::{ALPHA, Harness, header, payload, register};
+use super::{ALPHA, Harness, bind_address, header, payload, register};
 use crate::peer::response::RequestId;
 use crate::test_util::{GlobalMetrics, TEST_RUNTIME, label};
 use color_eyre::Result;
@@ -32,7 +30,7 @@ const SHORT: usize = 8;
 fn every_answer_counts_once_under_a_fixed_label() -> Result<()> {
     let metrics = GlobalMetrics::install();
     TEST_RUNTIME.block_on(async {
-        let harness = Harness::shared().await?;
+        let harness = Harness::with_metrics(bind_address(), metrics.metrics()).await?;
         let request = register(&harness.registry, &[ALPHA])?;
         let accepted = harness
             .deliver(&header(harness.peer, request.id(), ALPHA)?, payload(SHORT))
@@ -61,6 +59,7 @@ fn every_answer_counts_once_under_a_fixed_label() -> Result<()> {
                 ],
             "each answer must count once under its own label alone: {counted:?}"
         );
+        harness.stop().await?;
         Ok(())
     })
 }

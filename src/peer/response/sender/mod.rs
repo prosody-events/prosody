@@ -9,5 +9,6 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use route::Delivery as RouteDelivery;
-pub(crate) use route::{ResponseRoute, RouteOutcome, Then};
+pub use route::{PeerMetricSource, ResponseRoute};
+pub(crate) use route::{RouteOutcome, Then};
 pub(crate) use route::{deliver_response, stage};

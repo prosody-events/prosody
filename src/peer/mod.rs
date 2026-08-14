@@ -9,6 +9,7 @@
 //! [`Router::shutdown`] to wait for teardown.
 
 mod backend;
+pub(crate) mod metrics;
 pub(crate) mod requester;
 pub(crate) mod response;
 pub(crate) mod router;

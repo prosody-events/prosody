@@ -8,7 +8,7 @@ use crate::consumer::{ConsumerError, PeerInitError, ShutdownError};
 use crate::peer::PeerBackend;
 use crate::peer::heartbeat_registry;
 use crate::peer::requester::ProsodyRequester;
-use crate::peer::response::sender::{ResponseRoute, Then};
+use crate::peer::response::sender::{PeerMetricSource, ResponseRoute, Then};
 #[cfg(test)]
 use crate::peer::router::PeerId;
 use crate::peer::router::config::PeerParts;
@@ -37,7 +37,7 @@ mod local_route {
 }
 
 /// A response route that always tries the local peer first.
-pub(crate) trait LocalRoute: local_route::Sealed + ResponseRoute {
+pub(crate) trait LocalRoute: local_route::Sealed + ResponseRoute + PeerMetricSource {
     /// The local target that owns this route's request identity.
     fn local(&self) -> &LocalTarget;
 }

@@ -16,11 +16,12 @@ use crate::peer::router::loopback::direct_address;
 use crate::peer::router::loopback::listener::FixedRouter;
 use crate::peer::router::{EndpointKind, Host, NetworkRouter, PeerId, ResponseSender, SendFailure};
 use crate::subsystem::SubsystemName;
-use crate::test_util::{GlobalMetrics, GlobalSpans, TEST_RUNTIME, label, named};
+use crate::test_util::{GlobalMetrics, GlobalSpans, TEST_RUNTIME, label, named, trace_spans};
 use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use opentelemetry::Context;
 use opentelemetry::Value;
+use opentelemetry::trace::{TraceContextExt as _, TraceId};
 use opentelemetry_sdk::trace::SpanData;
 use std::convert::Infallible;
 use std::slice::from_ref;
@@ -67,7 +68,7 @@ fn a_large_response_crosses_a_relay() -> Result<()> {
         let pair = Pair::start(TargetRoute::Nowhere).await?;
         let request = awaited(&pair.target.registry)?;
         let outcome = async {
-            let answered = call_with_payload(
+            let (answered, _) = call_with_payload(
                 &pair.relay,
                 pair.target.peer,
                 request.id(),
@@ -100,7 +101,7 @@ fn a_frame_this_process_already_relayed_is_never_relayed_again() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let pair = Pair::start(TargetRoute::Relay).await?;
         let outcome = async {
-            let answered = call(&pair.relay, PeerId::new(), RequestId::new(), BUDGET).await?;
+            let (answered, _) = call(&pair.relay, PeerId::new(), RequestId::new(), BUDGET).await?;
             ensure(
                 answered == Code::FailedPrecondition,
                 format!(
@@ -133,7 +134,7 @@ fn a_forward_carries_what_is_left_of_the_caller_budget() -> Result<()> {
     TEST_RUNTIME.block_on(async {
         let pair = Pair::start(TargetRoute::Nowhere).await?;
         let outcome = async {
-            let answered =
+            let (answered, trace) =
                 call(&pair.relay, PeerId::new(), RequestId::new(), CALLER_BUDGET).await?;
             ensure(
                 answered == Code::FailedPrecondition,
@@ -142,7 +143,7 @@ fn a_forward_carries_what_is_left_of_the_caller_budget() -> Result<()> {
                      answer {answered:?}"
                 ),
             )?;
-            let ended = spans.ended();
+            let ended = trace_spans(&spans.ended(), trace);
             let (relay, target) = two_hops(&ended)?;
             let relay_ms = deadline_ms(relay)?;
             let target_ms = deadline_ms(target)?;
@@ -183,12 +184,13 @@ fn a_relayed_response_reads_as_one_trace() -> Result<()> {
         let pair = Pair::start(TargetRoute::Nowhere).await?;
         let outcome = async {
             let request = awaited(&pair.target.registry)?;
-            let answered = call(&pair.relay, pair.target.peer, request.id(), BUDGET).await?;
+            let (answered, trace) =
+                call(&pair.relay, pair.target.peer, request.id(), BUDGET).await?;
             ensure(
                 answered == Code::Ok,
                 format!("the target must accept the relayed response, not answer {answered:?}"),
             )?;
-            let ended = spans.ended();
+            let ended = trace_spans(&spans.ended(), trace);
             let caller = named(&ended, CALLER)?;
             let (relay, target) = two_hops(&ended)?;
             let forward = named(&ended, FORWARDED)?;
@@ -231,7 +233,7 @@ fn a_relayed_response_reads_as_one_trace() -> Result<()> {
 fn a_response_crosses_two_networks_through_a_relay() -> Result<()> {
     let metrics = GlobalMetrics::install();
     TEST_RUNTIME.block_on(async {
-        let pair = Pair::start(TargetRoute::Nowhere).await?;
+        let pair = Pair::start_with_metrics(TargetRoute::Nowhere, metrics.metrics()).await?;
         let outcome = crossing(&pair).await;
         pair.stop().await?;
         outcome?;
@@ -277,7 +279,8 @@ async fn crossing(pair: &Pair) -> Result<()> {
     )?;
 
     let payload = PAYLOAD.to_vec();
-    let prepared = stage_response::<CountingCodec, Infallible>(
+    let prepared = stage_response::<CountingCodec, Infallible, _>(
+        &router,
         FrameHeader {
             target: pair.target.peer,
             request: request.id(),
@@ -300,7 +303,12 @@ async fn crossing(pair: &Pair) -> Result<()> {
 }
 
 /// Delivers one frame for `target` into `live`, under a budget of `granted`.
-async fn call(live: &Live, target: PeerId, request: RequestId, granted: Duration) -> Result<Code> {
+async fn call(
+    live: &Live,
+    target: PeerId,
+    request: RequestId,
+    granted: Duration,
+) -> Result<(Code, TraceId)> {
     call_with_payload(live, target, request, granted, PAYLOAD).await
 }
 
@@ -310,7 +318,7 @@ async fn call_with_payload(
     request: RequestId,
     granted: Duration,
     payload: &[u8],
-) -> Result<Code> {
+) -> Result<(Code, TraceId)> {
     let sender = GrpcSender::new(PeerCacheConfiguration::default());
     let header = FrameHeader {
         target,
@@ -321,11 +329,12 @@ async fn call_with_payload(
     let staged = stage_success::<CountingCodec>(&header, &payload.to_vec())?;
     let caller = info_span!("peer.test.call");
     let context = caller.context();
+    let trace = context.span().span_context().trace_id();
     let delivered = deliver(&sender, &live.address, &staged, granted, &context).await;
     drop(caller);
     match delivered {
-        Ok(()) => Ok(Code::Ok),
-        Err(SendFailure::Status(code)) => Ok(code),
+        Ok(()) => Ok((Code::Ok, trace)),
+        Err(SendFailure::Status(code)) => Ok((code, trace)),
         Err(failure) => bail!("the listener answered nothing at all: {failure}"),
     }
 }

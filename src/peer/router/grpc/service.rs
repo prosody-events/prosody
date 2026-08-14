@@ -8,6 +8,7 @@ use super::generated::peer_service_server::PeerService as PeerServiceApi;
 use super::inject::MetadataExtractor;
 use super::telemetry::{METHOD, record_status};
 use crate::otel::context_with_parent;
+use crate::peer::metrics::PeerMetrics;
 use crate::peer::response::ResponseDisposition;
 use crate::peer::response::frame::ResponseFrame;
 use crate::peer::response::frame::encode::Forwarded;
@@ -41,6 +42,14 @@ impl<R> PeerService<R> {
             relay,
             propagator: new_propagator(),
         }
+    }
+
+    fn answer(
+        &self,
+        span: &Span,
+        disposition: ResponseDisposition,
+    ) -> Result<Response<()>, Status> {
+        answer(span, self.local.pending().metrics(), disposition)
     }
 }
 
@@ -107,8 +116,8 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
             }
             let routing = routing(self.local.peer, target, frame.header.relay);
             match routing {
-                Routing::Accept => answer(&span, self.local.accept(frame)),
-                Routing::AlreadyRelayed => answer(&span, ResponseDisposition::AlreadyRelayed),
+                Routing::Accept => self.answer(&span, self.local.accept(frame)),
+                Routing::AlreadyRelayed => self.answer(&span, ResponseDisposition::AlreadyRelayed),
                 Routing::Forward => {
                     // The forwarded form carries this process's own id, so a
                     // relay id the caller supplied cannot survive the hop.
@@ -141,12 +150,12 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
                         Err(RelayFailure::DeadlineExceeded) => {
                             record_status(&forward, Code::DeadlineExceeded);
                             forward.in_scope(|| error!(error = "the relay deadline elapsed"));
-                            answer(&span, ResponseDisposition::RelayDeadlineExceeded)
+                            self.answer(&span, ResponseDisposition::RelayDeadlineExceeded)
                         }
                         Err(RelayFailure::Unreachable) => {
                             record_status(&forward, Code::Unavailable);
                             forward.in_scope(|| error!(error = "the relay target was unavailable"));
-                            answer(&span, ResponseDisposition::Unreachable)
+                            self.answer(&span, ResponseDisposition::Unreachable)
                         }
                         // The hop came to a status. It is passed through
                         // unchanged: rewriting a code here can silently change
@@ -173,9 +182,13 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
 /// Every refusal is named rather than caught, so a disposition added later does
 /// not compile until somebody decides here whether it means the response was
 /// stored. That decision is what `OK` reports.
-fn answer(span: &Span, disposition: ResponseDisposition) -> Result<Response<()>, Status> {
+fn answer(
+    span: &Span,
+    metrics: &PeerMetrics,
+    disposition: ResponseDisposition,
+) -> Result<Response<()>, Status> {
     span.record("peer.disposition", disposition.label());
-    disposition.record();
+    disposition.record(metrics);
     record_status(span, disposition.status());
     match disposition {
         ResponseDisposition::Accepted => Ok(Response::new(())),

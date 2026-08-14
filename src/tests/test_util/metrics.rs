@@ -1,42 +1,45 @@
 //! Reading back what the code under test recorded on a meter, and holding its
 //! labels to the rule that no identity is ever one.
 
+use crate::peer::metrics::PeerMetrics;
 use color_eyre::Result;
 use color_eyre::eyre::{bail, ensure};
 use opentelemetry::KeyValue;
-use opentelemetry::global::set_meter_provider;
+use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use std::collections::BTreeMap;
 
-/// Captures every metric this process records, for a test whose claim is the
-/// attribute set a counter carries rather than an in-process oracle.
+/// Captures metrics from one local provider.
 ///
-/// The peer instruments are `LazyLock` statics bound to whatever meter provider
-/// is global when they are first touched, so install this **before** the code
-/// under test records anything. One process installs one meter provider, so
-/// this belongs to tests that own their process — nextest gives each test one.
-///
-/// This is a deliberate process-global install, for the same reason
-/// [`GlobalSpans`](super::GlobalSpans) is one: the recording sites are free
-/// functions, spawned workers, and a `Default`-constructed codec, so there is
-/// no owner to inject a `Meter` into.
+/// Pass [`Self::metrics`] to the peer harness under test. Other tests then
+/// cannot add points to this capture.
 pub(crate) struct GlobalMetrics {
     exporter: InMemoryMetricExporter,
     /// Read directly for its `force_flush`, which is what moves a recorded
     /// value into the exporter before a test reads it.
     provider: SdkMeterProvider,
+    metrics: PeerMetrics,
 }
 
 impl GlobalMetrics {
-    /// Installs the pipeline as this process's global meter provider.
+    /// Builds a local pipeline and its peer instruments.
     pub(crate) fn install() -> Self {
         let exporter = InMemoryMetricExporter::default();
         let provider = SdkMeterProvider::builder()
             .with_periodic_exporter(exporter.clone())
             .build();
-        set_meter_provider(provider.clone());
-        Self { exporter, provider }
+        let metrics = PeerMetrics::new(&provider.meter("prosody"));
+        Self {
+            exporter,
+            provider,
+            metrics,
+        }
+    }
+
+    /// The peer instruments bound to this capture.
+    pub(crate) fn metrics(&self) -> PeerMetrics {
+        self.metrics.clone()
     }
 
     /// Every series the instrument named `name` carries, as its exact attribute

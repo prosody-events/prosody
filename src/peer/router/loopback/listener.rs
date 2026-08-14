@@ -2,6 +2,7 @@
 //! how it is served and stopped, and the router a served process reaches its
 //! neighbours through.
 
+use crate::peer::metrics::PeerMetrics;
 use crate::peer::router::cache_config::PeerCacheConfiguration;
 use crate::peer::router::directory::{Endpoint, NetworkId, PeerRegistration};
 use crate::peer::router::grpc::client::GrpcSender;
@@ -40,6 +41,7 @@ pub(crate) struct FixedRouter {
     transport: Arc<GrpcSender>,
     registration: Option<Arc<PeerRegistration>>,
     here: Option<NetworkId>,
+    metrics: PeerMetrics,
 }
 
 impl Served {
@@ -78,11 +80,16 @@ impl FixedRouter {
             transport: Arc::new(GrpcSender::new(config)),
             registration: registration.map(Arc::new),
             here,
+            metrics: PeerMetrics::default(),
         }
     }
 }
 
 impl NetworkRouter for FixedRouter {
+    fn peer_metrics(&self) -> &PeerMetrics {
+        &self.metrics
+    }
+
     fn route(
         &self,
         _peer: PeerId,

@@ -115,7 +115,8 @@ fn the_deadline_bounds_transport_readiness() -> Result<()> {
 
 fn frame(harness: &Harness) -> Result<Staged> {
     let payload = PAYLOAD.to_vec();
-    let PreparedResponse::Ready(frame) = stage::<CountingCodec, Infallible>(
+    let PreparedResponse::Ready(frame) = stage::<CountingCodec, Infallible, _>(
+        &*harness.route,
         FrameHeader {
             target: peer(PEER_A),
             ..harness.header.clone()

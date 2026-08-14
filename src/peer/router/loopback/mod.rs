@@ -3,6 +3,7 @@
 //!
 //! A helper any two suites both need lives here rather than in either of them.
 
+use crate::peer::metrics::PeerMetrics;
 use crate::peer::router::cache_config::PeerCacheConfiguration;
 use crate::peer::router::directory::{DirectAddress, Endpoint, PeerRegistration};
 use crate::peer::router::{
@@ -88,6 +89,7 @@ pub(crate) struct TestRouter {
     transport: Arc<LoopbackSender>,
     registrations: Arc<HashMap<PeerId, Arc<PeerRegistration>>>,
     hold_lookup: bool,
+    metrics: PeerMetrics,
 }
 
 /// What one attempt gets, once the script has been consulted.
@@ -135,6 +137,13 @@ impl LoopbackSender {
 impl TestRouter {
     /// Builds the transport, published addresses, and delivery stream.
     pub(crate) fn new() -> Result<(Self, UnboundedReceiver<Delivery>), TestRouterError> {
+        Self::with_metrics(PeerMetrics::default())
+    }
+
+    /// Builds a test router with the specified peer instruments.
+    pub(crate) fn with_metrics(
+        metrics: PeerMetrics,
+    ) -> Result<(Self, UnboundedReceiver<Delivery>), TestRouterError> {
         let (transport, deliveries) = LoopbackSender::new();
         let registrations = (0..PUBLISHED_PEERS)
             .map(|index| {
@@ -155,6 +164,7 @@ impl TestRouter {
                 transport: Arc::new(transport),
                 registrations: Arc::new(registrations),
                 hold_lookup: false,
+                metrics,
             },
             deliveries,
         ))
@@ -173,6 +183,10 @@ impl TestRouter {
 }
 
 impl NetworkRouter for TestRouter {
+    fn peer_metrics(&self) -> &PeerMetrics {
+        &self.metrics
+    }
+
     fn route(
         &self,
         peer: PeerId,

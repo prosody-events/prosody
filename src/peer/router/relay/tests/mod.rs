@@ -12,6 +12,7 @@ mod wire;
 
 use super::Relay;
 use crate::codec::Codec;
+use crate::peer::metrics::PeerMetrics;
 use crate::peer::requester::registry::PendingRegistry;
 use crate::peer::requester::registry::tests::TestRegistration;
 use crate::peer::response::frame::tests::CountingCodec;
@@ -144,16 +145,24 @@ impl Pair {
     /// Both are bound before either is served, because the two routers name
     /// each other.
     pub(super) async fn start(route: TargetRoute) -> Result<Self> {
+        Self::start_with_metrics(route, PeerMetrics::default()).await
+    }
+
+    /// Serves a pair whose target records through `metrics`.
+    pub(super) async fn start_with_metrics(
+        route: TargetRoute,
+        metrics: PeerMetrics,
+    ) -> Result<Self> {
         let relay_bound = bind().await?;
         let target_bound = bind().await?;
         let relay_address = endpoint(&relay_bound)?;
         let target_address = endpoint(&target_bound)?;
-        let relay = Live::serve(relay_bound, Some(&target_address)).await?;
+        let relay = Live::serve(relay_bound, Some(&target_address), PeerMetrics::default()).await?;
         let seen = match route {
             TargetRoute::Relay => Some(&relay_address),
             TargetRoute::Nowhere => None,
         };
-        match Live::serve(target_bound, seen).await {
+        match Live::serve(target_bound, seen, metrics).await {
             Ok(target) => Ok(Self { relay, target }),
             Err(error) => {
                 relay.stop().await?;
@@ -172,10 +181,14 @@ impl Pair {
 
 impl Live {
     /// Serves `bound`, sending every frame it does not own on to `seen`.
-    async fn serve(bound: BoundListener, seen: Option<&Endpoint>) -> Result<Self> {
+    async fn serve(
+        bound: BoundListener,
+        seen: Option<&Endpoint>,
+        metrics: PeerMetrics,
+    ) -> Result<Self> {
         let peer = PeerId::new();
         let address = endpoint(&bound)?;
-        let registry = PendingRegistry::new();
+        let registry = PendingRegistry::with_metrics(metrics);
         let registration = seen.map(registration).transpose()?;
         let router = FixedRouter::new(PeerCacheConfiguration::default(), registration, None);
         let served = Served::start(

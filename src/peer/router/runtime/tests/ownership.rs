@@ -12,7 +12,7 @@ use crate::peer::response::frame::tests::CountingCodec;
 use crate::peer::response::frame::{FrameResult, ResponseSuccess};
 use crate::peer::response::headers::RequestDeadline;
 use crate::peer::response::sender::{
-    ResponseRoute, Then, deliver_response, stage as stage_response,
+    PeerMetricSource, ResponseRoute, Then, deliver_response, stage as stage_response,
 };
 use crate::peer::router::cache_config::PeerCacheConfiguration;
 use crate::peer::router::directory::PeerDirectory;
@@ -108,7 +108,7 @@ fn a_same_peer_response_uses_the_local_registry() -> Result<()> {
 }
 
 /// Sends one response to this process's own peer id and waits for the registry.
-async fn delivered_to_itself<D: PeerDirectory, R: ResponseRoute>(
+async fn delivered_to_itself<D: PeerDirectory, R: ResponseRoute + PeerMetricSource>(
     network: &NetworkRoute<GrpcSender, D>,
     own: &R,
     shared: &Shared,
@@ -125,7 +125,8 @@ async fn delivered_to_itself<D: PeerDirectory, R: ResponseRoute>(
     let mut request = TestRegistration::new(&shared.pending, from_ref(&subsystem), TIMEOUT)?;
     let receiver = request.receiver()?;
     let payload = PAYLOAD.to_vec();
-    let prepared = stage_response::<CountingCodec, Infallible>(
+    let prepared = stage_response::<CountingCodec, Infallible, _>(
+        own,
         header(shared.peer, request.id(), ALPHA)?,
         Ok(&payload),
     );

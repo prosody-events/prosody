@@ -6,11 +6,10 @@
 //! a caller choose the metrics pipeline's cardinality. Each attribute set is
 //! therefore compared **exactly**.
 //!
-//! [`GlobalMetrics`] is installed as the first statement of each case: the
-//! instruments bind to whatever meter provider is global when they are first
-//! touched, and nextest gives each case its own process.
+//! Each case supplies local instruments to its requester.
 
-use super::{MAX_TIMEOUT, names, register, registry, unanswered_call};
+use super::{MAX_TIMEOUT, names, register, unanswered_call_with_registry};
+use crate::peer::requester::registry::PendingRegistry;
 use crate::test_util::{GlobalMetrics, label};
 use color_eyre::Result;
 use color_eyre::eyre::ensure;
@@ -33,7 +32,7 @@ const SUBSYSTEM: &str = "billing";
 #[tokio::test(start_paused = true)]
 async fn a_waiting_request_is_counted_until_it_is_over() -> Result<()> {
     let metrics = GlobalMetrics::install();
-    let registry = registry();
+    let registry = PendingRegistry::with_metrics(metrics.metrics());
     let awaited = names(&[SUBSYSTEM])?;
     let registration = register(&registry, &awaited, MAX_TIMEOUT)?;
     ensure!(
@@ -59,7 +58,7 @@ async fn a_waiting_request_is_counted_until_it_is_over() -> Result<()> {
 #[tokio::test(start_paused = true)]
 async fn an_unanswered_call_records_its_wait_as_answered_by_nobody() -> Result<()> {
     let metrics = GlobalMetrics::install();
-    unanswered_call().await?;
+    unanswered_call_with_registry(PendingRegistry::with_metrics(metrics.metrics())).await?;
     ensure!(
         metrics.points(LATENCY)? == vec![(label("outcome", "none"), 1)],
         "the call must record one wait under the answers it got: {:?}",

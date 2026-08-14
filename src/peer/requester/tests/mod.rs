@@ -163,7 +163,11 @@ pub(super) fn requester(
 ///
 /// Returns an error when the call fails or answers anything but a timeout.
 pub(super) async fn unanswered_call() -> Result<()> {
-    let registry = registry();
+    unanswered_call_with_registry(registry()).await
+}
+
+/// Drives one unanswered call through `registry`.
+pub(super) async fn unanswered_call_with_registry(registry: Arc<PendingRegistry>) -> Result<()> {
     let requester = requester(registry)?;
     let awaited = names(&[SUBSYSTEM])?;
     let results = requester

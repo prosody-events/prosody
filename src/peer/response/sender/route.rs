@@ -4,6 +4,7 @@ use super::metrics::{DropReason, Stage};
 use crate::codec::Codec;
 use crate::error::ClassifyError;
 use crate::otel::context_with_parent;
+use crate::peer::metrics::PeerMetrics;
 use crate::peer::response::ResponseDisposition;
 use crate::peer::response::frame::FrameHeader;
 use crate::peer::response::frame::encode::{Staged, stage_error, stage_success};
@@ -31,6 +32,11 @@ pub trait ResponseRoute: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<RouteOutcome, DropReason>> + Send;
 }
 
+/// Gives an internal response route its peer instruments.
+pub trait PeerMetricSource {
+    fn peer_metrics(&self) -> &PeerMetrics;
+}
+
 /// Two routes evaluated in order.
 #[derive(Clone)]
 pub(crate) struct Then<A, B>(pub(crate) A, pub(crate) B);
@@ -46,7 +52,7 @@ pub(crate) struct Then<A, B>(pub(crate) A, pub(crate) B);
 /// It is a child of the trace the job carries, so the listener's
 /// `peer.response.receive` — parented on the context this span's own injection
 /// writes — lands under the call that asked for the response.
-pub(crate) async fn deliver_response<R: ResponseRoute>(
+pub(crate) async fn deliver_response<R: ResponseRoute + PeerMetricSource>(
     router: &R,
     prepared: PreparedResponse,
     trace: Context,
@@ -87,7 +93,7 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
                 Delivery::Remote(kind) => kind.label(),
             };
             span.record("peer.endpoint.kind", endpoint_kind);
-            Stage::Delivered.record();
+            Stage::Delivered.record(router.peer_metrics());
         }
         Err(reason) => {
             span.record("peer.disposition", reason.label());
@@ -95,7 +101,7 @@ pub(crate) async fn deliver_response<R: ResponseRoute>(
                 span.record(ERROR_TYPE, reason.label());
             }
             span.in_scope(|| error!(error = %reason.label()));
-            reason.record();
+            reason.record(router.peer_metrics());
         }
     }
 }
@@ -127,13 +133,19 @@ impl ResponseRoute for LocalTarget {
             return Ok(RouteOutcome::Declined(frame));
         }
         let disposition = self.accept(frame.into_local_frame());
-        disposition.record();
+        disposition.record(self.pending().metrics());
         if disposition == ResponseDisposition::Accepted {
             Ok(RouteOutcome::Delivered(Delivery::Local))
         } else {
             Span::current().record(ERROR_TYPE, disposition.label());
             Err(DropReason::SendFailed)
         }
+    }
+}
+
+impl PeerMetricSource for LocalTarget {
+    fn peer_metrics(&self) -> &PeerMetrics {
+        self.pending().metrics()
     }
 }
 
@@ -181,6 +193,12 @@ impl<R: NetworkRouter> ResponseRoute for R {
     }
 }
 
+impl<R: NetworkRouter> PeerMetricSource for R {
+    fn peer_metrics(&self) -> &PeerMetrics {
+        NetworkRouter::peer_metrics(self)
+    }
+}
+
 impl<A: ResponseRoute, B: ResponseRoute> ResponseRoute for Then<A, B> {
     async fn deliver(
         &self,
@@ -192,6 +210,12 @@ impl<A: ResponseRoute, B: ResponseRoute> ResponseRoute for Then<A, B> {
             RouteOutcome::Declined(frame) => self.1.deliver(frame, deadline, context).await,
             delivered @ RouteOutcome::Delivered(_) => Ok(delivered),
         }
+    }
+}
+
+impl<A: PeerMetricSource, B> PeerMetricSource for Then<A, B> {
+    fn peer_metrics(&self) -> &PeerMetrics {
+        self.0.peer_metrics()
     }
 }
 
@@ -225,16 +249,21 @@ impl PreparedResponse {
 }
 
 /// Encodes one payload and records the common frame stage.
-pub(crate) fn stage<C, E>(header: FrameHeader, result: Result<&C::Payload, &E>) -> PreparedResponse
+pub(crate) fn stage<C, E, R>(
+    router: &R,
+    header: FrameHeader,
+    result: Result<&C::Payload, &E>,
+) -> PreparedResponse
 where
     C: Codec,
     E: ClassifyError + Display,
+    R: ResponseRoute + PeerMetricSource,
 {
-    Stage::Attempted.record();
+    Stage::Attempted.record(router.peer_metrics());
     let encoded = match result {
         Ok(payload) => stage_success::<C>(&header, payload),
         Err(error) => {
-            Stage::Framed.record();
+            Stage::Framed.record(router.peer_metrics());
             return PreparedResponse::Ready(stage_error(
                 &header,
                 error.classify_error(),
@@ -244,7 +273,7 @@ where
     };
     match encoded {
         Ok(staged) => {
-            Stage::Framed.record();
+            Stage::Framed.record(router.peer_metrics());
             PreparedResponse::Ready(staged)
         }
         Err(error) => {

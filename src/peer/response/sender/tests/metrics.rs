@@ -6,9 +6,7 @@
 //! is therefore compared **exactly**, not searched for the label it should
 //! carry.
 //!
-//! [`GlobalMetrics`] is installed as the first statement of each case that
-//! reads a metric: the instruments bind to whatever meter provider is global
-//! when they are first touched, and nextest gives each case its own process.
+//! Each case supplies local instruments to its response route.
 
 use super::super::metrics::{DropReason, Stage};
 use super::{Harness, PAYLOAD, attempts, deadline};
@@ -49,9 +47,13 @@ impl Codec for FailingCodec {
 fn a_codec_failure_records_the_encode_drop() -> Result<()> {
     let metrics = GlobalMetrics::install();
     paused()?.block_on(async {
-        let harness = Harness::new()?;
+        let harness = Harness::with_metrics(metrics.metrics())?;
         let payload = PAYLOAD.to_vec();
-        let prepared = stage::<FailingCodec, Infallible>(harness.header.clone(), Ok(&payload));
+        let prepared = stage::<FailingCodec, Infallible, _>(
+            &harness.router,
+            harness.header.clone(),
+            Ok(&payload),
+        );
         deliver_response(&harness.router, prepared, Context::current(), deadline()).await;
         Ok::<_, color_eyre::Report>(())
     })?;
@@ -76,7 +78,7 @@ fn a_codec_failure_records_the_encode_drop() -> Result<()> {
 fn a_drop_names_its_reason_and_never_the_peer() -> Result<()> {
     let metrics = GlobalMetrics::install();
     let drained = paused()?.block_on(async {
-        let harness = Harness::new()?;
+        let harness = Harness::with_metrics(metrics.metrics())?;
         harness.send(PUBLISHED).await?;
         harness.send(UNPUBLISHED_PEER).await?;
         harness.drain().await

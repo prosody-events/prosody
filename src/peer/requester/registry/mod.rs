@@ -1,19 +1,18 @@
 //! Pending responses keyed by request and subsystem.
 
+use crate::peer::metrics::PeerMetrics;
 use crate::peer::requester::RequestError;
 use crate::peer::response::frame::ResponseFrame;
 use crate::peer::response::headers::RequestDeadline;
 use crate::peer::response::{RequestId, ResponseDisposition};
 use crate::subsystem::SubsystemName;
 use ahash::RandomState;
-use opentelemetry::global::meter;
-use opentelemetry::metrics::UpDownCounter;
 use scc::HashMap;
 use smallvec::SmallVec;
 use std::error::Error;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::{Acquire, Release};
-use std::sync::{Arc, LazyLock};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
@@ -21,14 +20,6 @@ const INLINE_AWAITED: usize = 2;
 
 #[cfg(test)]
 pub(crate) mod tests;
-
-static PENDING: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
-    meter("prosody")
-        .i64_up_down_counter("prosody.peer.requests.pending")
-        .with_description("Requests this process is waiting for answers to")
-        .with_unit("{request}")
-        .build()
-});
 
 type ResponseKey = (RequestId, SubsystemName);
 type FrameSender = oneshot::Sender<ResponseFrame>;
@@ -44,6 +35,7 @@ type PendingSenders = HashMap<ResponseKey, FrameSender, RandomState>;
 pub(crate) struct PendingRegistry {
     senders: PendingSenders,
     closed: AtomicBool,
+    metrics: PeerMetrics,
 }
 
 /// Owns one request's receivers and removes its remaining senders on drop.
@@ -63,10 +55,21 @@ pub(super) struct PendingRequest {
 impl PendingRegistry {
     /// Builds an empty pending response registry.
     pub(crate) fn new() -> Arc<Self> {
+        Self::with_metrics(PeerMetrics::default())
+    }
+
+    /// Builds an empty registry with the specified peer instruments.
+    pub(crate) fn with_metrics(metrics: PeerMetrics) -> Arc<Self> {
         Arc::new(Self {
             senders: HashMap::with_hasher(RandomState::default()),
             closed: AtomicBool::new(false),
+            metrics,
         })
+    }
+
+    /// The peer instruments that this registry updates.
+    pub(crate) const fn metrics(&self) -> &PeerMetrics {
+        &self.metrics
     }
 
     /// Registers one sender for each awaited subsystem.
@@ -109,7 +112,7 @@ impl PendingRegistry {
             self.remove(&keys);
             return Err(RequestError::ShuttingDown);
         }
-        PENDING.add(1, &[]);
+        self.metrics.requests_pending.add(1, &[]);
         Ok(Registration {
             pending: PendingRequest {
                 registry: Arc::clone(self),
@@ -170,6 +173,6 @@ impl PendingRequest {
 impl Drop for PendingRequest {
     fn drop(&mut self) {
         self.registry.remove(&self.keys);
-        PENDING.add(-1, &[]);
+        self.registry.metrics.requests_pending.add(-1, &[]);
     }
 }
