@@ -112,10 +112,11 @@ pub fn run_batch_slo_with_inputs(
         resource_window_attempt_count_max: EVENT_COUNT
             .saturating_mul(u32::from(crate::MAX_RETRY_FAILURES) + 1),
         failure_service_weight: 0.3_f64,
-        // One arrival per second with one expected change per day is the
-        // batch baseline; the batch drains a fixed backlog, so this prior
-        // only shapes early rate uncertainty.
-        arrival_prior: ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?,
+        // The plant releases no events after the backlog, so the authored
+        // prior expects about one spurious arrival per day. A one-per-second
+        // mean forecasts a phantom stream across the whole budget window and
+        // erases the budget response the batch regime exists to measure.
+        arrival_prior: ArrivalPrior::new(1.0_f64, 86_400.0_f64, 1.0_f64 / 86_400.0_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
