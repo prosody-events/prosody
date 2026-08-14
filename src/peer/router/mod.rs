@@ -3,6 +3,7 @@
 //! Every peer feature routes through here. Remote paths know only a [`PeerId`]
 //! and frame bytes. The local target owns this process's request registry.
 
+use crate::peer::metrics::PeerMetrics;
 use crate::peer::requester::registry::PendingRegistry;
 use crate::peer::response::ResponseDisposition;
 use crate::peer::response::frame::ResponseFrame;
@@ -179,6 +180,9 @@ pub(crate) trait RelayHop: Clone + Send + Sync + 'static {
 /// response path names one `R`. Address resolution belongs here, with the
 /// route call that can await it.
 pub(crate) trait NetworkRouter: RelayHop {
+    /// The instruments owned by this router's peer runtime.
+    fn peer_metrics(&self) -> &PeerMetrics;
+
     /// The endpoint `peer` may be dialed on from this process. This
     /// is the responder's lookup, and [`choose_route`] decides what it answers.
     ///
@@ -201,6 +205,7 @@ pub(crate) struct NetworkRoute<S, D> {
     addresses: AddressResolver<D>,
     transport: Arc<S>,
     here: Option<NetworkId>,
+    metrics: PeerMetrics,
 }
 
 impl PeerId {
@@ -242,6 +247,7 @@ impl<S, D: Clone> Clone for NetworkRoute<S, D> {
             addresses: self.addresses.clone(),
             transport: Arc::clone(&self.transport),
             here: self.here.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -252,11 +258,13 @@ impl<S, D> NetworkRoute<S, D> {
         addresses: AddressResolver<D>,
         transport: Arc<S>,
         here: Option<NetworkId>,
+        metrics: PeerMetrics,
     ) -> Self {
         Self {
             addresses,
             transport,
             here,
+            metrics,
         }
     }
 }
@@ -276,6 +284,10 @@ impl<S: ResponseSender, D: PeerDirectory> RelayHop for NetworkRoute<S, D> {
 }
 
 impl<S: ResponseSender, D: PeerDirectory> NetworkRouter for NetworkRoute<S, D> {
+    fn peer_metrics(&self) -> &PeerMetrics {
+        &self.metrics
+    }
+
     async fn route(&self, peer: PeerId) -> Result<Option<Route>, D::Error> {
         let registration = self.addresses.resolve(peer).await?;
         Ok(registration

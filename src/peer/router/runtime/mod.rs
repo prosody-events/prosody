@@ -169,7 +169,12 @@ impl<D: PeerDirectory> PreparedPeerRuntime<D> {
             registration(PeerId::new(), &inputs.listener, discovered, inputs.router)?;
         let addresses = AddressResolver::new(inputs.cache.peer_capacity, directory.clone());
         let local = LocalTarget::new(registration.peer, Arc::clone(&pending));
-        let network = NetworkRoute::new(addresses.clone(), transport, registration.network.clone());
+        let network = NetworkRoute::new(
+            addresses.clone(),
+            transport,
+            registration.network.clone(),
+            pending.metrics().clone(),
+        );
         let (stop_listener, stopped) = oneshot::channel();
         let listener = match serve(
             inputs.listener,

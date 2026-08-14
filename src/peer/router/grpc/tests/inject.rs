@@ -6,7 +6,7 @@
 //! would still pass with the injection deleted, so it would prove nothing.
 
 use super::{ALPHA, Harness, header, payload, register};
-use crate::test_util::{GlobalSpans, TEST_RUNTIME, named};
+use crate::test_util::{GlobalSpans, TEST_RUNTIME, named, span_attribute};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use opentelemetry_sdk::trace::SpanData;
@@ -55,7 +55,18 @@ fn the_metadata_hop_carries_the_trace_context() -> Result<()> {
 
         let ended = spans.ended();
         let caller = named(&ended, CALLER)?;
-        let received: Vec<&SpanData> = ended.iter().filter(|span| span.name == RECEIVED).collect();
+        let request_ids = [traced.id().to_string(), untraced.id().to_string()];
+        let received: Vec<&SpanData> = ended
+            .iter()
+            .filter(|span| {
+                span.name == RECEIVED
+                    && span_attribute(span, "peer.request").is_ok_and(|value| {
+                        request_ids
+                            .iter()
+                            .any(|request| value.as_str() == request.as_str())
+                    })
+            })
+            .collect();
         ensure!(
             received.len() == 2,
             "the listener must have opened one span per delivery, not {}",

@@ -1,13 +1,11 @@
 //! Synchrony recovery's own half: what a response is, how it is framed, and
 //! how one delivery attempt is answered.
 
+use crate::peer::metrics::PeerMetrics;
 use bytes::Bytes;
 use opentelemetry::KeyValue;
-use opentelemetry::global::meter;
-use opentelemetry::metrics::Counter;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::str::{Utf8Error, from_utf8};
-use std::sync::LazyLock;
 use tonic::Code;
 use uuid::{Bytes as UuidBytes, Uuid};
 
@@ -33,15 +31,6 @@ impl FormatToken {
         &self.0
     }
 }
-
-/// Delivery attempts this peer answered, by fixed disposition label.
-static DISPOSITIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    meter("prosody")
-        .u64_counter("prosody.response.dispositions")
-        .with_description("Response delivery attempts this peer answered")
-        .with_unit("{response}")
-        .build()
-});
 
 /// Identifies one request across the fleet.
 ///
@@ -153,8 +142,10 @@ impl ResponseDisposition {
     ///
     /// A frame this process only sent on is counted at the peer that decided
     /// it, so a relay never adds a second point for one delivery.
-    pub(crate) fn record(self) {
-        DISPOSITIONS.add(1, &[KeyValue::new("disposition", self.label())]);
+    pub(crate) fn record(self, metrics: &PeerMetrics) {
+        metrics
+            .response_dispositions
+            .add(1, &[KeyValue::new("disposition", self.label())]);
     }
 
     /// The stable telemetry label for this disposition.

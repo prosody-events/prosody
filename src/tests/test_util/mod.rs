@@ -17,7 +17,7 @@ use quickcheck::{Arbitrary, Gen};
 use serde_json::{Map, Value};
 use std::env;
 use std::fmt::{Debug, Write as _};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 use tracing::field::{Field, Visit};
@@ -27,6 +27,12 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;
+
+static SPAN_CAPTURE: Mutex<()> = Mutex::new(());
+static SPAN_INIT: Mutex<()> = Mutex::new(());
+static GLOBAL_SPANS: LazyLock<Arc<Mutex<Option<Vec<SpanData>>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(None)));
+static GLOBAL_SPAN_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 /// The shared, pre-migrated keyspace every Cassandra-backed test runs against.
 ///
@@ -151,39 +157,71 @@ fn span_pipeline(
     (exporter, provider, subscriber)
 }
 
-/// Captures spans opened on **any** thread, for a test whose subject runs in a
-/// spawned task.
-///
-/// [`captured_spans`] installs its subscriber with `with_default`, which is
-/// thread-local, so it cannot see a span a server task opened. This installs
-/// the same pipeline as the process default instead — which one test process
-/// may do exactly once, so it belongs to tests that own their process.
+#[derive(Clone, Debug, Default)]
+struct GlobalSpanExporter;
+
+impl SpanExporter for GlobalSpanExporter {
+    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+        if let Some(spans) = GLOBAL_SPANS.lock().as_mut() {
+            spans.extend(batch);
+        }
+        Ok(())
+    }
+}
+
+/// Captures spans opened on any thread during one serialized capture window.
 pub(crate) struct GlobalSpans {
-    exporter: TestExporter,
-    /// Held so the pipeline outlives the capture. The simple processor exports
-    /// on span end, so nothing has to be flushed before a read.
-    _provider: SdkTracerProvider,
+    _capture: parking_lot::MutexGuard<'static, ()>,
+    spans: Arc<Mutex<Option<Vec<SpanData>>>>,
 }
 
 impl GlobalSpans {
-    /// Installs the pipeline as this process's default subscriber.
+    /// Starts one capture on the shared process subscriber.
     ///
     /// # Errors
     ///
-    /// Returns an error when a default subscriber is already installed.
+    /// Returns an error when another subscriber was installed first.
     pub(crate) fn install() -> Result<Self> {
-        let (exporter, provider, subscriber) = span_pipeline(LevelFilter::TRACE);
-        set_global_default(subscriber)?;
+        let capture = SPAN_CAPTURE.lock();
+        init_global_test_tracing()?;
+        *GLOBAL_SPANS.lock() = Some(Vec::new());
         Ok(Self {
-            exporter,
-            _provider: provider,
+            _capture: capture,
+            spans: Arc::clone(&GLOBAL_SPANS),
         })
     }
 
     /// Every span that has ended so far, on every thread.
     pub(crate) fn ended(&self) -> Vec<SpanData> {
-        self.exporter.0.lock().clone()
+        self.spans.lock().as_ref().cloned().unwrap_or_default()
     }
+}
+
+impl Drop for GlobalSpans {
+    fn drop(&mut self) {
+        *self.spans.lock() = None;
+    }
+}
+
+/// Installs the shared subscriber for unit tests.
+pub(crate) fn init_global_test_tracing() -> Result<()> {
+    let _init = SPAN_INIT.lock();
+    if GLOBAL_SPAN_PROVIDER.get().is_some() {
+        return Ok(());
+    }
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(GlobalSpanExporter)
+        .build();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("test"))
+            .with_filter(LevelFilter::TRACE),
+    );
+    set_global_default(subscriber)?;
+    GLOBAL_SPAN_PROVIDER
+        .set(provider)
+        .map_err(|_| eyre!("the test span provider was already installed"))?;
+    Ok(())
 }
 
 /// Accumulates every captured tracing event, rendered field-by-field, into a
@@ -305,6 +343,15 @@ pub(crate) fn named<'a>(spans: &'a [SpanData], name: &str) -> Result<&'a SpanDat
         "more than one {name} span was exported"
     );
     Ok(span)
+}
+
+/// Every exported span in `trace`.
+pub(crate) fn trace_spans(spans: &[SpanData], trace: TraceId) -> Vec<SpanData> {
+    spans
+        .iter()
+        .filter(|span| span.span_context.trace_id() == trace)
+        .cloned()
+        .collect()
 }
 
 /// One attribute from one exported span.

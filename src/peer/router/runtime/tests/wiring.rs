@@ -89,7 +89,8 @@ fn two_peer_clients_communicate_through_their_socket_addresses() -> Result<()> {
                 TestRegistration::new(&receiver.shared.pending, from_ref(&subsystem), TIMEOUT)?;
             let response = request.receiver()?;
             let payload = PAYLOAD.to_vec();
-            let prepared = stage_response::<CountingCodec, Infallible>(
+            let prepared = stage_response::<CountingCodec, Infallible, _>(
+                &sender.runtime.network,
                 header(receiver.shared.peer, request.id(), ALPHA)?,
                 Ok(&payload),
             );

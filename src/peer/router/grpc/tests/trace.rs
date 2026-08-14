@@ -12,7 +12,7 @@ use crate::peer::response::frame::tests::CountingCodec;
 use crate::peer::response::headers::RequestDeadline;
 use crate::peer::response::sender::{deliver_response, stage};
 use crate::peer::router::directory::Endpoint;
-use crate::test_util::{GlobalSpans, TEST_RUNTIME, named, span_attribute};
+use crate::test_util::{GlobalSpans, TEST_RUNTIME, named, span_attribute, trace_spans};
 use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use opentelemetry::trace::{SpanKind, Status, TraceContextExt};
@@ -49,13 +49,13 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         let router = reaching(&harness.address)?;
         let request = register(&harness.registry, &[ALPHA])?;
 
-        // The caller's span is opened, read, and closed here: the send carries
-        // its context, not the span itself.
+        // The send carries the caller's context, not the span itself.
         let caller = info_span!("peer.test.call");
         let trace = caller.context();
         let caller_span = trace.span().span_context().clone();
         let payload = PAYLOAD.to_vec();
-        let prepared = stage::<CountingCodec, Infallible>(
+        let prepared = stage::<CountingCodec, Infallible, _>(
+            &router,
             header(harness.peer, request.id(), ALPHA)?,
             Ok(&payload),
         );
@@ -68,7 +68,7 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         .await;
         drop(caller);
 
-        let ended = spans.ended();
+        let ended = trace_spans(&spans.ended(), caller_span.trace_id());
         let sent = named(&ended, SENT)?;
         let received = named(&ended, RECEIVED)?;
         ensure!(
@@ -115,8 +115,10 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         let mut refused = register(&harness.registry, &[ALPHA])?;
         drop(refused.receiver()?);
         let caller = info_span!("peer.test.refused");
+        let refused_trace = caller.context().span().span_context().trace_id();
         let payload = PAYLOAD.to_vec();
-        let prepared = stage::<CountingCodec, Infallible>(
+        let prepared = stage::<CountingCodec, Infallible, _>(
+            &router,
             header(harness.peer, refused.id(), ALPHA)?,
             Ok(&payload),
         );
@@ -129,24 +131,29 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         .await;
         drop(caller);
 
-        let ended = spans.ended();
-        for (name, expected) in [(SENT, "send_failed"), (RECEIVED, "closed_request")] {
-            let span = ended
-                .iter()
-                .find(|span| span.name == name && matches!(span.status, Status::Error { .. }))
-                .ok_or_else(|| eyre!("no failed {name} span was exported"))?;
-            ensure!(
-                matches!(&span.status, Status::Error { description } if description == expected),
-                "{name} must report {expected} as an error, not {:?}",
-                span.status
-            );
-            ensure!(
-                span_attribute(span, "error.type")?.as_str() == "NOT_FOUND",
-                "{name} must keep the exact gRPC error type"
-            );
-        }
+        let ended = trace_spans(&spans.ended(), refused_trace);
+        ensure_failed_spans(&ended)?;
         Ok(())
     })
+}
+
+fn ensure_failed_spans(spans: &[SpanData]) -> Result<()> {
+    for (name, expected) in [(SENT, "send_failed"), (RECEIVED, "closed_request")] {
+        let span = spans
+            .iter()
+            .find(|span| span.name == name && matches!(span.status, Status::Error { .. }))
+            .ok_or_else(|| eyre!("no failed {name} span was exported"))?;
+        ensure!(
+            matches!(&span.status, Status::Error { description } if description == expected),
+            "{name} must report {expected} as an error, not {:?}",
+            span.status
+        );
+        ensure!(
+            span_attribute(span, "error.type")?.as_str() == "NOT_FOUND",
+            "{name} must keep the exact gRPC error type"
+        );
+    }
+    Ok(())
 }
 
 fn ensure_rpc_attributes(span: &SpanData) -> Result<()> {

@@ -16,8 +16,6 @@ use crate::producer::{ProducerError, ProsodyProducer};
 use crate::subsystem::SubsystemName;
 use crate::{Codec, EventIdentity, Topic};
 use opentelemetry::KeyValue;
-use opentelemetry::global::meter;
-use opentelemetry::metrics::Histogram;
 use opentelemetry_semantic_conventions::attribute::{
     ERROR_TYPE, MESSAGING_MESSAGE_CONVERSATION_ID,
 };
@@ -25,7 +23,7 @@ use rdkafka::message::{Header, OwnedHeaders};
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::marker::PhantomData;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::Instant;
@@ -37,18 +35,6 @@ mod tests;
 
 /// Reserved headers that occur exactly once in every request.
 const RESERVED_SINGLETONS: usize = 3;
-
-/// How long one request waited, by how complete its answers were.
-///
-/// A sustained `none` is what says synchrony waiting has stopped working:
-/// callers are paying full deadlines for answers that never come.
-static LATENCY: LazyLock<Histogram<f64>> = LazyLock::new(|| {
-    meter("prosody")
-        .f64_histogram("prosody.peer.request.latency")
-        .with_description("How long one peer request waited for its answers")
-        .with_unit("s")
-        .build()
-});
 
 /// Why one requested subsystem produced no successful response.
 ///
@@ -269,13 +255,19 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             Span::current().record("responses.missing", display(Missing(subsystems, results)));
             Span::current().record("responses.errors", display(Failures(subsystems, results)));
             Span::current().record("request.outcome", completeness);
-            LATENCY.record(waited, &[KeyValue::new("outcome", completeness)]);
+            self.registry
+                .metrics()
+                .request_latency
+                .record(waited, &[KeyValue::new("outcome", completeness)]);
         } else {
             if let Err(error) = &collected {
                 record_request_error(error);
             }
             Span::current().record("request.outcome", "failed");
-            LATENCY.record(waited, &[KeyValue::new("outcome", "failed")]);
+            self.registry
+                .metrics()
+                .request_latency
+                .record(waited, &[KeyValue::new("outcome", "failed")]);
         }
         collected
     }

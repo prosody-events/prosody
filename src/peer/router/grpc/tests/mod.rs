@@ -19,6 +19,7 @@ mod trace;
 use super::BoundListener;
 use super::client::GrpcSender;
 use super::service::PeerService;
+use crate::peer::metrics::PeerMetrics;
 use crate::peer::requester::registry::PendingRegistry;
 use crate::peer::requester::registry::tests::TestRegistration;
 use crate::peer::response::RequestId;
@@ -78,7 +79,12 @@ impl Harness {
     /// A listener of this suite's own, for the cases that vary its
     /// configuration. Call [`stop`](Self::stop) before the test returns.
     pub(super) async fn with(address: SocketAddr) -> Result<Self> {
-        let served_registry = registry();
+        Self::with_metrics(address, PeerMetrics::default()).await
+    }
+
+    /// A listener that records through the specified peer instruments.
+    pub(super) async fn with_metrics(address: SocketAddr, metrics: PeerMetrics) -> Result<Self> {
+        let served_registry = PendingRegistry::with_metrics(metrics);
         let peer = PeerId::new();
         let bound = BoundListener::bind(address).await?;
         let address = endpoint(&bound)?;
@@ -134,10 +140,6 @@ pub(super) fn reaching(address: &Endpoint) -> Result<FixedRouter> {
         Some(registration(address)?),
         None,
     ))
-}
-
-pub(super) fn registry() -> Arc<PendingRegistry> {
-    PendingRegistry::new()
 }
 
 /// Registers one request that awaits `subsystems`.

@@ -6,32 +6,9 @@
 //! fixed `&'static str` a `const fn` chose.
 //!
 //! These counters are the operator's account of delivery.
-//!
-//! Each instrument binds to whatever meter provider is global when it is first
-//! touched. Thus, install the process provider before the first response.
 
+use crate::peer::metrics::PeerMetrics;
 use opentelemetry::KeyValue;
-use opentelemetry::global::meter;
-use opentelemetry::metrics::Counter;
-use std::sync::LazyLock;
-
-/// Responses that reached each stage of the send path, by fixed stage label.
-static STAGES: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    meter("prosody")
-        .u64_counter("prosody.response.stages")
-        .with_description("Responses that reached one stage of the send path")
-        .with_unit("{response}")
-        .build()
-});
-
-/// Responses the sender gave up on, by fixed reason label.
-static DROPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    meter("prosody")
-        .u64_counter("prosody.response.dropped")
-        .with_description("Responses the sender gave up on")
-        .with_unit("{response}")
-        .build()
-});
 
 /// How far one response got.
 ///
@@ -71,8 +48,10 @@ pub enum DropReason {
 
 impl Stage {
     /// Counts one response reaching this stage.
-    pub(super) fn record(self) {
-        STAGES.add(1, &[KeyValue::new("stage", self.label())]);
+    pub(super) fn record(self, metrics: &PeerMetrics) {
+        metrics
+            .response_stages
+            .add(1, &[KeyValue::new("stage", self.label())]);
     }
 
     /// The metric label for this stage.
@@ -87,8 +66,10 @@ impl Stage {
 
 impl DropReason {
     /// Counts one response dropped for this reason.
-    pub(super) fn record(self) {
-        DROPPED.add(1, &[KeyValue::new("reason", self.label())]);
+    pub(super) fn record(self, metrics: &PeerMetrics) {
+        metrics
+            .responses_dropped
+            .add(1, &[KeyValue::new("reason", self.label())]);
     }
 
     /// The metric label for this reason.

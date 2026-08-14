@@ -20,9 +20,11 @@ use tracing::level_filters::LevelFilter;
 use tracing::subscriber::{SetGlobalDefaultError, set_global_default};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::filter::ParseError;
+#[cfg(not(test))]
+use tracing_subscriber::fmt;
 use tracing_subscriber::layer::Identity as TracingIdentity;
 use tracing_subscriber::layer::{Layered, SubscriberExt};
-use tracing_subscriber::{EnvFilter, Layer, Registry, fmt};
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 /// A layer that does nothing
 pub type Identity = TracingIdentity;
@@ -299,6 +301,15 @@ pub enum TracingError {
 ///
 /// Defaults to ERROR level to reduce test noise. Set `PROSODY_LOG` environment
 /// variable to override (e.g., `PROSODY_LOG=debug cargo test`).
+#[cfg(test)]
+pub fn init_test_logging() {
+    use crate::test_util::init_global_test_tracing;
+
+    let _ = init_global_test_tracing();
+}
+
+#[cfg(not(test))]
+/// Initializes test tracing infrastructure.
 pub fn init_test_logging() {
     use std::sync::Once;
 

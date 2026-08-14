@@ -29,7 +29,7 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::peer::response::headers::ResultRequest;
-use crate::peer::response::sender::{ResponseRoute, deliver_response, stage};
+use crate::peer::response::sender::{PeerMetricSource, ResponseRoute, deliver_response, stage};
 use crate::subsystem::SubsystemName;
 use crate::timers::Trigger;
 use opentelemetry::Context;
@@ -142,7 +142,7 @@ where
     H::Output: Sync + 'static,
     H::Error: Sync + 'static,
     C: Codec<Payload = H::Output>,
-    R: ResponseRoute,
+    R: ResponseRoute + PeerMetricSource,
 {
     type Error = Responded<H::Error>;
     type Output = Responded<H::Output>;
@@ -213,7 +213,7 @@ where
         };
         let deadline = request.deadline();
         let header = request.delivery_header(self.responder.subsystem.clone());
-        let response = stage::<C, _>(header, result.as_ref());
+        let response = stage::<C, _, _>(&self.responder.route, header, result.as_ref());
         self.handler.after_commit(context, result).await;
         deliver_response(&self.responder.route, response, trace, deadline).await;
     }
@@ -245,7 +245,7 @@ where
     H::Output: Sync + 'static,
     H::Error: Sync + 'static,
     C: Codec<Payload = H::Output>,
-    R: ResponseRoute,
+    R: ResponseRoute + PeerMetricSource,
 {
     /// Delegates the inner classification.
     ///

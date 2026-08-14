@@ -1,13 +1,16 @@
 use super::{
     EndpointKind, LocalTarget, NetworkRoute, NetworkRouter, PeerId, RelayHop, choose_route,
 };
+use crate::peer::metrics::PeerMetrics;
 use crate::peer::requester::registry::PendingRegistry;
 use crate::peer::requester::registry::tests::TestRegistration;
 use crate::peer::response::frame::FrameHeader;
 use crate::peer::response::frame::encode::{Staged, stage_success};
 use crate::peer::response::frame::tests::CountingCodec;
 use crate::peer::response::headers::RequestDeadline;
-use crate::peer::response::sender::{DropReason, ResponseRoute, RouteDelivery, RouteOutcome, Then};
+use crate::peer::response::sender::{
+    DropReason, PeerMetricSource, ResponseRoute, RouteDelivery, RouteOutcome, Then,
+};
 use crate::peer::router::Host;
 use crate::peer::router::directory::cache::AddressResolver;
 use crate::peer::router::directory::tests::support::TestDirectory;
@@ -31,7 +34,7 @@ use std::time::Duration;
 use uuid::{Uuid, Version};
 
 #[derive(Clone)]
-struct CountedNetwork(Arc<AtomicUsize>);
+struct CountedNetwork(Arc<AtomicUsize>, PeerMetrics);
 
 impl ResponseRoute for CountedNetwork {
     async fn deliver(
@@ -44,6 +47,12 @@ impl ResponseRoute for CountedNetwork {
         Ok(RouteOutcome::Delivered(RouteDelivery::Remote(
             EndpointKind::Direct,
         )))
+    }
+}
+
+impl PeerMetricSource for CountedNetwork {
+    fn peer_metrics(&self) -> &PeerMetrics {
+        &self.1
     }
 }
 
@@ -287,7 +296,7 @@ fn a_local_target_never_reaches_the_network_route() -> Result<()> {
         let network_calls = Arc::new(AtomicUsize::new(0));
         let route = Then(
             LocalTarget::new(peer, registry),
-            CountedNetwork(Arc::clone(&network_calls)),
+            CountedNetwork(Arc::clone(&network_calls), PeerMetrics::default()),
         );
         let frame = stage_success::<CountingCodec>(
             &FrameHeader {
@@ -321,5 +330,6 @@ fn test_router(directory: TestDirectory) -> NetworkRoute<LoopbackSender, TestDir
         AddressResolver::new(CACHE_CAPACITY, directory),
         Arc::new(transport),
         None,
+        PeerMetrics::default(),
     )
 }

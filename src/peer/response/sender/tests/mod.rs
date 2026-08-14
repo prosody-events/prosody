@@ -1,7 +1,8 @@
 //! What response delivery suites share: an in-process route and a harness that
 //! records every attempt.
 
-use super::{ResponseRoute, RouteOutcome, deliver_response, stage};
+use super::{PeerMetricSource, ResponseRoute, RouteOutcome, deliver_response, stage};
+use crate::peer::metrics::PeerMetrics;
 use crate::peer::response::RequestId;
 use crate::peer::response::frame::FrameHeader;
 use crate::peer::response::frame::encode::Staged;
@@ -83,10 +84,22 @@ impl ResponseRoute for ObservedRoute {
     }
 }
 
+impl PeerMetricSource for ObservedRoute {
+    fn peer_metrics(&self) -> &PeerMetrics {
+        self.route.peer_metrics()
+    }
+}
+
 impl Harness {
     /// A harness where every peer publishes a direct endpoint.
     pub(super) fn new() -> Result<Self> {
         let (router, deliveries) = TestRouter::new()?;
+        Self::over(router, deliveries)
+    }
+
+    /// A harness that records through the specified peer instruments.
+    pub(super) fn with_metrics(metrics: PeerMetrics) -> Result<Self> {
+        let (router, deliveries) = TestRouter::with_metrics(metrics)?;
         Self::over(router, deliveries)
     }
 
@@ -117,7 +130,8 @@ impl Harness {
 
     /// Sends `payload` for `index`.
     pub(super) async fn send_payload(&self, index: u8, payload: Vec<u8>) -> Result<()> {
-        let prepared = stage::<CountingCodec, Infallible>(
+        let prepared = stage::<CountingCodec, Infallible, _>(
+            &*self.route,
             FrameHeader {
                 target: peer(index),
                 ..self.header.clone()
@@ -136,7 +150,7 @@ impl Harness {
             ..self.header.clone()
         };
         let payload = PAYLOAD.to_vec();
-        let prepared = stage::<CountingCodec, Infallible>(header, Ok(&payload));
+        let prepared = stage::<CountingCodec, Infallible, _>(&*route, header, Ok(&payload));
         tokio::spawn(async move {
             deliver_response(&*route, prepared, Context::current(), deadline()).await;
             Ok(())
