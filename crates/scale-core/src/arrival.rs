@@ -2,7 +2,7 @@ use std::array::from_fn;
 use std::time::Duration;
 
 use rand::RngExt;
-use statrs::distribution::{ContinuousCDF, DiscreteCDF, Gamma, Poisson};
+use statrs::distribution::{ContinuousCDF, DiscreteCDF, Gamma, NegativeBinomial, Poisson};
 use statrs::function::gamma::ln_gamma;
 use thiserror::Error;
 
@@ -10,8 +10,8 @@ use crate::change_point::ChangePointKernel;
 use crate::random::{PoissonMean, count_as_f64, sample_gamma, sample_poisson};
 use crate::types::{CalendarColumns, CalendarForecast, prior_artifact_contract_holds};
 use crate::{
-    ArrivalPosterior, CalendarArtifactId, PriorArtifactBudget, PriorArtifactIdentity,
-    PriorCoverageRecord, RandomStream,
+    CalendarArtifactId, PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord,
+    RandomStream,
 };
 
 const HAZARD_COUNT: usize = 5;
@@ -20,7 +20,7 @@ const RATE_COUNT: usize = 257;
 const CELL_COUNT: usize = HAZARD_COUNT * RESET_COUNT * RATE_COUNT;
 const MODEL_VERSION: u32 = 1;
 const ARRIVAL_ARTIFACT_SOURCE: u64 = 0x0041_5252_4956_414c;
-const T_MAX_SECONDS: f64 = 86_400.0_f64;
+const T_MAX_SECONDS: f64 = 604_800.0_f64;
 const EPSILON_GRID: f64 = 0.02_f64;
 const EPSILON_BOUNDARY: f64 = 1.0e-6_f64;
 const EPSILON_PATH: f64 = 1.0e-9_f64;
@@ -36,6 +36,17 @@ const ARRIVAL_ARTIFACT_BUDGET: PriorArtifactBudget = PriorArtifactBudget::new(
     0.0_f64,
     EPSILON_GRID,
 );
+
+/// Exact count prediction from the finite arrival model.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArrivalCountPredictive {
+    /// Probability of a count smaller than the observed count.
+    pub lower_cdf: f64,
+    /// Probability of a count no larger than the observed count.
+    pub upper_cdf: f64,
+    /// Predictive counts at probabilities 0.1, 0.5, and 0.9.
+    pub quantiles: [u64; 3],
+}
 
 /// A validated finite-state arrival model.
 ///
@@ -54,6 +65,13 @@ pub struct ArrivalPrior {
 }
 
 impl ArrivalPrior {
+    /// The certified path domain in microseconds.
+    pub(crate) const MAXIMUM_PATH_MICROS: u64 = (T_MAX_SECONDS * 1_000_000.0_f64) as u64;
+    /// Longest path duration inside the certified sampler domain.
+    pub(crate) const MAXIMUM_PATH_SECONDS: f64 = T_MAX_SECONDS;
+    /// Fixed length of the finite arrival-rate posterior.
+    pub(crate) const POSTERIOR_VALUE_COUNT: u32 = RATE_COUNT as u32;
+
     /// Constructs a validated finite arrival model.
     ///
     /// `shape` and `rate_seconds` define the reset-rate prior. The change rate
@@ -418,7 +436,7 @@ impl ArrivalFactor {
     }
 
     pub(crate) fn expected_rate(&self, now_micros: u64) -> f64 {
-        let local = self.marginal_moments(now_micros).0;
+        let local = self.marginal_mean(now_micros);
         let calendar = if self.calendar_rate > 0.0_f64 {
             self.calendar_shape / self.calendar_rate
         } else {
@@ -428,36 +446,10 @@ impl ArrivalFactor {
         (1.0_f64 - probability) * local + probability * calendar
     }
 
-    pub(crate) fn posterior(&self, now_micros: u64) -> ArrivalPosterior {
-        let (local_mean, local_variance) = self.marginal_moments(now_micros);
-        let calendar_probability = self.calendar_probability();
-        let calendar_mean = if self.calendar_rate > 0.0_f64 {
-            self.calendar_shape / self.calendar_rate
-        } else {
-            local_mean
-        };
-        let calendar_variance = if self.calendar_rate > 0.0_f64 {
-            self.calendar_shape / self.calendar_rate.powi(2)
-        } else {
-            local_variance
-        };
-        let mean =
-            (1.0_f64 - calendar_probability) * local_mean + calendar_probability * calendar_mean;
-        let variance = (1.0_f64 - calendar_probability)
-            * (local_variance + (local_mean - mean).powi(2))
-            + calendar_probability * (calendar_variance + (calendar_mean - mean).powi(2));
-        let variance = variance.max(f64::MIN_POSITIVE);
-        ArrivalPosterior {
-            shape: mean * mean / variance,
-            rate: mean / variance,
-        }
-    }
-
-    fn marginal_moments(&self, now_micros: u64) -> (f64, f64) {
+    fn marginal_mean(&self, now_micros: u64) -> f64 {
         let elapsed = Duration::from_micros(now_micros.saturating_sub(self.last_evidence_micros))
             .as_secs_f64();
         let mut mean = 0.0_f64;
-        let mut second = 0.0_f64;
         for hazard in 0..HAZARD_COUNT {
             let retained = (-self.hazards[hazard] * elapsed).exp();
             for reset in 0..RESET_COUNT {
@@ -471,23 +463,141 @@ impl ArrivalFactor {
                 let reset_mean = self.reset_probability[reset]
                     .iter()
                     .zip(self.rates)
-                    .map(|(p, r)| p * r)
+                    .map(|(probability, rate)| probability * rate)
                     .sum::<f64>();
                 mean += retained * retained_mean + (1.0_f64 - retained) * group * reset_mean;
-                let retained_second = (0..RATE_COUNT)
-                    .map(|rate| {
-                        self.probability[cell(hazard, reset, rate)] * self.rates[rate].powi(2)
-                    })
-                    .sum::<f64>();
-                let reset_second = self.reset_probability[reset]
-                    .iter()
-                    .zip(self.rates)
-                    .map(|(p, r)| p * r * r)
-                    .sum::<f64>();
-                second += retained * retained_second + (1.0_f64 - retained) * group * reset_second;
             }
         }
-        (mean, (second - mean * mean).max(0.0_f64))
+        mean
+    }
+
+    pub(crate) fn write_posterior(
+        &self,
+        now_micros: u64,
+        values: &mut [f64],
+        probabilities: &mut [f64],
+    ) -> bool {
+        if values.len() != RATE_COUNT || probabilities.len() != RATE_COUNT {
+            return false;
+        }
+        let elapsed = Duration::from_micros(now_micros.saturating_sub(self.last_evidence_micros))
+            .as_secs_f64();
+        values.copy_from_slice(&self.rates);
+        probabilities.fill(0.0_f64);
+        for hazard in 0..HAZARD_COUNT {
+            let retained = (-self.hazards[hazard] * elapsed).exp();
+            for reset in 0..RESET_COUNT {
+                let group = (0..RATE_COUNT)
+                    .map(|rate| self.probability[cell(hazard, reset, rate)])
+                    .sum::<f64>();
+                for (rate, probability) in probabilities.iter_mut().enumerate() {
+                    *probability += retained * self.probability[cell(hazard, reset, rate)]
+                        + (1.0_f64 - retained) * group * self.reset_probability[reset][rate];
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) fn count_predictive(
+        &self,
+        now_micros: u64,
+        observed_count: u32,
+        exposure_seconds: f64,
+    ) -> Result<ArrivalCountPredictive, ArrivalPredictiveError> {
+        self.validate_predictive_exposure(exposure_seconds)?;
+        let transition_seconds =
+            Duration::from_micros(now_micros.saturating_sub(self.last_evidence_micros))
+                .as_secs_f64()
+                + exposure_seconds;
+        let observed_count = u64::from(observed_count);
+        let upper_cdf =
+            self.predictive_cdf(observed_count, exposure_seconds, transition_seconds)?;
+        let lower_cdf = if observed_count == 0 {
+            0.0_f64
+        } else {
+            self.predictive_cdf(observed_count - 1, exposure_seconds, transition_seconds)?
+        };
+        let mut quantiles = [0_u64; 3];
+        for (index, threshold) in [0.1_f64, 0.5_f64, 0.9_f64].into_iter().enumerate() {
+            let mut high = 1_u64;
+            while high < u64::MAX
+                && self.predictive_cdf(high, exposure_seconds, transition_seconds)? < threshold
+            {
+                high = high.saturating_mul(2);
+            }
+            let mut low = 0_u64;
+            while low < high {
+                let middle = low.midpoint(high);
+                if self.predictive_cdf(middle, exposure_seconds, transition_seconds)? >= threshold {
+                    high = middle;
+                } else {
+                    low = middle.saturating_add(1);
+                }
+            }
+            quantiles[index] = low;
+        }
+        Ok(ArrivalCountPredictive {
+            lower_cdf,
+            upper_cdf,
+            quantiles,
+        })
+    }
+
+    fn validate_predictive_exposure(
+        &self,
+        exposure_seconds: f64,
+    ) -> Result<(), ArrivalPredictiveError> {
+        if !exposure_seconds.is_finite()
+            || exposure_seconds <= 0.0_f64
+            || exposure_seconds > T_MAX_SECONDS
+            || PoissonMean::new(self.rates[RATE_COUNT - 1] * exposure_seconds).is_none()
+        {
+            return Err(ArrivalPredictiveError::InvalidExposure);
+        }
+        Ok(())
+    }
+
+    fn predictive_cdf(
+        &self,
+        count: u64,
+        exposure_seconds: f64,
+        transition_seconds: f64,
+    ) -> Result<f64, ArrivalPredictiveError> {
+        let mut poisson_cdfs = [0.0_f64; RATE_COUNT];
+        for (poisson_cdf, rate) in poisson_cdfs.iter_mut().zip(self.rates) {
+            let mean = rate * exposure_seconds;
+            if PoissonMean::new(mean).is_none() {
+                return Err(ArrivalPredictiveError::InvalidExposure);
+            }
+            let distribution =
+                Poisson::new(mean).map_err(|_| ArrivalPredictiveError::InvalidDistribution)?;
+            *poisson_cdf = distribution.cdf(count);
+        }
+        let mut local_cdf = 0.0_f64;
+        for hazard in 0..HAZARD_COUNT {
+            let retained = (-self.hazards[hazard] * transition_seconds).exp();
+            for reset in 0..RESET_COUNT {
+                let group = (0..RATE_COUNT)
+                    .map(|rate| self.probability[cell(hazard, reset, rate)])
+                    .sum::<f64>();
+                for (rate, poisson_cdf) in poisson_cdfs.iter().copied().enumerate() {
+                    let probability = retained * self.probability[cell(hazard, reset, rate)]
+                        + (1.0_f64 - retained) * group * self.reset_probability[reset][rate];
+                    local_cdf += probability * poisson_cdf;
+                }
+            }
+        }
+        let calendar_probability = self.calendar_probability();
+        if calendar_probability <= 0.0_f64 || self.calendar_rate <= 0.0_f64 {
+            return Ok(local_cdf.clamp(0.0_f64, 1.0_f64));
+        }
+        let success = self.calendar_rate / (self.calendar_rate + exposure_seconds);
+        let calendar = NegativeBinomial::new(self.calendar_shape, success)
+            .map_err(|_| ArrivalPredictiveError::InvalidDistribution)?;
+        Ok(((1.0_f64 - calendar_probability) * local_cdf
+            + calendar_probability * calendar.cdf(count))
+        .clamp(0.0_f64, 1.0_f64))
     }
 
     pub(crate) fn sample_rate_path(
@@ -846,6 +956,17 @@ pub enum ArrivalPriorError {
     /// The continuous reset prior has too much mass outside the rate grid.
     #[error("arrival reset prior exceeds the boundary-mass budget")]
     BoundaryMass,
+}
+
+/// Failure from an exact arrival-count prediction.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ArrivalPredictiveError {
+    /// The exposure is outside the validated Poisson domain.
+    #[error("arrival predictive exposure is outside the validated domain")]
+    InvalidExposure,
+    /// A validated predictive distribution could not be constructed.
+    #[error("arrival predictive distribution is invalid")]
+    InvalidDistribution,
 }
 
 #[derive(Debug, Eq, PartialEq)]

@@ -324,6 +324,10 @@ impl LaunchPrior {
         &self.coverage
     }
 
+    pub(crate) fn coverage_support_seconds(&self) -> (f64, f64) {
+        coverage_support(&self.coverage)
+    }
+
     /// Constructs one normalized joint readiness prior.
     ///
     /// Probability order is intercept, slope, fast cell, and slow cell.
@@ -483,6 +487,10 @@ impl RebalancePrior {
     #[must_use]
     pub fn coverage(&self) -> &[PriorCoverageRecord] {
         &self.coverage
+    }
+
+    pub(crate) fn coverage_support_seconds(&self) -> (f64, f64) {
+        coverage_support(&self.coverage)
     }
 
     /// Constructs one normalized rebalance-duration prior.

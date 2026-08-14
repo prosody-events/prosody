@@ -1,5 +1,6 @@
 use allocation_counter::measure;
 use quickcheck_macros::quickcheck;
+use thiserror::Error;
 
 use super::{
     ArrivalEvidence, ArrivalFactor, ArrivalPrior, CELL_COUNT, HAZARD_COUNT, RATE_COUNT,
@@ -7,6 +8,22 @@ use super::{
 };
 use crate::types::{CalendarColumns, CalendarForecast};
 use crate::{CalendarArtifactId, CalendarRateSegment, RandomStream};
+
+#[test]
+fn concentrated_posterior_has_a_finite_exact_predictive_rank() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
+    let mut factor = ArrivalFactor::new(&model);
+    factor.probability.fill(0.0_f64);
+    factor.probability[cell(0, 0, RATE_COUNT / 2)] = 1.0_f64;
+
+    let predictive = factor.count_predictive(0, 7, 1.0_f64)?;
+    let rank = predictive.lower_cdf.midpoint(predictive.upper_cdf);
+
+    assert!(rank.is_finite());
+    assert!((0.0_f64..=1.0_f64).contains(&rank));
+    assert!(predictive.lower_cdf <= predictive.upper_cdf);
+    Ok(())
+}
 
 #[quickcheck]
 fn boundary_filter_matches_exhaustive_one_step(count_code: u8, duration_code: u16) -> bool {
@@ -152,4 +169,12 @@ fn accepted_paths_end_at_the_requested_horizon(seed: u64, duration_code: u16) ->
     length > 0
         && length <= model.path_segment_count_max()
         && (ends[length - 1] - duration).abs() < f64::EPSILON
+}
+
+#[derive(Debug, Error)]
+enum TestError {
+    #[error(transparent)]
+    Prior(#[from] super::ArrivalPriorError),
+    #[error(transparent)]
+    Predictive(#[from] super::ArrivalPredictiveError),
 }

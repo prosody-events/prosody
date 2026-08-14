@@ -3,14 +3,13 @@ use std::slice;
 use std::time::Duration;
 
 use prosody_scale_core::{
-    ActuationCommitment, ArrivalPosterior, AttemptOutcomeCounts, AttemptOutcomeEvidence,
-    BacklogCohort, CapacityGrid, Cohort, CompletionPosteriorCell, Configuration,
-    ConfigurationError, DecisionRejection, DemandClass, HoldReason, ModelTime, ObservationBuffer,
-    OccupancyTransition, PosteriorQuery, RandomStream, ReadinessGroupId, ReadinessLump,
-    ReadinessObservation, RebalanceEvidence, ResourceWindow, ScaleDecision, ScaleScratch,
-    ScaleState, TransitionDirection, step,
+    ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort, CapacityGrid,
+    Cohort, CompletionPosteriorCell, Configuration, ConfigurationError, DecisionRejection,
+    DemandClass, HoldReason, ModelTime, ObservationBuffer, OccupancyTransition, PosteriorQuery,
+    RandomStream, ReadinessGroupId, ReadinessLump, ReadinessObservation, RebalanceEvidence,
+    ResourceWindow, ScaleDecision, ScaleScratch, ScaleState, TransitionDirection, step,
 };
-use statrs::distribution::{DiscreteCDF, NegativeBinomial, Poisson};
+use statrs::distribution::{DiscreteCDF, Poisson};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -305,9 +304,9 @@ pub struct ControllerTrace {
     lead_time_down_posterior: DiscretePosteriorTrace,
     rebalance_time_up_posterior: DiscretePosteriorTrace,
     rebalance_time_down_posterior: DiscretePosteriorTrace,
-    arrival_prior: ArrivalPosterior,
-    arrival_shape: Vec<f64>,
-    arrival_rate: Vec<f64>,
+    arrival_posterior_values: Vec<f64>,
+    arrival_prior_probabilities: Vec<f64>,
+    arrival_posterior_probabilities: Vec<f64>,
     decision_candidate_count: usize,
     decision_expected_losses: Vec<f64>,
     decision_deadline_satisfaction_probabilities: Vec<f64>,
@@ -377,6 +376,23 @@ fn initial_capacity_posterior(
     Ok((values, probabilities))
 }
 
+fn cell_counts(capacity: usize, value_count: u32) -> Result<(usize, usize), PlantError> {
+    let count = usize::try_from(value_count).map_err(|_| PlantError::PlatformLimit)?;
+    let cells = capacity
+        .checked_mul(count)
+        .ok_or(PlantError::PlatformLimit)?;
+    Ok((count, cells))
+}
+
+fn initial_arrival_posterior(state: &ScaleState) -> Result<(Vec<f64>, Vec<f64>), PlantError> {
+    let value_count = usize::try_from(state.arrival_posterior_value_count())
+        .map_err(|_| PlantError::PlatformLimit)?;
+    let mut values = vec![0.0_f64; value_count];
+    let mut probabilities = vec![0.0_f64; value_count];
+    state.write_arrival_posterior(&mut values, &mut probabilities)?;
+    Ok((values, probabilities))
+}
+
 impl ControllerTrace {
     fn new(sample_count_max: u32, state: &ScaleState) -> Result<Self, PlantError> {
         let capacity = usize::try_from(sample_count_max).map_err(|_| PlantError::PlatformLimit)?;
@@ -385,19 +401,18 @@ impl ControllerTrace {
                 name: "controller_trace_count_max",
             });
         }
-        let posterior_value_count = usize::try_from(state.capacity_posterior_value_count())
-            .map_err(|_| PlantError::PlatformLimit)?;
-        let posterior_cell_count = capacity
-            .checked_mul(posterior_value_count)
-            .ok_or(PlantError::PlatformLimit)?;
-        let decision_candidate_count = usize::try_from(state.configuration().replica_count_max)
-            .map_err(|_| PlantError::PlatformLimit)?;
-        let decision_cell_count = capacity
-            .checked_mul(decision_candidate_count)
-            .ok_or(PlantError::PlatformLimit)?;
+        let (posterior_value_count, posterior_cell_count) =
+            cell_counts(capacity, state.capacity_posterior_value_count())?;
+        let (decision_candidate_count, decision_cell_count) =
+            cell_counts(capacity, state.configuration().replica_count_max)?;
         let (capacity_posterior_values, capacity_prior_probabilities) =
             initial_capacity_posterior(state, posterior_value_count)?;
         let posteriors = PosteriorTraces::new(state, capacity)?;
+        let (arrival_posterior_values, arrival_prior_probabilities) =
+            initial_arrival_posterior(state)?;
+        let arrival_cell_count = capacity
+            .checked_mul(arrival_posterior_values.len())
+            .ok_or(PlantError::PlatformLimit)?;
         Ok(Self {
             at_micros: Vec::with_capacity(capacity),
             scenario_count: Vec::with_capacity(capacity),
@@ -467,9 +482,9 @@ impl ControllerTrace {
             lead_time_down_posterior: posteriors.lead_time_down,
             rebalance_time_up_posterior: posteriors.rebalance_time_up,
             rebalance_time_down_posterior: posteriors.rebalance_time_down,
-            arrival_prior: state.arrival_posterior(),
-            arrival_shape: Vec::with_capacity(capacity),
-            arrival_rate: Vec::with_capacity(capacity),
+            arrival_posterior_values,
+            arrival_prior_probabilities,
+            arrival_posterior_probabilities: Vec::with_capacity(arrival_cell_count),
             decision_candidate_count,
             decision_expected_losses: Vec::with_capacity(decision_cell_count),
             decision_deadline_satisfaction_probabilities: Vec::with_capacity(decision_cell_count),
@@ -644,19 +659,25 @@ impl ControllerTrace {
         values.get(start..end)
     }
 
-    /// Returns the arrival-rate prior before the first observation.
+    /// Returns the ordered finite arrival-rate axis.
     #[must_use]
-    pub const fn arrival_prior(&self) -> ArrivalPosterior {
-        self.arrival_prior
+    pub fn arrival_posterior_values(&self) -> &[f64] {
+        &self.arrival_posterior_values
     }
 
-    /// Returns one arrival-rate posterior at the selected time.
+    /// Returns the finite arrival-rate prior before the first observation.
     #[must_use]
-    pub fn arrival_posterior(&self, index: usize) -> Option<ArrivalPosterior> {
-        Some(ArrivalPosterior {
-            shape: *self.arrival_shape.get(index)?,
-            rate: self.arrival_rate[index],
-        })
+    pub fn arrival_prior(&self) -> &[f64] {
+        &self.arrival_prior_probabilities
+    }
+
+    /// Returns one exact finite arrival-rate posterior.
+    #[must_use]
+    pub fn arrival_posterior(&self, index: usize) -> Option<&[f64]> {
+        let width = self.arrival_posterior_values.len();
+        let start = index.checked_mul(width)?;
+        let end = start.checked_add(width)?;
+        self.arrival_posterior_probabilities.get(start..end)
     }
 
     fn arrival_evidence_sample(&self, index: usize) -> ArrivalEvidenceSample {
@@ -959,9 +980,19 @@ impl ControllerTrace {
         self.lead_time_down_posterior.push(state)?;
         self.rebalance_time_up_posterior.push(state)?;
         self.rebalance_time_down_posterior.push(state)?;
-        let arrival = state.arrival_posterior();
-        self.arrival_shape.push(arrival.shape);
-        self.arrival_rate.push(arrival.rate);
+        let arrival_start = self.arrival_posterior_probabilities.len();
+        let arrival_end = arrival_start
+            .checked_add(self.arrival_posterior_values.len())
+            .ok_or(PlantError::PlatformLimit)?;
+        if arrival_end > self.arrival_posterior_probabilities.capacity() {
+            return Err(PlantError::MetricCapacity);
+        }
+        self.arrival_posterior_probabilities
+            .resize(arrival_end, 0.0_f64);
+        state.write_arrival_posterior(
+            &mut self.arrival_posterior_values,
+            &mut self.arrival_posterior_probabilities[arrival_start..arrival_end],
+        )?;
         Ok(())
     }
 }
@@ -1337,6 +1368,8 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         Workload: TickGenerator,
     {
         self.observation.clear();
+        self.observation
+            .advance_model_time(ModelTime::from_micros(context.now_micros))?;
         let active_transition = if context.plant.partitions_ready {
             None
         } else {
@@ -1994,21 +2027,15 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         let ArrivalEvidenceSample::Accepted(window) = self.arrival_evidence_sample else {
             return Ok(ArrivalPrediction::missing());
         };
-        let posterior = self.state.arrival_posterior();
-        let success = posterior.rate / (posterior.rate + window.exposure_seconds);
-        let distribution = NegativeBinomial::new(posterior.shape, success)?;
-        let quantiles = negative_binomial_quantiles(&distribution);
-        let observed = u64::from(window.count);
-        let upper = distribution.cdf(observed);
-        let lower = if observed == 0 {
-            0.0_f64
-        } else {
-            distribution.cdf(observed - 1)
-        };
+        let predictive = self
+            .state
+            .arrival_count_predictive(window.count, window.exposure_seconds)?;
+        let quantiles = predictive.quantiles.map(count_f64);
         let rank_offset = arrival_predictive_rank_offset(self.diagnostic_seed, now_micros);
         Ok(ArrivalPrediction {
             quantiles,
-            rank: lower + rank_offset * (upper - lower),
+            rank: predictive.lower_cdf
+                + rank_offset * (predictive.upper_cdf - predictive.lower_cdf),
         })
     }
 
@@ -2320,27 +2347,6 @@ fn predictive_rank_offset(seed: u64, now_micros: u64) -> f64 {
 fn arrival_predictive_rank_offset(seed: u64, now_micros: u64) -> f64 {
     let mut random = RandomStream::new(0x6172_7269_7661_6c73 ^ seed).domain(now_micros);
     random.open_unit_f64()
-}
-
-fn negative_binomial_quantiles(distribution: &NegativeBinomial) -> [f64; 3] {
-    let mut quantiles = [0.0_f64; 3];
-    for (index, threshold) in [0.1_f64, 0.5_f64, 0.9_f64].into_iter().enumerate() {
-        let mut high = 1_u64;
-        while distribution.cdf(high) < threshold && high < u64::MAX {
-            high = high.saturating_mul(2);
-        }
-        let mut low = 0_u64;
-        while low < high {
-            let middle = low.midpoint(high);
-            if distribution.cdf(middle) >= threshold {
-                high = middle;
-            } else {
-                low = middle.saturating_add(1);
-            }
-        }
-        quantiles[index] = count_f64(low);
-    }
-    quantiles
 }
 
 fn count_f64(value: u64) -> f64 {

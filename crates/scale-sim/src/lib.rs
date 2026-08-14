@@ -5,7 +5,7 @@
 
 use prosody_scale_core::{DemandClass, RandomStream};
 use rayon::prelude::*;
-use statrs::distribution::{BinomialError, NegativeBinomialError, PoissonError};
+use statrs::distribution::{BinomialError, PoissonError};
 use std::collections::VecDeque;
 use std::mem;
 use std::num::NonZeroU8;
@@ -2168,9 +2168,9 @@ pub enum PlantError {
     /// A paired predictive distribution parameter is invalid.
     #[error(transparent)]
     PairedPredictiveDistribution(#[from] BinomialError),
-    /// An arrival predictive distribution parameter is invalid.
+    /// An exact arrival-count prediction failed.
     #[error(transparent)]
-    ArrivalPredictiveDistribution(#[from] NegativeBinomialError),
+    ArrivalPredictive(#[from] prosody_scale_core::ArrivalPredictiveError),
     /// Generated launch or rebalance evidence is invalid.
     #[error(transparent)]
     LaunchEvidence(#[from] prosody_scale_core::LaunchEvidenceError),

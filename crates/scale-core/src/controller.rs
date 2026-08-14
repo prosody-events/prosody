@@ -4,7 +4,7 @@ use std::time::Duration;
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 
 use crate::TransitionDirection;
-use crate::arrival::ArrivalFactor;
+use crate::arrival::{ArrivalFactor, ArrivalPrior};
 use crate::capacity::{CapacityFactor, CompletionPosteriorCell, ThroughputPosteriorCell};
 use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
@@ -22,10 +22,10 @@ use crate::types::{
     POSTERIOR_SAMPLES_PER_CAPACITY_CLASS_MIN, ScheduledRelease, WorkCohorts,
 };
 use crate::{
-    ApplyDecision, ArrivalPosterior, CapacityGrid, Configuration, ConfigurationError,
-    DecisionDiagnostics, DemandClass, GroupObservation, HoldDecision, HoldReason, ModelTime,
-    PosteriorError, PosteriorQuery, PredictiveQuantileError, RandomStream, ResourceWindow,
-    ScaleDecision,
+    ApplyDecision, ArrivalCountPredictive, ArrivalPredictiveError, CapacityGrid, Configuration,
+    ConfigurationError, DecisionDiagnostics, DemandClass, GroupObservation, HoldDecision,
+    HoldReason, ModelTime, PosteriorError, PosteriorQuery, PredictiveQuantileError, RandomStream,
+    ResourceWindow, ScaleDecision,
 };
 use thiserror::Error;
 
@@ -297,10 +297,48 @@ impl ScaleState {
             .write_capacity_posterior(values, probabilities)
     }
 
-    /// Returns exact Gamma parameters for the arrival-rate posterior.
+    /// Returns the exact count prediction for one observation interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when exposure is outside the validated domain.
+    pub fn arrival_count_predictive(
+        &self,
+        observed_count: u32,
+        exposure_seconds: f64,
+    ) -> Result<ArrivalCountPredictive, ArrivalPredictiveError> {
+        self.arrivals.count_predictive(
+            self.model_time.as_micros(),
+            observed_count,
+            exposure_seconds,
+        )
+    }
+
+    /// Returns the fixed value count for the finite arrival-rate posterior.
     #[must_use]
-    pub fn arrival_posterior(&self) -> ArrivalPosterior {
-        self.arrivals.posterior(self.model_time.as_micros())
+    pub const fn arrival_posterior_value_count(&self) -> u32 {
+        ArrivalPrior::POSTERIOR_VALUE_COUNT
+    }
+
+    /// Writes the finite arrival-rate posterior into caller-owned buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either buffer has the wrong fixed length.
+    pub fn write_arrival_posterior(
+        &self,
+        values: &mut [f64],
+        probabilities: &mut [f64],
+    ) -> Result<(), PosteriorError> {
+        let expected = self.arrival_posterior_value_count();
+        if self
+            .arrivals
+            .write_posterior(self.model_time.as_micros(), values, probabilities)
+        {
+            Ok(())
+        } else {
+            Err(PosteriorError::BufferLength { expected })
+        }
     }
 
     /// Returns the posterior predictive CDF for one actuation duration.
@@ -1274,12 +1312,8 @@ fn evaluate_one_scenario(
         &mut workspace.partition_share_draws,
         &mut workspace.moved_partition_share,
     );
-    let (planning_horizon_micros, disturbance_horizon_micros) = scenario_horizons(
-        state,
-        shared.resource_cohorts,
-        &lead_random,
-        &rebalance_random,
-    );
+    let (planning_horizon_micros, disturbance_horizon_micros) =
+        scenario_horizons(state, shared.resource_cohorts);
     let path_length = sample_scenario_path(
         state,
         shared.calendar,
@@ -1408,21 +1442,17 @@ fn finalize_scenario_columns(state: &ScaleState, scratch: &mut ScaleScratch) {
 /// every known deadline, and one budget past the last boundary. It does
 /// not depend on the candidate, so every action is judged over the same
 /// future.
-fn scenario_horizons(
-    state: &ScaleState,
-    cohorts: &WorkCohorts,
-    lead_random: &RandomStream,
-    rebalance_random: &RandomStream,
-) -> (u64, u64) {
-    let mut transition_span_seconds = 0.0_f64;
-    for direction in [TransitionDirection::Up, TransitionDirection::Down] {
-        for delta in 1..=state.configuration.replica_count_max {
-            transition_span_seconds = transition_span_seconds.max(
-                scenario_launch_seconds(state, lead_random, direction, delta)
-                    + scenario_rebalance_seconds(state, rebalance_random, direction, delta),
-            );
-        }
-    }
+fn scenario_horizons(state: &ScaleState, cohorts: &WorkCohorts) -> (u64, u64) {
+    let transition_span_seconds = state
+        .configuration
+        .launch_time_prior
+        .coverage_support_seconds()
+        .1
+        + state
+            .configuration
+            .rebalance_time_prior
+            .coverage_support_seconds()
+            .1;
     let report_horizon_micros = state
         .model_time
         .as_micros()

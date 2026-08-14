@@ -1,7 +1,7 @@
 use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
-use super::{SCHEDULED_PARTITION, prepare_work_cohorts, scenario_event_count};
+use super::{SCHEDULED_PARTITION, prepare_work_cohorts, scenario_event_count, scenario_horizons};
 use crate::edf::ArrivalPath;
 use crate::types::WorkCohorts;
 use crate::{
@@ -85,6 +85,71 @@ fn scheduled_release_validation_rejects_invalid_inputs() -> Result<(), TestError
         state.configuration.scheduled_release_count_max as usize + 1
     ];
     assert!(observation.set_scheduled_releases(&excess).is_err());
+    Ok(())
+}
+
+#[test]
+fn configuration_rejects_an_uncovered_planning_horizon() -> Result<(), TestError> {
+    let mut configuration = test_configuration()?;
+    configuration.report_interval_micros = ArrivalPrior::MAXIMUM_PATH_MICROS;
+
+    assert_eq!(
+        configuration.validate(),
+        Err(ConfigurationError::PlanningHorizonDomain)
+    );
+    Ok(())
+}
+
+#[test]
+fn ingestion_rejects_deadlines_beyond_the_arrival_domain() -> Result<(), TestError> {
+    let configuration = test_configuration()?;
+    let mut observation = ObservationBuffer::new(&configuration)?;
+    let now_micros = 17_u64;
+    observation.advance_model_time(ModelTime::from_micros(now_micros))?;
+    let deadline_max =
+        now_micros + ArrivalPrior::MAXIMUM_PATH_MICROS - configuration.objective.budget_micros();
+
+    assert_eq!(
+        observation.push_cohort(crate::Cohort {
+            release_micros: now_micros,
+            deadline_micros: deadline_max + 1,
+            offered_events: 1.0_f64,
+            partition: 0,
+            demand_class: DemandClass::Normal,
+        }),
+        Err(ObservationError::DeadlineHorizon)
+    );
+    assert_eq!(
+        observation.set_scheduled_releases(&[ScheduledRelease {
+            release_micros: deadline_max - configuration.objective.budget_micros() + 1,
+            count: 1,
+        }]),
+        Err(ObservationError::DeadlineHorizon)
+    );
+    Ok(())
+}
+
+#[test]
+fn scenario_horizon_uses_only_artifact_support() -> Result<(), TestError> {
+    let (state, _scratch, _observation) = test_model()?;
+    let cohorts = WorkCohorts::new(1);
+    let first = scenario_horizons(&state, &cohorts);
+    let second = scenario_horizons(&state, &cohorts);
+    let support_seconds = state
+        .configuration
+        .launch_time_prior
+        .coverage_support_seconds()
+        .1
+        + state
+            .configuration
+            .rebalance_time_prior
+            .coverage_support_seconds()
+            .1;
+    let report = state.configuration.report_interval_micros;
+    let expected_disturbance = report + (2.0_f64 * support_seconds * 1_000_000.0_f64) as u64;
+
+    assert_eq!(first, second, "the horizon must be equal across seeds");
+    assert_eq!(first.1, expected_disturbance);
     Ok(())
 }
 

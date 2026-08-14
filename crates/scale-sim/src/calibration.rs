@@ -1,9 +1,7 @@
 use std::thread::available_parallelism;
 
-use prosody_scale_core::ArrivalPosterior;
 use rayon::prelude::*;
 use rayon::{ThreadPoolBuildError, ThreadPoolBuilder};
-use statrs::distribution::{ContinuousCDF, Gamma, GammaError};
 use thiserror::Error;
 
 use crate::regime::run_capacity_evidence_regime_seeded_with_sensitivity;
@@ -617,13 +615,14 @@ fn summarize_demand_trial(
     if observation_count == 0 {
         return Err(CalibrationError::NoObservations);
     }
-    let prior_width = arrival_posterior_width(run.controller().arrival_prior())?;
+    let arrival_values = run.controller().arrival_posterior_values();
+    let prior_width = arrival_posterior_width(arrival_values, run.controller().arrival_prior());
     let final_index = run.controller().len().saturating_sub(1);
     let final_posterior = run
         .controller()
         .arrival_posterior(final_index)
         .ok_or(CalibrationError::MissingControllerSample)?;
-    let final_width = arrival_posterior_width(final_posterior)?;
+    let final_width = arrival_posterior_width(arrival_values, final_posterior);
     let count = f64::from(observation_count);
     Ok(DemandCalibrationTrial {
         regime,
@@ -639,10 +638,13 @@ fn summarize_demand_trial(
     })
 }
 
-fn arrival_posterior_width(posterior: ArrivalPosterior) -> Result<f64, CalibrationError> {
-    let distribution = Gamma::new(posterior.shape, posterior.rate)?;
-    let width = distribution.inverse_cdf(0.9_f64) - distribution.inverse_cdf(0.1_f64);
-    Ok(width / (posterior.shape / posterior.rate))
+fn arrival_posterior_width(values: &[f64], probabilities: &[f64]) -> f64 {
+    let mean = values
+        .iter()
+        .zip(probabilities)
+        .map(|(value, probability)| value * probability)
+        .sum::<f64>();
+    posterior_width(values, probabilities) / mean
 }
 
 fn summarize_trial(
@@ -743,9 +745,6 @@ pub enum CalibrationError {
     /// The bounded calibration worker pool could not start.
     #[error(transparent)]
     ThreadPool(#[from] ThreadPoolBuildError),
-    /// An arrival posterior has invalid parameters.
-    #[error(transparent)]
-    ArrivalPosterior(#[from] GammaError),
     /// A seeded regime failed.
     #[error(transparent)]
     Principal(#[from] PrincipalRunError),

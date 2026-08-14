@@ -1,11 +1,6 @@
 use std::cmp::Ordering;
 
-use prosody_scale_core::ArrivalPosterior;
-
-use super::{
-    ARRIVAL_CELL_COUNT, PosteriorHeatmap, PosteriorPanel, format_value, gamma_mass, quantiles,
-    select_snapshots,
-};
+use super::{PosteriorHeatmap, PosteriorPanel, format_value, quantiles, select_snapshots};
 
 #[test]
 fn snapshot_selects_largest_posterior_change() {
@@ -34,21 +29,13 @@ fn snapshot_selects_largest_posterior_change() {
 }
 
 #[test]
-fn log_rate_gamma_mass_normalizes() {
-    let values = (0..ARRIVAL_CELL_COUNT)
-        .map(|index| 2.0_f64.powf(-10.0_f64 + f64::from(index as u32) * 0.25_f64))
-        .collect::<Vec<_>>();
-    let mut scratch = [0.0_f64; ARRIVAL_CELL_COUNT];
+fn quantiles_use_exact_discrete_mass() {
+    // Keep every cumulative sum away from a threshold: an exact hit is
+    // unstable under f64 rounding.
+    let values = [1.0_f64, 2.0_f64, 4.0_f64, 8.0_f64];
+    let mass = [0.05_f64, 0.15_f64, 0.72_f64, 0.08_f64];
 
-    let mass = gamma_mass(
-        ArrivalPosterior {
-            shape: 37.0_f64,
-            rate: 0.25_f64,
-        },
-        &values,
-        &mut scratch,
-    );
-
-    assert!((mass.iter().sum::<f64>() - 1.0_f64).abs() < 1.0e-12_f64);
-    assert!(mass.iter().all(|probability| probability.is_finite()));
+    let actual = quantiles(&values, &mass);
+    let expected = [2.0_f64, 4.0_f64, 4.0_f64];
+    assert_eq!(actual.partial_cmp(&expected), Some(Ordering::Equal));
 }

@@ -1,11 +1,7 @@
-use std::cmp::Ordering;
-
 use prosody_scale_core::ThroughputPosteriorCell;
-use statrs::distribution::NegativeBinomial;
 
 use super::{
-    negative_binomial_quantiles, posterior_predictive_throughput_quantiles, predictive_rank_offset,
-    predictive_throughput_cdf,
+    posterior_predictive_throughput_quantiles, predictive_rank_offset, predictive_throughput_cdf,
 };
 use crate::PlantError;
 
@@ -73,19 +69,6 @@ fn covering_cell_predictive_rank_stays_interior() -> Result<(), PlantError> {
     let rank = lower.midpoint(upper);
 
     assert!((0.1_f64..=0.9_f64).contains(&rank), "rank={rank}");
-    Ok(())
-}
-
-#[test]
-fn arrival_prediction_uses_negative_binomial_count_quantiles() -> Result<(), PlantError> {
-    let distribution = NegativeBinomial::new(10.0_f64, 0.5_f64)?;
-    let quantiles = negative_binomial_quantiles(&distribution);
-
-    assert_eq!(
-        quantiles.partial_cmp(&[5.0_f64, 9.0_f64, 16.0_f64]),
-        Some(Ordering::Equal),
-        "arrival prediction must retain discrete count quantiles"
-    );
     Ok(())
 }
 

@@ -17,7 +17,10 @@ mod random;
 mod reliability;
 mod types;
 
-pub use arrival::{ArrivalEvidence, ArrivalPrior, ArrivalPriorError};
+pub use arrival::{
+    ArrivalCountPredictive, ArrivalEvidence, ArrivalPredictiveError, ArrivalPrior,
+    ArrivalPriorError,
+};
 pub use capacity::{
     CapacityCurve, CapacityGrid, CapacityGridError, CapacityModelError, CapacityPrior,
     CompletionPosteriorCell, PosteriorError, ResourceWindow, ResourceWindowError,
@@ -36,12 +39,12 @@ pub use partition::{PartitionPriorPredictiveCheck, partition_prior_predictive_ch
 pub use random::RandomStream;
 pub use reliability::ReliabilityPrior;
 pub use types::{
-    ActuationCommitment, ApplyDecision, ArrivalPosterior, AttemptOutcomeCounts,
-    AttemptOutcomeEvidence, BacklogCohort, CalendarArtifactId, CalendarRateSegment, Cohort,
-    Configuration, ConfigurationError, DecisionDiagnostics, DemandClass, GroupObservation,
-    HoldDecision, HoldReason, ModelTime, ObservationBuffer, ObservationError,
-    OccupancyTraceEvidence, OccupancyTransition, PosteriorQuery, PriorArtifactBudget,
-    PriorArtifactIdentity, PriorCoverageRecord, ScaleDecision, ScheduledRelease, ServiceObjective,
+    ActuationCommitment, ApplyDecision, AttemptOutcomeCounts, AttemptOutcomeEvidence,
+    BacklogCohort, CalendarArtifactId, CalendarRateSegment, Cohort, Configuration,
+    ConfigurationError, DecisionDiagnostics, DemandClass, GroupObservation, HoldDecision,
+    HoldReason, ModelTime, ObservationBuffer, ObservationError, OccupancyTraceEvidence,
+    OccupancyTransition, PosteriorQuery, PriorArtifactBudget, PriorArtifactIdentity,
+    PriorCoverageRecord, ScaleDecision, ScheduledRelease, ServiceObjective,
 };
 
 #[cfg(test)]

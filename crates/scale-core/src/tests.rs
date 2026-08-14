@@ -1396,9 +1396,13 @@ fn every_discrete_posterior_has_an_ordered_normalized_view() -> Result<(), TestE
         assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(close_relative(probabilities.iter().sum(), 1.0_f64));
     }
-    let arrival = state.arrival_posterior();
-    assert!(arrival.shape > 0.0_f64);
-    assert!(arrival.rate > 0.0_f64);
+    let arrival_count = usize::try_from(state.arrival_posterior_value_count())
+        .map_err(|_| ConfigurationError::PlatformLimit)?;
+    let mut arrival_values = vec![0.0_f64; arrival_count];
+    let mut arrival_probabilities = vec![0.0_f64; arrival_count];
+    state.write_arrival_posterior(&mut arrival_values, &mut arrival_probabilities)?;
+    assert!(arrival_values.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(close_relative(arrival_probabilities.iter().sum(), 1.0_f64));
     Ok(())
 }
 

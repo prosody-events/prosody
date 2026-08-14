@@ -13,7 +13,6 @@ use crate::{ControllerTrace, PLOT_FONT_FAMILY, PlotError};
 
 const WIDTH: u32 = 1_440;
 const HEATMAP_HEIGHT: u32 = 440;
-const ARRIVAL_CELL_COUNT: usize = 64;
 const SNAPSHOT_HEIGHT: u32 = 480;
 
 pub(crate) struct PosteriorHeatmap {
@@ -384,10 +383,13 @@ fn discrete_heatmap(controller: &ControllerTrace, query: PosteriorQuery) -> Post
 }
 
 fn arrival_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
-    let (rates, values) = arrival_axes(controller);
+    let values = controller
+        .arrival_posterior_values()
+        .iter()
+        .map(|rate| rate.log2())
+        .collect::<Vec<_>>();
     let mut at_micros = Vec::with_capacity(controller.len());
-    let mut probabilities = Vec::with_capacity(controller.len() * ARRIVAL_CELL_COUNT);
-    let mut log_mass = [0.0_f64; ARRIVAL_CELL_COUNT];
+    let mut probabilities = Vec::with_capacity(controller.len().saturating_mul(values.len()));
     for index in 0..controller.len() {
         let Some(sample) = controller.sample(index) else {
             continue;
@@ -395,13 +397,7 @@ fn arrival_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
         let Some(posterior) = controller.arrival_posterior(index) else {
             continue;
         };
-        let start = probabilities.len();
-        probabilities.extend(gamma_mass(posterior, &rates, &mut log_mass));
-        debug_assert_eq!(
-            probabilities.len() - start,
-            ARRIVAL_CELL_COUNT,
-            "each arrival posterior must contain one complete grid"
-        );
+        probabilities.extend_from_slice(posterior);
         at_micros.push(sample.at_micros);
     }
     PosteriorHeatmap {
@@ -412,39 +408,7 @@ fn arrival_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
 }
 
 fn arrival_prior_mass(controller: &ControllerTrace) -> Vec<f64> {
-    let (rates, _) = arrival_axes(controller);
-    let mut log_mass = [0.0_f64; ARRIVAL_CELL_COUNT];
-    gamma_mass(controller.arrival_prior(), &rates, &mut log_mass).to_vec()
-}
-
-fn arrival_axes(controller: &ControllerTrace) -> (Vec<f64>, Vec<f64>) {
-    let maximum = arrival_maximum(controller).max(1.0_f64);
-    let minimum = maximum / 1_048_576.0_f64;
-    let log_minimum = minimum.log2();
-    let log_width = (maximum.log2() - log_minimum) / f64::from(ARRIVAL_CELL_COUNT as u32);
-    let rates = (0..ARRIVAL_CELL_COUNT)
-        .map(|index| 2.0_f64.powf(log_minimum + (f64::from(index as u32) + 0.5_f64) * log_width))
-        .collect::<Vec<_>>();
-    let values = rates.iter().map(|rate| rate.log2()).collect();
-    (rates, values)
-}
-
-fn gamma_mass(
-    posterior: prosody_scale_core::ArrivalPosterior,
-    values: &[f64],
-    log_mass: &mut [f64; ARRIVAL_CELL_COUNT],
-) -> [f64; ARRIVAL_CELL_COUNT] {
-    for (cell, &value) in values.iter().enumerate() {
-        // Equal log-rate cells need the rate Jacobian.
-        log_mass[cell] = posterior.shape * value.ln() - posterior.rate * value;
-    }
-    let maximum_log_mass = log_mass.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let mut mass = log_mass.map(|value| (value - maximum_log_mass).exp());
-    let total = mass.iter().sum::<f64>();
-    for probability in &mut mass {
-        *probability /= total;
-    }
-    mass
+    controller.arrival_prior().to_vec()
 }
 
 fn select_snapshots(panel: &PosteriorPanel) -> SnapshotSelection<'_> {
@@ -506,22 +470,6 @@ fn quantiles(values: &[f64], mass: &[f64]) -> [f64; 3] {
         }
     }
     result
-}
-
-fn arrival_maximum(controller: &ControllerTrace) -> f64 {
-    let mut maximum = gamma_upper(controller.arrival_prior());
-    for index in 0..controller.len() {
-        if let Some(posterior) = controller.arrival_posterior(index) {
-            maximum = maximum.max(gamma_upper(posterior));
-        }
-    }
-    maximum
-}
-
-fn gamma_upper(posterior: prosody_scale_core::ArrivalPosterior) -> f64 {
-    let mean = posterior.shape / posterior.rate;
-    let standard_deviation = posterior.shape.sqrt() / posterior.rate;
-    mean + 4.0_f64 * standard_deviation
 }
 
 fn posterior_color(probability: f64) -> RGBColor {

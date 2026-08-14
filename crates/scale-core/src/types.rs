@@ -3,8 +3,8 @@ use std::{num::NonZeroU32, time::Duration};
 use thiserror::Error;
 
 use crate::{
-    ArrivalEvidence, LaunchEvidence, LaunchEvidenceError, ReadinessLump, RebalanceEvidence,
-    ResourceWindow, TransitionDirection,
+    ArrivalEvidence, ArrivalPrior, LaunchEvidence, LaunchEvidenceError, ReadinessLump,
+    RebalanceEvidence, ResourceWindow, TransitionDirection,
 };
 
 pub(crate) const POSTERIOR_SAMPLES_PER_CAPACITY_CLASS_MIN: u32 = 2;
@@ -138,15 +138,6 @@ pub enum PosteriorQuery {
         /// Absolute replica-count change.
         replica_delta: u32,
     },
-}
-
-/// Exact Gamma posterior parameters for the arrival rate.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ArrivalPosterior {
-    /// Gamma shape parameter.
-    pub shape: f64,
-    /// Gamma rate parameter in seconds.
-    pub rate: f64,
 }
 
 /// Stable identity for one frozen calendar artifact.
@@ -549,7 +540,7 @@ pub struct Configuration {
     /// Maximum failure-service fraction while normal work waits.
     pub failure_service_weight: f64,
     /// Prior for live arrival-rate segments.
-    pub arrival_prior: crate::ArrivalPrior,
+    pub arrival_prior: ArrivalPrior,
     /// Prior rate for physical capacity-curve changes.
     pub capacity_change_rate_per_second: f64,
     /// Population prior for class-specific retry probabilities.
@@ -636,6 +627,14 @@ impl Configuration {
             || self.capacity_change_rate_per_second <= 0.0_f64
         {
             return Err(ConfigurationError::InvalidCapacityChangeRate);
+        }
+        let span_support_seconds = self.launch_time_prior.coverage_support_seconds().1
+            + self.rebalance_time_prior.coverage_support_seconds().1;
+        let required_seconds = Duration::from_micros(self.report_interval_micros).as_secs_f64()
+            + 2.0_f64 * span_support_seconds
+            + Duration::from_micros(self.objective.budget_micros()).as_secs_f64();
+        if !required_seconds.is_finite() || required_seconds > ArrivalPrior::MAXIMUM_PATH_SECONDS {
+            return Err(ConfigurationError::PlanningHorizonDomain);
         }
         Ok(())
     }
@@ -1369,6 +1368,9 @@ pub struct ObservationBuffer {
     rebalance: Option<RebalanceEvidence>,
     current_replicas: Option<u32>,
     actuation_commitments: ActuationCommitments,
+    model_time: ModelTime,
+    deadline_offset_max_micros: u64,
+    budget_micros: u64,
 }
 
 impl ObservationBuffer {
@@ -1403,6 +1405,9 @@ impl ObservationBuffer {
                 .ok_or(ConfigurationError::PlatformLimit)?,
         )
         .map_err(|_| ConfigurationError::PlatformLimit)?;
+        let deadline_offset_max_micros = ArrivalPrior::MAXIMUM_PATH_MICROS
+            .checked_sub(configuration.objective.budget_micros())
+            .ok_or(ConfigurationError::PlanningHorizonDomain)?;
         Ok(Self {
             partition_count: configuration.partition_count,
             replica_count_max: configuration.replica_count_max,
@@ -1432,7 +1437,23 @@ impl ObservationBuffer {
             rebalance: None,
             current_replicas: None,
             actuation_commitments: ActuationCommitments::new(replica_count_max),
+            model_time: ModelTime::from_micros(0),
+            deadline_offset_max_micros,
+            budget_micros: configuration.objective.budget_micros(),
         })
+    }
+
+    /// Advances the time used to validate future deadlines.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when time decreases.
+    pub fn advance_model_time(&mut self, model_time: ModelTime) -> Result<(), ObservationError> {
+        if model_time < self.model_time {
+            return Err(ObservationError::ModelTime);
+        }
+        self.model_time = model_time;
+        Ok(())
     }
 
     /// Clears values without releasing capacity.
@@ -1465,6 +1486,9 @@ impl ObservationBuffer {
     /// Returns an error for invalid work or a full cohort buffer.
     pub fn push_cohort(&mut self, cohort: Cohort) -> Result<(), ObservationError> {
         cohort.validate()?;
+        if cohort.deadline_micros > self.deadline_max_micros() {
+            return Err(ObservationError::DeadlineHorizon);
+        }
         if cohort.partition >= self.partition_count {
             return Err(ObservationError::PartitionIndex);
         }
@@ -1566,6 +1590,15 @@ impl ObservationBuffer {
         {
             return Err(ObservationError::ScheduledReleaseOrder);
         }
+        let deadline_max_micros = self.deadline_max_micros();
+        if releases.iter().any(|release| {
+            release
+                .release_micros
+                .checked_add(self.budget_micros)
+                .is_none_or(|deadline| deadline > deadline_max_micros)
+        }) {
+            return Err(ObservationError::DeadlineHorizon);
+        }
         self.scheduled_releases.clear();
         for &release in releases {
             if let Some(previous) = self.scheduled_releases.last_mut()
@@ -1580,6 +1613,12 @@ impl ObservationBuffer {
             }
         }
         Ok(())
+    }
+
+    fn deadline_max_micros(&self) -> u64 {
+        self.model_time
+            .as_micros()
+            .saturating_add(self.deadline_offset_max_micros)
     }
 
     /// Sets one complete partition arrival vector and its exposure.
@@ -2042,11 +2081,20 @@ pub enum ConfigurationError {
     /// Calendar input exceeds the bounded arrival-path representation.
     #[error("calendar segment capacity exceeds arrival path capacity")]
     CalendarPathCapacity,
+    /// The report, response, and budget exceed the arrival path domain.
+    #[error("the planning horizon exceeds the validated arrival path domain")]
+    PlanningHorizonDomain,
 }
 
 /// Invalid observation input.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum ObservationError {
+    /// Model time decreased between observation updates.
+    #[error("observation model time must not decrease")]
+    ModelTime,
+    /// A work deadline exceeds the validated arrival path domain.
+    #[error("a work deadline exceeds the validated arrival path domain")]
+    DeadlineHorizon,
     /// Resource concurrency exceeds the configured plant maximum.
     #[error("resource concurrency exceeds the configured maximum")]
     ResourceConcurrency,
