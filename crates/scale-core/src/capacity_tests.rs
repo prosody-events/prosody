@@ -5,12 +5,13 @@ use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
 use super::{
-    CapacityGrid, CapacityGridError, CapacityModelError, CompletionScratch, DeathBand,
-    ResourceWindow, ResourceWindowError, RetainedHistory, StartWindow, binomial_log_probability,
-    capacity_model_artifact, completion_expectation, completion_log_likelihood,
-    completion_marginal_probability, contamination_prior, feasibility_probability, fold_trace,
-    hazard_prior, log_contamination_mixture, log_normal_axis_masses, log_weighted_sum,
-    path_log_score, pure_death_step, record_start_window,
+    CapacityGrid, CapacityGridError, CapacityModelError, CompletionScratch, DeathBand, ErrorLedger,
+    PATH_SOLVER_PROBABILITY_ERROR_MAX, ResourceWindow, ResourceWindowError, RetainedHistory,
+    StartWindow, binomial_log_probability, capacity_model_artifact, completion_expectation,
+    completion_log_likelihood, completion_marginal_probability, contamination_prior,
+    feasibility_probability, feasibility_probability_and_charge, fold_trace, hazard_prior,
+    log_contamination_mixture, log_normal_axis_masses, log_weighted_sum, path_log_score,
+    pure_death_step, record_start_window, uniformized_death_step,
 };
 use crate::types::occupancy_trace_for_test;
 use crate::{ArrivalPrior, OccupancyTraceEvidence};
@@ -702,6 +703,104 @@ fn equal_and_mixed_rate_death_bands_match_the_erlang_limit() -> Result<(), TestE
     assert!((probabilities[2] - expected).abs() <= fallback_tolerance);
     assert!((probabilities[1] - expected * 0.5_f64).abs() <= fallback_tolerance);
     assert!((probabilities.iter().sum::<f64>() - 1.0_f64).abs() <= fallback_tolerance);
+    Ok(())
+}
+
+#[test]
+fn equal_rate_erlang_matches_uniformization_within_its_charge() -> Result<(), TestError> {
+    let rates = [0.0_f64, 2.0_f64, 2.0_f64, 2.0_f64];
+    let band = DeathBand {
+        low: 1,
+        high: 3,
+        exposure_seconds: 0.75_f64,
+    };
+    let mut erlang = [0.0_f64, 0.2_f64, 0.3_f64, 0.5_f64];
+    let mut uniform = erlang;
+    let mut erlang_coefficients = [0.0_f64; 4];
+    let mut erlang_work = [0.0_f64; 4];
+    let mut uniform_current = [0.0_f64; 4];
+    let mut uniform_next = [0.0_f64; 4];
+    let mut ledger = ErrorLedger::new(1).ok_or(CapacityModelError::StorageBound)?;
+    pure_death_step(
+        &CapacityGrid::new(&[0.5_f64], &[2.0_f64], &[0.0_f64])?,
+        0,
+        band,
+        &mut erlang,
+        &mut erlang_coefficients,
+        &mut erlang_work,
+    )
+    .ok_or(CapacityModelError::InvalidObservationContract)?;
+    uniformized_death_step(
+        &rates,
+        band,
+        &mut uniform,
+        &mut uniform_current,
+        &mut uniform_next,
+        &mut ledger,
+    )
+    .ok_or(CapacityModelError::InvalidObservationContract)?;
+    assert!(
+        erlang
+            .iter()
+            .zip(uniform)
+            .map(|(left, right)| (left - right).abs())
+            .sum::<f64>()
+            <= ledger.charged + 512.0_f64 * f64::EPSILON
+    );
+    Ok(())
+}
+
+#[test]
+fn multi_group_window_charges_at_most_the_path_budget() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.5_f64], &[1.5_f64], &[1.0_f64])?;
+    let rates: [f64; 9] = array::from_fn(|state| super::state_rate(&grid, 0, state));
+    let window = ResourceWindow::new_with_starts(2.4_f64, 1.2_f64, 0, 6)?;
+    let offsets = [300_000_u64, 700_000, 1_000_000];
+    let completed = [0_u32; 3];
+    let started = [2_u32; 3];
+    let evidence =
+        occupancy_trace_for_test(window, 2, 8, 2_400_000, &offsets, &completed, &started);
+    let mut probabilities = [0.0_f64; 9];
+    let mut coefficients = [0.0_f64; 9];
+    let mut work = [0.0_f64; 9];
+    let (_, charged) = feasibility_probability_and_charge(
+        &rates,
+        evidence,
+        &mut probabilities,
+        &mut coefficients,
+        &mut work,
+    )
+    .ok_or(CapacityModelError::InvalidObservationContract)?;
+    assert!(charged <= PATH_SOLVER_PROBABILITY_ERROR_MAX);
+    Ok(())
+}
+
+#[test]
+fn band_contraction_matches_the_finite_grid_oracle_within_its_charge() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.05_f64], &[100.0_f64], &[0.0_f64])?;
+    let rates = array::from_fn(|state| super::state_rate(&grid, 0, state));
+    let offsets = [1_000_000_u64];
+    let started = [3_u32];
+    let completed = [0_u32];
+    let window = ResourceWindow::new_with_starts(3.0_f64, 1.0_f64, 0, 3)?;
+    let evidence =
+        occupancy_trace_for_test(window, 3, 6, 3_000_000, &offsets, &completed, &started);
+    let (oracle, _, operation_count) = oracle_forward(&rates, 3, &offsets, &started);
+    let mut probabilities = [0.0_f64; 4];
+    let mut coefficients = [0.0_f64; 4];
+    let mut work = [0.0_f64; 4];
+    let (actual, charged) = feasibility_probability_and_charge(
+        &rates,
+        evidence,
+        &mut probabilities,
+        &mut coefficients,
+        &mut work,
+    )
+    .ok_or(CapacityModelError::InvalidObservationContract)?;
+    let oracle_error =
+        Duration::from_micros(operation_count).as_secs_f64() * 64_000_000.0_f64 * f64::EPSILON;
+    assert!(charged > 0.0_f64);
+    assert!((actual - oracle).abs() <= charged + oracle_error);
     Ok(())
 }
 

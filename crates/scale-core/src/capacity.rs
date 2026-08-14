@@ -523,6 +523,39 @@ struct DeathBand {
 }
 
 #[derive(Clone, Copy)]
+struct ErrorLedger {
+    group_budget: f64,
+    charged: f64,
+}
+
+impl ErrorLedger {
+    /// Splits the path error across all solver groups in one cell-window.
+    ///
+    /// Each group receives `PATH_SOLVER_PROBABILITY_ERROR_MAX / group_count`.
+    /// A group divides its grant across its uniformization steps and
+    /// contraction.
+    fn new(group_count: usize) -> Option<Self> {
+        Self::with_budget(group_count, PATH_SOLVER_PROBABILITY_ERROR_MAX)
+    }
+
+    fn with_budget(group_count: usize, budget: f64) -> Option<Self> {
+        let count = u32::try_from(group_count).ok()?;
+        (count > 0).then_some(Self {
+            group_budget: budget / f64::from(count),
+            charged: 0.0_f64,
+        })
+    }
+
+    fn charge(&mut self, amount: f64) {
+        self.charged += amount;
+        debug_assert!(
+            self.charged <= PATH_SOLVER_PROBABILITY_ERROR_MAX,
+            "the path solver must not exceed its error budget"
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
 struct CapacityAllocation {
     cell_count: usize,
     state_count: usize,
@@ -560,6 +593,7 @@ pub(crate) struct CapacityFactor {
     state_exposure_seconds: Vec<f64>,
     state_completion_counts: Vec<u32>,
     forward_probabilities: Vec<f64>,
+    state_rates: Vec<f64>,
     forward_coefficients: Vec<f64>,
     forward_work: Vec<f64>,
     residual_counts: [u32; RESIDUAL_BIN_COUNT],
@@ -674,6 +708,7 @@ impl CapacityFactor {
             state_exposure_seconds: vec![0.0_f64; state_count],
             state_completion_counts: vec![0; state_count],
             forward_probabilities: vec![0.0_f64; state_count],
+            state_rates: vec![0.0_f64; state_count],
             forward_coefficients: vec![0.0_f64; state_count],
             forward_work: vec![0.0_f64; state_count],
             residual_counts: [0; RESIDUAL_BIN_COUNT],
@@ -804,9 +839,11 @@ impl CapacityFactor {
 
     /// Applies one certified occupancy-trace observation.
     ///
-    /// The update costs `O(G J C² + G F)`. `G` is the curve count, `J` is
-    /// the start-group count, `C` is the completion bound, and `F` is filter
-    /// count. An accepted window also enters the start-history ring that
+    /// The update costs `O(G (C + J (C N + D)) + G F)`. `G` is the curve count.
+    /// `J` is the start-group count. `C` is the state count. `N` is the
+    /// largest certified Poisson term count. `D` is the contracted death count.
+    /// `D` is zero when contraction cannot occur. `F` is the filter count.
+    /// An accepted window also enters the start-history ring that
     /// feeds [`Self::write_completion_posterior`].
     pub(crate) fn update(&mut self, evidence: OccupancyTraceEvidence<'_>) {
         let window = evidence.window();
@@ -825,15 +862,14 @@ impl CapacityFactor {
         );
         self.update_residual_check(evidence);
         for index in 0..self.likelihoods.len() {
-            let raw = path_log_score(
-                &self.grid,
-                index,
+            fill_state_rates(&self.grid, index, &mut self.state_rates);
+            let raw = path_log_score_with_rates(
+                &self.state_rates,
                 &self.state_exposure_seconds,
                 &self.state_completion_counts,
             );
-            let normalizer = feasibility_probability(
-                &self.grid,
-                index,
+            let normalizer = feasibility_probability_with_rates(
+                &self.state_rates,
                 evidence,
                 &mut self.forward_probabilities,
                 &mut self.forward_coefficients,
@@ -1299,7 +1335,7 @@ fn capacity_storage_bytes(
         .and_then(|count| count.checked_mul(size_of::<f64>()))
         .and_then(|bytes| {
             state_count
-                .checked_mul(4 * size_of::<f64>() + size_of::<u32>())
+                .checked_mul(5 * size_of::<f64>() + size_of::<u32>())
                 .and_then(|state_bytes| bytes.checked_add(state_bytes))
         })
         .and_then(|bytes| {
@@ -1565,6 +1601,12 @@ fn state_rate(grid: &CapacityGrid, index: usize, state: usize) -> f64 {
     )
 }
 
+fn fill_state_rates(grid: &CapacityGrid, index: usize, rates: &mut [f64]) {
+    for (state, rate) in rates.iter_mut().enumerate() {
+        *rate = state_rate(grid, index, state);
+    }
+}
+
 fn fold_trace(
     evidence: OccupancyTraceEvidence<'_>,
     exposure_seconds: &mut [f64],
@@ -1592,15 +1634,14 @@ fn fold_trace(
         Duration::from_micros(evidence.window().exposure_micros() - previous_offset).as_secs_f64();
 }
 
-fn path_log_score(
-    grid: &CapacityGrid,
-    index: usize,
+fn path_log_score_with_rates(
+    rates: &[f64],
     exposure_seconds: &[f64],
     completion_counts: &[u32],
 ) -> f64 {
     let mut score = 0.0_f64;
     for state in 1..exposure_seconds.len() {
-        let rate = state_rate(grid, index, state);
+        let rate = rates[state];
         score -= exposure_seconds[state] * rate;
         if completion_counts[state] > 0 {
             if rate <= 0.0_f64 {
@@ -1612,14 +1653,42 @@ fn path_log_score(
     score
 }
 
-fn feasibility_probability(
-    grid: &CapacityGrid,
-    index: usize,
+fn feasibility_probability_with_rates(
+    rates: &[f64],
     evidence: OccupancyTraceEvidence<'_>,
     probabilities: &mut [f64],
     coefficients: &mut [f64],
     work: &mut [f64],
 ) -> Option<f64> {
+    feasibility_probability_and_charge(rates, evidence, probabilities, coefficients, work)
+        .map(|(probability, _)| probability)
+}
+
+fn feasibility_probability_and_charge(
+    rates: &[f64],
+    evidence: OccupancyTraceEvidence<'_>,
+    probabilities: &mut [f64],
+    coefficients: &mut [f64],
+    work: &mut [f64],
+) -> Option<(f64, f64)> {
+    feasibility_probability_with_budget(
+        rates,
+        evidence,
+        probabilities,
+        coefficients,
+        work,
+        PATH_SOLVER_PROBABILITY_ERROR_MAX,
+    )
+}
+
+fn feasibility_probability_with_budget(
+    rates: &[f64],
+    evidence: OccupancyTraceEvidence<'_>,
+    probabilities: &mut [f64],
+    coefficients: &mut [f64],
+    work: &mut [f64],
+    budget: f64,
+) -> Option<(f64, f64)> {
     let c_max = probabilities.len() - 1;
     let total_starts = evidence.window().started_attempts()? as usize;
     let initial = evidence.initial_busy_slots() as usize;
@@ -1627,8 +1696,14 @@ fn feasibility_probability(
         .checked_add(total_starts)
         .is_some_and(|value| value <= c_max)
     {
-        return Some(1.0_f64);
+        return Some((1.0_f64, 0.0_f64));
     }
+    let group_count = evidence
+        .start_groups()
+        .iter()
+        .filter(|starts| **starts > 0)
+        .count();
+    let mut ledger = ErrorLedger::with_budget(group_count, budget)?;
     probabilities.fill(0.0_f64);
     probabilities[initial] = 1.0_f64;
     let mut safe_mass = 0.0_f64;
@@ -1649,9 +1724,8 @@ fn feasibility_probability(
             continue;
         }
         let band_mass = probabilities[low..=high].iter().sum::<f64>();
-        pure_death_step(
-            grid,
-            index,
+        let contraction_budget = pure_death_step_with_rates(
+            rates,
             DeathBand {
                 low,
                 high,
@@ -1660,8 +1734,20 @@ fn feasibility_probability(
             probabilities,
             coefficients,
             work,
+            &mut ledger,
         )?;
-        safe_mass += band_mass - probabilities[low..=high].iter().sum::<f64>();
+        safe_mass += (band_mass - probabilities[low..=high].iter().sum::<f64>()).max(0.0_f64);
+        high = contract_death_band(
+            rates,
+            DeathBand {
+                low,
+                high,
+                exposure_seconds: Duration::from_micros(offset - previous_offset).as_secs_f64(),
+            },
+            probabilities,
+            contraction_budget,
+            &mut ledger,
+        );
         let starts = starts as usize;
         for state in (low..=high).rev() {
             let shifted = state.saturating_add(starts);
@@ -1684,10 +1770,39 @@ fn feasibility_probability(
         }
         previous_offset = offset;
         if low > high {
-            return Some(safe_mass.min(1.0_f64));
+            return Some((safe_mass.min(1.0_f64), ledger.charged));
         }
     }
-    Some((safe_mass + probabilities[low..=high].iter().sum::<f64>()).clamp(0.0_f64, 1.0_f64))
+    Some((
+        (safe_mass + probabilities[low..=high].iter().sum::<f64>()).clamp(0.0_f64, 1.0_f64),
+        ledger.charged,
+    ))
+}
+
+#[cfg(test)]
+fn path_log_score(
+    grid: &CapacityGrid,
+    index: usize,
+    exposure_seconds: &[f64],
+    completion_counts: &[u32],
+) -> f64 {
+    let mut rates = vec![0.0_f64; exposure_seconds.len()];
+    fill_state_rates(grid, index, &mut rates);
+    path_log_score_with_rates(&rates, exposure_seconds, completion_counts)
+}
+
+#[cfg(test)]
+fn feasibility_probability(
+    grid: &CapacityGrid,
+    index: usize,
+    evidence: OccupancyTraceEvidence<'_>,
+    probabilities: &mut [f64],
+    coefficients: &mut [f64],
+    work: &mut [f64],
+) -> Option<f64> {
+    let mut rates = vec![0.0_f64; probabilities.len()];
+    fill_state_rates(grid, index, &mut rates);
+    feasibility_probability_with_rates(&rates, evidence, probabilities, coefficients, work)
 }
 
 #[cfg(test)]
@@ -1699,8 +1814,21 @@ fn completion_marginal_probability(
     coefficients: &mut [f64],
     work: &mut [f64],
 ) -> Option<f64> {
-    let normalizer =
-        feasibility_probability(grid, index, evidence, probabilities, coefficients, work)?;
+    let mut rates = vec![0.0_f64; probabilities.len()];
+    fill_state_rates(grid, index, &mut rates);
+    let rough_normalizer =
+        feasibility_probability_with_rates(&rates, evidence, probabilities, coefficients, work)?;
+    // The ratio uses two solver results. Give each result one quarter of the
+    // target times the denominator, so their combined ratio error stays bound.
+    let solver_budget = PATH_SOLVER_PROBABILITY_ERROR_MAX * rough_normalizer / 4.0_f64;
+    let (normalizer, _) = feasibility_probability_with_budget(
+        &rates,
+        evidence,
+        probabilities,
+        coefficients,
+        work,
+        solver_budget,
+    )?;
     if normalizer <= 0.0_f64 {
         return None;
     }
@@ -1710,6 +1838,13 @@ fn completion_marginal_probability(
     let mut high = evidence.initial_busy_slots() as usize;
     probabilities.fill(0.0_f64);
     probabilities[high] = 1.0_f64;
+    let group_count = evidence
+        .start_groups()
+        .iter()
+        .filter(|starts| **starts > 0)
+        .count()
+        + 1;
+    let mut ledger = ErrorLedger::with_budget(group_count, solver_budget)?;
     let mut previous_offset = 0_u64;
     for (&offset, &starts) in evidence
         .offsets_micros()
@@ -1719,9 +1854,8 @@ fn completion_marginal_probability(
         if starts == 0 {
             continue;
         }
-        pure_death_step(
-            grid,
-            index,
+        pure_death_step_with_rates(
+            &rates,
             DeathBand {
                 low,
                 high,
@@ -1730,6 +1864,7 @@ fn completion_marginal_probability(
             probabilities,
             coefficients,
             work,
+            &mut ledger,
         )?;
         let starts = starts as usize;
         for state in (low..=high).rev() {
@@ -1745,9 +1880,8 @@ fn completion_marginal_probability(
         probabilities[..low].fill(0.0_f64);
         previous_offset = offset;
     }
-    pure_death_step(
-        grid,
-        index,
+    pure_death_step_with_rates(
+        &rates,
         DeathBand {
             low: final_state,
             high,
@@ -1759,15 +1893,42 @@ fn completion_marginal_probability(
         probabilities,
         coefficients,
         work,
+        &mut ledger,
     )?;
     Some((probabilities[final_state] / normalizer).clamp(0.0_f64, 1.0_f64))
 }
 
-/// Evolves one reachable pure-death band without rate-dependent work.
+/// Evolves one reachable pure-death band with a certified Poisson term count.
 ///
-/// Distinct rates use the triangular closed form. Equal-rate bands use its
-/// Erlang limit. A mixed near-equal band uses uniformization. Its Poisson tail
-/// stops only after the artifact's omitted-probability bound holds.
+/// Equal-rate bands use the Erlang limit. All other bands use uniformization.
+fn pure_death_step_with_rates(
+    rates: &[f64],
+    band: DeathBand,
+    probabilities: &mut [f64],
+    coefficients: &mut [f64],
+    work: &mut [f64],
+    ledger: &mut ErrorLedger,
+) -> Option<f64> {
+    let DeathBand {
+        low,
+        high,
+        exposure_seconds,
+    } = band;
+    if exposure_seconds == 0.0_f64 || low > high {
+        return Some(ledger.group_budget);
+    }
+    let first_rate = rates[low];
+    let all_equal = rates[low..=high]
+        .iter()
+        .all(|rate| rate.to_bits() == first_rate.to_bits());
+    if all_equal {
+        equal_rate_death_step(first_rate, low, high, exposure_seconds, probabilities, work)?;
+        return Some(ledger.group_budget);
+    }
+    uniformized_death_step(rates, band, probabilities, coefficients, work, ledger)
+}
+
+#[cfg(test)]
 fn pure_death_step(
     grid: &CapacityGrid,
     index: usize,
@@ -1776,55 +1937,10 @@ fn pure_death_step(
     coefficients: &mut [f64],
     work: &mut [f64],
 ) -> Option<()> {
-    let DeathBand {
-        low,
-        high,
-        exposure_seconds,
-    } = band;
-    if exposure_seconds == 0.0_f64 || low > high {
-        return Some(());
-    }
-    let first_rate = state_rate(grid, index, low);
-    let mut all_equal = true;
-    let mut all_distinct = true;
-    for left in low..=high {
-        let left_rate = state_rate(grid, index, left);
-        all_equal &= left_rate.to_bits() == first_rate.to_bits();
-        for right in left + 1..=high {
-            let right_rate = state_rate(grid, index, right);
-            let separation = (left_rate - right_rate).abs();
-            let scale = left_rate.abs().max(right_rate.abs()).max(1.0_f64);
-            all_distinct &= separation > 64.0_f64 * f64::EPSILON * scale;
-        }
-    }
-    if all_equal {
-        return equal_rate_death_step(first_rate, low, high, exposure_seconds, probabilities, work);
-    }
-    if !all_distinct {
-        return uniformized_death_step(grid, index, band, probabilities, coefficients, work);
-    }
-    coefficients[low..=high].fill(0.0_f64);
-    for state in (low..=high).rev() {
-        if state == high {
-            coefficients[state] = probabilities[state];
-        } else {
-            let feed_rate = state_rate(grid, index, state + 1);
-            let current_rate = state_rate(grid, index, state);
-            let mut sum = 0.0_f64;
-            for (offset, coefficient) in coefficients[state + 1..=high].iter_mut().enumerate() {
-                let source = state + 1 + offset;
-                *coefficient *= feed_rate / (current_rate - state_rate(grid, index, source));
-                sum += *coefficient;
-            }
-            coefficients[state] = probabilities[state] - sum;
-        }
-        probabilities[state] = (state..=high)
-            .map(|source| {
-                coefficients[source] * (-state_rate(grid, index, source) * exposure_seconds).exp()
-            })
-            .sum::<f64>()
-            .max(0.0_f64);
-    }
+    let mut rates = vec![0.0_f64; probabilities.len()];
+    fill_state_rates(grid, index, &mut rates);
+    let mut ledger = ErrorLedger::new(1)?;
+    pure_death_step_with_rates(&rates, band, probabilities, coefficients, work, &mut ledger)?;
     Some(())
 }
 
@@ -1854,43 +1970,44 @@ fn equal_rate_death_step(
 }
 
 fn uniformized_death_step(
-    grid: &CapacityGrid,
-    index: usize,
+    rates: &[f64],
     band: DeathBand,
     probabilities: &mut [f64],
     current: &mut [f64],
     next: &mut [f64],
-) -> Option<()> {
+    ledger: &mut ErrorLedger,
+) -> Option<f64> {
     let DeathBand {
         low,
         high,
         exposure_seconds,
     } = band;
     let rate = (low..=high)
-        .map(|state| state_rate(grid, index, state))
+        .map(|state| rates[state])
         .fold(0.0_f64, f64::max);
     if rate == 0.0_f64 {
-        return Some(());
+        return Some(ledger.group_budget);
     }
-    let mean_limit = -PATH_SOLVER_PROBABILITY_ERROR_MAX.ln();
+    let mean_limit = -ledger.group_budget.ln();
     let step_count = (rate * exposure_seconds / mean_limit).ceil().max(1.0_f64) as u64;
     let step_count_f64 = Duration::from_secs(step_count).as_secs_f64();
     let step_seconds = exposure_seconds / step_count_f64;
-    let tail_bound = PATH_SOLVER_PROBABILITY_ERROR_MAX / step_count_f64;
+    let charge_count = step_count.checked_add(1)?;
+    let charge_count_f64 = Duration::from_secs(charge_count).as_secs_f64();
+    let tail_bound = ledger.group_budget / charge_count_f64;
     for _ in 0..step_count {
         current[low..=high].copy_from_slice(&probabilities[low..=high]);
         probabilities[low..=high].fill(0.0_f64);
         let mean = rate * step_seconds;
         let mut poisson = (-mean).exp();
-        let mut cumulative = poisson;
         for state in low..=high {
             probabilities[state] += poisson * current[state];
         }
         let mut term = 0_u32;
-        while 1.0_f64 - cumulative > tail_bound {
+        while poisson_upper_tail_bound(mean, term, poisson) > tail_bound {
             next[low..=high].fill(0.0_f64);
             for state in low..=high {
-                let death = state_rate(grid, index, state) / rate;
+                let death = rates[state] / rate;
                 next[state] += current[state] * (1.0_f64 - death);
                 if state > low {
                     next[state - 1] += current[state] * death;
@@ -1899,13 +2016,90 @@ fn uniformized_death_step(
             current[low..=high].copy_from_slice(&next[low..=high]);
             term = term.checked_add(1)?;
             poisson *= mean / f64::from(term);
-            cumulative += poisson;
             for state in low..=high {
                 probabilities[state] += poisson * current[state];
             }
         }
+        if current[low + 1..=high].iter().all(|mass| *mass == 0.0_f64) {
+            probabilities[low] += poisson_upper_tail(mean, term, poisson);
+        }
+        ledger.charge(tail_bound);
     }
-    Some(())
+    Some(tail_bound)
+}
+
+fn poisson_upper_tail(mean: f64, term: u32, probability: f64) -> f64 {
+    let mut term = term;
+    let mut probability = probability;
+    let mut tail = 0.0_f64;
+    loop {
+        let Some(next_term) = term.checked_add(1) else {
+            return tail;
+        };
+        probability *= mean / f64::from(next_term);
+        if probability == 0.0_f64 {
+            return tail;
+        }
+        tail += probability;
+        term = next_term;
+    }
+}
+
+fn poisson_upper_tail_bound(mean: f64, term: u32, probability: f64) -> f64 {
+    let next_term = term.saturating_add(1);
+    let next = probability * mean / f64::from(next_term);
+    let following = next_term.saturating_add(1);
+    if f64::from(following) <= mean {
+        return 1.0_f64;
+    }
+    next / (1.0_f64 - mean / f64::from(following))
+}
+
+/// Removes upper states only when their total mass has a charged bound.
+///
+/// Reaching `state` needs `high - state` deaths. The collapse curve is
+/// unimodal, so the minimum intermediate rate is at one of the two endpoints.
+/// The one-death bound at `high - 1` is the smallest candidate bound.
+/// Lower states use no larger minimum rate and require more deaths.
+fn contract_death_band(
+    rates: &[f64],
+    band: DeathBand,
+    probabilities: &mut [f64],
+    budget: f64,
+    ledger: &mut ErrorLedger,
+) -> usize {
+    let DeathBand {
+        low,
+        high,
+        exposure_seconds,
+    } = band;
+    if (-rates[high] * exposure_seconds).exp() > budget {
+        return high;
+    }
+    for state in low..high {
+        let rate = rates[state + 1].min(rates[high]);
+        let death_count = high - state;
+        if poisson_lower_tail(rate * exposure_seconds, death_count, budget) <= budget {
+            probabilities[state + 1..=high].fill(0.0_f64);
+            ledger.charge(budget);
+            return state;
+        }
+    }
+    high
+}
+
+fn poisson_lower_tail(mean: f64, term_count: usize, budget: f64) -> f64 {
+    let mut probability = (-mean).exp();
+    let mut sum = probability;
+    for term in 1..term_count {
+        if sum > budget {
+            return sum;
+        }
+        let term = u32::try_from(term).map_or(f64::INFINITY, f64::from);
+        probability *= mean / term;
+        sum += probability;
+    }
+    sum
 }
 
 fn completion_expectation(
