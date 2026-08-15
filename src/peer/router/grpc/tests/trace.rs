@@ -1,10 +1,10 @@
 //! The return leg reads as one nested client call.
 //!
 //! The assertion spans the real delivery. The sender opens
-//! `peer.response.send`, the client injects that span's context into the
+//! `request.response.send`, the client injects that span's context into the
 //! outbound metadata, and the listener extracts it in another task. Asserting
 //! the *immediate* parent is what makes it falsifiable — dropping the injection
-//! re-parents `peer.response.receive`, and "it is not a root span" would not
+//! re-parents `request.response.receive`, and "it is not a root span" would not
 //! notice.
 
 use super::{ALPHA, Harness, header, reaching, register};
@@ -22,25 +22,26 @@ use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// The span the sender opens for one outbound response.
-const SENT: &str = "peer.response.send";
+const SENT: &str = "request.response.send";
 
 /// The span the listener opens for the response it receives.
-const RECEIVED: &str = "peer.response.receive";
+const RECEIVED: &str = "request.response.receive";
 
 /// The response body this suite sends.
 const PAYLOAD: &[u8] = b"traced";
 
 /// The attribute naming what became of the response.
-const DISPOSITION: &str = "peer.disposition";
+const DISPOSITION: &str = "request.disposition";
 
 /// The attribute naming the endpoint that answered.
-const ENDPOINT_KIND: &str = "peer.endpoint.kind";
+const ENDPOINT_KIND: &str = "request.endpoint.kind";
 
 /// One response delivered through the whole send path lands in the caller's
-/// trace, with `peer.response.receive` directly under `peer.response.send`, the
-/// send span is a client call rather than a consumer continuation, and that
-/// span says what became of the response and which endpoint answered. A
-/// refused delivery marks both transport spans as OpenTelemetry errors.
+/// trace, with `request.response.receive` directly under
+/// `request.response.send`, the send span is a client call rather than a
+/// consumer continuation, and that span says what became of the response and
+/// which endpoint answered. A refused delivery marks both transport spans as
+/// OpenTelemetry errors.
 #[test]
 fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
     let spans = GlobalSpans::install()?;
@@ -100,9 +101,9 @@ fn the_return_leg_nests_under_the_call_that_asked_for_it() -> Result<()> {
         ensure_rpc_attributes(received)?;
         ensure_server_attributes(sent, &harness.address)?;
         for (key, expected) in [
-            ("peer.request", request.id().to_string()),
-            ("peer.subsystem", ALPHA.to_owned()),
-            ("peer.target", harness.peer.to_string()),
+            ("request.id", request.id().to_string()),
+            ("subsystem", ALPHA.to_owned()),
+            ("request.target", harness.peer.to_string()),
             (DISPOSITION, "accepted".to_owned()),
         ] {
             let value = span_attribute(received, key)?;

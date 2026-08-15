@@ -165,7 +165,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             messaging.message.conversation_id = Empty,
             topic = topic.as_ref(),
             key = %key,
-            response.peer = %self.peer,
+            requester.id = %self.peer,
             request.id = Empty,
             request.outcome = Empty,
             request.latency_ms = Empty,

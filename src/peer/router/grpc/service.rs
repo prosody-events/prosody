@@ -67,18 +67,18 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
         // goes through this owned handle, because a level-disabled span never
         // becomes current.
         let span = debug_span!(
-            "peer.response.receive",
+            "request.response.receive",
             otel.kind = "server",
             rpc.system.name = "grpc",
             rpc.method = METHOD,
             rpc.response.status_code = Empty,
             error.type = Empty,
-            peer.request = Empty,
-            peer.subsystem = Empty,
-            peer.target = Empty,
-            peer.relay = Empty,
-            peer.disposition = Empty,
-            peer.deadline_ms = Empty,
+            request.id = Empty,
+            subsystem = Empty,
+            request.target = Empty,
+            request.relay = Empty,
+            request.disposition = Empty,
+            request.deadline_ms = Empty,
         );
         // A caller that sent no propagation headers, or broken ones, still gets
         // its response delivered: the span is simply unparented.
@@ -98,7 +98,7 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
             .saturating_duration_since(Instant::now())
             .as_millis();
         span.record(
-            "peer.deadline_ms",
+            "request.deadline_ms",
             i64::try_from(remaining_ms).unwrap_or(i64::MAX),
         );
         let frame: ResponseFrame = request.into_inner().try_into().map_err(|error| {
@@ -107,12 +107,12 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
             refusal(&error)
         })?;
         async {
-            span.record("peer.request", display(frame.header.request));
-            span.record("peer.subsystem", display(&frame.header.subsystem));
+            span.record("request.id", display(frame.header.request));
+            span.record("subsystem", display(&frame.header.subsystem));
             let target = frame.header.target;
-            span.record("peer.target", display(target));
+            span.record("request.target", display(target));
             if let Some(relay) = frame.header.relay {
-                span.record("peer.relay", display(relay));
+                span.record("request.relay", display(relay));
             }
             let routing = routing(self.local.peer, target, frame.header.relay);
             match routing {
@@ -123,13 +123,13 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
                     // relay id the caller supplied cannot survive the hop.
                     let forwarded = Forwarded::new(frame, self.local.peer);
                     let forward = debug_span!(
-                        "peer.response.forward",
+                        "request.response.forward",
                         otel.kind = "client",
                         rpc.system.name = "grpc",
                         rpc.method = METHOD,
                         rpc.response.status_code = Empty,
                         error.type = Empty,
-                        peer.target = %target,
+                        request.target = %target,
                     );
                     let forward_context = context_with_parent(&forward, context.clone());
                     // Awaited rather than spawned, so this answer covers the
@@ -144,7 +144,10 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
                         Ok(()) => {
                             record_status(&forward, Code::Ok);
                             record_status(&span, Code::Ok);
-                            span.record("peer.disposition", ResponseDisposition::Accepted.label());
+                            span.record(
+                                "request.disposition",
+                                ResponseDisposition::Accepted.label(),
+                            );
                             Ok(Response::new(()))
                         }
                         Err(RelayFailure::DeadlineExceeded) => {
@@ -164,7 +167,7 @@ impl<R: RelayHop> PeerServiceApi for PeerService<R> {
                             record_status(&forward, code);
                             forward.in_scope(|| error!(error = %code.description()));
                             record_status(&span, code);
-                            span.record("peer.disposition", "target_error");
+                            span.record("request.disposition", "target_error");
                             span.in_scope(|| error!(error = %code.description()));
                             Err(service_status(code, code.description()))
                         }
@@ -187,7 +190,7 @@ fn answer(
     metrics: &PeerMetrics,
     disposition: ResponseDisposition,
 ) -> Result<Response<()>, Status> {
-    span.record("peer.disposition", disposition.label());
+    span.record("request.disposition", disposition.label());
     disposition.record(metrics);
     record_status(span, disposition.status());
     match disposition {
