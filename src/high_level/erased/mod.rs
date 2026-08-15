@@ -89,6 +89,14 @@ where
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
     ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>>;
+    async fn request_excise(
+        &self,
+        headers: Vec<(String, String)>,
+        topic: Topic,
+        key: String,
+        subsystems: Vec<SubsystemName>,
+        timeout: Duration,
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>>;
     async fn subscribe(&self, handler: T)
     -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
     async fn unsubscribe(&self) -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
@@ -218,6 +226,28 @@ where
         };
         client
             .request(headers, topic, key, payload, subsystems, timeout)
+            .await
+    }
+
+    /// Sends one excise request and returns one result per subsystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request is invalid or cannot start.
+    pub async fn request_excise(
+        &self,
+        headers: Vec<(String, String)>,
+        topic: Topic,
+        key: String,
+        subsystems: Vec<SubsystemName>,
+        timeout: Duration,
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>> {
+        let guard = self.client.read().await;
+        let Some(client) = guard.as_deref() else {
+            return Err(RequestError::ShuttingDown);
+        };
+        client
+            .request_excise(headers, topic, key, subsystems, timeout)
             .await
     }
 
@@ -438,6 +468,19 @@ where
     ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>> {
         self.0
             .request_owned(headers, topic, key, payload, subsystems, timeout)
+            .await
+    }
+
+    async fn request_excise(
+        &self,
+        headers: Vec<(String, String)>,
+        topic: Topic,
+        key: String,
+        subsystems: Vec<SubsystemName>,
+        timeout: Duration,
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>> {
+        self.0
+            .request_excise_owned(headers, topic, key, subsystems, timeout)
             .await
     }
 

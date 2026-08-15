@@ -209,6 +209,41 @@ async fn a_valid_call_registers_first_and_gives_its_record_back() -> Result<()> 
     Ok(())
 }
 
+/// An excise request uses the same registry lifecycle as a message request.
+#[tokio::test(start_paused = true)]
+async fn a_valid_excise_call_registers_and_cleans_up() -> Result<()> {
+    let registry = registry();
+    let requester = requester(Arc::clone(&registry))?;
+    let awaited = names(&["billing", "ledger"])?;
+    let mut call = pin!(requester.request_excise::<_, u32>(
+        empty(),
+        Topic::from("requests"),
+        "key",
+        &awaited,
+        TIMEOUT,
+    ));
+    assert!(
+        poll_once(call.as_mut()).await.is_pending(),
+        "the call must park until a response or its deadline"
+    );
+    assert_eq!(pending_len(&registry), awaited.len());
+
+    assert_eq!(
+        call.await?
+            .values()
+            .filter(|result| **result == Err(ResponseError::Timeout))
+            .count(),
+        awaited.len(),
+        "one unanswered result must come back per named subsystem"
+    );
+    assert_eq!(
+        pending_len(&registry),
+        0,
+        "the finished call kept its map record"
+    );
+    Ok(())
+}
+
 /// A call dropped before it finishes leaves no map record behind,
 /// because the record belongs to the call rather than to the future's progress.
 #[tokio::test(start_paused = true)]

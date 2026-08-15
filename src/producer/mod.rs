@@ -390,7 +390,17 @@ impl<C: Codec> ProsodyProducer<C> {
                 value: Some(value.as_bytes()),
             });
         }
-        self.send_record(owned, topic, key.into(), None).await
+        self.excise_owned(owned, topic, key).await
+    }
+
+    /// Sends an excise record with headers that the caller already owns.
+    pub(crate) async fn excise_owned(
+        &self,
+        headers: OwnedHeaders,
+        topic: Topic,
+        key: &str,
+    ) -> Result<(), ProducerError<C::Error>> {
+        self.send_record(headers, topic, key.into(), None).await
     }
 
     async fn send_record(

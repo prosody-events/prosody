@@ -5,6 +5,7 @@ pub(crate) mod registry;
 
 use self::collect::collect;
 use self::registry::PendingRegistry;
+use crate::consumer::Record;
 use crate::peer::response::RequestId;
 use crate::peer::response::headers::{
     ID_TEXT_LEN, RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER, RESPONSE_PEER_HEADER,
@@ -148,8 +149,47 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         R: Codec<Payload = V>,
     {
         let record_headers = request_headers(headers, subsystems.len())?;
-        self.request_prepared(record_headers, topic, key, payload, subsystems, timeout)
-            .await
+        self.request_prepared(
+            record_headers,
+            topic,
+            key,
+            Record::Message(payload),
+            subsystems,
+            timeout,
+        )
+        .await
+    }
+
+    /// Sends one excise request and waits for one answer per subsystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestError`] for invalid arguments, a produce failure, or
+    /// shutdown.
+    pub async fn request_excise<'a, H, V>(
+        &self,
+        headers: H,
+        topic: Topic,
+        key: &str,
+        subsystems: &[SubsystemName],
+        timeout: Duration,
+    ) -> Result<SubsystemOutcomes<V>, RequestError<C::Error>>
+    where
+        H: IntoIterator<Item = (&'a str, &'a str)> + Send,
+        H::IntoIter: ExactSizeIterator + Send,
+        C::Payload: EventIdentity,
+        R: Codec<Payload = V>,
+    {
+        let record_headers = request_headers(headers, subsystems.len())?;
+        self.request_prepared(
+            record_headers,
+            topic,
+            key,
+            Record::Excise,
+            subsystems,
+            timeout,
+        )
+        .await
     }
 
     #[instrument(
@@ -184,7 +224,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         mut record_headers: OwnedHeaders,
         topic: Topic,
         key: &str,
-        payload: C::Payload,
+        record: Record<C::Payload>,
         subsystems: &[SubsystemName],
         timeout: Duration,
     ) -> Result<SubsystemOutcomes<V>, RequestError<C::Error>>
@@ -223,12 +263,16 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         );
 
         let started = Instant::now();
-        let collected = collect::<R, _, _>(
-            registration,
-            subsystems,
-            self.producer
-                .send_owned(record_headers, topic, key, payload),
-        )
+        let collected = collect::<R, _, _>(registration, subsystems, async move {
+            match record {
+                Record::Message(payload) => {
+                    self.producer
+                        .send_owned(record_headers, topic, key, payload)
+                        .await
+                }
+                Record::Excise => self.producer.excise_owned(record_headers, topic, key).await,
+            }
+        })
         .await;
         // A request refused before this point sent nothing, so it has no
         // latency to report. Only a call that really waited records one.

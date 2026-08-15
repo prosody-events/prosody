@@ -206,6 +206,29 @@ where
             .await
     }
 
+    /// Sends one excise request and returns one result per subsystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestError`] for invalid arguments, a produce failure, or
+    /// shutdown.
+    pub async fn request_excise<'a, H>(
+        &self,
+        headers: H,
+        topic: Topic,
+        key: &str,
+        subsystems: &[SubsystemName],
+        timeout: Duration,
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>>
+    where
+        H: IntoIterator<Item = (&'a str, &'a str)> + Send,
+        H::IntoIter: ExactSizeIterator + Send,
+    {
+        self.requester
+            .request_excise(headers, topic, key, subsystems, timeout)
+            .await
+    }
+
     /// Sends one request from owned FFI values.
     pub(crate) async fn request_owned(
         &self,
@@ -223,6 +246,27 @@ where
             topic,
             &key,
             payload,
+            &subsystems,
+            timeout,
+        )
+        .await
+    }
+
+    /// Sends one excise request from owned FFI values.
+    pub(crate) async fn request_excise_owned(
+        &self,
+        headers: Vec<(String, String)>,
+        topic: Topic,
+        key: String,
+        subsystems: Vec<SubsystemName>,
+        timeout: Duration,
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>> {
+        self.request_excise(
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+            topic,
+            &key,
             &subsystems,
             timeout,
         )
