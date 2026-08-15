@@ -119,11 +119,10 @@ use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use async_stream::try_stream;
 use bytes::Bytes;
-use decode::{CellTtlRow, KeyedCellRow, KeyedCellTtlRow, RawCellRow, split_keyed_cell_ttl};
-use encoding::encode_payload;
+use decode::{BorrowedKeyedCellTtlRow, FramedKeyedCellRow, split_keyed_cell_ttl};
+use encoding::{EncodedPayload, encode_payload, select_encoding};
 use futures::{Stream, TryStreamExt, pin_mut};
 use scylla::client::session::Session;
-use scylla::deserialize::row::DeserializeRow;
 use scylla::serialize::SerializationError;
 use scylla::serialize::row::{RowSerializationContext, SerializeRow};
 use scylla::serialize::writers::RowWriter;
@@ -137,9 +136,6 @@ use tokio::task::coop::cooperative;
 
 pub use crate::state::cassandra::error::CassandraCellStoreError;
 pub use decode::CellCorruptReason;
-
-/// Payload encoding for cell blobs written by this build.
-const VALUE_ENCODING: Encoding = Encoding::RawZstdV1;
 
 /// Soft byte ceiling for one same-partition `UNLOGGED BATCH`.
 ///
@@ -247,8 +243,7 @@ impl CassandraCellResources {
     /// the `kind=Cell` row and projects [`Cell::project_committed`]. It
     /// never returns an in-flight provisional value and never runs
     /// owner-side repair: no `help_read_window`, no oracle. An absent row
-    /// reads `None`. It point-reads through [`fetch_cell_row`], shared with
-    /// the resolving [`CassandraStore`].
+    /// reads `None`. It decodes the borrowed row before it drops the response.
     ///
     /// # Errors
     ///
@@ -259,12 +254,12 @@ impl CassandraCellResources {
         id: &CollectionId,
         cell: &CellKey,
     ) -> Result<Option<Bytes>, CassandraCellStoreError> {
-        let Some(row) =
-            fetch_cell_row::<RawCellRow>(&self.session, &self.queries.read_cell, id, cell).await?
+        let Some(cell) =
+            fetch_and_decode_cell(&self.session, &self.queries.read_cell, id, cell).await?
         else {
             return Ok(None);
         };
-        Ok(decode::try_decode_cell(row)?.project_committed().cloned())
+        Ok(cell.project_committed().cloned())
     }
 
     /// The batch form of [`Self::read_committed`]. Reads one section's
@@ -289,13 +284,10 @@ impl CassandraCellResources {
             fetch_cells_batch(&self.session, &self.queries, id, section, &uniques).await?;
         let mut answers: CellBuffer<Option<Bytes>> = SmallVec::with_capacity(uniques.len());
         for &coordinate in &uniques {
-            let committed = match rows.iter().position(|(found, _)| found == coordinate) {
+            let committed = match rows.iter().position(|(found, ..)| found == coordinate) {
                 Some(pos) => {
-                    let (_, row) = rows.swap_remove(pos);
-                    decode::try_decode_cell_ttl(row)?
-                        .0
-                        .project_committed()
-                        .cloned()
+                    let (_, cell, _) = rows.swap_remove(pos);
+                    cell.project_committed().cloned()
                 }
                 None => None,
             };
@@ -461,31 +453,26 @@ impl<O> CassandraStore<O> {
         self.session.session()
     }
 
-    /// Point-reads one `kind=Cell` row with `statement`, generic over the
-    /// selected row shape — `read_cell` ([`RawCellRow`]) and `read_cell_ttl`
-    /// ([`CellTtlRow`]) share this one bind tuple.
-    async fn point_read<R>(
+    async fn point_read_cell(
         &self,
         statement: &PreparedStatement,
         id: &CollectionId,
         cell: &CellKey,
-    ) -> Result<Option<R>, CassandraCellStoreError>
-    where
-        R: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata>,
-    {
-        fetch_cell_row(&self.session, statement, id, cell).await
+    ) -> Result<Option<Cell>, CassandraCellStoreError> {
+        fetch_and_decode_cell(&self.session, statement, id, cell).await
     }
 
-    /// Reads a section's `uniques` coordinates in one `IN` query, returning the
-    /// matching rows **un-decoded**, each re-keyed to its clustering
-    /// `coordinate`. Absent coordinates simply do not appear. Semantic decode
-    /// is deliberately deferred to the caller, so each caller imposes its
-    /// own decode order and a corrupt row surfaces where that caller's
-    /// error rule demands:
-    /// [`get_many_for_cache`](CellStore::get_many_for_cache) decodes in
-    /// first-input-position order;
-    /// [`provisional_many`](CellStore::provisional_many) decodes in ascending /
-    /// lowest-coordinate order.
+    async fn point_read_cell_ttl(
+        &self,
+        statement: &PreparedStatement,
+        id: &CollectionId,
+        cell: &CellKey,
+    ) -> Result<Option<(Cell, Option<i32>)>, CassandraCellStoreError> {
+        fetch_and_decode_cell_ttl(&self.session, statement, id, cell).await
+    }
+
+    /// Reads and decodes a section's coordinates in one `IN` query.
+    /// The output follows `uniques` order and omits absent coordinates.
     ///
     /// `uniques` is caller-deduped and non-empty by [`CoordinateBatch`]
     /// construction, so the `IN` list has no repeats and is never empty; and
@@ -496,7 +483,7 @@ impl<O> CassandraStore<O> {
         id: &CollectionId,
         section: Section,
         uniques: &[&Coordinate],
-    ) -> Result<CellBuffer<(Coordinate, CellTtlRow)>, CassandraCellStoreError> {
+    ) -> Result<CellBuffer<(Coordinate, Cell, Option<i32>)>, CassandraCellStoreError> {
         fetch_cells_batch(&self.session, &self.queries, id, section, uniques).await
     }
 
@@ -607,7 +594,7 @@ where
         &self,
         collection: &CollectionRef,
         marker: &EventMarker,
-    ) -> Result<Bytes, CellStoreError<O::Error>> {
+    ) -> Result<MarkerBlob, CellStoreError<O::Error>> {
         if let Some(standing) = self.standing_marker(collection.id()).await?
             && standing.event() != marker.event()
         {
@@ -620,15 +607,18 @@ where
             .upsert_async(collection.id().clone(), marker.clone())
             .await;
         self.presence.set(collection.id()).await;
-        // The frozen payload rides the store-wide blob convention: the same
-        // zstd `encode_payload` and `encoding`/`version` stamps as every cell
-        // blob, decoded through `decode_blob`.
         let payload = encode_marker_payload(marker)
             .map_err(CassandraCellStoreError::from)
             .map_err(ResolveCellError::Store)?;
-        encode_payload(&payload, VALUE_ENCODING)
+        let encoding = select_encoding(payload.len());
+        let payload = encode_payload(&payload, encoding)
             .map_err(CassandraCellStoreError::from)
-            .map_err(ResolveCellError::Store)
+            .map_err(ResolveCellError::Store)?;
+        Ok(MarkerBlob {
+            payload,
+            encoding,
+            event: marker.event(),
+        })
     }
 
     /// The single resolving section scan, yielding each present cell's
@@ -747,7 +737,7 @@ where
         // resolved (foreign + clears), the pre-help row may hold a now-erased
         // value, so the point read is re-issued.
         let (row, standing) = futures::join!(
-            self.point_read::<CellTtlRow>(&self.queries.read_cell_ttl, collection, cell),
+            self.point_read_cell_ttl(&self.queries.read_cell_ttl, collection, cell),
             self.standing_marker(collection),
         );
         let mut row = row.map_err(ResolveCellError::Store)?;
@@ -762,16 +752,12 @@ where
         .map_err(flatten_resolve)?
         {
             row = self
-                .point_read::<CellTtlRow>(&self.queries.read_cell_ttl, collection, cell)
+                .point_read_cell_ttl(&self.queries.read_cell_ttl, collection, cell)
                 .await
                 .map_err(ResolveCellError::Store)?;
         }
         let (raw, ttl) = match row {
-            Some(row) => {
-                let (cell, ttl) =
-                    decode::try_decode_cell_ttl(row).map_err(ResolveCellError::Store)?;
-                (cell, ttl)
-            }
+            Some(decoded) => decoded,
             None => (Cell::Resolved(Committed::new(None)), None),
         };
         let committed = resolve_read(
@@ -839,23 +825,18 @@ where
                 .await
                 .map_err(ResolveCellError::Store)?;
         }
-        // Resolve the unique coordinates SEQUENTIALLY in first-occurrence input
-        // order — matching the sequential point-get oracle, so backend parity is
-        // provable. Semantic decode is deferred to here (not `batch_read`), so a
-        // corrupt row surfaces at its earliest input position, never in the
-        // clustering order the `IN` query returns. A coordinate with no row
-        // resolves as `Committed(None)`. `rows` is bounded by `CELL_BATCH`, so
-        // the linear scan is all-stack and O(CELL_BATCH²) at worst.
+        // Resolve coordinates in first-occurrence input order. This order
+        // matches the point-read oracle. An absent row resolves as `None`.
         let mut answers: CacheBatch = SmallVec::with_capacity(uniques.len());
         for &coordinate in &uniques {
             let cell = CellKey {
                 section,
                 coordinate: Coordinate::clone(coordinate),
             };
-            let (raw, ttl) = match rows.iter().position(|(found, _)| found == coordinate) {
+            let (raw, ttl) = match rows.iter().position(|(found, ..)| found == coordinate) {
                 Some(pos) => {
-                    let (_, row) = rows.swap_remove(pos);
-                    decode::try_decode_cell_ttl(row).map_err(ResolveCellError::Store)?
+                    let (_, cell, ttl) = rows.swap_remove(pos);
+                    (cell, ttl)
                 }
                 None => (Cell::Resolved(Committed::new(None)), None),
             };
@@ -939,13 +920,13 @@ where
             .cell_point_reads
             .fetch_add(1, Ordering::Relaxed);
         let Some(raw) = self
-            .point_read::<RawCellRow>(&self.queries.read_cell, collection, cell)
+            .point_read_cell(&self.queries.read_cell, collection, cell)
             .await
             .map_err(ResolveCellError::Store)?
         else {
             return Ok(None);
         };
-        match decode::try_decode_cell(raw).map_err(ResolveCellError::Store)? {
+        match raw {
             Cell::Provisional(provisional) => Ok(Some(provisional)),
             Cell::Resolved(_) => Ok(None),
         }
@@ -974,7 +955,7 @@ where
             .batch_read(collection, section, &uniques)
             .await
             .map_err(ResolveCellError::Store)?;
-        decode_provisional_batch(rows).map_err(ResolveCellError::Store)
+        Ok(decode_provisional_batch(rows))
     }
 
     async fn write_provisional<'a>(
@@ -997,9 +978,9 @@ where
             "every staged write must be listed by the event marker"
         );
         let pk = Pk::of(collection.id());
-        let marker_blob: Option<(Bytes, EventRef)> = match marker {
+        let marker_blob: Option<MarkerBlob> = match marker {
             None => None,
-            Some(marker) => Some((self.stage_marker(collection, marker).await?, marker.event())),
+            Some(marker) => Some(self.stage_marker(collection, marker).await?),
         };
 
         // Encode every cell's blobs up front (this Vec owns the `Bytes`); the
@@ -1029,15 +1010,16 @@ where
         // The marker unit leads; each cell unit is one row. `units` stays a
         // `Vec` (not a `CellBuffer`) — see the `run_batches` ruling.
         let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len() + 1);
-        if let Some((blob, event)) = &marker_blob {
+        if let Some(blob) = &marker_blob {
             units.push(BatchUnit::new(
-                blob.len() as u64 + PER_STATEMENT_OVERHEAD,
+                blob.payload.len() as u64 + PER_STATEMENT_OVERHEAD,
                 smallvec![CellBatchRow {
                     statement: marker_stmt,
                     row: RowShape::MarkerWrite(MarkerWriteRow {
                         ttl,
-                        payload: blob,
-                        event: *event,
+                        payload: &blob.payload,
+                        encoding: blob.encoding,
+                        event: blob.event,
                         addr: CellAddr::marker(pk),
                     }),
                 }],
@@ -1184,7 +1166,7 @@ where
             .fetch_add(1, Ordering::Relaxed);
         let pk = Pk::of(collection);
         let addr = CellAddr::marker(pk);
-        let row = self
+        let result = self
             .cql()
             .execute_unpaged(
                 &self.queries.marker_read,
@@ -1203,8 +1185,9 @@ where
             .map_err(into_store_err::<O::Error>)?
             .into_rows_result()
             .map_err(CassandraStoreError::from)
-            .map_err(into_store_err::<O::Error>)?
-            .maybe_first_row::<decode::MarkerRow>()
+            .map_err(into_store_err::<O::Error>)?;
+        let row = result
+            .maybe_first_row::<decode::BorrowedMarkerRow<'_>>()
             .map_err(CassandraStoreError::from)
             .map_err(into_store_err::<O::Error>)?;
         let marker = row
@@ -1317,10 +1300,16 @@ impl<'a> Pk<'a> {
 /// iff **either** blob is present — a clear-over-present stage carries a null
 /// `data` with a non-null `prev_data` and still needs an encoding to decode it.
 struct CellBlobs {
-    data: Option<Bytes>,
-    prev_data: Option<Bytes>,
+    data: Option<EncodedPayload>,
+    prev_data: Option<EncodedPayload>,
     encoding: Option<Encoding>,
     version: Option<i32>,
+}
+
+struct MarkerBlob {
+    payload: EncodedPayload,
+    encoding: Encoding,
+    event: EventRef,
 }
 
 /// The key + clustering columns addressing one cell in its partition: the four
@@ -1429,6 +1418,7 @@ struct ResolvedRow<'a> {
 struct MarkerWriteRow<'a> {
     ttl: Option<i32>,
     payload: &'a [u8],
+    encoding: Encoding,
     event: EventRef,
     addr: CellAddr<'a>,
 }
@@ -1598,7 +1588,7 @@ impl SerializeRow for MarkerWriteRow<'_> {
             Some(ttl) => (
                 ttl,
                 self.payload,
-                VALUE_ENCODING,
+                self.encoding,
                 INITIAL_VERSION,
                 self.event,
                 a.pk.segment_id,
@@ -1612,7 +1602,7 @@ impl SerializeRow for MarkerWriteRow<'_> {
                 .serialize(ctx, writer),
             None => (
                 self.payload,
-                VALUE_ENCODING,
+                self.encoding,
                 INITIAL_VERSION,
                 self.event,
                 a.pk.segment_id,
@@ -1852,23 +1842,14 @@ fn into_store_err<E: Error + 'static>(error: CassandraStoreError) -> CellStoreEr
     ResolveCellError::Store(CassandraCellStoreError::from(error))
 }
 
-/// Point-reads one `kind=Cell` row with `statement`, generic over the row shape
-/// selected. This is the single bind tuple shared by two callers: the resolving
-/// [`CassandraStore::point_read`], and
-/// [`CassandraCellResources::read_committed`] which reads without the oracle.
-/// Owner and reader thus address a cell identically. Both `read_cell`
-/// ([`RawCellRow`]) and `read_cell_ttl` ([`CellTtlRow`]) call it.
-async fn fetch_cell_row<R>(
+async fn fetch_and_decode_cell(
     session: &CassandraSession,
     statement: &PreparedStatement,
     id: &CollectionId,
     cell: &CellKey,
-) -> Result<Option<R>, CassandraCellStoreError>
-where
-    R: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata>,
-{
+) -> Result<Option<Cell>, CassandraCellStoreError> {
     let pk = Pk::of(id);
-    let row = session
+    let result = session
         .session()
         .execute_unpaged(
             statement,
@@ -1885,25 +1866,55 @@ where
         .await
         .map_err(CassandraStoreError::from)?
         .into_rows_result()
-        .map_err(CassandraStoreError::from)?
-        .maybe_first_row::<R>()
         .map_err(CassandraStoreError::from)?;
-    Ok(row)
+    result
+        .maybe_first_row::<decode::BorrowedRawCellRow<'_>>()
+        .map_err(CassandraStoreError::from)?
+        .map(decode::try_decode_cell)
+        .transpose()
 }
 
-/// Reads a section's `uniques` coordinates in one `IN` query, returning the
-/// matching rows **un-decoded**, each re-keyed to its clustering `coordinate`.
-/// This is the bind shared by the resolving [`CassandraStore::batch_read`] and
-/// by [`CassandraCellResources::read_committed_many`], which reads without the
-/// oracle. See [`CassandraStore::batch_read`] for why decode is deferred to the
-/// caller. `uniques` is caller-deduped, non-empty, and `CELL_BATCH`-bounded.
+async fn fetch_and_decode_cell_ttl(
+    session: &CassandraSession,
+    statement: &PreparedStatement,
+    id: &CollectionId,
+    cell: &CellKey,
+) -> Result<Option<(Cell, Option<i32>)>, CassandraCellStoreError> {
+    let pk = Pk::of(id);
+    let result = session
+        .session()
+        .execute_unpaged(
+            statement,
+            (
+                pk.segment_id,
+                pk.key,
+                pk.state_type,
+                pk.name,
+                CellKind::Cell,
+                i8::from(cell.section),
+                &cell.coordinate,
+            ),
+        )
+        .await
+        .map_err(CassandraStoreError::from)?
+        .into_rows_result()
+        .map_err(CassandraStoreError::from)?;
+    result
+        .maybe_first_row::<decode::BorrowedCellTtlRow<'_>>()
+        .map_err(CassandraStoreError::from)?
+        .map(decode::try_decode_cell_ttl)
+        .transpose()
+}
+
+/// Reads and decodes one bounded `IN` query in input resolution order.
+/// The result owns no reference to the Scylla response frame.
 async fn fetch_cells_batch(
     session: &CassandraSession,
     queries: &CellQueries,
     id: &CollectionId,
     section: Section,
     uniques: &[&Coordinate],
-) -> Result<CellBuffer<(Coordinate, CellTtlRow)>, CassandraCellStoreError> {
+) -> Result<CellBuffer<(Coordinate, Cell, Option<i32>)>, CassandraCellStoreError> {
     let pk = Pk::of(id);
     let result = session
         .session()
@@ -1925,24 +1936,42 @@ async fn fetch_cells_batch(
         .map_err(CassandraStoreError::from)?;
     // At most one row per unique coordinate, so size once at the IN-list upper
     // bound rather than growing an inline buffer up to `CELL_BATCH`.
-    let mut out: CellBuffer<(Coordinate, CellTtlRow)> = SmallVec::with_capacity(uniques.len());
+    let mut rows: CellBuffer<(Coordinate, decode::BorrowedCellTtlRow<'_>)> =
+        SmallVec::with_capacity(uniques.len());
     for row in result
-        .rows::<KeyedCellTtlRow>()
+        .rows::<BorrowedKeyedCellTtlRow<'_>>()
         .map_err(CassandraStoreError::from)?
     {
-        out.push(split_keyed_cell_ttl(
+        rows.push(split_keyed_cell_ttl(
             row.map_err(CassandraStoreError::from)?,
         ));
+    }
+
+    decode_batch_rows(rows, uniques)
+}
+
+fn decode_batch_rows(
+    mut rows: CellBuffer<(Coordinate, decode::BorrowedCellTtlRow<'_>)>,
+    uniques: &[&Coordinate],
+) -> Result<CellBuffer<(Coordinate, Cell, Option<i32>)>, CassandraCellStoreError> {
+    let mut out = CellBuffer::with_capacity(uniques.len());
+    for &coordinate in uniques {
+        let Some(pos) = rows.iter().position(|(found, _)| found == coordinate) else {
+            continue;
+        };
+        let (coordinate, row) = rows.swap_remove(pos);
+        let (cell, ttl) = decode::try_decode_cell_ttl(row)?;
+        out.push((coordinate, cell, ttl));
     }
     Ok(out)
 }
 
 /// The shared section-scan row pager. It opens the prepared statement for the
 /// scan bounds (the six-arm `(dir, start)` selection), builds the
-/// [`KeyedCellRow`] stream, and yields each decoded `(CellKey, Cell)` with the
-/// in-code `past_end` cutoff applied. It applies no limit and no resolution.
-/// The limit counts present cells after projection, so each consumer keeps it
-/// in its own loop. Two callers consume this. The owner scan
+/// [`FramedKeyedCellRow`] stream, and yields each decoded `(CellKey, Cell)`
+/// with the in-code `past_end` cutoff applied. It applies no limit and no
+/// resolution. The limit counts present cells after projection, so each
+/// consumer keeps it in its own loop. Two callers consume this. The owner scan
 /// ([`CassandraStore::scan_inner`]) then applies `peek_read`; the reader scan
 /// ([`CassandraCellResources::scan_committed`]) then applies
 /// `project_committed`. Sharing this pager keeps their physical paging from
@@ -1995,7 +2024,7 @@ fn page_cells<'a>(
         };
         let stream = pager
             .map_err(CassandraStoreError::from)?
-            .rows_stream::<KeyedCellRow>()
+            .rows_stream::<FramedKeyedCellRow>()
             .map_err(CassandraStoreError::from)?;
         pin_mut!(stream);
         while let Some(row) = cooperative(stream.try_next())
@@ -2032,17 +2061,24 @@ fn encode_cell_blobs(
     data: Option<&Bytes>,
     prev: Option<&Bytes>,
 ) -> Result<CellBlobs, CassandraCellStoreError> {
+    let payload_len = data
+        .into_iter()
+        .chain(prev)
+        .map(Bytes::len)
+        .max()
+        .unwrap_or(0);
+    let encoding = select_encoding(payload_len);
     let data = data
-        .map(|p| encode_payload(p, VALUE_ENCODING))
+        .map(|payload| encode_payload(payload, encoding))
         .transpose()?;
     let prev_data = prev
-        .map(|p| encode_payload(p, VALUE_ENCODING))
+        .map(|payload| encode_payload(payload, encoding))
         .transpose()?;
     let any = data.is_some() || prev_data.is_some();
     Ok(CellBlobs {
         data,
         prev_data,
-        encoding: any.then_some(VALUE_ENCODING),
+        encoding: any.then_some(encoding),
         version: any.then_some(INITIAL_VERSION),
     })
 }
@@ -2075,27 +2111,19 @@ fn ttl_seconds_to_duration(ttl: Option<i32>) -> Option<CompactDuration> {
     ttl.map(|s| CompactDuration::new(u32::try_from(s).unwrap_or(0)))
 }
 
-/// Decodes a raw provisional batch ([`CassandraStore::provisional_many`]):
-/// sorts the re-keyed rows into ASCENDING coordinate order, then keeps only the
-/// provisional survivors, dropping absent (never present) and already-resolved
-/// rows. Sorting before decoding surfaces a per-row decode failure at the
-/// **lowest** failing coordinate, independent of the order `IN` returned the
-/// rows — the batch-read error rule. TTL is discarded (raw recovery
-/// reconstruction co-expires no cache). Output sized once at the row-count
-/// upper bound; duplicate coordinates are impossible (the caller deduped the IN
-/// list and the primary key is unique), so the sort is unstable.
+/// Keeps provisional cells from a recovery batch and discards their TTLs.
+/// The input already follows ascending coordinate order.
 fn decode_provisional_batch(
-    mut rows: CellBuffer<(Coordinate, CellTtlRow)>,
-) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, CassandraCellStoreError> {
-    rows.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    rows: CellBuffer<(Coordinate, Cell, Option<i32>)>,
+) -> CellBuffer<(Coordinate, ProvisionalCell)> {
     let mut out: CellBuffer<(Coordinate, ProvisionalCell)> = SmallVec::with_capacity(rows.len());
-    for (coordinate, row) in rows {
-        match decode::try_decode_cell_ttl(row)?.0 {
+    for (coordinate, cell, _) in rows {
+        match cell {
             Cell::Provisional(provisional) => out.push((coordinate, provisional)),
             Cell::Resolved(_) => {}
         }
     }
-    Ok(out)
+    out
 }
 
 cassandra_queries! {

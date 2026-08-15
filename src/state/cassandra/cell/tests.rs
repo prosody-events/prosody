@@ -13,7 +13,7 @@
 
 use super::decode::try_decode_marker;
 use super::{
-    CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellKind, CellQueries, KeyRow,
+    CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellKind, CellQueries, KeyRow, MarkerBlob,
     MarkerWriteRow, ResolvedRow, RowShape, StageRow, encode_cell_blobs, fits_one_batch,
     marker_last_split,
 };
@@ -58,6 +58,37 @@ use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
+
+#[test]
+fn row_encoding_uses_the_larger_present_payload() -> Result<()> {
+    use super::encoding::{CASSANDRA_COMPRESSION_BLOCK_BYTES, Encoding};
+
+    let small = Bytes::from_static(b"small");
+    let large = Bytes::from(vec![0x5A; CASSANDRA_COMPRESSION_BLOCK_BYTES + 1]);
+    let blobs = encode_cell_blobs(Some(&small), Some(&large))?;
+    assert_eq!(blobs.encoding, Some(Encoding::RawZstdV1));
+    assert_eq!(
+        super::encoding::decode_payload(
+            blobs
+                .data
+                .as_deref()
+                .ok_or_else(|| eyre!("data must exist"))?,
+            Encoding::RawZstdV1,
+        )?,
+        small
+    );
+    assert_eq!(
+        super::encoding::decode_payload(
+            blobs
+                .prev_data
+                .as_deref()
+                .ok_or_else(|| eyre!("previous data must exist"))?,
+            Encoding::RawZstdV1,
+        )?,
+        large
+    );
+    Ok(())
+}
 
 /// [`ShapeProbe`] over the live cluster, read by raw CQL against the trace's
 /// own partition key only (the isolation rule):
@@ -791,10 +822,8 @@ async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
     Ok(())
 }
 
-/// The durable Cassandra `data` column stays zstd-compressed (`RawZstdV1`),
-/// unlike the fjall cache which stores raw and lets fjall block-compress on
-/// disk. Reads the column with a raw CQL `SELECT` so the store's transparent
-/// decompression cannot mask a regression to raw storage.
+/// Cassandra uses Zstd for a payload larger than its compression block.
+/// A raw CQL read proves that the store wrote the selected durable form.
 #[tokio::test]
 async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
     use super::encoding::{Encoding, decode_payload};
@@ -805,9 +834,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
     let store = fx.bottom_store(ScriptedOracle::default());
     let c = collection("cart")?;
     let cell = value_cell();
-    // A long, repetitive payload so the zstd frame is unmistakably smaller than
-    // the raw bytes — a regression to raw storage fails both assertions.
-    let payload = Bytes::from(vec![0xAB_u8; 4096]);
+    let payload = Bytes::from(vec![0xAB_u8; 16 * 1024 + 1]);
     store
         .write_resolved(&c, &[(cell, Some(payload.clone()))], &[])
         .await?;
@@ -1077,7 +1104,7 @@ fn mixed_binding_batch<'a>(
     id: &'a CollectionId,
     blob_a: &'a CellBlobs,
     blob_c: &'a CellBlobs,
-    marker_blob: &'a Bytes,
+    marker_blob: &'a MarkerBlob,
     cells: [&'a CellKey; 4],
 ) -> Vec<BatchUnit<CellBatchRow<'a>>> {
     use super::Pk;
@@ -1146,7 +1173,8 @@ fn mixed_binding_batch<'a>(
                 statement: &q.marker_write_no_ttl,
                 row: RowShape::MarkerWrite(MarkerWriteRow {
                     ttl: None,
-                    payload: marker_blob,
+                    payload: &marker_blob.payload,
+                    encoding: marker_blob.encoding,
                     event: event(2),
                     addr: CellAddr::marker(pk),
                 }),
@@ -1171,8 +1199,8 @@ fn mixed_binding_batch<'a>(
 /// batch — see [`mixed_binding_batch`]).
 #[tokio::test]
 async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Result<()> {
-    use super::encoding::encode_payload;
-    use super::{Pk, VALUE_ENCODING, marker_delete_unit};
+    use super::encoding::{encode_payload, select_encoding};
+    use super::{Pk, marker_delete_unit};
     use crate::state::cell_key::Coordinate;
     use crate::state::marker::encode_marker_payload;
 
@@ -1217,10 +1245,13 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         cell_a.clone(),
         ProvisionalWrite::new(Some(data_a.clone()), Committed::new(None), event(2)),
     )];
-    let marker_blob = encode_payload(
-        &encode_marker_payload(&EventMarker::frozen(event(2), &staged_a, &[]))?,
-        VALUE_ENCODING,
-    )?;
+    let marker_payload = encode_marker_payload(&EventMarker::frozen(event(2), &staged_a, &[]))?;
+    let marker_encoding = select_encoding(marker_payload.len());
+    let marker_blob = MarkerBlob {
+        payload: encode_payload(&marker_payload, marker_encoding)?,
+        encoding: marker_encoding,
+        event: event(2),
+    };
     // One batch, one flatten, five distinct statements interleaved.
     let units = mixed_binding_batch(
         &fx.queries,
@@ -1349,7 +1380,13 @@ fn prop_cassandra_cell_crash_equivalence() {
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
         };
-        run_crash_equivalence_trace(make, oracle.clone(), trace, &probe).await
+        Box::pin(run_crash_equivalence_trace(
+            make,
+            oracle.clone(),
+            trace,
+            &probe,
+        ))
+        .await
     }
 
     init_test_logging();
@@ -2101,14 +2138,13 @@ async fn batch_returns_post_clear_truth() -> Result<()> {
 /// Sort-necessity unit pin (no cluster): a SHUFFLED raw batch with two corrupt
 /// rows — low coord `0x01` = `PrevWithoutEvent`, high coord `0xFE` =
 /// `BlobWithoutEncoding`, pushed high-then-low — must surface the LOWEST
-/// coordinate's error after `decode_provisional_batch`'s ascending sort. This
-/// is the honest proof the Cassandra sort is load-bearing; a live test cannot
-/// show it because `IN` already returns ascending clustering order.
+/// coordinate's error after the borrowed batch follows input resolution order.
+/// A live test cannot prove this because `IN` returns clustering order.
 #[test]
-fn decode_provisional_batch_orders_by_coordinate() -> Result<()> {
+fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
     use super::CellCorruptReason;
-    use super::decode::CellTtlRow;
-    use super::decode_provisional_batch;
+    use super::decode::BorrowedCellTtlRow;
+    use super::decode_batch_rows;
     use super::encoding::{Encoding, encode_payload};
     use crate::state::cassandra::CassandraCellStoreError;
     use crate::state::store::CellBuffer;
@@ -2116,24 +2152,27 @@ fn decode_provisional_batch_orders_by_coordinate() -> Result<()> {
 
     let prev_blob = encode_payload(&bytes(0xAA), Encoding::RawZstdV1)?;
     // event = None throughout, so no RawEventRef construction is needed.
-    let high: CellTtlRow = (Some(vec![0xBB]), None, None, None, None, None, None);
-    let low: CellTtlRow = (
+    let high_bytes = [0xBB];
+    let high: BorrowedCellTtlRow<'_> = (Some(&high_bytes), None, None, None, None, None, None);
+    let low: BorrowedCellTtlRow<'_> = (
         None,
-        Some(prev_blob.to_vec()),
+        Some(prev_blob.as_ref()),
         Some(4_i16),
         Some(1_i32),
         None,
         None,
         None,
     );
-    let mut rows: CellBuffer<(Coordinate, CellTtlRow)> = SmallVec::new();
-    rows.push((Coordinate::from_bytes(vec![0xFE]), high));
-    rows.push((Coordinate::from_bytes(vec![0x01]), low));
-    match decode_provisional_batch(rows) {
+    let high_coordinate = Coordinate::from_bytes(vec![0xFE]);
+    let low_coordinate = Coordinate::from_bytes(vec![0x01]);
+    let mut rows: CellBuffer<(Coordinate, BorrowedCellTtlRow<'_>)> = SmallVec::new();
+    rows.push((high_coordinate.clone(), high));
+    rows.push((low_coordinate.clone(), low));
+    match decode_batch_rows(rows, &[&low_coordinate, &high_coordinate]) {
         Err(CassandraCellStoreError::CorruptCell(reason)) => assert_eq!(
             reason,
             CellCorruptReason::PrevWithoutEvent,
-            "the lowest coordinate's error is surfaced after the ascending sort"
+            "the first coordinate's error must surface first"
         ),
         other => return Err(eyre!("expected PrevWithoutEvent, got {other:?}")),
     }

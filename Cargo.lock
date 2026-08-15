@@ -40,6 +40,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloc_count"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59760639ddef8d1b9a7cb961f6f38bf7e52b0bd0bae4e7148db74bf1c12a6f59"
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2406,6 +2412,7 @@ version = "0.5.0"
 dependencies = [
  "ahash",
  "aho-corasick",
+ "alloc_count",
  "arc-swap",
  "async-stream",
  "async-trait",

@@ -1,30 +1,83 @@
 //! Payload-cell encoding for keyed-state collections.
 //!
-//! Value cells hold raw codec bytes and select an on-disk representation via
-//! [`Encoding`], which round-trips through `i16` so the durable
-//! Cassandra column maps cleanly onto it.
+//! New rows use raw bytes through 16 KiB and Zstd above that size. The reader
+//! supports both forms and all Zstd frames from earlier Prosody versions.
 
 use crate::error::{ClassifyError, ErrorCategory};
 use bytes::Bytes;
-use std::io;
+use std::cell::RefCell;
+use std::io::{self, Cursor, Read};
+use std::ops::Deref;
 use thiserror::Error;
-use zstd::stream::{decode_all, encode_all};
+use zstd::bulk::Compressor;
+use zstd::stream::read::Decoder;
+use zstd::zstd_safe::{self, DCtx};
 
 const ZSTD_LEVEL: i32 = 0;
+pub(super) const CASSANDRA_COMPRESSION_BLOCK_BYTES: usize = 16 * 1024;
 
-/// Encoding discriminator for Value payload cells.
+thread_local! {
+    static CODEC: RefCell<Option<Codec>> = const { RefCell::new(None) };
+}
+
+/// One thread owns this codec state. Its scratch never escapes a codec call.
+/// The scratch retains the largest decoded capacity that this thread saw.
+struct Codec {
+    compressor: Compressor<'static>,
+    decompressor: DCtx<'static>,
+    decode_scratch: Vec<u8>,
+}
+
+/// Encoded bytes for one Cassandra blob.
 ///
-/// Mapped to and from `i16` so durable storage can persist a small
-/// integer column without leaking the named enum representation.
-/// Discriminants `1`/`2` (the `MsgPack`-wrapped cell encodings) and `3`
-/// (uncompressed `RawV1`) are retired and never reused — a stale cell
-/// carrying one fails loudly as [`EncodingError::UnknownEncoding`]
-/// (Permanent).
+/// Raw values share the codec output. Zstd values own the compressor output.
+#[derive(Debug)]
+pub(super) enum EncodedPayload {
+    /// Shared raw codec output.
+    Raw(Bytes),
+    /// Owned Zstd frame.
+    Zstd(Vec<u8>),
+}
+
+impl AsRef<[u8]> for EncodedPayload {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl Deref for EncodedPayload {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Raw(bytes) => bytes,
+            Self::Zstd(bytes) => bytes,
+        }
+    }
+}
+
+impl Codec {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            compressor: Compressor::new(ZSTD_LEVEL)?,
+            decompressor: DCtx::try_create()
+                .ok_or_else(|| io::Error::other("Zstd decoder initialization failed"))?,
+            decode_scratch: Vec::new(),
+        })
+    }
+}
+
+/// Encoding discriminator for value payload cells.
+///
+/// Values 1 through 3 are retired. Readers must reject them as permanent
+/// durable-data errors.
 #[repr(i16)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(in crate::state::cassandra) enum Encoding {
-    /// Raw codec bytes compressed with zstd.
+    /// Raw codec bytes compressed with Zstd.
     RawZstdV1 = 4,
+    /// Raw codec bytes without application compression.
+    RawV2 = 5,
 }
 
 impl From<Encoding> for i16 {
@@ -39,57 +92,127 @@ impl TryFrom<i16> for Encoding {
     fn try_from(value: i16) -> Result<Self, Self::Error> {
         match value {
             4 => Ok(Self::RawZstdV1),
+            5 => Ok(Self::RawV2),
             _ => Err(EncodingError::UnknownEncoding(value)),
         }
     }
 }
 
-/// Encodes a raw payload cell with the requested encoding.
-///
-/// The cell bytes are opaque to this layer — whatever codec produced them
-/// (JSON, the Kafka-ref `MsgPack`) lives above the store.
-pub(in crate::state::cassandra) fn encode_payload(
-    payload: &Bytes,
-    encoding: Encoding,
-) -> Result<Bytes, EncodingError> {
-    match encoding {
-        Encoding::RawZstdV1 => compress(payload),
+/// Selects one durable encoding for all present blobs in a row.
+#[must_use]
+pub(super) fn select_encoding(payload_len: usize) -> Encoding {
+    if payload_len > CASSANDRA_COMPRESSION_BLOCK_BYTES {
+        Encoding::RawZstdV1
+    } else {
+        Encoding::RawV2
     }
 }
 
-/// Decodes payload-cell bytes encoded with `encoding`.
+/// Encodes raw codec bytes with the selected durable encoding.
+pub(in crate::state::cassandra) fn encode_payload(
+    payload: &Bytes,
+    encoding: Encoding,
+) -> Result<EncodedPayload, EncodingError> {
+    match encoding {
+        Encoding::RawZstdV1 => compress(payload),
+        Encoding::RawV2 => Ok(EncodedPayload::Raw(payload.clone())),
+    }
+}
+
+/// Decodes durable payload bytes into a compact owned value.
 pub(in crate::state::cassandra) fn decode_payload(
     bytes: &[u8],
     encoding: Encoding,
 ) -> Result<Bytes, EncodingError> {
     match encoding {
-        Encoding::RawZstdV1 => decompress(bytes).map(Bytes::from),
+        Encoding::RawZstdV1 => decompress(bytes),
+        Encoding::RawV2 => Ok(Bytes::copy_from_slice(bytes)),
     }
 }
 
-/// Compresses `raw` at [`ZSTD_LEVEL`], the single source of both the level
-/// and the [`EncodingError::BadZstd`] mapping for every encode path.
-fn compress(raw: &[u8]) -> Result<Bytes, EncodingError> {
-    encode_all(raw, ZSTD_LEVEL)
-        .map(Bytes::from)
-        .map_err(EncodingError::BadZstd)
+fn compress(raw: &[u8]) -> Result<EncodedPayload, EncodingError> {
+    CODEC.with(|slot| {
+        let mut codec = slot.borrow_mut();
+        if codec.is_none() {
+            *codec = Some(Codec::new().map_err(EncodingError::BadZstd)?);
+        }
+        let Some(codec) = codec.as_mut() else {
+            return Err(EncodingError::BadZstd(io::Error::other(
+                "Zstd codec initialization failed",
+            )));
+        };
+        let mut encoded = Vec::with_capacity(zstd_safe::compress_bound(raw.len()));
+        codec
+            .compressor
+            .compress_to_buffer(raw, &mut encoded)
+            .map_err(EncodingError::BadZstd)?;
+        Ok(EncodedPayload::Zstd(encoded))
+    })
 }
 
-/// Decompresses zstd `bytes`, the single source of the
-/// [`EncodingError::BadZstd`] mapping for every decode path.
-fn decompress(bytes: &[u8]) -> Result<Vec<u8>, EncodingError> {
-    decode_all(bytes).map_err(EncodingError::BadZstd)
+fn decompress(bytes: &[u8]) -> Result<Bytes, EncodingError> {
+    CODEC.with(|slot| {
+        let mut codec = slot.borrow_mut();
+        if codec.is_none() {
+            *codec = Some(Codec::new().map_err(EncodingError::BadZstd)?);
+        }
+        let Some(codec) = codec.as_mut() else {
+            return Err(EncodingError::BadZstd(io::Error::other(
+                "Zstd codec initialization failed",
+            )));
+        };
+
+        codec.decode_scratch.clear();
+        if codec.decode_scratch.capacity() > 0
+            && codec
+                .decompressor
+                .decompress(&mut codec.decode_scratch, bytes)
+                .is_ok()
+        {
+            return Ok(Bytes::copy_from_slice(&codec.decode_scratch));
+        }
+
+        codec.decode_scratch.clear();
+        let Codec {
+            decompressor,
+            decode_scratch,
+            ..
+        } = codec;
+        Decoder::with_context(Cursor::new(bytes), decompressor)
+            .read_to_end(decode_scratch)
+            .map_err(EncodingError::BadZstd)?;
+        Ok(Bytes::copy_from_slice(decode_scratch))
+    })
+}
+
+#[cfg(test)]
+pub(super) fn reset_codec() {
+    CODEC.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+pub(super) fn decode_scratch() -> (usize, usize) {
+    CODEC.with(|slot| {
+        slot.borrow().as_ref().map_or((0, 0), |codec| {
+            let capacity = codec.decode_scratch.capacity();
+            if capacity == 0 {
+                (0, 0)
+            } else {
+                (codec.decode_scratch.as_ptr() as usize, capacity)
+            }
+        })
+    })
 }
 
 /// Error returned by the encoding module.
 #[derive(Debug, Error)]
 pub enum EncodingError {
-    /// The durable column carried an unknown payload encoding.
+    /// The durable column has an unknown payload encoding.
     #[error("unknown payload encoding: {0}")]
     UnknownEncoding(i16),
 
-    /// zstd compression or decompression failed.
-    #[error("bad zstd: {0}")]
+    /// Zstd compression or decompression failed.
+    #[error("bad Zstd: {0}")]
     BadZstd(#[source] io::Error),
 }
 
