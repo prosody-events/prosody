@@ -158,9 +158,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Peer requests
 
 Peer requests let a producer ask named subsystems to process one Kafka event.
-The request returns the handler result for each subsystem in the requested
-order. Each result reports success, handler failure, malformed data, a codec
-mismatch, or a timeout.
+The request returns one outcome keyed by each subsystem name. Each outcome
+reports success, handler failure, malformed data, a codec mismatch, or a
+timeout.
 
 A client can send requests without a subscription. Set `PROSODY_SUBSYSTEM`, or
 set `KeyedStateConfiguration::subsystem`, to make a subscribed client answer
@@ -183,10 +183,10 @@ let results = client
     )
     .await?;
 
-for result in results {
+for (subsystem, result) in results {
     match result {
         Ok(response) => println!("{response}"),
-        Err(error) => eprintln!("response failed: {error}"),
+        Err(error) => eprintln!("{subsystem} failed: {error}"),
     }
 }
 ```

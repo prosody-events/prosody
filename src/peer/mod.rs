@@ -20,7 +20,7 @@ pub(crate) mod runtime;
 pub(crate) use backend::PeerBackend;
 
 pub use endpoint::{PeerEndpoint, PeerEndpointError};
-pub use requester::{ProsodyRequester, RequestError, ResponseError};
+pub use requester::{ProsodyRequester, RequestError, ResponseError, SubsystemOutcomes};
 pub use router::api::{GrpcRouter, LocalRouter, Router};
 pub use router::config::{
     PeerConfiguration, PeerConfigurationBuilder, PeerConfigurationBuilderError,

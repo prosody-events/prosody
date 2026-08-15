@@ -10,7 +10,7 @@ use crate::high_level::{
     CassandraHighLevelClient, ClientBackend, ClientHandler, ConsumerBuilders, HighLevelClient,
     HighLevelClientError, MemoryHighLevelClient, MessageCodec, MessageCodecError, Mode,
 };
-use crate::peer::requester::{RequestError, ResponseError};
+use crate::peer::requester::{RequestError, SubsystemOutcomes};
 use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder};
 use crate::state_reader::ConsumerReaderBackend;
 use crate::subsystem::SubsystemName;
@@ -82,7 +82,7 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<MessageCodecError<T>>>;
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>>;
     async fn subscribe(&self, handler: T)
     -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
     async fn unsubscribe(&self) -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
@@ -190,7 +190,7 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<MessageCodecError<T>>> {
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>> {
         let guard = self.client.read().await;
         let Some(client) = guard.as_deref() else {
             return Err(RequestError::ShuttingDown);
@@ -406,7 +406,7 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<MessageCodecError<T>>> {
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>> {
         self.0
             .request_owned(headers, topic, key, payload, subsystems, timeout)
             .await

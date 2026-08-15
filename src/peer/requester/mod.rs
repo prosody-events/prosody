@@ -5,7 +5,6 @@ pub(crate) mod registry;
 
 use self::collect::collect;
 use self::registry::PendingRegistry;
-use crate::error::{ClassifyError, ErrorCategory};
 use crate::peer::response::RequestId;
 use crate::peer::response::headers::{
     ID_TEXT_LEN, RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER, RESPONSE_PEER_HEADER,
@@ -20,6 +19,7 @@ use opentelemetry_semantic_conventions::attribute::{
     ERROR_TYPE, MESSAGING_MESSAGE_CONVERSATION_ID,
 };
 use rdkafka::message::{Header, OwnedHeaders};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::marker::PhantomData;
@@ -36,17 +36,18 @@ mod tests;
 /// Reserved headers that occur exactly once in every request.
 const RESERVED_SINGLETONS: usize = 3;
 
-/// Why one requested subsystem produced no successful response.
+/// One outcome for each requested subsystem.
 ///
-/// Handler errors keep their category. A timeout is transient. An invalid or
-/// incompatible response is permanent for that request.
+/// The keys are canonical subsystem names. The map contains one entry for
+/// every accepted subsystem, including an explicit timeout for no response.
+pub type SubsystemOutcomes<T> = HashMap<SubsystemName, Result<T, ResponseError>>;
+
+/// Why one requested subsystem produced no successful response.
 #[derive(Debug, Error, PartialEq)]
 pub enum ResponseError {
     /// The handler returned an error.
     #[error("handler failed: {message}")]
     Handler {
-        /// The handler's retry classification.
-        category: ErrorCategory,
         /// The handler's display text.
         message: String,
     },
@@ -61,20 +62,11 @@ pub enum ResponseError {
     Malformed,
 }
 
-impl ClassifyError for ResponseError {
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            Self::Handler { category, .. } => *category,
-            Self::Timeout => ErrorCategory::Transient,
-            Self::FormatMismatch | Self::Malformed => ErrorCategory::Permanent,
-        }
-    }
-}
-
 /// Why one complete request failed before it could return subsystem results.
 ///
-/// This enum has no [`ClassifyError`] impl on purpose. Nothing retries a
-/// request for the caller, so a classification would have no consumer.
+/// This enum has no [`crate::error::ClassifyError`] impl on purpose. Nothing
+/// retries a request for the caller, so a classification would have no
+/// consumer.
 #[derive(Debug, Error)]
 pub enum RequestError<E: Error> {
     /// The request named no subsystem.
@@ -103,7 +95,7 @@ pub enum RequestError<E: Error> {
     Produce(#[from] ProducerError<E>),
 }
 
-/// Sends requests and returns responses in subsystem order.
+/// Sends requests and returns one outcome per subsystem.
 pub struct ProsodyRequester<C: Codec, R: Codec> {
     producer: ProsodyProducer<C>,
     peer: PeerId,
@@ -148,7 +140,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         payload: C::Payload,
         subsystems: &[SubsystemName],
         timeout: Duration,
-    ) -> Result<Vec<Result<V, ResponseError>>, RequestError<C::Error>>
+    ) -> Result<SubsystemOutcomes<V>, RequestError<C::Error>>
     where
         H: IntoIterator<Item = (&'a str, &'a str)> + Send,
         H::IntoIter: ExactSizeIterator + Send,
@@ -195,7 +187,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         payload: C::Payload,
         subsystems: &[SubsystemName],
         timeout: Duration,
-    ) -> Result<Vec<Result<V, ResponseError>>, RequestError<C::Error>>
+    ) -> Result<SubsystemOutcomes<V>, RequestError<C::Error>>
     where
         C::Payload: EventIdentity,
         R: Codec<Payload = V>,
@@ -233,6 +225,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         let started = Instant::now();
         let collected = collect::<R, _, _>(
             registration,
+            subsystems,
             self.producer
                 .send_owned(record_headers, topic, key, payload),
         )
@@ -252,8 +245,8 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             Span::current().record("responses.received", received as i64);
             Span::current().record("responses.succeeded", succeeded as i64);
             Span::current().record("responses.failed", failed as i64);
-            Span::current().record("responses.missing", display(Missing(subsystems, results)));
-            Span::current().record("responses.errors", display(Failures(subsystems, results)));
+            Span::current().record("responses.missing", display(Missing(results)));
+            Span::current().record("responses.errors", display(Failures(results)));
             Span::current().record("request.outcome", completeness);
             self.registry
                 .metrics()
@@ -311,14 +304,14 @@ where
     Ok(owned)
 }
 
-struct Missing<'a, V>(&'a [SubsystemName], &'a [Result<V, ResponseError>]);
+struct Missing<'a, V>(&'a SubsystemOutcomes<V>);
 
-struct Failures<'a, V>(&'a [SubsystemName], &'a [Result<V, ResponseError>]);
+struct Failures<'a, V>(&'a SubsystemOutcomes<V>);
 
 impl<V> Display for Missing<'_, V> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         let mut separator = "";
-        for (subsystem, result) in self.0.iter().zip(self.1) {
+        for (subsystem, result) in self.0 {
             if !answered(result) {
                 write!(formatter, "{separator}{subsystem}")?;
                 separator = ",";
@@ -331,7 +324,7 @@ impl<V> Display for Missing<'_, V> {
 impl<V> Display for Failures<'_, V> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> FmtResult {
         let mut separator = "";
-        for (subsystem, result) in self.0.iter().zip(self.1) {
+        for (subsystem, result) in self.0 {
             let Err(error) = result else {
                 continue;
             };
@@ -347,27 +340,16 @@ impl<V> Display for Failures<'_, V> {
 
 fn response_failure(error: &ResponseError) -> Option<&'static str> {
     match error {
-        ResponseError::Handler {
-            category: ErrorCategory::Transient,
-            ..
-        } => Some("handler.transient"),
-        ResponseError::Handler {
-            category: ErrorCategory::Permanent,
-            ..
-        } => Some("handler.permanent"),
-        ResponseError::Handler {
-            category: ErrorCategory::Terminal,
-            ..
-        } => Some("handler.terminal"),
+        ResponseError::Handler { .. } => Some("handler"),
         ResponseError::FormatMismatch => Some("format_mismatch"),
         ResponseError::Malformed => Some("malformed"),
         ResponseError::Timeout => None,
     }
 }
 
-fn response_counts<V>(responses: &[Result<V, ResponseError>]) -> (usize, usize) {
+fn response_counts<V>(responses: &SubsystemOutcomes<V>) -> (usize, usize) {
     responses
-        .iter()
+        .values()
         .fold((0, 0), |(succeeded, failed), response| match response {
             Ok(_) => (succeeded + 1, failed),
             Err(ResponseError::Timeout) => (succeeded, failed),

@@ -59,7 +59,7 @@ pub mod propagator;
 pub mod requester {
     //! Peer request types.
 
-    pub use crate::peer::{ProsodyRequester, RequestError, ResponseError};
+    pub use crate::peer::{ProsodyRequester, RequestError, ResponseError, SubsystemOutcomes};
 }
 mod segment;
 mod size;

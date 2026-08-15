@@ -1,10 +1,11 @@
 //! Concurrent Kafka delivery and subsystem response collection.
 
 use super::registry::{IndexedFrameReceivers, Registration};
-use super::{RequestError, ResponseError};
+use super::{RequestError, ResponseError, SubsystemOutcomes};
 use crate::Codec;
 use crate::peer::response::frame::{FrameResult, HandlerError, ResponseFrame, ResponseSuccess};
 use crate::producer::ProducerError;
+use crate::subsystem::SubsystemName;
 use std::error::Error;
 use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
@@ -19,8 +20,9 @@ use tokio::time::sleep_until;
 /// subsystem result. Thus, responses cannot cancel producer side effects.
 pub(crate) async fn collect<R, F, PE>(
     registration: Registration,
+    subsystems: &[SubsystemName],
     produce: F,
-) -> Result<Vec<Result<R::Payload, ResponseError>>, RequestError<PE>>
+) -> Result<SubsystemOutcomes<R::Payload>, RequestError<PE>>
 where
     R: Codec,
     F: Future<Output = Result<(), ProducerError<PE>>>,
@@ -56,7 +58,11 @@ where
         }
     }
 
-    Ok(results)
+    Ok(subsystems
+        .iter()
+        .cloned()
+        .zip(results)
+        .collect::<SubsystemOutcomes<_>>())
 }
 
 /// Returns the next response without allocating one task node per receiver.
@@ -85,13 +91,13 @@ fn decode<R: Codec>(frame: ResponseFrame) -> Result<R::Payload, ResponseError> {
             R::with_cached_local(|codec| codec.deserialize_bytes(payload))
                 .map_err(|_| ResponseError::Malformed)
         }
-        FrameResult::HandlerError(HandlerError { category, message }) => {
+        FrameResult::HandlerError(HandlerError { message, .. }) => {
             let message = match message.try_into_mut() {
                 Ok(message) => String::from_utf8(message.into()),
                 Err(message) => String::from_utf8(message.to_vec()),
             }
             .map_err(|_| ResponseError::Malformed)?;
-            Err(ResponseError::Handler { category, message })
+            Err(ResponseError::Handler { message })
         }
     }
 }

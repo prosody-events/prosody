@@ -181,7 +181,7 @@ pub(super) async fn unanswered_call_with_registry(registry: Arc<PendingRegistry>
         )
         .await?;
     ensure!(
-        results == vec![Err(ResponseError::Timeout)],
+        results.get(&awaited[0]) == Some(&Err(ResponseError::Timeout)),
         "nothing answered this call, so its one result must be a timeout"
     );
     Ok(())

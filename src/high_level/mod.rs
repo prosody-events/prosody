@@ -16,7 +16,7 @@ pub use crate::high_level::error::HighLevelClientError;
 pub use crate::high_level::mode::Mode;
 use crate::high_level::state::{ConsumerState, ConsumerStateView};
 use crate::peer::Router;
-use crate::peer::requester::{ProsodyRequester, RequestError, ResponseError};
+use crate::peer::requester::{ProsodyRequester, RequestError, SubsystemOutcomes};
 use crate::producer::{ProducerConfiguration, ProsodyProducer};
 use crate::state::descriptor::{Registered, StateDescriptor};
 use crate::state_reader::ConsumerReaderBackend;
@@ -182,7 +182,7 @@ where
         payload: T::Payload,
         subsystems: &[SubsystemName],
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<MessageCodecError<T>>>
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>>
     where
         H: IntoIterator<Item = (&'a str, &'a str)> + Send,
         H::IntoIter: ExactSizeIterator + Send,
@@ -201,7 +201,7 @@ where
         payload: T::Payload,
         subsystems: Vec<SubsystemName>,
         timeout: Duration,
-    ) -> Result<Vec<Result<T::Output, ResponseError>>, RequestError<MessageCodecError<T>>> {
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>> {
         self.request(
             headers
                 .iter()
