@@ -41,7 +41,7 @@ environment variables for unset fields, so you can mix both approaches.
 | `PROSODY_SEND_TIMEOUT`              | Give up sending after this long                      | 1s      |
 | `PROSODY_IDEMPOTENCE_CACHE_SIZE`    | Producer dedup cache capacity (0 to disable)         | 8192    |
 
-## Peer Requests
+## Requests
 
 Set these values with environment variables or `PeerConfiguration::builder()`.
 An explicit builder value replaces its environment value.

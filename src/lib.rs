@@ -57,7 +57,7 @@ pub mod prelude;
 pub mod producer;
 pub mod propagator;
 pub mod requester {
-    //! Peer request types.
+    //! Request types.
 
     pub use crate::peer::{ProsodyRequester, RequestError, ResponseError, SubsystemOutcomes};
 }

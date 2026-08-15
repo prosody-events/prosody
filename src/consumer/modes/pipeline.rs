@@ -163,7 +163,7 @@ where
         .await
     }
 
-    /// Creates a pipeline consumer that answers peer requests.
+    /// Creates a pipeline consumer that answers requests.
     ///
     /// # Errors
     ///
