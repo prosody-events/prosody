@@ -75,9 +75,9 @@ impl Codec {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(in crate::state::cassandra) enum Encoding {
     /// Raw codec bytes compressed with Zstd.
-    RawZstdV1 = 4,
+    Zstd = 4,
     /// Raw codec bytes without application compression.
-    RawV2 = 5,
+    Raw = 5,
 }
 
 impl From<Encoding> for i16 {
@@ -91,8 +91,8 @@ impl TryFrom<i16> for Encoding {
 
     fn try_from(value: i16) -> Result<Self, Self::Error> {
         match value {
-            4 => Ok(Self::RawZstdV1),
-            5 => Ok(Self::RawV2),
+            4 => Ok(Self::Zstd),
+            5 => Ok(Self::Raw),
             _ => Err(EncodingError::UnknownEncoding(value)),
         }
     }
@@ -102,9 +102,9 @@ impl TryFrom<i16> for Encoding {
 #[must_use]
 pub(super) fn select_encoding(payload_len: usize) -> Encoding {
     if payload_len > CASSANDRA_COMPRESSION_BLOCK_BYTES {
-        Encoding::RawZstdV1
+        Encoding::Zstd
     } else {
-        Encoding::RawV2
+        Encoding::Raw
     }
 }
 
@@ -114,8 +114,8 @@ pub(in crate::state::cassandra) fn encode_payload(
     encoding: Encoding,
 ) -> Result<EncodedPayload, EncodingError> {
     match encoding {
-        Encoding::RawZstdV1 => compress(payload),
-        Encoding::RawV2 => Ok(EncodedPayload::Raw(payload.clone())),
+        Encoding::Zstd => compress(payload),
+        Encoding::Raw => Ok(EncodedPayload::Raw(payload.clone())),
     }
 }
 
@@ -125,8 +125,8 @@ pub(in crate::state::cassandra) fn decode_payload(
     encoding: Encoding,
 ) -> Result<Bytes, EncodingError> {
     match encoding {
-        Encoding::RawZstdV1 => decompress(bytes),
-        Encoding::RawV2 => Ok(Bytes::copy_from_slice(bytes)),
+        Encoding::Zstd => decompress(bytes),
+        Encoding::Raw => Ok(Bytes::copy_from_slice(bytes)),
     }
 }
 

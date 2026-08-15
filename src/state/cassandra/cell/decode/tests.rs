@@ -47,7 +47,7 @@ impl Drop for FrameOwner {
 
 /// The shared encoding discriminator a present blob carries.
 fn enc() -> i16 {
-    i16::from(Encoding::RawZstdV1)
+    i16::from(Encoding::Zstd)
 }
 
 /// The version stamp paired with present bytes.
@@ -58,7 +58,7 @@ fn ver() -> i32 {
 /// Encodes a payload exactly as the cell store would, so the decoder's
 /// `decode_payload` round-trips it.
 fn blob(s: &str) -> Result<Vec<u8>> {
-    Ok(encode_payload(&Bytes::copy_from_slice(s.as_bytes()), Encoding::RawZstdV1)?.to_vec())
+    Ok(encode_payload(&Bytes::copy_from_slice(s.as_bytes()), Encoding::Zstd)?.to_vec())
 }
 
 fn message_event() -> EventRef {
@@ -252,8 +252,8 @@ fn corrupt_event_udt_is_rejected() -> Result<()> {
 /// this.
 #[test]
 fn encoding_wire_contract_is_frozen() -> Result<()> {
-    assert_eq!(i16::from(Encoding::RawZstdV1), 4);
-    assert_eq!(i16::from(Encoding::RawV2), 5);
+    assert_eq!(i16::from(Encoding::Zstd), 4);
+    assert_eq!(i16::from(Encoding::Raw), 5);
     for retired in [0_i16, 1, 2, 3] {
         let Err(error) = Encoding::try_from(retired) else {
             bail!("discriminant {retired} must stay retired");
@@ -268,15 +268,15 @@ fn encoding_wire_contract_is_frozen() -> Result<()> {
 fn encoding_selection_uses_the_strict_block_boundary() {
     assert_eq!(
         select_encoding(CASSANDRA_COMPRESSION_BLOCK_BYTES - 1),
-        Encoding::RawV2
+        Encoding::Raw
     );
     assert_eq!(
         select_encoding(CASSANDRA_COMPRESSION_BLOCK_BYTES),
-        Encoding::RawV2
+        Encoding::Raw
     );
     assert_eq!(
         select_encoding(CASSANDRA_COMPRESSION_BLOCK_BYTES + 1),
-        Encoding::RawZstdV1
+        Encoding::Zstd
     );
 }
 
@@ -287,7 +287,7 @@ fn encoding_selection_uses_the_strict_block_boundary() {
 fn prop_payload_encoding_round_trips() {
     fn prop(bytes: Vec<u8>) -> TestResult {
         let payload = Bytes::from(bytes);
-        for encoding in [Encoding::RawZstdV1, Encoding::RawV2] {
+        for encoding in [Encoding::Zstd, Encoding::Raw] {
             match encode_payload(&payload, encoding)
                 .and_then(|encoded| decode_payload(&encoded, encoding))
             {
@@ -311,7 +311,7 @@ fn prop_legacy_zstd_frames_decode() {
             Ok(encoded) => encoded,
             Err(error) => return TestResult::error(format!("{error}")),
         };
-        match decode_payload(&encoded, Encoding::RawZstdV1) {
+        match decode_payload(&encoded, Encoding::Zstd) {
             Ok(decoded) => TestResult::from_bool(decoded == source),
             Err(error) => TestResult::error(format!("{error}")),
         }
@@ -326,11 +326,11 @@ fn durable_payload_bytes_are_frozen() -> Result<()> {
         0x3c, 0x1f, 0x36, 0x87,
     ];
     assert_eq!(
-        decode_payload(LEGACY_ZSTD, Encoding::RawZstdV1)?,
+        decode_payload(LEGACY_ZSTD, Encoding::Zstd)?,
         Bytes::from_static(b"legacy")
     );
     assert_eq!(
-        encode_payload(&Bytes::from_static(b"raw"), Encoding::RawV2)?.as_ref(),
+        encode_payload(&Bytes::from_static(b"raw"), Encoding::Raw)?.as_ref(),
         b"raw"
     );
     Ok(())
@@ -348,7 +348,7 @@ fn decoded_cell_does_not_retain_its_response_frame() -> Result<()> {
         vec![1],
         Some(frame.slice(6..9)),
         None,
-        Some(i16::from(Encoding::RawV2)),
+        Some(i16::from(Encoding::Raw)),
         Some(INITIAL_VERSION),
         None,
     );
@@ -373,26 +373,26 @@ fn measured<T>(operation: impl FnOnce() -> T) -> (T, alloc_count::AllocStats) {
 fn steady_state_codec_allocation_counts_are_exact() -> Result<()> {
     let raw = Bytes::from(vec![0xA5; CASSANDRA_COMPRESSION_BLOCK_BYTES]);
     let _ = measured(|| ()); // Initialize the allocation counter for this thread.
-    drop(encode_payload(&raw, Encoding::RawV2)?);
-    let (_, raw_encode) = measured(|| encode_payload(&raw, Encoding::RawV2));
+    drop(encode_payload(&raw, Encoding::Raw)?);
+    let (_, raw_encode) = measured(|| encode_payload(&raw, Encoding::Raw));
     assert_eq!(raw_encode.alloc_calls, 0);
     assert_eq!(raw_encode.realloc_calls, 0);
 
-    let (decoded, raw_decode) = measured(|| decode_payload(&raw, Encoding::RawV2));
+    let (decoded, raw_decode) = measured(|| decode_payload(&raw, Encoding::Raw));
     assert_eq!(decoded?, raw);
     assert_eq!(raw_decode.alloc_calls, 1);
     assert_eq!(raw_decode.realloc_calls, 0);
 
     let large = Bytes::from(vec![0x5A; CASSANDRA_COMPRESSION_BLOCK_BYTES + 1]);
     reset_codec();
-    drop(encode_payload(&large, Encoding::RawZstdV1)?);
-    let (encoded, zstd_encode) = measured(|| encode_payload(&large, Encoding::RawZstdV1));
+    drop(encode_payload(&large, Encoding::Zstd)?);
+    let (encoded, zstd_encode) = measured(|| encode_payload(&large, Encoding::Zstd));
     let encoded = encoded?;
     assert_eq!(zstd_encode.alloc_calls, 1);
     assert_eq!(zstd_encode.realloc_calls, 0);
 
-    drop(decode_payload(&encoded, Encoding::RawZstdV1)?);
-    let (decoded, zstd_decode) = measured(|| decode_payload(&encoded, Encoding::RawZstdV1));
+    drop(decode_payload(&encoded, Encoding::Zstd)?);
+    let (decoded, zstd_decode) = measured(|| decode_payload(&encoded, Encoding::Zstd));
     assert_eq!(decoded?, large);
     assert_eq!(zstd_decode.alloc_calls, 1);
     assert_eq!(zstd_decode.realloc_calls, 0);
@@ -404,19 +404,16 @@ fn decode_scratch_grows_once_and_then_stays_stable() -> Result<()> {
     reset_codec();
     let maximum = Bytes::from(vec![0x3C; 64 * 1024]);
     let minimum = Bytes::from_static(b"small");
-    let encoded_maximum = encode_payload(&maximum, Encoding::RawZstdV1)?;
-    let encoded_minimum = encode_payload(&minimum, Encoding::RawZstdV1)?;
+    let encoded_maximum = encode_payload(&maximum, Encoding::Zstd)?;
+    let encoded_minimum = encode_payload(&minimum, Encoding::Zstd)?;
 
     assert_eq!(decode_scratch(), (0, 0));
-    assert_eq!(
-        decode_payload(&encoded_maximum, Encoding::RawZstdV1)?,
-        maximum
-    );
+    assert_eq!(decode_payload(&encoded_maximum, Encoding::Zstd)?, maximum);
     let warmed = decode_scratch();
     assert!(warmed.1 >= maximum.len());
 
     for encoded in [&encoded_minimum, &encoded_maximum, &encoded_minimum] {
-        let (decoded, allocations) = measured(|| decode_payload(encoded, Encoding::RawZstdV1));
+        let (decoded, allocations) = measured(|| decode_payload(encoded, Encoding::Zstd));
         drop(decoded?);
         assert_eq!(allocations.alloc_calls, 1);
         assert_eq!(allocations.realloc_calls, 0);

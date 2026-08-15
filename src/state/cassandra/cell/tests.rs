@@ -66,14 +66,14 @@ fn row_encoding_uses_the_larger_present_payload() -> Result<()> {
     let small = Bytes::from_static(b"small");
     let large = Bytes::from(vec![0x5A; CASSANDRA_COMPRESSION_BLOCK_BYTES + 1]);
     let blobs = encode_cell_blobs(Some(&small), Some(&large))?;
-    assert_eq!(blobs.encoding, Some(Encoding::RawZstdV1));
+    assert_eq!(blobs.encoding, Some(Encoding::Zstd));
     assert_eq!(
         super::encoding::decode_payload(
             blobs
                 .data
                 .as_deref()
                 .ok_or_else(|| eyre!("data must exist"))?,
-            Encoding::RawZstdV1,
+            Encoding::Zstd,
         )?,
         small
     );
@@ -83,7 +83,7 @@ fn row_encoding_uses_the_larger_present_payload() -> Result<()> {
                 .prev_data
                 .as_deref()
                 .ok_or_else(|| eyre!("previous data must exist"))?,
-            Encoding::RawZstdV1,
+            Encoding::Zstd,
         )?,
         large
     );
@@ -793,7 +793,7 @@ async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
     let cell = value_cell();
     let id = c.id();
 
-    // Both blobs and `event` absent, `encoding` = 4 (RawZstdV1), `version` = 1
+    // Both blobs and `event` absent, `encoding` = 4 (`Zstd`), `version` = 1
     // (INITIAL_VERSION) — the legacy null-null residue shape.
     let insert = format!(
         "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
@@ -874,7 +874,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
         payload.len()
     );
     assert_eq!(
-        decode_payload(&raw, Encoding::RawZstdV1)?,
+        decode_payload(&raw, Encoding::Zstd)?,
         payload,
         "zstd frame must decompress to the payload"
     );
@@ -1985,7 +1985,7 @@ async fn seed_prev_without_event_and_blob_without_encoding(
 
     let cell_a = cell_in(0, 0x01);
     let cell_b = cell_in(0, 0xFE);
-    let prev_blob = encode_payload(&bytes(0xAA), Encoding::RawZstdV1)?;
+    let prev_blob = encode_payload(&bytes(0xAA), Encoding::Zstd)?;
     let insert_a = format!(
         "INSERT INTO {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} (segment_id, key, state_type, name, \
          kind, section, coordinate, prev_data, encoding, version) VALUES (?, ?, ?, ?, 0, 0, ?, ?, \
@@ -2150,7 +2150,7 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
     use crate::state::store::CellBuffer;
     use smallvec::SmallVec;
 
-    let prev_blob = encode_payload(&bytes(0xAA), Encoding::RawZstdV1)?;
+    let prev_blob = encode_payload(&bytes(0xAA), Encoding::Zstd)?;
     // event = None throughout, so no RawEventRef construction is needed.
     let high_bytes = [0xBB];
     let high: BorrowedCellTtlRow<'_> = (Some(&high_bytes), None, None, None, None, None, None);
