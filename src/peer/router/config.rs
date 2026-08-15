@@ -1,5 +1,6 @@
 //! What an operator sets to join the peer fleet and how the runtime uses it.
 
+use crate::peer::PeerEndpoint;
 use crate::peer::router::cache_config::PeerCacheConfiguration;
 use crate::peer::router::directory::{RegistrationTtl, RegistrationTtlError};
 use crate::peer::router::runtime::RouterConfiguration;
@@ -10,7 +11,6 @@ use std::net::AddrParseError;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
 use thiserror::Error;
-use tonic::transport::Endpoint;
 use validator::{Validate, ValidationError, ValidationErrors};
 
 /// How this process joins the peer fleet: what its listener binds, what it
@@ -35,7 +35,7 @@ pub struct PeerConfiguration {
     pub bind_address: Option<SocketAddr>,
     /// The gRPC connect URI that peers on another network use.
     #[builder(default = "from_option_env(\"PROSODY_PEER_ADVERTISED_CONNECT\")?")]
-    pub advertised_connect: Option<Endpoint>,
+    pub advertised_connect: Option<PeerEndpoint>,
     /// The network label for direct routes.
     #[builder(default = "from_option_env(\"PROSODY_PEER_NETWORK_NAME\")?")]
     pub network_name: Option<String>,
@@ -116,7 +116,10 @@ impl PeerConfiguration {
         Ok(PeerParts {
             bind: self.bind_address.map_or_else(default_socket_address, Ok)?,
             router: RouterConfiguration {
-                advertised: self.advertised_connect.clone(),
+                advertised: self
+                    .advertised_connect
+                    .clone()
+                    .map(PeerEndpoint::into_inner),
                 network: self.network_name.clone(),
             },
             cache: PeerCacheConfiguration {
@@ -135,7 +138,10 @@ fn validate_peer(config: &PeerConfiguration) -> Result<(), ValidationError> {
         return Err(ValidationError::new("unspecified_bind_address"));
     }
     RouterConfiguration {
-        advertised: config.advertised_connect.clone(),
+        advertised: config
+            .advertised_connect
+            .clone()
+            .map(PeerEndpoint::into_inner),
         network: config.network_name.clone(),
     }
     .validate()

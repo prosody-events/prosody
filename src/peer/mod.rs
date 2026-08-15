@@ -9,6 +9,7 @@
 //! [`Router::shutdown`] to wait for teardown.
 
 mod backend;
+mod endpoint;
 pub(crate) mod metrics;
 pub(crate) mod requester;
 pub(crate) mod response;
@@ -18,6 +19,7 @@ pub(crate) mod runtime;
 #[cfg(test)]
 pub(crate) use backend::PeerBackend;
 
+pub use endpoint::{PeerEndpoint, PeerEndpointError};
 pub use requester::{ProsodyRequester, RequestError, ResponseError};
 pub use router::api::{GrpcRouter, LocalRouter, Router};
 pub use router::config::{
