@@ -60,7 +60,7 @@ pub use crate::high_level::{ClientHandler, Codecs, JsonCodecs};
 /// Producer bootstrap and delivery configuration.
 pub use crate::producer::ProducerConfiguration;
 /// Errors for a complete request and for each subsystem response.
-pub use crate::requester::{RequestError, ResponseError};
+pub use crate::requester::{RequestError, ResponseError, SubsystemOutcomes};
 /// Standalone client for published state reads.
 pub use crate::state_reader::StateReaderClient;
 /// Shared dependencies passed to a standalone state reader client.

@@ -3,7 +3,6 @@
 
 use super::{PEER, POOL, RequestPayload, distinct_indices, names, poll_once, registry, requester};
 use crate::Topic;
-use crate::error::{ClassifyError, ErrorCategory};
 use crate::peer::requester::registry::tests::pending_len;
 use crate::peer::requester::{RequestError, ResponseError, append_request_headers};
 use crate::peer::response::RequestId;
@@ -35,10 +34,9 @@ const USER_NAMES: [&str; 3] = ["tenant", "correlation", "priority"];
 const USER_VALUES: [&str; 3] = ["alpha", "beta", "gamma"];
 
 #[test]
-fn response_errors_keep_their_retry_posture() {
+fn response_errors_expose_one_message() {
     let errors = [
         ResponseError::Handler {
-            category: ErrorCategory::Terminal,
             message: "failed".to_owned(),
         },
         ResponseError::Timeout,
@@ -46,13 +44,14 @@ fn response_errors_keep_their_retry_posture() {
         ResponseError::Malformed,
     ];
     assert_eq!(
-        errors.map(|error| error.classify_error()),
+        errors.map(|error| error.to_string()),
         [
-            ErrorCategory::Terminal,
-            ErrorCategory::Transient,
-            ErrorCategory::Permanent,
-            ErrorCategory::Permanent,
+            "handler failed: failed",
+            "no response arrived before the deadline",
+            "the responder answered in another format",
+            "the response did not decode",
         ]
+        .map(str::to_owned)
     );
 }
 
@@ -195,8 +194,11 @@ async fn a_valid_call_registers_first_and_gives_its_record_back() -> Result<()> 
     );
 
     assert_eq!(
-        call.await?,
-        vec![Err(ResponseError::Timeout), Err(ResponseError::Timeout)],
+        call.await?
+            .values()
+            .filter(|result| **result == Err(ResponseError::Timeout))
+            .count(),
+        awaited.len(),
         "one unanswered result must come back per named subsystem"
     );
     assert_eq!(

@@ -74,14 +74,15 @@ async fn each_pending_response_is_removed_once() -> Result<()> {
         ResponseDisposition::Accepted
     );
 
-    let results = collect::<TestCodec, _, TestCodecError>(registration, pending()).await?;
-    assert_eq!(results, vec![Ok(1), Ok(2)]);
+    let results = collect::<TestCodec, _, TestCodecError>(registration, &names, pending()).await?;
+    assert_eq!(results.get(&names[0]), Some(&Ok(1)));
+    assert_eq!(results.get(&names[1]), Some(&Ok(2)));
     assert_eq!(pending_len(&registry), 0);
     Ok(())
 }
 
 #[tokio::test(start_paused = true)]
-async fn handler_failures_keep_their_category_and_message() -> Result<()> {
+async fn handler_failures_keep_their_message() -> Result<()> {
     let registry = registry();
     let names = names(&["billing"])?;
     let registration = register(&registry, &names, MAX_TIMEOUT)?;
@@ -94,16 +95,15 @@ async fn handler_failures_keep_their_category_and_message() -> Result<()> {
         )),
         ResponseDisposition::Accepted
     );
-    let results = collect::<TestCodec, _, TestCodecError>(registration, async {
+    let results = collect::<TestCodec, _, TestCodecError>(registration, &names, async {
         Ok::<(), ProducerError<TestCodecError>>(())
     })
     .await?;
     assert_eq!(
-        results,
-        vec![Err(ResponseError::Handler {
-            category: ErrorCategory::Permanent,
+        results.get(&names[0]),
+        Some(&Err(ResponseError::Handler {
             message: "invalid account".to_owned(),
-        })]
+        }))
     );
     Ok(())
 }
@@ -128,6 +128,7 @@ async fn responses_do_not_cancel_producer_completion() -> Result<()> {
 
     let mut collected = pin!(collect::<TestCodec, _, TestCodecError>(
         registration,
+        &names,
         produce,
     ));
     assert!(
@@ -135,7 +136,7 @@ async fn responses_do_not_cancel_producer_completion() -> Result<()> {
         "responses completed the request before producer completion"
     );
     assert!(complete.send(()).is_ok());
-    assert_eq!(collected.await?, vec![Ok(1)]);
+    assert_eq!(collected.await?.get(&names[0]), Some(&Ok(1)));
     Ok(())
 }
 
@@ -148,18 +149,21 @@ async fn every_request_exit_removes_remaining_responses() -> Result<()> {
     assert_eq!(pending_len(&registry), 0);
 
     let registration = register(&registry, &names, MAX_TIMEOUT)?;
-    let results = collect::<TestCodec, _, TestCodecError>(registration, async {
+    let results = collect::<TestCodec, _, TestCodecError>(registration, &names, async {
         Ok::<(), ProducerError<TestCodecError>>(())
     })
     .await?;
     assert_eq!(
-        results,
-        vec![Err(ResponseError::Timeout), Err(ResponseError::Timeout)]
+        results
+            .values()
+            .filter(|result| **result == Err(ResponseError::Timeout))
+            .count(),
+        names.len()
     );
     assert_eq!(pending_len(&registry), 0);
 
     let registration = register(&registry, &names, MAX_TIMEOUT)?;
-    let outcome = collect::<TestCodec, _, TestCodecError>(registration, async {
+    let outcome = collect::<TestCodec, _, TestCodecError>(registration, &names, async {
         Err(ProducerError::Kafka(KafkaError::Canceled))
     })
     .await;
@@ -170,7 +174,7 @@ async fn every_request_exit_removes_remaining_responses() -> Result<()> {
 
     let registration = register(&registry, &names, MAX_TIMEOUT)?;
     registry.terminate();
-    let outcome = collect::<TestCodec, _, TestCodecError>(registration, pending()).await;
+    let outcome = collect::<TestCodec, _, TestCodecError>(registration, &names, pending()).await;
     if !matches!(outcome, Err(RequestError::ShuttingDown)) {
         bail!("shutdown did not fail the request");
     }
@@ -204,16 +208,21 @@ fn run_arrivals(trace: ArrivalTrace) -> Result<()> {
             );
         }
 
-        let results = collect::<TestCodec, _, TestCodecError>(registration, pending()).await?;
+        let results =
+            collect::<TestCodec, _, TestCodecError>(registration, &awaited, pending()).await?;
         assert_eq!(
             results,
-            expected
+            awaited
                 .into_iter()
-                .map(|value| match value {
-                    Some(value) => Ok(value),
-                    None => Err(ResponseError::Timeout),
-                })
-                .collect::<Vec<_>>()
+                .zip(expected)
+                .map(|(name, value)| (
+                    name,
+                    match value {
+                        Some(value) => Ok(value),
+                        None => Err(ResponseError::Timeout),
+                    }
+                ))
+                .collect()
         );
         assert_eq!(pending_len(&registry), 0);
         Ok(())

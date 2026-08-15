@@ -28,6 +28,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{ensure, eyre};
 use serde_json::{Value, json};
 use std::convert::Infallible;
+use std::slice::from_ref;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -167,11 +168,11 @@ fn a_mock_client_round_trips_one_peer_request() -> Result<()> {
                     Topic::from("test-topic"),
                     "key",
                     payload.clone(),
-                    &[subsystem],
+                    from_ref(&subsystem),
                     Duration::from_secs(1),
                 )
                 .await?;
-            assert_eq!(outcomes, vec![Ok(payload)]);
+            assert_eq!(outcomes.get(&subsystem), Some(&Ok(payload)));
             Ok(())
         }
         .await;

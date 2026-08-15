@@ -5,7 +5,6 @@
 //! answer arriving, because the answer is this call returning.
 
 use super::{KEY, PEER, SUBSYSTEM, TOPIC, names, unanswered_call};
-use crate::error::ErrorCategory;
 use crate::peer::requester::{Failures, ResponseError, response_counts};
 use crate::peer::router::loopback::paused;
 use crate::test_util::{captured_spans, named, span_attribute};
@@ -93,20 +92,33 @@ fn one_call_opens_a_client_span_naming_its_request_and_its_answers() -> Result<(
 #[test]
 fn response_error_summary_is_concise_and_omits_handler_messages() -> Result<()> {
     let subsystems = names(&["billing", "ledger", "search", "mailer", "audit"])?;
-    let results: Vec<Result<(), ResponseError>> = vec![
-        Ok(()),
-        Err(ResponseError::Handler {
-            category: ErrorCategory::Permanent,
-            message: "account 123 is private".to_owned(),
-        }),
-        Err(ResponseError::FormatMismatch),
-        Err(ResponseError::Malformed),
-        Err(ResponseError::Timeout),
-    ];
+    let results = subsystems
+        .iter()
+        .cloned()
+        .zip([
+            Ok(()),
+            Err(ResponseError::Handler {
+                message: "account 123 is private".to_owned(),
+            }),
+            Err(ResponseError::FormatMismatch),
+            Err(ResponseError::Malformed),
+            Err(ResponseError::Timeout),
+        ])
+        .collect();
 
+    let mut failures = Failures(&results)
+        .to_string()
+        .split(',')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    failures.sort();
     assert_eq!(
-        Failures(&subsystems, &results).to_string(),
-        "ledger=handler.permanent,search=format_mismatch,mailer=malformed"
+        failures,
+        [
+            "ledger=handler",
+            "mailer=malformed",
+            "search=format_mismatch"
+        ]
     );
     assert_eq!(response_counts(&results), (1, 3));
     Ok(())
