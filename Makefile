@@ -1,7 +1,8 @@
 # Install Rust and necessary tools
 bootstrap:
 	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-	cargo install cargo-udeps cargo-tarpaulin taplo-cli bacon cargo-nextest
+	brew install buf protobuf
+	cargo install cargo-udeps cargo-llvm-cov taplo-cli bacon cargo-nextest
 
 # Start Kafka and related services using Docker Compose
 up:
@@ -17,15 +18,20 @@ console:
 
 # Format Rust code and TOML files
 format:
-	cargo fmt
+	cargo +nightly fmt
 	taplo fmt
 
 # Build the project
 build:
 	cargo build
 
-# Check for compilation errors without building
-check:
+# Check Protobuf schema style
+proto-check:
+	buf lint proto
+	buf format --diff --exit-code proto
+
+# Check schemas and compilation without building
+check: proto-check
 	cargo check
 
 # Watch for changes and check for compilation errors
@@ -50,7 +56,7 @@ test-watch: up
 
 # Generate code coverage report
 coverage: up
-	cargo tarpaulin
+	cargo llvm-cov nextest
 
 # Check for unused dependencies
 # note: requires installing nightly with `rustup install nightly`

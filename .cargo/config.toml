@@ -7,3 +7,6 @@ CMAKE_POLICY_VERSION_MINIMUM = { value = "3.5", force = true }
 # not just test binaries; binaries invoked directly (e.g. a release deploy)
 # are unaffected and sit far below the limit regardless.
 RUST_MIN_STACK = "8388608"
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

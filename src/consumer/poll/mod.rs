@@ -10,7 +10,7 @@
 //! - Dispatches messages to the appropriate partition managers
 //!
 //! The main entry point is the [`poll`] function, which orchestrates all these
-//! operations within a continuous loop until shutdown is signaled.
+//! operations within a continuous loop.
 
 use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext};
 use rdkafka::error::KafkaError;
@@ -26,7 +26,7 @@ use tracing::{Span, debug, error, warn};
 use crate::Codec;
 use crate::EventType;
 use crate::Topic;
-use crate::consumer::decode::{DecodedMessage, decode_message};
+use crate::consumer::decode::{DecodedMessage, ResultRequestReader, decode_message};
 use crate::consumer::message::ConsumerMessage;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{Managers, WatermarkVersion};
@@ -35,7 +35,7 @@ use crate::otel::SpanRelation;
 use crate::propagator::new_propagator;
 use crate::related_span;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 #[cfg(test)]
 mod tests;
@@ -52,11 +52,12 @@ mod tests;
 ///   poller only calls `Consumer`-trait methods on it, so it stays agnostic to
 ///   the provider generics baked into the context.
 /// * `C` - A type implementing [`Codec`] for deserializing message payloads.
-pub struct PollConfig<'a, Ctx, C>
+pub struct PollConfig<'a, Ctx, C, R>
 where
     Ctx: ConsumerContext,
     C: Codec,
     C::Payload: Clone + EventType,
+    R: ResultRequestReader,
 {
     /// Time between consecutive poll operations
     pub poll_interval: Duration,
@@ -84,6 +85,9 @@ where
 
     /// Span relation for message execution spans
     pub message_spans: SpanRelation,
+
+    /// Result-request reader selected by the response policy.
+    pub requests: R,
 }
 
 /// Runs the main Kafka message polling and processing loop.
@@ -97,12 +101,14 @@ where
 /// 6. Processes valid messages through validation and filtering
 /// 7. Dispatches messages to their respective partition managers
 ///
-/// The loop continues until the shutdown flag is set to true.
-pub fn poll<Ctx, C>(config: PollConfig<Ctx, C>)
+/// The loop continues until the shutdown flag is set, or until the message
+/// buffer's semaphore reports closed.
+pub fn poll<Ctx, C, R>(config: PollConfig<Ctx, C, R>)
 where
     Ctx: ConsumerContext,
     C: Codec,
     C::Payload: Clone + EventType,
+    R: ResultRequestReader,
 {
     // Destructure configuration for cleaner access
     let PollConfig {
@@ -115,6 +121,7 @@ where
         heartbeat,
         shutdown,
         message_spans,
+        requests,
     } = config;
 
     // Initialize distributed tracing propagator for context extraction
@@ -131,8 +138,20 @@ where
         // Periodically commit watermark offsets to Kafka
         store_watermarks(&consumer, watermark_version, managers, &mut last_version);
 
-        // Attempt to acquire semaphore to buffer a new message
-        let maybe_permit = semaphore.clone().try_acquire_owned().ok();
+        // Take one of the message buffer's permits, or find out why not.
+        //
+        // `Closed` cannot happen: this loop creates the semaphore, and nothing
+        // in the crate closes it. A closed semaphore takes no record again.
+        // The loop then stops, rather than beat its heartbeat over a buffer
+        // that can take nothing.
+        let maybe_permit = match Arc::clone(&semaphore).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(TryAcquireError::NoPermits) => None,
+            Err(TryAcquireError::Closed) => {
+                error!("the message buffer was closed; stopping the poll loop");
+                break;
+            }
+        };
 
         // Pause/resume partitions based on their buffer capacity
         if let Err(error) =
@@ -172,7 +191,7 @@ where
         );
 
         // Decode message through extraction, validation, and filtering
-        let maybe_decoded = decode_message(&mut message, &propagator, &mut codec);
+        let maybe_decoded = decode_message(&mut message, &propagator, &mut codec, &requests);
 
         // Create consumer message with processing state and dispatch
         if let Some(decoded) = maybe_decoded {

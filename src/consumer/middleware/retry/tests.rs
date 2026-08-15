@@ -775,7 +775,7 @@ mod attempt_boundary {
     use crate::codec::{JsonCodec, JsonCodecError};
     use crate::consumer::event_context::StateAccessError;
     use crate::consumer::middleware::tests::test_support::{
-        RecordingOracle, RecordingSession, committed_value, recording_session,
+        RecordingOracle, RecordingSession, committed_json_value, recording_session,
     };
     use crate::consumer::middleware::{Settlement, SettlementHandler};
     use crate::state::descriptor::{CellStateError, Registered, ValueDescriptor, value_state};
@@ -968,12 +968,12 @@ mod attempt_boundary {
             "one failed then one ok attempt"
         );
         assert_eq!(
-            committed_value(&cell_store, state_key.clone(), "wishlist").await?,
+            committed_json_value(&cell_store, state_key.clone(), "wishlist").await?,
             Some(json!({ "attempt": 2_i32 })),
             "attempt 2's write must be committed",
         );
         assert_eq!(
-            committed_value(&cell_store, state_key.clone(), "cart").await?,
+            committed_json_value(&cell_store, state_key.clone(), "cart").await?,
             None,
             "attempt 1's discarded write must NOT leak into the committed state",
         );
@@ -1123,7 +1123,7 @@ mod attempt_boundary {
             "the final after_commit reads attempt 2's committed wishlist",
         );
         assert_eq!(
-            committed_value(&cell_store, state_key, "wishlist").await?,
+            committed_json_value(&cell_store, state_key, "wishlist").await?,
             Some(json!({ "attempt": 2_i32 })),
             "wishlist committed",
         );
@@ -1160,7 +1160,7 @@ mod attempt_boundary {
              despite the inner retry's epoch bump",
         );
         assert_eq!(
-            committed_value(&cell_store, state_key, "wishlist").await?,
+            committed_json_value(&cell_store, state_key, "wishlist").await?,
             Some(json!({ "attempt": 2_i32 })),
             "wishlist committed",
         );
@@ -1296,7 +1296,7 @@ mod attempt_boundary {
             "both intermediate after_abort commits are fenced",
         );
         assert_eq!(
-            committed_value(&cell_store, state_key, "cart").await?,
+            committed_json_value(&cell_store, state_key, "cart").await?,
             Some(json!({ "attempt": 3_i32 })),
             "only the successful attempt 3's cart commits; the fenced intermediate commits added \
              nothing durable",

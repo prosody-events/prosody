@@ -5,8 +5,10 @@
 //! methods for building and accessing configuration details. It also includes a
 //! custom error type for handling configuration-related errors.
 
+use crate::PeerConfiguration;
 use crate::Topic;
 use crate::cassandra::{CassandraConfiguration, config::CassandraConfigurationBuilderError};
+use crate::consumer::ConsumerError;
 use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilder;
 use crate::consumer::middleware::deduplication::DeduplicationConfigurationBuilderError;
 use crate::consumer::middleware::defer::DeferConfigurationBuilder;
@@ -30,7 +32,6 @@ use crate::consumer::middleware::topic::{
 use crate::consumer::{
     CommonConfiguration, ConsumerConfiguration, ConsumerConfigurationBuilder,
     ConsumerConfigurationBuilderError, KeyedStateConfiguration,
-    KeyedStateConfigurationBuilderError,
 };
 use crate::high_level::mode::Mode;
 use crate::state::descriptor::{Registered, StateDescriptor};
@@ -63,25 +64,24 @@ pub struct ConsumerBuilders {
     /// Keyed-state configuration (always-on; carries collection
     /// registrations). Mode-independent — every mode threads it through.
     pub keyed_state: KeyedStateConfiguration,
+    /// Peer configuration.
+    pub peer: PeerConfiguration,
     /// Telemetry emitter configuration.
     pub emitter: TelemetryEmitterConfiguration,
 }
 
 impl ConsumerBuilders {
-    /// Every builder at its default, with the keyed-state section resolved from
-    /// the environment.
+    /// Creates every builder at its default.
     ///
-    /// Fallible only because that section reads environment overrides: an
-    /// override the operator supplied but got wrong fails here instead of being
-    /// replaced by a default. A `Default` impl could not report that, so there
-    /// is none.
+    /// Construction reads keyed-state and peer environment overrides. An
+    /// invalid override returns an error instead of a default. Therefore, this
+    /// type has no `Default` implementation.
     ///
     /// # Errors
     ///
-    /// [`KeyedStateConfigurationBuilderError`] when a `PROSODY_STATE_*`
-    /// override is set to a value that cannot be parsed. An unset or blank
-    /// variable takes its default and never errors.
-    pub fn new() -> Result<Self, KeyedStateConfigurationBuilderError> {
+    /// Returns [`ConsumerError`] when a `PROSODY_STATE_*` or `PROSODY_PEER_*`
+    /// override cannot be parsed.
+    pub fn new() -> Result<Self, ConsumerError> {
         Ok(Self {
             consumer: ConsumerConfigurationBuilder::default(),
             retry: RetryConfigurationBuilder::default(),
@@ -92,6 +92,7 @@ impl ConsumerBuilders {
             dedup: DeduplicationConfigurationBuilder::default(),
             timeout: TimeoutConfigurationBuilder::default(),
             keyed_state: KeyedStateConfiguration::builder().build()?,
+            peer: PeerConfiguration::builder().build()?,
             emitter: TelemetryEmitterConfiguration::default(),
         })
     }
@@ -115,7 +116,7 @@ pub enum TriggerStoreConfiguration {
 }
 
 /// Configuration for different operational modes of the Prosody client.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ModeConfiguration {
     /// Configuration for Pipeline mode.
     Pipeline {

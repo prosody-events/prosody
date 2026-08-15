@@ -7,6 +7,8 @@ use crate::consumer::middleware::scheduler::SchedulerInitError;
 use crate::consumer::middleware::timeout::TimeoutInitError;
 use crate::consumer::storage::StoreCreationError;
 use crate::error::ErrorCategory;
+use crate::peer::router::config::{PeerConfigurationBuilderError, PeerConfigurationError};
+use crate::peer::router::runtime::PeerRuntimeError;
 use crate::state::config::KeyedStateConfigurationBuilderError;
 use crate::state::registry::RegisterStateError;
 use crate::state_reader::StateReaderError;
@@ -44,6 +46,13 @@ pub enum ConsumerError {
     /// Indicates a Kafka operation failure.
     #[error("Kafka operation failed: {0:#}")]
     Kafka(#[from] KafkaError),
+
+    /// The mock Kafka cluster could not create a subscribed topic.
+    #[error("mock Kafka topic creation failed: {message}")]
+    MockCluster {
+        /// The mock cluster's error report.
+        message: String,
+    },
 
     /// A blocking startup step — the initial Kafka metadata fetch — did not
     /// finish.
@@ -85,6 +94,100 @@ pub enum ConsumerError {
     /// Indicates a keyed-state initialization failure.
     #[error("Keyed-state initialization failed: {0:#}")]
     KeyedState(#[from] KeyedStateInitError),
+
+    /// The peer runtime could not start.
+    #[error("peer initialization failed: {0:#}")]
+    Peer(#[from] PeerInitError),
+}
+
+/// Errors raised while the peer runtime starts.
+///
+/// Most variants carry a rendered message instead of a `#[source]` field. The
+/// source types are crate-private, so a public error cannot name them, and this
+/// crate does not box an error as a trait object.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum PeerInitError {
+    /// The peer configuration is invalid.
+    #[error("invalid peer configuration: {message}")]
+    Configuration {
+        /// The rendered source chain.
+        message: String,
+    },
+    /// The process could not discover its host.
+    #[error("peer host discovery failed: {message}")]
+    Discovery {
+        /// The rendered source chain.
+        message: String,
+    },
+    /// The peer directory could not start or register this process.
+    #[error("peer directory failed: {message}")]
+    Directory {
+        /// The rendered source chain.
+        message: String,
+    },
+    /// The peer cache bound is invalid.
+    #[error("peer cache configuration is invalid: {message}")]
+    Cache {
+        /// The rendered source chain.
+        message: String,
+    },
+    /// The peer listener could not start.
+    #[error("peer listener failed: {message}")]
+    Listener {
+        /// The rendered source chain.
+        message: String,
+    },
+}
+
+impl From<PeerConfigurationError> for PeerInitError {
+    fn from(error: PeerConfigurationError) -> Self {
+        Self::Configuration {
+            message: format!("{error:#}"),
+        }
+    }
+}
+
+impl From<PeerRuntimeError> for PeerInitError {
+    fn from(error: PeerRuntimeError) -> Self {
+        match error {
+            PeerRuntimeError::Configuration(error) => Self::Configuration {
+                message: format!("{error:#}"),
+            },
+            PeerRuntimeError::Discovery(error) => Self::Discovery {
+                message: format!("{error:#}"),
+            },
+            PeerRuntimeError::Cache(error) => Self::Cache {
+                message: format!("{error:#}"),
+            },
+            PeerRuntimeError::Listener(error) => Self::Listener {
+                message: format!("{error:#}"),
+            },
+        }
+    }
+}
+
+/// Errors raised while a consumer stops.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ShutdownError {
+    /// The poll loop task did not end cleanly. It panicked, or something
+    /// aborted it, so in-flight message processing may not have finished.
+    #[error("the consumer poll loop did not end cleanly: {message}")]
+    PollLoop {
+        /// The rendered join failure.
+        message: String,
+    },
+    /// The peer directory did not confirm the removal of this peer. The row
+    /// may or may not survive, and one that survives expires on its lease.
+    #[error("the peer directory did not confirm the removal of this peer: {message}")]
+    Directory {
+        /// The rendered source chain.
+        message: String,
+    },
+    /// The peer teardown ended without reporting.
+    #[error("the peer teardown ended without reporting")]
+    Teardown,
 }
 
 /// Errors raised while wiring the keyed-state layer into a pipeline
@@ -156,6 +259,14 @@ pub enum KeyedStateInitError {
 impl From<KeyedStateConfigurationBuilderError> for ConsumerError {
     fn from(error: KeyedStateConfigurationBuilderError) -> Self {
         Self::KeyedState(KeyedStateInitError::Configuration(error))
+    }
+}
+
+impl From<PeerConfigurationBuilderError> for ConsumerError {
+    fn from(error: PeerConfigurationBuilderError) -> Self {
+        Self::Peer(PeerInitError::Configuration {
+            message: format!("{error:#}"),
+        })
     }
 }
 

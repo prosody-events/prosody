@@ -417,7 +417,7 @@ mod defer_swallow {
     use crate::consumer::middleware::defer::timer::handler::TimerDeferOutput;
     use crate::consumer::middleware::tests::test_support::{
         BypassedHandler, MockEventContext, RecordingTimer, ScriptedHandler, StagingHook,
-        StagingTransientHandler, TestError, committed_value, recording_session,
+        StagingTransientHandler, TestError, committed_json_value, recording_session,
     };
     use crate::consumer::middleware::{FallibleEventHandler, Settlement, SettlementHandler};
     use crate::error::ErrorCategory;
@@ -525,7 +525,7 @@ mod defer_swallow {
             "a bypassed dispatch must arm NO StateRecovery backstop (Clean-never-arms parity)",
         );
         assert_eq!(
-            committed_value(&cell_store, state_key, "cart").await?,
+            committed_json_value(&cell_store, state_key, "cart").await?,
             None,
             "the failed attempt's buffered write must not commit",
         );

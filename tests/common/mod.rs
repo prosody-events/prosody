@@ -21,7 +21,9 @@ pub(crate) mod receive;
 
 use prosody::cassandra::config::CassandraConfiguration;
 use prosody::high_level::config::TriggerStoreConfiguration;
+use prosody::peer::PeerConfiguration;
 use std::env;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::LazyLock;
 use std::time::Duration as StdDuration;
 use tokio::runtime::{Builder, Runtime};
@@ -95,4 +97,11 @@ pub(crate) fn test_cassandra_config() -> CassandraConfiguration {
         password: None,
         retention: StdDuration::from_mins(10),
     }
+}
+
+/// The peer configuration for parallel integration tests.
+pub(crate) fn test_peer_config() -> color_eyre::Result<PeerConfiguration> {
+    Ok(PeerConfiguration::builder()
+        .bind_address(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .build()?)
 }

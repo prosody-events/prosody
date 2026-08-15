@@ -86,7 +86,7 @@ use crate::state::collection::{
 use crate::state::order_codec::{I64KeyCodec, KeyCodecError, OrderedKeyCodec, UnitKey};
 use crate::state::{CollectionKindId, StateAccessError, StoreOutcome};
 use async_stream::try_stream;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
@@ -222,6 +222,7 @@ impl OrderedKeyCodec for MapKeysetKey {
 /// byte-identity law on [`OrderedKeyCodec`] holds by construction. Exists to
 /// satisfy the supertrait; the keyset cell is only ever addressed at its one
 /// fixed coordinate.
+/// Every input form writes or checks the same fixed, empty coordinate.
 impl Codec for MapKeysetKey {
     type Error = KeyCodecError;
     type Payload = ();
@@ -232,7 +233,11 @@ impl Codec for MapKeysetKey {
         Self::decode(buf)
     }
 
-    fn serialize(&mut self, (): (), buf: &mut Vec<u8>) -> Result<(), KeyCodecError> {
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<(), KeyCodecError> {
+        Self::decode(&buf)
+    }
+
+    fn serialize_ref(&mut self, (): &(), buf: &mut Vec<u8>) -> Result<(), KeyCodecError> {
         buf.extend_from_slice(Self::encode(&()).as_bytes());
         Ok(())
     }
@@ -289,6 +294,9 @@ pub(crate) enum Keyset {
 /// The keyset cell's payload codec — the ONE decoder. Module-fixed by the Map
 /// kind, so its [`FORMAT_ID`](Codec::FORMAT_ID) never rides a collection's
 /// durable identity (the entries key codec `KC` alone does).
+/// Owned decoding transfers the frame allocation into coordinate slices.
+/// Borrowed decoding copies once to create those owned slices.
+/// Both serializers read coordinates without copying their backing storage.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MapKeysetCodec;
 
@@ -307,30 +315,45 @@ impl Codec for MapKeysetCodec {
         decode_keyset(&Bytes::copy_from_slice(buf))
     }
 
-    fn serialize(&mut self, payload: Keyset, buf: &mut Vec<u8>) -> Result<(), KeysetFrameError> {
-        match payload {
-            Keyset::Overflowed => {
-                buf.reserve(1);
-                buf.push(OVERFLOWED_TAG);
-            }
-            Keyset::Tracked(keys) => {
-                let count =
-                    u32::try_from(keys.len()).map_err(|_| KeysetFrameError::CountOverflow)?;
-                // Exact length with checked arithmetic *before* any reserve.
-                let total = tracked_frame_len(&keys).ok_or(KeysetFrameError::CountOverflow)?;
-                buf.reserve(total);
-                buf.push(TRACKED_TAG);
-                buf.extend_from_slice(&count.to_be_bytes());
-                for coordinate in &keys {
-                    let len = u32::try_from(coordinate.as_bytes().len())
-                        .map_err(|_| KeysetFrameError::CountOverflow)?;
-                    buf.extend_from_slice(&len.to_be_bytes());
-                    buf.extend_from_slice(coordinate.as_bytes());
-                }
+    fn deserialize_owned(&mut self, buf: BytesMut) -> Result<Keyset, KeysetFrameError> {
+        // Freezing transfers the allocation into each coordinate slice.
+        decode_keyset(&buf.freeze())
+    }
+
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<Keyset, KeysetFrameError> {
+        decode_keyset(&buf)
+    }
+
+    fn serialize_ref(
+        &mut self,
+        payload: &Keyset,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), KeysetFrameError> {
+        encode_keyset(payload, buf)
+    }
+}
+
+fn encode_keyset(payload: &Keyset, buf: &mut Vec<u8>) -> Result<(), KeysetFrameError> {
+    match payload {
+        Keyset::Overflowed => {
+            buf.reserve(1);
+            buf.push(OVERFLOWED_TAG);
+        }
+        Keyset::Tracked(keys) => {
+            let count = u32::try_from(keys.len()).map_err(|_| KeysetFrameError::CountOverflow)?;
+            let total = tracked_frame_len(keys).ok_or(KeysetFrameError::CountOverflow)?;
+            buf.reserve(total);
+            buf.push(TRACKED_TAG);
+            buf.extend_from_slice(&count.to_be_bytes());
+            for coordinate in keys {
+                let len = u32::try_from(coordinate.as_bytes().len())
+                    .map_err(|_| KeysetFrameError::CountOverflow)?;
+                buf.extend_from_slice(&len.to_be_bytes());
+                buf.extend_from_slice(coordinate.as_bytes());
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 /// The keyset cell's state as read at the top of a `set`, folding the typed

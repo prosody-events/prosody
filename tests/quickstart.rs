@@ -10,16 +10,19 @@
 #![recursion_limit = "256"]
 
 use color_eyre::eyre::{Result, eyre};
+use prosody::Topic;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
+use prosody::codec::JsonCodec;
 use prosody::high_level::CassandraHighLevelClient;
 use prosody::prelude::*;
 use prosody::tracing::init_test_logging;
-use prosody::{JsonCodec, Topic};
 use serde_json::json;
 use std::convert::Infallible;
 use tokio::sync::mpsc::{Sender, channel};
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
+
+mod common;
 
 #[derive(Clone)]
 struct MyHandler {
@@ -72,6 +75,10 @@ impl FallibleHandler for MyHandler {
     }
 }
 
+impl ClientHandler for MyHandler {
+    type Codecs = Codecs<JsonCodec, UnitCodec>;
+}
+
 #[tokio::test]
 async fn quickstart() -> Result<()> {
     init_test_logging();
@@ -107,17 +114,19 @@ async fn quickstart() -> Result<()> {
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_config,
+        peer: common::test_peer_config()?,
         ..ConsumerBuilders::new()?
     };
 
     let (sender, mut receiver) = channel(1);
 
-    let client = CassandraHighLevelClient::<MyHandler, JsonCodec>::new(
+    let client = CassandraHighLevelClient::<MyHandler>::new(
         cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-    )?;
+    )
+    .await?;
 
     client.subscribe(MyHandler { sender }).await?;
 

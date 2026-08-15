@@ -7,6 +7,7 @@ use crate::producer::ProducerConfiguration;
 use crate::telemetry::Telemetry;
 use parking_lot::Mutex;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+use std::mem::{replace, take};
 use std::sync::Arc;
 
 // === Error Classification Tests ===
@@ -60,7 +61,7 @@ fn dlq_send_failed_classifies_by_producer_error() {
 // `Result<inner::Output, inner::Error>` to the inner handler.
 
 /// Records the inner-result a probe handler observes in each apply hook.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum InnerHookEvent {
     Commit(Result<u64, TestError>),
     Abort(Result<u64, TestError>),
@@ -129,7 +130,7 @@ impl FallibleHandler for Probe {
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        self.timer_result.lock().clone()
+        replace(&mut *self.timer_result.lock(), Ok(0))
     }
 
     async fn after_commit<C>(&self, _context: C, result: Result<Self::Output, Self::Error>)
@@ -268,7 +269,7 @@ async fn apply_hook_routing_matrix() -> color_eyre::Result<()> {
             Hook::Abort => handler.after_abort(MockEventContext::new(), result).await,
         }
 
-        let events = log.lock().clone();
+        let events = take(&mut *log.lock());
         assert_eq!(
             events.len(),
             1,
@@ -371,7 +372,7 @@ mod settlement_pins {
     use crate::consumer::message::UncommittedMessage;
     use crate::consumer::middleware::tests::test_support::{
         MockEventContext as SessionContext, RecordingParts, StagingError, StagingHook,
-        StagingTransientHandler, committed_value, recording_session,
+        StagingTransientHandler, committed_json_value, recording_session,
     };
     use crate::consumer::middleware::{FallibleEventHandler, Settlement, SettlementHandler};
     use crate::consumer::partition::offsets::OffsetTracker;
@@ -445,7 +446,7 @@ mod settlement_pins {
         // had the error surfaced instead (no route), the boundary would have
         // recorded the Permanent marker or re-driven.
         assert_eq!(
-            committed_value(&cell_store, state_key, "cart").await?,
+            committed_json_value(&cell_store, state_key, "cart").await?,
             None,
             "the failed attempt's buffered write must not commit",
         );

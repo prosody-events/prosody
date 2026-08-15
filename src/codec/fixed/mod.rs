@@ -9,8 +9,10 @@
 //! components' ids so a composed codec names its own durable identity.
 
 use crate::codec::Codec;
+use crate::codec::const_id::ConstId;
+use bytes::{Bytes, BytesMut};
+use std::convert::Infallible;
 use std::error::Error;
-use std::str::from_utf8;
 use thiserror::Error;
 
 /// A [`Codec`] whose wire form is exactly [`WIDTH`](FixedCodec::WIDTH) bytes
@@ -28,6 +30,70 @@ pub trait FixedCodec: Codec {
     const WIDTH: usize;
 }
 
+/// Codec for an empty success value.
+/// Every input form has the same zero-cost implementation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnitCodec;
+
+impl Codec for UnitCodec {
+    type Error = UnitCodecError;
+    type Payload = ();
+
+    const FORMAT_ID: &'static str = "unit";
+
+    fn deserialize(&mut self, buf: &mut [u8]) -> Result<(), UnitCodecError> {
+        if buf.is_empty() {
+            Ok(())
+        } else {
+            Err(UnitCodecError { actual: buf.len() })
+        }
+    }
+
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<(), UnitCodecError> {
+        if buf.is_empty() {
+            Ok(())
+        } else {
+            Err(UnitCodecError { actual: buf.len() })
+        }
+    }
+
+    fn serialize_ref(&mut self, (): &(), _buf: &mut Vec<u8>) -> Result<(), UnitCodecError> {
+        Ok(())
+    }
+}
+
+impl FixedCodec for UnitCodec {
+    const WIDTH: usize = 0;
+}
+
+/// Codec for an error type that has no values.
+/// Every operation returns without reading or allocating storage.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InfallibleCodec;
+
+impl Codec for InfallibleCodec {
+    type Error = InfallibleCodecError;
+    type Payload = Infallible;
+
+    const FORMAT_ID: &'static str = "infallible";
+
+    fn deserialize(&mut self, _buf: &mut [u8]) -> Result<Infallible, InfallibleCodecError> {
+        Err(InfallibleCodecError)
+    }
+
+    fn deserialize_bytes(&mut self, _buf: Bytes) -> Result<Infallible, InfallibleCodecError> {
+        Err(InfallibleCodecError)
+    }
+
+    fn serialize_ref(
+        &mut self,
+        value: &Infallible,
+        _buf: &mut Vec<u8>,
+    ) -> Result<(), InfallibleCodecError> {
+        match *value {}
+    }
+}
+
 /// Plain big-endian `i64` payload codec (8 bytes).
 ///
 /// This is the *payload* encoding — the raw two's-complement big-endian bytes.
@@ -35,6 +101,8 @@ pub trait FixedCodec: Codec {
 /// encoding in [`order_codec`](crate::state::order_codec): a key codec must
 /// sort by memcmp, a payload codec need not, so the two never share bytes or a
 /// token.
+/// Owned and borrowed serialization both write one stack array.
+/// Both decode forms read eight bytes without allocation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct I64Codec;
 
@@ -49,7 +117,13 @@ impl Codec for I64Codec {
         Ok(i64::from_be_bytes(bytes))
     }
 
-    fn serialize(&mut self, payload: i64, buf: &mut Vec<u8>) -> Result<(), I64CodecError> {
+    fn deserialize_bytes(&mut self, buf: Bytes) -> Result<i64, I64CodecError> {
+        let bytes =
+            <[u8; 8]>::try_from(buf.as_ref()).map_err(|_| I64CodecError { actual: buf.len() })?;
+        Ok(i64::from_be_bytes(bytes))
+    }
+
+    fn serialize_ref(&mut self, payload: &i64, buf: &mut Vec<u8>) -> Result<(), I64CodecError> {
         buf.extend_from_slice(&payload.to_be_bytes());
         Ok(())
     }
@@ -65,6 +139,9 @@ impl FixedCodec for I64Codec {
 /// derived at compile time (see `ConstId`) so a composed codec asserts a
 /// durable identity distinct from either component's. Arity 2 only; a wider
 /// tuple is a macro away when a caller needs one.
+///
+/// Owned operations transfer each component. Borrowed operations preserve both.
+/// Owned decoding splits one buffer without copying its bytes.
 impl<A, B> Codec for (A, B)
 where
     A: FixedCodec,
@@ -98,6 +175,46 @@ where
         Ok((a, b))
     }
 
+    fn deserialize_owned(&mut self, mut buf: BytesMut) -> Result<Self::Payload, Self::Error> {
+        let expected = A::WIDTH + B::WIDTH;
+        if buf.len() != expected {
+            return Err(PairCodecError::Length {
+                expected,
+                actual: buf.len(),
+            });
+        }
+        let second = buf.split_off(A::WIDTH);
+        let a = self
+            .0
+            .deserialize_owned(buf)
+            .map_err(PairCodecError::First)?;
+        let b = self
+            .1
+            .deserialize_owned(second)
+            .map_err(PairCodecError::Second)?;
+        Ok((a, b))
+    }
+
+    fn deserialize_bytes(&mut self, mut buf: Bytes) -> Result<Self::Payload, Self::Error> {
+        let expected = A::WIDTH + B::WIDTH;
+        if buf.len() != expected {
+            return Err(PairCodecError::Length {
+                expected,
+                actual: buf.len(),
+            });
+        }
+        let second = buf.split_off(A::WIDTH);
+        let a = self
+            .0
+            .deserialize_bytes(buf)
+            .map_err(PairCodecError::First)?;
+        let b = self
+            .1
+            .deserialize_bytes(second)
+            .map_err(PairCodecError::Second)?;
+        Ok((a, b))
+    }
+
     fn serialize(&mut self, payload: Self::Payload, buf: &mut Vec<u8>) -> Result<(), Self::Error> {
         self.0
             .serialize(payload.0, buf)
@@ -106,6 +223,19 @@ where
             .serialize(payload.1, buf)
             .map_err(PairCodecError::Second)?;
         Ok(())
+    }
+
+    fn serialize_ref(
+        &mut self,
+        payload: &Self::Payload,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Self::Error> {
+        self.0
+            .serialize_ref(&payload.0, buf)
+            .map_err(PairCodecError::First)?;
+        self.1
+            .serialize_ref(&payload.1, buf)
+            .map_err(PairCodecError::Second)
     }
 }
 
@@ -116,73 +246,6 @@ where
 {
     // Const arithmetic over generic consts is legal (not an array length).
     const WIDTH: usize = A::WIDTH + B::WIDTH;
-}
-
-/// Compile-time builder for a composed [`Codec::FORMAT_ID`] such as `"(a,b)"`.
-///
-/// Component ids are appended through [`Self::push`], which rejects the
-/// composition delimiters `(`, `)`, `,` — a `const` panic, so it is a compile
-/// error. That keeps composition **injective**: `"(a,b)"` + `c` can never
-/// collide with `a` + `"b,c)"`, so two distinct compositions can never mint the
-/// same durable token. Overflowing the fixed buffer is likewise a compile
-/// error.
-struct ConstId {
-    buf: [u8; 128],
-    len: usize,
-}
-
-impl ConstId {
-    const fn new() -> Self {
-        Self {
-            buf: [0; 128],
-            len: 0,
-        }
-    }
-
-    /// Appends a component id, rejecting the reserved composition delimiters so
-    /// distinct compositions stay injective.
-    const fn push(mut self, s: &str) -> Self {
-        let bytes = s.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            assert!(
-                bytes[i] != b'(' && bytes[i] != b')' && bytes[i] != b',',
-                "codec id contains a reserved composition delimiter"
-            );
-            self.buf[self.len] = bytes[i]; // buffer overflow -> const panic = compile error
-            self.len += 1;
-            i += 1;
-        }
-        self
-    }
-
-    /// Appends the composition delimiters themselves, exempt from the reserved
-    /// character check.
-    const fn raw(mut self, s: &str) -> Self {
-        let bytes = s.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            self.buf[self.len] = bytes[i];
-            self.len += 1;
-            i += 1;
-        }
-        self
-    }
-
-    const fn as_static_str(&'static self) -> &'static str {
-        let (head, _) = self.buf.split_at(self.len);
-        // Every byte was copied whole from `&str` inputs, so `head` is always
-        // valid UTF-8; the assert fails closed (a compile error) if a builder
-        // edit ever breaks that, rather than minting a colliding empty id.
-        assert!(
-            from_utf8(head).is_ok(),
-            "composed codec id is not valid UTF-8"
-        );
-        match from_utf8(head) {
-            Ok(s) => s,
-            Err(_) => "",
-        }
-    }
 }
 
 /// Error from a fixed-width pair codec: a wrong combined length, or a failure
@@ -214,6 +277,19 @@ pub struct I64CodecError {
     /// The width the cell actually had.
     pub actual: usize,
 }
+
+/// Error from a [`UnitCodec`] buffer that contains bytes.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("bad unit codec width: expected 0, got {actual}")]
+pub struct UnitCodecError {
+    /// The unexpected byte count.
+    pub actual: usize,
+}
+
+/// Error from an attempt to decode an [`Infallible`] value.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("an infallible value has no wire representation")]
+pub struct InfallibleCodecError;
 
 #[cfg(test)]
 mod tests;

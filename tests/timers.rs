@@ -10,13 +10,15 @@
 use ahash::HashSet;
 use color_eyre::eyre::{Result, ensure, eyre};
 use prosody::cassandra::config::CassandraConfigurationBuilder;
+use prosody::codec::UnitCodec;
 use prosody::consumer::event_context::EventContext;
 use prosody::high_level::mode::Mode;
-use prosody::high_level::{CassandraHighLevelClient, ConsumerBuilders};
+use prosody::high_level::{CassandraHighLevelClient, ClientHandler, Codecs, ConsumerBuilders};
 use prosody::producer::ProducerConfigurationBuilder;
 use prosody::telemetry::TelemetryEmitterConfiguration;
 use prosody::tracing::init_test_logging;
 use prosody::{
+    JsonCodec,
     consumer::ConsumerConfigurationBuilder,
     consumer::message::{ConsumerMessage, UncommittedMessage},
     consumer::middleware::{CloneProvider, FallibleHandler},
@@ -273,6 +275,10 @@ impl FallibleHandler for InlineReplacementHandler {
     }
 }
 
+impl ClientHandler for InlineReplacementHandler {
+    type Codecs = Codecs<JsonCodec, UnitCodec>;
+}
+
 /// Test environment wrapping [`ConsumerEnv`] with the timer handler's event
 /// channels and timer-specific assertion helpers.
 struct TestEnvironment {
@@ -466,7 +472,7 @@ where
 /// Build a `HighLevelClient` for the inline-replacement test — the one test
 /// in this file that must drive `clear_and_schedule` through the full
 /// pipeline-mode middleware stack rather than the direct-consumer harness.
-fn build_inline_replacement_client(
+async fn build_inline_replacement_client(
     source_topic: &str,
     telemetry_topic: &str,
 ) -> Result<CassandraHighLevelClient<InlineReplacementHandler>> {
@@ -488,6 +494,7 @@ fn build_inline_replacement_client(
             topic: telemetry_topic.to_owned(),
             enabled: true,
         },
+        peer: common::test_peer_config()?,
         ..ConsumerBuilders::new()?
     };
 
@@ -499,7 +506,8 @@ fn build_inline_replacement_client(
         Mode::Pipeline,
         &mut producer_builder,
         &consumer_builders,
-    )?;
+    )
+    .await?;
     Ok(client)
 }
 
@@ -804,7 +812,7 @@ async fn inline_replacement_fires_once_at_replacement_time() -> Result<()> {
         let source_topic = source.to_string();
 
         let client: CassandraHighLevelClient<InlineReplacementHandler> =
-            build_inline_replacement_client(&source_topic, telemetry_topic.as_ref())?;
+            build_inline_replacement_client(&source_topic, telemetry_topic.as_ref()).await?;
 
         let (messages, mut msg_rx) = channel(16);
         let (replacement_time, mut replacement_time_rx) = channel(16);

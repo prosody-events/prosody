@@ -1,4 +1,4 @@
-//! Lazy construction of the client's shared reader family.
+//! Shared reader components for the high-level client.
 
 use crate::Codec;
 use crate::consumer::TypedConsumerSetup;
@@ -24,6 +24,21 @@ pub struct ReaderConfiguration {
     pub(super) cache_ttl: Option<Duration>,
 }
 
+pub(super) async fn build<C, B>(
+    config: &ReaderConfiguration,
+    backend: &B,
+) -> Result<StateReaderDependencies<C, B::Reader>, HighLevelClientError<C::Error>>
+where
+    C: Codec,
+    C::Payload: Clone,
+    B: ClientBackend<C>,
+{
+    backend
+        .build_reader(config)
+        .await
+        .map_err(HighLevelClientError::StateReader)
+}
+
 impl ReaderConfiguration {
     pub(super) fn from_mode(mode: &ModeConfiguration) -> Self {
         let (consumer, keyed_state) = match mode {
@@ -38,28 +53,13 @@ impl ReaderConfiguration {
             } => (consumer, &common.keyed_state),
         };
         Self {
-            loader: LoaderConfiguration::for_consumer(consumer),
+            loader: LoaderConfiguration::for_consumer(consumer, keyed_state.subsystem.as_ref()),
             group_id: consumer.group_id.clone(),
             stall_threshold: consumer.stall_threshold,
             cache_size: keyed_state.reader_cache_size(),
             cache_ttl: keyed_state.read_cache_ttl,
         }
     }
-}
-
-pub(super) async fn build<C, B>(
-    config: &ReaderConfiguration,
-    backend: &B,
-) -> Result<StateReaderDependencies<C, B::Reader>, HighLevelClientError<C::Error>>
-where
-    C: Codec,
-    C::Payload: Clone,
-    B: ClientBackend<C>,
-{
-    backend
-        .build_reader(config)
-        .await
-        .map_err(HighLevelClientError::StateReader)
 }
 
 pub(super) fn consumer_setup<'a, C, B>(

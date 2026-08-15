@@ -20,6 +20,7 @@ use tracing::{Span, debug};
 
 use crate::consumer::partition::offsets::UncommittedOffset;
 use crate::consumer::{Keyed, Uncommitted};
+use crate::peer::response::headers::ResultRequest;
 use crate::timers::PendingTimer;
 use crate::timers::store::TriggerStore;
 use crate::{EventIdentity, Key, Offset, Partition, ProcessScope, SourceSystem, Topic};
@@ -269,6 +270,13 @@ pub struct ConsumerMessageValue<P> {
     /// Record content.
     #[educe(Debug(ignore))]
     pub record: Record<P>,
+
+    /// Where a response to this message must go, when the record asked for one
+    /// and this consumer answers for one of the subsystems it awaits.
+    ///
+    /// Crate-internal deliberately: it is framework routing, not something
+    /// every cross-language binding has to express.
+    pub(crate) request: Option<ResultRequest>,
 }
 
 #[cfg(test)]
@@ -282,11 +290,23 @@ impl Default for ConsumerMessageValue<serde_json::Value> {
             key: "test-key".into(),
             timestamp: Utc::now(),
             record: Record::Message(serde_json::json!({})),
+            request: None,
         }
     }
 }
 
 impl<P> ConsumerMessage<P> {
+    /// Reports whether this consumer must respond to the message.
+    #[must_use]
+    pub fn response_requested(&self) -> bool {
+        self.value.request.is_some()
+    }
+
+    /// Where a response to this message must go, when the record asked for one.
+    pub(crate) fn request(&self) -> Option<ResultRequest> {
+        self.value.request
+    }
+
     /// Create a new `ConsumerMessage` from a message value and processing state
     /// components.
     #[must_use]
@@ -417,6 +437,7 @@ impl<P> ConsumerMessage<P> {
                 key,
                 timestamp: Utc::now(),
                 record: Record::Message(payload),
+                request: None,
             },
             Span::current(),
             permit,

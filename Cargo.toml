@@ -48,12 +48,17 @@ futures = "0.3"
 humantime = "2.3"
 internment = "0.8"
 intervallum = "1.4"
+itoa = "1"
+netdev = { version = "0.46", default-features = false, features = ["gateway"] }
 nohash-hasher = "0.2"
 opentelemetry = { version = "0.32", features = ["metrics"] }
 opentelemetry-otlp = { version = "0.32", features = [
     "grpc-tonic",
     "http-json",
     "http-proto",
+] }
+opentelemetry-semantic-conventions = { version = "0.32", features = [
+    "semconv_experimental",
 ] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 parking_lot = { version = "0.12", features = ["hardware-lock-elision"] }
@@ -62,6 +67,7 @@ paste = "1.0"
 pin-project = "1.1"
 portable-atomic = { version = "1.3", features = ["float"] }
 prosody-macros = { version = "0.5.0", path = "crates/prosody-macros" }
+prost = "0.14.4"
 quanta = "0.12"
 quick_cache = "0.7"
 rand = "0.10"
@@ -81,17 +87,23 @@ thiserror = "2.0"
 tokio = { version = "1.50", features = ["macros", "parking_lot", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["time"] }
+tonic = "0.14.6"
+tonic-health = "0.14.6"
+tonic-reflection = "0.14.6"
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",
     "parking_lot",
 ] }
-uuid = { version = "1.23", features = ["v4", "v5", "v8"] }
+uuid = { version = "1.23", features = ["v4", "v5", "v7", "v8"] }
 validator = { version = "0.21", features = ["derive"] }
 whoami = "2.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zstd = "0.13"
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"
 
 [features]
 default = ["cmake-build"]
@@ -130,6 +142,7 @@ color-eyre = "0.6"
 derive-quickcheck-arbitrary = "0.1"
 itertools = "0.15"
 opentelemetry_sdk = { version = "0.32", features = ["testing"] }
+prost-types = "0.14.4"
 quickcheck = "1.0"
 quickcheck_macros = "1.1"
 reqwest = "0.13"

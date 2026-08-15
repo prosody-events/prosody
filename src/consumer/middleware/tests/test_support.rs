@@ -8,17 +8,20 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bytes::Bytes;
 use educe::Educe;
+use futures::StreamExt;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tracing::Span;
 use uuid::Uuid;
 
 use crate::Key;
 use crate::consumer::event_context::{EventContext, StateAccessError, TerminationSignals};
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
+use crate::consumer::handler::EventHandler;
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, UncommittedMessage};
 use crate::consumer::middleware::{
     DemandType, FallibleHandler, RepinProof, Settlement, SettlementHandler,
 };
@@ -27,16 +30,17 @@ use crate::consumer::{Keyed, Uncommitted};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::{MemoryLoader, MessageLoader};
 use crate::state::cell::Committed;
-use crate::state::cell_key::{CellKey, Coordinate, Section};
+use crate::state::descriptor::tests::{FixedOracle, TestSession, test_session_parts};
 use crate::state::descriptor::{Registered, StateDescriptor, ValueDescriptor, value_state};
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::oracle::CommitOracle;
-use crate::state::registry::CollectionDefRegistry;
+use crate::state::registry::{CollectionDef, CollectionDefRegistry};
 use crate::state::session::{
     EventSession, KeyedStateSession, LifecycleAccess, SessionParts, TerminationWatch,
 };
 use crate::state::store::CellStore;
+use crate::state::tests::cell_suite::value_cell;
 use crate::state::tests::support::UnavailableState;
 use crate::state::{
     CollectionId, CommitDecision, EventRef, PartitionBackend, StateKey, StateName, StateType,
@@ -44,6 +48,117 @@ use crate::state::{
 use crate::timers::datetime::CompactDateTime;
 use crate::timers::duration::CompactDuration;
 use crate::timers::{TimerType, Trigger, UncommittedTimer};
+
+/// A context backed by a real keyed-state test session.
+pub type Ctx = MockEventContext<Value, TestSession>;
+
+/// A commit guard that reports when durability reaches the commit.
+///
+/// The guard then waits for test release. This pause makes the order between
+/// commit and a later apply hook observable. The report is a one-shot because
+/// a guard commits at most once.
+pub struct GatedGuard {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+    committed: Arc<AtomicUsize>,
+    aborted: Arc<AtomicUsize>,
+}
+
+impl GatedGuard {
+    /// Returns a guard, both gates, and its terminal counters.
+    pub fn new() -> (
+        Self,
+        oneshot::Receiver<()>,
+        oneshot::Sender<()>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let committed: Arc<AtomicUsize> = Arc::default();
+        let aborted: Arc<AtomicUsize> = Arc::default();
+        (
+            Self {
+                entered: entered_tx,
+                release: release_rx,
+                committed: Arc::clone(&committed),
+                aborted: Arc::clone(&aborted),
+            },
+            entered_rx,
+            release_tx,
+            committed,
+            aborted,
+        )
+    }
+}
+
+impl Uncommitted for GatedGuard {
+    async fn commit(self) {
+        let _send_result = self.entered.send(());
+        drop(self.release.await);
+        self.committed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn abort(self) {
+        self.aborted.fetch_add(1, Ordering::SeqCst);
+        drop(self.entered);
+    }
+}
+
+/// Returns the `cart` value descriptor.
+pub fn cart() -> ValueDescriptor {
+    value_state("cart")
+}
+
+/// Buffers one `cart` write through a real session.
+///
+/// The settle boundary owns the only stage. `configure` changes the context
+/// before the write.
+pub async fn buffered(
+    configure: impl FnOnce(Ctx) -> Ctx,
+) -> color_eyre::Result<(Ctx, MemoryCellStore<FixedOracle>, CollectionId)> {
+    let mut registry = CollectionDefRegistry::default();
+    registry.register(&cart(), CollectionDef::new(None))?;
+    let state_key = StateKey::new(Uuid::from_u128(0x7), Arc::from("user-1"));
+    let (session, cell_store) =
+        test_session_parts(MemoryLoader::new(), registry, state_key.clone());
+    let context = configure(MockEventContext::new().with_session(session));
+    let handle = context
+        .state(Registered::new(cart()))
+        .map_err(|error| color_eyre::eyre::eyre!("bind cart: {error}"))?;
+    handle.set(json!({ "x": 1_i32 })).await?;
+    let cart_id = CollectionId::new(
+        state_key,
+        StateType::Application,
+        StateName::try_new("cart")?,
+    );
+    Ok((context, cell_store, cart_id))
+}
+
+/// Reports whether `id` still has a provisional cell.
+pub async fn is_provisional(
+    cell_store: &MemoryCellStore<FixedOracle>,
+    id: &CollectionId,
+) -> color_eyre::Result<bool> {
+    let stream = cell_store.provisional_cells(id);
+    futures::pin_mut!(stream);
+    Ok(stream.next().await.transpose()?.is_some())
+}
+
+/// Returns the resolved value from a settled `cart` cell.
+pub async fn committed_value(
+    cell_store: &MemoryCellStore<FixedOracle>,
+    id: &CollectionId,
+) -> color_eyre::Result<Option<Bytes>> {
+    let probe = EventRef::Message {
+        dedup_id: Uuid::from_u128(u128::MAX),
+    };
+    cell_store
+        .get(id, &value_cell(), probe)
+        .await
+        .map(Committed::into_inner)
+        .map_err(|error| color_eyre::eyre::eyre!("read committed: {error}"))
+}
 
 /// Timer-operation error the mock injects on demand, carrying the category to
 /// classify as. The backstop arm is must-succeed (invariant 8), so it retries
@@ -468,7 +583,7 @@ impl<C: EventContext> TestLifecycleAccess for C {}
 
 /// Test error carrying its classification. Display matches the per-file
 /// originals (`test error (Transient)`) so no assertion text changes.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, PartialEq, Eq, Error)]
 #[error("test error ({0:?})")]
 pub struct TestError(pub ErrorCategory);
 
@@ -476,6 +591,39 @@ impl ClassifyError for TestError {
     fn classify_error(&self) -> ErrorCategory {
         self.0
     }
+}
+
+/// An [`EventHandler`] that commits every event and records nothing.
+///
+/// Startup and lifecycle tests build a real consumer and deliver nothing to it.
+/// This is the handler they give it.
+#[derive(Clone)]
+pub struct SilentHandler;
+
+impl EventHandler for SilentHandler {
+    type Payload = Value;
+
+    async fn on_message<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<Value>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        let (_, uncommitted) = message.into_inner();
+        uncommitted.commit().await;
+    }
+
+    async fn on_timer<C, T>(&self, _context: C, timer: T, _demand_type: DemandType)
+    where
+        C: EventContext<Payload = Self::Payload>,
+        T: UncommittedTimer,
+    {
+        timer.commit().await;
+    }
+
+    async fn shutdown(self) {}
 }
 
 /// A hook firing recorded by [`ScriptedHandler`], projected onto
@@ -1022,20 +1170,16 @@ pub fn recording_session_with_loader(
 
 /// The committed value at the single Value cell of `name` under `state_key`,
 /// failing on a store read error or undecodable bytes.
-pub async fn committed_value(
+pub async fn committed_json_value(
     cell_store: &MemoryCellStore<RecordingOracle>,
     state_key: StateKey,
     name: &str,
 ) -> color_eyre::Result<Option<Value>> {
     let id = CollectionId::new(state_key, StateType::Application, StateName::try_new(name)?);
-    let cell = CellKey {
-        section: Section::new(0),
-        coordinate: Coordinate::empty(),
-    };
     let probe = EventRef::Message {
         dedup_id: Uuid::from_u128(u128::MAX),
     };
-    match Committed::into_inner(cell_store.get(&id, &cell, probe).await?) {
+    match Committed::into_inner(cell_store.get(&id, &value_cell(), probe).await?) {
         Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         None => Ok(None),
     }

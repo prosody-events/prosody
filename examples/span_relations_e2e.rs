@@ -172,6 +172,10 @@ impl FallibleHandler for SpanProbe {
     }
 }
 
+impl ClientHandler for SpanProbe {
+    type Codecs = Codecs<JsonCodec, UnitCodec>;
+}
+
 /// Per-key trace/span ids and thread spreads for the sched and disp phases.
 type ProbeEvents = (
     BTreeMap<String, String>,
@@ -267,12 +271,13 @@ async fn main() -> Result<()> {
     };
 
     let (sender, mut receiver) = channel(keys * 2 + 4);
-    let client = CassandraHighLevelClient::<SpanProbe, JsonCodec>::new(
+    let client = CassandraHighLevelClient::<SpanProbe>::new(
         cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-    )?;
+    )
+    .await?;
 
     // One shared absolute fire time lands every timer in the same instant, so
     // the fires dispatch concurrently across the runtime's worker threads.

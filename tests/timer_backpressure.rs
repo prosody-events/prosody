@@ -142,6 +142,16 @@ async fn test_timer_backpressure() -> Result<()> {
         .subscribed_topics(&[topic.to_string()])
         .build()?;
 
+    // Set up the producer configuration. Every fallible step sits before the
+    // consumer starts, so nothing between its start and its shutdown can
+    // return early and leak the consumer or the topic.
+    let producer_config = ProducerConfiguration::builder()
+        .bootstrap_servers(bootstrap.clone())
+        .source_system("test-timer-producer")
+        .build()?;
+
+    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
+
     let slow_timer_handler = SlowTimerHandler { timers_tx };
     let consumer: ProsodyConsumer<JsonCodec> = ProsodyConsumer::new(
         &consumer_config,
@@ -151,14 +161,6 @@ async fn test_timer_backpressure() -> Result<()> {
         Telemetry::new(),
     )
     .await?;
-
-    // Set up the producer configuration
-    let producer_config = ProducerConfiguration::builder()
-        .bootstrap_servers(bootstrap.clone())
-        .source_system("test-timer-producer")
-        .build()?;
-
-    let producer = ProsodyProducer::<JsonCodec>::new(&producer_config, Telemetry::new().sender())?;
 
     // Send messages that will schedule timers
     let total = 500u32;

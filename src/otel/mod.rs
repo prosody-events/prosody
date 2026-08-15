@@ -3,9 +3,12 @@
 //! Shared across both the consumer and timer subsystems so neither has to
 //! depend on the other's module for a common configuration type.
 
+use opentelemetry::Context;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
+use tracing::{Span, debug};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Controls how a new span relates to a propagated OpenTelemetry context.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +110,34 @@ macro_rules! related_span {
             }
         }
     }};
+}
+
+/// Makes `span` the child of a carried `OTel` context.
+///
+/// The sibling of [`related_span!`] for a span that is not a consumer-side
+/// continuation: the call site writes the span and names its kind, and this
+/// carries the parent. A function rather than a second exported macro, because
+/// the kind differs per call site — an outbound peer call is `client` and the
+/// listener that receives it is `server` — and no call site needs the macro's
+/// source location. Taking the kind as a parameter here would move nothing: a
+/// tracing call site declares its own fields, so `otel.kind` is written where
+/// the span is written whatever this function takes.
+///
+/// Returns the context that downstream work must propagate. An enabled span
+/// returns its child context. A disabled span returns the carried context, so a
+/// level filter cannot break propagation.
+///
+/// A context that cannot be attached is logged. The work continues with the
+/// carried context.
+pub(crate) fn context_with_parent(span: &Span, context: Context) -> Context {
+    if span.is_disabled() {
+        return context;
+    }
+    if let Err(error) = span.set_parent(context.clone()) {
+        debug!(%error, "a carried trace context could not be attached");
+        return context;
+    }
+    span.context()
 }
 
 /// Error returned when parsing a [`SpanRelation`] from a string fails.

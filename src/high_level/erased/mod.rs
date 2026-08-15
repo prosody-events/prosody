@@ -1,24 +1,31 @@
 //! Optional type erasure for foreign-language client wrappers.
 
 use crate::cassandra::config::{CassandraConfigurationBuilder, CassandraConfigurationBuilderError};
+use crate::codec::ErasedStateCodec;
 use crate::consumer::MockConfigurationError;
-use crate::consumer::middleware::FallibleHandler;
+use crate::high_level::codecs::StateCodec;
 use crate::high_level::config::ModeConfiguration;
 use crate::high_level::state::ConsumerState;
 use crate::high_level::{
-    CassandraHighLevelClient, ClientBackend, ConsumerBuilders, HighLevelClient,
-    HighLevelClientError, MemoryHighLevelClient, Mode,
+    CassandraHighLevelClient, ClientBackend, ClientHandler, ConsumerBuilders, HighLevelClient,
+    HighLevelClientError, MemoryHighLevelClient, MessageCodec, MessageCodecError, Mode,
 };
+use crate::peer::requester::{RequestError, SubsystemOutcomes};
 use crate::producer::{ProducerConfiguration, ProducerConfigurationBuilder};
 use crate::state_reader::ConsumerReaderBackend;
-use crate::{Codec, EventIdentity, EventType, Topic};
+use crate::subsystem::SubsystemName;
+use crate::{EventIdentity, EventType, Topic};
 use async_trait::async_trait;
 use opentelemetry::propagation::TextMapCompositePropagator;
 use std::error::Error as StdError;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 mod readers;
+
+pub(super) use readers::{deque, map, value};
 
 pub use readers::{
     ErasedDequeReader, ErasedDirection, ErasedMapReader, ErasedReadCache, ErasedReaderBuildError,
@@ -28,6 +35,8 @@ pub use readers::{
 /// Consumer lifecycle state materialized across an FFI boundary.
 #[derive(Clone, Debug)]
 pub enum ErasedConsumerState<T> {
+    /// The client is shut down.
+    Shutdown,
     /// No valid consumer configuration exists.
     Unconfigured,
     /// Consumer configuration failed.
@@ -54,65 +63,304 @@ pub struct ErasedConsumerConfiguration {
     pub group_id: String,
 }
 
-/// Lifecycle operations used by foreign-language client wrappers.
-///
-/// Rust callers use [`HighLevelClient`] directly and pay no type-erasure cost.
 #[async_trait]
-pub trait ErasedHighLevelClient<T, C>: Send + Sync
+trait ErasedHighLevelClient<T>: Send + Sync
 where
-    C: Codec,
+    T: ClientHandler,
 {
-    /// Sends one event.
     async fn send(
         &self,
         topic: Topic,
         key: String,
-        payload: C::Payload,
-    ) -> Result<(), HighLevelClientError<C::Error>>;
+        payload: T::Payload,
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
     /// Sends one excise record.
-    async fn excise(&self, topic: Topic, key: String)
-    -> Result<(), HighLevelClientError<C::Error>>;
-    /// Starts consuming.
-    async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>>;
-    /// Stops consuming.
-    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>>;
-    /// Returns the current lifecycle state.
+    async fn excise(
+        &self,
+        topic: Topic,
+        key: String,
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
+    async fn request(
+        &self,
+        headers: Vec<(String, String)>,
+        topic: Topic,
+        key: String,
+        payload: T::Payload,
+        subsystems: Vec<SubsystemName>,
+        timeout: Duration,
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>>;
+    async fn subscribe(&self, handler: T)
+    -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
+    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
+    async fn shutdown(self: Box<Self>) -> Result<(), HighLevelClientError<MessageCodecError<T>>>;
     async fn consumer_state(&self) -> ErasedConsumerState<T>;
-    /// Builds a read-only view of one published value collection.
     async fn value_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedValueReader<C>, ErasedReaderBuildError<C::Error>>;
-    /// Builds a read-only view of one published string-keyed map collection.
+    ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec;
     async fn map_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<C>, ErasedReaderBuildError<C::Error>>;
-    /// Builds a read-only view of one published deque collection.
+    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec;
     async fn deque_state(
         &self,
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedDequeReader<C>, ErasedReaderBuildError<C::Error>>;
-    /// Returns the assigned partition count.
+    ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec;
     async fn assigned_partition_count(&self) -> u32;
-    /// Reports whether any consumer heartbeat is stalled.
     async fn is_stalled(&self) -> bool;
-    /// Producer configuration.
     fn producer_config(&self) -> &ProducerConfiguration;
-    /// Trace-context propagator.
-    fn propagator(&self) -> &TextMapCompositePropagator;
-    /// Configured source system.
-    fn source_system(&self) -> &str;
+    fn propagator(&self) -> &Arc<TextMapCompositePropagator>;
 }
 
-/// Shared erased client representation stored by native FFI wrappers.
-pub type SharedHighLevelClient<T, C> = Arc<dyn ErasedHighLevelClient<T, C>>;
+/// Shared FFI client with one concrete lifecycle owner.
+///
+/// Operations hold shared access until they finish. Shutdown takes exclusive
+/// access and consumes the concrete client.
+///
+/// Each foreign binding polls each operation in an independent task. Do not
+/// retain an operation future and await shutdown from the same task.
+pub struct SharedHighLevelClient<T>
+where
+    T: ClientHandler,
+{
+    client: Arc<RwLock<Option<Box<dyn ErasedHighLevelClient<T>>>>>,
+    producer_config: Arc<ProducerConfiguration>,
+    propagator: Arc<TextMapCompositePropagator>,
+}
+
+impl<T> Clone for SharedHighLevelClient<T>
+where
+    T: ClientHandler,
+{
+    fn clone(&self) -> Self {
+        Self {
+            client: Arc::clone(&self.client),
+            producer_config: Arc::clone(&self.producer_config),
+            propagator: Arc::clone(&self.propagator),
+        }
+    }
+}
+
+impl<T> SharedHighLevelClient<T>
+where
+    T: ClientHandler,
+{
+    fn new(client: Box<dyn ErasedHighLevelClient<T>>) -> Self {
+        let producer_config = Arc::new(client.producer_config().clone());
+        let propagator = Arc::clone(client.propagator());
+        Self {
+            client: Arc::new(RwLock::new(Some(client))),
+            producer_config,
+            propagator,
+        }
+    }
+
+    /// Sends one event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or Kafka rejects the event.
+    pub async fn send(
+        &self,
+        topic: Topic,
+        key: String,
+        payload: T::Payload,
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
+        client.send(topic, key, payload).await
+    }
+
+    /// Sends one excise record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or Kafka rejects the record.
+    pub async fn excise(
+        &self,
+        topic: Topic,
+        key: String,
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
+        client.excise(topic, key).await
+    }
+
+    /// Sends one request and returns one result per subsystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request is invalid or cannot start.
+    pub async fn request(
+        &self,
+        headers: Vec<(String, String)>,
+        topic: Topic,
+        key: String,
+        payload: T::Payload,
+        subsystems: Vec<SubsystemName>,
+        timeout: Duration,
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>> {
+        let guard = self.client.read().await;
+        let Some(client) = guard.as_deref() else {
+            return Err(RequestError::ShuttingDown);
+        };
+        client
+            .request(headers, topic, key, payload, subsystems, timeout)
+            .await
+    }
+
+    /// Starts consuming.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or cannot subscribe.
+    pub async fn subscribe(
+        &self,
+        handler: T,
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
+        client.subscribe(handler).await
+    }
+
+    /// Stops consuming.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or is not subscribed.
+    pub async fn unsubscribe(&self) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
+        client.unsubscribe().await
+    }
+
+    /// Shuts down the client and all its services.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or a service cannot stop.
+    pub async fn shutdown(self) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
+        let client = {
+            let mut guard = self.client.write().await;
+            guard.take().ok_or(HighLevelClientError::Closed)?
+        };
+        client.shutdown().await
+    }
+
+    /// Returns the current lifecycle state.
+    pub async fn consumer_state(&self) -> ErasedConsumerState<T> {
+        let guard = self.client.read().await;
+        let Some(client) = guard.as_deref() else {
+            return ErasedConsumerState::Shutdown;
+        };
+        client.consumer_state().await
+    }
+
+    /// Builds a read-only view of one published value collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or the reader is invalid.
+    pub async fn value_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
+        client.value_state(subsystem, name, cache).await
+    }
+
+    /// Builds a read-only view of one published string-keyed map collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or the reader is invalid.
+    pub async fn map_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
+        client.map_state(subsystem, name, cache).await
+    }
+
+    /// Builds a read-only view of one published deque collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is shut down or the reader is invalid.
+    pub async fn deque_state(
+        &self,
+        subsystem: String,
+        name: String,
+        cache: ErasedReadCache,
+    ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
+        let guard = self.client.read().await;
+        let client = guard.as_deref().ok_or(HighLevelClientError::Closed)?;
+        client.deque_state(subsystem, name, cache).await
+    }
+
+    /// Returns the assigned partition count.
+    pub async fn assigned_partition_count(&self) -> u32 {
+        let guard = self.client.read().await;
+        let Some(client) = guard.as_deref() else {
+            return 0;
+        };
+        client.assigned_partition_count().await
+    }
+
+    /// Reports whether any consumer heartbeat is stalled.
+    pub async fn is_stalled(&self) -> bool {
+        let guard = self.client.read().await;
+        let Some(client) = guard.as_deref() else {
+            return false;
+        };
+        client.is_stalled().await
+    }
+
+    /// Returns the producer configuration.
+    #[must_use]
+    pub fn producer_config(&self) -> &ProducerConfiguration {
+        &self.producer_config
+    }
+
+    /// Returns the trace-context propagator.
+    #[must_use]
+    pub fn propagator(&self) -> &TextMapCompositePropagator {
+        &self.propagator
+    }
+
+    /// Returns the configured source system.
+    #[must_use]
+    pub fn source_system(&self) -> &str {
+        &self.producer_config.source_system
+    }
+}
 
 /// Constructs and erases the backend selected by an FFI configuration.
 ///
@@ -120,52 +368,54 @@ pub type SharedHighLevelClient<T, C> = Arc<dyn ErasedHighLevelClient<T, C>>;
 ///
 /// Backend selection and backend-specific configuration validation happen
 /// here so every foreign-language client follows the same construction path.
-pub fn new_erased<T, C>(
+pub async fn new_erased<T>(
     mode: Mode,
     producer: &mut ProducerConfigurationBuilder,
     consumers: &ConsumerBuilders,
     cassandra: &CassandraConfigurationBuilder,
-) -> Result<SharedHighLevelClient<T, C>, ErasedClientBuildError<C::Error>>
+) -> Result<SharedHighLevelClient<T>, ErasedClientBuildError<MessageCodecError<T>>>
 where
-    T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-    C: Codec + Send + Sync,
-    C::Payload: EventIdentity + EventType + Clone,
+    T: ClientHandler + Clone + Send + Sync + 'static,
+    T::Payload: EventIdentity + EventType + Clone,
+    T::Output: Sync + 'static,
+    T::Error: Sync + 'static,
 {
     let mock = consumers.consumer.configured_mock()?;
 
     if mock {
-        Ok(Arc::new(ErasedClient(MemoryHighLevelClient::new(
-            mode, producer, consumers,
-        )?)))
+        Ok(SharedHighLevelClient::new(Box::new(ErasedClient(
+            MemoryHighLevelClient::new(mode, producer, consumers).await?,
+        ))))
     } else {
         let cassandra = cassandra.build()?;
-        Ok(Arc::new(ErasedClient(CassandraHighLevelClient::new(
-            cassandra, mode, producer, consumers,
-        )?)))
+        Ok(SharedHighLevelClient::new(Box::new(ErasedClient(
+            CassandraHighLevelClient::new(cassandra, mode, producer, consumers).await?,
+        ))))
     }
 }
 
-struct ErasedClient<T, C, B>(HighLevelClient<T, C, B>)
+struct ErasedClient<T, B>(HighLevelClient<T, B>)
 where
-    C: Codec,
-    C::Payload: EventIdentity,
-    B: ClientBackend<C>;
+    T: ClientHandler,
+    T::Payload: EventIdentity,
+    B: ClientBackend<MessageCodec<T>>;
 
 #[async_trait]
-impl<T, C, B> ErasedHighLevelClient<T, C> for ErasedClient<T, C, B>
+impl<T, B> ErasedHighLevelClient<T> for ErasedClient<T, B>
 where
-    T: FallibleHandler<Payload = C::Payload> + Clone + Send + Sync + 'static,
-    C: Codec + Send + Sync,
-    C::Payload: EventIdentity + EventType + Clone,
-    B: ClientBackend<C>,
-    B::Reader: ConsumerReaderBackend<C>,
+    T: ClientHandler + Clone + Send + Sync + 'static,
+    T::Payload: EventIdentity + EventType + Clone,
+    T::Output: Sync + 'static,
+    T::Error: Sync + 'static,
+    B: ClientBackend<MessageCodec<T>>,
+    B::Reader: ConsumerReaderBackend<MessageCodec<T>>,
 {
     async fn send(
         &self,
         topic: Topic,
         key: String,
-        payload: C::Payload,
-    ) -> Result<(), HighLevelClientError<C::Error>> {
+        payload: T::Payload,
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         self.0.send(topic, &key, payload).await
     }
 
@@ -173,16 +423,37 @@ where
         &self,
         topic: Topic,
         key: String,
-    ) -> Result<(), HighLevelClientError<C::Error>> {
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         self.0.excise(topic, &key).await
     }
 
-    async fn subscribe(&self, handler: T) -> Result<(), HighLevelClientError<C::Error>> {
+    async fn request(
+        &self,
+        headers: Vec<(String, String)>,
+        topic: Topic,
+        key: String,
+        payload: T::Payload,
+        subsystems: Vec<SubsystemName>,
+        timeout: Duration,
+    ) -> Result<SubsystemOutcomes<T::Output>, RequestError<MessageCodecError<T>>> {
+        self.0
+            .request_owned(headers, topic, key, payload, subsystems, timeout)
+            .await
+    }
+
+    async fn subscribe(
+        &self,
+        handler: T,
+    ) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         self.0.subscribe_inner(handler).await
     }
 
-    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<C::Error>> {
+    async fn unsubscribe(&self) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
         self.0.unsubscribe().await
+    }
+
+    async fn shutdown(self: Box<Self>) -> Result<(), HighLevelClientError<MessageCodecError<T>>> {
+        self.0.shutdown().await
     }
 
     async fn consumer_state(&self) -> ErasedConsumerState<T> {
@@ -208,8 +479,11 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedValueReader<C>, ErasedReaderBuildError<C::Error>> {
-        readers::value(&self.0, subsystem, name, cache).await
+    ) -> Result<SharedValueReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
+        value(&self.0, subsystem, &name, cache).await
     }
 
     async fn map_state(
@@ -217,8 +491,11 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedMapReader<C>, ErasedReaderBuildError<C::Error>> {
-        readers::map(&self.0, subsystem, name, cache).await
+    ) -> Result<SharedMapReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
+        map(&self.0, subsystem, &name, cache).await
     }
 
     async fn deque_state(
@@ -226,8 +503,11 @@ where
         subsystem: String,
         name: String,
         cache: ErasedReadCache,
-    ) -> Result<SharedDequeReader<C>, ErasedReaderBuildError<C::Error>> {
-        readers::deque(&self.0, subsystem, name, cache).await
+    ) -> Result<SharedDequeReader<StateCodec<T>>, ErasedReaderBuildError<MessageCodecError<T>>>
+    where
+        T::Payload: ErasedStateCodec,
+    {
+        deque(&self.0, subsystem, &name, cache).await
     }
 
     async fn assigned_partition_count(&self) -> u32 {
@@ -242,12 +522,8 @@ where
         self.0.producer_config()
     }
 
-    fn propagator(&self) -> &TextMapCompositePropagator {
-        self.0.propagator()
-    }
-
-    fn source_system(&self) -> &str {
-        self.0.source_system()
+    fn propagator(&self) -> &Arc<TextMapCompositePropagator> {
+        &self.0.propagator
     }
 }
 

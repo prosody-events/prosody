@@ -1,9 +1,11 @@
 //! Compile-time storage choices for the high-level client.
 
-use crate::cassandra::config::CassandraConfiguration;
+use crate::cassandra::CassandraStore;
 use crate::codec::Codec;
+use crate::consumer::ConsumerError;
 use crate::high_level::deps::ReaderConfiguration;
 use crate::loader::MemoryLoader;
+use crate::peer::{GrpcRouter, LocalRouter, PeerConfiguration, Router};
 use crate::state::memory::{MemoryCells, MemoryDescriptorIdentityStore, MemoryPublicationStore};
 use crate::state_reader::{
     CassandraReaderBackend, MemoryReaderBackend, ReaderBackend, StateReaderDependencies,
@@ -26,12 +28,20 @@ where
 {
     /// Reader components shared with the consumer.
     type Reader: ReaderBackend<C>;
+    /// Peer route selected with this backend.
+    type Router: Router;
 
     /// Builds the shared reader components.
     fn build_reader(
         &self,
         config: &ReaderConfiguration,
     ) -> impl Future<Output = Result<StateReaderDependencies<C, Self::Reader>, StateReaderError>> + Send;
+
+    /// Builds the peer route over the shared reader backend.
+    fn build_router(
+        &self,
+        config: &PeerConfiguration,
+    ) -> impl Future<Output = Result<Self::Router, ConsumerError>> + Send;
 }
 
 /// In-memory high-level client backend.
@@ -90,6 +100,7 @@ where
     C::Payload: Clone,
 {
     type Reader = MemoryReaderBackend<C>;
+    type Router = LocalRouter;
 
     async fn build_reader(
         &self,
@@ -106,20 +117,27 @@ where
         )
         .with_default_read_cache_ttl(config.cache_ttl))
     }
+
+    async fn build_router(
+        &self,
+        _config: &PeerConfiguration,
+    ) -> Result<Self::Router, ConsumerError> {
+        LocalRouter::new().await
+    }
 }
 
 /// Cassandra high-level client backend.
 pub struct CassandraClientBackend<C> {
-    config: CassandraConfiguration,
+    store: CassandraStore,
     codec: PhantomData<fn() -> C>,
 }
 
 impl<C> CassandraClientBackend<C> {
     /// Selects Cassandra storage.
     #[must_use]
-    pub fn new(config: CassandraConfiguration) -> Self {
+    pub fn new(store: CassandraStore) -> Self {
         Self {
-            config,
+            store,
             codec: PhantomData,
         }
     }
@@ -127,7 +145,7 @@ impl<C> CassandraClientBackend<C> {
 
 impl<C> Clone for CassandraClientBackend<C> {
     fn clone(&self) -> Self {
-        Self::new(self.config.clone())
+        Self::new(self.store.clone())
     }
 }
 
@@ -139,18 +157,26 @@ where
     C::Payload: Clone,
 {
     type Reader = CassandraReaderBackend<C>;
+    type Router = GrpcRouter;
 
     async fn build_reader(
         &self,
         config: &ReaderConfiguration,
     ) -> Result<StateReaderDependencies<C, Self::Reader>, StateReaderError> {
-        Ok(StateReaderDependencies::cassandra_with_loader(
-            &self.config,
+        Ok(StateReaderDependencies::cassandra_with_store(
+            self.store.clone(),
             config.loader.clone(),
             config.cache_size,
             config.stall_threshold,
         )
         .await?
         .with_default_read_cache_ttl(config.cache_ttl))
+    }
+
+    async fn build_router(
+        &self,
+        config: &PeerConfiguration,
+    ) -> Result<Self::Router, ConsumerError> {
+        GrpcRouter::new(config, self.store.clone()).await
     }
 }

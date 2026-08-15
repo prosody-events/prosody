@@ -6,6 +6,7 @@
 //! section discriminants and the `Meta` cell addresses.
 
 use super::*;
+use bytes::BytesMut;
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 
 /// The frozen cell addresses (a durable contract — the keyset family lowers to
@@ -66,7 +67,35 @@ fn round_trip(keyset: &Keyset) -> Result<Keyset, KeysetFrameError> {
     let mut codec = MapKeysetCodec;
     let mut buf = Vec::new();
     codec.serialize(keyset.clone(), &mut buf)?;
-    codec.deserialize(&mut buf)
+    let mut borrowed = Vec::new();
+    codec.serialize_ref(keyset, &mut borrowed)?;
+    assert_eq!(borrowed, buf, "both serializers must write the same bytes");
+    let owned = codec.deserialize_owned(BytesMut::from(buf.as_slice()))?;
+    let decoded = codec.deserialize(&mut buf)?;
+    assert_eq!(owned, decoded, "both decoders must read the same value");
+    Ok(decoded)
+}
+
+#[test]
+fn owned_keyset_decode_reuses_frame_storage() -> color_eyre::Result<()> {
+    let keyset = Keyset::Tracked(vec![
+        Coordinate::from_bytes("alpha"),
+        Coordinate::from_bytes("omega"),
+    ]);
+    let mut encoded = Vec::new();
+    MapKeysetCodec.serialize(keyset, &mut encoded)?;
+    let frame = BytesMut::from(encoded.as_slice());
+    let start = frame.as_ptr() as usize;
+    let end = start + frame.len();
+
+    let Keyset::Tracked(coordinates) = MapKeysetCodec.deserialize_owned(frame)? else {
+        color_eyre::eyre::bail!("tracked frame decoded as overflowed");
+    };
+    assert!(coordinates.iter().all(|coordinate| {
+        let pointer = coordinate.as_bytes().as_ptr() as usize;
+        (start..end).contains(&pointer)
+    }));
+    Ok(())
 }
 
 /// Decodes a raw frame through the codec (exercising the trait-boundary copy).

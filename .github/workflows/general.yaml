@@ -34,7 +34,7 @@ jobs:
     if: needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      RUSTFLAGS: -C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=mold
     services:
       kafka:
         image: apache/kafka:latest
@@ -75,7 +75,7 @@ jobs:
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@v1.6.0
         with:
-          packages: cmake libcurl4-openssl-dev
+          packages: cmake libcurl4-openssl-dev protobuf-compiler
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-nextest
@@ -114,7 +114,7 @@ jobs:
     if: needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      RUSTFLAGS: -C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v6
       - name: Install mold
@@ -124,7 +124,7 @@ jobs:
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@v1.6.0
         with:
-          packages: cmake libcurl4-openssl-dev
+          packages: cmake libcurl4-openssl-dev protobuf-compiler
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Install udeps from crates.io
@@ -140,7 +140,7 @@ jobs:
     if: needs.plan.outputs.docs == 'true' || needs.plan.outputs.build == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      RUSTFLAGS: -C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v6
       - name: Install mold
@@ -150,7 +150,7 @@ jobs:
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@v1.6.0
         with:
-          packages: cmake libcurl4-openssl-dev
+          packages: cmake libcurl4-openssl-dev protobuf-compiler
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check documentation

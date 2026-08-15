@@ -15,11 +15,12 @@
 #![recursion_limit = "256"]
 
 use color_eyre::eyre::{Result, eyre};
+use prosody::Topic;
 use prosody::admin::{AdminConfiguration, ProsodyAdminClient, TopicConfiguration};
+use prosody::codec::JsonCodec;
 use prosody::high_level::CassandraHighLevelClient;
 use prosody::prelude::*;
 use prosody::timers::duration::CompactDuration;
-use prosody::{JsonCodec, Topic};
 use serde_json::json;
 use std::convert::Infallible;
 use tokio::sync::mpsc::{Sender, channel};
@@ -27,6 +28,8 @@ use tokio::time::{Duration, timeout};
 use tracing::Span;
 use tracing::subscriber::set_global_default;
 use uuid::Uuid;
+
+mod common;
 
 /// Reports whether the handler's ambient span is exactly the event's span.
 #[derive(Clone)]
@@ -95,6 +98,10 @@ impl FallibleHandler for AmbientProbe {
     }
 }
 
+impl ClientHandler for AmbientProbe {
+    type Codecs = Codecs<JsonCodec, UnitCodec>;
+}
+
 #[tokio::test]
 async fn handlers_run_inside_their_event_spans() -> Result<()> {
     set_global_default(tracing_subscriber::registry())?;
@@ -130,16 +137,18 @@ async fn handlers_run_inside_their_event_spans() -> Result<()> {
 
     let consumer_builders = ConsumerBuilders {
         consumer: consumer_config,
+        peer: common::test_peer_config()?,
         ..ConsumerBuilders::new()?
     };
 
     let (sender, mut receiver) = channel(4);
-    let client = CassandraHighLevelClient::<AmbientProbe, JsonCodec>::new(
+    let client = CassandraHighLevelClient::<AmbientProbe>::new(
         cassandra_config.build()?,
         Mode::Pipeline,
         &mut producer_config,
         &consumer_builders,
-    )?;
+    )
+    .await?;
 
     let fire_at = CompactDateTime::now()?.add_duration(CompactDuration::new(2))?;
     client.subscribe(AmbientProbe { sender, fire_at }).await?;

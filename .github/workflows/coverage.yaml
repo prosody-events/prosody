@@ -32,7 +32,7 @@ jobs:
     if: needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      RUSTFLAGS: -C target-cpu=x86-64-v3 -C link-arg=-fuse-ld=mold
     services:
       kafka:
         image: apache/kafka:latest
@@ -74,12 +74,20 @@ jobs:
       - name: Install system dependencies
         uses: awalsh128/cache-apt-pkgs-action@v1.6.0
         with:
-          packages: cmake libcurl4-openssl-dev
+          packages: cmake libcurl4-openssl-dev protobuf-compiler
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install tarpaulin
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
         uses: baptiste0928/cargo-install@v3
         with:
-          crate: cargo-tarpaulin
+          crate: cargo-llvm-cov
+          locked: true
+      - name: Install cargo-nextest
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          locked: true
       - uses: Swatinem/rust-cache@v2
       - name: Initialize Cassandra migrations
         run: |
@@ -90,8 +98,9 @@ jobs:
           PROSODY_BOOTSTRAP_SERVERS: localhost:9094
       - name: Run code coverage
         run: |
-          cargo tarpaulin --skip-clean --timeout 3600 --out Json --output-dir coverage
-          echo "COVERAGE=$(jq -r '.coverage | round' coverage/tarpaulin-report.json)" >> $GITHUB_ENV
+          mkdir -p coverage
+          cargo llvm-cov nextest --json --output-path coverage/llvm-cov.json
+          echo "COVERAGE=$(jq -r '.data[0].totals.lines.percent | round' coverage/llvm-cov.json)" >> $GITHUB_ENV
           echo "BRANCH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_ENV
           echo "BADGE_PATH=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}/coverage-badge.svg" >> $GITHUB_ENV
         env:

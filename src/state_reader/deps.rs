@@ -111,7 +111,7 @@ where
     ) -> Result<Self, StateReaderError> {
         Ok(Self::cassandra_with_loader(
             cassandra,
-            LoaderConfiguration::for_consumer(consumer),
+            LoaderConfiguration::for_consumer(consumer, keyed_state.subsystem.as_ref()),
             keyed_state.reader_cache_size(),
             consumer.stall_threshold,
         )
@@ -125,11 +125,20 @@ where
         budget: NonZeroU64,
         stall_threshold: Duration,
     ) -> Result<Self, StateReaderError> {
-        let heartbeats = HeartbeatRegistry::new(loader.group_id.clone(), stall_threshold);
         let store = CassandraStore::new(cassandra)
             .await
             .map_err(|error| StateReaderError::store(&error))?;
-        let keyspace = &cassandra.keyspace;
+        Self::cassandra_with_store(store, loader, budget, stall_threshold).await
+    }
+
+    pub(crate) async fn cassandra_with_store(
+        store: CassandraStore,
+        loader: LoaderConfiguration,
+        budget: NonZeroU64,
+        stall_threshold: Duration,
+    ) -> Result<Self, StateReaderError> {
+        let heartbeats = HeartbeatRegistry::new(loader.group_id.clone(), stall_threshold);
+        let keyspace = store.keyspace();
         let (cells, identities, publications) = try_join!(
             CellQueries::new(store.session(), keyspace),
             IdentityQueries::new(store.session(), keyspace),
