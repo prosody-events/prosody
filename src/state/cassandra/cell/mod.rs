@@ -123,6 +123,7 @@ use decode::{BorrowedKeyedCellTtlRow, FramedKeyedCellRow, split_keyed_cell_ttl};
 use encoding::{EncodedPayload, encode_payload, select_encoding};
 use futures::{Stream, TryStreamExt, pin_mut};
 use scylla::client::session::Session;
+use scylla::response::query_result::QueryRowsResult;
 use scylla::serialize::SerializationError;
 use scylla::serialize::row::{RowSerializationContext, SerializeRow};
 use scylla::serialize::writers::RowWriter;
@@ -280,15 +281,12 @@ impl CassandraCellResources {
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, CassandraCellStoreError> {
         let (uniques, plan) = dedupe(batch);
-        let mut rows =
-            fetch_cells_batch(&self.session, &self.queries, id, section, &uniques).await?;
+        let rows = fetch_cells_batch(&self.session, &self.queries, id, section, &uniques).await?;
+        let mut rows = rows.into_iter().peekable();
         let mut answers: CellBuffer<Option<Bytes>> = SmallVec::with_capacity(uniques.len());
         for &coordinate in &uniques {
-            let committed = match rows.iter().position(|(found, ..)| found == coordinate) {
-                Some(pos) => {
-                    let (_, cell, _) = rows.swap_remove(pos);
-                    cell.project_committed().cloned()
-                }
+            let committed = match rows.next_if(|(found, ..)| found == coordinate) {
+                Some((_, cell, _)) => cell.project_committed().cloned(),
                 None => None,
             };
             answers.push(committed);
@@ -548,8 +546,8 @@ impl<O> CassandraStore<O> {
                     row: RowShape::Resolved(ResolvedRow {
                         ttl,
                         data: blob.data.as_deref(),
-                        encoding: blob.encoding,
-                        version: blob.version,
+                        encoding: blob.encoding(),
+                        version: blob.version(),
                         addr,
                     }),
                 },
@@ -616,7 +614,6 @@ where
             .map_err(ResolveCellError::Store)?;
         Ok(MarkerBlob {
             payload,
-            encoding,
             event: marker.event(),
         })
     }
@@ -827,17 +824,15 @@ where
         }
         // Resolve coordinates in first-occurrence input order. This order
         // matches the point-read oracle. An absent row resolves as `None`.
+        let mut rows = rows.into_iter().peekable();
         let mut answers: CacheBatch = SmallVec::with_capacity(uniques.len());
         for &coordinate in &uniques {
             let cell = CellKey {
                 section,
                 coordinate: Coordinate::clone(coordinate),
             };
-            let (raw, ttl) = match rows.iter().position(|(found, ..)| found == coordinate) {
-                Some(pos) => {
-                    let (_, cell, ttl) = rows.swap_remove(pos);
-                    (cell, ttl)
-                }
+            let (raw, ttl) = match rows.next_if(|(found, ..)| found == coordinate) {
+                Some((_, cell, ttl)) => (cell, ttl),
                 None => (Cell::Resolved(Committed::new(None)), None),
             };
             let committed = resolve_read(
@@ -944,10 +939,7 @@ where
             .fetch_add(1, Ordering::Relaxed);
         // Sorted-distinct IN list (no scatter plan — the output is survivor-only,
         // not index-aligned).
-        let mut uniques: CellBuffer<&Coordinate> = SmallVec::with_capacity(batch.len());
-        uniques.extend(batch.iter());
-        uniques.sort_unstable();
-        uniques.dedup();
+        let uniques = sorted_unique_coordinates(batch);
         // One IN query, reusing the TTL-bearing batch read; TTL is discarded in
         // the decoder. Never consults the oracle, never resolves, never writes —
         // no read-window marker resolve, exactly as `provisional_cell_at`.
@@ -1018,7 +1010,7 @@ where
                     row: RowShape::MarkerWrite(MarkerWriteRow {
                         ttl,
                         payload: &blob.payload,
-                        encoding: blob.encoding,
+                        encoding: blob.payload.encoding(),
                         event: blob.event,
                         addr: CellAddr::marker(pk),
                     }),
@@ -1035,8 +1027,8 @@ where
                         ttl,
                         data: blob.data.as_deref(),
                         prev_data: blob.prev_data.as_deref(),
-                        encoding: blob.encoding,
-                        version: blob.version,
+                        encoding: blob.encoding(),
+                        version: blob.version(),
                         event: write.event(),
                         addr,
                     }),
@@ -1302,13 +1294,23 @@ impl<'a> Pk<'a> {
 struct CellBlobs {
     data: Option<EncodedPayload>,
     prev_data: Option<EncodedPayload>,
-    encoding: Option<Encoding>,
-    version: Option<i32>,
+}
+
+impl CellBlobs {
+    fn encoding(&self) -> Option<Encoding> {
+        self.data
+            .as_ref()
+            .or(self.prev_data.as_ref())
+            .map(EncodedPayload::encoding)
+    }
+
+    fn version(&self) -> Option<i32> {
+        self.encoding().map(|_| INITIAL_VERSION)
+    }
 }
 
 struct MarkerBlob {
     payload: EncodedPayload,
-    encoding: Encoding,
     event: EventRef,
 }
 
@@ -1848,25 +1850,7 @@ async fn fetch_and_decode_cell(
     id: &CollectionId,
     cell: &CellKey,
 ) -> Result<Option<Cell>, CassandraCellStoreError> {
-    let pk = Pk::of(id);
-    let result = session
-        .session()
-        .execute_unpaged(
-            statement,
-            (
-                pk.segment_id,
-                pk.key,
-                pk.state_type,
-                pk.name,
-                CellKind::Cell,
-                i8::from(cell.section),
-                &cell.coordinate,
-            ),
-        )
-        .await
-        .map_err(CassandraStoreError::from)?
-        .into_rows_result()
-        .map_err(CassandraStoreError::from)?;
+    let result = fetch_cell_rows_result(session, statement, id, cell).await?;
     result
         .maybe_first_row::<decode::BorrowedRawCellRow<'_>>()
         .map_err(CassandraStoreError::from)?
@@ -1880,8 +1864,22 @@ async fn fetch_and_decode_cell_ttl(
     id: &CollectionId,
     cell: &CellKey,
 ) -> Result<Option<(Cell, Option<i32>)>, CassandraCellStoreError> {
+    let result = fetch_cell_rows_result(session, statement, id, cell).await?;
+    result
+        .maybe_first_row::<decode::BorrowedCellTtlRow<'_>>()
+        .map_err(CassandraStoreError::from)?
+        .map(decode::try_decode_cell_ttl)
+        .transpose()
+}
+
+async fn fetch_cell_rows_result(
+    session: &CassandraSession,
+    statement: &PreparedStatement,
+    id: &CollectionId,
+    cell: &CellKey,
+) -> Result<QueryRowsResult, CassandraCellStoreError> {
     let pk = Pk::of(id);
-    let result = session
+    session
         .session()
         .execute_unpaged(
             statement,
@@ -1898,12 +1896,7 @@ async fn fetch_and_decode_cell_ttl(
         .await
         .map_err(CassandraStoreError::from)?
         .into_rows_result()
-        .map_err(CassandraStoreError::from)?;
-    result
-        .maybe_first_row::<decode::BorrowedCellTtlRow<'_>>()
-        .map_err(CassandraStoreError::from)?
-        .map(decode::try_decode_cell_ttl)
-        .transpose()
+        .map_err(|error| CassandraCellStoreError::from(CassandraStoreError::from(error)))
 }
 
 /// Reads and decodes one bounded `IN` query in input resolution order.
@@ -2074,13 +2067,7 @@ fn encode_cell_blobs(
     let prev_data = prev
         .map(|payload| encode_payload(payload, encoding))
         .transpose()?;
-    let any = data.is_some() || prev_data.is_some();
-    Ok(CellBlobs {
-        data,
-        prev_data,
-        encoding: any.then_some(encoding),
-        version: any.then_some(INITIAL_VERSION),
-    })
+    Ok(CellBlobs { data, prev_data })
 }
 
 /// The batch-packing weight of a cell row: its blob bytes plus the fixed
@@ -2124,6 +2111,15 @@ fn decode_provisional_batch(
         }
     }
     out
+}
+
+/// Returns the sorted, distinct coordinates for one recovery query.
+fn sorted_unique_coordinates(batch: &CoordinateBatch) -> CellBuffer<&Coordinate> {
+    let mut coordinates: CellBuffer<&Coordinate> = SmallVec::with_capacity(batch.len());
+    coordinates.extend(batch.iter());
+    coordinates.sort_unstable();
+    coordinates.dedup();
+    coordinates
 }
 
 cassandra_queries! {

@@ -11,7 +11,7 @@ use std::ops::Deref;
 use thiserror::Error;
 use zstd::bulk::Compressor;
 use zstd::stream::read::Decoder;
-use zstd::zstd_safe::{self, DCtx};
+use zstd::zstd_safe::{self, DCtx, ResetDirective};
 
 const ZSTD_LEVEL: i32 = 0;
 pub(super) const CASSANDRA_COMPRESSION_BLOCK_BYTES: usize = 16 * 1024;
@@ -21,10 +21,11 @@ thread_local! {
 }
 
 /// One thread owns this codec state. Its scratch never escapes a codec call.
-/// The scratch retains the largest decoded capacity that this thread saw.
+/// Each scratch buffer retains the largest capacity that this thread saw.
 struct Codec {
     compressor: Compressor<'static>,
     decompressor: DCtx<'static>,
+    encode_scratch: Vec<u8>,
     decode_scratch: Vec<u8>,
 }
 
@@ -36,7 +37,18 @@ pub(super) enum EncodedPayload {
     /// Shared raw codec output.
     Raw(Bytes),
     /// Owned Zstd frame.
-    Zstd(Vec<u8>),
+    Zstd(Bytes),
+}
+
+impl EncodedPayload {
+    /// Returns the durable encoding that matches these bytes.
+    #[must_use]
+    pub(super) const fn encoding(&self) -> Encoding {
+        match self {
+            Self::Raw(_) => Encoding::Raw,
+            Self::Zstd(_) => Encoding::Zstd,
+        }
+    }
 }
 
 impl AsRef<[u8]> for EncodedPayload {
@@ -50,8 +62,7 @@ impl Deref for EncodedPayload {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Raw(bytes) => bytes,
-            Self::Zstd(bytes) => bytes,
+            Self::Raw(bytes) | Self::Zstd(bytes) => bytes,
         }
     }
 }
@@ -62,6 +73,7 @@ impl Codec {
             compressor: Compressor::new(ZSTD_LEVEL)?,
             decompressor: DCtx::try_create()
                 .ok_or_else(|| io::Error::other("Zstd decoder initialization failed"))?,
+            encode_scratch: Vec::new(),
             decode_scratch: Vec::new(),
         })
     }
@@ -130,58 +142,76 @@ pub(in crate::state::cassandra) fn decode_payload(
 }
 
 fn compress(raw: &[u8]) -> Result<EncodedPayload, EncodingError> {
-    CODEC.with(|slot| {
-        let mut codec = slot.borrow_mut();
-        if codec.is_none() {
-            *codec = Some(Codec::new().map_err(EncodingError::BadZstd)?);
-        }
-        let Some(codec) = codec.as_mut() else {
-            return Err(EncodingError::BadZstd(io::Error::other(
-                "Zstd codec initialization failed",
-            )));
-        };
-        let mut encoded = Vec::with_capacity(zstd_safe::compress_bound(raw.len()));
+    with_codec(|codec| {
+        codec.encode_scratch.clear();
+        codec
+            .encode_scratch
+            .reserve(zstd_safe::compress_bound(raw.len()));
         codec
             .compressor
-            .compress_to_buffer(raw, &mut encoded)
+            .compress_to_buffer(raw, &mut codec.encode_scratch)
             .map_err(EncodingError::BadZstd)?;
-        Ok(EncodedPayload::Zstd(encoded))
+        Ok(EncodedPayload::Zstd(Bytes::copy_from_slice(
+            &codec.encode_scratch,
+        )))
     })
 }
 
 fn decompress(bytes: &[u8]) -> Result<Bytes, EncodingError> {
-    CODEC.with(|slot| {
-        let mut codec = slot.borrow_mut();
-        if codec.is_none() {
-            *codec = Some(Codec::new().map_err(EncodingError::BadZstd)?);
-        }
-        let Some(codec) = codec.as_mut() else {
-            return Err(EncodingError::BadZstd(io::Error::other(
-                "Zstd codec initialization failed",
-            )));
-        };
-
+    with_codec(|codec| {
+        codec
+            .decompressor
+            .reset(ResetDirective::SessionOnly)
+            .map_err(zstd_error)?;
         codec.decode_scratch.clear();
-        if codec.decode_scratch.capacity() > 0
-            && codec
-                .decompressor
-                .decompress(&mut codec.decode_scratch, bytes)
-                .is_ok()
-        {
-            return Ok(Bytes::copy_from_slice(&codec.decode_scratch));
+        match zstd_safe::get_frame_content_size(bytes) {
+            Ok(Some(size)) => {
+                let size = usize::try_from(size).map_err(|_| {
+                    EncodingError::BadZstd(io::Error::other(
+                        "Zstd frame content size exceeds this platform",
+                    ))
+                })?;
+                codec.decode_scratch.reserve(size);
+                codec
+                    .decompressor
+                    .decompress(&mut codec.decode_scratch, bytes)
+                    .map_err(zstd_error)?;
+            }
+            Ok(None) => {
+                let Codec {
+                    decompressor,
+                    decode_scratch,
+                    ..
+                } = codec;
+                Decoder::with_context(Cursor::new(bytes), decompressor)
+                    .read_to_end(decode_scratch)
+                    .map_err(EncodingError::BadZstd)?;
+            }
+            Err(_) => {
+                return Err(EncodingError::BadZstd(io::Error::other(
+                    "invalid Zstd frame header",
+                )));
+            }
         }
-
-        codec.decode_scratch.clear();
-        let Codec {
-            decompressor,
-            decode_scratch,
-            ..
-        } = codec;
-        Decoder::with_context(Cursor::new(bytes), decompressor)
-            .read_to_end(decode_scratch)
-            .map_err(EncodingError::BadZstd)?;
-        Ok(Bytes::copy_from_slice(decode_scratch))
+        Ok(Bytes::copy_from_slice(&codec.decode_scratch))
     })
+}
+
+fn with_codec<T>(
+    operation: impl FnOnce(&mut Codec) -> Result<T, EncodingError>,
+) -> Result<T, EncodingError> {
+    CODEC.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let codec = match &mut *slot {
+            Some(codec) => codec,
+            empty @ None => empty.insert(Codec::new().map_err(EncodingError::BadZstd)?),
+        };
+        operation(codec)
+    })
+}
+
+fn zstd_error(code: usize) -> EncodingError {
+    EncodingError::BadZstd(io::Error::other(zstd_safe::get_error_name(code)))
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 use zstd::stream::encode_all;
+use zstd::zstd_safe::get_frame_content_size;
 
 struct FrameOwner {
     bytes: Vec<u8>,
@@ -315,6 +316,21 @@ fn prop_legacy_zstd_frames_decode() {
         }
     }
     QuickCheck::new().quickcheck(prop as fn(Vec<u8>) -> TestResult);
+}
+
+#[test]
+fn failed_stream_decode_does_not_poison_the_next_frame() -> Result<()> {
+    reset_codec();
+    let valid = encode_all(b"valid after corrupt".as_slice(), 0)?;
+    assert!(matches!(get_frame_content_size(&valid), Ok(None)));
+    let mut truncated = valid.clone();
+    truncated.truncate(truncated.len().saturating_sub(1));
+    assert!(decode_payload(&truncated, Encoding::Zstd).is_err());
+    assert_eq!(
+        decode_payload(&valid, Encoding::Zstd)?,
+        Bytes::from_static(b"valid after corrupt")
+    );
+    Ok(())
 }
 
 #[test]

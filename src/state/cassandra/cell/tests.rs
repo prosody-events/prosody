@@ -15,7 +15,7 @@ use super::decode::try_decode_marker;
 use super::{
     CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellKind, CellQueries, KeyRow, MarkerBlob,
     MarkerWriteRow, ResolvedRow, RowShape, StageRow, encode_cell_blobs, fits_one_batch,
-    marker_last_split,
+    marker_last_split, sorted_unique_coordinates,
 };
 use crate::cassandra::{BatchUnit, CassandraStore as CassandraSession};
 use crate::state::cached::Cached;
@@ -66,7 +66,7 @@ fn row_encoding_uses_the_larger_present_payload() -> Result<()> {
     let small = Bytes::from_static(b"small");
     let large = Bytes::from(vec![0x5A; CASSANDRA_COMPRESSION_BLOCK_BYTES + 1]);
     let blobs = encode_cell_blobs(Some(&small), Some(&large))?;
-    assert_eq!(blobs.encoding, Some(Encoding::Zstd));
+    assert_eq!(blobs.encoding(), Some(Encoding::Zstd));
     assert_eq!(
         super::encoding::decode_payload(
             blobs
@@ -1127,8 +1127,8 @@ fn mixed_binding_batch<'a>(
                     ttl: None,
                     data: blob_a.data.as_deref(),
                     prev_data: None,
-                    encoding: blob_a.encoding,
-                    version: blob_a.version,
+                    encoding: blob_a.encoding(),
+                    version: blob_a.version(),
                     event: event(2),
                     addr: addr_a,
                 }),
@@ -1151,8 +1151,8 @@ fn mixed_binding_batch<'a>(
                 row: RowShape::Resolved(ResolvedRow {
                     ttl: None,
                     data: blob_c.data.as_deref(),
-                    encoding: blob_c.encoding,
-                    version: blob_c.version,
+                    encoding: blob_c.encoding(),
+                    version: blob_c.version(),
                     addr: addr_c,
                 }),
             }],
@@ -1174,7 +1174,7 @@ fn mixed_binding_batch<'a>(
                 row: RowShape::MarkerWrite(MarkerWriteRow {
                     ttl: None,
                     payload: &marker_blob.payload,
-                    encoding: marker_blob.encoding,
+                    encoding: marker_blob.payload.encoding(),
                     event: event(2),
                     addr: CellAddr::marker(pk),
                 }),
@@ -1249,7 +1249,6 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
     let marker_encoding = select_encoding(marker_payload.len());
     let marker_blob = MarkerBlob {
         payload: encode_payload(&marker_payload, marker_encoding)?,
-        encoding: marker_encoding,
         event: event(2),
     };
     // One batch, one flatten, five distinct statements interleaved.
@@ -1893,8 +1892,8 @@ async fn markerless_provisional_is_sweep_invisible_but_first_touch_repairs() -> 
                 ttl: None,
                 data: blob.data.as_deref(),
                 prev_data: None,
-                encoding: blob.encoding,
-                version: blob.version,
+                encoding: blob.encoding(),
+                version: blob.version(),
                 event: staging,
                 addr: CellAddr::new(Pk::of(c.id()), &cell),
             }),
@@ -2176,6 +2175,24 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
         ),
         other => return Err(eyre!("expected PrevWithoutEvent, got {other:?}")),
     }
+    Ok(())
+}
+
+#[test]
+fn provisional_batch_coordinates_are_sorted_and_distinct() -> Result<()> {
+    let batch = CoordinateBatch::chunks(
+        [0xFE_u8, 0x01, 0x80, 0x01].map(|byte| Coordinate::from_bytes(vec![byte])),
+    )
+    .next()
+    .ok_or_else(|| eyre!("non-empty input must yield one batch"))?;
+    let coordinates = sorted_unique_coordinates(&batch);
+    assert_eq!(
+        coordinates
+            .iter()
+            .map(|coordinate| coordinate.as_bytes())
+            .collect::<Vec<_>>(),
+        vec![&[0x01_u8][..], &[0x80_u8][..], &[0xFE_u8][..]]
+    );
     Ok(())
 }
 
