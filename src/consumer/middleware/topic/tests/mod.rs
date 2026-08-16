@@ -10,6 +10,12 @@ use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use std::mem::{replace, take};
 use std::sync::Arc;
 
+#[test]
+fn failure_topic_source_kind_distinguishes_excise_records() {
+    assert_eq!(source_kind(&Record::<serde_json::Value>::Excise), "excise");
+    assert_eq!(source_kind(&Record::Message(serde_json::Value::Null)), "message");
+}
+
 // === Error Classification Tests ===
 
 #[test]

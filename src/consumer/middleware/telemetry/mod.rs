@@ -4,6 +4,9 @@
 //! metrics like execution time, success/failure rates, and error
 //! classifications without affecting the processing flow.
 //!
+//! Message telemetry represents Kafka record work. It includes message and
+//! excise records because both use the same offset lifecycle.
+//!
 //! # Execution Order
 //!
 //! **Request Path:**
@@ -206,6 +209,7 @@ where
         FallibleHandler::on_message(self, context, message, demand_type)
     }
 
+    /// Records invocation, success, and failure telemetry for a timer.
     async fn on_timer<C>(
         &self,
         context: C,

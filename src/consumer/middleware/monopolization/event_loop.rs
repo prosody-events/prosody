@@ -44,9 +44,10 @@ pub(super) async fn run_event_loop(
             KeyState::HandlerInvoked => {
                 const MAX_NANOS: u64 = u64::MAX - 1;
                 let open = [(elapsed_nanos, MAX_NANOS)].to_interval_set();
-                let intervals = key_intervals
-                    .get(&tp_key)
-                    .map_or_else(|| open.clone(), |current| current.union(&open));
+                let intervals = match key_intervals.get(&tp_key) {
+                    Some(current) => current.union(&open),
+                    None => open,
+                };
                 key_intervals.insert(tp_key.clone(), intervals);
                 trace!(
                     topic = %tp_key.topic,

@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn test_partition_manager_event_type_filtering() {
+async fn test_partition_manager_event_type_filtering() -> color_eyre::Result<()> {
     init_test_logging();
 
     let handler = TestHandler::new();
@@ -10,8 +10,7 @@ async fn test_partition_manager_event_type_filtering() {
     config.allowed_events = Some(
         AhoCorasick::builder()
             .start_kind(StartKind::Anchored)
-            .build(["allowed"])
-            .expect("Invalid event pattern"),
+            .build(["allowed"])?,
     );
     let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
@@ -26,10 +25,7 @@ async fn test_partition_manager_event_type_filtering() {
             ..Default::default()
         },
         Span::current(),
-        test_semaphore
-            .clone()
-            .try_acquire_owned()
-            .expect("Failed to acquire permit"),
+        test_semaphore.clone().try_acquire_owned()?,
     );
     assert!(partition_manager.try_send(disallowed).is_ok());
 
@@ -42,10 +38,7 @@ async fn test_partition_manager_event_type_filtering() {
             ..Default::default()
         },
         Span::current(),
-        test_semaphore
-            .clone()
-            .try_acquire_owned()
-            .expect("Failed to acquire permit"),
+        test_semaphore.clone().try_acquire_owned()?,
     );
     assert!(partition_manager.try_send(allowed).is_ok());
 
@@ -57,15 +50,11 @@ async fn test_partition_manager_event_type_filtering() {
             ..Default::default()
         },
         Span::current(),
-        test_semaphore
-            .try_acquire_owned()
-            .expect("Failed to acquire permit"),
+        test_semaphore.try_acquire_owned()?,
     );
     assert!(partition_manager.try_send(excise).is_ok());
 
-    wait_for_processed_offsets(&handler, 2, Duration::from_secs(1))
-        .await
-        .expect("The allowed message and excise record should be processed");
+    wait_for_processed_offsets(&handler, 2, Duration::from_secs(1)).await?;
 
     let processed = handler.processed_offsets.lock().await;
     assert_eq!(
@@ -75,6 +64,7 @@ async fn test_partition_manager_event_type_filtering() {
     );
 
     partition_manager.shutdown().await;
+    Ok(())
 }
 
 /// Waits for a specific number of messages to be processed or times out.
@@ -244,19 +234,20 @@ impl EventHandler for TestHandler {
 }
 
 /// Helper functions to create test messages.
-pub(super) fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage<serde_json::Value> {
+pub(super) fn create_test_message(
+    offset: Offset,
+    key: &str,
+) -> color_eyre::Result<ConsumerMessage<serde_json::Value>> {
     let semaphore = Arc::new(Semaphore::new(10));
-    ConsumerMessage::new(
+    Ok(ConsumerMessage::new(
         ConsumerMessageValue {
             offset,
             key: key.into(),
             ..Default::default()
         },
         Span::current(),
-        semaphore
-            .try_acquire_owned()
-            .expect("Failed to acquire permit"),
-    )
+        semaphore.try_acquire_owned()?,
+    ))
 }
 
 /// Timer and processing heartbeats stay integrated into partition stall
@@ -265,7 +256,7 @@ pub(super) fn create_test_message(offset: Offset, key: &str) -> ConsumerMessage<
 /// across a window several thresholds wide proves every registered heartbeat
 /// is actively beaten.
 #[tokio::test]
-async fn test_partition_manager_timer_heartbeat_integration() {
+async fn test_partition_manager_timer_heartbeat_integration() -> color_eyre::Result<()> {
     init_test_logging();
 
     let handler = TestHandler::new();
@@ -281,14 +272,12 @@ async fn test_partition_manager_timer_heartbeat_integration() {
 
     // Send a message to spin up the keyed processing loop and timer manager,
     // registering their heartbeats
-    let message = create_test_message(1, "test-key");
+    let message = create_test_message(1, "test-key")?;
     assert!(
         partition_manager.try_send(message).is_ok(),
         "Message send should succeed"
     );
-    wait_for_processed_offsets(&handler, 1, Duration::from_secs(1))
-        .await
-        .expect("Message should be processed");
+    wait_for_processed_offsets(&handler, 1, Duration::from_secs(1)).await?;
 
     // Negative-invariant observation window (~3× the stall threshold): by its
     // end every registered heartbeat is past the threshold unless actively
@@ -302,4 +291,5 @@ async fn test_partition_manager_timer_heartbeat_integration() {
     // Shutdown drains the in-flight commit, so the watermark reflects it
     let watermark = partition_manager.shutdown().await;
     assert_eq!(watermark, Some(1), "Shutdown should drain the commit");
+    Ok(())
 }

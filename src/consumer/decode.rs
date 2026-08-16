@@ -143,7 +143,7 @@ pub fn decode_message<C: Codec, R: ResultRequestReader>(
         debug!(
             topic = %topic,
             partition,
-            offset = %offset,
+            offset,
             key = %key,
             "decoded excise record"
         );

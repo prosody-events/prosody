@@ -11,6 +11,9 @@ pub enum FailureTopicError<E, P> {
     Handler(E),
 
     /// The producer did not accept the failure topic record.
+    ///
+    /// Classification uses `producer`. The inner error remains available for
+    /// the matching apply hook.
     #[error("failure-topic send failed: {producer}")]
     DlqSendFailed {
         /// The original handler error.
@@ -28,6 +31,8 @@ where
     fn classify_error(&self) -> ErrorCategory {
         match self {
             Self::Handler(error) => error.classify_error(),
+            // Outer retry reacts to the producer failure. The inner error is
+            // retained only for its apply hook.
             Self::DlqSendFailed { producer, .. } => producer.classify_error(),
         }
     }

@@ -13,7 +13,8 @@ use crate::consumer::event_context::EventContext;
 use crate::consumer::middleware::{ClassifyError, ErrorCategory, NextAttempt};
 use crate::{Offset, Partition};
 
-/// per-attempt apply-hook split).
+/// How [`RetryHandler::run`] resolved the final retry attempt.
+/// The run method owns apply hooks for non-final attempts.
 ///
 /// - [`Resolution::Commit`] — the final attempt is final from the inner's POV:
 ///   success, `Permanent`, or `Transient` after `max_retries`. The outer routes

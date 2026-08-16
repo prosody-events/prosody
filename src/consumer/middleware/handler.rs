@@ -18,6 +18,7 @@ use crate::timers::Trigger;
 ///   decisions — see [Error classification](#error-classification)).
 /// - [`on_message`](Self::on_message) — called for each Kafka message delivered
 ///   to the consumer.
+/// - [`on_excise`](Self::on_excise) — called for each excise record.
 /// - [`on_timer`](Self::on_timer) — called for each scheduled timer that fires
 ///   (when the consumer is configured with a timer system).
 /// - [`shutdown`](Self::shutdown) — called when the consumer stops or a
@@ -114,11 +115,12 @@ use crate::timers::Trigger;
 /// stack. It states what a `FallibleHandler` middleware (a wrapper around
 /// an inner handler) must do.
 ///
-/// 1. **Forward the handler methods.** Call the matching inner method for
-///    messages, excise records, and timers. Then decide whether to
-///    short-circuit, transform the result, or pass it through. Cascade
-///    `shutdown` by awaiting `self.inner.shutdown()` so inner resources are
-///    released.
+/// 1. **Forward the handler methods.** The stack calls middleware
+///    [`on_message`](Self::on_message) for messages and excise records. Apply
+///    the same message policy to both record types. The leaf adapter calls the
+///    user's matching method. Forward timers through
+///    [`on_timer`](Self::on_timer). Implement [`on_excise`](Self::on_excise)
+///    because the trait requires it. Cascade `shutdown` to the inner handler.
 ///
 /// 2. **Wrap the inner's error.** Define an enum like `enum MyError<E> {
 ///    Inner(E), MyOwn(...) }`. Implement [`ClassifyError`] for it by delegating

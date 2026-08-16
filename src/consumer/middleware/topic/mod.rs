@@ -271,7 +271,9 @@ where
             .timestamp()
             .to_rfc3339_opts(SecondsFormat::Millis, true);
 
-        // Attempt to process the message with the wrapped handler.
+        let source_kind = source_kind(message.record());
+
+        // Attempt to process the record with the wrapped handler.
         let error = match self
             .handler
             .on_message(context, message.clone(), demand_type)
@@ -288,7 +290,7 @@ where
                 partition,
                 key = key.as_ref(),
                 offset,
-                "terminal condition encountered while handling message: {error:#}; aborting"
+                "terminal condition encountered while handling {source_kind}: {error:#}; aborting"
             );
             return Err(FailureTopicError::Handler(error));
         }
@@ -299,13 +301,13 @@ where
             partition,
             key = key.as_ref(),
             offset,
-            "failed to process message: {error:#}; sending to {}",
+            "failed to process {source_kind}: {error:#}; sending to {}",
             self.topic
         );
 
         // Prepare headers for the failure message
         let headers = [
-            ("source-kind", "message"),
+            ("source-kind", source_kind),
             ("source-topic", topic),
             ("source-partition", &partition.to_string()),
             ("source-offset", &offset.to_string()),
@@ -351,6 +353,9 @@ where
         FallibleHandler::on_message(self, context, message, demand_type)
     }
 
+    /// Propagates timer failures without a failure-topic write.
+    ///
+    /// This method preserves the inner error category for outer middleware.
     async fn on_timer<C>(
         &self,
         context: C,
@@ -467,6 +472,13 @@ where
                 _ => Settlement::Bypassed,
             },
         }
+    }
+}
+
+const fn source_kind<P>(record: &Record<P>) -> &'static str {
+    match record {
+        Record::Message(_) => "message",
+        Record::Excise => "excise",
     }
 }
 

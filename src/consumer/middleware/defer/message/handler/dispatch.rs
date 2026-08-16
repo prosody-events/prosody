@@ -107,6 +107,10 @@ where
         FallibleHandler::on_message(self, context, message, demand_type)
     }
 
+    /// Keeps each deferred-message trigger inside this middleware.
+    ///
+    /// An empty queue returns `NoInner`. It does not enter the application
+    /// timer path. This rule preserves the reload identity across attempts.
     async fn on_timer<C>(
         &self,
         context: C,

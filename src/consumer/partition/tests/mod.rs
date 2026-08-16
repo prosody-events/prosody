@@ -89,7 +89,7 @@ fn default_config()
 }
 
 #[tokio::test]
-async fn test_partition_manager_capacity() {
+async fn test_partition_manager_capacity() -> color_eyre::Result<()> {
     init_test_logging();
 
     let handler = TestHandler::new();
@@ -99,7 +99,7 @@ async fn test_partition_manager_capacity() {
 
     // Send messages up to buffer capacity
     for i in 0..5u8 {
-        let message = create_test_message(Offset::from(i), "key");
+        let message = create_test_message(Offset::from(i), "key")?;
         assert!(
             partition_manager.try_send(message).is_ok(),
             "Message send should succeed"
@@ -107,20 +107,21 @@ async fn test_partition_manager_capacity() {
     }
 
     // Send one more message; it should be rejected because the buffer is full
-    let message = create_test_message(5, "key");
+    let message = create_test_message(5, "key")?;
     assert!(
         partition_manager.try_send(message).is_err(),
         "Message send should fail when buffer is full"
     );
 
     partition_manager.shutdown().await;
+    Ok(())
 }
 
 /// Same-key events are strictly serialized, in order: each handler holds its
 /// key "in processing" for a real delay, so any second same-key dispatch
 /// before the first completes would trip the concurrency flag.
 #[tokio::test]
-async fn test_partition_manager_ordering() {
+async fn test_partition_manager_ordering() -> color_eyre::Result<()> {
     init_test_logging();
 
     let handler = TestHandler::with_delay(Duration::from_millis(20));
@@ -130,7 +131,7 @@ async fn test_partition_manager_ordering() {
     // Send messages with the same key and increasing offsets
     let offsets = vec![0, 1, 2, 3];
     for &offset in &offsets {
-        let message = create_test_message(offset, "key");
+        let message = create_test_message(offset, "key")?;
         assert!(
             partition_manager.try_send(message).is_ok(),
             "Message send should succeed"
@@ -138,9 +139,7 @@ async fn test_partition_manager_ordering() {
     }
 
     // Wait for all messages to be processed
-    wait_for_processed_offsets(&handler, offsets.len(), Duration::from_secs(1))
-        .await
-        .expect("Messages should be processed");
+    wait_for_processed_offsets(&handler, offsets.len(), Duration::from_secs(1)).await?;
 
     // Verify messages were processed in order
     let processed_offsets = handler.processed_offsets.lock().await;
@@ -157,10 +156,11 @@ async fn test_partition_manager_ordering() {
     );
 
     partition_manager.shutdown().await;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_partition_manager_watermark() {
+async fn test_partition_manager_watermark() -> color_eyre::Result<()> {
     init_test_logging();
 
     let handler = TestHandler::new();
@@ -169,7 +169,7 @@ async fn test_partition_manager_watermark() {
 
     // Send sequential messages
     for i in 0..5 {
-        let message = create_test_message(i, "key");
+        let message = create_test_message(i, "key")?;
         assert!(
             partition_manager.try_send(message).is_ok(),
             "Message send should succeed"
@@ -177,19 +177,18 @@ async fn test_partition_manager_watermark() {
     }
 
     // Wait for all messages to be processed
-    wait_for_processed_offsets(&handler, 5, Duration::from_secs(1))
-        .await
-        .expect("Messages should be processed");
+    wait_for_processed_offsets(&handler, 5, Duration::from_secs(1)).await?;
 
     // Verify that watermark was updated correctly
     let watermark = partition_manager.watermark();
     assert_eq!(watermark, Some(4), "Watermark should be updated to 4");
 
     partition_manager.shutdown().await;
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_partition_manager_max_uncommitted() {
+async fn test_partition_manager_max_uncommitted() -> color_eyre::Result<()> {
     init_test_logging();
 
     let handler = TestHandler::new();
@@ -200,7 +199,7 @@ async fn test_partition_manager_max_uncommitted() {
 
     // Send more messages than max_uncommitted
     for i in 0..(max_uncommitted + 5) {
-        let message = create_test_message(i as Offset, "key");
+        let message = create_test_message(i as Offset, "key")?;
         assert!(
             partition_manager.try_send(message).is_ok(),
             "Message send should succeed"
@@ -208,11 +207,10 @@ async fn test_partition_manager_max_uncommitted() {
     }
 
     // Verify that only max_uncommitted messages are processed before backpressure
-    wait_for_processed_offsets(&handler, max_uncommitted, Duration::from_secs(1))
-        .await
-        .expect("Should process up to max_uncommitted messages");
+    wait_for_processed_offsets(&handler, max_uncommitted, Duration::from_secs(1)).await?;
 
     partition_manager.shutdown().await;
+    Ok(())
 }
 
 #[tokio::test]
@@ -289,7 +287,7 @@ async fn test_partition_manager_is_stalled() -> color_eyre::Result<()> {
     let partition_manager = PartitionManager::new(config, handler.clone(), "test-topic".into(), 0);
 
     // Send a message that is delayed in processing
-    let message = create_test_message(0, "key");
+    let message = create_test_message(0, "key")?;
     assert!(
         partition_manager.try_send(message).is_ok(),
         "Message send should succeed"

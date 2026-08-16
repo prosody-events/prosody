@@ -202,8 +202,6 @@ async fn wait_with_cancellation<C: EventContext>(
     }
 }
 
-/// How `RetryHandler::run` resolved the **final attempt** of a retry
-/// session (non-final attempts are not represented here; `run` owns the
 impl<P: Send + Sync + 'static> HandlerMiddleware<P> for RetryMiddleware {
     type Provider<T>
         = RetryProvider<T>
