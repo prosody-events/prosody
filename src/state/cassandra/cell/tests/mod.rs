@@ -17,14 +17,15 @@ mod batch_reads;
 mod compatibility;
 mod lifecycle;
 mod properties;
+mod repair;
 mod ttl_marker;
 
 use super::decode::try_decode_marker;
 use super::{
     CassandraStore, CellAddr, CellBatchRow, CellBlobs, CellCorruptReason, CellKind, CellQueries,
-    KeyRow, MarkerBlob, MarkerWriteRow, Pk, ResolvedRow, RowShape, StageRow, blob_weight,
-    decode_batch_rows, encode_cell_blobs, fits_one_batch, marker_delete_unit, marker_last_split,
-    sorted_unique_coordinates, ttl_seconds_to_duration,
+    KeyRow, MarkerBlob, MarkerWriteRow, Pk, ResolvedRow, RowShape, StageRow,
+    align_and_decode_batch_rows, blob_weight, encode_cell_blobs, fits_one_batch,
+    marker_delete_unit, marker_last_split, sorted_unique_coordinates, ttl_seconds_to_duration,
 };
 use super::{decode, encoding};
 use crate::cassandra::{BatchUnit, CassandraStore as CassandraSession};

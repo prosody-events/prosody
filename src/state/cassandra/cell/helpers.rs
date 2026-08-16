@@ -1,7 +1,7 @@
 use super::{
     Bytes, CassandraCellStoreError, Cell, CellBlobs, CellBuffer, CompactDuration, Coordinate,
-    CoordinateBatch, EncodedPayload, PER_STATEMENT_OVERHEAD, ProvisionalCell, SmallVec,
-    encode_payload, select_encoding,
+    CoordinateBatch, PER_STATEMENT_OVERHEAD, ProvisionalCell, SmallVec, encode_payload,
+    select_encoding,
 };
 
 /// Encodes a cell's `data` and `prev` payloads into their bound columns.
@@ -18,10 +18,10 @@ pub(super) fn encode_cell_blobs(
         .unwrap_or(0);
     let encoding = select_encoding(payload_len);
     let data = data
-        .map(|payload| encode_payload(payload, encoding).map(EncodedPayload::into_bytes))
+        .map(|payload| encode_payload(payload, encoding))
         .transpose()?;
     let prev_data = prev
-        .map(|payload| encode_payload(payload, encoding).map(EncodedPayload::into_bytes))
+        .map(|payload| encode_payload(payload, encoding))
         .transpose()?;
     Ok(CellBlobs {
         encoding: data.as_ref().or(prev_data.as_ref()).map(|_| encoding),
@@ -61,13 +61,16 @@ pub(super) fn ttl_seconds_to_duration(ttl: Option<i32>) -> Option<CompactDuratio
 /// Keeps provisional cells from a recovery batch and discards their TTLs.
 /// The input already follows ascending coordinate order.
 pub(super) fn decode_provisional_batch(
-    rows: CellBuffer<(Coordinate, Cell, Option<i32>)>,
+    rows: CellBuffer<Option<(Cell, Option<i32>)>>,
+    coordinates: &[&Coordinate],
 ) -> CellBuffer<(Coordinate, ProvisionalCell)> {
     let mut out: CellBuffer<(Coordinate, ProvisionalCell)> = SmallVec::with_capacity(rows.len());
-    for (coordinate, cell, _) in rows {
-        match cell {
-            Cell::Provisional(provisional) => out.push((coordinate, provisional)),
-            Cell::Resolved(_) => {}
+    for (&coordinate, row) in coordinates.iter().zip(rows) {
+        match row.map(|(cell, _)| cell) {
+            Some(Cell::Provisional(provisional)) => {
+                out.push((Coordinate::clone(coordinate), provisional));
+            }
+            Some(Cell::Resolved(_)) | None => {}
         }
     }
     out

@@ -1,8 +1,7 @@
 use super::{
     Arc, Bytes, CassandraCellResources, CassandraCellStoreError, CassandraSession, CellBuffer,
-    CellKey, CellQueries, CollectionId, CoordinateBatch, Scan, Section, SmallVec, Stream,
-    TryStreamExt, dedupe, fetch_and_decode_cell, fetch_cells_batch, page_cells, pin_mut,
-    try_stream,
+    CellKey, CellQueries, CollectionId, CoordinateBatch, Scan, Section, Stream, TryStreamExt,
+    dedupe, fetch_and_decode_cell, fetch_cells_batch, page_cells, pin_mut, try_stream,
 };
 
 impl CassandraCellResources {
@@ -55,15 +54,10 @@ impl CassandraCellResources {
     ) -> Result<CellBuffer<Option<Bytes>>, CassandraCellStoreError> {
         let (uniques, plan) = dedupe(batch);
         let rows = fetch_cells_batch(&self.session, &self.queries, id, section, &uniques).await?;
-        let mut rows = rows.into_iter().peekable();
-        let mut answers: CellBuffer<Option<Bytes>> = SmallVec::with_capacity(uniques.len());
-        for &coordinate in &uniques {
-            let committed = match rows.next_if(|(found, ..)| found == coordinate) {
-                Some((_, cell, _)) => cell.project_committed().cloned(),
-                None => None,
-            };
-            answers.push(committed);
-        }
+        let answers: CellBuffer<Option<Bytes>> = rows
+            .into_iter()
+            .map(|row| row.and_then(|(cell, _)| cell.project_committed().cloned()))
+            .collect();
         let out: CellBuffer<Option<Bytes>> = plan.iter().map(|&i| answers[i].clone()).collect();
         debug_assert_eq!(
             out.len(),

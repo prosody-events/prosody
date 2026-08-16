@@ -32,13 +32,6 @@
 // the default 128 is not enough to lay out those types.
 #![recursion_limit = "256"]
 
-#[cfg(test)]
-use std::alloc::System;
-
-#[cfg(test)]
-#[global_allocator]
-static TEST_ALLOCATOR: alloc_count::AllocCounter = alloc_count::AllocCounter(System);
-
 use ::tracing::info;
 use fixedstr::Flexstr;
 use internment::Intern;

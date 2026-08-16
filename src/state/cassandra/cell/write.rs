@@ -63,12 +63,12 @@ where
     let mut units: Vec<BatchUnit<CellBatchRow>> = Vec::with_capacity(writes.len() + 1);
     if let Some(blob) = &marker_blob {
         units.push(BatchUnit::new(
-            blob.payload.len() as u64 + PER_STATEMENT_OVERHEAD,
+            blob.payload.as_ref().len() as u64 + PER_STATEMENT_OVERHEAD,
             smallvec![CellBatchRow {
                 statement: marker_stmt,
                 row: RowShape::MarkerWrite(MarkerWriteRow {
                     ttl,
-                    payload: &blob.payload,
+                    payload: blob.payload.as_ref(),
                     encoding: blob.payload.encoding(),
                     event: blob.event,
                     addr: CellAddr::marker(pk),

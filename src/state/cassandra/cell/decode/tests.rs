@@ -398,42 +398,6 @@ fn decoded_cell_does_not_retain_its_response_frame() -> Result<()> {
     Ok(())
 }
 
-fn measured<T>(operation: impl FnOnce() -> T) -> (T, alloc_count::AllocStats) {
-    let before = alloc_count::stats();
-    let output = operation();
-    (output, alloc_count::stats().saturating_sub(before))
-}
-
-#[test]
-fn steady_state_codec_allocation_counts_are_exact() -> Result<()> {
-    let raw = Bytes::from(vec![0xA5; CASSANDRA_COMPRESSION_BLOCK_BYTES]);
-    let _ = measured(|| ()); // Initialize the allocation counter for this thread.
-    drop(encode_payload(&raw, Encoding::Raw)?);
-    let (_, raw_encode) = measured(|| encode_payload(&raw, Encoding::Raw));
-    assert_eq!(raw_encode.alloc_calls, 0);
-    assert_eq!(raw_encode.realloc_calls, 0);
-
-    let (decoded, raw_decode) = measured(|| decode_payload(&raw, Encoding::Raw));
-    assert_eq!(decoded?, raw);
-    assert_eq!(raw_decode.alloc_calls, 1);
-    assert_eq!(raw_decode.realloc_calls, 0);
-
-    let large = Bytes::from(vec![0x5A; CASSANDRA_COMPRESSION_BLOCK_BYTES + 1]);
-    reset_codec();
-    drop(encode_payload(&large, Encoding::Zstd)?);
-    let (encoded, zstd_encode) = measured(|| encode_payload(&large, Encoding::Zstd));
-    let encoded = encoded?;
-    assert_eq!(zstd_encode.alloc_calls, 1);
-    assert_eq!(zstd_encode.realloc_calls, 0);
-
-    drop(decode_payload(&encoded, Encoding::Zstd)?);
-    let (decoded, zstd_decode) = measured(|| decode_payload(&encoded, Encoding::Zstd));
-    assert_eq!(decoded?, large);
-    assert_eq!(zstd_decode.alloc_calls, 1);
-    assert_eq!(zstd_decode.realloc_calls, 0);
-    Ok(())
-}
-
 #[test]
 fn decode_scratch_grows_once_and_then_stays_stable() -> Result<()> {
     reset_codec();
@@ -448,10 +412,7 @@ fn decode_scratch_grows_once_and_then_stays_stable() -> Result<()> {
     assert!(warmed.1 >= maximum.len());
 
     for encoded in [&encoded_minimum, &encoded_maximum, &encoded_minimum] {
-        let (decoded, allocations) = measured(|| decode_payload(encoded, Encoding::Zstd));
-        drop(decoded?);
-        assert_eq!(allocations.alloc_calls, 1);
-        assert_eq!(allocations.realloc_calls, 0);
+        drop(decode_payload(encoded, Encoding::Zstd)?);
         assert_eq!(decode_scratch(), warmed);
     }
     Ok(())

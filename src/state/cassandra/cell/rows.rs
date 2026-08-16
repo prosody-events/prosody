@@ -1,5 +1,5 @@
 use super::{
-    Bytes, CellKey, CellKind, CollectionId, EncodedPayload, Encoding, EventRef, INITIAL_VERSION,
+    Bytes, CellKey, CellKind, CollectionId, EncodedBlob, Encoding, EventRef, INITIAL_VERSION,
     PreparedStatement, StateType,
 };
 
@@ -45,7 +45,7 @@ impl CellBlobs {
 }
 
 pub(super) struct MarkerBlob {
-    pub(super) payload: EncodedPayload,
+    pub(super) payload: EncodedBlob,
     pub(super) event: EventRef,
 }
 

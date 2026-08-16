@@ -16,7 +16,7 @@ use super::*;
 /// batch — see [`mixed_binding_batch`]).
 #[tokio::test]
 async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Result<()> {
-    use super::encoding::{encode_payload, select_encoding};
+    use super::encoding::encode;
     use super::{Pk, marker_delete_unit};
     use crate::state::cell_key::Coordinate;
     use crate::state::marker::encode_marker_payload;
@@ -63,9 +63,9 @@ async fn mixed_statement_batch_binds_each_statement_to_its_own_columns() -> Resu
         ProvisionalWrite::new(Some(data_a.clone()), Committed::new(None), event(2)),
     )];
     let marker_payload = encode_marker_payload(&EventMarker::frozen(event(2), &staged_a, &[]))?;
-    let marker_encoding = select_encoding(marker_payload.len());
+    let payload = encode(&marker_payload)?;
     let marker_blob = MarkerBlob {
-        payload: encode_payload(&marker_payload, marker_encoding)?,
+        payload,
         event: event(2),
     };
     // One batch, one flatten, five distinct statements interleaved.

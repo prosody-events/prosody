@@ -106,9 +106,10 @@ use helpers::{
 };
 pub use queries::CellQueries;
 #[cfg(test)]
-use read::decode_batch_rows;
+use read::align_and_decode_batch_rows;
 use read::{
-    fetch_and_decode_cell, fetch_and_decode_cell_ttl, fetch_cells_batch, into_store_err, page_cells,
+    decode_batch_rows, decode_cell_ttl_result, fetch_and_decode_cell, fetch_cell_rows_result,
+    fetch_cells_batch, fetch_cells_batch_result, into_store_err, page_cells,
 };
 use rows::{
     CellAddr, CellBatchRow, CellBlobs, GapBetweenRow, GapEdgeRow, GapSectionRow, KeyRow,
@@ -146,7 +147,7 @@ use ahash::RandomState;
 use async_stream::try_stream;
 use bytes::Bytes;
 use decode::{BorrowedKeyedCellTtlRow, FramedKeyedCellRow, split_keyed_cell_ttl};
-use encoding::{EncodedPayload, encode_payload, select_encoding};
+use encoding::{EncodedBlob, encode, encode_payload, select_encoding};
 use futures::{Stream, TryStreamExt, pin_mut};
 use scylla::client::session::Session;
 use scylla::response::query_result::QueryRowsResult;

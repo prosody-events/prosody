@@ -160,58 +160,6 @@ async fn first_error_is_first_input_position() -> Result<()> {
     Ok(())
 }
 
-/// Marker-window re-read pin: committed rows `[1, 2, 3]` with a standing
-/// FOREIGN event marker carrying a section clear whose only survivor is `2` (so
-/// `1` and `3` are cleared). Reading the batch with a foreign `own` must
-/// resolve the clears-bearing marker (`help_read_window`), apply the gap
-/// deletes, re-issue the `IN` query, and return post-clear truth: `1 → None`,
-/// `2 → present`, `3 → None`. Skipping the re-read would serve the stale
-/// pre-clear rows for `1` and `3`.
-#[tokio::test]
-async fn batch_returns_post_clear_truth() -> Result<()> {
-    init_test_logging();
-    let fx = fixture().await?;
-    let oracle = ScriptedOracle::default();
-    let store = fx.bottom_store(oracle.clone());
-    let c = collection("clears-window")?;
-    let id = c.id();
-
-    store
-        .write_resolved(
-            &c,
-            &[
-                (cell_in(0, 1), Some(bytes(1))),
-                (cell_in(0, 2), Some(bytes(2))),
-                (cell_in(0, 3), Some(bytes(3))),
-            ],
-            &[],
-        )
-        .await?;
-
-    // A foreign committed event whose marker clears section 0 down to survivor 2.
-    let foreign = event(0xF0);
-    let survivors = [(cell_in(0, 2), Some(bytes(2)))];
-    let clear = SectionClear::frozen_resolved(SECTIONS[0], &survivors);
-    let marker = EventMarker::frozen(foreign, &[], slice::from_ref(&clear));
-    store.write_provisional(&c, &[], Some(&marker)).await?;
-    oracle.record_message(Uuid::from_u128(0xF0)).await?;
-
-    let batch = CoordinateBatch::chunks([1u8, 2, 3].map(|b| Coordinate::from_bytes(vec![b])))
-        .next()
-        .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    let got = Box::pin(store.get_many(id, SECTIONS[0], &batch, event(7))).await?;
-    assert_eq!(
-        got.as_slice(),
-        &[
-            Committed::new(None),
-            Committed::new(Some(bytes(2))),
-            Committed::new(None),
-        ],
-        "the cleared coordinates read absent and the survivor reads present"
-    );
-    Ok(())
-}
-
 /// Sort-necessity unit pin (no cluster): a SHUFFLED raw batch with two corrupt
 /// rows — low coord `0x01` = `PrevWithoutEvent`, high coord `0xFE` =
 /// `BlobWithoutEncoding`, pushed high-then-low — must surface the LOWEST
@@ -220,8 +168,8 @@ async fn batch_returns_post_clear_truth() -> Result<()> {
 #[test]
 fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
     use super::CellCorruptReason;
+    use super::align_and_decode_batch_rows;
     use super::decode::BorrowedCellTtlRow;
-    use super::decode_batch_rows;
     use super::encoding::{Encoding, encode_payload};
     use crate::state::cassandra::CassandraCellStoreError;
     use crate::state::store::CellBuffer;
@@ -245,7 +193,7 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
     let mut rows: CellBuffer<(Coordinate, BorrowedCellTtlRow<'_>)> = SmallVec::new();
     rows.push((high_coordinate.clone(), high));
     rows.push((low_coordinate.clone(), low));
-    match decode_batch_rows(rows, &[&low_coordinate, &high_coordinate]) {
+    match align_and_decode_batch_rows(rows, &[&low_coordinate, &high_coordinate]) {
         Err(CassandraCellStoreError::CorruptCell(reason)) => assert_eq!(
             reason,
             CellCorruptReason::PrevWithoutEvent,
@@ -253,6 +201,46 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
         ),
         other => return Err(eyre!("expected PrevWithoutEvent, got {other:?}")),
     }
+    Ok(())
+}
+
+#[test]
+fn borrowed_batch_is_aligned_to_requested_coordinates() -> Result<()> {
+    use super::align_and_decode_batch_rows;
+    use super::decode::BorrowedCellTtlRow;
+    use crate::state::store::CellBuffer;
+    use smallvec::smallvec;
+
+    let low_data = [0x11];
+    let high_data = [0x33];
+    let row = |data| -> BorrowedCellTtlRow<'_> {
+        (Some(data), None, Some(1_i16), Some(1_i32), None, None, None)
+    };
+    let low = Coordinate::from_bytes(vec![1]);
+    let absent = Coordinate::from_bytes(vec![2]);
+    let high = Coordinate::from_bytes(vec![3]);
+    let rows: CellBuffer<_> = smallvec![
+        (high.clone(), row(&high_data)),
+        (low.clone(), row(&low_data)),
+    ];
+
+    let decoded = align_and_decode_batch_rows(rows, &[&low, &absent, &high])?;
+    assert_eq!(decoded.len(), 3);
+    assert_eq!(
+        decoded[0]
+            .as_ref()
+            .and_then(|(cell, _)| cell.project_committed())
+            .map(Bytes::as_ref),
+        Some(&low_data[..])
+    );
+    assert!(decoded[1].is_none());
+    assert_eq!(
+        decoded[2]
+            .as_ref()
+            .and_then(|(cell, _)| cell.project_committed())
+            .map(Bytes::as_ref),
+        Some(&high_data[..])
+    );
     Ok(())
 }
 

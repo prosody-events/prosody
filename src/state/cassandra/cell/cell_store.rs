@@ -6,10 +6,10 @@ use super::{
     CollectionRef, CommitOracle, Committed, CommittedBatch, CompactDuration, Coordinate,
     CoordinateBatch, EventMarker, EventRef, KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell,
     ProvisionalWrite, ResolveCellError, RowShape, Scan, Section, SectionClear, SmallVec, Stream,
-    decode, decode_provisional_batch, dedupe, encode_cell_blobs, extend_gap_units, flatten_resolve,
-    gap_count, help_read_window, help_write_window, into_store_err, resolve_read, section_batches,
-    smallvec, sorted_unique_coordinates, try_stream, ttl_seconds_to_duration, ttl_to_i32,
-    write_provisional,
+    decode, decode_batch_rows, decode_cell_ttl_result, decode_provisional_batch, dedupe,
+    encode_cell_blobs, extend_gap_units, flatten_resolve, gap_count, help_read_window,
+    help_write_window, into_store_err, resolve_read, section_batches, smallvec,
+    sorted_unique_coordinates, try_stream, ttl_seconds_to_duration, ttl_to_i32, write_provisional,
 };
 
 impl<O> CellStore for CassandraStore<O>
@@ -45,7 +45,7 @@ where
         // resolved (foreign + clears), the pre-help row may hold a now-erased
         // value, so the point read is re-issued.
         let (row, standing) = futures::join!(
-            self.point_read_cell_ttl(&self.queries.read_cell_ttl, collection, cell),
+            self.point_read_cell_result(&self.queries.read_cell_ttl, collection, cell),
             self.standing_marker(collection),
         );
         let mut row = row.map_err(ResolveCellError::Store)?;
@@ -60,11 +60,11 @@ where
         .map_err(flatten_resolve)?
         {
             row = self
-                .point_read_cell_ttl(&self.queries.read_cell_ttl, collection, cell)
+                .point_read_cell_result(&self.queries.read_cell_ttl, collection, cell)
                 .await
                 .map_err(ResolveCellError::Store)?;
         }
-        let (raw, ttl) = match row {
+        let (raw, ttl) = match decode_cell_ttl_result(&row).map_err(ResolveCellError::Store)? {
             Some(decoded) => decoded,
             None => (Cell::Resolved(Committed::new(None)), None),
         };
@@ -114,7 +114,7 @@ where
         // rows may hold now-erased values, so the whole `IN` query is re-issued
         // once.
         let (rows, standing) = futures::join!(
-            self.batch_read(collection, section, &uniques),
+            self.batch_read_result(collection, section, &uniques),
             self.standing_marker(collection),
         );
         let mut rows = rows.map_err(ResolveCellError::Store)?;
@@ -129,21 +129,19 @@ where
         .map_err(flatten_resolve)?
         {
             rows = self
-                .batch_read(collection, section, &uniques)
+                .batch_read_result(collection, section, &uniques)
                 .await
                 .map_err(ResolveCellError::Store)?;
         }
-        // Resolve coordinates in first-occurrence input order. This order
-        // matches the point-read oracle. An absent row resolves as `None`.
-        let mut rows = rows.into_iter().peekable();
+        let rows = decode_batch_rows(&rows, &uniques).map_err(ResolveCellError::Store)?;
         let mut answers: CacheBatch = SmallVec::with_capacity(uniques.len());
-        for &coordinate in &uniques {
+        for (&coordinate, row) in uniques.iter().zip(rows) {
             let cell = CellKey {
                 section,
                 coordinate: Coordinate::clone(coordinate),
             };
-            let (raw, ttl) = match rows.next_if(|(found, ..)| found == coordinate) {
-                Some((_, cell, ttl)) => (cell, ttl),
+            let (raw, ttl) = match row {
+                Some((cell, ttl)) => (cell, ttl),
                 None => (Cell::Resolved(Committed::new(None)), None),
             };
             let committed = resolve_read(
@@ -258,7 +256,7 @@ where
             .batch_read(collection, section, &uniques)
             .await
             .map_err(ResolveCellError::Store)?;
-        Ok(decode_provisional_batch(rows))
+        Ok(decode_provisional_batch(rows, &uniques))
     }
 
     async fn write_provisional<'a>(

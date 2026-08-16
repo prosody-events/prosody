@@ -104,6 +104,49 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
     Ok(())
 }
 
+/// Cassandra stores a payload at or below its compression block unchanged.
+/// A raw CQL read freezes both the bytes and the encoding discriminator.
+#[tokio::test]
+async fn cassandra_data_column_is_raw_through_the_block_size() -> Result<()> {
+    use crate::cassandra::TABLE_KEYED_STATE_CELL;
+
+    init_test_logging();
+    let fx = fixture().await?;
+    let store = fx.bottom_store(ScriptedOracle::default());
+    let c = collection("raw-format")?;
+    let cell = value_cell();
+    let payload = Bytes::from_static(b"raw durable payload");
+    store
+        .write_resolved(&c, &[(cell, Some(payload.clone()))], &[])
+        .await?;
+
+    let cql = format!(
+        "SELECT data, encoding FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} WHERE segment_id = ? \
+         AND key = ? AND state_type = ? AND name = ?"
+    );
+    let id = c.id();
+    let (data, encoding) = fx
+        .cassandra
+        .session()
+        .query_unpaged(
+            cql,
+            (
+                id.state_key().segment_id,
+                id.state_key().key.as_ref(),
+                i8::from(id.state_type()),
+                id.name().as_str(),
+            ),
+        )
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(Option<Vec<u8>>, Option<i16>)>()?
+        .ok_or_else(|| eyre!("cell row missing"))?;
+
+    assert_eq!(data.as_deref(), Some(payload.as_ref()));
+    assert_eq!(encoding, Some(1));
+    Ok(())
+}
+
 /// A cell whose `event_ref` UDT carries a `timer_type` outside `{0,1,2,3}`
 /// (external CQL corruption, or a forward-compat cross-version writer) must
 /// reject the **one row** as `CorruptUdt`/`Permanent`, not tear the partition
@@ -396,7 +439,7 @@ pub(super) fn mixed_binding_batch<'a>(
                 statement: &q.marker_write_no_ttl,
                 row: RowShape::MarkerWrite(MarkerWriteRow {
                     ttl: None,
-                    payload: &marker_blob.payload,
+                    payload: marker_blob.payload.as_ref(),
                     encoding: marker_blob.payload.encoding(),
                     event: event(2),
                     addr: CellAddr::marker(pk),

@@ -7,7 +7,6 @@ use crate::error::{ClassifyError, ErrorCategory};
 use bytes::Bytes;
 use std::cell::RefCell;
 use std::io;
-use std::ops::Deref;
 use thiserror::Error;
 use zstd::bulk::Compressor;
 use zstd::zstd_safe::{self, DCtx, ResetDirective};
@@ -30,49 +29,22 @@ struct Codec {
     decode_scratch: Vec<u8>,
 }
 
-/// Encoded bytes for one Cassandra blob.
-///
-/// Raw values share the codec output. Zstd values own the compressor output.
-#[derive(Debug)]
-pub(super) enum EncodedPayload {
-    /// Shared raw codec output.
-    Raw(Bytes),
-    /// Owned Zstd frame.
-    Zstd(Bytes),
+/// Encoded bytes paired with their durable discriminator.
+pub(super) struct EncodedBlob {
+    bytes: Bytes,
+    encoding: Encoding,
 }
 
-impl EncodedPayload {
-    /// Returns the durable encoding that matches these bytes.
+impl EncodedBlob {
     #[must_use]
     pub(super) const fn encoding(&self) -> Encoding {
-        match self {
-            Self::Raw(_) => Encoding::Raw,
-            Self::Zstd(_) => Encoding::Zstd,
-        }
-    }
-
-    /// Returns the encoded bytes without their encoding tag.
-    #[must_use]
-    pub(super) fn into_bytes(self) -> Bytes {
-        match self {
-            Self::Raw(bytes) | Self::Zstd(bytes) => bytes,
-        }
+        self.encoding
     }
 }
 
-impl AsRef<[u8]> for EncodedPayload {
+impl AsRef<[u8]> for EncodedBlob {
     fn as_ref(&self) -> &[u8] {
-        self
-    }
-}
-
-impl Deref for EncodedPayload {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Raw(bytes) | Self::Zstd(bytes) => bytes,
-        }
+        &self.bytes
     }
 }
 
@@ -80,8 +52,7 @@ impl Codec {
     fn new() -> io::Result<Self> {
         Ok(Self {
             compressor: Compressor::new(ZSTD_LEVEL)?,
-            decompressor: DCtx::try_create()
-                .ok_or_else(|| io::Error::other("Zstd decoder initialization failed"))?,
+            decompressor: DCtx::create(),
             encode_scratch: Vec::new(),
             decode_scratch: Vec::new(),
         })
@@ -132,11 +103,17 @@ pub(super) fn select_encoding(payload_len: usize) -> Encoding {
 pub(in crate::state::cassandra) fn encode_payload(
     payload: &Bytes,
     encoding: Encoding,
-) -> Result<EncodedPayload, EncodingError> {
+) -> Result<Bytes, EncodingError> {
     match encoding {
         Encoding::Zstd => compress(payload),
-        Encoding::Raw => Ok(EncodedPayload::Raw(payload.clone())),
+        Encoding::Raw => Ok(payload.clone()),
     }
+}
+
+/// Selects an encoding and returns it with the matching encoded bytes.
+pub(super) fn encode(payload: &Bytes) -> Result<EncodedBlob, EncodingError> {
+    let encoding = select_encoding(payload.len());
+    encode_payload(payload, encoding).map(|bytes| EncodedBlob { bytes, encoding })
 }
 
 /// Decodes durable payload bytes into a compact owned value.
@@ -150,7 +127,7 @@ pub(in crate::state::cassandra) fn decode_payload(
     }
 }
 
-fn compress(raw: &[u8]) -> Result<EncodedPayload, EncodingError> {
+fn compress(raw: &[u8]) -> Result<Bytes, EncodingError> {
     with_codec(|codec| {
         codec.encode_scratch.clear();
         codec
@@ -160,9 +137,7 @@ fn compress(raw: &[u8]) -> Result<EncodedPayload, EncodingError> {
             .compressor
             .compress_to_buffer(raw, &mut codec.encode_scratch)
             .map_err(EncodingError::BadZstd)?;
-        Ok(EncodedPayload::Zstd(Bytes::copy_from_slice(
-            &codec.encode_scratch,
-        )))
+        Ok(Bytes::copy_from_slice(&codec.encode_scratch))
     })
 }
 

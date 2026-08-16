@@ -6,6 +6,8 @@ use super::{
     split_keyed_cell_ttl, try_stream,
 };
 
+pub(super) type DecodedBatch = CellBuffer<Option<(Cell, Option<i32>)>>;
+
 /// Maps a raw Cassandra error into the resolving store error, generic only over
 /// the oracle error type `E` the caller's stream carries.
 pub(super) fn into_store_err<E: Error + 'static>(error: CassandraStoreError) -> CellStoreError<E> {
@@ -26,13 +28,9 @@ pub(super) async fn fetch_and_decode_cell(
         .transpose()
 }
 
-pub(super) async fn fetch_and_decode_cell_ttl(
-    session: &CassandraSession,
-    statement: &PreparedStatement,
-    id: &CollectionId,
-    cell: &CellKey,
+pub(super) fn decode_cell_ttl_result(
+    result: &QueryRowsResult,
 ) -> Result<Option<(Cell, Option<i32>)>, CassandraCellStoreError> {
-    let result = fetch_cell_rows_result(session, statement, id, cell).await?;
     result
         .maybe_first_row::<decode::BorrowedCellTtlRow<'_>>()
         .map_err(CassandraStoreError::from)?
@@ -77,9 +75,20 @@ pub(super) async fn fetch_cells_batch(
     id: &CollectionId,
     section: Section,
     uniques: &[&Coordinate],
-) -> Result<CellBuffer<(Coordinate, Cell, Option<i32>)>, CassandraCellStoreError> {
+) -> Result<DecodedBatch, CassandraCellStoreError> {
+    let result = fetch_cells_batch_result(session, queries, id, section, uniques).await?;
+    decode_batch_rows(&result, uniques)
+}
+
+pub(super) async fn fetch_cells_batch_result(
+    session: &CassandraSession,
+    queries: &CellQueries,
+    id: &CollectionId,
+    section: Section,
+    uniques: &[&Coordinate],
+) -> Result<QueryRowsResult, CassandraCellStoreError> {
     let pk = Pk::of(id);
-    let result = session
+    session
         .session()
         .execute_unpaged(
             &queries.read_cells_batch,
@@ -96,7 +105,14 @@ pub(super) async fn fetch_cells_batch(
         .await
         .map_err(CassandraStoreError::from)?
         .into_rows_result()
-        .map_err(CassandraStoreError::from)?;
+        .map_err(CassandraStoreError::from)
+        .map_err(CassandraCellStoreError::from)
+}
+
+pub(super) fn decode_batch_rows(
+    result: &QueryRowsResult,
+    uniques: &[&Coordinate],
+) -> Result<DecodedBatch, CassandraCellStoreError> {
     // At most one row per unique coordinate, so size once at the IN-list upper
     // bound rather than growing an inline buffer up to `CELL_BATCH`.
     let mut rows: CellBuffer<(Coordinate, decode::BorrowedCellTtlRow<'_>)> =
@@ -110,21 +126,23 @@ pub(super) async fn fetch_cells_batch(
         ));
     }
 
-    decode_batch_rows(rows, uniques)
+    align_and_decode_batch_rows(rows, uniques)
 }
 
-pub(super) fn decode_batch_rows(
+pub(super) fn align_and_decode_batch_rows(
     mut rows: CellBuffer<(Coordinate, decode::BorrowedCellTtlRow<'_>)>,
     uniques: &[&Coordinate],
-) -> Result<CellBuffer<(Coordinate, Cell, Option<i32>)>, CassandraCellStoreError> {
+) -> Result<DecodedBatch, CassandraCellStoreError> {
+    // Align the result here so every caller receives one slot per requested
+    // coordinate. Cassandra does not guarantee the order of an `IN` result.
     let mut out = CellBuffer::with_capacity(uniques.len());
     for &coordinate in uniques {
         let Some(pos) = rows.iter().position(|(found, _)| found == coordinate) else {
+            out.push(None);
             continue;
         };
-        let (coordinate, row) = rows.swap_remove(pos);
-        let (cell, ttl) = decode::try_decode_cell_ttl(row)?;
-        out.push((coordinate, cell, ttl));
+        let (_, row) = rows.swap_remove(pos);
+        out.push(Some(decode::try_decode_cell_ttl(row)?));
     }
     Ok(out)
 }

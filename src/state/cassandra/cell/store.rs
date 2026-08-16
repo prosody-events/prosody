@@ -5,11 +5,12 @@ use super::{
     CellAddr, CellBatchRow, CellBlobs, CellBuffer, CellKey, CellKind, CellQueries, CellStore,
     CellStoreError, CollectionDefRegistry, CollectionId, CollectionRef, CommitOracle, Coordinate,
     EventMarker, EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob,
-    MarkerPresence, Pk, PreparedStatement, ResolveCellError, ResolvedRow, Resolver, RowShape,
-    SHARD_FANOUT_CONCURRENCY, Scan, Section, Session, Stream, TryStreamExt, blob_weight,
-    encode_marker_payload, encode_payload, fetch_and_decode_cell, fetch_and_decode_cell_ttl,
-    fetch_cells_batch, flatten_resolve, help_read_window, marker_delete_unit, marker_last_split,
-    page_cells, peek_read, pin_mut, resolve_marker, select_encoding, smallvec, try_stream,
+    MarkerPresence, Pk, PreparedStatement, QueryRowsResult, ResolveCellError, ResolvedRow,
+    Resolver, RowShape, SHARD_FANOUT_CONCURRENCY, Scan, Section, Session, Stream, TryStreamExt,
+    blob_weight, encode, encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result,
+    fetch_cells_batch, fetch_cells_batch_result, flatten_resolve, help_read_window,
+    marker_delete_unit, marker_last_split, page_cells, peek_read, pin_mut, resolve_marker,
+    smallvec, try_stream,
 };
 
 impl<O> CassandraStore<O> {
@@ -58,13 +59,13 @@ impl<O> CassandraStore<O> {
         fetch_and_decode_cell(&self.session, statement, id, cell).await
     }
 
-    pub(super) async fn point_read_cell_ttl(
+    pub(super) async fn point_read_cell_result(
         &self,
         statement: &PreparedStatement,
         id: &CollectionId,
         cell: &CellKey,
-    ) -> Result<Option<(Cell, Option<i32>)>, CassandraCellStoreError> {
-        fetch_and_decode_cell_ttl(&self.session, statement, id, cell).await
+    ) -> Result<QueryRowsResult, CassandraCellStoreError> {
+        fetch_cell_rows_result(&self.session, statement, id, cell).await
     }
 
     /// Reads and decodes a section's coordinates in one `IN` query.
@@ -79,8 +80,17 @@ impl<O> CassandraStore<O> {
         id: &CollectionId,
         section: Section,
         uniques: &[&Coordinate],
-    ) -> Result<CellBuffer<(Coordinate, Cell, Option<i32>)>, CassandraCellStoreError> {
+    ) -> Result<CellBuffer<Option<(Cell, Option<i32>)>>, CassandraCellStoreError> {
         fetch_cells_batch(&self.session, &self.queries, id, section, uniques).await
+    }
+
+    pub(super) async fn batch_read_result(
+        &self,
+        id: &CollectionId,
+        section: Section,
+        uniques: &[&Coordinate],
+    ) -> Result<QueryRowsResult, CassandraCellStoreError> {
+        fetch_cells_batch_result(&self.session, &self.queries, id, section, uniques).await
     }
 
     /// Executes the packed same-partition `UNLOGGED BATCH`es for a multi-cell
@@ -206,8 +216,7 @@ where
         let payload = encode_marker_payload(marker)
             .map_err(CassandraCellStoreError::from)
             .map_err(ResolveCellError::Store)?;
-        let encoding = select_encoding(payload.len());
-        let payload = encode_payload(&payload, encoding)
+        let payload = encode(&payload)
             .map_err(CassandraCellStoreError::from)
             .map_err(ResolveCellError::Store)?;
         Ok(MarkerBlob {
