@@ -74,6 +74,7 @@
 //! #     type Error = Infallible;
 //! #     type Output = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_excise<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
@@ -112,6 +113,7 @@
 //! #     type Error = Infallible;
 //! #     type Output = ();
 //! #     async fn on_message<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
+//! #     async fn on_excise<C>(&self, _: C, _: ConsumerMessage<serde_json::Value>, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn on_timer<C>(&self, _: C, _: Trigger, _: DemandType) -> Result<(), Self::Error> { Ok(()) }
 //! #     async fn shutdown(self) {}
 //! # }
@@ -413,8 +415,8 @@ pub trait HandlerMiddleware<P: Send + Sync + 'static> {
 /// stack. It states what a `FallibleHandler` middleware (a wrapper around
 /// an inner handler) must do.
 ///
-/// 1. **Forward the handler methods.** Call `self.inner.on_message(...)` and
-///    `self.inner.on_timer(...)` (await them), then decide whether to
+/// 1. **Forward the handler methods.** Call the matching inner method for
+///    messages, excise records, and timers. Then decide whether to
 ///    short-circuit, transform the result, or pass it through. Cascade
 ///    `shutdown` by awaiting `self.inner.shutdown()` so inner resources are
 ///    released.

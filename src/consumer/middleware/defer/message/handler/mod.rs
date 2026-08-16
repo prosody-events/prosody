@@ -782,13 +782,7 @@ where
             .await
     }
 
-    /// Defer-trigger ownership is stable across attempts: this branches on
-    /// the trigger's immutable `timer_type`, so a `DeferredMessage` trigger
-    /// is fully consumed inside this middleware on every attempt — an empty
-    /// queue terminates as `NoInner`, never a fall-through to the pure-timer
-    /// path. The reload identity override's stale-read argument (every
-    /// marker-consulting settle arm implies the final attempt performed the
-    /// set) leans on this fact.
+    /// Processes an excise record with the message defer policy.
     fn on_excise<C>(
         &self,
         context: C,

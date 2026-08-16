@@ -946,8 +946,8 @@ async fn filter_loops<P: Send + Sync + 'static>(
 
 /// Filters messages based on their event type if filtering is enabled.
 ///
-/// Only messages with event types matching the allowed patterns will be
-/// processed. Returns `None` if the message should be filtered out.
+/// Only messages with matching event types pass the filter. Excise records
+/// always pass because they have no event type.
 async fn filter_event_type<P: Send + Sync + 'static + EventType>(
     allowed_events: Option<&AhoCorasick>,
     message: UncommittedMessage<P>,

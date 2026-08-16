@@ -795,13 +795,13 @@ impl FallibleHandler for ScriptedHandler {
         &self,
         _context: C,
         _message: ConsumerMessage<Self::Payload>,
-        _demand_type: DemandType,
+        demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
         self.excisions.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        self.dispatch(demand_type)
     }
 }
 

@@ -193,13 +193,7 @@ where
         result
     }
 
-    /// Processes a timer and records telemetry events for handler lifecycle,
-    /// passing through the wrapped handler's result (and error) unchanged.
-    ///
-    /// Records the following events:
-    /// - `HandlerInvoked` when the handler is called
-    /// - `HandlerSucceeded` when the handler completes successfully
-    /// - `HandlerFailed` when the handler returns an error
+    /// Records telemetry for an excise record.
     fn on_excise<C>(
         &self,
         context: C,

@@ -73,11 +73,13 @@
 
 use chrono::SecondsFormat;
 use derive_builder::Builder;
-use thiserror::Error;
 use tracing::{debug, error, info};
 use validator::{Validate, ValidationErrors};
 
 use crate::Codec;
+
+mod error;
+
 use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
@@ -90,6 +92,7 @@ use crate::producer::{ProducerError, ProsodyProducer};
 use crate::timers::Trigger;
 use crate::util::from_env;
 use crate::{EventIdentity, Partition, Topic, Topic as TopicType};
+pub use error::FailureTopicError;
 
 /// Configuration for failure topic middleware.
 #[derive(Builder, Clone, Debug, Validate)]
@@ -335,10 +338,7 @@ where
         }
     }
 
-    /// Timer failures are not routed to the failure topic. `Ok(o)` becomes
-    /// [`FailureTopicOutput::Inner`]; every error — Terminal, Permanent, or
-    /// Transient — propagates as [`FailureTopicError::Handler`] with its
-    /// original classification. Outer retry / telemetry decide what to do.
+    /// Routes an excise failure with the same policy as a message failure.
     fn on_excise<C>(
         &self,
         context: C,
@@ -466,51 +466,6 @@ where
                 ErrorCategory::Permanent => T::settlement(Err(inner)),
                 _ => Settlement::Bypassed,
             },
-        }
-    }
-}
-
-/// Errors that can occur during failure topic handling.
-#[derive(Debug, Error)]
-pub enum FailureTopicError<E, P> {
-    /// Error from the wrapped handler that the middleware did not rescue.
-    /// Used for any Terminal message error, every timer error, and any
-    /// non-Terminal message error that does not reach the DLQ branch.
-    /// Carries the inner's typed error so the apply hook can forward it.
-    #[error(transparent)]
-    Handler(E),
-
-    /// The wrapped handler returned a non-Terminal error and the producer
-    /// failed to accept the routed message.
-    ///
-    /// Both errors are preserved so the framework can:
-    /// - classify on `producer` (the immediate failure that the outer retry
-    ///   layer should react to), and
-    /// - fire the inner's apply hook with `Err(inner)` when re-dispatch happens
-    ///   (`after_abort(Err(inner))`) or, in the unlikely case the outer commits
-    ///   despite this error, `after_commit(Err(inner))`.
-    #[error("failure-topic send failed: {producer}")]
-    DlqSendFailed {
-        /// Inner handler's original (non-Terminal) error.
-        inner: E,
-        /// Producer error from the failure-topic send.
-        #[source]
-        producer: ProducerError<P>,
-    },
-}
-
-impl<E, P> ClassifyError for FailureTopicError<E, P>
-where
-    E: ClassifyError,
-{
-    fn classify_error(&self) -> ErrorCategory {
-        match self {
-            FailureTopicError::Handler(error) => error.classify_error(),
-            // Outer retry layers should react to the producer-level failure
-            // (e.g. transient broker errors) rather than the inner's
-            // classification; the inner error is only carried through for
-            // apply-hook forwarding.
-            FailureTopicError::DlqSendFailed { producer, .. } => producer.classify_error(),
         }
     }
 }

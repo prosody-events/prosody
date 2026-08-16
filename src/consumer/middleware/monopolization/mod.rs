@@ -42,16 +42,14 @@
 use derive_builder::Builder;
 use humantime::format_duration;
 use interval::IntervalSet;
-use interval::interval_set::ToIntervalSet;
-use interval::prelude::{Bounded, Intersection, Union};
+use interval::prelude::Bounded;
 use quanta::Instant;
 use quick_cache::sync::Cache;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::spawn;
-use tokio::sync::broadcast;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 use validator::{Validate, ValidationErrors};
 
 use crate::consumer::event_context::EventContext;
@@ -62,10 +60,13 @@ use crate::consumer::middleware::{
 };
 use crate::consumer::{DemandType, Keyed};
 use crate::telemetry::Telemetry;
-use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
 use crate::timers::Trigger;
 use crate::util::{from_duration_env_with_fallback, from_env_with_fallback};
 use crate::{Key, Partition, Topic, TopicPartitionKey};
+
+mod event_loop;
+
+use event_loop::run_event_loop;
 
 /// Rolling per-key execution intervals, shared by the middleware, its
 /// provider, and every handler it wraps.
@@ -436,99 +437,6 @@ where
 
         None
     }
-}
-
-async fn run_event_loop(
-    reference_instant: Instant,
-    key_intervals: KeyIntervals,
-    window_duration: Duration,
-    mut telemetry_rx: broadcast::Receiver<TelemetryEvent>,
-) {
-    let window_nanos = window_duration.as_nanos() as u64;
-
-    debug!("Event loop started, listening for key state transitions");
-
-    loop {
-        let event = match telemetry_rx.recv().await {
-            Ok(event) => event,
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!(
-                    skipped_events = skipped,
-                    "Telemetry channel lagged - some key execution intervals may be inaccurate"
-                );
-                continue;
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                debug!("Telemetry channel closed, event loop shutting down");
-                break;
-            }
-        };
-
-        let Data::Key(KeyEvent { key, state, .. }) = &*event.data else {
-            continue;
-        };
-
-        let tp_key = TopicPartitionKey::new(event.topic, event.partition, key.clone());
-
-        let elapsed_nanos = event
-            .timestamp
-            .saturating_duration_since(reference_instant)
-            .as_nanos() as u64;
-
-        match *state {
-            KeyState::HandlerInvoked => {
-                const MAX_NANOS: u64 = u64::MAX - 1;
-                let open_interval_set = [(elapsed_nanos, MAX_NANOS)].to_interval_set();
-
-                if let Some(intervals) = key_intervals.get(&tp_key) {
-                    key_intervals.insert(tp_key.clone(), intervals.union(&open_interval_set));
-                    trace!(
-                        topic = %tp_key.topic,
-                        partition = tp_key.partition,
-                        key = %tp_key.key,
-                        "Handler invoked - extended execution interval"
-                    );
-                } else {
-                    key_intervals.insert(tp_key.clone(), open_interval_set);
-                    trace!(
-                        topic = %tp_key.topic,
-                        partition = tp_key.partition,
-                        key = %tp_key.key,
-                        "Handler invoked - opened new execution interval"
-                    );
-                }
-            }
-            KeyState::HandlerSucceeded | KeyState::HandlerFailed => {
-                let window_start = elapsed_nanos.saturating_sub(window_nanos);
-                let window_interval_set = [(window_start, elapsed_nanos)].to_interval_set();
-
-                if let Some(intervals) = key_intervals.get(&tp_key) {
-                    let windowed = intervals.intersection(&window_interval_set);
-                    key_intervals.insert(tp_key.clone(), windowed);
-
-                    trace!(
-                        topic = %tp_key.topic,
-                        partition = tp_key.partition,
-                        key = %tp_key.key,
-                        ?state,
-                        "Handler completed - closed execution interval"
-                    );
-                } else {
-                    // Handler completed without a corresponding invocation event
-                    // (possibly due to telemetry lag or cache eviction)
-                    debug!(
-                        topic = %tp_key.topic,
-                        partition = tp_key.partition,
-                        key = %tp_key.key,
-                        ?state,
-                        "Handler completed but no open interval found"
-                    );
-                }
-            }
-        }
-    }
-
-    debug!("Event loop terminated");
 }
 
 /// Errors that can occur during monopolization detection.

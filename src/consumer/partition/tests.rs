@@ -351,16 +351,29 @@ async fn test_partition_manager_event_type_filtering() {
     );
     assert!(partition_manager.try_send(allowed).is_ok());
 
-    // Only the allowed message should make it through
-    wait_for_processed_offsets(&handler, 1, Duration::from_secs(1))
+    let excise = ConsumerMessage::new(
+        ConsumerMessageValue {
+            offset: Offset::from(2_u8),
+            key: "key".into(),
+            record: Record::Excise,
+            ..Default::default()
+        },
+        Span::current(),
+        test_semaphore
+            .try_acquire_owned()
+            .expect("Failed to acquire permit"),
+    );
+    assert!(partition_manager.try_send(excise).is_ok());
+
+    wait_for_processed_offsets(&handler, 2, Duration::from_secs(1))
         .await
-        .expect("Only the allowed message should be processed");
+        .expect("The allowed message and excise record should be processed");
 
     let processed = handler.processed_offsets.lock().await;
     assert_eq!(
         processed.as_slice(),
-        &[Offset::from(1_u8)],
-        "Only offset 1 should have been processed"
+        &[Offset::from(1_u8), Offset::from(2_u8)],
+        "The filter must pass excise records"
     );
 
     partition_manager.shutdown().await;

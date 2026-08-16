@@ -21,7 +21,7 @@ use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::{Message, Timestamp};
 use std::str;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
@@ -131,15 +131,23 @@ pub fn decode_message<C: Codec, R: ResultRequestReader>(
     // `Cargo.toml` (which uses caret semver and accepts any 0.39.x via
     // `cargo update`). Re-audit on any rdkafka bump, including patch updates.
     #[allow(unsafe_code)]
-    let record = match unsafe { message.payload_mut() } {
-        Some(payload_bytes) => match codec.deserialize(payload_bytes) {
+    let record = if let Some(payload_bytes) = unsafe { message.payload_mut() } {
+        match codec.deserialize(payload_bytes) {
             Ok(payload) => Record::Message(payload),
             Err(error) => {
                 error!("invalid payload: {error:#}; discarding message");
                 return None;
             }
-        },
-        None => Record::Excise,
+        }
+    } else {
+        debug!(
+            topic = %topic,
+            partition,
+            offset = %offset,
+            key = %key,
+            "decoded excise record"
+        );
+        Record::Excise
     };
 
     let value = Arc::new(ConsumerMessageValue {
