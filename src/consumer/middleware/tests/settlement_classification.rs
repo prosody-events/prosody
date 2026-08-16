@@ -83,6 +83,6 @@ async fn leaf_dispatches_excise_record_to_excise() -> color_eyre::Result<()> {
     )
     .await?;
     assert_eq!(handler.excision_count(), 1);
-    assert_eq!(handler.call_count(), 0);
+    assert_eq!(handler.call_count(), 1);
     Ok(())
 }

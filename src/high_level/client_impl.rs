@@ -241,8 +241,9 @@ where
         self.reader.get().map(StateReaderClient::deps)
     }
 
-    /// Composes a standalone [`StateReader`] over this client's one shared
-    /// bundle, for `descriptor` routed under `subsystem`.
+    /// Composes a standalone [`crate::state_reader::StateReader`] over this
+    /// client's one shared bundle, for `descriptor` routed under
+    /// `subsystem`.
     ///
     /// Valid once the consumer is `Configured` or `Running`. Both draw from
     /// the same retained bundle. A reader built before `subscribe` and one

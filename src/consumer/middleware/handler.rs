@@ -35,8 +35,8 @@ use crate::timers::Trigger;
 ///
 /// The consumer pipeline is itself a stack of `FallibleHandler` impls
 /// (retry, deduplication, defer, telemetry, your handler at the bottom),
-/// so middleware authors implement this same trait. The [module-level
-/// docs](self) describe how impls are composed (layering, providers,
+/// so middleware authors implement this same trait. The middleware module
+/// documentation describes how impls are composed (layering, providers,
 /// execution flow); [Implementing as middleware](#implementing-as-middleware)
 /// below states what an individual middleware impl owes its inner
 /// handler.
@@ -47,19 +47,19 @@ use crate::timers::Trigger;
 /// [`ClassifyError::classify_error`] into one of three categories that
 /// determine how the consumer pipeline reacts:
 ///
-/// - [`Transient`](ErrorCategory::Transient) — **retry**. A temporary problem
-///   (network blip, store timeout, downstream service unavailable) that may
-///   succeed later. The retry middleware reattempts; if configured, the defer
-///   middleware can move the message to a timer-based retry to unblock the
-///   partition.
-/// - [`Permanent`](ErrorCategory::Permanent) — **give up on this message**. The
-///   data itself is bad (deserialization failure, schema violation, business
-///   rule rejection) and retrying won't help. The message is committed, and may
-///   be routed to a dead-letter topic if the failure-topic middleware is
-///   configured.
-/// - [`Terminal`](ErrorCategory::Terminal) — **shut the consumer down**. The
-///   process can't safely continue (corrupted local state, an invariant
-///   violation) and a new instance must take over.
+/// - [`Transient`](crate::error::ErrorCategory::Transient) — **retry**. A
+///   temporary problem (network blip, store timeout, downstream service
+///   unavailable) that may succeed later. The retry middleware reattempts; if
+///   configured, the defer middleware can move the message to a timer-based
+///   retry to unblock the partition.
+/// - [`Permanent`](crate::error::ErrorCategory::Permanent) — **give up on this
+///   message**. The data itself is bad (deserialization failure, schema
+///   violation, business rule rejection) and retrying won't help. The message
+///   is committed, and may be routed to a dead-letter topic if the
+///   failure-topic middleware is configured.
+/// - [`Terminal`](crate::error::ErrorCategory::Terminal) — **shut the consumer
+///   down**. The process can't safely continue (corrupted local state, an
+///   invariant violation) and a new instance must take over.
 ///
 /// The classification is the contract between your handler and the
 /// framework: pick the right category and the middleware stack handles
@@ -152,7 +152,8 @@ use crate::timers::Trigger;
 /// re-dispatch on the next poll, which produces a new invocation with
 /// its own apply hook). [`retry`] owns the only other `EventHandler`
 /// boundary; both route their final outcome through the shared `settle`
-/// durability sequence (see [`FallibleEventHandler`]).
+/// durability sequence (see
+/// [`crate::consumer::middleware::FallibleEventHandler`]).
 ///
 /// [`EventHandler`]: crate::consumer::EventHandler
 /// [`Uncommitted::commit`]: crate::consumer::Uncommitted::commit

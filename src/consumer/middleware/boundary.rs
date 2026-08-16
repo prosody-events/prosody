@@ -38,11 +38,12 @@ use crate::timers::UncommittedTimer;
 /// written outside the stack by the marker commit; the message marker here
 /// restores message/timer symmetry.
 ///
-/// [`RetryHandler`](retry::RetryHandler) is a second durability boundary
-/// (it owns its own `EventHandler` impl so it can map shutdown to abort
-/// rather than commit); it routes its final outcome through the **same**
-/// `settle` / `abandon` functions, so the sequence still has a single
-/// owner. No other middleware should implement `EventHandler` directly.
+/// [`RetryHandler`](crate::consumer::middleware::retry::RetryHandler) is a
+/// second durability boundary (it owns its own `EventHandler` impl so it can
+/// map shutdown to abort rather than commit); it routes its final outcome
+/// through the **same** `settle` / `abandon` functions, so the sequence still
+/// has a single owner. No other middleware should implement `EventHandler`
+/// directly.
 ///
 /// **Stack contract:** whether a dispatch settles the event is a pure
 /// function of the *final* result the stack returns — the crate-internal
