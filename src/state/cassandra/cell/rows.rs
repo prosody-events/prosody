@@ -102,9 +102,9 @@ impl<'a> CellAddr<'a> {
 /// statement it targets and the [`RowShape`] that binds exactly that
 /// statement's columns. [`scylla::statement::batch::Batch`] binds its
 /// statement list 1:1 with the value list, so each row must serialize
-/// precisely the columns of the statement [`BatchRow::statement`] returns —
-/// kept consistent at the construction sites, which pair each shape with its
-/// own statement.
+/// precisely the columns of the statement
+/// [`crate::cassandra::BatchRow::statement`] returns — kept consistent at the
+/// construction sites, which pair each shape with its own statement.
 pub(super) struct CellBatchRow<'a> {
     pub(super) statement: &'a PreparedStatement,
     pub(super) row: RowShape<'a>,

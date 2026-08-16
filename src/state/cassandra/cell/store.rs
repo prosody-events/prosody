@@ -86,7 +86,7 @@ impl<O> CassandraStore<O> {
     ///
     /// Allocation ruling (write-path buffer audit): every mutator's `units`
     /// buffer — and the `blobs` its rows borrow — stays a `Vec`, never a
-    /// [`CellBuffer`]/`SmallVec`.
+    /// [`crate::state::store::CellBuffer`]/`SmallVec`.
     /// `BatchUnit<CellBatchRow>` is 320 B and `CellBlobs` 80 B, and both live
     /// across this `.await`; an inline capacity would embed hundreds of bytes
     /// to kilobytes in every stage/settle future the way `StagedCollection`
@@ -116,7 +116,8 @@ impl<O> CassandraStore<O> {
     /// `kind=Cell` row (the row-absence invariant — no null-blob residue).
     /// Returns a borrowing iterator the callers extend into their pre-sized
     /// `units` — no intermediate buffer; see [`Self::run_batches`] for why the
-    /// callers' `units` is a `Vec` rather than a [`CellBuffer`].
+    /// callers' `units` is a `Vec` rather than a
+    /// [`crate::state::store::CellBuffer`].
     pub(super) fn resolved_units<'u>(
         &'u self,
         pk: Pk<'u>,
@@ -154,10 +155,10 @@ impl<O> CassandraStore<O> {
         })
     }
 
-    /// Mirrors a successful settle into the marker memo ([`MarkerMemo`]'s
-    /// standing map plus the presence latch): the marker is now durably
-    /// deleted, so the collection is known marker-absent for the rest of the
-    /// assignment.
+    /// Mirrors a successful settle into the marker memo
+    /// ([`super::MarkerMemo`]'s standing map plus the presence latch): the
+    /// marker is now durably deleted, so the collection is known
+    /// marker-absent for the rest of the assignment.
     pub(super) async fn settle_memo(&self, collection: &CollectionId) {
         self.memo.standing.remove_async(collection).await;
         self.presence.set(collection).await;
@@ -178,7 +179,7 @@ where
     /// chunk of a split stage) is overwritten, never resolved. A resolution
     /// failure fails the stage (retry middleware). The memo is updated BEFORE
     /// the durable attempt (the over-report-safe direction — see the
-    /// [`MarkerMemo`] invariant).
+    /// [`super::MarkerMemo`] invariant).
     pub(super) async fn stage_marker(
         &self,
         collection: &CollectionRef,

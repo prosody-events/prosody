@@ -11,8 +11,8 @@ use super::super::encoding::{
     encode_payload, reset_codec, select_encoding, validate_decompression_bound,
 };
 use super::{
-    CellCorruptReason, FramedKeyedCellRow, RawCellRow, blob_ttl, try_decode_cell,
-    try_decode_keyed_cell,
+    BorrowedCellTtlRow, CellCorruptReason, FramedKeyedCellRow, RawCellRow, blob_ttl,
+    try_decode_cell, try_decode_keyed_cell, try_decode_provisional_cell_ttl,
 };
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::EventRef;
@@ -351,6 +351,31 @@ fn failed_stream_decode_does_not_poison_the_next_frame() -> Result<()> {
         decode_payload(&valid, Encoding::Zstd)?,
         Bytes::from_static(b"valid after corrupt")
     );
+    Ok(())
+}
+
+#[test]
+fn resolved_corrupt_body_is_skipped_only_by_recovery() -> Result<()> {
+    let corrupt = [0_u8];
+    let recovery_row: BorrowedCellTtlRow<'_> = (
+        Some(&corrupt),
+        None,
+        Some(i16::from(Encoding::Zstd)),
+        Some(INITIAL_VERSION),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(try_decode_provisional_cell_ttl(recovery_row)?, None);
+
+    let live = try_decode_cell((
+        Some(&corrupt),
+        None,
+        Some(i16::from(Encoding::Zstd)),
+        Some(INITIAL_VERSION),
+        None,
+    ));
+    assert!(matches!(live, Err(CassandraCellStoreError::Encoding(_))));
     Ok(())
 }
 

@@ -71,10 +71,9 @@ pub(super) fn extend_gap_units<'u>(
 }
 
 /// The one-row batch unit deleting a collection's event-marker row at its
-/// fixed address, appended last by [`issue_marker_last`], the shared tail of
-/// both settle verbs.
-///
-/// [`issue_marker_last`]: CassandraStore::issue_marker_last
+/// fixed address, appended last by
+/// [`super::CassandraStore::issue_marker_last`], the shared tail of both settle
+/// verbs.
 pub(super) fn marker_delete_unit<'u>(
     pk: Pk<'u>,
     queries: &'u CellQueries,
@@ -100,7 +99,7 @@ pub(super) fn marker_delete_unit<'u>(
 /// positional (`units.len() - 1`), so a marker placed elsewhere, or a caller
 /// awaiting the tail before the prefix, would issue the marker before the
 /// recovery-relevant rows.
-/// [`issue_marker_last`](CassandraStore::issue_marker_last) owns that ordering;
+/// [`super::CassandraStore::issue_marker_last`] owns that ordering;
 /// this function only decides where the split falls.
 pub(super) fn marker_last_split<R>(
     units: &[BatchUnit<R>],

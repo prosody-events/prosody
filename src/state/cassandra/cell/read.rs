@@ -180,8 +180,8 @@ fn align_batch_rows_inner<'frame>(
 /// with the in-code `past_end` cutoff applied. It applies no limit and no
 /// resolution. The limit counts present cells after projection, so each
 /// consumer keeps it in its own loop. Two callers consume this. The owner scan
-/// ([`CassandraStore::scan_inner`]) then applies `peek_read`; the reader scan
-/// ([`CassandraCellResources::scan_committed`]) then applies
+/// ([`super::CassandraStore::scan_inner`]) then applies `peek_read`; the reader
+/// scan ([`super::CassandraCellResources::scan_committed`]) then applies
 /// `project_committed`. Sharing this pager keeps their physical paging from
 /// drifting apart. Each `try_next` is wrapped in [`cooperative`] so a drain of
 /// ready rows yields to the runtime every ~128 items.
