@@ -1879,7 +1879,7 @@ async fn fetch_cell_rows_result(
     cell: &CellKey,
 ) -> Result<QueryRowsResult, CassandraCellStoreError> {
     let pk = Pk::of(id);
-    session
+    let result = session
         .session()
         .execute_unpaged(
             statement,
@@ -1894,9 +1894,11 @@ async fn fetch_cell_rows_result(
             ),
         )
         .await
-        .map_err(CassandraStoreError::from)?
+        .map_err(CassandraStoreError::from)?;
+    result
         .into_rows_result()
-        .map_err(|error| CassandraCellStoreError::from(CassandraStoreError::from(error)))
+        .map_err(CassandraStoreError::from)
+        .map_err(CassandraCellStoreError::from)
 }
 
 /// Reads and decodes one bounded `IN` query in input resolution order.
