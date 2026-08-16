@@ -96,7 +96,7 @@ macro_rules! impl_subscribe {
         {
             /// Subscribes the consumer with the provided handler.
             ///
-            /// A configured subsystem answers peer requests. Without one, the
+            /// A configured subsystem answers requests. Without one, the
             /// consumer processes events without answers.
             ///
             /// # Errors

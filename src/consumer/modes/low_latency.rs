@@ -68,7 +68,7 @@ where
         .await
     }
 
-    /// Creates a low-latency consumer that answers peer requests.
+    /// Creates a low-latency consumer that answers requests.
     ///
     /// # Errors
     ///

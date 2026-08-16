@@ -44,14 +44,14 @@ pub(crate) struct Then<A, B>(pub(crate) A, pub(crate) B);
 /// Frames and delivers one response.
 ///
 /// Every response ends as exactly one outcome. It moves one stage or one
-/// drop reason, one of this sender's two counters, and the `peer.disposition`
-/// attribute on its own span. A delivered job also records
-/// `peer.endpoint.kind`. Every count of a response's outcome sits in this one
-/// match. Thus, no counters can disagree.
-/// The `peer.response.send` span is opened here and covers the delivery alone.
-/// It is a child of the trace the job carries, so the listener's
-/// `peer.response.receive` — parented on the context this span's own injection
-/// writes — lands under the call that asked for the response.
+/// drop reason, one of this sender's two counters, and the
+/// `request.disposition` attribute on its own span. A delivered job also
+/// records `request.endpoint.kind`. Every count of a response's outcome sits in
+/// this one match. Thus, no counters can disagree.
+/// The `request.response.send` span is opened here and covers the delivery
+/// alone. It is a child of the trace the job carries, so the listener's
+/// `request.response.receive` — parented on the context this span's own
+/// injection writes — lands under the call that asked for the response.
 pub(crate) async fn deliver_response<R: ResponseRoute + PeerMetricSource>(
     router: &R,
     prepared: PreparedResponse,
@@ -60,7 +60,7 @@ pub(crate) async fn deliver_response<R: ResponseRoute + PeerMetricSource>(
 ) {
     let header = prepared.header();
     let span = debug_span!(
-        "peer.response.send",
+        "request.response.send",
         otel.kind = "client",
         rpc.system.name = Empty,
         rpc.method = Empty,
@@ -68,11 +68,11 @@ pub(crate) async fn deliver_response<R: ResponseRoute + PeerMetricSource>(
         server.address = Empty,
         server.port = Empty,
         error.type = Empty,
-        peer.target = %header.target,
-        peer.request = %header.request,
-        peer.subsystem = %header.subsystem,
-        peer.disposition = Empty,
-        peer.endpoint.kind = Empty,
+        request.target = %header.target,
+        request.id = %header.request,
+        subsystem = %header.subsystem,
+        request.disposition = Empty,
+        request.endpoint.kind = Empty,
     );
     let context = context_with_parent(&span, trace);
     let outcome = match prepared {
@@ -87,16 +87,16 @@ pub(crate) async fn deliver_response<R: ResponseRoute + PeerMetricSource>(
     // level-disabled span never becomes current.
     match outcome {
         Ok(delivery) => {
-            span.record("peer.disposition", "delivered");
+            span.record("request.disposition", "delivered");
             let endpoint_kind = match delivery {
                 Delivery::Local => "local",
                 Delivery::Remote(kind) => kind.label(),
             };
-            span.record("peer.endpoint.kind", endpoint_kind);
+            span.record("request.endpoint.kind", endpoint_kind);
             Stage::Delivered.record(router.peer_metrics());
         }
         Err(reason) => {
-            span.record("peer.disposition", reason.label());
+            span.record("request.disposition", reason.label());
             if reason != DropReason::SendFailed {
                 span.record(ERROR_TYPE, reason.label());
             }

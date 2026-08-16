@@ -16,10 +16,10 @@ use color_eyre::eyre::ensure;
 use std::collections::BTreeMap;
 
 /// How many requests this process waits for answers to.
-const PENDING: &str = "prosody.peer.requests.pending";
+const PENDING: &str = "prosody.requests.pending";
 
 /// How long one request waited, by how complete its answers were.
-const LATENCY: &str = "prosody.peer.request.latency";
+const LATENCY: &str = "prosody.request.latency";
 
 /// The subsystem the registered request awaits.
 const SUBSYSTEM: &str = "billing";

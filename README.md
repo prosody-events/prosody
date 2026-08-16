@@ -44,7 +44,7 @@ chain. Handler timeouts cancel handlers that exceed their deadline, preventing a
 - **Backpressure**: Pauses partitions when handlers fall behind.
 - **Mocking**: In-memory Kafka broker for tests (`PROSODY_MOCK=true`).
 - **High-Level Client**: Combines producer and consumer with timer support.
-- **Peer Requests**: Collects one typed response from each requested subsystem.
+- **Requests**: Collects one typed response from each requested subsystem.
 - **Failure Handling**: Pipeline (retry forever), Low-Latency (dead letter), Best-Effort (log and skip).
 
 ## Usage
@@ -174,9 +174,9 @@ Call `excise(topic, key)` to send a Kafka record with a key and no payload. Use 
 
 Each handler must implement `on_excise`. It receives the same arguments as `on_message`. The message contains `Record::Excise` instead of a payload.
 
-## Peer requests
+## Requests
 
-Peer requests let a producer ask named subsystems to process one Kafka event.
+Requests let a producer ask named subsystems to process one Kafka event.
 The request returns one outcome keyed by each subsystem name. Each outcome
 reports success, handler failure, malformed data, a codec mismatch, or a
 timeout.
@@ -187,7 +187,7 @@ requests. A handler response uses the response codec in `ClientHandler::Codecs`.
 
 Prosody delivers responses locally when the requester and responder share one
 client. It routes other responses between live peers. See
-[Peer Requests](CONFIGURATION.md#peer-requests) for network and cache settings.
+[Requests](CONFIGURATION.md#requests) for network and cache settings.
 
 ```rust,ignore
 let subsystems = [SubsystemName::try_new("inventory")?];

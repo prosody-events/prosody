@@ -46,7 +46,7 @@ mod tests;
 /// Construction takes a route from the process router. The route always tries
 /// local delivery before network delivery.
 ///
-/// `subsystem` is the name this consumer answers peer requests for. The decode
+/// `subsystem` is the name this consumer answers requests for. The decode
 /// path and this responder use the same subsystem value.
 pub(crate) struct Responder<C: Codec, R: ResponseRoute> {
     route: R,
