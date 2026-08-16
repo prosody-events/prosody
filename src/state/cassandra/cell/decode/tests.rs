@@ -244,21 +244,19 @@ fn corrupt_event_udt_is_rejected() -> Result<()> {
     Ok(())
 }
 
-/// Wire-format freeze for the payload-encoding discriminants: the `i16` is a
-/// durable column, so the live value is pinned and the retired discriminants
-/// (`1`/`2` `MsgPack`-era, `3` uncompressed `RawV1`, plus never-assigned `0`)
-/// must keep rejecting loudly as a Permanent
-/// [`EncodingError::UnknownEncoding`] — a round-trip test cannot prove any of
-/// this.
+/// Wire-format freeze for the payload-encoding discriminants.
+///
+/// Zstd value 4 is part of the released durable format. Raw value 1 is the
+/// first new format. Value 0 stays invalid so missing data fails loudly.
 #[test]
 fn encoding_wire_contract_is_frozen() -> Result<()> {
     assert_eq!(i16::from(Encoding::Zstd), 4);
-    assert_eq!(i16::from(Encoding::Raw), 5);
-    for retired in [0_i16, 1, 2, 3] {
-        let Err(error) = Encoding::try_from(retired) else {
-            bail!("discriminant {retired} must stay retired");
+    assert_eq!(i16::from(Encoding::Raw), 1);
+    for unknown in [0_i16, 2, 3, 5] {
+        let Err(error) = Encoding::try_from(unknown) else {
+            bail!("discriminant {unknown} must stay unknown");
         };
-        assert!(matches!(error, EncodingError::UnknownEncoding(value) if value == retired));
+        assert!(matches!(error, EncodingError::UnknownEncoding(value) if value == unknown));
         assert_eq!(error.classify_error(), ErrorCategory::Permanent);
     }
     Ok(())

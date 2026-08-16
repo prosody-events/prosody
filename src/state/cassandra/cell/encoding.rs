@@ -69,15 +69,14 @@ impl Codec {
 
 /// Encoding discriminator for value payload cells.
 ///
-/// Values 1 through 3 are retired. Readers must reject them as permanent
-/// durable-data errors.
+/// Value 4 identifies the released Zstd format. Value 0 stays invalid.
 #[repr(i16)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(in crate::state::cassandra) enum Encoding {
     /// Raw codec bytes compressed with Zstd.
     Zstd = 4,
     /// Raw codec bytes without application compression.
-    Raw = 5,
+    Raw = 1,
 }
 
 impl From<Encoding> for i16 {
@@ -92,7 +91,7 @@ impl TryFrom<i16> for Encoding {
     fn try_from(value: i16) -> Result<Self, Self::Error> {
         match value {
             4 => Ok(Self::Zstd),
-            5 => Ok(Self::Raw),
+            1 => Ok(Self::Raw),
             _ => Err(EncodingError::UnknownEncoding(value)),
         }
     }
