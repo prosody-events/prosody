@@ -1,4 +1,16 @@
-use super::*;
+#[cfg(test)]
+use super::Ordering;
+use super::{
+    BatchUnit, Bytes, CacheBatch, CassandraStore, CassandraStoreError, Cell, CellAddr,
+    CellBatchRow, CellBuffer, CellKey, CellKind, CellStore, CellStoreError, CollectionId,
+    CollectionRef, CommitOracle, Committed, CommittedBatch, CompactDuration, Coordinate,
+    CoordinateBatch, EventMarker, EventRef, KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell,
+    ProvisionalWrite, ResolveCellError, RowShape, Scan, Section, SectionClear, SmallVec, Stream,
+    decode, decode_provisional_batch, dedupe, encode_cell_blobs, extend_gap_units, flatten_resolve,
+    gap_count, help_read_window, help_write_window, into_store_err, resolve_read, section_batches,
+    smallvec, sorted_unique_coordinates, try_stream, ttl_seconds_to_duration, ttl_to_i32,
+    write_provisional,
+};
 
 impl<O> CellStore for CassandraStore<O>
 where
@@ -255,8 +267,7 @@ where
         writes: &'a [(CellKey, ProvisionalWrite)],
         marker: Option<&'a EventMarker>,
     ) -> Result<(), Self::Error> {
-        self.write_provisional_inner(collection, writes, marker)
-            .await
+        write_provisional(self, collection, writes, marker).await
     }
 
     async fn write_resolved<'a>(

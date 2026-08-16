@@ -8,7 +8,7 @@
 
 use super::super::encoding::{
     CASSANDRA_COMPRESSION_BLOCK_BYTES, Encoding, EncodingError, decode_payload, decode_scratch,
-    encode_payload, reset_codec, select_encoding,
+    encode_payload, reset_codec, select_encoding, validate_decompression_bound,
 };
 use super::{
     CellCorruptReason, FramedKeyedCellRow, RawCellRow, blob_ttl, try_decode_cell,
@@ -26,6 +26,7 @@ use quickcheck::{QuickCheck, TestResult};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
+use zstd::bulk::compress;
 use zstd::stream::encode_all;
 use zstd::zstd_safe::get_frame_content_size;
 
@@ -277,6 +278,26 @@ fn encoding_selection_uses_the_strict_block_boundary() {
         select_encoding(CASSANDRA_COMPRESSION_BLOCK_BYTES + 1),
         Encoding::Zstd
     );
+}
+
+#[test]
+fn concatenated_zstd_frames_decode() -> Result<()> {
+    let first = compress(b"first", 0)?;
+    let second = compress(b"second", 0)?;
+    let mut frames = Vec::with_capacity(first.len() + second.len());
+    frames.extend_from_slice(&first);
+    frames.extend_from_slice(&second);
+
+    assert_eq!(
+        decode_payload(&frames, Encoding::Zstd)?,
+        Bytes::from_static(b"firstsecond")
+    );
+    Ok(())
+}
+
+#[test]
+fn declared_size_cannot_exceed_the_block_expansion_bound() {
+    assert!(validate_decompression_bound(19, u64::MAX).is_err());
 }
 
 /// Payload round-trip over arbitrary bytes:

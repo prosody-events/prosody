@@ -99,12 +99,22 @@ mod serialization;
 mod store;
 mod write;
 
-use batch::*;
-use helpers::*;
+use batch::{extend_gap_units, fits_one_batch, gap_count, marker_delete_unit, marker_last_split};
+use helpers::{
+    blob_weight, decode_provisional_batch, encode_cell_blobs, sorted_unique_coordinates,
+    ttl_seconds_to_duration, ttl_to_i32,
+};
 pub use queries::CellQueries;
-use read::*;
-use rows::*;
-
+#[cfg(test)]
+use read::decode_batch_rows;
+use read::{
+    fetch_and_decode_cell, fetch_and_decode_cell_ttl, fetch_cells_batch, into_store_err, page_cells,
+};
+use rows::{
+    CellAddr, CellBatchRow, CellBlobs, GapBetweenRow, GapEdgeRow, GapSectionRow, KeyRow,
+    MarkerBlob, MarkerWriteRow, Pk, ResolvedRow, RowShape, StageRow,
+};
+use write::write_provisional;
 #[cfg(test)]
 mod tests;
 

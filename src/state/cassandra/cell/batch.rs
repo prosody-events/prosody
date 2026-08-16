@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    BatchUnit, CellAddr, CellBatchRow, CellKind, CellQueries, GapBetweenRow, GapEdgeRow,
+    GapSectionRow, KeyRow, PER_STATEMENT_OVERHEAD, Pk, RowShape, SectionClear, smallvec,
+};
 
 /// The number of gap rows needed to erase `clears` while excluding survivors.
 pub(super) fn gap_count(clears: &[SectionClear]) -> usize {

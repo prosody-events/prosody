@@ -1,4 +1,16 @@
-use super::*;
+#[cfg(test)]
+use super::RecoveryReadCounts;
+use super::{
+    Arc, BatchUnit, Bytes, CassandraCellStoreError, CassandraSession, CassandraStore, Cell,
+    CellAddr, CellBatchRow, CellBlobs, CellBuffer, CellKey, CellKind, CellQueries, CellStore,
+    CellStoreError, CollectionDefRegistry, CollectionId, CollectionRef, CommitOracle, Coordinate,
+    EventMarker, EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob,
+    MarkerPresence, Pk, PreparedStatement, ResolveCellError, ResolvedRow, Resolver, RowShape,
+    SHARD_FANOUT_CONCURRENCY, Scan, Section, Session, Stream, TryStreamExt, blob_weight,
+    encode_marker_payload, encode_payload, fetch_and_decode_cell, fetch_and_decode_cell_ttl,
+    fetch_cells_batch, flatten_resolve, help_read_window, marker_delete_unit, marker_last_split,
+    page_cells, peek_read, pin_mut, resolve_marker, select_encoding, smallvec, try_stream,
+};
 
 impl<O> CassandraStore<O> {
     /// Creates a Cassandra cell store over an existing session, a prepared

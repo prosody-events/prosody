@@ -100,7 +100,7 @@ uuid = { version = "1.23", features = ["v4", "v5", "v7", "v8"] }
 validator = { version = "0.21", features = ["derive"] }
 whoami = "2.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-zstd = "0.13"
+zstd = { version = "0.13", features = ["experimental"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

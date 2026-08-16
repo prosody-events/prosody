@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    Bytes, CassandraCellStoreError, Cell, CellBlobs, CellBuffer, CompactDuration, Coordinate,
+    CoordinateBatch, EncodedPayload, PER_STATEMENT_OVERHEAD, ProvisionalCell, SmallVec,
+    encode_payload, select_encoding,
+};
 
 /// Encodes a cell's `data` and `prev` payloads into their bound columns.
 /// It selects shared flags when either blob is present.
@@ -14,12 +18,16 @@ pub(super) fn encode_cell_blobs(
         .unwrap_or(0);
     let encoding = select_encoding(payload_len);
     let data = data
-        .map(|payload| encode_payload(payload, encoding))
+        .map(|payload| encode_payload(payload, encoding).map(EncodedPayload::into_bytes))
         .transpose()?;
     let prev_data = prev
-        .map(|payload| encode_payload(payload, encoding))
+        .map(|payload| encode_payload(payload, encoding).map(EncodedPayload::into_bytes))
         .transpose()?;
-    Ok(CellBlobs { data, prev_data })
+    Ok(CellBlobs {
+        encoding: data.as_ref().or(prev_data.as_ref()).map(|_| encoding),
+        data,
+        prev_data,
+    })
 }
 
 /// The batch-packing weight of a cell row: its blob bytes plus the fixed

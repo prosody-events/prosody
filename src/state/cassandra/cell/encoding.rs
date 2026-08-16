@@ -1,19 +1,20 @@
 //! Payload-cell encoding for keyed-state collections.
 //!
 //! New rows use raw bytes through 16 KiB and Zstd above that size. The reader
-//! supports both forms and all Zstd frames from earlier Prosody versions.
+//! supports both forms and Zstd values from earlier versions.
 
 use crate::error::{ClassifyError, ErrorCategory};
 use bytes::Bytes;
 use std::cell::RefCell;
-use std::io::{self, Cursor, Read};
+use std::io;
 use std::ops::Deref;
 use thiserror::Error;
 use zstd::bulk::Compressor;
-use zstd::stream::read::Decoder;
 use zstd::zstd_safe::{self, DCtx, ResetDirective};
 
 const ZSTD_LEVEL: i32 = 0;
+const ZSTD_BLOCK_HEADER_BYTES: usize = 3;
+const ZSTD_MAX_BLOCK_BYTES: usize = 128 * 1_024;
 pub(super) const CASSANDRA_COMPRESSION_BLOCK_BYTES: usize = 16 * 1024;
 
 thread_local! {
@@ -47,6 +48,14 @@ impl EncodedPayload {
         match self {
             Self::Raw(_) => Encoding::Raw,
             Self::Zstd(_) => Encoding::Zstd,
+        }
+    }
+
+    /// Returns the encoded bytes without their encoding tag.
+    #[must_use]
+    pub(super) fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Raw(bytes) | Self::Zstd(bytes) => bytes,
         }
     }
 }
@@ -164,37 +173,48 @@ fn decompress(bytes: &[u8]) -> Result<Bytes, EncodingError> {
             .reset(ResetDirective::SessionOnly)
             .map_err(zstd_error)?;
         codec.decode_scratch.clear();
-        match zstd_safe::get_frame_content_size(bytes) {
-            Ok(Some(size)) => {
-                let size = usize::try_from(size).map_err(|_| {
-                    EncodingError::BadZstd(io::Error::other(
-                        "Zstd frame content size exceeds this platform",
-                    ))
-                })?;
-                codec.decode_scratch.reserve(size);
-                codec
-                    .decompressor
-                    .decompress(&mut codec.decode_scratch, bytes)
-                    .map_err(zstd_error)?;
-            }
-            Ok(None) => {
-                let Codec {
-                    decompressor,
-                    decode_scratch,
-                    ..
-                } = codec;
-                Decoder::with_context(Cursor::new(bytes), decompressor)
-                    .read_to_end(decode_scratch)
-                    .map_err(EncodingError::BadZstd)?;
-            }
-            Err(_) => {
-                return Err(EncodingError::BadZstd(io::Error::other(
-                    "invalid Zstd frame header",
-                )));
-            }
-        }
+        let bound = validated_decompression_bound(bytes)?;
+        codec.decode_scratch.reserve(bound);
+        codec
+            .decompressor
+            .decompress(&mut codec.decode_scratch, bytes)
+            .map_err(zstd_error)?;
         Ok(Bytes::copy_from_slice(&codec.decode_scratch))
     })
+}
+
+/// Returns Zstd's output bound after it passes an independent block ceiling.
+///
+/// Each block has a three-byte header and expands to at most 128 KiB. Thus,
+/// compressed input cannot produce more than one maximum block per three
+/// bytes. This ceiling rejects a corrupt declared size before allocation.
+fn validated_decompression_bound(bytes: &[u8]) -> Result<usize, EncodingError> {
+    let bound = zstd_safe::decompress_bound(bytes).map_err(zstd_error)?;
+    validate_decompression_bound(bytes.len(), bound)
+}
+
+pub(super) fn validate_decompression_bound(
+    compressed_len: usize,
+    bound: u64,
+) -> Result<usize, EncodingError> {
+    let block_count = compressed_len / ZSTD_BLOCK_HEADER_BYTES + 1;
+    let hard_bound = block_count.saturating_mul(ZSTD_MAX_BLOCK_BYTES) as u64;
+    if bound > hard_bound {
+        return Err(EncodingError::BadZstd(io::Error::other(
+            "Zstd content size exceeds the block expansion bound",
+        )));
+    }
+    let bound = usize::try_from(bound).map_err(|_| {
+        EncodingError::BadZstd(io::Error::other(
+            "Zstd decompression bound exceeds this platform",
+        ))
+    })?;
+    if bound > isize::MAX as usize {
+        return Err(EncodingError::BadZstd(io::Error::other(
+            "Zstd decompression bound exceeds the maximum allocation size",
+        )));
+    }
+    Ok(bound)
 }
 
 fn with_codec<T>(

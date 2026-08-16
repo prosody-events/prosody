@@ -1,4 +1,6 @@
-use super::*;
+#[cfg(doc)]
+use super::{CassandraStore, ScanEdge};
+use super::{TABLE_KEYED_STATE_CELL, cassandra_queries};
 
 cassandra_queries! {
     /// Container for the prepared CQL statements used by [`CassandraStore`].

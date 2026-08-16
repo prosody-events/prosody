@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Bytes, CellKey, CellKind, CollectionId, EncodedPayload, Encoding, EventRef, INITIAL_VERSION,
+    PreparedStatement, StateType,
+};
 
 /// The four partition-key column values of a collection's Cassandra partition.
 #[derive(Clone, Copy)]
@@ -26,16 +29,14 @@ impl<'a> Pk<'a> {
 /// iff **either** blob is present — a clear-over-present stage carries a null
 /// `data` with a non-null `prev_data` and still needs an encoding to decode it.
 pub(super) struct CellBlobs {
-    pub(super) data: Option<EncodedPayload>,
-    pub(super) prev_data: Option<EncodedPayload>,
+    pub(super) encoding: Option<Encoding>,
+    pub(super) data: Option<Bytes>,
+    pub(super) prev_data: Option<Bytes>,
 }
 
 impl CellBlobs {
     pub(super) fn encoding(&self) -> Option<Encoding> {
-        self.data
-            .as_ref()
-            .or(self.prev_data.as_ref())
-            .map(EncodedPayload::encoding)
+        self.encoding
     }
 
     pub(super) fn version(&self) -> Option<i32> {
