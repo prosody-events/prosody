@@ -262,37 +262,21 @@ fn provisional_batch_coordinates_are_sorted_and_distinct() -> Result<()> {
     Ok(())
 }
 
-/// Live end-to-end mirror of the sort pin: two corrupt rows seeded by raw CQL
-/// at coords A (`0x01`, `PrevWithoutEvent`) and B (`0xFE`,
-/// `BlobWithoutEncoding`), read via `provisional_many` over the batch `[0xFE,
-/// 0x01]`. Because the verb decodes in ascending coordinate order, it surfaces
-/// A's `PrevWithoutEvent` (the LOWEST coordinate) — the OPPOSITE of
-/// `get_many`'s first-input rule.
+/// Recovery skips resolved rows before it decodes their unused blobs.
 #[tokio::test]
-async fn cassandra_raw_batch_lowest_corrupt_coordinate() -> Result<()> {
-    use super::CellCorruptReason;
-    use crate::state::cassandra::CassandraCellStoreError;
-    use crate::state::resolve::ResolveCellError;
-
+async fn resolved_corrupt_rows_are_skipped_before_decode() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     let store = fx.bottom_store(ScriptedOracle::default());
-    let c = collection("raw-lowest-corrupt")?;
+    let c = collection("resolved-corrupt-skip")?;
     let id = c.id();
     seed_prev_without_event_and_blob_without_encoding(fx.cassandra.session(), id).await?;
 
-    // Read list `[B, A]`: ascending-order decode must surface A's (lowest) error.
     let batch = CoordinateBatch::chunks([0xFEu8, 0x01].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    match Box::pin(store.provisional_many(id, SECTIONS[0], &batch)).await {
-        Err(ResolveCellError::Store(CassandraCellStoreError::CorruptCell(reason))) => assert_eq!(
-            reason,
-            CellCorruptReason::PrevWithoutEvent,
-            "the lowest coordinate (A) determines the surfaced error"
-        ),
-        other => return Err(eyre!("expected A's PrevWithoutEvent, got {other:?}")),
-    }
+    let rows = Box::pin(store.provisional_many(id, SECTIONS[0], &batch)).await?;
+    assert!(rows.is_empty(), "resolved rows are not recovery candidates");
     Ok(())
 }
 

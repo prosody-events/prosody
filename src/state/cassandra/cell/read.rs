@@ -113,6 +113,28 @@ pub(super) fn decode_batch_rows(
     result: &QueryRowsResult,
     uniques: &[&Coordinate],
 ) -> Result<DecodedBatch, CassandraCellStoreError> {
+    align_batch_rows(result, uniques)?
+        .into_iter()
+        .map(|row| row.map(decode::try_decode_cell_ttl).transpose())
+        .collect()
+}
+
+#[cfg(test)]
+pub(super) fn align_and_decode_batch_rows<'frame>(
+    rows: CellBuffer<(&'frame [u8], decode::BorrowedCellTtlRow<'frame>)>,
+    uniques: &[&Coordinate],
+) -> Result<DecodedBatch, CassandraCellStoreError> {
+    align_batch_rows_inner(rows, uniques)
+        .into_iter()
+        .map(|row| row.map(decode::try_decode_cell_ttl).transpose())
+        .collect()
+}
+
+/// Aligns borrowed batch rows to the requested coordinate order.
+pub(super) fn align_batch_rows<'frame>(
+    result: &'frame QueryRowsResult,
+    uniques: &[&Coordinate],
+) -> Result<CellBuffer<Option<decode::BorrowedCellTtlRow<'frame>>>, CassandraCellStoreError> {
     // At most one row per unique coordinate, so size once at the IN-list upper
     // bound rather than growing an inline buffer up to `CELL_BATCH`.
     let mut rows: CellBuffer<(&[u8], decode::BorrowedCellTtlRow<'_>)> =
@@ -126,13 +148,13 @@ pub(super) fn decode_batch_rows(
         ));
     }
 
-    align_and_decode_batch_rows(rows, uniques)
+    Ok(align_batch_rows_inner(rows, uniques))
 }
 
-pub(super) fn align_and_decode_batch_rows<'frame>(
+fn align_batch_rows_inner<'frame>(
     mut rows: CellBuffer<(&'frame [u8], decode::BorrowedCellTtlRow<'frame>)>,
     uniques: &[&Coordinate],
-) -> Result<DecodedBatch, CassandraCellStoreError> {
+) -> CellBuffer<Option<decode::BorrowedCellTtlRow<'frame>>> {
     // Align the result here so every caller receives one slot per requested
     // coordinate. Cassandra does not guarantee the order of an `IN` result.
     let mut out = CellBuffer::with_capacity(uniques.len());
@@ -145,9 +167,9 @@ pub(super) fn align_and_decode_batch_rows<'frame>(
             continue;
         };
         let (_, row) = rows.swap_remove(pos);
-        out.push(Some(decode::try_decode_cell_ttl(row)?));
+        out.push(Some(row));
     }
-    Ok(out)
+    out
 }
 
 /// The shared section-scan row pager. It opens the prepared statement for the

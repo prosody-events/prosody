@@ -1,14 +1,14 @@
 #[cfg(test)]
 use super::Ordering;
 use super::{
-    BatchUnit, Bytes, CacheBatch, CassandraStore, CassandraStoreError, Cell, CellAddr,
+    Arc, BatchUnit, Bytes, CacheBatch, CassandraStore, CassandraStoreError, Cell, CellAddr,
     CellBatchRow, CellBuffer, CellKey, CellKind, CellStore, CellStoreError, CollectionId,
     CollectionRef, CommitOracle, Committed, CommittedBatch, CompactDuration, Coordinate,
     CoordinateBatch, EventMarker, EventRef, KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell,
     ProvisionalWrite, ResolveCellError, RowShape, Scan, Section, SectionClear, SmallVec, Stream,
-    decode, decode_batch_rows, decode_cell_ttl_result, decode_provisional_batch, dedupe,
-    encode_cell_blobs, extend_gap_units, flatten_resolve, gap_count, help_read_window,
-    help_write_window, into_store_err, resolve_read, section_batches, smallvec,
+    align_batch_rows, decode, decode_batch_rows, decode_cell_ttl_result, decode_provisional_batch,
+    dedupe, encode_cell_blobs, extend_gap_units, flatten_resolve, gap_count, help_read_window,
+    help_write_window, into_store_err, realign, resolve_read, section_batches, smallvec,
     sorted_unique_coordinates, try_stream, ttl_seconds_to_duration, ttl_to_i32, write_provisional,
 };
 
@@ -156,13 +156,7 @@ where
             .map_err(flatten_resolve)?;
             answers.push((committed, ttl_seconds_to_duration(ttl)));
         }
-        let out: CacheBatch = plan.iter().map(|&i| answers[i].clone()).collect();
-        debug_assert_eq!(
-            out.len(),
-            batch.len(),
-            "batch read must answer every input position"
-        );
-        Ok(out)
+        Ok(realign(&plan, &answers))
     }
 
     fn scan_cells<'a>(
@@ -252,11 +246,12 @@ where
         // One IN query, reusing the TTL-bearing batch read; TTL is discarded in
         // the decoder. Never consults the oracle, never resolves, never writes —
         // no read-window marker resolve, exactly as `provisional_cell_at`.
-        let rows = self
-            .batch_read(collection, section, &uniques)
+        let result = self
+            .batch_read_result(collection, section, &uniques)
             .await
             .map_err(ResolveCellError::Store)?;
-        Ok(decode_provisional_batch(rows, &uniques))
+        let rows = align_batch_rows(&result, &uniques).map_err(ResolveCellError::Store)?;
+        decode_provisional_batch(rows, &uniques).map_err(ResolveCellError::Store)
     }
 
     async fn write_provisional<'a>(
@@ -353,7 +348,7 @@ where
             return Ok(self
                 .memo
                 .standing
-                .read_async(collection, |_, marker| marker.clone())
+                .read_async(collection, |_, marker| marker.as_ref().clone())
                 .await);
         }
         // Memo miss: the one durable point read at the fixed marker address,
@@ -395,7 +390,7 @@ where
         if let Some(marker) = &marker {
             self.memo
                 .standing
-                .upsert_async(collection.clone(), marker.clone())
+                .upsert_async(collection.clone(), Arc::new(marker.clone()))
                 .await;
         }
         self.presence.set(collection).await;

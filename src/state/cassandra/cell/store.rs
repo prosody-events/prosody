@@ -2,15 +2,14 @@
 use super::RecoveryReadCounts;
 use super::{
     Arc, BatchUnit, Bytes, CassandraCellStoreError, CassandraSession, CassandraStore, Cell,
-    CellAddr, CellBatchRow, CellBlobs, CellBuffer, CellKey, CellKind, CellQueries, CellStore,
-    CellStoreError, CollectionDefRegistry, CollectionId, CollectionRef, CommitOracle, Coordinate,
-    EventMarker, EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob,
-    MarkerPresence, Pk, PreparedStatement, QueryRowsResult, ResolveCellError, ResolvedRow,
-    Resolver, RowShape, SHARD_FANOUT_CONCURRENCY, Scan, Section, Session, Stream, TryStreamExt,
-    blob_weight, encode, encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result,
-    fetch_cells_batch, fetch_cells_batch_result, flatten_resolve, help_read_window,
-    marker_delete_unit, marker_last_split, page_cells, peek_read, pin_mut, resolve_marker,
-    smallvec, try_stream,
+    CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStore, CellStoreError,
+    CollectionDefRegistry, CollectionId, CollectionRef, CommitOracle, Coordinate, EventMarker,
+    EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerPresence, Pk,
+    PreparedStatement, QueryRowsResult, ResolveCellError, ResolvedRow, Resolver, RowShape,
+    SHARD_FANOUT_CONCURRENCY, Scan, Section, Session, Stream, TryStreamExt, blob_weight, encode,
+    encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result, fetch_cells_batch_result,
+    flatten_resolve, help_read_window, marker_delete_unit, marker_last_split, page_cells,
+    peek_read, pin_mut, resolve_marker, smallvec, try_stream,
 };
 
 impl<O> CassandraStore<O> {
@@ -66,22 +65,6 @@ impl<O> CassandraStore<O> {
         cell: &CellKey,
     ) -> Result<QueryRowsResult, CassandraCellStoreError> {
         fetch_cell_rows_result(&self.session, statement, id, cell).await
-    }
-
-    /// Reads and decodes a section's coordinates in one `IN` query.
-    /// The output follows `uniques` order and omits absent coordinates.
-    ///
-    /// `uniques` is caller-deduped and non-empty by [`CoordinateBatch`]
-    /// construction, so the `IN` list has no repeats and is never empty; and
-    /// bounded by `CELL_BATCH`, so the [`CellBuffer`] result stays bounded —
-    /// inline for small reads, a single heap spill for larger ones.
-    pub(super) async fn batch_read(
-        &self,
-        id: &CollectionId,
-        section: Section,
-        uniques: &[&Coordinate],
-    ) -> Result<CellBuffer<Option<(Cell, Option<i32>)>>, CassandraCellStoreError> {
-        fetch_cells_batch(&self.session, &self.queries, id, section, uniques).await
     }
 
     pub(super) async fn batch_read_result(
@@ -210,7 +193,7 @@ where
         }
         self.memo
             .standing
-            .upsert_async(collection.id().clone(), marker.clone())
+            .upsert_async(collection.id().clone(), Arc::new(marker.clone()))
             .await;
         self.presence.set(collection.id()).await;
         let payload = encode_marker_payload(marker)

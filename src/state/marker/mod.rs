@@ -36,6 +36,7 @@ use super::cell_key::{CellKey, Coordinate, Section};
 use super::event_ref::EventRef;
 use crate::error::{ClassifyError, ErrorCategory};
 use bytes::Bytes;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Width of the `u32` big-endian count/length prefixes in the frozen payload.
@@ -121,9 +122,14 @@ impl SectionClear {
 /// See the module docs for the invariants it carries. Constructed only inside
 /// the state module (mirroring
 /// [`ProvisionalCell`](super::cell::ProvisionalCell)): only the stage path
-/// mints a marker.
+/// mints a marker. Clones share one immutable payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventMarker {
+    inner: Arc<EventMarkerData>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EventMarkerData {
     event: EventRef,
     staged: Vec<CellKey>,
     clears: Vec<SectionClear>,
@@ -142,39 +148,37 @@ impl EventMarker {
     ) -> Self {
         let mut coordinates: Vec<CellKey> = staged.iter().map(|(cell, _)| cell.clone()).collect();
         coordinates.sort_unstable();
-        Self {
-            event,
-            staged: coordinates,
-            clears: clears.to_vec(),
-        }
+        Self::from_parts(event, coordinates, clears.to_vec())
     }
 
     /// Reconstructs a marker from decoded parts (the payload decoder).
     #[must_use]
     fn from_parts(event: EventRef, staged: Vec<CellKey>, clears: Vec<SectionClear>) -> Self {
         Self {
-            event,
-            staged,
-            clears,
+            inner: Arc::new(EventMarkerData {
+                event,
+                staged,
+                clears,
+            }),
         }
     }
 
     /// The owning event.
     #[must_use]
     pub fn event(&self) -> EventRef {
-        self.event
+        self.inner.event
     }
 
     /// The event's full staged coordinate set, ascending.
     #[must_use]
     pub fn staged(&self) -> &[CellKey] {
-        &self.staged
+        &self.inner.staged
     }
 
     /// Each cleared section with its frozen survivors.
     #[must_use]
     pub fn clears(&self) -> &[SectionClear] {
-        &self.clears
+        &self.inner.clears
     }
 }
 
@@ -203,11 +207,11 @@ pub(in crate::state) fn encode_marker_payload(
     marker: &EventMarker,
 ) -> Result<Bytes, MarkerPayloadError> {
     let mut len = LEN_PREFIX;
-    for cell in &marker.staged {
+    for cell in marker.staged() {
         len += 1 + LEN_PREFIX + cell.coordinate.as_bytes().len();
     }
     len += LEN_PREFIX;
-    for clear in &marker.clears {
+    for clear in marker.clears() {
         len += 1 + LEN_PREFIX;
         for coordinate in &clear.survivors {
             len += LEN_PREFIX + coordinate.as_bytes().len();
@@ -215,13 +219,13 @@ pub(in crate::state) fn encode_marker_payload(
     }
 
     let mut buf = Vec::with_capacity(len);
-    buf.extend_from_slice(&len_u32(marker.staged.len())?.to_be_bytes());
-    for cell in &marker.staged {
+    buf.extend_from_slice(&len_u32(marker.staged().len())?.to_be_bytes());
+    for cell in marker.staged() {
         buf.push(i8::from(cell.section).cast_unsigned());
         push_len_prefixed(&mut buf, &cell.coordinate)?;
     }
-    buf.extend_from_slice(&len_u32(marker.clears.len())?.to_be_bytes());
-    for clear in &marker.clears {
+    buf.extend_from_slice(&len_u32(marker.clears().len())?.to_be_bytes());
+    for clear in marker.clears() {
         buf.push(i8::from(clear.section).cast_unsigned());
         buf.extend_from_slice(&len_u32(clear.survivors.len())?.to_be_bytes());
         for coordinate in &clear.survivors {

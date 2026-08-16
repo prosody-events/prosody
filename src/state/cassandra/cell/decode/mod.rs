@@ -65,26 +65,23 @@ pub(super) type BorrowedRawCellRow<'frame> = RawCellRow<&'frame [u8]>;
 /// Seven-column shape produced by `SELECT section, coordinate, data,
 /// prev_data, encoding, version, event` — a [`RawCellRow`] prefixed with the
 /// clustering columns. Used by the section scans.
-pub(super) type KeyedCellRow<B = Vec<u8>> = (
+pub(super) type FramedKeyedCellRow = (
     i8,      // section
     Vec<u8>, // coordinate
-    Option<B>,
-    Option<B>,
+    Option<Bytes>,
+    Option<Bytes>,
     Option<i16>,
     Option<i32>,
     Option<RawEventRef>,
 );
 
-/// Paged scan row that holds frame slices only during one stream iteration.
-pub(super) type FramedKeyedCellRow = KeyedCellRow<Bytes>;
-
 /// Seven-column shape produced by `SELECT data, prev_data, encoding, version,
 /// event, TTL(data), TTL(prev_data)` — a [`RawCellRow`] suffixed with the
 /// per-blob remaining TTLs [`blob_ttl`] coalesces, for the cache-fill point
 /// read.
-pub(super) type CellTtlRow<B = Vec<u8>> = (
-    Option<B>,
-    Option<B>,
+pub(super) type BorrowedCellTtlRow<'frame> = (
+    Option<&'frame [u8]>,
+    Option<&'frame [u8]>,
     Option<i16>,
     Option<i32>,
     Option<RawEventRef>,
@@ -92,19 +89,16 @@ pub(super) type CellTtlRow<B = Vec<u8>> = (
     Option<i32>, // TTL(prev_data) in whole seconds
 );
 
-/// TTL point-read row that borrows payloads from its Scylla response frame.
-pub(super) type BorrowedCellTtlRow<'frame> = CellTtlRow<&'frame [u8]>;
-
 /// Eight-column shape produced by the batch cache-fill `SELECT coordinate,
 /// data, prev_data, encoding, version, event, TTL(data), TTL(prev_data)` — a
 /// [`CellTtlRow`] prefixed with the clustering `coordinate`. Used by the batch
 /// read (`get_many`/`get_many_for_cache`), where `IN` returns rows in
 /// clustering order, so the coordinate is carried to re-key each row back to
 /// its input position.
-pub(super) type KeyedCellTtlRow<C = Vec<u8>, B = Vec<u8>> = (
-    C, // coordinate
-    Option<B>,
-    Option<B>,
+pub(super) type BorrowedKeyedCellTtlRow<'frame> = (
+    &'frame [u8], // coordinate
+    Option<&'frame [u8]>,
+    Option<&'frame [u8]>,
     Option<i16>,
     Option<i32>,
     Option<RawEventRef>,
@@ -112,12 +106,11 @@ pub(super) type KeyedCellTtlRow<C = Vec<u8>, B = Vec<u8>> = (
     Option<i32>,
 );
 
-/// Batch row that borrows payloads from its Scylla response frame.
-pub(super) type BorrowedKeyedCellTtlRow<'frame> = KeyedCellTtlRow<&'frame [u8], &'frame [u8]>;
-
 /// Splits a batch row's borrowed clustering coordinate from its body.
 /// Semantic decode stays deferred so corrupt rows surface in input order.
-pub(super) fn split_keyed_cell_ttl<C, B>(row: KeyedCellTtlRow<C, B>) -> (C, CellTtlRow<B>) {
+pub(super) fn split_keyed_cell_ttl(
+    row: BorrowedKeyedCellTtlRow<'_>,
+) -> (&[u8], BorrowedCellTtlRow<'_>) {
     let (coordinate, data, prev_data, encoding, version, event, ttl_data, ttl_prev) = row;
     (
         coordinate,
@@ -174,7 +167,7 @@ pub(super) fn try_decode_marker<B: AsRef<[u8]>>(
 /// section scans. Fails with the same corruption errors as
 /// [`try_decode_cell`].
 pub(super) fn try_decode_keyed_cell(
-    row: KeyedCellRow<Bytes>,
+    row: FramedKeyedCellRow,
 ) -> Result<(CellKey, Cell), CassandraCellStoreError> {
     let (section, coordinate, data, prev_data, encoding, version, event) = row;
     let key = clustered_cell_key(section, coordinate);
@@ -185,12 +178,27 @@ pub(super) fn try_decode_keyed_cell(
 /// Decodes a cache-fill point row into its [`Cell`] and co-expiry TTL
 /// ([`blob_ttl`]). Fails with the same corruption errors as
 /// [`try_decode_cell`].
-pub(super) fn try_decode_cell_ttl<B: AsRef<[u8]>>(
-    row: CellTtlRow<B>,
+pub(super) fn try_decode_cell_ttl(
+    row: BorrowedCellTtlRow<'_>,
 ) -> Result<(Cell, Option<i32>), CassandraCellStoreError> {
     let (data, prev_data, encoding, version, event, ttl_data, ttl_prev) = row;
     let cell = try_decode_cell((data, prev_data, encoding, version, event))?;
     Ok((cell, blob_ttl(ttl_data, ttl_prev)))
+}
+
+/// Decodes a recovery row only when its event column marks it provisional.
+/// Resolved rows need no blob decode because recovery discards them.
+pub(super) fn try_decode_provisional_cell_ttl(
+    row: BorrowedCellTtlRow<'_>,
+) -> Result<Option<ProvisionalCell>, CassandraCellStoreError> {
+    if row.4.is_none() {
+        return Ok(None);
+    }
+    let (cell, _) = try_decode_cell_ttl(row)?;
+    match cell {
+        Cell::Provisional(provisional) => Ok(Some(provisional)),
+        Cell::Resolved(_) => Ok(None),
+    }
 }
 
 /// The cache-fill co-expiry: the remaining TTL of whichever blob the row

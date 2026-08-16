@@ -1,7 +1,7 @@
 use super::{
     Arc, Bytes, CassandraCellResources, CassandraCellStoreError, CassandraSession, CellBuffer,
     CellKey, CellQueries, CollectionId, CoordinateBatch, Scan, Section, Stream, TryStreamExt,
-    dedupe, fetch_and_decode_cell, fetch_cells_batch, page_cells, pin_mut, try_stream,
+    dedupe, fetch_and_decode_cell, fetch_cells_batch, page_cells, pin_mut, realign, try_stream,
 };
 
 impl CassandraCellResources {
@@ -58,13 +58,7 @@ impl CassandraCellResources {
             .into_iter()
             .map(|row| row.and_then(|(cell, _)| cell.project_committed().cloned()))
             .collect();
-        let out: CellBuffer<Option<Bytes>> = plan.iter().map(|&i| answers[i].clone()).collect();
-        debug_assert_eq!(
-            out.len(),
-            batch.len(),
-            "batch read must answer every input position"
-        );
-        Ok(out)
+        Ok(realign(&plan, &answers))
     }
 
     /// Scans a section's committed values without consulting the oracle. This

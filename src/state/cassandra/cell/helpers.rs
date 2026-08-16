@@ -1,11 +1,12 @@
 use super::{
-    Bytes, CassandraCellStoreError, Cell, CellBlobs, CellBuffer, CompactDuration, Coordinate,
+    Bytes, CassandraCellStoreError, CellBlobs, CellBuffer, CompactDuration, Coordinate,
     CoordinateBatch, PER_STATEMENT_OVERHEAD, ProvisionalCell, SmallVec, encode_payload,
     select_encoding,
 };
 
 /// Encodes a cell's `data` and `prev` payloads into their bound columns.
-/// It selects shared flags when either blob is present.
+/// It selects one shared encoding from the larger payload because the row has
+/// one encoding column for both provisional blobs.
 pub(super) fn encode_cell_blobs(
     data: Option<&Bytes>,
     prev: Option<&Bytes>,
@@ -57,19 +58,18 @@ pub(super) fn ttl_seconds_to_duration(ttl: Option<i32>) -> Option<CompactDuratio
 /// Keeps provisional cells from a recovery batch and discards their TTLs.
 /// The input already follows ascending coordinate order.
 pub(super) fn decode_provisional_batch(
-    rows: CellBuffer<Option<(Cell, Option<i32>)>>,
+    rows: CellBuffer<Option<super::decode::BorrowedCellTtlRow<'_>>>,
     coordinates: &[&Coordinate],
-) -> CellBuffer<(Coordinate, ProvisionalCell)> {
+) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, CassandraCellStoreError> {
     let mut out: CellBuffer<(Coordinate, ProvisionalCell)> = SmallVec::with_capacity(rows.len());
     for (&coordinate, row) in coordinates.iter().zip(rows) {
-        match row.map(|(cell, _)| cell) {
-            Some(Cell::Provisional(provisional)) => {
-                out.push((Coordinate::clone(coordinate), provisional));
-            }
-            Some(Cell::Resolved(_)) | None => {}
+        if let Some(row) = row
+            && let Some(provisional) = super::decode::try_decode_provisional_cell_ttl(row)?
+        {
+            out.push((Coordinate::clone(coordinate), provisional));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Returns the sorted, distinct coordinates for one recovery query.
@@ -79,4 +79,13 @@ pub(super) fn sorted_unique_coordinates(batch: &CoordinateBatch) -> CellBuffer<&
     coordinates.sort_unstable();
     coordinates.dedup();
     coordinates
+}
+
+/// Expands unique answers through a deduplication plan.
+pub(super) fn realign<T: Clone>(plan: &[usize], answers: &[T]) -> CellBuffer<T> {
+    debug_assert!(
+        plan.iter().all(|&index| index < answers.len()),
+        "batch read must answer every input position"
+    );
+    plan.iter().map(|&index| answers[index].clone()).collect()
 }

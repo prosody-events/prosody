@@ -204,7 +204,7 @@ async fn cassandra_backend() -> Result<CassandraReaderBackend> {
 
 /// Converts a runner `Result<bool>` into a `TestResult` (a store/setup error is
 /// a broken environment, never a shrinkable property failure). Mirrors
-/// `cell/tests.rs::finish`.
+/// `state/cassandra/cell/tests/properties.rs::finish`.
 fn finish(result: Result<bool>) -> TestResult {
     match result {
         Ok(true) => TestResult::passed(),
