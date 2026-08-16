@@ -101,7 +101,7 @@ mod write;
 
 use batch::{extend_gap_units, fits_one_batch, gap_count, marker_delete_unit, marker_last_split};
 use helpers::{
-    blob_weight, decode_provisional_batch, encode_cell_blobs, realign, sorted_unique_coordinates,
+    blob_weight, decode_provisional_batch, encode_cell_blobs, sorted_unique_coordinates,
     ttl_seconds_to_duration, ttl_to_i32,
 };
 pub use queries::CellQueries;
@@ -140,7 +140,8 @@ use crate::state::resolve::{
     resolve_marker, resolve_read,
 };
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe, section_batches,
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe, realign,
+    section_batches,
 };
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;
@@ -321,7 +322,7 @@ pub(crate) struct RecoveryReadCounts {
 /// the module, stage, and settle docs cite.
 #[derive(Debug, Default)]
 struct MarkerMemo {
-    standing: scc::HashMap<CollectionId, Arc<EventMarker>, RandomState>,
+    standing: scc::HashMap<CollectionId, EventMarker, RandomState>,
 }
 
 /// Cassandra-backed uniform cell store.

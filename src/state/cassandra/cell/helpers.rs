@@ -80,12 +80,3 @@ pub(super) fn sorted_unique_coordinates(batch: &CoordinateBatch) -> CellBuffer<&
     coordinates.dedup();
     coordinates
 }
-
-/// Expands unique answers through a deduplication plan.
-pub(super) fn realign<T: Clone>(plan: &[usize], answers: &[T]) -> CellBuffer<T> {
-    debug_assert!(
-        plan.iter().all(|&index| index < answers.len()),
-        "batch read must answer every input position"
-    );
-    plan.iter().map(|&index| answers[index].clone()).collect()
-}

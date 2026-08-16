@@ -109,6 +109,8 @@ pub mod registry;
 pub mod resolve;
 pub mod session;
 pub(crate) mod store;
+mod store_helpers;
+mod store_types;
 
 #[cfg(test)]
 pub(crate) mod tests;

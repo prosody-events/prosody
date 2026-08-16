@@ -3,6 +3,7 @@
 //! New rows use raw bytes through 16 KiB and Zstd above that size. The reader
 //! supports both forms and Zstd values from earlier versions.
 
+use crate::codec::SerializeBufGuard;
 use crate::error::{ClassifyError, ErrorCategory};
 use bytes::Bytes;
 use std::cell::RefCell;
@@ -20,13 +21,10 @@ thread_local! {
     static CODEC: RefCell<Option<Codec>> = const { RefCell::new(None) };
 }
 
-/// One thread owns this codec state. Its scratch never escapes a codec call.
-/// Each scratch buffer retains the largest capacity that this thread saw.
+/// One thread owns the Zstd contexts. Scratch comes from [`SerializeBufGuard`].
 struct Codec {
     compressor: Compressor<'static>,
     decompressor: DCtx<'static>,
-    encode_scratch: Vec<u8>,
-    decode_scratch: Vec<u8>,
 }
 
 /// Encoded bytes paired with their durable discriminator.
@@ -53,15 +51,14 @@ impl Codec {
         Ok(Self {
             compressor: Compressor::new(ZSTD_LEVEL)?,
             decompressor: DCtx::create(),
-            encode_scratch: Vec::new(),
-            decode_scratch: Vec::new(),
         })
     }
 }
 
 /// Encoding discriminator for value payload cells.
 ///
-/// Value 4 identifies the released Zstd format. Value 0 stays invalid.
+/// Value 4 identifies the released Zstd format. Value 0 stays invalid. No
+/// released build persisted value 1 in `keyed_state_cell`, so Raw can use it.
 #[repr(i16)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(in crate::state::cassandra) enum Encoding {
@@ -129,15 +126,13 @@ pub(in crate::state::cassandra) fn decode_payload(
 
 fn compress(raw: &[u8]) -> Result<Bytes, EncodingError> {
     with_codec(|codec| {
-        codec.encode_scratch.clear();
-        codec
-            .encode_scratch
-            .reserve(zstd_safe::compress_bound(raw.len()));
+        let mut scratch = SerializeBufGuard::acquire();
+        scratch.reserve(zstd_safe::compress_bound(raw.len()));
         codec
             .compressor
-            .compress_to_buffer(raw, &mut codec.encode_scratch)
+            .compress_to_buffer(raw, &mut *scratch)
             .map_err(EncodingError::BadZstd)?;
-        Ok(Bytes::copy_from_slice(&codec.encode_scratch))
+        Ok(Bytes::copy_from_slice(&scratch))
     })
 }
 
@@ -147,14 +142,14 @@ fn decompress(bytes: &[u8]) -> Result<Bytes, EncodingError> {
             .decompressor
             .reset(ResetDirective::SessionOnly)
             .map_err(zstd_error)?;
-        codec.decode_scratch.clear();
+        let mut scratch = SerializeBufGuard::acquire();
         let bound = validated_decompression_bound(bytes)?;
-        codec.decode_scratch.reserve(bound);
+        scratch.reserve(bound);
         codec
             .decompressor
-            .decompress(&mut codec.decode_scratch, bytes)
+            .decompress(&mut *scratch, bytes)
             .map_err(zstd_error)?;
-        Ok(Bytes::copy_from_slice(&codec.decode_scratch))
+        Ok(Bytes::copy_from_slice(&scratch))
     })
 }
 
@@ -212,20 +207,12 @@ fn zstd_error(code: usize) -> EncodingError {
 #[cfg(test)]
 pub(super) fn reset_codec() {
     CODEC.with(|slot| *slot.borrow_mut() = None);
+    SerializeBufGuard::reset();
 }
 
 #[cfg(test)]
 pub(super) fn decode_scratch() -> (usize, usize) {
-    CODEC.with(|slot| {
-        slot.borrow().as_ref().map_or((0, 0), |codec| {
-            let capacity = codec.decode_scratch.capacity();
-            if capacity == 0 {
-                (0, 0)
-            } else {
-                (codec.decode_scratch.as_ptr() as usize, capacity)
-            }
-        })
-    })
+    SerializeBufGuard::allocation()
 }
 
 /// Error returned by the encoding module.

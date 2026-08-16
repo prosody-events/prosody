@@ -1,7 +1,7 @@
 #[cfg(test)]
 use super::Ordering;
 use super::{
-    Arc, BatchUnit, Bytes, CacheBatch, CassandraStore, CassandraStoreError, Cell, CellAddr,
+    BatchUnit, Bytes, CacheBatch, CassandraStore, CassandraStoreError, Cell, CellAddr,
     CellBatchRow, CellBuffer, CellKey, CellKind, CellStore, CellStoreError, CollectionId,
     CollectionRef, CommitOracle, Committed, CommittedBatch, CompactDuration, Coordinate,
     CoordinateBatch, EventMarker, EventRef, KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell,
@@ -348,7 +348,7 @@ where
             return Ok(self
                 .memo
                 .standing
-                .read_async(collection, |_, marker| marker.as_ref().clone())
+                .read_async(collection, |_, marker| marker.clone())
                 .await);
         }
         // Memo miss: the one durable point read at the fixed marker address,
@@ -390,7 +390,7 @@ where
         if let Some(marker) = &marker {
             self.memo
                 .standing
-                .upsert_async(collection.clone(), Arc::new(marker.clone()))
+                .upsert_async(collection.clone(), marker.clone())
                 .await;
         }
         self.presence.set(collection).await;

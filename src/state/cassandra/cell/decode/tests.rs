@@ -405,6 +405,7 @@ fn decode_scratch_grows_once_and_then_stays_stable() -> Result<()> {
     let minimum = Bytes::from_static(b"small");
     let encoded_maximum = encode_payload(&maximum, Encoding::Zstd)?;
     let encoded_minimum = encode_payload(&minimum, Encoding::Zstd)?;
+    reset_codec();
 
     assert_eq!(decode_scratch(), (0, 0));
     assert_eq!(decode_payload(&encoded_maximum, Encoding::Zstd)?, maximum);

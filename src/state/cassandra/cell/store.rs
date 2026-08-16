@@ -193,7 +193,7 @@ where
         }
         self.memo
             .standing
-            .upsert_async(collection.id().clone(), Arc::new(marker.clone()))
+            .upsert_async(collection.id().clone(), marker.clone())
             .await;
         self.presence.set(collection.id()).await;
         let payload = encode_marker_payload(marker)
