@@ -101,8 +101,7 @@ mod write;
 
 use batch::{extend_gap_units, fits_one_batch, gap_count, marker_delete_unit, marker_last_split};
 use helpers::{
-    blob_weight, decode_provisional_batch, encode_cell_blobs, sorted_unique_coordinates,
-    ttl_seconds_to_duration, ttl_to_i32,
+    blob_weight, decode_provisional_batch, encode_cell_blobs, ttl_seconds_to_duration, ttl_to_i32,
 };
 pub use queries::CellQueries;
 #[cfg(test)]
@@ -141,7 +140,7 @@ use crate::state::resolve::{
 };
 use crate::state::store::{
     CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe, realign,
-    section_batches,
+    section_batches, sorted_unique_coordinates,
 };
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;

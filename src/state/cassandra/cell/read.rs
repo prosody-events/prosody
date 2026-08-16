@@ -113,10 +113,7 @@ pub(super) fn decode_batch_rows(
     result: &QueryRowsResult,
     uniques: &[&Coordinate],
 ) -> Result<DecodedBatch, CassandraCellStoreError> {
-    align_batch_rows(result, uniques)?
-        .into_iter()
-        .map(|row| row.map(decode::try_decode_cell_ttl).transpose())
-        .collect()
+    decode_aligned(align_batch_rows(result, uniques)?)
 }
 
 #[cfg(test)]
@@ -124,8 +121,13 @@ pub(super) fn align_and_decode_batch_rows<'frame>(
     rows: CellBuffer<(&'frame [u8], decode::BorrowedCellTtlRow<'frame>)>,
     uniques: &[&Coordinate],
 ) -> Result<DecodedBatch, CassandraCellStoreError> {
-    align_batch_rows_inner(rows, uniques)
-        .into_iter()
+    decode_aligned(align_batch_rows_inner(rows, uniques))
+}
+
+fn decode_aligned(
+    rows: CellBuffer<Option<decode::BorrowedCellTtlRow<'_>>>,
+) -> Result<DecodedBatch, CassandraCellStoreError> {
+    rows.into_iter()
         .map(|row| row.map(decode::try_decode_cell_ttl).transpose())
         .collect()
 }

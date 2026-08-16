@@ -55,7 +55,9 @@ use futures::Stream;
 use std::error::Error;
 use std::future::Future;
 
-pub(crate) use super::store_helpers::{dedupe, provisional_point_loop, realign, section_batches};
+pub(crate) use super::store_helpers::{
+    dedupe, provisional_point_loop, realign, section_batches, sorted_unique_coordinates,
+};
 pub(crate) use super::store_types::CELL_BATCH;
 pub use super::store_types::{CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch};
 

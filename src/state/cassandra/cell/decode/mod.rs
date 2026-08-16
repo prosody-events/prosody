@@ -187,11 +187,21 @@ pub(super) fn try_decode_cell_ttl(
 }
 
 /// Decodes a recovery row only when its event column marks it provisional.
-/// Resolved rows need no blob decode because recovery discards them.
+/// Resolved rows validate their metadata, then skip blob decode.
 pub(super) fn try_decode_provisional_cell_ttl(
     row: BorrowedCellTtlRow<'_>,
 ) -> Result<Option<ProvisionalCell>, CassandraCellStoreError> {
     if row.4.is_none() {
+        validate_version(row.3)?;
+        if row.0.is_some() || row.1.is_some() {
+            let Some(encoding) = row.2 else {
+                return Err(CellCorruptReason::BlobWithoutEncoding.into());
+            };
+            Encoding::try_from(encoding)?;
+        }
+        if row.1.is_some() {
+            return Err(CellCorruptReason::PrevWithoutEvent.into());
+        }
         return Ok(None);
     }
     let (cell, _) = try_decode_cell_ttl(row)?;

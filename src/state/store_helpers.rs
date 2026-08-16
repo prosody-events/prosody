@@ -29,6 +29,15 @@ pub(crate) fn realign<T: Clone>(plan: &[usize], answers: &[T]) -> CellBuffer<T> 
     plan.iter().map(|&index| answers[index].clone()).collect()
 }
 
+/// Returns the sorted, distinct coordinates for one bounded batch.
+pub(crate) fn sorted_unique_coordinates(batch: &CoordinateBatch) -> CellBuffer<&Coordinate> {
+    let mut coordinates: CellBuffer<&Coordinate> = SmallVec::with_capacity(batch.len());
+    coordinates.extend(batch.iter());
+    coordinates.sort_unstable();
+    coordinates.dedup();
+    coordinates
+}
+
 /// Groups sorted cell keys into bounded batches for each section.
 pub(crate) fn section_batches(keys: &[CellKey]) -> Vec<(Section, CoordinateBatch)> {
     keys.chunk_by(|a, b| a.section == b.section)
@@ -47,10 +56,7 @@ pub(crate) async fn provisional_point_loop<S: CellStore>(
     section: Section,
     batch: &CoordinateBatch,
 ) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, S::Error> {
-    let mut uniques: CellBuffer<&Coordinate> = SmallVec::with_capacity(batch.len());
-    uniques.extend(batch.iter());
-    uniques.sort_unstable();
-    uniques.dedup();
+    let uniques = sorted_unique_coordinates(batch);
     let mut out: CellBuffer<(Coordinate, ProvisionalCell)> = SmallVec::with_capacity(uniques.len());
     for coordinate in uniques {
         let cell = CellKey {

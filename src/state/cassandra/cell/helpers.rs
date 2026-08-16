@@ -1,7 +1,6 @@
 use super::{
     Bytes, CassandraCellStoreError, CellBlobs, CellBuffer, CompactDuration, Coordinate,
-    CoordinateBatch, PER_STATEMENT_OVERHEAD, ProvisionalCell, SmallVec, encode_payload,
-    select_encoding,
+    PER_STATEMENT_OVERHEAD, ProvisionalCell, SmallVec, encode_payload, select_encoding,
 };
 
 /// Encodes a cell's `data` and `prev` payloads into their bound columns.
@@ -70,13 +69,4 @@ pub(super) fn decode_provisional_batch(
         }
     }
     Ok(out)
-}
-
-/// Returns the sorted, distinct coordinates for one recovery query.
-pub(super) fn sorted_unique_coordinates(batch: &CoordinateBatch) -> CellBuffer<&Coordinate> {
-    let mut coordinates: CellBuffer<&Coordinate> = SmallVec::with_capacity(batch.len());
-    coordinates.extend(batch.iter());
-    coordinates.sort_unstable();
-    coordinates.dedup();
-    coordinates
 }

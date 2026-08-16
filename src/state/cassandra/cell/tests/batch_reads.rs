@@ -262,21 +262,31 @@ fn provisional_batch_coordinates_are_sorted_and_distinct() -> Result<()> {
     Ok(())
 }
 
-/// Recovery skips resolved rows before it decodes their unused blobs.
+/// Recovery validates resolved row metadata before it skips unused blobs.
 #[tokio::test]
-async fn resolved_corrupt_rows_are_skipped_before_decode() -> Result<()> {
+async fn resolved_corrupt_rows_fail_before_blob_decode() -> Result<()> {
+    use super::CellCorruptReason;
+    use crate::state::cassandra::CassandraCellStoreError;
+    use crate::state::resolve::ResolveCellError;
+
     init_test_logging();
     let fx = fixture().await?;
     let store = fx.bottom_store(ScriptedOracle::default());
-    let c = collection("resolved-corrupt-skip")?;
+    let c = collection("resolved-corrupt-error")?;
     let id = c.id();
     seed_prev_without_event_and_blob_without_encoding(fx.cassandra.session(), id).await?;
 
     let batch = CoordinateBatch::chunks([0xFEu8, 0x01].map(|b| Coordinate::from_bytes(vec![b])))
         .next()
         .ok_or_else(|| eyre!("non-empty read list must yield one batch"))?;
-    let rows = Box::pin(store.provisional_many(id, SECTIONS[0], &batch)).await?;
-    assert!(rows.is_empty(), "resolved rows are not recovery candidates");
+    match Box::pin(store.provisional_many(id, SECTIONS[0], &batch)).await {
+        Err(ResolveCellError::Store(CassandraCellStoreError::CorruptCell(reason))) => assert_eq!(
+            reason,
+            CellCorruptReason::PrevWithoutEvent,
+            "the lowest corrupt coordinate determines the recovery error"
+        ),
+        other => return Err(eyre!("expected PrevWithoutEvent, got {other:?}")),
+    }
     Ok(())
 }
 
