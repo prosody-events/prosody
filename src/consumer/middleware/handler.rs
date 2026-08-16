@@ -44,8 +44,8 @@ use crate::timers::Trigger;
 ///
 /// # Error classification
 ///
-/// Every error returned by `on_message`, `on_excise`, or `on_timer` is routed by
-/// [`ClassifyError::classify_error`] into one of three categories that
+/// Every error returned by `on_message`, `on_excise`, or `on_timer` is routed
+/// by [`ClassifyError::classify_error`] into one of three categories that
 /// determine how the consumer pipeline reacts:
 ///
 /// - [`Transient`](crate::error::ErrorCategory::Transient) — **retry**. A
@@ -73,8 +73,8 @@ use crate::timers::Trigger;
 /// invocation will be retried. Most handlers don't need them — leave
 /// [`Output`](Self::Output) as `()` and the default no-op hooks suffice.
 ///
-/// Every `on_message` / `on_timer` invocation that runs and returns is
-/// paired with one apply hook on the same handler instance:
+/// Every `on_message`, `on_excise`, or `on_timer` invocation that runs and
+/// returns is paired with one apply hook on the same handler instance:
 ///
 /// - [`after_commit`](Self::after_commit) — the invocation is **final**. The
 ///   same logical message/timer will not be dispatched to this handler again.
@@ -105,9 +105,9 @@ use crate::timers::Trigger;
 /// Each invocation returns a typed [`Self::Output`] on success, which the
 /// framework hands to the matching apply hook for that invocation. This
 /// gives handlers a 2-phase-commit seam: stage external state inside
-/// `on_message` / `on_timer`, return a staging handle as the `Ok` value,
-/// and finalize (in `after_commit`) or unstage (in `after_abort`) that
-/// state in the paired hook.
+/// `on_message`, `on_excise`, or `on_timer`, return a staging handle as the
+/// `Ok` value, and finalize (in `after_commit`) or unstage (in `after_abort`)
+/// that state in the paired hook.
 ///
 /// # Implementing as middleware
 ///
@@ -258,11 +258,11 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// Finalizes staged work after the just-completed invocation has been
     /// committed.
     ///
-    /// Called after [`Self::on_message`] / [`Self::on_timer`] when this
-    /// consumer will not invoke the handler again for the same logical
-    /// event. Use this hook to finalize any external state that was staged
-    /// during the invocation (the second phase of a 2-phase-commit
-    /// pattern).
+    /// Called after [`Self::on_message`], [`Self::on_excise`], or
+    /// [`Self::on_timer`] when this consumer will not invoke the handler
+    /// again for the same logical event. Use this hook to finalize any
+    /// external state that was staged during the invocation (the second
+    /// phase of a 2-phase-commit pattern).
     ///
     /// The hook receives the exact [`Result`] the invocation returned. An
     /// `Ok` carries the staged value to commit; an `Err` means the event
@@ -312,12 +312,12 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// Rolls back staged work after the just-completed invocation, before
     /// the next attempt runs.
     ///
-    /// Called after [`Self::on_message`] / [`Self::on_timer`] when this
-    /// consumer **will** invoke the handler again for the same logical
-    /// event — another attempt is coming (an in-process retry, a deferred
-    /// retry via a timer, or a re-poll after the durability marker
-    /// aborted). Use this hook to unstage any external state from the
-    /// invocation so the next attempt starts clean.
+    /// Called after [`Self::on_message`], [`Self::on_excise`], or
+    /// [`Self::on_timer`] when this consumer **will** invoke the handler
+    /// again for the same logical event — another attempt is coming (an
+    /// in-process retry, a deferred retry via a timer, or a re-poll after
+    /// the durability marker aborted). Use this hook to unstage any
+    /// external state from the invocation so the next attempt starts clean.
     ///
     /// The hook receives the exact [`Result`] the invocation returned —
     /// typically an `Err` carrying the failure that triggered the retry,
