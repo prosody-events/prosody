@@ -44,7 +44,7 @@ use crate::timers::Trigger;
 ///
 /// # Error classification
 ///
-/// Every error returned by `on_message` or `on_timer` is routed by
+/// Every error returned by `on_message`, `on_excise`, or `on_timer` is routed by
 /// [`ClassifyError::classify_error`] into one of three categories that
 /// determine how the consumer pipeline reacts:
 ///
