@@ -101,8 +101,8 @@ pub(super) type BorrowedCellTtlRow<'frame> = CellTtlRow<&'frame [u8]>;
 /// read (`get_many`/`get_many_for_cache`), where `IN` returns rows in
 /// clustering order, so the coordinate is carried to re-key each row back to
 /// its input position.
-pub(super) type KeyedCellTtlRow<B = Vec<u8>> = (
-    Vec<u8>, // coordinate
+pub(super) type KeyedCellTtlRow<C = Vec<u8>, B = Vec<u8>> = (
+    C, // coordinate
     Option<B>,
     Option<B>,
     Option<i16>,
@@ -113,17 +113,14 @@ pub(super) type KeyedCellTtlRow<B = Vec<u8>> = (
 );
 
 /// Batch row that borrows payloads from its Scylla response frame.
-pub(super) type BorrowedKeyedCellTtlRow<'frame> = KeyedCellTtlRow<&'frame [u8]>;
+pub(super) type BorrowedKeyedCellTtlRow<'frame> = KeyedCellTtlRow<&'frame [u8], &'frame [u8]>;
 
-/// Splits a batch row's clustering `coordinate` off its [`CellTtlRow`] body,
-/// **without** decoding. Infallible (the coordinate is opaque bytes); semantic
-/// decode is deferred to [`try_decode_cell_ttl`] so a corrupt row surfaces in
-/// input-resolution order, not in clustering order (the batch read's
-/// first-occurrence error-ordering rule).
-pub(super) fn split_keyed_cell_ttl<B>(row: KeyedCellTtlRow<B>) -> (Coordinate, CellTtlRow<B>) {
+/// Splits a batch row's borrowed clustering coordinate from its body.
+/// Semantic decode stays deferred so corrupt rows surface in input order.
+pub(super) fn split_keyed_cell_ttl<C, B>(row: KeyedCellTtlRow<C, B>) -> (C, CellTtlRow<B>) {
     let (coordinate, data, prev_data, encoding, version, event, ttl_data, ttl_prev) = row;
     (
-        Coordinate::from_bytes(coordinate),
+        coordinate,
         (
             data, prev_data, encoding, version, event, ttl_data, ttl_prev,
         ),

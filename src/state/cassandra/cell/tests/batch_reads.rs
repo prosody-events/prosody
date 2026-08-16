@@ -190,9 +190,9 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
     );
     let high_coordinate = Coordinate::from_bytes(vec![0xFE]);
     let low_coordinate = Coordinate::from_bytes(vec![0x01]);
-    let mut rows: CellBuffer<(Coordinate, BorrowedCellTtlRow<'_>)> = SmallVec::new();
-    rows.push((high_coordinate.clone(), high));
-    rows.push((low_coordinate.clone(), low));
+    let mut rows: CellBuffer<(&[u8], BorrowedCellTtlRow<'_>)> = SmallVec::new();
+    rows.push((high_coordinate.as_bytes(), high));
+    rows.push((low_coordinate.as_bytes(), low));
     match align_and_decode_batch_rows(rows, &[&low_coordinate, &high_coordinate]) {
         Err(CassandraCellStoreError::CorruptCell(reason)) => assert_eq!(
             reason,
@@ -220,8 +220,8 @@ fn borrowed_batch_is_aligned_to_requested_coordinates() -> Result<()> {
     let absent = Coordinate::from_bytes(vec![2]);
     let high = Coordinate::from_bytes(vec![3]);
     let rows: CellBuffer<_> = smallvec![
-        (high.clone(), row(&high_data)),
-        (low.clone(), row(&low_data)),
+        (high.as_bytes(), row(&high_data)),
+        (low.as_bytes(), row(&low_data)),
     ];
 
     let decoded = align_and_decode_batch_rows(rows, &[&low, &absent, &high])?;
@@ -453,8 +453,9 @@ fn prop_cassandra_raw_batch_parity() {
         );
 }
 
-/// Ascending-output pin over the live store (correctness; the sort-necessity
-/// itself is pinned by `decode_provisional_batch_orders_by_coordinate`).
+/// Ascending-output pin over the live store. The sort requirement is also
+/// pinned by `borrowed_batch_decodes_in_resolution_order` and
+/// `provisional_batch_coordinates_are_sorted_and_distinct`.
 #[tokio::test]
 async fn cassandra_raw_batch_ascending_output() -> Result<()> {
     init_test_logging();

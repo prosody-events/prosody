@@ -115,7 +115,7 @@ pub(super) fn decode_batch_rows(
 ) -> Result<DecodedBatch, CassandraCellStoreError> {
     // At most one row per unique coordinate, so size once at the IN-list upper
     // bound rather than growing an inline buffer up to `CELL_BATCH`.
-    let mut rows: CellBuffer<(Coordinate, decode::BorrowedCellTtlRow<'_>)> =
+    let mut rows: CellBuffer<(&[u8], decode::BorrowedCellTtlRow<'_>)> =
         SmallVec::with_capacity(uniques.len());
     for row in result
         .rows::<BorrowedKeyedCellTtlRow<'_>>()
@@ -129,15 +129,18 @@ pub(super) fn decode_batch_rows(
     align_and_decode_batch_rows(rows, uniques)
 }
 
-pub(super) fn align_and_decode_batch_rows(
-    mut rows: CellBuffer<(Coordinate, decode::BorrowedCellTtlRow<'_>)>,
+pub(super) fn align_and_decode_batch_rows<'frame>(
+    mut rows: CellBuffer<(&'frame [u8], decode::BorrowedCellTtlRow<'frame>)>,
     uniques: &[&Coordinate],
 ) -> Result<DecodedBatch, CassandraCellStoreError> {
     // Align the result here so every caller receives one slot per requested
     // coordinate. Cassandra does not guarantee the order of an `IN` result.
     let mut out = CellBuffer::with_capacity(uniques.len());
     for &coordinate in uniques {
-        let Some(pos) = rows.iter().position(|(found, _)| found == coordinate) else {
+        let Some(pos) = rows
+            .iter()
+            .position(|(found, _)| *found == coordinate.as_bytes())
+        else {
             out.push(None);
             continue;
         };

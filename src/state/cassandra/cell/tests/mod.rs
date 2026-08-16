@@ -84,10 +84,7 @@ fn row_encoding_uses_the_larger_present_payload() -> Result<()> {
     assert_eq!(blobs.encoding(), Some(Encoding::Zstd));
     assert_eq!(
         encoding::decode_payload(
-            blobs
-                .data
-                .as_deref()
-                .ok_or_else(|| eyre!("data must exist"))?,
+            blobs.data().ok_or_else(|| eyre!("data must exist"))?,
             Encoding::Zstd,
         )?,
         small
@@ -95,8 +92,7 @@ fn row_encoding_uses_the_larger_present_payload() -> Result<()> {
     assert_eq!(
         encoding::decode_payload(
             blobs
-                .prev_data
-                .as_deref()
+                .prev_data()
                 .ok_or_else(|| eyre!("previous data must exist"))?,
             Encoding::Zstd,
         )?,

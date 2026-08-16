@@ -148,12 +148,12 @@ impl<O> CassandraStore<O> {
         };
         blobs.iter().zip(cells).map(move |(blob, (cell, _))| {
             let addr = CellAddr::new(pk, cell);
-            let row = match blob.data {
+            let row = match blob.data() {
                 Some(_) => CellBatchRow {
                     statement: cell_stmt,
                     row: RowShape::Resolved(ResolvedRow {
                         ttl,
-                        data: blob.data.as_deref(),
+                        data: blob.data(),
                         encoding: blob.encoding(),
                         version: blob.version(),
                         addr,

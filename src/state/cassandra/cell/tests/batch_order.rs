@@ -77,7 +77,7 @@ async fn markerless_provisional_is_sweep_invisible_but_first_touch_repairs() -> 
             statement: &fx.queries.write_provisional_no_ttl,
             row: RowShape::Stage(StageRow {
                 ttl: None,
-                data: blob.data.as_deref(),
+                data: blob.data(),
                 prev_data: None,
                 encoding: blob.encoding(),
                 version: blob.version(),

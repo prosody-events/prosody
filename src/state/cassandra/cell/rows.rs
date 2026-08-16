@@ -29,12 +29,29 @@ impl<'a> Pk<'a> {
 /// iff **either** blob is present — a clear-over-present stage carries a null
 /// `data` with a non-null `prev_data` and still needs an encoding to decode it.
 pub(super) struct CellBlobs {
-    pub(super) encoding: Option<Encoding>,
-    pub(super) data: Option<Bytes>,
-    pub(super) prev_data: Option<Bytes>,
+    encoding: Option<Encoding>,
+    data: Option<Bytes>,
+    prev_data: Option<Bytes>,
 }
 
 impl CellBlobs {
+    pub(super) fn new(encoding: Encoding, data: Option<Bytes>, prev_data: Option<Bytes>) -> Self {
+        let encoding = data.as_ref().or(prev_data.as_ref()).map(|_| encoding);
+        Self {
+            encoding,
+            data,
+            prev_data,
+        }
+    }
+
+    pub(super) fn data(&self) -> Option<&[u8]> {
+        self.data.as_deref()
+    }
+
+    pub(super) fn prev_data(&self) -> Option<&[u8]> {
+        self.prev_data.as_deref()
+    }
+
     pub(super) fn encoding(&self) -> Option<Encoding> {
         self.encoding
     }

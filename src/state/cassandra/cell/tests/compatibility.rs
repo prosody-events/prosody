@@ -1,4 +1,32 @@
 use super::*;
+use crate::cassandra::TABLE_KEYED_STATE_CELL;
+
+async fn read_cell_blob(fx: &Fixture, id: &CollectionId) -> Result<(Vec<u8>, i16)> {
+    let cql = format!(
+        "SELECT data, encoding FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} WHERE segment_id = ? \
+         AND key = ? AND state_type = ? AND name = ?"
+    );
+    let (data, encoding) = fx
+        .cassandra
+        .session()
+        .query_unpaged(
+            cql,
+            (
+                id.state_key().segment_id,
+                id.state_key().key.as_ref(),
+                i8::from(id.state_type()),
+                id.name().as_str(),
+            ),
+        )
+        .await?
+        .into_rows_result()?
+        .maybe_first_row::<(Option<Vec<u8>>, Option<i16>)>()?
+        .ok_or_else(|| eyre!("cell row missing"))?;
+    Ok((
+        data.ok_or_else(|| eyre!("data column missing"))?,
+        encoding.ok_or_else(|| eyre!("encoding column missing"))?,
+    ))
+}
 
 /// Legacy decode tolerance: the null-null-with-encoding residue shape is no
 /// longer produced by any statement (a committed-absent cell deletes its row),
@@ -7,8 +35,6 @@ use super::*;
 /// decoder's tolerance kept honest now that no code path produces the shape.
 #[tokio::test]
 async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
-    use crate::cassandra::TABLE_KEYED_STATE_CELL;
-
     init_test_logging();
     let fx = fixture().await?;
     let store = fx.bottom_store(ScriptedOracle::default());
@@ -50,7 +76,6 @@ async fn legacy_null_null_residue_reads_committed_none() -> Result<()> {
 #[tokio::test]
 async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
     use super::encoding::{Encoding, decode_payload};
-    use crate::cassandra::TABLE_KEYED_STATE_CELL;
 
     init_test_logging();
     let fx = fixture().await?;
@@ -62,28 +87,8 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
         .write_resolved(&c, &[(cell, Some(payload.clone()))], &[])
         .await?;
 
-    let cql = format!(
-        "SELECT data FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} WHERE segment_id = ? AND key = \
-         ? AND state_type = ? AND name = ?"
-    );
     let id = c.id();
-    let raw = fx
-        .cassandra
-        .session()
-        .query_unpaged(
-            cql,
-            (
-                id.state_key().segment_id,
-                id.state_key().key.as_ref(),
-                i8::from(id.state_type()),
-                id.name().as_str(),
-            ),
-        )
-        .await?
-        .into_rows_result()?
-        .maybe_first_row::<(Option<Vec<u8>>,)>()?
-        .and_then(|(data,)| data)
-        .ok_or_else(|| eyre!("data column missing"))?;
+    let (raw, encoding) = read_cell_blob(&fx, id).await?;
 
     assert_ne!(
         raw.as_slice(),
@@ -101,6 +106,7 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
         payload,
         "zstd frame must decompress to the payload"
     );
+    assert_eq!(encoding, i16::from(Encoding::Zstd));
     Ok(())
 }
 
@@ -108,8 +114,6 @@ async fn cassandra_data_column_is_zstd_compressed() -> Result<()> {
 /// A raw CQL read freezes both the bytes and the encoding discriminator.
 #[tokio::test]
 async fn cassandra_data_column_is_raw_through_the_block_size() -> Result<()> {
-    use crate::cassandra::TABLE_KEYED_STATE_CELL;
-
     init_test_logging();
     let fx = fixture().await?;
     let store = fx.bottom_store(ScriptedOracle::default());
@@ -120,30 +124,11 @@ async fn cassandra_data_column_is_raw_through_the_block_size() -> Result<()> {
         .write_resolved(&c, &[(cell, Some(payload.clone()))], &[])
         .await?;
 
-    let cql = format!(
-        "SELECT data, encoding FROM {TEST_KEYSPACE}.{TABLE_KEYED_STATE_CELL} WHERE segment_id = ? \
-         AND key = ? AND state_type = ? AND name = ?"
-    );
     let id = c.id();
-    let (data, encoding) = fx
-        .cassandra
-        .session()
-        .query_unpaged(
-            cql,
-            (
-                id.state_key().segment_id,
-                id.state_key().key.as_ref(),
-                i8::from(id.state_type()),
-                id.name().as_str(),
-            ),
-        )
-        .await?
-        .into_rows_result()?
-        .maybe_first_row::<(Option<Vec<u8>>, Option<i16>)>()?
-        .ok_or_else(|| eyre!("cell row missing"))?;
+    let (data, encoding) = read_cell_blob(&fx, id).await?;
 
-    assert_eq!(data.as_deref(), Some(payload.as_ref()));
-    assert_eq!(encoding, Some(1));
+    assert_eq!(data.as_slice(), payload.as_ref());
+    assert_eq!(encoding, 1);
     Ok(())
 }
 
@@ -157,7 +142,6 @@ async fn cassandra_data_column_is_raw_through_the_block_size() -> Result<()> {
 /// decoding the row.
 #[tokio::test]
 async fn corrupt_timer_type_is_permanent_not_terminal() -> Result<()> {
-    use crate::cassandra::TABLE_KEYED_STATE_CELL;
     use crate::error::{ClassifyError, ErrorCategory};
     use crate::state::cassandra::CassandraCellStoreError;
     use crate::state::resolve::ResolveCellError;
@@ -391,7 +375,7 @@ pub(super) fn mixed_binding_batch<'a>(
                 statement: &q.write_provisional_no_ttl,
                 row: RowShape::Stage(StageRow {
                     ttl: None,
-                    data: blob_a.data.as_deref(),
+                    data: blob_a.data(),
                     prev_data: None,
                     encoding: blob_a.encoding(),
                     version: blob_a.version(),
@@ -416,7 +400,7 @@ pub(super) fn mixed_binding_batch<'a>(
                 statement: &q.write_resolved_no_ttl,
                 row: RowShape::Resolved(ResolvedRow {
                     ttl: None,
-                    data: blob_c.data.as_deref(),
+                    data: blob_c.data(),
                     encoding: blob_c.encoding(),
                     version: blob_c.version(),
                     addr: addr_c,

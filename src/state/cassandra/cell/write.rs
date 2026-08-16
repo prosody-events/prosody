@@ -84,8 +84,8 @@ where
                 statement: cell_stmt,
                 row: RowShape::Stage(StageRow {
                     ttl,
-                    data: blob.data.as_deref(),
-                    prev_data: blob.prev_data.as_deref(),
+                    data: blob.data(),
+                    prev_data: blob.prev_data(),
                     encoding: blob.encoding(),
                     version: blob.version(),
                     event: write.event(),

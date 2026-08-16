@@ -23,19 +23,15 @@ pub(super) fn encode_cell_blobs(
     let prev_data = prev
         .map(|payload| encode_payload(payload, encoding))
         .transpose()?;
-    Ok(CellBlobs {
-        encoding: data.as_ref().or(prev_data.as_ref()).map(|_| encoding),
-        data,
-        prev_data,
-    })
+    Ok(CellBlobs::new(encoding, data, prev_data))
 }
 
 /// The batch-packing weight of a cell row: its blob bytes plus the fixed
 /// [`PER_STATEMENT_OVERHEAD`]. Over-counts rather than under-counts, so a
 /// packed batch never exceeds the byte budget it was sized against.
 pub(super) fn blob_weight(blob: &CellBlobs) -> u64 {
-    let blob_bytes = blob.data.as_ref().map_or(0_u64, |b| b.len() as u64)
-        + blob.prev_data.as_ref().map_or(0_u64, |b| b.len() as u64);
+    let blob_bytes = blob.data().map_or(0_u64, |b| b.len() as u64)
+        + blob.prev_data().map_or(0_u64, |b| b.len() as u64);
     PER_STATEMENT_OVERHEAD + blob_bytes
 }
 
