@@ -42,73 +42,26 @@ pub(super) async fn process_event<T, S, M, P>(
 {
     match event {
         UncommittedEvent::Message(message) => {
-            let (cancel_tx, cancel_rx) = watch::channel(false);
-            // Derive the dedup id for every message — even when no
-            // descriptors are registered — because the EventRef must exist
-            // before we know whether the handler touches state. The
-            // derivation matches the marker the settle boundary records, so
-            // recovery resolves a message by the exact recorded id.
-            let msg = message.message();
-            let dedup_id = dedup_uuid_for_message(dedup_identity, msg);
-            // The scope owns the event's state lifetime; its `Drop` clears the
-            // dirty buffer. Keep it bound (never `let _`) through dispatch and
-            // `invalidate` so it drops last — per-key serialization keeps the
-            // key busy until this future completes, so no next same-key event
-            // sees stale dirty in the drop window.
-            let scope = state_manager.session(
-                msg.key().clone(),
-                EventRef::Message { dedup_id },
-                TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
-            );
-            let context = PartitionEventContext::new(
-                message.key().clone(),
-                shutdown_rx.clone(),
-                (cancel_tx, cancel_rx),
-                timer_manager.clone(),
-                scope.handle(),
-            );
-            let cloned_context = context.clone();
-            let _guard = message.process_scope();
-            // Instrument with the receive span so handler-created spans (and
-            // `Span::current()` captures like `EventContext::schedule`) nest
-            // under it ambiently.
-            let receive_span = message.span();
-            guarded_dispatch(
-                &scope,
-                handler
-                    .on_message(context, message, DemandType::Normal)
-                    .instrument(receive_span),
+            process_record(
+                message,
+                |context, message| handler.on_message(context, message, DemandType::Normal),
+                shutdown_rx,
+                timer_manager,
+                state_manager,
+                dedup_identity,
             )
             .await;
-            cloned_context.invalidate();
         }
         UncommittedEvent::Excise(message) => {
-            let (cancel_tx, cancel_rx) = watch::channel(false);
-            let msg = message.message();
-            let dedup_id = dedup_uuid_for_message(dedup_identity, msg);
-            let scope = state_manager.session(
-                msg.key().clone(),
-                EventRef::Message { dedup_id },
-                TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
-            );
-            let context = PartitionEventContext::new(
-                message.key().clone(),
-                shutdown_rx.clone(),
-                (cancel_tx, cancel_rx),
-                timer_manager.clone(),
-                scope.handle(),
-            );
-            let cloned_context = context.clone();
-            let _guard = message.process_scope();
-            let receive_span = message.span();
-            guarded_dispatch(
-                &scope,
-                handler
-                    .on_excise(context, message, DemandType::Normal)
-                    .instrument(receive_span),
+            process_record(
+                message,
+                |context, message| handler.on_excise(context, message, DemandType::Normal),
+                shutdown_rx,
+                timer_manager,
+                state_manager,
+                dedup_identity,
             )
             .await;
-            cloned_context.invalidate();
         }
         UncommittedEvent::Timer(timer) => {
             process_timer(
@@ -122,6 +75,52 @@ pub(super) async fn process_event<T, S, M, P>(
             .await;
         }
     }
+}
+
+async fn process_record<S, M, Q, F, Fut>(
+    message: UncommittedMessage<Q>,
+    dispatch: F,
+    shutdown_rx: &watch::Receiver<ShutdownPhase>,
+    timer_manager: &TimerManager<S>,
+    state_manager: &M,
+    dedup_identity: DedupIdentity<'_>,
+) where
+    S: TriggerStore,
+    M: PartitionStateManager<Session: EventSession<Loader: MessageLoader>>,
+    Q: Send + Sync + 'static + EventIdentity,
+    F: FnOnce(PartitionEventContext<S, M::Session>, UncommittedMessage<Q>) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    // Derive the dedup id for every message — even when no descriptors are
+    // registered — because the EventRef must exist before state access. This
+    // derivation matches the marker that the settle boundary records.
+    // Recovery resolves the message with this exact recorded ID.
+    let msg = message.message();
+    let dedup_id = dedup_uuid_for_message(dedup_identity, msg);
+    // The scope owns the event's state lifetime. Its `Drop` clears the dirty
+    // buffer. Keep it bound, and never use `let _`. It must drop after dispatch
+    // and `invalidate`, while per-key serialization still holds the key. Thus,
+    // the next event for this key cannot observe stale dirty state.
+    let scope = state_manager.session(
+        msg.key().clone(),
+        EventRef::Message { dedup_id },
+        TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
+    );
+    let context = PartitionEventContext::new(
+        message.key().clone(),
+        shutdown_rx.clone(),
+        (cancel_tx, cancel_rx),
+        timer_manager.clone(),
+        scope.handle(),
+    );
+    let cloned_context = context.clone();
+    let _guard = message.process_scope();
+    // Use the receive span so handler spans and `Span::current()` captures nest
+    // below it.
+    let receive_span = message.span();
+    guarded_dispatch(&scope, dispatch(context, message).instrument(receive_span)).await;
+    cloned_context.invalidate();
 }
 
 async fn process_timer<T, S, M, P>(

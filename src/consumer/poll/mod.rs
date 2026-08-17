@@ -26,8 +26,8 @@ use tracing::{Span, debug, error, warn};
 use crate::Codec;
 use crate::EventType;
 use crate::Topic;
-use crate::consumer::decode::{DecodedMessage, DecodedRecord, ResultRequestReader, decode_record};
-use crate::consumer::message::{ConsumerMessage, ConsumerRecord};
+use crate::consumer::decode::{DecodedMessage, ResultRequestReader, decode_record};
+use crate::consumer::message::ConsumerRecord;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{Managers, WatermarkVersion};
 use crate::heartbeat::Heartbeat;
@@ -192,24 +192,11 @@ where
 
         let record =
             decode_record(&mut message, &propagator, &mut codec, &requests).map(|record| {
-                match record {
-                    DecodedRecord::Message(decoded) => {
-                        let span = create_receive_span(&decoded, message_spans);
-                        ConsumerRecord::Message(ConsumerMessage::from_decoded(
-                            decoded.value,
-                            span,
-                            permit,
-                        ))
-                    }
-                    DecodedRecord::Excise(decoded) => {
-                        let span = create_receive_span(&decoded, message_spans);
-                        ConsumerRecord::Excise(ConsumerMessage::from_decoded(
-                            decoded.value,
-                            span,
-                            permit,
-                        ))
-                    }
-                }
+                record.into_record(
+                    permit,
+                    |decoded| create_receive_span(decoded, message_spans),
+                    |decoded| create_receive_span(decoded, message_spans),
+                )
             });
 
         if let Some(record) = record {

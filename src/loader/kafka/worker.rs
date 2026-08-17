@@ -269,6 +269,8 @@ fn cleanup_if_empty<P>(
 }
 
 /// Creates a load span with the decoded record's upstream context.
+///
+/// The span lifecycle does not depend on cache eviction.
 pub(super) fn create_load_span<P>(
     decoded: &DecodedMessage<P>,
     cached: bool,

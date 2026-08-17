@@ -21,11 +21,12 @@ use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::{Message, Timestamp};
 use std::str;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tokio::sync::OwnedSemaphorePermit;
+use tracing::{Span, debug, error};
 
 use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
-use crate::consumer::message::ConsumerMessageValue;
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, ConsumerRecord};
 use crate::peer::response::headers::{ResultRequest, parse_result_request};
 use crate::subsystem::SubsystemName;
 use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
@@ -66,6 +67,26 @@ pub enum DecodedRecord<P> {
     Message(DecodedMessage<P>),
     /// A record with no payload.
     Excise(DecodedMessage<()>),
+}
+
+impl<P> DecodedRecord<P> {
+    pub(crate) fn into_record(
+        self,
+        permit: OwnedSemaphorePermit,
+        message_span: impl FnOnce(&DecodedMessage<P>) -> Span,
+        excise_span: impl FnOnce(&DecodedMessage<()>) -> Span,
+    ) -> ConsumerRecord<P> {
+        match self {
+            Self::Message(decoded) => {
+                let span = message_span(&decoded);
+                ConsumerRecord::Message(ConsumerMessage::from_decoded(decoded.value, span, permit))
+            }
+            Self::Excise(decoded) => {
+                let span = excise_span(&decoded);
+                ConsumerRecord::Excise(ConsumerMessage::from_decoded(decoded.value, span, permit))
+            }
+        }
+    }
 }
 
 /// Reads result-request headers that this consumer can answer.

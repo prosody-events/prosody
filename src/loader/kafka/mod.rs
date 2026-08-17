@@ -46,7 +46,7 @@
 use super::{MessageLoader, PermitMode};
 use crate::consumer::ConsumerConfiguration;
 use crate::consumer::decode::{DecodedMessage, DecodedRecord, decode_record};
-use crate::consumer::message::{ConsumerMessage, ConsumerRecord};
+use crate::consumer::message::ConsumerRecord;
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::propagator::new_propagator;
 use crate::{JsonCodec, Offset, Partition, Topic};
@@ -134,6 +134,9 @@ pub type KafkaLoaderConfigurationBuilder = config::KafkaLoaderConfigurationBuild
 use worker::{create_load_span, poll_loop};
 
 /// Cache key and decoded record storage for the shared loader.
+///
+/// The topic, partition, and offset prevent collisions across partitions in
+/// the multiplexed loader.
 type LoadedCache<P> = Arc<Cache<(Topic, Partition, Offset), DecodedRecord<P>>>;
 
 /// Kafka message loader for retrieving messages by exact offset.
@@ -330,24 +333,11 @@ where
             (decoded, false)
         };
 
-        Ok(match decoded_message {
-            DecodedRecord::Message(decoded) => {
-                let span = create_load_span(&decoded, cached, self.message_spans);
-                ConsumerRecord::Message(ConsumerMessage::from_decoded(
-                    decoded.value,
-                    span,
-                    load_permit,
-                ))
-            }
-            DecodedRecord::Excise(decoded) => {
-                let span = create_load_span(&decoded, cached, self.message_spans);
-                ConsumerRecord::Excise(ConsumerMessage::from_decoded(
-                    decoded.value,
-                    span,
-                    load_permit,
-                ))
-            }
-        })
+        Ok(decoded_message.into_record(
+            load_permit,
+            |decoded| create_load_span(decoded, cached, self.message_spans),
+            |decoded| create_load_span(decoded, cached, self.message_spans),
+        ))
     }
 
     /// Loads a message from Kafka and caches the decoded result.

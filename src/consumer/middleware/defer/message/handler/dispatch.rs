@@ -33,6 +33,8 @@ where
         H: HandlerMethod<T>,
         C: EventContext<Payload = T::Payload>,
     {
+        // Already deferred: queue after existing messages to preserve order.
+        // The inner handler does not run, so return `NoInner`.
         if self
             .store
             .is_deferred(message.key())
@@ -46,6 +48,7 @@ where
 
         let message_key = message.key().clone();
         let offset = message.offset();
+        // Not deferred: call the handler. Defer a transient failure when enabled.
         let error = match H::call(&self.handler, context.clone(), message, demand_type).await {
             Ok(output) => return Ok(MessageDeferOutput::Inner(output)),
             Err(error) => error,
@@ -55,6 +58,7 @@ where
             return Err(DeferError::Handler(error));
         }
 
+        // Gate only the initial deferral. Always defer later transient failures again.
         if !self.config.enabled {
             debug!(
                 key = ?message_key,
