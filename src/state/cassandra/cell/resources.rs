@@ -1,7 +1,8 @@
 use super::{
     Arc, Bytes, CassandraCellResources, CassandraCellStoreError, CassandraSession, CellBuffer,
     CellKey, CellQueries, CollectionId, CoordinateBatch, Scan, Section, Stream, TryStreamExt,
-    dedupe, fetch_and_decode_cell, fetch_cells_batch, page_cells, pin_mut, realign, try_stream,
+    dedupe, expand_to_input_order, fetch_and_decode_cell, fetch_cells_batch, page_cells, pin_mut,
+    try_stream,
 };
 
 impl CassandraCellResources {
@@ -37,8 +38,8 @@ impl CassandraCellResources {
     }
 
     /// The batch form of [`Self::read_committed`]. Reads one section's
-    /// coordinates in one `IN` query. The result is index-aligned to `batch`,
-    /// so `result[i]` answers `batch[i]`. Duplicate coordinates share one
+    /// coordinates in one `IN` query. `result[i]` answers `batch[i]`.
+    /// Duplicate coordinates share one
     /// lookup, and an absent coordinate reads `None`. Only the committed value
     /// is projected. The TTL column is ignored: the reader has no write-through
     /// cache to mirror it into.
@@ -53,13 +54,20 @@ impl CassandraCellResources {
         section: Section,
         batch: &CoordinateBatch,
     ) -> Result<CellBuffer<Option<Bytes>>, CassandraCellStoreError> {
-        let (uniques, plan) = dedupe(batch);
-        let rows = fetch_cells_batch(&self.session, &self.queries, id, section, &uniques).await?;
-        let answers: CellBuffer<Option<Bytes>> = rows
+        let (unique_coordinates, input_indices) = dedupe(batch);
+        let rows = fetch_cells_batch(
+            &self.session,
+            &self.queries,
+            id,
+            section,
+            &unique_coordinates,
+        )
+        .await?;
+        let unique_answers: CellBuffer<Option<Bytes>> = rows
             .into_iter()
             .map(|row| row.and_then(|(cell, _)| cell.project_committed().cloned()))
             .collect();
-        Ok(realign(&plan, &answers))
+        Ok(expand_to_input_order(&input_indices, &unique_answers))
     }
 
     /// Scans a section's committed values without consulting the oracle. This

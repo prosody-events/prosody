@@ -105,10 +105,10 @@ use helpers::{
 };
 pub use queries::CellQueries;
 #[cfg(test)]
-use read::align_and_decode_batch_rows;
+use read::decode_rows_for_coordinates;
 use read::{
-    align_batch_rows, decode_batch_rows, decode_cell_ttl_result, fetch_and_decode_cell,
-    fetch_cell_rows_result, fetch_cells_batch, fetch_cells_batch_result, into_store_err,
+    decode_batch_rows, decode_cell_ttl_result, fetch_and_decode_cell, fetch_cell_rows_result,
+    fetch_cells_batch, fetch_cells_batch_result, into_store_err, match_batch_rows_to_coordinates,
     page_cells,
 };
 use rows::{
@@ -139,8 +139,8 @@ use crate::state::resolve::{
     resolve_marker, resolve_read,
 };
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe, realign,
-    section_batches, sorted_unique_coordinates,
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, dedupe,
+    expand_to_input_order, section_batches, sorted_unique_coordinates,
 };
 use crate::state::{CollectionId, CollectionRef, SHARD_FANOUT_CONCURRENCY, StateType};
 use crate::timers::duration::CompactDuration;

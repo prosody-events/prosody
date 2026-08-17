@@ -4,8 +4,8 @@ use super::*;
 /// override answers each position exactly as the sequential point-`get` oracle
 /// over an identically-seeded sibling collection — across duplicates, unknowns,
 /// absence, and provisional resolution. Runs directly on the bare store so the
-/// override (dedup, scatter, first-occurrence resolution) is exercised, not the
-/// `Cached` default.
+/// override (deduplication, input-order expansion, and resolution) is
+/// exercised, not the `Cached` default.
 #[test]
 fn prop_cassandra_batch_read_parity() {
     async fn run(trace: BatchReadTrace) -> Result<bool> {
@@ -23,8 +23,7 @@ fn prop_cassandra_batch_read_parity() {
         );
 }
 
-/// Within-batch duplicate co-observation + scatter alignment over the live
-/// store.
+/// Within-batch duplicate co-observation and input-order expansion.
 #[tokio::test]
 async fn cassandra_batch_duplicate_co_observation() -> Result<()> {
     init_test_logging();
@@ -37,7 +36,7 @@ async fn cassandra_batch_duplicate_co_observation() -> Result<()> {
 
 /// Every input position answered over two chunks on the live store.
 #[tokio::test]
-async fn cassandra_batch_alignment() -> Result<()> {
+async fn cassandra_batch_preserves_input_positions() -> Result<()> {
     init_test_logging();
     let fx = fixture().await?;
     Box::pin(run_batch_alignment(
@@ -103,8 +102,8 @@ async fn seed_prev_without_event_and_blob_without_encoding(
 
 /// Resolve-order pin: two rows with DISTINCT corruption shapes at coordinates
 /// whose clustering order (A `0x01` < B `0xFE`) is the reverse of the read list
-/// `[B, A]`. `get_many` decodes the uniques in first-occurrence input order, so
-/// it must surface B's `BlobWithoutEncoding` — not A's `PrevWithoutEvent`,
+/// `[B, A]`. `get_many` decodes unique rows in first-occurrence order. Thus, it
+/// must surface B's `BlobWithoutEncoding`, not A's `PrevWithoutEvent`,
 /// which the `IN` query returns first in clustering order. The corruptions are
 /// seeded by raw CQL (unreachable through the store verbs), and the sequential
 /// point `get`s confirm the two rows are distinguishable.
@@ -168,8 +167,8 @@ async fn first_error_is_first_input_position() -> Result<()> {
 #[test]
 fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
     use super::CellCorruptReason;
-    use super::align_and_decode_batch_rows;
     use super::decode::BorrowedCellTtlRow;
+    use super::decode_rows_for_coordinates;
     use super::encoding::{Encoding, encode_payload};
     use crate::state::cassandra::CassandraCellStoreError;
     use crate::state::store::CellBuffer;
@@ -193,7 +192,7 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
     let mut rows: CellBuffer<(&[u8], BorrowedCellTtlRow<'_>)> = SmallVec::new();
     rows.push((high_coordinate.as_bytes(), high));
     rows.push((low_coordinate.as_bytes(), low));
-    match align_and_decode_batch_rows(rows, &[&low_coordinate, &high_coordinate]) {
+    match decode_rows_for_coordinates(rows, &[&low_coordinate, &high_coordinate]) {
         Err(CassandraCellStoreError::CorruptCell(reason)) => assert_eq!(
             reason,
             CellCorruptReason::PrevWithoutEvent,
@@ -205,9 +204,9 @@ fn borrowed_batch_decodes_in_resolution_order() -> Result<()> {
 }
 
 #[test]
-fn borrowed_batch_is_aligned_to_requested_coordinates() -> Result<()> {
-    use super::align_and_decode_batch_rows;
+fn borrowed_batch_matches_requested_coordinates() -> Result<()> {
     use super::decode::BorrowedCellTtlRow;
+    use super::decode_rows_for_coordinates;
     use crate::state::store::CellBuffer;
     use smallvec::smallvec;
 
@@ -224,7 +223,7 @@ fn borrowed_batch_is_aligned_to_requested_coordinates() -> Result<()> {
         (low.as_bytes(), row(&low_data)),
     ];
 
-    let decoded = align_and_decode_batch_rows(rows, &[&low, &absent, &high])?;
+    let decoded = decode_rows_for_coordinates(rows, &[&low, &absent, &high])?;
     assert_eq!(decoded.len(), 3);
     assert_eq!(
         decoded[0]

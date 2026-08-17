@@ -6,10 +6,11 @@ use super::{
     CollectionRef, CommitOracle, Committed, CommittedBatch, CompactDuration, Coordinate,
     CoordinateBatch, EventMarker, EventRef, KeyRow, PER_STATEMENT_OVERHEAD, Pk, ProvisionalCell,
     ProvisionalWrite, ResolveCellError, RowShape, Scan, Section, SectionClear, SmallVec, Stream,
-    align_batch_rows, decode, decode_batch_rows, decode_cell_ttl_result, decode_provisional_batch,
-    dedupe, encode_cell_blobs, extend_gap_units, flatten_resolve, gap_count, help_read_window,
-    help_write_window, into_store_err, realign, resolve_read, section_batches, smallvec,
-    sorted_unique_coordinates, try_stream, ttl_seconds_to_duration, ttl_to_i32, write_provisional,
+    decode, decode_batch_rows, decode_cell_ttl_result, decode_provisional_batch, dedupe,
+    encode_cell_blobs, expand_to_input_order, extend_gap_units, flatten_resolve, gap_count,
+    help_read_window, help_write_window, into_store_err, match_batch_rows_to_coordinates,
+    resolve_read, section_batches, smallvec, sorted_unique_coordinates, try_stream,
+    ttl_seconds_to_duration, ttl_to_i32, write_provisional,
 };
 
 impl<O> CellStore for CassandraStore<O>
@@ -106,7 +107,7 @@ where
         own: EventRef,
     ) -> Result<CacheBatch, Self::Error> {
         let collection_ref = self.resolver.collection_ref(collection);
-        let (uniques, plan) = dedupe(batch);
+        let (unique_coordinates, input_indices) = dedupe(batch);
         // The committed-unapplied read window, exactly as the point read
         // (`get_for_cache`): consult the standing marker — memo-backed, so no
         // durable read after the one seed read — CONCURRENTLY with the batch
@@ -114,7 +115,7 @@ where
         // rows may hold now-erased values, so the whole `IN` query is re-issued
         // once.
         let (rows, standing) = futures::join!(
-            self.batch_read_result(collection, section, &uniques),
+            self.batch_read_result(collection, section, &unique_coordinates),
             self.standing_marker(collection),
         );
         let mut rows = rows.map_err(ResolveCellError::Store)?;
@@ -129,13 +130,14 @@ where
         .map_err(flatten_resolve)?
         {
             rows = self
-                .batch_read_result(collection, section, &uniques)
+                .batch_read_result(collection, section, &unique_coordinates)
                 .await
                 .map_err(ResolveCellError::Store)?;
         }
-        let rows = decode_batch_rows(&rows, &uniques).map_err(ResolveCellError::Store)?;
-        let mut answers: CacheBatch = SmallVec::with_capacity(uniques.len());
-        for (&coordinate, row) in uniques.iter().zip(rows) {
+        let rows =
+            decode_batch_rows(&rows, &unique_coordinates).map_err(ResolveCellError::Store)?;
+        let mut unique_answers: CacheBatch = SmallVec::with_capacity(unique_coordinates.len());
+        for (&coordinate, row) in unique_coordinates.iter().zip(rows) {
             let cell = CellKey {
                 section,
                 coordinate: Coordinate::clone(coordinate),
@@ -154,9 +156,9 @@ where
             )
             .await
             .map_err(flatten_resolve)?;
-            answers.push((committed, ttl_seconds_to_duration(ttl)));
+            unique_answers.push((committed, ttl_seconds_to_duration(ttl)));
         }
-        Ok(realign(&plan, &answers))
+        Ok(expand_to_input_order(&input_indices, &unique_answers))
     }
 
     fn scan_cells<'a>(
@@ -240,18 +242,18 @@ where
         self.counters
             .provisional_in_queries
             .fetch_add(1, Ordering::Relaxed);
-        // Sorted-distinct IN list (no scatter plan — the output is survivor-only,
-        // not index-aligned).
-        let uniques = sorted_unique_coordinates(batch);
+        // This survivor-only output needs no expansion to the input order.
+        let unique_coordinates = sorted_unique_coordinates(batch);
         // One IN query, reusing the TTL-bearing batch read; TTL is discarded in
         // the decoder. Never consults the oracle, never resolves, never writes —
         // no read-window marker resolve, exactly as `provisional_cell_at`.
         let result = self
-            .batch_read_result(collection, section, &uniques)
+            .batch_read_result(collection, section, &unique_coordinates)
             .await
             .map_err(ResolveCellError::Store)?;
-        let rows = align_batch_rows(&result, &uniques).map_err(ResolveCellError::Store)?;
-        decode_provisional_batch(rows, &uniques).map_err(ResolveCellError::Store)
+        let rows = match_batch_rows_to_coordinates(&result, &unique_coordinates)
+            .map_err(ResolveCellError::Store)?;
+        decode_provisional_batch(rows, &unique_coordinates).map_err(ResolveCellError::Store)
     }
 
     async fn write_provisional<'a>(

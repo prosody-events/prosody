@@ -71,9 +71,16 @@ impl<O> CassandraStore<O> {
         &self,
         id: &CollectionId,
         section: Section,
-        uniques: &[&Coordinate],
+        unique_coordinates: &[&Coordinate],
     ) -> Result<QueryRowsResult, CassandraCellStoreError> {
-        fetch_cells_batch_result(&self.session, &self.queries, id, section, uniques).await
+        fetch_cells_batch_result(
+            &self.session,
+            &self.queries,
+            id,
+            section,
+            unique_coordinates,
+        )
+        .await
     }
 
     /// Executes the packed same-partition `UNLOGGED BATCH`es for a multi-cell

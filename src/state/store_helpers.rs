@@ -4,29 +4,40 @@ use super::identity::CollectionId;
 use super::store::{CellBuffer, CellStore, CoordinateBatch};
 use smallvec::SmallVec;
 
-/// Splits a batch into unique coordinates and an input-position plan.
+/// Returns unique coordinates and each input coordinate's unique index.
 pub(crate) fn dedupe(batch: &CoordinateBatch) -> (CellBuffer<&Coordinate>, CellBuffer<usize>) {
-    let mut uniques: CellBuffer<&Coordinate> = SmallVec::with_capacity(batch.len());
-    let mut plan: CellBuffer<usize> = SmallVec::with_capacity(batch.len());
+    let mut unique_coordinates: CellBuffer<&Coordinate> = SmallVec::with_capacity(batch.len());
+    let mut input_indices: CellBuffer<usize> = SmallVec::with_capacity(batch.len());
     for coordinate in batch.iter() {
-        let index = if let Some(index) = uniques.iter().position(|unique| *unique == coordinate) {
+        let index = if let Some(index) = unique_coordinates
+            .iter()
+            .position(|unique| *unique == coordinate)
+        {
             index
         } else {
-            uniques.push(coordinate);
-            uniques.len() - 1
+            unique_coordinates.push(coordinate);
+            unique_coordinates.len() - 1
         };
-        plan.push(index);
+        input_indices.push(index);
     }
-    (uniques, plan)
+    (unique_coordinates, input_indices)
 }
 
-/// Expands unique answers through a deduplication plan.
-pub(crate) fn realign<T: Clone>(plan: &[usize], answers: &[T]) -> CellBuffer<T> {
+/// Expands unique answers to the original input order.
+pub(crate) fn expand_to_input_order<T: Clone>(
+    input_indices: &[usize],
+    unique_answers: &[T],
+) -> CellBuffer<T> {
     debug_assert!(
-        plan.iter().all(|&index| index < answers.len()),
+        input_indices
+            .iter()
+            .all(|&index| index < unique_answers.len()),
         "batch read must answer every input position"
     );
-    plan.iter().map(|&index| answers[index].clone()).collect()
+    input_indices
+        .iter()
+        .map(|&index| unique_answers[index].clone())
+        .collect()
 }
 
 /// Returns the sorted, distinct coordinates for one bounded batch.
@@ -56,9 +67,10 @@ pub(crate) async fn provisional_point_loop<S: CellStore>(
     section: Section,
     batch: &CoordinateBatch,
 ) -> Result<CellBuffer<(Coordinate, ProvisionalCell)>, S::Error> {
-    let uniques = sorted_unique_coordinates(batch);
-    let mut out: CellBuffer<(Coordinate, ProvisionalCell)> = SmallVec::with_capacity(uniques.len());
-    for coordinate in uniques {
+    let unique_coordinates = sorted_unique_coordinates(batch);
+    let mut out: CellBuffer<(Coordinate, ProvisionalCell)> =
+        SmallVec::with_capacity(unique_coordinates.len());
+    for coordinate in unique_coordinates {
         let cell = CellKey {
             section,
             coordinate: coordinate.clone(),

@@ -56,7 +56,8 @@ use std::error::Error;
 use std::future::Future;
 
 pub(crate) use super::store_helpers::{
-    dedupe, provisional_point_loop, realign, section_batches, sorted_unique_coordinates,
+    dedupe, expand_to_input_order, provisional_point_loop, section_batches,
+    sorted_unique_coordinates,
 };
 pub(crate) use super::store_types::CELL_BATCH;
 pub use super::store_types::{CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch};
@@ -161,8 +162,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// This is **not** naive point-sequence equivalence — it is the weaker,
     /// backend-uniform contract every implementation upholds:
     ///
-    /// * **Alignment** — the result has exactly `batch.len()` entries and every
-    ///   position is answered.
+    /// * **Input positions** — the result has exactly `batch.len()` entries.
+    ///   `result[i]` answers `batch[i]`.
     /// * **Dedup + co-observation** — a repeated coordinate is read once; all
     ///   its positions answer identically.
     /// * **First-occurrence ordering** — unique coordinates are resolved in the
@@ -176,7 +177,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     ///   with no cell attribution.
     ///
     /// The default reads each unique coordinate through [`Self::get`] in
-    /// first-occurrence order and scatters the answer to every duplicate
+    /// first-occurrence order and expands the answer to every duplicate
     /// position; a failing coordinate fails the whole batch at its earliest
     /// occurrence (the memory default has no whole-collection phase). The
     /// Cassandra backend overrides it with one `IN` query. Every internal
@@ -196,28 +197,28 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         own: EventRef,
     ) -> impl Future<Output = Result<CommittedBatch, Self::Error>> + Send + 'a {
         async move {
-            let (uniques, plan) = dedupe(batch);
-            let mut answers = CommittedBatch::with_capacity(uniques.len());
-            for &coordinate in &uniques {
+            let (unique_coordinates, input_indices) = dedupe(batch);
+            let mut unique_answers = CommittedBatch::with_capacity(unique_coordinates.len());
+            for &coordinate in &unique_coordinates {
                 let cell = CellKey {
                     section,
                     coordinate: Coordinate::clone(coordinate),
                 };
-                answers.push(self.get(collection, &cell, own).await?);
+                unique_answers.push(self.get(collection, &cell, own).await?);
             }
-            Ok(realign(&plan, &answers))
+            Ok(expand_to_input_order(&input_indices, &unique_answers))
         }
     }
 
     /// Cache-fill batch twin of [`Self::get_for_cache`]: the batch read plus
     /// each position's remaining TTL, for the
     /// [`Cached`](super::cached::Cached) write-through cache to mirror.
-    /// Same read contract and index alignment as [`Self::get_many`].
+    /// Same input-position contract as [`Self::get_many`].
     ///
     /// The default reads each unique coordinate through [`Self::get_for_cache`]
     /// (**not** [`Self::get_many`] with `None` TTLs — that would silently drop
     /// a backend's TTL metadata, the `commit_provisional`-wrapper bug
-    /// class) in first-occurrence order and scatters the `(value, ttl)`
+    /// class) in first-occurrence order and expands the `(value, ttl)`
     /// pair to every duplicate position. Only the Cassandra store overrides
     /// it, sharing one prepared statement with [`Self::get_many`].
     ///
@@ -233,16 +234,16 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         own: EventRef,
     ) -> impl Future<Output = Result<CacheBatch, Self::Error>> + Send + 'a {
         async move {
-            let (uniques, plan) = dedupe(batch);
-            let mut answers = CacheBatch::with_capacity(uniques.len());
-            for &coordinate in &uniques {
+            let (unique_coordinates, input_indices) = dedupe(batch);
+            let mut unique_answers = CacheBatch::with_capacity(unique_coordinates.len());
+            for &coordinate in &unique_coordinates {
                 let cell = CellKey {
                     section,
                     coordinate: Coordinate::clone(coordinate),
                 };
-                answers.push(self.get_for_cache(collection, &cell, own).await?);
+                unique_answers.push(self.get_for_cache(collection, &cell, own).await?);
             }
-            Ok(realign(&plan, &answers))
+            Ok(expand_to_input_order(&input_indices, &unique_answers))
         }
     }
 
