@@ -1054,12 +1054,20 @@ fn arrival_change_point_replaces_stale_rate_evidence() -> Result<(), TestError> 
 #[test]
 fn arrival_change_point_normalizes_after_an_extreme_rate_change() -> Result<(), TestError> {
     let prior = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
+    let upper_rate = prior.coverage()[0].upper_endpoint();
     let mut factor = ArrivalFactor::new(&prior);
 
     factor.update(ArrivalEvidence::new(10_000, 1_000_000), None, 1_000_000);
 
     let rate = factor.expected_rate(1_000_000);
-    assert!(rate.is_finite() && rate > 1_000.0_f64, "rate={rate}");
+    let boundary = factor.boundary_diagnostic(1_000_000);
+    assert!(
+        rate.is_finite()
+            && rate >= 0.9_f64 * upper_rate
+            && boundary.exceeds_budget()
+            && boundary.upper_endpoint_probability > boundary.probability_budget,
+        "rate={rate}, upper rate={upper_rate}, boundary={boundary:?}"
+    );
     Ok(())
 }
 
@@ -2316,7 +2324,7 @@ fn model_priors_carry_validated_artifacts() -> Result<(), TestError> {
     let validated = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?;
     assert_eq!(ArrivalPrior::test_artifact()?, validated);
     assert_eq!(validated.artifact().version(), 1);
-    assert_eq!(validated.coverage().len(), 4);
+    assert_eq!(validated.coverage().len(), 5);
     assert!(
         validated.coverage().iter().all(
             |record| record.tail_probability() <= validated.budget().boundary_probability_max()

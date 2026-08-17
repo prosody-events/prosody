@@ -21,8 +21,8 @@ mod reliability;
 mod types;
 
 pub use arrival::{
-    ArrivalCountPredictive, ArrivalEvidence, ArrivalPredictiveError, ArrivalPrior,
-    ArrivalPriorError,
+    ArrivalBoundaryDiagnostic, ArrivalCountPredictive, ArrivalEvidence, ArrivalPredictiveError,
+    ArrivalPrior, ArrivalPriorError,
 };
 pub use capacity::{
     CapacityClockCheck, CapacityCurve, CapacityGrid, CapacityGridError, CapacityModelError,

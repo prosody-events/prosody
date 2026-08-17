@@ -1,15 +1,14 @@
-use std::array::from_fn;
-
 use allocation_counter::measure;
 use quickcheck_macros::quickcheck;
 use statrs::distribution::{ContinuousCDF, Gamma};
-use statrs::function::gamma::gamma_ur;
+use statrs::function::gamma::{gamma_lr, gamma_ur};
+use std::f64::consts::E;
 use thiserror::Error;
 
 use super::{
-    ArrivalEvidence, ArrivalFactor, ArrivalPrior, ArrivalPriorError, CELL_COUNT, EPSILON_BOUNDARY,
-    HAZARD_COUNT, RATE_COUNT, RESET_COUNT, T_MAX_SECONDS, arrival_coverage, cell, poisson_mass,
-    sample_path_counts,
+    ArrivalEvidence, ArrivalFactor, ArrivalPrior, ArrivalPriorError, EPSILON_BOUNDARY,
+    EPSILON_GRID, HAZARD_TRANSITION_PROBABILITY_ERROR_MAX, RESET_COUNT, T_MAX_SECONDS, cell,
+    poisson_mass, sample_path_counts,
 };
 use crate::types::{CalendarColumns, CalendarForecast};
 use crate::{CalendarArtifactId, CalendarRateSegment, RandomStream};
@@ -18,8 +17,9 @@ use crate::{CalendarArtifactId, CalendarRateSegment, RandomStream};
 fn concentrated_posterior_has_a_finite_exact_predictive_rank() -> Result<(), TestError> {
     let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
     let mut factor = ArrivalFactor::new(&model);
+    let rate_count = factor.rates.len();
     factor.probability.fill(0.0_f64);
-    factor.probability[cell(0, 0, RATE_COUNT / 2)] = 1.0_f64;
+    factor.probability[cell(0, 0, rate_count / 2, rate_count)] = 1.0_f64;
 
     let predictive = factor.count_predictive(0, 7, 1.0_f64)?;
     let rank = predictive.lower_cdf.midpoint(predictive.upper_cdf);
@@ -38,23 +38,21 @@ fn boundary_filter_matches_exhaustive_one_step(count_code: u8, duration_code: u1
     let duration = 0.1_f64 + 30.0_f64 * f64::from(duration_code) / f64::from(u16::MAX);
     let count = u32::from(count_code % 32);
     let before = ArrivalFactor::new(&model);
-    let mut expected = vec![0.0_f64; CELL_COUNT];
-    for hazard in 0..HAZARD_COUNT {
+    let rate_count = before.rates.len();
+    let mut expected = vec![0.0_f64; before.probability.len()];
+    for hazard in 0..before.hazards.len() {
         let retained = (-before.hazards[hazard] * duration).exp();
         for reset in 0..RESET_COUNT {
-            for source in 0..RATE_COUNT {
-                let source_mass = before.probability[cell(hazard, reset, source)];
-                for destination in 0..RATE_COUNT {
-                    let transition = if source == destination {
-                        retained
-                    } else {
-                        0.0_f64
-                    } + (1.0_f64 - retained)
-                        * before.reset_probability[reset][destination];
-                    expected[cell(hazard, reset, destination)] += source_mass
-                        * transition
-                        * poisson_mass(count, before.rates[destination] * duration);
-                }
+            let changed = (0..rate_count)
+                .map(|source| before.probability[cell(hazard, reset, source, rate_count)])
+                .sum::<f64>()
+                * (1.0_f64 - retained);
+            for destination in 0..rate_count {
+                let prior = retained
+                    * before.probability[cell(hazard, reset, destination, rate_count)]
+                    + changed * before.reset_probability[reset][destination];
+                expected[cell(hazard, reset, destination, rate_count)] =
+                    prior * poisson_mass(count, before.rates[destination] * duration);
             }
         }
     }
@@ -70,11 +68,14 @@ fn boundary_filter_matches_exhaustive_one_step(count_code: u8, duration_code: u1
 #[test]
 fn update_path_does_not_allocate() -> Result<(), ArrivalPriorError> {
     let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
+    let factor = ArrivalFactor::new(&model);
+    let rate_count = factor.rates.len();
+    let hazard_count = factor.hazards.len();
     assert_eq!(
-        ArrivalPrior::storage_bytes()?,
-        8 * (2 * CELL_COUNT + HAZARD_COUNT + RESET_COUNT * RATE_COUNT + RATE_COUNT)
+        ArrivalPrior::storage_bytes(hazard_count, rate_count)?,
+        8 * (2 * factor.probability.len() + hazard_count + RESET_COUNT * rate_count + rate_count)
     );
-    let mut factor = ArrivalFactor::new(&model);
+    let mut factor = factor;
     let allocation = measure(|| factor.update(ArrivalEvidence::new(7, 1_000_000), None, 1_000_000));
     assert_eq!(allocation.count_total, 0);
     assert_eq!(allocation.bytes_total, 0);
@@ -85,6 +86,7 @@ fn update_path_does_not_allocate() -> Result<(), ArrivalPriorError> {
 fn reset_cell_masses_are_exact_and_exhaustive() -> Result<(), TestError> {
     let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
     let factor = ArrivalFactor::new(&model);
+    let rate_count = factor.rates.len();
     let mean = model.shape() / model.rate_seconds();
 
     for (shape, masses) in [1.0_f64, 2.0_f64, 4.0_f64]
@@ -92,21 +94,37 @@ fn reset_cell_masses_are_exact_and_exhaustive() -> Result<(), TestError> {
         .zip(factor.reset_probability)
     {
         let distribution = Gamma::new(shape, shape).map_err(|_| TestError::Distribution)?;
-        let lower_boundary = factor.rates[0] * 2.0_f64.powf(0.125_f64) / mean;
-        let upper_boundary = factor.rates[RATE_COUNT - 1] * 2.0_f64.powf(-0.125_f64) / mean;
+        let lower_boundary = (factor.rates[0] * factor.rates[1]).sqrt() / mean;
+        let upper_boundary =
+            (factor.rates[rate_count - 2] * factor.rates[rate_count - 1]).sqrt() / mean;
 
         assert!((masses.iter().sum::<f64>() - 1.0_f64).abs() <= 2.0e-15_f64);
         assert!((masses[0] - distribution.cdf(lower_boundary)).abs() <= f64::EPSILON);
         assert!(
-            (masses[RATE_COUNT - 1] - (1.0_f64 - distribution.cdf(upper_boundary))).abs()
+            (masses[rate_count - 1] - (1.0_f64 - distribution.cdf(upper_boundary))).abs()
                 <= f64::EPSILON
         );
-        let high_index = 219;
-        let high_lower = factor.rates[high_index] * 2.0_f64.powf(-0.125_f64) / mean;
-        let high_upper = factor.rates[high_index] * 2.0_f64.powf(0.125_f64) / mean;
-        let high_mass = gamma_ur(shape, shape * high_lower) - gamma_ur(shape, shape * high_upper);
-        assert!(masses[high_index] > 0.0_f64);
-        assert!((masses[high_index] - high_mass).abs() <= f64::EPSILON * high_mass);
+        let below_index = rate_count * 3 / 4;
+        let below_lower = (factor.rates[below_index - 1] * factor.rates[below_index]).sqrt() / mean;
+        let below_upper = (factor.rates[below_index] * factor.rates[below_index + 1]).sqrt() / mean;
+        let below_mass =
+            gamma_lr(shape, shape * below_upper) - gamma_lr(shape, shape * below_lower);
+        assert!(factor.rates[below_index] < mean && masses[below_index] > 0.0_f64);
+        assert!((masses[below_index] - below_mass).abs() <= 32.0_f64 * f64::EPSILON * below_mass);
+
+        let first_above = factor
+            .rates
+            .iter()
+            .position(|rate| *rate > mean)
+            .ok_or(TestError::Distribution)?;
+        let above_index = first_above + 2;
+        assert!(above_index + 1 < rate_count);
+        let above_lower = (factor.rates[above_index - 1] * factor.rates[above_index]).sqrt() / mean;
+        let above_upper = (factor.rates[above_index] * factor.rates[above_index + 1]).sqrt() / mean;
+        let above_mass =
+            gamma_ur(shape, shape * above_lower) - gamma_ur(shape, shape * above_upper);
+        assert!(factor.rates[above_index] > mean && masses[above_index] > 0.0_f64);
+        assert!((masses[above_index] - above_mass).abs() <= 32.0_f64 * f64::EPSILON * above_mass);
     }
     for (record, shape) in model.coverage()[..RESET_COUNT]
         .iter()
@@ -132,8 +150,10 @@ fn reset_cell_masses_are_exact_and_exhaustive() -> Result<(), TestError> {
 fn path_initial_draw_applies_the_elapsed_transition() -> Result<(), TestError> {
     let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 90.0_f64)?;
     let mut factor = ArrivalFactor::new(&model);
+    let rate_count = factor.rates.len();
+    let maximum_rate = factor.rates[rate_count - 1];
     factor.probability.fill(0.0_f64);
-    factor.probability[cell(0, 1, RATE_COUNT - 1)] = 1.0_f64;
+    factor.probability[cell(factor.hazards.len() - 1, 1, rate_count - 1, rate_count)] = 1.0_f64;
     let mut ends = vec![0.0_f64; model.path_segment_count_max()];
     let mut rates = vec![0.0_f64; model.path_segment_count_max()];
     let mut total = 0.0_f64;
@@ -151,39 +171,27 @@ fn path_initial_draw_applies_the_elapsed_transition() -> Result<(), TestError> {
         total += rates[0];
     }
 
-    assert!(total / 128.0_f64 < 1_000.0_f64);
+    assert!(total / 128.0_f64 < 0.5_f64 * maximum_rate);
     Ok(())
 }
 
 #[test]
-fn reset_coverage_rejects_each_boundary_tail() -> Result<(), TestError> {
-    let hazards = [1.0_f64 / 7_200.0_f64; HAZARD_COUNT];
-    let lower_rates = from_fn(|index| {
-        let index = u32::try_from(index).map_or(u32::MAX, |value| value);
-        2.0_f64.powf(f64::from(index) / 4.0_f64)
-    });
-    let upper_rates = from_fn(|index| {
-        let index = u32::try_from(index).map_or(u32::MAX, |value| value);
-        let last = u32::try_from(RATE_COUNT - 1).map_or(u32::MAX, |value| value);
-        2.0_f64.powf((f64::from(index) - f64::from(last)) / 4.0_f64)
-    });
-    let distribution = Gamma::new(1.0_f64, 1.0_f64).map_err(|_| TestError::Distribution)?;
-    let lower_tail = distribution.cdf(lower_rates[0] / 2.0_f64.powf(0.125_f64));
-    let lower_upper_tail =
-        1.0_f64 - distribution.cdf(lower_rates[RATE_COUNT - 1] * 2.0_f64.powf(0.125_f64));
-    let upper_lower_tail = distribution.cdf(upper_rates[0] / 2.0_f64.powf(0.125_f64));
-    let upper_tail =
-        1.0_f64 - distribution.cdf(upper_rates[RATE_COUNT - 1] * 2.0_f64.powf(0.125_f64));
-
-    assert!(lower_tail > EPSILON_BOUNDARY && lower_upper_tail <= EPSILON_BOUNDARY);
-    assert!(upper_tail > EPSILON_BOUNDARY && upper_lower_tail <= EPSILON_BOUNDARY);
-    assert_eq!(
-        arrival_coverage(1.0_f64, 1.0_f64, &lower_rates, &hazards),
-        Err(ArrivalPriorError::BoundaryMass)
-    );
-    assert_eq!(
-        arrival_coverage(1.0_f64, 1.0_f64, &upper_rates, &hazards),
-        Err(ArrivalPriorError::BoundaryMass)
+fn derived_grids_meet_their_accuracy_and_coverage_budgets() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?;
+    let factor = ArrivalFactor::new(&model);
+    let rate_error = (model.rate_log_step * 0.5_f64).exp() - 1.0_f64;
+    let hazard_error = model.hazard_log_step / E;
+    assert!(rate_error <= EPSILON_GRID);
+    assert!(hazard_error <= HAZARD_TRANSITION_PROBABILITY_ERROR_MAX);
+    assert!(model.coverage().iter().all(|record| {
+        record.lower_tail_probability() <= EPSILON_BOUNDARY * 0.5_f64
+            && record.upper_tail_probability() <= EPSILON_BOUNDARY * 0.5_f64
+    }));
+    assert!((factor.probability.iter().sum::<f64>() - 1.0_f64).abs() <= 2.0e-14_f64);
+    assert!(
+        factor.reset_probability.iter().all(|masses| {
+            (masses.iter().sum::<f64>() - 1.0_f64).abs() <= 4.0_f64 * f64::EPSILON
+        })
     );
     Ok(())
 }

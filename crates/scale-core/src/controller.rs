@@ -4,7 +4,7 @@ use std::time::Duration;
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 
 use crate::TransitionDirection;
-use crate::arrival::{ArrivalFactor, ArrivalPrior};
+use crate::arrival::{ArrivalBoundaryDiagnostic, ArrivalFactor, ArrivalPrior};
 use crate::capacity::{
     CapacityClockCheck, CapacityFactor, CompletionPosteriorCell, ThroughputPosteriorCell,
 };
@@ -345,17 +345,24 @@ impl ScaleState {
         )
     }
 
-    /// Returns the fixed value count for the finite arrival-rate posterior.
+    /// Returns the value count for the finite arrival-rate posterior.
     #[must_use]
-    pub const fn arrival_posterior_value_count(&self) -> u32 {
-        ArrivalPrior::POSTERIOR_VALUE_COUNT
+    pub fn arrival_posterior_value_count(&self) -> u32 {
+        self.arrivals.posterior_value_count()
+    }
+
+    /// Returns posterior rate-grid boundary pressure.
+    #[must_use]
+    pub fn arrival_boundary_diagnostic(&self) -> ArrivalBoundaryDiagnostic {
+        self.arrivals
+            .boundary_diagnostic(self.model_time.as_micros())
     }
 
     /// Writes the finite arrival-rate posterior into caller-owned buffers.
     ///
     /// # Errors
     ///
-    /// Returns an error when either buffer has the wrong fixed length.
+    /// Returns an error when either buffer has the wrong length.
     pub fn write_arrival_posterior(
         &self,
         values: &mut [f64],

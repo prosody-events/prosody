@@ -1,4 +1,4 @@
-use std::array::from_fn;
+use std::f64::consts::E;
 use std::time::Duration;
 
 use rand::RngExt;
@@ -14,28 +14,22 @@ use crate::{
     RandomStream,
 };
 
-const HAZARD_COUNT: usize = 5;
 const RESET_COUNT: usize = 3;
-const RATE_COUNT: usize = 257;
-const CELL_COUNT: usize = HAZARD_COUNT * RESET_COUNT * RATE_COUNT;
 const MODEL_VERSION: u32 = 1;
 const ARRIVAL_ARTIFACT_SOURCE: u64 = 0x0041_5252_4956_414c;
 const T_MAX_SECONDS: f64 = 604_800.0_f64;
 const EPSILON_GRID: f64 = 0.02_f64;
 const EPSILON_BOUNDARY: f64 = 1.0e-6_f64;
+// The exponential is the maximum-entropy hazard prior for the authored mean.
+// It is also the center of the reset-shape family.
+const HAZARD_SHAPE: f64 = 1.0_f64;
+const HAZARD_TRANSITION_PROBABILITY_ERROR_MAX: f64 = 1.0_f64 / 8.0_f64;
 const EPSILON_PATH: f64 = 1.0e-9_f64;
-const STORAGE_BUDGET_BYTES: usize = 96 * 1_024;
+// One scaling target can use at most 16 MiB for its arrival filter.
+const STORAGE_BUDGET_BYTES: usize = 16 * 1_024 * 1_024;
 const CALENDAR_SEGMENT_LIMIT: usize = 1_024;
-const PATH_SEGMENT_LIMIT: usize = 65_536;
+const PATH_SEGMENT_LIMIT: usize = 262_144;
 const ARRIVAL_COUNT_DOMAIN: u64 = 0x6172_7269_7661_6c73;
-const ARRIVAL_ARTIFACT_BUDGET: PriorArtifactBudget = PriorArtifactBudget::new(
-    CELL_COUNT as u32,
-    STORAGE_BUDGET_BYTES as u64,
-    (7 * CELL_COUNT) as u64,
-    EPSILON_BOUNDARY,
-    0.0_f64,
-    EPSILON_GRID,
-);
 
 /// Exact count prediction from the finite arrival model.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,6 +40,33 @@ pub struct ArrivalCountPredictive {
     pub upper_cdf: f64,
     /// Predictive counts at probabilities 0.1, 0.5, and 0.9.
     pub quantiles: [u64; 3],
+}
+
+/// Posterior mass on the finite rate grid endpoints.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArrivalBoundaryDiagnostic {
+    /// Posterior probability on the lower endpoint cell.
+    pub lower_endpoint_probability: f64,
+    /// Posterior probability on the upper endpoint cell.
+    pub upper_endpoint_probability: f64,
+    /// Maximum permitted probability on both endpoint cells.
+    pub probability_budget: f64,
+}
+
+impl ArrivalBoundaryDiagnostic {
+    /// Returns true when either endpoint probability exceeds the budget.
+    #[must_use]
+    pub fn exceeds_budget(self) -> bool {
+        self.lower_endpoint_probability > self.probability_budget
+            || self.upper_endpoint_probability > self.probability_budget
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GridSpec {
+    low: f64,
+    log_step: f64,
+    count: usize,
 }
 
 /// A validated finite-state arrival model.
@@ -61,6 +82,12 @@ pub struct ArrivalPrior {
     authored_shape: f64,
     rate_seconds: f64,
     hazard_center: f64,
+    hazard_low: f64,
+    hazard_log_step: f64,
+    hazard_count: usize,
+    rate_low: f64,
+    rate_log_step: f64,
+    rate_count: usize,
     path_change_bound: usize,
 }
 
@@ -69,8 +96,6 @@ impl ArrivalPrior {
     pub(crate) const MAXIMUM_PATH_MICROS: u64 = (T_MAX_SECONDS * 1_000_000.0_f64) as u64;
     /// Longest path duration inside the certified sampler domain.
     pub(crate) const MAXIMUM_PATH_SECONDS: f64 = T_MAX_SECONDS;
-    /// Fixed length of the finite arrival-rate posterior.
-    pub(crate) const POSTERIOR_VALUE_COUNT: u32 = RATE_COUNT as u32;
 
     /// Constructs a validated finite arrival model.
     ///
@@ -96,7 +121,15 @@ impl ArrivalPrior {
         if !change_rate_per_second.is_finite() || change_rate_per_second <= 0.0_f64 {
             return Err(ArrivalPriorError::InvalidChangeRate);
         }
-        let storage_bytes = Self::storage_bytes()?;
+        let tail_limit = EPSILON_BOUNDARY * 0.25_f64;
+        let mean = shape / rate_seconds;
+        if !mean.is_finite() || mean <= 0.0_f64 {
+            return Err(ArrivalPriorError::InvalidRate);
+        }
+        let hazard = derive_hazard_grid(change_rate_per_second, tail_limit)?;
+        let rate = derive_rate_grid(shape, mean, tail_limit)?;
+        let cell_count = cell_count(hazard.count, rate.count)?;
+        let storage_bytes = Self::storage_bytes(hazard.count, rate.count)?;
         if storage_bytes > STORAGE_BUDGET_BYTES {
             return Err(ArrivalPriorError::StorageBudget {
                 required: storage_bytes,
@@ -104,36 +137,28 @@ impl ArrivalPrior {
             });
         }
 
-        // A symmetric log grid expresses one octave of hazard uncertainty.
         let hazard_center = ChangePointKernel::new(change_rate_per_second).rate_per_second();
-        let hazard_scale = [
-            0.5_f64,
-            2.0_f64.sqrt().recip(),
-            1.0_f64,
-            2.0_f64.sqrt(),
-            2.0_f64,
-        ];
-        let hazards = hazard_scale.map(|scale| hazard_center * scale);
+        let hazards = geometric_grid(hazard.low, hazard.log_step, hazard.count);
         if hazards.iter().any(|value| !value.is_finite()) {
             return Err(ArrivalPriorError::InvalidChangeRate);
         }
-        // A normal density on log hazard is weakly informative and proper.
-        let mean = shape / rate_seconds;
-        if !mean.is_finite() || mean <= 0.0_f64 {
-            return Err(ArrivalPriorError::InvalidRate);
-        }
-        let rates: [f64; RATE_COUNT] = from_fn(|index| {
-            let index = u32::try_from(index).map_or(u32::MAX, |value| value);
-            mean * 2.0_f64.powf(f64::from(index) / 4.0_f64 - 48.0_f64)
-        });
+        let rates = geometric_grid(rate.low, rate.log_step, rate.count);
         if rates
             .iter()
             .any(|value| !value.is_finite() || *value <= 0.0_f64)
         {
             return Err(ArrivalPriorError::InvalidRate);
         }
-        let (coverage, path_change_bound) = arrival_coverage(shape, mean, &rates, &hazards)?;
-        let maximum_poisson_mean = rates[RATE_COUNT - 1] * T_MAX_SECONDS;
+        let achieved_rate_error = rate.log_step.mul_add(0.5_f64, 0.0_f64).exp() - 1.0_f64;
+        let (coverage, path_change_bound) = arrival_coverage(
+            shape,
+            mean,
+            &rates,
+            &hazards,
+            change_rate_per_second,
+            achieved_rate_error,
+        )?;
+        let maximum_poisson_mean = rates[rate.count - 1] * T_MAX_SECONDS;
         if PoissonMean::new(maximum_poisson_mean).is_none() {
             return Err(ArrivalPriorError::InvalidPoissonMean);
         }
@@ -143,23 +168,30 @@ impl ArrivalPrior {
             | 1;
         let artifact =
             PriorArtifactIdentity::new(ARRIVAL_ARTIFACT_SOURCE, MODEL_VERSION, random_stream);
+        let budget = arrival_artifact_budget(cell_count)?;
         if !prior_artifact_contract_holds(
             artifact,
-            ARRIVAL_ARTIFACT_BUDGET,
+            budget,
             &coverage,
-            CELL_COUNT,
+            cell_count,
             storage_bytes,
-            (7 * CELL_COUNT) as u64,
+            (7 * cell_count) as u64,
         ) {
             return Err(ArrivalPriorError::InvalidAccuracyBudget);
         }
         Ok(Self {
             artifact,
-            budget: ARRIVAL_ARTIFACT_BUDGET,
+            budget,
             coverage: coverage.into(),
             authored_shape: shape,
             rate_seconds,
             hazard_center,
+            hazard_low: hazard.low,
+            hazard_log_step: hazard.log_step,
+            hazard_count: hazard.count,
+            rate_low: rate.low,
+            rate_log_step: rate.log_step,
+            rate_count: rate.count,
             path_change_bound,
         })
     }
@@ -211,11 +243,16 @@ impl ArrivalPrior {
         self.rate_seconds
     }
 
-    fn storage_bytes() -> Result<usize, ArrivalPriorError> {
-        CELL_COUNT
+    pub(crate) fn posterior_value_count(&self) -> u32 {
+        u32::try_from(self.rate_count).map_or(u32::MAX, |count| count)
+    }
+
+    fn storage_bytes(hazard_count: usize, rate_count: usize) -> Result<usize, ArrivalPriorError> {
+        let cell_count = cell_count(hazard_count, rate_count)?;
+        cell_count
             .checked_mul(2)
             .and_then(|value| {
-                value.checked_add(HAZARD_COUNT + RESET_COUNT * RATE_COUNT + RATE_COUNT)
+                value.checked_add(hazard_count + RESET_COUNT * rate_count + rate_count)
             })
             .and_then(|value| value.checked_mul(size_of::<f64>()))
             .ok_or(ArrivalPriorError::ArithmeticOverflow)
@@ -242,9 +279,9 @@ impl ArrivalEvidence {
 
 pub(crate) struct ArrivalFactor {
     model: ArrivalPrior,
-    hazards: [f64; HAZARD_COUNT],
-    rates: [f64; RATE_COUNT],
-    reset_probability: [[f64; RATE_COUNT]; RESET_COUNT],
+    hazards: Box<[f64]>,
+    rates: Box<[f64]>,
+    reset_probability: [Box<[f64]>; RESET_COUNT],
     probability: Box<[f64]>,
     scratch: Box<[f64]>,
     // Calendar segment changes take effect at the next evidence boundary.
@@ -261,57 +298,41 @@ pub(crate) struct ArrivalFactor {
 
 impl ArrivalFactor {
     pub(crate) fn new(model: &ArrivalPrior) -> Self {
-        let hazard_scale = [
-            0.5_f64,
-            2.0_f64.sqrt().recip(),
-            1.0_f64,
-            2.0_f64.sqrt(),
-            2.0_f64,
-        ];
-        let hazards = hazard_scale.map(|scale| model.hazard_center * scale);
+        let hazards = geometric_grid(model.hazard_low, model.hazard_log_step, model.hazard_count);
+        let hazard_prior = exact_gamma_masses(&hazards, HAZARD_SHAPE, model.hazard_center);
         let mean = model.authored_shape / model.rate_seconds;
-        let rates = from_fn(|index| {
-            let index = u32::try_from(index).map_or(u32::MAX, |value| value);
-            mean * 2.0_f64.powf(f64::from(index) / 4.0_f64 - 48.0_f64)
-        });
+        let rates = geometric_grid(model.rate_low, model.rate_log_step, model.rate_count);
         let reset_shapes = [
             model.authored_shape * 0.5_f64,
             model.authored_shape,
             model.authored_shape * 2.0_f64,
         ];
         let reset_probability = reset_shapes.map(|shape| {
-            from_fn(|index| {
-                if index == 0 {
-                    gamma_lr(shape, shape * rates[0] * 2.0_f64.powf(0.125_f64) / mean)
-                } else if index == RATE_COUNT - 1 {
-                    gamma_ur(
-                        shape,
-                        shape * rates[RATE_COUNT - 1] * 2.0_f64.powf(-0.125_f64) / mean,
-                    )
-                } else {
-                    let lower = rates[index] * 2.0_f64.powf(-0.125_f64) / mean;
-                    let upper = rates[index] * 2.0_f64.powf(0.125_f64) / mean;
-                    // Select the dominant tail to prevent CDF subtraction cancellation.
-                    if rates[index] <= mean {
-                        gamma_lr(shape, shape * upper) - gamma_lr(shape, shape * lower)
+            (0..model.rate_count)
+                .map(|index| {
+                    if index == 0 {
+                        gamma_lr(shape, shape * geometric_upper(&rates, index) / mean)
+                    } else if index == model.rate_count - 1 {
+                        gamma_ur(shape, shape * geometric_lower(&rates, index) / mean)
                     } else {
-                        gamma_ur(shape, shape * lower) - gamma_ur(shape, shape * upper)
+                        let lower = geometric_lower(&rates, index) / mean;
+                        let upper = geometric_upper(&rates, index) / mean;
+                        // Select the dominant tail to prevent CDF subtraction cancellation.
+                        if rates[index] <= mean {
+                            gamma_lr(shape, shape * upper) - gamma_lr(shape, shape * lower)
+                        } else {
+                            gamma_ur(shape, shape * lower) - gamma_ur(shape, shape * upper)
+                        }
                     }
-                }
-            })
+                })
+                .collect::<Box<[_]>>()
         });
-        let hazard_prior = normalize([
-            0.001_349_612_f64,
-            0.157_305_356_f64,
-            0.682_689_492_f64,
-            0.157_305_356_f64,
-            0.001_349_612_f64,
-        ]);
-        let mut probability = vec![0.0_f64; CELL_COUNT].into_boxed_slice();
-        for hazard in 0..HAZARD_COUNT {
+        let cell_count = model.hazard_count * RESET_COUNT * model.rate_count;
+        let mut probability = vec![0.0_f64; cell_count].into_boxed_slice();
+        for hazard in 0..model.hazard_count {
             for reset in 0..RESET_COUNT {
-                for rate in 0..RATE_COUNT {
-                    probability[cell(hazard, reset, rate)] =
+                for rate in 0..model.rate_count {
+                    probability[cell(hazard, reset, rate, model.rate_count)] =
                         hazard_prior[hazard] / 3.0_f64 * reset_probability[reset][rate];
                 }
             }
@@ -322,7 +343,7 @@ impl ArrivalFactor {
             rates,
             reset_probability,
             probability,
-            scratch: vec![0.0_f64; CELL_COUNT].into_boxed_slice(),
+            scratch: vec![0.0_f64; cell_count].into_boxed_slice(),
             calendar_artifact: None,
             calendar_position: 0,
             calendar_shape: 0.0_f64,
@@ -331,6 +352,10 @@ impl ArrivalFactor {
             calendar_active: false,
             last_evidence_micros: 0,
         }
+    }
+
+    pub(crate) fn posterior_value_count(&self) -> u32 {
+        self.model.posterior_value_count()
     }
 
     /// Updates the model with one certified evidence interval.
@@ -383,18 +408,19 @@ impl ArrivalFactor {
             return;
         }
         self.scratch.fill(0.0_f64);
-        for hazard in 0..HAZARD_COUNT {
+        for hazard in 0..self.hazards.len() {
             let retained = (-self.hazards[hazard] * duration).exp();
             for reset in 0..RESET_COUNT {
                 let mut reset_mass = 0.0_f64;
-                for source in 0..RATE_COUNT {
-                    reset_mass +=
-                        self.probability[cell(hazard, reset, source)] * (1.0_f64 - retained);
+                for source in 0..self.rates.len() {
+                    reset_mass += self.probability[cell(hazard, reset, source, self.rates.len())]
+                        * (1.0_f64 - retained);
                 }
-                for destination in 0..RATE_COUNT {
-                    let prior = self.probability[cell(hazard, reset, destination)] * retained
+                for destination in 0..self.rates.len() {
+                    let index = cell(hazard, reset, destination, self.rates.len());
+                    let prior = self.probability[index] * retained
                         + reset_mass * self.reset_probability[reset][destination];
-                    self.scratch[cell(hazard, reset, destination)] = count.map_or(prior, |value| {
+                    self.scratch[index] = count.map_or(prior, |value| {
                         prior.ln() + log_poisson_mass(value, self.rates[destination] * duration)
                     });
                 }
@@ -468,19 +494,19 @@ impl ArrivalFactor {
         let elapsed = Duration::from_micros(now_micros.saturating_sub(self.last_evidence_micros))
             .as_secs_f64();
         let mut mean = 0.0_f64;
-        for hazard in 0..HAZARD_COUNT {
+        for hazard in 0..self.hazards.len() {
             let retained = (-self.hazards[hazard] * elapsed).exp();
             for reset in 0..RESET_COUNT {
                 let mut group = 0.0_f64;
                 let mut retained_mean = 0.0_f64;
-                for rate in 0..RATE_COUNT {
-                    let probability = self.probability[cell(hazard, reset, rate)];
+                for rate in 0..self.rates.len() {
+                    let probability = self.probability[cell(hazard, reset, rate, self.rates.len())];
                     group += probability;
                     retained_mean += probability * self.rates[rate];
                 }
                 let reset_mean = self.reset_probability[reset]
                     .iter()
-                    .zip(self.rates)
+                    .zip(&self.rates)
                     .map(|(probability, rate)| probability * rate)
                     .sum::<f64>();
                 mean += retained * retained_mean + (1.0_f64 - retained) * group * reset_mean;
@@ -495,26 +521,53 @@ impl ArrivalFactor {
         values: &mut [f64],
         probabilities: &mut [f64],
     ) -> bool {
-        if values.len() != RATE_COUNT || probabilities.len() != RATE_COUNT {
+        if values.len() != self.rates.len() || probabilities.len() != self.rates.len() {
             return false;
         }
         let elapsed = Duration::from_micros(now_micros.saturating_sub(self.last_evidence_micros))
             .as_secs_f64();
         values.copy_from_slice(&self.rates);
         probabilities.fill(0.0_f64);
-        for hazard in 0..HAZARD_COUNT {
+        for hazard in 0..self.hazards.len() {
             let retained = (-self.hazards[hazard] * elapsed).exp();
             for reset in 0..RESET_COUNT {
-                let group = (0..RATE_COUNT)
-                    .map(|rate| self.probability[cell(hazard, reset, rate)])
+                let group = (0..self.rates.len())
+                    .map(|rate| self.probability[cell(hazard, reset, rate, self.rates.len())])
                     .sum::<f64>();
                 for (rate, probability) in probabilities.iter_mut().enumerate() {
-                    *probability += retained * self.probability[cell(hazard, reset, rate)]
+                    *probability += retained
+                        * self.probability[cell(hazard, reset, rate, self.rates.len())]
                         + (1.0_f64 - retained) * group * self.reset_probability[reset][rate];
                 }
             }
         }
         true
+    }
+
+    pub(crate) fn boundary_diagnostic(&self, now_micros: u64) -> ArrivalBoundaryDiagnostic {
+        let elapsed = Duration::from_micros(now_micros.saturating_sub(self.last_evidence_micros))
+            .as_secs_f64();
+        let mut lower = 0.0_f64;
+        let mut upper = 0.0_f64;
+        for hazard in 0..self.hazards.len() {
+            let retained = (-self.hazards[hazard] * elapsed).exp();
+            for reset in 0..RESET_COUNT {
+                let group = (0..self.rates.len())
+                    .map(|rate| self.probability[cell(hazard, reset, rate, self.rates.len())])
+                    .sum::<f64>();
+                let endpoint = |rate| {
+                    retained * self.probability[cell(hazard, reset, rate, self.rates.len())]
+                        + (1.0_f64 - retained) * group * self.reset_probability[reset][rate]
+                };
+                lower += endpoint(0);
+                upper += endpoint(self.rates.len() - 1);
+            }
+        }
+        ArrivalBoundaryDiagnostic {
+            lower_endpoint_probability: lower,
+            upper_endpoint_probability: upper,
+            probability_budget: EPSILON_BOUNDARY,
+        }
     }
 
     pub(crate) fn count_predictive(
@@ -569,7 +622,7 @@ impl ArrivalFactor {
         if !exposure_seconds.is_finite()
             || exposure_seconds <= 0.0_f64
             || exposure_seconds > T_MAX_SECONDS
-            || PoissonMean::new(self.rates[RATE_COUNT - 1] * exposure_seconds).is_none()
+            || PoissonMean::new(self.rates[self.rates.len() - 1] * exposure_seconds).is_none()
         {
             return Err(ArrivalPredictiveError::InvalidExposure);
         }
@@ -582,8 +635,8 @@ impl ArrivalFactor {
         exposure_seconds: f64,
         transition_seconds: f64,
     ) -> Result<f64, ArrivalPredictiveError> {
-        let mut poisson_cdfs = [0.0_f64; RATE_COUNT];
-        for (poisson_cdf, rate) in poisson_cdfs.iter_mut().zip(self.rates) {
+        let mut poisson_cdfs = vec![0.0_f64; self.rates.len()];
+        for (poisson_cdf, rate) in poisson_cdfs.iter_mut().zip(&self.rates) {
             let mean = rate * exposure_seconds;
             if PoissonMean::new(mean).is_none() {
                 return Err(ArrivalPredictiveError::InvalidExposure);
@@ -593,14 +646,15 @@ impl ArrivalFactor {
             *poisson_cdf = distribution.cdf(count);
         }
         let mut local_cdf = 0.0_f64;
-        for hazard in 0..HAZARD_COUNT {
+        for hazard in 0..self.hazards.len() {
             let retained = (-self.hazards[hazard] * transition_seconds).exp();
             for reset in 0..RESET_COUNT {
-                let group = (0..RATE_COUNT)
-                    .map(|rate| self.probability[cell(hazard, reset, rate)])
+                let group = (0..self.rates.len())
+                    .map(|rate| self.probability[cell(hazard, reset, rate, self.rates.len())])
                     .sum::<f64>();
                 for (rate, poisson_cdf) in poisson_cdfs.iter().copied().enumerate() {
-                    let probability = retained * self.probability[cell(hazard, reset, rate)]
+                    let probability = retained
+                        * self.probability[cell(hazard, reset, rate, self.rates.len())]
                         + (1.0_f64 - retained) * group * self.reset_probability[reset][rate];
                     local_cdf += probability * poisson_cdf;
                 }
@@ -696,9 +750,13 @@ impl ArrivalFactor {
 
     fn sample_joint(&self, random: &mut RandomStream) -> (usize, usize, usize) {
         let selected = sample_discrete(&self.probability, random);
-        let hazard = selected / (RESET_COUNT * RATE_COUNT);
-        let remainder = selected % (RESET_COUNT * RATE_COUNT);
-        (hazard, remainder / RATE_COUNT, remainder % RATE_COUNT)
+        let hazard = selected / (RESET_COUNT * self.rates.len());
+        let remainder = selected % (RESET_COUNT * self.rates.len());
+        (
+            hazard,
+            remainder / self.rates.len(),
+            remainder % self.rates.len(),
+        )
     }
 
     fn sample_calendar_path(
@@ -748,14 +806,15 @@ impl ArrivalFactor {
 
     fn predictive_probability(&self, count: u32, exposure: f64) -> f64 {
         let mut mass = 0.0_f64;
-        for hazard in 0..HAZARD_COUNT {
+        for hazard in 0..self.hazards.len() {
             let retained = (-self.hazards[hazard] * exposure).exp();
             for reset in 0..RESET_COUNT {
-                let group = (0..RATE_COUNT)
-                    .map(|rate| self.probability[cell(hazard, reset, rate)])
+                let group = (0..self.rates.len())
+                    .map(|rate| self.probability[cell(hazard, reset, rate, self.rates.len())])
                     .sum::<f64>();
-                for rate in 0..RATE_COUNT {
-                    let destination = retained * self.probability[cell(hazard, reset, rate)]
+                for rate in 0..self.rates.len() {
+                    let destination = retained
+                        * self.probability[cell(hazard, reset, rate, self.rates.len())]
                         + (1.0_f64 - retained) * group * self.reset_probability[reset][rate];
                     mass += destination * poisson_mass(count, self.rates[rate] * exposure);
                 }
@@ -769,16 +828,134 @@ impl ArrivalFactor {
     }
 }
 
-fn normalize<const N: usize>(mut values: [f64; N]) -> [f64; N] {
-    let total = values.iter().sum::<f64>();
-    for value in &mut values {
-        *value /= total;
-    }
-    values
+const fn cell(hazard: usize, reset: usize, rate: usize, rate_count: usize) -> usize {
+    (hazard * RESET_COUNT + reset) * rate_count + rate
 }
 
-const fn cell(hazard: usize, reset: usize, rate: usize) -> usize {
-    (hazard * RESET_COUNT + reset) * RATE_COUNT + rate
+fn derive_hazard_grid(mean: f64, tail_limit: f64) -> Result<GridSpec, ArrivalPriorError> {
+    let distribution =
+        Gamma::new(HAZARD_SHAPE, HAZARD_SHAPE).map_err(|_| ArrivalPriorError::InvalidChangeRate)?;
+    let low = mean * distribution.inverse_cdf(tail_limit);
+    let high = mean * distribution.inverse_cdf(1.0_f64 - tail_limit);
+    let intervals =
+        ((high / low).ln() / (E * HAZARD_TRANSITION_PROBABILITY_ERROR_MAX)).ceil() as usize;
+    Ok(GridSpec {
+        low,
+        log_step: log_step(low, high, intervals)?,
+        count: intervals
+            .checked_add(1)
+            .ok_or(ArrivalPriorError::ArithmeticOverflow)?,
+    })
+}
+
+fn derive_rate_grid(shape: f64, mean: f64, tail_limit: f64) -> Result<GridSpec, ArrivalPriorError> {
+    let (low, high) = rate_window(shape, mean, tail_limit)?;
+    let intervals = ((high / low).ln() / (2.0_f64 * EPSILON_GRID.ln_1p())).ceil() as usize;
+    Ok(GridSpec {
+        low,
+        log_step: log_step(low, high, intervals)?,
+        count: intervals
+            .checked_add(1)
+            .ok_or(ArrivalPriorError::ArithmeticOverflow)?,
+    })
+}
+
+fn arrival_artifact_budget(cell_count: usize) -> Result<PriorArtifactBudget, ArrivalPriorError> {
+    let operations = 7_usize
+        .checked_mul(cell_count)
+        .ok_or(ArrivalPriorError::ArithmeticOverflow)?;
+    Ok(PriorArtifactBudget::new(
+        u32::try_from(cell_count).map_err(|_| ArrivalPriorError::ArithmeticOverflow)?,
+        STORAGE_BUDGET_BYTES as u64,
+        u64::try_from(operations).map_err(|_| ArrivalPriorError::ArithmeticOverflow)?,
+        EPSILON_BOUNDARY,
+        0.0_f64,
+        EPSILON_GRID.max(HAZARD_TRANSITION_PROBABILITY_ERROR_MAX),
+    ))
+}
+
+fn cell_count(hazard_count: usize, rate_count: usize) -> Result<usize, ArrivalPriorError> {
+    hazard_count
+        .checked_mul(RESET_COUNT)
+        .and_then(|count| count.checked_mul(rate_count))
+        .ok_or(ArrivalPriorError::ArithmeticOverflow)
+}
+
+fn log_step(low: f64, high: f64, interval_count: usize) -> Result<f64, ArrivalPriorError> {
+    let intervals = u32::try_from(interval_count)
+        .map(f64::from)
+        .map_err(|_| ArrivalPriorError::ArithmeticOverflow)?;
+    Ok((high.ln() - low.ln()) / intervals)
+}
+
+fn geometric_grid(low: f64, log_step: f64, count: usize) -> Box<[f64]> {
+    (0..count)
+        .map(|index| {
+            let index = u32::try_from(index).map_or(u32::MAX, |value| value);
+            (low.ln() + f64::from(index) * log_step).exp()
+        })
+        .collect()
+}
+
+fn geometric_lower(values: &[f64], index: usize) -> f64 {
+    (values[index - 1] * values[index]).sqrt()
+}
+
+fn geometric_upper(values: &[f64], index: usize) -> f64 {
+    (values[index] * values[index + 1]).sqrt()
+}
+
+fn rate_window(shape: f64, mean: f64, tail_limit: f64) -> Result<(f64, f64), ArrivalPriorError> {
+    let mut low = f64::INFINITY;
+    let mut high = 0.0_f64;
+    for density_shape in [shape, shape * 0.5_f64, shape, shape * 2.0_f64] {
+        let distribution =
+            Gamma::new(density_shape, density_shape).map_err(|_| ArrivalPriorError::InvalidRate)?;
+        low = low.min(mean * distribution.inverse_cdf(tail_limit));
+        high = high.max(mean * distribution.inverse_cdf(1.0_f64 - tail_limit));
+    }
+    while [shape, shape * 0.5_f64, shape, shape * 2.0_f64]
+        .into_iter()
+        .any(|density_shape| gamma_lr(density_shape, density_shape * low / mean) > tail_limit)
+    {
+        low *= 0.5_f64;
+    }
+    while [shape, shape * 0.5_f64, shape, shape * 2.0_f64]
+        .into_iter()
+        .any(|density_shape| gamma_ur(density_shape, density_shape * high / mean) > tail_limit)
+    {
+        high *= 2.0_f64;
+    }
+    if !low.is_finite() || low <= 0.0_f64 || !high.is_finite() || high <= low {
+        return Err(ArrivalPriorError::InvalidRate);
+    }
+    Ok((low, high))
+}
+
+fn exact_gamma_masses(values: &[f64], shape: f64, mean: f64) -> Box<[f64]> {
+    (0..values.len())
+        .map(|index| {
+            let lower = if index == 0 {
+                0.0_f64
+            } else {
+                geometric_lower(values, index)
+            };
+            let upper = if index + 1 == values.len() {
+                f64::INFINITY
+            } else {
+                geometric_upper(values, index)
+            };
+            if index == 0 {
+                gamma_lr(shape, shape * upper / mean)
+            } else if index + 1 == values.len() {
+                gamma_ur(shape, shape * lower / mean)
+            } else if values[index] <= mean {
+                gamma_lr(shape, shape * upper / mean) - gamma_lr(shape, shape * lower / mean)
+            } else {
+                gamma_ur(shape, shape * lower / mean) - gamma_ur(shape, shape * upper / mean)
+            }
+        })
+        .collect()
 }
 
 fn sample_discrete(probability: &[f64], random: &mut RandomStream) -> usize {
@@ -800,19 +977,21 @@ fn poisson_mass(count: u32, mean: f64) -> f64 {
 fn arrival_coverage(
     shape: f64,
     mean: f64,
-    rates: &[f64; RATE_COUNT],
-    hazards: &[f64; HAZARD_COUNT],
-) -> Result<([PriorCoverageRecord; RESET_COUNT + 1], usize), ArrivalPriorError> {
+    rates: &[f64],
+    hazards: &[f64],
+    hazard_mean: f64,
+    achieved_rate_error: f64,
+) -> Result<([PriorCoverageRecord; RESET_COUNT + 2], usize), ArrivalPriorError> {
     let mut coverage =
-        [PriorCoverageRecord::new(0.0_f64, 1.0_f64, 0.0_f64, 0.0_f64, 0.0_f64); RESET_COUNT + 1];
+        [PriorCoverageRecord::new(0.0_f64, 1.0_f64, 0.0_f64, 0.0_f64, 0.0_f64); RESET_COUNT + 2];
     for (record, reset_shape) in coverage
         .iter_mut()
         .zip([shape * 0.5_f64, shape, shape * 2.0_f64])
     {
         let distribution =
             Gamma::new(reset_shape, reset_shape).map_err(|_| ArrivalPriorError::InvalidRate)?;
-        let lower_endpoint = rates[0] / 2.0_f64.powf(0.125_f64);
-        let upper_endpoint = rates[RATE_COUNT - 1] * 2.0_f64.powf(0.125_f64);
+        let lower_endpoint = rates[0];
+        let upper_endpoint = rates[rates.len() - 1];
         let lower_tail = distribution.cdf(lower_endpoint / mean);
         let upper_tail = gamma_ur(reset_shape, reset_shape * upper_endpoint / mean);
         if !lower_tail.is_finite() || !upper_tail.is_finite() {
@@ -826,10 +1005,30 @@ fn arrival_coverage(
             upper_endpoint,
             lower_tail,
             upper_tail,
-            EPSILON_GRID,
+            achieved_rate_error,
         );
     }
-    let maximum_mean = hazards[HAZARD_COUNT - 1] * T_MAX_SECONDS;
+    let hazard_lower_endpoint = hazards[0];
+    let hazard_upper_endpoint = hazards[hazards.len() - 1];
+    let hazard_lower_tail = gamma_lr(
+        HAZARD_SHAPE,
+        HAZARD_SHAPE * hazard_lower_endpoint / hazard_mean,
+    );
+    let hazard_upper_tail = gamma_ur(
+        HAZARD_SHAPE,
+        HAZARD_SHAPE * hazard_upper_endpoint / hazard_mean,
+    );
+    if hazard_lower_tail + hazard_upper_tail > EPSILON_BOUNDARY {
+        return Err(ArrivalPriorError::HazardTailMass);
+    }
+    coverage[RESET_COUNT] = PriorCoverageRecord::new(
+        hazard_lower_endpoint,
+        hazard_upper_endpoint,
+        hazard_lower_tail,
+        hazard_upper_tail,
+        HAZARD_TRANSITION_PROBABILITY_ERROR_MAX,
+    );
+    let maximum_mean = hazards[hazards.len() - 1] * T_MAX_SECONDS;
     let path_change_bound = poisson_tail_bound(maximum_mean, EPSILON_PATH)?;
     let path_change_bound_u32 =
         u32::try_from(path_change_bound).map_err(|_| ArrivalPriorError::InvalidPathBound {
@@ -842,7 +1041,7 @@ fn arrival_coverage(
             maximum: PATH_SEGMENT_LIMIT,
         })?;
     let path_tail = 1.0_f64 - path_distribution.cdf(u64::from(path_change_bound_u32));
-    coverage[RESET_COUNT] = PriorCoverageRecord::new(
+    coverage[RESET_COUNT + 1] = PriorCoverageRecord::new(
         0.0_f64,
         f64::from(path_change_bound_u32),
         0.0_f64,
@@ -986,6 +1185,9 @@ pub enum ArrivalPriorError {
     /// The continuous reset prior has too much mass outside the rate grid.
     #[error("arrival reset prior exceeds the boundary-mass budget")]
     BoundaryMass,
+    /// The continuous hazard prior has too much mass outside the hazard grid.
+    #[error("arrival hazard prior exceeds the boundary-mass budget")]
+    HazardTailMass,
 }
 
 /// Failure from an exact arrival-count prediction.
