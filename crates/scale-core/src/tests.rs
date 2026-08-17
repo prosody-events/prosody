@@ -130,8 +130,9 @@ fn admissible_closure_is_horizon_invariant(work_seed: u16, capacity_seed: u8) ->
     );
     let first_late = first.late_area + first.terminal_late_area;
     let second_late = second.late_area + second.terminal_late_area;
-    let first_resource = terminal_replica_seconds(2_000_000, first.drain_seconds, 3_000_000, 1);
-    let second_resource = terminal_replica_seconds(3_000_000, second.drain_seconds, 3_000_000, 1);
+    let first_resource = terminal_replica_seconds(0, 2_000_000, first.drain_seconds, 3_000_000, 1);
+    let second_resource =
+        terminal_replica_seconds(0, 3_000_000, second.drain_seconds, 3_000_000, 1);
 
     close_relative(first_late, second_late) && close_relative(first_resource, second_resource)
 }
@@ -1680,9 +1681,9 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
     let exact_loss = 0.25_f64 * low_knee_late_area / 75.0_f64;
 
     assert!(
-        (apply.diagnostics.expected_loss - exact_loss).abs() < 1.0e-5_f64,
+        (apply.diagnostics.miss_delay_fraction - exact_loss).abs() < 1.0e-5_f64,
         "actual={}, exact={exact_loss}",
-        apply.diagnostics.expected_loss
+        apply.diagnostics.miss_delay_fraction
     );
     assert!(close_relative(
         apply.diagnostics.saturation_probability,
@@ -1735,13 +1736,10 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
-    let mut losses = [0.0_f64; 2];
-    scratch.write_decision_expected_losses(&mut losses)?;
-    assert!(
-        losses.iter().all(|loss| *loss > 0.0_f64),
-        "losses={losses:?}"
-    );
-    assert!(apply.diagnostics.shortfall > 0.0_f64);
+    let mut costs = [0.0_f64; 2];
+    scratch.write_decision_expected_costs(&mut costs)?;
+    assert!(costs.iter().all(|cost| *cost > 0.0_f64), "costs={costs:?}");
+    assert!(apply.diagnostics.miss_delay_fraction > 0.0_f64);
     Ok(())
 }
 
@@ -1859,7 +1857,7 @@ fn predictive_arrivals_consume_service_while_debt_drains() -> Result<(), TestErr
 }
 
 #[test]
-fn decision_curve_contains_the_selected_expected_loss() -> Result<(), TestError> {
+fn decision_curve_contains_the_selected_expected_cost() -> Result<(), TestError> {
     let configuration = configuration()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
     let mut scratch = state.new_scratch()?;
@@ -1881,12 +1879,12 @@ fn decision_curve_contains_the_selected_expected_loss() -> Result<(), TestError>
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
-    let mut losses = vec![0.0_f64; scratch.decision_candidate_count()];
-    scratch.write_decision_expected_losses(&mut losses)?;
+    let mut costs = vec![0.0_f64; scratch.decision_candidate_count()];
+    scratch.write_decision_expected_costs(&mut costs)?;
 
     assert!(close_relative(
-        losses[apply.target as usize - 1],
-        apply.diagnostics.expected_loss,
+        costs[apply.target as usize - 1],
+        apply.diagnostics.expected_cost,
     ));
     Ok(())
 }
@@ -2068,7 +2066,7 @@ fn one_hot_partition_cannot_claim_capacity_from_other_replicas() -> Result<(), T
         return Err(TestError::UnexpectedHold);
     };
     assert_eq!(apply.target, 1);
-    assert!(apply.diagnostics.shortfall > 0.0_f64);
+    assert!(apply.diagnostics.miss_delay_fraction > 0.0_f64);
     Ok(())
 }
 
@@ -2103,13 +2101,10 @@ fn wide_cohort_cannot_hide_one_hot_partition_deadline() -> Result<(), TestError>
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
-    let mut losses = [0.0_f64; 32];
-    scratch.write_decision_expected_losses(&mut losses)?;
-    assert!(
-        losses.iter().all(|loss| *loss > 0.0_f64),
-        "losses={losses:?}"
-    );
-    assert!(apply.diagnostics.shortfall > 0.0_f64);
+    let mut costs = [0.0_f64; 32];
+    scratch.write_decision_expected_costs(&mut costs)?;
+    assert!(costs.iter().all(|cost| *cost > 0.0_f64), "costs={costs:?}");
+    assert!(apply.diagnostics.miss_delay_fraction > 0.0_f64);
     Ok(())
 }
 
@@ -2300,8 +2295,8 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
     let apply = apply.ok_or(TestError::MissingDecisionCurve)?;
     let selected =
         usize::try_from(apply.target - 1).map_err(|_| ConfigurationError::PlatformLimit)?;
-    let mut losses = vec![0.0_f64; scratch.decision_candidate_count()];
-    scratch.write_decision_expected_losses(&mut losses)?;
+    let mut costs = vec![0.0_f64; scratch.decision_candidate_count()];
+    scratch.write_decision_expected_costs(&mut costs)?;
     let summary = scratch
         .decision_column_summary(selected)
         .ok_or(TestError::MissingDecisionCurve)?;
@@ -2315,7 +2310,7 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
     );
     // The anti-scaling wall stays gone: one step above the demand floor
     // costs less expected delay than holding at it.
-    assert!(losses[2] <= losses[1], "losses={:?}", &losses[..8]);
+    assert!(costs[2] <= costs[1], "costs={:?}", &costs[..8]);
     Ok(())
 }
 

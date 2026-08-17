@@ -514,8 +514,8 @@ fn retry_outcomes_increase_loss_without_creating_physical_saturation()
         .any(|index| {
             failed
                 .controller()
-                .decision_expected_losses(index)
-                .zip(healthy.controller().decision_expected_losses(index))
+                .decision_expected_costs(index)
+                .zip(healthy.controller().decision_expected_costs(index))
                 .is_some_and(|(failed, healthy)| failed[0] > healthy[0] + 1.0e-9_f64)
         });
 

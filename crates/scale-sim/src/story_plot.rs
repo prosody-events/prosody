@@ -413,10 +413,10 @@ fn latency_panel(trace: &MetricTrace, budget_seconds: f64) -> StoryPanel {
 
 fn risk_panel(trace: &MetricTrace, allowed_miss_fraction: f64) -> StoryPanel {
     StoryPanel::new(
-        "expected loss (events)",
+        "expected cost (event-delay-seconds)",
         vec![
             metric_f64(trace, "realized misses", &trace.miss_fraction),
-            metric_f64(trace, "expected loss", &trace.expected_loss),
+            metric_f64(trace, "expected cost", &trace.expected_cost),
             metric_f64(
                 trace,
                 "saturation probability",
@@ -594,7 +594,7 @@ fn reliability_evidence_panel(trace: &MetricTrace) -> StoryPanel {
 
 fn decision_loss_panel(trace: &MetricTrace, controller: &ControllerTrace) -> StoryPanel {
     StoryPanel::new(
-        "replicas; light color means more expected loss",
+        "replicas; light color means more expected cost",
         vec![
             metric_u32(trace, "actual", &trace.replicas).step(),
             metric_u32(trace, "selected target", &trace.target).points(),
@@ -651,7 +651,7 @@ fn decision_deadline_satisfaction_heatmap(controller: &ControllerTrace) -> Poste
 }
 
 fn decision_loss_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
-    let Some(first) = controller.decision_expected_losses(0) else {
+    let Some(first) = controller.decision_expected_costs(0) else {
         return PosteriorHeatmap {
             at_micros: Vec::new(),
             values: Vec::new(),
@@ -663,21 +663,21 @@ fn decision_loss_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
         .map(|(replicas, _)| f64::from(replicas))
         .collect();
     let mut at_micros = Vec::with_capacity(controller.len());
-    let mut expected_losses = Vec::with_capacity(controller.len().saturating_mul(first.len()));
+    let mut expected_costs = Vec::with_capacity(controller.len().saturating_mul(first.len()));
     for index in 0..controller.len() {
         let Some(sample) = controller.sample(index) else {
             continue;
         };
-        let Some(losses) = controller.decision_expected_losses(index) else {
+        let Some(costs) = controller.decision_expected_costs(index) else {
             continue;
         };
         at_micros.push(sample.at_micros);
-        expected_losses.extend_from_slice(losses);
+        expected_costs.extend_from_slice(costs);
     }
     PosteriorHeatmap {
         at_micros,
         values,
-        probabilities: expected_losses,
+        probabilities: expected_costs,
     }
 }
 

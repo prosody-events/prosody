@@ -105,7 +105,7 @@ const STORY_FIGURES: [FlowFigure; 19] = [
     FlowFigure::new(
         "Decision loss by replica candidate",
         "17-decision-loss.svg",
-        "Dark cells have low expected loss. Light cells have high expected loss. The lines show \
+        "Dark cells have low expected cost. Light cells have high expected cost. The lines show \
          the selected target, saturation cap, and actual replicas.",
     ),
     FlowFigure::new(
@@ -1314,10 +1314,10 @@ fn placement_constraint_binds(controller: &ControllerTrace) -> bool {
         let Some(sample) = controller.sample(index) else {
             return false;
         };
-        let Some(losses) = controller.decision_expected_losses(index) else {
+        let Some(costs) = controller.decision_expected_costs(index) else {
             return false;
         };
-        let Some((&one_replica, &maximum_replicas)) = losses.first().zip(losses.last()) else {
+        let Some((&one_replica, &maximum_replicas)) = costs.first().zip(costs.last()) else {
             return false;
         };
         !sample.hold
@@ -1877,7 +1877,7 @@ const fn situation(regime: PrincipalRegime) -> &'static str {
         }
         PrincipalRegime::ReplicaCeiling => {
             "Demand requires more replicas than configuration permits. The ceiling makes some \
-             shortfall unavoidable."
+             deadline miss unavoidable."
         }
         PrincipalRegime::HistoricalMatch => {
             "Current demand matches the historical reference. History and live evidence agree."
@@ -1952,7 +1952,7 @@ const fn question(regime: PrincipalRegime) -> &'static str {
             "does replacement restore the prior and then update from evidence?"
         }
         PrincipalRegime::ReplicaCeiling => {
-            "does the decision expose shortfall when the replica ceiling binds?"
+            "does the decision expose missed delay when the replica ceiling binds?"
         }
         PrincipalRegime::HistoricalMatch => {
             "does matching live evidence support the historical forecast?"
@@ -2024,7 +2024,7 @@ const fn expectation(regime: PrincipalRegime) -> &'static str {
             "show prior restoration followed by evidence-driven contraction."
         }
         PrincipalRegime::ReplicaCeiling => {
-            "bind at the ceiling and report residual decision shortfall."
+            "bind at the ceiling and report the residual missed delay."
         }
         PrincipalRegime::HistoricalMatch => {
             "combine compatible historical and live evidence without a large correction."

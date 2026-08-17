@@ -62,10 +62,10 @@ pub struct ControllerSample {
     pub hold: bool,
     /// Typed Hold reason. Apply decisions have no reason.
     pub hold_reason: Option<HoldReason>,
-    /// Largest fractional resource shortfall.
-    pub shortfall: f64,
-    /// Posterior expected fractional loss.
-    pub expected_loss: f64,
+    /// Posterior expected cost at the selected target.
+    pub expected_cost: f64,
+    /// Posterior expected delay as a fraction of the deadline budget.
+    pub miss_delay_fraction: f64,
     /// Selected action late-area sum.
     pub selected_late_area_mean: f64,
     /// Selected action replica-seconds sum.
@@ -300,8 +300,8 @@ pub struct ControllerTrace {
     cap: Vec<u32>,
     hold: Vec<bool>,
     hold_reason: Vec<Option<HoldReason>>,
-    shortfall: Vec<f64>,
-    expected_loss: Vec<f64>,
+    expected_cost: Vec<f64>,
+    miss_delay_fraction: Vec<f64>,
     selected_late_area_mean: Vec<f64>,
     selected_replica_seconds_mean: Vec<f64>,
     selected_cost: Vec<f64>,
@@ -375,7 +375,7 @@ pub struct ControllerTrace {
     arrival_prior_probabilities: Vec<f64>,
     arrival_posterior_probabilities: Vec<f64>,
     decision_candidate_count: usize,
-    decision_expected_losses: Vec<f64>,
+    decision_expected_costs: Vec<f64>,
     decision_deadline_satisfaction_probabilities: Vec<f64>,
     decision_deadline_rejections: Vec<f64>,
     decision_placement_rejections: Vec<f64>,
@@ -650,8 +650,8 @@ impl ControllerTrace {
             cap: Vec::with_capacity(capacity),
             hold: Vec::with_capacity(capacity),
             hold_reason: Vec::with_capacity(capacity),
-            shortfall: Vec::with_capacity(capacity),
-            expected_loss: Vec::with_capacity(capacity),
+            expected_cost: Vec::with_capacity(capacity),
+            miss_delay_fraction: Vec::with_capacity(capacity),
             selected_late_area_mean: Vec::with_capacity(capacity),
             selected_replica_seconds_mean: Vec::with_capacity(capacity),
             selected_cost: Vec::with_capacity(capacity),
@@ -725,7 +725,7 @@ impl ControllerTrace {
             arrival_prior_probabilities: posterior.arrival_prior,
             arrival_posterior_probabilities: Vec::with_capacity(posterior.arrival_cell_count),
             decision_candidate_count: posterior.decision_candidate_count,
-            decision_expected_losses: Vec::with_capacity(posterior.decision_cell_count),
+            decision_expected_costs: Vec::with_capacity(posterior.decision_cell_count),
             decision_deadline_satisfaction_probabilities: Vec::with_capacity(
                 posterior.decision_cell_count,
             ),
@@ -763,8 +763,8 @@ impl ControllerTrace {
             cap: self.cap[index],
             hold: self.hold[index],
             hold_reason: self.hold_reason[index],
-            shortfall: self.shortfall[index],
-            expected_loss: self.expected_loss[index],
+            expected_cost: self.expected_cost[index],
+            miss_delay_fraction: self.miss_delay_fraction[index],
             selected_late_area_mean: self.selected_late_area_mean[index],
             selected_replica_seconds_mean: self.selected_replica_seconds_mean[index],
             selected_cost: self.selected_cost[index],
@@ -923,12 +923,12 @@ impl ControllerTrace {
         self.discrete_posterior(query)?.posterior(index)
     }
 
-    /// Returns the expected loss for each replica candidate at one decision.
+    /// Returns the expected cost for each replica candidate at one decision.
     #[must_use]
-    pub fn decision_expected_losses(&self, index: usize) -> Option<&[f64]> {
+    pub fn decision_expected_costs(&self, index: usize) -> Option<&[f64]> {
         let start = index.checked_mul(self.decision_candidate_count)?;
         let end = start.checked_add(self.decision_candidate_count)?;
-        self.decision_expected_losses.get(start..end)
+        self.decision_expected_costs.get(start..end)
     }
 
     /// Returns the absolute deadline-satisfaction probability for each
@@ -1061,7 +1061,7 @@ impl ControllerTrace {
             trace.target[metric_index] = self.target[controller_index];
             trace.cap[metric_index] = self.cap[controller_index];
             trace.hold[metric_index] = self.hold[controller_index];
-            trace.expected_loss[metric_index] = self.expected_loss[controller_index];
+            trace.expected_cost[metric_index] = self.expected_cost[controller_index];
             trace.prediction_median[metric_index] = f64::NAN;
             trace.resource_concurrency[metric_index] = self.resource_concurrency[controller_index];
             trace.attempt_throughput_per_second[metric_index] =
@@ -1111,8 +1111,8 @@ impl ControllerTrace {
         self.cap.push(sample.cap);
         self.hold.push(sample.hold);
         self.hold_reason.push(sample.hold_reason);
-        self.shortfall.push(sample.shortfall);
-        self.expected_loss.push(sample.expected_loss);
+        self.expected_cost.push(sample.expected_cost);
+        self.miss_delay_fraction.push(sample.miss_delay_fraction);
         self.arrival_rate_per_second
             .push(sample.arrival_rate_per_second);
         match sample.arrival_evidence {
@@ -1284,21 +1284,21 @@ impl ControllerTrace {
     }
 
     fn push_decision_curves(&mut self, scratch: &ScaleScratch) -> Result<(), PlantError> {
-        let decision_start = self.decision_expected_losses.len();
+        let decision_start = self.decision_expected_costs.len();
         let decision_end = decision_start
             .checked_add(self.decision_candidate_count)
             .ok_or(PlantError::PlatformLimit)?;
-        if decision_end > self.decision_expected_losses.capacity() {
+        if decision_end > self.decision_expected_costs.capacity() {
             return Err(PlantError::MetricCapacity);
         }
-        self.decision_expected_losses.resize(decision_end, f64::NAN);
+        self.decision_expected_costs.resize(decision_end, f64::NAN);
         if decision_end > self.decision_deadline_satisfaction_probabilities.capacity() {
             return Err(PlantError::MetricCapacity);
         }
         self.decision_deadline_satisfaction_probabilities
             .resize(decision_end, f64::NAN);
-        match scratch.write_decision_expected_losses(
-            &mut self.decision_expected_losses[decision_start..decision_end],
+        match scratch.write_decision_expected_costs(
+            &mut self.decision_expected_costs[decision_start..decision_end],
         ) {
             Ok(()) | Err(prosody_scale_core::DecisionCurveError::Unavailable) => {}
             Err(error) => return Err(error.into()),
@@ -2457,8 +2457,8 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             cap,
             hold,
             hold_reason,
-            shortfall: diagnostics.shortfall,
-            expected_loss: diagnostics.expected_loss,
+            expected_cost: diagnostics.expected_cost,
+            miss_delay_fraction: diagnostics.miss_delay_fraction,
             selected_late_area_mean: f64::NAN,
             selected_replica_seconds_mean: f64::NAN,
             selected_cost: f64::NAN,

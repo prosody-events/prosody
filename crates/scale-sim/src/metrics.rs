@@ -95,7 +95,7 @@ pub struct MetricPoint {
     /// Time since the last adverse transition.
     pub recovery_micros: u64,
     /// Posterior expected fractional loss.
-    pub expected_loss: f64,
+    pub expected_cost: f64,
     /// Posterior expected one-replica scale-up lead time.
     pub lead_time_up_seconds: f64,
     /// Posterior expected one-replica scale-down lead time.
@@ -160,7 +160,7 @@ impl MetricPoint {
             missing_reporters: 0,
             scale_actions: 0,
             recovery_micros: 0,
-            expected_loss: 0.0_f64,
+            expected_cost: 0.0_f64,
             lead_time_up_seconds: 0.0_f64,
             lead_time_down_seconds: 0.0_f64,
             lead_time_seconds: 0.0_f64,
@@ -221,7 +221,7 @@ pub struct MetricTrace {
     pub(crate) missing_reporters: Vec<u32>,
     pub(crate) scale_actions: Vec<u32>,
     pub(crate) recovery_micros: Vec<u64>,
-    pub(crate) expected_loss: Vec<f64>,
+    pub(crate) expected_cost: Vec<f64>,
     pub(crate) lead_time_up_seconds: Vec<f64>,
     pub(crate) lead_time_down_seconds: Vec<f64>,
     pub(crate) lead_time_seconds: Vec<f64>,
@@ -292,7 +292,7 @@ impl MetricTrace {
             missing_reporters: Vec::with_capacity(capacity),
             scale_actions: Vec::with_capacity(capacity),
             recovery_micros: Vec::with_capacity(capacity),
-            expected_loss: Vec::with_capacity(capacity),
+            expected_cost: Vec::with_capacity(capacity),
             lead_time_up_seconds: Vec::with_capacity(capacity),
             lead_time_down_seconds: Vec::with_capacity(capacity),
             lead_time_seconds: Vec::with_capacity(capacity),
@@ -370,7 +370,7 @@ impl MetricTrace {
         self.missing_reporters.push(point.missing_reporters);
         self.scale_actions.push(point.scale_actions);
         self.recovery_micros.push(point.recovery_micros);
-        self.expected_loss.push(point.expected_loss);
+        self.expected_cost.push(point.expected_cost);
         self.lead_time_up_seconds.push(point.lead_time_up_seconds);
         self.lead_time_down_seconds
             .push(point.lead_time_down_seconds);
@@ -442,7 +442,7 @@ impl MetricTrace {
             missing_reporters: self.missing_reporters[index],
             scale_actions: self.scale_actions[index],
             recovery_micros: self.recovery_micros[index],
-            expected_loss: self.expected_loss[index],
+            expected_cost: self.expected_cost[index],
             lead_time_up_seconds: self.lead_time_up_seconds[index],
             lead_time_down_seconds: self.lead_time_down_seconds[index],
             lead_time_seconds: self.lead_time_seconds[index],

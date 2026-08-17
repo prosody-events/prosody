@@ -15,8 +15,8 @@ use crate::edf::{
 use crate::lead_time::{LaunchComponentSummary, LaunchTimeFactor, RebalanceTimeFactor};
 use crate::partition::PartitionFactor;
 use crate::planning::{
-    ActionColumns, complete_horizon_micros, replica_seconds, select_action, select_runner_up,
-    terminal_replica_seconds,
+    ActionColumns, billing_replica_seconds, complete_horizon_micros,
+    next_report_boundary_at_or_after, select_action, select_runner_up, terminal_replica_seconds,
 };
 use crate::reliability::{RELIABILITY_BIN_COUNT, ReliabilityFactor};
 use crate::types::{
@@ -545,13 +545,13 @@ pub struct ScaleScratch {
     partition_cohort_indexes: Vec<u32>,
     moved_partition_counts: Vec<u32>,
     posterior_missed_work_sums: Vec<f64>,
-    posterior_loss_sums: Vec<f64>,
+    posterior_miss_delay_fraction_sums: Vec<f64>,
     posterior_late_area_sums: Vec<f64>,
     posterior_replica_seconds_sums: Vec<f64>,
     posterior_supply_sums: Vec<f64>,
     class_masses: Vec<f64>,
     candidate_concurrency: Vec<f64>,
-    scenario_shortfall: Vec<f64>,
+    scenario_miss_delay_fraction: Vec<f64>,
     scenario_late_area: Vec<f64>,
     scenario_drain_seconds: Vec<f64>,
     scenario_replica_seconds: Vec<f64>,
@@ -703,7 +703,7 @@ struct ScenarioColumns<'a> {
     candidate_stride: usize,
     path_stride: usize,
     supply: &'a mut [f64],
-    shortfall: &'a mut [f64],
+    miss_delay_fraction: &'a mut [f64],
     late_area: &'a mut [f64],
     drain_seconds: &'a mut [f64],
     missed_work: &'a mut [f64],
@@ -719,7 +719,7 @@ struct ScenarioColumns<'a> {
 /// One scenario's output cells.
 struct ScenarioCells<'a> {
     supply: &'a mut [f64],
-    shortfall: &'a mut [f64],
+    miss_delay_fraction: &'a mut [f64],
     late_area: &'a mut [f64],
     drain_seconds: &'a mut [f64],
     missed_work: &'a mut [f64],
@@ -738,7 +738,8 @@ impl ScenarioColumns<'_> {
         let cell = scenario * self.candidate_stride;
         let path_cell = scenario * self.path_stride;
         let (left_supply, right_supply) = self.supply.split_at_mut(cell);
-        let (left_shortfall, right_shortfall) = self.shortfall.split_at_mut(cell);
+        let (left_miss_delay_fraction, right_miss_delay_fraction) =
+            self.miss_delay_fraction.split_at_mut(cell);
         let (left_late_area, right_late_area) = self.late_area.split_at_mut(cell);
         let (left_drain, right_drain) = self.drain_seconds.split_at_mut(cell);
         let (left_missed, right_missed) = self.missed_work.split_at_mut(cell);
@@ -759,7 +760,7 @@ impl ScenarioColumns<'_> {
                 candidate_stride: self.candidate_stride,
                 path_stride: self.path_stride,
                 supply: left_supply,
-                shortfall: left_shortfall,
+                miss_delay_fraction: left_miss_delay_fraction,
                 late_area: left_late_area,
                 drain_seconds: left_drain,
                 missed_work: left_missed,
@@ -777,7 +778,7 @@ impl ScenarioColumns<'_> {
                 candidate_stride: self.candidate_stride,
                 path_stride: self.path_stride,
                 supply: right_supply,
-                shortfall: right_shortfall,
+                miss_delay_fraction: right_miss_delay_fraction,
                 late_area: right_late_area,
                 drain_seconds: right_drain,
                 missed_work: right_missed,
@@ -800,7 +801,7 @@ impl ScenarioColumns<'_> {
         let path_last = path_first + self.path_stride;
         ScenarioCells {
             supply: &mut self.supply[first..last],
-            shortfall: &mut self.shortfall[first..last],
+            miss_delay_fraction: &mut self.miss_delay_fraction[first..last],
             late_area: &mut self.late_area[first..last],
             drain_seconds: &mut self.drain_seconds[first..last],
             missed_work: &mut self.missed_work[first..last],
@@ -846,13 +847,16 @@ impl ScratchBounds {
             partition_count,
             partition_offset_count,
             replica_count_max,
-            // Each candidate holds its own transition events plus at most
-            // one strictly-increasing repair for every replica target.
+            // Each candidate can hold at most two fixed events per replica,
+            // one requested event, and one repair per arrival path segment.
             trajectory_event_count_max: replica_count_max
                 .checked_mul(
                     replica_count_max
                         .checked_mul(2)
                         .and_then(|events| events.checked_add(1))
+                        .and_then(|events| {
+                            events.checked_add(configuration.arrival_prior.path_segment_count_max())
+                        })
                         .ok_or(ConfigurationError::PlatformLimit)?,
                 )
                 .ok_or(ConfigurationError::PlatformLimit)?,
@@ -941,13 +945,13 @@ impl ScaleScratch {
             partition_cohort_indexes: vec![0; work_cohort_count_max],
             moved_partition_counts,
             posterior_missed_work_sums: vec![0.0_f64; replica_count_max],
-            posterior_loss_sums: vec![0.0_f64; replica_count_max],
+            posterior_miss_delay_fraction_sums: vec![0.0_f64; replica_count_max],
             posterior_late_area_sums: vec![0.0_f64; replica_count_max],
             posterior_replica_seconds_sums: vec![0.0_f64; replica_count_max],
             posterior_supply_sums: vec![0.0_f64; replica_count_max],
             class_masses: vec![0.0_f64; capacity_class_count],
             candidate_concurrency,
-            scenario_shortfall: vec![0.0_f64; scenario_cell_count],
+            scenario_miss_delay_fraction: vec![0.0_f64; scenario_cell_count],
             scenario_late_area: vec![0.0_f64; scenario_cell_count],
             scenario_drain_seconds: vec![0.0_f64; scenario_cell_count],
             scenario_replica_seconds: vec![0.0_f64; scenario_cell_count],
@@ -972,7 +976,7 @@ impl ScaleScratch {
     /// Returns the fixed number of replica candidates.
     #[must_use]
     pub fn decision_candidate_count(&self) -> usize {
-        self.posterior_loss_sums.len()
+        self.posterior_miss_delay_fraction_sums.len()
     }
 
     /// Returns bounded scalar columns for the selected and runner-up actions.
@@ -1005,7 +1009,7 @@ impl ScaleScratch {
         if self.active_inner_count < 2 {
             return f64::NAN;
         }
-        let stride = self.posterior_loss_sums.len();
+        let stride = self.posterior_miss_delay_fraction_sums.len();
         let count = u32::try_from(self.active_inner_count).map_or(f64::INFINITY, f64::from);
         let mut variance = 0.0_f64;
         for class in 0..self.class_masses.len() {
@@ -1047,7 +1051,7 @@ impl ScaleScratch {
         }
     }
 
-    /// Writes the expected normalized loss for each candidate.
+    /// Writes the expected cost for each candidate.
     ///
     /// Candidate index zero represents one replica. The last index represents
     /// the configured replica limit.
@@ -1055,24 +1059,25 @@ impl ScaleScratch {
     /// # Errors
     ///
     /// Returns an error for an invalid buffer or an unavailable decision.
-    pub fn write_decision_expected_losses(
+    pub fn write_decision_expected_costs(
         &self,
-        expected_losses: &mut [f64],
+        expected_costs: &mut [f64],
     ) -> Result<(), DecisionCurveError> {
-        if expected_losses.len() != self.posterior_loss_sums.len() {
+        if expected_costs.len() != self.posterior_miss_delay_fraction_sums.len() {
             return Err(DecisionCurveError::BufferLength {
-                expected: self.posterior_loss_sums.len(),
+                expected: self.posterior_miss_delay_fraction_sums.len(),
             });
         }
         if self.decision_curve_sample_count == 0 {
             return Err(DecisionCurveError::Unavailable);
         }
         let action_count = decision_action_count(self);
-        for (index, expected_loss) in expected_losses.iter_mut().enumerate() {
+        for (index, expected_cost) in expected_costs.iter_mut().enumerate() {
             if index < action_count {
-                *expected_loss = self.posterior_loss_sums[index];
+                *expected_cost = self.posterior_late_area_sums[index]
+                    + self.decision_rate * self.posterior_replica_seconds_sums[index];
             } else {
-                *expected_loss = f64::INFINITY;
+                *expected_cost = f64::INFINITY;
             }
         }
         Ok(())
@@ -1093,16 +1098,16 @@ impl ScaleScratch {
         reason: DecisionRejection,
         probabilities: &mut [f64],
     ) -> Result<(), DecisionCurveError> {
-        if probabilities.len() != self.posterior_loss_sums.len() {
+        if probabilities.len() != self.posterior_miss_delay_fraction_sums.len() {
             return Err(DecisionCurveError::BufferLength {
-                expected: self.posterior_loss_sums.len(),
+                expected: self.posterior_miss_delay_fraction_sums.len(),
             });
         }
         if self.decision_curve_sample_count == 0 {
             return Err(DecisionCurveError::Unavailable);
         }
         probabilities.fill(0.0_f64);
-        let candidate_count = self.posterior_loss_sums.len();
+        let candidate_count = self.posterior_miss_delay_fraction_sums.len();
         let action_count = decision_action_count(self);
         for scenario in 0..self.active_scenario_count {
             let inner_count =
@@ -1207,7 +1212,7 @@ fn select_target(
     prepare_partition_work(state, scratch);
     prepare_candidate_concurrency(state, scratch);
     scratch.posterior_missed_work_sums.fill(0.0_f64);
-    scratch.posterior_loss_sums.fill(0.0_f64);
+    scratch.posterior_miss_delay_fraction_sums.fill(0.0_f64);
     let scenario_count = state.configuration.posterior_sample_count;
     let class_count = state.capacity_classes.len() as u32;
     let inner_count = scenario_count / class_count;
@@ -1253,7 +1258,7 @@ fn evaluate_scenarios(
             .map(|&cell| state.capacity.curve_and_probability(cell).1)
             .sum();
     }
-    let candidate_stride = scratch.posterior_loss_sums.len();
+    let candidate_stride = scratch.posterior_miss_delay_fraction_sums.len();
     let path_stride = state.configuration.arrival_prior.path_segment_count_max();
     let action_count = decision_action_count(scratch);
     let worker_count = scratch.scenario_workspaces.len().min(scenario_total).max(1);
@@ -1265,7 +1270,8 @@ fn evaluate_scenarios(
         candidate_stride,
         path_stride,
         supply: &mut scratch.scenario_supply[..scenario_total * candidate_stride],
-        shortfall: &mut scratch.scenario_shortfall[..scenario_total * candidate_stride],
+        miss_delay_fraction: &mut scratch.scenario_miss_delay_fraction
+            [..scenario_total * candidate_stride],
         late_area: &mut scratch.scenario_late_area[..scenario_total * candidate_stride],
         drain_seconds: &mut scratch.scenario_drain_seconds[..scenario_total * candidate_stride],
         missed_work: &mut scratch.scenario_missed_work[..scenario_total * candidate_stride],
@@ -1486,7 +1492,7 @@ fn evaluate_scenario_outcome(
             arrival_path,
         },
         &mut workspace.edf,
-        &mut cells.shortfall[..shared.action_count],
+        &mut cells.miss_delay_fraction[..shared.action_count],
         &mut cells.drain_seconds[..shared.action_count],
         &mut cells.missed_work[..shared.action_count],
     );
@@ -1494,13 +1500,14 @@ fn evaluate_scenario_outcome(
     for candidate_index in 0..shared.action_count {
         let first = workspace.trajectory_offsets[candidate_index] as usize;
         let last = workspace.trajectory_offsets[candidate_index + 1] as usize;
-        cells.replica_seconds[candidate_index] = replica_seconds(
+        cells.replica_seconds[candidate_index] = billing_replica_seconds(
             start_seconds,
             planning_horizon_seconds,
             state.current_replicas,
             &workspace.trajectory.targets[first..last],
-            &workspace.trajectory.ready_seconds[first..last],
+            &workspace.trajectory.pause_seconds[first..last],
         ) + terminal_replica_seconds(
+            state.model_time.as_micros(),
             forecast.planning_horizon_micros,
             cells.drain_seconds[candidate_index],
             state.configuration.report_interval_micros,
@@ -1532,10 +1539,9 @@ fn expected_event_count(scratch: &ScaleScratch) -> f64 {
 
 /// Returns the planning and disturbance horizons for one scenario.
 ///
-/// The horizon covers the candidate transition and one reactive repair,
-/// every known deadline, and one budget past the last boundary. It does
-/// not depend on the candidate, so every action is judged over the same
-/// future.
+/// The horizon covers one report and two maximum transition spans. It also
+/// covers every known deadline and one budget after the last boundary. It does
+/// not depend on the candidate, so every action uses the same future.
 fn scenario_horizons(state: &ScaleState, cohorts: &WorkCohorts) -> (u64, u64) {
     let transition_span_seconds = state
         .configuration
@@ -1589,9 +1595,9 @@ fn sample_scenario_path(
 
 fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
     let candidate_count = decision_action_count(scratch);
-    let candidate_stride = scratch.posterior_loss_sums.len();
+    let candidate_stride = scratch.posterior_miss_delay_fraction_sums.len();
     scratch.posterior_missed_work_sums.fill(0.0_f64);
-    scratch.posterior_loss_sums.fill(0.0_f64);
+    scratch.posterior_miss_delay_fraction_sums.fill(0.0_f64);
     scratch.posterior_late_area_sums.fill(0.0_f64);
     scratch.posterior_replica_seconds_sums.fill(0.0_f64);
     scratch.posterior_supply_sums.fill(0.0_f64);
@@ -1611,9 +1617,13 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
                         simd,
                         &scratch.scenario_missed_work[cell..cell + S::f64s::N],
                     ) * S::f64s::splat(simd, cell_weight);
-            let loss = S::f64s::from_slice(simd, &scratch.posterior_loss_sums[target..last])
-                + S::f64s::from_slice(simd, &scratch.scenario_shortfall[cell..cell + S::f64s::N])
-                    * S::f64s::splat(simd, cell_weight);
+            let miss_delay_fraction = S::f64s::from_slice(
+                simd,
+                &scratch.posterior_miss_delay_fraction_sums[target..last],
+            ) + S::f64s::from_slice(
+                simd,
+                &scratch.scenario_miss_delay_fraction[cell..cell + S::f64s::N],
+            ) * S::f64s::splat(simd, cell_weight);
             let late_area =
                 S::f64s::from_slice(simd, &scratch.posterior_late_area_sums[target..last])
                     + S::f64s::from_slice(
@@ -1630,7 +1640,8 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
                 + S::f64s::from_slice(simd, &scratch.scenario_supply[cell..cell + S::f64s::N])
                     * S::f64s::splat(simd, cell_weight);
             missed.store_slice(&mut scratch.posterior_missed_work_sums[target..last]);
-            loss.store_slice(&mut scratch.posterior_loss_sums[target..last]);
+            miss_delay_fraction
+                .store_slice(&mut scratch.posterior_miss_delay_fraction_sums[target..last]);
             late_area.store_slice(&mut scratch.posterior_late_area_sums[target..last]);
             replica_seconds.store_slice(&mut scratch.posterior_replica_seconds_sums[target..last]);
             supply.store_slice(&mut scratch.posterior_supply_sums[target..last]);
@@ -1639,7 +1650,8 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
             let cell = first + target;
             scratch.posterior_missed_work_sums[target] +=
                 cell_weight * scratch.scenario_missed_work[cell];
-            scratch.posterior_loss_sums[target] += cell_weight * scratch.scenario_shortfall[cell];
+            scratch.posterior_miss_delay_fraction_sums[target] +=
+                cell_weight * scratch.scenario_miss_delay_fraction[cell];
             scratch.posterior_late_area_sums[target] +=
                 cell_weight * scratch.scenario_late_area[cell];
             scratch.posterior_replica_seconds_sums[target] +=
@@ -1669,7 +1681,7 @@ fn numerical_decision(state: &ScaleState, scratch: &mut ScaleScratch) -> usize {
     if selection.used_fallback {
         let deadline = DecisionRejection::Deadline.bit();
         for scenario in 0..scratch.active_scenario_count {
-            let first = scenario * scratch.posterior_loss_sums.len();
+            let first = scenario * scratch.posterior_miss_delay_fraction_sums.len();
             for rejection in &mut scratch.scenario_rejection[first..first + candidate_count] {
                 *rejection |= deadline;
             }
@@ -1705,7 +1717,8 @@ fn scenario_event_count(
 
 /// Converts one scenario's raw outcomes into normalized decision cells.
 ///
-/// The shortfall cell becomes excess delay for each served event budget.
+/// The miss-delay-fraction cell arrives as raw late area. Normalization
+/// divides it by the served events and the deadline budget.
 /// The missed cell keeps event units and adds the deterministic placement
 /// floor, so a candidate that cannot own the located work carries its
 /// unservable events in every scenario.
@@ -1719,10 +1732,10 @@ fn normalize_scenario_outcomes(
     // Retry demand remains message-evidence-only. This is conservative for
     // future scheduled work, whose outcomes do not exist yet.
     for candidate in 0..shared.action_count {
-        let late_area = cells.shortfall[candidate];
+        let late_area = cells.miss_delay_fraction[candidate];
         let denominator = *cells.event_count * budget_seconds;
         cells.late_area[candidate] = late_area + cells.partition_late_area[candidate];
-        cells.shortfall[candidate] = if denominator > f64::EPSILON {
+        cells.miss_delay_fraction[candidate] = if denominator > f64::EPSILON {
             cells.late_area[candidate] / denominator
         } else {
             0.0_f64
@@ -1761,11 +1774,11 @@ fn prepare_unassigned_cohorts(source: &WorkCohorts, workspace: &mut ScenarioWork
 fn evaluate_candidates(
     shared: &CandidateEvaluation<'_>,
     edf: &mut EdfScratch,
-    shortfall: &mut [f64],
+    miss_delay_fraction: &mut [f64],
     drain_seconds: &mut [f64],
     missed_work: &mut [f64],
 ) {
-    for candidate in 0..shortfall.len() {
+    for candidate in 0..miss_delay_fraction.len() {
         let first = shared.trajectory_offsets[candidate] as usize;
         let last = shared.trajectory_offsets[candidate + 1] as usize;
         let outcome = evaluate_prepared_trajectory(
@@ -1786,7 +1799,7 @@ fn evaluate_candidates(
             &shared.arrival_path,
             edf,
         );
-        shortfall[candidate] = outcome.late_area + outcome.terminal_late_area;
+        miss_delay_fraction[candidate] = outcome.late_area + outcome.terminal_late_area;
         drain_seconds[candidate] = outcome.drain_seconds;
         missed_work[candidate] = outcome.missed_work;
     }
@@ -1799,7 +1812,10 @@ fn finish_decision(
 ) -> ScaleDecision {
     let target = target_index as u32 + 1;
     let selected = target_index;
-    let expected_loss = scratch.posterior_loss_sums[selected];
+    let expected_cost = scratch.posterior_late_area_sums[selected]
+        + state.configuration.objective.replica_second_delay_rate()
+            * scratch.posterior_replica_seconds_sums[selected];
+    let miss_delay_fraction = scratch.posterior_miss_delay_fraction_sums[selected];
     let saturation_probability = state
         .capacity
         .saturation_probability(state.simd_level, scratch.candidate_concurrency[selected]);
@@ -1811,7 +1827,8 @@ fn finish_decision(
             .min(state.configuration.partition_count),
         diagnostics: diagnostics(
             state,
-            expected_loss,
+            expected_cost,
+            miss_delay_fraction,
             saturation_probability,
             Some(target),
             scratch.decision_curve_sample_count,
@@ -2100,6 +2117,7 @@ fn append_reactive_repairs(
     let candidate_count = workspace.posterior_resource_supply.len();
     let report_seconds =
         Duration::from_micros(state.configuration.report_interval_micros).as_secs_f64();
+    let report_epoch_seconds = now_seconds + report_seconds;
     let mut segment_start = 0.0_f64;
     for segment in 0..draws.arrival_path_end_seconds.len() {
         let segment_end = draws.arrival_path_end_seconds[segment];
@@ -2113,10 +2131,8 @@ fn append_reactive_repairs(
         if observed >= end_seconds {
             continue;
         }
-        let intervals = ((observed - now_seconds) / report_seconds)
-            .ceil()
-            .max(1.0_f64);
-        let requested = now_seconds + intervals * report_seconds;
+        let requested =
+            next_report_boundary_at_or_after(report_epoch_seconds, report_seconds, observed);
         let target = repair_target(&workspace.posterior_resource_supply[..action_count], rate);
         if target == transition.replicas {
             continue;
@@ -2574,7 +2590,7 @@ fn decision_action_count(scratch: &ScaleScratch) -> usize {
     scratch
         .partition_write_offsets
         .len()
-        .min(scratch.posterior_loss_sums.len())
+        .min(scratch.posterior_miss_delay_fraction_sums.len())
 }
 
 fn demand_class_totals(cohorts: &CohortColumns, backlog: &BacklogColumns) -> (f64, f64) {
@@ -2632,16 +2648,17 @@ pub(crate) fn mixed_event_supply(
     aggregate.min(attempt_supply * failure_service_weight * events / failure_demand)
 }
 
-fn hold(state: &ScaleState, reason: HoldReason, shortfall: f64) -> ScaleDecision {
+fn hold(state: &ScaleState, reason: HoldReason, miss_delay_fraction: f64) -> ScaleDecision {
     ScaleDecision::Hold(HoldDecision {
         reason,
-        diagnostics: diagnostics(state, shortfall, 0.0_f64, None, 0),
+        diagnostics: diagnostics(state, 0.0_f64, miss_delay_fraction, 0.0_f64, None, 0),
     })
 }
 
 fn diagnostics(
     state: &ScaleState,
-    shortfall: f64,
+    expected_cost: f64,
+    miss_delay_fraction: f64,
     saturation_probability: f64,
     selected_target: Option<u32>,
     scenario_count: u32,
@@ -2679,8 +2696,8 @@ fn diagnostics(
         lead_time_seconds: selected_lead_time,
         handler_seconds: state.capacity.expected_service_time(state.simd_level),
         maximum_partition_share: state.partition_placement.maximum_expected_share(),
-        shortfall,
-        expected_loss: shortfall,
+        expected_cost,
+        miss_delay_fraction,
     }
 }
 

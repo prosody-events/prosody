@@ -1276,11 +1276,11 @@ fn replica_ceiling_exposes_unmet_demand_at_the_limit() -> Result<(), TestError> 
     assert!(targets.iter().all(|target| *target <= 8));
     // The burst work is sunk before any transition can land, so the
     // controller does not buy replicas that save nothing. The limit
-    // candidate's expected loss stays positive: the ceiling hides no
+    // candidate's expected cost stays positive: the ceiling hides no
     // unmet demand.
     let exposed = (0..run.controller().len()).any(|index| {
         run.controller()
-            .decision_expected_losses(index)
+            .decision_expected_costs(index)
             .and_then(|losses| losses.last().copied())
             .is_some_and(|loss| loss > 0.0_f64)
     });
@@ -1450,7 +1450,7 @@ fn hot_partition_exposes_unavoidable_placement_loss() -> Result<(), TestError> {
         let Some(sample) = run.controller().sample(index) else {
             return false;
         };
-        let Some(losses) = run.controller().decision_expected_losses(index) else {
+        let Some(losses) = run.controller().decision_expected_costs(index) else {
             return false;
         };
         let Some(&one_replica) = losses.first() else {
@@ -1492,7 +1492,7 @@ fn assert_lead_time_diagnostics_use_prequential_predictive_distributions(
             0
         };
         maximum_target_streak = maximum_target_streak.max(target_streak);
-        let losses = run.controller().decision_expected_losses(index);
+        let losses = run.controller().decision_expected_costs(index);
         let satisfactions = run
             .controller()
             .decision_deadline_satisfaction_probabilities(index);
@@ -1531,8 +1531,8 @@ fn assert_lead_time_diagnostics_use_prequential_predictive_distributions(
             sample.capacity_median_per_second,
             sample.no_knee_probability,
         ));
-        minimum_loss = minimum_loss.min(sample.expected_loss);
-        maximum_loss = maximum_loss.max(sample.expected_loss);
+        minimum_loss = minimum_loss.min(sample.expected_cost);
+        maximum_loss = maximum_loss.max(sample.expected_cost);
         if matches!(
             sample.lead_time_evidence,
             crate::LeadTimeEvidenceSample::Completed { .. }

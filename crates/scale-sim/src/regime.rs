@@ -1184,7 +1184,7 @@ fn single_worker_constraint_binds(run: &PrincipalRun) -> bool {
         let Some(sample) = run.controller.sample(index) else {
             return false;
         };
-        let Some(losses) = run.controller.decision_expected_losses(index) else {
+        let Some(losses) = run.controller.decision_expected_costs(index) else {
             return false;
         };
         let Some(&one_replica) = losses.first() else {
@@ -1767,7 +1767,7 @@ impl RunProgress {
             };
             let ready_index = snapshot.replicas.saturating_sub(1) as usize;
             let next_index = ready_index.saturating_add(1);
-            let losses = controller.decision_expected_losses(controller_index);
+            let costs = controller.decision_expected_costs(controller_index);
             let satisfactions =
                 controller.decision_deadline_satisfaction_probabilities(controller_index);
             let selected = controller_sample.map_or(0, |sample| sample.target);
@@ -1781,8 +1781,9 @@ impl RunProgress {
             };
             let arrival_rate =
                 controller_sample.map_or(f64::NAN, |sample| sample.arrival_rate_per_second);
-            let selected_loss = controller_sample.map_or(f64::NAN, |sample| sample.expected_loss);
-            let selected_shortfall = controller_sample.map_or(f64::NAN, |sample| sample.shortfall);
+            let selected_cost = controller_sample.map_or(f64::NAN, |sample| sample.expected_cost);
+            let selected_miss_delay_fraction =
+                controller_sample.map_or(f64::NAN, |sample| sample.miss_delay_fraction);
             let scenario_count = controller_sample.map_or(0, |sample| sample.scenario_count);
             tracing::info!(
                 regime = regime.name(),
@@ -1801,8 +1802,8 @@ impl RunProgress {
                 selected_target = selected,
                 backlog = snapshot.backlog,
                 inferred_arrival_rate_per_second = arrival_rate,
-                selected_expected_loss = selected_loss,
-                selected_shortfall,
+                selected_expected_cost = selected_cost,
+                selected_miss_delay_fraction,
                 scenario_count,
                 selected_deadline_rejection_probability = rejection(DecisionRejection::Deadline),
                 selected_placement_rejection_probability =
@@ -1815,11 +1816,11 @@ impl RunProgress {
                     .and_then(|values| values.get(next_index))
                     .copied()
                     .unwrap_or(f64::NAN),
-                ready_target_expected_loss = losses
+                ready_target_expected_cost = costs
                     .and_then(|values| values.get(ready_index))
                     .copied()
                     .unwrap_or(f64::NAN),
-                next_target_expected_loss = losses
+                next_target_expected_cost = costs
                     .and_then(|values| values.get(next_index))
                     .copied()
                     .unwrap_or(f64::NAN),

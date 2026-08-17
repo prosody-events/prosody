@@ -2038,10 +2038,10 @@ pub struct DecisionDiagnostics {
     pub handler_seconds: f64,
     /// Largest posterior expected partition share.
     pub maximum_partition_share: f64,
-    /// Largest fractional shortfall at the selected target.
-    pub shortfall: f64,
-    /// Posterior expected fractional loss at the selected target.
-    pub expected_loss: f64,
+    /// Posterior expected cost at the selected target.
+    pub expected_cost: f64,
+    /// Posterior expected delay as a fraction of the deadline budget.
+    pub miss_delay_fraction: f64,
 }
 
 /// An actionable controller decision.

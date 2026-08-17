@@ -1,8 +1,8 @@
 use quickcheck_macros::quickcheck;
 
 use super::{
-    ActionColumns, complete_horizon_micros, replica_seconds, select_action,
-    terminal_replica_seconds,
+    ActionColumns, billing_replica_seconds, complete_horizon_micros,
+    next_report_boundary_at_or_after, select_action, terminal_replica_seconds,
 };
 
 #[test]
@@ -127,11 +127,11 @@ fn empty_feasible_set_selects_the_smallest_miss_fraction(
 }
 
 #[test]
-fn replica_seconds_integrates_physical_membership_changes() {
+fn billing_replica_seconds_integrates_pod_lifetime_changes() {
     let targets = [2, 4];
-    let membership_seconds = [3.0_f64, 7.0_f64];
+    let pod_lifetime_seconds = [3.0_f64, 7.0_f64];
 
-    let area = replica_seconds(1.0_f64, 11.0_f64, 1, &targets, &membership_seconds);
+    let area = billing_replica_seconds(1.0_f64, 11.0_f64, 1, &targets, &pod_lifetime_seconds);
 
     assert!(area.total_cmp(&26.0_f64).is_eq(), "area={area}");
 }
@@ -141,14 +141,23 @@ fn terminal_membership_reaches_the_first_report_boundary() {
     // The 2 s planning horizon caps the 8 s drain. The next 3 s report
     // boundary is 6 s. Two replicas therefore cost 2 * 4 = 8.
     assert!(
-        terminal_replica_seconds(2_000_000, 8.0_f64, 3_000_000, 2)
+        terminal_replica_seconds(0, 2_000_000, 8.0_f64, 3_000_000, 2)
             .total_cmp(&8.0_f64)
             .is_eq()
     );
     // No terminal work needs no successor continuation.
     assert!(
-        terminal_replica_seconds(2_000_000, 0.0_f64, 3_000_000, 2)
+        terminal_replica_seconds(0, 2_000_000, 0.0_f64, 3_000_000, 2)
             .total_cmp(&0.0_f64)
+            .is_eq()
+    );
+}
+
+#[test]
+fn report_boundary_uses_the_named_epoch() {
+    assert!(
+        next_report_boundary_at_or_after(5.0_f64, 3.0_f64, 9.0_f64)
+            .total_cmp(&11.0_f64)
             .is_eq()
     );
 }
