@@ -1,12 +1,36 @@
 use super::{
     BorrowedKeyedCellTtlRow, CassandraCellStoreError, CassandraSession, CassandraStoreError, Cell,
     CellBuffer, CellKey, CellKind, CellQueries, CellStoreError, CollectionId, Coordinate,
-    Direction, Error, FramedKeyedCellRow, Pk, PreparedStatement, QueryRowsResult, ResolveCellError,
-    Scan, ScanEdge, Section, SmallVec, Stream, TryStreamExt, cooperative, decode, pin_mut,
-    split_keyed_cell_ttl, try_stream,
+    Direction, Error, Pk, PreparedStatement, QueryRowsResult, ResolveCellError, Scan, ScanEdge,
+    Section, SmallVec, Stream, TryStreamExt, cooperative, decode, pin_mut, split_keyed_cell_ttl,
+    try_stream,
 };
+use scylla::deserialize::row::DeserializeRow;
 
 pub(super) type DecodedCellBatch = CellBuffer<Option<(Cell, Option<i32>)>>;
+
+#[derive(Clone, Copy)]
+pub(super) struct ScanStatements<'a> {
+    forward_incl: &'a PreparedStatement,
+    forward_excl: &'a PreparedStatement,
+    backward_incl: &'a PreparedStatement,
+    backward_excl: &'a PreparedStatement,
+    forward_all: &'a PreparedStatement,
+    backward_all: &'a PreparedStatement,
+}
+
+impl<'a> ScanStatements<'a> {
+    pub(super) fn values(queries: &'a CellQueries) -> Self {
+        Self {
+            forward_incl: &queries.scan_forward_incl,
+            forward_excl: &queries.scan_forward_excl,
+            backward_incl: &queries.scan_backward_incl,
+            backward_excl: &queries.scan_backward_excl,
+            forward_all: &queries.scan_forward_all,
+            backward_all: &queries.scan_backward_all,
+        }
+    }
+}
 
 /// Maps a raw Cassandra error into the resolving store error, generic only over
 /// the oracle error type `E` the caller's stream carries.
@@ -186,12 +210,16 @@ fn match_rows_to_coordinates<'frame>(
 /// `project_committed`. Sharing this pager keeps their physical paging from
 /// drifting apart. Each `try_next` is wrapped in [`cooperative`] so a drain of
 /// ready rows yields to the runtime every ~128 items.
-pub(super) fn page_cells<'a>(
+pub(super) fn page_cells<'a, Row>(
     session: &'a CassandraSession,
-    queries: &'a CellQueries,
+    statements: ScanStatements<'a>,
     collection: &'a CollectionId,
     scan: Scan<'a>,
-) -> impl Stream<Item = Result<(CellKey, Cell), CassandraCellStoreError>> + Send + 'a {
+    decode_row: fn(Row) -> Result<(CellKey, Cell), CassandraCellStoreError>,
+) -> impl Stream<Item = Result<(CellKey, Cell), CassandraCellStoreError>> + Send + 'a
+where
+    Row: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> + Send + 'a,
+{
     let section = i8::from(scan.section);
     let dir = scan.dir;
     // Both edges are held as owned `Coordinate`s across the stream's awaits —
@@ -209,38 +237,38 @@ pub(super) fn page_cells<'a>(
         // pager must open inside each arm.
         let pager = match (dir, start.as_ref()) {
             (Direction::Forward, ScanEdge::Included(c)) => {
-                session.session().execute_iter(queries.scan_forward_incl.clone(),
+                session.session().execute_iter(statements.forward_incl.clone(),
                     (seg, key, st, name, cell_kind, sect, c)).await
             }
             (Direction::Forward, ScanEdge::Excluded(c)) => {
-                session.session().execute_iter(queries.scan_forward_excl.clone(),
+                session.session().execute_iter(statements.forward_excl.clone(),
                     (seg, key, st, name, cell_kind, sect, c)).await
             }
             (Direction::Backward, ScanEdge::Included(c)) => {
-                session.session().execute_iter(queries.scan_backward_incl.clone(),
+                session.session().execute_iter(statements.backward_incl.clone(),
                     (seg, key, st, name, cell_kind, sect, c)).await
             }
             (Direction::Backward, ScanEdge::Excluded(c)) => {
-                session.session().execute_iter(queries.scan_backward_excl.clone(),
+                session.session().execute_iter(statements.backward_excl.clone(),
                     (seg, key, st, name, cell_kind, sect, c)).await
             }
             (Direction::Forward, ScanEdge::Unbounded) => {
-                session.session().execute_iter(queries.scan_forward_all.clone(), prefix).await
+                session.session().execute_iter(statements.forward_all.clone(), prefix).await
             }
             (Direction::Backward, ScanEdge::Unbounded) => {
-                session.session().execute_iter(queries.scan_backward_all.clone(), prefix).await
+                session.session().execute_iter(statements.backward_all.clone(), prefix).await
             }
         };
         let stream = pager
             .map_err(CassandraStoreError::from)?
-            .rows_stream::<FramedKeyedCellRow>()
+            .rows_stream::<Row>()
             .map_err(CassandraStoreError::from)?;
         pin_mut!(stream);
         while let Some(row) = cooperative(stream.try_next())
             .await
             .map_err(CassandraStoreError::from)?
         {
-            let (key, cell) = decode::try_decode_keyed_cell(row)?;
+            let (key, cell) = decode_row(row)?;
             if past_end(dir, &key, end.as_ref()) {
                 break;
             }

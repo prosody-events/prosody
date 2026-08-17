@@ -1,8 +1,8 @@
 use super::{
     Arc, Bytes, CassandraCellResources, CassandraCellStoreError, CassandraSession, CellBuffer,
-    CellKey, CellQueries, CollectionId, CoordinateBatch, Scan, Section, Stream, TryStreamExt,
-    dedupe, expand_to_input_order, fetch_and_decode_cell, fetch_cells_batch, page_cells, pin_mut,
-    try_stream,
+    CellKey, CellQueries, CollectionId, CoordinateBatch, Scan, ScanStatements, Section, Stream,
+    TryStreamExt, decode, dedupe, expand_to_input_order, fetch_and_decode_cell, fetch_cells_batch,
+    page_cells, pin_mut, try_stream,
 };
 
 impl CassandraCellResources {
@@ -93,7 +93,13 @@ impl CassandraCellResources {
     ) -> impl Stream<Item = Result<(CellKey, Bytes), CassandraCellStoreError>> + Send + 'a {
         let limit = scan.limit;
         try_stream! {
-            let pages = page_cells(&self.session, &self.queries, id, scan);
+            let pages = page_cells(
+                &self.session,
+                ScanStatements::values(&self.queries),
+                id,
+                scan,
+                decode::try_decode_keyed_cell,
+            );
             pin_mut!(pages);
             let mut yielded = 0usize;
             while let Some((key, cell)) = pages.try_next().await? {

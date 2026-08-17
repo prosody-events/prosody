@@ -6,10 +6,11 @@ use super::{
     CollectionDefRegistry, CollectionId, CollectionRef, CommitOracle, Coordinate, EventMarker,
     EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerPresence, Pk,
     PreparedStatement, QueryRowsResult, ResolveCellError, ResolvedRow, Resolver, RowShape,
-    SHARD_FANOUT_CONCURRENCY, Scan, Section, Session, Stream, TryStreamExt, blob_weight, encode,
-    encode_marker_payload, fetch_and_decode_cell, fetch_cell_rows_result, fetch_cells_batch_result,
-    flatten_resolve, help_read_window, marker_delete_unit, marker_last_split, page_cells,
-    peek_read, pin_mut, resolve_marker, smallvec, try_stream,
+    SHARD_FANOUT_CONCURRENCY, Scan, ScanStatements, Section, Session, Stream, TryStreamExt,
+    blob_weight, decode, encode, encode_marker_payload, fetch_and_decode_cell,
+    fetch_cell_rows_result, fetch_cells_batch_result, flatten_resolve, help_read_window,
+    marker_delete_unit, marker_last_split, page_cells, peek_read, pin_mut, resolve_marker,
+    smallvec, try_stream,
 };
 
 impl<O> CassandraStore<O> {
@@ -240,7 +241,13 @@ where
             // The shared paging core (`page_cells`): it selects the per-bound
             // statement, decodes each row, and applies `past_end`. It applies
             // no resolution and no limit.
-            let pages = page_cells(&self.session, &self.queries, collection, scan);
+            let pages = page_cells(
+                &self.session,
+                ScanStatements::values(&self.queries),
+                collection,
+                scan,
+                decode::try_decode_keyed_cell,
+            );
             pin_mut!(pages);
 
             let mut yielded = 0usize;

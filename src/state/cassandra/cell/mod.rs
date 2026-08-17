@@ -107,9 +107,9 @@ pub use queries::CellQueries;
 #[cfg(test)]
 use read::decode_rows_for_coordinates;
 use read::{
-    decode_batch_rows, decode_cell_ttl_result, fetch_and_decode_cell, fetch_cell_rows_result,
-    fetch_cells_batch, fetch_cells_batch_result, into_store_err, match_batch_rows_to_coordinates,
-    page_cells,
+    ScanStatements, decode_batch_rows, decode_cell_ttl_result, fetch_and_decode_cell,
+    fetch_cell_rows_result, fetch_cells_batch, fetch_cells_batch_result, into_store_err,
+    match_batch_rows_to_coordinates, page_cells,
 };
 use rows::{
     CellAddr, CellBatchRow, CellBlobs, GapBetweenRow, GapEdgeRow, GapSectionRow, KeyRow,
@@ -147,7 +147,7 @@ use crate::timers::duration::CompactDuration;
 use ahash::RandomState;
 use async_stream::try_stream;
 use bytes::Bytes;
-use decode::{BorrowedKeyedCellTtlRow, FramedKeyedCellRow, split_keyed_cell_ttl};
+use decode::{BorrowedKeyedCellTtlRow, split_keyed_cell_ttl};
 use encoding::{EncodedBlob, encode, encode_payload, select_encoding};
 use futures::{Stream, TryStreamExt, pin_mut};
 use scylla::client::session::Session;

@@ -131,28 +131,17 @@ where
         batch: &'a CoordinateBatch,
         own: EventRef,
     ) -> Result<CommittedBatch, L::Error> {
-        let section_cleared = self.dirty.section_cleared(collection, section);
-        let mut answers: CellBuffer<Option<Committed>> = smallvec![None; batch.len()];
-        let mut untouched: CellBuffer<Coordinate> = SmallVec::new();
-        let mut untouched_pos: CellBuffer<usize> = SmallVec::new();
-        for (i, coordinate) in batch.iter().enumerate() {
-            let cell = CellKey {
-                section,
-                coordinate: Coordinate::clone(coordinate),
-            };
-            match self.dirty.lookup(collection, &cell) {
-                Some(DirtyVal::Set(bytes)) => answers[i] = Some(Committed::new(Some(bytes))),
-                Some(DirtyVal::Cleared) => answers[i] = Some(Committed::new(None)),
-                // A standing dirty clear marker answers known-absence for any
-                // untouched cell of the section (a repopulating `set` would
-                // have matched the `Set` arm above).
-                None if section_cleared => answers[i] = Some(Committed::new(None)),
-                None => {
-                    untouched.push(Coordinate::clone(coordinate));
-                    untouched_pos.push(i);
-                }
-            }
-        }
+        let (dirty_answers, untouched, untouched_pos) =
+            self.classify_batch(collection, section, batch);
+        let mut answers: CellBuffer<Option<Committed>> = dirty_answers
+            .into_iter()
+            .map(|answer| {
+                answer.map(|value| match value {
+                    DirtyVal::Set(bytes) => Committed::new(Some(bytes)),
+                    DirtyVal::Cleared => Committed::new(None),
+                })
+            })
+            .collect();
         // `untouched.len() ≤ batch.len() ≤ CELL_BATCH`, so this yields zero or
         // one lower batch; `untouched_pos` aligns 1:1 with its answers.
         for lower_batch in CoordinateBatch::chunks(untouched) {
@@ -177,6 +166,41 @@ where
         Ok(out)
     }
 
+    /// A dirty `Set` answers its value. A dirty `Cleared` answers absence.
+    /// A section clear answers absence for an untouched cell because a later
+    /// `Set` matches first. The lower sub-batch keeps untouched input
+    /// positions.
+    fn classify_batch(
+        &self,
+        collection: &CollectionId,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> (
+        CellBuffer<Option<DirtyVal>>,
+        CellBuffer<Coordinate>,
+        CellBuffer<usize>,
+    ) {
+        let section_cleared = self.dirty.section_cleared(collection, section);
+        let mut answers = smallvec![None; batch.len()];
+        let mut untouched = SmallVec::new();
+        let mut untouched_pos = SmallVec::new();
+        for (i, coordinate) in batch.iter().enumerate() {
+            let cell = CellKey {
+                section,
+                coordinate: Coordinate::clone(coordinate),
+            };
+            match self.dirty.lookup(collection, &cell) {
+                Some(value) => answers[i] = Some(value),
+                None if section_cleared => answers[i] = Some(DirtyVal::Cleared),
+                None => {
+                    untouched.push(Coordinate::clone(coordinate));
+                    untouched_pos.push(i);
+                }
+            }
+        }
+        (answers, untouched, untouched_pos)
+    }
+
     /// Scans a range through the overlay, lazily merging the dirty leg
     /// against `lower.scan_cells` in `coordinate` order — dirty wins on a key
     /// tie, a dirty `Cleared` hides the lower cell. A standing dirty clear
@@ -188,6 +212,28 @@ where
         scan: Scan<'a>,
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a {
+        // Strip the lower limit because dirty cells can add or hide results.
+        // The merge applies the limit to its output.
+        let bottom = self.lower.scan_cells(
+            collection,
+            Scan {
+                limit: None,
+                ..scan
+            },
+            own,
+        );
+        self.merge_cells(collection, scan, bottom)
+    }
+
+    fn merge_cells<'a, S>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        bottom: S,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a
+    where
+        S: Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a,
+    {
         let cleared = self.dirty.section_cleared(collection, scan.section);
         let mut top = self.dirty.section_snapshot(collection, scan.section);
         // Bound the dirty leg to the scan's range in `dir` before merging:
@@ -215,19 +261,6 @@ where
                 }
                 return;
             }
-            // Strip the limit from the lower leg: a dirty `Cleared` hides a
-            // lower cell and a dirty `Set` adds one, so the limit must bound
-            // the MERGED output, not the lower leg in isolation. It is counted
-            // below; the lower stream stays lazy, so dropping early stops its
-            // paging.
-            let bottom = self.lower.scan_cells(
-                collection,
-                Scan {
-                    limit: None,
-                    ..scan
-                },
-                own,
-            );
             // `top` is an owned, pre-sorted snapshot (the guard was dropped when
             // it was built), walked by index; `bottom` stays a lazy stream.
             let mut ti = 0usize;
