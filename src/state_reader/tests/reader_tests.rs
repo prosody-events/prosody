@@ -20,18 +20,22 @@ use super::support::{
 };
 use crate::Key;
 use crate::codec::JsonCodec;
+use crate::state::cell_key::{Coordinate, Direction, Scan, ScanEdge, Section};
 use crate::state::descriptor::{
     DescriptorIdentity, StateDescriptor, deque_state, map_state, value_state,
 };
 use crate::state::descriptor_identity::DurableDescriptorIdentity;
+use crate::state::identity::CollectionId;
 use crate::state::order_codec::I64KeyCodec;
 use crate::state::publication::PublicationStore;
 use crate::state::registry::CollectionDef;
+use crate::state::store::CoordinateBatch;
 use crate::state::tests::collection_suite::{DequeOp, MapOp, Trace};
 use crate::state::{ReadCachePolicy, StateType};
+use crate::state_reader::CommittedCellSource;
 use crate::state_reader::{StateReader, StateReaderError};
 use color_eyre::eyre::{Result, bail, eyre};
-use futures::executor::block_on;
+use futures::{TryStreamExt, executor::block_on};
 use serde_json::Value;
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -151,6 +155,35 @@ async fn reader_reads_prev_in_commit_window() -> Result<()> {
         },
     )
     .await?;
+
+    let id = CollectionId::new(state_key, StateType::Application, name.clone());
+    let section = Section::new(0);
+    let batch = CoordinateBatch::chunks([Coordinate::empty(), Coordinate::from_bytes("missing")])
+        .next()
+        .ok_or_else(|| eyre!("the test batch is empty"))?;
+    let values = harness.cells.load_many(&id, section, &batch).await?;
+    let presence = harness
+        .cells
+        .load_presence_many(&id, section, &batch)
+        .await?;
+    let expected: Vec<bool> = values.into_iter().map(|value| value.is_some()).collect();
+    assert_eq!(presence.as_slice(), expected);
+    let scan = Scan {
+        section,
+        start: ScanEdge::Unbounded,
+        dir: Direction::Forward,
+        end: ScanEdge::Unbounded,
+        limit: None,
+    };
+    let values = harness.cells.scan(&id, scan).map_ok(|(cell, _)| cell);
+    assert_eq!(
+        harness
+            .cells
+            .scan_presence(&id, scan)
+            .try_collect::<Vec<_>>()
+            .await?,
+        values.try_collect::<Vec<_>>().await?
+    );
 
     publish_source(
         (&harness.publications, &harness.identities),

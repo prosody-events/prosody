@@ -502,6 +502,8 @@ where
         scan: Scan<'a>,
         own: EventRef,
     ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        // A shared helper needs an inner-stream type for two small methods.
+        // These direct twins are easier to read.
         try_stream! {
             if !self.fjall.fuse_blown() {
                 self.delete_read_window(collection, own).await?;
