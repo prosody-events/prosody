@@ -37,13 +37,13 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 const CALLER: &str = "peer.test.call";
 
 /// The span a process opens for one frame it received.
-const RECEIVED: &str = "peer.response.receive";
+const RECEIVED: &str = "request.response.receive";
 
 /// The span a process opens for one frame it sends on.
-const FORWARDED: &str = "peer.response.forward";
+const FORWARDED: &str = "request.response.forward";
 
 /// The attribute carrying what is left of the caller's budget.
-const DEADLINE_MS: &str = "peer.deadline_ms";
+const DEADLINE_MS: &str = "request.deadline_ms";
 
 /// The counter of delivery attempts a process decided.
 const DISPOSITIONS: &str = "prosody.response.dispositions";

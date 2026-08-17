@@ -95,7 +95,7 @@ fn a_drop_names_its_reason_and_never_the_peer() -> Result<()> {
     );
     ensure!(
         metrics.points("prosody.response.dropped")?
-            == vec![(label("reason", "unresolvable_peer"), 1)],
+            == vec![(label("reason", "unresolvable_requester"), 1)],
         "the drop must be counted under its reason alone: {:?}",
         metrics.points("prosody.response.dropped")?
     );

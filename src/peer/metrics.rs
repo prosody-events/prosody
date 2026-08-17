@@ -20,18 +20,18 @@ impl PeerMetrics {
     pub(crate) fn new(meter: &Meter) -> Self {
         Self {
             request_latency: meter
-                .f64_histogram("prosody.peer.request.latency")
-                .with_description("How long one peer request waited for its answers")
+                .f64_histogram("prosody.request.latency")
+                .with_description("How long one request waited for its answers")
                 .with_unit("s")
                 .build(),
             requests_pending: meter
-                .i64_up_down_counter("prosody.peer.requests.pending")
+                .i64_up_down_counter("prosody.requests.pending")
                 .with_description("Requests this process is waiting for answers to")
                 .with_unit("{request}")
                 .build(),
             response_dispositions: meter
                 .u64_counter("prosody.response.dispositions")
-                .with_description("Response delivery attempts this peer answered")
+                .with_description("Response delivery attempts this process answered")
                 .with_unit("{response}")
                 .build(),
             response_stages: meter

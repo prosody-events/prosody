@@ -76,7 +76,7 @@ impl DropReason {
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::EncodeFailed => "encode_failed",
-            Self::UnresolvablePeer => "unresolvable_peer",
+            Self::UnresolvablePeer => "unresolvable_requester",
             Self::LookupFailed => "lookup_failed",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::SendFailed => "send_failed",

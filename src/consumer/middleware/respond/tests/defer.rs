@@ -53,7 +53,7 @@ const TARGET: u8 = 3;
 const REQUEST: u8 = 44;
 
 /// The span one outbound response opens.
-const SENT: &str = "peer.response.send";
+const SENT: &str = "request.response.send";
 
 /// The span the loader opens for the record it rebuilds. It is the reloaded
 /// record's own span, so the answer must hang directly under it.

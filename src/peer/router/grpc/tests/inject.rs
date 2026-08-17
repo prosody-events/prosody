@@ -15,7 +15,7 @@ use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// The span the listener opens for one delivered response.
-const RECEIVED: &str = "peer.response.receive";
+const RECEIVED: &str = "request.response.receive";
 
 /// The span the instrumented call is made from.
 const CALLER: &str = "peer.test.call";
@@ -60,7 +60,7 @@ fn the_metadata_hop_carries_the_trace_context() -> Result<()> {
             .iter()
             .filter(|span| {
                 span.name == RECEIVED
-                    && span_attribute(span, "peer.request").is_ok_and(|value| {
+                    && span_attribute(span, "request.id").is_ok_and(|value| {
                         request_ids
                             .iter()
                             .any(|request| value.as_str() == request.as_str())

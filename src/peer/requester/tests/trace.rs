@@ -15,7 +15,7 @@ use opentelemetry::trace::SpanKind;
 use uuid::Uuid;
 
 /// The span `request` opens. `#[instrument]` with no explicit name takes the
-/// function's name, so anything naming it `peer.request` is wrong.
+/// function's name.
 const CALL: &str = "request";
 
 /// One unanswered call opens a client span carrying the request's identity, the
@@ -44,7 +44,7 @@ fn one_call_opens_a_client_span_naming_its_request_and_its_answers() -> Result<(
         ("messaging.kafka.message.key", KEY),
         ("topic", TOPIC),
         ("key", KEY),
-        ("response.peer", &PEER.to_string()),
+        ("requester.id", &PEER.to_string()),
         ("request.outcome", "none"),
         ("responses.missing", SUBSYSTEM),
     ] {
