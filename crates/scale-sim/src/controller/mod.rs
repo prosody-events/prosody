@@ -2358,7 +2358,6 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             &mut self.state,
             &mut self.scratch,
             self.observation.observation(),
-            ModelTime::from_micros(context.now_micros),
         );
         let desired = context
             .history

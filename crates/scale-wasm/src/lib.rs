@@ -70,6 +70,12 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
     let Ok(mut observation) = ObservationBuffer::new(&configuration) else {
         return ERROR_CODE;
     };
+    if observation
+        .advance_model_time(ModelTime::from_micros(1))
+        .is_err()
+    {
+        return ERROR_CODE;
+    }
     if observation.set_arrivals(offered_events, 1_000_000).is_err() {
         return ERROR_CODE;
     }
@@ -86,12 +92,7 @@ pub fn fixture_decision(offered_events: u32) -> u64 {
     {
         return ERROR_CODE;
     }
-    encode(step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(1),
-    ))
+    encode(step(&mut state, &mut scratch, observation.observation()))
 }
 
 fn encode(decision: ScaleDecision) -> u64 {

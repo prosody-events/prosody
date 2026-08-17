@@ -134,6 +134,7 @@ pub fn run_batch_slo_with_inputs(
     let artifact_identity = state.capacity_artifact().identity();
     let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
+    observation.advance_model_time(ModelTime::from_micros(1))?;
     let mut partition_events = [0_u32; PARTITION_COUNT as usize];
     for event_index in 0..EVENT_COUNT {
         let event = batch_event(event_index);
@@ -149,12 +150,7 @@ pub fn run_batch_slo_with_inputs(
             demand_class: DemandClass::Normal,
         })?;
     }
-    let decision = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(1),
-    );
+    let decision = step(&mut state, &mut scratch, observation.observation());
     let ScaleDecision::Apply(apply) = decision else {
         return Err(BatchSloError::ControllerHold);
     };

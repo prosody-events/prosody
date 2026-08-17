@@ -1130,13 +1130,13 @@ pub fn step(
     state: &mut ScaleState,
     scratch: &mut ScaleScratch,
     observation: GroupObservation<'_>,
-    now: ModelTime,
 ) -> ScaleDecision {
     scratch.decision_curve_sample_count = 0;
-    if now < state.model_time {
+    if observation.model_time < state.model_time {
         return hold(state, HoldReason::ModelTimeRegressed, 0.0);
     }
     let GroupObservation {
+        model_time,
         cohorts,
         backlog,
         arrivals,
@@ -1150,9 +1150,12 @@ pub fn step(
         current_replicas,
         actuation_commitments,
     } = observation;
-    let elapsed =
-        Duration::from_micros(now.as_micros().saturating_sub(state.model_time.as_micros()));
-    state.model_time = now;
+    let elapsed = Duration::from_micros(
+        model_time
+            .as_micros()
+            .saturating_sub(state.model_time.as_micros()),
+    );
+    state.model_time = model_time;
     state.capacity.transition(elapsed);
     state.lead_time.transition(elapsed);
     state.rebalance_time.transition(elapsed);
@@ -1165,9 +1168,13 @@ pub fn step(
         state.reliability.update(evidence);
     }
     if let Some(evidence) = arrivals {
-        state.arrivals.update(evidence, calendar, now.as_micros());
+        state
+            .arrivals
+            .update(evidence, calendar, model_time.as_micros());
     } else {
-        state.arrivals.prepare_calendar(calendar, now.as_micros());
+        state
+            .arrivals
+            .prepare_calendar(calendar, model_time.as_micros());
     }
     if let Some(evidence) = partition_arrivals {
         state.partition_placement.update(evidence.consume());
@@ -1542,6 +1549,9 @@ fn expected_event_count(scratch: &ScaleScratch) -> f64 {
 /// The horizon covers one report and two maximum transition spans. It also
 /// covers every known deadline and one budget after the last boundary. It does
 /// not depend on the candidate, so every action uses the same future.
+/// [`Configuration::validate`] bounds the fixed span. The `ObservationBuffer`
+/// deadline checks bound each accepted deadline. Thus, the planning horizon
+/// stays in the validated arrival domain.
 fn scenario_horizons(state: &ScaleState, cohorts: &WorkCohorts) -> (u64, u64) {
     let transition_span_seconds = state
         .configuration
@@ -1567,6 +1577,12 @@ fn scenario_horizons(state: &ScaleState, cohorts: &WorkCohorts) -> (u64, u64) {
     );
     let disturbance_horizon_micros =
         planning_horizon_micros.saturating_sub(state.configuration.objective.budget_micros());
+    assert!(
+        Duration::from_micros(planning_horizon_micros.saturating_sub(state.model_time.as_micros()))
+            .as_secs_f64()
+            <= ArrivalPrior::MAXIMUM_PATH_SECONDS,
+        "planning horizon exceeds the validated arrival domain"
+    );
     (planning_horizon_micros, disturbance_horizon_micros)
 }
 

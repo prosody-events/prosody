@@ -6,7 +6,7 @@ use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
-use crate::arrival::{ArrivalEvidence, ArrivalFactor};
+use crate::arrival::{ArrivalEvidence, ArrivalFactor, ArrivalPrior};
 use crate::capacity::CapacityFactor;
 use crate::change_point::ChangePointKernel;
 use crate::controller::{
@@ -547,6 +547,29 @@ fn backlog_evidence_has_one_positive_observation_per_partition_and_class() -> Re
 }
 
 #[test]
+fn future_backlog_deadline_exceeding_horizon_is_rejected() -> Result<(), TestError> {
+    let configuration = configuration()?;
+    let mut observation = ObservationBuffer::new(&configuration)?;
+    let model_time = 10_u64;
+    observation.advance_model_time(ModelTime::from_micros(model_time))?;
+    let oldest_arrival_micros =
+        model_time + ArrivalPrior::MAXIMUM_PATH_MICROS - configuration.objective.budget_micros();
+    let backlog = BacklogCohort::new(
+        oldest_arrival_micros,
+        oldest_arrival_micros,
+        1,
+        0,
+        DemandClass::Normal,
+    )?;
+
+    assert_eq!(
+        observation.set_backlog(backlog),
+        Err(ObservationError::DeadlineHorizon)
+    );
+    Ok(())
+}
+
+#[test]
 fn launch_evidence_accepts_incremental_groups_and_rejects_duplicate_groups() -> Result<(), TestError>
 {
     let configuration = configuration()?;
@@ -842,13 +865,9 @@ fn rebalance_evidence_updates_each_observed_phase() -> Result<(), TestError> {
         ModelTime::from_micros(119_000_000),
         ModelTime::from_micros(120_000_000),
     )?)?;
+    observation.advance_model_time(ModelTime::from_micros(1))?;
 
-    let _ = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(1),
-    );
+    let _ = step(&mut state, &mut scratch, observation.observation());
     let mut lead_after = vec![0.0_f64; value_count];
     let mut pause_after = vec![0.0_f64; value_count];
     state.write_posterior(lead_query, &mut values, &mut lead_after)?;
@@ -1015,7 +1034,7 @@ fn partition_arrival_update_is_consumed_once() -> Result<(), TestError> {
 
 #[test]
 fn arrival_change_point_replaces_stale_rate_evidence() -> Result<(), TestError> {
-    let prior = crate::ArrivalPrior::new(100.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
+    let prior = ArrivalPrior::new(100.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
     let mut factor = ArrivalFactor::new(&prior);
     for _ in 0_u32..100 {
         factor.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
@@ -1033,7 +1052,7 @@ fn arrival_change_point_replaces_stale_rate_evidence() -> Result<(), TestError> 
 
 #[test]
 fn arrival_change_point_normalizes_after_an_extreme_rate_change() -> Result<(), TestError> {
-    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
+    let prior = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
     let mut factor = ArrivalFactor::new(&prior);
 
     factor.update(ArrivalEvidence::new(10_000, 1_000_000), None, 1_000_000);
@@ -1044,7 +1063,7 @@ fn arrival_change_point_normalizes_after_an_extreme_rate_change() -> Result<(), 
 
 #[test]
 fn missing_arrival_prediction_is_cadence_invariant() -> Result<(), TestError> {
-    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
+    let prior = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
     let mut coarse = ArrivalFactor::new(&prior);
     let mut fine = ArrivalFactor::new(&prior);
     coarse.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
@@ -1063,7 +1082,7 @@ fn missing_arrival_prediction_is_cadence_invariant() -> Result<(), TestError> {
 #[test]
 fn missing_interval_weakens_stale_arrival_evidence_before_the_next_update() -> Result<(), TestError>
 {
-    let prior = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
+    let prior = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 90.0_f64)?;
     let mut contiguous = ArrivalFactor::new(&prior);
     let mut missing = ArrivalFactor::new(&prior);
     contiguous.update(ArrivalEvidence::new(100, 1_000_000), None, 1_000_000);
@@ -1345,24 +1364,24 @@ fn controller_transition_is_cadence_invariant() -> Result<(), TestError> {
     let mut fine_observation = ObservationBuffer::new(&configuration)?;
 
     for now_micros in [250_000_u64, 500_000, 750_000] {
+        fine_observation.advance_model_time(ModelTime::from_micros(now_micros))?;
         let _ = step(
             &mut fine_state,
             &mut fine_scratch,
             fine_observation.observation(),
-            ModelTime::from_micros(now_micros),
         );
     }
+    coarse_observation.advance_model_time(ModelTime::from_micros(1_000_000))?;
     let coarse = step(
         &mut coarse_state,
         &mut coarse_scratch,
         coarse_observation.observation(),
-        ModelTime::from_micros(1_000_000),
     );
+    fine_observation.advance_model_time(ModelTime::from_micros(1_000_000))?;
     let fine = step(
         &mut fine_state,
         &mut fine_scratch,
         fine_observation.observation(),
-        ModelTime::from_micros(1_000_000),
     );
 
     assert_eq!(coarse, fine);
@@ -1419,12 +1438,8 @@ fn attempt_outcomes_update_only_their_retry_factors() -> Result<(), TestError> {
         AttemptOutcomeCounts::new(80, 10, 10, 0),
         AttemptOutcomeCounts::new(10, 5, 0, 5),
     ))?;
-    let _ = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(1),
-    );
+    observation.advance_model_time(ModelTime::from_micros(1))?;
+    let _ = step(&mut state, &mut scratch, observation.observation());
 
     let normal = posterior_mean(&state, PosteriorQuery::NormalRetryProbability)?;
     let failure = posterior_mean(&state, PosteriorQuery::FailureRetryProbability)?;
@@ -1614,13 +1629,9 @@ fn partial_observation_returns_a_decision() -> Result<(), TestError> {
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
     let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
+    observation.advance_model_time(ModelTime::from_micros(1))?;
 
-    let decision = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(1),
-    );
+    let decision = step(&mut state, &mut scratch, observation.observation());
 
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
@@ -1643,7 +1654,7 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
         report_interval_micros: 1_000_000,
         resource_window_attempt_count_max: 100_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: crate::ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
+        arrival_prior: ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
@@ -1666,13 +1677,9 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
         AttemptOutcomeCounts::new(1_000_000, 0, 0, 0),
     ))?;
     observation.set_arrivals(0, u64::MAX)?;
+    observation.advance_model_time(ModelTime::from_micros(1))?;
 
-    let decision = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(1),
-    );
+    let decision = step(&mut state, &mut scratch, observation.observation());
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
@@ -1726,13 +1733,9 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
             demand_class: DemandClass::Normal,
         })?;
     }
+    observation.advance_model_time(ModelTime::from_micros(1))?;
 
-    let decision = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(1),
-    );
+    let decision = step(&mut state, &mut scratch, observation.observation());
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
@@ -1869,13 +1872,9 @@ fn decision_curve_contains_the_selected_expected_cost() -> Result<(), TestError>
         partition: 0,
         demand_class: DemandClass::Normal,
     })?;
+    observation.advance_model_time(ModelTime::from_micros(1))?;
 
-    let decision = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(1),
-    );
+    let decision = step(&mut state, &mut scratch, observation.observation());
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
@@ -1897,13 +1896,9 @@ fn decision_diagnostics_report_no_rejection_for_zero_demand() -> Result<(), Test
     let mut state = ScaleState::new(configuration.clone(), grid)?;
     let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
+    observation.advance_model_time(ModelTime::from_micros(1))?;
 
-    let decision = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(1),
-    );
+    let decision = step(&mut state, &mut scratch, observation.observation());
     if !matches!(decision, ScaleDecision::Apply(_)) {
         return Err(TestError::UnexpectedHold);
     }
@@ -1965,39 +1960,19 @@ fn steady_state_step_allocates_no_memory() -> Result<(), TestError> {
             demand_class: DemandClass::Normal,
         })?;
     }
-    let warm_decision = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(1),
-    );
+    observation.advance_model_time(ModelTime::from_micros(1))?;
+    let warm_decision = step(&mut state, &mut scratch, observation.observation());
     black_box(warm_decision);
-    let warm_decision = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(2),
-    );
+    observation.advance_model_time(ModelTime::from_micros(2))?;
+    let warm_decision = step(&mut state, &mut scratch, observation.observation());
     black_box(warm_decision);
 
     let pool = rayon::ThreadPoolBuilder::new().build()?;
-    let _ = pool.install(|| {
-        step(
-            &mut state,
-            &mut scratch,
-            observation.observation(),
-            ModelTime::from_micros(3),
-        )
-    });
+    observation.advance_model_time(ModelTime::from_micros(3))?;
+    let _ = pool.install(|| step(&mut state, &mut scratch, observation.observation()));
+    observation.advance_model_time(ModelTime::from_micros(4))?;
     let allocation = allocation_counter::measure(|| {
-        let _ = pool.install(|| {
-            step(
-                &mut state,
-                &mut scratch,
-                observation.observation(),
-                ModelTime::from_micros(4),
-            )
-        });
+        let _ = pool.install(|| step(&mut state, &mut scratch, observation.observation()));
     });
     assert_eq!(allocation.count_total, 0);
     assert_eq!(allocation.bytes_total, 0);
@@ -2014,25 +1989,17 @@ fn rayon_width_does_not_change_the_decision() -> Result<(), TestError> {
 }
 
 #[test]
-fn regressed_model_time_returns_hold() -> Result<(), TestError> {
+fn observation_stamp_drives_step_regression_check() -> Result<(), TestError> {
     let configuration = configuration()?;
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
     let mut scratch = state.new_scratch()?;
     let mut first = ObservationBuffer::new(&configuration)?;
     let mut second = ObservationBuffer::new(&configuration)?;
-    let _ = step(
-        &mut state,
-        &mut scratch,
-        first.observation(),
-        ModelTime::from_micros(2),
-    );
+    first.advance_model_time(ModelTime::from_micros(2))?;
+    let _ = step(&mut state, &mut scratch, first.observation());
 
-    let decision = step(
-        &mut state,
-        &mut scratch,
-        second.observation(),
-        ModelTime::from_micros(1),
-    );
+    second.advance_model_time(ModelTime::from_micros(1))?;
+    let decision = step(&mut state, &mut scratch, second.observation());
 
     assert!(matches!(
         decision,
@@ -2055,13 +2022,9 @@ fn one_hot_partition_cannot_claim_capacity_from_other_replicas() -> Result<(), T
         partition: 0,
         demand_class: DemandClass::Normal,
     })?;
+    observation.advance_model_time(ModelTime::from_micros(1))?;
 
-    let decision = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(1),
-    );
+    let decision = step(&mut state, &mut scratch, observation.observation());
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
@@ -2091,13 +2054,9 @@ fn wide_cohort_cannot_hide_one_hot_partition_deadline() -> Result<(), TestError>
         partition: 0,
         demand_class: DemandClass::Normal,
     })?;
+    observation.advance_model_time(ModelTime::from_micros(1))?;
 
-    let decision = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(1),
-    );
+    let decision = step(&mut state, &mut scratch, observation.observation());
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
@@ -2222,7 +2181,7 @@ fn plateau_configuration() -> Result<Configuration, TestError> {
         report_interval_micros: 1_000_000,
         resource_window_attempt_count_max: 100_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: crate::ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
+        arrival_prior: ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
@@ -2251,12 +2210,9 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
     let mut observation = ObservationBuffer::new(&configuration)?;
     observation.set_arrivals(72_000, 240_000_000)?;
     observation.set_current_replicas(2)?;
-    let ScaleDecision::Apply(_first) = step(
-        &mut state,
-        &mut scratch,
-        observation.observation(),
-        ModelTime::from_micros(240_000_000),
-    ) else {
+    observation.advance_model_time(ModelTime::from_micros(240_000_000))?;
+    let ScaleDecision::Apply(_first) = step(&mut state, &mut scratch, observation.observation())
+    else {
         return Err(TestError::UnexpectedHold);
     };
 
@@ -2282,12 +2238,10 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
                 demand_class: DemandClass::Normal,
             })?;
         }
-        let ScaleDecision::Apply(decision) = step(
-            &mut state,
-            &mut scratch,
-            observation.observation(),
-            ModelTime::from_micros(now_micros),
-        ) else {
+        observation.advance_model_time(ModelTime::from_micros(now_micros))?;
+        let ScaleDecision::Apply(decision) =
+            step(&mut state, &mut scratch, observation.observation())
+        else {
             return Err(TestError::UnexpectedHold);
         };
         apply = Some(decision);
@@ -2357,8 +2311,8 @@ fn posterior_mean(state: &ScaleState, query: PosteriorQuery) -> Result<f64, Test
 
 #[test]
 fn model_priors_carry_validated_artifacts() -> Result<(), TestError> {
-    let validated = crate::ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?;
-    assert_eq!(crate::ArrivalPrior::test_artifact()?, validated);
+    let validated = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?;
+    assert_eq!(ArrivalPrior::test_artifact()?, validated);
     assert_eq!(validated.artifact().version(), 1);
     assert_eq!(validated.coverage().len(), 4);
     assert!(
@@ -2389,7 +2343,7 @@ fn configuration() -> Result<Configuration, TestError> {
         report_interval_micros: 1_000_000,
         resource_window_attempt_count_max: 100_000,
         failure_service_weight: 0.3_f64,
-        arrival_prior: crate::ArrivalPrior::test_artifact()?,
+        arrival_prior: ArrivalPrior::test_artifact()?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
         reliability_prior: ReliabilityPrior::authored()?,
         launch_time_prior: LaunchPrior::kubernetes()?,
@@ -2416,17 +2370,13 @@ fn decision_with_threads(thread_count: usize) -> Result<ScaleDecision, TestError
                 demand_class: DemandClass::Normal,
             })?;
         }
-        Ok(step(
-            &mut state,
-            &mut scratch,
-            observation.observation(),
-            ModelTime::from_micros(1),
-        ))
+        observation.advance_model_time(ModelTime::from_micros(1))?;
+        Ok(step(&mut state, &mut scratch, observation.observation()))
     })
 }
 
-fn negligible_arrival_prior() -> Result<crate::ArrivalPrior, TestError> {
-    Ok(crate::ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?)
+fn negligible_arrival_prior() -> Result<ArrivalPrior, TestError> {
+    Ok(ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?)
 }
 
 fn grid() -> Result<CapacityGrid, TestError> {
@@ -2488,7 +2438,7 @@ fn capacity_factor_with_rate(
     Ok(CapacityFactor::new_with_prior(
         grid,
         change_rate_per_second,
-        &crate::ArrivalPrior::test_artifact()?,
+        &ArrivalPrior::test_artifact()?,
         concurrency_max,
         1.0_f64,
         100_000,

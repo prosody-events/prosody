@@ -615,7 +615,8 @@ impl Configuration {
     ///
     /// # Errors
     ///
-    /// Returns an error when any fixed capacity is zero.
+    /// Returns an error when any configuration value violates its documented
+    /// bound.
     pub fn validate(&self) -> Result<(), ConfigurationError> {
         if self.cohort_count_max == 0 {
             return Err(ConfigurationError::ZeroBound {
@@ -1247,6 +1248,7 @@ struct LaunchEvidenceHeader {
 /// Borrowed typed input for one controller tick.
 #[derive(Debug)]
 pub struct GroupObservation<'a> {
+    pub(crate) model_time: ModelTime,
     pub(crate) cohorts: &'a CohortColumns,
     pub(crate) backlog: &'a BacklogColumns,
     pub(crate) arrivals: Option<ArrivalEvidence>,
@@ -1540,10 +1542,11 @@ impl ObservationBuffer {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid work or a full cohort buffer.
+    /// Returns an error for an invalid cohort, deadline, partition, or buffer
+    /// capacity.
     pub fn push_cohort(&mut self, cohort: Cohort) -> Result<(), ObservationError> {
         cohort.validate()?;
-        if cohort.deadline_micros > self.deadline_max_micros() {
+        if cohort.deadline_micros > self.deadline_horizon_micros() {
             return Err(ObservationError::DeadlineHorizon);
         }
         if cohort.partition >= self.partition_count {
@@ -1560,10 +1563,17 @@ impl ObservationBuffer {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unknown partition or a duplicate observation.
+    /// Returns an error for an unknown partition, an excessive deadline, or
+    /// duplicate evidence.
     pub fn set_backlog(&mut self, backlog: BacklogCohort) -> Result<(), ObservationError> {
         if backlog.partition() >= self.partition_count {
             return Err(ObservationError::PartitionIndex);
+        }
+        let deadline_micros = backlog
+            .oldest_arrival_micros()
+            .saturating_add(self.budget_micros);
+        if deadline_micros > self.deadline_horizon_micros() {
+            return Err(ObservationError::DeadlineHorizon);
         }
         let index = backlog.partition() as usize * DemandClass::COUNT_USIZE
             + backlog.demand_class().index();
@@ -1629,8 +1639,8 @@ impl ObservationBuffer {
     ///
     /// # Errors
     ///
-    /// Returns an error for excess entries, invalid counts, or decreasing
-    /// times.
+    /// Returns an error for excess entries, zero or overflowing counts,
+    /// decreasing times, or excessive deadlines.
     pub fn set_scheduled_releases(
         &mut self,
         releases: &[ScheduledRelease],
@@ -1647,12 +1657,12 @@ impl ObservationBuffer {
         {
             return Err(ObservationError::ScheduledReleaseOrder);
         }
-        let deadline_max_micros = self.deadline_max_micros();
+        let deadline_horizon_micros = self.deadline_horizon_micros();
         if releases.iter().any(|release| {
             release
                 .release_micros
                 .checked_add(self.budget_micros)
-                .is_none_or(|deadline| deadline > deadline_max_micros)
+                .is_none_or(|deadline| deadline > deadline_horizon_micros)
         }) {
             return Err(ObservationError::DeadlineHorizon);
         }
@@ -1672,7 +1682,7 @@ impl ObservationBuffer {
         Ok(())
     }
 
-    fn deadline_max_micros(&self) -> u64 {
+    fn deadline_horizon_micros(&self) -> u64 {
         self.model_time
             .as_micros()
             .saturating_add(self.deadline_offset_max_micros)
@@ -1959,6 +1969,7 @@ impl ObservationBuffer {
                     token,
                 });
         GroupObservation {
+            model_time: self.model_time,
             cohorts: &self.cohorts,
             backlog: &self.backlog,
             arrivals: self.arrivals.take(),
