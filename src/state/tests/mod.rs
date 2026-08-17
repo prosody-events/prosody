@@ -731,6 +731,7 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
             StateName::try_new("presence")?,
         );
 
+        // Seed one committed present key.
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(1),
         };
@@ -751,6 +752,7 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
             .map_err(|e| eyre!("{e}"))?;
         finalize_and_promote(&seed_session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
 
+        // Fresh cold session, fresh resolve counter, one live dirty overlay.
         counting.reset();
         let resolves = ResolveCounter::default();
         let event = EventRef::Message {
@@ -796,12 +798,12 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
             .set(K3, Value::from(K3))
             .await
             .map_err(|e| eyre!("{e}"))?;
-        assert!(
-            handle.contains_key(&K3).await.map_err(|e| eyre!("{e}"))?,
-            "set after clear -> true"
-        );
-        assert_contains_presence_counts(&counting, &resolves);
+        assert!(handle.contains_key(&K3).await.map_err(|e| eyre!("{e}"))?);
+        assert_eq!(resolves.resolves(), 0);
+        assert_eq!(counting.presence_reads(), 2);
+        assert_eq!(counting.batch_reads(), 0);
 
+        // Contrast: the K3 cell IS resolvable, so the zero above is a real skip.
         assert!(handle.get(&K3).await.map_err(|e| eyre!("{e}"))?.is_some());
         assert!(
             resolves.resolves() >= 1,
@@ -809,15 +811,6 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
         );
         Ok(())
     })
-}
-
-fn assert_contains_presence_counts(
-    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
-    resolves: &ResolveCounter,
-) {
-    assert_eq!(resolves.resolves(), 0);
-    assert_eq!(counting.presence_reads(), 2);
-    assert_eq!(counting.batch_reads(), 0);
 }
 
 /// The key-scan resolver-skip pin: `keys()` runs the resolver zero times on

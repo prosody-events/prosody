@@ -7,14 +7,15 @@
 //! collection-layer handles over this one trait and the durability layer is
 //! written exactly once.
 //!
-//! Its currency is the resolved [`Committed`] cell: `get` and `scan_cells`
-//! oracle-resolve any in-flight provisional cell **inside the backend** before
-//! yielding, so callers above it (the `Overlay`
-//! dirty overlay, the [`Cached`](super::cached::Cached) write-through cache)
-//! are oracle-free and merely delegate down. The `own: EventRef` argument lets
-//! the bottom store short-circuit to `prev` for the running handler's own
-//! provisional cell without an oracle consult (the own-event-base-is-prev
-//! invariant); the per-event session injects it, so collections never pass it.
+//! Its currency is the resolved [`Committed`] cell. `get`, `get_many`,
+//! `scan_cells`, `scan_keys`, and `contains_many` oracle-resolve provisional
+//! cells **inside the backend** before they return. Thus, the `Overlay` dirty
+//! overlay and the [`Cached`](super::cached::Cached) store do not use the
+//! oracle. They delegate resolution to lower stores. The `own: EventRef`
+//! argument lets the bottom store short-circuit to `prev` for the running
+//! handler's own provisional cell without an oracle consult (the
+//! own-event-base-is-prev invariant); the per-event session injects it, so
+//! collections never pass it.
 //!
 //! # Collection-grain atomicity invariant
 //!
@@ -66,10 +67,11 @@ pub use super::store_types::{
 
 /// Uniform durable storage for the cells of one collection partition.
 ///
-/// `get` is a resolving point read and `scan_cells` a resolving single-section
-/// range stream; `provisional_cells` is the whole-partition recovery scan. The
-/// three mutators take a collection's touched cells as a batch and map onto the
-/// durability sequence:
+/// `get` and `get_many` are resolving point reads. `scan_cells` and `scan_keys`
+/// are resolving range streams. `contains_many` is their batch presence twin.
+/// `provisional_cells` is the whole-partition recovery scan. The three mutators
+/// take a collection's touched cells as a batch and map onto the durability
+/// sequence:
 ///
 /// * [`Self::write_provisional`] — *stage*: writes `data | prev | event` for
 ///   each cell (the `ReadCommitted` outcome path).
@@ -103,9 +105,9 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// (`help_read_window` in `resolve`) before the read is served, so a
     /// committed-but-unapplied clear can never serve pre-clear rows. Markers
     /// without clears are left standing — first-touch resolution stays
-    /// cell-grained and marker-free. [`Self::scan_cells`] and the cache-fill
-    /// twin [`Self::get_for_cache`] share the same implementation, so the
-    /// contract holds across all three reads.
+    /// cell-grained and marker-free. [`Self::scan_cells`], [`Self::scan_keys`],
+    /// [`Self::get_many`], [`Self::contains_many`], and the cache-fill reads
+    /// use the same guard.
     ///
     /// # Errors
     ///

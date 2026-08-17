@@ -236,8 +236,8 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
         }
     }
 
-    /// The unfenced presence-only body: the same chunking, with the value bytes
-    /// used as a presence bit and discarded.
+    /// The unfenced presence-only body uses the same chunking. It reads one
+    /// presence bit for each key.
     fn key_source(self) -> impl Stream<Item = KeyItem<T>> + Send {
         try_stream! {
             let Self { base, keys } = self;
@@ -365,8 +365,8 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
         fenced::<S, _, T>(session, self.entry_source())
     }
 
-    /// Streams the section's live keys in `dir` order, **without decoding or
-    /// resolving any value** — the paged envelope's value bytes are discarded.
+    /// Streams the section's live keys in `dir` order through presence-only
+    /// pages. It does not transfer, decode, or resolve a value.
     pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
         let session = self.base.session.clone();
         fenced::<S, _, T>(session, self.key_source())
