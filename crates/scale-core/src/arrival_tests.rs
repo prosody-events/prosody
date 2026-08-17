@@ -1,10 +1,15 @@
+use std::array::from_fn;
+
 use allocation_counter::measure;
 use quickcheck_macros::quickcheck;
+use statrs::distribution::{ContinuousCDF, Gamma};
+use statrs::function::gamma::gamma_ur;
 use thiserror::Error;
 
 use super::{
-    ArrivalEvidence, ArrivalFactor, ArrivalPrior, CELL_COUNT, HAZARD_COUNT, RATE_COUNT,
-    RESET_COUNT, T_MAX_SECONDS, cell, poisson_mass,
+    ArrivalEvidence, ArrivalFactor, ArrivalPrior, ArrivalPriorError, CELL_COUNT, EPSILON_BOUNDARY,
+    HAZARD_COUNT, RATE_COUNT, RESET_COUNT, T_MAX_SECONDS, arrival_coverage, cell, poisson_mass,
+    sample_path_counts,
 };
 use crate::types::{CalendarColumns, CalendarForecast};
 use crate::{CalendarArtifactId, CalendarRateSegment, RandomStream};
@@ -63,7 +68,7 @@ fn boundary_filter_matches_exhaustive_one_step(count_code: u8, duration_code: u1
 }
 
 #[test]
-fn update_path_does_not_allocate() -> Result<(), super::ArrivalPriorError> {
+fn update_path_does_not_allocate() -> Result<(), ArrivalPriorError> {
     let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
     assert_eq!(
         ArrivalPrior::storage_bytes()?,
@@ -77,7 +82,155 @@ fn update_path_does_not_allocate() -> Result<(), super::ArrivalPriorError> {
 }
 
 #[test]
-fn crossing_interval_updates_its_start_calendar_segment() -> Result<(), super::ArrivalPriorError> {
+fn reset_cell_masses_are_exact_and_exhaustive() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
+    let factor = ArrivalFactor::new(&model);
+    let mean = model.shape() / model.rate_seconds();
+
+    for (shape, masses) in [1.0_f64, 2.0_f64, 4.0_f64]
+        .into_iter()
+        .zip(factor.reset_probability)
+    {
+        let distribution = Gamma::new(shape, shape).map_err(|_| TestError::Distribution)?;
+        let lower_boundary = factor.rates[0] * 2.0_f64.powf(0.125_f64) / mean;
+        let upper_boundary = factor.rates[RATE_COUNT - 1] * 2.0_f64.powf(-0.125_f64) / mean;
+
+        assert!((masses.iter().sum::<f64>() - 1.0_f64).abs() <= 2.0e-15_f64);
+        assert!((masses[0] - distribution.cdf(lower_boundary)).abs() <= f64::EPSILON);
+        assert!(
+            (masses[RATE_COUNT - 1] - (1.0_f64 - distribution.cdf(upper_boundary))).abs()
+                <= f64::EPSILON
+        );
+        let high_index = 219;
+        let high_lower = factor.rates[high_index] * 2.0_f64.powf(-0.125_f64) / mean;
+        let high_upper = factor.rates[high_index] * 2.0_f64.powf(0.125_f64) / mean;
+        let high_mass = gamma_ur(shape, shape * high_lower) - gamma_ur(shape, shape * high_upper);
+        assert!(masses[high_index] > 0.0_f64);
+        assert!((masses[high_index] - high_mass).abs() <= f64::EPSILON * high_mass);
+    }
+    for (record, shape) in model.coverage()[..RESET_COUNT]
+        .iter()
+        .zip([1.0_f64, 2.0_f64, 4.0_f64])
+    {
+        let distribution = Gamma::new(shape, shape).map_err(|_| TestError::Distribution)?;
+        assert!(
+            (record.lower_tail_probability() - distribution.cdf(record.lower_endpoint() / mean))
+                .abs()
+                <= f64::EPSILON
+        );
+        assert!(
+            (record.upper_tail_probability()
+                - (1.0_f64 - distribution.cdf(record.upper_endpoint() / mean)))
+            .abs()
+                <= f64::EPSILON
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn path_initial_draw_applies_the_elapsed_transition() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 90.0_f64)?;
+    let mut factor = ArrivalFactor::new(&model);
+    factor.probability.fill(0.0_f64);
+    factor.probability[cell(0, 1, RATE_COUNT - 1)] = 1.0_f64;
+    let mut ends = vec![0.0_f64; model.path_segment_count_max()];
+    let mut rates = vec![0.0_f64; model.path_segment_count_max()];
+    let mut total = 0.0_f64;
+
+    for seed in 0_u64..128 {
+        let length = factor.sample_rate_path(
+            1.0_f64,
+            &mut RandomStream::new(seed),
+            &mut ends,
+            &mut rates,
+            None,
+            604_800_000_000,
+        );
+        assert!(length > 0);
+        total += rates[0];
+    }
+
+    assert!(total / 128.0_f64 < 1_000.0_f64);
+    Ok(())
+}
+
+#[test]
+fn reset_coverage_rejects_each_boundary_tail() -> Result<(), TestError> {
+    let hazards = [1.0_f64 / 7_200.0_f64; HAZARD_COUNT];
+    let lower_rates = from_fn(|index| {
+        let index = u32::try_from(index).map_or(u32::MAX, |value| value);
+        2.0_f64.powf(f64::from(index) / 4.0_f64)
+    });
+    let upper_rates = from_fn(|index| {
+        let index = u32::try_from(index).map_or(u32::MAX, |value| value);
+        let last = u32::try_from(RATE_COUNT - 1).map_or(u32::MAX, |value| value);
+        2.0_f64.powf((f64::from(index) - f64::from(last)) / 4.0_f64)
+    });
+    let distribution = Gamma::new(1.0_f64, 1.0_f64).map_err(|_| TestError::Distribution)?;
+    let lower_tail = distribution.cdf(lower_rates[0] / 2.0_f64.powf(0.125_f64));
+    let lower_upper_tail =
+        1.0_f64 - distribution.cdf(lower_rates[RATE_COUNT - 1] * 2.0_f64.powf(0.125_f64));
+    let upper_lower_tail = distribution.cdf(upper_rates[0] / 2.0_f64.powf(0.125_f64));
+    let upper_tail =
+        1.0_f64 - distribution.cdf(upper_rates[RATE_COUNT - 1] * 2.0_f64.powf(0.125_f64));
+
+    assert!(lower_tail > EPSILON_BOUNDARY && lower_upper_tail <= EPSILON_BOUNDARY);
+    assert!(upper_tail > EPSILON_BOUNDARY && upper_lower_tail <= EPSILON_BOUNDARY);
+    assert_eq!(
+        arrival_coverage(1.0_f64, 1.0_f64, &lower_rates, &hazards),
+        Err(ArrivalPriorError::BoundaryMass)
+    );
+    assert_eq!(
+        arrival_coverage(1.0_f64, 1.0_f64, &upper_rates, &hazards),
+        Err(ArrivalPriorError::BoundaryMass)
+    );
+    Ok(())
+}
+
+#[test]
+fn expired_calendar_returns_the_local_marginal() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
+    let mut factor = ArrivalFactor::new(&model);
+    let mut segments = CalendarColumns::new(1);
+    segments.extend(&[CalendarRateSegment {
+        position: 0,
+        start_micros: 0,
+        end_micros: 2_000_000,
+        shape: 1_000.0_f64,
+        rate_seconds: 1.0_f64,
+    }]);
+    let calendar = CalendarForecast {
+        artifact: CalendarArtifactId(7),
+        prior_probability: 0.9_f64,
+        segments: &segments,
+    };
+
+    factor.prepare_calendar(Some(calendar), 1_000_000);
+    assert!(factor.expected_rate(1_000_000) > factor.marginal_mean(1_000_000));
+    let log_odds = factor.calendar_log_odds;
+    factor.prepare_calendar(Some(calendar), 2_000_000);
+
+    assert_eq!(factor.calendar_log_odds.to_bits(), log_odds.to_bits());
+    assert_eq!(
+        factor.expected_rate(2_000_000).to_bits(),
+        factor.marginal_mean(2_000_000).to_bits()
+    );
+    Ok(())
+}
+
+#[test]
+fn zero_length_path_segment_is_rejected() {
+    let random = RandomStream::new(1);
+    let ends = [0.0_f64];
+    let mut rates = [1.0_f64];
+
+    assert!(!sample_path_counts(&random, &ends, &mut rates, 1));
+    assert_eq!(rates[0].to_bits(), 1.0_f64.to_bits());
+}
+
+#[test]
+fn crossing_interval_updates_its_start_calendar_segment() -> Result<(), ArrivalPriorError> {
     let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 3_600.0_f64)?;
     let mut segments = CalendarColumns::new(2);
     segments.extend(&[
@@ -174,7 +327,9 @@ fn accepted_paths_end_at_the_requested_horizon(seed: u64, duration_code: u16) ->
 #[derive(Debug, Error)]
 enum TestError {
     #[error(transparent)]
-    Prior(#[from] super::ArrivalPriorError),
+    Prior(#[from] ArrivalPriorError),
     #[error(transparent)]
     Predictive(#[from] super::ArrivalPredictiveError),
+    #[error("test distribution is invalid")]
+    Distribution,
 }

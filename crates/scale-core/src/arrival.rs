@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use rand::RngExt;
 use statrs::distribution::{ContinuousCDF, DiscreteCDF, Gamma, NegativeBinomial, Poisson};
-use statrs::function::gamma::ln_gamma;
+use statrs::function::gamma::{gamma_lr, gamma_ur, ln_gamma};
 use thiserror::Error;
 
 use crate::change_point::ChangePointKernel;
@@ -255,6 +255,7 @@ pub(crate) struct ArrivalFactor {
     calendar_shape: f64,
     calendar_rate: f64,
     calendar_log_odds: f64,
+    calendar_active: bool,
     last_evidence_micros: u64,
 }
 
@@ -279,15 +280,25 @@ impl ArrivalFactor {
             model.authored_shape * 2.0_f64,
         ];
         let reset_probability = reset_shapes.map(|shape| {
-            let rate_parameter = shape / mean;
-            normalize(from_fn(|index| {
-                let rate = rates[index];
-                (shape * rate_parameter.ln() - ln_gamma(shape) + (shape - 1.0_f64) * rate.ln()
-                    - rate_parameter * rate
-                    + rate.ln())
-                .exp()
-                .max(f64::MIN_POSITIVE)
-            }))
+            from_fn(|index| {
+                if index == 0 {
+                    gamma_lr(shape, shape * rates[0] * 2.0_f64.powf(0.125_f64) / mean)
+                } else if index == RATE_COUNT - 1 {
+                    gamma_ur(
+                        shape,
+                        shape * rates[RATE_COUNT - 1] * 2.0_f64.powf(-0.125_f64) / mean,
+                    )
+                } else {
+                    let lower = rates[index] * 2.0_f64.powf(-0.125_f64) / mean;
+                    let upper = rates[index] * 2.0_f64.powf(0.125_f64) / mean;
+                    // Select the dominant tail to prevent CDF subtraction cancellation.
+                    if rates[index] <= mean {
+                        gamma_lr(shape, shape * upper) - gamma_lr(shape, shape * lower)
+                    } else {
+                        gamma_ur(shape, shape * lower) - gamma_ur(shape, shape * upper)
+                    }
+                }
+            })
         });
         let hazard_prior = normalize([
             0.001_349_612_f64,
@@ -317,6 +328,7 @@ impl ArrivalFactor {
             calendar_shape: 0.0_f64,
             calendar_rate: 0.0_f64,
             calendar_log_odds: f64::NEG_INFINITY,
+            calendar_active: false,
             last_evidence_micros: 0,
         }
     }
@@ -418,11 +430,14 @@ impl ArrivalFactor {
         evidence_start_micros: u64,
     ) {
         let Some(forecast) = calendar else {
+            self.calendar_active = false;
             return;
         };
         let Some(segment) = calendar_segment_at(forecast.segments, evidence_start_micros) else {
+            self.calendar_active = false;
             return;
         };
+        self.calendar_active = true;
         let artifact_changed = self.calendar_artifact != Some(forecast.artifact);
         if artifact_changed || self.calendar_position != forecast.segments.position(segment) {
             self.calendar_artifact = Some(forecast.artifact);
@@ -437,6 +452,9 @@ impl ArrivalFactor {
 
     pub(crate) fn expected_rate(&self, now_micros: u64) -> f64 {
         let local = self.marginal_mean(now_micros);
+        if !self.calendar_active {
+            return local;
+        }
         let calendar = if self.calendar_rate > 0.0_f64 {
             self.calendar_shape / self.calendar_rate
         } else {
@@ -632,16 +650,22 @@ impl ArrivalFactor {
                 end_seconds,
                 rates,
             );
-            sample_path_counts(
+            if sample_path_counts(
                 &random.clone().domain(ARRIVAL_COUNT_DOMAIN),
                 end_seconds,
                 rates,
                 length,
-            );
-            return length;
+            ) {
+                return length;
+            }
         }
+        let elapsed = Duration::from_micros(now_micros.saturating_sub(self.last_evidence_micros))
+            .as_secs_f64();
         loop {
             let (hazard, reset, mut rate) = self.sample_joint(random);
+            if random.random::<f64>() >= (-self.hazards[hazard] * elapsed).exp() {
+                rate = sample_discrete(&self.reset_probability[reset], random);
+            }
             let mut cursor = 0.0_f64;
             let mut length = 0;
             loop {
@@ -651,13 +675,15 @@ impl ArrivalFactor {
                 rates[length] = self.rates[rate];
                 length += 1;
                 if end >= duration_seconds {
-                    sample_path_counts(
+                    if sample_path_counts(
                         &random.clone().domain(ARRIVAL_COUNT_DOMAIN),
                         end_seconds,
                         rates,
                         length,
-                    );
-                    return length;
+                    ) {
+                        return length;
+                    }
+                    break;
                 }
                 if length > self.model.path_change_bound {
                     break;
@@ -783,12 +809,12 @@ fn arrival_coverage(
         .iter_mut()
         .zip([shape * 0.5_f64, shape, shape * 2.0_f64])
     {
-        let distribution = Gamma::new(reset_shape, reset_shape.recip())
-            .map_err(|_| ArrivalPriorError::InvalidRate)?;
+        let distribution =
+            Gamma::new(reset_shape, reset_shape).map_err(|_| ArrivalPriorError::InvalidRate)?;
         let lower_endpoint = rates[0] / 2.0_f64.powf(0.125_f64);
         let upper_endpoint = rates[RATE_COUNT - 1] * 2.0_f64.powf(0.125_f64);
         let lower_tail = distribution.cdf(lower_endpoint / mean);
-        let upper_tail = 1.0_f64 - distribution.cdf(upper_endpoint / mean);
+        let upper_tail = gamma_ur(reset_shape, reset_shape * upper_endpoint / mean);
         if !lower_tail.is_finite() || !upper_tail.is_finite() {
             return Err(ArrivalPriorError::InvalidRate);
         }
@@ -868,16 +894,20 @@ fn sample_path_counts(
     end_seconds: &[f64],
     rates: &mut [f64],
     length: usize,
-) {
+) -> bool {
     let mut start = 0.0_f64;
     for segment in 0..length {
         let duration = end_seconds[segment] - start;
+        if duration <= 0.0_f64 {
+            return false;
+        }
         let mean = PoissonMean::from_product(rates[segment], duration);
         // The named domain separates count noise from path-state draws.
         let mut segment_random = random.clone().domain(segment as u64);
         rates[segment] = count_as_f64(sample_poisson(mean, &mut segment_random)) / duration;
         start = end_seconds[segment];
     }
+    true
 }
 
 fn calendar_segment_at(segments: &CalendarColumns, now_micros: u64) -> Option<usize> {
