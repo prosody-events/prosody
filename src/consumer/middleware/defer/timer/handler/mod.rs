@@ -117,16 +117,22 @@ where
             .map_err(DeferError::Handler)
     }
 
-    fn on_excise<C>(
+    async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type)
+        let key = message.key().clone();
+        let context = TimerDeferContext::new(context, self.store.clone(), key);
+        self.handler
+            .on_excise(context, message, demand_type)
+            .await
+            .map(TimerDeferOutput::Inner)
+            .map_err(DeferError::Handler)
     }
 
     async fn on_timer<C>(

@@ -282,16 +282,23 @@ where
             .map_err(MonopolizationError::Handler)
     }
 
-    fn on_excise<C>(
+    async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type)
+        let tp_key = TopicPartitionKey::new(self.topic, self.partition, message.key().clone());
+        if let Some(error) = self.check_monopolization(&tp_key, Instant::now()) {
+            return Err(error);
+        }
+        self.handler
+            .on_excise(context, message, demand_type)
+            .await
+            .map_err(MonopolizationError::Handler)
     }
 
     async fn on_timer<C>(

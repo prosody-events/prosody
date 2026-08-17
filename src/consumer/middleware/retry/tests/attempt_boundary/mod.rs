@@ -73,31 +73,10 @@ struct AttemptAwareHandler {
     calls: Arc<AtomicUsize>,
 }
 
-impl FallibleHandler for AttemptAwareHandler {
-    type Error = TestError;
-    type Output = ();
-    type Payload = Value;
-
-    async fn on_excise<C>(
-        &self,
-        context: C,
-        message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+impl AttemptAwareHandler {
+    async fn handle<C>(&self, context: C, demand_type: DemandType) -> Result<(), TestError>
     where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        FallibleHandler::on_message(self, context, message, demand_type).await
-    }
-
-    async fn on_message<C>(
-        &self,
-        context: C,
-        _message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        C: EventContext<Payload = Self::Payload>,
+        C: EventContext<Payload = Value>,
     {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match demand_type {
@@ -122,6 +101,36 @@ impl FallibleHandler for AttemptAwareHandler {
                 Ok(())
             }
         }
+    }
+}
+
+impl FallibleHandler for AttemptAwareHandler {
+    type Error = TestError;
+    type Output = ();
+    type Payload = Value;
+
+    async fn on_excise<C>(
+        &self,
+        context: C,
+        _message: ConsumerMessage<()>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.handle(context, demand_type).await
+    }
+
+    async fn on_message<C>(
+        &self,
+        context: C,
+        _message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.handle(context, demand_type).await
     }
 
     async fn on_timer<C>(
@@ -229,31 +238,10 @@ struct FinalHookReadHandler {
     read: Arc<Mutex<Option<ReadObs>>>,
 }
 
-impl FallibleHandler for FinalHookReadHandler {
-    type Error = TestError;
-    type Output = ();
-    type Payload = Value;
-
-    async fn on_excise<C>(
-        &self,
-        context: C,
-        message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+impl FinalHookReadHandler {
+    async fn handle<C>(&self, context: C, demand_type: DemandType) -> Result<(), TestError>
     where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        FallibleHandler::on_message(self, context, message, demand_type).await
-    }
-
-    async fn on_message<C>(
-        &self,
-        context: C,
-        _message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        C: EventContext<Payload = Self::Payload>,
+        C: EventContext<Payload = Value>,
     {
         match demand_type {
             DemandType::Normal => Err(TestError(ErrorCategory::Transient)),
@@ -268,6 +256,36 @@ impl FallibleHandler for FinalHookReadHandler {
                 Ok(())
             }
         }
+    }
+}
+
+impl FallibleHandler for FinalHookReadHandler {
+    type Error = TestError;
+    type Output = ();
+    type Payload = Value;
+
+    async fn on_excise<C>(
+        &self,
+        context: C,
+        _message: ConsumerMessage<()>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.handle(context, demand_type).await
+    }
+
+    async fn on_message<C>(
+        &self,
+        context: C,
+        _message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.handle(context, demand_type).await
     }
 
     async fn on_timer<C>(

@@ -223,7 +223,7 @@ pub trait FallibleHandler: Send + Sync + 'static {
     fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
     where
@@ -374,4 +374,62 @@ pub trait FallibleHandler: Send + Sync + 'static {
     /// `inner.shutdown().await`; otherwise the inner handler's resources
     /// leak.
     fn shutdown(self) -> impl Future<Output = ()> + Send;
+}
+
+pub(crate) trait HandlerMethod<H>
+where
+    H: FallibleHandler,
+{
+    type MessagePayload: Send + Sync + 'static;
+
+    fn call<C>(
+        handler: &H,
+        context: C,
+        message: ConsumerMessage<Self::MessagePayload>,
+        demand_type: DemandType,
+    ) -> impl Future<Output = Result<H::Output, H::Error>> + Send
+    where
+        C: EventContext<Payload = H::Payload>;
+}
+
+pub(crate) struct OnMessage;
+
+impl<H> HandlerMethod<H> for OnMessage
+where
+    H: FallibleHandler,
+{
+    type MessagePayload = H::Payload;
+
+    fn call<C>(
+        handler: &H,
+        context: C,
+        message: ConsumerMessage<Self::MessagePayload>,
+        demand_type: DemandType,
+    ) -> impl Future<Output = Result<H::Output, H::Error>> + Send
+    where
+        C: EventContext<Payload = H::Payload>,
+    {
+        handler.on_message(context, message, demand_type)
+    }
+}
+
+pub(crate) struct OnExcise;
+
+impl<H> HandlerMethod<H> for OnExcise
+where
+    H: FallibleHandler,
+{
+    type MessagePayload = ();
+
+    fn call<C>(
+        handler: &H,
+        context: C,
+        message: ConsumerMessage<()>,
+        demand_type: DemandType,
+    ) -> impl Future<Output = Result<H::Output, H::Error>> + Send
+    where
+        C: EventContext<Payload = H::Payload>,
+    {
+        handler.on_excise(context, message, demand_type)
+    }
 }

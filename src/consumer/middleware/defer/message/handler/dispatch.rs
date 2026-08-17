@@ -2,12 +2,13 @@ use tracing::debug;
 
 use super::{MessageDeferHandler, MessageDeferOutput};
 use crate::consumer::event_context::EventContext;
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::{ConsumerMessage, ConsumerRecord};
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
 use crate::consumer::middleware::defer::decider::DeferralDecider;
 use crate::consumer::middleware::defer::error::DeferError;
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
+use crate::consumer::middleware::handler::{OnExcise, OnMessage};
 use crate::consumer::{DemandType, Keyed};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
@@ -95,16 +96,43 @@ where
     }
 
     /// Processes an excise record with the message defer policy.
-    fn on_excise<C>(
+    async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type)
+        if self
+            .store
+            .is_deferred(message.key())
+            .await
+            .map_err(DeferError::Store)?
+            .is_some()
+        {
+            return self
+                .append_to_deferred_queue(message.key(), message.offset())
+                .await;
+        }
+        let key = message.key().clone();
+        let offset = message.offset();
+        let error = match self
+            .handler
+            .on_excise(context.clone(), message, demand_type)
+            .await
+        {
+            Ok(output) => return Ok(MessageDeferOutput::Inner(output)),
+            Err(error) => error,
+        };
+        if !matches!(error.classify_error(), ErrorCategory::Transient)
+            || !self.config.enabled
+            || !self.decider.should_defer()
+        {
+            return Err(DeferError::Handler(error));
+        }
+        self.defer_message(context, &key, offset, error).await
     }
 
     /// Keeps each deferred-message trigger inside this middleware.
@@ -177,15 +205,17 @@ where
         // retry re-dispatch of this same timer after a durable queue advance
         // loads the next head and re-points the override at it.
         if let Ok(marker) = context.marker_identity() {
-            marker.set_reload_marker(MessageMarker::new(dedup_uuid_for_message(
-                DedupIdentity {
-                    version: &self.dedup_version,
-                    group_id: &self.source,
-                    topic: self.topic.as_ref(),
-                    partition: self.partition,
-                },
-                &message,
-            )));
+            let identity = DedupIdentity {
+                version: &self.dedup_version,
+                group_id: &self.source,
+                topic: self.topic.as_ref(),
+                partition: self.partition,
+            };
+            let dedup_id = match &message {
+                ConsumerRecord::Message(message) => dedup_uuid_for_message(identity, message),
+                ConsumerRecord::Excise(message) => dedup_uuid_for_message(identity, message),
+            };
+            marker.set_reload_marker(MessageMarker::new(dedup_id));
         }
 
         debug!(
@@ -197,8 +227,30 @@ where
             "Loaded deferred message - attempting retry"
         );
 
-        self.retry_deferred_message(context, &trigger, message_key, offset, retry_count, message)
-            .await
+        match message {
+            ConsumerRecord::Message(message) => {
+                self.retry_deferred_message::<OnMessage, _>(
+                    context,
+                    &trigger,
+                    message_key,
+                    offset,
+                    retry_count,
+                    message,
+                )
+                .await
+            }
+            ConsumerRecord::Excise(message) => {
+                self.retry_deferred_message::<OnExcise, _>(
+                    context,
+                    &trigger,
+                    message_key,
+                    offset,
+                    retry_count,
+                    message,
+                )
+                .await
+            }
+        }
     }
 
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)

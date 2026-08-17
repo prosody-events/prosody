@@ -175,7 +175,7 @@ where
     async fn on_excise<C2>(
         &self,
         context: C2,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

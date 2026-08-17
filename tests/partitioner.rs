@@ -67,6 +67,17 @@ impl EventHandler for PartitionCaptureHandler {
         uncommitted.commit().await;
     }
 
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<()>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        message.commit().await;
+    }
+
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext<Payload = Self::Payload>,

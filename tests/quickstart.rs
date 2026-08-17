@@ -64,7 +64,7 @@ impl FallibleHandler for MyHandler {
     async fn on_excise<C>(
         &self,
         _context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

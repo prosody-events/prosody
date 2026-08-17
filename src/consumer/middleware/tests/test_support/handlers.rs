@@ -34,6 +34,17 @@ impl EventHandler for SilentHandler {
         uncommitted.commit().await;
     }
 
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<()>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        message.commit().await;
+    }
+
     async fn on_timer<C, T>(&self, _context: C, timer: T, _demand_type: DemandType)
     where
         C: EventContext<Payload = Self::Payload>,
@@ -213,7 +224,7 @@ impl FallibleHandler for ScriptedHandler {
     async fn on_excise<C>(
         &self,
         _context: C,
-        _message: ConsumerMessage<Self::Payload>,
+        _message: ConsumerMessage<()>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -243,14 +254,14 @@ impl FallibleHandler for BypassedHandler {
 
     async fn on_excise<C>(
         &self,
-        context: C,
-        message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
+        _context: C,
+        _message: ConsumerMessage<()>,
+        _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type).await
+        Ok(())
     }
 
     async fn on_message<C>(
@@ -290,9 +301,9 @@ impl SettlementHandler for BypassedHandler {
 ///
 /// Surfaces the (never-in-practice) permit-acquisition failure rather than
 /// swallowing it, per the testing rules.
-pub fn create_test_message_from(
-    value: ConsumerMessageValue<Value>,
-) -> color_eyre::Result<ConsumerMessage<Value>> {
+pub fn create_test_message_from<P>(
+    value: ConsumerMessageValue<P>,
+) -> color_eyre::Result<ConsumerMessage<P>> {
     let semaphore = Arc::new(Semaphore::new(10));
     let permit = semaphore.try_acquire_owned()?;
     Ok(ConsumerMessage::new(value, Span::current(), permit))

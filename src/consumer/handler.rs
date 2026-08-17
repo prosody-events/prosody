@@ -106,6 +106,16 @@ pub trait EventHandler {
     where
         C: EventContext<Payload = Self::Payload>;
 
+    /// Processes an excise record.
+    fn on_excise<C>(
+        &self,
+        context: C,
+        message: UncommittedMessage<()>,
+        demand_type: DemandType,
+    ) -> impl Future<Output = ()> + Send
+    where
+        C: EventContext<Payload = Self::Payload>;
+
     /// Handles timer events when they fire.
     ///
     /// This method is called when a scheduled timer reaches its execution time

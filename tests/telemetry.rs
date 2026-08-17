@@ -59,7 +59,7 @@ macro_rules! ignore_excise {
         async fn on_excise<C>(
             &self,
             _: C,
-            _: ConsumerMessage<Value>,
+            _: ConsumerMessage<()>,
             _: DemandType,
         ) -> Result<(), Self::Error>
         where
@@ -293,9 +293,8 @@ impl FallibleHandler for ClearAndScheduleHandler {
     {
         let key = msg.key().to_string();
         let step = msg
-            .record()
-            .message()
-            .and_then(|payload| payload.get("step"))
+            .payload()
+            .get("step")
             .and_then(Value::as_i64)
             .ok_or(TestError)?;
 

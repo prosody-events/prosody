@@ -53,11 +53,11 @@ impl EventHandler for SlowTimerHandler {
     {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
-        let payload = msg.record().message();
+        let payload = msg.payload();
 
         // Schedule a timer based on the message
         if let Some(delay_ms) = payload
-            .and_then(|payload| payload.get("schedule_timer_delay_ms"))
+            .get("schedule_timer_delay_ms")
             .and_then(Value::as_u64)
         {
             let delay_secs = (delay_ms / 1000).max(1) as u32; // Convert to seconds, minimum 1
@@ -78,6 +78,17 @@ impl EventHandler for SlowTimerHandler {
         }
 
         uncommitted.commit().await;
+    }
+
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<()>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        message.commit().await;
     }
 
     async fn on_timer<C, U>(&self, _context: C, timer: U, _demand_type: DemandType)

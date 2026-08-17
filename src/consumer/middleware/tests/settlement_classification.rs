@@ -69,13 +69,13 @@ fn leaf_handler_is_final_on_both_sides() {
 }
 
 #[tokio::test]
-async fn leaf_dispatches_excise_record_to_excise() -> color_eyre::Result<()> {
+async fn leaf_dispatches_excise_to_excise() -> color_eyre::Result<()> {
     let handler = ScriptedHandler::success();
     let message = create_test_message_from(ConsumerMessageValue {
-        record: Record::Excise,
+        payload: (),
         ..Default::default()
     })?;
-    FallibleHandler::on_message(
+    FallibleHandler::on_excise(
         &LeafHandler::new(handler.clone()),
         MockEventContext::new(),
         message,

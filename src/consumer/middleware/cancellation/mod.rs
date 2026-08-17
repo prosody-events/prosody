@@ -53,6 +53,7 @@ use tracing::debug;
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::handler::{HandlerMethod, OnExcise, OnMessage};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
     Settlement, SettlementHandler,
@@ -87,6 +88,40 @@ pub struct CancellationHandler<T> {
 impl<T> CancellationHandler<T> {
     pub(crate) fn new(handler: T) -> Self {
         Self { handler }
+    }
+}
+
+impl<T> CancellationHandler<T>
+where
+    T: FallibleHandler,
+{
+    async fn handle<H, C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<H::MessagePayload>,
+        demand_type: DemandType,
+    ) -> Result<T::Output, CancellationError<T::Error>>
+    where
+        H: HandlerMethod<T>,
+        C: EventContext<Payload = T::Payload>,
+    {
+        if context.is_shutdown() {
+            return Err(CancellationError::Shutdown);
+        }
+        if context.is_message_cancelled() {
+            return Err(CancellationError::MessageCancelled);
+        }
+        H::call(&self.handler, context.clone(), message, demand_type)
+            .await
+            .map_err(|error| {
+                if context.is_shutdown()
+                    && matches!(error.classify_error(), ErrorCategory::Transient)
+                {
+                    CancellationError::ShutdownAfterInner(error)
+                } else {
+                    CancellationError::Handler(error)
+                }
+            })
     }
 }
 
@@ -138,37 +173,21 @@ where
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        if context.is_shutdown() {
-            return Err(CancellationError::Shutdown);
-        }
-        if context.is_message_cancelled() {
-            return Err(CancellationError::MessageCancelled);
-        }
-
-        self.handler
-            .on_message(context.clone(), message, demand_type)
+        self.handle::<OnMessage, _>(context, message, demand_type)
             .await
-            .map_err(|error| {
-                if context.is_shutdown()
-                    && matches!(error.classify_error(), ErrorCategory::Transient)
-                {
-                    CancellationError::ShutdownAfterInner(error)
-                } else {
-                    CancellationError::Handler(error)
-                }
-            })
     }
 
-    fn on_excise<C>(
+    async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type)
+        self.handle::<OnExcise, _>(context, message, demand_type)
+            .await
     }
 
     async fn on_timer<C>(

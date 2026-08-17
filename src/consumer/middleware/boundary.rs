@@ -90,6 +90,22 @@ where
         settle(self, context, uncommitted_offset, result).await;
     }
 
+    async fn on_excise<C>(
+        &self,
+        context: C,
+        message: UncommittedMessage<()>,
+        demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = T::Payload>,
+    {
+        let (message, uncommitted_offset) = message.into_inner();
+        let result = FallibleHandler::on_excise(self, context.clone(), message, demand_type).await;
+        if let Err(error) = &result {
+            self.on_message_error(error);
+        }
+        settle(self, context, uncommitted_offset, result).await;
+    }
+
     async fn on_timer<C, U>(&self, context: C, timer: U, demand_type: DemandType)
     where
         C: EventContext<Payload = T::Payload>,

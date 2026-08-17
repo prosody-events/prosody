@@ -8,31 +8,10 @@ struct IntermediateHookHandler {
     commits: Arc<Mutex<Vec<CommitObs>>>,
 }
 
-impl FallibleHandler for IntermediateHookHandler {
-    type Error = TestError;
-    type Output = ();
-    type Payload = Value;
-
-    async fn on_excise<C>(
-        &self,
-        context: C,
-        message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
+impl IntermediateHookHandler {
+    async fn handle<C>(&self, context: C) -> Result<(), TestError>
     where
-        C: EventContext<Payload = Self::Payload>,
-    {
-        FallibleHandler::on_message(self, context, message, demand_type).await
-    }
-
-    async fn on_message<C>(
-        &self,
-        context: C,
-        _message: ConsumerMessage<Self::Payload>,
-        _demand_type: DemandType,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        C: EventContext<Payload = Self::Payload>,
+        C: EventContext<Payload = Value>,
     {
         let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let handle = context
@@ -47,6 +26,36 @@ impl FallibleHandler for IntermediateHookHandler {
         } else {
             Err(TestError(ErrorCategory::Transient))
         }
+    }
+}
+
+impl FallibleHandler for IntermediateHookHandler {
+    type Error = TestError;
+    type Output = ();
+    type Payload = Value;
+
+    async fn on_excise<C>(
+        &self,
+        context: C,
+        _message: ConsumerMessage<()>,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.handle(context).await
+    }
+
+    async fn on_message<C>(
+        &self,
+        context: C,
+        _message: ConsumerMessage<Self::Payload>,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.handle(context).await
     }
 
     async fn on_timer<C>(

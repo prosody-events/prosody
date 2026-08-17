@@ -320,6 +320,17 @@ impl EventHandler for PanicLeakHandler {
         }
     }
 
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<()>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        message.commit().await;
+    }
+
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
     where
         C: EventContext<Payload = Self::Payload>,
@@ -372,7 +383,7 @@ async fn process_event_wires_the_catch_for_a_panicking_handler() -> Result<()> {
     let partition_manager = PartitionManager::new(config, handler, "test-topic".into(), 0);
 
     partition_manager
-        .try_send(create_test_message(0, "key")?)
+        .try_send_record(ConsumerRecord::Message(create_test_message(0, "key")?))
         .map_err(|_| eyre!("message send rejected"))?;
 
     // The handler ran and buffered a set on the live attempt and is about

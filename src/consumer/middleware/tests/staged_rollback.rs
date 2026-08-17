@@ -156,14 +156,14 @@ impl FallibleHandler for SkipReadProbe {
 
     async fn on_excise<C>(
         &self,
-        context: C,
-        message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
+        _context: C,
+        _message: ConsumerMessage<()>,
+        _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type).await
+        Ok(0)
     }
 
     async fn on_message<C>(

@@ -162,7 +162,7 @@ impl FallibleHandler for SpanProbe {
     async fn on_excise<C>(
         &self,
         _context: C,
-        _message: ConsumerMessage<Self::Payload>,
+        _message: ConsumerMessage<()>,
         _demand_type: DemandType,
     ) -> Result<(), Infallible>
     where

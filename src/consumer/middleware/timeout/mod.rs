@@ -44,6 +44,7 @@ use validator::{Validate, ValidationErrors};
 use crate::consumer::DemandType;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::handler::{HandlerMethod, OnExcise, OnMessage};
 use crate::consumer::middleware::{
     FallibleHandler, FallibleHandlerProvider, HandlerMiddleware, Settlement, SettlementHandler,
 };
@@ -150,6 +151,30 @@ impl<T> TimeoutHandler<T> {
     }
 }
 
+impl<T> TimeoutHandler<T>
+where
+    T: FallibleHandler,
+{
+    async fn handle<H, C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<H::MessagePayload>,
+        demand_type: DemandType,
+        kind: &'static str,
+    ) -> Result<T::Output, T::Error>
+    where
+        H: HandlerMethod<T>,
+        C: EventContext<Payload = T::Payload>,
+    {
+        self.run_with_timeout(
+            context.clone(),
+            H::call(&self.handler, context, message, demand_type),
+            kind,
+        )
+        .await
+    }
+}
+
 /// Errors that can occur during timeout middleware initialization.
 #[derive(Debug, Error)]
 pub enum TimeoutInitError {
@@ -244,24 +269,21 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        self.run_with_timeout(
-            context.clone(),
-            self.handler.on_message(context, message, demand_type),
-            "message",
-        )
-        .await
+        self.handle::<OnMessage, _>(context, message, demand_type, "message")
+            .await
     }
 
-    fn on_excise<C>(
+    async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type)
+        self.handle::<OnExcise, _>(context, message, demand_type, "excise")
+            .await
     }
 
     async fn on_timer<C>(

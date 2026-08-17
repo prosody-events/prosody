@@ -232,8 +232,12 @@ async fn null_payload_loads_as_excise() -> color_eyre::Result<()> {
 
         let message = timeout(Duration::from_mins(1), loader.load_message(topic, 0, 0)).await??;
 
+        let ConsumerRecord::Excise(message) = message else {
+            return Err(color_eyre::eyre::eyre!(
+                "the loader returned a message payload"
+            ));
+        };
         assert_eq!(message.key().as_ref(), "test-key");
-        assert!(matches!(message.record(), Record::Excise));
         Ok(())
     })
     .await

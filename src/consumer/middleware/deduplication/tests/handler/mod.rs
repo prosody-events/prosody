@@ -6,7 +6,7 @@ use crate::consumer::DemandType;
 use crate::consumer::EventHandler;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, Record};
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::deduplication::{
     DedupIdentity, DeduplicationConfiguration, DeduplicationError, DeduplicationHandler,
     DeduplicationMiddleware, DeduplicationStore, MemoryDeduplicationStore,
@@ -81,14 +81,19 @@ impl FallibleHandler for MockHandler {
 
     async fn on_excise<C>(
         &self,
-        context: C,
-        message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
+        _context: C,
+        _message: ConsumerMessage<()>,
+        _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type).await
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref error) = self.error {
+            Err(error.clone())
+        } else {
+            Ok(())
+        }
     }
 
     async fn on_message<C>(
@@ -158,7 +163,7 @@ fn create_test_message(
     };
     create_test_message_from(ConsumerMessageValue {
         key: key.into(),
-        record: Record::Message(payload),
+        payload,
         ..Default::default()
     })
 }
@@ -273,14 +278,14 @@ fn settlement_classification_table() {
 
         async fn on_excise<C>(
             &self,
-            context: C,
-            message: ConsumerMessage<Self::Payload>,
-            demand_type: DemandType,
+            _context: C,
+            _message: ConsumerMessage<()>,
+            _demand_type: DemandType,
         ) -> Result<Self::Output, Self::Error>
         where
             C: EventContext<Payload = Self::Payload>,
         {
-            FallibleHandler::on_message(self, context, message, demand_type).await
+            Ok(())
         }
 
         async fn on_message<C>(

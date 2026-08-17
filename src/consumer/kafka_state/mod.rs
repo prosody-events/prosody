@@ -24,7 +24,7 @@
 //! `MessageCell<MyLoader>` once.
 
 use crate::consumer::event_context::StateAccessError;
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::{ConsumerMessage, ConsumerRecord};
 use crate::loader::MessageLoader;
 use crate::state::descriptor::{
     CellResolver, CellStateError, DequeDescriptor, MapDescriptor, ValueDescriptor, WithResolver,
@@ -105,10 +105,14 @@ impl<L: MessageLoader + 'static> CellResolver for MessageResolver<L> {
             offset,
         } = stored;
         async move {
-            loader
+            match loader
                 .try_load_message(topic, partition, offset)
                 .await
-                .map_err(|error| StateAccessError::load(&error))
+                .map_err(|error| StateAccessError::load(&error))?
+            {
+                ConsumerRecord::Message(message) => Ok(message),
+                ConsumerRecord::Excise(_) => Err(StateAccessError::excised_message()),
+            }
         }
     }
 

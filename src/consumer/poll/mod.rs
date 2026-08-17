@@ -26,8 +26,8 @@ use tracing::{Span, debug, error, warn};
 use crate::Codec;
 use crate::EventType;
 use crate::Topic;
-use crate::consumer::decode::{DecodedMessage, ResultRequestReader, decode_message};
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::decode::{DecodedMessage, DecodedRecord, ResultRequestReader, decode_record};
+use crate::consumer::message::{ConsumerMessage, ConsumerRecord};
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{Managers, WatermarkVersion};
 use crate::heartbeat::Heartbeat;
@@ -190,17 +190,30 @@ where
             partition, offset, "received message"
         );
 
-        // Decode message through extraction, validation, and filtering
-        let maybe_decoded = decode_message(&mut message, &propagator, &mut codec, &requests);
+        let record =
+            decode_record(&mut message, &propagator, &mut codec, &requests).map(|record| {
+                match record {
+                    DecodedRecord::Message(decoded) => {
+                        let span = create_receive_span(&decoded, message_spans);
+                        ConsumerRecord::Message(ConsumerMessage::from_decoded(
+                            decoded.value,
+                            span,
+                            permit,
+                        ))
+                    }
+                    DecodedRecord::Excise(decoded) => {
+                        let span = create_receive_span(&decoded, message_spans);
+                        ConsumerRecord::Excise(ConsumerMessage::from_decoded(
+                            decoded.value,
+                            span,
+                            permit,
+                        ))
+                    }
+                }
+            });
 
-        // Create consumer message with processing state and dispatch
-        if let Some(decoded) = maybe_decoded {
-            // Create receive span connected to parent trace context
-            let receive_span = create_receive_span(&decoded, message_spans);
-
-            let consumer_message =
-                ConsumerMessage::from_decoded(decoded.value, receive_span, permit);
-            dispatch_with_retry(consumer_message, poll_interval, managers);
+        if let Some(record) = record {
+            dispatch_with_retry(record, poll_interval, managers);
         }
 
         debug!(topic = topic.as_ref(), partition, offset, "poll complete");
@@ -233,7 +246,7 @@ fn create_receive_span<P>(decoded: &DecodedMessage<P>, relation: SpanRelation) -
 /// the dispatch operation after waiting for the poll interval. If the partition
 /// is not found (which happens during rebalancing), the message is discarded.
 fn dispatch_with_retry<P: Send + Sync + 'static>(
-    message: ConsumerMessage<P>,
+    message: ConsumerRecord<P>,
     poll_interval: Duration,
     managers: &Managers<P>,
 ) {
@@ -383,7 +396,7 @@ where
 /// partition is not assigned, or `DispatchError::Busy` if the partition's
 /// message queue is full.
 fn dispatch_message<P: Send + Sync + 'static>(
-    message: ConsumerMessage<P>,
+    message: ConsumerRecord<P>,
     managers: &Managers<P>,
 ) -> Result<(), DispatchError<P>> {
     debug!(
@@ -400,7 +413,7 @@ fn dispatch_message<P: Send + Sync + 'static>(
     };
 
     // Try to send message to the manager
-    let Err(message) = manager.try_send(message) else {
+    let Err(message) = manager.try_send_record(message) else {
         return Ok(());
     };
 
@@ -413,9 +426,9 @@ fn dispatch_message<P: Send + Sync + 'static>(
 enum DispatchError<P: Send + Sync + 'static> {
     /// The target partition is not assigned to this consumer
     #[error("message sent to unassigned partition")]
-    PartitionNotFound(ConsumerMessage<P>),
+    PartitionNotFound(ConsumerRecord<P>),
 
     /// The partition manager's buffer is full
     #[error("partition is busy")]
-    Busy(ConsumerMessage<P>),
+    Busy(ConsumerRecord<P>),
 }

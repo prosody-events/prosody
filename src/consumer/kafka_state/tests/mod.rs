@@ -176,7 +176,7 @@ async fn kafka_descriptor_set_then_get_loads_full_message() -> Result<()> {
     assert_eq!(message.topic(), topic);
     assert_eq!(message.partition(), partition);
     assert_eq!(message.offset(), offset);
-    assert_eq!(message.record().message(), Some(&payload));
+    assert_eq!(message.payload(), &payload);
     Ok(())
 }
 

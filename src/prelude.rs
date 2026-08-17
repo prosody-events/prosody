@@ -17,7 +17,7 @@ pub use crate::consumer::Keyed;
 /// The context bound used in `where C: EventContext` clauses.
 pub use crate::consumer::event_context::EventContext;
 /// Message types received by message handlers.
-pub use crate::consumer::message::{ConsumerMessage, Record};
+pub use crate::consumer::message::ConsumerMessage;
 /// The primary handler trait to implement.
 pub use crate::consumer::middleware::FallibleHandler;
 /// Timer classification passed to `context.schedule()`.

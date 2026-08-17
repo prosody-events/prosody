@@ -3,7 +3,9 @@
 
 use super::*;
 use crate::Key;
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, Record, UncommittedMessage};
+use crate::consumer::message::{
+    ConsumerMessage, ConsumerMessageValue, ConsumerRecord, UncommittedMessage,
+};
 use crate::consumer::{DemandType, EventContext, EventHandler, Keyed, Uncommitted};
 use crate::loader::MemoryLoader;
 use crate::state::SharedStateBackend;
@@ -101,7 +103,9 @@ async fn test_partition_manager_capacity() -> color_eyre::Result<()> {
     for i in 0..5u8 {
         let message = create_test_message(Offset::from(i), "key")?;
         assert!(
-            partition_manager.try_send(message).is_ok(),
+            partition_manager
+                .try_send_record(ConsumerRecord::Message(message))
+                .is_ok(),
             "Message send should succeed"
         );
     }
@@ -109,7 +113,9 @@ async fn test_partition_manager_capacity() -> color_eyre::Result<()> {
     // Send one more message; it should be rejected because the buffer is full
     let message = create_test_message(5, "key")?;
     assert!(
-        partition_manager.try_send(message).is_err(),
+        partition_manager
+            .try_send_record(ConsumerRecord::Message(message))
+            .is_err(),
         "Message send should fail when buffer is full"
     );
 
@@ -133,7 +139,9 @@ async fn test_partition_manager_ordering() -> color_eyre::Result<()> {
     for &offset in &offsets {
         let message = create_test_message(offset, "key")?;
         assert!(
-            partition_manager.try_send(message).is_ok(),
+            partition_manager
+                .try_send_record(ConsumerRecord::Message(message))
+                .is_ok(),
             "Message send should succeed"
         );
     }
@@ -171,7 +179,9 @@ async fn test_partition_manager_watermark() -> color_eyre::Result<()> {
     for i in 0..5 {
         let message = create_test_message(i, "key")?;
         assert!(
-            partition_manager.try_send(message).is_ok(),
+            partition_manager
+                .try_send_record(ConsumerRecord::Message(message))
+                .is_ok(),
             "Message send should succeed"
         );
     }
@@ -201,7 +211,9 @@ async fn test_partition_manager_max_uncommitted() -> color_eyre::Result<()> {
     for i in 0..(max_uncommitted + 5) {
         let message = create_test_message(i as Offset, "key")?;
         assert!(
-            partition_manager.try_send(message).is_ok(),
+            partition_manager
+                .try_send_record(ConsumerRecord::Message(message))
+                .is_ok(),
             "Message send should succeed"
         );
     }
@@ -257,6 +269,17 @@ async fn test_partition_manager_is_stalled() -> color_eyre::Result<()> {
             }
         }
 
+        async fn on_excise<C>(
+            &self,
+            _context: C,
+            message: UncommittedMessage<()>,
+            _demand_type: DemandType,
+        ) where
+            C: EventContext<Payload = Self::Payload>,
+        {
+            message.commit().await;
+        }
+
         async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
         where
             C: EventContext<Payload = Self::Payload>,
@@ -289,7 +312,9 @@ async fn test_partition_manager_is_stalled() -> color_eyre::Result<()> {
     // Send a message that is delayed in processing
     let message = create_test_message(0, "key")?;
     assert!(
-        partition_manager.try_send(message).is_ok(),
+        partition_manager
+            .try_send_record(ConsumerRecord::Message(message))
+            .is_ok(),
         "Message send should succeed"
     );
 

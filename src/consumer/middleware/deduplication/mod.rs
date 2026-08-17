@@ -47,7 +47,8 @@ use xxhash_rust::xxh3::Xxh3Default;
 use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::message::{ConsumerMessage, Record};
+use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::handler::{HandlerMethod, OnExcise, OnMessage};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
     Settlement, SettlementHandler,
@@ -164,6 +165,43 @@ pub struct DeduplicationHandler<T, S: DeduplicationStore> {
     pub(crate) store: S,
 }
 
+impl<T, S> DeduplicationHandler<T, S>
+where
+    T: FallibleHandler,
+    S: DeduplicationStore,
+{
+    async fn handle<H, C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<H::MessagePayload>,
+        demand_type: DemandType,
+    ) -> Result<Option<T::Output>, DeduplicationError<T::Error>>
+    where
+        H: HandlerMethod<T>,
+        C: EventContext<Payload = T::Payload>,
+    {
+        let marker = context
+            .marker_identity()
+            .ok()
+            .and_then(|marker| marker.message_marker());
+        if let Some(marker) = marker
+            && self
+                .store
+                .exists(marker.into_uuid())
+                .await
+                .map_err(|error| DeduplicationError::Store(Box::new(error)))?
+        {
+            info_span!(parent: message.span(), "message.filtered", reason = "deduplicated")
+                .in_scope(|| debug!("message deduplicated"));
+            return Ok(None);
+        }
+        H::call(&self.inner, context, message, demand_type)
+            .await
+            .map(Some)
+            .map_err(DeduplicationError::Inner)
+    }
+}
+
 /// Computes the dedup UUID for a message.
 ///
 /// Length-prefixes each field before hashing so that adjacent fields cannot
@@ -242,10 +280,7 @@ pub fn dedup_uuid_for_message<P>(identity: DedupIdentity<'_>, message: &Consumer
 where
     P: EventIdentity,
 {
-    let event_id = match message.record() {
-        Record::Message(payload) => payload.event_id(),
-        Record::Excise => None,
-    };
+    let event_id = message.payload().event_id();
     dedup_uuid(
         identity.version,
         identity.group_id,
@@ -277,50 +312,21 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        // The filter reads the same boundary-readable identity the settle
-        // boundary records (the session EventRef's dedup id, or the
-        // deferred-reload override), so filter and record cannot disagree.
-        // A context with no marker source (stateless / invalidated session)
-        // dispatches unfiltered.
-        let marker = context
-            .marker_identity()
-            .ok()
-            .and_then(|marker| marker.message_marker());
-        if let Some(marker) = marker
-            && self
-                .store
-                .exists(marker.into_uuid())
-                .await
-                .map_err(|e| DeduplicationError::Store(Box::new(e)))?
-        {
-            info_span!(
-                parent: message.span(),
-                "message.filtered",
-                reason = "deduplicated"
-            )
-            .in_scope(|| {
-                debug!("message deduplicated");
-            });
-            return Ok(None);
-        }
-
-        self.inner
-            .on_message(context, message, demand_type)
+        self.handle::<OnMessage, _>(context, message, demand_type)
             .await
-            .map(Some)
-            .map_err(DeduplicationError::Inner)
     }
 
-    fn on_excise<C>(
+    async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type)
+        self.handle::<OnExcise, _>(context, message, demand_type)
+            .await
     }
 
     async fn on_timer<C>(

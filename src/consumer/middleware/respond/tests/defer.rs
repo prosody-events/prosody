@@ -9,7 +9,7 @@ use super::super::RespondHandler;
 use super::{
     Fixture, ResultProbeCodec, offset_tracker, requesting, requesting_under, serialize_count,
 };
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::ConsumerRecord;
 use crate::consumer::middleware::FallibleEventHandler;
 use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
@@ -264,12 +264,14 @@ impl MessageLoader for RequestLoader {
         _topic: Topic,
         _partition: Partition,
         _offset: Offset,
-    ) -> Result<ConsumerMessage<Value>, RequestLoaderError> {
+    ) -> Result<ConsumerRecord<Value>, RequestLoaderError> {
         // The Kafka loader parents a reloaded record's span on the record's own
         // propagated context, so a reload rejoins the trace the request began
         // in. This double does the same, from one fixed remote context.
         let load = related_span!(SpanRelation::Child, sampled_remote_context(), "load");
-        requesting_under(TARGET, REQUEST, KEY, load).map_err(|_| RequestLoaderError::Unavailable)
+        requesting_under(TARGET, REQUEST, KEY, load)
+            .map(ConsumerRecord::Message)
+            .map_err(|_| RequestLoaderError::Unavailable)
     }
 
     async fn try_load_message(
@@ -277,7 +279,7 @@ impl MessageLoader for RequestLoader {
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> Result<ConsumerMessage<Value>, RequestLoaderError> {
+    ) -> Result<ConsumerRecord<Value>, RequestLoaderError> {
         self.load_message(topic, partition, offset).await
     }
 }

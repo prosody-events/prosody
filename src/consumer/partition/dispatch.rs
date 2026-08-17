@@ -10,7 +10,9 @@ use tracing::{Instrument, debug, debug_span, error, info_span};
 
 use super::ShutdownPhase;
 use crate::consumer::event_context::PartitionEventContext;
-use crate::consumer::message::{ConsumerMessage, Record, UncommittedEvent, UncommittedMessage};
+use crate::consumer::message::{
+    ConsumerMessage, ConsumerRecord, UncommittedEvent, UncommittedMessage,
+};
 use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::consumer::{DemandType, EventHandler, Keyed, Uncommitted};
@@ -20,7 +22,7 @@ use crate::state::manager::{EventStateScope, PartitionStateManager, SweepResolut
 use crate::state::session::{EventSession, TerminationWatch};
 use crate::state::{EventRef, TimerEventRef};
 use crate::timers::store::TriggerStore;
-use crate::timers::{TimerManager, TimerType, UncommittedTimer};
+use crate::timers::{PendingTimer, TimerManager, TimerType, UncommittedTimer};
 use crate::{EventIdentity, EventType, ProcessScope};
 
 /// Processes one event in a fresh keyed-state session.
@@ -80,68 +82,110 @@ pub(super) async fn process_event<T, S, M, P>(
             .await;
             cloned_context.invalidate();
         }
+        UncommittedEvent::Excise(message) => {
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            let msg = message.message();
+            let dedup_id = dedup_uuid_for_message(dedup_identity, msg);
+            let scope = state_manager.session(
+                msg.key().clone(),
+                EventRef::Message { dedup_id },
+                TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
+            );
+            let context = PartitionEventContext::new(
+                message.key().clone(),
+                shutdown_rx.clone(),
+                (cancel_tx, cancel_rx),
+                timer_manager.clone(),
+                scope.handle(),
+            );
+            let cloned_context = context.clone();
+            let _guard = message.process_scope();
+            let receive_span = message.span();
+            guarded_dispatch(
+                &scope,
+                handler
+                    .on_excise(context, message, DemandType::Normal)
+                    .instrument(receive_span),
+            )
+            .await;
+            cloned_context.invalidate();
+        }
         UncommittedEvent::Timer(timer) => {
-            if let Some(firing) = timer.fire().await {
-                firing.set_dispatch_span(timer_spans);
-
-                // `StateRecovery` is framework-internal: the sweep runs
-                // here, owned by the state manager, and user handlers
-                // structurally never see the trigger. State is always
-                // wired, so the sweep is always intercepted (it is inert
-                // when no collections are registered). See
-                // `PartitionStateManager::recover` for the
-                // never-abort-except-shutdown posture behind the
-                // `SweepResolution` mapping below.
-                if firing.timer_type() == TimerType::StateRecovery {
-                    let _guard = firing.process_scope();
-                    let (trigger, commit_guard) = firing.into_inner();
-                    match state_manager
-                        .recover(trigger.key.clone(), timer_manager, shutdown_rx)
-                        .await
-                    {
-                        SweepResolution::Commit => commit_guard.commit().await,
-                        SweepResolution::Abort => commit_guard.abort().await,
-                    }
-                    return;
-                }
-
-                let (cancel_tx, cancel_rx) = watch::channel(false);
-                let trigger = firing.trigger();
-                let event = EventRef::Timer(TimerEventRef::new(
-                    trigger.timer_type,
-                    trigger.time,
-                    trigger.tag,
-                ));
-                // Kept bound through dispatch + `invalidate` so its `Drop`
-                // clears the dirty buffer last (see the message arm above).
-                let scope = state_manager.session(
-                    firing.key().clone(),
-                    event,
-                    TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
-                );
-                let context = PartitionEventContext::new(
-                    firing.key().clone(),
-                    shutdown_rx.clone(),
-                    (cancel_tx, cancel_rx),
-                    timer_manager.clone(),
-                    scope.handle(),
-                );
-                let cloned_context = context.clone();
-                let _guard = firing.process_scope();
-                // Instrument with the dispatch span so handler-created spans
-                // nest under it ambiently (mirrors the message arm).
-                let dispatch_span = firing.trigger().span();
-                guarded_dispatch(
-                    &scope,
-                    handler
-                        .on_timer(context, firing, DemandType::Normal)
-                        .instrument(dispatch_span),
-                )
-                .await;
-                cloned_context.invalidate();
-            }
+            process_timer(
+                timer,
+                handler,
+                shutdown_rx,
+                timer_manager,
+                state_manager,
+                timer_spans,
+            )
+            .await;
         }
     }
+}
+
+async fn process_timer<T, S, M, P>(
+    timer: PendingTimer<S>,
+    handler: &T,
+    shutdown_rx: &watch::Receiver<ShutdownPhase>,
+    timer_manager: &TimerManager<S>,
+    state_manager: &M,
+    timer_spans: SpanRelation,
+) where
+    T: EventHandler<Payload = P>,
+    S: TriggerStore,
+    M: PartitionStateManager<Session: EventSession<Loader: MessageLoader<Payload = P>>>,
+    P: Send + Sync + 'static,
+{
+    let Some(firing) = timer.fire().await else {
+        return;
+    };
+    firing.set_dispatch_span(timer_spans);
+
+    // State recovery is internal. User handlers never receive its trigger.
+    if firing.timer_type() == TimerType::StateRecovery {
+        let _guard = firing.process_scope();
+        let (trigger, commit_guard) = firing.into_inner();
+        match state_manager
+            .recover(trigger.key.clone(), timer_manager, shutdown_rx)
+            .await
+        {
+            SweepResolution::Commit => commit_guard.commit().await,
+            SweepResolution::Abort => commit_guard.abort().await,
+        }
+        return;
+    }
+
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let trigger = firing.trigger();
+    let event = EventRef::Timer(TimerEventRef::new(
+        trigger.timer_type,
+        trigger.time,
+        trigger.tag,
+    ));
+    let scope = state_manager.session(
+        firing.key().clone(),
+        event,
+        TerminationWatch::new(shutdown_rx.clone(), cancel_rx.clone()),
+    );
+    let context = PartitionEventContext::new(
+        firing.key().clone(),
+        shutdown_rx.clone(),
+        (cancel_tx, cancel_rx),
+        timer_manager.clone(),
+        scope.handle(),
+    );
+    let cloned_context = context.clone();
+    let _guard = firing.process_scope();
+    let dispatch_span = firing.trigger().span();
+    guarded_dispatch(
+        &scope,
+        handler
+            .on_timer(context, firing, DemandType::Normal)
+            .instrument(dispatch_span),
+    )
+    .await;
+    cloned_context.invalidate();
 }
 
 /// Runs one event's dispatch under a panic-unwind guard — the single catch
@@ -192,7 +236,7 @@ where
 /// or a timer) ready for processing.
 pub(super) fn build_message_stream<T, P>(
     offsets: &OffsetTracker,
-    mut message_rx: Receiver<ConsumerMessage<P>>,
+    mut message_rx: Receiver<ConsumerRecord<P>>,
     group_id: &str,
     highest_offset_seen: &mut i64,
     allowed_events: Option<&AhoCorasick>,
@@ -202,28 +246,25 @@ where
     P: Send + Sync + 'static + EventType,
 {
     stream! {
-        while let Some(message) = message_rx.recv().await {
+        while let Some(record) = message_rx.recv().await {
             // Apply filter_rewind - skip messages with offsets we've already processed
-            if !filter_rewind(highest_offset_seen, &message).await {
+            if !filter_rewind(highest_offset_seen, &record).await {
                 continue;
             }
 
-            // Apply reserve_offset - reserve offset and convert to UncommittedMessage
-            let Some(uncommitted) = reserve_offset(offsets, message).await else {
-                continue;
-            };
-
-            // Apply filter_loops - filter out messages from same consumer group
-            let Some(uncommitted) = filter_loops(group_id, uncommitted).await else {
-                continue;
-            };
-
-            // Apply filter_event_type - filter based on allowed event types
-            let Some(uncommitted) = filter_event_type(allowed_events, uncommitted).await else {
-                continue;
-            };
-
-            yield UncommittedEvent::Message(uncommitted);
+            match record {
+                ConsumerRecord::Message(message) => {
+                    let Some(message) = reserve_offset(offsets, message).await else { continue };
+                    let Some(message) = filter_loops(group_id, message).await else { continue };
+                    let Some(message) = filter_event_type(allowed_events, message).await else { continue };
+                    yield UncommittedEvent::Message(message);
+                }
+                ConsumerRecord::Excise(message) => {
+                    let Some(message) = reserve_offset(offsets, message).await else { continue };
+                    let Some(message) = filter_loops(group_id, message).await else { continue };
+                    yield UncommittedEvent::Excise(message);
+                }
+            }
         }
     }
 }
@@ -232,7 +273,7 @@ where
 ///
 /// This prevents processing duplicate messages that might be delivered by
 /// Kafka, especially after consumer rebalances.
-fn filter_rewind<P>(highest_offset_seen: &mut i64, message: &ConsumerMessage<P>) -> Ready<bool> {
+fn filter_rewind<P>(highest_offset_seen: &mut i64, message: &ConsumerRecord<P>) -> Ready<bool> {
     let partition = message.partition();
     let offset = message.offset();
 
@@ -318,11 +359,7 @@ async fn filter_event_type<P: Send + Sync + 'static + EventType>(
     allowed_events: Option<&AhoCorasick>,
     message: UncommittedMessage<P>,
 ) -> Option<UncommittedMessage<P>> {
-    // Extract event type from message payload if present
-    let event_type = match message.record() {
-        Record::Message(payload) => payload.event_type(),
-        Record::Excise => return Some(message),
-    };
+    let event_type = message.payload().event_type();
     let Some(event_type) = event_type else {
         return Some(message);
     };

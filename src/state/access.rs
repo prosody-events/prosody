@@ -108,6 +108,13 @@ impl StateAccessError {
             category: error.classify_error(),
         }
     }
+
+    pub(crate) fn excised_message() -> Self {
+        Self::Load {
+            message: "the message has no payload".to_owned(),
+            category: ErrorCategory::Permanent,
+        }
+    }
 }
 
 impl ClassifyError for StateAccessError {

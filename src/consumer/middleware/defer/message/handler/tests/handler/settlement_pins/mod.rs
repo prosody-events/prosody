@@ -69,6 +69,30 @@ struct StagingLeaf {
 }
 
 impl StagingLeaf {
+    async fn handle_message<C, P>(
+        &self,
+        context: C,
+        message: ConsumerMessage<P>,
+    ) -> Result<(), StagingError>
+    where
+        C: EventContext<Payload = Value>,
+    {
+        self.processed.lock().push(message.offset());
+        let handle = context
+            .state(Registered::new(Self::collection()))
+            .map_err(|_| StagingError(ErrorCategory::Terminal))?;
+        handle
+            .set(json!({ "offset": message.offset() }))
+            .await
+            .map_err(|_| StagingError(ErrorCategory::Terminal))?;
+        let mut outcomes = self.outcomes.lock();
+        if outcomes.is_empty() {
+            Ok(())
+        } else {
+            Err(StagingError(outcomes.remove(0)))
+        }
+    }
+
     fn collection() -> ValueDescriptor {
         value_state("cart")
     }
@@ -91,13 +115,13 @@ impl FallibleHandler for StagingLeaf {
     async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
+        message: ConsumerMessage<()>,
+        _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type).await
+        self.handle_message(context, message).await
     }
 
     async fn on_message<C>(
@@ -109,20 +133,7 @@ impl FallibleHandler for StagingLeaf {
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        self.processed.lock().push(message.offset());
-        let handle = context
-            .state(Registered::new(Self::collection()))
-            .map_err(|_| StagingError(ErrorCategory::Terminal))?;
-        handle
-            .set(json!({ "offset": message.offset() }))
-            .await
-            .map_err(|_| StagingError(ErrorCategory::Terminal))?;
-        let mut outcomes = self.outcomes.lock();
-        if outcomes.is_empty() {
-            Ok(())
-        } else {
-            Err(StagingError(outcomes.remove(0)))
-        }
+        self.handle_message(context, message).await
     }
 
     async fn on_timer<C>(

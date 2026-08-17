@@ -172,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Call `excise(topic, key)` to send a Kafka record with a key and no payload. Use this record to delete the key from compacted views.
 
-Each handler must implement `on_excise`. It receives the same arguments as `on_message`. The message contains `Record::Excise` instead of a payload.
+Each handler must implement `on_excise`. It receives `ConsumerMessage<()>`, which has no application payload.
 
 ## Requests
 

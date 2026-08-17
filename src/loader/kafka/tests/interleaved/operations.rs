@@ -74,7 +74,7 @@ pub(super) async fn delete_scenario_records(
 /// Assert the outcome of one load request against the expected deleted/valid
 /// boundary.
 pub(super) fn assert_load_result(
-    result: Result<ConsumerMessage<serde_json::Value>, KafkaLoaderError>,
+    result: Result<ConsumerRecord<serde_json::Value>, KafkaLoaderError>,
     topic: usize,
     partition: Partition,
     offset_idx: usize,
@@ -96,7 +96,7 @@ pub(super) fn assert_load_result(
         assert_eq!(got_partition, partition);
         assert_eq!(got_offset, expected_offset);
     } else {
-        let Ok(msg) = result else {
+        let Ok(ConsumerRecord::Message(msg)) = result else {
             color_eyre::eyre::bail!(
                 "topic {topic} partition {partition} offset_idx {offset_idx} (offset \
                  {expected_offset}) expected Ok (lso_idx={lso}), got: {result:?}"

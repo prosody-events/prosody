@@ -258,6 +258,12 @@ pub trait EventIdentity {
     fn event_id(&self) -> Option<&str>;
 }
 
+impl EventIdentity for () {
+    fn event_id(&self) -> Option<&str> {
+        None
+    }
+}
+
 /// Provides access to the event type field within a payload.
 ///
 /// Used to extract event type identifiers for event filtering and routing.
