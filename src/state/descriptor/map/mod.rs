@@ -722,8 +722,7 @@ where
     /// **without decoding or resolving any value**. So a message-backed map
     /// enumerates keys with **zero Kafka fetches**: the guarantee is "no value
     /// decode, no resolver run," not "no I/O" (the tracked arm still does a
-    /// presence-only batched read; the degrade arm still transfers each cell
-    /// envelope and discards the value bytes).
+    /// presence-only batch read; the degrade arm uses a presence-only scan).
     ///
     /// Presence-only: a key is yielded for every present cell, even one whose
     /// value would fail to decode or resolve (unlike [`stream`](Self::stream),
@@ -745,6 +744,17 @@ where
                 yield item?;
             }
         }
+    }
+
+    /// Reports whether the map holds no live entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns a key codec error or an access error from the session.
+    pub async fn is_empty(&self) -> Result<bool, MapStateError<CellCodecError<V>>> {
+        let keys = self.keys(Direction::Forward);
+        futures::pin_mut!(keys);
+        Ok(keys.next().await.transpose()?.is_none())
     }
 
     /// Durably commits this map's buffered ops mid-handler — entries and keyset

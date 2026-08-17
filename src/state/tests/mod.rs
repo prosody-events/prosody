@@ -731,7 +731,6 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
             StateName::try_new("presence")?,
         );
 
-        // Seed one committed present key.
         let event = EventRef::Message {
             dedup_id: Uuid::from_u128(1),
         };
@@ -752,7 +751,6 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
             .map_err(|e| eyre!("{e}"))?;
         finalize_and_promote(&seed_session, &oracle, Uuid::from_u128(1), &cells, &id).await?;
 
-        // Fresh cold session, fresh resolve counter, one live dirty overlay.
         counting.reset();
         let resolves = ResolveCounter::default();
         let event = EventRef::Message {
@@ -802,15 +800,8 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
             handle.contains_key(&K3).await.map_err(|e| eyre!("{e}"))?,
             "set after clear -> true"
         );
-        assert_eq!(resolves.resolves(), 0, "no contains_key resolved");
-        assert_eq!(
-            counting.presence_reads(),
-            2,
-            "only the two keys without a dirty answer reach the store"
-        );
-        assert_eq!(counting.batch_reads(), 0, "no value batch on this route");
+        assert_contains_presence_counts(&counting, &resolves);
 
-        // Contrast: the K3 cell IS resolvable, so the zero above is a real skip.
         assert!(handle.get(&K3).await.map_err(|e| eyre!("{e}"))?.is_some());
         assert!(
             resolves.resolves() >= 1,
@@ -818,6 +809,15 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
         );
         Ok(())
     })
+}
+
+fn assert_contains_presence_counts(
+    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    resolves: &ResolveCounter,
+) {
+    assert_eq!(resolves.resolves(), 0);
+    assert_eq!(counting.presence_reads(), 2);
+    assert_eq!(counting.batch_reads(), 0);
 }
 
 /// The key-scan resolver-skip pin: `keys()` runs the resolver zero times on
@@ -910,6 +910,8 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     );
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
+    assert!(!handle.is_empty().await.map_err(|e| eyre!("{e}"))?);
+
     for dir in [Direction::Forward, Direction::Backward] {
         let drained: Vec<i64> = {
             let stream = handle.keys(dir);
@@ -932,7 +934,7 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     assert_eq!(
         resolves.resolves(),
         0,
-        "keys() resolves nothing on either arm"
+        "is_empty and keys resolve nothing on either arm"
     );
 
     if get_contrast {
@@ -1585,6 +1587,14 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
             dedup_id: Uuid::from_u128(u128::MAX - 100),
         };
         let session = counting_session(&counting, &oracle, &registry, &state_key, &armed, event);
+        let handle = map_state::<I64KeyCodec, JsonCodec>("mp-of")
+            .bind(&session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        assert!(
+            !handle.is_empty().await?,
+            "a live overflowed map is not empty"
+        );
+        counting.reset();
         let out = drain_map_stream(&session, "mp-of", Direction::Forward).await?;
         assert_eq!(
             out,
@@ -1600,6 +1610,39 @@ fn map_overflowed_stream_issues_one_scan() -> Result<()> {
             counting.lower_reads(),
             1,
             "the single keyset get — no bound reads"
+        );
+
+        handle.remove(&0).await?;
+        finalize_and_promote(
+            &session,
+            &oracle,
+            Uuid::from_u128(u128::MAX - 100),
+            &cells,
+            &of_id,
+        )
+        .await?;
+        counting.reset();
+        let empty_session = counting_session(
+            &counting,
+            &oracle,
+            &registry,
+            &state_key,
+            &armed,
+            EventRef::Message {
+                dedup_id: Uuid::from_u128(u128::MAX - 99),
+            },
+        );
+        let empty = map_state::<I64KeyCodec, JsonCodec>("mp-of")
+            .bind(&empty_session)
+            .map_err(|e| eyre!("bind: {e}"))?;
+        assert!(
+            empty.is_empty().await?,
+            "a removed overflowed entry leaves an empty map"
+        );
+        assert_eq!(
+            counting.presence_scans(),
+            1,
+            "the empty overflowed map scans once"
         );
         Ok(())
     })

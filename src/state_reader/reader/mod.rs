@@ -250,6 +250,20 @@ where
             .map_err(|e| StateReaderError::store(&e))
     }
 
+    /// Reports whether the committed map is empty.
+    ///
+    /// # Errors
+    ///
+    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
+    pub async fn is_empty<K: Into<Key>>(&self, key: K) -> Result<bool, StateReaderError> {
+        let session = self.session(key.into()).await?;
+        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
+        handle
+            .is_empty()
+            .await
+            .map_err(|e| StateReaderError::store(&e))
+    }
+
     /// Reads the committed values for `map_keys` as one isolated batch,
     /// index-aligned to the input.
     ///

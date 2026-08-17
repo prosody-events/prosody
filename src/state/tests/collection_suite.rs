@@ -180,6 +180,7 @@ pub(crate) enum MapOp {
     Set(i64, u8),
     Remove(i64),
     Get(i64),
+    IsEmpty,
     Clear,
     Commit,
 }
@@ -187,11 +188,12 @@ pub(crate) enum MapOp {
 impl Arbitrary for MapOp {
     fn arbitrary(g: &mut Gen) -> Self {
         let key = g.choose(&KEY_POOL).copied().unwrap_or(0);
-        match u8::arbitrary(g) % 6 {
+        match u8::arbitrary(g) % 7 {
             0 | 1 => Self::Set(key, u8::arbitrary(g)),
             2 => Self::Remove(key),
             3 => Self::Get(key),
-            4 => Self::Clear,
+            4 => Self::IsEmpty,
+            5 => Self::Clear,
             _ => Self::Commit,
         }
     }
@@ -727,6 +729,9 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
                     got == scratch.get(&k).cloned() && present == got.is_some(),
                 ))
             }
+            MapOp::IsEmpty => Ok(mismatch_unless(
+                handle.is_empty().await? == scratch.is_empty(),
+            )),
             MapOp::Clear => {
                 handle.clear().await?;
                 scratch.clear();
@@ -806,6 +811,9 @@ pub(crate) async fn run_map_ttl_keyset_refresh_trace(trace: MapTrace) -> Result<
                 MapOp::Get(k) => {
                     handle.get(&k).await?;
                 }
+                MapOp::IsEmpty => {
+                    handle.is_empty().await?;
+                }
                 MapOp::Clear => handle.clear().await?,
                 MapOp::Commit => {
                     handle.commit().await?;
@@ -864,6 +872,9 @@ pub(crate) async fn run_map_keyset_exact_trace(trace: MapTrace) -> Result<bool> 
                 }
                 MapOp::Get(k) => {
                     handle.get(&k).await?;
+                }
+                MapOp::IsEmpty => {
+                    handle.is_empty().await?;
                 }
                 MapOp::Clear => {
                     handle.clear().await?;
@@ -1386,6 +1397,9 @@ pub(crate) async fn run_map_key_scan_holes(shape: MapKeyHoles) -> Result<bool> {
         if stream_keys != present {
             return Ok(false);
         }
+        if handle.is_empty().await? != present.is_empty() {
+            return Ok(false);
+        }
     }
     Ok(true)
 }
@@ -1520,7 +1534,10 @@ where
         return Ok(false);
     }
     let descending_keys: Vec<i64> = model.keys().rev().copied().collect();
-    Ok(collect_map_keys(handle, Direction::Backward).await? == descending_keys)
+    Ok(
+        collect_map_keys(handle, Direction::Backward).await? == descending_keys
+            && handle.is_empty().await? == model.is_empty(),
+    )
 }
 
 /// Collects a map handle's `stream(dir)` into a `(key, value)` vector.
@@ -1674,7 +1691,9 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
         let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
         block_on(async {
-            // Presence reads see the cell — no decode, no error.
+            assert!(!handle.is_empty().await?);
+            assert_presence_route_calls(&counting, tracked_route);
+            counting.reset();
             assert!(
                 handle.contains_key(&key).await.map_err(|e| eyre!("{e}"))?,
                 "contains_key answers about the cell, not the value"
@@ -1688,18 +1707,7 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
                 vec![key],
                 "keys() yields the key of an undecodable-value cell"
             );
-            assert_eq!(
-                counting.presence_reads(),
-                usize::from(tracked_route),
-                "only tracked keys use a presence batch"
-            );
-            assert_eq!(
-                counting.presence_scans(),
-                usize::from(!tracked_route),
-                "only overflowed keys use a presence scan"
-            );
-            assert_eq!(counting.batch_reads(), 0);
-            assert_eq!(counting.lower_scans(), 0);
+            assert_presence_route_calls(&counting, tracked_route);
 
             // Value reads surface the decode failure as `Permanent`.
             let got = handle.get(&key).await;
@@ -1726,6 +1734,16 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+fn assert_presence_route_calls(
+    counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
+    tracked_route: bool,
+) {
+    assert_eq!(counting.presence_reads(), usize::from(tracked_route));
+    assert_eq!(counting.presence_scans(), usize::from(!tracked_route));
+    assert_eq!(counting.batch_reads(), 0);
+    assert_eq!(counting.lower_scans(), 0);
 }
 
 /// Durable meta-frame golden (Deque): after real pushes `commit()`, the raw
@@ -2162,6 +2180,49 @@ fn map_first_set_writes_keyset() -> Result<()> {
         "the entry is live"
     );
     Ok(())
+}
+
+/// A live entry without its keyset stays hidden until a handler reconstructs
+/// the keyset. Both key-only reads must use the same residual posture.
+#[test]
+fn map_missing_keyset_hides_a_live_entry() -> Result<()> {
+    use bytes::Bytes;
+    use futures::executor::block_on;
+
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = map_state::<I64KeyCodec, JsonCodec>("mp");
+    let (registry, collection_ref) =
+        registry_and_ref(&descriptor, "mp", &state_key, CollectionDef::new(None))?;
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let coordinate = I64KeyCodec::encode(&7);
+    let value = Bytes::from(serde_json::to_vec(&Value::from(1_u8))?);
+    block_on(store.write_resolved(
+        &collection_ref,
+        &[(entry_cell_for(&coordinate), Some(value))],
+        &[],
+    ))?;
+
+    let armed: ArmedKeys = Arc::default();
+    let session = make_session(
+        &cells,
+        &oracle,
+        &registry,
+        &state_key,
+        &armed,
+        read_event(0),
+    );
+    let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
+    block_on(async {
+        assert!(handle.is_empty().await?);
+        assert!(
+            collect_map_keys(&handle, Direction::Forward)
+                .await?
+                .is_empty()
+        );
+        Ok::<_, color_eyre::Report>(())
+    })
 }
 
 /// The exact `Tracked` frame bytes over `i64` keys (assumed ascending): tag

@@ -183,6 +183,9 @@ pub trait DynMapState<Item: Send + 'static>: Send + Sync {
     /// running the resolver (a presence read through the dirty overlay).
     async fn contains_key(&self, key: String) -> Result<bool, ErasedStateError>;
 
+    /// Whether the map holds no live entries.
+    async fn is_empty(&self) -> Result<bool, ErasedStateError>;
+
     /// Reads each key in input order as one isolated batch. Absent keys yield
     /// `None`, and duplicate keys retain their positions.
     async fn get_many(&self, keys: Vec<String>) -> Result<Vec<Option<Item>>, ErasedStateError>;
@@ -690,6 +693,13 @@ where
     async fn contains_key(&self, key: String) -> Result<bool, ErasedStateError> {
         self.handle
             .contains_key(&key)
+            .await
+            .map_err(|e| ErasedStateError::from_classified(&e))
+    }
+
+    async fn is_empty(&self) -> Result<bool, ErasedStateError> {
+        self.handle
+            .is_empty()
             .await
             .map_err(|e| ErasedStateError::from_classified(&e))
     }
