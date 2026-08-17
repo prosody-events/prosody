@@ -32,6 +32,23 @@ impl SerializeBufGuard {
             buf: SERIALIZE_BUF.with_borrow_mut(take),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn reset() {
+        SERIALIZE_BUF.with_borrow_mut(|buf| *buf = Vec::new());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocation() -> (usize, usize) {
+        SERIALIZE_BUF.with_borrow(|buf| {
+            let capacity = buf.capacity();
+            if capacity == 0 {
+                (0, 0)
+            } else {
+                (buf.as_ptr() as usize, capacity)
+            }
+        })
+    }
 }
 
 impl Drop for SerializeBufGuard {

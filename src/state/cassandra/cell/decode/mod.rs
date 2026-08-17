@@ -15,6 +15,9 @@
 //! | `version` present and ≠ [`INITIAL_VERSION`]              | `VersionMismatch`                  |
 //! | semantically-corrupt `event` UDT (e.g. `kind == 7`)      | `CorruptUdt`                       |
 //!
+//! Point reads and recovery reads use the same row-shape validation. Recovery
+//! skips only the body decode for a valid resolved row.
+//!
 //! `encoding` and `version` are **shared** by `data` and
 //! `prev_data`: a single build encodes both with the same codec. The pairing
 //! is therefore validated *per blob* (a present blob needs an encoding), never
@@ -51,22 +54,25 @@ use thiserror::Error;
 /// version, event` against `keyed_state_cell`.
 ///
 /// Module-private — callers never observe the intermediate tuple.
-pub(super) type RawCellRow = (
-    Option<Vec<u8>>,     // data
-    Option<Vec<u8>>,     // prev_data
+pub(super) type RawCellRow<B = Vec<u8>> = (
+    Option<B>,           // data
+    Option<B>,           // prev_data
     Option<i16>,         // encoding (shared by data + prev_data)
     Option<i32>,         // version (shared by data + prev_data)
     Option<RawEventRef>, // event (validated into EventRef during decode)
 );
 
+/// Point-read cell row that borrows payloads from its Scylla response frame.
+pub(super) type BorrowedRawCellRow<'frame> = RawCellRow<&'frame [u8]>;
+
 /// Seven-column shape produced by `SELECT section, coordinate, data,
 /// prev_data, encoding, version, event` — a [`RawCellRow`] prefixed with the
 /// clustering columns. Used by the section scans.
-pub(super) type KeyedCellRow = (
+pub(super) type FramedKeyedCellRow = (
     i8,      // section
     Vec<u8>, // coordinate
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
+    Option<Bytes>,
+    Option<Bytes>,
     Option<i16>,
     Option<i32>,
     Option<RawEventRef>,
@@ -76,9 +82,9 @@ pub(super) type KeyedCellRow = (
 /// event, TTL(data), TTL(prev_data)` — a [`RawCellRow`] suffixed with the
 /// per-blob remaining TTLs [`blob_ttl`] coalesces, for the cache-fill point
 /// read.
-pub(super) type CellTtlRow = (
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
+pub(super) type BorrowedCellTtlRow<'frame> = (
+    Option<&'frame [u8]>,
+    Option<&'frame [u8]>,
     Option<i16>,
     Option<i32>,
     Option<RawEventRef>,
@@ -88,14 +94,14 @@ pub(super) type CellTtlRow = (
 
 /// Eight-column shape produced by the batch cache-fill `SELECT coordinate,
 /// data, prev_data, encoding, version, event, TTL(data), TTL(prev_data)` — a
-/// [`CellTtlRow`] prefixed with the clustering `coordinate`. Used by the batch
-/// read (`get_many`/`get_many_for_cache`), where `IN` returns rows in
+/// [`BorrowedCellTtlRow`] prefixed with the clustering `coordinate`. Used by
+/// the batch read (`get_many`/`get_many_for_cache`), where `IN` returns rows in
 /// clustering order, so the coordinate is carried to re-key each row back to
 /// its input position.
-pub(super) type KeyedCellTtlRow = (
-    Vec<u8>, // coordinate
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
+pub(super) type BorrowedKeyedCellTtlRow<'frame> = (
+    &'frame [u8], // coordinate
+    Option<&'frame [u8]>,
+    Option<&'frame [u8]>,
     Option<i16>,
     Option<i32>,
     Option<RawEventRef>,
@@ -103,15 +109,14 @@ pub(super) type KeyedCellTtlRow = (
     Option<i32>,
 );
 
-/// Splits a batch row's clustering `coordinate` off its [`CellTtlRow`] body,
-/// **without** decoding. Infallible (the coordinate is opaque bytes); semantic
-/// decode is deferred to [`try_decode_cell_ttl`] so a corrupt row surfaces in
-/// input-resolution order, not in clustering order (the batch read's
-/// first-occurrence error-ordering rule).
-pub(super) fn split_keyed_cell_ttl(row: KeyedCellTtlRow) -> (Coordinate, CellTtlRow) {
+/// Splits a batch row's borrowed clustering coordinate from its body.
+/// Semantic decode stays deferred so corrupt rows surface in input order.
+pub(super) fn split_keyed_cell_ttl(
+    row: BorrowedKeyedCellTtlRow<'_>,
+) -> (&[u8], BorrowedCellTtlRow<'_>) {
     let (coordinate, data, prev_data, encoding, version, event, ttl_data, ttl_prev) = row;
     (
-        Coordinate::from_bytes(coordinate),
+        coordinate,
         (
             data, prev_data, encoding, version, event, ttl_data, ttl_prev,
         ),
@@ -121,12 +126,15 @@ pub(super) fn split_keyed_cell_ttl(row: KeyedCellTtlRow) -> (Coordinate, CellTtl
 /// Four-column shape produced by the `marker_read` point read of the
 /// fixed-address event-marker row: the frozen payload blob, its shared
 /// `encoding`/`version`, and the staging event.
-pub(super) type MarkerRow = (
-    Option<Vec<u8>>,     // data (the frozen marker payload)
+pub(super) type MarkerRow<B = Vec<u8>> = (
+    Option<B>,           // data (the frozen marker payload)
     Option<i16>,         // encoding
     Option<i32>,         // version
     Option<RawEventRef>, // event (the staging event)
 );
+
+/// Marker point-read row that borrows its payload from the response frame.
+pub(super) type BorrowedMarkerRow<'frame> = MarkerRow<&'frame [u8]>;
 
 /// Builds the [`CellKey`] a scanned row's clustering columns address.
 /// Infallible: the clustering key is opaque to the cell layer (validated, if
@@ -143,13 +151,16 @@ pub(super) fn clustered_cell_key(section: i8, coordinate: Vec<u8>) -> CellKey {
 /// statement writes them together — so a NULL in either is a corrupt marker
 /// ([`CellCorruptReason::IncompleteMarker`], Permanent), never tolerated: the
 /// shape is unwritten by any build (the marker design shipped unreleased).
-pub(super) fn try_decode_marker(row: MarkerRow) -> Result<EventMarker, CassandraCellStoreError> {
+pub(super) fn try_decode_marker<B: AsRef<[u8]>>(
+    row: MarkerRow<B>,
+) -> Result<EventMarker, CassandraCellStoreError> {
     let (data, encoding, version, event) = row;
     validate_version(version)?;
     let Some(raw_event) = event else {
         return Err(CellCorruptReason::IncompleteMarker.into());
     };
     let event = raw_event.try_into_event()?;
+    let encoding = encoding.map(Encoding::try_from).transpose()?;
     let Some(payload) = decode_blob(data, encoding)? else {
         return Err(CellCorruptReason::IncompleteMarker.into());
     };
@@ -160,7 +171,7 @@ pub(super) fn try_decode_marker(row: MarkerRow) -> Result<EventMarker, Cassandra
 /// section scans. Fails with the same corruption errors as
 /// [`try_decode_cell`].
 pub(super) fn try_decode_keyed_cell(
-    row: KeyedCellRow,
+    row: FramedKeyedCellRow,
 ) -> Result<(CellKey, Cell), CassandraCellStoreError> {
     let (section, coordinate, data, prev_data, encoding, version, event) = row;
     let key = clustered_cell_key(section, coordinate);
@@ -172,11 +183,37 @@ pub(super) fn try_decode_keyed_cell(
 /// ([`blob_ttl`]). Fails with the same corruption errors as
 /// [`try_decode_cell`].
 pub(super) fn try_decode_cell_ttl(
-    row: CellTtlRow,
+    row: BorrowedCellTtlRow<'_>,
 ) -> Result<(Cell, Option<i32>), CassandraCellStoreError> {
     let (data, prev_data, encoding, version, event, ttl_data, ttl_prev) = row;
     let cell = try_decode_cell((data, prev_data, encoding, version, event))?;
     Ok((cell, blob_ttl(ttl_data, ttl_prev)))
+}
+
+/// Decodes a recovery row only when its event column marks it provisional.
+/// Resolved rows validate their metadata, then skip blob decode. This keeps a
+/// corrupt resolved body from blocking recovery; a live read still decodes it.
+pub(super) fn try_decode_provisional_cell_ttl(
+    row: BorrowedCellTtlRow<'_>,
+) -> Result<Option<ProvisionalCell>, CassandraCellStoreError> {
+    let (data, prev_data, encoding, version, event, ttl_data, ttl_prev) = row;
+    if event.is_none() {
+        validate_row_shape(
+            data.as_ref(),
+            prev_data.as_ref(),
+            encoding,
+            version,
+            event.as_ref(),
+        )?;
+        return Ok(None);
+    }
+    let (cell, _) = try_decode_cell_ttl((
+        data, prev_data, encoding, version, event, ttl_data, ttl_prev,
+    ))?;
+    match cell {
+        Cell::Provisional(provisional) => Ok(Some(provisional)),
+        Cell::Resolved(_) => Ok(None),
+    }
 }
 
 /// The cache-fill co-expiry: the remaining TTL of whichever blob the row
@@ -201,20 +238,23 @@ fn blob_ttl(ttl_data: Option<i32>, ttl_prev: Option<i32>) -> Option<i32> {
 /// [`CassandraCellStoreError::CorruptUdt`] for a bad `event` UDT,
 /// [`CassandraCellStoreError::VersionMismatch`] for an unknown version stamp,
 /// or [`CassandraCellStoreError::Encoding`] when a blob fails to deserialize.
-pub(super) fn try_decode_cell(row: RawCellRow) -> Result<Cell, CassandraCellStoreError> {
+pub(super) fn try_decode_cell<B: AsRef<[u8]>>(
+    row: RawCellRow<B>,
+) -> Result<Cell, CassandraCellStoreError> {
     let (data, prev_data, encoding, version, event) = row;
-    validate_version(version)?;
+    let encoding = validate_row_shape(
+        data.as_ref(),
+        prev_data.as_ref(),
+        encoding,
+        version,
+        event.as_ref(),
+    )?;
 
     let data = decode_blob(data, encoding)?;
     let prev = decode_blob(prev_data, encoding)?;
 
     match event {
-        None => {
-            if prev.is_some() {
-                return Err(CellCorruptReason::PrevWithoutEvent.into());
-            }
-            Ok(Cell::Resolved(Committed::new(data)))
-        }
+        None => Ok(Cell::Resolved(Committed::new(data))),
         Some(raw) => {
             let event = raw.try_into_event()?;
             Ok(Cell::Provisional(ProvisionalCell::new(data, prev, event)))
@@ -225,18 +265,40 @@ pub(super) fn try_decode_cell(row: RawCellRow) -> Result<Cell, CassandraCellStor
 /// Decodes one blob against the shared encoding. A NULL blob decodes to
 /// `None` regardless of the shared encoding (the other blob may own it); a
 /// present blob without an encoding is corrupt.
-fn decode_blob(
-    blob: Option<Vec<u8>>,
-    encoding: Option<i16>,
+fn decode_blob<B: AsRef<[u8]>>(
+    blob: Option<B>,
+    encoding: Option<Encoding>,
 ) -> Result<Option<Bytes>, CassandraCellStoreError> {
     match (blob, encoding) {
         (None, _) => Ok(None),
-        (Some(bytes), Some(encoding)) => {
-            let encoding = Encoding::try_from(encoding)?;
-            Ok(Some(decode_payload(&bytes, encoding)?))
-        }
+        (Some(bytes), Some(encoding)) => Ok(Some(decode_payload(bytes.as_ref(), encoding)?)),
         (Some(_), None) => Err(CellCorruptReason::BlobWithoutEncoding.into()),
     }
+}
+
+/// Validates metadata shared by point reads and recovery reads.
+fn validate_row_shape<B>(
+    data: Option<&B>,
+    prev_data: Option<&B>,
+    encoding: Option<i16>,
+    version: Option<i32>,
+    event: Option<&RawEventRef>,
+) -> Result<Option<Encoding>, CassandraCellStoreError> {
+    validate_version(version)?;
+    for present in [data.is_some(), prev_data.is_some()] {
+        if present && encoding.is_none() {
+            return Err(CellCorruptReason::BlobWithoutEncoding.into());
+        }
+    }
+    let encoding = if data.is_some() || prev_data.is_some() {
+        encoding.map(Encoding::try_from).transpose()?
+    } else {
+        None
+    };
+    if event.is_none() && prev_data.is_some() {
+        return Err(CellCorruptReason::PrevWithoutEvent.into());
+    }
+    Ok(encoding)
 }
 
 /// Validates the `version` value when present. Absent is always fine

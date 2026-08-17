@@ -6,8 +6,14 @@
 //! against the shape-table regressions a live-Cassandra run would otherwise be
 //! the first to catch.
 
-use super::super::encoding::{Encoding, EncodingError, decode_payload, encode_payload};
-use super::{CellCorruptReason, RawCellRow, blob_ttl, try_decode_cell};
+use super::super::encoding::{
+    CASSANDRA_COMPRESSION_BLOCK_BYTES, Encoding, EncodingError, decode_payload, decode_scratch,
+    encode_payload, reset_encoding_state, select_encoding, validate_decompression_bound,
+};
+use super::{
+    BorrowedCellTtlRow, CellCorruptReason, FramedKeyedCellRow, RawCellRow, blob_ttl,
+    try_decode_cell, try_decode_keyed_cell, try_decode_provisional_cell_ttl,
+};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::EventRef;
 use crate::state::cassandra::cell::INITIAL_VERSION;
@@ -17,11 +23,33 @@ use crate::state::cell::{Cell, Committed, ProvisionalCell};
 use bytes::Bytes;
 use color_eyre::eyre::{Result, bail};
 use quickcheck::{QuickCheck, TestResult};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
+use zstd::bulk::compress;
+use zstd::stream::encode_all;
+use zstd::zstd_safe::get_frame_content_size;
+
+struct FrameOwner {
+    bytes: Vec<u8>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl AsRef<[u8]> for FrameOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for FrameOwner {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Relaxed);
+    }
+}
 
 /// The shared encoding discriminator a present blob carries.
 fn enc() -> i16 {
-    i16::from(Encoding::RawZstdV1)
+    i16::from(Encoding::Zstd)
 }
 
 /// The version stamp paired with present bytes.
@@ -32,7 +60,7 @@ fn ver() -> i32 {
 /// Encodes a payload exactly as the cell store would, so the decoder's
 /// `decode_payload` round-trips it.
 fn blob(s: &str) -> Result<Vec<u8>> {
-    Ok(encode_payload(&Bytes::copy_from_slice(s.as_bytes()), Encoding::RawZstdV1)?.to_vec())
+    Ok(encode_payload(&Bytes::copy_from_slice(s.as_bytes()), Encoding::Zstd)?.to_vec())
 }
 
 fn message_event() -> EventRef {
@@ -218,23 +246,58 @@ fn corrupt_event_udt_is_rejected() -> Result<()> {
     Ok(())
 }
 
-/// Wire-format freeze for the payload-encoding discriminants: the `i16` is a
-/// durable column, so the live value is pinned and the retired discriminants
-/// (`1`/`2` `MsgPack`-era, `3` uncompressed `RawV1`, plus never-assigned `0`)
-/// must keep rejecting loudly as a Permanent
-/// [`EncodingError::UnknownEncoding`] — a round-trip test cannot prove any of
-/// this.
+/// Wire-format freeze for the payload-encoding discriminants.
+///
+/// Zstd value 4 is part of the released durable format. Raw value 1 is the
+/// first new format. Value 0 stays invalid so missing data fails loudly.
 #[test]
 fn encoding_wire_contract_is_frozen() -> Result<()> {
-    assert_eq!(i16::from(Encoding::RawZstdV1), 4);
-    for retired in [0_i16, 1, 2, 3] {
-        let Err(error) = Encoding::try_from(retired) else {
-            bail!("discriminant {retired} must stay retired");
+    assert_eq!(i16::from(Encoding::Zstd), 4);
+    assert_eq!(i16::from(Encoding::Raw), 1);
+    for unknown in [0_i16, 2, 3, 5] {
+        let Err(error) = Encoding::try_from(unknown) else {
+            bail!("discriminant {unknown} must stay unknown");
         };
-        assert!(matches!(error, EncodingError::UnknownEncoding(value) if value == retired));
+        assert!(matches!(error, EncodingError::UnknownEncoding(value) if value == unknown));
         assert_eq!(error.classify_error(), ErrorCategory::Permanent);
     }
     Ok(())
+}
+
+#[test]
+fn encoding_selection_uses_the_strict_block_boundary() {
+    assert_eq!(
+        select_encoding(CASSANDRA_COMPRESSION_BLOCK_BYTES - 1),
+        Encoding::Raw
+    );
+    assert_eq!(
+        select_encoding(CASSANDRA_COMPRESSION_BLOCK_BYTES),
+        Encoding::Raw
+    );
+    assert_eq!(
+        select_encoding(CASSANDRA_COMPRESSION_BLOCK_BYTES + 1),
+        Encoding::Zstd
+    );
+}
+
+#[test]
+fn concatenated_zstd_frames_decode() -> Result<()> {
+    let first = compress(b"first", 0)?;
+    let second = compress(b"second", 0)?;
+    let mut frames = Vec::with_capacity(first.len() + second.len());
+    frames.extend_from_slice(&first);
+    frames.extend_from_slice(&second);
+
+    assert_eq!(
+        decode_payload(&frames, Encoding::Zstd)?,
+        Bytes::from_static(b"firstsecond")
+    );
+    Ok(())
+}
+
+#[test]
+fn declared_size_cannot_exceed_the_block_expansion_bound() {
+    assert!(validate_decompression_bound(19, u64::MAX).is_err());
 }
 
 /// Payload round-trip over arbitrary bytes:
@@ -244,14 +307,141 @@ fn encoding_wire_contract_is_frozen() -> Result<()> {
 fn prop_payload_encoding_round_trips() {
     fn prop(bytes: Vec<u8>) -> TestResult {
         let payload = Bytes::from(bytes);
-        match encode_payload(&payload, Encoding::RawZstdV1)
-            .and_then(|encoded| decode_payload(&encoded, Encoding::RawZstdV1))
-        {
-            Ok(decoded) => TestResult::from_bool(decoded == payload),
+        for encoding in [Encoding::Zstd, Encoding::Raw] {
+            match encode_payload(&payload, encoding)
+                .and_then(|encoded| decode_payload(&encoded, encoding))
+            {
+                Ok(decoded) if decoded == payload => {}
+                Ok(_) => return TestResult::failed(),
+                Err(error) => return TestResult::error(format!("{error}")),
+            }
+        }
+        TestResult::passed()
+    }
+    QuickCheck::new().quickcheck(prop as fn(Vec<u8>) -> TestResult);
+}
+
+/// The legacy writer used the stream encoder, which omitted the content size.
+/// The current reader must decode every frame that writer produced.
+#[test]
+fn prop_legacy_zstd_frames_decode() {
+    fn prop(bytes: Vec<u8>) -> TestResult {
+        let source = Bytes::from(bytes);
+        let encoded = match encode_all(source.as_ref(), 0) {
+            Ok(encoded) => encoded,
+            Err(error) => return TestResult::error(format!("{error}")),
+        };
+        match decode_payload(&encoded, Encoding::Zstd) {
+            Ok(decoded) => TestResult::from_bool(decoded == source),
             Err(error) => TestResult::error(format!("{error}")),
         }
     }
     QuickCheck::new().quickcheck(prop as fn(Vec<u8>) -> TestResult);
+}
+
+#[test]
+fn failed_stream_decode_does_not_poison_the_next_frame() -> Result<()> {
+    reset_encoding_state();
+    let valid = encode_all(b"valid after corrupt".as_slice(), 0)?;
+    assert!(matches!(get_frame_content_size(&valid), Ok(None)));
+    let mut truncated = valid.clone();
+    truncated.truncate(truncated.len().saturating_sub(1));
+    assert!(decode_payload(&truncated, Encoding::Zstd).is_err());
+    assert_eq!(
+        decode_payload(&valid, Encoding::Zstd)?,
+        Bytes::from_static(b"valid after corrupt")
+    );
+    Ok(())
+}
+
+#[test]
+fn resolved_corrupt_body_is_skipped_only_by_recovery() -> Result<()> {
+    let corrupt = [0_u8];
+    let recovery_row: BorrowedCellTtlRow<'_> = (
+        Some(&corrupt),
+        None,
+        Some(i16::from(Encoding::Zstd)),
+        Some(INITIAL_VERSION),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(try_decode_provisional_cell_ttl(recovery_row)?, None);
+
+    let live = try_decode_cell((
+        Some(&corrupt),
+        None,
+        Some(i16::from(Encoding::Zstd)),
+        Some(INITIAL_VERSION),
+        None,
+    ));
+    assert!(matches!(live, Err(CassandraCellStoreError::Encoding(_))));
+    Ok(())
+}
+
+#[test]
+fn durable_payload_bytes_are_frozen() -> Result<()> {
+    const LEGACY_ZSTD: &[u8] = &[
+        0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x31, 0x00, 0x00, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79,
+        0x3c, 0x1f, 0x36, 0x87,
+    ];
+    assert_eq!(
+        decode_payload(LEGACY_ZSTD, Encoding::Zstd)?,
+        Bytes::from_static(b"legacy")
+    );
+    assert_eq!(
+        encode_payload(&Bytes::from_static(b"raw"), Encoding::Raw)?.as_ref(),
+        b"raw"
+    );
+    Ok(())
+}
+
+#[test]
+fn decoded_cell_does_not_retain_its_response_frame() -> Result<()> {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let frame = Bytes::from_owner(FrameOwner {
+        bytes: b"prefixrawsuffix".to_vec(),
+        dropped: dropped.clone(),
+    });
+    let row: FramedKeyedCellRow = (
+        0,
+        vec![1],
+        Some(frame.slice(6..9)),
+        None,
+        Some(i16::from(Encoding::Raw)),
+        Some(INITIAL_VERSION),
+        None,
+    );
+    let (_, cell) = try_decode_keyed_cell(row)?;
+    drop(frame);
+
+    assert!(dropped.load(Ordering::Relaxed));
+    assert_eq!(
+        cell,
+        Cell::Resolved(Committed::new(Some(Bytes::from_static(b"raw"))))
+    );
+    Ok(())
+}
+
+#[test]
+fn decode_scratch_grows_once_and_then_stays_stable() -> Result<()> {
+    reset_encoding_state();
+    let maximum = Bytes::from(vec![0x3C; 64 * 1024]);
+    let minimum = Bytes::from_static(b"small");
+    let encoded_maximum = encode_payload(&maximum, Encoding::Zstd)?;
+    let encoded_minimum = encode_payload(&minimum, Encoding::Zstd)?;
+    reset_encoding_state();
+
+    assert_eq!(decode_scratch(), (0, 0));
+    assert_eq!(decode_payload(&encoded_maximum, Encoding::Zstd)?, maximum);
+    let warmed = decode_scratch();
+    assert!(warmed.1 >= maximum.len());
+
+    for encoded in [&encoded_minimum, &encoded_maximum, &encoded_minimum] {
+        drop(decode_payload(encoded, Encoding::Zstd)?);
+        assert_eq!(decode_scratch(), warmed);
+    }
+    Ok(())
 }
 
 /// The cache-fill co-expiry coalesces whichever blob's TTL is present, `data`

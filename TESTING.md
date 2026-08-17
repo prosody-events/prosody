@@ -192,7 +192,7 @@ are generic over the `CellStore` backend and run unchanged against memory
 whole suite for the cost of one instantiation.
 
 Instantiations: `src/state/tests/mod.rs` (memory),
-`src/state/cassandra/cell/tests.rs` (live Cassandra).
+`src/state/cassandra/cell/tests/properties.rs` (live Cassandra).
 
 ### Differential (parity) testing
 
@@ -237,7 +237,7 @@ failing operation index. Never swallow them into a `false` property
 result.
 
 Exemplar: `finish_trace` in `src/state/descriptor/tests.rs`; the `finish`
-helper + `TestResult::error` in `src/state/cassandra/cell/tests.rs`.
+helper + `TestResult::error` in `src/state/cassandra/cell/tests/properties.rs`.
 
 ### Deterministic time: per-iteration runtimes
 
