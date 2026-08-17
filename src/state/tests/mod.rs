@@ -307,7 +307,12 @@ fn prop_memory_batch_read_parity() {
     fn property(trace: BatchReadTrace) -> Result<bool> {
         let oracle = ScriptedOracle::default();
         let store = memory_store(MemoryCells::new(), oracle.clone());
-        executor::block_on(run_batch_read_parity_trace(store, oracle, trace))
+        executor::block_on(run_batch_read_parity_trace(
+            store.clone(),
+            store,
+            oracle,
+            trace,
+        ))
     }
     QuickCheck::new().quickcheck(property as fn(BatchReadTrace) -> Result<bool>);
 }

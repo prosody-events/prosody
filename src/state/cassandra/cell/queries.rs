@@ -69,6 +69,15 @@ cassandra_queries! {
             TABLE_KEYED_STATE_CELL
         ),
 
+        /// Reads presence for one bounded coordinate list without payloads.
+        read_presence_batch: (
+            "SELECT coordinate, WRITETIME(data), WRITETIME(prev_data), encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate IN ?",
+            TABLE_KEYED_STATE_CELL
+        ),
+
         /// Forward single-section scan from an inclusive `coordinate` anchor.
         scan_forward_incl: (
             "SELECT section, coordinate, data, prev_data, encoding, version, event \
@@ -130,6 +139,60 @@ cassandra_queries! {
              WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
              AND kind = ? AND section = ? \
              ORDER BY coordinate DESC",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Presence-only forward scan from an inclusive coordinate.
+        scan_presence_forward_incl: (
+            "SELECT section, coordinate, WRITETIME(data), WRITETIME(prev_data), encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate >= ? ORDER BY coordinate ASC",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Presence-only forward scan from an exclusive coordinate.
+        scan_presence_forward_excl: (
+            "SELECT section, coordinate, WRITETIME(data), WRITETIME(prev_data), encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate > ? ORDER BY coordinate ASC",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Presence-only backward scan from an inclusive coordinate.
+        scan_presence_backward_incl: (
+            "SELECT section, coordinate, WRITETIME(data), WRITETIME(prev_data), encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate <= ? ORDER BY coordinate DESC",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Presence-only backward scan from an exclusive coordinate.
+        scan_presence_backward_excl: (
+            "SELECT section, coordinate, WRITETIME(data), WRITETIME(prev_data), encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? AND coordinate < ? ORDER BY coordinate DESC",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Presence-only forward scan of one section.
+        scan_presence_forward_all: (
+            "SELECT section, coordinate, WRITETIME(data), WRITETIME(prev_data), encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? ORDER BY coordinate ASC",
+            TABLE_KEYED_STATE_CELL
+        ),
+
+        /// Presence-only backward scan of one section.
+        scan_presence_backward_all: (
+            "SELECT section, coordinate, WRITETIME(data), WRITETIME(prev_data), encoding, version, event \
+             FROM $keyspace.{} \
+             WHERE segment_id = ? AND key = ? AND state_type = ? AND name = ? \
+             AND kind = ? AND section = ? ORDER BY coordinate DESC",
             TABLE_KEYED_STATE_CELL
         ),
 

@@ -153,7 +153,8 @@ use super::fjall::{CacheRead, FjallCellCache, FjallCellCacheError};
 use super::identity::{CollectionId, CollectionRef};
 use super::marker::{EventMarker, SectionClear};
 use super::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, section_batches,
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch,
+    section_batches,
 };
 use crate::timers::duration::CompactDuration;
 use async_stream::try_stream;
@@ -446,6 +447,35 @@ where
         Ok(filled.into_iter().map(|(committed, _)| committed).collect())
     }
 
+    async fn contains_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> Result<PresenceBatch, Self::Error> {
+        if self.fjall.fuse_blown() {
+            return self
+                .lower
+                .contains_many(collection, section, batch, own)
+                .await;
+        }
+        match self.fjall.get_batch(collection, section, batch).await {
+            Ok(Some(hits)) => {
+                return Ok(hits
+                    .into_iter()
+                    .map(|committed| committed.get().is_some())
+                    .collect());
+            }
+            Ok(None) => {}
+            Err(error) => warn_skip("read presence batch", &error),
+        }
+        self.delete_read_window(collection, own).await?;
+        self.lower
+            .contains_many(collection, section, batch, own)
+            .await
+    }
+
     fn scan_cells<'a>(
         &'a self,
         collection: &'a CollectionId,
@@ -459,6 +489,24 @@ where
                 self.delete_read_window(collection, own).await?;
             }
             let inner = self.lower.scan_cells(collection, scan, own);
+            pin_mut!(inner);
+            while let Some(item) = inner.next().await {
+                yield item?;
+            }
+        }
+    }
+
+    fn scan_keys<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        try_stream! {
+            if !self.fjall.fuse_blown() {
+                self.delete_read_window(collection, own).await?;
+            }
+            let inner = self.lower.scan_keys(collection, scan, own);
             pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 yield item?;

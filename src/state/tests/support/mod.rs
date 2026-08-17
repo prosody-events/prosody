@@ -20,7 +20,8 @@ use crate::state::registry::CollectionDef;
 use crate::state::session::sealed::{MarkerIdentity, StateLifecycle};
 use crate::state::session::{Finalized, MessageMarker, OpPermit, SessionGate};
 use crate::state::store::{
-    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, provisional_point_loop,
+    CacheBatch, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch,
+    provisional_point_loop,
 };
 use crate::state::{
     CollectionId, CollectionRef, CommitDecision, EventRef, StateKey, StateName, StateType,
@@ -35,6 +36,7 @@ use futures::stream::{self, Stream};
 use parking_lot::Mutex;
 use quickcheck::{Arbitrary, Gen};
 use serde_json::Value;
+use smallvec::smallvec;
 use std::convert::Infallible;
 use std::fmt;
 use std::future::{Future, ready};

@@ -3,11 +3,11 @@ use super::RecoveryReadCounts;
 use super::{
     Arc, BatchUnit, Bytes, CassandraCellStoreError, CassandraSession, CassandraStore, Cell,
     CellAddr, CellBatchRow, CellBlobs, CellKey, CellKind, CellQueries, CellStore, CellStoreError,
-    CollectionDefRegistry, CollectionId, CollectionRef, CommitOracle, Coordinate, EventMarker,
-    EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob, MarkerPresence, Pk,
-    PreparedStatement, QueryRowsResult, ResolveCellError, ResolvedRow, Resolver, RowShape,
-    SHARD_FANOUT_CONCURRENCY, Scan, ScanStatements, Section, Session, Stream, TryStreamExt,
-    blob_weight, decode, encode, encode_marker_payload, fetch_and_decode_cell,
+    CollectionDefRegistry, CollectionId, CollectionRef, CommitOracle, Coordinate, DeserializeRow,
+    EventMarker, EventRef, KeyRow, MAX_BATCH_BYTES, MAX_BATCH_STATEMENTS, MarkerBlob,
+    MarkerPresence, Pk, PreparedStatement, QueryRowsResult, ResolveCellError, ResolvedRow,
+    Resolver, RowShape, SHARD_FANOUT_CONCURRENCY, Scan, ScanStatements, Section, Session, Stream,
+    TryStreamExt, blob_weight, encode, encode_marker_payload, fetch_and_decode_cell,
     fetch_cell_rows_result, fetch_cells_batch_result, flatten_resolve, help_read_window,
     marker_delete_unit, marker_last_split, page_cells, peek_read, pin_mut, resolve_marker,
     smallvec, try_stream,
@@ -219,12 +219,17 @@ where
 
     /// The single resolving section scan, yielding each present cell's
     /// committed bytes — the body behind [`scan_cells`](CellStore::scan_cells).
-    pub(super) fn scan_inner<'a>(
+    pub(super) fn scan_inner<'a, Row>(
         &'a self,
+        statements: ScanStatements<'a>,
         collection: &'a CollectionId,
         scan: Scan<'a>,
         own: EventRef,
-    ) -> impl Stream<Item = Result<(CellKey, Bytes), CellStoreError<O::Error>>> + Send + 'a {
+        decode_row: fn(Row) -> Result<(CellKey, Cell), CassandraCellStoreError>,
+    ) -> impl Stream<Item = Result<(CellKey, Bytes), CellStoreError<O::Error>>> + Send + 'a
+    where
+        Row: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> + Send + 'a,
+    {
         let limit = scan.limit;
         let collection_ref = self.resolver.collection_ref(collection);
         try_stream! {
@@ -243,10 +248,10 @@ where
             // no resolution and no limit.
             let pages = page_cells(
                 &self.session,
-                ScanStatements::values(&self.queries),
+                statements,
                 collection,
                 scan,
-                decode::try_decode_keyed_cell,
+                decode_row,
             );
             pin_mut!(pages);
 

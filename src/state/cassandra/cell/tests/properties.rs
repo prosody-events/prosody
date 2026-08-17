@@ -243,7 +243,12 @@ fn prop_cassandra_bottom_scan() {
         let probe = CassandraShapeProbe {
             session: fx.cassandra.clone(),
         };
-        run_bottom_scan_trace(fx.bottom_store(ScriptedOracle::default()), trace, &probe).await
+        Box::pin(run_bottom_scan_trace(
+            fx.bottom_store(ScriptedOracle::default()),
+            trace,
+            &probe,
+        ))
+        .await
     }
 
     init_test_logging();

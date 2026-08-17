@@ -8,6 +8,8 @@ use super::{
 use scylla::deserialize::row::DeserializeRow;
 
 pub(super) type DecodedCellBatch = CellBuffer<Option<(Cell, Option<i32>)>>;
+/// Presence cells aligned with the unique coordinate batch.
+pub(super) type DecodedPresenceBatch = CellBuffer<Option<Cell>>;
 
 #[derive(Clone, Copy)]
 pub(super) struct ScanStatements<'a> {
@@ -28,6 +30,18 @@ impl<'a> ScanStatements<'a> {
             backward_excl: &queries.scan_backward_excl,
             forward_all: &queries.scan_forward_all,
             backward_all: &queries.scan_backward_all,
+        }
+    }
+
+    /// Selects the six payload-free presence scan statements.
+    pub(super) fn presence(queries: &'a CellQueries) -> Self {
+        Self {
+            forward_incl: &queries.scan_presence_forward_incl,
+            forward_excl: &queries.scan_presence_forward_excl,
+            backward_incl: &queries.scan_presence_backward_incl,
+            backward_excl: &queries.scan_presence_backward_excl,
+            forward_all: &queries.scan_presence_forward_all,
+            backward_all: &queries.scan_presence_backward_all,
         }
     }
 }
@@ -134,6 +148,56 @@ pub(super) async fn fetch_cells_batch_result(
         .map_err(CassandraCellStoreError::from)
 }
 
+/// Reads one bounded payload-free presence batch.
+pub(super) async fn fetch_presence_batch_result(
+    session: &CassandraSession,
+    queries: &CellQueries,
+    id: &CollectionId,
+    section: Section,
+    unique_coordinates: &[&Coordinate],
+) -> Result<QueryRowsResult, CassandraCellStoreError> {
+    let pk = Pk::of(id);
+    session
+        .session()
+        .execute_unpaged(
+            &queries.read_presence_batch,
+            (
+                pk.segment_id,
+                pk.key,
+                pk.state_type,
+                pk.name,
+                CellKind::Cell,
+                i8::from(section),
+                unique_coordinates,
+            ),
+        )
+        .await
+        .map_err(CassandraStoreError::from)?
+        .into_rows_result()
+        .map_err(CassandraStoreError::from)
+        .map_err(CassandraCellStoreError::from)
+}
+
+/// Decodes and aligns one payload-free presence batch.
+pub(super) fn decode_presence_batch_rows(
+    result: &QueryRowsResult,
+    coordinates: &[&Coordinate],
+) -> Result<DecodedPresenceBatch, CassandraCellStoreError> {
+    let mut rows = SmallVec::with_capacity(coordinates.len());
+    for row in result
+        .rows::<decode::BorrowedKeyedPresenceRow<'_>>()
+        .map_err(CassandraStoreError::from)?
+    {
+        let (coordinate, data, prev, encoding, version, event) =
+            row.map_err(CassandraStoreError::from)?;
+        rows.push((coordinate, (data, prev, encoding, version, event)));
+    }
+    match_rows_to_coordinates(rows, coordinates)
+        .into_iter()
+        .map(|row| row.map(decode::try_decode_presence).transpose())
+        .collect()
+}
+
 pub(super) fn decode_batch_rows(
     result: &QueryRowsResult,
     unique_coordinates: &[&Coordinate],
@@ -178,10 +242,10 @@ pub(super) fn match_batch_rows_to_coordinates<'frame>(
     Ok(match_rows_to_coordinates(rows, coordinates))
 }
 
-fn match_rows_to_coordinates<'frame>(
-    mut rows: CellBuffer<(&'frame [u8], decode::BorrowedCellTtlRow<'frame>)>,
+fn match_rows_to_coordinates<Row>(
+    mut rows: CellBuffer<(&[u8], Row)>,
     coordinates: &[&Coordinate],
-) -> CellBuffer<Option<decode::BorrowedCellTtlRow<'frame>>> {
+) -> CellBuffer<Option<Row>> {
     // Match the result here so every caller receives one slot per requested
     // coordinate. Cassandra can reorder an `IN` result and omit absent rows.
     let mut out = CellBuffer::with_capacity(coordinates.len());

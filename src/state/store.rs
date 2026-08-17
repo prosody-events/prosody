@@ -60,7 +60,9 @@ pub(crate) use super::store_helpers::{
     sorted_unique_coordinates,
 };
 pub(crate) use super::store_types::CELL_BATCH;
-pub use super::store_types::{CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch};
+pub use super::store_types::{
+    CacheBatch, CellBuffer, CommittedBatch, CoordinateBatch, PresenceBatch,
+};
 
 /// Uniform durable storage for the cells of one collection partition.
 ///
@@ -128,6 +130,19 @@ pub trait CellStore: Clone + Send + Sync + 'static {
         scan: Scan<'a>,
         own: EventRef,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), Self::Error>> + Send + 'a;
+
+    /// Scans visible committed keys in coordinate order. The scan applies its
+    /// direction, edges, and limit to present keys.
+    ///
+    /// This read returns marker-resolved truth through the read window stated
+    /// on [`Self::get`]. It resolves provisional presence with `peek_read` and
+    /// never repairs a cell from its own snapshot.
+    fn scan_keys<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a;
 
     /// Cache-fill point read: the committed value **plus** the durable cell's
     /// remaining TTL, for the [`Cached`](super::cached::Cached) write-through
@@ -209,6 +224,20 @@ pub trait CellStore: Clone + Send + Sync + 'static {
             Ok(expand_to_input_order(&input_indices, &unique_answers))
         }
     }
+
+    /// Tests presence for one section's coordinates in one backend hop.
+    /// Results follow the observation contract on [`Self::get_many`].
+    ///
+    /// This read returns marker-resolved truth through the read window stated
+    /// on [`Self::get`]. It resolves provisional presence with `peek_read` and
+    /// never repairs a cell from its own snapshot.
+    fn contains_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> impl Future<Output = Result<PresenceBatch, Self::Error>> + Send + 'a;
 
     /// Cache-fill batch twin of [`Self::get_for_cache`]: the batch read plus
     /// each position's remaining TTL, for the

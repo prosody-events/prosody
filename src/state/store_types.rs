@@ -58,5 +58,8 @@ pub type CellBuffer<T> = SmallVec<[T; CELLS_INLINE]>;
 /// The index-aligned result of a committed batch read.
 pub type CommittedBatch = CellBuffer<Committed>;
 
+/// One presence bit per input position.
+pub type PresenceBatch = CellBuffer<bool>;
+
 /// The index-aligned result of a cache-fill batch read.
 pub type CacheBatch = CellBuffer<(Committed, Option<CompactDuration>)>;

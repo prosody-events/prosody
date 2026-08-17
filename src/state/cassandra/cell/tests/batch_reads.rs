@@ -12,7 +12,13 @@ fn prop_cassandra_batch_read_parity() {
         let fx = fixture().await?;
         let oracle = ScriptedOracle::default();
         let store = fx.bottom_store(oracle.clone());
-        Box::pin(run_batch_read_parity_trace(store, oracle, trace)).await
+        Box::pin(run_batch_read_parity_trace(
+            store.clone(),
+            store,
+            oracle,
+            trace,
+        ))
+        .await
     }
 
     init_test_logging();

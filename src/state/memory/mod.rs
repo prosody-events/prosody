@@ -9,11 +9,14 @@ use super::resolve::{
     ResolveCellError, Resolver, flatten_resolve, help_read_window, help_write_window, peek_read,
     resolve_marker, resolve_read,
 };
-use super::store::{CellBuffer, CellStore, CoordinateBatch, provisional_point_loop};
+use super::store::{
+    CellBuffer, CellStore, CoordinateBatch, PresenceBatch, dedupe, expand_to_input_order,
+    provisional_point_loop,
+};
 use super::{CollectionId, CollectionRef, EventRef};
 use async_stream::try_stream;
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use scc::hash_map::Entry;
 use smallvec::SmallVec;
 use std::convert::Infallible;
@@ -248,6 +251,48 @@ where
                 }
             }
         }
+    }
+
+    fn scan_keys<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<CellKey, Self::Error>> + Send + 'a {
+        self.scan_cells(collection, scan, own)
+            .map(|item| item.map(|(key, _)| key))
+    }
+
+    async fn contains_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> Result<PresenceBatch, Self::Error> {
+        let collection_ref = self.resolver.collection_ref(collection);
+        self.read_help(&collection_ref, own).await?;
+        let (coordinates, input_indices) = dedupe(batch);
+        let mut answers = PresenceBatch::with_capacity(coordinates.len());
+        for coordinate in coordinates {
+            let cell = CellKey {
+                section,
+                coordinate: Coordinate::clone(coordinate),
+            };
+            answers.push(
+                peek_read(
+                    self.resolver.oracle(),
+                    &collection_ref,
+                    own,
+                    self.read_raw(collection, &cell),
+                )
+                .await
+                .map_err(ResolveCellError::Oracle)?
+                .get()
+                .is_some(),
+            );
+        }
+        Ok(expand_to_input_order(&input_indices, &answers))
     }
 
     fn provisional_cells<'a>(
