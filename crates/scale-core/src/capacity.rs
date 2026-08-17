@@ -35,6 +35,11 @@ const CAPACITY_MODEL_BUDGET: PriorArtifactBudget = PriorArtifactBudget::new(
     REPORT_CLOCK_ERROR_SECONDS,
     HAZARD_TRANSITION_PROBABILITY_ERROR_MAX,
 );
+const EMPTY_START_WINDOW: StartWindow = StartWindow {
+    end_micros: 0,
+    exposure_seconds: 0.0_f64,
+    started_attempts: None,
+};
 
 /// Versioned prior and approximation limits for the capacity model.
 ///
@@ -436,21 +441,22 @@ pub struct ResourceWindow {
     concurrency: f64,
     exposure_micros: u64,
     completed_attempts: u32,
-    started_attempts: Option<u32>,
+    started_attempts: u32,
 }
 
 impl ResourceWindow {
-    /// Constructs one eligible resource window.
+    /// Constructs one resource window with an observed start count.
     ///
     /// # Errors
     ///
     /// Returns an error when concurrency is negative or not finite.
     ///
     /// Returns an error when exposure is not positive and finite.
-    pub fn new(
+    pub fn new_with_starts(
         concurrency: f64,
         exposure_seconds: f64,
         completed_attempts: u32,
+        started_attempts: u32,
     ) -> Result<Self, ResourceWindowError> {
         if !concurrency.is_finite() || concurrency < 0.0_f64 {
             return Err(ResourceWindowError::InvalidValue {
@@ -473,26 +479,8 @@ impl ResourceWindow {
             concurrency,
             exposure_micros,
             completed_attempts,
-            started_attempts: None,
+            started_attempts,
         })
-    }
-
-    /// Constructs one resource window with an observed start count.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when concurrency is negative or not finite.
-    ///
-    /// Returns an error when exposure is not positive and finite.
-    pub fn new_with_starts(
-        concurrency: f64,
-        exposure_seconds: f64,
-        completed_attempts: u32,
-        started_attempts: u32,
-    ) -> Result<Self, ResourceWindowError> {
-        let mut window = Self::new(concurrency, exposure_seconds, completed_attempts)?;
-        window.started_attempts = Some(started_attempts);
-        Ok(window)
     }
 
     pub(crate) const fn concurrency(&self) -> f64 {
@@ -511,13 +499,14 @@ impl ResourceWindow {
         self.completed_attempts
     }
 
-    pub(crate) const fn started_attempts(&self) -> Option<u32> {
+    pub(crate) const fn started_attempts(&self) -> u32 {
         self.started_attempts
     }
 }
 
 #[derive(Clone, Copy)]
 struct StartWindow {
+    end_micros: u64,
     exposure_seconds: f64,
     started_attempts: Option<u32>,
 }
@@ -527,6 +516,7 @@ struct RetainedHistory<'a> {
     windows: &'a [StartWindow],
     head: usize,
     length: usize,
+    end_micros: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -599,6 +589,7 @@ pub(crate) struct CapacityFactor {
     start_history: Vec<StartWindow>,
     start_history_head: usize,
     start_history_len: usize,
+    observation_clock_micros: u64,
     predictive_start_history: Vec<StartWindow>,
     state_exposure_seconds: Vec<f64>,
     state_completion_counts: Vec<u32>,
@@ -609,6 +600,7 @@ pub(crate) struct CapacityFactor {
     residual_counts: [u32; RESIDUAL_BIN_COUNT],
     residual_sample_count: u32,
     residual_integrated_hazard: f64,
+    discard_next_residual: bool,
     markov_clock_rejected: bool,
 }
 
@@ -699,22 +691,11 @@ impl CapacityFactor {
             filter_log_weights: vec![0.0_f64; filter_count],
             filter_weights,
             filter_curve_weights,
-            start_history: vec![
-                StartWindow {
-                    exposure_seconds: 0.0_f64,
-                    started_attempts: None,
-                };
-                start_history_capacity
-            ],
+            start_history: vec![EMPTY_START_WINDOW; start_history_capacity],
             start_history_head: 0,
             start_history_len: 0,
-            predictive_start_history: vec![
-                StartWindow {
-                    exposure_seconds: 0.0_f64,
-                    started_attempts: None,
-                };
-                start_history_capacity
-            ],
+            observation_clock_micros: 0,
+            predictive_start_history: vec![EMPTY_START_WINDOW; start_history_capacity],
             state_exposure_seconds: vec![0.0_f64; state_count],
             state_completion_counts: vec![0; state_count],
             forward_probabilities: vec![0.0_f64; state_count],
@@ -724,6 +705,7 @@ impl CapacityFactor {
             residual_counts: [0; RESIDUAL_BIN_COUNT],
             residual_sample_count: 0,
             residual_integrated_hazard: 0.0_f64,
+            discard_next_residual: false,
             markov_clock_rejected: false,
         })
     }
@@ -832,11 +814,16 @@ impl CapacityFactor {
             .copy_from_slice(&self.start_history);
         let mut head = self.start_history_head;
         let mut length = self.start_history_len;
+        let end_micros = self
+            .observation_clock_micros
+            .saturating_add(window.exposure_micros());
         record_start_window(
             &mut self.predictive_start_history,
             &mut head,
             &mut length,
             window,
+            end_micros,
+            Some(window.started_attempts()),
         );
         for (index, cell) in cells.iter_mut().enumerate() {
             cell.mean = completion_expectation(
@@ -846,6 +833,7 @@ impl CapacityFactor {
                     windows: &self.predictive_start_history,
                     head,
                     length,
+                    end_micros,
                 },
                 window,
                 self.arrival_shape,
@@ -894,13 +882,28 @@ impl CapacityFactor {
     /// `J` is the start-group count. `C` is the state count. `N` is the
     /// largest certified Poisson term count. `D` is the contracted death count.
     /// `D` is zero when contraction cannot occur. `F` is the filter count.
-    /// An accepted window also enters the start-history ring that
-    /// feeds [`Self::write_completion_posterior`].
-    pub(crate) fn update(&mut self, evidence: OccupancyTraceEvidence<'_>) {
+    /// Every report enters the start-history ring for completion prediction.
+    ///
+    /// The update applies evidence to its interval start. It then advances
+    /// the change process across the evidence interval.
+    pub(crate) fn update(&mut self, evidence: OccupancyTraceEvidence<'_>, elapsed: Duration) {
         let window = evidence.window();
         debug_assert!(
             evidence.mean_concurrency() <= self.concurrency_max,
             "the observation buffer enforces maximum resource concurrency"
+        );
+        let exposure = Duration::from_micros(window.exposure_micros());
+        self.transition(elapsed.saturating_sub(exposure));
+        self.observation_clock_micros = self
+            .observation_clock_micros
+            .saturating_add(elapsed.as_micros() as u64);
+        record_start_window(
+            &mut self.start_history,
+            &mut self.start_history_head,
+            &mut self.start_history_len,
+            window,
+            self.observation_clock_micros,
+            Some(window.started_attempts()),
         );
         debug_assert!(
             window.exposure_seconds() >= self.exposure_min_seconds,
@@ -931,18 +934,26 @@ impl CapacityFactor {
                 .map_or(f64::NEG_INFINITY, |value| raw - value.ln());
         }
         let prior_predictive = log_weighted_sum(&self.prior_weights, &self.likelihoods);
-        if prior_predictive.is_finite() && self.update_filters(prior_predictive) {
-            record_start_window(
-                &mut self.start_history,
-                &mut self.start_history_head,
-                &mut self.start_history_len,
-                window,
-            );
+        if posterior_update_eligible(prior_predictive) {
+            self.update_filters(prior_predictive);
         }
+        self.transition(exposure);
     }
 
-    pub(crate) fn omit_observation(&mut self) {
+    pub(crate) fn omit_observation(&mut self, elapsed: Duration) {
+        self.transition(elapsed);
+        self.observation_clock_micros = self
+            .observation_clock_micros
+            .saturating_add(elapsed.as_micros() as u64);
+        record_start_gap(
+            &mut self.start_history,
+            &mut self.start_history_head,
+            &mut self.start_history_len,
+            self.observation_clock_micros,
+            elapsed,
+        );
         self.residual_integrated_hazard = 0.0_f64;
+        self.discard_next_residual = true;
     }
 
     pub(crate) const fn markov_clock_rejected(&self) -> bool {
@@ -963,19 +974,7 @@ impl CapacityFactor {
             / (2.0_f64 * sample_count))
             .sqrt();
         let lattice_bound = 1.0_f64 / RESIDUAL_BIN_COUNT_F64;
-        let mut cumulative = 0_u32;
-        let mut maximum_distance = 0.0_f64;
-        let mut expected = lattice_bound;
-        for (index, count) in self.residual_counts.iter().enumerate() {
-            cumulative = cumulative.saturating_add(*count);
-            let empirical = f64::from(cumulative) / sample_count;
-            maximum_distance = maximum_distance.max((empirical - expected).abs());
-            expected = if index + 1 == RESIDUAL_BIN_COUNT {
-                1.0_f64
-            } else {
-                expected + lattice_bound
-            };
-        }
+        let maximum_distance = self.residual_distance(sample_count, lattice_bound);
         CapacityClockCheck {
             sample_count: self.residual_sample_count,
             maximum_distance,
@@ -996,10 +995,15 @@ impl CapacityFactor {
             let exposure = Duration::from_micros(offset - previous_offset).as_secs_f64();
             self.residual_integrated_hazard += exposure * self.posterior_state_rate(state);
             for _ in 0..completed {
-                let uniform = 1.0_f64 - (-self.residual_integrated_hazard).exp();
-                let bin = ((uniform * RESIDUAL_BIN_COUNT_F64) as usize).min(RESIDUAL_BIN_COUNT - 1);
-                self.residual_counts[bin] = self.residual_counts[bin].saturating_add(1);
-                self.residual_sample_count = self.residual_sample_count.saturating_add(1);
+                if self.discard_next_residual {
+                    self.discard_next_residual = false;
+                } else {
+                    let uniform = 1.0_f64 - (-self.residual_integrated_hazard).exp();
+                    let bin =
+                        ((uniform * RESIDUAL_BIN_COUNT_F64) as usize).min(RESIDUAL_BIN_COUNT - 1);
+                    self.residual_counts[bin] = self.residual_counts[bin].saturating_add(1);
+                    self.residual_sample_count = self.residual_sample_count.saturating_add(1);
+                }
                 self.residual_integrated_hazard = 0.0_f64;
                 state -= 1;
             }
@@ -1009,27 +1013,27 @@ impl CapacityFactor {
         let tail = Duration::from_micros(evidence.window().exposure_micros() - previous_offset)
             .as_secs_f64();
         self.residual_integrated_hazard += tail * self.posterior_state_rate(state);
-        if self.residual_sample_count == 0 {
-            return;
+        if self.residual_sample_count > 0 {
+            let sample_count = f64::from(self.residual_sample_count);
+            let alpha = CAPACITY_MODEL_BUDGET.boundary_probability_max();
+            let dkw_bound = (-(alpha * 0.5_f64).ln() / (2.0_f64 * sample_count)).sqrt();
+            let lattice_bound = 1.0_f64 / RESIDUAL_BIN_COUNT_F64;
+            self.markov_clock_rejected =
+                self.residual_distance(sample_count, lattice_bound) > dkw_bound + lattice_bound;
         }
-        let alpha = CAPACITY_MODEL_BUDGET.boundary_probability_max();
-        let sample_count = f64::from(self.residual_sample_count);
-        let dkw_bound = (-(alpha * 0.5_f64).ln() / (2.0_f64 * sample_count)).sqrt();
-        let lattice_bound = 1.0_f64 / RESIDUAL_BIN_COUNT_F64;
+    }
+
+    fn residual_distance(&self, sample_count: f64, lattice_bound: f64) -> f64 {
         let mut cumulative = 0_u32;
-        let mut distance = 0.0_f64;
+        let mut maximum = 0.0_f64;
         let mut expected = lattice_bound;
-        for (index, count) in self.residual_counts.iter().enumerate() {
-            cumulative = cumulative.saturating_add(*count);
+        for count in self.residual_counts {
+            cumulative = cumulative.saturating_add(count);
             let empirical = f64::from(cumulative) / sample_count;
-            distance = distance.max((empirical - expected).abs());
-            expected = if index + 1 == RESIDUAL_BIN_COUNT {
-                1.0_f64
-            } else {
-                expected + lattice_bound
-            };
+            maximum = maximum.max((empirical - expected).abs());
+            expected += lattice_bound;
         }
-        self.markov_clock_rejected = distance > dkw_bound + lattice_bound;
+        maximum
     }
 
     fn posterior_state_rate(&self, state: usize) -> f64 {
@@ -1233,12 +1237,12 @@ impl CapacityFactor {
     ///
     /// An identifiable persistent curve has positive divergence from the
     /// prior predictive. Its run evidence then grows in expectation.
-    fn update_filters(&mut self, prior_predictive: f64) -> bool {
+    fn update_filters(&mut self, prior_predictive: f64) {
         let cell_count = self.weights.len();
         let quality_count = self.contamination_probabilities.len();
         for (filter, curve_weights) in self
             .filter_curve_weights
-            .chunks_exact_mut(cell_count)
+            .chunks_exact(cell_count)
             .enumerate()
         {
             let contamination = self.contamination_probabilities[filter % quality_count];
@@ -1259,16 +1263,11 @@ impl CapacityFactor {
                             .exp()
                 })
                 .sum::<f64>();
-            if predictive <= 0.0_f64 {
-                return false;
+            if !predictive.is_finite() || predictive <= 0.0_f64 {
+                return;
             }
             self.filter_log_weights[filter] =
                 self.filter_weights[filter].ln() + maximum + predictive.ln();
-            for (weight, likelihood) in curve_weights.iter_mut().zip(&self.likelihoods) {
-                let mixture =
-                    log_contamination_mixture(*likelihood, prior_predictive, contamination);
-                *weight *= (mixture - maximum).exp() / predictive;
-            }
         }
         let maximum = self
             .filter_log_weights
@@ -1280,14 +1279,35 @@ impl CapacityFactor {
             .iter()
             .map(|weight| (*weight - maximum).exp())
             .sum::<f64>();
-        if total <= 0.0_f64 {
-            return false;
+        if !total.is_finite() || total <= 0.0_f64 {
+            return;
+        }
+        for (filter, curve_weights) in self
+            .filter_curve_weights
+            .chunks_exact_mut(cell_count)
+            .enumerate()
+        {
+            let contamination = self.contamination_probabilities[filter % quality_count];
+            let maximum = self
+                .likelihoods
+                .iter()
+                .map(|likelihood| {
+                    log_contamination_mixture(*likelihood, prior_predictive, contamination)
+                })
+                .fold(f64::NEG_INFINITY, f64::max);
+            let predictive =
+                (self.filter_log_weights[filter] - self.filter_weights[filter].ln() - maximum)
+                    .exp();
+            for (weight, likelihood) in curve_weights.iter_mut().zip(&self.likelihoods) {
+                let mixture =
+                    log_contamination_mixture(*likelihood, prior_predictive, contamination);
+                *weight *= (mixture - maximum).exp() / predictive;
+            }
         }
         for (weight, log_weight) in self.filter_weights.iter_mut().zip(&self.filter_log_weights) {
             *weight = (*log_weight - maximum).exp() / total;
         }
         self.mix_filters();
-        true
     }
 
     fn mix_filters(&mut self) {
@@ -1656,13 +1676,36 @@ fn record_start_window(
     head: &mut usize,
     length: &mut usize,
     window: &ResourceWindow,
+    end_micros: u64,
+    started_attempts: Option<u32>,
 ) {
     history[*head] = StartWindow {
+        end_micros,
         exposure_seconds: window.exposure_seconds(),
-        started_attempts: window.started_attempts,
+        started_attempts,
     };
     *head = (*head + 1) % history.len();
     *length = (*length + 1).min(history.len());
+}
+
+fn record_start_gap(
+    history: &mut [StartWindow],
+    head: &mut usize,
+    length: &mut usize,
+    end_micros: u64,
+    exposure: Duration,
+) {
+    history[*head] = StartWindow {
+        end_micros,
+        exposure_seconds: exposure.as_secs_f64(),
+        started_attempts: None,
+    };
+    *head = (*head + 1) % history.len();
+    *length = (*length + 1).min(history.len());
+}
+
+fn posterior_update_eligible(prior_predictive: f64) -> bool {
+    prior_predictive.is_finite()
 }
 
 fn effective_service_time(grid: &CapacityGrid, index: usize, concurrency: f64) -> f64 {
@@ -1776,7 +1819,7 @@ fn feasibility_probability_with_budget(
     budget: f64,
 ) -> Option<(f64, f64)> {
     let c_max = probabilities.len() - 1;
-    let total_starts = evidence.window().started_attempts()? as usize;
+    let total_starts = evidence.window().started_attempts() as usize;
     let initial = evidence.initial_busy_slots() as usize;
     if initial
         .checked_add(total_starts)
@@ -1859,10 +1902,7 @@ fn feasibility_probability_with_budget(
             return Some((safe_mass.min(1.0_f64), ledger.charged));
         }
     }
-    Some((
-        (safe_mass + probabilities[low..=high].iter().sum::<f64>()).clamp(0.0_f64, 1.0_f64),
-        ledger.charged,
-    ))
+    None
 }
 
 #[cfg(test)]
@@ -1919,7 +1959,7 @@ fn completion_marginal_probability(
         return None;
     }
     let final_state = evidence.final_busy_slots() as usize;
-    let mut remaining_starts = evidence.window().started_attempts()? as usize;
+    let mut remaining_starts = evidence.window().started_attempts() as usize;
     let mut low = final_state.saturating_sub(remaining_starts);
     let mut high = evidence.initial_busy_slots() as usize;
     probabilities.fill(0.0_f64);
@@ -2075,11 +2115,11 @@ fn uniformized_death_step(
         return Some(ledger.group_budget);
     }
     let mean_limit = -ledger.group_budget.ln();
-    let step_count = (rate * exposure_seconds / mean_limit).ceil().max(1.0_f64) as u64;
-    let step_count_f64 = Duration::from_secs(step_count).as_secs_f64();
+    let step_count = (rate * exposure_seconds / mean_limit).ceil().max(1.0_f64) as u32;
+    let step_count_f64 = f64::from(step_count);
     let step_seconds = exposure_seconds / step_count_f64;
     let charge_count = step_count.checked_add(1)?;
-    let charge_count_f64 = Duration::from_secs(charge_count).as_secs_f64();
+    let charge_count_f64 = f64::from(charge_count);
     let tail_bound = ledger.group_budget / charge_count_f64;
     for _ in 0..step_count {
         current[low..=high].copy_from_slice(&probabilities[low..=high]);
@@ -2198,7 +2238,6 @@ fn completion_expectation(
 ) -> f64 {
     let delay = effective_service_time(grid, index, window.concurrency);
     let target_end = delay + window.exposure_seconds();
-    let mut age = 0.0_f64;
     let mut known_mean = 0.0_f64;
     let mut known_overlap = 0.0_f64;
     let mut posterior_shape = arrival_shape;
@@ -2206,6 +2245,8 @@ fn completion_expectation(
     for offset in 0..history.length {
         let index = (history.head + history.windows.len() - 1 - offset) % history.windows.len();
         let start_window = history.windows[index];
+        let age = Duration::from_micros(history.end_micros.saturating_sub(start_window.end_micros))
+            .as_secs_f64();
         let window_end = age + start_window.exposure_seconds;
         if let Some(starts) = start_window.started_attempts {
             posterior_shape += f64::from(starts);
@@ -2214,7 +2255,6 @@ fn completion_expectation(
             known_overlap += overlap;
             known_mean += f64::from(starts) * overlap / start_window.exposure_seconds;
         }
-        age = window_end;
     }
     let missing = (window.exposure_seconds() - known_overlap).max(0.0_f64);
     known_mean + posterior_shape / posterior_rate * missing
@@ -2241,7 +2281,6 @@ fn completion_log_likelihood(
     }
     let delay = effective_service_time(grid, index, window.concurrency);
     let target_end = delay + window.exposure_seconds();
-    let mut age = 0.0_f64;
     let mut known_overlap = 0.0_f64;
     let mut posterior_shape = arrival_shape;
     let mut posterior_rate = arrival_rate_seconds;
@@ -2250,6 +2289,8 @@ fn completion_log_likelihood(
         let history_index =
             (history.head + history.windows.len() - 1 - offset) % history.windows.len();
         let start_window = history.windows[history_index];
+        let age = Duration::from_micros(history.end_micros.saturating_sub(start_window.end_micros))
+            .as_secs_f64();
         let window_end = age + start_window.exposure_seconds;
         if let Some(starts) = start_window.started_attempts {
             posterior_shape += f64::from(starts);
@@ -2260,7 +2301,6 @@ fn completion_log_likelihood(
                 deterministic = deterministic.saturating_add(starts as usize);
             }
         }
-        age = window_end;
     }
     if deterministic > completed {
         return f64::NEG_INFINITY;
@@ -2270,11 +2310,12 @@ fn completion_log_likelihood(
     coefficients[0] = 1.0_f64;
     let mut degree = 0_usize;
     let mut coefficient_log_scale = 0.0_f64;
-    age = 0.0_f64;
     for offset in 0..history.length {
         let history_index =
             (history.head + history.windows.len() - 1 - offset) % history.windows.len();
         let start_window = history.windows[history_index];
+        let age = Duration::from_micros(history.end_micros.saturating_sub(start_window.end_micros))
+            .as_secs_f64();
         let window_end = age + start_window.exposure_seconds;
         if let Some(starts) = start_window.started_attempts {
             let overlap = (window_end.min(target_end) - age.max(delay)).max(0.0_f64);
@@ -2311,7 +2352,6 @@ fn completion_log_likelihood(
                 coefficient_log_scale += maximum + scale.ln();
             }
         }
-        age = window_end;
     }
     let missing = (window.exposure_seconds() - known_overlap).max(0.0_f64);
     completion_probability_from_coefficients(

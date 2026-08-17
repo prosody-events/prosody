@@ -1739,9 +1739,7 @@ impl ObservationBuffer {
             return Err(ObservationError::ResourceExposure);
         }
         if window.completed_attempts() > self.resource_attempt_count_max
-            || window
-                .started_attempts()
-                .is_some_and(|count| count > self.resource_attempt_count_max)
+            || window.started_attempts() > self.resource_attempt_count_max
         {
             return Err(ObservationError::ResourceAttemptCount);
         }
@@ -1789,7 +1787,7 @@ impl ObservationBuffer {
             .ok_or(ObservationError::CountOverflow)?;
         if state != final_busy_slots
             || completed_attempts != window.completed_attempts()
-            || Some(started_attempts) != window.started_attempts()
+            || started_attempts != window.started_attempts()
         {
             return Err(ObservationError::ResourceTraceSummary);
         }

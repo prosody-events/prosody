@@ -2429,15 +2429,18 @@ fn update_constant_capacity_trace(
         .collect::<Vec<_>>();
     let completed = vec![1_u32; transitions.len()];
     let started = vec![1_u32; transitions.len()];
-    factor.update(occupancy_trace_for_test(
-        window,
-        concurrency,
-        concurrency,
-        u128::from(concurrency) * u128::from(window.exposure_micros()),
-        &offsets,
-        &completed,
-        &started,
-    ));
+    factor.update(
+        occupancy_trace_for_test(
+            window,
+            concurrency,
+            concurrency,
+            u128::from(concurrency) * u128::from(window.exposure_micros()),
+            &offsets,
+            &completed,
+            &started,
+        ),
+        Duration::from_micros(window.exposure_micros()),
+    );
 }
 
 fn capacity_factor_with_rate(

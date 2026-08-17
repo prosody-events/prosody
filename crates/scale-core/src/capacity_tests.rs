@@ -13,6 +13,7 @@ use super::{
     log_contamination_mixture, log_normal_axis_masses, log_weighted_sum, path_log_score,
     pure_death_step, record_start_window, uniformized_death_step,
 };
+use crate::change_point::ChangePointKernel;
 use crate::types::occupancy_trace_for_test;
 use crate::{ArrivalPrior, OccupancyTraceEvidence};
 
@@ -34,15 +35,127 @@ fn update_constant_trace(
         .collect::<Vec<_>>();
     let completed = vec![1_u32; completed_attempts as usize];
     let started = vec![1_u32; completed_attempts as usize];
-    factor.update(occupancy_trace_for_test(
-        window,
-        concurrency,
-        concurrency,
-        u128::from(concurrency) * u128::from(exposure_micros),
-        &offsets,
-        &completed,
-        &started,
-    ));
+    factor.update(
+        occupancy_trace_for_test(
+            window,
+            concurrency,
+            concurrency,
+            u128::from(concurrency) * u128::from(exposure_micros),
+            &offsets,
+            &completed,
+            &started,
+        ),
+        Duration::from_micros(exposure_micros),
+    );
+    Ok(())
+}
+
+fn posterior_bits(factor: &super::CapacityFactor) -> Vec<u64> {
+    factor
+        .weights
+        .iter()
+        .chain(&factor.filter_weights)
+        .chain(&factor.filter_curve_weights)
+        .map(|value| value.to_bits())
+        .collect()
+}
+
+#[quickcheck]
+fn rejecting_update_leaves_the_posterior_byte_identical(operation_codes: Vec<u8>) -> bool {
+    let Ok(grid) = CapacityGrid::new(&[0.25_f64, 1.0_f64], &[100.0_f64], &[0.0_f64]) else {
+        return false;
+    };
+    let Ok(prior) = ArrivalPrior::test_artifact() else {
+        return false;
+    };
+    let Ok(mut factor) = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &prior,
+        1.0_f64,
+        1.0_f64,
+        8,
+    ) else {
+        return false;
+    };
+    for code in operation_codes.into_iter().take(16) {
+        if update_constant_trace(&mut factor, 1, 1.0_f64, u32::from(code % 2)).is_err() {
+            return false;
+        }
+    }
+    let before = posterior_bits(&factor);
+    factor.likelihoods[0] = f64::NAN;
+    factor.update_filters(0.0_f64);
+    before == posterior_bits(&factor)
+}
+
+#[test]
+fn missed_tick_update_matches_an_explicit_interval_start_transition() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.25_f64, 1.0_f64], &[100.0_f64], &[0.0_f64])?;
+    let prior = ArrivalPrior::test_artifact()?;
+    let mut owned = super::CapacityFactor::new_with_prior(
+        grid.clone(),
+        1.0_f64 / 300.0_f64,
+        &prior,
+        1.0_f64,
+        1.0_f64,
+        8,
+    )?;
+    let mut explicit = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &prior,
+        1.0_f64,
+        1.0_f64,
+        8,
+    )?;
+    for _ in 0_u8..8 {
+        update_constant_trace(&mut owned, 1, 1.0_f64, 1)?;
+        update_constant_trace(&mut explicit, 1, 1.0_f64, 1)?;
+    }
+    let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 1, 1)?;
+    let offsets = [500_000_u64];
+    let completed = [1_u32];
+    let started = [1_u32];
+    let evidence =
+        occupancy_trace_for_test(window, 1, 1, 1_000_000, &offsets, &completed, &started);
+    owned.update(evidence, Duration::from_secs(3));
+    explicit.transition(Duration::from_secs(2));
+    explicit.update(evidence, Duration::ZERO);
+    assert_eq!(posterior_bits(&owned), posterior_bits(&explicit));
+    assert_eq!(owned.observation_clock_micros, 11_000_000);
+    let latest =
+        (owned.start_history_head + owned.start_history.len() - 1) % owned.start_history.len();
+    assert_eq!(owned.start_history[latest].end_micros, 11_000_000);
+    Ok(())
+}
+
+#[test]
+fn first_completion_residual_after_a_gap_is_discarded() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &ArrivalPrior::test_artifact()?,
+        2.0_f64,
+        1.0_f64,
+        2,
+    )?;
+    factor.omit_observation(Duration::from_secs(2));
+    let window = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 1, 0)?;
+    let offsets = [500_000_u64];
+    let completed = [1_u32];
+    let started = [0_u32];
+    factor.update(
+        occupancy_trace_for_test(window, 1, 0, 500_000, &offsets, &completed, &started),
+        Duration::from_secs(1),
+    );
+    assert_eq!(factor.residual_sample_count, 0);
+    assert_eq!(factor.start_history_len, 2);
+    assert_eq!(factor.start_history[0].started_attempts, None);
+    assert_eq!(factor.start_history[0].end_micros, 2_000_000);
+    assert_eq!(factor.start_history[1].started_attempts, Some(0));
+    assert_eq!(factor.start_history[1].end_micros, 3_000_000);
     Ok(())
 }
 
@@ -115,19 +228,25 @@ fn prehistory_mean_does_not_use_the_completion_response(
         return false;
     };
     let history = [StartWindow {
+        end_micros: 0,
         exposure_seconds: 1.0_f64,
         started_attempts: None,
     }];
-    let Ok(first) = ResourceWindow::new(1.0_f64, 1.0_f64, u32::from(first_completed)) else {
+    let Ok(first) =
+        ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, u32::from(first_completed), 0)
+    else {
         return false;
     };
-    let Ok(second) = ResourceWindow::new(1.0_f64, 1.0_f64, u32::from(second_completed)) else {
+    let Ok(second) =
+        ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, u32::from(second_completed), 0)
+    else {
         return false;
     };
     let retained = RetainedHistory {
         windows: &history,
         head: 0,
         length: 0,
+        end_micros: 0,
     };
     completion_expectation(&grid, 0, retained, &first, 2.0_f64, 1.0_f64)
         .total_cmp(&completion_expectation(
@@ -140,6 +259,7 @@ fn prehistory_mean_does_not_use_the_completion_response(
 fn coverage_ring_matches_unbounded_history() -> Result<(), TestError> {
     let grid = CapacityGrid::new(&[2.0_f64], &[10.0_f64], &[0.0_f64])?;
     let empty = StartWindow {
+        end_micros: 0,
         exposure_seconds: 0.0_f64,
         started_attempts: None,
     };
@@ -155,16 +275,27 @@ fn coverage_ring_matches_unbounded_history() -> Result<(), TestError> {
     let mut reference_coefficients = [0.0_f64; 65];
     let mut reference_convolution = [0.0_f64; 65];
     let mut reference_binomial = [0.0_f64; 65];
+    let mut end_micros = 0_u64;
     for index in 0_u32..180 {
         let exposure = if index % 2 == 0 { 1.0_f64 } else { 1.5_f64 };
         let starts = if index % 7 == 0 { 13 } else { 5 };
         let window = ResourceWindow::new_with_starts(1.0_f64, exposure, 5, starts)?;
-        record_start_window(&mut ring, &mut ring_head, &mut ring_len, &window);
+        end_micros = end_micros.saturating_add(window.exposure_micros());
+        record_start_window(
+            &mut ring,
+            &mut ring_head,
+            &mut ring_len,
+            &window,
+            end_micros,
+            Some(starts),
+        );
         record_start_window(
             &mut unbounded,
             &mut unbounded_head,
             &mut unbounded_len,
             &window,
+            end_micros,
+            Some(starts),
         );
         let actual = completion_log_likelihood(
             &grid,
@@ -173,6 +304,7 @@ fn coverage_ring_matches_unbounded_history() -> Result<(), TestError> {
                 windows: &ring,
                 head: ring_head,
                 length: ring_len,
+                end_micros,
             },
             &window,
             1.0_f64,
@@ -190,6 +322,7 @@ fn coverage_ring_matches_unbounded_history() -> Result<(), TestError> {
                 windows: &unbounded,
                 head: unbounded_head,
                 length: unbounded_len,
+                end_micros,
             },
             &window,
             1.0_f64,
@@ -334,7 +467,7 @@ fn completion_convolution_update_does_not_allocate() -> Result<(), TestError> {
     let started = [1_u32; 32];
     let evidence =
         occupancy_trace_for_test(window, 1, 1, 1_000_000, &offsets, &completed, &started);
-    let allocation = measure(|| factor.update(evidence));
+    let allocation = measure(|| factor.update(evidence, Duration::from_secs(1)));
     assert_eq!(allocation.count_total, 0);
     assert_eq!(allocation.bytes_total, 0);
     assert_eq!(factor.start_history_len, 2);
@@ -487,12 +620,16 @@ fn assert_contamination_filter_parity(
     }
     let total_filter_evidence = filter_evidence.iter().sum::<f64>();
     for (filter, evidence) in filter_evidence.iter().enumerate() {
+        let transition =
+            ChangePointKernel::new(factor.hazard_rates_per_second[filter / quality_count])
+                .probabilities(Duration::from_secs(1));
         for cell in 0..cell_count {
-            direct_weights[cell] +=
-                evidence / total_filter_evidence * conditional_weights[filter * cell_count + cell];
+            let conditional = transition.retained * conditional_weights[filter * cell_count + cell]
+                + transition.redrawn * factor.prior_weights[cell];
+            direct_weights[cell] += evidence / total_filter_evidence * conditional;
         }
     }
-    factor.update(evidence);
+    factor.update(evidence, Duration::from_secs(1));
     let operation_bound = 4_096.0_f64 * f64::EPSILON;
     assert!(
         factor
@@ -916,6 +1053,7 @@ fn ablation_likelihoods(
     observation: AblationWindow<'_>,
 ) -> Result<[[f64; 2]; ABLATION_ARM_COUNT], TestError> {
     let history = [StartWindow {
+        end_micros: 1_000_000,
         exposure_seconds: 1.0_f64,
         started_attempts: Some(1),
     }];
@@ -929,6 +1067,7 @@ fn ablation_likelihoods(
                 windows: &history,
                 head: 0,
                 length: 1,
+                end_micros: 1_000_000,
             },
             observation.window,
             1.0_f64,
@@ -1091,7 +1230,7 @@ fn time_rescaled_residuals_reject_tied_deterministic_completions() -> Result<(),
     let evidence =
         occupancy_trace_for_test(window, 20, 20, 20_000_000, &offsets, &completed, &started);
     for _ in 0_u8..10 {
-        factor.update(evidence);
+        factor.update(evidence, Duration::from_secs(1));
     }
     assert!(factor.markov_clock_rejected());
     Ok(())

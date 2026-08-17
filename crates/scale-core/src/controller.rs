@@ -1163,13 +1163,12 @@ pub fn step(
             .saturating_sub(state.model_time.as_micros()),
     );
     state.model_time = model_time;
-    state.capacity.transition(elapsed);
     state.lead_time.transition(elapsed);
     state.rebalance_time.transition(elapsed);
     if let Some(evidence) = resource {
-        state.capacity.update(evidence);
+        state.capacity.update(evidence, elapsed);
     } else {
-        state.capacity.omit_observation();
+        state.capacity.omit_observation(elapsed);
     }
     if let Some(evidence) = attempt_outcomes {
         state.reliability.update(evidence);
