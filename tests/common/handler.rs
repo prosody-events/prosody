@@ -66,10 +66,11 @@ impl EventHandler for ChannelHandler {
             sleep(self.delay).await;
         }
 
-        if let Err(error) = self
-            .messages_tx
-            .send((msg.key().to_string(), msg.payload().clone()))
-            .await
+        if let Some(payload) = msg.record().message()
+            && let Err(error) = self
+                .messages_tx
+                .send((msg.key().to_string(), payload.clone()))
+                .await
         {
             error!("failed to send message: {error:#}");
         }
@@ -138,10 +139,12 @@ impl FallibleHandler for FallibleTestHandler {
         C: EventContext<Payload = Self::Payload>,
     {
         // Send errors are irrelevant here: the receiver may already be gone.
-        let _ = self
-            .messages_tx
-            .send((message.key().to_string(), message.payload().clone()))
-            .await;
+        if let Some(payload) = message.record().message() {
+            let _ = self
+                .messages_tx
+                .send((message.key().to_string(), payload.clone()))
+                .await;
+        }
         Ok(())
     }
 
@@ -158,6 +161,18 @@ impl FallibleHandler for FallibleTestHandler {
     }
 
     async fn shutdown(self) {}
+
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage<Value>,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
 }
 
 impl ClientHandler for FallibleTestHandler {

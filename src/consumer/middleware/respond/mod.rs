@@ -172,6 +172,25 @@ where
         }
     }
 
+    async fn on_excise<C2>(
+        &self,
+        context: C2,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C2: EventContext<Payload = Self::Payload>,
+    {
+        let meta = message.request().map(|request| ResultDelivery {
+            request,
+            trace: message.span().context(),
+        });
+        match self.handler.on_excise(context, message, demand_type).await {
+            Ok(inner) => Ok(Responded { inner, meta }),
+            Err(inner) => Err(Responded { inner, meta }),
+        }
+    }
+
     /// Forwards a timer without response metadata.
     ///
     /// A trigger has no headers, so this path cannot construct response

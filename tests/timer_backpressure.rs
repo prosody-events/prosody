@@ -53,11 +53,11 @@ impl EventHandler for SlowTimerHandler {
     {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
-        let payload = msg.payload();
+        let payload = msg.record().message();
 
         // Schedule a timer based on the message
         if let Some(delay_ms) = payload
-            .get("schedule_timer_delay_ms")
+            .and_then(|payload| payload.get("schedule_timer_delay_ms"))
             .and_then(Value::as_u64)
         {
             let delay_secs = (delay_ms / 1000).max(1) as u32; // Convert to seconds, minimum 1

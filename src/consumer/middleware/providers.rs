@@ -34,14 +34,14 @@
 use std::future::Future;
 
 use crate::consumer::event_context::EventContext;
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::{ConsumerMessage, Record};
 use crate::consumer::{DemandType, EventHandler, HandlerProvider, Partition, Topic};
 use crate::timers::Trigger;
 
 use super::{FallibleHandler, FallibleHandlerProvider, Settlement, SettlementHandler};
 
 /// The chain terminator [`into_provider`] mints around the user's leaf
-/// handler: a pure pass-through whose crate-internal settlement
+/// handler. Its crate-internal settlement
 /// classification is final on both sides — the leaf's result is the event's
 /// own outcome, by definition. Minting it here (instead of a blanket
 /// classification over all handlers) keeps the classification an explicit,
@@ -68,16 +68,31 @@ where
     type Output = H::Output;
     type Payload = H::Payload;
 
-    fn on_message<C>(
+    async fn on_message<C>(
         &self,
         context: C,
         message: ConsumerMessage<Self::Payload>,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        self.0.on_message(context, message, demand_type)
+        match message.record() {
+            Record::Message(_) => self.0.on_message(context, message, demand_type).await,
+            Record::Excise => self.0.on_excise(context, message, demand_type).await,
+        }
+    }
+
+    async fn on_excise<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.0.on_excise(context, message, demand_type).await
     }
 
     fn on_timer<C>(

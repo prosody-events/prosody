@@ -105,10 +105,10 @@ impl<P> UncommittedMessage<P> {
         self.inner.timestamp()
     }
 
-    /// Returns a reference to the deserialized payload.
+    /// Returns the record value.
     #[must_use]
-    pub fn payload(&self) -> &P {
-        self.inner.payload()
+    pub fn record(&self) -> &Record<P> {
+        self.inner.record()
     }
 
     /// Returns the tracing span associated with this message.
@@ -175,7 +175,10 @@ impl<P> Keyed for UncommittedMessage<P> {
 
 impl<P: EventIdentity> EventIdentity for UncommittedMessage<P> {
     fn event_id(&self) -> Option<&str> {
-        self.payload().event_id()
+        match self.record() {
+            Record::Message(payload) => payload.event_id(),
+            Record::Excise => None,
+        }
     }
 }
 
@@ -221,6 +224,25 @@ struct ProcessingState {
     _permit: OwnedSemaphorePermit,
 }
 
+/// Content of one keyed Kafka record.
+pub enum Record<P> {
+    /// A record with a deserialized payload.
+    Message(P),
+    /// A record that deletes its key from compacted views.
+    Excise,
+}
+
+impl<P> Record<P> {
+    /// Returns the message payload, if this is a message record.
+    #[must_use]
+    pub fn message(&self) -> Option<&P> {
+        match self {
+            Self::Message(payload) => Some(payload),
+            Self::Excise => None,
+        }
+    }
+}
+
 /// The full data and metadata for a consumer message.
 ///
 /// Owned by `ConsumerMessage` and shared via `Arc`.
@@ -245,9 +267,9 @@ pub struct ConsumerMessageValue<P> {
     /// Broker timestamp when the message was produced.
     pub timestamp: DateTime<Utc>,
 
-    /// Deserialized message payload.
+    /// Record content.
     #[educe(Debug(ignore))]
-    pub payload: P,
+    pub record: Record<P>,
 
     /// Where a response to this message must go, when the record asked for one
     /// and this consumer answers for one of the subsystems it awaits.
@@ -267,7 +289,7 @@ impl Default for ConsumerMessageValue<serde_json::Value> {
             offset: 0,
             key: "test-key".into(),
             timestamp: Utc::now(),
-            payload: serde_json::json!({}),
+            record: Record::Message(serde_json::json!({})),
             request: None,
         }
     }
@@ -354,10 +376,10 @@ impl<P> ConsumerMessage<P> {
         &self.value.timestamp
     }
 
-    /// Returns the deserialized payload.
+    /// Returns the record value.
     #[must_use]
-    pub fn payload(&self) -> &P {
-        &self.value.payload
+    pub fn record(&self) -> &Record<P> {
+        &self.value.record
     }
 
     /// Returns the tracing span associated with this message.
@@ -414,7 +436,7 @@ impl<P> ConsumerMessage<P> {
                 offset,
                 key,
                 timestamp: Utc::now(),
-                payload,
+                record: Record::Message(payload),
                 request: None,
             },
             Span::current(),

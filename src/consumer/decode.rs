@@ -21,11 +21,11 @@ use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::{Message, Timestamp};
 use std::str;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
-use crate::consumer::message::ConsumerMessageValue;
+use crate::consumer::message::{ConsumerMessageValue, Record};
 use crate::peer::response::headers::{ResultRequest, parse_result_request};
 use crate::subsystem::SubsystemName;
 use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
@@ -131,22 +131,23 @@ pub fn decode_message<C: Codec, R: ResultRequestReader>(
     // `Cargo.toml` (which uses caret semver and accepts any 0.39.x via
     // `cargo update`). Re-audit on any rdkafka bump, including patch updates.
     #[allow(unsafe_code)]
-    let Some(payload_bytes) = (unsafe { message.payload_mut() }) else {
-        error!(
-            topic = %topic,
-            partition = partition,
-            offset = offset,
-            "missing payload; discarding message"
-        );
-        return None;
-    };
-
-    let payload = match codec.deserialize(payload_bytes) {
-        Ok(p) => p,
-        Err(error) => {
-            error!("invalid payload: {error:#}; discarding message");
-            return None;
+    let record = if let Some(payload_bytes) = unsafe { message.payload_mut() } {
+        match codec.deserialize(payload_bytes) {
+            Ok(payload) => Record::Message(payload),
+            Err(error) => {
+                error!("invalid payload: {error:#}; discarding message");
+                return None;
+            }
         }
+    } else {
+        debug!(
+            topic = %topic,
+            partition,
+            offset,
+            key = %key,
+            "decoded excise record"
+        );
+        Record::Excise
     };
 
     let value = Arc::new(ConsumerMessageValue {
@@ -156,7 +157,7 @@ pub fn decode_message<C: Codec, R: ResultRequestReader>(
         offset,
         key,
         timestamp,
-        payload,
+        record,
         request,
     });
 

@@ -7,9 +7,12 @@ use crate::telemetry::event::{Data, KeyEvent, KeyState, TelemetryEvent};
 use crate::tracing::init_test_logging;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
+use interval::interval_set::ToIntervalSet;
+use interval::prelude::{Intersection, Union};
 use quickcheck::{Arbitrary, Gen, QuickCheck};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::time::sleep;
 
 const TEST_TOPIC: &str = "test-topic";

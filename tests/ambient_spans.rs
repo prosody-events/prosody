@@ -82,6 +82,20 @@ impl FallibleHandler for AmbientProbe {
     }
 
     async fn shutdown(self) {}
+
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: ConsumerMessage<Self::Payload>,
+        _demand_type: DemandType,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        let ok = ambient_is(&message.span());
+        let _ = self.sender.send(("excise".to_owned(), ok)).await;
+        Ok(())
+    }
 }
 
 impl ClientHandler for AmbientProbe {

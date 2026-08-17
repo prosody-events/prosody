@@ -310,7 +310,7 @@ impl<C: Codec> ProsodyProducer<C> {
     )]
     pub(crate) async fn send_owned(
         &self,
-        mut headers: OwnedHeaders,
+        headers: OwnedHeaders,
         topic: Topic,
         key: &str,
         payload: C::Payload,
@@ -353,11 +353,70 @@ impl<C: Codec> ProsodyProducer<C> {
             Span::current().record("payload_size", payload_size);
         }
 
+        self.send_record(headers, topic, key, Some(serialized.as_slice()))
+            .await?;
+
+        // Update the idempotence cache if needed
+        if let (Some(cache), Some(hash)) = (&self.idempotence_cache, dedup_hash) {
+            cache.insert(hash, ());
+        }
+        Ok(())
+    }
+
+    /// Sends an excise record with the specified key and no payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ProducerError` if the system clock or Kafka send fails.
+    #[instrument(
+        skip(self, topic, headers),
+        fields(otel.kind = "producer", messaging.system = "kafka", topic = topic.as_ref(), key = %key, partition, offset, timestamp),
+        err
+    )]
+    pub async fn excise<'a, H>(
+        &'a self,
+        headers: H,
+        topic: Topic,
+        key: &str,
+    ) -> Result<(), ProducerError<C::Error>>
+    where
+        H: IntoIterator<Item = (&'static str, &'a str), IntoIter: ExactSizeIterator>,
+    {
+        let headers = headers.into_iter();
+        let mut owned = OwnedHeaders::new_with_capacity(headers.len() + 1);
+        for (key, value) in headers {
+            owned = owned.insert(Header {
+                key,
+                value: Some(value.as_bytes()),
+            });
+        }
+        self.excise_owned(owned, topic, key).await
+    }
+
+    /// Sends an excise record with headers that the caller already owns.
+    pub(crate) async fn excise_owned(
+        &self,
+        headers: OwnedHeaders,
+        topic: Topic,
+        key: &str,
+    ) -> Result<(), ProducerError<C::Error>> {
+        self.send_record(headers, topic, key.into(), None).await
+    }
+
+    async fn send_record(
+        &self,
+        mut headers: OwnedHeaders,
+        topic: Topic,
+        key: Key,
+        payload: Option<&[u8]>,
+    ) -> Result<(), ProducerError<C::Error>> {
         // Build the Kafka record
         let mut record = FutureRecord::to(&topic)
             .key(key.as_ref())
-            .payload(serialized.as_slice())
             .timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64);
+        if let Some(payload) = payload {
+            record = record.payload(payload);
+        }
 
         // Add source system header
         headers = headers.insert(Header {
@@ -390,14 +449,10 @@ impl<C: Codec> ProsodyProducer<C> {
             topic,
             delivery.partition,
             delivery.offset,
-            key.clone(),
+            key,
             Arc::from(self.source_system.as_ref()),
         );
 
-        // Update the idempotence cache if needed
-        if let (Some(cache), Some(hash)) = (&self.idempotence_cache, dedup_hash) {
-            cache.insert(hash, ());
-        }
         Ok(())
     }
 

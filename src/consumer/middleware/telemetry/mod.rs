@@ -4,6 +4,9 @@
 //! metrics like execution time, success/failure rates, and error
 //! classifications without affecting the processing flow.
 //!
+//! Message telemetry represents Kafka record work. It includes message and
+//! excise records because both use the same offset lifecycle.
+//!
 //! # Execution Order
 //!
 //! **Request Path:**
@@ -193,13 +196,20 @@ where
         result
     }
 
-    /// Processes a timer and records telemetry events for handler lifecycle,
-    /// passing through the wrapped handler's result (and error) unchanged.
-    ///
-    /// Records the following events:
-    /// - `HandlerInvoked` when the handler is called
-    /// - `HandlerSucceeded` when the handler completes successfully
-    /// - `HandlerFailed` when the handler returns an error
+    /// Records telemetry for an excise record.
+    fn on_excise<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        FallibleHandler::on_message(self, context, message, demand_type)
+    }
+
+    /// Records invocation, success, and failure telemetry for a timer.
     async fn on_timer<C>(
         &self,
         context: C,

@@ -7,7 +7,7 @@
 //! [`MemoryLoader::store_message`].
 
 use super::{MessageLoader, PermitMode};
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, Record};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::otel::SpanRelation;
 use crate::related_span;
@@ -110,7 +110,7 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
             offset,
             key,
             timestamp: Utc::now(),
-            payload,
+            record: Record::Message(payload),
             // This loader serves messages it was handed, not Kafka records, so
             // there are no headers to read a result request from.
             request: None,

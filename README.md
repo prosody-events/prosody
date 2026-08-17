@@ -108,6 +108,18 @@ impl FallibleHandler for MyHandler {
     }
 
     async fn shutdown(self) {}
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: ConsumerMessage<Self::Payload>,
+        _demand_type: DemandType,
+    ) -> Result<(), Self::Error>
+    where
+        C: EventContext,
+    {
+        println!("Excise key: {}", message.key());
+        Ok(())
+    }
 }
 
 impl ClientHandler for MyHandler {
@@ -147,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.subscribe(MyHandler).await?;
 
     client.send("my-topic".into(), "message-key", json!({"value": "Hello, Kafka!"})).await?;
+    client.excise("my-topic".into(), "obsolete-key").await?;
 
     // Run your application logic here
 
@@ -154,6 +167,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Excise records
+
+Call `excise(topic, key)` to send a Kafka record with a key and no payload. Use this record to delete the key from compacted views.
+
+Each handler must implement `on_excise`. It receives the same arguments as `on_message`. The message contains `Record::Excise` instead of a payload.
 
 ## Requests
 

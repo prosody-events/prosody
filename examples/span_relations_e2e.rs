@@ -158,6 +158,18 @@ impl FallibleHandler for SpanProbe {
     }
 
     async fn shutdown(self) {}
+
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        _message: ConsumerMessage<Self::Payload>,
+        _demand_type: DemandType,
+    ) -> Result<(), Infallible>
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        Ok(())
+    }
 }
 
 impl ClientHandler for SpanProbe {

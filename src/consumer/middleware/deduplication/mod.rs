@@ -47,7 +47,7 @@ use xxhash_rust::xxh3::Xxh3Default;
 use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::{ConsumerMessage, Record};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
     Settlement, SettlementHandler,
@@ -242,13 +242,17 @@ pub fn dedup_uuid_for_message<P>(identity: DedupIdentity<'_>, message: &Consumer
 where
     P: EventIdentity,
 {
+    let event_id = match message.record() {
+        Record::Message(payload) => payload.event_id(),
+        Record::Excise => None,
+    };
     dedup_uuid(
         identity.version,
         identity.group_id,
         identity.topic,
         identity.partition,
         message.key().as_bytes(),
-        message.payload().event_id().map(str::as_bytes),
+        event_id.map(str::as_bytes),
         message.offset(),
     )
 }
@@ -305,6 +309,18 @@ where
             .await
             .map(Some)
             .map_err(DeduplicationError::Inner)
+    }
+
+    fn on_excise<C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<Self::Payload>,
+        demand_type: DemandType,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        FallibleHandler::on_message(self, context, message, demand_type)
     }
 
     async fn on_timer<C>(

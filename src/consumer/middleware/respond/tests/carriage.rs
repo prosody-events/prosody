@@ -2,11 +2,12 @@
 //! boundary.
 
 use super::super::{RespondHandler, Responded};
-use super::{Fixture, ResultProbeCodec, offset_tracker, requesting};
+use super::{Fixture, ResultProbeCodec, offset_tracker, requesting, requesting_excise};
+use crate::consumer::middleware::providers::LeafHandler;
 use crate::consumer::middleware::tests::test_support::{
     BypassedHandler, MockEventContext, ScriptedHandler, TestError,
 };
-use crate::consumer::middleware::{Settlement, SettlementHandler};
+use crate::consumer::middleware::{FallibleHandler, Settlement, SettlementHandler};
 use crate::consumer::{DemandType, EventHandler};
 use crate::error::ErrorCategory;
 use crate::peer::response::RequestId;
@@ -14,6 +15,7 @@ use crate::peer::response::frame::tests::decode_frame;
 use crate::peer::response::frame::{FrameResult, HandlerError};
 use crate::peer::router::loopback::{TestRouter, paused, peer};
 use color_eyre::Result;
+use std::sync::Arc;
 
 /// The request reaches the wire from the error arm and the success arm.
 ///
@@ -55,6 +57,36 @@ fn metadata_rides_the_error_arm() -> Result<()> {
         };
         assert_eq!(category, ErrorCategory::Permanent);
         assert_eq!(message, b"test error (Permanent)".as_slice());
+        Ok(())
+    })
+}
+
+/// An excise result reaches the request response.
+#[test]
+fn excise_returns_one_response() -> Result<()> {
+    paused()?.block_on(async {
+        let fixture = Fixture::<ResultProbeCodec>::new()?;
+        let handler = RespondHandler::new(
+            LeafHandler::new(ScriptedHandler::success()),
+            Arc::clone(&fixture.responder),
+        );
+        let message = requesting_excise(3, 12, "obsolete")?;
+
+        let result = FallibleHandler::on_excise(
+            &handler,
+            MockEventContext::new(),
+            message,
+            DemandType::Normal,
+        )
+        .await;
+        handler.after_commit(MockEventContext::new(), result).await;
+        drop(handler);
+
+        let mut drained = fixture.drain().await?;
+        assert_eq!(drained.len(), 1);
+        let mut delivery = drained.remove(0);
+        let frame = decode_frame(&mut delivery.bytes)?;
+        assert!(matches!(frame.result, FrameResult::Success(_)));
         Ok(())
     })
 }
