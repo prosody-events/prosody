@@ -8,7 +8,7 @@
 
 use super::super::encoding::{
     CASSANDRA_COMPRESSION_BLOCK_BYTES, Encoding, EncodingError, decode_payload, decode_scratch,
-    encode_payload, reset_codec, select_encoding, validate_decompression_bound,
+    encode_payload, reset_encoding_state, select_encoding, validate_decompression_bound,
 };
 use super::{
     BorrowedCellTtlRow, CellCorruptReason, FramedKeyedCellRow, RawCellRow, blob_ttl,
@@ -341,7 +341,7 @@ fn prop_legacy_zstd_frames_decode() {
 
 #[test]
 fn failed_stream_decode_does_not_poison_the_next_frame() -> Result<()> {
-    reset_codec();
+    reset_encoding_state();
     let valid = encode_all(b"valid after corrupt".as_slice(), 0)?;
     assert!(matches!(get_frame_content_size(&valid), Ok(None)));
     let mut truncated = valid.clone();
@@ -425,12 +425,12 @@ fn decoded_cell_does_not_retain_its_response_frame() -> Result<()> {
 
 #[test]
 fn decode_scratch_grows_once_and_then_stays_stable() -> Result<()> {
-    reset_codec();
+    reset_encoding_state();
     let maximum = Bytes::from(vec![0x3C; 64 * 1024]);
     let minimum = Bytes::from_static(b"small");
     let encoded_maximum = encode_payload(&maximum, Encoding::Zstd)?;
     let encoded_minimum = encode_payload(&minimum, Encoding::Zstd)?;
-    reset_codec();
+    reset_encoding_state();
 
     assert_eq!(decode_scratch(), (0, 0));
     assert_eq!(decode_payload(&encoded_maximum, Encoding::Zstd)?, maximum);

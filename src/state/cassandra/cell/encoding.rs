@@ -18,11 +18,11 @@ const ZSTD_MAX_BLOCK_BYTES: usize = 128 * 1_024;
 pub(super) const CASSANDRA_COMPRESSION_BLOCK_BYTES: usize = 16 * 1024;
 
 thread_local! {
-    static CODEC: RefCell<Option<Codec>> = const { RefCell::new(None) };
+    static ZSTD_CONTEXTS: RefCell<Option<ZstdContexts>> = const { RefCell::new(None) };
 }
 
 /// One thread owns the Zstd contexts. Scratch comes from [`SerializeBufGuard`].
-struct Codec {
+struct ZstdContexts {
     compressor: Compressor<'static>,
     decompressor: DCtx<'static>,
 }
@@ -46,7 +46,7 @@ impl AsRef<[u8]> for EncodedBlob {
     }
 }
 
-impl Codec {
+impl ZstdContexts {
     fn new() -> io::Result<Self> {
         Ok(Self {
             compressor: Compressor::new(ZSTD_LEVEL)?,
@@ -125,10 +125,10 @@ pub(in crate::state::cassandra) fn decode_payload(
 }
 
 fn compress(raw: &[u8]) -> Result<Bytes, EncodingError> {
-    with_codec(|codec| {
+    with_zstd_contexts(|contexts| {
         let mut scratch = SerializeBufGuard::acquire();
         scratch.reserve(zstd_safe::compress_bound(raw.len()));
-        codec
+        contexts
             .compressor
             .compress_to_buffer(raw, &mut *scratch)
             .map_err(EncodingError::BadZstd)?;
@@ -137,15 +137,15 @@ fn compress(raw: &[u8]) -> Result<Bytes, EncodingError> {
 }
 
 fn decompress(bytes: &[u8]) -> Result<Bytes, EncodingError> {
-    with_codec(|codec| {
-        codec
+    with_zstd_contexts(|contexts| {
+        contexts
             .decompressor
             .reset(ResetDirective::SessionOnly)
             .map_err(zstd_error)?;
         let mut scratch = SerializeBufGuard::acquire();
         let bound = validated_decompression_bound(bytes)?;
         scratch.reserve(bound);
-        codec
+        contexts
             .decompressor
             .decompress(&mut *scratch, bytes)
             .map_err(zstd_error)?;
@@ -187,16 +187,16 @@ pub(super) fn validate_decompression_bound(
     Ok(bound)
 }
 
-fn with_codec<T>(
-    operation: impl FnOnce(&mut Codec) -> Result<T, EncodingError>,
+fn with_zstd_contexts<T>(
+    operation: impl FnOnce(&mut ZstdContexts) -> Result<T, EncodingError>,
 ) -> Result<T, EncodingError> {
-    CODEC.with(|slot| {
+    ZSTD_CONTEXTS.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let codec = match &mut *slot {
-            Some(codec) => codec,
-            empty @ None => empty.insert(Codec::new().map_err(EncodingError::BadZstd)?),
+        let contexts = match &mut *slot {
+            Some(contexts) => contexts,
+            empty @ None => empty.insert(ZstdContexts::new().map_err(EncodingError::BadZstd)?),
         };
-        operation(codec)
+        operation(contexts)
     })
 }
 
@@ -205,8 +205,8 @@ fn zstd_error(code: usize) -> EncodingError {
 }
 
 #[cfg(test)]
-pub(super) fn reset_codec() {
-    CODEC.with(|slot| *slot.borrow_mut() = None);
+pub(super) fn reset_encoding_state() {
+    ZSTD_CONTEXTS.with(|slot| *slot.borrow_mut() = None);
     SerializeBufGuard::reset();
 }
 
