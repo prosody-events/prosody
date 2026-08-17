@@ -460,20 +460,43 @@ where
                 .contains_many(collection, section, batch, own)
                 .await;
         }
-        match self.fjall.get_batch(collection, section, batch).await {
-            Ok(Some(hits)) => {
-                return Ok(hits
-                    .into_iter()
-                    .map(|committed| committed.get().is_some())
-                    .collect());
-            }
+        match self
+            .fjall
+            .get_presence_batch(collection, section, batch)
+            .await
+        {
+            Ok(Some(hits)) => return Ok(hits),
             Ok(None) => {}
             Err(error) => warn_skip("read presence batch", &error),
         }
         self.delete_read_window(collection, own).await?;
-        self.lower
+        // Take the clock sample before the durable read. Published entries can
+        // then expire early, but they cannot outlive durable data.
+        let stamped_at = self.fjall.clock().now_ms();
+        let presence = self
+            .lower
             .contains_many(collection, section, batch, own)
-            .await
+            .await?;
+        // A presence read has no value bytes. Cache only Absent positions.
+        // Present positions stay cold until a value read can publish payloads.
+        let absent = batch
+            .iter()
+            .zip(&presence)
+            .filter(|(_, present)| !**present)
+            .map(|(coordinate, _)| {
+                (
+                    CellKey {
+                        section,
+                        coordinate: coordinate.clone(),
+                    },
+                    Committed::new(None),
+                    expiry_at(stamped_at, None),
+                )
+            });
+        if let Err(error) = self.fjall.put_batch(collection, absent).await {
+            warn_skip("populate presence batch", &error);
+        }
+        Ok(presence)
     }
 
     fn scan_cells<'a>(

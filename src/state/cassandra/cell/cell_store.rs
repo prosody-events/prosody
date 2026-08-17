@@ -171,6 +171,7 @@ where
     ) -> Result<PresenceBatch, Self::Error> {
         let collection_ref = self.resolver.collection_ref(collection);
         let (unique_coordinates, input_indices) = dedupe(batch);
+        // Use the read-window sequence documented on `get_for_cache`.
         let (rows, standing) = futures::join!(
             fetch_presence_batch_result(
                 &self.session,

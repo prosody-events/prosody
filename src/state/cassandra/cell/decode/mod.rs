@@ -79,13 +79,7 @@ pub(super) type FramedKeyedCellRow = (
 );
 
 /// Presence body from the two write times and shared cell metadata.
-pub(super) type RawPresenceRow = (
-    Option<i64>,
-    Option<i64>,
-    Option<i16>,
-    Option<i32>,
-    Option<RawEventRef>,
-);
+pub(super) type RawPresenceRow = RawCellRow<i64>;
 
 /// Presence scan row with its section and coordinate.
 pub(super) type FramedKeyedPresenceRow = (
@@ -305,7 +299,8 @@ pub(super) fn try_decode_cell<B: AsRef<[u8]>>(
 
 /// Decodes write-time presence into a sentinel [`Cell`]. A live write time
 /// becomes `Some(Bytes::new())`; a dead write time becomes `None`. The sentinel
-/// never crosses a store boundary.
+/// never crosses a store boundary. Presence cells resolve through `peek_read`
+/// only: a repairing resolve would persist the sentinel over real bytes.
 pub(super) fn try_decode_presence(row: RawPresenceRow) -> Result<Cell, CassandraCellStoreError> {
     let (data, prev, encoding, version, event) = row;
     validate_row_shape(

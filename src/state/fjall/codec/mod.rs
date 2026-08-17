@@ -304,6 +304,33 @@ pub(super) fn encode_present_cell(payload: &[u8], expiry: u64) -> Bytes {
 /// it is uniquely owned — preserving the `try_into_mut` read fast path the
 /// handle relies on.
 pub(super) fn decode_cell(bytes: Option<&[u8]>) -> Result<(u64, Read<Bytes>), FjallCellCacheError> {
+    let (expiry, read) = decode_cell_parts(bytes)?;
+    Ok((
+        expiry,
+        match read {
+            Read::Present(payload) => Read::Present(Bytes::copy_from_slice(payload)),
+            Read::Absent => Read::Absent,
+            Read::Unknown => Read::Unknown,
+        },
+    ))
+}
+
+/// Decodes presence and expiry without copying the payload bytes.
+pub(super) fn decode_presence(
+    bytes: Option<&[u8]>,
+) -> Result<(u64, Read<()>), FjallCellCacheError> {
+    let (expiry, read) = decode_cell_parts(bytes)?;
+    Ok((
+        expiry,
+        match read {
+            Read::Present(_) => Read::Present(()),
+            Read::Absent => Read::Absent,
+            Read::Unknown => Read::Unknown,
+        },
+    ))
+}
+
+fn decode_cell_parts(bytes: Option<&[u8]>) -> Result<(u64, Read<&[u8]>), FjallCellCacheError> {
     let Some(bytes) = bytes else {
         return Ok((NEVER_EXPIRES, Read::Unknown));
     };
@@ -321,7 +348,7 @@ pub(super) fn decode_cell(bytes: Option<&[u8]>) -> Result<(u64, Read<Bytes>), Fj
         CACHE_TAG_ABSENT => Ok((expiry, Read::Absent)),
         // An empty payload tail is valid: a `Set` of empty bytes frames as
         // `[0x01][expiry]`, so do NOT re-add an "empty tail ⇒ corrupt" guard.
-        CACHE_TAG_PRESENT => Ok((expiry, Read::Present(Bytes::copy_from_slice(payload)))),
+        CACHE_TAG_PRESENT => Ok((expiry, Read::Present(payload))),
         other => Err(FjallCellCacheError::UnknownCacheTag(other)),
     }
 }

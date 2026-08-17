@@ -25,6 +25,11 @@ const _: () = assert!(
 pub struct CoordinateBatch(CellBuffer<Coordinate>);
 
 impl CoordinateBatch {
+    /// Creates one batch for one coordinate.
+    pub(crate) fn one(coordinate: Coordinate) -> Self {
+        CoordinateBatch(CellBuffer::from_iter([coordinate]))
+    }
+
     /// Splits `coords` into maximal `1..=CELL_BATCH` batches in input order.
     pub fn chunks<I: IntoIterator<Item = Coordinate>>(
         coords: I,

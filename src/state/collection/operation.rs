@@ -476,16 +476,15 @@ async fn read_presence<S: StateSession>(
     section: Section,
     coordinate: Coordinate,
 ) -> Result<bool, StateAccessError> {
-    for batch in CoordinateBatch::chunks([coordinate]) {
-        let answers = <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
-            session, inner, state_type, name, section, &batch,
-        )
-        .await?;
-        if let Some(answer) = answers.first() {
-            return Ok(*answer);
-        }
-    }
-    Err(StateAccessError::misaligned_batch(0, 1))
+    let batch = CoordinateBatch::one(coordinate);
+    let answers = <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
+        session, inner, state_type, name, section, &batch,
+    )
+    .await?;
+    answers
+        .first()
+        .copied()
+        .ok_or_else(|| StateAccessError::misaligned_batch(answers.len(), batch.len()))
 }
 
 impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {
@@ -637,9 +636,8 @@ async fn batched_bytes<S: StateSession>(
         .collect())
 }
 
-/// Reads `keys`' visible committed bytes as one aligned batch — the whole read
-/// a journal-free invocation performs, and the presence-only half a key-scan
-/// chunk needs, with no decode and no resolver.
+/// Reads visible committed bytes for typed entry reads.
+/// The result aligns with `keys` and does not decode values.
 ///
 /// # Errors
 ///

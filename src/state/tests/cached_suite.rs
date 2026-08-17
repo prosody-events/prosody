@@ -1446,6 +1446,32 @@ fn absent_get_is_cached() -> Result<()> {
     })
 }
 
+/// KV2 negative caching: two presence reads of a never-written cell issue one
+/// lower read. The second read uses the cached Absent tag.
+#[test]
+fn absent_presence_is_cached() -> Result<()> {
+    TEST_RUNTIME.block_on(async {
+        let (cached, counting, id) = counting_cached("absent-presence")?;
+        let batch = batch_of([9])?;
+
+        counting.reset();
+        assert_eq!(
+            cached.contains_many(&id, SECTION, &batch, probe(1)).await?,
+            PresenceBatch::from_iter([false]),
+        );
+        assert_eq!(
+            cached.contains_many(&id, SECTION, &batch, probe(2)).await?,
+            PresenceBatch::from_iter([false]),
+        );
+        assert_eq!(
+            counting.presence_reads(),
+            1,
+            "two absent presence reads pay one durable read"
+        );
+        Ok(())
+    })
+}
+
 /// A blown fuse bypasses a stale cache entry for a presence batch.
 #[test]
 fn blown_fuse_presence_reads_durable_truth() -> Result<()> {
