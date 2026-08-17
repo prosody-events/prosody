@@ -140,8 +140,24 @@ where
             Err(error) => error,
         };
         if matches!(error.classify_error(), ErrorCategory::Terminal) {
+            info!(
+                topic,
+                partition,
+                key = key.as_ref(),
+                offset,
+                "terminal condition encountered while handling {EXCISE_SOURCE_KIND}: {error:#}; \
+                 aborting"
+            );
             return Err(FailureTopicError::Handler(error));
         }
+        error!(
+            topic,
+            partition,
+            key = key.as_ref(),
+            offset,
+            "failed to process {EXCISE_SOURCE_KIND}: {error:#}; sending to {}",
+            self.topic
+        );
         let headers = [
             ("source-kind", EXCISE_SOURCE_KIND),
             ("source-topic", topic),

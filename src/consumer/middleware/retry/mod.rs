@@ -66,6 +66,7 @@ use validator::{Validate, ValidationErrors};
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
+use crate::consumer::middleware::handler::{HandlerMethod, OnExcise, OnMessage};
 use crate::consumer::middleware::{
     FallibleHandler, FallibleHandlerProvider, HandlerMiddleware, Settlement, SettlementHandler,
     abandon, settle,
@@ -172,6 +173,50 @@ impl<T> RetryProvider<T> {
             max_delay_millis: self.config.max_delay.as_millis() as u64,
             max_retries: self.config.max_retries,
             handler,
+        }
+    }
+}
+
+impl<T> RetryHandler<T>
+where
+    T: FallibleHandler,
+{
+    async fn handle<H, C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<H::MessagePayload>,
+        demand_type: DemandType,
+    ) -> Result<T::Output, T::Error>
+    where
+        H: HandlerMethod<T>,
+        C: EventContext<Payload = T::Payload>,
+    {
+        let topic = message.topic();
+        let partition = message.partition();
+        let key = message.key();
+        let offset = message.offset();
+        let (resolution, _final) = self
+            .run(
+                context,
+                demand_type,
+                Some(self.max_retries),
+                |ctx, dt| H::call(&self.handler, ctx, message.clone(), dt),
+                |ctx, error| self.handler.after_abort(ctx, Err(error)),
+                |reason| {
+                    log_message_failure(
+                        topic.as_ref(),
+                        partition,
+                        key.as_ref(),
+                        offset,
+                        &reason,
+                        "",
+                    );
+                },
+            )
+            .await;
+        match resolution {
+            Resolution::Commit(result) => result,
+            Resolution::Abort(error) => Err(error),
         }
     }
 }
@@ -285,33 +330,8 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        let topic = message.topic();
-        let partition = message.partition();
-        let key = message.key();
-        let offset = message.offset();
-        let (resolution, _final) = self
-            .run(
-                context,
-                demand_type,
-                Some(self.max_retries),
-                |ctx, dt| self.handler.on_message(ctx, message.clone(), dt),
-                |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| {
-                    log_message_failure(
-                        topic.as_ref(),
-                        partition,
-                        key.as_ref(),
-                        offset,
-                        &reason,
-                        "",
-                    );
-                },
-            )
-            .await;
-        match resolution {
-            Resolution::Commit(result) => result,
-            Resolution::Abort(error) => Err(error),
-        }
+        self.handle::<OnMessage, _>(context, message, demand_type)
+            .await
     }
 
     async fn on_excise<C>(
@@ -323,33 +343,8 @@ where
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        let topic = message.topic();
-        let partition = message.partition();
-        let key = message.key();
-        let offset = message.offset();
-        let (resolution, _final) = self
-            .run(
-                context,
-                demand_type,
-                Some(self.max_retries),
-                |ctx, dt| self.handler.on_excise(ctx, message.clone(), dt),
-                |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| {
-                    log_message_failure(
-                        topic.as_ref(),
-                        partition,
-                        key.as_ref(),
-                        offset,
-                        &reason,
-                        "",
-                    );
-                },
-            )
-            .await;
-        match resolution {
-            Resolution::Commit(result) => result,
-            Resolution::Abort(error) => Err(error),
-        }
+        self.handle::<OnExcise, _>(context, message, demand_type)
+            .await
     }
 
     async fn on_timer<C>(

@@ -8,12 +8,79 @@ use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_m
 use crate::consumer::middleware::defer::decider::DeferralDecider;
 use crate::consumer::middleware::defer::error::DeferError;
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
-use crate::consumer::middleware::handler::{OnExcise, OnMessage};
+use crate::consumer::middleware::handler::{HandlerMethod, OnExcise, OnMessage};
 use crate::consumer::{DemandType, Keyed};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
 use crate::state::session::{MarkerAccessExt, MessageMarker};
 use crate::timers::{TimerType, Trigger};
+
+impl<T, M, L, D> MessageDeferHandler<T, M, L, D>
+where
+    T: FallibleHandler<Payload = L::Payload>,
+    M: MessageDeferStore,
+    L: MessageLoader + 'static,
+    D: DeferralDecider,
+    L::Payload: crate::EventIdentity,
+{
+    async fn handle<H, C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<H::MessagePayload>,
+        demand_type: DemandType,
+    ) -> Result<MessageDeferOutput<T::Output, T::Error>, DeferError<M::Error, T::Error, L::Error>>
+    where
+        H: HandlerMethod<T>,
+        C: EventContext<Payload = T::Payload>,
+    {
+        if self
+            .store
+            .is_deferred(message.key())
+            .await
+            .map_err(DeferError::Store)?
+            .is_some()
+        {
+            let offset = message.offset();
+            return self.append_to_deferred_queue(message.key(), offset).await;
+        }
+
+        let message_key = message.key().clone();
+        let offset = message.offset();
+        let error = match H::call(&self.handler, context.clone(), message, demand_type).await {
+            Ok(output) => return Ok(MessageDeferOutput::Inner(output)),
+            Err(error) => error,
+        };
+
+        if !matches!(error.classify_error(), ErrorCategory::Transient) {
+            return Err(DeferError::Handler(error));
+        }
+
+        if !self.config.enabled {
+            debug!(
+                key = ?message_key,
+                offset,
+                topic = %self.topic,
+                partition = self.partition,
+                "Deferral skipped: middleware disabled"
+            );
+            return Err(DeferError::Handler(error));
+        }
+
+        if !self.decider.should_defer() {
+            debug!(
+                key = ?message_key,
+                offset,
+                topic = %self.topic,
+                partition = self.partition,
+                "Deferral skipped: decider threshold not met"
+            );
+            return Err(DeferError::Handler(error));
+        }
+
+        self.defer_message(context, &message_key, offset, error)
+            .await
+    }
+}
 
 impl<T, M, L, D> FallibleHandler for MessageDeferHandler<T, M, L, D>
 where
@@ -38,60 +105,7 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        // Already deferred: queue behind existing messages (ordering
-        // invariant). Inner does not run -> NoInner.
-        if self
-            .store
-            .is_deferred(message.key())
-            .await
-            .map_err(DeferError::Store)?
-            .is_some()
-        {
-            let offset = message.offset();
-            return self.append_to_deferred_queue(message.key(), offset).await;
-        }
-
-        // Not deferred: try handler, defer on transient failure if enabled.
-        let message_key = message.key().clone();
-        let offset = message.offset();
-
-        let error = match self
-            .handler
-            .on_message(context.clone(), message, demand_type)
-            .await
-        {
-            Ok(output) => return Ok(MessageDeferOutput::Inner(output)),
-            Err(error) => error,
-        };
-
-        if !matches!(error.classify_error(), ErrorCategory::Transient) {
-            return Err(DeferError::Handler(error));
-        }
-
-        // Only gate initial deferral; once deferred, always re-defer transient.
-        if !self.config.enabled {
-            debug!(
-                key = ?message_key,
-                offset = offset,
-                topic = %self.topic,
-                partition = self.partition,
-                "Deferral skipped: middleware disabled"
-            );
-            return Err(DeferError::Handler(error));
-        }
-
-        if !self.decider.should_defer() {
-            debug!(
-                key = ?message_key,
-                offset = offset,
-                topic = %self.topic,
-                partition = self.partition,
-                "Deferral skipped: decider threshold not met"
-            );
-            return Err(DeferError::Handler(error));
-        }
-
-        self.defer_message(context, &message_key, offset, error)
+        self.handle::<OnMessage, _>(context, message, demand_type)
             .await
     }
 
@@ -105,34 +119,8 @@ where
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        if self
-            .store
-            .is_deferred(message.key())
+        self.handle::<OnExcise, _>(context, message, demand_type)
             .await
-            .map_err(DeferError::Store)?
-            .is_some()
-        {
-            return self
-                .append_to_deferred_queue(message.key(), message.offset())
-                .await;
-        }
-        let key = message.key().clone();
-        let offset = message.offset();
-        let error = match self
-            .handler
-            .on_excise(context.clone(), message, demand_type)
-            .await
-        {
-            Ok(output) => return Ok(MessageDeferOutput::Inner(output)),
-            Err(error) => error,
-        };
-        if !matches!(error.classify_error(), ErrorCategory::Transient)
-            || !self.config.enabled
-            || !self.decider.should_defer()
-        {
-            return Err(DeferError::Handler(error));
-        }
-        self.defer_message(context, &key, offset, error).await
     }
 
     /// Keeps each deferred-message trigger inside this middleware.

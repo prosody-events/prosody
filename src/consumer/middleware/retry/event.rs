@@ -68,6 +68,10 @@ where
     ) where
         C: EventContext<Payload = T::Payload>,
     {
+        let topic = message.topic();
+        let partition = message.partition();
+        let key = message.key().to_owned();
+        let offset = message.offset();
         let (message, uncommitted_offset) = message.into_inner();
         let (resolution, final_ctx) = self
             .run(
@@ -76,7 +80,16 @@ where
                 None,
                 |ctx, dt| self.handler.on_excise(ctx, message.clone(), dt),
                 |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |_| {},
+                |reason| {
+                    log_message_failure(
+                        topic.as_ref(),
+                        partition,
+                        key.as_ref(),
+                        offset,
+                        &reason,
+                        "; discarding message",
+                    );
+                },
             )
             .await;
 
