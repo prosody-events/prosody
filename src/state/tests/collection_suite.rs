@@ -30,6 +30,7 @@
 //! entirely in the descriptor layer above it.
 
 use super::cell_suite::{MAX_TRACE_OPS, ScriptedOracle, capped_vec};
+use super::support::CountingCellStore;
 use super::support::assert_no_settlement_residue;
 use crate::codec::{Codec, JsonCodec};
 use crate::consumer::partition::ShutdownPhase;
@@ -1632,7 +1633,7 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
     // reach the same present-but-undecodable cell.
     let tracked = Bytes::from(tracked_frame(&[key]));
     let overflowed = Bytes::from(OVERFLOWED_FRAME.to_vec());
-    for keyset_frame in [tracked, overflowed] {
+    for (tracked_route, keyset_frame) in [(true, tracked), (false, overflowed)] {
         let oracle = ScriptedOracle::default();
         let cells = MemoryCells::new();
         let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
@@ -1646,8 +1647,12 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
                 ..CollectionDef::new(None)
             },
         )?;
-        let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
-        block_on(store.write_resolved(
+        let counting = CountingCellStore::new(MemoryCellStore::new(
+            cells.clone(),
+            oracle.clone(),
+            registry.clone(),
+        ));
+        block_on(counting.write_resolved(
             &collection_ref,
             &[
                 (keyset_cell(), Some(keyset_frame)),
@@ -1657,8 +1662,9 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
         ))?;
 
         let armed: ArmedKeys = Arc::default();
-        let session = make_session(
-            &cells,
+        counting.reset();
+        let session = super::counting_session(
+            &counting,
             &oracle,
             &registry,
             &state_key,
@@ -1673,11 +1679,27 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
                 handle.contains_key(&key).await.map_err(|e| eyre!("{e}"))?,
                 "contains_key answers about the cell, not the value"
             );
+            assert_eq!(counting.presence_reads(), 1);
+            assert_eq!(counting.batch_reads(), 0);
+            assert_eq!(counting.presence_scans(), 0, "contains_key does not scan");
+            counting.reset();
             assert_eq!(
                 collect_map_keys(&handle, Direction::Forward).await?,
                 vec![key],
                 "keys() yields the key of an undecodable-value cell"
             );
+            assert_eq!(
+                counting.presence_reads(),
+                usize::from(tracked_route),
+                "only tracked keys use a presence batch"
+            );
+            assert_eq!(
+                counting.presence_scans(),
+                usize::from(!tracked_route),
+                "only overflowed keys use a presence scan"
+            );
+            assert_eq!(counting.batch_reads(), 0);
+            assert_eq!(counting.lower_scans(), 0);
 
             // Value reads surface the decode failure as `Permanent`.
             let got = handle.get(&key).await;

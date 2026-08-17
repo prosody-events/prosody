@@ -309,19 +309,20 @@ impl<S: StateSession, L> CollectionRead for ReadOperation<'_, S, L> {
         family: CellFamily<L, T>,
         key: &KeyOf<T>,
     ) -> impl Future<Output = Result<bool, StateAccessError>> + Send {
-        let cell = cell_key(family, key);
+        let section = family.section();
+        let coordinate = <T::Key as OrderedKeyCodec>::encode(key);
         let Self { collection, inner } = self;
         let session = collection.session();
         async move {
-            let bytes = <S::Engine as sealed::ReadEngine<S>>::read_point(
+            read_presence(
                 session,
                 inner,
                 collection.state_type(),
                 collection.name(),
-                &cell,
+                section,
+                coordinate,
             )
-            .await?;
-            Ok(bytes.is_some())
+            .await
         }
     }
 
@@ -431,15 +432,17 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
             match staged {
                 Some(Staged::Present(_)) => Ok(true),
                 Some(Staged::Absent) => Ok(false),
-                None => Ok(<S::Engine as sealed::ReadEngine<S>>::read_point(
-                    session,
-                    &mut **inner,
-                    collection.state_type(),
-                    collection.name(),
-                    &cell,
-                )
-                .await?
-                .is_some()),
+                None => {
+                    read_presence(
+                        session,
+                        &mut **inner,
+                        collection.state_type(),
+                        collection.name(),
+                        cell.section,
+                        cell.coordinate,
+                    )
+                    .await
+                }
             }
         }
     }
@@ -462,6 +465,27 @@ impl<S: WritableStateSession, L> CollectionRead for WriteOperation<'_, S, L> {
         // engine await, never the borrowed key.
         async move { read_staged::<S, T, L>(collection, &mut **inner, staged, &cell).await }
     }
+}
+
+/// Reads one coordinate through the engine's presence batch.
+async fn read_presence<S: StateSession>(
+    session: &S,
+    inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
+    state_type: StateType,
+    name: &StateName,
+    section: Section,
+    coordinate: Coordinate,
+) -> Result<bool, StateAccessError> {
+    for batch in CoordinateBatch::chunks([coordinate]) {
+        let answers = <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
+            session, inner, state_type, name, section, &batch,
+        )
+        .await?;
+        if let Some(answer) = answers.first() {
+            return Ok(*answer);
+        }
+    }
+    Err(StateAccessError::misaligned_batch(0, 1))
 }
 
 impl<S: WritableStateSession, L> CollectionWrite for WriteOperation<'_, S, L> {

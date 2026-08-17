@@ -42,10 +42,10 @@ use super::cell_key::{CellKey, Coordinate, Direction, Scan, Section};
 use super::dirty::{DirtyStore, DirtyVal};
 use super::event_ref::EventRef;
 use super::identity::CollectionId;
-use super::store::{CellBuffer, CellStore, CommittedBatch, CoordinateBatch};
+use super::store::{CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch};
 use async_stream::try_stream;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use smallvec::{SmallVec, smallvec};
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -166,6 +166,38 @@ where
         Ok(out)
     }
 
+    /// Presence twin of [`Self::get_many`].
+    pub async fn contains_many<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        section: Section,
+        batch: &'a CoordinateBatch,
+        own: EventRef,
+    ) -> Result<PresenceBatch, L::Error> {
+        let (dirty_answers, untouched, untouched_pos) =
+            self.classify_batch(collection, section, batch);
+        let mut answers: CellBuffer<Option<bool>> = dirty_answers
+            .into_iter()
+            .map(|answer| answer.map(|value| matches!(value, DirtyVal::Set(_))))
+            .collect();
+        for lower_batch in CoordinateBatch::chunks(untouched) {
+            let lower = self
+                .lower
+                .contains_many(collection, section, &lower_batch, own)
+                .await?;
+            for (present, &pos) in lower.into_iter().zip(untouched_pos.iter()) {
+                answers[pos] = Some(present);
+            }
+        }
+        let out: PresenceBatch = answers.into_iter().flatten().collect();
+        debug_assert_eq!(
+            out.len(),
+            batch.len(),
+            "batch read must answer every input position"
+        );
+        Ok(out)
+    }
+
     /// A dirty `Set` answers its value. A dirty `Cleared` answers absence.
     /// A section clear answers absence for an untouched cell because a later
     /// `Set` matches first. The lower sub-batch keeps untouched input
@@ -223,6 +255,28 @@ where
             own,
         );
         self.merge_cells(collection, scan, bottom)
+    }
+
+    /// Presence twin of [`Self::scan_cells`].
+    pub fn scan_keys<'a>(
+        &'a self,
+        collection: &'a CollectionId,
+        scan: Scan<'a>,
+        own: EventRef,
+    ) -> impl Stream<Item = Result<CellKey, L::Error>> + Send + 'a {
+        let bottom = self
+            .lower
+            .scan_keys(
+                collection,
+                Scan {
+                    limit: None,
+                    ..scan
+                },
+                own,
+            )
+            .map_ok(|key| (key, Bytes::new()));
+        self.merge_cells(collection, scan, bottom)
+            .map_ok(|(key, _)| key)
     }
 
     fn merge_cells<'a, S>(

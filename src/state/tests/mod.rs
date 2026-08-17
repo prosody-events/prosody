@@ -803,6 +803,12 @@ fn map_contains_key_presence_without_resolving() -> Result<()> {
             "set after clear -> true"
         );
         assert_eq!(resolves.resolves(), 0, "no contains_key resolved");
+        assert_eq!(
+            counting.presence_reads(),
+            2,
+            "only the two keys without a dirty answer reach the store"
+        );
+        assert_eq!(counting.batch_reads(), 0, "no value batch on this route");
 
         // Contrast: the K3 cell IS resolvable, so the zero above is a real skip.
         assert!(handle.get(&K3).await.map_err(|e| eyre!("{e}"))?.is_some());
@@ -1394,7 +1400,7 @@ fn session_with_loader<L>(
 
 /// Mints a session over `counting` for one event with the default in-memory
 /// loader.
-fn counting_session(
+pub(super) fn counting_session(
     counting: &CountingCellStore<MemoryCellStore<ScriptedOracle>>,
     oracle: &ScriptedOracle,
     registry: &Arc<CollectionDefRegistry>,

@@ -61,6 +61,30 @@ fn key(name: &str) -> Result<CacheKey> {
     key_at(StateType::Application, name, 1, vec![0])
 }
 
+/// Presence uses fresh positive and negative cache entries without a fill.
+#[test]
+fn presence_probe_matches_cached_values() -> Result<()> {
+    let keys = [key("presence-positive")?, key("presence-negative")?];
+    block_on(async {
+        let (cache, _clock) = mock_clock_cache(1 << 20);
+        let values: CellBuffer<Option<Bytes>> = [Some(Bytes::from_static(b"value")), None]
+            .into_iter()
+            .collect();
+        let warmed = cache
+            .get_many_cached(&keys, CACHE_TTL, || async { Ok(values.clone()) })
+            .await?;
+        assert_eq!(warmed, values);
+        assert_eq!(
+            cache
+                .presence_many(&keys, CACHE_TTL)
+                .map(|bits| bits.into_iter().collect::<Vec<_>>()),
+            Some(vec![true, false])
+        );
+        Ok::<_, StateAccessError>(())
+    })?;
+    Ok(())
+}
+
 // --- Staleness property -----------------------------------------------------
 
 /// The distinct collection names the schedule's key pool spans. They differ

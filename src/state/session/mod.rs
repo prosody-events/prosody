@@ -75,7 +75,7 @@ use crate::state::marker::{EventMarker, SectionClear};
 use crate::state::oracle::CommitOracle;
 use crate::state::overlay::Overlay;
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch};
+use crate::state::store::{CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, PresenceBatch};
 use crate::state::{
     CollectionKindId, CommitMode, EventRef, SHARD_FANOUT_CONCURRENCY, STATE_FANOUT_CONCURRENCY,
     StateBackend, StateKey, StateName, StateType, StoreOutcome,
@@ -1089,6 +1089,22 @@ where
         Ok(committed.into_iter().map(Committed::into_inner).collect())
     }
 
+    /// Reads one section's presence values through the event overlay.
+    pub(in crate::state) async fn contains_many(
+        &self,
+        state_type: StateType,
+        name: &StateName,
+        section: Section,
+        batch: &CoordinateBatch,
+    ) -> Result<PresenceBatch, StateAccessError> {
+        let id = self.id_for(state_type, name);
+        self.inner
+            .overlay
+            .contains_many(&id, section, batch, self.inner.event)
+            .await
+            .map_err(|error| StateAccessError::store(&error))
+    }
+
     /// The single-section, start-anchored, bidirectional range primitive: a
     /// lazy stream of the visible committed cells in `coordinate` byte order.
     pub(in crate::state) fn scan<'a>(
@@ -1108,6 +1124,25 @@ where
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 yield item.map_err(|e| StateAccessError::store(&e))?;
+            }
+        }
+    }
+
+    /// Streams visible keys without value payloads.
+    pub(in crate::state) fn scan_keys<'a>(
+        &'a self,
+        state_type: StateType,
+        name: &'a StateName,
+        scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a {
+        let id = self.id_for(state_type, name);
+        let event = self.inner.event;
+        let overlay = self.inner.overlay.clone();
+        try_stream! {
+            let inner = overlay.scan_keys(&id, scan, event);
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().await {
+                yield item.map_err(|error| StateAccessError::store(&error))?;
             }
         }
     }

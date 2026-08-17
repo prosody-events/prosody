@@ -44,7 +44,8 @@ use super::super::oracle::CommitOracle;
 use super::super::overlay::Overlay;
 use super::super::resolve::{resolve_cell, resolve_marker, sweep_provisional};
 use super::super::store::{
-    CELL_BATCH, CellBuffer, CellStore, CoordinateBatch, PresenceBatch, provisional_point_loop,
+    CELL_BATCH, CellBuffer, CellStore, CommittedBatch, CoordinateBatch, PresenceBatch,
+    provisional_point_loop,
 };
 use super::super::{CommitDecision, EventRef, StateKey, StateName, StateType};
 use super::support::{CountingCellStore, CountingOracle, batch_of};
@@ -2167,6 +2168,10 @@ where
                 if collect_scan(&overlay, &id, &req, own, None).await? != expected {
                     return Ok(false);
                 }
+                let expected_keys: Vec<u8> = expected.iter().map(|(key, _)| *key).collect();
+                if collect_scan_keys(&overlay, &id, &req, own).await? != expected_keys {
+                    return Ok(false);
+                }
             }
         }
 
@@ -2194,6 +2199,12 @@ where
             let got = overlay
                 .get_many(&id, SECTIONS[s as usize], &batch, own)
                 .await?;
+            let presence = overlay
+                .contains_many(&id, SECTIONS[s as usize], &batch, own)
+                .await?;
+            if presence != presence_of(&got) {
+                return Ok(false);
+            }
             if got.len() != CELLS as usize + 1 {
                 return Ok(false);
             }
@@ -2209,6 +2220,13 @@ where
         }
     }
     Ok(true)
+}
+
+fn presence_of(batch: &CommittedBatch) -> PresenceBatch {
+    batch
+        .iter()
+        .map(|committed| committed.get().is_some())
+        .collect()
 }
 
 /// Deterministic precedence pin for [`Overlay::get_many`]: a dirty `Set` inside
@@ -2520,6 +2538,27 @@ where
     {
         let (key, value) = item?;
         out.push((coord_of(&key), value));
+    }
+    Ok(out)
+}
+
+/// Collects the payload-free twin of [`collect_scan`].
+async fn collect_scan_keys<S>(
+    overlay: &Overlay<S>,
+    id: &CollectionId,
+    req: &ScanReq,
+    own: EventRef,
+) -> Result<Vec<u8>>
+where
+    S: CellStore,
+{
+    let start = Coordinate::from_bytes(vec![req.start]);
+    let end = Coordinate::from_bytes(vec![req.end]);
+    let stream = overlay.scan_keys(id, scan_of(*req, &start, &end), own);
+    futures::pin_mut!(stream);
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        out.push(coord_of(&item?));
     }
     Ok(out)
 }

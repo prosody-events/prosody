@@ -235,6 +235,17 @@ where
         ready(Err(StateAccessError::Unavailable))
     }
 
+    async fn read_presence_batch(
+        _session: &UnavailableState<P>,
+        _inner: &mut Self::ReadInner<'_>,
+        _state_type: StateType,
+        _name: &StateName,
+        _section: Section,
+        _batch: &CoordinateBatch,
+    ) -> Result<PresenceBatch, StateAccessError> {
+        Err(StateAccessError::Unavailable)
+    }
+
     fn capture((): &()) {}
 
     async fn resume(_session: &UnavailableState<P>, (): &()) {}
@@ -246,6 +257,16 @@ where
         _name: &'a StateName,
         _scan: Scan<'a>,
     ) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + 'a {
+        stream::once(async { Err(StateAccessError::Unavailable) })
+    }
+
+    fn page_keys<'a>(
+        _session: &'a UnavailableState<P>,
+        (): &'a (),
+        _state_type: StateType,
+        _name: &'a StateName,
+        _scan: Scan<'a>,
+    ) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + 'a {
         stream::once(async { Err(StateAccessError::Unavailable) })
     }
 

@@ -67,6 +67,10 @@ impl<S> CountingCellStore<S> {
         self.counts.scan_cells.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn presence_scans(&self) -> usize {
+        self.counts.scan_keys.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn presence_reads(&self) -> usize {
         self.counts.contains_many.load(Ordering::Relaxed)
     }
