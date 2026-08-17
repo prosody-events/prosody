@@ -79,8 +79,8 @@ impl TryFrom<i16> for Encoding {
 
     fn try_from(value: i16) -> Result<Self, Self::Error> {
         match value {
-            4 => Ok(Self::Zstd),
             1 => Ok(Self::Raw),
+            4 => Ok(Self::Zstd),
             _ => Err(EncodingError::UnknownEncoding(value)),
         }
     }
@@ -102,8 +102,8 @@ pub(in crate::state::cassandra) fn encode_payload(
     encoding: Encoding,
 ) -> Result<Bytes, EncodingError> {
     match encoding {
-        Encoding::Zstd => compress(payload),
         Encoding::Raw => Ok(payload.clone()),
+        Encoding::Zstd => compress(payload),
     }
 }
 
@@ -119,8 +119,8 @@ pub(in crate::state::cassandra) fn decode_payload(
     encoding: Encoding,
 ) -> Result<Bytes, EncodingError> {
     match encoding {
-        Encoding::Zstd => decompress(bytes),
         Encoding::Raw => Ok(Bytes::copy_from_slice(bytes)),
+        Encoding::Zstd => decompress(bytes),
     }
 }
 
