@@ -18,7 +18,6 @@ mod batch;
 mod batch_plot;
 mod calibration;
 mod calibration_plot;
-mod capacity_plot;
 mod controller;
 mod harness;
 mod input;
@@ -29,10 +28,12 @@ mod plot_error;
 mod posterior_plot;
 mod regime;
 mod report;
+mod report_check;
 mod result_metrics;
 mod series;
 mod snapshot;
 mod story_plot;
+mod visual;
 mod w6_witness;
 
 pub use batch::{
@@ -53,7 +54,6 @@ pub use calibration_plot::{
     write_demand_calibration_figures, write_lead_time_calibration_data,
     write_partition_calibration_data,
 };
-pub use capacity_plot::write_capacity_belief_svg;
 pub use controller::{
     ArrivalEvidenceSample, ArrivalWindowSample, CapacityEvidenceKind, CapacityEvidenceSample,
     CapacityTraceSample, CapacityWindowSample, ClosedLoop, ClosedLoopError, ControllerSample,
@@ -81,10 +81,14 @@ pub use regime::{
     validate_principal_regime,
 };
 pub use report::{
-    ExperimentReport, RegimeReport, ReportError, write_batch_report_pdf,
+    ExperimentReport, HistoricalComparisonRow, RegimeReport, ReportError, write_batch_report_pdf,
     write_capacity_calibration_report_pdf, write_demand_calibration_report_pdf,
-    write_lead_time_calibration_report_pdf, write_partition_calibration_report_pdf,
-    write_regime_report_pdf,
+    write_historical_comparison_pdf, write_lead_time_calibration_report_pdf,
+    write_partition_calibration_report_pdf, write_regime_report_pdf,
+};
+pub use report_check::{
+    DocumentManifest, ImageManifestEntry, PanelContent, ReportCheckError, ReportSection,
+    check_document, check_images, label_inside_image,
 };
 pub use series::{
     OutputFunction, RecordedSeries, SeriesCell, SeriesContext, SeriesFunction, SeriesHistory,

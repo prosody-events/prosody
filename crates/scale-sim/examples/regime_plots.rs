@@ -6,12 +6,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use prosody_scale_sim::{
-    BatchSloError, ExperimentReport, PlantError, PlotError, PrincipalRegime, PrincipalRunError,
-    RegimeExperiment, RegimeReport, RegimeStory, RegimeValidationError, ReportError, run_batch_slo,
-    run_capacity_evidence_regime, run_principal_regime, validate_principal_regime,
-    write_batch_actuation_svg, write_batch_report_pdf, write_batch_slo_svg,
-    write_capacity_belief_svg, write_model_belief_figures, write_model_belief_snapshot_figures,
-    write_regime_report_pdf, write_regime_story_figures,
+    BatchSloError, ExperimentReport, HistoricalComparisonRow, ImageManifestEntry, PlantError,
+    PlotError, PrincipalRegime, PrincipalRunError, RegimeExperiment, RegimeReport, RegimeStory,
+    RegimeValidationError, ReportError, run_batch_slo, run_capacity_evidence_regime,
+    run_principal_regime, validate_principal_regime, write_batch_actuation_svg,
+    write_batch_report_pdf, write_batch_slo_svg, write_historical_comparison_pdf,
+    write_model_belief_figures, write_model_belief_snapshot_figures, write_regime_report_pdf,
+    write_regime_story_figures,
 };
 use rayon::prelude::*;
 use thiserror::Error;
@@ -72,11 +73,43 @@ fn main() -> Result<(), PlotGenerationError> {
         tracing::error!(regime = "batch-backlog", %error, "regime report failed");
         failures.push(format!("batch-backlog: {error}"));
     }
+    if let Err(error) = generate_historical_comparison(&report_directory) {
+        tracing::error!(%error, "historical comparison failed");
+        failures.push(format!("historical-comparison: {error}"));
+    }
     if failures.is_empty() {
         Ok(())
     } else {
         Err(PlotGenerationError::ValidationSummary { failures })
     }
+}
+
+fn generate_historical_comparison(report_directory: &Path) -> Result<(), PlotGenerationError> {
+    let regimes = [
+        PrincipalRegime::HistoricalMatch,
+        PrincipalRegime::HistoricalExceeded,
+        PrincipalRegime::HistoricalUnder,
+        PrincipalRegime::HistoricalMissing,
+    ];
+    let mut rows = Vec::with_capacity(regimes.len());
+    for regime in regimes {
+        let result = run_principal_regime(regime)?;
+        let trace = result.metric_trace(result.metric_window_micros(), regime.budget_micros())?;
+        rows.push(HistoricalComparisonRow::from_experiment(
+            regime,
+            ExperimentReport {
+                metadata: result.report_metadata(),
+                trace: &trace,
+                controller: result.controller(),
+                stop: result.stop(),
+                images: &[],
+            },
+        ));
+    }
+    let directory = report_directory.join("historical-comparison");
+    fs::create_dir_all(&directory)?;
+    write_historical_comparison_pdf(&directory.join("report.pdf"), &rows)?;
+    Ok(())
 }
 
 fn generate_batch(report_directory: &Path) -> Result<(), PlotGenerationError> {
@@ -86,9 +119,14 @@ fn generate_batch(report_directory: &Path) -> Result<(), PlotGenerationError> {
     for budget_hours in [6_u64, 12, 24, 48] {
         batch_summaries.push(run_batch_slo(budget_hours * 60 * 60 * 1_000_000, 0.05)?);
     }
-    write_batch_slo_svg(&batch_directory.join("slo-sweep.svg"), &batch_summaries)?;
-    write_batch_actuation_svg(&batch_directory.join("actuation.svg"), &batch_summaries)?;
-    write_batch_report_pdf(&batch_directory.join("report.pdf"), &batch_summaries)?;
+    let sweep = write_batch_slo_svg(&batch_directory.join("slo-sweep.svg"), &batch_summaries)?;
+    let actuation =
+        write_batch_actuation_svg(&batch_directory.join("actuation.svg"), &batch_summaries)?;
+    write_batch_report_pdf(
+        &batch_directory.join("report.pdf"),
+        &batch_summaries,
+        &[actuation, sweep],
+    )?;
     Ok(())
 }
 
@@ -103,7 +141,7 @@ fn generate_regime(
     let closed_loop_validation =
         validate_principal_regime(regime, RegimeExperiment::ClosedLoop, &result);
     let trace = result.metric_trace(result.metric_window_micros(), regime.budget_micros())?;
-    write_experiment_figures(
+    let closed_loop_images = write_experiment_figures(
         &regime_directory.join("closed-loop"),
         regime,
         &result,
@@ -126,16 +164,11 @@ fn generate_regime(
             capacity_evidence_result.metric_window_micros(),
             regime.budget_micros(),
         )?;
-        write_experiment_figures(
-            &regime_directory.join("capacity-evidence"),
-            regime,
-            &capacity_evidence_result,
-            &capacity_evidence_trace,
-        )?;
         Some((
             capacity_evidence_result,
             capacity_evidence_trace,
             validation,
+            Vec::new(),
         ))
     } else {
         None
@@ -150,12 +183,14 @@ fn generate_regime(
                 trace: &trace,
                 controller: result.controller(),
                 stop: result.stop(),
+                images: &closed_loop_images,
             },
             capacity_evidence: capacity_evidence.as_ref().map(|evidence| ExperimentReport {
                 metadata: evidence.0.report_metadata(),
                 trace: &evidence.1,
                 controller: evidence.0.controller(),
                 stop: evidence.0.stop(),
+                images: &evidence.3,
             }),
         },
     )?;
@@ -171,9 +206,9 @@ fn write_experiment_figures(
     regime: PrincipalRegime,
     result: &prosody_scale_sim::PrincipalRun,
     trace: &prosody_scale_sim::MetricTrace,
-) -> Result<(), PlotGenerationError> {
+) -> Result<Vec<ImageManifestEntry>, PlotGenerationError> {
     fs::create_dir_all(directory)?;
-    write_regime_story_figures(
+    let mut images = write_regime_story_figures(
         &directory.join("story"),
         &RegimeStory {
             trace,
@@ -184,14 +219,16 @@ fn write_experiment_figures(
             allowed_miss_fraction: 0.01,
         },
     )?;
-    write_capacity_belief_svg(
-        &directory.join("capacity-belief.svg"),
-        &format!("{} capacity belief", regime.name()),
+    images.extend(write_model_belief_figures(
+        &directory.join("beliefs"),
         result.controller(),
-    )?;
-    write_model_belief_figures(&directory.join("beliefs"), result.controller())?;
-    write_model_belief_snapshot_figures(&directory.join("snapshots"), result.controller())?;
-    Ok(())
+    )?);
+    images.extend(write_model_belief_snapshot_figures(
+        &directory.join("snapshots"),
+        result.controller(),
+    )?);
+    images.sort_by_key(|image| image.section);
+    Ok(images)
 }
 
 fn clear_plot_files(directory: &PathBuf) -> Result<(), io::Error> {

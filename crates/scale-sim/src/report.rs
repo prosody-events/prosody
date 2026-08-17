@@ -11,8 +11,10 @@ use typst_pdf::PdfOptions;
 use crate::{
     BatchSloSummary, CapacityCalibration, CapacityEvidenceKind, CapacityEvidenceSample,
     CapacitySensitivity, CapacitySensitivityCalibration, CapacityWindowSample, ControllerTrace,
-    DemandCalibration, LeadTimeCalibration, MetricTrace, PartitionCalibration, PrincipalRegime,
-    RunStop, RunStopReason, predictive_coverage_levels,
+    DemandCalibration, DocumentManifest, ImageManifestEntry, LeadTimeCalibration, MetricTrace,
+    PanelContent, PartitionCalibration, PrincipalRegime, PriorArtifactKind, ReportCheckError,
+    ReportSection, RunStop, RunStopReason, check_document, check_images,
+    predictive_coverage_levels,
 };
 use prosody_scale_core::{PosteriorQuery, TransitionDirection};
 
@@ -109,11 +111,10 @@ const STORY_FIGURES: [FlowFigure; 19] = [
          the selected target, saturation cap, and actual replicas.",
     ),
     FlowFigure::new(
-        "Capacity posterior predictive check",
-        "18-capacity-predictive.svg",
-        "Accepted throughput should behave like a draw from the joint posterior predictive. Each \
-         interval uses the posterior from before its evidence. It reproduces the Poisson or \
-         conditional Binomial observation model that accepted the window.",
+        "Certified capacity event trace",
+        "18-capacity-trace.svg",
+        "The panel shows the W6 busy-slot path. Exposed states summarize E_n. The trace retains \
+         D_n and equal-clock transition groups for audit.",
     ),
     FlowFigure::new(
         "Capacity predictive coverage",
@@ -241,6 +242,88 @@ pub struct ExperimentReport<'a> {
     pub controller: &'a ControllerTrace,
     /// Exact duration and stop reason.
     pub stop: RunStop,
+    /// Images produced for this experiment.
+    pub images: &'a [ImageManifestEntry],
+}
+
+/// One owned row in the four-case historical comparison.
+#[derive(Clone, Copy)]
+pub struct HistoricalComparisonRow {
+    regime: PrincipalRegime,
+    final_no_knee_probability: f64,
+    maximum_target: u32,
+    peak_backlog: u64,
+    miss_fraction: f64,
+    final_cost: f64,
+}
+
+impl HistoricalComparisonRow {
+    /// Builds one aligned comparison row from a completed experiment.
+    #[must_use]
+    pub fn from_experiment(regime: PrincipalRegime, experiment: ExperimentReport<'_>) -> Self {
+        let summary = ReportSummary::from_trace(experiment.trace, experiment.controller);
+        let final_cost = experiment
+            .controller
+            .len()
+            .checked_sub(1)
+            .and_then(|index| experiment.controller.sample(index))
+            .map_or(0.0_f64, |sample| sample.selected_cost);
+        Self {
+            regime,
+            final_no_knee_probability: summary.final_no_knee_probability,
+            maximum_target: summary.maximum_target,
+            peak_backlog: summary.peak_backlog,
+            miss_fraction: summary.total_miss_fraction,
+            final_cost,
+        }
+    }
+}
+
+/// Writes the shared four-case historical comparison document.
+///
+/// # Errors
+///
+/// Returns an error when the four cases are incomplete or output fails.
+pub fn write_historical_comparison_pdf(
+    path: &Path,
+    rows: &[HistoricalComparisonRow],
+) -> Result<(), ReportError> {
+    const H4: [PrincipalRegime; 4] = [
+        PrincipalRegime::HistoricalMatch,
+        PrincipalRegime::HistoricalExceeded,
+        PrincipalRegime::HistoricalUnder,
+        PrincipalRegime::HistoricalMissing,
+    ];
+    if rows.len() != H4.len()
+        || H4
+            .iter()
+            .any(|regime| !rows.iter().any(|row| row.regime == *regime))
+    {
+        return Err(ReportError::HistoricalComparison);
+    }
+    let mut source = String::with_capacity(4_096);
+    source.push_str(
+        "#set document(title: \"Historical evidence comparison\")\n#set page(paper: \
+         \"us-letter\", margin: 0.65in)\n#set text(font: \"Charter\", size: 10pt)\n\n= Historical \
+         evidence comparison\n\nThe four cases use one table and one scale for each \
+         quantity.\n\n== Belief, decision, outcome, and cost\n\n#table(columns: 6, stroke: none, \
+         inset: 5pt, [*Case*], [*Belief*], [*Decision*], [*Outcome*], [*Miss fraction*], [*Cost*],",
+    );
+    for row in rows {
+        writeln!(
+            source,
+            "[{}], [{:.3} no-knee probability], [{} replicas], [{} backlog events], [{:.3}], \
+             [{:.1} event-delay-seconds],",
+            row.regime.name(),
+            row.final_no_knee_probability,
+            row.maximum_target,
+            row.peak_backlog,
+            row.miss_fraction,
+            row.final_cost,
+        )?;
+    }
+    source.push_str(")\n");
+    write_pdf(path, &source)
 }
 
 /// Writes one complete regime report as a PDF file.
@@ -253,15 +336,124 @@ pub fn write_regime_report_pdf(path: &Path, report: &RegimeReport<'_>) -> Result
         ReportSummary::from_trace(report.closed_loop.trace, report.closed_loop.controller);
     let mut source = String::with_capacity(8_192);
     write_header(&mut source, report)?;
-    write_summary(&mut source, report, summary)?;
-    write_strengths_and_limitations(&mut source, report, summary)?;
-    write_capacity_diagnostic(&mut source, report.closed_loop.controller)?;
-    write_experiment_figures(&mut source, "closed-loop", report.closed_loop.stop)?;
+    write_design(&mut source, report)?;
+    write_experiment_figures(&mut source, "closed-loop", report.closed_loop)?;
     if let Some(capacity_evidence) = report.capacity_evidence {
         write_capacity_evidence_summary(&mut source, capacity_evidence)?;
-        write_experiment_figures(&mut source, "capacity-evidence", capacity_evidence.stop)?;
+        write_direct_comparison(&mut source, report.closed_loop, capacity_evidence)?;
+    }
+    write_summary(&mut source, summary)?;
+    write_strengths_and_limitations(&mut source, report, summary)?;
+    write_capacity_diagnostic(&mut source, report.closed_loop.controller)?;
+    validate_document_source(&source)?;
+    check_images(report.closed_loop.images)?;
+    if let Some(capacity_evidence) = report.capacity_evidence
+        && !capacity_evidence.images.is_empty()
+    {
+        check_images(capacity_evidence.images)?;
     }
     write_pdf(path, &source)
+}
+
+fn validate_document_source(source: &str) -> Result<(), ReportCheckError> {
+    let section_markers = [
+        (ReportSection::Regime, " regime"),
+        (ReportSection::Evidence, "== Evidence"),
+        (ReportSection::Belief, "== Belief"),
+        (ReportSection::Decision, "== Decision"),
+        (ReportSection::Outcome, "== Outcome"),
+        (ReportSection::Cost, "== Cost"),
+    ];
+    let mut sections = section_markers
+        .into_iter()
+        .filter_map(|(section, marker)| source.find(marker).map(|position| (position, section)))
+        .collect::<Vec<_>>();
+    sections.sort_by_key(|(position, _)| *position);
+    let sections = sections
+        .into_iter()
+        .map(|(_, section)| section)
+        .collect::<Vec<_>>();
+    let unit_names = [
+        "events",
+        "replicas",
+        "probability",
+        "operations per second",
+        "seconds",
+        "event-delay-seconds",
+        "replica-seconds",
+    ];
+    let units = unit_names
+        .into_iter()
+        .filter(|unit| source.contains(unit))
+        .collect::<Vec<_>>();
+    let metadata_names = [
+        ("commit", "Commit:"),
+        ("model version", "Model version:"),
+        ("artifact identity", "Artifact identity:"),
+        ("seed", "Seed:"),
+        ("duration", "Duration:"),
+        ("generator version", "Generator version:"),
+    ];
+    let metadata = metadata_names
+        .into_iter()
+        .filter_map(|(name, marker)| source.contains(marker).then_some(name))
+        .collect::<Vec<_>>();
+    let artifact_names = ["capacity", "arrival", "reliability", "launch", "rebalance"];
+    let artifacts = artifact_names
+        .into_iter()
+        .filter(|artifact| source.contains(&format!("[{artifact}]")))
+        .collect::<Vec<_>>();
+    check_document(&DocumentManifest {
+        sections: &sections,
+        units: &units,
+        metadata: &metadata,
+        artifacts: &artifacts,
+    })
+}
+
+fn write_direct_comparison(
+    source: &mut String,
+    closed_loop: ExperimentReport<'_>,
+    capacity_evidence: ExperimentReport<'_>,
+) -> Result<(), fmt::Error> {
+    let closed = ReportSummary::from_trace(closed_loop.trace, closed_loop.controller);
+    let evidence = ReportSummary::from_trace(capacity_evidence.trace, capacity_evidence.controller);
+    writeln!(source, "\n#pagebreak()\n== Direct experiment comparison\n")?;
+    writeln!(
+        source,
+        "The columns use one order and one unit for each comparison."
+    )?;
+    writeln!(
+        source,
+        "\n#table(columns: 3, stroke: none, inset: 5pt, [*Spine*], [*Closed loop*], [*Capacity \
+         evidence*],"
+    )?;
+    writeln!(
+        source,
+        "[Evidence], [{} accepted windows], [{} accepted windows],",
+        closed.resource_windows, evidence.resource_windows
+    )?;
+    writeln!(
+        source,
+        "[Belief], [{:.1} final no-knee probability], [{:.1} final no-knee probability],",
+        closed.final_no_knee_probability, evidence.final_no_knee_probability
+    )?;
+    writeln!(
+        source,
+        "[Decision], [{} peak target replicas], [{} peak target replicas],",
+        closed.maximum_target, evidence.maximum_target
+    )?;
+    writeln!(
+        source,
+        "[Outcome], [{} peak backlog events], [{} peak backlog events],",
+        closed.peak_backlog, evidence.peak_backlog
+    )?;
+    writeln!(
+        source,
+        "[Cost], [{:.3} observed miss fraction], [{:.3} observed miss fraction],",
+        closed.total_miss_fraction, evidence.total_miss_fraction
+    )?;
+    writeln!(source, ")")
 }
 
 /// Writes the 50,000-job batch report as a PDF file.
@@ -272,6 +464,7 @@ pub fn write_regime_report_pdf(path: &Path, report: &RegimeReport<'_>) -> Result
 pub fn write_batch_report_pdf(
     path: &Path,
     summaries: &[BatchSloSummary],
+    images: &[ImageManifestEntry],
 ) -> Result<(), ReportError> {
     let mut source = String::with_capacity(4_096);
     source.push_str(
@@ -322,6 +515,7 @@ pub fn write_batch_report_pdf(
          ready time.",
         true,
     )?;
+    check_images(images)?;
     write_pdf(path, &source)
 }
 
@@ -1029,6 +1223,49 @@ fn write_header(source: &mut String, report: &RegimeReport<'_>) -> Result<(), fm
         source,
         "#text(fill: rgb(80, 80, 80))[A deterministic virtual-time case study]"
     )?;
+    let metadata = report.closed_loop.metadata;
+    writeln!(
+        source,
+        "\nCommit: `{}`. Model version: `{}`. Generator version: `{}`. Seed: {}. Duration: {}.",
+        metadata.commit,
+        metadata.model_version,
+        metadata.generator_version,
+        metadata.seed,
+        format_duration(metadata.duration_micros),
+    )?;
+    writeln!(
+        source,
+        "\nArtifact identity: source {}, version {}, stream {}.",
+        metadata.artifact_identity.source(),
+        metadata.artifact_identity.version(),
+        metadata.artifact_identity.random_stream(),
+    )?;
+    writeln!(source, "\n=== Model artifacts\n")?;
+    writeln!(
+        source,
+        "#table(columns: 5, stroke: none, inset: 4pt, [*Family*], [*Schema*], [*Source*], [*Lower \
+         tail*], [*Upper tail*],"
+    )?;
+    for artifact in report.closed_loop.controller.artifacts() {
+        let lower = artifact
+            .coverage()
+            .iter()
+            .map(|record| record.lower_tail_probability())
+            .fold(0.0_f64, f64::max);
+        let upper = artifact
+            .coverage()
+            .iter()
+            .map(|record| record.upper_tail_probability())
+            .fold(0.0_f64, f64::max);
+        writeln!(
+            source,
+            "[{}], [{}], [{}], [{lower:.2e}], [{upper:.2e}],",
+            artifact_name(artifact.kind()),
+            artifact.schema_version(),
+            artifact.identity().source(),
+        )?;
+    }
+    writeln!(source, ")")?;
     writeln!(source, "\n== Abstract\n")?;
     writeln!(source, "{}", situation(report.regime))?;
     writeln!(source, "\nThe experiment asks: {}", question(report.regime))?;
@@ -1040,23 +1277,17 @@ fn write_header(source: &mut String, report: &RegimeReport<'_>) -> Result<(), fm
     Ok(())
 }
 
-fn write_summary(
-    source: &mut String,
-    report: &RegimeReport<'_>,
-    summary: ReportSummary,
-) -> Result<(), fmt::Error> {
-    writeln!(source, "\n== Experimental design\n")?;
-    writeln!(
-        source,
-        "The simulator controls all time. The run lasted {} and stopped because {}.",
-        format_duration(report.closed_loop.stop.at_micros),
-        stop_reason(report.closed_loop.stop.reason)
-    )?;
-    writeln!(
-        source,
-        "\nThe latency objective was {:.1} seconds.",
-        crate::u64_to_f64(report.regime.budget_micros()) / 1_000_000.0_f64
-    )?;
+const fn artifact_name(kind: PriorArtifactKind) -> &'static str {
+    match kind {
+        PriorArtifactKind::Capacity => "capacity",
+        PriorArtifactKind::Arrival => "arrival",
+        PriorArtifactKind::Reliability => "reliability",
+        PriorArtifactKind::Launch => "launch",
+        PriorArtifactKind::Rebalance => "rebalance",
+    }
+}
+
+fn write_summary(source: &mut String, summary: ReportSummary) -> Result<(), fmt::Error> {
     writeln!(source, "\n== Observed response\n")?;
     writeln!(
         source,
@@ -1085,7 +1316,26 @@ fn write_summary(
         "\nThe model accepted {} passive resource windows.",
         summary.resource_windows
     )?;
-    writeln!(source, "\n== Outcome assessment\n")?;
+    writeln!(source, "\n== Run assessment\n")?;
+    write_outcome_assessment(source, summary)
+}
+
+fn write_design(source: &mut String, report: &RegimeReport<'_>) -> Result<(), fmt::Error> {
+    writeln!(source, "\n== Experimental design\n")?;
+    writeln!(
+        source,
+        "The simulator controls all time. The run lasted {} and stopped because {}.",
+        format_duration(report.closed_loop.stop.at_micros),
+        stop_reason(report.closed_loop.stop.reason)
+    )?;
+    writeln!(
+        source,
+        "\nThe latency objective was {:.1} seconds.",
+        crate::u64_to_f64(report.regime.budget_micros()) / 1_000_000.0_f64
+    )
+}
+
+fn write_outcome_assessment(source: &mut String, summary: ReportSummary) -> Result<(), fmt::Error> {
     if summary.final_backlog == 0 {
         writeln!(
             source,
@@ -1548,53 +1798,114 @@ fn posterior_quantiles(
 fn write_experiment_figures(
     source: &mut String,
     directory: &str,
-    stop: RunStop,
+    experiment: ExperimentReport<'_>,
 ) -> Result<(), fmt::Error> {
-    writeln!(
-        source,
-        "\n#pagebreak()\n== Evidence, decision, and outcome\n"
-    )?;
-    for figure in STORY_FIGURES {
-        write_flow_figure(source, directory, figure, stop)?;
+    writeln!(source, "\n#pagebreak()\n== Evidence\n")?;
+    for index in [0_usize, 6, 8, 9, 10, 11, 12, 13, 14, 17] {
+        write_manifest_figure(source, directory, STORY_FIGURES[index], experiment)?;
     }
-    writeln!(source, "\n#pagebreak()\n== Posterior factors\n")?;
+    writeln!(source, "\n#pagebreak()\n== Belief\n")?;
     writeln!(
         source,
         "Each heatmap column sums to one. Color shows relative probability mass within that \
          factor.\n"
     )?;
-    for factor in MODEL_FACTORS {
+    for (index, factor) in MODEL_FACTORS.into_iter().enumerate() {
         writeln!(
             source,
             "#block(breakable: false)[\n=== {}\n",
             factor.heading
         )?;
-        write_figure(
-            source,
-            &format!("{directory}/beliefs/{}.svg", factor.file),
-            factor.belief_caption,
-            stop,
-        )?;
-        write_figure(
-            source,
-            &format!("{directory}/snapshots/{}.svg", factor.file),
-            "The snapshots compare the prior, largest accepted update, and final posterior. Gray \
-             marks 10% and 90%. Orange marks 50%.",
-            stop,
-        )?;
+        let belief_file = format!("beliefs/{}.svg", factor.file);
+        if image_is_visible(experiment.images, &belief_file) {
+            write_figure(
+                source,
+                &format!("{directory}/{belief_file}"),
+                factor.belief_caption,
+                experiment.stop,
+            )?;
+        }
+        if factor_changed(experiment.controller, index)
+            && image_is_visible(experiment.images, &format!("snapshots/{}.svg", factor.file))
+        {
+            write_figure(
+                source,
+                &format!("{directory}/snapshots/{}.svg", factor.file),
+                "The snapshots compare the prior, largest accepted update, and final posterior. \
+                 Gray marks 10% and 90%. Orange marks 50%.",
+                experiment.stop,
+            )?;
+        }
         writeln!(source, "]\n")?;
     }
+    writeln!(source, "\n#pagebreak()\n== Decision\n")?;
+    for index in [15_usize, 16] {
+        write_manifest_figure(source, directory, STORY_FIGURES[index], experiment)?;
+    }
+    writeln!(source, "\n#pagebreak()\n== Outcome\n")?;
+    for index in [1_usize, 2, 3, 4, 5, 18] {
+        write_manifest_figure(source, directory, STORY_FIGURES[index], experiment)?;
+    }
+    writeln!(source, "\n#pagebreak()\n== Cost\n")?;
     writeln!(
         source,
-        "#block(breakable: false)[\n=== Capacity belief summary\n"
-    )?;
-    write_figure(
-        source,
-        &format!("{directory}/capacity-belief.svg"),
-        "This view compares the capacity prior, largest accepted update, and final posterior.",
-        stop,
-    )?;
-    writeln!(source, "]")
+        "Selected actions report late area, replica-seconds, and total expected cost."
+    )
+}
+
+fn write_manifest_figure(
+    source: &mut String,
+    directory: &str,
+    figure: FlowFigure,
+    experiment: ExperimentReport<'_>,
+) -> Result<(), fmt::Error> {
+    let file = format!("story/{}", figure.file);
+    if image_is_visible(experiment.images, &file) {
+        write_flow_figure(source, directory, figure, experiment.stop)?;
+    }
+    Ok(())
+}
+
+fn image_is_visible(images: &[ImageManifestEntry], file: &str) -> bool {
+    images
+        .iter()
+        .find(|image| image.file == file)
+        .is_some_and(|image| image.content == PanelContent::Visible)
+}
+
+fn factor_changed(controller: &ControllerTrace, index: usize) -> bool {
+    let query = match index {
+        0 => {
+            return controller
+                .arrival_posterior(controller.len().saturating_sub(1))
+                .is_some_and(|posterior| controller.arrival_prior() != posterior);
+        }
+        1 => PosteriorQuery::PartitionShare,
+        2 => PosteriorQuery::Capacity,
+        3 => PosteriorQuery::ServiceTime,
+        4 => PosteriorQuery::Collapse,
+        5 => PosteriorQuery::Knee,
+        6 => PosteriorQuery::NormalRetryProbability,
+        7 => PosteriorQuery::FailureRetryProbability,
+        8 => PosteriorQuery::LeadTime {
+            direction: TransitionDirection::Up,
+            replica_delta: 1,
+        },
+        9 => PosteriorQuery::LeadTime {
+            direction: TransitionDirection::Down,
+            replica_delta: 1,
+        },
+        10 => PosteriorQuery::RebalanceTime {
+            direction: TransitionDirection::Up,
+            replica_delta: 1,
+        },
+        _ => PosteriorQuery::RebalanceTime {
+            direction: TransitionDirection::Down,
+            replica_delta: 1,
+        },
+    };
+    controller.posterior_prior(query)
+        != controller.posterior(query, controller.len().saturating_sub(1))
 }
 
 fn write_flow_figure(
@@ -2065,6 +2376,12 @@ pub enum ReportError {
     /// File output failed.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// The report or image manifest violates the presentation contract.
+    #[error(transparent)]
+    Check(#[from] ReportCheckError),
+    /// The historical comparison omits one required case.
+    #[error("the historical comparison requires all four historical cases")]
+    HistoricalComparison,
     /// The output path has no parent directory.
     #[error("the report output path must have a parent directory")]
     MissingParent,
@@ -2078,3 +2395,7 @@ pub enum ReportError {
     #[error("Typst PDF export failed: {0}")]
     Pdf(String),
 }
+
+#[cfg(test)]
+#[path = "report_tests.rs"]
+mod tests;

@@ -7,28 +7,48 @@ use plotters::coord::Shift;
 use plotters::coord::types::{RangedCoordf64, RangedCoordusize};
 use plotters::prelude::*;
 
-use crate::{BatchSloSummary, PLOT_FONT_FAMILY, PlotError};
+use crate::visual::{AXIS_COLOR, TEXT_COLOR, label_margin, semantic_style};
+use crate::{
+    BatchSloSummary, ImageManifestEntry, PLOT_FONT_FAMILY, PanelContent, PlotError, ReportSection,
+    label_inside_image,
+};
 
 const WIDTH: u32 = 1_200;
 const PANEL_HEIGHT: u32 = 220;
 const TITLE_HEIGHT: u32 = 44;
-const BLUE: RGBColor = RGBColor(70, 110, 145);
-const BLACK: RGBColor = RGBColor(35, 35, 35);
-const RED: RGBColor = RGBColor(180, 45, 35);
+const BLUE: RGBColor = RGBColor(0, 114, 178);
+const BLACK: RGBColor = TEXT_COLOR;
+const RED: RGBColor = RGBColor(213, 94, 0);
 
 /// Writes the batch SLO sweep as a deterministic SVG plot.
 ///
 /// # Errors
 ///
 /// Returns an error when the sweep is empty or drawing fails.
-pub fn write_batch_slo_svg(path: &Path, summaries: &[BatchSloSummary]) -> Result<(), PlotError> {
+pub fn write_batch_slo_svg(
+    path: &Path,
+    summaries: &[BatchSloSummary],
+) -> Result<ImageManifestEntry, PlotError> {
     if summaries.is_empty() {
         return Err(PlotError::EmptyTrace);
     }
     let root = SVGBackend::new(path, (WIDTH, TITLE_HEIGHT + PANEL_HEIGHT * 4)).into_drawing_area();
     draw(&root, summaries).map_err(|error| drawing_error(&error))?;
     root.present().map_err(|error| drawing_error(&error))?;
-    Ok(())
+    Ok(ImageManifestEntry {
+        file: "slo-sweep.svg".to_owned(),
+        section: ReportSection::Cost,
+        content: PanelContent::Visible,
+        labels_inside_bounds: label_inside_image(
+            (WIDTH, TITLE_HEIGHT + PANEL_HEIGHT * 4),
+            (88, 28),
+            "50,000-job batch objective sweep",
+            22,
+        ),
+        color_key_present: false,
+        requires_color_key: false,
+        comparison_scale: None,
+    })
 }
 
 /// Writes desired and actual batch replica trajectories.
@@ -39,7 +59,7 @@ pub fn write_batch_slo_svg(path: &Path, summaries: &[BatchSloSummary]) -> Result
 pub fn write_batch_actuation_svg(
     path: &Path,
     summaries: &[BatchSloSummary],
-) -> Result<(), PlotError> {
+) -> Result<ImageManifestEntry, PlotError> {
     if summaries.is_empty() {
         return Err(PlotError::EmptyTrace);
     }
@@ -58,7 +78,20 @@ pub fn write_batch_actuation_svg(
         draw_actuation_panel(area, summary).map_err(|error| drawing_error(&error))?;
     }
     root.present().map_err(|error| drawing_error(&error))?;
-    Ok(())
+    Ok(ImageManifestEntry {
+        file: "actuation.svg".to_owned(),
+        section: ReportSection::Decision,
+        content: PanelContent::Visible,
+        labels_inside_bounds: label_inside_image(
+            (WIDTH, 360),
+            (88, 28),
+            "desired and actual replicas during pod readiness",
+            22,
+        ),
+        color_key_present: false,
+        requires_color_key: false,
+        comparison_scale: Some("batch-actuation-v1"),
+    })
 }
 
 fn draw_actuation_panel<Backend: DrawingBackend>(
@@ -78,7 +111,7 @@ fn draw_actuation_panel<Backend: DrawingBackend>(
             (PLOT_FONT_FAMILY, 15_i32).into_font(),
         )
         .x_label_area_size(34_u32)
-        .y_label_area_size(46_u32)
+        .y_label_area_size(label_margin(["replicas".len()].into_iter()))
         .build_cartesian_2d(0.0_f64..x_max, 0.0_f64..y_max)?;
     chart
         .configure_mesh()
@@ -87,7 +120,7 @@ fn draw_actuation_panel<Backend: DrawingBackend>(
         .y_labels(4)
         .x_desc("seconds after decision")
         .y_desc("replicas")
-        .axis_style(RGBColor(175, 175, 175))
+        .axis_style(AXIS_COLOR)
         .label_style(
             (PLOT_FONT_FAMILY, 10_i32)
                 .into_font()
@@ -116,7 +149,7 @@ fn draw_actuation_panel<Backend: DrawingBackend>(
     )))?;
     chart.draw_series(once(Text::new(
         format!("actual ready at {ready_seconds:.0} s"),
-        (ready_seconds, initial),
+        (ready_seconds.min(x_max * 0.55_f64), initial),
         (PLOT_FONT_FAMILY, 11_i32).into_font().color(&BLACK),
     )))?;
     Ok(())
@@ -198,7 +231,7 @@ fn draw_panel<Backend: DrawingBackend>(
         .margin_bottom(4_u32)
         .caption(title, (PLOT_FONT_FAMILY, 16_i32).into_font())
         .x_label_area_size(32_u32)
-        .y_label_area_size(70_u32)
+        .y_label_area_size(label_margin([unit.len()].into_iter()))
         .build_cartesian_2d(0_usize..x_end, 0.0_f64..maximum * 1.08_f64)?;
     chart
         .configure_mesh()
@@ -207,7 +240,7 @@ fn draw_panel<Backend: DrawingBackend>(
         .x_label_formatter(&no_axis_label)
         .x_desc("latency budget (hours)")
         .y_desc(unit)
-        .axis_style(RGBColor(175, 175, 175))
+        .axis_style(AXIS_COLOR)
         .label_style(
             (PLOT_FONT_FAMILY, 11_i32)
                 .into_font()
@@ -246,19 +279,22 @@ fn draw_line<Backend: DrawingBackend>(
     line: Line,
     label_offset: f64,
 ) -> Result<(), DrawingAreaErrorKind<Backend::ErrorType>> {
+    let semantic = semantic_style(line.0);
     chart.draw_series(LineSeries::new(
         summaries
             .iter()
             .enumerate()
             .map(|(index, summary)| (index * 2, line.1(summary))),
-        line.2.stroke_width(2),
+        semantic.color.stroke_width(2),
     ))?;
     let final_index = summaries.len() - 1;
     let final_value = line.1(&summaries[final_index]);
     chart.draw_series(once(Text::new(
         format!("{} {final_value:.3}", line.0),
         (summaries.len() * 2, final_value + label_offset),
-        (PLOT_FONT_FAMILY, 12_i32).into_font().color(&line.2),
+        (PLOT_FONT_FAMILY, 12_i32)
+            .into_font()
+            .color(&semantic.color),
     )))?;
     Ok(())
 }

@@ -9,23 +9,19 @@ use plotters::coord::Shift;
 use plotters::coord::types::{RangedCoordf64, RangedCoordu64};
 use plotters::prelude::*;
 
-use crate::posterior_plot::{PosteriorHeatmap, draw_posterior_heatmap};
+use crate::posterior_plot::{PosteriorHeatmap, draw_color_key, draw_posterior_heatmap};
+use crate::visual::{AxisScale, LinePattern, Quantity, label_margin, semantic_style, shape};
 use crate::{
-    ArrivalEvidenceSample, CapacityEvidenceSample, ControllerTrace, MetricTrace, PLOT_FONT_FAMILY,
-    PlotError, RunStop, SeriesCell, SeriesHistory,
+    ArrivalEvidenceSample, CapacityEvidenceSample, ControllerTrace, ImageManifestEntry,
+    MetricTrace, PLOT_FONT_FAMILY, PanelContent, PlotError, ReportSection, RunStop, SeriesCell,
+    SeriesHistory, label_inside_image,
 };
 
 const WIDTH: u32 = 1_240;
 const PANEL_HEIGHT: u32 = 340;
 const PANEL_COUNT: u32 = 19;
-const LABEL_SPAN_DIVISOR: u64 = 6;
+const LABEL_SPAN_DIVISOR: u64 = 3;
 const LABEL_GAP_FRACTION: f64 = 0.08_f64;
-const COLORS: [RGBColor; 4] = [
-    RGBColor(25, 25, 25),
-    RGBColor(55, 105, 145),
-    RGBColor(155, 65, 45),
-    RGBColor(105, 105, 105),
-];
 const STORY_FILES: [&str; PANEL_COUNT as usize] = [
     "01-demand.svg",
     "02-backlog.svg",
@@ -44,7 +40,7 @@ const STORY_FILES: [&str; PANEL_COUNT as usize] = [
     "15-reliability-evidence.svg",
     "16-decision-pass.svg",
     "17-decision-loss.svg",
-    "18-capacity-predictive.svg",
+    "18-capacity-trace.svg",
     "19-capacity-coverage.svg",
 ];
 
@@ -75,13 +71,28 @@ pub struct RegimeStory<'a> {
 pub fn write_regime_story_figures(
     directory: &Path,
     story: &RegimeStory<'_>,
-) -> Result<(), PlotError> {
+) -> Result<Vec<ImageManifestEntry>, PlotError> {
     let panels = story_panels(story)?;
     if panels.iter().all(|panel| panel.series.is_empty()) {
         return Err(PlotError::EmptyTrace);
     }
     fs::create_dir_all(directory)?;
-    for (file, panel) in STORY_FILES.iter().zip(&panels) {
+    let mut manifest = Vec::with_capacity(panels.len());
+    for (index, (file, panel)) in STORY_FILES.iter().zip(&panels).enumerate() {
+        let content = panel.content();
+        let entry = ImageManifestEntry {
+            file: format!("story/{file}"),
+            section: story_section(index),
+            content,
+            labels_inside_bounds: panel.labels_fit(),
+            color_key_present: panel.heatmap.is_some(),
+            requires_color_key: panel.heatmap.is_some(),
+            comparison_scale: None,
+        };
+        manifest.push(entry);
+        if content != PanelContent::Visible {
+            continue;
+        }
         let mut svg = String::new();
         {
             let root = SVGBackend::with_string(&mut svg, (WIDTH, PANEL_HEIGHT)).into_drawing_area();
@@ -94,13 +105,16 @@ pub fn write_regime_story_figures(
             svg.replace("<rect ", "<rect shape-rendering=\"crispEdges\" "),
         )?;
     }
-    Ok(())
+    Ok(manifest)
 }
 
 fn draw_panel<Backend: DrawingBackend>(
     area: &DrawingArea<Backend, Shift>,
     panel: &StoryPanel,
 ) -> Result<(), DrawingAreaErrorKind<Backend::ErrorType>> {
+    let key_width = if panel.heatmap.is_some() { 90 } else { 0 };
+    let (chart_area, key_area) =
+        area.split_horizontally(area.dim_in_pixel().0.saturating_sub(key_width));
     let final_micros = panel
         .horizon_micros
         .or_else(|| {
@@ -114,13 +128,15 @@ fn draw_panel<Backend: DrawingBackend>(
         .max(1);
     let label_span = final_micros.div_ceil(LABEL_SPAN_DIVISOR);
     let (minimum, maximum) = panel_bounds(panel);
-    let mut chart = ChartBuilder::on(area)
+    let mut chart = ChartBuilder::on(&chart_area)
         .margin_left(12_u32)
         .margin_right(16_u32)
         .margin_top(8_u32)
         .margin_bottom(4_u32)
         .x_label_area_size(48_u32)
-        .y_label_area_size(104_u32)
+        .y_label_area_size(label_margin(
+            panel.series.iter().map(|series| series.label.len()),
+        ))
         .build_cartesian_2d(0_u64..final_micros, minimum..maximum)?;
     chart
         .configure_mesh()
@@ -130,7 +146,7 @@ fn draw_panel<Backend: DrawingBackend>(
         .x_desc("virtual time")
         .y_desc(panel.unit)
         .x_label_formatter(&|micros| format_time(*micros))
-        .y_label_formatter(&|value| format!("{value:.3}"))
+        .y_label_formatter(&|value| panel.quantity().format(panel.axis.restore(*value)))
         .axis_style(RGBColor(180, 180, 180))
         .label_style(
             (PLOT_FONT_FAMILY, 20_i32)
@@ -140,10 +156,32 @@ fn draw_panel<Backend: DrawingBackend>(
         .draw()?;
     let label_positions = label_positions(panel, minimum, maximum);
     draw_heatmap_layer(&mut chart, panel, final_micros)?;
+    draw_series_layers(
+        &mut chart,
+        panel,
+        &label_positions,
+        final_micros,
+        label_span,
+    )?;
+    draw_annotations(&mut chart, panel, minimum, maximum)?;
+    if panel.heatmap.is_some() {
+        draw_color_key(&key_area)?;
+    }
+    Ok(())
+}
+
+fn draw_series_layers<Backend: DrawingBackend>(
+    chart: &mut ChartContext<'_, Backend, Cartesian2d<RangedCoordu64, RangedCoordf64>>,
+    panel: &StoryPanel,
+    label_positions: &[Option<f64>],
+    final_micros: u64,
+    label_span: u64,
+) -> Result<(), DrawingAreaErrorKind<Backend::ErrorType>> {
     for (index, series) in panel.series.iter().enumerate() {
+        let semantic = semantic_style(&series.label);
         let color = match series.style {
-            SeriesStyle::LightLine => RGBColor(225, 225, 225),
-            _ => COLORS[index % COLORS.len()],
+            SeriesStyle::LightLine => RGBColor(145, 145, 145),
+            _ => semantic.color,
         };
         let points = series
             .at_micros
@@ -153,10 +191,10 @@ fn draw_panel<Backend: DrawingBackend>(
             .filter(|(_, value)| value.is_finite());
         match series.style {
             SeriesStyle::Line => {
-                chart.draw_series(LineSeries::new(points, color.stroke_width(2)))?;
+                chart.draw_series(LineSeries::new(points, shape(semantic, 2)))?;
             }
             SeriesStyle::Step => {
-                chart.draw_series(LineSeries::new(step_points(series), color.stroke_width(2)))?;
+                chart.draw_series(LineSeries::new(step_points(series), shape(semantic, 2)))?;
             }
             SeriesStyle::LightLine => {
                 chart.draw_series(LineSeries::new(points, color.stroke_width(1)))?;
@@ -164,24 +202,29 @@ fn draw_panel<Backend: DrawingBackend>(
             SeriesStyle::Points => {
                 chart.draw_series(points.map(|point| Circle::new(point, 4_i32, color.filled())))?;
             }
-            SeriesStyle::Intervals => {
-                chart.draw_series(
-                    series
-                        .at_micros
-                        .chunks_exact(2)
-                        .zip(series.values.chunks_exact(2))
-                        .map(|(at, values)| {
-                            PathElement::new(
-                                vec![(at[0], values[0]), (at[1], values[1])],
-                                color.stroke_width(2),
-                            )
-                        }),
-                )?;
-            }
+        }
+        if matches!(semantic.pattern, LinePattern::Dashed | LinePattern::Dotted)
+            && matches!(series.style, SeriesStyle::Line | SeriesStyle::Step)
+        {
+            let spacing = if semantic.pattern == LinePattern::Dashed {
+                3
+            } else {
+                2
+            };
+            chart.draw_series(
+                series
+                    .at_micros
+                    .iter()
+                    .copied()
+                    .zip(series.values.iter().copied())
+                    .enumerate()
+                    .filter(|(point, (_, value))| point % spacing == 0 && value.is_finite())
+                    .map(|(_, point)| Circle::new(point, 3_i32, color.filled())),
+            )?;
         }
         if let Some(label_y) = label_positions[index] {
             draw_label(
-                &mut chart,
+                chart,
                 series,
                 color,
                 final_micros.saturating_sub(label_span),
@@ -189,7 +232,6 @@ fn draw_panel<Backend: DrawingBackend>(
             )?;
         }
     }
-    draw_annotations(&mut chart, panel, minimum, maximum)?;
     Ok(())
 }
 
@@ -264,8 +306,8 @@ fn meaningful_index(values: &[f64]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-fn panel_value_label(_: &StorySeries, value: f64) -> String {
-    format!("{value:.3}")
+fn panel_value_label(series: &StorySeries, value: f64) -> String {
+    series.quantity.format(series.axis.restore(value))
 }
 
 fn label_positions(panel: &StoryPanel, minimum: f64, maximum: f64) -> Vec<Option<f64>> {
@@ -327,11 +369,19 @@ fn story_panels(story: &RegimeStory<'_>) -> Result<[StoryPanel; PANEL_COUNT as u
         reliability_evidence_panel(trace),
         decision_deadline_satisfaction_panel(trace, story.controller),
         decision_loss_panel(trace, story.controller),
-        capacity_predictive_panel(story.controller),
+        capacity_trace_panel(story.controller),
         capacity_predictive_coverage_panel(story.controller),
     ];
     for panel in &mut panels {
-        panel.horizon_micros = Some(story.stop.at_micros);
+        panel.apply_axis();
+        if panel.horizon_micros.is_none() {
+            panel.horizon_micros = panel
+                .series
+                .iter()
+                .filter_map(StorySeries::relevant_end_micros)
+                .max()
+                .or(Some(story.stop.at_micros));
+        }
     }
     Ok(panels)
 }
@@ -681,35 +731,55 @@ fn decision_loss_heatmap(controller: &ControllerTrace) -> PosteriorHeatmap {
     }
 }
 
-fn capacity_predictive_panel(controller: &ControllerTrace) -> StoryPanel {
+fn capacity_trace_panel(controller: &ControllerTrace) -> StoryPanel {
     let mut at_micros = Vec::with_capacity(controller.len());
-    let mut observed = Vec::with_capacity(controller.len());
-    let mut median = Vec::with_capacity(controller.len());
-    let mut interval_at_micros = Vec::with_capacity(controller.len().saturating_mul(2));
-    let mut interval_values = Vec::with_capacity(controller.len().saturating_mul(2));
+    let mut initial = Vec::with_capacity(controller.len());
+    let mut final_state = Vec::with_capacity(controller.len());
+    let mut exposed_states = Vec::with_capacity(controller.len());
+    let mut completion_states = Vec::with_capacity(controller.len());
+    let mut transition_groups = Vec::with_capacity(controller.len());
     for index in 0..controller.len() {
         let Some(sample) = controller.sample(index) else {
             continue;
         };
-        let observed_value = match sample.capacity_evidence {
-            CapacityEvidenceSample::None => continue,
-            CapacityEvidenceSample::Window(window) => window.throughput_per_second(),
+        let Some(trace) = controller.capacity_trace(index) else {
+            continue;
         };
         at_micros.push(sample.at_micros);
-        observed.push(observed_value);
-        median.push(sample.capacity_predictive_median_per_second);
-        interval_at_micros.extend([sample.at_micros, sample.at_micros]);
-        interval_values.extend([
-            sample.capacity_predictive_low_per_second,
-            sample.capacity_predictive_high_per_second,
-        ]);
+        initial.push(f64::from(trace.initial_busy_slots));
+        final_state.push(f64::from(trace.final_busy_slots));
+        let count = trace
+            .state_exposure_seconds
+            .iter()
+            .filter(|exposure| **exposure > 0.0_f64)
+            .count();
+        exposed_states.push(usize_f64(count));
+        let count = trace
+            .state_completion_counts
+            .iter()
+            .filter(|completions| **completions > 0)
+            .count();
+        completion_states.push(usize_f64(count));
+        transition_groups.push(usize_f64(trace.transition_groups.len()));
     }
     StoryPanel::new(
-        "operations per second",
+        "busy-slot states",
         vec![
-            StorySeries::new("observed accepted window", at_micros.clone(), observed).points(),
-            StorySeries::new("prequential median", at_micros, median).points(),
-            StorySeries::new("prequential 10–90%", interval_at_micros, interval_values).intervals(),
+            StorySeries::new("initial busy slots", at_micros.clone(), initial).points(),
+            StorySeries::new("final busy slots", at_micros.clone(), final_state).points(),
+            StorySeries::new(
+                "states with exposure E_n",
+                at_micros.clone(),
+                exposed_states,
+            )
+            .points(),
+            StorySeries::new(
+                "states with completions D_n",
+                at_micros.clone(),
+                completion_states,
+            )
+            .points(),
+            StorySeries::new("equal-clock trace groups", at_micros, transition_groups).points(),
         ],
     )
 }
@@ -933,11 +1003,16 @@ struct StoryPanel {
     annotations: Vec<StoryAnnotation>,
     heatmap: Option<PosteriorHeatmap>,
     vertical_bounds: Option<(f64, f64)>,
+    axis: AxisScale,
 }
 
 impl StoryPanel {
     fn new(unit: &'static str, series: Vec<StorySeries>) -> Self {
-        let series = deduplicate_series(series);
+        let mut series = deduplicate_series(series);
+        let quantity = quantity_for_unit(unit);
+        for item in &mut series {
+            item.quantity = quantity;
+        }
         Self {
             unit,
             series,
@@ -945,7 +1020,87 @@ impl StoryPanel {
             annotations: Vec::new(),
             heatmap: None,
             vertical_bounds: None,
+            axis: AxisScale::Linear,
         }
+    }
+
+    fn quantity(&self) -> Quantity {
+        quantity_for_unit(self.unit)
+    }
+
+    fn apply_axis(&mut self) {
+        if !matches!(self.quantity(), Quantity::Rate | Quantity::Cost) {
+            return;
+        }
+        let range = self
+            .series
+            .iter()
+            .flat_map(|series| series.values.iter().copied())
+            .chain(
+                self.heatmap
+                    .iter()
+                    .flat_map(|heatmap| heatmap.values.iter().copied()),
+            )
+            .filter(|value| value.is_finite() && *value > 0.0_f64)
+            .fold(None, |range, value| {
+                Some(
+                    range.map_or((value, value), |(minimum, maximum): (f64, f64)| {
+                        (minimum.min(value), maximum.max(value))
+                    }),
+                )
+            });
+        let Some((minimum, maximum)) = range else {
+            return;
+        };
+        self.axis = AxisScale::for_range(minimum, maximum);
+        if self.axis == AxisScale::Linear {
+            return;
+        }
+        for value in self.series.iter_mut().flat_map(|series| {
+            series.axis = self.axis;
+            series.values.iter_mut()
+        }) {
+            *value = if *value > 0.0_f64 {
+                self.axis.project(*value)
+            } else {
+                f64::NAN
+            };
+        }
+        if let Some(heatmap) = &mut self.heatmap {
+            for value in &mut heatmap.values {
+                *value = self.axis.project(*value);
+            }
+        }
+    }
+
+    fn content(&self) -> PanelContent {
+        let mut finite = self
+            .series
+            .iter()
+            .flat_map(|series| series.values.iter())
+            .filter(|value| value.is_finite());
+        let Some(first) = finite.next().copied() else {
+            return PanelContent::Empty;
+        };
+        if finite.all(|value| value.to_bits() == first.to_bits()) && self.heatmap.is_none() {
+            PanelContent::Unchanged
+        } else {
+            PanelContent::Visible
+        }
+    }
+
+    fn labels_fit(&self) -> bool {
+        let longest = self
+            .series
+            .iter()
+            .map(|series| series.label.as_str())
+            .max_by_key(|label| label.len())
+            .map_or("", |label| label);
+        let x = WIDTH.saturating_mul(2).saturating_div(3);
+        let Ok(x) = i32::try_from(x) else {
+            return false;
+        };
+        label_inside_image((WIDTH, PANEL_HEIGHT), (x, 8_i32), longest, 19)
     }
 
     fn with_horizon(mut self, horizon_micros: u64) -> Self {
@@ -968,6 +1123,39 @@ impl StoryPanel {
     }
 }
 
+fn story_section(index: usize) -> ReportSection {
+    match index {
+        0 | 6 | 8..=14 | 17 => ReportSection::Evidence,
+        7 => ReportSection::Belief,
+        15 | 16 => ReportSection::Decision,
+        1..=5 | 18 => ReportSection::Outcome,
+        _ => ReportSection::Cost,
+    }
+}
+
+fn usize_f64(value: usize) -> f64 {
+    let Ok(value) = u32::try_from(value) else {
+        return f64::from(u32::MAX);
+    };
+    f64::from(value)
+}
+
+fn quantity_for_unit(unit: &str) -> Quantity {
+    if unit.contains("replica") {
+        Quantity::Replicas
+    } else if unit.contains("probability") || unit.contains("fraction") {
+        Quantity::Probability
+    } else if unit.contains("second") && !unit.contains("per second") {
+        Quantity::Seconds
+    } else if unit.contains("per second") {
+        Quantity::Rate
+    } else if unit.contains("cost") {
+        Quantity::Cost
+    } else {
+        Quantity::Count
+    }
+}
+
 struct StoryAnnotation {
     at_micros: u64,
     label: String,
@@ -979,6 +1167,8 @@ struct StorySeries {
     values: Vec<f64>,
     horizon: Horizon,
     style: SeriesStyle,
+    quantity: Quantity,
+    axis: AxisScale,
 }
 
 impl StorySeries {
@@ -989,6 +1179,8 @@ impl StorySeries {
             values,
             horizon: Horizon::State,
             style: SeriesStyle::Line,
+            quantity: Quantity::Count,
+            axis: AxisScale::Linear,
         }
     }
 
@@ -999,6 +1191,8 @@ impl StorySeries {
             values,
             horizon: Horizon::Reference,
             style: SeriesStyle::Line,
+            quantity: Quantity::Count,
+            axis: AxisScale::Linear,
         }
     }
 
@@ -1019,11 +1213,6 @@ impl StorySeries {
 
     fn light(mut self) -> Self {
         self.style = SeriesStyle::LightLine;
-        self
-    }
-
-    fn intervals(mut self) -> Self {
-        self.style = SeriesStyle::Intervals;
         self
     }
 
@@ -1050,7 +1239,6 @@ enum SeriesStyle {
     Step,
     LightLine,
     Points,
-    Intervals,
 }
 
 fn step_points(series: &StorySeries) -> Vec<(u64, f64)> {

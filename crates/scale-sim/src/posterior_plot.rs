@@ -7,9 +7,14 @@ use std::path::Path;
 use plotters::coord::Shift;
 use plotters::coord::types::{RangedCoordf64, RangedCoordu64};
 use plotters::prelude::*;
+use prosody_scale_core::PriorCoverageRecord;
 use prosody_scale_core::{PosteriorQuery, TransitionDirection};
 
-use crate::{ControllerTrace, PLOT_FONT_FAMILY, PlotError};
+use crate::visual::AxisScale;
+use crate::{
+    ControllerTrace, ImageManifestEntry, PLOT_FONT_FAMILY, PanelContent, PlotError,
+    PriorArtifactKind, ReportSection, label_inside_image,
+};
 
 const WIDTH: u32 = 1_440;
 const HEATMAP_HEIGHT: u32 = 440;
@@ -27,6 +32,8 @@ struct PosteriorPanel {
     heatmap: PosteriorHeatmap,
     prior: Vec<f64>,
     y_label: fn(f64) -> String,
+    axis: AxisScale,
+    tail_label: Option<String>,
 }
 
 struct SnapshotSelection<'a> {
@@ -43,13 +50,31 @@ struct SnapshotSelection<'a> {
 pub fn write_model_belief_figures(
     directory: &Path,
     controller: &ControllerTrace,
-) -> Result<(), PlotError> {
+) -> Result<Vec<ImageManifestEntry>, PlotError> {
     if controller.is_empty() {
         return Err(PlotError::EmptyTrace);
     }
     let panels = model_panels(controller);
     fs::create_dir_all(directory)?;
+    let mut manifest = Vec::with_capacity(panels.len());
     for panel in &panels {
+        let content = if panel_unchanged(panel) {
+            PanelContent::Unchanged
+        } else {
+            panel_content(&panel.heatmap.probabilities)
+        };
+        manifest.push(ImageManifestEntry {
+            file: format!("beliefs/{}.svg", panel.file),
+            section: ReportSection::Belief,
+            content,
+            labels_inside_bounds: heatmap_labels_fit(panel),
+            color_key_present: content == PanelContent::Visible,
+            requires_color_key: true,
+            comparison_scale: None,
+        });
+        if content != PanelContent::Visible {
+            continue;
+        }
         let mut svg = String::new();
         {
             let root =
@@ -63,7 +88,7 @@ pub fn write_model_belief_figures(
             svg.replace("<rect ", "<rect shape-rendering=\"crispEdges\" "),
         )?;
     }
-    Ok(())
+    Ok(manifest)
 }
 
 /// Writes prior, important-update, and final distributions for each factor.
@@ -74,13 +99,31 @@ pub fn write_model_belief_figures(
 pub fn write_model_belief_snapshot_figures(
     directory: &Path,
     controller: &ControllerTrace,
-) -> Result<(), PlotError> {
+) -> Result<Vec<ImageManifestEntry>, PlotError> {
     if controller.is_empty() {
         return Err(PlotError::EmptyTrace);
     }
     let panels = model_panels(controller);
     fs::create_dir_all(directory)?;
+    let mut manifest = Vec::with_capacity(panels.len());
     for panel in &panels {
+        let content = if panel_unchanged(panel) {
+            PanelContent::Unchanged
+        } else {
+            panel_content(&panel.heatmap.probabilities)
+        };
+        manifest.push(ImageManifestEntry {
+            file: format!("snapshots/{}.svg", panel.file),
+            section: ReportSection::Belief,
+            content,
+            labels_inside_bounds: snapshot_labels_fit(panel),
+            color_key_present: false,
+            requires_color_key: false,
+            comparison_scale: None,
+        });
+        if content != PanelContent::Visible {
+            continue;
+        }
         let mut svg = String::new();
         {
             let root =
@@ -91,7 +134,7 @@ pub fn write_model_belief_snapshot_figures(
         };
         fs::write(directory.join(format!("{}.svg", panel.file)), svg)?;
     }
-    Ok(())
+    Ok(manifest)
 }
 
 pub(crate) fn draw_posterior_heatmap<Backend: DrawingBackend>(
@@ -110,7 +153,8 @@ pub(crate) fn draw_posterior_heatmap<Backend: DrawingBackend>(
     let color_maximum = heatmap
         .probabilities
         .iter()
-        .copied()
+        .enumerate()
+        .map(|(index, probability)| probability / cell_width(&heatmap.values, index % width))
         .fold(0.0_f64, f64::max)
         .max(f64::MIN_POSITIVE);
     for time_index in 0..heatmap.at_micros.len() {
@@ -150,7 +194,10 @@ pub(crate) fn draw_posterior_heatmap<Backend: DrawingBackend>(
             ) + vertical_overlap;
             chart.draw_series(iter::once(Rectangle::new(
                 [(x_start, lower), (x_end, upper)],
-                posterior_color(probability / color_maximum).filled(),
+                posterior_color(
+                    probability / cell_width(&heatmap.values, value_index) / color_maximum,
+                )
+                .filled(),
             )))?;
         }
     }
@@ -213,7 +260,7 @@ fn draw_snapshot<Backend: DrawingBackend>(
         .y_labels(3)
         .x_desc(panel.unit)
         .y_desc("mass")
-        .x_label_formatter(&|value| (panel.y_label)(*value))
+        .x_label_formatter(&|value| panel.format_value(*value))
         .axis_style(RGBColor(180, 180, 180))
         .label_style(
             (PLOT_FONT_FAMILY, 18_i32)
@@ -253,9 +300,10 @@ fn draw_panel<Backend: DrawingBackend>(
     area: &DrawingArea<Backend, Shift>,
     panel: &PosteriorPanel,
 ) -> Result<(), DrawingAreaErrorKind<Backend::ErrorType>> {
+    let (chart_area, key_area) = area.split_horizontally(area.dim_in_pixel().0.saturating_sub(90));
     let final_micros = panel.heatmap.at_micros.last().copied().unwrap_or(1).max(1);
     let (minimum, maximum) = value_bounds(&panel.heatmap.values);
-    let mut chart = ChartBuilder::on(area)
+    let mut chart = ChartBuilder::on(&chart_area)
         .margin_left(8_u32)
         .margin_right(12_u32)
         .margin_top(8_u32)
@@ -271,7 +319,7 @@ fn draw_panel<Backend: DrawingBackend>(
         .x_desc("virtual time")
         .y_desc(panel.unit)
         .x_label_formatter(&|micros| format_time(*micros))
-        .y_label_formatter(&|value| (panel.y_label)(*value))
+        .y_label_formatter(&|value| panel.format_value(*value))
         .axis_style(RGBColor(180, 180, 180))
         .label_style(
             (PLOT_FONT_FAMILY, 20_i32)
@@ -279,7 +327,59 @@ fn draw_panel<Backend: DrawingBackend>(
                 .color(&RGBColor(65, 65, 65)),
         )
         .draw()?;
-    draw_posterior_heatmap(&mut chart, &panel.heatmap, final_micros)
+    draw_posterior_heatmap(&mut chart, &panel.heatmap, final_micros)?;
+    if let Some(label) = &panel.tail_label {
+        chart.draw_series(iter::once(Text::new(
+            label.clone(),
+            (0_u64, maximum),
+            (PLOT_FONT_FAMILY, 15_i32).into_font(),
+        )))?;
+    }
+    draw_color_key(&key_area)
+}
+
+pub(crate) fn draw_color_key<Backend: DrawingBackend>(
+    area: &DrawingArea<Backend, Shift>,
+) -> Result<(), DrawingAreaErrorKind<Backend::ErrorType>> {
+    let (_, height) = area.dim_in_pixel();
+    let height = height.clamp(1_u32, u32::MAX >> 1_u32);
+    let height = i32::try_from(height).map_or(i32::MAX, |value| value);
+    for y in 0_i32..height {
+        let density = 1.0_f64 - f64::from(y) / f64::from(height);
+        area.draw(&Rectangle::new(
+            [(18_i32, y), (42_i32, y.saturating_add(1))],
+            posterior_color(density).filled(),
+        ))?;
+    }
+    area.draw(&Text::new(
+        "density",
+        (8_i32, 18_i32),
+        (PLOT_FONT_FAMILY, 15_i32).into_font(),
+    ))?;
+    area.draw(&Text::new(
+        "1.0",
+        (48_i32, 34_i32),
+        (PLOT_FONT_FAMILY, 13_i32).into_font(),
+    ))?;
+    area.draw(&Text::new(
+        "0.0",
+        (48_i32, height.saturating_sub(8)),
+        (PLOT_FONT_FAMILY, 13_i32).into_font(),
+    ))
+}
+
+fn cell_width(values: &[f64], index: usize) -> f64 {
+    let Some(&value) = values.get(index) else {
+        return 1.0_f64;
+    };
+    let lower = index
+        .checked_sub(1)
+        .and_then(|prior| values.get(prior))
+        .map_or(value, |prior| prior.midpoint(value));
+    let upper = values
+        .get(index.saturating_add(1))
+        .map_or(value, |next| value.midpoint(*next));
+    (upper - lower).abs().max(f64::MIN_POSITIVE)
 }
 
 fn model_panels(controller: &ControllerTrace) -> Vec<PosteriorPanel> {
@@ -343,19 +443,126 @@ fn model_panels(controller: &ControllerTrace) -> Vec<PosteriorPanel> {
         heatmap: arrival_heatmap(controller),
         prior: arrival_prior_mass(controller),
         y_label: format_log_rate,
+        axis: AxisScale::Linear,
+        tail_label: tail_label(controller, PriorArtifactKind::Arrival),
     });
     for (file, unit, query) in queries {
+        let mut heatmap = discrete_heatmap(controller, query);
+        let axis = axis_for_values(&heatmap.values);
+        if axis == AxisScale::Logarithmic {
+            for value in &mut heatmap.values {
+                *value = axis.project(*value);
+            }
+        }
         panels.push(PosteriorPanel {
             file,
             unit,
-            heatmap: discrete_heatmap(controller, query),
+            heatmap,
             prior: controller
                 .posterior_prior(query)
                 .map_or_else(Vec::new, <[f64]>::to_vec),
             y_label: format_value,
+            axis,
+            tail_label: tail_label(controller, artifact_kind(query)),
         });
     }
     panels
+}
+
+impl PosteriorPanel {
+    fn format_value(&self, value: f64) -> String {
+        let value = match self.axis {
+            AxisScale::Linear => value,
+            AxisScale::Logarithmic => 10.0_f64.powf(value),
+        };
+        (self.y_label)(value)
+    }
+}
+
+fn axis_for_values(values: &[f64]) -> AxisScale {
+    values
+        .first()
+        .copied()
+        .zip(values.last().copied())
+        .map_or(AxisScale::Linear, |(minimum, maximum)| {
+            AxisScale::for_range(minimum, maximum)
+        })
+}
+
+const fn artifact_kind(query: PosteriorQuery) -> PriorArtifactKind {
+    match query {
+        PosteriorQuery::Capacity
+        | PosteriorQuery::Collapse
+        | PosteriorQuery::Knee
+        | PosteriorQuery::SaturationState
+        | PosteriorQuery::CapacityContaminationProbability => PriorArtifactKind::Capacity,
+        PosteriorQuery::PartitionShare | PosteriorQuery::ServiceTime => PriorArtifactKind::Arrival,
+        PosteriorQuery::NormalRetryProbability | PosteriorQuery::FailureRetryProbability => {
+            PriorArtifactKind::Reliability
+        }
+        PosteriorQuery::LeadTime { .. } => PriorArtifactKind::Launch,
+        PosteriorQuery::RebalanceTime { .. } => PriorArtifactKind::Rebalance,
+    }
+}
+
+fn tail_label(controller: &ControllerTrace, kind: PriorArtifactKind) -> Option<String> {
+    let artifact = controller.artifact(kind)?;
+    format_tail_label(artifact.coverage())
+}
+
+fn format_tail_label(coverage: &[PriorCoverageRecord]) -> Option<String> {
+    if coverage.is_empty() {
+        return None;
+    }
+    let lower = coverage
+        .iter()
+        .map(|record| record.lower_tail_probability())
+        .fold(0.0_f64, f64::max);
+    let upper = coverage
+        .iter()
+        .map(|record| record.upper_tail_probability())
+        .fold(0.0_f64, f64::max);
+    Some(format!("lower tail {lower:.2e} · upper tail {upper:.2e}"))
+}
+
+fn panel_content(values: &[f64]) -> PanelContent {
+    if values.iter().any(|value| value.is_finite()) {
+        PanelContent::Visible
+    } else {
+        PanelContent::Empty
+    }
+}
+
+fn panel_unchanged(panel: &PosteriorPanel) -> bool {
+    let width = panel.heatmap.values.len();
+    width > 0
+        && panel
+            .heatmap
+            .probabilities
+            .chunks_exact(width)
+            .all(|posterior| panel.prior == posterior)
+}
+
+fn heatmap_labels_fit(panel: &PosteriorPanel) -> bool {
+    let Ok(x) = i32::try_from(WIDTH.saturating_sub(82)) else {
+        return false;
+    };
+    panel.tail_label.as_ref().is_none_or(|label| {
+        label_inside_image((WIDTH, HEATMAP_HEIGHT), (110_i32, 24_i32), label, 15)
+    }) && label_inside_image((WIDTH, HEATMAP_HEIGHT), (x, 8_i32), "density", 15)
+}
+
+fn snapshot_labels_fit(panel: &PosteriorPanel) -> bool {
+    let selection = select_snapshots(panel);
+    let width = WIDTH / 3;
+    [
+        "prior",
+        selection.important_title.as_str(),
+        "final posterior",
+    ]
+    .into_iter()
+    .all(|title| label_inside_image((width, SNAPSHOT_HEIGHT), (12_i32, 8_i32), title, 21))
+        && label_inside_image((width, SNAPSHOT_HEIGHT), (12_i32, 440_i32), panel.unit, 18)
 }
 
 fn discrete_heatmap(controller: &ControllerTrace, query: PosteriorQuery) -> PosteriorHeatmap {

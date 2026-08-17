@@ -1,6 +1,10 @@
 use std::cmp::Ordering;
 
-use super::{PosteriorHeatmap, PosteriorPanel, format_value, quantiles, select_snapshots};
+use super::{
+    PosteriorHeatmap, PosteriorPanel, format_tail_label, format_value, quantiles, select_snapshots,
+};
+use crate::visual::AxisScale;
+use prosody_scale_core::PriorCoverageRecord;
 
 #[test]
 fn snapshot_selects_largest_posterior_change() {
@@ -17,6 +21,8 @@ fn snapshot_selects_largest_posterior_change() {
         },
         prior: vec![0.34_f64, 0.33_f64, 0.33_f64],
         y_label: format_value,
+        axis: AxisScale::Linear,
+        tail_label: None,
     };
 
     let selected = select_snapshots(&panel);
@@ -38,4 +44,15 @@ fn quantiles_use_exact_discrete_mass() {
     let actual = quantiles(&values, &mass);
     let expected = [2.0_f64, 4.0_f64, 4.0_f64];
     assert_eq!(actual.partial_cmp(&expected), Some(Ordering::Equal));
+}
+
+#[test]
+fn tail_label_names_both_endpoint_masses() {
+    let coverage = [PriorCoverageRecord::new(
+        1.0_f64, 10.0_f64, 0.002_f64, 0.003_f64, 0.0_f64,
+    )];
+    assert_eq!(
+        format_tail_label(&coverage).as_deref(),
+        Some("lower tail 2.00e-3 · upper tail 3.00e-3")
+    );
 }
