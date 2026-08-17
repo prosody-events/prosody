@@ -22,6 +22,7 @@
 //! permanently rejected stage still commits and still fires this hook, so the
 //! answer carries the handler's own result. It never reports the durability of
 //! the writes behind it.
+use super::handler::{HandlerMethod, OnExcise, OnMessage};
 use super::{FallibleHandler, Settlement, SettlementHandler};
 use crate::codec::Codec;
 use crate::consumer::DemandType;
@@ -56,21 +57,16 @@ pub(crate) struct Responder<C: Codec, R: ResponseRoute> {
 
 /// The metadata needed to deliver one requested handler result.
 ///
-/// Both are read from the message rather than from the invocation that answers
-/// it. A deferred reload answers the request its own record names, in that
-/// record's trace, whatever span the settle boundary later runs under — and by
-/// default a timer dispatch starts a trace of its own, so an ambient context
-/// would answer outside the requester's trace.
+/// The message supplies the request and trace. A deferred reload therefore
+/// answers the request in its record's trace. A [`Context`] preserves this
+/// trace until the final apply hook.
 ///
-/// A [`Context`] preserves the request trace across the final apply hook.
+/// The capture happens while the message's processing state is live, so
+/// `message.span()` is never `Span::none()` and the response leg can never
+/// open as a root of its own trace.
 ///
-/// The capture happens while the message's processing state is still live, so
-/// `message.span()` is never `Span::none()` and the response leg can never open
-/// as a root of a trace of its own.
-///
-/// One exists per requested in-flight event. Both exits are here:
-/// [`after_commit`](FallibleHandler::after_commit) moves it into the responder,
-/// and [`after_abort`](FallibleHandler::after_abort) drops it.
+/// [`after_commit`](FallibleHandler::after_commit) moves the metadata into the
+/// responder. [`after_abort`](FallibleHandler::after_abort) drops it.
 #[derive(Debug)]
 struct ResultDelivery {
     request: ResultRequest,
@@ -126,6 +122,30 @@ impl<H, C: Codec, R: ResponseRoute> RespondHandler<H, C, R> {
     pub(crate) fn new(handler: H, responder: Arc<Responder<C, R>>) -> Self {
         Self { handler, responder }
     }
+
+    async fn handle<M, C2>(
+        &self,
+        context: C2,
+        message: ConsumerMessage<M::MessagePayload>,
+        demand_type: DemandType,
+    ) -> Result<Responded<H::Output>, Responded<H::Error>>
+    where
+        H: FallibleHandler,
+        M: HandlerMethod<H>,
+        C2: EventContext<Payload = H::Payload>,
+    {
+        // Use the message's own span. An ambient middleware span must not
+        // become the response's parent.
+        let meta = message.request().map(|request| ResultDelivery {
+            request,
+            trace: message.span().context(),
+        });
+        // Match the result because `map` and `map_err` would move the carrier twice.
+        match M::call(&self.handler, context, message, demand_type).await {
+            Ok(inner) => Ok(Responded { inner, meta }),
+            Err(inner) => Err(Responded { inner, meta }),
+        }
+    }
 }
 
 impl<E: ClassifyError> ClassifyError for Responded<E> {
@@ -157,19 +177,8 @@ where
     where
         C2: EventContext<Payload = Self::Payload>,
     {
-        // The message's own span, not the ambient one: a middleware span
-        // between the dispatch and this layer must not become the response's
-        // parent.
-        let meta = message.request().map(|request| ResultDelivery {
-            request,
-            trace: message.span().context(),
-        });
-        // Matched rather than mapped: a `map` / `map_err` pair would move the
-        // carrier into two closures.
-        match self.handler.on_message(context, message, demand_type).await {
-            Ok(inner) => Ok(Responded { inner, meta }),
-            Err(inner) => Err(Responded { inner, meta }),
-        }
+        self.handle::<OnMessage, _>(context, message, demand_type)
+            .await
     }
 
     async fn on_excise<C2>(
@@ -181,14 +190,8 @@ where
     where
         C2: EventContext<Payload = Self::Payload>,
     {
-        let meta = message.request().map(|request| ResultDelivery {
-            request,
-            trace: message.span().context(),
-        });
-        match self.handler.on_excise(context, message, demand_type).await {
-            Ok(inner) => Ok(Responded { inner, meta }),
-            Err(inner) => Err(Responded { inner, meta }),
-        }
+        self.handle::<OnExcise, _>(context, message, demand_type)
+            .await
     }
 
     /// Forwards a timer without response metadata.
