@@ -95,7 +95,11 @@ impl RandomStream {
 }
 
 pub(crate) fn sample_gamma(shape: f64, random: &mut RandomStream) -> f64 {
-    let adjusted_shape = shape.max(1.0_f64);
+    let adjusted_shape = if shape < 1.0_f64 {
+        shape + 1.0_f64
+    } else {
+        shape
+    };
     let d = adjusted_shape - 1.0_f64 / 3.0_f64;
     let c = (9.0_f64 * d).sqrt().recip();
     let sample = loop {

@@ -245,8 +245,10 @@ fn edf_outcome(
     delay_area: f64,
     late_area: f64,
     terminal_capacity: f64,
+    continuation_seconds: f64,
 ) -> EdfOutcome {
-    let (terminal_late_area, drain_seconds) = terminal_closure(deadline.queue, terminal_capacity);
+    let (terminal_late_area, drain_seconds) =
+        terminal_closure(deadline.queue, terminal_capacity, continuation_seconds);
     EdfOutcome {
         shortfall: shortfall.max(deadline.shortfall),
         delay_area,
@@ -257,15 +259,20 @@ fn edf_outcome(
     }
 }
 
-/// Returns the exact constant-rate continuation after an admissible closure.
-fn terminal_closure(queue: f64, capacity: f64) -> (f64, f64) {
+/// Prices a constant-rate continuation over one finite planning horizon.
+fn terminal_closure(queue: f64, capacity: f64, horizon_seconds: f64) -> (f64, f64) {
     if queue == 0.0_f64 {
         return (0.0_f64, 0.0_f64);
     }
-    if capacity == 0.0_f64 {
-        return (f64::INFINITY, f64::INFINITY);
-    }
-    (queue * queue / (2.0_f64 * capacity), queue / capacity)
+    let drain_seconds = if capacity > 0.0_f64 {
+        (queue / capacity).min(horizon_seconds)
+    } else {
+        horizon_seconds
+    };
+    let residual = (queue - capacity * drain_seconds).max(0.0_f64);
+    let late_area = queue * drain_seconds - 0.5_f64 * capacity * drain_seconds * drain_seconds
+        + residual * horizon_seconds;
+    (late_area, drain_seconds)
 }
 
 impl SupplyTrajectory<'_> {
@@ -558,6 +565,8 @@ pub(crate) fn evaluate_prepared_step(
         delay_area,
         late_area,
         terminal_capacity,
+        Duration::from_micros(window.horizon_micros.saturating_sub(window.start_micros))
+            .as_secs_f64(),
     )
 }
 
@@ -699,6 +708,7 @@ fn evaluate_ordered_trajectory(
         delay_area,
         late_area,
         trajectory.capacity_at_micros(horizon_micros),
+        Duration::from_micros(horizon_micros.saturating_sub(start_micros)).as_secs_f64(),
     )
 }
 
@@ -876,6 +886,7 @@ fn evaluate_general_trajectory(
         delay_area,
         late_area,
         trajectory.capacity_at_micros(horizon_micros),
+        Duration::from_micros(horizon_micros.saturating_sub(start_micros)).as_secs_f64(),
     )
 }
 
@@ -955,6 +966,7 @@ fn evaluate_common_trajectory(
         delay_area,
         late_area,
         trajectory.capacity_at_micros(horizon_micros),
+        Duration::from_micros(horizon_micros.saturating_sub(start_micros)).as_secs_f64(),
     )
 }
 
@@ -1313,13 +1325,19 @@ mod tests {
     #[test]
     fn terminal_triangle_matches_closed_form_cases() {
         // q=12 and c=3 give T=q/c=4 and V=q*T/2=24.
-        assert_eq!(terminal_closure(12.0_f64, 3.0_f64), (24.0_f64, 4.0_f64));
+        assert_eq!(
+            terminal_closure(12.0_f64, 3.0_f64, 10.0_f64),
+            (24.0_f64, 4.0_f64)
+        );
         // An empty queue has zero continuation for every terminal capacity.
-        assert_eq!(terminal_closure(0.0_f64, 0.0_f64), (0.0_f64, 0.0_f64));
-        // Positive work cannot drain at zero capacity, so both terms diverge.
-        let (late_area, drain_seconds) = terminal_closure(1.0_f64, 0.0_f64);
-        assert!(late_area.is_infinite());
-        assert!(drain_seconds.is_infinite());
+        assert_eq!(
+            terminal_closure(0.0_f64, 0.0_f64, 10.0_f64),
+            (0.0_f64, 0.0_f64)
+        );
+        assert_eq!(
+            terminal_closure(1.0_f64, 0.0_f64, 10.0_f64),
+            (20.0_f64, 10.0_f64)
+        );
     }
 
     /// The debt remainder sits between the ledger error bound and the span

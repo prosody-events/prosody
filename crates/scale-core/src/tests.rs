@@ -103,8 +103,9 @@ fn evaluate_constant_supply(
 
 #[quickcheck]
 fn admissible_closure_is_horizon_invariant(work_seed: u16, capacity_seed: u8) -> bool {
-    let work = 100.0_f64 + f64::from(work_seed);
     let capacity = f64::from(capacity_seed % 10 + 1);
+    let drain_fraction = f64::from(work_seed % 1_000 + 1) / 1_000.0_f64;
+    let work = 1.5_f64 * capacity * drain_fraction;
     let mut cohorts = WorkCohorts::new(1);
     cohorts.push_values(0, 1_000_000, work, 0);
     let Ok(mut scratch) = EdfScratch::new(1) else {
@@ -129,10 +130,8 @@ fn admissible_closure_is_horizon_invariant(work_seed: u16, capacity_seed: u8) ->
     );
     let first_late = first.late_area + first.terminal_late_area;
     let second_late = second.late_area + second.terminal_late_area;
-    let first_resource =
-        2.0_f64 + terminal_replica_seconds(2_000_000, first.drain_seconds, 3_000_000, 1);
-    let second_resource =
-        3.0_f64 + terminal_replica_seconds(3_000_000, second.drain_seconds, 3_000_000, 1);
+    let first_resource = terminal_replica_seconds(2_000_000, first.drain_seconds, 3_000_000, 1);
+    let second_resource = terminal_replica_seconds(3_000_000, second.drain_seconds, 3_000_000, 1);
 
     close_relative(first_late, second_late) && close_relative(first_resource, second_resource)
 }
@@ -220,7 +219,8 @@ fn forecast_path_stops_arrivals_at_its_declared_end() -> Result<(), TestError> {
         &mut scratch,
     );
 
-    assert!(outcome.drain_seconds.is_infinite());
+    assert!(outcome.drain_seconds.total_cmp(&3.0_f64).is_eq());
+    assert!(outcome.terminal_late_area.total_cmp(&60.0_f64).is_eq());
     Ok(())
 }
 
@@ -367,18 +367,20 @@ fn edf_counts_a_late_cohort_after_an_earlier_wide_interval() -> Result<(), TestE
 
 #[test]
 fn decision_random_coordinates_do_not_shift_between_factors() {
-    let mut first_arrival = decision_random(17, DecisionRandomDomain::Arrival);
-    let mut first_lead = decision_random(17, DecisionRandomDomain::LeadTime);
+    let mut first_arrival = decision_random(3, 17, DecisionRandomDomain::Arrival);
+    let mut first_lead = decision_random(3, 17, DecisionRandomDomain::LeadTime);
     let expected_lead = first_lead.next_u64();
     for _ in 0_u8..100 {
         let _ = first_arrival.next_u64();
     }
 
-    let mut second_lead = decision_random(17, DecisionRandomDomain::LeadTime);
-    let mut other_scenario_lead = decision_random(18, DecisionRandomDomain::LeadTime);
-    let mut reliability = decision_random(17, DecisionRandomDomain::Reliability);
+    let mut second_lead = decision_random(3, 17, DecisionRandomDomain::LeadTime);
+    let mut other_decision_lead = decision_random(4, 17, DecisionRandomDomain::LeadTime);
+    let mut other_scenario_lead = decision_random(3, 18, DecisionRandomDomain::LeadTime);
+    let mut reliability = decision_random(3, 17, DecisionRandomDomain::Reliability);
 
     assert_eq!(second_lead.next_u64(), expected_lead);
+    assert_ne!(other_decision_lead.next_u64(), expected_lead);
     assert_ne!(other_scenario_lead.next_u64(), expected_lead);
     assert_ne!(reliability.next_u64(), expected_lead);
 }

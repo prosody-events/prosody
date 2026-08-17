@@ -28,10 +28,13 @@ fn action_selection_uses_the_lowest_total_cost() {
     let columns = ActionColumns {
         late_area_sums: &[12.0_f64, 1.0_f64, 4.0_f64],
         replica_seconds_sums: &[1.0_f64, 5.0_f64, 2.0_f64],
+        missed_work_sums: &[0.0_f64; 3],
+        event_count: 1.0_f64,
+        epsilon: 0.5_f64,
         rate: 3.0_f64,
     };
 
-    assert_eq!(select_action(&columns), 2);
+    assert_eq!(select_action(&columns).index, 2);
 }
 
 #[test]
@@ -39,10 +42,13 @@ fn action_selection_uses_the_smallest_index_for_an_exact_cost_tie() {
     let columns = ActionColumns {
         late_area_sums: &[3.0_f64, 0.0_f64, 6.0_f64],
         replica_seconds_sums: &[1.0_f64, 2.0_f64, 0.0_f64],
+        missed_work_sums: &[0.0_f64; 3],
+        event_count: 1.0_f64,
+        epsilon: 0.5_f64,
         rate: 3.0_f64,
     };
 
-    assert_eq!(select_action(&columns), 0);
+    assert_eq!(select_action(&columns).index, 0);
 }
 
 #[quickcheck]
@@ -59,9 +65,13 @@ fn action_selection_is_the_cost_argmin(
         replica_seconds_sums[index] = f64::from(replicas);
     }
     let rate = f64::from(rate_code) + 1.0_f64;
+    let missed_work_sums = vec![0.0_f64; count];
     let columns = ActionColumns {
         late_area_sums: &late_area_sums,
         replica_seconds_sums: &replica_seconds_sums,
+        missed_work_sums: &missed_work_sums,
+        event_count: 1.0_f64,
+        epsilon: 0.5_f64,
         rate,
     };
     let expected = (0..count)
@@ -73,7 +83,47 @@ fn action_selection_is_the_cost_argmin(
         })
         .unwrap_or(0);
 
-    select_action(&columns) == expected
+    select_action(&columns).index == expected
+}
+
+#[quickcheck]
+fn feasible_action_is_never_beaten_by_an_infeasible_action(
+    feasible_cost: u16,
+    infeasible_cost: u16,
+) -> bool {
+    let late_area_sums = [f64::from(feasible_cost), f64::from(infeasible_cost)];
+    let columns = ActionColumns {
+        late_area_sums: &late_area_sums,
+        replica_seconds_sums: &[0.0_f64; 2],
+        missed_work_sums: &[0.0_f64, 2.0_f64],
+        event_count: 2.0_f64,
+        epsilon: 0.5_f64,
+        rate: 1.0_f64,
+    };
+
+    let selection = select_action(&columns);
+    selection.index == 0 && !selection.used_fallback
+}
+
+#[quickcheck]
+fn empty_feasible_set_selects_the_smallest_miss_fraction(
+    first_excess: u16,
+    second_excess: u16,
+) -> bool {
+    let first = f64::from(first_excess) + 2.0_f64;
+    let second = f64::from(second_excess) + 2.0_f64;
+    let columns = ActionColumns {
+        late_area_sums: &[0.0_f64; 2],
+        replica_seconds_sums: &[0.0_f64; 2],
+        missed_work_sums: &[first, second],
+        event_count: 1.0_f64,
+        epsilon: 0.5_f64,
+        rate: 1.0_f64,
+    };
+    let expected = usize::from(second < first);
+    let selection = select_action(&columns);
+
+    selection.index == expected && selection.used_fallback
 }
 
 #[test]
@@ -88,11 +138,11 @@ fn replica_seconds_integrates_physical_membership_changes() {
 
 #[test]
 fn terminal_membership_reaches_the_first_report_boundary() {
-    // The horizon is 2 s. Eight drain seconds end at 10 s. The next 3 s
-    // report boundary is 12 s. Two replicas therefore cost 2 * 10 = 20.
+    // The 2 s planning horizon caps the 8 s drain. The next 3 s report
+    // boundary is 6 s. Two replicas therefore cost 2 * 4 = 8.
     assert!(
         terminal_replica_seconds(2_000_000, 8.0_f64, 3_000_000, 2)
-            .total_cmp(&20.0_f64)
+            .total_cmp(&8.0_f64)
             .is_eq()
     );
     // No terminal work needs no successor continuation.
@@ -101,6 +151,4 @@ fn terminal_membership_reaches_the_first_report_boundary() {
             .total_cmp(&0.0_f64)
             .is_eq()
     );
-    // Work that cannot drain keeps infinite resource cost.
-    assert!(terminal_replica_seconds(2_000_000, f64::INFINITY, 3_000_000, 2).is_infinite());
 }

@@ -1,6 +1,27 @@
 use rand::TryRng;
 
-use super::{PoissonMean, RandomStream, count_as_f64, sample_poisson};
+use quickcheck_macros::quickcheck;
+
+use super::{PoissonMean, RandomStream, count_as_f64, sample_gamma, sample_poisson};
+
+const MOMENT_SAMPLE_COUNT: u32 = 4_096;
+
+#[quickcheck]
+fn small_shape_gamma_sampler_matches_first_two_moments(seed: u64) -> bool {
+    let shape = 0.5_f64;
+    let mut random = RandomStream::new(seed);
+    let mut sum = 0.0_f64;
+    let mut sum_squared = 0.0_f64;
+    for _ in 0..MOMENT_SAMPLE_COUNT {
+        let value = sample_gamma(shape, &mut random);
+        sum += value;
+        sum_squared += value * value;
+    }
+    let count = f64::from(MOMENT_SAMPLE_COUNT);
+    let mean = sum / count;
+    let variance = sum_squared / count - mean * mean;
+    (mean - shape).abs() < 0.06_f64 && (variance - shape).abs() < 0.15_f64
+}
 
 #[test]
 fn poisson_sampler_matches_its_first_two_moments() {
