@@ -339,7 +339,7 @@ fn write_categorical_error_uncertainty<Calibration: CategoricalCalibrationPlot>(
         .filter(|trial| calibration.include(trial))
         .map(|trial| Calibration::error(trial).max(Calibration::uncertainty(trial)))
         .fold(0.0_f64, f64::max)
-        .max(f64::EPSILON);
+        .max(1.0_f64);
     let mut svg = String::new();
     {
         let root = SVGBackend::with_string(&mut svg, (WIDTH, PANEL_HEIGHT)).into_drawing_area();
@@ -715,7 +715,7 @@ fn write_demand_error_uncertainty(
         .iter()
         .map(|trial| trial.mean_absolute_error.max(trial.mean_uncertainty))
         .fold(0.0_f64, f64::max)
-        .max(f64::EPSILON);
+        .max(1.0_f64);
     let mut svg = String::new();
     {
         let root = SVGBackend::with_string(&mut svg, (WIDTH, PANEL_HEIGHT)).into_drawing_area();
@@ -1146,7 +1146,7 @@ fn write_error_uncertainty(
                 .max(trial.mean_uncertainty_per_second)
         })
         .fold(0.0_f64, f64::max)
-        .max(f64::EPSILON);
+        .max(1.0_f64);
     let mut svg = String::new();
     {
         let root = SVGBackend::with_string(&mut svg, (WIDTH, PANEL_HEIGHT)).into_drawing_area();

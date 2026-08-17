@@ -20,7 +20,7 @@ use crate::lead_time::{LaunchTimeFactor, RebalanceTimeFactor};
 use crate::partition::PartitionFactor;
 use crate::planning::terminal_replica_seconds;
 use crate::reliability::ReliabilityFactor;
-use crate::types::{WorkCohorts, occupancy_trace_for_test};
+use crate::types::{SlotSecondCohorts, occupancy_trace_for_test};
 use crate::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
     CapacityCurve, CapacityGrid, CapacityPrior, Cohort, Configuration, ConfigurationError,
@@ -75,7 +75,7 @@ fn configuration_requires_two_samples_for_each_capacity_class() -> Result<(), Te
 }
 
 fn evaluate_constant_supply(
-    cohorts: &WorkCohorts,
+    cohorts: &SlotSecondCohorts,
     capacity: f64,
     horizon_micros: u64,
     initial_debt_work: f64,
@@ -107,7 +107,7 @@ fn admissible_closure_is_horizon_invariant(work_seed: u16, capacity_seed: u8) ->
     let capacity = f64::from(capacity_seed % 10 + 1);
     let drain_fraction = f64::from(work_seed % 1_000 + 1) / 1_000.0_f64;
     let work = 1.5_f64 * capacity * drain_fraction;
-    let mut cohorts = WorkCohorts::new(1);
+    let mut cohorts = SlotSecondCohorts::new(1);
     cohorts.push_values(0, 1_000_000, work, 0);
     let Ok(mut scratch) = EdfScratch::new(1) else {
         return false;
@@ -144,7 +144,7 @@ fn drain_inside_horizon_has_no_terminal_terms(work_seed: u16, capacity_seed: u8)
     let capacity = f64::from(capacity_seed % 20 + 1);
     let drain_seconds = work / capacity;
     let horizon_micros = ((drain_seconds + 2.0_f64) * 1_000_000.0_f64).ceil() as u64;
-    let mut cohorts = WorkCohorts::new(1);
+    let mut cohorts = SlotSecondCohorts::new(1);
     cohorts.push_values(0, 1_000_000, work, 0);
     let Ok(mut scratch) = EdfScratch::new(1) else {
         return false;
@@ -168,7 +168,7 @@ fn drain_inside_horizon_has_no_terminal_terms(work_seed: u16, capacity_seed: u8)
 
 #[test]
 fn forecast_work_that_waits_past_its_deadline_fails_the_chance_test() -> Result<(), TestError> {
-    let cohorts = WorkCohorts::new(0);
+    let cohorts = SlotSecondCohorts::new(0);
     let mut scratch = EdfScratch::new(0)?;
     prepare(&cohorts, &mut scratch);
     let arrivals = ArrivalPath {
@@ -203,7 +203,7 @@ fn forecast_work_that_waits_past_its_deadline_fails_the_chance_test() -> Result<
 
 #[test]
 fn forecast_path_stops_arrivals_at_its_declared_end() -> Result<(), TestError> {
-    let cohorts = WorkCohorts::new(0);
+    let cohorts = SlotSecondCohorts::new(0);
     let mut scratch = EdfScratch::new(0)?;
     prepare(&cohorts, &mut scratch);
     let arrivals = ArrivalPath {
@@ -230,7 +230,7 @@ fn forecast_path_stops_arrivals_at_its_declared_end() -> Result<(), TestError> {
 fn edf_counts_missed_work_and_bounds_late_area(work_seed: u16, supply_seed: u16) -> bool {
     let work = f64::from(work_seed % 10_000 + 1);
     let supply = f64::from(supply_seed % 1_000 + 1);
-    let mut cohorts = WorkCohorts::new(1);
+    let mut cohorts = SlotSecondCohorts::new(1);
     cohorts.push_values(0, 1_000_000, work, 0);
     let Ok(mut scratch) = EdfScratch::new(1) else {
         return false;
@@ -266,7 +266,7 @@ fn edf_counts_missed_work_and_bounds_late_area(work_seed: u16, supply_seed: u16)
 
 #[test]
 fn edf_prices_preexisting_overdue_work() -> Result<(), TestError> {
-    let cohorts = WorkCohorts::new(0);
+    let cohorts = SlotSecondCohorts::new(0);
     let mut scratch = EdfScratch::new(0)?;
     prepare(&cohorts, &mut scratch);
     let outcome = evaluate_prepared_step(
@@ -298,7 +298,7 @@ fn edf_prices_preexisting_overdue_work() -> Result<(), TestError> {
 
 #[test]
 fn edf_does_not_report_lateness_after_work_finishes_before_its_deadline() -> Result<(), TestError> {
-    let mut cohorts = WorkCohorts::new(1);
+    let mut cohorts = SlotSecondCohorts::new(1);
     cohorts.push_values(0, 1_000_000, 188.0_f64, 0);
     let mut scratch = EdfScratch::new(1)?;
     prepare(&cohorts, &mut scratch);
@@ -329,7 +329,7 @@ fn edf_does_not_report_lateness_after_work_finishes_before_its_deadline() -> Res
 
 #[test]
 fn edf_counts_a_late_cohort_after_an_earlier_wide_interval() -> Result<(), TestError> {
-    let mut cohorts = WorkCohorts::new(2);
+    let mut cohorts = SlotSecondCohorts::new(2);
     cohorts.push_values(0, 100_000_000, 0.0_f64, 0);
     cohorts.push_values(50_000_000, 51_000_000, 16.0_f64, 0);
     let mut scratch = EdfScratch::new(2)?;
@@ -389,12 +389,12 @@ fn decision_random_coordinates_do_not_shift_between_factors() {
 
 #[test]
 fn trajectory_counts_a_cohort_released_before_its_horizon() -> Result<(), TestError> {
-    let mut cohorts = WorkCohorts::new(1);
+    let mut cohorts = SlotSecondCohorts::new(1);
     cohorts.push_values(50_000_000, 51_000_000, 160.0_f64, 0);
     let trajectory = SupplyTrajectory {
         initial: 45.0_f64,
-        pause_seconds: &[77.0_f64],
-        ready_seconds: &[78.0_f64],
+        pause_micros: &[77_000_000_u64],
+        ready_micros: &[78_000_000_u64],
         during: &[20.0_f64],
         after: &[45.0_f64],
     };
@@ -423,7 +423,7 @@ fn trajectory_counts_a_cohort_released_before_its_horizon() -> Result<(), TestEr
 fn common_cohort_required_capacity_matches_fluid_work(count_seed: u8, work_seed: u16) -> bool {
     let count = usize::from(count_seed % 16 + 1);
     let work = f64::from(work_seed) / 10.0_f64;
-    let mut cohorts = WorkCohorts::new(count);
+    let mut cohorts = SlotSecondCohorts::new(count);
     for partition in 0..count {
         cohorts.push_values(250_000, 1_500_000, work, partition as u32);
     }
@@ -455,12 +455,12 @@ fn change_point_kernel_satisfies_the_semigroup_law(
 }
 
 #[derive(Clone, Debug)]
-struct CohortSet(WorkCohorts);
+struct CohortSet(SlotSecondCohorts);
 
 impl Arbitrary for CohortSet {
     fn arbitrary(generator: &mut Gen) -> Self {
         let count = usize::arbitrary(generator) % 16;
-        let mut cohorts = WorkCohorts::new(count);
+        let mut cohorts = SlotSecondCohorts::new(count);
         for partition in 0..count {
             let release_micros = u64::arbitrary(generator) % 20;
             let duration_micros = u64::arbitrary(generator) % 20 + 1;
@@ -485,13 +485,13 @@ impl Arbitrary for CohortSet {
     }
 }
 
-fn copy_work_range(source: &WorkCohorts, start: usize, end: usize) -> WorkCohorts {
-    let mut copy = WorkCohorts::new(end - start);
+fn copy_work_range(source: &SlotSecondCohorts, start: usize, end: usize) -> SlotSecondCohorts {
+    let mut copy = SlotSecondCohorts::new(end - start);
     for index in start..end {
         copy.push_values(
             source.release_micros(index),
             source.deadline_micros(index),
-            source.work_slot_seconds(index),
+            source.work(index),
             source.partition(index),
         );
     }
@@ -1282,11 +1282,12 @@ fn capacity_quantiles_preserve_posterior_order() -> Result<(), TestError> {
     let median = factor.capacity_quantile(0.5_f64);
     let high = factor.capacity_quantile(0.9_f64);
 
-    assert!(low <= median);
-    assert!(median <= high);
-    assert_eq!(low.to_bits(), 100.0_f64.to_bits());
-    assert_eq!(median.to_bits(), 200.0_f64.to_bits());
-    assert_eq!(high.to_bits(), 400.0_f64.to_bits());
+    assert!(low.value <= median.value);
+    assert!(median.value <= high.value);
+    assert_eq!(low.value.to_bits(), 100.0_f64.to_bits());
+    assert_eq!(median.value.to_bits(), 200.0_f64.to_bits());
+    assert_eq!(high.value.to_bits(), 400.0_f64.to_bits());
+    assert_eq!(low.conditioning_probability.to_bits(), 0.5_f64.to_bits());
     Ok(())
 }
 
@@ -1665,7 +1666,7 @@ fn capacity_grid_accepts_exactly_representable_log_normal_parameters(
         && capacity_median.is_finite()
         && capacity_median > 0.0_f64
         && log_standard_deviation.is_finite()
-        && log_standard_deviation >= f64::EPSILON;
+        && log_standard_deviation > 0.0_f64;
     let result = CapacityGrid::new_with_prior(
         &[0.05_f64, 0.1_f64],
         &[160.0_f64, 320.0_f64],
@@ -1725,7 +1726,7 @@ fn fluid_edf_matches_exhaustive_interval_oracle(input: CohortSet, slots: u8) -> 
 
 #[test]
 fn feasible_fluid_schedule_tolerates_roundoff_slivers() -> Result<(), TestError> {
-    let mut cohorts = WorkCohorts::new(3);
+    let mut cohorts = SlotSecondCohorts::new(3);
     for (partition, (release, deadline, work)) in [
         (0_u64, 11_u64, 3.2e-5_f64),
         (6, 15, 1.5e-5_f64),
@@ -1919,7 +1920,7 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
 
 #[test]
 fn partition_pause_removes_service_from_candidate_supply() -> Result<(), TestError> {
-    let mut cohorts = WorkCohorts::new(1);
+    let mut cohorts = SlotSecondCohorts::new(1);
     cohorts.push_values(0, 1_000_000, 0.75_f64, 0);
     let mut scratch = EdfScratch::new(1)?;
     prepare(&cohorts, &mut scratch);
@@ -1948,7 +1949,7 @@ fn partition_pause_removes_service_from_candidate_supply() -> Result<(), TestErr
 
 #[test]
 fn missed_work_remains_service_debt_and_rewards_faster_recovery() -> Result<(), TestError> {
-    let mut cohorts = WorkCohorts::new(1);
+    let mut cohorts = SlotSecondCohorts::new(1);
     cohorts.push_values(0, 1_000_000, 1.0_f64, 0);
     let mut scratch = EdfScratch::new(1)?;
     prepare(&cohorts, &mut scratch);
@@ -1976,7 +1977,7 @@ fn missed_work_remains_service_debt_and_rewards_faster_recovery() -> Result<(), 
 
 #[test]
 fn debt_only_observation_rewards_faster_recovery() -> Result<(), TestError> {
-    let cohorts = WorkCohorts::new(0);
+    let cohorts = SlotSecondCohorts::new(0);
     let mut scratch = EdfScratch::new(1)?;
     prepare(&cohorts, &mut scratch);
     let slow = evaluate_constant_supply(
@@ -2003,7 +2004,7 @@ fn debt_only_observation_rewards_faster_recovery() -> Result<(), TestError> {
 
 #[test]
 fn predictive_arrivals_consume_service_while_debt_drains() -> Result<(), TestError> {
-    let cohorts = WorkCohorts::new(0);
+    let cohorts = SlotSecondCohorts::new(0);
     let mut scratch = EdfScratch::new(1)?;
     prepare(&cohorts, &mut scratch);
     let matched = evaluate_constant_supply(
@@ -2238,11 +2239,11 @@ fn wide_cohort_cannot_hide_one_hot_partition_deadline() -> Result<(), TestError>
     Ok(())
 }
 
-fn exhaustive_feasible(cohorts: &WorkCohorts, slots: f64) -> bool {
+fn exhaustive_feasible(cohorts: &SlotSecondCohorts, slots: f64) -> bool {
     exhaustive_required_capacity(cohorts) <= slots + 8.0_f64 * f64::EPSILON * slots.max(1.0_f64)
 }
 
-fn exhaustive_required_capacity(cohorts: &WorkCohorts) -> f64 {
+fn exhaustive_required_capacity(cohorts: &SlotSecondCohorts) -> f64 {
     let mut required = 0.0_f64;
     for start in 0..cohorts.len() {
         for end in 0..cohorts.len() {
@@ -2254,7 +2255,7 @@ fn exhaustive_required_capacity(cohorts: &WorkCohorts) -> f64 {
                 if cohorts.release_micros(index) >= cohorts.release_micros(start)
                     && cohorts.deadline_micros(index) <= cohorts.deadline_micros(end)
                 {
-                    demand += cohorts.work_slot_seconds(index);
+                    demand += cohorts.work(index);
                 }
             }
             let elapsed =

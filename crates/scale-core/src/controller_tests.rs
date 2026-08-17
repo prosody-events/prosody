@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use super::{SCHEDULED_PARTITION, prepare_work_cohorts, scenario_event_count, scenario_horizons};
 use crate::edf::ArrivalPath;
-use crate::types::WorkCohorts;
+use crate::types::EventCohorts;
 use crate::{
     ArrivalPrior, ArrivalPriorError, BacklogCohort, CapacityGrid, CapacityGridError, Configuration,
     ConfigurationError, DemandClass, LaunchPrior, ModelTime, ObservationBuffer, ObservationError,
@@ -77,11 +77,11 @@ fn overdue_backlog_keeps_each_original_deadline() -> Result<(), TestError> {
     assert_eq!(scratch.resource_cohorts.deadline_micros(0), 9_500_000);
     assert_eq!(scratch.resource_cohorts.deadline_micros(1), 9_000_000);
     assert!(approximately_equal(
-        scratch.resource_cohorts.work_slot_seconds(0),
+        scratch.resource_cohorts.work(0),
         5.0_f64,
     ));
     assert!(approximately_equal(
-        scratch.resource_cohorts.work_slot_seconds(1),
+        scratch.resource_cohorts.work(1),
         7.0_f64,
     ));
     Ok(())
@@ -167,7 +167,7 @@ fn ingestion_rejects_deadlines_beyond_the_arrival_domain() -> Result<(), TestErr
 #[test]
 fn scenario_horizon_uses_only_artifact_support() -> Result<(), TestError> {
     let (state, _scratch, _observation) = test_model()?;
-    let cohorts = WorkCohorts::new(1);
+    let cohorts = EventCohorts::new(1);
     let first = scenario_horizons(&state, &cohorts);
     let second = scenario_horizons(&state, &cohorts);
     let support_seconds = state
@@ -248,7 +248,7 @@ fn scheduled_releases_are_exact_and_idempotent(raw: Vec<(u8, u16)>) -> bool {
                     .release_micros
                     .saturating_add(state.configuration.objective.budget_micros())
             && approximately_equal(
-                scratch.resource_cohorts.work_slot_seconds(index),
+                scratch.resource_cohorts.work(index),
                 f64::from(release.count),
             )
             && scratch.resource_cohorts.partition(index) == SCHEDULED_PARTITION
@@ -258,7 +258,7 @@ fn scheduled_releases_are_exact_and_idempotent(raw: Vec<(u8, u16)>) -> bool {
 #[quickcheck]
 fn scheduled_counts_are_equal_across_scenarios(count: u16) -> bool {
     let scheduled_count = f64::from(count) + 1.0_f64;
-    let mut cohorts = WorkCohorts::new(1);
+    let mut cohorts = EventCohorts::new(1);
     cohorts.push_values(2_000_000, 3_000_000, scheduled_count, SCHEDULED_PARTITION);
     let empty = ArrivalPath {
         start_seconds: 0.0_f64,

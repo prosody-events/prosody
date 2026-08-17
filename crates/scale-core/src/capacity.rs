@@ -114,6 +114,15 @@ pub struct CapacityClockCheck {
     pub rejected: bool,
 }
 
+/// A capacity summary conditioned on the model having a finite knee.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ConditionalCapacity {
+    /// Posterior probability of the conditioning event.
+    pub(crate) conditioning_probability: f64,
+    /// Conditional value. Infinity represents the unbounded no-knee case.
+    pub(crate) value: f64,
+}
+
 /// One point on the passive throughput curve.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CapacityCurve {
@@ -244,7 +253,7 @@ impl CapacityPrior {
                 && capacity_median_per_second.is_finite()
                 && capacity_median_per_second > 0.0_f64
                 && log_standard_deviation.is_finite()
-                && log_standard_deviation >= f64::EPSILON =>
+                && log_standard_deviation > 0.0_f64 =>
             {
                 Ok(())
             }
@@ -652,7 +661,7 @@ impl CapacityFactor {
         record_grid_coverage(&grid, &mut artifact)?;
         artifact.coverage.push(PriorCoverageRecord::new(
             0.0_f64,
-            history_coverage_seconds.max(f64::EPSILON),
+            history_coverage_seconds,
             0.0_f64,
             0.0_f64,
             0.0_f64,
@@ -754,7 +763,7 @@ impl CapacityFactor {
         record_grid_coverage(&self.grid, &mut artifact)?;
         artifact.coverage.push(PriorCoverageRecord::new(
             0.0_f64,
-            self.history_coverage_seconds.max(f64::EPSILON),
+            self.history_coverage_seconds,
             0.0_f64,
             0.0_f64,
             0.0_f64,
@@ -1107,13 +1116,18 @@ impl CapacityFactor {
         self.residual_maximum_distance = maximum;
     }
 
-    pub(crate) fn expected_capacity(&self, simd_level: Level) -> f64 {
+    pub(crate) fn expected_capacity(&self, simd_level: Level) -> ConditionalCapacity {
         let knee_probability = self.knee_probability();
-        if knee_probability <= f64::EPSILON {
-            return 0.0_f64;
+        let value = if knee_probability == 0.0_f64 {
+            f64::INFINITY
+        } else {
+            dispatch!(simd_level, simd => weighted_sum(simd, &self.weights, &self.grid.capacities_per_second))
+                / knee_probability
+        };
+        ConditionalCapacity {
+            conditioning_probability: knee_probability,
+            value,
         }
-        dispatch!(simd_level, simd => weighted_sum(simd, &self.weights, &self.grid.capacities_per_second))
-            / knee_probability
     }
 
     pub(crate) fn expected_service_time(&self, simd_level: Level) -> f64 {
@@ -1124,14 +1138,17 @@ impl CapacityFactor {
         ))
     }
 
-    pub(crate) fn capacity_quantile(&self, probability: f64) -> f64 {
+    pub(crate) fn capacity_quantile(&self, probability: f64) -> ConditionalCapacity {
         let collapse_count = self.grid.collapse_count as usize;
         let capacity_count = self.grid.capacity_count as usize;
         let service_count = self.grid.service_time_count as usize;
         let service_stride = capacity_count * collapse_count;
         let knee_probability = self.knee_probability();
-        if knee_probability <= f64::EPSILON {
-            return 0.0_f64;
+        if knee_probability == 0.0_f64 {
+            return ConditionalCapacity {
+                conditioning_probability: 0.0_f64,
+                value: f64::INFINITY,
+            };
         }
         let mut cumulative = 0.0_f64;
         for capacity in 0..capacity_count {
@@ -1141,17 +1158,23 @@ impl CapacityFactor {
                 cumulative += self.weights[start..end].iter().sum::<f64>() / knee_probability;
             }
             if cumulative >= probability {
-                return self.grid.capacities_per_second[capacity * collapse_count];
+                return ConditionalCapacity {
+                    conditioning_probability: knee_probability,
+                    value: self.grid.capacities_per_second[capacity * collapse_count],
+                };
             }
         }
-        self.grid.capacities_per_second[(capacity_count - 1) * collapse_count]
+        ConditionalCapacity {
+            conditioning_probability: knee_probability,
+            value: self.grid.capacities_per_second[(capacity_count - 1) * collapse_count],
+        }
     }
 
     pub(crate) fn write_capacity_posterior(
         &self,
         values: &mut [f64],
         probabilities: &mut [f64],
-    ) -> Result<(), PosteriorError> {
+    ) -> Result<f64, PosteriorError> {
         let capacity_count = self.grid.capacity_count as usize;
         if values.len() != capacity_count || probabilities.len() != capacity_count {
             return Err(PosteriorError::BufferLength {
@@ -1170,20 +1193,20 @@ impl CapacityFactor {
             }
         }
         let knee_probability = self.knee_probability();
-        if knee_probability <= f64::EPSILON {
-            return Ok(());
+        if knee_probability == 0.0_f64 {
+            return Ok(0.0_f64);
         }
         for value in probabilities {
             *value /= knee_probability;
         }
-        Ok(())
+        Ok(knee_probability)
     }
 
     pub(crate) fn write_service_time_posterior(
         &self,
         values: &mut [f64],
         probabilities: &mut [f64],
-    ) -> Result<(), PosteriorError> {
+    ) -> Result<f64, PosteriorError> {
         let service_count = self.grid.service_time_count as usize;
         if values.len() != service_count || probabilities.len() != service_count {
             return Err(PosteriorError::BufferLength {
@@ -1199,14 +1222,14 @@ impl CapacityFactor {
                 .sum::<f64>()
                 + self.weights[self.grid.knee_cell_count as usize + service];
         }
-        Ok(())
+        Ok(1.0_f64)
     }
 
     pub(crate) fn write_collapse_posterior(
         &self,
         values: &mut [f64],
         probabilities: &mut [f64],
-    ) -> Result<(), PosteriorError> {
+    ) -> Result<f64, PosteriorError> {
         let collapse_count = self.grid.collapse_count as usize;
         if values.len() != collapse_count || probabilities.len() != collapse_count {
             return Err(PosteriorError::BufferLength {
@@ -1224,20 +1247,20 @@ impl CapacityFactor {
             probabilities[cell % collapse_count] += weight;
         }
         let knee_probability = self.knee_probability();
-        if knee_probability <= f64::EPSILON {
-            return Ok(());
+        if knee_probability == 0.0_f64 {
+            return Ok(0.0_f64);
         }
         for value in probabilities {
             *value /= knee_probability;
         }
-        Ok(())
+        Ok(knee_probability)
     }
 
     pub(crate) fn write_knee_posterior(
         &self,
         values: &mut [f64],
         probabilities: &mut [f64],
-    ) -> Result<(), PosteriorError> {
+    ) -> Result<f64, PosteriorError> {
         let knee_count = self.grid.knee_values.len();
         if values.len() != knee_count || probabilities.len() != knee_count {
             return Err(PosteriorError::BufferLength {
@@ -1250,13 +1273,13 @@ impl CapacityFactor {
             probabilities[index as usize] += weight;
         }
         let knee_probability = self.knee_probability();
-        if knee_probability <= f64::EPSILON {
-            return Ok(());
+        if knee_probability == 0.0_f64 {
+            return Ok(0.0_f64);
         }
         for value in probabilities {
             *value /= knee_probability;
         }
-        Ok(())
+        Ok(knee_probability)
     }
 
     pub(crate) fn saturation_probability(&self, simd_level: Level, concurrency: f64) -> f64 {
@@ -1656,22 +1679,21 @@ fn record_grid_coverage(
     artifact.coverage.extend([
         PriorCoverageRecord::new(
             services[0],
-            services[services.len() - 1].max(services[0] + f64::EPSILON * services[0].max(1.0_f64)),
+            services[services.len() - 1],
             service_lower,
             service_upper,
             service_error,
         ),
         PriorCoverageRecord::new(
             capacities[0],
-            capacities[capacities.len() - 1]
-                .max(capacities[0] + f64::EPSILON * capacities[0].max(1.0_f64)),
+            capacities[capacities.len() - 1],
             capacity_lower,
             capacity_upper,
             capacity_error,
         ),
         PriorCoverageRecord::new(
             collapses[0],
-            collapses[collapses.len() - 1].max(collapses[0] + f64::EPSILON),
+            collapses[collapses.len() - 1],
             0.0_f64,
             0.0_f64,
             collapse_error,

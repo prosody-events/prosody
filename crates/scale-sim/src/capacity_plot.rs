@@ -133,7 +133,7 @@ fn draw_snapshot<Backend: DrawingBackend>(
         .copied()
         .filter(|mass| mass.is_finite())
         .fold(0.0_f64, f64::max)
-        .max(f64::EPSILON)
+        .max(1.0_f64)
         * 1.14_f64;
     let mut chart = ChartBuilder::on(area)
         .margin_left(12_u32)

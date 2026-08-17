@@ -34,7 +34,11 @@ impl ActionColumns<'_> {
     }
 
     pub(crate) fn miss_fraction(&self, index: usize) -> f64 {
-        self.missed_work_sums[index] / self.event_count.max(f64::MIN_POSITIVE)
+        if self.event_count == 0.0_f64 {
+            0.0_f64
+        } else {
+            self.missed_work_sums[index] / self.event_count
+        }
     }
 
     fn is_feasible(&self, index: usize) -> bool {
@@ -103,34 +107,34 @@ pub(crate) fn compare_actions(left: usize, right: usize, columns: &ActionColumns
 /// The target and pod-lifetime columns have equal lengths. Pod-lifetime times
 /// are monotonic. A target changes the billed resource at its paired time.
 pub(crate) fn billing_replica_seconds(
-    start_seconds: f64,
-    end_seconds: f64,
+    start_micros: u64,
+    end_micros: u64,
     initial_replicas: u32,
     targets: &[u32],
-    pod_lifetime_seconds: &[f64],
+    pod_lifetime_micros: &[u64],
 ) -> f64 {
     assert_eq!(
         targets.len(),
-        pod_lifetime_seconds.len(),
+        pod_lifetime_micros.len(),
         "each target must pair with one pod-lifetime time"
     );
     assert!(
-        end_seconds >= start_seconds,
+        end_micros >= start_micros,
         "the integration interval must not be inverted"
     );
-    let mut cursor = start_seconds;
+    let mut cursor = start_micros;
     let mut replicas = initial_replicas;
     let mut area = 0.0_f64;
-    for (&target, &pod_lifetime) in targets.iter().zip(pod_lifetime_seconds) {
-        let boundary = pod_lifetime.clamp(cursor, end_seconds);
-        area += f64::from(replicas) * (boundary - cursor);
+    for (&target, &pod_lifetime) in targets.iter().zip(pod_lifetime_micros) {
+        let boundary = pod_lifetime.clamp(cursor, end_micros);
+        area += f64::from(replicas) * Duration::from_micros(boundary - cursor).as_secs_f64();
         cursor = boundary;
-        if pod_lifetime >= end_seconds {
+        if pod_lifetime >= end_micros {
             return area;
         }
         replicas = target;
     }
-    area + f64::from(replicas) * (end_seconds - cursor).max(0.0_f64)
+    area + f64::from(replicas) * Duration::from_micros(end_micros - cursor).as_secs_f64()
 }
 
 /// Returns the first report boundary at or after the specified time.

@@ -267,7 +267,7 @@ fn coefficient_of_variation(values: &[u64]) -> f64 {
         .map(|&micros| Duration::from_micros(micros).as_secs_f64())
         .sum::<f64>()
         / usize_f64(values.len());
-    if mean <= f64::EPSILON {
+    if mean == 0.0_f64 {
         return 0.0_f64;
     }
     let variance = values

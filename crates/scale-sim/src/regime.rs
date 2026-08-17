@@ -3135,7 +3135,7 @@ impl ArrivalSeries {
 fn sample_poisson(mean: f64, random: &mut RandomStream) -> u32 {
     let mut remaining = mean;
     let mut total = 0_u32;
-    while remaining > f64::EPSILON {
+    while remaining > 0.0_f64 {
         let lambda = remaining.min(20.0_f64);
         let limit = (-lambda).exp();
         let mut product = 1.0_f64;

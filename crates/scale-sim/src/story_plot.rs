@@ -875,7 +875,8 @@ fn panel_bounds(panel: &StoryPanel) -> (f64, f64) {
         (minimum.min(value), maximum.max(value))
     });
     minimum = minimum.min(0.0_f64);
-    let span = (maximum - minimum).max(f64::EPSILON);
+    // One event is the smallest useful count span on this plot.
+    let span = (maximum - minimum).max(1.0_f64);
     maximum += span * 0.08_f64;
     (minimum, maximum)
 }

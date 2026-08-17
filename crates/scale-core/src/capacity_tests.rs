@@ -1,6 +1,7 @@
 use std::{array, time::Duration};
 
 use allocation_counter::measure;
+use fearless_simd::Level;
 use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
@@ -445,6 +446,37 @@ fn log_normal_endpoint_cells_truncate_both_tail_masses() -> Result<(), TestError
     assert!((masses.iter().sum::<f64>() - 1.0_f64).abs() <= 16.0_f64 * f64::EPSILON);
     assert!((masses[0] - masses[2]).abs() <= 16.0_f64 * f64::EPSILON);
     assert!(masses[1] > masses[0]);
+    Ok(())
+}
+
+#[test]
+fn no_knee_condition_reports_zero_mass_and_unbounded_capacity() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &ArrivalPrior::test_artifact()?,
+        1.0_f64,
+        1.0_f64,
+        3,
+    )?;
+    factor.weights.fill(0.0_f64);
+    let no_knee = factor.grid.knee_cell_count as usize;
+    factor.weights[no_knee] = 1.0_f64;
+    let mut values = [0.0_f64];
+    let mut probabilities = [0.0_f64];
+
+    let conditioning_probability =
+        factor.write_capacity_posterior(&mut values, &mut probabilities)?;
+    let expected = factor.expected_capacity(Level::new());
+
+    assert_eq!(conditioning_probability.to_bits(), 0.0_f64.to_bits());
+    assert_eq!(probabilities[0].to_bits(), 0.0_f64.to_bits());
+    assert_eq!(
+        expected.conditioning_probability.to_bits(),
+        0.0_f64.to_bits()
+    );
+    assert!(expected.value.is_infinite());
     Ok(())
 }
 
@@ -1380,6 +1412,8 @@ enum TestError {
     Grid(#[from] CapacityGridError),
     #[error(transparent)]
     Model(#[from] CapacityModelError),
+    #[error(transparent)]
+    Posterior(#[from] crate::PosteriorError),
     #[error(transparent)]
     Window(#[from] ResourceWindowError),
 }

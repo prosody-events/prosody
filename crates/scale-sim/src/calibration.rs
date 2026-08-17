@@ -515,7 +515,7 @@ fn summarize_lead_time_trial(
         rank_counts,
         mean_absolute_error_seconds: absolute_error_sum / count,
         mean_uncertainty_seconds: uncertainty_sum / count,
-        posterior_contraction: if prior_width > f64::EPSILON {
+        posterior_contraction: if prior_width > 0.0_f64 {
             1.0_f64 - final_width / prior_width
         } else {
             0.0_f64
@@ -577,7 +577,7 @@ fn summarize_partition_trial(
         rank_counts,
         mean_log_loss: log_loss_sum / count,
         mean_entropy: entropy_sum / count,
-        entropy_contraction: if prior_entropy > f64::EPSILON {
+        entropy_contraction: if prior_entropy > 0.0_f64 {
             1.0_f64 - final_entropy / prior_entropy
         } else {
             0.0_f64
@@ -727,7 +727,7 @@ fn summarize_trial(
         rank_counts,
         mean_absolute_error_per_second: absolute_error_sum / count,
         mean_uncertainty_per_second: uncertainty_sum / count,
-        capacity_contraction: if prior_width > f64::EPSILON {
+        capacity_contraction: if prior_width > 0.0_f64 {
             1.0_f64 - final_width / prior_width
         } else {
             0.0_f64

@@ -188,7 +188,7 @@ fn draw_panel<Backend: DrawingBackend>(
                 second.map_or(0.0_f64, |line| line.1(summary)),
             ]
         })
-        .fold(f64::EPSILON, f64::max);
+        .fold(1.0_f64, f64::max);
     let x_end = summaries.len() * 2 + 1;
     let no_axis_label = |_: &usize| String::new();
     let mut chart = ChartBuilder::on(area)

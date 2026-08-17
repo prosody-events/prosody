@@ -1337,7 +1337,7 @@ fn capacity_regimes_record_passive_resource_windows() -> Result<(), TestError> {
                 .capacity_posterior(index)
                 .ok_or(TestError::MissingControllerSample)?;
             let total = posterior.iter().sum::<f64>();
-            assert!(total <= f64::EPSILON || (total - 1.0_f64).abs() < 1.0e-9_f64);
+            assert!(total == 0.0_f64 || (total - 1.0_f64).abs() < 1.0e-9_f64);
         }
         let prior = run
             .controller()

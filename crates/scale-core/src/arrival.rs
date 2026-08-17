@@ -375,7 +375,7 @@ impl ArrivalFactor {
             exposure_micros,
         } = evidence;
         let exposure = Duration::from_micros(exposure_micros).as_secs_f64();
-        if exposure <= f64::EPSILON {
+        if exposure == 0.0_f64 {
             return;
         }
         let evidence_start = now_micros.saturating_sub(exposure_micros);
@@ -400,7 +400,7 @@ impl ArrivalFactor {
     }
 
     fn transition(&mut self, duration: f64, count: Option<u32>) {
-        if duration <= f64::EPSILON {
+        if duration == 0.0_f64 {
             return;
         }
         self.scratch.fill(0.0_f64);
@@ -677,7 +677,7 @@ impl ArrivalFactor {
         calendar: Option<CalendarForecast<'_>>,
         now_micros: u64,
     ) -> usize {
-        if duration_seconds <= f64::EPSILON {
+        if duration_seconds == 0.0_f64 {
             return 0;
         }
         assert!(
@@ -1048,7 +1048,7 @@ fn arrival_coverage(
 }
 
 fn log_poisson_mass(count: u32, mean: f64) -> f64 {
-    if mean <= f64::EPSILON {
+    if mean == 0.0_f64 {
         return if count == 0 {
             0.0_f64
         } else {

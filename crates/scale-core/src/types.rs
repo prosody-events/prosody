@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, time::Duration};
+use std::{marker::PhantomData, num::NonZeroU32, time::Duration};
 
 use thiserror::Error;
 
@@ -305,7 +305,7 @@ impl PriorCoverageRecord {
         self.lower_endpoint.is_finite()
             && self.lower_endpoint >= 0.0_f64
             && self.upper_endpoint.is_finite()
-            && self.upper_endpoint > self.lower_endpoint
+            && self.upper_endpoint >= self.lower_endpoint
             && self.lower_tail_probability.is_finite()
             && self.lower_tail_probability >= 0.0_f64
             && self.upper_tail_probability.is_finite()
@@ -870,12 +870,26 @@ impl Cohort {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct WorkCohorts {
+pub(crate) struct EventCount;
+#[derive(Clone, Debug)]
+pub(crate) struct SlotSeconds;
+
+pub(crate) type EventCohorts = WorkCohorts<EventCount>;
+pub(crate) type SlotSecondCohorts = WorkCohorts<SlotSeconds>;
+
+/// Work columns for one EDF evaluation unit.
+///
+/// An overdue backlog keeps its original deadline. Thus, its deadline can
+/// precede its release at the evaluation window start. Every other cohort has
+/// a deadline at or after its release.
+#[derive(Clone, Debug)]
+pub(crate) struct WorkCohorts<Unit> {
     release_micros: Vec<u64>,
     deadline_micros: Vec<u64>,
-    work_slot_seconds: Vec<f64>,
+    work: Vec<f64>,
     partitions: Vec<u32>,
     deadline_max_micros: u64,
+    unit: PhantomData<Unit>,
 }
 
 #[derive(Debug)]
@@ -920,21 +934,22 @@ pub(crate) struct RebalancingCommitment {
     pub(crate) started_at: ModelTime,
 }
 
-impl WorkCohorts {
+impl<Unit> WorkCohorts<Unit> {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             release_micros: Vec::with_capacity(capacity),
             deadline_micros: Vec::with_capacity(capacity),
-            work_slot_seconds: Vec::with_capacity(capacity),
+            work: Vec::with_capacity(capacity),
             partitions: Vec::with_capacity(capacity),
             deadline_max_micros: 0,
+            unit: PhantomData,
         }
     }
 
     pub(crate) fn clear(&mut self) {
         self.release_micros.clear();
         self.deadline_micros.clear();
-        self.work_slot_seconds.clear();
+        self.work.clear();
         self.partitions.clear();
         self.deadline_max_micros = 0;
     }
@@ -943,16 +958,18 @@ impl WorkCohorts {
         &mut self,
         release_micros: u64,
         deadline_micros: u64,
-        work_slot_seconds: f64,
+        work: f64,
         partition: u32,
     ) {
+        // The prepared evaluator checks the overdue representation against its
+        // window start, which is not available at this boundary.
         assert!(
             self.len() < self.release_micros.capacity(),
             "work cohorts must fit the configured capacity"
         );
         self.release_micros.push(release_micros);
         self.deadline_micros.push(deadline_micros);
-        self.work_slot_seconds.push(work_slot_seconds);
+        self.work.push(work);
         self.partitions.push(partition);
         self.deadline_max_micros = self.deadline_max_micros.max(deadline_micros);
     }
@@ -973,8 +990,8 @@ impl WorkCohorts {
         self.deadline_micros[index]
     }
 
-    pub(crate) fn work_slot_seconds(&self, index: usize) -> f64 {
-        self.work_slot_seconds[index]
+    pub(crate) fn work(&self, index: usize) -> f64 {
+        self.work[index]
     }
 
     pub(crate) fn partition(&self, index: usize) -> u32 {
@@ -983,6 +1000,13 @@ impl WorkCohorts {
 
     pub(crate) const fn deadline_max_micros(&self) -> u64 {
         self.deadline_max_micros
+    }
+
+    pub(crate) fn is_valid_at(&self, window_start_micros: u64) -> bool {
+        (0..self.len()).all(|index| {
+            self.deadline_micros(index) >= self.release_micros(index)
+                || self.release_micros(index) <= window_start_micros
+        })
     }
 }
 

@@ -1178,7 +1178,7 @@ fn normalize(probabilities: &mut [f64]) -> Result<(), LeadTimePriorError> {
         return Err(LeadTimePriorError::InvalidProbability);
     }
     let total = probabilities.iter().sum::<f64>();
-    if !total.is_finite() || total <= f64::EPSILON {
+    if !total.is_finite() || total == 0.0_f64 {
         return Err(LeadTimePriorError::EmptyMass);
     }
     for probability in probabilities {

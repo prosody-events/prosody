@@ -432,7 +432,7 @@ fn select_snapshots(panel: &PosteriorPanel) -> SnapshotSelection<'_> {
     let start = important_index * width;
     let end = start + width;
     let important = &panel.heatmap.probabilities[start..end];
-    let important_title = if maximum_change <= f64::EPSILON {
+    let important_title = if maximum_change == 0.0_f64 {
         "no posterior update".to_owned()
     } else {
         format!(

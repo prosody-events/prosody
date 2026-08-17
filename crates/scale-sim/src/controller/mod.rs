@@ -2956,7 +2956,7 @@ fn point_predictive_throughput_cdf(
 
 #[cfg(test)]
 fn poisson_cdf(mean: f64, completed_attempts: u64) -> Result<f64, PlantError> {
-    if mean <= f64::EPSILON {
+    if mean == 0.0_f64 {
         return Ok(1.0_f64);
     }
     Ok(Poisson::new(mean)?.cdf(completed_attempts))

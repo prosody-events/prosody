@@ -129,9 +129,9 @@ fn empty_feasible_set_selects_the_smallest_miss_fraction(
 #[test]
 fn billing_replica_seconds_integrates_pod_lifetime_changes() {
     let targets = [2, 4];
-    let pod_lifetime_seconds = [3.0_f64, 7.0_f64];
+    let pod_lifetime_micros = [3_000_000_u64, 7_000_000_u64];
 
-    let area = billing_replica_seconds(1.0_f64, 11.0_f64, 1, &targets, &pod_lifetime_seconds);
+    let area = billing_replica_seconds(1_000_000, 11_000_000, 1, &targets, &pod_lifetime_micros);
 
     assert!(area.total_cmp(&26.0_f64).is_eq(), "area={area}");
 }
