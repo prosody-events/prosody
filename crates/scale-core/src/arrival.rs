@@ -260,11 +260,11 @@ impl ArrivalPrior {
 }
 
 /// One consumable count and exposure update.
-#[derive(Debug, Eq, PartialEq)]
+#[must_use = "pass arrival evidence to the controller"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArrivalEvidence {
     count: u32,
     exposure_micros: u64,
-    token: EvidenceToken,
 }
 
 impl ArrivalEvidence {
@@ -272,7 +272,6 @@ impl ArrivalEvidence {
         Self {
             count,
             exposure_micros,
-            token: EvidenceToken,
         }
     }
 }
@@ -374,11 +373,9 @@ impl ArrivalFactor {
         let ArrivalEvidence {
             count,
             exposure_micros,
-            token,
         } = evidence;
         let exposure = Duration::from_micros(exposure_micros).as_secs_f64();
         if exposure <= f64::EPSILON {
-            drop(token);
             return;
         }
         let evidence_start = now_micros.saturating_sub(exposure_micros);
@@ -400,7 +397,6 @@ impl ArrivalFactor {
         self.transition(exposure, Some(count));
         self.prepare_calendar(calendar, now_micros);
         self.last_evidence_micros = now_micros;
-        drop(token);
     }
 
     fn transition(&mut self, duration: f64, count: Option<u32>) {
@@ -1199,13 +1195,6 @@ pub enum ArrivalPredictiveError {
     /// A validated predictive distribution could not be constructed.
     #[error("arrival predictive distribution is invalid")]
     InvalidDistribution,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct EvidenceToken;
-
-impl Drop for EvidenceToken {
-    fn drop(&mut self) {}
 }
 
 #[cfg(test)]

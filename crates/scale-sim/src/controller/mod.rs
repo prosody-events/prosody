@@ -1876,8 +1876,8 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         )?;
         self.prepare_arrival_evidence(context, reporter)?;
         self.push_backlog_cohorts(context)?;
-        self.prepare_attempt_outcomes(context)?;
         self.prepare_capacity_evidence(context)?;
+        self.prepare_attempt_outcomes(context)?;
         self.prepare_transition_evidence(context)?;
         Ok(())
     }

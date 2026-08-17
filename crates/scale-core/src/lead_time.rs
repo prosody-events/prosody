@@ -14,6 +14,16 @@ const DEFAULT_LAUNCH_ARTIFACT: PriorArtifactIdentity =
     PriorArtifactIdentity::new(0x4c41_554e_4348, 1, 0x4c41_554e_4348_0001);
 const DEFAULT_REBALANCE_ARTIFACT: PriorArtifactIdentity =
     PriorArtifactIdentity::new(0x5245_4241_4c41, 1, 0x5245_4241_4c41_0001);
+/// Launch behavior gets one prior redraw per 24 hours in expectation.
+///
+/// No representative change corpus exists. One day lets a long-lived instance
+/// recover from a changed image, node pool, or scheduler configuration.
+const LAUNCH_CHANGE_RATE_PER_SECOND: f64 = 1.0_f64 / (24.0_f64 * 60.0_f64 * 60.0_f64);
+/// Rebalance behavior gets one prior redraw per 24 hours in expectation.
+///
+/// No representative change corpus exists. One day lets a long-lived instance
+/// recover from a changed broker, client, or group configuration.
+const REBALANCE_CHANGE_RATE_PER_SECOND: f64 = 1.0_f64 / (24.0_f64 * 60.0_f64 * 60.0_f64);
 
 /// Direction of one replica transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,13 +152,13 @@ impl ReadinessLump {
 ///
 /// One update can contain only the groups observed since the prior update.
 /// Its pod count can therefore be less than the requested replica change.
+#[must_use = "pass launch evidence to the controller"]
 #[derive(Debug)]
 pub struct LaunchEvidence<'a> {
     requested_at: ModelTime,
     requested_delta: u32,
     observed_at: ModelTime,
     lumps: &'a [ReadinessLump],
-    token: EvidenceToken,
 }
 
 impl<'a> LaunchEvidence<'a> {
@@ -163,7 +173,6 @@ impl<'a> LaunchEvidence<'a> {
             requested_delta,
             observed_at,
             lumps,
-            token: EvidenceToken,
         }
     }
 
@@ -173,9 +182,7 @@ impl<'a> LaunchEvidence<'a> {
             requested_delta,
             observed_at,
             lumps,
-            token,
         } = self;
-        drop(token);
         LaunchEvidenceValues {
             requested_at,
             requested_delta,
@@ -186,10 +193,10 @@ impl<'a> LaunchEvidence<'a> {
 }
 
 /// One consumable rebalance-pause interval.
+#[must_use = "pass rebalance evidence to the controller"]
 #[derive(Debug)]
 pub struct RebalanceEvidence {
     observation: ReadinessObservation,
-    token: EvidenceToken,
 }
 
 impl RebalanceEvidence {
@@ -204,7 +211,6 @@ impl RebalanceEvidence {
     ) -> Result<Self, LaunchEvidenceError> {
         Ok(Self {
             observation: ReadinessObservation::ready(after, at_or_before)?,
-            token: EvidenceToken,
         })
     }
 
@@ -216,14 +222,19 @@ impl RebalanceEvidence {
     pub fn pending(after: ModelTime, through: ModelTime) -> Result<Self, LaunchEvidenceError> {
         Ok(Self {
             observation: ReadinessObservation::pending(after, through)?,
-            token: EvidenceToken,
         })
     }
 
     fn consume(self) -> ReadinessObservation {
-        let Self { observation, token } = self;
-        drop(token);
-        observation
+        self.observation
+    }
+
+    pub(crate) const fn bounds(&self) -> (ModelTime, ModelTime) {
+        self.observation.bounds()
+    }
+
+    pub(crate) const fn observation(&self) -> ReadinessObservation {
+        self.observation
     }
 }
 
@@ -369,7 +380,7 @@ impl LaunchPrior {
                 .iter()
                 .all(|value| value.is_finite() && *value >= 0.0_f64)
             || !change_rate_per_second.is_finite()
-            || change_rate_per_second < 0.0_f64
+            || change_rate_per_second <= 0.0_f64
         {
             return Err(LeadTimePriorError::InvalidAxis);
         }
@@ -402,8 +413,12 @@ impl LaunchPrior {
 
     /// Returns the supported Kubernetes launch artifact.
     ///
-    /// The fast support includes cached starts and cold pulls. The slow
-    /// support includes optimized nodes, cold images, and capacity retries.
+    /// No representative launch corpus exists. The intercept weights assign
+    /// half the mass to an even fast and slow mixture. They split the rest
+    /// equally between 10% and 90% slow mixtures. The slope weights assign 70%
+    /// to no replica-count effect and 30% to moderate growth. Each duration
+    /// axis assigns 60% to its center and 20% to each adjacent scale. The
+    /// change rate expects one environment change per 24 hours.
     ///
     /// # Errors
     ///
@@ -420,10 +435,11 @@ impl LaunchPrior {
             DurationCell::new(360.0_f64, 0.3_f64)?,
         ];
         let coverage = [
-            PriorCoverageRecord::new(0.5_f64, 120.0_f64, 1.0e-18_f64, 1.5e-8_f64, 1.0e-5_f64),
-            PriorCoverageRecord::new(15.0_f64, 1_800.0_f64, 2.0e-6_f64, 5.0e-7_f64, 1.0e-5_f64),
+            duration_coverage(&fast, 0.5_f64, 120.0_f64),
+            duration_coverage(&slow, 15.0_f64, 1_800.0_f64),
         ];
         let budget = PriorArtifactBudget::new(64, 2_048, 4_096, 1.0e-4_f64, 0.001_f64, 1.0e-4_f64);
+        // Logits of 10%, 50%, and 90% slow-mixture probability.
         let intercepts = [
             -2.197_224_577_336_219_6_f64,
             0.0_f64,
@@ -451,7 +467,7 @@ impl LaunchPrior {
             &coverage,
             LaunchPriorGrid::new(&intercepts, &slopes, &fast, &slow),
             &probabilities,
-            0.0_f64,
+            LAUNCH_CHANGE_RATE_PER_SECOND,
         )
     }
 
@@ -519,7 +535,7 @@ impl RebalancePrior {
     ) -> Result<Self, LeadTimePriorError> {
         if cells.is_empty()
             || !change_rate_per_second.is_finite()
-            || change_rate_per_second < 0.0_f64
+            || change_rate_per_second <= 0.0_f64
         {
             return Err(LeadTimePriorError::InvalidAxis);
         }
@@ -542,7 +558,11 @@ impl RebalancePrior {
 
     /// Returns the supported KIP-848 pause artifact.
     ///
-    /// The support includes normal handoffs and the 45-second crash path.
+    /// No representative KIP-848 pause corpus exists. The first two cells
+    /// share half the mass for normal handoffs. The one-second cell gets 20%.
+    /// The 10-second and 45-second disruption cells get 10% and 15%. The
+    /// 120-second tail gets 5%. The change rate expects one environment change
+    /// per 24 hours.
     ///
     /// # Errors
     ///
@@ -556,20 +576,14 @@ impl RebalancePrior {
             DurationCell::new(45.0_f64, 0.3_f64)?,
             DurationCell::new(120.0_f64, 0.3_f64)?,
         ];
-        let coverage = [PriorCoverageRecord::new(
-            0.005_f64,
-            600.0_f64,
-            1.0e-14_f64,
-            4.0e-8_f64,
-            1.0e-5_f64,
-        )];
+        let coverage = [duration_coverage(&cells, 0.005_f64, 600.0_f64)];
         Self::new(
             DEFAULT_REBALANCE_ARTIFACT,
             PriorArtifactBudget::new(8, 512, 512, 1.0e-4_f64, 0.001_f64, 1.0e-4_f64),
             &coverage,
             &cells,
             &[0.25_f64, 0.25_f64, 0.2_f64, 0.1_f64, 0.15_f64, 0.05_f64],
-            0.0_f64,
+            REBALANCE_CHANGE_RATE_PER_SECOND,
         )
     }
 }
@@ -605,8 +619,22 @@ impl LaunchTimeFactor {
         }
     }
 
-    pub(crate) fn update(&mut self, simd_level: Level, evidence: LaunchEvidence<'_>) {
+    /// Applies evidence at its interval start, then advances across the
+    /// interval.
+    pub(crate) fn update(
+        &mut self,
+        simd_level: Level,
+        evidence: LaunchEvidence<'_>,
+        elapsed: Duration,
+    ) {
         let evidence = evidence.consume();
+        let exposure = Duration::from_micros(
+            evidence
+                .observed_at
+                .as_micros()
+                .saturating_sub(evidence.requested_at.as_micros()),
+        );
+        self.transition(elapsed.saturating_sub(exposure));
         self.last_replica_delta = evidence.requested_delta;
         self.likelihoods.fill(0.0_f64);
         for lump in evidence.lumps {
@@ -623,6 +651,7 @@ impl LaunchTimeFactor {
             "validated launch evidence must not precede its request"
         );
         apply_log_likelihood(simd_level, &mut self.weights, &mut self.likelihoods);
+        self.transition(exposure);
     }
 
     pub(crate) fn expected_seconds(
@@ -920,14 +949,25 @@ impl RebalanceTimeFactor {
         }
     }
 
-    pub(crate) fn update(&mut self, simd_level: Level, evidence: RebalanceEvidence) {
+    /// Applies evidence at its interval start, then advances across the
+    /// interval.
+    pub(crate) fn update(
+        &mut self,
+        simd_level: Level,
+        evidence: RebalanceEvidence,
+        elapsed: Duration,
+    ) {
         let observation = evidence.consume();
+        let (after, through) = observation.bounds();
+        let exposure = Duration::from_micros(through.as_micros().saturating_sub(after.as_micros()));
+        self.transition(elapsed.saturating_sub(exposure));
         for (likelihood, cell) in self.likelihoods.iter_mut().zip(&self.prior.cells) {
-            *likelihood = observation_probability(*cell, observation, ModelTime::from_micros(0))
+            *likelihood = observation_probability(*cell, observation, after)
                 .max(f64::MIN_POSITIVE)
                 .ln();
         }
         apply_log_likelihood(simd_level, &mut self.weights, &mut self.likelihoods);
+        self.transition(exposure);
     }
 
     pub(crate) fn expected_seconds(&self) -> f64 {
@@ -1017,6 +1057,11 @@ impl RebalanceTimeFactor {
         probabilities.copy_from_slice(&self.weights);
         true
     }
+
+    #[cfg(test)]
+    pub(crate) fn posterior_weights(&self) -> &[f64] {
+        &self.weights
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1032,13 +1077,6 @@ struct MixtureComponents {
     slow_probability: f64,
     fast: DurationCell,
     slow: DurationCell,
-}
-
-#[derive(Debug)]
-struct EvidenceToken;
-
-impl Drop for EvidenceToken {
-    fn drop(&mut self) {}
 }
 
 fn checked_product(lengths: &[usize]) -> Result<usize, LeadTimePriorError> {
@@ -1090,6 +1128,28 @@ fn validate_duration_support(
         return Err(LeadTimePriorError::CoverageBudget);
     }
     Ok(())
+}
+
+fn duration_coverage(
+    cells: &[DurationCell],
+    lower_endpoint: f64,
+    upper_endpoint: f64,
+) -> PriorCoverageRecord {
+    let lower_tail = cells
+        .iter()
+        .map(|cell| log_normal_cdf(*cell, lower_endpoint))
+        .fold(0.0_f64, f64::max);
+    let upper_tail = cells
+        .iter()
+        .map(|cell| 1.0_f64 - log_normal_cdf(*cell, upper_endpoint))
+        .fold(0.0_f64, f64::max);
+    PriorCoverageRecord::new(
+        lower_endpoint,
+        upper_endpoint,
+        lower_tail,
+        upper_tail,
+        lower_tail + upper_tail,
+    )
 }
 
 fn duration_boundary_mass(cell: DurationCell, coverage: PriorCoverageRecord) -> f64 {
@@ -1397,6 +1457,9 @@ pub enum LaunchEvidenceError {
     /// A launch update repeats a stable group identity.
     #[error("readiness group identities must be unique in one launch update")]
     DuplicateGroup,
+    /// A readiness interval does not start at its consumed cursor.
+    #[error("a readiness interval must start at its prior consumed bound")]
+    NoncontiguousInterval,
 }
 
 /// Invalid launch or rebalance prior artifact.

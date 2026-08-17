@@ -3,8 +3,8 @@ use std::{num::NonZeroU32, time::Duration};
 use thiserror::Error;
 
 use crate::{
-    ArrivalEvidence, ArrivalPrior, LaunchEvidence, LaunchEvidenceError, ReadinessLump,
-    RebalanceEvidence, ResourceWindow, TransitionDirection,
+    ArrivalEvidence, ArrivalPrior, LaunchEvidence, LaunchEvidenceError, ReadinessGroupId,
+    ReadinessLump, ReadinessObservation, RebalanceEvidence, ResourceWindow, TransitionDirection,
 };
 
 pub(crate) const POSTERIOR_SAMPLES_PER_CAPACITY_CLASS_MIN: u32 = 2;
@@ -733,9 +733,20 @@ impl AttemptOutcomeCounts {
             terminal,
         }
     }
+
+    fn total(self) -> Option<u32> {
+        self.success
+            .checked_add(self.permanent)
+            .and_then(|count| count.checked_add(self.transient))
+            .and_then(|count| count.checked_add(self.terminal))
+    }
 }
 
-/// Attempt outcomes for both demand classes in one observation window.
+/// Attempt outcomes for both demand classes in one resource window.
+///
+/// The sum across both classes equals the completed-attempt count in the
+/// resource window. This identity lets capacity and reliability condition on
+/// the same physical attempts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttemptOutcomeEvidence {
     pub(crate) normal: AttemptOutcomeCounts,
@@ -1399,6 +1410,10 @@ struct OccupancyTraceHeader {
 }
 
 /// Reusable owner for one [`GroupObservation`] view.
+///
+/// Each open readiness group owns one cursor. A pending interval advances its
+/// cursor, and a ready interval removes it. The configured lump limit bounds
+/// all cursor storage. The rebalance cursor follows the same rule.
 #[derive(Debug)]
 pub struct ObservationBuffer {
     partition_count: u32,
@@ -1424,7 +1439,9 @@ pub struct ObservationBuffer {
     attempt_outcomes: Option<AttemptOutcomeEvidence>,
     launch_header: Option<LaunchEvidenceHeader>,
     readiness_lumps: Vec<ReadinessLump>,
+    readiness_cursors: Vec<(ReadinessGroupId, ModelTime)>,
     rebalance: Option<RebalanceEvidence>,
+    rebalance_cursor: Option<ModelTime>,
     current_replicas: Option<u32>,
     actuation_commitments: ActuationCommitments,
     model_time: ModelTime,
@@ -1493,7 +1510,9 @@ impl ObservationBuffer {
             attempt_outcomes: None,
             launch_header: None,
             readiness_lumps: Vec::with_capacity(readiness_lump_count_max),
+            readiness_cursors: Vec::with_capacity(readiness_lump_count_max),
             rebalance: None,
+            rebalance_cursor: None,
             current_replicas: None,
             actuation_commitments: ActuationCommitments::new(replica_count_max),
             model_time: ModelTime::from_micros(0),
@@ -1834,6 +1853,17 @@ impl ObservationBuffer {
         if self.attempt_outcomes.is_some() {
             return Err(ObservationError::AttemptOutcomePending);
         }
+        let Some(resource) = self.resource_trace else {
+            return Err(ObservationError::AttemptOutcomeResourceWindow);
+        };
+        let outcome_count = evidence
+            .normal
+            .total()
+            .and_then(|count| evidence.failure.total()?.checked_add(count))
+            .ok_or(ObservationError::CountOverflow)?;
+        if outcome_count != resource.window.completed_attempts() {
+            return Err(ObservationError::AttemptOutcomeCount);
+        }
         self.attempt_outcomes = Some(evidence);
         Ok(())
     }
@@ -1874,6 +1904,14 @@ impl ObservationBuffer {
             {
                 return Err(LaunchEvidenceError::DuplicateGroup.into());
             }
+            if self
+                .readiness_cursors
+                .iter()
+                .find(|(group, _)| *group == lump.group())
+                .is_some_and(|(_, cursor)| *cursor != lower)
+            {
+                return Err(LaunchEvidenceError::NoncontiguousInterval.into());
+            }
             pod_count = pod_count
                 .checked_add(lump.pod_count())
                 .ok_or(ObservationError::CountOverflow)?;
@@ -1881,6 +1919,7 @@ impl ObservationBuffer {
         if pod_count > requested_delta {
             return Err(LaunchEvidenceError::PodCountExceedsDelta.into());
         }
+        self.advance_readiness_cursors(lumps)?;
         self.readiness_lumps.clear();
         self.readiness_lumps.extend_from_slice(lumps);
         self.launch_header = Some(LaunchEvidenceHeader {
@@ -1888,6 +1927,68 @@ impl ObservationBuffer {
             requested_delta,
             observed_at,
         });
+        Ok(())
+    }
+
+    fn advance_readiness_cursors(
+        &mut self,
+        lumps: &[ReadinessLump],
+    ) -> Result<(), ObservationError> {
+        let completed_open_count = lumps
+            .iter()
+            .filter(|lump| {
+                matches!(lump.observation(), ReadinessObservation::Ready { .. })
+                    && self
+                        .readiness_cursors
+                        .iter()
+                        .any(|(group, _)| *group == lump.group())
+            })
+            .count();
+        let new_pending_count = lumps
+            .iter()
+            .filter(|lump| {
+                matches!(lump.observation(), ReadinessObservation::Pending { .. })
+                    && !self
+                        .readiness_cursors
+                        .iter()
+                        .any(|(group, _)| *group == lump.group())
+            })
+            .count();
+        if self.readiness_cursors.len() - completed_open_count + new_pending_count
+            > self.readiness_lump_count_max
+        {
+            return Err(ObservationError::ReadinessLumpCapacity);
+        }
+        for lump in lumps
+            .iter()
+            .filter(|lump| matches!(lump.observation(), ReadinessObservation::Ready { .. }))
+        {
+            if let Some(position) = self
+                .readiness_cursors
+                .iter()
+                .position(|(group, _)| *group == lump.group())
+            {
+                self.readiness_cursors.swap_remove(position);
+            }
+        }
+        for lump in lumps
+            .iter()
+            .filter(|lump| matches!(lump.observation(), ReadinessObservation::Pending { .. }))
+        {
+            let (_, upper) = lump.observation().bounds();
+            let position = self
+                .readiness_cursors
+                .iter()
+                .position(|(group, _)| *group == lump.group());
+            match position {
+                Some(position) => {
+                    self.readiness_cursors[position].1 = upper;
+                }
+                None => {
+                    self.readiness_cursors.push((lump.group(), upper));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1903,6 +2004,14 @@ impl ObservationBuffer {
         if self.rebalance.is_some() {
             return Err(ObservationError::RebalanceEvidencePending);
         }
+        let (after, through) = evidence.bounds();
+        if self.rebalance_cursor.is_some_and(|cursor| cursor != after) {
+            return Err(LaunchEvidenceError::NoncontiguousInterval.into());
+        }
+        self.rebalance_cursor = match evidence.observation() {
+            ReadinessObservation::Pending { .. } => Some(through),
+            ReadinessObservation::Ready { .. } => None,
+        };
         self.rebalance = Some(evidence);
         Ok(())
     }
@@ -2227,6 +2336,12 @@ pub enum ObservationError {
     /// Attempt outcome evidence was not consumed.
     #[error("consume the pending attempt outcomes before replacement")]
     AttemptOutcomePending,
+    /// Attempt outcomes do not have a pending resource window.
+    #[error("set the resource window before its attempt outcomes")]
+    AttemptOutcomeResourceWindow,
+    /// Attempt outcomes disagree with the resource completion count.
+    #[error("attempt outcomes must equal the resource completion count")]
+    AttemptOutcomeCount,
     /// A partition and class backlog observation was not consumed.
     #[error("backlog evidence is already pending for this partition and class")]
     BacklogPending,

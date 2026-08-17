@@ -16,9 +16,10 @@ use crate::edf::{
     ArrivalPath, EdfOutcome, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
     evaluate_prepared_step, evaluate_prepared_trajectory, prepare, required_capacity_prepared,
 };
-use crate::lead_time::LaunchTimeFactor;
+use crate::lead_time::{LaunchTimeFactor, RebalanceTimeFactor};
 use crate::partition::PartitionFactor;
 use crate::planning::terminal_replica_seconds;
+use crate::reliability::ReliabilityFactor;
 use crate::types::{WorkCohorts, occupancy_trace_for_test};
 use crate::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
@@ -600,6 +601,42 @@ fn launch_evidence_accepts_incremental_groups_and_rejects_duplicate_groups() -> 
             crate::LaunchEvidenceError::DuplicateGroup
         ))
     ));
+
+    let first_pending = ReadinessLump::new(
+        ReadinessGroupId(3),
+        1,
+        ReadinessObservation::pending(requested_at, ModelTime::from_micros(2_000_000))?,
+    )?;
+    observation.set_launch_evidence(requested_at, 3, observed_at, &[first_pending])?;
+    assert!(observation.observation().launch.is_some());
+    let repeated = ReadinessLump::new(
+        ReadinessGroupId(3),
+        1,
+        ReadinessObservation::pending(requested_at, observed_at)?,
+    )?;
+    assert_eq!(
+        observation.set_launch_evidence(requested_at, 3, observed_at, &[repeated]),
+        Err(ObservationError::LaunchEvidence(
+            crate::LaunchEvidenceError::NoncontiguousInterval
+        ))
+    );
+    Ok(())
+}
+
+#[test]
+fn rebalance_evidence_rejects_a_repeated_pending_interval() -> Result<(), TestError> {
+    let configuration = configuration()?;
+    let mut observation = ObservationBuffer::new(&configuration)?;
+    let start = ModelTime::from_micros(1_000_000);
+    let end = ModelTime::from_micros(2_000_000);
+    observation.set_rebalance_evidence(RebalanceEvidence::pending(start, end)?)?;
+    assert!(observation.observation().rebalance.is_some());
+    assert_eq!(
+        observation.set_rebalance_evidence(RebalanceEvidence::pending(start, end)?),
+        Err(ObservationError::LaunchEvidence(
+            crate::LaunchEvidenceError::NoncontiguousInterval
+        ))
+    );
     Ok(())
 }
 
@@ -621,6 +658,7 @@ fn bimodal_launch_evidence_concentrates_without_a_compromise_cell() -> Result<()
                 ModelTime::from_micros(60_050_000),
                 &witness.lumps,
             ),
+            Duration::from_millis(60_050),
         );
         update_launch_oracle(
             &mut witness.oracle,
@@ -729,7 +767,7 @@ fn mixture_witness() -> Result<MixtureWitness, TestError> {
         ],
         LaunchPriorGrid::new(&intercepts, &[0.0_f64], &fast_cells, &slow_cells),
         &[1.0_f64; 12],
-        0.0_f64,
+        f64::MIN_POSITIVE,
     )?;
     Ok(MixtureWitness {
         factor: LaunchTimeFactor::new(&prior),
@@ -874,7 +912,17 @@ fn rebalance_evidence_updates_each_observed_phase() -> Result<(), TestError> {
     state.write_posterior(pause_query, &mut values, &mut pause_after)?;
 
     assert!(lead_after[0] > lead_before[0]);
-    assert!(pause_after[value_count - 1] > pause_before[value_count - 1]);
+    let pause_mean_before = values
+        .iter()
+        .zip(&pause_before)
+        .map(|(value, probability)| value * probability)
+        .sum::<f64>();
+    let pause_mean_after = values
+        .iter()
+        .zip(&pause_after)
+        .map(|(value, probability)| value * probability)
+        .sum::<f64>();
+    assert!((pause_mean_after - 1.0_f64).abs() < (pause_mean_before - 1.0_f64).abs());
     Ok(())
 }
 
@@ -914,6 +962,13 @@ fn resource_window_is_consumed_once() -> Result<(), TestError> {
         replacement,
         Err(ObservationError::ResourceWindowPending)
     ));
+    assert_eq!(
+        observation.set_attempt_outcomes(AttemptOutcomeEvidence::new(
+            AttemptOutcomeCounts::new(79, 0, 0, 0),
+            AttemptOutcomeCounts::default(),
+        )),
+        Err(ObservationError::AttemptOutcomeCount)
+    );
 
     let consumed = observation.observation();
     assert!(consumed.resource.is_some());
@@ -1322,6 +1377,7 @@ fn actuation_transition_is_cadence_invariant() -> Result<(), TestError> {
             ModelTime::from_micros(30_000_000),
             &lumps,
         ),
+        Duration::from_secs(30),
     );
     fine.update(
         Level::new(),
@@ -1331,6 +1387,7 @@ fn actuation_transition_is_cadence_invariant() -> Result<(), TestError> {
             ModelTime::from_micros(30_000_000),
             &lumps,
         ),
+        Duration::from_secs(30),
     );
 
     coarse.transition(Duration::from_secs(1));
@@ -1358,6 +1415,96 @@ fn actuation_transition_is_cadence_invariant() -> Result<(), TestError> {
             .iter()
             .zip(fine_probability)
             .all(|(left, right)| (left - right).abs() < 1.0e-12_f64)
+    );
+    Ok(())
+}
+
+#[test]
+fn launch_update_owns_the_missed_tick_boundary() -> Result<(), TestError> {
+    let prior = LaunchPrior::kubernetes()?;
+    let mut owned = LaunchTimeFactor::new(&prior);
+    let mut explicit = LaunchTimeFactor::new(&prior);
+    let seed_start = ModelTime::from_micros(0);
+    let seed_end = ModelTime::from_micros(1_000_000);
+    let seed_lumps = [ReadinessLump::new(
+        ReadinessGroupId(1),
+        1,
+        ReadinessObservation::ready(seed_start, seed_end)?,
+    )?];
+    owned.update(
+        Level::new(),
+        crate::LaunchEvidence::new(seed_start, 1, seed_end, &seed_lumps),
+        Duration::from_secs(1),
+    );
+    explicit.update(
+        Level::new(),
+        crate::LaunchEvidence::new(seed_start, 1, seed_end, &seed_lumps),
+        Duration::from_secs(1),
+    );
+    let requested_at = ModelTime::from_micros(10_000_000);
+    let observed_at = ModelTime::from_micros(20_000_000);
+    let lumps = [ReadinessLump::new(
+        ReadinessGroupId(2),
+        1,
+        ReadinessObservation::ready(requested_at, observed_at)?,
+    )?];
+    owned.update(
+        Level::new(),
+        crate::LaunchEvidence::new(requested_at, 1, observed_at, &lumps),
+        Duration::from_secs(20),
+    );
+    explicit.transition(Duration::from_secs(10));
+    explicit.update(
+        Level::new(),
+        crate::LaunchEvidence::new(requested_at, 1, observed_at, &lumps),
+        Duration::from_secs(10),
+    );
+    assert!(
+        owned
+            .posterior_weights()
+            .iter()
+            .zip(explicit.posterior_weights())
+            .all(|(left, right)| left.to_ne_bytes() == right.to_ne_bytes())
+    );
+    Ok(())
+}
+
+#[test]
+fn rebalance_update_owns_the_missed_tick_boundary() -> Result<(), TestError> {
+    let prior = RebalancePrior::kip848()?;
+    let mut owned = RebalanceTimeFactor::new(&prior);
+    let mut explicit = RebalanceTimeFactor::new(&prior);
+    let seed_start = ModelTime::from_micros(0);
+    let seed_end = ModelTime::from_micros(1_000_000);
+    owned.update(
+        Level::new(),
+        RebalanceEvidence::completed(seed_start, seed_end)?,
+        Duration::from_secs(1),
+    );
+    explicit.update(
+        Level::new(),
+        RebalanceEvidence::completed(seed_start, seed_end)?,
+        Duration::from_secs(1),
+    );
+    let start = ModelTime::from_micros(10_000_000);
+    let end = ModelTime::from_micros(20_000_000);
+    owned.update(
+        Level::new(),
+        RebalanceEvidence::completed(start, end)?,
+        Duration::from_secs(20),
+    );
+    explicit.transition(Duration::from_secs(10));
+    explicit.update(
+        Level::new(),
+        RebalanceEvidence::completed(start, end)?,
+        Duration::from_secs(10),
+    );
+    assert!(
+        owned
+            .posterior_weights()
+            .iter()
+            .zip(explicit.posterior_weights())
+            .all(|(left, right)| left.to_ne_bytes() == right.to_ne_bytes())
     );
     Ok(())
 }
@@ -1444,6 +1591,13 @@ fn attempt_outcomes_update_only_their_retry_factors() -> Result<(), TestError> {
     let mut state = ScaleState::new(configuration.clone(), grid()?)?;
     let mut scratch = state.new_scratch()?;
     let mut observation = ObservationBuffer::new(&configuration)?;
+    let transitions = constant_occupancy_transitions(120, 1_000_000);
+    observation.set_resource_observation(
+        ResourceWindow::new_with_starts(8.0_f64, 1.0_f64, 120, 120)?,
+        8,
+        8,
+        &transitions,
+    )?;
     observation.set_attempt_outcomes(AttemptOutcomeEvidence::new(
         AttemptOutcomeCounts::new(80, 10, 10, 0),
         AttemptOutcomeCounts::new(10, 5, 0, 5),
@@ -1661,10 +1815,6 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
         partition: 0,
         demand_class: DemandClass::Normal,
     })?;
-    observation.set_attempt_outcomes(AttemptOutcomeEvidence::new(
-        AttemptOutcomeCounts::new(1_000_000, 0, 0, 0),
-        AttemptOutcomeCounts::new(1_000_000, 0, 0, 0),
-    ))?;
     observation.set_arrivals(0, u64::MAX)?;
     observation.advance_model_time(ModelTime::from_micros(1))?;
 
@@ -1672,9 +1822,41 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
     let ScaleDecision::Apply(apply) = decision else {
         return Err(TestError::UnexpectedHold);
     };
-    let missed_at_low_knee = 75.0_f64 - 50.0_f64;
-    let low_knee_late_area = missed_at_low_knee * missed_at_low_knee / (2.0_f64 * 50.0_f64);
-    let exact_loss = 0.25_f64 * low_knee_late_area / 75.0_f64;
+    // The authored Beta(1, 9) priors supply one paired retry draw per scenario.
+    let reliability = ReliabilityFactor::new(ReliabilityPrior::authored()?);
+    // The flat capacity prior gives these one-slot supplies and exact masses.
+    let capacity_classes = [
+        (50.0_f64, 0.25_f64),
+        (100.0_f64, 0.25_f64),
+        (1_000.0_f64, 0.5_f64),
+    ];
+    let class_count =
+        u32::try_from(capacity_classes.len()).map_err(|_| ConfigurationError::PlatformLimit)?;
+    // Integer class allocation uses 341 paired draws per capacity class.
+    let inner_count = configuration.posterior_sample_count / class_count;
+    let exact_loss = (0_u32..)
+        .zip(capacity_classes)
+        .map(|(class, (attempt_supply, capacity_mass))| {
+            let first_sample = class * inner_count;
+            let class_loss = (first_sample..first_sample + inner_count)
+                .map(|sample| {
+                    let mut random = decision_random(1, sample, DecisionRandomDomain::Reliability);
+                    let (normal_retry, failure_retry) =
+                        reliability.sample_retry_probabilities(&mut random);
+                    let failure_sequence_attempts = (1.0_f64 - failure_retry).recip();
+                    let failure_attempts = normal_retry * failure_sequence_attempts;
+                    let aggregate_supply = attempt_supply / (1.0_f64 + failure_attempts);
+                    let failure_limited_supply =
+                        attempt_supply * configuration.failure_service_weight / failure_attempts;
+                    let event_supply = aggregate_supply.min(failure_limited_supply);
+                    // Constant supply creates a triangular queue after the deadline.
+                    let delayed_work = (75.0_f64 - event_supply).max(0.0_f64);
+                    delayed_work * delayed_work / (2.0_f64 * event_supply * 75.0_f64)
+                })
+                .sum::<f64>();
+            capacity_mass * class_loss / f64::from(inner_count)
+        })
+        .sum::<f64>();
 
     assert!(
         (apply.diagnostics.miss_delay_fraction - exact_loss).abs() < 1.0e-5_f64,
@@ -2123,7 +2305,7 @@ fn incomplete_actuation_uses_the_conditional_remaining_time() -> Result<(), Test
         &coverage,
         LaunchPriorGrid::new(&[0.0_f64], &[0.0_f64], &cells, &cells),
         &[1.0_f64],
-        0.0_f64,
+        f64::MIN_POSITIVE,
     )?;
     let factor = LaunchTimeFactor::new(&prior);
     let elapsed_seconds = 20.0_f64;
@@ -2313,10 +2495,48 @@ fn model_priors_carry_validated_artifacts() -> Result<(), TestError> {
     let reliability = ReliabilityPrior::authored()?;
     assert_eq!(reliability.artifact().version(), 1);
     assert_eq!(reliability.coverage().len(), 2);
+    assert_eq!(reliability.budget().hypothesis_count_max(), 128);
+    assert_eq!(reliability.budget().storage_bytes_max(), 2_048);
     assert!(reliability.coverage().iter().all(|record| {
         record.tail_probability() <= reliability.budget().boundary_probability_max()
             && record.decision_cost_error() <= reliability.budget().decision_cost_error_max()
     }));
+    Ok(())
+}
+
+#[test]
+fn lead_time_priors_reject_stationary_change_rates() -> Result<(), TestError> {
+    let cell = [DurationCell::new(1.0_f64, 0.3_f64)?];
+    let coverage = [PriorCoverageRecord::new(
+        0.001_f64,
+        1_000.0_f64,
+        0.0_f64,
+        0.0_f64,
+        0.0_f64,
+    )];
+    let budget = PriorArtifactBudget::new(1, 64, 64, 0.01_f64, 1.0_f64, 0.01_f64);
+    assert_eq!(
+        LaunchPrior::new(
+            PriorArtifactIdentity::new(1, 1, 1),
+            budget,
+            &[coverage[0], coverage[0]],
+            LaunchPriorGrid::new(&[0.0_f64], &[0.0_f64], &cell, &cell),
+            &[1.0_f64],
+            0.0_f64,
+        ),
+        Err(crate::LeadTimePriorError::InvalidAxis)
+    );
+    assert_eq!(
+        RebalancePrior::new(
+            PriorArtifactIdentity::new(1, 1, 1),
+            budget,
+            &coverage,
+            &cell,
+            &[1.0_f64],
+            0.0_f64,
+        ),
+        Err(crate::LeadTimePriorError::InvalidAxis)
+    );
     Ok(())
 }
 

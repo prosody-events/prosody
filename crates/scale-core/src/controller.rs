@@ -1161,8 +1161,6 @@ pub fn step(
             .saturating_sub(state.model_time.as_micros()),
     );
     state.model_time = model_time;
-    state.lead_time.transition(elapsed);
-    state.rebalance_time.transition(elapsed);
     if let Some(evidence) = resource {
         state.capacity.update(evidence, elapsed);
     } else {
@@ -1184,10 +1182,16 @@ pub fn step(
         state.partition_placement.update(evidence.consume());
     }
     if let Some(evidence) = launch {
-        state.lead_time.update(state.simd_level, evidence);
+        state.lead_time.update(state.simd_level, evidence, elapsed);
+    } else {
+        state.lead_time.transition(elapsed);
     }
     if let Some(evidence) = rebalance {
-        state.rebalance_time.update(state.simd_level, evidence);
+        state
+            .rebalance_time
+            .update(state.simd_level, evidence, elapsed);
+    } else {
+        state.rebalance_time.transition(elapsed);
     }
     if let Some(replicas) = current_replicas {
         state.current_replicas = replicas;
