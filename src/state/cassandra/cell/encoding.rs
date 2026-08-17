@@ -62,10 +62,10 @@ impl ZstdContexts {
 #[repr(i16)]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(in crate::state::cassandra) enum Encoding {
-    /// Raw codec bytes compressed with Zstd.
-    Zstd = 4,
     /// Raw codec bytes without application compression.
     Raw = 1,
+    /// Raw codec bytes compressed with Zstd.
+    Zstd = 4,
 }
 
 impl From<Encoding> for i16 {
