@@ -4,12 +4,13 @@ use std::time::Duration;
 
 use prosody_scale_core::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
-    CapacityClockCheck, CapacityGrid, Cohort, CompletionPosteriorCell, Configuration,
-    ConfigurationError, DecisionDiagnostics, DecisionRejection, DemandClass, HoldReason,
-    LaunchComponentSummary, ModelTime, ObservationBuffer, OccupancyTransition, PosteriorQuery,
-    RandomStream, ReadinessGroupId, ReadinessLump, ReadinessObservation, RebalanceEvidence,
-    ResourceWindow, ScaleDecision, ScaleScratch, ScaleState, TransitionDirection, step,
+    CapacityClockCheck, CapacityGrid, Cohort, Configuration, ConfigurationError,
+    DecisionDiagnostics, DecisionRejection, DemandClass, HoldReason, LaunchComponentSummary,
+    ModelTime, ObservationBuffer, OccupancyTransition, PosteriorQuery, RandomStream,
+    ReadinessGroupId, ReadinessLump, ReadinessObservation, RebalanceEvidence, ResourceWindow,
+    ScaleDecision, ScaleScratch, ScaleState, TransitionDirection, step,
 };
+#[cfg(test)]
 use statrs::distribution::{DiscreteCDF, Poisson};
 use thiserror::Error;
 
@@ -1450,7 +1451,6 @@ pub struct ClosedLoop<Workload> {
     budget_micros: u64,
     latest_capacity_window: Option<CapacityWindow>,
     capacity_evidence_sample: CapacityEvidenceSample,
-    completion_posterior_scratch: Vec<CompletionPosteriorCell>,
     capacity_transition_scratch: Vec<OccupancyTransition>,
     inflight_transitions: Vec<PendingTransition>,
     ready_transitions: Vec<PendingTransition>,
@@ -1706,8 +1706,6 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         let budget_micros = core_configuration.objective.budget_micros();
         let state = ScaleState::new(core_configuration.clone(), capacity_grid.clone())?;
         let trace = ControllerTrace::new(trace_count_max, &state)?;
-        let throughput_posterior_count = usize::try_from(state.throughput_posterior_value_count())
-            .map_err(|_| ConfigurationError::PlatformLimit)?;
         let partition_posterior_count = trace.partition_share_posterior.values.len();
         let transition_capacity =
             usize::try_from(trace_count_max).map_err(|_| ConfigurationError::PlatformLimit)?;
@@ -1740,10 +1738,6 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             budget_micros,
             latest_capacity_window: None,
             capacity_evidence_sample: CapacityEvidenceSample::None,
-            completion_posterior_scratch: vec![
-                CompletionPosteriorCell::default();
-                throughput_posterior_count
-            ],
             capacity_transition_scratch: Vec::with_capacity(capacity_transition_count),
             inflight_transitions: Vec::with_capacity(transition_capacity),
             ready_transitions: Vec::with_capacity(transition_capacity),
@@ -2659,21 +2653,28 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                     .latest_capacity_window
                     .ok_or(PlantError::MetricCapacity)?
                     .evidence()?;
-                self.state.write_completion_posterior(
-                    &evidence,
-                    &mut self.completion_posterior_scratch,
-                )?;
-                let quantiles = posterior_predictive_completion_quantiles(
-                    &self.completion_posterior_scratch,
-                    window.exposure_seconds,
-                )?;
-                let observed = u64::from(window.completed_attempts);
-                let upper =
-                    predictive_completion_cdf(&self.completion_posterior_scratch, observed)?;
+                let mut quantiles = [0.0_f64; 3];
+                let upper_count = self.configuration.core().resource_window_attempt_count_max;
+                for (index, threshold) in [0.1_f64, 0.5_f64, 0.9_f64].into_iter().enumerate() {
+                    let mut low = 0_u32;
+                    let mut high = upper_count;
+                    while low < high {
+                        let middle = low + (high - low) / 2;
+                        if self.state.completion_predictive_cdf(&evidence, middle) >= threshold {
+                            high = middle;
+                        } else {
+                            low = middle + 1;
+                        }
+                    }
+                    quantiles[index] = f64::from(low) / window.exposure_seconds;
+                }
+                let observed = window.completed_attempts;
+                let upper = self.state.completion_predictive_cdf(&evidence, observed);
                 let lower = if observed == 0 {
                     0.0_f64
                 } else {
-                    predictive_completion_cdf(&self.completion_posterior_scratch, observed - 1)?
+                    self.state
+                        .completion_predictive_cdf(&evidence, observed - 1)
                 };
                 Ok(CapacityPrediction {
                     quantiles,
@@ -2862,44 +2863,6 @@ fn count_f64(value: u64) -> f64 {
     f64::from(high) * 4_294_967_296.0_f64 + f64::from(low)
 }
 
-fn posterior_predictive_completion_quantiles(
-    cells: &[CompletionPosteriorCell],
-    exposure_seconds: f64,
-) -> Result<[f64; 3], PlantError> {
-    let maximum_mean = cells.iter().map(|cell| cell.mean).fold(0.0_f64, f64::max);
-    let upper = (maximum_mean + 12.0_f64 * maximum_mean.sqrt() + 64.0_f64)
-        .ceil()
-        .clamp(1.0_f64, f64::from(u32::MAX)) as u64;
-    let mut quantiles = [0.0_f64; 3];
-    let thresholds = [0.1_f64, 0.5_f64, 0.9_f64];
-    for (index, threshold) in thresholds.into_iter().enumerate() {
-        let mut low = 0_u64;
-        let mut high = upper;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if predictive_completion_cdf(cells, middle)? >= threshold {
-                high = middle;
-            } else {
-                low = middle + 1;
-            }
-        }
-        let count = u32::try_from(low).map_err(|_| PlantError::PlatformLimit)?;
-        quantiles[index] = f64::from(count) / exposure_seconds;
-    }
-    Ok(quantiles)
-}
-
-fn predictive_completion_cdf(
-    cells: &[CompletionPosteriorCell],
-    completed_attempts: u64,
-) -> Result<f64, PlantError> {
-    let mut cumulative = 0.0_f64;
-    for cell in cells {
-        cumulative += cell.probability * poisson_cdf(cell.mean, completed_attempts)?;
-    }
-    Ok(cumulative)
-}
-
 #[cfg(test)]
 fn posterior_predictive_throughput_quantiles(
     cells: &[ThroughputPosteriorCell],
@@ -2991,6 +2954,7 @@ fn point_predictive_throughput_cdf(
     Ok(cumulative)
 }
 
+#[cfg(test)]
 fn poisson_cdf(mean: f64, completed_attempts: u64) -> Result<f64, PlantError> {
     if mean <= f64::EPSILON {
         return Ok(1.0_f64);

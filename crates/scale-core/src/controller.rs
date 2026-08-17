@@ -6,7 +6,7 @@ use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use crate::TransitionDirection;
 use crate::arrival::{ArrivalBoundaryDiagnostic, ArrivalFactor, ArrivalPrior};
 use crate::capacity::{
-    CapacityClockCheck, CapacityFactor, CompletionPosteriorCell, ThroughputPosteriorCell,
+    CapacityClockCheck, CapacityFactor, ThroughputPosteriorCell, curve_throughput,
 };
 use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
@@ -299,19 +299,17 @@ impl ScaleState {
         self.capacity.write_throughput_posterior(concurrency, cells)
     }
 
-    /// Writes the completion predictive with the likelihood's shared mean.
+    /// Evaluates the completion predictive CDF at one completed-attempt count.
     ///
-    /// The predictive uses the current posterior before the window update.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the buffer has the wrong fixed length.
-    pub fn write_completion_posterior(
+    /// The predictive uses the prior report's occupancy. It uses the current
+    /// report's certified start schedule.
+    pub fn completion_predictive_cdf(
         &mut self,
         window: &ResourceWindow,
-        cells: &mut [CompletionPosteriorCell],
-    ) -> Result<(), PosteriorError> {
-        self.capacity.write_completion_posterior(window, cells)
+        completed_attempts: u32,
+    ) -> f64 {
+        self.capacity
+            .completion_predictive_cdf(window, completed_attempts)
     }
 
     /// Writes the marginal capacity posterior into caller-owned buffers.
@@ -1370,12 +1368,13 @@ fn evaluate_one_scenario(
     let sample = scenario as u32;
     let representative = state.capacity_classes.representative(capacity_class);
     let (curve, _) = state.capacity.curve_and_probability(representative);
-    CapacityFactor::fill_throughput(
-        state.simd_level,
+    // ScaleScratch::new gives both buffers one replica-count element per action.
+    dispatch!(state.simd_level, simd => curve_throughput(
+        simd,
         curve,
         shared.candidate_concurrency,
         &mut workspace.posterior_resource_supply,
-    );
+    ));
     let mut reliability_random = decision_random(
         state.decision_index,
         sample,

@@ -1665,15 +1665,23 @@ fn capacity_grid(
     let service_times_seconds: &[f64] = if capacity_regime || historical_regime {
         &[0.025_f64, 0.05_f64, 0.1_f64, 0.2_f64]
     } else {
+        // Every step stays within the capacity model's two-octave cell
+        // bound. The nine original anchors remain grid points.
         &[
             0.000_5_f64,
             0.001_f64,
             0.002_f64,
+            0.005_f64,
             0.01_f64,
+            0.03_f64,
             0.1_f64,
+            0.3_f64,
             1.0_f64,
+            3.0_f64,
             10.0_f64,
+            25.0_f64,
             60.0_f64,
+            240.0_f64,
             600.0_f64,
         ]
     };

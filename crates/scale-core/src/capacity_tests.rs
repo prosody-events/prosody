@@ -6,8 +6,10 @@ use thiserror::Error;
 
 use super::{
     CapacityGrid, CapacityGridError, CapacityModelError, CompletionScratch, DeathBand, ErrorLedger,
-    PATH_SOLVER_PROBABILITY_ERROR_MAX, ResourceWindow, ResourceWindowError, RetainedHistory,
-    StartWindow, binomial_log_probability, capacity_model_artifact, completion_expectation,
+    HAZARD_COVERAGE_INDEX, HAZARD_TRANSITION_PROBABILITY_ERROR_MAX, OBSERVATION_COVERAGE_INDEX,
+    OBSERVATION_PROBABILITY_ERROR_MAX, PATH_SOLVER_PROBABILITY_ERROR_MAX, ResourceWindow,
+    ResourceWindowError, RetainedHistory, SOLVER_COVERAGE_INDEX, StartWindow,
+    binomial_log_probability, capacity_model_artifact, completion_expectation,
     completion_log_likelihood, completion_marginal_probability, contamination_prior,
     feasibility_probability, feasibility_probability_and_charge, fold_trace, hazard_prior,
     log_contamination_mixture, log_normal_axis_masses, log_weighted_sum, path_log_score,
@@ -341,7 +343,7 @@ fn coverage_ring_matches_unbounded_history() -> Result<(), TestError> {
 
 #[test]
 fn contamination_cells_preserve_the_authored_beta_mass() -> Result<(), TestError> {
-    let artifact = capacity_model_artifact(1.0_f64 / 300.0_f64, 4.0_f64, 4)?;
+    let artifact = capacity_model_artifact(1.0_f64 / 300.0_f64, 4.0_f64)?;
     let (probabilities, weights) = contamination_prior(&artifact)?;
     assert_eq!(probabilities.len(), weights.len());
     assert!(probabilities.windows(2).all(|pair| pair[0] < pair[1]));
@@ -403,25 +405,47 @@ fn an_identifiable_persistent_run_beats_contamination_redraws() -> Result<(), Te
 
 #[test]
 fn hazard_cells_cover_the_declared_gamma_tails() -> Result<(), TestError> {
-    let artifact = capacity_model_artifact(1.0_f64 / 300.0_f64, 4.0_f64, 4)?;
+    let artifact = capacity_model_artifact(1.0_f64 / 300.0_f64, 4.0_f64)?;
     assert_eq!(artifact.identity.version(), 2);
-    assert!(artifact.coverage[1].tail_probability() <= artifact.budget.boundary_probability_max());
+    assert!(
+        artifact.coverage[HAZARD_COVERAGE_INDEX].tail_probability()
+            <= artifact.budget.boundary_probability_max()
+    );
+    assert_eq!(
+        artifact.coverage[OBSERVATION_COVERAGE_INDEX]
+            .decision_cost_error()
+            .to_bits(),
+        OBSERVATION_PROBABILITY_ERROR_MAX.to_bits()
+    );
+    assert_eq!(
+        artifact.coverage[HAZARD_COVERAGE_INDEX]
+            .decision_cost_error()
+            .to_bits(),
+        HAZARD_TRANSITION_PROBABILITY_ERROR_MAX.to_bits()
+    );
+    assert_eq!(
+        artifact.coverage[SOLVER_COVERAGE_INDEX]
+            .decision_cost_error()
+            .to_bits(),
+        PATH_SOLVER_PROBABILITY_ERROR_MAX.to_bits()
+    );
     let (rates, weights) = hazard_prior(&artifact)?;
     assert!(rates.windows(2).all(|pair| pair[0] < pair[1]));
     assert!((weights.iter().sum::<f64>() - 1.0_f64).abs() <= 16.0_f64 * f64::EPSILON);
     assert!(matches!(
-        capacity_model_artifact(0.0_f64, 4.0_f64, 4),
+        capacity_model_artifact(0.0_f64, 4.0_f64),
         Err(CapacityModelError::InvalidHazardPrior)
     ));
     Ok(())
 }
 
 #[test]
-fn log_normal_endpoint_cells_hold_both_tail_masses() {
-    let masses = log_normal_axis_masses(&[1.0_f64, 2.0_f64, 4.0_f64], 2.0_f64, 1.0_f64);
+fn log_normal_endpoint_cells_truncate_both_tail_masses() -> Result<(), TestError> {
+    let masses = log_normal_axis_masses(&[1.0_f64, 2.0_f64, 4.0_f64], 2.0_f64, 1.0_f64)?;
     assert!((masses.iter().sum::<f64>() - 1.0_f64).abs() <= 16.0_f64 * f64::EPSILON);
-    assert!(masses[0] > masses[1]);
     assert!((masses[0] - masses[2]).abs() <= 16.0_f64 * f64::EPSILON);
+    assert!(masses[1] > masses[0]);
+    Ok(())
 }
 
 #[test]
@@ -437,15 +461,15 @@ fn observation_contract_sizes_history_from_coverage() -> Result<(), TestError> {
     )?;
     assert_eq!(factor.start_history.len(), 3);
     let collapse_grid = CapacityGrid::new(&[600.0_f64], &[0.01_f64], &[2.0_f64])?;
-    let clamped = super::CapacityFactor::new_with_prior(
+    let result = super::CapacityFactor::new_with_prior(
         collapse_grid,
         1.0_f64 / 300.0_f64,
         &ArrivalPrior::test_artifact()?,
         4_096.0_f64,
         1.0_f64,
         8,
-    )?;
-    assert_eq!(clamped.start_history.len(), super::START_HISTORY_SLOT_MAX);
+    );
+    assert!(matches!(result, Err(CapacityModelError::StorageBound)));
     Ok(())
 }
 
@@ -1234,6 +1258,93 @@ fn time_rescaled_residuals_reject_tied_deterministic_completions() -> Result<(),
     }
     assert!(factor.markov_clock_rejected());
     Ok(())
+}
+
+#[test]
+fn residual_ring_retains_the_latest_contract_window() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &ArrivalPrior::test_artifact()?,
+        1.0_f64,
+        1.0_f64,
+        3,
+    )?;
+    for residual in [0.1_f64, 0.2_f64, 0.3_f64, 0.4_f64] {
+        factor.record_residual(residual);
+    }
+    assert_eq!(factor.residual_sample_count, 3);
+    assert!(!factor.residuals.contains(&0.1_f64));
+    assert!(factor.residuals.contains(&0.2_f64));
+    assert!(factor.residuals.contains(&0.3_f64));
+    assert!(factor.residuals.contains(&0.4_f64));
+    Ok(())
+}
+
+#[test]
+fn curve_axis_rejects_more_than_two_octaves_per_cell() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[1.0_f64, 16.0_f64], &[100.0_f64], &[0.0_f64])?;
+    let result = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &ArrivalPrior::test_artifact()?,
+        1.0_f64,
+        1.0_f64,
+        3,
+    );
+    assert!(matches!(result, Err(CapacityModelError::GridCoverage)));
+    Ok(())
+}
+
+#[test]
+fn residual_cdf_mixes_each_curve_before_the_clock_check() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(&[0.5_f64, 2.0_f64], &[100.0_f64], &[0.0_f64])?;
+    let mut factor = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &ArrivalPrior::test_artifact()?,
+        1.0_f64,
+        1.0_f64,
+        8,
+    )?;
+    factor.weights.fill(0.0_f64);
+    factor.weights[0] = 0.25_f64;
+    factor.weights[1] = 0.75_f64;
+    factor.residual_integrated_hazards.fill(0.0_f64);
+    factor.residual_integrated_hazards[0] = 0.5_f64;
+    factor.residual_integrated_hazards[1] = 2.0_f64;
+    let expected =
+        0.25_f64 * (1.0_f64 - (-0.5_f64).exp()) + 0.75_f64 * (1.0_f64 - (-2.0_f64).exp());
+    assert!((factor.predictive_residual() - expected).abs() <= 8.0_f64 * f64::EPSILON);
+    Ok(())
+}
+
+#[quickcheck]
+fn completion_predictive_cdf_is_monotone(count: u8) -> bool {
+    let Ok(grid) = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64]) else {
+        return false;
+    };
+    let Ok(prior) = ArrivalPrior::test_artifact() else {
+        return false;
+    };
+    let Ok(mut factor) = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &prior,
+        2.0_f64,
+        1.0_f64,
+        255,
+    ) else {
+        return false;
+    };
+    factor.previous_window_concurrency = Some(1.0_f64);
+    let Ok(window) = ResourceWindow::new_with_starts(1.0_f64, 1.0_f64, 0, 1) else {
+        return false;
+    };
+    let lower = factor.completion_predictive_cdf(&window, u32::from(count));
+    let upper = factor.completion_predictive_cdf(&window, u32::from(count) + 1);
+    (0.0_f64..=1.0_f64).contains(&lower) && lower <= upper && upper <= 1.0_f64
 }
 
 fn deleted_poisson_log_kernel(count: f64, mean: f64) -> f64 {

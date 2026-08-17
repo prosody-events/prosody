@@ -7,7 +7,7 @@ use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
 use crate::arrival::{ArrivalEvidence, ArrivalFactor, ArrivalPrior};
-use crate::capacity::CapacityFactor;
+use crate::capacity::{CapacityFactor, log_normal_axis_masses};
 use crate::change_point::ChangePointKernel;
 use crate::controller::{
     DecisionRandomDomain, decision_random, minimal_moved_partitions, mixed_event_supply,
@@ -24,11 +24,11 @@ use crate::{
     ActuationCommitment, AttemptOutcomeCounts, AttemptOutcomeEvidence, BacklogCohort,
     CapacityCurve, CapacityGrid, CapacityPrior, Cohort, Configuration, ConfigurationError,
     DemandClass, DurationCell, HoldReason, LaunchPrior, LaunchPriorGrid, ModelTime,
-    ObservationBuffer, ObservationError, OccupancyTransition, PosteriorQuery, PriorArtifactBudget,
-    PriorArtifactIdentity, PriorCoverageRecord, RandomStream, ReadinessGroupId, ReadinessLump,
-    ReadinessObservation, RebalanceEvidence, RebalancePrior, ReliabilityPrior, ResourceWindow,
-    ScaleDecision, ScaleState, ServiceObjective, ThroughputPosteriorCell, TransitionDirection,
-    step,
+    ObservationBuffer, ObservationError, OccupancyTransition, PosteriorError, PosteriorQuery,
+    PriorArtifactBudget, PriorArtifactIdentity, PriorCoverageRecord, RandomStream,
+    ReadinessGroupId, ReadinessLump, ReadinessObservation, RebalanceEvidence, RebalancePrior,
+    ReliabilityPrior, ResourceWindow, ScaleDecision, ScaleState, ServiceObjective,
+    ThroughputPosteriorCell, TransitionDirection, step,
 };
 
 const NO_FUTURE_ARRIVALS: ArrivalPath<'static> = ArrivalPath {
@@ -1239,7 +1239,7 @@ fn capacity_quantiles_preserve_posterior_order() -> Result<(), TestError> {
 fn capacity_prior_is_proper_and_stationary() -> Result<(), TestError> {
     let grid = CapacityGrid::new(
         &[0.01_f64],
-        &[1.0_f64, 10.0_f64, 100.0_f64],
+        &[1.0_f64, 4.0_f64, 16.0_f64],
         &[0.0_f64, 1.0_f64],
     )?;
     let mut factor = capacity_factor(grid, 1.0_f64)?;
@@ -1250,7 +1250,7 @@ fn capacity_prior_is_proper_and_stationary() -> Result<(), TestError> {
     assert!(
         values
             .iter()
-            .zip([1.0_f64, 10.0_f64, 100.0_f64])
+            .zip([1.0_f64, 4.0_f64, 16.0_f64])
             .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
     );
     assert!(close_relative(prior[0], 0.25_f64));
@@ -1273,8 +1273,8 @@ fn capacity_prior_is_proper_and_stationary() -> Result<(), TestError> {
 #[test]
 fn capacity_transition_is_cadence_invariant() -> Result<(), TestError> {
     let grid = CapacityGrid::new(
-        &[0.01_f64, 0.1_f64],
-        &[100.0_f64, 1_000.0_f64],
+        &[0.01_f64, 0.04_f64],
+        &[100.0_f64, 400.0_f64],
         &[0.0_f64, 1.0_f64],
     )?;
     let cell_count = grid.cell_count() as usize;
@@ -1469,30 +1469,9 @@ fn mixed_demand_supply_respects_work_conservation_and_failure_share() {
 
 #[test]
 fn narrower_log_capacity_prior_concentrates_more_mass_at_its_median() -> Result<(), TestError> {
-    let service_times = [0.025_f64, 0.05_f64, 0.1_f64, 0.2_f64];
     let capacities = [80.0_f64, 160.0_f64, 320.0_f64, 640.0_f64];
-    let narrow = CapacityGrid::new_with_prior(
-        &service_times,
-        &capacities,
-        &[0.0_f64, 0.5_f64, 1.0_f64],
-        CapacityPrior::LogNormal {
-            service_time_median_seconds: 0.1_f64,
-            capacity_median_per_second: 320.0_f64,
-            log_standard_deviation: 2.0_f64.ln(),
-        },
-    )?;
-    let wide = CapacityGrid::new_with_prior(
-        &service_times,
-        &capacities,
-        &[0.0_f64, 0.5_f64, 1.0_f64],
-        CapacityPrior::LogNormal {
-            service_time_median_seconds: 0.1_f64,
-            capacity_median_per_second: 320.0_f64,
-            log_standard_deviation: 8.0_f64.ln(),
-        },
-    )?;
-    let narrow = capacity_prior(narrow)?;
-    let wide = capacity_prior(wide)?;
+    let narrow = log_normal_axis_masses(&capacities, 320.0_f64, 2.0_f64.ln())?;
+    let wide = log_normal_axis_masses(&capacities, 320.0_f64, 8.0_f64.ln())?;
 
     assert!(
         narrow[2] > wide[2],
@@ -2282,7 +2261,7 @@ fn steady_plateau_selects_the_cost_minimum() -> Result<(), TestError> {
 /// keeps its collapse for inference. See
 /// [`CapacityCurve::sustainable_throughput`].
 #[test]
-fn sustainable_supply_never_falls_with_more_slots() {
+fn sustainable_supply_never_falls_with_more_slots() -> Result<(), PosteriorError> {
     let curve = CapacityCurve::Knee {
         service_time_seconds: 0.1_f64,
         capacity_per_second: 300.0_f64,
@@ -2290,11 +2269,12 @@ fn sustainable_supply_never_falls_with_more_slots() {
     };
     let concurrency = [16.0_f64, 32.0_f64, 64.0_f64, 256.0_f64];
     let mut supply = [0.0_f64; 4];
-    CapacityFactor::fill_throughput(Level::new(), curve, &concurrency, &mut supply);
+    CapacityFactor::fill_throughput(Level::new(), curve, &concurrency, &mut supply)?;
 
     assert!(supply.windows(2).all(|pair| pair[0] <= pair[1]));
     assert!(close_relative(supply[3], 300.0_f64));
     assert!(curve.throughput(256.0_f64) < 300.0_f64);
+    Ok(())
 }
 
 fn cohort_fraction(count: usize) -> f64 {
@@ -2469,7 +2449,7 @@ enum TestError {
     #[error(transparent)]
     CapacityModel(#[from] crate::CapacityModelError),
     #[error(transparent)]
-    Posterior(#[from] crate::PosteriorError),
+    Posterior(#[from] PosteriorError),
     #[error(transparent)]
     Configuration(#[from] ConfigurationError),
     #[error(transparent)]
