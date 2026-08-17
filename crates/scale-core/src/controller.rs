@@ -18,6 +18,7 @@ use crate::planning::{
     ActionColumns, billing_replica_seconds, complete_horizon_micros,
     next_report_boundary_at_or_after, select_action, select_runner_up, terminal_replica_seconds,
 };
+use crate::random::count_as_f64;
 use crate::reliability::{RELIABILITY_BIN_COUNT, ReliabilityFactor};
 use crate::types::{
     ActuationCommitments, BacklogColumns, CalendarForecast, CohortColumns, EventCohorts,
@@ -32,8 +33,6 @@ use crate::{
 use thiserror::Error;
 
 const DECISION_SCENARIO_SEED: u64 = 0x7363_616c_652d_636f;
-/// Schedule visibility covers the worst launch delay, rebalance, report,
-/// objective budget, and slack. A posterior lead-time quantile can replace it.
 /// Scheduled work has no known partition. Resource feasibility prices it.
 /// Partition placement excludes this sentinel before it indexes columns.
 const SCHEDULED_PARTITION: u32 = u32::MAX;
@@ -171,7 +170,6 @@ pub struct ScaleState {
     lead_time: LaunchTimeFactor,
     rebalance_time: RebalanceTimeFactor,
     current_replicas: u32,
-    standing_target: u32,
 }
 
 impl ScaleState {
@@ -225,7 +223,6 @@ impl ScaleState {
             lead_time,
             rebalance_time,
             current_replicas: 1,
-            standing_target: 0,
         })
     }
 
@@ -605,8 +602,6 @@ pub struct DecisionColumnSummary {
     pub runner_up: Option<DecisionActionColumns>,
     /// Paired standard error of the runner-up cost minus selected cost.
     pub paired_standard_error: Option<f64>,
-    /// Smallest action index that covers known demand.
-    pub demand_floor: u32,
 }
 
 /// One worker's private buffers for evaluating whole scenarios.
@@ -935,9 +930,7 @@ impl ScaleScratch {
             arrival_path_cell_count,
             ..
         } = &bounds;
-        let candidate_concurrency = (1..=configuration.replica_count_max)
-            .map(|replicas| f64::from(replicas) * f64::from(configuration.slots_per_replica))
-            .collect::<Vec<_>>();
+        let candidate_concurrency = vec![0.0_f64; replica_count_max];
         let moved_partition_counts = moved_partition_count_matrix(
             configuration.partition_count,
             configuration.replica_count_max,
@@ -1012,16 +1005,12 @@ impl ScaleScratch {
             runner_up: runner_up_index.map(|index| self.action_columns(index, columns.rate)),
             paired_standard_error: runner_up_index
                 .map(|runner_up| self.paired_standard_error(selected, runner_up, columns.rate)),
-            demand_floor: 0,
         })
     }
 
     fn paired_standard_error(&self, selected: usize, runner_up: usize, rate: f64) -> f64 {
-        if self.active_inner_count < 2 {
-            return f64::NAN;
-        }
         let stride = self.posterior_miss_delay_fraction_sums.len();
-        let count = u32::try_from(self.active_inner_count).map_or(f64::INFINITY, f64::from);
+        let count = count_as_f64(self.active_inner_count as u64);
         let mut variance = 0.0_f64;
         for class in 0..self.class_masses.len() {
             let first = class * self.active_inner_count;
@@ -1094,8 +1083,6 @@ impl ScaleScratch {
         Ok(())
     }
 
-    /// # Errors
-    ///
     /// Writes the probability of one rejection reason for each candidate.
     ///
     /// A scenario can contain more than one reason. These probabilities do
@@ -1204,7 +1191,7 @@ pub fn step(
     }
 
     state.decision_index = state.decision_index.wrapping_add(1);
-    let decision = select_target(
+    select_target(
         state,
         scratch,
         cohorts,
@@ -1212,11 +1199,7 @@ pub fn step(
         scheduled_releases,
         calendar,
         actuation_commitments,
-    );
-    if let ScaleDecision::Apply(apply) = &decision {
-        state.standing_target = apply.target;
-    }
-    decision
+    )
 }
 
 fn select_target(
@@ -1230,7 +1213,7 @@ fn select_target(
 ) -> ScaleDecision {
     let (normal_events, failure_events) = demand_class_totals(cohorts, backlog);
     prepare_work_cohorts(state, scratch, cohorts, backlog, scheduled_releases);
-    prepare_partition_work(state, scratch);
+    prepare_partition_work(scratch);
     prepare_candidate_concurrency(state, scratch);
     scratch.posterior_missed_work_sums.fill(0.0_f64);
     scratch.posterior_miss_delay_fraction_sums.fill(0.0_f64);
@@ -1550,7 +1533,7 @@ fn finalize_scenario_columns(state: &ScaleState, scratch: &mut ScaleScratch) {
 fn expected_event_count(scratch: &ScaleScratch) -> f64 {
     (0..scratch.active_scenario_count)
         .map(|scenario| {
-            let count = u32::try_from(scratch.active_inner_count).map_or(f64::INFINITY, f64::from);
+            let count = count_as_f64(scratch.active_inner_count as u64);
             scratch.class_masses[scenario / scratch.active_inner_count] / count
                 * scratch.scenario_event_count[scenario]
         })
@@ -2504,7 +2487,7 @@ fn prepare_work_cohorts(
     }
 }
 
-fn prepare_partition_work(_state: &ScaleState, scratch: &mut ScaleScratch) {
+fn prepare_partition_work(scratch: &mut ScaleScratch) {
     let cohorts = &scratch.resource_cohorts;
     scratch.partition_offsets.fill(0);
     for cohort in 0..cohorts.len() {
@@ -2731,7 +2714,9 @@ fn diagnostics(
             + state.rebalance_time.expected_seconds(),
         lead_time_seconds: selected_lead_time,
         handler_seconds: state.capacity.expected_service_time(state.simd_level),
-        maximum_partition_share: state.partition_placement.maximum_expected_share(),
+        posterior_mean_count_argmax_partition_share: state
+            .partition_placement
+            .posterior_mean_count_argmax_share(),
         expected_cost,
         miss_delay_fraction,
     }

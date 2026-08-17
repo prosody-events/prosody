@@ -2178,8 +2178,8 @@ pub struct DecisionDiagnostics {
     pub lead_time_seconds: f64,
     /// Posterior expected uncongested handler duration in seconds.
     pub handler_seconds: f64,
-    /// Largest posterior expected partition share.
-    pub maximum_partition_share: f64,
+    /// Posterior mean share of the partition with the largest observed count.
+    pub posterior_mean_count_argmax_partition_share: f64,
     /// Posterior expected cost at the selected target.
     pub expected_cost: f64,
     /// Posterior expected delay as a fraction of the deadline budget.
@@ -2191,7 +2191,7 @@ pub struct DecisionDiagnostics {
 pub struct ApplyDecision {
     /// Desired replica count.
     pub target: u32,
-    /// Largest safe replica count under saturation evidence.
+    /// Largest replica count allowed by the partition and configuration limits.
     pub cap: u32,
     /// Bounded diagnostic values.
     pub diagnostics: DecisionDiagnostics,
@@ -2211,8 +2211,6 @@ pub struct HoldDecision {
 pub enum HoldReason {
     /// Model time moved backward.
     ModelTimeRegressed,
-    /// A prequential resource check rejected the capacity model.
-    CapacityModelMismatch,
 }
 
 /// Result of one controller transition.

@@ -471,7 +471,6 @@ fn assert_sample_fields(sample: &ControllerSample) {
     assert!(sample.selected_late_area_mean.is_finite());
     assert!(sample.selected_replica_seconds_mean.is_finite());
     assert!(sample.selected_cost.is_finite());
-    assert!(sample.demand_floor <= sample.cap);
     assert!(sample.lead_time_fast_seconds.is_finite());
     assert!(sample.lead_time_slow_seconds.is_finite());
     assert!((0.0_f64..=1.0_f64).contains(&sample.lead_time_slow_probability));

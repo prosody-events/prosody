@@ -81,8 +81,6 @@ pub struct ControllerSample {
     pub runner_up_replica_seconds_mean: f64,
     /// Runner-up action expected-cost sum.
     pub runner_up_cost: f64,
-    /// Zero-based demand-floor action index.
-    pub demand_floor: u32,
     /// Posterior expected arrival rate.
     pub arrival_rate_per_second: f64,
     /// Arrival evidence accepted at this controller tick.
@@ -310,7 +308,6 @@ pub struct ControllerTrace {
     runner_up_late_area_mean: Vec<f64>,
     runner_up_replica_seconds_mean: Vec<f64>,
     runner_up_cost: Vec<f64>,
-    demand_floor: Vec<u32>,
     arrival_rate_per_second: Vec<f64>,
     arrival_evidence: Vec<bool>,
     arrival_evidence_count: Vec<u32>,
@@ -660,7 +657,6 @@ impl ControllerTrace {
             runner_up_late_area_mean: Vec::with_capacity(capacity),
             runner_up_replica_seconds_mean: Vec::with_capacity(capacity),
             runner_up_cost: Vec::with_capacity(capacity),
-            demand_floor: Vec::with_capacity(capacity),
             arrival_rate_per_second: Vec::with_capacity(capacity),
             arrival_evidence: Vec::with_capacity(capacity),
             arrival_evidence_count: Vec::with_capacity(capacity),
@@ -773,7 +769,6 @@ impl ControllerTrace {
             runner_up_late_area_mean: self.runner_up_late_area_mean[index],
             runner_up_replica_seconds_mean: self.runner_up_replica_seconds_mean[index],
             runner_up_cost: self.runner_up_cost[index],
-            demand_floor: self.demand_floor[index],
             arrival_rate_per_second: self.arrival_rate_per_second[index],
             arrival_evidence: self.arrival_evidence_sample(index),
             arrival_predictive_low_count: self.arrival_predictive_low_count[index],
@@ -1280,8 +1275,6 @@ impl ControllerTrace {
             .push(runner_up.map_or(f64::NAN, |action| action.replica_seconds_mean));
         self.runner_up_cost
             .push(runner_up.map_or(f64::NAN, |action| action.cost));
-        self.demand_floor
-            .push(summary.map_or(u32::MAX, |summary| summary.demand_floor));
     }
 
     fn push_decision_curves(&mut self, scratch: &ScaleScratch) -> Result<(), PlantError> {
@@ -2459,7 +2452,6 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             runner_up_late_area_mean: f64::NAN,
             runner_up_replica_seconds_mean: f64::NAN,
             runner_up_cost: f64::NAN,
-            demand_floor: u32::MAX,
             arrival_rate_per_second: diagnostics.arrival_rate_per_second,
             arrival_evidence: self.arrival_evidence_sample,
             arrival_predictive_low_count: arrival.quantiles[0],

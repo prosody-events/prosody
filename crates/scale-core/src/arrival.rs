@@ -6,7 +6,6 @@ use statrs::distribution::{ContinuousCDF, DiscreteCDF, Gamma, NegativeBinomial, 
 use statrs::function::gamma::{gamma_lr, gamma_ur, ln_gamma};
 use thiserror::Error;
 
-use crate::change_point::ChangePointKernel;
 use crate::random::{PoissonMean, count_as_f64, sample_gamma, sample_poisson};
 use crate::types::{CalendarColumns, CalendarForecast, prior_artifact_contract_holds};
 use crate::{
@@ -17,7 +16,8 @@ use crate::{
 const RESET_COUNT: usize = 3;
 const MODEL_VERSION: u32 = 1;
 const ARRIVAL_ARTIFACT_SOURCE: u64 = 0x0041_5252_4956_414c;
-const T_MAX_SECONDS: f64 = 604_800.0_f64;
+const T_MAX_SECONDS_U32: u32 = 7 * 24 * 60 * 60;
+const T_MAX_SECONDS: f64 = T_MAX_SECONDS_U32 as f64;
 const EPSILON_GRID: f64 = 0.02_f64;
 const EPSILON_BOUNDARY: f64 = 1.0e-6_f64;
 // The exponential is the maximum-entropy hazard prior for the authored mean.
@@ -27,7 +27,11 @@ const HAZARD_TRANSITION_PROBABILITY_ERROR_MAX: f64 = 1.0_f64 / 8.0_f64;
 const EPSILON_PATH: f64 = 1.0e-9_f64;
 // One scaling target can use at most 16 MiB for its arrival filter.
 const STORAGE_BUDGET_BYTES: usize = 16 * 1_024 * 1_024;
-const CALENDAR_SEGMENT_LIMIT: usize = 1_024;
+// The path buffer holds one calendar segment per ten minutes for seven days.
+// Finer forecasts remain valid when their total count fits this capacity.
+const CALENDAR_SEGMENT_SECONDS_MIN: u64 = 600;
+const CALENDAR_SEGMENT_LIMIT: usize =
+    (T_MAX_SECONDS_U32 as u64 / CALENDAR_SEGMENT_SECONDS_MIN) as usize;
 const PATH_SEGMENT_LIMIT: usize = 262_144;
 const ARRIVAL_COUNT_DOMAIN: u64 = 0x6172_7269_7661_6c73;
 
@@ -67,6 +71,11 @@ struct GridSpec {
     low: f64,
     log_step: f64,
     count: usize,
+}
+
+struct ArrivalGrids {
+    hazards: Box<[f64]>,
+    rates: Box<[f64]>,
 }
 
 /// A validated finite-state arrival model.
@@ -137,12 +146,13 @@ impl ArrivalPrior {
             });
         }
 
-        let hazard_center = ChangePointKernel::new(change_rate_per_second).rate_per_second();
-        let hazards = geometric_grid(hazard.low, hazard.log_step, hazard.count);
+        let hazard_center = change_rate_per_second;
+        let grids = arrival_grids(hazard, rate);
+        let hazards = &grids.hazards;
         if hazards.iter().any(|value| !value.is_finite()) {
             return Err(ArrivalPriorError::InvalidChangeRate);
         }
-        let rates = geometric_grid(rate.low, rate.log_step, rate.count);
+        let rates = &grids.rates;
         if rates
             .iter()
             .any(|value| !value.is_finite() || *value <= 0.0_f64)
@@ -153,8 +163,8 @@ impl ArrivalPrior {
         let (coverage, path_change_bound) = arrival_coverage(
             shape,
             mean,
-            &rates,
-            &hazards,
+            rates,
+            hazards,
             change_rate_per_second,
             achieved_rate_error,
         )?;
@@ -223,12 +233,9 @@ impl ArrivalPrior {
     }
 
     pub(crate) const fn path_segment_count_max(&self) -> usize {
-        // Calendar timing needs a separate bound. The shared caller buffer keeps its
-        // legacy limit.
+        // The shared path buffer fits the larger stochastic or calendar bound.
         let stochastic = self.path_change_bound + 1;
-        if self.artifact.version() != MODEL_VERSION {
-            0
-        } else if stochastic > CALENDAR_SEGMENT_LIMIT {
+        if stochastic > CALENDAR_SEGMENT_LIMIT {
             stochastic
         } else {
             CALENDAR_SEGMENT_LIMIT
@@ -297,10 +304,22 @@ pub(crate) struct ArrivalFactor {
 
 impl ArrivalFactor {
     pub(crate) fn new(model: &ArrivalPrior) -> Self {
-        let hazards = geometric_grid(model.hazard_low, model.hazard_log_step, model.hazard_count);
+        let grids = arrival_grids(
+            GridSpec {
+                low: model.hazard_low,
+                log_step: model.hazard_log_step,
+                count: model.hazard_count,
+            },
+            GridSpec {
+                low: model.rate_low,
+                log_step: model.rate_log_step,
+                count: model.rate_count,
+            },
+        );
+        let hazards = grids.hazards;
         let hazard_prior = exact_gamma_masses(&hazards, HAZARD_SHAPE, model.hazard_center);
         let mean = model.authored_shape / model.rate_seconds;
-        let rates = geometric_grid(model.rate_low, model.rate_log_step, model.rate_count);
+        let rates = grids.rates;
         let reset_shapes = [
             model.authored_shape * 0.5_f64,
             model.authored_shape,
@@ -882,6 +901,13 @@ fn log_step(low: f64, high: f64, interval_count: usize) -> Result<f64, ArrivalPr
         .map(f64::from)
         .map_err(|_| ArrivalPriorError::ArithmeticOverflow)?;
     Ok((high.ln() - low.ln()) / intervals)
+}
+
+fn arrival_grids(hazard: GridSpec, rate: GridSpec) -> ArrivalGrids {
+    ArrivalGrids {
+        hazards: geometric_grid(hazard.low, hazard.log_step, hazard.count),
+        rates: geometric_grid(rate.low, rate.log_step, rate.count),
+    }
 }
 
 fn geometric_grid(low: f64, log_step: f64, count: usize) -> Box<[f64]> {

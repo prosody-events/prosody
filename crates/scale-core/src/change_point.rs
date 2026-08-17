@@ -22,10 +22,6 @@ impl ChangePointKernel {
             redrawn: 1.0_f64 - retained,
         }
     }
-
-    pub(crate) const fn rate_per_second(self) -> f64 {
-        self.rate_per_second
-    }
 }
 
 #[derive(Clone, Copy)]

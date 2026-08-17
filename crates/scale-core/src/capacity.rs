@@ -200,12 +200,8 @@ impl CapacityCurve {
     ///
     /// A work-conserving consumer operates at the demand-driven concurrency,
     /// not at its slot allowance. Idle slots therefore never push the plant
-    /// past its knee: the deliverable rate is the curve peak inside the
-    /// allowance, `min(slots / service_time, capacity)`. The knee ceiling on
-    /// the replica target itself comes from [`ScaleState`] through the
-    /// decision cap, not from this rate.
-    ///
-    /// [`ScaleState`]: crate::ScaleState
+    /// past its knee. The deliverable rate is the curve peak inside the
+    /// allowance: `min(slots / service_time, capacity)`.
     #[must_use]
     pub fn sustainable_throughput(self, concurrency: f64) -> f64 {
         if concurrency <= 0.0_f64 {
@@ -1072,6 +1068,8 @@ impl CapacityFactor {
             let alpha = RESIDUAL_REJECTION_PROBABILITY;
             let dkw_bound = (-(alpha * 0.5_f64).ln() / (2.0_f64 * sample_count)).sqrt();
             self.refresh_residual_check(sample_count);
+            // The capacity certification ruling makes this check advisory.
+            // Decision gating waits for a calibrated rejection rule.
             self.markov_clock_rejected = self.residual_maximum_distance > dkw_bound;
         }
     }

@@ -133,7 +133,8 @@ impl PartitionFactor {
         }
     }
 
-    pub(crate) fn maximum_expected_share(&self) -> f64 {
+    /// Returns the posterior mean share of the count-argmax partition.
+    pub(crate) fn posterior_mean_count_argmax_share(&self) -> f64 {
         let prior = JEFFREYS_CONCENTRATION;
         let prior_total = prior * f64::from(self.partition_count);
         let total = self.count_sums.iter().copied().sum::<f64>();
