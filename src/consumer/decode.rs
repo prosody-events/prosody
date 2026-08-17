@@ -10,8 +10,9 @@
 //! - Key extraction and UTF-8 validation
 //! - Timestamp resolution from Kafka metadata
 //!
-//! The main entry point is [`decode_message`], which performs all validation
-//! and returns `None` if the message is invalid or should be filtered out.
+//! The main entry point is [`decode_record`]. It selects the record type from
+//! payload presence, performs all validation, and returns `None` if the
+//! record is invalid or filtered out.
 
 use chrono::{MappedLocalTime, TimeZone, Utc};
 use internment::Intern;
@@ -22,7 +23,7 @@ use rdkafka::{Message, Timestamp};
 use std::str;
 use std::sync::Arc;
 use tokio::sync::OwnedSemaphorePermit;
-use tracing::{Span, debug, error};
+use tracing::{Span, error};
 
 use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
@@ -160,12 +161,6 @@ pub fn decode_excise<R: ResultRequestReader>(
     propagator: &TextMapCompositePropagator,
     requests: &R,
 ) -> Option<DecodedMessage<()>> {
-    debug!(
-        topic = message.topic(),
-        partition = message.partition(),
-        offset = message.offset(),
-        "decoded excise record"
-    );
     decode_value(message, propagator, (), requests)
 }
 

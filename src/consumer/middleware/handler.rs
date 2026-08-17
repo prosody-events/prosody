@@ -376,6 +376,15 @@ pub trait FallibleHandler: Send + Sync + 'static {
     fn shutdown(self) -> impl Future<Output = ()> + Send;
 }
 
+/// Selects a record-dispatch method of a [`FallibleHandler`].
+///
+/// [`OnMessage`] selects `on_message` and [`OnExcise`] selects `on_excise`.
+/// A pass-through middleware writes one `handle::<H, _>` body for both
+/// record types instead of two duplicated arms.
+///
+/// Ruling: the folded helpers add one monomorphized future layer per
+/// middleware. The layer allocates nothing and costs a few poll matches;
+/// the compile-time type depth is paid once by the crate recursion limits.
 pub(crate) trait HandlerMethod<H>
 where
     H: FallibleHandler,
