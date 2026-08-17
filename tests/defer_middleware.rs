@@ -27,7 +27,7 @@
 //! cargo test --test defer_middleware
 //! ```
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use color_eyre::eyre::{Result, ensure};
 use prosody::JsonCodec;

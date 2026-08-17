@@ -3,7 +3,7 @@
 //! Verifies that messages with identical event IDs are deduplicated when
 //! processed through the pipeline consumer with the deduplication middleware.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use crate::common::handler::FallibleTestHandler;
 use crate::common::receive::collect_messages_with_timeout;

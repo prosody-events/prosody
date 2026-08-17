@@ -34,7 +34,7 @@
 //! within the configured limit, even when messages are distributed across
 //! multiple partitions.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -3,7 +3,7 @@
 //! This module verifies that the Prosody messaging system correctly handles
 //! message deduplication based on event IDs within message payloads.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use color_eyre::eyre::{self, ensure};
 use eyre::Result;

@@ -7,7 +7,7 @@
 //! the ephemeral topic this test creates and deletes around the example
 //! (the README assumes the topic already exists).
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use color_eyre::eyre::{Result, eyre};
 use prosody::Topic;

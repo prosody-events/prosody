@@ -8,7 +8,7 @@
 //! with fixed golden vectors only catch drift after this match is established;
 //! they cannot prove the match holds in the first place.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use std::collections::HashMap;
 use std::time::Duration;

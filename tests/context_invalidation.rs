@@ -4,7 +4,7 @@
 //! method completes. This prevents race conditions and data corruption when
 //! partition ownership changes.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use color_eyre::eyre::{Result, eyre};
 use prosody::tracing::init_test_logging;

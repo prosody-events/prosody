@@ -3,7 +3,7 @@
 //! received in the order they were produced per key, utilizing integration
 //! tests with Kafka, via the Prosody library.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use std::cmp::max;
 use std::collections::{BTreeSet, HashSet};

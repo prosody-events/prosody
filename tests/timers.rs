@@ -5,7 +5,7 @@
 //! from message handlers, triggered at the correct times, and properly
 //! canceled when needed.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use ahash::HashSet;
 use color_eyre::eyre::{Result, ensure, eyre};

@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 //! Integration tests for telemetry event emission via Kafka.
 //!
 //! Validates that telemetry events (message lifecycle, producer message sent)

@@ -4,7 +4,7 @@
 //! while the consumer processes them slowly, demonstrating the backpressure
 //! handling capabilities of the system.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use std::time::Duration;
 

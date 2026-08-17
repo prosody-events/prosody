@@ -12,7 +12,7 @@
 //! The other publishes under a subsystem and additionally checks what that made
 //! discoverable; see [`publication`].
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use crate::cart::{CartHandler, Observation, RECEIPT, cart, last_seen, verify_observations};
 use crate::publication::{assert_routing_row, read_cart_via_standalone_reader};

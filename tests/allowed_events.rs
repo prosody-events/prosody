@@ -2,7 +2,7 @@
 //! filtering in the Prosody application. It ensures that the consumer can
 //! correctly filter out disallowed events and only process allowed ones.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use crate::common::handler::ChannelHandler;
 use color_eyre::eyre::{Result, ensure, eyre};
