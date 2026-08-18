@@ -190,12 +190,9 @@ where
             partition, offset, "received message"
         );
 
-        let record =
-            decode_record(&mut message, &propagator, &mut codec, &requests).map(|record| {
-                record.into_record(permit, |meta| create_receive_span(meta, message_spans))
-            });
-
-        if let Some(record) = record {
+        if let Some(decoded) = decode_record(&mut message, &propagator, &mut codec, &requests) {
+            let record =
+                decoded.into_record(permit, |meta| create_receive_span(meta, message_spans));
             dispatch_with_retry(record, poll_interval, managers);
         }
 
