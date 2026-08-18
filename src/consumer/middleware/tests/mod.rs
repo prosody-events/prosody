@@ -29,7 +29,7 @@ use super::settle::{ArmOutcome, arm_backstop};
 use super::*;
 use crate::consumer::EventHandler;
 use crate::consumer::Uncommitted;
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, Record};
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::tests::test_support::{
     MockEventContext, create_test_message, create_test_message_from,
 };
@@ -108,14 +108,15 @@ impl FallibleHandler for ProbeHandler {
 
     async fn on_excise<C>(
         &self,
-        context: C,
-        message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
+        _context: C,
+        _message: ConsumerMessage<()>,
+        _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type).await
+        self.log.lock().push(HookEvent::Handler);
+        self.result.clone().map(|()| self.sentinel)
     }
 
     async fn on_message<C>(
@@ -359,7 +360,7 @@ where
     async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

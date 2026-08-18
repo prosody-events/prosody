@@ -27,7 +27,7 @@
 //! cargo test --test defer_middleware
 //! ```
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use color_eyre::eyre::{Result, ensure};
 use prosody::JsonCodec;
@@ -130,12 +130,9 @@ impl FallibleHandler for DeferTestHandler {
         C: EventContext<Payload = Self::Payload>,
     {
         let key = message.key().to_string();
-        let payload = message.record().message();
+        let payload = message.payload();
 
-        if let Some(value) = payload
-            .and_then(|payload| payload.get("value"))
-            .and_then(Value::as_i64)
-        {
+        if let Some(value) = payload.get("value").and_then(Value::as_i64) {
             let should_fail = match self.fail_budget.lock().get_mut(&value) {
                 Some(remaining) if *remaining > 0 => {
                     *remaining -= 1;
@@ -193,7 +190,7 @@ impl FallibleHandler for DeferTestHandler {
     async fn on_excise<C>(
         &self,
         _context: C,
-        _message: ConsumerMessage<Value>,
+        _message: ConsumerMessage<()>,
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -226,12 +223,9 @@ impl FallibleHandler for PermanentErrorHandler {
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        let payload = message.record().message();
+        let payload = message.payload();
         if self.permanent_value.is_some()
-            && payload
-                .and_then(|payload| payload.get("value"))
-                .and_then(Value::as_i64)
-                == self.permanent_value
+            && payload.get("value").and_then(Value::as_i64) == self.permanent_value
         {
             return Err(TestError::Permanent);
         }
@@ -257,7 +251,7 @@ impl FallibleHandler for PermanentErrorHandler {
     async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Value>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

@@ -3,7 +3,7 @@
 //! Wraps [`MemoryLoader`] and allows single-shot failure injection
 //! based on trace specifications.
 
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::ConsumerRecord;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::{MemoryLoader, MemoryLoaderError, MessageLoader};
 use crate::{Key, Offset, Partition, Topic};
@@ -80,7 +80,7 @@ impl MessageLoader for FailableLoader {
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> Result<ConsumerMessage<Value>, Self::Error> {
+    ) -> Result<ConsumerRecord<Value>, Self::Error> {
         // Check for injected failure (single-shot: take clears it)
         if let Some(failure) = self.next_failure.lock().take() {
             return Err(match failure {
@@ -100,7 +100,7 @@ impl MessageLoader for FailableLoader {
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> Result<ConsumerMessage<Value>, Self::Error> {
+    ) -> Result<ConsumerRecord<Value>, Self::Error> {
         self.inner
             .try_load_message(topic, partition, offset)
             .await

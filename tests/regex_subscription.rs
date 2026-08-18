@@ -4,7 +4,7 @@
 //! subscriptions (topics prefixed with "^") and that consumers can dynamically
 //! subscribe to topics matching patterns.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use crate::common::handler::FallibleTestHandler;
 use crate::common::receive::collect_messages_with_timeout;

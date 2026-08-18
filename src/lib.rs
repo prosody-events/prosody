@@ -30,7 +30,7 @@
 // The scoped collection operations nest one engine projection per session
 // bound, and the middleware test futures compose them several layers deep;
 // the default 128 is not enough to lay out those types.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use ::tracing::info;
 use fixedstr::Flexstr;
@@ -256,6 +256,12 @@ pub trait EventIdentity {
     ///
     /// Returns `None` if the event has no identifier.
     fn event_id(&self) -> Option<&str>;
+}
+
+impl EventIdentity for () {
+    fn event_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Provides access to the event type field within a payload.

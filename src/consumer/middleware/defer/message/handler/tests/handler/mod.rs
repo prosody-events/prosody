@@ -60,6 +60,25 @@ pub struct OutcomeHandler {
 }
 
 impl OutcomeHandler {
+    fn handle_message<P>(&self, message: &ConsumerMessage<P>) -> Result<(), OutcomeError> {
+        use crate::consumer::Keyed;
+        let key = message.key().clone();
+        let offset = message.offset();
+        let outcome = self.take_outcome();
+        tracing::info!(
+            "OutcomeHandler.on_message: key={:?}, offset={}, outcome={:?}",
+            key,
+            offset,
+            outcome
+        );
+        self.record_processed(key, offset);
+        self.ambient_pairs
+            .lock()
+            .push((tracing::Span::current().id(), message.span().id()));
+        self.maybe_trigger_shutdown();
+        outcome.into_result()
+    }
+
     /// Creates a new handler with no preset outcome.
     #[must_use]
     pub fn new() -> Self {
@@ -146,14 +165,14 @@ impl FallibleHandler for OutcomeHandler {
 
     async fn on_excise<C>(
         &self,
-        context: C,
-        message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
+        _context: C,
+        message: ConsumerMessage<()>,
+        _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type).await
+        self.handle_message(&message)
     }
 
     async fn on_message<C>(
@@ -165,25 +184,7 @@ impl FallibleHandler for OutcomeHandler {
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        use crate::consumer::Keyed;
-        let key = message.key().clone();
-        let offset = message.offset();
-        let outcome = self.take_outcome();
-        tracing::info!(
-            "OutcomeHandler.on_message: key={:?}, offset={}, outcome={:?}",
-            key,
-            offset,
-            outcome
-        );
-
-        // Record this message as processed (for order verification)
-        self.record_processed(key, offset);
-        self.ambient_pairs
-            .lock()
-            .push((tracing::Span::current().id(), message.span().id()));
-
-        self.maybe_trigger_shutdown();
-        outcome.into_result()
+        self.handle_message(&message)
     }
 
     async fn on_timer<C>(

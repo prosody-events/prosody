@@ -12,11 +12,7 @@ use std::sync::Arc;
 
 #[test]
 fn failure_topic_source_kind_distinguishes_excise_records() {
-    assert_eq!(source_kind(&Record::<serde_json::Value>::Excise), "excise");
-    assert_eq!(
-        source_kind(&Record::Message(serde_json::Value::Null)),
-        "message"
-    );
+    assert_ne!(MESSAGE_SOURCE_KIND, EXCISE_SOURCE_KIND);
 }
 
 // === Error Classification Tests ===
@@ -108,14 +104,14 @@ impl FallibleHandler for Probe {
 
     async fn on_excise<C>(
         &self,
-        context: C,
-        message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
+        _context: C,
+        _message: ConsumerMessage<()>,
+        _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type).await
+        Ok(0)
     }
 
     async fn on_message<C>(

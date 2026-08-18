@@ -8,6 +8,7 @@ use super::{
     HeartbeatRegistry, JsonCodec, KafkaLoader, LoaderConfiguration, Offset, Topic, loader_config,
     producer, with_topic,
 };
+use crate::consumer::decode::DecodedRecord;
 use crate::peer::response::RequestId;
 use crate::peer::response::headers::{
     RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER, RESPONSE_PEER_HEADER,
@@ -150,5 +151,8 @@ async fn load(
         loader.load_from_kafka(topic, 0, offset),
     )
     .await??;
-    Ok(decoded.value.request)
+    Ok(match decoded {
+        DecodedRecord::Message(message) => message.value.request,
+        DecodedRecord::Excise(message) => message.value.request,
+    })
 }

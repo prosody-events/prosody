@@ -31,6 +31,7 @@ use validator::{Validate, ValidationErrors};
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::handler::{HandlerMethod, OnExcise, OnMessage};
 use crate::consumer::middleware::scheduler::dispatch::{DispatchError, Dispatcher};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
@@ -205,6 +206,28 @@ pub struct SchedulerHandler<T> {
     partition: Partition,
 }
 
+impl<T> SchedulerHandler<T>
+where
+    T: FallibleHandler,
+{
+    async fn handle<H, C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<H::MessagePayload>,
+        demand_type: DemandType,
+    ) -> Result<T::Output, SchedulerError<T::Error>>
+    where
+        H: HandlerMethod<T>,
+        C: EventContext<Payload = T::Payload>,
+    {
+        let key = TopicPartitionKey::new(self.topic, self.partition, message.key().clone());
+        let _permit = self.dispatcher.get_permit(key, demand_type).await?;
+        H::call(&self.handler, context, message, demand_type)
+            .await
+            .map_err(SchedulerError::Handler)
+    }
+}
+
 /// Errors that can occur during scheduled handler execution.
 #[derive(Debug, Error)]
 pub enum SchedulerError<E> {
@@ -313,25 +336,21 @@ where
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        let tp_key = TopicPartitionKey::new(self.topic, self.partition, message.key().clone());
-        let _permit = self.dispatcher.get_permit(tp_key, demand_type).await?;
-
-        self.handler
-            .on_message(context, message, demand_type)
+        self.handle::<OnMessage, _>(context, message, demand_type)
             .await
-            .map_err(SchedulerError::Handler)
     }
 
-    fn on_excise<C>(
+    async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type)
+        self.handle::<OnExcise, _>(context, message, demand_type)
+            .await
     }
 
     async fn on_timer<C>(

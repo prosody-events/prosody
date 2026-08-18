@@ -20,6 +20,7 @@ use super::handler::{HandlerOutcome, OutcomeHandler};
 use super::loader::{FailableLoader, LoaderFailureType};
 use super::types::{MessageEvent, MessageOutcome, TimerEvent, TimerOutcome, TraceEvent};
 use crate::consumer::DemandType;
+use crate::consumer::message::ConsumerRecord;
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::defer::DeferConfiguration;
 use crate::consumer::middleware::defer::decider::TraceBasedDecider;
@@ -252,6 +253,9 @@ impl TestHarness {
             .load_message(self.topic, self.partition, event.offset)
             .await
             .map_err(|e| eyre!("loader error: {e}"))?;
+        let ConsumerRecord::Message(message) = message else {
+            return Err(eyre!("the loader returned an excise record"));
+        };
 
         // Call the real MessageDeferHandler::on_message
         let result = self

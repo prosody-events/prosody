@@ -13,13 +13,13 @@
 //! # Architecture
 //!
 //! The [`MessageLoader`] trait provides a common interface for different
-//! loading implementations. Each loader returns a [`ConsumerMessage`] with
+//! loading implementations. Each loader returns a [`ConsumerRecord`] with
 //! appropriate backpressure (via semaphore permits) and tracing context.
 //!
 //! Error types implement [`ClassifyError`] so each caller can apply its retry
 //! policy.
 
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::ConsumerRecord;
 use crate::error::ClassifyError;
 use crate::{Offset, Partition, Topic};
 use std::error::Error as StdError;
@@ -58,7 +58,7 @@ pub trait MessageLoader: Send + Sync + Clone {
 
     /// Loads a specific message from storage by its exact coordinates.
     ///
-    /// Returns a [`ConsumerMessage`] ready for processing, with appropriate
+    /// Returns a [`ConsumerRecord`] ready for processing, with appropriate
     /// permit and span context.
     ///
     /// # Errors
@@ -70,7 +70,7 @@ pub trait MessageLoader: Send + Sync + Clone {
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> impl Future<Output = Result<ConsumerMessage<Self::Payload>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<ConsumerRecord<Self::Payload>, Self::Error>> + Send;
 
     /// Loads a message without waiting for loader capacity.
     ///
@@ -80,5 +80,5 @@ pub trait MessageLoader: Send + Sync + Clone {
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> impl Future<Output = Result<ConsumerMessage<Self::Payload>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<ConsumerRecord<Self::Payload>, Self::Error>> + Send;
 }

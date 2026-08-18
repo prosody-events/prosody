@@ -101,9 +101,8 @@ impl CartHandler {
         };
         items.push(
             message
-                .record()
-                .message()
-                .and_then(|payload| payload.get("item"))
+                .payload()
+                .get("item")
                 .cloned()
                 .unwrap_or(Value::Null),
         );
@@ -156,13 +155,7 @@ impl CartHandler {
             .message_value_state(LAST_SEEN)?
             .get()
             .await?
-            .and_then(|message| {
-                message
-                    .record()
-                    .message()
-                    .cloned()
-                    .map(|payload| (message.offset(), payload))
-            });
+            .map(|message| (message.offset(), message.payload().clone()));
 
         self.observations_tx
             .send(Observation::Timer { cart, last_seen })
@@ -198,7 +191,7 @@ impl FallibleHandler for CartHandler {
     async fn on_excise<C>(
         &self,
         ctx: C,
-        _message: ConsumerMessage<Self::Payload>,
+        _message: ConsumerMessage<()>,
         _demand: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

@@ -5,7 +5,6 @@ pub(crate) mod registry;
 
 use self::collect::collect;
 use self::registry::PendingRegistry;
-use crate::consumer::Record;
 use crate::peer::response::RequestId;
 use crate::peer::response::headers::{
     ID_TEXT_LEN, RESPONSE_AWAITED_HEADER, RESPONSE_DEADLINE_HEADER, RESPONSE_PEER_HEADER,
@@ -23,6 +22,7 @@ use rdkafka::message::{Header, OwnedHeaders};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
@@ -153,9 +153,13 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             record_headers,
             topic,
             key,
-            Record::Message(payload),
             subsystems,
             timeout,
+            |record_headers| async move {
+                self.producer
+                    .send_owned(record_headers, topic, key, payload)
+                    .await
+            },
         )
         .await
     }
@@ -185,9 +189,11 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
             record_headers,
             topic,
             key,
-            Record::Excise,
             subsystems,
             timeout,
+            |record_headers| async move {
+                self.producer.excise_owned(record_headers, topic, key).await
+            },
         )
         .await
     }
@@ -219,18 +225,20 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         ),
         err
     )]
-    async fn request_prepared<V>(
+    async fn request_prepared<V, F, Fut>(
         &self,
         mut record_headers: OwnedHeaders,
         topic: Topic,
         key: &str,
-        record: Record<C::Payload>,
         subsystems: &[SubsystemName],
         timeout: Duration,
+        produce: F,
     ) -> Result<SubsystemOutcomes<V>, RequestError<C::Error>>
     where
         C::Payload: EventIdentity,
         R: Codec<Payload = V>,
+        F: FnOnce(OwnedHeaders) -> Fut,
+        Fut: Future<Output = Result<(), ProducerError<C::Error>>>,
     {
         // The two id texts are declared before the header list, so they outlive
         // the borrows the list holds on them.
@@ -263,17 +271,7 @@ impl<C: Codec, R: Codec> ProsodyRequester<C, R> {
         );
 
         let started = Instant::now();
-        let collected = collect::<R, _, _>(registration, subsystems, async move {
-            match record {
-                Record::Message(payload) => {
-                    self.producer
-                        .send_owned(record_headers, topic, key, payload)
-                        .await
-                }
-                Record::Excise => self.producer.excise_owned(record_headers, topic, key).await,
-            }
-        })
-        .await;
+        let collected = collect::<R, _, _>(registration, subsystems, produce(record_headers)).await;
         // A request refused before this point sent nothing, so it has no
         // latency to report. Only a call that really waited records one.
         let elapsed = started.elapsed();

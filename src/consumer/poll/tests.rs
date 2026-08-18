@@ -3,6 +3,7 @@
 //! for both [`SpanRelation`] modes.
 
 use super::*;
+use crate::consumer::decode::DecodedMessage;
 use crate::consumer::message::ConsumerMessageValue;
 use crate::test_util::{assert_span_relation, captured_spans, sampled_remote_context};
 use color_eyre::Result;
@@ -29,7 +30,7 @@ fn receive_span_connects_to_producer_context() -> Result<()> {
     for relation in [SpanRelation::Child, SpanRelation::FollowsFrom] {
         let decoded = decoded_message(context.clone());
         let spans = captured_spans(move || {
-            let _span = create_receive_span(&decoded, relation);
+            let _span = create_receive_span(decoded.meta(), relation);
         });
         assert_span_relation(&spans, "receive", relation, &target)?;
     }

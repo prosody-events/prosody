@@ -2,17 +2,89 @@ use tracing::debug;
 
 use super::{MessageDeferHandler, MessageDeferOutput};
 use crate::consumer::event_context::EventContext;
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::{ConsumerMessage, ConsumerRecord};
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::deduplication::{DedupIdentity, dedup_uuid_for_message};
 use crate::consumer::middleware::defer::decider::DeferralDecider;
 use crate::consumer::middleware::defer::error::DeferError;
 use crate::consumer::middleware::defer::message::store::MessageDeferStore;
+use crate::consumer::middleware::handler::{HandlerMethod, OnExcise, OnMessage};
 use crate::consumer::{DemandType, Keyed};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
 use crate::state::session::{MarkerAccessExt, MessageMarker};
 use crate::timers::{TimerType, Trigger};
+
+impl<T, M, L, D> MessageDeferHandler<T, M, L, D>
+where
+    T: FallibleHandler<Payload = L::Payload>,
+    M: MessageDeferStore,
+    L: MessageLoader + 'static,
+    D: DeferralDecider,
+    L::Payload: crate::EventIdentity,
+{
+    async fn handle<H, C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<H::MessagePayload>,
+        demand_type: DemandType,
+    ) -> Result<MessageDeferOutput<T::Output, T::Error>, DeferError<M::Error, T::Error, L::Error>>
+    where
+        H: HandlerMethod<T>,
+        C: EventContext<Payload = T::Payload>,
+    {
+        // Already deferred: queue after existing messages to preserve order.
+        // The inner handler does not run, so return `NoInner`.
+        if self
+            .store
+            .is_deferred(message.key())
+            .await
+            .map_err(DeferError::Store)?
+            .is_some()
+        {
+            let offset = message.offset();
+            return self.append_to_deferred_queue(message.key(), offset).await;
+        }
+
+        let message_key = message.key().clone();
+        let offset = message.offset();
+        // Not deferred: call the handler. Defer a transient failure when enabled.
+        let error = match H::call(&self.handler, context.clone(), message, demand_type).await {
+            Ok(output) => return Ok(MessageDeferOutput::Inner(output)),
+            Err(error) => error,
+        };
+
+        if !matches!(error.classify_error(), ErrorCategory::Transient) {
+            return Err(DeferError::Handler(error));
+        }
+
+        // Gate only the initial deferral. Always defer later transient failures again.
+        if !self.config.enabled {
+            debug!(
+                key = ?message_key,
+                offset,
+                topic = %self.topic,
+                partition = self.partition,
+                "Deferral skipped: middleware disabled"
+            );
+            return Err(DeferError::Handler(error));
+        }
+
+        if !self.decider.should_defer() {
+            debug!(
+                key = ?message_key,
+                offset,
+                topic = %self.topic,
+                partition = self.partition,
+                "Deferral skipped: decider threshold not met"
+            );
+            return Err(DeferError::Handler(error));
+        }
+
+        self.defer_message(context, &message_key, offset, error)
+            .await
+    }
+}
 
 impl<T, M, L, D> FallibleHandler for MessageDeferHandler<T, M, L, D>
 where
@@ -37,74 +109,22 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        // Already deferred: queue behind existing messages (ordering
-        // invariant). Inner does not run -> NoInner.
-        if self
-            .store
-            .is_deferred(message.key())
-            .await
-            .map_err(DeferError::Store)?
-            .is_some()
-        {
-            let offset = message.offset();
-            return self.append_to_deferred_queue(message.key(), offset).await;
-        }
-
-        // Not deferred: try handler, defer on transient failure if enabled.
-        let message_key = message.key().clone();
-        let offset = message.offset();
-
-        let error = match self
-            .handler
-            .on_message(context.clone(), message, demand_type)
-            .await
-        {
-            Ok(output) => return Ok(MessageDeferOutput::Inner(output)),
-            Err(error) => error,
-        };
-
-        if !matches!(error.classify_error(), ErrorCategory::Transient) {
-            return Err(DeferError::Handler(error));
-        }
-
-        // Only gate initial deferral; once deferred, always re-defer transient.
-        if !self.config.enabled {
-            debug!(
-                key = ?message_key,
-                offset = offset,
-                topic = %self.topic,
-                partition = self.partition,
-                "Deferral skipped: middleware disabled"
-            );
-            return Err(DeferError::Handler(error));
-        }
-
-        if !self.decider.should_defer() {
-            debug!(
-                key = ?message_key,
-                offset = offset,
-                topic = %self.topic,
-                partition = self.partition,
-                "Deferral skipped: decider threshold not met"
-            );
-            return Err(DeferError::Handler(error));
-        }
-
-        self.defer_message(context, &message_key, offset, error)
+        self.handle::<OnMessage, _>(context, message, demand_type)
             .await
     }
 
     /// Processes an excise record with the message defer policy.
-    fn on_excise<C>(
+    async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type)
+        self.handle::<OnExcise, _>(context, message, demand_type)
+            .await
     }
 
     /// Keeps each deferred-message trigger inside this middleware.
@@ -177,15 +197,17 @@ where
         // retry re-dispatch of this same timer after a durable queue advance
         // loads the next head and re-points the override at it.
         if let Ok(marker) = context.marker_identity() {
-            marker.set_reload_marker(MessageMarker::new(dedup_uuid_for_message(
-                DedupIdentity {
-                    version: &self.dedup_version,
-                    group_id: &self.source,
-                    topic: self.topic.as_ref(),
-                    partition: self.partition,
-                },
-                &message,
-            )));
+            let identity = DedupIdentity {
+                version: &self.dedup_version,
+                group_id: &self.source,
+                topic: self.topic.as_ref(),
+                partition: self.partition,
+            };
+            let dedup_id = match &message {
+                ConsumerRecord::Message(message) => dedup_uuid_for_message(identity, message),
+                ConsumerRecord::Excise(message) => dedup_uuid_for_message(identity, message),
+            };
+            marker.set_reload_marker(MessageMarker::new(dedup_id));
         }
 
         debug!(
@@ -197,8 +219,30 @@ where
             "Loaded deferred message - attempting retry"
         );
 
-        self.retry_deferred_message(context, &trigger, message_key, offset, retry_count, message)
-            .await
+        match message {
+            ConsumerRecord::Message(message) => {
+                self.retry_deferred_message::<OnMessage, _>(
+                    context,
+                    &trigger,
+                    message_key,
+                    offset,
+                    retry_count,
+                    message,
+                )
+                .await
+            }
+            ConsumerRecord::Excise(message) => {
+                self.retry_deferred_message::<OnExcise, _>(
+                    context,
+                    &trigger,
+                    message_key,
+                    offset,
+                    retry_count,
+                    message,
+                )
+                .await
+            }
+        }
     }
 
     async fn after_commit<C>(&self, context: C, result: Result<Self::Output, Self::Error>)

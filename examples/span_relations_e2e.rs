@@ -20,7 +20,7 @@
 //! - `E2E_TIMER_RELATION` — `child` or `follows_from` (default)
 //! - `E2E_KEYS` — number of concurrent keys (default 64)
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use color_eyre::eyre::{Error, Result, eyre};
 use opentelemetry::trace::TraceContextExt as _;
@@ -162,7 +162,7 @@ impl FallibleHandler for SpanProbe {
     async fn on_excise<C>(
         &self,
         _context: C,
-        _message: ConsumerMessage<Self::Payload>,
+        _message: ConsumerMessage<()>,
         _demand_type: DemandType,
     ) -> Result<(), Infallible>
     where

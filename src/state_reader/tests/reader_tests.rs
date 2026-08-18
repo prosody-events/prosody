@@ -372,7 +372,7 @@ async fn kafka_ref_reader_resolves_through_loader() -> Result<()> {
     assert_eq!(resolved.topic(), msg_topic);
     assert_eq!(resolved.partition(), msg_partition);
     assert_eq!(resolved.offset(), msg_offset);
-    assert_eq!(resolved.record().message(), Some(&payload));
+    assert_eq!(resolved.payload(), &payload);
     Ok(())
 }
 

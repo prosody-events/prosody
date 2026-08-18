@@ -56,7 +56,6 @@
 //!
 //! [`ErrorCategory::Transient`]: crate::consumer::middleware::ErrorCategory::Transient
 
-use std::future::Future;
 use std::time::Duration;
 
 use derive_builder::Builder;
@@ -67,6 +66,7 @@ use validator::{Validate, ValidationErrors};
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::{ConsumerMessage, UncommittedMessage};
+use crate::consumer::middleware::handler::{HandlerMethod, OnExcise, OnMessage};
 use crate::consumer::middleware::{
     FallibleHandler, FallibleHandlerProvider, HandlerMiddleware, Settlement, SettlementHandler,
     abandon, settle,
@@ -173,6 +173,50 @@ impl<T> RetryProvider<T> {
             max_delay_millis: self.config.max_delay.as_millis() as u64,
             max_retries: self.config.max_retries,
             handler,
+        }
+    }
+}
+
+impl<T> RetryHandler<T>
+where
+    T: FallibleHandler,
+{
+    async fn handle<H, C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<H::MessagePayload>,
+        demand_type: DemandType,
+    ) -> Result<T::Output, T::Error>
+    where
+        H: HandlerMethod<T>,
+        C: EventContext<Payload = T::Payload>,
+    {
+        let topic = message.topic();
+        let partition = message.partition();
+        let key = message.key();
+        let offset = message.offset();
+        let (resolution, _final) = self
+            .run(
+                context,
+                demand_type,
+                Some(self.max_retries),
+                |ctx, dt| H::call(&self.handler, ctx, message.clone(), dt),
+                |ctx, error| self.handler.after_abort(ctx, Err(error)),
+                |reason| {
+                    log_message_failure(
+                        topic.as_ref(),
+                        partition,
+                        key.as_ref(),
+                        offset,
+                        &reason,
+                        "",
+                    );
+                },
+            )
+            .await;
+        match resolution {
+            Resolution::Commit(result) => result,
+            Resolution::Abort(error) => Err(error),
         }
     }
 }
@@ -286,45 +330,21 @@ where
     where
         C: EventContext<Payload = T::Payload>,
     {
-        let topic = message.topic();
-        let partition = message.partition();
-        let key = message.key();
-        let offset = message.offset();
-        let (resolution, _final) = self
-            .run(
-                context,
-                demand_type,
-                Some(self.max_retries),
-                |ctx, dt| self.handler.on_message(ctx, message.clone(), dt),
-                |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| {
-                    log_message_failure(
-                        topic.as_ref(),
-                        partition,
-                        key.as_ref(),
-                        offset,
-                        &reason,
-                        "",
-                    );
-                },
-            )
-            .await;
-        match resolution {
-            Resolution::Commit(result) => result,
-            Resolution::Abort(error) => Err(error),
-        }
+        self.handle::<OnMessage, _>(context, message, demand_type)
+            .await
     }
 
-    fn on_excise<C>(
+    async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type)
+        self.handle::<OnExcise, _>(context, message, demand_type)
+            .await
     }
 
     async fn on_timer<C>(
@@ -402,96 +422,7 @@ where
 // Per-attempt apply hooks are `run`'s responsibility — see its apply-hook
 // split.
 
-impl<T> EventHandler for RetryHandler<T>
-where
-    T: SettlementHandler,
-{
-    type Payload = T::Payload;
-
-    async fn on_message<C>(
-        &self,
-        context: C,
-        message: UncommittedMessage<Self::Payload>,
-        demand_type: DemandType,
-    ) where
-        C: EventContext<Payload = T::Payload>,
-    {
-        let topic = message.topic();
-        let partition = message.partition();
-        let key = message.key().to_owned();
-        let offset = message.offset();
-        let (message, uncommitted_offset) = message.into_inner();
-
-        let (resolution, final_ctx) = self
-            .run(
-                context,
-                demand_type,
-                None,
-                |ctx, dt| self.handler.on_message(ctx, message.clone(), dt),
-                |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| {
-                    log_message_failure(
-                        topic.as_ref(),
-                        partition,
-                        key.as_ref(),
-                        offset,
-                        &reason,
-                        "; discarding message",
-                    );
-                },
-            )
-            .await;
-
-        // Settle on the FINAL dispatch context (a fresh re-pinned Arc for a
-        // retried event), not the original `context`: a leaked attempt-1 clone
-        // could have invalidated the original's shared Arc, which would strand
-        // the real attempt's dirty overlay at settle.
-        match resolution {
-            Resolution::Commit(result) => {
-                settle(self, final_ctx, uncommitted_offset, result).await;
-            }
-            Resolution::Abort(error) => {
-                // Terminal abort: nothing staged (the receipt never minted),
-                // and abandon touches no state.
-                abandon(self, final_ctx, uncommitted_offset, Err(error)).await;
-            }
-        }
-    }
-
-    async fn on_timer<C, U>(&self, context: C, timer: U, demand_type: DemandType)
-    where
-        C: EventContext<Payload = T::Payload>,
-        U: UncommittedTimer,
-    {
-        let (trigger, uncommitted) = timer.into_inner();
-
-        let (resolution, final_ctx) = self
-            .run(
-                context,
-                demand_type,
-                None,
-                |ctx, dt| self.handler.on_timer(ctx, trigger.clone(), dt),
-                |ctx, error| self.handler.after_abort(ctx, Err(error)),
-                |reason| log_timer_failure(&reason, "; discarding timer"),
-            )
-            .await;
-
-        // Settle on the FINAL dispatch context — see the message arm above.
-        match resolution {
-            Resolution::Commit(result) => settle(self, final_ctx, uncommitted, result).await,
-            Resolution::Abort(error) => {
-                // Terminal abort: nothing staged (the receipt never minted),
-                // and abandon touches no state.
-                abandon(self, final_ctx, uncommitted, Err(error)).await;
-            }
-        }
-    }
-
-    async fn shutdown(self) {
-        debug!("shutting down retry handler");
-        self.handler.shutdown().await;
-    }
-}
+mod event;
 
 #[cfg(test)]
 mod tests;

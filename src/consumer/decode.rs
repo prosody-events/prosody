@@ -10,8 +10,9 @@
 //! - Key extraction and UTF-8 validation
 //! - Timestamp resolution from Kafka metadata
 //!
-//! The main entry point is [`decode_message`], which performs all validation
-//! and returns `None` if the message is invalid or should be filtered out.
+//! The main entry point is [`decode_record`]. It selects the record type from
+//! payload presence, performs all validation, and returns `None` if the
+//! record is invalid or filtered out.
 
 use chrono::{MappedLocalTime, TimeZone, Utc};
 use internment::Intern;
@@ -21,14 +22,15 @@ use rdkafka::message::{BorrowedMessage, Headers};
 use rdkafka::{Message, Timestamp};
 use std::str;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tokio::sync::OwnedSemaphorePermit;
+use tracing::{Span, error};
 
 use crate::Codec;
 use crate::consumer::extractor::MessageExtractor;
-use crate::consumer::message::{ConsumerMessageValue, Record};
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, ConsumerRecord};
 use crate::peer::response::headers::{ResultRequest, parse_result_request};
 use crate::subsystem::SubsystemName;
-use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
+use crate::{Key, Offset, Partition, SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
 /// A decoded Kafka message without live span references.
 ///
@@ -59,6 +61,60 @@ pub struct DecodedMessage<P> {
     pub parent_context: Context,
 }
 
+/// The payload-independent fields a record span is built from.
+///
+/// Both record variants expose the same metadata, so one span builder
+/// serves both. Payload access stays impossible by construction.
+#[derive(Clone, Copy)]
+pub(crate) struct RecordMeta<'a> {
+    pub(crate) parent_context: &'a Context,
+    pub(crate) topic: Topic,
+    pub(crate) partition: Partition,
+    pub(crate) offset: Offset,
+    pub(crate) key: &'a Key,
+}
+
+/// A decoded Kafka record before its consumer message is constructed.
+#[derive(Clone, Debug)]
+pub enum DecodedRecord<P> {
+    /// A record with a decoded payload.
+    Message(DecodedMessage<P>),
+    /// A record with no payload.
+    Excise(DecodedMessage<()>),
+}
+
+impl<P> DecodedMessage<P> {
+    /// Borrows the metadata a record span is built from.
+    pub(crate) fn meta(&self) -> RecordMeta<'_> {
+        RecordMeta {
+            parent_context: &self.parent_context,
+            topic: self.value.topic,
+            partition: self.value.partition,
+            offset: self.value.offset,
+            key: &self.value.key,
+        }
+    }
+}
+
+impl<P> DecodedRecord<P> {
+    pub(crate) fn into_record(
+        self,
+        permit: OwnedSemaphorePermit,
+        span: impl FnOnce(RecordMeta<'_>) -> Span,
+    ) -> ConsumerRecord<P> {
+        match self {
+            Self::Message(decoded) => {
+                let span = span(decoded.meta());
+                ConsumerRecord::Message(ConsumerMessage::from_decoded(decoded.value, span, permit))
+            }
+            Self::Excise(decoded) => {
+                let span = span(decoded.meta());
+                ConsumerRecord::Excise(ConsumerMessage::from_decoded(decoded.value, span, permit))
+            }
+        }
+    }
+}
+
 /// Reads result-request headers that this consumer can answer.
 pub(crate) trait ResultRequestReader: Send {
     fn request(&self, message: &BorrowedMessage) -> Option<ResultRequest>;
@@ -84,6 +140,61 @@ pub fn decode_message<C: Codec, R: ResultRequestReader>(
     codec: &mut C,
     requests: &R,
 ) -> Option<DecodedMessage<C::Payload>> {
+    // SAFETY: librdkafka does not formally promise the payload is mutable,
+    // but on the consumer poll path:
+    //   - `on_consume` interceptors run inside `rd_kafka_message_setup` before the
+    //     message is returned to the application, so no librdkafka-internal code
+    //     reads these bytes after delivery.
+    //   - The payload occupies a disjoint slice of the refcounted fetch buffer;
+    //     mutating it cannot corrupt sibling messages.
+    //   - `decode_message` is the only site in the crate that reads the borrowed
+    //     payload bytes, so the codec's destructive parse cannot affect downstream
+    //     code.
+    // The audit boundary is the rdkafka version resolved in `Cargo.lock`, not
+    // `Cargo.toml` (which uses caret semver and accepts any 0.39.x via
+    // `cargo update`). Re-audit on any rdkafka bump, including patch updates.
+    #[allow(unsafe_code)]
+    let payload_bytes = (unsafe { message.payload_mut() })?;
+    let payload = match codec.deserialize(payload_bytes) {
+        Ok(payload) => payload,
+        Err(error) => {
+            error!("invalid payload: {error:#}; discarding message");
+            return None;
+        }
+    };
+
+    decode_value(message, propagator, payload, requests)
+}
+
+/// Decodes a message or excise record.
+pub fn decode_record<C: Codec, R: ResultRequestReader>(
+    message: &mut BorrowedMessage,
+    propagator: &TextMapCompositePropagator,
+    codec: &mut C,
+    requests: &R,
+) -> Option<DecodedRecord<C::Payload>> {
+    if message.payload().is_some() {
+        decode_message(message, propagator, codec, requests).map(DecodedRecord::Message)
+    } else {
+        decode_excise(message, propagator, requests).map(DecodedRecord::Excise)
+    }
+}
+
+/// Decodes and validates a Kafka excise record.
+pub fn decode_excise<R: ResultRequestReader>(
+    message: &BorrowedMessage,
+    propagator: &TextMapCompositePropagator,
+    requests: &R,
+) -> Option<DecodedMessage<()>> {
+    decode_value(message, propagator, (), requests)
+}
+
+fn decode_value<P, R: ResultRequestReader>(
+    message: &BorrowedMessage,
+    propagator: &TextMapCompositePropagator,
+    payload: P,
+    requests: &R,
+) -> Option<DecodedMessage<P>> {
     let topic: Topic = Intern::from(message.topic());
     let partition = message.partition();
     let offset = message.offset();
@@ -117,39 +228,6 @@ pub fn decode_message<C: Codec, R: ResultRequestReader>(
         }
     };
 
-    // SAFETY: librdkafka does not formally promise the payload is mutable,
-    // but on the consumer poll path:
-    //   - `on_consume` interceptors run inside `rd_kafka_message_setup` before the
-    //     message is returned to the application, so no librdkafka-internal code
-    //     reads these bytes after delivery.
-    //   - The payload occupies a disjoint slice of the refcounted fetch buffer;
-    //     mutating it cannot corrupt sibling messages.
-    //   - `decode_message` is the only site in the crate that reads the borrowed
-    //     payload bytes, so the codec's destructive parse cannot affect downstream
-    //     code.
-    // The audit boundary is the rdkafka version resolved in `Cargo.lock`, not
-    // `Cargo.toml` (which uses caret semver and accepts any 0.39.x via
-    // `cargo update`). Re-audit on any rdkafka bump, including patch updates.
-    #[allow(unsafe_code)]
-    let record = if let Some(payload_bytes) = unsafe { message.payload_mut() } {
-        match codec.deserialize(payload_bytes) {
-            Ok(payload) => Record::Message(payload),
-            Err(error) => {
-                error!("invalid payload: {error:#}; discarding message");
-                return None;
-            }
-        }
-    } else {
-        debug!(
-            topic = %topic,
-            partition,
-            offset,
-            key = %key,
-            "decoded excise record"
-        );
-        Record::Excise
-    };
-
     let value = Arc::new(ConsumerMessageValue {
         source_system,
         topic,
@@ -157,7 +235,7 @@ pub fn decode_message<C: Codec, R: ResultRequestReader>(
         offset,
         key,
         timestamp,
-        record,
+        payload,
         request,
     });
 

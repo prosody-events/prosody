@@ -66,16 +66,26 @@ impl EventHandler for ChannelHandler {
             sleep(self.delay).await;
         }
 
-        if let Some(payload) = msg.record().message()
-            && let Err(error) = self
-                .messages_tx
-                .send((msg.key().to_string(), payload.clone()))
-                .await
+        if let Err(error) = self
+            .messages_tx
+            .send((msg.key().to_string(), msg.payload().clone()))
+            .await
         {
             error!("failed to send message: {error:#}");
         }
 
         uncommitted.commit().await;
+    }
+
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<()>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        message.commit().await;
     }
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
@@ -139,12 +149,10 @@ impl FallibleHandler for FallibleTestHandler {
         C: EventContext<Payload = Self::Payload>,
     {
         // Send errors are irrelevant here: the receiver may already be gone.
-        if let Some(payload) = message.record().message() {
-            let _ = self
-                .messages_tx
-                .send((message.key().to_string(), payload.clone()))
-                .await;
-        }
+        let _ = self
+            .messages_tx
+            .send((message.key().to_string(), message.payload().clone()))
+            .await;
         Ok(())
     }
 
@@ -165,7 +173,7 @@ impl FallibleHandler for FallibleTestHandler {
     async fn on_excise<C>(
         &self,
         _context: C,
-        _message: ConsumerMessage<Value>,
+        _message: ConsumerMessage<()>,
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

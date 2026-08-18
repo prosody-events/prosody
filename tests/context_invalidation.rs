@@ -4,7 +4,7 @@
 //! method completes. This prevents race conditions and data corruption when
 //! partition ownership changes.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use color_eyre::eyre::{Result, eyre};
 use prosody::tracing::init_test_logging;
@@ -61,6 +61,17 @@ impl EventHandler for ContextInvalidationHandler {
 
         info!("Handler completing - context should be invalidated after this");
         // When this method returns, the context should be invalidated
+    }
+
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<()>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        message.commit().await;
     }
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)

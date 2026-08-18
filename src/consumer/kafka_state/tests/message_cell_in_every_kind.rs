@@ -23,9 +23,7 @@ fn seed_message(loader: &MemoryLoader<Value>, id: i64) -> Result<ConsumerMessage
 fn matches_model(resolved: Option<&ConsumerMessage<Value>>, expected: Option<i64>) -> bool {
     match (resolved, expected) {
         (None, None) => true,
-        (Some(message), Some(id)) => {
-            message.offset() == id && message.record().message() == Some(&json!(id))
-        }
+        (Some(message), Some(id)) => message.offset() == id && message.payload() == &json!(id),
         _ => false,
     }
 }

@@ -55,6 +55,7 @@ use crate::consumer::DemandType;
 use crate::consumer::Keyed;
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::handler::{HandlerMethod, OnExcise, OnMessage};
 use crate::consumer::middleware::{
     FallibleHandler, FallibleHandlerProvider, HandlerMiddleware, Settlement, SettlementHandler,
 };
@@ -136,6 +137,48 @@ where
     }
 }
 
+impl<T> TelemetryHandler<T>
+where
+    T: FallibleHandler,
+{
+    async fn handle<H, C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<H::MessagePayload>,
+        demand_type: DemandType,
+    ) -> Result<T::Output, T::Error>
+    where
+        H: HandlerMethod<T>,
+        C: EventContext<Payload = T::Payload>,
+    {
+        let key = message.key().clone();
+        let offset = message.offset();
+        self.sender.handler_invoked(key.clone(), demand_type);
+        self.sender
+            .message_dispatched(key.clone(), offset, demand_type, self.source.clone());
+        let result = H::call(&self.handler, context, message, demand_type).await;
+        match &result {
+            Ok(_) => {
+                self.sender.handler_succeeded(key.clone(), demand_type);
+                self.sender
+                    .message_succeeded(key, offset, demand_type, self.source.clone());
+            }
+            Err(error) => {
+                self.sender.handler_failed(key.clone(), demand_type);
+                self.sender.message_failed(
+                    key,
+                    offset,
+                    demand_type,
+                    self.source.clone(),
+                    error.classify_error(),
+                    format!("{error:?}").into_boxed_str(),
+                );
+            }
+        }
+        result
+    }
+}
+
 impl<T> FallibleHandler for TelemetryHandler<T>
 where
     T: FallibleHandler,
@@ -160,53 +203,22 @@ where
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        let key = message.key().clone();
-        let offset = message.offset();
-
-        // Record handler invocation
-        self.sender.handler_invoked(key.clone(), demand_type);
-
-        // Emit message dispatched
-        self.sender
-            .message_dispatched(key.clone(), offset, demand_type, self.source.clone());
-
-        // Process the message with the wrapped handler
-        let result = self.handler.on_message(context, message, demand_type).await;
-
-        // Record success or failure
-        match &result {
-            Ok(_) => {
-                self.sender.handler_succeeded(key.clone(), demand_type);
-                self.sender
-                    .message_succeeded(key, offset, demand_type, self.source.clone());
-            }
-            Err(e) => {
-                self.sender.handler_failed(key.clone(), demand_type);
-                self.sender.message_failed(
-                    key,
-                    offset,
-                    demand_type,
-                    self.source.clone(),
-                    e.classify_error(),
-                    format!("{e:?}").into_boxed_str(),
-                );
-            }
-        }
-
-        result
+        self.handle::<OnMessage, _>(context, message, demand_type)
+            .await
     }
 
     /// Records telemetry for an excise record.
-    fn on_excise<C>(
+    async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type)
+        self.handle::<OnExcise, _>(context, message, demand_type)
+            .await
     }
 
     /// Records invocation, success, and failure telemetry for a timer.

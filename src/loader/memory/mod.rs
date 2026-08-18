@@ -7,7 +7,7 @@
 //! [`MemoryLoader::store_message`].
 
 use super::{MessageLoader, PermitMode};
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, Record};
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, ConsumerRecord};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::otel::SpanRelation;
 use crate::related_span;
@@ -110,7 +110,7 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
             offset,
             key,
             timestamp: Utc::now(),
-            record: Record::Message(payload),
+            payload,
             // This loader serves messages it was handed, not Kafka records, so
             // there are no headers to read a result request from.
             request: None,
@@ -153,7 +153,7 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
         partition: Partition,
         offset: Offset,
         mode: PermitMode,
-    ) -> Result<ConsumerMessage<P>, MemoryLoaderError> {
+    ) -> Result<ConsumerRecord<P>, MemoryLoaderError> {
         let semaphore = self.semaphore.clone();
         let permit = match mode {
             PermitMode::Wait => semaphore
@@ -189,7 +189,11 @@ impl<P: Send + Sync + 'static> MemoryLoader<P> {
             key = %message_value.key,
             cached = false,
         );
-        Ok(ConsumerMessage::from_decoded(message_value, span, permit))
+        Ok(ConsumerRecord::Message(ConsumerMessage::from_decoded(
+            message_value,
+            span,
+            permit,
+        )))
     }
 }
 
@@ -208,7 +212,7 @@ impl<P: Clone + Send + Sync + 'static> MessageLoader for MemoryLoader<P> {
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> impl Future<Output = Result<ConsumerMessage<Self::Payload>, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<ConsumerRecord<Self::Payload>, Self::Error>> + Send {
         self.load_message_impl(topic, partition, offset, PermitMode::Wait)
     }
 
@@ -217,7 +221,7 @@ impl<P: Clone + Send + Sync + 'static> MessageLoader for MemoryLoader<P> {
         topic: Topic,
         partition: Partition,
         offset: Offset,
-    ) -> impl Future<Output = Result<ConsumerMessage<Self::Payload>, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<ConsumerRecord<Self::Payload>, Self::Error>> + Send {
         self.load_message_impl(topic, partition, offset, PermitMode::Available)
     }
 }

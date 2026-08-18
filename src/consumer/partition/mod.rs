@@ -14,7 +14,7 @@
 //! of partition-level message processing.
 
 use crate::consumer::EventHandler;
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::ConsumerRecord;
 use crate::consumer::partition::offsets::OffsetTracker;
 use crate::heartbeat::HeartbeatRegistry;
 use crate::loader::MessageLoader;
@@ -102,7 +102,7 @@ struct PartitionContext<P> {
     /// Tracks offset commits and processing progress.
     offsets: OffsetTracker,
     /// Channel receiving messages to process.
-    message_rx: Receiver<ConsumerMessage<P>>,
+    message_rx: Receiver<ConsumerRecord<P>>,
     /// Registry for monitoring processing and timer heartbeats.
     heartbeats: HeartbeatRegistry,
     /// Channel receiving shutdown phase transitions.
@@ -196,7 +196,7 @@ pub struct PartitionManager<P> {
 
     /// Channel for sending messages to be processed
     #[educe(Debug(ignore))]
-    message_tx: Sender<ConsumerMessage<P>>,
+    message_tx: Sender<ConsumerRecord<P>>,
 
     /// Heartbeat registry
     #[educe(Debug(ignore))]
@@ -281,7 +281,10 @@ impl<P: Send + 'static> PartitionManager<P> {
     /// This non-blocking method tries to send a message to the internal
     /// processing queue without waiting. If the queue is full or closed, the
     /// original message is returned to the caller in the `Err` variant.
-    pub fn try_send(&self, message: ConsumerMessage<P>) -> Result<(), ConsumerMessage<P>> {
+    pub(crate) fn try_send_record(
+        &self,
+        message: ConsumerRecord<P>,
+    ) -> Result<(), ConsumerRecord<P>> {
         self.message_tx
             .try_send(message)
             .map_err(|error| match error {

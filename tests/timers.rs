@@ -5,7 +5,7 @@
 //! from message handlers, triggered at the correct times, and properly
 //! canceled when needed.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use ahash::HashSet;
 use color_eyre::eyre::{Result, ensure, eyre};
@@ -90,10 +90,7 @@ impl EventHandler for TimerTestHandler {
     {
         let (msg, uncommitted) = message.into_inner();
         let key = msg.key().to_string();
-        let Some(payload) = msg.record().message().cloned() else {
-            uncommitted.commit().await;
-            return;
-        };
+        let payload = msg.payload().clone();
 
         // Send message event for verification
         if let Err(e) = self
@@ -166,6 +163,17 @@ impl EventHandler for TimerTestHandler {
         uncommitted.commit().await;
     }
 
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<()>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        message.commit().await;
+    }
+
     async fn on_timer<C, U>(&self, _context: C, timer: U, _demand_type: DemandType)
     where
         C: EventContext<Payload = Self::Payload>,
@@ -220,9 +228,8 @@ impl FallibleHandler for InlineReplacementHandler {
     {
         let key = msg.key().to_string();
         let step = msg
-            .record()
-            .message()
-            .and_then(|payload| payload.get("step"))
+            .payload()
+            .get("step")
             .and_then(Value::as_i64)
             .ok_or(TestError)?;
 
@@ -265,7 +272,7 @@ impl FallibleHandler for InlineReplacementHandler {
     async fn on_excise<C>(
         &self,
         _context: C,
-        _message: ConsumerMessage<Self::Payload>,
+        _message: ConsumerMessage<()>,
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

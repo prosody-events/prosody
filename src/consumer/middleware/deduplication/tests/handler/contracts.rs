@@ -154,14 +154,18 @@ impl FallibleHandler for ApplyProbe {
 
     async fn on_excise<C>(
         &self,
-        context: C,
-        message: ConsumerMessage<Self::Payload>,
-        demand_type: DemandType,
+        _context: C,
+        _message: ConsumerMessage<()>,
+        _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type).await
+        self.log.lock().push(ApplyEvent::Handler);
+        match &self.error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 
     async fn on_message<C>(
@@ -338,9 +342,8 @@ fn dedup_id_writer_matches_canonical_reader_derivation() -> color_eyre::Result<(
             TOPIC,
             PARTITION,
             msg.key().as_bytes(),
-            msg.record()
-                .message()
-                .and_then(|payload| payload.get("id"))
+            msg.payload()
+                .get("id")
                 .and_then(|v| v.as_str())
                 .map(str::as_bytes),
             msg.offset(),

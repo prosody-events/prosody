@@ -8,7 +8,7 @@
 //! with fixed golden vectors only catch drift after this match is established;
 //! they cannot prove the match holds in the first place.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -65,6 +65,17 @@ impl EventHandler for PartitionCaptureHandler {
             error!("failed to forward captured partition: {error:#}");
         }
         uncommitted.commit().await;
+    }
+
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<()>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        message.commit().await;
     }
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)

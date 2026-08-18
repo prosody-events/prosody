@@ -34,7 +34,7 @@
 //! within the configured limit, even when messages are distributed across
 //! multiple partitions.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -115,6 +115,17 @@ impl EventHandler for ConcurrencyTestHandler {
         if self.processed.load(Ordering::Acquire) == self.total {
             self.notify.notify_waiters();
         }
+    }
+
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<()>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        message.commit().await;
     }
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)

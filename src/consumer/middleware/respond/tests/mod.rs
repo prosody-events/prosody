@@ -8,7 +8,7 @@
 
 use super::{RespondHandler, Responder};
 use crate::codec::Codec;
-use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, Record};
+use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue};
 use crate::consumer::middleware::log::LogMiddleware;
 use crate::consumer::middleware::providers::{FallibleCloneProvider, LeafHandler};
 use crate::consumer::middleware::retry::{RetryConfiguration, RetryMiddleware};
@@ -162,8 +162,8 @@ fn requesting(index: u8, request_byte: u8, key: &str) -> Result<ConsumerMessage<
 }
 
 /// An excise record that requests one response.
-fn requesting_excise(index: u8, request_byte: u8, key: &str) -> Result<ConsumerMessage<Value>> {
-    create_message_with_record(
+fn requesting_excise(index: u8, request_byte: u8, key: &str) -> Result<ConsumerMessage<()>> {
+    create_message_with_payload(
         key,
         Some(ResultRequest::new(
             RequestId::from_bytes([request_byte; 16]),
@@ -171,7 +171,7 @@ fn requesting_excise(index: u8, request_byte: u8, key: &str) -> Result<ConsumerM
             RequestDeadline::from_unix_micros(4_102_444_800_000_000),
         )),
         Span::current(),
-        Record::Excise,
+        (),
     )
 }
 
@@ -214,15 +214,15 @@ fn create_message(
     request: Option<ResultRequest>,
     span: Span,
 ) -> Result<ConsumerMessage<Value>> {
-    create_message_with_record(key, request, span, Record::Message(Value::default()))
+    create_message_with_payload(key, request, span, Value::default())
 }
 
-fn create_message_with_record(
+fn create_message_with_payload<P: Default + Send + Sync + 'static>(
     key: &str,
     request: Option<ResultRequest>,
     span: Span,
-    record: Record<Value>,
-) -> Result<ConsumerMessage<Value>> {
+    payload: P,
+) -> Result<ConsumerMessage<P>> {
     let semaphore = Arc::new(Semaphore::new(1));
     let permit = semaphore.try_acquire_owned()?;
     Ok(ConsumerMessage::new(
@@ -230,7 +230,7 @@ fn create_message_with_record(
             key: key.into(),
             topic: Topic::from(TOPIC),
             partition: PARTITION,
-            record,
+            payload,
             request,
             ..Default::default()
         },

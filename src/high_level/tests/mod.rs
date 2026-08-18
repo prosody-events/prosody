@@ -116,16 +116,13 @@ impl FallibleHandler for EchoHandler {
     where
         C: EventContext<Payload = Value>,
     {
-        Ok(message
-            .record()
-            .message()
-            .map_or_else(Value::default, Clone::clone))
+        Ok(message.payload().clone())
     }
 
     async fn on_excise<C>(
         &self,
         _ctx: C,
-        _message: ConsumerMessage<Value>,
+        _message: ConsumerMessage<()>,
         _demand: DemandType,
     ) -> Result<Value, Infallible>
     where
@@ -254,7 +251,7 @@ impl FallibleHandler for NoOpHandler {
     async fn on_excise<C>(
         &self,
         _context: C,
-        _message: ConsumerMessage<Self::Payload>,
+        _message: ConsumerMessage<()>,
         _demand: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where
@@ -305,7 +302,7 @@ impl FallibleHandler for BinaryHandler {
     async fn on_excise<C>(
         &self,
         _context: C,
-        _message: ConsumerMessage<Self::Payload>,
+        _message: ConsumerMessage<()>,
         _demand: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

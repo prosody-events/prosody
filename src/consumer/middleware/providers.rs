@@ -34,7 +34,7 @@
 use std::future::Future;
 
 use crate::consumer::event_context::EventContext;
-use crate::consumer::message::{ConsumerMessage, Record};
+use crate::consumer::message::ConsumerMessage;
 use crate::consumer::{DemandType, EventHandler, HandlerProvider, Partition, Topic};
 use crate::timers::Trigger;
 
@@ -77,16 +77,13 @@ where
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        match message.record() {
-            Record::Message(_) => self.0.on_message(context, message, demand_type).await,
-            Record::Excise => self.0.on_excise(context, message, demand_type).await,
-        }
+        self.0.on_message(context, message, demand_type).await
     }
 
     async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

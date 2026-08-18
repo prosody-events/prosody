@@ -6,7 +6,7 @@
 //! message handling via Kafka, and this module tests specific subscription
 //! scenarios to validate that only expected messages are received.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use crate::common::handler::ChannelHandler;
 use color_eyre::eyre::{Result, ensure, eyre};

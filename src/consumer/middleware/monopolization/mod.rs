@@ -1,43 +1,11 @@
-//! Monopolization detection middleware for preventing key-level execution
-//! monopolies.
+//! Prevents one key from monopolizing handler execution.
 //!
-//! Detects when a single key monopolizes handler execution time (>90% over 5
-//! minutes) and returns an error for monopolizing keys.
+//! The middleware rejects a key when it exceeds the configured execution
+//! ratio in the configured time window.
 //!
-//! # Execution
-//!
-//! **Request Path:**
-//! 1. Check if current key is monopolizing execution time
-//! 2. Return error for monopolizing keys, otherwise proceed to inner handler
-//!
-//! **Background Processing:**
-//! - Tracks execution intervals per key using `IntervalSet<u64>`
-//! - Maintains rolling 5-minute window of execution intervals
-//!
-//! # Apply-hook contract
-//!
-//! This middleware is a "reject-at-this-layer" gate. The `FallibleHandler`
-//! invariant requires that for every `on_message`/`on_timer` call on the
-//! inner handler that runs and returns, the framework must call exactly one
-//! of `after_commit`/`after_abort` on that same inner handler — and if the
-//! inner handler did NOT run, neither apply hook fires for it.
-//!
-//! There are exactly two work outcomes here:
-//!
-//! - **Inner ran** — `Ok(_)` or `Err(MonopolizationError::Handler(_))`. The
-//!   apply hook is forwarded to the inner handler with the inner-typed result.
-//! - **Inner did NOT run** — `Err(MonopolizationError::Monopolization { .. })`
-//!   was produced at this layer before delegation. The inner handler's apply
-//!   hook is suppressed.
-//!
-//! The inner is invoked at most once per call; per-invocation invariant
-//! trivially upheld.
-//!
-//! # Configuration
-//!
-//! - `monopolization_threshold`: Execution time ratio threshold (default: 0.9
-//!   for 90%)
-//! - `window_duration`: Rolling window duration (default: 5 minutes)
+//! The middleware forwards an apply hook only when the inner handler ran.
+//! It suppresses the hook after a monopolization rejection. It calls the
+//! inner handler at most once for each event.
 
 use derive_builder::Builder;
 use humantime::format_duration;
@@ -54,6 +22,7 @@ use validator::{Validate, ValidationErrors};
 
 use crate::consumer::event_context::EventContext;
 use crate::consumer::message::ConsumerMessage;
+use crate::consumer::middleware::handler::{HandlerMethod, OnExcise, OnMessage};
 use crate::consumer::middleware::{
     ClassifyError, ErrorCategory, FallibleHandler, FallibleHandlerProvider, HandlerMiddleware,
     Settlement, SettlementHandler,
@@ -271,27 +240,21 @@ where
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        let tp_key = TopicPartitionKey::new(self.topic, self.partition, message.key().clone());
-        if let Some(error) = self.check_monopolization(&tp_key, Instant::now()) {
-            return Err(error);
-        }
-
-        self.handler
-            .on_message(context, message, demand_type)
+        self.handle::<OnMessage, _>(context, message, demand_type)
             .await
-            .map_err(MonopolizationError::Handler)
     }
 
-    fn on_excise<C>(
+    async fn on_excise<C>(
         &self,
         context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         demand_type: DemandType,
-    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send
+    ) -> Result<Self::Output, Self::Error>
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        FallibleHandler::on_message(self, context, message, demand_type)
+        self.handle::<OnExcise, _>(context, message, demand_type)
+            .await
     }
 
     async fn on_timer<C>(
@@ -377,6 +340,26 @@ impl<T> MonopolizationHandler<T>
 where
     T: FallibleHandler,
 {
+    async fn handle<H, C>(
+        &self,
+        context: C,
+        message: ConsumerMessage<H::MessagePayload>,
+        demand_type: DemandType,
+    ) -> Result<T::Output, MonopolizationError<T::Error>>
+    where
+        H: HandlerMethod<T>,
+        C: EventContext<Payload = T::Payload>,
+    {
+        let tp_key = TopicPartitionKey::new(self.topic, self.partition, message.key().clone());
+        if let Some(error) = self.check_monopolization(&tp_key, Instant::now()) {
+            return Err(error);
+        }
+
+        H::call(&self.handler, context, message, demand_type)
+            .await
+            .map_err(MonopolizationError::Handler)
+    }
+
     /// Checks if a key is monopolizing execution time.
     #[expect(
         clippy::cast_precision_loss,

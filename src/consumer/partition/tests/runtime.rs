@@ -21,38 +21,50 @@ async fn test_partition_manager_event_type_filtering() -> color_eyre::Result<()>
         ConsumerMessageValue {
             offset: Offset::from(0u8),
             key: "key".into(),
-            record: Record::Message(json!({ "type": "disallowed" })),
+            payload: json!({ "type": "disallowed" }),
             ..Default::default()
         },
         Span::current(),
         test_semaphore.clone().try_acquire_owned()?,
     );
-    assert!(partition_manager.try_send(disallowed).is_ok());
+    assert!(
+        partition_manager
+            .try_send_record(ConsumerRecord::Message(disallowed))
+            .is_ok()
+    );
 
     // 2) an allowed event ("type": "allowed")
     let allowed = ConsumerMessage::new(
         ConsumerMessageValue {
             offset: Offset::from(1u8),
             key: "key".into(),
-            record: Record::Message(json!({ "type": "allowed" })),
+            payload: json!({ "type": "allowed" }),
             ..Default::default()
         },
         Span::current(),
         test_semaphore.clone().try_acquire_owned()?,
     );
-    assert!(partition_manager.try_send(allowed).is_ok());
+    assert!(
+        partition_manager
+            .try_send_record(ConsumerRecord::Message(allowed))
+            .is_ok()
+    );
 
     let excise = ConsumerMessage::new(
         ConsumerMessageValue {
             offset: Offset::from(2_u8),
             key: "key".into(),
-            record: Record::Excise,
+            payload: (),
             ..Default::default()
         },
         Span::current(),
         test_semaphore.try_acquire_owned()?,
     );
-    assert!(partition_manager.try_send(excise).is_ok());
+    assert!(
+        partition_manager
+            .try_send_record(ConsumerRecord::Excise(excise))
+            .is_ok()
+    );
 
     wait_for_processed_offsets(&handler, 2, Duration::from_secs(1)).await?;
 
@@ -165,6 +177,32 @@ impl TestHandler {
             delay,
         }
     }
+
+    async fn process<P: Send + Sync + 'static>(&self, message: UncommittedMessage<P>) {
+        let key = message.key().clone();
+        let offset = message.offset();
+        let processed = self.processed_offsets.clone();
+        let concurrent_flag = self.has_concurrent_processing.clone();
+        let keys_proc = self.keys_in_processing.clone();
+        let notify = self.notify.clone();
+        let delay = self.delay;
+        {
+            let mut keys = keys_proc.lock().await;
+            if keys.contains(&key) {
+                let mut flag = concurrent_flag.lock().await;
+                *flag = true;
+            } else {
+                keys.push(key.clone());
+            }
+        }
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+        processed.lock().await.push(offset);
+        keys_proc.lock().await.retain(|candidate| candidate != &key);
+        notify.notify_waiters();
+        message.commit().await;
+    }
 }
 
 impl HasProcessedOffsets for TestHandler {
@@ -189,37 +227,18 @@ impl EventHandler for TestHandler {
     where
         C: EventContext<Payload = Self::Payload>,
     {
-        let key = message.key().clone();
-        let offset = message.offset();
-        let processed = self.processed_offsets.clone();
-        let concurrent_flag = self.has_concurrent_processing.clone();
-        let keys_proc = self.keys_in_processing.clone();
-        let notify = self.notify.clone();
-        let delay = self.delay;
-        async move {
-            {
-                let mut keys = keys_proc.lock().await;
-                if keys.contains(&key) {
-                    let mut flag = concurrent_flag.lock().await;
-                    *flag = true;
-                } else {
-                    keys.push(key.clone());
-                }
-            }
-            if !delay.is_zero() {
-                sleep(delay).await;
-            }
-            {
-                let mut list = processed.lock().await;
-                list.push(offset);
-            };
-            {
-                let mut keys = keys_proc.lock().await;
-                keys.retain(|k| k != &key);
-            };
-            notify.notify_waiters();
-            message.commit().await;
-        }
+        self.process(message)
+    }
+
+    async fn on_excise<C>(
+        &self,
+        _context: C,
+        message: UncommittedMessage<()>,
+        _demand_type: DemandType,
+    ) where
+        C: EventContext<Payload = Self::Payload>,
+    {
+        self.process(message).await;
     }
 
     async fn on_timer<C, U>(&self, _context: C, _timer: U, _demand_type: DemandType)
@@ -274,7 +293,9 @@ async fn test_partition_manager_timer_heartbeat_integration() -> color_eyre::Res
     // registering their heartbeats
     let message = create_test_message(1, "test-key")?;
     assert!(
-        partition_manager.try_send(message).is_ok(),
+        partition_manager
+            .try_send_record(ConsumerRecord::Message(message))
+            .is_ok(),
         "Message send should succeed"
     );
     wait_for_processed_offsets(&handler, 1, Duration::from_secs(1)).await?;

@@ -2,7 +2,7 @@ use tracing::{Instrument, debug, info, warn};
 
 use super::{MessageDeferHandler, MessageDeferOutput};
 use crate::consumer::event_context::EventContext;
-use crate::consumer::message::ConsumerMessage;
+use crate::consumer::message::{ConsumerMessage, ConsumerRecord};
 use crate::consumer::middleware::FallibleHandler;
 use crate::consumer::middleware::defer::calculate_backoff;
 use crate::consumer::middleware::defer::decider::DeferralDecider;
@@ -10,6 +10,7 @@ use crate::consumer::middleware::defer::error::{DeferError, DeferResult};
 use crate::consumer::middleware::defer::message::store::{
     MessageDeferStore, MessageRetryCompletionResult,
 };
+use crate::consumer::middleware::handler::HandlerMethod;
 use crate::consumer::{DemandType, Keyed};
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
@@ -246,7 +247,7 @@ where
         message_key: &Key,
         offset: Offset,
         retry_count: u32,
-    ) -> DeferResult<Option<ConsumerMessage<T::Payload>>, M::Error, T::Error, L::Error>
+    ) -> DeferResult<Option<ConsumerRecord<T::Payload>>, M::Error, T::Error, L::Error>
     where
         C: EventContext<Payload = T::Payload>,
     {
@@ -294,7 +295,7 @@ where
         offset: Offset,
         retry_count: u32,
         error: L::Error,
-    ) -> DeferResult<Option<ConsumerMessage<T::Payload>>, M::Error, T::Error, L::Error>
+    ) -> DeferResult<Option<ConsumerRecord<T::Payload>>, M::Error, T::Error, L::Error>
     where
         C: EventContext<Payload = T::Payload>,
     {
@@ -381,17 +382,18 @@ where
     /// Permanent / Terminal failure: surfaces as
     /// `Err(DeferError::Handler(_))` and the inner sees the wrapping
     /// framework's chosen apply hook with that `Err`.
-    pub(super) async fn retry_deferred_message<C>(
+    pub(super) async fn retry_deferred_message<H, C>(
         &self,
         context: C,
         trigger: &Trigger,
         message_key: &Key,
         offset: Offset,
         retry_count: u32,
-        message: ConsumerMessage<T::Payload>,
+        message: ConsumerMessage<H::MessagePayload>,
     ) -> DeferResult<MessageDeferOutput<T::Output, T::Error>, M::Error, T::Error, L::Error>
     where
         C: EventContext<Payload = T::Payload>,
+        H: HandlerMethod<T>,
     {
         self.sender.timer_dispatched(
             trigger.key.clone(),
@@ -411,9 +413,7 @@ where
         // Instrument with the reload span so the retried handler runs inside
         // it ambiently, mirroring the partition dispatch arms.
         let load_span = message.span();
-        match self
-            .handler
-            .on_message(context.clone(), message, DemandType::Failure)
+        match H::call(&self.handler, context.clone(), message, DemandType::Failure)
             .instrument(load_span)
             .await
         {

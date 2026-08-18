@@ -12,7 +12,7 @@
 //! and make the id comparison vacuous); the `is_some` guards fail loudly if
 //! spans are ever disabled.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use color_eyre::eyre::{Result, eyre};
 use prosody::Topic;
@@ -86,7 +86,7 @@ impl FallibleHandler for AmbientProbe {
     async fn on_excise<C>(
         &self,
         _context: C,
-        message: ConsumerMessage<Self::Payload>,
+        message: ConsumerMessage<()>,
         _demand_type: DemandType,
     ) -> Result<Self::Output, Self::Error>
     where

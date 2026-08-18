@@ -305,7 +305,7 @@ async fn run_interleaved_async(scenario: InterleavedScenario) -> color_eyre::Res
     // SlotMap gives stable DefaultKey handles with no index bookkeeping.
     let mut handles: SlotMap<
         DefaultKey,
-        JoinHandle<Result<ConsumerMessage<serde_json::Value>, KafkaLoaderError>>,
+        JoinHandle<Result<ConsumerRecord<serde_json::Value>, KafkaLoaderError>>,
     > = SlotMap::new();
     let mut pending: AHashMap<ResolvedKey, Vec<DefaultKey>> = AHashMap::new();
 
