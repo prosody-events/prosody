@@ -697,6 +697,37 @@ pub(crate) async fn run_deque_trace(
 /// `contains_key` agrees with it, and that `KeysetPresence` holds (any live
 /// entry implies a present keyset cell).
 pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> Result<bool> {
+    run_map_trace_inner(trace, commit_mode, 3, None).await
+}
+
+pub(crate) async fn run_map_keys_prefix_trace(trace: MapTrace, limit: usize) -> Result<bool> {
+    run_map_prefix_trace(trace, limit, PrefixFamily::Keys).await
+}
+
+pub(crate) async fn run_map_entries_prefix_trace(trace: MapTrace, limit: usize) -> Result<bool> {
+    run_map_prefix_trace(trace, limit, PrefixFamily::Entries).await
+}
+
+async fn run_map_prefix_trace(trace: MapTrace, limit: usize, family: PrefixFamily) -> Result<bool> {
+    if !run_map_trace_inner(
+        trace.clone(),
+        CommitMode::ReadCommitted,
+        4096,
+        Some((limit, family)),
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    run_map_trace_inner(trace, CommitMode::ReadCommitted, 0, Some((limit, family))).await
+}
+
+async fn run_map_trace_inner(
+    trace: MapTrace,
+    commit_mode: CommitMode,
+    keyset_limit: usize,
+    prefix: Option<(usize, PrefixFamily)>,
+) -> Result<bool> {
     run_collection_trace(
         trace,
         map_state::<I64KeyCodec, JsonCodec>("mp"),
@@ -707,7 +738,7 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
         // to the keyset's existence (the property proves it cannot tell).
         CollectionDef {
             commit_mode,
-            keyset_limit: 3,
+            keyset_limit,
             ..CollectionDef::new(None)
         },
         async |handle, op, scratch: &mut BTreeMap<i64, Value>| match op {
@@ -743,11 +774,17 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
             }
         },
         async |handle, model, backing: &Backing<'_>| {
-            Ok(assert_map(handle, model).await?
+            Ok(assert_map(handle, model, prefix).await?
                 && assert_keyset_present(backing.cells, backing.state_key, model)?)
         },
     )
     .await
+}
+
+#[derive(Clone, Copy)]
+enum PrefixFamily {
+    Keys,
+    Entries,
 }
 
 /// Map TTL keyset-refresh (what `finalize` stages): on a collection **with a
@@ -1513,6 +1550,7 @@ where
 async fn assert_map<S>(
     handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
     model: &BTreeMap<i64, Value>,
+    prefix: Option<(usize, PrefixFamily)>,
 ) -> Result<bool>
 where
     S: StateSession,
@@ -1541,10 +1579,29 @@ where
         return Ok(false);
     }
     let descending_keys: Vec<i64> = model.keys().rev().copied().collect();
-    Ok(
-        collect_map_keys(handle, Direction::Backward).await? == descending_keys
-            && handle.is_empty().await? == model.is_empty(),
-    )
+    if collect_map_keys(handle, Direction::Backward).await? != descending_keys {
+        return Ok(false);
+    }
+    if let Some((limit, family)) = prefix {
+        for dir in [Direction::Forward, Direction::Backward] {
+            let matches = match family {
+                PrefixFamily::Keys => {
+                    let unlimited = collect_map_keys(handle, dir).await?;
+                    drain(handle.keys_with_test_limit(dir, limit)).await?
+                        == unlimited.into_iter().take(limit).collect::<Vec<_>>()
+                }
+                PrefixFamily::Entries => {
+                    let unlimited = collect_map(handle, dir).await?;
+                    drain(handle.stream_with_limit(dir, limit)).await?
+                        == unlimited.into_iter().take(limit).collect::<Vec<_>>()
+                }
+            };
+            if !matches {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(handle.is_empty().await? == model.is_empty())
 }
 
 /// Collects a map handle's `stream(dir)` into a `(key, value)` vector.
@@ -1700,6 +1757,11 @@ fn map_presence_survives_an_undecodable_value() -> Result<()> {
         block_on(async {
             assert!(!handle.is_empty().await?);
             assert_presence_route_calls(&counting, tracked_route);
+            assert_eq!(
+                counting.presence_batch_width(),
+                usize::from(tracked_route),
+                "tracked is_empty reads one coordinate"
+            );
             counting.reset();
             assert!(
                 handle.contains_key(&key).await.map_err(|e| eyre!("{e}"))?,

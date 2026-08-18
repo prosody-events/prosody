@@ -20,8 +20,9 @@ use self::cell_suite::{SECTIONS, bytes, cell_in};
 use self::collection_suite::{
     DequeCapacityShape, DequeHoles, DequeInterleave, DequeTrace, MapGetManyInput, MapInterleave,
     MapKeyHoles, MapTrace, finalize_and_promote, run_deque_capacity_convergence, run_deque_holes,
-    run_deque_stream_interleave, run_deque_trace, run_map_get_many_parity_trace,
-    run_map_key_scan_holes, run_map_keyset_exact_trace, run_map_stream_interleave, run_map_trace,
+    run_deque_stream_interleave, run_deque_trace, run_map_entries_prefix_trace,
+    run_map_get_many_parity_trace, run_map_key_scan_holes, run_map_keys_prefix_trace,
+    run_map_keyset_exact_trace, run_map_stream_interleave, run_map_trace,
     run_map_ttl_keyset_refresh_trace,
 };
 use self::publication_suite::{PublicationTrace, run_publication_trace};
@@ -904,6 +905,11 @@ async fn map_keys_drain_resolves(keyset_limit: usize, n: usize, get_contrast: bo
     let handle = descriptor.bind(&session).map_err(|e| eyre!("bind: {e}"))?;
 
     assert!(!handle.is_empty().await.map_err(|e| eyre!("{e}"))?);
+    assert_eq!(
+        counting.presence_batch_width(),
+        usize::from(get_contrast),
+        "tracked is_empty reads one coordinate"
+    );
 
     for dir in [Direction::Forward, Direction::Backward] {
         let drained: Vec<i64> = {
@@ -1073,6 +1079,24 @@ fn prop_map_collection_lifecycle_read_uncommitted() {
         executor::block_on(run_map_trace(trace, CommitMode::ReadUncommitted))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
+}
+
+/// Limited map keys equal the unlimited present-key prefix on both plan arms.
+#[test]
+fn prop_map_keys_limit_is_present_prefix() {
+    fn property(trace: MapTrace, limit: u8) -> Result<bool> {
+        executor::block_on(run_map_keys_prefix_trace(trace, usize::from(limit)))
+    }
+    QuickCheck::new().quickcheck(property as fn(MapTrace, u8) -> Result<bool>);
+}
+
+/// Limited map entries equal the unlimited present-entry prefix on both arms.
+#[test]
+fn prop_map_entries_limit_is_present_prefix() {
+    fn property(trace: MapTrace, limit: u8) -> Result<bool> {
+        executor::block_on(run_map_entries_prefix_trace(trace, usize::from(limit)))
+    }
+    QuickCheck::new().quickcheck(property as fn(MapTrace, u8) -> Result<bool>);
 }
 
 /// Keyset exactness: over an arbitrary committed trace on a non-overflowing

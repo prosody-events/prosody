@@ -755,13 +755,26 @@ where
     /// [`stream`](Self::stream)'s (same keyset-plan decision); only the value
     /// work is dropped.
     pub fn keys(&self, dir: Direction) -> impl Stream<Item = MapKeyItem<KC, V>> + '_ {
+        self.keys_with_limit(dir, None)
+    }
+
+    fn keys_with_limit(
+        &self,
+        dir: Direction,
+        limit: Option<usize>,
+    ) -> impl Stream<Item = MapKeyItem<KC, V>> + '_ {
         let span = info_span!(
             "map.keys",
             collection = self.cells.name().as_str(),
             direction = ?dir,
         );
         try_stream! {
-            let inner = self.stream_plan(dir).instrument(span.clone()).await?.keys();
+            let plan = self.stream_plan(dir).instrument(span.clone()).await?;
+            let plan = match limit {
+                Some(limit) => plan.with_limit(limit),
+                None => plan,
+            };
+            let inner = plan.keys();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;
@@ -776,9 +789,36 @@ where
     /// Returns a key codec error or an access error from the session.
     #[instrument(name = "map.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, MapStateError<CellCodecError<V>>> {
-        let keys = self.keys(Direction::Forward);
+        let keys = self.keys_with_limit(Direction::Forward, Some(1));
         futures::pin_mut!(keys);
         Ok(keys.next().await.transpose()?.is_none())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stream_with_limit(
+        &self,
+        dir: Direction,
+        limit: usize,
+    ) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
+    where
+        for<'s> ContextOf<'s, V>: FromSession<'s, S>,
+    {
+        try_stream! {
+            let inner = self.stream_plan(dir).await?.with_limit(limit).entries();
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().await {
+                yield item?;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keys_with_test_limit(
+        &self,
+        dir: Direction,
+        limit: usize,
+    ) -> impl Stream<Item = MapKeyItem<KC, V>> + '_ {
+        self.keys_with_limit(dir, Some(limit))
     }
 
     /// Durably commits this map's buffered ops mid-handler — entries and keyset
