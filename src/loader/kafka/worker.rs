@@ -1,8 +1,8 @@
 use super::request::{handle_request, seek_to_first_active_offset, unassign_partition};
 use super::{
-    ActiveRequests, BTreeMap, BaseConsumer, BorrowedMessage, Codec, DecodedMessage, Handle,
-    HashMap, Heartbeat, KafkaError, KafkaLoaderError, LoaderConfiguration, Message, Offset,
-    Partition, Request, Responses, Span, SpanRelation, TextMapCompositePropagator, Timeout, Topic,
+    ActiveRequests, BTreeMap, BaseConsumer, BorrowedMessage, Codec, Handle, HashMap, Heartbeat,
+    KafkaError, KafkaLoaderError, LoaderConfiguration, Message, Offset, Partition, RecordMeta,
+    Request, Responses, Span, SpanRelation, TextMapCompositePropagator, Timeout, Topic,
     TryRecvError, debug, decode_record, error, mpsc, new_propagator, related_span, select, warn,
 };
 use crate::subsystem::SubsystemName;
@@ -271,20 +271,16 @@ fn cleanup_if_empty<P>(
 /// Creates a load span with the decoded record's upstream context.
 ///
 /// The span lifecycle does not depend on cache eviction.
-pub(super) fn create_load_span<P>(
-    decoded: &DecodedMessage<P>,
-    cached: bool,
-    relation: SpanRelation,
-) -> Span {
+pub(super) fn create_load_span(meta: RecordMeta<'_>, cached: bool, relation: SpanRelation) -> Span {
     related_span!(
         relation,
-        decoded.parent_context.clone(),
+        meta.parent_context.clone(),
         "load",
         messaging.system = "kafka",
-        partition = decoded.value.partition,
-        offset = decoded.value.offset,
-        topic = %decoded.value.topic,
-        key = %decoded.value.key,
+        partition = meta.partition,
+        offset = meta.offset,
+        topic = %meta.topic,
+        key = %meta.key,
         cached = cached,
     )
 }

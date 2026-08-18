@@ -45,7 +45,7 @@
 
 use super::{MessageLoader, PermitMode};
 use crate::consumer::ConsumerConfiguration;
-use crate::consumer::decode::{DecodedMessage, DecodedRecord, decode_record};
+use crate::consumer::decode::{DecodedRecord, RecordMeta, decode_record};
 use crate::consumer::message::ConsumerRecord;
 use crate::heartbeat::{Heartbeat, HeartbeatRegistry};
 use crate::propagator::new_propagator;
@@ -333,11 +333,9 @@ where
             (decoded, false)
         };
 
-        Ok(decoded_message.into_record(
-            load_permit,
-            |decoded| create_load_span(decoded, cached, self.message_spans),
-            |decoded| create_load_span(decoded, cached, self.message_spans),
-        ))
+        Ok(decoded_message.into_record(load_permit, |meta| {
+            create_load_span(meta, cached, self.message_spans)
+        }))
     }
 
     /// Loads a message from Kafka and caches the decoded result.

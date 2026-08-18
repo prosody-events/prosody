@@ -30,7 +30,7 @@ use crate::consumer::extractor::MessageExtractor;
 use crate::consumer::message::{ConsumerMessage, ConsumerMessageValue, ConsumerRecord};
 use crate::peer::response::headers::{ResultRequest, parse_result_request};
 use crate::subsystem::SubsystemName;
-use crate::{SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
+use crate::{Key, Offset, Partition, SOURCE_SYSTEM_HEADER, SourceSystem, Topic};
 
 /// A decoded Kafka message without live span references.
 ///
@@ -61,6 +61,19 @@ pub struct DecodedMessage<P> {
     pub parent_context: Context,
 }
 
+/// The payload-independent fields a record span is built from.
+///
+/// Both record variants expose the same metadata, so one span builder
+/// serves both. Payload access stays impossible by construction.
+#[derive(Clone, Copy)]
+pub(crate) struct RecordMeta<'a> {
+    pub(crate) parent_context: &'a Context,
+    pub(crate) topic: Topic,
+    pub(crate) partition: Partition,
+    pub(crate) offset: Offset,
+    pub(crate) key: &'a Key,
+}
+
 /// A decoded Kafka record before its consumer message is constructed.
 #[derive(Clone, Debug)]
 pub enum DecodedRecord<P> {
@@ -70,20 +83,32 @@ pub enum DecodedRecord<P> {
     Excise(DecodedMessage<()>),
 }
 
+impl<P> DecodedMessage<P> {
+    /// Borrows the metadata a record span is built from.
+    pub(crate) fn meta(&self) -> RecordMeta<'_> {
+        RecordMeta {
+            parent_context: &self.parent_context,
+            topic: self.value.topic,
+            partition: self.value.partition,
+            offset: self.value.offset,
+            key: &self.value.key,
+        }
+    }
+}
+
 impl<P> DecodedRecord<P> {
     pub(crate) fn into_record(
         self,
         permit: OwnedSemaphorePermit,
-        message_span: impl FnOnce(&DecodedMessage<P>) -> Span,
-        excise_span: impl FnOnce(&DecodedMessage<()>) -> Span,
+        span: impl FnOnce(RecordMeta<'_>) -> Span,
     ) -> ConsumerRecord<P> {
         match self {
             Self::Message(decoded) => {
-                let span = message_span(&decoded);
+                let span = span(decoded.meta());
                 ConsumerRecord::Message(ConsumerMessage::from_decoded(decoded.value, span, permit))
             }
             Self::Excise(decoded) => {
-                let span = excise_span(&decoded);
+                let span = span(decoded.meta());
                 ConsumerRecord::Excise(ConsumerMessage::from_decoded(decoded.value, span, permit))
             }
         }

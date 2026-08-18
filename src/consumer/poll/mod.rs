@@ -26,7 +26,7 @@ use tracing::{Span, debug, error, warn};
 use crate::Codec;
 use crate::EventType;
 use crate::Topic;
-use crate::consumer::decode::{DecodedMessage, ResultRequestReader, decode_record};
+use crate::consumer::decode::{RecordMeta, ResultRequestReader, decode_record};
 use crate::consumer::message::ConsumerRecord;
 use crate::consumer::partition::PartitionManager;
 use crate::consumer::{Managers, WatermarkVersion};
@@ -192,11 +192,7 @@ where
 
         let record =
             decode_record(&mut message, &propagator, &mut codec, &requests).map(|record| {
-                record.into_record(
-                    permit,
-                    |decoded| create_receive_span(decoded, message_spans),
-                    |decoded| create_receive_span(decoded, message_spans),
-                )
+                record.into_record(permit, |meta| create_receive_span(meta, message_spans))
             });
 
         if let Some(record) = record {
@@ -214,16 +210,16 @@ where
 ///
 /// Creates a span named "receive" with message metadata attributes and
 /// connects it to the upstream trace via the configured [`SpanRelation`].
-fn create_receive_span<P>(decoded: &DecodedMessage<P>, relation: SpanRelation) -> Span {
+fn create_receive_span(meta: RecordMeta<'_>, relation: SpanRelation) -> Span {
     related_span!(
         relation,
-        decoded.parent_context.clone(),
+        meta.parent_context.clone(),
         "receive",
         messaging.system = "kafka",
-        partition = decoded.value.partition,
-        offset = decoded.value.offset,
-        topic = %decoded.value.topic,
-        key = %decoded.value.key,
+        partition = meta.partition,
+        offset = meta.offset,
+        topic = %meta.topic,
+        key = %meta.key,
     )
 }
 
