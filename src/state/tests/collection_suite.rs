@@ -1587,13 +1587,15 @@ where
             let matches = match family {
                 PrefixFamily::Keys => {
                     let unlimited = collect_map_keys(handle, dir).await?;
-                    drain(handle.keys_with_test_limit(dir, limit)).await?
-                        == unlimited.into_iter().take(limit).collect::<Vec<_>>()
+                    let limit = NonZeroUsize::new(limit).unwrap_or(NonZeroUsize::MIN);
+                    drain(handle.keys_with_limit(dir, Some(limit))).await?
+                        == unlimited.into_iter().take(limit.get()).collect::<Vec<_>>()
                 }
                 PrefixFamily::Entries => {
                     let unlimited = collect_map(handle, dir).await?;
-                    drain(handle.stream_with_limit(dir, limit)).await?
-                        == unlimited.into_iter().take(limit).collect::<Vec<_>>()
+                    let limit = NonZeroUsize::new(limit).unwrap_or(NonZeroUsize::MIN);
+                    drain(handle.stream_with_limit(dir, Some(limit))).await?
+                        == unlimited.into_iter().take(limit.get()).collect::<Vec<_>>()
                 }
             };
             if !matches {

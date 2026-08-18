@@ -137,7 +137,7 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         start: &KeyOf<T>,
         dir: Direction,
         end: &KeyOf<T>,
-        limit: usize,
+        limit: NonZeroUsize,
     ) -> RangePlan<S, T> {
         RangePlan::new(
             self.plan_base(family.section()),

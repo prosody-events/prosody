@@ -91,6 +91,7 @@ use educe::Educe;
 use futures::stream::{Stream, StreamExt};
 use std::error::Error;
 use std::fmt::Display;
+use std::num::NonZeroUsize;
 use std::slice::from_ref;
 use thiserror::Error;
 use tracing::{Instrument, info_span, instrument, warn};
@@ -718,6 +719,17 @@ where
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
     {
+        self.stream_with_limit(dir, None)
+    }
+
+    pub(crate) fn stream_with_limit(
+        &self,
+        dir: Direction,
+        limit: Option<NonZeroUsize>,
+    ) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
+    where
+        for<'s> ContextOf<'s, V>: FromSession<'s, S>,
+    {
         // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
         // so each inner await is instrumented with a clone instead; the
         // span's recorded time is the stream's own work. Unlike the sibling
@@ -732,7 +744,14 @@ where
         try_stream! {
             // Init: `stream_plan` reads the keyset under an admission it drops
             // as it returns, before this `?` observes the result.
-            let inner = self.stream_plan(dir).instrument(span.clone()).await?.entries();
+            let plan = self.stream_plan(dir).instrument(span.clone()).await?;
+            // No production caller limits entries yet; owner ruling keeps
+            // this path symmetric with the key scan.
+            let plan = match limit {
+                Some(limit) => plan.with_limit(limit),
+                None => plan,
+            };
+            let inner = plan.entries();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;
@@ -758,10 +777,10 @@ where
         self.keys_with_limit(dir, None)
     }
 
-    fn keys_with_limit(
+    pub(crate) fn keys_with_limit(
         &self,
         dir: Direction,
-        limit: Option<usize>,
+        limit: Option<NonZeroUsize>,
     ) -> impl Stream<Item = MapKeyItem<KC, V>> + '_ {
         let span = info_span!(
             "map.keys",
@@ -789,36 +808,9 @@ where
     /// Returns a key codec error or an access error from the session.
     #[instrument(name = "map.is_empty", skip_all, fields(collection = self.cells.name().as_str()), err)]
     pub async fn is_empty(&self) -> Result<bool, MapStateError<CellCodecError<V>>> {
-        let keys = self.keys_with_limit(Direction::Forward, Some(1));
+        let keys = self.keys_with_limit(Direction::Forward, Some(NonZeroUsize::MIN));
         futures::pin_mut!(keys);
         Ok(keys.next().await.transpose()?.is_none())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn stream_with_limit(
-        &self,
-        dir: Direction,
-        limit: usize,
-    ) -> impl Stream<Item = MapStreamItem<KC, V>> + '_
-    where
-        for<'s> ContextOf<'s, V>: FromSession<'s, S>,
-    {
-        try_stream! {
-            let inner = self.stream_plan(dir).await?.with_limit(limit).entries();
-            futures::pin_mut!(inner);
-            while let Some(item) = inner.next().await {
-                yield item?;
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn keys_with_test_limit(
-        &self,
-        dir: Direction,
-        limit: usize,
-    ) -> impl Stream<Item = MapKeyItem<KC, V>> + '_ {
-        self.keys_with_limit(dir, Some(limit))
     }
 
     /// Durably commits this map's buffered ops mid-handler — entries and keyset

@@ -403,7 +403,7 @@ where
                 &start,
                 dir,
                 &end,
-                len,
+                NonZeroUsize::new(len).unwrap_or(NonZeroUsize::MIN),
             )));
         }
         // Point-get arm. `absolute` is monotone in the position. One check of

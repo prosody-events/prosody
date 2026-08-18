@@ -29,6 +29,7 @@ use bytes::Bytes;
 use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt};
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
 
 /// One item a resolving managed stream yields: a decoded key paired with its
@@ -92,7 +93,7 @@ impl<S: StateSession> PlanBase<S> {
 pub(crate) struct CoordinatePlan<S: StateSession, T: CellType> {
     base: PlanBase<S>,
     keys: Vec<KeyOf<T>>,
-    limit: Option<usize>,
+    limit: Option<NonZeroUsize>,
 }
 
 /// A managed durable-range plan: one contiguous span of one section, walked in
@@ -112,7 +113,7 @@ pub(crate) struct RangePlan<S: StateSession, T> {
     start: ScanEdge<Coordinate>,
     dir: Direction,
     end: ScanEdge<Coordinate>,
-    limit: Option<usize>,
+    limit: Option<NonZeroUsize>,
     _cell: PhantomData<fn() -> T>,
 }
 
@@ -135,7 +136,7 @@ pub(crate) enum Plan<S: StateSession, T: CellType> {
 
 impl<S: StateSession, T: CellType> Plan<S, T> {
     /// Sets the maximum number of present items that the plan can yield.
-    pub(crate) fn with_limit(mut self, limit: usize) -> Self {
+    pub(crate) fn with_limit(mut self, limit: NonZeroUsize) -> Self {
         match &mut self {
             Self::Points(plan) => plan.limit = Some(limit),
             Self::Scan(plan) => plan.limit = Some(limit),
@@ -180,7 +181,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         let session = self.base.session.clone();
-        let limit = self.limit.unwrap_or(usize::MAX);
+        let limit = self.limit.map_or(usize::MAX, NonZeroUsize::get);
         fenced::<S, _, T>(session, self.entry_source().take(limit))
     }
 
@@ -189,7 +190,7 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
     /// with zero loader fetches.
     pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
         let session = self.base.session.clone();
-        let limit = self.limit.unwrap_or(usize::MAX);
+        let limit = self.limit.map_or(usize::MAX, NonZeroUsize::get);
         fenced::<S, _, T>(session, self.key_source().take(limit))
     }
 
@@ -204,8 +205,6 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
             let base = &base;
             let chunks = stream::unfold((keys.into_iter().peekable(), true), |(mut keys, first)| async move {
                 keys.peek()?; // exhausted ⇒ unfold ends
-                // No production caller limits entries yet; owner ruling keeps
-                // this path symmetric with the key scan.
                 let chunk: CellBuffer<KeyOf<T>> =
                     keys.by_ref().take(chunk_width(limit, first)).collect();
                 // Admission spans the chunk's raw batch read ONLY: it is
@@ -319,9 +318,9 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
 
 /// Narrows the first tracked chunk to the limit.
 /// Dead tracked keys make later chunks return to full width.
-fn chunk_width(limit: Option<usize>, first: bool) -> usize {
+fn chunk_width(limit: Option<NonZeroUsize>, first: bool) -> usize {
     if first {
-        limit.map_or(CELL_BATCH, |limit| limit.min(CELL_BATCH))
+        limit.map_or(CELL_BATCH, |limit| limit.get().min(CELL_BATCH))
     } else {
         CELL_BATCH
     }
@@ -336,7 +335,7 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
         start: ScanEdge<Coordinate>,
         dir: Direction,
         end: ScanEdge<Coordinate>,
-        limit: Option<usize>,
+        limit: Option<NonZeroUsize>,
     ) -> Self {
         Self {
             base,
@@ -357,7 +356,7 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
             start: self.start.as_ref(),
             dir: self.dir,
             end: self.end.as_ref(),
-            limit: self.limit,
+            limit: self.limit.map(NonZeroUsize::get),
         };
         <S::Engine as sealed::ReadEngine<S>>::page(
             &self.base.session,
@@ -375,7 +374,7 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
             start: self.start.as_ref(),
             dir: self.dir,
             end: self.end.as_ref(),
-            limit: self.limit,
+            limit: self.limit.map(NonZeroUsize::get),
         };
         <S::Engine as sealed::ReadEngine<S>>::page_keys(
             &self.base.session,

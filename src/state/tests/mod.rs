@@ -1085,7 +1085,8 @@ fn prop_map_collection_lifecycle_read_uncommitted() {
 #[test]
 fn prop_map_keys_limit_is_present_prefix() {
     fn property(trace: MapTrace, limit: u8) -> Result<bool> {
-        executor::block_on(run_map_keys_prefix_trace(trace, usize::from(limit)))
+        // A zero plan limit is uncompilable, so this property starts at one.
+        executor::block_on(run_map_keys_prefix_trace(trace, usize::from(limit.max(1))))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace, u8) -> Result<bool>);
 }
@@ -1094,7 +1095,11 @@ fn prop_map_keys_limit_is_present_prefix() {
 #[test]
 fn prop_map_entries_limit_is_present_prefix() {
     fn property(trace: MapTrace, limit: u8) -> Result<bool> {
-        executor::block_on(run_map_entries_prefix_trace(trace, usize::from(limit)))
+        // A zero plan limit is uncompilable, so this property starts at one.
+        executor::block_on(run_map_entries_prefix_trace(
+            trace,
+            usize::from(limit.max(1)),
+        ))
     }
     QuickCheck::new().quickcheck(property as fn(MapTrace, u8) -> Result<bool>);
 }
