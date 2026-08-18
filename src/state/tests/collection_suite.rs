@@ -700,15 +700,25 @@ pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> R
     run_map_trace_inner(trace, commit_mode, 3, None).await
 }
 
-pub(crate) async fn run_map_keys_prefix_trace(trace: MapTrace, limit: usize) -> Result<bool> {
+pub(crate) async fn run_map_keys_prefix_trace(
+    trace: MapTrace,
+    limit: NonZeroUsize,
+) -> Result<bool> {
     run_map_prefix_trace(trace, limit, PrefixFamily::Keys).await
 }
 
-pub(crate) async fn run_map_entries_prefix_trace(trace: MapTrace, limit: usize) -> Result<bool> {
+pub(crate) async fn run_map_entries_prefix_trace(
+    trace: MapTrace,
+    limit: NonZeroUsize,
+) -> Result<bool> {
     run_map_prefix_trace(trace, limit, PrefixFamily::Entries).await
 }
 
-async fn run_map_prefix_trace(trace: MapTrace, limit: usize, family: PrefixFamily) -> Result<bool> {
+async fn run_map_prefix_trace(
+    trace: MapTrace,
+    limit: NonZeroUsize,
+    family: PrefixFamily,
+) -> Result<bool> {
     if !run_map_trace_inner(
         trace.clone(),
         CommitMode::ReadCommitted,
@@ -726,7 +736,7 @@ async fn run_map_trace_inner(
     trace: MapTrace,
     commit_mode: CommitMode,
     keyset_limit: usize,
-    prefix: Option<(usize, PrefixFamily)>,
+    prefix: Option<(NonZeroUsize, PrefixFamily)>,
 ) -> Result<bool> {
     run_collection_trace(
         trace,
@@ -1550,7 +1560,7 @@ where
 async fn assert_map<S>(
     handle: &MapHandle<S, I64KeyCodec, JsonCodec>,
     model: &BTreeMap<i64, Value>,
-    prefix: Option<(usize, PrefixFamily)>,
+    prefix: Option<(NonZeroUsize, PrefixFamily)>,
 ) -> Result<bool>
 where
     S: StateSession,
@@ -1587,13 +1597,11 @@ where
             let matches = match family {
                 PrefixFamily::Keys => {
                     let unlimited = collect_map_keys(handle, dir).await?;
-                    let limit = NonZeroUsize::new(limit).unwrap_or(NonZeroUsize::MIN);
                     drain(handle.keys_with_limit(dir, Some(limit))).await?
                         == unlimited.into_iter().take(limit.get()).collect::<Vec<_>>()
                 }
                 PrefixFamily::Entries => {
                     let unlimited = collect_map(handle, dir).await?;
-                    let limit = NonZeroUsize::new(limit).unwrap_or(NonZeroUsize::MIN);
                     drain(handle.stream_with_limit(dir, Some(limit))).await?
                         == unlimited.into_iter().take(limit.get()).collect::<Vec<_>>()
                 }
