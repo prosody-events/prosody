@@ -1101,9 +1101,9 @@ impl CapacityFactor {
                     self.record_residual(residual);
                 }
                 self.residual_integrated_hazards.fill(0.0_f64);
-                state -= 1;
             }
-            state += started as usize;
+            // One group is a simultaneous batch; see `fold_trace`.
+            state = state + started as usize - completed as usize;
             previous_offset = offset;
         }
         let tail = Duration::from_micros(evidence.window().exposure_micros() - previous_offset)
@@ -2085,6 +2085,11 @@ fn linear_rate_band(grid: &CapacityGrid, index: usize) -> LinearRateBand {
     }
 }
 
+/// Folds a boundary trace into per-state exposure and completion counts.
+///
+/// One trace group is a simultaneous batch: the state path is defined at
+/// group boundaries only, and a group's completions are attributed to the
+/// state that accrued the exposure they came from.
 fn fold_trace(
     evidence: OccupancyTraceEvidence<'_>,
     exposure_seconds: &mut [f64],
@@ -2101,11 +2106,8 @@ fn fold_trace(
         .zip(evidence.start_groups())
     {
         exposure_seconds[state] += Duration::from_micros(offset - previous_offset).as_secs_f64();
-        for _ in 0..completed {
-            completion_counts[state] = completion_counts[state].saturating_add(1);
-            state -= 1;
-        }
-        state += started as usize;
+        completion_counts[state] = completion_counts[state].saturating_add(completed);
+        state = state + started as usize - completed as usize;
         previous_offset = offset;
     }
     exposure_seconds[state] +=

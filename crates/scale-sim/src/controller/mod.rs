@@ -1625,15 +1625,15 @@ fn fold_capacity_trace(
             .get_mut(state)
             .ok_or(PlantError::MetricCapacity)?;
         *exposure += Duration::from_micros(elapsed).as_secs_f64();
-        for _ in 0..group.completed_attempts() {
-            let count = completion_counts
-                .get_mut(state)
-                .ok_or(PlantError::MetricCapacity)?;
-            *count = count.saturating_add(1);
-            state = state.checked_sub(1).ok_or(PlantError::MetricCapacity)?;
-        }
+        // One group is a simultaneous batch: its completions pair with the
+        // state that accrued the exposure, and only the net state advances.
+        let count = completion_counts
+            .get_mut(state)
+            .ok_or(PlantError::MetricCapacity)?;
+        *count = count.saturating_add(group.completed_attempts());
         state = state
             .checked_add(group.started_attempts() as usize)
+            .and_then(|value| value.checked_sub(group.completed_attempts() as usize))
             .ok_or(PlantError::MetricCapacity)?;
         previous_offset = group.offset_micros();
     }
@@ -2186,8 +2186,8 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                 )
                 .ok_or(PlantError::MetricCapacity)?;
             final_busy_slots = final_busy_slots
-                .checked_sub(group.completed_attempts())
-                .and_then(|state| state.checked_add(group.started_attempts()))
+                .checked_add(group.started_attempts())
+                .and_then(|state| state.checked_sub(group.completed_attempts()))
                 .ok_or(PlantError::MetricCapacity)?;
             previous_offset = group.offset_micros();
         }
@@ -2802,11 +2802,10 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
 /// Coalesces exact slot transitions into at most `group_count_max` boundary
 /// groups over one report window.
 ///
-/// Starts round down to their bin's start boundary. Completions round up to
-/// their bin's end boundary. A completion therefore always applies at a
-/// later boundary than its own start. The certified intake applies
-/// completions before starts at one offset, so this bracketing keeps every
-/// physically valid transition stream representable.
+/// Every transition in a bin coalesces to the bin's end boundary, so each
+/// boundary state equals the exact state at that time. One group is a
+/// simultaneous batch at its boundary; the certified intake checks the net
+/// state, so every physically valid transition stream stays representable.
 fn bucket_window_transitions(
     transitions: &[AttemptTransition],
     window_start_micros: u64,
@@ -2818,16 +2817,15 @@ fn bucket_window_transitions(
     if exposure_micros == 0 {
         return Err(PlantError::MetricCapacity);
     }
-    let bin_count = u64::from(group_count_max).saturating_sub(1).max(1);
-    let boundary_count =
-        usize::try_from(bin_count.saturating_add(1)).map_err(|_| PlantError::PlatformLimit)?;
+    let bin_count = u64::from(group_count_max).max(1);
+    let boundary_count = usize::try_from(bin_count).map_err(|_| PlantError::PlatformLimit)?;
     if boundary_count > groups.capacity() {
         return Err(PlantError::MetricCapacity);
     }
     for boundary in 0..boundary_count {
         let index = u64::try_from(boundary).map_err(|_| PlantError::PlatformLimit)?;
         groups.push(OccupancyTransition::new(
-            index.saturating_mul(exposure_micros) / bin_count,
+            index.saturating_add(1).saturating_mul(exposure_micros) / bin_count,
             0,
             0,
         ));
@@ -2842,11 +2840,11 @@ fn bucket_window_transitions(
                 .min(bin_count.saturating_sub(1)),
         )
         .map_err(|_| PlantError::PlatformLimit)?;
-        let (index, completed, started) = match transition.kind {
-            AttemptTransitionKind::Start => (bin, 0_u32, 1_u32),
-            AttemptTransitionKind::Completion => (bin + 1, 1_u32, 0_u32),
+        let (completed, started) = match transition.kind {
+            AttemptTransitionKind::Start => (0_u32, 1_u32),
+            AttemptTransitionKind::Completion => (1_u32, 0_u32),
         };
-        let group = groups.get_mut(index).ok_or(PlantError::MetricCapacity)?;
+        let group = groups.get_mut(bin).ok_or(PlantError::MetricCapacity)?;
         *group = OccupancyTransition::new(
             group.offset_micros(),
             group

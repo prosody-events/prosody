@@ -8,8 +8,8 @@ use super::{
 use crate::{AttemptTransition, AttemptTransitionKind, PlantError};
 
 /// Bucketed traces must preserve totals, keep strictly increasing offsets
-/// within the window, respect the group bound, and stay admissible under the
-/// intake order: completions apply before starts at each offset.
+/// within the window, respect the group bound, and stay admissible under
+/// the intake's batch semantics: each group's net state stays non-negative.
 #[quickcheck]
 fn bucketed_transitions_stay_admissible_and_preserve_totals(
     initial_code: u8,
@@ -73,9 +73,10 @@ fn bucketed_transitions_stay_admissible_and_preserve_totals(
     let mut state = initial_busy_slots;
     let admissible = groups.iter().all(|group| {
         state
-            .checked_sub(group.completed_attempts())
+            .checked_add(group.started_attempts())
+            .and_then(|value| value.checked_sub(group.completed_attempts()))
             .is_some_and(|next| {
-                state = next.saturating_add(group.started_attempts());
+                state = next;
                 true
             })
     });

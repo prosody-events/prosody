@@ -1820,11 +1820,11 @@ impl ObservationBuffer {
             busy_slot_micros = busy_slot_micros
                 .checked_add(u128::from(elapsed) * u128::from(state))
                 .ok_or(ObservationError::CountOverflow)?;
-            state = state
-                .checked_sub(transition.completed_attempts)
-                .ok_or(ObservationError::ResourceBusySlots)?;
+            // One group is a simultaneous batch: coalescing destroys the
+            // within-offset event order, so only the net state is checked.
             state = state
                 .checked_add(transition.started_attempts)
+                .and_then(|value| value.checked_sub(transition.completed_attempts))
                 .filter(|value| *value <= self.resource_concurrency_max as u32)
                 .ok_or(ObservationError::ResourceBusySlots)?;
             completed_attempts = completed_attempts
