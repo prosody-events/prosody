@@ -273,6 +273,7 @@ pub struct CapacityGrid {
     collapse_lows: Vec<f64>,
     collapse_highs: Vec<f64>,
     no_knee: Vec<f64>,
+    linear_state_max: Vec<usize>,
     knee_values: Vec<f64>,
     knee_indexes: Vec<u32>,
     knee_cell_count: u32,
@@ -343,6 +344,7 @@ impl CapacityGrid {
         let mut collapse_cells = Vec::with_capacity(cell_count);
         let mut collapse_lows = Vec::with_capacity(cell_count);
         let mut collapse_highs = Vec::with_capacity(cell_count);
+        let mut linear_state_max = Vec::with_capacity(cell_count);
         for (service_index, &service_time_seconds) in service_times_seconds.iter().enumerate() {
             for (capacity_index, &capacity_per_second) in capacities_per_second.iter().enumerate() {
                 for (collapse_index, &collapse) in collapse_values.iter().enumerate() {
@@ -355,6 +357,8 @@ impl CapacityGrid {
                     collapse_cells.push(collapse);
                     collapse_lows.push(collapse_bounds[collapse_index].0);
                     collapse_highs.push(collapse_bounds[collapse_index].1);
+                    let knee = capacity_per_second * service_time_seconds;
+                    linear_state_max.push(knee.floor() as usize);
                 }
             }
         }
@@ -370,27 +374,10 @@ impl CapacityGrid {
             collapse_lows.push(0.0_f64);
             collapse_highs.push(0.0_f64);
             no_knee.push(1.0_f64);
+            linear_state_max.push(usize::MAX);
         }
-        let mut knee_values = service_time_cells
-            .iter()
-            .take(knee_cell_count)
-            .zip(capacity_cells.iter().take(knee_cell_count))
-            .map(|(service_time, capacity)| service_time * capacity)
-            .collect::<Vec<_>>();
-        knee_values.sort_by(f64::total_cmp);
-        knee_values.dedup_by(|left, right| left.total_cmp(right).is_eq());
-        let mut knee_indexes = Vec::with_capacity(knee_cell_count);
-        for (&service_time, &capacity) in service_time_cells
-            .iter()
-            .take(knee_cell_count)
-            .zip(capacity_cells.iter().take(knee_cell_count))
-        {
-            let knee = service_time * capacity;
-            let index = knee_values
-                .binary_search_by(|candidate| candidate.total_cmp(&knee))
-                .map_err(|_| CapacityGridError::KneeIndex)?;
-            knee_indexes.push(u32::try_from(index).map_err(|_| CapacityGridError::TooLarge)?);
-        }
+        let (knee_values, knee_indexes) =
+            knee_metadata(&service_time_cells, &capacity_cells, knee_cell_count)?;
         Ok(Self {
             service_times_seconds: service_time_cells,
             service_time_lows,
@@ -402,6 +389,7 @@ impl CapacityGrid {
             collapse_lows,
             collapse_highs,
             no_knee,
+            linear_state_max,
             knee_values,
             knee_indexes,
             knee_cell_count: u32::try_from(knee_cell_count)
@@ -458,6 +446,32 @@ impl CapacityGrid {
         };
         (low, high)
     }
+}
+
+fn knee_metadata(
+    service_times: &[f64],
+    capacities: &[f64],
+    knee_cell_count: usize,
+) -> Result<(Vec<f64>, Vec<u32>), CapacityGridError> {
+    let cells = service_times
+        .iter()
+        .take(knee_cell_count)
+        .zip(capacities.iter().take(knee_cell_count));
+    let mut values = cells
+        .clone()
+        .map(|(service, capacity)| service * capacity)
+        .collect::<Vec<_>>();
+    values.sort_by(f64::total_cmp);
+    values.dedup_by(|left, right| left.total_cmp(right).is_eq());
+    let mut indexes = Vec::with_capacity(knee_cell_count);
+    for (&service, &capacity) in cells {
+        let knee = service * capacity;
+        let index = values
+            .binary_search_by(|candidate| candidate.total_cmp(&knee))
+            .map_err(|_| CapacityGridError::KneeIndex)?;
+        indexes.push(u32::try_from(index).map_err(|_| CapacityGridError::TooLarge)?);
+    }
+    Ok((values, indexes))
 }
 
 /// One passive resource observation window.
@@ -1014,25 +1028,13 @@ impl CapacityFactor {
             &mut self.state_completion_counts,
         );
         self.update_residual_check(evidence);
-        for index in 0..self.likelihoods.len() {
-            fill_state_rates(&self.grid, index, &mut self.state_rates);
-            let linear_rate_band = linear_rate_band(&self.grid, index);
-            let raw = path_log_score_with_rates(
-                &self.state_rates,
-                &self.state_exposure_seconds,
-                &self.state_completion_counts,
-            );
-            let normalizer = feasibility_probability_with_rates(
-                &self.state_rates,
-                linear_rate_band,
-                evidence,
-                &mut self.forward_probabilities,
-                &mut self.forward_coefficients,
-                &mut self.forward_work,
-            );
-            self.likelihoods[index] = normalizer
-                .filter(|value| *value > 0.0_f64)
-                .map_or(f64::NEG_INFINITY, |value| raw - value.ln());
+        for index in 0..self.grid.knee_cell_count as usize {
+            fill_knee_state_rates(&self.grid, index, &mut self.state_rates);
+            self.update_cell_likelihood(index, evidence);
+        }
+        for index in self.grid.knee_cell_count as usize..self.likelihoods.len() {
+            fill_no_knee_state_rates(&self.grid, index, &mut self.state_rates);
+            self.update_cell_likelihood(index, evidence);
         }
         let prior_predictive = log_weighted_sum(&self.prior_weights, &self.likelihoods);
         if posterior_update_eligible(prior_predictive) {
@@ -1040,6 +1042,26 @@ impl CapacityFactor {
         }
         self.previous_window_concurrency = Some(evidence.mean_concurrency());
         self.transition(exposure);
+    }
+
+    fn update_cell_likelihood(&mut self, index: usize, evidence: OccupancyTraceEvidence<'_>) {
+        let linear_rate_band = linear_rate_band(&self.grid, index);
+        let raw = path_log_score_with_rates(
+            &self.state_rates,
+            &self.state_exposure_seconds,
+            &self.state_completion_counts,
+        );
+        let normalizer = feasibility_probability_with_rates(
+            &self.state_rates,
+            linear_rate_band,
+            evidence,
+            &mut self.forward_probabilities,
+            &mut self.forward_coefficients,
+            &mut self.forward_work,
+        );
+        self.likelihoods[index] = normalizer
+            .filter(|value| *value > 0.0_f64)
+            .map_or(f64::NEG_INFINITY, |value| raw - value.ln());
     }
 
     pub(crate) fn omit_observation(&mut self, elapsed: Duration) {
@@ -1154,6 +1176,8 @@ impl CapacityFactor {
     }
 
     fn refresh_residual_check(&mut self, sample_count: f64) {
+        // Keep the priced sort. Incremental sorted maintenance adds index code for
+        // negligible work.
         self.residual_sort_scratch[..self.residual_len]
             .copy_from_slice(&self.residuals[..self.residual_len]);
         self.residual_sort_scratch[..self.residual_len].sort_unstable_by(f64::total_cmp);
@@ -1730,6 +1754,11 @@ fn capacity_grid_storage_bytes(cell_count: usize, knee_cell_count: usize) -> Opt
         .checked_mul(10)
         .and_then(|count| count.checked_mul(size_of::<f64>()))
         .and_then(|bytes| {
+            cell_count
+                .checked_mul(size_of::<usize>())
+                .and_then(|metadata_bytes| bytes.checked_add(metadata_bytes))
+        })
+        .and_then(|bytes| {
             knee_cell_count
                 .checked_mul(size_of::<f64>() + size_of::<u32>())
                 .and_then(|knee_bytes| bytes.checked_add(knee_bytes))
@@ -2108,21 +2137,49 @@ fn state_rate(grid: &CapacityGrid, index: usize, state: usize) -> f64 {
     )
 }
 
-fn fill_state_rates(grid: &CapacityGrid, index: usize, rates: &mut [f64]) {
+fn fill_knee_state_rates(grid: &CapacityGrid, index: usize, rates: &mut [f64]) {
+    let service_time_seconds = grid.service_times_seconds[index];
+    let capacity_per_second = grid.capacities_per_second[index];
+    let collapse = grid.collapse_values[index];
+    let knee = capacity_per_second * service_time_seconds;
     for (state, rate) in rates.iter_mut().enumerate() {
-        *rate = state_rate(grid, index, state);
+        let concurrency = u32::try_from(state).map_or(f64::from(u32::MAX), f64::from);
+        *rate = if concurrency <= 0.0_f64 {
+            0.0_f64
+        } else if concurrency <= knee {
+            concurrency / service_time_seconds
+        } else {
+            let excess = (concurrency - knee) / knee;
+            capacity_per_second / (1.0_f64 + collapse * excess * excess)
+        };
+    }
+}
+
+fn fill_no_knee_state_rates(grid: &CapacityGrid, index: usize, rates: &mut [f64]) {
+    let service_time_seconds = grid.service_times_seconds[index];
+    for (state, rate) in rates.iter_mut().enumerate() {
+        let concurrency = u32::try_from(state).map_or(f64::from(u32::MAX), f64::from);
+        *rate = if concurrency <= 0.0_f64 {
+            0.0_f64
+        } else {
+            concurrency / service_time_seconds
+        };
+    }
+}
+
+#[cfg(test)]
+fn fill_state_rates(grid: &CapacityGrid, index: usize, rates: &mut [f64]) {
+    if index < grid.knee_cell_count as usize {
+        fill_knee_state_rates(grid, index, rates);
+    } else {
+        fill_no_knee_state_rates(grid, index, rates);
     }
 }
 
 fn linear_rate_band(grid: &CapacityGrid, index: usize) -> LinearRateBand {
-    let state_max = if grid.no_knee[index] > 0.0_f64 {
-        usize::MAX
-    } else {
-        (grid.capacities_per_second[index] * grid.service_times_seconds[index]).floor() as usize
-    };
     LinearRateBand {
         service_time_seconds: grid.service_times_seconds[index],
-        state_max,
+        state_max: grid.linear_state_max[index],
     }
 }
 
@@ -2483,10 +2540,12 @@ fn pure_death_step_with_rates(
         return Some(source_charge);
     }
     let first_rate = rates[low];
-    let all_equal = rates[low..=high]
+    // This bitwise scan is semantic; knee thresholds diverge at integer-knee ULP
+    // corners and width-one collapse bands, while its linear cost is negligible.
+    if rates[low..=high]
         .iter()
-        .all(|rate| rate.to_bits() == first_rate.to_bits());
-    if all_equal {
+        .all(|rate| rate.to_bits() == first_rate.to_bits())
+    {
         equal_rate_death_step(
             first_rate,
             low,
@@ -3274,7 +3333,12 @@ pub(super) fn curve_throughput<S: Simd>(
         sustainable.store_slice(&mut output[start..end]);
     }
     for candidate in vector_count * lane_count..concurrency.len() {
-        output[candidate] = curve.sustainable_throughput(concurrency[candidate]);
+        let concurrency = concurrency[candidate];
+        output[candidate] = if concurrency <= 0.0_f64 {
+            0.0_f64
+        } else {
+            (concurrency / service_time_seconds).min(ceiling)
+        };
     }
 }
 

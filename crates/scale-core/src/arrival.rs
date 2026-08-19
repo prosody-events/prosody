@@ -299,8 +299,10 @@ pub(crate) struct ArrivalFactor {
     hazards: Box<[f64]>,
     rates: Box<[f64]>,
     reset_probability: [Box<[f64]>; RESET_COUNT],
+    reset_means: [f64; RESET_COUNT],
     probability: Box<[f64]>,
     scratch: Box<[f64]>,
+    rate_scratch: Box<[f64]>,
     // Calendar segment changes take effect at the next evidence boundary.
     // Each interval belongs to the segment active at its start.
     // This assignment is exact for the declared discrete model.
@@ -359,6 +361,13 @@ impl ArrivalFactor {
                 })
                 .collect::<Box<[_]>>()
         });
+        let reset_means = reset_probability.each_ref().map(|probabilities| {
+            probabilities
+                .iter()
+                .zip(&rates)
+                .map(|(probability, rate)| probability * rate)
+                .sum::<f64>()
+        });
         let cell_count = model.hazard_count * RESET_COUNT * model.rate_count;
         let mut probability = vec![0.0_f64; cell_count].into_boxed_slice();
         for hazard in 0..model.hazard_count {
@@ -374,8 +383,10 @@ impl ArrivalFactor {
             hazards,
             rates,
             reset_probability,
+            reset_means,
             probability,
             scratch: vec![0.0_f64; cell_count].into_boxed_slice(),
+            rate_scratch: vec![0.0_f64; model.rate_count].into_boxed_slice(),
             calendar_artifact: None,
             calendar_position: 0,
             calendar_shape: 0.0_f64,
@@ -437,6 +448,11 @@ impl ArrivalFactor {
             return;
         }
         self.scratch.fill(0.0_f64);
+        if let Some(value) = count {
+            for (likelihood, rate) in self.rate_scratch.iter_mut().zip(&self.rates) {
+                *likelihood = log_poisson_mass(value, rate * duration);
+            }
+        }
         for hazard in 0..self.hazards.len() {
             let retained = (-self.hazards[hazard] * duration).exp();
             for reset in 0..RESET_COUNT {
@@ -449,9 +465,8 @@ impl ArrivalFactor {
                     let index = cell(hazard, reset, destination, self.rates.len());
                     let prior = self.probability[index] * retained
                         + reset_mass * self.reset_probability[reset][destination];
-                    self.scratch[index] = count.map_or(prior, |value| {
-                        prior.ln() + log_poisson_mass(value, self.rates[destination] * duration)
-                    });
+                    self.scratch[index] =
+                        count.map_or(prior, |_| prior.ln() + self.rate_scratch[destination]);
                 }
             }
         }
@@ -533,11 +548,7 @@ impl ArrivalFactor {
                     group += probability;
                     retained_mean += probability * self.rates[rate];
                 }
-                let reset_mean = self.reset_probability[reset]
-                    .iter()
-                    .zip(&self.rates)
-                    .map(|(probability, rate)| probability * rate)
-                    .sum::<f64>();
+                let reset_mean = self.reset_means[reset];
                 mean += retained * retained_mean + (1.0_f64 - retained) * group * reset_mean;
             }
         }
@@ -600,7 +611,7 @@ impl ArrivalFactor {
     }
 
     pub(crate) fn count_predictive(
-        &self,
+        &mut self,
         now_micros: u64,
         observed_count: u32,
         exposure_seconds: f64,
@@ -659,13 +670,12 @@ impl ArrivalFactor {
     }
 
     fn predictive_cdf(
-        &self,
+        &mut self,
         count: u64,
         exposure_seconds: f64,
         transition_seconds: f64,
     ) -> Result<f64, ArrivalPredictiveError> {
-        let mut poisson_cdfs = vec![0.0_f64; self.rates.len()];
-        for (poisson_cdf, rate) in poisson_cdfs.iter_mut().zip(&self.rates) {
+        for (poisson_cdf, rate) in self.rate_scratch.iter_mut().zip(&self.rates) {
             let mean = rate * exposure_seconds;
             if PoissonMean::new(mean).is_none() {
                 return Err(ArrivalPredictiveError::InvalidExposure);
@@ -681,7 +691,7 @@ impl ArrivalFactor {
                 let group = (0..self.rates.len())
                     .map(|rate| self.probability[cell(hazard, reset, rate, self.rates.len())])
                     .sum::<f64>();
-                for (rate, poisson_cdf) in poisson_cdfs.iter().copied().enumerate() {
+                for (rate, poisson_cdf) in self.rate_scratch.iter().copied().enumerate() {
                     let probability = retained
                         * self.probability[cell(hazard, reset, rate, self.rates.len())]
                         + (1.0_f64 - retained) * group * self.reset_probability[reset][rate];
@@ -829,11 +839,14 @@ impl ArrivalFactor {
         length
     }
 
-    fn log_predictive_mass(&self, count: u32, exposure: f64) -> f64 {
+    fn log_predictive_mass(&mut self, count: u32, exposure: f64) -> f64 {
         self.predictive_probability(count, exposure).ln()
     }
 
-    fn predictive_probability(&self, count: u32, exposure: f64) -> f64 {
+    fn predictive_probability(&mut self, count: u32, exposure: f64) -> f64 {
+        for (mass, rate) in self.rate_scratch.iter_mut().zip(&self.rates) {
+            *mass = poisson_mass(count, rate * exposure);
+        }
         let mut mass = 0.0_f64;
         for hazard in 0..self.hazards.len() {
             let retained = (-self.hazards[hazard] * exposure).exp();
@@ -845,7 +858,7 @@ impl ArrivalFactor {
                     let destination = retained
                         * self.probability[cell(hazard, reset, rate, self.rates.len())]
                         + (1.0_f64 - retained) * group * self.reset_probability[reset][rate];
-                    mass += destination * poisson_mass(count, self.rates[rate] * exposure);
+                    mass += destination * self.rate_scratch[rate];
                 }
             }
         }

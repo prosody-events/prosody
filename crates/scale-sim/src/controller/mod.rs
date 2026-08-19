@@ -2485,7 +2485,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             })
     }
 
-    fn arrival_prediction(&self, now_micros: u64) -> Result<ArrivalPrediction, PlantError> {
+    fn arrival_prediction(&mut self, now_micros: u64) -> Result<ArrivalPrediction, PlantError> {
         let ArrivalEvidenceSample::Accepted(window) = self.arrival_evidence_sample else {
             return Ok(ArrivalPrediction::missing());
         };

@@ -269,6 +269,7 @@ fn terminal_closure(queue: f64, capacity: f64, horizon_seconds: f64) -> (f64, f6
 }
 
 impl SupplyTrajectory<'_> {
+    #[cfg(test)]
     fn capacity_at_micros(&self, at_micros: u64) -> f64 {
         let mut capacity = self.initial;
         for event in 0..self.pause_micros.len() {
@@ -285,12 +286,67 @@ impl SupplyTrajectory<'_> {
         capacity
     }
 
+    #[cfg(test)]
     fn next_boundary_micros(&self, after_micros: u64) -> Option<u64> {
         self.pause_micros
             .iter()
             .chain(self.ready_micros)
             .copied()
             .filter(|boundary| *boundary > after_micros)
+            .min()
+    }
+}
+
+/// `SupplyTrajectory` owns sorted pause times, so equal pauses keep their input
+/// order and the last tie wins.
+struct TrajectoryCursor<'a> {
+    trajectory: &'a SupplyTrajectory<'a>,
+    pause_count: usize,
+}
+
+impl<'a> TrajectoryCursor<'a> {
+    const fn new(trajectory: &'a SupplyTrajectory<'a>) -> Self {
+        Self {
+            trajectory,
+            pause_count: 0,
+        }
+    }
+
+    fn advance_to(&mut self, at_micros: u64) {
+        while self
+            .trajectory
+            .pause_micros
+            .get(self.pause_count)
+            .is_some_and(|pause| *pause <= at_micros)
+        {
+            self.pause_count += 1;
+        }
+    }
+
+    fn capacity(&self, at_micros: u64) -> f64 {
+        if self.pause_count == 0 {
+            return self.trajectory.initial;
+        }
+        let event = self.pause_count - 1;
+        if at_micros < self.trajectory.ready_micros[event] {
+            self.trajectory.during[event]
+        } else {
+            self.trajectory.after[event]
+        }
+    }
+
+    fn next_boundary_micros(&self, after_micros: u64) -> Option<u64> {
+        self.trajectory
+            .pause_micros
+            .get(self.pause_count)
+            .into_iter()
+            .chain(
+                self.trajectory
+                    .ready_micros
+                    .iter()
+                    .filter(|boundary| **boundary > after_micros),
+            )
+            .copied()
             .min()
     }
 }
@@ -324,6 +380,7 @@ impl ArrivalPath<'_> {
         count
     }
 
+    #[cfg(test)]
     fn rate_at(&self, at: f64) -> f64 {
         let relative = (at - self.start_seconds).max(0.0_f64);
         if self.end_seconds.last().is_none_or(|end| relative >= *end) {
@@ -336,6 +393,7 @@ impl ArrivalPath<'_> {
         self.rates.get(index).copied().map_or(0.0_f64, |rate| rate)
     }
 
+    #[cfg(test)]
     fn next_boundary(&self, after: f64) -> Option<f64> {
         let relative = (after - self.start_seconds).max(0.0_f64);
         self.end_seconds
@@ -344,6 +402,7 @@ impl ArrivalPath<'_> {
             .map(|end| self.start_seconds + end)
     }
 
+    #[cfg(test)]
     fn deadline_rate_at(&self, at: f64, budget_seconds: f64) -> f64 {
         if at < self.start_seconds + budget_seconds {
             0.0_f64
@@ -352,6 +411,7 @@ impl ArrivalPath<'_> {
         }
     }
 
+    #[cfg(test)]
     fn next_deadline_boundary(&self, after: f64, budget_seconds: f64) -> Option<f64> {
         let first = self.start_seconds + budget_seconds;
         if first > after {
@@ -362,6 +422,118 @@ impl ArrivalPath<'_> {
             .get(self.end_seconds.partition_point(|end| *end <= relative))
             .copied()
             .map(|end| self.start_seconds + end + budget_seconds)
+    }
+}
+
+struct ArrivalCursor<'a> {
+    path: &'a ArrivalPath<'a>,
+    segment: usize,
+    deadline_rate_segment: usize,
+    deadline_boundary_segment: usize,
+}
+
+impl<'a> ArrivalCursor<'a> {
+    const fn new(path: &'a ArrivalPath<'a>) -> Self {
+        Self {
+            path,
+            segment: 0,
+            deadline_rate_segment: 0,
+            deadline_boundary_segment: 0,
+        }
+    }
+
+    fn advance_to(&mut self, at: f64, budget_seconds: f64) {
+        let relative = (at - self.path.start_seconds).max(0.0_f64);
+        while self
+            .path
+            .end_seconds
+            .get(self.segment)
+            .is_some_and(|end| relative >= *end)
+        {
+            self.segment += 1;
+        }
+        if at < self.path.start_seconds + budget_seconds {
+            return;
+        }
+        let deadline_rate_relative = ((at - budget_seconds) - self.path.start_seconds).max(0.0_f64);
+        while self
+            .path
+            .end_seconds
+            .get(self.deadline_rate_segment)
+            .is_some_and(|end| deadline_rate_relative >= *end)
+        {
+            self.deadline_rate_segment += 1;
+        }
+        let deadline_boundary_relative = at - self.path.start_seconds - budget_seconds;
+        while self
+            .path
+            .end_seconds
+            .get(self.deadline_boundary_segment)
+            .is_some_and(|end| deadline_boundary_relative >= *end)
+        {
+            self.deadline_boundary_segment += 1;
+        }
+    }
+
+    fn rate(&self, at: f64) -> f64 {
+        let relative = (at - self.path.start_seconds).max(0.0_f64);
+        if self
+            .path
+            .end_seconds
+            .last()
+            .is_none_or(|end| relative >= *end)
+        {
+            return 0.0_f64;
+        }
+        self.path
+            .rates
+            .get(self.segment.min(self.path.rates.len().saturating_sub(1)))
+            .copied()
+            .map_or(0.0_f64, |rate| rate)
+    }
+
+    fn next_boundary(&self) -> Option<f64> {
+        self.path
+            .end_seconds
+            .get(self.segment)
+            .copied()
+            .map(|end| self.path.start_seconds + end)
+    }
+
+    fn deadline_rate(&self, at: f64, budget_seconds: f64) -> f64 {
+        if at < self.path.start_seconds + budget_seconds {
+            0.0_f64
+        } else {
+            let relative = ((at - budget_seconds) - self.path.start_seconds).max(0.0_f64);
+            if self
+                .path
+                .end_seconds
+                .last()
+                .is_none_or(|end| relative >= *end)
+            {
+                return 0.0_f64;
+            }
+            self.path
+                .rates
+                .get(
+                    self.deadline_rate_segment
+                        .min(self.path.rates.len().saturating_sub(1)),
+                )
+                .copied()
+                .map_or(0.0_f64, |rate| rate)
+        }
+    }
+
+    fn next_deadline_boundary(&self, at: f64, budget_seconds: f64) -> Option<f64> {
+        let first = self.path.start_seconds + budget_seconds;
+        if first > at {
+            return Some(first);
+        }
+        self.path
+            .end_seconds
+            .get(self.deadline_boundary_segment)
+            .copied()
+            .map(|end| self.path.start_seconds + end + budget_seconds)
     }
 }
 
@@ -504,6 +676,7 @@ pub(crate) fn evaluate_prepared_step<Unit>(
     let mut delay_area = 0.0_f64;
     let mut late_area = 0.0_f64;
     let budget_seconds = Duration::from_micros(window.deadline_budget_micros).as_secs_f64();
+    let mut arrival_cursor = ArrivalCursor::new(future_arrivals);
     while now_micros < window.horizon_micros {
         deadline.release(release_work(
             cohorts,
@@ -527,11 +700,11 @@ pub(crate) fn evaluate_prepared_step<Unit>(
             next_micros = next_micros.min(supply.ready_micros);
         }
         let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
-        if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
+        arrival_cursor.advance_to(now_seconds, budget_seconds);
+        if let Some(boundary) = arrival_cursor.next_boundary() {
             next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
         }
-        if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
-        {
+        if let Some(boundary) = arrival_cursor.next_deadline_boundary(now_seconds, budget_seconds) {
             next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
         }
         if next_micros <= now_micros {
@@ -542,8 +715,8 @@ pub(crate) fn evaluate_prepared_step<Unit>(
         let advance = deadline.advance(
             duration_seconds,
             capacity,
-            future_arrivals.rate_at(now_seconds),
-            future_arrivals.deadline_rate_at(now_seconds, budget_seconds),
+            arrival_cursor.rate(now_seconds),
+            arrival_cursor.deadline_rate(now_seconds, budget_seconds),
         );
         delay_area += advance.queue_area;
         late_area += advance.late_area;
@@ -574,8 +747,8 @@ pub(crate) fn evaluate_prepared_step<Unit>(
 
 /// Clamps one event step to the next supply or arrival boundary.
 fn shared_boundary_micros(
-    trajectory: &SupplyTrajectory<'_>,
-    future_arrivals: &ArrivalPath<'_>,
+    trajectory: &TrajectoryCursor<'_>,
+    future_arrivals: &ArrivalCursor<'_>,
     now_micros: u64,
     budget_seconds: f64,
     mut next_micros: u64,
@@ -584,7 +757,7 @@ fn shared_boundary_micros(
         next_micros = next_micros.min(boundary);
     }
     let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
-    if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
+    if let Some(boundary) = future_arrivals.next_boundary() {
         next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
     }
     if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds) {
@@ -630,6 +803,8 @@ fn evaluate_general_trajectory<Unit>(
     let mut delay_area = 0.0_f64;
     let mut late_area = 0.0_f64;
     let budget_seconds = Duration::from_micros(deadline_budget_micros).as_secs_f64();
+    let mut trajectory_cursor = TrajectoryCursor::new(trajectory);
+    let mut arrival_cursor = ArrivalCursor::new(future_arrivals);
     while now_micros < horizon_micros {
         deadline.release(release_work(
             cohorts,
@@ -646,9 +821,12 @@ fn evaluate_general_trajectory<Unit>(
         let mut next_micros = horizon_micros;
         next_micros = next_micros.min(next_release_micros(cohorts, scratch, release_cursor));
         next_micros = next_micros.min(next_deadline_micros(cohorts, scratch, deadline_cursor));
+        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
+        trajectory_cursor.advance_to(now_micros);
+        arrival_cursor.advance_to(now_seconds, budget_seconds);
         let next_micros = shared_boundary_micros(
-            trajectory,
-            future_arrivals,
+            &trajectory_cursor,
+            &arrival_cursor,
             now_micros,
             budget_seconds,
             next_micros,
@@ -656,7 +834,91 @@ fn evaluate_general_trajectory<Unit>(
         if next_micros <= now_micros {
             break;
         }
+        let duration_seconds = Duration::from_micros(next_micros - now_micros).as_secs_f64();
+        let capacity = trajectory_cursor.capacity(now_micros);
+        let advance = deadline.advance(
+            duration_seconds,
+            capacity,
+            arrival_cursor.rate(now_seconds),
+            arrival_cursor.deadline_rate(now_seconds, budget_seconds),
+        );
+        delay_area += advance.queue_area;
+        late_area += advance.late_area;
+        now_micros = next_micros;
+    }
+    deadline.release(release_work(
+        cohorts,
+        scratch,
+        &mut release_cursor,
+        now_micros,
+    ));
+    deadline.make_due(deadline_work(
+        cohorts,
+        scratch,
+        &mut deadline_cursor,
+        now_micros,
+    ));
+    trajectory_cursor.advance_to(horizon_micros);
+    edf_outcome(
+        &deadline,
+        delay_area,
+        late_area,
+        trajectory_cursor.capacity(horizon_micros),
+        Duration::from_micros(horizon_micros.saturating_sub(start_micros)).as_secs_f64(),
+    )
+}
+
+#[cfg(test)]
+fn evaluate_general_trajectory_reference<Unit>(
+    cohorts: &WorkCohorts<Unit>,
+    trajectory: &SupplyTrajectory<'_>,
+    window: EvaluationWindow,
+    future_arrivals: &ArrivalPath<'_>,
+    scratch: &mut EdfScratch,
+) -> EdfOutcome {
+    let EvaluationWindow {
+        start_micros,
+        horizon_micros,
+        initial_debt_work,
+        deadline_budget_micros,
+    } = window;
+    let mut release_cursor = 0_usize;
+    let mut deadline_cursor = 0_usize;
+    let mut now_micros = start_micros;
+    let mut deadline = DeadlineState::new(initial_debt_work);
+    let mut delay_area = 0.0_f64;
+    let mut late_area = 0.0_f64;
+    let budget_seconds = Duration::from_micros(deadline_budget_micros).as_secs_f64();
+    while now_micros < horizon_micros {
+        deadline.release(release_work(
+            cohorts,
+            scratch,
+            &mut release_cursor,
+            now_micros,
+        ));
+        deadline.make_due(deadline_work(
+            cohorts,
+            scratch,
+            &mut deadline_cursor,
+            now_micros,
+        ));
+        let mut next_micros = horizon_micros;
+        next_micros = next_micros.min(next_release_micros(cohorts, scratch, release_cursor));
+        next_micros = next_micros.min(next_deadline_micros(cohorts, scratch, deadline_cursor));
+        if let Some(boundary) = trajectory.next_boundary_micros(now_micros) {
+            next_micros = next_micros.min(boundary);
+        }
         let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
+        if let Some(boundary) = future_arrivals.next_boundary(now_seconds) {
+            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
+        }
+        if let Some(boundary) = future_arrivals.next_deadline_boundary(now_seconds, budget_seconds)
+        {
+            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
+        }
+        if next_micros <= now_micros {
+            break;
+        }
         let duration_seconds = Duration::from_micros(next_micros - now_micros).as_secs_f64();
         let capacity = trajectory.capacity_at_micros(now_micros);
         let advance = deadline.advance(
@@ -711,6 +973,8 @@ fn evaluate_common_trajectory(
     let mut delay_area = 0.0_f64;
     let mut late_area = 0.0_f64;
     let budget_seconds = Duration::from_micros(deadline_budget_micros).as_secs_f64();
+    let mut trajectory_cursor = TrajectoryCursor::new(trajectory);
+    let mut arrival_cursor = ArrivalCursor::new(future_arrivals);
     while now_micros < horizon_micros {
         let (released, due) = update_common_boundaries(cohort, now_micros, &mut state);
         deadline.release(released);
@@ -722,9 +986,12 @@ fn evaluate_common_trajectory(
         if state.released && !state.expired {
             next_micros = next_micros.min(cohort.deadline_micros);
         }
+        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
+        trajectory_cursor.advance_to(now_micros);
+        arrival_cursor.advance_to(now_seconds, budget_seconds);
         let next_micros = shared_boundary_micros(
-            trajectory,
-            future_arrivals,
+            &trajectory_cursor,
+            &arrival_cursor,
             now_micros,
             budget_seconds,
             next_micros,
@@ -732,14 +999,13 @@ fn evaluate_common_trajectory(
         if next_micros <= now_micros {
             break;
         }
-        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
         let duration = Duration::from_micros(next_micros - now_micros).as_secs_f64();
-        let capacity = trajectory.capacity_at_micros(now_micros);
+        let capacity = trajectory_cursor.capacity(now_micros);
         let advance = deadline.advance(
             duration,
             capacity,
-            future_arrivals.rate_at(now_seconds),
-            future_arrivals.deadline_rate_at(now_seconds, budget_seconds),
+            arrival_cursor.rate(now_seconds),
+            arrival_cursor.deadline_rate(now_seconds, budget_seconds),
         );
         delay_area += advance.queue_area;
         late_area += advance.late_area;
@@ -748,11 +1014,12 @@ fn evaluate_common_trajectory(
     let (released, due) = update_common_boundaries(cohort, now_micros, &mut state);
     deadline.release(released);
     deadline.make_due(due);
+    trajectory_cursor.advance_to(horizon_micros);
     edf_outcome(
         &deadline,
         delay_area,
         late_area,
-        trajectory.capacity_at_micros(horizon_micros),
+        trajectory_cursor.capacity(horizon_micros),
         Duration::from_micros(horizon_micros.saturating_sub(start_micros)).as_secs_f64(),
     )
 }
@@ -826,11 +1093,14 @@ fn seconds_to_micros_ceil(seconds: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::iter::repeat;
+
     use quickcheck_macros::quickcheck;
 
     use super::{
         ArrivalPath, DeadlineState, EdfScratch, EvaluationWindow, SupplyTrajectory,
-        evaluate_general_trajectory, evaluate_prepared_trajectory, prepare, terminal_closure,
+        TrajectoryCursor, evaluate_general_trajectory, evaluate_general_trajectory_reference,
+        evaluate_prepared_trajectory, prepare, terminal_closure,
     };
     use crate::types::SlotSecondCohorts;
 
@@ -862,6 +1132,25 @@ mod tests {
             trajectory.capacity_at_micros(500_003).to_bits(),
             4.0_f64.to_bits()
         );
+    }
+
+    #[test]
+    fn trajectory_cursor_keeps_last_equal_pause() {
+        let trajectory = SupplyTrajectory {
+            initial: 1.0_f64,
+            pause_micros: &[500_000, 500_000],
+            ready_micros: &[900_000, 900_000],
+            during: &[2.0_f64, 3.0_f64],
+            after: &[4.0_f64, 5.0_f64],
+        };
+        let mut cursor = TrajectoryCursor::new(&trajectory);
+        cursor.advance_to(500_000);
+
+        assert_eq!(cursor.capacity(500_000).to_bits(), 3.0_f64.to_bits());
+        assert!(cursor_solver_matches_reference(
+            &trajectory,
+            &NO_FUTURE_ARRIVALS
+        ));
     }
 
     #[quickcheck]
@@ -915,6 +1204,99 @@ mod tests {
             && close_relative(fast.drain_seconds, general.drain_seconds);
         assert!(matches, "fast={fast:?}, general={general:?}");
         true
+    }
+
+    #[quickcheck]
+    fn trajectory_cursor_matches_search_solver(
+        pause_seeds: Vec<u8>,
+        ready_seeds: Vec<u8>,
+        supply_seed: u8,
+    ) -> bool {
+        let count = pause_seeds.len().clamp(1, 8);
+        let mut pause_micros = Vec::with_capacity(count);
+        let mut ready_micros = Vec::with_capacity(count);
+        let mut during = Vec::with_capacity(count);
+        let mut after = Vec::with_capacity(count);
+        let mut pause = 100_000_u64;
+        let pause_seeds = pause_seeds.into_iter().chain(repeat(1));
+        let ready_seeds = ready_seeds.into_iter().chain(repeat(1));
+        for (pause_seed, ready_seed) in pause_seeds.zip(ready_seeds).take(count) {
+            pause = pause.saturating_add(u64::from(pause_seed % 20 + 1) * 10_000);
+            pause_micros.push(pause);
+            ready_micros.push(pause.saturating_add(u64::from(ready_seed) * 5_000));
+            during.push(f64::from(supply_seed % 20 + 1));
+            after.push(f64::from(ready_seed % 20 + 1));
+        }
+        let trajectory = SupplyTrajectory {
+            initial: f64::from(supply_seed % 20 + 1),
+            pause_micros: &pause_micros,
+            ready_micros: &ready_micros,
+            during: &during,
+            after: &after,
+        };
+        cursor_solver_matches_reference(&trajectory, &NO_FUTURE_ARRIVALS)
+    }
+
+    #[quickcheck]
+    fn arrival_cursor_matches_search_solver(end_seeds: Vec<u8>, rate_seeds: Vec<u8>) -> bool {
+        let count = end_seeds.len().clamp(1, 8);
+        let mut end_seconds = Vec::with_capacity(count);
+        let mut rates = Vec::with_capacity(count);
+        let mut end = 0.0_f64;
+        let end_seeds = end_seeds.into_iter().chain(repeat(1));
+        let rate_seeds = rate_seeds.into_iter().chain(repeat(1));
+        for (end_seed, rate_seed) in end_seeds.zip(rate_seeds).take(count) {
+            end += f64::from(end_seed % 20 + 1) * 0.05_f64;
+            end_seconds.push(end);
+            rates.push(f64::from(rate_seed % 20));
+        }
+        let future_arrivals = ArrivalPath {
+            start_seconds: 0.125_f64,
+            end_seconds: &end_seconds,
+            rates: &rates,
+        };
+        let trajectory = SupplyTrajectory {
+            initial: 7.0_f64,
+            pause_micros: &[],
+            ready_micros: &[],
+            during: &[],
+            after: &[],
+        };
+        cursor_solver_matches_reference(&trajectory, &future_arrivals)
+    }
+
+    fn cursor_solver_matches_reference(
+        trajectory: &SupplyTrajectory<'_>,
+        future_arrivals: &ArrivalPath<'_>,
+    ) -> bool {
+        let mut cohorts = SlotSecondCohorts::new(2);
+        cohorts.push_values(50_000, 1_500_000, 3.0_f64, 0);
+        cohorts.push_values(200_000, 2_500_000, 5.0_f64, 1);
+        let Ok(mut scratch) = EdfScratch::new(2) else {
+            return false;
+        };
+        prepare(&cohorts, &mut scratch);
+        let window = EvaluationWindow {
+            start_micros: 0,
+            horizon_micros: 3_000_000,
+            initial_debt_work: 2.0_f64,
+            deadline_budget_micros: 400_000,
+        };
+        let cursor = evaluate_general_trajectory(
+            &cohorts,
+            trajectory,
+            window,
+            future_arrivals,
+            &mut scratch,
+        );
+        let reference = evaluate_general_trajectory_reference(
+            &cohorts,
+            trajectory,
+            window,
+            future_arrivals,
+            &mut scratch,
+        );
+        cursor == reference
     }
 
     fn close_relative(left: f64, right: f64) -> bool {

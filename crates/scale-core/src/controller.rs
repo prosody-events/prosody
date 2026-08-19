@@ -331,7 +331,7 @@ impl ScaleState {
     ///
     /// Returns an error when exposure is outside the validated domain.
     pub fn arrival_count_predictive(
-        &self,
+        &mut self,
         observed_count: u32,
         exposure_seconds: f64,
     ) -> Result<ArrivalCountPredictive, ArrivalPredictiveError> {
@@ -701,6 +701,8 @@ struct ScenarioShared<'a> {
     calendar: Option<CalendarForecast<'a>>,
     actuation_commitments: &'a ActuationCommitments,
     inner_count: usize,
+    planning_horizon_micros: u64,
+    disturbance_horizon_micros: u64,
 }
 
 /// One worker's disjoint chunk of the scenario-indexed output cells.
@@ -1266,6 +1268,8 @@ fn evaluate_scenarios(
     let candidate_stride = scratch.posterior_miss_delay_fraction_sums.len();
     let path_stride = state.configuration.arrival_prior.path_segment_count_max();
     let action_count = decision_action_count(scratch);
+    let (planning_horizon_micros, disturbance_horizon_micros) =
+        scenario_horizons(state, &scratch.resource_cohorts);
     let worker_count = scratch.scenario_workspaces.len().min(scenario_total).max(1);
     let scenario_chunk = scenario_total.div_ceil(worker_count);
     let active_workers = scenario_total.div_ceil(scenario_chunk);
@@ -1306,6 +1310,8 @@ fn evaluate_scenarios(
         calendar,
         actuation_commitments,
         inner_count,
+        planning_horizon_micros,
+        disturbance_horizon_micros,
     };
     evaluate_scenario_workers(
         state,
@@ -1404,13 +1410,11 @@ fn evaluate_one_scenario(
         sample,
         DecisionRandomDomain::Placement,
     );
-    let (planning_horizon_micros, disturbance_horizon_micros) =
-        scenario_horizons(state, shared.resource_cohorts);
     let path_length = sample_scenario_path(
         state,
         shared.calendar,
         sample,
-        disturbance_horizon_micros,
+        shared.disturbance_horizon_micros,
         cells.arrival_path_end_seconds,
         cells.arrival_path_rates,
     );
@@ -1441,8 +1445,8 @@ fn evaluate_one_scenario(
             current_supply,
             service_time_seconds: curve.service_time_seconds(),
             path_length,
-            planning_horizon_micros,
-            disturbance_horizon_micros,
+            planning_horizon_micros: shared.planning_horizon_micros,
+            disturbance_horizon_micros: shared.disturbance_horizon_micros,
         },
     );
 }
@@ -1528,17 +1532,6 @@ fn finalize_scenario_columns(state: &ScaleState, scratch: &mut ScaleScratch) {
     dispatch!(state.simd_level, simd => aggregate_scenario_values(simd, scratch));
     scratch.decision_curve_sample_count =
         u32::try_from(scratch.active_scenario_count).map_or(u32::MAX, |count| count);
-    scratch.decision_event_count = expected_event_count(scratch);
-}
-
-fn expected_event_count(scratch: &ScaleScratch) -> f64 {
-    (0..scratch.active_scenario_count)
-        .map(|scenario| {
-            let count = count_as_f64(scratch.active_inner_count as u64);
-            scratch.class_masses[scenario / scratch.active_inner_count] / count
-                * scratch.scenario_event_count[scenario]
-        })
-        .sum()
 }
 
 /// Returns the planning and disturbance horizons for one scenario.
@@ -1614,10 +1607,15 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
     scratch.posterior_late_area_sums.fill(0.0_f64);
     scratch.posterior_replica_seconds_sums.fill(0.0_f64);
     scratch.posterior_supply_sums.fill(0.0_f64);
+    scratch.decision_event_count = 0.0_f64;
     for scenario in 0..scratch.active_scenario_count {
         let inner_count = u32::try_from(scratch.active_inner_count).map_or(u32::MAX, |value| value);
         let cell_weight =
             scratch.class_masses[scenario / scratch.active_inner_count] / f64::from(inner_count);
+        let count = count_as_f64(scratch.active_inner_count as u64);
+        scratch.decision_event_count += scratch.class_masses[scenario / scratch.active_inner_count]
+            / count
+            * scratch.scenario_event_count[scenario];
         let first = scenario * candidate_stride;
         let vector_count = candidate_count / S::f64s::N;
         for vector in 0..vector_count {

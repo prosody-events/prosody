@@ -637,10 +637,10 @@ impl LaunchTimeFactor {
         self.transition(elapsed.saturating_sub(exposure));
         self.last_replica_delta = evidence.requested_delta;
         self.likelihoods.fill(0.0_f64);
-        for lump in evidence.lumps {
-            let observation = lump.observation();
-            for hypothesis in 0..self.weights.len() {
-                let components = self.components(hypothesis, evidence.requested_delta);
+        for hypothesis in 0..self.weights.len() {
+            let components = self.components(hypothesis, evidence.requested_delta);
+            for lump in evidence.lumps {
+                let observation = lump.observation();
                 let contribution =
                     launch_observation_probability(components, observation, evidence.requested_at);
                 // Every finite positive log-normal interval has positive mass.
