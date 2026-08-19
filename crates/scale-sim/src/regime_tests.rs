@@ -2,11 +2,48 @@ use super::{
     ArrivalSchedule, ArrivalSeries, CALENDAR_PRIOR_RATE_SECONDS, CALENDAR_PRIOR_SHAPE,
     HISTORICAL_SCHEDULE, HISTORY_EVENT_COUNT_MAX, HistoricalSeries, IndexSeries,
     PrincipalDefinition, PrincipalRegime, RunSchedule, RunStopReason, SEASONAL_SCHEDULE,
-    SharedResourcePolicy, StopCondition, run_principal_definition, run_principal_regime_seeded,
+    SharedResourcePolicy, StopCondition, resource_attempt_count_max, run_principal_definition,
+    run_principal_regime_seeded,
 };
 use crate::model::{AttemptFrame, AttemptModel};
 use crate::{ConcurrencyLatencyCurve, PlantError, PrincipalRunError, SeriesCell};
 use quickcheck_macros::quickcheck;
+
+#[quickcheck]
+fn attempt_contract_is_the_smaller_authored_supply_bound(
+    event_code: u16,
+    replica_code: u8,
+    slot_code: u8,
+    window_code: u8,
+    service_code: u8,
+    retries: bool,
+) -> bool {
+    let events = u32::from(event_code) + 1;
+    let replicas = u32::from(replica_code) % 32 + 1;
+    let slots = u32::from(slot_code) % 64 + 1;
+    let window_micros = (u64::from(window_code) + 1) * 10_000;
+    let service_micros = (u64::from(service_code) + 1) * 1_000;
+    let inflation = if retries {
+        u32::from(crate::MAX_RETRY_FAILURES) + 1
+    } else {
+        1
+    };
+    let expected = events.saturating_mul(inflation).min(
+        replicas
+            .saturating_mul(slots)
+            .saturating_mul((window_micros.div_ceil(service_micros) + 1) as u32)
+            .saturating_mul(inflation),
+    );
+    resource_attempt_count_max(
+        events,
+        replicas,
+        slots,
+        window_micros,
+        service_micros,
+        retries,
+    )
+    .is_ok_and(|actual| actual == expected)
+}
 
 #[quickcheck]
 fn calendar_forecast_round_trips_the_historical_schedule(seasonal: bool) -> bool {
@@ -71,6 +108,48 @@ fn capacity_grid_covers_the_declared_collapse() {
     let collapse = f64::from(definition.inputs.shared_resource.collapse);
 
     assert!(super::CAPACITY_COLLAPSE_GRID.contains(&collapse));
+}
+
+#[test]
+fn authored_regimes_meet_capacity_model_contracts() {
+    for regime in PrincipalRegime::ALL {
+        if matches!(
+            regime,
+            PrincipalRegime::ReplicaCeiling | PrincipalRegime::SnapshotFaults
+        ) {
+            continue;
+        }
+        let definition = PrincipalDefinition::for_regime(regime);
+        let result = super::principal_graph(
+            regime,
+            super::is_capacity_regime(regime),
+            definition,
+            super::DEFAULT_CONCURRENCY_PER_REPLICA,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "{}: {:?}",
+            regime.name(),
+            result.as_ref().err()
+        );
+    }
+    for sensitivity in super::CapacitySensitivity::ALL {
+        let regime = PrincipalRegime::FlatPostKnee;
+        let result = super::principal_graph(
+            regime,
+            true,
+            PrincipalDefinition::capacity_evidence(regime),
+            super::DEFAULT_CONCURRENCY_PER_REPLICA,
+            Some(sensitivity),
+        );
+        assert!(
+            result.is_ok(),
+            "{}: {:?}",
+            sensitivity.name(),
+            result.as_ref().err()
+        );
+    }
 }
 
 #[test]

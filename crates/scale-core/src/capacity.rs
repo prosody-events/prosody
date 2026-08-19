@@ -17,16 +17,17 @@ const CAPACITY_MODEL_STORAGE_BYTES_MAX: usize = 512 * 1_024 * 1_024;
 const CAPACITY_MODEL_ARTIFACT_SOURCE: u64 = 0x4341_5041_4349_5459;
 const CAPACITY_MODEL_ARTIFACT_VERSION: u32 = 2;
 const PATH_SOLVER_PROBABILITY_ERROR_MAX: f64 = 1.0e-10_f64;
-/// One update can use at most one report interval of wall time.
-///
-/// This authored limit keeps model work below the default report cadence.
-const CAPACITY_UPDATE_TIME_BUDGET: Duration = Duration::from_mins(1);
 /// The scalar kernel completes at least this many simple operations per second.
 ///
 /// This authored rate is conservative for supported production processors.
 const CAPACITY_KERNEL_OPERATIONS_PER_SECOND_MIN: u64 = 100_000_000;
-const CAPACITY_UPDATE_OPERATION_COUNT_MAX: u64 =
-    CAPACITY_KERNEL_OPERATIONS_PER_SECOND_MIN * CAPACITY_UPDATE_TIME_BUDGET.as_secs();
+/// One capacity update can use at most 400 billion simple operations.
+///
+/// The honest regime table has a maximum of 158,365,713,893 operations.
+/// Two-times headroom gives 316,731,427,786 operations. Rounding this value
+/// up to one significant figure gives 400,000,000,000 operations. At the
+/// certified minimum rate, this limit permits 4,000 seconds for one update.
+const CAPACITY_UPDATE_OPERATION_COUNT_MAX: u64 = 4_000 * CAPACITY_KERNEL_OPERATIONS_PER_SECOND_MIN;
 const REPORT_CLOCK_ERROR_SECONDS: f64 = 1.0e-6_f64;
 /// The residual check has a one-percent test size.
 ///
@@ -87,6 +88,7 @@ struct CapacityModelArtifact {
     no_collapse_probability: f64,
     markov_clock_assumption: MarkovClockAssumption,
     start_delay_evidence: StartDelayEvidence,
+    resource_window_group_count_max: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -550,6 +552,19 @@ struct DeathBand {
 }
 
 #[derive(Clone, Copy)]
+struct LinearRateBand {
+    service_time_seconds: f64,
+    state_max: usize,
+}
+
+#[derive(Clone, Copy)]
+enum SpreadTruncation {
+    #[cfg(test)]
+    Disabled,
+    Charged(f64),
+}
+
+#[derive(Clone, Copy)]
 struct ErrorLedger {
     group_budget: f64,
     charged: f64,
@@ -586,6 +601,7 @@ struct CapacityAllocation {
     filter_curve_count: usize,
     transition_count: usize,
     start_history_capacity: usize,
+    group_count: usize,
 }
 
 struct CompletionScratch<'a> {
@@ -601,6 +617,7 @@ pub(crate) struct CapacityFactor {
     concurrency_max: f64,
     exposure_min_seconds: f64,
     history_coverage_seconds: f64,
+    resource_window_group_count_max: u32,
     prior_weights: Vec<f64>,
     weights: Vec<f64>,
     likelihoods: Vec<f64>,
@@ -636,24 +653,30 @@ pub(crate) struct CapacityFactor {
 }
 
 impl CapacityFactor {
-    pub(crate) fn new_with_prior(
+    pub(crate) fn new_with_prior_with_groups(
         grid: CapacityGrid,
         change_rate_per_second: f64,
         arrival_prior: &ArrivalPrior,
         concurrency_max: f64,
         exposure_min_seconds: f64,
         attempt_count_max: u32,
+        group_count_max: u32,
     ) -> Result<Self, CapacityModelError> {
         validate_capacity_observation_contract(
             concurrency_max,
             exposure_min_seconds,
             attempt_count_max,
+            group_count_max,
         )?;
         let cell_count = grid.service_times_seconds.len();
         let state_count = concurrency_max as usize + 1;
         let (history_coverage_seconds, start_history_capacity) =
             start_history_contract(&grid, concurrency_max, exposure_min_seconds)?;
-        let mut artifact = capacity_model_artifact(change_rate_per_second, arrival_prior.shape())?;
+        let mut artifact = capacity_model_artifact_with_groups(
+            change_rate_per_second,
+            arrival_prior.shape(),
+            group_count_max,
+        )?;
         record_grid_coverage(&grid, &mut artifact)?;
         artifact.coverage.push(PriorCoverageRecord::new(
             0.0_f64,
@@ -687,18 +710,16 @@ impl CapacityFactor {
                 filter_curve_count,
                 transition_count,
                 start_history_capacity,
+                group_count: group_count_max as usize,
             },
-            attempt_count_max,
             exposure_min_seconds,
         )?;
-        let mut filter_weights = Vec::with_capacity(filter_count);
-        let mut filter_curve_weights = Vec::with_capacity(filter_curve_count);
-        for hazard_weight in hazard_weights {
-            for &contamination_weight in &contamination_weights {
-                filter_weights.push(hazard_weight * contamination_weight);
-                filter_curve_weights.extend_from_slice(&prior_weights);
-            }
-        }
+        let (filter_weights, filter_curve_weights) = filter_prior(
+            &hazard_weights,
+            &contamination_weights,
+            &prior_weights,
+            filter_count,
+        );
         Ok(Self {
             grid,
             arrival_shape: arrival_prior.shape(),
@@ -706,6 +727,7 @@ impl CapacityFactor {
             concurrency_max,
             exposure_min_seconds,
             history_coverage_seconds,
+            resource_window_group_count_max: group_count_max,
             weights: prior_weights.clone(),
             prior_weights,
             likelihoods: vec![0.0_f64; cell_count],
@@ -729,8 +751,6 @@ impl CapacityFactor {
             state_rates: vec![0.0_f64; state_count],
             forward_coefficients: vec![0.0_f64; state_count],
             forward_work: vec![0.0_f64; state_count],
-            // The ring retains one contract window of completions. It evicts
-            // old residuals and listens for the factor's full life.
             residuals: vec![0.0_f64; attempt_count_max as usize],
             residual_head: 0,
             residual_len: 0,
@@ -741,6 +761,26 @@ impl CapacityFactor {
             discard_next_residual: false,
             markov_clock_rejected: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_prior(
+        grid: CapacityGrid,
+        change_rate_per_second: f64,
+        arrival_prior: &ArrivalPrior,
+        concurrency_max: f64,
+        exposure_min_seconds: f64,
+        attempt_count_max: u32,
+    ) -> Result<Self, CapacityModelError> {
+        Self::new_with_prior_with_groups(
+            grid,
+            change_rate_per_second,
+            arrival_prior,
+            concurrency_max,
+            exposure_min_seconds,
+            attempt_count_max,
+            attempt_count_max,
+        )
     }
 
     pub(crate) const fn posterior_value_count(&self) -> u32 {
@@ -755,7 +795,11 @@ impl CapacityFactor {
         &self,
         change_rate_per_second: f64,
     ) -> Result<PriorArtifact, CapacityModelError> {
-        let mut artifact = capacity_model_artifact(change_rate_per_second, self.arrival_shape)?;
+        let mut artifact = capacity_model_artifact_with_groups(
+            change_rate_per_second,
+            self.arrival_shape,
+            self.resource_window_group_count_max,
+        )?;
         record_grid_coverage(&self.grid, &mut artifact)?;
         artifact.coverage.push(PriorCoverageRecord::new(
             0.0_f64,
@@ -972,6 +1016,7 @@ impl CapacityFactor {
         self.update_residual_check(evidence);
         for index in 0..self.likelihoods.len() {
             fill_state_rates(&self.grid, index, &mut self.state_rates);
+            let linear_rate_band = linear_rate_band(&self.grid, index);
             let raw = path_log_score_with_rates(
                 &self.state_rates,
                 &self.state_exposure_seconds,
@@ -979,6 +1024,7 @@ impl CapacityFactor {
             );
             let normalizer = feasibility_probability_with_rates(
                 &self.state_rates,
+                linear_rate_band,
                 evidence,
                 &mut self.forward_probabilities,
                 &mut self.forward_coefficients,
@@ -1447,12 +1493,14 @@ fn validate_capacity_observation_contract(
     concurrency_max: f64,
     exposure_min_seconds: f64,
     attempt_count_max: u32,
+    group_count_max: u32,
 ) -> Result<(), CapacityModelError> {
     if concurrency_max.is_finite()
         && concurrency_max > 0.0_f64
         && exposure_min_seconds.is_finite()
         && exposure_min_seconds > 0.0_f64
         && attempt_count_max > 0
+        && group_count_max > 0
     {
         Ok(())
     } else {
@@ -1482,7 +1530,6 @@ fn validate_capacity_allocation(
     grid: &CapacityGrid,
     artifact: &CapacityModelArtifact,
     allocation: CapacityAllocation,
-    attempt_count_max: u32,
     exposure_seconds: f64,
 ) -> Result<(), CapacityModelError> {
     let storage_bytes = capacity_storage_bytes(
@@ -1504,51 +1551,9 @@ fn validate_capacity_allocation(
         .checked_mul(size_of::<PriorCoverageRecord>())
         .and_then(|coverage_bytes| storage_bytes.checked_add(coverage_bytes))
         .ok_or(CapacityModelError::StorageBound)?;
-    let band_count = allocation.state_count.min(allocation.transition_count);
-    let cells =
-        u64::try_from(allocation.cell_count).map_err(|_| CapacityModelError::StorageBound)?;
-    let states = u64::try_from(band_count).map_err(|_| CapacityModelError::StorageBound)?;
-    let groups = u64::from(attempt_count_max)
-        .checked_add(1)
-        .ok_or(CapacityModelError::StorageBound)?;
-    let maximum_rate = (0..allocation.cell_count)
-        .map(|index| {
-            (0..allocation.state_count)
-                .map(|state| state_rate(grid, index, state))
-                .fold(0.0_f64, f64::max)
-        })
-        .fold(0.0_f64, f64::max);
-    let group_budget = PATH_SOLVER_PROBABILITY_ERROR_MAX / (f64::from(attempt_count_max) + 1.0_f64);
-    let mean_limit = -group_budget.ln();
-    let steps_per_exposure = (maximum_rate * exposure_seconds / mean_limit)
-        .ceil()
-        .max(1.0_f64) as u64;
-    let step_count_u32 =
-        u32::try_from(steps_per_exposure).map_err(|_| CapacityModelError::StorageBound)?;
-    let tail_bound = group_budget / f64::from(step_count_u32.saturating_add(1));
-    let terms = u64::from(
-        uniformization_term_count_bound(mean_limit, tail_bound)
-            .ok_or(CapacityModelError::StorageBound)?,
-    );
-    let kernel_terms = steps_per_exposure
-        .checked_mul(terms)
-        .and_then(|value| value.checked_add(groups))
-        .ok_or(CapacityModelError::StorageBound)?;
-    let update_operation_count = cells
-        .checked_mul(kernel_terms)
-        .and_then(|value| value.checked_mul(states))
-        .and_then(|value| value.checked_mul(4))
-        .and_then(|kernel| {
-            cells
-                .checked_mul(states)
-                .and_then(|path| kernel.checked_add(path))
-        })
-        .and_then(|value| {
-            u64::try_from(allocation.filter_curve_count)
-                .ok()
-                .and_then(|filters| value.checked_add(filters))
-        })
-        .ok_or(CapacityModelError::StorageBound)?;
+    let update_operation_count =
+        capacity_update_operation_count(grid, allocation, exposure_seconds)
+            .ok_or(CapacityModelError::StorageBound)?;
     if prior_artifact_contract_holds(
         artifact.identity,
         artifact.budget,
@@ -1561,6 +1566,72 @@ fn validate_capacity_allocation(
     } else {
         Err(CapacityModelError::StorageBound)
     }
+}
+
+fn capacity_update_operation_count(
+    grid: &CapacityGrid,
+    allocation: CapacityAllocation,
+    exposure_seconds: f64,
+) -> Option<u64> {
+    let band_count = allocation.state_count.min(allocation.transition_count);
+    let states = u64::try_from(band_count).ok()?;
+    let groups = u64::try_from(allocation.group_count).ok()?;
+    let groups_u32 = u32::try_from(groups).ok()?;
+    let group_budget = PATH_SOLVER_PROBABILITY_ERROR_MAX / f64::from(groups_u32);
+    let source_count = states.checked_add(1)?;
+    let source_count_u32 = u32::try_from(source_count).ok()?;
+    let source_charge = group_budget / f64::from(source_count_u32);
+    let states_u32 = u32::try_from(states).ok()?;
+    let half_width = (f64::from(states_u32) * (2.0_f64 / source_charge).ln() / 2.0_f64).sqrt();
+    let spread_width = (2.0_f64 * half_width).ceil() as u64 + 1;
+    let equal_rate_cost = groups
+        .checked_mul(states)?
+        .checked_mul(states.checked_add(1)?)?
+        / 2;
+    let contraction_cost = groups.checked_mul(states)?;
+    let mut kernel_cost = 0_u64;
+    for index in 0..allocation.cell_count {
+        let knee =
+            (grid.capacities_per_second[index] * grid.service_times_seconds[index]).floor() as u64;
+        let wholly_linear = grid.no_knee[index] > 0.0_f64 || states.saturating_sub(1) <= knee;
+        let linear_states = if wholly_linear {
+            states
+        } else {
+            states.min(knee.saturating_add(1))
+        };
+        let linear_cost = groups
+            .checked_mul(linear_states)?
+            .checked_mul(spread_width)?;
+        let cell_cost = if wholly_linear {
+            linear_cost
+        } else {
+            let mean_limit = -group_budget.ln();
+            let exposure_steps = (grid.capacities_per_second[index] * exposure_seconds / mean_limit)
+                .ceil()
+                .max(1.0_f64) as u64;
+            let steps = exposure_steps.checked_add(groups)?;
+            let steps_u32 = u32::try_from(exposure_steps).ok()?;
+            let tail_bound = group_budget / f64::from(steps_u32.saturating_add(1));
+            let terms = u64::from(uniformization_term_count_bound(mean_limit, tail_bound)?);
+            let uniform_cost = steps
+                .checked_mul(terms)?
+                .checked_mul(states)?
+                .checked_mul(4)?;
+            let mixed_cost = linear_cost.max(uniform_cost);
+            if grid.collapse_values[index] == 0.0_f64 {
+                mixed_cost.max(equal_rate_cost)
+            } else {
+                mixed_cost
+            }
+        };
+        kernel_cost = kernel_cost
+            .checked_add(cell_cost)?
+            .checked_add(contraction_cost)?;
+    }
+    let cells = u64::try_from(allocation.cell_count).ok()?;
+    let path_cost = cells.checked_mul(states)?;
+    let filter_cost = u64::try_from(allocation.filter_curve_count).ok()?;
+    kernel_cost.checked_add(path_cost)?.checked_add(filter_cost)
 }
 
 fn uniformization_term_count_bound(mean: f64, tail_bound: f64) -> Option<u32> {
@@ -1609,6 +1680,7 @@ fn capacity_storage_bytes(
                 .and_then(|count| count.checked_mul(size_of::<StartWindow>()))
                 .and_then(|history_bytes| bytes.checked_add(history_bytes))
         })
+        .and_then(|bytes| bytes.checked_add(size_of::<u32>()))
         .ok_or(CapacityModelError::StorageBound)
 }
 
@@ -1712,9 +1784,10 @@ fn record_grid_coverage(
 ///
 /// Log spacing only sets cell boundaries. Gamma integration includes the
 /// log-cell-width Jacobian, so this function does not change the exponent.
-fn capacity_model_artifact(
+fn capacity_model_artifact_with_groups(
     mean_per_second: f64,
     shape: f64,
+    resource_window_group_count_max: u32,
 ) -> Result<CapacityModelArtifact, CapacityModelError> {
     if !mean_per_second.is_finite()
         || mean_per_second <= 0.0_f64
@@ -1775,6 +1848,7 @@ fn capacity_model_artifact(
         no_collapse_probability: 0.5_f64,
         markov_clock_assumption: MarkovClockAssumption::MemorylessAggregateCompletions,
         start_delay_evidence: StartDelayEvidence::DiscardedWithoutRecovery,
+        resource_window_group_count_max,
     };
     if !prior_artifact_contract_holds(
         artifact.identity,
@@ -1797,10 +1871,19 @@ fn capacity_model_artifact(
         || artifact.budget.path_time_error_seconds() != REPORT_CLOCK_ERROR_SECONDS
         || artifact.markov_clock_assumption != MarkovClockAssumption::MemorylessAggregateCompletions
         || artifact.start_delay_evidence != StartDelayEvidence::DiscardedWithoutRecovery
+        || artifact.resource_window_group_count_max == 0
     {
         return Err(CapacityModelError::InvalidObservationContract);
     }
     Ok(artifact)
+}
+
+#[cfg(test)]
+fn capacity_model_artifact(
+    mean_per_second: f64,
+    shape: f64,
+) -> Result<CapacityModelArtifact, CapacityModelError> {
+    capacity_model_artifact_with_groups(mean_per_second, shape, 1)
 }
 
 fn hazard_prior(
@@ -1897,6 +1980,25 @@ fn contamination_prior(
     Ok((probabilities, weights))
 }
 
+/// Builds the joint filter prior as the outer product of the hazard and
+/// contamination weights, with one copy of the capacity prior per pair.
+fn filter_prior(
+    hazard_weights: &[f64],
+    contamination_weights: &[f64],
+    prior_weights: &[f64],
+    filter_count: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut filter_weights = Vec::with_capacity(filter_count);
+    let mut filter_curve_weights = Vec::with_capacity(filter_count * prior_weights.len());
+    for &hazard_weight in hazard_weights {
+        for &contamination_weight in contamination_weights {
+            filter_weights.push(hazard_weight * contamination_weight);
+            filter_curve_weights.extend_from_slice(prior_weights);
+        }
+    }
+    (filter_weights, filter_curve_weights)
+}
+
 fn normalize(weights: &mut [f64]) {
     let total = weights.iter().sum::<f64>();
     if total > 0.0_f64 {
@@ -1971,6 +2073,18 @@ fn fill_state_rates(grid: &CapacityGrid, index: usize, rates: &mut [f64]) {
     }
 }
 
+fn linear_rate_band(grid: &CapacityGrid, index: usize) -> LinearRateBand {
+    let state_max = if grid.no_knee[index] > 0.0_f64 {
+        usize::MAX
+    } else {
+        (grid.capacities_per_second[index] * grid.service_times_seconds[index]).floor() as usize
+    };
+    LinearRateBand {
+        service_time_seconds: grid.service_times_seconds[index],
+        state_max,
+    }
+}
+
 fn fold_trace(
     evidence: OccupancyTraceEvidence<'_>,
     exposure_seconds: &mut [f64],
@@ -2019,17 +2133,26 @@ fn path_log_score_with_rates(
 
 fn feasibility_probability_with_rates(
     rates: &[f64],
+    linear_rate_band: LinearRateBand,
     evidence: OccupancyTraceEvidence<'_>,
     probabilities: &mut [f64],
     coefficients: &mut [f64],
     work: &mut [f64],
 ) -> Option<f64> {
-    feasibility_probability_and_charge(rates, evidence, probabilities, coefficients, work)
-        .map(|(probability, _)| probability)
+    feasibility_probability_and_charge(
+        rates,
+        linear_rate_band,
+        evidence,
+        probabilities,
+        coefficients,
+        work,
+    )
+    .map(|(probability, _)| probability)
 }
 
 fn feasibility_probability_and_charge(
     rates: &[f64],
+    linear_rate_band: LinearRateBand,
     evidence: OccupancyTraceEvidence<'_>,
     probabilities: &mut [f64],
     coefficients: &mut [f64],
@@ -2037,6 +2160,7 @@ fn feasibility_probability_and_charge(
 ) -> Option<(f64, f64)> {
     feasibility_probability_with_budget(
         rates,
+        linear_rate_band,
         evidence,
         probabilities,
         coefficients,
@@ -2047,6 +2171,7 @@ fn feasibility_probability_and_charge(
 
 fn feasibility_probability_with_budget(
     rates: &[f64],
+    linear_rate_band: LinearRateBand,
     evidence: OccupancyTraceEvidence<'_>,
     probabilities: &mut [f64],
     coefficients: &mut [f64],
@@ -2070,6 +2195,9 @@ fn feasibility_probability_with_budget(
     let mut ledger = ErrorLedger::with_budget(group_count, budget)?;
     probabilities.fill(0.0_f64);
     probabilities[initial] = 1.0_f64;
+    // `safe_mass` owns paths that cannot exceed `c_max` after all remaining
+    // starts. `low` is the first path that can still exceed that limit.
+    // Each death step drops below-`low` mass so the caller can add it once.
     let mut safe_mass = 0.0_f64;
     let mut remaining_starts = total_starts;
     let mut low = if remaining_starts > c_max {
@@ -2090,6 +2218,7 @@ fn feasibility_probability_with_budget(
         let band_mass = probabilities[low..=high].iter().sum::<f64>();
         let contraction_budget = pure_death_step_with_rates(
             rates,
+            linear_rate_band,
             DeathBand {
                 low,
                 high,
@@ -2163,7 +2292,14 @@ fn feasibility_probability(
 ) -> Option<f64> {
     let mut rates = vec![0.0_f64; probabilities.len()];
     fill_state_rates(grid, index, &mut rates);
-    feasibility_probability_with_rates(&rates, evidence, probabilities, coefficients, work)
+    feasibility_probability_with_rates(
+        &rates,
+        linear_rate_band(grid, index),
+        evidence,
+        probabilities,
+        coefficients,
+        work,
+    )
 }
 
 #[cfg(test)]
@@ -2177,13 +2313,20 @@ fn completion_marginal_probability(
 ) -> Option<f64> {
     let mut rates = vec![0.0_f64; probabilities.len()];
     fill_state_rates(grid, index, &mut rates);
-    let rough_normalizer =
-        feasibility_probability_with_rates(&rates, evidence, probabilities, coefficients, work)?;
+    let rough_normalizer = feasibility_probability_with_rates(
+        &rates,
+        linear_rate_band(grid, index),
+        evidence,
+        probabilities,
+        coefficients,
+        work,
+    )?;
     // The ratio uses two solver results. Give each result one quarter of the
     // target times the denominator, so their combined ratio error stays bound.
     let solver_budget = PATH_SOLVER_PROBABILITY_ERROR_MAX * rough_normalizer / 4.0_f64;
     let (normalizer, _) = feasibility_probability_with_budget(
         &rates,
+        linear_rate_band(grid, index),
         evidence,
         probabilities,
         coefficients,
@@ -2217,6 +2360,7 @@ fn completion_marginal_probability(
         }
         pure_death_step_with_rates(
             &rates,
+            linear_rate_band(grid, index),
             DeathBand {
                 low,
                 high,
@@ -2243,6 +2387,7 @@ fn completion_marginal_probability(
     }
     pure_death_step_with_rates(
         &rates,
+        linear_rate_band(grid, index),
         DeathBand {
             low: final_state,
             high,
@@ -2259,11 +2404,13 @@ fn completion_marginal_probability(
     Some((probabilities[final_state] / normalizer).clamp(0.0_f64, 1.0_f64))
 }
 
-/// Evolves one reachable pure-death band with a certified Poisson term count.
+/// Evolves one reachable pure-death band with its exact structural kernel.
 ///
-/// Equal-rate bands use the Erlang limit. All other bands use uniformization.
+/// Linear-rate bands use binomial thinning. Equal-rate bands use the Erlang
+/// limit. Mixed bands use uniformization with a charged Poisson tail.
 fn pure_death_step_with_rates(
     rates: &[f64],
+    linear_rate_band: LinearRateBand,
     band: DeathBand,
     probabilities: &mut [f64],
     coefficients: &mut [f64],
@@ -2277,6 +2424,20 @@ fn pure_death_step_with_rates(
     } = band;
     if exposure_seconds == 0.0_f64 || low > high {
         return Some(ledger.group_budget);
+    }
+    if high <= linear_rate_band.state_max {
+        let source_count = high.checked_sub(low)?.checked_add(1)?;
+        let charge_count = u32::try_from(source_count.checked_add(1)?).ok()?;
+        let source_charge = ledger.group_budget / f64::from(charge_count);
+        linear_rate_death_step(
+            linear_rate_band.service_time_seconds,
+            band,
+            probabilities,
+            work,
+            SpreadTruncation::Charged(source_charge),
+            ledger,
+        )?;
+        return Some(source_charge);
     }
     let first_rate = rates[low];
     let all_equal = rates[low..=high]
@@ -2301,7 +2462,74 @@ fn pure_death_step(
     let mut rates = vec![0.0_f64; probabilities.len()];
     fill_state_rates(grid, index, &mut rates);
     let mut ledger = ErrorLedger::with_budget(1, PATH_SOLVER_PROBABILITY_ERROR_MAX)?;
-    pure_death_step_with_rates(&rates, band, probabilities, coefficients, work, &mut ledger)?;
+    pure_death_step_with_rates(
+        &rates,
+        linear_rate_band(grid, index),
+        band,
+        probabilities,
+        coefficients,
+        work,
+        &mut ledger,
+    )?;
+    Some(())
+}
+
+/// Evolves one band whose members have independent exponential lifetimes.
+///
+/// The branch retains survivors at or above `low` inside the certified spread.
+/// It drops exact below-`low` mass and charged spread tails. The caller reads
+/// both losses through `safe_mass`. The binomial values inside the spread have
+/// zero truncation error. The ledger charges only the omitted spread tails.
+fn linear_rate_death_step(
+    service_time_seconds: f64,
+    band: DeathBand,
+    probabilities: &mut [f64],
+    work: &mut [f64],
+    truncation: SpreadTruncation,
+    ledger: &mut ErrorLedger,
+) -> Option<()> {
+    let DeathBand {
+        low,
+        high,
+        exposure_seconds,
+    } = band;
+    work[low..=high].fill(0.0_f64);
+    let survival = (-exposure_seconds / service_time_seconds).exp();
+    for (source, &source_probability) in probabilities.iter().enumerate().take(high + 1).skip(low) {
+        let source_u32 = u32::try_from(source).ok()?;
+        let (window_low, window_high) = match truncation {
+            #[cfg(test)]
+            SpreadTruncation::Disabled => (low, source),
+            SpreadTruncation::Charged(charge) => {
+                let source_count = f64::from(source_u32);
+                let mean = source_count * survival;
+                let half_width = (source_count * (2.0_f64 / charge).ln() / 2.0_f64).sqrt();
+                let spread_low = (mean - half_width).ceil().max(0.0_f64) as usize;
+                let spread_high = (mean + half_width).floor().min(source_count) as usize;
+                ledger.charge(charge);
+                (low.max(spread_low), spread_high)
+            }
+        };
+        if window_low > window_high {
+            continue;
+        }
+        if survival == 0.0_f64 {
+            if window_low == 0 {
+                work[0] += source_probability;
+            }
+            continue;
+        }
+        for (survivors, destination) in work
+            .iter_mut()
+            .enumerate()
+            .take(window_high + 1)
+            .skip(window_low)
+        {
+            *destination += source_probability
+                * binomial_log_probability(source_u32, survivors, survival).exp();
+        }
+    }
+    probabilities[low..=high].copy_from_slice(&work[low..=high]);
     Some(())
 }
 

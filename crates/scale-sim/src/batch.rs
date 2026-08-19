@@ -113,6 +113,7 @@ pub fn run_batch_slo_with_inputs(
         report_interval_micros: budget_micros,
         resource_window_attempt_count_max: EVENT_COUNT
             .saturating_mul(u32::from(crate::MAX_RETRY_FAILURES) + 1),
+        resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
         // The plant releases no events after the backlog, so the authored
         // prior expects about one spurious arrival per day. A one-per-second

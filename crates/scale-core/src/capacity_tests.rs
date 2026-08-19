@@ -6,19 +6,26 @@ use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
 use super::{
-    CapacityGrid, CapacityGridError, CapacityModelError, CompletionScratch, DeathBand, ErrorLedger,
-    HAZARD_COVERAGE_INDEX, HAZARD_TRANSITION_PROBABILITY_ERROR_MAX, OBSERVATION_COVERAGE_INDEX,
+    CAPACITY_UPDATE_OPERATION_COUNT_MAX, CapacityAllocation, CapacityGrid, CapacityGridError,
+    CapacityModelError, CompletionScratch, DeathBand, ErrorLedger, HAZARD_COVERAGE_INDEX,
+    HAZARD_TRANSITION_PROBABILITY_ERROR_MAX, LinearRateBand, OBSERVATION_COVERAGE_INDEX,
     OBSERVATION_PROBABILITY_ERROR_MAX, PATH_SOLVER_PROBABILITY_ERROR_MAX, ResourceWindow,
-    ResourceWindowError, RetainedHistory, SOLVER_COVERAGE_INDEX, StartWindow,
-    binomial_log_probability, capacity_model_artifact, completion_expectation,
-    completion_log_likelihood, completion_marginal_probability, contamination_prior,
-    feasibility_probability, feasibility_probability_and_charge, fold_trace, hazard_prior,
-    log_contamination_mixture, log_normal_axis_masses, log_weighted_sum, path_log_score,
-    pure_death_step, record_start_window, uniformized_death_step,
+    ResourceWindowError, RetainedHistory, SOLVER_COVERAGE_INDEX, SpreadTruncation, StartWindow,
+    binomial_log_probability, capacity_model_artifact, capacity_update_operation_count,
+    completion_expectation, completion_log_likelihood, completion_marginal_probability,
+    contamination_prior, equal_rate_death_step, feasibility_probability,
+    feasibility_probability_and_charge, fold_trace, hazard_prior, linear_rate_band,
+    linear_rate_death_step, log_contamination_mixture, log_normal_axis_masses, log_weighted_sum,
+    path_log_score, pure_death_step, pure_death_step_with_rates, record_start_window,
+    uniformized_death_step,
 };
 use crate::change_point::ChangePointKernel;
 use crate::types::occupancy_trace_for_test;
 use crate::{ArrivalPrior, OccupancyTraceEvidence};
+
+fn state_f64(value: usize) -> f64 {
+    u32::try_from(value).map_or(f64::from(u32::MAX), f64::from)
+}
 
 fn update_constant_trace(
     factor: &mut super::CapacityFactor,
@@ -944,6 +951,60 @@ fn equal_rate_erlang_matches_uniformization_within_its_charge() -> Result<(), Te
     Ok(())
 }
 
+#[quickcheck]
+fn equal_rate_erlang_matches_enumeration_on_random_bands(
+    low_code: u8,
+    width_code: u8,
+    rate_code: u8,
+    exposure_code: u8,
+) -> bool {
+    const STATE_COUNT: usize = 9;
+    let low = usize::from(low_code) % 5;
+    let high = low + usize::from(width_code) % (STATE_COUNT - low);
+    let rate = (f64::from(rate_code) + 1.0_f64) / 16.0_f64;
+    let exposure_seconds = (f64::from(exposure_code) + 1.0_f64) / 64.0_f64;
+    let band = DeathBand {
+        low,
+        high,
+        exposure_seconds,
+    };
+    let source_count = high - low + 1;
+    let mut erlang = [0.0_f64; STATE_COUNT];
+    for probability in &mut erlang[low..=high] {
+        *probability = 1.0_f64 / state_f64(source_count);
+    }
+    let mut uniform = erlang;
+    let mut work = [0.0_f64; STATE_COUNT];
+    if equal_rate_death_step(rate, low, high, exposure_seconds, &mut erlang, &mut work).is_none() {
+        return false;
+    }
+    let rates: [f64; STATE_COUNT] =
+        array::from_fn(|state| if state >= low { rate } else { 0.0_f64 });
+    let mut current = [0.0_f64; STATE_COUNT];
+    let mut next = [0.0_f64; STATE_COUNT];
+    let Some(mut ledger) = ErrorLedger::with_budget(1, PATH_SOLVER_PROBABILITY_ERROR_MAX) else {
+        return false;
+    };
+    if uniformized_death_step(
+        &rates,
+        band,
+        &mut uniform,
+        &mut current,
+        &mut next,
+        &mut ledger,
+    )
+    .is_none()
+    {
+        return false;
+    }
+    erlang
+        .iter()
+        .zip(uniform)
+        .map(|(left, right)| (left - right).abs())
+        .sum::<f64>()
+        <= ledger.charged + 4_096.0_f64 * f64::EPSILON
+}
+
 #[test]
 fn multi_group_window_charges_at_most_the_path_budget() -> Result<(), TestError> {
     let grid = CapacityGrid::new(&[0.5_f64], &[1.5_f64], &[1.0_f64])?;
@@ -959,6 +1020,7 @@ fn multi_group_window_charges_at_most_the_path_budget() -> Result<(), TestError>
     let mut work = [0.0_f64; 9];
     let (_, charged) = feasibility_probability_and_charge(
         &rates,
+        linear_rate_band(&grid, 0),
         evidence,
         &mut probabilities,
         &mut coefficients,
@@ -985,6 +1047,7 @@ fn band_contraction_matches_the_finite_grid_oracle_within_its_charge() -> Result
     let mut work = [0.0_f64; 4];
     let (actual, charged) = feasibility_probability_and_charge(
         &rates,
+        linear_rate_band(&grid, 0),
         evidence,
         &mut probabilities,
         &mut coefficients,
@@ -996,6 +1059,265 @@ fn band_contraction_matches_the_finite_grid_oracle_within_its_charge() -> Result
     assert!(charged > 0.0_f64);
     assert!((actual - oracle).abs() <= charged + oracle_error);
     Ok(())
+}
+
+#[quickcheck]
+fn linear_rate_kernel_matches_enumeration_and_uniformization(
+    low_code: u8,
+    width_code: u8,
+    exposure_code: u8,
+) -> bool {
+    const STATE_COUNT: usize = 9;
+    let low = usize::from(low_code) % 5;
+    let high = low + usize::from(width_code) % (STATE_COUNT - low);
+    let exposure_seconds = (f64::from(exposure_code) + 1.0_f64) / 64.0_f64;
+    let service_time_seconds = 0.5_f64;
+    let survival = (-exposure_seconds / service_time_seconds).exp();
+    let band = DeathBand {
+        low,
+        high,
+        exposure_seconds,
+    };
+    let mut initial = [0.0_f64; STATE_COUNT];
+    let source_count = high - low + 1;
+    for probability in &mut initial[low..=high] {
+        *probability = 1.0_f64 / state_f64(source_count);
+    }
+    let mut oracle = [0.0_f64; STATE_COUNT];
+    for (source, weight) in initial.iter().enumerate().take(high + 1).skip(low) {
+        for mask in 0_usize..1_usize << source {
+            let survivors = mask.count_ones() as usize;
+            if survivors >= low {
+                oracle[survivors] += weight
+                    * survival.powi(survivors as i32)
+                    * (1.0_f64 - survival).powi((source - survivors) as i32);
+            }
+        }
+    }
+    let mut exact = initial;
+    let mut exact_work = [0.0_f64; STATE_COUNT];
+    let Some(mut exact_ledger) = ErrorLedger::with_budget(1, PATH_SOLVER_PROBABILITY_ERROR_MAX)
+    else {
+        return false;
+    };
+    if linear_rate_death_step(
+        service_time_seconds,
+        band,
+        &mut exact,
+        &mut exact_work,
+        SpreadTruncation::Disabled,
+        &mut exact_ledger,
+    )
+    .is_none()
+    {
+        return false;
+    }
+    let mut linear = initial;
+    let mut linear_work = [0.0_f64; STATE_COUNT];
+    let mut linear_ledger = exact_ledger;
+    let source_charge = linear_ledger.group_budget / state_f64(source_count + 1);
+    if linear_rate_death_step(
+        service_time_seconds,
+        band,
+        &mut linear,
+        &mut linear_work,
+        SpreadTruncation::Charged(source_charge),
+        &mut linear_ledger,
+    )
+    .is_none()
+    {
+        return false;
+    }
+    let rates: [f64; STATE_COUNT] = array::from_fn(|state| state_f64(state) / service_time_seconds);
+    let mut uniform = initial;
+    let mut current = [0.0_f64; STATE_COUNT];
+    let mut next = [0.0_f64; STATE_COUNT];
+    let mut uniform_ledger = exact_ledger;
+    if uniformized_death_step(
+        &rates,
+        band,
+        &mut uniform,
+        &mut current,
+        &mut next,
+        &mut uniform_ledger,
+    )
+    .is_none()
+    {
+        return false;
+    }
+    let roundoff = 4_096.0_f64 * f64::EPSILON;
+    exact
+        .iter()
+        .zip(oracle)
+        .all(|(actual, expected)| (actual - expected).abs() <= roundoff)
+        && linear
+            .iter()
+            .zip(uniform)
+            .map(|(left, right)| (left - right).abs())
+            .sum::<f64>()
+            <= linear_ledger.charged + uniform_ledger.charged + roundoff
+}
+
+#[quickcheck]
+fn composed_death_kernel_matches_full_uniformization(
+    structure_code: u8,
+    low_code: u8,
+    width_code: u8,
+    exposure_code: u8,
+) -> bool {
+    const STATE_COUNT: usize = 9;
+    let low = usize::from(low_code) % 5;
+    let high = low + usize::from(width_code) % (STATE_COUNT - low);
+    let exposure_seconds = (f64::from(exposure_code) + 1.0_f64) / 128.0_f64;
+    let structure = structure_code % 3;
+    let linear_state_max = match structure {
+        0 => usize::MAX,
+        1 => 0,
+        _ => 3,
+    };
+    let rates: [f64; STATE_COUNT] = array::from_fn(|state| match structure {
+        0 => state_f64(state) / 0.5_f64,
+        1 if state > 0 => 2.0_f64,
+        1 => 0.0_f64,
+        _ if state <= linear_state_max => state_f64(state) / 0.5_f64,
+        _ => 8.0_f64 / (1.0_f64 + 0.25_f64 * state_f64(state - linear_state_max)),
+    });
+    let band = DeathBand {
+        low,
+        high,
+        exposure_seconds,
+    };
+    let source_count = high - low + 1;
+    let mut composed = [0.0_f64; STATE_COUNT];
+    for probability in &mut composed[low..=high] {
+        *probability = 1.0_f64 / state_f64(source_count);
+    }
+    let mut uniform = composed;
+    let mut coefficients = [0.0_f64; STATE_COUNT];
+    let mut work = [0.0_f64; STATE_COUNT];
+    let mut current = [0.0_f64; STATE_COUNT];
+    let mut next = [0.0_f64; STATE_COUNT];
+    let Some(mut composed_ledger) = ErrorLedger::with_budget(1, PATH_SOLVER_PROBABILITY_ERROR_MAX)
+    else {
+        return false;
+    };
+    let Some(mut uniform_ledger) = ErrorLedger::with_budget(1, PATH_SOLVER_PROBABILITY_ERROR_MAX)
+    else {
+        return false;
+    };
+    if pure_death_step_with_rates(
+        &rates,
+        LinearRateBand {
+            service_time_seconds: 0.5_f64,
+            state_max: linear_state_max,
+        },
+        band,
+        &mut composed,
+        &mut coefficients,
+        &mut work,
+        &mut composed_ledger,
+    )
+    .is_none()
+        || uniformized_death_step(
+            &rates,
+            band,
+            &mut uniform,
+            &mut current,
+            &mut next,
+            &mut uniform_ledger,
+        )
+        .is_none()
+    {
+        return false;
+    }
+    composed
+        .iter()
+        .zip(uniform)
+        .map(|(left, right)| (left - right).abs())
+        .sum::<f64>()
+        <= composed_ledger.charged + uniform_ledger.charged + 8_192.0_f64 * f64::EPSILON
+}
+
+#[test]
+fn honest_regime_prices_derive_the_capacity_operation_budget() -> Result<(), TestError> {
+    let general = CapacityGrid::new(
+        &[0.000_5_f64, 0.001_f64, 0.002_f64, 0.004_f64, 0.008_f64],
+        &[32_000.0_f64, 64_000.0_f64, 128_000.0_f64, 256_000.0_f64],
+        &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
+    )?;
+    let capacity = CapacityGrid::new(
+        &[0.2_f64, 0.4_f64, 0.8_f64],
+        &[80.0_f64, 320.0_f64, 1_280.0_f64],
+        &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
+    )?;
+    let historical = CapacityGrid::new(
+        &[0.025_f64, 0.05_f64, 0.1_f64, 0.2_f64, 0.4_f64],
+        &[64_000.0_f64, 128_000.0_f64, 256_000.0_f64],
+        &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
+    )?;
+    let prices = [
+        operation_price_for_test(&general, 257, 256, 0.1_f64)?,
+        operation_price_for_test(&capacity, 193, 256, 1.0_f64)?,
+        operation_price_for_test(&capacity, 65, 256, 1.0_f64)?,
+        operation_price_for_test(&general, 1_537, 64, 1.0_f64)?,
+        operation_price_for_test(&general, 257, 64, 1.0_f64)?,
+        operation_price_for_test(&general, 65, 256, 1.0_f64)?,
+        operation_price_for_test(&general, 65, 256, 1.0_f64)?,
+        operation_price_for_test(&general, 257, 256, 0.1_f64)?,
+        operation_price_for_test(&general, 257, 128, 0.5_f64)?,
+        operation_price_for_test(&general, 257, 256, 0.1_f64)?,
+        operation_price_for_test(&historical, 257, 256, 1.0_f64)?,
+        operation_price_for_test(&historical, 449, 128, 1.0_f64)?,
+        operation_price_for_test(&historical, 129, 256, 1.0_f64)?,
+    ];
+    assert_eq!(
+        prices,
+        [
+            2_235_684_613,
+            425_629_719,
+            76_700_455,
+            158_365_713_893,
+            10_369_582_469,
+            533_221_925,
+            533_221_925,
+            2_235_684_613,
+            5_606_155_317,
+            2_235_684_613,
+            581_628_385,
+            668_726_305,
+            206_088_545,
+        ]
+    );
+    let maximum = prices
+        .into_iter()
+        .max()
+        .ok_or(CapacityModelError::StorageBound)?;
+    assert_eq!(CAPACITY_UPDATE_OPERATION_COUNT_MAX, 400_000_000_000);
+    assert!(maximum.saturating_mul(2) <= CAPACITY_UPDATE_OPERATION_COUNT_MAX);
+    Ok(())
+}
+
+fn operation_price_for_test(
+    grid: &CapacityGrid,
+    state_count: usize,
+    group_count: usize,
+    exposure_seconds: f64,
+) -> Result<u64, CapacityModelError> {
+    let cell_count = grid.service_times_seconds.len();
+    capacity_update_operation_count(
+        grid,
+        CapacityAllocation {
+            cell_count,
+            state_count,
+            filter_count: 160,
+            filter_curve_count: 160 * cell_count,
+            transition_count: 100_001,
+            start_history_capacity: 1,
+            group_count,
+        },
+        exposure_seconds,
+    )
+    .ok_or(CapacityModelError::StorageBound)
 }
 
 fn oracle_forward(

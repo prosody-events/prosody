@@ -594,6 +594,11 @@ pub struct Configuration {
     pub report_interval_micros: u64,
     /// Maximum starts or completions in one resource report.
     pub resource_window_attempt_count_max: u32,
+    /// Maximum transition groups in one resource report.
+    ///
+    /// The capacity model conditions on a start trace no finer than this
+    /// bound. Producers must coalesce finer traces before observation intake.
+    pub resource_window_group_count_max: u32,
     /// Maximum failure-service fraction while normal work waits.
     pub failure_service_weight: f64,
     /// Prior for live arrival-rate segments.
@@ -672,6 +677,11 @@ impl Configuration {
         if self.resource_window_attempt_count_max == 0 {
             return Err(ConfigurationError::ZeroBound {
                 name: "resource_window_attempt_count_max",
+            });
+        }
+        if self.resource_window_group_count_max == 0 {
+            return Err(ConfigurationError::ZeroBound {
+                name: "resource_window_group_count_max",
             });
         }
         if !self.failure_service_weight.is_finite()
@@ -1445,6 +1455,7 @@ pub struct ObservationBuffer {
     resource_concurrency_max: f64,
     resource_exposure_micros: u64,
     resource_attempt_count_max: u32,
+    resource_group_count_max: usize,
     cohorts: CohortColumns,
     backlog: BacklogColumns,
     arrivals: Option<ArrivalEvidence>,
@@ -1497,14 +1508,9 @@ impl ObservationBuffer {
         let backlog_count = partition_count
             .checked_mul(DemandClass::COUNT_USIZE)
             .ok_or(ConfigurationError::PlatformLimit)?;
-        let resource_transition_count_max = usize::try_from(
-            configuration
-                .resource_window_attempt_count_max
-                .checked_mul(2)
-                .and_then(|count| count.checked_add(1))
-                .ok_or(ConfigurationError::PlatformLimit)?,
-        )
-        .map_err(|_| ConfigurationError::PlatformLimit)?;
+        let resource_transition_count_max =
+            usize::try_from(configuration.resource_window_group_count_max)
+                .map_err(|_| ConfigurationError::PlatformLimit)?;
         let deadline_offset_max_micros = ArrivalPrior::MAXIMUM_PATH_MICROS
             .checked_sub(configuration.objective.budget_micros())
             .ok_or(ConfigurationError::PlanningHorizonDomain)?;
@@ -1514,6 +1520,7 @@ impl ObservationBuffer {
             resource_concurrency_max: configuration.capacity_concurrency_max()?,
             resource_exposure_micros: configuration.report_interval_micros,
             resource_attempt_count_max: configuration.resource_window_attempt_count_max,
+            resource_group_count_max: resource_transition_count_max,
             cohorts: CohortColumns::new(cohort_count_max),
             backlog: BacklogColumns::new(backlog_count),
             arrivals: None,
@@ -1790,6 +1797,9 @@ impl ObservationBuffer {
             || final_busy_slots > self.resource_concurrency_max as u32
         {
             return Err(ObservationError::ResourceBusySlots);
+        }
+        if transitions.len() > self.resource_group_count_max {
+            return Err(ObservationError::ResourceTraceGroupCount);
         }
         if transitions.len() > self.resource_transition_offsets_micros.capacity() {
             return Err(ObservationError::ResourceTransitionCapacity);
@@ -2307,6 +2317,9 @@ pub enum ObservationError {
     /// A resource trace exceeds its fixed transition bound.
     #[error("the resource trace exceeds its fixed transition bound")]
     ResourceTransitionCapacity,
+    /// A resource trace exceeds its certified group count.
+    #[error("the resource trace exceeds its certified group count")]
+    ResourceTraceGroupCount,
     /// A resource transition is outside the report interval.
     #[error("a resource transition is outside the report interval")]
     ResourceTransitionTime,

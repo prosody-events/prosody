@@ -366,6 +366,32 @@ fn closed_loop_emits_passive_resource_windows() -> Result<(), TestError> {
 }
 
 #[test]
+fn irregular_tick_omits_paired_capacity_and_reliability_evidence() -> Result<(), TestError> {
+    let closed_loop = capacity_test_closed_loop(CapacityWorkload, 4)?;
+    let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?
+        .with_rebalance(0, 0)
+        .with_metric_poll_interval_micros(10_000);
+    let mut harness = SimulationHarness::new(plant_configuration, 1, 4, closed_loop)?;
+    for at_micros in [0_u64, 10_000, 25_000, 35_000] {
+        harness.tick(at_micros)?;
+    }
+    let (_result, closed_loop) = harness.finish_with_graph();
+    let sample = closed_loop
+        .trace()
+        .sample(2)
+        .ok_or(TestError::MissingControllerSample)?;
+    assert!(matches!(
+        sample.capacity_evidence,
+        CapacityEvidenceSample::None
+    ));
+    assert!(matches!(
+        sample.reliability_evidence,
+        ReliabilityEvidenceSample::None
+    ));
+    Ok(())
+}
+
+#[test]
 fn controller_trace_exposes_report_evidence_contract() -> Result<(), TestError> {
     let closed_loop = capacity_test_closed_loop(CapacityWorkload, 8)?;
     let plant_configuration = PlantConfiguration::new(4, 100, 200, 8, 2, 16)?
@@ -585,6 +611,7 @@ fn run_idle_partition_capacity_trace(partition_count: u32) -> Result<(Vec<u64>, 
         posterior_sample_count: 64,
         report_interval_micros: 10_000,
         resource_window_attempt_count_max: 100_000,
+        resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
         arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
@@ -660,6 +687,7 @@ fn capacity_test_closed_loop<Workload: TickGenerator>(
         posterior_sample_count: 64,
         report_interval_micros: 10_000,
         resource_window_attempt_count_max: 100_000,
+        resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
         arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
@@ -749,6 +777,7 @@ fn higher_retarget_preserves_each_completed_lead_time() -> Result<(), TestError>
         posterior_sample_count: 64,
         report_interval_micros: 10_000_000,
         resource_window_attempt_count_max: 100_000,
+        resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
         arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
@@ -2233,6 +2262,7 @@ fn source_arrival_count(messages: u32, timers: u32) -> Result<u32, TestError> {
         posterior_sample_count: 64,
         report_interval_micros: 10_000,
         resource_window_attempt_count_max: 100_000,
+        resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
         arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
@@ -2278,6 +2308,7 @@ fn run_reported_arrivals(
         posterior_sample_count: 64,
         report_interval_micros: 10_000,
         resource_window_attempt_count_max: 100_000,
+        resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
         arrival_prior: test_arrival_prior()?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,

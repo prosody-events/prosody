@@ -183,13 +183,14 @@ impl ScaleState {
         capacity_grid: CapacityGrid,
     ) -> Result<Self, ConfigurationError> {
         configuration.validate()?;
-        let capacity = CapacityFactor::new_with_prior(
+        let capacity = CapacityFactor::new_with_prior_with_groups(
             capacity_grid,
             configuration.capacity_change_rate_per_second,
             &configuration.arrival_prior,
             configuration.capacity_concurrency_max()?,
             configuration.resource_exposure_min_seconds(),
             configuration.resource_window_attempt_count_max,
+            configuration.resource_window_group_count_max,
         )?;
         let capacity_artifact = capacity.artifact(configuration.capacity_change_rate_per_second)?;
         let capacity_classes = CapacityClasses::new(&configuration, &capacity)?;

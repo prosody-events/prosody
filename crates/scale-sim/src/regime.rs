@@ -269,15 +269,15 @@ pub enum RegimeExperiment {
 /// Fixed capacity-prior or grid variant for sensitivity experiments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapacitySensitivity {
-    /// Log-normal prior with a factor-two logarithmic standard deviation.
+    /// Compact truth-centered grid under the common log-uniform prior.
     NarrowPrior,
-    /// Log-normal prior with a factor-four logarithmic standard deviation.
+    /// Reference truth-centered grid under the common log-uniform prior.
     ReferencePrior,
-    /// Log-normal prior with a factor-eight logarithmic standard deviation.
+    /// Wide truth-centered grid under the common log-uniform prior.
     WidePrior,
-    /// Reference prior with a 640 operations-per-second grid ceiling.
+    /// Reference grid with its lower capacity ceiling.
     LowerGridCeiling,
-    /// Reference prior with a 2,560 operations-per-second grid ceiling.
+    /// Dense grid with its higher capacity ceiling.
     HigherGridCeiling,
 }
 
@@ -1572,11 +1572,19 @@ fn principal_graph(
     slots_per_replica: u32,
     sensitivity: Option<CapacitySensitivity>,
 ) -> Result<ClosedLoop<PrincipalGraph>, PrincipalRunError> {
-    let replica_count_max = if regime == PrincipalRegime::ReplicaCeiling {
-        8
-    } else {
-        128
-    };
+    let replica_count_max = replica_count_max(regime);
+    let report_interval_micros = definition
+        .schedule
+        .workload_interval_micros
+        .min(definition.schedule.followup_interval_micros);
+    let attempt_count_max = resource_attempt_count_max(
+        definition.event_count_max,
+        replica_count_max,
+        slots_per_replica,
+        report_interval_micros,
+        definition.inputs.handler_micros,
+        regime == PrincipalRegime::TransientFailures,
+    )?;
     let controller_configuration = Configuration {
         cohort_count_max: 64,
         calendar_segment_count_max: 64,
@@ -1586,16 +1594,9 @@ fn principal_graph(
         replica_count_max,
         slots_per_replica,
         posterior_sample_count: 4_096,
-        report_interval_micros: definition
-            .schedule
-            .workload_interval_micros
-            .min(definition.schedule.followup_interval_micros),
-        // The plant can retry every event, so one report window can carry
-        // every attempt the run can produce. The certified bound comes from
-        // that plant contract, never from an authored guess.
-        resource_window_attempt_count_max: definition
-            .event_count_max
-            .saturating_mul(u32::from(crate::MAX_RETRY_FAILURES) + 1),
+        report_interval_micros,
+        resource_window_attempt_count_max: attempt_count_max,
+        resource_window_group_count_max: resource_group_count_max(regime),
         failure_service_weight: DEFAULT_FAILURE_WEIGHT,
         arrival_prior: prosody_scale_core::ArrivalPrior::new(
             4.0_f64,
@@ -1636,89 +1637,138 @@ fn principal_graph(
     }
 }
 
+const fn replica_count_max(regime: PrincipalRegime) -> u32 {
+    match regime {
+        PrincipalRegime::LinearThroughput => 6,
+        PrincipalRegime::FlatPostKnee
+        | PrincipalRegime::DecliningPostKnee
+        | PrincipalRegime::HotSerializedKey
+        | PrincipalRegime::TransientFailures => 2,
+        PrincipalRegime::ShortBurst
+        | PrincipalRegime::SeasonalWaves
+        | PrincipalRegime::TimerWave => 48,
+        PrincipalRegime::HistoricalExceeded => 14,
+        PrincipalRegime::HistoricalUnder => 4,
+        PrincipalRegime::Idle
+        | PrincipalRegime::ApplicationLimited
+        | PrincipalRegime::HotPartition
+        | PrincipalRegime::PermanentRejections
+        | PrincipalRegime::RebalanceStorm
+        | PrincipalRegime::HandlerContention
+        | PrincipalRegime::LooseBudgetBacklog
+        | PrincipalRegime::SnapshotFaults
+        | PrincipalRegime::MissingReporter
+        | PrincipalRegime::AggregatorReplacement
+        | PrincipalRegime::ReplicaCeiling
+        | PrincipalRegime::HistoricalMatch
+        | PrincipalRegime::HistoricalMissing => 8,
+    }
+}
+
+const fn resource_group_count_max(regime: PrincipalRegime) -> u32 {
+    match regime {
+        PrincipalRegime::ShortBurst
+        | PrincipalRegime::SeasonalWaves
+        | PrincipalRegime::TimerWave
+        | PrincipalRegime::HotPartition
+        | PrincipalRegime::ReplicaCeiling => 64,
+        PrincipalRegime::HistoricalExceeded | PrincipalRegime::HandlerContention => 128,
+        _ => 256,
+    }
+}
+
+fn resource_attempt_count_max(
+    event_count_max: u32,
+    replica_count_max: u32,
+    slots_per_replica: u32,
+    report_interval_micros: u64,
+    service_micros: u64,
+    retry_inflation: bool,
+) -> Result<u32, PlantError> {
+    // Starts cannot exceed the authored event supply or physical slot reuse.
+    // Each transient event can add its authored retry attempts to both bounds.
+    let retry_inflation = if retry_inflation {
+        u64::from(crate::MAX_RETRY_FAILURES) + 1
+    } else {
+        1
+    };
+    let concurrency_max = u64::from(replica_count_max)
+        .checked_mul(u64::from(slots_per_replica))
+        .ok_or(PlantError::PlatformLimit)?;
+    let service_windows = report_interval_micros.div_ceil(service_micros);
+    let physical_attempts = concurrency_max
+        .checked_mul(service_windows.saturating_add(1))
+        .and_then(|value| value.checked_mul(retry_inflation))
+        .ok_or(PlantError::PlatformLimit)?;
+    let event_attempts = u64::from(event_count_max)
+        .checked_mul(retry_inflation)
+        .ok_or(PlantError::PlatformLimit)?;
+    let attempts = physical_attempts.min(event_attempts);
+    u32::try_from(attempts).map_err(|_| PlantError::PlatformLimit)
+}
+
 fn capacity_grid(
     regime: PrincipalRegime,
     capacity_regime: bool,
     sensitivity: Option<CapacitySensitivity>,
 ) -> Result<CapacityGrid, prosody_scale_core::CapacityGridError> {
-    let capacity_count = match sensitivity {
-        Some(CapacitySensitivity::LowerGridCeiling) => 32,
-        Some(CapacitySensitivity::HigherGridCeiling) => 128,
-        _ => 64,
-    };
-    let capacities_per_second = if capacity_regime {
-        (1_u32..=capacity_count)
-            .map(|value| f64::from(value) * 20.0_f64)
-            .collect::<Vec<_>>()
+    let historical_regime = historical_regime(regime);
+    let (service_times_seconds, capacities_per_second): (&[f64], &[f64]) = if historical_regime {
+        (
+            &[0.025_f64, 0.05_f64, 0.1_f64, 0.2_f64, 0.4_f64],
+            &[64_000.0_f64, 128_000.0_f64, 256_000.0_f64],
+        )
+    } else if capacity_regime {
+        capacity_sensitivity_axes(sensitivity)
     } else {
-        (1_u32..=64)
-            .map(|value| f64::from(value) * 2_000.0_f64)
-            .collect::<Vec<_>>()
+        // Every step stays within the capacity model's two-octave cell
+        // bound. The nine original anchors remain grid points.
+        (
+            &[0.000_5_f64, 0.001_f64, 0.002_f64, 0.004_f64, 0.008_f64],
+            &[32_000.0_f64, 64_000.0_f64, 128_000.0_f64, 256_000.0_f64],
+        )
     };
-    let historical_regime = matches!(
+    let prior = CapacityPrior::LogUniform;
+    CapacityGrid::new_with_prior(
+        service_times_seconds,
+        capacities_per_second,
+        CAPACITY_COLLAPSE_GRID,
+        prior,
+    )
+}
+
+const fn historical_regime(regime: PrincipalRegime) -> bool {
+    matches!(
         regime,
         PrincipalRegime::HistoricalMatch
             | PrincipalRegime::HistoricalExceeded
             | PrincipalRegime::HistoricalUnder
             | PrincipalRegime::HistoricalMissing
-    );
-    let service_times_seconds: &[f64] = if capacity_regime || historical_regime {
-        &[0.025_f64, 0.05_f64, 0.1_f64, 0.2_f64]
-    } else {
-        // Every step stays within the capacity model's two-octave cell
-        // bound. The nine original anchors remain grid points.
-        &[
-            0.000_5_f64,
-            0.001_f64,
-            0.002_f64,
-            0.005_f64,
-            0.01_f64,
-            0.03_f64,
-            0.1_f64,
-            0.3_f64,
-            1.0_f64,
-            3.0_f64,
-            10.0_f64,
-            25.0_f64,
-            60.0_f64,
-            240.0_f64,
-            600.0_f64,
-        ]
-    };
-    let prior = if historical_regime {
-        CapacityPrior::LogNormal {
-            service_time_median_seconds: 0.1_f64,
-            capacity_median_per_second: 1_280.0_f64,
-            log_standard_deviation: 2.0_f64.ln(),
-        }
-    } else if capacity_regime {
-        sensitivity.map_or(CapacityPrior::LogUniform, |variant| {
-            let factor: f64 = match variant {
-                CapacitySensitivity::NarrowPrior => 2.0_f64,
-                CapacitySensitivity::WidePrior => 8.0_f64,
-                CapacitySensitivity::ReferencePrior
-                | CapacitySensitivity::LowerGridCeiling
-                | CapacitySensitivity::HigherGridCeiling => 4.0_f64,
-            };
-            CapacityPrior::LogNormal {
-                service_time_median_seconds: 0.1_f64,
-                capacity_median_per_second: 320.0_f64,
-                log_standard_deviation: factor.ln(),
-            }
-        })
-    } else {
-        CapacityPrior::LogNormal {
-            service_time_median_seconds: 0.002_f64,
-            capacity_median_per_second: 64_000.0_f64,
-            log_standard_deviation: 100.0_f64.ln(),
-        }
-    };
-    CapacityGrid::new_with_prior(
-        service_times_seconds,
-        &capacities_per_second,
-        CAPACITY_COLLAPSE_GRID,
-        prior,
     )
+}
+
+fn capacity_sensitivity_axes(
+    sensitivity: Option<CapacitySensitivity>,
+) -> (&'static [f64], &'static [f64]) {
+    const SERVICE_REFERENCE: &[f64] = &[0.2, 0.4, 0.8];
+    const CAPACITY_REFERENCE: &[f64] = &[80.0, 320.0, 1_280.0];
+    const SERVICE_WIDE: &[f64] = &[0.2, 0.8, 3.2];
+    const CAPACITY_WIDE: &[f64] = &[20.0, 80.0, 320.0, 1_280.0];
+    const SERVICE_DENSE: &[f64] = &[0.2, 0.3, 0.4, 0.6, 0.8];
+    const CAPACITY_DENSE: &[f64] = &[80.0, 160.0, 320.0, 640.0, 1_280.0];
+    const SERVICE_COMPACT: &[f64] = &[0.2, 0.4, 0.8];
+    const CAPACITY_COMPACT: &[f64] = &[80.0, 320.0, 1_280.0];
+
+    match sensitivity {
+        None => (SERVICE_COMPACT, CAPACITY_COMPACT),
+        Some(CapacitySensitivity::WidePrior) => (SERVICE_WIDE, CAPACITY_WIDE),
+        Some(CapacitySensitivity::HigherGridCeiling) => (SERVICE_DENSE, CAPACITY_DENSE),
+        Some(
+            CapacitySensitivity::NarrowPrior
+            | CapacitySensitivity::ReferencePrior
+            | CapacitySensitivity::LowerGridCeiling,
+        ) => (SERVICE_REFERENCE, CAPACITY_REFERENCE),
+    }
 }
 
 struct RunProgress {

@@ -973,6 +973,7 @@ fn resource_window_is_consumed_once() -> Result<(), TestError> {
 fn occupancy_trace_contract_rejects_each_invalid_value() -> Result<(), TestError> {
     let mut configuration = configuration()?;
     configuration.resource_window_attempt_count_max = 2;
+    configuration.resource_window_group_count_max = 2;
     let mut observation = ObservationBuffer::new(&configuration)?;
     assert!(matches!(
         ResourceWindow::new_with_starts(1.0_f64, 1.000_000_5_f64, 0, 0),
@@ -1031,7 +1032,7 @@ fn occupancy_trace_contract_rejects_each_invalid_value() -> Result<(), TestError
     let too_many = [OccupancyTransition::new(0, 0, 0); 6];
     assert!(matches!(
         observation.set_resource_observation(empty, 0, 0, &too_many),
-        Err(ObservationError::ResourceTransitionCapacity)
+        Err(ObservationError::ResourceTraceGroupCount)
     ));
     Ok(())
 }
@@ -1707,6 +1708,7 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
         posterior_sample_count: 1_024,
         report_interval_micros: 1_000_000,
         resource_window_attempt_count_max: 100_000,
+        resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
         arrival_prior: ArrivalPrior::new(1.0_f64, 1.0e12_f64, 1.0e-12_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
@@ -1794,6 +1796,7 @@ fn capacity_that_arrives_after_a_deadline_cannot_satisfy_it() -> Result<(), Test
         posterior_sample_count: 128,
         report_interval_micros: 1_000_000,
         resource_window_attempt_count_max: 100_000,
+        resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
         arrival_prior: negligible_arrival_prior()?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
@@ -2228,6 +2231,7 @@ fn plateau_configuration() -> Result<Configuration, TestError> {
         posterior_sample_count: 4_096,
         report_interval_micros: 1_000_000,
         resource_window_attempt_count_max: 100_000,
+        resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
         arrival_prior: ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,
@@ -2429,6 +2433,7 @@ fn configuration() -> Result<Configuration, TestError> {
         posterior_sample_count: 128,
         report_interval_micros: 1_000_000,
         resource_window_attempt_count_max: 100_000,
+        resource_window_group_count_max: 256,
         failure_service_weight: 0.3_f64,
         arrival_prior: ArrivalPrior::test_artifact()?,
         capacity_change_rate_per_second: 1.0_f64 / 86_400.0_f64,

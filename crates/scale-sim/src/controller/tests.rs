@@ -1,9 +1,86 @@
-use prosody_scale_core::ThroughputPosteriorCell;
+use prosody_scale_core::{OccupancyTransition, ThroughputPosteriorCell};
+use quickcheck_macros::quickcheck;
 
 use super::{
-    posterior_predictive_throughput_quantiles, predictive_rank_offset, predictive_throughput_cdf,
+    bucket_window_transitions, posterior_predictive_throughput_quantiles, predictive_rank_offset,
+    predictive_throughput_cdf,
 };
-use crate::PlantError;
+use crate::{AttemptTransition, AttemptTransitionKind, PlantError};
+
+/// Bucketed traces must preserve totals, keep strictly increasing offsets
+/// within the window, respect the group bound, and stay admissible under the
+/// intake order: completions apply before starts at each offset.
+#[quickcheck]
+fn bucketed_transitions_stay_admissible_and_preserve_totals(
+    initial_code: u8,
+    codes: Vec<u8>,
+) -> bool {
+    const EXPOSURE_MICROS: u64 = 10_000;
+    const GROUP_COUNT_MAX: usize = 8;
+    let initial_busy_slots = u32::from(initial_code % 4);
+    let mut active = initial_busy_slots;
+    let mut at_micros = 0_u64;
+    let mut started = 0_u32;
+    let mut completed = 0_u32;
+    let mut transitions = Vec::with_capacity(codes.len());
+    for code in codes {
+        at_micros = (at_micros + u64::from(code >> 4_u32) * 199).min(EXPOSURE_MICROS + 500);
+        let kind = if (code & 1) == 1 && active > 0 {
+            active -= 1;
+            completed += 1;
+            AttemptTransitionKind::Completion
+        } else {
+            active += 1;
+            started += 1;
+            AttemptTransitionKind::Start
+        };
+        transitions.push(AttemptTransition { at_micros, kind });
+    }
+    let mut groups = Vec::with_capacity(GROUP_COUNT_MAX);
+    let Ok(group_count_max) = u32::try_from(GROUP_COUNT_MAX) else {
+        return false;
+    };
+    if bucket_window_transitions(
+        &transitions,
+        0,
+        EXPOSURE_MICROS,
+        group_count_max,
+        &mut groups,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let totals_hold = groups
+        .iter()
+        .copied()
+        .map(OccupancyTransition::completed_attempts)
+        .sum::<u32>()
+        == completed
+        && groups
+            .iter()
+            .copied()
+            .map(OccupancyTransition::started_attempts)
+            .sum::<u32>()
+            == started;
+    let mut previous: Option<u64> = None;
+    let ordered = groups.iter().all(|group| {
+        let increasing = previous.is_none_or(|offset| group.offset_micros() > offset)
+            && group.offset_micros() <= EXPOSURE_MICROS;
+        previous = Some(group.offset_micros());
+        increasing
+    });
+    let mut state = initial_busy_slots;
+    let admissible = groups.iter().all(|group| {
+        state
+            .checked_sub(group.completed_attempts())
+            .is_some_and(|next| {
+                state = next.saturating_add(group.started_attempts());
+                true
+            })
+    });
+    groups.len() <= GROUP_COUNT_MAX && totals_hold && ordered && admissible
+}
 
 #[test]
 fn predictive_throughput_includes_poisson_observation_noise() -> Result<(), PlantError> {

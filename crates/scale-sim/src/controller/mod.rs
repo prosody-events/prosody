@@ -19,10 +19,10 @@ use prosody_scale_core::ThroughputPosteriorCell;
 
 use crate::w6_witness::W6_ABLATION_WITNESSES;
 use crate::{
-    CalendarForecastInput, EventContext, EventInputs, FaultPattern, MetricTrace, PlantError,
-    PriorArtifactKind, PriorArtifactMetadata, ReporterDirective, ScaleDirective,
-    ScheduledReleasesInput, Snapshot, SnapshotChannel, SnapshotCursor, SnapshotTable, TickContext,
-    TickGenerator, TickInputs, W6AblationWitness,
+    AttemptTransition, AttemptTransitionKind, CalendarForecastInput, EventContext, EventInputs,
+    FaultPattern, MetricTrace, PlantError, PriorArtifactKind, PriorArtifactMetadata,
+    ReporterDirective, ScaleDirective, ScheduledReleasesInput, Snapshot, SnapshotChannel,
+    SnapshotCursor, SnapshotTable, TickContext, TickGenerator, TickInputs, W6AblationWitness,
 };
 
 const HANDLER_COVERAGE_LEVELS: [f64; 4] = [0.5_f64, 0.8_f64, 0.9_f64, 0.95_f64];
@@ -584,14 +584,8 @@ fn capacity_trace_layout(
     let state_cell_count = capacity
         .checked_mul(state_count)
         .ok_or(PlantError::PlatformLimit)?;
-    let transition_count_max = usize::try_from(
-        configuration
-            .resource_window_attempt_count_max
-            .checked_mul(2)
-            .and_then(|count| count.checked_add(1))
-            .ok_or(PlantError::PlatformLimit)?,
-    )
-    .map_err(|_| PlantError::PlatformLimit)?;
+    let transition_count_max = usize::try_from(configuration.resource_window_group_count_max)
+        .map_err(|_| PlantError::PlatformLimit)?;
     let transition_cell_count = capacity
         .checked_mul(transition_count_max)
         .ok_or(PlantError::PlatformLimit)?;
@@ -1702,14 +1696,9 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         let partition_posterior_count = trace.partition_share_posterior.values.len();
         let transition_capacity =
             usize::try_from(trace_count_max).map_err(|_| ConfigurationError::PlatformLimit)?;
-        let capacity_transition_count = usize::try_from(
-            core_configuration
-                .resource_window_attempt_count_max
-                .checked_mul(2)
-                .and_then(|count| count.checked_add(1))
-                .ok_or(ConfigurationError::PlatformLimit)?,
-        )
-        .map_err(|_| ConfigurationError::PlatformLimit)?;
+        let capacity_transition_count =
+            usize::try_from(core_configuration.resource_window_group_count_max)
+                .map_err(|_| ConfigurationError::PlatformLimit)?;
         let scratch = state.new_scratch()?;
         let observation = ObservationBuffer::new(core_configuration)?;
         Ok(Self {
@@ -2066,6 +2055,9 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
     }
 
     fn prepare_attempt_outcomes(&mut self, context: &TickContext<'_>) -> Result<(), PlantError> {
+        if self.latest_capacity_window.is_none() {
+            return Ok(());
+        }
         let Some(previous_normal_successes) = context.history.normal_successes(0) else {
             return Ok(());
         };
@@ -2166,46 +2158,13 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             .attempt_transitions
             .get(previous_count..context.plant.attempt_transition_count)
             .unwrap_or(&[]);
-        self.capacity_transition_scratch.clear();
-        for transition in window_transitions.iter().copied() {
-            let offset_micros = transition
-                .at_micros
-                .saturating_sub(previous_micros)
-                .min(exposure_micros);
-            if let Some(group) = self.capacity_transition_scratch.last_mut()
-                && group.offset_micros() == offset_micros
-            {
-                let completed = group
-                    .completed_attempts()
-                    .saturating_add(u32::from(matches!(
-                        transition.kind,
-                        crate::AttemptTransitionKind::Completion
-                    )));
-                let started = group.started_attempts().saturating_add(u32::from(matches!(
-                    transition.kind,
-                    crate::AttemptTransitionKind::Start
-                )));
-                *group = OccupancyTransition::new(offset_micros, completed, started);
-            } else {
-                if self.capacity_transition_scratch.len()
-                    == self.capacity_transition_scratch.capacity()
-                {
-                    return Err(PlantError::MetricCapacity);
-                }
-                self.capacity_transition_scratch
-                    .push(OccupancyTransition::new(
-                        offset_micros,
-                        u32::from(matches!(
-                            transition.kind,
-                            crate::AttemptTransitionKind::Completion
-                        )),
-                        u32::from(matches!(
-                            transition.kind,
-                            crate::AttemptTransitionKind::Start
-                        )),
-                    ));
-            }
-        }
+        bucket_window_transitions(
+            window_transitions,
+            previous_micros,
+            exposure_micros,
+            self.configuration.core().resource_window_group_count_max,
+            &mut self.capacity_transition_scratch,
+        )?;
         let completed_attempts = self
             .capacity_transition_scratch
             .iter()
@@ -2217,17 +2176,27 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             .map(|group| group.started_attempts())
             .fold(0_u32, u32::saturating_add);
         let mut final_busy_slots = initial_busy_slots;
+        let mut previous_offset = 0_u64;
+        let mut busy_slot_micros = 0_u128;
         for group in &self.capacity_transition_scratch {
+            busy_slot_micros = busy_slot_micros
+                .checked_add(
+                    u128::from(group.offset_micros() - previous_offset)
+                        * u128::from(final_busy_slots),
+                )
+                .ok_or(PlantError::MetricCapacity)?;
             final_busy_slots = final_busy_slots
                 .checked_sub(group.completed_attempts())
                 .and_then(|state| state.checked_add(group.started_attempts()))
                 .ok_or(PlantError::MetricCapacity)?;
+            previous_offset = group.offset_micros();
         }
-        let previous_occupancy = context.history.handler_occupancy_micros(0).unwrap_or(0);
-        let occupancy = context
-            .plant
-            .handler_occupancy_micros
-            .saturating_sub(previous_occupancy);
+        busy_slot_micros = busy_slot_micros
+            .checked_add(
+                u128::from(exposure_micros - previous_offset) * u128::from(final_busy_slots),
+            )
+            .ok_or(PlantError::MetricCapacity)?;
+        let occupancy = u64::try_from(busy_slot_micros).map_err(|_| PlantError::MetricCapacity)?;
         let exposure_seconds = Duration::from_micros(exposure_micros).as_secs_f64();
         let current = CapacityWindow {
             concurrency: Duration::from_micros(occupancy).as_secs_f64() / exposure_seconds,
@@ -2828,6 +2797,70 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         self.pending_transition_observations.push_back(observation);
         Ok(())
     }
+}
+
+/// Coalesces exact slot transitions into at most `group_count_max` boundary
+/// groups over one report window.
+///
+/// Starts round down to their bin's start boundary. Completions round up to
+/// their bin's end boundary. A completion therefore always applies at a
+/// later boundary than its own start. The certified intake applies
+/// completions before starts at one offset, so this bracketing keeps every
+/// physically valid transition stream representable.
+fn bucket_window_transitions(
+    transitions: &[AttemptTransition],
+    window_start_micros: u64,
+    exposure_micros: u64,
+    group_count_max: u32,
+    groups: &mut Vec<OccupancyTransition>,
+) -> Result<(), PlantError> {
+    groups.clear();
+    if exposure_micros == 0 {
+        return Err(PlantError::MetricCapacity);
+    }
+    let bin_count = u64::from(group_count_max).saturating_sub(1).max(1);
+    let boundary_count =
+        usize::try_from(bin_count.saturating_add(1)).map_err(|_| PlantError::PlatformLimit)?;
+    if boundary_count > groups.capacity() {
+        return Err(PlantError::MetricCapacity);
+    }
+    for boundary in 0..boundary_count {
+        let index = u64::try_from(boundary).map_err(|_| PlantError::PlatformLimit)?;
+        groups.push(OccupancyTransition::new(
+            index.saturating_mul(exposure_micros) / bin_count,
+            0,
+            0,
+        ));
+    }
+    for transition in transitions.iter().copied() {
+        let offset_micros = transition
+            .at_micros
+            .saturating_sub(window_start_micros)
+            .min(exposure_micros);
+        let bin = usize::try_from(
+            (offset_micros.saturating_mul(bin_count) / exposure_micros)
+                .min(bin_count.saturating_sub(1)),
+        )
+        .map_err(|_| PlantError::PlatformLimit)?;
+        let (index, completed, started) = match transition.kind {
+            AttemptTransitionKind::Start => (bin, 0_u32, 1_u32),
+            AttemptTransitionKind::Completion => (bin + 1, 1_u32, 0_u32),
+        };
+        let group = groups.get_mut(index).ok_or(PlantError::MetricCapacity)?;
+        *group = OccupancyTransition::new(
+            group.offset_micros(),
+            group
+                .completed_attempts()
+                .checked_add(completed)
+                .ok_or(PlantError::MetricCapacity)?,
+            group
+                .started_attempts()
+                .checked_add(started)
+                .ok_or(PlantError::MetricCapacity)?,
+        );
+    }
+    groups.retain(|group| group.completed_attempts() > 0 || group.started_attempts() > 0);
+    Ok(())
 }
 
 fn predictive_rank_bin(rank: f64) -> usize {
