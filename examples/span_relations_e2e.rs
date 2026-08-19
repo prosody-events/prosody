@@ -300,7 +300,7 @@ async fn main() -> Result<()> {
     let (sched, disp, sched_threads, disp_threads) =
         collect_probe_events(&mut receiver, keys).await?;
 
-    client.unsubscribe().await?;
+    client.shutdown().await?;
     admin.delete_topic(&topic).await?;
 
     // Export the tail spans deterministically instead of waiting out the
