@@ -3,6 +3,7 @@ use std::{array, time::Duration};
 use allocation_counter::measure;
 use fearless_simd::Level;
 use quickcheck_macros::quickcheck;
+use statrs::distribution::{ContinuousCDF, Gamma};
 use thiserror::Error;
 
 use super::{
@@ -974,8 +975,19 @@ fn equal_rate_erlang_matches_enumeration_on_random_bands(
         *probability = 1.0_f64 / state_f64(source_count);
     }
     let mut uniform = erlang;
+    let mut log_factorials = [0.0_f64; STATE_COUNT];
     let mut work = [0.0_f64; STATE_COUNT];
-    if equal_rate_death_step(rate, low, high, exposure_seconds, &mut erlang, &mut work).is_none() {
+    if equal_rate_death_step(
+        rate,
+        low,
+        high,
+        exposure_seconds,
+        &mut erlang,
+        &mut log_factorials,
+        &mut work,
+    )
+    .is_none()
+    {
         return false;
     }
     let rates: [f64; STATE_COUNT] =
@@ -1003,6 +1015,27 @@ fn equal_rate_erlang_matches_enumeration_on_random_bands(
         .map(|(left, right)| (left - right).abs())
         .sum::<f64>()
         <= ledger.charged + 4_096.0_f64 * f64::EPSILON
+}
+
+#[test]
+fn equal_rate_erlang_retains_large_mean_mass() -> Result<(), TestError> {
+    const STATE_COUNT: usize = 1_002;
+    let mut probabilities = vec![0.0_f64; STATE_COUNT];
+    probabilities[STATE_COUNT - 1] = 1.0_f64;
+    let mut log_factorials = vec![0.0_f64; STATE_COUNT];
+    let mut work = vec![0.0_f64; STATE_COUNT];
+    equal_rate_death_step(
+        800.0_f64,
+        1,
+        STATE_COUNT - 1,
+        1.0_f64,
+        &mut probabilities,
+        &mut log_factorials,
+        &mut work,
+    )
+    .ok_or(CapacityModelError::InvalidObservationContract)?;
+    assert!(probabilities[1..].iter().sum::<f64>() > 0.99_f64);
+    Ok(())
 }
 
 #[test]
@@ -1273,19 +1306,19 @@ fn honest_regime_prices_derive_the_capacity_operation_budget() -> Result<(), Tes
     assert_eq!(
         prices,
         [
-            2_235_684_613,
-            425_629_719,
-            76_700_455,
-            158_365_713_893,
-            10_369_582_469,
-            533_221_925,
-            533_221_925,
-            2_235_684_613,
-            5_606_155_317,
-            2_235_684_613,
-            581_628_385,
-            668_726_305,
-            206_088_545,
+            2_237_473_359,
+            427_368_773,
+            78_434_517,
+            158_367_561_327,
+            10_371_321_103,
+            534_994_351,
+            534_994_351,
+            2_237_473_359,
+            5_607_910_655,
+            2_237_473_359,
+            583_396_611,
+            670_481_283,
+            207_848_451,
         ]
     );
     let maximum = prices
@@ -1590,8 +1623,67 @@ fn five_arm_double_counting_and_alternating_ablation_match_the_oracle() -> Resul
     Ok(())
 }
 
+#[quickcheck]
+fn batched_completion_residuals_accept_the_specified_clock(batch_code: u8) -> bool {
+    let batch_count = u32::from(batch_code % 7 + 2);
+    let Ok(grid) = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64]) else {
+        return false;
+    };
+    let Ok(prior) = ArrivalPrior::test_artifact() else {
+        return false;
+    };
+    let Ok(mut factor) = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &prior,
+        20.0_f64,
+        1.0_f64,
+        32,
+    ) else {
+        return false;
+    };
+    let Ok(distribution) = Gamma::new(f64::from(batch_count), 1.0_f64) else {
+        return false;
+    };
+    let Ok(window) = ResourceWindow::new_with_starts(20.0_f64, 1.0_f64, batch_count, batch_count)
+    else {
+        return false;
+    };
+    let offset = (distribution.inverse_cdf(0.5_f64) / 20.0_f64 * 1_000_000.0_f64) as u64;
+    factor.update(
+        occupancy_trace_for_test(
+            window,
+            20,
+            20,
+            20_000_000,
+            &[offset],
+            &[batch_count],
+            &[batch_count],
+        ),
+        Duration::from_secs(1),
+    );
+    if factor.residual_sample_count != 1 {
+        return false;
+    }
+    factor.residual_head = 0;
+    factor.residual_len = 0;
+    factor.residual_sample_count = 0;
+    for sample in 0_u32..32 {
+        let probability = (f64::from(sample) + 0.5_f64) / 32.0_f64;
+        let hazard = distribution.inverse_cdf(probability);
+        factor.residual_integrated_hazards.fill(hazard);
+        let residual = factor.predictive_residual(batch_count);
+        factor.record_residual(residual);
+    }
+    let sample_count = f64::from(factor.residual_sample_count);
+    factor.refresh_residual_check(sample_count);
+    let bound =
+        (-(super::RESIDUAL_REJECTION_PROBABILITY * 0.5_f64).ln() / (2.0_f64 * sample_count)).sqrt();
+    factor.residual_maximum_distance <= bound
+}
+
 #[test]
-fn time_rescaled_residuals_reject_tied_deterministic_completions() -> Result<(), TestError> {
+fn batched_completion_residuals_reject_a_misspecified_clock() -> Result<(), TestError> {
     let grid = CapacityGrid::new(&[1.0_f64], &[100.0_f64], &[0.0_f64])?;
     let mut factor = super::CapacityFactor::new_with_prior(
         grid,
@@ -1601,15 +1693,21 @@ fn time_rescaled_residuals_reject_tied_deterministic_completions() -> Result<(),
         1.0_f64,
         32,
     )?;
-    let window = ResourceWindow::new_with_starts(20.0_f64, 1.0_f64, 20, 20)?;
-    let offsets = [500_000_u64];
-    let completed = [20_u32];
-    let started = [20_u32];
-    let evidence =
-        occupancy_trace_for_test(window, 20, 20, 20_000_000, &offsets, &completed, &started);
-    for _ in 0_u8..10 {
-        factor.update(evidence, Duration::from_secs(1));
+    let completed = 4_u32;
+    let distribution = Gamma::new(f64::from(completed), 1.0_f64)
+        .map_err(|_| CapacityModelError::InvalidObservationContract)?;
+    for _ in 0_u32..32 {
+        let hazard = distribution.inverse_cdf(0.5_f64);
+        factor.residual_integrated_hazards.fill(hazard);
+        let residual = factor.predictive_residual(completed);
+        factor.record_residual(residual);
     }
+    let window = ResourceWindow::new_with_starts(0.0_f64, 1.0_f64, 0, 0)?;
+    let offsets: [u64; 0] = [];
+    let counts: [u32; 0] = [];
+    factor.update_residual_check(occupancy_trace_for_test(
+        window, 0, 0, 0, &offsets, &counts, &counts,
+    ));
     assert!(factor.markov_clock_rejected());
     Ok(())
 }
@@ -1670,7 +1768,7 @@ fn residual_cdf_mixes_each_curve_before_the_clock_check() -> Result<(), TestErro
     factor.residual_integrated_hazards[1] = 2.0_f64;
     let expected =
         0.25_f64 * (1.0_f64 - (-0.5_f64).exp()) + 0.75_f64 * (1.0_f64 - (-2.0_f64).exp());
-    assert!((factor.predictive_residual() - expected).abs() <= 8.0_f64 * f64::EPSILON);
+    assert!((factor.predictive_residual(1) - -(-expected).ln_1p()).abs() <= 8.0_f64 * f64::EPSILON);
     Ok(())
 }
 

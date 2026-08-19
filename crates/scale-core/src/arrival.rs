@@ -18,12 +18,18 @@ const MODEL_VERSION: u32 = 1;
 const ARRIVAL_ARTIFACT_SOURCE: u64 = 0x0041_5252_4956_414c;
 const T_MAX_SECONDS_U32: u32 = 7 * 24 * 60 * 60;
 const T_MAX_SECONDS: f64 = T_MAX_SECONDS_U32 as f64;
+// A rate cell can change its Poisson mean by at most two percent. The
+// achieved half-cell relative error enters the decision-cost coverage record.
 const EPSILON_GRID: f64 = 0.02_f64;
+// Omitted prior tails have at most one part per million of total mass. This
+// bounds total variation and expected bounded-loss error by the same fraction.
 const EPSILON_BOUNDARY: f64 = 1.0e-6_f64;
 // The exponential is the maximum-entropy hazard prior for the authored mean.
 // It is also the center of the reset-shape family.
 const HAZARD_SHAPE: f64 = 1.0_f64;
 const HAZARD_TRANSITION_PROBABILITY_ERROR_MAX: f64 = 1.0_f64 / 8.0_f64;
+// Path rejection omits at most one part per billion of predictive mass. This
+// is the total-variation loss between full and buffer-conditioned path laws.
 const EPSILON_PATH: f64 = 1.0e-9_f64;
 // One scaling target can use at most 16 MiB for its arrival filter.
 const STORAGE_BUDGET_BYTES: usize = 16 * 1_024 * 1_024;
@@ -32,6 +38,9 @@ const STORAGE_BUDGET_BYTES: usize = 16 * 1_024 * 1_024;
 const CALENDAR_SEGMENT_SECONDS_MIN: u64 = 600;
 const CALENDAR_SEGMENT_LIMIT: usize =
     (T_MAX_SECONDS_U32 as u64 / CALENDAR_SEGMENT_SECONDS_MIN) as usize;
+// One sampled path can contain at most 262,144 change segments. This authored
+// limit bounds path construction work when an extreme hazard makes the
+// Poisson tail contract larger than useful controller scratch.
 const PATH_SEGMENT_LIMIT: usize = 262_144;
 const ARRIVAL_COUNT_DOMAIN: u64 = 0x6172_7269_7661_6c73;
 
@@ -83,6 +92,8 @@ struct ArrivalGrids {
 /// The declared model is discrete at evidence boundaries. A rate stays fixed
 /// during an interval. It changes at the next boundary with probability
 /// `1 - exp(-hazard * duration)`. The filter is exact for this finite model.
+/// The caller authors the reset-shape center. The prior gives equal mass to
+/// that shape and shapes one octave below and above it for scale robustness.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrivalPrior {
     artifact: PriorArtifactIdentity,
@@ -320,6 +331,9 @@ impl ArrivalFactor {
         let hazard_prior = exact_gamma_masses(&hazards, HAZARD_SHAPE, model.hazard_center);
         let mean = model.authored_shape / model.rate_seconds;
         let rates = grids.rates;
+        // The declared reset-shape prior is uniform on one octave below the
+        // authored center, the center, and one octave above the center. Each
+        // shape keeps the authored mean and changes only concentration.
         let reset_shapes = [
             model.authored_shape * 0.5_f64,
             model.authored_shape,

@@ -2,7 +2,7 @@ use std::{f64::consts::E, mem::size_of, time::Duration};
 
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use statrs::distribution::{Beta, ContinuousCDF, Gamma, LogNormal};
-use statrs::function::gamma::ln_gamma;
+use statrs::function::gamma::{gamma_lr, gamma_ur, ln_gamma};
 use thiserror::Error;
 
 use crate::arrival::ArrivalPrior;
@@ -23,8 +23,8 @@ const PATH_SOLVER_PROBABILITY_ERROR_MAX: f64 = 1.0e-10_f64;
 const CAPACITY_KERNEL_OPERATIONS_PER_SECOND_MIN: u64 = 100_000_000;
 /// One capacity update can use at most 400 billion simple operations.
 ///
-/// The honest regime table has a maximum of 158,365,713,893 operations.
-/// Two-times headroom gives 316,731,427,786 operations. Rounding this value
+/// The honest regime table has a maximum of 158,367,561,327 operations.
+/// Two-times headroom gives 316,735,122,654 operations. Rounding this value
 /// up to one significant figure gives 400,000,000,000 operations. At the
 /// certified minimum rate, this limit permits 4,000 seconds for one update.
 const CAPACITY_UPDATE_OPERATION_COUNT_MAX: u64 = 4_000 * CAPACITY_KERNEL_OPERATIONS_PER_SECOND_MIN;
@@ -1093,11 +1093,11 @@ impl CapacityFactor {
         {
             let exposure = Duration::from_micros(offset - previous_offset).as_secs_f64();
             self.add_residual_exposure(state, exposure);
-            for _ in 0..completed {
+            if completed > 0 {
                 if self.discard_next_residual {
                     self.discard_next_residual = false;
                 } else {
-                    let residual = self.predictive_residual();
+                    let residual = self.predictive_residual(completed);
                     self.record_residual(residual);
                 }
                 self.residual_integrated_hazards.fill(0.0_f64);
@@ -1126,12 +1126,24 @@ impl CapacityFactor {
         }
     }
 
-    fn predictive_residual(&self) -> f64 {
-        self.weights
+    fn predictive_residual(&self, completed: u32) -> f64 {
+        let shape = f64::from(completed);
+        let survival = self
+            .weights
             .iter()
             .zip(&self.residual_integrated_hazards)
-            .map(|(weight, hazard)| weight * (1.0_f64 - (-hazard).exp()))
-            .sum()
+            .map(|(weight, hazard)| {
+                let cell_survival = if *hazard <= 0.0_f64 {
+                    1.0_f64
+                } else if *hazard < shape {
+                    1.0_f64 - gamma_lr(shape, *hazard)
+                } else {
+                    gamma_ur(shape, *hazard)
+                };
+                weight * cell_survival
+            })
+            .sum::<f64>();
+        -survival.ln()
     }
 
     fn record_residual(&mut self, residual: f64) {
@@ -1154,8 +1166,9 @@ impl CapacityFactor {
             let index = u32::try_from(index).map_or(u32::MAX, |value| value);
             let lower = f64::from(index) / sample_count;
             let upper = f64::from(index.saturating_add(1)) / sample_count;
-            maximum = maximum.max((residual - lower).abs());
-            maximum = maximum.max((upper - residual).abs());
+            let cdf = -(-residual).exp_m1();
+            maximum = maximum.max((cdf - lower).abs());
+            maximum = maximum.max((upper - cdf).abs());
         }
         self.residual_maximum_distance = maximum;
     }
@@ -1629,9 +1642,37 @@ fn capacity_update_operation_count(
             .checked_add(contraction_cost)?;
     }
     let cells = u64::try_from(allocation.cell_count).ok()?;
-    let path_cost = cells.checked_mul(states)?;
+    let allocated_states = u64::try_from(allocation.state_count).ok()?;
+    // Each cell fills its rate vector and then scans the same vector for the
+    // path score. Kernel work is priced separately above.
+    let path_cost = cells.checked_mul(allocated_states)?.checked_mul(2)?;
+    let Ok(attempts) = u64::try_from(allocation.transition_count.saturating_sub(1) / 2) else {
+        return None;
+    };
+    let residual_batches = groups.min(attempts);
+    // Each trace group adds exposure for every curve. Each completion batch
+    // then scans the curve posterior and clears its integrated hazards.
+    let residual_grid_cost = groups
+        .checked_add(1)?
+        .checked_add(residual_batches.checked_mul(2)?)?
+        .checked_mul(cells)?;
+    let residual_ring_cost = residual_batches;
+    let sort_levels = u64::from(attempts.max(1).ilog2().saturating_add(1));
+    // The diagnostic copies and scans the ring once. The unstable sort has an
+    // O(N log N) comparison bound; two operations price each compare and move.
+    let residual_sort_cost = attempts
+        .checked_mul(sort_levels)?
+        .checked_mul(2)?
+        .checked_add(attempts.checked_mul(2)?)?;
+    let trace_cost = groups.checked_mul(5)?;
     let filter_cost = u64::try_from(allocation.filter_curve_count).ok()?;
-    kernel_cost.checked_add(path_cost)?.checked_add(filter_cost)
+    kernel_cost
+        .checked_add(path_cost)?
+        .checked_add(residual_grid_cost)?
+        .checked_add(residual_ring_cost)?
+        .checked_add(residual_sort_cost)?
+        .checked_add(trace_cost)?
+        .checked_add(filter_cost)
 }
 
 fn uniformization_term_count_bound(mean: f64, tail_bound: f64) -> Option<u32> {
@@ -2446,7 +2487,15 @@ fn pure_death_step_with_rates(
         .iter()
         .all(|rate| rate.to_bits() == first_rate.to_bits());
     if all_equal {
-        equal_rate_death_step(first_rate, low, high, exposure_seconds, probabilities, work)?;
+        equal_rate_death_step(
+            first_rate,
+            low,
+            high,
+            exposure_seconds,
+            probabilities,
+            coefficients,
+            work,
+        )?;
         return Some(ledger.group_budget);
     }
     uniformized_death_step(rates, band, probabilities, coefficients, work, ledger)
@@ -2535,25 +2584,42 @@ fn linear_rate_death_step(
     Some(())
 }
 
+/// Evolves an equal-rate band from independent log-space Poisson terms.
+///
+/// `log_factorials` is construction-sized scratch. Each term that underflows
+/// is below `f64::MIN_POSITIVE`. The total omitted mass is at most the band
+/// width times that value for each source state.
 fn equal_rate_death_step(
     rate: f64,
     low: usize,
     high: usize,
     exposure_seconds: f64,
     probabilities: &mut [f64],
+    log_factorials: &mut [f64],
     work: &mut [f64],
 ) -> Option<()> {
     work[low..=high].fill(0.0_f64);
     let mean = rate * exposure_seconds;
-    let zero_deaths = (-mean).exp();
+    let width = high.checked_sub(low)?;
+    log_factorials[0] = 0.0_f64;
+    for deaths in 1..=width {
+        let Ok(deaths_u32) = u32::try_from(deaths) else {
+            return None;
+        };
+        log_factorials[deaths] = log_factorials[deaths - 1] + f64::from(deaths_u32).ln();
+    }
+    let log_mean = mean.ln();
     for source in low..=high {
-        let mut probability = zero_deaths;
         for deaths in 0..=source - low {
-            work[source - deaths] += probabilities[source] * probability;
-            let Ok(divisor) = u32::try_from(deaths + 1) else {
+            let Ok(deaths_u32) = u32::try_from(deaths) else {
                 return None;
             };
-            probability *= mean / f64::from(divisor);
+            let probability = if mean == 0.0_f64 {
+                f64::from(u8::from(deaths == 0))
+            } else {
+                (-mean + f64::from(deaths_u32) * log_mean - log_factorials[deaths]).exp()
+            };
+            work[source - deaths] += probabilities[source] * probability;
         }
     }
     probabilities[low..=high].copy_from_slice(&work[low..=high]);

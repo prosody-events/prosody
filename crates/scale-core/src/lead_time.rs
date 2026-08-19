@@ -643,6 +643,8 @@ impl LaunchTimeFactor {
                 let components = self.components(hypothesis, evidence.requested_delta);
                 let contribution =
                     launch_observation_probability(components, observation, evidence.requested_at);
+                // Every finite positive log-normal interval has positive mass.
+                // Zero here can only be floating-point underflow of that mass.
                 self.likelihoods[hypothesis] += contribution.max(f64::MIN_POSITIVE).ln();
             }
         }
@@ -962,6 +964,8 @@ impl RebalanceTimeFactor {
         let exposure = Duration::from_micros(through.as_micros().saturating_sub(after.as_micros()));
         self.transition(elapsed.saturating_sub(exposure));
         for (likelihood, cell) in self.likelihoods.iter_mut().zip(&self.prior.cells) {
+            // Every finite positive log-normal interval has positive mass.
+            // Zero here can only be floating-point underflow of that mass.
             *likelihood = observation_probability(*cell, observation, after)
                 .max(f64::MIN_POSITIVE)
                 .ln();
@@ -1213,6 +1217,8 @@ fn launch_observation_probability(
                 * (1.0_f64 - log_normal_cdf(components.fast, upper_seconds))
                 + components.slow_probability
                     * (1.0_f64 - log_normal_cdf(components.slow, upper_seconds));
+            // Finite log-normal survival is positive. The floor only repairs
+            // a zero caused by survival-tail cancellation in binary64.
             current_survival / prior_survival.max(f64::MIN_POSITIVE)
         }
     }
@@ -1235,6 +1241,8 @@ fn observation_probability(
         ReadinessObservation::Pending { .. } => {
             let prior_survival = 1.0_f64 - log_normal_cdf(cell, lower_seconds);
             let current_survival = 1.0_f64 - log_normal_cdf(cell, upper_seconds);
+            // Finite log-normal survival is positive. The floor only repairs
+            // a zero caused by survival-tail cancellation in binary64.
             current_survival / prior_survival.max(f64::MIN_POSITIVE)
         }
     }
@@ -1275,6 +1283,8 @@ fn sample_log_normal_after(
 ) -> f64 {
     let lower_cdf = log_normal_cdf(cell, elapsed_seconds);
     let probability = lower_cdf + random.open_unit_f64() * (1.0_f64 - lower_cdf);
+    // A log-normal value is strictly positive. MIN_POSITIVE represents that
+    // open support when the observed elapsed time is exactly zero.
     let mut low = elapsed_seconds.max(f64::MIN_POSITIVE);
     let mut high = cell.median_seconds().max(low * 2.0_f64);
     while log_normal_cdf(cell, high) < probability {
@@ -1412,6 +1422,10 @@ fn normal_survival(standardized: f64) -> f64 {
     0.5_f64 * complementary_error_function(standardized / SQRT_2)
 }
 
+/// Evaluates the Numerical Recipes `erfcc` rational fit.
+///
+/// The published relative-error bound is `1.2e-7`. The smallest lead-time
+/// decision-cost budget is `1e-4`, so that declared budget absorbs this error.
 fn complementary_error_function(value: f64) -> f64 {
     let absolute = value.abs();
     let t = 1.0_f64 / (1.0_f64 + 0.5_f64 * absolute);
@@ -1430,6 +1444,26 @@ fn complementary_error_function(value: f64) -> f64 {
         polynomial
     } else {
         2.0_f64 - polynomial
+    }
+}
+
+#[cfg(test)]
+mod approximation_tests {
+    use super::complementary_error_function;
+
+    #[test]
+    fn complementary_error_function_matches_reference_values() {
+        let references = [
+            (0.0_f64, 1.0_f64),
+            (1.0_f64, 0.157_299_207_050_285_13_f64),
+            (-1.0_f64, 1.842_700_792_949_714_8_f64),
+            (3.0_f64, 2.209_049_699_858_544e-5_f64),
+        ];
+        for (value, reference) in references {
+            let relative_error =
+                ((complementary_error_function(value) - reference) / reference).abs();
+            assert!(relative_error <= 1.2e-7_f64);
+        }
     }
 }
 
