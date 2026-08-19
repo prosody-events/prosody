@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.6.0](https://github.com/prosody-events/prosody/compare/prosody-v0.5.0...prosody-v0.6.0) (2026-08-19)
+
+
+### Features
+
+* add binary JSON codec bundle ([#61](https://github.com/prosody-events/prosody/issues/61)) ([05f5a0d](https://github.com/prosody-events/prosody/commit/05f5a0dacc9729bcc07d8c2b5c757444e51912bb))
+* add excise records ([#60](https://github.com/prosody-events/prosody/issues/60)) ([a349033](https://github.com/prosody-events/prosody/commit/a3490334293e0ab337adddb3bdf7ec89b9fd59a6))
+* **peer:** peer delivery and synchrony recovery ([#56](https://github.com/prosody-events/prosody/issues/56)) ([4968118](https://github.com/prosody-events/prosody/commit/4968118b7761d9eed6291c8384fc7e0053eede5a))
+* return keyed subsystem outcomes ([#67](https://github.com/prosody-events/prosody/issues/67)) ([91a4fc4](https://github.com/prosody-events/prosody/commit/91a4fc4730e1befbac6d87e8331000906bc367e3))
+* **state:** expose published keyed state ([#51](https://github.com/prosody-events/prosody/issues/51)) ([1add1b7](https://github.com/prosody-events/prosody/commit/1add1b742a4118142ea536b96d3dc8237ae16897))
+* **tracing:** retain OTel provider handles and add flush/shutdown ([#49](https://github.com/prosody-events/prosody/issues/49)) ([e9b492f](https://github.com/prosody-events/prosody/commit/e9b492fc6c75bafce4d28bbea205aebf5baaa2d3))
+
+
+### Bug Fixes
+
+* defer automatic peer address selection ([#63](https://github.com/prosody-events/prosody/issues/63)) ([da1665d](https://github.com/prosody-events/prosody/commit/da1665d5b82cfd1c60f418bc7ac3bc5899d2f95e))
+* derive erased state codecs from payloads ([#62](https://github.com/prosody-events/prosody/issues/62)) ([9551102](https://github.com/prosody-events/prosody/commit/955110209d22691ae6a287a7d50655cad951c535))
+* isolate coverage tests ([#64](https://github.com/prosody-events/prosody/issues/64)) ([0c95867](https://github.com/prosody-events/prosody/commit/0c958671f9f9f5f610edcefbb66a639cc5a8217a))
+* isolate peer telemetry tests ([#65](https://github.com/prosody-events/prosody/issues/65)) ([d96b53a](https://github.com/prosody-events/prosody/commit/d96b53af1a0c8e9f9b0c0d4155e05f4fda6e28e1))
+
+
+### Performance Improvements
+
+* reduce Cassandra keyed-state allocations ([#69](https://github.com/prosody-events/prosody/issues/69)) ([0e76aa7](https://github.com/prosody-events/prosody/commit/0e76aa77a5a29bad5be59c9a3aaea58a1c94a5c2))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * prosody-macros bumped from 0.5.0 to 0.6.0
+
 ## [0.5.0](https://github.com/prosody-events/prosody/compare/prosody-v0.4.0...prosody-v0.5.0) (2026-07-21)
 
 
