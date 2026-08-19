@@ -3747,6 +3747,7 @@ dependencies = [
 name = "prosody-scale-sim"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "criterion",
  "paste",
  "plotters",

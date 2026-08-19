@@ -11,6 +11,7 @@ repository = "https://github.com/prosody-events/prosody"
 version = "0.1.0"
 
 [dependencies]
+chrono.workspace = true
 paste.workspace = true
 plotters.workspace = true
 prosody-scale-core = { path = "../scale-core" }

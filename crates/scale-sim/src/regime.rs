@@ -1,6 +1,11 @@
+use std::env;
+use std::fs::{File, create_dir_all};
+use std::io::{self, Write};
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use chrono::{Local, TimeDelta};
 use prosody_scale_core::{
     CalendarArtifactId, CalendarRateSegment, CapacityGrid, CapacityPrior, Configuration,
     DecisionRejection, LaunchPrior, RandomStream, RebalancePrior, ReliabilityPrior,
@@ -22,6 +27,12 @@ use crate::{
 
 const CAPACITY_COLLAPSE_GRID: &[f64] = &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64];
 const REPLICA_SECOND_DELAY_RATE: f64 = 3.0_f64;
+
+/// Minimum wall-clock time between progress reports.
+const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Smoothing factor for the step-time estimate behind the ETA.
+const PROGRESS_STEP_SMOOTHING: f64 = 0.3_f64;
 
 const EVENT_COUNT: u32 = 2_000;
 const HOT_KEY_EVENT_COUNT: u32 = 6_000;
@@ -1517,7 +1528,7 @@ fn run_principal_definition(
         graph,
         attempt_model,
     )?;
-    let stop = run_schedule(&mut harness, regime, definition.schedule)?;
+    let stop = run_schedule(&mut harness, regime, seed, definition.schedule)?;
     let (simulation, graph) = harness.finish_with_graph();
     let (controller, graph) = graph.into_parts();
     Ok(PrincipalRun {
@@ -1771,24 +1782,126 @@ fn capacity_sensitivity_axes(
     }
 }
 
+/// Step timing for one progress report.
+struct StepTiming {
+    elapsed: f64,
+    recent_millis: f64,
+    average_millis: f64,
+    eta_seconds: f64,
+}
+
+/// Live progress reporter for one regime run.
+///
+/// The reporter appends one report line at most every
+/// [`PROGRESS_REPORT_INTERVAL`], and always on a controller target
+/// change. Each line shows elapsed wall time, tick position, virtual
+/// time, step rate, remaining time, and the estimated finish time.
+/// The remaining time is the remaining tick count times an
+/// exponentially smoothed step time. Lines go to the run's progress
+/// file and to a `tracing` event. To watch a live run:
+/// `tail -f target/sim-progress/<regime>-seed<seed>.progress`.
 struct RunProgress {
     started: Instant,
-    progress_started: Instant,
+    reported: Instant,
     tick_count: u32,
-    progress_tick_count: u32,
+    reported_tick_count: u32,
     prior_target: Option<u32>,
+    smoothed_step_seconds: f64,
+    sink: Option<File>,
 }
 
 impl RunProgress {
-    fn new() -> Self {
+    fn new(regime: PrincipalRegime, seed: u64, tick_count_max: u32) -> Result<Self, io::Error> {
         let started = Instant::now();
-        Self {
+        let mut progress = Self {
             started,
-            progress_started: started,
+            reported: started,
             tick_count: 0,
-            progress_tick_count: 0,
+            reported_tick_count: 0,
             prior_target: None,
+            smoothed_step_seconds: 0.0_f64,
+            sink: progress_file(regime, seed)?,
+        };
+        progress.write_line(&format!(
+            "run start | {tick_count_max} ticks maximum | {}",
+            Local::now().format("%Y-%m-%d %H:%M:%S")
+        ))?;
+        Ok(progress)
+    }
+
+    fn write_line(&mut self, line: &str) -> Result<(), io::Error> {
+        if let Some(sink) = self.sink.as_mut() {
+            writeln!(sink, "{line}")?;
         }
+        Ok(())
+    }
+
+    /// Writes the final report line for one run outcome.
+    fn finish(&mut self, outcome: &Result<RunStop, PrincipalRunError>) -> Result<(), io::Error> {
+        let elapsed = format_clock(self.started.elapsed().as_secs_f64());
+        let ticks = self.tick_count;
+        let line = match outcome {
+            Ok(stop) => format!(
+                "run complete | {:?} | {ticks} ticks | elapsed {elapsed}",
+                stop.reason
+            ),
+            Err(error) => format!("run failed | {error} | {ticks} ticks | elapsed {elapsed}"),
+        };
+        self.write_line(&line)
+    }
+
+    fn step_timing(&mut self, now: Instant, tick_count_max: u32) -> StepTiming {
+        let elapsed = now.duration_since(self.started).as_secs_f64();
+        let report_ticks = self
+            .tick_count
+            .saturating_sub(self.reported_tick_count)
+            .max(1);
+        let recent_seconds =
+            now.duration_since(self.reported).as_secs_f64() / f64::from(report_ticks);
+        self.smoothed_step_seconds = if self.smoothed_step_seconds > 0.0_f64 {
+            PROGRESS_STEP_SMOOTHING.mul_add(
+                recent_seconds - self.smoothed_step_seconds,
+                self.smoothed_step_seconds,
+            )
+        } else {
+            recent_seconds
+        };
+        StepTiming {
+            elapsed,
+            recent_millis: recent_seconds * 1_000.0_f64,
+            average_millis: elapsed * 1_000.0_f64 / f64::from(self.tick_count),
+            eta_seconds: self.smoothed_step_seconds
+                * f64::from(tick_count_max.saturating_sub(self.tick_count)),
+        }
+    }
+
+    fn write_progress_line(
+        &mut self,
+        timing: &StepTiming,
+        phase: &str,
+        at_micros: u64,
+        schedule: RunSchedule,
+        tick_count_max: u32,
+    ) -> Result<(), io::Error> {
+        let percent = 100.0_f64 * f64::from(self.tick_count) / f64::from(tick_count_max.max(1));
+        let finish = TimeDelta::try_milliseconds((timing.eta_seconds * 1_000.0_f64) as i64)
+            .and_then(|delta| Local::now().checked_add_signed(delta))
+            .map_or_else(
+                || String::from("unknown"),
+                |time| time.format("%Y-%m-%d %H:%M:%S").to_string(),
+            );
+        self.write_line(&format!(
+            "elapsed {} | tick {}/{tick_count_max} ({percent:.1}%) | virtual {:.0} s of {:.0} s | \
+             {phase} | step {:.0} ms recent, {:.0} ms average | remaining {} | finish about \
+             {finish}",
+            format_clock(timing.elapsed),
+            self.tick_count,
+            Duration::from_micros(at_micros).as_secs_f64(),
+            Duration::from_micros(schedule.maximum_micros).as_secs_f64(),
+            timing.recent_millis,
+            timing.average_millis,
+            format_clock(timing.eta_seconds),
+        ))
     }
 
     fn record(
@@ -1799,25 +1912,19 @@ impl RunProgress {
         schedule: RunSchedule,
         at_micros: u64,
         tick_count_max: u32,
-    ) {
-        const INTERVAL: u32 = 25;
-
+    ) -> Result<(), io::Error> {
         self.tick_count = self.tick_count.saturating_add(1);
         let controller = harness.graph().trace();
         let controller_index = controller.len().saturating_sub(1);
         let controller_sample = controller.sample(controller_index);
         let target_changed =
             controller_sample.is_some_and(|sample| self.prior_target != Some(sample.target));
-        if self.tick_count == 1 || self.tick_count.is_multiple_of(INTERVAL) || target_changed {
-            let now = Instant::now();
-            let elapsed = now.duration_since(self.started).as_secs_f64();
-            let progress_ticks = self.tick_count.saturating_sub(self.progress_tick_count);
-            let recent_millis = now.duration_since(self.progress_started).as_secs_f64()
-                * 1_000.0_f64
-                / f64::from(progress_ticks);
-            let average_millis = elapsed * 1_000.0_f64 / f64::from(self.tick_count);
-            let remaining_ticks = tick_count_max.saturating_sub(self.tick_count);
-            let eta_seconds = average_millis * f64::from(remaining_ticks) / 1_000.0_f64;
+        let now = Instant::now();
+        let due = self.tick_count == 1
+            || target_changed
+            || now.duration_since(self.reported) >= PROGRESS_REPORT_INTERVAL;
+        if due {
+            let timing = self.step_timing(now, tick_count_max);
             let phase = if at_micros < schedule.workload_end_micros {
                 "workload"
             } else {
@@ -1850,10 +1957,10 @@ impl RunProgress {
                 virtual_seconds = Duration::from_micros(at_micros).as_secs_f64(),
                 maximum_virtual_seconds =
                     Duration::from_micros(schedule.maximum_micros).as_secs_f64(),
-                wall_elapsed_seconds = elapsed,
-                recent_step_millis = recent_millis,
-                average_step_millis = average_millis,
-                eta_seconds,
+                wall_elapsed_seconds = timing.elapsed,
+                recent_step_millis = timing.recent_millis,
+                average_step_millis = timing.average_millis,
+                eta_seconds = timing.eta_seconds,
                 phase,
                 actual_replicas = snapshot.replicas,
                 desired_replicas = harness.desired_replicas(),
@@ -1885,26 +1992,71 @@ impl RunProgress {
                 target_changed,
                 "regime progress"
             );
-            self.progress_started = now;
-            self.progress_tick_count = self.tick_count;
+            self.write_progress_line(&timing, phase, at_micros, schedule, tick_count_max)?;
+            self.reported = now;
+            self.reported_tick_count = self.tick_count;
         }
         if let Some(sample) = controller_sample {
             self.prior_target = Some(sample.target);
         }
+        Ok(())
+    }
+}
+
+/// Opens the progress file for one run.
+///
+/// The file lives in `SIM_PROGRESS_DIR` when that variable is set.
+/// Otherwise it lives in the workspace `target/sim-progress`
+/// directory. Returns `None` when no directory is resolvable. Two
+/// runs with one regime and seed share one file; the later run
+/// truncates it.
+fn progress_file(regime: PrincipalRegime, seed: u64) -> Result<Option<File>, io::Error> {
+    let directory = env::var_os("SIM_PROGRESS_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("CARGO_MANIFEST_DIR")
+                .map(|manifest| PathBuf::from(manifest).join("../../target/sim-progress"))
+        });
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    create_dir_all(&directory)?;
+    File::create(directory.join(format!("{}-seed{seed}.progress", regime.name()))).map(Some)
+}
+
+/// Formats a second count as `HH:MM:SS`, with a day prefix past one day.
+fn format_clock(seconds: f64) -> String {
+    let total = if seconds.is_finite() {
+        seconds.max(0.0_f64) as u64
+    } else {
+        0
+    };
+    let days = total / 86_400;
+    let hours = total % 86_400 / 3_600;
+    let minutes = total % 3_600 / 60;
+    let seconds = total % 60;
+    if days > 0 {
+        format!("{days}d {hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
     }
 }
 
 fn run_schedule(
     harness: &mut SimulationHarness<ClosedLoop<PrincipalGraph>, PrincipalAttemptModel>,
     regime: PrincipalRegime,
+    seed: u64,
     schedule: RunSchedule,
 ) -> Result<RunStop, PrincipalRunError> {
     let mut at_micros = schedule.start_micros;
     let mut stable_count = 0_u8;
     let tick_count_max = schedule.controller_sample_count_max()?;
-    let mut progress = RunProgress::new();
-    loop {
-        let snapshot = harness.tick(at_micros)?;
+    let mut progress = RunProgress::new(regime, seed, tick_count_max)?;
+    let outcome = loop {
+        let snapshot = match harness.tick(at_micros) {
+            Ok(snapshot) => snapshot,
+            Err(error) => break Err(PrincipalRunError::Plant(error)),
+        };
         progress.record(
             harness,
             &snapshot,
@@ -1912,7 +2064,7 @@ fn run_schedule(
             schedule,
             at_micros,
             tick_count_max,
-        );
+        )?;
         match schedule.stop {
             StopCondition::IdleStable { sample_count } => {
                 let stable = at_micros >= schedule.workload_end_micros
@@ -1924,19 +2076,19 @@ fn run_schedule(
                     0
                 };
                 if stable_count >= sample_count {
-                    return Ok(RunStop {
+                    break Ok(RunStop {
                         at_micros,
                         reason: RunStopReason::IdleStable,
                     });
                 }
             }
             StopCondition::FixedDuration { reason } if at_micros >= schedule.maximum_micros => {
-                return Ok(RunStop { at_micros, reason });
+                break Ok(RunStop { at_micros, reason });
             }
             StopCondition::FixedDuration { .. } => {}
         }
         if at_micros >= schedule.maximum_micros {
-            return Err(PrincipalRunError::RunDurationExceeded {
+            break Err(PrincipalRunError::RunDurationExceeded {
                 maximum_micros: schedule.maximum_micros,
             });
         }
@@ -1948,7 +2100,9 @@ fn run_schedule(
         at_micros = at_micros
             .saturating_add(interval)
             .min(schedule.maximum_micros);
-    }
+    };
+    progress.finish(&outcome)?;
+    outcome
 }
 
 /// One principal plant result with its controller trace.
@@ -2056,6 +2210,9 @@ pub enum PrincipalRunError {
         /// Maximum virtual time.
         maximum_micros: u64,
     },
+    /// The progress report file was not writable.
+    #[error("the progress report file was not writable: {0}")]
+    Progress(#[from] io::Error),
 }
 
 /// A principal run contradicted its declared regime.

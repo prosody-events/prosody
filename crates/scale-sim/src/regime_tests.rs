@@ -2,12 +2,20 @@ use super::{
     ArrivalSchedule, ArrivalSeries, CALENDAR_PRIOR_RATE_SECONDS, CALENDAR_PRIOR_SHAPE,
     HISTORICAL_SCHEDULE, HISTORY_EVENT_COUNT_MAX, HistoricalSeries, IndexSeries,
     PrincipalDefinition, PrincipalRegime, RunSchedule, RunStopReason, SEASONAL_SCHEDULE,
-    SharedResourcePolicy, StopCondition, resource_attempt_count_max, run_principal_definition,
-    run_principal_regime_seeded,
+    SharedResourcePolicy, StopCondition, format_clock, resource_attempt_count_max,
+    run_principal_definition, run_principal_regime_seeded,
 };
 use crate::model::{AttemptFrame, AttemptModel};
 use crate::{ConcurrencyLatencyCurve, PlantError, PrincipalRunError, SeriesCell};
 use quickcheck_macros::quickcheck;
+
+#[test]
+fn progress_clock_formats_boundaries() {
+    assert_eq!(format_clock(0.0_f64), "00:00:00");
+    assert_eq!(format_clock(59.0_f64), "00:00:59");
+    assert_eq!(format_clock(3_661.0_f64), "01:01:01");
+    assert_eq!(format_clock(90_061.0_f64), "1d 01:01:01");
+}
 
 #[quickcheck]
 fn attempt_contract_is_the_smaller_authored_supply_bound(
