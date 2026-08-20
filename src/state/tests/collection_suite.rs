@@ -962,8 +962,9 @@ impl Arbitrary for MapGetManyInput {
     }
 }
 
-/// `Map::get_many(keys)` parity against the already-trusted point path:
-/// `get_many(queries)` answers each position exactly as `queries.map(get)`,
+/// Map batch-read parity against the already-trusted point paths:
+/// `get_many(queries)` answers each position exactly as `queries.map(get)`, and
+/// `contains_many(queries)` answers each position as `queries.map(contains)`.
 /// including duplicate, present, and absent keys, across the sub-batch
 /// boundary. No TTL is in play and the JSON identity resolver is deterministic,
 /// so the observation rules collapse to exact point-parity and this isolates
@@ -992,7 +993,9 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
 
     // Read arm: the same (dirty) session, or a fresh event after committing 0.
     let batch;
+    let presence;
     let mut point = Vec::with_capacity(input.queries.len());
+    let mut point_presence = Vec::with_capacity(input.queries.len());
     if input.commit {
         finalize_and_promote(&session0, &oracle, event_dedup(ev0), &cells, id).await?;
         let ev1 = EventRef::Message {
@@ -1001,13 +1004,17 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
         let session1 = make_session(&cells, &oracle, &registry, &state_key, &armed, ev1);
         let handle1 = descriptor.bind(&session1).map_err(|e| eyre!("bind: {e}"))?;
         batch = Box::pin(handle1.get_many(&input.queries)).await?;
+        presence = Box::pin(handle1.contains_many(&input.queries)).await?;
         for q in &input.queries {
             point.push(handle1.get(q).await?);
+            point_presence.push(handle1.contains_key(q).await?);
         }
     } else {
         batch = Box::pin(handle0.get_many(&input.queries)).await?;
+        presence = Box::pin(handle0.contains_many(&input.queries)).await?;
         for q in &input.queries {
             point.push(handle0.get(q).await?);
+            point_presence.push(handle0.contains_key(q).await?);
         }
     }
 
@@ -1015,7 +1022,7 @@ pub(crate) async fn run_map_get_many_parity_trace(input: MapGetManyInput) -> Res
     if batch.len() != input.queries.len() {
         return Ok(false);
     }
-    Ok(batch == point)
+    Ok(batch == point && presence == point_presence)
 }
 
 /// Seeds a deque window directly into `store`: the `head ‖ tail` meta frame for

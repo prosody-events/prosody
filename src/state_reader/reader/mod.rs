@@ -283,6 +283,25 @@ where
             .map_err(|e| StateReaderError::store(&e))
     }
 
+    /// Tests committed presence for `map_keys` as one aligned batch. Each
+    /// result answers the same input position.
+    ///
+    /// # Errors
+    ///
+    /// Any [`StateReaderError`]; see [`StateReader::get`](StateReader::get).
+    pub async fn contains_many<K: Into<Key>>(
+        &self,
+        key: K,
+        map_keys: &[KC::Key],
+    ) -> Result<Vec<bool>, StateReaderError> {
+        let session = self.session(key.into()).await?;
+        let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
+        handle
+            .contains_many(map_keys)
+            .await
+            .map_err(|e| StateReaderError::store(&e))
+    }
+
     /// Streams the committed live entries of the map under partition `key` in
     /// key order (ascending for [`Direction::Forward`]).
     ///

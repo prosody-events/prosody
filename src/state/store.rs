@@ -136,9 +136,8 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// Scans visible committed keys in coordinate order. The scan applies its
     /// direction, edges, and limit to present keys.
     ///
-    /// This read returns marker-resolved truth through the read window stated
-    /// on [`Self::get`]. It resolves provisional presence with `peek_read` and
-    /// never repairs a cell from its own snapshot.
+    /// This read uses the marker-resolved presence rules on
+    /// [`Self::scan_keys`].
     fn scan_keys<'a>(
         &'a self,
         collection: &'a CollectionId,

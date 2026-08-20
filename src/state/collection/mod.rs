@@ -705,6 +705,18 @@ pub(crate) trait CollectionRead: sealed_ops::CollectionOperation {
         T: CellType,
         for<'s> ContextOf<'s, T>: FromSession<'s, Self::Session>;
 
+    /// Tests `keys` for presence as one aligned batch. Each result answers the
+    /// same input position. Duplicate keys keep their positions.
+    ///
+    /// # Errors
+    ///
+    /// An engine access error.
+    fn contains_many<T: CellType>(
+        &mut self,
+        family: CellFamily<Self::Layout, T>,
+        keys: &[KeyOf<T>],
+    ) -> impl Future<Output = Result<CellBuffer<bool>, StateAccessError>> + Send;
+
     /// Whether a stored cell exists at `key`, **without decoding its value or
     /// running the resolver**. The guarantee is "no decode, no resolve", not
     /// "no I/O": a cold cache still reaches the store.

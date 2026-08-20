@@ -428,7 +428,7 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
 }
 
 /// Reads key presence in aligned batches without value payloads.
-async fn read_keys_presence<S, T>(
+pub(super) async fn read_keys_presence<S, T>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
     state_type: StateType,

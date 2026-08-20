@@ -1088,11 +1088,10 @@ fn prop_map_keyset_exact() {
     QuickCheck::new().quickcheck(property as fn(MapTrace) -> Result<bool>);
 }
 
-/// `Map::get_many` parity: it answers each position exactly as the point `get`
-/// over random populations and query lists (duplicates, absent keys, and
-/// `> CELL_BATCH` lengths crossing sub-batches), in both the dirty-overlay and
-/// committed arms. See `run_map_get_many_parity_trace` for why the point path
-/// is a valid oracle here.
+/// Map batch-read parity: values and presence answer each position exactly as
+/// their point twins over random populations and query lists. The inputs cover
+/// duplicates, absent keys, and lengths above `CELL_BATCH` in dirty and
+/// committed arms.
 #[test]
 fn prop_map_get_many_parity() {
     fn property(input: MapGetManyInput) -> Result<bool> {

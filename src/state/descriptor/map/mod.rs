@@ -513,6 +513,29 @@ where
             .into_vec())
     }
 
+    /// Tests `keys` for presence as one isolated batch. `results[i]` answers
+    /// `keys[i]`. Duplicate keys keep their positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a session access error.
+    #[instrument(
+        name = "map.contains_many",
+        skip_all,
+        fields(collection = self.cells.name().as_str(), keys = keys.len() as i64),
+        err
+    )]
+    #[read(op)]
+    pub async fn contains_many(
+        &self,
+        keys: &[KC::Key],
+    ) -> Result<Vec<bool>, MapStateError<CellCodecError<V>>> {
+        Ok(op
+            .contains_many(MapKind::<KC, V>::ENTRIES, keys)
+            .await?
+            .into_vec())
+    }
+
     /// Inserts or overwrites `key`'s value (a blind last-writer-wins write —
     /// the entry is never read first) and folds `key` into the keyset (see the
     /// module's current-membership invariant).
