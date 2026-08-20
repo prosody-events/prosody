@@ -1046,6 +1046,10 @@ pub(crate) fn evaluate_prepared_trajectory<Unit>(
     evaluate_general_trajectory(cohorts, trajectory, window, future_arrivals, scratch)
 }
 
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "evaluate_general_trajectory")
+)]
 fn evaluate_general_trajectory<Unit>(
     cohorts: &WorkCohorts<Unit>,
     trajectory: &SupplyTrajectory<'_>,
@@ -1215,6 +1219,10 @@ fn evaluate_general_trajectory_reference<Unit>(
     )
 }
 
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "evaluate_common_trajectory")
+)]
 fn evaluate_common_trajectory(
     cohort: CommonCohort,
     trajectory: &SupplyTrajectory<'_>,

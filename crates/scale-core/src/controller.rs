@@ -1979,6 +1979,30 @@ fn prepare_supply_trajectories(
         shared.actuation_commitments,
         &draws.commitment_random,
     );
+    prepare_candidate_trajectories(
+        state,
+        shared,
+        workspace,
+        draws,
+        current_supply,
+        candidate_count,
+        now_micros,
+    );
+}
+
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "prepare_candidate_trajectories")
+)]
+fn prepare_candidate_trajectories(
+    state: &ScaleState,
+    shared: &ScenarioShared<'_>,
+    workspace: &mut ScenarioWorkspace,
+    draws: &ScenarioDraws<'_>,
+    current_supply: f64,
+    candidate_count: usize,
+    now_micros: u64,
+) {
     clear_trajectory(&mut workspace.trajectory);
     workspace.trajectory_offsets[0] = 0;
     for candidate_index in 0..candidate_count {
@@ -2318,6 +2342,10 @@ fn repair_target(supply: &[f64], rate: f64) -> u32 {
     index.min(supply.len() - 1) as u32 + 1
 }
 
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "sample_commitment_pauses")
+)]
 fn sample_commitment_pauses(
     state: &ScaleState,
     workspace: &mut ScenarioWorkspace,
