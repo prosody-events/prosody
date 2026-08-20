@@ -67,7 +67,7 @@ pub fn write_model_belief_figures(
             file: format!("beliefs/{}.svg", panel.file),
             section: ReportSection::Belief,
             content,
-            labels_inside_bounds: heatmap_labels_fit(panel),
+            clipped_label: clipped_heatmap_label(panel),
             color_key_present: content == PanelContent::Visible,
             requires_color_key: true,
             comparison_scale: None,
@@ -116,7 +116,7 @@ pub fn write_model_belief_snapshot_figures(
             file: format!("snapshots/{}.svg", panel.file),
             section: ReportSection::Belief,
             content,
-            labels_inside_bounds: snapshot_labels_fit(panel),
+            clipped_label: clipped_snapshot_label(panel),
             color_key_present: false,
             requires_color_key: false,
             comparison_scale: None,
@@ -543,26 +543,37 @@ fn panel_unchanged(panel: &PosteriorPanel) -> bool {
             .all(|posterior| panel.prior == posterior)
 }
 
-fn heatmap_labels_fit(panel: &PosteriorPanel) -> bool {
+fn clipped_heatmap_label(panel: &PosteriorPanel) -> Option<String> {
     let Ok(x) = i32::try_from(WIDTH.saturating_sub(82)) else {
-        return false;
+        return Some("density".to_owned());
     };
-    panel.tail_label.as_ref().is_none_or(|label| {
-        label_inside_image((WIDTH, HEATMAP_HEIGHT), (110_i32, 24_i32), label, 15)
-    }) && label_inside_image((WIDTH, HEATMAP_HEIGHT), (x, 8_i32), "density", 15)
+    if let Some(label) = panel
+        .tail_label
+        .as_ref()
+        .filter(|label| !label_inside_image((WIDTH, HEATMAP_HEIGHT), (110_i32, 24_i32), label, 15))
+    {
+        return Some(label.clone());
+    }
+    (!label_inside_image((WIDTH, HEATMAP_HEIGHT), (x, 8_i32), "density", 15))
+        .then(|| "density".to_owned())
 }
 
-fn snapshot_labels_fit(panel: &PosteriorPanel) -> bool {
+fn clipped_snapshot_label(panel: &PosteriorPanel) -> Option<String> {
     let selection = select_snapshots(panel);
     let width = WIDTH / 3;
-    [
+    let titles = [
         "prior",
         selection.important_title.as_str(),
         "final posterior",
-    ]
-    .into_iter()
-    .all(|title| label_inside_image((width, SNAPSHOT_HEIGHT), (12_i32, 8_i32), title, 21))
-        && label_inside_image((width, SNAPSHOT_HEIGHT), (12_i32, 440_i32), panel.unit, 18)
+    ];
+    if let Some(title) = titles
+        .into_iter()
+        .find(|title| !label_inside_image((width, SNAPSHOT_HEIGHT), (12_i32, 8_i32), title, 21))
+    {
+        return Some(title.to_owned());
+    }
+    (!label_inside_image((width, SNAPSHOT_HEIGHT), (12_i32, 440_i32), panel.unit, 18))
+        .then(|| panel.unit.to_owned())
 }
 
 fn discrete_heatmap(controller: &ControllerTrace, query: PosteriorQuery) -> PosteriorHeatmap {

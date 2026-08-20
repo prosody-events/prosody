@@ -84,7 +84,7 @@ pub fn write_regime_story_figures(
             file: format!("story/{file}"),
             section: story_section(index),
             content,
-            labels_inside_bounds: panel.labels_fit(),
+            clipped_label: panel.clipped_label(),
             color_key_present: panel.heatmap.is_some(),
             requires_color_key: panel.heatmap.is_some(),
             comparison_scale: None,
@@ -1089,7 +1089,7 @@ impl StoryPanel {
         }
     }
 
-    fn labels_fit(&self) -> bool {
+    fn clipped_label(&self) -> Option<String> {
         let longest = self
             .series
             .iter()
@@ -1098,9 +1098,10 @@ impl StoryPanel {
             .map_or("", |label| label);
         let x = WIDTH.saturating_mul(2).saturating_div(3);
         let Ok(x) = i32::try_from(x) else {
-            return false;
+            return Some(longest.to_owned());
         };
-        label_inside_image((WIDTH, PANEL_HEIGHT), (x, 8_i32), longest, 19)
+        (!label_inside_image((WIDTH, PANEL_HEIGHT), (x, 8_i32), longest, 19))
+            .then(|| longest.to_owned())
     }
 
     fn with_horizon(mut self, horizon_micros: u64) -> Self {

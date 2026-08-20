@@ -39,8 +39,8 @@ pub struct ImageManifestEntry {
     pub section: ReportSection,
     /// Whether the panel is empty, unchanged, or visible.
     pub content: PanelContent,
-    /// Whether every measured label stays inside the image bounds.
-    pub labels_inside_bounds: bool,
+    /// Text of the first measured label outside the image bounds.
+    pub clipped_label: Option<String>,
     /// Whether a heatmap has a labeled numeric color key.
     pub color_key_present: bool,
     /// Whether this image contains a heatmap.
@@ -120,11 +120,20 @@ pub fn check_document(manifest: &DocumentManifest<'_>) -> Result<(), ReportCheck
 ///
 /// Returns an error when an image violates the visual contract.
 pub fn check_images(images: &[ImageManifestEntry]) -> Result<(), ReportCheckError> {
-    if images
-        .iter()
-        .any(|image| image.content == PanelContent::Visible && !image.labels_inside_bounds)
-    {
-        return Err(ReportCheckError::ClippedLabel);
+    if let Some((file, label)) = images.iter().find_map(|image| {
+        (image.content == PanelContent::Visible)
+            .then(|| {
+                image
+                    .clipped_label
+                    .as_ref()
+                    .map(|label| (&image.file, label))
+            })
+            .flatten()
+    }) {
+        return Err(ReportCheckError::ClippedLabel {
+            file: file.clone(),
+            label: label.clone(),
+        });
     }
     if images.iter().any(|image| {
         image.content == PanelContent::Visible
@@ -191,8 +200,13 @@ pub enum ReportCheckError {
     #[error("required model artifact metadata is absent")]
     Artifact,
     /// An image label extends outside its bounds.
-    #[error("an image contains a clipped label")]
-    ClippedLabel,
+    #[error("image '{file}' contains clipped label '{label}'")]
+    ClippedLabel {
+        /// Image path relative to its report root.
+        file: String,
+        /// Text that extends outside the image bounds.
+        label: String,
+    },
     /// A heatmap has no labeled numeric color key.
     #[error("a heatmap has no labeled numeric color key")]
     ColorKey,
@@ -250,7 +264,7 @@ mod tests {
             file: format!("{section:?}.svg"),
             section,
             content: PanelContent::Visible,
-            labels_inside_bounds: true,
+            clipped_label: None,
             color_key_present: true,
             requires_color_key: true,
             comparison_scale: Some("shared-v1"),
@@ -263,6 +277,28 @@ mod tests {
             check_images(&inconsistent),
             Err(ReportCheckError::ComparisonScale)
         );
+    }
+
+    #[test]
+    fn clipped_label_error_names_the_image_and_label() {
+        let images = [ImageManifestEntry {
+            file: "beliefs/capacity.svg".to_owned(),
+            section: ReportSection::Belief,
+            content: PanelContent::Visible,
+            clipped_label: Some("capacity tail probability".to_owned()),
+            color_key_present: true,
+            requires_color_key: true,
+            comparison_scale: None,
+        }];
+        let error = ReportCheckError::ClippedLabel {
+            file: "beliefs/capacity.svg".to_owned(),
+            label: "capacity tail probability".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "image 'beliefs/capacity.svg' contains clipped label 'capacity tail probability'"
+        );
+        assert_eq!(check_images(&images), Err(error));
     }
 
     #[test]

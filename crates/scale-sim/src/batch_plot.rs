@@ -39,12 +39,13 @@ pub fn write_batch_slo_svg(
         file: "slo-sweep.svg".to_owned(),
         section: ReportSection::Cost,
         content: PanelContent::Visible,
-        labels_inside_bounds: label_inside_image(
+        clipped_label: (!label_inside_image(
             (WIDTH, TITLE_HEIGHT + PANEL_HEIGHT * 4),
             (88, 28),
             "50,000-job batch objective sweep",
             22,
-        ),
+        ))
+        .then(|| "50,000-job batch objective sweep".to_owned()),
         color_key_present: false,
         requires_color_key: false,
         comparison_scale: None,
@@ -82,12 +83,13 @@ pub fn write_batch_actuation_svg(
         file: "actuation.svg".to_owned(),
         section: ReportSection::Decision,
         content: PanelContent::Visible,
-        labels_inside_bounds: label_inside_image(
+        clipped_label: (!label_inside_image(
             (WIDTH, 360),
             (88, 28),
             "desired and actual replicas during pod readiness",
             22,
-        ),
+        ))
+        .then(|| "desired and actual replicas during pod readiness".to_owned()),
         color_key_present: false,
         requires_color_key: false,
         comparison_scale: Some("batch-actuation-v1"),
