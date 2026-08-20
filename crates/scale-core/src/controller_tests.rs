@@ -1,21 +1,23 @@
+use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
 use super::{
-    DecisionRandomDomain, SCHEDULED_PARTITION, ScenarioDraws, ScenarioWorkspace, ScratchBounds,
-    balanced_partition_owner, balanced_partition_range, decision_random,
-    partition_replica_capacity, prepare_work_cohorts, sample_moved_partition_prefix,
-    scenario_event_count, scenario_horizons,
+    DecisionRandomDomain, SCHEDULED_PARTITION, ScenarioDraws, ScenarioShared, ScenarioWorkspace,
+    ScratchBounds, balanced_partition_owner, balanced_partition_range, clear_trajectory,
+    decision_random, distribute_candidate_launches_reference, partition_replica_capacity,
+    prepare_candidate_trajectories, prepare_candidate_trajectory_rows, prepare_work_cohorts,
+    sample_moved_partition_prefix, scenario_event_count, scenario_horizons,
 };
 use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, evaluate_prepared_step, prepare,
 };
 use crate::types::{EventCohorts, SlotSecondCohorts};
 use crate::{
-    ArrivalPrior, ArrivalPriorError, BacklogCohort, CapacityGrid, CapacityGridError, Configuration,
-    ConfigurationError, DemandClass, LaunchPrior, ModelTime, ObservationBuffer, ObservationError,
-    PosteriorError, PosteriorQuery, RebalancePrior, ReliabilityPrior, ScaleScratch, ScaleState,
-    ScheduledRelease, ServiceObjective,
+    ActuationCommitment, ArrivalPrior, ArrivalPriorError, BacklogCohort, CapacityGrid,
+    CapacityGridError, Configuration, ConfigurationError, DemandClass, LaunchPrior, ModelTime,
+    ObservationBuffer, ObservationError, PosteriorError, PosteriorQuery, RebalancePrior,
+    ReliabilityPrior, ScaleScratch, ScaleState, ScheduledRelease, ServiceObjective,
 };
 
 #[quickcheck]
@@ -50,35 +52,180 @@ fn moved_partition_prefix_cache_matches_ordinal_draw() -> Result<(), TestError> 
         arrival_path_end_seconds: &[],
         arrival_path_rates: &[],
     };
-    let ordinal = 1_u64;
-    sample_moved_partition_prefix(&state, &mut workspace, &draws, ordinal);
-    let first = workspace.moved_partition_share.clone();
-    sample_moved_partition_prefix(&state, &mut workspace, &draws, ordinal);
-
     let mut order = vec![0; bounds.partition_count];
     let mut shares = vec![0.0_f64; bounds.partition_count];
     let mut expected = vec![0.0_f64; bounds.partition_offset_count];
-    let mut random = placement_random.domain(ordinal);
-    state.partition_placement.sample_moved_prefix(
-        &mut random,
-        &mut order,
-        &mut shares,
-        &mut expected,
-    );
-    assert!(
-        first
-            .iter()
-            .zip(&expected)
-            .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
-    );
-    assert!(
-        workspace
-            .moved_partition_share
-            .iter()
-            .zip(&expected)
-            .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
-    );
+    for ordinal in 0..bounds.candidate_event_count_max as u64 {
+        let mut random = placement_random.clone().domain(ordinal);
+        state.partition_placement.sample_moved_prefix(
+            &mut random,
+            &mut order,
+            &mut shares,
+            &mut expected,
+        );
+        for (moved, expected) in expected.iter().enumerate() {
+            let actual = sample_moved_partition_prefix(
+                &state,
+                &mut workspace,
+                &draws,
+                ordinal,
+                moved as u32,
+            );
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+    }
     Ok(())
+}
+
+#[quickcheck]
+fn one_pass_launch_distribution_preserves_trajectory_columns(seed: u64) -> TestResult {
+    match trajectory_distribution_parity(seed) {
+        Ok(()) => TestResult::passed(),
+        Err(error) => TestResult::error(error.to_string()),
+    }
+}
+
+fn trajectory_distribution_parity(seed: u64) -> Result<(), TestError> {
+    let (mut state, _scratch, mut observation) = test_model()?;
+    state.current_replicas = 2;
+    observation.push_actuation_commitment(ActuationCommitment::launching(
+        1,
+        3,
+        ModelTime::from_micros(seed % 100),
+    )?)?;
+    observation.push_actuation_commitment(ActuationCommitment::launching(
+        1,
+        4,
+        ModelTime::from_micros(seed % 100),
+    )?)?;
+    observation.push_actuation_commitment(ActuationCommitment::rebalancing(
+        2,
+        1,
+        ModelTime::from_micros(0),
+        ModelTime::from_micros(seed % 100),
+    )?)?;
+    let group = observation.observation();
+    let bounds = ScratchBounds::new(state.configuration())?;
+    let mut actual = ScenarioWorkspace::new(&bounds)?;
+    let mut expected = ScenarioWorkspace::new(&bounds)?;
+    actual
+        .posterior_resource_supply
+        .copy_from_slice(&[1.0_f64, 2.0_f64, 3.0_f64, 4.0_f64]);
+    expected
+        .posterior_resource_supply
+        .copy_from_slice(&actual.posterior_resource_supply);
+    let pause_micros = 10_000 + seed % 1_000;
+    actual.commitment_pause_micros[..2].fill(pause_micros);
+    expected.commitment_pause_micros[..2].fill(pause_micros);
+    actual.rebalancing_ready_micros = 20_000 + seed % 1_000;
+    expected.rebalancing_ready_micros = actual.rebalancing_ready_micros;
+    actual.moved_partition_prefix_valid.fill(false);
+    expected.moved_partition_prefix_valid.fill(false);
+
+    let resource_cohorts = EventCohorts::new(0);
+    let moved_partition_counts = vec![0; 16];
+    let candidate_concurrency = [32.0_f64, 64.0_f64, 96.0_f64, 128.0_f64];
+    let shared = ScenarioShared {
+        resource_cohorts: &resource_cohorts,
+        moved_partition_counts: &moved_partition_counts,
+        partition_offsets: &[],
+        partition_cohort_indexes: &[],
+        partition_count: 4,
+        candidate_concurrency: &candidate_concurrency,
+        action_count: 4,
+        current_index: 1,
+        normal_events: 1.0_f64,
+        failure_events: 0.0_f64,
+        calendar: None,
+        actuation_commitments: group.actuation_commitments,
+        inner_count: 1,
+        planning_horizon_micros: 1_000_000,
+        disturbance_horizon_micros: 1_000_000,
+    };
+    let placement_random = decision_random(seed, 0, DecisionRandomDomain::Placement);
+    let draws = ScenarioDraws {
+        current_supply: 4.0_f64,
+        lead_random: decision_random(seed, 0, DecisionRandomDomain::LeadTime),
+        rebalance_random: decision_random(seed, 0, DecisionRandomDomain::Rebalance),
+        placement_random,
+        commitment_random: decision_random(seed, 0, DecisionRandomDomain::Commitment),
+        arrival_path_end_seconds: &[],
+        arrival_path_rates: &[],
+    };
+    let now_micros = seed % 1_000;
+    prepare_candidate_trajectories(
+        &state,
+        &shared,
+        &mut actual,
+        &draws,
+        draws.current_supply,
+        4,
+        now_micros,
+    );
+
+    clear_trajectory(&mut expected.trajectory);
+    expected.trajectory_offsets[0] = 0;
+    let committed_replicas = 1;
+    distribute_candidate_launches_reference(
+        shared.actuation_commitments,
+        &expected.commitment_pause_micros,
+        &mut expected.candidate_launches,
+        committed_replicas,
+        4,
+    );
+    prepare_candidate_trajectory_rows(
+        &state,
+        &shared,
+        &mut expected,
+        &draws,
+        draws.current_supply,
+        super::TrajectoryPreparation {
+            candidate_index: 0,
+            candidate_count: 4,
+            now_micros,
+            committed_replicas,
+        },
+    );
+
+    assert_trajectory_columns_equal(&actual, &expected);
+    Ok(())
+}
+
+fn assert_trajectory_columns_equal(actual: &ScenarioWorkspace, expected: &ScenarioWorkspace) {
+    assert_eq!(actual.trajectory.targets, expected.trajectory.targets);
+    assert_eq!(
+        actual.trajectory.pause_micros,
+        expected.trajectory.pause_micros
+    );
+    assert_eq!(
+        actual.trajectory.ready_override_micros,
+        expected.trajectory.ready_override_micros
+    );
+    assert_eq!(
+        actual.trajectory.ready_micros,
+        expected.trajectory.ready_micros
+    );
+    assert_eq!(
+        actual.trajectory.ready_boundaries,
+        expected.trajectory.ready_boundaries
+    );
+    assert!(
+        actual
+            .trajectory
+            .during_supply
+            .iter()
+            .zip(&expected.trajectory.during_supply)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+    );
+    assert!(
+        actual
+            .trajectory
+            .after_supply
+            .iter()
+            .zip(&expected.trajectory.after_supply)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+    );
+    assert_eq!(actual.trajectory_offsets, expected.trajectory_offsets);
 }
 
 #[test]
