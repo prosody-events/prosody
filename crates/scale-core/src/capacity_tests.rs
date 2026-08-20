@@ -13,12 +13,12 @@ use super::{
     OBSERVATION_PROBABILITY_ERROR_MAX, PATH_SOLVER_PROBABILITY_ERROR_MAX, ResourceWindow,
     ResourceWindowError, RetainedHistory, SOLVER_COVERAGE_INDEX, SpreadTruncation, StartWindow,
     binomial_log_probability, capacity_model_artifact, capacity_update_operation_count,
-    completion_expectation, completion_log_likelihood, completion_marginal_probability,
-    contamination_prior, equal_rate_death_step, feasibility_probability,
-    feasibility_probability_and_charge, fold_trace, hazard_prior, linear_rate_band,
-    linear_rate_death_step, log_contamination_mixture, log_normal_axis_masses, log_weighted_sum,
-    path_log_score, pure_death_step, pure_death_step_with_rates, record_start_window,
-    uniformized_death_step,
+    completion_expectation, completion_log_likelihood, completion_log_likelihood_reference,
+    completion_marginal_probability, contamination_prior, equal_rate_death_step,
+    feasibility_probability, feasibility_probability_and_charge, fold_trace, hazard_prior,
+    linear_rate_band, linear_rate_death_step, log_contamination_mixture, log_normal_axis_masses,
+    log_weighted_sum, path_log_score, pure_death_step, pure_death_step_with_rates,
+    record_start_window, uniformized_death_step,
 };
 use crate::change_point::ChangePointKernel;
 use crate::types::occupancy_trace_for_test;
@@ -321,6 +321,7 @@ fn coverage_ring_matches_unbounded_history() -> Result<(), TestError> {
             1.0_f64,
             1.0_f64,
             CompletionScratch {
+                simd_level: Level::new(),
                 coefficients: &mut ring_coefficients,
                 convolution: &mut ring_convolution,
                 binomial: &mut ring_binomial,
@@ -339,6 +340,7 @@ fn coverage_ring_matches_unbounded_history() -> Result<(), TestError> {
             1.0_f64,
             1.0_f64,
             CompletionScratch {
+                simd_level: Level::new(),
                 coefficients: &mut reference_coefficients,
                 convolution: &mut reference_convolution,
                 binomial: &mut reference_binomial,
@@ -1484,6 +1486,7 @@ fn ablation_likelihoods(
             1.0_f64,
             1.0_f64,
             CompletionScratch {
+                simd_level: Level::new(),
                 coefficients: &mut scratch.completion_coefficients,
                 convolution: &mut scratch.completion_convolution,
                 binomial: &mut scratch.completion_binomial,
@@ -1872,6 +1875,92 @@ fn completion_predictive_sweep_matches_scalar_cdf_and_summary(
         && summary.lower.to_bits() == reference_lower.to_bits()
         && summary.upper.to_bits() == reference_upper.to_bits()
         && rank.to_bits() == reference_rank.to_bits()
+}
+
+#[quickcheck]
+fn completion_group_convolution_matches_scalar_reference(
+    seed: u8,
+    service_millis: u16,
+    capacity: u16,
+) -> bool {
+    let service_seconds = f64::from(service_millis % 1_900 + 100) / 1_000.0_f64;
+    let capacity_per_second = f64::from(capacity % 900 + 100);
+    let Ok(grid) = CapacityGrid::new(&[service_seconds], &[capacity_per_second], &[0.0_f64]) else {
+        return false;
+    };
+    let history = [
+        StartWindow {
+            end_micros: 500_000,
+            exposure_seconds: 0.5_f64,
+            started_attempts: Some(u32::from(seed % 7 + 1)),
+        },
+        StartWindow {
+            end_micros: 1_250_000,
+            exposure_seconds: 0.75_f64,
+            started_attempts: Some(u32::from(seed.rotate_left(2) % 9 + 1)),
+        },
+        StartWindow {
+            end_micros: 2_250_000,
+            exposure_seconds: 1.0_f64,
+            started_attempts: Some(u32::from(seed.rotate_left(4) % 11 + 1)),
+        },
+    ];
+    let retained = RetainedHistory {
+        windows: &history,
+        head: 0,
+        length: history.len(),
+        end_micros: 2_500_000,
+    };
+    for index in 0..grid.service_times_seconds.len() {
+        for completed in 0..=31_u32 {
+            let Ok(window) = ResourceWindow::new_with_starts(
+                f64::from(seed % 4 + 1),
+                f64::from(seed % 19 + 1) / 10.0_f64,
+                completed,
+                u32::from(seed % 13),
+            ) else {
+                return false;
+            };
+            let mut actual_coefficients = [0.0_f64; 32];
+            let mut actual_convolution = [0.0_f64; 32];
+            let mut actual_binomial = [0.0_f64; 32];
+            let actual = completion_log_likelihood(
+                &grid,
+                index,
+                retained,
+                &window,
+                2.0_f64,
+                1.5_f64,
+                CompletionScratch {
+                    simd_level: Level::new(),
+                    coefficients: &mut actual_coefficients,
+                    convolution: &mut actual_convolution,
+                    binomial: &mut actual_binomial,
+                },
+            );
+            let mut reference_coefficients = [0.0_f64; 32];
+            let mut reference_convolution = [0.0_f64; 32];
+            let mut reference_binomial = [0.0_f64; 32];
+            let reference = completion_log_likelihood_reference(
+                &grid,
+                index,
+                retained,
+                &window,
+                2.0_f64,
+                1.5_f64,
+                CompletionScratch {
+                    simd_level: Level::new(),
+                    coefficients: &mut reference_coefficients,
+                    convolution: &mut reference_convolution,
+                    binomial: &mut reference_binomial,
+                },
+            );
+            if actual.to_bits() != reference.to_bits() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn deleted_poisson_log_kernel(count: f64, mean: f64) -> f64 {

@@ -648,12 +648,14 @@ struct CapacityAllocation {
 }
 
 struct CompletionScratch<'a> {
+    simd_level: Level,
     coefficients: &'a mut [f64],
     convolution: &'a mut [f64],
     binomial: &'a mut [f64],
 }
 
 pub(crate) struct CapacityFactor {
+    simd_level: Level,
     grid: CapacityGrid,
     arrival_shape: f64,
     arrival_rate_seconds: f64,
@@ -758,6 +760,7 @@ impl CapacityFactor {
             filter_count,
         );
         Ok(Self {
+            simd_level: Level::new(),
             grid,
             arrival_shape: arrival_prior.shape(),
             arrival_rate_seconds: arrival_prior.rate_seconds(),
@@ -958,6 +961,7 @@ impl CapacityFactor {
                     self.arrival_shape,
                     self.arrival_rate_seconds,
                     CompletionScratch {
+                        simd_level: self.simd_level,
                         coefficients: &mut self.completion_coefficients,
                         convolution: &mut self.completion_convolution,
                         binomial: &mut self.completion_binomial,
@@ -1066,6 +1070,7 @@ impl CapacityFactor {
                     self.arrival_shape,
                     self.arrival_rate_seconds,
                     CompletionScratch {
+                        simd_level: self.simd_level,
                         coefficients: &mut self.completion_coefficients,
                         convolution: &mut self.completion_convolution,
                         binomial: &mut self.completion_binomial,
@@ -2997,9 +3002,189 @@ fn completion_log_likelihood(
     scratch: CompletionScratch<'_>,
 ) -> f64 {
     let CompletionScratch {
+        simd_level,
         coefficients,
         convolution,
         binomial,
+    } = scratch;
+    let completed = window.completed_attempts as usize;
+    if completed >= coefficients.len() {
+        return f64::NEG_INFINITY;
+    }
+    let delay = effective_service_time(grid, index, window.concurrency);
+    let target_end = delay + window.exposure_seconds();
+    let mut known_overlap = 0.0_f64;
+    let mut posterior_shape = arrival_shape;
+    let mut posterior_rate = arrival_rate_seconds;
+    let mut deterministic = 0_usize;
+    for offset in 0..history.length {
+        let history_index =
+            (history.head + history.windows.len() - 1 - offset) % history.windows.len();
+        let start_window = history.windows[history_index];
+        let age = Duration::from_micros(history.end_micros.saturating_sub(start_window.end_micros))
+            .as_secs_f64();
+        let window_end = age + start_window.exposure_seconds;
+        if let Some(starts) = start_window.started_attempts {
+            posterior_shape += f64::from(starts);
+            posterior_rate += start_window.exposure_seconds;
+            let overlap = (window_end.min(target_end) - age.max(delay)).max(0.0_f64);
+            known_overlap += overlap;
+            if overlap >= start_window.exposure_seconds {
+                deterministic = deterministic.saturating_add(starts as usize);
+            }
+        }
+    }
+    if deterministic > completed {
+        return f64::NEG_INFINITY;
+    }
+    let target = completed - deterministic;
+    coefficients[..=target].fill(0.0_f64);
+    coefficients[0] = 1.0_f64;
+    let mut degree = 0_usize;
+    let mut coefficient_log_scale = 0.0_f64;
+    for offset in 0..history.length {
+        let history_index =
+            (history.head + history.windows.len() - 1 - offset) % history.windows.len();
+        let start_window = history.windows[history_index];
+        let age = Duration::from_micros(history.end_micros.saturating_sub(start_window.end_micros))
+            .as_secs_f64();
+        let window_end = age + start_window.exposure_seconds;
+        if let Some(starts) = start_window.started_attempts {
+            let overlap = (window_end.min(target_end) - age.max(delay)).max(0.0_f64);
+            let probability = overlap / start_window.exposure_seconds;
+            if probability > 0.0_f64 && probability < 1.0_f64 {
+                let group_degree = (starts as usize).min(target);
+                for (count, value) in binomial[..=group_degree].iter_mut().enumerate() {
+                    *value = binomial_log_probability(starts, count, probability);
+                }
+                let (maximum, scale, next_degree) = dispatch!(simd_level, simd => completion_group_convolution(
+                    simd,
+                    coefficients,
+                    convolution,
+                    binomial,
+                    degree,
+                    group_degree,
+                    target,
+                ));
+                if scale <= 0.0_f64 {
+                    return f64::NEG_INFINITY;
+                }
+                degree = next_degree;
+                coefficient_log_scale += maximum + scale.ln();
+            }
+        }
+    }
+    let missing = (window.exposure_seconds() - known_overlap).max(0.0_f64);
+    completion_probability_from_coefficients(
+        coefficients,
+        degree,
+        target,
+        coefficient_log_scale,
+        posterior_shape,
+        posterior_rate,
+        missing,
+    )
+}
+
+fn completion_group_convolution<S: Simd>(
+    simd: S,
+    coefficients: &mut [f64],
+    convolution: &mut [f64],
+    binomial: &mut [f64],
+    degree: usize,
+    group_degree: usize,
+    target: usize,
+) -> (f64, f64, usize) {
+    let next_degree = target.min(degree + group_degree);
+    // Log masses are finite or negative infinity, and convolutions contain
+    // non-negative products. Neither maximum scan can contain NaN.
+    let maximum = vector_max(simd, &binomial[..=group_degree], f64::NEG_INFINITY);
+    for value in &mut binomial[..=group_degree] {
+        *value = (*value - maximum).exp();
+    }
+    convolution[..=target].fill(0.0_f64);
+    for known in 0..=degree {
+        let added_count = group_degree.min(target - known) + 1;
+        convolution_axpy(
+            simd,
+            coefficients[known],
+            &binomial[..added_count],
+            &mut convolution[known..known + added_count],
+        );
+    }
+    let scale = vector_max(simd, &convolution[..=next_degree], 0.0_f64);
+    vector_divide(
+        simd,
+        &convolution[..=next_degree],
+        &mut coefficients[..=next_degree],
+        scale,
+    );
+    (maximum, scale, next_degree)
+}
+
+fn convolution_axpy<S: Simd>(simd: S, coefficient: f64, values: &[f64], output: &mut [f64]) {
+    let lane_count = S::f64s::N;
+    let vector_count = values.len() / lane_count;
+    let coefficient = S::f64s::splat(simd, coefficient);
+    for vector in 0..vector_count {
+        let start = vector * lane_count;
+        let end = start + lane_count;
+        let value = S::f64s::from_slice(simd, &values[start..end]);
+        let current = S::f64s::from_slice(simd, &output[start..end]);
+        // Keep multiply and add separate. A fused multiply-add changes result bits.
+        (current + coefficient * value).store_slice(&mut output[start..end]);
+    }
+    for index in vector_count * lane_count..values.len() {
+        output[index] += coefficient.as_slice()[0] * values[index];
+    }
+}
+
+fn vector_max<S: Simd>(simd: S, values: &[f64], initial: f64) -> f64 {
+    let lane_count = S::f64s::N;
+    let vector_count = values.len() / lane_count;
+    let mut maximum = S::f64s::splat(simd, initial);
+    for vector in 0..vector_count {
+        let start = vector * lane_count;
+        let end = start + lane_count;
+        maximum = maximum.max(S::f64s::from_slice(simd, &values[start..end]));
+    }
+    let mut result = maximum.as_slice().iter().copied().fold(initial, f64::max);
+    for value in &values[vector_count * lane_count..] {
+        result = result.max(*value);
+    }
+    result
+}
+
+fn vector_divide<S: Simd>(simd: S, values: &[f64], output: &mut [f64], divisor: f64) {
+    let lane_count = S::f64s::N;
+    let vector_count = values.len() / lane_count;
+    let divisor = S::f64s::splat(simd, divisor);
+    for vector in 0..vector_count {
+        let start = vector * lane_count;
+        let end = start + lane_count;
+        let value = S::f64s::from_slice(simd, &values[start..end]);
+        (value / divisor).store_slice(&mut output[start..end]);
+    }
+    for index in vector_count * lane_count..values.len() {
+        output[index] = values[index] / divisor.as_slice()[0];
+    }
+}
+
+#[cfg(test)]
+fn completion_log_likelihood_reference(
+    grid: &CapacityGrid,
+    index: usize,
+    history: RetainedHistory<'_>,
+    window: &ResourceWindow,
+    arrival_shape: f64,
+    arrival_rate_seconds: f64,
+    scratch: CompletionScratch<'_>,
+) -> f64 {
+    let CompletionScratch {
+        coefficients,
+        convolution,
+        binomial,
+        ..
     } = scratch;
     let completed = window.completed_attempts as usize;
     if completed >= coefficients.len() {
