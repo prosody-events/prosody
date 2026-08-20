@@ -925,6 +925,10 @@ impl CapacityFactor {
         Ok(())
     }
 
+    #[cfg_attr(
+        feature = "hotpath",
+        hotpath::measure(label = "completion_predictive_sweep")
+    )]
     fn completion_predictive_sweep(
         &mut self,
         window: &ResourceWindow,
@@ -3029,6 +3033,10 @@ fn completion_expectation(
     known_mean + posterior_shape / posterior_rate * missing
 }
 
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "completion_log_likelihood")
+)]
 fn completion_log_likelihood(
     grid: &CapacityGrid,
     index: usize,
@@ -3159,6 +3167,10 @@ fn write_binomial_log_masses(
     }
 }
 
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "completion_group_convolution")
+)]
 fn completion_group_convolution<S: Simd>(
     simd: S,
     coefficients: &mut [f64],
