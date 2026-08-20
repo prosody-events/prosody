@@ -416,7 +416,10 @@ pub struct MapHandle<S, KC, V> {
 /// A directional map stream query.
 ///
 /// Build one with [`MapHandle::query`]. Finish with [`keys`](Self::keys) or
-/// [`entries`](Self::entries).
+/// [`entries`](Self::entries). `from` and `to` include their key. `after` and
+/// `before` exclude their key. State all edges in iteration order. A later call
+/// for the same edge replaces the earlier call. A start past the end yields an
+/// empty stream.
 #[must_use]
 pub struct MapQuery<'a, S, KC, V> {
     handle: &'a MapHandle<S, KC, V>,
@@ -433,6 +436,46 @@ where
     KC::Key: Display,
     V: CellType<Key = UnitKey>,
 {
+    /// Starts at `key`.
+    pub fn from(self, key: &KC::Key) -> Self {
+        self.inclusive_start(KC::encode(key))
+    }
+
+    /// Starts after `key`.
+    pub fn after(self, key: &KC::Key) -> Self {
+        self.exclusive_start(KC::encode(key))
+    }
+
+    /// Stops at `key`.
+    pub fn to(self, key: &KC::Key) -> Self {
+        self.inclusive_end(KC::encode(key))
+    }
+
+    /// Stops before `key`.
+    pub fn before(self, key: &KC::Key) -> Self {
+        self.exclusive_end(KC::encode(key))
+    }
+
+    pub(crate) fn inclusive_start(mut self, coordinate: Coordinate) -> Self {
+        self.start = ScanEdge::Included(coordinate);
+        self
+    }
+
+    pub(crate) fn exclusive_start(mut self, coordinate: Coordinate) -> Self {
+        self.start = ScanEdge::Excluded(coordinate);
+        self
+    }
+
+    pub(crate) fn inclusive_end(mut self, coordinate: Coordinate) -> Self {
+        self.end = ScanEdge::Included(coordinate);
+        self
+    }
+
+    pub(crate) fn exclusive_end(mut self, coordinate: Coordinate) -> Self {
+        self.end = ScanEdge::Excluded(coordinate);
+        self
+    }
+
     fn constrain(&self, mut plan: Plan<S, Keyed<KC, V>>) -> Plan<S, Keyed<KC, V>> {
         plan = match &self.start {
             ScanEdge::Included(start) => plan.from(start.clone()),
@@ -725,7 +768,7 @@ where
     ///
     /// A keyset-read access error propagates. It never silently degrades.
     #[read(op)]
-    pub(crate) async fn stream_plan(
+    async fn stream_plan(
         &self,
         dir: Direction,
     ) -> Result<Plan<S, Keyed<KC, V>>, MapStateError<CellCodecError<V>>> {

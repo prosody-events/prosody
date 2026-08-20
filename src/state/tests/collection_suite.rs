@@ -35,10 +35,10 @@ use super::support::assert_no_settlement_residue;
 use crate::codec::{Codec, JsonCodec};
 use crate::consumer::partition::ShutdownPhase;
 use crate::loader::MemoryLoader;
-use crate::state::collection::{Plan, StateSession};
+use crate::state::collection::StateSession;
 use crate::state::descriptor::map::{entry_cell_for, keyset_cell};
 use crate::state::descriptor::{
-    DequeHandle, Keyed, MapHandle, StateDescriptor, deque, deque_state, map_state,
+    DequeHandle, MapHandle, StateDescriptor, deque, deque_state, map_state,
 };
 use crate::state::dirty::DirtyStore;
 use crate::state::manager::ArmedKeys;
@@ -65,6 +65,7 @@ use std::fmt::Display;
 use std::future::Future;
 use std::iter::once;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -1750,18 +1751,33 @@ pub(crate) async fn run_deque_constraint_parity(constraints: DequePlanConstraint
         &armed,
         read_event(0),
     );
-    for descriptor in [point, range] {
+    for (descriptor, width) in [(point, 5), (range, deque::DEQUE_POINT_ITERATION_MAX + 1)] {
         let handle = descriptor
             .bind(&session)
             .map_err(|error| eyre!("bind: {error}"))?;
         for dir in [Direction::Forward, Direction::Backward] {
-            let unlimited = drain(handle.stream_plan(dir).await?.entries()).await?;
-            let constrained =
-                drain(constrain_deque_plan(handle.stream_plan(dir).await?, constraints).entries())
-                    .await?;
-            let expected = unlimited
+            let unlimited = drain(handle.stream(dir)).await?;
+            let (start, end) = constraints.range(dir)?;
+            let mut query = handle.query(dir).range((start, end));
+            if let Some(limit) = constraints.limit {
+                query = query.limit(limit);
+            }
+            let constrained = drain(query.values()).await?;
+            let indexed = unlimited
+                .into_iter()
+                .enumerate()
+                .map(|(position, value)| {
+                    let index = match dir {
+                        Direction::Forward => position,
+                        Direction::Backward => width - 1 - position,
+                    };
+                    Ok((i64::try_from(index)?, value))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let expected = indexed
                 .into_iter()
                 .filter(|(index, _)| constraints.contains(*index, dir))
+                .map(|(_, value)| value)
                 .take(constraints.limit.map_or(usize::MAX, NonZeroUsize::get))
                 .collect::<Vec<_>>();
             if constrained != expected {
@@ -1772,36 +1788,24 @@ pub(crate) async fn run_deque_constraint_parity(constraints: DequePlanConstraint
     Ok(true)
 }
 
-fn constrain_deque_plan<S>(
-    mut plan: Plan<S, Keyed<I64KeyCodec, JsonCodec>>,
-    constraints: DequePlanConstraints,
-) -> Plan<S, Keyed<I64KeyCodec, JsonCodec>>
-where
-    S: StateSession,
-{
-    if let Some((start, included)) = constraints.start {
-        let coordinate = I64KeyCodec::encode(&start);
-        plan = if included {
-            plan.from(coordinate)
-        } else {
-            plan.after(coordinate)
-        };
-    }
-    if let Some((end, included)) = constraints.end {
-        let coordinate = I64KeyCodec::encode(&end);
-        plan = if included {
-            plan.to(coordinate)
-        } else {
-            plan.before(coordinate)
-        };
-    }
-    if let Some(limit) = constraints.limit {
-        plan = plan.with_limit(limit);
-    }
-    plan
-}
-
 impl DequePlanConstraints {
+    fn range(self, dir: Direction) -> Result<(Bound<usize>, Bound<usize>)> {
+        let bound = |edge: Option<(i64, bool)>| -> Result<Bound<usize>> {
+            edge.map_or(Ok(Bound::Unbounded), |(position, included)| {
+                let position = usize::try_from(position)?;
+                Ok(if included {
+                    Bound::Included(position)
+                } else {
+                    Bound::Excluded(position)
+                })
+            })
+        };
+        match dir {
+            Direction::Forward => Ok((bound(self.start)?, bound(self.end)?)),
+            Direction::Backward => Ok((bound(self.end)?, bound(self.start)?)),
+        }
+    }
+
     fn contains(self, key: i64, dir: Direction) -> bool {
         let starts = self.start.is_none_or(|(edge, included)| match dir {
             Direction::Forward => key > edge || (included && key == edge),
@@ -1824,27 +1828,25 @@ async fn collect_constrained_map<S>(
 where
     S: StateSession,
 {
-    let mut plan = handle.stream_plan(dir).await?;
+    let mut query = handle.query(dir);
     if let Some((start, included)) = constraints.start {
-        let coordinate = I64KeyCodec::encode(&start);
-        plan = if included {
-            plan.from(coordinate)
+        query = if included {
+            query.from(&start)
         } else {
-            plan.after(coordinate)
+            query.after(&start)
         };
     }
     if let Some((end, included)) = constraints.end {
-        let coordinate = I64KeyCodec::encode(&end);
-        plan = if included {
-            plan.to(coordinate)
+        query = if included {
+            query.to(&end)
         } else {
-            plan.before(coordinate)
+            query.before(&end)
         };
     }
     if let Some(limit) = constraints.limit {
-        plan = plan.with_limit(limit);
+        query = query.limit(limit);
     }
-    drain(plan.entries()).await
+    drain(query.entries()).await
 }
 
 async fn collect_constrained_map_keys<S>(
@@ -1855,27 +1857,25 @@ async fn collect_constrained_map_keys<S>(
 where
     S: StateSession,
 {
-    let mut plan = handle.stream_plan(dir).await?;
+    let mut query = handle.query(dir);
     if let Some((start, included)) = constraints.start {
-        let coordinate = I64KeyCodec::encode(&start);
-        plan = if included {
-            plan.from(coordinate)
+        query = if included {
+            query.from(&start)
         } else {
-            plan.after(coordinate)
+            query.after(&start)
         };
     }
     if let Some((end, included)) = constraints.end {
-        let coordinate = I64KeyCodec::encode(&end);
-        plan = if included {
-            plan.to(coordinate)
+        query = if included {
+            query.to(&end)
         } else {
-            plan.before(coordinate)
+            query.before(&end)
         };
     }
     if let Some(limit) = constraints.limit {
-        plan = plan.with_limit(limit);
+        query = query.limit(limit);
     }
-    drain(plan.keys()).await
+    drain(query.keys()).await
 }
 
 /// Collects a map handle's `stream(dir)` into a `(key, value)` vector.
