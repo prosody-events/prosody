@@ -83,8 +83,8 @@ use crate::state::cell_key::Direction;
 #[cfg(test)]
 use crate::state::cell_key::{CellKey, Coordinate};
 use crate::state::collection::{
-    Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE, Plan,
-    StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
+    Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints, JOURNAL_INLINE,
+    Plan, StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
     spec_matches,
 };
 #[cfg(test)]
@@ -300,11 +300,10 @@ where
                 .stream_plan(self.dir, &self.start, &self.end)
                 .instrument(span.clone())
                 .await?;
-            let plan = match self.limit {
-                Some(limit) => plan.with_limit(limit),
-                None => plan,
-            };
-            let inner = plan.entries();
+            let inner = plan.entries(Constraints {
+                limit: self.limit,
+                ..Constraints::default()
+            });
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 // The driver yields the decoded index. The module's window
@@ -504,17 +503,15 @@ where
                 limit,
             )));
         }
-        // Point-get arm. `absolute` is monotone in the position. One check of
-        // the extreme index therefore proves that every position in `[0, len)`
-        // is in range, and that the coordinate list cannot fail.
+        // Point-get arm. `absolute` is monotone in the position, and `first`
+        // and `last` checked both extremes above, so every interior index is
+        // `first + offset` with no overflow possible.
         // `DEQUE_POINT_ITERATION_MAX` bounds this buffer at 128 × 8 B ≈ 1 KiB.
         // This code sizes it once and pays it once per stream construction,
         // never in the per-item steady state. Owned indices are what let one
         // driver serve both the owner and the reader.
         let mut indices: Vec<i64> = Vec::with_capacity(len);
-        for position in start..end {
-            indices.push(window.absolute(position)?);
-        }
+        indices.extend((0..len).map(|offset| first + offset as i64));
         if dir == Direction::Backward {
             indices.reverse();
         }

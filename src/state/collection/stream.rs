@@ -28,7 +28,6 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt};
-use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
@@ -94,10 +93,7 @@ impl<S: StateSession> PlanBase<S> {
 pub(crate) struct CoordinatePlan<S: StateSession, T: CellType> {
     base: PlanBase<S>,
     keys: Vec<KeyOf<T>>,
-    start: ScanEdge<Coordinate>,
     dir: Direction,
-    end: ScanEdge<Coordinate>,
-    limit: Option<NonZeroUsize>,
 }
 
 /// A managed durable-range plan: one contiguous span of one section, walked in
@@ -121,6 +117,26 @@ pub(crate) struct RangePlan<S: StateSession, T> {
     _cell: PhantomData<fn() -> T>,
 }
 
+/// The constraints a query hands to its plan's terminal: the
+/// direction-relative edges and the present-yield limit. A query accumulates
+/// one and passes it whole; each arm consumes it where its semantics live.
+#[derive(Clone)]
+pub(crate) struct Constraints {
+    pub(crate) start: ScanEdge<Coordinate>,
+    pub(crate) end: ScanEdge<Coordinate>,
+    pub(crate) limit: Option<NonZeroUsize>,
+}
+
+impl Default for Constraints {
+    fn default() -> Self {
+        Self {
+            start: ScanEdge::Unbounded,
+            end: ScanEdge::Unbounded,
+            limit: None,
+        }
+    }
+}
+
 /// The arm a collection's stream method takes, as the owned plan its planning
 /// invocation captured. The two members carry the per-kind semantics; a
 /// collection chooses between them in its planning method and drives the choice
@@ -139,77 +155,27 @@ pub(crate) enum Plan<S: StateSession, T: CellType> {
 }
 
 impl<S: StateSession, T: CellType> Plan<S, T> {
-    /// Sets an inclusive start edge in iteration order.
-    pub(crate) fn from(mut self, coordinate: Coordinate) -> Self {
-        self.set_start(ScanEdge::Included(coordinate));
-        self
-    }
-
-    /// Sets an exclusive start edge in iteration order.
-    pub(crate) fn after(mut self, coordinate: Coordinate) -> Self {
-        self.set_start(ScanEdge::Excluded(coordinate));
-        self
-    }
-
-    /// Sets an inclusive end edge in iteration order.
-    pub(crate) fn to(mut self, coordinate: Coordinate) -> Self {
-        self.set_end(ScanEdge::Included(coordinate));
-        self
-    }
-
-    /// Sets an exclusive end edge in iteration order.
-    pub(crate) fn before(mut self, coordinate: Coordinate) -> Self {
-        self.set_end(ScanEdge::Excluded(coordinate));
-        self
-    }
-
-    /// Sets the maximum number of present items that the plan can yield.
-    ///
-    /// This method keeps the smaller limit. A query cannot widen a collection
-    /// window that already set a limit.
-    pub(crate) fn with_limit(mut self, limit: NonZeroUsize) -> Self {
-        match &mut self {
-            Self::Points(plan) => {
-                plan.limit = Some(plan.limit.map_or(limit, |current| current.min(limit)));
-            }
-            Self::Scan(plan) => {
-                plan.limit = Some(plan.limit.map_or(limit, |current| current.min(limit)));
-            }
-        }
-        self
-    }
-
-    fn set_start(&mut self, edge: ScanEdge<Coordinate>) {
-        match self {
-            Self::Points(plan) => plan.start = edge,
-            Self::Scan(plan) => plan.start = intersect_start(plan.dir, &plan.start, edge),
-        }
-    }
-
-    fn set_end(&mut self, edge: ScanEdge<Coordinate>) {
-        match self {
-            Self::Points(plan) => plan.end = edge,
-            Self::Scan(plan) => plan.end = intersect_end(plan.dir, &plan.end, edge),
-        }
-    }
-
-    /// Drives the planned arm and resolves each live entry.
-    pub(crate) fn entries(self) -> impl Stream<Item = ScanItem<T>> + Send
+    /// Drives the planned arm under `constraints` and resolves each live
+    /// entry. This match is the arm's single dispatch point: the choice
+    /// leaves here as a monomorphized [`Either`], never as a per-operation
+    /// branch.
+    pub(crate) fn entries(self, constraints: Constraints) -> impl Stream<Item = ScanItem<T>> + Send
     where
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         match self {
-            Self::Points(plan) => Either::Left(plan.entries()),
-            Self::Scan(plan) => Either::Right(plan.entries()),
+            Self::Points(plan) => Either::Left(plan.entries(constraints)),
+            Self::Scan(plan) => Either::Right(plan.entries(constraints)),
         }
     }
 
-    /// Drives the planned arm presence-only. It yields keys and never touches a
-    /// value.
-    pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
+    /// Drives the planned arm under `constraints` presence-only. It yields
+    /// keys and never touches a value. See [`Self::entries`] for the dispatch
+    /// posture.
+    pub(crate) fn keys(self, constraints: Constraints) -> impl Stream<Item = KeyItem<T>> + Send {
         match self {
-            Self::Points(plan) => Either::Left(plan.keys()),
-            Self::Scan(plan) => Either::Right(plan.keys()),
+            Self::Points(plan) => Either::Left(plan.keys(constraints)),
+            Self::Scan(plan) => Either::Right(plan.keys(constraints)),
         }
     }
 }
@@ -217,43 +183,37 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
 impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
     /// Builds the plan over the planning invocation's captured state.
     pub(super) fn new(base: PlanBase<S>, keys: Vec<KeyOf<T>>, dir: Direction) -> Self {
-        Self {
-            base,
-            keys,
-            start: ScanEdge::Unbounded,
-            dir,
-            end: ScanEdge::Unbounded,
-            limit: None,
-        }
+        Self { base, keys, dir }
     }
 
     /// Streams each planned key's live entry, resolved, in plan order.
-    pub(crate) fn entries(self) -> impl Stream<Item = ScanItem<T>> + Send
+    pub(super) fn entries(self, constraints: Constraints) -> impl Stream<Item = ScanItem<T>> + Send
     where
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         let session = self.base.session.clone();
-        let limit = self.limit.map_or(usize::MAX, NonZeroUsize::get);
-        fenced::<S, _, T>(session, self.entry_source().take(limit))
+        let limit = constraints.limit.map_or(usize::MAX, NonZeroUsize::get);
+        fenced::<S, _, T>(session, self.entry_source(constraints).take(limit))
     }
 
     /// Streams the planned keys whose cell is present, **without decoding or
     /// resolving any value** — so a message-backed collection enumerates keys
     /// with zero loader fetches.
-    pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
+    pub(super) fn keys(self, constraints: Constraints) -> impl Stream<Item = KeyItem<T>> + Send {
         let session = self.base.session.clone();
-        let limit = self.limit.map_or(usize::MAX, NonZeroUsize::get);
-        fenced::<S, _, T>(session, self.key_source().take(limit))
+        let limit = constraints.limit.map_or(usize::MAX, NonZeroUsize::get);
+        fenced::<S, _, T>(session, self.key_source(constraints).take(limit))
     }
 
     /// The unfenced resolving body: one admission-scoped batch read, then one
     /// bounded resolve fan-out, per chunk.
-    fn entry_source(self) -> impl Stream<Item = ScanItem<T>> + Send
+    fn entry_source(self, constraints: Constraints) -> impl Stream<Item = ScanItem<T>> + Send
     where
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         try_stream! {
-            let Self { base, keys, start, dir, end, limit } = self;
+            let Self { base, keys, dir } = self;
+            let Constraints { start, end, limit } = constraints;
             let keys = constrained_keys::<T>(keys, dir, start.as_ref(), end.as_ref());
             let base = &base;
             let chunks = stream::unfold((keys.into_iter().peekable(), true), |(mut keys, first)| async move {
@@ -309,9 +269,10 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
 
     /// The unfenced presence-only body uses the same chunking. It reads one
     /// presence bit for each key.
-    fn key_source(self) -> impl Stream<Item = KeyItem<T>> + Send {
+    fn key_source(self, constraints: Constraints) -> impl Stream<Item = KeyItem<T>> + Send {
         try_stream! {
-            let Self { base, keys, start, dir, end, limit } = self;
+            let Self { base, keys, dir } = self;
+            let Constraints { start, end, limit } = constraints;
             let keys = constrained_keys::<T>(keys, dir, start.as_ref(), end.as_ref());
             let base = &base;
             let chunks = stream::unfold((keys.into_iter().peekable(), true), |(mut keys, first)| async move {
@@ -425,67 +386,6 @@ fn chunk_width(limit: Option<NonZeroUsize>, first: bool) -> usize {
     }
 }
 
-fn intersect_start(
-    dir: Direction,
-    current: &ScanEdge<Coordinate>,
-    requested: ScanEdge<Coordinate>,
-) -> ScanEdge<Coordinate> {
-    match dir {
-        Direction::Forward => intersect_lower(current.clone(), requested),
-        Direction::Backward => intersect_upper(current.clone(), requested),
-    }
-}
-
-fn intersect_end(
-    dir: Direction,
-    current: &ScanEdge<Coordinate>,
-    requested: ScanEdge<Coordinate>,
-) -> ScanEdge<Coordinate> {
-    match dir {
-        Direction::Forward => intersect_upper(current.clone(), requested),
-        Direction::Backward => intersect_lower(current.clone(), requested),
-    }
-}
-
-fn intersect_lower(
-    left: ScanEdge<Coordinate>,
-    right: ScanEdge<Coordinate>,
-) -> ScanEdge<Coordinate> {
-    intersect_edge(left, right, Ordering::Greater)
-}
-
-fn intersect_upper(
-    left: ScanEdge<Coordinate>,
-    right: ScanEdge<Coordinate>,
-) -> ScanEdge<Coordinate> {
-    intersect_edge(left, right, Ordering::Less)
-}
-
-fn intersect_edge(
-    left: ScanEdge<Coordinate>,
-    right: ScanEdge<Coordinate>,
-    tighter: Ordering,
-) -> ScanEdge<Coordinate> {
-    let (left_coordinate, left_excluded) = match &left {
-        ScanEdge::Included(coordinate) => (coordinate, false),
-        ScanEdge::Excluded(coordinate) => (coordinate, true),
-        ScanEdge::Unbounded => return right,
-    };
-    let (right_coordinate, right_excluded) = match &right {
-        ScanEdge::Included(coordinate) => (coordinate, false),
-        ScanEdge::Excluded(coordinate) => (coordinate, true),
-        ScanEdge::Unbounded => return left,
-    };
-    match left_coordinate.cmp(right_coordinate) {
-        Ordering::Equal if left_excluded || right_excluded => {
-            ScanEdge::Excluded(left_coordinate.clone())
-        }
-        Ordering::Equal => ScanEdge::Included(left_coordinate.clone()),
-        order if order == tighter => left,
-        _ => right,
-    }
-}
-
 impl<S: StateSession, T: CellType> RangePlan<S, T> {
     /// Builds the plan over the planning invocation's captured state. The plan
     /// walks `[start, end]` and yields at most `limit` cells. The edges are
@@ -551,20 +451,42 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
         }
     }
 
+    /// Folds the query constraints into the plan's own window. A query edge
+    /// can only reach a whole-section plan (a deque bounds its window
+    /// positionally inside its planning read), so an edge lands only on an
+    /// unbounded side and a set window edge always survives. The limit keeps
+    /// the smaller value: a query cannot widen a window's yield bound.
+    fn constrained(mut self, constraints: Constraints) -> Self {
+        let Constraints { start, end, limit } = constraints;
+        if matches!(self.start, ScanEdge::Unbounded) {
+            self.start = start;
+        }
+        if matches!(self.end, ScanEdge::Unbounded) {
+            self.end = end;
+        }
+        self.limit = match (self.limit, limit) {
+            (Some(window), Some(query)) => Some(window.min(query)),
+            (window, query) => window.or(query),
+        };
+        self
+    }
+
     /// Streams the section's live entries, resolved, in `dir` order.
-    pub(crate) fn entries(self) -> impl Stream<Item = ScanItem<T>> + Send
+    pub(super) fn entries(self, constraints: Constraints) -> impl Stream<Item = ScanItem<T>> + Send
     where
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
-        let session = self.base.session.clone();
-        fenced::<S, _, T>(session, self.entry_source())
+        let plan = self.constrained(constraints);
+        let session = plan.base.session.clone();
+        fenced::<S, _, T>(session, plan.entry_source())
     }
 
     /// Streams the section's live keys in `dir` order through presence-only
     /// pages. It does not transfer, decode, or resolve a value.
-    pub(crate) fn keys(self) -> impl Stream<Item = KeyItem<T>> + Send {
-        let session = self.base.session.clone();
-        fenced::<S, _, T>(session, self.key_source())
+    pub(super) fn keys(self, constraints: Constraints) -> impl Stream<Item = KeyItem<T>> + Send {
+        let plan = self.constrained(constraints);
+        let session = plan.base.session.clone();
+        fenced::<S, _, T>(session, plan.key_source())
     }
 
     /// The unfenced resolving body: gate-free paging through an ordered
@@ -636,7 +558,29 @@ where
     T: CellType,
 {
     let coordinates = keys.iter().map(<T::Key as OrderedKeyCodec>::encode);
-    let mut presence = CellBuffer::with_capacity(keys.len());
+    let presence =
+        read_presence_coordinates::<S>(session, inner, state_type, name, section, coordinates)
+            .await?;
+    debug_assert_eq!(
+        presence.len(),
+        keys.len(),
+        "batch read answers every input position"
+    );
+    Ok(presence)
+}
+
+/// Reads presence for already-encoded coordinates in aligned batches. The
+/// typed twin above encodes first; the write journal's staged merge feeds
+/// its journal-silent coordinates here directly.
+pub(super) async fn read_presence_coordinates<S: StateSession>(
+    session: &S,
+    inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
+    state_type: StateType,
+    name: &StateName,
+    section: Section,
+    coordinates: impl ExactSizeIterator<Item = Coordinate> + Send,
+) -> Result<CellBuffer<bool>, StateAccessError> {
+    let mut presence = CellBuffer::with_capacity(coordinates.len());
     for batch in CoordinateBatch::chunks(coordinates) {
         presence.extend(
             <S::Engine as sealed::ReadEngine<S>>::read_presence_batch(
@@ -645,11 +589,6 @@ where
             .await?,
         );
     }
-    debug_assert_eq!(
-        presence.len(),
-        keys.len(),
-        "batch read answers every input position"
-    );
     Ok(presence)
 }
 

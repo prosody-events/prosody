@@ -30,7 +30,8 @@ mod admission;
 use crate::Key;
 use crate::codec::Codec;
 use crate::state::StateName;
-use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
+use crate::state::cell_key::{Direction, ScanEdge};
+use crate::state::collection::Constraints;
 use crate::state::descriptor::{
     CellType, ContextOf, DequeDescriptor, DequeHandle, FromSession, MapDescriptor, MapHandle,
     ResolvedOf, StateDescriptor, ValueDescriptor,
@@ -214,9 +215,7 @@ pub struct MapReaderQuery<'a, KC, V, C: Codec, B = MemoryReaderBackend<C>> {
     reader: &'a StateReader<MapDescriptor<KC, V>, C, B>,
     key: Key,
     dir: Direction,
-    start: ScanEdge<Coordinate>,
-    end: ScanEdge<Coordinate>,
-    limit: Option<NonZeroUsize>,
+    constraints: Constraints,
 }
 
 impl<KC, V, C, B> MapReaderQuery<'_, KC, V, C, B>
@@ -231,31 +230,31 @@ where
 {
     /// Starts at `key`.
     pub fn from(mut self, key: &KC::Key) -> Self {
-        self.start = ScanEdge::Included(KC::encode(key));
+        self.constraints.start = ScanEdge::Included(KC::encode(key));
         self
     }
 
     /// Starts after `key`.
     pub fn after(mut self, key: &KC::Key) -> Self {
-        self.start = ScanEdge::Excluded(KC::encode(key));
+        self.constraints.start = ScanEdge::Excluded(KC::encode(key));
         self
     }
 
     /// Stops at `key`.
     pub fn to(mut self, key: &KC::Key) -> Self {
-        self.end = ScanEdge::Included(KC::encode(key));
+        self.constraints.end = ScanEdge::Included(KC::encode(key));
         self
     }
 
     /// Stops before `key`.
     pub fn before(mut self, key: &KC::Key) -> Self {
-        self.end = ScanEdge::Excluded(KC::encode(key));
+        self.constraints.end = ScanEdge::Excluded(KC::encode(key));
         self
     }
 
     /// Sets the maximum number of present items that the stream yields.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.limit = Some(limit);
+        self.constraints.limit = Some(limit);
         self
     }
 
@@ -277,22 +276,10 @@ where
         let session = self.reader.session(self.key).await?;
         let handle: MapHandle<_, KC, V> = self.reader.descriptor.bind(&session)?;
         Ok(async_stream::try_stream! {
-            let query = handle.query(self.dir);
-            let query = match self.start {
-                ScanEdge::Included(start) => query.inclusive_start(start),
-                ScanEdge::Excluded(start) => query.exclusive_start(start),
-                ScanEdge::Unbounded => query,
-            };
-            let query = match self.end {
-                ScanEdge::Included(end) => query.inclusive_end(end),
-                ScanEdge::Excluded(end) => query.exclusive_end(end),
-                ScanEdge::Unbounded => query,
-            };
-            let query = match self.limit {
-                Some(limit) => query.limit(limit),
-                None => query,
-            };
-            let inner = query.entries();
+            let inner = handle
+                .query(self.dir)
+                .with_constraints(self.constraints)
+                .entries();
             futures::pin_mut!(inner);
             while let Some(item) = cooperative(inner.next()).await {
                 yield item.map_err(|e| StateReaderError::store(&e))?;
@@ -315,22 +302,10 @@ where
         let session = self.reader.session(self.key).await?;
         let handle: MapHandle<_, KC, V> = self.reader.descriptor.bind(&session)?;
         Ok(async_stream::try_stream! {
-            let query = handle.query(self.dir);
-            let query = match self.start {
-                ScanEdge::Included(start) => query.inclusive_start(start),
-                ScanEdge::Excluded(start) => query.exclusive_start(start),
-                ScanEdge::Unbounded => query,
-            };
-            let query = match self.end {
-                ScanEdge::Included(end) => query.inclusive_end(end),
-                ScanEdge::Excluded(end) => query.exclusive_end(end),
-                ScanEdge::Unbounded => query,
-            };
-            let query = match self.limit {
-                Some(limit) => query.limit(limit),
-                None => query,
-            };
-            let inner = query.keys();
+            let inner = handle
+                .query(self.dir)
+                .with_constraints(self.constraints)
+                .keys();
             futures::pin_mut!(inner);
             while let Some(item) = cooperative(inner.next()).await {
                 yield item.map_err(|e| StateReaderError::store(&e))?;
@@ -489,9 +464,7 @@ where
             reader: self,
             key: key.into(),
             dir,
-            start: ScanEdge::Unbounded,
-            end: ScanEdge::Unbounded,
-            limit: None,
+            constraints: Constraints::default(),
         }
     }
 }

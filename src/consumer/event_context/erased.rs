@@ -35,13 +35,13 @@ use crate::consumer::kafka_state::MessageCell;
 use crate::consumer::message::ConsumerMessage;
 use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MessageLoader;
-use crate::state::cell_key::Direction;
-use crate::state::collection::WritableStateSession;
+use crate::state::cell_key::{Direction, ScanEdge};
+use crate::state::collection::{Constraints, WritableStateSession};
 use crate::state::descriptor::{
     CellCodecError, CellStateError, CellType, ContextOf, DequeHandle, DequeStateError, FromSession,
     MapHandle, MapStateError, ResolvedOf, ValueHandle,
 };
-use crate::state::order_codec::{UnitKey, Utf8KeyCodec};
+use crate::state::order_codec::{OrderedKeyCodec, UnitKey, Utf8KeyCodec};
 
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -797,21 +797,10 @@ where
     fn scan(&self, config: MapScanConfig) -> BoxStateCursor<(String, ResolvedOf<T>)> {
         let handle = self.handle.clone();
         let stream = try_stream! {
-            let mut query = handle.query(config.dir);
-            query = match &config.start {
-                Bound::Included(start) => query.from(start),
-                Bound::Excluded(start) => query.after(start),
-                Bound::Unbounded => query,
-            };
-            query = match &config.end {
-                Bound::Included(end) => query.to(end),
-                Bound::Excluded(end) => query.before(end),
-                Bound::Unbounded => query,
-            };
-            if let Some(limit) = config.limit {
-                query = query.limit(limit);
-            }
-            let inner = query.entries();
+            let inner = handle
+                .query(config.dir)
+                .with_constraints(map_constraints(config))
+                .entries();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 let (key, value) = item.map_err(|e| ErasedStateError::from_classified(&e))?;
@@ -824,21 +813,10 @@ where
     fn keys(&self, config: MapScanConfig) -> BoxStateCursor<String> {
         let handle = self.handle.clone();
         let stream = try_stream! {
-            let mut query = handle.query(config.dir);
-            query = match &config.start {
-                Bound::Included(start) => query.from(start),
-                Bound::Excluded(start) => query.after(start),
-                Bound::Unbounded => query,
-            };
-            query = match &config.end {
-                Bound::Included(end) => query.to(end),
-                Bound::Excluded(end) => query.before(end),
-                Bound::Unbounded => query,
-            };
-            if let Some(limit) = config.limit {
-                query = query.limit(limit);
-            }
-            let inner = query.keys();
+            let inner = handle
+                .query(config.dir)
+                .with_constraints(map_constraints(config))
+                .keys();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().await {
                 let key = item.map_err(|e| ErasedStateError::from_classified(&e))?;
@@ -984,6 +962,20 @@ where
 
 fn bound_usize(bound: Bound<u64>) -> Bound<usize> {
     bound.map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+}
+
+/// Lowers an erased map scan config onto the typed constraint carrier.
+fn map_constraints(config: MapScanConfig) -> Constraints {
+    let edge = |bound: Bound<String>| match bound {
+        Bound::Included(key) => ScanEdge::Included(Utf8KeyCodec::encode(&key)),
+        Bound::Excluded(key) => ScanEdge::Excluded(Utf8KeyCodec::encode(&key)),
+        Bound::Unbounded => ScanEdge::Unbounded,
+    };
+    Constraints {
+        start: edge(config.start),
+        end: edge(config.end),
+        limit: config.limit,
+    }
 }
 
 #[cfg(test)]

@@ -1702,16 +1702,27 @@ impl MapKey for (i64, Value) {
 
 impl StreamConstraints {
     fn contains(self, key: i64, dir: Direction) -> bool {
-        let starts = self.start.is_none_or(|(edge, included)| match dir {
-            Direction::Forward => key > edge || (included && key == edge),
-            Direction::Backward => key < edge || (included && key == edge),
-        });
-        let ends = self.end.is_none_or(|(edge, included)| match dir {
-            Direction::Forward => key < edge || (included && key == edge),
-            Direction::Backward => key > edge || (included && key == edge),
-        });
-        starts && ends
+        edges_contain(self.start, self.end, key, dir)
     }
+}
+
+/// The oracle's direction-relative interval check, shared by both constraint
+/// generators.
+fn edges_contain(
+    start: Option<(i64, bool)>,
+    end: Option<(i64, bool)>,
+    key: i64,
+    dir: Direction,
+) -> bool {
+    let starts = start.is_none_or(|(edge, included)| match dir {
+        Direction::Forward => key > edge || (included && key == edge),
+        Direction::Backward => key < edge || (included && key == edge),
+    });
+    let ends = end.is_none_or(|(edge, included)| match dir {
+        Direction::Forward => key < edge || (included && key == edge),
+        Direction::Backward => key > edge || (included && key == edge),
+    });
+    starts && ends
 }
 
 /// Proves deque plan constraint parity on the point and range arms.
@@ -1807,15 +1818,7 @@ impl DequePlanConstraints {
     }
 
     fn contains(self, key: i64, dir: Direction) -> bool {
-        let starts = self.start.is_none_or(|(edge, included)| match dir {
-            Direction::Forward => key > edge || (included && key == edge),
-            Direction::Backward => key < edge || (included && key == edge),
-        });
-        let ends = self.end.is_none_or(|(edge, included)| match dir {
-            Direction::Forward => key < edge || (included && key == edge),
-            Direction::Backward => key > edge || (included && key == edge),
-        });
-        starts && ends
+        edges_contain(self.start, self.end, key, dir)
     }
 }
 

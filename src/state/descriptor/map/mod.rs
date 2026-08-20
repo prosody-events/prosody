@@ -79,8 +79,8 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::state::cell_key::CellKey;
 use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
 use crate::state::collection::{
-    Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE, Plan,
-    StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
+    Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints, JOURNAL_INLINE,
+    Plan, StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
     spec_matches,
 };
 use crate::state::order_codec::{I64KeyCodec, KeyCodecError, OrderedKeyCodec, UnitKey};
@@ -424,9 +424,7 @@ pub struct MapHandle<S, KC, V> {
 pub struct MapQuery<'a, S, KC, V> {
     handle: &'a MapHandle<S, KC, V>,
     dir: Direction,
-    start: ScanEdge<Coordinate>,
-    end: ScanEdge<Coordinate>,
-    limit: Option<NonZeroUsize>,
+    constraints: Constraints,
 }
 
 impl<'a, S, KC, V> MapQuery<'a, S, KC, V>
@@ -437,66 +435,40 @@ where
     V: CellType<Key = UnitKey>,
 {
     /// Starts at `key`.
-    pub fn from(self, key: &KC::Key) -> Self {
-        self.inclusive_start(KC::encode(key))
+    pub fn from(mut self, key: &KC::Key) -> Self {
+        self.constraints.start = ScanEdge::Included(KC::encode(key));
+        self
     }
 
     /// Starts after `key`.
-    pub fn after(self, key: &KC::Key) -> Self {
-        self.exclusive_start(KC::encode(key))
+    pub fn after(mut self, key: &KC::Key) -> Self {
+        self.constraints.start = ScanEdge::Excluded(KC::encode(key));
+        self
     }
 
     /// Stops at `key`.
-    pub fn to(self, key: &KC::Key) -> Self {
-        self.inclusive_end(KC::encode(key))
+    pub fn to(mut self, key: &KC::Key) -> Self {
+        self.constraints.end = ScanEdge::Included(KC::encode(key));
+        self
     }
 
     /// Stops before `key`.
-    pub fn before(self, key: &KC::Key) -> Self {
-        self.exclusive_end(KC::encode(key))
-    }
-
-    pub(crate) fn inclusive_start(mut self, coordinate: Coordinate) -> Self {
-        self.start = ScanEdge::Included(coordinate);
+    pub fn before(mut self, key: &KC::Key) -> Self {
+        self.constraints.end = ScanEdge::Excluded(KC::encode(key));
         self
-    }
-
-    pub(crate) fn exclusive_start(mut self, coordinate: Coordinate) -> Self {
-        self.start = ScanEdge::Excluded(coordinate);
-        self
-    }
-
-    pub(crate) fn inclusive_end(mut self, coordinate: Coordinate) -> Self {
-        self.end = ScanEdge::Included(coordinate);
-        self
-    }
-
-    pub(crate) fn exclusive_end(mut self, coordinate: Coordinate) -> Self {
-        self.end = ScanEdge::Excluded(coordinate);
-        self
-    }
-
-    fn constrain(&self, mut plan: Plan<S, Keyed<KC, V>>) -> Plan<S, Keyed<KC, V>> {
-        plan = match &self.start {
-            ScanEdge::Included(start) => plan.from(start.clone()),
-            ScanEdge::Excluded(start) => plan.after(start.clone()),
-            ScanEdge::Unbounded => plan,
-        };
-        plan = match &self.end {
-            ScanEdge::Included(end) => plan.to(end.clone()),
-            ScanEdge::Excluded(end) => plan.before(end.clone()),
-            ScanEdge::Unbounded => plan,
-        };
-        match self.limit {
-            Some(limit) => plan.with_limit(limit),
-            None => plan,
-        }
     }
 
     /// Sets the maximum number of present items that the stream yields.
     /// Absent rows are free. Fetch sizing cannot change an answer.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
-        self.limit = Some(limit);
+        self.constraints.limit = Some(limit);
+        self
+    }
+
+    /// Replaces the whole constraint set with one an outer layer already
+    /// lowered. The reader and erased surfaces funnel through this one seam.
+    pub(crate) fn with_constraints(mut self, constraints: Constraints) -> Self {
+        self.constraints = constraints;
         self
     }
 
@@ -520,8 +492,7 @@ where
             // Init: `stream_plan` reads the keyset under an admission it drops
             // as it returns, before this `?` observes the result.
             let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let plan = self.constrain(plan);
-            let inner = plan.entries();
+            let inner = plan.entries(self.constraints);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;
@@ -538,8 +509,7 @@ where
         );
         try_stream! {
             let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let plan = self.constrain(plan);
-            let inner = plan.keys();
+            let inner = plan.keys(self.constraints);
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
                 yield item?;
@@ -884,9 +854,7 @@ where
         MapQuery {
             handle: self,
             dir,
-            start: ScanEdge::Unbounded,
-            end: ScanEdge::Unbounded,
-            limit: None,
+            constraints: Constraints::default(),
         }
     }
 

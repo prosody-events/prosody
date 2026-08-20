@@ -18,8 +18,8 @@
 mod plans;
 
 use super::{
-    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE,
-    StateSession, collection_layout, collection_methods, decode_cell,
+    CellFamily, Collection, CollectionLayout, CollectionRead, CollectionWrite, Constraints,
+    JOURNAL_INLINE, StateSession, collection_layout, collection_methods, decode_cell,
 };
 use crate::codec::{I64Codec, I64CodecError};
 use crate::consumer::middleware::RepinProof;
@@ -838,7 +838,7 @@ fn empty_coordinate_plan_fences_on_exhaustion() -> Result<()> {
             .await;
         session.reset(RepinProof::for_test()).await;
 
-        let stream = plan.entries();
+        let stream = plan.entries(Constraints::default());
         futures::pin_mut!(stream);
         match stream.next().await {
             Some(Err(CellStateError::Access(StateAccessError::Terminated))) => Ok(()),
