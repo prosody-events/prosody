@@ -135,8 +135,10 @@ pub(crate) enum Plan<S: StateSession, T: CellType> {
 }
 
 impl<S: StateSession, T: CellType> Plan<S, T> {
-    /// No production caller limits entries yet. The shared builder keeps the
-    /// twin scans symmetric.
+    /// Sets the maximum number of present items that the plan can yield.
+    ///
+    /// Both arms accept the limit even though no production caller limits
+    /// entries yet: the shared builder keeps the twin scans symmetric.
     pub(crate) fn with_limit(mut self, limit: NonZeroUsize) -> Self {
         match &mut self {
             Self::Points(plan) => plan.limit = Some(limit),
