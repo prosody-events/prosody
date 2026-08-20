@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use thiserror::Error;
 
-/// One required causal section in a regime report.
+/// One causal section in a generated report.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ReportSection {
     /// Regime question and experimental design.
@@ -15,7 +15,7 @@ pub enum ReportSection {
     Decision,
     /// Realized plant response.
     Outcome,
-    /// Late area, replica time, and total cost.
+    /// Cost panels in a batch report.
     Cost,
 }
 
@@ -67,13 +67,12 @@ pub struct DocumentManifest<'a> {
 ///
 /// Returns an error when the document violates the report contract.
 pub fn check_document(manifest: &DocumentManifest<'_>) -> Result<(), ReportCheckError> {
-    const REQUIRED: [ReportSection; 6] = [
+    const REQUIRED: [ReportSection; 5] = [
         ReportSection::Regime,
         ReportSection::Evidence,
         ReportSection::Belief,
         ReportSection::Decision,
         ReportSection::Outcome,
-        ReportSection::Cost,
     ];
     if manifest.sections != REQUIRED {
         return Err(ReportCheckError::PanelOrder);
@@ -222,13 +221,12 @@ mod tests {
         check_document, check_images, label_inside_image,
     };
 
-    const ORDER: [ReportSection; 6] = [
+    const ORDER: [ReportSection; 5] = [
         ReportSection::Regime,
         ReportSection::Evidence,
         ReportSection::Belief,
         ReportSection::Decision,
         ReportSection::Outcome,
-        ReportSection::Cost,
     ];
 
     #[test]
@@ -249,7 +247,7 @@ mod tests {
         assert_eq!(check_document(&manifest), Ok(()));
 
         let incomplete = DocumentManifest {
-            sections: &ORDER[..5],
+            sections: &ORDER[..4],
             ..manifest
         };
         assert_eq!(

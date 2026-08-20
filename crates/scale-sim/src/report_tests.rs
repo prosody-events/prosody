@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::{fmt, path::Path};
 
 use super::{
-    ReportError, image_is_visible, validate_document_source, write_historical_comparison_pdf,
+    MODEL_FACTORS, ReportError, image_is_visible, validate_document_source, write_factor_header,
+    write_historical_comparison_pdf,
 };
 use crate::{ImageManifestEntry, PanelContent, ReportSection};
 
@@ -11,8 +12,9 @@ fn report_source_check_reads_written_contract_fields() {
                   Duration: 1 s. Artifact identity: x.\n[capacity][arrival][reliability][launch]
                   [rebalance]\n== Evidence\nevents operations per second seconds\n== \
                   Belief\nprobability\n
-                  == Decision\nreplicas\n== Outcome\n== Cost\nevent-delay-seconds replica-seconds";
+                  == Decision\nreplicas\n== Outcome\nevent-delay-seconds replica-seconds";
     assert_eq!(validate_document_source(source), Ok(()));
+    assert!(!source.contains("== Cost"));
 
     let invalid = source.replace("== Decision", "== Choice");
     assert!(validate_document_source(&invalid).is_err());
@@ -48,4 +50,12 @@ fn report_prunes_only_nonvisible_panels() {
     ];
     assert!(image_is_visible(&images, "visible.svg"));
     assert!(!image_is_visible(&images, "empty.svg"));
+}
+
+#[test]
+fn pruned_factor_emits_no_header() -> Result<(), fmt::Error> {
+    let mut source = String::new();
+    assert!(!write_factor_header(&mut source, MODEL_FACTORS[7], false)?);
+    assert!(!source.contains("Failure retry probability"));
+    Ok(())
 }

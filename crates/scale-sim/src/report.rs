@@ -227,7 +227,7 @@ pub struct RegimeReport<'a> {
     pub regime: PrincipalRegime,
     /// Closed-loop run evidence.
     pub closed_loop: ExperimentReport<'a>,
-    /// Additional closed-loop capacity evidence, when applicable.
+    /// Capacity-evidence experiment, when applicable.
     pub capacity_evidence: Option<ExperimentReport<'a>>,
 }
 
@@ -362,7 +362,6 @@ fn validate_document_source(source: &str) -> Result<(), ReportCheckError> {
         (ReportSection::Belief, "== Belief"),
         (ReportSection::Decision, "== Decision"),
         (ReportSection::Outcome, "== Outcome"),
-        (ReportSection::Cost, "== Cost"),
     ];
     let mut sections = section_markers
         .into_iter()
@@ -1337,14 +1336,11 @@ fn write_design(source: &mut String, report: &RegimeReport<'_>) -> Result<(), fm
 
 fn write_outcome_assessment(source: &mut String, summary: ReportSummary) -> Result<(), fmt::Error> {
     if summary.final_backlog == 0 {
-        writeln!(
-            source,
-            "The plant cleared all observed backlog before the stop condition."
-        )?;
+        writeln!(source, "The plant stopped with no queued events.")?;
     } else {
         writeln!(
             source,
-            "The plant stopped with {} queued events. The run did not clear its backlog.",
+            "The plant stopped with {} queued events.",
             summary.final_backlog
         )?;
     }
@@ -1596,7 +1592,7 @@ fn write_capacity_evidence_summary(
     )?;
     writeln!(
         source,
-        "The additional closed-loop run lasted {} and stopped because {}.",
+        "The capacity-evidence experiment lasted {} and stopped because {}.",
         format_duration(experiment.stop.at_micros),
         stop_reason(experiment.stop.reason)
     )?;
@@ -1811,13 +1807,15 @@ fn write_experiment_figures(
          factor.\n"
     )?;
     for (index, factor) in MODEL_FACTORS.into_iter().enumerate() {
-        writeln!(
-            source,
-            "#block(breakable: false)[\n=== {}\n",
-            factor.heading
-        )?;
         let belief_file = format!("beliefs/{}.svg", factor.file);
-        if image_is_visible(experiment.images, &belief_file) {
+        let belief_visible = image_is_visible(experiment.images, &belief_file);
+        let snapshot_file = format!("snapshots/{}.svg", factor.file);
+        let snapshot_visible = factor_changed(experiment.controller, index)
+            && image_is_visible(experiment.images, &snapshot_file);
+        if !write_factor_header(source, factor, belief_visible || snapshot_visible)? {
+            continue;
+        }
+        if belief_visible {
             write_figure(
                 source,
                 &format!("{directory}/{belief_file}"),
@@ -1825,12 +1823,10 @@ fn write_experiment_figures(
                 experiment.stop,
             )?;
         }
-        if factor_changed(experiment.controller, index)
-            && image_is_visible(experiment.images, &format!("snapshots/{}.svg", factor.file))
-        {
+        if snapshot_visible {
             write_figure(
                 source,
-                &format!("{directory}/snapshots/{}.svg", factor.file),
+                &format!("{directory}/{snapshot_file}"),
                 "The snapshots compare the prior, largest accepted update, and final posterior. \
                  Gray marks 10% and 90%. Orange marks 50%.",
                 experiment.stop,
@@ -1846,11 +1842,23 @@ fn write_experiment_figures(
     for index in [1_usize, 2, 3, 4, 5, 18] {
         write_manifest_figure(source, directory, STORY_FIGURES[index], experiment)?;
     }
-    writeln!(source, "\n#pagebreak()\n== Cost\n")?;
+    Ok(())
+}
+
+fn write_factor_header(
+    source: &mut String,
+    factor: ModelFactor,
+    visible: bool,
+) -> Result<bool, fmt::Error> {
+    if !visible {
+        return Ok(false);
+    }
     writeln!(
         source,
-        "Selected actions report late area, replica-seconds, and total expected cost."
-    )
+        "#block(breakable: false)[\n=== {}\n",
+        factor.heading
+    )?;
+    Ok(true)
 }
 
 fn write_manifest_figure(

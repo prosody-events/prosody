@@ -122,17 +122,7 @@ fn draw_panel<Backend: DrawingBackend>(
     };
     let (chart_area, key_area) =
         area.split_horizontally(area.dim_in_pixel().0.saturating_sub(key_width));
-    let final_micros = panel
-        .horizon_micros
-        .or_else(|| {
-            panel
-                .series
-                .iter()
-                .filter_map(StorySeries::relevant_end_micros)
-                .max()
-        })
-        .unwrap_or(1)
-        .max(1);
+    let final_micros = panel.horizon_micros.unwrap_or(1).max(1);
     let (minimum, maximum) = panel_bounds(panel);
     let mut chart = ChartBuilder::on(&chart_area)
         .margin_left(CHART_MARGIN_LEFT)
@@ -389,33 +379,29 @@ fn story_panels(story: &RegimeStory<'_>) -> Result<[StoryPanel; PANEL_COUNT as u
         capacity_trace_panel(story.controller),
         capacity_predictive_coverage_panel(story.controller),
     ];
-    for panel in &mut panels {
-        panel.apply_axis();
-        if panel.horizon_micros.is_none() {
-            panel.horizon_micros = panel
-                .series
-                .iter()
-                .filter_map(StorySeries::relevant_end_micros)
-                .max()
-                .or(Some(story.stop.at_micros));
-        }
-    }
+    finish_story_panels(&mut panels, story.stop.at_micros);
     Ok(panels)
+}
+
+fn finish_story_panels(panels: &mut [StoryPanel], horizon_micros: u64) {
+    for panel in panels {
+        panel.apply_axis();
+        panel.horizon_micros = Some(horizon_micros);
+    }
 }
 
 fn work_panel(inputs: &SeriesHistory) -> StoryPanel {
     StoryPanel::new(
         "events per interval",
         vec![
-            input_series(inputs, "message_count", "current messages", count_value).activity(),
-            input_series(inputs, "timer_count", "current timers", count_value).activity(),
+            input_series(inputs, "message_count", "current messages", count_value),
+            input_series(inputs, "timer_count", "current timers", count_value),
             input_series(
                 inputs,
                 "historical_message_count",
                 "historical messages",
                 count_value,
-            )
-            .activity(),
+            ),
         ],
     )
 }
@@ -424,8 +410,8 @@ fn queue_panel(trace: &MetricTrace) -> StoryPanel {
     StoryPanel::new(
         "events per interval",
         vec![
-            metric_u64(trace, "backlog", &trace.backlog, count).activity(),
-            metric_u64(trace, "completed", &trace.useful_completions, count).activity(),
+            metric_u64(trace, "backlog", &trace.backlog, count),
+            metric_u64(trace, "completed", &trace.useful_completions, count),
         ],
     )
 }
@@ -470,9 +456,9 @@ fn latency_panel(trace: &MetricTrace, budget_seconds: f64) -> StoryPanel {
     StoryPanel::new(
         "seconds",
         vec![
-            metric_u64(trace, "p50", &trace.latency_p50_micros, micros).activity(),
-            metric_u64(trace, "p99", &trace.latency_p99_micros, micros).activity(),
-            metric_u64(trace, "p99.9", &trace.latency_p999_micros, micros).activity(),
+            metric_u64(trace, "p50", &trace.latency_p50_micros, micros),
+            metric_u64(trace, "p99", &trace.latency_p99_micros, micros),
+            metric_u64(trace, "p99.9", &trace.latency_p999_micros, micros),
             reference(trace, "SLO", budget_seconds),
         ],
     )
@@ -551,7 +537,7 @@ fn arrival_predictive_panel(controller: &ControllerTrace) -> StoryPanel {
     StoryPanel::new(
         "accepted events per exposure",
         vec![
-            StorySeries::new("accepted evidence", at_micros.clone(), observed).activity(),
+            StorySeries::new("accepted evidence", at_micros.clone(), observed),
             StorySeries::new("predictive 10%", at_micros.clone(), low).light(),
             StorySeries::new("predictive 50%", at_micros.clone(), median),
             StorySeries::new("predictive 90%", at_micros, high).light(),
@@ -596,7 +582,6 @@ fn shared_resource_panel(trace: &MetricTrace, inputs: &SeriesHistory) -> StoryPa
                 "completed attempts",
                 &trace.attempt_throughput_per_second,
             )
-            .activity()
             .points(),
         ],
     )
@@ -626,7 +611,14 @@ fn reporter_coverage_panel(trace: &MetricTrace) -> StoryPanel {
 }
 
 fn snapshot_age_panel(trace: &MetricTrace) -> StoryPanel {
-    StoryPanel::new(
+    let maximum = trace
+        .snapshot_age_micros
+        .iter()
+        .copied()
+        .map(micros)
+        .fold(0.0_f64, f64::max);
+    let upper = maximum + maximum.max(1.0_f64) * 0.2_f64;
+    let mut panel = StoryPanel::new(
         "seconds",
         vec![metric_u64(
             trace,
@@ -634,7 +626,9 @@ fn snapshot_age_panel(trace: &MetricTrace) -> StoryPanel {
             &trace.snapshot_age_micros,
             micros,
         )],
-    )
+    );
+    panel.vertical_bounds = Some((0.0_f64, upper));
+    panel
 }
 
 fn reliability_evidence_panel(trace: &MetricTrace) -> StoryPanel {
@@ -646,15 +640,13 @@ fn reliability_evidence_panel(trace: &MetricTrace) -> StoryPanel {
                 "transient failures",
                 &trace.transient_failures,
                 count,
-            )
-            .activity(),
+            ),
             metric_u64(
                 trace,
                 "permanent rejections",
                 &trace.permanent_rejections,
                 count,
-            )
-            .activity(),
+            ),
         ],
     )
 }
@@ -1165,8 +1157,7 @@ fn story_section(index: usize) -> ReportSection {
         0 | 6 | 8..=14 | 17 => ReportSection::Evidence,
         7 => ReportSection::Belief,
         15 | 16 => ReportSection::Decision,
-        1..=5 | 18 => ReportSection::Outcome,
-        _ => ReportSection::Cost,
+        _ => ReportSection::Outcome,
     }
 }
 
@@ -1202,7 +1193,6 @@ struct StorySeries {
     label: String,
     at_micros: Vec<u64>,
     values: Vec<f64>,
-    horizon: Horizon,
     style: SeriesStyle,
     quantity: Quantity,
     axis: AxisScale,
@@ -1214,7 +1204,6 @@ impl StorySeries {
             label: label.to_owned(),
             at_micros,
             values,
-            horizon: Horizon::State,
             style: SeriesStyle::Line,
             quantity: Quantity::Count,
             axis: AxisScale::Linear,
@@ -1222,20 +1211,7 @@ impl StorySeries {
     }
 
     fn reference(label: &'static str, at_micros: Vec<u64>, values: Vec<f64>) -> Self {
-        Self {
-            label: label.to_owned(),
-            at_micros,
-            values,
-            horizon: Horizon::Reference,
-            style: SeriesStyle::Line,
-            quantity: Quantity::Count,
-            axis: AxisScale::Linear,
-        }
-    }
-
-    fn activity(mut self) -> Self {
-        self.horizon = Horizon::Activity;
-        self
+        Self::new(label, at_micros, values)
     }
 
     fn points(mut self) -> Self {
@@ -1252,22 +1228,6 @@ impl StorySeries {
         self.style = SeriesStyle::LightLine;
         self
     }
-
-    fn relevant_end_micros(&self) -> Option<u64> {
-        let index = match self.horizon {
-            Horizon::Activity => meaningful_index(&self.values)?,
-            Horizon::State => state_change_index(&self.values)?,
-            Horizon::Reference => return None,
-        };
-        self.at_micros.get(index).copied()
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Horizon {
-    Activity,
-    State,
-    Reference,
 }
 
 #[derive(Clone, Copy)]
@@ -1295,16 +1255,6 @@ fn step_points(series: &StorySeries) -> Vec<(u64, f64)> {
     points
 }
 
-fn state_change_index(values: &[f64]) -> Option<usize> {
-    if values.is_empty() {
-        return None;
-    }
-    (1..values.len())
-        .rev()
-        .find(|index| values[*index].to_bits() != values[index - 1].to_bits())
-        .or(Some(0))
-}
-
 fn deduplicate_series(series: Vec<StorySeries>) -> Vec<StorySeries> {
     let mut distinct: Vec<StorySeries> = Vec::with_capacity(series.len());
     for candidate in series {
@@ -1322,7 +1272,21 @@ fn deduplicate_series(series: Vec<StorySeries>) -> Vec<StorySeries> {
 
 #[cfg(test)]
 mod tests {
-    use super::{StoryPanel, StorySeries};
+    use super::{StoryPanel, StorySeries, finish_story_panels};
+
+    #[test]
+    fn story_panels_share_the_experiment_horizon() {
+        let mut panels = [StoryPanel::new(
+            "events",
+            vec![StorySeries::new(
+                "early change",
+                vec![0, 1_000_000],
+                vec![0.0_f64, 1.0_f64],
+            )],
+        )];
+        finish_story_panels(&mut panels, 65_000_000);
+        assert_eq!(panels[0].horizon_micros, Some(65_000_000));
+    }
 
     #[test]
     fn merged_story_label_moves_inside_panel() {

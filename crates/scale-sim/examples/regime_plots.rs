@@ -174,7 +174,7 @@ fn generate_regime(
         None
     };
     // Write all artifacts before validation so failed regimes keep their reports.
-    write_regime_report_pdf(
+    let report_result = write_regime_report_pdf(
         &regime_directory.join("report.pdf"),
         &RegimeReport {
             regime,
@@ -193,11 +193,22 @@ fn generate_regime(
                 images: &evidence.3,
             }),
         },
-    )?;
-    closed_loop_validation?;
-    if let Some(evidence) = capacity_evidence {
-        evidence.2?;
+    );
+    if let Err(error) = closed_loop_validation {
+        if let Err(report_error) = report_result {
+            tracing::error!(%report_error, "report generation also failed");
+        }
+        return Err(error.into());
     }
+    if let Some(evidence) = capacity_evidence
+        && let Err(error) = evidence.2
+    {
+        if let Err(report_error) = report_result {
+            tracing::error!(%report_error, "report generation also failed");
+        }
+        return Err(error.into());
+    }
+    report_result?;
     Ok(())
 }
 
