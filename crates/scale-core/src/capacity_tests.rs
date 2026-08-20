@@ -28,6 +28,15 @@ fn state_f64(value: usize) -> f64 {
     u32::try_from(value).map_or(f64::from(u32::MAX), f64::from)
 }
 
+fn kernel_float_matches(actual: f64, expected: f64) -> bool {
+    if actual.is_infinite() || expected.is_infinite() {
+        return actual.is_infinite()
+            && expected.is_infinite()
+            && actual.is_sign_positive() == expected.is_sign_positive();
+    }
+    (actual - expected).abs() <= 1.0e-12_f64.max(1.0e-9_f64 * expected.abs())
+}
+
 fn update_constant_trace(
     factor: &mut super::CapacityFactor,
     concurrency: u32,
@@ -1842,11 +1851,10 @@ fn completion_predictive_sweep_matches_scalar_cdf_and_summary(
     let mut sweep = vec![0.0_f64; count_max as usize + 1];
     factor.write_completion_predictive_cdfs(&window, &mut sweep);
     for (count, actual) in sweep.iter().enumerate() {
-        if actual.to_bits()
-            != factor
-                .completion_predictive_cdf(&window, count as u32)
-                .to_bits()
-        {
+        if !kernel_float_matches(
+            *actual,
+            factor.completion_predictive_cdf(&window, count as u32),
+        ) {
             return false;
         }
     }
@@ -1878,9 +1886,9 @@ fn completion_predictive_sweep_matches_scalar_cdf_and_summary(
     let rank = summary.lower + rank_offset * (summary.upper - summary.lower);
     let reference_rank = reference_lower + rank_offset * (reference_upper - reference_lower);
     summary.quantile_counts == reference_quantiles
-        && summary.lower.to_bits() == reference_lower.to_bits()
-        && summary.upper.to_bits() == reference_upper.to_bits()
-        && rank.to_bits() == reference_rank.to_bits()
+        && kernel_float_matches(summary.lower, reference_lower)
+        && kernel_float_matches(summary.upper, reference_upper)
+        && kernel_float_matches(rank, reference_rank)
 }
 
 #[quickcheck]
@@ -1966,7 +1974,12 @@ fn completion_group_convolution_matches_scalar_reference(
                     ln_gamma_integers: &ln_gamma_integers,
                 },
             );
-            if actual.to_bits() != reference.to_bits() {
+            if !kernel_float_matches(actual, reference)
+                || !actual_coefficients
+                    .iter()
+                    .zip(reference_coefficients)
+                    .all(|(actual, expected)| kernel_float_matches(*actual, expected))
+            {
                 return false;
             }
         }

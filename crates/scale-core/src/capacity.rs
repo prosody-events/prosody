@@ -3159,11 +3159,13 @@ fn write_binomial_log_masses(
     let log_failure_probability = (-probability).ln_1p();
     for (mass_index, value) in output[..=group_degree].iter_mut().enumerate() {
         let count = f64::from(u32::try_from(mass_index).map_or(u32::MAX, |value| value));
-        *value = trials_log_gamma
+        let log_combination = trials_log_gamma
             - ln_gamma_integers[mass_index]
-            - ln_gamma_integers[trials - mass_index]
-            + count * log_probability
-            + (trials_float - count) * log_failure_probability;
+            - ln_gamma_integers[trials - mass_index];
+        *value = (trials_float - count).mul_add(
+            log_failure_probability,
+            count.mul_add(log_probability, log_combination),
+        );
     }
 }
 
@@ -3255,18 +3257,17 @@ fn convolution_axpy_four<S: Simd>(
         let output_start = added + 3;
         let output_end = output_start + lane_count;
         let mut current = S::f64s::from_slice(simd, &output[output_start..output_end]);
-        // Keep each multiply and add separate and keep row order. FMA changes result
-        // bits.
         for row in 0..4 {
             let value = S::f64s::from_slice(simd, &values[added + 3 - row..output_end - row]);
-            current += coefficient_vectors[row] * value;
+            current = coefficient_vectors[row].mul_add(value, current);
         }
         current.store_slice(&mut output[output_start..output_end]);
     }
     for added in vector_count * lane_count..shared_count {
         let output_index = added + 3;
         for row in 0..4 {
-            output[output_index] += coefficients[row] * values[added + 3 - row];
+            output[output_index] =
+                coefficients[row].mul_add(values[added + 3 - row], output[output_index]);
         }
     }
 }
@@ -3289,11 +3290,12 @@ fn convolution_axpy<S: Simd>(simd: S, coefficient: f64, values: &[f64], output: 
         let end = start + lane_count;
         let value = S::f64s::from_slice(simd, &values[start..end]);
         let current = S::f64s::from_slice(simd, &output[start..end]);
-        // Keep multiply and add separate. A fused multiply-add changes result bits.
-        (current + coefficient * value).store_slice(&mut output[start..end]);
+        coefficient
+            .mul_add(value, current)
+            .store_slice(&mut output[start..end]);
     }
     for index in vector_count * lane_count..values.len() {
-        output[index] += coefficient.as_slice()[0] * values[index];
+        output[index] = coefficient.as_slice()[0].mul_add(values[index], output[index]);
     }
 }
 
