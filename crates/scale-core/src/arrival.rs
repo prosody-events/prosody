@@ -315,6 +315,25 @@ pub(crate) struct ArrivalFactor {
     last_evidence_micros: u64,
 }
 
+/// Predictive mean rates at consecutive report boundaries.
+///
+/// This view contains only tick-time information. It cannot expose a sampled
+/// latent arrival path.
+#[derive(Clone, Copy)]
+pub(crate) struct MeanRateTrajectory<'a> {
+    rates: &'a [f64],
+}
+
+impl<'a> MeanRateTrajectory<'a> {
+    pub(crate) const fn new(rates: &'a [f64]) -> Self {
+        Self { rates }
+    }
+
+    pub(crate) fn rates(self) -> impl Iterator<Item = f64> + 'a {
+        self.rates.iter().copied()
+    }
+}
+
 impl ArrivalFactor {
     pub(crate) fn new(model: &ArrivalPrior) -> Self {
         let grids = arrival_grids(
@@ -533,6 +552,50 @@ impl ArrivalFactor {
         };
         let probability = self.calendar_probability();
         (1.0_f64 - probability) * local + probability * calendar
+    }
+
+    /// Writes the expected sampled-path rate at each report boundary.
+    ///
+    /// The local component decays toward its reset mean at its hazard. Each
+    /// calendar component uses its Gamma mean. The sampler excludes scheduled
+    /// releases, so this trajectory excludes them too.
+    pub(crate) fn write_mean_rate_trajectory<'a>(
+        &self,
+        duration_micros: u64,
+        report_interval_micros: u64,
+        calendar: Option<CalendarForecast<'_>>,
+        now_micros: u64,
+        rates: &'a mut [f64],
+    ) -> MeanRateTrajectory<'a> {
+        let count = (duration_micros / report_interval_micros) as usize;
+        assert!(count <= rates.len(), "mean trajectory storage is too small");
+        let duration_seconds = Duration::from_micros(duration_micros).as_secs_f64();
+        let calendar = calendar
+            .filter(|forecast| calendar_covers(forecast.segments, now_micros, duration_seconds));
+        let calendar_probability = calendar.map_or(0.0_f64, |_| self.calendar_probability());
+        for (index, output) in rates[..count].iter_mut().enumerate() {
+            let offset = report_interval_micros.saturating_mul(index as u64 + 1);
+            let at_micros = now_micros.saturating_add(offset);
+            let local = self.marginal_mean(at_micros);
+            let calendar_mean = calendar.map_or(local, |forecast| {
+                calendar_segment_at(forecast.segments, at_micros).map_or(local, |segment| {
+                    self.calendar_segment_mean(forecast, segment)
+                })
+            });
+            *output =
+                (1.0_f64 - calendar_probability) * local + calendar_probability * calendar_mean;
+        }
+        MeanRateTrajectory::new(&rates[..count])
+    }
+
+    fn calendar_segment_mean(&self, forecast: CalendarForecast<'_>, segment: usize) -> f64 {
+        if self.calendar_artifact == Some(forecast.artifact)
+            && self.calendar_position == forecast.segments.position(segment)
+        {
+            self.calendar_shape / self.calendar_rate
+        } else {
+            forecast.segments.shape(segment) / forecast.segments.rate_seconds(segment)
+        }
     }
 
     fn marginal_mean(&self, now_micros: u64) -> f64 {

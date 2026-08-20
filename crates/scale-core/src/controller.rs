@@ -5,7 +5,7 @@ use std::time::Duration;
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 
 use crate::TransitionDirection;
-use crate::arrival::{ArrivalBoundaryDiagnostic, ArrivalFactor, ArrivalPrior};
+use crate::arrival::{ArrivalBoundaryDiagnostic, ArrivalFactor, ArrivalPrior, MeanRateTrajectory};
 use crate::capacity::{
     CapacityClockCheck, CapacityFactor, CompletionPredictiveSummary, ThroughputPosteriorCell,
     curve_throughput,
@@ -18,8 +18,8 @@ use crate::edf::{
 use crate::lead_time::{LaunchComponentSummary, LaunchTimeFactor, RebalanceTimeFactor};
 use crate::partition::PartitionFactor;
 use crate::planning::{
-    ActionColumns, billing_replica_seconds, complete_horizon_micros,
-    next_report_boundary_at_or_after, select_action, select_runner_up, terminal_replica_seconds,
+    ActionColumns, billing_replica_seconds, complete_horizon_micros, select_action,
+    select_runner_up, terminal_replica_seconds,
 };
 use crate::random::count_as_f64;
 use crate::reliability::{RELIABILITY_BIN_COUNT, ReliabilityFactor};
@@ -573,6 +573,7 @@ pub struct ScaleScratch {
     scenario_supply: Vec<f64>,
     scenario_arrival_path_end_seconds: Vec<f64>,
     scenario_arrival_path_rates: Vec<f64>,
+    mean_arrival_rates: Vec<f64>,
     scenario_event_count: Vec<f64>,
     scenario_partition_missed_work: Vec<f64>,
     scenario_partition_late_area: Vec<f64>,
@@ -683,6 +684,7 @@ struct ScratchBounds {
     posterior_sample_count: usize,
     scenario_cell_count: usize,
     arrival_path_cell_count: usize,
+    successor_report_count_max: usize,
 }
 
 struct CandidateEvaluation<'a> {
@@ -717,6 +719,7 @@ struct ScenarioShared<'a> {
     inner_count: usize,
     planning_horizon_micros: u64,
     disturbance_horizon_micros: u64,
+    mean_trajectory: MeanRateTrajectory<'a>,
 }
 
 /// One worker's disjoint chunk of the scenario-indexed output cells.
@@ -863,14 +866,22 @@ impl ScratchBounds {
         let scenario_cell_count = posterior_sample_count
             .checked_mul(replica_count_max)
             .ok_or(ConfigurationError::PlatformLimit)?;
+        let transition_span_seconds = configuration.launch_time_prior.coverage_support_seconds().1
+            + configuration
+                .rebalance_time_prior
+                .coverage_support_seconds()
+                .1;
+        let successor_horizon_micros = configuration
+            .report_interval_micros
+            .saturating_add(seconds_to_micros(2.0_f64 * transition_span_seconds));
+        let successor_report_count_max =
+            successor_horizon_micros.div_ceil(configuration.report_interval_micros) as usize;
         // Each candidate can hold at most two fixed events per replica,
-        // one requested event, and one repair per arrival path segment.
+        // one requested event, and one repair per report boundary.
         let candidate_event_count_max = replica_count_max
             .checked_mul(2)
             .and_then(|events| events.checked_add(1))
-            .and_then(|events| {
-                events.checked_add(configuration.arrival_prior.path_segment_count_max())
-            })
+            .and_then(|events| events.checked_add(successor_report_count_max))
             .ok_or(ConfigurationError::PlatformLimit)?;
         let placement_count_max = replica_count_max
             .checked_mul(
@@ -897,6 +908,7 @@ impl ScratchBounds {
             arrival_path_cell_count: posterior_sample_count
                 .checked_mul(configuration.arrival_prior.path_segment_count_max())
                 .ok_or(ConfigurationError::PlatformLimit)?,
+            successor_report_count_max,
         })
     }
 }
@@ -969,6 +981,7 @@ impl ScaleScratch {
             posterior_sample_count,
             scenario_cell_count,
             arrival_path_cell_count,
+            successor_report_count_max,
             ..
         } = &bounds;
         let candidate_concurrency = vec![0.0_f64; replica_count_max];
@@ -1005,6 +1018,7 @@ impl ScaleScratch {
             scenario_supply: vec![0.0_f64; scenario_cell_count],
             scenario_arrival_path_end_seconds: vec![0.0_f64; arrival_path_cell_count],
             scenario_arrival_path_rates: vec![0.0_f64; arrival_path_cell_count],
+            mean_arrival_rates: vec![0.0_f64; successor_report_count_max],
             scenario_event_count: vec![0.0_f64; posterior_sample_count],
             scenario_partition_missed_work: vec![0.0_f64; scenario_cell_count],
             scenario_partition_late_area: vec![0.0_f64; scenario_cell_count],
@@ -1311,6 +1325,13 @@ fn evaluate_scenarios(
     let action_count = decision_action_count(scratch);
     let (planning_horizon_micros, disturbance_horizon_micros) =
         scenario_horizons(state, &scratch.resource_cohorts);
+    let mean_trajectory = state.arrivals.write_mean_rate_trajectory(
+        disturbance_horizon_micros.saturating_sub(state.model_time.as_micros()),
+        state.configuration.report_interval_micros,
+        calendar,
+        state.model_time.as_micros(),
+        &mut scratch.mean_arrival_rates,
+    );
     let worker_count = scratch.scenario_workspaces.len().min(scenario_total).max(1);
     let scenario_chunk = scenario_total.div_ceil(worker_count);
     let active_workers = scenario_total.div_ceil(scenario_chunk);
@@ -1353,6 +1374,7 @@ fn evaluate_scenarios(
         inner_count,
         planning_horizon_micros,
         disturbance_horizon_micros,
+        mean_trajectory,
     };
     evaluate_scenario_workers(
         state,
@@ -1480,8 +1502,6 @@ fn evaluate_one_scenario(
                 sample,
                 DecisionRandomDomain::Commitment,
             ),
-            arrival_path_end_seconds: &cells.arrival_path_end_seconds[..path_length],
-            arrival_path_rates: &cells.arrival_path_rates[..path_length],
         },
     );
     evaluate_scenario_outcome(
@@ -2005,14 +2025,12 @@ struct ScenarioForecast {
 }
 
 /// One scenario's sampled transition and disturbance context.
-struct ScenarioDraws<'a> {
+struct ScenarioDraws {
     current_supply: f64,
     lead_random: RandomStream,
     rebalance_random: RandomStream,
     placement_random: RandomStream,
     commitment_random: RandomStream,
-    arrival_path_end_seconds: &'a [f64],
-    arrival_path_rates: &'a [f64],
 }
 
 #[cfg_attr(
@@ -2023,7 +2041,7 @@ fn prepare_supply_trajectories(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
-    draws: &ScenarioDraws<'_>,
+    draws: &ScenarioDraws,
 ) {
     let current_supply = draws.current_supply;
     let candidate_count = workspace.posterior_resource_supply.len();
@@ -2053,7 +2071,7 @@ fn prepare_candidate_trajectories(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
-    draws: &ScenarioDraws<'_>,
+    draws: &ScenarioDraws,
     current_supply: f64,
     candidate_count: usize,
     now_micros: u64,
@@ -2115,6 +2133,7 @@ fn prepare_candidate_trajectories(
             shared,
             workspace,
             draws,
+            shared.mean_trajectory,
             ReactiveTransition {
                 replicas: active.replicas,
                 supply: active.after_supply,
@@ -2136,7 +2155,7 @@ fn write_trajectory_event(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
-    draws: &ScenarioDraws<'_>,
+    draws: &ScenarioDraws,
     read: usize,
     active: &mut ActiveTransition,
     preparation: TrajectoryPreparation,
@@ -2218,7 +2237,7 @@ const fn membership_ready(
 fn push_candidate_events(
     state: &ScaleState,
     workspace: &mut ScenarioWorkspace,
-    draws: &ScenarioDraws<'_>,
+    draws: &ScenarioDraws,
     actuation_commitments: &ActuationCommitments,
     candidate: u32,
     now_micros: u64,
@@ -2294,44 +2313,37 @@ fn push_candidate_events(
     (first, fixed_event_count, committed_replicas)
 }
 
-/// Appends the reactive corrections one deterministic successor makes.
+/// Appends the reactive corrections one certainty-equivalent successor makes.
 ///
-/// The successor requests the smallest target that covers the realized rate.
+/// Successor measurability requires each target to use only tick-time data.
+/// The mean view makes the scenario latent path unreachable from target choice.
 ///
-/// This rule is an optimistic approximation. It observes the sampled plant
-/// truth, but the real controller observes a posterior. The approximation can
-/// underprice low and high initial targets. Paired reports measure this bias.
+/// Certainty equivalence omits rescue after a surprise surge. It can overprice
+/// low targets. A surprise lull can overprice high targets. Paired reports
+/// measure both bias directions.
 fn append_reactive_repairs(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
-    draws: &ScenarioDraws<'_>,
+    draws: &ScenarioDraws,
+    mean_trajectory: MeanRateTrajectory<'_>,
     mut transition: ReactiveTransition,
 ) {
     let now_micros = state.model_time.as_micros();
     let action_count = shared.action_count;
     let candidate_count = workspace.posterior_resource_supply.len();
-    let report_seconds =
-        Duration::from_micros(state.configuration.report_interval_micros).as_secs_f64();
-    let report_epoch_seconds = Duration::from_micros(now_micros).as_secs_f64() + report_seconds;
-    let mut segment_start = 0.0_f64;
-    for segment in 0..draws.arrival_path_end_seconds.len() {
-        let segment_end = draws.arrival_path_end_seconds[segment];
-        let begin_micros = now_micros.saturating_add(seconds_to_micros(segment_start));
-        let end_micros = now_micros.saturating_add(seconds_to_micros(segment_end));
-        segment_start = segment_end;
-        let rate = draws.arrival_path_rates[segment];
+    for (boundary, rate) in mean_trajectory.rates().enumerate() {
+        let requested_micros = now_micros.saturating_add(
+            state
+                .configuration
+                .report_interval_micros
+                .saturating_mul(boundary as u64 + 1),
+        );
         // One transition runs at a time: the successor acts once the
         // active transition completes and the report shows the shortage.
-        let observed_micros = begin_micros.max(transition.ready_micros);
-        if observed_micros >= end_micros {
+        if requested_micros < transition.ready_micros {
             continue;
         }
-        let requested_micros = seconds_to_micros(next_report_boundary_at_or_after(
-            report_epoch_seconds,
-            report_seconds,
-            Duration::from_micros(observed_micros).as_secs_f64(),
-        ));
         let target = repair_target(&workspace.posterior_resource_supply[..action_count], rate);
         if target == transition.replicas {
             continue;
@@ -2522,7 +2534,7 @@ fn push_trajectory_event(
 
 fn sampled_membership_ready(
     state: &ScaleState,
-    draws: &ScenarioDraws<'_>,
+    draws: &ScenarioDraws,
     event_ordinal: u64,
     direction: TransitionDirection,
     replica_delta: u32,
@@ -2550,7 +2562,7 @@ fn sampled_membership_ready(
 fn sample_moved_partition_prefix(
     state: &ScaleState,
     workspace: &mut ScenarioWorkspace,
-    draws: &ScenarioDraws<'_>,
+    draws: &ScenarioDraws,
     event_ordinal: u64,
 ) {
     let ordinal = event_ordinal as usize;

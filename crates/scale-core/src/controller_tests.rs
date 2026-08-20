@@ -4,9 +4,10 @@ use thiserror::Error;
 use super::{
     DecisionRandomDomain, SCHEDULED_PARTITION, ScenarioDraws, ScenarioWorkspace, ScratchBounds,
     balanced_partition_owner, balanced_partition_range, decision_random,
-    partition_replica_capacity, prepare_work_cohorts, sample_moved_partition_prefix,
+    partition_replica_capacity, prepare_work_cohorts, repair_target, sample_moved_partition_prefix,
     scenario_event_count, scenario_horizons,
 };
+use crate::arrival::MeanRateTrajectory;
 use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, evaluate_prepared_step, prepare,
 };
@@ -47,8 +48,6 @@ fn moved_partition_prefix_cache_matches_ordinal_draw() -> Result<(), TestError> 
         rebalance_random: placement_random.clone(),
         placement_random: placement_random.clone(),
         commitment_random: placement_random.clone(),
-        arrival_path_end_seconds: &[],
-        arrival_path_rates: &[],
     };
     let ordinal = 1_u64;
     sample_moved_partition_prefix(&state, &mut workspace, &draws, ordinal);
@@ -79,6 +78,37 @@ fn moved_partition_prefix_cache_matches_ordinal_draw() -> Result<(), TestError> 
             .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
     );
     Ok(())
+}
+
+#[test]
+fn flat_predictive_mean_has_no_successor_repair() {
+    // Successor targets accept this measurable view, not scenario latent rates.
+    let trajectory = MeanRateTrajectory::new(&[150.0_f64; 8]);
+    let supply = [100.0_f64, 200.0_f64, 300.0_f64];
+    let initial = 2_u32;
+
+    assert!(
+        trajectory
+            .rates()
+            .all(|rate| repair_target(&supply, rate) == initial)
+    );
+}
+
+#[test]
+fn calendar_wave_retargets_at_mean_boundaries() {
+    let trajectory = MeanRateTrajectory::new(&[150.0_f64, 250.0_f64, 250.0_f64, 50.0_f64]);
+    let supply = [100.0_f64, 200.0_f64, 300.0_f64];
+    let mut target = 2_u32;
+    let mut changes = Vec::new();
+    for (boundary, rate) in trajectory.rates().enumerate() {
+        let next = repair_target(&supply, rate);
+        if next != target {
+            changes.push((boundary + 1, next));
+            target = next;
+        }
+    }
+
+    assert_eq!(changes, vec![(2, 3), (4, 1)]);
 }
 
 #[test]

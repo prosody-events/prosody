@@ -176,6 +176,83 @@ fn path_initial_draw_applies_the_elapsed_transition() -> Result<(), TestError> {
 }
 
 #[test]
+fn sampled_path_average_converges_to_mean_trajectory() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(2.0_f64, 0.2_f64, 1.0_f64 / 90.0_f64)?;
+    let factor = ArrivalFactor::new(&model);
+    let mut mean_rates = [0.0_f64; 3];
+    let mean = factor.write_mean_rate_trajectory(90_000_000, 30_000_000, None, 0, &mut mean_rates);
+    let expected = mean.rates().collect::<Vec<_>>();
+    let mut ends = vec![0.0_f64; model.path_segment_count_max()];
+    let mut rates = vec![0.0_f64; model.path_segment_count_max()];
+    let mut sums = [0.0_f64; 3];
+    let mut squared_sums = [0.0_f64; 3];
+    let sample_count = 4_096_u32;
+    for seed in 0..sample_count {
+        let length = factor.sample_rate_path(
+            90.0_f64,
+            &mut RandomStream::new(u64::from(seed)),
+            &mut ends,
+            &mut rates,
+            None,
+            0,
+        );
+        for (boundary, at) in [30.0_f64, 60.0_f64, 90.0_f64].into_iter().enumerate() {
+            let segment = ends[..length]
+                .partition_point(|end| *end < at)
+                .min(length - 1);
+            sums[boundary] += rates[segment];
+            squared_sums[boundary] += rates[segment] * rates[segment];
+        }
+    }
+    let count = f64::from(sample_count);
+    for boundary in 0..expected.len() {
+        let average = sums[boundary] / count;
+        let variance = (squared_sums[boundary] / count - average * average).max(0.0_f64);
+        let six_standard_errors = 6.0_f64 * (variance / count).sqrt();
+        assert!((average - expected[boundary]).abs() <= six_standard_errors);
+    }
+    Ok(())
+}
+
+#[test]
+fn calendar_mean_trajectory_follows_segment_boundaries() -> Result<(), TestError> {
+    let model = ArrivalPrior::new(2.0_f64, 20.0_f64, 1.0_f64 / 3_600.0_f64)?;
+    let mut factor = ArrivalFactor::new(&model);
+    let mut segments = CalendarColumns::new(2);
+    segments.extend(&[
+        CalendarRateSegment {
+            position: 0,
+            start_micros: 0,
+            end_micros: 60_000_000,
+            shape: 100.0_f64,
+            rate_seconds: 1.0_f64,
+        },
+        CalendarRateSegment {
+            position: 1,
+            start_micros: 60_000_000,
+            end_micros: 121_000_000,
+            shape: 400.0_f64,
+            rate_seconds: 1.0_f64,
+        },
+    ]);
+    let calendar = CalendarForecast {
+        artifact: CalendarArtifactId(9),
+        prior_probability: 1.0_f64,
+        segments: &segments,
+    };
+    factor.prepare_calendar(Some(calendar), 0);
+    let mut rates = [0.0_f64; 4];
+    let actual =
+        factor.write_mean_rate_trajectory(120_000_000, 30_000_000, Some(calendar), 0, &mut rates);
+
+    assert_eq!(
+        actual.rates().collect::<Vec<_>>(),
+        vec![100.0_f64, 400.0_f64, 400.0_f64, 400.0_f64]
+    );
+    Ok(())
+}
+
+#[test]
 fn derived_grids_meet_their_accuracy_and_coverage_budgets() -> Result<(), TestError> {
     let model = ArrivalPrior::new(1.0_f64, 1.0_f64, 1.0_f64 / 86_400.0_f64)?;
     let factor = ArrivalFactor::new(&model);
