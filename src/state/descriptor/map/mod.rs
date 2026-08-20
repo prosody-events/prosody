@@ -416,8 +416,7 @@ pub struct MapHandle<S, KC, V> {
 /// A directional map stream query.
 ///
 /// Build one with [`MapHandle::query`]. Finish with [`keys`](Self::keys) or
-/// [`entries`](Self::entries). No production caller limits entries yet; the
-/// shared builder keeps the twin scans symmetric (owner ruling).
+/// [`entries`](Self::entries).
 #[must_use]
 pub struct MapQuery<'a, S, KC, V> {
     handle: &'a MapHandle<S, KC, V>,
