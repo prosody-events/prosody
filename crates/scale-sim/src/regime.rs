@@ -1696,12 +1696,24 @@ fn principal_graph(
 const fn replica_count_max(regime: PrincipalRegime, experiment: RegimeExperiment) -> u32 {
     match regime {
         PrincipalRegime::LinearThroughput => 6,
-        PrincipalRegime::FlatPostKnee | PrincipalRegime::DecliningPostKnee
+        PrincipalRegime::FlatPostKnee
             if matches!(experiment, RegimeExperiment::CapacityEvidence) =>
         {
-            // The 128-slot bound sits on the 0.404-service knee alias point; 96 slots
-            // saturate at a discriminating occupancy.
+            // The flat plant saturates at 320 per second. At 128 slots the
+            // effective service time is 0.400 seconds, on the 0.404-service
+            // no-knee alias. At 96 slots it is 0.300 seconds, between grid
+            // cells, so the plateau discriminates.
             3
+        }
+        PrincipalRegime::DecliningPostKnee
+            if matches!(experiment, RegimeExperiment::CapacityEvidence) =>
+        {
+            // The declining plant yields 213 per second at 96 slots, an
+            // effective service time of 0.450 seconds — too close to the
+            // 0.404-service no-knee cell for the ten-second belief deadline.
+            // At 128 slots it yields 107 per second (1.200 seconds), far
+            // from every no-knee cell, so the posterior separates fast.
+            4
         }
         PrincipalRegime::FlatPostKnee
         | PrincipalRegime::DecliningPostKnee
