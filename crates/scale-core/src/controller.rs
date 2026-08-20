@@ -624,11 +624,11 @@ struct ScenarioWorkspace {
     posterior_resource_supply: Vec<f64>,
     partition_order: Vec<u32>,
     partition_share_draws: Vec<f64>,
+    moved_partition_share: Vec<f64>,
     moved_partition_prefix_rows: Vec<f64>,
     moved_partition_prefix_valid: Vec<bool>,
     commitment_pause_micros: Vec<u64>,
     rebalancing_ready_micros: u64,
-    candidate_launches: CandidateLaunchColumns,
     trajectory_offsets: Vec<u32>,
     trajectory: TrajectoryColumns,
 }
@@ -646,13 +646,6 @@ struct TrajectoryColumns {
     ready_boundaries: Vec<u64>,
     during_supply: Vec<f64>,
     after_supply: Vec<f64>,
-}
-
-struct CandidateLaunchColumns {
-    targets: Vec<u32>,
-    pause_micros: Vec<u64>,
-    counts: Vec<usize>,
-    row_width: usize,
 }
 
 struct ReactiveTransition {
@@ -674,10 +667,8 @@ struct ActiveTransition {
 
 #[derive(Clone, Copy)]
 struct TrajectoryPreparation {
-    candidate_index: usize,
     candidate_count: usize,
     now_micros: u64,
-    committed_replicas: u32,
 }
 
 struct ScratchBounds {
@@ -924,45 +915,6 @@ impl TrajectoryColumns {
     }
 }
 
-impl CandidateLaunchColumns {
-    fn new(candidate_count: usize) -> Result<Self, ConfigurationError> {
-        let cell_count = candidate_count
-            .checked_mul(candidate_count)
-            .ok_or(ConfigurationError::PlatformLimit)?;
-        Ok(Self {
-            targets: vec![0; cell_count],
-            pause_micros: vec![0; cell_count],
-            counts: vec![0; candidate_count],
-            row_width: candidate_count,
-        })
-    }
-
-    fn clear(&mut self) {
-        self.counts.fill(0);
-    }
-
-    fn row(&self, candidate: usize) -> (&[u32], &[u64]) {
-        let first = candidate * self.row_width;
-        let last = first + self.counts[candidate];
-        (&self.targets[first..last], &self.pause_micros[first..last])
-    }
-
-    fn push_unique(&mut self, candidate: usize, target: u32, pause_micros: u64) {
-        let first = candidate * self.row_width;
-        let count = self.counts[candidate];
-        if self.targets[first..first + count].contains(&target) {
-            return;
-        }
-        assert!(
-            count < self.row_width,
-            "candidate launches must fit their fixed row"
-        );
-        self.targets[first + count] = target;
-        self.pause_micros[first + count] = pause_micros;
-        self.counts[candidate] += 1;
-    }
-}
-
 impl ScenarioWorkspace {
     fn new(bounds: &ScratchBounds) -> Result<Self, ConfigurationError> {
         let mut prepared_placements = Vec::with_capacity(bounds.placement_count_max);
@@ -979,6 +931,7 @@ impl ScenarioWorkspace {
             posterior_resource_supply: vec![0.0_f64; bounds.replica_count_max],
             partition_order: vec![0; bounds.partition_count],
             partition_share_draws: vec![0.0_f64; bounds.partition_count],
+            moved_partition_share: vec![0.0_f64; bounds.partition_offset_count],
             moved_partition_prefix_rows: vec![
                 0.0_f64;
                 bounds
@@ -989,7 +942,6 @@ impl ScenarioWorkspace {
             moved_partition_prefix_valid: vec![false; bounds.candidate_event_count_max],
             commitment_pause_micros: vec![0_u64; bounds.replica_count_max],
             rebalancing_ready_micros: u64::MAX,
-            candidate_launches: CandidateLaunchColumns::new(bounds.replica_count_max)?,
             trajectory_offsets: vec![0; bounds.replica_count_max + 1],
             trajectory: TrajectoryColumns::new(bounds.trajectory_event_count_max),
         })
@@ -2108,64 +2060,20 @@ fn prepare_candidate_trajectories(
 ) {
     clear_trajectory(&mut workspace.trajectory);
     workspace.trajectory_offsets[0] = 0;
-    let committed_replicas = shared
-        .actuation_commitments
-        .rebalancing()
-        .map_or(state.current_replicas, |commitment| {
-            commitment.target_replicas
-        });
-    distribute_candidate_launches(
-        shared.actuation_commitments,
-        &workspace.commitment_pause_micros,
-        &mut workspace.candidate_launches,
-        committed_replicas,
-        candidate_count,
-    );
-    prepare_candidate_trajectory_rows(
-        state,
-        shared,
-        workspace,
-        draws,
-        current_supply,
-        TrajectoryPreparation {
-            candidate_index: 0,
-            candidate_count,
-            now_micros,
-            committed_replicas,
-        },
-    );
-}
-
-#[cfg_attr(
-    feature = "hotpath",
-    hotpath::measure(label = "trajectory_filter_repair_and_finalize")
-)]
-fn prepare_candidate_trajectory_rows(
-    state: &ScaleState,
-    shared: &ScenarioShared<'_>,
-    workspace: &mut ScenarioWorkspace,
-    draws: &ScenarioDraws<'_>,
-    current_supply: f64,
-    preparation: TrajectoryPreparation,
-) {
-    for candidate_index in 0..preparation.candidate_count {
+    for candidate_index in 0..candidate_count {
         let candidate = candidate_index as u32 + 1;
-        let preparation = TrajectoryPreparation {
-            candidate_index,
-            ..preparation
-        };
-        let (first, fixed_event_count) = push_candidate_events(
+        let (first, fixed_event_count, committed_replicas) = push_candidate_events(
             state,
             workspace,
             draws,
             shared.actuation_commitments,
             candidate,
-            preparation,
+            now_micros,
         );
         sort_trajectory_events(&mut workspace.trajectory, first + fixed_event_count);
         let mut active = ActiveTransition {
             replicas: state.current_replicas,
-            ready_micros: preparation.now_micros,
+            ready_micros: now_micros,
             during_supply: current_supply,
             after_supply: current_supply,
             event: None,
@@ -2175,8 +2083,8 @@ fn prepare_candidate_trajectory_rows(
         for read in first..workspace.trajectory.targets.len() {
             let target = workspace.trajectory.targets[read];
             if read >= first + fixed_event_count
-                && ((candidate > preparation.committed_replicas && target <= active.replicas)
-                    || (candidate < preparation.committed_replicas && target >= active.replicas))
+                && ((candidate > committed_replicas && target <= active.replicas)
+                    || (candidate < committed_replicas && target >= active.replicas))
             {
                 continue;
             }
@@ -2187,7 +2095,10 @@ fn prepare_candidate_trajectory_rows(
                 draws,
                 read,
                 &mut active,
-                preparation,
+                TrajectoryPreparation {
+                    candidate_count,
+                    now_micros,
+                },
             );
         }
         workspace.trajectory.targets.truncate(active.write);
@@ -2218,93 +2129,6 @@ fn prepare_candidate_trajectory_rows(
         workspace.trajectory.ready_boundaries[first..].sort_unstable();
         workspace.trajectory_offsets[candidate_index + 1] =
             workspace.trajectory.targets.len() as u32;
-    }
-}
-
-#[cfg_attr(
-    feature = "hotpath",
-    hotpath::measure(label = "trajectory_event_assembly")
-)]
-fn distribute_candidate_launches(
-    commitments: &ActuationCommitments,
-    commitment_pause_micros: &[u64],
-    launches: &mut CandidateLaunchColumns,
-    committed_replicas: u32,
-    candidate_count: usize,
-) {
-    launches.clear();
-    for (commitment_index, &pause_micros) in commitment_pause_micros
-        .iter()
-        .enumerate()
-        .take(commitments.launching_len())
-    {
-        if pause_micros == u64::MAX {
-            continue;
-        }
-        let launch_direction = commitments.launching_direction(commitment_index);
-        let launch_target = commitments.launching_target_replicas(commitment_index);
-        for candidate_index in 0..candidate_count {
-            let candidate = candidate_index as u32 + 1;
-            if candidate == committed_replicas {
-                continue;
-            }
-            let candidate_direction = if candidate > committed_replicas {
-                TransitionDirection::Up
-            } else {
-                TransitionDirection::Down
-            };
-            if launch_direction != candidate_direction {
-                continue;
-            }
-            let target = match candidate_direction {
-                TransitionDirection::Up => launch_target.min(candidate),
-                TransitionDirection::Down => launch_target.max(candidate),
-            };
-            if target != committed_replicas {
-                launches.push_unique(candidate_index, target, pause_micros);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-fn distribute_candidate_launches_reference(
-    commitments: &ActuationCommitments,
-    commitment_pause_micros: &[u64],
-    launches: &mut CandidateLaunchColumns,
-    committed_replicas: u32,
-    candidate_count: usize,
-) {
-    launches.clear();
-    for candidate_index in 0..candidate_count {
-        let candidate = candidate_index as u32 + 1;
-        if candidate == committed_replicas {
-            continue;
-        }
-        let candidate_direction = if candidate > committed_replicas {
-            TransitionDirection::Up
-        } else {
-            TransitionDirection::Down
-        };
-        for (commitment_index, &pause_micros) in commitment_pause_micros
-            .iter()
-            .enumerate()
-            .take(commitments.launching_len())
-        {
-            if commitments.launching_direction(commitment_index) != candidate_direction
-                || pause_micros == u64::MAX
-            {
-                continue;
-            }
-            let launch_target = commitments.launching_target_replicas(commitment_index);
-            let target = match candidate_direction {
-                TransitionDirection::Up => launch_target.min(candidate),
-                TransitionDirection::Down => launch_target.max(candidate),
-            };
-            if target != committed_replicas {
-                launches.push_unique(candidate_index, target, pause_micros);
-            }
-        }
     }
 }
 
@@ -2346,8 +2170,8 @@ fn write_trajectory_event(
     let moved = shared.moved_partition_counts
         [(active.replicas as usize - 1) * preparation.candidate_count + target as usize - 1];
     let ready = membership_ready(direction, moved, pause, sampled_ready);
-    let retained =
-        1.0_f64 - sample_moved_partition_prefix(state, workspace, draws, active.ordinal, moved);
+    sample_moved_partition_prefix(state, workspace, draws, active.ordinal);
+    let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
     workspace.trajectory.targets[active.write] = target;
     workspace.trajectory.pause_micros[active.write] = pause;
     workspace.trajectory.ready_override_micros[active.write] = ready_override;
@@ -2389,58 +2213,85 @@ const fn membership_ready(
 
 /// Pushes one candidate's committed and requested transition events.
 ///
-/// Returns the candidate's first event index and its fixed-event count.
+/// Returns the candidate's first event index, its fixed-event count, and
+/// the replica count the started rebalance commits.
 fn push_candidate_events(
     state: &ScaleState,
     workspace: &mut ScenarioWorkspace,
     draws: &ScenarioDraws<'_>,
     actuation_commitments: &ActuationCommitments,
     candidate: u32,
-    preparation: TrajectoryPreparation,
-) -> (usize, usize) {
+    now_micros: u64,
+) -> (usize, usize, u32) {
     let first = workspace.trajectory.targets.len();
     let rebalancing = actuation_commitments.rebalancing();
-    if let Some(commitment) = rebalancing {
+    let committed_replicas = rebalancing.map_or(state.current_replicas, |commitment| {
         push_trajectory_event(
             &mut workspace.trajectory,
             commitment.target_replicas,
-            preparation.now_micros,
+            now_micros,
             Some(workspace.rebalancing_ready_micros),
         );
-    }
+        commitment.target_replicas
+    });
     let fixed_event_count = workspace.trajectory.targets.len() - first;
-    let (launch_targets, launch_pauses) = workspace
-        .candidate_launches
-        .row(preparation.candidate_index);
-    for (&target, &pause_micros) in launch_targets.iter().zip(launch_pauses) {
-        push_trajectory_event(&mut workspace.trajectory, target, pause_micros, None);
-    }
-    if candidate != preparation.committed_replicas
-        && !workspace.trajectory.targets[first..].contains(&candidate)
-    {
-        let direction = if candidate > preparation.committed_replicas {
+    if candidate != committed_replicas {
+        let candidate_direction = if candidate > committed_replicas {
             TransitionDirection::Up
         } else {
             TransitionDirection::Down
         };
-        let replica_delta = candidate.abs_diff(preparation.committed_replicas);
+        for commitment_index in 0..actuation_commitments.launching_len() {
+            if actuation_commitments.launching_direction(commitment_index) != candidate_direction
+                || workspace.commitment_pause_micros[commitment_index] == u64::MAX
+            {
+                continue;
+            }
+            let target = match candidate_direction {
+                TransitionDirection::Up => actuation_commitments
+                    .launching_target_replicas(commitment_index)
+                    .min(candidate),
+                TransitionDirection::Down => actuation_commitments
+                    .launching_target_replicas(commitment_index)
+                    .max(candidate),
+            };
+            if target == committed_replicas
+                || workspace.trajectory.targets[first..].contains(&target)
+            {
+                continue;
+            }
+            push_trajectory_event(
+                &mut workspace.trajectory,
+                target,
+                workspace.commitment_pause_micros[commitment_index],
+                None,
+            );
+        }
+    }
+    if candidate != committed_replicas
+        && !workspace.trajectory.targets[first..].contains(&candidate)
+    {
+        let direction = if candidate > committed_replicas {
+            TransitionDirection::Up
+        } else {
+            TransitionDirection::Down
+        };
+        let replica_delta = candidate.abs_diff(committed_replicas);
         let event_ordinal = (workspace.trajectory.targets.len() - first) as u64;
         push_trajectory_event(
             &mut workspace.trajectory,
             candidate,
-            preparation
-                .now_micros
-                .saturating_add(seconds_to_micros(scenario_launch_seconds(
-                    state,
-                    &draws.lead_random,
-                    event_ordinal,
-                    direction,
-                    replica_delta,
-                ))),
+            now_micros.saturating_add(seconds_to_micros(scenario_launch_seconds(
+                state,
+                &draws.lead_random,
+                event_ordinal,
+                direction,
+                replica_delta,
+            ))),
             None,
         );
     }
-    (first, fixed_event_count)
+    (first, fixed_event_count, committed_replicas)
 }
 
 /// Appends the reactive corrections one deterministic successor makes.
@@ -2513,14 +2364,8 @@ fn append_reactive_repairs(
                 replica_delta,
             )))
         };
-        let retained = 1.0_f64
-            - sample_moved_partition_prefix(
-                state,
-                workspace,
-                draws,
-                transition.event_ordinal,
-                moved,
-            );
+        sample_moved_partition_prefix(state, workspace, draws, transition.event_ordinal);
+        let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
         let after = workspace.posterior_resource_supply[target as usize - 1];
         workspace.trajectory.targets.push(target);
         workspace.trajectory.pause_micros.push(pause_micros);
@@ -2707,24 +2552,27 @@ fn sample_moved_partition_prefix(
     workspace: &mut ScenarioWorkspace,
     draws: &ScenarioDraws<'_>,
     event_ordinal: u64,
-    moved: u32,
-) -> f64 {
+) {
     let ordinal = event_ordinal as usize;
-    let row_width = workspace.partition_order.len() + 1;
+    let row_width = workspace.moved_partition_share.len();
     let first = ordinal * row_width;
     let last = first + row_width;
     if workspace.moved_partition_prefix_valid[ordinal] {
-        return workspace.moved_partition_prefix_rows[first + moved as usize];
+        workspace
+            .moved_partition_share
+            .copy_from_slice(&workspace.moved_partition_prefix_rows[first..last]);
+        return;
     }
     let mut random = draws.placement_random.clone().domain(event_ordinal);
     state.partition_placement.sample_moved_prefix(
         &mut random,
         &mut workspace.partition_order,
         &mut workspace.partition_share_draws,
-        &mut workspace.moved_partition_prefix_rows[first..last],
+        &mut workspace.moved_partition_share,
     );
+    workspace.moved_partition_prefix_rows[first..last]
+        .copy_from_slice(&workspace.moved_partition_share);
     workspace.moved_partition_prefix_valid[ordinal] = true;
-    workspace.moved_partition_prefix_rows[first + moved as usize]
 }
 
 fn sort_trajectory_events(trajectory: &mut TrajectoryColumns, first: usize) {
