@@ -717,7 +717,9 @@ pub(crate) struct CapacityFactor {
     likelihoods: Vec<f64>,
     hazard_rates_per_second: Vec<f64>,
     contamination_probabilities: Vec<f64>,
+    /// Provides the normalized linear view of `filter_log_weights`.
     filter_weights: Vec<f64>,
+    /// Stores the authoritative normalized filter posterior in the log domain.
     filter_log_weights: Vec<f64>,
     filter_curve_weights: Vec<f64>,
     start_history: Vec<StartWindow>,
@@ -807,6 +809,7 @@ impl CapacityFactor {
             &prior_weights,
             filter_count,
         );
+        let filter_log_weights = filter_weights.iter().map(|weight| weight.ln()).collect();
         Ok(Self {
             simd_level: Level::new(),
             grid,
@@ -821,7 +824,7 @@ impl CapacityFactor {
             likelihoods: vec![0.0_f64; cell_count],
             hazard_rates_per_second,
             contamination_probabilities,
-            filter_log_weights: vec![0.0_f64; filter_count],
+            filter_log_weights,
             filter_weights,
             filter_curve_weights,
             start_history: vec![EMPTY_START_WINDOW; start_history_capacity],
@@ -1610,7 +1613,7 @@ impl CapacityFactor {
         let quality_count = self.contamination_probabilities.len();
         for (filter, curve_weights) in self
             .filter_curve_weights
-            .chunks_exact(cell_count)
+            .chunks_exact_mut(cell_count)
             .enumerate()
         {
             let contamination = self.contamination_probabilities[filter % quality_count];
@@ -1634,8 +1637,12 @@ impl CapacityFactor {
             if !predictive.is_finite() || predictive <= 0.0_f64 {
                 return;
             }
-            self.filter_log_weights[filter] =
-                self.filter_weights[filter].ln() + maximum + predictive.ln();
+            self.filter_log_weights[filter] += maximum + predictive.ln();
+            for (weight, likelihood) in curve_weights.iter_mut().zip(&self.likelihoods) {
+                let mixture =
+                    log_contamination_mixture(*likelihood, prior_predictive, contamination);
+                *weight *= (mixture - maximum).exp() / predictive;
+            }
         }
         let maximum = self
             .filter_log_weights
@@ -1650,28 +1657,6 @@ impl CapacityFactor {
         if !total.is_finite() || total <= 0.0_f64 {
             return;
         }
-        for (filter, curve_weights) in self
-            .filter_curve_weights
-            .chunks_exact_mut(cell_count)
-            .enumerate()
-        {
-            let contamination = self.contamination_probabilities[filter % quality_count];
-            let maximum = self
-                .likelihoods
-                .iter()
-                .map(|likelihood| {
-                    log_contamination_mixture(*likelihood, prior_predictive, contamination)
-                })
-                .fold(f64::NEG_INFINITY, f64::max);
-            let predictive =
-                (self.filter_log_weights[filter] - self.filter_weights[filter].ln() - maximum)
-                    .exp();
-            for (weight, likelihood) in curve_weights.iter_mut().zip(&self.likelihoods) {
-                let mixture =
-                    log_contamination_mixture(*likelihood, prior_predictive, contamination);
-                *weight *= (mixture - maximum).exp() / predictive;
-            }
-        }
         dispatch!(self.simd_level, simd => write_normalized_exponentials(
             simd,
             &self.filter_log_weights,
@@ -1679,6 +1664,10 @@ impl CapacityFactor {
             maximum,
             total,
         ));
+        let log_total = maximum + total.ln();
+        for weight in &mut self.filter_log_weights {
+            *weight -= log_total;
+        }
         self.mix_filters();
     }
 

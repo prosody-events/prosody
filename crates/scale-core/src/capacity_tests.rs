@@ -79,9 +79,116 @@ fn posterior_bits(factor: &super::CapacityFactor) -> Vec<u64> {
         .weights
         .iter()
         .chain(&factor.filter_weights)
+        .chain(&factor.filter_log_weights)
         .chain(&factor.filter_curve_weights)
         .map(|value| value.to_bits())
         .collect()
+}
+
+fn storm_factor() -> Result<super::CapacityFactor, TestError> {
+    let grid = CapacityGrid::new_with_prior(
+        &[0.0005_f64, 0.001_f64, 0.002_f64, 0.004_f64, 0.008_f64],
+        &[32_000.0_f64, 64_000.0_f64, 128_000.0_f64, 256_000.0_f64],
+        &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
+        super::CapacityPrior::LogUniform,
+    )?;
+    Ok(super::CapacityFactor::new_with_prior_with_groups(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &ArrivalPrior::new(1.0_f64, 86_400.0_f64, 1.0_f64 / 86_400.0_f64)?,
+        256.0_f64,
+        0.1_f64,
+        10_000,
+        1_000,
+    )?)
+}
+
+fn update_storm_window(
+    factor: &mut super::CapacityFactor,
+    burst: bool,
+) -> Result<(), ResourceWindowError> {
+    let (window, initial, busy_micros, offsets, completed, started) = if burst {
+        (
+            ResourceWindow::new_with_starts(229.8_f64, 0.1_f64, 8, 8)?,
+            230,
+            22_980_000,
+            [80_000, 100_000],
+            [1, 7],
+            [0, 8],
+        )
+    } else {
+        (
+            ResourceWindow::new_with_starts(50.5_f64, 0.1_f64, 50, 50)?,
+            50,
+            5_050_000,
+            [50_000, 100_000],
+            [24, 26],
+            [25, 25],
+        )
+    };
+    factor.update(
+        occupancy_trace_for_test(
+            window,
+            initial,
+            initial,
+            busy_micros,
+            &offsets,
+            &completed,
+            &started,
+        ),
+        Duration::from_millis(100),
+    );
+    Ok(())
+}
+
+fn filter_posterior_is_finite_and_normalized(factor: &super::CapacityFactor) -> bool {
+    let sum = factor.filter_weights.iter().sum::<f64>();
+    factor
+        .filter_log_weights
+        .iter()
+        .all(|weight| weight.is_finite())
+        && factor
+            .filter_weights
+            .iter()
+            .all(|weight| weight.is_finite())
+        && factor.weights.iter().all(|weight| weight.is_finite())
+        && factor.no_knee_probability().is_finite()
+        && (sum - 1.0_f64).abs() <= 64.0_f64 * f64::EPSILON
+}
+
+#[test]
+fn storm_filter_posterior_stays_finite_past_window_266() -> Result<(), TestError> {
+    let mut factor = storm_factor()?;
+    for index in 0_usize..=266_usize {
+        update_storm_window(&mut factor, index == 12_usize)?;
+        assert!(filter_posterior_is_finite_and_normalized(&factor));
+    }
+    Ok(())
+}
+
+#[quickcheck]
+fn filter_posterior_stays_finite_and_normalized_for_random_windows(codes: Vec<u8>) -> bool {
+    let Ok(mut factor) = storm_factor() else {
+        return false;
+    };
+    if update_storm_window(&mut factor, true).is_err() {
+        return false;
+    }
+    for code in codes.into_iter().take(32) {
+        let concurrency = 1_u32 + u32::from(code);
+        let exposure_seconds = if code % 4 == 0 { 0.1_f64 } else { 1.0_f64 };
+        let completed = if code % 7 == 0 {
+            0
+        } else {
+            u32::from(code % 64)
+        };
+        if update_constant_trace(&mut factor, concurrency, exposure_seconds, completed).is_err()
+            || !filter_posterior_is_finite_and_normalized(&factor)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[quickcheck]
