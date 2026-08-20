@@ -75,6 +75,33 @@ async fn assert_deque_peeks<P: ParityPayload>(
     Ok(opt_same::<P>(back.as_ref(), visible.back()))
 }
 
+async fn assert_deque_scans<P: ParityPayload>(
+    handle: &BoxDequeState<P>,
+    visible: &VecDeque<P>,
+) -> Result<bool> {
+    let scanned = drain_cursor(&handle.scan(DequeScanConfig::default())).await?;
+    if scanned.len() != visible.len()
+        || scanned
+            .iter()
+            .zip(visible)
+            .any(|(actual, expected)| !P::same(actual, expected))
+    {
+        return Ok(false);
+    }
+    let constrained = drain_cursor(&handle.scan(DequeScanConfig {
+        dir: Direction::Forward,
+        limit: Some(NonZeroUsize::MIN),
+        start: Bound::Included(1),
+        end: Bound::Excluded(3),
+    }))
+    .await?;
+    Ok(constrained.len() == visible.iter().skip(1).take(1).count()
+        && constrained
+            .iter()
+            .zip(visible.iter().skip(1).take(1))
+            .all(|(actual, expected)| P::same(actual, expected)))
+}
+
 /// Drives a deque trace through the erased handle and a `(floor, visible)`
 /// `VecDeque` model, asserting `len`, every positional `get`, the endpoint
 /// peeks (`peek_front`/`peek_back` against `visible.front()`/`.back()`), and a
@@ -175,13 +202,7 @@ where
             if !assert_deque_peeks(&handle, &visible).await? {
                 return Ok(false);
             }
-            let scanned = drain_cursor(&handle.scan(Direction::Forward)).await?;
-            if scanned.len() != visible.len()
-                || scanned
-                    .iter()
-                    .zip(visible.iter())
-                    .any(|(a, b)| !P::same(a, b))
-            {
+            if !assert_deque_scans(&handle, &visible).await? {
                 return Ok(false);
             }
         }
