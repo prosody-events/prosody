@@ -1,4 +1,4 @@
-use std::{f64::consts::E, mem::size_of, time::Duration};
+use std::{array, f64::consts::E, mem::size_of, time::Duration};
 
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use statrs::distribution::{Beta, ContinuousCDF, Gamma, LogNormal};
@@ -3186,8 +3186,22 @@ fn completion_group_convolution<S: Simd>(
     // Log masses are finite or negative infinity, and convolutions contain
     // non-negative products. Neither maximum scan can contain NaN.
     let maximum = exponentiate_log_masses(simd, &mut binomial[..=group_degree]);
-    convolution[..=target].fill(0.0_f64);
+    convolution[..=next_degree].fill(0.0_f64);
     let mut known = 0_usize;
+    while known + 7 <= degree && group_degree >= 7 {
+        let full_added_count = group_degree + 1;
+        let eighth_added_count = group_degree.min(target - known - 7) + 1;
+        if eighth_added_count != full_added_count {
+            break;
+        }
+        convolution_axpy_eight(
+            simd,
+            &coefficients[known..known + 8],
+            &binomial[..full_added_count],
+            &mut convolution[known..known + group_degree + 8],
+        );
+        known += 8;
+    }
     while known + 3 <= degree && group_degree >= 3 {
         let full_added_count = group_degree + 1;
         let fourth_added_count = group_degree.min(target - known - 3) + 1;
@@ -3219,6 +3233,53 @@ fn completion_group_convolution<S: Simd>(
         scale,
     );
     (maximum, scale, next_degree)
+}
+
+fn convolution_axpy_eight<S: Simd>(
+    simd: S,
+    coefficients: &[f64],
+    values: &[f64],
+    output: &mut [f64],
+) {
+    for row in 0..8 {
+        convolution_axpy(
+            simd,
+            coefficients[row],
+            &values[..7 - row],
+            &mut output[row..7],
+        );
+        let suffix_start = values.len() - row;
+        convolution_axpy(
+            simd,
+            coefficients[row],
+            &values[suffix_start..],
+            &mut output[values.len()..values.len() + row],
+        );
+    }
+
+    let lane_count = S::f64s::N;
+    let shared_count = values.len() - 7;
+    let vector_count = shared_count / lane_count;
+    let coefficient_vectors: [S::f64s; 8] =
+        array::from_fn(|row| S::f64s::splat(simd, coefficients[row]));
+    for vector in 0..vector_count {
+        let added = vector * lane_count;
+        let output_start = added + 7;
+        let output_end = output_start + lane_count;
+        let mut current = S::f64s::from_slice(simd, &output[output_start..output_end]);
+        for row in 0..8 {
+            let value = S::f64s::from_slice(simd, &values[added + 7 - row..output_end - row]);
+            current = coefficient_vectors[row].mul_add(value, current);
+        }
+        current.store_slice(&mut output[output_start..output_end]);
+    }
+    for added in vector_count * lane_count..shared_count {
+        let output_index = added + 7;
+        for row in 0..8 {
+            output[output_index] =
+                coefficients[row].mul_add(values[added + 7 - row], output[output_index]);
+        }
+    }
 }
 
 fn convolution_axpy_four<S: Simd>(

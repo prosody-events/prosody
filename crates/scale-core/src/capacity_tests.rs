@@ -1,7 +1,7 @@
 use std::{array, time::Duration};
 
 use allocation_counter::measure;
-use fearless_simd::Level;
+use fearless_simd::{Level, dispatch};
 use quickcheck_macros::quickcheck;
 use statrs::distribution::{ContinuousCDF, Gamma};
 use thiserror::Error;
@@ -13,12 +13,12 @@ use super::{
     OBSERVATION_PROBABILITY_ERROR_MAX, PATH_SOLVER_PROBABILITY_ERROR_MAX, ResourceWindow,
     ResourceWindowError, RetainedHistory, SOLVER_COVERAGE_INDEX, SpreadTruncation, StartWindow,
     binomial_log_probability, capacity_model_artifact, capacity_update_operation_count,
-    completion_expectation, completion_log_likelihood, completion_log_likelihood_reference,
-    completion_marginal_probability, contamination_prior, equal_rate_death_step,
-    feasibility_probability, feasibility_probability_and_charge, fold_trace, hazard_prior,
-    integer_ln_gamma_table, linear_rate_band, linear_rate_death_step, log_contamination_mixture,
-    log_normal_axis_masses, log_weighted_sum, path_log_score, pure_death_step,
-    pure_death_step_with_rates, record_start_window, uniformized_death_step,
+    completion_expectation, completion_group_convolution, completion_log_likelihood,
+    completion_log_likelihood_reference, completion_marginal_probability, contamination_prior,
+    equal_rate_death_step, feasibility_probability, feasibility_probability_and_charge, fold_trace,
+    hazard_prior, integer_ln_gamma_table, linear_rate_band, linear_rate_death_step,
+    log_contamination_mixture, log_normal_axis_masses, log_weighted_sum, path_log_score,
+    pure_death_step, pure_death_step_with_rates, record_start_window, uniformized_death_step,
 };
 use crate::change_point::ChangePointKernel;
 use crate::types::occupancy_trace_for_test;
@@ -1985,6 +1985,178 @@ fn completion_group_convolution_matches_scalar_reference(
         }
     }
     true
+}
+
+#[quickcheck]
+fn eight_row_convolution_matches_one_output_scalar_order(
+    seed: u8,
+    coefficient_seed: u64,
+    mass_seed: u64,
+) -> bool {
+    let degree = usize::from(seed % 9 + 7);
+    let group_degree = usize::from(seed.rotate_left(3) % 9 + 7);
+    let target = (degree + group_degree).min(31);
+    let mut actual_coefficients = [0.0_f64; 32];
+    let mut reference_coefficients = [0.0_f64; 32];
+    for index in 0..=degree {
+        let bits = coefficient_seed.rotate_left(index as u32)
+            ^ (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let exponent = 1_000 + bits % 40;
+        let value = f64::from_bits((exponent << 52) | (bits & ((1_u64 << 52) - 1)));
+        actual_coefficients[index] = value;
+        reference_coefficients[index] = value;
+    }
+    let mut actual_binomial = [0.0_f64; 32];
+    let mut reference_binomial = [0.0_f64; 32];
+    for index in 0..=group_degree {
+        let bits = mass_seed.rotate_right(index as u32)
+            ^ (index as u64).wrapping_mul(0xd1b5_4a32_d192_ed03);
+        let mass = u32::try_from(bits % 10_000).map_or(u32::MAX, |value| value);
+        let value = -f64::from(mass) / 100.0_f64;
+        actual_binomial[index] = value;
+        reference_binomial[index] = value;
+    }
+    let mut actual_convolution = [0.0_f64; 32];
+    let mut reference_convolution = [0.0_f64; 32];
+    let actual = dispatch!(Level::new(), simd => completion_group_convolution(
+        simd,
+        &mut actual_coefficients,
+        &mut actual_convolution,
+        &mut actual_binomial,
+        degree,
+        group_degree,
+        target,
+    ));
+    let reference = scalar_completion_group_convolution(
+        &mut reference_coefficients,
+        &mut reference_convolution,
+        &mut reference_binomial,
+        degree,
+        group_degree,
+        target,
+    );
+    tuple_bits_equal(actual, reference)
+        && slice_bits_equal(&actual_coefficients, &reference_coefficients)
+        && slice_bits_equal(&actual_convolution, &reference_convolution)
+        && slice_bits_equal(&actual_binomial, &reference_binomial)
+}
+
+#[test]
+fn convolution_sweep_ignores_poisoned_suffix() -> Result<(), TestError> {
+    let ln_gamma_integers = integer_ln_gamma_table(32)?;
+    let grid = CapacityGrid::new(&[0.2_f64], &[500.0_f64], &[0.0_f64])?;
+    let history = [
+        StartWindow {
+            end_micros: 500_000,
+            exposure_seconds: 0.5_f64,
+            started_attempts: Some(9),
+        },
+        StartWindow {
+            end_micros: 1_250_000,
+            exposure_seconds: 0.75_f64,
+            started_attempts: Some(11),
+        },
+    ];
+    let retained = RetainedHistory {
+        windows: &history,
+        head: 0,
+        length: history.len(),
+        end_micros: 1_500_000,
+    };
+    let window = ResourceWindow::new_with_starts(2.0_f64, 1.0_f64, 15, 7)?;
+    let mut clean_coefficients = [0.0_f64; 32];
+    let mut clean_convolution = [0.0_f64; 32];
+    let mut clean_binomial = [0.0_f64; 32];
+    let clean = completion_log_likelihood(
+        &grid,
+        0,
+        retained,
+        &window,
+        2.0_f64,
+        1.5_f64,
+        CompletionScratch {
+            simd_level: Level::new(),
+            coefficients: &mut clean_coefficients,
+            convolution: &mut clean_convolution,
+            binomial: &mut clean_binomial,
+            ln_gamma_integers: &ln_gamma_integers,
+        },
+    );
+    let mut poisoned_coefficients = [0.0_f64; 32];
+    let mut poisoned_convolution = [1.0e300_f64; 32];
+    let mut poisoned_binomial = [0.0_f64; 32];
+    let poisoned = completion_log_likelihood(
+        &grid,
+        0,
+        retained,
+        &window,
+        2.0_f64,
+        1.5_f64,
+        CompletionScratch {
+            simd_level: Level::new(),
+            coefficients: &mut poisoned_coefficients,
+            convolution: &mut poisoned_convolution,
+            binomial: &mut poisoned_binomial,
+            ln_gamma_integers: &ln_gamma_integers,
+        },
+    );
+    assert_eq!(clean.to_bits(), poisoned.to_bits());
+    assert!(slice_bits_equal(
+        &clean_coefficients,
+        &poisoned_coefficients
+    ));
+    assert!(
+        poisoned_convolution[16..]
+            .iter()
+            .all(|value| value.to_bits() == 1.0e300_f64.to_bits())
+    );
+    Ok(())
+}
+
+fn scalar_completion_group_convolution(
+    coefficients: &mut [f64],
+    convolution: &mut [f64],
+    binomial: &mut [f64],
+    degree: usize,
+    group_degree: usize,
+    target: usize,
+) -> (f64, f64, usize) {
+    let next_degree = target.min(degree + group_degree);
+    let maximum = binomial[..=group_degree]
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    for value in &mut binomial[..=group_degree] {
+        *value = (*value - maximum).exp();
+    }
+    convolution[..=next_degree].fill(0.0_f64);
+    for (known, &coefficient) in coefficients[..=degree].iter().enumerate() {
+        let added_count = group_degree.min(target - known) + 1;
+        for (added, &mass) in binomial[..added_count].iter().enumerate() {
+            let output = known + added;
+            convolution[output] = coefficient.mul_add(mass, convolution[output]);
+        }
+    }
+    let scale = convolution[..=next_degree]
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max);
+    for index in 0..=next_degree {
+        coefficients[index] = convolution[index] / scale;
+    }
+    (maximum, scale, next_degree)
+}
+
+fn tuple_bits_equal(left: (f64, f64, usize), right: (f64, f64, usize)) -> bool {
+    left.0.to_bits() == right.0.to_bits()
+        && left.1.to_bits() == right.1.to_bits()
+        && left.2 == right.2
+}
+
+fn slice_bits_equal(left: &[f64], right: &[f64]) -> bool {
+    left.iter()
+        .zip(right)
+        .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
 fn deleted_poisson_log_kernel(count: f64, mean: f64) -> f64 {
