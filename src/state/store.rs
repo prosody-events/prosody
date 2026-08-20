@@ -137,7 +137,7 @@ pub trait CellStore: Clone + Send + Sync + 'static {
     /// direction, edges, and limit to present keys.
     ///
     /// This read uses the marker-resolved presence rules on
-    /// [`Self::scan_keys`].
+    /// [`Self::contains_many`].
     fn scan_keys<'a>(
         &'a self,
         collection: &'a CollectionId,
