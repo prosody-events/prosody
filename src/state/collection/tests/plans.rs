@@ -307,7 +307,7 @@ async fn coordinate_plan_fences_after_its_last_item() -> Result<()> {
         .map_err(|e| eyre!("seed: {e}"))?;
 
     let plan = cells
-        .read(async |op| op.coordinates(PlainLayout::CELLS, vec![7_i64]))
+        .read(async |op| op.coordinates(PlainLayout::CELLS, vec![7_i64], Direction::Forward))
         .await;
     let stream = plan.entries();
     futures::pin_mut!(stream);
@@ -395,7 +395,7 @@ fn plan_streams_are_send() -> Result<()> {
             .await;
         assert_send(range.entries());
         let points = cells
-            .read(async |op| op.coordinates(GatedLayout::CELLS, Vec::new()))
+            .read(async |op| op.coordinates(GatedLayout::CELLS, Vec::new(), Direction::Forward))
             .await;
         assert_send(points.entries());
         Ok(())

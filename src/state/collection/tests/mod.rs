@@ -25,7 +25,7 @@ use crate::codec::{I64Codec, I64CodecError};
 use crate::consumer::middleware::RepinProof;
 use crate::loader::MemoryLoader;
 use crate::state::cached::Cached;
-use crate::state::cell_key::CellKey;
+use crate::state::cell_key::{CellKey, Direction};
 use crate::state::descriptor::tests::{session_over, session_with_dirty, value_registry};
 use crate::state::descriptor::{
     CellStateError, Keyed, StateDescriptor, StructuralIdentity, ValueDescriptor, value_state,
@@ -834,7 +834,7 @@ fn empty_coordinate_plan_fences_on_exhaustion() -> Result<()> {
 
         let plan = handle
             .cells
-            .read(async |op| op.coordinates(PairLayout::LEFT, Vec::new()))
+            .read(async |op| op.coordinates(PairLayout::LEFT, Vec::new(), Direction::Forward))
             .await;
         session.reset(RepinProof::for_test()).await;
 

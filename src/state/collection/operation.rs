@@ -100,8 +100,9 @@ impl<'a, S: StateSession, L> ReadOperation<'a, S, L> {
         &self,
         family: CellFamily<L, T>,
         keys: Vec<KeyOf<T>>,
+        dir: Direction,
     ) -> CoordinatePlan<S, T> {
-        CoordinatePlan::new(self.plan_base(family.section()), keys)
+        CoordinatePlan::new(self.plan_base(family.section()), keys, dir)
     }
 
     /// Plans a managed durable range over the whole of `family`'s section, in

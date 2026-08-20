@@ -28,6 +28,7 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use futures::future::Either;
 use futures::stream::{self, Stream, StreamExt};
+use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use tokio::task::coop::cooperative;
@@ -93,6 +94,9 @@ impl<S: StateSession> PlanBase<S> {
 pub(crate) struct CoordinatePlan<S: StateSession, T: CellType> {
     base: PlanBase<S>,
     keys: Vec<KeyOf<T>>,
+    start: ScanEdge<Coordinate>,
+    dir: Direction,
+    end: ScanEdge<Coordinate>,
     limit: Option<NonZeroUsize>,
 }
 
@@ -135,16 +139,58 @@ pub(crate) enum Plan<S: StateSession, T: CellType> {
 }
 
 impl<S: StateSession, T: CellType> Plan<S, T> {
+    /// Sets an inclusive start edge in iteration order.
+    pub(crate) fn from(mut self, coordinate: Coordinate) -> Self {
+        self.set_start(ScanEdge::Included(coordinate));
+        self
+    }
+
+    /// Sets an exclusive start edge in iteration order.
+    pub(crate) fn after(mut self, coordinate: Coordinate) -> Self {
+        self.set_start(ScanEdge::Excluded(coordinate));
+        self
+    }
+
+    /// Sets an inclusive end edge in iteration order.
+    pub(crate) fn to(mut self, coordinate: Coordinate) -> Self {
+        self.set_end(ScanEdge::Included(coordinate));
+        self
+    }
+
+    /// Sets an exclusive end edge in iteration order.
+    pub(crate) fn before(mut self, coordinate: Coordinate) -> Self {
+        self.set_end(ScanEdge::Excluded(coordinate));
+        self
+    }
+
     /// Sets the maximum number of present items that the plan can yield.
     ///
-    /// Both arms accept the limit even though no production caller limits
-    /// entries yet: the shared builder keeps the twin scans symmetric.
+    /// This method keeps the smaller limit. A query cannot widen a collection
+    /// window that already set a limit.
     pub(crate) fn with_limit(mut self, limit: NonZeroUsize) -> Self {
         match &mut self {
-            Self::Points(plan) => plan.limit = Some(limit),
-            Self::Scan(plan) => plan.limit = Some(limit),
+            Self::Points(plan) => {
+                plan.limit = Some(plan.limit.map_or(limit, |current| current.min(limit)));
+            }
+            Self::Scan(plan) => {
+                plan.limit = Some(plan.limit.map_or(limit, |current| current.min(limit)));
+            }
         }
         self
+    }
+
+    fn set_start(&mut self, edge: ScanEdge<Coordinate>) {
+        match self {
+            Self::Points(plan) => plan.start = edge,
+            Self::Scan(plan) => plan.start = intersect_start(plan.dir, &plan.start, edge),
+        }
+    }
+
+    fn set_end(&mut self, edge: ScanEdge<Coordinate>) {
+        match self {
+            Self::Points(plan) => plan.end = edge,
+            Self::Scan(plan) => plan.end = intersect_end(plan.dir, &plan.end, edge),
+        }
     }
 
     /// Drives the planned arm and resolves each live entry.
@@ -170,10 +216,13 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
 
 impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
     /// Builds the plan over the planning invocation's captured state.
-    pub(super) fn new(base: PlanBase<S>, keys: Vec<KeyOf<T>>) -> Self {
+    pub(super) fn new(base: PlanBase<S>, keys: Vec<KeyOf<T>>, dir: Direction) -> Self {
         Self {
             base,
             keys,
+            start: ScanEdge::Unbounded,
+            dir,
+            end: ScanEdge::Unbounded,
             limit: None,
         }
     }
@@ -204,7 +253,8 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
     {
         try_stream! {
-            let Self { base, keys, limit } = self;
+            let Self { base, keys, start, dir, end, limit } = self;
+            let keys = constrained_keys::<T>(keys, dir, start.as_ref(), end.as_ref());
             let base = &base;
             let chunks = stream::unfold((keys.into_iter().peekable(), true), |(mut keys, first)| async move {
                 keys.peek()?; // exhausted ⇒ unfold ends
@@ -261,7 +311,8 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
     /// presence bit for each key.
     fn key_source(self) -> impl Stream<Item = KeyItem<T>> + Send {
         try_stream! {
-            let Self { base, keys, limit } = self;
+            let Self { base, keys, start, dir, end, limit } = self;
+            let keys = constrained_keys::<T>(keys, dir, start.as_ref(), end.as_ref());
             let base = &base;
             let chunks = stream::unfold((keys.into_iter().peekable(), true), |(mut keys, first)| async move {
                 keys.peek()?;
@@ -319,6 +370,51 @@ impl<S: StateSession, T: CellType> CoordinatePlan<S, T> {
     }
 }
 
+fn constrained_keys<T: CellType>(
+    mut keys: Vec<KeyOf<T>>,
+    dir: Direction,
+    start: ScanEdge<&Coordinate>,
+    end: ScanEdge<&Coordinate>,
+) -> Vec<KeyOf<T>> {
+    let start = match (dir, start) {
+        (_, ScanEdge::Unbounded) => 0,
+        (Direction::Forward, ScanEdge::Included(edge)) => {
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) < *edge)
+        }
+        (Direction::Forward, ScanEdge::Excluded(edge)) => {
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) <= *edge)
+        }
+        (Direction::Backward, ScanEdge::Included(edge)) => {
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) > *edge)
+        }
+        (Direction::Backward, ScanEdge::Excluded(edge)) => {
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) >= *edge)
+        }
+    };
+    let end = match (dir, end) {
+        (_, ScanEdge::Unbounded) => keys.len(),
+        (Direction::Forward, ScanEdge::Included(edge)) => {
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) <= *edge)
+        }
+        (Direction::Forward, ScanEdge::Excluded(edge)) => {
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) < *edge)
+        }
+        (Direction::Backward, ScanEdge::Included(edge)) => {
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) >= *edge)
+        }
+        (Direction::Backward, ScanEdge::Excluded(edge)) => {
+            keys.partition_point(|key| <T::Key as OrderedKeyCodec>::encode(key) > *edge)
+        }
+    };
+    if start >= end {
+        keys.clear();
+    } else {
+        keys.truncate(end);
+        keys.drain(..start);
+    }
+    keys
+}
+
 /// Narrows the first tracked chunk to the limit.
 /// Dead tracked keys make later chunks return to full width.
 fn chunk_width(limit: Option<NonZeroUsize>, first: bool) -> usize {
@@ -326,6 +422,67 @@ fn chunk_width(limit: Option<NonZeroUsize>, first: bool) -> usize {
         limit.map_or(CELL_BATCH, |limit| limit.get().min(CELL_BATCH))
     } else {
         CELL_BATCH
+    }
+}
+
+fn intersect_start(
+    dir: Direction,
+    current: &ScanEdge<Coordinate>,
+    requested: ScanEdge<Coordinate>,
+) -> ScanEdge<Coordinate> {
+    match dir {
+        Direction::Forward => intersect_lower(current.clone(), requested),
+        Direction::Backward => intersect_upper(current.clone(), requested),
+    }
+}
+
+fn intersect_end(
+    dir: Direction,
+    current: &ScanEdge<Coordinate>,
+    requested: ScanEdge<Coordinate>,
+) -> ScanEdge<Coordinate> {
+    match dir {
+        Direction::Forward => intersect_upper(current.clone(), requested),
+        Direction::Backward => intersect_lower(current.clone(), requested),
+    }
+}
+
+fn intersect_lower(
+    left: ScanEdge<Coordinate>,
+    right: ScanEdge<Coordinate>,
+) -> ScanEdge<Coordinate> {
+    intersect_edge(left, right, Ordering::Greater)
+}
+
+fn intersect_upper(
+    left: ScanEdge<Coordinate>,
+    right: ScanEdge<Coordinate>,
+) -> ScanEdge<Coordinate> {
+    intersect_edge(left, right, Ordering::Less)
+}
+
+fn intersect_edge(
+    left: ScanEdge<Coordinate>,
+    right: ScanEdge<Coordinate>,
+    tighter: Ordering,
+) -> ScanEdge<Coordinate> {
+    let (left_coordinate, left_excluded) = match &left {
+        ScanEdge::Included(coordinate) => (coordinate, false),
+        ScanEdge::Excluded(coordinate) => (coordinate, true),
+        ScanEdge::Unbounded => return right,
+    };
+    let (right_coordinate, right_excluded) = match &right {
+        ScanEdge::Included(coordinate) => (coordinate, false),
+        ScanEdge::Excluded(coordinate) => (coordinate, true),
+        ScanEdge::Unbounded => return left,
+    };
+    match left_coordinate.cmp(right_coordinate) {
+        Ordering::Equal if left_excluded || right_excluded => {
+            ScanEdge::Excluded(left_coordinate.clone())
+        }
+        Ordering::Equal => ScanEdge::Included(left_coordinate.clone()),
+        order if order == tighter => left,
+        _ => right,
     }
 }
 

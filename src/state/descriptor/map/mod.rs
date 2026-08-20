@@ -77,7 +77,7 @@ use crate::codec::{Codec, JsonCodec};
 use crate::error::{ClassifyError, ErrorCategory};
 #[cfg(test)]
 use crate::state::cell_key::CellKey;
-use crate::state::cell_key::{Coordinate, Direction};
+use crate::state::cell_key::{Coordinate, Direction, ScanEdge};
 use crate::state::collection::{
     Collection, CollectionLayout, CollectionRead, CollectionWrite, JOURNAL_INLINE, Plan,
     StateSession, WritableStateSession, collection_layout, collection_methods, same_token,
@@ -421,6 +421,8 @@ pub struct MapHandle<S, KC, V> {
 pub struct MapQuery<'a, S, KC, V> {
     handle: &'a MapHandle<S, KC, V>,
     dir: Direction,
+    start: ScanEdge<Coordinate>,
+    end: ScanEdge<Coordinate>,
     limit: Option<NonZeroUsize>,
 }
 
@@ -431,6 +433,23 @@ where
     KC::Key: Display,
     V: CellType<Key = UnitKey>,
 {
+    fn constrain(&self, mut plan: Plan<S, Keyed<KC, V>>) -> Plan<S, Keyed<KC, V>> {
+        plan = match &self.start {
+            ScanEdge::Included(start) => plan.from(start.clone()),
+            ScanEdge::Excluded(start) => plan.after(start.clone()),
+            ScanEdge::Unbounded => plan,
+        };
+        plan = match &self.end {
+            ScanEdge::Included(end) => plan.to(end.clone()),
+            ScanEdge::Excluded(end) => plan.before(end.clone()),
+            ScanEdge::Unbounded => plan,
+        };
+        match self.limit {
+            Some(limit) => plan.with_limit(limit),
+            None => plan,
+        }
+    }
+
     /// Sets the maximum number of present items that the stream yields.
     /// Absent rows are free. Fetch sizing cannot change an answer.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
@@ -458,10 +477,7 @@ where
             // Init: `stream_plan` reads the keyset under an admission it drops
             // as it returns, before this `?` observes the result.
             let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let plan = match self.limit {
-                Some(limit) => plan.with_limit(limit),
-                None => plan,
-            };
+            let plan = self.constrain(plan);
             let inner = plan.entries();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
@@ -479,10 +495,7 @@ where
         );
         try_stream! {
             let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
-            let plan = match self.limit {
-                Some(limit) => plan.with_limit(limit),
-                None => plan,
-            };
+            let plan = self.constrain(plan);
             let inner = plan.keys();
             futures::pin_mut!(inner);
             while let Some(item) = inner.next().instrument(span.clone()).await {
@@ -712,7 +725,7 @@ where
     ///
     /// A keyset-read access error propagates. It never silently degrades.
     #[read(op)]
-    async fn stream_plan(
+    pub(crate) async fn stream_plan(
         &self,
         dir: Direction,
     ) -> Result<Plan<S, Keyed<KC, V>>, MapStateError<CellCodecError<V>>> {
@@ -720,9 +733,11 @@ where
             // Absent ⇒ no live entries: an empty tracked plan — zero
             // coordinates, so zero point gets and no scan.
             PriorKeyset::Absent => {
-                return Ok(Plan::Points(
-                    op.coordinates(MapKind::<KC, V>::ENTRIES, Vec::new()),
-                ));
+                return Ok(Plan::Points(op.coordinates(
+                    MapKind::<KC, V>::ENTRIES,
+                    Vec::new(),
+                    dir,
+                )));
             }
             // Overflowed falls to the scan with no warning; Malformed already
             // warned in `read_keyset_state`.
@@ -752,9 +767,11 @@ where
         if dir == Direction::Backward {
             keys.reverse();
         }
-        Ok(Plan::Points(
-            op.coordinates(MapKind::<KC, V>::ENTRIES, keys),
-        ))
+        Ok(Plan::Points(op.coordinates(
+            MapKind::<KC, V>::ENTRIES,
+            keys,
+            dir,
+        )))
     }
 
     /// Streams the live entries in key order — ascending for
@@ -824,6 +841,8 @@ where
         MapQuery {
             handle: self,
             dir,
+            start: ScanEdge::Unbounded,
+            end: ScanEdge::Unbounded,
             limit: None,
         }
     }

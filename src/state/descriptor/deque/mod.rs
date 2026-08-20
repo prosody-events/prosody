@@ -380,7 +380,7 @@ where
     /// An empty window gives an empty point-get plan. It does zero reads, and
     /// its exhaustion still passes the stream fence.
     #[read(op)]
-    async fn stream_plan(
+    pub(crate) async fn stream_plan(
         &self,
         dir: Direction,
     ) -> Result<Plan<S, Keyed<I64KeyCodec, T>>, DequeStateError<CellCodecError<T>>> {
@@ -426,9 +426,11 @@ where
         if dir == Direction::Backward {
             indices.reverse();
         }
-        Ok(Plan::Points(
-            op.coordinates(DequeKind::<T>::ENTRIES, indices),
-        ))
+        Ok(Plan::Points(op.coordinates(
+            DequeKind::<T>::ENTRIES,
+            indices,
+            dir,
+        )))
     }
 
     /// Streams the live elements in index order — front to back for
