@@ -766,6 +766,10 @@ fn shared_boundary_micros(
     next_micros
 }
 
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "evaluate_prepared_trajectory")
+)]
 pub(crate) fn evaluate_prepared_trajectory<Unit>(
     cohorts: &WorkCohorts<Unit>,
     trajectory: &SupplyTrajectory<'_>,

@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::ops::Range;
 use std::time::Duration;
 
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
@@ -2374,6 +2375,10 @@ fn sampled_membership_ready(
     )
 }
 
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "sample_moved_partition_prefix")
+)]
 fn sample_moved_partition_prefix(
     state: &ScaleState,
     workspace: &mut ScenarioWorkspace,
@@ -2553,12 +2558,9 @@ fn partition_deadline_outcomes(
         let mut candidate_late = 0.0_f64;
         for replica in 0..replica_count {
             workspace.placement_cohorts.clear();
-            for partition in 0..shared.partition_count {
-                if balanced_partition_owner(shared.partition_count, replica_count, partition)
-                    != replica
-                {
-                    continue;
-                }
+            for partition in
+                balanced_partition_range(shared.partition_count, replica_count, replica)
+            {
                 let first = shared.partition_offsets[partition] as usize;
                 let last = shared.partition_offsets[partition + 1] as usize;
                 for &cohort_index in &shared.partition_cohort_indexes[first..last] {
@@ -2599,6 +2601,7 @@ fn partition_deadline_outcomes(
     }
 }
 
+#[cfg(test)]
 fn balanced_partition_owner(partitions: usize, replicas: usize, partition: usize) -> usize {
     let base = partitions / replicas;
     let remainder = partitions % replicas;
@@ -2608,6 +2611,14 @@ fn balanced_partition_owner(partitions: usize, replicas: usize, partition: usize
     } else {
         remainder + (partition - wide_end) / base
     }
+}
+
+fn balanced_partition_range(partitions: usize, replicas: usize, replica: usize) -> Range<usize> {
+    let base = partitions / replicas;
+    let remainder = partitions % replicas;
+    let first = replica * base + replica.min(remainder);
+    let width = base + usize::from(replica < remainder);
+    first..first + width
 }
 
 fn prepare_candidate_concurrency(state: &ScaleState, scratch: &mut ScaleScratch) {

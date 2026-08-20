@@ -1,7 +1,10 @@
 use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
-use super::{SCHEDULED_PARTITION, prepare_work_cohorts, scenario_event_count, scenario_horizons};
+use super::{
+    SCHEDULED_PARTITION, balanced_partition_owner, balanced_partition_range, prepare_work_cohorts,
+    scenario_event_count, scenario_horizons,
+};
 use crate::edf::ArrivalPath;
 use crate::types::EventCohorts;
 use crate::{
@@ -10,6 +13,23 @@ use crate::{
     PosteriorError, PosteriorQuery, RebalancePrior, ReliabilityPrior, ScaleScratch, ScaleState,
     ScheduledRelease, ServiceObjective,
 };
+
+#[quickcheck]
+fn balanced_partition_ranges_match_owner_order(partition_seed: u8, replica_seed: u8) -> bool {
+    let partition_count = usize::from(partition_seed % 64 + 1);
+    let replica_count = usize::from(replica_seed % 64 + 1).min(partition_count);
+    (0..replica_count).all(|replica| {
+        (0..partition_count)
+            .filter(|partition| {
+                balanced_partition_owner(partition_count, replica_count, *partition) == replica
+            })
+            .eq(balanced_partition_range(
+                partition_count,
+                replica_count,
+                replica,
+            ))
+    })
+}
 
 #[test]
 fn report_views_match_the_fixed_model_contract() -> Result<(), TestError> {
