@@ -2,12 +2,93 @@ use super::{
     ArrivalSchedule, ArrivalSeries, CALENDAR_PRIOR_RATE_SECONDS, CALENDAR_PRIOR_SHAPE,
     HISTORICAL_SCHEDULE, HISTORY_EVENT_COUNT_MAX, HistoricalSeries, IndexSeries,
     PrincipalDefinition, PrincipalRegime, RunSchedule, RunStopReason, SEASONAL_SCHEDULE,
-    SharedResourcePolicy, StopCondition, format_clock, resource_attempt_count_max,
-    run_principal_definition, run_principal_regime_seeded,
+    SharedResourcePolicy, StopCondition, capacity_regime_axes, format_clock, replica_count_max,
+    resource_attempt_count_max, run_principal_definition, run_principal_regime_seeded,
 };
 use crate::model::{AttemptFrame, AttemptModel};
 use crate::{ConcurrencyLatencyCurve, PlantError, PrincipalRunError, SeriesCell};
 use quickcheck_macros::quickcheck;
+use std::time::Duration;
+
+#[test]
+fn capacity_regime_service_truth_is_inside_its_axis() {
+    for regime in [
+        PrincipalRegime::LinearThroughput,
+        PrincipalRegime::FlatPostKnee,
+        PrincipalRegime::DecliningPostKnee,
+    ] {
+        let definition = PrincipalDefinition::capacity_evidence(regime);
+        let truth = attempt_service_seconds(definition);
+        let (service_axis, _) = capacity_regime_axes(regime, None);
+        assert!(
+            service_axis
+                .first()
+                .zip(service_axis.last())
+                .is_some_and(|(low, high)| *low < truth && truth < *high)
+        );
+    }
+}
+
+#[test]
+fn linear_true_service_knees_are_below_the_driven_concurrency() {
+    let regime = PrincipalRegime::LinearThroughput;
+    let definition = PrincipalDefinition::capacity_evidence(regime);
+    let truth = attempt_service_seconds(definition);
+    let maximum = maximum_evidence_concurrency(regime, definition);
+    let (service_axis, capacity_axis) = capacity_regime_axes(regime, None);
+
+    assert!(
+        service_axis
+            .iter()
+            .any(|service| service.to_bits() == truth.to_bits())
+    );
+    assert!(
+        capacity_axis
+            .iter()
+            .all(|capacity| capacity * truth < maximum)
+    );
+}
+
+#[test]
+fn collapse_regime_fleets_exceed_the_physical_knee() {
+    for regime in [
+        PrincipalRegime::FlatPostKnee,
+        PrincipalRegime::DecliningPostKnee,
+    ] {
+        let definition = PrincipalDefinition::capacity_evidence(regime);
+        let fleet_slots = replica_count_max(regime, definition.experiment)
+            * crate::DEFAULT_CONCURRENCY_PER_REPLICA;
+        assert!(fleet_slots > definition.inputs.shared_resource.parallelism);
+    }
+}
+
+fn attempt_service_seconds(definition: PrincipalDefinition) -> f64 {
+    let resource = definition.inputs.shared_resource;
+    let resource_micros = u64::from(resource.parallelism)
+        .saturating_mul(1_000_000)
+        .div_ceil(u64::from(resource.capacity_per_second));
+    Duration::from_micros(resource_micros.saturating_add(definition.inputs.handler_micros))
+        .as_secs_f64()
+}
+
+fn maximum_evidence_concurrency(regime: PrincipalRegime, definition: PrincipalDefinition) -> f64 {
+    let ArrivalSeries::StaircaseRate {
+        initial_per_second,
+        increment_per_second,
+        step_interval_micros,
+        ..
+    } = definition.inputs.messages
+    else {
+        return f64::NAN;
+    };
+    let final_micros = definition.schedule.workload_end_micros.saturating_sub(1);
+    let steps = u32::try_from(final_micros / step_interval_micros).map_or(u32::MAX, |value| value);
+    let rate = initial_per_second.saturating_add(increment_per_second.saturating_mul(steps));
+    let demand_concurrency = f64::from(rate) * attempt_service_seconds(definition);
+    let fleet_slots =
+        replica_count_max(regime, definition.experiment) * crate::DEFAULT_CONCURRENCY_PER_REPLICA;
+    demand_concurrency.min(f64::from(fleet_slots))
+}
 
 #[test]
 fn progress_clock_formats_boundaries() {

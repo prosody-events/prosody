@@ -46,6 +46,10 @@ const CAPACITY_RESPONSE_EVENT_COUNT: u32 = 231_000;
 const LINEAR_RESPONSE_EVENT_COUNT: u32 = 462_000;
 const LINEAR_STEP_MICROS: u64 = 180_000_000;
 const LINEAR_RATE_INCREMENT: u32 = 100;
+const LINEAR_CAPACITY_SERVICE_SECONDS: &[f64] = &[0.0505_f64, 0.101_f64, 0.202_f64];
+const LINEAR_CAPACITY_PER_SECOND: &[f64] = &[80.0_f64, 320.0_f64, 640.0_f64];
+const COLLAPSE_CAPACITY_SERVICE_SECONDS: &[f64] = &[0.101_f64, 0.202_f64, 0.404_f64];
+const COLLAPSE_CAPACITY_PER_SECOND: &[f64] = &[80.0_f64, 320.0_f64, 600.0_f64];
 const HISTORY_EVENT_COUNT_MAX: u32 = 240_000;
 const CALENDAR_HISTORY_EXPOSURE_SECONDS: u32 = 900;
 const IDLE_COST_START_MICROS: u64 = 91_000_000;
@@ -1362,12 +1366,14 @@ fn validate_capacity_evidence(
         )?;
     }
     match regime {
-        PrincipalRegime::LinearThroughput => require_regime(
-            final_no_knee_probability(run) >= 0.95_f64,
-            regime,
-            experiment,
-            "the linear capacity belief lost its no-knee mass",
-        )?,
+        PrincipalRegime::LinearThroughput => {
+            require_regime(
+                final_no_knee_probability(run) >= 0.95_f64,
+                regime,
+                experiment,
+                "the linear capacity belief lost its no-knee mass",
+            )?;
+        }
         PrincipalRegime::FlatPostKnee => {
             require_regime(
                 final_no_knee_probability(run) <= 0.01_f64,
@@ -1622,7 +1628,7 @@ fn principal_graph(
     slots_per_replica: u32,
     sensitivity: Option<CapacitySensitivity>,
 ) -> Result<ClosedLoop<PrincipalGraph>, PrincipalRunError> {
-    let replica_count_max = replica_count_max(regime);
+    let replica_count_max = replica_count_max(regime, definition.experiment);
     let report_interval_micros = definition
         .schedule
         .workload_interval_micros
@@ -1687,9 +1693,14 @@ fn principal_graph(
     }
 }
 
-const fn replica_count_max(regime: PrincipalRegime) -> u32 {
+const fn replica_count_max(regime: PrincipalRegime, experiment: RegimeExperiment) -> u32 {
     match regime {
         PrincipalRegime::LinearThroughput => 6,
+        PrincipalRegime::FlatPostKnee | PrincipalRegime::DecliningPostKnee
+            if matches!(experiment, RegimeExperiment::CapacityEvidence) =>
+        {
+            4
+        }
         PrincipalRegime::FlatPostKnee
         | PrincipalRegime::DecliningPostKnee
         | PrincipalRegime::HotSerializedKey
@@ -1769,7 +1780,7 @@ fn capacity_grid(
             &[64_000.0_f64, 128_000.0_f64, 256_000.0_f64],
         )
     } else if capacity_regime {
-        capacity_sensitivity_axes(sensitivity)
+        capacity_regime_axes(regime, sensitivity)
     } else {
         // Every step stays within the capacity model's two-octave cell
         // bound. The nine original anchors remain grid points.
@@ -1818,6 +1829,22 @@ fn capacity_sensitivity_axes(
             | CapacitySensitivity::ReferencePrior
             | CapacitySensitivity::LowerGridCeiling,
         ) => (SERVICE_REFERENCE, CAPACITY_REFERENCE),
+    }
+}
+
+fn capacity_regime_axes(
+    regime: PrincipalRegime,
+    sensitivity: Option<CapacitySensitivity>,
+) -> (&'static [f64], &'static [f64]) {
+    match (regime, sensitivity) {
+        (PrincipalRegime::LinearThroughput, None) => {
+            (LINEAR_CAPACITY_SERVICE_SECONDS, LINEAR_CAPACITY_PER_SECOND)
+        }
+        (PrincipalRegime::FlatPostKnee | PrincipalRegime::DecliningPostKnee, None) => (
+            COLLAPSE_CAPACITY_SERVICE_SECONDS,
+            COLLAPSE_CAPACITY_PER_SECOND,
+        ),
+        _ => capacity_sensitivity_axes(sensitivity),
     }
 }
 
@@ -2566,6 +2593,7 @@ struct PrincipalDefinition {
     schedule: RunSchedule,
     event_count_max: u32,
     initial_replicas: u32,
+    experiment: RegimeExperiment,
 }
 
 impl PrincipalDefinition {
@@ -2671,7 +2699,7 @@ impl PrincipalDefinition {
     }
 
     fn capacity_evidence(regime: PrincipalRegime) -> Self {
-        Self::for_regime(regime)
+        let mut definition = Self::for_regime(regime)
             .messages(ArrivalSeries::StaircaseRate {
                 initial_per_second: 100,
                 increment_per_second: 400,
@@ -2679,7 +2707,9 @@ impl PrincipalDefinition {
                 count_max: CAPACITY_EVENT_COUNT_MAX,
             })
             .launch_delay(LaunchDelaySeries::Immediate)
-            .schedule(RunSchedule::extended_capacity_evidence())
+            .schedule(RunSchedule::extended_capacity_evidence());
+        definition.experiment = RegimeExperiment::CapacityEvidence;
+        definition
     }
 
     const fn standard() -> Self {
@@ -2706,6 +2736,7 @@ impl PrincipalDefinition {
             schedule: RunSchedule::standard(),
             event_count_max: EVENT_COUNT,
             initial_replicas: 8,
+            experiment: RegimeExperiment::ClosedLoop,
         }
     }
 
@@ -2733,6 +2764,7 @@ impl PrincipalDefinition {
             schedule: RunSchedule::capacity_evidence(),
             event_count_max: CAPACITY_EVENT_COUNT_MAX,
             initial_replicas: 1,
+            experiment: RegimeExperiment::ClosedLoop,
         }
     }
 
