@@ -734,11 +734,7 @@ impl CapacityFactor {
         let filter_curve_count = filter_count
             .checked_mul(cell_count)
             .ok_or(CapacityModelError::StorageBound)?;
-        let transition_count = usize::try_from(attempt_count_max)
-            .map_err(|_| CapacityModelError::StorageBound)?
-            .checked_mul(2)
-            .and_then(|count| count.checked_add(1))
-            .ok_or(CapacityModelError::StorageBound)?;
+        let transition_count = attempt_transition_count(attempt_count_max)?;
         validate_capacity_allocation(
             &grid,
             &artifact,
@@ -1710,19 +1706,12 @@ fn validate_capacity_allocation(
     allocation: CapacityAllocation,
     exposure_seconds: f64,
 ) -> Result<(), CapacityModelError> {
-    let storage_bytes = capacity_storage_bytes(
-        allocation.filter_curve_count,
-        allocation.cell_count,
-        allocation.filter_count,
-        allocation.state_count,
-        allocation.transition_count,
-        allocation.start_history_capacity,
-    )?
-    .checked_add(
-        capacity_grid_storage_bytes(allocation.cell_count, grid.knee_cell_count as usize)
-            .ok_or(CapacityModelError::StorageBound)?,
-    )
-    .ok_or(CapacityModelError::StorageBound)?;
+    let storage_bytes = capacity_storage_bytes(allocation)?
+        .checked_add(
+            capacity_grid_storage_bytes(allocation.cell_count, grid.knee_cell_count as usize)
+                .ok_or(CapacityModelError::StorageBound)?,
+        )
+        .ok_or(CapacityModelError::StorageBound)?;
     let storage_bytes = artifact
         .coverage
         .len()
@@ -1850,14 +1839,16 @@ fn uniformization_term_count_bound(mean: f64, tail_bound: f64) -> Option<u32> {
     term.checked_add(1)
 }
 
-fn capacity_storage_bytes(
-    filter_curve_count: usize,
-    cell_count: usize,
-    filter_count: usize,
-    state_count: usize,
-    transition_count: usize,
-    start_history_capacity: usize,
-) -> Result<usize, CapacityModelError> {
+fn capacity_storage_bytes(allocation: CapacityAllocation) -> Result<usize, CapacityModelError> {
+    let CapacityAllocation {
+        filter_curve_count,
+        cell_count,
+        filter_count,
+        state_count,
+        transition_count,
+        start_history_capacity,
+        ..
+    } = allocation;
     filter_curve_count
         .checked_add(
             cell_count
@@ -1888,6 +1879,17 @@ fn capacity_storage_bytes(
         })
         .and_then(|bytes| bytes.checked_add(size_of::<u32>()))
         .ok_or(CapacityModelError::StorageBound)
+}
+
+/// Derives the transition buffer length from the attempt cap.
+fn attempt_transition_count(attempt_count_max: u32) -> Result<usize, CapacityModelError> {
+    let attempt_count =
+        usize::try_from(attempt_count_max).map_err(|_| CapacityModelError::StorageBound)?;
+    let transition_count = attempt_count
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(1))
+        .ok_or(CapacityModelError::StorageBound)?;
+    Ok(transition_count)
 }
 
 fn capacity_grid_storage_bytes(cell_count: usize, knee_cell_count: usize) -> Option<usize> {
@@ -3054,9 +3056,7 @@ fn completion_log_likelihood(
             let probability = overlap / start_window.exposure_seconds;
             if probability > 0.0_f64 && probability < 1.0_f64 {
                 let group_degree = (starts as usize).min(target);
-                for (count, value) in binomial[..=group_degree].iter_mut().enumerate() {
-                    *value = binomial_log_probability(starts, count, probability);
-                }
+                write_binomial_log_masses(starts, probability, group_degree, binomial);
                 let (maximum, scale, next_degree) = dispatch!(simd_level, simd => completion_group_convolution(
                     simd,
                     coefficients,
@@ -3086,6 +3086,21 @@ fn completion_log_likelihood(
     )
 }
 
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "binomial_mass_generation")
+)]
+fn write_binomial_log_masses(
+    starts: u32,
+    probability: f64,
+    group_degree: usize,
+    output: &mut [f64],
+) {
+    for (mass_index, value) in output[..=group_degree].iter_mut().enumerate() {
+        *value = binomial_log_probability(starts, mass_index, probability);
+    }
+}
+
 fn completion_group_convolution<S: Simd>(
     simd: S,
     coefficients: &mut [f64],
@@ -3098,10 +3113,7 @@ fn completion_group_convolution<S: Simd>(
     let next_degree = target.min(degree + group_degree);
     // Log masses are finite or negative infinity, and convolutions contain
     // non-negative products. Neither maximum scan can contain NaN.
-    let maximum = vector_max(simd, &binomial[..=group_degree], f64::NEG_INFINITY);
-    for value in &mut binomial[..=group_degree] {
-        *value = (*value - maximum).exp();
-    }
+    let maximum = exponentiate_log_masses(simd, &mut binomial[..=group_degree]);
     convolution[..=target].fill(0.0_f64);
     for known in 0..=degree {
         let added_count = group_degree.min(target - known) + 1;
@@ -3120,6 +3132,15 @@ fn completion_group_convolution<S: Simd>(
         scale,
     );
     (maximum, scale, next_degree)
+}
+
+#[cfg_attr(feature = "hotpath", hotpath::measure(label = "mass_exponentiation"))]
+fn exponentiate_log_masses<S: Simd>(simd: S, values: &mut [f64]) -> f64 {
+    let maximum = vector_max(simd, values, f64::NEG_INFINITY);
+    for value in values {
+        *value = (*value - maximum).exp();
+    }
+    maximum
 }
 
 fn convolution_axpy<S: Simd>(simd: S, coefficient: f64, values: &[f64], output: &mut [f64]) {
@@ -3276,6 +3297,10 @@ fn completion_log_likelihood_reference(
     )
 }
 
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "completion_probability_from_coefficients")
+)]
 fn completion_probability_from_coefficients(
     coefficients: &[f64],
     degree: usize,
