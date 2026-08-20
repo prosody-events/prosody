@@ -20,8 +20,11 @@ use crate::{
 const WIDTH: u32 = 1_240;
 const PANEL_HEIGHT: u32 = 340;
 const PANEL_COUNT: u32 = 19;
-const LABEL_SPAN_DIVISOR: u64 = 3;
 const LABEL_GAP_FRACTION: f64 = 0.08_f64;
+const LABEL_FONT_PIXELS: u32 = 19;
+const CHART_MARGIN_LEFT: u32 = 12;
+const CHART_MARGIN_RIGHT: u32 = 16;
+const COLOR_KEY_WIDTH: u32 = 90;
 const STORY_FILES: [&str; PANEL_COUNT as usize] = [
     "01-demand.svg",
     "02-backlog.svg",
@@ -112,7 +115,11 @@ fn draw_panel<Backend: DrawingBackend>(
     area: &DrawingArea<Backend, Shift>,
     panel: &StoryPanel,
 ) -> Result<(), DrawingAreaErrorKind<Backend::ErrorType>> {
-    let key_width = if panel.heatmap.is_some() { 90 } else { 0 };
+    let key_width = if panel.heatmap.is_some() {
+        COLOR_KEY_WIDTH
+    } else {
+        0
+    };
     let (chart_area, key_area) =
         area.split_horizontally(area.dim_in_pixel().0.saturating_sub(key_width));
     let final_micros = panel
@@ -126,11 +133,10 @@ fn draw_panel<Backend: DrawingBackend>(
         })
         .unwrap_or(1)
         .max(1);
-    let label_span = final_micros.div_ceil(LABEL_SPAN_DIVISOR);
     let (minimum, maximum) = panel_bounds(panel);
     let mut chart = ChartBuilder::on(&chart_area)
-        .margin_left(12_u32)
-        .margin_right(16_u32)
+        .margin_left(CHART_MARGIN_LEFT)
+        .margin_right(CHART_MARGIN_RIGHT)
         .margin_top(8_u32)
         .margin_bottom(4_u32)
         .x_label_area_size(48_u32)
@@ -156,13 +162,7 @@ fn draw_panel<Backend: DrawingBackend>(
         .draw()?;
     let label_positions = label_positions(panel, minimum, maximum);
     draw_heatmap_layer(&mut chart, panel, final_micros)?;
-    draw_series_layers(
-        &mut chart,
-        panel,
-        &label_positions,
-        final_micros,
-        label_span,
-    )?;
+    draw_series_layers(&mut chart, panel, &label_positions)?;
     draw_annotations(&mut chart, panel, minimum, maximum)?;
     if panel.heatmap.is_some() {
         draw_color_key(&key_area)?;
@@ -174,9 +174,9 @@ fn draw_series_layers<Backend: DrawingBackend>(
     chart: &mut ChartContext<'_, Backend, Cartesian2d<RangedCoordu64, RangedCoordf64>>,
     panel: &StoryPanel,
     label_positions: &[Option<f64>],
-    final_micros: u64,
-    label_span: u64,
 ) -> Result<(), DrawingAreaErrorKind<Backend::ErrorType>> {
+    let (plot_left, plot_right) = story_plot_horizontal_bounds(panel);
+    let preferred_label_x = plot_left + (plot_right - plot_left) * 2_i32 / 3_i32;
     for (index, series) in panel.series.iter().enumerate() {
         let semantic = semantic_style(&series.label);
         let color = match series.style {
@@ -223,13 +223,7 @@ fn draw_series_layers<Backend: DrawingBackend>(
             )?;
         }
         if let Some(label_y) = label_positions[index] {
-            draw_label(
-                chart,
-                series,
-                color,
-                final_micros.saturating_sub(label_span),
-                label_y,
-            )?;
+            draw_label(chart, series, color, preferred_label_x, plot_left, label_y)?;
         }
     }
     Ok(())
@@ -278,23 +272,46 @@ fn draw_label<Backend: DrawingBackend>(
     chart: &mut ChartContext<'_, Backend, Cartesian2d<RangedCoordu64, RangedCoordf64>>,
     series: &StorySeries,
     color: RGBColor,
-    label_x: u64,
+    preferred_x: i32,
+    plot_left: i32,
     label_y: f64,
 ) -> Result<(), DrawingAreaErrorKind<Backend::ErrorType>> {
     let Some(index) = meaningful_index(&series.values) else {
         return Ok(());
     };
     let point = (series.at_micros[index], series.values[index]);
-    chart.draw_series(once(PathElement::new(
-        vec![point, (label_x, label_y)],
+    let text = series_label_text(series, point.1);
+    let plotting_area = chart.plotting_area();
+    let point_pixel = plotting_area.map_coordinate(&point);
+    let label_y_pixel = plotting_area.map_coordinate(&(point.0, label_y)).1;
+    let label_x = label_x_anchor(&text, LABEL_FONT_PIXELS, preferred_x, plot_left);
+    let screen = plotting_area.use_screen_coord();
+    screen.draw(&PathElement::new(
+        vec![point_pixel, (label_x, label_y_pixel)],
         color.stroke_width(1),
-    )))?;
-    chart.draw_series(once(Text::new(
-        format!("{} {}", series.label, panel_value_label(series, point.1)),
-        (label_x, label_y),
-        (PLOT_FONT_FAMILY, 19_i32).into_font().color(&color),
-    )))?;
+    ))?;
+    screen.draw(&Text::new(
+        text,
+        (label_x, label_y_pixel),
+        (PLOT_FONT_FAMILY, LABEL_FONT_PIXELS)
+            .into_font()
+            .color(&color),
+    ))?;
     Ok(())
+}
+
+fn series_label_text(series: &StorySeries, value: f64) -> String {
+    format!("{} {}", series.label, panel_value_label(series, value))
+}
+
+fn label_x_anchor(text: &str, font_pixels: u32, preferred_x: i32, plot_left: i32) -> i32 {
+    let mut anchor = preferred_x.max(plot_left);
+    while anchor > plot_left
+        && !label_inside_image((WIDTH, PANEL_HEIGHT), (anchor, 8_i32), text, font_pixels)
+    {
+        anchor -= 1_i32;
+    }
+    anchor
 }
 
 fn meaningful_index(values: &[f64]) -> Option<usize> {
@@ -1090,18 +1107,20 @@ impl StoryPanel {
     }
 
     fn clipped_label(&self) -> Option<String> {
-        let longest = self
-            .series
-            .iter()
-            .map(|series| series.label.as_str())
-            .max_by_key(|label| label.len())
-            .map_or("", |label| label);
-        let x = WIDTH.saturating_mul(2).saturating_div(3);
-        let Ok(x) = i32::try_from(x) else {
-            return Some(longest.to_owned());
-        };
-        (!label_inside_image((WIDTH, PANEL_HEIGHT), (x, 8_i32), longest, 19))
-            .then(|| longest.to_owned())
+        let (plot_left, plot_right) = story_plot_horizontal_bounds(self);
+        let preferred_x = plot_left + (plot_right - plot_left) * 2_i32 / 3_i32;
+        self.series.iter().find_map(|series| {
+            let index = meaningful_index(&series.values)?;
+            let text = series_label_text(series, series.values[index]);
+            let anchor = label_x_anchor(&text, LABEL_FONT_PIXELS, preferred_x, plot_left);
+            (!label_inside_image(
+                (WIDTH, PANEL_HEIGHT),
+                (anchor, 8_i32),
+                &text,
+                LABEL_FONT_PIXELS,
+            ))
+            .then_some(text)
+        })
     }
 
     fn with_horizon(mut self, horizon_micros: u64) -> Self {
@@ -1122,6 +1141,23 @@ impl StoryPanel {
         self.heatmap = Some(heatmap);
         self
     }
+}
+
+fn story_plot_horizontal_bounds(panel: &StoryPanel) -> (i32, i32) {
+    let key_width = if panel.heatmap.is_some() {
+        COLOR_KEY_WIDTH
+    } else {
+        0
+    };
+    let y_label_width = label_margin(panel.series.iter().map(|series| series.label.len()));
+    let left = CHART_MARGIN_LEFT.saturating_add(y_label_width);
+    let right = WIDTH
+        .saturating_sub(key_width)
+        .saturating_sub(CHART_MARGIN_RIGHT);
+    (
+        i32::try_from(left).map_or(i32::MAX, |value| value),
+        i32::try_from(right).map_or(i32::MAX, |value| value),
+    )
 }
 
 fn story_section(index: usize) -> ReportSection {
@@ -1282,4 +1318,43 @@ fn deduplicate_series(series: Vec<StorySeries>) -> Vec<StorySeries> {
         }
     }
     distinct
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StoryPanel, StorySeries};
+
+    #[test]
+    fn merged_story_label_moves_inside_panel() {
+        let panel = StoryPanel::new(
+            "replicas",
+            vec![
+                StorySeries::new(
+                    "historical replicas",
+                    vec![0, 1_000_000],
+                    vec![12.0_f64, 12.0_f64],
+                ),
+                StorySeries::new(
+                    "experiment target",
+                    vec![0, 1_000_000],
+                    vec![12.0_f64, 12.0_f64],
+                ),
+            ],
+        );
+
+        assert_eq!(
+            panel.series[0].label,
+            "historical replicas = experiment target"
+        );
+        assert_eq!(panel.clipped_label(), None);
+    }
+
+    #[test]
+    fn story_label_wider_than_panel_stays_clipped() {
+        let mut series = StorySeries::new("wide", vec![0], vec![1.0_f64]);
+        series.label = "wide label ".repeat(200);
+        let panel = StoryPanel::new("replicas", vec![series]);
+
+        assert!(panel.clipped_label().is_some());
+    }
 }
