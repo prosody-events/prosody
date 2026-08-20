@@ -1,10 +1,11 @@
 use std::cmp::Ordering;
+use std::iter::repeat;
 
 use prosody_scale_core::{
     ArrivalPrior, ArrivalPriorError, CapacityGrid, Configuration as ControllerConfiguration,
     LaunchPrior, PosteriorQuery, RandomStream, RebalancePrior, ReliabilityPrior, ServiceObjective,
 };
-use quickcheck::{Arbitrary, Gen};
+use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use rayon::prelude::*;
 use thiserror::Error;
@@ -140,7 +141,16 @@ fn incremental_virtual_time_matches_one_shot_replay() -> Result<(), TestError> {
     assert_eq!(snapshot.released, 2);
     assert_eq!(snapshot.settled, 0);
     let mut partition_backlog = [0_u32; 4];
-    incremental.write_partition_normal_backlog(1_500, &mut partition_backlog)?;
+    let mut normal_release = [0_u64; 4];
+    let mut failure_backlog = [0_u32; 4];
+    let mut failure_release = [0_u64; 4];
+    incremental.write_partition_backlogs(
+        1_500,
+        &mut partition_backlog,
+        &mut normal_release,
+        &mut failure_backlog,
+        &mut failure_release,
+    )?;
     assert_eq!(partition_backlog.iter().sum::<u32>(), snapshot.backlog);
     assert_eq!(incremental.run(), expected);
     Ok(())
@@ -1985,18 +1995,143 @@ fn transient_failures_consume_attempts_and_backoff() -> Result<(), TestError> {
     assert_eq!(during_backoff.active_handlers, 0);
     assert_eq!(during_backoff.backlog, 1);
     let mut normal_backlog = [0_u32; 4];
-    plant.write_partition_normal_backlog(500_000, &mut normal_backlog)?;
-    assert_eq!(normal_backlog.iter().sum::<u32>(), 0);
     let mut failure_backlog = [0_u32; 4];
+    let mut normal_release = [0_u64; 4];
     let mut failure_release = [0_u64; 4];
-    plant.write_partition_failure_backlog(&mut failure_backlog)?;
-    plant.write_partition_failure_release(&mut failure_release)?;
+    plant.write_partition_backlogs(
+        500_000,
+        &mut normal_backlog,
+        &mut normal_release,
+        &mut failure_backlog,
+        &mut failure_release,
+    )?;
+    assert_eq!(normal_backlog.iter().sum::<u32>(), 0);
     assert_eq!(failure_backlog.iter().sum::<u32>(), 1);
     assert!(failure_release[0] > 500_000);
     let result = plant.run();
     assert_eq!(result.settlements()[0].attempts, 3);
     assert_eq!(result.settlements()[0].settle_micros, 1_009_000);
     Ok(())
+}
+
+#[quickcheck]
+fn maintained_plant_counters_match_full_recounts(operation_codes: Vec<u8>) -> TestResult {
+    let Ok(mut plant) = counter_parity_plant(operation_codes) else {
+        return TestResult::error("fixed counter parity plant failed");
+    };
+    for at_micros in (0_u64..=9_000).step_by(1_000) {
+        let snapshot = plant.advance_until(at_micros);
+        if !counter_recounts_match(&plant, at_micros, snapshot.released, snapshot.settled) {
+            return TestResult::failed();
+        }
+    }
+    TestResult::passed()
+}
+
+fn counter_parity_plant(operation_codes: Vec<u8>) -> Result<Plant, PlantError> {
+    let event_count = operation_codes.len().clamp(1, 32);
+    let configuration = PlantConfiguration::new(4, 4, event_count as u32, 4, 4, 1)?;
+    let mut plant = Plant::new(configuration.with_retry_backoff_micros(0), 1)?;
+    let codes = operation_codes.into_iter().chain(repeat(0));
+    for (index, code) in codes.take(event_count).enumerate() {
+        let release_micros = u64::from(code % 8) * 1_000;
+        let mut work = event(release_micros, index as u32 % 4, u64::from(code % 5 + 1));
+        work.partition = index as u32 % 4;
+        work.outcome = match code % 3 {
+            0 => EventOutcome::Final(FinalOutcome::Success),
+            1 => EventOutcome::Final(FinalOutcome::PermanentFailure),
+            _ => EventOutcome::from_transient_failures(1, FinalOutcome::Success)
+                .map_err(PlantError::from)?,
+        };
+        plant.add_event(work)?;
+    }
+    Ok(plant)
+}
+
+fn counter_recounts_match(
+    plant: &Plant,
+    at_micros: u64,
+    actual_released: u32,
+    actual_settled: u32,
+) -> bool {
+    let released = plant
+        .events
+        .release_micros
+        .iter()
+        .filter(|release| **release <= at_micros)
+        .count() as u32;
+    let settled = plant
+        .events
+        .release_micros
+        .iter()
+        .zip(&plant.settled_by_event)
+        .filter(|(release, is_settled)| **release <= at_micros && **is_settled)
+        .count() as u32;
+    let failures = plant
+        .attempt_outcomes
+        .iter()
+        .filter(|outcome| outcome.result == crate::AttemptResult::Failure)
+        .count();
+    actual_released == released
+        && actual_settled == settled
+        && plant.attempt_failure_count == failures
+        && backlog_columns_match_recount(plant, at_micros)
+}
+
+fn backlog_columns_match_recount(plant: &Plant, at_micros: u64) -> bool {
+    let mut actual_normal = [0_u32; 4];
+    let mut actual_normal_release = [0_u64; 4];
+    let mut actual_failure = [0_u32; 4];
+    let mut actual_failure_release = [0_u64; 4];
+    if plant
+        .write_partition_backlogs(
+            at_micros,
+            &mut actual_normal,
+            &mut actual_normal_release,
+            &mut actual_failure,
+            &mut actual_failure_release,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let mut expected_normal = [0_u32; 4];
+    let mut expected_normal_release = [u64::MAX; 4];
+    let mut expected_failure = [0_u32; 4];
+    let mut expected_failure_release = [u64::MAX; 4];
+    for event_index in 0..plant.events.len() {
+        let partition = plant.events.partition[event_index] as usize;
+        let release = plant.events.release_micros[event_index];
+        if release <= at_micros
+            && !plant.settled_by_event[event_index]
+            && plant.retry_mode_by_event[event_index] == crate::RetryMode::Inline
+        {
+            expected_normal[partition] = expected_normal[partition].saturating_add(1);
+            expected_normal_release[partition] = expected_normal_release[partition].min(release);
+        }
+        let queued = matches!(
+            plant.attempt_state[event_index],
+            crate::AttemptState::Backoff(crate::RetryWait::Deferred)
+                | crate::AttemptState::Ready(prosody_scale_core::DemandClass::Failure)
+        );
+        if plant.retry_mode_by_event[event_index] == crate::RetryMode::Deferred && queued {
+            expected_failure[partition] = expected_failure[partition].saturating_add(1);
+            expected_failure_release[partition] =
+                expected_failure_release[partition].min(plant.retry_ready_micros[event_index]);
+        }
+    }
+    for partition in 0..4 {
+        expected_normal_release[partition] =
+            u64::from(expected_normal_release[partition] != u64::MAX)
+                .saturating_mul(expected_normal_release[partition]);
+        expected_failure_release[partition] =
+            u64::from(expected_failure_release[partition] != u64::MAX)
+                .saturating_mul(expected_failure_release[partition]);
+    }
+    actual_normal == expected_normal
+        && actual_normal_release == expected_normal_release
+        && actual_failure == expected_failure
+        && actual_failure_release == expected_failure_release
 }
 
 #[test]

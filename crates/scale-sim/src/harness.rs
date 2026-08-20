@@ -982,16 +982,13 @@ impl<Graph: TickGenerator, Model: TickDrivenAttemptModel> SimulationHarness<Grap
             inputs.timer_count,
         )?;
         let after = self.plant.advance_until(now_micros);
-        self.plant
-            .write_partition_normal_backlog(now_micros, &mut self.partition_normal_backlog)?;
-        self.plant.write_partition_normal_oldest_release(
+        self.plant.write_partition_backlogs(
             now_micros,
+            &mut self.partition_normal_backlog,
             &mut self.partition_normal_oldest_release_micros,
+            &mut self.partition_failure_backlog,
+            &mut self.partition_failure_release_micros,
         )?;
-        self.plant
-            .write_partition_failure_backlog(&mut self.partition_failure_backlog)?;
-        self.plant
-            .write_partition_failure_release(&mut self.partition_failure_release_micros)?;
         let observed_inputs = self.graph.observe(
             TickContext {
                 now_micros,

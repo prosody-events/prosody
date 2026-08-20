@@ -438,6 +438,65 @@ pub struct EventSpec {
     pub source: EventSource,
 }
 
+/// Each event column has one shared fixed capacity and the same length.
+struct EventColumns {
+    release_micros: Vec<u64>,
+    partition: Vec<u32>,
+    key: Vec<u32>,
+    handler_micros: Vec<u64>,
+    dependency_operations: Vec<u32>,
+    outcome: Vec<EventOutcome>,
+    source: Vec<EventSource>,
+}
+
+impl EventColumns {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            release_micros: Vec::with_capacity(capacity),
+            partition: Vec::with_capacity(capacity),
+            key: Vec::with_capacity(capacity),
+            handler_micros: Vec::with_capacity(capacity),
+            dependency_operations: Vec::with_capacity(capacity),
+            outcome: Vec::with_capacity(capacity),
+            source: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, event: EventSpec) {
+        self.release_micros.push(event.release_micros);
+        self.partition.push(event.partition);
+        self.key.push(event.key);
+        self.handler_micros.push(event.handler_micros);
+        self.dependency_operations.push(event.dependency_operations);
+        self.outcome.push(event.outcome);
+        self.source.push(event.source);
+    }
+
+    fn len(&self) -> usize {
+        self.release_micros.len()
+    }
+
+    fn is_full(&self) -> bool {
+        self.len() == self.release_micros.capacity()
+    }
+
+    fn into_specs(self) -> Vec<EventSpec> {
+        let mut events = Vec::with_capacity(self.len());
+        for index in 0..self.len() {
+            events.push(EventSpec {
+                release_micros: self.release_micros[index],
+                partition: self.partition[index],
+                key: self.key[index],
+                handler_micros: self.handler_micros[index],
+                dependency_operations: self.dependency_operations[index],
+                outcome: self.outcome[index],
+                source: self.source[index],
+            });
+        }
+        events
+    }
+}
+
 /// One requested replica change.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScaleChange {
@@ -669,7 +728,7 @@ pub struct Plant<M = SeriesAttemptModel> {
     configuration: PlantConfiguration,
     attempt_model: M,
     replicas: u32,
-    events: Vec<EventSpec>,
+    events: EventColumns,
     pending_actuation: PendingActuation,
     scale_down_generation: u32,
     scale_schedule_count: usize,
@@ -709,6 +768,7 @@ pub struct Plant<M = SeriesAttemptModel> {
     normal_service_micros: u64,
     failure_service_micros: u64,
     attempt_outcomes: VecDeque<AttemptOutcome>,
+    attempt_failure_count: usize,
     attempt_transitions: Vec<AttemptTransition>,
     useful_completions: u32,
     completed_attempts: u32,
@@ -725,6 +785,8 @@ pub struct Plant<M = SeriesAttemptModel> {
     failure_terminal_failures: u32,
     failure_permanent_failures: u32,
     queued_events: u32,
+    released_events: u32,
+    settled_events: u32,
     initial_replicas: u32,
     now_micros: u64,
     started: bool,
@@ -779,7 +841,7 @@ impl<M: AttemptModel> Plant<M> {
             configuration,
             attempt_model,
             replicas: initial_replicas,
-            events: Vec::with_capacity(event_count_max),
+            events: EventColumns::with_capacity(event_count_max),
             pending_actuation: PendingActuation::Converged(Vec::with_capacity(change_count_max)),
             scale_down_generation: 0,
             scale_schedule_count: 0,
@@ -821,6 +883,7 @@ impl<M: AttemptModel> Plant<M> {
             attempt_outcomes: VecDeque::with_capacity(
                 event_count_max.saturating_mul(usize::from(MAX_RETRY_FAILURES) + 1),
             ),
+            attempt_failure_count: 0,
             attempt_transitions: Vec::with_capacity(
                 event_count_max
                     .saturating_mul(usize::from(MAX_RETRY_FAILURES) + 1)
@@ -841,6 +904,8 @@ impl<M: AttemptModel> Plant<M> {
             failure_terminal_failures: 0,
             failure_permanent_failures: 0,
             queued_events: 0,
+            released_events: 0,
+            settled_events: 0,
             initial_replicas,
             now_micros: 0,
             started: false,
@@ -862,7 +927,7 @@ impl<M: AttemptModel> Plant<M> {
         if event.key >= self.configuration.key_count {
             return Err(PlantError::KeyIndex);
         }
-        if self.events.len() == self.events.capacity() {
+        if self.events.is_full() {
             return Err(PlantError::EventCapacity);
         }
         let event_index = self.events.len() as u32;
@@ -1153,7 +1218,7 @@ impl<M: AttemptModel> Plant<M> {
                 ScheduledKind::RetryReady(event) => {
                     if let AttemptState::Backoff(wait) = self.attempt_state[event as usize] {
                         if wait == RetryWait::Inline {
-                            let key = self.events[event as usize].key as usize;
+                            let key = self.events.key[event as usize] as usize;
                             self.key_active[key] = true;
                         }
                         self.attempt_state[event as usize] =
@@ -1188,7 +1253,7 @@ impl<M: AttemptModel> Plant<M> {
     pub fn run(mut self) -> SimulationResult {
         let _ = self.advance_until(u64::MAX);
         SimulationResult {
-            events: self.events,
+            events: self.events.into_specs(),
             settlements: self.settlements,
             changes: self.applied_changes,
             initial_replicas: self.initial_replicas,
@@ -1197,119 +1262,59 @@ impl<M: AttemptModel> Plant<M> {
         }
     }
 
-    /// Writes observable Normal backlog counts by partition.
-    ///
-    /// A deferred event leaves this backlog after its retry timer persists.
+    /// Writes all observable backlog columns by partition in one event pass.
     ///
     /// # Errors
     ///
-    /// Returns an error when the output does not match the partition count.
-    pub fn write_partition_normal_backlog(
+    /// Returns an error when an output does not match the partition count.
+    pub fn write_partition_backlogs(
         &self,
         at_micros: u64,
-        output: &mut [u32],
+        normal_count: &mut [u32],
+        normal_oldest_release_micros: &mut [u64],
+        failure_count: &mut [u32],
+        failure_release_micros: &mut [u64],
     ) -> Result<(), PlantError> {
-        if output.len() != self.partition_reconciliation.len() {
+        let partition_count = self.partition_reconciliation.len();
+        if normal_count.len() != partition_count
+            || normal_oldest_release_micros.len() != partition_count
+            || failure_count.len() != partition_count
+            || failure_release_micros.len() != partition_count
+        {
             return Err(PlantError::PartitionCount);
         }
-        output.fill(0);
-        for (event_index, event) in self.events.iter().enumerate() {
-            if event.release_micros <= at_micros
+        normal_count.fill(0);
+        normal_oldest_release_micros.fill(u64::MAX);
+        failure_count.fill(0);
+        failure_release_micros.fill(u64::MAX);
+        for event_index in 0..self.events.len() {
+            let partition = self.events.partition[event_index] as usize;
+            let release_micros = self.events.release_micros[event_index];
+            if release_micros <= at_micros
                 && !self.settled_by_event[event_index]
                 && self.retry_mode_by_event[event_index] == RetryMode::Inline
             {
-                let partition = event.partition as usize;
-                output[partition] = output[partition].saturating_add(1);
+                normal_count[partition] = normal_count[partition].saturating_add(1);
+                normal_oldest_release_micros[partition] =
+                    normal_oldest_release_micros[partition].min(release_micros);
             }
-        }
-        Ok(())
-    }
-
-    /// Writes the oldest observable Normal release by partition.
-    ///
-    /// A zero value means that the partition has no released backlog.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the output does not match the partition count.
-    pub fn write_partition_normal_oldest_release(
-        &self,
-        at_micros: u64,
-        output: &mut [u64],
-    ) -> Result<(), PlantError> {
-        if output.len() != self.partition_reconciliation.len() {
-            return Err(PlantError::PartitionCount);
-        }
-        output.fill(u64::MAX);
-        for (event_index, event) in self.events.iter().enumerate() {
-            if event.release_micros <= at_micros
-                && !self.settled_by_event[event_index]
-                && self.retry_mode_by_event[event_index] == RetryMode::Inline
-            {
-                let oldest = &mut output[event.partition as usize];
-                *oldest = (*oldest).min(event.release_micros);
-            }
-        }
-        for oldest in output {
-            if *oldest == u64::MAX {
-                *oldest = 0;
-            }
-        }
-        Ok(())
-    }
-
-    /// Writes known deferred Failure backlog counts by partition.
-    ///
-    /// Running attempts do not enter this backlog.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the output does not match the partition count.
-    pub fn write_partition_failure_backlog(&self, output: &mut [u32]) -> Result<(), PlantError> {
-        if output.len() != self.partition_reconciliation.len() {
-            return Err(PlantError::PartitionCount);
-        }
-        output.fill(0);
-        for (event_index, event) in self.events.iter().enumerate() {
             let queued = matches!(
                 self.attempt_state[event_index],
                 AttemptState::Backoff(RetryWait::Deferred)
                     | AttemptState::Ready(DemandClass::Failure)
             );
             if self.retry_mode_by_event[event_index] == RetryMode::Deferred && queued {
-                let partition = event.partition as usize;
-                output[partition] = output[partition].saturating_add(1);
+                failure_count[partition] = failure_count[partition].saturating_add(1);
+                failure_release_micros[partition] =
+                    failure_release_micros[partition].min(self.retry_ready_micros[event_index]);
             }
         }
-        Ok(())
-    }
-
-    /// Writes the earliest known deferred Failure release by partition.
-    ///
-    /// A zero value means that the partition has no known Failure backlog.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the output does not match the partition count.
-    pub fn write_partition_failure_release(&self, output: &mut [u64]) -> Result<(), PlantError> {
-        if output.len() != self.partition_reconciliation.len() {
-            return Err(PlantError::PartitionCount);
-        }
-        output.fill(u64::MAX);
-        for (event_index, event) in self.events.iter().enumerate() {
-            let queued = matches!(
-                self.attempt_state[event_index],
-                AttemptState::Backoff(RetryWait::Deferred)
-                    | AttemptState::Ready(DemandClass::Failure)
-            );
-            if self.retry_mode_by_event[event_index] == RetryMode::Deferred && queued {
-                let release = &mut output[event.partition as usize];
-                *release = (*release).min(self.retry_ready_micros[event_index]);
+        for partition in 0..partition_count {
+            if normal_oldest_release_micros[partition] == u64::MAX {
+                normal_oldest_release_micros[partition] = 0;
             }
-        }
-        for release in output {
-            if *release == u64::MAX {
-                *release = 0;
+            if failure_release_micros[partition] == u64::MAX {
+                failure_release_micros[partition] = 0;
             }
         }
         Ok(())
@@ -1330,7 +1335,7 @@ impl<M: AttemptModel> Plant<M> {
     fn seed_heap(&mut self) {
         for event in 0..self.events.len() {
             let scheduled = Scheduled {
-                at_micros: self.events[event].release_micros,
+                at_micros: self.events.release_micros[event],
                 ordinal: event as u32,
                 kind: ScheduledKind::Arrival(event as u32),
             };
@@ -1339,7 +1344,8 @@ impl<M: AttemptModel> Plant<M> {
     }
 
     fn enqueue(&mut self, event: u32) {
-        let key = self.events[event as usize].key as usize;
+        self.released_events = self.released_events.saturating_add(1);
+        let key = self.events.key[event as usize] as usize;
         let tail = self.key_tail[key];
         if tail == NO_EVENT {
             self.key_head[key] = event;
@@ -1371,7 +1377,7 @@ impl<M: AttemptModel> Plant<M> {
             if class == DemandClass::Normal && self.key_active[key] {
                 continue;
             }
-            let partition = self.events[event as usize].partition as usize;
+            let partition = self.events.partition[event as usize] as usize;
             if matches!(
                 self.partition_reconciliation[partition],
                 PartitionReconciliation::Paused { .. }
@@ -1411,9 +1417,8 @@ impl<M: AttemptModel> Plant<M> {
 
     fn start_attempt(&mut self, event: u32, class: DemandClass, now_micros: u64) {
         let event_index = event as usize;
-        let spec = self.events[event_index];
-        let key = spec.key as usize;
-        let partition = spec.partition as usize;
+        let key = self.events.key[event_index] as usize;
+        let partition = self.events.partition[event_index] as usize;
         let owner = self.partition_owner[partition] as usize;
         self.key_active[key] = true;
         self.active_handlers += 1;
@@ -1448,10 +1453,10 @@ impl<M: AttemptModel> Plant<M> {
 
     fn attempt_finish(&mut self, event: u32, now_micros: u64) -> u64 {
         let event_index = event as usize;
-        let spec = self.events[event_index];
+        let dependency_operations = self.events.dependency_operations[event_index];
         self.active_dependency_operations = self
             .active_dependency_operations
-            .saturating_add(u32::from(spec.dependency_operations > 0));
+            .saturating_add(u32::from(dependency_operations > 0));
         let attempt = self.attempt_model.calculate(AttemptFrame {
             now_micros,
             event_index: event,
@@ -1463,9 +1468,9 @@ impl<M: AttemptModel> Plant<M> {
         });
         let dependency_operation_micros = attempt.dependency_operation_micros;
         let dependency_micros =
-            dependency_operation_micros.saturating_mul(u64::from(spec.dependency_operations));
+            dependency_operation_micros.saturating_mul(u64::from(dependency_operations));
         let dependency_finish = now_micros.saturating_add(dependency_micros);
-        if spec.dependency_operations > 0 {
+        if dependency_operations > 0 {
             heap_push(
                 &mut self.heap,
                 Scheduled {
@@ -1477,9 +1482,8 @@ impl<M: AttemptModel> Plant<M> {
         }
         self.dependency_micros[event_index] =
             self.dependency_micros[event_index].saturating_add(dependency_micros);
-        let handler_micros = spec
-            .handler_micros
-            .saturating_add(attempt.handler_added_micros);
+        let handler_micros =
+            self.events.handler_micros[event_index].saturating_add(attempt.handler_added_micros);
         self.handler_micros[event_index] =
             self.handler_micros[event_index].saturating_add(handler_micros);
         dependency_finish.saturating_add(handler_micros)
@@ -1487,7 +1491,7 @@ impl<M: AttemptModel> Plant<M> {
 
     fn finish_attempt(&mut self, event: u32, now_micros: u64) {
         let event_index = event as usize;
-        let spec = self.events[event_index];
+        let event_outcome = self.events.outcome[event_index];
         let AttemptState::Running(class) = self.attempt_state[event_index] else {
             return;
         };
@@ -1497,7 +1501,7 @@ impl<M: AttemptModel> Plant<M> {
             at_micros: now_micros,
             kind: AttemptTransitionKind::Completion,
         });
-        let retry = match spec.outcome {
+        let retry = match event_outcome {
             EventOutcome::Final(_) => None,
             EventOutcome::Retry {
                 outcome,
@@ -1517,7 +1521,7 @@ impl<M: AttemptModel> Plant<M> {
             self.finish_retry(event, class, now_micros, outcome, count, final_outcome);
             return;
         }
-        self.settle_final(event, class, now_micros, spec);
+        self.settle_final(event, class, now_micros, event_outcome.final_outcome());
     }
 
     fn finish_retry(
@@ -1530,7 +1534,7 @@ impl<M: AttemptModel> Plant<M> {
         final_outcome: FinalOutcome,
     ) {
         let event_index = event as usize;
-        let spec = self.events[event_index];
+        let key = self.events.key[event_index] as usize;
         match (class, outcome) {
             (DemandClass::Normal, RetryOutcome::Transient) => {
                 self.normal_transient_failures = self.normal_transient_failures.saturating_add(1);
@@ -1548,7 +1552,7 @@ impl<M: AttemptModel> Plant<M> {
         let defer = self.retry_mode_by_event[event_index] == RetryMode::Deferred
             || self.should_defer(now_micros);
         self.record_attempt_outcome(now_micros, AttemptResult::Failure);
-        self.events[event_index].outcome =
+        self.events.outcome[event_index] =
             count
                 .after_one()
                 .map_or(EventOutcome::Final(final_outcome), |count| {
@@ -1567,7 +1571,7 @@ impl<M: AttemptModel> Plant<M> {
             };
             self.retry_mode_by_event[event_index] = RetryMode::Deferred;
             self.deferred_retry_count[event_index] = retry_count;
-            self.key_active[spec.key as usize] = false;
+            self.key_active[key] = false;
             self.deferred_retry_delay(event, retry_count)
         } else {
             self.inline_retry_delay(event, self.attempts_by_event[event_index].saturating_sub(1))
@@ -1589,9 +1593,14 @@ impl<M: AttemptModel> Plant<M> {
         );
     }
 
-    fn settle_final(&mut self, event: u32, class: DemandClass, now_micros: u64, spec: EventSpec) {
+    fn settle_final(
+        &mut self,
+        event: u32,
+        class: DemandClass,
+        now_micros: u64,
+        final_outcome: FinalOutcome,
+    ) {
         let event_index = event as usize;
-        let final_outcome = spec.outcome.final_outcome();
         self.record_attempt_outcome(
             now_micros,
             match final_outcome {
@@ -1621,14 +1630,15 @@ impl<M: AttemptModel> Plant<M> {
             }
         }
         self.attempt_state[event_index] = AttemptState::Settled;
-        let key = spec.key as usize;
+        let key = self.events.key[event_index] as usize;
+        let release_micros = self.events.release_micros[event_index];
         self.settlements.push(Settlement {
             event,
-            release_micros: spec.release_micros,
+            release_micros,
             settle_micros: now_micros,
             attempts: self.attempts_by_event[event_index],
             permit_wait_micros: self.first_dispatch_micros[event_index]
-                .saturating_sub(spec.release_micros),
+                .saturating_sub(release_micros),
             dependency_micros: self.dependency_micros[event_index],
             handler_micros: self.handler_micros[event_index],
             in_flight_at_dispatch: self.in_flight_at_dispatch[event_index],
@@ -1639,6 +1649,7 @@ impl<M: AttemptModel> Plant<M> {
             .useful_completions
             .saturating_add(u32::from(matches!(final_outcome, FinalOutcome::Success)));
         self.settled_by_event[event_index] = true;
+        self.settled_events = self.settled_events.saturating_add(1);
         self.key_active[key] = false;
         self.remove_head(key);
     }
@@ -1655,8 +1666,7 @@ impl<M: AttemptModel> Plant<M> {
             }
         }
         self.active_handlers = self.active_handlers.saturating_sub(1);
-        let spec = self.events[event_index];
-        let partition = spec.partition as usize;
+        let partition = self.events.partition[event_index] as usize;
         let owner = self.owner_at_dispatch[event_index] as usize;
         self.active_handlers_by_owner[owner] =
             self.active_handlers_by_owner[owner].saturating_sub(1);
@@ -1673,17 +1683,19 @@ impl<M: AttemptModel> Plant<M> {
             .front()
             .is_some_and(|outcome| outcome.at_micros < cutoff)
         {
-            self.attempt_outcomes.pop_front();
+            if self
+                .attempt_outcomes
+                .pop_front()
+                .is_some_and(|outcome| outcome.result == AttemptResult::Failure)
+            {
+                self.attempt_failure_count = self.attempt_failure_count.saturating_sub(1);
+            }
         }
-        let failures = self
-            .attempt_outcomes
-            .iter()
-            .filter(|outcome| outcome.result == AttemptResult::Failure)
-            .count();
         let rate = if self.attempt_outcomes.is_empty() {
             0.0_f64
         } else {
-            let failures = u32::try_from(failures).map_or(u32::MAX, |value| value);
+            let failures =
+                u32::try_from(self.attempt_failure_count).map_or(u32::MAX, |value| value);
             let attempts =
                 u32::try_from(self.attempt_outcomes.len()).map_or(u32::MAX, |value| value);
             f64::from(failures) / f64::from(attempts)
@@ -1692,6 +1704,9 @@ impl<M: AttemptModel> Plant<M> {
     }
 
     fn record_attempt_outcome(&mut self, at_micros: u64, result: AttemptResult) {
+        self.attempt_failure_count = self
+            .attempt_failure_count
+            .saturating_add(usize::from(result == AttemptResult::Failure));
         self.attempt_outcomes
             .push_back(AttemptOutcome { at_micros, result });
     }
@@ -1861,30 +1876,24 @@ impl<M: AttemptModel> Plant<M> {
     }
 
     fn snapshot(&self, at_micros: u64) -> PlantSnapshot {
-        let mut released = 0_u32;
-        let mut settled = 0_u32;
-        for (event_index, event) in self.events.iter().enumerate() {
-            released = released.saturating_add(u32::from(event.release_micros <= at_micros));
-            settled = settled.saturating_add(u32::from(
-                event.release_micros <= at_micros && self.settled_by_event[event_index],
-            ));
+        let mut reconciling_partitions = 0_u32;
+        let mut paused_partitions = 0_u32;
+        for state in &self.partition_reconciliation {
+            reconciling_partitions = reconciling_partitions.saturating_add(u32::from(!matches!(
+                state,
+                PartitionReconciliation::Serving
+            )));
+            paused_partitions = paused_partitions.saturating_add(u32::from(matches!(
+                state,
+                PartitionReconciliation::Paused { .. }
+            )));
         }
-        let reconciling_partitions = self
-            .partition_reconciliation
-            .iter()
-            .filter(|state| !matches!(state, PartitionReconciliation::Serving))
-            .count() as u32;
-        let paused_partitions = self
-            .partition_reconciliation
-            .iter()
-            .filter(|state| matches!(state, PartitionReconciliation::Paused { .. }))
-            .count() as u32;
         PlantSnapshot {
             at_micros,
             replicas: self.replicas,
-            released,
-            settled,
-            backlog: released.saturating_sub(settled),
+            released: self.released_events,
+            settled: self.settled_events,
+            backlog: self.released_events.saturating_sub(self.settled_events),
             active_handlers: self.active_handlers,
             handler_occupancy_micros: self.handler_occupancy_micros,
             useful_completions: self.useful_completions,
@@ -1902,10 +1911,7 @@ impl<M: AttemptModel> Plant<M> {
             failure_transient_failures: self.failure_transient_failures,
             failure_terminal_failures: self.failure_terminal_failures,
             failure_permanent_failures: self.failure_permanent_failures,
-            partitions_ready: self
-                .partition_reconciliation
-                .iter()
-                .all(|state| matches!(state, PartitionReconciliation::Serving)),
+            partitions_ready: reconciling_partitions == 0,
             reconciling_partitions,
             paused_partitions,
             reconciliation_started_micros: self.reconciliation_started_micros,
