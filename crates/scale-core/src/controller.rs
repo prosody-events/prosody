@@ -12,7 +12,7 @@ use crate::capacity::{
 };
 use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
-    evaluate_prepared_step, evaluate_prepared_trajectory, prepare, refresh_prepared_work,
+    evaluate_prepared_step, evaluate_prepared_trajectory, prepare,
 };
 use crate::lead_time::{LaunchComponentSummary, LaunchTimeFactor, RebalanceTimeFactor};
 use crate::partition::PartitionFactor;
@@ -634,7 +634,6 @@ struct ScenarioWorkspace {
 
 struct PreparedPlacement {
     cohorts: SlotSecondCohorts,
-    source_indexes: Vec<u32>,
     edf: EdfScratch,
 }
 
@@ -921,7 +920,6 @@ impl ScenarioWorkspace {
         for _ in 0..bounds.placement_count_max {
             prepared_placements.push(PreparedPlacement {
                 cohorts: SlotSecondCohorts::new(bounds.work_cohort_count_max),
-                source_indexes: Vec::with_capacity(bounds.work_cohort_count_max),
                 edf: EdfScratch::new(bounds.work_cohort_count_max_u32)?,
             });
         }
@@ -1406,7 +1404,6 @@ fn prepare_partition_placements(shared: &ScenarioShared<'_>, workspace: &mut Sce
         for replica in 0..replica_count {
             let placement = &mut workspace.prepared_placements[placement_index];
             placement.cohorts.clear();
-            placement.source_indexes.clear();
             for partition in
                 balanced_partition_range(shared.partition_count, replica_count, replica)
             {
@@ -1420,7 +1417,6 @@ fn prepare_partition_placements(shared: &ScenarioShared<'_>, workspace: &mut Sce
                         shared.resource_cohorts.work(cohort),
                         shared.resource_cohorts.partition(cohort),
                     );
-                    placement.source_indexes.push(cohort_index);
                 }
             }
             prepare(&placement.cohorts, &mut placement.edf);
@@ -1516,7 +1512,6 @@ fn evaluate_one_scenario(
         cells,
         &ScenarioForecast {
             current_supply,
-            service_time_seconds: curve.service_time_seconds(),
             path_length,
             planning_horizon_micros: shared.planning_horizon_micros,
             disturbance_horizon_micros: shared.disturbance_horizon_micros,
@@ -1934,7 +1929,6 @@ fn finish_decision(
 /// One scenario's realized draws that the outcome evaluation reads.
 struct ScenarioForecast {
     current_supply: f64,
-    service_time_seconds: f64,
     path_length: usize,
     planning_horizon_micros: u64,
     disturbance_horizon_micros: u64,
@@ -2632,7 +2626,6 @@ fn partition_deadline_outcomes(
     missed_work: &mut [f64],
     late_area: &mut [f64],
 ) {
-    let service_time_seconds = forecast.service_time_seconds;
     let no_arrivals = ArrivalPath {
         start_seconds: Duration::from_micros(state.model_time.as_micros()).as_secs_f64(),
         end_seconds: &[f64::MAX],
@@ -2641,21 +2634,14 @@ fn partition_deadline_outcomes(
     let mut placement_index = 0_usize;
     for candidate in 0..shared.action_count {
         let replica_count = (candidate + 1).min(shared.partition_count);
-        let replica_count_f64 = u32::try_from(replica_count).map_or(f64::INFINITY, f64::from);
-        let capacity = workspace.posterior_resource_supply[candidate] * service_time_seconds
-            / replica_count_f64;
+        let capacity = partition_replica_capacity(
+            workspace.posterior_resource_supply[candidate],
+            replica_count,
+        );
         let mut candidate_missed = 0.0_f64;
         let mut candidate_late = 0.0_f64;
         for _ in 0..replica_count {
             let placement = &mut workspace.prepared_placements[placement_index];
-            for cohort in 0..placement.source_indexes.len() {
-                let source = placement.source_indexes[cohort] as usize;
-                placement.cohorts.set_work(
-                    cohort,
-                    shared.resource_cohorts.work(source) * service_time_seconds,
-                );
-            }
-            refresh_prepared_work(&placement.cohorts, &mut placement.edf);
             let outcome = evaluate_prepared_step(
                 &placement.cohorts,
                 SupplyStep {
@@ -2674,14 +2660,17 @@ fn partition_deadline_outcomes(
                 &no_arrivals,
                 &mut placement.edf,
             );
-            candidate_missed += outcome.missed_work / service_time_seconds;
-            candidate_late +=
-                (outcome.late_area + outcome.terminal_late_area) / service_time_seconds;
+            candidate_missed += outcome.missed_work;
+            candidate_late += outcome.late_area + outcome.terminal_late_area;
             placement_index += 1;
         }
         missed_work[candidate] = candidate_missed;
         late_area[candidate] = candidate_late;
     }
+}
+
+fn partition_replica_capacity(supply: f64, replica_count: usize) -> f64 {
+    supply / u32::try_from(replica_count).map_or(f64::INFINITY, f64::from)
 }
 
 #[cfg(test)]

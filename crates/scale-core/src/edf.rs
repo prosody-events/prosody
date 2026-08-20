@@ -588,15 +588,6 @@ pub(crate) fn prepare<Unit>(cohorts: &WorkCohorts<Unit>, scratch: &mut EdfScratc
     scratch.common_cohort = common_cohort(cohorts);
 }
 
-pub(crate) fn refresh_prepared_work<Unit>(cohorts: &WorkCohorts<Unit>, scratch: &mut EdfScratch) {
-    assert_eq!(
-        scratch.prepared_len,
-        cohorts.len(),
-        "prepared EDF orders must match the cohort count"
-    );
-    scratch.common_cohort = common_cohort(cohorts);
-}
-
 fn common_cohort<Unit>(cohorts: &WorkCohorts<Unit>) -> Option<CommonCohort> {
     if cohorts.is_empty() {
         return None;
@@ -1124,7 +1115,7 @@ mod tests {
     use super::{
         ArrivalPath, DeadlineState, EdfScratch, EvaluationWindow, SupplyTrajectory,
         TrajectoryCursor, evaluate_general_trajectory, evaluate_general_trajectory_reference,
-        evaluate_prepared_trajectory, prepare, refresh_prepared_work, terminal_closure,
+        evaluate_prepared_trajectory, prepare, terminal_closure,
     };
     use crate::types::SlotSecondCohorts;
 
@@ -1133,55 +1124,6 @@ mod tests {
         end_seconds: &[f64::MAX],
         rates: &[0.0_f64],
     };
-
-    #[quickcheck]
-    fn refreshed_work_keeps_full_prepare_state(
-        release_seeds: Vec<u16>,
-        deadline_seeds: Vec<u16>,
-        work_seed: u8,
-    ) -> bool {
-        let count = release_seeds.len().clamp(1, 16);
-        let releases = release_seeds.into_iter().chain(repeat(0));
-        let deadlines = deadline_seeds.into_iter().chain(repeat(0));
-        let mut cached = SlotSecondCohorts::new(count);
-        for (index, (release_seed, deadline_seed)) in
-            releases.zip(deadlines).take(count).enumerate()
-        {
-            let index_u32 = u32::try_from(index).map_or(u32::MAX, |value| value);
-            let release = u64::from(release_seed) * 1_000;
-            let deadline = release + u64::from(deadline_seed) * 1_000 + 1;
-            cached.push_values(release, deadline, f64::from(index_u32) + 1.0_f64, index_u32);
-        }
-        let mut full = cached.clone();
-        let Ok(mut cached_scratch) = EdfScratch::new(count as u32) else {
-            return false;
-        };
-        let Ok(mut full_scratch) = EdfScratch::new(count as u32) else {
-            return false;
-        };
-        prepare(&cached, &mut cached_scratch);
-        for index in 0..count {
-            let index_u32 = u32::try_from(index).map_or(u32::MAX, |value| value);
-            let work = (f64::from(index_u32) + 1.0_f64) * f64::from(work_seed);
-            cached.set_work(index, work);
-            full.set_work(index, work);
-        }
-        refresh_prepared_work(&cached, &mut cached_scratch);
-        prepare(&full, &mut full_scratch);
-
-        cached_scratch.release_order == full_scratch.release_order
-            && cached_scratch.deadline_order == full_scratch.deadline_order
-            && cached_scratch.prepared_len == full_scratch.prepared_len
-            && match (cached_scratch.common_cohort, full_scratch.common_cohort) {
-                (Some(left), Some(right)) => {
-                    left.release_micros == right.release_micros
-                        && left.deadline_micros == right.deadline_micros
-                        && left.work.to_bits() == right.work.to_bits()
-                }
-                (None, None) => true,
-                _ => false,
-            }
-    }
 
     #[test]
     fn supply_trajectory_keeps_exact_microsecond_boundaries() {

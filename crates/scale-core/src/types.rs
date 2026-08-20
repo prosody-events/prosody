@@ -1004,10 +1004,6 @@ impl<Unit> WorkCohorts<Unit> {
         self.work[index]
     }
 
-    pub(crate) fn set_work(&mut self, index: usize, work: f64) {
-        self.work[index] = work;
-    }
-
     pub(crate) fn partition(&self, index: usize) -> u32 {
         self.partitions[index]
     }

@@ -3,11 +3,14 @@ use thiserror::Error;
 
 use super::{
     DecisionRandomDomain, SCHEDULED_PARTITION, ScenarioDraws, ScenarioWorkspace, ScratchBounds,
-    balanced_partition_owner, balanced_partition_range, decision_random, prepare_work_cohorts,
-    sample_moved_partition_prefix, scenario_event_count, scenario_horizons,
+    balanced_partition_owner, balanced_partition_range, decision_random,
+    partition_replica_capacity, prepare_work_cohorts, sample_moved_partition_prefix,
+    scenario_event_count, scenario_horizons,
 };
-use crate::edf::ArrivalPath;
-use crate::types::EventCohorts;
+use crate::edf::{
+    ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, evaluate_prepared_step, prepare,
+};
+use crate::types::{EventCohorts, SlotSecondCohorts};
 use crate::{
     ArrivalPrior, ArrivalPriorError, BacklogCohort, CapacityGrid, CapacityGridError, Configuration,
     ConfigurationError, DemandClass, LaunchPrior, ModelTime, ObservationBuffer, ObservationError,
@@ -76,6 +79,85 @@ fn moved_partition_prefix_cache_matches_ordinal_draw() -> Result<(), TestError> 
             .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
     );
     Ok(())
+}
+
+#[test]
+fn partition_deadline_outputs_preserve_work_scale() -> Result<(), TestError> {
+    let service_time_seconds = 0.25_f64;
+    let supply = 3.0_f64;
+    let no_arrivals = ArrivalPath {
+        start_seconds: 0.0_f64,
+        end_seconds: &[f64::MAX],
+        rates: &[0.0_f64],
+    };
+    let window = EvaluationWindow {
+        start_micros: 0,
+        horizon_micros: 4_000_000,
+        initial_debt_work: 0.0_f64,
+        deadline_budget_micros: 1_000_000,
+    };
+    let mut raw_outputs = [(0.0_f64, 0.0_f64); 4];
+    let mut scaled_outputs = [(0.0_f64, 0.0_f64); 4];
+    for replica_count in 1..=4 {
+        let mut raw = SlotSecondCohorts::new(2);
+        raw.push_values(0, 1_000_000, 4.0_f64, 0);
+        raw.push_values(500_000, 2_000_000, 6.0_f64, 1);
+        let mut scaled = SlotSecondCohorts::new(2);
+        scaled.push_values(0, 1_000_000, 4.0_f64 * service_time_seconds, 0);
+        scaled.push_values(500_000, 2_000_000, 6.0_f64 * service_time_seconds, 1);
+        let mut raw_scratch = EdfScratch::new(2)?;
+        let mut scaled_scratch = EdfScratch::new(2)?;
+        prepare(&raw, &mut raw_scratch);
+        prepare(&scaled, &mut scaled_scratch);
+        let raw_capacity = partition_replica_capacity(supply, replica_count);
+        let replica_count_f64 = f64::from(replica_count as u32);
+        let scaled_capacity = supply * service_time_seconds / replica_count_f64;
+        let raw_outcome = evaluate_prepared_step(
+            &raw,
+            SupplyStep {
+                before: raw_capacity,
+                during: raw_capacity,
+                after: raw_capacity,
+                pause_micros: 0,
+                ready_micros: 0,
+            },
+            window,
+            &no_arrivals,
+            &mut raw_scratch,
+        );
+        let scaled_outcome = evaluate_prepared_step(
+            &scaled,
+            SupplyStep {
+                before: scaled_capacity,
+                during: scaled_capacity,
+                after: scaled_capacity,
+                pause_micros: 0,
+                ready_micros: 0,
+            },
+            window,
+            &no_arrivals,
+            &mut scaled_scratch,
+        );
+        raw_outputs[replica_count - 1] = (
+            raw_outcome.missed_work,
+            raw_outcome.late_area + raw_outcome.terminal_late_area,
+        );
+        scaled_outputs[replica_count - 1] = (
+            scaled_outcome.missed_work / service_time_seconds,
+            (scaled_outcome.late_area + scaled_outcome.terminal_late_area) / service_time_seconds,
+        );
+    }
+    assert!(raw_outputs.iter().zip(scaled_outputs).all(
+        |(&(raw_missed, raw_late), (scaled_missed, scaled_late))| {
+            partition_float_matches(raw_missed, scaled_missed)
+                && partition_float_matches(raw_late, scaled_late)
+        }
+    ));
+    Ok(())
+}
+
+fn partition_float_matches(actual: f64, expected: f64) -> bool {
+    (actual - expected).abs() <= 1.0e-12_f64.max(1.0e-9_f64 * expected.abs())
 }
 
 #[test]
