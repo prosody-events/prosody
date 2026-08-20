@@ -12,8 +12,8 @@ use crate::capacity::{
 };
 use crate::edf::{
     ArrivalPath, EdfOutcomeLanes, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
-    evaluate_prepared_step, evaluate_prepared_step_capacities, evaluate_prepared_trajectory,
-    prepare,
+    SupplyTrajectoryBatch, evaluate_prepared_step, evaluate_prepared_step_capacities,
+    evaluate_prepared_trajectory, evaluate_prepared_trajectory_batch, prepare,
 };
 use crate::lead_time::{LaunchComponentSummary, LaunchTimeFactor, RebalanceTimeFactor};
 use crate::partition::PartitionFactor;
@@ -1569,6 +1569,7 @@ fn evaluate_scenario_outcome(
     );
     prepare_unassigned_cohorts(shared.resource_cohorts, workspace);
     evaluate_candidates(
+        state.simd_level,
         &CandidateEvaluation {
             model_time_micros: state.model_time.as_micros(),
             deadline_budget_micros: state.configuration.objective.budget_micros(),
@@ -1876,13 +1877,72 @@ fn prepare_unassigned_cohorts(source: &EventCohorts, workspace: &mut ScenarioWor
 
 #[cfg_attr(feature = "hotpath", hotpath::measure(label = "evaluate_candidates"))]
 fn evaluate_candidates(
+    simd_level: Level,
     shared: &CandidateEvaluation<'_>,
     edf: &mut EdfScratch,
     miss_delay_fraction: &mut [f64],
     drain_seconds: &mut [f64],
     missed_work: &mut [f64],
 ) {
-    for candidate in 0..miss_delay_fraction.len() {
+    dispatch!(simd_level, simd => evaluate_candidates_simd(
+        simd,
+        shared,
+        edf,
+        miss_delay_fraction,
+        drain_seconds,
+        missed_work,
+    ));
+}
+
+fn evaluate_candidates_simd<S: Simd>(
+    simd: S,
+    shared: &CandidateEvaluation<'_>,
+    edf: &mut EdfScratch,
+    miss_delay_fraction: &mut [f64],
+    drain_seconds: &mut [f64],
+    missed_work: &mut [f64],
+) {
+    let candidate_count = miss_delay_fraction.len();
+    let lane_count = S::f64s::N;
+    let full_lane_count = if edf.has_common_cohort() {
+        0
+    } else {
+        candidate_count / lane_count * lane_count
+    };
+    let trajectories = SupplyTrajectoryBatch {
+        initial: shared.current_supply,
+        offsets: shared.trajectory_offsets,
+        pause_micros: shared.trajectory_pause_micros,
+        ready_micros: shared.trajectory_ready_micros,
+        ready_boundaries: shared.trajectory_ready_boundaries,
+        during: shared.trajectory_during_supply,
+        after: shared.trajectory_after_supply,
+    };
+    let window = EvaluationWindow {
+        start_micros: shared.model_time_micros,
+        horizon_micros: shared.horizon_micros,
+        initial_debt_work: 0.0_f64,
+        deadline_budget_micros: shared.deadline_budget_micros,
+    };
+    for first_candidate in (0..full_lane_count).step_by(lane_count) {
+        let outcomes = evaluate_prepared_trajectory_batch(
+            simd,
+            shared.resource_cohorts,
+            &trajectories,
+            first_candidate,
+            window,
+            &shared.arrival_path,
+            edf,
+        );
+        for lane in 0..lane_count {
+            let candidate = first_candidate + lane;
+            miss_delay_fraction[candidate] =
+                outcomes.late_area.as_slice()[lane] + outcomes.terminal_late_area.as_slice()[lane];
+            drain_seconds[candidate] = outcomes.drain_seconds.as_slice()[lane];
+            missed_work[candidate] = outcomes.missed_work.as_slice()[lane];
+        }
+    }
+    for candidate in full_lane_count..candidate_count {
         let first = shared.trajectory_offsets[candidate] as usize;
         let last = shared.trajectory_offsets[candidate + 1] as usize;
         let outcome = evaluate_prepared_trajectory(
@@ -1895,12 +1955,7 @@ fn evaluate_candidates(
                 during: &shared.trajectory_during_supply[first..last],
                 after: &shared.trajectory_after_supply[first..last],
             },
-            EvaluationWindow {
-                start_micros: shared.model_time_micros,
-                horizon_micros: shared.horizon_micros,
-                initial_debt_work: 0.0_f64,
-                deadline_budget_micros: shared.deadline_budget_micros,
-            },
+            window,
             &shared.arrival_path,
             edf,
         );
