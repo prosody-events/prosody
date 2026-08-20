@@ -6,7 +6,8 @@ use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use crate::TransitionDirection;
 use crate::arrival::{ArrivalBoundaryDiagnostic, ArrivalFactor, ArrivalPrior};
 use crate::capacity::{
-    CapacityClockCheck, CapacityFactor, ThroughputPosteriorCell, curve_throughput,
+    CapacityClockCheck, CapacityFactor, CompletionPredictiveSummary, ThroughputPosteriorCell,
+    curve_throughput,
 };
 use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
@@ -297,17 +298,18 @@ impl ScaleState {
         self.capacity.write_throughput_posterior(concurrency, cells)
     }
 
-    /// Evaluates the completion predictive CDF at one completed-attempt count.
+    /// Finds completion quantiles and the CDF interval around one observation.
     ///
     /// The predictive uses the prior report's occupancy. It uses the current
     /// report's certified start schedule.
-    pub fn completion_predictive_cdf(
+    pub fn completion_predictive_summary(
         &mut self,
         window: &ResourceWindow,
-        completed_attempts: u32,
-    ) -> f64 {
+        observed: u32,
+        thresholds: [f64; 3],
+    ) -> CompletionPredictiveSummary {
         self.capacity
-            .completion_predictive_cdf(window, completed_attempts)
+            .completion_predictive_summary(window, observed, thresholds)
     }
 
     /// Writes the marginal capacity posterior into caller-owned buffers.

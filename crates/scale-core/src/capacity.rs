@@ -157,6 +157,17 @@ pub struct ThroughputPosteriorCell {
     pub probability: f64,
 }
 
+/// Predictive completion counts and the CDF interval around one observation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompletionPredictiveSummary {
+    /// Smallest counts whose CDF reaches each requested probability.
+    pub quantile_counts: [u32; 3],
+    /// CDF immediately below the observed count.
+    pub lower: f64,
+    /// CDF at the observed count.
+    pub upper: f64,
+}
+
 impl CapacityCurve {
     pub(crate) const fn service_time_seconds(self) -> f64 {
         match self {
@@ -649,6 +660,7 @@ pub(crate) struct CapacityFactor {
     completion_coefficients: Vec<f64>,
     completion_convolution: Vec<f64>,
     completion_binomial: Vec<f64>,
+    completion_cell_cdfs: Vec<f64>,
     state_exposure_seconds: Vec<f64>,
     state_completion_counts: Vec<u32>,
     forward_probabilities: Vec<f64>,
@@ -759,6 +771,7 @@ impl CapacityFactor {
             completion_coefficients: vec![0.0_f64; attempt_count_max as usize + 1],
             completion_convolution: vec![0.0_f64; attempt_count_max as usize + 1],
             completion_binomial: vec![0.0_f64; attempt_count_max as usize + 1],
+            completion_cell_cdfs: vec![0.0_f64; cell_count],
             state_exposure_seconds: vec![0.0_f64; state_count],
             state_completion_counts: vec![0; state_count],
             forward_probabilities: vec![0.0_f64; state_count],
@@ -895,6 +908,111 @@ impl CapacityFactor {
         Ok(())
     }
 
+    fn completion_predictive_sweep(
+        &mut self,
+        window: &ResourceWindow,
+        count_max: u32,
+        mut visit: impl FnMut(u32, f64) -> bool,
+    ) {
+        self.predictive_start_history
+            .copy_from_slice(&self.start_history);
+        let mut head = self.start_history_head;
+        let mut length = self.start_history_len;
+        let end_micros = self
+            .observation_clock_micros
+            .saturating_add(window.exposure_micros());
+        record_start_window(
+            &mut self.predictive_start_history,
+            &mut head,
+            &mut length,
+            window,
+            end_micros,
+            Some(window.started_attempts()),
+        );
+        let predictive_concurrency = self
+            .previous_window_concurrency
+            .unwrap_or(window.concurrency);
+        self.completion_cell_cdfs.fill(0.0_f64);
+        for count in 0..=count_max {
+            for index in 0..self.weights.len() {
+                let predictive_window = ResourceWindow {
+                    concurrency: predictive_concurrency,
+                    exposure_micros: window.exposure_micros,
+                    completed_attempts: count,
+                    started_attempts: window.started_attempts,
+                };
+                self.completion_cell_cdfs[index] += completion_log_likelihood(
+                    &self.grid,
+                    index,
+                    RetainedHistory {
+                        windows: &self.predictive_start_history,
+                        head,
+                        length,
+                        end_micros,
+                    },
+                    &predictive_window,
+                    self.arrival_shape,
+                    self.arrival_rate_seconds,
+                    CompletionScratch {
+                        coefficients: &mut self.completion_coefficients,
+                        convolution: &mut self.completion_convolution,
+                        binomial: &mut self.completion_binomial,
+                    },
+                )
+                .exp();
+            }
+            let mut cumulative = 0.0_f64;
+            for (weight, cell_cdf) in self.weights.iter().zip(&self.completion_cell_cdfs) {
+                cumulative += *weight * *cell_cdf;
+            }
+            if !visit(count, cumulative.clamp(0.0_f64, 1.0_f64)) {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn completion_predictive_summary(
+        &mut self,
+        window: &ResourceWindow,
+        observed: u32,
+        thresholds: [f64; 3],
+    ) -> CompletionPredictiveSummary {
+        let count_max = self.completion_coefficients.len().saturating_sub(1) as u32;
+        let mut quantile_counts = [count_max; 3];
+        let mut quantile_found = [false; 3];
+        let mut lower = if observed.saturating_sub(1) > count_max {
+            1.0_f64
+        } else {
+            0.0_f64
+        };
+        let mut upper = if observed > count_max {
+            1.0_f64
+        } else {
+            0.0_f64
+        };
+        self.completion_predictive_sweep(window, count_max, |count, cdf| {
+            for index in 0..thresholds.len() {
+                if !quantile_found[index] && cdf >= thresholds[index] {
+                    quantile_counts[index] = count;
+                    quantile_found[index] = true;
+                }
+            }
+            if observed > 0 && count == observed - 1 {
+                lower = cdf;
+            }
+            if count == observed {
+                upper = cdf;
+            }
+            !(quantile_found.iter().all(|found| *found) && count >= observed)
+        });
+        CompletionPredictiveSummary {
+            quantile_counts,
+            lower,
+            upper,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn completion_predictive_cdf(
         &mut self,
         window: &ResourceWindow,
@@ -954,6 +1072,19 @@ impl CapacityFactor {
             cumulative += self.weights[index] * cell_cdf;
         }
         cumulative.clamp(0.0_f64, 1.0_f64)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_completion_predictive_cdfs(
+        &mut self,
+        window: &ResourceWindow,
+        output: &mut [f64],
+    ) {
+        let count_max = output.len().saturating_sub(1) as u32;
+        self.completion_predictive_sweep(window, count_max, |count, cdf| {
+            output[count as usize] = cdf;
+            true
+        });
     }
 
     pub(crate) const fn service_time_posterior_value_count(&self) -> u32 {
@@ -1721,7 +1852,7 @@ fn capacity_storage_bytes(
     filter_curve_count
         .checked_add(
             cell_count
-                .checked_mul(3)
+                .checked_mul(4)
                 .ok_or(CapacityModelError::StorageBound)?,
         )
         .and_then(|count| {

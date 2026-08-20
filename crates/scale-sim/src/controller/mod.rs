@@ -2640,32 +2640,18 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
                     .latest_capacity_window
                     .ok_or(PlantError::MetricCapacity)?
                     .evidence()?;
-                let mut quantiles = [0.0_f64; 3];
-                let upper_count = self.configuration.core().resource_window_attempt_count_max;
-                for (index, threshold) in [0.1_f64, 0.5_f64, 0.9_f64].into_iter().enumerate() {
-                    let mut low = 0_u32;
-                    let mut high = upper_count;
-                    while low < high {
-                        let middle = low + (high - low) / 2;
-                        if self.state.completion_predictive_cdf(&evidence, middle) >= threshold {
-                            high = middle;
-                        } else {
-                            low = middle + 1;
-                        }
-                    }
-                    quantiles[index] = f64::from(low) / window.exposure_seconds;
-                }
                 let observed = window.completed_attempts;
-                let upper = self.state.completion_predictive_cdf(&evidence, observed);
-                let lower = if observed == 0 {
-                    0.0_f64
-                } else {
-                    self.state
-                        .completion_predictive_cdf(&evidence, observed - 1)
-                };
+                let summary = self.state.completion_predictive_summary(
+                    &evidence,
+                    observed,
+                    [0.1_f64, 0.5_f64, 0.9_f64],
+                );
+                let quantiles = summary
+                    .quantile_counts
+                    .map(|count| f64::from(count) / window.exposure_seconds);
                 Ok(CapacityPrediction {
                     quantiles,
-                    rank: lower + rank_offset * (upper - lower),
+                    rank: summary.lower + rank_offset * (summary.upper - summary.lower),
                 })
             }
         }

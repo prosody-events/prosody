@@ -1799,6 +1799,81 @@ fn completion_predictive_cdf_is_monotone(count: u8) -> bool {
     (0.0_f64..=1.0_f64).contains(&lower) && lower <= upper && upper <= 1.0_f64
 }
 
+#[quickcheck]
+fn completion_predictive_sweep_matches_scalar_cdf_and_summary(
+    seed: u8,
+    exposure_millis: u16,
+    high_concurrency: bool,
+) -> bool {
+    let Ok(grid) = CapacityGrid::new(&[0.5_f64, 2.0_f64], &[100.0_f64], &[0.0_f64]) else {
+        return false;
+    };
+    let Ok(prior) = ArrivalPrior::test_artifact() else {
+        return false;
+    };
+    let count_max = 16_u32 + u32::from(seed % 16);
+    let Ok(mut factor) = super::CapacityFactor::new_with_prior(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &prior,
+        2.0_f64,
+        1.0_f64,
+        count_max,
+    ) else {
+        return false;
+    };
+    let concurrency = if high_concurrency { 2.0_f64 } else { 1.0_f64 };
+    factor.previous_window_concurrency = Some(concurrency);
+    let started = u32::from(seed % 8);
+    let exposure_seconds = f64::from(exposure_millis % 1_901 + 100) / 1_000.0_f64;
+    let Ok(window) = ResourceWindow::new_with_starts(concurrency, exposure_seconds, 0, started)
+    else {
+        return false;
+    };
+    let mut sweep = vec![0.0_f64; count_max as usize + 1];
+    factor.write_completion_predictive_cdfs(&window, &mut sweep);
+    for (count, actual) in sweep.iter().enumerate() {
+        if actual.to_bits()
+            != factor
+                .completion_predictive_cdf(&window, count as u32)
+                .to_bits()
+        {
+            return false;
+        }
+    }
+
+    let observed = u32::from(seed) % (count_max + 1);
+    let thresholds = [0.1_f64, 0.5_f64, 0.9_f64];
+    let summary = factor.completion_predictive_summary(&window, observed, thresholds);
+    let mut reference_quantiles = [count_max; 3];
+    for (index, threshold) in thresholds.into_iter().enumerate() {
+        let mut low = 0_u32;
+        let mut high = count_max;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if factor.completion_predictive_cdf(&window, middle) >= threshold {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        reference_quantiles[index] = low;
+    }
+    let reference_upper = factor.completion_predictive_cdf(&window, observed);
+    let reference_lower = if observed == 0 {
+        0.0_f64
+    } else {
+        factor.completion_predictive_cdf(&window, observed - 1)
+    };
+    let rank_offset = f64::from(seed) / f64::from(u8::MAX);
+    let rank = summary.lower + rank_offset * (summary.upper - summary.lower);
+    let reference_rank = reference_lower + rank_offset * (reference_upper - reference_lower);
+    summary.quantile_counts == reference_quantiles
+        && summary.lower.to_bits() == reference_lower.to_bits()
+        && summary.upper.to_bits() == reference_upper.to_bits()
+        && rank.to_bits() == reference_rank.to_bits()
+}
+
 fn deleted_poisson_log_kernel(count: f64, mean: f64) -> f64 {
     if mean > 0.0_f64 {
         count * mean.ln() - mean

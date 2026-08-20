@@ -26,7 +26,8 @@ pub use arrival::{
 };
 pub use capacity::{
     CapacityClockCheck, CapacityCurve, CapacityGrid, CapacityGridError, CapacityModelError,
-    CapacityPrior, PosteriorError, ResourceWindow, ResourceWindowError, ThroughputPosteriorCell,
+    CapacityPrior, CompletionPredictiveSummary, PosteriorError, ResourceWindow,
+    ResourceWindowError, ThroughputPosteriorCell,
 };
 pub use controller::{
     DecisionActionColumns, DecisionColumnSummary, DecisionCurveError, DecisionRejection,
