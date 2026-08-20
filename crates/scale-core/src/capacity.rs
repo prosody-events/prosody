@@ -1,4 +1,9 @@
-use std::{array, f64::consts::E, mem::size_of, time::Duration};
+use std::{
+    array,
+    f64::consts::{E, LOG2_E},
+    mem::size_of,
+    time::Duration,
+};
 
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use statrs::distribution::{Beta, ContinuousCDF, Gamma, LogNormal};
@@ -1600,11 +1605,11 @@ impl CapacityFactor {
             .iter()
             .copied()
             .fold(f64::NEG_INFINITY, f64::max);
-        let total = self
-            .filter_log_weights
-            .iter()
-            .map(|weight| (*weight - maximum).exp())
-            .sum::<f64>();
+        let total = dispatch!(self.simd_level, simd => sum_shifted_exponentials(
+            simd,
+            &self.filter_log_weights,
+            maximum,
+        ));
         if !total.is_finite() || total <= 0.0_f64 {
             return;
         }
@@ -1630,9 +1635,13 @@ impl CapacityFactor {
                 *weight *= (mixture - maximum).exp() / predictive;
             }
         }
-        for (weight, log_weight) in self.filter_weights.iter_mut().zip(&self.filter_log_weights) {
-            *weight = (*log_weight - maximum).exp() / total;
-        }
+        dispatch!(self.simd_level, simd => write_normalized_exponentials(
+            simd,
+            &self.filter_log_weights,
+            &mut self.filter_weights,
+            maximum,
+            total,
+        ));
         self.mix_filters();
     }
 
@@ -3336,10 +3345,143 @@ fn convolution_axpy_four<S: Simd>(
 #[cfg_attr(feature = "hotpath", hotpath::measure(label = "mass_exponentiation"))]
 fn exponentiate_log_masses<S: Simd>(simd: S, values: &mut [f64]) -> f64 {
     let maximum = vector_max(simd, values, f64::NEG_INFINITY);
-    for value in values {
-        *value = (*value - maximum).exp();
+    let lane_count = S::f64s::N;
+    let vector_count = values.len() / lane_count;
+    let maximum_vector = S::f64s::splat(simd, maximum);
+    for vector in 0..vector_count {
+        let start = vector * lane_count;
+        let end = start + lane_count;
+        vector_exp(
+            simd,
+            S::f64s::from_slice(simd, &values[start..end]) - maximum_vector,
+        )
+        .store_slice(&mut values[start..end]);
+    }
+    let tail = &mut values[vector_count * lane_count..];
+    if !tail.is_empty() {
+        let input = S::f64s::from_fn(simd, |lane| {
+            tail.get(lane).map_or(0.0_f64, |value| *value - maximum)
+        });
+        let output = vector_exp(simd, input);
+        tail.copy_from_slice(&output.as_slice()[..tail.len()]);
     }
     maximum
+}
+
+fn vector_exp<S: Simd>(simd: S, value: S::f64s) -> S::f64s {
+    const LN_2_HIGH: f64 = 6.933_593_75e-1_f64;
+    const LN_2_LOW: f64 = -2.121_944_400_546_905_8e-4_f64;
+    const UNDERFLOW_CUTOFF: f64 = -745.133_219_101_941_1_f64;
+    const P: [f64; 3] = [
+        1.261_771_930_748_105_8e-4_f64,
+        3.029_944_077_074_419_6e-2_f64,
+        1.0_f64,
+    ];
+    const Q: [f64; 4] = [
+        3.001_985_051_386_644_7e-6_f64,
+        2.524_483_403_496_841e-3_f64,
+        2.272_655_482_081_550_2e-1_f64,
+        2.0_f64,
+    ];
+
+    let exponent = (value * LOG2_E).round_ties_even();
+    let reduced = exponent
+        .mul_add(S::f64s::splat(simd, -LN_2_HIGH), value)
+        .mul_add(S::f64s::splat(simd, 1.0_f64), exponent * -LN_2_LOW);
+    let square = reduced * reduced;
+    let numerator = (square * P[0] + P[1]) * square + P[2];
+    let numerator = numerator * reduced;
+    let denominator = ((square * Q[0] + Q[1]) * square + Q[2]) * square + Q[3];
+    let polynomial = numerator.mul_add(
+        S::f64s::splat(simd, 2.0_f64) / (denominator - numerator),
+        S::f64s::splat(simd, 1.0_f64),
+    );
+    let scale = S::f64s::from_fn(simd, |lane| {
+        let integer_exponent = exponent.as_slice()[lane] as i64;
+        // The clamp keeps `power_of_two` arithmetic in range when a
+        // discarded padding lane carries an infinite input.
+        power_of_two(integer_exponent.clamp(-1_074, 1_024))
+    });
+    let subnormal_adjustment = S::f64s::from_fn(simd, |lane| {
+        if (exponent.as_slice()[lane] as i64) < -1_074 {
+            0.5_f64
+        } else {
+            1.0_f64
+        }
+    });
+    let result = polynomial * subnormal_adjustment * scale;
+    value
+        .simd_lt(S::f64s::splat(simd, UNDERFLOW_CUTOFF))
+        .select(S::f64s::splat(simd, 0.0_f64), result)
+}
+
+fn power_of_two(exponent: i64) -> f64 {
+    if exponent >= -1_022 {
+        let biased = u64::try_from(exponent + 1_023).map_or(u64::MAX, |value| value);
+        f64::from_bits(biased << 52)
+    } else {
+        let shift = u32::try_from(exponent + 1_074).map_or(0, |value| value);
+        f64::from_bits(1_u64 << shift)
+    }
+}
+
+fn sum_shifted_exponentials<S: Simd>(simd: S, values: &[f64], maximum: f64) -> f64 {
+    let lane_count = S::f64s::N;
+    let vector_count = values.len() / lane_count;
+    let maximum_vector = S::f64s::splat(simd, maximum);
+    let mut total = 0.0_f64;
+    for vector in 0..vector_count {
+        let start = vector * lane_count;
+        let end = start + lane_count;
+        let exponential = vector_exp(
+            simd,
+            S::f64s::from_slice(simd, &values[start..end]) - maximum_vector,
+        );
+        for value in exponential.as_slice() {
+            total += *value;
+        }
+    }
+    let tail = &values[vector_count * lane_count..];
+    if !tail.is_empty() {
+        let input = S::f64s::from_fn(simd, |lane| {
+            tail.get(lane).map_or(0.0_f64, |value| *value) - maximum
+        });
+        let exponential = vector_exp(simd, input);
+        for value in &exponential.as_slice()[..tail.len()] {
+            total += *value;
+        }
+    }
+    total
+}
+
+fn write_normalized_exponentials<S: Simd>(
+    simd: S,
+    values: &[f64],
+    output: &mut [f64],
+    maximum: f64,
+    total: f64,
+) {
+    let lane_count = S::f64s::N;
+    let vector_count = values.len() / lane_count;
+    let maximum_vector = S::f64s::splat(simd, maximum);
+    let total = S::f64s::splat(simd, total);
+    for vector in 0..vector_count {
+        let start = vector * lane_count;
+        let end = start + lane_count;
+        (vector_exp(
+            simd,
+            S::f64s::from_slice(simd, &values[start..end]) - maximum_vector,
+        ) / total)
+            .store_slice(&mut output[start..end]);
+    }
+    let tail = &values[vector_count * lane_count..];
+    if !tail.is_empty() {
+        let input = S::f64s::from_fn(simd, |lane| {
+            tail.get(lane).map_or(0.0_f64, |value| *value) - maximum
+        });
+        let exponential = vector_exp(simd, input) / total;
+        output[vector_count * lane_count..].copy_from_slice(&exponential.as_slice()[..tail.len()]);
+    }
 }
 
 fn convolution_axpy<S: Simd>(simd: S, coefficient: f64, values: &[f64], output: &mut [f64]) {

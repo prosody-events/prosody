@@ -1,7 +1,7 @@
 use std::{array, time::Duration};
 
 use allocation_counter::measure;
-use fearless_simd::{Level, dispatch};
+use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use quickcheck_macros::quickcheck;
 use statrs::distribution::{ContinuousCDF, Gamma};
 use thiserror::Error;
@@ -15,10 +15,11 @@ use super::{
     binomial_log_probability, capacity_model_artifact, capacity_update_operation_count,
     completion_expectation, completion_group_convolution, completion_log_likelihood,
     completion_log_likelihood_reference, completion_marginal_probability, contamination_prior,
-    equal_rate_death_step, feasibility_probability, feasibility_probability_and_charge, fold_trace,
-    hazard_prior, integer_ln_gamma_table, linear_rate_band, linear_rate_death_step,
-    log_contamination_mixture, log_normal_axis_masses, log_weighted_sum, path_log_score,
-    pure_death_step, pure_death_step_with_rates, record_start_window, uniformized_death_step,
+    equal_rate_death_step, exponentiate_log_masses, feasibility_probability,
+    feasibility_probability_and_charge, fold_trace, hazard_prior, integer_ln_gamma_table,
+    linear_rate_band, linear_rate_death_step, log_contamination_mixture, log_normal_axis_masses,
+    log_weighted_sum, path_log_score, pure_death_step, pure_death_step_with_rates,
+    record_start_window, uniformized_death_step, vector_exp,
 };
 use crate::change_point::ChangePointKernel;
 use crate::types::occupancy_trace_for_test;
@@ -2122,13 +2123,10 @@ fn scalar_completion_group_convolution(
     target: usize,
 ) -> (f64, f64, usize) {
     let next_degree = target.min(degree + group_degree);
-    let maximum = binomial[..=group_degree]
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
-    for value in &mut binomial[..=group_degree] {
-        *value = (*value - maximum).exp();
-    }
+    let maximum = dispatch!(Level::new(), simd => exponentiate_log_masses(
+        simd,
+        &mut binomial[..=group_degree],
+    ));
     convolution[..=next_degree].fill(0.0_f64);
     for (known, &coefficient) in coefficients[..=degree].iter().enumerate() {
         let added_count = group_degree.min(target - known) + 1;
@@ -2157,6 +2155,71 @@ fn slice_bits_equal(left: &[f64], right: &[f64]) -> bool {
     left.iter()
         .zip(right)
         .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
+#[quickcheck]
+fn vector_exponential_matches_scalar_libm(seed: u64) -> bool {
+    dispatch!(Level::new(), simd => {
+        let input = <_>::from_fn(simd, |lane| {
+            let mixed = seed.rotate_left(lane as u32)
+                ^ (lane as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let part = u32::try_from(mixed % 1_000_001).map_or(u32::MAX, |value| value);
+            -750.0_f64 + 751.0_f64 * f64::from(part) / 1_000_000.0_f64
+        });
+        let output = vector_exp(simd, input);
+        input
+            .as_slice()
+            .iter()
+            .zip(output.as_slice())
+            .all(|(&input, &output)| exponential_matches_libm(input, output))
+    })
+}
+
+#[test]
+fn vector_exponential_preserves_required_edges() {
+    assert_eq!(
+        vector_exp_scalar(f64::NEG_INFINITY).to_bits(),
+        0.0_f64.to_bits()
+    );
+    assert_eq!(vector_exp_scalar(-746.0_f64).to_bits(), 0.0_f64.to_bits());
+    assert!(exponential_matches_libm(
+        0.0_f64,
+        vector_exp_scalar(0.0_f64)
+    ));
+    assert!(vector_exp_scalar(f64::NAN).is_nan());
+    assert!(vector_exp_scalar(f64::INFINITY).is_nan());
+}
+
+#[test]
+fn vector_exponential_dense_domain_reports_maximum_error() {
+    let mut maximum_absolute_error = 0.0_f64;
+    let mut maximum_relative_error = 0.0_f64;
+    for step in 0..=100_000_u32 {
+        let input = -750.0_f64 + 751.0_f64 * f64::from(step) / 100_000.0_f64;
+        let expected = input.exp();
+        let actual = vector_exp_scalar(input);
+        let absolute_error = (actual - expected).abs();
+        maximum_absolute_error = maximum_absolute_error.max(absolute_error);
+        if expected > 0.0_f64 {
+            maximum_relative_error = maximum_relative_error.max(absolute_error / expected);
+        }
+        assert!(exponential_matches_libm(input, actual));
+    }
+    assert!(maximum_absolute_error <= 1.0e-12_f64);
+    assert!(maximum_relative_error <= 1.0e-9_f64);
+}
+
+fn vector_exp_scalar(value: f64) -> f64 {
+    dispatch!(Level::new(), simd => vector_exp_first(simd, value))
+}
+
+fn vector_exp_first<S: Simd>(simd: S, value: f64) -> f64 {
+    vector_exp(simd, S::f64s::splat(simd, value)).as_slice()[0]
+}
+
+fn exponential_matches_libm(input: f64, actual: f64) -> bool {
+    let expected = input.exp();
+    (actual - expected).abs() <= 1.0e-12_f64.max(1.0e-9_f64 * expected.abs())
 }
 
 fn deleted_poisson_log_kernel(count: f64, mean: f64) -> f64 {
