@@ -16,9 +16,9 @@ use super::{
     completion_expectation, completion_log_likelihood, completion_log_likelihood_reference,
     completion_marginal_probability, contamination_prior, equal_rate_death_step,
     feasibility_probability, feasibility_probability_and_charge, fold_trace, hazard_prior,
-    linear_rate_band, linear_rate_death_step, log_contamination_mixture, log_normal_axis_masses,
-    log_weighted_sum, path_log_score, pure_death_step, pure_death_step_with_rates,
-    record_start_window, uniformized_death_step,
+    integer_ln_gamma_table, linear_rate_band, linear_rate_death_step, log_contamination_mixture,
+    log_normal_axis_masses, log_weighted_sum, path_log_score, pure_death_step,
+    pure_death_step_with_rates, record_start_window, uniformized_death_step,
 };
 use crate::change_point::ChangePointKernel;
 use crate::types::occupancy_trace_for_test;
@@ -268,6 +268,7 @@ fn prehistory_mean_does_not_use_the_completion_response(
 
 #[test]
 fn coverage_ring_matches_unbounded_history() -> Result<(), TestError> {
+    let ln_gamma_integers = integer_ln_gamma_table(257)?;
     let grid = CapacityGrid::new(&[2.0_f64], &[10.0_f64], &[0.0_f64])?;
     let empty = StartWindow {
         end_micros: 0,
@@ -325,6 +326,7 @@ fn coverage_ring_matches_unbounded_history() -> Result<(), TestError> {
                 coefficients: &mut ring_coefficients,
                 convolution: &mut ring_convolution,
                 binomial: &mut ring_binomial,
+                ln_gamma_integers: &ln_gamma_integers,
             },
         );
         let expected = completion_log_likelihood(
@@ -344,6 +346,7 @@ fn coverage_ring_matches_unbounded_history() -> Result<(), TestError> {
                 coefficients: &mut reference_coefficients,
                 convolution: &mut reference_convolution,
                 binomial: &mut reference_binomial,
+                ln_gamma_integers: &ln_gamma_integers,
             },
         );
         let error_bound = 256.0_f64 * f64::EPSILON * actual.abs().max(expected.abs()).max(1.0_f64);
@@ -1347,6 +1350,7 @@ fn operation_price_for_test(
             filter_count: 160,
             filter_curve_count: 160 * cell_count,
             transition_count: 100_001,
+            ln_gamma_integer_count: 50_001,
             start_history_capacity: 1,
             group_count,
         },
@@ -1465,6 +1469,7 @@ fn ablation_likelihoods(
     cell_indexes: [usize; 2],
     observation: AblationWindow<'_>,
 ) -> Result<[[f64; 2]; ABLATION_ARM_COUNT], TestError> {
+    let ln_gamma_integers = integer_ln_gamma_table(2)?;
     let history = [StartWindow {
         end_micros: 1_000_000,
         exposure_seconds: 1.0_f64,
@@ -1490,6 +1495,7 @@ fn ablation_likelihoods(
                 coefficients: &mut scratch.completion_coefficients,
                 convolution: &mut scratch.completion_convolution,
                 binomial: &mut scratch.completion_binomial,
+                ln_gamma_integers: &ln_gamma_integers,
             },
         );
         let rate = super::state_rate(grid, index, 1);
@@ -1883,6 +1889,9 @@ fn completion_group_convolution_matches_scalar_reference(
     service_millis: u16,
     capacity: u16,
 ) -> bool {
+    let Ok(ln_gamma_integers) = integer_ln_gamma_table(32) else {
+        return false;
+    };
     let service_seconds = f64::from(service_millis % 1_900 + 100) / 1_000.0_f64;
     let capacity_per_second = f64::from(capacity % 900 + 100);
     let Ok(grid) = CapacityGrid::new(&[service_seconds], &[capacity_per_second], &[0.0_f64]) else {
@@ -1936,6 +1945,7 @@ fn completion_group_convolution_matches_scalar_reference(
                     coefficients: &mut actual_coefficients,
                     convolution: &mut actual_convolution,
                     binomial: &mut actual_binomial,
+                    ln_gamma_integers: &ln_gamma_integers,
                 },
             );
             let mut reference_coefficients = [0.0_f64; 32];
@@ -1953,6 +1963,7 @@ fn completion_group_convolution_matches_scalar_reference(
                     coefficients: &mut reference_coefficients,
                     convolution: &mut reference_convolution,
                     binomial: &mut reference_binomial,
+                    ln_gamma_integers: &ln_gamma_integers,
                 },
             );
             if actual.to_bits() != reference.to_bits() {

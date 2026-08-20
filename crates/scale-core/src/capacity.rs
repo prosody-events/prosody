@@ -643,6 +643,7 @@ struct CapacityAllocation {
     filter_count: usize,
     filter_curve_count: usize,
     transition_count: usize,
+    ln_gamma_integer_count: usize,
     start_history_capacity: usize,
     group_count: usize,
 }
@@ -652,6 +653,16 @@ struct CompletionScratch<'a> {
     coefficients: &'a mut [f64],
     convolution: &'a mut [f64],
     binomial: &'a mut [f64],
+    ln_gamma_integers: &'a [f64],
+}
+
+#[derive(Clone, Copy)]
+struct CompletionTail<'a> {
+    coefficient_log_scale: f64,
+    posterior_shape: f64,
+    posterior_rate: f64,
+    missing: f64,
+    ln_gamma_integers: &'a [f64],
 }
 
 pub(crate) struct CapacityFactor {
@@ -681,6 +692,7 @@ pub(crate) struct CapacityFactor {
     completion_convolution: Vec<f64>,
     completion_binomial: Vec<f64>,
     completion_cell_cdfs: Vec<f64>,
+    ln_gamma_integers: Vec<f64>,
     state_exposure_seconds: Vec<f64>,
     state_completion_counts: Vec<u32>,
     forward_probabilities: Vec<f64>,
@@ -734,7 +746,7 @@ impl CapacityFactor {
         let filter_curve_count = filter_count
             .checked_mul(cell_count)
             .ok_or(CapacityModelError::StorageBound)?;
-        let transition_count = attempt_transition_count(attempt_count_max)?;
+        let (transition_count, ln_gamma_integer_count) = attempt_buffer_counts(attempt_count_max)?;
         validate_capacity_allocation(
             &grid,
             &artifact,
@@ -744,6 +756,7 @@ impl CapacityFactor {
                 filter_count,
                 filter_curve_count,
                 transition_count,
+                ln_gamma_integer_count,
                 start_history_capacity,
                 group_count: group_count_max as usize,
             },
@@ -782,6 +795,7 @@ impl CapacityFactor {
             completion_convolution: vec![0.0_f64; attempt_count_max as usize + 1],
             completion_binomial: vec![0.0_f64; attempt_count_max as usize + 1],
             completion_cell_cdfs: vec![0.0_f64; cell_count],
+            ln_gamma_integers: integer_ln_gamma_table(ln_gamma_integer_count)?,
             state_exposure_seconds: vec![0.0_f64; state_count],
             state_completion_counts: vec![0; state_count],
             forward_probabilities: vec![0.0_f64; state_count],
@@ -961,6 +975,7 @@ impl CapacityFactor {
                         coefficients: &mut self.completion_coefficients,
                         convolution: &mut self.completion_convolution,
                         binomial: &mut self.completion_binomial,
+                        ln_gamma_integers: &self.ln_gamma_integers,
                     },
                 )
                 .exp();
@@ -1070,6 +1085,7 @@ impl CapacityFactor {
                         coefficients: &mut self.completion_coefficients,
                         convolution: &mut self.completion_convolution,
                         binomial: &mut self.completion_binomial,
+                        ln_gamma_integers: &self.ln_gamma_integers,
                     },
                 )
                 .exp();
@@ -1846,6 +1862,7 @@ fn capacity_storage_bytes(allocation: CapacityAllocation) -> Result<usize, Capac
         filter_count,
         state_count,
         transition_count,
+        ln_gamma_integer_count,
         start_history_capacity,
         ..
     } = allocation;
@@ -1877,19 +1894,37 @@ fn capacity_storage_bytes(allocation: CapacityAllocation) -> Result<usize, Capac
                 .and_then(|count| count.checked_mul(size_of::<StartWindow>()))
                 .and_then(|history_bytes| bytes.checked_add(history_bytes))
         })
+        .and_then(|bytes| {
+            ln_gamma_integer_count
+                .checked_mul(size_of::<f64>())
+                .and_then(|table_bytes| bytes.checked_add(table_bytes))
+        })
         .and_then(|bytes| bytes.checked_add(size_of::<u32>()))
         .ok_or(CapacityModelError::StorageBound)
 }
 
-/// Derives the transition buffer length from the attempt cap.
-fn attempt_transition_count(attempt_count_max: u32) -> Result<usize, CapacityModelError> {
+/// Derives attempt-sized buffer lengths from the attempt cap.
+fn attempt_buffer_counts(attempt_count_max: u32) -> Result<(usize, usize), CapacityModelError> {
     let attempt_count =
         usize::try_from(attempt_count_max).map_err(|_| CapacityModelError::StorageBound)?;
     let transition_count = attempt_count
         .checked_mul(2)
         .and_then(|count| count.checked_add(1))
         .ok_or(CapacityModelError::StorageBound)?;
-    Ok(transition_count)
+    let ln_gamma_integer_count = attempt_count
+        .checked_add(1)
+        .ok_or(CapacityModelError::StorageBound)?;
+    Ok((transition_count, ln_gamma_integer_count))
+}
+
+/// Index `n` stores `ln_gamma(n + 1)` for the certified attempt range.
+fn integer_ln_gamma_table(count: usize) -> Result<Vec<f64>, CapacityModelError> {
+    (0..count)
+        .map(|index| {
+            let integer = u32::try_from(index).map_err(|_| CapacityModelError::StorageBound)?;
+            Ok(ln_gamma(f64::from(integer) + 1.0_f64))
+        })
+        .collect()
 }
 
 fn capacity_grid_storage_bytes(cell_count: usize, knee_cell_count: usize) -> Option<usize> {
@@ -3008,6 +3043,7 @@ fn completion_log_likelihood(
         coefficients,
         convolution,
         binomial,
+        ln_gamma_integers,
     } = scratch;
     let completed = window.completed_attempts as usize;
     if completed >= coefficients.len() {
@@ -3056,7 +3092,13 @@ fn completion_log_likelihood(
             let probability = overlap / start_window.exposure_seconds;
             if probability > 0.0_f64 && probability < 1.0_f64 {
                 let group_degree = (starts as usize).min(target);
-                write_binomial_log_masses(starts, probability, group_degree, binomial);
+                write_binomial_log_masses(
+                    starts,
+                    probability,
+                    group_degree,
+                    binomial,
+                    ln_gamma_integers,
+                );
                 let (maximum, scale, next_degree) = dispatch!(simd_level, simd => completion_group_convolution(
                     simd,
                     coefficients,
@@ -3079,10 +3121,13 @@ fn completion_log_likelihood(
         coefficients,
         degree,
         target,
-        coefficient_log_scale,
-        posterior_shape,
-        posterior_rate,
-        missing,
+        CompletionTail {
+            coefficient_log_scale,
+            posterior_shape,
+            posterior_rate,
+            missing,
+            ln_gamma_integers,
+        },
     )
 }
 
@@ -3095,9 +3140,22 @@ fn write_binomial_log_masses(
     probability: f64,
     group_degree: usize,
     output: &mut [f64],
+    ln_gamma_integers: &[f64],
 ) {
+    // Observation intake rejects windows whose started attempts exceed the
+    // attempt cap, so `trials` and both derived indexes stay inside the table.
+    let trials = starts as usize;
+    let trials_float = f64::from(starts);
+    let trials_log_gamma = ln_gamma_integers[trials];
+    let log_probability = probability.ln();
+    let log_failure_probability = (-probability).ln_1p();
     for (mass_index, value) in output[..=group_degree].iter_mut().enumerate() {
-        *value = binomial_log_probability(starts, mass_index, probability);
+        let count = f64::from(u32::try_from(mass_index).map_or(u32::MAX, |value| value));
+        *value = trials_log_gamma
+            - ln_gamma_integers[mass_index]
+            - ln_gamma_integers[trials - mass_index]
+            + count * log_probability
+            + (trials_float - count) * log_failure_probability;
     }
 }
 
@@ -3286,7 +3344,7 @@ fn completion_log_likelihood_reference(
         }
     }
     let missing = (window.exposure_seconds() - known_overlap).max(0.0_f64);
-    completion_probability_from_coefficients(
+    completion_probability_from_coefficients_reference(
         coefficients,
         degree,
         target,
@@ -3297,11 +3355,8 @@ fn completion_log_likelihood_reference(
     )
 }
 
-#[cfg_attr(
-    feature = "hotpath",
-    hotpath::measure(label = "completion_probability_from_coefficients")
-)]
-fn completion_probability_from_coefficients(
+#[cfg(test)]
+fn completion_probability_from_coefficients_reference(
     coefficients: &[f64],
     degree: usize,
     target: usize,
@@ -3333,6 +3388,70 @@ fn completion_probability_from_coefficients(
     likelihood
 }
 
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "completion_probability_from_coefficients")
+)]
+fn completion_probability_from_coefficients(
+    coefficients: &[f64],
+    degree: usize,
+    target: usize,
+    tail: CompletionTail<'_>,
+) -> f64 {
+    let CompletionTail {
+        coefficient_log_scale,
+        posterior_shape,
+        posterior_rate,
+        missing,
+        ln_gamma_integers,
+    } = tail;
+    if missing == 0.0_f64 {
+        return if target <= degree && coefficients[target] > 0.0_f64 {
+            coefficients[target].ln() + coefficient_log_scale
+        } else {
+            f64::NEG_INFINITY
+        };
+    }
+    let success = posterior_rate / (posterior_rate + missing);
+    let shape_log_gamma = ln_gamma(posterior_shape);
+    let log_success = success.ln();
+    let log_failure = (-success).ln_1p();
+    let mut likelihood = f64::NEG_INFINITY;
+    for (known, coefficient) in coefficients.iter().enumerate().take(degree.min(target) + 1) {
+        if *coefficient > 0.0_f64 {
+            let missing_count = target - known;
+            likelihood = log_add_exp(
+                likelihood,
+                coefficient.ln()
+                    + coefficient_log_scale
+                    + negative_binomial_log_probability_hoisted(
+                        posterior_shape,
+                        missing_count,
+                        shape_log_gamma,
+                        log_success,
+                        log_failure,
+                        ln_gamma_integers,
+                    ),
+            );
+        }
+    }
+    likelihood
+}
+
+fn negative_binomial_log_probability_hoisted(
+    shape: f64,
+    count: usize,
+    shape_log_gamma: f64,
+    log_success: f64,
+    log_failure: f64,
+    ln_gamma_integers: &[f64],
+) -> f64 {
+    let count_float = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
+    ln_gamma(count_float + shape) - shape_log_gamma - ln_gamma_integers[count]
+        + shape * log_success
+        + count_float * log_failure
+}
+
 fn binomial_log_probability(trials: u32, count: usize, probability: f64) -> f64 {
     let trials = f64::from(trials);
     let count = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
@@ -3341,6 +3460,7 @@ fn binomial_log_probability(trials: u32, count: usize, probability: f64) -> f64 
         + (trials - count) * (-probability).ln_1p()
 }
 
+#[cfg(test)]
 fn negative_binomial_log_probability(shape: f64, success: f64, count: usize) -> f64 {
     let count = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
     ln_gamma(count + shape) - ln_gamma(shape) - ln_gamma(count + 1.0_f64)
