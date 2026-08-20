@@ -11,8 +11,9 @@ use crate::capacity::{
     curve_throughput,
 };
 use crate::edf::{
-    ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
-    evaluate_prepared_step, evaluate_prepared_trajectory, prepare,
+    ArrivalPath, EdfOutcomeLanes, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
+    evaluate_prepared_step, evaluate_prepared_step_capacities, evaluate_prepared_trajectory,
+    prepare,
 };
 use crate::lead_time::{LaunchComponentSummary, LaunchTimeFactor, RebalanceTimeFactor};
 use crate::partition::PartitionFactor;
@@ -1375,6 +1376,17 @@ fn evaluate_scenario_workers(
         prepare_partition_placements(shared, workspace);
         for local in 0..columns.scenario_count {
             let scenario = columns.first_scenario + local;
+            prepare_scenario_supply(
+                state,
+                shared,
+                workspace,
+                &mut columns.cells(local),
+                scenario,
+            );
+        }
+        partition_deadline_outcomes(state, shared, workspace, &mut columns);
+        for local in 0..columns.scenario_count {
+            let scenario = columns.first_scenario + local;
             evaluate_one_scenario(state, shared, workspace, columns.cells(local), scenario);
         }
         return;
@@ -1430,44 +1442,11 @@ fn evaluate_one_scenario(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
-    cells: ScenarioCells<'_>,
+    mut cells: ScenarioCells<'_>,
     scenario: usize,
 ) {
-    let capacity_class = scenario / shared.inner_count;
+    let current_supply = prepare_scenario_supply(state, shared, workspace, &mut cells, scenario);
     let sample = scenario as u32;
-    let representative = state.capacity_classes.representative(capacity_class);
-    let (curve, _) = state.capacity.curve_and_probability(representative);
-    // ScaleScratch::new gives both buffers one replica-count element per action.
-    dispatch!(state.simd_level, simd => curve_throughput(
-        simd,
-        curve,
-        shared.candidate_concurrency,
-        &mut workspace.posterior_resource_supply,
-    ));
-    let mut reliability_random = decision_random(
-        state.decision_index,
-        sample,
-        DecisionRandomDomain::Reliability,
-    );
-    let (normal_retry, failure_retry) = state
-        .reliability
-        .sample_retry_probabilities(&mut reliability_random);
-    let event_supply_factor = mixed_event_supply(
-        1.0_f64,
-        normal_retry,
-        failure_retry,
-        state.configuration.failure_service_weight,
-        shared.normal_events,
-        shared.failure_events,
-    );
-    dispatch!(state.simd_level, simd => scale_and_store_supply(
-        simd,
-        event_supply_factor,
-        &mut workspace.posterior_resource_supply,
-        &mut *cells.supply,
-    ));
-    let current_concurrency = shared.candidate_concurrency[shared.current_index];
-    let current_supply = curve.sustainable_throughput(current_concurrency) * event_supply_factor;
     let lead_random = decision_random(state.decision_index, sample, DecisionRandomDomain::LeadTime);
     let rebalance_random = decision_random(
         state.decision_index,
@@ -1519,6 +1498,50 @@ fn evaluate_one_scenario(
     );
 }
 
+fn prepare_scenario_supply(
+    state: &ScaleState,
+    shared: &ScenarioShared<'_>,
+    workspace: &mut ScenarioWorkspace,
+    cells: &mut ScenarioCells<'_>,
+    scenario: usize,
+) -> f64 {
+    let capacity_class = scenario / shared.inner_count;
+    let sample = scenario as u32;
+    let representative = state.capacity_classes.representative(capacity_class);
+    let (curve, _) = state.capacity.curve_and_probability(representative);
+    // ScaleScratch::new gives both buffers one replica-count element per action.
+    dispatch!(state.simd_level, simd => curve_throughput(
+        simd,
+        curve,
+        shared.candidate_concurrency,
+        &mut workspace.posterior_resource_supply,
+    ));
+    let mut reliability_random = decision_random(
+        state.decision_index,
+        sample,
+        DecisionRandomDomain::Reliability,
+    );
+    let (normal_retry, failure_retry) = state
+        .reliability
+        .sample_retry_probabilities(&mut reliability_random);
+    let event_supply_factor = mixed_event_supply(
+        1.0_f64,
+        normal_retry,
+        failure_retry,
+        state.configuration.failure_service_weight,
+        shared.normal_events,
+        shared.failure_events,
+    );
+    dispatch!(state.simd_level, simd => scale_and_store_supply(
+        simd,
+        event_supply_factor,
+        &mut workspace.posterior_resource_supply,
+        &mut *cells.supply,
+    ));
+    let current_concurrency = shared.candidate_concurrency[shared.current_index];
+    curve.sustainable_throughput(current_concurrency) * event_supply_factor
+}
+
 /// Evaluates one scenario's prepared trajectories into decision cells.
 fn evaluate_scenario_outcome(
     state: &ScaleState,
@@ -1530,14 +1553,6 @@ fn evaluate_scenario_outcome(
     let start_seconds = Duration::from_micros(state.model_time.as_micros()).as_secs_f64();
     let disturbance_horizon_seconds =
         Duration::from_micros(forecast.disturbance_horizon_micros).as_secs_f64();
-    partition_deadline_outcomes(
-        state,
-        shared,
-        workspace,
-        forecast,
-        cells.partition_missed_work,
-        cells.partition_late_area,
-    );
     let arrival_path = ArrivalPath {
         start_seconds,
         end_seconds: &cells.arrival_path_end_seconds[..forecast.path_length],
@@ -2622,50 +2637,104 @@ fn partition_deadline_outcomes(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
     workspace: &mut ScenarioWorkspace,
-    forecast: &ScenarioForecast,
-    missed_work: &mut [f64],
-    late_area: &mut [f64],
+    columns: &mut ScenarioColumns<'_>,
+) {
+    columns.partition_missed_work.fill(0.0_f64);
+    columns.partition_late_area.fill(0.0_f64);
+    dispatch!(state.simd_level, simd => partition_deadline_outcomes_simd(
+        simd,
+        state,
+        shared,
+        workspace,
+        columns,
+    ));
+}
+
+fn partition_deadline_outcomes_simd<S: Simd>(
+    simd: S,
+    state: &ScaleState,
+    shared: &ScenarioShared<'_>,
+    workspace: &mut ScenarioWorkspace,
+    columns: &mut ScenarioColumns<'_>,
 ) {
     let no_arrivals = ArrivalPath {
         start_seconds: Duration::from_micros(state.model_time.as_micros()).as_secs_f64(),
         end_seconds: &[f64::MAX],
         rates: &[0.0_f64],
     };
+    let window = EvaluationWindow {
+        start_micros: state.model_time.as_micros(),
+        horizon_micros: shared.planning_horizon_micros,
+        initial_debt_work: 0.0_f64,
+        deadline_budget_micros: state.configuration.objective.budget_micros(),
+    };
+    let lane_count = S::f64s::N;
     let mut placement_index = 0_usize;
     for candidate in 0..shared.action_count {
         let replica_count = (candidate + 1).min(shared.partition_count);
-        let capacity = partition_replica_capacity(
-            workspace.posterior_resource_supply[candidate],
-            replica_count,
-        );
-        let mut candidate_missed = 0.0_f64;
-        let mut candidate_late = 0.0_f64;
         for _ in 0..replica_count {
             let placement = &mut workspace.prepared_placements[placement_index];
-            let outcome = evaluate_prepared_step(
-                &placement.cohorts,
-                SupplyStep {
-                    before: capacity,
-                    during: capacity,
-                    after: capacity,
-                    pause_micros: state.model_time.as_micros(),
-                    ready_micros: state.model_time.as_micros(),
-                },
-                EvaluationWindow {
-                    start_micros: state.model_time.as_micros(),
-                    horizon_micros: forecast.planning_horizon_micros,
-                    initial_debt_work: 0.0_f64,
-                    deadline_budget_micros: state.configuration.objective.budget_micros(),
-                },
-                &no_arrivals,
-                &mut placement.edf,
-            );
-            candidate_missed += outcome.missed_work;
-            candidate_late += outcome.late_area + outcome.terminal_late_area;
+            let full_lane_count = columns.scenario_count / lane_count * lane_count;
+            for local in (0..full_lane_count).step_by(lane_count) {
+                let capacities = S::f64s::from_fn(simd, |lane| {
+                    let cell = (local + lane) * columns.candidate_stride + candidate;
+                    partition_replica_capacity(columns.supply[cell], replica_count)
+                });
+                let outcomes = evaluate_prepared_step_capacities(
+                    simd,
+                    &placement.cohorts,
+                    capacities,
+                    window,
+                    &no_arrivals,
+                    &placement.edf,
+                );
+                accumulate_partition_outcome_lanes(
+                    columns, candidate, local, lane_count, &outcomes,
+                );
+            }
+            for local in full_lane_count..columns.scenario_count {
+                let cell = local * columns.candidate_stride + candidate;
+                let capacity = partition_replica_capacity(columns.supply[cell], replica_count);
+                let outcome = evaluate_prepared_step(
+                    &placement.cohorts,
+                    SupplyStep {
+                        before: capacity,
+                        during: capacity,
+                        after: capacity,
+                        pause_micros: state.model_time.as_micros(),
+                        ready_micros: state.model_time.as_micros(),
+                    },
+                    window,
+                    &no_arrivals,
+                    &mut placement.edf,
+                );
+                columns.partition_missed_work[cell] += outcome.missed_work;
+                columns.partition_late_area[cell] += outcome.late_area + outcome.terminal_late_area;
+            }
             placement_index += 1;
         }
-        missed_work[candidate] = candidate_missed;
-        late_area[candidate] = candidate_late;
+    }
+}
+
+fn accumulate_partition_outcome_lanes<S: Simd>(
+    columns: &mut ScenarioColumns<'_>,
+    candidate: usize,
+    first_local: usize,
+    lane_count: usize,
+    outcomes: &EdfOutcomeLanes<S>,
+) {
+    let EdfOutcomeLanes {
+        delay_area: _delay_area,
+        missed_work,
+        late_area,
+        terminal_late_area,
+        drain_seconds: _drain_seconds,
+    } = outcomes;
+    for lane in 0..lane_count {
+        let cell = (first_local + lane) * columns.candidate_stride + candidate;
+        columns.partition_missed_work[cell] += missed_work.as_slice()[lane];
+        columns.partition_late_area[cell] +=
+            late_area.as_slice()[lane] + terminal_late_area.as_slice()[lane];
     }
 }
 

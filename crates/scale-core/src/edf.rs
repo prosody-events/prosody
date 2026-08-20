@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use fearless_simd::{Simd, prelude::*};
+
 use crate::types::WorkCohorts;
 
 pub(crate) struct EdfScratch {
@@ -91,6 +93,23 @@ struct DeadlineState {
 struct DeadlineAdvance {
     queue_area: f64,
     late_area: f64,
+}
+
+struct DeadlineStateLanes<S: Simd> {
+    queue: S::f64s,
+    on_time: S::f64s,
+    overdue: S::f64s,
+    completion_credit: S::f64s,
+    due_work: S::f64s,
+    missed: S::f64s,
+}
+
+pub(crate) struct EdfOutcomeLanes<S: Simd> {
+    pub(crate) delay_area: S::f64s,
+    pub(crate) missed_work: S::f64s,
+    pub(crate) late_area: S::f64s,
+    pub(crate) terminal_late_area: S::f64s,
+    pub(crate) drain_seconds: S::f64s,
 }
 
 impl DeadlineState {
@@ -225,6 +244,115 @@ impl DeadlineState {
             capacity.min(arrival_rate)
         }
     }
+}
+
+impl<S: Simd> DeadlineStateLanes<S> {
+    fn new(simd: S) -> Self {
+        let zero = S::f64s::splat(simd, 0.0_f64);
+        Self {
+            queue: zero,
+            on_time: zero,
+            overdue: zero,
+            completion_credit: zero,
+            due_work: zero,
+            missed: zero,
+        }
+    }
+
+    fn release(&mut self, work: f64) {
+        self.queue += work;
+        self.on_time += work;
+    }
+
+    fn make_due(&mut self, simd: S, work: f64) {
+        self.due_work += work;
+        let zero = S::f64s::splat(simd, 0.0_f64);
+        let work = S::f64s::splat(simd, work);
+        let covered = self.completion_credit.simd_ge(work);
+        let remaining_due = work - self.completion_credit;
+        let missed = remaining_due.min(self.on_time);
+        self.completion_credit = covered.select(self.completion_credit - work, zero);
+        self.on_time = covered.select(self.on_time, self.on_time - missed);
+        self.overdue = covered.select(self.overdue, self.overdue + missed);
+        self.missed = covered.select(self.missed, self.missed + missed);
+    }
+
+    fn advance(&mut self, simd: S, duration: f64, capacity: S::f64s) -> DeadlineAdvanceLanes<S> {
+        let zero = S::f64s::splat(simd, 0.0_f64);
+        let half = S::f64s::splat(simd, 0.5_f64);
+        let infinity = S::f64s::splat(simd, f64::INFINITY);
+        let mut remaining = S::f64s::splat(simd, duration);
+        let mut queue_area = zero;
+        let mut late_area = zero;
+        // Each scalar lane has at most four zero crossings. The vector loop
+        // uses the largest lane count, so five passes still suffice.
+        let iteration_bound = 5_usize;
+        let mut iterations = 0_usize;
+        while remaining.simd_gt(zero).any_true() {
+            iterations += 1;
+            debug_assert!(
+                iterations <= iteration_bound,
+                "the constant-rate breakpoint proof bounds each advance"
+            );
+            let queue_positive = self.queue.simd_gt(zero);
+            let service_rate = queue_positive.select(capacity, zero);
+            let had_overdue = self.overdue.simd_gt(zero);
+            let overdue_service = had_overdue.select(service_rate, zero);
+            let on_time_service = had_overdue.select(zero, service_rate);
+            let queue_rate = -service_rate;
+            let overdue_rate = -overdue_service;
+            let on_time_rate = -on_time_service;
+            let credit_rate = on_time_service;
+            let queue_crossing =
+                positive_crossing_lanes::<S>(self.queue, queue_rate, zero, infinity);
+            let overdue_crossing =
+                positive_crossing_lanes::<S>(self.overdue, overdue_rate, zero, infinity);
+            let on_time_crossing =
+                positive_crossing_lanes::<S>(self.on_time, on_time_rate, zero, infinity);
+            let credit_crossing =
+                positive_crossing_lanes::<S>(self.completion_credit, credit_rate, zero, infinity);
+            let crossing = queue_crossing
+                .min(overdue_crossing)
+                .min(on_time_crossing)
+                .min(credit_crossing);
+            let span = crossing.min(remaining);
+            let queue_after = self.queue + queue_rate * span;
+            let overdue_after = self.overdue + overdue_rate * span;
+            queue_area += half * (self.queue + queue_after) * span;
+            late_area += half * (self.overdue + overdue_after) * span;
+            self.queue = queue_after;
+            self.overdue = overdue_after;
+            self.on_time += on_time_rate * span;
+            self.completion_credit += credit_rate * span;
+            let missed_rate = had_overdue.select(zero, overdue_rate.max(zero));
+            self.missed += missed_rate * span;
+            self.queue = queue_crossing.simd_eq(span).select(zero, self.queue);
+            self.overdue = overdue_crossing.simd_eq(span).select(zero, self.overdue);
+            self.on_time = on_time_crossing.simd_eq(span).select(zero, self.on_time);
+            self.completion_credit = credit_crossing
+                .simd_eq(span)
+                .select(zero, self.completion_credit);
+            remaining -= span;
+        }
+        DeadlineAdvanceLanes {
+            queue_area,
+            late_area,
+        }
+    }
+}
+
+struct DeadlineAdvanceLanes<S: Simd> {
+    queue_area: S::f64s,
+    late_area: S::f64s,
+}
+
+fn positive_crossing_lanes<S: Simd>(
+    value: S::f64s,
+    rate: S::f64s,
+    zero: S::f64s,
+    infinity: S::f64s,
+) -> S::f64s {
+    (value.simd_gt(zero) & rate.simd_lt(zero)).select(value / -rate, infinity)
 }
 
 fn positive_crossing(value: f64, rate: f64) -> f64 {
@@ -756,6 +884,126 @@ pub(crate) fn evaluate_prepared_step<Unit>(
     )
 }
 
+/// Evaluates one constant-capacity scenario in each SIMD lane.
+///
+/// All lanes share cohorts, times, zero arrivals, and zero initial debt. Each
+/// lane supplies one constant capacity for the complete window.
+pub(crate) fn evaluate_prepared_step_capacities<S: Simd, Unit>(
+    simd: S,
+    cohorts: &WorkCohorts<Unit>,
+    capacities: S::f64s,
+    window: EvaluationWindow,
+    future_arrivals: &ArrivalPath<'_>,
+    scratch: &EdfScratch,
+) -> EdfOutcomeLanes<S> {
+    assert!(
+        cohorts.is_valid_at(window.start_micros),
+        "invalid cohort order"
+    );
+    assert!(
+        window.initial_debt_work.to_bits().trailing_zeros() >= 63,
+        "batched EDF requires zero initial debt"
+    );
+    assert!(
+        future_arrivals
+            .rates
+            .iter()
+            .all(|rate| rate.to_bits().trailing_zeros() >= 63),
+        "batched EDF requires zero arrivals"
+    );
+    let mut release_cursor = 0_usize;
+    let mut deadline_cursor = 0_usize;
+    let mut now_micros = window.start_micros;
+    let mut deadline = DeadlineStateLanes::new(simd);
+    let zero = S::f64s::splat(simd, 0.0_f64);
+    let mut delay_area = zero;
+    let mut late_area = zero;
+    let budget_seconds = Duration::from_micros(window.deadline_budget_micros).as_secs_f64();
+    let mut arrival_cursor = ArrivalCursor::new(future_arrivals);
+    while now_micros < window.horizon_micros {
+        deadline.release(release_work(
+            cohorts,
+            scratch,
+            &mut release_cursor,
+            now_micros,
+        ));
+        deadline.make_due(
+            simd,
+            deadline_work(cohorts, scratch, &mut deadline_cursor, now_micros),
+        );
+        let mut next_micros = window.horizon_micros;
+        next_micros = next_micros.min(next_release_micros(cohorts, scratch, release_cursor));
+        next_micros = next_micros.min(next_deadline_micros(cohorts, scratch, deadline_cursor));
+        let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
+        arrival_cursor.advance_to(now_seconds, budget_seconds);
+        if let Some(boundary) = arrival_cursor.next_boundary() {
+            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
+        }
+        if let Some(boundary) = arrival_cursor.next_deadline_boundary(now_seconds, budget_seconds) {
+            next_micros = next_micros.min(seconds_to_micros_ceil(boundary));
+        }
+        if next_micros <= now_micros {
+            break;
+        }
+        let duration_seconds = Duration::from_micros(next_micros - now_micros).as_secs_f64();
+        let advance = deadline.advance(simd, duration_seconds, capacities);
+        delay_area += advance.queue_area;
+        late_area += advance.late_area;
+        now_micros = next_micros;
+    }
+    deadline.release(release_work(
+        cohorts,
+        scratch,
+        &mut release_cursor,
+        now_micros,
+    ));
+    deadline.make_due(
+        simd,
+        deadline_work(cohorts, scratch, &mut deadline_cursor, now_micros),
+    );
+    edf_outcome_lanes(
+        simd,
+        &deadline,
+        delay_area,
+        late_area,
+        capacities,
+        Duration::from_micros(window.horizon_micros.saturating_sub(window.start_micros))
+            .as_secs_f64(),
+    )
+}
+
+fn edf_outcome_lanes<S: Simd>(
+    simd: S,
+    deadline: &DeadlineStateLanes<S>,
+    delay_area: S::f64s,
+    late_area: S::f64s,
+    terminal_capacity: S::f64s,
+    continuation_seconds: f64,
+) -> EdfOutcomeLanes<S> {
+    let zero = S::f64s::splat(simd, 0.0_f64);
+    let half = S::f64s::splat(simd, 0.5_f64);
+    let one = S::f64s::splat(simd, 1.0_f64);
+    let horizon = S::f64s::splat(simd, continuation_seconds);
+    let queue_zero = deadline.queue.simd_eq(zero);
+    let capacity_positive = terminal_capacity.simd_gt(zero);
+    let safe_capacity = capacity_positive.select(terminal_capacity, one);
+    let positive_drain = (deadline.queue / safe_capacity).min(horizon);
+    let drain_seconds = queue_zero.select(zero, capacity_positive.select(positive_drain, horizon));
+    let residual = (deadline.queue - terminal_capacity * drain_seconds).max(zero);
+    let terminal_late_area = queue_zero.select(
+        zero,
+        deadline.queue * drain_seconds - half * terminal_capacity * drain_seconds * drain_seconds
+            + residual * horizon,
+    );
+    EdfOutcomeLanes {
+        delay_area,
+        missed_work: deadline.missed,
+        late_area,
+        terminal_late_area,
+        drain_seconds,
+    }
+}
+
 /// Clamps one event step to the next supply or arrival boundary.
 fn shared_boundary_micros(
     trajectory: &TrajectoryCursor<'_>,
@@ -1110,12 +1358,15 @@ fn seconds_to_micros_ceil(seconds: f64) -> u64 {
 mod tests {
     use std::iter::repeat;
 
+    use fearless_simd::{Level, Simd, dispatch, prelude::*};
+    use quickcheck::TestResult;
     use quickcheck_macros::quickcheck;
 
     use super::{
-        ArrivalPath, DeadlineState, EdfScratch, EvaluationWindow, SupplyTrajectory,
+        ArrivalPath, DeadlineState, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
         TrajectoryCursor, evaluate_general_trajectory, evaluate_general_trajectory_reference,
-        evaluate_prepared_trajectory, prepare, terminal_closure,
+        evaluate_prepared_step, evaluate_prepared_step_capacities, evaluate_prepared_trajectory,
+        prepare, terminal_closure,
     };
     use crate::types::SlotSecondCohorts;
 
@@ -1124,6 +1375,106 @@ mod tests {
         end_seconds: &[f64::MAX],
         rates: &[0.0_f64],
     };
+
+    #[quickcheck]
+    fn batched_step_matches_each_scalar_lane(
+        release_seeds: Vec<u16>,
+        deadline_seeds: Vec<u16>,
+        work_seeds: Vec<u16>,
+        capacity_seed: u64,
+        budget_seed: u16,
+    ) -> TestResult {
+        let count = release_seeds.len().clamp(1, 16);
+        let releases = release_seeds.into_iter().chain(repeat(0));
+        let deadlines = deadline_seeds.into_iter().chain(repeat(0));
+        let works = work_seeds.into_iter().chain(repeat(1));
+        let mut cohorts = SlotSecondCohorts::new(count);
+        let mut horizon_micros = 1_u64;
+        for (index, ((release_seed, deadline_seed), work_seed)) in
+            releases.zip(deadlines).zip(works).take(count).enumerate()
+        {
+            let release_micros = u64::from(release_seed % 2_000) * 1_000;
+            let deadline_micros = release_micros + u64::from(deadline_seed % 2_000 + 1) * 1_000;
+            let work = f64::from(work_seed % 1_000 + 1) / 10.0_f64;
+            let partition = u32::try_from(index).map_or(u32::MAX, |value| value);
+            cohorts.push_values(release_micros, deadline_micros, work, partition);
+            horizon_micros = horizon_micros.max(deadline_micros + 1_000_000);
+        }
+        let window = EvaluationWindow {
+            start_micros: 0,
+            horizon_micros,
+            initial_debt_work: 0.0_f64,
+            deadline_budget_micros: u64::from(budget_seed % 2_000 + 1) * 1_000,
+        };
+        let Ok(count_u32) = u32::try_from(count) else {
+            return TestResult::error("the cohort count exceeded u32");
+        };
+        let Ok(mut scratch) = EdfScratch::new(count_u32) else {
+            return TestResult::error("EDF scratch rejected a bounded cohort count");
+        };
+        prepare(&cohorts, &mut scratch);
+        TestResult::from_bool(dispatch!(Level::new(), simd => batch_step_matches_scalar(
+            simd,
+            &cohorts,
+            &mut scratch,
+            window,
+            capacity_seed,
+        )))
+    }
+
+    fn batch_step_matches_scalar<S: Simd>(
+        simd: S,
+        cohorts: &SlotSecondCohorts,
+        scratch: &mut EdfScratch,
+        window: EvaluationWindow,
+        capacity_seed: u64,
+    ) -> bool {
+        let capacities = S::f64s::from_fn(simd, |lane| {
+            let shift = u32::try_from((lane % 8) * 8).map_or(0, |value| value);
+            let rotated = capacity_seed.rotate_left(shift) & u64::from(u16::MAX);
+            let seed = u16::try_from(rotated).map_or(u16::MAX, |value| value);
+            f64::from(seed % 2_000 + 1) / 100.0_f64
+        });
+        let batch = evaluate_prepared_step_capacities(
+            simd,
+            cohorts,
+            capacities,
+            window,
+            &NO_FUTURE_ARRIVALS,
+            scratch,
+        );
+        for (lane, &capacity) in capacities.as_slice().iter().enumerate() {
+            let scalar = evaluate_prepared_step(
+                cohorts,
+                SupplyStep {
+                    before: capacity,
+                    during: capacity,
+                    after: capacity,
+                    pause_micros: window.start_micros,
+                    ready_micros: window.start_micros,
+                },
+                window,
+                &NO_FUTURE_ARRIVALS,
+                scratch,
+            );
+            if !edf_float_matches(batch.delay_area.as_slice()[lane], scalar.delay_area)
+                || !edf_float_matches(batch.missed_work.as_slice()[lane], scalar.missed_work)
+                || !edf_float_matches(batch.late_area.as_slice()[lane], scalar.late_area)
+                || !edf_float_matches(
+                    batch.terminal_late_area.as_slice()[lane],
+                    scalar.terminal_late_area,
+                )
+                || !edf_float_matches(batch.drain_seconds.as_slice()[lane], scalar.drain_seconds)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn edf_float_matches(actual: f64, expected: f64) -> bool {
+        (actual - expected).abs() <= 1.0e-12_f64.max(1.0e-9_f64 * expected.abs())
+    }
 
     #[test]
     fn supply_trajectory_keeps_exact_microsecond_boundaries() {
