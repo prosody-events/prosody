@@ -122,6 +122,7 @@ impl PartitionFactor {
         })
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "partition_update"))]
     pub(crate) fn update(&mut self, counts: &[u32]) {
         assert_eq!(
             counts.len(),

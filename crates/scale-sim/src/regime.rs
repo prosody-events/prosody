@@ -234,6 +234,23 @@ pub fn run_principal_regime_seeded(
     run_principal_definition(regime, definition, None)
 }
 
+/// Runs one bounded principal regime for hot-path profiling.
+///
+/// Profiling runs bound ticks so the report prints inside the test-time cap.
+///
+/// # Errors
+///
+/// Returns an error when a fixed plant bound is invalid or full.
+#[cfg(feature = "hotpath")]
+pub fn run_principal_regime_profiled(
+    regime: PrincipalRegime,
+    seed: u64,
+    tick_count_max: u64,
+) -> Result<PrincipalRun, PrincipalRunError> {
+    let definition = PrincipalDefinition::for_regime(regime).seeded(seed);
+    run_principal_definition_inner(regime, definition, None, Some(tick_count_max))
+}
+
 /// Runs an extended capacity experiment under controller actuation.
 ///
 /// # Errors
@@ -1501,6 +1518,21 @@ fn run_principal_definition(
     definition: PrincipalDefinition,
     sensitivity: Option<CapacitySensitivity>,
 ) -> Result<PrincipalRun, PrincipalRunError> {
+    run_principal_definition_inner(
+        regime,
+        definition,
+        sensitivity,
+        #[cfg(feature = "hotpath")]
+        None,
+    )
+}
+
+fn run_principal_definition_inner(
+    regime: PrincipalRegime,
+    definition: PrincipalDefinition,
+    sensitivity: Option<CapacitySensitivity>,
+    #[cfg(feature = "hotpath")] profile_tick_count_max: Option<u64>,
+) -> Result<PrincipalRun, PrincipalRunError> {
     let seed = definition.inputs.seed;
     let capacity_regime = is_capacity_regime(regime);
     let slots_per_replica = DEFAULT_CONCURRENCY_PER_REPLICA;
@@ -1528,7 +1560,14 @@ fn run_principal_definition(
         graph,
         attempt_model,
     )?;
-    let stop = run_schedule(&mut harness, regime, seed, definition.schedule)?;
+    let stop = run_schedule(
+        &mut harness,
+        regime,
+        seed,
+        definition.schedule,
+        #[cfg(feature = "hotpath")]
+        profile_tick_count_max,
+    )?;
     let (simulation, graph) = harness.finish_with_graph();
     let (controller, graph) = graph.into_parts();
     Ok(PrincipalRun {
@@ -2047,8 +2086,11 @@ fn run_schedule(
     regime: PrincipalRegime,
     seed: u64,
     schedule: RunSchedule,
+    #[cfg(feature = "hotpath")] profile_tick_count_max: Option<u64>,
 ) -> Result<RunStop, PrincipalRunError> {
     let mut at_micros = schedule.start_micros;
+    #[cfg(feature = "hotpath")]
+    let mut profile_tick_count = 0_u64;
     let mut stable_count = 0_u8;
     let tick_count_max = schedule.controller_sample_count_max()?;
     let mut progress = RunProgress::new(regime, seed, tick_count_max)?;
@@ -2065,6 +2107,16 @@ fn run_schedule(
             at_micros,
             tick_count_max,
         )?;
+        #[cfg(feature = "hotpath")]
+        {
+            profile_tick_count = profile_tick_count.saturating_add(1);
+            if profile_tick_count_max.is_some_and(|maximum| profile_tick_count >= maximum) {
+                break Ok(RunStop {
+                    at_micros,
+                    reason: RunStopReason::IdleStable,
+                });
+            }
+        }
         match schedule.stop {
             StopCondition::IdleStable { sample_count } => {
                 let stable = at_micros >= schedule.workload_end_micros

@@ -164,6 +164,7 @@ impl ReliabilityFactor {
         }
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "reliability_update"))]
     pub(crate) fn update(&mut self, evidence: AttemptOutcomeEvidence) {
         self.normal.update(evidence.normal);
         self.failure.update(evidence.failure);

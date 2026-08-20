@@ -9,8 +9,12 @@ publish = false
 repository = "https://github.com/prosody-events/prosody"
 version = "0.1.0"
 
+[features]
+hotpath = ["dep:hotpath"]
+
 [dependencies]
 fearless_simd.workspace = true
+hotpath = { version = "0.23", features = ["hotpath"], optional = true }
 rand.workspace = true
 rand_distr.workspace = true
 rand_xoshiro.workspace = true

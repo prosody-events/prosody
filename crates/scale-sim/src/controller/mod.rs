@@ -1775,6 +1775,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         (self.trace, self.workload)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "prepare_observation"))]
     fn prepare_observation(
         &mut self,
         context: &TickContext<'_>,
@@ -1864,6 +1865,10 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         Ok(())
     }
 
+    #[cfg_attr(
+        feature = "hotpath",
+        hotpath::measure(label = "prepare_arrival_evidence")
+    )]
     fn prepare_arrival_evidence(
         &mut self,
         context: &TickContext<'_>,
@@ -1941,6 +1946,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "replace_aggregator"))]
     fn replace_aggregator(&mut self) -> Result<(), PlantError> {
         self.state = ScaleState::new(
             self.configuration.core().clone(),
@@ -1955,6 +1961,10 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         Ok(())
     }
 
+    #[cfg_attr(
+        feature = "hotpath",
+        hotpath::measure(label = "prepare_transition_evidence")
+    )]
     fn prepare_transition_evidence(&mut self, context: &TickContext<'_>) -> Result<(), PlantError> {
         let mut index = 0_usize;
         while index < self.inflight_transitions.len() {
@@ -2054,6 +2064,10 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         Ok(())
     }
 
+    #[cfg_attr(
+        feature = "hotpath",
+        hotpath::measure(label = "prepare_attempt_outcomes")
+    )]
     fn prepare_attempt_outcomes(&mut self, context: &TickContext<'_>) -> Result<(), PlantError> {
         if self.latest_capacity_window.is_none() {
             return Ok(());
@@ -2140,6 +2154,10 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
     /// A tie clamps to offset zero or to the full exposure. Only a window
     /// that spans exactly one report interval is a certified report; a tick
     /// at any other spacing omits the observation.
+    #[cfg_attr(
+        feature = "hotpath",
+        hotpath::measure(label = "prepare_capacity_evidence")
+    )]
     fn prepare_capacity_evidence(&mut self, context: &TickContext<'_>) -> Result<(), PlantError> {
         let Some(previous_micros) = context.history.now_micros(0) else {
             return Ok(());
@@ -2218,6 +2236,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "count_generated"))]
     fn count_generated(
         &mut self,
         context: &TickContext<'_>,
@@ -2253,6 +2272,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "push_backlog_cohorts"))]
     fn push_backlog_cohorts(&mut self, context: &TickContext<'_>) -> Result<(), PlantError> {
         for partition in 0..self.generated_counts.len() {
             let Some(normal) = context.normal_backlog.get(partition) else {
@@ -2300,6 +2320,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "apply_decision"))]
     fn apply_decision(
         &mut self,
         context: &TickContext<'_>,
@@ -2380,6 +2401,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         Ok(inputs)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "report_sample"))]
     fn report_sample(&self, input: &ControllerSampleInput) -> ControllerSample {
         let &ControllerSampleInput {
             at_micros,
@@ -2485,6 +2507,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
             })
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "arrival_prediction"))]
     fn arrival_prediction(&mut self, now_micros: u64) -> Result<ArrivalPrediction, PlantError> {
         let ArrivalEvidenceSample::Accepted(window) = self.arrival_evidence_sample else {
             return Ok(ArrivalPrediction::missing());
@@ -2501,6 +2524,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         })
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "partition_prediction"))]
     fn partition_prediction(&mut self, now_micros: u64) -> Result<PartitionPrediction, PlantError> {
         if !self.partition_evidence_accepted {
             return Ok(PartitionPrediction::missing());
@@ -2575,6 +2599,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         })
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "lead_time_prediction"))]
     fn lead_time_prediction(&self) -> Result<LeadTimePrediction, PlantError> {
         let (direction, replica_delta, elapsed_seconds) = match self.lead_time_evidence_sample {
             LeadTimeEvidenceSample::None => return Ok(LeadTimePrediction::missing()),
@@ -2605,6 +2630,7 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         })
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "capacity_prediction"))]
     fn capacity_prediction(&mut self, now_micros: u64) -> Result<CapacityPrediction, PlantError> {
         let rank_offset = predictive_rank_offset(self.diagnostic_seed, now_micros);
         match self.capacity_evidence_sample {
@@ -2785,6 +2811,10 @@ impl<Workload: TickGenerator> ClosedLoop<Workload> {
         })
     }
 
+    #[cfg_attr(
+        feature = "hotpath",
+        hotpath::measure(label = "push_transition_observation")
+    )]
     fn push_transition_observation(
         &mut self,
         observation: PendingTransitionObservation,
@@ -3028,6 +3058,7 @@ impl<Workload: TickGenerator> TickGenerator for ClosedLoop<Workload> {
         self.workload.calculate(context)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "closedloop_observe"))]
     fn observe(
         &mut self,
         context: TickContext<'_>,

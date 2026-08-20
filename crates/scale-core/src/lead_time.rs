@@ -621,6 +621,7 @@ impl LaunchTimeFactor {
 
     /// Applies evidence at its interval start, then advances across the
     /// interval.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "launch_update"))]
     pub(crate) fn update(
         &mut self,
         simd_level: Level,
@@ -953,6 +954,7 @@ impl RebalanceTimeFactor {
 
     /// Applies evidence at its interval start, then advances across the
     /// interval.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "rebalance_update"))]
     pub(crate) fn update(
         &mut self,
         simd_level: Level,

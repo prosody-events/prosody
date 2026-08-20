@@ -1127,6 +1127,7 @@ impl ScaleScratch {
 
 /// Advances the complete controller by one observation.
 #[must_use]
+#[cfg_attr(feature = "hotpath", hotpath::measure(label = "controller_step"))]
 pub fn step(
     state: &mut ScaleState,
     scratch: &mut ScaleScratch,
@@ -1205,6 +1206,7 @@ pub fn step(
     )
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure(label = "select_target"))]
 fn select_target(
     state: &mut ScaleState,
     scratch: &mut ScaleScratch,
@@ -1244,6 +1246,7 @@ fn select_target(
 /// [`finalize_scenario_columns`] reads the cells in a fixed order
 /// afterwards, so the parallel evaluation is bit-identical to a serial
 /// loop.
+#[cfg_attr(feature = "hotpath", hotpath::measure(label = "evaluate_scenarios"))]
 fn evaluate_scenarios(
     state: &ScaleState,
     scratch: &mut ScaleScratch,
@@ -1528,6 +1531,10 @@ fn evaluate_scenario_outcome(
 }
 
 /// Folds scenario cells into decision columns.
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "finalize_scenario_columns")
+)]
 fn finalize_scenario_columns(state: &ScaleState, scratch: &mut ScaleScratch) {
     dispatch!(state.simd_level, simd => aggregate_scenario_values(simd, scratch));
     scratch.decision_curve_sample_count =
@@ -2429,6 +2436,7 @@ fn moved_partition_count_matrix(
     Ok(counts)
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure(label = "prepare_work_cohorts"))]
 fn prepare_work_cohorts(
     state: &ScaleState,
     scratch: &mut ScaleScratch,

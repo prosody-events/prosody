@@ -408,6 +408,7 @@ impl ArrivalFactor {
     /// now]`. The producer controls delivery delay.
     /// After the evidence applies, the update advances the calendar boundary to
     /// `now_micros`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "arrival_update"))]
     pub(crate) fn update(
         &mut self,
         evidence: ArrivalEvidence,

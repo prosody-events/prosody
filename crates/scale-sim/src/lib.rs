@@ -74,6 +74,8 @@ pub use model::{
 };
 pub use plot_error::PlotError;
 pub use posterior_plot::{write_model_belief_figures, write_model_belief_snapshot_figures};
+#[cfg(feature = "hotpath")]
+pub use regime::run_principal_regime_profiled;
 pub use regime::{
     CapacitySensitivity, PrincipalRegime, PrincipalRun, PrincipalRunError, RegimeExperiment,
     RegimeValidationError, RunStop, RunStopReason, run_capacity_evidence_regime,
@@ -1196,6 +1198,7 @@ impl<M: AttemptModel> Plant<M> {
 
     /// Advances scheduled work through one inclusive virtual-time boundary.
     #[must_use]
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "plant_advance_until"))]
     pub fn advance_until(&mut self, until_micros: u64) -> PlantSnapshot {
         if !self.started {
             self.seed_heap();
@@ -1875,6 +1878,7 @@ impl<M: AttemptModel> Plant<M> {
         self.now_micros = self.now_micros.max(now_micros);
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "plant_snapshot"))]
     fn snapshot(&self, at_micros: u64) -> PlantSnapshot {
         let mut reconciling_partitions = 0_u32;
         let mut paused_partitions = 0_u32;

@@ -10,8 +10,12 @@ publish = false
 repository = "https://github.com/prosody-events/prosody"
 version = "0.1.0"
 
+[features]
+hotpath = ["dep:hotpath", "prosody-scale-core/hotpath"]
+
 [dependencies]
 chrono.workspace = true
+hotpath = { version = "0.23", features = ["hotpath"], optional = true }
 paste.workspace = true
 plotters.workspace = true
 prosody-scale-core = { path = "../scale-core" }
@@ -38,3 +42,7 @@ name = "batch"
 [[bench]]
 harness = false
 name = "model_graph"
+
+[[example]]
+name = "hotspot_probe"
+required-features = ["hotpath"]

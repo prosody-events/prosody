@@ -999,6 +999,7 @@ impl CapacityFactor {
     ///
     /// The update applies evidence to its interval start. It then advances
     /// the change process across the evidence interval.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(label = "capacity_update"))]
     pub(crate) fn update(&mut self, evidence: OccupancyTraceEvidence<'_>, elapsed: Duration) {
         let window = evidence.window();
         debug_assert!(
