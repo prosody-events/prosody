@@ -12,7 +12,7 @@ use crate::capacity::{
 };
 use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
-    evaluate_prepared_step, evaluate_prepared_trajectory, prepare,
+    evaluate_prepared_step, evaluate_prepared_trajectory, prepare, refresh_prepared_work,
 };
 use crate::lead_time::{LaunchComponentSummary, LaunchTimeFactor, RebalanceTimeFactor};
 use crate::partition::PartitionFactor;
@@ -618,9 +618,8 @@ pub struct DecisionColumnSummary {
 /// bit-identical to a serial one.
 struct ScenarioWorkspace {
     edf: EdfScratch,
-    placement_edf: EdfScratch,
     unassigned_cohorts: EventCohorts,
-    placement_cohorts: SlotSecondCohorts,
+    prepared_placements: Vec<PreparedPlacement>,
     posterior_resource_supply: Vec<f64>,
     partition_order: Vec<u32>,
     partition_share_draws: Vec<f64>,
@@ -631,6 +630,12 @@ struct ScenarioWorkspace {
     rebalancing_ready_micros: u64,
     trajectory_offsets: Vec<u32>,
     trajectory: TrajectoryColumns,
+}
+
+struct PreparedPlacement {
+    cohorts: SlotSecondCohorts,
+    source_indexes: Vec<u32>,
+    edf: EdfScratch,
 }
 
 struct TrajectoryColumns {
@@ -672,6 +677,7 @@ struct ScratchBounds {
     partition_count: usize,
     partition_offset_count: usize,
     replica_count_max: usize,
+    placement_count_max: usize,
     candidate_event_count_max: usize,
     trajectory_event_count_max: usize,
     posterior_sample_count: usize,
@@ -866,6 +872,14 @@ impl ScratchBounds {
                 events.checked_add(configuration.arrival_prior.path_segment_count_max())
             })
             .ok_or(ConfigurationError::PlatformLimit)?;
+        let placement_count_max = replica_count_max
+            .checked_mul(
+                replica_count_max
+                    .checked_add(1)
+                    .ok_or(ConfigurationError::PlatformLimit)?,
+            )
+            .and_then(|count| count.checked_div(2))
+            .ok_or(ConfigurationError::PlatformLimit)?;
         Ok(Self {
             work_cohort_count_max,
             work_cohort_count_max_u32: u32::try_from(work_cohort_count_max)
@@ -873,6 +887,7 @@ impl ScratchBounds {
             partition_count,
             partition_offset_count,
             replica_count_max,
+            placement_count_max,
             candidate_event_count_max,
             trajectory_event_count_max: replica_count_max
                 .checked_mul(candidate_event_count_max)
@@ -902,11 +917,18 @@ impl TrajectoryColumns {
 
 impl ScenarioWorkspace {
     fn new(bounds: &ScratchBounds) -> Result<Self, ConfigurationError> {
+        let mut prepared_placements = Vec::with_capacity(bounds.placement_count_max);
+        for _ in 0..bounds.placement_count_max {
+            prepared_placements.push(PreparedPlacement {
+                cohorts: SlotSecondCohorts::new(bounds.work_cohort_count_max),
+                source_indexes: Vec::with_capacity(bounds.work_cohort_count_max),
+                edf: EdfScratch::new(bounds.work_cohort_count_max_u32)?,
+            });
+        }
         Ok(Self {
             edf: EdfScratch::new(bounds.work_cohort_count_max_u32)?,
-            placement_edf: EdfScratch::new(bounds.work_cohort_count_max_u32)?,
             unassigned_cohorts: EventCohorts::new(bounds.work_cohort_count_max),
-            placement_cohorts: SlotSecondCohorts::new(bounds.work_cohort_count_max),
+            prepared_placements,
             posterior_resource_supply: vec![0.0_f64; bounds.replica_count_max],
             partition_order: vec![0; bounds.partition_count],
             partition_share_draws: vec![0.0_f64; bounds.partition_count],
@@ -1352,6 +1374,7 @@ fn evaluate_scenario_workers(
     scenario_chunk: usize,
 ) {
     if let [workspace] = workspaces {
+        prepare_partition_placements(shared, workspace);
         for local in 0..columns.scenario_count {
             let scenario = columns.first_scenario + local;
             evaluate_one_scenario(state, shared, workspace, columns.cells(local), scenario);
@@ -1374,6 +1397,36 @@ fn evaluate_scenario_workers(
             );
         },
     );
+}
+
+fn prepare_partition_placements(shared: &ScenarioShared<'_>, workspace: &mut ScenarioWorkspace) {
+    let mut placement_index = 0_usize;
+    for candidate in 0..shared.action_count {
+        let replica_count = (candidate + 1).min(shared.partition_count);
+        for replica in 0..replica_count {
+            let placement = &mut workspace.prepared_placements[placement_index];
+            placement.cohorts.clear();
+            placement.source_indexes.clear();
+            for partition in
+                balanced_partition_range(shared.partition_count, replica_count, replica)
+            {
+                let first = shared.partition_offsets[partition] as usize;
+                let last = shared.partition_offsets[partition + 1] as usize;
+                for &cohort_index in &shared.partition_cohort_indexes[first..last] {
+                    let cohort = cohort_index as usize;
+                    placement.cohorts.push_values(
+                        shared.resource_cohorts.release_micros(cohort),
+                        shared.resource_cohorts.deadline_micros(cohort),
+                        shared.resource_cohorts.work(cohort),
+                        shared.resource_cohorts.partition(cohort),
+                    );
+                    placement.source_indexes.push(cohort_index);
+                }
+            }
+            prepare(&placement.cohorts, &mut placement.edf);
+            placement_index += 1;
+        }
+    }
 }
 
 /// Samples one scenario's draws and writes its decision cells.
@@ -2585,6 +2638,7 @@ fn partition_deadline_outcomes(
         end_seconds: &[f64::MAX],
         rates: &[0.0_f64],
     };
+    let mut placement_index = 0_usize;
     for candidate in 0..shared.action_count {
         let replica_count = (candidate + 1).min(shared.partition_count);
         let replica_count_f64 = u32::try_from(replica_count).map_or(f64::INFINITY, f64::from);
@@ -2592,26 +2646,18 @@ fn partition_deadline_outcomes(
             / replica_count_f64;
         let mut candidate_missed = 0.0_f64;
         let mut candidate_late = 0.0_f64;
-        for replica in 0..replica_count {
-            workspace.placement_cohorts.clear();
-            for partition in
-                balanced_partition_range(shared.partition_count, replica_count, replica)
-            {
-                let first = shared.partition_offsets[partition] as usize;
-                let last = shared.partition_offsets[partition + 1] as usize;
-                for &cohort_index in &shared.partition_cohort_indexes[first..last] {
-                    let cohort = cohort_index as usize;
-                    workspace.placement_cohorts.push_values(
-                        shared.resource_cohorts.release_micros(cohort),
-                        shared.resource_cohorts.deadline_micros(cohort),
-                        shared.resource_cohorts.work(cohort) * service_time_seconds,
-                        shared.resource_cohorts.partition(cohort),
-                    );
-                }
+        for _ in 0..replica_count {
+            let placement = &mut workspace.prepared_placements[placement_index];
+            for cohort in 0..placement.source_indexes.len() {
+                let source = placement.source_indexes[cohort] as usize;
+                placement.cohorts.set_work(
+                    cohort,
+                    shared.resource_cohorts.work(source) * service_time_seconds,
+                );
             }
-            prepare(&workspace.placement_cohorts, &mut workspace.placement_edf);
+            refresh_prepared_work(&placement.cohorts, &mut placement.edf);
             let outcome = evaluate_prepared_step(
-                &workspace.placement_cohorts,
+                &placement.cohorts,
                 SupplyStep {
                     before: capacity,
                     during: capacity,
@@ -2626,11 +2672,12 @@ fn partition_deadline_outcomes(
                     deadline_budget_micros: state.configuration.objective.budget_micros(),
                 },
                 &no_arrivals,
-                &mut workspace.placement_edf,
+                &mut placement.edf,
             );
             candidate_missed += outcome.missed_work / service_time_seconds;
             candidate_late +=
                 (outcome.late_area + outcome.terminal_late_area) / service_time_seconds;
+            placement_index += 1;
         }
         missed_work[candidate] = candidate_missed;
         late_area[candidate] = candidate_late;
