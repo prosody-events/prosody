@@ -589,6 +589,78 @@ fn one_second_transition_retains_an_informative_capacity_update() -> Result<(), 
 }
 
 #[test]
+fn saturated_fleet_occupancy_discriminates_the_flat_plateau_alias() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(
+        &[0.101_f64, 0.202_f64, 0.404_f64],
+        &[80.0_f64, 320.0_f64, 600.0_f64],
+        &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
+    )?;
+    let arrival_prior = ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?;
+    let mut factor = super::CapacityFactor::new_with_prior_with_groups(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &arrival_prior,
+        128.0_f64,
+        1.0_f64,
+        2_112,
+        256,
+    )?;
+    apply_flat_capacity_windows(&mut factor, 20, 3)?;
+    let below_knee_mass = factor.no_knee_probability();
+    assert!(below_knee_mass > 0.1_f64, "{below_knee_mass}");
+
+    apply_flat_capacity_windows(&mut factor, 128, 3)?;
+    let aliased_mass = factor.no_knee_probability();
+    assert!(aliased_mass > 0.1_f64, "{aliased_mass}");
+
+    apply_flat_capacity_windows(&mut factor, 96, 3)?;
+    let recovered_mass = factor.no_knee_probability();
+    assert!(recovered_mass <= 0.01_f64, "{recovered_mass}");
+    Ok(())
+}
+
+fn apply_flat_capacity_windows(
+    factor: &mut super::CapacityFactor,
+    concurrency: u32,
+    count: u32,
+) -> Result<(), TestError> {
+    let completions = if concurrency < 65 {
+        (f64::from(concurrency) / 0.202_f64).round() as u32
+    } else {
+        320
+    };
+    let group_count = completions.min(128);
+    let offsets = (0..group_count)
+        .map(|index| u64::from(index + 1) * 1_000_000_u64 / u64::from(group_count + 1))
+        .collect::<Vec<_>>();
+    let completed = (0..group_count)
+        .map(|index| completions / group_count + u32::from(index < completions % group_count))
+        .collect::<Vec<_>>();
+    for _ in 0..count {
+        let window = ResourceWindow::new_with_starts(
+            f64::from(concurrency),
+            1.0_f64,
+            completions,
+            completions,
+        )?;
+        let started = completed.clone();
+        factor.update(
+            occupancy_trace_for_test(
+                window,
+                concurrency,
+                concurrency,
+                u128::from(concurrency) * 1_000_000_u128,
+                &offsets,
+                &completed,
+                &started,
+            ),
+            Duration::from_secs(1),
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn log_normal_endpoint_cells_truncate_both_tail_masses() -> Result<(), TestError> {
     let masses = log_normal_axis_masses(&[1.0_f64, 2.0_f64, 4.0_f64], 2.0_f64, 1.0_f64)?;
     assert!((masses.iter().sum::<f64>() - 1.0_f64).abs() <= 16.0_f64 * f64::EPSILON);

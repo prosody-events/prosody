@@ -1699,7 +1699,9 @@ const fn replica_count_max(regime: PrincipalRegime, experiment: RegimeExperiment
         PrincipalRegime::FlatPostKnee | PrincipalRegime::DecliningPostKnee
             if matches!(experiment, RegimeExperiment::CapacityEvidence) =>
         {
-            4
+            // The 128-slot bound sits on the 0.404-service knee alias point; 96 slots
+            // saturate at a discriminating occupancy.
+            3
         }
         PrincipalRegime::FlatPostKnee
         | PrincipalRegime::DecliningPostKnee
