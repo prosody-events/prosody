@@ -18,10 +18,11 @@ use super::{
     completion_expectation, completion_group_convolution, completion_log_likelihood,
     completion_log_likelihood_reference, completion_marginal_probability, contamination_prior,
     equal_rate_death_step, exponentiate_log_masses, feasibility_probability,
-    feasibility_probability_and_charge, fold_trace, hazard_prior, integer_ln_gamma_table,
-    linear_rate_band, linear_rate_death_step, log_contamination_mixture, log_normal_axis_masses,
-    log_weighted_sum, path_log_score, pure_death_step, pure_death_step_with_rates,
-    record_start_window, uniformized_death_step, vector_exp,
+    feasibility_probability_and_charge, fill_knee_state_rates, fill_no_knee_state_rates,
+    fold_trace, hazard_prior, integer_ln_gamma_table, linear_rate_band, linear_rate_death_step,
+    log_contamination_mixture, log_normal_axis_masses, log_weighted_sum, path_log_score,
+    pure_death_step, pure_death_step_with_rates, record_start_window, uniformized_death_step,
+    vector_exp,
 };
 use crate::change_point::ChangePointKernel;
 use crate::types::occupancy_trace_for_test;
@@ -477,7 +478,8 @@ fn an_identifiable_persistent_run_beats_contamination_redraws() -> Result<(), Te
 
 #[test]
 fn hazard_cells_cover_the_declared_gamma_tails() -> Result<(), TestError> {
-    let artifact = capacity_model_artifact(1.0_f64 / 300.0_f64, 4.0_f64)?;
+    let mean_per_second = 1.0_f64 / 300.0_f64;
+    let artifact = capacity_model_artifact(mean_per_second, 4.0_f64)?;
     assert_eq!(artifact.identity.version(), 2);
     assert!(
         artifact.coverage[HAZARD_COVERAGE_INDEX].tail_probability()
@@ -504,10 +506,85 @@ fn hazard_cells_cover_the_declared_gamma_tails() -> Result<(), TestError> {
     let (rates, weights) = hazard_prior(&artifact)?;
     assert!(rates.windows(2).all(|pair| pair[0] < pair[1]));
     assert!((weights.iter().sum::<f64>() - 1.0_f64).abs() <= 16.0_f64 * f64::EPSILON);
+    let discrete_mean = rates
+        .iter()
+        .zip(&weights)
+        .map(|(rate, weight)| rate * weight)
+        .sum::<f64>();
+    // The hazard grid controls transition probability to 1/8. Requiring the
+    // same relative bound on its mean is no weaker than the declared loss.
+    assert!(
+        (discrete_mean - mean_per_second).abs()
+            <= HAZARD_TRANSITION_PROBABILITY_ERROR_MAX * mean_per_second
+    );
     assert!(matches!(
         capacity_model_artifact(0.0_f64, 4.0_f64),
         Err(CapacityModelError::InvalidHazardPrior)
     ));
+    Ok(())
+}
+
+#[test]
+fn one_second_transition_retains_an_informative_capacity_update() -> Result<(), TestError> {
+    let grid = CapacityGrid::new(
+        &[0.0505_f64, 0.101_f64, 0.202_f64],
+        &[80.0_f64, 320.0_f64, 640.0_f64],
+        &[0.0_f64, 0.5_f64, 1.0_f64, 2.0_f64],
+    )?;
+    let arrival_prior = ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?;
+    let mut factor = super::CapacityFactor::new_with_prior_with_groups(
+        grid,
+        1.0_f64 / 300.0_f64,
+        &arrival_prior,
+        192.0_f64,
+        1.0_f64,
+        2_112,
+        256,
+    )?;
+    let completed_attempts = 495_u32;
+    let window =
+        ResourceWindow::new_with_starts(50.0_f64, 1.0_f64, completed_attempts, completed_attempts)?;
+    let offsets = (0..256_u64)
+        .map(|index| (index + 1) * 1_000_000_u64 / 256_u64)
+        .collect::<Vec<_>>();
+    let completed = (0..256_u32)
+        .map(|index| 1_u32 + u32::from(index < 239))
+        .collect::<Vec<_>>();
+    let started = completed.clone();
+    let evidence =
+        occupancy_trace_for_test(window, 50, 50, 50_000_000, &offsets, &completed, &started);
+    fold_trace(
+        evidence,
+        &mut factor.state_exposure_seconds,
+        &mut factor.state_completion_counts,
+    );
+    for index in 0..factor.grid.knee_cell_count as usize {
+        fill_knee_state_rates(&factor.grid, index, &mut factor.state_rates);
+        factor.update_cell_likelihood(index, evidence);
+    }
+    for index in factor.grid.knee_cell_count as usize..factor.likelihoods.len() {
+        fill_no_knee_state_rates(&factor.grid, index, &mut factor.state_rates);
+        factor.update_cell_likelihood(index, evidence);
+    }
+    let prior_predictive = log_weighted_sum(&factor.prior_weights, &factor.likelihoods);
+    factor.update_filters(prior_predictive);
+    let learned = factor.no_knee_probability();
+    let expected_redraw = factor
+        .hazard_rates_per_second
+        .iter()
+        .zip(
+            factor
+                .filter_weights
+                .chunks_exact(factor.contamination_probabilities.len()),
+        )
+        .map(|(hazard, weights)| weights.iter().sum::<f64>() * (1.0_f64 - (-hazard).exp()))
+        .sum::<f64>();
+    factor.transition(Duration::from_secs(1));
+    let retained = factor.no_knee_probability();
+    // Since 1 - exp(-h) is at most h, a 1/300 mean hazard redraws about
+    // 0.33 percent per second. A probability can move by at most that mass.
+    assert!((learned - 0.5_f64).abs() > 0.25_f64);
+    assert!((retained - learned).abs() <= expected_redraw);
     Ok(())
 }
 

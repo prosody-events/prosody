@@ -2098,7 +2098,7 @@ fn capacity_model_artifact_with_groups(
     {
         return Err(CapacityModelError::InvalidHazardPrior);
     }
-    let distribution = Gamma::new(shape, mean_per_second / shape)
+    let distribution = Gamma::new(shape, shape / mean_per_second)
         .map_err(|_| CapacityModelError::InvalidHazardPrior)?;
     // Keep half of the tail budget for inverse-CDF and CDF roundoff.
     let tail = CAPACITY_MODEL_BUDGET.boundary_probability_max() * 0.25_f64;
@@ -2193,7 +2193,7 @@ fn hazard_prior(
 ) -> Result<(Vec<f64>, Vec<f64>), CapacityModelError> {
     let distribution = Gamma::new(
         artifact.hazard_shape,
-        artifact.hazard_mean_per_second / artifact.hazard_shape,
+        artifact.hazard_shape / artifact.hazard_mean_per_second,
     )
     .map_err(|_| CapacityModelError::InvalidHazardPrior)?;
     let coverage = artifact.coverage[HAZARD_COVERAGE_INDEX];
