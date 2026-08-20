@@ -606,6 +606,13 @@ struct LinearRateBand {
 }
 
 #[derive(Clone, Copy)]
+struct DeathKernel<'a> {
+    rates: &'a [f64],
+    linear_rate_band: LinearRateBand,
+    ln_gamma_integers: &'a [f64],
+}
+
+#[derive(Clone, Copy)]
 enum SpreadTruncation {
     #[cfg(test)]
     Disabled,
@@ -668,6 +675,32 @@ struct CompletionTail<'a> {
     posterior_rate: f64,
     missing: f64,
     ln_gamma_integers: &'a [f64],
+}
+
+#[derive(Clone, Copy)]
+struct DescendingLogGamma {
+    value: f64,
+    correction: f64,
+}
+
+impl DescendingLogGamma {
+    const fn new(value: f64) -> Self {
+        Self {
+            value,
+            correction: 0.0_f64,
+        }
+    }
+
+    fn previous(self, shape: f64, count: usize) -> Self {
+        let previous = count.saturating_sub(1);
+        let previous_float = f64::from(u32::try_from(previous).map_or(u32::MAX, |value| value));
+        let term = -(previous_float + shape).ln() - self.correction;
+        let value = self.value + term;
+        Self {
+            value,
+            correction: (value - self.value) - term,
+        }
+    }
 }
 
 pub(crate) struct CapacityFactor {
@@ -751,7 +784,8 @@ impl CapacityFactor {
         let filter_curve_count = filter_count
             .checked_mul(cell_count)
             .ok_or(CapacityModelError::StorageBound)?;
-        let (transition_count, ln_gamma_integer_count) = attempt_buffer_counts(attempt_count_max)?;
+        let (transition_count, ln_gamma_integer_count) =
+            attempt_buffer_counts(attempt_count_max, state_count)?;
         validate_capacity_allocation(
             &grid,
             &artifact,
@@ -1214,8 +1248,11 @@ impl CapacityFactor {
             &self.state_completion_counts,
         );
         let normalizer = feasibility_probability_with_rates(
-            &self.state_rates,
-            linear_rate_band,
+            DeathKernel {
+                rates: &self.state_rates,
+                linear_rate_band,
+                ln_gamma_integers: &self.ln_gamma_integers,
+            },
             evidence,
             &mut self.forward_probabilities,
             &mut self.forward_coefficients,
@@ -1916,8 +1953,11 @@ fn capacity_storage_bytes(allocation: CapacityAllocation) -> Result<usize, Capac
         .ok_or(CapacityModelError::StorageBound)
 }
 
-/// Derives attempt-sized buffer lengths from the attempt cap.
-fn attempt_buffer_counts(attempt_count_max: u32) -> Result<(usize, usize), CapacityModelError> {
+/// Derives attempt buffers and the integer gamma table from certified bounds.
+fn attempt_buffer_counts(
+    attempt_count_max: u32,
+    state_count: usize,
+) -> Result<(usize, usize), CapacityModelError> {
     let attempt_count =
         usize::try_from(attempt_count_max).map_err(|_| CapacityModelError::StorageBound)?;
     let transition_count = attempt_count
@@ -1926,11 +1966,12 @@ fn attempt_buffer_counts(attempt_count_max: u32) -> Result<(usize, usize), Capac
         .ok_or(CapacityModelError::StorageBound)?;
     let ln_gamma_integer_count = attempt_count
         .checked_add(1)
+        .map(|count| count.max(state_count))
         .ok_or(CapacityModelError::StorageBound)?;
     Ok((transition_count, ln_gamma_integer_count))
 }
 
-/// Index `n` stores `ln_gamma(n + 1)` for the certified attempt range.
+/// Index `n` stores `ln_gamma(n + 1)` for the attempt and state ranges.
 fn integer_ln_gamma_table(count: usize) -> Result<Vec<f64>, CapacityModelError> {
     (0..count)
         .map(|index| {
@@ -2423,35 +2464,25 @@ fn path_log_score_with_rates(
 }
 
 fn feasibility_probability_with_rates(
-    rates: &[f64],
-    linear_rate_band: LinearRateBand,
+    kernel: DeathKernel<'_>,
     evidence: OccupancyTraceEvidence<'_>,
     probabilities: &mut [f64],
     coefficients: &mut [f64],
     work: &mut [f64],
 ) -> Option<f64> {
-    feasibility_probability_and_charge(
-        rates,
-        linear_rate_band,
-        evidence,
-        probabilities,
-        coefficients,
-        work,
-    )
-    .map(|(probability, _)| probability)
+    feasibility_probability_and_charge(kernel, evidence, probabilities, coefficients, work)
+        .map(|(probability, _)| probability)
 }
 
 fn feasibility_probability_and_charge(
-    rates: &[f64],
-    linear_rate_band: LinearRateBand,
+    kernel: DeathKernel<'_>,
     evidence: OccupancyTraceEvidence<'_>,
     probabilities: &mut [f64],
     coefficients: &mut [f64],
     work: &mut [f64],
 ) -> Option<(f64, f64)> {
     feasibility_probability_with_budget(
-        rates,
-        linear_rate_band,
+        kernel,
         evidence,
         probabilities,
         coefficients,
@@ -2461,8 +2492,7 @@ fn feasibility_probability_and_charge(
 }
 
 fn feasibility_probability_with_budget(
-    rates: &[f64],
-    linear_rate_band: LinearRateBand,
+    kernel: DeathKernel<'_>,
     evidence: OccupancyTraceEvidence<'_>,
     probabilities: &mut [f64],
     coefficients: &mut [f64],
@@ -2508,8 +2538,7 @@ fn feasibility_probability_with_budget(
         }
         let band_mass = probabilities[low..=high].iter().sum::<f64>();
         let contraction_budget = pure_death_step_with_rates(
-            rates,
-            linear_rate_band,
+            kernel,
             DeathBand {
                 low,
                 high,
@@ -2522,7 +2551,7 @@ fn feasibility_probability_with_budget(
         )?;
         safe_mass += (band_mass - probabilities[low..=high].iter().sum::<f64>()).max(0.0_f64);
         high = contract_death_band(
-            rates,
+            kernel.rates,
             DeathBand {
                 low,
                 high,
@@ -2582,10 +2611,16 @@ fn feasibility_probability(
     work: &mut [f64],
 ) -> Option<f64> {
     let mut rates = vec![0.0_f64; probabilities.len()];
+    let Ok(ln_gamma_integers) = integer_ln_gamma_table(probabilities.len()) else {
+        return None;
+    };
     fill_state_rates(grid, index, &mut rates);
     feasibility_probability_with_rates(
-        &rates,
-        linear_rate_band(grid, index),
+        DeathKernel {
+            rates: &rates,
+            linear_rate_band: linear_rate_band(grid, index),
+            ln_gamma_integers: &ln_gamma_integers,
+        },
         evidence,
         probabilities,
         coefficients,
@@ -2603,21 +2638,22 @@ fn completion_marginal_probability(
     work: &mut [f64],
 ) -> Option<f64> {
     let mut rates = vec![0.0_f64; probabilities.len()];
+    let Ok(ln_gamma_integers) = integer_ln_gamma_table(probabilities.len()) else {
+        return None;
+    };
     fill_state_rates(grid, index, &mut rates);
-    let rough_normalizer = feasibility_probability_with_rates(
-        &rates,
-        linear_rate_band(grid, index),
-        evidence,
-        probabilities,
-        coefficients,
-        work,
-    )?;
+    let kernel = DeathKernel {
+        rates: &rates,
+        linear_rate_band: linear_rate_band(grid, index),
+        ln_gamma_integers: &ln_gamma_integers,
+    };
+    let rough_normalizer =
+        feasibility_probability_with_rates(kernel, evidence, probabilities, coefficients, work)?;
     // The ratio uses two solver results. Give each result one quarter of the
     // target times the denominator, so their combined ratio error stays bound.
     let solver_budget = PATH_SOLVER_PROBABILITY_ERROR_MAX * rough_normalizer / 4.0_f64;
     let (normalizer, _) = feasibility_probability_with_budget(
-        &rates,
-        linear_rate_band(grid, index),
+        kernel,
         evidence,
         probabilities,
         coefficients,
@@ -2650,8 +2686,7 @@ fn completion_marginal_probability(
             continue;
         }
         pure_death_step_with_rates(
-            &rates,
-            linear_rate_band(grid, index),
+            kernel,
             DeathBand {
                 low,
                 high,
@@ -2677,8 +2712,7 @@ fn completion_marginal_probability(
         previous_offset = offset;
     }
     pure_death_step_with_rates(
-        &rates,
-        linear_rate_band(grid, index),
+        kernel,
         DeathBand {
             low: final_state,
             high,
@@ -2700,8 +2734,7 @@ fn completion_marginal_probability(
 /// Linear-rate bands use binomial thinning. Equal-rate bands use the Erlang
 /// limit. Mixed bands use uniformization with a charged Poisson tail.
 fn pure_death_step_with_rates(
-    rates: &[f64],
-    linear_rate_band: LinearRateBand,
+    kernel: DeathKernel<'_>,
     band: DeathBand,
     probabilities: &mut [f64],
     coefficients: &mut [f64],
@@ -2716,24 +2749,25 @@ fn pure_death_step_with_rates(
     if exposure_seconds == 0.0_f64 || low > high {
         return Some(ledger.group_budget);
     }
-    if high <= linear_rate_band.state_max {
+    if high <= kernel.linear_rate_band.state_max {
         let source_count = high.checked_sub(low)?.checked_add(1)?;
         let charge_count = u32::try_from(source_count.checked_add(1)?).ok()?;
         let source_charge = ledger.group_budget / f64::from(charge_count);
         linear_rate_death_step(
-            linear_rate_band.service_time_seconds,
+            kernel.linear_rate_band.service_time_seconds,
             band,
             probabilities,
             work,
+            kernel.ln_gamma_integers,
             SpreadTruncation::Charged(source_charge),
             ledger,
         )?;
         return Some(source_charge);
     }
-    let first_rate = rates[low];
+    let first_rate = kernel.rates[low];
     // This bitwise scan is semantic; knee thresholds diverge at integer-knee ULP
     // corners and width-one collapse bands, while its linear cost is negligible.
-    if rates[low..=high]
+    if kernel.rates[low..=high]
         .iter()
         .all(|rate| rate.to_bits() == first_rate.to_bits())
     {
@@ -2748,7 +2782,14 @@ fn pure_death_step_with_rates(
         )?;
         return Some(ledger.group_budget);
     }
-    uniformized_death_step(rates, band, probabilities, coefficients, work, ledger)
+    uniformized_death_step(
+        kernel.rates,
+        band,
+        probabilities,
+        coefficients,
+        work,
+        ledger,
+    )
 }
 
 #[cfg(test)]
@@ -2761,11 +2802,17 @@ fn pure_death_step(
     work: &mut [f64],
 ) -> Option<()> {
     let mut rates = vec![0.0_f64; probabilities.len()];
+    let Ok(ln_gamma_integers) = integer_ln_gamma_table(probabilities.len()) else {
+        return None;
+    };
     fill_state_rates(grid, index, &mut rates);
     let mut ledger = ErrorLedger::with_budget(1, PATH_SOLVER_PROBABILITY_ERROR_MAX)?;
     pure_death_step_with_rates(
-        &rates,
-        linear_rate_band(grid, index),
+        DeathKernel {
+            rates: &rates,
+            linear_rate_band: linear_rate_band(grid, index),
+            ln_gamma_integers: &ln_gamma_integers,
+        },
         band,
         probabilities,
         coefficients,
@@ -2786,6 +2833,7 @@ fn linear_rate_death_step(
     band: DeathBand,
     probabilities: &mut [f64],
     work: &mut [f64],
+    ln_gamma_integers: &[f64],
     truncation: SpreadTruncation,
     ledger: &mut ErrorLedger,
 ) -> Option<()> {
@@ -2827,7 +2875,8 @@ fn linear_rate_death_step(
             .skip(window_low)
         {
             *destination += source_probability
-                * binomial_log_probability(source_u32, survivors, survival).exp();
+                * binomial_log_probability(source_u32, survivors, survival, ln_gamma_integers)
+                    .exp();
         }
     }
     probabilities[low..=high].copy_from_slice(&work[low..=high]);
@@ -3597,10 +3646,12 @@ fn completion_log_likelihood_reference(
             if probability > 0.0_f64 && probability < 1.0_f64 {
                 let group_degree = (starts as usize).min(target);
                 let maximum = (0..=group_degree)
-                    .map(|count| binomial_log_probability(starts, count, probability))
+                    .map(|count| binomial_log_probability_reference(starts, count, probability))
                     .fold(f64::NEG_INFINITY, f64::max);
                 for (count, value) in binomial[..=group_degree].iter_mut().enumerate() {
-                    *value = (binomial_log_probability(starts, count, probability) - maximum).exp();
+                    *value = (binomial_log_probability_reference(starts, count, probability)
+                        - maximum)
+                        .exp();
                 }
                 convolution[..=target].fill(0.0_f64);
                 for known in 0..=degree {
@@ -3701,9 +3752,13 @@ fn completion_probability_from_coefficients(
     let log_success = success.ln();
     let log_failure = (-success).ln_1p();
     let mut likelihood = f64::NEG_INFINITY;
-    for (known, coefficient) in coefficients.iter().enumerate().take(degree.min(target) + 1) {
+    let maximum_known = degree.min(target);
+    let target_float = f64::from(u32::try_from(target).map_or(u32::MAX, |value| value));
+    let mut count_shape_log_gamma =
+        DescendingLogGamma::new(ln_gamma(target_float + posterior_shape));
+    for (known, coefficient) in coefficients.iter().enumerate().take(maximum_known + 1) {
+        let missing_count = target - known;
         if *coefficient > 0.0_f64 {
-            let missing_count = target - known;
             likelihood = log_add_exp(
                 likelihood,
                 coefficient.ln()
@@ -3715,8 +3770,12 @@ fn completion_probability_from_coefficients(
                         log_success,
                         log_failure,
                         ln_gamma_integers,
+                        count_shape_log_gamma.value,
                     ),
             );
+        }
+        if known < maximum_known {
+            count_shape_log_gamma = count_shape_log_gamma.previous(posterior_shape, missing_count);
         }
     }
     likelihood
@@ -3729,14 +3788,33 @@ fn negative_binomial_log_probability_hoisted(
     log_success: f64,
     log_failure: f64,
     ln_gamma_integers: &[f64],
+    count_shape_log_gamma: f64,
 ) -> f64 {
     let count_float = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
-    ln_gamma(count_float + shape) - shape_log_gamma - ln_gamma_integers[count]
+    count_shape_log_gamma - shape_log_gamma - ln_gamma_integers[count]
         + shape * log_success
         + count_float * log_failure
 }
 
-fn binomial_log_probability(trials: u32, count: usize, probability: f64) -> f64 {
+fn binomial_log_probability(
+    trials: u32,
+    count: usize,
+    probability: f64,
+    ln_gamma_integers: &[f64],
+) -> f64 {
+    // Construction sizes the table for every reachable pure-death state.
+    let trials_index = trials as usize;
+    let trials_float = f64::from(trials);
+    let count_float = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
+    ln_gamma_integers[trials_index]
+        - ln_gamma_integers[count]
+        - ln_gamma_integers[trials_index - count]
+        + count_float * probability.ln()
+        + (trials_float - count_float) * (-probability).ln_1p()
+}
+
+#[cfg(test)]
+fn binomial_log_probability_reference(trials: u32, count: usize, probability: f64) -> f64 {
     let trials = f64::from(trials);
     let count = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
     ln_gamma(trials + 1.0_f64) - ln_gamma(count + 1.0_f64) - ln_gamma(trials - count + 1.0_f64)

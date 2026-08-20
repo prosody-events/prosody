@@ -4,15 +4,17 @@ use allocation_counter::measure;
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use quickcheck_macros::quickcheck;
 use statrs::distribution::{ContinuousCDF, Gamma};
+use statrs::function::gamma::ln_gamma;
 use thiserror::Error;
 
 use super::{
     CAPACITY_UPDATE_OPERATION_COUNT_MAX, CapacityAllocation, CapacityGrid, CapacityGridError,
-    CapacityModelError, CompletionScratch, DeathBand, ErrorLedger, HAZARD_COVERAGE_INDEX,
-    HAZARD_TRANSITION_PROBABILITY_ERROR_MAX, LinearRateBand, OBSERVATION_COVERAGE_INDEX,
-    OBSERVATION_PROBABILITY_ERROR_MAX, PATH_SOLVER_PROBABILITY_ERROR_MAX, ResourceWindow,
-    ResourceWindowError, RetainedHistory, SOLVER_COVERAGE_INDEX, SpreadTruncation, StartWindow,
-    binomial_log_probability, capacity_model_artifact, capacity_update_operation_count,
+    CapacityModelError, CompletionScratch, DeathBand, DeathKernel, DescendingLogGamma, ErrorLedger,
+    HAZARD_COVERAGE_INDEX, HAZARD_TRANSITION_PROBABILITY_ERROR_MAX, LinearRateBand,
+    OBSERVATION_COVERAGE_INDEX, OBSERVATION_PROBABILITY_ERROR_MAX,
+    PATH_SOLVER_PROBABILITY_ERROR_MAX, ResourceWindow, ResourceWindowError, RetainedHistory,
+    SOLVER_COVERAGE_INDEX, SpreadTruncation, StartWindow, binomial_log_probability,
+    binomial_log_probability_reference, capacity_model_artifact, capacity_update_operation_count,
     completion_expectation, completion_group_convolution, completion_log_likelihood,
     completion_log_likelihood_reference, completion_marginal_probability, contamination_prior,
     equal_rate_death_step, exponentiate_log_masses, feasibility_probability,
@@ -184,11 +186,57 @@ fn first_completion_residual_after_a_gap_is_discarded() -> Result<(), TestError>
 fn known_start_binomial_likelihood_is_normalized(trial_code: u8, probability_code: u8) -> bool {
     let trials = u32::from(trial_code % 32);
     let probability = (f64::from(probability_code) + 0.5_f64) / 256.0_f64;
+    let Ok(ln_gamma_integers) = integer_ln_gamma_table(trials as usize + 1) else {
+        return false;
+    };
     let total = (0..=trials as usize)
-        .map(|count| binomial_log_probability(trials, count, probability).exp())
+        .map(|count| binomial_log_probability(trials, count, probability, &ln_gamma_integers).exp())
         .sum::<f64>();
     let operation_count = f64::from(trials + 1).powi(2);
     (total - 1.0_f64).abs() <= operation_count * 1_024.0_f64 * f64::EPSILON
+}
+
+#[quickcheck]
+fn integer_binomial_table_matches_scalar_bits(trial_code: u16, probability_code: u16) -> bool {
+    let trials = u32::from(trial_code % 4_096);
+    let probability = (f64::from(probability_code) + 0.5_f64) / 65_536.0_f64;
+    let Ok(ln_gamma_integers) = integer_ln_gamma_table(trials as usize + 1) else {
+        return false;
+    };
+    (0..=trials as usize).all(|count| {
+        binomial_log_probability(trials, count, probability, &ln_gamma_integers).to_bits()
+            == binomial_log_probability_reference(trials, count, probability).to_bits()
+    })
+}
+
+#[quickcheck]
+fn descending_negative_binomial_gamma_matches_scalar(
+    shape_code: u32,
+    count_code: u32,
+    span_code: u16,
+) -> bool {
+    let shape = 0.25_f64 + f64::from(shape_code % 400_000_000) / 4.0_f64;
+    let low = count_code as usize % 100_001;
+    let high = low
+        .saturating_add(usize::from(span_code % 1_025))
+        .min(100_000);
+    let high_float = f64::from(u32::try_from(high).map_or(u32::MAX, |value| value));
+    let mut count_shape_log_gamma = DescendingLogGamma::new(ln_gamma(high_float + shape));
+    for count in (low..=high).rev() {
+        let count_float = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
+        let expected = ln_gamma(count_float + shape);
+        if !epsilon_matches(count_shape_log_gamma.value, expected) {
+            return false;
+        }
+        if count > low {
+            count_shape_log_gamma = count_shape_log_gamma.previous(shape, count);
+        }
+    }
+    true
+}
+
+fn epsilon_matches(actual: f64, expected: f64) -> bool {
+    (actual - expected).abs() <= 1.0e-12_f64.max(1.0e-9_f64 * expected.abs())
 }
 
 #[quickcheck]
@@ -1066,9 +1114,13 @@ fn multi_group_window_charges_at_most_the_path_budget() -> Result<(), TestError>
     let mut probabilities = [0.0_f64; 9];
     let mut coefficients = [0.0_f64; 9];
     let mut work = [0.0_f64; 9];
+    let ln_gamma_integers = integer_ln_gamma_table(probabilities.len())?;
     let (_, charged) = feasibility_probability_and_charge(
-        &rates,
-        linear_rate_band(&grid, 0),
+        DeathKernel {
+            rates: &rates,
+            linear_rate_band: linear_rate_band(&grid, 0),
+            ln_gamma_integers: &ln_gamma_integers,
+        },
         evidence,
         &mut probabilities,
         &mut coefficients,
@@ -1093,9 +1145,13 @@ fn band_contraction_matches_the_finite_grid_oracle_within_its_charge() -> Result
     let mut probabilities = [0.0_f64; 4];
     let mut coefficients = [0.0_f64; 4];
     let mut work = [0.0_f64; 4];
+    let ln_gamma_integers = integer_ln_gamma_table(probabilities.len())?;
     let (actual, charged) = feasibility_probability_and_charge(
-        &rates,
-        linear_rate_band(&grid, 0),
+        DeathKernel {
+            rates: &rates,
+            linear_rate_band: linear_rate_band(&grid, 0),
+            ln_gamma_integers: &ln_gamma_integers,
+        },
         evidence,
         &mut probabilities,
         &mut coefficients,
@@ -1144,6 +1200,9 @@ fn linear_rate_kernel_matches_enumeration_and_uniformization(
     }
     let mut exact = initial;
     let mut exact_work = [0.0_f64; STATE_COUNT];
+    let Ok(ln_gamma_integers) = integer_ln_gamma_table(STATE_COUNT) else {
+        return false;
+    };
     let Some(mut exact_ledger) = ErrorLedger::with_budget(1, PATH_SOLVER_PROBABILITY_ERROR_MAX)
     else {
         return false;
@@ -1153,6 +1212,7 @@ fn linear_rate_kernel_matches_enumeration_and_uniformization(
         band,
         &mut exact,
         &mut exact_work,
+        &ln_gamma_integers,
         SpreadTruncation::Disabled,
         &mut exact_ledger,
     )
@@ -1169,6 +1229,7 @@ fn linear_rate_kernel_matches_enumeration_and_uniformization(
         band,
         &mut linear,
         &mut linear_work,
+        &ln_gamma_integers,
         SpreadTruncation::Charged(source_charge),
         &mut linear_ledger,
     )
@@ -1245,6 +1306,9 @@ fn composed_death_kernel_matches_full_uniformization(
     let mut work = [0.0_f64; STATE_COUNT];
     let mut current = [0.0_f64; STATE_COUNT];
     let mut next = [0.0_f64; STATE_COUNT];
+    let Ok(ln_gamma_integers) = integer_ln_gamma_table(STATE_COUNT) else {
+        return false;
+    };
     let Some(mut composed_ledger) = ErrorLedger::with_budget(1, PATH_SOLVER_PROBABILITY_ERROR_MAX)
     else {
         return false;
@@ -1254,10 +1318,13 @@ fn composed_death_kernel_matches_full_uniformization(
         return false;
     };
     if pure_death_step_with_rates(
-        &rates,
-        LinearRateBand {
-            service_time_seconds: 0.5_f64,
-            state_max: linear_state_max,
+        DeathKernel {
+            rates: &rates,
+            linear_rate_band: LinearRateBand {
+                service_time_seconds: 0.5_f64,
+                state_max: linear_state_max,
+            },
+            ln_gamma_integers: &ln_gamma_integers,
         },
         band,
         &mut composed,
