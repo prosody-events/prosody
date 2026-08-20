@@ -7,7 +7,7 @@ use prosody_scale_sim::{PrincipalRegime, run_principal_regime_profiled};
 const DEFAULT_SEED: u64 = 7;
 const DEFAULT_TICK_COUNT_MAX: u64 = 70;
 
-#[hotpath::main]
+#[hotpath::main(functions_limit = 64)]
 fn main() {
     let mut arguments = env::args().skip(1);
     let regime_name = match arguments.next() {
