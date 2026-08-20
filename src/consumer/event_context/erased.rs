@@ -964,7 +964,7 @@ fn bound_usize(bound: Bound<u64>) -> Bound<usize> {
     bound.map(|value| usize::try_from(value).unwrap_or(usize::MAX))
 }
 
-/// Lowers an erased map scan config onto the typed constraint carrier.
+/// Lowers an erased [`MapScanConfig`] to typed [`Constraints`].
 fn map_constraints(config: MapScanConfig) -> Constraints {
     let edge = |bound: Bound<String>| match bound {
         Bound::Included(key) => ScanEdge::Included(Utf8KeyCodec::encode(&key)),

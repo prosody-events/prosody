@@ -465,8 +465,9 @@ where
         self
     }
 
-    /// Replaces the whole constraint set with one an outer layer already
-    /// lowered. The reader and erased surfaces funnel through this one seam.
+    /// Replaces the whole constraint set with one that an outer layer
+    /// lowered. The reader and the erased surfaces apply their configs
+    /// through this one method.
     pub(crate) fn with_constraints(mut self, constraints: Constraints) -> Self {
         self.constraints = constraints;
         self

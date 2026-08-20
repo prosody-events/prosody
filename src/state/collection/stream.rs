@@ -117,9 +117,9 @@ pub(crate) struct RangePlan<S: StateSession, T> {
     _cell: PhantomData<fn() -> T>,
 }
 
-/// The constraints a query hands to its plan's terminal: the
-/// direction-relative edges and the present-yield limit. A query accumulates
-/// one and passes it whole; each arm consumes it where its semantics live.
+/// The constraints a query applies to its plan: the direction-relative edges
+/// and the limit on present yields. A query collects one set and passes it to
+/// the terminal. Each arm applies the set to its own read.
 #[derive(Clone)]
 pub(crate) struct Constraints {
     pub(crate) start: ScanEdge<Coordinate>,
@@ -156,9 +156,8 @@ pub(crate) enum Plan<S: StateSession, T: CellType> {
 
 impl<S: StateSession, T: CellType> Plan<S, T> {
     /// Drives the planned arm under `constraints` and resolves each live
-    /// entry. This match is the arm's single dispatch point: the choice
-    /// leaves here as a monomorphized [`Either`], never as a per-operation
-    /// branch.
+    /// entry. This match is the only dispatch on the arm. The choice leaves
+    /// here as a monomorphized [`Either`].
     pub(crate) fn entries(self, constraints: Constraints) -> impl Stream<Item = ScanItem<T>> + Send
     where
         for<'s> ContextOf<'s, T>: FromSession<'s, S>,
@@ -171,7 +170,7 @@ impl<S: StateSession, T: CellType> Plan<S, T> {
 
     /// Drives the planned arm under `constraints` presence-only. It yields
     /// keys and never touches a value. See [`Self::entries`] for the dispatch
-    /// posture.
+    /// rule.
     pub(crate) fn keys(self, constraints: Constraints) -> impl Stream<Item = KeyItem<T>> + Send {
         match self {
             Self::Points(plan) => Either::Left(plan.keys(constraints)),
@@ -452,10 +451,10 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
     }
 
     /// Folds the query constraints into the plan's own window. A query edge
-    /// can only reach a whole-section plan (a deque bounds its window
-    /// positionally inside its planning read), so an edge lands only on an
-    /// unbounded side and a set window edge always survives. The limit keeps
-    /// the smaller value: a query cannot widen a window's yield bound.
+    /// can only reach a whole-section plan, because a deque bounds its window
+    /// inside its planning read. An edge therefore lands only on an unbounded
+    /// side, and a set window edge always survives. The limit keeps the
+    /// smaller value: a query cannot widen the window's yield bound.
     fn constrained(mut self, constraints: Constraints) -> Self {
         let Constraints { start, end, limit } = constraints;
         if matches!(self.start, ScanEdge::Unbounded) {
@@ -569,9 +568,9 @@ where
     Ok(presence)
 }
 
-/// Reads presence for already-encoded coordinates in aligned batches. The
-/// typed twin above encodes first; the write journal's staged merge feeds
-/// its journal-silent coordinates here directly.
+/// Reads presence for encoded coordinates in aligned batches.
+/// [`read_keys_presence`] encodes typed keys and delegates here. The write
+/// journal's staged merge passes its journal-silent coordinates directly.
 pub(super) async fn read_presence_coordinates<S: StateSession>(
     session: &S,
     inner: &mut <S::Engine as sealed::ReadEngine<S>>::ReadInner<'_>,
