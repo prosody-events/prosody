@@ -415,8 +415,9 @@ pub struct MapHandle<S, KC, V> {
 
 /// A directional map stream query.
 ///
-/// No production caller limits entries yet. The option keeps both terminal
-/// scans symmetric.
+/// Build one with [`MapHandle::query`]. Finish with [`keys`](Self::keys) or
+/// [`entries`](Self::entries). No production caller limits entries yet; the
+/// shared builder keeps the twin scans symmetric (owner ruling).
 #[must_use]
 pub struct MapQuery<'a, S, KC, V> {
     handle: &'a MapHandle<S, KC, V>,
@@ -443,12 +444,20 @@ where
     where
         for<'s> ContextOf<'s, V>: FromSession<'s, S>,
     {
+        // Hand-built span: `#[instrument]` cannot follow a returned `Stream`,
+        // so each inner await is instrumented with a clone instead; the
+        // span's recorded time is the stream's own work. Unlike the sibling
+        // ops' `err`, failures are yielded per item rather than recorded on
+        // the span — a failing chunk ends with an OK-status span, and the
+        // yielded `Err` surfaces to the caller inside this span's scope.
         let span = info_span!(
             "map.stream",
             collection = self.handle.cells.name().as_str(),
             direction = ?self.dir,
         );
         try_stream! {
+            // Init: `stream_plan` reads the keyset under an admission it drops
+            // as it returns, before this `?` observes the result.
             let plan = self.handle.stream_plan(self.dir).instrument(span.clone()).await?;
             let plan = match self.limit {
                 Some(limit) => plan.with_limit(limit),

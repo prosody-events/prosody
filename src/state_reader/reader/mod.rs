@@ -226,7 +226,7 @@ where
     V: CellType<Key = UnitKey>,
     for<'s> ContextOf<'s, V>: FromSession<'s, ReadSession<C, B>>,
 {
-    /// Applies the owner map query limit.
+    /// Sets the maximum number of present items that the stream yields.
     pub fn limit(mut self, limit: NonZeroUsize) -> Self {
         self.limit = Some(limit);
         self
@@ -347,17 +347,10 @@ where
     pub async fn is_empty<K: Into<Key>>(&self, key: K) -> Result<bool, StateReaderError> {
         let session = self.session(key.into()).await?;
         let handle: MapHandle<_, KC, V> = self.descriptor.bind(&session)?;
-        let keys = handle
-            .query(Direction::Forward)
-            .limit(NonZeroUsize::MIN)
-            .keys();
-        futures::pin_mut!(keys);
-        Ok(keys
-            .next()
+        handle
+            .is_empty()
             .await
-            .transpose()
-            .map_err(|e| StateReaderError::store(&e))?
-            .is_none())
+            .map_err(|e| StateReaderError::store(&e))
     }
 
     /// Reads the committed values for `map_keys` as one aligned batch,
