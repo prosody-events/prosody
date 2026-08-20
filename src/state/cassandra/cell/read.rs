@@ -6,6 +6,7 @@ use super::{
     try_stream,
 };
 use scylla::deserialize::row::DeserializeRow;
+use std::num::NonZeroUsize;
 
 pub(super) type DecodedCellBatch = CellBuffer<Option<(Cell, Option<i32>)>>;
 /// Presence cells aligned with the unique coordinate batch.
@@ -284,13 +285,13 @@ pub(super) fn page_cells<'a, Row>(
 where
     Row: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> + Send + 'a,
 {
-    let section = i8::from(scan.section);
-    let dir = scan.dir;
+    let section = i8::from(scan.section());
+    let dir = scan.direction();
     // Both edges are held as owned `Coordinate`s across the stream's awaits —
     // O(1) refcount bumps (`Coordinate` is `Bytes`), never byte copies.
-    let start = scan.start.cloned();
-    let end = scan.end.cloned();
-    let limit = scan.limit;
+    let start = scan.start().cloned();
+    let end = scan.end().cloned();
+    let limit = scan.result_limit();
     try_stream! {
         let pk = Pk::of(collection);
         // The section-prefix bind values every scan statement shares.
@@ -344,12 +345,12 @@ where
 
 /// Clones one prepared scan statement and applies its fetch-size hint.
 /// The present-yield counter remains the only result limit.
-fn scan_statement(statement: &PreparedStatement, limit: Option<usize>) -> PreparedStatement {
+fn scan_statement(statement: &PreparedStatement, limit: Option<NonZeroUsize>) -> PreparedStatement {
     let mut statement = statement.clone();
     if let Some(limit) = limit {
         let default = statement.get_page_size();
         let default_usize = usize::try_from(default).unwrap_or(usize::MAX);
-        let hint = limit.saturating_add(8).min(default_usize);
+        let hint = limit.get().saturating_add(8).min(default_usize);
         statement.set_page_size(i32::try_from(hint).unwrap_or(default));
     }
     statement

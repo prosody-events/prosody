@@ -354,13 +354,7 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
     /// whole plan once, so the [`Scan`]'s edges name the plan's own owned
     /// coordinates.
     fn page(&self) -> impl Stream<Item = Result<(CellKey, Bytes), StateAccessError>> + Send + '_ {
-        let scan = Scan {
-            section: self.base.section,
-            start: self.start.as_ref(),
-            dir: self.dir,
-            end: self.end.as_ref(),
-            limit: self.limit.map(NonZeroUsize::get),
-        };
+        let scan = self.scan();
         <S::Engine as sealed::ReadEngine<S>>::page(
             &self.base.session,
             &self.base.plan,
@@ -372,13 +366,7 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
 
     /// Opens the plan's payload-free key page.
     fn page_keys(&self) -> impl Stream<Item = Result<CellKey, StateAccessError>> + Send + '_ {
-        let scan = Scan {
-            section: self.base.section,
-            start: self.start.as_ref(),
-            dir: self.dir,
-            end: self.end.as_ref(),
-            limit: self.limit.map(NonZeroUsize::get),
-        };
+        let scan = self.scan();
         <S::Engine as sealed::ReadEngine<S>>::page_keys(
             &self.base.session,
             &self.base.plan,
@@ -386,6 +374,24 @@ impl<S: StateSession, T: CellType> RangePlan<S, T> {
             &self.base.name,
             scan,
         )
+    }
+
+    fn scan(&self) -> Scan<'_> {
+        let scan = Scan::over(self.base.section, self.dir);
+        let scan = match self.start.as_ref() {
+            ScanEdge::Included(start) => scan.from(start),
+            ScanEdge::Excluded(start) => scan.after(start),
+            ScanEdge::Unbounded => scan,
+        };
+        let scan = match self.end.as_ref() {
+            ScanEdge::Included(end) => scan.to(end),
+            ScanEdge::Excluded(end) => scan.before(end),
+            ScanEdge::Unbounded => scan,
+        };
+        match self.limit {
+            Some(limit) => scan.limit(limit),
+            None => scan,
+        }
     }
 
     /// Streams the section's live entries, resolved, in `dir` order.

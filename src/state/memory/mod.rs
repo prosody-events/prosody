@@ -219,16 +219,19 @@ where
             // borrowing iterator across an await), then resolve each lazily.
             let mut raw: Vec<(CellKey, Cell)> = Vec::new();
             self.map().iter_sync(|(id, cell), stored| {
-                if id == collection && cell.section == scan.section && scan.contains(&cell.coordinate) {
+                if id == collection
+                    && cell.section == scan.section()
+                    && scan.contains(&cell.coordinate)
+                {
                     raw.push((cell.clone(), stored.to_cell()));
                 }
                 true
             });
             raw.sort_by(|(a, _), (b, _)| a.coordinate.cmp(&b.coordinate));
-            if scan.dir == Direction::Backward {
+            if scan.direction() == Direction::Backward {
                 raw.reverse();
             }
-            let limit = scan.limit;
+            let limit = scan.result_limit();
             // The limit bounds *yielded* (present) cells, not raw rows: a cleared
             // or rolled-back-to-absent cell in range is skipped without consuming
             // a limit slot (matching the Cassandra scan's `yielded` counter).
@@ -238,7 +241,7 @@ where
             // fires every ~128 items.
             let mut yielded = 0usize;
             for (cell, stored) in raw {
-                if limit.is_some_and(|n| yielded >= n) {
+                if limit.is_some_and(|n| yielded >= n.get()) {
                     break;
                 }
                 let committed =

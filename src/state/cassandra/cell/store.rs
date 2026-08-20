@@ -230,7 +230,7 @@ where
     where
         Row: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> + Send + 'a,
     {
-        let limit = scan.limit;
+        let limit = scan.result_limit();
         let collection_ref = self.resolver.collection_ref(collection);
         try_stream! {
             // Read-help once before the pager opens (`help_read_window`): a
@@ -268,10 +268,9 @@ where
             // back durably (a scan write-back could clobber a newer `commit()`
             // of the same cell), so this posture costs no write amplification.
             while let Some((key, raw)) = pages.try_next().await.map_err(ResolveCellError::Store)? {
-                // The limit bounds *yielded* (present) cells; check it before
-                // processing the next row so `Some(0)` yields nothing (an absent
-                // cell never consumes a slot — only a present yield does).
-                if limit.is_some_and(|n| yielded >= n) {
+                // The limit bounds *yielded* cells. An absent cell does not use
+                // a slot.
+                if limit.is_some_and(|n| yielded >= n.get()) {
                     break;
                 }
                 let committed = peek_read(self.resolver.oracle(), &collection_ref, own, raw)

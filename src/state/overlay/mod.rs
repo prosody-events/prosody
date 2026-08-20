@@ -246,14 +246,7 @@ where
     ) -> impl Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a {
         // Strip the lower limit because dirty cells can add or hide results.
         // The merge applies the limit to its output.
-        let bottom = self.lower.scan_cells(
-            collection,
-            Scan {
-                limit: None,
-                ..scan
-            },
-            own,
-        );
+        let bottom = self.lower.scan_cells(collection, scan.without_limit(), own);
         self.merge_cells(collection, scan, bottom)
     }
 
@@ -266,14 +259,7 @@ where
     ) -> impl Stream<Item = Result<CellKey, L::Error>> + Send + 'a {
         let bottom = self
             .lower
-            .scan_keys(
-                collection,
-                Scan {
-                    limit: None,
-                    ..scan
-                },
-                own,
-            )
+            .scan_keys(collection, scan.without_limit(), own)
             .map_ok(|key| (key, Bytes::new()));
         self.merge_cells(collection, scan, bottom)
             .map_ok(|(key, _)| key)
@@ -288,15 +274,15 @@ where
     where
         S: Stream<Item = Result<(CellKey, Bytes), L::Error>> + Send + 'a,
     {
-        let cleared = self.dirty.section_cleared(collection, scan.section);
-        let mut top = self.dirty.section_snapshot(collection, scan.section);
+        let cleared = self.dirty.section_cleared(collection, scan.section());
+        let mut top = self.dirty.section_snapshot(collection, scan.section());
         // Bound the dirty leg to the scan's range in `dir` before merging:
         // `section_snapshot` yields the whole section, so without this a dirty
         // cell outside the range (or on the wrong side of `start`) would leak
         // into a bounded scan. The lower leg is already range-bounded.
         top.retain(|(key, _)| scan.contains(&key.coordinate));
         // The snapshot is ascending; the lower leg is in `dir` order, so align.
-        if scan.dir == Direction::Backward {
+        if scan.direction() == Direction::Backward {
             top.reverse();
         }
         try_stream! {
@@ -305,7 +291,7 @@ where
                 // the post-clear dirty `Set`s, honoring the limit.
                 let mut yielded = 0usize;
                 for (key, value) in &top {
-                    if scan.limit.is_some_and(|n| yielded >= n) {
+                    if scan.result_limit().is_some_and(|n| yielded >= n.get()) {
                         break;
                     }
                     if let DirtyVal::Set(bytes) = value {
@@ -321,8 +307,7 @@ where
             let mut yielded = 0usize;
             let mut bottom = std::pin::pin!(bottom.peekable());
             loop {
-                // Apply the merged-output limit (handles `Some(0)` → yield none).
-                if scan.limit.is_some_and(|n| yielded >= n) {
+                if scan.result_limit().is_some_and(|n| yielded >= n.get()) {
                     break;
                 }
                 let order = match (top.get(ti), bottom.as_mut().peek().await) {
@@ -332,7 +317,7 @@ where
                     // Lower-only, or lower errored (surfaced when consumed below).
                     (None, Some(_)) | (Some(_), Some(Err(_))) => Ordering::Greater,
                     (Some((tk, _)), Some(Ok((bk, _)))) => {
-                        front_cmp(scan.dir, &tk.coordinate, &bk.coordinate)
+                        front_cmp(scan.direction(), &tk.coordinate, &bk.coordinate)
                     }
                 };
                 match order {

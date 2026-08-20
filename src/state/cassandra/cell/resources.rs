@@ -147,7 +147,7 @@ impl CassandraCellResources {
     where
         Row: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> + Send + 'a,
     {
-        let limit = scan.limit;
+        let limit = scan.result_limit();
         try_stream! {
             let pages = page_cells(
                 &self.session,
@@ -159,7 +159,7 @@ impl CassandraCellResources {
             pin_mut!(pages);
             let mut yielded = 0usize;
             while let Some((key, cell)) = pages.try_next().await? {
-                if limit.is_some_and(|n| yielded >= n) {
+                if limit.is_some_and(|n| yielded >= n.get()) {
                     break;
                 }
                 if let Some(bytes) = cell.project_committed().cloned() {
