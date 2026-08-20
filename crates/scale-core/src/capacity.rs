@@ -91,6 +91,24 @@ struct CapacityModelArtifact {
     resource_window_group_count_max: u32,
 }
 
+impl CapacityModelArtifact {
+    fn with_coverage(
+        mut self,
+        grid: &CapacityGrid,
+        history_coverage_seconds: f64,
+    ) -> Result<Self, CapacityModelError> {
+        record_grid_coverage(grid, &mut self)?;
+        self.coverage.push(PriorCoverageRecord::new(
+            0.0_f64,
+            history_coverage_seconds,
+            0.0_f64,
+            0.0_f64,
+            0.0_f64,
+        ));
+        Ok(self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MarkovClockAssumption {
     MemorylessAggregateCompletions,
@@ -698,19 +716,12 @@ impl CapacityFactor {
         let state_count = concurrency_max as usize + 1;
         let (history_coverage_seconds, start_history_capacity) =
             start_history_contract(&grid, concurrency_max, exposure_min_seconds)?;
-        let mut artifact = capacity_model_artifact_with_groups(
+        let artifact = capacity_model_artifact_with_groups(
             change_rate_per_second,
             arrival_prior.shape(),
             group_count_max,
-        )?;
-        record_grid_coverage(&grid, &mut artifact)?;
-        artifact.coverage.push(PriorCoverageRecord::new(
-            0.0_f64,
-            history_coverage_seconds,
-            0.0_f64,
-            0.0_f64,
-            0.0_f64,
-        ));
+        )?
+        .with_coverage(&grid, history_coverage_seconds)?;
         let prior_weights = capacity_prior(&grid, &artifact)?;
         let (hazard_rates_per_second, hazard_weights) = hazard_prior(&artifact)?;
         let (contamination_probabilities, contamination_weights) = contamination_prior(&artifact)?;
@@ -822,19 +833,12 @@ impl CapacityFactor {
         &self,
         change_rate_per_second: f64,
     ) -> Result<PriorArtifact, CapacityModelError> {
-        let mut artifact = capacity_model_artifact_with_groups(
+        let artifact = capacity_model_artifact_with_groups(
             change_rate_per_second,
             self.arrival_shape,
             self.resource_window_group_count_max,
-        )?;
-        record_grid_coverage(&self.grid, &mut artifact)?;
-        artifact.coverage.push(PriorCoverageRecord::new(
-            0.0_f64,
-            self.history_coverage_seconds,
-            0.0_f64,
-            0.0_f64,
-            0.0_f64,
-        ));
+        )?
+        .with_coverage(&self.grid, self.history_coverage_seconds)?;
         Ok(PriorArtifact::new(
             artifact.identity,
             artifact.budget,

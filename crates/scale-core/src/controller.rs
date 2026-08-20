@@ -1795,6 +1795,7 @@ fn prepare_unassigned_cohorts(source: &EventCohorts, workspace: &mut ScenarioWor
     prepare(&workspace.unassigned_cohorts, &mut workspace.edf);
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure(label = "evaluate_candidates"))]
 fn evaluate_candidates(
     shared: &CandidateEvaluation<'_>,
     edf: &mut EdfScratch,
@@ -1880,6 +1881,10 @@ struct ScenarioDraws<'a> {
     arrival_path_rates: &'a [f64],
 }
 
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "prepare_supply_trajectories")
+)]
 fn prepare_supply_trajectories(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
@@ -2521,6 +2526,10 @@ fn prepare_partition_work(scratch: &mut ScaleScratch) {
     }
 }
 
+#[cfg_attr(
+    feature = "hotpath",
+    hotpath::measure(label = "partition_deadline_outcomes")
+)]
 fn partition_deadline_outcomes(
     state: &ScaleState,
     shared: &ScenarioShared<'_>,
