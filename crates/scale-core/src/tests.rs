@@ -360,6 +360,7 @@ fn trajectory_counts_a_cohort_released_before_its_horizon() -> Result<(), TestEr
         initial: 45.0_f64,
         pause_micros: &[77_000_000_u64],
         ready_micros: &[78_000_000_u64],
+        ready_boundaries: &[78_000_000_u64],
         during: &[20.0_f64],
         after: &[45.0_f64],
     };

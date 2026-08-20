@@ -625,6 +625,8 @@ struct ScenarioWorkspace {
     partition_order: Vec<u32>,
     partition_share_draws: Vec<f64>,
     moved_partition_share: Vec<f64>,
+    moved_partition_prefix_rows: Vec<f64>,
+    moved_partition_prefix_valid: Vec<bool>,
     commitment_pause_micros: Vec<u64>,
     rebalancing_ready_micros: u64,
     trajectory_offsets: Vec<u32>,
@@ -636,6 +638,7 @@ struct TrajectoryColumns {
     pause_micros: Vec<u64>,
     ready_override_micros: Vec<Option<u64>>,
     ready_micros: Vec<u64>,
+    ready_boundaries: Vec<u64>,
     during_supply: Vec<f64>,
     after_supply: Vec<f64>,
 }
@@ -669,6 +672,7 @@ struct ScratchBounds {
     partition_count: usize,
     partition_offset_count: usize,
     replica_count_max: usize,
+    candidate_event_count_max: usize,
     trajectory_event_count_max: usize,
     posterior_sample_count: usize,
     scenario_cell_count: usize,
@@ -683,6 +687,7 @@ struct CandidateEvaluation<'a> {
     trajectory_offsets: &'a [u32],
     trajectory_pause_micros: &'a [u64],
     trajectory_ready_micros: &'a [u64],
+    trajectory_ready_boundaries: &'a [u64],
     trajectory_during_supply: &'a [f64],
     trajectory_after_supply: &'a [f64],
     horizon_micros: u64,
@@ -852,6 +857,15 @@ impl ScratchBounds {
         let scenario_cell_count = posterior_sample_count
             .checked_mul(replica_count_max)
             .ok_or(ConfigurationError::PlatformLimit)?;
+        // Each candidate can hold at most two fixed events per replica,
+        // one requested event, and one repair per arrival path segment.
+        let candidate_event_count_max = replica_count_max
+            .checked_mul(2)
+            .and_then(|events| events.checked_add(1))
+            .and_then(|events| {
+                events.checked_add(configuration.arrival_prior.path_segment_count_max())
+            })
+            .ok_or(ConfigurationError::PlatformLimit)?;
         Ok(Self {
             work_cohort_count_max,
             work_cohort_count_max_u32: u32::try_from(work_cohort_count_max)
@@ -859,18 +873,9 @@ impl ScratchBounds {
             partition_count,
             partition_offset_count,
             replica_count_max,
-            // Each candidate can hold at most two fixed events per replica,
-            // one requested event, and one repair per arrival path segment.
+            candidate_event_count_max,
             trajectory_event_count_max: replica_count_max
-                .checked_mul(
-                    replica_count_max
-                        .checked_mul(2)
-                        .and_then(|events| events.checked_add(1))
-                        .and_then(|events| {
-                            events.checked_add(configuration.arrival_prior.path_segment_count_max())
-                        })
-                        .ok_or(ConfigurationError::PlatformLimit)?,
-                )
+                .checked_mul(candidate_event_count_max)
                 .ok_or(ConfigurationError::PlatformLimit)?,
             posterior_sample_count,
             scenario_cell_count,
@@ -888,6 +893,7 @@ impl TrajectoryColumns {
             pause_micros: Vec::with_capacity(capacity),
             ready_override_micros: Vec::with_capacity(capacity),
             ready_micros: Vec::with_capacity(capacity),
+            ready_boundaries: Vec::with_capacity(capacity),
             during_supply: Vec::with_capacity(capacity),
             after_supply: Vec::with_capacity(capacity),
         }
@@ -905,6 +911,14 @@ impl ScenarioWorkspace {
             partition_order: vec![0; bounds.partition_count],
             partition_share_draws: vec![0.0_f64; bounds.partition_count],
             moved_partition_share: vec![0.0_f64; bounds.partition_offset_count],
+            moved_partition_prefix_rows: vec![
+                0.0_f64;
+                bounds
+                    .candidate_event_count_max
+                    .checked_mul(bounds.partition_offset_count)
+                    .ok_or(ConfigurationError::PlatformLimit)?
+            ],
+            moved_partition_prefix_valid: vec![false; bounds.candidate_event_count_max],
             commitment_pause_micros: vec![0_u64; bounds.replica_count_max],
             rebalancing_ready_micros: u64::MAX,
             trajectory_offsets: vec![0; bounds.replica_count_max + 1],
@@ -1500,6 +1514,7 @@ fn evaluate_scenario_outcome(
             trajectory_offsets: &workspace.trajectory_offsets,
             trajectory_pause_micros: &workspace.trajectory.pause_micros,
             trajectory_ready_micros: &workspace.trajectory.ready_micros,
+            trajectory_ready_boundaries: &workspace.trajectory.ready_boundaries,
             trajectory_during_supply: &workspace.trajectory.during_supply,
             trajectory_after_supply: &workspace.trajectory.after_supply,
             horizon_micros: forecast.planning_horizon_micros,
@@ -1813,6 +1828,7 @@ fn evaluate_candidates(
                 initial: shared.current_supply,
                 pause_micros: &shared.trajectory_pause_micros[first..last],
                 ready_micros: &shared.trajectory_ready_micros[first..last],
+                ready_boundaries: &shared.trajectory_ready_boundaries[first..last],
                 during: &shared.trajectory_during_supply[first..last],
                 after: &shared.trajectory_after_supply[first..last],
             },
@@ -1894,6 +1910,7 @@ fn prepare_supply_trajectories(
 ) {
     let current_supply = draws.current_supply;
     let candidate_count = workspace.posterior_resource_supply.len();
+    workspace.moved_partition_prefix_valid.fill(false);
     let now_micros = sample_commitment_pauses(
         state,
         workspace,
@@ -1964,6 +1981,11 @@ fn prepare_supply_trajectories(
                 event_ordinal: active.ordinal,
             },
         );
+        workspace
+            .trajectory
+            .ready_boundaries
+            .extend_from_slice(&workspace.trajectory.ready_micros[first..]);
+        workspace.trajectory.ready_boundaries[first..].sort_unstable();
         workspace.trajectory_offsets[candidate_index + 1] =
             workspace.trajectory.targets.len() as u32;
     }
@@ -2030,6 +2052,7 @@ fn clear_trajectory(trajectory: &mut TrajectoryColumns) {
     trajectory.pause_micros.clear();
     trajectory.ready_override_micros.clear();
     trajectory.ready_micros.clear();
+    trajectory.ready_boundaries.clear();
     trajectory.during_supply.clear();
     trajectory.after_supply.clear();
 }
@@ -2385,6 +2408,16 @@ fn sample_moved_partition_prefix(
     draws: &ScenarioDraws<'_>,
     event_ordinal: u64,
 ) {
+    let ordinal = event_ordinal as usize;
+    let row_width = workspace.moved_partition_share.len();
+    let first = ordinal * row_width;
+    let last = first + row_width;
+    if workspace.moved_partition_prefix_valid[ordinal] {
+        workspace
+            .moved_partition_share
+            .copy_from_slice(&workspace.moved_partition_prefix_rows[first..last]);
+        return;
+    }
     let mut random = draws.placement_random.clone().domain(event_ordinal);
     state.partition_placement.sample_moved_prefix(
         &mut random,
@@ -2392,6 +2425,9 @@ fn sample_moved_partition_prefix(
         &mut workspace.partition_share_draws,
         &mut workspace.moved_partition_share,
     );
+    workspace.moved_partition_prefix_rows[first..last]
+        .copy_from_slice(&workspace.moved_partition_share);
+    workspace.moved_partition_prefix_valid[ordinal] = true;
 }
 
 fn sort_trajectory_events(trajectory: &mut TrajectoryColumns, first: usize) {

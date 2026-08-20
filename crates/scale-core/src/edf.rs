@@ -38,6 +38,7 @@ pub(crate) struct SupplyTrajectory<'a> {
     pub(crate) initial: f64,
     pub(crate) pause_micros: &'a [u64],
     pub(crate) ready_micros: &'a [u64],
+    pub(crate) ready_boundaries: &'a [u64],
     pub(crate) during: &'a [f64],
     pub(crate) after: &'a [f64],
 }
@@ -298,10 +299,12 @@ impl SupplyTrajectory<'_> {
 }
 
 /// `SupplyTrajectory` owns sorted pause times, so equal pauses keep their input
-/// order and the last tie wins.
+/// order and the last tie wins. Its ready-boundary column is a sorted copy of
+/// all ready times.
 struct TrajectoryCursor<'a> {
     trajectory: &'a SupplyTrajectory<'a>,
     pause_count: usize,
+    ready_boundary_count: usize,
 }
 
 impl<'a> TrajectoryCursor<'a> {
@@ -309,6 +312,7 @@ impl<'a> TrajectoryCursor<'a> {
         Self {
             trajectory,
             pause_count: 0,
+            ready_boundary_count: 0,
         }
     }
 
@@ -320,6 +324,14 @@ impl<'a> TrajectoryCursor<'a> {
             .is_some_and(|pause| *pause <= at_micros)
         {
             self.pause_count += 1;
+        }
+        while self
+            .trajectory
+            .ready_boundaries
+            .get(self.ready_boundary_count)
+            .is_some_and(|ready| *ready <= at_micros)
+        {
+            self.ready_boundary_count += 1;
         }
     }
 
@@ -335,16 +347,15 @@ impl<'a> TrajectoryCursor<'a> {
         }
     }
 
-    fn next_boundary_micros(&self, after_micros: u64) -> Option<u64> {
+    fn next_boundary_micros(&self) -> Option<u64> {
         self.trajectory
             .pause_micros
             .get(self.pause_count)
             .into_iter()
             .chain(
                 self.trajectory
-                    .ready_micros
-                    .iter()
-                    .filter(|boundary| **boundary > after_micros),
+                    .ready_boundaries
+                    .get(self.ready_boundary_count),
             )
             .copied()
             .min()
@@ -753,7 +764,7 @@ fn shared_boundary_micros(
     budget_seconds: f64,
     mut next_micros: u64,
 ) -> u64 {
-    if let Some(boundary) = trajectory.next_boundary_micros(now_micros) {
+    if let Some(boundary) = trajectory.next_boundary_micros() {
         next_micros = next_micros.min(boundary);
     }
     let now_seconds = Duration::from_micros(now_micros).as_secs_f64();
@@ -1120,6 +1131,7 @@ mod tests {
             initial: 3.0_f64,
             pause_micros: &[500_001],
             ready_micros: &[500_003],
+            ready_boundaries: &[500_003],
             during: &[2.0_f64],
             after: &[4.0_f64],
         };
@@ -1144,6 +1156,7 @@ mod tests {
             initial: 1.0_f64,
             pause_micros: &[500_000, 500_000],
             ready_micros: &[900_000, 900_000],
+            ready_boundaries: &[900_000, 900_000],
             during: &[2.0_f64, 3.0_f64],
             after: &[4.0_f64, 5.0_f64],
         };
@@ -1176,6 +1189,7 @@ mod tests {
             initial: supply,
             pause_micros: &[500_000_u64],
             ready_micros: &[1_000_000_u64],
+            ready_boundaries: &[1_000_000_u64],
             during: &[supply * 0.5_f64],
             after: &[supply * 1.5_f64],
         };
@@ -1231,10 +1245,13 @@ mod tests {
             during.push(f64::from(supply_seed % 20 + 1));
             after.push(f64::from(ready_seed % 20 + 1));
         }
+        let mut ready_boundaries = ready_micros.clone();
+        ready_boundaries.sort_unstable();
         let trajectory = SupplyTrajectory {
             initial: f64::from(supply_seed % 20 + 1),
             pause_micros: &pause_micros,
             ready_micros: &ready_micros,
+            ready_boundaries: &ready_boundaries,
             during: &during,
             after: &after,
         };
@@ -1263,6 +1280,7 @@ mod tests {
             initial: 7.0_f64,
             pause_micros: &[],
             ready_micros: &[],
+            ready_boundaries: &[],
             during: &[],
             after: &[],
         };

@@ -2,8 +2,9 @@ use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
 use super::{
-    SCHEDULED_PARTITION, balanced_partition_owner, balanced_partition_range, prepare_work_cohorts,
-    scenario_event_count, scenario_horizons,
+    DecisionRandomDomain, SCHEDULED_PARTITION, ScenarioDraws, ScenarioWorkspace, ScratchBounds,
+    balanced_partition_owner, balanced_partition_range, decision_random, prepare_work_cohorts,
+    sample_moved_partition_prefix, scenario_event_count, scenario_horizons,
 };
 use crate::edf::ArrivalPath;
 use crate::types::EventCohorts;
@@ -29,6 +30,52 @@ fn balanced_partition_ranges_match_owner_order(partition_seed: u8, replica_seed:
                 replica,
             ))
     })
+}
+
+#[test]
+fn moved_partition_prefix_cache_matches_ordinal_draw() -> Result<(), TestError> {
+    let (state, _scratch, _observation) = test_model()?;
+    let bounds = ScratchBounds::new(state.configuration())?;
+    let mut workspace = ScenarioWorkspace::new(&bounds)?;
+    let placement_random = decision_random(7, 11, DecisionRandomDomain::Placement);
+    let draws = ScenarioDraws {
+        current_supply: 1.0_f64,
+        lead_random: placement_random.clone(),
+        rebalance_random: placement_random.clone(),
+        placement_random: placement_random.clone(),
+        commitment_random: placement_random.clone(),
+        arrival_path_end_seconds: &[],
+        arrival_path_rates: &[],
+    };
+    let ordinal = 1_u64;
+    sample_moved_partition_prefix(&state, &mut workspace, &draws, ordinal);
+    let first = workspace.moved_partition_share.clone();
+    sample_moved_partition_prefix(&state, &mut workspace, &draws, ordinal);
+
+    let mut order = vec![0; bounds.partition_count];
+    let mut shares = vec![0.0_f64; bounds.partition_count];
+    let mut expected = vec![0.0_f64; bounds.partition_offset_count];
+    let mut random = placement_random.domain(ordinal);
+    state.partition_placement.sample_moved_prefix(
+        &mut random,
+        &mut order,
+        &mut shares,
+        &mut expected,
+    );
+    assert!(
+        first
+            .iter()
+            .zip(&expected)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+    );
+    assert!(
+        workspace
+            .moved_partition_share
+            .iter()
+            .zip(&expected)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+    );
+    Ok(())
 }
 
 #[test]
