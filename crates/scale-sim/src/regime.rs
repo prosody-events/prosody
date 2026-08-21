@@ -676,27 +676,39 @@ fn validate_capacity_closed_loop_claim(
     regime: PrincipalRegime,
     run: &PrincipalRun,
 ) -> Result<(), RegimeValidationError> {
-    // The controller reacts within one second after demand exceeds capacity.
-    // The first accepted window above the knee starts the evidence clock.
-    // Identification then completes during the bounded clamp traversal.
-    const DEMAND_STEP_MICROS: u64 = 270_000_000;
-    const REACTION_LIMIT_MICROS: u64 = 5_000_000;
+    // One replica supplies 32 / 0.202 = 158 operations per second. The
+    // 90-second staircase first exceeds this rate at 200 operations per
+    // second. The one-second observation cadence gives the decision one
+    // sample to rise above one. Launch delay affects readiness, not targets.
+    // Two more staircase intervals place the final step at 270 seconds. The
+    // target must reach the configured maximum before that step.
+    //
+    // The identification bound separates two authored belief states. A run
+    // without above-knee evidence holds the no-knee mass at or above the 0.5
+    // prior. Both identified twins collapse it below 0.03 within two
+    // one-second samples of the first accepted above-knee window. The 0.25
+    // bound is half the prior: below every stuck-at-prior trace and above
+    // every identified trace, with a two-sample window from the same probes.
+    const CAPACITY_CROSSING_MICROS: u64 = 90_000_000;
+    const TARGET_REACTION_LIMIT_MICROS: u64 = 1_000_000;
+    const FINAL_STEP_MICROS: u64 = 270_000_000;
+    const IDENTIFICATION_LIMIT_MICROS: u64 = 2_000_000;
+    const NO_KNEE_BOUND: f64 = 0.25_f64;
     const KNEE_CONCURRENCY: u32 = 64;
-    let pre_step_target = controller_samples(run)
-        .take_while(|sample| sample.at_micros <= DEMAND_STEP_MICROS)
-        .last()
-        .map(|sample| sample.target);
-    let reacted = pre_step_target.is_some_and(|pre_step| {
-        controller_samples(run).any(|sample| {
-            sample.at_micros > DEMAND_STEP_MICROS
-                && sample.at_micros <= DEMAND_STEP_MICROS + REACTION_LIMIT_MICROS
-                && sample.target > pre_step
-        })
-    });
     require_closed_loop(
-        reacted,
+        controller_samples(run).any(|sample| {
+            sample.at_micros > CAPACITY_CROSSING_MICROS
+                && sample.at_micros <= CAPACITY_CROSSING_MICROS + TARGET_REACTION_LIMIT_MICROS
+                && sample.target > 1
+        }),
         regime,
-        "the capacity target did not react to the demand step",
+        "the capacity target did not react when demand exceeded one-replica capacity",
+    )?;
+    require_closed_loop(
+        controller_samples(run)
+            .any(|sample| sample.at_micros < FINAL_STEP_MICROS && sample.target == 3),
+        regime,
+        "the capacity target did not reach its maximum before the final demand step",
     )?;
     let evidence_at = controller_samples(run)
         .find(|sample| {
@@ -712,6 +724,17 @@ fn validate_capacity_closed_loop_claim(
         evidence_at.is_some(),
         regime,
         "the plant produced no resource evidence above the knee",
+    )?;
+    require_closed_loop(
+        evidence_at.is_some_and(|start_micros| {
+            controller_samples(run).any(|sample| {
+                sample.at_micros >= start_micros
+                    && sample.at_micros <= start_micros.saturating_add(IDENTIFICATION_LIMIT_MICROS)
+                    && sample.no_knee_probability < NO_KNEE_BOUND
+            })
+        }),
+        regime,
+        "the capacity belief did not identify the post-knee plant",
     )?;
     if regime == PrincipalRegime::FlatPostKnee {
         return require_closed_loop(
