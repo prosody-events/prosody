@@ -16,7 +16,9 @@ use crate::edf::{
     ArrivalPath, EdfOutcome, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
     evaluate_prepared_step, evaluate_prepared_trajectory, prepare, required_capacity_prepared,
 };
-use crate::lead_time::{LaunchTimeFactor, RebalanceTimeFactor};
+use crate::lead_time::{
+    LaunchDurationShock, LaunchTimeFactor, RebalanceDurationShock, RebalanceTimeFactor,
+};
 use crate::partition::PartitionFactor;
 use crate::planning::terminal_replica_seconds;
 use crate::reliability::ReliabilityFactor;
@@ -772,6 +774,47 @@ fn mixture_witness() -> Result<MixtureWitness, TestError> {
             readiness_lump(2, 59_950_000, 60_050_000)?,
         ],
     })
+}
+
+#[quickcheck]
+fn duration_shock_transforms_match_direct_samplers(
+    seed: u64,
+    delta_seed: u8,
+    scale_up: bool,
+) -> quickcheck::TestResult {
+    let witness = match mixture_witness() {
+        Ok(witness) => witness,
+        Err(error) => return quickcheck::TestResult::error(error.to_string()),
+    };
+    let direction = if scale_up {
+        TransitionDirection::Up
+    } else {
+        TransitionDirection::Down
+    };
+    let delta = u32::from(delta_seed % 8 + 1);
+    let mut shock_launch_random = RandomStream::new(seed);
+    let launch_shock = LaunchDurationShock::draw(&mut shock_launch_random);
+    let direct_launch = witness
+        .factor
+        .legacy_seconds_from_shock(direction, delta, launch_shock);
+    let transformed_launch = witness
+        .factor
+        .seconds_from_shock(direction, delta, launch_shock);
+
+    let rebalance_prior = match RebalancePrior::kip848() {
+        Ok(prior) => prior,
+        Err(error) => return quickcheck::TestResult::error(error.to_string()),
+    };
+    let rebalance = RebalanceTimeFactor::new(&rebalance_prior);
+    let mut shock_rebalance_random = RandomStream::new(seed.rotate_left(17));
+    let rebalance_shock = RebalanceDurationShock::draw(&mut shock_rebalance_random);
+    let direct_rebalance = rebalance.legacy_seconds_from_shock(rebalance_shock);
+    let transformed_rebalance = rebalance.seconds_from_shock(rebalance_shock);
+
+    quickcheck::TestResult::from_bool(
+        direct_launch.to_bits() == transformed_launch.to_bits()
+            && direct_rebalance.to_bits() == transformed_rebalance.to_bits(),
+    )
 }
 
 fn readiness_lump(group: u64, after: u64, ready: u64) -> Result<ReadinessLump, TestError> {
@@ -1537,7 +1580,27 @@ fn controller_transition_is_cadence_invariant() -> Result<(), TestError> {
         fine_observation.observation(),
     );
 
-    assert_eq!(coarse, fine);
+    let without_sampling_error = |decision| match decision {
+        ScaleDecision::Apply(mut apply) => {
+            apply.diagnostics.paired_cost_standard_error = None;
+            ScaleDecision::Apply(apply)
+        }
+        ScaleDecision::Hold(mut hold) => {
+            hold.diagnostics.paired_cost_standard_error = None;
+            ScaleDecision::Hold(hold)
+        }
+    };
+    assert_eq!(without_sampling_error(coarse), without_sampling_error(fine));
+    for decision in [coarse, fine] {
+        if let ScaleDecision::Apply(apply) = decision {
+            assert!(
+                apply
+                    .diagnostics
+                    .paired_cost_standard_error
+                    .is_some_and(f64::is_finite)
+            );
+        }
+    }
     Ok(())
 }
 

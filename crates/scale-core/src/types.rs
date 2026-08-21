@@ -2204,6 +2204,8 @@ pub struct DecisionDiagnostics {
     pub posterior_mean_count_argmax_partition_share: f64,
     /// Posterior expected cost at the selected target.
     pub expected_cost: f64,
+    /// Paired standard error for runner-up cost minus selected cost.
+    pub paired_cost_standard_error: Option<f64>,
     /// Posterior expected delay as a fraction of the deadline budget.
     pub miss_delay_fraction: f64,
 }

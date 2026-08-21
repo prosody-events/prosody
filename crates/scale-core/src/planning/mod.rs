@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::time::Duration;
 
 /// Returns one common horizon for all actions in a posterior scenario.
@@ -55,10 +54,27 @@ pub(crate) struct ActionSelection {
 ///
 /// When no action meets epsilon, the smallest miss fraction wins. This
 /// fallback keeps loss finite and marks every action as a deadline rejection.
+#[cfg(test)]
 pub(crate) fn select_action(columns: &ActionColumns<'_>) -> ActionSelection {
+    select_action_by(columns, |index| columns.cost(index))
+}
+
+/// Selects from paired cost differences while preserving feasibility rules.
+pub(crate) fn select_paired_action(
+    columns: &ActionColumns<'_>,
+    cost_differences: &[f64],
+) -> ActionSelection {
+    select_action_by(columns, |index| cost_differences[index])
+}
+
+fn select_action_by(columns: &ActionColumns<'_>, cost: impl Fn(usize) -> f64) -> ActionSelection {
     let feasible = (0..columns.late_area_sums.len())
         .filter(|index| columns.is_feasible(*index))
-        .min_by(|left, right| compare_actions(*left, *right, columns))
+        .min_by(|left, right| {
+            cost(*left)
+                .total_cmp(&cost(*right))
+                .then_with(|| left.cmp(right))
+        })
         .map(|index| ActionSelection {
             index,
             used_fallback: false,
@@ -76,8 +92,9 @@ pub(crate) fn select_action(columns: &ActionColumns<'_>) -> ActionSelection {
     })
 }
 
-pub(crate) fn select_runner_up(
+pub(crate) fn select_paired_runner_up(
     columns: &ActionColumns<'_>,
+    cost_differences: &[f64],
     selected: usize,
     used_fallback: bool,
 ) -> Option<usize> {
@@ -90,16 +107,11 @@ pub(crate) fn select_runner_up(
                     .total_cmp(&columns.miss_fraction(*right))
                     .then_with(|| left.cmp(right))
             } else {
-                compare_actions(*left, *right, columns)
+                cost_differences[*left]
+                    .total_cmp(&cost_differences[*right])
+                    .then_with(|| left.cmp(right))
             }
         })
-}
-
-pub(crate) fn compare_actions(left: usize, right: usize, columns: &ActionColumns<'_>) -> Ordering {
-    columns
-        .cost(left)
-        .total_cmp(&columns.cost(right))
-        .then_with(|| left.cmp(&right))
 }
 
 /// Integrates billed replica count over one virtual-time interval.

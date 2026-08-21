@@ -1,16 +1,18 @@
+use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
 use super::{
     DecisionRandomDomain, SCHEDULED_PARTITION, ScenarioDraws, ScenarioWorkspace, ScratchBounds,
-    balanced_partition_owner, balanced_partition_range, decision_random,
-    partition_replica_capacity, prepare_work_cohorts, repair_target, sample_moved_partition_prefix,
-    scenario_event_count, scenario_horizons,
+    TransitionRole, WorldEvent, balanced_partition_owner, balanced_partition_range,
+    decision_random, partition_replica_capacity, prepare_work_cohorts, prepare_world_shocks,
+    repair_target, sample_moved_partition_prefix, scenario_event_count, scenario_horizons,
 };
 use crate::arrival::MeanRateTrajectory;
 use crate::edf::{
     ArrivalPath, EdfScratch, EvaluationWindow, SupplyStep, evaluate_prepared_step, prepare,
 };
+use crate::lead_time::{LaunchDurationShock, RebalanceDurationShock};
 use crate::types::{EventCohorts, SlotSecondCohorts};
 use crate::{
     ArrivalPrior, ArrivalPriorError, BacklogCohort, CapacityGrid, CapacityGridError, Configuration,
@@ -37,7 +39,7 @@ fn balanced_partition_ranges_match_owner_order(partition_seed: u8, replica_seed:
 }
 
 #[test]
-fn moved_partition_prefix_cache_matches_ordinal_draw() -> Result<(), TestError> {
+fn moved_partition_prefix_cache_matches_world_event_draw() -> Result<(), TestError> {
     let (state, _scratch, _observation) = test_model()?;
     let bounds = ScratchBounds::new(state.configuration())?;
     let mut workspace = ScenarioWorkspace::new(&bounds)?;
@@ -49,15 +51,17 @@ fn moved_partition_prefix_cache_matches_ordinal_draw() -> Result<(), TestError> 
         placement_random: placement_random.clone(),
         commitment_random: placement_random.clone(),
     };
-    let ordinal = 1_u64;
-    sample_moved_partition_prefix(&state, &mut workspace, &draws, ordinal);
+    let event = WorldEvent::repair(1);
+    sample_moved_partition_prefix(&state, &mut workspace, &draws, event);
     let first = workspace.moved_partition_share.clone();
-    sample_moved_partition_prefix(&state, &mut workspace, &draws, ordinal);
+    sample_moved_partition_prefix(&state, &mut workspace, &draws, event);
 
     let mut order = vec![0; bounds.partition_count];
     let mut shares = vec![0.0_f64; bounds.partition_count];
     let mut expected = vec![0.0_f64; bounds.partition_offset_count];
-    let mut random = placement_random.domain(ordinal);
+    let mut random = placement_random
+        .domain(event.report_boundary as u64)
+        .domain(TransitionRole::ReactiveRepair as u64);
     state.partition_placement.sample_moved_prefix(
         &mut random,
         &mut order,
@@ -78,6 +82,83 @@ fn moved_partition_prefix_cache_matches_ordinal_draw() -> Result<(), TestError> 
             .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
     );
     Ok(())
+}
+
+#[quickcheck]
+fn world_event_shocks_survive_candidate_skips(
+    decision_seed: u8,
+    scenario_seed: u8,
+    first_boundary_seed: u8,
+    second_boundary_seed: u8,
+) -> TestResult {
+    let (state, _scratch, _observation) = match test_model() {
+        Ok(model) => model,
+        Err(error) => return TestResult::error(error.to_string()),
+    };
+    let bounds = match ScratchBounds::new(state.configuration()) {
+        Ok(bounds) => bounds,
+        Err(error) => return TestResult::error(error.to_string()),
+    };
+    let mut workspace = match ScenarioWorkspace::new(&bounds) {
+        Ok(workspace) => workspace,
+        Err(error) => return TestResult::error(error.to_string()),
+    };
+    let scenario = u32::from(scenario_seed);
+    let draws = ScenarioDraws {
+        current_supply: 1.0_f64,
+        lead_random: decision_random(
+            u64::from(decision_seed),
+            scenario,
+            DecisionRandomDomain::LeadTime,
+        ),
+        rebalance_random: decision_random(
+            u64::from(decision_seed),
+            scenario,
+            DecisionRandomDomain::Rebalance,
+        ),
+        placement_random: decision_random(
+            u64::from(decision_seed),
+            scenario,
+            DecisionRandomDomain::Placement,
+        ),
+        commitment_random: decision_random(
+            u64::from(decision_seed),
+            scenario,
+            DecisionRandomDomain::Commitment,
+        ),
+    };
+    prepare_world_shocks(&mut workspace, &draws);
+    let boundary_count = bounds.successor_report_count_max + 1;
+    let first = WorldEvent::repair(usize::from(first_boundary_seed) % boundary_count);
+    let second = WorldEvent::repair(usize::from(second_boundary_seed) % boundary_count);
+    let before = (
+        workspace.launch_shocks[second.index()],
+        workspace.rebalance_shocks[second.index()],
+    );
+    let mut expected_launch_random = draws.lead_random.clone().domain(second.index() as u64);
+    let mut expected_rebalance_random =
+        draws.rebalance_random.clone().domain(second.index() as u64);
+    let expected = (
+        LaunchDurationShock::draw(&mut expected_launch_random),
+        RebalanceDurationShock::draw(&mut expected_rebalance_random),
+    );
+    let candidate_one = (
+        workspace.launch_shocks[first.index()],
+        workspace.rebalance_shocks[first.index()],
+    );
+    let candidate_two = (
+        workspace.launch_shocks[first.index()],
+        workspace.rebalance_shocks[first.index()],
+    );
+    let _skipped = (
+        workspace.launch_shocks[first.index()],
+        workspace.rebalance_shocks[first.index()],
+    );
+    let after = (
+        workspace.launch_shocks[second.index()],
+        workspace.rebalance_shocks[second.index()],
+    );
+    TestResult::from_bool(candidate_one == candidate_two && before == expected && before == after)
 }
 
 #[test]

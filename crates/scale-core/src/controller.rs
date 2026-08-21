@@ -15,11 +15,14 @@ use crate::edf::{
     SupplyTrajectoryBatch, evaluate_prepared_step, evaluate_prepared_step_capacities,
     evaluate_prepared_trajectory, evaluate_prepared_trajectory_batch, prepare,
 };
-use crate::lead_time::{LaunchComponentSummary, LaunchTimeFactor, RebalanceTimeFactor};
+use crate::lead_time::{
+    LaunchComponentSummary, LaunchDurationShock, LaunchTimeFactor, RebalanceDurationShock,
+    RebalanceTimeFactor,
+};
 use crate::partition::PartitionFactor;
 use crate::planning::{
-    ActionColumns, billing_replica_seconds, complete_horizon_micros, select_action,
-    select_runner_up, terminal_replica_seconds,
+    ActionColumns, billing_replica_seconds, complete_horizon_micros, select_paired_action,
+    select_paired_runner_up, terminal_replica_seconds,
 };
 use crate::random::count_as_f64;
 use crate::reliability::{RELIABILITY_BIN_COUNT, ReliabilityFactor};
@@ -561,6 +564,7 @@ pub struct ScaleScratch {
     posterior_miss_delay_fraction_sums: Vec<f64>,
     posterior_late_area_sums: Vec<f64>,
     posterior_replica_seconds_sums: Vec<f64>,
+    paired_cost_differences: Vec<f64>,
     posterior_supply_sums: Vec<f64>,
     class_masses: Vec<f64>,
     candidate_concurrency: Vec<f64>,
@@ -628,7 +632,10 @@ struct ScenarioWorkspace {
     moved_partition_share: Vec<f64>,
     moved_partition_prefix_rows: Vec<f64>,
     moved_partition_prefix_valid: Vec<bool>,
+    launch_shocks: Vec<LaunchDurationShock>,
+    rebalance_shocks: Vec<RebalanceDurationShock>,
     commitment_pause_micros: Vec<u64>,
+    commitment_ready_micros: Vec<u64>,
     rebalancing_ready_micros: u64,
     trajectory_offsets: Vec<u32>,
     trajectory: TrajectoryColumns,
@@ -641,6 +648,7 @@ struct PreparedPlacement {
 
 struct TrajectoryColumns {
     targets: Vec<u32>,
+    world_events: Vec<Option<WorldEvent>>,
     pause_micros: Vec<u64>,
     ready_override_micros: Vec<Option<u64>>,
     ready_micros: Vec<u64>,
@@ -653,7 +661,41 @@ struct ReactiveTransition {
     replicas: u32,
     supply: f64,
     ready_micros: u64,
-    event_ordinal: u64,
+}
+
+/// The semantic identity of a candidate-independent transition event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorldEvent {
+    report_boundary: usize,
+    role: TransitionRole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionRole {
+    InitialCommitment,
+    ReactiveRepair,
+}
+
+impl WorldEvent {
+    const ROLE_COUNT: usize = 2;
+
+    const fn initial() -> Self {
+        Self {
+            report_boundary: 0,
+            role: TransitionRole::InitialCommitment,
+        }
+    }
+
+    const fn repair(report_boundary: usize) -> Self {
+        Self {
+            report_boundary,
+            role: TransitionRole::ReactiveRepair,
+        }
+    }
+
+    const fn index(self) -> usize {
+        self.report_boundary * Self::ROLE_COUNT + self.role as usize
+    }
 }
 
 struct ActiveTransition {
@@ -663,7 +705,6 @@ struct ActiveTransition {
     after_supply: f64,
     event: Option<usize>,
     write: usize,
-    ordinal: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -679,12 +720,12 @@ struct ScratchBounds {
     partition_offset_count: usize,
     replica_count_max: usize,
     placement_count_max: usize,
-    candidate_event_count_max: usize,
     trajectory_event_count_max: usize,
     posterior_sample_count: usize,
     scenario_cell_count: usize,
     arrival_path_cell_count: usize,
     successor_report_count_max: usize,
+    world_event_count_max: usize,
 }
 
 struct CandidateEvaluation<'a> {
@@ -876,6 +917,12 @@ impl ScratchBounds {
             .saturating_add(seconds_to_micros(2.0_f64 * transition_span_seconds));
         let successor_report_count_max =
             successor_horizon_micros.div_ceil(configuration.report_interval_micros) as usize;
+        // The table has two roles for the current report boundary and each
+        // future report boundary inside the planning horizon.
+        let world_event_count_max = successor_report_count_max
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(WorldEvent::ROLE_COUNT))
+            .ok_or(ConfigurationError::PlatformLimit)?;
         // Each candidate can hold at most two fixed events per replica,
         // one requested event, and one repair per report boundary.
         let candidate_event_count_max = replica_count_max
@@ -899,7 +946,6 @@ impl ScratchBounds {
             partition_offset_count,
             replica_count_max,
             placement_count_max,
-            candidate_event_count_max,
             trajectory_event_count_max: replica_count_max
                 .checked_mul(candidate_event_count_max)
                 .ok_or(ConfigurationError::PlatformLimit)?,
@@ -909,6 +955,7 @@ impl ScratchBounds {
                 .checked_mul(configuration.arrival_prior.path_segment_count_max())
                 .ok_or(ConfigurationError::PlatformLimit)?,
             successor_report_count_max,
+            world_event_count_max,
         })
     }
 }
@@ -917,6 +964,7 @@ impl TrajectoryColumns {
     fn new(capacity: usize) -> Self {
         Self {
             targets: Vec::with_capacity(capacity),
+            world_events: Vec::with_capacity(capacity),
             pause_micros: Vec::with_capacity(capacity),
             ready_override_micros: Vec::with_capacity(capacity),
             ready_micros: Vec::with_capacity(capacity),
@@ -947,12 +995,18 @@ impl ScenarioWorkspace {
             moved_partition_prefix_rows: vec![
                 0.0_f64;
                 bounds
-                    .candidate_event_count_max
+                    .world_event_count_max
                     .checked_mul(bounds.partition_offset_count)
                     .ok_or(ConfigurationError::PlatformLimit)?
             ],
-            moved_partition_prefix_valid: vec![false; bounds.candidate_event_count_max],
+            moved_partition_prefix_valid: vec![false; bounds.world_event_count_max],
+            launch_shocks: vec![LaunchDurationShock::placeholder(); bounds.world_event_count_max],
+            rebalance_shocks: vec![
+                RebalanceDurationShock::placeholder();
+                bounds.world_event_count_max
+            ],
             commitment_pause_micros: vec![0_u64; bounds.replica_count_max],
+            commitment_ready_micros: vec![0_u64; bounds.replica_count_max],
             rebalancing_ready_micros: u64::MAX,
             trajectory_offsets: vec![0; bounds.replica_count_max + 1],
             trajectory: TrajectoryColumns::new(bounds.trajectory_event_count_max),
@@ -1006,6 +1060,7 @@ impl ScaleScratch {
             posterior_miss_delay_fraction_sums: vec![0.0_f64; replica_count_max],
             posterior_late_area_sums: vec![0.0_f64; replica_count_max],
             posterior_replica_seconds_sums: vec![0.0_f64; replica_count_max],
+            paired_cost_differences: vec![0.0_f64; replica_count_max],
             posterior_supply_sums: vec![0.0_f64; replica_count_max],
             class_masses: vec![0.0_f64; capacity_class_count],
             candidate_concurrency,
@@ -1053,8 +1108,14 @@ impl ScaleScratch {
             epsilon: self.decision_epsilon,
             rate: self.decision_rate,
         };
-        let selection = select_action(&columns);
-        let runner_up_index = select_runner_up(&columns, selected, selection.used_fallback);
+        let selection =
+            select_paired_action(&columns, &self.paired_cost_differences[..action_count]);
+        let runner_up_index = select_paired_runner_up(
+            &columns,
+            &self.paired_cost_differences[..action_count],
+            selected,
+            selection.used_fallback,
+        );
         Some(DecisionColumnSummary {
             selected: self.action_columns(selected, columns.rate),
             runner_up: runner_up_index.map(|index| self.action_columns(index, columns.rate)),
@@ -1780,23 +1841,45 @@ fn aggregate_scenario_values<S: Simd>(simd: S, scratch: &mut ScaleScratch) {
     }
 }
 
-/// Selects the paired-sample minimum expected cost.
+/// Selects the minimum weighted paired-cost difference.
 ///
-/// All actions use the same configured posterior scenarios. A smaller target
-/// wins only when represented means are exactly equal.
+/// Each scenario subtracts candidate one's cost before class aggregation.
+/// A smaller target wins only when represented differences are exactly equal.
 fn numerical_decision(state: &ScaleState, scratch: &mut ScaleScratch) -> usize {
     let candidate_count = decision_action_count(scratch);
     let rate = state.configuration.objective.replica_second_delay_rate();
     scratch.decision_rate = rate;
     scratch.decision_epsilon = state.configuration.objective.epsilon();
-    let selection = select_action(&ActionColumns {
+    scratch.paired_cost_differences[..candidate_count].fill(0.0_f64);
+    let stride = scratch.posterior_miss_delay_fraction_sums.len();
+    let inner_count = count_as_f64(scratch.active_inner_count as u64);
+    for scenario in 0..scratch.active_scenario_count {
+        let weight = scratch.class_masses[scenario / scratch.active_inner_count] / inner_count;
+        let first = scenario * stride;
+        let baseline =
+            scratch.scenario_late_area[first] + rate * scratch.scenario_replica_seconds[first];
+        for candidate in 1..candidate_count {
+            let cost = scratch.scenario_late_area[first + candidate]
+                + rate * scratch.scenario_replica_seconds[first + candidate];
+            scratch.paired_cost_differences[candidate] += weight * (cost - baseline);
+        }
+    }
+    let columns = ActionColumns {
         late_area_sums: &scratch.posterior_late_area_sums[..candidate_count],
         replica_seconds_sums: &scratch.posterior_replica_seconds_sums[..candidate_count],
         missed_work_sums: &scratch.posterior_missed_work_sums[..candidate_count],
         event_count: scratch.decision_event_count,
         epsilon: state.configuration.objective.epsilon(),
         rate,
-    });
+    };
+    debug_assert!(
+        columns.cost(0).is_finite(),
+        "candidate one cost must be finite"
+    );
+    let selection = select_paired_action(
+        &columns,
+        &scratch.paired_cost_differences[..candidate_count],
+    );
     if selection.used_fallback {
         let deadline = DecisionRejection::Deadline.bit();
         for scenario in 0..scratch.active_scenario_count {
@@ -1998,6 +2081,9 @@ fn finish_decision(
     let saturation_probability = state
         .capacity
         .saturation_probability(state.simd_level, scratch.candidate_concurrency[selected]);
+    let paired_cost_standard_error = scratch
+        .decision_column_summary(selected)
+        .and_then(|summary| summary.paired_standard_error);
     ScaleDecision::Apply(ApplyDecision {
         target,
         diagnostics: diagnostics(
@@ -2007,6 +2093,7 @@ fn finish_decision(
             saturation_probability,
             Some(target),
             scratch.decision_curve_sample_count,
+            paired_cost_standard_error,
         ),
     })
 }
@@ -2041,6 +2128,7 @@ fn prepare_supply_trajectories(
     let current_supply = draws.current_supply;
     let candidate_count = workspace.posterior_resource_supply.len();
     workspace.moved_partition_prefix_valid.fill(false);
+    prepare_world_shocks(workspace, draws);
     let now_micros = sample_commitment_pauses(
         state,
         workspace,
@@ -2056,6 +2144,16 @@ fn prepare_supply_trajectories(
         candidate_count,
         now_micros,
     );
+}
+
+fn prepare_world_shocks(workspace: &mut ScenarioWorkspace, draws: &ScenarioDraws) {
+    for index in 0..workspace.launch_shocks.len() {
+        let event_domain = index as u64;
+        let mut launch_random = draws.lead_random.clone().domain(event_domain);
+        let mut rebalance_random = draws.rebalance_random.clone().domain(event_domain);
+        workspace.launch_shocks[index] = LaunchDurationShock::draw(&mut launch_random);
+        workspace.rebalance_shocks[index] = RebalanceDurationShock::draw(&mut rebalance_random);
+    }
 }
 
 #[cfg_attr(
@@ -2078,7 +2176,6 @@ fn prepare_candidate_trajectories(
         let (first, fixed_event_count, committed_replicas) = push_candidate_events(
             state,
             workspace,
-            draws,
             shared.actuation_commitments,
             candidate,
             now_micros,
@@ -2091,7 +2188,6 @@ fn prepare_candidate_trajectories(
             after_supply: current_supply,
             event: None,
             write: first,
-            ordinal: 0,
         };
         for read in first..workspace.trajectory.targets.len() {
             let target = workspace.trajectory.targets[read];
@@ -2115,6 +2211,7 @@ fn prepare_candidate_trajectories(
             );
         }
         workspace.trajectory.targets.truncate(active.write);
+        workspace.trajectory.world_events.truncate(active.write);
         workspace.trajectory.pause_micros.truncate(active.write);
         workspace
             .trajectory
@@ -2133,7 +2230,6 @@ fn prepare_candidate_trajectories(
                 replicas: active.replicas,
                 supply: active.after_supply,
                 ready_micros: active.ready_micros,
-                event_ordinal: active.ordinal,
             },
         );
         workspace
@@ -2170,21 +2266,24 @@ fn write_trajectory_event(
     } else {
         TransitionDirection::Down
     };
-    let replica_delta = target.abs_diff(active.replicas);
     let ready_override = workspace.trajectory.ready_override_micros[read];
-    let sampled_ready = sampled_membership_ready(
-        state,
-        draws,
-        active.ordinal,
-        direction,
-        replica_delta,
-        pause,
-        ready_override,
-    );
+    let world_event = workspace.trajectory.world_events[read];
+    let sampled_ready =
+        sampled_membership_ready(state, workspace, draws, world_event, pause, ready_override);
     let moved = shared.moved_partition_counts
         [(active.replicas as usize - 1) * preparation.candidate_count + target as usize - 1];
     let ready = membership_ready(direction, moved, pause, sampled_ready);
-    sample_moved_partition_prefix(state, workspace, draws, active.ordinal);
+    if let Some(event) = world_event {
+        sample_moved_partition_prefix(state, workspace, draws, event);
+    } else {
+        let mut random = draws.placement_random.clone().domain(pause);
+        state.partition_placement.sample_moved_prefix(
+            &mut random,
+            &mut workspace.partition_order,
+            &mut workspace.partition_share_draws,
+            &mut workspace.moved_partition_share,
+        );
+    }
     let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
     workspace.trajectory.targets[active.write] = target;
     workspace.trajectory.pause_micros[active.write] = pause;
@@ -2198,12 +2297,12 @@ fn write_trajectory_event(
     active.after_supply = workspace.trajectory.after_supply[active.write];
     active.event = Some(active.write);
     active.write += 1;
-    active.ordinal += 1;
     active.replicas = target;
 }
 
 fn clear_trajectory(trajectory: &mut TrajectoryColumns) {
     trajectory.targets.clear();
+    trajectory.world_events.clear();
     trajectory.pause_micros.clear();
     trajectory.ready_override_micros.clear();
     trajectory.ready_micros.clear();
@@ -2232,7 +2331,6 @@ const fn membership_ready(
 fn push_candidate_events(
     state: &ScaleState,
     workspace: &mut ScenarioWorkspace,
-    draws: &ScenarioDraws,
     actuation_commitments: &ActuationCommitments,
     candidate: u32,
     now_micros: u64,
@@ -2245,6 +2343,7 @@ fn push_candidate_events(
             commitment.target_replicas,
             now_micros,
             Some(workspace.rebalancing_ready_micros),
+            None,
         );
         commitment.target_replicas
     });
@@ -2278,6 +2377,7 @@ fn push_candidate_events(
                 &mut workspace.trajectory,
                 target,
                 workspace.commitment_pause_micros[commitment_index],
+                Some(workspace.commitment_ready_micros[commitment_index]),
                 None,
             );
         }
@@ -2291,18 +2391,19 @@ fn push_candidate_events(
             TransitionDirection::Down
         };
         let replica_delta = candidate.abs_diff(committed_replicas);
-        let event_ordinal = (workspace.trajectory.targets.len() - first) as u64;
+        let pause_micros = now_micros.saturating_add(seconds_to_micros(scenario_launch_seconds(
+            state,
+            workspace,
+            WorldEvent::initial(),
+            direction,
+            replica_delta,
+        )));
         push_trajectory_event(
             &mut workspace.trajectory,
             candidate,
-            now_micros.saturating_add(seconds_to_micros(scenario_launch_seconds(
-                state,
-                &draws.lead_random,
-                event_ordinal,
-                direction,
-                replica_delta,
-            ))),
+            pause_micros,
             None,
+            Some(WorldEvent::initial()),
         );
     }
     (first, fixed_event_count, committed_replicas)
@@ -2328,6 +2429,7 @@ fn append_reactive_repairs(
     let action_count = shared.action_count;
     let candidate_count = workspace.posterior_resource_supply.len();
     for (boundary, rate) in mean_trajectory.rates().enumerate() {
+        let world_event = WorldEvent::repair(boundary + 1);
         let requested_micros = now_micros.saturating_add(
             state
                 .configuration
@@ -2353,8 +2455,8 @@ fn append_reactive_repairs(
             .max(transition.ready_micros)
             .saturating_add(seconds_to_micros(scenario_launch_seconds(
                 state,
-                &draws.lead_random,
-                transition.event_ordinal,
+                workspace,
+                world_event,
                 direction,
                 replica_delta,
             )));
@@ -2365,16 +2467,15 @@ fn append_reactive_repairs(
         } else {
             pause_micros.saturating_add(seconds_to_micros(scenario_rebalance_seconds(
                 state,
-                &draws.rebalance_random,
-                transition.event_ordinal,
-                direction,
-                replica_delta,
+                workspace,
+                world_event,
             )))
         };
-        sample_moved_partition_prefix(state, workspace, draws, transition.event_ordinal);
+        sample_moved_partition_prefix(state, workspace, draws, world_event);
         let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
         let after = workspace.posterior_resource_supply[target as usize - 1];
         workspace.trajectory.targets.push(target);
+        workspace.trajectory.world_events.push(Some(world_event));
         workspace.trajectory.pause_micros.push(pause_micros);
         workspace.trajectory.ready_override_micros.push(None);
         workspace.trajectory.ready_micros.push(repair_ready_micros);
@@ -2386,7 +2487,6 @@ fn append_reactive_repairs(
         transition.replicas = target;
         transition.supply = after;
         transition.ready_micros = repair_ready_micros;
-        transition.event_ordinal += 1;
     }
 }
 
@@ -2418,6 +2518,7 @@ fn sample_commitment_pauses(
     for index in 0..commitments.launching_len() {
         if commitments.launching_requested_at(index) > state.model_time {
             workspace.commitment_pause_micros[index] = u64::MAX;
+            workspace.commitment_ready_micros[index] = u64::MAX;
             continue;
         }
         let elapsed_seconds = Duration::from_micros(
@@ -2427,10 +2528,8 @@ fn sample_commitment_pauses(
                 .saturating_sub(commitments.launching_requested_at(index).as_micros()),
         )
         .as_secs_f64();
-        let domain = commitments.launching_requested_at(index).as_micros()
-            ^ u64::from(commitments.launching_target_replicas(index)).rotate_left(21)
-            ^ u64::from(commitments.launching_replica_delta(index)).rotate_left(42);
-        let mut commitment_random = random.clone().domain(domain);
+        let domain = commitments.launching_requested_at(index).as_micros();
+        let mut commitment_random = random.clone().domain(domain).domain(0);
         let remaining_seconds = state.lead_time.sample_remaining_seconds(
             commitments.launching_direction(index),
             commitments.launching_replica_delta(index),
@@ -2439,6 +2538,11 @@ fn sample_commitment_pauses(
         );
         workspace.commitment_pause_micros[index] =
             now_micros.saturating_add(seconds_to_micros(remaining_seconds));
+        let mut rebalance_random = random.clone().domain(domain).domain(1);
+        workspace.commitment_ready_micros[index] = workspace.commitment_pause_micros[index]
+            .saturating_add(seconds_to_micros(
+                state.rebalance_time.sample_seconds(&mut rebalance_random),
+            ));
     }
     workspace.rebalancing_ready_micros = commitments.rebalancing().map_or(u64::MAX, |commitment| {
         if commitment.started_at > state.model_time {
@@ -2451,9 +2555,8 @@ fn sample_commitment_pauses(
                 .saturating_sub(commitment.started_at.as_micros()),
         )
         .as_secs_f64();
-        let domain = commitment.requested_at.as_micros()
-            ^ commitment.started_at.as_micros().rotate_left(17)
-            ^ u64::from(commitment.target_replicas).rotate_left(34);
+        let domain =
+            commitment.requested_at.as_micros() ^ commitment.started_at.as_micros().rotate_left(17);
         let mut rebalance_random = random.clone().domain(domain);
         now_micros.saturating_add(seconds_to_micros(
             state
@@ -2477,40 +2580,26 @@ pub(crate) fn decision_random(
 
 fn scenario_launch_seconds(
     state: &ScaleState,
-    random: &RandomStream,
-    event_ordinal: u64,
+    workspace: &ScenarioWorkspace,
+    world_event: WorldEvent,
     direction: TransitionDirection,
     replica_delta: u32,
 ) -> f64 {
-    let direction_domain = match direction {
-        TransitionDirection::Up => 0_u64,
-        TransitionDirection::Down => 1_u64 << 32_u32,
-    };
-    let mut random = random
-        .clone()
-        .domain(event_ordinal)
-        .domain(direction_domain | u64::from(replica_delta));
-    state
-        .lead_time
-        .sample_seconds(direction, replica_delta, &mut random)
+    state.lead_time.seconds_from_shock(
+        direction,
+        replica_delta,
+        workspace.launch_shocks[world_event.index()],
+    )
 }
 
 fn scenario_rebalance_seconds(
     state: &ScaleState,
-    random: &RandomStream,
-    event_ordinal: u64,
-    direction: TransitionDirection,
-    replica_delta: u32,
+    workspace: &ScenarioWorkspace,
+    world_event: WorldEvent,
 ) -> f64 {
-    let direction_domain = match direction {
-        TransitionDirection::Up => 0_u64,
-        TransitionDirection::Down => 1_u64 << 32_u32,
-    };
-    let mut random = random
-        .clone()
-        .domain(event_ordinal)
-        .domain(direction_domain | u64::from(replica_delta));
-    state.rebalance_time.sample_seconds(&mut random)
+    state
+        .rebalance_time
+        .seconds_from_shock(workspace.rebalance_shocks[world_event.index()])
 }
 
 fn push_trajectory_event(
@@ -2518,8 +2607,10 @@ fn push_trajectory_event(
     target: u32,
     pause_micros: u64,
     ready_override_micros: Option<u64>,
+    world_event: Option<WorldEvent>,
 ) {
     trajectory.targets.push(target);
+    trajectory.world_events.push(world_event);
     trajectory.pause_micros.push(pause_micros);
     trajectory.ready_override_micros.push(ready_override_micros);
     trajectory.ready_micros.push(0_u64);
@@ -2529,22 +2620,22 @@ fn push_trajectory_event(
 
 fn sampled_membership_ready(
     state: &ScaleState,
+    workspace: &ScenarioWorkspace,
     draws: &ScenarioDraws,
-    event_ordinal: u64,
-    direction: TransitionDirection,
-    replica_delta: u32,
+    world_event: Option<WorldEvent>,
     pause_micros: u64,
     ready_override_micros: Option<u64>,
 ) -> u64 {
     ready_override_micros.map_or_else(
         || {
-            pause_micros.saturating_add(seconds_to_micros(scenario_rebalance_seconds(
-                state,
-                &draws.rebalance_random,
-                event_ordinal,
-                direction,
-                replica_delta,
-            )))
+            let seconds = world_event.map_or_else(
+                || {
+                    let mut random = draws.commitment_random.clone().domain(pause_micros);
+                    state.rebalance_time.sample_seconds(&mut random)
+                },
+                |event| scenario_rebalance_seconds(state, workspace, event),
+            );
+            pause_micros.saturating_add(seconds_to_micros(seconds))
         },
         |ready_micros| ready_micros.max(pause_micros),
     )
@@ -2558,9 +2649,9 @@ fn sample_moved_partition_prefix(
     state: &ScaleState,
     workspace: &mut ScenarioWorkspace,
     draws: &ScenarioDraws,
-    event_ordinal: u64,
+    world_event: WorldEvent,
 ) {
-    let ordinal = event_ordinal as usize;
+    let ordinal = world_event.index();
     let row_width = workspace.moved_partition_share.len();
     let first = ordinal * row_width;
     let last = first + row_width;
@@ -2570,7 +2661,11 @@ fn sample_moved_partition_prefix(
             .copy_from_slice(&workspace.moved_partition_prefix_rows[first..last]);
         return;
     }
-    let mut random = draws.placement_random.clone().domain(event_ordinal);
+    let mut random = draws
+        .placement_random
+        .clone()
+        .domain(world_event.report_boundary as u64)
+        .domain(world_event.role as u64);
     state.partition_placement.sample_moved_prefix(
         &mut random,
         &mut workspace.partition_order,
@@ -2586,6 +2681,7 @@ fn sort_trajectory_events(trajectory: &mut TrajectoryColumns, first: usize) {
     for mut event in first + 1..trajectory.targets.len() {
         while event > first && trajectory.pause_micros[event] < trajectory.pause_micros[event - 1] {
             trajectory.targets.swap(event, event - 1);
+            trajectory.world_events.swap(event, event - 1);
             trajectory.pause_micros.swap(event, event - 1);
             trajectory.ready_override_micros.swap(event, event - 1);
             trajectory.ready_micros.swap(event, event - 1);
@@ -2930,7 +3026,7 @@ pub(crate) fn mixed_event_supply(
 fn hold(state: &ScaleState, reason: HoldReason, miss_delay_fraction: f64) -> ScaleDecision {
     ScaleDecision::Hold(HoldDecision {
         reason,
-        diagnostics: diagnostics(state, 0.0_f64, miss_delay_fraction, 0.0_f64, None, 0),
+        diagnostics: diagnostics(state, 0.0_f64, miss_delay_fraction, 0.0_f64, None, 0, None),
     })
 }
 
@@ -2941,6 +3037,7 @@ fn diagnostics(
     saturation_probability: f64,
     selected_target: Option<u32>,
     scenario_count: u32,
+    paired_cost_standard_error: Option<f64>,
 ) -> DecisionDiagnostics {
     let selected_lead_time = selected_target.map_or_else(
         || state.lead_time.expected_last_seconds() + state.rebalance_time.expected_seconds(),
@@ -2978,6 +3075,7 @@ fn diagnostics(
             .partition_placement
             .posterior_mean_count_argmax_share(),
         expected_cost,
+        paired_cost_standard_error,
         miss_delay_fraction,
     }
 }
