@@ -3,10 +3,11 @@ use quickcheck_macros::quickcheck;
 use thiserror::Error;
 
 use super::{
-    DecisionRandomDomain, SCHEDULED_PARTITION, ScenarioDraws, ScenarioWorkspace, ScratchBounds,
+    SCHEDULED_PARTITION, ScenarioDraws, ScenarioRole, ScenarioWorkspace, ScratchBounds,
     TransitionRole, WorldEvent, balanced_partition_owner, balanced_partition_range,
-    decision_random, partition_replica_capacity, prepare_work_cohorts, prepare_world_shocks,
-    repair_target, sample_moved_partition_prefix, scenario_event_count, scenario_horizons,
+    partition_replica_capacity, prepare_work_cohorts, prepare_world_shocks, repair_target,
+    sample_moved_partition_prefix, scenario_event_count, scenario_horizons, scenario_quantile,
+    scenario_random,
 };
 use crate::arrival::MeanRateTrajectory;
 use crate::edf::{
@@ -44,7 +45,7 @@ fn moved_partition_prefix_cache_matches_world_event_draw() -> Result<(), TestErr
     let (state, _scratch, _observation) = test_model()?;
     let bounds = ScratchBounds::new(state.configuration())?;
     let mut workspace = ScenarioWorkspace::new(&bounds)?;
-    let placement_random = decision_random(7, 11, DecisionRandomDomain::Placement);
+    let placement_random = scenario_random(11, 256, ScenarioRole::Placement);
     let draws = ScenarioDraws {
         current_supply: 1.0_f64,
         lead_random: placement_random.clone(),
@@ -87,7 +88,6 @@ fn moved_partition_prefix_cache_matches_world_event_draw() -> Result<(), TestErr
 
 #[quickcheck]
 fn world_event_shocks_survive_candidate_skips(
-    decision_seed: u8,
     scenario_seed: u8,
     first_boundary_seed: u8,
     second_boundary_seed: u8,
@@ -107,26 +107,10 @@ fn world_event_shocks_survive_candidate_skips(
     let scenario = u32::from(scenario_seed);
     let draws = ScenarioDraws {
         current_supply: 1.0_f64,
-        lead_random: decision_random(
-            u64::from(decision_seed),
-            scenario,
-            DecisionRandomDomain::LeadTime,
-        ),
-        rebalance_random: decision_random(
-            u64::from(decision_seed),
-            scenario,
-            DecisionRandomDomain::Rebalance,
-        ),
-        placement_random: decision_random(
-            u64::from(decision_seed),
-            scenario,
-            DecisionRandomDomain::Placement,
-        ),
-        commitment_random: decision_random(
-            u64::from(decision_seed),
-            scenario,
-            DecisionRandomDomain::Commitment,
-        ),
+        lead_random: scenario_random(scenario, 256, ScenarioRole::LeadTime),
+        rebalance_random: scenario_random(scenario, 256, ScenarioRole::Rebalance),
+        placement_random: scenario_random(scenario, 256, ScenarioRole::Placement),
+        commitment_random: scenario_random(scenario, 256, ScenarioRole::Commitment),
     };
     prepare_world_shocks(&mut workspace, &draws);
     let boundary_count = bounds.successor_report_count_max + 1;
@@ -177,7 +161,62 @@ fn flat_predictive_mean_has_no_successor_repair() {
 }
 
 #[test]
-fn idle_decision_cost_increments_are_equal_across_the_replica_ladder() -> Result<(), TestError> {
+fn scenario_role_quantiles_form_distinct_midpoint_permutations() {
+    const COUNT: usize = 64;
+    let lead = (0..COUNT)
+        .map(|scenario| scenario_quantile(scenario, COUNT, ScenarioRole::LeadTime))
+        .collect::<Vec<_>>();
+    let rebalance = (0..COUNT)
+        .map(|scenario| scenario_quantile(scenario, COUNT, ScenarioRole::Rebalance))
+        .collect::<Vec<_>>();
+    let mut sorted = lead.clone();
+    sorted.sort_by(f64::total_cmp);
+
+    assert!(sorted.iter().enumerate().all(|(rank, quantile)| {
+        let rank = u32::try_from(rank).unwrap_or(u32::MAX);
+        let count = u32::try_from(COUNT).unwrap_or(u32::MAX);
+        quantile.to_bits() == ((f64::from(rank) + 0.5_f64) / f64::from(count)).to_bits()
+    }));
+    assert_ne!(lead, rebalance);
+}
+
+#[test]
+fn identical_posterior_decisions_have_identical_cost_ladders() -> Result<(), TestError> {
+    let mut configuration = test_configuration()?;
+    configuration.posterior_sample_count = 256;
+    configuration.arrival_prior = ArrivalPrior::new(4.0_f64, 0.01_f64, 1.0_f64 / 90.0_f64)?;
+    let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
+    let mut state = ScaleState::new(configuration.clone(), grid)?;
+    let mut scratch = state.new_scratch()?;
+    let mut observation = ObservationBuffer::new(&configuration)?;
+    observation.advance_model_time(ModelTime::from_micros(1_000_000))?;
+    observation.set_current_replicas(4)?;
+    observation.set_backlog(BacklogCohort::new(
+        1_000_000,
+        500_000,
+        100,
+        0,
+        DemandClass::Normal,
+    )?)?;
+    let _ = step(&mut state, &mut scratch, observation.observation());
+    let mut first = vec![0.0_f64; scratch.decision_candidate_count()];
+    scratch.write_decision_expected_costs(&mut first)?;
+
+    let _ = step(&mut state, &mut scratch, observation.observation());
+    let mut second = vec![0.0_f64; scratch.decision_candidate_count()];
+    scratch.write_decision_expected_costs(&mut second)?;
+
+    assert!(
+        first
+            .iter()
+            .zip(&second)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+    );
+    Ok(())
+}
+
+#[test]
+fn idle_pending_descent_cost_ladder_selects_one() -> Result<(), TestError> {
     let mut configuration = test_configuration()?;
     configuration.partition_count = 64;
     configuration.replica_count_max = 8;
@@ -215,16 +254,8 @@ fn idle_decision_cost_increments_are_equal_across_the_replica_ladder() -> Result
         .windows(2)
         .map(|pair| pair[1] - pair[0])
         .collect::<Vec<_>>();
-    let mean = increments.iter().sum::<f64>() / 7.0_f64;
-
     assert!(
         increments.iter().all(|increment| *increment > 0.0_f64),
-        "costs={costs:?}, increments={increments:?}"
-    );
-    assert!(
-        increments
-            .iter()
-            .all(|increment| (*increment - mean).abs() <= mean.abs() * 0.1_f64),
         "costs={costs:?}, increments={increments:?}"
     );
     Ok(())

@@ -25,6 +25,8 @@ use crate::planning::{
     select_paired_runner_up, terminal_replica_seconds,
 };
 use crate::random::count_as_f64;
+#[cfg(test)]
+use crate::random::permuted_rank;
 use crate::reliability::{RELIABILITY_BIN_COUNT, ReliabilityFactor};
 use crate::types::{
     ActuationCommitments, BacklogColumns, CalendarForecast, CohortColumns, EventCohorts,
@@ -61,7 +63,11 @@ impl DecisionRejection {
 
 #[repr(u64)]
 #[derive(Clone, Copy)]
-pub(crate) enum DecisionRandomDomain {
+/// Stable identities for scenario latent families.
+///
+/// A stream counter identifies one coordinate inside a family. A derived
+/// domain identifies one world event, commitment, segment, or partition.
+pub(crate) enum ScenarioRole {
     Reliability = 0x7265_6c69_6162_6c65,
     LeadTime = 0x6c65_6164_7469_6d65,
     Rebalance = 0x7265_6261_6c61_6e63,
@@ -166,7 +172,6 @@ pub struct ScaleState {
     simd_level: Level,
     configuration: Configuration,
     model_time: ModelTime,
-    decision_index: u64,
     arrivals: ArrivalFactor,
     capacity: CapacityFactor,
     capacity_artifact: PriorArtifact,
@@ -220,7 +225,6 @@ impl ScaleState {
             simd_level: Level::new(),
             configuration,
             model_time: ModelTime::from_micros(0),
-            decision_index: 0,
             arrivals,
             capacity,
             capacity_artifact,
@@ -619,7 +623,7 @@ pub struct DecisionColumnSummary {
 /// Scenario evaluation parallelizes over scenarios, not candidates:
 /// each worker owns one workspace and a disjoint range of scenario
 /// cells, so workers share no mutable state. Scenario randomness is
-/// index-derived ([`decision_random`]) and the aggregation pass reads
+/// index-derived ([`scenario_random`]) and the aggregation pass reads
 /// the cells in a fixed order, so the parallel evaluation is
 /// bit-identical to a serial one.
 struct ScenarioWorkspace {
@@ -1315,7 +1319,6 @@ pub fn step(
         state.current_replicas = replicas;
     }
 
-    state.decision_index = state.decision_index.wrapping_add(1);
     select_target(
         state,
         scratch,
@@ -1363,7 +1366,7 @@ fn select_target(
 ///
 /// Each worker owns one [`ScenarioWorkspace`] and a disjoint, contiguous
 /// range of scenario cells, so workers share no mutable state. Scenario
-/// randomness is index-derived ([`decision_random`]) and
+/// randomness is index-derived ([`scenario_random`]) and
 /// [`finalize_scenario_columns`] reads the cells in a fixed order
 /// afterwards, so the parallel evaluation is bit-identical to a serial
 /// loop.
@@ -1538,17 +1541,10 @@ fn evaluate_one_scenario(
 ) {
     let current_supply = prepare_scenario_supply(state, shared, workspace, &mut cells, scenario);
     let sample = scenario as u32;
-    let lead_random = decision_random(state.decision_index, sample, DecisionRandomDomain::LeadTime);
-    let rebalance_random = decision_random(
-        state.decision_index,
-        sample,
-        DecisionRandomDomain::Rebalance,
-    );
-    let placement_random = decision_random(
-        state.decision_index,
-        sample,
-        DecisionRandomDomain::Placement,
-    );
+    let scenario_count = shared.inner_count * state.capacity_classes.len();
+    let lead_random = scenario_random(sample, scenario_count, ScenarioRole::LeadTime);
+    let rebalance_random = scenario_random(sample, scenario_count, ScenarioRole::Rebalance);
+    let placement_random = scenario_substream(sample, ScenarioRole::Placement);
     let path_length = sample_scenario_path(
         state,
         shared.calendar,
@@ -1566,11 +1562,7 @@ fn evaluate_one_scenario(
             lead_random,
             rebalance_random,
             placement_random,
-            commitment_random: decision_random(
-                state.decision_index,
-                sample,
-                DecisionRandomDomain::Commitment,
-            ),
+            commitment_random: scenario_random(sample, scenario_count, ScenarioRole::Commitment),
         },
     );
     evaluate_scenario_outcome(
@@ -1605,11 +1597,7 @@ fn prepare_scenario_supply(
         shared.candidate_concurrency,
         &mut workspace.posterior_resource_supply,
     ));
-    let mut reliability_random = decision_random(
-        state.decision_index,
-        sample,
-        DecisionRandomDomain::Reliability,
-    );
+    let mut reliability_random = scenario_substream(sample, ScenarioRole::Reliability);
     let (normal_retry, failure_retry) = state
         .reliability
         .sample_retry_probabilities(&mut reliability_random);
@@ -1776,8 +1764,7 @@ fn sample_scenario_path(
     let start_seconds = Duration::from_micros(state.model_time.as_micros()).as_secs_f64();
     let disturbance_horizon_seconds =
         Duration::from_micros(disturbance_horizon_micros).as_secs_f64();
-    let mut arrival_random =
-        decision_random(state.decision_index, sample, DecisionRandomDomain::Arrival);
+    let mut arrival_random = scenario_substream(sample, ScenarioRole::Arrival);
     state.arrivals.sample_rate_path(
         disturbance_horizon_seconds - start_seconds,
         &mut arrival_random,
@@ -2629,15 +2616,27 @@ fn sample_commitment_pauses(
     now_micros
 }
 
-pub(crate) fn decision_random(
-    decision_index: u64,
+pub(crate) fn scenario_random(
     scenario: u32,
-    domain: DecisionRandomDomain,
+    scenario_count: usize,
+    role: ScenarioRole,
 ) -> RandomStream {
+    let count = u32::try_from(scenario_count).unwrap_or(u32::MAX);
+    RandomStream::stratified(DECISION_SCENARIO_SEED, scenario, count, role as u64)
+}
+
+pub(crate) fn scenario_substream(scenario: u32, role: ScenarioRole) -> RandomStream {
     RandomStream::new(DECISION_SCENARIO_SEED)
-        .domain(decision_index)
+        .domain(role as u64)
         .domain(u64::from(scenario))
-        .domain(domain as u64)
+}
+
+#[cfg(test)]
+pub(crate) fn scenario_quantile(scenario: usize, count: usize, role: ScenarioRole) -> f64 {
+    let count_u32 = u32::try_from(count).unwrap_or(u32::MAX);
+    let scenario_u32 = u32::try_from(scenario).unwrap_or(u32::MAX);
+    let rank = permuted_rank(scenario_u32, count_u32, role as u64);
+    (f64::from(rank) + 0.5_f64) / f64::from(count_u32)
 }
 
 fn scenario_launch_seconds(

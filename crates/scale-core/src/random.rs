@@ -38,6 +38,16 @@ pub struct RandomStream {
     key: u64,
     counter: u64,
     generator: Xoshiro256PlusPlus,
+    stratification: Option<Stratification>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Stratification {
+    scenario: u32,
+    count: u32,
+    role: u64,
+    multiplier: u32,
+    offset: u32,
 }
 
 impl RandomStream {
@@ -48,25 +58,64 @@ impl RandomStream {
             key,
             counter: 0,
             generator: Xoshiro256PlusPlus::seed_from_u64(key),
+            stratification: None,
         }
+    }
+
+    /// Creates a stream with one midpoint stratum per coordinate.
+    pub(crate) fn stratified(key: u64, scenario: u32, count: u32, role: u64) -> Self {
+        let mut stream = Self::new(key);
+        let (multiplier, offset) = permutation_parameters(count, role);
+        stream.stratification = Some(Stratification {
+            scenario,
+            count,
+            role,
+            multiplier,
+            offset,
+        });
+        stream
     }
 
     /// Creates one independent stream from a stable domain identifier.
     #[must_use]
     pub fn domain(self, domain: u64) -> Self {
-        Self::new(mix(self.key ^ domain))
+        let key = mix(self.key ^ domain);
+        self.stratification.map_or_else(
+            || Self::new(key),
+            |stratification| {
+                Self::stratified(
+                    key,
+                    stratification.scenario,
+                    stratification.count,
+                    mix(stratification.role ^ domain),
+                )
+            },
+        )
     }
 
     /// Returns the next uniformly distributed integer.
     #[must_use]
     pub fn next_u64(&mut self) -> u64 {
+        let value = self.stratification.map_or_else(
+            || self.generator.next_u64(),
+            |stratification| {
+                let quantile = stratified_quantile(stratification, self.counter);
+                let scaled = (quantile * 9_007_199_254_740_992.0_f64).floor() as u64;
+                scaled.min(9_007_199_254_740_991) << 11_u32
+            },
+        );
         self.counter = self.counter.wrapping_add(1);
-        self.generator.next_u64()
+        value
     }
 
     /// Returns the next value in the open unit interval.
     #[must_use]
     pub fn open_unit_f64(&mut self) -> f64 {
+        if let Some(stratification) = self.stratification {
+            let quantile = stratified_quantile(stratification, self.counter);
+            self.counter = self.counter.wrapping_add(1);
+            return quantile;
+        }
         let mantissa = self.next_u64() >> 11_u32;
         let high = (mantissa >> 27_u32) as u32;
         let low = (mantissa & 0x07ff_ffff) as u32;
@@ -92,6 +141,32 @@ impl RandomStream {
     pub const fn counter(&self) -> u64 {
         self.counter
     }
+}
+
+fn stratified_quantile(stratification: Stratification, counter: u64) -> f64 {
+    let rank = if counter == 0 {
+        apply_permutation(
+            stratification.scenario,
+            stratification.count,
+            stratification.multiplier,
+            stratification.offset,
+        )
+    } else {
+        let role = mix(stratification.role ^ counter);
+        let multiplier = if role & 1 == 0 {
+            1
+        } else {
+            stratification.count - 1
+        };
+        let offset = role.rotate_right(17) as u32 % stratification.count;
+        apply_permutation(
+            stratification.scenario,
+            stratification.count,
+            multiplier,
+            offset,
+        )
+    };
+    (f64::from(rank) + 0.5_f64) / f64::from(stratification.count)
 }
 
 pub(crate) fn sample_gamma(shape: f64, random: &mut RandomStream) -> f64 {
@@ -203,6 +278,34 @@ const fn mix(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
+}
+
+#[cfg(test)]
+pub(crate) fn permuted_rank(scenario: u32, count: u32, role: u64) -> u32 {
+    let (multiplier, offset) = permutation_parameters(count, role);
+    apply_permutation(scenario, count, multiplier, offset)
+}
+
+fn permutation_parameters(count: u32, role: u64) -> (u32, u32) {
+    let mut multiplier = (role as u32 | 1) % count;
+    while greatest_common_divisor(multiplier, count) != 1 {
+        multiplier = (multiplier + 2) % count;
+    }
+    let offset = role.rotate_right(17) as u32 % count;
+    (multiplier, offset)
+}
+
+fn apply_permutation(scenario: u32, count: u32, multiplier: u32, offset: u32) -> u32 {
+    ((u64::from(multiplier) * u64::from(scenario) + u64::from(offset)) % u64::from(count)) as u32
+}
+
+const fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 #[cfg(test)]

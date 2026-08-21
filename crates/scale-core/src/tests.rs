@@ -10,7 +10,7 @@ use crate::arrival::{ArrivalEvidence, ArrivalFactor, ArrivalPrior};
 use crate::capacity::{CapacityFactor, log_normal_axis_masses};
 use crate::change_point::ChangePointKernel;
 use crate::controller::{
-    DecisionRandomDomain, decision_random, minimal_moved_partitions, mixed_event_supply,
+    ScenarioRole, minimal_moved_partitions, mixed_event_supply, scenario_random, scenario_substream,
 };
 use crate::edf::{
     ArrivalPath, EdfOutcome, EdfScratch, EvaluationWindow, SupplyStep, SupplyTrajectory,
@@ -361,21 +361,19 @@ fn edf_counts_a_late_cohort_after_an_earlier_wide_interval() -> Result<(), TestE
 }
 
 #[test]
-fn decision_random_coordinates_do_not_shift_between_factors() {
-    let mut first_arrival = decision_random(3, 17, DecisionRandomDomain::Arrival);
-    let mut first_lead = decision_random(3, 17, DecisionRandomDomain::LeadTime);
+fn scenario_random_coordinates_do_not_shift_between_factors() {
+    let mut first_arrival = scenario_random(17, 256, ScenarioRole::Arrival);
+    let mut first_lead = scenario_random(17, 256, ScenarioRole::LeadTime);
     let expected_lead = first_lead.next_u64();
     for _ in 0_u8..100 {
         let _ = first_arrival.next_u64();
     }
 
-    let mut second_lead = decision_random(3, 17, DecisionRandomDomain::LeadTime);
-    let mut other_decision_lead = decision_random(4, 17, DecisionRandomDomain::LeadTime);
-    let mut other_scenario_lead = decision_random(3, 18, DecisionRandomDomain::LeadTime);
-    let mut reliability = decision_random(3, 17, DecisionRandomDomain::Reliability);
+    let mut second_lead = scenario_random(17, 256, ScenarioRole::LeadTime);
+    let mut other_scenario_lead = scenario_random(18, 256, ScenarioRole::LeadTime);
+    let mut reliability = scenario_random(17, 256, ScenarioRole::Reliability);
 
     assert_eq!(second_lead.next_u64(), expected_lead);
-    assert_ne!(other_decision_lead.next_u64(), expected_lead);
     assert_ne!(other_scenario_lead.next_u64(), expected_lead);
     assert_ne!(reliability.next_u64(), expected_lead);
 }
@@ -1846,7 +1844,7 @@ fn exact_capacity_mean_matches_direct_enumeration() -> Result<(), TestError> {
             let first_sample = class * inner_count;
             let class_loss = (first_sample..first_sample + inner_count)
                 .map(|sample| {
-                    let mut random = decision_random(1, sample, DecisionRandomDomain::Reliability);
+                    let mut random = scenario_substream(sample, ScenarioRole::Reliability);
                     let (normal_retry, failure_retry) =
                         reliability.sample_retry_probabilities(&mut random);
                     let failure_sequence_attempts = (1.0_f64 - failure_retry).recip();
