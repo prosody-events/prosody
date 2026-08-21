@@ -158,9 +158,10 @@ fn admissible_closure_is_horizon_invariant(work_seed: u16, capacity_seed: u8) ->
     );
     let first_late = first.late_area + first.terminal_late_area;
     let second_late = second.late_area + second.terminal_late_area;
-    let first_resource = terminal_replica_seconds(0, 2_000_000, first.drain_seconds, 3_000_000, 1);
+    let first_resource =
+        terminal_replica_seconds(0, 2_000_000, 2_000_000, first.drain_seconds, 3_000_000, 1);
     let second_resource =
-        terminal_replica_seconds(0, 3_000_000, second.drain_seconds, 3_000_000, 1);
+        terminal_replica_seconds(0, 3_000_000, 3_000_000, second.drain_seconds, 3_000_000, 1);
 
     close_relative(first_late, second_late) && close_relative(first_resource, second_resource)
 }

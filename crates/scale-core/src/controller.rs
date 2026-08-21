@@ -663,6 +663,13 @@ struct ReactiveTransition {
     ready_micros: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ReactiveRepair {
+    world_event: WorldEvent,
+    requested_micros: u64,
+    rate: f64,
+}
+
 /// The semantic identity of a candidate-independent transition event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WorldEvent {
@@ -924,11 +931,13 @@ impl ScratchBounds {
             .and_then(|count| count.checked_mul(WorldEvent::ROLE_COUNT))
             .ok_or(ConfigurationError::PlatformLimit)?;
         // Each candidate can hold at most two fixed events per replica,
-        // one requested event, and one repair per report boundary.
+        // one requested event, one repair per report boundary, and one
+        // terminal repair after an unfinished transition.
         let candidate_event_count_max = replica_count_max
             .checked_mul(2)
             .and_then(|events| events.checked_add(1))
             .and_then(|events| events.checked_add(successor_report_count_max))
+            .and_then(|events| events.checked_add(1))
             .ok_or(ConfigurationError::PlatformLimit)?;
         let placement_count_max = replica_count_max
             .checked_mul(
@@ -1670,18 +1679,29 @@ fn evaluate_scenario_outcome(
         &mut cells.missed_work[..shared.action_count],
     );
     normalize_scenario_outcomes(state, shared, &mut cells);
+    // Every candidate uses the same billing horizon. It includes the final
+    // successor event, even when a sampled transition exceeds the plan.
+    let billing_horizon_micros = workspace
+        .trajectory
+        .pause_micros
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(forecast.planning_horizon_micros)
+        .max(forecast.planning_horizon_micros);
     for candidate_index in 0..shared.action_count {
         let first = workspace.trajectory_offsets[candidate_index] as usize;
         let last = workspace.trajectory_offsets[candidate_index + 1] as usize;
         cells.replica_seconds[candidate_index] = billing_replica_seconds(
             state.model_time.as_micros(),
-            forecast.planning_horizon_micros,
+            billing_horizon_micros,
             state.current_replicas,
             &workspace.trajectory.targets[first..last],
             &workspace.trajectory.pause_micros[first..last],
         ) + terminal_replica_seconds(
             state.model_time.as_micros(),
             forecast.planning_horizon_micros,
+            billing_horizon_micros,
             cells.drain_seconds[candidate_index],
             state.configuration.report_interval_micros,
             workspace.trajectory.targets[first..last]
@@ -2426,8 +2446,7 @@ fn append_reactive_repairs(
     mut transition: ReactiveTransition,
 ) {
     let now_micros = state.model_time.as_micros();
-    let action_count = shared.action_count;
-    let candidate_count = workspace.posterior_resource_supply.len();
+    let mut final_repair = None;
     for (boundary, rate) in mean_trajectory.rates().enumerate() {
         let world_event = WorldEvent::repair(boundary + 1);
         let requested_micros = now_micros.saturating_add(
@@ -2436,58 +2455,96 @@ fn append_reactive_repairs(
                 .report_interval_micros
                 .saturating_mul(boundary as u64 + 1),
         );
+        let repair = ReactiveRepair {
+            world_event,
+            requested_micros,
+            rate,
+        };
+        final_repair = Some(repair);
         // One transition runs at a time: the successor acts once the
         // active transition completes and the report shows the shortage.
         if requested_micros < transition.ready_micros {
             continue;
         }
-        let target = repair_target(&workspace.posterior_resource_supply[..action_count], rate);
-        if target == transition.replicas {
-            continue;
-        }
-        let direction = if target > transition.replicas {
-            TransitionDirection::Up
-        } else {
-            TransitionDirection::Down
-        };
-        let replica_delta = target.abs_diff(transition.replicas);
-        let pause_micros = requested_micros
-            .max(transition.ready_micros)
-            .saturating_add(seconds_to_micros(scenario_launch_seconds(
-                state,
-                workspace,
-                world_event,
-                direction,
-                replica_delta,
-            )));
-        let moved = shared.moved_partition_counts
-            [(transition.replicas as usize - 1) * candidate_count + target as usize - 1];
-        let repair_ready_micros = if direction == TransitionDirection::Down && moved == 0 {
-            pause_micros
-        } else {
-            pause_micros.saturating_add(seconds_to_micros(scenario_rebalance_seconds(
-                state,
-                workspace,
-                world_event,
-            )))
-        };
-        sample_moved_partition_prefix(state, workspace, draws, world_event);
-        let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
-        let after = workspace.posterior_resource_supply[target as usize - 1];
-        workspace.trajectory.targets.push(target);
-        workspace.trajectory.world_events.push(Some(world_event));
-        workspace.trajectory.pause_micros.push(pause_micros);
-        workspace.trajectory.ready_override_micros.push(None);
-        workspace.trajectory.ready_micros.push(repair_ready_micros);
-        workspace
-            .trajectory
-            .during_supply
-            .push(transition.supply * retained);
-        workspace.trajectory.after_supply.push(after);
-        transition.replicas = target;
-        transition.supply = after;
-        transition.ready_micros = repair_ready_micros;
+        append_reactive_repair(state, shared, workspace, draws, repair, &mut transition);
     }
+    if let Some(mut repair) = final_repair
+        && repair.requested_micros < transition.ready_micros
+    {
+        let report_interval = state.configuration.report_interval_micros;
+        let report_count = transition
+            .ready_micros
+            .saturating_sub(now_micros)
+            .div_ceil(report_interval);
+        repair.requested_micros =
+            now_micros.saturating_add(report_count.saturating_mul(report_interval));
+        append_reactive_repair(state, shared, workspace, draws, repair, &mut transition);
+    }
+}
+
+fn append_reactive_repair(
+    state: &ScaleState,
+    shared: &ScenarioShared<'_>,
+    workspace: &mut ScenarioWorkspace,
+    draws: &ScenarioDraws,
+    repair: ReactiveRepair,
+    transition: &mut ReactiveTransition,
+) {
+    let action_count = shared.action_count;
+    let candidate_count = workspace.posterior_resource_supply.len();
+    let target = repair_target(
+        &workspace.posterior_resource_supply[..action_count],
+        repair.rate,
+    );
+    if target == transition.replicas {
+        return;
+    }
+    let direction = if target > transition.replicas {
+        TransitionDirection::Up
+    } else {
+        TransitionDirection::Down
+    };
+    let replica_delta = target.abs_diff(transition.replicas);
+    let pause_micros = repair
+        .requested_micros
+        .max(transition.ready_micros)
+        .saturating_add(seconds_to_micros(scenario_launch_seconds(
+            state,
+            workspace,
+            repair.world_event,
+            direction,
+            replica_delta,
+        )));
+    let moved = shared.moved_partition_counts
+        [(transition.replicas as usize - 1) * candidate_count + target as usize - 1];
+    let repair_ready_micros = if direction == TransitionDirection::Down && moved == 0 {
+        pause_micros
+    } else {
+        pause_micros.saturating_add(seconds_to_micros(scenario_rebalance_seconds(
+            state,
+            workspace,
+            repair.world_event,
+        )))
+    };
+    sample_moved_partition_prefix(state, workspace, draws, repair.world_event);
+    let retained = 1.0_f64 - workspace.moved_partition_share[moved as usize];
+    let after = workspace.posterior_resource_supply[target as usize - 1];
+    workspace.trajectory.targets.push(target);
+    workspace
+        .trajectory
+        .world_events
+        .push(Some(repair.world_event));
+    workspace.trajectory.pause_micros.push(pause_micros);
+    workspace.trajectory.ready_override_micros.push(None);
+    workspace.trajectory.ready_micros.push(repair_ready_micros);
+    workspace
+        .trajectory
+        .during_supply
+        .push(transition.supply * retained);
+    workspace.trajectory.after_supply.push(after);
+    transition.replicas = target;
+    transition.supply = after;
+    transition.ready_micros = repair_ready_micros;
 }
 
 /// Returns the smallest replica target whose supply covers one rate.

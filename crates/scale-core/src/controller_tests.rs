@@ -16,9 +16,9 @@ use crate::lead_time::{LaunchDurationShock, RebalanceDurationShock};
 use crate::types::{EventCohorts, SlotSecondCohorts};
 use crate::{
     ArrivalPrior, ArrivalPriorError, BacklogCohort, CapacityGrid, CapacityGridError, Configuration,
-    ConfigurationError, DemandClass, LaunchPrior, ModelTime, ObservationBuffer, ObservationError,
-    PosteriorError, PosteriorQuery, RebalancePrior, ReliabilityPrior, ScaleScratch, ScaleState,
-    ScheduledRelease, ServiceObjective,
+    ConfigurationError, DecisionCurveError, DemandClass, LaunchPrior, ModelTime, ObservationBuffer,
+    ObservationError, PosteriorError, PosteriorQuery, RebalancePrior, ReliabilityPrior,
+    ScaleDecision, ScaleScratch, ScaleState, ScheduledRelease, ServiceObjective, step,
 };
 
 #[quickcheck]
@@ -173,6 +173,46 @@ fn flat_predictive_mean_has_no_successor_repair() {
             .rates()
             .all(|rate| repair_target(&supply, rate) == initial)
     );
+}
+
+#[test]
+fn idle_decision_cost_increments_are_equal_across_the_replica_ladder() -> Result<(), TestError> {
+    let mut configuration = test_configuration()?;
+    configuration.partition_count = 64;
+    configuration.replica_count_max = 8;
+    configuration.posterior_sample_count = 128;
+    configuration.report_interval_micros = 100_000;
+    let grid = CapacityGrid::new(&[0.1_f64], &[1_000.0_f64], &[0.0_f64])?;
+    let mut state = ScaleState::new(configuration.clone(), grid)?;
+    let mut scratch = state.new_scratch()?;
+    let mut observation = ObservationBuffer::new(&configuration)?;
+    observation.advance_model_time(ModelTime::from_micros(1))?;
+
+    if !matches!(
+        step(&mut state, &mut scratch, observation.observation()),
+        ScaleDecision::Apply(_)
+    ) {
+        return Err(TestError::UnexpectedDecision);
+    }
+    let mut costs = vec![0.0_f64; scratch.decision_candidate_count()];
+    scratch.write_decision_expected_costs(&mut costs)?;
+    let increments = costs
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .collect::<Vec<_>>();
+    let mean = increments.iter().sum::<f64>() / 7.0_f64;
+
+    assert!(
+        increments.iter().all(|increment| *increment > 0.0_f64),
+        "costs={costs:?}, increments={increments:?}"
+    );
+    assert!(
+        increments
+            .iter()
+            .all(|increment| (*increment - mean).abs() <= mean.abs() * 0.1_f64),
+        "costs={costs:?}, increments={increments:?}"
+    );
+    Ok(())
 }
 
 #[test]
@@ -610,6 +650,8 @@ fn test_configuration() -> Result<Configuration, TestError> {
 
 #[derive(Debug, Error)]
 enum TestError {
+    #[error("the controller returned an unexpected decision")]
+    UnexpectedDecision,
     #[error(transparent)]
     Integer(#[from] TryFromIntError),
     #[error(transparent)]
@@ -620,6 +662,8 @@ enum TestError {
     Capacity(#[from] CapacityGridError),
     #[error(transparent)]
     Configuration(#[from] ConfigurationError),
+    #[error(transparent)]
+    DecisionCurve(#[from] DecisionCurveError),
     #[error(transparent)]
     Observation(#[from] ObservationError),
     #[error(transparent)]

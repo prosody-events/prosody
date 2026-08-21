@@ -167,13 +167,14 @@ pub(crate) fn next_report_boundary_at_or_after(
             * report_interval_seconds
 }
 
-/// Prices terminal pod lifetime over one finite planning horizon.
+/// Prices terminal pod lifetime after the common billing horizon.
 ///
 /// The planning horizon caps an infinite drain. The smaller action index still
 /// resolves an exact finite-cost tie.
 pub(crate) fn terminal_replica_seconds(
     model_time_micros: u64,
-    horizon_micros: u64,
+    planning_horizon_micros: u64,
+    billing_horizon_micros: u64,
     drain_seconds: f64,
     report_interval_micros: u64,
     replicas: u32,
@@ -181,13 +182,14 @@ pub(crate) fn terminal_replica_seconds(
     if drain_seconds == 0.0_f64 {
         return drain_seconds;
     }
-    let horizon_seconds = Duration::from_micros(horizon_micros).as_secs_f64();
+    let planning_horizon_seconds = Duration::from_micros(planning_horizon_micros).as_secs_f64();
+    let billing_horizon_seconds = Duration::from_micros(billing_horizon_micros).as_secs_f64();
     let report_seconds = Duration::from_micros(report_interval_micros).as_secs_f64();
     let report_epoch_seconds =
         Duration::from_micros(model_time_micros).as_secs_f64() + report_seconds;
-    let drain_at = horizon_seconds + drain_seconds.min(horizon_seconds);
+    let drain_at = planning_horizon_seconds + drain_seconds.min(planning_horizon_seconds);
     let boundary = next_report_boundary_at_or_after(report_epoch_seconds, report_seconds, drain_at);
-    f64::from(replicas) * (boundary - horizon_seconds)
+    f64::from(replicas) * (boundary - billing_horizon_seconds).max(0.0_f64)
 }
 
 #[cfg(test)]

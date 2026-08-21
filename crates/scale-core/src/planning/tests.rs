@@ -141,13 +141,13 @@ fn terminal_membership_reaches_the_first_report_boundary() {
     // The 2 s planning horizon caps the 8 s drain. The next 3 s report
     // boundary is 6 s. Two replicas therefore cost 2 * 4 = 8.
     assert!(
-        terminal_replica_seconds(0, 2_000_000, 8.0_f64, 3_000_000, 2)
+        terminal_replica_seconds(0, 2_000_000, 2_000_000, 8.0_f64, 3_000_000, 2)
             .total_cmp(&8.0_f64)
             .is_eq()
     );
     // No terminal work needs no successor continuation.
     assert!(
-        terminal_replica_seconds(0, 2_000_000, 0.0_f64, 3_000_000, 2)
+        terminal_replica_seconds(0, 2_000_000, 2_000_000, 0.0_f64, 3_000_000, 2)
             .total_cmp(&0.0_f64)
             .is_eq()
     );
