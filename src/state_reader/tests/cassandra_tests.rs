@@ -146,11 +146,12 @@ impl ReaderBackend for CassandraReaderBackend {
     }
 }
 
-/// Names for the three registered kinds. Each name is distinct, so each
+/// Names for the four registered kinds. Each name is distinct, so each
 /// kind's `structural_identity` differs instead of collapsing onto whichever
 /// kind registered first.
 const VALUE_NAME: &str = "reader-value";
 const MAP_NAME: &str = "reader-map";
+const SET_NAME: &str = "reader-set";
 const DEQUE_NAME: &str = "reader-deque";
 
 /// The reader's fixed topic. Keeping it fixed avoids growing the topic intern
@@ -161,7 +162,7 @@ fn reader_topic() -> Topic {
 }
 
 /// Builds the heavy environment: a session, prepared queries, a process
-/// presence latch, and a registry carrying the three per-kind defs, plus the
+/// presence latch, and a registry carrying the four per-kind defs, plus the
 /// shared owner cell store and the reader's carriers.
 async fn cassandra_backend() -> Result<CassandraReaderBackend> {
     let conn = CassandraConn::new(&test_cassandra_config()).await?;
@@ -177,6 +178,10 @@ async fn cassandra_backend() -> Result<CassandraReaderBackend> {
     )?;
     registry.register(
         &map_state::<I64KeyCodec, JsonCodec>(MAP_NAME),
+        CollectionDef::new(None),
+    )?;
+    registry.register(
+        &set_state::<I64KeyCodec>(SET_NAME),
         CollectionDef::new(None),
     )?;
     registry.register(
@@ -284,7 +289,7 @@ cassandra_reader_prop!(
     prop_cassandra_reader_set,
     SetOp,
     set_state::<I64KeyCodec>,
-    "reader-set",
+    SET_NAME,
     run_reader_set_trace
 );
 
