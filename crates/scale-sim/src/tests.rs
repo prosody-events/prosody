@@ -1027,7 +1027,7 @@ impl TickGenerator for PauseWitnessWorkload {
         Ok(TickInputs {
             message_count: 20,
             timer_count: 0,
-            handler_micros: 10_000,
+            handler_micros: 1,
             dependency_operations: 1,
             dependency_operation_micros: 1,
             handler_added_micros: 0,

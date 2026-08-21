@@ -44,6 +44,31 @@ const TEN_FUTURE_ARRIVALS_PER_SECOND: ArrivalPath<'static> = ArrivalPath {
 };
 
 #[test]
+fn authored_launch_geometry_prices_the_update_budget() -> Result<(), TestError> {
+    const INTERCEPT_COUNT: u64 = 3;
+    const SLOPE_COUNT: u64 = 2;
+    const FAST_DURATION_COUNT: u64 = 3;
+    const SLOW_DURATION_COUNT: u64 = 3;
+    const LARGEST_REPLICA_COUNT: u64 = 48;
+    const LIVE_GROUP_COUNT: u64 = LARGEST_REPLICA_COUNT - 1;
+    const COMPLETED_GROUP_BACKLOG: u64 = LIVE_GROUP_COUNT;
+
+    let operations_per_group = INTERCEPT_COUNT
+        .saturating_mul(SLOPE_COUNT)
+        .saturating_mul(FAST_DURATION_COUNT)
+        .saturating_mul(SLOW_DURATION_COUNT);
+    let group_count = LIVE_GROUP_COUNT.saturating_add(COMPLETED_GROUP_BACKLOG);
+    let required_operations = operations_per_group.saturating_mul(group_count);
+    let budget = LaunchPrior::kubernetes()?.budget();
+
+    assert_eq!(operations_per_group, 54);
+    assert_eq!(group_count, 94);
+    assert_eq!(required_operations, 5_076);
+    assert!(required_operations <= budget.update_operation_count_max());
+    Ok(())
+}
+
+#[test]
 fn service_objective_rejects_invalid_replica_second_delay_rates() {
     for rate in [
         f64::NEG_INFINITY,
