@@ -19,7 +19,9 @@ use crate::consumer::partition::ShutdownPhase;
 use crate::error::ClassifyError;
 use crate::loader::MessageLoader;
 use crate::state::collection::StateSession;
-use crate::state::descriptor::{Registered, StateDescriptor, deque_state, map_state, value_state};
+use crate::state::descriptor::{
+    Registered, StateDescriptor, deque_state, map_state, set_state, value_state,
+};
 use crate::state::order_codec::Utf8KeyCodec;
 use crate::state::session::EventSession;
 use crate::timers::datetime::CompactDateTime;
@@ -43,10 +45,11 @@ use tracing::{Instrument, Span, error, field::Empty, field::display};
 mod erased;
 
 pub use erased::{
-    BoxDequeState, BoxMapState, BoxStateCursor, BoxValueState, DequeScanConfig, DynDequeState,
-    DynMapState, DynValueState, ErasedCategory, ErasedStateError, MapScanConfig, StateCursor,
+    BoxDequeState, BoxMapState, BoxSetState, BoxStateCursor, BoxValueState, DequeScanConfig,
+    DynDequeState, DynMapState, DynSetState, DynValueState, ErasedCategory, ErasedStateError,
+    KeyScanConfig, StateCursor,
 };
-use erased::{ErasedDeque, ErasedMap, ErasedValue};
+use erased::{ErasedDeque, ErasedMap, ErasedSet, ErasedValue};
 
 /// Marker trait for errors that can be returned from event context operations.
 ///
@@ -784,12 +787,13 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     fn should_cancel(&self) -> bool;
 
     // Keyed-state vend methods — the FFI seam the bindings wrap. Each mints a
-    // boxed erased handle ([`DynValueState`]/[`DynMapState`]/[`DynDequeState`])
+    // boxed erased handle
+    // ([`DynValueState`]/[`DynMapState`]/[`DynSetState`]/[`DynDequeState`])
     // over the *same* typed `state(...)` path as the Rust API: the value
     // families recover the cell codec from the payload via [`ErasedStateCodec`]
     // (the blanket impl's `Self::Payload: ErasedStateCodec` bound restricts a
     // boxed context to the FFI payloads); the message families resolve through
-    // the session's loader. Maps are always `String`-keyed ([`Utf8KeyCodec`]).
+    // the session's loader. Maps and sets always use `String` keys.
     //
     // Vending runs the access-time `verify_state_registration` check (an
     // unregistered or identity-mismatched name is a Permanent error), then
@@ -812,6 +816,13 @@ pub trait DynEventContext: DynClone + Send + Sync + 'static {
     ///
     /// See [`value_state`](Self::value_state).
     fn map_state(&self, name: &str) -> Result<BoxMapState<Self::Payload>, ErasedStateError>;
+
+    /// Vends the erased handle for the named `String`-keyed set collection.
+    ///
+    /// # Errors
+    ///
+    /// See [`value_state`](Self::value_state).
+    fn set_state(&self, name: &str) -> Result<BoxSetState, ErasedStateError>;
 
     /// Vends the erased handle for the named deque collection.
     ///
@@ -938,6 +949,13 @@ where
             >(name)))
             .map_err(|e| ErasedStateError::from_classified(&e))?;
         Ok(Box::new(ErasedMap::new(handle)))
+    }
+
+    fn set_state(&self, name: &str) -> Result<BoxSetState, ErasedStateError> {
+        let handle = self
+            .state(Registered::new(set_state::<Utf8KeyCodec>(name)))
+            .map_err(|error| ErasedStateError::from_classified(&error))?;
+        Ok(Box::new(ErasedSet::new(handle)))
     }
 
     fn deque_state(&self, name: &str) -> Result<BoxDequeState<Self::Payload>, ErasedStateError> {

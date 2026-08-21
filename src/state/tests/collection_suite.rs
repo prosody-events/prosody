@@ -38,7 +38,7 @@ use crate::loader::MemoryLoader;
 use crate::state::collection::StateSession;
 use crate::state::descriptor::map::{entry_cell_for, keyset_cell};
 use crate::state::descriptor::{
-    DequeHandle, MapHandle, StateDescriptor, deque, deque_state, map_state,
+    DequeHandle, MapHandle, SetHandle, StateDescriptor, deque, deque_state, map_state, set_state,
 };
 use crate::state::dirty::DirtyStore;
 use crate::state::manager::ArmedKeys;
@@ -307,6 +307,34 @@ pub(crate) type DequeTrace = Trace<DequeOp>;
 
 /// A map trace.
 pub(crate) type MapTrace = Trace<MapOp>;
+
+/// One set mutation, membership read, clear, or mid-handler commit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SetOp {
+    Insert(i64),
+    Remove(i64),
+    Contains(i64),
+    IsEmpty,
+    Clear,
+    Commit,
+}
+
+impl Arbitrary for SetOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let key = g.choose(&KEY_POOL).copied().unwrap_or(0);
+        match u8::arbitrary(g) % 7 {
+            0 | 1 => Self::Insert(key),
+            2 => Self::Remove(key),
+            3 => Self::Contains(key),
+            4 => Self::IsEmpty,
+            5 => Self::Clear,
+            _ => Self::Commit,
+        }
+    }
+}
+
+/// A set trace.
+pub(crate) type SetTrace = Trace<SetOp>;
 
 /// The bounded window width the deque-holes property ranges over.
 const MAX_DEQUE_WINDOW: usize = 8;
@@ -751,6 +779,211 @@ pub(crate) async fn run_deque_trace(
 /// entry implies a present keyset cell).
 pub(crate) async fn run_map_trace(trace: MapTrace, commit_mode: CommitMode) -> Result<bool> {
     run_map_trace_inner(trace, commit_mode, 3, None).await
+}
+
+/// Drives a set trace against a `BTreeSet` model.
+pub(crate) async fn run_set_trace(trace: SetTrace, commit_mode: CommitMode) -> Result<bool> {
+    run_set_trace_inner(trace, commit_mode, 3, None).await
+}
+
+/// Proves set query constraints on tracked and scan plans.
+pub(crate) async fn run_set_keys_prefix_trace(
+    trace: SetTrace,
+    constraints: StreamConstraints,
+) -> Result<bool> {
+    if !run_set_trace_inner(
+        trace.clone(),
+        CommitMode::ReadCommitted,
+        4096,
+        Some(constraints),
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    run_set_trace_inner(trace, CommitMode::ReadCommitted, 0, Some(constraints)).await
+}
+
+async fn run_set_trace_inner(
+    trace: SetTrace,
+    commit_mode: CommitMode,
+    keyset_limit: usize,
+    prefix: Option<StreamConstraints>,
+) -> Result<bool> {
+    run_collection_trace(
+        trace,
+        set_state::<I64KeyCodec>("st"),
+        "st",
+        CollectionDef {
+            commit_mode,
+            keyset_limit,
+            ..CollectionDef::new(None)
+        },
+        async |handle, op, model: &mut BTreeSet<i64>| match op {
+            SetOp::Insert(key) => {
+                handle.insert(key).await?;
+                model.insert(key);
+                Ok(OpOutcome::Continue)
+            }
+            SetOp::Remove(key) => {
+                handle.remove(&key).await?;
+                model.remove(&key);
+                Ok(OpOutcome::Continue)
+            }
+            SetOp::Contains(key) => Ok(mismatch_unless(
+                handle.contains(&key).await? == model.contains(&key),
+            )),
+            SetOp::IsEmpty => Ok(mismatch_unless(
+                handle.is_empty().await? == model.is_empty(),
+            )),
+            SetOp::Clear => {
+                handle.clear().await?;
+                model.clear();
+                Ok(OpOutcome::Continue)
+            }
+            SetOp::Commit => {
+                handle.commit().await?;
+                Ok(OpOutcome::Committed)
+            }
+        },
+        async |handle, model, _| assert_set(handle, model, prefix).await,
+    )
+    .await
+}
+
+/// Checks every set read surface against its model.
+async fn assert_set<S>(
+    handle: &SetHandle<S, I64KeyCodec>,
+    model: &BTreeSet<i64>,
+    prefix: Option<StreamConstraints>,
+) -> Result<bool>
+where
+    S: StateSession,
+{
+    for key in KEY_POOL {
+        if handle.contains(&key).await? != model.contains(&key) {
+            return Ok(false);
+        }
+    }
+    let expected_many = KEY_POOL.map(|key| model.contains(&key)).to_vec();
+    if handle.contains_many(&KEY_POOL).await? != expected_many {
+        return Ok(false);
+    }
+    let ascending = model.iter().copied().collect::<Vec<_>>();
+    if drain(handle.keys(Direction::Forward)).await? != ascending {
+        return Ok(false);
+    }
+    let descending = model.iter().rev().copied().collect::<Vec<_>>();
+    if drain(handle.keys(Direction::Backward)).await? != descending {
+        return Ok(false);
+    }
+    if let Some(constraints) = prefix {
+        for dir in [Direction::Forward, Direction::Backward] {
+            let unlimited = drain(handle.keys(dir)).await?;
+            let actual = collect_constrained_set_keys(handle, dir, constraints).await?;
+            if actual != constrained(unlimited, dir, constraints) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(handle.is_empty().await? == model.is_empty())
+}
+
+async fn collect_constrained_set_keys<S>(
+    handle: &SetHandle<S, I64KeyCodec>,
+    dir: Direction,
+    constraints: StreamConstraints,
+) -> Result<Vec<i64>>
+where
+    S: StateSession,
+{
+    let mut query = handle.query(dir);
+    if let Some((start, included)) = constraints.start {
+        query = if included {
+            query.from(&start)
+        } else {
+            query.after(&start)
+        };
+    }
+    if let Some((end, included)) = constraints.end {
+        query = if included {
+            query.to(&end)
+        } else {
+            query.before(&end)
+        };
+    }
+    if let Some(limit) = constraints.limit {
+        query = query.limit(limit);
+    }
+    drain(query.keys()).await
+}
+
+/// Proves exact set keyset maintenance after each committed event.
+pub(crate) async fn run_set_keyset_exact_trace(trace: SetTrace) -> Result<bool> {
+    let oracle = ScriptedOracle::default();
+    let cells = MemoryCells::new();
+    let state_key = StateKey::new(Uuid::new_v4(), Arc::from("key"));
+    let descriptor = set_state::<I64KeyCodec>("st");
+    let (registry, collection_ref) = registry_and_ref(
+        &descriptor,
+        "st",
+        &state_key,
+        CollectionDef {
+            keyset_limit: 8,
+            ..CollectionDef::new(None)
+        },
+    )?;
+    let id = collection_ref.id();
+    let store = MemoryCellStore::new(cells.clone(), oracle.clone(), registry.clone());
+    let armed: ArmedKeys = Arc::default();
+    let mut model = BTreeSet::new();
+    for (index, event) in trace.events.into_iter().enumerate() {
+        let event_ref = EventRef::Message {
+            dedup_id: Uuid::from_u128(index as u128),
+        };
+        let session = make_session(&cells, &oracle, &registry, &state_key, &armed, event_ref);
+        let handle = descriptor
+            .bind(&session)
+            .map_err(|error| eyre!("bind: {error}"))?;
+        for op in event.ops {
+            match op {
+                SetOp::Insert(key) => {
+                    handle.insert(key).await?;
+                    model.insert(key);
+                }
+                SetOp::Remove(key) => {
+                    handle.remove(&key).await?;
+                    model.remove(&key);
+                }
+                SetOp::Contains(key) => {
+                    handle.contains(&key).await?;
+                }
+                SetOp::IsEmpty => {
+                    handle.is_empty().await?;
+                }
+                SetOp::Clear => {
+                    handle.clear().await?;
+                    model.clear();
+                }
+                SetOp::Commit => {
+                    handle.commit().await?;
+                }
+            }
+        }
+        finalize_and_promote(&session, &oracle, event_dedup(event_ref), &cells, id).await?;
+        let live = model.iter().copied().collect::<Vec<_>>();
+        let stored = store
+            .get(id, &keyset_cell(), read_event(index))
+            .await?
+            .into_inner();
+        if !match stored {
+            Some(bytes) => bytes[..] == tracked_frame(&live)[..],
+            None => live.is_empty(),
+        } {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) async fn run_map_keys_prefix_trace(

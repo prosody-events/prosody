@@ -1,12 +1,12 @@
 //! Erased-vs-typed parity and pins for the [`DynEventContext`] keyed-state FFI
 //! seam.
 //!
-//! The six vend methods must be *exactly* the typed `ctx.state(...)` path with
+//! The seven vend methods must use the typed `ctx.state(...)` path with
 //! the codec recovered from the payload and the name resolved at runtime. The
 //! flagship properties drive a random trace of by-name ops through the boxed
 //! erased handles and assert agreement, after **every** op, against an
 //! in-memory model (the strong oracle) — for both FFI payload erasures
-//! (`serde_json::Value` and [`BinaryPayload`]) and all three collection kinds.
+//! (`serde_json::Value` and [`BinaryPayload`]) and all four collection kinds.
 //! Because `<P as ErasedStateCodec>::Codec` *is* the codec the typed path uses,
 //! `erased == typed` is structural; the model catches any encode/decode
 //! corruption or name-resolution bug. Cursor laziness, the null-write
@@ -15,8 +15,8 @@
 //! in `state/descriptor/tests.rs`.
 
 use super::{
-    BoxDequeState, BoxMapState, DequeScanConfig, DynEventContext, ErasedCategory, ErasedStateError,
-    EventContext, MapScanConfig, StateCursor,
+    BoxDequeState, BoxMapState, BoxSetState, DequeScanConfig, DynEventContext, ErasedCategory,
+    ErasedStateError, EventContext, KeyScanConfig, StateCursor,
 };
 use crate::codec::{BinaryPayload, ErasedStateCodec, JsonCodec};
 use crate::consumer::kafka_state::{message_deque_state, message_map_state, message_state};
@@ -27,7 +27,9 @@ use crate::error::{ClassifyError, ErrorCategory};
 use crate::loader::MemoryLoader;
 use crate::state::cell_key::Direction;
 use crate::state::descriptor::tests::{TestBackend, test_session, test_session_for};
-use crate::state::descriptor::{Registered, StateDescriptor, deque_state, map_state, value_state};
+use crate::state::descriptor::{
+    Registered, StateDescriptor, deque_state, map_state, set_state, value_state,
+};
 use crate::state::dirty::DirtyStore;
 use crate::state::memory::{MemoryCellStore, MemoryCells, MemoryDescriptorIdentityStore};
 use crate::state::order_codec::Utf8KeyCodec;
@@ -57,6 +59,7 @@ use uuid::Uuid;
 /// Name-resolution is pinned by the unregistered-name test.
 const VALUE_NAME: &str = "v";
 const MAP_NAME: &str = "m";
+const SET_NAME: &str = "s";
 const DEQUE_NAME: &str = "d";
 
 /// A small key pool for map traces, so keys collide and re-use.
@@ -140,6 +143,10 @@ where
     )?;
     registry.register(
         &deque_state::<<P as ErasedStateCodec>::Codec>(DEQUE_NAME),
+        CollectionDef::new(None),
+    )?;
+    registry.register(
+        &set_state::<Utf8KeyCodec>(SET_NAME),
         CollectionDef::new(None),
     )?;
     let session = test_session_for(MemoryLoader::<P>::new(), registry);
@@ -343,3 +350,4 @@ fn prop_erased_value_parity_binary() {
 mod deque_parity;
 mod map_parity;
 mod seams;
+mod set_parity;

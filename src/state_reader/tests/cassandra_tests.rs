@@ -4,21 +4,22 @@
 //! owner [`KeyedStateSession`](crate::state::session::KeyedStateSession) over a
 //! `CassandraStore<FixedOracle>` and reads it back through the production
 //! oracle-free carriers ([`CassandraCellResources`]). The same
-//! `run_reader_{value,map,deque}_trace` runner the memory suite uses
+//! `run_reader_{value,map,set,deque}_trace` runner the memory suite uses
 //! ([`reader_suite`](super::reader_suite)) runs here over live CQL, adding
-//! Cassandra coverage for Value, Map, Deque, scans, and the two-group probe.
+//! Cassandra coverage for Value, Map, Set, Deque, scans, and source selection.
 //!
 //! Isolation follows TESTING.md's Cassandra row rule. Each evaluation runs in
 //! the shared `prosody_test` keyspace and generates a fresh subsystem, group,
 //! and key token before it starts. `partition_count` is always `1`, so
 //! `partition_for_key` trivially agrees with the owner's write partition. Each
-//! kind uses a fixed descriptor name, and the three names differ so their
+//! kind uses a fixed descriptor name. The four names differ, so their
 //! `structural_identity` values differ too. A fresh group id yields a fresh
 //! `UUIDv5` segment, so cell rows stay disjoint. A fresh subsystem yields a
 //! fresh publication partition, and a fresh key isolates the reader cache.
 
 use super::reader_suite::{
-    ReaderCase, ValueOp, run_reader_deque_trace, run_reader_map_trace, run_reader_value_trace,
+    ReaderCase, ValueOp, run_reader_deque_trace, run_reader_map_trace, run_reader_set_trace,
+    run_reader_value_trace,
 };
 use super::support::{
     ReaderBackend, collect_stream, owner_commit_cell, source_state_key, state_name,
@@ -34,13 +35,15 @@ use crate::state::cassandra::{
 };
 use crate::state::cell_key::Direction;
 use crate::state::descriptor::deque::DEQUE_POINT_ITERATION_MAX;
-use crate::state::descriptor::{DescriptorIdentity, deque_state, map_state, value_state};
+use crate::state::descriptor::{
+    DescriptorIdentity, deque_state, map_state, set_state, value_state,
+};
 use crate::state::descriptor_identity::{DescriptorIdentityStore, DurableDescriptorIdentity};
 use crate::state::fjall::test_db;
 use crate::state::order_codec::I64KeyCodec;
 use crate::state::publication::{PublicationStore, StatePublication};
 use crate::state::registry::{CollectionDef, CollectionDefRegistry};
-use crate::state::tests::collection_suite::{DequeOp, MapOp, Trace};
+use crate::state::tests::collection_suite::{DequeOp, MapOp, SetOp, Trace};
 use crate::state::tests::support::FixedOracle;
 use crate::state::{StateName, StateType};
 use crate::state_reader::backend::ReaderComponents;
@@ -274,6 +277,15 @@ cassandra_reader_prop!(
     map_state::<I64KeyCodec, JsonCodec>,
     MAP_NAME,
     run_reader_map_trace
+);
+
+// The Set property checks committed membership and ordered keys.
+cassandra_reader_prop!(
+    prop_cassandra_reader_set,
+    SetOp,
+    set_state::<I64KeyCodec>,
+    "reader-set",
+    run_reader_set_trace
 );
 
 // The Deque property: committed state must equal the oracle, over live

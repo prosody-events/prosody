@@ -173,7 +173,7 @@ const _: () = {
 /// A `set` whose updated keyset frame would exceed this writes `Overflowed`
 /// instead: `keyset_limit` keys of unbounded encoded length must not produce an
 /// unbounded meta cell, so the byte size is capped independently of the count.
-const KEYSET_BYTE_CEILING: usize = 64 * 1024;
+pub(crate) const KEYSET_BYTE_CEILING: usize = 64 * 1024;
 
 /// Keyset frame tag for a [`Keyset::Tracked`] payload. Frozen wire byte, pinned
 /// by `map_keyset_cell_bytes_are_frozen`.
@@ -359,7 +359,7 @@ fn encode_keyset(payload: &Keyset, buf: &mut Vec<u8>) -> Result<(), KeysetFrameE
 
 /// The keyset cell's state as read at the top of a `set`, folding the typed
 /// get's malformed arm into data so [`update_keyset`] is one match.
-enum PriorKeyset {
+pub(crate) enum PriorKeyset {
     /// No keyset cell (a fresh map, or TTL-expired rows).
     Absent,
 
@@ -1097,7 +1097,7 @@ where
 /// entries' [`Cell`](MapStateError::Cell) arm. The key half cannot arise (the
 /// keyset cell is read at its one fixed coordinate) but is forwarded for
 /// exhaustiveness.
-fn keyset_err<E>(err: CellStateError<KeysetFrameError>) -> MapStateError<E>
+pub(crate) fn keyset_err<E>(err: CellStateError<KeysetFrameError>) -> MapStateError<E>
 where
     E: Error + Send + Sync + 'static,
 {
@@ -1112,7 +1112,7 @@ where
 /// (`1` tag + `4` count + `Σ(4 len + coordinate bytes)`), or `None` on `usize`
 /// overflow — the single length arithmetic the serializer and both size checks
 /// share.
-fn tracked_frame_len(keys: &[Coordinate]) -> Option<usize> {
+pub(crate) fn tracked_frame_len(keys: &[Coordinate]) -> Option<usize> {
     let mut total = 1usize.checked_add(4)?;
     for coordinate in keys {
         total = total
@@ -1126,7 +1126,7 @@ fn tracked_frame_len(keys: &[Coordinate]) -> Option<usize> {
 /// registered limit or the byte ceiling). Shared by the read and write
 /// paths — the stream plan degrades on it and [`update_tracked`] collapses on
 /// it — so the two can never disagree about what "oversized" means.
-fn is_oversized(keys: &[Coordinate], limit: usize) -> bool {
+pub(crate) fn is_oversized(keys: &[Coordinate], limit: usize) -> bool {
     keys.len() > limit || tracked_frame_len(keys).is_none_or(|len| len > KEYSET_BYTE_CEILING)
 }
 
@@ -1142,7 +1142,9 @@ fn is_oversized(keys: &[Coordinate], limit: usize) -> bool {
 /// bounded by the registered limit and paid once per stream construction, not
 /// per item — and is accepted over trusting the codec's byte-identity law,
 /// because an aliasing codec would otherwise silently double-yield an entry.
-fn decoded_key_list<KC: OrderedKeyCodec>(coordinates: &[Coordinate]) -> Option<Vec<KC::Key>> {
+pub(crate) fn decoded_key_list<KC: OrderedKeyCodec>(
+    coordinates: &[Coordinate],
+) -> Option<Vec<KC::Key>> {
     let mut keys = Vec::with_capacity(coordinates.len());
     for coordinate in coordinates {
         let key = KC::decode(coordinate.as_bytes()).ok()?;
