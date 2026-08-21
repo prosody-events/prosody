@@ -1,13 +1,14 @@
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
+use std::array;
 use std::time::Duration;
 use thiserror::Error;
 
 use super::{
     SCHEDULED_PARTITION, ScenarioDraws, ScenarioRole, ScenarioWorkspace, ScratchBounds, WorldEvent,
     balanced_partition_owner, balanced_partition_range, partition_replica_capacity,
-    prepare_work_cohorts, prepare_world_shocks, repair_target, scenario_event_count,
-    scenario_horizons, scenario_quantile, scenario_random,
+    prepare_work_cohorts, prepare_world_shocks, repair_target, sample_transition_times,
+    scenario_event_count, scenario_horizons, scenario_quantile, scenario_random,
 };
 use crate::arrival::MeanRateTrajectory;
 use crate::edf::{
@@ -27,6 +28,7 @@ struct I27Measurement {
     replica_seconds: [f64; 8],
     costs: [f64; 8],
     candidate_eight_has_target_eight_event: bool,
+    candidate_transition_times: [Option<(u64, u64)>; 8],
 }
 
 #[test]
@@ -36,7 +38,7 @@ fn committed_eight_prices_only_the_honest_replica_margin() -> Result<(), TestErr
     assert!(!measurement.candidate_eight_has_target_eight_event);
     let replica_margin =
         3.0_f64 * (measurement.replica_seconds[7] - measurement.replica_seconds[0]);
-    assert!((replica_margin - 47.197_503_f64).abs() < 0.01_f64);
+    assert!((replica_margin - 47.496_974_f64).abs() < 0.01_f64);
     assert!(measurement.costs[0] < measurement.costs[7]);
     Ok(())
 }
@@ -44,7 +46,83 @@ fn committed_eight_prices_only_the_honest_replica_margin() -> Result<(), TestErr
 #[test]
 fn inflight_descent_prices_only_the_honest_replica_margin() -> Result<(), TestError> {
     let measurement = i27_measurement(Some((8, 1)), 0.02_f64, 12)?;
+    let fresh = i27_measurement(None, 0.02_f64, 12)?;
+    assert_eq!(
+        &measurement.candidate_transition_times[1..7],
+        &fresh.candidate_transition_times[1..7]
+    );
     assert!(measurement.costs[0] < measurement.costs[7]);
+    Ok(())
+}
+
+#[test]
+fn cancel_prices_candidate_two_from_the_current_count() -> Result<(), TestError> {
+    let retained = i27_measurement(Some((8, 1)), 0.02_f64, 12)?;
+    let fresh = i27_measurement(None, 0.02_f64, 12)?;
+    assert_eq!(
+        retained.candidate_transition_times[1],
+        fresh.candidate_transition_times[1]
+    );
+    Ok(())
+}
+
+#[test]
+fn transition_request_identity_preserves_the_survival_adjustment() -> Result<(), TestError> {
+    let (mut state, _scratch, mut observation) = i27_model(0.02_f64)?;
+    observation.advance_model_time(ModelTime::from_micros(13_000_000))?;
+    observation.set_resource_observation(
+        ResourceWindow::new_with_starts(32.0_f64, 1.0_f64, 500, 500)?,
+        32,
+        32,
+        &[OccupancyTransition::new(500_000, 500, 500)],
+    )?;
+    if let Some(resource) = observation.observation().resource {
+        state.capacity.update(resource, Duration::from_secs(1));
+    }
+    let requested_at = 13_000_000;
+    for scenario in 0_u32..256 {
+        let random = scenario_random(scenario, 256, ScenarioRole::Commitment);
+        let fresh = sample_transition_times(
+            &state,
+            &random,
+            requested_at,
+            requested_at,
+            0.0_f64,
+            crate::TransitionDirection::Up,
+            3,
+        );
+        let fresh_again = sample_transition_times(
+            &state,
+            &random,
+            requested_at,
+            requested_at,
+            0.0_f64,
+            crate::TransitionDirection::Up,
+            3,
+        );
+        assert_eq!(fresh, fresh_again);
+
+        let retained = sample_transition_times(
+            &state,
+            &random,
+            requested_at,
+            requested_at + 1_000_000,
+            1.0_f64,
+            crate::TransitionDirection::Up,
+            3,
+        );
+        let mut oracle_random = random.clone().domain(requested_at).domain(0);
+        let oracle_remaining = state.lead_time.sample_remaining_seconds(
+            crate::TransitionDirection::Up,
+            3,
+            1.0_f64,
+            &mut oracle_random,
+        );
+        let oracle_pause = requested_at
+            .saturating_add(1_000_000)
+            .saturating_add(super::seconds_to_micros(oracle_remaining));
+        assert_eq!(retained.0, oracle_pause);
+    }
     Ok(())
 }
 
@@ -126,10 +204,26 @@ fn i27_measurement(
     let last = workspace.trajectory_offsets[8] as usize;
     let candidate_eight_has_target_eight_event =
         workspace.trajectory.targets[first..last].contains(&8);
+    let candidate_transition_times = array::from_fn(|candidate_index| {
+        let first = workspace.trajectory_offsets[candidate_index] as usize;
+        let last = workspace.trajectory_offsets[candidate_index + 1] as usize;
+        let target = candidate_index as u32 + 1;
+        workspace.trajectory.targets[first..last]
+            .iter()
+            .position(|event_target| *event_target == target)
+            .map(|offset| {
+                let event = first + offset;
+                (
+                    workspace.trajectory.pause_micros[event],
+                    workspace.trajectory.ready_override_micros[event].unwrap_or(u64::MAX),
+                )
+            })
+    });
     Ok(I27Measurement {
         replica_seconds,
         costs,
         candidate_eight_has_target_eight_event,
+        candidate_transition_times,
     })
 }
 

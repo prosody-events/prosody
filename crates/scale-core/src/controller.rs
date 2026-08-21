@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::ops::Range;
 use std::time::Duration;
 
@@ -687,34 +686,17 @@ struct ReactiveRepair {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WorldEvent {
     report_boundary: usize,
-    role: TransitionRole,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TransitionRole {
-    InitialCommitment,
-    ReactiveRepair,
 }
 
 impl WorldEvent {
     const ROLE_COUNT: usize = 2;
 
-    const fn initial() -> Self {
-        Self {
-            report_boundary: 0,
-            role: TransitionRole::InitialCommitment,
-        }
-    }
-
     const fn repair(report_boundary: usize) -> Self {
-        Self {
-            report_boundary,
-            role: TransitionRole::ReactiveRepair,
-        }
+        Self { report_boundary }
     }
 
     const fn index(self) -> usize {
-        self.report_boundary * Self::ROLE_COUNT + self.role as usize
+        self.report_boundary * 2 + 1
     }
 }
 
@@ -2168,7 +2150,8 @@ fn prepare_supply_trajectories(
 }
 
 fn prepare_world_shocks(workspace: &mut ScenarioWorkspace, draws: &ScenarioDraws) {
-    for index in 0..workspace.launch_shocks.len() {
+    // Index zero belonged to the deleted candidate initial event.
+    for index in 1..workspace.launch_shocks.len() {
         let event_domain = index as u64;
         let mut launch_random = draws.lead_random.clone().domain(event_domain);
         let mut rebalance_random = draws.rebalance_random.clone().domain(event_domain);
@@ -2201,6 +2184,7 @@ fn prepare_candidate_trajectories(
             state,
             workspace,
             shared.actuation_commitments,
+            &draws.commitment_random,
             candidate,
             now_micros,
         );
@@ -2375,6 +2359,7 @@ fn push_candidate_events(
     state: &ScaleState,
     workspace: &mut ScenarioWorkspace,
     actuation_commitments: &ActuationCommitments,
+    random: &RandomStream,
     candidate: u32,
     now_micros: u64,
 ) -> (usize, usize, u32) {
@@ -2391,61 +2376,48 @@ fn push_candidate_events(
         commitment.target_replicas
     });
     let fixed_event_count = workspace.trajectory.targets.len() - first;
-    let candidate_direction = match candidate.cmp(&committed_replicas) {
-        Ordering::Greater => Some(TransitionDirection::Up),
-        Ordering::Less => Some(TransitionDirection::Down),
-        Ordering::Equal => None,
-    };
     for commitment_index in 0..actuation_commitments.launching_len() {
-        let commitment_direction = actuation_commitments.launching_direction(commitment_index);
-        if candidate_direction.is_none_or(|direction| direction != commitment_direction)
+        if candidate == state.current_replicas
+            || candidate != actuation_commitments.launching_target_replicas(commitment_index)
             || workspace.commitment_pause_micros[commitment_index] == u64::MAX
         {
             continue;
         }
-        let target = candidate_direction.map_or(candidate, |direction| match direction {
-            TransitionDirection::Up => actuation_commitments
-                .launching_target_replicas(commitment_index)
-                .min(candidate),
-            TransitionDirection::Down => actuation_commitments
-                .launching_target_replicas(commitment_index)
-                .max(candidate),
-        });
-        if (target == committed_replicas && candidate != committed_replicas)
-            || workspace.trajectory.targets[first..].contains(&target)
-        {
+        if workspace.trajectory.targets[first..].contains(&candidate) {
             continue;
         }
         push_trajectory_event(
             &mut workspace.trajectory,
-            target,
+            candidate,
             workspace.commitment_pause_micros[commitment_index],
             Some(workspace.commitment_ready_micros[commitment_index]),
             None,
         );
     }
-    if candidate != committed_replicas
+    if candidate != state.current_replicas
         && !workspace.trajectory.targets[first..].contains(&candidate)
     {
-        let direction = if candidate > committed_replicas {
+        let direction = if candidate > state.current_replicas {
             TransitionDirection::Up
         } else {
             TransitionDirection::Down
         };
-        let replica_delta = candidate.abs_diff(committed_replicas);
-        let pause_micros = now_micros.saturating_add(seconds_to_micros(scenario_launch_seconds(
+        let replica_delta = candidate.abs_diff(state.current_replicas);
+        let (pause_micros, ready_micros) = sample_transition_times(
             state,
-            workspace,
-            WorldEvent::initial(),
+            random,
+            now_micros,
+            now_micros,
+            0.0_f64,
             direction,
             replica_delta,
-        )));
+        );
         push_trajectory_event(
             &mut workspace.trajectory,
             candidate,
             pause_micros,
+            Some(ready_micros),
             None,
-            Some(WorldEvent::initial()),
         );
     }
     (first, fixed_event_count, committed_replicas)
@@ -2602,21 +2574,18 @@ fn sample_commitment_pauses(
                 .saturating_sub(commitments.launching_requested_at(index).as_micros()),
         )
         .as_secs_f64();
-        let domain = commitments.launching_requested_at(index).as_micros();
-        let mut commitment_random = random.clone().domain(domain).domain(0);
-        let remaining_seconds = state.lead_time.sample_remaining_seconds(
+        let requested_at = commitments.launching_requested_at(index).as_micros();
+        let (pause_micros, ready_micros) = sample_transition_times(
+            state,
+            random,
+            requested_at,
+            now_micros,
+            elapsed_seconds,
             commitments.launching_direction(index),
             commitments.launching_replica_delta(index),
-            elapsed_seconds,
-            &mut commitment_random,
         );
-        workspace.commitment_pause_micros[index] =
-            now_micros.saturating_add(seconds_to_micros(remaining_seconds));
-        let mut rebalance_random = random.clone().domain(domain).domain(1);
-        workspace.commitment_ready_micros[index] = workspace.commitment_pause_micros[index]
-            .saturating_add(seconds_to_micros(
-                state.rebalance_time.sample_seconds(&mut rebalance_random),
-            ));
+        workspace.commitment_pause_micros[index] = now_micros.max(pause_micros);
+        workspace.commitment_ready_micros[index] = now_micros.max(ready_micros);
     }
     workspace.rebalancing_ready_micros = commitments.rebalancing().map_or(u64::MAX, |commitment| {
         if commitment.started_at > state.model_time {
@@ -2639,6 +2608,37 @@ fn sample_commitment_pauses(
         ))
     });
     now_micros
+}
+
+/// Samples one transition through its stable request-time identity.
+///
+/// At zero elapsed time, retained and fresh paths use this function with
+/// bit-identical inputs and produce bit-identical results.
+fn sample_transition_times(
+    state: &ScaleState,
+    random: &RandomStream,
+    requested_at_micros: u64,
+    now_micros: u64,
+    elapsed_seconds: f64,
+    direction: TransitionDirection,
+    replica_delta: u32,
+) -> (u64, u64) {
+    let mut launch_random = random.clone().domain(requested_at_micros).domain(0);
+    let remaining_seconds = state.lead_time.sample_remaining_seconds(
+        direction,
+        replica_delta,
+        elapsed_seconds,
+        &mut launch_random,
+    );
+    let pause_micros = now_micros.saturating_add(seconds_to_micros(remaining_seconds));
+    let mut rebalance_random = random.clone().domain(requested_at_micros).domain(1);
+    let rebalance_seconds = state
+        .rebalance_time
+        .sample_remaining_seconds(0.0_f64, &mut rebalance_random);
+    (
+        pause_micros,
+        pause_micros.saturating_add(seconds_to_micros(rebalance_seconds)),
+    )
 }
 
 pub(crate) fn scenario_random(
