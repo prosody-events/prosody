@@ -39,6 +39,7 @@ const PROGRESS_STEP_SMOOTHING: f64 = 0.3_f64;
 const EVENT_COUNT: u32 = 2_000;
 const HOT_KEY_EVENT_COUNT: u32 = 6_000;
 const HOT_PARTITION_EVENT_COUNT: u32 = 60_000;
+const HOT_SETTLED_TAIL_START_MICROS: u64 = 90_000_000;
 const SEASONAL_EVENT_COUNT: u32 = 3_000;
 const TRANSIENT_EVENT_COUNT: u32 = 36_000;
 const REBALANCE_EVENT_COUNT: u32 = 32_500;
@@ -545,11 +546,14 @@ fn validate_idle_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> 
     let cost_duration_seconds =
         Duration::from_micros(run.stop.at_micros.saturating_sub(IDLE_COST_START_MICROS))
             .as_secs_f64();
-    require_closed_loop(
-        replica_seconds_between(run, IDLE_COST_START_MICROS, run.stop.at_micros)
-            <= 1.5_f64 * cost_duration_seconds,
+    let measured_cost = replica_seconds_between(run, IDLE_COST_START_MICROS, run.stop.at_micros);
+    let cost_budget = 1.5_f64 * cost_duration_seconds;
+    require_closed_loop_measurement(
+        measured_cost <= cost_budget,
         PrincipalRegime::Idle,
         "idle capacity exceeded its controllable cost budget",
+        measured_cost,
+        cost_budget,
     )?;
     require_closed_loop(
         final_target(run) == Some(1),
@@ -792,7 +796,7 @@ fn validate_single_worker_claim(
     regime: PrincipalRegime,
     run: &PrincipalRun,
 ) -> Result<(), RegimeValidationError> {
-    let mut decisions = (0..run.controller.len()).filter_map(|index| {
+    let decisions = (0..run.controller.len()).filter_map(|index| {
         Some((
             run.controller.sample(index)?,
             run.controller.decision_expected_costs(index)?,
@@ -812,12 +816,31 @@ fn validate_single_worker_claim(
         regime,
         "no decision had positive one-replica loss",
     )?;
+    let (has_settled_decision, settled_at_one, settled_costs_non_decreasing) = decisions
+        .filter(|(sample, _)| sample.at_micros >= HOT_SETTLED_TAIL_START_MICROS)
+        .fold(
+            (false, true, true),
+            |(_, targets_hold, costs_hold), (sample, costs)| {
+                (
+                    true,
+                    targets_hold && sample.target == 1,
+                    costs_hold
+                        && !costs.is_empty()
+                        && costs.windows(2).all(|pair| pair[0] <= pair[1]),
+                )
+            },
+        );
     require_closed_loop(
-        decisions.any(|(_, losses)| {
-            !losses.is_empty() && losses.iter().skip(1).all(|loss| *loss == f64::INFINITY)
-        }),
+        has_settled_decision && settled_at_one,
         regime,
-        "no decision had infinite loss for every larger replica target",
+        "the selected target did not stay at one for the final 30-second schedule window",
+    )?;
+    // These two clauses replace the deleted mask claim. Exact cost minimization
+    // prices unhelpful replicas, so the cost model replaces the mask heuristic.
+    require_closed_loop(
+        settled_costs_non_decreasing,
+        regime,
+        "expected cost decreased above target one in the settled schedule window",
     )
 }
 
@@ -1003,10 +1026,14 @@ fn validate_historical_exceeded_claim(run: &PrincipalRun) -> Result<(), RegimeVa
 }
 
 fn validate_historical_under_claim(run: &PrincipalRun) -> Result<(), RegimeValidationError> {
-    require_closed_loop(
-        slo_miss_fraction(run, PrincipalRegime::HistoricalUnder.budget_micros()) <= 0.01_f64,
+    let miss_fraction = slo_miss_fraction(run, PrincipalRegime::HistoricalUnder.budget_micros());
+    let miss_fraction_limit = 0.01_f64;
+    require_closed_loop_measurement(
+        miss_fraction <= miss_fraction_limit,
         PrincipalRegime::HistoricalUnder,
         "lower live demand did not stay inside its SLO",
+        miss_fraction,
+        miss_fraction_limit,
     )?;
     let history_cost =
         8.0_f64 * Duration::from_micros(HISTORY_END_MICROS - HISTORY_START_MICROS).as_secs_f64();
@@ -1031,9 +1058,16 @@ fn validate_historical_missing_claim(run: &PrincipalRun) -> Result<(), RegimeVal
         |(peak, _), sample| (peak.max(sample.target), Some(sample.target)),
     );
     require_closed_loop(
-        final_seasoned_target.is_some() && seasoned_peak <= 6,
+        final_seasoned_target.is_some(),
+        PrincipalRegime::HistoricalMissing,
+        "missing history produced no seasoned target",
+    )?;
+    require_closed_loop_measurement(
+        seasoned_peak <= 6,
         PrincipalRegime::HistoricalMissing,
         "missing history held an excessive seasoned target",
+        f64::from(seasoned_peak),
+        6.0_f64,
     )?;
     require_closed_loop(
         final_seasoned_target.is_some_and(|target| target <= 5),
@@ -1437,6 +1471,25 @@ fn require_regime(
             regime,
             experiment,
             invariant,
+        })
+    }
+}
+
+fn require_closed_loop_measurement(
+    condition: bool,
+    regime: PrincipalRegime,
+    invariant: &'static str,
+    measured: f64,
+    bound: f64,
+) -> Result<(), RegimeValidationError> {
+    if condition {
+        Ok(())
+    } else {
+        Err(RegimeValidationError::MeasuredFailure {
+            regime,
+            invariant,
+            measured,
+            bound,
         })
     }
 }
@@ -2258,6 +2311,18 @@ pub enum RegimeValidationError {
         experiment: RegimeExperiment,
         /// Failed invariant.
         invariant: &'static str,
+    },
+    /// One measured closed-loop invariant did not hold.
+    #[error("{regime:?} ClosedLoop failed: {invariant}: measured {measured}, bound {bound}")]
+    MeasuredFailure {
+        /// Regime under test.
+        regime: PrincipalRegime,
+        /// Failed invariant.
+        invariant: &'static str,
+        /// Measured value.
+        measured: f64,
+        /// Required bound.
+        bound: f64,
     },
 }
 
