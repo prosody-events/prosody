@@ -21,18 +21,11 @@ use crate::{
 const CAPACITY_MODEL_STORAGE_BYTES_MAX: usize = 512 * 1_024 * 1_024;
 const CAPACITY_MODEL_ARTIFACT_SOURCE: u64 = 0x4341_5041_4349_5459;
 const CAPACITY_MODEL_ARTIFACT_VERSION: u32 = 2;
-const PATH_SOLVER_PROBABILITY_ERROR_MAX: f64 = 1.0e-10_f64;
-/// The scalar kernel completes at least this many simple operations per second.
+/// One capacity update can use at most 13 million simple operations.
 ///
-/// This authored rate is conservative for supported production processors.
-const CAPACITY_KERNEL_OPERATIONS_PER_SECOND_MIN: u64 = 100_000_000;
-/// One capacity update can use at most 400 billion simple operations.
-///
-/// The honest regime table has a maximum of 158,367,561,327 operations.
-/// Two-times headroom gives 316,735,122,654 operations. Rounding this value
-/// up to one significant figure gives 400,000,000,000 operations. At the
-/// certified minimum rate, this limit permits 4,000 seconds for one update.
-const CAPACITY_UPDATE_OPERATION_COUNT_MAX: u64 = 4_000 * CAPACITY_KERNEL_OPERATIONS_PER_SECOND_MIN;
+/// The price table has a maximum of 6,303,059 operations. Two-times headroom
+/// gives 12,606,118 operations. Rounding up gives 13,000,000 operations.
+const CAPACITY_UPDATE_OPERATION_COUNT_MAX: u64 = 13_000_000;
 const REPORT_CLOCK_ERROR_SECONDS: f64 = 1.0e-6_f64;
 /// The residual check has a one-percent test size.
 ///
@@ -55,7 +48,6 @@ const HAZARD_TRANSITION_PROBABILITY_ERROR_MAX: f64 = 1.0_f64 / 8.0_f64;
 const CURVE_GRID_RELATIVE_ERROR_MAX: f64 = 1.0_f64;
 const OBSERVATION_COVERAGE_INDEX: usize = 0;
 const HAZARD_COVERAGE_INDEX: usize = 1;
-const SOLVER_COVERAGE_INDEX: usize = 2;
 const CAPACITY_MODEL_BUDGET: PriorArtifactBudget = PriorArtifactBudget::new(
     (CAPACITY_MODEL_STORAGE_BYTES_MAX / size_of::<f64>()) as u32,
     CAPACITY_MODEL_STORAGE_BYTES_MAX as u64,
@@ -307,7 +299,6 @@ pub struct CapacityGrid {
     collapse_lows: Vec<f64>,
     collapse_highs: Vec<f64>,
     no_knee: Vec<f64>,
-    linear_state_max: Vec<usize>,
     knee_values: Vec<f64>,
     knee_indexes: Vec<u32>,
     knee_cell_count: u32,
@@ -378,7 +369,6 @@ impl CapacityGrid {
         let mut collapse_cells = Vec::with_capacity(cell_count);
         let mut collapse_lows = Vec::with_capacity(cell_count);
         let mut collapse_highs = Vec::with_capacity(cell_count);
-        let mut linear_state_max = Vec::with_capacity(cell_count);
         for (service_index, &service_time_seconds) in service_times_seconds.iter().enumerate() {
             for (capacity_index, &capacity_per_second) in capacities_per_second.iter().enumerate() {
                 for (collapse_index, &collapse) in collapse_values.iter().enumerate() {
@@ -391,8 +381,6 @@ impl CapacityGrid {
                     collapse_cells.push(collapse);
                     collapse_lows.push(collapse_bounds[collapse_index].0);
                     collapse_highs.push(collapse_bounds[collapse_index].1);
-                    let knee = capacity_per_second * service_time_seconds;
-                    linear_state_max.push(knee.floor() as usize);
                 }
             }
         }
@@ -408,7 +396,6 @@ impl CapacityGrid {
             collapse_lows.push(0.0_f64);
             collapse_highs.push(0.0_f64);
             no_knee.push(1.0_f64);
-            linear_state_max.push(usize::MAX);
         }
         let (knee_values, knee_indexes) =
             knee_metadata(&service_time_cells, &capacity_cells, knee_cell_count)?;
@@ -423,7 +410,6 @@ impl CapacityGrid {
             collapse_lows,
             collapse_highs,
             no_knee,
-            linear_state_max,
             knee_values,
             knee_indexes,
             knee_cell_count: u32::try_from(knee_cell_count)
@@ -593,62 +579,6 @@ struct RetainedHistory<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct DeathBand {
-    low: usize,
-    high: usize,
-    exposure_seconds: f64,
-}
-
-#[derive(Clone, Copy)]
-struct LinearRateBand {
-    service_time_seconds: f64,
-    state_max: usize,
-}
-
-#[derive(Clone, Copy)]
-struct DeathKernel<'a> {
-    rates: &'a [f64],
-    linear_rate_band: LinearRateBand,
-    ln_gamma_integers: &'a [f64],
-}
-
-#[derive(Clone, Copy)]
-enum SpreadTruncation {
-    #[cfg(test)]
-    Disabled,
-    Charged(f64),
-}
-
-#[derive(Clone, Copy)]
-struct ErrorLedger {
-    group_budget: f64,
-    charged: f64,
-}
-
-impl ErrorLedger {
-    /// Splits the path error budget across all solver groups in one
-    /// cell-window.
-    ///
-    /// Each group receives `budget / group_count`. A group divides its grant
-    /// across its uniformization steps and contraction.
-    fn with_budget(group_count: usize, budget: f64) -> Option<Self> {
-        let count = u32::try_from(group_count).ok()?;
-        (count > 0).then_some(Self {
-            group_budget: budget / f64::from(count),
-            charged: 0.0_f64,
-        })
-    }
-
-    fn charge(&mut self, amount: f64) {
-        self.charged += amount;
-        debug_assert!(
-            self.charged <= PATH_SOLVER_PROBABILITY_ERROR_MAX,
-            "the path solver must not exceed its error budget"
-        );
-    }
-}
-
-#[derive(Clone, Copy)]
 struct CapacityAllocation {
     cell_count: usize,
     state_count: usize,
@@ -693,7 +623,7 @@ impl DescendingLogGamma {
 
     fn previous(self, shape: f64, count: usize) -> Self {
         let previous = count.saturating_sub(1);
-        let previous_float = f64::from(u32::try_from(previous).map_or(u32::MAX, |value| value));
+        let previous_float = f64::from(u32::try_from(previous).unwrap_or(u32::MAX));
         let term = -(previous_float + shape).ln() - self.correction;
         let value = self.value + term;
         Self {
@@ -735,10 +665,7 @@ pub(crate) struct CapacityFactor {
     ln_gamma_integers: Vec<f64>,
     state_exposure_seconds: Vec<f64>,
     state_completion_counts: Vec<u32>,
-    forward_probabilities: Vec<f64>,
     state_rates: Vec<f64>,
-    forward_coefficients: Vec<f64>,
-    forward_work: Vec<f64>,
     residuals: Vec<f64>,
     residual_head: usize,
     residual_len: usize,
@@ -801,7 +728,6 @@ impl CapacityFactor {
                 start_history_capacity,
                 group_count: group_count_max as usize,
             },
-            exposure_min_seconds,
         )?;
         let (filter_weights, filter_curve_weights) = filter_prior(
             &hazard_weights,
@@ -840,10 +766,7 @@ impl CapacityFactor {
             ln_gamma_integers: integer_ln_gamma_table(ln_gamma_integer_count)?,
             state_exposure_seconds: vec![0.0_f64; state_count],
             state_completion_counts: vec![0; state_count],
-            forward_probabilities: vec![0.0_f64; state_count],
             state_rates: vec![0.0_f64; state_count],
-            forward_coefficients: vec![0.0_f64; state_count],
-            forward_work: vec![0.0_f64; state_count],
             residuals: vec![0.0_f64; attempt_count_max as usize],
             residual_head: 0,
             residual_len: 0,
@@ -971,6 +894,7 @@ impl CapacityFactor {
         feature = "hotpath",
         hotpath::measure(label = "completion_predictive_sweep")
     )]
+    /// Predicts completions with admitted starts fixed as observed cohorts.
     fn completion_predictive_sweep(
         &mut self,
         window: &ResourceWindow,
@@ -1243,27 +1167,18 @@ impl CapacityFactor {
         self.transition(exposure);
     }
 
-    fn update_cell_likelihood(&mut self, index: usize, evidence: OccupancyTraceEvidence<'_>) {
-        let linear_rate_band = linear_rate_band(&self.grid, index);
+    /// Scores an admission-gated occupancy path.
+    ///
+    /// The observed path comes from an admission-controlled system. Every
+    /// certified trace is feasible with probability one. The raw Markov path
+    /// score is the exact conditional likelihood.
+    fn update_cell_likelihood(&mut self, index: usize, _: OccupancyTraceEvidence<'_>) {
         let raw = path_log_score_with_rates(
             &self.state_rates,
             &self.state_exposure_seconds,
             &self.state_completion_counts,
         );
-        let normalizer = feasibility_probability_with_rates(
-            DeathKernel {
-                rates: &self.state_rates,
-                linear_rate_band,
-                ln_gamma_integers: &self.ln_gamma_integers,
-            },
-            evidence,
-            &mut self.forward_probabilities,
-            &mut self.forward_coefficients,
-            &mut self.forward_work,
-        );
-        self.likelihoods[index] = normalizer
-            .filter(|value| *value > 0.0_f64)
-            .map_or(f64::NEG_INFINITY, |value| raw - value.ln());
+        self.likelihoods[index] = raw;
     }
 
     pub(crate) fn omit_observation(&mut self, elapsed: Duration) {
@@ -1389,7 +1304,7 @@ impl CapacityFactor {
             .copied()
             .enumerate()
         {
-            let index = u32::try_from(index).map_or(u32::MAX, |value| value);
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
             let lower = f64::from(index) / sample_count;
             let upper = f64::from(index.saturating_add(1)) / sample_count;
             let cdf = -(-residual).exp_m1();
@@ -1759,7 +1674,6 @@ fn validate_capacity_allocation(
     grid: &CapacityGrid,
     artifact: &CapacityModelArtifact,
     allocation: CapacityAllocation,
-    exposure_seconds: f64,
 ) -> Result<(), CapacityModelError> {
     let storage_bytes = capacity_storage_bytes(allocation)?
         .checked_add(
@@ -1774,8 +1688,7 @@ fn validate_capacity_allocation(
         .and_then(|coverage_bytes| storage_bytes.checked_add(coverage_bytes))
         .ok_or(CapacityModelError::StorageBound)?;
     let update_operation_count =
-        capacity_update_operation_count(grid, allocation, exposure_seconds)
-            .ok_or(CapacityModelError::StorageBound)?;
+        capacity_update_operation_count(allocation).ok_or(CapacityModelError::StorageBound)?;
     if prior_artifact_contract_holds(
         artifact.identity,
         artifact.budget,
@@ -1790,71 +1703,12 @@ fn validate_capacity_allocation(
     }
 }
 
-fn capacity_update_operation_count(
-    grid: &CapacityGrid,
-    allocation: CapacityAllocation,
-    exposure_seconds: f64,
-) -> Option<u64> {
-    let band_count = allocation.state_count.min(allocation.transition_count);
-    let states = u64::try_from(band_count).ok()?;
+fn capacity_update_operation_count(allocation: CapacityAllocation) -> Option<u64> {
+    let states = u64::try_from(allocation.state_count).ok()?;
     let groups = u64::try_from(allocation.group_count).ok()?;
-    let groups_u32 = u32::try_from(groups).ok()?;
-    let group_budget = PATH_SOLVER_PROBABILITY_ERROR_MAX / f64::from(groups_u32);
-    let source_count = states.checked_add(1)?;
-    let source_count_u32 = u32::try_from(source_count).ok()?;
-    let source_charge = group_budget / f64::from(source_count_u32);
-    let states_u32 = u32::try_from(states).ok()?;
-    let half_width = (f64::from(states_u32) * (2.0_f64 / source_charge).ln() / 2.0_f64).sqrt();
-    let spread_width = (2.0_f64 * half_width).ceil() as u64 + 1;
-    let equal_rate_cost = groups
-        .checked_mul(states)?
-        .checked_mul(states.checked_add(1)?)?
-        / 2;
-    let contraction_cost = groups.checked_mul(states)?;
-    let mut kernel_cost = 0_u64;
-    for index in 0..allocation.cell_count {
-        let knee =
-            (grid.capacities_per_second[index] * grid.service_times_seconds[index]).floor() as u64;
-        let wholly_linear = grid.no_knee[index] > 0.0_f64 || states.saturating_sub(1) <= knee;
-        let linear_states = if wholly_linear {
-            states
-        } else {
-            states.min(knee.saturating_add(1))
-        };
-        let linear_cost = groups
-            .checked_mul(linear_states)?
-            .checked_mul(spread_width)?;
-        let cell_cost = if wholly_linear {
-            linear_cost
-        } else {
-            let mean_limit = -group_budget.ln();
-            let exposure_steps = (grid.capacities_per_second[index] * exposure_seconds / mean_limit)
-                .ceil()
-                .max(1.0_f64) as u64;
-            let steps = exposure_steps.checked_add(groups)?;
-            let steps_u32 = u32::try_from(exposure_steps).ok()?;
-            let tail_bound = group_budget / f64::from(steps_u32.saturating_add(1));
-            let terms = u64::from(uniformization_term_count_bound(mean_limit, tail_bound)?);
-            let uniform_cost = steps
-                .checked_mul(terms)?
-                .checked_mul(states)?
-                .checked_mul(4)?;
-            let mixed_cost = linear_cost.max(uniform_cost);
-            if grid.collapse_values[index] == 0.0_f64 {
-                mixed_cost.max(equal_rate_cost)
-            } else {
-                mixed_cost
-            }
-        };
-        kernel_cost = kernel_cost
-            .checked_add(cell_cost)?
-            .checked_add(contraction_cost)?;
-    }
     let cells = u64::try_from(allocation.cell_count).ok()?;
-    let allocated_states = u64::try_from(allocation.state_count).ok()?;
-    // Each cell fills its rate vector and then scans the same vector for the
-    // path score. Kernel work is priced separately above.
-    let path_cost = cells.checked_mul(allocated_states)?.checked_mul(2)?;
+    // Each cell fills its rate vector and scans it for the raw path score.
+    let path_cost = cells.checked_mul(states)?.checked_mul(2)?;
     let Ok(attempts) = u64::try_from(allocation.transition_count.saturating_sub(1) / 2) else {
         return None;
     };
@@ -1875,23 +1729,12 @@ fn capacity_update_operation_count(
         .checked_add(attempts.checked_mul(2)?)?;
     let trace_cost = groups.checked_mul(5)?;
     let filter_cost = u64::try_from(allocation.filter_curve_count).ok()?;
-    kernel_cost
-        .checked_add(path_cost)?
+    path_cost
         .checked_add(residual_grid_cost)?
         .checked_add(residual_ring_cost)?
         .checked_add(residual_sort_cost)?
         .checked_add(trace_cost)?
         .checked_add(filter_cost)
-}
-
-fn uniformization_term_count_bound(mean: f64, tail_bound: f64) -> Option<u32> {
-    let mut probability = (-mean).exp();
-    let mut term = 0_u32;
-    while poisson_upper_tail_bound(mean, term, probability) > tail_bound {
-        term = term.checked_add(1)?;
-        probability *= mean / f64::from(term);
-    }
-    term.checked_add(1)
 }
 
 fn capacity_storage_bytes(allocation: CapacityAllocation) -> Result<usize, CapacityModelError> {
@@ -1974,11 +1817,6 @@ fn capacity_grid_storage_bytes(cell_count: usize, knee_cell_count: usize) -> Opt
     cell_count
         .checked_mul(10)
         .and_then(|count| count.checked_mul(size_of::<f64>()))
-        .and_then(|bytes| {
-            cell_count
-                .checked_mul(size_of::<usize>())
-                .and_then(|metadata_bytes| bytes.checked_add(metadata_bytes))
-        })
         .and_then(|bytes| {
             knee_cell_count
                 .checked_mul(size_of::<f64>() + size_of::<u32>())
@@ -2099,7 +1937,7 @@ fn capacity_model_artifact_with_groups(
     let lower_tail = distribution.cdf(low);
     let upper_tail = 1.0_f64 - distribution.cdf(high);
     let random_stream = mean_per_second.to_bits() ^ shape.to_bits().rotate_left(32) | 1;
-    let mut coverage = Vec::with_capacity(6);
+    let mut coverage = Vec::with_capacity(5);
     coverage.extend([
         PriorCoverageRecord::new(
             0.0_f64,
@@ -2114,13 +1952,6 @@ fn capacity_model_artifact_with_groups(
             lower_tail,
             upper_tail,
             HAZARD_TRANSITION_PROBABILITY_ERROR_MAX,
-        ),
-        PriorCoverageRecord::new(
-            0.0_f64,
-            1.0_f64,
-            0.0_f64,
-            PATH_SOLVER_PROBABILITY_ERROR_MAX,
-            PATH_SOLVER_PROBABILITY_ERROR_MAX,
         ),
     ]);
     let artifact = CapacityModelArtifact {
@@ -2155,10 +1986,6 @@ fn capacity_model_artifact_with_groups(
         != OBSERVATION_PROBABILITY_ERROR_MAX
         || artifact.coverage[HAZARD_COVERAGE_INDEX].decision_cost_error()
             != HAZARD_TRANSITION_PROBABILITY_ERROR_MAX
-        || artifact.coverage[SOLVER_COVERAGE_INDEX].decision_cost_error()
-            != PATH_SOLVER_PROBABILITY_ERROR_MAX
-        || artifact.coverage[SOLVER_COVERAGE_INDEX].tail_probability()
-            > PATH_SOLVER_PROBABILITY_ERROR_MAX
         || artifact.budget.path_time_error_seconds() != REPORT_CLOCK_ERROR_SECONDS
         || artifact.markov_clock_assumption != MarkovClockAssumption::MemorylessAggregateCompletions
         || artifact.start_delay_evidence != StartDelayEvidence::DiscardedWithoutRecovery
@@ -2206,7 +2033,7 @@ fn hazard_prior(
     let log_step = (high.ln() - log_low) / interval_count_f64;
     let rates = (0..count)
         .map(|index| {
-            let index = u32::try_from(index).map_or(u32::MAX, |value| value);
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
             (log_low + f64::from(index) * log_step).exp()
         })
         .collect::<Vec<_>>();
@@ -2255,13 +2082,13 @@ fn contamination_prior(
     let width = 1.0_f64 / f64::from(count_u32);
     let probabilities = (0..count)
         .map(|index| {
-            let index = u32::try_from(index).map_or(u32::MAX, |value| value);
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
             (f64::from(index) + 0.5_f64) * width
         })
         .collect::<Vec<_>>();
     let mut weights = (0..count)
         .map(|index| {
-            let index = u32::try_from(index).map_or(u32::MAX, |value| value);
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
             let lower = f64::from(index) * width;
             let upper = f64::from(index + 1) * width;
             distribution.cdf(upper) - distribution.cdf(lower)
@@ -2397,13 +2224,6 @@ fn fill_state_rates(grid: &CapacityGrid, index: usize, rates: &mut [f64]) {
     }
 }
 
-fn linear_rate_band(grid: &CapacityGrid, index: usize) -> LinearRateBand {
-    LinearRateBand {
-        service_time_seconds: grid.service_times_seconds[index],
-        state_max: grid.linear_state_max[index],
-    }
-}
-
 /// Folds a boundary trace into per-state exposure and completion counts.
 ///
 /// One trace group is a simultaneous batch: the state path is defined at
@@ -2452,132 +2272,6 @@ fn path_log_score_with_rates(
     score
 }
 
-fn feasibility_probability_with_rates(
-    kernel: DeathKernel<'_>,
-    evidence: OccupancyTraceEvidence<'_>,
-    probabilities: &mut [f64],
-    coefficients: &mut [f64],
-    work: &mut [f64],
-) -> Option<f64> {
-    feasibility_probability_and_charge(kernel, evidence, probabilities, coefficients, work)
-        .map(|(probability, _)| probability)
-}
-
-fn feasibility_probability_and_charge(
-    kernel: DeathKernel<'_>,
-    evidence: OccupancyTraceEvidence<'_>,
-    probabilities: &mut [f64],
-    coefficients: &mut [f64],
-    work: &mut [f64],
-) -> Option<(f64, f64)> {
-    feasibility_probability_with_budget(
-        kernel,
-        evidence,
-        probabilities,
-        coefficients,
-        work,
-        PATH_SOLVER_PROBABILITY_ERROR_MAX,
-    )
-}
-
-fn feasibility_probability_with_budget(
-    kernel: DeathKernel<'_>,
-    evidence: OccupancyTraceEvidence<'_>,
-    probabilities: &mut [f64],
-    coefficients: &mut [f64],
-    work: &mut [f64],
-    budget: f64,
-) -> Option<(f64, f64)> {
-    let c_max = probabilities.len() - 1;
-    let total_starts = evidence.window().started_attempts() as usize;
-    let initial = evidence.initial_busy_slots() as usize;
-    if initial
-        .checked_add(total_starts)
-        .is_some_and(|value| value <= c_max)
-    {
-        return Some((1.0_f64, 0.0_f64));
-    }
-    let group_count = evidence
-        .start_groups()
-        .iter()
-        .filter(|starts| **starts > 0)
-        .count();
-    let mut ledger = ErrorLedger::with_budget(group_count, budget)?;
-    probabilities.fill(0.0_f64);
-    probabilities[initial] = 1.0_f64;
-    // `safe_mass` owns paths that cannot exceed `c_max` after all remaining
-    // starts. `low` is the first path that can still exceed that limit.
-    // Each death step drops below-`low` mass so the caller can add it once.
-    let mut safe_mass = 0.0_f64;
-    let mut remaining_starts = total_starts;
-    let mut low = if remaining_starts > c_max {
-        0
-    } else {
-        c_max - remaining_starts + 1
-    };
-    let mut high = initial;
-    let mut previous_offset = 0_u64;
-    for (&offset, &starts) in evidence
-        .offsets_micros()
-        .iter()
-        .zip(evidence.start_groups())
-    {
-        if starts == 0 {
-            continue;
-        }
-        let band_mass = probabilities[low..=high].iter().sum::<f64>();
-        let contraction_budget = pure_death_step_with_rates(
-            kernel,
-            DeathBand {
-                low,
-                high,
-                exposure_seconds: Duration::from_micros(offset - previous_offset).as_secs_f64(),
-            },
-            probabilities,
-            coefficients,
-            work,
-            &mut ledger,
-        )?;
-        safe_mass += (band_mass - probabilities[low..=high].iter().sum::<f64>()).max(0.0_f64);
-        high = contract_death_band(
-            kernel.rates,
-            DeathBand {
-                low,
-                high,
-                exposure_seconds: Duration::from_micros(offset - previous_offset).as_secs_f64(),
-            },
-            probabilities,
-            contraction_budget,
-            &mut ledger,
-        );
-        let starts = starts as usize;
-        for state in (low..=high).rev() {
-            let shifted = state.saturating_add(starts);
-            if shifted <= c_max {
-                probabilities[shifted] = probabilities[state];
-            }
-            probabilities[state] = 0.0_f64;
-        }
-        high = high.saturating_add(starts).min(c_max);
-        remaining_starts = remaining_starts.saturating_sub(starts);
-        if remaining_starts <= c_max {
-            let safe_high = c_max - remaining_starts;
-            for probability in &mut probabilities[..=safe_high.min(high)] {
-                safe_mass += *probability;
-                *probability = 0.0_f64;
-            }
-            low = safe_high + 1;
-        } else {
-            low = 0;
-        }
-        previous_offset = offset;
-        if low > high {
-            return Some((safe_mass.min(1.0_f64), ledger.charged));
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 fn path_log_score(
     grid: &CapacityGrid,
@@ -2588,463 +2282,6 @@ fn path_log_score(
     let mut rates = vec![0.0_f64; exposure_seconds.len()];
     fill_state_rates(grid, index, &mut rates);
     path_log_score_with_rates(&rates, exposure_seconds, completion_counts)
-}
-
-#[cfg(test)]
-fn feasibility_probability(
-    grid: &CapacityGrid,
-    index: usize,
-    evidence: OccupancyTraceEvidence<'_>,
-    probabilities: &mut [f64],
-    coefficients: &mut [f64],
-    work: &mut [f64],
-) -> Option<f64> {
-    let mut rates = vec![0.0_f64; probabilities.len()];
-    let Ok(ln_gamma_integers) = integer_ln_gamma_table(probabilities.len()) else {
-        return None;
-    };
-    fill_state_rates(grid, index, &mut rates);
-    feasibility_probability_with_rates(
-        DeathKernel {
-            rates: &rates,
-            linear_rate_band: linear_rate_band(grid, index),
-            ln_gamma_integers: &ln_gamma_integers,
-        },
-        evidence,
-        probabilities,
-        coefficients,
-        work,
-    )
-}
-
-#[cfg(test)]
-fn completion_marginal_probability(
-    grid: &CapacityGrid,
-    index: usize,
-    evidence: OccupancyTraceEvidence<'_>,
-    probabilities: &mut [f64],
-    coefficients: &mut [f64],
-    work: &mut [f64],
-) -> Option<f64> {
-    let mut rates = vec![0.0_f64; probabilities.len()];
-    let Ok(ln_gamma_integers) = integer_ln_gamma_table(probabilities.len()) else {
-        return None;
-    };
-    fill_state_rates(grid, index, &mut rates);
-    let kernel = DeathKernel {
-        rates: &rates,
-        linear_rate_band: linear_rate_band(grid, index),
-        ln_gamma_integers: &ln_gamma_integers,
-    };
-    let rough_normalizer =
-        feasibility_probability_with_rates(kernel, evidence, probabilities, coefficients, work)?;
-    // The ratio uses two solver results. Give each result one quarter of the
-    // target times the denominator, so their combined ratio error stays bound.
-    let solver_budget = PATH_SOLVER_PROBABILITY_ERROR_MAX * rough_normalizer / 4.0_f64;
-    let (normalizer, _) = feasibility_probability_with_budget(
-        kernel,
-        evidence,
-        probabilities,
-        coefficients,
-        work,
-        solver_budget,
-    )?;
-    if normalizer <= 0.0_f64 {
-        return None;
-    }
-    let final_state = evidence.final_busy_slots() as usize;
-    let mut remaining_starts = evidence.window().started_attempts() as usize;
-    let mut low = final_state.saturating_sub(remaining_starts);
-    let mut high = evidence.initial_busy_slots() as usize;
-    probabilities.fill(0.0_f64);
-    probabilities[high] = 1.0_f64;
-    let group_count = evidence
-        .start_groups()
-        .iter()
-        .filter(|starts| **starts > 0)
-        .count()
-        + 1;
-    let mut ledger = ErrorLedger::with_budget(group_count, solver_budget)?;
-    let mut previous_offset = 0_u64;
-    for (&offset, &starts) in evidence
-        .offsets_micros()
-        .iter()
-        .zip(evidence.start_groups())
-    {
-        if starts == 0 {
-            continue;
-        }
-        pure_death_step_with_rates(
-            kernel,
-            DeathBand {
-                low,
-                high,
-                exposure_seconds: Duration::from_micros(offset - previous_offset).as_secs_f64(),
-            },
-            probabilities,
-            coefficients,
-            work,
-            &mut ledger,
-        )?;
-        let starts = starts as usize;
-        for state in (low..=high).rev() {
-            let shifted = state.saturating_add(starts);
-            if shifted < probabilities.len() {
-                probabilities[shifted] = probabilities[state];
-            }
-            probabilities[state] = 0.0_f64;
-        }
-        high = high.saturating_add(starts).min(probabilities.len() - 1);
-        remaining_starts = remaining_starts.saturating_sub(starts);
-        low = final_state.saturating_sub(remaining_starts);
-        probabilities[..low].fill(0.0_f64);
-        previous_offset = offset;
-    }
-    pure_death_step_with_rates(
-        kernel,
-        DeathBand {
-            low: final_state,
-            high,
-            exposure_seconds: Duration::from_micros(
-                evidence.window().exposure_micros() - previous_offset,
-            )
-            .as_secs_f64(),
-        },
-        probabilities,
-        coefficients,
-        work,
-        &mut ledger,
-    )?;
-    Some((probabilities[final_state] / normalizer).clamp(0.0_f64, 1.0_f64))
-}
-
-/// Evolves one reachable pure-death band with its exact structural kernel.
-///
-/// Linear-rate bands use binomial thinning. Equal-rate bands use the Erlang
-/// limit. Mixed bands use uniformization with a charged Poisson tail.
-fn pure_death_step_with_rates(
-    kernel: DeathKernel<'_>,
-    band: DeathBand,
-    probabilities: &mut [f64],
-    coefficients: &mut [f64],
-    work: &mut [f64],
-    ledger: &mut ErrorLedger,
-) -> Option<f64> {
-    let DeathBand {
-        low,
-        high,
-        exposure_seconds,
-    } = band;
-    if exposure_seconds == 0.0_f64 || low > high {
-        return Some(ledger.group_budget);
-    }
-    if high <= kernel.linear_rate_band.state_max {
-        let source_count = high.checked_sub(low)?.checked_add(1)?;
-        let charge_count = u32::try_from(source_count.checked_add(1)?).ok()?;
-        let source_charge = ledger.group_budget / f64::from(charge_count);
-        linear_rate_death_step(
-            kernel.linear_rate_band.service_time_seconds,
-            band,
-            probabilities,
-            work,
-            kernel.ln_gamma_integers,
-            SpreadTruncation::Charged(source_charge),
-            ledger,
-        )?;
-        return Some(source_charge);
-    }
-    let first_rate = kernel.rates[low];
-    // This bitwise scan is semantic; knee thresholds diverge at integer-knee ULP
-    // corners and width-one collapse bands, while its linear cost is negligible.
-    if kernel.rates[low..=high]
-        .iter()
-        .all(|rate| rate.to_bits() == first_rate.to_bits())
-    {
-        equal_rate_death_step(
-            first_rate,
-            low,
-            high,
-            exposure_seconds,
-            probabilities,
-            coefficients,
-            work,
-        )?;
-        return Some(ledger.group_budget);
-    }
-    uniformized_death_step(
-        kernel.rates,
-        band,
-        probabilities,
-        coefficients,
-        work,
-        ledger,
-    )
-}
-
-#[cfg(test)]
-fn pure_death_step(
-    grid: &CapacityGrid,
-    index: usize,
-    band: DeathBand,
-    probabilities: &mut [f64],
-    coefficients: &mut [f64],
-    work: &mut [f64],
-) -> Option<()> {
-    let mut rates = vec![0.0_f64; probabilities.len()];
-    let Ok(ln_gamma_integers) = integer_ln_gamma_table(probabilities.len()) else {
-        return None;
-    };
-    fill_state_rates(grid, index, &mut rates);
-    let mut ledger = ErrorLedger::with_budget(1, PATH_SOLVER_PROBABILITY_ERROR_MAX)?;
-    pure_death_step_with_rates(
-        DeathKernel {
-            rates: &rates,
-            linear_rate_band: linear_rate_band(grid, index),
-            ln_gamma_integers: &ln_gamma_integers,
-        },
-        band,
-        probabilities,
-        coefficients,
-        work,
-        &mut ledger,
-    )?;
-    Some(())
-}
-
-/// Evolves one band whose members have independent exponential lifetimes.
-///
-/// The branch retains survivors at or above `low` inside the certified spread.
-/// It drops exact below-`low` mass and charged spread tails. The caller reads
-/// both losses through `safe_mass`. The binomial values inside the spread have
-/// zero truncation error. The ledger charges only the omitted spread tails.
-fn linear_rate_death_step(
-    service_time_seconds: f64,
-    band: DeathBand,
-    probabilities: &mut [f64],
-    work: &mut [f64],
-    ln_gamma_integers: &[f64],
-    truncation: SpreadTruncation,
-    ledger: &mut ErrorLedger,
-) -> Option<()> {
-    let DeathBand {
-        low,
-        high,
-        exposure_seconds,
-    } = band;
-    work[low..=high].fill(0.0_f64);
-    let survival = (-exposure_seconds / service_time_seconds).exp();
-    for (source, &source_probability) in probabilities.iter().enumerate().take(high + 1).skip(low) {
-        let source_u32 = u32::try_from(source).ok()?;
-        let (window_low, window_high) = match truncation {
-            #[cfg(test)]
-            SpreadTruncation::Disabled => (low, source),
-            SpreadTruncation::Charged(charge) => {
-                let source_count = f64::from(source_u32);
-                let mean = source_count * survival;
-                let half_width = (source_count * (2.0_f64 / charge).ln() / 2.0_f64).sqrt();
-                let spread_low = (mean - half_width).ceil().max(0.0_f64) as usize;
-                let spread_high = (mean + half_width).floor().min(source_count) as usize;
-                ledger.charge(charge);
-                (low.max(spread_low), spread_high)
-            }
-        };
-        if window_low > window_high {
-            continue;
-        }
-        if survival == 0.0_f64 {
-            if window_low == 0 {
-                work[0] += source_probability;
-            }
-            continue;
-        }
-        for (survivors, destination) in work
-            .iter_mut()
-            .enumerate()
-            .take(window_high + 1)
-            .skip(window_low)
-        {
-            *destination += source_probability
-                * binomial_log_probability(source_u32, survivors, survival, ln_gamma_integers)
-                    .exp();
-        }
-    }
-    probabilities[low..=high].copy_from_slice(&work[low..=high]);
-    Some(())
-}
-
-/// Evolves an equal-rate band from independent log-space Poisson terms.
-///
-/// `log_factorials` is construction-sized scratch. Each term that underflows
-/// is below `f64::MIN_POSITIVE`. The total omitted mass is at most the band
-/// width times that value for each source state.
-fn equal_rate_death_step(
-    rate: f64,
-    low: usize,
-    high: usize,
-    exposure_seconds: f64,
-    probabilities: &mut [f64],
-    log_factorials: &mut [f64],
-    work: &mut [f64],
-) -> Option<()> {
-    work[low..=high].fill(0.0_f64);
-    let mean = rate * exposure_seconds;
-    let width = high.checked_sub(low)?;
-    log_factorials[0] = 0.0_f64;
-    for deaths in 1..=width {
-        let Ok(deaths_u32) = u32::try_from(deaths) else {
-            return None;
-        };
-        log_factorials[deaths] = log_factorials[deaths - 1] + f64::from(deaths_u32).ln();
-    }
-    let log_mean = mean.ln();
-    for source in low..=high {
-        for deaths in 0..=source - low {
-            let Ok(deaths_u32) = u32::try_from(deaths) else {
-                return None;
-            };
-            let probability = if mean == 0.0_f64 {
-                f64::from(u8::from(deaths == 0))
-            } else {
-                (-mean + f64::from(deaths_u32) * log_mean - log_factorials[deaths]).exp()
-            };
-            work[source - deaths] += probabilities[source] * probability;
-        }
-    }
-    probabilities[low..=high].copy_from_slice(&work[low..=high]);
-    Some(())
-}
-
-fn uniformized_death_step(
-    rates: &[f64],
-    band: DeathBand,
-    probabilities: &mut [f64],
-    current: &mut [f64],
-    next: &mut [f64],
-    ledger: &mut ErrorLedger,
-) -> Option<f64> {
-    let DeathBand {
-        low,
-        high,
-        exposure_seconds,
-    } = band;
-    let rate = (low..=high)
-        .map(|state| rates[state])
-        .fold(0.0_f64, f64::max);
-    if rate == 0.0_f64 {
-        return Some(ledger.group_budget);
-    }
-    let mean_limit = -ledger.group_budget.ln();
-    let step_count = (rate * exposure_seconds / mean_limit).ceil().max(1.0_f64) as u32;
-    let step_count_f64 = f64::from(step_count);
-    let step_seconds = exposure_seconds / step_count_f64;
-    let charge_count = step_count.checked_add(1)?;
-    let charge_count_f64 = f64::from(charge_count);
-    let tail_bound = ledger.group_budget / charge_count_f64;
-    for _ in 0..step_count {
-        current[low..=high].copy_from_slice(&probabilities[low..=high]);
-        probabilities[low..=high].fill(0.0_f64);
-        let mean = rate * step_seconds;
-        let mut poisson = (-mean).exp();
-        for state in low..=high {
-            probabilities[state] += poisson * current[state];
-        }
-        let mut term = 0_u32;
-        while poisson_upper_tail_bound(mean, term, poisson) > tail_bound {
-            next[low..=high].fill(0.0_f64);
-            for state in low..=high {
-                let death = rates[state] / rate;
-                next[state] += current[state] * (1.0_f64 - death);
-                if state > low {
-                    next[state - 1] += current[state] * death;
-                }
-            }
-            current[low..=high].copy_from_slice(&next[low..=high]);
-            term = term.checked_add(1)?;
-            poisson *= mean / f64::from(term);
-            for state in low..=high {
-                probabilities[state] += poisson * current[state];
-            }
-        }
-        if current[low + 1..=high].iter().all(|mass| *mass == 0.0_f64) {
-            probabilities[low] += poisson_upper_tail(mean, term, poisson);
-        }
-        ledger.charge(tail_bound);
-    }
-    Some(tail_bound)
-}
-
-fn poisson_upper_tail(mean: f64, term: u32, probability: f64) -> f64 {
-    let mut term = term;
-    let mut probability = probability;
-    let mut tail = 0.0_f64;
-    loop {
-        let Some(next_term) = term.checked_add(1) else {
-            return tail;
-        };
-        probability *= mean / f64::from(next_term);
-        if probability == 0.0_f64 {
-            return tail;
-        }
-        tail += probability;
-        term = next_term;
-    }
-}
-
-fn poisson_upper_tail_bound(mean: f64, term: u32, probability: f64) -> f64 {
-    let next_term = term.saturating_add(1);
-    let next = probability * mean / f64::from(next_term);
-    let following = next_term.saturating_add(1);
-    if f64::from(following) <= mean {
-        return 1.0_f64;
-    }
-    next / (1.0_f64 - mean / f64::from(following))
-}
-
-/// Removes upper states only when their total mass has a charged bound.
-///
-/// Reaching `state` needs `high - state` deaths. The collapse curve is
-/// unimodal, so the minimum intermediate rate is at one of the two endpoints.
-/// The one-death bound at `high - 1` is the smallest candidate bound.
-/// Lower states use no larger minimum rate and require more deaths.
-fn contract_death_band(
-    rates: &[f64],
-    band: DeathBand,
-    probabilities: &mut [f64],
-    budget: f64,
-    ledger: &mut ErrorLedger,
-) -> usize {
-    let DeathBand {
-        low,
-        high,
-        exposure_seconds,
-    } = band;
-    if (-rates[high] * exposure_seconds).exp() > budget {
-        return high;
-    }
-    for state in low..high {
-        let rate = rates[state + 1].min(rates[high]);
-        let death_count = high - state;
-        if poisson_lower_tail(rate * exposure_seconds, death_count, budget) <= budget {
-            probabilities[state + 1..=high].fill(0.0_f64);
-            ledger.charge(budget);
-            return state;
-        }
-    }
-    high
-}
-
-fn poisson_lower_tail(mean: f64, term_count: usize, budget: f64) -> f64 {
-    let mut probability = (-mean).exp();
-    let mut sum = probability;
-    for term in 1..term_count {
-        if sum > budget {
-            return sum;
-        }
-        let term = u32::try_from(term).map_or(f64::INFINITY, f64::from);
-        probability *= mean / term;
-        sum += probability;
-    }
-    sum
 }
 
 #[cfg(test)]
@@ -3205,7 +2442,7 @@ fn write_binomial_log_masses(
     let log_probability = probability.ln();
     let log_failure_probability = (-probability).ln_1p();
     for (mass_index, value) in output[..=group_degree].iter_mut().enumerate() {
-        let count = f64::from(u32::try_from(mass_index).map_or(u32::MAX, |value| value));
+        let count = f64::from(u32::try_from(mass_index).unwrap_or(u32::MAX));
         let log_combination = trials_log_gamma
             - ln_gamma_integers[mass_index]
             - ln_gamma_integers[trials - mass_index];
@@ -3455,10 +2692,10 @@ fn vector_exp<S: Simd>(simd: S, value: S::f64s) -> S::f64s {
 
 fn power_of_two(exponent: i64) -> f64 {
     if exponent >= -1_022 {
-        let biased = u64::try_from(exponent + 1_023).map_or(u64::MAX, |value| value);
+        let biased = u64::try_from(exponent + 1_023).unwrap_or(u64::MAX);
         f64::from_bits(biased << 52)
     } else {
-        let shift = u32::try_from(exponent + 1_074).map_or(0, |value| value);
+        let shift = u32::try_from(exponent + 1_074).unwrap_or(0);
         f64::from_bits(1_u64 << shift)
     }
 }
@@ -3742,7 +2979,7 @@ fn completion_probability_from_coefficients(
     let log_failure = (-success).ln_1p();
     let mut likelihood = f64::NEG_INFINITY;
     let maximum_known = degree.min(target);
-    let target_float = f64::from(u32::try_from(target).map_or(u32::MAX, |value| value));
+    let target_float = f64::from(u32::try_from(target).unwrap_or(u32::MAX));
     let mut count_shape_log_gamma =
         DescendingLogGamma::new(ln_gamma(target_float + posterior_shape));
     for (known, coefficient) in coefficients.iter().enumerate().take(maximum_known + 1) {
@@ -3779,12 +3016,13 @@ fn negative_binomial_log_probability_hoisted(
     ln_gamma_integers: &[f64],
     count_shape_log_gamma: f64,
 ) -> f64 {
-    let count_float = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
+    let count_float = f64::from(u32::try_from(count).unwrap_or(u32::MAX));
     count_shape_log_gamma - shape_log_gamma - ln_gamma_integers[count]
         + shape * log_success
         + count_float * log_failure
 }
 
+#[cfg(test)]
 fn binomial_log_probability(
     trials: u32,
     count: usize,
@@ -3794,7 +3032,7 @@ fn binomial_log_probability(
     // Construction sizes the table for every reachable pure-death state.
     let trials_index = trials as usize;
     let trials_float = f64::from(trials);
-    let count_float = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
+    let count_float = f64::from(u32::try_from(count).unwrap_or(u32::MAX));
     ln_gamma_integers[trials_index]
         - ln_gamma_integers[count]
         - ln_gamma_integers[trials_index - count]
@@ -3805,7 +3043,7 @@ fn binomial_log_probability(
 #[cfg(test)]
 fn binomial_log_probability_reference(trials: u32, count: usize, probability: f64) -> f64 {
     let trials = f64::from(trials);
-    let count = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
+    let count = f64::from(u32::try_from(count).unwrap_or(u32::MAX));
     ln_gamma(trials + 1.0_f64) - ln_gamma(count + 1.0_f64) - ln_gamma(trials - count + 1.0_f64)
         + count * probability.ln()
         + (trials - count) * (-probability).ln_1p()
@@ -3813,7 +3051,7 @@ fn binomial_log_probability_reference(trials: u32, count: usize, probability: f6
 
 #[cfg(test)]
 fn negative_binomial_log_probability(shape: f64, success: f64, count: usize) -> f64 {
-    let count = f64::from(u32::try_from(count).map_or(u32::MAX, |value| value));
+    let count = f64::from(u32::try_from(count).unwrap_or(u32::MAX));
     ln_gamma(count + shape) - ln_gamma(shape) - ln_gamma(count + 1.0_f64)
         + shape * success.ln()
         + count * (-success).ln_1p()
